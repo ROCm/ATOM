@@ -4,15 +4,21 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+import torch
 
 from atom.models.utils import get_pp_indices
+from atom.utils.forward_context import get_published_dcp_local_context_lens
 
 try:
     import aiter  # noqa: F401
 
     from atom.model_ops.attentions import aiter_mla
-    from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
+    from atom.model_ops.attentions.aiter_mla import (
+        AiterMLAMetadataBuilder,
+        _pad_prefill_mla_draft_tail,
+    )
 except (ImportError, RuntimeError) as exc:
     pytest.skip(f"aiter MLA backend unavailable: {exc}", allow_module_level=True)
 
@@ -25,6 +31,43 @@ def test_global_index_cache_layout_excludes_shared_and_keeps_mtp():
 
 def test_global_index_cache_layout_without_schedule_is_unchanged():
     assert aiter_mla._global_index_cache_layer_ids(None, 4, 1) == (0, 1, 2, 3, 4)
+
+
+def test_padded_prefill_mla_rows_have_empty_initialized_kv_ranges():
+    kv_indptr = torch.tensor([0, 3, 7, 101, 202], dtype=torch.int32)
+    kv_last_page_lens = np.array([3, 4, 9, 9], dtype=np.int32)
+    block_tables = np.full((4, 3), 17, dtype=np.int32)
+
+    _pad_prefill_mla_draft_tail(
+        kv_indptr,
+        kv_last_page_lens,
+        block_tables,
+        scheduled_bs=2,
+        running_bs=4,
+    )
+
+    assert kv_indptr.tolist() == [0, 3, 7, 7, 7]
+    assert kv_last_page_lens.tolist() == [3, 4, 0, 0]
+    assert block_tables[:2].tolist() == [[17, 17, 17], [17, 17, 17]]
+    assert not block_tables[2:].any()
+
+
+def test_empty_dp_rank_initializes_every_padded_prefill_mla_row():
+    kv_indptr = torch.tensor([0, 101, 202], dtype=torch.int32)
+    kv_last_page_lens = np.full(2, 9, dtype=np.int32)
+    block_tables = np.full((2, 3), 17, dtype=np.int32)
+
+    _pad_prefill_mla_draft_tail(
+        kv_indptr,
+        kv_last_page_lens,
+        block_tables,
+        scheduled_bs=0,
+        running_bs=2,
+    )
+
+    assert kv_indptr.tolist() == [0, 0, 0]
+    assert not kv_last_page_lens.any()
+    assert not block_tables.any()
 
 
 def test_global_index_cache_layout_includes_real_stack_draft_layers():
@@ -349,3 +392,117 @@ def test_transfer_regions_use_explicit_compact_consumer_map(monkeypatch):
         9,
         10,
     ]
+
+
+class _FakeMetadataBuffer:
+    def __init__(self, size):
+        self.np = np.zeros(size, dtype=np.int32)
+        self.gpu = torch.zeros(size, dtype=torch.int32)
+        self.copy_sizes = []
+
+    def copy_to_gpu(self, size):
+        self.copy_sizes.append(size)
+        self.gpu[:size].copy_(torch.from_numpy(self.np[:size]))
+        return self.gpu[:size]
+
+
+def _capture_metadata_builder(dcp_world_size, *, is_sparse):
+    bs = 4
+    var = {
+        "slot_mapping": _FakeMetadataBuffer(bs),
+        "context_lens": _FakeMetadataBuffer(bs),
+        "block_tables": _FakeMetadataBuffer(bs),
+        "cu_seqlens_q": _FakeMetadataBuffer(bs + 1),
+        "kv_indptr": _FakeMetadataBuffer(bs + 1),
+        "kv_indices": _FakeMetadataBuffer(bs),
+        "kv_last_page_lens": _FakeMetadataBuffer(bs),
+        "positions": _FakeMetadataBuffer(bs),
+        "g_kv_indptr": _FakeMetadataBuffer(bs + 1),
+    }
+    if is_sparse:
+        var["sparse_kv_indptr"] = _FakeMetadataBuffer(bs + 1)
+        var["sparse_kv_last_page_lens"] = _FakeMetadataBuffer(bs)
+    if is_sparse and dcp_world_size > 1:
+        var["dcp_local_context_lens"] = _FakeMetadataBuffer(bs)
+
+    builder = object.__new__(AiterMLAMetadataBuilder)
+    builder.model_runner = SimpleNamespace(forward_vars=var)
+    builder.block_size = 1
+    builder.is_sparse = is_sparse
+    builder.dcp_world_size = dcp_world_size
+    builder._publishes_dcp_local_lens = is_sparse and dcp_world_size > 1
+    builder._tbo_full_running_bs = 0
+    builder.dtype_q = None
+    builder.set_mla_persistent_worker_buffers = lambda *args, **kwargs: {}
+    return builder, var
+
+
+def test_cudagraph_capture_publishes_dcp_local_context_lens():
+    builder, var = _capture_metadata_builder(dcp_world_size=4, is_sparse=True)
+
+    metadata, _ = builder.build_for_cudagraph_capture(bs=4)
+
+    torch.testing.assert_close(
+        metadata.dcp_local_context_lens, torch.ones(4, dtype=torch.int32)
+    )
+    assert var["dcp_local_context_lens"].copy_sizes == [4]
+    assert (
+        get_published_dcp_local_context_lens(metadata, 4)
+        is metadata.dcp_local_context_lens
+    )
+
+
+@pytest.mark.parametrize(
+    ("dcp_world_size", "is_sparse"),
+    [(1, True), (4, False)],
+)
+def test_cudagraph_capture_keeps_non_sparse_dcp_paths_independent(
+    dcp_world_size, is_sparse
+):
+    builder, var = _capture_metadata_builder(
+        dcp_world_size=dcp_world_size, is_sparse=is_sparse
+    )
+    assert "dcp_local_context_lens" not in var
+
+    metadata, _ = builder.build_for_cudagraph_capture(bs=4)
+
+    assert metadata.dcp_local_context_lens is None
+
+
+def test_ubatch_metadata_views_full_dcp_local_context_buffer():
+    builder, var = _capture_metadata_builder(dcp_world_size=4, is_sparse=True)
+    builder._tbo_full_running_bs = 4
+    builder._set_ubatch_mla_buffers = lambda *args, **kwargs: None
+    var["dcp_local_context_lens"].gpu.copy_(
+        torch.tensor([11, 12, 13, 14], dtype=torch.int32)
+    )
+    p = "ub1_"
+    for name, size in (
+        ("slot_mapping", 2),
+        ("context_lens", 2),
+        ("block_tables", 2),
+        ("cu_seqlens_q", 3),
+        ("kv_indptr", 3),
+        ("kv_indices", 2),
+        ("kv_last_page_lens", 2),
+        ("sparse_kv_indptr", 3),
+        ("g_kv_indptr", 3),
+    ):
+        var[f"{p}{name}"] = _FakeMetadataBuffer(size)
+    for name in (
+        "work_meta_data",
+        "work_info_set",
+        "work_indptr",
+        "reduce_indptr",
+        "reduce_final_map",
+        "reduce_partial_map",
+    ):
+        var[f"{p}{name}"] = torch.empty(1)
+
+    metadata = builder.build_ubatch_metadata(ubatch_idx=1, running_bs=2)
+
+    torch.testing.assert_close(
+        metadata.dcp_local_context_lens,
+        torch.tensor([13, 14], dtype=torch.int32),
+    )
+    assert "ub1_dcp_local_context_lens" not in var

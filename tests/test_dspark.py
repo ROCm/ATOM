@@ -9,10 +9,19 @@ import types
 
 import pytest
 
-pytest.importorskip("aiter", reason="the compiled draft imports aiter at module load")
+# Named on the module, not on "aiter": a test collected after one that stubs
+# `sys.modules["aiter"]` (tests/test_pd_pp.py does) sees the name import fine
+# and dies on a symbol, which is a collection error and takes the suite with
+# it. `exc_type` is what turns that ImportError into a skip.
+pytest.importorskip(
+    "atom.spec_decode.drafter",
+    reason="the compiled draft imports aiter at module load",
+    exc_type=ImportError,
+)
 
 import torch
 
+import atom.spec_decode.drafter as mod_drafter
 from atom.model_ops.v4_kernels.dspark_fp8_indices import DSparkIndexBuffers
 from atom.models.deepseek_v4_dspark import (
     DSparkConfidenceHead,
@@ -338,12 +347,16 @@ def test_scheduler_multi_request_global_topk():
 # ---------------------------------------------------------------------------
 
 
-def _core_probe(*, piecewise, capturing, graph_ready, dummy=False, capture=True):
+def _core_probe(
+    *, piecewise, capturing, graph_ready, dummy=False, capture=True, decode=True
+):
     """Drive a decorated core once against fake collaborators and report which
     of capture / replay / deliver / bare-core it chose.
 
     `capture` is the mode gate (AF_PIECEWISE on). Off, the core never records a
-    graph of its own -- plain PIECEWISE, eager core plus a stabilised output."""
+    graph of its own -- plain PIECEWISE, eager core plus a stabilised output.
+    `decode` is the eligibility gate: prefill is never captured, whatever the
+    mode, because its shapes are one-off."""
     import types
 
     from atom.utils.attn_ffn_piecewise import piecewise_core
@@ -380,7 +393,12 @@ def _core_probe(*, piecewise, capturing, graph_ready, dummy=False, capture=True)
 
     fc = types.SimpleNamespace(
         context=types.SimpleNamespace(is_dummy_run=dummy),
-        attn_metadata=object(),
+        # `_is_decode` reads `attn_metadata.state` by NAME, so a stub enum-alike
+        # is enough and this file needs no AttnState import.
+        attn_metadata=types.SimpleNamespace(
+            state=types.SimpleNamespace(name="DECODE" if decode else "PREFILL_NATIVE"),
+            max_seqlen_q=1,
+        ),
         in_hipgraph=capturing,
     )
     core(
@@ -405,6 +423,22 @@ def test_decorated_core_picks_capture_replay_or_eager():
     assert P(piecewise=False, capturing=False, graph_ready=False) == ["core"]
     assert P(piecewise=False, capturing=True, graph_ready=True) == ["core"]
 
+    # PREFILL is never captured, whatever the mode: its shapes are one-off and
+    # the compressor's prefill plan is sliced to an actual count, not a
+    # graph-fixed capacity. It still owes the downstream piece a deliver.
+    #
+    # This replaced a `num_tokens <= 512` bound, which was trying to say the
+    # same thing in the wrong units -- at DSpark q=6 it also cut every decode
+    # above bs~85, silently disabling AF for the three largest buckets.
+    assert P(piecewise=True, capturing=False, graph_ready=True, decode=False) == [
+        "core",
+        "deliver",
+    ]
+    assert P(piecewise=True, capturing=True, graph_ready=False, decode=False) == [
+        "core",
+        "deliver",
+    ]
+
     # Capture pass, first time this key appears: warm up, record, then compute
     # the real answer (the recording fed on clones).
     assert P(piecewise=True, capturing=True, graph_ready=False) == [
@@ -428,7 +462,7 @@ def test_decorated_core_picks_capture_replay_or_eager():
     # Plain PIECEWISE (capture gate off): the core never records or replays a
     # graph of its own, whatever the capture pass / cache says -- it runs eager
     # and only stabilises its output. This is the path the three-way branch in
-    # v4_core_attention used to hand-code outside the decorator.
+    # v4_attn_compress used to hand-code outside the decorator.
     assert P(piecewise=True, capturing=True, graph_ready=True, capture=False) == [
         "core",
         "deliver",
@@ -483,22 +517,78 @@ def test_runner_copies_only_what_is_not_zero_copy():
     assert refresh["positions"] is read_from["positions"]
 
 
-def test_v4_core_captures_on_everything_but_positions():
-    # Pins the one input the graph must not bake a pointer to. Capturing on it
-    # costs ~2pts of accuracy; the root cause was never found, so this is the
-    # workaround and it has to stay stated somewhere a change would trip over.
+def test_v4_core_copies_nothing_per_step():
+    # Nothing is copied, and structurally so: the core is the batch-shaped half
+    # alone, and its inputs all come from the dense piece immediately upstream,
+    # whose graph writes them to the same address every replay. `positions` cost
+    # ~5pts when captured on (8f86bbaf) and is not an input here at all any
+    # more -- both its readers (`_qk_norm_rope`, `_fill_csa_paged_compress`) are
+    # token-shaped and stayed in the dense pieces. If a future change moves a
+    # token-shaped reader back INTO the core, this is what should stop it.
     import pytest
 
     try:
         from atom.models.deepseek_v4 import DeepseekV4Attention
 
-        core = DeepseekV4Attention._attn_core
+        core = DeepseekV4Attention._attn_compress
     except ImportError as e:
         if "aiter" not in str(e):
             raise
         pytest.skip(f"requires aiter to import deepseek_v4: {e}")
 
-    assert set(core.zero_copy_names) == set(core.input_names) - {"positions"}
+    assert set(core.zero_copy_names) == set(core.input_names)
+
+
+def test_copy_per_step_rejects_a_bare_string():
+    # `("positions")` is a string, not a 1-tuple; `frozenset` of it is a set of
+    # characters, which subtracts nothing from the input names -- so the entry
+    # silently means "copy nothing" while reading as its opposite. That shipped.
+    import pytest
+
+    from atom.utils.attn_ffn_piecewise import piecewise_core
+
+    with pytest.raises(TypeError, match="trailing comma"):
+
+        @piecewise_core(copy_per_step="positions")
+        def core(layer, *, x):
+            return x
+
+
+def test_topk_cannot_reach_qr_when_the_projection_was_handed_in():
+    # `_attn_pre` passes None for `qr`/`qr_scale` on the AF path, which is only
+    # safe because the core's single use of them -- `Indexer.topk` -- never
+    # reaches them once `pre_q_quant` is given. That short-circuit is the whole
+    # justification, so assert it directly rather than trusting the read.
+    import types
+
+    import pytest
+
+    try:
+        from atom.models.deepseek_v4 import Indexer
+    except ImportError as e:
+        if "aiter" not in str(e) and "forward_context" not in str(e):
+            raise
+        pytest.skip(f"deepseek_v4 not importable here: {e}")
+
+    def _explode(*a, **k):
+        raise AssertionError("forward_batched ran -- qr would have been read")
+
+    sentinel = object()
+    stub = types.SimpleNamespace(
+        score_topk_from=lambda q, w, s: (q, w, s),
+        forward_batched=_explode,
+    )
+    out = Indexer.topk(
+        stub,
+        None,  # x_full
+        _explode,  # qr_full: reading it at all is a failure
+        None,  # positions
+        _explode,  # qr_full_scale
+        pre_q_quant=sentinel,
+        pre_weights="w",
+        pre_q_scale="s",
+    )
+    assert out == (sentinel, "w", "s")
 
 
 def test_v4_core_inputs_come_from_the_signature():
@@ -510,23 +600,17 @@ def test_v4_core_inputs_come_from_the_signature():
     try:
         from atom.models.deepseek_v4 import DeepseekV4Attention
 
-        core = DeepseekV4Attention._attn_core
+        core = DeepseekV4Attention._attn_compress
     except ImportError as e:
         if "aiter" not in str(e):
             raise
         pytest.skip(f"requires aiter to import deepseek_v4: {e}")
 
-    assert core.input_names == (
-        "x",
-        "q",
-        "kv_pre",
-        "qr",
-        "qr_scale",
-        "positions",
-        "idx_q_quant",
-        "idx_weights",
-        "idx_q_scale",
-    )
+    # The core is the ONE batch-shaped kernel now: the compressor, whose grid is
+    # `graph_bs * per_seq_bound`. `x` is all it needs. The indexer top-k left
+    # with the FP4 default -- its varqlen path is token-shaped -- and everything
+    # else token-shaped was already in the dense pieces. Nine inputs to one.
+    assert core.input_names == ("x",)
 
 
 def test_core_with_var_kwargs_is_rejected():
@@ -732,7 +816,7 @@ def test_attention_is_reached_only_through_the_opaque_op():
     # Dynamo graphs -- the second trips "VllmBackend can only be called once".
     #
     # The V4 target calls the identical kernel safely because its call site is
-    # behind torch.ops.aiter.v4_core_attention. Mirror that, and keep it mirrored.
+    # behind torch.ops.aiter.v4_attn_compress. Mirror that, and keep it mirrored.
     import ast
     import inspect
     import textwrap
@@ -895,7 +979,7 @@ def test_forward_spec_passes_the_batch_through_unpadded(is_dummy, B):
 _GRAPH_BS = [1, 2, 4, 8, 16, 32, 48, 64, 128, 256]
 
 
-def _stub_forward_context(*, scheduled_bs, target_bs, use_cudagraph=True):
+def _stub_forward_context(*, scheduled_bs, target_bs):
     context = types.SimpleNamespace(
         scheduled_bs=scheduled_bs,
         running_bs=target_bs,
@@ -905,10 +989,8 @@ def _stub_forward_context(*, scheduled_bs, target_bs, use_cudagraph=True):
         running_tokens=target_bs * 337,
         is_dummy_run=False,
         is_draft=False,
+        is_prefill=False,
         positions=None,
-        forward_mode=types.SimpleNamespace(
-            use_cudagraph=use_cudagraph, running_bs=target_bs
-        ),
     )
     # `prepare_decode` publishes the ring slots at the PADDED batch, so the stub
     # does too -- the block slices to that length and nothing stages it.
@@ -919,19 +1001,30 @@ def _stub_forward_context(*, scheduled_bs, target_bs, use_cudagraph=True):
     return types.SimpleNamespace(context=context, attn_metadata=attn_metadata)
 
 
-def _proposer_with_graph_bs(monkeypatch, *, eplb=False, mtp_k=5, window=128):
-    """A DSparkProposer carrying only what the block pass reads."""
+def _proposer_with_graph_bs(
+    monkeypatch, *, eplb=False, mtp_k=5, window=128, captured=True
+):
+    """A DSparkProposer carrying only what the block pass reads.
+
+    ``captured`` is the fixture keeping its own name's promise: the startup
+    sweep records every capture size, and `propose` widens only for a batch
+    that has a recording. Answered through `is_captured` rather than by filling
+    `_cuda_graphs`, so `run` still reaches the backbone -- the only place these
+    tests can watch the width. `captured=False` is the no-recording case, where
+    widening would hand the variable-length MoE gather rows nothing replays.
+    """
+    from atom.spec_decode.draft_graph import DraftGraph
     from atom.spec_decode.dspark_proposer import DSparkProposer
+
+    monkeypatch.setattr(
+        DraftGraph,
+        "is_captured",
+        lambda self, running_bs: captured and running_bs in _GRAPH_BS,
+    )
 
     monkeypatch.setattr(DSparkProposer, "_with_draft", False, raising=False)
     monkeypatch.setattr(
         DSparkProposer, "aux_for", lambda self, h: [torch.zeros(1)], raising=False
-    )
-    monkeypatch.setattr(
-        DSparkProposer,
-        "_refresh_dp_metadata",
-        lambda self, fc, n: None,
-        raising=False,
     )
     monkeypatch.setattr(DSparkProposer, "verify_scheduler", None, raising=False)
 
@@ -956,7 +1049,7 @@ def _proposer_with_graph_bs(monkeypatch, *, eplb=False, mtp_k=5, window=128):
     return p
 
 
-def _run_propose(p, fc, real_bs, monkeypatch, seen):
+def _run_propose(p, fc, scheduled_bs, monkeypatch, seen):
     import atom.spec_decode.dspark_proposer as mod
 
     def _backbone(ids, pos, num_draft):
@@ -992,18 +1085,18 @@ def _run_propose(p, fc, real_bs, monkeypatch, seen):
     monkeypatch.setattr(mod, "get_forward_context", lambda: fc)
     return p.propose(
         target_token_ids=None,
-        target_positions=torch.arange(real_bs, dtype=torch.int64) * 7 + 3,
-        target_hidden_states=torch.zeros(real_bs, 4),
+        target_positions=torch.arange(scheduled_bs, dtype=torch.int64) * 7 + 3,
+        target_hidden_states=torch.zeros(scheduled_bs, 4),
         num_reject_tokens=None,
-        next_token_ids=torch.full((real_bs,), 5, dtype=torch.int32),
-        last_token_indices=torch.arange(real_bs, dtype=torch.int64),
+        next_token_ids=torch.full((scheduled_bs,), 5, dtype=torch.int32),
+        last_token_indices=torch.arange(scheduled_bs, dtype=torch.int64),
     )
 
 
 @pytest.mark.parametrize(
-    "real_bs,expect_B", [(44, 48), (50, 64), (1, 1), (64, 64), (35, 48)]
+    "scheduled_bs,expect_B", [(44, 48), (50, 64), (1, 1), (64, 64), (35, 48)]
 )
-def test_propose_drafts_at_the_captured_graph_bs(monkeypatch, real_bs, expect_B):
+def test_propose_drafts_at_the_captured_graph_bs(monkeypatch, scheduled_bs, expect_B):
     """The block runs at the target's running_bs, not the live batch size.
 
     Without this the drafter hands aiter a fresh width on every distinct decode
@@ -1012,42 +1105,257 @@ def test_propose_drafts_at_the_captured_graph_bs(monkeypatch, real_bs, expect_B)
     """
     seen = {}
     p = _proposer_with_graph_bs(monkeypatch)
-    fc = _stub_forward_context(scheduled_bs=real_bs, target_bs=expect_B)
-    out = _run_propose(p, fc, real_bs, monkeypatch, seen)
+    fc = _stub_forward_context(scheduled_bs=scheduled_bs, target_bs=expect_B)
+    out = _run_propose(p, fc, scheduled_bs, monkeypatch, seen)
 
     assert seen["B"] == expect_B
     assert seen["positions_B"] == expect_B
     # The block does not touch the target's ring slots: they arrive already at
     # the padded length, so there is nothing to install and nothing to restore.
     assert seen["slots"].shape[0] >= expect_B
-    assert seen["slots"][:real_bs].tolist() == list(range(100, 100 + real_bs))
-    assert out.shape[0] == real_bs
+    assert seen["slots"][:scheduled_bs].tolist() == list(range(100, 100 + scheduled_bs))
+    assert out.shape[0] == scheduled_bs
 
     # ...but the rows it fabricated must scatter no draft KV. Their ring slot is
     # the 0 `prepare_decode` fills that tail with, and 0 is a real position, so
     # an unmasked pad row writes into another request's window.
     t = p.mtp_k
     ids = seen["batch_ids"]
-    assert ids[: real_bs * t].tolist() == [i // t for i in range(real_bs * t)]
-    assert ids[real_bs * t : expect_B * t].tolist() == [-1] * (expect_B - real_bs) * t
+    assert ids[: scheduled_bs * t].tolist() == [i // t for i in range(scheduled_bs * t)]
+    assert (
+        ids[scheduled_bs * t : expect_B * t].tolist()
+        == [-1] * (expect_B - scheduled_bs) * t
+    )
 
 
-@pytest.mark.parametrize(
-    "cudagraph,eplb,why",
-    [
-        (False, False, "eager: the target pinned no wider batch to follow"),
-        (True, True, "pad rows would poison the expert-load histogram"),
-    ],
-)
-def test_propose_leaves_the_batch_alone_when_nothing_pins_a_wider_one(
-    monkeypatch, cudagraph, eplb, why
-):
+def test_propose_states_both_units_of_its_own_pass(monkeypatch):
+    """The draft's shape, and it is the pass's own, not the target's.
+
+    `scheduled_tokens` is how many rows carry a real request, `running_tokens`
+    how many the pass runs, and they DIFFER exactly when the batch was widened.
+    Pinned 44 against 48 so a version that reports one number twice cannot pass.
+    """
     seen = {}
-    p = _proposer_with_graph_bs(monkeypatch, eplb=eplb)
-    fc = _stub_forward_context(scheduled_bs=44, target_bs=48, use_cudagraph=cudagraph)
+    p = _proposer_with_graph_bs(monkeypatch, captured=False)
+    fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
     out = _run_propose(p, fc, 44, monkeypatch, seen)
-    assert seen["B"] == 44, why
-    assert out.shape[0] == 44
+
+    t = p.mtp_k
+    assert seen["B"] == 48, "the pass runs the agreed batch, recording or not"
+    assert fc.context.scheduled_tokens == 44 * t
+    assert fc.context.running_tokens == 48 * t
+    assert out.shape[0] == 44, "sliced back to the real requests on the way out"
+    # ...and the fabricated rows still scatter no draft KV.
+    ids = seen["batch_ids"]
+    assert ids[44 * t : 48 * t].tolist() == [-1] * (4 * t)
+
+
+def test_propose_sizes_the_draft_gather_without_asking_the_group(monkeypatch):
+    """No collective here. The step already ran its one.
+
+    Every rank's draft height is the same number by construction --
+    `running_bs` came out of that reduction and the draft width is config -- so
+    each can write the whole table itself. `DPMetadata.make` all_reduces it
+    when the table is not supplied, which cost one CPU collective per draft
+    pass: `mtp_k` of them per step for the serial drafters.
+
+    Watched by making the ask itself fail, not by counting calls: a version
+    that asks would otherwise pass here on a stub that answers.
+    """
+    seen = {}
+    p = _proposer_with_graph_bs(monkeypatch)
+    p.config.parallel_config = types.SimpleNamespace(
+        data_parallel_size=2, data_parallel_rank=0
+    )
+
+    def _must_not_ask(*a, **k):
+        raise AssertionError("draft asked the group for a height it already knows")
+
+    monkeypatch.setattr(
+        mod_drafter.DPMetadata, "num_tokens_across_dp", staticmethod(_must_not_ask)
+    )
+    fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
+    fc.dp_metadata = None
+    _run_propose(p, fc, 44, monkeypatch, seen)
+
+    t = p.mtp_k
+    assert fc.dp_metadata.get_sizes_across_dp() == [48 * t, 48 * t]
+
+
+def test_propose_puts_the_pass_on_the_path_its_own_shape_is_on(monkeypatch):
+    """The block pass is uniform across DP and is not a prefill.
+
+    Its height is `running_bs * draft width`, and both factors are the step's
+    own reduction or config -- so every rank runs the same number of rows,
+    whatever `decide` said about the TARGET's counts. That is what lets the
+    table below be declared rather than asked for.
+
+    `is_prefill` is a SEPARATE write by this same caller, not a consequence of
+    publishing a shape -- the padded gather reads it to choose which of the two
+    heights to check the rows against. Asserted here rather than one seam down
+    because the drafter reusing the target's prefill layout needs the opposite.
+    """
+    seen = {}
+    p = _proposer_with_graph_bs(monkeypatch)
+    p.config.parallel_config = types.SimpleNamespace(
+        data_parallel_size=2, data_parallel_rank=0
+    )
+    monkeypatch.setattr(
+        mod_drafter.DPMetadata, "make", staticmethod(lambda *a, **k: "dp_meta")
+    )
+    fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
+    fc.context.is_prefill = True
+    fc.dp_metadata = None
+    _run_propose(p, fc, 44, monkeypatch, seen)
+
+    assert fc.context.running_tokens_are_unified is True
+    assert fc.context.is_prefill is False
+    assert fc.dp_metadata == "dp_meta"
+
+
+class _BareFlavor(mod_drafter.Drafter):
+    """The abstract methods, stubbed. `_publish_draft_shape` reads neither."""
+
+    _resolve_mtp_k = propose = staticmethod(lambda *a, **k: None)
+
+
+def _bare_drafter(dp_size):
+    """A Drafter carrying only what `_publish_draft_shape` reads.
+
+    Not a DSparkProposer: the tests below are about the seam every flavor goes
+    through, and the one that gets it wrong is the one with no fixture.
+    """
+    drafter = object.__new__(_BareFlavor)
+    drafter.config = types.SimpleNamespace(
+        parallel_config=types.SimpleNamespace(
+            data_parallel_size=dp_size, data_parallel_rank=0
+        )
+    )
+    return drafter
+
+
+def test_a_height_the_group_did_not_agree_on_is_asked_for_not_declared(monkeypatch):
+    """A draft pass sized off this rank alone still costs the collective.
+
+    `running_bs * width` is the same number everywhere; a pass carrying this
+    rank's own token stream is not, and declaring it uniform states an equality
+    no reduction ever checked.
+
+    What travels is the answer, not the table it implies -- how `make` then
+    builds one is tested against the real thing in tests/test_dp_metadata.py.
+    The two counts are pinned apart so forwarding the wrong one fails here.
+    """
+    seen = {}
+
+    def _make(cfg, batchsize, num_tokens_across_dp=None, *, unified=False):
+        seen["batchsize"] = batchsize
+        seen["table"] = num_tokens_across_dp
+        seen["unified"] = unified
+        return "dp_meta"
+
+    monkeypatch.setattr(mod_drafter.DPMetadata, "make", staticmethod(_make))
+    fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
+
+    _bare_drafter(2)._publish_draft_shape(
+        fc,
+        scheduled_tokens=308,
+        running_tokens=336,
+        running_tokens_are_unified=False,
+    )
+    assert fc.context.running_tokens_are_unified is False
+    assert seen["unified"] is False, "a ragged height has to be discovered"
+
+    _bare_drafter(2)._publish_draft_shape(
+        fc,
+        scheduled_tokens=308,
+        running_tokens=336,
+        running_tokens_are_unified=True,
+    )
+    assert fc.context.running_tokens_are_unified is True
+    assert seen["batchsize"] == 336, "the group is told what the pass RUNS"
+    assert seen["unified"] is True, "an agreed height is worth no ask"
+    assert seen["table"] is None, "the answer travels, not a table built here"
+
+
+def test_publishing_a_shape_does_not_decide_whether_it_is_a_prefill():
+    """Two different questions, and one drafter answers them differently.
+
+    A draft step that reuses the target's own prefill layout -- Eagle's first
+    -- runs the target's ragged token stream through metadata that still
+    describes a prefill, so clearing the flag here would send every MLA layer,
+    the indexer and PCP down the decode branch on a pass that is not one.
+    """
+    fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
+    fc.context.is_prefill = True
+
+    # dp_size 1: no metadata to build, so nothing but the flag is under test.
+    _bare_drafter(1)._publish_draft_shape(
+        fc,
+        scheduled_tokens=337,
+        running_tokens=337,
+        running_tokens_are_unified=False,
+    )
+
+    assert fc.context.is_prefill is True
+
+
+def test_propose_pads_under_eplb_exactly_as_it_does_without_it(monkeypatch):
+    """EPLB is not a reason to decline the padding, though it used to be.
+
+    The stated reason was the expert-load histogram: a pad row routes through
+    the draft's MoE and `select_experts_with_record` counts it. But the TARGET
+    pads on every cudagraph decode step and its rows reach the same recorder
+    (`eplb_map_and_record_fused` masks nothing), in far greater volume -- so
+    declining here protected nothing and only cost the draft its warmed shape.
+
+    Asserting the two are EQUAL, not that either is 48: a future term that
+    reads the config back into the width fails here whichever way it leans.
+    """
+    seen_on, seen_off = {}, {}
+    _run_propose(
+        _proposer_with_graph_bs(monkeypatch, eplb=True),
+        _stub_forward_context(scheduled_bs=44, target_bs=48),
+        44,
+        monkeypatch,
+        seen_on,
+    )
+    _run_propose(
+        _proposer_with_graph_bs(monkeypatch, eplb=False),
+        _stub_forward_context(scheduled_bs=44, target_bs=48),
+        44,
+        monkeypatch,
+        seen_off,
+    )
+    assert seen_on["B"] == seen_off["B"] == 48
+
+
+def test_propose_replays_at_the_agreed_batch_even_when_it_had_to_pad(monkeypatch):
+    """The seam, end to end through `propose`.
+
+    A step whose real batch is 44 runs the block at the agreed 48 and stands in
+    for the recording there. Watched through the recording being returned and
+    the backbone never running -- asserting the label alone would pass on a
+    `run` that replays nothing.
+
+    """
+    seen = {}
+    p = _proposer_with_graph_bs(monkeypatch)
+    recorded = (
+        torch.full((48, p.mtp_k), 9, dtype=torch.int32),
+        torch.zeros(48, p.mtp_k),
+    )
+    replays = []
+    p.block._cuda_graphs[48] = (
+        types.SimpleNamespace(replay=lambda: replays.append(1)),
+        recorded,
+    )
+    fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
+    out = _run_propose(p, fc, 44, monkeypatch, seen)
+    assert replays == [1], "must replay the recording at the agreed batch"
+    assert "B" not in seen, "the backbone must not run when the recording stands in"
+    # Sliced back to the real batch: the 4 fabricated rows are the recording's
+    # to compute and nobody's to return.
+    assert out.tolist() == recorded[0][:44, : p.mtp_k].tolist()
 
 
 def test_propose_pads_a_dp_sync_dummy_exactly_like_the_rank_with_work(monkeypatch):
@@ -1273,12 +1581,12 @@ def test_the_separate_draft_model_path_declares_no_draft_graph(monkeypatch):
     the warmup and epilogue reach for -- and `warmup` runs both BEFORE it
     consults the pad/capture gates. So an unpaddable-but-declared pass still
     takes the startup sweep through `_block_warmup_inputs` and dies with an
-    AttributeError, which is what leaving this at `pads = False` used to do.
+    AttributeError, so declining to pad was never enough to keep it out.
     """
     from atom.spec_decode.dspark_proposer import DSparkProposer
 
     p = _proposer_with_graph_bs(monkeypatch)
-    assert p.draft_graphs and p.block.pads
+    assert p.draft_graphs and p.block is not None
 
     monkeypatch.setattr(DSparkProposer, "_with_draft", True, raising=False)
     p._build_draft_graphs()
@@ -1286,3 +1594,707 @@ def test_the_separate_draft_model_path_declares_no_draft_graph(monkeypatch):
     # None, not absent and not the pass a previous build left behind: rebuilding
     # is what the flavor probes in these tests do, and `propose` reads this.
     assert p.block is None
+
+
+def test_qk_norm_rope_short_circuits_dummy_run():
+    # warmup_model runs BEFORE allocate_kv_cache, so the SWA plane this kernel
+    # writes into is not bound yet. the attention has always guarded dummy_run;
+    # called from `_attn_pre` this sits UPSTREAM of that guard and needs its
+    # own. Getting that wrong died in `flydsl_hca_compress_attn` on a None
+    # kv_cache, so the guard is asserted where it now has to live.
+    import types
+
+    import pytest
+
+    try:
+        from atom.models.deepseek_v4 import DeepseekV4Attention
+    except ImportError as e:
+        # `forward_context`: conftest stubs `atom.config` for the rest of the
+        # suite and `module_dispatch_ops` then cannot resolve
+        # `get_current_cudagraph_runtime_mode`, which is why the sibling V4
+        # tests here only pass when this file runs alone. Anything else is a
+        # real import break and must not be skipped past.
+        if "aiter" not in str(e) and "forward_context" not in str(e):
+            raise
+        pytest.skip(f"deepseek_v4 not importable here: {e}")
+
+    import atom.models.deepseek_v4 as v4
+
+    T, H, D, RD = 4, 2, 64, 16
+    layer = types.SimpleNamespace(
+        n_local_heads=H, head_dim=D, rope_head_dim=RD, kv_fp8=False
+    )
+    fc = types.SimpleNamespace(context=types.SimpleNamespace(is_dummy_run=True))
+    saved = v4.get_forward_context
+    v4.get_forward_context = lambda: fc
+    try:
+        # No attn_metadata, no kv_norm, no rotary_emb, no swa_plane on the stub:
+        # reaching past the guard is an AttributeError, which is the assertion.
+        qkn = DeepseekV4Attention._qk_norm_rope(
+            layer,
+            torch.zeros(T, H * D),
+            torch.zeros(T, D),
+            torch.zeros(T, dtype=torch.int32),
+        )
+    finally:
+        v4.get_forward_context = saved
+
+    # Shapes still have to be right -- warmup's output is consumed downstream,
+    # and the op's fake impl promises exactly these.
+    assert qkn.q_sa.shape == (T, H, D) and qkn.kv.shape == (T, D)
+    assert torch.all(qkn.q_sa == 0) and torch.all(qkn.kv == 0)
+
+
+def test_core_still_binds_the_inputs_that_arrive_none():
+    # A core whose signature spans more than one call shape gets None for the
+    # inputs of the shape it is not in -- under the narrow split `_attn_compress` is
+    # handed the paged Q and not `q`/`kv_pre`. Those parameters still have to be
+    # BOUND: dropping them from the call instead was a missing-argument
+    # TypeError that only showed up at cudagraph capture on real hardware.
+    import types
+
+    from atom.utils.attn_ffn_piecewise import piecewise_core
+
+    seen = {}
+
+    @piecewise_core()
+    def core(layer, *, x: torch.Tensor | None, y: torch.Tensor | None):
+        seen["x"], seen["y"] = x, y
+        return y if x is None else x
+
+    class _Outputs:
+        def deliver(self, key, out):
+            return out
+
+    fc = types.SimpleNamespace(
+        context=types.SimpleNamespace(is_dummy_run=False),
+        attn_metadata=object(),
+        in_hipgraph=False,
+    )
+    y = torch.ones(4)
+    out = core(
+        types.SimpleNamespace(layer_name="l0"),
+        runner=None,
+        outputs=_Outputs(),
+        piecewise=True,
+        capture=False,
+        forward_context=fc,
+        x=None,
+        y=y,
+    )
+    assert seen == {"x": None, "y": y}
+    assert out is y
+
+
+def test_core_rejects_an_all_none_call():
+    # The row count comes off an input, so there has to be one. Saying so beats
+    # an AttributeError on None deep in the runner.
+    import types
+
+    import pytest
+
+    from atom.utils.attn_ffn_piecewise import piecewise_core
+
+    @piecewise_core()
+    def core(layer, *, x: torch.Tensor | None):
+        return x
+
+    fc = types.SimpleNamespace(
+        context=types.SimpleNamespace(is_dummy_run=False),
+        attn_metadata=object(),
+        in_hipgraph=False,
+    )
+    with pytest.raises(ValueError, match="every tensor input None"):
+        core(
+            types.SimpleNamespace(layer_name="l0"),
+            runner=None,
+            outputs=None,
+            piecewise=True,
+            capture=False,
+            forward_context=fc,
+            x=None,
+        )
+
+
+def test_every_half_of_the_core_short_circuits_dummy_run():
+    # warmup_model runs BEFORE allocate_kv_cache: the SWA plane and the
+    # Compressor/Indexer caches are all unbound. The attention has always guarded
+    # dummy_run, but BOTH halves of it now also run from `_attn_pre`, a graph
+    # piece earlier -- outside that guard. Each needs its own, and guarding one
+    # and not the other is exactly the bug that shipped twice: both times it
+    # died in `flydsl_hca_compress_attn` on a None kv_cache.
+    #
+    # So this asserts the property over EVERY entry point `_attn_pre` can reach
+    # under AF, rather than over whichever one was most recently added.
+    import types
+
+    import pytest
+
+    try:
+        from atom.models.deepseek_v4 import DeepseekV4Attention
+    except ImportError as e:
+        if "aiter" not in str(e) and "forward_context" not in str(e):
+            raise
+        pytest.skip(f"deepseek_v4 not importable here: {e}")
+
+    import atom.models.deepseek_v4 as v4
+
+    T, H, D, RD = 4, 2, 64, 16
+    q, kv_pre = torch.zeros(T, H * D), torch.zeros(T, D)
+    positions = torch.zeros(T, dtype=torch.int32)
+
+    def _explode(*a, **k):
+        raise AssertionError("a paged kernel ran: the KV caches are not bound yet")
+
+    # Deliberately bare: anything that reaches past the guard touches an
+    # attribute this stub does not have, or an exploding collaborator.
+    layer = types.SimpleNamespace(
+        n_local_heads=H,
+        head_dim=D,
+        rope_head_dim=RD,
+        kv_fp8=False,
+        compress_ratio=4,
+        skip_topk=False,
+        indexer=types.SimpleNamespace(topk=_explode),
+        maybe_compressors_async=_explode,
+        _fill_csa_paged_compress=_explode,
+    )
+    fc = types.SimpleNamespace(context=types.SimpleNamespace(is_dummy_run=True))
+    saved = v4.get_forward_context
+    v4.get_forward_context = lambda: fc
+    try:
+        qkn = DeepseekV4Attention._qk_norm_rope(layer, q, kv_pre, positions)
+        x = torch.zeros(T, D)
+        # `piecewise=False` is the decorator's eager route -- it just runs the
+        # body, which is what has the guard.
+        assert DeepseekV4Attention._attn_compress(layer, piecewise=False, x=x) is None
+        o = DeepseekV4Attention._sparse_attention(layer, qkn, positions)
+        assert o.shape == (T, H * D) and torch.all(o == 0)
+    finally:
+        v4.get_forward_context = saved
+
+    # Shapes still have to be right: warmup's output is consumed downstream and
+    # the op's fake impl promises exactly these.
+    assert qkn.q_sa.shape == (T, H, D) and qkn.kv.shape == (T, D)
+    assert torch.all(qkn.q_sa == 0) and torch.all(qkn.kv == 0)
+
+
+def test_custom_op_bodies_only_call_methods_that_exist():
+    # The custom ops resolve their layer out of `static_forward_context` and
+    # then call methods on it, so a method the model no longer has is not a
+    # NameError at import -- it is an AttributeError inside a compiled graph, on
+    # the GPU, at capture time. That shipped: a op left behind by a reverted
+    # design kept calling `self._paged_pre_ran_upstream()` after the method was
+    # deleted, and every test here passed because none of them reach `_attn_pre`.
+    #
+    # So this reads the ops' own bodies and checks each `self.<name>` against
+    # the class. Cheap, and it fails at the moment the method disappears.
+    import ast
+    import inspect
+
+    import pytest
+
+    try:
+        import atom.models.deepseek_v4 as v4
+    except ImportError as e:
+        if "aiter" not in str(e) and "forward_context" not in str(e):
+            raise
+        pytest.skip(f"deepseek_v4 not importable here: {e}")
+
+    tree = ast.parse(inspect.getsource(v4))
+    # The module-level functions registered as custom ops: named in a
+    # `direct_register_custom_op` call, or decorated with `mark_spliting_op`.
+    registered = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        name = getattr(fn, "id", None) or getattr(fn, "attr", None)
+        if name not in ("direct_register_custom_op", "mark_spliting_op"):
+            continue
+        for kw in node.keywords:
+            if kw.arg in ("op_func", "gen_fake") and isinstance(kw.value, ast.Name):
+                registered.add(kw.value.id)
+    # `mark_spliting_op` is a decorator, so its op is the function it decorates.
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and any(
+            getattr(getattr(d, "func", d), "id", None) == "mark_spliting_op"
+            for d in node.decorator_list
+        ):
+            registered.add(node.name)
+
+    assert registered, "found no custom ops to check -- the scan is broken"
+
+    missing = []
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef) or node.name not in registered:
+            continue
+        for sub in ast.walk(node):
+            # CALLS only. Instance attributes (`self.kv_fp8`, set in __init__)
+            # are not on the class and would all read as missing; methods are,
+            # and a missing method is what this is for.
+            if not isinstance(sub, ast.Call):
+                continue
+            fn = sub.func
+            if (
+                isinstance(fn, ast.Attribute)
+                and isinstance(fn.value, ast.Name)
+                and fn.value.id == "self"
+                and not callable(getattr(v4.DeepseekV4Attention, fn.attr, None))
+            ):
+                missing.append(f"{node.name} -> self.{fn.attr}()")
+
+    assert not missing, (
+        "custom op bodies call methods DeepseekV4Attention does not have; these "
+        "raise inside a compiled graph on the GPU, not at import:\n  "
+        + "\n  ".join(sorted(set(missing)))
+    )
+
+
+def test_every_op_fake_agrees_with_its_body():
+    # A fake impl that promises a different shape than the body returns does not
+    # fail at the op -- it fails as `assert_size_stride` deep inside the compiled
+    # graph, on the GPU, with a message about strides. That shipped: the core's
+    # no-top-k stand-in returned [T, 1] while its fake promised [T, index_topk].
+    #
+    # Both are reachable here: the fakes are plain functions, and every body has
+    # a dummy_run short-circuit that returns the same shape the real path does
+    # (it has to -- warmup output feeds the layers downstream). So compare them.
+    import types
+
+    import pytest
+
+    try:
+        import atom.models.deepseek_v4 as v4
+    except ImportError as e:
+        if "aiter" not in str(e) and "forward_context" not in str(e):
+            raise
+        pytest.skip(f"deepseek_v4 not importable here: {e}")
+
+    T, H, D, RD, TOPK = 4, 2, 64, 16, 32
+    layer = types.SimpleNamespace(
+        n_local_heads=H,
+        head_dim=D,
+        rope_head_dim=RD,
+        kv_fp8=False,
+        compress_ratio=4,
+        skip_topk=False,
+        indexer=types.SimpleNamespace(index_topk=TOPK),
+    )
+    q, kv_pre = torch.zeros(T, H * D), torch.zeros(T, D)
+    x, positions = torch.zeros(T, D), torch.zeros(T, dtype=torch.int32)
+
+    cfg = types.SimpleNamespace(
+        compilation_config=types.SimpleNamespace(static_forward_context={"L": layer})
+    )
+    fc = types.SimpleNamespace(context=types.SimpleNamespace(is_dummy_run=True))
+    saved_cfg, saved_fc = v4.get_current_atom_config, v4.get_forward_context
+    v4.get_current_atom_config = lambda: cfg
+    v4.get_forward_context = lambda: fc
+    try:
+        A = v4.DeepseekV4Attention
+        cases = [
+            (
+                "v4_qk_norm_rope",
+                [t.shape for t in v4._v4_qk_norm_rope_fake(q, kv_pre, positions, "L")],
+                [
+                    t.shape
+                    for t in A._qk_norm_rope(
+                        layer, q, kv_pre, positions
+                    ).custom_op_return()
+                ],
+            ),
+            (
+                "v4_attn_compress",
+                [v4._v4_attn_compress_fake(x, "L")],
+                [A._attn_compress(layer, piecewise=False, x=x)],
+            ),
+            (
+                "v4_sparse_attention",
+                [
+                    v4._v4_sparse_attention_fake(
+                        # a real Q: the fake sizes on it, not on `positions`
+                        torch.zeros(T, H, D),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        positions,
+                        None,
+                        None,
+                        None,
+                        "L",
+                    ).shape
+                ],
+                [
+                    A._sparse_attention(
+                        layer,
+                        # a real Q: the body sizes on it and asserts it is there
+                        v4.QKNormRopeOut(q_sa=torch.zeros(T, H, D)),
+                        positions,
+                    ).shape
+                ],
+            ),
+        ]
+    finally:
+        v4.get_current_atom_config, v4.get_forward_context = saved_cfg, saved_fc
+
+    for name, fake_shapes, real_shapes in cases:
+        assert fake_shapes == real_shapes, (
+            f"{name}: fake promises {fake_shapes}, body returns {real_shapes}. "
+            "These must match or the compiled graph fails on assert_size_stride."
+        )
+
+
+def test_paged_post_refuses_a_missing_q():
+    # `forward()`'s narrow branch always calls `v4_sparse_attention`, so whatever
+    # fills its Q must run on EVERY narrow path. Gating `v4_qk_norm_rope` on
+    # AF_PIECEWISE alone left plain PIECEWISE with no QK-norm at all and a None
+    # Q going into an aiter kernel -- a GPU-side failure, and invisible to every
+    # test here because none of them reach `_attn_pre`.
+    #
+    # So the shape of that mistake is asserted on the CPU side instead.
+    import types
+
+    import pytest
+
+    try:
+        from atom.models.deepseek_v4 import DeepseekV4Attention, QKNormRopeOut
+    except ImportError as e:
+        if "aiter" not in str(e) and "forward_context" not in str(e):
+            raise
+        pytest.skip(f"deepseek_v4 not importable here: {e}")
+
+    import atom.models.deepseek_v4 as v4
+
+    T, H, D = 4, 2, 64
+    layer = types.SimpleNamespace(
+        n_local_heads=H,
+        head_dim=D,
+        rope_head_dim=16,
+        kv_fp8=False,
+        compress_ratio=4,
+        skip_topk=False,
+        indexer=types.SimpleNamespace(index_topk=8),
+    )
+    # is_dummy_run False, or the short-circuit fires before the assertion.
+    fc = types.SimpleNamespace(
+        context=types.SimpleNamespace(is_dummy_run=False), attn_metadata=object()
+    )
+    saved = v4.get_forward_context
+    v4.get_forward_context = lambda: fc
+    try:
+        with pytest.raises(AssertionError, match="did not run upstream"):
+            DeepseekV4Attention._sparse_attention(
+                layer,
+                QKNormRopeOut(),  # every field None -- the broken-gate shape
+                torch.zeros(T, dtype=torch.int32),
+            )
+    finally:
+        v4.get_forward_context = saved
+
+
+def test_qk_norm_rope_shapes_match_what_the_paged_kernel_asserts():
+    # `_qkn_placeholder` feeds both the op's fake impl and the dummy_run
+    # stand-in, so comparing those two to each other proves nothing -- they were
+    # BOTH 448 wide while the real kernel produced 512, and it surfaced as
+    # `assert_size_stride` inside a compiled graph on an fp8-KV run (the bf16
+    # runs never touched that branch).
+    #
+    # So check against the CONSUMER's contract instead: the asm path of
+    # `sparse_attn_v4_paged_decode` asserts its Q on these exact constants. The
+    # 2buff packed width is NOT `head_dim - rope_head_dim` -- that is
+    # `V4_DIM_NOPE`; the packed row adds the inline e8m0 scale and padding.
+    import types
+
+    import pytest
+
+    try:
+        import atom.models.deepseek_v4 as v4
+        from atom.model_ops.v4_kernels.v4_quant import (
+            V4_DIM_NOPE,
+            V4_DIM_QK_PACKED,
+            V4_DIM_ROPE,
+        )
+    except ImportError as e:
+        if "aiter" not in str(e) and "forward_context" not in str(e):
+            raise
+        pytest.skip(f"deepseek_v4 not importable here: {e}")
+
+    assert V4_DIM_QK_PACKED != V4_DIM_NOPE, (
+        "the trap this pins is gone -- packed and nope now coincide, so "
+        "deriving one from head_dim would no longer be wrong"
+    )
+
+    T, H, D, RD = 4, 2, 512, V4_DIM_ROPE
+    q = torch.zeros(T, H * D)
+
+    def layer(kv_fp8):
+        return types.SimpleNamespace(
+            n_local_heads=H, head_dim=D, rope_head_dim=RD, kv_fp8=kv_fp8
+        )
+
+    fp8 = v4._qkn_placeholder(layer(True), q, T, zeros=True)
+    assert fp8.q_packed.shape == (T, H, V4_DIM_QK_PACKED)
+    assert fp8.q_rope.shape == (T, H, V4_DIM_ROPE)
+    assert fp8.k_packed.shape == (T, 1, V4_DIM_QK_PACKED)
+    assert fp8.k_rope.shape == (T, 1, V4_DIM_ROPE)
+    assert fp8.q_sa is None and fp8.kv is None
+
+    bf16 = v4._qkn_placeholder(layer(False), q, T, zeros=True)
+    assert bf16.q_sa.shape == (T, H, D) and bf16.kv.shape == (T, D)
+    assert bf16.q_packed is None and bf16.q_rope is None
+
+    # And the op's return list has to carry the active layout's four / two.
+    assert len(fp8.custom_op_return()) == 4
+    assert len(bf16.custom_op_return()) == 2
+
+
+# ---------------------------------------------------------------------------
+# `kv_indices_{swa,csa,hca}` carry no information in their own length
+#
+# `_attach_v4_paged_decode_meta` publishes them whole, not sliced to
+# `indptr_np[T]`. That length is a cumsum of per-token KV spans, so it varies
+# step to step at a FIXED num_tokens and no graph key pins it -- and a cudagraph
+# bakes it. Neither consumer reads it: the paged kernel walks
+# `kv_indices[indptr[t]:indptr[t+1]]`, `csa_translate_pack`'s grid comes from
+# `topk_local.shape`. Both are exercised below against an exact and an oversized
+# buffer and required to agree.
+# ---------------------------------------------------------------------------
+
+ENVELOPE_ROWS = 8
+CSA_BLOCK_CAPACITY = 64
+WINDOW_SIZE = 128
+SLACK = 97  # deliberately not a round number, and not a multiple of index_topk
+
+
+def _decode_batch(bs: int, tokens_per_seq: int, index_topk: int):
+    """A ragged decode batch: per-token spans differ, and a CG pad tail follows.
+
+    `positions` drives `skip = min(pos + 1, WINDOW_SIZE)` inline, so varying
+    them across tokens is what makes `valid_k` -- and therefore the exact
+    destination length -- data-dependent in the first place.
+    """
+    g = torch.Generator().manual_seed(bs * 1000 + tokens_per_seq)
+    t_real = bs * tokens_per_seq
+    t_pad = t_real + 3  # CG padding: batch_id -1, contributes nothing
+
+    batch_id = torch.full((t_pad,), -1, dtype=torch.int32)
+    batch_id[:t_real] = torch.repeat_interleave(
+        torch.arange(bs, dtype=torch.int32), tokens_per_seq
+    )
+    positions = torch.zeros(t_pad, dtype=torch.int32)
+    positions[:t_real] = torch.randint(
+        WINDOW_SIZE, WINDOW_SIZE * 6, (t_real,), generator=g, dtype=torch.int32
+    )
+
+    # Slice length per token = skip + valid_k, with valid_k ragged across tokens.
+    skip = torch.minimum(
+        positions[:t_real].to(torch.int64) + 1, torch.tensor(WINDOW_SIZE)
+    )
+    valid_k = torch.randint(1, index_topk + 1, (t_real,), generator=g)
+    spans = torch.zeros(t_pad, dtype=torch.int64)
+    spans[:t_real] = skip + valid_k
+
+    indptr = torch.zeros(t_pad + 1, dtype=torch.int32)
+    indptr[1:] = torch.cumsum(spans, 0).to(torch.int32)
+
+    topk_local = torch.randint(
+        0, CSA_BLOCK_CAPACITY * 4, (t_pad, index_topk), generator=g, dtype=torch.int32
+    )
+    block_tables = torch.randint(
+        1, 5000, (max(bs, 1), 16), generator=g, dtype=torch.int32
+    )
+    return topk_local, block_tables, positions, indptr, batch_id, int(indptr[t_pad])
+
+
+def _run_writer(dest_len: int, batch) -> torch.Tensor:
+    from atom.model_ops.v4_kernels.csa_translate_pack import (
+        csa_translate_pack_reference,
+    )
+
+    topk_local, block_tables, positions, indptr, batch_id, _ = batch
+    dest = torch.full((dest_len,), -7, dtype=torch.int32)
+    csa_translate_pack_reference(
+        topk_local,
+        block_tables,
+        positions,
+        indptr,
+        batch_id,
+        None,
+        dest,
+        envelope_rows=ENVELOPE_ROWS,
+        csa_block_capacity=CSA_BLOCK_CAPACITY,
+        window_size=WINDOW_SIZE,
+    )
+    return dest
+
+
+def test_writer_ignores_the_destination_length():
+    batch = _decode_batch(bs=5, tokens_per_seq=6, index_topk=32)
+    exact = batch[-1]
+
+    tight = _run_writer(exact, batch)
+    loose = _run_writer(exact + SLACK, batch)
+
+    torch.testing.assert_close(loose[:exact], tight)
+    assert torch.all(loose[exact:] == -7), (
+        "an oversized destination must leave its tail untouched -- a writer that "
+        "sized anything off `kv_indices.numel()` would have scribbled into it"
+    )
+
+
+def test_writer_is_length_invariant_across_shapes():
+    """The same, over batch shapes whose exact lengths differ widely."""
+    for bs, tokens_per_seq, index_topk in [
+        (1, 1, 16),
+        (3, 4, 32),
+        (8, 6, 64),
+        (17, 2, 128),
+    ]:
+        batch = _decode_batch(bs, tokens_per_seq, index_topk)
+        exact = batch[-1]
+        tight = _run_writer(exact, batch)
+        loose = _run_writer(exact + SLACK, batch)
+        torch.testing.assert_close(
+            loose[:exact],
+            tight,
+            msg=f"bs={bs} tokens_per_seq={tokens_per_seq} topk={index_topk}",
+        )
+
+
+def test_reader_ignores_the_indices_length():
+    """Attention output is identical over an exact vs an oversized `kv_indices`.
+
+    The oversized tail is filled with in-range but WRONG slot ids, so a reader
+    that walked past `indptr[T]` would change its answer rather than fault.
+    """
+    torch.manual_seed(0)
+    t, heads, dim, pages = 6, 4, 32, 512
+
+    spans = torch.tensor([3, 1, 7, 0, 4, 2])
+    indptr = torch.zeros(t + 1, dtype=torch.int32)
+    indptr[1:] = torch.cumsum(spans, 0).to(torch.int32)
+    exact = int(indptr[t])
+
+    q = torch.randn(t, heads, dim)
+    unified_kv = torch.randn(pages, dim)
+    attn_sink = torch.randn(heads)
+    tight = torch.randint(0, pages, (exact,), dtype=torch.int32)
+    loose = torch.cat([tight, torch.randint(0, pages, (SLACK,), dtype=torch.int32)])
+
+    from atom.model_ops.v4_kernels.paged_decode import (
+        sparse_attn_v4_paged_decode_reference,
+    )
+
+    out_tight = sparse_attn_v4_paged_decode_reference(
+        q, unified_kv, tight, indptr, attn_sink, dim**-0.5
+    )
+    out_loose = sparse_attn_v4_paged_decode_reference(
+        q, unified_kv, loose, indptr, attn_sink, dim**-0.5
+    )
+    torch.testing.assert_close(out_tight, out_loose)
+
+
+def test_a_void_op_survives_only_because_split_ops_are_not_compiled():
+    # `v4_attn_compress` returns nothing. That is only safe because a split op's
+    # submodule is the one piece the backend leaves uncompiled --
+    # `submod_names_to_compile` excludes `is_splitting_graph` -- so it never
+    # reaches AOT autograd, which is the layer that drops an effect-free call.
+    #
+    # Both halves of that are pinned here: the DCE layer, and the exclusion. Get
+    # either wrong and the compressor silently stops running, with no error.
+    import torch
+
+    from atom.utils.custom_register import direct_register_custom_op
+
+    calls = []
+
+    def _op(x: torch.Tensor) -> None:
+        calls.append(1)
+
+    def _fake(x: torch.Tensor) -> None:
+        return None
+
+    direct_register_custom_op(
+        op_name="_void_probe", op_func=_op, mutates_args=[], fake_impl=_fake
+    )
+
+    def f(x):
+        torch.ops.aiter._void_probe(x)
+        return x * 2
+
+    if not torch.cuda.is_available():
+        import pytest
+
+        pytest.skip("the op registers a CUDA kernel")
+    x = torch.randn(8, device="cuda")
+    seen = {}
+    for backend in ("eager", "aot_eager"):
+        g = torch.compile(f, backend=backend, dynamic=False)
+        g(x)
+        calls.clear()
+        g(x)
+        seen[backend] = len(calls)
+        torch._dynamo.reset()
+    assert seen["eager"] == 1, "Dynamo alone keeps it; if not, the premise moved"
+    assert seen["aot_eager"] == 0, (
+        "AOT no longer drops an effect-free op -- then a void op would be safe "
+        "anywhere and `v4_attn_compress` need not stay a split op"
+    )
+
+    import inspect
+
+    from atom.utils import backends
+
+    src = inspect.getsource(backends)
+    assert "if not item.is_splitting_graph" in src, (
+        "the backend no longer excludes split-op submodules from compilation, "
+        "so `v4_attn_compress` would go through AOT and be DCE'd"
+    )
+
+
+def test_sparse_attention_sizes_on_the_q_not_positions():
+    # The attention output feeds the mHC residual stream, which is sized by the
+    # hidden state. The Q descends from the hidden state, `positions` does not
+    # have to: under `--enable-dp-attention` a step where any rank is prefilling
+    # takes the variable-length path and the two counts can differ. Sizing on
+    # `positions` then surfaced as an aiter `residual_in shape mismatch` deep
+    # inside a compiled piece -- expected 6, got 5 -- with nothing near the
+    # cause. Both the body and the fake are pinned, since disagreeing is its own
+    # class of failure.
+    import types
+
+    import pytest
+
+    try:
+        import atom.models.deepseek_v4 as v4
+    except ImportError as e:
+        if "aiter" not in str(e) and "forward_context" not in str(e):
+            raise
+        pytest.skip(f"deepseek_v4 not importable here: {e}")
+
+    T_Q, T_POS, H, D = 5, 6, 2, 64  # deliberately different
+    layer = types.SimpleNamespace(
+        n_local_heads=H, head_dim=D, rope_head_dim=16, kv_fp8=False
+    )
+    qkn = v4.QKNormRopeOut(q_sa=torch.zeros(T_Q, H, D), kv=torch.zeros(T_Q, D))
+    positions = torch.zeros(T_POS, dtype=torch.int32)
+
+    cfg = types.SimpleNamespace(
+        compilation_config=types.SimpleNamespace(static_forward_context={"L": layer})
+    )
+    fc = types.SimpleNamespace(context=types.SimpleNamespace(is_dummy_run=True))
+    saved_cfg, saved_fc = v4.get_current_atom_config, v4.get_forward_context
+    v4.get_current_atom_config, v4.get_forward_context = (lambda: cfg), (lambda: fc)
+    try:
+        body = v4.DeepseekV4Attention._sparse_attention(layer, qkn, positions)
+        fake = v4._v4_sparse_attention_fake(
+            qkn.q_sa, qkn.kv, None, None, None, None, positions, None, None, None, "L"
+        )
+    finally:
+        v4.get_current_atom_config, v4.get_forward_context = saved_cfg, saved_fc
+
+    assert body.shape == (T_Q, H * D), f"body followed positions: {body.shape}"
+    assert fake.shape == (T_Q, H * D), f"fake followed positions: {fake.shape}"

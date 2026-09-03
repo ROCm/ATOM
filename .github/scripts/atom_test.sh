@@ -445,7 +445,7 @@ if [ "$TYPE" == "benchmark" ]; then
     source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/aiperf_agentic.sh"
     agentic_prepare
   else
-    BENCH_MAX_MIN=60
+    BENCH_MAX_MIN=${ATOM_BENCHMARK_MAX_MINUTES:-60}
     # Build the benchmark command as an array so the printed command is exactly
     # what runs (no echo/cmd drift). $PROFILE_ARG and $BENCH_EXTRA_ARGS stay
     # unquoted so they word-split into 0+ args, matching the previous behavior.
@@ -484,12 +484,17 @@ if [ "$TYPE" == "benchmark" ]; then
   set +m
 
   echo "========== Supervising benchmark with wait_infer_drain.sh =========="
-  # See accuracy block above for STUCK_POLLS=18 rationale.
-  # MAX_MIN=60: high-concurrency long-context runs (e.g. DP-attention 8k/1k
-  # c=1024 with num_prompts=conc*10) take ~48 min wall (warmup + 10240 reqs);
-  # 30 min cut them off mid-run (drain exit 4). Real hangs/faults still
-  # surface fast via STUCK_POLLS / fault detection, not MAX_MIN.
-  bash scripts/wait_infer_drain.sh ${ATOM_SERVER_PORT} "$BENCH_MAX_MIN" 10 "$ATOM_CLIENT_LOG" 18
+  # Drain budget: BENCH_KIND picks the default -- 60 min for the random sweep,
+  # and for the agentic replay `agentic_prepare` derives it from the trace
+  # duration (must stay below the workflow step's `timeout-minutes`).
+  # Per-model overrides from models.json: ATOM_BENCHMARK_MAX_MINUTES raises the
+  # budget for long random cases (e.g. 8k/1k high concurrency);
+  # ATOM_BENCHMARK_STUCK_POLLS widens the stuck window (default 18 x POLL_SEC
+  # = 3 min) -- see the accuracy block above for the rationale.
+  benchmark_stuck_polls=${ATOM_BENCHMARK_STUCK_POLLS:-18}
+  bash scripts/wait_infer_drain.sh \
+    ${ATOM_SERVER_PORT} "$BENCH_MAX_MIN" 10 \
+    "$ATOM_CLIENT_LOG" "$benchmark_stuck_polls"
   DRAIN_RC=$?
   if [ "$DRAIN_RC" -ne 0 ]; then
     echo "wait_infer_drain.sh exit=$DRAIN_RC — killing benchmark pgid $CLIENT_PID"

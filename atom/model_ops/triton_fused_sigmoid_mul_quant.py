@@ -5,12 +5,12 @@ single Triton kernel. The output can be passed directly to
 ``LinearBase.forward(x_fp8, x_scale=scale)`` to skip the internal quant step.
 """
 
+import aiter
 import torch
-from torch import Tensor
 import triton
 import triton.language as tl
-
-import aiter
+from aiter import QuantType
+from torch import Tensor
 
 fp8_dtype = aiter.dtypes.fp8
 
@@ -116,13 +116,100 @@ def _fused_sigmoid_mul_fp8_group_quant_kernel(
         )
 
 
+@triton.jit
+def _fused_sigmoid_mul_fp8_per_token_quant_kernel(
+    # Input pointers
+    attn_ptr,
+    gate_ptr,
+    # Output pointers
+    out_fp8_ptr,
+    out_scale_ptr,
+    # Strides
+    stride_attn_m,
+    stride_attn_n,
+    stride_gate_m,
+    stride_gate_n,
+    stride_fp8_m,
+    stride_fp8_n,
+    # Dimensions
+    N,
+    # Constexprs
+    BLOCK: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    FP8_MIN: tl.constexpr,
+):
+    # One program owns one token row: the whole row is loaded in a single BLOCK
+    # (BLOCK = next_pow2(N)), so the amax reduces to a single per-token scale
+    # without a cross-block reduction. This is the ptpc / a8w8 per-token scheme
+    # (one scale per row), as opposed to the per-1x128 block scheme above.
+    pid_m = tl.program_id(0)
+    stride_attn_m = tl.cast(stride_attn_m, tl.int64)
+    stride_gate_m = tl.cast(stride_gate_m, tl.int64)
+    stride_fp8_m = tl.cast(stride_fp8_m, tl.int64)
+
+    cols = tl.arange(0, BLOCK)
+    mask = cols < N
+    attn = tl.load(
+        attn_ptr + pid_m * stride_attn_m + cols * stride_attn_n, mask=mask, other=0.0
+    ).to(tl.float32)
+    gate = tl.load(
+        gate_ptr + pid_m * stride_gate_m + cols * stride_gate_n, mask=mask, other=0.0
+    ).to(tl.float32)
+
+    x = tl.sigmoid(gate) * attn
+    amax = tl.max(tl.abs(x))
+    scale_out = tl.maximum(amax, 1e-10) / FP8_MAX
+    x_fp8 = tl.clamp(x / scale_out, FP8_MIN, FP8_MAX)
+
+    tl.store(
+        out_fp8_ptr + pid_m * stride_fp8_m + cols * stride_fp8_n,
+        x_fp8.to(out_fp8_ptr.dtype.element_ty),
+        mask=mask,
+    )
+    tl.store(out_scale_ptr + pid_m, scale_out)
+
+
+def _fused_sigmoid_mul_fp8_per_token_quant(
+    attn_output: Tensor, gate: Tensor
+) -> tuple[Tensor, Tensor]:
+    """Per-token variant: one FP8 scale per row (amax over the full N).
+
+    Returns ``(x_fp8 [M, N], x_scale [M, 1] float32)`` ready for an a8w8
+    per-token GEMM's ``x_scale=`` path (Kimi-K3 o_proj under ptpc_fp8).
+    """
+    M, N = attn_output.shape
+    out_fp8 = torch.empty((M, N), dtype=fp8_dtype, device=attn_output.device)
+    out_scale = torch.empty((M, 1), dtype=torch.float32, device=attn_output.device)
+    if M == 0:
+        return out_fp8, out_scale
+    BLOCK = triton.next_power_of_2(N)
+    _fused_sigmoid_mul_fp8_per_token_quant_kernel[(M,)](
+        attn_output,
+        gate,
+        out_fp8,
+        out_scale,
+        attn_output.stride(0),
+        attn_output.stride(1),
+        gate.stride(0),
+        gate.stride(1),
+        out_fp8.stride(0),
+        out_fp8.stride(1),
+        N=N,
+        BLOCK=BLOCK,
+        FP8_MAX=DTYPE_MAX,
+        FP8_MIN=DTYPE_MIN,
+    )
+    return out_fp8, out_scale
+
+
 def fused_sigmoid_mul_fp8_quant(
     attn_output: Tensor,
     gate: Tensor,
     group_size: int = 128,
     transpose_scale: bool | None = None,
+    per_token: bool = False,
 ) -> tuple[Tensor, Tensor]:
-    """Fused sigmoid(gate) * attn_output + FP8 per-group quantization.
+    """Fused sigmoid(gate) * attn_output + FP8 quantization.
 
     Args:
         attn_output: [M, N] bf16/fp16 — attention output tensor.
@@ -131,12 +218,17 @@ def fused_sigmoid_mul_fp8_quant(
         transpose_scale: If True, produce column-major x_scale (for preshuffle GEMM).
                          If False, produce row-major x_scale (for non-preshuffle GEMM).
                          If None (default), follows ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE env var.
+        per_token: If True, produce a single per-token (per-row) scale [M, 1]
+                   (a8w8 ptpc scheme) instead of per-``group_size`` block scales.
+                   ``group_size``/``transpose_scale`` are ignored in this mode.
 
     Returns:
         (x_fp8, x_scale):
             x_fp8: [M, N] FP8 — quantized sigmoid(gate) * attn_output.
-            x_scale: [M, N // group_size] float32 — per-group scales.
+            x_scale: per-token mode -> [M, 1]; per-group mode -> [M, N // group_size].
     """
+    if per_token:
+        return _fused_sigmoid_mul_fp8_per_token_quant(attn_output, gate)
     if transpose_scale is None:
         from atom.utils import envs
 
@@ -194,3 +286,48 @@ def fused_sigmoid_mul_fp8_quant(
         out_scale = out_scale.view(M, num_scale_cols)
 
     return out_fp8, out_scale
+
+
+def fused_sigmoid_mul_maybe_quant(
+    attn_output: Tensor,
+    gate: Tensor,
+    quant: bool = False,
+    quant_type_value: int = QuantType.per_Token.value,
+    transpose_scale: bool | None = None,
+) -> tuple[Tensor, Tensor | None]:
+    """sigmoid(gate) * attn_output, optionally fused with FP8 quant.
+
+    Unifies the quant and non-quant paths behind one call site so the caller
+    always does ``o_proj(x, x_scale=scale)``:
+
+    - ``quant=False``: return ``(sigmoid(gate) * attn_output bf16, None)``. The
+      ``None`` scale makes ``o_proj(x, x_scale=None)`` fall back to its own
+      standalone activation quant.
+    - ``quant=True``: fuse sigmoid(gate) * attn_output + FP8 quant into one
+      Triton kernel and return ``(x_fp8, x_scale)`` for o_proj's ``x_scale=``
+      path. ``quant_type_value`` selects the scheme:
+      ``QuantType.per_Token.value`` -> a8w8 per-token scale ``[M, 1]`` (Kimi-K3
+      o_proj under ptpc_fp8); ``QuantType.per_1x128.value`` -> per-1x128 block
+      scales (``transpose_scale`` controls their layout, as in
+      :func:`fused_sigmoid_mul_fp8_quant`).
+
+    Takes the ``int`` ``QuantType.value``, not a ``QuantType``: Dynamo graph-breaks
+    comparing the pybind11 type inside a traced ``forward``.
+    """
+    if not quant:
+        return attn_output * torch.sigmoid(gate), None
+    if quant_type_value == QuantType.per_Token.value:
+        return fused_sigmoid_mul_fp8_quant(attn_output, gate, per_token=True)
+    if quant_type_value == QuantType.per_1x128.value:
+        return fused_sigmoid_mul_fp8_quant(
+            attn_output,
+            gate,
+            group_size=128,
+            transpose_scale=transpose_scale,
+            per_token=False,
+        )
+    raise ValueError(
+        f"fused_sigmoid_mul_maybe_quant: unsupported quant_type_value "
+        f"{quant_type_value}; expected QuantType.per_Token.value "
+        "or QuantType.per_1x128.value"
+    )

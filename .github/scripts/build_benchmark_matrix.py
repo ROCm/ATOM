@@ -37,6 +37,7 @@ DEFAULT_PARAM_LISTS = "1024,1024,128,0.8"
 RESERVED_INPUTS = {
     "agentic",
     "agentic_duration",
+    "agentic_concurrency",
     "extra_args",
     "image",
     "runner",
@@ -105,12 +106,36 @@ def main() -> int:
         param_lists = None
     else:
         bench_kinds = {"random"}
+
+    # `agentic_concurrency` narrows the replay to the picked point(s) of the
+    # curve. Agentic-only on purpose: a cell is ~1h of 8-GPU time, so re-running
+    # one point instead of the 9-cell set is the difference between an hour and
+    # most of a day. The random sweep is cheap per cell and already has
+    # `param_lists` for that, so the filter never touches it.
+    conc_filter = None
+    if "aiperf_agentic" in bench_kinds:
+        picked = str(inputs.get("agentic_concurrency") or "all").strip()
+        if picked and picked != "all":
+            conc_filter = {int(c) for c in picked.split(",") if c.strip()}
+
     configs = build_cell_configs(
         CATALOG,
         param_lists=param_lists,
         model_filter=model_filter,
         bench_kind_filter=bench_kinds,
+        conc_filter=conc_filter,
     )
+    if conc_filter and not configs:
+        # Every agentic concurrency sits inside exactly one variant's band, so
+        # an empty matrix here means the dropdown and the catalog disagree.
+        # Fail loudly: `has_cells=false` would just skip the run in silence.
+        print(
+            f"ERROR: no agentic cells at concurrency {sorted(conc_filter)}; "
+            f"the dropdown in atom-benchmark.yaml and the scenario "
+            f"concurrency lists in {CATALOG} are out of sync.",
+            file=sys.stderr,
+        )
+        return 1
     _emit(configs)
 
     n_cells = sum(len(json.loads(c["concurrency"])) for c in configs)

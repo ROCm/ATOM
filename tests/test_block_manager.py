@@ -558,6 +558,24 @@ class TestDecodeBlockHashing:
 
 
 class TestRegisterReceivedPrefix:
+    @staticmethod
+    def _dcp_block_manager(monkeypatch):
+        cfg = MockConfig(
+            num_kvcache_blocks=12,
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            enable_prefix_caching=True,
+        )
+        bm = BlockManager(cfg)
+        # Allocation normally asks dcp_ops for each rank's local token count.
+        # These scheduler tests only need the equivalent virtual-block count.
+        monkeypatch.setattr(
+            bm,
+            "num_pool_blocks",
+            lambda seq_len: (seq_len + bm.hash_block_size - 1) // bm.hash_block_size,
+        )
+        return bm
+
     def test_registers_full_prompt_blocks_enabling_next_turn_hit(
         self, block_manager_prefix, seq_factory
     ):
@@ -583,3 +601,55 @@ class TestRegisterReceivedPrefix:
         a = seq_factory(list(range(1, 11)))  # 10 tokens, bs=4 -> 2 full + partial
         bm.allocate(a)
         assert bm.register_received_prefix(a) == 2
+
+    def test_dcp_registers_at_hash_block_granularity(self, seq_factory, monkeypatch):
+        bm = self._dcp_block_manager(monkeypatch)
+        assert bm.block_size == 4
+        assert bm.hash_block_size == 8
+
+        seq = seq_factory(list(range(20)))
+        bm.allocate(seq)
+
+        assert bm.register_received_prefix(seq) == 2
+        assert seq.num_hashed_tokens == 16
+        assert seq.prefix_hashes_published is True
+        assert list(bm.kv.block(seq.block_table[0]).token_ids) == list(range(8))
+        assert list(bm.kv.block(seq.block_table[1]).token_ids) == list(range(8, 16))
+        assert bm.kv.block(seq.block_table[2]).hash == -1
+
+    def test_dcp_registers_only_suffix_after_local_cache_hit(
+        self, seq_factory, monkeypatch
+    ):
+        bm = self._dcp_block_manager(monkeypatch)
+
+        cached = seq_factory(list(range(16)))
+        bm.allocate(cached)
+        bm.hash_blocks(cached, cached.num_prompt_tokens)
+        bm.deallocate(cached)
+
+        received = seq_factory(list(range(32)))
+        num_cached_blocks = bm.can_allocate(received)
+        assert num_cached_blocks == 2
+        bm.allocate(received, num_cached_blocks)
+        cached_hashes = [
+            bm.kv.block(block_id).hash for block_id in received.block_table[:2]
+        ]
+        computed_token_groups = []
+        compute_hash = bm.compute_hash
+
+        def tracked_compute_hash(token_ids, prefix=-1):
+            computed_token_groups.append(list(token_ids))
+            return compute_hash(token_ids, prefix)
+
+        monkeypatch.setattr(bm, "compute_hash", tracked_compute_hash)
+
+        assert bm.register_received_prefix(received) == 2
+        assert received.num_cached_tokens == 16
+        assert received.num_hashed_tokens == 32
+        assert computed_token_groups == [list(range(16, 24)), list(range(24, 32))]
+        assert [
+            bm.kv.block(block_id).hash for block_id in received.block_table[:2]
+        ] == cached_hashes
+        assert all(
+            bm.kv.block(block_id).hash != -1 for block_id in received.block_table[2:]
+        )

@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
-"""DCP sparse index filter: a global top-k -> this rank's compacted slot list.
+"""DCP sparse PREFILL index filter: a top-k -> this rank's compacted slot list.
 
-Both halves of the same kernel family in ``atom/model_ops/dcp_ops.py``:
-
-  * decode  -- ``triton_filter_and_convert_dcp_index``
-  * prefill -- ``triton_filter_and_convert_dcp_index_prefill``
+Covers ``triton_filter_and_convert_dcp_index_prefill`` in
+``atom/model_ops/dcp_ops.py``. Decode had a twin until the fused merge
+(``aiter.flydsl_dcp_topk_merge``) took over, emitting this rank's owned slots
+directly with nothing left to filter; its tests live in test_dcp_topk.py.
 
 Why the checks go past "it does not crash": ``cp_lse_ag_out_rs`` rebuilds a
 global softmax out of per-rank partial attentions, and that is only valid when
@@ -31,10 +31,7 @@ import torch
 
 try:
     from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
-    from atom.model_ops.dcp_ops import (
-        triton_filter_and_convert_dcp_index,
-        triton_filter_and_convert_dcp_index_prefill,
-    )
+    from atom.model_ops.dcp_ops import triton_filter_and_convert_dcp_index_prefill
 except ImportError as _e:  # triton/aiter absent on a CPU-only runner
     pytest.skip(f"requires full atom import env: {_e}", allow_module_level=True)
 
@@ -66,194 +63,13 @@ def writer_slot(block_table_row, pos, rank, world, page, interleave=1):
     )
 
 
-# ─────────────────────────────────────────────────────────────── decode side ──
-
-DEC_W = 4  # dcp world size
-DEC_K = 256  # NUM_TOPK_TOKENS (must be a multiple of BLOCK_N=128)
-DEC_PAGE = 16  # runner physical block size
-
-
-def _build_decode_case(g_ctxs, max_blocks, seed):
-    """Random global top-k selections + block table for the given contexts."""
-    gen = torch.Generator().manual_seed(seed)
-    bs = len(g_ctxs)
-
-    qo_indptr = torch.arange(bs + 1, dtype=torch.int32)
-    global_kv_indptr = torch.zeros(bs + 1, dtype=torch.int32)
-    global_kv_indptr[1:] = torch.cumsum(torch.tensor(g_ctxs), 0).to(torch.int32)
-
-    # Physical blocks are deliberately shuffled so a wrong slot formula cannot
-    # accidentally match a "logical == physical" identity mapping.
-    block_table = (
-        torch.randperm(bs * max_blocks, generator=gen)[: bs * max_blocks]
-        .reshape(bs, max_blocks)
-        .to(torch.int32)
-    )
-
-    token_indices = torch.full((bs, DEC_K), -1, dtype=torch.int32)
-    for b, g in enumerate(g_ctxs):
-        n = min(g, DEC_K)
-        # distinct global positions in [0, g), in the indexer's (arbitrary) order
-        picks = torch.randperm(g, generator=gen)[:n]
-        token_indices[b, :n] = picks.to(torch.int32)
-    return qo_indptr, global_kv_indptr, block_table, token_indices
-
-
-def _decode_reference(g_ctxs, block_table, token_indices, rank, interleave=1):
-    """Expected compacted slots per request, taken from the write side."""
-    out = []
-    for b, g in enumerate(g_ctxs):
-        n = min(g, DEC_K)
-        slots = []
-        for c in range(n):
-            tok = int(token_indices[b, c])
-            if tok < 0:
-                continue
-            # ownership AND placement both come from the writer
-            slot = writer_slot(block_table[b], tok, rank, DEC_W, DEC_PAGE, interleave)
-            if slot >= 0:
-                slots.append(slot)
-        out.append(slots)
-    return out
-
-
-@pytest.mark.parametrize(
-    "name, g_ctxs, seed",
-    [
-        ("short ctx (< topk)", [13], 1),
-        ("multi-request mixed", [13, 100, 7, 300], 2),
-        ("ctx > topk (clipped)", [1000, 4096], 3),
-        ("page boundary", [DEC_PAGE * DEC_W, DEC_PAGE * DEC_W + 1], 4),
-        # ctx=2 with W=4 leaves ranks 2 and 3 owning nothing for that request.
-        ("zero-owned ranks", [2, 1], 5),
-    ],
-)
-def test_decode_filter(name, g_ctxs, seed):
-    bs = len(g_ctxs)
-    max_blocks = max(1, (max(g_ctxs) + DEC_PAGE * DEC_W - 1) // (DEC_PAGE * DEC_W)) + 1
-    qo_indptr, global_kv_indptr, block_table, token_indices = _build_decode_case(
-        g_ctxs, max_blocks, seed
-    )
-
-    qo_g = qo_indptr.to(DEV)
-    gkv_g = global_kv_indptr.to(DEV)
-    bt_g = block_table.to(DEV)
-    ti_g = token_indices.to(DEV)
-
-    per_rank_lens = []
-    for rank in range(DEC_W):
-        out_buf = torch.full((bs * DEC_K,), -999, dtype=torch.int32, device=DEV)
-        out_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=DEV)
-        counts = torch.zeros(bs, dtype=torch.int32, device=DEV)
-
-        triton_filter_and_convert_dcp_index(
-            qo_g,
-            gkv_g,
-            bt_g,
-            ti_g,
-            rank,
-            DEC_W,
-            DEC_PAGE,
-            out_kv_indptr=out_indptr,
-            owned_counts=counts,
-            NUM_TOPK_TOKENS=DEC_K,
-            out=out_buf,
-        )
-        torch.cuda.synchronize()
-
-        exp = _decode_reference(g_ctxs, block_table, token_indices, rank)
-        indptr = out_indptr.cpu().tolist()
-
-        for b in range(bs):
-            got_len = indptr[b + 1] - indptr[b]
-            assert got_len == len(exp[b]), (
-                f"[{name}] rank{rank} req{b}: region length {got_len} "
-                f"!= {len(exp[b])}"
-            )
-        for b in range(bs):
-            got = out_buf[indptr[b] : indptr[b + 1]].cpu().tolist()
-            assert got == exp[b], f"[{name}] rank{rank} req{b}: {got} != {exp[b]}"
-
-        written = out_buf[: indptr[bs]]
-        assert (
-            int((written < 0).sum()) == 0
-        ), f"[{name}] rank{rank}: -1 hole inside the compacted region"
-
-        per_rank_lens.append([indptr[b + 1] - indptr[b] for b in range(bs)])
-
-    # Partition: every valid top-k token is claimed by exactly one rank.
-    # Checked on COUNTS, not on slot values -- slots are per-rank local
-    # addresses (each rank holds its own 1/W KV shard), so equal slot numbers
-    # across ranks are expected and carry no information. Counts summing to n
-    # rules out both dropped and double-claimed tokens, which is what
-    # cp_lse_ag_out_rs needs.
-    for b, g in enumerate(g_ctxs):
-        n = min(g, DEC_K)
-        total = sum(per_rank_lens[rank][b] for rank in range(DEC_W))
-        assert total == n, f"[{name}] req{b}: kept {total} of {n} top-k tokens"
-
-
-@pytest.mark.parametrize("interleave", [2, 4])  # both divide DEC_PAGE=16
-@pytest.mark.parametrize(
-    "g_ctxs, seed",
-    [([13, 100, 7, 300], 12), ([1000, 4096], 13), ([DEC_PAGE * DEC_W + 1], 14)],
-)
-def test_decode_filter_block_interleave(interleave, g_ctxs, seed):
-    """Same partition + writer-agreement checks as test_decode_filter, but with
-    block-level interleave S>1 (cp_kv_cache_interleave_size). The reference
-    slots come from the same _dcp_round_robin_slot writer, now with S, so the
-    filter kernel's owner/offset math is pinned to the write side at S>1."""
-    bs = len(g_ctxs)
-    max_blocks = max(1, (max(g_ctxs) + DEC_PAGE * DEC_W - 1) // (DEC_PAGE * DEC_W)) + 1
-    qo_indptr, global_kv_indptr, block_table, token_indices = _build_decode_case(
-        g_ctxs, max_blocks, seed
-    )
-    qo_g = qo_indptr.to(DEV)
-    gkv_g = global_kv_indptr.to(DEV)
-    bt_g = block_table.to(DEV)
-    ti_g = token_indices.to(DEV)
-
-    per_rank_lens = []
-    for rank in range(DEC_W):
-        out_buf = torch.full((bs * DEC_K,), -999, dtype=torch.int32, device=DEV)
-        out_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=DEV)
-        counts = torch.zeros(bs, dtype=torch.int32, device=DEV)
-
-        triton_filter_and_convert_dcp_index(
-            qo_g,
-            gkv_g,
-            bt_g,
-            ti_g,
-            rank,
-            DEC_W,
-            DEC_PAGE,
-            out_kv_indptr=out_indptr,
-            owned_counts=counts,
-            NUM_TOPK_TOKENS=DEC_K,
-            out=out_buf,
-            cp_kv_cache_interleave_size=interleave,
-        )
-        torch.cuda.synchronize()
-
-        exp = _decode_reference(g_ctxs, block_table, token_indices, rank, interleave)
-        indptr = out_indptr.cpu().tolist()
-        for b in range(bs):
-            got = out_buf[indptr[b] : indptr[b + 1]].cpu().tolist()
-            assert got == exp[b], f"S={interleave} rank{rank} req{b}: {got} != {exp[b]}"
-        assert int((out_buf[: indptr[bs]] < 0).sum()) == 0, "-1 hole in region"
-        per_rank_lens.append([indptr[b + 1] - indptr[b] for b in range(bs)])
-
-    for b, g in enumerate(g_ctxs):
-        n = min(g, DEC_K)
-        total = sum(per_rank_lens[rank][b] for rank in range(DEC_W))
-        assert total == n, f"S={interleave} req{b}: kept {total} of {n}"
-
-
 # ────────────────────────────────────────────────────────────── prefill side ──
 
-PRE_W = 8
+PRE_W = 8  # overridden per-test below
 PRE_PAGE = 16
-PRE_TOPK = 256  # multiple of BLOCK_N=128; production runs index_topk=2048
+PRE_TOPK = (
+    256  # multiple of BLOCK_N=128; production runs index_topk=2048 (see the prod case)
+)
 
 
 def _build_prefill_case(seq_lens):
@@ -348,11 +164,14 @@ def _run_prefill(case, interleave=1):
     return per_rank
 
 
+@pytest.mark.parametrize("world", [8, 4, 2])  # production ships dcp8; 4/2 untested
 @pytest.mark.parametrize("interleave", [1, 4])  # 4 divides PRE_PAGE=16
 @pytest.mark.parametrize(
     "seq_lens", [[400], [300, 240], [17, 5, 1]], ids=["single", "two-seq", "tiny"]
 )
-def test_prefill_filter(seq_lens, interleave):
+def test_prefill_filter(seq_lens, interleave, world):
+    global PRE_W
+    PRE_W = world
     case = _build_prefill_case(np.asarray(seq_lens, dtype=np.int32))
     per_rank = _run_prefill(case, interleave)
 
@@ -397,21 +216,20 @@ def test_prefill_filter(seq_lens, interleave):
                 if owner == r
             ]
 
-            # Contract: a row this rank owns nothing of stays
-            # EMPTY -- no dummy candidate is injected. mla_decode_fwd accepts a
-            # zero-length region and writes lse=-inf; the caller zeroes the
-            # matching NaN `o`. So the region must be exactly length 0 and
-            # owned_counts must report 0.
+            # Contract: a row this rank owns nothing of gets one valid dummy
+            # slot so persistent MLA metadata never sees a zero-length row.
+            # owned_counts remains 0, allowing the caller to replace its
+            # attention result with O=0/LSE=-inf before the DCP merge.
             # Counted off the kernel's own indptr, never off the reference:
             # summing the reference's per-rank splits would reproduce `want` by
             # construction and assert nothing.
-            n_claimed += len(slots)
+            n_claimed += int(cnts[t])
 
             if not exp_slots:
                 n_empty += 1
-                assert len(slots) == 0 and cnts[t] == 0, (
-                    f"token={t} rank={r}: unowned row must stay empty, got "
-                    f"len={len(slots)} count={cnts[t]}"
+                assert list(slots) == [0] and cnts[t] == 0, (
+                    f"token={t} rank={r}: unowned row must hold one dummy, got "
+                    f"slots={list(slots)} count={cnts[t]}"
                 )
                 continue
 

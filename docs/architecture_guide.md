@@ -180,7 +180,8 @@ The `Sequence` class (in `atom/model_engine/sequence.py`) is the central data st
 | `num_prompt_tokens` | `int` | Length of the original prompt |
 | `num_tokens` | `int` (property) | Total length including generated tokens |
 | `block_table` | `list[int]` | KV cache block IDs allocated to this sequence |
-| `per_req_cache_group` | `int` | Per-request stateful-attention slot index (currently used by hybrid Qwen3-Next / Qwen3.5 GDN layers; future stateful attentions plug in via the same mechanism); `-1` if unallocated or not a stateful-attention model |
+| `state_slots` | `list[int]` | Every per-request stateful-attention slot the sequence holds: `[0]` committed, `[1:]` speculation rollback (Qwen3-Next / Qwen3.5 GDN layers, Kimi-K3 KDA, the DeepSeek-V4 compressor ring; future stateful attentions plug in via the same mechanism). Empty if unallocated or not a stateful-attention model |
+| `state_slot` | `int` (property) | `state_slots[0]`, or `-1` — the slot the forward reads and writes |
 | `status` | `SequenceStatus` | Current lifecycle state |
 | `type` | `SequenceType` | Current execution type |
 | `temperature` | `float` | Sampling temperature |
@@ -260,6 +261,7 @@ Each attention backend provides its own `prepare_mtp_decode()` implementation:
 | `atom/model_engine/engine_core_mgr.py` | `CoreManager` ZMQ orchestration, process launching, load-balanced DP dispatch |
 | `atom/model_engine/model_runner.py` | `ModelRunner` per-GPU execution (model loading, CUDA graph capture, forward pass), `tokenIDProcessor` deferred output handling |
 | `atom/model_engine/scheduler.py` | `Scheduler` prefill-first scheduling, `ScheduledBatch` batch descriptor, `ScheduledBatchOutput` forward results |
+| `atom/model_engine/engine_stats.py` | `EngineStats` — MTP acceptance, prefix-cache hits, and the periodic engine-status line, each on its own cadence |
 | `atom/model_engine/sequence.py` | `Sequence` request state, `SequenceStatus` and `SequenceType` enums |
 | `atom/model_engine/block_manager.py` | `BlockManager` KV cache block allocation with optional prefix caching |
 | `atom/model_engine/request.py` | `RequestOutput` dataclass for streaming callbacks |

@@ -18,6 +18,7 @@ import zmq.asyncio
 
 from atom.config import Config
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
+from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.utils import (
     envs,
@@ -189,6 +190,11 @@ class CoreManager:
         # an api_server <-> engine_core_mgr import cycle). Stays None on every
         # path that never streams, which the output thread checks for.
         self._flush_stream_batch_fn = None
+        # Longest prompt the KV pool can hold, reported by each rank's READY.
+        # None until the first one arrives, and thereafter the smallest across
+        # ranks: a DP rank sizes its pool from its own free memory, so a prompt
+        # is only safe to admit if it fits wherever the router sends it.
+        self.max_pool_tokens: int | None = None
         self.engine_core_processes = []
         self.input_sockets = []
         self.output_sockets = []
@@ -502,6 +508,18 @@ class CoreManager:
         self._output_handler_task = None
         self._asyncio_mode = config.asyncio_mode
 
+    def _record_ready_payload(self, data) -> None:
+        """Fold one rank's READY facts into the manager's view of capacity."""
+        if not data:
+            return
+        reported = data.get("max_pool_tokens")
+        if reported is None:
+            return
+        if self.max_pool_tokens is None:
+            self.max_pool_tokens = reported
+        else:
+            self.max_pool_tokens = min(self.max_pool_tokens, reported)
+
     def _wait_for_all_ready_signals(self):
         """Wait for READY signals from all DP ranks in parallel (no timeout)."""
         poller = zmq.Poller()
@@ -530,6 +548,7 @@ class CoreManager:
                     logger.info(
                         f"{self.label}: DP rank {dp_rank} is fully initialized and ready"
                     )
+                    self._record_ready_payload(data)
                     ready_received[dp_rank] = True
                     remaining -= 1
                 elif request_type == EngineCoreRequestType.SHUTDOWN:
@@ -640,8 +659,32 @@ class CoreManager:
                         seqs = data
                         # Offline (non-streaming) completions arrive here as
                         # finished sequences; release their in-flight DP load.
+                        #
+                        # So do sequences the scheduler rejected before they
+                        # ever ran (`_unschedulable_reason`, abort-while-waiting)
+                        # — those never reach `postprocess`, so no STREAM chunk
+                        # is ever built for them. An online client is still
+                        # holding a callback and would wait forever, so the
+                        # terminal output it is owed has to be raised here.
+                        # Anything already delivered through STREAM has had its
+                        # callback popped by then (STREAM is enqueued ahead of
+                        # the finished-seq list and this socket is FIFO), so a
+                        # normal completion finds nothing to do below.
+                        delivered = False
                         for seq in seqs:
+                            delivered |= self._deliver_terminal_output(seq)
                             self._release_seq_load(seq.id)
+                        if delivered and self._flush_stream_batch_fn is not None:
+                            # The callbacks above only buffer into a thread-local;
+                            # without this flush the chunk never reaches the
+                            # request's collector and the client still hangs.
+                            try:
+                                self._flush_stream_batch_fn()
+                            except Exception as e:
+                                logger.warning(
+                                    f"{self.label}: flush_stream_batch failed: {e}",
+                                    exc_info=True,
+                                )
                         self.outputs_queue.put_nowait(seqs)
             finally:
                 # Close sockets.
@@ -1130,6 +1173,47 @@ class CoreManager:
         self._rank_tokens[dp_rank] += tok_cost
         self._seq_load[seq.id] = (dp_rank, req_cost, tok_cost)
 
+    def _deliver_terminal_output(self, seq) -> bool:
+        """Give an online client the terminal output for a seq that never streamed.
+
+        A sequence the scheduler rejected before it ran produced no tokens and
+        no STREAM chunk, so nothing has answered the client yet. Synthesises the
+        finished `RequestOutput` the normal path would have built in
+        `postprocess`, carrying `leave_reason` as the finish reason so the
+        response says why it ended rather than closing empty.
+
+        Returns whether a callback was invoked, so the caller knows to flush the
+        batch the callback buffered into. Offline sequences register no callback
+        and normal completions have had theirs popped by the STREAM that
+        delivered them, so both answer False and keep their existing path.
+        """
+        callback = self._seq_id_to_callback.pop(seq.id, None)
+        if callback is None:
+            return False
+        # Never empty: an empty reason reaches the client as `finish_reason:
+        # null`, which the OpenAI schema reserves for a choice still being
+        # generated -- so a client would keep waiting on a finished stream.
+        reason = seq.leave_reason or "rejected"
+        try:
+            callback(
+                RequestOutput(
+                    request_id=seq.id,
+                    output_tokens=[],
+                    finished=True,
+                    finish_reason=reason,
+                )
+            )
+        except Exception as e:
+            logger.warning(
+                f"Error delivering terminal output for sequence {seq.id}: {e}",
+                exc_info=True,
+            )
+            return False
+        logger.info(
+            "%s: seq %s returned without running: %s", self.label, seq.id, reason
+        )
+        return True
+
     def _release_seq_load(self, seq_id) -> None:
         """Undo a seq's in-flight load when it finishes or is aborted.
 
@@ -1566,8 +1650,9 @@ class DisaggCoreManager(CoreManager):
         sock = self.output_sockets[idx]
         while True:
             obj = sock.recv(copy=False)
-            request_type, _ = pickle.loads(obj)
+            request_type, data = pickle.loads(obj)
             if request_type == EngineCoreRequestType.READY:
+                self._record_ready_payload(data)
                 return
             if request_type == EngineCoreRequestType.SHUTDOWN:
                 raise RuntimeError(

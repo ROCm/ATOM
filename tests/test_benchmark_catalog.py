@@ -143,12 +143,16 @@ def test_cells_respect_conc_bands():
     overlap the TP band, which is the only concurrency where the two can be
     compared at all.
     """
+    # Keyed on the resolved server args too, not just (prefix, suffix): the
+    # EPLB MegaMoE pair shares the `-mega` suffix and is split ONLY by band
+    # (c=512 vs c=4096, the latter carrying its own --gpu-memory-utilization).
+    # Keying on the suffix alone drops one of the two bands on the floor.
     bands = {
-        (v["prefix"], v["suffix"]): (v["conc_min"], v["conc_max"])
+        (v["prefix"], v["suffix"], v["args"]): (v["conc_min"], v["conc_max"])
         for v in catalog.load_variants(CATALOG)
     }
     for c in catalog.build_cells(CATALOG):
-        lo, hi = bands[(c["prefix"], c["suffix"])]
+        lo, hi = bands[(c["prefix"], c["suffix"], c["server_args"])]
         assert (
             lo <= c["conc"] <= hi
         ), f"{c['result_filename']} at conc={c['conc']} is outside [{lo}, {hi}]"
@@ -354,7 +358,7 @@ def test_dp_agentic_variant_carries_the_session_routing_env():
         "ATOM_DP_SESSION_AFFINITY=1",
         "ATOM_DP_LB_REQ_EQUIV=512",
         "ATOM_ENABLE_PREFILL_DELAYER=1",
-        "ATOM_PREFILL_DECODE_INTERVAL=10",
+        "ATOM_PREFILL_DECODE_INTERVAL=6",
         # TBO never travels alone in this catalog -- every TBO variant pairs
         # `--enable-tbo` with these two. Asserted alongside the routing vars so
         # the flag cannot be moved without them.
@@ -376,3 +380,57 @@ def test_dp_agentic_variant_carries_the_session_routing_env():
         # rather than the equivalent rate so it matches the literal in
         # InferenceX's dsv4_fp4_mi355x_atom_mtp.sh.
         assert "--spec-decode-acceptance-length 2.49" in args, name
+
+
+def test_conc_filter_narrows_the_agentic_sweep():
+    """`conc_filter` picks single points out of a curve, after the conc band.
+
+    An agentic cell is ~1h of 8-GPU time, so the dispatch dropdown exists to
+    re-run one point rather than the whole 9-cell set. The filter must compose
+    with the band rather than bypass it: a concurrency outside every band still
+    yields nothing, which is what makes the "out of sync" guard in
+    `build_benchmark_matrix.py` reachable.
+    """
+    agentic = catalog.build_cells(CATALOG, bench_kind_filter={"aiperf_agentic"})
+    all_concs = {c["conc"] for c in agentic}
+    assert len(agentic) > 1, "expected a multi-cell agentic curve"
+
+    for conc in sorted(all_concs):
+        picked = catalog.build_cells(
+            CATALOG, bench_kind_filter={"aiperf_agentic"}, conc_filter={conc}
+        )
+        assert picked, f"conc={conc} is in the catalog but filtered to nothing"
+        assert {c["conc"] for c in picked} == {conc}
+
+    # None == no filter (the "all" dropdown value).
+    assert len(
+        catalog.build_cells(CATALOG, bench_kind_filter={"aiperf_agentic"})
+    ) == len(agentic)
+    # Out-of-band concurrency yields an empty matrix rather than a stray cell.
+    assert (
+        catalog.build_cells(
+            CATALOG, bench_kind_filter={"aiperf_agentic"}, conc_filter={7}
+        )
+        == []
+    )
+
+
+def test_agentic_concurrency_dropdown_matches_the_catalog():
+    """The dispatch dropdown must offer exactly the catalog's agentic points.
+
+    A stale option silently produces an empty matrix at dispatch time (caught
+    only by the guard in `build_benchmark_matrix.py`, after the run starts); a
+    missing one makes a cell unreachable from the UI.
+    """
+    yaml = pytest.importorskip("yaml")
+    wf = yaml.safe_load(WORKFLOW.read_text())
+    on = wf.get("on", wf.get(True))
+    options = on["workflow_dispatch"]["inputs"]["agentic_concurrency"]["options"]
+
+    assert options[0] == "all", "'all' must stay the first option (the default)"
+    offered = {int(o) for o in options[1:]}
+    in_catalog = {
+        c["conc"]
+        for c in catalog.build_cells(CATALOG, bench_kind_filter={"aiperf_agentic"})
+    }
+    assert offered == in_catalog

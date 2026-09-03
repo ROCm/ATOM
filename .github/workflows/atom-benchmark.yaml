@@ -14,6 +14,10 @@ on:
         description: "Benchmark DeepSeek-V4-Pro"
         type: boolean
         default: true
+      deepseek-v4-pro-eplb:
+        description: "Benchmark DeepSeek-V4-Pro EPLB r0 + MegaMoE (8k1k, c=512/4096)"
+        type: boolean
+        default: true
       glm-5-2-fp8:
         description: "Benchmark GLM-5.2-FP8"
         type: boolean
@@ -62,6 +66,11 @@ on:
         description: "Run ONLY the agentic AgentX trace replay (DeepSeek-V4-Pro, 9 cells x ~1h GPU). Overrides the model checkboxes and the workload grid above. The nightly never runs it."
         type: boolean
         default: false
+      agentic_concurrency:
+        description: "Agentic: which concurrency to run. 'all' = the full 9-cell curve; pick one to re-run a single ~1h cell. Ignored unless the agentic checkbox is ticked."
+        type: choice
+        default: "all"
+        options: ["all", "1", "2", "8", "16", "48", "64", "96", "128", "256"]
       agentic_duration:
         description: "Agentic replay seconds per cell. 3600 = official; under 900 forces --unsafe-override and stamps submission_valid=false."
         type: string

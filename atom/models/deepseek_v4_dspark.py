@@ -88,8 +88,8 @@ def dspark_block_attention(
     only be called once``.
 
     The V4 target calls the very same kernel and is fine precisely because its
-    call site (``DeepseekV4Attention._attn_core``) is reachable only through
-    ``torch.ops.aiter.v4_core_attention``, a splitting op. This mirrors that,
+    call site (``DeepseekV4Attention._attn_compress``) is reachable only through
+    ``torch.ops.aiter.v4_attn_compress``, a splitting op. This mirrors that,
     at the WIDE granularity (``v4_attention_with_output``): the whole attention
     sub-layer stays eager.
 
@@ -915,7 +915,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
             )  # [B, T, n_heads, head_dim]
 
         # Output projection: mirror DeepseekV4Attention's output stage exactly
-        # (`_attn_core` + `_attn_post`). `_wo_a_grouped_lora` owns the inverse
+        # (the attention halves + `_attn_post`). `_wo_a_grouped_lora` owns the inverse
         # RoPE on both wo_a paths, so hand it the un-inverse-RoPE'd output and
         # inherit whichever path the shared wo_a is on.
         # GPU-VERIFY: numerics validated against the V4 reference output stage.

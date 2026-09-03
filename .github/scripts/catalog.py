@@ -200,6 +200,7 @@ def build_cells(
     param_lists: str | None = None,
     model_filter: set[str] | None = None,
     bench_kind_filter: set[str] | None = None,
+    conc_filter: set[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Expand the catalog into fully-resolved benchmark cells.
 
@@ -215,6 +216,12 @@ def build_cells(
     live in separate workflows because their costs differ by an order of
     magnitude -- an agentic cell replays for an hour -- so the nightly asks for
     `{"random"}` and would otherwise pick up the agentic variants by prefix.
+
+    `conc_filter` (None = no filter) keeps only cells at those concurrencies,
+    applied AFTER each variant's `conc_min`/`conc_max` band. It lets a dispatch
+    re-run a single point of a curve without editing the catalog -- an agentic
+    sweep is 9 cells at ~1h of 8-GPU time each, so re-running one cell rather
+    than the set is the difference between an hour and most of a day.
     """
     catalog = _load_catalog(path)
     default_scenarios = catalog.get("default_scenarios", [])
@@ -240,6 +247,8 @@ def build_cells(
             ratio = sc.get("random_range_ratio", DEFAULT_RATIO)
             ratio_str = _fmt_ratio(ratio)
             for conc in sc["concurrency"]:
+                if conc_filter is not None and conc not in conc_filter:
+                    continue
                 cells.append(
                     {
                         "display": rec["display"],
@@ -284,6 +293,7 @@ def build_cell_configs(
     param_lists: str | None = None,
     model_filter: set[str] | None = None,
     bench_kind_filter: set[str] | None = None,
+    conc_filter: set[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Group cells into first-level matrix configs: one per (variant, scenario).
 
@@ -305,6 +315,7 @@ def build_cell_configs(
         param_lists=param_lists,
         model_filter=model_filter,
         bench_kind_filter=bench_kind_filter,
+        conc_filter=conc_filter,
     )
 
     configs: dict[tuple, dict[str, Any]] = {}
