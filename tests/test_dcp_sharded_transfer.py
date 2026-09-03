@@ -36,7 +36,7 @@ def test_shard_plan_matches_dcp_token_ownership(dcp_size, dcp_rank, interleave):
     assert plan.src_token.size == dst_pages * block_size // interleave
     assert (plan.run_length == interleave).all()
 
-    src_starts, dst_starts, lengths = plan.coalesced_token_runs(dst_block_ids)
+    src_starts, dst_starts, lengths = plan.token_runs(dst_block_ids)
     actual_src = _expand_runs(src_starts, lengths)
     actual_dst = _expand_runs(dst_starts, lengths)
 

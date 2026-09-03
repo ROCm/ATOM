@@ -126,6 +126,10 @@ class ConnectorCompletion:
 # token-contiguous, while producer preshuffled DSA index bytes require staging.
 MLA_KV_ROLE = "mla.kv"
 INDEX_CACHE_ROLE = "dsa.index_cache"
+# Producer gather callbacks need one staging slot per concurrent send worker.
+# Mooncake and attention-pool allocation share this fallback so their defaults
+# cannot drift independently.
+DEFAULT_SHARDED_STAGING_WORKERS = 16
 
 
 @dataclass
@@ -144,11 +148,6 @@ class KVTransferRegion:
     # and list positions are process-local implementation details; a named role
     # makes equal-sized planes distinguishable across code versions.
     semantic_role: str | None = None
-    # Plane split of a preshuffled DSA index page, which is not token-addressable
-    # (MFMA-16x16 tiled fp8 keys, then a plane of fp32 scales): a sub-page
-    # relayout moves each plane on its own. None for token-contiguous pages.
-    key_plane_bytes: int | None = None
-    scale_plane_bytes: int | None = None
 
     def unit_addr(self, index: int) -> int:
         if self.reverse_indexed:
