@@ -1444,6 +1444,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         runner = self.model_runner
         if self.kv_pool is None:
             return None
+        mooncake_producer = _mooncake_producer_transfer_configured(runner.config)
+        if mooncake_producer and self.dcp_world_size > 1:
+            raise RuntimeError(
+                "Mooncake P/D transfer requires an unsharded producer because "
+                "the DCP transfer plan assumes producer blocks contain the "
+                "global contiguous token order"
+            )
         # What the pool was built with, not what the hook would recompute: a
         # hybrid caches for fewer layers than the model has, and the consumer
         # indices below are positions in the allocated rows.
@@ -1586,11 +1593,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         index_staging_chunk_pages = 0
         prepare_sharded_index = None
         gather_sharded_index = None
-        if (
-            index_tensors
-            and self.dcp_world_size == 1
-            and _mooncake_producer_transfer_configured(runner.config)
-        ):
+        if index_tensors and self.dcp_world_size == 1 and mooncake_producer:
             # Mooncake's producer workers can receive requests from a DCP
             # consumer whose index cache is sharded below one MFMA tile. Keep a
             # small per-send-thread pool that repacks one index layer at a time;
