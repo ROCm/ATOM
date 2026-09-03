@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788421862998,
+  "lastUpdate": 1788456660888,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -2503,6 +2503,63 @@ window.BENCHMARK_DATA = {
             "value": 0.7089,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33723474050 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | Docker: rocm/atom-dev:nightly_202609021444 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.6619 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "ZhangLirong",
+            "username": "ZhangLirong-amd",
+            "email": "lirzhang@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "412f5bfe5241e2f15801b5bc6f46c82fbdaff529",
+          "message": "feat(dp): DP-vocab-sharded greedy argmax for speculative drafting (#2128)\n\n* feat(dp): DP-vocab-sharded greedy argmax for speculative drafting\n\nMTP/eagle draft compute_argmax_token runs a replicated full-vocab GEMM per DP\nrank ([N, V]) -- weight-read bound at the tiny draft M, re-reading the whole\n[H, V] lm_head every draft step. Shard the vocab across the DP group so each\nrank reads only [H, V/dp]; DP ranks own distinct rows, so hidden is gathered\nfirst, each rank reduces its shard to a packed (max, global_id), and only the\n[Sigma-rows, 2] pack is all-gathered (never the O(vocab) logits) before the\nglobal argmax is sliced back to this rank's rows. Token-identical to the\nreplicated argmax, tie-break included.\n\nShares the gather/pad/project front half with the decode head: the argmax is a\nthird mode of _dp_sharded_logits (alongside all2all / allgather), so a draft\nstep calls it with mode='argmax' and gets ids back.\n\nOn by default (ATOM_DP_DRAFT_ARGMAX); engages only on pure DP for a unified\n(rectangular) draft step, and only while the GEMM is weight-read bound -- past\nATOM_DP_DRAFT_ARGMAX_MAX_ROWS (default 256) rows the hidden gather outweighs the\nread it saves, so it falls back to the replicated argmax. Every gate value is\nDP-agreed, so the verdict stays consistent across ranks.\n\n* fix(dp): harden the draft argmax gate (review)\n\nAddress valarLip's review at 41a3fa1: _can_use_dp_sharded_argmax was the decode\ngate with its safety removed, reachable from contexts the sibling excludes.\n\n- Total predicate: get_dp_group() (which asserts the group exists) now runs\n  last, behind the dp_metadata check -- so an unbuilt DP group is a False, not\n  an AssertionError. The unit-test monkeypatch that worked around the raise is\n  dropped.\n- dp_metadata is not None: the proof running_tokens was DP-reduced. Absent under\n  SGLang dp-attention (aiter DP group >1 while ATOM data_parallel_size ==1) and\n  single-GPU, where the fixed-size all_gather would otherwise post mismatched\n  sizes and deadlock.\n- Skip plugin mode (both the dispatch and the gate): its caller issues one\n  collective per per-rank chunk, so ranks disagree on the count -> DP deadlock.\n- Exclude is_prefill, matching the decode gate.\n\nTests (CPU, no DP group): tests/test_dp_sharded_argmax.py covers the gate\nverdict table, the total-predicate no-raise case, and the rank-major offset\narithmetic of the argmax exchange.\n\nDocstring: the DP path reshapes the GEMM ([M,V]->[dp*M,V/dp]), so its logits are\nnot bitwise-identical to the replicated path -- only the TP path is. Softened\nthe identity claim accordingly.",
+          "timestamp": "2026-09-03T15:10:38Z",
+          "url": "https://github.com/ROCm/ATOM/commit/412f5bfe5241e2f15801b5bc6f46c82fbdaff529"
+        },
+        "date": 1788456660084,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9454,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33777866079 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202609031453 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9447 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
+            "value": 0.9484,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33777866079 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609031453 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9492 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP MTP acceptance (%)",
+            "value": 66.1,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33777866079 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609031453 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9492 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
+            "value": 2.98,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOMesh::Meta-Llama-3-8B-Instruct accuracy (GSM8K)",
+            "value": 0.7574,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33777866079 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | Docker: rocm/atom-dev:nightly_202609031453 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.7597 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8795,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33777866079 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609031453 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.351 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
