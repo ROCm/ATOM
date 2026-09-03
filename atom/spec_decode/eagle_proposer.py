@@ -37,6 +37,41 @@ def _pcp_active_for_draft_model(draft_model: nn.Module) -> bool:
     return _pcp_active_v4()
 
 
+def _pcp_split_draft_inputs(
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    """Split a draft prefill onto this rank's 1/pcp query shard.
+
+    A draft prefill reuses the target's attn_metadata, already reindexed to
+    1/pcp by the builder, so its q rows must be split to match or aiter aborts
+    on `kv_indptr_prefix length must be N+1`. Both draft prefill entry points
+    need this: `propose()`'s i==0 step and `precompute_context_kv`.
+
+    Callers gate on `_pcp_active_for_draft_model` first. Returns the shards
+    plus (n_global, pcp_ws) for callers that must all-gather back.
+
+    Assumes 1-D positions: MRoPE's `[3, N]` layout puts the token axis last,
+    which the pad-and-split below would corrupt. No MRoPE model can reach the
+    PCP draft path today.
+    """
+    pcp_ws = get_pcp_world_size()
+    n_global = input_ids.shape[0]
+    assert positions.shape[0] == n_global and hidden_states.shape[0] == n_global, (
+        f"draft PCP split needs row-aligned inputs: ids={n_global} "
+        f"pos={positions.shape[0]} hidden={hidden_states.shape[0]}"
+    )
+    n_pad = pcp_pad_len(n_global, pcp_ws) - n_global
+    return (
+        pcp_round_robin_split(pcp_pad_dense(input_ids, n_pad), pcp_ws),
+        pcp_round_robin_split(pcp_pad_dense(positions, n_pad), pcp_ws),
+        pcp_round_robin_split(pcp_pad_dense(hidden_states, n_pad), pcp_ws),
+        n_global,
+        pcp_ws,
+    )
+
+
 class EagleProposer(Drafter):
     """Serial speculative drafter: plain MTP and EAGLE3.
 
@@ -316,13 +351,25 @@ class EagleProposer(Drafter):
         input_ids = self.runner.tokenID_processor.input_ids.gpu[1 : num_tokens + 1]
         input_ids.scatter_(0, last_token_indices, anchor_ids)
 
+        d_input_ids = input_ids
+        d_positions = positions[:num_tokens] + 1
+        d_hidden = draft_hidden
+        # Same split as propose()'s i==0 step: this pass reuses the same
+        # 1/pcp-reindexed attn_metadata. Only q is sharded -- attention
+        # all-gathers K/V back to full order before writing, so every rank still
+        # ends up with the whole draft KV.
+        if _pcp_active_for_draft_model(self.model):
+            d_input_ids, d_positions, d_hidden, _, _ = _pcp_split_draft_inputs(
+                d_input_ids, d_positions, d_hidden
+            )
+
         was_draft = context.is_draft
         context.is_draft = True
         try:
             self.model(
-                input_ids=input_ids,
-                positions=positions[:num_tokens] + 1,
-                hidden_states=draft_hidden,
+                input_ids=d_input_ids,
+                positions=d_positions,
+                hidden_states=d_hidden,
             )
         finally:
             context.is_draft = was_draft
@@ -560,18 +607,13 @@ class EagleProposer(Drafter):
                 # full `last_token_indices`) is unchanged.
                 pcp_draft_prefill = i == 0 and _pcp_active_for_draft_model(self.model)
                 if pcp_draft_prefill:
-                    pcp_ws = get_pcp_world_size()
-                    n_global_draft = input_ids.shape[0]
-                    n_pad = pcp_pad_len(n_global_draft, pcp_ws) - n_global_draft
-                    d_input_ids = pcp_round_robin_split(
-                        pcp_pad_dense(input_ids, n_pad), pcp_ws
-                    )
-                    d_positions = pcp_round_robin_split(
-                        pcp_pad_dense(positions, n_pad), pcp_ws
-                    )
-                    d_hidden = pcp_round_robin_split(
-                        pcp_pad_dense(hidden_states, n_pad), pcp_ws
-                    )
+                    (
+                        d_input_ids,
+                        d_positions,
+                        d_hidden,
+                        n_global_draft,
+                        pcp_ws,
+                    ) = _pcp_split_draft_inputs(input_ids, positions, hidden_states)
                 else:
                     d_input_ids, d_positions, d_hidden = (
                         input_ids,
