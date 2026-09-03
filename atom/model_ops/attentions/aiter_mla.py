@@ -28,6 +28,7 @@ from atom.distributed.pcp_utils import (
     pcp_round_robin_query_indices,
 )
 from atom.kv_transfer.disaggregation.sharded_transfer import DCPShardPlan
+from atom.kv_transfer.disaggregation.types import DEFAULT_SHARDED_STAGING_WORKERS
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import (
     _MLA_MIN_HEADS,
@@ -351,47 +352,42 @@ def gather_dcp_preshuffled_index_pages(
     return dst_pages
 
 
-def _mooncake_producer_transfer_configured(config) -> bool:
-    """Whether this worker is a Mooncake P/D producer."""
-
+def _pd_producer_connectors(config) -> tuple[dict, ...]:
+    """Return the configured P/D producer connector entries."""
     transfer_config = getattr(config, "kv_transfer_config", None)
     if not isinstance(transfer_config, dict) or not transfer_config:
-        return False
-
-    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-
-    def is_mooncake_producer(sub_config, path):
-        if not isinstance(sub_config, dict):
-            return False
-        try:
-            connector = KVConnectorFactory.canonical_name(
-                sub_config.get("kv_connector"), path=path
-            )
-        except (TypeError, ValueError):
-            return False
-        return (
-            connector == "mooncake"
-            and sub_config.get("kv_role", "kv_producer") == "kv_producer"
-        )
-
-    try:
-        connector = KVConnectorFactory.canonical_name(
-            transfer_config.get("kv_connector"), path="kv_transfer_config"
-        )
-    except (TypeError, ValueError):
-        return False
-    if connector == "mooncake":
-        return is_mooncake_producer(transfer_config, "kv_transfer_config")
-    if connector != "multi":
-        return False
-
-    sub_configs = transfer_config.get("connectors")
-    if not isinstance(sub_configs, list):
-        return False
-    return any(
-        is_mooncake_producer(sub_config, f"kv_transfer_config.connectors[{index}]")
-        for index, sub_config in enumerate(sub_configs)
+        return ()
+    # MultiConnector nests the real connectors; a bare config is its own entry.
+    connectors = transfer_config.get("connectors") or [transfer_config]
+    if not isinstance(connectors, (list, tuple)):
+        return ()
+    return tuple(
+        connector
+        for connector in connectors
+        if isinstance(connector, dict)
+        and connector.get("kv_role", "kv_producer") == "kv_producer"
     )
+
+
+def _pd_producer_configured(config) -> bool:
+    """Whether any connector on this worker is configured as a P/D producer."""
+
+    return bool(_pd_producer_connectors(config))
+
+
+def _pd_staging_pool_size(config) -> int:
+    """Size producer staging for the maximum configured send concurrency."""
+
+    worker_counts = []
+    for connector in _pd_producer_connectors(config):
+        count = connector.get("num_worker_threads", DEFAULT_SHARDED_STAGING_WORKERS)
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise ValueError(
+                "P/D producer num_worker_threads must be a positive integer, "
+                f"got {count!r}"
+            )
+        worker_counts.append(count)
+    return max(worker_counts, default=0)
 
 
 class AiterMLABackend(AttentionBackend):
@@ -1380,10 +1376,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         runner = self.model_runner
         if not hasattr(runner, "kv_cache"):
             return None
-        mooncake_producer = _mooncake_producer_transfer_configured(runner.config)
-        if mooncake_producer and self.dcp_world_size > 1:
+        pd_producer = _pd_producer_configured(runner.config)
+        if pd_producer and self.dcp_world_size > 1:
             raise RuntimeError(
-                "Mooncake P/D transfer requires an unsharded producer because "
+                "P/D transfer requires an unsharded producer because "
                 "the DCP transfer plan assumes producer blocks contain the "
                 "global contiguous token order"
             )
@@ -1403,19 +1399,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
 
         if hasattr(runner, "index_cache"):
-            index_head_dim = runner.config.hf_config.index_head_dim
             for layer_id in range(runner.index_cache.shape[0]):
                 t = runner.index_cache[layer_id]
-                bpb = self._index_cache_block_bytes(t)
-                tokens_per_page = bpb // runner.aligned_index_dim
                 block_regions.append(
                     KVTransferRegion(
                         base_addr=t.data_ptr(),
                         total_bytes=t.numel() * t.element_size(),
-                        unit_bytes=bpb,
+                        unit_bytes=self._index_cache_block_bytes(t),
                         semantic_role=INDEX_CACHE_ROLE,
-                        key_plane_bytes=tokens_per_page * index_head_dim,
-                        scale_plane_bytes=tokens_per_page * 4,
                     )
                 )
 
@@ -1513,24 +1504,17 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         index_staging_chunk_pages = 0
         prepare_sharded_index = None
         gather_sharded_index = None
-        if (
-            hasattr(runner, "index_cache")
-            and self.dcp_world_size == 1
-            and mooncake_producer
-        ):
-            # Mooncake's producer workers can receive requests from a DCP
-            # consumer whose index cache is sharded below one MFMA tile. Keep a
+        if hasattr(runner, "index_cache") and self.dcp_world_size == 1 and pd_producer:
+            # A P/D producer can receive requests from a DCP consumer whose
+            # index cache is sharded below one MFMA tile. Keep a
             # small per-send-thread pool that repacks one index layer at a time;
             # latent MLA pages continue to transfer directly.
-            index_staging_pool_size = 16
+            index_staging_pool_size = _pd_staging_pool_size(runner.config)
             index_staging_chunk_pages = 256
+            index_head_dim = runner.config.hf_config.index_head_dim
             first_index_page = runner.index_cache[0]
-            page_bytes = (
-                first_index_page.stride(0)
-                * first_index_page.element_size()
-                * self.block_ratio
-            )
-            runner.index_transfer_staging = torch.empty(
+            page_bytes = self._index_cache_block_bytes(first_index_page)
+            staging = torch.empty(
                 (
                     index_staging_pool_size,
                     index_staging_chunk_pages,
@@ -1539,7 +1523,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 dtype=torch.uint8,
                 device=first_index_page.device,
             )
-            staging = runner.index_transfer_staging
             index_staging_region = KVTransferRegion(
                 base_addr=staging.data_ptr(),
                 total_bytes=staging.numel() * staging.element_size(),

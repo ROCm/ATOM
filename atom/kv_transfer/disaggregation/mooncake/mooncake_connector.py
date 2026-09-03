@@ -44,6 +44,7 @@ from atom.kv_transfer.disaggregation.sharded_transfer import (
     coalesce_contiguous,
 )
 from atom.kv_transfer.disaggregation.types import (
+    DEFAULT_SHARDED_STAGING_WORKERS,
     INDEX_CACHE_ROLE,
     ConnectorMetadata,
     KVTransferRegion,
@@ -635,8 +636,6 @@ class MooncakeConnector(KVConnectorBase):
         self._staging_pool_size: int = 0
         self._staging_free: list[int] = []
         self._staging_lock = threading.Lock()
-        self._index_staging_base_addr: int = 0
-        self._index_staging_slot_bytes: int = 0
         self._index_staging_pool_size: int = 0
         self._index_staging_chunk_pages: int = 0
         self._index_staging_free: list[int] = []
@@ -692,7 +691,9 @@ class MooncakeConnector(KVConnectorBase):
         self._cuda_device = torch.cuda.current_device()
         if self.is_producer:
             self._send_executor = ThreadPoolExecutor(
-                max_workers=kv_transfer_config.get("num_worker_threads", 16),
+                max_workers=kv_transfer_config.get(
+                    "num_worker_threads", DEFAULT_SHARDED_STAGING_WORKERS
+                ),
                 thread_name_prefix="mooncake-send-worker",
                 initializer=torch.cuda.set_device,
                 initargs=(self._cuda_device,),
@@ -777,8 +778,6 @@ class MooncakeConnector(KVConnectorBase):
             self._staging_pool_size = tt.staging_pool_size
             self._staging_free = list(range(tt.staging_pool_size))
         if tt.index_staging_region is not None:
-            self._index_staging_base_addr = tt.index_staging_region.base_addr
-            self._index_staging_slot_bytes = tt.index_staging_region.unit_bytes
             self._index_staging_pool_size = tt.index_staging_pool_size
             self._index_staging_chunk_pages = tt.index_staging_chunk_pages
             self._index_staging_free = list(range(tt.index_staging_pool_size))
@@ -1502,21 +1501,6 @@ class MooncakeConnector(KVConnectorBase):
             request_data.get("consumer_num_layers"),
             self._block_region_consumer_indices,
         )
-        # The plan comes from this stage's role list but the bytes land at
-        # cmap[region_idx], and equal region counts do not make the two orders
-        # match. Writing an index region with the latent's plan corrupts it into
-        # plausible text instead of faulting, so check the pairing.
-        consumer_roles = request_data.get("consumer_region_roles")
-        if consumer_roles is not None:
-            for region_idx in range(num_regions):
-                remote_role = consumer_roles[cmap[region_idx]]
-                if self._block_region_roles[region_idx] != remote_role:
-                    raise RuntimeError(
-                        f"Region role mismatch for req {req_id}: local region "
-                        f"{region_idx} is "
-                        f"{self._block_region_roles[region_idx]!r}, but consumer "
-                        f"region {cmap[region_idx]} is {remote_role!r}"
-                    )
         # Under DCP the consumer rank owns only part of each block, so
         # whole-block descriptors no longer line up and the push becomes the
         # per-region relayout described at the top of this file. Safe in token
@@ -1535,7 +1519,7 @@ class MooncakeConnector(KVConnectorBase):
                 interleave_size=interleave,
                 dst_pages=len(dst_block_ids),
             )
-            sharded_runs = sharded_plan.coalesced_token_runs(dst_block_ids)
+            sharded_runs = sharded_plan.token_runs(dst_block_ids)
             stages_sharded_index = (
                 interleave < self.block_size
                 and INDEX_CACHE_ROLE in self._block_region_roles
@@ -1556,48 +1540,53 @@ class MooncakeConnector(KVConnectorBase):
                 )
 
         staged_regions: list[tuple[int, int, int]] = []
+        # The plan comes from this stage's region order but the bytes land at
+        # cmap[region_idx], and equal region counts do not make the two orders
+        # match. Validate both semantic role and physical width so incompatible
+        # producer/consumer layouts fail instead of silently corrupting KV.
+        consumer_roles = request_data.get("consumer_region_roles")
         consumer_bpb = request_data.get("consumer_block_bpb")
         for region_idx in range(num_regions):
             src_base = self.kv_caches_base_addr[region_idx]
             dst_base = consumer_base_addrs[cmap[region_idx]]
             bpb = self._per_block_bytes_list[region_idx]
+            role = self._block_region_roles[region_idx]
+            if consumer_roles is not None and consumer_roles[cmap[region_idx]] != role:
+                raise RuntimeError(
+                    f"Region role mismatch for req {req_id}: local region "
+                    f"{region_idx} is {role!r}, but consumer region "
+                    f"{cmap[region_idx]} is {consumer_roles[cmap[region_idx]]!r}"
+                )
             if consumer_bpb is not None and consumer_bpb[cmap[region_idx]] != bpb:
                 raise RuntimeError(
                     f"Region byte-size mismatch for req {req_id}: producer "
                     f"region {region_idx} has {bpb}, consumer region "
-                    f"{cmap[region_idx]} has {consumer_bpb[cmap[region_idx]]}; "
-                    f"expected {bpb}"
+                    f"{cmap[region_idx]} has {consumer_bpb[cmap[region_idx]]}"
                 )
-            if (
-                stages_sharded_index
-                and self._block_region_roles[region_idx] == INDEX_CACHE_ROLE
-            ):
+            if stages_sharded_index and role == INDEX_CACHE_ROLE:
                 staged_regions.append((region_idx, dst_base, bpb))
                 continue
-            unit = 0
             if sharded_runs is None:
                 for sb, db in zip(src_block_ids, dst_block_ids):
                     src_addrs.append(src_base + sb * bpb)
                     dst_addrs.append(dst_base + db * bpb)
                     sizes.append(bpb)
                 continue
-            if not unit:
-                # The destination page is wider only in whole tokens and the
-                # plan already counts in its token space, so both ends scale by
-                # the source's per-token width.
-                if bpb % self.block_size:
-                    raise RuntimeError(
-                        f"Region {region_idx} stores {bpb} bytes per block, "
-                        f"which block_size {self.block_size} does not divide. "
-                        "Addressing a single token needs its bytes contiguous, "
-                        "which holds for the MLA layout the token-unit relayout "
-                        "is built on."
-                    )
-                unit = bpb // self.block_size
-            for src_off, dst_off, run_len in zip(*sharded_runs):
-                src_addrs.append(src_base + int(src_off) * unit)
-                dst_addrs.append(dst_base + int(dst_off) * unit)
-                sizes.append(int(run_len) * unit)
+            # The destination page is wider only in whole tokens and the plan
+            # already counts in its token space, so both ends scale by the
+            # source's per-token width.
+            if bpb % self.block_size:
+                raise RuntimeError(
+                    f"Region {region_idx} stores {bpb} bytes per block, which "
+                    f"block_size {self.block_size} does not divide. Addressing "
+                    "a single token needs its bytes contiguous, which holds for "
+                    "the MLA layout the token-unit relayout is built on."
+                )
+            unit = bpb // self.block_size
+            run_src, run_dst, run_len = sharded_runs
+            src_addrs.extend((src_base + run_src * unit).tolist())
+            dst_addrs.extend((dst_base + run_dst * unit).tolist())
+            sizes.extend((run_len * unit).tolist())
 
         if src_addrs:
             logger.debug(
@@ -1674,7 +1663,7 @@ class MooncakeConnector(KVConnectorBase):
                 dst_base + dst_page * bytes_per_page,
                 length,
             )
-            logger.info(
+            logger.debug(
                 "[PRODUCER] staged index RDMA write: req=%s, region=%d, "
                 "pages=%d, descriptors=%d, total_bytes=%d",
                 req_id,

@@ -41,6 +41,8 @@ def test_global_index_cache_layout_without_schedule_is_unchanged():
         (None, False),
         ({}, False),
         ({"kv_connector": "mooncake", "kv_role": "kv_producer"}, True),
+        ({"kv_connector": "moriio", "kv_role": "kv_producer"}, True),
+        ({"kv_connector": "mooncake"}, True),
         ({"kv_connector": "mooncake", "kv_role": "kv_consumer"}, False),
         ({"kv_connector": "lmcache_offload", "kv_role": "offload"}, False),
         (
@@ -65,12 +67,64 @@ def test_global_index_cache_layout_without_schedule_is_unchanged():
         ),
     ],
 )
-def test_index_staging_requires_mooncake_producer(kv_transfer_config, expected):
+def test_index_staging_requires_a_pd_producer(kv_transfer_config, expected):
     config = SimpleNamespace(kv_transfer_config=kv_transfer_config)
-    assert aiter_mla._mooncake_producer_transfer_configured(config) is expected
+    assert aiter_mla._pd_producer_configured(config) is expected
 
 
-def test_dcp_mooncake_producer_is_rejected_before_transfer_planning():
+@pytest.mark.parametrize(
+    "kv_transfer_config, expected",
+    [
+        (None, 0),
+        ({"kv_connector": "mooncake", "kv_role": "kv_producer"}, 16),
+        (
+            {
+                "kv_connector": "mooncake",
+                "kv_role": "kv_producer",
+                "num_worker_threads": 32,
+            },
+            32,
+        ),
+        (
+            {
+                "kv_connector": "multi",
+                "connectors": [
+                    {
+                        "kv_connector": "mooncake",
+                        "kv_role": "kv_producer",
+                        "num_worker_threads": 24,
+                    },
+                    {
+                        "kv_connector": "mooncake",
+                        "kv_role": "kv_consumer",
+                        "num_worker_threads": 64,
+                    },
+                    {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+                ],
+            },
+            24,
+        ),
+    ],
+)
+def test_pd_staging_pool_matches_producer_worker_count(kv_transfer_config, expected):
+    config = SimpleNamespace(kv_transfer_config=kv_transfer_config)
+    assert aiter_mla._pd_staging_pool_size(config) == expected
+
+
+@pytest.mark.parametrize("worker_count", [0, -1, True, "32"])
+def test_pd_staging_pool_rejects_invalid_worker_count(worker_count):
+    config = SimpleNamespace(
+        kv_transfer_config={
+            "kv_connector": "mooncake",
+            "kv_role": "kv_producer",
+            "num_worker_threads": worker_count,
+        }
+    )
+    with pytest.raises(ValueError, match="positive integer"):
+        aiter_mla._pd_staging_pool_size(config)
+
+
+def test_dcp_pd_producer_is_rejected_before_transfer_planning():
     builder = object.__new__(AiterMLAMetadataBuilder)
     builder.dcp_world_size = 2
     builder.model_runner = SimpleNamespace(
@@ -125,11 +179,12 @@ def test_preshuffled_index_gather_reorganizes_pages_and_zeros_tail():
     )
 
     src_block_ids = [2, 0, 4, 1, 3]
+    dcp_size, dcp_rank = 4, 3
     plan = build_dcp_shard_plan(
         src_block_ids,
         block_size=scheduler_block_size,
-        dcp_size=4,
-        dcp_rank=3,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
     )
     indices = prepare_dcp_index_gather_indices(plan, torch.device("cpu"))
     staging = torch.full(
@@ -158,7 +213,7 @@ def test_preshuffled_index_gather_reorganizes_pages_and_zeros_tail():
     ].view(torch.float32)
     for local_token in range(plan.dst_pages * scheduler_block_size):
         dst_page, dst_token = divmod(local_token, scheduler_block_size)
-        global_token = local_token * plan.dcp_size + plan.dcp_rank
+        global_token = local_token * dcp_size + dcp_rank
         src_ordinal, src_token = divmod(global_token, scheduler_block_size)
         valid = src_ordinal < len(src_block_ids)
         for dim in range(index_head_dim):
@@ -272,7 +327,6 @@ def _builder(
             ),
         ),
         block_size=16,
-        aligned_index_dim=(index_head_dim + 4 + 15) // 16 * 16,
         is_deepseek_v32=True,
         _get_total_num_layers=lambda: total_local_layers,
     )
