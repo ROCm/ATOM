@@ -122,7 +122,7 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         `None` until `register_kv_caches` builds it (and stays `None` under PP or
         on a non-owning layout).
         """
-        tier = getattr(self, "_state_tier", None)
+        tier = self._state_tier
         if tier is not None:
             tier.drain()
             tier.shutdown()
