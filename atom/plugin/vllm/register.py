@@ -180,9 +180,18 @@ def register_platform() -> str | None:
 def _register_kv_connectors() -> None:
     """Expose ATOM's byte-level LMCache offload to vLLM's connector factory.
 
+    Convenience only. vLLM validates ``kv_transfer_config`` while building
+    VllmConfig, which happens BEFORE platform plugins are invoked, so a run
+    that names the connector by bare name fails config validation before this
+    ever runs. The supported way to select it is vLLM's out-of-tree entry
+    point, which takes priority over the registry and needs no registration:
+
+        --kv-transfer-config '{"kv_connector": "AtomLMCacheOffloadConnector",
+          "kv_connector_module_path": "atom.plugin.vllm.kv_transfer.connector",
+          "kv_role": "kv_both"}'
+
     Registered by module path so importing the plugin does not drag in the
-    offload stack (and LMCache) for every run -- vLLM resolves it lazily, only
-    when a --kv-transfer-config actually names it.
+    offload stack (and LMCache) for every run.
     """
     from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 
