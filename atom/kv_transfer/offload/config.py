@@ -49,10 +49,12 @@ _HF_PAGE_FIELDS = (
     "qk_rope_head_dim",
     "compress_ratios",
     "indexer_dtype",
+    "indexer_types",
 )
 _HF_INTEGER_GEOMETRY_FIELDS = frozenset(_HF_PAGE_FIELDS) - {
     "compress_ratios",
     "indexer_dtype",
+    "indexer_types",
 }
 
 logger = logging.getLogger("atom")

@@ -97,6 +97,12 @@ class ConnectorCompletion:
         return self.channel, self.operation_id
 
 
+# Region roles the DCP relayout dispatches on: an MLA latent region is always
+# interleave-sharded, a DSA index region may instead be replicated whole.
+MLA_KV_ROLE = "mla.kv"
+INDEX_CACHE_ROLE = "dsa.index_cache"
+
+
 @dataclass
 class KVTransferRegion:
     """One RDMA-registerable tensor region."""
@@ -113,6 +119,11 @@ class KVTransferRegion:
     # and list positions are process-local implementation details; a named role
     # makes equal-sized planes distinguishable across code versions.
     semantic_role: str | None = None
+    # Plane split of a preshuffled DSA index page, which is not token-addressable
+    # (MFMA-16x16 tiled fp8 keys, then a plane of fp32 scales): a sub-page
+    # relayout moves each plane on its own. None for token-contiguous pages.
+    key_plane_bytes: int | None = None
+    scale_plane_bytes: int | None = None
 
     def unit_addr(self, index: int) -> int:
         if self.reverse_indexed:
@@ -131,6 +142,9 @@ class KVTransferTensors:
     plane count explicit so registration can reject a missing plane.
     ``staging_region`` plus ``gather_slot``/``scatter_slot`` cover only the
     compressor-state PD staging pool and are invalid as sidecar SLOT sources.
+    ``index_staging_region`` plus ``build_sharded_index_plan`` and
+    ``gather_sharded_index`` cover producer-side repacking of preshuffled index
+    pages before DCP-sharded RDMA. The plan is shared across index layers.
     """
 
     # Block-indexed PAGE regions, indexed forward by physical block id.
@@ -152,6 +166,14 @@ class KVTransferTensors:
     scatter_slot: Callable[[int, int], None] | None = None
     # Appended for positional compatibility with existing generic descriptors.
     expected_full_slot_region_count: int | None = None
+    # Producer-side DSA index-page staging. The callback fills one pool slot
+    # with compact destination pages and returns (base_addr, page_count).
+    index_staging_region: KVTransferRegion | None = None
+    index_staging_pool_size: int = 0
+    index_staging_chunk_pages: int = 0
+    gather_sharded_index: Callable[..., tuple[int, int]] | None = None
+    # Appended after the original staging fields for positional compatibility.
+    build_sharded_index_plan: Callable[..., Any] | None = None
 
 
 @dataclass

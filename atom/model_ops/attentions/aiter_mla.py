@@ -166,6 +166,192 @@ def cdiv(a, b):
     return (a + b - 1) // b
 
 
+@dataclass(frozen=True)
+class DCPIndexGatherPlan:
+    """Layer-invariant GPU indices for one sharded-index transfer chunk."""
+
+    dst_pages: int
+    src_block_id_per_token: torch.Tensor
+    src_token: torch.Tensor
+    src_token_tile: torch.Tensor
+    src_token_in_tile: torch.Tensor
+    valid: torch.Tensor
+
+
+def build_dcp_index_gather_plan(
+    src_block_ids,
+    device: torch.device,
+    dcp_size: int,
+    dcp_rank: int,
+    scheduler_block_size: int,
+) -> DCPIndexGatherPlan:
+    """Build the block-id-dependent indices shared by every index layer."""
+
+    src_count = len(src_block_ids)
+    dst_pages = cdiv(src_count, dcp_size)
+    token_count = dst_pages * scheduler_block_size
+    local_token = torch.arange(token_count, device=device, dtype=torch.int64)
+    global_token = local_token * dcp_size + dcp_rank
+    src_ordinal = torch.div(global_token, scheduler_block_size, rounding_mode="floor")
+    src_token = global_token.remainder(scheduler_block_size)
+    valid = src_ordinal < src_count
+
+    if src_count:
+        src_ordinal = src_ordinal.clamp_max(src_count - 1)
+        source_block_ids = torch.as_tensor(
+            src_block_ids, device=device, dtype=torch.int64
+        )
+        src_block_id_per_token = source_block_ids[src_ordinal]
+    else:
+        src_block_id_per_token = torch.empty(0, device=device, dtype=torch.int64)
+
+    return DCPIndexGatherPlan(
+        dst_pages=dst_pages,
+        src_block_id_per_token=src_block_id_per_token,
+        src_token=src_token,
+        src_token_tile=torch.div(src_token, 16, rounding_mode="floor"),
+        src_token_in_tile=src_token.remainder(16),
+        valid=valid,
+    )
+
+
+def gather_dcp_preshuffled_index_pages(
+    source: torch.Tensor,
+    staging: torch.Tensor,
+    plan: DCPIndexGatherPlan,
+    index_head_dim: int,
+    scheduler_block_size: int,
+    block_ratio: int,
+    quant_block_size: int = 128,
+) -> int:
+    """Convert producer index rows into compact consumer preshuffled pages.
+
+    Prefill commonly allocates one-token physical pages, but the indexer views
+    each ``block_ratio``-sized group as one scheduler block and writes MFMA
+    preshuffled data across that contiguous group. Reconstruct that grouped
+    page before gathering. Already-quantized key and scale bytes move directly;
+    no dequantization or requantization occurs.
+    """
+
+    source_page_size = source.shape[1]
+    if scheduler_block_size % 16 or index_head_dim % 16:
+        raise ValueError(
+            "Preshuffled index staging requires scheduler block size and "
+            f"head_dim multiples of 16, got {scheduler_block_size=} and "
+            f"{index_head_dim=}"
+        )
+    if source_page_size * block_ratio != scheduler_block_size:
+        raise ValueError(
+            f"Source physical page {source_page_size} × ratio {block_ratio} "
+            f"does not match scheduler block {scheduler_block_size}"
+        )
+    if index_head_dim % quant_block_size:
+        raise ValueError(
+            f"index_head_dim={index_head_dim} must be divisible by quant_block_size="
+            f"{quant_block_size}"
+        )
+    if plan.dst_pages == 0:
+        return 0
+    dst_pages = plan.dst_pages
+    if dst_pages > staging.shape[0]:
+        raise ValueError(
+            f"Index staging holds {staging.shape[0]} pages, needs {dst_pages}"
+        )
+
+    aligned_index_dim = source.shape[2]
+    page_bytes = scheduler_block_size * aligned_index_dim * source.element_size()
+    if source.shape[0] % block_ratio:
+        raise ValueError(
+            f"Source physical page count {source.shape[0]} is not divisible by "
+            f"block_ratio={block_ratio}"
+        )
+    source_bytes = source.view(torch.uint8).reshape(
+        source.shape[0] // block_ratio, page_bytes
+    )
+    output = staging[:dst_pages, :page_bytes]
+    output.zero_()
+
+    token_tiles = scheduler_block_size // 16
+    column_tiles = index_head_dim // 16
+    source_keys = source_bytes[:, : scheduler_block_size * index_head_dim].reshape(
+        source_bytes.shape[0], token_tiles, column_tiles, 16, 16
+    )
+    selected_keys = source_keys[
+        plan.src_block_id_per_token,
+        plan.src_token_tile,
+        :,
+        plan.src_token_in_tile,
+        :,
+    ]
+    selected_keys.masked_fill_(~plan.valid[:, None, None], 0)
+    output[:, : scheduler_block_size * index_head_dim].reshape(
+        dst_pages, token_tiles, column_tiles, 16, 16
+    ).copy_(
+        selected_keys.reshape(dst_pages, token_tiles, 16, column_tiles, 16).permute(
+            0, 1, 3, 2, 4
+        )
+    )
+
+    scales_per_token = index_head_dim // quant_block_size
+    key_bytes = scheduler_block_size * index_head_dim
+    scale_bytes = scheduler_block_size * scales_per_token * 4
+    source_scales = source_bytes[:, key_bytes : key_bytes + scale_bytes].view(
+        torch.float32
+    )
+    selected_scales = source_scales.reshape(
+        source_bytes.shape[0], scheduler_block_size, scales_per_token
+    )[plan.src_block_id_per_token, plan.src_token]
+    selected_scales.masked_fill_(~plan.valid[:, None], 0)
+    output[:, key_bytes : key_bytes + scale_bytes].view(torch.float32).reshape(
+        dst_pages, scheduler_block_size, scales_per_token
+    ).copy_(selected_scales.reshape(dst_pages, scheduler_block_size, scales_per_token))
+
+    return dst_pages
+
+
+def _mooncake_producer_transfer_configured(config) -> bool:
+    """Whether this worker is a Mooncake P/D producer."""
+
+    transfer_config = getattr(config, "kv_transfer_config", None)
+    if not isinstance(transfer_config, dict) or not transfer_config:
+        return False
+
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    def is_mooncake_producer(sub_config, path):
+        if not isinstance(sub_config, dict):
+            return False
+        try:
+            connector = KVConnectorFactory.canonical_name(
+                sub_config.get("kv_connector"), path=path
+            )
+        except (TypeError, ValueError):
+            return False
+        return (
+            connector == "mooncake"
+            and sub_config.get("kv_role", "kv_producer") == "kv_producer"
+        )
+
+    try:
+        connector = KVConnectorFactory.canonical_name(
+            transfer_config.get("kv_connector"), path="kv_transfer_config"
+        )
+    except (TypeError, ValueError):
+        return False
+    if connector == "mooncake":
+        return is_mooncake_producer(transfer_config, "kv_transfer_config")
+    if connector != "multi":
+        return False
+
+    sub_configs = transfer_config.get("connectors")
+    if not isinstance(sub_configs, list):
+        return False
+    return any(
+        is_mooncake_producer(sub_config, f"kv_transfer_config.connectors[{index}]")
+        for index, sub_config in enumerate(sub_configs)
+    )
+
+
 class AiterMLABackend(AttentionBackend):
     @staticmethod
     def get_name() -> str:
@@ -1092,6 +1278,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
     def get_kv_transfer_tensors(self):
         from atom.kv_transfer.disaggregation.types import (
+            INDEX_CACHE_ROLE,
+            MLA_KV_ROLE,
             KVTransferRegion,
             KVTransferTensors,
         )
@@ -1110,18 +1298,24 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     base_addr=t.data_ptr(),
                     total_bytes=t.numel() * t.element_size(),
                     unit_bytes=bpb,
+                    semantic_role=MLA_KV_ROLE,
                 )
             )
 
         if hasattr(runner, "index_cache"):
+            index_head_dim = runner.config.hf_config.index_head_dim
             for layer_id in range(runner.index_cache.shape[0]):
                 t = runner.index_cache[layer_id]
                 bpb = t.stride(0) * t.element_size() * self.block_ratio
+                tokens_per_page = bpb // runner.aligned_index_dim
                 block_regions.append(
                     KVTransferRegion(
                         base_addr=t.data_ptr(),
                         total_bytes=t.numel() * t.element_size(),
                         unit_bytes=bpb,
+                        semantic_role=INDEX_CACHE_ROLE,
+                        key_plane_bytes=tokens_per_page * index_head_dim,
+                        scale_plane_bytes=tokens_per_page * 4,
                     )
                 )
 
@@ -1175,11 +1369,96 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 for layer_id in local_index_layer_ids
             ]
 
+        index_staging_region = None
+        index_staging_pool_size = 0
+        index_staging_chunk_pages = 0
+        build_sharded_index_plan = None
+        gather_sharded_index = None
+        if (
+            hasattr(runner, "index_cache")
+            and self.dcp_world_size == 1
+            and _mooncake_producer_transfer_configured(runner.config)
+        ):
+            # Mooncake's producer workers can receive requests from a DCP
+            # consumer whose index cache is sharded below one MFMA tile. Keep a
+            # small per-send-thread pool that repacks one index layer at a time;
+            # latent MLA pages continue to transfer directly.
+            index_staging_pool_size = 16
+            index_staging_chunk_pages = 256
+            first_index_page = runner.index_cache[0]
+            page_bytes = (
+                first_index_page.stride(0)
+                * first_index_page.element_size()
+                * self.block_ratio
+            )
+            runner.index_transfer_staging = torch.empty(
+                (
+                    index_staging_pool_size,
+                    index_staging_chunk_pages,
+                    page_bytes,
+                ),
+                dtype=torch.uint8,
+                device=first_index_page.device,
+            )
+            staging = runner.index_transfer_staging
+            index_staging_region = KVTransferRegion(
+                base_addr=staging.data_ptr(),
+                total_bytes=staging.numel() * staging.element_size(),
+                unit_bytes=index_staging_chunk_pages * page_bytes,
+                semantic_role="dsa.index_staging",
+            )
+
+            def build_sharded_index_plan(
+                src_block_ids,
+                dcp_size,
+                dcp_rank,
+                interleave,
+            ):
+                if interleave != 1:
+                    raise ValueError(
+                        "Preshuffled index staging currently supports "
+                        f"interleave=1, got {interleave}"
+                    )
+                return build_dcp_index_gather_plan(
+                    src_block_ids,
+                    first_index_page.device,
+                    dcp_size,
+                    dcp_rank,
+                    runner.config.kv_cache_block_size,
+                )
+
+            def gather_sharded_index(
+                region_idx,
+                plan,
+                pool_idx,
+            ):
+                index_region_idx = region_idx - num_layers
+                if not 0 <= index_region_idx < runner.index_cache.shape[0]:
+                    raise IndexError(
+                        f"Index region {region_idx} maps to invalid cache row "
+                        f"{index_region_idx}"
+                    )
+                slot = staging[pool_idx]
+                pages = gather_dcp_preshuffled_index_pages(
+                    runner.index_cache[index_region_idx],
+                    slot,
+                    plan,
+                    index_head_dim,
+                    runner.config.kv_cache_block_size,
+                    self.block_ratio,
+                )
+                return slot.data_ptr(), pages
+
         return KVTransferTensors(
             block_regions=block_regions,
             slot_regions=[],
             num_blocks=runner.config.num_kvcache_blocks,
             block_region_consumer_indices=block_region_consumer_indices,
+            index_staging_region=index_staging_region,
+            index_staging_pool_size=index_staging_pool_size,
+            index_staging_chunk_pages=index_staging_chunk_pages,
+            build_sharded_index_plan=build_sharded_index_plan,
+            gather_sharded_index=gather_sharded_index,
         )
 
     def _build_dcp_indexer_prefill_meta(self, attn_metadata, bs: int, counts, var):
