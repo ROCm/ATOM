@@ -256,6 +256,21 @@ class PPEngineCoreProc(EngineCore):
         if not self.kv_transfer_enabled:
             return
 
+        # Reclaim any offload save whose completion report never came (worker
+        # crash, dropped completion, LMCache force-unpin). This override fully
+        # replaces the base `_poll_kv_transfer_progress`, whose getattr-guarded
+        # call is the reclaimer's only caller repo-wide; without mirroring it
+        # here, under `pp_size > 1` a stalled save stays in
+        # `Scheduler.deferred_free_blocks` forever -- `has_pending_kv_work()`
+        # stays True, so the engine busy-loops with every GPU idle, the blocks
+        # never return to the pool, and `_drain_kv_work_at_exit` spins to
+        # `KV_SHUTDOWN_DRAIN_TIMEOUT_S` on every shutdown. Self-throttled, so
+        # calling it each poll is cheap; placed above the has_offload /
+        # pp_messages early-returns so a quiet poll still reclaims.
+        reconcile = getattr(self.scheduler, "_reconcile_stalled_deferred_saves", None)
+        if callable(reconcile):
+            reconcile()
+
         # Collect local TP-aggregated output.
         kvoutput = self.runner_mgr.call_func_with_aggregation("async_proc_aggregation")
         if kvoutput is None:
