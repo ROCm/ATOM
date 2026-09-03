@@ -812,31 +812,40 @@ def dcp_local_context_lens(
     dcp_rank: int,
     dcp_world_size: int,
     cp_kv_cache_interleave_size: int,
-    num_rows: int,
+    batch_size: int,
+    next_n: int = 1,
 ) -> torch.Tensor:
-    """This rank's per-request LOCAL KV length under interleave-S sharding.
+    """This rank's LOCAL KV length per query row under interleave-S sharding.
 
     Matches get_dcp_local_seq_lens / prepare_decode's slot split: each full S*W
     super-block gives every rank S tokens, and the tail remainder is handed out
     S at a time by rank. S=1 -> the round-robin base + (does this rank own the
     +1 tail?) split.
 
-    Depends only on context_lens / S / W / dcp_rank, so it is the same for every
-    layer and prepare_decode already computes it on the host. Prefer that
-    published buffer -- deriving it here costs 7 elementwise kernels on every
-    full-index layer (21 of them on GLM-5.2). The fallback keeps metadata
-    builders that do not publish it working.
+    For plain decode (``next_n=1``), one row represents one request and sees its
+    full context. For MTP verify, row ``(request, j)`` sees global prefix
+    ``ctx - next_n + 1 + j``. Returns one request-major flat int32 tensor with
+    ``batch_size * next_n`` entries.
+
+    Prepare-decode publishes the appropriate layer-invariant buffer on the host;
+    prefer it to avoid repeating device arithmetic on every full-index layer.
+    The fallback keeps metadata builders that do not publish it working.
     """
+    num_rows = batch_size * next_n
     local_ctx = get_published_dcp_local_context_lens(attn_metadata, num_rows)
     if local_ctx is not None:
         return local_ctx
-    g_ctx = attn_metadata.context_lens
+
     S = cp_kv_cache_interleave_size
     W = dcp_world_size
-    full_chunks = g_ctx // (S * W)
-    base = full_chunks * S
-    remainder = (g_ctx - base * W - dcp_rank * S).clamp(0, S)
-    return (base + remainder).to(torch.int32)
+    g_ctx = attn_metadata.context_lens[:batch_size].to(torch.int64)
+    pos = torch.arange(next_n, device=g_ctx.device, dtype=torch.int64)
+    # Global prefix visible to each query position, clamped for the short
+    # contexts a padded cudagraph batch leaves behind.
+    visible = (g_ctx[:, None] - next_n + 1 + pos[None, :]).clamp_(min=0)
+    base = (visible // (S * W)) * S
+    remainder = (visible - base * W - dcp_rank * S).clamp_(0, S)
+    return (base + remainder).to(torch.int32).reshape(-1)
 
 
 # ---------------------------------------------------------------------------
@@ -902,12 +911,10 @@ def dcp_decode_candidate_exchange_fused(
     # scheduled -- NOT padded_q_fp8_decode_tokens.shape, which is the padded
     # capture width. Sizing off the padded array walks rows nothing scheduled
     # and hands attention a width it did not ask for (upstream 0b4f1ddba).
-    next_n = padded_q_fp8_decode_tokens.shape[1]
     assert attn_metadata.max_seqlen_q == 1, (
         "DCP + DeepSeek-V3.2 sparse indexer (DSA) currently supports "
         "qlen=1 decode only (MTP verify not yet supported)."
     )
-
     local_ctx = dcp_local_context_lens(
         attn_metadata,
         dcp_rank,
@@ -948,7 +955,7 @@ def dcp_decode_candidate_exchange_fused(
     )
     top_k_per_row_decode(
         local_logits,
-        next_n,
+        1,
         local_ctx,
         local_idx,
         num_decode_tokens,

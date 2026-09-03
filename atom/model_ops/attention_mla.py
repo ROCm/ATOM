@@ -746,13 +746,8 @@ class MLAAttention(nn.Module):
 
         self.dcp_persistent_supported = dcp_persistent_supported()
         self.dcp_prefill_merge_bf16_ok = dcp_prefill_merge_bf16_ok()
-        # Scope sparse persistent DCP to native non-speculative attention.
-        # Decode is q_len=1; sparse prefill is represented as per-token virtual
-        # q_len=1 rows. Plugin DCP reconfigures its group after construction.
         self.sparse_dcp_metadata_rebuild = (
-            self.is_sparse_mla
-            and self.dcp_world_size > 1
-            and getattr(atom_config, "speculative_config", None) is None
+            self.is_sparse_mla and self.dcp_world_size > 1
         )
 
         # Compacted per-layer sparse offsets for DCP decode; rebound by the
@@ -2129,8 +2124,8 @@ class MLAAttention(nn.Module):
                     paged_kv_indptr = attn_metadata.sparse_kv_indptr[: B + 1]
                     paged_kv_indices = self.sparse_kv_indices_buffer
                     paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens[:B]
-                    if self.dcp_world_size > 1:
-                        paged_kv_indptr = self.dcp_sparse_kv_indptr_buffer[: B + 1]
+                if self.dcp_world_size > 1:
+                    paged_kv_indptr = self.dcp_sparse_kv_indptr_buffer[: B + 1]
 
             dp_size = get_dp_group().world_size
             use_persistent_mode = should_use_persistent_mode(
@@ -2162,6 +2157,7 @@ class MLAAttention(nn.Module):
                     paged_cu_seqlens_q,
                     paged_kv_indptr,
                     paged_kv_last_page_lens,
+                    work_prefix="sparse_mtp_" if is_sparse_mtp else "",
                 )
 
             if not use_persistent_mode:
