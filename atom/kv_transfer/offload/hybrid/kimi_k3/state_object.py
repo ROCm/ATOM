@@ -128,33 +128,33 @@ class StateByteCodec:
         obj = self._allocate(self.entry_bytes)
         if obj is None:
             return False
-        # `batched_put` discharges the reference it is handed -- but only if
-        # reached. A throwing `pack` skips it and strands the allocation at
-        # ref_count=1 (LMCache reports "garbage collected with ref_count=1,
-        # pin_count=0" much later), shrinking the CPU pool one entry per failure.
-        # `get` guards its own reference with `finally` for the same reason.
+        # `batched_put` discharges the reference it is handed, but only in its
+        # terminal tail loop (LMCache `storage_manager.py`, one
+        # `ref_count_down()` per object), which runs *after* every step that can
+        # raise -- the scheduler-role guard, `get_allocator_backend`,
+        # `allocate_and_copy_objects`, `batched_submit_put_task`. So the down is
+        # `batched_put`'s last action: on a successful return the reference is
+        # already discharged, and there is no window where the object is adopted
+        # yet a later step raises.
         #
-        # `handed_off` draws the line the bare `except` could not: it cannot tell
-        # "never reached `batched_put`" (must down the ref) from "reached it, it
-        # took ownership, then something raised" (must NOT down it). The second
-        # case is real -- an NVMe/L3 backend error or an eviction-path raise
-        # inside LMCache's put, after the CPU insert. Downing there drives the
-        # count to -1 / returns a still-indexed buffer to the allocator, and a
-        # later `get` for a DIFFERENT key hands that buffer back: wrong bytes
-        # unpacked into a request's Active Slot, no exception anywhere. Once the
-        # reference is passed to `batched_put`, ownership is its, success or raise.
-        handed_off = False
+        # That means on ANY exception below -- from `pack`, from
+        # `on_source_released`, or from a pre-adoption raise inside
+        # `batched_put` -- the reference was never downed and we still own it, so
+        # we down it exactly once. The earlier `handed_off = True` set *before*
+        # the call did the opposite: it suppressed the down on a pre-adoption
+        # `batched_put` raise, stranding the allocation at ref_count=1 (LMCache
+        # reports "garbage collected with ref_count=1, pin_count=0" much later)
+        # and shrinking the CPU pool one entry per failure. `get` guards its own
+        # reference with `finally` for the same reason.
         try:
             self._staged.pack(self._backend.page_unit_views(unit_ids), obj)
             # Source first: `pack` has synchronized the stream that reads the
             # units, so nothing on the device touches them from here.
             if on_source_released is not None:
                 on_source_released()
-            handed_off = True
             self._storage.batched_put([key], [obj])
         except Exception:
-            if not handed_off:
-                obj.ref_count_down()
+            obj.ref_count_down()
             raise
         return True
 
