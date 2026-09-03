@@ -1645,6 +1645,9 @@ class Scheduler:
         )
         checkpoints.store.attach_store_queue(queue)
         self.state_store_queue = queue
+        # Re-attached with the queue so its counters reach `checkpoint_funnel`
+        # alongside the index's.
+        self.block_manager.attach_state_offload(index, store_queue=queue)
         logger.info(
             "state offload: engine index attached (store=%s load=%s chunk=%d)",
             index.can_store,

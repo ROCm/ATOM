@@ -40,6 +40,109 @@ Prefix caching remains disabled because the KDA recurrent state is maintained pe
 
 ---
 
+## CPU offload for KV and KDA state (opt-in)
+
+The launch lines above pass `--no-enable_prefix_caching`, so they run none of the
+offload path. To serve K3 with the `lmcache_offload` connector — dense MLA KV
+chunks *plus* a CPU tier for the KDA recurrent state — use this shape instead:
+
+```bash
+export AITER_LOG_LEVEL=WARNING
+export LMCACHE_LOCAL_CPU=True
+export LMCACHE_MAX_LOCAL_CPU_SIZE=96      # GiB, KV *and* state share this pool
+export LMCACHE_CHUNK_SIZE=1024            # = block_size × decode_context_parallel_size
+
+python -m atom.entrypoints.openai_server \
+  --model /models/Kimi-K3 --trust-remote-code \
+  --tensor-parallel-size 8 --decode-context-parallel-size 8 \
+  --kv_cache_dtype fp8 --block-size 128 \
+  --max-num-seqs 32 --max-num-batched-tokens 8192 --gpu-memory-utilization 0.86 \
+  --enable_prefix_caching --state-checkpoint-interval-tokens -1 \
+  --kv-transfer-config '{"kv_connector":"lmcache_offload","kv_role":"offload"}'
+```
+
+`--enable_prefix_caching` is **required**. The whole tier hangs off the
+prefix-cache admission path: the joint boundary is chosen while the block manager
+walks the HBM prefix cache, and with prefix caching off there is no walk, no
+boundary and no load.
+
+`--state-checkpoint-interval-tokens -1` keeps state checkpointing on but places
+no fixed interval rungs — checkpoints are taken at the demand rung and the
+prompt-end anchor only. `0` would disable state checkpointing outright and with
+it the whole tier; a positive value is a rung every N tokens and is also valid,
+at the cost of more checkpoints kept.
+
+### `LMCACHE_CHUNK_SIZE` must be a multiple of the hash block size
+
+The prefix-cache hash block size is `block_size × decode_context_parallel_size`
+(`BlockManager.hash_block_size`) — 1024 in the configuration above. The KV leg of
+a joint load moves whole LMCache chunks, so `BlockManager._joint_kv_boundary`
+floors the claim to the chunk grid; if that floored claim is not also a multiple
+of the hash block size the boundary is **refused** and counted as
+`joint_skip_claim_off_hash_grid`. It refuses rather than re-flooring because the
+tail between the two grids would land in a fresh, unfilled block that
+`num_cached_tokens` then counts as computed — silent wrong output.
+
+If your chunk size and hash block size do not divide, **raise** the chunk size to
+a multiple of the hash block size. Do not lower it: a smaller chunk does not make
+the grids divide, and every boundary is lost the same way.
+
+### Sizing
+
+`LMCACHE_MAX_LOCAL_CPU_SIZE` is the one size to tune. KV chunks and state objects
+go into a single LMCache pool under a single LRU, deliberately: a state boundary
+whose KV has been evicted is worthless, so the two should cool at the same rate.
+There is no separate state-size knob.
+
+### Pipeline parallelism is refused
+
+The LMCache key carries no PP component, so two stages at the same TP rank would
+overwrite each other's state images. `pipeline_parallel_size > 1` therefore
+raises at startup with a message naming the value. Run with
+`pipeline_parallel_size=1`, or drop `--kv-transfer-config`.
+
+### Confirming it is actually running
+
+At startup each rank logs
+
+```text
+kimi_k3 offload: state tier up, entry=... MiB rank=..., sharing the paged-KV CPU pool, layout=...
+state offload: engine index attached (store=True load=True chunk=1024)
+```
+
+If the first line is missing, the worker built no tier — the same code path logs
+a `kimi_k3 offload: ...` warning naming which probe failed (no attention backend,
+no checkpoint layout id, no per-request state views, no `page_unit_views`, or an
+image/slot byte mismatch).
+
+Then read the funnel, which `BlockManager.checkpoint_funnel()` assembles and the
+server exposes at `GET /debug/cache_stats`:
+
+```bash
+curl -s localhost:8000/debug/cache_stats | python3 -m json.tool
+```
+
+| Key | Reading |
+|-----|---------|
+| `joint_boundaries` | Joint KV+state boundaries committed. Zero means nothing was ever offered to the tier. |
+| `state_hbm_boundaries` / `state_tier_boundaries` | Of those, how many were served from the HBM checkpoint pool versus the CPU tier. Only the second exercises this code. |
+| `joint_skip_<reason>` | One bucket per refusal reason, e.g. `joint_skip_off`, `joint_skip_no_chunk_size`, `joint_skip_lmcache_within_hbm`, `joint_skip_hbm_off_chunk_grid`, `joint_skip_no_room_above_hbm`, `joint_skip_no_rung_above_hbm`, `joint_skip_covering_chunk_beyond_lookup`, `joint_skip_claim_off_hash_grid`. |
+| `stores_attempted` / `stores_completed` / `stores_failed` / `stores_refused` | The store leg. `stores_completed` against `checkpoints_kept` is how much of what HBM keeps the CPU tier never received. |
+| `loads_dispatched` / `loads_settled` / `loads_outstanding` | The load leg's lifecycle; `dispatched == settled + outstanding` always holds. |
+| `loads_completed` / `loads_failed` | `loads_failed / loads_dispatched` is the index's false-positive rate — hashes it still advertised after LMCache's LRU dropped the bytes. |
+| `indexed` / `hashes_evicted` | Hashes the engine believes are in LMCache, and how many the index itself dropped. |
+
+The diagnostic reading is the pair: `joint_boundaries == 0` with one
+`joint_skip_*` bucket carrying all the counts tells you exactly which gate
+refused. `joint_skip_off` means no tier is attached at all;
+`joint_skip_no_paged_checkpoints` means the sequence carries no per-request state
+or the runtime published no paged checkpoint coordinator;
+`joint_skip_claim_off_hash_grid` is the chunk size above; and
+`joint_skip_lmcache_within_hbm` or `joint_skip_no_rung_above_hbm` is the benign
+case where LMCache held nothing usable beyond what HBM already had.
+
+---
+
 ## Accuracy test
 
 Start the server as above, then run the full 1319-question GSM8K evaluation:

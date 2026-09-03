@@ -67,7 +67,7 @@ Four rules carry the module:
 | File | Role |
 |------|------|
 | `__init__.py` | Registers the `lmcache_offload` backend with `KVConnectorFactory`. |
-| `connector.py` | Public config-only `dense`/`hybrid` selector and thin worker/scheduler delegation shells. |
+| `connector.py` | Public config-only `dense`/`hybrid`/`kimi_k3` selector and thin worker/scheduler delegation shells. |
 | `_offload_common.py` | Shared LMCache engine construction, role validation, executors, and completion plumbing. |
 | `_block_gpu_connector.py` | Family-neutral raw-block LMCache `GPUConnectorInterface`; DCP-aware bounded staging and two-stage copies. |
 | `config.py` | Builds the per-rank `LMCacheEngineConfig` + `LMCacheMetadata` from `LMCACHE_*` env and `kv_transfer_config` extras. |
@@ -79,6 +79,11 @@ Four rules carry the module:
 | `hybrid/dsv4/policy.py` | DSV4 geometry/profile, PAGE/SLOT cadence, prefix hashes, fingerprint, committed-checkpoint policy, and bounded staging-row admission. |
 | `hybrid/dsv4/codec.py` | `DSV4PageSlotCodec`, `DSV4CheckpointCodec`, and `DSV4CheckpointStore`: unified GPU layout plans plus AOS1 framing/storage. |
 | `hybrid/dsv4/triton_page_slot.py` | Raw-`uint8` PAGE/SLOT gather/scatter kernels; PAGE is forward-indexed and SLOT is reverse-indexed. |
+| `hybrid/kimi_k3/__init__.py` | Kimi-K3 layout package: dense paged KV plus the KDA per-request state tier. |
+| `hybrid/kimi_k3/connector.py` | `KimiK3OffloadConnector` / `KimiK3OffloadScheduler`: extends the dense layout with the recurrent-state legs, aims both legs at one joint boundary, and owns the `k3_state` completion channel. |
+| `hybrid/kimi_k3/state_tier.py` | `StateOffloadTier`: worker-side state transfers. The load is synchronous on the load task's own thread (one task, one completion for both legs); the store keeps an executor and reports two phases — source released, then put resolved. |
+| `hybrid/kimi_k3/state_object.py` | `StateByteCodec`: one checkpoint as one opaque `K3S1`-framed LMCache object keyed by ATOM's prefix hash. State bytes cannot be sliced by token, so LMCache's token-chunk database is bypassed. |
+| `hybrid/kimi_k3/staging.py` | `StagedTransfer`: whole-entry GPU staging — bounded device buffer, two copy streams and the event handshake from `atom_lmcache_staging`, without `BlockGPUConnector`'s chunk orchestration. |
 | `atom_lmcache_staging.py` | Per-thread CUDA streams, staging buffer, ready/free events, env helpers. |
 
 ## Architecture
@@ -1269,6 +1274,23 @@ python3 multi-round-qa.py \
 - **`min_load` is ATOM-standalone only.** The vLLM-plugin path
   (`LMCacheConnectorV1`) does not consume `OFFLOAD_MIN_LOAD_TOKENS`; its analog is
   LMCache's `min_retrieve_tokens` (default 0 — no threshold).
+- **Kimi-K3: a process restart makes even the surviving KV unreadable.** The
+  engine-side `StateOffloadIndex` is in memory and is never persisted, so after a
+  restart it is empty and no joint boundary can be formed — which means K3 cannot
+  read back even the KV that LMCache still holds. This is worse than the dense
+  layout, and it makes a persistent NVMe tier much less valuable for K3. It is a
+  known design limit rather than a bug: LMCache's own `LocalDiskBackend` starts
+  from an empty dict and never scans its directory, so an index recovered from
+  disk would be a pure false-positive generator (see the module docstring of
+  `atom/model_engine/state_offload.py`). Loosening the KV gate does not fix it
+  either, because `num_cached_tokens` is the single skip knob for both legs: a
+  claim of 0 makes the prefill recompute `[0, n)` through every layer, including
+  the paged-attention layers, which rewrite the very KV blocks just fetched.
+- **Kimi-K3: pipeline parallelism is refused at startup.** `CacheEngineKey` has
+  no PP component, so two stages at one TP rank would overwrite each other's
+  state images. `_build_state_tier` raises rather than running with the tier
+  silently off; run with `pipeline_parallel_size=1` or drop
+  `--kv-transfer-config`.
 - **GDS / NVMe-direct is disabled.** `config.py` forces `use_gds=False` (cufile
   init hangs without NVMe-GDS hardware here); the NVMe tier goes through LMCache's
   host path.

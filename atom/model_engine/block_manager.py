@@ -263,6 +263,7 @@ class BlockManager:
         # engine re-deriving it from config is how the two come to disagree.
         # None is the inert case -- every joint path takes `_no_joint("off")`.
         self.state_offload: StateOffloadIndex | None = None
+        self.state_store_queue = None
         # The joint-boundary funnel. `joint_skips` is bucketed by reason because
         # a silent zero is indistinguishable from a feature that ran and found
         # nothing, which is exactly how this subsystem was mis-diagnosed before.
@@ -272,7 +273,7 @@ class BlockManager:
         self.state_gate_lost_boundary: int = 0
         self.joint_skips: dict[str, int] = {}
 
-    def attach_state_offload(self, index: StateOffloadIndex) -> None:
+    def attach_state_offload(self, index: StateOffloadIndex, store_queue=None) -> None:
         """Install the state offload tier's index, once, at startup.
 
         The connector reports what it can do -- store, load, and the LMCache
@@ -282,6 +283,11 @@ class BlockManager:
         worker validates it against another, which is silent wrong output.
         """
         self.state_offload = index
+        # Held only so `checkpoint_funnel` can surface its counters. A counter
+        # incremented somewhere and read nowhere is how this subsystem's
+        # defects previously stayed silent, so the queue's stats reach the same
+        # funnel as the index's or they do not exist.
+        self.state_store_queue = store_queue
         if self.paged_state_checkpoints is not None:
             self.paged_state_checkpoints.attach_offload(index)
 
@@ -1721,6 +1727,7 @@ class BlockManager:
                 "state_gate_lost_boundary": self.state_gate_lost_boundary,
             }
             | self.state_offload.stats()
+            | ({} if self.state_store_queue is None else self.state_store_queue.stats())
             | {f"joint_skip_{k}": v for k, v in sorted(self.joint_skips.items())}
         )
 

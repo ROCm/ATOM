@@ -35,6 +35,7 @@ from atom.model_engine.state_runtime import (
     StateRuntime,
     StateTransfer,
 )
+from atom.model_engine.state_store_queue import StateStoreQueue
 
 BLOCK = 4
 MIN_FORK = 8
@@ -1418,6 +1419,33 @@ class TestPagedCopyCheckpoint:
 
         assert second.state_slot != -1, "a recompute still needs a slot"
         assert bm.state_gate_lost_boundary == lost_before + 1
+
+    def test_every_offload_counter_is_reachable_from_the_funnel(self):
+        """A counter incremented somewhere and read nowhere is not observability.
+
+        Both objects' `stats()` must reach `checkpoint_funnel`, because that is
+        what the accuracy run asserts on. Asserted rather than documented: the
+        claim lives in two docstrings and neither one can fail.
+        """
+        bm = make_block_manager(
+            paged_copy_config(),
+            state_runtime=PAGED_COPY_RUNTIME,
+        )
+        index = StateOffloadIndex(
+            can_store=True,
+            can_load=True,
+            chunk_tokens=1024,
+            release_slot=lambda slot: None,
+        )
+        queue = StateStoreQueue(
+            store=bm.paged_state_checkpoints.store, index=index, max_inflight=2
+        )
+        bm.attach_state_offload(index, store_queue=queue)
+
+        funnel = bm.checkpoint_funnel()
+        missing = (set(index.stats()) | set(queue.stats())) - set(funnel)
+        assert not missing, f"counters incremented but never read: {sorted(missing)}"
+        assert "joint_boundaries" in funnel
 
     def test_a_missing_gated_checkpoint_is_served_by_the_offload_tier(self):
         """The same miss, with the tier holding the image: a load is dispatched
