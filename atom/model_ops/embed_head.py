@@ -250,7 +250,7 @@ class ParallelLMHead(VocabParallelEmbedding):
                 last_indices = attn_metadata.cu_seqlens_q[1:] - 1
                 x = x[last_indices].contiguous()
             if self._can_use_dp_sharded_head(context):
-                return self._dp_sharded_logits(x)
+                return self._dp_sharded_logits(x, envs.ATOM_DP_LM_HEAD_MODE)
         logits = tgemm.mm(x, self.weight, self.bias)
         if self.tp_size > 1:
             use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
@@ -286,6 +286,13 @@ class ParallelLMHead(VocabParallelEmbedding):
             assert (
                 out.dtype == torch.long and out.device == x.device
             ), "argmax out must be an int64 tensor on the input device"
+        # Pure-DP draft: shard the vocab across the DP group instead of a
+        # replicated full-vocab GEMM. Env first so a disabled build skips the
+        # context lookup.
+        if envs.ATOM_DP_DRAFT_ARGMAX and self._can_use_dp_sharded_argmax(
+            get_forward_context().context
+        ):
+            return self._dp_sharded_logits(x, "argmax", out)
         logits = tgemm.mm(x, self.weight, self.bias)  # [N, vocab/tp]
         if self.tp_size <= 1:
             token = logits.argmax(dim=-1)
@@ -347,33 +354,37 @@ class ParallelLMHead(VocabParallelEmbedding):
             return False
         return get_forward_context().dp_metadata is not None
 
-    def _dp_sharded_logits(self, x: torch.Tensor) -> torch.Tensor:
-        """Full-vocab logits for this rank's own rows via a DP-sharded head.
+    def _dp_sharded_logits(
+        self, x: torch.Tensor, mode: str, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """This rank's own rows out of a DP-vocab-sharded lm_head.
 
-        x: ``[local_rows, dim]`` (this DP rank's tokens). Under uniform decode
-        every rank pads to the DP-wide ``running_tokens`` so the collective is
-        fixed-size and identical on all ranks; the padded tail is dropped at the
-        end. returns: ``[local_rows, vocab]``.
+        Shared front half: pad x to the DP-agreed ``running_tokens``, all-gather
+        hidden across DP (fixed-size, identical on all ranks), and project onto
+        this rank's vocab slice. ``mode`` then picks the exchange:
+
+        - ``"argmax"``: reduce each shard to a packed ``(max, global_id)`` and
+          all-gather only ``[Σrows, 2]``, then pick the winner -> ``[local_rows]``
+          int64 ids (drafting; ``out``, if given, receives them).
+        - ``"all2all"`` / ``"allgather"``: exchange full-vocab logits ->
+          ``[local_rows, vocab]`` (the decode head).
         """
-        mode = envs.ATOM_DP_LM_HEAD_MODE
         dp_group = get_dp_group()
         dp_size = dp_group.world_size
         dp_rank = dp_group.rank_in_group
         vshard = self.num_embeddings // dp_size
+        use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
 
-        fc = get_forward_context()
         local_rows = x.shape[0]
-        max_rows = int(fc.context.running_tokens)
+        max_rows = int(get_forward_context().context.running_tokens)
         # running_tokens is the padded height, so local_rows <= max_rows always;
-        # keep the guard as a loud tripwire rather than a silent DP-wide hang.
+        # a loud tripwire beats a silent DP-wide hang on a size mismatch.
         assert local_rows <= max_rows, (
-            f"DP LM head: local_rows={local_rows} > running_tokens={max_rows}; "
+            f"DP sharded head: local_rows={local_rows} > running_tokens={max_rows}; "
             "hidden height exceeds the DP-uniform gather bucket."
         )
         if local_rows < max_rows:
             x = torch.cat([x, x.new_zeros(max_rows - local_rows, x.shape[1])], dim=0)
-
-        use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
 
         # [max_rows, dim] -> [dp_size * max_rows, dim] (rank-major concat).
         gathered = dp_group.all_gather(x.contiguous(), dim=0, use_custom=use_custom)
@@ -384,31 +395,68 @@ class ParallelLMHead(VocabParallelEmbedding):
             else self.bias[dp_rank * vshard : (dp_rank + 1) * vshard]
         )
         logits_shard = tgemm.mm(gathered, w, b)  # [dp_size * max_rows, V/dp]
+        start = dp_rank * max_rows
+
+        if mode == "argmax":
+            # Reduce each shard to (max, global_id); exchange only [Σrows, 2].
+            packed = lm_head_argmax_pack(logits_shard, dp_rank * vshard)
+            gathered_packed = dp_group.all_gather(
+                packed, dim=0, use_custom=use_custom
+            ).view(dp_size, dp_size * max_rows, 2)
+            winner = gathered_packed[:, :, 0].argmax(dim=0)  # [Σrows] winning shard
+            token = (
+                gathered_packed[:, :, 1]
+                .gather(0, winner.unsqueeze(0))
+                .squeeze(0)
+                .to(torch.long)
+            )[
+                start : start + local_rows
+            ]  # keep own rows
+            return token if out is None else out.copy_(token)
 
         if mode == "all2all":
-            # Send each destination rank only the block of rows it owns; receive
-            # this rank's rows on every peer's vocab shard.
+            # Send each destination rank only the rows it owns; receive this
+            # rank's rows on every peer's vocab shard.
             logits_shard = logits_shard.contiguous()
-            out = torch.empty_like(logits_shard)
+            recv = torch.empty_like(logits_shard)
             torch.distributed.all_to_all_single(
-                out.view(-1), logits_shard.view(-1), group=dp_group.device_group
+                recv.view(-1), logits_shard.view(-1), group=dp_group.device_group
             )
-            # out is source-major [dp_size, max_rows, vshard]; the sampler wants
-            # the vocab shards concatenated along dim 1. The (dp <-> rows) axis
-            # swap is non-contiguous, so the following reshape materialises one
-            # copy — inherent to converting all-to-all's source-major output to
-            # row-major full-vocab logits. Slice to the real rows *before* the
-            # reshape so the copy only touches local_rows (not the padded tail).
+            # recv is source-major [dp_size, max_rows, vshard]; the sampler wants
+            # the vocab shards along dim 1. That (dp <-> rows) swap is
+            # non-contiguous, so the reshape copies -- slice to the real rows
+            # first so the copy only touches local_rows, not the padded tail.
             return (
-                out.view(dp_size, max_rows, vshard)[:, :local_rows, :]
+                recv.view(dp_size, max_rows, vshard)[:, :local_rows, :]
                 .permute(1, 0, 2)
                 .reshape(local_rows, dp_size * vshard)
             )
 
-        # mode == "allgather": all-gather every rank's [Σrows, V/dp] shard into
-        # the full vocab, then scatter this rank's own row block.
+        # "allgather": materialise the full vocab on every rank, keep own rows.
         global_logits = dp_group.all_gather(
             logits_shard, dim=1, use_custom=use_custom
         )  # [Σrows, V]
-        start = dp_rank * max_rows
         return global_logits[start : start + local_rows].contiguous()
+
+    # Draft greedy argmax reuses `_dp_sharded_logits(mode="argmax")`: a draft's
+    # replicated [N, V] GEMM is weight-read bound at the tiny draft M, so sharding
+    # the vocab ([H, V/dp]) and exchanging only the packed [N, 2] argmax pays.
+    def _can_use_dp_sharded_argmax(self, context) -> bool:
+        """Whether a draft step may run the DP-sharded argmax.
+
+        Every DP rank must reach the same verdict, so every gated value is
+        DP-agreed. `running_tokens_are_unified` marks a rectangular draft (a
+        ragged one falls back); `running_tokens` is bounded because the hidden
+        gather outgrows the weight-read saving past ATOM_DP_DRAFT_ARGMAX_MAX_ROWS.
+        """
+        if not envs.ATOM_DP_DRAFT_ARGMAX or self.tp_size != 1:
+            return False
+        dp_group = get_dp_group()
+        if dp_group.world_size <= 1 or self.num_embeddings % dp_group.world_size != 0:
+            return False
+        return (
+            context is not None
+            and getattr(context, "is_draft", False)
+            and getattr(context, "running_tokens_are_unified", False)
+            and int(context.running_tokens) <= envs.ATOM_DP_DRAFT_ARGMAX_MAX_ROWS
+        )
