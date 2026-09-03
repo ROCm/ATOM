@@ -39,11 +39,13 @@ from atom.model_engine.sequence import (
     SequenceType,
     new_token_ids,
 )
+from atom.model_engine.state_offload import StateOffloadIndex
 from atom.model_engine.state_runtime import (
     DEFAULT_STATE_RUNTIME,
     StateMaintenanceOps,
     StateRuntime,
 )
+from atom.model_engine.state_store_queue import StateStoreQueue
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -526,6 +528,8 @@ class Scheduler:
         from atom.utils.forward_context import get_kvconnector
 
         self.kv_connector = get_kvconnector("scheduler", config)
+        self.state_store_queue = None
+        self._attach_state_offload()
 
         from atom.distributed.kv_events import (
             EventPublisher as _EventPublisher,
@@ -1600,6 +1604,122 @@ class Scheduler:
             and len(seq.block_table) > 0
         )
 
+    def _attach_state_offload(self) -> None:
+        """Build the state offload tier's engine-side halves, if one is hosted.
+
+        Everything here is driven by what the CONNECTOR reports -- whether it
+        can store, whether it can load, and the LMCache chunk grid. The engine
+        re-deriving those from config is what gives one fact two derivations,
+        and the chunk grid is the one that must not have two: the engine floors
+        a joint boundary against it while the worker's transfer is validated
+        against it, so a disagreement is silent wrong output.
+
+        A connector that hosts no state tier reports nothing and everything here
+        stays None, which leaves every joint path at `_no_joint("off")`.
+        """
+        capability = getattr(self.kv_connector, "state_tier_capability", None)
+        if capability is None:
+            return
+        reported = capability()
+        chunk_tokens = int(reported.get("chunk_tokens", 0) or 0)
+        if chunk_tokens <= 0:
+            logger.warning(
+                "state offload: the connector reports no LMCache chunk size, so "
+                "no joint boundary can be aligned; state tier off."
+            )
+            return
+        index = StateOffloadIndex(
+            can_store=bool(reported.get("can_store", False)),
+            can_load=bool(reported.get("can_load", False)),
+            chunk_tokens=chunk_tokens,
+            release_slot=self.block_manager.state.release,
+        )
+        self.block_manager.attach_state_offload(index)
+        checkpoints = getattr(self.block_manager, "paged_state_checkpoints", None)
+        if checkpoints is None or not index.can_store:
+            return
+        queue = StateStoreQueue(
+            store=checkpoints.store,
+            index=index,
+            max_inflight=self._state_store_max_inflight(),
+        )
+        checkpoints.store.attach_store_queue(queue)
+        self.state_store_queue = queue
+        logger.info(
+            "state offload: engine index attached (store=%s load=%s chunk=%d)",
+            index.can_store,
+            index.can_load,
+            chunk_tokens,
+        )
+
+    def _state_store_max_inflight(self) -> int:
+        """How many state stores may pin PAGE units at once.
+
+        Asked of the connector rather than parsed from a second env var: each
+        in-flight store holds a whole checkpoint's units out of the KV pool, and
+        two independent caps would admit their sum.
+        """
+        reported = getattr(self.kv_connector, "max_pending_saves", None)
+        try:
+            value = int(reported() if callable(reported) else reported)
+        except (TypeError, ValueError):
+            value = 0
+        return max(1, value or 2)
+
+    def _state_abandon_timeout_s(self) -> float:
+        """How long a lost state report is waited on before its pin is reclaimed.
+
+        Asked of the connector, which owns the backend's own liveness clock, so
+        this cannot be tightened independently of it. A reclaim window shorter
+        than the transfer it is watching turns the reclaimer into the hazard it
+        exists to prevent: it hands back a slot or a unit set the worker may
+        still be reading.
+        """
+        reported = getattr(self.kv_connector, "save_abandon_timeout_s", None)
+        try:
+            value = float(reported() if callable(reported) else reported)
+        except (TypeError, ValueError):
+            value = 0.0
+        return value if value > 0 else 600.0
+
+    def _advance_state_offload(self) -> None:
+        """One pass of the state tier's engine side: settle, dispatch, reclaim.
+
+        Called from the connector-output path, which runs every step, so a store
+        report is applied in the pass it arrives and the PAGE units it releases
+        are back in the pool for the next admission.
+        """
+        # Guarded rather than direct: this runs from the connector-output path,
+        # which several partial harnesses drive without a full block manager.
+        index = getattr(getattr(self, "block_manager", None), "state_offload", None)
+        if index is None:
+            return
+        queue = self.state_store_queue
+        events = getattr(self.kv_connector, "take_state_events", None)
+        for kind, value, ok in events() if events is not None else ():
+            if kind == "miss":
+                # The only event that may retract a hash. A fused load verdict
+                # of "failed" may mean the KV leg, and retracting on that would
+                # permanently deny state bytes that are still present.
+                index.forget(int(value))
+            elif queue is None:
+                continue
+            elif kind == "src":
+                queue.settle_source(value)
+            elif kind == "put":
+                queue.settle_stored(value, ok)
+        if queue is None:
+            return
+        timeout_s = self._state_abandon_timeout_s()
+        queue.reclaim(timeout_s)
+        index.reclaim(timeout_s)
+        enqueue = getattr(self.kv_connector, "enqueue_state_stores", None)
+        if enqueue is None:
+            return
+        specs = queue.take(self._state_store_max_inflight())
+        if specs:
+            enqueue(specs)
+
     def _query_connector_prefill_match(self, seq: Sequence, *, skip: bool) -> bool:
         """Ask the connector whether this prefill should park for remote KV."""
         if skip or self.kv_connector is None:
@@ -2635,9 +2755,18 @@ class Scheduler:
             )
             self.failed_recving_kv_req_ids.append(req_id)
 
+        # One completion per dispatch covers BOTH legs, so settling the state
+        # index here is the whole of its terminal handling -- there is no second
+        # report to reconcile against.
+        self._advance_state_offload()
+        state_index = getattr(
+            getattr(self, "block_manager", None), "state_offload", None
+        )
         for req_id in kv_connector_output.finished_loading or ():
             assert is_offload, "Only offload connector should update loading KV status"
             logger.debug("Finished offload KV load for request %s", req_id)
+            if state_index is not None:
+                state_index.settle(req_id, ok=True)
             if self._finish_aborted_load_cleanup(req_id):
                 continue
             self.finished_recving_kv_req_ids.append(req_id)
@@ -2650,6 +2779,8 @@ class Scheduler:
                 "Offload KV load failed for request %s; falling back to prefill.",
                 req_id,
             )
+            if state_index is not None:
+                state_index.settle(req_id, ok=False)
             if self._finish_aborted_load_cleanup(req_id):
                 continue
             self.failed_recving_kv_req_ids.append(req_id)
