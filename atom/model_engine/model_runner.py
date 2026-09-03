@@ -1059,6 +1059,15 @@ class ModelRunner:
         if not self.still_running:
             return
         self.still_running = False
+        # 0. Join any offload connector's copy threads. Its ThreadPoolExecutors
+        #    are non-daemon, so leaving them running wedges interpreter shutdown
+        #    or races an in-flight copy against atexit. Must run BEFORE the KV
+        #    pool it copies out of is dropped and before the dist env goes away.
+        #    Guarded: only offload workers define close() (moriio etc. do not).
+        connector = get_kvconnector()
+        close = getattr(connector, "close", None) if connector is not None else None
+        if callable(close):
+            close()
         # 1. Destroy distributed env (NCCL + CustomAllreduce + process groups)
         #    Must happen while ops module is still alive for CustomAllreduce cleanup.
         destroy_dist_env()
@@ -2042,6 +2051,11 @@ class ModelRunner:
             for key, kv_cache_tensor in zip(kv_cache_keys, kv_cache_tensors)
         }
         transfer_tensors = self.attn_metadata_builder.get_kv_transfer_tensors()
+        if transfer_tensors is not None:
+            # The tier is built inside `register_kv_caches` and needs
+            # `state_entry_views` to name the bytes it packs. This is the only
+            # place the builder and the connector are both in scope.
+            transfer_tensors.state_backend = self.attn_metadata_builder
         if hasattr(self, "eagle3_draft_builder") and transfer_tensors is not None:
             draft_regions = self.eagle3_draft_builder.get_kv_transfer_tensors()
             if draft_regions:

@@ -26,6 +26,32 @@ from atom.model_engine.scheduler import (
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.sampling_params import SamplingParams
 
+
+class _OffloadMixinStub(OffloadSchedulerMixin):
+    """Concrete `OffloadSchedulerMixin` for scheduler tests.
+
+    `OffloadSchedulerMixin` declares the six save/load lifecycle methods abstract
+    so a missing forwarder is a construction-time TypeError. These test doubles
+    exercise only the scheduler's deferred-free / preemption paths, so this base
+    fills the contract with harmless defaults and each local `_Connector`
+    overrides the methods it drives.
+    """
+
+    is_producer = False
+    is_offload = True
+
+    def save_finished(self, req_id) -> None: ...
+    def abandon_save(self, req_id) -> None: ...
+    def release_stalled_save(self, seq) -> None: ...
+    def load_failed(self, req_id) -> bool:
+        return False
+
+    def load_finished(self, req_id) -> bool:
+        return True
+
+    def cancel_pending_load(self, seq) -> None: ...
+
+
 # ── EngineStats: spec section ────────────────────────────────────────────────
 
 
@@ -437,7 +463,7 @@ class TestSchedule:
         )
         events = []
 
-        class _Connector(OffloadSchedulerMixin):
+        class _Connector(_OffloadMixinStub):
             is_offload = True
             is_producer = False
 
@@ -633,6 +659,110 @@ class TestSchedule:
         assert list(batch2.scheduled_tokens) == list(range(6, 10))
         assert list(batch2.num_cached_tokens) == [6]
 
+    def test_multimodal_prefill_shortened_after_alloc_is_requeued_whole(
+        self, seq_factory
+    ):
+        # A multimodal prompt must forward in one chunk (its vision embeddings
+        # are scattered onto placeholder positions for the whole prompt). The
+        # pre-allocation atomic guard enforces that, but a post-allocation
+        # adjuster -- offload chunk deferral or state-checkpoint alignment --
+        # can shorten the chunk *after* that guard passed. When it does, the
+        # prompt must be requeued whole, not split into a partial chunk that
+        # would scatter the embeddings against the wrong positions.
+        sched = Scheduler(
+            MockConfig(
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                enable_chunked_prefill=True,
+            )
+        )
+        # Whole 8-token prompt clears the pre-alloc guard (budget 64 >= 8);
+        # only the post-alloc adjuster shortens it.
+        sched._adjust_prefill_chunk_after_alloc = lambda seq, chunk: 4
+        seq = seq_factory(list(range(8)), multimodal_data={"pixel_values": object()})
+        sched.add(seq)
+
+        batch, _ = sched.schedule()
+
+        # Not split into a 4-token partial chunk -- deferred whole.
+        assert batch.total_seqs_num_prefill == 0
+        assert seq.is_partial_prefill is False
+        assert seq in sched.waiting
+
+    def test_text_prefill_shortened_after_alloc_still_splits(self, seq_factory):
+        # Control for the guard above: a non-multimodal prompt shortened by the
+        # same post-alloc adjuster is chunked as usual -- the requeue is
+        # multimodal-only.
+        sched = Scheduler(
+            MockConfig(
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                enable_chunked_prefill=True,
+            )
+        )
+        sched._adjust_prefill_chunk_after_alloc = lambda seq, chunk: 4
+        seq = seq_factory(list(range(8)))
+        sched.add(seq)
+
+        batch, _ = sched.schedule()
+
+        assert batch.total_seqs_num_prefill == 1
+        assert list(batch.num_scheduled_tokens) == [4]
+
+    def test_multimodal_prefill_spanning_checkpoint_rung_admits_whole(
+        self, seq_factory
+    ):
+        # The requeue test above forces the shortening through the *offload*
+        # adjuster, whose real-world shortening goes away once the load lands --
+        # so a single pass is enough to prove the requeue. The state-checkpoint
+        # rung cut in `_finalize_prefill_chunk` is different: it is deterministic,
+        # so a multimodal prompt spanning one interval is shortened the *same* way
+        # every pass, and requeue-whole then loops forever (idle GPUs, head-of-
+        # line blocking). A one-pass test cannot see that. Drive two passes with a
+        # fixed rung cut in place and assert the prompt is admitted whole and
+        # prefill actually completes -- the cut must be suppressed for multimodal.
+        sched = Scheduler(
+            MockConfig(
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                enable_chunked_prefill=True,
+            )
+        )
+        # A rung that always lands 4 tokens short of the chunk end -- the same
+        # shortening on every pass, exactly as a real ladder cuts a prompt that
+        # spans an interval. If the cut were honoured for multimodal, the atomic
+        # re-assert would requeue whole and this seq would never make progress.
+        sched.block_manager.checkpoint_cut = lambda seq, start, end: end - 4
+        seq = seq_factory(list(range(8)), multimodal_data={"pixel_values": object()})
+        sched.add(seq)
+
+        # Pass 1: admitted whole, not shortened to a 4-token partial, not requeued.
+        batch1, _ = sched.schedule()
+        assert batch1.total_seqs_num_prefill == 1
+        assert list(batch1.num_scheduled_tokens) == [8]
+        assert seq.is_partial_prefill is False
+        assert seq not in sched.waiting
+
+        sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(
+                req_ids=[],
+                token_ids=[],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+            batch=batch1,
+        )
+
+        # Pass 2: prefill is done, so the seq is not bounced back to waiting to
+        # be re-shortened -- the livelock would show here as the seq reappearing
+        # in `waiting` with no forward progress.
+        assert seq not in sched.waiting
+
     def test_prefill_respects_block_availability(self, seq_factory):
         sched = Scheduler(MockConfig(num_kvcache_blocks=1, kv_cache_block_size=4))
         sched.add(seq_factory([1, 2, 3, 4]))  # 1 block
@@ -678,7 +808,7 @@ class TestSchedule:
         pinned_victim.append_token(10)
         operation = SaveOperationId(pinned_victim.id, 50)
 
-        class _Connector(OffloadSchedulerMixin):
+        class _Connector(_OffloadMixinStub):
             is_producer = False
             is_offload = True
             _do_load = False
@@ -716,7 +846,7 @@ class TestSchedule:
         pinned.append_token(9)
         operation = SaveOperationId(pinned.id, 51)
 
-        class _Connector(OffloadSchedulerMixin):
+        class _Connector(_OffloadMixinStub):
             is_producer = False
             is_offload = True
             _do_load = False
@@ -816,6 +946,49 @@ class TestSchedule:
         assert failed.offload_load_failed is True
         assert failed in sched.running
         assert sched._num_parked_remote_kv == 0
+
+    def test_a_resumed_offload_prefill_reports_the_hit_the_load_gave_it(
+        self, seq_factory
+    ):
+        """`cached_tokens` must count the tokens LMCache brought back.
+
+        The load is the entire point of parking: `_mark_offload_load_ready`
+        raises `num_cached_tokens` from the pre-park HBM-only hit to the
+        post-load one. But the resume branch `continue`s before either
+        `prefix_cache_hit_tokens` assignment, so the field keeps the pre-park
+        value while `CacheStats` is fed the fresh `num_cached_tokens` in
+        `_schedule_prefill_seq`. The two then disagree about the same request,
+        and the one the user sees is the one that undercounts -- making the
+        offload tier look like it did nothing.
+        """
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=2,
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=100,
+            )
+        )
+        sched.kv_connector = SimpleNamespace(
+            is_offload=True,
+            build_connector_meta=lambda: None,
+        )
+
+        seq = seq_factory(list(range(8)))
+        seq.num_cached_tokens = 2  # the HBM-only hit, before the load
+        seq.prefix_cache_hit_tokens = 2
+        seq.block_table = [0]
+        seq.offload_loaded_tokens = 6  # LMCache returned four more
+        sched._park_for_remote_load(seq, deque())
+        sched._count_inflight_load(seq)
+        sched.finished_recving_kv_req_ids.append(seq.id)
+        assert sched._resolve_waiting_remote_kv(seq, deque()) is False
+        sched.waiting.append(seq)
+
+        sched.schedule()
+
+        assert seq in sched.running, "precondition: the resume must be admitted"
+        assert seq.num_cached_tokens == 6, "precondition: the load was applied"
+        assert seq.prefix_cache_hit_tokens == 6
 
     def test_partial_prefill_ready_for_offload_load_moves_to_waiting(self):
         class _Connector:
@@ -1408,6 +1581,43 @@ class TestPreempt:
         assert seq.status == SequenceStatus.WAITING
         assert len(seq.block_table) == 0
 
+    def test_preempt_releases_stalled_save_before_freeing_blocks(
+        self, scheduler, seq_factory
+    ):
+        """A stall-escaped save is preemptable, and the free runs no
+        `request_finished`; the connector must be told to drop its save tracker
+        at the free, and told BEFORE the blocks are deallocated so its save loop
+        can never race in and read them."""
+        seq = seq_factory([1, 2, 3, 4])
+        scheduler.add(seq)
+        scheduler.schedule()
+        events: list[str] = []
+        block_table_at_release: list = []
+
+        class _Connector:
+            def should_defer_free(self, s):
+                return False  # stall-escaped -> preemptable
+
+            def release_stalled_save(self, s):
+                events.append("release")
+                block_table_at_release[:] = list(s.block_table)
+
+        scheduler.kv_connector = _Connector()
+        original_deallocate = scheduler.block_manager.deallocate
+
+        def _recording_deallocate(s):
+            events.append("deallocate")
+            return original_deallocate(s)
+
+        scheduler.block_manager.deallocate = _recording_deallocate
+
+        assert scheduler.preempt(seq) is True
+        # Released, and released first -- the blocks were still held then.
+        assert events == ["release", "deallocate"]
+        assert block_table_at_release  # non-empty at the moment of release
+        assert seq.status == SequenceStatus.WAITING
+        assert len(seq.block_table) == 0
+
 
 # ── postprocess ────────────────────────────────────────────────────────────
 
@@ -1724,3 +1934,250 @@ class TestComputeDetailedAggregates:
         assert batch.detailed_sqsq == 9  # 3^2
         assert batch.detailed_sqsk == 300  # 3 * 100
         assert batch.detailed_sk == 100
+
+
+class TestStalledOffloadSaveReclaim:
+    """`_reconcile_stalled_deferred_saves`: the way out for a save nobody answers.
+
+    LMCache's pin monitor force-unpins a stalled transfer without emitting a
+    completion, so `should_defer_free` stays True forever, `has_pending_kv_work()`
+    never clears, and the engine busy-loops with every GPU idle. Reproduced on
+    the k3-dev line as a hard hang under a tight pool.
+    """
+
+    @staticmethod
+    def _sched(monkeypatch, deferred, connector=None):
+        import atom.model_engine.scheduler as sched_mod
+
+        s = object.__new__(sched_mod.Scheduler)
+        s.deferred_free_blocks = {seq.id: seq for seq in deferred}
+        s._abandoned_saves = 0
+        s._next_save_reconcile_at = 0.0
+        # The window is now sourced from the connector, not a scheduler constant:
+        # the scheduler asks `kv_connector.save_abandon_timeout_s()` for it (the
+        # value is LMCache knowledge). Tests choose their own via the stub.
+        if connector is None:
+            connector = SimpleNamespace(save_abandon_timeout_s=lambda: 100.0)
+        s.kv_connector = connector
+        freed: list[int] = []
+        s.block_manager = SimpleNamespace(deallocate=lambda q: freed.append(q.id))
+        return s, freed
+
+    def test_a_save_past_the_window_gets_its_blocks_back(self, monkeypatch):
+        import time as _time
+
+        now = _time.monotonic()
+        stale = SimpleNamespace(id=1, _deferred_save_at=now - 500.0)
+        fresh = SimpleNamespace(id=2, _deferred_save_at=now)
+        s, freed = self._sched(monkeypatch, [stale, fresh])
+
+        assert s._reconcile_stalled_deferred_saves() == 1
+        assert freed == [1], "only the stalled save is reclaimed"
+        assert 2 in s.deferred_free_blocks, "a save still inside its window is kept"
+        assert s._abandoned_saves == 1
+
+    def test_reclaim_notifies_the_connector_to_drop_the_save(self, monkeypatch):
+        """Freeing blocks is not enough: without `abandon_save` the connector's
+        `_save_inflight` keeps the request, `has_pending_kv_work()` never clears,
+        and the engine busy-loops (review finding #4)."""
+        import time as _time
+
+        now = _time.monotonic()
+        stale = SimpleNamespace(id=1, _deferred_save_at=now - 500.0)
+        abandoned: list = []
+        connector = SimpleNamespace(
+            save_abandon_timeout_s=lambda: 100.0,
+            abandon_save=lambda sid: abandoned.append(sid),
+        )
+        s, freed = self._sched(monkeypatch, [stale], connector=connector)
+
+        assert s._reconcile_stalled_deferred_saves() == 1
+        assert freed == [1]
+        # Notified with the string request id, matching the connector's sid keys.
+        assert abandoned == ["1"]
+
+    def test_it_self_throttles_so_a_1ms_poll_is_cheap(self, monkeypatch):
+        import time as _time
+
+        stale = SimpleNamespace(id=1, _deferred_save_at=_time.monotonic() - 500.0)
+        s, freed = self._sched(monkeypatch, [stale])
+
+        assert s._reconcile_stalled_deferred_saves() == 1
+        # Second call inside the throttle interval must not rescan.
+        s.deferred_free_blocks = {
+            9: SimpleNamespace(id=9, _deferred_save_at=_time.monotonic() - 500.0)
+        }
+        assert s._reconcile_stalled_deferred_saves() == 0
+        assert freed == [1]
+
+    def test_a_non_positive_window_restores_wait_forever(self, monkeypatch):
+        import time as _time
+
+        import atom.model_engine.scheduler as sched_mod
+
+        s = object.__new__(sched_mod.Scheduler)
+        s.deferred_free_blocks = {
+            1: SimpleNamespace(id=1, _deferred_save_at=_time.monotonic() - 1e6)
+        }
+        s._abandoned_saves = 0
+        s._next_save_reconcile_at = 0.0
+        # A connector reporting a non-positive window disables reclamation.
+        s.kv_connector = SimpleNamespace(save_abandon_timeout_s=lambda: 0.0)
+        s.block_manager = SimpleNamespace(deallocate=lambda q: pytest.fail("reclaimed"))
+
+        assert s._reconcile_stalled_deferred_saves() == 0
+
+    def test_the_window_sits_above_lmcaches_own_pin_timeout(self, monkeypatch):
+        """Deriving it from LMCache's knob IS the safety argument.
+
+        Two independent env vars would let ours be set below the timeout it has
+        to exceed, and nothing would say so. The derivation now lives on the
+        offload connector (`offload_save_abandon_timeout_s`), since the pin
+        timeout is LMCache knowledge; the scheduler only asks for the result.
+        """
+        import atom.kv_transfer.offload._offload_common as offload_common
+
+        monkeypatch.setattr(offload_common, "_save_abandon_timeout_s", None)
+        monkeypatch.setenv("LMCACHE_EC_PIN_TIMEOUT_SEC", "900")
+        assert offload_common.offload_save_abandon_timeout_s() == 930.0
+
+        monkeypatch.setattr(offload_common, "_save_abandon_timeout_s", None)
+        monkeypatch.delenv("LMCACHE_EC_PIN_TIMEOUT_SEC", raising=False)
+        assert offload_common.offload_save_abandon_timeout_s() == 330.0
+
+    def test_no_offload_connector_disables_reclamation(self):
+        """`_save_abandon_timeout_s` returns 0 when nothing offloads.
+
+        A non-offload connector (or none at all) has no save to reclaim, so the
+        scheduler must read a non-positive window and skip the scan rather than
+        raise reaching for a method that is not there.
+        """
+        import atom.model_engine.scheduler as sched_mod
+
+        s = object.__new__(sched_mod.Scheduler)
+        s.kv_connector = None
+        assert s._save_abandon_timeout_s() == 0.0
+        s.kv_connector = SimpleNamespace()  # a connector without the offload face
+        assert s._save_abandon_timeout_s() == 0.0
+
+
+class TestStateStorePendingCap:
+    """`_state_store_pending_cap`: the state leg reads the KV leg's save bound.
+
+    It must share the connector's real `max_pending_saves` so both legs pin the
+    same slice of the pool -- and read it off the *public* accessor, never by
+    reaching through the delegating shell's `_impl` (review finding §2b).
+    """
+
+    @staticmethod
+    def _sched(connector):
+        import atom.model_engine.scheduler as sched_mod
+
+        s = object.__new__(sched_mod.Scheduler)
+        s.kv_connector = connector
+        return s
+
+    def test_reads_the_public_bound_off_the_connector(self):
+        s = self._sched(SimpleNamespace(max_pending_saves=5))
+        assert s._state_store_pending_cap() == 5
+
+    def test_falls_back_to_env_when_the_connector_does_not_bound(self, monkeypatch):
+        """dense reports None (its save queue is unbounded); use the env reader."""
+        import atom.model_engine.scheduler as sched_mod
+
+        monkeypatch.setattr(sched_mod, "_MAX_PENDING_OFFLOAD", None)
+        monkeypatch.setenv("OFFLOAD_MAX_PENDING_SAVES", "3")
+        s = self._sched(SimpleNamespace(max_pending_saves=None))
+        assert s._state_store_pending_cap() == 3
+
+    def test_under_multi_reaches_the_bound_on_the_state_tier_sub(self):
+        """The composite bounds nothing of its own; the sub carries the bound."""
+        sub = SimpleNamespace(max_pending_saves=7)
+        conn = SimpleNamespace(max_pending_saves=None, _state_tier_sub=lambda: sub)
+        s = self._sched(conn)
+        assert s._state_store_pending_cap() == 7
+
+
+class TestTheTierSplitPartitionsServedReuse:
+    """`[Cache Tiers]` exists to answer "what does the CPU tier buy", so its two
+    halves have to be two halves of one thing.
+
+    `cached` and `offload` are that: `cached` is what the HBM walk actually
+    handed over, `offload` is what the tier added on top, and they sum to
+    `num_cached`. `compressed` is NOT -- it is how far the walk reached before
+    the state gates cut it, so it counts reuse nobody got.
+    """
+
+    @staticmethod
+    def stats(**kw):
+        from atom.model_engine.engine_stats import EngineStats
+
+        s = EngineStats(enable_prefix_caching=True)
+        s.update_cache(**kw)
+        return s
+
+    def test_the_two_halves_sum_to_the_end_to_end_rate(self):
+        s = self.stats(
+            num_cached_tokens=300,
+            num_full_tokens=1200,
+            num_compressed_tokens=800,
+            num_wanted_tokens=300,
+            num_reusable_tokens=1000,
+            num_offload_tokens=700,
+        )
+        assert s.cache_hit_rate + s.lmcache_hit_rate == pytest.approx(1.0)
+
+    def test_the_halves_never_exceed_the_denominator(self):
+        """K3's ordinary anchor-only shape: the walk reaches 8 blocks, the only
+        resumable rung is at 3, the joint boundary lands at 10. Pairing
+        `compressed` against `offload` prints 80% + 70% here -- 150% of a
+        denominator that is the ceiling."""
+        s = self.stats(
+            num_cached_tokens=300,  # the gate cut the walk from 800 to 300
+            num_full_tokens=1200,
+            num_compressed_tokens=800,
+            num_wanted_tokens=300,
+            num_reusable_tokens=1000,
+            num_offload_tokens=700,
+        )
+        assert s.paged_hit_rate + s.lmcache_hit_rate > 1.0, (
+            "precondition: this is the shape that makes the wrong pairing "
+            "exceed 100%, so the assertion below is not vacuous"
+        )
+        assert s.cache_hit_rate + s.lmcache_hit_rate <= 1.0
+
+    def test_the_line_reports_cached_not_compressed(self, caplog):
+        """Reads the emitted text: swapping `hit_rate` back for
+        `paged_hit_rate` has to be what fails here."""
+        import logging
+
+        s = self.stats(
+            num_cached_tokens=300,
+            num_full_tokens=1200,
+            num_compressed_tokens=800,
+            num_wanted_tokens=300,
+            num_reusable_tokens=1000,
+            num_offload_tokens=700,
+        )
+        with caplog.at_level(logging.INFO, logger="atom"):
+            s._log_pools()
+        line = next(
+            r.getMessage() for r in caplog.records if "[Cache Tiers]" in r.getMessage()
+        )
+        assert "300/1000" in line, f"HBM half must be `cached`, got: {line}"
+        assert "800/1000" not in line, f"`compressed` is reach, not served: {line}"
+        assert "700/1000" in line
+
+    def test_no_tier_attached_emits_no_tier_line(self, caplog):
+        import logging
+
+        s = self.stats(
+            num_cached_tokens=300,
+            num_full_tokens=1200,
+            num_compressed_tokens=800,
+            num_wanted_tokens=300,
+            num_reusable_tokens=1000,
+        )
+        with caplog.at_level(logging.INFO, logger="atom"):
+            s._log_pools()
+        assert not any("[Cache Tiers]" in r.getMessage() for r in caplog.records)
