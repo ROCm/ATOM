@@ -453,6 +453,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Run Mooncake RDMA transfer test on selected nodes
+        id: rdma-smoke
         run: |
           set -euo pipefail
           export PATH="/usr/local/slurm-24.05.5.1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
@@ -954,17 +955,22 @@ jobs:
             done
           }
 
-          local_ip="$(ip route get 1.1.1.1 2>/dev/null | awk '
-            {
-              for (i = 1; i <= NF; i++) {
-                if ($i == "src" && i < NF) {
-                  print $(i + 1)
-                  exit
+          local_ip=""
+          if command -v ip >/dev/null 2>&1; then
+            local_ip="$(ip route get 1.1.1.1 2>/dev/null | awk '
+              {
+                for (i = 1; i <= NF; i++) {
+                  if ($i == "src" && i < NF) {
+                    print $(i + 1)
+                    exit
+                  }
                 }
               }
-            }
-          ')"
-          local_ip="${local_ip:-$(hostname -I | awk '{print $1}')}"
+            ' || true)"
+          fi
+          if [[ -z "${local_ip}" ]]; then
+            local_ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+          fi
           if [[ -z "${local_ip}" ]]; then
             echo "ERROR: unable to determine node IP for cross-node GDR testing" >&2
             exit 1
@@ -1222,6 +1228,86 @@ jobs:
           echo "slurm_exit_code=${SLURM_EXIT_CODE}"
           echo "slurm job exit code: ${SLURM_JOB_RC}"
           exit "${SLURM_JOB_RC}"
+
+      - name: Summarize Mooncake RDMA smoke test
+        if: always()
+        env:
+          RDMA_SMOKE_OUTCOME: ${{ steps.rdma-smoke.outcome }}
+        run: |
+          set -uo pipefail
+
+          current_user="$(id -un 2>/dev/null || id -u)"
+          log_root="${ATOMESH_LOG_ROOT//\$\{USER\}/${current_user}}"
+          log_root="${log_root//\$USER/${current_user}}"
+          run_dir="${log_root%/}/rdma-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          summary_path="${run_dir}/rdma-smoke-summary.md"
+          mkdir -p "${run_dir}"
+
+          if [[ "${RDMA_SMOKE_OUTCOME}" == "success" ]]; then
+            outcome_icon="✅"
+          else
+            outcome_icon="❌"
+          fi
+
+          job_id=""
+          if [[ -s "${run_dir}/slurm-job-id" ]]; then
+            job_id="$(tr -d '[:space:]' < "${run_dir}/slurm-job-id")"
+          fi
+
+          shopt -s nullglob
+          log_files=("${run_dir}"/slurm-*.out "${run_dir}"/slurm-*.err)
+          shopt -u nullglob
+
+          {
+            echo "## Mooncake RDMA smoke test"
+            echo
+            echo "- Result: ${outcome_icon} \`${RDMA_SMOKE_OUTCOME}\`"
+            echo "- Image: \`${RDMA_SMOKE_IMAGE}\`"
+            echo "- Requested nodes: \`${RDMA_SMOKE_NODE_COUNT}\`"
+            echo "- Decode HCA mode: \`${RDMA_SMOKE_DECODE_HCA_MODE}\`"
+            echo "- Slurm job: \`${job_id:-not submitted}\`"
+            echo
+
+            echo "### Node-local RDMA WRITE"
+            if [[ "${#log_files[@]}" -gt 0 ]] &&
+               grep -h "^GPUDirect RDMA passed from prefill GPU" "${log_files[@]}" 2>/dev/null |
+                 sort -u |
+                 awk '{ print "- ✅ " $0; found = 1 } END { exit(found ? 0 : 1) }'; then
+              :
+            else
+              echo "- No completed node-local RDMA WRITE pairs."
+            fi
+            echo
+
+            echo "### Cross-node RDMA WRITE"
+            if [[ "${#log_files[@]}" -gt 0 ]] &&
+               grep -h "^Cross-node GPUDirect RDMA passed from prefill GPU" "${log_files[@]}" 2>/dev/null |
+                 sort -u |
+                 awk '{ print "- ✅ " $0; found = 1 } END { exit(found ? 0 : 1) }'; then
+              :
+            else
+              echo "- No completed cross-node RDMA WRITE pairs."
+            fi
+            echo
+
+            echo "### Errors"
+            if [[ "${#log_files[@]}" -gt 0 ]] &&
+               awk '
+                 /^(ERROR:|E[0-9]{8})/ ||
+                 /Permission denied|command not found|Detect data integrity/ {
+                   if (!seen[$0]++ && count++ < 20) {
+                     print "- ❌ `" $0 "`"
+                   }
+                 }
+                 END { exit(count ? 0 : 1) }
+               ' "${log_files[@]}"; then
+              :
+            else
+              echo "- No RDMA smoke errors found in Slurm logs."
+            fi
+          } | tee "${summary_path}" >> "${GITHUB_STEP_SUMMARY}"
+
+          echo "RDMA smoke summary written to ${summary_path}"
 
   run-model-benchmark:
     name: ${{ matrix.id }}
