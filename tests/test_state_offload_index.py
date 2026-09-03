@@ -242,3 +242,105 @@ class TestTheInvariantIsActuallyWiredUp:
         index.stats()
         assert index.invariant_violations == 0
         assert index.released == []
+
+
+class TestTheInvariantReachesAnOperator:
+    """The audit is only worth having if its result leaves the process.
+
+    The chain is `stats()` -> `PagedStateCheckpointCoordinator.checkpoint_fates`
+    -> `BlockManager.state_checkpoint_fates` -> `checkpoint_funnel`, and the
+    middle link is a `getattr(self.offload, "stats", None)` rather than a direct
+    call. That indirection is deliberate (a test double need not carry
+    counters), but it means the chain cannot be seen by grep -- so it is
+    asserted here instead of left to be re-derived.
+    """
+
+    def _bm_with_index(self):
+        from test_state_checkpoint import (
+            PAGED_COPY_RUNTIME,
+            make_block_manager,
+            paged_copy_config,
+        )
+
+        bm = make_block_manager(paged_copy_config(), state_runtime=PAGED_COPY_RUNTIME)
+        index = _index()
+        bm.state_offload = index
+        bm.paged_state_checkpoints.attach_offload(index)
+        return bm, index
+
+    def test_a_violation_reaches_the_checkpoint_funnel(self):
+        bm, index = self._bm_with_index()
+        assert bm.checkpoint_funnel()["state_offload_invariant_violations"] == 0
+
+        index.dispatched = 9  # corrupt the accounting behind the object's back
+
+        assert bm.checkpoint_funnel()["state_offload_invariant_violations"] == 1
+
+    def test_the_outstanding_count_reaches_the_funnel_too(self):
+        """`loads_outstanding` is what says a request is parked on a report that
+        cannot come, so an operator has to be able to see it."""
+        bm, index = self._bm_with_index()
+        index.note_stored(7)
+        index.request_load("r", 7, slot=0)
+
+        assert bm.checkpoint_funnel()["state_offload_loads_outstanding"] == 1
+
+
+class TestARefusedKvLegSettlesItsStateLoad:
+    """The path a review asked about: armed, then the KV leg refused.
+
+    `request_load` has already counted a dispatch by the time
+    `build_connector_meta` clears `_state_load_seqs`. If the refusal path did
+    not settle it, the entry would stay outstanding for the life of the process
+    and its request would be parked on a report nothing can produce. The
+    terminal transition is `abandon_load` -- not `fail_load`, because nothing
+    was attempted, so the hash must stay loadable for the next request.
+    """
+
+    def _scheduler_with(self, index, *, disown_ok=True):
+        from types import SimpleNamespace
+
+        from atom.model_engine.scheduler import Scheduler
+
+        sched = object.__new__(Scheduler)
+        sched.block_manager = SimpleNamespace(
+            state_offload=index, disown_claimed_prefix=lambda seq: disown_ok
+        )
+        return sched
+
+    def _seq(self, h):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            id="r1", offload_joint=SimpleNamespace(load_hash=h, boundary_tokens=512)
+        )
+
+    def test_the_refusal_settles_the_dispatch(self):
+        index = _index(7)
+        index.request_load("r1", 7, slot=0)
+        assert index.outstanding == 1
+
+        sched = self._scheduler_with(index)
+        assert sched._drop_state_load(self._seq(7)) is True
+
+        assert index.outstanding == 0, "a dropped load must not stay in flight"
+        index.check_invariant()
+
+    def test_an_abandon_is_not_a_miss(self):
+        """Nothing was attempted, so the hash stays loadable and no failure is
+        counted -- forgetting it would send the next request over that prefix
+        to a full recompute for no reason."""
+        index = _index(7)
+        index.request_load("r1", 7, slot=0)
+
+        self._scheduler_with(index)._drop_state_load(self._seq(7))
+
+        assert index.could_serve(7), "an abandon must not retract the hash"
+        assert index.loads_failed == 0
+        index.check_invariant()
+
+    def test_a_seq_with_no_armed_load_settles_nothing(self):
+        index = _index(7)
+        self._scheduler_with(index)._drop_state_load(self._seq(-1))
+        assert index.dispatched == 0
+        index.check_invariant()
