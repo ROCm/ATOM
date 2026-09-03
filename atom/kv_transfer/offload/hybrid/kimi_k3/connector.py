@@ -136,19 +136,33 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
 
     # -- tier construction -------------------------------------------------
     def _build_state_tier(self, transfer_tensors) -> None:
-        from aiter.dist.parallel_state import get_tp_group
-
+        # The config refusals come first, and deliberately above the aiter
+        # import: whether this configuration can host a tier at all is decided
+        # by config alone, so it must not depend on a GPU library being
+        # importable -- otherwise the refusal cannot be reached, or tested, on a
+        # CPU runner.
         # PP breaks the tier: the CacheEngineKey has no PP component, so two
         # stages at the same TP rank would overwrite each other. Refused rather
         # than half-supported. Paged KV is unaffected.
         pp_size = int(getattr(self._config, "pipeline_parallel_size", 1) or 1)
         if pp_size > 1:
-            logger.warning(
-                "kimi_k3 offload: the state tier is unsupported under pipeline "
-                "parallelism (pipeline_parallel_size=%d); paged KV is unaffected.",
-                pp_size,
+            # Refused loudly rather than warned about. `CacheEngineKey` carries
+            # no PP component, so two stages at one TP rank would overwrite each
+            # other's state images. The engine agrees independently
+            # (`state_tier_capability`), so both legs of a K3 request are then
+            # declined and the offload does nothing at all -- a server started
+            # with `--kv-transfer-config` and `pp_size > 1` would serve at
+            # baseline speed while its operator believed offload was on, and one
+            # warning line among thousands is not how that gets noticed.
+            raise ValueError(
+                "kimi_k3 offload: the recurrent-state tier does not support "
+                f"pipeline parallelism (pipeline_parallel_size={pp_size}). The "
+                "LMCache key carries no PP component, so two stages at one TP "
+                "rank would overwrite each other's state images, and with the "
+                "tier off a K3 request's KV leg is declined too -- the offload "
+                "would be inert. Run with pipeline_parallel_size=1, or drop "
+                "--kv-transfer-config."
             )
-            return
 
         backend = getattr(transfer_tensors, "state_backend", None)
         if backend is None:
@@ -209,6 +223,10 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
                 entry_bytes,
             )
             return
+
+        # Imported here, at its one use site: everything above is a refusal
+        # decidable without a GPU library.
+        from aiter.dist.parallel_state import get_tp_group
 
         tp = get_tp_group()
         rank, world = pp_aware_rank_and_world(self._config, tp)

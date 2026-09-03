@@ -5636,6 +5636,29 @@ def _k3_worker(*, tier=True) -> KimiK3OffloadConnector:
     return c
 
 
+def test_pipeline_parallelism_is_refused_loudly_not_warned_about(monkeypatch):
+    """A warning here is not enough. The engine independently declines the tier
+    under PP, and with no tier a K3 request's KV leg is declined too -- so the
+    offload is inert while its operator believes it is on. One warning line
+    among thousands is not how that gets noticed."""
+    c = KimiK3OffloadConnector.__new__(KimiK3OffloadConnector)
+    c._config = SimpleNamespace(pipeline_parallel_size=2)
+    with pytest.raises(ValueError, match="pipeline_parallel_size=2"):
+        c._build_state_tier(SimpleNamespace(state_backend=None))
+
+
+def test_a_single_stage_still_builds_the_tier_path(monkeypatch):
+    """The refusal must key on PP, not on being called at all: pp_size 1 has to
+    fall through to the ordinary backend checks."""
+    c = KimiK3OffloadConnector.__new__(KimiK3OffloadConnector)
+    c._config = SimpleNamespace(pipeline_parallel_size=1)
+    c._state_tier = None
+    # No backend published -> the tier declines quietly, which is the normal
+    # non-K3-backend path and must NOT raise.
+    c._build_state_tier(SimpleNamespace(state_backend=None))
+    assert c._state_tier is None
+
+
 def _k3_load_req(req_id: str, *, state: bool = True, generation: int = 0):
     """A load request shaped like `build_connector_meta`'s: it always attaches a
     `load_operation`, which is the identity the one completion reports under."""

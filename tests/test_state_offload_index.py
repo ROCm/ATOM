@@ -208,3 +208,37 @@ def test_the_stats_line_carries_the_invariants_three_terms():
     assert stats["loads_outstanding"] == 1
     assert stats["indexed"] == 2
     assert "orphan_load_slots_reclaimed" in stats
+
+
+class TestTheInvariantIsActuallyWiredUp:
+    """An assertion nothing runs in production is not an assertion.
+
+    `check_invariant` raises so a test can prove it fails; the serving path
+    needs the opposite -- a bookkeeping fault must surface without taking the
+    engine down. `stats()` is where the two meet, because it is the periodic
+    path `checkpoint_funnel` already pulls.
+    """
+
+    def test_stats_audits_on_every_read(self):
+        index = _index()
+        assert index.stats()["invariant_violations"] == 0
+
+        index.dispatched = 7  # corrupt the accounting behind the object's back
+
+        assert index.stats()["invariant_violations"] == 1, "stats must audit"
+
+    def test_a_violation_does_not_take_the_engine_down(self):
+        index = _index()
+        index.dispatched = 3
+        index.stats()
+        index.stats()
+        assert index.invariant_violations == 2, "counted every read"
+
+    def test_a_healthy_index_never_reports_a_violation(self):
+        index = _index(1)
+        index.request_load("r", 1, slot=0)
+        index.stats()
+        index.complete_load("r")
+        index.stats()
+        assert index.invariant_violations == 0
+        assert index.released == []
