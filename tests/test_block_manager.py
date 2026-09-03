@@ -998,6 +998,44 @@ class TestReclaimedStoresAreNotIndexed:
         assert bm.state_offload.stores_completed == 1
         assert bm.state_offload.stores_untrusted == 0
 
+    def test_a_failed_store_releases_but_is_not_indexed(self):
+        """The asymmetry `settle_state_store` documents and nothing asserted.
+
+        The pin existed to keep the bytes still during the copy and the copy is
+        over either way, so it is released on both legs. Only the indexing
+        differs: voting for a hash whose bytes never landed sends the next
+        request over that prefix to a `get` that must miss.
+        """
+        from atom.kv_transfer.disaggregation.types import StateStoreOperationId
+
+        bm = self._bm()
+        op = StateStoreOperationId(11, 1)
+        bm.settle_state_store(op, ok=False)
+
+        assert bm.paged_state_checkpoints.settled == [op], "the units go back"
+        assert 11 not in bm.state_offload.hashes, "a miss must not be advertised"
+        assert bm.state_offload.stores_failed == 1
+        assert bm.state_offload.stores_completed == 0
+
+    def test_a_refused_store_is_not_counted_as_a_failure(self):
+        """`attempted=False` is a store the connector never took.
+
+        It still has to release, but counting it as `stores_failed` would name
+        the same event twice -- the caller already counts it as
+        `stores_refused` -- and would leave it lingering in
+        `attempted - completed - failed`.
+        """
+        from atom.kv_transfer.disaggregation.types import StateStoreOperationId
+
+        bm = self._bm()
+        bm.state_offload.stores_attempted = 1
+        op = StateStoreOperationId(11, 1)
+        bm.settle_state_store(op, ok=False, attempted=False)
+
+        assert bm.paged_state_checkpoints.settled == [op], "the units go back"
+        assert bm.state_offload.stores_failed == 0, "refused is not failed"
+        assert bm.state_offload.stores_attempted == 0, "the optimistic bump backs out"
+
     def test_a_reclaimed_store_reporting_success_is_forfeited(self):
         from atom.kv_transfer.disaggregation.types import StateStoreOperationId
 

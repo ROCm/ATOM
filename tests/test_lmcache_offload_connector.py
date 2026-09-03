@@ -5998,11 +5998,14 @@ class TestStateStoreCompletionsCarryAGeneration:
 # ── kimi_k3: a load never queues behind a backlog of stores ────────────────
 
 
-class TestStateLoadsAndStoresRunInSeparateLanes:
-    """A load is on the TTFT critical path and a store is not. `load_state` runs
-    synchronously on the caller's own thread, so it cannot sit behind work
-    already queued on the store executor -- which is what a shared executor, and
-    then a shared staging semaphore, each made unenforceable in turn."""
+class TestStateLoadsNeverQueueBehindStores:
+    """A load is on the TTFT critical path and a store is not.
+
+    There are no lanes to balance any more: `load_state` runs synchronously on
+    the calling KV load task's own thread, so it cannot sit behind work already
+    queued on the store executor. The property is now structural rather than
+    scheduled, which is why this pins the thread it runs on and not an ordering.
+    """
 
     class _BlockingCodec:
         """A codec whose stores hang until released; loads always land."""
