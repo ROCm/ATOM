@@ -1797,6 +1797,14 @@ class Config:
                     f"the persistent cprr MLA kernel); got {gfx}. Disable DCP or "
                     f"speculative decode on this GPU."
                 )
+                # TBO slices its ubatch work buffers by request, while the
+                # sparse DCP indexer indexes them by query token. The two agree
+                # only at one query per sequence.
+                assert not self.enable_tbo_decode, (
+                    "Decode TBO (--enable-tbo all) combined with speculative "
+                    "decode and DCP is unverified. Use --enable-tbo (prefill "
+                    "only), or drop DCP or speculative decode."
+                )
         # DCP KV-cache interleave granularity S. S=1 (default) = token-level
         # round-robin (unchanged). S>1 = block-level interleave; must divide the
         # KV block so each physical block holds an integer number of S-groups
