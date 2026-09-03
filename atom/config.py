@@ -666,6 +666,7 @@ _PLAIN_TEXT_CONFIG_MODEL_TYPES: frozenset[str] = frozenset(
 # multimodal models fully supported by plugin mode
 _PLUGIN_SUPPORTED_MULTIMODAL_MODELS: set[str] = {
     "kimi_k25",
+    "kimi_k3",
     "qwen3_5",
     "qwen3_5_moe",
 }

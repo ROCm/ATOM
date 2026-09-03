@@ -937,7 +937,6 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             )
 
         if not hasattr(self, "_cached_ops"):
-            from aiter.dist.parallel_state import get_tp_group as get_aiter_tp_group
             from vllm import _custom_ops as ops
             from vllm.distributed.parallel_state import get_dcp_group
             from vllm.platforms import current_platform
@@ -1023,6 +1022,12 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         q = q[:num_actual_toks, ...]
         k_c_normed = k_c_normed[:num_actual_toks, ...]
         k_pe = k_pe[:num_actual_toks, ...]
+        # Model runner V2 sizes slot_mapping to the CUDA-graph token width and
+        # marks the tail with PAD_SLOT_ID, but leaves num_actual_tokens unpadded
+        # on the piecewise path; V1 never pads it. The cache kernels launch one
+        # block per slot and index q/kv by that block, so slot_mapping must not
+        # outrun the tensors sliced above. Same trim layer_mha already applies.
+        slot_mapping = attn_metadata.slot_mapping[:num_actual_toks]
 
         decode_q = q[:num_decode_tokens]
         prefill_q = q[num_decode_tokens:]
@@ -1050,7 +1055,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                     k_c_normed,
                     self.rotary_emb_cos_sin_cache,
                     self.rotary_emb.is_neox_style,
-                    attn_metadata.slot_mapping,
+                    slot_mapping,
                     kv_cache,
                     self.kv_cache_dtype,
                     self._k_scale,
@@ -1062,7 +1067,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                         k_c_normed,
                         k_pe.squeeze(1),
                         kv_cache,
-                        attn_metadata.slot_mapping.flatten(),
+                        slot_mapping.flatten(),
                         kv_cache_dtype=self.kv_cache_dtype,
                         scale=self._k_scale,
                     )
@@ -1143,7 +1148,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                         self.kv_lora_rank + self.qk_rope_head_dim,
                     ),
                     decode_q,
-                    attn_metadata.slot_mapping,
+                    slot_mapping,
                     self._k_scale,
                     self._q_scale,
                     positions,
@@ -1313,6 +1318,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         q = q[:num_actual_toks, ...]
         k_c_normed = k_c_normed[:num_actual_toks, ...]
         k_pe = k_pe[:num_actual_toks, ...].unsqueeze(1)
+        slot_mapping = sparse_meta.slot_mapping[:num_actual_toks]
 
         positions = None
         if self._is_vllm_forward_context_available():
@@ -1391,7 +1397,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                     kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
                 ),
                 q_out,
-                sparse_meta.slot_mapping,
+                slot_mapping,
                 self._k_scale,
                 self._q_scale,
                 positions,
@@ -1452,8 +1458,9 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
     def get_kv_cache_spec(self, vllm_config):
         from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
+        block_size = vllm_config.cache_config.block_size
         return MLAAttentionSpec(
-            block_size=vllm_config.cache_config.block_size,
+            block_size=block_size,
             num_kv_heads=1,
             head_size=self.head_size,
             dtype=self.kv_cache_torch_dtype,
