@@ -166,9 +166,10 @@ class KVTransferTensors:
     plane count explicit so registration can reject a missing plane.
     ``staging_region`` plus ``gather_slot``/``scatter_slot`` cover only the
     compressor-state PD staging pool and are invalid as sidecar SLOT sources.
-    ``index_staging_region`` plus ``build_sharded_index_plan`` and
+    ``index_staging_region`` plus ``prepare_sharded_index`` and
     ``gather_sharded_index`` cover producer-side repacking of preshuffled index
-    pages before DCP-sharded RDMA. The plan is shared across index layers.
+    pages before DCP-sharded RDMA. The prepared indices are shared across index
+    layers.
     """
 
     # Block-indexed PAGE regions, indexed forward by physical block id.
@@ -206,7 +207,7 @@ class KVTransferTensors:
     index_staging_chunk_pages: int = 0
     gather_sharded_index: Callable[..., tuple[int, int]] | None = None
     # Appended after the original staging fields for positional compatibility.
-    build_sharded_index_plan: Callable[..., Any] | None = None
+    prepare_sharded_index: Callable[..., Any] | None = None
 
 
 @dataclass

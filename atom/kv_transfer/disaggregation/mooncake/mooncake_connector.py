@@ -39,6 +39,10 @@ from atom.kv_transfer.disaggregation.port_offset import (
 from atom.kv_transfer.disaggregation.port_offset import (
     side_channel_port_offset as _port_offset,
 )
+from atom.kv_transfer.disaggregation.sharded_transfer import (
+    build_dcp_shard_plan,
+    coalesce_contiguous,
+)
 from atom.kv_transfer.disaggregation.types import (
     INDEX_CACHE_ROLE,
     ConnectorMetadata,
@@ -144,63 +148,6 @@ def _configure_mooncake_transport(protocol: str) -> None:
     """
     if protocol.strip().lower() == "tcp":
         os.environ["MC_FORCE_TCP"] = "true"
-
-
-def _coalesce(
-    src: np.ndarray, dst: np.ndarray, length: np.ndarray
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Merge runs that are contiguous on both sides into single descriptors.
-
-    A virtual block's ``dcp_size`` replicated sources, and consecutively
-    allocated blocks in general, collapse into one descriptor whenever the
-    allocator handed out consecutive ids, which is the common case and keeps
-    the RDMA batch small.
-    """
-    if src.size == 0:
-        empty = np.empty(0, dtype=np.int64)
-        return empty, empty.copy(), empty.copy()
-    contiguous = (src[1:] == src[:-1] + length[:-1]) & (
-        dst[1:] == dst[:-1] + length[:-1]
-    )
-    starts = np.concatenate(([True], ~contiguous))
-    group = np.cumsum(starts) - 1
-    merged_len = np.bincount(group, weights=length).astype(np.int64)
-    return src[starts], dst[starts], merged_len
-
-
-def plan_sharded(
-    src_block_ids,
-    dst_block_ids,
-    block_size: int,
-    dcp_size: int,
-    dcp_rank: int,
-    interleave_size: int = 1,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Plan the KV (interleave-sharded) transfer for one DCP rank.
-
-    Walks ``block_size // interleave_size`` runs per destination block. Runs
-    whose source block is past the end of the producer's list are dropped: the
-    block manager sizes every rank's table from rank 0's share, so ranks above
-    it can own a trailing virtual block that has no source tokens at all.
-    """
-    S = int(interleave_size)
-    src_ids = np.asarray(src_block_ids, dtype=np.int64)
-    dst_ids = np.asarray(dst_block_ids, dtype=np.int64)
-
-    # One run per S-group of this rank's local slots. Starting each run on an
-    # S-group boundary is what lets dcp_global_pos reduce to the group form
-    # below, and keeps the whole run inside one source block.
-    local = np.arange(0, dst_ids.size * block_size, S, dtype=np.int64)
-    dst_block, dst_token = np.divmod(local, block_size)
-    g = ((local // S) * dcp_size + dcp_rank) * S
-    src_block, src_token = np.divmod(g, block_size)
-
-    keep = src_block < src_ids.size
-    return _coalesce(
-        src_ids[src_block[keep]] * block_size + src_token[keep],
-        dst_ids[dst_block[keep]] * block_size + dst_token[keep],
-        np.full(int(keep.sum()), S, dtype=np.int64),
-    )
 
 
 # ZMQ side-channel message types
@@ -694,7 +641,7 @@ class MooncakeConnector(KVConnectorBase):
         self._index_staging_chunk_pages: int = 0
         self._index_staging_free: list[int] = []
         self._index_staging_lock = threading.Lock()
-        self._build_sharded_index_plan = None
+        self._prepare_sharded_index = None
         self._gather_sharded_index = None
 
         # --- Producer: completed prefill block_ids cache ---
@@ -835,7 +782,7 @@ class MooncakeConnector(KVConnectorBase):
             self._index_staging_pool_size = tt.index_staging_pool_size
             self._index_staging_chunk_pages = tt.index_staging_chunk_pages
             self._index_staging_free = list(range(tt.index_staging_pool_size))
-            self._build_sharded_index_plan = tt.build_sharded_index_plan
+            self._prepare_sharded_index = tt.prepare_sharded_index
             self._gather_sharded_index = tt.gather_sharded_index
 
         # Populate block/slot region lists for transfer offset computation
@@ -1577,16 +1524,18 @@ class MooncakeConnector(KVConnectorBase):
         dcp_size = max(1, request_data.get("consumer_dcp_size", 1))
         interleave = request_data.get("consumer_dcp_interleave", 1)
         sharded_plan = None
+        sharded_runs = None
         stages_sharded_index = False
         if dcp_size > 1:
-            sharded_plan = plan_sharded(
+            sharded_plan = build_dcp_shard_plan(
                 src_block_ids,
-                dst_block_ids,
-                self.block_size,
-                dcp_size,
-                request_data["consumer_dcp_rank"],
-                interleave,
+                block_size=self.block_size,
+                dcp_size=dcp_size,
+                dcp_rank=request_data["consumer_dcp_rank"],
+                interleave_size=interleave,
+                dst_pages=len(dst_block_ids),
             )
+            sharded_runs = sharded_plan.coalesced_token_runs(dst_block_ids)
             stages_sharded_index = (
                 interleave < self.block_size
                 and INDEX_CACHE_ROLE in self._block_region_roles
@@ -1594,7 +1543,7 @@ class MooncakeConnector(KVConnectorBase):
             if stages_sharded_index and (
                 interleave != 1
                 or self.block_size % 16
-                or self._build_sharded_index_plan is None
+                or self._prepare_sharded_index is None
                 or self._gather_sharded_index is None
                 or self._index_staging_chunk_pages <= 0
             ):
@@ -1603,7 +1552,7 @@ class MooncakeConnector(KVConnectorBase):
                     "interleave=1, a block size divisible by 16, and producer "
                     "index staging; got "
                     f"{interleave=}, block_size={self.block_size}, "
-                    f"has_staging={self._gather_sharded_index is not None and self._build_sharded_index_plan is not None}."
+                    f"has_staging={self._gather_sharded_index is not None and self._prepare_sharded_index is not None}."
                 )
 
         staged_regions: list[tuple[int, int, int]] = []
@@ -1625,9 +1574,8 @@ class MooncakeConnector(KVConnectorBase):
             ):
                 staged_regions.append((region_idx, dst_base, bpb))
                 continue
-            plan = sharded_plan
             unit = 0
-            if plan is None:
+            if sharded_runs is None:
                 for sb, db in zip(src_block_ids, dst_block_ids):
                     src_addrs.append(src_base + sb * bpb)
                     dst_addrs.append(dst_base + db * bpb)
@@ -1646,7 +1594,7 @@ class MooncakeConnector(KVConnectorBase):
                         "is built on."
                     )
                 unit = bpb // self.block_size
-            for src_off, dst_off, run_len in zip(*plan):
+            for src_off, dst_off, run_len in zip(*sharded_runs):
                 src_addrs.append(src_base + int(src_off) * unit)
                 dst_addrs.append(dst_base + int(dst_off) * unit)
                 sizes.append(int(run_len) * unit)
@@ -1672,19 +1620,10 @@ class MooncakeConnector(KVConnectorBase):
                 dst_chunk = dst_block_ids[
                     dst_start : dst_start + self._index_staging_chunk_pages
                 ]
-                src_start = dst_start * dcp_size
-                src_chunk = src_block_ids[
-                    src_start : min(
-                        len(src_block_ids),
-                        (dst_start + len(dst_chunk)) * dcp_size,
-                    )
-                ]
-                gather_plan = self._build_sharded_index_plan(
-                    src_chunk,
-                    dcp_size,
-                    request_data["consumer_dcp_rank"],
-                    interleave,
+                chunk_plan = sharded_plan.slice_pages(
+                    dst_start, dst_start + len(dst_chunk)
                 )
+                gather_indices = self._prepare_sharded_index(chunk_plan)
 
                 for region_idx, dst_base, bpb in staged_regions:
                     if not self._execute_staged_index_layer_chunk(
@@ -1694,7 +1633,7 @@ class MooncakeConnector(KVConnectorBase):
                         bpb,
                         dst_chunk,
                         req_id,
-                        gather_plan,
+                        gather_indices,
                     ):
                         return False
         return True
@@ -1707,7 +1646,7 @@ class MooncakeConnector(KVConnectorBase):
         bytes_per_page: int,
         dst_block_ids: list[int],
         req_id: str,
-        gather_plan,
+        gather_indices,
     ) -> bool:
         """GPU-repack one index layer/chunk, then RDMA its local pages."""
 
@@ -1715,7 +1654,7 @@ class MooncakeConnector(KVConnectorBase):
         try:
             staging_base, staged_pages = self._gather_sharded_index(
                 region_idx,
-                gather_plan,
+                gather_indices,
                 pool_idx,
             )
             if staged_pages != len(dst_block_ids):
@@ -1730,7 +1669,7 @@ class MooncakeConnector(KVConnectorBase):
             src_page = np.arange(staged_pages, dtype=np.int64)
             dst_page = np.asarray(dst_block_ids, dtype=np.int64)
             length = np.full(staged_pages, bytes_per_page, dtype=np.int64)
-            src_addrs, dst_addrs, sizes = _coalesce(
+            src_addrs, dst_addrs, sizes = coalesce_contiguous(
                 staging_base + src_page * bytes_per_page,
                 dst_base + dst_page * bytes_per_page,
                 length,
