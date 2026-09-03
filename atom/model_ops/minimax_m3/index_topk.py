@@ -1030,9 +1030,14 @@ def minimax_m3_index_topk_decode(
     assert (
         num_idx_heads == num_kv_heads
     ), "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
-    assert (
-        total_q % max_query_len == 0
-    ), f"total_q {total_q} not divisible by max_query_len {max_query_len}"
+    assert total_q % max_query_len == 0, (
+        f"total_q {total_q} not divisible by max_query_len {max_query_len}: the "
+        "decode segment must be uniform, i.e. every request contributes exactly "
+        "max_query_len rows, because the kernels below recover a request as "
+        "row // max_query_len. A ragged segment (spec decode where some request "
+        "carries no draft tokens) has to be routed to the prefill path by the "
+        "attention metadata builder."
+    )
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
     topk_idx = torch.empty(
         (num_idx_heads, total_q, topk),

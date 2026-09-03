@@ -452,6 +452,37 @@ class MinimaxM3SparseMetadata:
     decode: MinimaxM3SparseDecodeMetadata | None = None
 
 
+def _uniform_decode_query_len(
+    query_start_loc_cpu: torch.Tensor | None, num_decodes: int
+) -> int | None:
+    """Query length shared by every decode request, or None if they differ.
+
+    ATOM's decode kernels recover a request from a flat query row by dividing:
+    the M3 index-topk kernels use ``row // max_query_len`` (and the causal
+    cutoff ``seq_len - max_query_len + tok + 1``), and aiter's gluon paged
+    decode reshapes ``q`` to ``[q.shape[0] // max_query_len, max_query_len,
+    ...]``. Both only hold when every decode request contributes exactly
+    ``max_query_len`` rows.
+
+    Speculative decode breaks that on both sides. On the target model a request
+    that joins without draft tokens contributes one row next to requests
+    verifying ``num_spec + 1``; on the EAGLE/MTP draft a request contributes
+    however many tokens the last step accepted. vLLM keeps all of them in the
+    decode segment because each query length is still within the reorder
+    threshold, so the builders have to check the lengths themselves.
+    """
+    if num_decodes <= 0 or query_start_loc_cpu is None:
+        return None
+    starts = query_start_loc_cpu[: num_decodes + 1]
+    if starts.numel() != num_decodes + 1:
+        return None
+    query_lens = starts[1:] - starts[:-1]
+    first = int(query_lens[0])
+    if not bool(torch.all(query_lens == first)):
+        return None
+    return first
+
+
 class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
     # Uniform decode batches are safe to capture, including spec-decode verify
     # (query_len == num_spec + 1): the decode index-topk and sparse-attn kernels
@@ -521,9 +552,34 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
 
         # Plain decode has max_query_len == 1, while MTP/spec decode verifies
         # num_spec+1 tokens per request. Both should use the decode path, but only
-        # when the split says there are no prefill/extend requests in the batch.
-        if num_decodes > 0 and num_extends == 0 and num_prefills == 0:
-            return self._build_uniform_decode_metadata(common_attn_metadata)
+        # when the split says there are no prefill/extend requests in the batch
+        # AND every decode request carries the same number of query tokens -- the
+        # decode kernels index a request as `row // max_query_len`, so a ragged
+        # decode segment would read the wrong request and the wrong causal
+        # cutoff. Spec decode produces such a segment whenever a request without
+        # draft tokens sits next to requests verifying num_spec+1 tokens.
+        decode_query_len = _uniform_decode_query_len(
+            common_attn_metadata.query_start_loc_cpu, num_decodes
+        )
+        if (
+            num_decodes > 0
+            and num_extends == 0
+            and num_prefills == 0
+            and decode_query_len is not None
+        ):
+            return self._build_uniform_decode_metadata(
+                common_attn_metadata, decode_query_len
+            )
+
+        if num_decodes > 0 and decode_query_len is None:
+            # Ragged decode segment: hand those requests to the prefill kernel,
+            # which derives causality from cu_seqlens_q/context_lens and so
+            # accepts variable query lengths. The prefill slice below starts at
+            # num_decodes/num_decode_tokens, so zeroing both widens it to the
+            # whole batch.
+            num_prefills += num_decodes
+            num_decodes = 0
+            num_decode_tokens = 0
 
         num_tokens = common_attn_metadata.num_actual_tokens
         num_prefills_total = num_extends + num_prefills
@@ -566,10 +622,14 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
 
         decode_metadata: MinimaxM3SparseDecodeMetadata | None = None
         if num_decodes > 0:
+            # decode_query_len is the measured length, not the reorder
+            # threshold: a mixed batch whose decode segment is plain decode has
+            # query_len == 1 even when the threshold is num_spec + 1, and
+            # feeding the threshold to the kernels would mis-map every row.
             decode_metadata = MinimaxM3SparseDecodeMetadata(
                 seq_lens=seq_lens[:num_decodes],
                 block_table=block_table[:num_decodes],
-                max_query_len=self.reorder_batch_threshold,
+                max_query_len=decode_query_len,
             )
 
         return MinimaxM3SparseMetadata(
@@ -587,12 +647,21 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
             decode=decode_metadata,
         )
 
-    def _build_uniform_decode_metadata(self, common_attn_metadata):
+    def _build_uniform_decode_metadata(
+        self, common_attn_metadata, decode_query_len: int | None = None
+    ):
         assert common_attn_metadata is not None
 
         num_reqs = common_attn_metadata.num_reqs
         num_tokens = common_attn_metadata.num_actual_tokens
-        max_query_len = common_attn_metadata.max_query_len
+        # Callers that already measured the per-request query length pass it in;
+        # cudagraph capture builds a uniform batch by construction, so falling
+        # back to the batch maximum is exact there.
+        max_query_len = (
+            decode_query_len
+            if decode_query_len is not None
+            else common_attn_metadata.max_query_len
+        )
         seq_lens = common_attn_metadata.seq_lens
         block_table = common_attn_metadata.block_table_tensor
 
@@ -739,6 +808,23 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
             num_prefill_tokens,
         ) = split_ret
 
+        # aiter's gluon decode kernel derives the batch as
+        # `q.shape[0] // max_query_len`, so a decode segment whose requests
+        # disagree on query length cannot go through it. EAGLE/MTP propose steps
+        # produce exactly that: a request's query length there is however many
+        # draft tokens the previous step accepted. Send such a segment to the
+        # extend path instead, which is varlen (driven by cu_seqlens_q). Decode
+        # requests sort before extends, so widening the extend segment covers
+        # them without reordering.
+        decode_query_len = _uniform_decode_query_len(
+            common_attn_metadata.query_start_loc_cpu, num_decodes
+        )
+        if num_decodes > 0 and decode_query_len is None:
+            num_extends += num_decodes
+            num_extend_tokens += num_decode_tokens
+            num_decodes = 0
+            num_decode_tokens = 0
+
         prefill_only = num_decodes == 0 and num_extends == 0 and num_prefills > 0
         decode_only = num_decodes > 0 and num_extends == 0 and num_prefills == 0
         mixed = not (prefill_only or decode_only)
@@ -769,7 +855,7 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
                     - prefill_query_start_loc[prefill_start]
                 )
             if num_decodes > 0:
-                decode_max_query_len = query_lens_cpu[:num_decodes].max().item()
+                decode_max_query_len = decode_query_len
                 decode_max_seq_len = seq_lens[:num_decodes].max().item()
                 decode_query_start_loc = decode_query_start_loc[: num_decodes + 1]
 
@@ -961,30 +1047,38 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
         """
         Build attention metadata for draft model without CPU-GPU sync.
 
-        During EAGLE/MTP drafting all requests are uniform decodes, so we can
-        skip split_decodes_prefills_and_extends() and avoid all .cpu() /
-        .item() calls that would otherwise break CUDA graph capture.
+        Drafting is usually a uniform decode, and then we can skip
+        split_decodes_prefills_and_extends() and avoid all .cpu() / .item()
+        calls that would otherwise break CUDA graph capture.
+
+        It is not always uniform, though: a request's query length here is
+        however many draft tokens the previous step accepted, so one request
+        can bring fewer rows than its neighbours. The gluon decode kernel
+        reshapes q to [q.shape[0] // max_query_len, max_query_len, ...] and
+        would fail on such a batch, so fall back to the full build(), which
+        routes a ragged segment to the varlen extend path.
         """
         query_start_loc = common_attn_metadata.query_start_loc_cpu
         query_lens = query_start_loc[1:] - query_start_loc[:-1]
         is_prefill = query_lens > self.reorder_batch_threshold
 
-        if torch.any(is_prefill):
+        num_reqs = common_attn_metadata.num_reqs
+        decode_query_len = _uniform_decode_query_len(query_start_loc, num_reqs)
+        if torch.any(is_prefill) or decode_query_len is None:
             return self.build(
                 common_prefix_len=0, common_attn_metadata=common_attn_metadata
             )
 
-        num_reqs = common_attn_metadata.num_reqs
         num_tokens = common_attn_metadata.num_actual_tokens
         decode_metadata = AiterMhaPhaseMetadata(
-            max_query_len=common_attn_metadata.max_query_len,
+            max_query_len=decode_query_len,
             max_seq_len=common_attn_metadata.max_seq_len,
             query_start_loc=common_attn_metadata.query_start_loc,
         )
         return AiterMhaMetadataForVllm(
             num_actual_tokens=num_tokens,
             num_actual_kv_tokens=0,
-            max_query_len=common_attn_metadata.max_query_len,
+            max_query_len=decode_query_len,
             query_start_loc=common_attn_metadata.query_start_loc,
             max_seq_len=common_attn_metadata.max_seq_len,
             seq_lens=common_attn_metadata.seq_lens,
