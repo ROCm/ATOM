@@ -125,14 +125,25 @@ class GDNStateMixin:
         # a hidden ordering dependency on the KV sizing path being
         # called first.
         hf = model_runner.config.hf_config
-        if getattr(hf, "model_type", None) == "kimi_linear":
+        model_type = getattr(hf, "model_type", None)
+        if model_type in ("kimi_linear", "glm5_next_text"):
             lin = getattr(hf, "linear_attn_config", {}) or {}
-            model_runner.full_attention_layers = [
-                int(i) - 1 for i in lin.get("full_attn_layers", [])
-            ]
-            model_runner.kda_attention_layers = [
-                int(i) - 1 for i in lin.get("kda_layers", [])
-            ]
+            # Kimi-Linear numbers these 1-based; GLM-5.3-Flash numbers them
+            # 0-based (its layer_types[3] is the first full-attention layer, and
+            # full_attn_layers correspondingly starts at 3).
+            offset = 0 if model_type == "glm5_next_text" else 1
+            if model_type == "glm5_next_text" and hasattr(hf, "glm5_full_attn_layers"):
+                # The model normalizer derives these from layer_types when a
+                # config revision omits the redundant linear-attn lists.
+                model_runner.full_attention_layers = list(hf.glm5_full_attn_layers)
+                model_runner.kda_attention_layers = list(hf.glm5_kda_layers)
+            else:
+                model_runner.full_attention_layers = [
+                    int(i) - offset for i in lin.get("full_attn_layers", [])
+                ]
+                model_runner.kda_attention_layers = [
+                    int(i) - offset for i in lin.get("kda_layers", [])
+                ]
             model_runner.num_full_attn = len(model_runner.full_attention_layers)
             model_runner.num_gdn_attn_state = len(model_runner.kda_attention_layers)
             hf.linear_num_key_heads = getattr(
@@ -314,9 +325,12 @@ class GDNStateMixin:
         return conv_state_shape, temporal_state_shape
 
     def _state_dtypes(self) -> tuple[torch.dtype, torch.dtype]:
-        if (
-            getattr(self.model_runner.config.hf_config, "model_type", None)
-            == "kimi_linear"
+        # KDA recurrence accumulates in fp32 and aiter's chunk_kimi_delta_attn
+        # reads the state back verbatim, so the temporal state must be fp32 for
+        # every KDA model (Kimi-Linear and GLM-5.3-Flash).
+        if getattr(self.model_runner.config.hf_config, "model_type", None) in (
+            "kimi_linear",
+            "glm5_next_text",
         ):
             return (
                 self.model_runner.config.torch_dtype,
@@ -354,9 +368,14 @@ class GDNStateMixin:
         )
 
     def _is_kda(self) -> bool:
-        return (
-            getattr(self.model_runner.config.hf_config, "model_type", None)
-            == "kimi_linear"
+        # Both KDA models, matching the two sibling checks above. GLM-5.3-Flash
+        # was added to those and missed here, which mattered because this one
+        # feeds `_replayssm_buffer_shapes()`: answering "not KDA" for a KDA
+        # model sizes the ReplaySSM record buffers for the wrong head geometry
+        # and the recurrence writes past them.
+        return getattr(self.model_runner.config.hf_config, "model_type", None) in (
+            "kimi_linear",
+            "glm5_next_text",
         )
 
     def _replayssm_bytes_per_slot(self) -> int:
@@ -584,6 +603,18 @@ class GDNStateMixin:
             (math.prod(shape_v) * dt_v.itemsize, n),
         ]
 
+    def _checkpoint_plane_tensors(self) -> list[torch.Tensor]:
+        """Allocated source planes in the order `_checkpoint_plane_shapes` names.
+
+        Kept separate from the pure geometry method because checkpoint sizing
+        runs before these tensors exist. Hybrid backends may extend both lists
+        with state that shares the same slot lifetime.
+        """
+        return [
+            self.model_runner.mamba_k_cache,
+            self.model_runner.mamba_v_cache,
+        ]
+
     def _checkpoint_num_slots(self) -> int:
         """The slot axis of the state tensors, or 1 before they exist.
 
@@ -630,10 +661,14 @@ class GDNStateMixin:
         than cleared by a hook, so a pool that moves underneath invalidates
         this by disagreeing with its own key.
         """
-        runner = self.model_runner
-        k_cache, v_cache = runner.mamba_k_cache, runner.mamba_v_cache
-        num_slots = int(k_cache.shape[1])
-        key = (k_cache.data_ptr(), v_cache.data_ptr(), num_slots)
+        plane_tensors = getattr(self, "_checkpoint_plane_tensors", None)
+        planes = (
+            GDNStateMixin._checkpoint_plane_tensors(self)
+            if plane_tensors is None
+            else plane_tensors()
+        )
+        num_slots = int(planes[0].shape[1])
+        key = tuple(cache.data_ptr() for cache in planes) + (num_slots,)
         cached = getattr(self, "_checkpoint_slot_base_cache", None)
         if cached is not None and cached[0] == key:
             return cached[1]
@@ -641,12 +676,18 @@ class GDNStateMixin:
         slots = np.arange(num_slots, dtype=np.int64)[:, None]
         columns = []
         for cache, (nbytes, n_layers) in zip(
-            (k_cache, v_cache), self._checkpoint_plane_shapes(), strict=True
+            planes, self._checkpoint_plane_shapes(), strict=True
         ):
             if not cache.is_contiguous():
                 raise RuntimeError(
                     "a PAGE-copy state plane must be contiguous; "
                     f"{tuple(cache.shape)} stride {cache.stride()} is not"
+                )
+            if int(cache.shape[0]) != n_layers or int(cache.shape[1]) != num_slots:
+                raise RuntimeError(
+                    "a PAGE-copy state plane disagrees with its checkpoint "
+                    f"geometry: tensor={tuple(cache.shape[:2])}, "
+                    f"geometry=({n_layers}, {num_slots})"
                 )
             layers = np.arange(n_layers, dtype=np.int64)[None, :]
             columns.append(cache.data_ptr() + (layers * num_slots + slots) * nbytes)
