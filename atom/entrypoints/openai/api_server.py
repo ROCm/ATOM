@@ -165,18 +165,26 @@ _stream_batch_dispatcher: StreamBatchDispatcher | None = None
 synthetic_token_text: str | None = None
 
 
-def delivered_text(token_ids) -> str:
+def delivered_text(token_ids, stop_truncate_to: int = -1) -> str:
     """The text a non-streaming response carries for these tokens.
 
     Decoded even when the answer is thrown away: the runs that stand their text
     in are measuring throughput, and skipping the work the measured server does
     would flatter it. The streaming half of this lives in
-    `IncrementalStreamDetokenizer.update`.
+    `StreamingTextState.update`.
+
+    ``stop_truncate_to`` is where a stop string matched. A stop string is
+    defined over the text, so the cut is applied to the text -- the token that
+    carried the match may hold characters on both sides of it, which no
+    token-level trim could separate. A run that stands its text in has no such
+    offset to honour: the cut was measured against text it does not deliver.
     """
     decoded = tokenizer.decode(token_ids, skip_special_tokens=True)
-    if synthetic_token_text is None:
-        return decoded
-    return synthetic_token_text * len(token_ids)
+    if synthetic_token_text is not None:
+        return synthetic_token_text * len(token_ids)
+    if stop_truncate_to >= 0:
+        return decoded[:stop_truncate_to]
+    return decoded
 
 
 def reasoning_channel(
@@ -508,13 +516,19 @@ def _build_sampling_params(
     top_k: int = -1,
     top_p: float = 1.0,
     n: int = 1,
+    min_tokens: int | None = 0,
+    stop_token_ids: list[int] | None = None,
+    include_stop_str_in_output: bool = False,
 ) -> SamplingParams:
     return SamplingParams(
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
         max_tokens=max_tokens,
+        min_tokens=min_tokens or 0,
         stop_strings=stop_strings,
+        stop_token_ids=stop_token_ids,
+        include_stop_str_in_output=include_stop_str_in_output,
         ignore_eos=ignore_eos,
         n=n,
     )
@@ -793,6 +807,7 @@ def _build_stream_chunk(request_output: RequestOutput, request_id: str) -> dict:
         "finished_at": time.time(),
         "started_at": started_at,
         "num_cached_tokens": getattr(request_output, "num_cached_tokens", 0),
+        "stop_truncate_to": request_output.stop_truncate_to,
     }
     if getattr(request_output, "kv_transfer_params_output", None):
         chunk_data["kv_transfer_params"] = request_output.kv_transfer_params_output
@@ -874,6 +889,7 @@ async def generate_async(
     # consumer that starts reading that key has to convert.
     all_token_ids = new_token_ids()
     finish_reason: str | None = None
+    stop_truncate_to: int = -1
     seq = None
     kv_transfer_output_meta_info = None
     num_cached_tokens_seen = 0
@@ -893,6 +909,7 @@ async def generate_async(
                 "token_ids": request_output.output_tokens,
                 "finished": request_output.finished,
                 "finish_reason": request_output.finish_reason,
+                "stop_truncate_to": request_output.stop_truncate_to,
                 "ts": now,
             },
         )
@@ -928,6 +945,7 @@ async def generate_async(
                 all_token_ids.extend(token_ids)
             if item.get("finished", False):
                 finish_reason = item.get("finish_reason")
+                stop_truncate_to = item.get("stop_truncate_to", -1)
                 _finished_ok = True
                 break
     finally:
@@ -945,7 +963,7 @@ async def generate_async(
                     engine.core_mgr.abort_request(seq.id)
             engine.io_processor.requests.pop(seq.id, None)
 
-    text = delivered_text(all_token_ids)
+    text = delivered_text(all_token_ids, stop_truncate_to)
     num_tokens_input = (
         seq.num_prompt_tokens if seq is not None else len(tokenizer.encode(prompt))
     )
@@ -995,6 +1013,7 @@ async def generate_async_multimodal(
     last_token_at: float | None = None
     all_token_ids = new_token_ids()
     finish_reason: str | None = None
+    stop_truncate_to: int = -1
     seq = None
 
     def completion_callback(request_output: RequestOutput):
@@ -1005,6 +1024,7 @@ async def generate_async_multimodal(
                 "token_ids": request_output.output_tokens,
                 "finished": request_output.finished,
                 "finish_reason": request_output.finish_reason,
+                "stop_truncate_to": request_output.stop_truncate_to,
                 "ts": now,
             },
         )
@@ -1040,6 +1060,7 @@ async def generate_async_multimodal(
                 all_token_ids.extend(token_ids_out)
             if item.get("finished", False):
                 finish_reason = item.get("finish_reason")
+                stop_truncate_to = item.get("stop_truncate_to", -1)
                 _finished_ok = True
                 break
     finally:
@@ -1050,7 +1071,7 @@ async def generate_async_multimodal(
                     engine.core_mgr.abort_request(seq.id)
             engine.io_processor.requests.pop(seq.id, None)
 
-    text = delivered_text(all_token_ids)
+    text = delivered_text(all_token_ids, stop_truncate_to)
     num_tokens_output = len(all_token_ids)
     finished_at = time.time()
     ttft = (first_token_at - started_at) if first_token_at is not None else 0.0
@@ -1105,6 +1126,8 @@ async def generate_async_fanout(
     per_first_token_at: list[float | None] = [None] * n
     per_last_token_at: list[float | None] = [None] * n
     per_finish_reason: list[str | None] = [None] * n
+    per_stop_truncate_to = [-1] * n
+    per_kv_transfer_output: list[dict[str, Any] | None] = [None] * n
     finished = [False] * n
 
     def make_callback(idx: int):
@@ -1118,6 +1141,10 @@ async def generate_async_fanout(
                         "token_ids": request_output.output_tokens,
                         "finished": request_output.finished,
                         "finish_reason": request_output.finish_reason,
+                        "stop_truncate_to": request_output.stop_truncate_to,
+                        "kv_transfer_params_output": getattr(
+                            request_output, "kv_transfer_params_output", None
+                        ),
                         "ts": now,
                     },
                 ),
@@ -1164,6 +1191,8 @@ async def generate_async_fanout(
                 per_tokens[idx].extend(tokens)
             if item.get("finished", False):
                 per_finish_reason[idx] = item.get("finish_reason")
+                per_stop_truncate_to[idx] = item.get("stop_truncate_to", -1)
+                per_kv_transfer_output[idx] = item.get("kv_transfer_params_output")
                 finished[idx] = True
         _all_finished = True
     finally:
@@ -1192,18 +1221,20 @@ async def generate_async_fanout(
             and num_tokens_output > 1
             else 0.0
         )
-        outputs.append(
-            {
-                "text": delivered_text(per_tokens[i]),
-                "token_ids": per_tokens[i],
-                "finish_reason": per_finish_reason[i],
-                "num_tokens_input": num_tokens_input,
-                "num_tokens_output": num_tokens_output,
-                "ttft": ttft,
-                "tpot": tpot,
-                "latency": finished_at - started_at,
-            }
-        )
+        text = delivered_text(per_tokens[i], per_stop_truncate_to[i])
+        output = {
+            "text": text,
+            "token_ids": per_tokens[i],
+            "finish_reason": per_finish_reason[i],
+            "num_tokens_input": num_tokens_input,
+            "num_tokens_output": num_tokens_output,
+            "ttft": ttft,
+            "tpot": tpot,
+            "latency": finished_at - started_at,
+        }
+        if per_kv_transfer_output[i] is not None:
+            output["kv_transfer_output_meta_info"] = per_kv_transfer_output[i]
+        outputs.append(output)
     return outputs
 
 
@@ -1247,7 +1278,7 @@ async def setup_streaming_request(
     # The detokenizer lives in this closure, so it is freed when the engine
     # drops the callback on the stream's last chunk -- no registry, no cleanup.
     assert _stream_batch_dispatcher is not None
-    detokenizer = _stream_batch_dispatcher.new_state()
+    detokenizer = _stream_batch_dispatcher.new_state(sampling_params.stop_strings)
 
     def stream_callback(request_output: RequestOutput) -> None:
         _send_stream_chunk_direct(
@@ -1458,7 +1489,7 @@ async def setup_streaming_request_fanout(
 
     def make_callback(idx: int):
         # One detokenizer per sibling, held by the closure that feeds it.
-        detokenizer = _stream_batch_dispatcher.new_state()
+        detokenizer = _stream_batch_dispatcher.new_state(sampling_params.stop_strings)
 
         def _cb(request_output: RequestOutput) -> None:
             _send_stream_chunk_tagged(
@@ -1654,6 +1685,9 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             top_k=request.top_k,
             top_p=request.top_p,
             n=effective_n,
+            min_tokens=request.min_tokens,
+            stop_token_ids=request.stop_token_ids,
+            include_stop_str_in_output=request.include_stop_str_in_output,
         )
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -1886,6 +1920,9 @@ async def completions(request: CompletionRequest, raw_request: Request):
             top_k=request.top_k,
             top_p=request.top_p,
             n=effective_n,
+            min_tokens=request.min_tokens,
+            stop_token_ids=request.stop_token_ids,
+            include_stop_str_in_output=request.include_stop_str_in_output,
         )
 
         request_id = f"cmpl-{uuid.uuid4().hex}"
@@ -2070,6 +2107,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             ignore_eos=False,
             top_k=(request.top_k if request.top_k is not None else model_top_k),
             top_p=(request.top_p if request.top_p is not None else model_top_p),
+            min_tokens=request.min_tokens,
         )
 
         request_id = uuid.uuid4().hex[:24]

@@ -188,7 +188,10 @@ class ChatCompletionRequest(BaseModel):
     top_p: float | None = DEFAULT_TOP_P
     max_tokens: int | None = DEFAULT_MAX_TOKENS
     max_completion_tokens: int | None = None
+    min_tokens: int | None = 0
     stop: list[str] | None = None
+    stop_token_ids: list[int] | None = None
+    include_stop_str_in_output: bool = False
     ignore_eos: bool | None = False
     stream: bool | None = False
     seed: int | None = None
@@ -242,7 +245,10 @@ class CompletionRequest(BaseModel):
     top_p: float | None = DEFAULT_TOP_P
     max_tokens: int | None = DEFAULT_MAX_TOKENS
     max_completion_tokens: int | None = None
+    min_tokens: int | None = 0
     stop: list[str] | None = None
+    stop_token_ids: list[int] | None = None
+    include_stop_str_in_output: bool = False
     ignore_eos: bool | None = False
     stream: bool | None = False
     # Optional KV-transfer metadata for P/D disaggregation.

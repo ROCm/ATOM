@@ -9,15 +9,13 @@ single callback per event loop. :class:`StreamOutputCollector` is the loop-side
 landing point each stream's SSE generator reads from.
 """
 
-import array
 import logging
 import threading
 import time
 from asyncio import AbstractEventLoop, Event
-from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
-from atom.model_engine.sequence import new_token_ids
+from atom.model_engine.stop_strings import StreamingTextState
 
 logger = logging.getLogger("atom")
 
@@ -42,50 +40,6 @@ _LATEST_WINS = ("finish_reason", "kv_transfer_params", "num_cached_tokens")
 # it carries no marker any dialect or tool-call format intercepts, so it reaches
 # the client whatever the model is.
 SYNTHETIC_TOKEN_TEXT = "synthetic "
-
-
-@dataclass
-class IncrementalStreamDetokenizer:
-    """Decode token deltas without emitting incomplete UTF-8 characters."""
-
-    tokenizer: Any
-    # Grows for the whole life of a stream, one entry per token, and only ever
-    # sliced into `tokenizer.decode` -- which takes an array. Nothing here is
-    # serialized, so this one has no boundary to convert back at.
-    tokens: array.array = field(default_factory=new_token_ids)
-    prefix_offset: int = 0
-    read_offset: int = 0
-    # Emitted once per token in place of the decoded text, for runs whose text
-    # is a byproduct rather than an answer. See `SYNTHETIC_TOKEN_TEXT`.
-    synthetic_text: str | None = None
-
-    def update(self, token_ids: list[int], finished: bool) -> str:
-        decoded = self._decode(token_ids, finished)
-        if self.synthetic_text is None:
-            return decoded
-        # Decoded and thrown away: the run is measuring throughput, and skipping
-        # the work would make the server look faster than the one being measured.
-        return self.synthetic_text * len(token_ids)
-
-    def _decode(self, token_ids: list[int], finished: bool) -> str:
-        self.tokens.extend(token_ids)
-        prefix_text = self.tokenizer.decode(
-            self.tokens[self.prefix_offset : self.read_offset],
-            skip_special_tokens=True,
-        )
-        new_text = self.tokenizer.decode(
-            self.tokens[self.prefix_offset :],
-            skip_special_tokens=True,
-        )
-
-        if len(new_text) > len(prefix_text) and not new_text.endswith("\ufffd"):
-            delta = new_text[len(prefix_text) :]
-            self.prefix_offset = self.read_offset
-            self.read_offset = len(self.tokens)
-            return delta
-        if finished:
-            return new_text[len(prefix_text) :]
-        return ""
 
 
 def merge_chunk(into: dict, new: dict) -> None:
@@ -227,7 +181,7 @@ class _BufferedChunk(NamedTuple):
 
     loop: AbstractEventLoop
     collector: Any
-    state: IncrementalStreamDetokenizer
+    state: StreamingTextState
     chunk: dict
     tag: int | None
 
@@ -253,10 +207,10 @@ class StreamBatchDispatcher:
         self.synthetic_text = synthetic_text
         self._thread_local = threading.local()
 
-    def new_state(self) -> IncrementalStreamDetokenizer:
+    def new_state(self, stop_strings: list[str] | None = None) -> StreamingTextState:
         """Make the detokenizer for one stream, for its callback to hold."""
-        return IncrementalStreamDetokenizer(
-            self.tokenizer, synthetic_text=self.synthetic_text
+        return StreamingTextState(
+            self.tokenizer, stop_strings, synthetic_text=self.synthetic_text
         )
 
     def enqueue(
@@ -264,7 +218,7 @@ class StreamBatchDispatcher:
         *,
         loop: AbstractEventLoop,
         collector: Any,
-        state: IncrementalStreamDetokenizer,
+        state: StreamingTextState,
         chunk: dict,
         tag: int | None = None,
     ) -> None:
@@ -287,6 +241,7 @@ class StreamBatchDispatcher:
             item.chunk["text"] = item.state.update(
                 item.chunk.get("token_ids") or [],
                 bool(item.chunk.get("finished")),
+                item.chunk.get("stop_truncate_to", -1),
             )
             payload = item.chunk if item.tag is None else (item.tag, item.chunk)
             by_loop.setdefault(item.loop, []).append((item.collector, payload))

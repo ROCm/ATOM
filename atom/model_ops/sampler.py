@@ -2,7 +2,9 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import warnings
+from functools import lru_cache
 
+import numpy as np
 import torch
 from aiter import mixed_sample_outer_exponential
 from aiter.ops.triton.softmax import softmax
@@ -37,6 +39,152 @@ def get_per_token_exponential(vocab_size: int, device) -> torch.Tensor:
     """
     return torch.empty((1, vocab_size), dtype=torch.float, device=device).exponential_(
         1
+    )
+
+
+@lru_cache(maxsize=8)
+def _stop_token_id_tensor(
+    token_ids: tuple[int, ...], device: torch.device
+) -> torch.Tensor:
+    """Cache the terminal-token index tensor; it is constant for a served model."""
+    return torch.tensor(token_ids, dtype=torch.long, device=device)
+
+
+def _mask_terminal_tokens(
+    logits: torch.Tensor,
+    rows: np.ndarray,
+    reqs: np.ndarray,
+    eos_token_id: int,
+    stop_token_ids: list[int] | tuple[int, ...],
+    request_stop_token_ids: list[frozenset[int]] | None,
+) -> torch.Tensor:
+    """Set every terminal token to ``-inf`` on the given ``logits`` rows.
+
+    ``rows`` indexes ``logits``; ``reqs`` names the owning request for each of
+    those rows, so the two differ only on the speculative path, where one
+    request owns several rows. Both are positional, so ``reqs[k]`` is the
+    request that ``rows[k]`` belongs to.
+    """
+    vocab_size = logits.shape[-1]
+    global_stop_ids = {
+        int(token_id)
+        for token_id in (eos_token_id, *stop_token_ids)
+        if 0 <= int(token_id) < vocab_size
+    }
+    if global_stop_ids:
+        row_index = torch.from_numpy(rows).to(logits.device, non_blocking=True)
+        token_ids = _stop_token_id_tensor(tuple(sorted(global_stop_ids)), logits.device)
+        logits[row_index[:, None], token_ids[None, :]] = -torch.inf
+
+    if request_stop_token_ids is not None:
+        for row, req in zip(rows.tolist(), reqs.tolist()):
+            row_stop_ids = [
+                int(token_id)
+                for token_id in request_stop_token_ids[req]
+                if 0 <= int(token_id) < vocab_size
+                and int(token_id) not in global_stop_ids
+            ]
+            if row_stop_ids:
+                logits[row, row_stop_ids] = -torch.inf
+
+    return logits
+
+
+def apply_min_tokens_mask(
+    logits: torch.Tensor,
+    min_tokens,
+    num_completion_tokens,
+    eos_token_id: int,
+    stop_token_ids: list[int] | tuple[int, ...] = (),
+    request_stop_token_ids: list[frozenset[int]] | None = None,
+) -> torch.Tensor:
+    """Mask terminal tokens while a request is below ``min_tokens``.
+
+    One row per request, which is the non-speculative layout and also the
+    bonus-logits layout on the speculative path. See
+    ``apply_min_tokens_mask_with_spec_decode`` for the draft rows.
+
+    The mask is applied to logits rather than ignoring EOS after sampling:
+    feeding a sampled EOS back into the model would start a new message and
+    change the requested distribution.
+
+    Terminal here means the model's EOS, the server's `stop_token_ids` and the
+    request's own -- everything that ends a request by *token* id. Stop
+    strings are not maskable and are not tried: they end a request from the
+    frontend, on detokenized text, and a floor that is still in force simply
+    keeps that check from running.
+    """
+    blocked_rows = np.flatnonzero(
+        np.asarray(num_completion_tokens) < np.asarray(min_tokens)
+    )
+    if blocked_rows.size == 0:
+        return logits
+
+    # Row index and request index coincide when each request owns one row.
+    return _mask_terminal_tokens(
+        logits,
+        blocked_rows,
+        blocked_rows,
+        eos_token_id,
+        stop_token_ids,
+        request_stop_token_ids,
+    )
+
+
+def apply_min_tokens_mask_with_spec_decode(
+    logits: torch.Tensor,
+    min_tokens,
+    num_completion_tokens,
+    num_draft_tokens,
+    eos_token_id: int,
+    stop_token_ids: list[int] | tuple[int, ...] = (),
+    request_stop_token_ids: list[frozenset[int]] | None = None,
+) -> torch.Tensor:
+    """``apply_min_tokens_mask`` for the flattened draft logits.
+
+    ``logits`` holds ``sum(num_draft_tokens)`` rows, request-major and
+    contiguous per request -- the layout ``Drafter.calc_spec_decode_metadata``
+    builds ``target_logits_indices`` in. Request ``i`` therefore owns rows
+    ``[cu[i], cu[i] + num_draft_tokens[i])``, and only the leading
+    ``min_tokens[i] - num_completion_tokens[i]`` of them are still below the
+    floor: a draft position that a request can only reach after emitting the
+    tokens ahead of it in the same forward is no longer below it.
+
+    Masking here is what makes the floor hold under speculative decoding.
+    ATOM's rejection sampler is argmax-based, so a masked terminal token
+    simply stops being ``target_argmax``: a draft that proposed EOS too early
+    is rejected and the sequence continues from the target's own token. That
+    is the outcome the floor asks for, not a distortion of it.
+    """
+    min_toks = np.asarray(min_tokens)
+    completed = np.asarray(num_completion_tokens)
+    drafts = np.asarray(num_draft_tokens, dtype=np.int64)
+    batch_size = drafts.shape[0]
+
+    # A batch carries its sampling arrays for every scheduled seq; the spec
+    # metadata covers the decode prefix of that same ordering.
+    remaining = np.clip(min_toks[:batch_size] - completed[:batch_size], 0, None)
+    num_masked = np.minimum(remaining, drafts)
+    total_masked = int(num_masked.sum())
+    if total_masked == 0:
+        return logits
+
+    # Ragged arange: the k-th masked row of request i is `starts[i] + k`.
+    starts = np.concatenate([[0], np.cumsum(drafts)[:-1]])
+    reqs = np.repeat(np.arange(batch_size, dtype=np.int64), num_masked)
+    group_starts = np.concatenate([[0], np.cumsum(num_masked)[:-1]])
+    within = np.arange(total_masked, dtype=np.int64) - np.repeat(
+        group_starts, num_masked
+    )
+    rows = starts[reqs] + within
+
+    return _mask_terminal_tokens(
+        logits,
+        rows,
+        reqs,
+        eos_token_id,
+        stop_token_ids,
+        request_stop_token_ids,
     )
 
 

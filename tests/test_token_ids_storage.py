@@ -68,8 +68,6 @@ def test_every_per_token_field_on_a_sequence_is_an_array():
         held = getattr(seq, name)
         assert isinstance(held, array.array), f"{name} is a {type(held).__name__}"
         assert held.typecode == typecode, name
-    for stop in _seq([1], stop_token_sequences=[[1]]).stop_token_sequences:
-        assert isinstance(stop, array.array)
 
 
 def test_storage_is_int32_and_holds_what_a_list_held():
@@ -94,19 +92,19 @@ def test_the_operations_a_sequence_performs_on_it():
 # --- the three comparisons, each with its control ------------------------
 
 
-def test_stop_sequences_are_stored_in_the_same_type_they_are_compared_against():
-    """`Scheduler._check_stop` does `seq.token_ids[a:b] == stop_seq`.
+def test_a_slice_of_token_ids_never_equals_a_list():
+    """The comparison hazard this file exists for, kept after its last caller.
 
-    Left as lists, that comparison is False for every input and generation
-    never stops on a stop sequence -- with no error anywhere.
+    The scheduler used to match stop sequences with
+    `seq.token_ids[a:b] == stop_seq`, and a list on the right made that False
+    for every input -- silently. Stop strings are matched on text now, so no
+    production comparison has this shape; the hazard is still true of the
+    storage type, and the next reader to reach for a list here should find it
+    written down rather than rediscover it.
     """
-    seq = _seq([1, 2, 3, 4], stop_token_sequences=[[3, 4], [9]])
-    for stored in seq.stop_token_sequences:
-        assert isinstance(stored, array.array), "a list here never matches"
-    assert seq.token_ids[2:4] == seq.stop_token_sequences[0]
-
-    # Control: the shape of the bug this guards.
+    seq = _seq([1, 2, 3, 4])
     assert seq.token_ids[2:4] != [3, 4]
+    assert seq.token_ids[2:4] == array.array("i", [3, 4])
 
 
 def test_compute_hash_does_not_depend_on_its_argument_type():

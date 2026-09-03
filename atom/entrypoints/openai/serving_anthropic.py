@@ -52,6 +52,7 @@ class AnthropicMessagesRequest(BaseModel):
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
+    min_tokens: int | None = 0
     stream: bool = False
     stop_sequences: list[str] | None = None
     tools: list[dict] | None = None
