@@ -206,7 +206,9 @@ def role_env(
         model_cfg.get("env", {}).get(role, {}),
         suite_cfg.get("env", {}).get(role, {}),
     )
-    env = resolve_env_refs_in_value(env, preserve_names={"ROLE_IP"})
+    # ROLE_IP and HANDSHAKE_PORT are filled in by pd_server_atom.sh at
+    # launch time (host IP and 6301 + ATOMESH_SERVICE_PORT_OFFSET).
+    env = resolve_env_refs_in_value(env, preserve_names={"ROLE_IP", "HANDSHAKE_PORT"})
     return {str(key): str(value) for key, value in env.items()}
 
 
