@@ -99,6 +99,9 @@ class StateOffloadIndex:
         self.loads_failed = 0
         self.loads_abandoned = 0
         self.orphan_load_slots_reclaimed = 0
+        # Non-zero means `audit_invariant` caught the accounting drifting.
+        self.invariant_violations = 0
+        self._warned_invariant = False
         # Store-side counters. Until this commit the only store-side signal was
         # `indexed` growing, which is why a shell that refused every store
         # (`enqueue_state_stores` never forwarded) looked identical to a tier
@@ -146,6 +149,34 @@ class StateOffloadIndex:
                 "state offload index: hashes and _hash_lru diverged "
                 f"({len(self.hashes)} != {len(self._hash_lru)})"
             )
+
+    def audit_invariant(self) -> bool:
+        """Check the invariant on the serving path. Reports, never raises.
+
+        `check_invariant` raises because a test that cannot fail proves nothing.
+        Production wants the opposite: a bookkeeping fault must not take the
+        engine down, but it must not be silent either -- a violation means some
+        request is parked on a report that will never come, or a slot has
+        leaked, and without this the first symptom is a hang nobody can explain.
+
+        So the fault surfaces twice: one loud log line naming the numbers, and
+        `invariant_violations` in `stats()`, which reaches `checkpoint_funnel`.
+        An assertion nothing ever runs is not an assertion.
+        """
+        try:
+            self.check_invariant()
+        except AssertionError as exc:
+            self.invariant_violations += 1
+            if not self._warned_invariant:
+                self._warned_invariant = True
+                logger.error(
+                    "%s. This is an accounting fault, not a cache miss: a "
+                    "request is parked on a report that cannot come, or a "
+                    "state slot has leaked. Serving continues.",
+                    exc,
+                )
+            return False
+        return True
 
     # ------------------------------- stores -------------------------------- #
     def note_stored(self, h: int) -> None:
@@ -335,7 +366,12 @@ class StateOffloadIndex:
         in flight. Read the store counters the same way, and read
         `stores_completed` against `checkpoints_kept`: the gap is how much of
         what HBM keeps the CPU tier never received.
+
+        Audits the invariant on the way past. This is the periodic path the
+        funnel already pulls, so it costs two integer comparisons per metrics
+        read and it is the only place the check runs in a live engine.
         """
+        self.audit_invariant()
         return {
             # Store leg. `attempted - completed - failed` is in flight;
             # `refused` is a wiring fault, not backpressure -- any non-zero
@@ -353,6 +389,7 @@ class StateOffloadIndex:
             "loads_failed": self.loads_failed,
             "loads_abandoned": self.loads_abandoned,
             "orphan_load_slots_reclaimed": self.orphan_load_slots_reclaimed,
+            "invariant_violations": self.invariant_violations,
             "indexed": len(self.hashes),
             # Non-zero means the index hit its `_hash_cap` and is dropping the
             # coldest hashes. Harmless (a dropped hash just misses one reuse),
