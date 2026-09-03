@@ -259,8 +259,8 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         if not isinstance(metadata, LMCacheOffloadMetadata):
             super().start_load_kv(metadata)
             return
-        # The three state helpers run before super() so the KV leg is submitted
-        # against a park that already exists. They must not be able to skip
+        # The arm + three state helpers run before super() so the KV leg is
+        # submitted against a park that already exists. None of them may skip
         # super(): _JointPark's correctness -- and the refutation of the
         # "park leaks on abort" candidate -- both rest on "the KV leg always
         # reports", which holds only while super().start_load_kv() cannot be
@@ -271,8 +271,13 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         # into the same failed-load / failed-store channels a no-tier step uses,
         # so the armed park resolves to a recompute instead of hanging), and
         # super() runs in a finally so a KV load or save is never dropped.
-        self._arm_joint_loads(metadata)
+        # `_arm_joint_loads` is inside the try too: it builds park state and can
+        # raise (a MemoryError filing the dicts, say), and the same "KV leg must
+        # still report" invariant that puts super() in a finally requires the
+        # KV submit to run even when arming half-completed -- an arriving KV
+        # completion then settles or evicts whatever the arm did file.
         try:
+            self._arm_joint_loads(metadata)
             self._start_state_loads(metadata)
             self._start_state_stores(metadata)
         finally:
