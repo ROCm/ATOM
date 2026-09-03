@@ -53,20 +53,20 @@ changes.
 
 | CONC | DCP | spec | AL | LMCache | ReplaySSM | `max-num-seqs` | batched tokens | GPU util | `graph_max` |
 |---:|---:|---:|---:|---|---:|---:|---:|---:|---:|
-| 1 | 1 | 7 | 3.84 | off | 1 | 32 | 8192 | 0.88 | 16 |
-| 2 | 1 | 7 | 3.84 | off | 1 | 32 | 8192 | 0.88 | 32 |
-| 4 | 1 | 7 | 3.84 | off | 1 | 32 | 8192 | 0.88 | 64 |
+| 1 | 1 | 7 | 3.84 | off | 0 | 32 | 8192 | 0.88 | 16 |
+| 2 | 1 | 7 | 3.84 | off | 0 | 32 | 8192 | 0.88 | 32 |
+| 4 | 1 | 7 | 3.84 | off | 0 | 32 | 8192 | 0.88 | 64 |
 | 8 | 8 | 3 | 3.00 | 128 GiB | 1 | 32 | 4096 | 0.88 | 64 |
 | 12 | 8 | 3 | 3.00 | 128 GiB | 1 | 24 | 4096 | 0.88 | 96 |
-| 16 | 8 | 3 | 3.00 | 128 GiB | 0 | 32 | 8192 | 0.86 | 128 |
+| 16 | 8 | 3 | 3.00 | 128 GiB | 1 | 32 | 8192 | 0.86 | 128 |
 | 32 | 8 | 0 | — | 128 GiB | 0 | 64 | 8192 | 0.86 | 64 |
 | 40 | 8 | 0 | — | 128 GiB | 0 | 80 | 8192 | 0.86 | 80 |
 | 56 | 8 | 0 | — | **192 GiB** | 0 | **112** | 8192 | 0.86 | 112 |
 | 64 | 8 | 0 | — | **192 GiB** | 0 | **128** | 8192 | 0.86 | 128 |
 
 C8–C40 use 128 GiB LMCache; C56/C64 use **192 GiB**.
-`AITER_REUSE_IDENTICAL_COMM_GROUPS=1` on C56/C64 (and is the default in this
-recipe). LMCache CPU size is `LMCACHE_MAX_LOCAL_CPU_SIZE`; chunk size is 1024
+`AITER_REUSE_IDENTICAL_COMM_GROUPS=1` only on C56/C64; every other CONC leaves
+it off. LMCache CPU size is `LMCACHE_MAX_LOCAL_CPU_SIZE`; chunk size is 1024
 tokens.
 
 ## 1. Start the ATOM Server
@@ -85,7 +85,6 @@ export CONC="${CONC:-8}"
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_SITUV2_A4W4=1
 export AITER_FLYDSL_STAGE2_FP8=1
-export AITER_REUSE_IDENTICAL_COMM_GROUPS="${AITER_REUSE_IDENTICAL_COMM_GROUPS:-1}"
 
 ONLINE_QUANT_CONFIG='{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*"]}'
 
@@ -96,7 +95,7 @@ case "${CONC}" in
     MAX_NUM_BATCHED_TOKENS=8192
     GPU_MEMORY_UTILIZATION=0.88
     ENABLE_LMCACHE=0
-    ATOM_ENABLE_REPLAYSSM=1
+    ATOM_ENABLE_REPLAYSSM=0
     NUM_SPECULATIVE_TOKENS=7
     SPEC_DECODE_ACCEPTANCE_LENGTH=3.84
     ;;
@@ -129,7 +128,7 @@ case "${CONC}" in
     GPU_MEMORY_UTILIZATION=0.86
     ENABLE_LMCACHE=1
     LMCACHE_MAX_LOCAL_CPU_SIZE=128
-    ATOM_ENABLE_REPLAYSSM=0
+    ATOM_ENABLE_REPLAYSSM=1
     NUM_SPECULATIVE_TOKENS=3
     SPEC_DECODE_ACCEPTANCE_LENGTH=3.00
     ;;
@@ -163,6 +162,7 @@ case "${CONC}" in
     ENABLE_LMCACHE=1
     LMCACHE_MAX_LOCAL_CPU_SIZE=192
     ATOM_ENABLE_REPLAYSSM=0
+    AITER_REUSE_IDENTICAL_COMM_GROUPS=1
     NUM_SPECULATIVE_TOKENS=0
     SPEC_DECODE_ACCEPTANCE_LENGTH=""
     ;;
@@ -174,6 +174,7 @@ case "${CONC}" in
     ENABLE_LMCACHE=1
     LMCACHE_MAX_LOCAL_CPU_SIZE=192
     ATOM_ENABLE_REPLAYSSM=0
+    AITER_REUSE_IDENTICAL_COMM_GROUPS=1
     NUM_SPECULATIVE_TOKENS=0
     SPEC_DECODE_ACCEPTANCE_LENGTH=""
     ;;
@@ -183,6 +184,8 @@ case "${CONC}" in
     ;;
 esac
 
+AITER_REUSE_IDENTICAL_COMM_GROUPS="${AITER_REUSE_IDENTICAL_COMM_GROUPS:-0}"
+export AITER_REUSE_IDENTICAL_COMM_GROUPS
 export ATOM_ENABLE_REPLAYSSM
 SPEC_TOKENS_FOR_GRAPH=0
 if [[ "${NUM_SPECULATIVE_TOKENS}" != "0" ]]; then
@@ -260,9 +263,9 @@ acceptance flags; ATOM rejects that pair at startup. See [`DSpark.md`](DSpark.md
 ### ReplaySSM
 
 Kimi-K3 KDA decode can rebuild SSM state from a checkpoint ring
-(`ATOM_ENABLE_REPLAYSSM=1`). The table above is the AgentX default: on for
-CONC ≤ 12, off from CONC 16 up. Override with `ATOM_ENABLE_REPLAYSSM=0` when
-comparing against a no-ReplaySSM baseline.
+(`ATOM_ENABLE_REPLAYSSM=1`). The table above is the AgentX default: off for
+CONC 1/2/4, on for CONC 8/12/16, off from CONC 32 up. Override with
+`ATOM_ENABLE_REPLAYSSM=0` or `1` when comparing the other setting.
 
 ### Use GPU prefix caching without LMCache
 
