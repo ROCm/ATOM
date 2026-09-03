@@ -470,5 +470,44 @@
     "accuracy_baseline": 0.95,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
     "_baseline_note": "TBO + dp-attention at conc=1000. Local 1319-sample GSM8K 3-shot, 4 runs = 0.9439/0.9484/0.9538/0.9530 (mean ~0.950, 2026-06-14, after TBO ids-gather + pad_for_all_gather fixes). Baseline 0.95; threshold 0.93 (~1.4pp below lowest 0.9439, conc=1000 variance)."
+  },
+  {
+    "model_name": "GLM-5.3-Flash-kpool-16shot",
+    "model_path": "zai-org/GLM-5.3-Flash",
+    "extraArgs": "--kv_cache_dtype bf16 -tp 8 --max-model-len 8192 --max-num-batched-tokens 8192 --max-num-seqs 32 --gpu-memory-utilization 0.85 --no-enable_prefix_caching",
+    "client_command": "lm_eval --model local-chat-completions --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/chat/completions,num_concurrent=32,max_retries=3,tokenized_requests=False,max_gen_toks=512 --tasks gsm8k --num_fewshot 16 --batch_size 65 --apply_chat_template --fewshot_as_multiturn --output_path ${OUTPUT_PATH} --log_samples",
+    "env_vars": "",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "pr",
+    "accuracy_threshold": 0.94,
+    "accuracy_baseline": 0.9613,
+    "accuracy_baseline_model": "zai-org/GLM-5.3-Flash",
+    "_baseline_note": "Guards the POOLED (kpool) indexer path. 16-shot prompts run 2763-3591 tokens, so every one of the 1319 questions exceeds index_topk=2048 and pooled scoring plus pooled top-k decide what the model attends to. The GLM-5.3-Flash entry above does NOT cover this: at or below index_topk the indexer selects every token, attention_mla runs dense, and the pooled selection is computed but never used -- a short-context score only shows the pooled writes did no harm. Measured 2026-08-28: flexible-extract=0.9659, strict-match=0.9666, matching the 0.9682/0.9689 of the dense 3-shot entry within run-to-run spread (two runs of identical code disagree on ~28 of 1319 questions in each direction). Needs --max-model-len 8192, not 4096: lm_eval samples its shots at random, the longest prompt is 3591 tokens, and 3591 + max_gen_toks 512 overflows a 4096 cap -- 4 requests then 400 and lm_eval aborts the whole eval after its retries. The short-context GLM-5.3-Flash entry (max-model-len 2048, 3-shot) was removed in favour of this one: below index_topk the indexer selects every token and attention_mla runs dense, so that entry exercised a strict subset of this path while costing a second 8-GPU nightly. Threshold stays at 0.94. This entry is test_level pr, so every unrelated PR runs it on 8 GPUs; repeat runs of IDENTICAL code have landed at 0.9613/0.9629/0.9644/0.9659, so a 0.96 threshold is cleared by 0.0013 in the worst case and would fail roughly one PR in four on unchanged code -- a gate that flaky trains people to re-run until green and stops carrying information. Baseline is the 0.9613 measured on this tree; the 0.9659 it replaced came from an earlier branch and is optimistic here."
+  },
+  {
+    "model_name": "GLM-5.3-FP8",
+    "model_path": "zai-org/GLM-5.3",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --gpu-memory-utilization 0.8",
+    "client_command": "lm_eval --model local-chat-completions --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/chat/completions,api_key=EMPTY,num_concurrent=64,max_retries=5,timeout=1800,tokenized_requests=False,max_length=1048576 --apply_chat_template --tasks gsm8k --gen_kwargs max_tokens=16384,temperature=0,top_p=1 --num_fewshot 5 --output_path ${OUTPUT_PATH} --log_samples",
+    "env_vars": "",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.96,
+    "accuracy_baseline": 0.9719,
+    "accuracy_baseline_model": "zai-org/GLM-5.3",
+    "_baseline_note": "First accuracy gate for GLM-5.3 (glm_moe_dsa); the model ran on ATOM before this but was covered by no CI entry and no recipe. Measured 2026-09-02 on 8xMI355X, all 1319 questions, chat 5-shot, temperature 0: flexible-extract=0.9719, strict-match=0.9727. MUST run chat, not the default raw-completions client: GLM-5.3's template ends '<|assistant|><think>' and the server reports 'This chat template has no switch for reasoning', so few-shot completions suppress the reasoning the model is trained to do and score ~0.91 -- measured 0.9136 (MXFP4) and 0.9234 (FP8) over all 1319, which would fail this threshold on a healthy checkpoint. Chat 5-shot is also far steadier: two runs of identical code disagree on 13 of 1319 questions in chat versus 108 in 3-shot completions."
+  },
+  {
+    "model_name": "GLM-5.3-MXFP4",
+    "model_path": "amd/GLM-5.3-MXFP4",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 4 --online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\", \"*expert*\"]}'",
+    "client_command": "lm_eval --model local-chat-completions --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/chat/completions,api_key=EMPTY,num_concurrent=64,max_retries=5,timeout=1800,tokenized_requests=False,max_length=1048576 --apply_chat_template --tasks gsm8k --gen_kwargs max_tokens=16384,temperature=0,top_p=1 --num_fewshot 5 --output_path ${OUTPUT_PATH} --log_samples",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.96,
+    "accuracy_baseline": 0.9765,
+    "accuracy_baseline_model": "zai-org/GLM-5.3",
+    "_baseline_note": "Server args are the GLM-5.2-MXFP4 entry verbatim: the two checkpoints have byte-identical quantization_config, the same 1319-entry exclude list and the same 408 GB footprint, differing only in weights and a new moe_router_dtype key. Measured 2026-09-02, all 1319, chat 5-shot, temperature 0: flexible-extract=0.9765, strict-match=0.9773 -- level with the FP8 source (0.9719/0.9727), so MXFP4 costs nothing detectable here. Chat runs of this model have spanned 0.9719-0.9773 across five measurements, so 0.96 keeps ~1.6pp of headroom below the worst. The HF card ships this checkpoint with no evaluation at all. MUST run chat, not the default raw-completions client: GLM-5.3's template ends '<|assistant|><think>' and the server reports 'This chat template has no switch for reasoning', so few-shot completions suppress the reasoning the model is trained to do and score ~0.91 -- measured 0.9136 (MXFP4) and 0.9234 (FP8) over all 1319, which would fail this threshold on a healthy checkpoint. Chat 5-shot is also far steadier: two runs of identical code disagree on 13 of 1319 questions in chat versus 108 in 3-shot completions."
   }
 ]

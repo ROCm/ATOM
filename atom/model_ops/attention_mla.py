@@ -491,6 +491,13 @@ class MLAModules:
     # still run sparse attention (reusing the prior "full" layer's top-k), so
     # sparsity must be derived from the model, not from whether this layer owns
     # an indexer. Defaults keep non-sparse models unchanged.
+    # True when `qk_rope_head_dim` lanes exist only as ZERO PADDING, i.e. a NoPE
+    # model widened so the latent/cache side matches what the MLA kernels
+    # hard-code (576). The padded lanes contribute `sum(0*0) == 0` to every QK
+    # dot product, so prefill may -- and must -- drop them: `qk_nope_head_dim`
+    # is already 256 for GLM-5.3 and CK's flash-attention caps head_dim at 256,
+    # so a padded 320-wide query is refused outright.
+    rope_is_zero_pad: bool = False
     is_sparse: bool = False
     topk_tokens: int | None = None
 
@@ -596,6 +603,7 @@ class MLAAttention(nn.Module):
         self.qk_rope_head_dim = mla_modules.qk_rope_head_dim
         self.qk_head_dim = mla_modules.qk_head_dim
         self.v_head_dim = mla_modules.v_head_dim
+        self.rope_is_zero_pad = mla_modules.rope_is_zero_pad
         self.rotary_emb = mla_modules.rotary_emb
         self.q_proj = mla_modules.q_proj
         self.o_proj = mla_modules.o_proj
@@ -746,13 +754,11 @@ class MLAAttention(nn.Module):
 
         self.dcp_persistent_supported = dcp_persistent_supported()
         self.dcp_prefill_merge_bf16_ok = dcp_prefill_merge_bf16_ok()
-        # Scope sparse persistent DCP to native non-speculative attention.
-        # Decode is q_len=1; sparse prefill is represented as per-token virtual
-        # q_len=1 rows. Plugin DCP reconfigures its group after construction.
+        # Every sparse DCP shape is per-token q_len=1 rows -- one per sequence
+        # in decode, one per query token in sparse prefill and MTP verify.
+        # Plugin DCP reconfigures its group after construction.
         self.sparse_dcp_metadata_rebuild = (
-            self.is_sparse_mla
-            and self.dcp_world_size > 1
-            and getattr(atom_config, "speculative_config", None) is None
+            self.is_sparse_mla and self.dcp_world_size > 1
         )
 
         # Compacted per-layer sparse offsets for DCP decode; rebound by the
@@ -883,6 +889,35 @@ class MLAAttention(nn.Module):
         if self.head_pad > 0:
             return torch.nn.functional.pad(q, (0, 0, 0, self.head_pad))
         return q
+
+    def _drop_rope_pad(self, *tensors):
+        """Slice the zero rope-pad lanes off q/k before flash-attention.
+
+        A NoPE model widened to `kv_lora_rank + 64` for the MLA kernels also
+        widens the per-head q/k to `qk_nope_head_dim + 64`. For GLM-5.3 that is
+        320, and CK's flash-attention caps head_dim at 256. The trailing lanes
+        are identically zero, so dropping them is exact. Applied at EVERY
+        flash_attn_varlen_func site: prefill has several variants (plain,
+        cached-single-pass, chunked context/suffix) and fixing only the one that
+        a short-prompt smoke test happens to reach leaves the others to fail
+        later, under chunked prefill, as a head-dim error.
+
+        The slice is deliberately NOT made contiguous. It leaves
+        ``stride(-2) == qk_nope_head_dim + pad`` against ``size(-1) ==
+        qk_nope_head_dim``, and all five flash-attention sites take it as is.
+        Measured on gfx950 rather than assumed: against a ``.contiguous()``
+        copy of the same slice the output is bit-identical (max abs diff 0.0),
+        so the kernel takes its row pitch from the stride and not from
+        ``size(-1)``, and the call is ~1.5% slower at 4096 tokens -- far
+        cheaper than materializing K per chunk per layer.
+
+        Also idempotent, which is what makes the two sites that rebind
+        ``prefill_q`` inside a loop correct.
+        """
+        if not self.rope_is_zero_pad:
+            return tensors if len(tensors) > 1 else tensors[0]
+        out = tuple(t[..., : self.qk_nope_head_dim] for t in tensors)
+        return out if len(out) > 1 else out[0]
 
     def _restore_query_heads(
         self, output: torch.Tensor, num_heads: int | None = None
@@ -1257,6 +1292,7 @@ class MLAAttention(nn.Module):
             getattr(attn_metadata, "shuffle_kv_block_indptr", None),
             getattr(attn_metadata, "shuffle_kv_block_indices", None),
         )
+        prefill_q, k_full = self._drop_rope_pad(prefill_q, k_full)
         output = flash_attn_varlen_func(
             q=prefill_q,
             k=k_full,
@@ -1396,6 +1432,7 @@ class MLAAttention(nn.Module):
         k_new = torch.cat(
             (k_nope_new, k_rope_new.expand((*k_nope_new.shape[:-1], -1))), dim=-1
         )
+        prefill_q, k_new = self._drop_rope_pad(prefill_q, k_new)
         new_out, new_lse = flash_attn_varlen_func(
             q=prefill_q,
             k=k_new,
@@ -1449,6 +1486,7 @@ class MLAAttention(nn.Module):
                         else None
                     ),
                 )
+                prefill_q, k_chunk = self._drop_rope_pad(prefill_q, k_chunk)
                 suf_out, suf_lse = flash_attn_varlen_func(
                     q=prefill_q,
                     k=k_chunk,
@@ -1563,6 +1601,13 @@ class MLAAttention(nn.Module):
             )
 
             # 4. flash attention over the (unmasked) context chunk.
+            # main's fused `_kv_b_proj_gather` above replaces the hand-written
+            # decompress this branch used to do, so its `k`/`v` are gone -- but
+            # the pad still has to come off. `_dcp_context_kv_buffers` hands
+            # back either the chunk workspace or a fresh buffer of
+            # `self.qk_head_dim`, and both are the WIDENED 320 for a NoPE
+            # model, which CK's 256 head-dim cap refuses.
+            prefill_q, k_chunk = self._drop_rope_pad(prefill_q, k_chunk)
             ctx_out, ctx_lse = flash_attn_varlen_func(
                 q=prefill_q,
                 k=k_chunk,
@@ -1718,6 +1763,7 @@ class MLAAttention(nn.Module):
 
             k = torch.cat((k_nope, k_rope.expand((*k_nope.shape[:-1], -1))), dim=-1)
 
+        q, k = self._drop_rope_pad(q, k)
         output = flash_attn_varlen_func(
             q=q,
             k=k,
@@ -1990,8 +2036,13 @@ class MLAAttention(nn.Module):
         """
         if not work_prefix:
             assert attn_metadata.max_seqlen_q == 1, (
-                "Sparse DCP persistent decode metadata rebuild currently "
-                "supports non-speculative q_len=1 only."
+                "The unprefixed sparse DCP work buffers describe a q_len=1 step; "
+                'an MTP verify step must pass work_prefix="sparse_mtp_".'
+            )
+        elif work_prefix == "sparse_mtp_":
+            assert attn_metadata.max_seqlen_q > 1, (
+                "sparse_mtp_ work buffers describe the per-token verify layout; "
+                "a q_len=1 step must use the unprefixed ones."
             )
         assert q.shape[1] == self.dcp_kernel_num_heads
         get_mla_metadata_v1(
@@ -2129,8 +2180,11 @@ class MLAAttention(nn.Module):
                     paged_kv_indptr = attn_metadata.sparse_kv_indptr[: B + 1]
                     paged_kv_indices = self.sparse_kv_indices_buffer
                     paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens[:B]
-                    if self.dcp_world_size > 1:
-                        paged_kv_indptr = self.dcp_sparse_kv_indptr_buffer[: B + 1]
+                if self.dcp_world_size > 1:
+                    # The indexer compacted this layer's owned top-k, so the
+                    # real lengths are here, not in sparse_kv_indptr; `B` is a
+                    # token count on both branches.
+                    paged_kv_indptr = self.dcp_sparse_kv_indptr_buffer[: B + 1]
 
             dp_size = get_dp_group().world_size
             use_persistent_mode = should_use_persistent_mode(
@@ -2140,10 +2194,9 @@ class MLAAttention(nn.Module):
                 dcp_world_size=self.dcp_world_size,
                 dcp_persistent_supported=self.dcp_persistent_supported,
             )
-            # Sparse DCP persistent decode is enabled only for ordinary q_len=1
-            # native serving. Its full IndexShare layers rebuild the work plan
-            # below from the layer-local compact indptr; plugin/speculative paths
-            # retain the established non-persistent fallback.
+            # Sparse DCP persistent decode rebuilds the work plan below from
+            # the layer-local compact indptr; MTP verify is per-token q_len=1
+            # rows and rebuilds into the sparse_mtp_ buffers.
             if self.is_sparse_mla and self.dcp_world_size > 1:
                 use_persistent_mode = (
                     use_persistent_mode and self.sparse_dcp_metadata_rebuild
@@ -2162,6 +2215,7 @@ class MLAAttention(nn.Module):
                     paged_cu_seqlens_q,
                     paged_kv_indptr,
                     paged_kv_last_page_lens,
+                    work_prefix="sparse_mtp_" if is_sparse_mtp else "",
                 )
 
             if not use_persistent_mode:
@@ -2694,6 +2748,9 @@ def _convert_req_index_to_global_index_kernel(
     kv_start = tl.load(kv_indptr + batch_id)
     kv_end = tl.load(kv_indptr + batch_id + 1)
     out_kv_start = tl.load(page_kv_indptr + batch_id)
+    # This request OWNS only [out_kv_start, out_kv_end); the output is packed
+    # by page_kv_indptr, so anything past it belongs to request batch_id + 1.
+    out_kv_end = tl.load(page_kv_indptr + batch_id + 1)
     kv_len = kv_end - kv_start
     qo_start = tl.load(qo_indptr + batch_id)
     qo_end = tl.load(qo_indptr + batch_id + 1)
@@ -2725,10 +2782,20 @@ def _convert_req_index_to_global_index_kernel(
 
         # Store results
         out_offset = out_kv_start + indice_id
+        # `valid_col_mask` bounds the column by kv_len, which counts entries on
+        # the INPUT side; it is not the width of this request's output region.
+        # A pooled selection makes the two diverge -- the row is padded out to
+        # `round_up(index_topk + kpool - 1, 128)` columns while the region holds
+        # at most `index_topk + kpool - 1` -- and a long context makes kv_len
+        # exceed both, so every column stores. The surplus columns are the top-k
+        # padding, -1, which `tl.where(out_val >= 0, ...)` turns into cache slot
+        # 0 and writes over the START of request batch_id + 1. OUT_NUMEL only
+        # catches the final request, so the corruption is silent for the rest.
         store_mask = (
             valid_token_row
             & valid_col_mask
             & (out_offset >= 0)
+            & (out_offset < out_kv_end)
             & (out_offset < OUT_NUMEL)
         )
         out_ptr_ij = out_kv_indices + out_offset

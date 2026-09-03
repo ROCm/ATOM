@@ -6,6 +6,7 @@ from torch import nn
 from torch.profiler import record_function
 
 from atom.config import CompilationLevel
+from atom.distributed.dcp_utils import get_dcp_world_size
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
     pcp_allgather_rerange,
@@ -87,6 +88,10 @@ class EagleProposer(Drafter):
         # Gated on method=mtp, DSA index_topk and the config flag, so other
         # draft backends are unchanged. (DSpark is DSparkProposer, not this
         # class, so it cannot reach here.)
+        #
+        # Not under DCP: the reuse gathers indices at a fixed stride, while DCP
+        # compacts each rank's owned slots to a data-dependent length recorded
+        # in dcp_sparse_kv_indptr_buffer.
         draft_hf = self.speculative_config.draft_model_hf_config
         mtp_inner = getattr(self.model, "model", None)
         self._share_mtp_indices = (
@@ -95,6 +100,7 @@ class EagleProposer(Drafter):
             and hasattr(draft_hf, "index_topk")
             and mtp_inner is not None
             and hasattr(mtp_inner, "set_skip_topk")
+            and get_dcp_world_size() == 1
         )
         if self._share_mtp_indices:
             logger.info(
@@ -466,6 +472,10 @@ class EagleProposer(Drafter):
         # block_tables, context_lens, and sparse_kv_indptr are
         # needed by both MHA and MLA+sparse attention
         attn_metadata.block_tables = var["block_tables"].gpu[:running_bs]
+        if attn_metadata.dcp_token_block_tables is not None:
+            # One query per sequence, so the per-token table is block_tables
+            # itself; the verify step's has the right row count, wrong rows.
+            attn_metadata.dcp_token_block_tables = attn_metadata.block_tables
         attn_metadata.context_lens = var["context_lens"].gpu[:running_bs]
         if "sparse_kv_indptr" in var:
             attn_metadata.sparse_kv_indptr = var["sparse_kv_indptr"].gpu[
