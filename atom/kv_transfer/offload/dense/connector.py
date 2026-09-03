@@ -161,6 +161,17 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
 
     # -- copy daemon thread ----------------------------------------------
     def _do_load_req(self, req: LMCacheReqMeta) -> None:
+        ok = self._load_kv_bytes(req)
+        self._finish_load(req, ok)
+
+    def _load_kv_bytes(self, req: LMCacheReqMeta) -> bool:
+        """Move this request's KV bytes back into HBM. Reports nothing.
+
+        Returns True when the KV leg is servable, False when the caller must
+        re-prefill. The completion report is the caller's job
+        (:meth:`_finish_load`) so a subclass can fuse this leg with a second
+        leg and still emit exactly one completion.
+        """
         ls = req.load_spec
         assert ls is not None
         hbm = int(ls.hbm_cached_tokens)
@@ -168,10 +179,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         toks = req.token_ids[:lmc]
         t_total0 = time.perf_counter()
         if lmc <= hbm:
-            self._lookup_unpin(req.req_id)
-            with self._lock:
-                self._done_load.add(self._load_completion_id(req))
-            return
+            return True
         chunk_size = int(self.chunk_size or 256)
         if hbm % chunk_size != 0:
             logger.warning(
@@ -181,10 +189,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 hbm,
                 chunk_size,
             )
-            self._lookup_unpin(req.req_id)
-            with self._lock:
-                self._failed_load.add(self._load_completion_id(req))
-            return
+            return False
 
         mask = torch.ones(len(toks), dtype=torch.bool)
         mask[:hbm] = False
@@ -199,13 +204,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         )
         retrieve_ms = (time.perf_counter() - t_retrieve0) * 1000
         transfer_stats = self._last_gpu_connector_transfer_stats()
-        self._lookup_unpin(req.req_id)
         loaded = bool(ret_mask[hbm:lmc].all().item())
-        with self._lock:
-            if loaded:
-                self._done_load.add(self._load_completion_id(req))
-            else:
-                self._failed_load.add(self._load_completion_id(req))
         total_ms = (time.perf_counter() - t_total0) * 1000
         if self._profile_enabled():
             logger.info(
@@ -239,6 +238,17 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 retrieve_ms,
                 total_ms,
             )
+        return loaded
+
+    def _finish_load(self, req: LMCacheReqMeta, ok: bool) -> None:
+        """Release the lookup pin and report exactly one load completion."""
+
+        self._lookup_unpin(req.req_id)
+        with self._lock:
+            if ok:
+                self._done_load.add(self._load_completion_id(req))
+            else:
+                self._failed_load.add(self._load_completion_id(req))
 
     def _do_save_req(self, req: LMCacheReqMeta) -> None:
         ss = req.save_spec
@@ -444,6 +454,15 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         if hit == num_prompt:  # full-prompt hit → recompute last token
             hit -= 1
         self._hit_save_floors[sid] = self._chunk_floor(hit)
+        # The ABSOLUTE LMCache-resident prefix, recorded before the `need <= 0`
+        # early return below discards it. That return means "nothing more than
+        # HBM already has" for the KV leg, but a hybrid layout still needs the
+        # number: it is the ceiling the joint boundary is chosen under, and the
+        # only place it is known is right here, in the lookup's own answer.
+        # Inert for dense -- nothing else reads it.
+        joint = getattr(seq, "offload_joint", None)
+        if joint is not None:
+            joint.kv_prefix_tokens = hit
         need = hit - int(seq.num_cached_tokens)
         if need <= 0:
             if self._lookup_client is not None:

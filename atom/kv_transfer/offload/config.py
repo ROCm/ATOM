@@ -36,6 +36,15 @@ _OFFLOAD_LAYOUT_ALIASES = {
     "page_slot": "hybrid",
     "chunked": "dense",
     "chunked_mla": "dense",
+    "kimi_k3": "kimi_k3",
+}
+# K3's paged KV is ordinary dense MLA -- only its recurrent state rides the
+# sidecar -- so its PAGE bytes belong in the dense namespace, never the DSV4
+# region-partitioned one.
+_PAGE_MODE_BY_LAYOUT = {
+    "hybrid": "dsv4-page-regions",
+    "dense": "dense-opaque-block",
+    "kimi_k3": "dense-opaque-block",
 }
 _HF_PAGE_FIELDS = (
     "num_hidden_layers",
@@ -70,8 +79,25 @@ def _strict_integer(name: str, value: object, *, minimum: int = 0) -> int:
     return normalized
 
 
+def _text_model_type(hf_config) -> str | None:
+    """Read ``model_type`` off the *text* sub-config when there is one.
+
+    Plugin mode (``is_vllm()``) builds ``hf_config`` through a flatten map that
+    does not cover every model type, so the bare outer attribute can miss a
+    nested text config. Any failure here degrades to the bare read rather than
+    breaking config parsing.
+    """
+
+    try:
+        from atom.utils import get_hf_text_config
+
+        return getattr(get_hf_text_config(hf_config), "model_type", None)
+    except Exception:  # noqa: BLE001 - layout sniffing must never break startup
+        return getattr(hf_config, "model_type", None)
+
+
 def select_offload_layout(config) -> str:
-    """Resolve the config-only dense/hybrid layout selection.
+    """Resolve the config-only dense/hybrid/kimi_k3 layout selection.
 
     The worker, scheduler, and LMCache key namespace must all use this exact
     selector. Otherwise an explicit layout override can make two incompatible
@@ -92,7 +118,13 @@ def select_offload_layout(config) -> str:
         )
 
     hf_config = getattr(config, "hf_config", None)
-    if hf_config is not None and getattr(hf_config, "compress_ratios", None):
+    if hf_config is None:
+        return "dense"
+    # K3 is checked first: it carries no compress_ratios, so dense/hybrid
+    # selection for every other model stays exactly as before.
+    if _text_model_type(hf_config) == "kimi_linear":
+        return "kimi_k3"
+    if getattr(hf_config, "compress_ratios", None):
         return "hybrid"
     return "dense"
 
@@ -173,10 +205,10 @@ def build_page_namespace(
         "schema": "atom-page-namespace",
         "layout_version": layout_version,
         "model": base_model_name,
-        "page_mode": (
-            "dsv4-page-regions"
-            if select_offload_layout(config) == "hybrid"
-            else "dense-opaque-block"
+        # Unknown layouts fall back to the dense byte shape, which is what any
+        # non-DSV4 layout stores.
+        "page_mode": _PAGE_MODE_BY_LAYOUT.get(
+            select_offload_layout(config), "dense-opaque-block"
         ),
         "kv_cache_dtype": str(getattr(config, "kv_cache_dtype", "auto")),
         "index_cache_dtype": str(getattr(config, "index_cache_dtype", "auto")),

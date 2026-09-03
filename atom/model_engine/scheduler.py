@@ -620,7 +620,12 @@ class Scheduler:
             ):
                 continue
             # KV-pressured requests definitely cannot prefill.
-            return self.block_manager.can_allocate(seq) >= 0
+            # `record=False`: this only asks whether the seq fits. Computing the
+            # joint boundary here would walk a chained xxhash over the whole
+            # prompt, every pass, for an answer a probe discards -- and
+            # committing it would move the funnel counters for an admission that
+            # never happened.
+            return self.block_manager.can_allocate(seq, record=False) >= 0
         return False
 
     def _kv_usage(self) -> float:
@@ -1188,7 +1193,15 @@ class Scheduler:
             if chunk is None or (atomic_prefill and chunk < num_new_tokens):
                 self.waiting.appendleft(seq)
                 break
-            self.block_manager.allocate(seq, num_cached_blocks)
+            if not self.block_manager.allocate(seq, num_cached_blocks):
+                # A joint boundary had to be disowned and the pool could not
+                # back the private copies of the prefix this seq claimed.
+                # Recomputing over the shared canonical blocks would tear
+                # another sequence's decode, so give everything back and requeue
+                # for a clean admission next pass.
+                self.block_manager.deallocate(seq)
+                self.waiting.appendleft(seq)
+                break
 
             # Guard: PD decode consumer inherits hit from prefill node;
             # don't clobber with local num_cached_blocks (always 0 on consumer).
@@ -1784,11 +1797,17 @@ class Scheduler:
     def _confirm_remote_load_after_alloc(
         self, seq: Sequence, needs_remote_load: bool
     ) -> bool:
-        if not needs_remote_load:
+        if self.kv_connector is None:
             return False
         if hasattr(self.kv_connector, "should_park_for_load_after_alloc"):
+            # Asked even when the KV lookup found nothing extra to fetch. A
+            # hybrid model can need a park for its recurrent state alone -- KV
+            # already resident, the state checkpoint only in the CPU tier -- and
+            # that case has no KV leg to announce itself with. The predicate is
+            # self-guarding: it returns False when no load was armed, so asking
+            # it unconditionally costs the other layouts nothing.
             return self.kv_connector.should_park_for_load_after_alloc(seq)
-        return True
+        return needs_remote_load
 
     def _park_for_remote_load(
         self, seq: Sequence, skipped_waiting_requests: deque[Sequence]
@@ -3017,10 +3036,16 @@ class DecodeScheduler(Scheduler):
         while self.waiting:
             seq = self.waiting[0]
             with self._prefill_lock:
-                if self.block_manager.can_allocate(seq) < 0:
+                if self.block_manager.can_allocate(seq, record=False) < 0:
                     logger.warning("Cannot allocate prefill")
                     break
-                self.block_manager.allocate(seq)
+                if not self.block_manager.allocate(seq):
+                    # The pool could not back a private prefix copy. Hand
+                    # everything back and retry next pass rather than forward
+                    # over blocks another sequence is decoding out of.
+                    self.block_manager.deallocate(seq)
+                    logger.warning("Cannot allocate prefill: disown refused")
+                    break
             self.waiting.popleft()
 
             self.prefill_waiting[seq.id] = seq

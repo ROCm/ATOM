@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 
 from atom.model_engine.block_pool import BlockPool
@@ -126,6 +126,12 @@ class PageUnitCheckpointStore:
         self._inflight_restores: list[int] = []
         self._next_checkpoint_id = 0
         self.evictions = 0
+        # Called with `(prefix_hash, unit_ids)` at the COPYING -> READY
+        # transition, or None. Optional and inert by default: a build with no
+        # offload connector must behave exactly as it did before this hook
+        # existed, and a callback nobody attached would otherwise take pins
+        # nobody drains.
+        self._on_ready: Callable[[int, tuple[int, ...]], None] | None = None
 
     @property
     def units_per_checkpoint(self) -> int:
@@ -297,11 +303,20 @@ class PageUnitCheckpointStore:
         self._inflight_restores.extend(checkpoint_id for checkpoint_id, _ in queued)
         return tuple(op for _, op in queued)
 
+    def restore_queued_for(self, dst_slot: int) -> bool:
+        """Whether a restore into `dst_slot` is already queued this pass.
+
+        The evidence half of the joint gate's backstop: it is what lets
+        `BlockManager._state_leg_secured` tell "a PAGE image is on its way into
+        this slot" from "this slot holds whatever the last occupant left".
+        """
+        return any(op.dst_slot == dst_slot for _, op in self._queued_restores)
+
     def cancel_queued_restore(self, dst_slot: int) -> None:
         kept: list[tuple[int, CheckpointRestoreOp]] = []
         for checkpoint_id, op in self._queued_restores:
             if op.dst_slot == dst_slot:
-                self._release_restore_pin(checkpoint_id)
+                self._release_pin(checkpoint_id)
             else:
                 kept.append((checkpoint_id, op))
         self._queued_restores = kept
@@ -326,19 +341,61 @@ class PageUnitCheckpointStore:
             record.state = READY
             self.hash_to_checkpoint[record.prefix_hash] = checkpoint_id
             self._lru[checkpoint_id] = None
+            if self._on_ready is not None:
+                self._on_ready(record.prefix_hash, record.unit_ids)
 
         restores, self._inflight_restores = self._inflight_restores, []
         for checkpoint_id in restores:
-            self._release_restore_pin(checkpoint_id)
+            self._release_pin(checkpoint_id)
 
-    def _release_restore_pin(self, checkpoint_id: int) -> None:
+    def attach_store_queue(self, queue) -> None:
+        """Let a CPU-tier store queue see checkpoints as they reach READY.
+
+        READY and nowhere else: `begin_store` is too early (the scatter has not
+        ridden a batch, so the units hold no image yet) and `_evict`/`unindex`
+        are too late (they fire when the pool wants those units *now*). READY is
+        when the bytes first exist and when the record is least wanted -- it has
+        just entered the LRU at the cold end.
+        """
+        self._on_ready = queue.nominate
+
+    def pin_checkpoint(self, prefix_hash: int) -> tuple[int, tuple[int, ...]] | None:
+        """Hold a READY image's units against eviction; None if there is none.
+
+        The same `pin_count` a restore takes, so `_is_evictable` and `unindex`
+        need no second notion of "busy": `unindex` marks the record EVICTING and
+        defers `_release_record` while any pin is held, which is exactly what a
+        store crossing an eviction needs.
+
+        Returns the checkpoint id to unpin by -- a hash may be evicted and
+        stored again, and unpinning by hash would then decrement a *different*
+        record's count -- together with the units that were actually pinned.
+
+        Does not touch the LRU. A restore is a use and moves its checkpoint to
+        the warm end; copying an image out to the CPU tier is not, and making it
+        one would keep alive exactly the checkpoints the tier has taken over.
+        """
+        checkpoint_id = self.lookup(prefix_hash)
+        if checkpoint_id < 0:
+            return None
+        record = self.records[checkpoint_id]
+        record.pin_count += 1
+        return checkpoint_id, record.unit_ids
+
+    def unpin_checkpoint(self, checkpoint_id: int) -> None:
+        """Release one pin taken by `pin_checkpoint`."""
+        self._release_pin(checkpoint_id)
+
+    def _release_pin(self, checkpoint_id: int) -> None:
         record = self.records.get(checkpoint_id)
         if record is None:
             return
         if record.pin_count <= 0:
-            raise AssertionError("checkpoint restore pin underflow")
+            raise AssertionError("checkpoint pin underflow")
         record.pin_count -= 1
         if record.state == EVICTING and record.pin_count == 0:
+            # `unindex` or `clear` fired while this pin was held: the image is
+            # unreachable in HBM from now on, and only now do the units go back.
             self._release_record(checkpoint_id)
 
     def unindex(self, prefix_hash: int) -> bool:
@@ -431,9 +488,37 @@ class PagedStateCheckpointCoordinator:
         self.checkpoints_kept = 0
         self.checkpoints_dropped = 0
         self.checkpoints_orphaned = 0
+        # The CPU offload tier's index, or None. Read-only from here: this
+        # coordinator votes with it, never writes it.
+        self._offload = None
+
+    def attach_offload(self, index) -> None:
+        """Let the resumable scan see what the CPU tier holds.
+
+        Without this the scan asks HBM alone, and a boundary whose image was
+        offloaded reads as unresumable -- which is the whole reason a checkpoint
+        that outlived its KV in LMCache could not be reached.
+        """
+        self._offload = index
 
     def applies(self, seq: Sequence) -> bool:
         return self.enabled and seq.has_per_req_cache
+
+    def contains(self, prefix_hash: int) -> bool:
+        """Whether HBM itself holds this checkpoint (not the tier)."""
+        return self.store.contains(prefix_hash)
+
+    def _reachable(self, prefix_hash: int) -> bool:
+        """Whether this boundary's state can be produced at all, from anywhere.
+
+        `could_serve` rather than a bare membership test on the tier's hash set:
+        that predicate also carries `can_load`, so a store-only role does not
+        vote for a hash it would then refuse to fetch. All three voters route
+        through the one predicate so they cannot drift.
+        """
+        if self.store.contains(prefix_hash):
+            return True
+        return self._offload is not None and self._offload.could_serve(prefix_hash)
 
     def resumable_hit(
         self,
@@ -445,7 +530,7 @@ class PagedStateCheckpointCoordinator:
         if not self.applies(seq):
             return hit
         for i in range(hit - 1, -1, -1):
-            if assume_checkpointed or self.store.contains(block_hashes[i]):
+            if assume_checkpointed or self._reachable(block_hashes[i]):
                 return i + 1
         return 0
 

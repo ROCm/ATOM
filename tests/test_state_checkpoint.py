@@ -29,6 +29,7 @@ from atom.model_engine.page_unit_checkpoint import (
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceType
 from atom.model_engine.state_cache import StateCache
+from atom.model_engine.state_offload import StateOffloadIndex
 from atom.model_engine.state_pool import StateSlotPool
 from atom.model_engine.state_runtime import (
     StateRuntime,
@@ -1390,7 +1391,16 @@ class TestPagedCopyCheckpoint:
         assert third.state_slot == dst
         assert bm.take_state_maintenance_ops().checkpoint_restores == ()
 
-    def test_missing_gated_checkpoint_releases_the_new_slot_and_raises(self):
+    def test_a_missing_gated_checkpoint_disowns_the_boundary(self):
+        """An HBM miss here used to be an invariant violation, and raised.
+
+        It is a normal path now, and it has to be: the admission gate consults
+        the CPU offload tier as well, so a hash it accepted may live only there
+        -- and once the tier is gone from that hash too, the honest answer is
+        "this is not your history", not a crash. The caller disowns the
+        boundary and the forward recomputes from token 0, which still needs a
+        slot to write into, so the slot stays with the sequence.
+        """
         bm = make_block_manager(
             paged_copy_config(),
             state_runtime=PAGED_COPY_RUNTIME,
@@ -1400,15 +1410,44 @@ class TestPagedCopyCheckpoint:
         h = boundary_hash(bm, first)
         bm.take_state_maintenance_ops()
         bm.complete_previous_state_batch()
-        free_slots = bm.state.num_free()
         bm.paged_state_checkpoints.unindex(h)
+        lost_before = bm.state_gate_lost_boundary
 
         second = stateful_seq(list(range(48)))
-        with pytest.raises(RuntimeError, match="disappeared"):
-            bm._attach_state_slots(second, h)
+        assert bm._attach_state_slots(second, h) is False
 
-        assert second.state_slot == -1
-        assert bm.state.num_free() == free_slots
+        assert second.state_slot != -1, "a recompute still needs a slot"
+        assert bm.state_gate_lost_boundary == lost_before + 1
+
+    def test_a_missing_gated_checkpoint_is_served_by_the_offload_tier(self):
+        """The same miss, with the tier holding the image: a load is dispatched
+        and the boundary survives."""
+        bm = make_block_manager(
+            paged_copy_config(),
+            state_runtime=PAGED_COPY_RUNTIME,
+        )
+        first = self._admitted(bm)
+        bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
+        h = boundary_hash(bm, first)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.unindex(h)
+
+        index = StateOffloadIndex(
+            can_store=True,
+            can_load=True,
+            chunk_tokens=1024,
+            release_slot=lambda slot: None,
+        )
+        index.note_stored(h)
+        bm.attach_state_offload(index)
+
+        second = stateful_seq(list(range(48)))
+        assert bm._attach_state_slots(second, h) is True
+
+        assert second.offload_joint.state_load_hash == h
+        assert index.outstanding == 1
+        index.check_invariant()
 
     def test_copy_transfer_can_checkpoint_a_speculative_decode_boundary(self):
         spec = SimpleNamespace(num_speculative_tokens=3, use_dspark=lambda: False)

@@ -122,6 +122,24 @@ class SlotLoadSpec:
     destination_group: int
 
 
+@dataclass(frozen=True)
+class StateLoadSpec:
+    """Identity and destination for one KDA recurrent-state restore.
+
+    ``chunk_tokens`` is carried on the spec so neither side re-derives the
+    LMCache chunk grid: the engine floors ``boundary_tokens`` against this grid
+    and the worker validates against the same number. Two independent
+    derivations (config parse vs. a worker-local default) can disagree, and a
+    boundary floored against one grid but keyed against another restores state
+    from the wrong token position — silent wrong output, not an error.
+    """
+
+    boundary_tokens: int  # B, the joint boundary in tokens
+    boundary_hash: int  # the chained block hash at B
+    destination_slot: int  # the request's Active Slot; H2D writes it directly
+    chunk_tokens: int  # the LMCache chunk grid the engine floored against
+
+
 @dataclass
 class LMCacheReqMeta:
     """Everything the worker needs to load/save one request's KV this step."""
@@ -145,6 +163,9 @@ class LMCacheReqMeta:
     save_operation: SaveOperationId | None = None
     # Appended for positional compatibility with existing metadata producers.
     load_operation: LoadOperationId | None = None
+    # K3 recurrent-state restore, fused into this request's load leg so one
+    # worker task emits exactly one completion.
+    state_load_spec: StateLoadSpec | None = None
 
 
 class LMCacheOffloadMetadata(ConnectorMetadata):
@@ -161,6 +182,10 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
         self.requests: list[LMCacheReqMeta] = []
         # req_ids whose worker-side lookup pin can be released this step.
         self.lookup_requests_in_step: list[str] = []
+        # Recurrent-state store operations for this step. A side list rather
+        # than a per-request field because a checkpoint outlives the request
+        # that produced it, so there is no request to hang it on.
+        self.state_stores: tuple = ()
 
     def add_request(self, meta: LMCacheReqMeta) -> None:
         self.requests.append(meta)
