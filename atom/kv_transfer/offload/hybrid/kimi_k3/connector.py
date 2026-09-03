@@ -306,28 +306,40 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         state_ids = {req_id for req_id, _h, _slot in loads}
         if not state_ids or not self._do_load:
             return
-        for req in metadata.requests:
-            if req.req_id not in state_ids:
-                continue
-            if req.load_spec is not None:
+        # Drive the loop off the state loads, not `metadata.requests`. The two
+        # sets have independent sources: `state_loads` arrives via
+        # `BlockManager.take_state_loads()` -> `Scheduler._publish_state_loads`,
+        # while `metadata.requests` is populated by the base KV scheduler. A
+        # state-only load -- KV resident, recurrent state not; the
+        # `_park_for_remote_load` path reached exactly when `needs_remote_load`
+        # came back False -- has no `LMCacheReqMeta` this step, so it is absent
+        # from `metadata.requests`. Iterating that set skipped precisely the
+        # state-only requests the `else` branch below exists for: unarmed, their
+        # failure emitted nothing and they hung in WAITING_FOR_REMOTE_KVS
+        # forever. Look the KV leg up per state id instead of the other way
+        # round.
+        by_id = {req.req_id: req for req in metadata.requests}
+        for req_id in state_ids:
+            req = by_id.get(req_id)
+            if req is not None and req.load_spec is not None:
                 # Both legs: file the park under the KV identity, because that is
                 # the one that has to reach the engine on finished/failed_loading.
                 self._joint_park.arm(
-                    req.req_id,
+                    req_id,
                     needs_kv=True,
                     needs_state=True,
                     kv_id=self._load_completion_id(req),
                 )
             else:
-                # State-only load (KV resident, recurrent state not). Arm it on
-                # the state leg alone. Its SUCCESS already reached the engine via
-                # the `_settle_joint` passthrough, but its FAILURE did not: an
+                # State-only load (KV resident, or no KV meta this step). Arm it
+                # on the state leg alone. Its SUCCESS already reached the engine
+                # via the `_settle_joint` passthrough, but its FAILURE did not: an
                 # unarmed park emitted nothing, so the request sat in
                 # WAITING_FOR_REMOTE_KVS forever (the orphan reclaimer never wakes
                 # a live parked request). Arming makes `take_ready` surface either
                 # outcome under the same bare id the passthrough already used.
                 self._joint_park.arm(
-                    req.req_id,
+                    req_id,
                     needs_kv=False,
                     needs_state=True,
                 )
