@@ -46,6 +46,40 @@ def _atom_kv_dtype(cache_config: Any, model_config: Any) -> str:
     return key
 
 
+class _HFConfigView:
+    """Read a model's HF config without caring whether it is nested.
+
+    Multimodal configs (MiniMax-M3, Qwen3.5-VL, ...) keep the transformer's own
+    fields on a nested text config: ``MiniMaxM3Config`` has no
+    ``num_hidden_layers`` at all, it lives on ``.text_config``. vLLM exposes the
+    resolved inner config as ``model_config.hf_text_config`` while
+    ``hf_config`` stays the outer one, and ATOM's offload code reads both
+    spellings (``config.py`` notes this skew itself: its namespace guard reads
+    ``hf_config.model_type`` while ``is_qwen_next`` reads
+    ``hf_text_config.model_type``).
+
+    Resolving inner-first and falling back to the outer config satisfies both
+    readers without asking either side to change which attribute it wants.
+    """
+
+    __slots__ = ("_inner", "_outer")
+
+    def __init__(self, inner: Any, outer: Any) -> None:
+        self._inner = inner
+        self._outer = outer
+
+    def __getattr__(self, name: str) -> Any:
+        if self._inner is not None:
+            try:
+                return getattr(self._inner, name)
+            except AttributeError:
+                pass
+        return getattr(self._outer, name)
+
+    def __repr__(self) -> str:
+        return f"_HFConfigView(inner={type(self._inner).__name__}, outer={type(self._outer).__name__})"
+
+
 class OffloadConfigShim:
     """The ATOM-offload-shaped view of a vLLM config.
 
@@ -76,7 +110,11 @@ class OffloadConfigShim:
             **(dict(extra) if isinstance(extra, dict) else {}),
         }
 
-        self.hf_config = getattr(model_config, "hf_config", None)
+        outer_hf = getattr(model_config, "hf_config", None)
+        inner_hf = getattr(model_config, "hf_text_config", None)
+        self.hf_config = (
+            _HFConfigView(inner_hf, outer_hf) if outer_hf is not None else None
+        )
         if self.hf_config is None:
             raise ValueError(
                 "ATOM offload connector: vLLM reported no model_config.hf_config; "

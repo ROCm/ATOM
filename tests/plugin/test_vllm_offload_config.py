@@ -79,3 +79,37 @@ def test_missing_hf_config_is_rejected():
 def test_extra_connector_config_is_carried_through():
     cfg = build_offload_config(_vllm_config(extra={"lmcache.foo": 7}))
     assert cfg.kv_transfer_config["lmcache.foo"] == 7
+
+
+def _nested_vllm_config():
+    """A multimodal config: the transformer's fields live on the text config.
+
+    MiniMaxM3Config genuinely has no num_hidden_layers -- reading it off the
+    outer config raises, which is how the first live run died.
+    """
+    text = NS(num_hidden_layers=60, model_type="minimax_m3_text")
+    outer = NS(model_type="minimax_m3", text_config=text)  # no num_hidden_layers
+    cfg = _vllm_config()
+    cfg.model_config.hf_config = outer
+    cfg.model_config.hf_text_config = text
+    return cfg
+
+
+def test_nested_text_config_supplies_the_layer_count():
+    cfg = build_offload_config(_nested_vllm_config())
+
+    assert cfg.hf_config.num_hidden_layers == 60
+
+
+def test_outer_only_fields_still_resolve():
+    cfg = build_offload_config(_nested_vllm_config())
+    cfg._vllm_config.model_config.hf_config.architectures = ["MiniMaxM3ForCausalLM"]
+
+    # Inner-first, outer as fallback: both readers in ATOM's offload path are
+    # satisfied without either changing which attribute it asks for.
+    assert cfg.hf_config.architectures == ["MiniMaxM3ForCausalLM"]
+
+
+def test_flat_config_is_unaffected():
+    cfg = build_offload_config(_vllm_config())
+    assert cfg.hf_config.num_hidden_layers == 60
