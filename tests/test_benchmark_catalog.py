@@ -472,3 +472,92 @@ def test_dp_agentic_variant_carries_the_session_routing_env():
         # rather than the equivalent rate so it matches the literal in
         # InferenceX's dsv4_fp4_mi355x_atom_mtp.sh.
         assert "--spec-decode-acceptance-length 2.49" in args, name
+
+
+def test_conc_filter_narrows_the_agentic_sweep():
+    """`conc_filter` picks single points out of a curve, after the conc band.
+
+    An agentic cell is ~1h of 8-GPU time, so the dispatch dropdown exists to
+    re-run one point rather than the whole 9-cell set. The filter must compose
+    with the band rather than bypass it: a concurrency outside every band still
+    yields nothing, which is what makes the "out of sync" guard in
+    `build_benchmark_matrix.py` reachable.
+    """
+    agentic = catalog.build_cells(CATALOG, bench_kind_filter={"aiperf_agentic"})
+    all_concs = {c["conc"] for c in agentic}
+    assert len(agentic) > 1, "expected a multi-cell agentic curve"
+
+    for conc in sorted(all_concs):
+        picked = catalog.build_cells(
+            CATALOG, bench_kind_filter={"aiperf_agentic"}, conc_filter={conc}
+        )
+        assert picked, f"conc={conc} is in the catalog but filtered to nothing"
+        assert {c["conc"] for c in picked} == {conc}
+
+    # None == no filter (the "all" dropdown value).
+    assert len(
+        catalog.build_cells(CATALOG, bench_kind_filter={"aiperf_agentic"})
+    ) == len(agentic)
+    # Out-of-band concurrency yields an empty matrix rather than a stray cell.
+    assert (
+        catalog.build_cells(
+            CATALOG, bench_kind_filter={"aiperf_agentic"}, conc_filter={7}
+        )
+        == []
+    )
+
+
+def test_parse_conc_filter():
+    """The `agentic_concurrency` box: free text in, conc filter out."""
+    from build_benchmark_matrix import parse_conc_filter
+
+    # "no selection" spellings all mean the full curve.
+    for raw in (None, "", "   ", "all", "ALL", " All "):
+        assert parse_conc_filter(raw) is None, raw
+    # A box holding only separators carries no selection either.
+    assert parse_conc_filter(",") is None
+    assert parse_conc_filter(" , ") is None
+
+    assert parse_conc_filter("96") == {96}
+    assert parse_conc_filter("48,64") == {48, 64}
+    # Spacing around the separators is what a human actually types.
+    assert parse_conc_filter(" 48 , 64 ") == {48, 64}
+    assert parse_conc_filter("48,64,") == {48, 64}
+    assert parse_conc_filter("64,48,64") == {48, 64}
+
+    # A typo must raise, not quietly widen to the whole 9-cell sweep.
+    for bad in ("48;64", "sixty-four", "48.5", "c=48"):
+        with pytest.raises(ValueError, match="agentic_concurrency"):
+            parse_conc_filter(bad)
+
+
+def test_agentic_concurrency_is_free_text():
+    """The dispatch input takes typed numbers, not a fixed option list.
+
+    A `choice` would have to be kept in sync with the catalog by hand, and
+    could not express a subset like "48,64" at all. The cost is that a typo is
+    only caught at dispatch time -- which is what `parse_conc_filter` and the
+    empty-matrix guard in `build_benchmark_matrix.py` are for.
+    """
+    yaml = pytest.importorskip("yaml")
+    wf = yaml.safe_load(WORKFLOW.read_text())
+    on = wf.get("on", wf.get(True))
+    box = on["workflow_dispatch"]["inputs"]["agentic_concurrency"]
+
+    assert box["type"] == "string"
+    assert "options" not in box
+    # The default must be a no-filter spelling, or every dispatch that leaves
+    # the box alone would silently run a subset.
+    from build_benchmark_matrix import parse_conc_filter
+
+    assert parse_conc_filter(box["default"]) is None
+
+    # Every concurrency the description advertises must actually be runnable.
+    in_catalog = {
+        c["conc"]
+        for c in catalog.build_cells(CATALOG, bench_kind_filter={"aiperf_agentic"})
+    }
+    advertised = parse_conc_filter(
+        box["description"].split("Catalog has ")[1].split(";")[0]
+    )
+    assert advertised == in_catalog
