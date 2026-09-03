@@ -102,14 +102,10 @@ class StateOffloadIndex:
         # Non-zero means `audit_invariant` caught the accounting drifting.
         self.invariant_violations = 0
         self._warned_invariant = False
-        # Store-side counters. Until this commit the only store-side signal was
-        # `indexed` growing, which is why a shell that refused every store
-        # (`enqueue_state_stores` never forwarded) looked identical to a tier
-        # with nothing to do -- 94 refusals produced one warning line and no
-        # number anywhere. `stores_refused` is the probe that would have said
-        # so on the first pass, and it is deliberately apart from
-        # `stores_failed`: refused means nobody tried, failed means the worker
-        # tried and could not.
+        # `stores_refused` is deliberately apart from `stores_failed`: refused
+        # means nobody tried, failed means the worker tried and could not. A
+        # shell that forwards no store at all is otherwise indistinguishable
+        # from a tier with nothing to do.
         self.stores_attempted = 0
         self.stores_completed = 0
         self.stores_failed = 0
@@ -160,7 +156,8 @@ class StateOffloadIndex:
         leaked, and without this the first symptom is a hang nobody can explain.
 
         So the fault surfaces twice: one loud log line naming the numbers, and
-        `invariant_violations` in `stats()`, which reaches `checkpoint_funnel`.
+        `state_offload_invariant_violations` in `checkpoint_funnel`, which
+        `stats()` reaches through the coordinator's `checkpoint_fates`.
         An assertion nothing ever runs is not an assertion.
         """
         try:
@@ -417,11 +414,9 @@ class StateTierCapability:
     Derived from configuration, not from the connector's public name. The name
     only says which connector class is constructed; whether that class builds a
     `StateOffloadTier` depends on the layout it resolves, the pipeline depth,
-    and the role it was given. The engine used to install a `StateOffloadIndex`
-    for any `lmcache_offload`, so a K3 run under PP>1 -- or any `dense`/`hybrid`
-    run -- got an index against a worker that would never build the tier. That
-    mismatch is what left stores emitted with nowhere to go, and it is the
-    common root of the tier-none fallback paths.
+    and the role it was given. An index installed for a worker that never
+    builds the tier emits stores with nowhere to go, which is the common root
+    of the tier-none fallback paths.
 
     `reason` is filled in whenever the tier is off, so the log names which check
     refused it rather than leaving the operator to guess.
