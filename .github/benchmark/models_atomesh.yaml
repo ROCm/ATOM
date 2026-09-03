@@ -325,6 +325,72 @@ models:
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c48
           concurrency: [48]
 
+        # CPP4 prefill (PP4 x TP1) paired with TP4+DCP4 decode on one node.
+        - &glm52_agentic_lmcache_cpp4_dcp4
+          <<: *glm52_agentic_tp4_tp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c48
+          topology: 1p1d_cpp4_dcp4
+          pd_worker_layout: single_node
+          concurrency: [48]
+          server:
+            common_args:
+              kv_cache_dtype: fp8
+              block_size: 16
+              max_num_seqs: 512
+              enable_prefix_caching: true
+              decode_max_num_seqs: 512
+              # Empty means "do not pass the flag", so the model config's own
+              # context length applies. The 16384 the model defaults carry would
+              # truncate this suite's 1M agentic traces.
+              max_model_len: ""
+              max_num_batched_tokens: ""
+              decode_max_num_batched_tokens: ""
+              online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}'
+              gpu_memory_utilization: 0.85
+              extra_args: "--level 3 --method mtp --num-speculative-tokens 3 --spec-decode-acceptance-rate 0.6633"
+          prefill:
+            workers: 1
+            tp: 1
+            cudagraph: none
+            extra_args: "--pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192"
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: >-
+              [1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]
+            extra_args: "--decode-context-parallel-size 4 --cudagraph-mode FULL"
+          env:
+            common:
+              ATOM_MLA_PAGE_SIZE: "1"
+              ATOM_ONLINE_QUANT_STREAMING: "0"
+              ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB: "2047"
+              ATOM_USE_TRITON_MLA: "0"
+              MAX_JOBS: "16"
+              PYTHONHASHSEED: "0"
+              TOPK_FORCE_PATH: "one"
+            prefill:
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+              VLLM_PP_LAYER_PARTITION: "20,20,20,18"
+              LMCACHE_LOCAL_CPU: "True"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
+              LMCACHE_CHUNK_SIZE: "256"
+              OFFLOAD_PROFILE: "1"
+              OFFLOAD_MIN_LOAD_TOKENS: "0"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
+            decode:
+              HIP_VISIBLE_DEVICES: "4,5,6,7"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+
+        - <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c32
+          concurrency: [32]
+
+        - <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c40
+          concurrency: [40]
+
         - &glm52_agentic_lmcache_tp4_dpa
           <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c24
