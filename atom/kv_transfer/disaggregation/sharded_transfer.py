@@ -39,8 +39,6 @@ class DCPShardPlan:
     """
 
     block_size: int
-    dcp_size: int
-    dcp_rank: int
     interleave_size: int
     dst_pages: int
     src_block_id_per_run: np.ndarray
@@ -63,8 +61,6 @@ class DCPShardPlan:
         row_stop = stop * runs_per_page
         return DCPShardPlan(
             block_size=self.block_size,
-            dcp_size=self.dcp_size,
-            dcp_rank=self.dcp_rank,
             interleave_size=self.interleave_size,
             dst_pages=stop - start,
             src_block_id_per_run=self.src_block_id_per_run[row_start:row_stop],
@@ -75,10 +71,16 @@ class DCPShardPlan:
             valid=self.valid[row_start:row_stop],
         )
 
-    def coalesced_token_runs(
+    def token_runs(
         self, dst_block_ids: Sequence[int]
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Materialize coalesced source/destination offsets in token units."""
+        """Materialize source/destination offsets in token units.
+
+        Runs are not merged. The sharded-transfer caller uses this for
+        ``dcp_size > 1``; consecutive runs are then ``interleave_size *
+        dcp_size`` tokens apart at the source but only ``interleave_size``
+        apart at the destination, so they cannot be contiguous at both ends.
+        """
 
         dst_ids = np.asarray(dst_block_ids, dtype=np.int64)
         if dst_ids.size != self.dst_pages:
@@ -89,7 +91,7 @@ class DCPShardPlan:
         keep = self.valid
         src = self.src_block_id_per_run[keep] * self.block_size + self.src_token[keep]
         dst = dst_ids[self.dst_page[keep]] * self.block_size + self.dst_token[keep]
-        return coalesce_contiguous(src, dst, self.run_length[keep])
+        return src, dst, self.run_length[keep]
 
 
 def build_dcp_shard_plan(
@@ -142,8 +144,6 @@ def build_dcp_shard_plan(
 
     return DCPShardPlan(
         block_size=block_size,
-        dcp_size=dcp_size,
-        dcp_rank=dcp_rank,
         interleave_size=interleave_size,
         dst_pages=dst_pages,
         src_block_id_per_run=src_block_id_per_run,
