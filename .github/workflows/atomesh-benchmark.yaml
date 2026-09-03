@@ -501,6 +501,7 @@ jobs:
           log_root="${log_root//\$USER/${current_user}}"
           run_dir="${log_root%/}/rdma-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           mkdir -p "${run_dir}"
+          chmod 0777 "${run_dir}"
           export RDMA_SMOKE_RUN_DIR="${run_dir}"
           export RDMA_SMOKE_NODE_COUNT="${node_count}"
           CURRENT_USER="${current_user}"
