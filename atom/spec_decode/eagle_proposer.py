@@ -54,10 +54,9 @@ class EagleProposer(Drafter):
         # draft backends are unchanged. (DSpark is DSparkProposer, not this
         # class, so it cannot reach here.)
         #
-        # Not under DCP: the reuse is a fixed-stride gather of the indices alone,
-        # while DCP compacts each rank's owned slots to a data-dependent length
-        # held in dcp_sparse_kv_indptr_buffer. Without those, the regions are
-        # wrong.
+        # Not under DCP: the reuse gathers indices at a fixed stride, while DCP
+        # compacts each rank's owned slots to a data-dependent length recorded
+        # in dcp_sparse_kv_indptr_buffer.
         draft_hf = self.speculative_config.draft_model_hf_config
         mtp_inner = getattr(self.model, "model", None)
         self._share_mtp_indices = (
@@ -428,8 +427,7 @@ class EagleProposer(Drafter):
         attn_metadata.block_tables = var["block_tables"].gpu[:running_bs]
         if attn_metadata.dcp_token_block_tables is not None:
             # One query per sequence, so the per-token table is block_tables
-            # itself; the verify step left one with the right row count and the
-            # wrong rows.
+            # itself; the verify step's has the right row count, wrong rows.
             attn_metadata.dcp_token_block_tables = attn_metadata.block_tables
         attn_metadata.context_lens = var["context_lens"].gpu[:running_bs]
         if "sparse_kv_indptr" in var:

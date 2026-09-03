@@ -746,9 +746,9 @@ class MLAAttention(nn.Module):
 
         self.dcp_persistent_supported = dcp_persistent_supported()
         self.dcp_prefill_merge_bf16_ok = dcp_prefill_merge_bf16_ok()
-        # Every sparse DCP shape is per-token virtual q_len=1 rows: decode has
-        # one row per sequence, sparse prefill and MTP verify one per query
-        # token. Plugin DCP reconfigures its group after construction.
+        # Every sparse DCP shape is per-token q_len=1 rows -- one per sequence
+        # in decode, one per query token in sparse prefill and MTP verify.
+        # Plugin DCP reconfigures its group after construction.
         self.sparse_dcp_metadata_rebuild = (
             self.is_sparse_mla and self.dcp_world_size > 1
         )
@@ -2105,8 +2105,8 @@ class MLAAttention(nn.Module):
                     paged_kv_indices = self.sparse_kv_indices_buffer
                     paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens[:B]
                 if self.dcp_world_size > 1:
-                    # The indexer compacted this layer's owned top-k, so the real
-                    # region lengths are here, not in sparse_kv_indptr. `B` is a
+                    # The indexer compacted this layer's owned top-k, so the
+                    # real lengths are here, not in sparse_kv_indptr; `B` is a
                     # token count on both branches.
                     paged_kv_indptr = self.dcp_sparse_kv_indptr_buffer[: B + 1]
 
@@ -2118,9 +2118,9 @@ class MLAAttention(nn.Module):
                 dcp_world_size=self.dcp_world_size,
                 dcp_persistent_supported=self.dcp_persistent_supported,
             )
-            # Sparse DCP persistent decode rebuilds the work plan below from the
-            # layer-local compact indptr. MTP verify is per-token q_len=1 rows
-            # and rebuilds into the sparse_mtp_ buffers, so it stays here too.
+            # Sparse DCP persistent decode rebuilds the work plan below from
+            # the layer-local compact indptr; MTP verify is per-token q_len=1
+            # rows and rebuilds into the sparse_mtp_ buffers.
             if self.is_sparse_mla and self.dcp_world_size > 1:
                 use_persistent_mode = (
                     use_persistent_mode and self.sparse_dcp_metadata_rebuild

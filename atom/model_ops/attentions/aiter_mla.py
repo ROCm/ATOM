@@ -354,8 +354,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         }
         if self._publishes_dcp_local_lens:
             # Layer-invariant sparse-DSA indexer metadata: one row per query
-            # token, derived from context_lens once per step and reused by every
-            # full layer.
+            # token, derived once per step and reused by every full layer.
             mla_metadata["dcp_local_context_lens"] = CpuGpuBuffer(
                 self.max_bs * max_seqlen_qo, **i32_kwargs
             )
@@ -401,10 +400,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 dtype=torch.int32,
                 device=self.device,
             )
-            # One block-table row per scored query token; only MTP verify needs
-            # its own copy. Built once per step rather than in the indexer, where
-            # 21 full-index layers would each allocate one into the CUDAGraph
-            # private pool.
+            # One block-table row per query token; only MTP verify needs a
+            # copy. Built once per step, not in the indexer, where every
+            # full-index layer would allocate one into the CUDAGraph pool.
             self._dcp_token_block_tables_gpu = (
                 torch.empty(
                     self.max_bs * max_seqlen_qo,
@@ -925,7 +923,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             local_ctx = (base + remainder).to(torch.int32)  # local KV tokens/blocks
         if self._publishes_dcp_local_lens:
             # A draft step runs one query per sequence, so this is already the
-            # per-query-token map. The verify step's copy is stale after
+            # per-token map. The verify step's copy is stale after
             # context_lens += 1, and a short length drops the newest tokens.
             var["dcp_local_context_lens"].gpu[:running_bs] = local_ctx
         if dcp_local_rebuild:
@@ -1888,10 +1886,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             if self._publishes_dcp_local_lens:
                 # Publish once per step instead of launching 7 elementwise
                 # kernels in every full sparse-indexer layer. One row per query
-                # token: round-robin sharding lands a draft position's extra
-                # token on a single rank, so the per-request length the dense
-                # metadata uses is only right for the last draft position.
-                # max_seqlen_q == 1 reproduces local_context_lens exactly.
+                # token: a draft position's extra token lands on a single rank,
+                # so a per-request length is only right for the last position.
                 var["dcp_local_context_lens"].np[:sum_scheduled_tokens] = (
                     get_dcp_local_window_lens(
                         context_lens,
@@ -2362,8 +2358,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         dcp_local_context_lens = None
         if self._publishes_dcp_local_lens:
             # The warmup forward reads this buffer before replay overwrites it.
-            # One local token matches the synthetic capture KV metadata above.
-            # One row per query token, as prepare_decode publishes it.
+            # One local token matches the synthetic capture KV metadata above;
+            # one row per query token, as prepare_decode publishes it.
             var["dcp_local_context_lens"].np[:sum_tokens] = 1
             dcp_local_context_lens = var["dcp_local_context_lens"].copy_to_gpu(
                 sum_tokens

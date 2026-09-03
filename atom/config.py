@@ -1761,11 +1761,9 @@ class Config:
                     f"the persistent cprr MLA kernel); got {gfx}. Disable DCP or "
                     f"speculative decode on this GPU."
                 )
-                # TBO decode splits a decode batch into ubatches, and the
-                # sparse DCP indexer slices its work buffers by query token
-                # rather than by request. The two agree at one query per
-                # sequence, so the combination has never run: refuse it rather
-                # than hand a verify step a ubatch window nothing has checked.
+                # TBO slices its ubatch work buffers by request, while the
+                # sparse DCP indexer indexes them by query token. The two agree
+                # only at one query per sequence.
                 assert not self.enable_tbo_decode, (
                     "Decode TBO (--enable-tbo all) combined with speculative "
                     "decode and DCP is unverified. Use --enable-tbo (prefill "

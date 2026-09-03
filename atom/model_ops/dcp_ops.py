@@ -707,21 +707,22 @@ def get_dcp_local_seq_lens(seq_lens, dcp_size, dcp_rank, cp_kv_cache_interleave_
 def get_dcp_local_window_lens(
     seq_lens, max_seqlen_q, dcp_size, dcp_rank, cp_kv_cache_interleave_size=1
 ):
-    """Per-DCP-rank local KV length of each QUERY TOKEN's causal window.
+    """Per-DCP-rank local KV length of each query token's causal window.
 
     Draft position ``j`` attends to global positions ``[0, seq_len -
-    max_seqlen_q + j]``; that one extra position belongs to a single rank, so
-    the ranks' local lengths do not all advance with j. Returns a flat
+    max_seqlen_q + j]``; that extra position belongs to a single rank, so the
+    ranks' local lengths do not all advance with j. Returns a flat
     ``[len(seq_lens) * max_seqlen_q]`` array in (sequence, draft position)
     order. ``max_seqlen_q == 1`` reproduces ``get_dcp_local_seq_lens``.
-
-    Row 0's window is the sequence's committed (non-draft) token count, which a
-    scheduled decode row always has at least one of; the clamp only keeps the
-    helper honest for callers that have not established that.
     """
     windows = seq_lens[:, None] - max_seqlen_q + 1 + np.arange(max_seqlen_q)
     return get_dcp_local_seq_lens(
-        windows.clip(min=0).ravel(), dcp_size, dcp_rank, cp_kv_cache_interleave_size
+        # Row 0 is the committed token count, which a scheduled decode row
+        # always has at least one of; the clip is for callers that do not.
+        windows.clip(min=0).ravel(),
+        dcp_size,
+        dcp_rank,
+        cp_kv_cache_interleave_size,
     )
 
 
@@ -803,8 +804,8 @@ def dcp_local_context_lens(
         return local_ctx
     g_ctx = attn_metadata.context_lens
     if g_ctx.shape[0] != num_rows:
-        # This fallback only sees per-request lengths; a verify step's
-        # per-draft windows have to come from the published buffer.
+        # This fallback only sees per-request lengths; per-draft windows
+        # have to come from the published buffer.
         raise ValueError(
             f"no published DCP local context lengths, and context_lens holds "
             f"{g_ctx.shape[0]} rows for {num_rows} query tokens"
@@ -881,12 +882,11 @@ def dcp_decode_candidate_exchange_fused(
     # capture width. Sizing off the padded array walks rows nothing scheduled
     # and hands attention a width it did not ask for (upstream 0b4f1ddba).
     #
-    # The row unit is the QUERY TOKEN, so the (batch, next_n) query is flattened
-    # here and next_n never reaches aiter. Its own window formula
-    # `seqLens[row // next_n] - next_n + row % next_n + 1` advances every rank's
-    # LOCAL length once per draft position, which holds only if this rank owns
-    # all of the last next_n global positions; at next_n == 1 it degenerates to
-    # `seqLens[row]` and local_ctx below says what each window really is.
+    # Rows are query tokens, so the (batch, next_n) query is flattened here and
+    # next_n never reaches aiter: its window formula `seqLens[row // next_n] -
+    # next_n + row % next_n + 1` advances every rank's LOCAL length once per
+    # draft position, but that extra position belongs to one rank. At next_n ==
+    # 1 it degenerates to `seqLens[row]` and local_ctx carries the real windows.
     q_rows = padded_q_fp8_decode_tokens.reshape(
         num_decode_tokens, 1, *padded_q_fp8_decode_tokens.shape[2:]
     )
