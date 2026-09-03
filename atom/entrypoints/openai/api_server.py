@@ -2465,7 +2465,15 @@ async def start_profile():
     message = next(
         (r["message"] for r in results if "message" in r), "Profiling started"
     )
-    return {"status": "success", "message": message}
+    response = {"status": "success", "message": message}
+    # Present only when a delay is configured, so a client can wait out the
+    # window without parsing the message.
+    armed = next(
+        (r["armed_after_iters"] for r in results if "armed_after_iters" in r), None
+    )
+    if armed is not None:
+        response["armed_after_iters"] = armed
+    return response
 
 
 @app.post("/stop_profile")
