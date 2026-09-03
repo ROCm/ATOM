@@ -1892,7 +1892,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         vars_used = [
             ("slot_mapping", running_tokens),
             ("context_lens", running_bs),
-            ("cu_seqlens_q", running_bs + 1),
             # ("kv_indptr", running_bs + 1),
             ("kv_last_page_lens", running_bs),
             ("block_tables", running_bs),
@@ -1900,7 +1899,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         if self._publishes_dcp_local_lens:
             vars_used.append(("dcp_local_context_lens", running_bs))
         metadata_deps = {
-            "cu_seqlens_q",
             "kv_last_page_lens",
         }
 
@@ -1984,6 +1982,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # metadata copies on main stream
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
         ctx.update({el: var[el].copy_to_gpu(num) for el, num in vars_for_metadata})
+        # A view: `publish_cu_seqlens_q` already uploaded it this step, and
+        # nothing here writes the host copy.
+        ctx["cu_seqlens_q"] = var["cu_seqlens_q"].gpu[: running_bs + 1]
 
         if is_sparse_mtp:
             sum_tokens = running_tokens

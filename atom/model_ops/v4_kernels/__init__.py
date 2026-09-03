@@ -95,8 +95,8 @@ __all__ = [
 
 logger = logging.getLogger("atom")
 
-# FP4 indexer persistent-grid schedule params, shared by the decode
-# (`pa_mqa_logits_fp4`) and prefill (`pa_mqa_logits_fp4_prefill`) kernels.
+# FP4 indexer persistent-grid schedule params for the `pa_mqa_logits_fp4_prefill`
+# kernels, which decode and prefill both score through.
 # The attention metadata builder precomputes each path's cta_info with these
 # and the scorer passes the matching block_k, so layout and grid agree. They
 # live here (rather than in either caller) because both the builder and the

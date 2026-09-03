@@ -26,7 +26,7 @@ from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.attentions.sub_pool_spec import SubPoolSpec
 from atom.model_ops.dcp_ops import dcp_local_index, dcp_owner_rank
 from atom.utils import CpuGpuBuffer, pack_rows
-from atom.utils.forward_context import AttentionMetaData, AttnState
+from atom.utils.forward_context import AttentionMetaData, AttnState, ForwardMode
 from atom.utils.tbo.ubatch_splitting import (
     UBatchSlice,
     attach_tbo_cpu_lens,
@@ -458,6 +458,47 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
 
         return self._copy_mrope_to_gpu(total_tokens)
 
+    def publish_cu_seqlens_q(
+        self, batch: ScheduledBatch, forward_mode: ForwardMode
+    ) -> None:
+        """Publish this step's `cu_seqlens_q`. The only writer.
+
+        Lives here because this class declares the buffer and defines its
+        layout, but is CALLED from `prepare_model` before `prepare_input_ids`,
+        which addresses each request's span through it and so cannot wait for
+        `build()`. `prepare_prefill` cross-checks against this rather than
+        deriving its own. Slot 0 is 0 from allocation.
+
+        The tail out to `running_bs` gets the flat cumsum: attention runs at
+        that width whether or not a graph is replayed, and a zero-length row
+        reads nothing. Left unwritten it holds the previous step's.
+        """
+        scheduled_bs = batch.total_seqs_num
+        assert forward_mode.running_bs >= scheduled_bs, (
+            f"running_bs={forward_mode.running_bs} < scheduled_bs={scheduled_bs}; "
+            "ForwardMode.decide invariant violated"
+        )
+        cu = self.model_runner.forward_vars["cu_seqlens_q"]
+        cu.np[1 : scheduled_bs + 1] = np.cumsum(batch.num_scheduled_tokens)
+        cu.np[scheduled_bs + 1 : forward_mode.running_bs + 1] = batch.total_tokens_num
+        # The step's only H2D for this buffer; every consumer slices `.gpu`.
+        cu.copy_to_gpu(forward_mode.running_bs + 1)
+
+    def decode_spans(self, batch: ScheduledBatch) -> tuple[int, np.ndarray, np.ndarray]:
+        """A pure-decode step's `(bs, per-request lengths, exclusive prefix sum)`.
+
+        One place, so no caller can pair a length vector with someone else's
+        cumsum: both come off `num_scheduled_tokens` and the buffer
+        `publish_cu_seqlens_q` published from it -- which is also why this is
+        only valid after that call, not from the shrink helpers that run before.
+        """
+        bs = batch.total_seqs_num_decode
+        return (
+            bs,
+            batch.num_scheduled_tokens[:bs],
+            self.model_runner.forward_vars["cu_seqlens_q"].np[: bs + 1],
+        )
+
     def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
         scheduled_bs = batch.total_seqs_num_prefill
         sum_scheduled_tokens = batch.total_tokens_num_prefill
@@ -538,7 +579,14 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["slot_mapping"].np[:sum_scheduled_tokens] = -1
         var["slot_mapping"].np[: len(slot_mapping)] = slot_mapping
-        var["cu_seqlens_q"].np[: scheduled_bs + 1] = cu_seqlens_q
+        # `cu_seqlens_q` already holds this: `publish_cu_seqlens_q`
+        # publishes it before `prepare_input_ids`, off the same
+        # `num_scheduled_tokens` this loop re-derives as
+        # `context_lens - num_cached_tokens`. Cross-check instead of rewriting;
+        # a second writer is how two derivations of one array drift.
+        assert np.array_equal(
+            var["cu_seqlens_q"].np[: scheduled_bs + 1], cu_seqlens_q
+        ), f"prefill cu_seqlens_q {cu_seqlens_q} != published"
         var["cu_seqlens_k"].np[: scheduled_bs + 1] = cu_seqlens_k
         var["context_lens"].np[:scheduled_bs] = batch.context_lens[:scheduled_bs]
         # Pad the per-sequence tail out to `running_bs`, the width a draft pass
@@ -546,13 +594,11 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         # A flat cumsum gives each fabricated row zero query length and a zero
         # context makes it read nothing; left unwritten they hold the previous
         # step's, and the drafter attends to a since-freed request's blocks.
-        var["cu_seqlens_q"].np[scheduled_bs + 1 : running_bs + 1] = cu_seqlens_q[-1]
         var["cu_seqlens_k"].np[scheduled_bs + 1 : running_bs + 1] = cu_seqlens_k[-1]
         var["context_lens"].np[scheduled_bs:running_bs] = 0
         min_seqlen_q = 0
         dropout_p = 0.0
         vars_used = [
-            ("cu_seqlens_q", running_bs + 1),
             ("cu_seqlens_k", running_bs + 1),
             ("slot_mapping", sum_scheduled_tokens),
             ("context_lens", running_bs),
@@ -562,6 +608,9 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             vars_used.append(("seq_starts", scheduled_bs))
 
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
+        # Already on the device: `publish_cu_seqlens_q` uploads it for every
+        # step, so this is a view. One writer AND one upload for this buffer.
+        ctx["cu_seqlens_q"] = var["cu_seqlens_q"].gpu[: running_bs + 1]
         num_cached_tokens = None
         if has_cached:
             num_cached_tokens = torch.tensor(

@@ -1134,12 +1134,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         vars_used = [
             ("slot_mapping", running_tokens),
             ("context_lens", running_bs),
-            ("cu_seqlens_q", running_bs + 1),
             ("block_tables", running_bs),
             ("kv_indptr", running_bs + 1),
         ]
 
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
+        # A view: `publish_cu_seqlens_q` already uploaded it this step, and
+        # nothing here writes the host copy.
+        ctx["cu_seqlens_q"] = var["cu_seqlens_q"].gpu[: running_bs + 1]
         if self.block_size in (256, 1024):
             ctx_pa_ps = self.set_aiter_persistent_worker_buffers(running_bs)
             ctx.update(ctx_pa_ps)

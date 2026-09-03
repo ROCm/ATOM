@@ -517,7 +517,6 @@ class Context:
     # forward's other host-to-device copies. Keeping these on the per-forward
     # context avoids launching pinned-buffer H2Ds later from postprocess.
     draft_anchor_overrides: torch.Tensor | None = None
-    draft_ragged_lens: torch.Tensor | None = None
 
     def __init__(
         self,
@@ -534,7 +533,6 @@ class Context:
         input_ids: torch.Tensor | None = None,
         ubatch_token_offset: int = 0,
         draft_anchor_overrides: torch.Tensor | None = None,
-        draft_ragged_lens: torch.Tensor | None = None,
     ):
         self.positions = positions
         self.is_prefill = is_prefill
@@ -549,7 +547,6 @@ class Context:
         self.input_ids = input_ids
         self.ubatch_token_offset = ubatch_token_offset
         self.draft_anchor_overrides = draft_anchor_overrides
-        self.draft_ragged_lens = draft_ragged_lens
 
 
 @dataclass
