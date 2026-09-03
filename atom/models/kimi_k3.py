@@ -876,24 +876,22 @@ def _kda_attention_with_output_fake(
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor | None,
     layer_name: str,
-) -> torch.Tensor:
-    # The mixer output (o_proj) is always bf16 even when the input activation is
-    # fp8 (fused input_layernorm+quant), so pin the dtype rather than empty_like.
-    return torch.empty(
-        hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
-    )
+    output: torch.Tensor,
+) -> None:
+    return None
 
 
 @mark_spliting_op(
     is_custom=True,
     gen_fake=_kda_attention_with_output_fake,
-    mutates_args=[],
+    mutates_args=["output"],
 )
 def kda_attention_with_output(
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor | None,
     layer_name: str,
-) -> torch.Tensor:
+    output: torch.Tensor,
+) -> None:
     """Opaque splitting-op boundary for the KDA mixer.
 
     The KDA recurrence reads the forward context, calls fla causal-conv/kda
@@ -902,11 +900,24 @@ def kda_attention_with_output(
     trace through it, so the whole mixer is wrapped in a custom op — inductor
     treats it as opaque and the piecewise backend splits the graph here,
     exactly as the GDN path does via aiter.linear_attention_with_output_base.
+
+    ``output`` is allocated by the caller *inside* the traced region and only
+    mutated here, so the op returns nothing. That is what makes the mixer safe
+    under PIECEWISE: the splitting submodule runs eager between two captured
+    pieces, and a returned tensor would be a fresh allocation every step while
+    the captured piece downstream reads the one address it baked at capture.
+    Allocating in the traced region instead puts the buffer inside the upstream
+    piece's cudagraph pool, where the address is fixed by construction.
     """
     self = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
-    return self._forward_impl(hidden_states, hidden_states_scale)
+    mixed = self._forward_impl(hidden_states, hidden_states_scale)
+    # _forward_impl returns only the num_actual_tokens rows it computed; the
+    # padded tail of `output` is left as-is, matching attention_gdn.py's
+    # core_attn_out. The copy cannot be folded into o_proj's out=: o_proj is a
+    # RowParallelLinear and its TP all-reduce returns a fresh tensor anyway.
+    output[: mixed.shape[0]] = mixed
 
 
 class KimiKDAAttention(nn.Module):
@@ -1168,11 +1179,20 @@ class KimiKDAAttention(nn.Module):
         hidden_states_scale = None
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_scale = hidden_states
+        # Allocate the mixer output here, in the traced region, so it belongs to
+        # the captured piece upstream of the split rather than to the eager op.
+        # See kda_attention_with_output's docstring. The mixer output is always
+        # bf16 even when the activation is fp8 (fused input_layernorm+quant), so
+        # pin the dtype rather than empty_like.
+        output = torch.empty(
+            hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
+        )
         # Route through the opaque custom op so torch.compile splits the graph
         # here instead of tracing the stateful recurrence in _forward_impl.
-        return torch.ops.aiter.kda_attention_with_output(
-            hidden_states, hidden_states_scale, self.layer_name
+        torch.ops.aiter.kda_attention_with_output(
+            hidden_states, hidden_states_scale, self.layer_name, output
         )
+        return output
 
     @mark_trace
     def _forward_impl(
@@ -1998,10 +2018,18 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        # Stay on the inputs_embeds path once vision embeddings exist; the
-        # language model would otherwise re-embed input_ids and drop them.
-        if inputs_embeds is None and get_pp_group().is_first_rank:
-            inputs_embeds = self.embed_input_ids(input_ids)
+        # Text-only batches go in as `input_ids` and are embedded *inside* the
+        # compiled language model (KimiLinearModel.forward falls back to
+        # embed_tokens when inputs_embeds is None). Embedding out here instead
+        # would hand a freshly allocated tensor to a captured graph every step,
+        # which is the PIECEWISE replay assert; it would also leave the
+        # embedding gather outside the cudagraph. vLLM makes the same choice
+        # (gpu_model_runner.py: "not desirable for performance since then the
+        # embedding layer is not included in the CUDA graph").
+        #
+        # Multimodal prefills still arrive with inputs_embeds already merged by
+        # ModelRunner.run_model, and prefill is never captured, so nothing is
+        # dropped.
         return self.language_model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
