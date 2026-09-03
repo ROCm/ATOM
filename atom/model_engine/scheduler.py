@@ -2002,6 +2002,20 @@ class Scheduler:
         than one checkpoint interval.
         """
         bm = self.block_manager
+        # A multimodal prompt is prefilled whole -- chunked multimodal prefill is
+        # unsupported (see the `atomic_prefill` guard in `_schedule_prefills`), so
+        # it is either admitted entire or requeued entire. Landing it on a state
+        # checkpoint rung shortens it deterministically, and the post-alloc atomic
+        # re-assert then requeues it whole; the very next pass produces the same
+        # shortened chunk and requeues again -- a livelock with idle GPUs and
+        # head-of-line blocking. Skip the rung cut here: the checkpoint machinery
+        # keeps a checkpoint only where a forward ends exactly on a rung, so a
+        # whole prompt that ends off-grid simply keeps no mid-prompt checkpoint,
+        # which is correct for a single-shot prefill (there is no later chunk to
+        # resume from anyway). Forks do not arise on a fresh multimodal prompt
+        # (`state_fork_src < 0`), so the fork-vetting below is likewise moot.
+        if getattr(seq, "multimodal_data", None) is not None:
+            return chunk
         target = bm.checkpoint_cut(seq, start, start + chunk)
         if target:
             chunk = target - start

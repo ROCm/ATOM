@@ -711,6 +711,58 @@ class TestSchedule:
         assert batch.total_seqs_num_prefill == 1
         assert list(batch.num_scheduled_tokens) == [4]
 
+    def test_multimodal_prefill_spanning_checkpoint_rung_admits_whole(
+        self, seq_factory
+    ):
+        # The requeue test above forces the shortening through the *offload*
+        # adjuster, whose real-world shortening goes away once the load lands --
+        # so a single pass is enough to prove the requeue. The state-checkpoint
+        # rung cut in `_finalize_prefill_chunk` is different: it is deterministic,
+        # so a multimodal prompt spanning one interval is shortened the *same* way
+        # every pass, and requeue-whole then loops forever (idle GPUs, head-of-
+        # line blocking). A one-pass test cannot see that. Drive two passes with a
+        # fixed rung cut in place and assert the prompt is admitted whole and
+        # prefill actually completes -- the cut must be suppressed for multimodal.
+        sched = Scheduler(
+            MockConfig(
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                enable_chunked_prefill=True,
+            )
+        )
+        # A rung that always lands 4 tokens short of the chunk end -- the same
+        # shortening on every pass, exactly as a real ladder cuts a prompt that
+        # spans an interval. If the cut were honoured for multimodal, the atomic
+        # re-assert would requeue whole and this seq would never make progress.
+        sched.block_manager.checkpoint_cut = lambda seq, start, end: end - 4
+        seq = seq_factory(list(range(8)), multimodal_data={"pixel_values": object()})
+        sched.add(seq)
+
+        # Pass 1: admitted whole, not shortened to a 4-token partial, not requeued.
+        batch1, _ = sched.schedule()
+        assert batch1.total_seqs_num_prefill == 1
+        assert list(batch1.num_scheduled_tokens) == [8]
+        assert seq.is_partial_prefill is False
+        assert seq not in sched.waiting
+
+        sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(
+                req_ids=[],
+                token_ids=[],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+            batch=batch1,
+        )
+
+        # Pass 2: prefill is done, so the seq is not bounced back to waiting to
+        # be re-shortened -- the livelock would show here as the seq reappearing
+        # in `waiting` with no forward progress.
+        assert seq not in sched.waiting
+
     def test_prefill_respects_block_availability(self, seq_factory):
         sched = Scheduler(MockConfig(num_kvcache_blocks=1, kv_cache_block_size=4))
         sched.add(seq_factory([1, 2, 3, 4]))  # 1 block
