@@ -1886,17 +1886,17 @@ class Config:
                     f"({self.long_prefill_token_threshold}) must be >= "
                     f"kv_cache_block_size ({self.kv_cache_block_size})."
                 )
+        if min(self.profiler_delay_iters, self.profiler_max_iters) < 0:
+            raise ValueError(
+                "profiler_delay_iters and profiler_max_iters must be >= 0, "
+                f"got {self.profiler_delay_iters} and {self.profiler_max_iters}"
+            )
         if not is_plugin_mode():
             if self.torch_profiler_dir is not None:
                 os.makedirs(self.torch_profiler_dir, exist_ok=True)
             assert self.torch_profiler_dir is None or os.path.isdir(
                 self.torch_profiler_dir
             ), f"torch_profiler_dir {self.torch_profiler_dir} is not a valid directory"
-            if min(self.profiler_delay_iters, self.profiler_max_iters) < 0:
-                raise ValueError(
-                    "profiler_delay_iters and profiler_max_iters must be >= 0, "
-                    f"got {self.profiler_delay_iters} and {self.profiler_max_iters}"
-                )
 
         # only for server mode or plugin mode(vllm)
         # for torch compile policy, plugin mode(vllm) uses the ATOM compile policy
