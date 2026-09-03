@@ -649,6 +649,9 @@ class KimiK3DSpark(DSparkDraftModel):
         # Bound by share_with_target(); both are skipped at load.
         self.embed_tokens = None
         self.lm_head = None
+        # vLLM 0.28 probes this attribute before enabling adaptive verification.
+        # This checkpoint deliberately skips the training-only head.
+        self.confidence_head = None
 
     # ---- weight-loading hooks ---------------------------------------------
 
