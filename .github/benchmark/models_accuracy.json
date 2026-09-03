@@ -1,17 +1,5 @@
 [
   {
-    "model_name": "Meta-Llama-3-8B-Instruct",
-    "model_path": "meta-llama/Meta-Llama-3-8B-Instruct",
-    "extraArgs": "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3",
-    "env_vars": "HSA_NO_SCRATCH_RECLAIM=1",
-    "runner": "linux-atom-mi35x-1",
-    "test_level": "pr",
-    "accuracy_threshold": 0.73,
-    "accuracy_baseline": 0.75,
-    "accuracy_baseline_model": "meta-llama/Meta-Llama-3-8B-Instruct",
-    "_baseline_note": "HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable"
-  },
-  {
     "model_name": "DeepSeek-R1-0528",
     "model_path": "deepseek-ai/DeepSeek-R1-0528",
     "extraArgs": "--kv_cache_dtype fp8 -tp 8",

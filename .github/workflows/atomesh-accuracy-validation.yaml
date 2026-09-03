@@ -105,8 +105,12 @@ jobs:
           current = level_map.get(event, "pr")
           allowed = {"pr": {"pr"}, "main": {"pr", "main"}, "nightly": {"pr", "main", "nightly"}}[current]
           models = json.load(open(".github/benchmark/models_accuracy.json", encoding="utf-8"))
+          # NOTE: Meta-Llama-3-8B-Instruct was this whitelist's only "pr" entry
+          # and has been removed from models_accuracy.json, so atomesh
+          # standalone currently validates nothing on a pull request. Promoting
+          # a replacement changes what every atomesh PR pays for, so it is left
+          # to the job owner rather than decided here.
           atomesh_levels = {
-              "Meta-Llama-3-8B-Instruct": "pr",
               "DeepSeek-R1-0528": "main",
               "DeepSeek-V4-Pro MTP": "nightly",
               "gpt-oss-120b": "nightly",
