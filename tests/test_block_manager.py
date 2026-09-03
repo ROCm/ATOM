@@ -1075,7 +1075,7 @@ class TestOrphanLoadSlotSingleDict:
         from time import monotonic
 
         bm = self._bm()
-        bm._orphan_load_slots["r"] = (7, monotonic())
+        bm._orphan_load_slots["r"] = [(7, monotonic())]
         bm.settle_state_load("r", ok=True)
         assert bm.state.released == [7]
         assert "r" not in bm._orphan_load_slots
@@ -1085,7 +1085,7 @@ class TestOrphanLoadSlotSingleDict:
         from time import monotonic
 
         bm = self._bm()
-        bm._orphan_load_slots["r"] = (7, monotonic())
+        bm._orphan_load_slots["r"] = [(7, monotonic())]
         bm.abandon_state_load("r")
         assert bm.state.released == [7]
         assert "r" not in bm._orphan_load_slots
@@ -1094,7 +1094,7 @@ class TestOrphanLoadSlotSingleDict:
         from time import monotonic
 
         bm = self._bm()
-        bm._orphan_load_slots["r"] = (7, monotonic())
+        bm._orphan_load_slots["r"] = [(7, monotonic())]
         assert bm.reconcile_orphan_load_slots(timeout_s=1e-9) == 1
         assert bm.state.released == [7]
         assert bm._orphan_load_slots_reclaimed == 1
@@ -1104,7 +1104,7 @@ class TestOrphanLoadSlotSingleDict:
         from time import monotonic
 
         bm = self._bm()
-        bm._orphan_load_slots["r"] = (7, monotonic())
+        bm._orphan_load_slots["r"] = [(7, monotonic())]
         assert bm.reconcile_orphan_load_slots(timeout_s=3600) == 0
         assert bm.state.released == []
         assert "r" in bm._orphan_load_slots
@@ -1113,10 +1113,49 @@ class TestOrphanLoadSlotSingleDict:
         from time import monotonic
 
         bm = self._bm()
-        bm._orphan_load_slots["r"] = (7, monotonic())
+        bm._orphan_load_slots["r"] = [(7, monotonic())]
         bm.reconcile_orphan_load_slots(timeout_s=1e-9)
         bm.settle_state_load("r", ok=True)  # the report finally arrives
         assert bm.state.released == [7], "freed once by reconcile, not twice"
+
+    def test_a_preempt_readmit_parks_the_same_id_twice_without_dropping_a_slot(
+        self,
+    ):
+        # `seq.id` is per-request, not per-admission: a preempt/re-admit can park
+        # the same id twice while the first load is still in flight. A single
+        # tuple would overwrite -- leaking slot 7 forever and, worse, releasing
+        # slot 8 (still being written) when the first report lands. Appended and
+        # released oldest-first, each report frees the slot its load actually
+        # settled.
+        from time import monotonic
+
+        bm = self._bm()
+        first = (7, monotonic())
+        second = (8, monotonic())
+        bm._orphan_load_slots["r"] = [first]  # first admission
+        bm._orphan_load_slots["r"].append(second)  # re-admission, load in flight
+
+        bm.settle_state_load("r", ok=True)  # first (oldest) load reports
+        assert bm.state.released == [7]
+        assert bm._orphan_load_slots["r"] == [second]  # slot 8 still parked
+
+        bm.settle_state_load("r", ok=True)  # second load reports
+        assert bm.state.released == [7, 8]
+        assert "r" not in bm._orphan_load_slots  # entry cleared when empty
+
+    def test_reconcile_expires_one_admission_and_keeps_the_fresh_one(self):
+        # Each parked admission ages on its own stamp: a stale one is reclaimed
+        # even while a newer park for the same id is still inside the window.
+        from time import monotonic
+
+        bm = self._bm()
+        now = monotonic()
+        bm._orphan_load_slots["r"] = [(7, now - 3600), (8, now)]  # old, fresh
+
+        assert bm.reconcile_orphan_load_slots(timeout_s=1.0) == 1
+        assert bm.state.released == [7]
+        assert bm._orphan_load_slots["r"] == [(8, now)]
+        assert bm._orphan_load_slots_reclaimed == 1
 
 
 # ── the LMCache chunk probe is gated on the capability ─────────────────────
