@@ -27,6 +27,7 @@ from atom.distributed.pcp_utils import (
     pcp_pad_len,
     pcp_round_robin_query_indices,
 )
+from atom.kv_transfer.disaggregation.sharded_transfer import DCPShardPlan
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import (
     _MLA_MIN_HEADS,
@@ -222,8 +223,8 @@ def cdiv(a, b):
 
 
 @dataclass(frozen=True)
-class DCPIndexGatherPlan:
-    """Layer-invariant GPU indices for one sharded-index transfer chunk."""
+class DCPIndexGatherIndices:
+    """GPU projection of a shared DCP shard plan for preshuffled index pages."""
 
     dst_pages: int
     src_block_id_per_token: torch.Tensor
@@ -233,47 +234,33 @@ class DCPIndexGatherPlan:
     valid: torch.Tensor
 
 
-def build_dcp_index_gather_plan(
-    src_block_ids,
-    device: torch.device,
-    dcp_size: int,
-    dcp_rank: int,
-    scheduler_block_size: int,
-) -> DCPIndexGatherPlan:
-    """Build the block-id-dependent indices shared by every index layer."""
+def prepare_dcp_index_gather_indices(
+    plan: DCPShardPlan, device: torch.device
+) -> DCPIndexGatherIndices:
+    """Project the shared token plan to reusable GPU index tensors."""
 
-    src_count = len(src_block_ids)
-    dst_pages = cdiv(src_count, dcp_size)
-    token_count = dst_pages * scheduler_block_size
-    local_token = torch.arange(token_count, device=device, dtype=torch.int64)
-    global_token = local_token * dcp_size + dcp_rank
-    src_ordinal = torch.div(global_token, scheduler_block_size, rounding_mode="floor")
-    src_token = global_token.remainder(scheduler_block_size)
-    valid = src_ordinal < src_count
-
-    if src_count:
-        src_ordinal = src_ordinal.clamp_max(src_count - 1)
-        source_block_ids = torch.as_tensor(
-            src_block_ids, device=device, dtype=torch.int64
+    if plan.interleave_size != 1:
+        raise ValueError(
+            "Preshuffled index staging currently supports "
+            f"interleave=1, got {plan.interleave_size}"
         )
-        src_block_id_per_token = source_block_ids[src_ordinal]
-    else:
-        src_block_id_per_token = torch.empty(0, device=device, dtype=torch.int64)
-
-    return DCPIndexGatherPlan(
-        dst_pages=dst_pages,
-        src_block_id_per_token=src_block_id_per_token,
+    src_token = torch.as_tensor(plan.src_token, device=device, dtype=torch.int64)
+    return DCPIndexGatherIndices(
+        dst_pages=plan.dst_pages,
+        src_block_id_per_token=torch.as_tensor(
+            plan.src_block_id_per_run, device=device, dtype=torch.int64
+        ),
         src_token=src_token,
         src_token_tile=torch.div(src_token, 16, rounding_mode="floor"),
         src_token_in_tile=src_token.remainder(16),
-        valid=valid,
+        valid=torch.as_tensor(plan.valid, device=device, dtype=torch.bool),
     )
 
 
 def gather_dcp_preshuffled_index_pages(
     source: torch.Tensor,
     staging: torch.Tensor,
-    plan: DCPIndexGatherPlan,
+    indices: DCPIndexGatherIndices,
     index_head_dim: int,
     scheduler_block_size: int,
     block_ratio: int,
@@ -305,9 +292,9 @@ def gather_dcp_preshuffled_index_pages(
             f"index_head_dim={index_head_dim} must be divisible by quant_block_size="
             f"{quant_block_size}"
         )
-    if plan.dst_pages == 0:
+    if indices.dst_pages == 0:
         return 0
-    dst_pages = plan.dst_pages
+    dst_pages = indices.dst_pages
     if dst_pages > staging.shape[0]:
         raise ValueError(
             f"Index staging holds {staging.shape[0]} pages, needs {dst_pages}"
@@ -332,13 +319,13 @@ def gather_dcp_preshuffled_index_pages(
         source_bytes.shape[0], token_tiles, column_tiles, 16, 16
     )
     selected_keys = source_keys[
-        plan.src_block_id_per_token,
-        plan.src_token_tile,
+        indices.src_block_id_per_token,
+        indices.src_token_tile,
         :,
-        plan.src_token_in_tile,
+        indices.src_token_in_tile,
         :,
     ]
-    selected_keys.masked_fill_(~plan.valid[:, None, None], 0)
+    selected_keys.masked_fill_(~indices.valid[:, None, None], 0)
     output[:, : scheduler_block_size * index_head_dim].reshape(
         dst_pages, token_tiles, column_tiles, 16, 16
     ).copy_(
@@ -355,8 +342,8 @@ def gather_dcp_preshuffled_index_pages(
     )
     selected_scales = source_scales.reshape(
         source_bytes.shape[0], scheduler_block_size, scales_per_token
-    )[plan.src_block_id_per_token, plan.src_token]
-    selected_scales.masked_fill_(~plan.valid[:, None], 0)
+    )[indices.src_block_id_per_token, indices.src_token]
+    selected_scales.masked_fill_(~indices.valid[:, None], 0)
     output[:, key_bytes : key_bytes + scale_bytes].view(torch.float32).reshape(
         dst_pages, scheduler_block_size, scales_per_token
     ).copy_(selected_scales.reshape(dst_pages, scheduler_block_size, scales_per_token))
@@ -1517,7 +1504,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         index_staging_region = None
         index_staging_pool_size = 0
         index_staging_chunk_pages = 0
-        build_sharded_index_plan = None
+        prepare_sharded_index = None
         gather_sharded_index = None
         if (
             hasattr(runner, "index_cache")
@@ -1553,28 +1540,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 semantic_role="dsa.index_staging",
             )
 
-            def build_sharded_index_plan(
-                src_block_ids,
-                dcp_size,
-                dcp_rank,
-                interleave,
-            ):
-                if interleave != 1:
-                    raise ValueError(
-                        "Preshuffled index staging currently supports "
-                        f"interleave=1, got {interleave}"
-                    )
-                return build_dcp_index_gather_plan(
-                    src_block_ids,
-                    first_index_page.device,
-                    dcp_size,
-                    dcp_rank,
-                    runner.config.kv_cache_block_size,
-                )
+            def prepare_sharded_index(plan: DCPShardPlan):
+                return prepare_dcp_index_gather_indices(plan, first_index_page.device)
 
             def gather_sharded_index(
                 region_idx,
-                plan,
+                indices,
                 pool_idx,
             ):
                 index_region_idx = region_idx - num_layers
@@ -1587,7 +1558,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 pages = gather_dcp_preshuffled_index_pages(
                     runner.index_cache[index_region_idx],
                     slot,
-                    plan,
+                    indices,
                     index_head_dim,
                     runner.config.kv_cache_block_size,
                     self.block_ratio,
@@ -1602,7 +1573,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             index_staging_region=index_staging_region,
             index_staging_pool_size=index_staging_pool_size,
             index_staging_chunk_pages=index_staging_chunk_pages,
-            build_sharded_index_plan=build_sharded_index_plan,
+            prepare_sharded_index=prepare_sharded_index,
             gather_sharded_index=gather_sharded_index,
         )
 
