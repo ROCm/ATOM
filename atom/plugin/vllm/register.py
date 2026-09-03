@@ -171,8 +171,30 @@ def register_platform() -> str | None:
 
     apply_vllm_v4_block_reuse_patch()
 
+    _register_kv_connectors()
+
     # return the ATOM platform to vllm
     return "atom.plugin.vllm.platform.ATOMPlatform"
+
+
+def _register_kv_connectors() -> None:
+    """Expose ATOM's byte-level LMCache offload to vLLM's connector factory.
+
+    Registered by module path so importing the plugin does not drag in the
+    offload stack (and LMCache) for every run -- vLLM resolves it lazily, only
+    when a --kv-transfer-config actually names it.
+    """
+    from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+
+    name = "AtomLMCacheOffloadConnector"
+    if name in getattr(KVConnectorFactory, "_registry", {}):
+        return
+    KVConnectorFactory.register_connector(
+        name,
+        "atom.plugin.vllm.kv_transfer.connector",
+        name,
+    )
+    logger.info("Registered ATOM KV connector: %s", name)
 
 
 def _patch_vllm_attention_process_weights_after_loading(attention) -> None:
