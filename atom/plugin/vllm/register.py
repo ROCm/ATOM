@@ -266,6 +266,12 @@ def register_model() -> None:
 
     apply_vllm_v4_block_reuse_patch()
 
+    from atom.plugin.vllm.lmcache_connector_patch import (
+        apply_vllm_lmcache_connector_patch,
+    )
+
+    apply_vllm_lmcache_connector_patch()
+
     from atom.plugin.vllm.gdn_backend import register_gdn_attention_backend
 
     register_gdn_attention_backend()
