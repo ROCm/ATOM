@@ -86,9 +86,20 @@ class MiniMaxM3SparseIndexerCache(nn.Module, AttentionLayerBase):
         self.attn_type = AttentionType.DECODER
         self.attn_backend = SparseMHAIndexerBackend
         self.kv_cache_dtype = kv_cache_dtype
-        self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
-            kv_cache_dtype, vllm_config.model_config
-        )
+        if str(kv_cache_dtype).startswith("fp8"):
+            # vLLM maps every fp8 kv-cache-dtype to torch.uint8, a byte buffer
+            # its own kernels reinterpret. The index-topk kernel dispatches on
+            # ``k.dtype.is_fp8()`` instead, so a uint8-labelled cache sends it
+            # down the bf16 branch and it dots bf16 against uint8. aiter already
+            # writes real fp8 bytes here and the native server labels this cache
+            # ``dtypes.d_dtypes["fp8"]``: same 1-byte element, correct label.
+            from aiter import dtypes as aiter_dtypes
+
+            self.kv_cache_torch_dtype = aiter_dtypes.fp8
+        else:
+            self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
+                kv_cache_dtype, vllm_config.model_config
+            )
         self.num_kv_heads = 1
         self.head_size = head_dim
         self.head_size_v = head_dim
