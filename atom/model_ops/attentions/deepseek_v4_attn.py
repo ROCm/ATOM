@@ -105,6 +105,7 @@ from atom.model_ops.v4_kernels import (
     FP4_MQA_PARALLEL_UNIT_NUM,
     build_v4_paged_decode_indptr,
     fp4_indexer_enabled,
+    plan_context_lens,
     write_v4_paged_decode_indices,
     write_v4_paged_prefill_indices,
 )
@@ -2489,13 +2490,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             state_slot_in_gpu = si_buf.copy_to_gpu(running_bs)
 
         # ---- CPU numpy work, overlapped with prep_stream H2D ----
-        # `make_compress_plans` re-derives positions as `(ctx - extend) + j`, so
-        # it needs the seq length THROUGH this step's last forwarded token --
-        # `ctx - full_q + len_i`, its documented "seq_len after the extend
-        # tokens". The unreduced `ctx` would tail-anchor the plan, landing
-        # compressed rows `full_q - len_i` off from `visible_csa(pos)`. A no-op
-        # when nothing shrank.
-        plan_context_lens_np = context_lens_np - (full_q - lens)
+        # The plan wants the seq length THROUGH this step's last forwarded
+        # token, not the reservation: the unreduced `ctx` tail-anchors it and
+        # lands compressed rows `full_q - len_i` off from `visible_csa(pos)`.
+        # `plan_context_lens` reads that length off the same `positions`
+        # attention runs on, so the two anchors cannot drift apart.
+        plan_context_lens_np = plan_context_lens(positions_np, cu, lens)
         compress_plans = self._build_compress_plans(
             lens,
             plan_context_lens_np,
@@ -2553,7 +2553,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 running_bs=running_bs,
                 max_seqlen_q=max_seqlen_q,
                 context_lens_np=context_lens_np,
-                plan_context_lens_np=plan_context_lens_np,
                 state_slot_np=state_slot_np,
                 state_slot_in_np=si_buf.np[:scheduled_bs],
                 positions_np=positions_np,
@@ -2569,7 +2568,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         running_bs: int,
         max_seqlen_q: int,
         context_lens_np: np.ndarray,
-        plan_context_lens_np: np.ndarray,
         state_slot_np: np.ndarray,
         state_slot_in_np: np.ndarray,
         positions_np: np.ndarray,
@@ -2687,7 +2685,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # ---- compress plans (per ubatch buffer set) ----
             # Sliced from the step-level array, NOT `ub_ctx_np`: only it agrees
             # with the anchor `positions` were built on. See the caller.
-            ctx_for_plan = plan_context_lens_np[req_start : req_start + ub_real_reqs]
+            ctx_for_plan = plan_context_lens(
+                ub_positions_np,
+                token_offsets[req_start:] - tok_start,
+                ub_extend_lens_np,
+            )
             compress_plans = self._build_compress_plans(
                 ub_extend_lens_np,
                 ctx_for_plan,
@@ -3610,12 +3612,19 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # the last real value makes each padded slot a 0-length query
         # (qo_indptr[t+1]-qo_indptr[t]==0) that the asm kernel bails on, exactly
         # like the kv_indptr pad tail. Per-token, so correct for MTP too.
+        # Written straight into the staging buffer rather than through `_stage`:
+        # the head is a slice of the constant `_v4_qo_indptr_np` budgeted for
+        # exactly this, so a temporary to hand `_stage` would be a second pass
+        # over the token axis. `_stage`'s capacity check is owed here instead.
         if self._kv_fp8:
-            qo_indptr_np = np.empty(T_pad + 1, dtype=np.int32)
-            qo_indptr_np[: T + 1] = np.arange(T + 1, dtype=np.int32)
-            if T_pad > T:
-                qo_indptr_np[T + 1 :] = T
-            attn_metadata.qo_indptr = self._stage("v4_qo_indptr", qo_indptr_np)
+            qo_buf = self.model_runner.forward_vars["v4_qo_indptr"]
+            assert T_pad + 1 <= qo_buf.np.shape[0], (
+                f"V4 buffer 'v4_qo_indptr' too small: need {T_pad + 1}, have "
+                f"{qo_buf.np.shape[0]}. Increase T_dec in _alloc_v4_metadata_buffers."
+            )
+            qo_buf.np[: T + 1] = self._v4_qo_indptr_np[: T + 1]
+            qo_buf.np[T + 1 : T_pad + 1] = T
+            attn_metadata.qo_indptr = qo_buf.copy_to_gpu(T_pad + 1)
 
     def _build_paged_prefill_meta(
         self,

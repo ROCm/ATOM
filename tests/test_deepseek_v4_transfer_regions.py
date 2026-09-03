@@ -77,6 +77,7 @@ def _stub_v4_runtime_imports():
         "build_v4_paged_decode_indptr",
         "fp4_indexer_enabled",
         "hca_compress_paged_offsets",
+        "plan_context_lens",
         "write_v4_paged_decode_indices",
         "write_v4_paged_prefill_indices",
     ):
