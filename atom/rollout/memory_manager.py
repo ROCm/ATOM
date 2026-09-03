@@ -136,7 +136,7 @@ class MemoryManagerMixin:
         # Without this, del self.kv_cache alone cannot free GPU memory.
         for model_obj in self._get_models_with_kv():
             for module in model_obj.modules():
-                for attr in ("k_cache", "v_cache", "kv_cache"):
+                for attr in ("k_cache", "v_cache", "kv_cache", "kpool_tail_cache"):
                     if hasattr(module, attr):
                         setattr(module, attr, None)
 
@@ -149,6 +149,7 @@ class MemoryManagerMixin:
             "index_cache",
             "mamba_k_cache",
             "mamba_v_cache",
+            "kpool_tail_cache",
             "_kv_cache_backup",
         ):
             if hasattr(self, attr) and getattr(self, attr) is not None:

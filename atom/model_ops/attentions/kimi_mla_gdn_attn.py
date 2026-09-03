@@ -1,22 +1,31 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from collections.abc import Sequence
-
 import numpy as np
 import torch
 from aiter import dtypes
 from aiter.dist.parallel_state import get_tp_group
 
+from atom.config import _MQA_LOGITS_PRESHUFFLE_ROWS
+from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAAttention
+from atom.model_ops.glm5_next.geometry import (
+    effective_kpool_size,
+    pooled_path_enabled,
+)
 from atom.utils import envs
 
-from .aiter_mla import AiterMLAMetadataBuilder
+from .aiter_mla import (
+    AiterMLAMetadataBuilder,
+    aligned_index_cache_dim,
+    mla_kv_entry_dim,
+)
 from .backends import AttentionBackend
 from .gdn_attn import GDNStateMixin
-from .sub_pool_spec import SubPoolSpec, page_pool
+from .page_unit_geometry import PageUnitGeometryMixin
+from .sub_pool_spec import SubPoolSpec, page_pool, state_pool
 from .triton_mla import TritonMLAMetadataBuilder
 
 
@@ -36,7 +45,7 @@ class KimiMLAGDNBackend(AttentionBackend):
         return MLAAttention
 
 
-class _KimiMLAGDNCommon(GDNStateMixin):
+class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
     def __init__(self, model_runner):
         super().__init__(model_runner=model_runner)
         self.mla_idx_by_layer = {
@@ -115,12 +124,25 @@ class _KimiMLAGDNCommon(GDNStateMixin):
         # otherwise-identical builds disagree on the image's size; `carry`
         # is the narrowing rule, and dropping the conv tail later would be a
         # `v2` rather than a silent reinterpretation of a v1 image.
+        tail_shape_fn = getattr(self, "_kpool_tail_plane_shape", None)
+        tail_shape = None if tail_shape_fn is None else tail_shape_fn()
+        version = "v2" if tail_shape is not None else "v1"
+        order = "conv-all-layers,ssm-all-layers"
+        tail_layout = ""
+        if tail_shape is not None:
+            tail_bytes, tail_layers = tail_shape
+            order += ",kpool-tail-all-layers"
+            tail_layout = (
+                f":kpool-tail=layers:{tail_layers},bytes-per-layer:{tail_bytes},"
+                f"dtype:{torch.bfloat16}"
+            )
         layout_id = (
-            "kda-paged-state-v1"
+            f"kda-paged-state-{version}"
             f":layers={self.model_runner.num_gdn_attn_state}"
             f":conv={tuple(shape_k)},{dt_k}"
             f":ssm={tuple(shape_v)},{dt_v}"
-            ":order=conv-all-layers,ssm-all-layers"
+            f":order={order}"
+            f"{tail_layout}"
             f":tp={get_tp_group().world_size}"
             f":spec={self.num_spec}"
             ":carry=all"
@@ -133,10 +155,168 @@ class _KimiMLAGDNCommon(GDNStateMixin):
         runner = self.model_runner
         config = runner.config
         hf = config.hf_config
-        entry = hf.kv_lora_rank + hf.qk_rope_head_dim
+        entry = mla_kv_entry_dim(hf)
         kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
         block_bytes = self._num_cache_rows() * runner.block_size * entry * kv_dtype_size
+        if runner.is_deepseek_v32:
+            # Sparse-indexer key cache rides the same paged pool (GLM-5.3-Flash).
+            index_cache_layer_ids, _ = self._index_cache_layout()
+            block_bytes += len(index_cache_layer_ids) * self._index_cache_block_bytes()
         return [page_pool(block_bytes), self.state_spec()]
+
+    def _aligned_index_dim(self) -> int:
+        """Indexer entry width, padded to 16B so inductor sees aligned rows."""
+        return aligned_index_cache_dim(self.model_runner.config.hf_config)
+
+    # ---- kpool tail buffer -------------------------------------------------
+    #
+    # GLM-5.3-Flash's indexer caches one POOLED key per `index_kpool` tokens, so
+    # the in-progress pool's raw K and gate score have to outlive the step that
+    # produced them. They ride the per-request state slots KDA already owns
+    # rather than a second paged cache: the buffer is `index_kpool - 1` useful
+    # rows of 2 x head_dim bf16 per request per indexer layer -- well under a MB
+    # for the whole engine -- and it inherits the state pool's lifetime, fork
+    # and relocation semantics for free.
+
+    def _kpool_size(self) -> int:
+        """``index_kpool``, or 1 when this model does not pool indexer keys."""
+        hf = self.model_runner.config.hf_config
+        configured = int(getattr(hf, "index_kpool", 1) or 1)
+        return effective_kpool_size(configured)
+
+    def _index_rows_per_block(self) -> int:
+        """Index-cache rows one scheduler block owns.
+
+        With the pooled path on, one cached key covers ``index_kpool`` tokens,
+        so a block of ``block_size`` tokens needs ``block_size // index_kpool``
+        rows rather than one per token. `Config` picks the block size so this
+        stays a multiple of the preshuffled row count that
+        `deepgemm_fp8_paged_mqa_logits` requires.
+
+        Sizing, allocation, binding and the transfer-region byte count all read
+        this one method, so they cannot disagree about how large the cache is.
+        """
+        runner = self.model_runner
+        kpool = self._kpool_size()
+        if not pooled_path_enabled(kpool):
+            return runner.block_size
+        assert runner.block_size % kpool == 0, (
+            f"kv_cache_block_size={runner.block_size} is not divisible by "
+            f"index_kpool={kpool}; Config sets the block size for exactly this"
+        )
+        rows = runner.block_size // kpool
+        assert rows % _MQA_LOGITS_PRESHUFFLE_ROWS == 0, (
+            f"{rows} pooled rows per block is not a multiple of "
+            f"{_MQA_LOGITS_PRESHUFFLE_ROWS}, so deepgemm_fp8_paged_mqa_logits "
+            "cannot stay in the preshuffled layout -- the only one it computes "
+            "correctly. Raise kv_cache_block_size."
+        )
+        return rows
+
+    def _index_cache_block_bytes(self, index_cache_layer=None) -> int:
+        """Bytes one scheduler block occupies in one layer of the index cache.
+
+        This cache is indexed by scheduler block already, and with pooling it
+        holds fewer rows than tokens, so the base's `block_ratio` factor does
+        not apply. Called with no tensor by the sizing path, which needs the
+        number before anything is allocated.
+        """
+        return (
+            self._index_rows_per_block()
+            * self._aligned_index_dim()
+            * dtypes.fp8.itemsize
+        )
+
+    def _kpool_tail_bytes(self) -> int:
+        """Per-request tail bytes across every indexer-owning layer."""
+        kpool = self._kpool_size()
+        if kpool <= 1 or not getattr(self.model_runner, "is_deepseek_v32", False):
+            return 0
+        hf = self.model_runner.config.hf_config
+        index_cache_layer_ids, _ = self._index_cache_layout()
+        per_layer = 2 * kpool * hf.index_head_dim * torch.bfloat16.itemsize
+        return len(index_cache_layer_ids) * per_layer
+
+    def _kpool_tail_plane_shape(self) -> tuple[int, int] | None:
+        """``(bytes per indexer layer, layer count)`` for checkpoint geometry."""
+        total = self._kpool_tail_bytes()
+        if not total:
+            return None
+        index_cache_layer_ids, _ = self._index_cache_layout()
+        layers = len(index_cache_layer_ids)
+        if layers <= 0 or total % layers:
+            raise RuntimeError(
+                "kpool tail bytes do not form an equal per-layer checkpoint plane"
+            )
+        return total // layers, layers
+
+    def _checkpoint_plane_shapes(self) -> list[tuple[int, int]]:
+        """KDA planes plus the partial kpool keys needed to resume exactly."""
+        shapes = super()._checkpoint_plane_shapes()
+        tail_shape = self._kpool_tail_plane_shape()
+        if tail_shape is not None:
+            shapes.append(tail_shape)
+        return shapes
+
+    def _checkpoint_plane_tensors(self) -> list[torch.Tensor]:
+        planes = super()._checkpoint_plane_tensors()
+        if self._kpool_tail_plane_shape() is not None:
+            planes.append(self.model_runner.kpool_tail_cache)
+        return planes
+
+    def state_spec(self) -> SubPoolSpec:
+        """KDA recurrent state, plus GLM-5.3's kpool tail in the same entry.
+
+        Widening the existing entry rather than declaring a second class keeps
+        one slot id per request: the tail must be addressed by exactly the
+        index KDA's state is, or a request would read another's partial pool.
+        """
+        base = super().state_spec()
+        extra = self._kpool_tail_bytes()
+        if not extra:
+            return base
+        return state_pool(
+            base.name,
+            base.entry_bytes + extra,
+            entries_per_req=base.entries_per_req,
+            extra_entries=base.extra_entries,
+        )
+
+    def allocate_per_req_cache(self, entries: dict[str, int]) -> dict:
+        out = super().allocate_per_req_cache(entries)
+        if not self._kpool_tail_bytes():
+            return out
+        hf = self.model_runner.config.hf_config
+        index_cache_layer_ids, _ = self._index_cache_layout()
+        out["kpool_tail_cache"] = torch.zeros(
+            (
+                len(index_cache_layer_ids),
+                entries.get(STATE_SLOT_CLASS, 0),
+                2,  # 0 = K, 1 = gate score
+                self._kpool_size(),
+                hf.index_head_dim,
+            ),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        return out
+
+    def relocate_state_slots(self, pairs) -> None:
+        """Move the tail with the KDA state it shares a slot group with.
+
+        Missing this would leave a relocated request reading the partial pool
+        of whichever request previously held its new slot -- a corruption that
+        only shows up once the pool boundary moves under load.
+        """
+        super().relocate_state_slots(pairs)
+        tail = getattr(self.model_runner, "kpool_tail_cache", None)
+        if tail is None or not pairs:
+            return
+        dsts, srcs = [], []
+        for src, dst in pairs:
+            dsts.append(tail[:, dst])
+            srcs.append(tail[:, src])
+        torch._foreach_copy_(dsts, srcs)
 
     def allocate_kv_cache_tensors(
         self, num_kv_heads: int, num_draft_layers: int
@@ -146,8 +326,8 @@ class _KimiMLAGDNCommon(GDNStateMixin):
         config = runner.config
         hf = config.hf_config
         num_layers = self._num_cache_rows()
-        entry = hf.kv_lora_rank + hf.qk_rope_head_dim
-        return {
+        entry = mla_kv_entry_dim(hf)
+        out: dict = {
             "kv_cache": torch.zeros(
                 num_layers,
                 runner.num_physical_kvcache_blocks,
@@ -157,76 +337,52 @@ class _KimiMLAGDNCommon(GDNStateMixin):
                 device="cuda",
             )
         }
+        if runner.is_deepseek_v32:
+            # Sparse indexer key cache, one compact row per indexer-owning
+            # layer. Mirrors AiterMLAMetadataBuilder.allocate_kv_cache_tensors,
+            # which this mixin shadows.
+            aligned = self._aligned_index_dim()
+            index_cache_layer_ids, _ = self._index_cache_layout()
+            out["aligned_index_dim"] = aligned
+            out["index_cache_layer_ids"] = index_cache_layer_ids
+            out["index_cache_layer_map"] = {
+                global_layer_id: compact_layer_id
+                for compact_layer_id, global_layer_id in enumerate(
+                    index_cache_layer_ids
+                )
+            }
+            # Indexed by SCHEDULER block, not by physical row: with the
+            # pooled path on there are fewer index rows than tokens, so the
+            # `num_physical_kvcache_blocks x physical_block_size` shape the
+            # token-granular cache uses no longer describes this one. Blocks x
+            # rows-per-block does, at any compression, and it makes the bytes
+            # one scheduler block owns a plain `stride(0)`.
+            num_sched_blocks = (
+                runner.num_physical_kvcache_blocks
+                * runner.physical_block_size
+                // runner.block_size
+            )
+            out["index_cache"] = torch.zeros(
+                len(index_cache_layer_ids),
+                num_sched_blocks,
+                self._index_rows_per_block(),
+                aligned,
+                dtype=dtypes.fp8,
+                device="cuda",
+            )
+        return out
 
-    def _page_unit_regions(self) -> tuple[np.ndarray, np.ndarray]:
-        """Base address and per-unit stride of every region a PAGE id owns.
+    def _page_unit_index_cache(self) -> torch.Tensor | None:
+        """The indexer key cache a PAGE unit owns a region of, or `None`.
 
-        The destination side of a checkpoint copy. `GDNStateMixin` knows where
-        a state slot's bytes are; this knows where a KV block's are, because
-        this class owns the MLA pool.
-
-        `kv_cache` is `(rows, physical_blocks, physical_block_size, entry)`,
-        so a block owns one contiguous region per row and the rows are a fixed
-        stride apart. Affine in the block id, and a property of the pool rather
-        than of any block, so it is worked out once.
-
-        The units are the trap. `unit_ids` carries **logical** block ids -- what
-        `BlockPool` hands out and what `sub_pool_specs` priced -- while the
-        tensor is shaped in **physical** blocks, and K3's `block_ratio` is 128.
-        So a region is `runner.block_size` tokens wide, not
-        `physical_block_size`, and the two differ by exactly that ratio. The
-        assertion below is what makes a mix-up a startup error rather than 127
-        blocks of scrambled state: it is the one relation that cannot hold if
-        the granularity is wrong.
+        Read through the same predicate `sub_pool_specs` prices with, so the
+        two cannot disagree: a unit owns index-cache bytes exactly when the
+        pool was priced with them.
         """
         runner = self.model_runner
-        cache = runner.kv_cache
-        owner = cache.data_ptr()
-        cached = getattr(self, "_page_unit_region_cache", None)
-        if cached is not None and cached[0] == owner:
-            return cached[1]
-
-        if not cache.is_contiguous():
-            raise RuntimeError("the MLA pool must be contiguous to be copied")
-        item = cache.element_size()
-        entry = cache.shape[3]
-        rows = cache.shape[0]
-        # One logical block's bytes inside one row.
-        region = runner.block_size * entry * item
-        row_stride = cache.stride(0) * item
-
-        runtime = getattr(runner, "state_runtime", None)
-        spec = None if runtime is None else runtime.checkpoint_spec
-        page_unit_bytes = spec.page_unit_bytes if spec is not None else rows * region
-        if rows * region != page_unit_bytes:
-            raise RuntimeError(
-                f"a PAGE unit is {page_unit_bytes} B but this pool gives a "
-                f"logical block {rows} rows x {region} B = {rows * region} B; "
-                "the two disagree about block granularity"
-            )
-        base = np.array(
-            [owner + row * row_stride for row in range(rows)], dtype=np.int64
-        )
-        regions = (base, np.full(rows, region, dtype=np.int64))
-        self._page_unit_region_cache = (owner, regions)
-        return regions
-
-    def _page_unit_bases(self, unit_ids: Sequence[Sequence[int]]) -> np.ndarray:
-        """Start address of every destination segment, one row per image.
-
-        `unit_ids` is `(images, units_per_checkpoint)`. A unit's regions are
-        each at `base + id * stride`, so one image's worth is an outer product
-        and a batch's is the same product with an image axis in front. Unit
-        major, region minor -- the order `_checkpoint_copy_plan` built the
-        destination stream in.
-        """
-        base, stride = self._page_unit_regions()
-        ids = np.asarray(unit_ids, dtype=np.int64)
-        return (base + ids[..., None] * stride).reshape(len(ids), -1)
-
-    def _page_unit_stream_sizes(self, units: int) -> np.ndarray:
-        """Bytes in each destination segment of an image of `units` units."""
-        return np.tile(self._page_unit_regions()[1], units)
+        if not runner.is_deepseek_v32:
+            return None
+        return getattr(runner, "index_cache", None)
 
     def build_kv_cache_tensor(self, layer_id: int, module):
         from atom.config import KVCacheTensor
@@ -243,6 +399,10 @@ class _KimiMLAGDNCommon(GDNStateMixin):
                 replay_buf_k=(runner.replayssm_buf_k[row] if self.replayssm else None),
                 replay_buf_u=(runner.replayssm_buf_u[row] if self.replayssm else None),
                 replay_buf_g=(runner.replayssm_buf_g[row] if self.replayssm else None),
+                # KDA recurrent state: slot-addressed, not paged. Registered
+                # because the forward reads it from `kv_cache_data`, but
+                # excluded from every block-addressed transfer.
+                per_request_state=True,
             )
 
         if hasattr(module, "base_attention") and getattr(module, "use_mla", False):
@@ -259,9 +419,32 @@ class _KimiMLAGDNCommon(GDNStateMixin):
                 f"MLA cache row {row} for model layer {layer_id} "
                 f"exceeds {allocated_rows} allocated rows"
             )
-            entry = hf.kv_lora_rank + hf.qk_rope_head_dim
+            entry = mla_kv_entry_dim(hf)
             kv_cache = runner.kv_cache[row].view(-1, 1, entry)
             module.max_model_len = runner.config.max_model_len
+            if runner.is_deepseek_v32 and getattr(module, "indexer", None) is not None:
+                if layer_id not in runner.index_cache_layer_map:
+                    raise RuntimeError(
+                        "Sparse MLA indexer layer is missing from the compact "
+                        f"index cache layout: layer_num={layer_id}"
+                    )
+                index_cache = runner.index_cache[runner.index_cache_layer_map[layer_id]]
+                # Flat row view: `indexer_k_quant_and_cache` addresses a
+                # slot as a single row id, and the pooled writer computes that
+                # id from the block table itself.
+                module.indexer.k_cache.kv_cache[0] = index_cache.view(
+                    index_cache.shape[0] * index_cache.shape[1],
+                    1,
+                    runner.aligned_index_dim,
+                )
+                # kpool: this layer's slice of the per-request tail buffer,
+                # bound here for the same reason the index cache is -- the
+                # indexer has no other route to a runner-owned tensor.
+                tail = getattr(runner, "kpool_tail_cache", None)
+                if tail is not None:
+                    module.indexer.kpool_tail_cache = tail[
+                        runner.index_cache_layer_map[layer_id]
+                    ]
             module.kv_cache = kv_cache
             return KVCacheTensor(
                 layer_num=layer_id,

@@ -3,7 +3,6 @@ import importlib
 import json
 import logging
 import os
-import types
 from collections.abc import Iterable
 
 import torch
@@ -521,7 +520,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             )
 
         if model_arch in _MTP_MASK_INPUT_ARCH:
-            self._adapt_mtp_layers_for_vllm()
+            self._enable_mtp_input_masking_for_vllm()
         if self.is_eagle3_draft_model:
             self._enable_eagle3_draft_interface()
         elif (self.is_eagle3 and self._eagle3_uses_aux_hidden_state()) or (
@@ -783,50 +782,39 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             hidden_states = hidden_states.flatten(1)
         return hidden_states
 
-    def _adapt_mtp_layers_for_vllm(self) -> None:
-        """Install vLLM-only MTP input masking without changing model code."""
+    def _enable_mtp_input_masking_for_vllm(self) -> None:
+        """Turn on the MTP predictor's position-0 input-embedding mask.
+
+        This used to be installed by rebinding every draft layer's ``forward``
+        to a wrapper that zeroed ``inputs_embeds`` and then re-called the
+        original with a hardcoded five-argument list. That wrapper silently
+        rotted the moment the layer signature grew: the fused FP8 prologue
+        added ``eh_input_quant``, and every vLLM-plugin MTP run died in
+        ``profile_run`` with ``DeepSeekMultiTokenPredictorLayer.forward() takes
+        from 5 to 6 positional arguments but 7 were given``. It also could not
+        see the fused path at all, where the embedding never materializes as a
+        tensor the layer receives.
+
+        So the mask lives in the predictors now (``mask_pos0_inputs_embeds``),
+        which own the embedding lookup on both the fused and unfused paths and
+        cannot fall out of sync with their own layers.
+        """
         if not self.is_mtp_draft_model:
             return
 
-        inner_model = getattr(self.model, "model", None)
-        layers = (
-            getattr(inner_model, "layers", None) if inner_model is not None else None
-        )
-        if layers is None:
-            return
-
-        layer_iter = layers.values() if isinstance(layers, nn.ModuleDict) else layers
-        for layer in layer_iter:
-            if getattr(layer, "_atom_vllm_mtp_masked", False):
-                continue
-
-            layer.forward = types.MethodType(
-                self._make_vllm_mtp_layer_forward(layer.forward),
-                layer,
+        predictor = getattr(self.model, "model", None)
+        if predictor is None or not hasattr(predictor, "mask_pos0_inputs_embeds"):
+            # Only archs listed in _MTP_MASK_INPUT_ARCH get here, and both of
+            # them expose the flag. Reaching this means the arch list and the
+            # models drifted apart -- fail loudly rather than silently serve an
+            # unmasked draft, which is how the old wrapper's breakage stayed
+            # hidden until an accuracy job crashed.
+            raise RuntimeError(
+                f"MTP input masking requested for {self.model_arch}, but its "
+                f"predictor {type(predictor).__name__} does not support "
+                "mask_pos0_inputs_embeds"
             )
-            layer._atom_vllm_mtp_masked = True
-
-    @staticmethod
-    def _make_vllm_mtp_layer_forward(original_forward):
-        @functools.wraps(original_forward)
-        def masked_forward(
-            self_layer,
-            input_ids,
-            positions,
-            previous_hidden_states,
-            inputs_embeds,
-            spec_step_index=0,
-        ):
-            inputs_embeds = torch.where(positions.unsqueeze(-1) == 0, 0, inputs_embeds)
-            return original_forward(
-                input_ids,
-                positions,
-                previous_hidden_states,
-                inputs_embeds,
-                spec_step_index,
-            )
-
-        return masked_forward
+        predictor.mask_pos0_inputs_embeds = True
 
     def _eagle3_uses_aux_hidden_state(self) -> bool:
         vllm_spec_config = getattr(self.vllm_config, "speculative_config", None)
