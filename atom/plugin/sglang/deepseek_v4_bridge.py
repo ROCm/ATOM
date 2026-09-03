@@ -1086,7 +1086,7 @@ class _V4SGLangDecodeGraphBuffers:
         self.n_csa = i32(s)
         self.batch_id = CpuGpuBuffer(t, dtype=torch.int32, device=device)
         self.swa_dest_rows = {ratio: i32(t) for ratio in _V4_SWA_DEST_RATIOS}
-        self.n_committed_per_token = i32(t)
+        self.csa_n_committed_per_token = i32(t)
         self.block_tables_per_token = i32(t, self.max_blocks)
         self.block_tables = i32(s, self.max_blocks)
         self.indptr_swa = i32(t + 1)
@@ -1581,7 +1581,9 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
         visible_np = visible_csa(pos_np).astype(np.int32)
     else:
         visible_np = np.zeros(0, dtype=np.int32)
-    md.n_committed_per_token = bufs.stage(bufs.n_committed_per_token, visible_np, t_pad)
+    md.csa_n_committed_per_token = bufs.stage(
+        bufs.csa_n_committed_per_token, visible_np, t_pad
+    )
     block_cols = int(block_tables.shape[1])
     block_rows = bufs.block_tables_per_token.gpu[:t_pad, :block_cols]
     safe_batch_ids = md.batch_id_per_token[:t_pad].clamp_min(0).long()
@@ -2052,7 +2054,7 @@ def build_atom_v4_attention_metadata_from_sglang(
 
     if is_decode:
         visible_np = visible_csa(pos_np).astype(np.int32)
-        md.n_committed_per_token = torch.from_numpy(visible_np).to(
+        md.csa_n_committed_per_token = torch.from_numpy(visible_np).to(
             device=device, dtype=torch.int32
         )
         batch_ids = torch.from_numpy(batch_np).to(device=device, dtype=torch.long)
