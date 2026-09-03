@@ -415,22 +415,57 @@ def test_conc_filter_narrows_the_agentic_sweep():
     )
 
 
-def test_agentic_concurrency_dropdown_matches_the_catalog():
-    """The dispatch dropdown must offer exactly the catalog's agentic points.
+def test_parse_conc_filter():
+    """The `agentic_concurrency` box: free text in, conc filter out."""
+    from build_benchmark_matrix import parse_conc_filter
 
-    A stale option silently produces an empty matrix at dispatch time (caught
-    only by the guard in `build_benchmark_matrix.py`, after the run starts); a
-    missing one makes a cell unreachable from the UI.
+    # "no selection" spellings all mean the full curve.
+    for raw in (None, "", "   ", "all", "ALL", " All "):
+        assert parse_conc_filter(raw) is None, raw
+    # A box holding only separators carries no selection either.
+    assert parse_conc_filter(",") is None
+    assert parse_conc_filter(" , ") is None
+
+    assert parse_conc_filter("96") == {96}
+    assert parse_conc_filter("48,64") == {48, 64}
+    # Spacing around the separators is what a human actually types.
+    assert parse_conc_filter(" 48 , 64 ") == {48, 64}
+    assert parse_conc_filter("48,64,") == {48, 64}
+    assert parse_conc_filter("64,48,64") == {48, 64}
+
+    # A typo must raise, not quietly widen to the whole 9-cell sweep.
+    for bad in ("48;64", "sixty-four", "48.5", "c=48"):
+        with pytest.raises(ValueError, match="agentic_concurrency"):
+            parse_conc_filter(bad)
+
+
+def test_agentic_concurrency_is_free_text():
+    """The dispatch input takes typed numbers, not a fixed option list.
+
+    A `choice` would have to be kept in sync with the catalog by hand, and
+    could not express a subset like "48,64" at all. The cost is that a typo is
+    only caught at dispatch time -- which is what `parse_conc_filter` and the
+    empty-matrix guard in `build_benchmark_matrix.py` are for.
     """
     yaml = pytest.importorskip("yaml")
     wf = yaml.safe_load(WORKFLOW.read_text())
     on = wf.get("on", wf.get(True))
-    options = on["workflow_dispatch"]["inputs"]["agentic_concurrency"]["options"]
+    box = on["workflow_dispatch"]["inputs"]["agentic_concurrency"]
 
-    assert options[0] == "all", "'all' must stay the first option (the default)"
-    offered = {int(o) for o in options[1:]}
+    assert box["type"] == "string"
+    assert "options" not in box
+    # The default must be a no-filter spelling, or every dispatch that leaves
+    # the box alone would silently run a subset.
+    from build_benchmark_matrix import parse_conc_filter
+
+    assert parse_conc_filter(box["default"]) is None
+
+    # Every concurrency the description advertises must actually be runnable.
     in_catalog = {
         c["conc"]
         for c in catalog.build_cells(CATALOG, bench_kind_filter={"aiperf_agentic"})
     }
-    assert offered == in_catalog
+    advertised = parse_conc_filter(
+        box["description"].split("Catalog has ")[1].split(";")[0]
+    )
+    assert advertised == in_catalog

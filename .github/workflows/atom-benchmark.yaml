@@ -63,14 +63,13 @@ on:
         type: boolean
         default: true
       agentic:
-        description: "Run ONLY the agentic AgentX trace replay (DeepSeek-V4-Pro, 9 cells x ~1h GPU). Overrides the model checkboxes and the workload grid above. The nightly never runs it."
+        description: "Run ONLY the agentic AgentX trace replay (DeepSeek-V4-Pro, 9 cells x ~1h GPU). Set agentic_concurrency below to run a subset. Overrides the model checkboxes and the workload grid above. The nightly never runs it."
         type: boolean
         default: false
       agentic_concurrency:
-        description: "Agentic: which concurrency to run. 'all' = the full 9-cell curve; pick one to re-run a single ~1h cell. Ignored unless the agentic checkbox is ticked."
-        type: choice
+        description: "Agentic concurrencies to run, comma-separated (e.g. 48,64). 'all' = the whole curve. Catalog has 1,2,8,16,48,64,96,128,256; each cell is ~1h GPU. Ignored unless the agentic checkbox is ticked."
+        type: string
         default: "all"
-        options: ["all", "1", "2", "8", "16", "48", "64", "96", "128", "256"]
       agentic_duration:
         description: "Agentic replay seconds per cell. 3600 = official; under 900 forces --unsafe-override and stamps submission_valid=false."
         type: string

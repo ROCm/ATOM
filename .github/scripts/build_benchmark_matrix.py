@@ -26,6 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from catalog import (  # noqa: E402
     build_cell_configs,
+    build_cells,
     load_variants,
     validate_dispatch_inputs,
 )
@@ -46,6 +47,36 @@ RESERVED_INPUTS = {
     "param_lists",
     "atom_commit",
 }
+
+
+def parse_conc_filter(raw: str | None) -> set[int] | None:
+    """Parse the `agentic_concurrency` dispatch box into a `conc_filter`.
+
+    Free text rather than a fixed option list: the box takes any subset of the
+    curve ("48,64"), and nothing has to be kept in sync with the catalog's
+    concurrency lists. Empty or "all" (any case) means no filter.
+
+    Raises ValueError on anything else rather than falling back to "all" -- a
+    typo that silently ran the whole 9-cell sweep would cost most of a day of
+    8-GPU time, which is exactly what this box exists to avoid.
+    """
+    picked = (raw or "").strip()
+    if not picked or picked.lower() == "all":
+        return None
+    out: set[int] = set()
+    for part in picked.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except ValueError:
+            raise ValueError(
+                f"agentic_concurrency: {part!r} is not a number -- expected "
+                f"'all', or a comma-separated list such as '48,64'"
+            ) from None
+    # A box holding only separators ("," / " , ") carries no selection.
+    return out or None
 
 
 def _emit(configs: list[dict]) -> None:
@@ -114,9 +145,11 @@ def main() -> int:
     # `param_lists` for that, so the filter never touches it.
     conc_filter = None
     if "aiperf_agentic" in bench_kinds:
-        picked = str(inputs.get("agentic_concurrency") or "all").strip()
-        if picked and picked != "all":
-            conc_filter = {int(c) for c in picked.split(",") if c.strip()}
+        try:
+            conc_filter = parse_conc_filter(inputs.get("agentic_concurrency"))
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
 
     configs = build_cell_configs(
         CATALOG,
@@ -126,13 +159,16 @@ def main() -> int:
         conc_filter=conc_filter,
     )
     if conc_filter and not configs:
-        # Every agentic concurrency sits inside exactly one variant's band, so
-        # an empty matrix here means the dropdown and the catalog disagree.
-        # Fail loudly: `has_cells=false` would just skip the run in silence.
+        # The box is free text, so this is usually a typo rather than catalog
+        # drift. Fail loudly and name what IS runnable: `has_cells=false` would
+        # just skip the run in silence and look like a passing dispatch.
+        available = sorted(
+            {c["conc"] for c in build_cells(CATALOG, bench_kind_filter=bench_kinds)}
+        )
         print(
-            f"ERROR: no agentic cells at concurrency {sorted(conc_filter)}; "
-            f"the dropdown in atom-benchmark.yaml and the scenario "
-            f"concurrency lists in {CATALOG} are out of sync.",
+            f"ERROR: no agentic cells at concurrency {sorted(conc_filter)}. "
+            f"Available in {CATALOG}: "
+            f"{','.join(str(c) for c in available)} (or 'all').",
             file=sys.stderr,
         )
         return 1
