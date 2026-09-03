@@ -838,6 +838,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         return StateTransfer.copy(layout_id)
 
+    def state_entry_views(self, slot: int) -> list[torch.Tensor]:
+        """One contiguous slice per plane: a V4 slot is one row per plane."""
+        # Reject a negative slot explicitly. Indexing a list with -1 silently
+        # returns the last slot's views rather than raising, so a stray -1 (the
+        # "no slot" sentinel used elsewhere on this path) would gather or scatter
+        # another request's state under this one's identity -- silent
+        # cross-request corruption. Fail loudly instead; the upstream invariant
+        # is that a real slot is always non-negative.
+        if slot < 0:
+            raise IndexError(f"state_entry_views: invalid negative slot {slot}")
+        return self._slot_views()[slot]
+
     def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
         """Relocate a request's whole Active Slot."""
         views = self._slot_views()
