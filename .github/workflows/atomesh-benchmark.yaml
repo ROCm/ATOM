@@ -714,9 +714,33 @@ jobs:
           cat /tmp/rdma-smoke-nic-priority.json
 
           target_pid=""
+          stop_target_process() {
+            local pid="${target_pid:-}"
+            local state=""
+            local attempt
+
+            [[ -n "${pid}" ]] || return 0
+            kill -TERM "${pid}" 2>/dev/null || true
+            for ((attempt = 0; attempt < 15; attempt++)); do
+              if ! kill -0 "${pid}" 2>/dev/null; then
+                break
+              fi
+              state="$(awk '{ print $3 }' "/proc/${pid}/stat" 2>/dev/null || true)"
+              [[ "${state}" == "Z" ]] && break
+              sleep 0.2
+            done
+
+            state="$(awk '{ print $3 }' "/proc/${pid}/stat" 2>/dev/null || true)"
+            if kill -0 "${pid}" 2>/dev/null && [[ "${state}" != "Z" ]]; then
+              echo "WARNING: RDMA target ${pid} did not exit after TERM; sending KILL" >&2
+              kill -KILL "${pid}" 2>/dev/null || true
+            fi
+            wait "${pid}" 2>/dev/null || true
+            target_pid=""
+          }
+
           cleanup_processes() {
-            [[ -z "${target_pid}" ]] || kill "${target_pid}" 2>/dev/null || true
-            [[ -z "${target_pid}" ]] || wait "${target_pid}" 2>/dev/null || true
+            stop_target_process
           }
           trap cleanup_processes EXIT HUP INT TERM
 
@@ -910,11 +934,9 @@ jobs:
                 exit 1
               fi
             else
-              echo "WARNING: RDMA data validation passed, but HCA affinity logging was unavailable for prefill GPU ${prefill_gpu_id}" >&2
+              echo "WARNING: RDMA WRITE completed, but HCA affinity logging was unavailable for prefill GPU ${prefill_gpu_id}" >&2
             fi
-            kill "${target_pid}" 2>/dev/null || true
-            wait "${target_pid}" 2>/dev/null || true
-            target_pid=""
+            stop_target_process
             echo "GPUDirect RDMA passed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id} via decode HCAs ${decode_device_csv}"
           done
           echo "Node-local GPUDirect RDMA passed for all four prefill/decode GPU pairs"
@@ -1025,6 +1047,9 @@ jobs:
               target_log="${SMOKE_RUN_DIR}/cross-node-prefill-${prefill_gpu_id}-decode-${decode_gpu_id}-target.log"
 
               if [[ "${SMOKE_RANK}" -eq 1 ]]; then
+                rm -f \
+                  "${ready_file}" "${ready_file}.tmp" \
+                  "${result_file}" "${result_file}.tmp"
                 echo "=== Cross-node decode target: ${local_ip}, GPU ${decode_gpu_id} (${decode_rdma_device}) ==="
                 HIP_VISIBLE_DEVICES="${decode_gpu_id}" \
                 "${validator_bin}" \
@@ -1046,9 +1071,7 @@ jobs:
 
                 wait_for_file "${result_file}" 150 "prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id} result"
                 result="$(<"${result_file}")"
-                kill "${target_pid}" 2>/dev/null || true
-                wait "${target_pid}" 2>/dev/null || true
-                target_pid=""
+                stop_target_process
                 if [[ "${result}" != "0" ]]; then
                   cat "${target_log}" >&2
                   echo "ERROR: cross-node GPUDirect RDMA failed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}" >&2
@@ -1105,7 +1128,7 @@ jobs:
                       result=1
                     fi
                   else
-                    echo "WARNING: cross-node RDMA data validation passed, but HCA affinity logging was unavailable from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}" >&2
+                    echo "WARNING: cross-node RDMA WRITE completed, but HCA affinity logging was unavailable from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}" >&2
                   fi
                 fi
                 echo "${result}" > "${result_file}.tmp"
