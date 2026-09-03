@@ -1247,16 +1247,21 @@ class BlockManager:
         return True
 
     def _tier_can_serve(self, hit_hash: int) -> bool:
-        """Whether the tier believes it holds `hit_hash`.
+        """Whether the tier could actually serve a load for `hit_hash`.
 
         Asked twice per admission -- once by `_attach_state_slots` to decide
         whether to try a load at all, and again inside `_request_state_load`.
-        One predicate so the two cannot drift.
+        Both, and `request_load` itself, go through `StateOffloadIndex.
+        could_serve`, so all three test the same capability+membership predicate
+        and cannot drift. A bare `hit_hash in hashes` here dropped the `can_load`
+        half: a store-only role (`kv_producer`) voted a hit it would then refuse,
+        the resumable scan stopped at the tier rung and skipped a still-resident
+        HBM rung, and the boundary was disowned into a full recompute.
         """
         return (
             hit_hash != -1
             and self.state_offload is not None
-            and hit_hash in self.state_offload.hashes
+            and self.state_offload.could_serve(hit_hash)
         )
 
     def _request_state_load(self, seq: Sequence, hit_hash: int) -> bool:

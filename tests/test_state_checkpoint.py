@@ -1400,6 +1400,9 @@ class TestPagedCopyCheckpoint:
             self.pending_loads = {}
             self.requested = []
 
+        def could_serve(self, h):
+            return h in self.hashes
+
         def request_load(self, req_id, h):
             if h not in self.hashes:
                 return False
@@ -3567,6 +3570,9 @@ class TestPagedAllocateAimsTheStateLegAtTheJointBoundary:
             self.requested = []
             self.can_store = True
             self.can_load = True
+
+        def could_serve(self, h):
+            return self.can_load and h in self.hashes
 
         def request_load(self, req_id, h):
             if h not in self.hashes:

@@ -102,6 +102,23 @@ class StateOffloadIndex:
         self.hashes.discard(h)
         self._hash_lru.pop(h, None)
 
+    def could_serve(self, h: int) -> bool:
+        """Whether a load for `h` could be offered at all: this tier can load
+        AND believes it holds `h`.
+
+        The membership+capability half of `request_load`'s guard (minus its
+        per-request in-flight check), factored out so the admission-path voters
+        -- `PageUnitCheckpointCoordinator._reachable` and
+        `BlockManager._tier_can_serve` -- test exactly what `request_load` will
+        accept and cannot drift from it. Mirroring only `h in hashes` there,
+        without `can_load`, made a `kv_producer` (can_load=False, but `hashes`
+        populated from its own stores) vote a tier hit it would then refuse: the
+        right-to-left resumable scan stopped at the tier rung, skipped a
+        still-resident HBM rung, and `request_load` returned False -- the
+        boundary disowned and the HBM checkpoint forfeited to a full recompute.
+        """
+        return self.can_load and h in self.hashes
+
     # -------------------------------- loads -------------------------------- #
     def request_load(self, req_id, h: int) -> bool:
         """Offer to fetch `h` back for `req_id`. False if this tier cannot.
@@ -110,11 +127,10 @@ class StateOffloadIndex:
         a worker report, so offering one for a hash never stored would park the
         request against bytes no `get` can produce.
         """
-        if not self.can_load:
-            # A store-only role. Voting for a hash whose load nothing will
-            # serve parks the request against a report that never comes.
-            return False
-        if h not in self.hashes:
+        if not self.could_serve(h):
+            # A store-only role (can_load False) or a hash never stored. Voting
+            # for either parks the request against a report that never comes;
+            # refuse so the boundary is disowned and recomputed.
             return False
         if req_id in self.pending_loads:
             # One request, one outstanding load: reports are keyed by request

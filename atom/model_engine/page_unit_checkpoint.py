@@ -807,10 +807,16 @@ class PagedStateCheckpointCoordinator:
         once", never "is still there". A false positive costs one park plus a
         recompute and retracts itself (`fail_load` -> `forget`); being certain
         would cost a synchronous cross-process lookup on the admission path.
+
+        The tier's half goes through `could_serve`, not a bare `h in hashes`, so
+        it also honours `can_load`: a store-only role (`kv_producer`) populates
+        `hashes` from its own stores but cannot load them back, and voting a hit
+        it would then refuse strands the scan at the tier rung -- skipping a
+        still-resident HBM rung -- and forfeits the checkpoint to a recompute.
         """
         if self.store.contains(h):
             return True
-        return self.offload is not None and h in self.offload.hashes
+        return self.offload is not None and self.offload.could_serve(h)
 
     def checkpoint(self, seq: Sequence, boundary_blocks: int, h: int) -> None:
         """File a boundary to be stored, keyed by hash rather than by seq.
