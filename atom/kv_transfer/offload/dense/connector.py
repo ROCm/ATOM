@@ -69,6 +69,13 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
     # producer semantic that would wrongly deallocate live offload blocks).
     # Executor plumbing + get_finished come from OffloadWorkerMixin.
 
+    # Whether a per-request recurrent-state tensor in the registered kv_caches is
+    # tolerated. The plain dense path has no rule keeping a restored KV prefix
+    # aligned with linear-attention state, so it must reject such a model
+    # (GDN: Qwen3-Next, Qwen3.5) and fail fast. A hybrid connector
+    # that owns a state tier (kimi_k3) overrides this to True.
+    _permit_per_request_state = False
+
     def __init__(self, config) -> None:
         self._config = config
         self._init_worker_common(config)  # kv_role, executors, lock, tallies
@@ -94,7 +101,11 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         # num_blocks is the physical block count (num_physical_kvcache_blocks),
         # threaded from the model runner. MLA stores its KV token-major, so the
         # codec can't infer the block count from tensor.shape[0]; pass it.
-        self._codec = DenseKVByteCodec(kv_caches, num_blocks=num_blocks)
+        self._codec = DenseKVByteCodec(
+            kv_caches,
+            num_blocks=num_blocks,
+            permit_per_request_state=self._permit_per_request_state,
+        )
         # Shared opaque-uint8 engine build; the chunked GPU connector needs
         # cfg.chunk_size, so it's built inside the factory once cfg exists.
         self._engine, cfg, meta = build_offload_engine(
@@ -346,6 +357,13 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         # prefix is stored to LMCache once prefill computes it
         # (seq.prefix_hashes_published flips True), chunk by chunk.
         self._save_tracker: dict[str, list] = {}
+        # Round-robin cursor over `_save_tracker`: the last sid that emitted a
+        # save. `build_connector_meta` resumes the save scan just after it so a
+        # bounded save queue (`_may_emit_save`) is shared fairly. Without it the
+        # scan always restarts at the insertion-ordered head, and a long
+        # multi-chunk request there re-wins the freed slot every step and
+        # starves later requests (their blocks stay pinned by should_defer_free).
+        self._save_rr_last: str | None = None
         # sid -> exact save generation.  Exact matching prevents a delayed TP
         # notification for an older request lifecycle from releasing the
         # current request's deferred blocks.
@@ -546,6 +564,15 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         adjusted = min(int(chunk), limit)
         return max(1, adjusted)
 
+    def _may_emit_save(self) -> bool:
+        """Seam for a subclass to bound how many saves may be outstanding.
+
+        Unbounded here. It matters for a layout whose `should_defer_free` pins
+        a finished request's blocks until its save drains -- an unbounded queue
+        then lets a slow backend hold an unbounded slice of the pool.
+        """
+        return True
+
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
         meta = LMCacheOffloadMetadata()
 
@@ -578,7 +605,7 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                 self._clear_pending_load(sid)
                 continue
             # num_cached after load = max(HBM, offload); never drop below HBM.
-            seq.offload_loaded_tokens = max(hbm, lmc)
+            seq.offload_loaded_tokens = self._claim_after_load(seq, hbm, lmc)
             # req_id MUST be the raw seq.id (the type the scheduler compares
             # against in _update_waiting_for_remote_kv); str(seq.id) is only for
             # LMCache's lookup/pin API. A str here silently never wakes the seq.
@@ -614,9 +641,19 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         # chunked prefill, seq.num_cached_tokens advances after each prefill
         # chunk's forward has completed; use it as the D2H-safe frontier.
         chunk = self.chunk_size or 256
-        for sid, entry in self._save_tracker.items():
+        # Round-robin start: resume just after the last sid we emitted a save
+        # for, so a bounded `_may_emit_save` queue is shared fairly instead of
+        # always favouring the insertion-ordered head (see `_save_rr_last`).
+        tracker_sids = list(self._save_tracker.keys())
+        if tracker_sids and self._save_rr_last in self._save_tracker:
+            start = (tracker_sids.index(self._save_rr_last) + 1) % len(tracker_sids)
+            tracker_sids = tracker_sids[start:] + tracker_sids[:start]
+        for sid in tracker_sids:
+            entry = self._save_tracker[sid]
             if not self._do_save:
                 continue
+            if not self._may_emit_save():
+                break
             seq, saved = entry
             if sid in self._reqs_need_recv or sid in loading_sids:
                 continue  # loading this step; defer its save
@@ -653,6 +690,7 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             )
             entry[1] = aligned
             self._save_inflight[sid] = save_operation
+            self._save_rr_last = sid
         dispatched = set(meta.lookup_requests_in_step)
         self._lookup_in_step = [
             sid for sid in self._lookup_in_step if sid not in dispatched
@@ -668,12 +706,22 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         sid = str(seq.id)
         return sid in self._save_inflight or self._has_pending_save(seq)
 
+    def release_stalled_save(self, seq) -> None:
+        """Drop bookkeeping for a stall-escaped save the scheduler is freeing.
+
+        No-op on dense: its `should_defer_free` has no stall escape, so a request
+        with a pending save always defers and is never preemptable. K3 overrides
+        this to pop its `_save_tracker`. Defined here so every offload impl
+        answers the scheduler's `release_stalled_save` forward uniformly.
+        """
+
     def has_pending_work(self) -> bool:
         """True while a load still needs dispatch or a save is unreported.
 
         Feeds ``EngineCore.has_pending_kv_work()``, so it reads only state
         that clears itself: ``_reqs_need_recv`` is emptied by every
-        ``build_connector_meta`` and ``_save_inflight`` by ``save_finished``.
+        ``build_connector_meta`` and ``_save_inflight`` by ``save_finished``
+        (or ``abandon_save`` when the scheduler reclaims a stalled save).
         Saves that are queued but not yet dispatched are covered there by the
         scheduler's ``deferred_free_blocks``, which ``should_defer_free``
         keeps populated for exactly those requests.
@@ -693,6 +741,29 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             return
         self._save_inflight.pop(sid, None)
         self._finish_save_statistics(req_id)
+
+    def abandon_save(self, req_id) -> None:
+        """Force-drop a save the scheduler reclaimed after it stalled.
+
+        `save_finished` is the completion path: it matches the exact
+        `SaveOperationId` and, handed a raw request id while an exact generation
+        is parked, deliberately refuses -- a delayed TP notification must not
+        complete a newer lifecycle. Reclamation is the opposite need. The
+        scheduler's `_reconcile_stalled_deferred_saves` has already freed the
+        blocks of a save the backend never reported (LMCache force-unpins a
+        stalled save without a completion) and holds only the raw request id, so
+        drop the entry unconditionally. Without this the entry lingers,
+        `should_defer_free` stays True and `has_pending_work` never clears, and
+        the engine busy-loops with every GPU idle. Not a completion: the bytes
+        were never persisted, so the statistics are *cancelled*, not finished,
+        and the tracker entry is dropped so the save loop cannot re-emit it
+        against freed blocks.
+        """
+        sid = str(req_id.req_id if isinstance(req_id, SaveOperationId) else req_id)
+        operation = self._save_inflight.pop(sid, None)
+        if operation is not None:
+            self._cancel_save_statistics(operation)
+        self._save_tracker.pop(sid, None)
 
     def load_failed(self, req_id) -> bool:
         sid = str(req_id.req_id if isinstance(req_id, LoadOperationId) else req_id)

@@ -3,6 +3,7 @@
 
 import array
 from collections.abc import Callable
+from dataclasses import dataclass
 from enum import Enum, auto
 from itertools import count
 from typing import Any
@@ -65,6 +66,61 @@ def get_exit_sequence():
     exit_seq = Sequence([-1], 1)
     exit_seq.status = SequenceStatus.EXIT_ENGINE
     return exit_seq
+
+
+@dataclass
+class OffloadJointRecord:
+    """The KV-transfer offload/joint-load protocol state for one sequence.
+
+    These six values were six flat attributes on `Sequence`, written from
+    `BlockManager` and `Scheduler` and read back by the offload connector, with
+    the joint subset re-initialised by hand in several places -- so a reset that
+    forgot one field left a stale span the connector would then act on. Grouped
+    here so the whole protocol state is one field (`Sequence.offload_joint`) and
+    the joint boundary has one place to be dropped from (`reset_joint`).
+    """
+
+    # Content hash of a checkpoint the tier was asked to fetch back into
+    # `state_slot`, or -1. Tells the scheduler to park, and tells the failure
+    # path that `num_cached_tokens` is claiming undelivered state.
+    load_hash: int = -1
+    # The LMCache-resident KV prefix in tokens, as this admission's lookup
+    # reported it -- the KV leg's ceiling. Written before `can_allocate`, which
+    # is where the two legs agree on one boundary. 0 = no lookup.
+    kv_prefix_tokens: int = 0
+    # The boundary both legs of a joint load are aimed at, or 0. Chosen by
+    # `can_allocate`: the rightmost checkpoint rung the LMCache KV prefix
+    # covers. `num_cached_tokens` stays at the HBM prefix until both legs
+    # report, which keeps the forward honest if either fails.
+    boundary_tokens: int = 0
+    # Content hash of that boundary's last block, for the state leg.
+    boundary_hash: int = -1
+    # How far the KV leg transfers, in tokens: the LMCache chunk that *covers*
+    # the boundary above, which is at or past it. The request still only claims
+    # the boundary -- see `_claim_after_load`.
+    kv_tokens: int = 0
+    # How far `allocate` claimed straight out of the HBM prefix cache, in
+    # tokens. Above `num_cached_tokens`, not below it: the blocks in
+    # `(hit, compressed_hit]` hold this prompt's KV and are still indexed --
+    # the state gate cut the hit, the KV never went anywhere. Claiming them is
+    # what keeps the KV leg from paying LMCache to resend what the pool already
+    # has, and it is where that leg starts.
+    claim_tokens: int = 0
+
+    def reset_joint(self) -> None:
+        """Drop the joint boundary and both of its transfer spans.
+
+        The four joint fields move together -- a boundary is meaningless
+        without the KV span aimed at it and the prefix claimed below it -- so
+        the sites that abandon a joint load in full clear them through here
+        rather than by hand. Leaves `load_hash` and `kv_prefix_tokens`
+        untouched: they are set on their own paths and are not part of the
+        boundary this drops.
+        """
+        self.boundary_tokens = 0
+        self.boundary_hash = -1
+        self.kv_tokens = 0
+        self.claim_tokens = 0
 
 
 class Sequence:
@@ -207,6 +263,10 @@ class Sequence:
         # forward. -1 = read and write the same slot, the case for every step in
         # between. Always a single slot: a checkpoint is one slot wide.
         self.state_fork_src = -1
+        # The KV-transfer offload/joint-load protocol state -- six values that
+        # move together through admission and load. Grouped so a joint reset
+        # cannot forget a field; see `OffloadJointRecord`.
+        self.offload_joint = OffloadJointRecord()
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p

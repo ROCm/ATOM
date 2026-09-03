@@ -633,3 +633,17 @@ def __getattr__(name: str):
 #   FLA_TRIL_PRECISION             — FLA ops library
 # VLLM_PP_LAYER_PARTITION         — vLLM legacy (still active in models/utils.py)
 # VLLM_USE_MODELSCOPE             — vLLM legacy (benchmarks)
+# LMCACHE_EC_PIN_TIMEOUT_SEC      — LMCache library's own source-pin timeout;
+#                                   read in kv_transfer/offload/_offload_common.py
+#                                   (offload_save_abandon_timeout_s) to derive the
+#                                   engine's save-abandon window from it, so the
+#                                   two stay ordered. The scheduler never reads the
+#                                   env itself -- it asks the connector, via
+#                                   save_abandon_timeout_s. ATOM does not own the
+#                                   knob, hence no default of its own here.
+# OFFLOAD_MAX_PENDING_SAVES       — offload connector queue-depth bound;
+#                                   defined/defaulted in
+#                                   kv_transfer/offload/_offload_common.py and
+#                                   documented in kv_transfer/offload/README.md.
+#                                   The state tier shares it (scheduler.py)
+#                                   rather than adding a second knob.

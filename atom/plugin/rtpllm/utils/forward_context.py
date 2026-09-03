@@ -1450,6 +1450,9 @@ class RTPForwardContext:
                 v_cache=ssm_state,
                 k_scale=None,
                 v_scale=None,
+                # Slot-addressed recurrent state, not paged KV -- see
+                # `KVCacheTensor.per_request_state`.
+                per_request_state=True,
             )
 
         # Build full-attn cache references from RTP LayerKVCache.
