@@ -204,7 +204,7 @@ docker run -dt --device=/dev/kfd ${DEVICE_FLAG} \
   --name "${CONTAINER_NAME}" \
   "${OOT_IMAGE_TAG}"
 
-bash .github/scripts/gpu_preflight_check.sh "${CONTAINER_NAME}" docker
+GPU_PREFLIGHT_KILL_DOCKER=1 bash .github/scripts/gpu_preflight_check.sh "${CONTAINER_NAME}" docker
 
 model_dir="/models/${MODEL_PATH}"
 if [[ -n "${MODEL_CACHE_MOUNT}" ]]; then
