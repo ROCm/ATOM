@@ -694,7 +694,7 @@ def get_published_dcp_local_context_lens(
     eager execution may score only the scheduled rows. The real requests are
     always the prefix and the producer zero-fills the padded tail.
     """
-    local_ctx = attn_metadata.dcp_local_context_lens
+    local_ctx = getattr(attn_metadata, "dcp_local_context_lens", None)
     if local_ctx is None or local_ctx.shape[0] < num_rows:
         return None
     if local_ctx.shape[0] == num_rows:

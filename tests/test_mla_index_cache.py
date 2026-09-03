@@ -163,11 +163,13 @@ def _builder(
             ),
         ),
         block_size=16,
+        aligned_index_dim=((index_head_dim + 4 + 15) // 16) * 16,
         is_deepseek_v32=True,
         _get_total_num_layers=lambda: total_local_layers,
     )
     builder = object.__new__(AiterMLAMetadataBuilder)
     builder.model_runner = runner
+    builder.dcp_world_size = 1
     return builder, runner
 
 
@@ -469,6 +471,8 @@ def _capture_metadata_builder(dcp_world_size, *, is_sparse):
     builder._tbo_full_running_bs = 0
     builder.dtype_q = None
     builder.set_mla_persistent_worker_buffers = lambda *args, **kwargs: {}
+    if is_sparse and dcp_world_size > 1:
+        builder._token_to_seq_idxs_gpu = torch.zeros(bs, dtype=torch.int32)
     return builder, var
 
 

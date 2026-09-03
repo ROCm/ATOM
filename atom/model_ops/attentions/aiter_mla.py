@@ -2367,6 +2367,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.sparse_kv_last_page_lens = var[
                 "sparse_kv_last_page_lens"
             ].gpu[:running_bs]
+            if self.dcp_world_size > 1:
+                # One token per request makes the filter's token -> request map
+                # the identity; it must still exist, since MTP shares the filter.
+                self._token_to_seq_idxs_gpu[:running_bs] = torch.arange(
+                    running_bs, dtype=torch.int32, device=self.device
+                )
+                attn_metadata.token_to_seq_idxs = self._token_to_seq_idxs_gpu[
+                    :running_bs
+                ]
 
         # running_bs, not scheduled_bs: the padded rows have to be split into the
         # ubatches too, or accuracy drifts.
@@ -2660,7 +2669,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 "sparse_kv_last_page_lens"
             ].gpu[:sum_tokens]
             self._token_to_seq_idxs_gpu[:sum_tokens] = torch.arange(
-                bs, dtype=torch.int32, device=self.device
+                bs,
+                dtype=torch.int32,
+                device=self._token_to_seq_idxs_gpu.device,
             ).repeat_interleave(max_q_len)
             attn_matadata.token_to_seq_idxs = self._token_to_seq_idxs_gpu[:sum_tokens]
         elif self.is_sparse:
@@ -2669,6 +2680,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_matadata.sparse_kv_last_page_lens = var[
                 "sparse_kv_last_page_lens"
             ].gpu[:bs]
+            if self.dcp_world_size > 1:
+                # Same identity map prepare_decode builds; the captured graph
+                # needs the buffer to exist.
+                self._token_to_seq_idxs_gpu[:bs] = torch.arange(
+                    bs,
+                    dtype=torch.int32,
+                    device=self._token_to_seq_idxs_gpu.device,
+                )
+                attn_matadata.token_to_seq_idxs = self._token_to_seq_idxs_gpu[:bs]
         positions = var["positions"].copy_to_gpu(sum_tokens)
         context = Context(
             positions=positions,

@@ -90,6 +90,9 @@ from atom.model_ops.attention_mla import (
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.dcp_ops import (
     dcp_decode_candidate_exchange_fused,
+    dcp_decode_candidate_exchange_mtp,
+    fused_dcp_topk_merge_available,
+    triton_filter_and_convert_dcp_index,
     triton_filter_and_convert_dcp_index_prefill,
 )
 from atom.model_ops.embed_head import (
@@ -1663,29 +1666,60 @@ def sparse_attn_indexer(
         dcp_world_size = get_dcp_world_size()
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
         if dcp_world_size > 1:
-            # The fused exchange scores this rank's own shard and writes the KV
-            # slots it owns -- ownership filter, slot localize and compaction all
-            # inside the op -- straight into sparse_kv_indices_buffer and
-            # dcp_sparse_kv_indptr_buffer. So there is no global logits plane
-            # left to rank and no topk_indices left to convert: everything the
-            # non-DCP path does below has already happened, and we return here.
-            dcp_decode_candidate_exchange_fused(
+            dcp_rank = get_dcp_rank()
+            if next_n == 1 and fused_dcp_topk_merge_available():
+                # Keep main's fused qlen=1 path when aiter has it: scores only,
+                # compacted physical slots emitted in the same op.
+                dcp_decode_candidate_exchange_fused(
+                    attn_metadata,
+                    padded_q_fp8_decode_tokens,
+                    kv_cache,
+                    weights,
+                    dcp_rank,
+                    num_decode_tokens,
+                    topk_tokens,
+                    max_model_len,
+                    runner_block_size,
+                    stable_topk,
+                    cp_kv_cache_interleave_size,
+                    out_kv_indices=sparse_kv_indices_buffer,
+                    out_kv_indptr=dcp_sparse_kv_indptr_buffer,
+                    owned_counts=dcp_owned_counts_buffer,
+                )
+                return weights
+
+            # MTP verify, or qlen=1 on an aiter without flydsl_dcp_topk_merge:
+            # reconstruct global candidates, then compact rank-owned slots.
+            dcp_decode_candidate_exchange_mtp(
                 attn_metadata,
                 padded_q_fp8_decode_tokens,
                 kv_cache,
                 weights,
-                get_dcp_rank(),
+                topk_indices,
+                dcp_rank,
                 num_decode_tokens,
                 topk_tokens,
                 max_model_len,
                 runner_block_size,
                 stable_topk,
                 cp_kv_cache_interleave_size,
-                out_kv_indices=sparse_kv_indices_buffer,
+            )
+            triton_filter_and_convert_dcp_index(
+                attn_metadata.token_to_seq_idxs,
+                num_decode_tokens,
+                attn_metadata.block_tables,
+                topk_indices,
+                dcp_rank,
+                dcp_world_size,
+                runner_block_size,
                 out_kv_indptr=dcp_sparse_kv_indptr_buffer,
                 owned_counts=dcp_owned_counts_buffer,
+                NUM_TOPK_TOKENS=topk_tokens,
+                out=sparse_kv_indices_buffer,
+                cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
             )
             return weights
+
         # Non-DCP: this rank holds the whole plane, so its top-k is already the
         # global one.
         logits = torch.empty(
