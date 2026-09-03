@@ -38,6 +38,24 @@ on:
         required: false
         default: ''
         type: string
+      rdma_smoke_node_count:
+        description: 'Number of Slurm nodes for the Mooncake RDMA smoke test'
+        required: false
+        default: '2'
+        type: choice
+        options:
+          - '1'
+          - '2'
+      rdma_smoke_decode_hca_mode:
+        description: 'Decode HCA registration mode for cross-rail RDMA diagnosis'
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - local
+          - peer
+          - local-peer
       run_all_models:
         description: 'Run all models from models_atomesh.yaml'
         required: false
@@ -426,6 +444,8 @@ jobs:
     env:
       RDMA_SMOKE_IMAGE: ${{ needs.load-config.outputs.image }}
       RDMA_SMOKE_NODES: ${{ inputs.rdma_smoke_nodes }}
+      RDMA_SMOKE_NODE_COUNT: ${{ inputs.rdma_smoke_node_count }}
+      RDMA_SMOKE_DECODE_HCA_MODE: ${{ inputs.rdma_smoke_decode_hca_mode }}
       SLURM_SUBMIT_RUNNER: ${{ inputs.atomesh_slurm_submit_runner }}
     steps:
       - name: Checkout repository
@@ -443,7 +463,7 @@ jobs:
 
           nodes="${RDMA_SMOKE_NODES:-${ATOMESH_1P1D_NODES:-}}"
           nodes="${nodes// /}"
-          RDMA_SMOKE_TARGET_NODE_COUNT=2
+          RDMA_SMOKE_TARGET_NODE_COUNT="${RDMA_SMOKE_NODE_COUNT:-2}"
           USES_SPUR_CONTROLLER=0
           SPUR_CONTROLLER_ADDR=""
           SPUR_ACCOUNTING_ADDR=""
@@ -551,6 +571,7 @@ jobs:
             -e MC_ENABLE_DEST_DEVICE_AFFINITY=1
             -e SMOKE_RANK="${rank}"
             -e SMOKE_NODE_COUNT="${RDMA_SMOKE_NODE_COUNT}"
+            -e SMOKE_DECODE_HCA_MODE="${RDMA_SMOKE_DECODE_HCA_MODE}"
             -e SMOKE_RUN_DIR=/rdma-smoke-shared
             -v "${RDMA_SMOKE_RUN_DIR}:/rdma-smoke-shared"
           )
@@ -720,7 +741,7 @@ jobs:
 
           HCA_COUNT=8
 
-          select_ib_devices_for_gpu() {
+          select_all_ib_devices_for_gpu() {
             local phys_idx="$1"
             local primary="${rdma_devices[phys_idx]}"
             local -a selected=("${primary}")
@@ -734,6 +755,46 @@ jobs:
               selected+=("${device}")
             done
             (IFS=,; echo "${selected[*]}")
+          }
+
+          select_decode_ib_devices() {
+            local prefill_idx="$1"
+            local decode_idx="$2"
+            local prefill_device="${rdma_devices[prefill_idx]}"
+            local decode_device="${rdma_devices[decode_idx]}"
+
+            case "${SMOKE_DECODE_HCA_MODE}" in
+              local)
+                echo "${decode_device}"
+                ;;
+              peer)
+                echo "${prefill_device}"
+                ;;
+              local-peer)
+                if [[ "${decode_device}" == "${prefill_device}" ]]; then
+                  echo "${decode_device}"
+                else
+                  echo "${decode_device},${prefill_device}"
+                fi
+                ;;
+              all)
+                select_all_ib_devices_for_gpu "${decode_idx}"
+                ;;
+              *)
+                echo "ERROR: unsupported SMOKE_DECODE_HCA_MODE=${SMOKE_DECODE_HCA_MODE}" >&2
+                return 1
+                ;;
+            esac
+          }
+
+          expected_decode_peer_device() {
+            local prefill_idx="$1"
+            local decode_idx="$2"
+            if [[ "${SMOKE_DECODE_HCA_MODE}" == "local" ]]; then
+              echo "${rdma_devices[decode_idx]}"
+            else
+              echo "${rdma_devices[prefill_idx]}"
+            fi
           }
 
           write_cuda0_nic_matrix() {
@@ -752,13 +813,12 @@ jobs:
           PY
           }
 
-          # Mirror ATOM mooncake_connector ib_enable_alternate_hca + ib_hca_count:
-          # register decode VRAM on the local HCA first, then all reachable HCAs.
+          echo "Decode HCA diagnostic mode: ${SMOKE_DECODE_HCA_MODE}"
           for ((prefill_gpu_id = 0; prefill_gpu_id < 4; prefill_gpu_id++)); do
             decode_gpu_id=$((prefill_gpu_id + 4))
             prefill_rdma_device="${rdma_devices[prefill_gpu_id]}"
             decode_rdma_device="${rdma_devices[decode_gpu_id]}"
-            decode_device_csv="$(select_ib_devices_for_gpu "${decode_gpu_id}")"
+            decode_device_csv="$(select_decode_ib_devices "${prefill_gpu_id}" "${decode_gpu_id}")"
             prefill_matrix="/tmp/gdr-smoke-prefill-gpu-${prefill_gpu_id}-nic-priority.json"
             decode_matrix="/tmp/gdr-smoke-decode-gpu-${decode_gpu_id}-nic-priority.json"
             write_cuda0_nic_matrix "${prefill_matrix}" "${prefill_rdma_device}"
@@ -815,7 +875,8 @@ jobs:
               echo "ERROR: GPUDirect RDMA data validation failed from prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) to decode GPU ${decode_gpu_id} (${decode_device_csv})" >&2
               exit 1
             fi
-            expected_affinity="local_device_name=${prefill_rdma_device}, peer_device_name=${prefill_rdma_device}"
+            expected_peer_device="$(expected_decode_peer_device "${prefill_gpu_id}" "${decode_gpu_id}")"
+            expected_affinity="local_device_name=${prefill_rdma_device}, peer_device_name=${expected_peer_device}"
             if grep -Fq "RDMA slice affinity:" "${initiator_log}"; then
               if ! grep -Fq "${expected_affinity}" "${initiator_log}"; then
                 grep -F "RDMA slice affinity:" "${initiator_log}" >&2 || true
@@ -914,8 +975,8 @@ jobs:
               expected_peer_device="${decode_rdma_device}"
               is_cross_rail=0
               if [[ "${prefill_gpu_id}" -ne "${decode_gpu_id}" ]]; then
-                decode_device_csv="$(select_ib_devices_for_gpu "${decode_gpu_id}")"
-                expected_peer_device="${prefill_rdma_device}"
+                decode_device_csv="$(select_decode_ib_devices "${prefill_gpu_id}" "${decode_gpu_id}")"
+                expected_peer_device="$(expected_decode_peer_device "${prefill_gpu_id}" "${decode_gpu_id}")"
                 is_cross_rail=1
               fi
               echo "=== Cross-node RDMA pair: prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) -> decode GPU ${decode_gpu_id} (${decode_device_csv}); expected peer HCA ${expected_peer_device} ==="
