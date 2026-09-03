@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 from aiter.dist.communication_op import tensor_model_parallel_all_gather
@@ -174,7 +173,10 @@ class VocabParallelEmbedding(nn.Module):
             )
             y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
         else:
-            y = F.embedding(x, self.weight)
+            # Not F.embedding: async scheduling can pass the -1 spec
+            # placeholder, which reads below the table and GPU-faults.
+            # replicated_embedding returns zeros out of range.
+            y = replicated_embedding(x, self.weight)
         return y
         # if self.tp_size > 1:
         #     mask = torch.logical_and(x >= self.vocab_start_idx, x < self.vocab_end_idx)
@@ -222,6 +224,23 @@ class ReplicatedEmbedding(nn.Module):
         return replicated_embedding(x, self.weight)
 
 
+class _UnquantizedHeadMethod:
+    """``QuantizeMethodBase``-shaped shim so vLLM's ``LogitsProcessor`` can drive
+    an ATOM head (EAGLE3/DSpark share the target's ``lm_head`` with the draft).
+
+    ``apply`` is the LOCAL shard GEMM only: vLLM's ``_apply_head`` does its own
+    TP gather, and ``ParallelLMHead.forward`` would double-gather.
+    """
+
+    @staticmethod
+    def apply(
+        layer: nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return tgemm.mm(x, layer.weight, layer.bias if bias is None else bias)
+
+
 class ParallelLMHead(VocabParallelEmbedding):
 
     def __init__(
@@ -232,6 +251,8 @@ class ParallelLMHead(VocabParallelEmbedding):
         **kwargs,
     ):
         super().__init__(num_embeddings, embedding_dim)
+        # Plain object, so nn.Module keeps it in __dict__, not as a submodule.
+        self.quant_method = _UnquantizedHeadMethod()
         if bias:
             self.bias = atom_parameter(
                 torch.empty(self.num_embeddings_per_partition),
