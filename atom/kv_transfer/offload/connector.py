@@ -90,7 +90,7 @@ class LMCacheOffloadConnector(KVConnectorBase):
     def _state_tier(self):
         """Expose the implementation's KDA state tier through the shell.
 
-        `MultiConnector._adopt_state_tier` probes `_state_tier` on each
+        `MultiConnector._refuse_two_state_tiers` probes `_state_tier` on each
         sub-connector to find the one offload backend that built a state tier.
         Under the `multi` shell the sub IS this object, not the `kimi_k3` impl
         behind `_impl`, so without this forwarder the probe reads None on every

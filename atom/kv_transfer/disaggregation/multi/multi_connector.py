@@ -38,11 +38,11 @@ Merge strategy mirrors vLLM's ``MultiConnector``, adapted to ATOM's
   index in ``start_load_kv``.
 * ``get_finished`` — union the completion sets, **but** see the send/save
   pairing below.
-* ``_state_tier`` — the state offload tier, if a sub built one, re-exposed on
-  the composite by ``_adopt_state_tier`` at ``register_kv_caches`` time (which
-  also refuses a config that lists two offload subs). Mirroring the sub's tier
-  on the composite keeps the attribute defined, so a probe for it resolves to
-  the real tier instead of raising ``AttributeError``.
+* ``_refuse_two_state_tiers`` — run at ``register_kv_caches`` time. It owns no
+  tier of its own; each sub keeps and uses its own, because ``start_load_kv``
+  fans each sub its own metadata. All this does is refuse a config that lists
+  two offload subs, which would leave a hash reported indexed by one tier and
+  fetched from another.
 
 Send/save pairing (the one tricky correctness point)
 ----------------------------------------------------
@@ -242,11 +242,6 @@ class MultiConnector(KVConnectorBase):
         self._pending_save_ops: dict[str, set[SaveCompletionId]] = {}
         self._sent: dict[str, Any] = {}
         self._saved: dict[str, set[SaveCompletionId]] = {}
-        # The state tier of whichever sub owns one. Adopted in
-        # `register_kv_caches` via `_adopt_state_tier`; set to None here so the
-        # attribute exists before the subs register -- a probe for it must
-        # resolve, not raise `AttributeError`.
-        self._state_tier = None
 
     @property
     def _pairs_send_and_save(self) -> bool:
@@ -266,10 +261,10 @@ class MultiConnector(KVConnectorBase):
     ) -> None:
         for c in self._connectors:
             c.register_kv_caches(kv_caches, transfer_tensors, num_blocks)
-        self._adopt_state_tier()
+        self._refuse_two_state_tiers()
 
-    def _adopt_state_tier(self) -> None:
-        """Take over the one sub-connector's state tier, or refuse two.
+    def _refuse_two_state_tiers(self) -> None:
+        """Refuse a config whose sub-connectors built more than one state tier.
 
         Nothing in ``_build_subconnectors`` stops a config from listing
         ``lmcache_offload`` twice, which would leave two live tiers and no
@@ -288,7 +283,6 @@ class MultiConnector(KVConnectorBase):
                 f"offload tier ({names}); exactly one may. List the offload "
                 "backend once in kv_transfer_config.connectors."
             )
-        self._state_tier = tiers[0]._state_tier if tiers else None
 
     def start_load_kv(self, metadata: ConnectorMetadata) -> None:
         metas = getattr(metadata, "metas", None)
@@ -398,8 +392,8 @@ class MultiConnector(KVConnectorBase):
 
         `ModelRunner.exit()` resolves `getattr(connector, "close", None)` on the
         composite under `multi`; without this forwarder it returns None and no
-        sub is joined -- the offload sub's non-daemon `lmc-state-store` /
-        `lmc-state-load` / `offload-save` threads keep copying out of the KV pool
+        sub is joined -- the offload sub's non-daemon `lmc-state-store` and
+        `offload-save` threads keep copying out of the KV pool
         that `destroy_dist_env()` is about to release. Guard per sub (`getattr`):
         a producer sub such as moriio need not implement `close`.
         """
@@ -596,7 +590,7 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         "enqueue_state_stores")` misses on the shell, so it takes the "did not
         carry" branch and releases each store's PAGE units *before* the D2H --
         the CPU tier can never fill under `kv_connector: multi`, even with an
-        offload sub-connector configured. `_adopt_state_tier` already guarantees
+        offload sub-connector configured. `_refuse_two_state_tiers` guarantees
         at most one tier, so "first" is "only" here too.
 
         Select by `has_state_tier`, not method presence -- see
