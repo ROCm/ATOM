@@ -111,9 +111,10 @@ class TestEverythingThatMovesAByteMovesTheId:
         assert layout_of() != layout_of(dt_k=torch.float16)
 
     def test_the_ssm_dtype(self):
-        """The fp32 v side is the reason a PAGE copy round-trips exactly. A
-        build that narrowed it must not read this one's images."""
+        """The v side is `ATOM_KDA_SSM_DTYPE`. fp16 and bf16 are the same size,
+        so the id is the only thing telling those two apart."""
         assert layout_of() != layout_of(dt_v=torch.bfloat16)
+        assert layout_of(dt_v=torch.float16) != layout_of(dt_v=torch.bfloat16)
 
     def test_the_layer_count(self):
         assert layout_of() != layout_of(layers=68)

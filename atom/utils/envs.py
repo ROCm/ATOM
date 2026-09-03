@@ -249,6 +249,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # serial one at verify windows >= ~12 tokens (measured on gfx950), so
     # "auto" keeps practical MTP windows on the serial route.
     "ATOM_REPLAYSSM_ROUTE": lambda: os.getenv("ATOM_REPLAYSSM_ROUTE", "auto").lower(),
+    # "fp32" | "fp16" | "bf16".  Storage dtype of the KDA temporal state pool,
+    # whose per-token traffic dominates KDA decode; the recurrence itself
+    # always accumulates in fp32.  fp16 over bf16 when narrowing: the state is
+    # O(1), so bf16's range buys nothing and its short mantissa costs accuracy.
+    "ATOM_KDA_SSM_DTYPE": lambda: os.getenv("ATOM_KDA_SSM_DTYPE", "fp32").lower(),
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT": lambda: (
         os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT", "1") == "1"
     ),
