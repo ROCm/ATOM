@@ -13,6 +13,7 @@ GLM52_DSA_MODEL_TYPE = "glm_moe_dsa"
 MODEL_TYPE_ADAPTER_ARCHES = {
     GLM52_DSA_MODEL_TYPE: GLM52_DSA_ARCH,
     "deepseek_v4": "DeepseekV4ForCausalLM",
+    "deepseek_v4_mtp": "DeepseekV4ForCausalLM",
     "kimi_k3": "KimiK3ForConditionalGeneration",
     "minimax_m3": "MiniMaxM3SparseForCausalLM",
     "minimax_m3_vl": "MiniMaxM3SparseForConditionalGeneration",
@@ -464,6 +465,14 @@ MODEL_ADAPTER_SPECS = {
         prepare_config=_prepare_minimax_m2_config,
     ),
     "DeepseekV4ForCausalLM": SGLangModelAdapterSpec(
+        install_adapters=_install_deepseek_v4_adapters,
+        bind_cache_views=_bind_deepseek_v4_cache_views,
+        build_forward_metadata=_build_deepseek_v4_forward_metadata,
+    ),
+    # SGLang rewrites the draft runner to this architecture.  V4 HF configs also
+    # report model_type deepseek_v3, so exact-arch lookup must not fall through
+    # to generic metadata (native attention needs state_slot_in).
+    "DeepseekV4ForCausalLMNextN": SGLangModelAdapterSpec(
         install_adapters=_install_deepseek_v4_adapters,
         bind_cache_views=_bind_deepseek_v4_cache_views,
         build_forward_metadata=_build_deepseek_v4_forward_metadata,
