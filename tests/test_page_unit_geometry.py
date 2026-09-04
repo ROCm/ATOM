@@ -24,6 +24,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
 from atom.model_ops.attentions.pool_layout.page_unit_geometry import (
     PageUnitGeometryMixin,
 )
