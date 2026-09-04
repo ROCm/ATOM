@@ -24,10 +24,8 @@ from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import SubPoolSpec
-from atom.model_ops.attentions.token_layout.prefill import (
-    prefill_positions,
-    prefill_slot_mapping,
-)
+from atom.model_ops.attentions.token_layout.prefill import prefill_positions
+from atom.model_ops.attentions.token_layout.slots import slot_mapping
 from atom.model_ops.dcp_ops import dcp_prefill_slot_mapping
 from atom.utils import CpuGpuBuffer, pack_rows
 from atom.utils.forward_context import AttentionMetaData, AttnState, ForwardMode
@@ -437,8 +435,8 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         if not getattr(self.model_runner, "use_mrope", False):
             return None
 
-        total_tokens = batch.total_tokens_num_prefill
-        positions = self._mrope_cpu_view(total_tokens)
+        scheduled_tokens = batch.total_tokens_num_prefill
+        positions = self._mrope_cpu_view(scheduled_tokens)
         offset = 0
         for req_id, seqlen, cached_seqlen in zip(
             batch.req_ids, batch.context_lens, batch.num_cached_tokens
@@ -455,7 +453,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
                 ]
             offset += num_tokens
 
-        return self._copy_mrope_to_gpu(total_tokens)
+        return self._copy_mrope_to_gpu(scheduled_tokens)
 
     def _build_mrope_decode_positions(
         self,
@@ -466,8 +464,8 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         if not getattr(self.model_runner, "use_mrope", False):
             return None
 
-        total_tokens = batch.total_tokens_num_decode
-        positions = self._mrope_cpu_view(total_tokens)
+        scheduled_tokens = batch.total_tokens_num_decode
+        positions = self._mrope_cpu_view(scheduled_tokens)
         offset = 0
         for req_id, context_len in zip(batch.req_ids, context_lens):
             start = int(context_len) - max_seqlen_q
@@ -480,7 +478,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             positions[:, offset : offset + max_seqlen_q] = base[None, :]
             offset += max_seqlen_q
 
-        return self._copy_mrope_to_gpu(total_tokens)
+        return self._copy_mrope_to_gpu(scheduled_tokens)
 
     def publish_cu_seqlens_q(
         self, batch: ScheduledBatch, forward_mode: ForwardMode
@@ -590,7 +588,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             )
             slots[:] = dcp_slots
             return
-        prefill_slot_mapping(
+        slot_mapping(
             positions,
             seqlens_q,
             var["block_tables"].np,
@@ -603,7 +601,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         self,
         scheduled_bs: int,
         running_bs: int,
-        sum_scheduled_tokens: int,
+        scheduled_tokens: int,
         has_cached: bool,
         cached_lens: np.ndarray,
     ) -> dict:
@@ -618,7 +616,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         var = self.model_runner.forward_vars
         vars_used = [
             ("cu_seqlens_k", running_bs + 1),
-            ("slot_mapping", sum_scheduled_tokens),
+            ("slot_mapping", scheduled_tokens),
             ("context_lens", running_bs),
         ]
         if has_cached:
@@ -638,7 +636,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
 
     def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
         scheduled_bs = batch.total_seqs_num_prefill
-        sum_scheduled_tokens = batch.total_tokens_num_prefill
+        scheduled_tokens = batch.total_tokens_num_prefill
         var = self.model_runner.forward_vars
 
         # The cached prefix is subtracted out of the two arrays this step
@@ -656,9 +654,9 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         # `seq.num_tokens` for a DECODE one (`scheduler.py`), so a decode row
         # among the first `scheduled_bs` shows up here elementwise even in the
         # cases where the totals still happen to agree.
-        assert cu_seqlens_q[scheduled_bs] == sum_scheduled_tokens, (
+        assert cu_seqlens_q[scheduled_bs] == scheduled_tokens, (
             f"published cu_seqlens_q ends at {cu_seqlens_q[scheduled_bs]}, not the "
-            f"{sum_scheduled_tokens} tokens scheduled for prefill: the batch's "
+            f"{scheduled_tokens} tokens scheduled for prefill: the batch's "
             f"first {scheduled_bs} rows are not its prefill rows"
         )
         # `.tolist()` against the list, not `np.array_equal` against it: the
@@ -678,18 +676,18 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             context_lens, scheduled_bs, running_bs
         )
         positions = prefill_positions(
-            self.model_runner.arange_np[:sum_scheduled_tokens],
+            self.model_runner.arange_np[:scheduled_tokens],
             cached_lens,
             cu_seqlens_q,
             seqlens_q,
-            out=var["positions"].np[:sum_scheduled_tokens],
+            out=var["positions"].np[:scheduled_tokens],
         )
         self._write_prefill_slots(
             batch, scheduled_bs, positions, seqlens_q, cached_lens, context_lens
         )
 
         ctx = self._upload_prefill_mirrors(
-            scheduled_bs, running_bs, sum_scheduled_tokens, has_cached, cached_lens
+            scheduled_bs, running_bs, scheduled_tokens, has_cached, cached_lens
         )
         attn_metadata = AttentionMetaData(
             # Cast to python int — numpy.int32 leaks in via batch.context_lens
@@ -708,7 +706,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         if mrope_positions is not None:
             positions = mrope_positions
         else:
-            positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
+            positions = var["positions"].copy_to_gpu(scheduled_tokens)
 
         return attn_metadata, positions
 

@@ -9,12 +9,17 @@ under test reads the left-aligned 2-D buffer `prepare_block_tables` packs and
 derives every token's slot from its position. Same answers or the vectorization
 is wrong.
 
-No GPU, no AITER: the module is numpy-only and loaded by path, so this never
+`token_layout/slots.py` is exercised here too, on prefill-shaped inputs -- the
+ragged axes and cached prefixes below are what make its edge cases, and it is
+one function serving both sides rather than a prefill one. Its decode-shaped
+cases are in `test_decode_token_layout.py`.
+
+No GPU, no AITER: both modules are numpy-only and loaded by path, so this never
 triggers `atom.model_ops.__init__`.
 
 Correctness only. The speedup table that motivated the vectorization is a
 reporting tool, not a test, and lives in
-`/app/logs_claude/prefill_token_layout_perf.py`; what stays here is the one
+`/app/logs_claude/tool/prefill_token_layout_perf.py`; what stays here is the one
 regression guard, and it alternates its arms -- see its own comment for why
 that is not optional.
 """
@@ -26,15 +31,23 @@ import pathlib
 import numpy as np
 import pytest
 
-_PATH = (
+_DIR = (
     pathlib.Path(__file__).resolve().parent.parent
-    / "atom/model_ops/attentions/token_layout/prefill.py"
+    / "atom/model_ops/attentions/token_layout"
 )
-_spec = importlib.util.spec_from_file_location("_prefill_under_test", _PATH)
-_mod = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_mod)
-prefill_positions = _mod.prefill_positions
-prefill_slot_mapping = _mod.prefill_slot_mapping
+
+
+def _load(name):
+    spec = importlib.util.spec_from_file_location(
+        f"_{name}_under_test", _DIR / f"{name}.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+prefill_positions = _load("prefill").prefill_positions
+slot_mapping = _load("slots").slot_mapping
 
 BLOCK_SIZE = 16
 B = BLOCK_SIZE
@@ -169,7 +182,7 @@ def test_slot_mapping_matches_the_per_block_loop(ctx, cached, extra):
     _, seqlens_q, cached_lens, cu_q, offsets = step_inputs(ctx, cached)
     positions = prefill_positions(offsets, cached_lens, cu_q, seqlens_q)
     tables = tables_for(ctx, extra_rows=extra)
-    got = prefill_slot_mapping(positions, seqlens_q, packed(tables, len(ctx)), B)
+    got = slot_mapping(positions, seqlens_q, packed(tables, len(ctx)), B)
     assert got.shape[0] == offsets.shape[0]
     assert np.array_equal(got, ref_slot_mapping(ctx, cached, tables, B))
 
@@ -193,9 +206,7 @@ def test_slot_mapping_written_into_a_caller_buffer():
     positions = prefill_positions(offsets, cached_lens, cu_q, seqlens_q)
     tables = tables_for(ctx)
     dst = np.full(offsets.shape[0] + 4, -7, dtype=np.int64)
-    got = prefill_slot_mapping(
-        positions, seqlens_q, packed(tables, len(ctx)), B, out=dst[:-4]
-    )
+    got = slot_mapping(positions, seqlens_q, packed(tables, len(ctx)), B, out=dst[:-4])
     assert np.shares_memory(got, dst)
     assert np.array_equal(dst[:-4], ref_slot_mapping(ctx, cached, tables, B))
     assert (dst[-4:] == -7).all()
@@ -208,7 +219,7 @@ def test_slot_mapping_reads_each_sequences_own_row():
     _, seqlens_q, cached_lens, cu_q, offsets = step_inputs(ctx, cached)
     positions = prefill_positions(offsets, cached_lens, cu_q, seqlens_q)
     tables = [array.array("i", [5, 6]), array.array("i", [900, 901])]
-    got = prefill_slot_mapping(positions, seqlens_q, packed(tables, 2), B)
+    got = slot_mapping(positions, seqlens_q, packed(tables, 2), B)
     assert got[0] == 5 * B and got[B] == 6 * B
     assert got[2 * B] == 900 * B and got[3 * B] == 901 * B
 
@@ -221,7 +232,7 @@ def test_row_stride_does_not_change_the_answer(cols):
     _, seqlens_q, cached_lens, cu_q, offsets = step_inputs(ctx, cached)
     positions = prefill_positions(offsets, cached_lens, cu_q, seqlens_q)
     tables = tables_for(ctx)
-    got = prefill_slot_mapping(positions, seqlens_q, packed(tables, 3, cols=cols), B)
+    got = slot_mapping(positions, seqlens_q, packed(tables, 3, cols=cols), B)
     assert np.array_equal(got, ref_slot_mapping(ctx, cached, tables, B))
 
 
@@ -232,7 +243,7 @@ def test_padding_columns_are_never_read():
     _, seqlens_q, cached_lens, cu_q, offsets = step_inputs(ctx, cached)
     positions = prefill_positions(offsets, cached_lens, cu_q, seqlens_q)
     tables = tables_for(ctx)
-    got = prefill_slot_mapping(
+    got = slot_mapping(
         positions, seqlens_q, packed(tables, 2, cols=32, fill=-(1 << 20)), B
     )
     assert (got >= 0).all()
@@ -251,9 +262,7 @@ def test_every_block_size_agrees_with_the_loop(block_size):
     _, seqlens_q, cached_lens, cu_q, offsets = step_inputs(ctx, cached)
     positions = prefill_positions(offsets, cached_lens, cu_q, seqlens_q)
     tables = tables_for(ctx, block_size=block_size)
-    got = prefill_slot_mapping(
-        positions, seqlens_q, packed(tables, len(ctx)), block_size
-    )
+    got = slot_mapping(positions, seqlens_q, packed(tables, len(ctx)), block_size)
     assert np.array_equal(got, ref_slot_mapping(ctx, cached, tables, block_size))
 
 
@@ -267,7 +276,7 @@ def test_a_slot_past_int32_does_not_wrap():
     _, seqlens_q, cached_lens, cu_q, offsets = step_inputs(ctx, cached)
     positions = prefill_positions(offsets, cached_lens, cu_q, seqlens_q)
     table = np.array([[high]], dtype=np.int32)
-    got = prefill_slot_mapping(positions, seqlens_q, table, block_size)
+    got = slot_mapping(positions, seqlens_q, table, block_size)
     assert got[0] == int(high) * block_size
     assert got[1] == int(high) * block_size + 1
 
@@ -281,9 +290,9 @@ def test_a_wider_table_is_refused():
     positions = prefill_positions(offsets, cached_lens, cu_q, seqlens_q)
     table = np.array([[3, 4], [7, 8]], dtype=np.int64)
     with pytest.raises(TypeError):
-        prefill_slot_mapping(positions, seqlens_q, table, B)
+        slot_mapping(positions, seqlens_q, table, B)
     # ...and the same ids at the shipped width do answer.
-    got = prefill_slot_mapping(positions, seqlens_q, table.astype(np.int32), B)
+    got = slot_mapping(positions, seqlens_q, table.astype(np.int32), B)
     assert np.array_equal(got[::B], [3 * B, 4 * B, 7 * B, 8 * B])
 
 
@@ -294,7 +303,7 @@ def test_a_non_contiguous_table_is_refused():
     _, seqlens_q, cached_lens, cu_q, offsets = step_inputs([B, B], [0, 0])
     positions = prefill_positions(offsets, cached_lens, cu_q, seqlens_q)
     with pytest.raises(TypeError):
-        prefill_slot_mapping(positions, seqlens_q, wide[:, ::2], B)
+        slot_mapping(positions, seqlens_q, wide[:, ::2], B)
 
 
 def test_positions_resume_at_the_cached_prefix():
@@ -318,7 +327,7 @@ def test_caller_scratch_is_used_and_not_read_past():
     scratch = np.full(n + 32, -7, dtype=np.int64)
     out = np.empty(n, dtype=np.int64)
 
-    got = prefill_slot_mapping(
+    got = slot_mapping(
         positions, seqlens_q, packed(tables, 2), B, out=out, scratch=scratch
     )
 
@@ -333,7 +342,7 @@ def test_scratch_does_not_corrupt_the_positions_it_reads():
     _, seqlens_q, cached_lens, cu_q, offsets = step_inputs(ctx, cached)
     positions = prefill_positions(offsets, cached_lens, cu_q, seqlens_q)
     before = positions.copy()
-    prefill_slot_mapping(
+    slot_mapping(
         positions,
         seqlens_q,
         packed(tables_for(ctx), 1),
@@ -369,9 +378,7 @@ def test_vectorized_beats_the_loop():
 
     def new():
         pos = prefill_positions(offsets, cached_lens, cu_q, seqlens_q)
-        return prefill_slot_mapping(
-            pos, seqlens_q, table_2d, B, out=out, scratch=scratch
-        )
+        return slot_mapping(pos, seqlens_q, table_2d, B, out=out, scratch=scratch)
 
     def legacy():
         # Both halves, or the arms are not doing the same work: `new` derives
@@ -397,7 +404,7 @@ def test_the_whole_corpus_through_the_shipped_buffers(ctx, cached, extra):
         offsets, cached_lens, cu_q, seqlens_q, out=np.empty(offsets.size, np.int64)
     )
     tables = tables_for(ctx, extra_rows=extra)
-    got = prefill_slot_mapping(
+    got = slot_mapping(
         positions,
         seqlens_q,
         packed(tables, len(ctx)),
