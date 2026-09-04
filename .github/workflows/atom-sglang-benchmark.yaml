@@ -80,13 +80,13 @@ on:
         type: string
         default: ""
       publish_to_dashboard:
-        description: "Upload SGLang-OOB results to the ATOM dashboard."
+        description: "Upload SGLang-OOB results to the ATOM dashboard (off by default for manual runs; schedule always publishes)"
         type: boolean
-        default: true
+        default: false
       upload_to_custom_dashboard:
-        description: "Upload benchmark results to the LLM-Booster dashboard"
+        description: "Upload benchmark results to the LLM-Booster dashboard (off by default for manual runs)"
         type: boolean
-        default: true
+        default: false
       param_lists:
         description: |
           "Optional benchmark parameter lists.
