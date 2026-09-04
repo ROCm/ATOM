@@ -60,6 +60,9 @@ on:
             glm-52-mxfp4-1p1d-tp4-agentic-1m-c1,glm-52-mxfp4-1p1d-tp4-agentic-1m-c2,
             glm-52-mxfp4-1p1d-tp4-agentic-1m-c4,glm-52-mxfp4-1p1d-tp4-agentic-1m-c8,
             glm-52-mxfp4-1p1d-tp4-agentic-1m-c48,
+            glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c32,
+            glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c40,
+            glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c48,
             glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c24,
             glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c32,
             glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c48
@@ -124,6 +127,10 @@ on:
           - mia1-p02-g42,mia1-p02-g44
           - mia1-p02-g42,mia1-p02-g47
           - mia1-p02-g44,mia1-p02-g47
+          # single_node cases only use the first entry, so keep orderings that
+          # let any one of the three nodes be selected.
+          - mia1-p02-g47,mia1-p02-g44
+          - mia1-p01-g43,mia1-p01-g36
           - mia1-p01-g36,mia1-p01-g43
       atomesh_2p1d_nodes:
         description: 'ATOMesh 2P1D nodes'
