@@ -1032,8 +1032,11 @@ jobs:
           echo "oot_image_tag=${OOT_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Push custom OOT image
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
-          docker push "${{ steps.image-meta.outputs.oot_image_tag }}"
+          .github/scripts/docker_push_retry.sh "${{ steps.image-meta.outputs.oot_image_tag }}"
 
       - name: Clean up build images
         if: always()
