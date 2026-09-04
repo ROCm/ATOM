@@ -562,5 +562,267 @@ def test_lmcache_nested_in_multi_connector_is_wrapped():
     child = LMCacheConnectorV1()
     _wrap_lmcache_connectors(MultiConnector([child]), required=True)
 
-    assert getattr(child, "_atom_lmcache_group_priming", False)
+    assert getattr(child, "_atom_lmcache_group_prebuilt", False)
     assert getattr(child, "_atom_lmcache_abort_guard", False)
+
+
+def _fake_first_rank_engine(chunk_sizes, first_rank=True):
+    """An LMCache engine stub that records what the broadcast loop does."""
+    import torch
+
+    calls = SimpleNamespace(objects=[], tensors=[], delegated=0)
+
+    def broadcast_object_fn(obj, src):
+        calls.objects.append((obj, src))
+
+    def broadcast_fn(tensor, src):
+        calls.tensors.append((tensor.data_ptr(), tensor.numel(), src))
+
+    def original(reordered_chunks, ret_mask):
+        calls.delegated += 1
+
+    original._atom_unblocked = False
+
+    chunks = []
+    for i, n in enumerate(chunk_sizes):
+        raw = torch.zeros(n, dtype=torch.uint8)
+        obj = SimpleNamespace(
+            raw_tensor=raw, metadata=SimpleNamespace(to_dict=lambda i=i: {"i": i})
+        )
+        chunks.append((None, obj, i * 8, i * 8 + 8))
+
+    engine = SimpleNamespace(
+        save_only_first_rank=True,
+        async_loading=False,
+        broadcast_fn=broadcast_fn,
+        broadcast_object_fn=broadcast_object_fn,
+        _broadcast_or_receive_memory_objs=original,
+        retrieve=lambda tokens, mask=None, **kw: None,
+        gpu_connector=SimpleNamespace(batched_to_gpu=lambda *a, **k: None),
+        metadata=SimpleNamespace(
+            is_first_rank=lambda: first_rank, first_rank=0, worker_id=0
+        ),
+    )
+    return engine, chunks, calls
+
+
+def test_first_rank_delegates_to_upstream_send():
+    """Rank 0 must stay on LMCache's own send path — we only window the peers."""
+    from atom.plugin.vllm.lmcache_connector_patch import _bound_broadcast_staging
+
+    engine, chunks, calls = _fake_first_rank_engine([64, 64], first_rank=True)
+    _bound_broadcast_staging(engine)
+    engine._broadcast_or_receive_memory_objs(chunks, None)
+
+    assert calls.delegated == 1, "rank 0 should call through to upstream"
+    assert calls.objects == [] and calls.tensors == []
+
+
+def test_peer_without_retrieve_wrapper_falls_back_to_upstream():
+    from atom.plugin.vllm.lmcache_connector_patch import _bound_broadcast_staging
+
+    engine, chunks, calls = _fake_first_rank_engine([64], first_rank=False)
+    _bound_broadcast_staging(engine)
+    engine._broadcast_or_receive_memory_objs(chunks, None)
+
+    assert calls.delegated == 1
+    assert calls.objects == [] and calls.tensors == []
+
+
+def test_first_rank_copy_patch_is_skipped_and_idempotent():
+    from atom.plugin.vllm.lmcache_connector_patch import _bound_broadcast_staging
+
+    engine, _, _ = _fake_first_rank_engine([64])
+    engine.save_only_first_rank = False
+    before = engine._broadcast_or_receive_memory_objs
+    _bound_broadcast_staging(engine)
+    assert engine._broadcast_or_receive_memory_objs is before
+
+    engine, _, _ = _fake_first_rank_engine([64])
+    _bound_broadcast_staging(engine)
+    patched = engine._broadcast_or_receive_memory_objs
+    _bound_broadcast_staging(engine)
+    assert engine._broadcast_or_receive_memory_objs is patched
+
+
+def test_peer_receive_uploads_and_releases_every_window():
+    """The peers must not hold the whole restore in device memory."""
+    pytest.importorskip("torch")
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU")
+
+    import lmcache.v1.memory_management as mm
+
+    from atom.plugin.vllm.lmcache_connector_patch import _bound_broadcast_staging
+
+    n_chunks, window = 7, 3
+    uploads: list[int] = []
+    released: list[int] = []
+    live: list[int] = []
+
+    class Obj:
+        def __init__(self, raw_data, metadata, parent_allocator):
+            self.raw_tensor = raw_data
+            live.append(1)
+
+        def ref_count_down(self):
+            released.append(1)
+            live.pop()
+
+    # rank 0 sends the count first, then one metadata tuple per chunk
+    feed = iter([n_chunks] + [(i * 8, i * 8 + 8, {}) for i in range(n_chunks)])
+    ret_mask = torch.zeros(n_chunks * 8, dtype=torch.bool)
+
+    def upload(objs, starts, ends, **kwargs):
+        assert kwargs == {"kvcaches": "sentinel"}, "retrieve kwargs must reach to_gpu"
+        uploads.append(len(objs))
+        # nothing may be held beyond the window at any point
+        assert len(live) <= window
+
+    engine = SimpleNamespace(
+        save_only_first_rank=True,
+        async_loading=False,
+        broadcast_fn=lambda t, src: None,
+        broadcast_object_fn=lambda obj, src: next(feed),
+        _broadcast_or_receive_memory_objs=lambda c, m: None,
+        gpu_connector=SimpleNamespace(batched_to_gpu=upload),
+        metadata=SimpleNamespace(
+            is_first_rank=lambda: False, first_rank=0, worker_id=1
+        ),
+    )
+    # the real retrieve is what drives the broadcast helper, so the stub must too
+    engine.retrieve = lambda tokens, mask=None, **kw: (
+        engine._broadcast_or_receive_memory_objs([], ret_mask)
+    )
+
+    real_obj, real_meta = mm.TensorMemoryObj, mm.MemoryObjMetadata
+    mm.TensorMemoryObj = Obj
+    mm.MemoryObjMetadata = SimpleNamespace(
+        from_dict=staticmethod(lambda d: SimpleNamespace(get_size=lambda: 64))
+    )
+    try:
+        _bound_broadcast_staging(engine, window=window)
+        engine.retrieve([1], None, kvcaches="sentinel")
+    finally:
+        mm.TensorMemoryObj, mm.MemoryObjMetadata = real_obj, real_meta
+
+    assert uploads == [3, 3, 1], uploads
+    assert sum(released) == n_chunks
+    assert not live, "every received chunk must be released"
+    assert bool(ret_mask.all()), "every chunk's span must be marked retrieved"
+
+
+def test_staging_patch_is_skipped_and_idempotent():
+    from atom.plugin.vllm.lmcache_connector_patch import _bound_broadcast_staging
+
+    engine, _, _ = _fake_first_rank_engine([64])
+    engine.save_only_first_rank = False
+    before = engine._broadcast_or_receive_memory_objs
+    _bound_broadcast_staging(engine)
+    assert engine._broadcast_or_receive_memory_objs is before
+
+    engine, _, _ = _fake_first_rank_engine([64])
+    _bound_broadcast_staging(engine)
+    patched = engine._broadcast_or_receive_memory_objs
+    _bound_broadcast_staging(engine)
+    assert engine._broadcast_or_receive_memory_objs is patched
+
+
+def _pin_connector(pins, loading, grace=1):
+    """A worker-side connector stub holding `pins` with `loading` in the step."""
+    from atom.plugin.vllm.lmcache_connector_patch import (
+        _release_unscheduled_lookup_pins,
+    )
+
+    unpinned = []
+
+    engine = SimpleNamespace(
+        lookup_pins=dict(pins),
+        lookup_unpin=lambda rid: (
+            unpinned.append(rid),
+            engine.lookup_pins.pop(rid, None),
+        ),
+    )
+    meta = SimpleNamespace(
+        requests=[SimpleNamespace(req_id=r, load_spec=object()) for r in loading]
+    )
+    started = []
+
+    conn = SimpleNamespace(
+        _lmcache_engine=SimpleNamespace(lmcache_engine=engine),
+        _get_connector_metadata=lambda: meta,
+        start_load_kv=lambda ctx, **kw: started.append(1),
+    )
+    _release_unscheduled_lookup_pins(conn, grace_steps=grace)
+    return conn, engine, unpinned, started
+
+
+def test_pins_that_never_became_loads_are_released():
+    """Mirrors the native connector: a matched-but-unloaded lookup must unpin."""
+    conn, engine, unpinned, started = _pin_connector(
+        pins={"a": {}, "b": {}, "c": {}}, loading=["b"]
+    )
+
+    conn.start_load_kv(None)  # first sighting: inside the grace window
+    assert unpinned == []
+    conn.start_load_kv(None)  # still unscheduled -> release
+    assert sorted(unpinned) == ["a", "c"]
+    assert "b" in engine.lookup_pins, "a loading request must keep its pin"
+    assert len(started) == 2, "the real start_load_kv must still run"
+
+
+def test_a_pin_that_starts_loading_is_kept():
+    conn, _engine, unpinned, _ = _pin_connector(pins={"a": {}}, loading=[])
+    conn.start_load_kv(None)
+    conn._get_connector_metadata = lambda: SimpleNamespace(
+        requests=[SimpleNamespace(req_id="a", load_spec=object())]
+    )
+    conn.start_load_kv(None)
+    conn.start_load_kv(None)
+    assert unpinned == [], "the grace counter must reset once loading starts"
+
+
+def test_pin_release_survives_a_broken_engine():
+    """Cleanup is best-effort: it must never block the forward pass."""
+    from atom.plugin.vllm.lmcache_connector_patch import (
+        _release_unscheduled_lookup_pins,
+    )
+
+    started = []
+    conn = SimpleNamespace(
+        _lmcache_engine=SimpleNamespace(lmcache_engine=None),
+        _get_connector_metadata=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+        start_load_kv=lambda ctx, **kw: started.append(1),
+    )
+    _release_unscheduled_lookup_pins(conn)
+    conn.start_load_kv(None)
+    assert started == [1]
+
+
+def test_a_save_only_request_does_not_keep_its_pin():
+    """Only a load reads the pinned chunks; a save in flight must not hold them."""
+    from atom.plugin.vllm.lmcache_connector_patch import (
+        _release_unscheduled_lookup_pins,
+    )
+
+    unpinned = []
+    engine = SimpleNamespace(
+        lookup_pins={"a": {}},
+        lookup_unpin=lambda rid: (
+            unpinned.append(rid),
+            engine.lookup_pins.pop(rid, None),
+        ),
+    )
+    meta = SimpleNamespace(requests=[SimpleNamespace(req_id="a", load_spec=None)])
+    conn = SimpleNamespace(
+        _lmcache_engine=SimpleNamespace(lmcache_engine=engine),
+        _get_connector_metadata=lambda: meta,
+        start_load_kv=lambda ctx, **kw: None,
+    )
+    _release_unscheduled_lookup_pins(conn, grace_steps=1)
+
+    conn.start_load_kv(None)
+    conn.start_load_kv(None)
+    assert unpinned == ["a"]

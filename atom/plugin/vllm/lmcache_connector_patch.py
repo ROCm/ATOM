@@ -44,7 +44,9 @@ def _lmcache_config():
 
         return LMCacheEngineConfig.from_env()
     except Exception:
-        logger.debug("ATOM vLLM plugin: could not pre-read LMCache config", exc_info=True)
+        logger.debug(
+            "ATOM vLLM plugin: could not pre-read LMCache config", exc_info=True
+        )
         return None
 
 
@@ -208,7 +210,7 @@ def enforce_lmcache_gpu_connector(vllm_config, kv_cache_config=None) -> bool:
     if configured is None:
         os.environ[_LMCACHE_V3_ENV] = "True"
         logger.info(
-            "ATOM plugin: %s has %s, which LMCache's default GPU connector "
+            "ATOM vLLM: %s has %s, which LMCache's default GPU connector "
             "cannot express. Setting %s=True.",
             arch,
             reason,
@@ -227,6 +229,110 @@ def enforce_lmcache_gpu_connector(vllm_config, kv_cache_config=None) -> bool:
     return True
 
 
+def _bound_broadcast_staging(engine, window: int = 32) -> None:
+    # In LMCache's save_only_first_rank node, the first rank copies its loaded
+    # cache to all other ranks through raw_tensors.to(device). In the upstream
+    # LMCache implementation, the receiving ranks gather all chunks in one go.
+    # If all data combined exceeds the GPU memory, the receiving ranks abort,
+    # and the first rank gets deadlocked waiting on the collectives.
+    # To avoid this, instead of accumulating all chunks, batch the staging
+    # into smaller number of chunks.
+    # lmcache.v1.cache_engine.LMCacheEngine._broadcast_or_receive_memory_objs
+    # but with batched chunks
+    if not getattr(engine, "save_only_first_rank", False):
+        return
+    original = getattr(engine, "_broadcast_or_receive_memory_objs", None)
+    if original is None or getattr(original, "_atom_bounded_staging", False):
+        return
+
+    import torch
+    from lmcache import torch_device_type
+    from lmcache.v1.memory_management import MemoryObjMetadata, TensorMemoryObj
+
+    original_retrieve = engine.retrieve
+    to_gpu_kwargs = None
+
+    # batched_to_gpu needs retrieve's paged-KV kwargs, which the broadcast
+    # helper is not given
+    def retrieve(tokens, mask=None, **kwargs):
+        nonlocal to_gpu_kwargs
+        to_gpu_kwargs = kwargs
+        try:
+            return original_retrieve(tokens, mask, **kwargs)
+        finally:
+            to_gpu_kwargs = None
+
+    def receive(reordered_chunks, ret_mask):
+        first_rank = engine.metadata.first_rank
+        local_rank = engine.metadata.worker_id % torch.cuda.device_count()
+        device = f"{torch_device_type}:{local_rank}"
+        chunk_count = engine.broadcast_object_fn(None, first_rank)
+        if chunk_count is None:
+            logger.warning("ATOM vLLM: rank %d received None chunk_count", local_rank)
+            return
+
+        pending: list = []
+
+        def upload():
+            if not pending:
+                return
+            engine.gpu_connector.batched_to_gpu(
+                [c[1] for c in pending],
+                [c[2] for c in pending],
+                [c[3] for c in pending],
+                **to_gpu_kwargs,
+            )
+            if not engine.async_loading:
+                for _key, memory_obj, _start, _end in pending:
+                    memory_obj.ref_count_down()
+            pending.clear()
+
+        for _ in range(chunk_count):
+            combined_metadata = engine.broadcast_object_fn(None, first_rank)
+            if combined_metadata is None:
+                logger.warning(
+                    "ATOM vLLM: rank %d received None chunk metadata", local_rank
+                )
+                break
+            start, end, metadata_dict = combined_metadata
+            ret_mask[start:end] = True
+            metadata = MemoryObjMetadata.from_dict(metadata_dict)
+            raw_tensor = torch.empty(
+                torch.Size([metadata.get_size()]), dtype=torch.uint8, device=device
+            )
+            engine.broadcast_fn(raw_tensor, first_rank)
+            pending.append(
+                (
+                    None,
+                    TensorMemoryObj(
+                        raw_data=raw_tensor, metadata=metadata, parent_allocator=None
+                    ),
+                    start,
+                    end,
+                )
+            )
+            if len(pending) >= window:
+                upload()
+        upload()
+
+    def broadcast_or_receive(reordered_chunks, ret_mask):
+        # Outside our retrieve wrapper the kwargs are unavailable, so windowing
+        # is impossible and upstream has to handle the whole step
+        if engine.metadata.is_first_rank() or to_gpu_kwargs is None:
+            original(reordered_chunks, ret_mask)
+        else:
+            receive(reordered_chunks, ret_mask)
+
+    broadcast_or_receive._atom_bounded_staging = True
+    engine._broadcast_or_receive_memory_objs = broadcast_or_receive
+    engine.retrieve = retrieve
+    logger.info(
+        "ATOM vLLM: bounded LMCache's first-rank restore staging to %d chunks "
+        "per receiving rank",
+        window,
+    )
+
+
 def _prebuild_gpu_connector_layer_groups(connector, kv_caches) -> None:
     # Run V3's group discovery at this point, rather than inside the first transfer
     impl = getattr(connector, "_lmcache_engine", None)
@@ -240,13 +346,14 @@ def _prebuild_gpu_connector_layer_groups(connector, kv_caches) -> None:
 
     gpu_connector.initialize_kvcaches_ptr(kvcaches=list(kv_caches.values()))
     initialize_pointers()
+    _bound_broadcast_staging(getattr(impl, "lmcache_engine", None))
 
     manager = getattr(
         getattr(gpu_connector, "metadata", None), "kv_layer_groups_manager", None
     )
     groups = getattr(manager, "kv_layer_groups", None) or ()
     logger.info(
-        "ATOM plugin: primed LMCache KV layer groups from %d registered caches -> %s",
+        "ATOM vLLM: primed LMCache KV layer groups from %d registered caches -> %s",
         len(kv_caches),
         [(g.num_layers, g.shape_desc.hs) for g in groups],
     )
@@ -277,7 +384,7 @@ def _wrap_register_kv_caches(connector, required: bool = False) -> None:
             if required:
                 raise
             logger.warning(
-                "ATOM plugin: could not pre-build LMCache's KV layer groups; "
+                "ATOM vLLM: could not pre-build LMCache's KV layer groups; "
                 "falling back to its lazy discovery.",
                 exc_info=True,
             )
@@ -298,6 +405,70 @@ class _NullLMCacheEngine:
     @staticmethod
     def is_healthy() -> bool:
         return True
+
+
+def _release_unscheduled_lookup_pins(connector, grace_steps: int = 1) -> None:
+    # Mirroring atom.kv_transfer.offload.dense.connector, release lookup pins
+    # for requests that are never served so that they can be evicted.
+    start_load_kv = getattr(connector, "start_load_kv", None)
+    impl = getattr(connector, "_lmcache_engine", None)
+    if start_load_kv is None or impl is None:
+        return
+    if getattr(start_load_kv, "_atom_pin_release", False):
+        return
+
+    idle_steps: dict = {}
+
+    def release_stale_pins():
+        engine = getattr(impl, "lmcache_engine", None)
+        pins = getattr(engine, "lookup_pins", None)
+        if not pins:
+            idle_steps.clear()
+            return
+        metadata = connector._get_connector_metadata()
+        # A request that is only being saved never reads the pinned chunks
+        loading = {
+            str(getattr(req, "req_id", ""))
+            for req in getattr(metadata, "requests", ())
+            if getattr(req, "load_spec", None) is not None
+        }
+        for lookup_id in list(pins):
+            key = str(lookup_id)
+            if key in loading:
+                idle_steps.pop(key, None)
+                continue
+            idle = idle_steps.get(key, 0) + 1
+            if idle > grace_steps:
+                engine.lookup_unpin(key)
+                idle_steps.pop(key, None)
+                logger.debug(
+                    "ATOM vLLM: released the LMCache lookup pin for %s, which "
+                    "was matched but never loaded",
+                    key,
+                )
+            else:
+                idle_steps[key] = idle
+        for key in list(idle_steps):
+            if key not in pins:
+                idle_steps.pop(key, None)
+
+    def start_load_kv_releasing(forward_context, **kwargs):
+        try:
+            release_stale_pins()
+        except Exception:  # optional third-party cleanup boundary
+            logger.debug(
+                "ATOM vLLM: releasing stale LMCache lookup pins failed",
+                exc_info=True,
+            )
+        return start_load_kv(forward_context, **kwargs)
+
+    start_load_kv_releasing._atom_pin_release = True
+    connector.start_load_kv = start_load_kv_releasing
+    logger.info(
+        "ATOM vLLM: releasing LMCache lookup pins that do not become loads "
+        "within %d step(s), so an unschedulable request cannot pin the CPU tier",
+        grace_steps + 1,
+    )
 
 
 def _wrap_request_finished(connector) -> None:
@@ -337,6 +508,7 @@ def _wrap_lmcache_connectors(connector, required: bool) -> None:
     # LMCache connector is reached.
     _wrap_register_kv_caches(connector, required)
     _wrap_request_finished(connector)
+    _release_unscheduled_lookup_pins(connector)
     for child in getattr(connector, "_connectors", None) or ():
         _wrap_lmcache_connectors(child, required)
 
@@ -361,6 +533,6 @@ def apply_vllm_lmcache_connector_patch() -> None:
     create_connector._atom_lmcache_connector_patched = True
     KVConnectorFactory.create_connector = classmethod(create_connector)
     logger.info(
-        "ATOM plugin: patched vLLM KVConnectorFactory to select and prime "
+        "ATOM vLLM: patched vLLM KVConnectorFactory to select and prime "
         "LMCache's multi-geometry GPU connector for DSA KV layouts"
     )
