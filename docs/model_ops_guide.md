@@ -522,6 +522,7 @@ has outgrown its package rather than merely broken a rule.
 |---|---|
 | `pool_layout/sub_pool_spec.py` | `SubPoolSpec`, `page_pool`, `state_pool`, `plan_pools` — sub-pool sizing as arithmetic over a byte budget |
 | `pool_layout/v4_pool_geometry.py` | `UnifiedPoolGeometry`, `WindowParams`, the compress ratios — where a DeepSeek-V4 row lives, and which rows a step may see |
+| `pool_layout/page_unit_geometry.py` | `PageUnitGeometryMixin` — where a K3 checkpoint image's bytes land in the MLA paged pool |
 | `pool_layout/state_arena.py` | `StateArena`, `StateField`, `plan_regions` — one request's per-layer state as a contiguous byte run |
 | `pool_layout/paged_state_copy.py` | `plan_segmented_copy`, `launch_copy_descriptor` — scattering that byte run across PAGE units and back |
 | `token_layout/prefill.py` | `prefill_positions`, `prefill_slot_mapping` — a prefill step's per-token index arrays, checkable against a naive reference |
