@@ -76,6 +76,8 @@ def _stub_v4_runtime_imports():
     for name in (
         "build_v4_paged_decode_indptr",
         "fp4_indexer_enabled",
+        "fp4_mqa_prefill_config",
+        "fp4_mqa_prefill_parallel_unit_num",
         "hca_compress_paged_offsets",
         "write_v4_paged_decode_indices",
         "write_v4_paged_prefill_indices",
