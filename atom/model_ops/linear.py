@@ -222,11 +222,21 @@ def gemm_a4w4_quant(
     else:
         if x_scale is None:
             quant_func = get_hip_quant(QuantType.per_1x32)
+            quant_kwargs = {}
+            if params_dtype == dtypes.fp8:
+                # MXFP8 activations. aiter's per_1x32 MX quant defaults fp8 to a
+                # continuous fp32 per-group scale, and refuses that together with
+                # shuffle=True because the fp32 path uses a transposed (scaleN, M)
+                # layout. The swizzled byte scale is what this path wants anyway:
+                # the shuffled fp4 sibling above emits e8m0 too, and the
+                # caller-supplied branch below reads x_scale as float8_e8m0fnu.
+                quant_kwargs["scale_type"] = dtypes.fp8_e8m0
             x, x_scale = quant_func(
                 x,
                 quant_dtype=params_dtype,
                 scale=input_scale,
                 shuffle=True,
+                **quant_kwargs,
             )
         else:
             x_scale = x_scale.view(torch.float8_e8m0fnu)
@@ -836,6 +846,34 @@ class LinearBase(nn.Module):
             self.weight.data, self.weight_scale.data, _ = normalize_e4m3fn_to_e4m3fnuz(
                 self.weight.data, self.weight_scale.data
             )
+        # --- MXFP8 (per_1x32 fp8) dense-linear bf16 fallback --------------
+        # gfx950 has no 1x32-both-sides mxfp8 GEMM: the dedicated mxfp8 gemms
+        # are gfx1250-only, blockscale is 1x128, and triton afp8wfp8 wants
+        # 128x128 weight blocks. The stock per_1x32 path routes fp8 weights
+        # into gemm_a4w4, which rejects fp8 ("Unsupported input_type:fp8,
+        # out_type:bf16"). For MXFP8 *dense* linears (qkv/o/gate_up/down —
+        # small vs the MoE experts) dequantize the fp8 weight + 1x32 e8m0
+        # block scale to bf16 once here and run the plain bf16 a16w16 GEMM
+        # (QuantType.No) in forward. Correct and highest-accuracy on gfx950;
+        # ~2x memory for these non-MoE weights only. Returns early to skip the
+        # a4w4 weight/scale shuffle below. (MXFP4 has params_dtype fp4x2, so
+        # this branch never touches it.)
+        if (
+            self.quant_type == QuantType.per_1x32
+            and self.params_dtype == dtypes.fp8
+            and self.weight.dim() == 2
+        ):
+            w = self.weight.data.to(torch.float32)
+            n, k = w.shape
+            scale = self.weight_scale.data
+            if scale.dtype != torch.float8_e8m0fnu:
+                scale = scale.view(torch.float8_e8m0fnu)
+            scale = scale.to(torch.float32).reshape(n, -1)
+            scale = scale.repeat_interleave(k // scale.shape[1], dim=1)[:, :k]
+            self.weight = atom_parameter((w * scale).to(torch.bfloat16))
+            self.quant_type = QuantType.No
+            return
+        # ------------------------------------------------------------------
         if (
             self.source_quant_dtype == torch.bfloat16
             and self.quant_type == QuantType.per_1x32

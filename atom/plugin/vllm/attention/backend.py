@@ -3,6 +3,7 @@ from typing import ClassVar
 import torch
 from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE
 
@@ -36,6 +37,25 @@ class _VllmAttentionBackendCompat:
     def supports_device_cpu_query_lens_mismatch(cls) -> bool:
         """ATOM metadata builders plan from exact CPU query boundaries."""
         return False
+
+    @classmethod
+    def supported_kv_cache_layouts(cls):
+        """Layouts this backend's kernels accept, most preferred first.
+
+        vLLM 0.28 asks every backend for this and ATOM's backends are
+        duck-typed, so they never inherit ``AttentionBackend``'s default.
+        They already state layout through the older
+        ``get_required_kv_cache_layout`` hook that 0.28 stopped calling, so
+        honour a subclass that pins one and otherwise express no preference,
+        exactly as ``AttentionBackend.supported_kv_cache_layouts`` does.
+        """
+        required = getattr(cls, "get_required_kv_cache_layout", None)
+        layout = required() if required is not None else None
+        if layout is None:
+            return None
+        if isinstance(layout, str):
+            layout = KVCacheLayout[layout]
+        return (layout,)
 
 
 class AiterMhaBackendForVllm(_VllmAttentionBackendCompat):

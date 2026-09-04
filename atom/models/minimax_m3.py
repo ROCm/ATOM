@@ -599,6 +599,19 @@ class MiniMaxM3DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        # Resolve the fused-quant predicates here, not in forward: they depend
+        # only on the linears' static quant config, and reading QuantType from
+        # the lazy aiter proxy inside the compiled region is sourceless to
+        # Dynamo, which graph-breaks the frame (and ATOM's backend asserts it is
+        # only ever called once).
+        self.fuse_input_ar_rmsnorm_quant = _linear_consumes_per_token_fp8(
+            self.self_attn.qkv_proj
+        )
+        self.fuse_post_attention_ar_rmsnorm_quant = (
+            not self.is_moe_layer
+            and _linear_consumes_per_token_fp8(self.mlp.gate_up_proj)
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -610,13 +623,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
         | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     ):
         hidden_states_scale = None
-        fuse_input_ar_rmsnorm_quant = _linear_consumes_per_token_fp8(
-            self.self_attn.qkv_proj
-        )
-        fuse_post_attention_ar_rmsnorm_quant = (
-            not self.is_moe_layer
-            and _linear_consumes_per_token_fp8(self.mlp.gate_up_proj)
-        )
+        fuse_input_ar_rmsnorm_quant = self.fuse_input_ar_rmsnorm_quant
+        fuse_post_attention_ar_rmsnorm_quant = self.fuse_post_attention_ar_rmsnorm_quant
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)

@@ -453,13 +453,28 @@ class MinimaxM3SparseMetadata:
 
 
 class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
-    # Uniform decode batches are safe to capture, including spec-decode verify
-    # (query_len == num_spec + 1): the decode index-topk and sparse-attn kernels
-    # thread MAX_Q with per-token causality (causal_len = seq_len - MAX_Q + tok +
-    # 1) and their grids depend only on shape constants, so a captured (batch,
-    # query_len) shape is fixed. Prefill/mixed batches still use build(), where
-    # variable query lengths and CPU-side max reduction are allowed.
-    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
+    # Only pure single-token decode (query_len == 1) is safe to full-capture.
+    #
+    # Under cudagraph_mode=FULL_AND_PIECEWISE with UNIFORM_BATCH support, vLLM
+    # full-captures *any* uniform batch and replays it -- and a pure-prefill
+    # request (num_reqs == 1) is trivially uniform, so a real prefill gets
+    # padded onto a captured uniform bucket and replayed instead of running the
+    # eager build()/split-op path. The MiniMax-M3 sparse attention op is a
+    # graph-break op whose body (index-topk cache, per-token slot_mapping insert,
+    # variable-length qo_indptr slicing) runs in Python and does NOT re-execute
+    # on cudagraph replay: the replay reuses the capture-time metadata/slots, so
+    # the prefill writes a corrupt KV/index cache and every downstream decode
+    # then reads garbage (observed as repeated-token "liclic" output). Empirically
+    # confirmed: with UNIFORM_BATCH, a 5-token prefill never re-enters the eager
+    # op (the smallest prefill that runs is the warmup capture bucket).
+    #
+    # Restricting capture to UNIFORM_SINGLE_TOKEN_DECODE keeps pure decode
+    # FULL-captured (query_len == 1) while forcing every prefill/mixed and
+    # spec-verify (query_len > 1) batch down the PIECEWISE/eager build() path,
+    # which is exactly the FULL_AND_PIECEWISE contract this model needs. The only
+    # thing given up is cudagraph capture of spec-decode verify batches (not used
+    # by the MXFP8 M3 serving path); correctness of prefill takes precedence.
+    _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
     reorder_batch_threshold = 1
 
     def __init__(
