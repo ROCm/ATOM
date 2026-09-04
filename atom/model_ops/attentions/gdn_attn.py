@@ -35,6 +35,12 @@ from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool, state_pool
 
 logger = logging.getLogger("atom")
 
+_KDA_SSM_DTYPES = {
+    "fp32": torch.float32,
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+}
+
 
 class GDNAttentionBackend(AiterBackend):
     @staticmethod
@@ -325,17 +331,21 @@ class GDNStateMixin:
         return conv_state_shape, temporal_state_shape
 
     def _state_dtypes(self) -> tuple[torch.dtype, torch.dtype]:
-        # KDA recurrence accumulates in fp32 and aiter's chunk_kimi_delta_attn
-        # reads the state back verbatim, so the temporal state must be fp32 for
-        # every KDA model (Kimi-Linear and GLM-5.3-Flash).
+        # The KDA recurrence accumulates in fp32 whatever the pool stores, so
+        # the KDA models pick their storage dtype; everyone else keeps the
+        # state at the model dtype.
         if getattr(self.model_runner.config.hf_config, "model_type", None) in (
             "kimi_linear",
             "glm5_next_text",
         ):
-            return (
-                self.model_runner.config.torch_dtype,
-                torch.float32,
-            )
+            requested = envs.ATOM_KDA_SSM_DTYPE
+            temporal_dtype = _KDA_SSM_DTYPES.get(requested)
+            if temporal_dtype is None:
+                raise ValueError(
+                    f"ATOM_KDA_SSM_DTYPE={requested!r} is not one of "
+                    f"{sorted(_KDA_SSM_DTYPES)}."
+                )
+            return (self.model_runner.config.torch_dtype, temporal_dtype)
         return (
             self.model_runner.config.torch_dtype,
             self.model_runner.config.torch_dtype,
@@ -429,8 +439,9 @@ class GDNStateMixin:
         Exact, not approximate, when it is turned back on: `h` is `k.new_empty`
         and `_state_dtypes` returns `config.torch_dtype`, so slicing `h` rounds
         exactly where a shortened forward would. That rests on the two dtypes
-        agreeing; kimi_linear's fp32 v side is the one pool that breaks it, and
-        it overrides (`_KimiMLAGDNCommon.state_transfer`).
+        agreeing; kimi_linear's temporal side is `ATOM_KDA_SSM_DTYPE` and need
+        not, so it overrides unconditionally
+        (`_KimiMLAGDNCommon.state_transfer`).
         """
         return StateTransfer.fork(1, readable_midstep=False)
 
