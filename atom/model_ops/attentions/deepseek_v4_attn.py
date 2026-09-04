@@ -245,7 +245,10 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     """int32 GPU `[decode_rows, block_table_cols]` — compressed-cache block
     table expanded from sequences to query rows by a device-side gather. It
     lets the existing aiter MQA kernels treat every query row as an
-    independent batch with `next_n=1`."""
+    independent batch with `next_n=1`.
+
+    FP8 decode only; None under the FP4 indexer, whose schedule keeps the q row
+    and the block-table row apart and so reads `block_tables` as it stands."""
     kv_indices_hca: torch.Tensor | None = None
     """[hca_indptr[T]] int32 GPU — packed paged offsets for HCA layers
     (HCA compress at slice head + SWA window prefix at tail; layer-invariant)."""
@@ -3515,16 +3518,23 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # kernels can run once with shape `[decode_rows, 1, ...]`. Source and
         # index are both on the device, so the gather runs there instead of the
         # host shipping the expansion; the rows it skips are the tail.
-        mqa_bt = var[f"{buf_prefix_ubatch}v4_block_tables_per_token"]
-        block_tables_per_token_gpu = mqa_bt[:T_pad]
-        torch.index_select(
-            var[f"{buf_prefix_ubatch}block_tables"].gpu,
-            0,
-            batch_id_per_token_gpu[:T],
-            out=block_tables_per_token_gpu[:T],
-        )
-        if T < T_pad:  # an empty `zero_` still costs a dispatch
-            block_tables_per_token_gpu[T:].zero_()
+        #
+        # FP8 only: `deepgemm_fp8_paged_mqa_logits` is the sole reader, and its
+        # schedule gives one id per CTA that must serve as both the q row and the
+        # block-table row. The FP4 scorer keeps `row_id` and `batch_id` apart and
+        # reads `block_tables` as it stands, so this gather would go unread.
+        block_tables_per_token_gpu = None
+        if not self._indexer_fp4:
+            mqa_bt = var[f"{buf_prefix_ubatch}v4_block_tables_per_token"]
+            block_tables_per_token_gpu = mqa_bt[:T_pad]
+            torch.index_select(
+                var[f"{buf_prefix_ubatch}block_tables"].gpu,
+                0,
+                batch_id_per_token_gpu[:T],
+                out=block_tables_per_token_gpu[:T],
+            )
+            if T < T_pad:  # an empty `zero_` still costs a dispatch
+                block_tables_per_token_gpu[T:].zero_()
 
         # HCA compress section: the kernel below fills it from block tables
         # already on the device, tiling each slice exactly
@@ -4267,9 +4277,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         bufs["v4_csa_n_committed_per_token"] = torch.zeros(T_dec, **i32)
         # Device-only, and as wide as the `block_tables` it gathers from: a host
         # mirror would be `T_dec * cols * 4` of pinned memory nothing writes.
-        bufs["v4_block_tables_per_token"] = torch.zeros(
-            T_dec, self.block_table_cols, **i32
-        )
+        # Absent under the FP4 indexer (no reader -- see
+        # `_attach_v4_paged_decode_meta`), so a reader added back without
+        # ungating the gather raises here rather than reading rows nobody wrote.
+        if not self._indexer_fp4:
+            bufs["v4_block_tables_per_token"] = torch.zeros(
+                T_dec, self.block_table_cols, **i32
+            )
         # Where each decode token's own KV row goes, one buffer per compress
         # class. The fused SWA write reads these rather than deriving the row,
         # so the window layout stays inside this repo (see
@@ -4429,9 +4443,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             bufs[f"{p}v4_kv_indptr_csa"] = torch.zeros(T_dec + 1, **i32)
             bufs[f"{p}v4_kv_indptr_hca"] = torch.zeros(T_dec + 1, **i32)
             bufs[f"{p}v4_csa_n_committed_per_token"] = torch.zeros(T_dec, **i32)
-            bufs[f"{p}v4_block_tables_per_token"] = torch.zeros(
-                T_dec, self.block_table_cols, **i32
-            )
+            if not self._indexer_fp4:
+                bufs[f"{p}v4_block_tables_per_token"] = torch.zeros(
+                    T_dec, self.block_table_cols, **i32
+                )
             for name in _DEST_ROW_BUFFERS.values():
                 bufs[f"{p}{name}"] = CpuGpuBuffer(T_dec, **i32)
             bufs[f"{p}v4_batch_id_per_token"] = CpuGpuBuffer(mnbt, **i32)
