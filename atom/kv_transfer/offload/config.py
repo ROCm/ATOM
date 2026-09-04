@@ -32,6 +32,7 @@ _OFFLOAD_LAYOUT_ALIASES = {
     "hybrid": "hybrid",
     "dense": "dense",
     "kimi_k3": "kimi_k3",
+    "m3": "m3",
     # Compatibility with the names used while the layout split was developed.
     "terminal_unit": "hybrid",
     "page_slot": "hybrid",
@@ -63,10 +64,12 @@ _HF_INTEGER_GEOMETRY_FIELDS = frozenset(_HF_PAGE_FIELDS) - {
 # drops `qwen3_5`/`qwen3_5_moe` from that flatten, so if offload is ever wired
 # into plugin mode this guard must switch to the text config to stay in sync.
 # Unreachable today -- no plugin caller passes a `kv_transfer_config`.
-# MiniMax-M2/M3 are absent by design: M3 is sparse *paged* attention
+# MiniMax-M3 is not here either: it is sparse *paged* attention
 # (`MiniMaxM3SparseForCausalLM` -> `SparseMHAPagedAttentionImpl`), no recurrent
-# state, so the dense offload path handles it as ordinary paged KV -- it is NOT
-# a GDN/linear model despite some sibling comments once listing it as one.
+# state, so it is NOT a GDN/linear model. It does get its own PAGE-only `m3`
+# layout (see `_is_minimax_m3` and offload/hybrid/m3/): its NSA index_cache is
+# delivered only through transfer_tensors.block_regions, so the dense codec --
+# which builds from per-layer KVCacheTensor K/V -- would silently drop it.
 _GDN_LINEAR_MODEL_TYPES = frozenset(
     {"qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text"}
 )
@@ -93,6 +96,25 @@ def _strict_integer(name: str, value: object, *, minimum: int = 0) -> int:
         relation = "positive" if minimum == 1 else f">= {minimum}"
         raise ValueError(f"{name} must be {relation}")
     return normalized
+
+
+def _is_minimax_m3(hf_config) -> bool:
+    """MiniMax-M3: PAGE-only NSA sparse attention, no SLOT/compression.
+
+    Detected by architecture / model_type name so the offload layout
+    resolves identically in the scheduler and worker processes
+    (config-only selection, matching select_offload_layout's contract).
+    """
+
+    if hf_config is None:
+        return False
+    architectures = getattr(hf_config, "architectures", None) or ()
+    for arch in architectures:
+        name = str(arch).lower()
+        if "minimaxm3" in name or "minimax_m3" in name:
+            return True
+    model_type = str(getattr(hf_config, "model_type", "") or "").lower()
+    return "minimax_m3" in model_type or "minimaxm3" in model_type
 
 
 def select_offload_layout(config) -> str:
@@ -146,6 +168,14 @@ def _layout_from_model(config) -> str:
     hf_config = getattr(config, "hf_config", None)
     if hf_config is None:
         return "dense"
+    # MiniMax-M3 (NSA sparse *paged* attention, no recurrent state) gets a
+    # PAGE-only layout whose codec is sourced from transfer_tensors.block_regions
+    # -- the NSA index_cache rides there, never as a KVCacheTensor the dense codec
+    # inspects, so `dense` would offload K/V and silently drop the index cache,
+    # corrupting restored prefixes. Checked before the text-config family probe
+    # below because M3 is identified by architecture name, not model_type family.
+    if _is_minimax_m3(hf_config):
+        return "m3"
     # Resolve the family off the *text* config, exactly as the model-side
     # predicates this mirrors do (`ModelRunner.is_qwen_next`/`is_kimi_linear`
     # read `self.hf_text_config`). Two names in `_GDN_LINEAR_MODEL_TYPES` --
@@ -261,11 +291,10 @@ def build_page_namespace(
         "schema": "atom-page-namespace",
         "layout_version": layout_version,
         "model": base_model_name,
-        "page_mode": (
-            "dsv4-page-regions"
-            if select_offload_layout(config) == "hybrid"
-            else "dense-opaque-block"
-        ),
+        "page_mode": {
+            "hybrid": "dsv4-page-regions",
+            "m3": "m3-page-regions",
+        }.get(select_offload_layout(config), "dense-opaque-block"),
         "kv_cache_dtype": str(getattr(config, "kv_cache_dtype", "auto")),
         "index_cache_dtype": str(getattr(config, "index_cache_dtype", "auto")),
         "block_size": _strict_integer(
