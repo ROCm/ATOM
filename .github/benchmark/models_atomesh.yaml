@@ -438,13 +438,8 @@ models:
         - <<: *kimi_k3_agentic_tp8
           name: kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c4
           concurrency: [4]
-          server:
-            common_args:
-              <<: *kimi_k3_agentic_dspark7_args
-              state_checkpoint_slots: 64
-          env:
-            common:
-              ATOM_ENABLE_REPLAYSSM: "1"
+          run_eval: true
+          eval_concurrency: [4]
 
         - &kimi_k3_agentic_dcp8_lmcache
           <<: *kimi_k3_agentic_tp8
@@ -473,9 +468,9 @@ models:
           env:
             common:
               ATOM_ENABLE_REPLAYSSM: "1"
-            prefill: &kimi_k3_agentic_lmcache100_env
+            prefill: &kimi_k3_agentic_lmcache128_env
               LMCACHE_LOCAL_CPU: "True"
-              LMCACHE_MAX_LOCAL_CPU_SIZE: "100"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "128"
               LMCACHE_CHUNK_SIZE: "1024"
               LMCACHE_ENABLE_OUTPUT_PATH_MODE: "1"
               LMCACHE_ENABLE_LAYOUT_FILE_MODE: "1"
@@ -492,6 +487,16 @@ models:
               <<: *kimi_k3_agentic_dspark3_args
               max_num_seqs: 24
 
+        - <<: *kimi_k3_agentic_dcp8_lmcache
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c16
+          concurrency: [16]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_dspark3_args
+              max_num_seqs: 32
+              max_num_batched_tokens: 8192
+              gpu_memory_utilization: 0.86
+
         - &kimi_k3_agentic_no_dspark
           <<: *kimi_k3_agentic_dcp8_lmcache
           name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-state-1m-c32
@@ -506,8 +511,7 @@ models:
             common:
               ATOM_ENABLE_REPLAYSSM: "0"
             prefill:
-              <<: *kimi_k3_agentic_lmcache100_env
-              LMCACHE_MAX_LOCAL_CPU_SIZE: "96"
+              <<: *kimi_k3_agentic_lmcache128_env
               OFFLOAD_STATE: "1"
               OFFLOAD_STATE_CPU_SIZE: "32"
               OFFLOAD_STATE_STAGING_GROUPS: "8"
@@ -528,11 +532,37 @@ models:
           server:
             common_args:
               <<: *kimi_k3_agentic_no_dspark_args
-              gpu_memory_utilization: 0.88
-              max_num_seqs: 72
-              max_num_batched_tokens: 4096
-          run_eval: true
-          eval_concurrency: [56]
+              max_num_seqs: 112
+          env:
+            common:
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            prefill:
+              <<: *kimi_k3_agentic_lmcache128_env
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
+              OFFLOAD_STATE: "1"
+              OFFLOAD_STATE_CPU_SIZE: "32"
+              OFFLOAD_STATE_STAGING_GROUPS: "8"
+              OFFLOAD_STATE_MIN_LOAD_TOKENS: "0"
+              OFFLOAD_GPU_STAGING_CHUNKS: "32"
+
+        - <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-state-1m-c64
+          concurrency: [64]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 128
+          env:
+            common:
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            prefill:
+              <<: *kimi_k3_agentic_lmcache128_env
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
+              OFFLOAD_STATE: "1"
+              OFFLOAD_STATE_CPU_SIZE: "32"
+              OFFLOAD_STATE_STAGING_GROUPS: "8"
+              OFFLOAD_STATE_MIN_LOAD_TOKENS: "0"
+              OFFLOAD_GPU_STAGING_CHUNKS: "32"
 
     accuracy:
       task: gsm8k
@@ -540,8 +570,9 @@ models:
       limit: null
       model_type: local-chat-completions
       endpoint: chat/completions
-      max_gen_toks: 16384
+      max_gen_toks: 512
       apply_chat_template: true
+      threshold: 0.94
 
   Kimi-K2.5-MXFP4:
     backend: atom

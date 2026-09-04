@@ -416,9 +416,14 @@ fi
 if [[ -n "${NUM_SPEC_TOKENS}" ]]; then
   server_common+=(--num-speculative-tokens "${NUM_SPEC_TOKENS}")
 fi
-if [[ -n "${SPEC_DECODE_ACCEPTANCE_LENGTH}" ]]; then
+spec_decode_acceptance_for_server="${SPEC_DECODE_ACCEPTANCE_LENGTH}"
+if [[ "${ATOMESH_EXECUTION_PHASE}" == "eval" && "${EVAL_TASK}" == "gsm8k" ]]; then
+  spec_decode_acceptance_for_server=""
+  echo "[runtime] omitting spec-decode-acceptance-length for gsm8k eval phase"
+fi
+if [[ -n "${spec_decode_acceptance_for_server}" ]]; then
   server_common+=(
-    --spec-decode-acceptance-length "${SPEC_DECODE_ACCEPTANCE_LENGTH}"
+    --spec-decode-acceptance-length "${spec_decode_acceptance_for_server}"
   )
 fi
 if [[ -n "${STATE_CHECKPOINT_INTERVAL_TOKENS}" ]]; then
