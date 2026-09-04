@@ -49,6 +49,8 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `state_checkpoint_demand` | `bool` | `True` | Whether a prefix hit refused for want of a checkpoint may place a rung of its own. Off leaves the prompt-end anchor as the only placement. Overridden by `ATOM_STATE_CHECKPOINT_DEMAND` |
 | `port` | `int` | `8006` | Engine internal communication port |
 | `torch_profiler_dir` | `str \| None` | `os.getenv("ATOM_TORCH_PROFILER_DIR", None)` | Directory for saving PyTorch profiler traces; creates the directory if it does not exist |
+| `profiler_delay_iters` | `int` | `0` | Engine steps to skip after `/start_profile` before the profiler records. `0` records immediately. Counted per `/start_profile`, so the delay restarts on every request |
+| `profiler_max_iters` | `int` | `0` | Recorded engine steps after which the profiler stops itself and writes the trace, with no `/stop_profile` needed. `0` records until stopped. An engine step is one forward dispatch, which under MTP or EAGLE covers the draft passes too. Each engine counts its own steps, so with DP or disagg the windows are per-engine: a `/start_profile` that returns 409 because one engine is still recording has already started the others, and needs a `/stop_profile` before it is retried |
 | `compilation_config` | `CompilationConfig` | `CompilationConfig()` | Compilation and CUDA graph settings (see Section 2) |
 | `quant_config` | `QuantizationConfig` | *(auto-detected)* | Quantization settings; auto-detected from HuggingFace config during `__post_init__` via `QuantizationConfig(hf_config)` (see Section 3) |
 | `asyncio_mode` | `bool` | `False` | Enable asyncio-based engine loop |
@@ -371,6 +373,8 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--load_dummy` | | `{empty,zero,xavier}` (optional value) | `None` | Dummy weights: bare/`=empty` skip load; `=zero` all-zero; `=xavier` xavier(bf16)/constant-magnitude(fp4/fp8) |
 | `--enable-expert-parallel` | | flag | `False` | Enable Expert Parallelism (EP MoE) |
 | `--torch-profiler-dir` | | `str` | `None` | Directory for torch profiler traces |
+| `--profiler-delay-iters` | | `int` | `0` | Engine steps to skip after `/start_profile` before recording starts |
+| `--profiler-max-iters` | | `int` | `0` | Stop the profiler and write the trace after this many recorded engine steps, without a `/stop_profile` call |
 | `--enable-dp-attention` | | flag | `False` | Enable DP attention |
 | `--method` | | `str` | `None` | Speculative method; choices: `mtp` |
 | `--num-speculative-tokens` | | `int` | `1` | Number of speculative tokens per iteration |

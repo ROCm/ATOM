@@ -289,9 +289,9 @@ class LLMEngine:
         outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
         return outputs
 
-    def start_profile(self):
-        self.core_mgr.broadcast_utility_command_sync("start_profile")
-        logger.info("Profiling started")
+    def start_profile(self) -> list[dict[str, Any]]:
+        responses = self.core_mgr.broadcast_utility_command_sync("start_profile")
+        return [resp.get("result", {}) for resp in responses]
 
     def stop_profile(self) -> list[dict[str, Any]]:
         responses = self.core_mgr.broadcast_utility_command_sync(

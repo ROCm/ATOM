@@ -2444,11 +2444,36 @@ async def server_info():
 async def start_profile():
     """Start profiling the engine."""
     try:
-        engine.start_profile()
-        return {"status": "success", "message": "Profiling started"}
+        results = engine.start_profile()
     except Exception as e:
         logger.exception("Failed to start profiling")
         raise HTTPException(status_code=500, detail=f"Failed to start profiling: {e!s}")
+    errors = [r["error"] for r in results if "error" in r]
+    if errors:
+        if len(errors) == len(results):
+            detail = errors[0]
+        else:
+            # Every engine decides for itself and the broadcast has already
+            # run, so the ones that were idle are recording by now. Say so
+            # rather than letting the 409 imply nothing started.
+            detail = (
+                f"Profiling already in progress on {len(errors)} of "
+                f"{len(results)} engines; the others have now started. "
+                "Call /stop_profile before retrying."
+            )
+        raise HTTPException(status_code=409, detail=detail)
+    message = next(
+        (r["message"] for r in results if "message" in r), "Profiling started"
+    )
+    response = {"status": "success", "message": message}
+    # Present only when a delay is configured, so a client can wait out the
+    # window without parsing the message.
+    armed = next(
+        (r["armed_after_iters"] for r in results if "armed_after_iters" in r), None
+    )
+    if armed is not None:
+        response["armed_after_iters"] = armed
+    return response
 
 
 @app.post("/stop_profile")
