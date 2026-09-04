@@ -876,6 +876,21 @@ def summary_cells(row: dict[str, Any]) -> list[str]:
     ]
 
 
+def summary_sort_key(row: dict[str, Any]) -> tuple[str, int, int, int]:
+    """Group the table by model, then walk each concurrency ladder upward.
+
+    Without this the rows arrive in result-path order, which interleaves the
+    serving bands of a single model (c32, c40, c12, c16, c8, c1 ...) because the
+    band name sits ahead of the concurrency in every cell id.
+    """
+    return (
+        model_key(row.get("benchmark_model_name")),
+        int(number(row.get("max_concurrency")) or 0),
+        int(number(row.get("random_input_len")) or 0),
+        int(number(row.get("random_output_len")) or 0),
+    )
+
+
 def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
     headers = summary_headers(rows)
     lines = [
@@ -886,7 +901,10 @@ def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
         + " | ".join("---:" if right else "---" for _, right in SUMMARY_LAYOUT)
         + " |",
     ]
-    lines.extend("| " + " | ".join(summary_cells(row)) + " |" for row in rows)
+    lines.extend(
+        "| " + " | ".join(summary_cells(row)) + " |"
+        for row in sorted(rows, key=summary_sort_key)
+    )
     note = summary_note(rows)
     if note:
         lines.extend(["", note])
