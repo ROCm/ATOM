@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 from functools import partial as functools_partial
 from typing import Callable, Optional
 
@@ -892,9 +893,18 @@ class LinearBase(nn.Module):
             self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
 
     def _maybe_pad_a8w8_preshuffle_output(self) -> bool:
-        if not (
+        is_per_token = (
             self.quant_type == QuantType.per_Token and self.params_dtype == dtypes.fp8
-        ):
+        )
+        is_dsv4_fused_qkv_block = (
+            os.getenv("ATOM_DSV4_0731_OPTIMIZATIONS", "0") == "1"
+            and self.quant_type == QuantType.per_1x128
+            and self.params_dtype == dtypes.fp8
+            and getattr(self, "needs_preshuffled_weight", False)
+            and self.weight.dim() == 2
+            and self.weight.shape[0] == 2112
+        )
+        if not (is_per_token or is_dsv4_fused_qkv_block):
             return False
         if self.weight.dim() != 2:
             return False
@@ -915,10 +925,13 @@ class LinearBase(nn.Module):
         self.weight.data = torch.nn.functional.pad(
             self.weight.data, (0, 0, 0, padding_size)
         )
-        ws = self.weight_scale.data
-        self.weight_scale.data = torch.cat(
-            [ws, ws.new_ones((padding_size, *ws.shape[1:]))], dim=0
-        )
+        if is_per_token:
+            ws = self.weight_scale.data
+            self.weight_scale.data = torch.cat(
+                [ws, ws.new_ones((padding_size, *ws.shape[1:]))], dim=0
+            )
+        # per_1x128 scales are row-blocked; N=2112 and padded N=2176 both use
+        # 17 scale rows, so no scale padding is necessary for this DSV4 weight.
         # Bias is also per-output-channel
         if self.bias is not None:
             b = self.bias.data

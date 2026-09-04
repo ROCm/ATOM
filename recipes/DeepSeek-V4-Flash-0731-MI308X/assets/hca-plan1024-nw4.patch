@@ -1,0 +1,15 @@
+--- a/aiter/ops/flydsl/kernels/fused_compress_attn.py
++++ b/aiter/ops/flydsl/kernels/fused_compress_attn.py
+@@ -2536,7 +2536,10 @@
+         # ratio=128, MTP<=3) prefers k_split=4 over 8: 30.4 vs 34.9 us on
+         # MI355X (~14% win, ~5 us per HCA layer).
+         return 256, 4
+     if plan_capacity <= 1024:
+-        return 512, 8
++        # MI308X: keep the 769-1024 row at SL256/NW4.  The inherited
++        # SL512/NW8 row compiles at only two waves/EU for the representative
++        # c8/i64K 128K-token co-prefill shape.
++        return 256, 4
+     if plan_capacity <= 8192:
+         return 512, 4
+     return 512, 1
