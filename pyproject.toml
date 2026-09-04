@@ -10,7 +10,7 @@ readme = "README.md"
 description = "a lightweight vLLM implementation built from scratch"
 requires-python = ">=3.10"
 dynamic = ["version"]
-dependencies = ["pybind11", "transformers==5.12.1", "zmq", "msgspec", "xxhash", "fastapi>=0.115,<0.137", "psutil", "prometheus_client>=0.25,<0.26", "protobuf", "uvicorn", "uvloop", "aiohttp", "datasets", "openpyxl", "tqdm", "setproctitle"]
+dependencies = ["pybind11", "transformers==5.16.1", "decord==0.6.0", "zmq", "msgspec", "xxhash", "fastapi>=0.115,<0.137", "psutil", "prometheus_client>=0.25,<0.26", "protobuf", "uvicorn", "uvloop", "aiohttp", "datasets", "openpyxl", "tqdm", "setproctitle"]
 
 [project.optional-dependencies]
 # atom/diffusion only. Kept out of the base install because none of it is

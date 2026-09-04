@@ -1246,3 +1246,82 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 if f"layers.{base + i}." in weight_name:
                     return base + i
         return None
+
+
+class Glm5NextMultimodalModel(nn.Module):
+    """GLM-5.3-Flash language model plus its native image/video encoder."""
+
+    packed_modules_mapping = Glm5NextForConditionalGeneration.packed_modules_mapping
+    hf_to_atom_mapper: ClassVar[dict[str, str]] = {
+        "model.visual.": "visual.",
+        "model.language_model.": "language_model.model.",
+        "lm_head.": "language_model.lm_head.",
+    }
+    quant_exclude_name_mapping = {
+        "model.visual.": "visual.",
+        "model.": "language_model.model.",
+        "lm_head.": "language_model.lm_head.",
+    }
+    weights_mapping: ClassVar[dict[str, str]] = {
+        "index_kpool_compress_gate": "index_kpool_compress_gate.weight",
+    }
+    fall_back_to_pt_during_load = False
+
+    def __init__(self, atom_config: Config, prefix: str = "") -> None:
+        super().__init__()
+        from atom.models.glm5_next_vl import Glm5NextVisionTransformer
+
+        mm_config = atom_config.multimodal_config
+        if mm_config is None:
+            raise ValueError("GLM-5.3 multimodal serving requires multimodal_config")
+        self.visual = Glm5NextVisionTransformer(mm_config.vision_config)
+        self.language_model = Glm5NextForConditionalGeneration(
+            atom_config, prefix=maybe_prefix(prefix, "language_model")
+        )
+        self.image_token_id = int(getattr(mm_config, "image_token_id", 154854))
+        self.video_token_id = int(getattr(mm_config, "video_token_id", 154855))
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.language_model.embed_input_ids(input_ids)
+
+    def get_vision_embeddings(self, pixel_values, grid_thw):
+        return self.visual(pixel_values, grid_thw)
+
+    def merge_multimodal_embeddings(self, input_ids, inputs_embeds, vision_embeds):
+        mask = (input_ids == self.image_token_id) | (input_ids == self.video_token_id)
+        if int(mask.sum()) != vision_embeds.shape[0]:
+            raise ValueError(
+                f"GLM vision produced {vision_embeds.shape[0]} embeddings for "
+                f"{int(mask.sum())} image/video placeholder tokens"
+            )
+        inputs_embeds[mask] = vision_embeds.to(inputs_embeds.dtype)
+        return inputs_embeds
+
+    def forward(
+        self,
+        input_ids,
+        positions,
+        intermediate_tensors=None,
+        inputs_embeds=None,
+        **model_kwargs,
+    ):
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_input_ids(input_ids)
+        return self.language_model(
+            input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+        )
+
+    def compute_logits(self, hidden_states):
+        return self.language_model.compute_logits(hidden_states)
+
+    def get_expert_mapping(self):
+        return self.language_model.get_expert_mapping()
+
+    @staticmethod
+    def get_spec_layer_idx_from_weight_name(config, weight_name):
+        return Glm5NextForConditionalGeneration.get_spec_layer_idx_from_weight_name(
+            config, weight_name
+        )

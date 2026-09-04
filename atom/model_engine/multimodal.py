@@ -23,6 +23,9 @@ from atom.config import Config
 from atom.utils import resolve_obj_by_qualname
 
 _MULTIMODAL_ARCH_TO_MODEL: dict[str, str] = {
+    "Glm5NextForConditionalGeneration": (
+        "atom.models.glm5_next.Glm5NextMultimodalModel"
+    ),
     "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MultimodalModel",
     "Qwen3_5MoeForConditionalGeneration": (
         "atom.models.qwen3_5.Qwen3_5MoeMultimodalModel"
