@@ -4,7 +4,7 @@ import torch
 from aiter import dtypes
 
 from atom.config import KVCacheTensor
-from atom.model_ops.attentions.sub_pool_spec import SubPoolSpec, page_pool
+from atom.model_ops.attentions.pool_layout.sub_pool_spec import SubPoolSpec, page_pool
 
 logger = logging.getLogger("atom")
 

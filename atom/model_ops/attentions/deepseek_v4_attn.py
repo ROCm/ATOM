@@ -70,12 +70,12 @@ from atom.model_ops.attentions.backends import (
     AttentionMetadataBuilder,
     CommonAttentionBuilder,
 )
-from atom.model_ops.attentions.paged_state_copy import (
+from atom.model_ops.attentions.pool_layout.paged_state_copy import (
     SegmentedCopyPlan,
     launch_copy_descriptor,
     plan_segmented_copy,
 )
-from atom.model_ops.attentions.state_arena import (
+from atom.model_ops.attentions.pool_layout.state_arena import (
     SplitStateArena,
     StateArena,
     StateField,
@@ -83,12 +83,12 @@ from atom.model_ops.attentions.state_arena import (
     plan_field_planes,
     plan_regions,
 )
-from atom.model_ops.attentions.sub_pool_spec import (
+from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
     SubPoolSpec,
     page_pool,
     state_pool,
 )
-from atom.model_ops.attentions.v4_pool_geometry import (
+from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
     ABSENT_RATIO,
     CSA_RATIO,
     DENSE_RATIO,
@@ -2749,12 +2749,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         return self._ubatch_decode_meta[ubatch_idx]
 
     def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
-        """V4 prefill prep: extends parent to always populate block_tables
-        and state_slot_out.
+        """V4 prefill prep: extends parent to always upload block_tables
+        and to publish state_slot_out.
 
-        The parent only emits block_tables when has_cached (prefix cache hit);
-        V4 always needs block_tables because Compressor scatters compressed
-        entries into the classical KV pool from token 0 onwards.
+        The parent only uploads block_tables when has_cached (prefix cache
+        hit); V4 always needs them on the device because Compressor scatters
+        compressed entries into the classical KV pool from token 0 onwards.
 
         Also publishes CPU mirrors (`v4_*_cpu`) consumed by the V4 forward
         path to avoid `.item()` / `.tolist()` syncs (PR-A Phase 2).
@@ -2770,9 +2770,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # PREFILL_PREFIX if any seq has chunk_start > 0 (chunked prefill).
         scheduled_bs = batch.total_seqs_num_prefill
         if attn_metadata.block_tables is None:
-            attn_metadata.block_tables = self._populate_block_tables(
-                batch, scheduled_bs
-            )
+            # Marshalled by the parent every step; only its upload is gated on
+            # a prefix-cache hit, and V4 needs the table on every one.
+            attn_metadata.block_tables = self.model_runner.forward_vars[
+                "block_tables"
+            ].copy_to_gpu(scheduled_bs)
         state_slot_gpu, state_slot_np = self._populate_state_slot_mappings(
             batch, scheduled_bs, running_bs, return_cpu=True
         )
@@ -3893,18 +3895,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             running_bs=running_bs,
             max_q_len=max_q_len,
         )
-
-    def _populate_block_tables(
-        self, batch: ScheduledBatch, scheduled_bs: int
-    ) -> torch.Tensor:
-        """Populate `forward_vars["block_tables"]` from the batch and return
-        the GPU view sliced to `scheduled_bs` rows.
-
-        Defers the marshal to `CommonAttentionBuilder.prepare_block_tables`,
-        but is invoked unconditionally (parent only calls it when has_cached).
-        """
-        self.prepare_block_tables(batch, limit=scheduled_bs)
-        return self.model_runner.forward_vars["block_tables"].copy_to_gpu(scheduled_bs)
 
     def _populate_state_slot_mappings(
         self,

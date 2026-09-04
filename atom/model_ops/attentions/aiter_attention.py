@@ -21,7 +21,7 @@ from atom.utils.forward_context import AttentionMetaData, Context, get_forward_c
 from atom.utils.tbo import TokenSplitPrefillState
 
 from .backends import AttentionBackend, CommonAttentionBuilder
-from .sub_pool_spec import SubPoolSpec, page_pool
+from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool
 
 logger = logging.getLogger("atom")
 
@@ -879,20 +879,18 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
         if self._has_sparse_attention and not attn_metadata.has_cached:
             bs = batch.total_seqs_num_prefill
-            self.prepare_block_tables(batch)
             attn_metadata.block_tables = self.model_runner.forward_vars[
                 "block_tables"
             ].copy_to_gpu(bs)
         # `prefill_attention_triton` reads the paged KV cache, so it needs a
-        # block_table even with no cached tokens. The base builder only uploads
-        # one when `has_cached`.
+        # block_table even with no cached tokens. The base builder marshals one
+        # every step but only uploads it when `has_cached`.
         if (
             attn_metadata.block_tables is None
             and envs.ATOM_USE_UNIFIED_ATTN
             and batch.block_tables
         ):
             bs = batch.total_seqs_num_prefill
-            self.prepare_block_tables(batch)
             attn_metadata.block_tables = self.model_runner.forward_vars[
                 "block_tables"
             ].copy_to_gpu(bs)

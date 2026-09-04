@@ -16,7 +16,7 @@ from itertools import pairwise
 import pytest
 import torch
 
-from atom.model_ops.attentions.state_arena import (
+from atom.model_ops.attentions.pool_layout.state_arena import (
     StateArena,
     StateField,
     checkpoint_ranges_for,

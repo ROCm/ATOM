@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 import torch
 
-from atom.model_ops.attentions.paged_state_copy import (
+from atom.model_ops.attentions.pool_layout.paged_state_copy import (
     launch_copy_descriptor,
     plan_segmented_copy,
 )

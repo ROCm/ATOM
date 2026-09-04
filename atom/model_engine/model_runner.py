@@ -54,7 +54,7 @@ from atom.model_engine.sequence import (
 )
 from atom.model_engine.state_runtime import StateRuntime
 from atom.model_loader.loader import load_model
-from atom.model_ops.attentions.sub_pool_spec import (
+from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
     InsufficientPoolBudget,
     Pool,
     PoolPlan,
@@ -1661,7 +1661,7 @@ class ModelRunner:
         specs = self._sub_pool_specs()
 
         # Sub-pool sizing is pure arithmetic over the byte budget — see
-        # atom/model_ops/attentions/sub_pool_spec.py. STATE classes (GDN
+        # atom/model_ops/attentions/pool_layout/sub_pool_spec.py. STATE classes (GDN
         # recurrent state, the V4 compressor ring, the V4 sliding window) take
         # their floor first because a request cannot run without them; the
         # PAGE class absorbs the rest. Which classes exist, and what they are

@@ -16,7 +16,7 @@ from atom.utils import envs
 from .aiter_mla import AiterMLAMetadataBuilder
 from .backends import AttentionBackend
 from .gdn_attn import GDNStateMixin
-from .sub_pool_spec import SubPoolSpec, page_pool
+from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool
 from .triton_mla import TritonMLAMetadataBuilder
 
 

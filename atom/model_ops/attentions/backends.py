@@ -23,8 +23,12 @@ from atom.model_engine.page_unit_checkpoint import (
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAModules
-from atom.model_ops.attentions.sub_pool_spec import SubPoolSpec
-from atom.model_ops.dcp_ops import dcp_local_index, dcp_owner_rank
+from atom.model_ops.attentions.pool_layout.sub_pool_spec import SubPoolSpec
+from atom.model_ops.attentions.token_layout.prefill import (
+    prefill_positions,
+    prefill_slot_mapping,
+)
+from atom.model_ops.dcp_ops import dcp_prefill_slot_mapping
 from atom.utils import CpuGpuBuffer, pack_rows
 from atom.utils.forward_context import AttentionMetaData, AttnState, ForwardMode
 from atom.utils.tbo.ubatch_splitting import (
@@ -339,6 +343,11 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         ).interleave_size
         self.max_num_batched_tokens = model_runner.max_num_batched_tokens
         self.max_bs = model_runner.max_bs
+        # Host scratch for the token axis, resident for the same reason every
+        # mirror is: a step runs one slot mapping between a lot of unrelated
+        # allocation, so a fresh temporary of this size costs what a cold
+        # allocation costs, not what a warm free-list hit costs.
+        self.token_axis_scratch = np.empty(self.max_num_batched_tokens, dtype=np.int64)
         # Every row's own index, resident so no step rebuilds it. One buffer for
         # three readers that each want the same numbers: a cu_seqlens ramp at one
         # token per sequence (hence `+ 1`), the real prefix a padded
@@ -370,6 +379,9 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             ),
             "cu_seqlens_q": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
             "cu_seqlens_k": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
+            # Uploaded only on a prefix-cache hit, so consumers read
+            # `AttentionMetaData.num_cached_tokens is None` as "no row has any".
+            "num_cached_tokens": CpuGpuBuffer(self.max_bs, **i32_kwargs),
             # seq_starts for cp_mha_gather_cache: always zeros (prefix at position 0)
             "seq_starts": CpuGpuBuffer(self.max_bs, **i32_kwargs),
         }
@@ -383,15 +395,14 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         self.model_runner.forward_vars.update(attn_metadata)
         self.has_sliding_window = hasattr(hf_config, "sliding_window")
 
-    def prepare_block_tables(self, batch: ScheduledBatch, limit: int | None = None):
+    def prepare_block_tables(self, batch: ScheduledBatch):
         """Marshal the batch's block tables into `forward_vars["block_tables"]`.
 
-        `limit` caps how many rows are taken, for callers scheduling fewer
-        sequences than the batch carries.
+        Runs on every prefill step, not only the ones that upload the buffer:
+        `prepare_prefill` reads it back to place each token's KV slot, so a
+        caller that wants the table on the device only has to upload it.
         """
-        var = self.model_runner.forward_vars
-        rows = batch.block_tables if limit is None else batch.block_tables[:limit]
-        pack_rows(var["block_tables"].np, rows)
+        pack_rows(self.model_runner.forward_vars["block_tables"].np, batch.block_tables)
 
     def _mrope_cpu_view(self, num_tokens: int) -> np.ndarray:
         return (
@@ -499,138 +510,184 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             self.model_runner.forward_vars["cu_seqlens_q"].np[: bs + 1],
         )
 
-    def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
-        scheduled_bs = batch.total_seqs_num_prefill
-        sum_scheduled_tokens = batch.total_tokens_num_prefill
+    def _publish_prefill_seq_lens(
+        self, context_lens: np.ndarray, scheduled_bs: int, running_bs: int
+    ) -> int:
+        """Write the two per-sequence length mirrors; return the batch's total KV.
+
+        Straight into the mirrors: this step is their only writer, so a
+        temporary would just be copied over.
+
+        Both are padded out to `running_bs`, the width a draft pass that follows
+        this step runs at and the one `prepare_decode` fills to. A flat cumsum
+        gives each fabricated row zero query length and a zero context makes it
+        read nothing; left unwritten they hold the previous step's, and the
+        drafter attends to a since-freed request's blocks.
+        """
+        cu_k = self.model_runner.forward_vars["cu_seqlens_k"].np
+        cu_k[0] = 0
+        np.cumsum(context_lens, out=cu_k[1 : scheduled_bs + 1])
+        cu_k[scheduled_bs + 1 : running_bs + 1] = cu_k[scheduled_bs]
+        lens = self.model_runner.forward_vars["context_lens"].np
+        lens[:scheduled_bs] = context_lens
+        lens[scheduled_bs:running_bs] = 0
+        return int(cu_k[scheduled_bs])
+
+    def _write_prefill_slots(
+        self,
+        batch: ScheduledBatch,
+        scheduled_bs: int,
+        positions: np.ndarray,
+        seqlens_q: np.ndarray,
+        cached_lens: np.ndarray,
+        context_lens: np.ndarray,
+    ) -> None:
+        """Place every scheduled token's KV slot into the `slot_mapping` mirror.
+
+        `-1` means "written nowhere": either the batch carries no block tables
+        at all, or under DCP this token belongs to another rank.
+        """
+        block_size = self.model_runner.block_size
         var = self.model_runner.forward_vars
-        positions = []
-        cu_seqlens_q = [0]
-        cu_seqlens_k = [0]
-        max_seqlen_q = 0
-        max_seqlen_k = 0
-        slot_mapping = []
-        has_cached = False
-        # seqs = list(batch.seqs.values())
-        # seqs = seqs[:scheduled_bs]
-        for i in range(scheduled_bs):
-            seqlen = batch.context_lens[i]
-            cached_seqlen = batch.num_cached_tokens[i]
-            if cached_seqlen > 0:
-                has_cached = True
-            positions.extend(list(range(cached_seqlen, seqlen)))
-            seqlen_q = seqlen - cached_seqlen
-            seqlen_k = seqlen
-            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
-            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
-            max_seqlen_q = max(seqlen_q, max_seqlen_q)
-            max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            if not batch.block_tables:
-                continue
-            block_table = batch.block_tables[i]
-            block_size = self.model_runner.block_size
-            if self.dcp_world_size > 1:
-                W = self.dcp_world_size
-                S = self.cp_kv_cache_interleave_size
-                virtual_block_size = block_size * W
-                for pos in range(cached_seqlen, seqlen):
-                    # Block-level interleave: token pos is owned by rank
-                    # (pos//S)%W at local index (pos//(S*W))*S + pos%S. S=1 is the
-                    # original round-robin. blk_idx = pos // (block_size*W) equals
-                    # local_index // block_size (needs block_size % S == 0).
-                    if dcp_owner_rank(pos, W, S) == self.dcp_rank:
-                        blk_idx = pos // virtual_block_size
-                        local_offset = dcp_local_index(pos, W, S) % block_size
-                        slot_mapping.append(
-                            block_table[blk_idx] * block_size + local_offset
-                        )
-                    else:
-                        slot_mapping.append(-1)
-            else:
-                first_blk = cached_seqlen // block_size
-                last_blk = (seqlen - 1) // block_size
-                for blk_idx in range(first_blk, last_blk + 1):
-                    blk_start = block_table[blk_idx] * block_size
-                    # Offset within block: skip already-cached prefix in first block
-                    off_start = (
-                        cached_seqlen % block_size if blk_idx == first_blk else 0
-                    )
-                    # End within block: partial last block
-                    off_end = (
-                        ((seqlen - 1) % block_size) + 1
-                        if blk_idx == last_blk
-                        else block_size
-                    )
-                    slot_mapping.extend(
-                        range(blk_start + off_start, blk_start + off_end)
-                    )
-        if has_cached:
-            self.prepare_block_tables(batch)
-        # Validate metadata consistency
-        assert (
-            len(positions) == sum_scheduled_tokens
-        ), f"positions length {len(positions)} != sum_scheduled_tokens {sum_scheduled_tokens}"
-        if batch.block_tables:
-            assert (
-                len(slot_mapping) == sum_scheduled_tokens
-            ), f"slot_mapping length {len(slot_mapping)} != sum_scheduled_tokens {sum_scheduled_tokens}"
-        assert (
-            cu_seqlens_q[-1] == sum_scheduled_tokens
-        ), f"cu_seqlens_q[-1]={cu_seqlens_q[-1]} != sum_scheduled_tokens={sum_scheduled_tokens}"
-        var["positions"].np[:sum_scheduled_tokens] = positions
-        var["slot_mapping"].np[:sum_scheduled_tokens] = -1
-        var["slot_mapping"].np[: len(slot_mapping)] = slot_mapping
-        # `cu_seqlens_q` already holds this: `publish_cu_seqlens_q`
-        # publishes it before `prepare_input_ids`, off the same
-        # `num_scheduled_tokens` this loop re-derives as
-        # `context_lens - num_cached_tokens`. Cross-check instead of rewriting;
-        # a second writer is how two derivations of one array drift.
-        assert np.array_equal(
-            var["cu_seqlens_q"].np[: scheduled_bs + 1], cu_seqlens_q
-        ), f"prefill cu_seqlens_q {cu_seqlens_q} != published"
-        var["cu_seqlens_k"].np[: scheduled_bs + 1] = cu_seqlens_k
-        var["context_lens"].np[:scheduled_bs] = batch.context_lens[:scheduled_bs]
-        # Pad the per-sequence tail out to `running_bs`, the width a draft pass
-        # that follows this step runs at and the one `prepare_decode` fills to.
-        # A flat cumsum gives each fabricated row zero query length and a zero
-        # context makes it read nothing; left unwritten they hold the previous
-        # step's, and the drafter attends to a since-freed request's blocks.
-        var["cu_seqlens_k"].np[scheduled_bs + 1 : running_bs + 1] = cu_seqlens_k[-1]
-        var["context_lens"].np[scheduled_bs:running_bs] = 0
-        min_seqlen_q = 0
-        dropout_p = 0.0
+        slots = var["slot_mapping"].np[: positions.shape[0]]
+        if not batch.block_tables:
+            slots[:] = -1
+            return
+        assert len(batch.block_tables) >= scheduled_bs, (
+            f"block_tables has {len(batch.block_tables)} rows for a batch "
+            f"whose first {scheduled_bs} are being prefilled"
+        )
+        # Marshalled every step, not only on the steps that upload it: the dense
+        # path below reads this buffer rather than the batch's ragged rows, so
+        # one pack serves both readers. The upload stays gated on `has_cached`.
+        self.prepare_block_tables(batch)
+        if self.dcp_world_size > 1:
+            dcp_slots = dcp_prefill_slot_mapping(
+                batch.block_tables[:scheduled_bs],
+                cached_lens.tolist(),
+                context_lens.tolist(),
+                block_size,
+                self.dcp_world_size,
+                self.dcp_rank,
+                self.cp_kv_cache_interleave_size,
+            )
+            assert len(dcp_slots) == slots.shape[0], (
+                f"dcp slot mapping is {len(dcp_slots)} long, not the "
+                f"{slots.shape[0]} tokens this step forwards"
+            )
+            slots[:] = dcp_slots
+            return
+        prefill_slot_mapping(
+            positions,
+            seqlens_q,
+            var["block_tables"].np,
+            block_size,
+            out=slots,
+            scratch=self.token_axis_scratch,
+        )
+
+    def _upload_prefill_mirrors(
+        self,
+        scheduled_bs: int,
+        running_bs: int,
+        sum_scheduled_tokens: int,
+        has_cached: bool,
+        cached_lens: np.ndarray,
+    ) -> dict:
+        """Send this step's mirrors to the device; return them keyed for
+        `AttentionMetaData`.
+
+        Which ones go depends on `has_cached`: with no prefix hit nothing reads
+        the block tables, the zero `seq_starts`, or the cached prefix, so the
+        step does not pay for uploading them. `num_cached_tokens` staying
+        absent is also how a consumer learns there is no prefix at all.
+        """
+        var = self.model_runner.forward_vars
         vars_used = [
             ("cu_seqlens_k", running_bs + 1),
             ("slot_mapping", sum_scheduled_tokens),
             ("context_lens", running_bs),
         ]
         if has_cached:
-            vars_used.append(("block_tables", scheduled_bs))
-            vars_used.append(("seq_starts", scheduled_bs))
-
+            # `cached_lens`, not `batch.num_cached_tokens`: the same numbers,
+            # already an int32 array rather than a Python list.
+            var["num_cached_tokens"].np[:scheduled_bs] = cached_lens
+            vars_used += [
+                ("block_tables", scheduled_bs),
+                ("seq_starts", scheduled_bs),
+                ("num_cached_tokens", scheduled_bs),
+            ]
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
         # Already on the device: `publish_cu_seqlens_q` uploads it for every
         # step, so this is a view. One writer AND one upload for this buffer.
         ctx["cu_seqlens_q"] = var["cu_seqlens_q"].gpu[: running_bs + 1]
-        num_cached_tokens = None
-        if has_cached:
-            num_cached_tokens = torch.tensor(
-                batch.num_cached_tokens[:scheduled_bs],
-                dtype=torch.int32,
-                pin_memory=True,
-            ).cuda(non_blocking=True)
-            total_tokens = sum(batch.context_lens[:scheduled_bs])
-        total_kv = total_tokens if has_cached else sum_scheduled_tokens
+        return ctx
+
+    def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
+        scheduled_bs = batch.total_seqs_num_prefill
+        sum_scheduled_tokens = batch.total_tokens_num_prefill
+        var = self.model_runner.forward_vars
+
+        # The cached prefix is subtracted out of the two arrays this step
+        # already holds rather than read from `batch.num_cached_tokens`, so it
+        # cannot disagree with the query lengths the rest of the step uses.
+        context_lens = batch.context_lens[:scheduled_bs]
+        seqlens_q = batch.num_scheduled_tokens[:scheduled_bs]
+        cached_lens = context_lens - seqlens_q
+        cu_seqlens_q = var["cu_seqlens_q"].np[: scheduled_bs + 1]
+        # Two asserts because there are two ways this can be wrong and only one
+        # of them is about the buffer. The first says `publish_cu_seqlens_q` ran
+        # over these rows; the second is the cross-check the derivation above
+        # would otherwise have cost -- `context_lens` is
+        # `num_cached_tokens + num_scheduled_tokens` for a PREFILL row and
+        # `seq.num_tokens` for a DECODE one (`scheduler.py`), so a decode row
+        # among the first `scheduled_bs` shows up here elementwise even in the
+        # cases where the totals still happen to agree.
+        assert cu_seqlens_q[scheduled_bs] == sum_scheduled_tokens, (
+            f"published cu_seqlens_q ends at {cu_seqlens_q[scheduled_bs]}, not the "
+            f"{sum_scheduled_tokens} tokens scheduled for prefill: the batch's "
+            f"first {scheduled_bs} rows are not its prefill rows"
+        )
+        # `.tolist()` against the list, not `np.array_equal` against it: the
+        # latter rebuilds an array from the list every step and costs 6x for
+        # the same answer (6.1 vs 1.0 us at bs=256).
+        assert cached_lens.tolist() == batch.num_cached_tokens[:scheduled_bs], (
+            f"derived cached prefix {cached_lens.tolist()} != the scheduler's "
+            f"{batch.num_cached_tokens[:scheduled_bs]}"
+        )
+        # `> 0`, not a truth test: the asserts above are what stand between this
+        # and a decode row, and a decode row's prefix comes out negative.
+        has_cached = bool((cached_lens > 0).any())
+        max_seqlen_q = int(seqlens_q.max(initial=0))
+        max_seqlen_k = int(context_lens.max(initial=0))
+
+        total_kv = self._publish_prefill_seq_lens(
+            context_lens, scheduled_bs, running_bs
+        )
+        positions = prefill_positions(
+            self.model_runner.arange_np[:sum_scheduled_tokens],
+            cached_lens,
+            cu_seqlens_q,
+            seqlens_q,
+            out=var["positions"].np[:sum_scheduled_tokens],
+        )
+        self._write_prefill_slots(
+            batch, scheduled_bs, positions, seqlens_q, cached_lens, context_lens
+        )
+
+        ctx = self._upload_prefill_mirrors(
+            scheduled_bs, running_bs, sum_scheduled_tokens, has_cached, cached_lens
+        )
         attn_metadata = AttentionMetaData(
             # Cast to python int — numpy.int32 leaks in via batch.context_lens
             # (numpy array) and breaks downstream Triton kernel constexpr
             # binding (`tl.minimum` rejects numpy scalars).
             max_seqlen_q=int(max_seqlen_q),
             max_seqlen_k=int(max_seqlen_k),
-            min_seqlen_q=int(min_seqlen_q),
-            dropout_p=dropout_p,
+            min_seqlen_q=0,
+            dropout_p=0.0,
             has_cached=has_cached,
             total_kv=int(total_kv),
-            num_cached_tokens=num_cached_tokens,
             state=AttnState.PREFILL_PREFIX if has_cached else AttnState.PREFILL_NATIVE,
             **ctx,
         )

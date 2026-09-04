@@ -43,7 +43,7 @@ from atom.utils.block_convert import (
 from atom.utils.forward_context import AttentionMetaData, Context
 
 from .backends import AttentionBackend, CommonAttentionBuilder
-from .sub_pool_spec import SubPoolSpec, page_pool
+from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool
 
 logger = logging.getLogger("atom")
 
@@ -1251,7 +1251,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var = self.model_runner.forward_vars
         if self.is_sparse and attn_metadata.max_seqlen_k > self.index_topk:
             if attn_metadata.block_tables is None:
-                self.prepare_block_tables(batch)
+                # Already marshalled by the base builder; only the upload is
+                # gated on `has_cached`.
                 attn_metadata.block_tables = var["block_tables"].copy_to_gpu(bs)
             counts = var["cu_seqlens_q"].np[1 : bs + 1] - var["cu_seqlens_q"].np[:bs]
             local_offsets = np.concatenate(
@@ -1382,10 +1383,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 attn_metadata.context_lens[:bs], 0
             )
 
-            # kv_indices_generate_triton expects logical block_tables (one entry
-            # per block_ratio tokens). Re-copy from var to get a fresh logical
-            # snapshot independent of attn_metadata.block_tables sharing.
-            self.prepare_block_tables(batch)
+            # kv_indices_generate_triton expects logical block_tables (one
+            # entry per block_ratio tokens). The parent packed exactly that
+            # this step, and the only write to the mirror in between is the
+            # tail zeroing below, which starts at `bs`.
             _pad_prefill_mla_draft_tail(
                 kv_indptr,
                 var["kv_last_page_lens"].np,

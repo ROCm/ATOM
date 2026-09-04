@@ -18,12 +18,14 @@ if not torch.cuda.is_available():
         allow_module_level=True,
     )
 
-from atom.model_ops.attentions.v4_pool_geometry import (
+from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
     CSA_RATIO,
     DENSE_RATIO,
     UnifiedPoolGeometry,
 )
-from atom.model_ops.attentions.v4_pool_geometry import HCA_RATIO as HCA_POOL_RATIO
+from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
+    HCA_RATIO as HCA_POOL_RATIO,
+)
 from atom.model_ops.v4_kernels.paged_prefill_indices import (
     write_v4_paged_prefill_indices,
     write_v4_paged_prefill_indices_reference,
