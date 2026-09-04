@@ -93,3 +93,19 @@ def test_a_unified_claim_is_not_checked_against_the_group(no_group):
     md = DPMetadata.make(_cfg(dp_size=4, dp_rank=3), 7, unified=True)
 
     assert md.get_sizes_across_dp() == [7, 7, 7, 7]
+
+
+def test_predecoded_sync_result_reuses_derived_token_counts():
+    """The packed exchange owns the MAX/cumsum work on the hot path."""
+
+    sync = types.SimpleNamespace(
+        max_tokens_across_dp_cpu=torch.tensor(17, dtype=torch.int32),
+        cu_tokens_across_dp_cpu=torch.tensor([11, 28], dtype=torch.int32),
+        max_tokens_across_dp=17,
+    )
+
+    md = DPMetadata.from_sync_result(sync)
+
+    assert md.max_tokens_across_dp_cpu is sync.max_tokens_across_dp_cpu
+    assert md.cu_tokens_across_dp_cpu is sync.cu_tokens_across_dp_cpu
+    assert md.max_tokens_across_dp == 17

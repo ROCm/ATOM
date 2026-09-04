@@ -37,13 +37,23 @@ def _method(
     )
 
 
-def _attribute_calls(method: ast.FunctionDef, attribute: str) -> list[ast.Call]:
+def _attribute_calls(root: ast.AST, attribute: str) -> list[ast.Call]:
     return [
         node
-        for node in ast.walk(method)
+        for node in ast.walk(root)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == attribute
+    ]
+
+
+def _name_calls(root: ast.AST, name: str) -> list[ast.Call]:
+    return [
+        node
+        for node in ast.walk(root)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == name
     ]
 
 
@@ -116,3 +126,65 @@ def test_late_draft_uploads_are_staged_by_prepare_model():
     assert not _attribute_calls(propose, "anchors_to_gpu")
     assert not _attribute_calls(propose, "copy_to_gpu")
     assert not _attribute_calls(compute_draft_kv, "anchors_to_gpu")
+
+
+def test_device_metadata_wait_is_hidden_by_local_input_staging():
+    """Submit metadata early and wait only after independent host preparation."""
+    forward = _method("forward")
+    begin = _attribute_calls(forward, "_begin_prepare_model")
+    advance = _attribute_calls(forward, "_advance_forward_vars")
+    gate = _attribute_calls(forward, "_gate_staging_reuse")
+    prepare = _attribute_calls(forward, "prepare_model")
+    assert len(begin) == len(advance) == len(gate) == len(prepare) == 1
+    assert begin[0].lineno < advance[0].lineno < gate[0].lineno < prepare[0].lineno
+
+    prepare_model = _method("prepare_model")
+    device_branch = next(
+        node
+        for node in ast.walk(prepare_model)
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "preparation.dp_sync is not None"
+    )
+    device_body = ast.Module(body=device_branch.body, type_ignores=[])
+    sample = _attribute_calls(device_body, "prepare_sample")
+    input_ids = _attribute_calls(device_body, "prepare_input_ids")
+    decode_host = _name_calls(device_body, "prepare_decode_host")
+    spec_decode = _attribute_calls(device_body, "calc_spec_decode_metadata")
+    join_decode_host = _name_calls(device_body, "join_decode_host_preparation")
+    finish = _name_calls(device_body, "finish_sync_dp_metadata")
+    decide = _name_calls(device_body, "_decide")
+
+    assert (
+        len(sample)
+        == len(input_ids)
+        == len(decode_host)
+        == len(spec_decode)
+        == len(join_decode_host)
+        == len(finish)
+        == len(decide)
+        == 1
+    )
+    assert (
+        input_ids[0].lineno
+        < decode_host[0].lineno
+        < spec_decode[0].lineno
+        < sample[0].lineno
+        < join_decode_host[0].lineno
+        < finish[0].lineno
+        < decide[0].lineno
+    )
+
+
+def test_deferred_scheduler_output_precedes_current_draft_submission():
+    """The next schedule must overlap this step's MTP enqueue, not follow it."""
+
+    postprocess = _method("postprocess")
+    publish = _attribute_calls(postprocess, "_publish_forward_output_early")
+    propose = _attribute_calls(postprocess, "propose_draft_token_ids")
+
+    # Real forwards publish the previous generation's output, while dummy
+    # forwards publish their completion acknowledgement.  Both branches must
+    # release the scheduler before the shared proposal submission below.
+    assert len(publish) == 2
+    assert len(propose) == 2  # deferred and ordinary/non-deferred paths
+    assert max(call.lineno for call in publish) < min(call.lineno for call in propose)

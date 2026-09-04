@@ -11,6 +11,7 @@ _ATOM_ENV_VARS = [
     "ATOM_DP_MASTER_IP",
     "ATOM_DP_MASTER_PORT",
     "ATOM_DP_BASE_PORT",
+    "ATOM_DP_METADATA_DEVICE_SYNC",
     "ATOM_USE_TRITON_GEMM",
     "ATOM_USE_TRITON_MXFP4_BMM",
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION",
@@ -67,6 +68,9 @@ class TestEnvsDefaults:
     def test_dp_base_port_default(self):
         assert _get_envs().ATOM_DP_BASE_PORT == 0
 
+    def test_dp_metadata_device_sync_default(self):
+        assert _get_envs().ATOM_DP_METADATA_DEVICE_SYNC is False
+
     def test_use_triton_gemm_default(self):
         assert _get_envs().ATOM_USE_TRITON_GEMM is False
 
@@ -121,6 +125,11 @@ class TestEnvsOverrides:
         monkeypatch.setenv("ATOM_DP_BASE_PORT", "29800")
         assert _get_envs().ATOM_DP_MASTER_PORT == 29700
         assert _get_envs().ATOM_DP_BASE_PORT == 29800
+
+    @pytest.mark.parametrize("value", ["1", "true", "True", "yes", "on"])
+    def test_dp_metadata_device_sync_enabled(self, monkeypatch, value):
+        monkeypatch.setenv("ATOM_DP_METADATA_DEVICE_SYNC", value)
+        assert _get_envs().ATOM_DP_METADATA_DEVICE_SYNC is True
 
     def test_torch_profiler_dir_override(self, monkeypatch):
         monkeypatch.setenv("ATOM_TORCH_PROFILER_DIR", "/tmp/prof")

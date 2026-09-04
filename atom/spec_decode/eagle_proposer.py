@@ -579,6 +579,12 @@ class EagleProposer(Drafter):
 
         # Mid-steps run padded and may replay; step 0 does neither, so it is
         # labelled as the plain batch it is.
+        #
+        # Step 0 also carries the target's exact input stream. Preserve the
+        # target DP table before later draft steps replace the context: its
+        # per-rank row counts are already known from the packed metadata
+        # exchange, so step 0 does not need a duplicate CPU/Gloo all-reduce.
+        target_dp_metadata = forward_context.dp_metadata
         step0_label = f"bs={scheduled_bs}"
         mid_label = (
             self.step.label(scheduled_bs, running_bs) if self.step else step0_label
@@ -604,6 +610,7 @@ class EagleProposer(Drafter):
                     running_tokens=running_bs if i else input_ids.shape[0],
                     # Only a widened mid-step runs a height the group agreed on.
                     running_tokens_are_unified=i > 0 and self.step is not None,
+                    precomputed_dp_metadata=(target_dp_metadata if i == 0 else None),
                 )
                 # ---- Prefill Context Parallel (draft i==0 prefill) --------
                 # The draft's first pass is a prefill that reuses the target's

@@ -25,6 +25,7 @@ _spec = importlib.util.spec_from_file_location("_compress_plan_under_test", _CP_
 _cp = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_cp)
 make_compress_plans = _cp.make_compress_plans
+prepare_compress_plans = _cp.prepare_compress_plans
 
 # V4-Pro layer geometry: (ratio, is_overlap). CSA r=4 overlap (K_pool=8),
 # HCA r=128 non-overlap (K_pool=128).
@@ -44,8 +45,11 @@ class _FakeBuf:
         # Pre-fill with a non-sentinel sentinel so we can prove the -1 fill ran.
         self.np = np.full((rows, 4), 7, dtype=np.int32)
         self._t = torch.from_numpy(self.np)
+        self.gpu = self._t
+        self.copy_count = 0
 
     def copy_to_gpu(self, n=None):
+        self.copy_count += 1
         return self._t if n is None else self._t[:n]
 
 
@@ -97,6 +101,33 @@ def test_decode_cg_slice_equals_graph_bs_times_bound():
         exp_wcap = running_bs * min(qlen, _k_pool(ratio, is_overlap))
         assert p.compress_plan_gpu.shape[0] == exp_ccap
         assert p.write_plan_gpu.shape[0] == exp_wcap
+
+
+def test_decode_cg_can_defer_individual_device_copies():
+    running_bs, qlen = 8, 4
+    extend, context = _uniform_decode(bs=5, qlen=qlen)
+    bufs = _buffers()
+    plans = make_compress_plans(
+        extend,
+        context,
+        RATIOS_OVERLAP,
+        plan_buffers=bufs,
+        running_bs=running_bs,
+        max_q_len=qlen,
+        defer_device_copy=True,
+    )
+
+    for ratio, _ in RATIOS_OVERLAP:
+        assert bufs[ratio]["compress"].copy_count == 0
+        assert bufs[ratio]["write"].copy_count == 0
+        assert (
+            plans[ratio].compress_plan_gpu.data_ptr()
+            == bufs[ratio]["compress"].gpu.data_ptr()
+        )
+        assert (
+            plans[ratio].write_plan_gpu.data_ptr()
+            == bufs[ratio]["write"].gpu.data_ptr()
+        )
 
 
 def test_decode_write_count_is_bs_times_bound():
@@ -157,6 +188,44 @@ def test_decode_cg_invariant_across_real_bs():
             for r, _ in RATIOS_OVERLAP
         }
     assert shapes[running_bs] == shapes[1] == shapes[7]
+
+
+def test_prepared_host_rows_match_inline_construction():
+    """Early host preparation must not change active rows or graph padding."""
+    running_bs, qlen = 8, 4
+    extend = np.array([4, 2, 1], dtype=np.int32)
+    context = np.array([100, 257, 1024], dtype=np.int32)
+
+    expected = make_compress_plans(
+        extend,
+        context,
+        RATIOS_OVERLAP,
+        plan_buffers=_buffers(),
+        running_bs=running_bs,
+        max_q_len=qlen,
+    )
+    prepared = prepare_compress_plans(extend, context, RATIOS_OVERLAP)
+    actual = make_compress_plans(
+        extend,
+        context,
+        RATIOS_OVERLAP,
+        plan_buffers=_buffers(),
+        running_bs=running_bs,
+        max_q_len=qlen,
+        prepared=prepared,
+    )
+
+    for ratio, _ in RATIOS_OVERLAP:
+        assert actual[ratio].num_compress == expected[ratio].num_compress
+        assert actual[ratio].num_write == expected[ratio].num_write
+        assert np.array_equal(
+            actual[ratio].cu_compress_cpu, expected[ratio].cu_compress_cpu
+        )
+        assert np.array_equal(
+            actual[ratio].compress_plan_cpu, expected[ratio].compress_plan_cpu
+        )
+        assert actual[ratio].compress_plan_gpu.equal(expected[ratio].compress_plan_gpu)
+        assert actual[ratio].write_plan_gpu.equal(expected[ratio].write_plan_gpu)
 
 
 # ── empty fwd ─────────────────────────────────────────────────────────────

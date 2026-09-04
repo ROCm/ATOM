@@ -228,16 +228,44 @@ class AsyncIOProc:
         "update_weights_from_shm",
     }
 
+    def _invoke_runner(self, runner, func_name: str, args: list):
+        """Invoke one RPC, arming early forward output only for that RPC."""
+
+        func = getattr(runner, func_name, None)
+        if func is None:
+            return None
+        # A deferred-output ModelRunner can make the scheduler-visible result
+        # available before it finishes enqueueing this step's draft work. Arm
+        # that fast path for both scheduler-visible forwards and the DPA
+        # dummy RPC.  A real forward publishes its ScheduledBatchOutput; a
+        # dummy publishes the RPC's ``True`` completion before its MTP tail is
+        # enqueued.  That lets EngineCore run the next CPU/Gloo state sync and
+        # queue the next RPC while this worker is still submitting the current
+        # proposal, without inventing an unsolicited model output for a dummy.
+        set_output_sink = getattr(runner, "_set_forward_output_sink", None)
+        output_sink = (
+            self.io_queues[1].put_nowait
+            if func_name in ("forward", "dummy_execution")
+            and self.io_addrs[1] is not None
+            else None
+        )
+        if set_output_sink is not None:
+            set_output_sink(output_sink)
+        try:
+            return func(*args)
+        finally:
+            if set_output_sink is not None:
+                set_output_sink(None)
+
     def busy_loop(self):
         """Main event loop: dequeue RPCs and dispatch to runners."""
         while True:
             func_name, args = self.get_func()
             need_barrier = func_name in self._BARRIER_FUNCS
             for runner in self.runners:
-                func = getattr(runner, func_name, None)
-                if func is None:
+                if getattr(runner, func_name, None) is None:
                     continue
-                out = func(*args)
+                out = self._invoke_runner(runner, func_name, args)
                 if need_barrier and self.all_ranks_barrier is not None:
                     self.all_ranks_barrier.wait()
                 if out is not None:

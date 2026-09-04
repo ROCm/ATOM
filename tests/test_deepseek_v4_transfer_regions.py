@@ -73,10 +73,13 @@ def _stub_v4_runtime_imports():
     kernels = types.ModuleType("atom.model_ops.v4_kernels")
     kernels.FP4_MQA_BLOCK_K = 128
     kernels.FP4_MQA_PARALLEL_UNIT_NUM = 1
+    kernels.CompressPlan = object
+    kernels.PreparedCompressPlan = object
     for name in (
         "build_v4_paged_decode_indptr",
         "fp4_indexer_enabled",
         "hca_compress_paged_offsets",
+        "prepare_compress_plans",
         "write_v4_paged_decode_indices",
         "write_v4_paged_prefill_indices",
     ):
@@ -123,6 +126,30 @@ def v4_builder_cls():
         finally:
             sys.modules.pop(module_name, None)
     return module.DeepseekV4AttentionMetadataBuilder
+
+
+def test_decode_prep_reuses_device_metadata_stream(v4_builder_cls):
+    builder = object.__new__(v4_builder_cls)
+    metadata_stream = object()
+    builder.model_runner = SimpleNamespace(
+        _dp_metadata_buffers=SimpleNamespace(stream=metadata_stream),
+        async_execute_stream=object(),
+    )
+
+    assert builder.prep_stream is metadata_stream
+
+
+def test_decode_prep_falls_back_to_async_stream_without_device_metadata(
+    v4_builder_cls,
+):
+    builder = object.__new__(v4_builder_cls)
+    async_stream = object()
+    builder.model_runner = SimpleNamespace(
+        _dp_metadata_buffers=None,
+        async_execute_stream=async_stream,
+    )
+
+    assert builder.prep_stream is async_stream
 
 
 def _transfer_builder(

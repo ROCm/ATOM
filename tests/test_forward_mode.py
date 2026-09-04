@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from atom.utils.forward_context import ForwardMode
+from atom.utils.tbo.ubatching import DPSyncResult
 
 # What `ModelRunner.capture_sizes_np` is: ascending int32, sorted where it is
 # built. `decide` searches it, so a test that passed a plain list would be
@@ -181,6 +182,37 @@ def test_a_peer_that_cannot_split_vetoes_tbo_for_the_group(monkeypatch):
         local_tbo=(True, True, 4, 4),
     )
     assert mode.tbo_collective_active == mode.sync.tbo_collective_active
+
+
+def test_a_precomputed_device_sync_is_consumed_without_a_second_collective(
+    monkeypatch,
+):
+    """Split-phase submission must still leave one collective per step."""
+
+    def unexpected_all_gather(*args, **kwargs):
+        raise AssertionError("precomputed sync issued a second collective")
+
+    monkeypatch.setattr(torch.distributed, "all_gather", unexpected_all_gather)
+    sync = DPSyncResult(
+        num_tokens_across_dp=torch.tensor([4, 5], dtype=torch.int32),
+        max_tokens_across_dp_cpu=torch.tensor(5, dtype=torch.int32),
+        cu_tokens_across_dp_cpu=torch.tensor([4, 9], dtype=torch.int32),
+        max_tokens_across_dp=5,
+        max_bs_across_dp=5,
+        any_rank_has_prefill=False,
+        tbo_collective_active=False,
+        ub_max_tokens_across_dp=None,
+    )
+    mode = _decide(
+        _batch(seqs=4, q=1),
+        dp_size=2,
+        dp_group=object(),
+        precomputed_sync=sync,
+    )
+
+    assert mode.sync is sync
+    assert mode.running_bs == 8
+    assert mode.use_cudagraph
 
 
 # --------------------------------------------------------------------------- #

@@ -114,6 +114,7 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         running_bs: int,
         running_tokens: int,
         max_seqlen_q: int,
+        host_preparation: Any | None = None,
     ):
         raise NotImplementedError
 
@@ -642,6 +643,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         running_bs: int,
         running_tokens: int,
         max_seqlen_q: int,
+        host_preparation: Any | None = None,
     ):
         """Build this step's metadata at the shape `prepare_inputs` settled.
 
@@ -670,8 +672,15 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         is_prefill = batch.total_tokens_num_prefill > 0
         if is_prefill:
             return self.prepare_prefill(batch, running_bs)
-        else:
+        if host_preparation is None:
             return self.prepare_decode(batch, running_bs, running_tokens, max_seqlen_q)
+        return self.prepare_decode(
+            batch,
+            running_bs,
+            running_tokens,
+            max_seqlen_q,
+            host_preparation=host_preparation,
+        )
 
 
 class AttentionImpl(nn.Module):

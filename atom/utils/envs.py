@@ -47,6 +47,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_DP_SESSION_AFFINITY", "0"
     ).lower()
     in {"1", "true", "yes", "on"},
+    # Exchange the tiny per-forward DPA metadata vector with the device/RCCL
+    # process group instead of the CPU/Gloo group.  The result is copied to the
+    # host once because scheduler and graph-shape decisions consume Python
+    # integers.  Kept opt-in until it has been qualified across platforms.
+    "ATOM_DP_METADATA_DEVICE_SYNC": lambda: (
+        os.getenv("ATOM_DP_METADATA_DEVICE_SYNC", "0").lower()
+        in {"1", "true", "yes", "on"}
+    ),
     # Prefix for process titles set via set_process_title (shown in ps/top/rocm-smi)
     "ATOM_PROCESS_NAME_PREFIX": lambda: os.getenv("ATOM_PROCESS_NAME_PREFIX", "ATOM"),
     # SGLang's GLM-5.2 and DeepSeek V4 prefill CP paths still force

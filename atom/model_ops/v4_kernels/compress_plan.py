@@ -64,6 +64,79 @@ class CompressPlan:
     compress_plan_cpu: np.ndarray | None = None  # [num_compress, 4] int32 or None
 
 
+@dataclass(frozen=True)
+class PreparedCompressPlan:
+    """CPU-only portion of one compression plan.
+
+    Decode can build these rows while the DP shape exchange is still in
+    flight.  The eventual graph bucket only controls how far the reusable GPU
+    buffers are padded and sliced; it does not change any active row.
+    """
+
+    compress_plan: np.ndarray
+    write_plan: np.ndarray
+    cu_compress_cpu: np.ndarray
+
+
+def prepare_compress_plans(
+    extend_lens_cpu: np.ndarray,
+    context_lens_cpu: np.ndarray,
+    unique_ratios_overlap: Iterable[tuple[int, bool]],
+) -> dict[int, PreparedCompressPlan]:
+    """Build the host rows of :func:`make_compress_plans` without GPU work."""
+
+    bs = len(extend_lens_cpu)
+    extend_lens_cpu = np.ascontiguousarray(extend_lens_cpu, dtype=np.int32)
+    context_lens_cpu = np.ascontiguousarray(context_lens_cpu, dtype=np.int32)
+    total = int(extend_lens_cpu.sum())
+    ratios = tuple(unique_ratios_overlap)
+
+    if total == 0 or bs == 0:
+        return {
+            ratio: PreparedCompressPlan(
+                compress_plan=np.empty((0, 4), dtype=np.int32),
+                write_plan=np.empty((0, 4), dtype=np.int32),
+                cu_compress_cpu=np.zeros(max(bs, 1) + 1, dtype=np.int32),
+            )
+            for ratio, _ in ratios
+        }
+
+    # Per-token columns shared across ratios.
+    batch_ids = np.repeat(np.arange(bs, dtype=np.int32), extend_lens_cpu)
+    ragged_ids = np.arange(total, dtype=np.int32)
+    cu_extend = np.empty(bs + 1, dtype=np.int32)
+    cu_extend[0] = 0
+    np.cumsum(extend_lens_cpu, out=cu_extend[1:])
+    j_in_seq = ragged_ids - cu_extend[batch_ids]
+    prefix_lens = context_lens_cpu - extend_lens_cpu
+    positions = prefix_lens[batch_ids] + j_in_seq
+
+    prepared: dict[int, PreparedCompressPlan] = {}
+    for ratio, is_overlap in ratios:
+        K = ratio * (2 if is_overlap else 1)
+        window_lens = np.maximum(0, K - np.minimum(j_in_seq + 1, K)).astype(np.int32)
+        plan_rows = np.stack(
+            [ragged_ids, batch_ids, positions, window_lens], axis=1
+        ).astype(np.int32)
+
+        compress_plan = plan_rows[(positions + 1) % ratio == 0]
+        compress_counts = np.bincount(compress_plan[:, 1], minlength=bs).astype(
+            np.int32
+        )
+        cu_compress = np.empty(bs + 1, dtype=np.int32)
+        cu_compress[0] = 0
+        np.cumsum(compress_counts, out=cu_compress[1:])
+
+        write_starts = np.maximum(0, context_lens_cpu - K).astype(np.int32)
+        write_plan = plan_rows[positions >= write_starts[batch_ids]]
+        prepared[ratio] = PreparedCompressPlan(
+            compress_plan=compress_plan,
+            write_plan=write_plan,
+            cu_compress_cpu=cu_compress,
+        )
+    return prepared
+
+
 def make_compress_plans(
     extend_lens_cpu: np.ndarray,
     context_lens_cpu: np.ndarray,
@@ -73,6 +146,8 @@ def make_compress_plans(
     running_bs: int | None = None,
     max_q_len: int | None = None,
     decode_capacity_per_ratio: dict[int, int] | None = None,
+    prepared: dict[int, PreparedCompressPlan] | None = None,
+    defer_device_copy: bool = False,
 ) -> dict[int, CompressPlan]:
     """Build a CompressPlan per (ratio, overlap) variant.
 
@@ -125,6 +200,13 @@ def make_compress_plans(
                     contiguous-from-base so data pointers stay stable; only
                     `shape[0]` shrinks. Buffers are always sized to the prefill
                     worst case.
+      prepared: optional CPU-only rows returned by
+                    :func:`prepare_compress_plans`. Supplying them skips numpy
+                    construction and only pads/stages the reusable GPU buffers.
+      defer_device_copy: populate the CPU buffers and return the corresponding
+                    GPU views without issuing their individual H2D copies. The
+                    caller must copy the backing storage before consuming the
+                    views. Used by DSV4's packed decode-metadata upload.
 
     Returns:
       dict[ratio] -> CompressPlan. On empty fwd (`extend_lens_cpu.sum() == 0`)
@@ -132,10 +214,13 @@ def make_compress_plans(
       (fully sentinel-filled), so capture-time addresses match replay-time
       addresses even on a zero-token fwd.
     """
-    bs = len(extend_lens_cpu)
     extend_lens_cpu = np.ascontiguousarray(extend_lens_cpu, dtype=np.int32)
     context_lens_cpu = np.ascontiguousarray(context_lens_cpu, dtype=np.int32)
-    total = int(extend_lens_cpu.sum())
+    ratios = tuple(unique_ratios_overlap)
+    if prepared is None:
+        prepared = prepare_compress_plans(extend_lens_cpu, context_lens_cpu, ratios)
+    elif set(prepared) != {ratio for ratio, _ in ratios}:
+        raise ValueError("prepared compression-plan ratios do not match the request")
     out: dict[int, CompressPlan] = {}
     if running_bs is not None:
         assert max_q_len is not None, "max_q_len is required when running_bs is set"
@@ -170,77 +255,10 @@ def make_compress_plans(
             return decode_capacity_per_ratio[ratio], full_wcap
         return n_compress, full_wcap
 
-    if total == 0 or bs == 0:
-        # Empty fwd: produce CompressPlans pointing at the pre-allocated
-        # buffers so capture-time addresses match replay-time addresses
-        # even on a zero-token fwd. Skipped via num_*=0.
-        for ratio, is_overlap in unique_ratios_overlap:
-            cbuf = plan_buffers[ratio]["compress"]
-            wbuf = plan_buffers[ratio]["write"]
-            ccap, wcap = _slices(ratio, is_overlap, 0, 0, wbuf.np.shape[0])
-            assert ccap <= cbuf.np.shape[0] and wcap <= wbuf.np.shape[0], (
-                f"ratio={ratio} empty-fwd caps (compress={ccap}, write={wcap}) "
-                f"exceed buffers ({cbuf.np.shape[0]}, {wbuf.np.shape[0]}); "
-                f"bump plan-buffer sizing in the builder __init__."
-            )
-            if ccap > 0:
-                cbuf.np[:ccap].fill(-1)
-            if wcap > 0:
-                wbuf.np[:wcap].fill(-1)
-            out[ratio] = CompressPlan(
-                compress_plan_gpu=cbuf.copy_to_gpu(ccap),
-                write_plan_gpu=wbuf.copy_to_gpu(wcap),
-                num_compress=0,
-                num_write=0,
-                cu_compress_cpu=np.zeros(max(bs, 1) + 1, dtype=np.int32),
-                compress_plan_cpu=None,
-            )
-        return out
-
-    # Per-token columns shared across ratios.
-    batch_ids = np.repeat(np.arange(bs, dtype=np.int32), extend_lens_cpu)
-    ragged_ids = np.arange(total, dtype=np.int32)
-    cu_extend = np.empty(bs + 1, dtype=np.int32)
-    cu_extend[0] = 0
-    np.cumsum(extend_lens_cpu, out=cu_extend[1:])
-    j_in_seq = ragged_ids - cu_extend[batch_ids]
-    prefix_lens = context_lens_cpu - extend_lens_cpu
-    positions = prefix_lens[batch_ids] + j_in_seq
-
-    for ratio, is_overlap in unique_ratios_overlap:
-        K = ratio * (2 if is_overlap else 1)
-        # window_len = K - min(j_in_seq + 1, K)
-        # Number of leading K-loop iterations that go to state cache.
-        window_lens = np.maximum(0, K - np.minimum(j_in_seq + 1, K)).astype(np.int32)
-        plan_rows = np.stack(
-            [ragged_ids, batch_ids, positions, window_lens], axis=1
-        ).astype(np.int32)
-
-        # compress: token at a compression boundary
-        compress_mask = (positions + 1) % ratio == 0
-        compress_plan = plan_rows[compress_mask]
-        # cu_compress: per-seq prefix-sum of boundary counts (for caller slicing).
-        # bincount preserves seq order because compress_plan rows are already
-        # sorted by ragged_id (and ragged_id increases monotonically with batch_id).
-        compress_counts = np.bincount(compress_plan[:, 1], minlength=bs).astype(
-            np.int32
-        )
-        cu_compress = np.empty(bs + 1, dtype=np.int32)
-        cu_compress[0] = 0
-        np.cumsum(compress_counts, out=cu_compress[1:])
-
-        # write: tokens whose absolute position falls in the per-seq
-        # "last STATE_SIZE positions" window. STATE_SIZE = K.
-        # write_start[i] = max(0, context_lens[i] - K) — uniform across overlap/non-overlap;
-        # the SGLang formula `(seq_len // ratio) * ratio - (ratio if overlap else 0)`
-        # is a stricter bound that includes only ratio-aligned writes; the looser
-        # `context_len - K` is what ATOM's update_compressor_states already uses
-        # (state_writes.py:152-154 docstring) and what the fused kernel's
-        # state-cache reader expects.
-        write_starts = np.maximum(0, context_lens_cpu - K).astype(np.int32)
-        write_mask = positions >= write_starts[batch_ids]
-        write_plan = plan_rows[write_mask]
-
+    for ratio, is_overlap in ratios:
+        host = prepared[ratio]
+        compress_plan = host.compress_plan
+        write_plan = host.write_plan
         n_compress = int(compress_plan.shape[0])
         n_write = int(write_plan.shape[0])
 
@@ -273,15 +291,19 @@ def make_compress_plans(
             wbuf.np[:n_write] = write_plan
         if write_slice > n_write:
             wbuf.np[n_write:write_slice].fill(-1)  # sentinel
-        compress_plan_gpu = cbuf.copy_to_gpu(compress_slice)
-        write_plan_gpu = wbuf.copy_to_gpu(write_slice)
+        if defer_device_copy:
+            compress_plan_gpu = cbuf.gpu[:compress_slice]
+            write_plan_gpu = wbuf.gpu[:write_slice]
+        else:
+            compress_plan_gpu = cbuf.copy_to_gpu(compress_slice)
+            write_plan_gpu = wbuf.copy_to_gpu(write_slice)
 
         out[ratio] = CompressPlan(
             compress_plan_gpu=compress_plan_gpu,
             write_plan_gpu=write_plan_gpu,
             num_compress=n_compress,
             num_write=n_write,
-            cu_compress_cpu=cu_compress,
+            cu_compress_cpu=host.cu_compress_cpu,
             compress_plan_cpu=compress_plan if n_compress > 0 else None,
         )
     return out

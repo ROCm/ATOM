@@ -1277,6 +1277,31 @@ def test_a_height_the_group_did_not_agree_on_is_asked_for_not_declared(monkeypat
     assert seen["table"] is None, "the answer travels, not a table built here"
 
 
+def test_a_reused_target_stream_keeps_its_precomputed_dp_metadata(monkeypatch):
+    """Eagle step 0 must not reduce token counts the target already reduced."""
+
+    def _must_not_make(*args, **kwargs):
+        raise AssertionError("draft repeated the target's DP metadata collective")
+
+    monkeypatch.setattr(mod_drafter.DPMetadata, "make", staticmethod(_must_not_make))
+    fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
+    target_dp_metadata = object()
+    fc.dp_metadata = target_dp_metadata
+
+    _bare_drafter(2)._publish_draft_shape(
+        fc,
+        scheduled_tokens=176,
+        running_tokens=176,
+        running_tokens_are_unified=False,
+        precomputed_dp_metadata=target_dp_metadata,
+    )
+
+    assert fc.context.scheduled_tokens == 176
+    assert fc.context.running_tokens == 176
+    assert fc.context.running_tokens_are_unified is False
+    assert fc.dp_metadata is target_dp_metadata
+
+
 def test_publishing_a_shape_does_not_decide_whether_it_is_a_prefill():
     """Two different questions, and one drafter answers them differently.
 

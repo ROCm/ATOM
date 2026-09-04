@@ -16,7 +16,9 @@ from aiter.jit.utils.chip_info import get_gfx
 
 from atom.model_ops.v4_kernels.compress_plan import (
     CompressPlan,
+    PreparedCompressPlan,
     make_compress_plans,
+    prepare_compress_plans,
 )
 from atom.model_ops.v4_kernels.csa_translate_pack import (
     csa_translate_pack,
@@ -65,6 +67,7 @@ __all__ = [
     "FP4_MQA_BLOCK_K",
     "FP4_MQA_PARALLEL_UNIT_NUM",
     "CompressPlan",
+    "PreparedCompressPlan",
     "QKNormRopeOut",
     "build_v4_paged_decode_indptr",
     "build_v4_paged_decode_indptr_reference",
@@ -76,6 +79,7 @@ __all__ = [
     "hca_compress_paged_offsets",
     "inverse_rope_inplace",
     "make_compress_plans",
+    "prepare_compress_plans",
     "qk_norm_rope_maybe_quant",
     "qk_norm_rope_maybe_quant_fp8_2buff",
     "qk_norm_rope_maybe_quant_reference",
