@@ -148,6 +148,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_GLM_FUSED_INDEXER": lambda: (
         os.getenv("ATOM_ENABLE_GLM_FUSED_INDEXER", "1") == "1"
     ),
+    # GLM-5.3 pooled sparse indexer. Disabling it is an exact A/B only while
+    # sequence length <= index_topk; the model refuses longer requests.
+    "ATOM_GLM5_KPOOL": lambda: os.getenv("ATOM_GLM5_KPOOL", "1") == "1",
+    # Bring-up/debug controls for the GLM-5.3 text path.
+    "ATOM_GLM5_FORCE_DENSE_MLA": lambda: (
+        os.getenv("ATOM_GLM5_FORCE_DENSE_MLA", "0") == "1"
+    ),
+    "ATOM_GLM5_DISABLE_FUSED_MHC": lambda: (
+        os.getenv("ATOM_GLM5_DISABLE_FUSED_MHC", "0") == "1"
+    ),
     # Kimi-K3 DSpark draft: fuse the per-layer context-row KV write
     # (K3DSparkMLAAttention.write_context_kv) into one Triton kernel --
     # RMSNorm(kv_c) + rope(k_pe) + concat + paged-cache store, versus today's
@@ -368,6 +378,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_LM_HEAD_MODE": lambda: os.getenv(
         "ATOM_DP_LM_HEAD_MODE", "all2all"
     ).lower(),
+    # Pure-DP draft greedy argmax: shard the draft lm_head vocab across the DP
+    # group so each rank reads [H, V/dp] instead of the full [H, V], exchanging
+    # only the packed [N, 2]. Active only for a unified (rectangular) pure-DP
+    # draft step; everything else falls back to the replicated local argmax.
+    "ATOM_DP_DRAFT_ARGMAX": lambda: os.getenv("ATOM_DP_DRAFT_ARGMAX", "1").lower()
+    in ("1", "true"),
+    # Row count (running_tokens) above which it falls back: the hidden gather
+    # grows with rows, so the shard only pays at small M. ~256 is the V4-Pro
+    # crossover.
+    "ATOM_DP_DRAFT_ARGMAX_MAX_ROWS": lambda: int(
+        os.getenv("ATOM_DP_DRAFT_ARGMAX_MAX_ROWS", "256")
+    ),
     "ATOM_USE_FLYDSL_GDR": lambda: os.getenv("ATOM_USE_FLYDSL_GDR", "0").lower() == "1",
     # Capture each declared draft pass into a per-captured-size CUDAGraph as it is
     # warmed, so the draft replays instead of relaunching every kernel. 0 drafts
@@ -623,3 +645,17 @@ def __getattr__(name: str):
 #   FLA_TRIL_PRECISION             — FLA ops library
 # VLLM_PP_LAYER_PARTITION         — vLLM legacy (still active in models/utils.py)
 # VLLM_USE_MODELSCOPE             — vLLM legacy (benchmarks)
+# LMCACHE_EC_PIN_TIMEOUT_SEC      — LMCache library's own source-pin timeout;
+#                                   read in kv_transfer/offload/_offload_common.py
+#                                   (offload_save_abandon_timeout_s) to derive the
+#                                   engine's save-abandon window from it, so the
+#                                   two stay ordered. The scheduler never reads the
+#                                   env itself -- it asks the connector, via
+#                                   save_abandon_timeout_s. ATOM does not own the
+#                                   knob, hence no default of its own here.
+# OFFLOAD_MAX_PENDING_SAVES       — offload connector queue-depth bound;
+#                                   defined/defaulted in
+#                                   kv_transfer/offload/_offload_common.py and
+#                                   documented in kv_transfer/offload/README.md.
+#                                   The state tier shares it (scheduler.py)
+#                                   rather than adding a second knob.

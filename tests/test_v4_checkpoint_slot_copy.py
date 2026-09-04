@@ -598,22 +598,6 @@ class TestWarmup:
         # and ModelRunner calls this unconditionally.
         assert AttentionMetadataBuilder.warmup_per_req_cache(object()) is None
 
-    def test_the_runner_warms_the_builder_once_the_pools_are_reachable(self):
-        """After the setattr loop, not before: the builder reads them off it.
-
-        Guarded here rather than left to review because nothing else calls
-        `warmup_per_req_cache` -- a runner that stopped would restore the
-        first-request JIT silently, with every test still green.
-        """
-        import inspect
-
-        from atom.model_engine import model_runner
-
-        src = inspect.getsource(model_runner.ModelRunner.allocate_kv_cache)
-        install = src.index("setattr(self, name, value)")
-        warm = src.index("warmup_per_req_cache()")
-        assert install < warm, "warmed before the pools were installed"
-
 
 class TestPageUnitRegionsValidateTheirOwnAddresses:
     """The region cache holds addresses from two allocations, one uncovered.

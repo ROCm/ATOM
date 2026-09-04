@@ -130,6 +130,9 @@ support_model_arch_dict = {
     "MistralForCausalLM": "atom.models.mistral3.Mistral3ForCausalLM",
     "MiniMaxM3SparseForCausalLM": "atom.models.minimax_m3.MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration": "atom.models.minimax_m3.MiniMaxM3SparseForConditionalGeneration",
+    "Glm5NextForConditionalGeneration": (
+        "atom.models.glm5_next.Glm5NextForConditionalGeneration"
+    ),
 }
 # seed = 34567
 # np.random.seed(seed)
@@ -648,8 +651,13 @@ class ModelRunner:
 
         rope_parameters = getattr(self.hf_text_config, "rope_parameters", None) or {}
         self.use_mrope = "mrope_section" in rope_parameters
+        # A sparse indexer is orthogonal to whether the model is pure MLA or a
+        # linear/MLA hybrid: GLM-5.3-Flash is both hybrid and sparse, so gating
+        # this on `use_mla` alone would silently leave its index cache unbound.
         self.is_deepseek_v32 = (
-            hasattr(hf_config, "index_topk") if self.use_mla else False
+            hasattr(hf_config, "index_topk")
+            if (self.use_mla or self.use_kimi_mla)
+            else False
         )
         # Initialize profiler for this rank (before _setup_device_and_distributed
         # so that dp config fields are still at their original values)
@@ -890,7 +898,17 @@ class ModelRunner:
         return False
 
     def is_kimi_linear(self) -> bool:
-        return getattr(self.hf_text_config, "model_type", None) == "kimi_linear"
+        """Hybrid MLA + KDA-linear-attention models (KimiMLAGDNBackend).
+
+        Selects the backend that allocates a paged MLA KV pool for the full
+        attention layers *and* a recurrent state pool for the linear ones.
+        GLM-5.3-Flash (``glm5_next_text``) has the same shape as Kimi-Linear:
+        11 MLA layers interleaved with 34 KDA layers.
+        """
+        return getattr(self.hf_text_config, "model_type", None) in (
+            "kimi_linear",
+            "glm5_next_text",
+        )
 
     def is_deepseek_v4(self) -> bool:
         # NOTE: `hf_text_config.model_type` reads "deepseek_v3" for V4 because
@@ -1026,6 +1044,15 @@ class ModelRunner:
         if not self.still_running:
             return
         self.still_running = False
+        # 0. Join any offload connector's copy threads. Its ThreadPoolExecutors
+        #    are non-daemon, so leaving them running wedges interpreter shutdown
+        #    or races an in-flight copy against atexit. Must run BEFORE the KV
+        #    pool it copies out of is dropped and before the dist env goes away.
+        #    Guarded: only offload workers define close() (moriio etc. do not).
+        connector = get_kvconnector()
+        close = getattr(connector, "close", None) if connector is not None else None
+        if callable(close):
+            close()
         # 1. Destroy distributed env (NCCL + CustomAllreduce + process groups)
         #    Must happen while ops module is still alive for CustomAllreduce cleanup.
         destroy_dist_env()
@@ -1041,6 +1068,7 @@ class ModelRunner:
             "index_cache",
             "mamba_k_cache",
             "mamba_v_cache",
+            "kpool_tail_cache",
         ):
             if hasattr(self, attr):
                 delattr(self, attr)
@@ -1999,6 +2027,11 @@ class ModelRunner:
             for key, kv_cache_tensor in zip(kv_cache_keys, kv_cache_tensors)
         }
         transfer_tensors = self.attn_metadata_builder.get_kv_transfer_tensors()
+        if transfer_tensors is not None:
+            # The tier is built inside `register_kv_caches` and needs
+            # `state_entry_views` to name the bytes it packs. This is the only
+            # place the builder and the connector are both in scope.
+            transfer_tensors.state_backend = self.attn_metadata_builder
         if hasattr(self, "eagle3_draft_builder") and transfer_tensors is not None:
             draft_regions = self.eagle3_draft_builder.get_kv_transfer_tensors()
             if draft_regions:
@@ -2769,7 +2802,17 @@ class ModelRunner:
         self._pp_send_needs_sparse = (not pp.is_last_rank) and _is_shared(
             inner.end_layer
         )
-        self._pp_index_topk = int(self.config.hf_config.index_topk)
+        # Transfer the physical producer row width, not the logical top-k.
+        # GLM-5.3 appends up to index_kpool-1 tail tokens and rounds each row
+        # to 128 columns; slicing at index_topk would start every later row at
+        # the wrong offset.
+        self._pp_index_topk = int(
+            getattr(
+                self.attn_metadata_builder,
+                "index_topk_out",
+                self.config.hf_config.index_topk,
+            )
+        )
         if self._pp_recv_needs_sparse or self._pp_send_needs_sparse:
             logger.info(
                 "[%s] PP shared-indexer transfer: recv=%s send=%s "
