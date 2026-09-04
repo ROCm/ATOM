@@ -359,7 +359,7 @@ def test_dp_agentic_variant_carries_the_session_routing_env():
         "ATOM_DP_LB_REQ_EQUIV=512",
         "ATOM_ENABLE_PREFILL_DELAYER=1",
         "ATOM_PREFILL_DECODE_INTERVAL=10",
-        "ATOM_PREFILL_DELAYER_MAX_QUEUE_MS=20000",
+        "ATOM_PREFILL_DELAYER_MAX_QUEUE_MS=15000",
         # TBO never travels alone in this catalog -- every TBO variant pairs
         # `--enable-tbo` with these two. Asserted alongside the routing vars so
         # the flag cannot be moved without them.
