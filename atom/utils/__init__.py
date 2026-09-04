@@ -720,6 +720,14 @@ class CpuGpuBuffer:
             self.np = self.cpu.numpy()
 
     def copy_to_gpu(self, n: int | None = None) -> torch.Tensor:
+        # Consumers that read `.gpu` directly cannot tell this step's contents
+        # from the previous batch's; this marks it refreshed.
+        #
+        # Only meaningful for a buffer someone also CLEARS each step. Today that
+        # is block_tables alone (CommonAttentionBuilder.build). On every other
+        # buffer this latches true at the first upload and stays there, so do
+        # not read it as "fresh" elsewhere without adding the matching clear.
+        self.gpu_is_current = True
         if n is None:
             return self.gpu.copy_(self.cpu, non_blocking=True)
         return self.gpu[:n].copy_(self.cpu[:n], non_blocking=True)

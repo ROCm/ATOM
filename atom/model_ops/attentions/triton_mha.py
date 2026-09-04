@@ -8,7 +8,10 @@ import torch
 
 from atom.config import KVCacheTensor
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_ops.attention_mha import PagedAttentionImpl
+from atom.model_ops.attention_mha import (
+    PagedAttentionImpl,
+    assert_kv_layout_matches,
+)
 from atom.utils import envs
 
 from .aiter_attention import AiterAttentionMetadataBuilder
@@ -146,6 +149,7 @@ class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):
             # KV cache is no longer in flash (4D) layout; unified_attention is
             # selected via ATOM_USE_UNIFIED_ATTN, and reads the SHUFFLE layout.
             impl.use_flash_layout = False
+        assert_kv_layout_matches(impl, k_cache)
 
         return KVCacheTensor(
             layer_num=layer_id,

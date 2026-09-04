@@ -11,19 +11,42 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
 from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 from aiter.ops.triton.unified_attention import unified_attention
-from atom.config import get_current_atom_config
-from atom.utils import envs
-from atom.utils.forward_context import ForwardContext, get_forward_context
 from torch import nn
 
-from .attention_mla import MLAModules
-
-from atom.utils.decorators import mark_trace
+from atom.config import get_current_atom_config
 from atom.model_ops.base_attention import (
     cp_mha_gather_cache,
     run_pa_decode_gluon,
     run_pa_fwd_asm,
 )
+from atom.utils import envs
+from atom.utils.decorators import mark_trace
+from atom.utils.forward_context import ForwardContext, get_forward_context
+
+from .attention_mla import MLAModules
+
+
+def assert_kv_layout_matches(impl, k_cache) -> None:
+    """A bound K of rank 4 means flash, rank 5 means SHUFFLE. Nothing else.
+
+    `rope_cache` picks the writer and `_dispatch_decode` the reader off
+    `use_flash_layout`, so a binder that leaves it disagreeing with the rank it
+    bound corrupts KV silently -- same element count, no shape error. Wired into
+    the binders that can produce either layout (AiterAttentionMetadataBuilder,
+    TritonMHAMetadataBuilder, Eagle3DraftBuilder, ModelRunner's PD rebind) so one
+    that forgets fails at bind time instead of at accuracy-review time.
+    """
+    if impl is None:
+        return
+    flash = bool(getattr(impl, "use_flash_layout", False))
+    rank = k_cache.dim()
+    if (rank == 4) is not flash:
+        raise AssertionError(
+            f"KV layout disagrees with use_flash_layout on {type(impl).__name__} "
+            f"layer {getattr(impl, 'layer_num', '?')}: bound K is {rank}-D "
+            f"({tuple(k_cache.shape)}) but use_flash_layout={flash}. A 4-D K is "
+            f"flash, a 5-D K is SHUFFLE; the binder must set the flag to match."
+        )
 
 
 @cache
@@ -92,9 +115,19 @@ class PagedAttentionImpl(nn.Module):
         self.rotary_emb = rotary_emb
         self.q_norm = q_norm
         self.k_norm = k_norm
-        # Set by the attention backend's build_kv_cache_tensor when KV cache is
-        # allocated in flash layout [num_blocks, block_size, num_kv_heads, head_dim]
-        # for aiter triton unified_attention. AiterBackend keeps this False.
+        # Fall back to Triton/Gluon for layouts unsupported by AITer PA ASM.
+        # Set here rather than only in `rope_cache` so it is readable at KV bind
+        # time, which runs before any forward. `rope_cache`, `_dispatch_decode`
+        # and the Eagle3 draft builder all read it, so it has one definition.
+        self.use_triton_attn = (
+            envs.ATOM_FORCE_ATTN_TRITON
+            or self.sliding_window != -1
+            or self.head_dim != 128
+        )
+        # Pool is flash (4D) [num_blocks, block_size, num_kv_heads, head_dim]
+        # rather than 5D SHUFFLE. Set at bind time by whichever builder allocates
+        # it; Eagle3DraftBuilder is the only one that sets True today. A builder
+        # that never assigns it gets SHUFFLE.
         self.use_flash_layout = False
 
         self.supports_quant_query_input = False
@@ -206,13 +239,7 @@ class PagedAttentionImpl(nn.Module):
         k_scale = kv_cache_data[f"layer_{self.layer_num}"].k_scale
         v_scale = kv_cache_data[f"layer_{self.layer_num}"].v_scale
 
-        # Fall back to Triton/Gluon for layouts unsupported by AITer PA ASM.
-        use_triton_attn = (
-            envs.ATOM_FORCE_ATTN_TRITON
-            or self.sliding_window != -1
-            or self.head_dim != 128
-        )
-        self.use_triton_attn = use_triton_attn
+        use_triton_attn = self.use_triton_attn
 
         if (
             self.rotary_emb is not None
@@ -777,11 +804,16 @@ class PagedAttentionImpl(nn.Module):
         # shuffle  K:   [num_blocks, num_kv_heads, head_size // x, block_size, x]
         # shuffle  V:   [num_blocks, num_kv_heads, block_size // x, head_size, x]
         #
-        # For pure prefill (no cached tokens), raw key/value are passed as a
-        # block_size=1 flash-layout cache with a fake block_table:
+        # The `else` below passes raw key/value as a block_size=1 flash-layout
+        # cache with the fake block_table TritonMHAMetadataBuilder builds for it:
         #
         # key:    [num_tokens, 1, num_kv_heads, head_size]
         # value:  [num_tokens, 1, num_kv_heads, head_size]
+        #
+        # DEAD: dispatch_backend reaches here only via
+        # `ATOM_USE_UNIFIED_ATTN or use_flash_layout`, so `has_cached` below can
+        # never decide anything. Kept until the fake-table producer in
+        # triton_mha.py is retired with it; do not build on it.
 
         attn_metadata = fwd_ctx.attn_metadata
 
@@ -794,22 +826,19 @@ class PagedAttentionImpl(nn.Module):
             (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
         )
 
-        # `block_tables` is always populated by TritonMHAMetadataBuilder.
-        # For pure prefill (no cached tokens) it is, by default, the fake table
-        # built in prepare_prefill that maps seq i to token indices
-        # [cu_seqlens_k[i], ..., cu_seqlens_k[i+1]-1], paired with raw K/V
-        # treated as kv_cache with block_size=1.
-        #
-        # Under ATOM_USE_UNIFIED_ATTN, prepare_prefill instead uploads the real
-        # per-seq block_table and reads from KV cache, the new tokens
-        # already written into the paged flash-layout cache during rope_cache
-        # are read straight from `k_cache`/`v_cache`, identical to the
-        # prefix-cache-hit path.
-        if envs.ATOM_USE_UNIFIED_ATTN or attn_metadata.has_cached:
+        # The `else` view of raw K/V as a block_size=1 cache only works with the
+        # fake block table TritonMHAMetadataBuilder.prepare_prefill builds for
+        # it; a real page-sized table against that view reads the wrong rows, in
+        # bounds and silently. Everyone else reads the paged cache, where
+        # rope_cache already wrote the new tokens -- the prefix-cache-hit path.
+        if (
+            envs.ATOM_USE_UNIFIED_ATTN
+            or self.use_flash_layout
+            or attn_metadata.has_cached
+        ):
             k_for_attn = k_cache
             v_for_attn = v_cache
-            # Reads the paged KV cache, which is 5D SHUFFLE unless the (default)
-            # 4D flash layout is in use.
+            # 5D SHUFFLE unless bound to a 4D flash pool (off by default).
             shuffled_kv_cache = not self.use_flash_layout
         else:
             #   k: [total_tokens, num_kv_heads, head_size]
@@ -861,6 +890,12 @@ class PagedAttentionImpl(nn.Module):
 
         atom_config = get_current_atom_config()
 
+        # Before the UNIFIED branch, which can return persistent_asm: the ASM
+        # paths address a 5D SHUFFLE pool and would read a flash pool's head_dim
+        # as its page size instead of faulting.
+        if self.use_flash_layout:
+            return self.paged_attention_triton
+
         if envs.ATOM_USE_UNIFIED_ATTN:
             if envs.ATOM_FORCE_ATTN_TRITON:
                 return self.paged_attention_triton
@@ -868,7 +903,7 @@ class PagedAttentionImpl(nn.Module):
                 return self.paged_attention_persistent_asm
             return self.paged_attention_triton
 
-        if self.use_triton_attn or self.use_flash_layout:
+        if self.use_triton_attn:
             return self.paged_attention_triton
 
         if use_pa_decode_bf16_asm():
@@ -991,6 +1026,10 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             k_norm=k_norm,
             **kwargs,
         )
+        # M3 sparse attention is fixed to head_dim == 128 and the AITER fused
+        # path; no Triton fallback. Set here as well as in `rope_cache` so the
+        # KV binder, which runs before any forward, reads the right value.
+        self.use_triton_attn = False
         # Indexer submodules + top-k parameters (impl-local state).
         self.index_q_norm = index_q_norm
         self.index_k_norm = index_k_norm

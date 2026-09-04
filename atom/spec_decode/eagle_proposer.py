@@ -417,6 +417,35 @@ class EagleProposer(Drafter):
             running_bs, running_bs, staged["positions"], zeros.to(torch.int64), zeros
         )
 
+    def _assert_block_tables_are_this_steps(self, context) -> None:
+        """Guard the persistent block_tables buffer against a stale read.
+
+        The draft reads `.gpu` unconditionally, but producers upload only under
+        their own conditions. An unrefreshed buffer is not None -- it holds the
+        previous batch's pages, in bounds, so the draft attends over the wrong
+        KV and only the acceptance rate moves. A None check misses that case.
+
+        Flash drafts only: they read the paged cache on every prefill, which is
+        what this PR makes reachable. A SHUFFLE draft on a prefill with no
+        cached prefix takes the raw-varlen path and never reads block_tables,
+        so guarding it would fail a config that is fine.
+
+        Quiet on dummy runs and before any `build` (warmup has no batch).
+        """
+        if context is not None and context.is_dummy_run:
+            return
+        builder = getattr(self.runner, "eagle3_draft_builder", None)
+        if not getattr(builder, "uses_flash_layout", False):
+            return
+        bt = self.runner.forward_vars.get("block_tables")
+        if bt is not None and not getattr(bt, "gpu_is_current", True):
+            raise AssertionError(
+                "Eagle3 flash draft would read block_tables the GPU copy of "
+                "which nobody refreshed this step: it still holds the previous "
+                "batch's pages. Upload them wherever a draft consumes them, "
+                "not only under the target backend's own read conditions."
+            )
+
     def _enter_decode_metadata(
         self,
         scheduled_bs,
@@ -471,6 +500,10 @@ class EagleProposer(Drafter):
                 ].gpu[:running_bs]
         # block_tables, context_lens, and sparse_kv_indptr are
         # needed by both MHA and MLA+sparse attention
+        #
+        # Reached from `propose`, so a serving step is already covered by the
+        # guard there. Unguarded only for `warmup_inputs`, which replays this
+        # with no scheduled batch -- the check would fire on warmup.
         attn_metadata.block_tables = var["block_tables"].gpu[:running_bs]
         if attn_metadata.dcp_token_block_tables is not None:
             # One query per sequence, so the per-token table is block_tables
@@ -563,6 +596,7 @@ class EagleProposer(Drafter):
         # cache is indexed by runner.block_size blocks.
         if draft_uses_mha:
             attn_metadata.slot_mapping = var["slot_mapping"].gpu[: len(input_ids)]
+            self._assert_block_tables_are_this_steps(context)
             attn_metadata.block_tables = var["block_tables"].gpu[:scheduled_bs]
         elif attn_metadata.slot_mapping is not None:
             # Make MLA draft slot_mapping == q rows. DeepSeek-V4 uses

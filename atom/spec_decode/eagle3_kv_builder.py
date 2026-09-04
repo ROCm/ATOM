@@ -4,7 +4,9 @@ import torch
 from aiter import dtypes
 
 from atom.config import KVCacheTensor
+from atom.model_ops.attention_mha import assert_kv_layout_matches
 from atom.model_ops.attentions.sub_pool_spec import SubPoolSpec, page_pool
+from atom.spec_decode.draft_kv_layout import use_flash_layout
 
 logger = logging.getLogger("atom")
 
@@ -104,6 +106,10 @@ class Eagle3DraftBuilder:
         logger.info(f"Allocated Eagle3 draft KV cache: {cache.shape}")
         return {"eagle3_kv_cache": cache, "eagle3_kv_scale": scale}
 
+    # The decision lives in `draft_kv_layout`, which stays importable without
+    # aiter so CI can test it. Kept as an attribute for existing call sites.
+    _use_flash_layout = staticmethod(use_flash_layout)
+
     def build_kv_cache_tensor(self, layer_id: int, module):
         """Bind one draft attention module to its slice of the independent draft
         KV cache. Returns None for modules this builder does not own (wrong
@@ -118,19 +124,47 @@ class Eagle3DraftBuilder:
         idx = self._next_layer_id
         self._next_layer_id += 1
         cache = runner.eagle3_kv_cache
-        x = 16 // cache.element_size()
-        k_cache = cache[0, idx].view(
-            self.num_blocks,
-            self.num_kv_heads,
-            self.head_dim // x,
-            self.block_size,
-            x,
-        )
-        v_cache = cache[1, idx].view(
-            self.num_blocks,
-            self.num_kv_heads,
-            self.head_dim,
-            self.block_size,
+        impl = getattr(module, "impl", None)
+        # Decide the layout and record it on the impl in the same breath: the
+        # flag is this binder's output, not an input to read back here. Every
+        # other assignment of it in the tree is a constant False.
+        flash = self._use_flash_layout(impl)
+        if impl is not None:
+            impl.use_flash_layout = flash
+        if flash:
+            # The pool is allocated [.., num_blocks, block_size, kv_heads,
+            # head_dim] -- already the flash layout, so take it unviewed.
+            k_cache = cache[0, idx]
+            v_cache = cache[1, idx]
+        else:
+            x = 16 // cache.element_size()
+            k_cache = cache[0, idx].view(
+                self.num_blocks,
+                self.num_kv_heads,
+                self.head_dim // x,
+                self.block_size,
+                x,
+            )
+            v_cache = cache[1, idx].view(
+                self.num_blocks,
+                self.num_kv_heads,
+                self.head_dim,
+                self.block_size,
+            )
+        # The proposer reads this to know whether the draft reaches the paged
+        # read that needs a fresh block_tables. OR, not assign: the predicate is
+        # per-layer (head_dim, sliding_window), so one flash layer is enough to
+        # need the guard, and a later SHUFFLE layer must not clear it.
+        self.uses_flash_layout = getattr(self, "uses_flash_layout", False) or flash
+        assert_kv_layout_matches(impl, k_cache)
+        # Otherwise invisible: both layouts are views of the same allocation, so
+        # only the shapes tell them apart.
+        logger.info(
+            "Eagle3 draft layer %d KV layout: %s (K %s, V %s)",
+            layer_id,
+            "flash" if flash else "SHUFFLE-K / 4D-V",
+            tuple(k_cache.shape),
+            tuple(v_cache.shape),
         )
         module.max_model_len = runner.config.max_model_len
         if runner.config.kv_cache_dtype == "fp8":
