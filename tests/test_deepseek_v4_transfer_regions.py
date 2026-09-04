@@ -19,7 +19,7 @@ from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.state_runtime import StateRuntime, StateTransfer
-from atom.model_ops.attentions.v4_pool_geometry import UnifiedPoolGeometry
+from atom.model_ops.attentions.pool_layout.v4_pool_geometry import UnifiedPoolGeometry
 
 _MISSING = object()
 _HEAD_DIM = 16
@@ -77,6 +77,7 @@ def _stub_v4_runtime_imports():
         "build_v4_paged_decode_indptr",
         "fp4_indexer_enabled",
         "hca_compress_paged_offsets",
+        "plan_context_lens",
         "write_v4_paged_decode_indices",
         "write_v4_paged_prefill_indices",
     ):

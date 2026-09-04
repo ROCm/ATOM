@@ -337,9 +337,10 @@ class EagleProposer(Drafter):
         if any(t < 0 for t in anchors):
             return
 
-        # Anchor row per sequence = `cu_seqlens_q[1:] - 1`, the rule
-        # `propose_draft_token_ids` uses on a pure prefill step.
-        last_token_indices = self.prepare_inputs(scheduled_bs, 1)
+        # Nothing was verified here, so every sequence anchors on its segment's
+        # last row -- the same rule `propose_draft_token_ids` applies to the
+        # prefill head of a batch.
+        last_token_indices = self.prepare_inputs(scheduled_bs)
         anchor_ids = forward_context.context.draft_anchor_overrides
         assert anchor_ids is not None
         anchor_ids = anchor_ids[:scheduled_bs]

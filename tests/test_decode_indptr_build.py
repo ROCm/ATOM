@@ -27,7 +27,7 @@ if not torch.cuda.is_available():
         allow_module_level=True,
     )
 
-from atom.model_ops.attentions.v4_pool_geometry import CSA_RATIO, HCA_RATIO
+from atom.model_ops.attentions.pool_layout.v4_pool_geometry import CSA_RATIO, HCA_RATIO
 from atom.model_ops.v4_kernels.paged_decode_indices import (
     build_v4_paged_decode_indptr,
     build_v4_paged_decode_indptr_reference,
@@ -57,9 +57,9 @@ def _outputs(n_rows, t_pad):
     }
 
 
-def _run(builder, *, positions, batch_id, t_pad, n_rows=None, **rect):
+def _run(builder, *, positions, batch_id, t_pad):
     """Drive one builder over a batch and hand back its four outputs."""
-    out = _outputs(n_rows if n_rows is not None else t_pad, t_pad)
+    out = _outputs(t_pad, t_pad)
     builder(
         batch_id_per_token=torch.tensor(batch_id, dtype=torch.int32, device=DEV),
         # int64, as the production `positions` buffer is.
@@ -68,7 +68,6 @@ def _run(builder, *, positions, batch_id, t_pad, n_rows=None, **rect):
         win=WIN,
         index_topk=INDEX_TOPK,
         **out,
-        **rect,
     )
     return out
 
@@ -133,8 +132,8 @@ def test_a_position_past_its_sequence_is_not_clamped():
     """Positive control for a bound that was deleted, not a behaviour anyone
     wants. `min(per-token, ctx//ratio)` used to sit in both builders; it never
     fired, because every caller derives `positions` FROM `context_lens` --
-    `prepare_decode` on both its ragged and rectangular branches, and
-    `build_for_cudagraph_capture` -- so `pos + 1 <= ctx`. (Named, not cited by
+    `prepare_decode` and `build_for_cudagraph_capture` -- so `pos + 1 <= ctx`.
+    (Named, not cited by
     line: a line number in a docstring is stale the next time anyone edits
     above it, and these three were already wrong.)
 
@@ -153,34 +152,6 @@ def test_a_position_past_its_sequence_is_not_clamped():
     assert out["csa_n_committed_per_token"].tolist() == [1001 // CSA_RATIO]
 
 
-def test_dspark_rectangle_right_aligns_and_leaves_holes_at_zero():
-    """DSpark fp8 wants `[bs, full_q]` rows, each sequence's tokens flushed
-    right. The slack that leaves belongs to no token and must read 0 -- the
-    indexer scores those rows too, and the destination arrives poisoned, so a
-    builder that only wrote the mapped slots would show `POISON` in the holes."""
-    full_q = 4
-    # Seq 0 brings 3 tokens, seq 1 brings 1 -- so both bands have holes, on a
-    # layout where a hole-free band would hide an off-by-one in the alignment.
-    rect = {
-        "rect_full_q": full_q,
-        "ragged_lens": torch.tensor([3, 1], dtype=torch.int32, device=DEV),
-        "cu_q_per_seq": torch.tensor([0, 3], dtype=torch.int32, device=DEV),
-    }
-    common = {
-        "positions": [126, 127, 128, 300, 0, 0],
-        "batch_id": [0, 0, 0, 1, -1, -1],
-        "t_pad": 6,
-        "n_rows": 2 * full_q,
-    }
-    kern = _run(build_v4_paged_decode_indptr, **common, **rect)
-    ref = _run(build_v4_paged_decode_indptr_reference, **common, **rect)
-    assert torch.equal(
-        kern["csa_n_committed_per_token"], ref["csa_n_committed_per_token"]
-    )
-    # Band 0 = [hole, 127//4, 128//4, 129//4]; band 1 = [hole, hole, hole, 301//4].
-    assert kern["csa_n_committed_per_token"].tolist() == [0, 31, 32, 32, 0, 0, 0, 75]
-
-
 # --- The cases above are all narrower than one iteration of the kernel's loop.
 #
 # `tl.arange(0, BLOCK)` is 1024 lanes wide whatever `t_pad` is, so a batch of ten
@@ -192,7 +163,7 @@ def test_dspark_rectangle_right_aligns_and_leaves_holes_at_zero():
 
 
 def test_a_token_indexed_destination_must_be_exactly_the_token_axis():
-    """Off the rectangle the destination IS the token axis, so a longer buffer
+    """The destination IS the token axis, so a longer buffer
     has a tail holding tokens this forward never declared -- and on a persistent
     forward_vars buffer those are the last forward's live ids, not zeros. Caught
     on the host rather than answered from them.
@@ -206,26 +177,6 @@ def test_a_token_indexed_destination_must_be_exactly_the_token_axis():
             T_pad=4,
             win=WIN,
             index_topk=INDEX_TOPK,
-            **out,
-        )
-
-
-def test_a_rectangle_must_carry_a_per_seq_entry_for_every_band():
-    """`seq = row // full_q` goes straight into `ragged_lens` and `cu_q_per_seq`
-    with nothing else bounding it, so their length is the bound. A short one
-    would be an unmasked device read of whatever follows -- which is why this
-    raises `ValueError` rather than asserting: `python -O` strips asserts."""
-    out = _outputs(4 * 4, 4)
-    with pytest.raises(ValueError, match="spans 4 bands"):
-        build_v4_paged_decode_indptr(
-            batch_id_per_token=torch.zeros(4, dtype=torch.int32, device=DEV),
-            positions=torch.arange(4, device=DEV),
-            T_pad=4,
-            win=WIN,
-            index_topk=INDEX_TOPK,
-            rect_full_q=4,
-            ragged_lens=torch.tensor([4, 4], dtype=torch.int32, device=DEV),
-            cu_q_per_seq=torch.tensor([0, 4], dtype=torch.int32, device=DEV),
             **out,
         )
 
@@ -257,32 +208,23 @@ def test_wide_token_indexed_batch_matches_reference():
     assert kern["swa_indptr"][-1].item() == sum(min(p + 1, WIN) for p in positions)
 
 
-def test_wide_dspark_rectangle_matches_reference():
-    full_q = 8
-    bs = 96  # 768 rows: past one trip in the destination loop as well
-    lens = [1 + (s * 5) % full_q for s in range(bs)]  # every band width appears
-    positions, batch_id, cu = [], [], [0]
-    for s, n in enumerate(lens):
-        start = 200 + s * 41
+def test_wide_batch_of_unequal_spans_matches_reference():
+    """Sequences forwarding different numbers of tokens, wide enough to cross
+    several loop trips. The case above holds every span at 4, so on its own it
+    cannot tell a builder that walks tokens from one that assumes a fixed stride
+    per sequence -- here every span width from 1 to 8 appears."""
+    max_span = 8
+    bs = 96
+    spans = [1 + (s * 5) % max_span for s in range(bs)]  # every width appears
+    positions, batch_id = [], []
+    for s, n in enumerate(spans):
+        start = 200 + s * 41  # stride coprime with both ratios
         positions += list(range(start, start + n))
         batch_id += [s] * n
-        cu.append(cu[-1] + n)
     t_pad = len(positions)
-    common = {
-        "positions": positions,
-        "batch_id": batch_id,
-        "t_pad": t_pad,
-        "n_rows": bs * full_q,
-    }
-    rect = {
-        "rect_full_q": full_q,
-        "ragged_lens": torch.tensor(lens, dtype=torch.int32, device=DEV),
-        "cu_q_per_seq": torch.tensor(cu[:-1], dtype=torch.int32, device=DEV),
-    }
-    kern = _run(build_v4_paged_decode_indptr, **common, **rect)
-    ref = _run(build_v4_paged_decode_indptr_reference, **common, **rect)
+    batch = {"positions": positions, "batch_id": batch_id, "t_pad": t_pad}
+    kern = _run(build_v4_paged_decode_indptr, **batch)
+    ref = _run(build_v4_paged_decode_indptr_reference, **batch)
     for name in kern:
         assert torch.equal(kern[name], ref[name]), name
-    # Holes outnumber mapped rows here, so a builder that wrote only the mapped
-    # ones would leave most of the destination poisoned.
-    assert (kern["csa_n_committed_per_token"] == 0).sum().item() == bs * full_q - t_pad
+    assert kern["swa_indptr"][-1].item() == sum(min(p + 1, WIN) for p in positions)

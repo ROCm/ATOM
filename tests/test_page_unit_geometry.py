@@ -6,8 +6,9 @@
 The CPU tier's only seam onto PAGE units is `page_unit_views`, and its address
 counterpart is `_page_unit_regions` / `_page_unit_bases`. Both are pure
 arithmetic over the runner's KV pool, so they live in
-`atom.model_ops.attentions.page_unit_geometry` -- a module with no aiter/GPU
-import -- and are tested here, directly, on the non-GPU runner.
+`atom.model_ops.attentions.pool_layout` -- the package for exactly that, whose
+members reach neither aiter nor the rest of atom -- and are tested here,
+directly, on the non-GPU runner.
 
 This is deliberately split out of `test_kda_checkpoint_slot_copy.py`: that file
 `importorskip`s the K3/GDN builder modules (they import aiter at load), so on a
@@ -24,7 +25,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from atom.model_ops.attentions.page_unit_geometry import PageUnitGeometryMixin
+from atom.model_ops.attentions.pool_layout.page_unit_geometry import (
+    PageUnitGeometryMixin,
+)
 
 
 class TestPageUnitAddressesAreArithmetic:

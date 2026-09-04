@@ -16,7 +16,7 @@ from typing import ClassVar
 
 import pytest
 
-from atom.model_ops.attentions.sub_pool_spec import (
+from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
     PAGED_CLASS,
     InsufficientPoolBudget,
     Pool,

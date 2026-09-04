@@ -20,7 +20,7 @@ try:
 except ImportError as _e:
     skip_if_dependency_missing(_e, "requires full atom import env")
 
-from atom.model_ops.attentions.v4_pool_geometry import (
+from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
     CSA_RATIO,
     DENSE_RATIO,
     HCA_RATIO,

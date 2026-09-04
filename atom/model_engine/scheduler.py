@@ -352,10 +352,6 @@ class ScheduledBatch:
 
         self.is_dummy_run = is_dummy_run
         self.num_spec_step = num_spec_step
-        # DSpark RAGGED (paper §5.2): per-request decode query lengths [bs]
-        # (ell_r + 1). None unless _dspark_apply_ragged set it this step; when
-        # set, consumers use it (per-seq) instead of the scalar above.
-        self.dynamic_spec_query_tokens_per_req = None
 
         # Detailed attention aggregates (set by Scheduler.compute_detailed_aggregates
         # when profiling is active and ATOM_ENABLE_DETAILED_ANNOTATION is set).

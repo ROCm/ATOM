@@ -213,6 +213,54 @@ def test_verify_explicit_compress_cap_write_full_buffer():
         assert p.write_plan_gpu.shape[0] == 64  # full buffer (legacy)
 
 
+# ── per-ratio row content ─────────────────────────────────────────────────
+#
+# Every test above checks a COUNT. These check what is in the rows, which is
+# what a shared row block would get wrong: the four columns are built once per
+# call and only `window_len` is rewritten per ratio, so a plan published for one
+# ratio must still carry that ratio's K after a later ratio has been built.
+
+
+def _window_len(j_in_seq, k_pool):
+    return max(0, k_pool - min(j_in_seq + 1, k_pool))
+
+
+def _rows_carry_own_k(rows, extend, ratio, is_overlap):
+    """Every row's `window_len` recomputed from its own (ragged_id, batch_id)."""
+    cu = np.concatenate([[0], np.cumsum(extend)]).astype(np.int64)
+    k_pool = _k_pool(ratio, is_overlap)
+    for ragged_id, batch_id, _pos, wlen in rows:
+        if ragged_id < 0:  # sentinel padding row
+            continue
+        j = int(ragged_id) - int(cu[int(batch_id)])
+        assert wlen == _window_len(j, k_pool), (
+            f"ratio={ratio}: row(ragged={ragged_id}, batch={batch_id}, j={j}) "
+            f"has window_len={wlen}, expected {_window_len(j, k_pool)} for "
+            f"K_pool={k_pool}"
+        )
+
+
+def test_each_ratio_publishes_its_own_window_len():
+    # Ragged extend lens and a context long enough that both ratios have live
+    # write rows; qlen > 1 so `j_in_seq` actually varies within a sequence.
+    extend = np.array([6, 3, 5, 1], dtype=np.int32)
+    context = np.array([600, 40, 271, 9], dtype=np.int32)
+    bufs = _buffers(compress_rows=512, write_rows=512)
+    plans = make_compress_plans(extend, context, RATIOS_OVERLAP, plan_buffers=bufs)
+    checked = 0
+    for ratio, is_overlap in RATIOS_OVERLAP:
+        p = plans[ratio]
+        if p.compress_plan_cpu is not None:
+            _rows_carry_own_k(p.compress_plan_cpu, extend, ratio, is_overlap)
+            checked += len(p.compress_plan_cpu)
+        write_rows = bufs[ratio]["write"].np[: p.num_write]
+        _rows_carry_own_k(write_rows, extend, ratio, is_overlap)
+        checked += p.num_write
+    # The two ratios must disagree somewhere, or the assertions above are vacuous.
+    assert checked > 0
+    assert _window_len(0, _k_pool(4, True)) != _window_len(0, _k_pool(128, False))
+
+
 def test_graph_bs_and_decode_cap_mutually_exclusive():
     extend, context = _uniform_decode(bs=2, qlen=2)
     with pytest.raises(AssertionError):

@@ -210,10 +210,9 @@ def v4_attn_compress(x: torch.Tensor, layer_name: str) -> None:
 
     Its grid is `plan_gpu.shape[0] = graph_bs * per_seq_bound`, which is why
     this graph keys on `(layer, num_tokens, bucket_bs, q_eff)` while a dense
-    piece keys on num_tokens alone. The indexer top-k would belong here on the
-    FP8 path (`_score_topk_decode_ragged` pads to a `bs * full_q` rectangle),
-    but FP4 is the default and its varqlen path is token-shaped, so it sits in
-    `_sparse_attention` with the rest of that granularity.
+    piece keys on num_tokens alone. The indexer top-k is token-shaped on both
+    the FP8 and FP4 paths, so it sits in `_sparse_attention` with the rest of
+    that granularity.
 
     It returns NOTHING, and does not need to: a split op's submodule is the one
     piece the backend leaves uncompiled (`backends.py`, `submod_names_to_compile`
@@ -1856,7 +1855,9 @@ class Indexer(nn.Module):
             preshuffle=True,
         )
 
-        cu_starts = indexer_meta["cu_starts_gpu"]  # [total_tokens] int32
+        # Same tensor `seq_base` is read from below -- one name for it here, so
+        # a reader does not have to discover that they are the same thing.
+        cu_starts = indexer_meta["seq_base_per_token_gpu"]  # [total_tokens] int32
         cu_ends = indexer_meta["cu_ends_gpu"]  # [total_tokens] int32
 
         # aiter `top_k_per_row_prefill` (radix kernel, parametric `k` via the
@@ -1929,25 +1930,6 @@ class Indexer(nn.Module):
         """
         total_tokens = q_fp8.size(0)
         attn_md = get_forward_context().attn_metadata
-
-        # DSpark RAGGED (paper §5.2): the decode indexer kernel
-        # `deepgemm_fp8_paged_mqa_logits` is RECTANGULAR-ONLY — its grid maps
-        # rows via `pid % next_n` / `pid // next_n`, assuming every seq has
-        # exactly next_n queries. Under per-request ragged verify each seq has
-        # its own len_i (!= a shared next_n), so total_tokens != bs*next_n and a
-        # plain `.view(bs, next_n, ...)` is impossible.
-
-        ragged_lens = getattr(attn_md, "dspark_ragged_lens_gpu", None)
-        is_ragged = ragged_lens is not None and attn_md.dspark_full_q > 0
-        if is_ragged:
-            return self._score_topk_decode_ragged(
-                q_fp8,
-                weights,
-                block_tables,
-                ragged_lens,
-                int(attn_md.dspark_full_q),
-                topk,
-            )
 
         # Treat each query row as an independent batch item (`next_n=1`).
         # The expanded block table preserves its source sequence mapping while
@@ -2126,121 +2108,6 @@ class Indexer(nn.Module):
 
     def _score_topk_decode_fp4(
         self,
-        q_fp4: torch.Tensor,  # [total_tokens, n_heads, head_dim//2] uint8
-        q_scale: torch.Tensor,  # [total_tokens, K_TILES, 4, 16, QS_PAD] uint8
-        block_tables: torch.Tensor,  # [bs, max_blocks_per_seq] int32
-        weights: torch.Tensor,  # [total_tokens, n_heads] fp32
-        indexer_meta: dict,
-        topk: int,
-    ) -> torch.Tensor:
-        """Decode/varctx FP4: `flydsl_pa_mqa_logits_fp4` reads the paged FP4
-        cache directly over each query row's exact CSA-visible window. Output is
-        seq-local `[total_tokens, max_model_len_idx]`, consumed by
-        `top_k_per_row_decode` exactly like the FP8 deepgemm path.
-
-        CUDAGraph-safe: the persistent-grid schedule (`cta_info`/`total_ctas`)
-        is precomputed eagerly by `_build_v4_indexer_meta` into a fixed-address
-        buffer (pre-replay) and passed in here, so the captured kernel uses a
-        fixed grid (== `total_ctas`) reading fresh per-fwd schedule contents from
-        a stable pointer — no host sync, no data-dependent grid. Passing
-        `cta_info`/`total_ctas` makes the kernel skip its own schedule build, so
-        `parallel_unit_num` is not passed (it would be ignored); only `block_k`
-        must match the value the schedule was built with (see `FP4_MQA_BLOCK_K`).
-        """
-        from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
-            flydsl_pa_mqa_logits_fp4,
-        )
-
-        fc = get_forward_context()
-        total_tokens = q_fp4.size(0)
-        # DSpark RAGGED decode (per-request variable query lengths): route to the
-        # varqlen FP4 path (aiter `flydsl_pa_mqa_logits_fp4_varqlen` via the
-        # ragged-prefill kernel). The rectangular path below does
-        # `q_fp4.view(bs, next_n, ...)` + a uniform-next_n cta_info schedule, so a
-        # ragged batch (total_tokens != bs*next_n) can't take it. Ragged is
-        # eager-only (CUDAGraph rectangularizes it upstream — see
-        # `deepseek_v4_attn.py` TRUE-FLAT graph), so this only triggers under
-        # --enforce-eager + MTP per-request verify, mirroring the FP8
-        # `_score_topk_decode_ragged` scope.
-        attn_md = fc.attn_metadata
-        ragged_lens = getattr(attn_md, "dspark_ragged_lens_gpu", None)
-        if ragged_lens is not None and getattr(attn_md, "dspark_full_q", 0) > 0:
-            return self._score_topk_decode_ragged_fp4(
-                q_fp4, q_scale, block_tables, weights, indexer_meta, topk
-            )
-        k_tiles = self.head_dim // 128
-        qs_pad = q_scale.shape[-1]
-        q_4d = q_fp4.view(total_tokens, 1, self.n_heads, self.head_dim // 2)
-        q_scale_6d = q_scale.view(total_tokens, 1, k_tiles, 4, 16, qs_pad)
-        max_seq_len = self._max_model_len_idx
-        kv_block_size = self.kv_cache.size(3)  # csa_rows_per_block = 64
-        # The packed-dword scale readers in pa_mqa_logits_fp4* require N_PHYS==1
-        # (NTPW=4 N-tiles share one physical block), i.e. kv_block_size == 64
-        # (TILES_PER_BLOCK = 64/MFMA_N(16) = 4 = NTPW). block_size=256 gives
-        # 64 CSA rows per block, which
-        # satisfies this; guard so an unsupported block size fails loudly here
-        # instead of reading scales with the wrong interleave.
-        assert kv_block_size == 64, (
-            f"FP4 indexer requires kv_block_size (CSA rows per block) == 64 "
-            f"for the packed "
-            f"N_PHYS==1 mqa-logits readers, got {kv_block_size}. Set V4 "
-            f"block_size=256 (CSA rows per block = block_size // 4)."
-        )
-
-        # Precomputed schedule from the metadata builder (always present on the
-        # FP4 decode path). When `cta_info` is passed the kernel skips its
-        # internal compute_varctx_schedule AND its out.fill_(-inf).
-        cta_info = indexer_meta["fp4_cta_info"]
-        total_ctas = indexer_meta["fp4_total_ctas"]
-        # Write-once GPU scratch, NOT -inf-filled (mirrors the FP8 decode path).
-        # The kernel writes every column in `[0, context_len)` per row and
-        # `top_k_per_row_decode` scans only the exact ratio-4 per-token prefix
-        # below, so cells past it are never read. A `torch.full(-inf)`
-        # pre-fill would be wasted ~290μs FillFunc work at width
-        # `max_model_len_idx`. CG-safe: torch.empty lands in the graph's private
-        # pool at a stable address across replays at this captured shape.
-        logits = torch.empty(
-            total_tokens, max_seq_len, dtype=torch.float32, device=q_fp4.device
-        )
-        flydsl_pa_mqa_logits_fp4(
-            q_4d,
-            q_scale_6d,
-            self.kv_cache,
-            self.kv_scale,
-            attn_md.block_tables_per_token[:total_tokens],
-            weights,
-            attn_md.csa_n_committed_per_token[:total_tokens],
-            max_seq_len,
-            weight_scale=self._weights_scale,
-            next_n=1,
-            block_k=FP4_MQA_BLOCK_K,
-            kv_block_size=kv_block_size,
-            # Grid is driven by the pre-built `cta_info`/`total_ctas`; the kernel
-            # ignores `parallel_unit_num` unless it builds the schedule itself
-            # (cta_info is None). Do NOT pass it here — the builder's real P is
-            # max(512, T_dec), so a hardcoded value would just mislead readers.
-            out=logits,
-            cta_info=cta_info,
-            total_ctas=total_ctas,
-        )  # [bs*next_n, max_seq_len] fp32, seq-local
-
-        topk_local = torch.empty(
-            total_tokens, self.index_topk, dtype=torch.int32, device=q_fp4.device
-        )
-        top_k_per_row_decode(
-            logits,
-            1,
-            attn_md.csa_n_committed_per_token[:total_tokens],
-            topk_local,
-            total_tokens,
-            logits.stride(0),
-            logits.stride(1),
-            k=topk,
-        )
-        return topk_local  # [total_tokens, index_topk] int32, raw seq-local
-
-    def _score_topk_decode_ragged_fp4(
-        self,
         q_fp4: torch.Tensor,  # [padded_tokens, n_heads, head_dim//2] uint8
         q_scale: torch.Tensor,  # [padded_tokens, K_TILES, 4, 16, QS_PAD] uint8
         block_tables: torch.Tensor,  # [bs, max_blocks_per_seq] int32
@@ -2250,15 +2117,11 @@ class Indexer(nn.Module):
     ) -> torch.Tensor:
         """RAGGED decode FP4 via the varqlen (ragged-prefill) MQA-logits kernel.
 
-        DSpark per-request variable query lengths (paper §5.2): seq b forwards
-        its own `qlen_b` query tokens, so `total_tokens = Σ qlen_b != bs*next_n`
-        and the rectangular `_score_topk_decode_fp4` view()/uniform-next_n
-        schedule can't apply. Instead of the FP8 path's pad-to-rectangle+gather
-        (`_score_topk_decode_ragged`), this uses aiter's native varqlen path: the
-        decode tokens are already laid out per-seq ascending (the natural DSpark
-        ragged order, `batch_id_per_token = repeat(arange(bs), qlen)`), which is
-        exactly what the ragged-prefill kernel + `compute_varqlen_windows`
-        consume — no scatter needed.
+        A sequence forwards its own number of query tokens, so `total_tokens` is
+        their sum and a `[bs, next_n]` view does not exist. None is needed: the
+        decode tokens are already laid out per-seq ascending, so row `r` IS token
+        `r` and `batch_id_per_token` is the row-to-sequence map the ragged-prefill
+        kernel wants — no scatter, no second layout.
 
         Per-row MTP tail-causal window: row n of seq b scores compressed KV
         `[0, n_committed_b - qlen_b + n + 1)`, identical to the rectangular decode
@@ -2293,11 +2156,11 @@ class Indexer(nn.Module):
         # so the full padded q_fp4 is scored single-shot: pad rows are skipped by
         # the kernel (empty window → 0 CTAs → no paged KV read) and their top-k is
         # -1 (ignored downstream by csa_translate_pack). No strip / pad-back.
-        row_to_batch = indexer_meta["fp4_ragged_row_to_batch"]
-        local_starts = indexer_meta["fp4_ragged_local_starts"]
-        local_ends = indexer_meta["fp4_ragged_local_ends"]
-        cta_info = indexer_meta["fp4_ragged_cta_info"]
-        n_ctas = indexer_meta["fp4_ragged_n_ctas"]
+        row_to_batch = indexer_meta["fp4_row_to_batch"]
+        local_starts = indexer_meta["fp4_local_starts"]
+        local_ends = indexer_meta["fp4_local_ends"]
+        cta_info = indexer_meta["fp4_cta_info"]
+        n_ctas = indexer_meta["fp4_n_ctas"]
         # Fixed logits width → static `[padded, W]` shape (CG-capturable), same as
         # the rectangular decode path.
         max_seq_len = self._max_model_len_idx
@@ -2339,115 +2202,24 @@ class Indexer(nn.Module):
         # Seq-local output → indices returned directly. top_k writes every row
         # (real + empty pad rows → -1), so a bare torch.empty output is fine.
         topk_out = torch.empty((padded_tokens, topk), dtype=torch.int32, device=device)
-        top_k_per_row_prefill(
+        # DECODE top-k even though the logits came from the prefill-shaped
+        # scorer: `local_starts` is all zeros, the `rowStart == 0` this entry
+        # assumes. The prefill entry dispatches on `topk_use_mulblocks(rows,
+        # stride0)` with `stride0 = max_position_embeddings // 4` (262144, which
+        # no serving flag lowers), so every step under 128 rows would land on
+        # the multi-block kernel aiter removed from decode. Revisit if
+        # `local_starts` ever stops being zero.
+        top_k_per_row_decode(
             logits,
-            local_starts,
+            1,
             local_ends,
             topk_out,
-            None,  # values not needed, only indices
             padded_tokens,
             logits.stride(0),
             logits.stride(1),
             k=topk,
         )
         return topk_out  # [padded_tokens, topk] int32, raw seq-local
-
-    def _score_topk_decode_ragged(
-        self,
-        q_fp8: torch.Tensor,  # [total_tokens, n_heads, head_dim] fp8
-        weights: torch.Tensor,  # [total_tokens, n_heads] fp32
-        block_tables: torch.Tensor,  # [bs, max_blocks_per_seq] int32
-        ragged_lens: torch.Tensor,  # int32 [bs] — per-seq len_i (= ell_i+1)
-        full_q: int,  # full draft span width (mtp_k + 1)
-        topk: int,
-    ) -> torch.Tensor:
-        """RAGGED decode indexer via pad-to-rectangle + gather (paper §5.2).
-
-        EAGER-ONLY: this per-seq ragged path runs only under --enforce-eager. The
-        CUDAGraph path uses a rectangular (uniform q_eff) decode layout (see
-        `_dspark_apply_ragged`'s graph branch), so under graph the indexer takes
-        the plain `_score_topk_decode` and never reaches here. True per-seq flat
-        under graph is a follow-up.
-
-        The decode indexer kernel is rectangular-only (see `_score_topk_decode`).
-        We scatter the ragged Q/weights into a [bs, full_q] rectangle at each
-        token's original in-span slot j, flatten its rows into independent
-        `next_n=1` batch items, then gather real rows back. The expanded per-row
-        block table preserves sequence ownership and the right-aligned row-end
-        metadata supplies each row's exact CSA-visible range.
-        """
-        device = q_fp8.device
-        total_tokens = q_fp8.size(0)
-        bs = int(ragged_lens.shape[0])
-        H, D = self.n_heads, self.head_dim
-        R = bs * full_q  # padded rectangle rows (fixed per (bs, full_q) graph)
-
-        # CUDAGraph-SAFE pad-to-rectangle. RIGHT-ALIGN: token j of seq i goes to
-        # row i*full_q + (full_q-len_i) + j, so a len_i seq fills the TAIL slots
-        # [full_q-len_i .. full_q-1] and sees ctx-len_i+j (matches the indexer's
-        # causal bound, identical to the rectangular path). dst is built without
-        # data-dependent-shape ops (repeat_interleave banned under CG); clamp the
-        # -1 pad ids to 0 here (redirected to the dump row below).
-        attn_md = get_forward_context().attn_metadata
-        bid_raw = attn_md.batch_id_per_token[:total_tokens].to(torch.int64)
-        bid = torch.clamp(bid_raw, min=0)  # [total_tokens]
-        lens_i64 = ragged_lens.to(torch.int64)
-        cu = torch.zeros(bs + 1, dtype=torch.int64, device=device)
-        torch.cumsum(lens_i64, dim=0, out=cu[1:])
-        tok_arange = torch.arange(total_tokens, device=device, dtype=torch.int64)
-        j_in_seq = tok_arange - cu[bid]  # in-span slot 0..len_i-1 (real tokens)
-        pad_i = full_q - lens_i64  # [bs] leading pad per seq (right-align)
-        dst = bid * full_q + pad_i[bid] + j_in_seq  # [total_tokens]
-        # Redirect CG tail-padding tokens (bid == -1) to a dedicated DUMP row R
-        # (one past the real rect) so they never clobber a real token's q. Fixed
-        # shape (total_tokens) → CG-safe; only rows [0:R] feed the kernel.
-        is_pad = bid_raw < 0
-        dst = torch.where(is_pad, torch.full_like(dst, R), dst)  # pad → row R
-        dst = torch.clamp(dst, 0, R)  # defensive: never OOB the [R+1] rect
-
-        # Zero the [R+1] rectangle (last row = pad dump), scatter all tokens.
-        q_rect = torch.zeros(R + 1, H, D, dtype=q_fp8.dtype, device=device)
-        w_rect = torch.zeros(R + 1, weights.size(1), dtype=weights.dtype, device=device)
-        q_rect[dst] = q_fp8
-        w_rect[dst] = weights
-        q_4d = q_rect[:R].view(R, 1, H, D)
-
-        kv_cache_4d = self.kv_cache.unsqueeze(-2)
-        # kernel operates on the real [R] rect (bs*full_q rows); the dump row R is
-        # only a scatter sink, excluded from the kernel + topk.
-        logits = torch.empty(
-            R, self._max_model_len_idx, dtype=torch.float32, device=device
-        )
-        deepgemm_fp8_paged_mqa_logits(
-            q_4d,
-            kv_cache_4d,
-            w_rect[:R],
-            logits,
-            attn_md.csa_n_committed_per_token[:R],
-            attn_md.block_tables_per_token[:R],
-            self._max_model_len_idx,
-            KVBlockSize=self.kv_cache.size(1),
-            Preshuffle=True,
-        )
-        # topk_rect has R+1 rows: [0:R] real, row R is the pad dump so that
-        # gather with dst∈{..,R} stays in-bounds. Fill row R with -1 sentinels
-        # (csa_translate_pack skips topk<0), the rest by the kernel.
-        topk_rect = torch.full(
-            (R + 1, self.index_topk), -1, dtype=torch.int32, device=device
-        )
-        top_k_per_row_decode(
-            logits,
-            1,
-            attn_md.csa_n_committed_per_token[:R],
-            topk_rect[:R],
-            R,
-            logits.stride(0),
-            logits.stride(1),
-            k=topk,
-        )
-        # Gather each seq's real rows back to the ragged [total_tokens] layout.
-        # Pad tokens (dst==R) read the -1 sentinel row → harmless downstream.
-        return topk_rect[dst]  # [total_tokens, index_topk] int32, seq-local
 
 
 # ---------------------------------------------------------------------------

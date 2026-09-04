@@ -14,7 +14,7 @@ from itertools import pairwise
 
 import pytest
 
-from atom.model_ops.attentions.v4_pool_geometry import (
+from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
     ABSENT_RATIO,
     CSA_RATIO,
     DENSE_RATIO,

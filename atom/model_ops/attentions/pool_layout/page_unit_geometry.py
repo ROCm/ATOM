@@ -7,9 +7,10 @@ The destination side of a K3 PAGE-copy checkpoint: given logical block (PAGE
 unit) ids, it gives the addresses and tensor views of the KV pool a checkpoint
 copy lands on. `_KimiMLAGDNCommon` mixes it in over `GDNStateMixin`.
 
-Kept aiter/GPU-import-free and pure over `self.model_runner` so this geometry --
-which decides where every checkpoint byte goes -- can be unit-tested on a
-GPU-less runner (the K3 builder's own module is `importorskip`ped on CI).
+Pure over `self.model_runner`, and here rather than beside that builder for the
+reason the package exists (see `pool_layout/__init__.py`): the geometry deciding
+where every checkpoint byte goes is then testable on a GPU-less runner, which
+the K3 builder's own module -- `importorskip`ped on CI -- is not.
 """
 
 from __future__ import annotations

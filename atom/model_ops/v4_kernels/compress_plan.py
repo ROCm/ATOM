@@ -64,6 +64,22 @@ class CompressPlan:
     compress_plan_cpu: np.ndarray | None = None  # [num_compress, 4] int32 or None
 
 
+def plan_context_lens(
+    positions: np.ndarray, cu_seqlens_q: np.ndarray, extend_lens: np.ndarray
+) -> np.ndarray:
+    """`context_lens_cpu` for `make_compress_plans`, read off this step's positions.
+
+    The plan re-derives each token's position as `(ctx - extend) + j`, so `ctx`
+    must be the seq length THROUGH the last token this forward writes. Taking
+    the seq's first position from `positions` rather than recomputing an anchor
+    is what stops the plan from placing a token somewhere attention does not:
+    the two anchors differ by `full_q - len_i` on a DSpark ragged step, and by
+    nothing anywhere else.
+    """
+    bs = len(extend_lens)
+    return (positions[cu_seqlens_q[:bs]] + extend_lens).astype(np.int32)
+
+
 def make_compress_plans(
     extend_lens_cpu: np.ndarray,
     context_lens_cpu: np.ndarray,
@@ -207,14 +223,21 @@ def make_compress_plans(
     prefix_lens = context_lens_cpu - extend_lens_cpu
     positions = prefix_lens[batch_ids] + j_in_seq
 
+    # Only `window_len` depends on the ratio, so the row block is built once and
+    # the loop rewrites that one column. Both selections below are boolean
+    # fancy-indexing, which numpy always materializes as a copy -- that is what
+    # lets the next ratio overwrite column 3 without reaching a plan this one
+    # already published. Keep them gathers.
+    plan_rows = np.empty((total, 4), dtype=np.int32)
+    plan_rows[:, 0] = ragged_ids
+    plan_rows[:, 1] = batch_ids
+    plan_rows[:, 2] = positions
+
     for ratio, is_overlap in unique_ratios_overlap:
         K = ratio * (2 if is_overlap else 1)
         # window_len = K - min(j_in_seq + 1, K)
         # Number of leading K-loop iterations that go to state cache.
-        window_lens = np.maximum(0, K - np.minimum(j_in_seq + 1, K)).astype(np.int32)
-        plan_rows = np.stack(
-            [ragged_ids, batch_ids, positions, window_lens], axis=1
-        ).astype(np.int32)
+        plan_rows[:, 3] = np.maximum(0, K - np.minimum(j_in_seq + 1, K))
 
         # compress: token at a compression boundary
         compress_mask = (positions + 1) % ratio == 0

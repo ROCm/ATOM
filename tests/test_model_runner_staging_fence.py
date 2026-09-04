@@ -112,7 +112,15 @@ def test_late_draft_uploads_are_staged_by_prepare_model():
     )
 
     assert len(_attribute_calls(prepare_model, "anchors_to_gpu")) == 1
-    assert len(_attribute_calls(prepare_model, "copy_to_gpu")) == 1
+    # Zero, not one: the per-request verify lengths used to be staged here into
+    # their own pinned buffer, and now ride `cu_seqlens_q`, which
+    # the attention builder's `publish_cu_seqlens_q` uploads once per step.
+    #
+    # This walks `prepare_model`'s own body, so it sees neither that upload nor
+    # any other a callee makes -- it catches a copy written HERE, not a second
+    # copy of the same buffer. That one is enforced by there being a single
+    # publisher, not by this count.
+    assert len(_attribute_calls(prepare_model, "copy_to_gpu")) == 0
     assert not _attribute_calls(propose, "anchors_to_gpu")
     assert not _attribute_calls(propose, "copy_to_gpu")
     assert not _attribute_calls(compute_draft_kv, "anchors_to_gpu")

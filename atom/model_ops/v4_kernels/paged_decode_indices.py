@@ -45,7 +45,7 @@ import torch
 import triton
 import triton.language as tl
 
-from atom.model_ops.attentions.v4_pool_geometry import (
+from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
     CSA_RATIO,
     DENSE_RATIO,
     HCA_RATIO,
@@ -497,24 +497,19 @@ def write_v4_paged_decode_indices_reference(
 def _v4_decode_indptr_kernel(
     batch_id_per_token_ptr,  # [T_pad] int — -1 sentinel in the CG-padded tail
     positions_ptr,  # [T_pad] int — global token position (int64 in production)
-    ragged_lens_ptr,  # [bs] int32 — DSpark per-seq query count (RECT only)
-    cu_q_ptr,  # [bs] int32 — per-seq first token index (RECT only)
     swa_indptr_ptr,  # [T_pad+1] int32 OUT
     csa_indptr_ptr,  # [T_pad+1] int32 OUT
     hca_indptr_ptr,  # [T_pad+1] int32 OUT
-    csa_n_committed_ptr,  # [T_pad] or [rect_bs*rect_full_q] int32 OUT
+    csa_n_committed_ptr,  # [T_pad] int32 OUT
     t_pad,  # token count including the CG pad — RUNTIME, see below
-    n_committed_rows,  # length of the visibility output, whichever layout
-    rect_full_q,  # rectangle width; only read when IS_RECT
     WIN: tl.constexpr,
     CSA_R: tl.constexpr,
     HCA_R: tl.constexpr,
     INDEX_TOPK: tl.constexpr,
-    IS_RECT: tl.constexpr,  # False = token-indexed output; True = DSpark rect
     BLOCK: tl.constexpr,
 ):
-    """One program: a running offset per class over `t_pad` tokens, then the
-    CSA visibility over `n_committed_rows` destination rows.
+    """One program: a running offset per class over `t_pad` tokens, and each
+    token's own CSA visibility alongside them.
 
     A prefix sum has to see every earlier token, so this is one serial scan
     rather than a grid. Against a 1.7us launch floor every multi-launch
@@ -574,42 +569,9 @@ def _v4_decode_indptr_kernel(
         acc_csa += tl.sum(cnt_csa)
         acc_hca += tl.sum(cnt_hca)
 
-        if not IS_RECT:
-            # row == token, so the lane that owns a slot here owns it in the
-            # destination too, and the CG pad takes its 0 from the same store.
-            tl.store(csa_n_committed_ptr + idx, tl.where(live, n_csa, 0), mask=in_range)
-
-    if IS_RECT:
-        # ----- CSA visibility, one pass over the DESTINATION -----
-        # DSpark fp8 lays this out as a `full_q`-wide rectangle with each
-        # sequence's tokens flushed right, so token -> row is a scatter and some
-        # rows hold no token. Walking rows writes every one exactly once from
-        # its owning lane; walking tokens would leave the rest to a clearing
-        # pass another warp could still be in -- a hazard to fence rather than
-        # one that cannot arise. They do get read: the indexer runs the captured
-        # grid and takes this as each row's end.
-        for row_base in tl.range(0, n_committed_rows, BLOCK):
-            row = row_base + tl.arange(0, BLOCK)
-            in_range = row < n_committed_rows
-            seq = row // rect_full_q
-            offset = row % rect_full_q
-            # A row holds a token only past its band's leading slack; bands past
-            # the batch read a zero `ragged_lens`, so the whole band is slack.
-            lead = rect_full_q - tl.load(ragged_lens_ptr + seq, mask=in_range, other=0)
-            token = tl.load(cu_q_ptr + seq, mask=in_range, other=0) + offset - lead
-            mapped = in_range & (offset >= lead)
-            # `mapped` already implies a token inside this sequence's span, so
-            # this gather is redundant WHILE `cu_q` is the cumsum of
-            # `ragged_lens`. Nothing here can check that, and the two now come
-            # from different arrays built in different files, so it stays.
-            bid = tl.load(batch_id_per_token_ptr + token, mask=mapped, other=-1)
-            live = mapped & (bid >= 0)
-            pos = tl.load(positions_ptr + token, mask=live, other=0).to(tl.int32)
-            tl.store(
-                csa_n_committed_ptr + row,
-                tl.where(live, (pos + 1) // CSA_R, 0),
-                mask=in_range,
-            )
+        # Row == token, so the lane that owns a slot here owns it in the
+        # destination too, and the CG pad takes its 0 from the same store.
+        tl.store(csa_n_committed_ptr + idx, tl.where(live, n_csa, 0), mask=in_range)
 
 
 @mark_trace
@@ -624,9 +586,6 @@ def build_v4_paged_decode_indptr(
     T_pad: int,
     win: int,
     index_topk: int,
-    rect_full_q: int = 0,
-    ragged_lens: torch.Tensor | None = None,
-    cu_q_per_seq: torch.Tensor | None = None,
 ) -> None:
     """Fill the three ragged indptr cumsums and the CSA per-token visibility.
 
@@ -642,12 +601,9 @@ def build_v4_paged_decode_indptr(
     capped by `index_topk`: that bounds what the CSA slice reserves, not what
     the indexer may look at.
 
-    `rect_full_q > 0` switches the output to DSpark's right-aligned
-    `[bs, full_q]` rectangle; `ragged_lens` / `cu_q_per_seq` are then required.
-
-    The whole of `csa_n_committed_per_token` is this call's to fill, however it
-    is laid out: pass the slice you want written and the rows no token maps to
-    are set to 0. That filler is right only because the decode scorers pass
+    The whole of `csa_n_committed_per_token` is this call's to fill: one row per
+    token, and the rows no live token maps to are set to 0. That filler is right
+    only because the decode scorers pass
     `next_n=1`, making `row_len == rowEnds[r]`; the per-seq twin pads with
     `index_topk` for the opposite reason (`_attach_v4_per_fwd_meta` -- there,
     too SMALL hangs the radix loop).
@@ -669,51 +625,26 @@ def build_v4_paged_decode_indptr(
                 f"{want} of them (T_pad={T_pad})"
             )
     n_rows = csa_n_committed_per_token.shape[0]
-    if rect_full_q > 0:
-        if ragged_lens is None or cu_q_per_seq is None:
-            raise ValueError(
-                "the DSpark rectangle needs the per-seq query counts and starts"
-            )
-        # The rows carry `seq = row // full_q` straight into both per-seq
-        # tensors, so their length is what bounds that index. Nothing else does:
-        # `rect_bs` is decided by the caller, and a short `ragged_lens` would be
-        # an unmasked device read of whatever follows it.
-        bands = -(-n_rows // rect_full_q)
-        for name, buf in (("ragged_lens", ragged_lens), ("cu_q_per_seq", cu_q_per_seq)):
-            if buf.shape[0] < bands:
-                raise ValueError(
-                    f"{name} has {buf.shape[0]} entries but the rectangle spans "
-                    f"{bands} bands ({n_rows} rows of {rect_full_q})"
-                )
-    elif n_rows != T_pad:
-        # Token-indexed: the destination IS the token axis, one row each. A
-        # longer buffer would leave its tail reading tokens this forward never
-        # declared -- live values from the last one, on a persistent buffer.
+    if n_rows != T_pad:
+        # The destination IS the token axis, one row each. A longer buffer would
+        # leave its tail reading tokens this forward never declared -- live
+        # values from the last one, on a persistent buffer.
         raise ValueError(
-            f"token-indexed output must be exactly T_pad={T_pad} rows, got "
-            f"{n_rows}; slice it, or pass the rectangle's parameters"
+            f"the visibility output must be exactly T_pad={T_pad} rows, got "
+            f"{n_rows}; slice it"
         )
     _v4_decode_indptr_kernel[(1,)](
         batch_id_per_token,
         positions,
-        # Triton takes a pointer per parameter whatever the constexpr says; the
-        # rect-only ones borrow a buffer of the right dtype when switched off.
-        ragged_lens if rect_full_q > 0 else batch_id_per_token,
-        cu_q_per_seq if rect_full_q > 0 else batch_id_per_token,
         swa_indptr,
         csa_indptr,
         hca_indptr,
         csa_n_committed_per_token,
         T_pad,
-        # The destination's own length, so the kernel fills exactly what it was
-        # handed: `T_pad` rows token-indexed, `rect_bs * full_q` as a rectangle.
-        csa_n_committed_per_token.shape[0],
-        rect_full_q,
         WIN=win,
         CSA_R=CSA_RATIO,
         HCA_R=HCA_RATIO,
         INDEX_TOPK=index_topk,
-        IS_RECT=rect_full_q > 0,
         BLOCK=1024,
     )
 
@@ -729,20 +660,13 @@ def build_v4_paged_decode_indptr_reference(
     T_pad: int,
     win: int,
     index_topk: int,
-    rect_full_q: int = 0,
-    ragged_lens: torch.Tensor | None = None,
-    cu_q_per_seq: torch.Tensor | None = None,
 ) -> None:
     """Pure-PyTorch equivalent of `build_v4_paged_decode_indptr`, for the
     kernel-vs-reference tests. Same argument contract, including owning the
     whole of `csa_n_committed_per_token`.
-
-    Stated as a scatter where the kernel walks the destination, so the parity
-    test compares two derivations of the layout rather than one twice.
     """
     bid = batch_id_per_token[:T_pad].long()
     live = bid >= 0
-    safe_bid = torch.where(live, bid, torch.zeros_like(bid))
     pos = positions[:T_pad].long()
     n = torch.minimum(pos + 1, torch.full_like(pos, win))
     n_csa = (pos + 1) // CSA_RATIO
@@ -758,15 +682,7 @@ def build_v4_paged_decode_indptr_reference(
     for key, out in (("swa", swa_indptr), ("csa", csa_indptr), ("hca", hca_indptr)):
         out[0] = 0
         out[1 : T_pad + 1] = torch.cumsum(counts[key], dim=0).to(out.dtype)
-    if rect_full_q > 0:
-        assert ragged_lens is not None and cu_q_per_seq is not None
-        dst = (
-            safe_bid * rect_full_q
-            + (rect_full_q - ragged_lens[safe_bid].long())
-            + (torch.arange(T_pad, device=bid.device) - cu_q_per_seq[safe_bid].long())
-        )
-    else:
-        dst = torch.arange(T_pad, device=bid.device)
+    dst = torch.arange(T_pad, device=bid.device)
     csa_n_committed_per_token.zero_()
     csa_n_committed_per_token[dst[live]] = n_csa[live].to(
         csa_n_committed_per_token.dtype

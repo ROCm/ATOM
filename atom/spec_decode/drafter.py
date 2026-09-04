@@ -603,18 +603,23 @@ class Drafter(abc.ABC):
     def prepare_inputs(
         self,
         scheduled_bs: int,
-        # [batch_size]
-        last_token_offset: int | torch.Tensor,
+        # [scheduled_bs] each request's anchor offset WITHIN its own segment;
+        # for a verified request that is its accepted-draft count. None ->
+        # every segment's last row, what a step that verified nothing wants.
+        anchor_in_seq: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        forward_context = get_forward_context()
-        attn_metadata = forward_context.attn_metadata
+        """Anchor row per request = its segment start + `anchor_in_seq`.
 
-        cu_seqlens_q = attn_metadata.cu_seqlens_q
-        # Only use decode sequences' cu_seqlens_q (num_rejected_tokens length
-        # matches decode sequences). cu_seqlens_q has length scheduled_bs + 1.
+        Reading forward from the start is what keeps this length-free; counting
+        back from the segment end needs the segment length, which DSpark's
+        ragged verify makes a per-request number.
+        """
+        cu_seqlens_q = get_forward_context().attn_metadata.cu_seqlens_q
         cu_seqlens_q = cu_seqlens_q[: scheduled_bs + 1]
 
-        token_indices = cu_seqlens_q[1:] - last_token_offset
+        if anchor_in_seq is None:
+            anchor_in_seq = cu_seqlens_q[1:] - cu_seqlens_q[:-1] - 1
+        token_indices = cu_seqlens_q[:-1] + anchor_in_seq
 
         # Defensive clamp to the valid flat-token range [0, total_tokens-1].
         # Under DSpark flat-ragged CUDA graph, the drain-phase corner (tiny /
