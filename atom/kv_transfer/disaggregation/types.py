@@ -121,6 +121,17 @@ class ConnectorCompletion:
         return self.channel, self.operation_id
 
 
+# Region roles used for producer-to-DCP-consumer relayout. The consumer stores
+# both MLA and DSA index caches interleave-sharded; producer MLA bytes are
+# token-contiguous, while producer preshuffled DSA index bytes require staging.
+MLA_KV_ROLE = "mla.kv"
+INDEX_CACHE_ROLE = "dsa.index_cache"
+# Producer gather callbacks need one staging slot per concurrent send worker.
+# Mooncake and attention-pool allocation share this fallback so their defaults
+# cannot drift independently.
+DEFAULT_SHARDED_STAGING_WORKERS = 16
+
+
 @dataclass
 class KVTransferRegion:
     """One RDMA-registerable tensor region."""
@@ -155,6 +166,10 @@ class KVTransferTensors:
     plane count explicit so registration can reject a missing plane.
     ``staging_region`` plus ``gather_slot``/``scatter_slot`` cover only the
     compressor-state PD staging pool and are invalid as sidecar SLOT sources.
+    ``index_staging_region`` plus ``prepare_sharded_index`` and
+    ``gather_sharded_index`` cover producer-side repacking of preshuffled index
+    pages before DCP-sharded RDMA. The prepared indices are shared across index
+    layers.
     """
 
     # Block-indexed PAGE regions, indexed forward by physical block id.
@@ -185,6 +200,14 @@ class KVTransferTensors:
     # loose runtime attribute so the field the connector reads is part of the
     # contract, not an undocumented assignment two layers away.
     state_backend: object | None = None
+    # Producer-side DSA index-page staging. The callback fills one pool slot
+    # with compact destination pages and returns (base_addr, page_count).
+    index_staging_region: KVTransferRegion | None = None
+    index_staging_pool_size: int = 0
+    index_staging_chunk_pages: int = 0
+    gather_sharded_index: Callable[..., tuple[int, int]] | None = None
+    # Appended after the original staging fields for positional compatibility.
+    prepare_sharded_index: Callable[..., Any] | None = None
 
 
 @dataclass

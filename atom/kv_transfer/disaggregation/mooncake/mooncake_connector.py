@@ -22,11 +22,13 @@ from typing import Any
 
 import msgpack
 import msgspec
+import numpy as np
 import torch
 import zmq
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
 
 from atom.config import Config
+from atom.distributed.dcp_utils import get_dcp_group
 from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
@@ -37,7 +39,13 @@ from atom.kv_transfer.disaggregation.port_offset import (
 from atom.kv_transfer.disaggregation.port_offset import (
     side_channel_port_offset as _port_offset,
 )
+from atom.kv_transfer.disaggregation.sharded_transfer import (
+    build_dcp_shard_plan,
+    coalesce_contiguous,
+)
 from atom.kv_transfer.disaggregation.types import (
+    DEFAULT_SHARDED_STAGING_WORKERS,
+    INDEX_CACHE_ROLE,
     ConnectorMetadata,
     KVTransferRegion,
     ReqId,
@@ -306,7 +314,8 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         self.dp_rank = config.parallel_config.data_parallel_rank
         self.pp_size = config.pipeline_parallel_size
         self.block_size = config.kv_cache_block_size
-        self.hash_block_size = self.block_size * config.decode_context_parallel_size
+        self.dcp_size = config.decode_context_parallel_size
+        self.hash_block_size = self.block_size * self.dcp_size
         self.host_ip = get_ip()
 
         # Pending requests: req_id -> (Sequence, block_table)
@@ -387,14 +396,15 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             # not covered by a block-only delta, so it takes a full transfer.
             num_computed_blocks = 0
             remote_hash_block_size = params.get("hash_block_size")
-            if remote_hash_block_size != self.hash_block_size:
+            if remote_hash_block_size != self.block_size:
                 logger.warning(
                     "PD incremental transfer disabled for req %s: producer "
-                    "hash_block_size=%r, consumer hash_block_size=%d; "
+                    "hash_block_size=%r, consumer block_size=%d (dcp=%d); "
                     "falling back to full transfer",
                     seq.id,
                     remote_hash_block_size,
-                    self.hash_block_size,
+                    self.block_size,
+                    self.dcp_size,
                 )
             elif not seq.has_per_req_cache and self.hash_block_size > 0:
                 num_computed_blocks = seq.num_cached_tokens // self.hash_block_size
@@ -478,6 +488,12 @@ class MooncakeConnector(KVConnectorBase):
         self.pp_rank = config.parallel_config.pipeline_parallel_rank
         self.pp_size = config.pipeline_parallel_size
         self.num_hidden_layers = config.hf_config.num_hidden_layers
+        self.block_size = config.kv_cache_block_size
+        # The consumer ships its DCP topology in the write_request; the
+        # producer relayouts on the way out and keeps dcp_size == 1 of its own.
+        self.dcp_size = config.decode_context_parallel_size
+        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_size > 1 else 0
+        self.dcp_interleave_size = config.dcp_config.interleave_size
         # Global index of this stage's first layer; consumer regions are ordered
         # over all layers, so a producer stage writes at this layer offset.
         self._start_layer = 0
@@ -595,6 +611,7 @@ class MooncakeConnector(KVConnectorBase):
         self.kv_caches: dict[str, Any] | None = None
         self.kv_caches_base_addr: list[int] = []
         self._per_block_bytes_list: list[int] = []
+        self._block_region_roles: list[str | None] = []
         self.kv_cache_shape: tuple[int, ...] | None = None
         self.block_len: int = config.kv_cache_block_size
         self.num_blocks: int = 0
@@ -619,6 +636,12 @@ class MooncakeConnector(KVConnectorBase):
         self._staging_pool_size: int = 0
         self._staging_free: list[int] = []
         self._staging_lock = threading.Lock()
+        self._index_staging_pool_size: int = 0
+        self._index_staging_chunk_pages: int = 0
+        self._index_staging_free: list[int] = []
+        self._index_staging_lock = threading.Lock()
+        self._prepare_sharded_index = None
+        self._gather_sharded_index = None
 
         # --- Producer: completed prefill block_ids cache ---
         # Populated from ConnectorMetadata.reqs_to_save each step.
@@ -665,10 +688,15 @@ class MooncakeConnector(KVConnectorBase):
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
 
         # --- Producer: thread pool for RDMA writes ---
+        self._cuda_device = torch.cuda.current_device()
         if self.is_producer:
             self._send_executor = ThreadPoolExecutor(
-                max_workers=kv_transfer_config.get("num_worker_threads", 16),
+                max_workers=kv_transfer_config.get(
+                    "num_worker_threads", DEFAULT_SHARDED_STAGING_WORKERS
+                ),
                 thread_name_prefix="mooncake-send-worker",
+                initializer=torch.cuda.set_device,
+                initargs=(self._cuda_device,),
             )
 
         # --- ZMQ for metadata exchange ---
@@ -749,6 +777,12 @@ class MooncakeConnector(KVConnectorBase):
             self._staging_slot_bytes = tt.staging_region.unit_bytes
             self._staging_pool_size = tt.staging_pool_size
             self._staging_free = list(range(tt.staging_pool_size))
+        if tt.index_staging_region is not None:
+            self._index_staging_pool_size = tt.index_staging_pool_size
+            self._index_staging_chunk_pages = tt.index_staging_chunk_pages
+            self._index_staging_free = list(range(tt.index_staging_pool_size))
+            self._prepare_sharded_index = tt.prepare_sharded_index
+            self._gather_sharded_index = tt.gather_sharded_index
 
         # Populate block/slot region lists for transfer offset computation
         self._block_regions = [(r.base_addr, r.unit_bytes) for r in tt.block_regions]
@@ -769,6 +803,7 @@ class MooncakeConnector(KVConnectorBase):
 
         self.kv_caches_base_addr = [r.base_addr for r in tt.block_regions]
         self._per_block_bytes_list = [r.unit_bytes for r in tt.block_regions]
+        self._block_region_roles = [r.semantic_role for r in tt.block_regions]
 
         # Under pipeline parallelism this stage holds only layers
         # [start_layer, end_layer); its local regions map onto the consumer's
@@ -805,6 +840,8 @@ class MooncakeConnector(KVConnectorBase):
         )
         if tt.staging_region is not None:
             all_regions.append(tt.staging_region)
+        if tt.index_staging_region is not None:
+            all_regions.append(tt.index_staging_region)
         for r in all_regions:
             offset = 0
             for chunk in self._rdma_chunk_sizes(r.total_bytes, r.unit_bytes):
@@ -956,17 +993,18 @@ class MooncakeConnector(KVConnectorBase):
                 self._pending_recv_nonce[req_id] = write_nonce
 
             # PD incremental: slice off locally cached prefix blocks; invalid
-            # offset falls back to full transfer.
+            # offset falls back to full transfer. Under DCP the same prefix
+            # costs dcp_size times as many source blocks.
             remote_block_ids = meta.remote_block_ids or []
             off = meta.num_computed_blocks
             if (
                 off < 0
                 or off >= len(meta.local_block_ids)
-                or off >= len(remote_block_ids)
+                or off * self.dcp_size >= len(remote_block_ids)
             ):
                 off = 0
             dst_block_ids = meta.local_block_ids[off:]
-            src_block_ids = remote_block_ids[off:]
+            src_block_ids = remote_block_ids[off * self.dcp_size :]
 
             # Build the (stage-independent) write_request payload once.
             request_body = {
@@ -976,6 +1014,10 @@ class MooncakeConnector(KVConnectorBase):
                 "consumer_rpc_port": self.rpc_port,
                 # Consumer's layer count per group for producer stride validation.
                 "consumer_num_layers": self._num_local_layers,
+                # Role of each of this side's block regions, so the producer can
+                # check its per-region plan lands on the same kind of region.
+                "consumer_region_roles": self._block_region_roles,
+                "consumer_block_bpb": [bpb for _, bpb in self._block_regions],
                 "dst_block_ids": dst_block_ids,
                 # Source block_ids so downstream stages (no scheduler, no
                 # _completed_prefills) can transfer without a local lookup.
@@ -987,6 +1029,10 @@ class MooncakeConnector(KVConnectorBase):
                 "notify_port": self._notification_port,
                 "consumer_tp_size": self.tp_size,
                 "write_nonce": write_nonce,
+                # DCP relayout: which shard of each block this rank owns.
+                "consumer_dcp_size": self.dcp_size,
+                "consumer_dcp_rank": self.dcp_rank,
+                "consumer_dcp_interleave": self.dcp_interleave_size,
             }
 
             consumer_staging_pool_idx = -1
@@ -1089,6 +1135,24 @@ class MooncakeConnector(KVConnectorBase):
     def _release_staging_slot(self, idx: int) -> None:
         with self._staging_lock:
             self._staging_free.append(idx)
+
+    def _acquire_index_staging_slot(self) -> int:
+        with self._index_staging_lock:
+            if self._index_staging_free:
+                return self._index_staging_free.pop()
+        logger.warning(
+            "Index staging pool exhausted (size=%d), waiting for a slot",
+            self._index_staging_pool_size,
+        )
+        while True:
+            time.sleep(0.001)
+            with self._index_staging_lock:
+                if self._index_staging_free:
+                    return self._index_staging_free.pop()
+
+    def _release_index_staging_slot(self, idx: int) -> None:
+        with self._index_staging_lock:
+            self._index_staging_free.append(idx)
 
     # -----------------------------------------------------------------
     # KVConnectorBase: get_finished
@@ -1202,6 +1266,7 @@ class MooncakeConnector(KVConnectorBase):
             notify_port = request_data["notify_port"]
             consumer_tp_size = request_data.get("consumer_tp_size", self.tp_size)
             consumers_per_rank = max(1, consumer_tp_size // self.tp_size)
+            consumer_dcp_size = max(1, request_data.get("consumer_dcp_size", 1))
             write_nonce = request_data.get("write_nonce", 0)
             has_slot_data = request_data.get("has_slot_regions", False)
 
@@ -1260,16 +1325,22 @@ class MooncakeConnector(KVConnectorBase):
             # PD incremental (TP-TP only): consumer already sliced dst; slice
             # producer's src by the same offset. PP src arrives pre-sliced.
             if self.pp_size == 1:
-                off = request_data.get("num_computed_blocks", 0)
+                # The consumer's offset counts destination blocks; under DCP
+                # each of those spans consumer_dcp_size source blocks.
+                off = request_data.get("num_computed_blocks", 0) * consumer_dcp_size
                 if 0 < off < len(src_block_ids):
                     src_block_ids = src_block_ids[off:]
-            if len(src_block_ids) != len(dst_block_ids):
+            expected_dst_blocks = -(-len(src_block_ids) // consumer_dcp_size)
+            if len(dst_block_ids) != expected_dst_blocks:
                 logger.error(
                     "[PRODUCER] src/dst block count mismatch for req %s "
-                    "(src=%d, dst=%d); aborting transfer to avoid misaligned KV.",
+                    "(src=%d, dst=%d, expected dst=%d at dcp_size=%d); aborting "
+                    "transfer to avoid misaligned KV.",
                     req_id,
                     len(src_block_ids),
                     len(dst_block_ids),
+                    expected_dst_blocks,
+                    consumer_dcp_size,
                 )
                 return
             target = f"{consumer_host}:{consumer_rpc_port}"
@@ -1430,30 +1501,194 @@ class MooncakeConnector(KVConnectorBase):
             request_data.get("consumer_num_layers"),
             self._block_region_consumer_indices,
         )
+        # Under DCP the consumer rank owns only part of each block, so
+        # whole-block descriptors no longer line up and the push becomes the
+        # per-region relayout described at the top of this file. Safe in token
+        # units because DCP only runs on MLA, which stores a token contiguously.
+        dcp_size = max(1, request_data.get("consumer_dcp_size", 1))
+        interleave = request_data.get("consumer_dcp_interleave", 1)
+        sharded_plan = None
+        sharded_runs = None
+        stages_sharded_index = False
+        if dcp_size > 1:
+            sharded_plan = build_dcp_shard_plan(
+                src_block_ids,
+                block_size=self.block_size,
+                dcp_size=dcp_size,
+                dcp_rank=request_data["consumer_dcp_rank"],
+                interleave_size=interleave,
+                dst_pages=len(dst_block_ids),
+            )
+            sharded_runs = sharded_plan.token_runs(dst_block_ids)
+            stages_sharded_index = (
+                interleave < self.block_size
+                and INDEX_CACHE_ROLE in self._block_region_roles
+            )
+            if stages_sharded_index and (
+                interleave != 1
+                or self.block_size % 16
+                or self._prepare_sharded_index is None
+                or self._gather_sharded_index is None
+                or self._index_staging_chunk_pages <= 0
+            ):
+                raise RuntimeError(
+                    "Sharded preshuffled DSA index transfer requires "
+                    "interleave=1, a block size divisible by 16, and producer "
+                    "index staging; got "
+                    f"{interleave=}, block_size={self.block_size}, "
+                    f"has_staging={self._gather_sharded_index is not None and self._prepare_sharded_index is not None}."
+                )
+
+        staged_regions: list[tuple[int, int, int]] = []
+        # The plan comes from this stage's region order but the bytes land at
+        # cmap[region_idx], and equal region counts do not make the two orders
+        # match. Validate both semantic role and physical width so incompatible
+        # producer/consumer layouts fail instead of silently corrupting KV.
+        consumer_roles = request_data.get("consumer_region_roles")
+        consumer_bpb = request_data.get("consumer_block_bpb")
         for region_idx in range(num_regions):
             src_base = self.kv_caches_base_addr[region_idx]
             dst_base = consumer_base_addrs[cmap[region_idx]]
             bpb = self._per_block_bytes_list[region_idx]
-            for sb, db in zip(src_block_ids, dst_block_ids):
-                src_addrs.append(src_base + sb * bpb)
-                dst_addrs.append(dst_base + db * bpb)
-                sizes.append(bpb)
+            role = self._block_region_roles[region_idx]
+            if consumer_roles is not None and consumer_roles[cmap[region_idx]] != role:
+                raise RuntimeError(
+                    f"Region role mismatch for req {req_id}: local region "
+                    f"{region_idx} is {role!r}, but consumer region "
+                    f"{cmap[region_idx]} is {consumer_roles[cmap[region_idx]]!r}"
+                )
+            if consumer_bpb is not None and consumer_bpb[cmap[region_idx]] != bpb:
+                raise RuntimeError(
+                    f"Region byte-size mismatch for req {req_id}: producer "
+                    f"region {region_idx} has {bpb}, consumer region "
+                    f"{cmap[region_idx]} has {consumer_bpb[cmap[region_idx]]}"
+                )
+            if stages_sharded_index and role == INDEX_CACHE_ROLE:
+                staged_regions.append((region_idx, dst_base, bpb))
+                continue
+            if sharded_runs is None:
+                for sb, db in zip(src_block_ids, dst_block_ids):
+                    src_addrs.append(src_base + sb * bpb)
+                    dst_addrs.append(dst_base + db * bpb)
+                    sizes.append(bpb)
+                continue
+            # The destination page is wider only in whole tokens and the plan
+            # already counts in its token space, so both ends scale by the
+            # source's per-token width.
+            if bpb % self.block_size:
+                raise RuntimeError(
+                    f"Region {region_idx} stores {bpb} bytes per block, which "
+                    f"block_size {self.block_size} does not divide. Addressing "
+                    "a single token needs its bytes contiguous, which holds for "
+                    "the MLA layout the token-unit relayout is built on."
+                )
+            unit = bpb // self.block_size
+            run_src, run_dst, run_len = sharded_runs
+            src_addrs.extend((src_base + run_src * unit).tolist())
+            dst_addrs.extend((dst_base + run_dst * unit).tolist())
+            sizes.extend((run_len * unit).tolist())
 
-        logger.debug(
-            "[PRODUCER] block RDMA write: req=%s, %d regions × %d blocks, "
-            "total_bytes=%d",
-            req_id,
-            num_regions,
-            len(src_block_ids),
-            sum(sizes),
-        )
+        if src_addrs:
+            logger.debug(
+                "[PRODUCER] block RDMA write: req=%s, %d regions × %d blocks, "
+                "total_bytes=%d",
+                req_id,
+                num_regions - len(staged_regions),
+                len(src_block_ids),
+                sum(sizes),
+            )
+            if not self._rdma_write_with_retry(
+                target, src_addrs, dst_addrs, sizes, req_id, "block"
+            ):
+                logger.error("[PRODUCER] block transfer failed for req %s", req_id)
+                return False
+        if staged_regions:
+            for dst_start in range(
+                0, len(dst_block_ids), self._index_staging_chunk_pages
+            ):
+                dst_chunk = dst_block_ids[
+                    dst_start : dst_start + self._index_staging_chunk_pages
+                ]
+                chunk_plan = sharded_plan.slice_pages(
+                    dst_start, dst_start + len(dst_chunk)
+                )
+                gather_indices = self._prepare_sharded_index(chunk_plan)
 
-        if not self._rdma_write_with_retry(
-            target, src_addrs, dst_addrs, sizes, req_id, "block"
-        ):
-            logger.error("[PRODUCER] block transfer failed for req %s", req_id)
-            return False
+                for region_idx, dst_base, bpb in staged_regions:
+                    if not self._execute_staged_index_layer_chunk(
+                        target,
+                        region_idx,
+                        dst_base,
+                        bpb,
+                        dst_chunk,
+                        req_id,
+                        gather_indices,
+                    ):
+                        return False
         return True
+
+    def _execute_staged_index_layer_chunk(
+        self,
+        target: str,
+        region_idx: int,
+        dst_base: int,
+        bytes_per_page: int,
+        dst_block_ids: list[int],
+        req_id: str,
+        gather_indices,
+    ) -> bool:
+        """GPU-repack one index layer/chunk, then RDMA its local pages."""
+
+        pool_idx = self._acquire_index_staging_slot()
+        try:
+            staging_base, staged_pages = self._gather_sharded_index(
+                region_idx,
+                gather_indices,
+                pool_idx,
+            )
+            if staged_pages != len(dst_block_ids):
+                raise RuntimeError(
+                    f"Index staging produced {staged_pages} pages for "
+                    f"{len(dst_block_ids)} destinations"
+                )
+            # The callback enqueues GPU writes on this worker thread's current
+            # stream. Fence them before Mooncake lets the NIC read.
+            torch.cuda.current_stream().synchronize()
+
+            src_page = np.arange(staged_pages, dtype=np.int64)
+            dst_page = np.asarray(dst_block_ids, dtype=np.int64)
+            length = np.full(staged_pages, bytes_per_page, dtype=np.int64)
+            src_addrs, dst_addrs, sizes = coalesce_contiguous(
+                staging_base + src_page * bytes_per_page,
+                dst_base + dst_page * bytes_per_page,
+                length,
+            )
+            logger.debug(
+                "[PRODUCER] staged index RDMA write: req=%s, region=%d, "
+                "pages=%d, descriptors=%d, total_bytes=%d",
+                req_id,
+                region_idx,
+                staged_pages,
+                len(src_addrs),
+                sum(sizes),
+            )
+            if not self._rdma_write_with_retry(
+                target,
+                src_addrs.tolist(),
+                dst_addrs.tolist(),
+                sizes.tolist(),
+                req_id,
+                "staged-index",
+            ):
+                logger.error(
+                    "[PRODUCER] staged index transfer failed for req %s region %d",
+                    req_id,
+                    region_idx,
+                )
+                return False
+            return True
+        finally:
+            self._release_index_staging_slot(pool_idx)
 
     def _execute_block_slot_transfer(
         self,

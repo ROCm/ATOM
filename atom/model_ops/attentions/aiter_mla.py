@@ -27,6 +27,8 @@ from atom.distributed.pcp_utils import (
     pcp_pad_len,
     pcp_round_robin_query_indices,
 )
+from atom.kv_transfer.disaggregation.sharded_transfer import DCPShardPlan
+from atom.kv_transfer.disaggregation.types import DEFAULT_SHARDED_STAGING_WORKERS
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import (
     _MLA_MIN_HEADS,
@@ -221,6 +223,173 @@ class MLAChunkContextMetadata:
 
 def cdiv(a, b):
     return (a + b - 1) // b
+
+
+@dataclass(frozen=True)
+class DCPIndexGatherIndices:
+    """GPU projection of a shared DCP shard plan for preshuffled index pages."""
+
+    dst_pages: int
+    src_block_id_per_token: torch.Tensor
+    src_token: torch.Tensor
+    src_token_tile: torch.Tensor
+    src_token_in_tile: torch.Tensor
+    valid: torch.Tensor
+
+
+def prepare_dcp_index_gather_indices(
+    plan: DCPShardPlan, device: torch.device
+) -> DCPIndexGatherIndices:
+    """Project the shared token plan to reusable GPU index tensors."""
+
+    if plan.interleave_size != 1:
+        raise ValueError(
+            "Preshuffled index staging currently supports "
+            f"interleave=1, got {plan.interleave_size}"
+        )
+    src_token = torch.as_tensor(plan.src_token, device=device, dtype=torch.int64)
+    return DCPIndexGatherIndices(
+        dst_pages=plan.dst_pages,
+        src_block_id_per_token=torch.as_tensor(
+            plan.src_block_id_per_run, device=device, dtype=torch.int64
+        ),
+        src_token=src_token,
+        src_token_tile=torch.div(src_token, 16, rounding_mode="floor"),
+        src_token_in_tile=src_token.remainder(16),
+        valid=torch.as_tensor(plan.valid, device=device, dtype=torch.bool),
+    )
+
+
+def gather_dcp_preshuffled_index_pages(
+    source: torch.Tensor,
+    staging: torch.Tensor,
+    indices: DCPIndexGatherIndices,
+    index_head_dim: int,
+    scheduler_block_size: int,
+    block_ratio: int,
+    quant_block_size: int = 128,
+) -> int:
+    """Convert producer index rows into compact consumer preshuffled pages.
+
+    Prefill commonly allocates one-token physical pages, but the indexer views
+    each ``block_ratio``-sized group as one scheduler block and writes MFMA
+    preshuffled data across that contiguous group. Reconstruct that grouped
+    page before gathering. Already-quantized key and scale bytes move directly;
+    no dequantization or requantization occurs.
+    """
+
+    source_page_size = source.shape[1]
+    if scheduler_block_size % 16 or index_head_dim % 16:
+        raise ValueError(
+            "Preshuffled index staging requires scheduler block size and "
+            f"head_dim multiples of 16, got {scheduler_block_size=} and "
+            f"{index_head_dim=}"
+        )
+    if source_page_size * block_ratio != scheduler_block_size:
+        raise ValueError(
+            f"Source physical page {source_page_size} × ratio {block_ratio} "
+            f"does not match scheduler block {scheduler_block_size}"
+        )
+    if index_head_dim % quant_block_size:
+        raise ValueError(
+            f"index_head_dim={index_head_dim} must be divisible by quant_block_size="
+            f"{quant_block_size}"
+        )
+    if indices.dst_pages == 0:
+        return 0
+    dst_pages = indices.dst_pages
+    if dst_pages > staging.shape[0]:
+        raise ValueError(
+            f"Index staging holds {staging.shape[0]} pages, needs {dst_pages}"
+        )
+
+    aligned_index_dim = source.shape[2]
+    page_bytes = scheduler_block_size * aligned_index_dim * source.element_size()
+    if source.shape[0] % block_ratio:
+        raise ValueError(
+            f"Source physical page count {source.shape[0]} is not divisible by "
+            f"block_ratio={block_ratio}"
+        )
+    source_bytes = source.view(torch.uint8).reshape(
+        source.shape[0] // block_ratio, page_bytes
+    )
+    output = staging[:dst_pages, :page_bytes]
+    output.zero_()
+
+    token_tiles = scheduler_block_size // 16
+    column_tiles = index_head_dim // 16
+    source_keys = source_bytes[:, : scheduler_block_size * index_head_dim].reshape(
+        source_bytes.shape[0], token_tiles, column_tiles, 16, 16
+    )
+    selected_keys = source_keys[
+        indices.src_block_id_per_token,
+        indices.src_token_tile,
+        :,
+        indices.src_token_in_tile,
+        :,
+    ]
+    selected_keys.masked_fill_(~indices.valid[:, None, None], 0)
+    output[:, : scheduler_block_size * index_head_dim].reshape(
+        dst_pages, token_tiles, column_tiles, 16, 16
+    ).copy_(
+        selected_keys.reshape(dst_pages, token_tiles, 16, column_tiles, 16).permute(
+            0, 1, 3, 2, 4
+        )
+    )
+
+    scales_per_token = index_head_dim // quant_block_size
+    key_bytes = scheduler_block_size * index_head_dim
+    scale_bytes = scheduler_block_size * scales_per_token * 4
+    source_scales = source_bytes[:, key_bytes : key_bytes + scale_bytes].view(
+        torch.float32
+    )
+    selected_scales = source_scales.reshape(
+        source_bytes.shape[0], scheduler_block_size, scales_per_token
+    )[indices.src_block_id_per_token, indices.src_token]
+    selected_scales.masked_fill_(~indices.valid[:, None], 0)
+    output[:, key_bytes : key_bytes + scale_bytes].view(torch.float32).reshape(
+        dst_pages, scheduler_block_size, scales_per_token
+    ).copy_(selected_scales.reshape(dst_pages, scheduler_block_size, scales_per_token))
+
+    return dst_pages
+
+
+def _pd_producer_connectors(config) -> tuple[dict, ...]:
+    """Return the configured P/D producer connector entries."""
+    transfer_config = getattr(config, "kv_transfer_config", None)
+    if not isinstance(transfer_config, dict) or not transfer_config:
+        return ()
+    # MultiConnector nests the real connectors; a bare config is its own entry.
+    connectors = transfer_config.get("connectors") or [transfer_config]
+    if not isinstance(connectors, (list, tuple)):
+        return ()
+    return tuple(
+        connector
+        for connector in connectors
+        if isinstance(connector, dict)
+        and connector.get("kv_role", "kv_producer") == "kv_producer"
+    )
+
+
+def _pd_producer_configured(config) -> bool:
+    """Whether any connector on this worker is configured as a P/D producer."""
+
+    return bool(_pd_producer_connectors(config))
+
+
+def _pd_staging_pool_size(config) -> int:
+    """Size producer staging for the maximum configured send concurrency."""
+
+    worker_counts = []
+    for connector in _pd_producer_connectors(config):
+        count = connector.get("num_worker_threads", DEFAULT_SHARDED_STAGING_WORKERS)
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise ValueError(
+                "P/D producer num_worker_threads must be a positive integer, "
+                f"got {count!r}"
+            )
+        worker_counts.append(count)
+    return max(worker_counts, default=0)
 
 
 class AiterMLABackend(AttentionBackend):
@@ -1200,6 +1369,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
     def get_kv_transfer_tensors(self):
         from atom.kv_transfer.disaggregation.types import (
+            INDEX_CACHE_ROLE,
+            MLA_KV_ROLE,
             KVTransferRegion,
             KVTransferTensors,
         )
@@ -1207,6 +1378,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         runner = self.model_runner
         if not hasattr(runner, "kv_cache"):
             return None
+        pd_producer = _pd_producer_configured(runner.config)
+        if pd_producer and self.dcp_world_size > 1:
+            raise RuntimeError(
+                "P/D transfer requires an unsharded producer because "
+                "the DCP transfer plan assumes producer blocks contain the "
+                "global contiguous token order"
+            )
 
         block_regions: list[KVTransferRegion] = []
         num_layers = runner.kv_cache.shape[0]
@@ -1218,18 +1396,19 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     base_addr=t.data_ptr(),
                     total_bytes=t.numel() * t.element_size(),
                     unit_bytes=bpb,
+                    semantic_role=MLA_KV_ROLE,
                 )
             )
 
         if hasattr(runner, "index_cache"):
             for layer_id in range(runner.index_cache.shape[0]):
                 t = runner.index_cache[layer_id]
-                bpb = self._index_cache_block_bytes(t)
                 block_regions.append(
                     KVTransferRegion(
                         base_addr=t.data_ptr(),
                         total_bytes=t.numel() * t.element_size(),
-                        unit_bytes=bpb,
+                        unit_bytes=self._index_cache_block_bytes(t),
+                        semantic_role=INDEX_CACHE_ROLE,
                     )
                 )
 
@@ -1322,11 +1501,72 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 for layer_id in local_index_layer_ids
             ]
 
+        index_staging_region = None
+        index_staging_pool_size = 0
+        index_staging_chunk_pages = 0
+        prepare_sharded_index = None
+        gather_sharded_index = None
+        if hasattr(runner, "index_cache") and self.dcp_world_size == 1 and pd_producer:
+            # A P/D producer can receive requests from a DCP consumer whose
+            # index cache is sharded below one MFMA tile. Keep a
+            # small per-send-thread pool that repacks one index layer at a time;
+            # latent MLA pages continue to transfer directly.
+            index_staging_pool_size = _pd_staging_pool_size(runner.config)
+            index_staging_chunk_pages = 256
+            index_head_dim = runner.config.hf_config.index_head_dim
+            first_index_page = runner.index_cache[0]
+            page_bytes = self._index_cache_block_bytes(first_index_page)
+            staging = torch.empty(
+                (
+                    index_staging_pool_size,
+                    index_staging_chunk_pages,
+                    page_bytes,
+                ),
+                dtype=torch.uint8,
+                device=first_index_page.device,
+            )
+            index_staging_region = KVTransferRegion(
+                base_addr=staging.data_ptr(),
+                total_bytes=staging.numel() * staging.element_size(),
+                unit_bytes=index_staging_chunk_pages * page_bytes,
+                semantic_role="dsa.index_staging",
+            )
+
+            def prepare_sharded_index(plan: DCPShardPlan):
+                return prepare_dcp_index_gather_indices(plan, first_index_page.device)
+
+            def gather_sharded_index(
+                region_idx,
+                indices,
+                pool_idx,
+            ):
+                index_region_idx = region_idx - num_layers
+                if not 0 <= index_region_idx < runner.index_cache.shape[0]:
+                    raise IndexError(
+                        f"Index region {region_idx} maps to invalid cache row "
+                        f"{index_region_idx}"
+                    )
+                slot = staging[pool_idx]
+                pages = gather_dcp_preshuffled_index_pages(
+                    runner.index_cache[index_region_idx],
+                    slot,
+                    indices,
+                    index_head_dim,
+                    runner.config.kv_cache_block_size,
+                    self.block_ratio,
+                )
+                return slot.data_ptr(), pages
+
         return KVTransferTensors(
             block_regions=block_regions,
             slot_regions=[],
             num_blocks=runner.config.num_kvcache_blocks,
             block_region_consumer_indices=block_region_consumer_indices,
+            index_staging_region=index_staging_region,
+            index_staging_pool_size=index_staging_pool_size,
+            index_staging_chunk_pages=index_staging_chunk_pages,
+            prepare_sharded_index=prepare_sharded_index,
+            gather_sharded_index=gather_sharded_index,
         )
 
     def _build_dcp_indexer_prefill_meta(self, attn_metadata, bs: int, counts, var):

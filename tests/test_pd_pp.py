@@ -170,10 +170,12 @@ def test_producer_advertises_remote_pp_size():
     assert seq.kv_transfer_params_output["remote_block_ids"] == [1, 2, 3]
 
 
-def _mooncake_consumer_scheduler(mc, hash_block_size=64):
+def _mooncake_consumer_scheduler(mc, block_size=64, dcp_size=1):
     sched = object.__new__(mc.MooncakeConnectorScheduler)
     sched.is_producer = False
-    sched.hash_block_size = hash_block_size
+    sched.block_size = block_size
+    sched.dcp_size = dcp_size
+    sched.hash_block_size = block_size * dcp_size
     sched.request_id_to_transfer_id = {}
     sched.transfer_id_to_request_id = {}
     sched._reqs_need_recv = {}
@@ -195,7 +197,7 @@ def _remote_prefill_seq(remote_hash_block_size):
     )
 
 
-def test_matching_hash_block_size_enables_incremental_transfer():
+def test_matching_block_size_enables_incremental_transfer():
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
@@ -207,8 +209,23 @@ def test_matching_hash_block_size_enables_incremental_transfer():
     assert seq.kv_transfer_params["num_computed_blocks"] == 2
 
 
+def test_dcp_consumer_stays_incremental_against_a_non_dcp_producer():
+    # CPP prefill (dcp=1, 16-token blocks) -> DCP decode (dcp=4). The consumer
+    # addresses 64-token virtual blocks, so the two sides' hash_block_size
+    # differ by exactly dcp_size; the block slicing applies that factor itself.
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    sched = _mooncake_consumer_scheduler(mc, block_size=16, dcp_size=4)
+    seq = _remote_prefill_seq(remote_hash_block_size=16)
+
+    sched.update_state_after_alloc(seq)
+
+    assert seq.kv_transfer_params["num_computed_blocks"] == 2
+
+
 @pytest.mark.parametrize("remote_hash_block_size", [32, None])
-def test_mismatched_or_missing_hash_block_size_forces_full_transfer(
+def test_mismatched_or_missing_block_size_forces_full_transfer(
     remote_hash_block_size, caplog
 ):
     mc = pytest.importorskip(
