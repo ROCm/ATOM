@@ -78,6 +78,12 @@ class DraftGraph:
     forward: Callable[..., Any]  # (running_bs, **staged) -> Any
     epilogue: Callable[..., Any] | None = None  # (fwd_out, running_bs, **staged)
     capture_epilogue: bool = False
+    # Rows one sequence contributes to this pass.  The capture ladder is in
+    # sequences, while ``set_forward_context`` and MoE collectives are sized in
+    # rows, so the warmup owner needs this conversion per pass.  Serial Eagle
+    # has two different widths: its first step consumes the target's whole
+    # verify rectangle, while later steps consume one row per sequence.
+    tokens_per_seq: int = 1
     inputs: "Mapping[str, StagedInput]" = field(default_factory=dict)
     warmup_inputs: Callable[..., None] | None = None
 
@@ -102,6 +108,10 @@ class DraftGraph:
         their addresses, and one born on the capture step would come out of the
         graph's own private pool.
         """
+        assert self.tokens_per_seq > 0, (
+            f"{self.name} has invalid tokens_per_seq={self.tokens_per_seq}; "
+            "a declared pass must run at least one row per sequence"
+        )
         assert self.inputs, (
             f"{self.name} stages nothing, so a fabricated row has no buffer "
             f"to land in -- declare no pass rather than an unpaddable one"

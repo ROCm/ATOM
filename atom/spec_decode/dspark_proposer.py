@@ -75,6 +75,7 @@ class DSparkProposer(Drafter):
             forward=self._block_backbone,
             epilogue=self._block_head,
             capture_epilogue=True,
+            tokens_per_seq=self.draft_tokens_per_seq,
             inputs={
                 "anchor_ids": StagedInput(dtype=torch.int32),
                 "anchor_positions": StagedInput(dtype=torch.int64),

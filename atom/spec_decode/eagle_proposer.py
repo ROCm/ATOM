@@ -112,12 +112,11 @@ class EagleProposer(Drafter):
         return self.speculative_config.num_speculative_tokens or 0
 
     def _declare_draft_graphs(self):
-        """The mid-step pass: draft steps 1..k-1, one row per sequence.
+        """The generic mid-step pass: draft steps 1..k-1, one row per sequence.
 
-        Step 0 counts tokens, not sequences -- it runs the target's whole token
-        stream -- and is NOT declared: warming it needs a prefill-shaped
-        synthetic forward context, which the capture builder cannot produce. A
-        stub would claim to be warmable and not be.
+        Step 0 counts tokens, not sequences, and its layout is model-specific.
+        The common proposer leaves it eager; a model-specific proposer may
+        declare a graph for it through the step-0 hooks below.
 
         Unlike DSpark's block, this pass does not carry its own metadata; it
         reads the target's, which ``_enter_decode_metadata`` rewrites to one row
@@ -131,12 +130,12 @@ class EagleProposer(Drafter):
         graphs nobody replays, paid for at every startup.
         """
         self.step = None
+        draft_hf = self.speculative_config.draft_model_hf_config
         if self.runner.use_mrope or self.mtp_k < 2:
             # mtp_k == 1 has no step 1+, so warming one would capture a graph
             # `propose` can never reach.
             self._reuse_step_buffers = False
             return ()
-        draft_hf = self.speculative_config.draft_model_hf_config
         # DeepSeek-V4 carries the mHC residual, so its hidden is [N, hc, dim]
         # rather than [N, dim]. `hc_mult` is absent on every architecture that
         # does not, which is exactly the two-dimensional case.
@@ -170,6 +169,24 @@ class EagleProposer(Drafter):
             warmup_inputs=self._step_warmup_inputs,
         )
         return (self.step,)
+
+    def _select_step0_graph(
+        self, scheduled_bs, input_ids, positions, hidden_states, last_token_indices
+    ) -> DraftGraph | None:
+        """Return a replayable model-specific step-0 graph, if one exists."""
+        return None
+
+    def _stage_step0_graph_inputs(
+        self,
+        graph,
+        running_bs,
+        input_ids,
+        positions,
+        hidden_states,
+        last_token_indices,
+    ):
+        """Stage model-specific step-0 inputs after `_select_step0_graph`."""
+        raise NotImplementedError
 
     def _step_forward(self, running_bs, *, input_ids, positions, hidden_states):
         """One mid-step draft forward at ``running_bs`` rows.
@@ -578,9 +595,18 @@ class EagleProposer(Drafter):
         # every iteration (used at i>=1 too, even though i==0 sets it).
         has_flat_kv = "kv_indices" in var
 
-        # Mid-steps run padded and may replay; step 0 does neither, so it is
-        # labelled as the plain batch it is.
-        step0_label = f"bs={scheduled_bs}"
+        step0_graph = self._select_step0_graph(
+            scheduled_bs,
+            input_ids,
+            positions,
+            hidden_states,
+            last_token_indices,
+        )
+        step0_label = (
+            step0_graph.label(scheduled_bs, scheduled_bs)
+            if step0_graph is not None
+            else f"bs={scheduled_bs}"
+        )
         mid_label = (
             self.step.label(scheduled_bs, running_bs) if self.step else step0_label
         )
@@ -635,7 +661,20 @@ class EagleProposer(Drafter):
                 # steps 1+ skip it and read the compacted sparse_kv buffer.
                 if self._share_mtp_indices and i == 0:
                     self.model.model.set_skip_topk(False)
-                if i and self.step is not None:
+                if i == 0 and step0_graph is not None:
+                    sample_hidden_states, graphed_ids = step0_graph.run(
+                        scheduled_bs,
+                        **self._stage_step0_graph_inputs(
+                            step0_graph,
+                            scheduled_bs,
+                            d_input_ids,
+                            d_positions,
+                            d_hidden,
+                            last_token_indices,
+                        ),
+                    )
+                    ret_hidden_states = None
+                elif i and self.step is not None:
                     # Steps 1+ are the declared pass: one row per sequence, at
                     # a batch the startup sweep already warmed. The head rides
                     # in the recording, so this hands back both of its outputs.
@@ -663,26 +702,27 @@ class EagleProposer(Drafter):
                 # Step 0 gathers one row per sequence out of the token stream;
                 # steps 1+ already are one row per sequence -- sliced back off
                 # the padded batch, so nothing downstream sees a pad row.
-                if i == 0:
-                    hidden_out = (
-                        self.step.buffer("hidden_states", scheduled_bs)
-                        if self._reuse_step_buffers
-                        else None
-                    )
-                    sample_hidden_states = (
-                        torch.index_select(
-                            ret_hidden_states,
-                            0,
-                            last_token_indices,
-                            out=hidden_out,
+                if not (i == 0 and step0_graph is not None):
+                    if i == 0:
+                        hidden_out = (
+                            self.step.buffer("hidden_states", scheduled_bs)
+                            if self._reuse_step_buffers
+                            else None
                         )
-                        if hidden_out is not None
-                        else torch.index_select(
-                            ret_hidden_states, 0, last_token_indices
+                        sample_hidden_states = (
+                            torch.index_select(
+                                ret_hidden_states,
+                                0,
+                                last_token_indices,
+                                out=hidden_out,
+                            )
+                            if hidden_out is not None
+                            else torch.index_select(
+                                ret_hidden_states, 0, last_token_indices
+                            )
                         )
-                    )
-                else:
-                    sample_hidden_states = ret_hidden_states[:scheduled_bs]
+                    else:
+                        sample_hidden_states = ret_hidden_states[:scheduled_bs]
                 # Only step 0 and a flavor with no declared pass land here; a
                 # recorded mid-step produced its ids inside the graph.
                 # Every draft model EagleProposer can build implements this --

@@ -230,14 +230,15 @@ class Drafter(abc.ABC):
             for bs in capture_sizes:
                 attn_metadata, context = build_context(bs=bs)
                 context.is_draft = True
-                # Every warmed pass is decode-shaped and DP-uniform: the graphs
-                # belong to the DSpark block and Eagle's mid-steps, and step 0
-                # has none. Stated, not inherited, per the rule above.
+                # Every declared pass uses the synthetic decode context from
+                # the target capture builder. Stated, not inherited, per the
+                # rule above.
                 context.is_prefill = False
                 context.running_tokens_are_unified = True
                 # The synthetic batch is full, so the pass's scheduled and
-                # running counts are the same number.
-                local_tokens = bs * self.draft_tokens_per_seq
+                # running counts are the same number. Width belongs to the
+                # pass: Eagle step 0 is full_q rows/seq while its mid-step is 1.
+                local_tokens = bs * pass_.tokens_per_seq
                 context.scheduled_tokens = local_tokens
                 context.running_tokens = local_tokens
                 set_forward_context(
@@ -260,12 +261,12 @@ class Drafter(abc.ABC):
     # ---- flavor hooks ----
     @property
     def draft_tokens_per_seq(self) -> int:
-        """Tokens one sequence contributes to a DECLARED pass.
+        """The flavor's default draft width per sequence.
 
-        1 for a serial flavor, whose declared pass is the mid-step; a block
-        flavor drafts its whole width in one pass and overrides. Read by
-        `warmup_draft_graphs`, which must state the shape on a synthetic
-        context and cannot ask `propose`.
+        1 for a serial flavor; a block flavor drafts its whole width in one
+        pass and overrides. A declared graph copies this into its own
+        ``tokens_per_seq`` because one flavor may declare passes of different
+        widths (Eagle step 0 and its mid-step).
         """
         return 1
 
