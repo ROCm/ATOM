@@ -2065,6 +2065,7 @@ def atom_deepseek_v4_forward_context(
     slot_allocator=None,
     proxy_layer_name: str = ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
 ):
+    from atom.plugin.vllm.req_id_passthrough_patch import in_dp_lockstep_dummy_batch
     from atom.utils.forward_context import (
         Context,
         reset_forward_context,
@@ -2131,10 +2132,12 @@ def atom_deepseek_v4_forward_context(
         getattr(common_attn_metadata, "num_reqs", 0)
         or (input_ids.shape[0] if input_ids is not None else 0)
     )
+    _dp_lockstep_dummy = in_dp_lockstep_dummy_batch()
+
     context = Context(
         positions=positions,
         is_prefill=is_prefill,
-        is_dummy_run=force_dummy or common_attn_metadata is None,
+        is_dummy_run=force_dummy or common_attn_metadata is None or _dp_lockstep_dummy,
         scheduled_bs=batch_size,
         # The rows this forward really runs -- what MoE will be handed.
         scheduled_tokens=int(input_ids.shape[0]) if input_ids is not None else 0,

@@ -40,6 +40,11 @@ import threading
 logger = logging.getLogger("atom")
 
 _req_id_local = threading.local()
+_dp_dummy_local = threading.local()
+
+
+def in_dp_lockstep_dummy_batch() -> bool:
+    return bool(getattr(_dp_dummy_local, "active", False))
 
 
 def get_current_req_ids() -> list[str] | None:
@@ -87,16 +92,57 @@ def _wrap_with_req_id_snapshot(cls, method_name: str) -> bool:
     return True
 
 
+def _wrap_execute_dummy_batch() -> bool:
+    try:
+        from vllm.v1.worker.gpu_worker import Worker
+    except ImportError as e:
+        logger.debug(
+            "ATOM vLLM req_id passthrough patch: Worker unavailable (%s), skip",
+            e,
+        )
+        return False
+    except Exception as e:  # noqa: BLE001 - a broken vLLM must not abort registration
+        logger.warning(
+            "ATOM plugin: importing vLLM Worker failed unexpectedly (%s); "
+            "DeepSeek-V4 state writes on an idle rank will not be skipped",
+            e,
+        )
+        return False
+
+    original = getattr(Worker, "execute_dummy_batch", None)
+    if original is None or getattr(original, "_atom_dp_dummy_patched", False):
+        return False
+
+    @functools.wraps(original)
+    def wrapped(self, *args, **kwargs):
+        prev = getattr(_dp_dummy_local, "active", False)
+        _dp_dummy_local.active = True
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            _dp_dummy_local.active = prev
+
+    wrapped._atom_dp_dummy_patched = True
+    Worker.execute_dummy_batch = wrapped
+    return True
+
+
 def apply_vllm_req_id_passthrough_patch() -> bool:
+    patched_dp_dummy = _wrap_execute_dummy_batch()
+    if patched_dp_dummy:
+        logger.info(
+            "ATOM plugin: patched vLLM Worker.execute_dummy_batch to mark the DP "
+            "lockstep dummy batch (skips DeepSeek-V4 state writes on idle ranks)"
+        )
     try:
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-    except Exception as e:  # pragma: no cover - import guard
+    except Exception as e:  # noqa: BLE001  # pragma: no cover - import guard
         logger.debug(
             "ATOM vLLM req_id passthrough patch: GPUModelRunner unavailable (%s), "
             "skip",
             e,
         )
-        return False
+        return patched_dp_dummy
 
     # Target attention metadata build.
     patched_target = _wrap_with_req_id_snapshot(
@@ -118,4 +164,4 @@ def apply_vllm_req_id_passthrough_patch() -> bool:
             patched_target,
             patched_draft,
         )
-    return patched_target or patched_draft
+    return patched_target or patched_draft or patched_dp_dummy
