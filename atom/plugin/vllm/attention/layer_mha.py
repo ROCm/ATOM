@@ -41,6 +41,29 @@ _GLUON_PA_DECODE_BS_MAPPING = {
 _NO_PS_FIXED_SPLITS = 64
 
 
+def _pa_decode_context_partition_num(
+    num_seqs: int,
+    num_kv_heads: int,
+    max_context_len: int,
+    context_partition_size: int,
+    page_size: int,
+) -> int:
+    """Context partitions for the Gluon paged-decode kernel.
+
+    The count bounds how much KV history the kernel reads -- it walks
+    `n * context_partition_size` tokens per sequence and silently drops the
+    rest -- and a partition crossing a page boundary resolves the wrong page.
+    So: floor at what the context needs, ceiling at the page-aligned prefix.
+    """
+    required = (
+        int(max_context_len) + context_partition_size - 1
+    ) // context_partition_size
+    partitions = max(get_recommended_splits(num_seqs, num_kv_heads), required)
+    if page_size % context_partition_size:
+        partitions = min(partitions, page_size // context_partition_size)
+    return max(partitions, 1)
+
+
 def _init_vllm_mha_layer_state(
     layer,
     *,
@@ -430,10 +453,20 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         query_group_size = max_qlen * (num_q_heads_total // num_kv_heads)
         context_partition_size = 256
 
+        max_context_len = (
+            decode_metadata.max_seq_len
+            if decode_metadata is not None
+            else attn_metadata.max_seq_len
+        )
+
         use_ps = True
         if use_ps:
-            max_context_partition_num = get_recommended_splits(
-                num_decodes, num_kv_heads
+            max_context_partition_num = _pa_decode_context_partition_num(
+                num_decodes,
+                num_kv_heads,
+                max_context_len,
+                context_partition_size,
+                block_size,
             )
         else:
             max_context_partition_num = _NO_PS_FIXED_SPLITS
