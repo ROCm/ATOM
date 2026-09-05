@@ -5,7 +5,6 @@ import array
 import logging
 from dataclasses import dataclass
 from math import inf, isinf
-from time import monotonic
 
 import numpy as np
 import xxhash
@@ -289,10 +288,10 @@ class BlockManager:
         # The number that says the tier is doing anything at all. Every other
         # counter here can be non-zero with the CPU tier switched off; this one
         # cannot, which makes it the only honest test of "did this feature run".
-        # Suffixed `_boundaries` so an int counter no longer shares the bare name
-        # `state_tier` with the state-tier object/module used across this PR
-        # (`kimi_k3.state_tier`, `_JointPark`, `_state_tier`). The exported funnel
-        # key and the log label keep the short `state_tier` string.
+        # Suffixed `_boundaries` so an int counter does not share the bare name
+        # `state_tier` with the state-tier object and module
+        # (`kimi_k3.state_tier`, `_state_tier`). The exported funnel key and the
+        # log label keep the short `state_tier` string.
         self.state_tier_boundaries = 0
         # Admissions whose gated boundary neither tier could produce by the time
         # `allocate` ran. Non-zero is expected under pressure (the CPU index is
@@ -313,30 +312,6 @@ class BlockManager:
         if kv_offload_enabled:
             self._joint_chunk_tokens = state_tier_chunk_tokens(config)
         self.state_offload: StateOffloadIndex | None = None
-        # (req_id, hash, target_group) admitted this pass and not yet handed to
-        # the connector. Kept here rather than in the index because the slot
-        # is this object's fact.
-        self._state_loads: list[tuple] = []
-        # req_id -> [(slot, monotonic stamp), ...], for loads whose request was
-        # deallocated before the bytes landed. The slot is off the free list
-        # until the report comes back; see `deallocate`. A *list* per id, not a
-        # single tuple: `seq.id` is per-request not per-admission, so a
-        # preempt/re-admit can park the same id twice while the first load is
-        # still in flight. A single-value entry would overwrite -- silently
-        # dropping the first slot (leaked forever) and, worse, releasing the
-        # wrong slot when the first report arrives (a slot still being written).
-        # Append instead and release oldest-first: the worker submits and reports
-        # a request's loads in admission order, so the FIFO pop in
-        # `settle_state_load`/`abandon_state_load` matches slot to report. The
-        # stamp trusts `settle_state_load` to "always come": it does not, if the
-        # worker that owed the report crashed or its completion was dropped. Then
-        # the slot would sit off the free list forever and the state gate in
-        # `can_allocate` would wedge the pool once every slot is stranded, so
-        # `reconcile_orphan_load_slots` reclaims it after the same abandon
-        # window the store pins use -- the load-side twin of
-        # `reclaim_stale_state_store_pins`.
-        self._orphan_load_slots: dict[object, list[tuple[int, float]]] = {}
-        self._orphan_load_slots_reclaimed: int = 0
         # `kv_offload_enabled` is the whole switch: without a connector to
         # carry a transfer there is nothing beneath the pool, and a hash whose
         # KV left HBM could not be resumed from anyway.
@@ -346,9 +321,14 @@ class BlockManager:
         # units the coordinator owns, not a slot the pool is about to hand
         # away -- which is what the staging ring existed to rescue.
         if kv_offload_enabled:
+            # `release_slot` is the index's only allocator dependency. It owns
+            # a load's destination slot once the request is torn down under it
+            # (`orphan`), because a worker may still be scattering into that
+            # slot, and hands it back when the load finally settles.
             self.state_offload = StateOffloadIndex(
                 can_store=self.state_tier_capability.can_store_state,
                 can_load=self.state_tier_capability.can_load_state,
+                release_slot=self.state.release,
             )
             # Attached rather than passed at construction: the coordinator is
             # built before the switch is read (it needs `checkpoint_spec`,
@@ -1153,7 +1133,7 @@ class BlockManager:
         start). `can_allocate` already shrank the hit to a boundary that
         `_resumable_from` accepted, and that is not the same as "in HBM": the
         tier votes too. So a hash whose slot went to LMCache arrives as a miss
-        and becomes a load (`_request_state_load`), and so does one whose bytes
+        and becomes a load (`_start_state_load`), and so does one whose bytes
         LMCache's own LRU has since dropped — which the tier cannot know until
         the fetch misses. The two are told apart by whether the tier still
         holds the hash, because only one of them may keep the boundary.
@@ -1204,7 +1184,7 @@ class BlockManager:
             # CPU tier too, so a hash it accepted may live only there. Leaving
             # the raise in would take the engine down on the first request that
             # actually used the tier.
-            if self._request_state_load(seq, hit_hash):
+            if self._start_state_load(seq, hit_hash):
                 return True
             # Neither tier can produce it. Reachable rather than defensive:
             # the tier's index is optimistic (`hashes` means "was stored once"),
@@ -1216,10 +1196,14 @@ class BlockManager:
 
         src = self.state.lookup(hit_hash) if hit_hash != -1 else -1
         if src < 0:
-            wants_load = self._tier_can_serve(hit_hash)
+            wants_load = (
+                hit_hash != -1
+                and self.state_offload is not None
+                and self.state_offload.could_serve(hit_hash)
+            )
             seq.state_slots = self.state.pop_many(width)
             seq.state_fork_src = -1
-            if wants_load and self._request_state_load(seq, hit_hash):
+            if wants_load and self._start_state_load(seq, hit_hash):
                 return True
             # A fresh slot holds the previous occupant's bytes. That is fine
             # for a cold start (nothing claims otherwise) and wrong for a hit,
@@ -1250,30 +1234,13 @@ class BlockManager:
         seq.state_fork_src = -1
         return True
 
-    def _tier_can_serve(self, hit_hash: int) -> bool:
-        """Whether the tier could actually serve a load for `hit_hash`.
-
-        Asked twice per admission -- once by `_attach_state_slots` to decide
-        whether to try a load at all, and again inside `_request_state_load`.
-        Both, and `request_load` itself, go through `StateOffloadIndex.
-        could_serve`, so all three test the same capability+membership predicate
-        and cannot drift. A bare `hit_hash in hashes` here dropped the `can_load`
-        half: a store-only role (`kv_producer`) voted a hit it would then refuse,
-        the resumable scan stopped at the tier rung and skipped a still-resident
-        HBM rung, and the boundary was disowned into a full recompute.
-        """
-        return (
-            hit_hash != -1
-            and self.state_offload is not None
-            and self.state_offload.could_serve(hit_hash)
-        )
-
-    def _request_state_load(self, seq: Sequence, hit_hash: int) -> bool:
+    def _start_state_load(self, seq: Sequence, hit_hash: int) -> bool:
         """Ask the tier to fetch `hit_hash` into the slot `seq` just took.
 
         Only reached when the HBM index missed -- the case the tier exists for.
         The bytes land in the committed slot, where the resuming forward reads
-        them.
+        them, and the connector picks the load up off `seq.offload_joint` when
+        it builds this step's metadata.
 
         `state_fork_src` stays -1. The loaded slot *is* the incoming state, and
         naming a source would send the forward to a different slot than the one
@@ -1284,79 +1251,12 @@ class BlockManager:
         bytes no `get` can produce would park the request forever. The caller
         then disowns the boundary -- the pre-tier answer.
         """
-        if not self._tier_can_serve(hit_hash):
+        if self.state_offload is None:
             return False
-        if not self.state_offload.request_load(seq.id, hit_hash):
+        if not self.state_offload.request_load(seq.id, hit_hash, seq.state_slot):
             return False
         seq.offload_joint.load_hash = hit_hash
-        self._state_loads.append((seq.id, hit_hash, seq.state_slot))
         return True
-
-    def cancel_state_load(self, seq: Sequence) -> bool:
-        """Withdraw a load requested this pass, before anything was issued.
-        Only legal before `take_state_loads` handed it over; afterwards the
-        bytes are on their way and the slot must be held. The boundary is
-        disowned exactly as `allocate` would have -- including privatising the
-        claimed prefix (finding #2) so the recompute cannot tear a shared
-        decode.
-
-        Returns ``False`` when the pool cannot back the private copies; the
-        caller must abandon this admission rather than resume over the shared
-        prefix. ``True`` when there was nothing to cancel or the disown held.
-        """
-        if seq.offload_joint.load_hash == -1:
-            return True
-        self._state_loads = [e for e in self._state_loads if e[0] != seq.id]
-        if self.state_offload is not None:
-            self.state_offload.abandon_load(seq.id)
-        seq.offload_joint.load_hash = -1
-        disowned = self.disown_claimed_prefix(seq)
-        seq.num_cached_tokens = 0
-        return disowned
-
-    def abandon_state_load(self, req_id) -> None:
-        """Give up on a load without blaming the bytes for it.
-        For a load nothing could carry. `settle_state_load(ok=False)` would
-        `forget` the hash on a miss that never happened, erasing the index one
-        request at a time and inflating its false-positive counter.
-        """
-        if self.state_offload is None:
-            return
-        self.state_offload.abandon_load(req_id)
-        self._release_oldest_orphan_slot(req_id)
-
-    def _release_oldest_orphan_slot(self, req_id) -> None:
-        """Hand back the oldest orphan-parked slot for `req_id`, if any.
-
-        FIFO: a preempt/re-admit can park a request's slot more than once, and
-        the worker reports its loads in admission order, so the oldest park is
-        the one this report settles. Releasing newest-first would free a slot a
-        later load is still writing.
-        """
-        parked = self._orphan_load_slots.get(req_id)
-        if not parked:
-            return
-        slot, _at = parked.pop(0)
-        if not parked:
-            del self._orphan_load_slots[req_id]
-        self.state.release(slot)
-
-    def settle_state_load(self, req_id, ok: bool) -> None:
-        """Apply one worker load report. Keyed by request, like the KV load.
-
-        Called for every `finished_loading`/`failed_loading` id, including the
-        many that are plain KV loads -- a no-op for those, which keeps the
-        scheduler from having to know which leg a report belongs to. An
-        abandoned load is already out of the index, but its slot is still being
-        written and comes back here, and only here.
-        """
-        if self.state_offload is None:
-            return
-        if ok:
-            self.state_offload.complete_load(req_id)
-        else:
-            self.state_offload.fail_load(req_id)
-        self._release_oldest_orphan_slot(req_id)
 
     def take_state_stores(self, max_inflight: int) -> list[tuple]:
         """`(operation, unit_ids)` for checkpoints to hand the CPU tier.
@@ -1477,66 +1377,6 @@ class BlockManager:
         if self.paged_state_checkpoints is None:
             return 0
         return self.paged_state_checkpoints.reclaim_stale_offload_pins(timeout_s)
-
-    def reconcile_orphan_load_slots(self, timeout_s: float) -> int:
-        """Free load slots whose `settle_state_load` never came, after `timeout_s`.
-
-        The load-side twin of `reclaim_stale_state_store_pins`. `deallocate`
-        parks a slot in `_orphan_load_slots` when it tears down a request whose
-        state load is still in flight, on the promise that the worker reports
-        every load and `settle_state_load` will hand it back. A crashed worker
-        or a dropped completion breaks that promise, and the slot then sits off
-        the free list forever -- `can_allocate`'s state gate refuses new
-        per-request work once enough slots are stranded, wedging the pool with
-        no fault to point at.
-
-        **This is a last resort and cannot tell a lost report from a slow
-        worker still writing the slot** -- the same limitation the store-pin
-        twin documents. Reclaiming under a live H2D hands the next request a
-        buffer someone else is filling, with `has_initial_state` already true
-        over it. So the window must be the abandon timeout, not a tight one:
-        long enough that a report still in flight has already arrived. The
-        index leg was abandoned back in `deallocate`, so nothing here touches
-        it; a late report finds the slot already popped and releases nothing.
-        """
-        if timeout_s <= 0 or not self._orphan_load_slots:
-            return 0
-        cutoff = monotonic() - timeout_s
-        reclaimed = 0
-        for req_id in list(self._orphan_load_slots):
-            parked = self._orphan_load_slots[req_id]
-            # Each admission is stamped and expires on its own age -- a stale
-            # park is dropped even when a newer one for the same id is still
-            # inside the window (kept in place).
-            fresh = []
-            for slot, at in parked:
-                if at <= cutoff:
-                    # The index leg was already abandoned in `deallocate` when the
-                    # slot was parked; only the slot itself outlived the report.
-                    # Do not touch the index again here -- a second `abandon_load`
-                    # would double-count the miss. A late report that still calls
-                    # in finds this slot gone and releases the next parked one.
-                    self.state.release(slot)
-                    reclaimed += 1
-                else:
-                    fresh.append((slot, at))
-            if fresh:
-                self._orphan_load_slots[req_id] = fresh
-            else:
-                del self._orphan_load_slots[req_id]
-        self._orphan_load_slots_reclaimed += reclaimed
-        return reclaimed
-
-    def take_state_loads(self) -> list[tuple]:
-        """`(req_id, hash, target_slot)` for loads admitted since the last call.
-        Drained once per pass by the scheduler, which hands them to the
-        connector. Draining rather than reading is what keeps a load from being
-        submitted twice into a slot the first transfer is already filling.
-        """
-        if self.state_offload is None:
-            return []
-        out, self._state_loads = self._state_loads, []
-        return out
 
     def _chain_parent_hash(self, seq: Sequence, start: int) -> int | None:
         """Return the chained hash of block ``start - 1``, or ``None`` on a gap.
@@ -2143,7 +1983,13 @@ class BlockManager:
             "state_hbm": self.state_hbm_boundaries,
             "state_tier": self.state_tier_boundaries,
             "state_gate_lost_boundary": self.state_gate_lost_boundary,
-            "orphan_load_slots_reclaimed": self._orphan_load_slots_reclaimed,
+            # Off the index, which owns an orphaned load's slot from the moment
+            # its request is torn down until the report lands.
+            "orphan_load_slots_reclaimed": (
+                self.state_offload.orphan_load_slots_reclaimed
+                if self.state_offload is not None
+                else 0
+            ),
         } | self.state_checkpoint_fates()
 
     def pool_pressure(self) -> dict[str, int]:
@@ -2501,28 +2347,11 @@ class BlockManager:
             # Unless a state load is in flight into the committed slot -- a
             # worker is writing it, so handing it back now would give the next
             # request a buffer someone else is filling, with `has_initial_state`
-            # already true over it. Held until `settle_state_load`, which always
-            # comes: the worker reports every load either way. The rollback
+            # already true over it. `orphan` moves that slot to the index, which
+            # releases it when the load's one report lands (or, if that report
+            # is lost to a dead worker, when its reclaimer fires). The rollback
             # scratch is nobody's destination and goes back regardless.
-            if seq.offload_joint.load_hash != -1 and self.state_offload is not None:
-                self._orphan_load_slots.setdefault(seq.id, []).append(
-                    (seq.state_slot, monotonic())
-                )
-                # Abandoned, not failed: an abort says nothing about the bytes,
-                # and forgetting the hash would cost the next request over this
-                # prefix a full recompute.
-                self.state_offload.abandon_load(seq.id)
-                # Drop any not-yet-taken load queued for this request, exactly as
-                # `cancel_state_load` does (finding #3). Without this, a requeued
-                # or preempted admission leaves its entry in `_state_loads`, and
-                # `_publish_state_loads` later hands the connector a load for a
-                # request no longer in `metadata.requests` -- the tier writes into
-                # a released or orphaned slot, and the completion can settle this
-                # request's NEXT-generation park, attributing a state restore to
-                # the wrong generation silently. A no-op once the load was taken
-                # (in flight): the entry is already gone and the orphan-slot path
-                # above holds the slot until `settle_state_load`.
-                self._state_loads = [e for e in self._state_loads if e[0] != seq.id]
+            if self.state_offload is not None and self.state_offload.orphan(seq.id):
                 self.state.release_many(seq.state_slots[1:])
             else:
                 self.state.release_many(seq.state_slots)

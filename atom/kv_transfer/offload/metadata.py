@@ -122,6 +122,27 @@ class SlotLoadSpec:
     destination_group: int
 
 
+@dataclass(frozen=True)
+class StateLoadSpec:
+    """Identity and destination for one request's recurrent-state restore.
+
+    Rides the request's `LMCacheReqMeta` rather than a side list, so the state
+    leg runs inside the KV leg's own task and one dispatch produces exactly one
+    completion.
+
+    `chunk_tokens` travels with the spec because the engine floors the joint
+    boundary against the LMCache chunk grid and the worker validates the
+    transfer against it. Deriving that number twice lets the two sides disagree
+    about where the boundary is, which is silent wrong output rather than an
+    error anyone would see.
+    """
+
+    boundary_tokens: int
+    boundary_hash: int
+    destination_slot: int
+    chunk_tokens: int
+
+
 @dataclass
 class LMCacheReqMeta:
     """Everything the worker needs to load/save one request's KV this step."""
@@ -145,6 +166,16 @@ class LMCacheReqMeta:
     save_operation: SaveOperationId | None = None
     # Appended for positional compatibility with existing metadata producers.
     load_operation: LoadOperationId | None = None
+    # The recurrent-state leg of this request's load, when it has one. Appended
+    # last for the same positional-compatibility reason as `load_operation`.
+    state_load_spec: StateLoadSpec | None = None
+    # Producer fence for the async KV save. Recorded on the compute stream in
+    # `start_load_kv` (RPC thread) before this step's forward, and awaited in
+    # `_do_save_req` on the off-TTFT save worker before the pack_stream gather --
+    # so the gather never reads KV pages a prior forward is still writing.
+    # Without it the gather captures torn/partially-written latent that is then
+    # faithfully reloaded (silent corruption). `None` when offload runs on CPU.
+    producer_event: Any = None
 
 
 class LMCacheOffloadMetadata(ConnectorMetadata):
@@ -156,15 +187,14 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
     descriptors the worker consumes in ``start_load_kv``.
     """
 
-    #: `state_loads` is the one that is easy to miss: it carries no
-    #: `LMCacheReqMeta`, so a step whose only work is a state load looks empty
-    #: to anything that only counts requests -- and the requests parked on
-    #: those loads are woken by nothing but the report they would never be
-    #: asked to produce.
+    #: `state_stores` is the one that is easy to miss: it carries no
+    #: `LMCacheReqMeta`, so a step whose only work is a state store looks empty
+    #: to anything that only counts requests -- and the PAGE units that store
+    #: pinned are released by nothing but the report it would never be asked to
+    #: produce.
     WORK_FIELDS = ConnectorMetadata.WORK_FIELDS + (
         "requests",
         "lookup_requests_in_step",
-        "state_loads",
         "state_stores",
     )
 
@@ -173,11 +203,6 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
         self.requests: list[LMCacheReqMeta] = []
         # req_ids whose worker-side lookup pin can be released this step.
         self.lookup_requests_in_step: list[str] = []
-        # (req_id, state_hash, target_group) for the K3 state tier. A separate
-        # list because a state load shares no shape with a KV transfer -- no
-        # token ids, no block ids, no chunking -- only the park/report
-        # lifecycle, which is why it rides the metadata rather than the batch.
-        self.state_loads: list[tuple] = []
         # (StateStoreOperationId, unit_ids) for checkpoints leaving HBM for the
         # CPU tier. Keyed by the operation id, not by request: by the time a
         # store lands its request is long gone, and the op (prefix hash plus

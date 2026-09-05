@@ -902,7 +902,7 @@ def test_a_producer_role_stores_but_never_votes_for_a_load(monkeypatch):
     assert bm.state_offload is not None
     assert bm.state_offload.can_store and not bm.state_offload.can_load
     bm.state_offload.note_stored(11)
-    assert bm.state_offload.request_load("r1", 11) is False
+    assert bm.state_offload.request_load("r1", 11, 0) is False
 
 
 def test_a_consumer_role_votes_but_never_hands_over_a_store(monkeypatch):
@@ -998,6 +998,44 @@ class TestReclaimedStoresAreNotIndexed:
         assert bm.state_offload.stores_completed == 1
         assert bm.state_offload.stores_untrusted == 0
 
+    def test_a_failed_store_releases_but_is_not_indexed(self):
+        """The asymmetry `settle_state_store` documents and nothing asserted.
+
+        The pin existed to keep the bytes still during the copy and the copy is
+        over either way, so it is released on both legs. Only the indexing
+        differs: voting for a hash whose bytes never landed sends the next
+        request over that prefix to a `get` that must miss.
+        """
+        from atom.kv_transfer.disaggregation.types import StateStoreOperationId
+
+        bm = self._bm()
+        op = StateStoreOperationId(11, 1)
+        bm.settle_state_store(op, ok=False)
+
+        assert bm.paged_state_checkpoints.settled == [op], "the units go back"
+        assert 11 not in bm.state_offload.hashes, "a miss must not be advertised"
+        assert bm.state_offload.stores_failed == 1
+        assert bm.state_offload.stores_completed == 0
+
+    def test_a_refused_store_is_not_counted_as_a_failure(self):
+        """`attempted=False` is a store the connector never took.
+
+        It still has to release, but counting it as `stores_failed` would name
+        the same event twice -- the caller already counts it as
+        `stores_refused` -- and would leave it lingering in
+        `attempted - completed - failed`.
+        """
+        from atom.kv_transfer.disaggregation.types import StateStoreOperationId
+
+        bm = self._bm()
+        bm.state_offload.stores_attempted = 1
+        op = StateStoreOperationId(11, 1)
+        bm.settle_state_store(op, ok=False, attempted=False)
+
+        assert bm.paged_state_checkpoints.settled == [op], "the units go back"
+        assert bm.state_offload.stores_failed == 0, "refused is not failed"
+        assert bm.state_offload.stores_attempted == 0, "the optimistic bump backs out"
+
     def test_a_reclaimed_store_reporting_success_is_forfeited(self):
         from atom.kv_transfer.disaggregation.types import StateStoreOperationId
 
@@ -1028,134 +1066,6 @@ class TestReclaimedStoresAreNotIndexed:
         assert bm.paged_state_checkpoints.settled == [], "the pin is not retired"
         # ...and it does not touch the index, which the store report owns.
         assert bm.state_offload.hashes == set()
-
-
-# ── the orphan load slot lives in one dict of (slot, stamp) ────────────────
-
-
-class TestOrphanLoadSlotSingleDict:
-    """A load slot whose request was torn down before its bytes landed is
-    parked in one dict of `(slot, stamp)`. It used to live across two parallel
-    dicts keyed the same way, mutated in pairs at four sites -- a shape where an
-    overwrite or a half-applied pop could desync them, so the reconciler
-    (iterating the stamp dict) and the release (reading the slot dict) could
-    disagree and strand a slot off the pool free list. One dict makes that
-    unrepresentable: an entry is present with its slot and stamp together, or it
-    is gone."""
-
-    class _Pool:
-        def __init__(self):
-            self.released = []
-
-        def release(self, slot):
-            self.released.append(slot)
-
-    class _Index:
-        def __init__(self):
-            self.abandoned, self.completed, self.failed = [], [], []
-
-        def abandon_load(self, req_id):
-            self.abandoned.append(req_id)
-
-        def complete_load(self, req_id):
-            self.completed.append(req_id)
-
-        def fail_load(self, req_id):
-            self.failed.append(req_id)
-
-    def _bm(self):
-        bm = object.__new__(BlockManager)
-        bm.state = self._Pool()
-        bm.state_offload = self._Index()
-        bm._orphan_load_slots = {}
-        bm._orphan_load_slots_reclaimed = 0
-        return bm
-
-    def test_settle_frees_the_parked_slot_and_clears_the_entry(self):
-        from time import monotonic
-
-        bm = self._bm()
-        bm._orphan_load_slots["r"] = [(7, monotonic())]
-        bm.settle_state_load("r", ok=True)
-        assert bm.state.released == [7]
-        assert "r" not in bm._orphan_load_slots
-        assert bm.state_offload.completed == ["r"]
-
-    def test_abandon_frees_the_parked_slot(self):
-        from time import monotonic
-
-        bm = self._bm()
-        bm._orphan_load_slots["r"] = [(7, monotonic())]
-        bm.abandon_state_load("r")
-        assert bm.state.released == [7]
-        assert "r" not in bm._orphan_load_slots
-
-    def test_reconcile_frees_a_slot_whose_report_never_came(self):
-        from time import monotonic
-
-        bm = self._bm()
-        bm._orphan_load_slots["r"] = [(7, monotonic())]
-        assert bm.reconcile_orphan_load_slots(timeout_s=1e-9) == 1
-        assert bm.state.released == [7]
-        assert bm._orphan_load_slots_reclaimed == 1
-        assert "r" not in bm._orphan_load_slots
-
-    def test_reconcile_spares_a_slot_still_inside_its_window(self):
-        from time import monotonic
-
-        bm = self._bm()
-        bm._orphan_load_slots["r"] = [(7, monotonic())]
-        assert bm.reconcile_orphan_load_slots(timeout_s=3600) == 0
-        assert bm.state.released == []
-        assert "r" in bm._orphan_load_slots
-
-    def test_a_late_report_after_reconcile_releases_nothing(self):
-        from time import monotonic
-
-        bm = self._bm()
-        bm._orphan_load_slots["r"] = [(7, monotonic())]
-        bm.reconcile_orphan_load_slots(timeout_s=1e-9)
-        bm.settle_state_load("r", ok=True)  # the report finally arrives
-        assert bm.state.released == [7], "freed once by reconcile, not twice"
-
-    def test_a_preempt_readmit_parks_the_same_id_twice_without_dropping_a_slot(
-        self,
-    ):
-        # `seq.id` is per-request, not per-admission: a preempt/re-admit can park
-        # the same id twice while the first load is still in flight. A single
-        # tuple would overwrite -- leaking slot 7 forever and, worse, releasing
-        # slot 8 (still being written) when the first report lands. Appended and
-        # released oldest-first, each report frees the slot its load actually
-        # settled.
-        from time import monotonic
-
-        bm = self._bm()
-        first = (7, monotonic())
-        second = (8, monotonic())
-        bm._orphan_load_slots["r"] = [first]  # first admission
-        bm._orphan_load_slots["r"].append(second)  # re-admission, load in flight
-
-        bm.settle_state_load("r", ok=True)  # first (oldest) load reports
-        assert bm.state.released == [7]
-        assert bm._orphan_load_slots["r"] == [second]  # slot 8 still parked
-
-        bm.settle_state_load("r", ok=True)  # second load reports
-        assert bm.state.released == [7, 8]
-        assert "r" not in bm._orphan_load_slots  # entry cleared when empty
-
-    def test_reconcile_expires_one_admission_and_keeps_the_fresh_one(self):
-        # Each parked admission ages on its own stamp: a stale one is reclaimed
-        # even while a newer park for the same id is still inside the window.
-        from time import monotonic
-
-        bm = self._bm()
-        now = monotonic()
-        bm._orphan_load_slots["r"] = [(7, now - 3600), (8, now)]  # old, fresh
-
-        assert bm.reconcile_orphan_load_slots(timeout_s=1.0) == 1
-        assert bm.state.released == [7]
-        assert bm._orphan_load_slots["r"] == [(8, now)]
-        assert bm._orphan_load_slots_reclaimed == 1
 
 
 # ── the LMCache chunk probe is gated on the capability ─────────────────────

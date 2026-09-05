@@ -44,9 +44,6 @@ class FakeScheduler:
         self.outputs = []
         self.state_publishes = 0
 
-    def _publish_state_loads(self):
-        self.state_publishes += 1
-
     def _publish_state_stores(self):
         self.state_publishes += 1
 
@@ -262,11 +259,12 @@ def test_exit_drain_is_a_noop_without_kv_transfer():
 
 
 def test_idle_drain_publishes_new_state_work():
-    # Normal idle: publish new state loads/stores so a lull between batches
-    # still makes forward progress on the offload tiers.
+    # Normal idle: publish new state stores so a lull between batches still
+    # makes forward progress on the offload tier. Loads have no publish of
+    # their own -- each rides its request's KV load metadata.
     proc = _engine(connector=FakeConnector(pending=True))
     proc._advance_idle_kv_transfer()
-    assert proc.scheduler.state_publishes == 2  # both loads and stores
+    assert proc.scheduler.state_publishes == 1
 
 
 def test_exit_drain_does_not_publish_new_state_work():
