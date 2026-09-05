@@ -8,7 +8,8 @@ both the scheduler and worker from configuration alone:
 
 * ``dense`` stores ordinary token-indexed KV chunks;
 * ``hybrid`` stores DSV4 compressed PAGE chunks plus complete SLOT sidecars;
-* ``kimi_k3`` stores dense MLA KV plus a KDA per-request state tier.
+* ``kimi_k3`` stores dense MLA KV plus a KDA per-request state tier;
+* ``m3`` stores MiniMax-M3 PAGE-only KV including the NSA index cache.
 
 Keeping selection config-only is important because the scheduler process does
 not have access to the worker's transfer tensors.
@@ -51,6 +52,13 @@ def _build_worker(config):
 
         return KimiK3OffloadConnector(config)
 
+    if variant == "m3":
+        from atom.kv_transfer.offload.hybrid.m3.connector import (
+            M3OffloadConnector,
+        )
+
+        return M3OffloadConnector(config)
+
     from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
 
     return DenseOffloadConnector(config)
@@ -72,6 +80,13 @@ def _build_scheduler(config):
         )
 
         return KimiK3OffloadScheduler(config)
+
+    if variant == "m3":
+        from atom.kv_transfer.offload.hybrid.m3.connector import (
+            M3OffloadScheduler,
+        )
+
+        return M3OffloadScheduler(config)
 
     from atom.kv_transfer.offload.dense.connector import DenseOffloadScheduler
 

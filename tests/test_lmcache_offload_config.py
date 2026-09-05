@@ -204,14 +204,37 @@ def test_offload_layout_override_still_allows_dense_hybrid_choice():
     assert offcfg.select_offload_layout(config) == "dense"
 
 
-def test_minimax_and_dense_model_types_still_route_to_dense():
+def test_minimax_m2_and_dense_model_types_still_route_to_dense():
     # The refusal must be narrow: a non-GDN model with no compress_ratios is
-    # ordinary dense, including MiniMax (sparse/standard attention, no state).
-    for model_type in ("minimax_m2", "minimax_m3", "llama", None):
+    # ordinary dense. MiniMax-M2 (standard attention, no NSA index cache) is
+    # plain dense; only M3, whose NSA index cache needs its own tier, is carved
+    # out to the PAGE-only "m3" layout (see the two tests below).
+    for model_type in ("minimax_m2", "llama", None):
         config = _config()
         config.hf_config.compress_ratios = None
         config.hf_config.model_type = model_type
         assert offcfg.select_offload_layout(config) == "dense"
+
+
+def test_minimax_m3_model_type_routes_to_m3():
+    # M3's NSA index cache rides in transfer_tensors.block_regions, which only
+    # the PAGE-only "m3" layout sources; `dense` would offload K/V and silently
+    # drop the index cache, corrupting restored prefixes.
+    config = _config()
+    config.hf_config.compress_ratios = None
+    config.hf_config.model_type = "minimax_m3"
+    assert offcfg.select_offload_layout(config) == "m3"
+
+
+def test_minimax_m3_is_detected_by_architecture_name():
+    # M3 is identified by architecture name, not a model_type family, so the
+    # arch-name path must route to "m3" from the architectures list even when
+    # the model_type string does not name M3.
+    config = _config()
+    config.hf_config.compress_ratios = None
+    config.hf_config.model_type = "minimax_text_01"
+    config.hf_config.architectures = ["MiniMaxM3ForCausalLM"]
+    assert offcfg.select_offload_layout(config) == "m3"
 
 
 @pytest.mark.parametrize("invalid", [True, 256.0, "256"])
