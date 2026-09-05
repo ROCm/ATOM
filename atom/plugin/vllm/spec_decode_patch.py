@@ -1,6 +1,8 @@
 import functools
 import logging
 
+import torch
+
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -127,6 +129,43 @@ def _patch_dspark_fused_markov_sample() -> None:
     )
 
 
+def _patch_dspark_markov_embed_bounds() -> None:
+    """Bounds-check the DSpark Markov embedding gather.
+
+    ``markov_embed`` is an unguarded ``F.embedding``, and under async scheduling
+    the ids can carry the scheduler's ``-1`` spec placeholder, which reads off
+    the table and faults the GPU.
+
+    Clamped at the point of use, not at the seed: ``_sample_sequential``
+    reassigns ``prev`` on every one of the K steps. No accuracy cost -- the
+    target verifies every draft token, so a bad draft costs acceptance only.
+    """
+    try:
+        from vllm.models.deepseek_v4.amd.dspark import DSparkDeepseekV4ForCausalLM
+    except ImportError:
+        return
+
+    original_markov_embed = DSparkDeepseekV4ForCausalLM.markov_embed
+    if getattr(original_markov_embed, "_atom_markov_bounds_patched", False):
+        return
+
+    @functools.wraps(original_markov_embed)
+    def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
+        limit = getattr(self, "_atom_markov_num_rows", None)
+        if limit is None:
+            limit = self.model.markov_head.markov_w1.num_embeddings
+            self._atom_markov_num_rows = limit
+        # Out-of-place: `prev` is the caller's live loop variable.
+        return original_markov_embed(self, token_ids.clamp(0, limit - 1))
+
+    markov_embed._atom_markov_bounds_patched = True
+    DSparkDeepseekV4ForCausalLM.markov_embed = markov_embed
+    logger.info(
+        "ATOM plugin: bounds-checking the DSpark Markov embedding gather "
+        "(an out-of-range draft id would fault the GPU under async scheduling)."
+    )
+
+
 def _get_attn_backend_block_size(backend) -> int:
     supported = backend.get_supported_kernel_block_sizes()
     get_preferred = getattr(backend, "get_preferred_block_size", None)
@@ -163,6 +202,97 @@ def _spec_has_heterogeneous_mla_mha_backend(kv_cache_spec) -> bool:
         elif isinstance(spec, AttentionSpec):
             has_non_mla_attn = True
     return has_mla and has_non_mla_attn
+
+
+def _spec_is_v4_proxy_target_with_mla_draft(kv_cache_spec) -> bool:
+    """The DeepSeek-V4 topology, the mirror image of the EAGLE3 one above: the
+    *target* is ATOM's opaque proxy layer (a FullAttentionSpec of uint8 bytes,
+    with the real MLA + indexer caches behind it) and the *draft* is vLLM's
+    DSpark head, whose 3 `mtp.*` layers are genuine sliding-window MLA.
+
+    `_spec_has_heterogeneous_mla_mha_backend` also matches, but its splitter
+    would rewrite the proxy's block size to ATOM's MHA one and the draft's to
+    ATOM's MLA one -- both wrong, since neither layer belongs to the backend the
+    name suggests. Handle it separately and keep every spec's own block size.
+    """
+    try:
+        from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
+
+        from atom.plugin.vllm.deepseek_v4_bridge import (
+            ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
+        )
+    except ImportError:  # specs are optional across vLLM versions
+        return False
+
+    if ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME not in kv_cache_spec:
+        return False
+    draft = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if name != ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME
+    }
+    # NB: SlidingWindowMLASpec derives from SlidingWindowSpec, NOT from
+    # MLAAttentionSpec. DSpark's mtp layers produce the former.
+    return bool(draft) and all(
+        isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+        for spec in draft.values()
+    )
+
+
+def _groups_are_v4_proxy_plus_mla_draft(kv_cache_groups) -> bool:
+    """Recognise the pair built by `_build_v4_proxy_draft_kv_cache_groups` so the
+    shared-num_blocks allocator below covers it too. Keyed on the proxy layer
+    name, not spec classes: SlidingWindowMLASpec does not subclass
+    MLAAttentionSpec, so `_groups_are_heterogeneous_mla_mha` misses it.
+    """
+    try:
+        from atom.plugin.vllm.deepseek_v4_bridge import (
+            ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
+        )
+    except ImportError:
+        return False
+
+    if len(kv_cache_groups) != 2:
+        return False
+    return kv_cache_groups[0].layer_names == [ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME]
+
+
+def _build_v4_proxy_draft_kv_cache_groups(kv_cache_spec):
+    """Two pools, each keeping the block size its own backend asked for: ATOM's
+    proxy at ATOM_DEEPSEEK_V4_BLOCK_SIZE, the DSpark draft at whatever vLLM's MLA
+    backend picked. Unifying them would rewrite the proxy's block size, which its
+    page -- a byte blob sized for ATOM's internal caches -- cannot survive.
+    """
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec, UniformTypeKVCacheSpecs
+
+    from atom.plugin.vllm.deepseek_v4_bridge import ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME
+    from atom.plugin.vllm.dspark_draft_kv_patch import convert_draft_specs
+
+    proxy_name = ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME
+    draft_specs = {
+        name: spec for name, spec in kv_cache_spec.items() if name != proxy_name
+    }
+    # Route the draft's specs to a manager that abstains from the prefix cache;
+    # otherwise the draft group caps the target's hit. See dspark_draft_kv_patch.
+    # No-op for non-DSpark drafts.
+    draft_specs = convert_draft_specs(draft_specs)
+
+    proxy_group = KVCacheGroupSpec(
+        layer_names=[proxy_name],
+        kv_cache_spec=kv_cache_spec[proxy_name],
+    )
+    draft_uniform = UniformTypeKVCacheSpecs.from_specs(draft_specs)
+    assert draft_uniform is not None, (
+        "DSpark draft KV specs are not of a uniform type: "
+        f"{ {n: type(s).__name__ for n, s in draft_specs.items()} }"
+    )
+    draft_group = KVCacheGroupSpec(
+        layer_names=list(draft_specs.keys()),
+        kv_cache_spec=draft_uniform,
+    )
+    # proxy (non-MLA) first, draft (MLA) second; the shared allocator below
+    # accepts either order.
+    return [proxy_group, draft_group]
 
 
 def _split_mla_and_mha_layers(kv_cache_spec):
@@ -356,6 +486,16 @@ def _patch_heterogeneous_eagle3_kv_cache() -> None:
 
     @functools.wraps(orig_get_groups)
     def patched_get_kv_cache_groups(vllm_config, kv_cache_spec):
+        logger.info(
+            "ATOM plugin: KV cache specs %s",
+            {name: type(spec).__name__ for name, spec in kv_cache_spec.items()},
+        )
+        if _spec_is_v4_proxy_target_with_mla_draft(kv_cache_spec):
+            logger.info(
+                "ATOM plugin: using heterogeneous KV cache layout - ATOM V4 proxy "
+                "target and vLLM MLA draft - with separate per-group pools."
+            )
+            return _build_v4_proxy_draft_kv_cache_groups(kv_cache_spec)
         if getattr(
             vllm_config.model_config, "use_mla", False
         ) and _spec_has_heterogeneous_mla_mha_backend(kv_cache_spec):
@@ -370,7 +510,9 @@ def _patch_heterogeneous_eagle3_kv_cache() -> None:
     def patched_get_kv_cache_config_from_groups(
         vllm_config, kv_cache_groups, available_memory
     ):
-        if _groups_are_heterogeneous_mla_mha(kv_cache_groups):
+        if _groups_are_heterogeneous_mla_mha(
+            kv_cache_groups
+        ) or _groups_are_v4_proxy_plus_mla_draft(kv_cache_groups):
             return _build_heterogeneous_kv_cache_config_from_groups(
                 vllm_config, kv_cache_groups, available_memory
             )
@@ -378,7 +520,9 @@ def _patch_heterogeneous_eagle3_kv_cache() -> None:
 
     @functools.wraps(orig_max_mem)
     def patched_max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups):
-        if _groups_are_heterogeneous_mla_mha(kv_cache_groups):
+        if _groups_are_heterogeneous_mla_mha(
+            kv_cache_groups
+        ) or _groups_are_v4_proxy_plus_mla_draft(kv_cache_groups):
             return _heterogeneous_max_memory_usage_bytes(vllm_config, kv_cache_groups)
         return orig_max_mem(vllm_config, kv_cache_groups)
 
@@ -444,7 +588,7 @@ def _patch_vllm_llm_base_model_sharing() -> None:
                     "DeepSeek-V4 MTP draft attention type check."
                 )
 
-    setattr(wrapped_load_model, "_atom_share_with_target_patched", True)
+    wrapped_load_model._atom_share_with_target_patched = True
     SpecDecodeBaseProposer.load_model = wrapped_load_model
 
 
@@ -513,16 +657,8 @@ def _patch_vllm_draft_kv_group_validation() -> None:
             return
         return original_initialize(self, kv_cache_config, kernel_block_sizes)
 
-    setattr(
-        wrapped_validate_same_kv_cache_group,
-        "_atom_kv_group_validation_patched",
-        True,
-    )
-    setattr(
-        wrapped_initialize_attn_backend,
-        "_atom_kv_group_validation_patched",
-        True,
-    )
+    wrapped_validate_same_kv_cache_group._atom_kv_group_validation_patched = True
+    wrapped_initialize_attn_backend._atom_kv_group_validation_patched = True
     SpecDecodeBaseProposer.validate_same_kv_cache_group = (
         wrapped_validate_same_kv_cache_group
     )
@@ -568,9 +704,7 @@ def _patch_vllm_draft_positions_on_metadata() -> None:
             common_attn_metadata.positions = self._get_positions(num_tokens)
         return original_build(self, common_attn_metadata, draft_index)
 
-    setattr(
-        wrapped_build_per_group_and_layer_attn_metadata, "_atom_positions_patched", True
-    )
+    wrapped_build_per_group_and_layer_attn_metadata._atom_positions_patched = True
     SpecDecodeBaseProposer.build_per_group_and_layer_attn_metadata = (
         wrapped_build_per_group_and_layer_attn_metadata
     )
@@ -619,7 +753,7 @@ def _patch_vllm_deepseek_v4_mtp_first_pass_inputs() -> None:
             num_rejected_tokens_gpu,
         )
 
-    setattr(wrapped_set_inputs_first_pass, "_atom_v4_mtp_inputs_patched", True)
+    wrapped_set_inputs_first_pass._atom_v4_mtp_inputs_patched = True
     SpecDecodeBaseProposer.set_inputs_first_pass = wrapped_set_inputs_first_pass
 
 
@@ -635,6 +769,7 @@ def _patch_vllm_dspark_dcp_inputs() -> None:
 def apply_vllm_spec_decode_patch() -> None:
     """Patch vLLM speculative decoding for ATOM metadata compatibility."""
     _patch_dspark_fused_markov_sample()
+    _patch_dspark_markov_embed_bounds()
     _patch_vllm_dspark_dcp_inputs()
     _patch_vllm_llm_base_model_sharing()
     _patch_vllm_draft_kv_group_validation()
@@ -686,7 +821,7 @@ def apply_vllm_spec_decode_patch() -> None:
                 dict.fromkeys((*allowed, *atom_allowed_attn_types))
             )
 
-    setattr(wrapped_init, "_atom_allowed_attn_types_patched", True)
+    wrapped_init._atom_allowed_attn_types_patched = True
     SpecDecodeBaseProposer.__init__ = wrapped_init
 
     logger.info(

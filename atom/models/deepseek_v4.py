@@ -126,6 +126,12 @@ from atom.utils.forward_context import AttnState, get_forward_context
 
 logger = logging.getLogger(__name__)
 
+# COMPILE BOUNDARY: `DeepseekV4Model.forward` is the only traced entry point.
+# `aux_hidden_state_layers` is read inside it, so Dynamo bakes in the branch and
+# the ids; from `--level 2` up the custom dispatcher replays code object 0
+# without evaluating guards, so mutating it after the first forward is silently
+# ignored. Set it at load time (`set_aux_hidden_state_layers`) and never after.
+
 # ---------------------------------------------------------------------------
 # Classical KV cache scatter / gather helpers (PR3-pre2c-B).
 #
@@ -4326,6 +4332,10 @@ class DeepseekV4Model(nn.Module):
         self.hc_head_base = atom_parameter(torch.empty(hc_mult, dtype=torch.float32))
         self.hc_head_scale = atom_parameter(torch.empty(1, dtype=torch.float32))
 
+        # 1-based layer ids whose residual is also returned, for EAGLE3 /
+        # DSpark / DFlash drafts. Set via `set_aux_hidden_state_layers`.
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
+
     def forward(
         self,
         input_ids: torch.Tensor,  # [num_tokens] int  flat ragged-batch token ids
@@ -4333,10 +4343,17 @@ class DeepseekV4Model(nn.Module):
     ) -> torch.Tensor:  # [num_tokens, hc, dim]  pre-hc_head residual stream
         """Forward over `num_tokens` flat ragged-batch tokens.
 
+        TRACED ENTRY POINT — see the COMPILE BOUNDARY note at the top of the file.
+
         Returns the mHC residual stack `[num_tokens, hc, dim]` BEFORE hc_head
         reduction — `hc_head + RMSNorm + LM head` are all deferred to
         `compute_logits`. Returning the hc-shaped residual lets the (future)
         MTP draft consume it without re-expanding from a dim-reduced state.
+
+        With `aux_hidden_state_layers` set, returns `(h, aux_hidden_states)`
+        instead; each aux entry is that layer's residual averaged over hc
+        (`[num_tokens, dim]`), matching vLLM's DSv4 target, which is what the
+        DSpark drafter was trained against.
         """
         assert input_ids.dim() == 1, f"input_ids must be 1D, got {input_ids.shape}"
         # PCP note: under PCP, `input_ids`/`positions` arrive already round-robin-
@@ -4350,12 +4367,38 @@ class DeepseekV4Model(nn.Module):
         h = h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
         hc_state = HCState(residual=h, post_mix=None, comb_mix=None, x_prev=None)
 
-        for layer in self.layers:
+        aux_layers = self.aux_hidden_state_layers
+        if not aux_layers:
+            for layer in self.layers:
+                hc_state = layer(hc_state, positions)
+            h = self.layers[-1].hc_post(
+                hc_state.x_prev, hc_state.residual, hc_state.post_mix, hc_state.comb_mix
+            )
+            return h
+
+        # Aux path. `hc_post` is the deferred mHC reconstruction: it turns the
+        # layer's `x_prev` + residual + mixing tensors into that layer's
+        # post-layer `[num_tokens, hc, dim]` residual, which is what aux wants.
+        aux_hidden_states: list[torch.Tensor] = []
+        final_aux_recon: torch.Tensor | None = None
+        for idx, layer in enumerate(self.layers):
             hc_state = layer(hc_state, positions)
-        h = self.layers[-1].hc_post(
-            hc_state.x_prev, hc_state.residual, hc_state.post_mix, hc_state.comb_mix
-        )
-        return h
+            if (idx + 1) in aux_layers:
+                final_aux_recon = layer.hc_post(
+                    hc_state.x_prev,
+                    hc_state.residual,
+                    hc_state.post_mix,
+                    hc_state.comb_mix,
+                )
+                aux_hidden_states.append(final_aux_recon.mean(dim=1))
+        if final_aux_recon is not None and len(self.layers) in aux_layers:
+            # Last layer was an aux layer; reuse its reconstruction.
+            h = final_aux_recon
+        else:
+            h = self.layers[-1].hc_post(
+                hc_state.x_prev, hc_state.residual, hc_state.post_mix, hc_state.comb_mix
+            )
+        return h, aux_hidden_states
 
 
 class DeepseekV4ForCausalLM(nn.Module):
@@ -4554,6 +4597,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         else:
             ctx.context.input_ids = input_ids
         h = self.model(input_ids, positions)
+        # Aux layers make the inner model return `(h, aux_list)`. Unpack so the
+        # PCP fixups below keep operating on a single tensor; re-attach at exit.
+        aux_hidden_states = None
+        if isinstance(h, tuple):
+            h, aux_hidden_states = h
 
         # ----- PCP: all-gather shards, restore original order, drop pad -----
         if use_pcp:
@@ -4566,7 +4614,35 @@ class DeepseekV4ForCausalLM(nn.Module):
                 h = pcp_allgather_rerange(h, pcp_size)
                 if pad > 0:
                     h = h[:n_global]
+                if aux_hidden_states is not None:
+                    aux_hidden_states = [
+                        (
+                            pcp_allgather_rerange(a, pcp_size)[:n_global]
+                            if pad > 0
+                            else pcp_allgather_rerange(a, pcp_size)
+                        )
+                        for a in aux_hidden_states
+                    ]
+        if aux_hidden_states is not None:
+            return h, aux_hidden_states
         return h
+
+    # ----- EAGLE3 / DSpark / DFlash auxiliary hidden states -----
+    # ATOM's server-mode convention. The plugin's
+    # `_enable_eagle3_target_interface` bridges it onto vLLM's `SupportsEagle3`.
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        """`layers` are 1-based: id `i` means "after `self.layers[i-1]`"."""
+        self.model.aux_hidden_state_layers = tuple(int(i) for i in layers)
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        # Checkpoint ids are 0-based; +1 converts to the 1-based convention.
+        for attr in ("dspark_target_layer_ids", "target_layer_ids"):
+            ids = getattr(self.hf_config, attr, None)
+            if ids:
+                return tuple(int(i) + 1 for i in ids)
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
 
     def compute_logits(
         self,
