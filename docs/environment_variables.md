@@ -96,6 +96,12 @@ combine knob as a quality/throughput tradeoff.
 
 ## Fusion passes
 
+### RMSNorm
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_USE_MODEL_SENSITIVE_RMSNORM** | bool | 0 (false) | If set to `1`, use AITER's model-sensitive RMSNorm rounding mode. This can change numerical results and prefill performance, so it is opt-in. |
+
 ### TP AllReduce fusion
 
 | Variable | Type | Default | Description |

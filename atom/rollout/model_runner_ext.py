@@ -33,6 +33,19 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
     to the base veRL behavior.
     """
 
+    TRUE_VOCAB_SIZE_ENV = "LUMENRL_ATOM_TRUE_VOCAB_SIZE"
+
+    def __init__(self, rank: int, config):
+        raw_true_vocab_size = os.environ.get(self.TRUE_VOCAB_SIZE_ENV, "0")
+        try:
+            self._true_vocab_size = int(raw_true_vocab_size or 0)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"Invalid {self.TRUE_VOCAB_SIZE_ENV}={raw_true_vocab_size!r}; "
+                "expected an integer"
+            ) from None
+        super().__init__(rank, config)
+
     # Environment variable whose value is a comma-separated list of physical
     # GPU indices assigned to this DP rank (e.g. "2,3").  When set, each DP
     # rank's ModelRunners form an independent NCCL world with TP only.
@@ -40,6 +53,30 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
     # responsible for mapping to VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER before constructing the
     # runner.
     DP_DEVICE_MAP_ENV = "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
+
+    def postprocess(
+        self,
+        batch: ScheduledBatch,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor | None,
+        top_ps: torch.Tensor | None,
+        all_greedy: bool,
+        hidden_states: torch.Tensor,
+        needs_independent_noise: bool = False,
+    ) -> ScheduledBatchOutput:
+        if self._true_vocab_size > 0 and logits.shape[-1] > self._true_vocab_size:
+            logits[..., self._true_vocab_size :] = float("-inf")
+        return super().postprocess(
+            batch,
+            logits,
+            temperatures,
+            top_ks,
+            top_ps,
+            all_greedy,
+            hidden_states,
+            needs_independent_noise=needs_independent_noise,
+        )
 
     def _setup_device_and_distributed(self, rank: int, config):
         """Override to set up DP-isolated NCCL worlds.

@@ -78,21 +78,23 @@ class MemoryManagerMixin:
         if "kv_cache" in tags:
             self._resume_kv_cache()
 
-        self._recapture_cudagraphs_if_needed()
-
         logger.info(f"{self.label}: GPU memory resumed, tags={tags}")
         return True
 
     def _release_weights(self) -> None:
         if not hasattr(self, "model") or self.model is None:
             return
-        # Release CUDA graphs first — they hold references to weight memory
-        # and prevent freeing GPU memory.
-        if not self.enforce_eager and hasattr(self, "graphs") and self.graphs:
-            self._graphs_backup_keys = list(self.graphs.keys())
-            self.graphs.clear()
-            self.graph_pool = None
-            logger.info(f"{self.label}: CUDA graphs released for sleep")
+        # No-eager sleep policy: keep weights AND CUDA graphs resident so their
+        # GPU addresses stay stable across sleep/wake. Online weight updates are
+        # applied in-place (param.data.copy_ + in-place shuffle), so the graphs
+        # remain valid and never need recapture — this avoids the GPU
+        # memory-access fault that occurs when recapturing graphs on wake under
+        # PYTORCH_CUDA_ALLOC_CONF=expandable_segments.
+        if not self.enforce_eager:
+            logger.info(
+                f"{self.label}: no-eager sleep keeps weights + CUDA graphs resident"
+            )
+            return
         # Discard GPU weight data but keep shape/dtype metadata so that
         # weight sync (SHM or IPC) can do param.data.copy_() later.
         # The weights are always overwritten after resume, so offloading
@@ -130,6 +132,13 @@ class MemoryManagerMixin:
     def _release_kv_cache(self) -> None:
         if not hasattr(self, "kv_cache") or self.kv_cache is None:
             return
+        # No-eager: keep the KV cache resident so its GPU address stays stable —
+        # decode CUDA graphs capture the KV cache base pointer, so freeing and
+        # re-allocating it would invalidate the graphs and force a (fault-prone)
+        # recapture on wake. Contents are still zeroed via clear_kv_cache().
+        if not self.enforce_eager:
+            logger.info(f"{self.label}: no-eager sleep keeps KV cache resident")
+            return
         self._kv_cache_num_blocks = self.config.num_kvcache_blocks
 
         # Clear per-module KV cache views that share the underlying storage.
@@ -164,6 +173,11 @@ class MemoryManagerMixin:
         return models
 
     def _resume_kv_cache(self) -> None:
+        # No-eager sleep keeps the existing KV cache resident so CUDA graph
+        # addresses remain stable. There is nothing to restore in this case.
+        if not self.enforce_eager and getattr(self, "kv_cache", None) is not None:
+            return
+
         if (
             not hasattr(self, "_kv_cache_num_blocks")
             or self._kv_cache_num_blocks is None
@@ -185,40 +199,3 @@ class MemoryManagerMixin:
         logger.info(
             f"{self.label}: KV cache re-allocated and bound ({num_blocks} blocks)"
         )
-
-    def _recapture_cudagraphs_if_needed(self) -> None:
-        """Recapture CUDA graphs if they were released during sleep.
-
-        CUDA graphs capture GPU memory addresses at capture time.  After
-        sleep/wake, weight and KV-cache tensors are at new addresses, so the
-        old graphs are invalid and must be recaptured.
-
-        We only recapture when **both** weights and KV cache are on GPU
-        (i.e., the model is fully ready for inference).
-        """
-        if self.enforce_eager:
-            return
-        if not hasattr(self, "_graphs_backup_keys") or not self._graphs_backup_keys:
-            return
-        # Only recapture if both weights and KV cache are on GPU
-        has_weights_on_gpu = any(p.is_cuda for p in self.model.parameters())
-        has_kv_cache = self.kv_cache is not None
-        if not has_weights_on_gpu or not has_kv_cache:
-            return
-        logger.info(f"{self.label}: Recapturing CUDA graphs after sleep/wake cycle")
-        try:
-            self.capture_cudagraph()
-            del self._graphs_backup_keys
-            logger.info(f"{self.label}: CUDA graph recapture completed")
-        except Exception as e:
-            logger.error(
-                f"{self.label}: CUDA graph recapture failed: {e}",
-                exc_info=True,
-            )
-            # Fall back to eager mode rather than crashing
-            self.enforce_eager = True
-            self.graphs = {}
-            self.graph_pool = None
-            if hasattr(self, "_graphs_backup_keys"):
-                del self._graphs_backup_keys
-            logger.warning(f"{self.label}: Falling back to enforce_eager=True")

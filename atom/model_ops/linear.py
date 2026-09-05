@@ -769,11 +769,15 @@ class LinearBase(nn.Module):
             )
         self.weight = nn.Parameter(q_weight, requires_grad=False)
         self.weight_scale = nn.Parameter(weight_scale, requires_grad=False)
+        self.weight.weight_loader_process = self.weight_loader_process
+        self.weight_scale.weight_loader_process = self.weight_loader_process
 
         # Update quant state
         self.quant_type = online_quant_type
         self.params_dtype = online_quant_dtype
         self.quant_func = get_hip_quant(online_quant_type)
+        # get_hip_quant already returns fnuz when quant_dtype=fnuz on gfx942;
+        # only normalize when output is still non-fnuz.
         self.need_normalize_e4m3fn_to_e4m3fnuz = (
             online_quant_dtype == torch.float8_e4m3fnuz
             and online_quant_type == QuantType.per_Token

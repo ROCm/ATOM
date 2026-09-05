@@ -20,6 +20,7 @@ _ATOM_ENV_VARS = [
     "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST",
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT",
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT",
+    "ATOM_USE_MODEL_SENSITIVE_RMSNORM",
     "ATOM_TORCH_PROFILER_DIR",
     "ATOM_PROFILER_MORE",
     "ATOM_PROFILER_TIMEOUT",
@@ -72,6 +73,9 @@ class TestEnvsDefaults:
 
     def test_ds_input_rmsnorm_quant_fusion_default_enabled(self):
         assert _get_envs().ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is True
+
+    def test_model_sensitive_rmsnorm_default_disabled(self):
+        assert _get_envs().ATOM_USE_MODEL_SENSITIVE_RMSNORM is False
 
     def test_torch_profiler_dir_default(self):
         assert _get_envs().ATOM_TORCH_PROFILER_DIR is None
@@ -133,6 +137,10 @@ class TestEnvsOverrides:
     def test_profiler_timeout_override(self, monkeypatch):
         monkeypatch.setenv("ATOM_PROFILER_TIMEOUT", "900")
         assert _get_envs().ATOM_PROFILER_TIMEOUT == 900.0
+
+    def test_model_sensitive_rmsnorm_enabled(self, monkeypatch):
+        monkeypatch.setenv("ATOM_USE_MODEL_SENSITIVE_RMSNORM", "1")
+        assert _get_envs().ATOM_USE_MODEL_SENSITIVE_RMSNORM is True
 
     def test_log_more_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_LOG_MORE", "1")

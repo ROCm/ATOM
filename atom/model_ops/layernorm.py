@@ -20,13 +20,17 @@ from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
+from torch import Tensor, nn
+from torch.overrides import handle_torch_function, has_torch_function_unary
+
 from atom.config import QuantizationConfig
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
-from atom.utils.decorators import mark_trace
 from atom.utils import envs
-from torch import Tensor, nn
-from torch.overrides import handle_torch_function, has_torch_function_unary
+from atom.utils.decorators import mark_trace
+
+_rmsnorm2d_fwd_supports_model_sensitive: bool | None = None
+_rmsnorm2d_fwd_with_add_supports_model_sensitive: bool | None = None
 
 
 def silu(input: Tensor, inplace: bool = False) -> Tensor:
@@ -58,19 +62,71 @@ def silu(input: Tensor, inplace: bool = False) -> Tensor:
 def rmsnorm2d_fwd_(
     x: torch.Tensor, weight: torch.Tensor, eps: float, dim: int
 ) -> torch.Tensor:
+    global _rmsnorm2d_fwd_supports_model_sensitive
+
     ori_shape = x.shape
     x = x.reshape(-1, dim)
-    return rmsnorm2d_fwd(x, weight, eps).view(ori_shape)
+    if (
+        envs.ATOM_USE_MODEL_SENSITIVE_RMSNORM
+        and _rmsnorm2d_fwd_supports_model_sensitive is not False
+    ):
+        try:
+            out = rmsnorm2d_fwd(x, weight, eps, use_model_sensitive_rmsnorm=1)
+        except TypeError as error:
+            msg = str(error)
+            unsupported_kw = (
+                "unexpected keyword argument" in msg
+                and "use_model_sensitive_rmsnorm" in msg
+            )
+            if _rmsnorm2d_fwd_supports_model_sensitive is True or not unsupported_kw:
+                raise
+            _rmsnorm2d_fwd_supports_model_sensitive = False
+        else:
+            _rmsnorm2d_fwd_supports_model_sensitive = True
+            return out.view(ori_shape)
+    out = rmsnorm2d_fwd(x, weight, eps)
+    return out.view(ori_shape)
 
 
 @torch_compile_guard()
 def rmsnorm2d_fwd_with_add_(
     x: torch.Tensor, weight: torch.Tensor, residual: torch.Tensor, eps: float, dim: int
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
+    global _rmsnorm2d_fwd_with_add_supports_model_sensitive
+
     ori_shape = x.shape
     x = x.reshape(-1, dim)
     out = torch.empty_like(x)
     residual_out = torch.empty_like(x)
+    if (
+        envs.ATOM_USE_MODEL_SENSITIVE_RMSNORM
+        and _rmsnorm2d_fwd_with_add_supports_model_sensitive is not False
+    ):
+        try:
+            rmsnorm2d_fwd_with_add(
+                out,
+                x,
+                residual,
+                residual_out,
+                weight,
+                eps,
+                use_model_sensitive_rmsnorm=1,
+            )
+        except TypeError as error:
+            msg = str(error)
+            unsupported_kw = (
+                "unexpected keyword argument" in msg
+                and "use_model_sensitive_rmsnorm" in msg
+            )
+            if (
+                _rmsnorm2d_fwd_with_add_supports_model_sensitive is True
+                or not unsupported_kw
+            ):
+                raise
+            _rmsnorm2d_fwd_with_add_supports_model_sensitive = False
+        else:
+            _rmsnorm2d_fwd_with_add_supports_model_sensitive = True
+            return out.view(ori_shape), residual_out.view(ori_shape)
     rmsnorm2d_fwd_with_add(out, x, residual, residual_out, weight, eps)
     return out.view(ori_shape), residual_out.view(ori_shape)
 

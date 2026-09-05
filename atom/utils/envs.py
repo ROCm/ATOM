@@ -255,6 +255,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT": lambda: (
         os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT", "1") == "1"
     ),
+    "ATOM_USE_MODEL_SENSITIVE_RMSNORM": lambda: (
+        os.getenv("ATOM_USE_MODEL_SENSITIVE_RMSNORM", "0") == "1"
+    ),
     # --- Profiling & Logging ---
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     # Move the startup heap (model, compiled graph, tokenizer, KV block pool)
