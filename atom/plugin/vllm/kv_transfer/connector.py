@@ -225,10 +225,35 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         ``num_computed_tokens`` is vLLM's HBM-prefix-cache frontier; ATOM reads
         the same quantity off the seq to avoid re-loading what is already
         resident, so it has to be pushed in before the lookup runs.
+
+        A lookup hit is not yet a decision to load. ATOM weighs that separately
+        -- a hit already covered by HBM, one whose boundary is not chunk
+        aligned, or one too small to be worth a transfer is dropped -- and its
+        native scheduler asks `should_park_for_load_after_alloc` before parking
+        anything.
+
+        vLLM has no such second chance: returning True here parks the request in
+        WAITING_FOR_REMOTE_KVS, and the ONLY thing that releases it is the
+        worker reporting the id in `finished_recving`. A load that is never
+        issued is never reported, so the request waits forever -- the engine
+        spins in `schedule()` with every GPU idle and the server is dead. Two of
+        the three drop reasons are routine: the default floor is 8192 tokens,
+        which is every prompt in a chat-sized workload, and with HBM prefix
+        caching on, vLLM's block-aligned frontier (128) is regularly not
+        chunk-aligned (256).
+
+        So the decision is taken here, before the promise. When ATOM declines it
+        has already cleared its pending-load state, and reporting no external
+        tokens leaves the request to prefill normally.
         """
         seq = self._seqs.get_or_create(request)
         seq.set_num_cached_tokens(num_computed_tokens)
-        return self._scheduler.get_num_new_matched_tokens(seq)
+        need, _ = self._scheduler.get_num_new_matched_tokens(seq)
+        if need <= 0:
+            return 0, False
+        if not self._scheduler.should_park_for_load_after_alloc(seq):
+            return 0, False
+        return need, True
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens: int):
         seq = self._seqs.get_or_create(request)
