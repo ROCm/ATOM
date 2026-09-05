@@ -613,6 +613,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sends only its 1/tp_size slice and the receiver all-gathers, cutting PP
     # link traffic by tp_size. Default on; set "0" for full-tensor sends.
     "ATOM_PP_SEND_ALLGATHER": lambda: os.getenv("ATOM_PP_SEND_ALLGATHER", "1") == "1",
+    # Let parallel groups spanning identical ranks (TP/DCP/EP at tp==dcp==world
+    # size, and the degenerate single-rank PCP/PP/DP) share one set of RCCL
+    # communicators by handing back the same GroupCoordinator instance instead of
+    # building one each. Default on; set to "0" to disable.
+    "ATOM_REUSE_COMM_GROUPS": lambda: os.getenv("ATOM_REUSE_COMM_GROUPS", "1") == "1",
 }
 
 

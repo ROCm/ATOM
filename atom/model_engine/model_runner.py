@@ -28,6 +28,7 @@ from aiter.dist.utils import get_distributed_init_method
 from torch.profiler import record_function
 
 from atom.config import Config, CUDAGraphMode, set_current_atom_config
+from atom.distributed.group_reuse import reuse_identical_rank_groups
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
     get_pcp_world_size,
@@ -967,51 +968,52 @@ class ModelRunner:
             config.parallel_config.data_parallel_master_ip,
             config.parallel_config.data_parallel_base_port,
         )
-        # Both branches handle simulated TP: the PP path only to reject it,
-        # since it would otherwise deadlock on a group sized for absent ranks.
-        if config.pipeline_parallel_size > 1:
-            from atom.distributed.pp_comm import init_pp_aware_dist_env
+        with reuse_identical_rank_groups():
+            # Both branches handle simulated TP: the PP path only to reject it,
+            # since it would otherwise deadlock on a group sized for absent ranks.
+            if config.pipeline_parallel_size > 1:
+                from atom.distributed.pp_comm import init_pp_aware_dist_env
 
-            reject_simulated_tp(config, "pipeline parallel")
-            dp_size = config.parallel_config.data_parallel_size
-            world_size = dp_size * pp_size * stage_span
-            dp_rank = config.parallel_config.data_parallel_rank
-            global_rank = (dp_rank * pp_size + pp_rank) * stage_span + rank
-            # No local_rank here, unlike the non-PP branch below. Safe only
-            # because PP is single-node today: CoreManager rejects multi-node
-            # DP when pp_size > 1, and asserts PP+DP out entirely, so
-            # global_rank is already the physical device index. Revisit if
-            # either restriction is lifted.
-            init_pp_aware_dist_env(
-                tensor_model_parallel_size=config.tensor_parallel_size,
-                pipeline_model_parallel_size=pp_size,
-                global_rank=global_rank,
-                world_size=world_size,
-                distributed_init_method=distributed_init_method,
-                backend="nccl",
-                data_parallel_size=dp_size,
-                prefill_context_model_parallel_size=config.prefill_context_parallel_size,
-            )
-        else:
-            # The group spans the devices that exist; apply_simulated_tp then
-            # makes it *report* the logical width so layers shard that many ways.
-            init_dist_env(
-                config.tp_world_size,
-                rankID=rank,
-                backend="nccl",
-                distributed_init_method=distributed_init_method,
-                # This node's physical device index. Without it aiter derives a
-                # local rank from the DP-scaled global rank, which overruns the
-                # device list on every node after the first.
-                local_rank=local_device_rank,
-                data_parallel_size=config.parallel_config.data_parallel_size,
-                data_parallel_rank=config.parallel_config.data_parallel_rank,
-                prefill_context_model_parallel_size=config.prefill_context_parallel_size,
-                decode_context_parallel_size=getattr(
-                    config, "decode_context_parallel_size", 1
-                ),
-            )
-            apply_simulated_tp(config)
+                reject_simulated_tp(config, "pipeline parallel")
+                dp_size = config.parallel_config.data_parallel_size
+                world_size = dp_size * pp_size * stage_span
+                dp_rank = config.parallel_config.data_parallel_rank
+                global_rank = (dp_rank * pp_size + pp_rank) * stage_span + rank
+                # No local_rank here, unlike the non-PP branch below. Safe only
+                # because PP is single-node today: CoreManager rejects multi-node
+                # DP when pp_size > 1, and asserts PP+DP out entirely, so
+                # global_rank is already the physical device index. Revisit if
+                # either restriction is lifted.
+                init_pp_aware_dist_env(
+                    tensor_model_parallel_size=config.tensor_parallel_size,
+                    pipeline_model_parallel_size=pp_size,
+                    global_rank=global_rank,
+                    world_size=world_size,
+                    distributed_init_method=distributed_init_method,
+                    backend="nccl",
+                    data_parallel_size=dp_size,
+                    prefill_context_model_parallel_size=config.prefill_context_parallel_size,
+                )
+            else:
+                # The group spans the devices that exist; apply_simulated_tp then
+                # makes it *report* the logical width so layers shard that many ways.
+                init_dist_env(
+                    config.tp_world_size,
+                    rankID=rank,
+                    backend="nccl",
+                    distributed_init_method=distributed_init_method,
+                    # This node's physical device index. Without it aiter derives a
+                    # local rank from the DP-scaled global rank, which overruns the
+                    # device list on every node after the first.
+                    local_rank=local_device_rank,
+                    data_parallel_size=config.parallel_config.data_parallel_size,
+                    data_parallel_rank=config.parallel_config.data_parallel_rank,
+                    prefill_context_model_parallel_size=config.prefill_context_parallel_size,
+                    decode_context_parallel_size=getattr(
+                        config, "decode_context_parallel_size", 1
+                    ),
+                )
+                apply_simulated_tp(config)
 
     def _make_buffer(
         self, *size: int | torch.SymInt, dtype: torch.dtype, numpy: bool = True
