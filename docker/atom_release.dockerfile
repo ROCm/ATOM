@@ -102,8 +102,13 @@ RUN echo "========== [ATOM] Installing MORI nightly ==========" && \
 # ROCm build whose version string doesn't match rocm-hip's declared dependency,
 # leaving dpkg in a broken state that blocks all subsequent apt-get install calls.
 ARG INSTALL_MOONCAKE=1
-ARG MOONCAKE_REPO="https://github.com/Jasen2201/Mooncake.git"
-ARG MOONCAKE_COMMIT="fix/ionic-mr-and-qp-resource-fixes"
+# Upstream Mooncake (includes HIP dma-buf MR via ibv_reg_dmabuf_mr, PR #2225).
+# Pin a SHA: floating `main` would silently drop dma-buf / ionic behavior.
+# Jasen2201 `fix/ionic-mr-and-qp-resource-fixes` only has CUDA dma-buf; HIP
+# still falls back to ibv_reg_mr (EINVAL 22 on ionic GPU VAs).
+ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
+ARG MOONCAKE_COMMIT="bfca1ce2af8419c50dc8d464820a95d97d43c930"
+ARG USE_HIP_DMABUF=ON
 ARG VENV_PYTHON="/opt/venv/bin/python"
 
 # [MC 1/4] Clone
@@ -151,16 +156,53 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         rm -f /tmp/libionic1.deb; \
     fi
 
-# [MC 3/4] CMake build with HIP support + system install
+# [MC 3/4] CMake build with HIP + HIP dma-buf MR (ibv_reg_dmabuf_mr)
+# USE_HIP_DMABUF must compile into rdma_transport (rdma_context.cpp). Without
+# hsa-runtime64, CMake silently disables dma-buf and GPU MRs stay on ibv_reg_mr.
+# ATOM only consumes the TransferEngine (`mooncake.engine`), so Mooncake Store
+# and its Rust bindings stay off: they add build surface (cachelib, cargo) that
+# nothing here loads. WITH_STORE_RUST=ON is a hard error without WITH_STORE.
+# HIP hipify copies tests/*.cpp into the build tree but not headers such as
+# rdma_test_peers.h, so BUILD_UNIT_TESTS=ON fails. Upstream ROCm CI also sets
+# BUILD_UNIT_TESTS=OFF; examples are unused in this image.
 RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
-        echo "========== [MC 3/4] Build and install Mooncake (USE_HIP=ON) =========="; \
+        echo "========== [MC 3/4] Build and install Mooncake (USE_HIP=ON USE_HIP_DMABUF=${USE_HIP_DMABUF}) =========="; \
+        HSA_PREFIXS="/opt/rocm"; \
+        for cfg in /opt/rocm/lib/cmake/hsa-runtime64/hsa-runtime64Config.cmake \
+                   /opt/rocm/lib64/cmake/hsa-runtime64/hsa-runtime64Config.cmake; do \
+            if [ -f "${cfg}" ]; then HSA_PREFIXS="$(dirname "$(dirname "$(dirname "${cfg}")")"):${HSA_PREFIXS}"; fi; \
+        done; \
         mkdir -p /app/mooncake/build && cd /app/mooncake/build \
-        && cmake .. -DUSE_HIP=ON -DUSE_ETCD=ON \
-        && make -j$(nproc) && make install \
+        && cmake .. -DUSE_HIP=ON -DUSE_HIP_DMABUF=${USE_HIP_DMABUF} -DUSE_ETCD=ON \
+             -DWITH_TE=ON -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF \
+             -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF \
+             -DCMAKE_PREFIX_PATH="${HSA_PREFIXS}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}" \
+             > /tmp/mooncake-cmake.log 2>&1 \
+        || { cat /tmp/mooncake-cmake.log; exit 1; } \
+        && cat /tmp/mooncake-cmake.log \
+        && if [ "${USE_HIP_DMABUF}" = "ON" ]; then \
+             grep -q "HIP dmabuf MR registration enabled" /tmp/mooncake-cmake.log \
+               || { echo "ERROR: HIP dma-buf was not enabled (hsa-runtime64 missing?)"; \
+                    grep -E "HIP dmabuf|hsa-runtime64" /tmp/mooncake-cmake.log || true; \
+                    exit 1; }; \
+           fi \
+        && { make -j$(nproc) > /tmp/mooncake-make.log 2>&1 \
+             || { echo "ERROR: Mooncake build failed. Compiler diagnostics:"; \
+                  grep -nE "error:|fatal error|undefined reference|Error [0-9]" \
+                       /tmp/mooncake-make.log | head -n 80; \
+                  echo "--- tail of build log ---"; \
+                  tail -n 120 /tmp/mooncake-make.log; \
+                  exit 1; }; } \
+        && make install \
         && ldconfig \
+        && ( grep -a -R -l "ibv_reg_dmabuf_mr" /usr/local/lib /opt/venv 2>/dev/null | head -n 1 \
+             || { echo "ERROR: installed Mooncake libs have no ibv_reg_dmabuf_mr"; exit 1; } ) \
         && echo "--- Clean up build artifacts ---" \
         && rm -rf /app/mooncake/build /app/mooncake/.git; \
     fi
+
+# Runtime: do not set MOONCAKE_DISABLE_HIP_DMABUF (any non-0 forces ibv_reg_mr).
+ENV MOONCAKE_DISABLE_HIP_DMABUF=0
 
 # ========== Install Rust toolchain ==========
 ARG RUST_VERSION="1.94.0"
