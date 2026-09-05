@@ -248,6 +248,30 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
                 seq.set_num_cached_tokens(num_tokens)
         return AtomOffloadMetadata(self._scheduler.build_connector_meta())
 
+    def update_connector_output(self, connector_output) -> None:
+        """Feed the worker's completions back into ATOM's scheduler state.
+
+        vLLM splits a connector across two processes and only the worker half
+        sees ATOM's completion objects; this is the scheduler half's only news
+        of them. Without it nothing ever clears: `_save_inflight` and the load
+        lifecycle grow for the life of the process, `has_pending_work()` never
+        goes quiet, and -- the one that actually hurts -- the SeqView of every
+        deferred request is retained, each holding that request's prompt token
+        ids. At M3's context lengths that is the difference between a bounded
+        server and one that grows by most of a megabyte per request.
+
+        The ids arrive as plain strings (that is all vLLM's KVConnectorOutput
+        carries), so the `*_by_request` resolvers recover the exact operation
+        identity ATOM parked.
+        """
+        for req_id in connector_output.finished_recving or ():
+            self._scheduler.load_finished_by_request(req_id)
+        for req_id in connector_output.finished_sending or ():
+            self._scheduler.save_finished_by_request(req_id)
+            # vLLM frees the blocks on this same report, so the request is over
+            # on both sides; the view was kept only for the deferred save.
+            self._seqs.drop(req_id)
+
     def request_finished(self, request, block_ids) -> tuple[bool, dict | None]:
         seq = self._seqs.get(request.request_id)
         if seq is not None:
