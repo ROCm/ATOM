@@ -75,6 +75,10 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         # order, so both sides are accumulated until they meet.
         self._saved_awaiting_finish: set[str] = set()
         self._finished_awaiting_save: set[str] = set()
+        # Requests parked on a promised load, and how many steps ago. A promise
+        # that never turns into a dispatched load is an unrecoverable hang, so
+        # it is at least named in the log. See `_check_promised_loads`.
+        self._promised_loads: dict[str, int] = {}
 
         if role == KVConnectorRole.WORKER:
             from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
@@ -253,6 +257,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
             return 0, False
         if not self._scheduler.should_park_for_load_after_alloc(seq):
             return 0, False
+        self._promised_loads[request.request_id] = 0
         return need, True
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens: int):
@@ -271,7 +276,44 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
             seq = self._seqs.get(req_id)
             if seq is not None:
                 seq.set_num_cached_tokens(num_tokens)
-        return AtomOffloadMetadata(self._scheduler.build_connector_meta())
+        inner = self._scheduler.build_connector_meta()
+        self._check_promised_loads(inner)
+        return AtomOffloadMetadata(inner)
+
+    # Steps a promised load may go undispatched before it is called out. Loads
+    # are emitted on the step after the promise, so anything past a handful of
+    # steps is already wrong; the margin is only so a busy scheduler does not
+    # produce noise.
+    _PROMISE_GRACE_STEPS = 50
+
+    def _check_promised_loads(self, inner) -> None:
+        """Name any request parked on a load that was never dispatched.
+
+        Nothing here can rescue it: vLLM releases a parked request only when the
+        worker reports the id in `finished_recving`, and the scheduler half
+        cannot inject that. The promise is gated on ATOM's own park decision, so
+        this should stay empty -- but when it does not, the symptom is an engine
+        spinning in `schedule()` with every GPU idle and no log line at all,
+        which costs hours to trace back. One line here names the request.
+        """
+        if not self._promised_loads:
+            return
+        for meta in getattr(inner, "requests", ()) or ():
+            self._promised_loads.pop(str(getattr(meta, "req_id", meta)), None)
+        stuck = []
+        for req_id in list(self._promised_loads):
+            self._promised_loads[req_id] += 1
+            if self._promised_loads[req_id] > self._PROMISE_GRACE_STEPS:
+                stuck.append(req_id)
+                del self._promised_loads[req_id]
+        if stuck:
+            logger.error(
+                "ATOM LMCache offload: promised a load for %s but none was "
+                "dispatched within %d steps; those requests are parked in "
+                "WAITING_FOR_REMOTE_KVS and cannot be released",
+                sorted(stuck),
+                self._PROMISE_GRACE_STEPS,
+            )
 
     def update_connector_output(self, connector_output) -> None:
         """Feed the worker's completions back into ATOM's scheduler state.
@@ -290,6 +332,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         identity ATOM parked.
         """
         for req_id in connector_output.finished_recving or ():
+            self._promised_loads.pop(str(req_id), None)
             self._scheduler.load_finished_by_request(req_id)
         for req_id in connector_output.finished_sending or ():
             self._scheduler.save_finished_by_request(req_id)
@@ -298,6 +341,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
             self._seqs.drop(req_id)
 
     def request_finished(self, request, block_ids) -> tuple[bool, dict | None]:
+        self._promised_loads.pop(request.request_id, None)
         seq = self._seqs.get(request.request_id)
         if seq is not None:
             self._scheduler.request_finished(seq)

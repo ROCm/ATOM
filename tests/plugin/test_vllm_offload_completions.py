@@ -43,6 +43,7 @@ def _adapter() -> tuple[object, _FakeScheduler]:
     scheduler = _FakeScheduler()
     adapter._scheduler = scheduler
     adapter._seqs = SeqViewRegistry()
+    adapter._promised_loads = {}
     return adapter, scheduler
 
 
@@ -101,6 +102,7 @@ def _lookup_adapter(scheduler):
     adapter = object.__new__(connector_mod.AtomLMCacheOffloadConnector)
     adapter._scheduler = scheduler
     adapter._seqs = SeqViewRegistry()
+    adapter._promised_loads = {}
     return adapter
 
 
@@ -136,3 +138,31 @@ def test_no_hit_does_not_ask_about_parking():
 
     assert adapter.get_num_new_matched_tokens(_req(), 0) == (0, False)
     assert scheduler.asked_park == 0
+
+
+def test_a_promise_that_never_dispatches_is_named(caplog):
+    """The hang leaves no trace of its own; this is the only breadcrumb."""
+    scheduler = _ParkScheduler(hit=10496, park=True)
+    adapter = _lookup_adapter(scheduler)
+    adapter.get_num_new_matched_tokens(_req("stuck"), 0)
+
+    empty = SimpleNamespace(requests=[])
+    with caplog.at_level("ERROR", logger="atom"):
+        for _ in range(adapter._PROMISE_GRACE_STEPS + 1):
+            adapter._check_promised_loads(empty)
+
+    assert "stuck" in caplog.text
+    # Reported once, not every step afterwards.
+    caplog.clear()
+    adapter._check_promised_loads(empty)
+    assert caplog.text == ""
+
+
+def test_a_dispatched_load_is_not_reported():
+    scheduler = _ParkScheduler(hit=10496, park=True)
+    adapter = _lookup_adapter(scheduler)
+    adapter.get_num_new_matched_tokens(_req("ok"), 0)
+
+    adapter._check_promised_loads(SimpleNamespace(requests=[SimpleNamespace(req_id="ok")]))
+
+    assert adapter._promised_loads == {}
