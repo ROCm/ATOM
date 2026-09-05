@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788555100250,
+  "lastUpdate": 1788627618046,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -2611,6 +2611,57 @@ window.BENCHMARK_DATA = {
             "value": 0.8886,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33894404452 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609041453 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.3063 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Lingpeng Jin",
+            "username": "valarLip",
+            "email": "103567126+valarLip@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "60f1e1b41f976696921d64b1273915e7fa8c90aa",
+          "message": "ci: retry docker push, gate manual dashboard uploads, set ATOM_MOE_GU_ITLV on gpt-oss (#2143)\n\n* ci: retry docker push with a fresh login\n\nThe nightly release build intermittently fails at push time. Each push step\nalready re-authenticates immediately before it, because the ~1h build leaves\nthe initial token stale and the manifest PUT comes back \"unauthorized:\nauthentication required\". That covers the first image only: a step pushing two\nmulti-GB tags can outlive the fresh token between them, and a transient\nregistry 5xx or dropped connection is not covered at all.\n\nAdd .github/scripts/docker_push_retry.sh and route all 13 push call sites\nthrough it. It re-authenticates before each retry rather than only sleeping,\nsince an expired token is the dominant failure and a bare retry reproduces it.\nThree attempts, backoff 15s doubling. Credentials arrive via stdin, never argv,\nmatching .github/actions/docker-auth.\n\nTwo properties worth stating, both exercised against a fake engine:\n- the happy path costs nothing extra (one push, zero logins);\n- with no credentials reachable it fails immediately with the reason named,\n  rather than burning the remaining attempts on the same auth error.\n\nThe per-step re-login is kept, so the first attempt still starts with a fresh\ntoken and the script only adds work when something actually fails.\n\nIn the native release step, `latest` and the nightly tag are now tagged\ntogether and pushed in one call. Previously the second push sat after the\nfirst multi-GB upload -- exactly where the token is most likely to have\nexpired -- with no retry behind it.\n\n* ci: default manual runs to not publishing dashboard data\n\nA hand-triggered run is usually a one-off experiment, and its numbers landing\nin the scheduled series read as a regression later. Manual runs should opt in.\n\nSix of the nine dashboard workflows already implement this and are untouched:\natom-test and atomesh-accuracy-validation gate on `push || schedule`, and\natomesh-benchmark, atomesh-mocker-benchmark, atom-vllm-accuracy-validation and\natom-sglang-accuracy-validation each already carry a dispatch input defaulting\nto false. Only three needed a change:\n\n- atom-vllm-benchmark, atom-sglang-benchmark: publish_to_dashboard and\n  upload_to_custom_dashboard flipped from default true to false. The\n  `schedule` branch sets both unconditionally, so only manual runs move.\n- atom-benchmark: had no gate at all. Adds the same input plus a\n  PUBLISH_DASHBOARD job env consumed by the five dashboard steps. Per-step\n  rather than a job-level `if` because the summary steps share that job and\n  must keep running.\n\nVerified with a script that parses every workflow and reports the gating input\nand its default: all nine now answer \"no upload\" for a bare manual run, and no\nnon-dispatch trigger changes behaviour.\n\nThe gate is spelled three ways across the repo already -- publish_to_dashboard,\npublish_dashboard, upload_accuracy_to_dashboard. This follows the majority for\nthe one new input; unifying the other five is a separate change.\n\n* ci: set ATOM_MOE_GU_ITLV=1 on the gpt-oss accuracy entries\n\nBoth gpt-oss-120b entries were the only MoE accuracy entries without it; the\nDeepSeek-V4-Pro family has carried it since it was introduced.\n\nMeasured on 8xMI355X, tp1, the same client_command this entry uses\n(chat-completions, 3-shot, conc 65, max_gen_toks 2048), GSM8K flexible-extract:\n\n  with    ATOM_MOE_GU_ITLV=1   0.9022 +/- 0.0082\n  without                      0.8825 +/- 0.0089\n\nso the pr-level entry moves from 0.0125 above its 0.87 threshold to 0.0322.\nn=1 per arm, and this repo has seen 1.6pp of run-to-run spread on an unchanged\ntree, so treat +1.97pp as \"no regression, likely a gain\" rather than a\nmeasurement. strict-match moves the other way (0.3450 -> 0.2153), which is the\nknown gpt-oss chat-format artifact -- flexible is the number this entry gates on.\n\nThe 2-GPU entry is unverified locally: that config faults on this box with or\nwithout the variable (Memory access fault, both arms), which is an environment\nproblem unrelated to this change. It is test_level main, so CI will be the\nfirst real signal.\n\n* ci: reserve publish_to_dashboard in the benchmark matrix builder\n\nThe new atom-benchmark dispatch input is not a model checkbox, but\n`build_benchmark_matrix.py` derives the model set as \"every input not in\nRESERVED_INPUTS\". Left out, `validate_dispatch_inputs` reports it as an extra\ncheckbox and every manual atom-benchmark run fails while building the matrix --\nso this is a runtime break, not only a red test.\n\nCaught by test_workflow_dispatch_inputs_match_catalog, which asserts the\ndispatch toggles equal the catalog prefixes. Single consumer: atom-benchmark is\nthe only workflow that runs the matrix builder, and nothing else enumerates\ndispatch inputs.",
+          "timestamp": "2026-09-04T23:47:40Z",
+          "url": "https://github.com/ROCm/ATOM/commit/60f1e1b41f976696921d64b1273915e7fa8c90aa"
+        },
+        "date": 1788627617476,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9477,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33977312390 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202609051454 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9401 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
+            "value": 0.9553,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33977312390 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609051454 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9553 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP MTP acceptance (%)",
+            "value": 65.94,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33977312390 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609051454 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9553 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
+            "value": 2.98,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8946,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33977312390 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609051454 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1683 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
