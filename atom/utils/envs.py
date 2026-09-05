@@ -421,18 +421,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM": lambda: (
         os.getenv("ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM", "0") == "1"
     ),
-    # --- MXFP8 MoE experts: dequantize to bf16 at load (accuracy) ---
-    # gfx950 has no high-accuracy 1x32 mxfp8 MoE kernel: the aiter per_1x32
-    # fused-MoE path runs fp8 weights AND fp8-quantized activations, which costs
-    # ~3 gsm8k points on MiniMax-M3 (the experts are the bulk of the model, while
-    # the small dense linears already fall back to bf16 in linear.py). When set,
-    # dequantize the fp8 expert weights + [1,32] e8m0 block scale to bf16 once at
-    # load and run the plain bf16 (QuantType.No) fused-MoE kernel. ~2x expert
-    # memory. Default "1" (enabled) — this is the correct/highest-accuracy path
-    # for MXFP8 on gfx950.
-    "ATOM_MXFP8_MOE_DEQUANT_BF16": lambda: (
-        os.getenv("ATOM_MXFP8_MOE_DEQUANT_BF16", "1") == "1"
-    ),
     # --- V4 Attention Backend Refactor (PR-A: kill .item(), unlock CUDAGraph) ---
     # `legacy` (default) keeps the per-seq Python dispatch loop with .item()
     # syncs in deepseek_v4.py. `new` routes through V4AttentionBackend with

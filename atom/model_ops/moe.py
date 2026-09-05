@@ -2390,22 +2390,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         else:
             self._process_tensor_quant(layer)
 
-    @staticmethod
-    def _dequant_1x32_to_bf16(
-        w_fp8: torch.Tensor, scale: torch.Tensor
-    ) -> torch.Tensor:
-        """Dequantize a [E, N, K] fp8 expert weight with a [E, N, K/32] e8m0
-        block scale to bf16. Element w[e,i,j] is scaled by scale[e,i,j//32]
-        (block along K), matching the dense-linear fallback in linear.py."""
-        E, N, K = w_fp8.shape
-        w = w_fp8.to(torch.float32)
-        sc = scale
-        if sc.dtype != torch.float8_e8m0fnu:
-            sc = sc.view(torch.float8_e8m0fnu)
-        sc = sc.to(torch.float32).reshape(E, N, -1)
-        sc = sc.repeat_interleave(K // sc.shape[-1], dim=-1)[..., :K]
-        return (w * sc).to(torch.bfloat16)
-
     def _process_block_quant(self, layer: nn.Module) -> None:
         assert self.quant_config.is_dynamic
         self._normalize_weights_and_scales(layer)
@@ -2417,39 +2401,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight_scale = atom_parameter(layer.w2_weight_scale.data)
 
         if self.quant_type == QuantType.per_1x32:
-            if envs.ATOM_MXFP8_MOE_DEQUANT_BF16:
-                # gfx950 high-accuracy fallback: the aiter per_1x32 fused-MoE
-                # kernel runs fp8 weights AND fp8-quantized activations, costing
-                # ~3 gsm8k points on MiniMax-M3 (experts dominate the params,
-                # while dense linears already fall back to bf16 in linear.py).
-                # Dequantize the fp8 expert weights + [1,32] e8m0 block scale to
-                # bf16 once here and run the plain bf16 (QuantType.No) MoE kernel.
-                # Mirrors linear.py's MXFP8 dense-linear bf16 fallback. ~2x
-                # expert memory, correct + highest accuracy on gfx950.
-                layer.w13_weight = atom_parameter(
-                    self._dequant_1x32_to_bf16(
-                        layer.w13_weight.data, layer.w13_weight_scale.data
-                    )
-                )
-                layer.w2_weight = atom_parameter(
-                    self._dequant_1x32_to_bf16(
-                        layer.w2_weight.data, layer.w2_weight_scale.data
-                    )
-                )
-                shuffle_weights(layer.w13_weight, layer.w2_weight)
-                # bf16 (QuantType.No) path ignores weight/input scales; drop them
-                # so apply() forwards None and picks the SEPARATED gate layout.
-                layer.w13_weight_scale = None
-                layer.w2_weight_scale = None
-                layer.w13_input_scale = None
-                layer.w2_input_scale = None
-                self.quant_type = QuantType.No
-                return
-            # aiter's MXFP8 MoE kernels consume the same gate/up interleaved
-            # layout used by their 1x32 shuffle helpers. Keep this branch
-            # isolated so the existing 1x128 FP8 path still uses shuffle_weights.
-            # moe_shuffle_weight mirrors moe_shuffle_scale: arch-aware GUGU
-            # handling (row interleave + WMMA tile shuffle on gfx1250).
+            # MXFP8 experts run natively: aiter's per_1x32 fused-MoE kernels
+            # (flydsl_moe1/moe2_afp8_wfp8_bf16, tuned for MiniMax-M3 on gfx950)
+            # consume fp8 weights + fp8-quantized activations directly, so the
+            # fp8 weights are kept as-is. This mirrors aiter's 1x32 shuffle
+            # helpers, whose gate/up interleaved layout these kernels expect.
+            # Keep this branch isolated so the existing 1x128 FP8 path still
+            # uses shuffle_weights. moe_shuffle_weight mirrors moe_shuffle_scale:
+            # arch-aware GUGU handling (row interleave + WMMA tile shuffle on
+            # gfx1250).
             layer.w13_weight.data = moe_shuffle_weight(
                 layer.w13_weight,
                 experts_cnt=self.num_experts,
