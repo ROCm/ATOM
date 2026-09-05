@@ -1,0 +1,417 @@
+name: vLLM Benchmark
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+on:
+  schedule:
+    # Weekly on Sunday at 03:00 Beijing time (19:00 UTC Saturday)
+    - cron: '0 19 * * 6'
+  workflow_dispatch:
+    inputs:
+      deepseek-r1-0528:
+        description: "Benchmark DeepSeek-R1-0528"
+        type: boolean
+        default: true
+      glm-5-fp8:
+        description: "Benchmark GLM-5-FP8"
+        type: boolean
+        default: true
+      kimi-k2-thinking-mxfp4:
+        description: "Benchmark Kimi-K2-Thinking-MXFP4"
+        type: boolean
+        default: true
+      image:
+        description: "OOT vLLM image to use"
+        type: string
+        default: ""
+      vllm_commit:
+        description: "vLLM commit hash (leave empty for default)"
+        type: string
+        default: ""
+      param_lists:
+        description: |
+          "Benchmark parameter lists.
+          Format: input_length,output_length,concurrency,random_range_ratio
+          Multiple sets separated by semicolons.
+          Example: 1024,1024,128,0.8;8192,1024,64,0.8"
+        type: string
+        default: "1024,1024,128,0.8"
+
+env:
+  ATOM_BASE_NIGHTLY_IMAGE: rocm/atom-dev:latest
+  DEFAULT_VLLM_COMMIT: b31e9326a7d9394aab8c767f8ebe225c65594b60
+  DEFAULT_VLLM_VERSION: "0.17"
+
+jobs:
+  parse-param-lists:
+    name: Parse parameter lists
+    runs-on: ubuntu-latest
+    outputs:
+      matrix_json: ${{ steps.parse.outputs.matrix_json }}
+    env:
+      NIGHTLY_PARAM_LISTS: "1024,1024,1,0.8;1024,1024,8,0.8;1024,1024,32,0.8;1024,1024,128,0.8;1024,8192,1,0.8;1024,8192,8,0.8;1024,8192,32,0.8;8192,1024,1,0.8;8192,1024,8,0.8;8192,1024,32,0.8;8192,1024,128,0.8"
+    steps:
+      - name: Parse parameter lists
+        id: parse
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            PARAM_LISTS="${{ env.NIGHTLY_PARAM_LISTS }}"
+            echo "Using weekly nightly param lists"
+          else
+            PARAM_LISTS="${{ inputs.param_lists || '1024,1024,128,0.8' }}"
+            echo "Using param_lists: ${PARAM_LISTS}"
+          fi
+          IFS=';' read -ra SETS <<< "${PARAM_LISTS}"
+          MATRIX_JSON="["
+          SEP=""
+          for SET in "${SETS[@]}"; do
+            IFS=',' read -ra PARAMS <<< "$SET"
+            MATRIX_JSON="${MATRIX_JSON}${SEP}{\"input_length\":${PARAMS[0]},\"output_length\":${PARAMS[1]},\"concurrency\":${PARAMS[2]},\"random_range_ratio\":${PARAMS[3]}}"
+            SEP=","
+          done
+          MATRIX_JSON="${MATRIX_JSON}]"
+          echo "matrix_json=${MATRIX_JSON}" >> $GITHUB_OUTPUT
+
+  load-models:
+    name: Load vLLM model configs
+    runs-on: ubuntu-latest
+    outputs:
+      models_json: ${{ steps.load.outputs.models_json }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: load
+        run: echo "models_json=$(jq -c . .github/benchmark/vllm-models.json)" >> $GITHUB_OUTPUT
+
+  build-oot-image:
+    name: Build OOT vLLM image
+    runs-on: atom-mi355-8gpu.predownload
+    outputs:
+      image_tag: ${{ steps.build.outputs.image_tag }}
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Build OOT vLLM image
+        id: build
+        run: |
+          VLLM_COMMIT="${{ inputs.vllm_commit || env.DEFAULT_VLLM_COMMIT }}"
+          IMAGE_TAG="atom_vllm_bench:${{ github.sha }}"
+
+          if [ -n "${{ inputs.image }}" ]; then
+            echo "Using pre-built image: ${{ inputs.image }}"
+            echo "image_tag=${{ inputs.image }}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Build base image with latest AITER + ATOM
+          cat <<EOF > Dockerfile.bench
+          FROM ${{ env.ATOM_BASE_NIGHTLY_IMAGE }}
+          RUN pip install hf_transfer
+          RUN pip uninstall -y amd-aiter
+          RUN pip install --upgrade "pybind11>=3.0.1"
+          RUN rm -rf /app/aiter-bench
+          RUN git clone --depth 1 https://github.com/ROCm/aiter.git /app/aiter-bench && \
+              cd /app/aiter-bench && \
+              git submodule sync && git submodule update --init --recursive && \
+              MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 python3 setup.py develop
+          RUN pip uninstall -y atom
+          RUN rm -rf /app/ATOM
+          COPY . /app/ATOM
+          RUN cd /app/ATOM && pip install -e .
+          EOF
+
+          docker build --pull --network=host --no-cache \
+            -t atom_oot_base_bench:ci \
+            -f Dockerfile.bench .
+
+          docker build --network=host --no-cache \
+            -t "${IMAGE_TAG}" \
+            --target atom_oot \
+            --build-arg OOT_BASE_IMAGE="atom_oot_base_bench:ci" \
+            --build-arg MAX_JOBS=64 \
+            --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
+            --build-arg INSTALL_FASTSAFETENSORS=1 \
+            -f docker/Dockerfile .
+
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Clean up build images
+        if: always()
+        run: |
+          docker rmi atom_oot_base_bench:ci 2>/dev/null || true
+
+  benchmark:
+    name: ${{ matrix.model.display }} (isl=${{ matrix.config.input_length }} osl=${{ matrix.config.output_length }} c=${{ matrix.config.concurrency }})
+    needs: [parse-param-lists, load-models, build-oot-image]
+    if: always() && needs.parse-param-lists.result == 'success' && needs.load-models.result == 'success' && needs.build-oot-image.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        config: ${{ fromJson(needs.parse-param-lists.outputs.matrix_json) }}
+        model: ${{ fromJson(needs.load-models.outputs.models_json) }}
+    runs-on: ${{ matrix.model.runner }}
+
+    env:
+      MODEL_PATH: ${{ matrix.model.path }}
+      ARGS: ${{ matrix.model.args }}
+      ISL: ${{ matrix.config.input_length }}
+      OSL: ${{ matrix.config.output_length }}
+      CONC: ${{ matrix.config.concurrency }}
+      RANDOM_RANGE_RATIO: ${{ matrix.config.random_range_ratio }}
+      RESULT_FILENAME: vllm-${{ matrix.model.prefix }}${{ matrix.model.suffix }}-${{ matrix.config.input_length }}-${{ matrix.config.output_length }}-${{ matrix.config.concurrency }}-${{ matrix.config.random_range_ratio }}
+      IMAGE_TAG: ${{ needs.build-oot-image.outputs.image_tag }}
+
+    steps:
+      - name: Check if model is enabled
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "enabled=true" >> $GITHUB_OUTPUT
+          else
+            case "${{ matrix.model.prefix }}" in
+              deepseek-r1-0528) echo "enabled=${{ inputs.deepseek-r1-0528 }}" >> $GITHUB_OUTPUT ;;
+              glm-5-fp8) echo "enabled=${{ inputs.glm-5-fp8 }}" >> $GITHUB_OUTPUT ;;
+              kimi-k2-thinking-mxfp4) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4 }}" >> $GITHUB_OUTPUT ;;
+              *) echo "enabled=true" >> $GITHUB_OUTPUT ;;
+            esac
+          fi
+
+      - name: Kill all Docker containers
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          containers=$(docker ps -q)
+          if [ -n "$containers" ]; then docker kill $containers || true; fi
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "find /workspace -mindepth 1 -delete" || true
+
+      - name: Checkout ATOM repo
+        if: steps.check.outputs.enabled == 'true'
+        uses: actions/checkout@v6
+
+      - name: Start vLLM benchmark container
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo "--device /dev/dri")
+          MODEL_MOUNT=""
+          [ -d "/models" ] && MODEL_MOUNT="-v /models:/models"
+
+          ENV_FLAGS=""
+          if [ -n "${{ matrix.model.env_vars }}" ]; then
+            for ev in ${{ matrix.model.env_vars }}; do ENV_FLAGS="$ENV_FLAGS -e $ev"; done
+          fi
+
+          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+            -v "${GITHUB_WORKSPACE:-$PWD}":/workspace $MODEL_MOUNT \
+            -w /workspace --ipc=host --group-add video \
+            --shm-size=16G --privileged --cap-add=SYS_PTRACE \
+            -e HF_TOKEN="${HF_TOKEN:-}" \
+            --security-opt seccomp=unconfined \
+            --ulimit memlock=-1 --ulimit stack=67108864 \
+            $ENV_FLAGS \
+            --name vllm-benchmark \
+            "${IMAGE_TAG}"
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Download models
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          if [ -d "/models" ]; then
+            docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} vllm-benchmark bash -lc \
+              "hf download ${{ env.MODEL_PATH }} --local-dir /models/${{ env.MODEL_PATH }}" || exit 1
+          fi
+
+      - name: Run vLLM benchmark
+        if: steps.check.outputs.enabled == 'true'
+        timeout-minutes: 90
+        run: |
+          set -euo pipefail
+          if [ -d "/models" ]; then model_path="/models/${{ env.MODEL_PATH }}"
+          else model_path="${{ env.MODEL_PATH }}"; fi
+
+          # Start vLLM server with ATOM OOT plugin
+          docker exec vllm-benchmark bash -lc "set -euo pipefail
+            echo '========== Starting vLLM server =========='
+            AITER_LOG_LEVEL=WARNING nohup vllm serve $model_path ${{ env.ARGS }} \
+              --port 8000 --disable-log-requests > /tmp/vllm_server.log 2>&1 &
+            echo \$! > /tmp/vllm_server.pid
+
+            # Wait for server to be ready
+            echo 'Waiting for vLLM server to start...'
+            for i in \$(seq 1 120); do
+              if curl -s http://localhost:8000/health > /dev/null 2>&1; then
+                echo 'vLLM server is ready after '\$i' seconds'
+                break
+              fi
+              if [ \$i -eq 120 ]; then
+                echo 'ERROR: vLLM server failed to start within 120s'
+                cat /tmp/vllm_server.log
+                exit 1
+              fi
+              sleep 1
+            done
+
+            echo '========== Running benchmark =========='
+            python -m atom.benchmarks.benchmark_serving \
+              --backend vllm \
+              --base-url http://localhost:8000 \
+              --model $model_path \
+              --dataset-name random \
+              --random-input-len ${{ env.ISL }} \
+              --random-output-len ${{ env.OSL }} \
+              --random-range-ratio ${{ env.RANDOM_RANGE_RATIO }} \
+              --max-concurrency ${{ env.CONC }} \
+              --num-prompts \$(( ${{ env.CONC }} * 10 )) \
+              --save-result \
+              --result-filename ${{ env.RESULT_FILENAME }}.json \
+              ${{ matrix.model.bench_args }}
+
+            # Stop server
+            kill \$(cat /tmp/vllm_server.pid) 2>/dev/null || true
+          "
+
+          # Copy result out of container
+          docker cp vllm-benchmark:/workspace/${{ env.RESULT_FILENAME }}.json ./ 2>/dev/null || \
+            docker cp vllm-benchmark:/app/${{ env.RESULT_FILENAME }}.json ./ 2>/dev/null || true
+
+      - name: Upload benchmark result
+        if: steps.check.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.RESULT_FILENAME }}
+          path: ${{ env.RESULT_FILENAME }}.json
+
+      - name: Clean Up
+        if: always() && steps.check.outputs.enabled == 'true'
+        run: |
+          docker stop vllm-benchmark || true
+          docker rm vllm-benchmark || true
+
+  summarize-and-deploy:
+    if: always()
+    name: Summarize & deploy dashboard
+    needs: [benchmark]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Download all benchmark results
+        uses: actions/download-artifact@v8
+        with:
+          pattern: 'vllm-*'
+          merge-multiple: true
+          path: .
+
+      - name: List benchmark results
+        run: |
+          echo "=== vLLM benchmark results ==="
+          ls -la vllm-*.json 2>/dev/null || echo "No vLLM result JSON files found"
+
+      - name: Transform results for benchmark dashboard
+        run: |
+          python3 -c "
+          import json, glob
+          run_url = f'https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+          entries = []
+          for f in sorted(glob.glob('vllm-*.json')):
+              try:
+                  d = json.load(open(f))
+              except (json.JSONDecodeError, OSError):
+                  continue
+              if 'output_throughput' not in d:
+                  continue
+              model = d.get('model_id', '').split('/')[-1]
+              isl = d.get('random_input_len', 0)
+              osl = d.get('random_output_len', 0)
+              conc = d.get('max_concurrency', 0)
+              label = f'{model} {isl}/{osl} c={conc}'
+              extra = f'Run: {run_url}'
+              entries.append({'name': f'{label} throughput (tok/s)', 'unit': 'tok/s',
+                              'value': round(d['output_throughput'], 2), 'extra': extra})
+              entries.append({'name': f'{label} Total Tput (tok/s)', 'unit': 'tok/s',
+                              'value': round(d.get('total_token_throughput', 0), 2), 'extra': extra})
+              entries.append({'name': f'{label} TTFT (ms)', 'unit': 'ms',
+                              'value': round(d.get('mean_ttft_ms', 0), 2), 'extra': extra})
+              entries.append({'name': f'{label} TPOT (ms)', 'unit': 'ms',
+                              'value': round(d.get('mean_tpot_ms', 0), 2), 'extra': extra})
+              tp = d.get('tensor_parallel_size', 1)
+              entries.append({'name': f'{label} _gpu_count', 'unit': '',
+                              'value': int(tp)})
+          json.dump(entries, open('vllm-benchmark-entries.json', 'w'), indent=2)
+          print(f'Generated {len(entries)} entries for vLLM benchmark dashboard')
+          "
+
+      - name: Deploy vLLM dashboard to gh-pages
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          CURRENT_SHA=$(git rev-parse HEAD)
+
+          # Save dashboard HTML before switching branches
+          cp .github/dashboard/vllm-index.html /tmp/vllm_dashboard_index.html
+          cp vllm-benchmark-entries.json /tmp/vllm-benchmark-entries.json
+
+          # Switch to gh-pages and merge new data
+          git fetch origin gh-pages
+          git checkout gh-pages
+
+          python3 << 'PYEOF'
+          import json, os, time
+
+          DATA_PATH = "vllm-benchmark-dashboard/data.js"
+          ENTRIES_PATH = "/tmp/vllm-benchmark-entries.json"
+          MAX_RUNS = 90
+
+          existing = {"lastUpdate": 0, "repoUrl": "https://github.com/vllm-project/vllm", "entries": {"Benchmark": []}}
+          if os.path.exists(DATA_PATH):
+              with open(DATA_PATH) as f:
+                  content = f.read()
+              json_str = content.replace("window.BENCHMARK_DATA = ", "", 1).rstrip().rstrip(";")
+              existing = json.loads(json_str)
+
+          with open(ENTRIES_PATH) as f:
+              new_entries = json.load(f)
+
+          if not new_entries:
+              print("No new entries to add, skipping")
+              import sys; sys.exit(0)
+
+          sha = os.environ.get("GITHUB_SHA", "unknown")
+          actor = os.environ.get("GITHUB_ACTOR", "github-actions[bot]")
+          run_id = os.environ.get("GITHUB_RUN_ID", "0")
+          new_run = {
+              "commit": {
+                  "author":    {"name": actor, "username": actor, "email": f"{actor}@users.noreply.github.com"},
+                  "committer": {"name": actor, "username": actor, "email": f"{actor}@users.noreply.github.com"},
+                  "id": sha,
+                  "message": f"vLLM benchmark run {run_id}",
+                  "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                  "url": f"https://github.com/ROCm/ATOM/actions/runs/{run_id}"
+              },
+              "date": int(time.time() * 1000),
+              "tool": "customBiggerIsBetter",
+              "benches": new_entries
+          }
+          existing["entries"]["Benchmark"].append(new_run)
+          existing["entries"]["Benchmark"] = existing["entries"]["Benchmark"][-MAX_RUNS:]
+          existing["lastUpdate"] = int(time.time() * 1000)
+          existing["repoUrl"] = "https://github.com/vllm-project/vllm"
+
+          os.makedirs(os.path.dirname(DATA_PATH) or ".", exist_ok=True)
+          with open(DATA_PATH, "w") as f:
+              f.write("window.BENCHMARK_DATA = " + json.dumps(existing, indent=2) + ";\n")
+          print(f"Updated data.js: {len(existing['entries']['Benchmark'])} runs, latest has {len(new_entries)} entries")
+          PYEOF
+
+          cp /tmp/vllm_dashboard_index.html vllm-benchmark-dashboard/index.html
+          git add vllm-benchmark-dashboard/
+          git diff --cached --quiet || git commit -m "Update vLLM benchmark data and dashboard"
+          git push origin gh-pages
+          git checkout "$CURRENT_SHA"
