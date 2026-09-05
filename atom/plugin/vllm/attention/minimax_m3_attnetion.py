@@ -65,6 +65,40 @@ def minimax_m3_sparse_attention(
     return layer._forward_with_output(qkv, positions, output)
 
 
+def _index_cache_torch_dtype(kv_cache_dtype: str, model_config) -> torch.dtype:
+    """Torch dtype for the MiniMax-M3 index cache.
+
+    Everything except fp8 is vLLM's own mapping. fp8 is the exception, and it
+    belongs here rather than in ``kv_cache_dtype_str_to_dtype``: that table is
+    vLLM's, it is shared by every layer of every model, and its ``fp8 ->
+    torch.uint8`` entry is deliberate -- vLLM's kernels take an fp8 KV cache as
+    a byte buffer and reinterpret it, and so do the aiter paged kernels behind
+    ATOM's main sparse and dense caches (see
+    ``_page16_shuffle_cache_for_sparse_kernel``, which does the ``.view()``
+    itself). Relabelling fp8 globally would change those caches too.
+
+    The index cache is read by a kernel that dispatches on the tensor instead:
+    ``_index_block_score_kernel`` branches on ``k.dtype.is_fp8()``, so a
+    uint8-labelled cache goes down the bf16 branch and dots bf16 against uint8
+    (a Triton compile error on the first request). The bytes there are already
+    fp8 -- aiter's ``fused_qknorm_idxrqknorm`` writes them under
+    ``kv_cache_dtype="fp8"`` -- so only the label was wrong. ``dtypes.d_dtypes``
+    is the same handle the native server resolves this cache through
+    (``atom.model_ops.attentions.aiter_attention._resolve_index_cache_dtype``),
+    which keeps the two paths on one arch-correct fp8 dtype instead of a
+    hard-coded ``torch.float8_e4m3fn``.
+
+    The element stays one byte either way, so vLLM's page-size accounting is
+    unchanged, and vLLM already allows a real fp8 dtype in this position -- its
+    own ``fp8_inc`` entry maps to ``torch.float8_e4m3fn``.
+    """
+    from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+
+    if str(kv_cache_dtype).startswith("fp8"):
+        return dtypes.d_dtypes["fp8"]
+    return kv_cache_dtype_str_to_dtype(kv_cache_dtype, model_config)
+
+
 class MiniMaxM3SparseIndexerCache(nn.Module, AttentionLayerBase):
     """Key-only index cache owned by MiniMax-M3 sparse attention."""
 
@@ -76,7 +110,6 @@ class MiniMaxM3SparseIndexerCache(nn.Module, AttentionLayerBase):
         kv_cache_dtype: str,
     ) -> None:
         from vllm.v1.attention.backend import AttentionType
-        from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 
         super().__init__()
         atom_config = get_current_atom_config()
@@ -86,7 +119,7 @@ class MiniMaxM3SparseIndexerCache(nn.Module, AttentionLayerBase):
         self.attn_type = AttentionType.DECODER
         self.attn_backend = SparseMHAIndexerBackend
         self.kv_cache_dtype = kv_cache_dtype
-        self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
+        self.kv_cache_torch_dtype = _index_cache_torch_dtype(
             kv_cache_dtype, vllm_config.model_config
         )
         self.num_kv_heads = 1
