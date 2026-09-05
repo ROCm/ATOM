@@ -1465,12 +1465,17 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         if self.calculate_kv_scales:
             self.calc_kv_scales(q, kv_c_normed, k_pe)
-        output = torch.ops.aiter.atom_vllm_mla_attention(
+        output = torch.empty(
+            (q.shape[0], self.num_heads * self.v_head_dim),
+            dtype=q.dtype,
+            device=q.device,
+        )
+        torch.ops.aiter.atom_vllm_mla_attention(
             q,
             kv_c_normed,
             k_pe,
             self.layer_name,
-            self.num_heads * self.v_head_dim,
+            output,
         )
         return self.o_proj(output)
 
