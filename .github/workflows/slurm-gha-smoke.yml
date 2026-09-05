@@ -1,0 +1,35 @@
+name: Slurm GHA Smoke
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Slurm GPU runner smoke
+    runs-on: [self-hosted, spur-runner-mi355x-1gpu]
+    timeout-minutes: 10
+    steps:
+      - name: Show runtime context
+        run: |
+          hostname
+          date -u
+          echo "RUNNER_NAME=${RUNNER_NAME:-}"
+          echo "RUNNER_OS=${RUNNER_OS:-}"
+          echo "HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-}"
+          echo "ROCR_VISIBLE_DEVICES=${ROCR_VISIBLE_DEVICES:-}"
+          echo "GITHUB_REPOSITORY=${GITHUB_REPOSITORY:-}"
+          echo "GITHUB_RUN_ID=${GITHUB_RUN_ID:-}"
+          echo "GITHUB_WORKFLOW=${GITHUB_WORKFLOW:-}"
+          env | sort | grep -E '^(RUNNER_|SLURM_)' || true
+          rocm-smi || true
