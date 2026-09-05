@@ -735,7 +735,25 @@ jobs:
               echo "WARNING: RDMA target ${pid} did not exit after TERM; sending KILL" >&2
               kill -KILL "${pid}" 2>/dev/null || true
             fi
-            wait "${pid}" 2>/dev/null || true
+
+            # wait is a shell builtin, so `timeout wait` cannot reap this child.
+            # Poll up to ~5s, then wait only if the process has exited or is a
+            # zombie. An uninterruptible D-state target would otherwise block
+            # the decode rank forever and stall the next GPU pair.
+            for ((attempt = 0; attempt < 25; attempt++)); do
+              if ! kill -0 "${pid}" 2>/dev/null; then
+                break
+              fi
+              state="$(awk '{ print $3 }' "/proc/${pid}/stat" 2>/dev/null || true)"
+              [[ "${state}" == "Z" ]] && break
+              sleep 0.2
+            done
+            state="$(awk '{ print $3 }' "/proc/${pid}/stat" 2>/dev/null || true)"
+            if ! kill -0 "${pid}" 2>/dev/null || [[ "${state}" == "Z" ]]; then
+              wait "${pid}" 2>/dev/null || true
+            else
+              echo "WARNING: RDMA target ${pid} still present after KILL; skipping wait" >&2
+            fi
             target_pid=""
           }
 
