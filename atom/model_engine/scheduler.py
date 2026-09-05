@@ -26,6 +26,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Iterable
+from dataclasses import replace
 
 import numpy as np
 
@@ -34,6 +35,7 @@ from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.request import RequestOutput
+from atom.model_engine.persistent_decoder import decide_persistent_decode
 from atom.model_engine.sequence import (
     Sequence,
     SequenceStatus,
@@ -372,6 +374,7 @@ class ScheduledBatch:
                 # Clear after first use to avoid re-sending on decode steps
                 seq.multimodal_data = None
         self.external_request_ids = [seq.external_request_id for seq in seqs.values()]
+        self.persistent_plan = None
 
         # logger.info(f"{[el for el in scheduled_spec_decode_tokens.keys()]=}")
         # logger.info(f"{self.num_scheduled_tokens=}")
@@ -1718,6 +1721,28 @@ class Scheduler:
                 else None
             ),
         )
+        if self.config.persistent_decoder != "off" and scheduled_seqs:
+            decision = decide_persistent_decode(
+                mode=self.config.persistent_decoder,
+                seqs=scheduled_seqs.values(),
+                num_scheduled_tokens=num_scheduled_tokens,
+                has_queued_work=(
+                    bool(self.waiting)
+                    or len(self.running) > len(scheduled_seqs)
+                    or self._num_parked_remote_kv > 0
+                ),
+                use_spec=self.use_spec,
+                max_model_len=self.max_model_len,
+                eos_token_id=self.eos_token_id,
+                extra_eos_token_ids=self.stop_token_ids,
+            )
+            if decision.plan is not None:
+                seq = next(iter(scheduled_seqs.values()))
+                if self.block_manager.reserve_append(seq, decision.plan.max_tokens):
+                    decode_batch.persistent_plan = replace(
+                        decision.plan,
+                        block_table=tuple(int(block) for block in seq.block_table),
+                    )
         self._consume_state_forks(scheduled_seqs)
         return (decode_batch, scheduled_seqs)
 

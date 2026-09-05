@@ -1587,6 +1587,10 @@ class Config:
     kv_cache_block_size: int = 16
     num_kvcache_blocks: int = -1
     kv_cache_dtype: str = "bf16"
+    # AITER GPT-OSS persistent decoder. This is strict opt-in while the
+    # provider is limited to TP1/gfx950/batch-one decode.
+    persistent_decoder: str = "off"  # off | auto | required
+    persistent_decoder_checkpoint: str | None = None
     index_cache_dtype: str | None = None
     enable_prefix_caching: bool = True
     enable_chunked_prefill: bool = True
@@ -1747,6 +1751,39 @@ class Config:
             self.dcp_config = DCPConfig(**self.dcp_config.__dict__)
         else:
             raise TypeError("dcp_config must be DCPConfig or dict")
+
+        if self.persistent_decoder not in ("off", "auto", "required"):
+            raise ValueError("persistent_decoder must be off, auto, or required")
+        if self.persistent_decoder != "off":
+            if not self.persistent_decoder_checkpoint:
+                raise ValueError(
+                    "persistent_decoder_checkpoint is required when persistent decode is enabled"
+                )
+            if self.kv_cache_dtype != "bf16":
+                raise ValueError("persistent decode currently requires BF16 KV cache")
+            if self.tensor_parallel_size != 1 or self.pipeline_parallel_size != 1:
+                raise ValueError("persistent decode currently requires TP1/PP1")
+            if self.prefill_context_parallel_size != 1:
+                raise ValueError("persistent decode currently requires PCP1")
+            if self.decode_context_parallel_size != 1:
+                raise ValueError("persistent decode currently requires DCP1")
+            if self.enable_expert_parallel or self.enable_dp_attention:
+                raise ValueError(
+                    "persistent decode does not support EP or DP attention"
+                )
+            if self.speculative_config is not None:
+                raise ValueError(
+                    "persistent decode does not support speculative decoding"
+                )
+            kv_transfer_enabled = self.kv_transfer_config not in ({}, None, "", "{}")
+            if self.enable_tbo or self.enable_rapidserve or kv_transfer_enabled:
+                raise ValueError(
+                    "persistent decode does not support TBO, RapidServe, or KV transfer"
+                )
+            if self.enable_prefix_caching or self.enable_chunked_prefill:
+                raise ValueError(
+                    "persistent decode v1 requires prefix caching and chunked prefill disabled"
+                )
         # assert os.path.isdir(self.model)
 
         # The forced-acceptance schedule spends its whole budget on the first
@@ -1860,6 +1897,20 @@ class Config:
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
         )
+        if self.persistent_decoder != "off":
+            architectures = tuple(getattr(self.hf_config, "architectures", ()) or ())
+            if "GptOssForCausalLM" not in architectures:
+                raise ValueError(
+                    "persistent decode currently supports GptOssForCausalLM only"
+                )
+            if int(getattr(self.hf_config, "num_hidden_layers", -1)) != 36:
+                raise ValueError(
+                    "persistent decode requires the 36-layer GPT-OSS model"
+                )
+            if int(getattr(self.hf_config, "num_key_value_heads", -1)) != 8:
+                raise ValueError("persistent decode requires 8 GPT-OSS KV heads")
+            if int(getattr(self.hf_config, "head_dim", -1)) != 64:
+                raise ValueError("persistent decode requires GPT-OSS head_dim=64")
         num_hidden_layers = getattr(self.hf_config, "num_hidden_layers", None)
         if num_hidden_layers is not None:
             assert num_hidden_layers >= self.pipeline_parallel_size, (

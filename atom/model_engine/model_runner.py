@@ -714,6 +714,11 @@ class ModelRunner:
             use_spec,
             self.num_spec_tokens,
         )
+        if self.config.persistent_decoder != "off":
+            # Ordinary and resident steps must share one synchronous token
+            # frontier; deferred output would surface a stale ordinary token
+            # after a persistent handoff.
+            self.tokenID_processor.is_deferred_out = False
         self.sampler = Sampler()
         self.arange_np = np.arange(
             max(
@@ -862,7 +867,15 @@ class ModelRunner:
         """Extra GPU bytes to hold back from the KV cache budget beyond the
         base overhead. Base runner reserves nothing; override point for
         setups that share the GPU with another process."""
-        return 0
+        if self.config.persistent_decoder == "off":
+            return 0
+        from aiter.MK1 import persistent_checkpoint_bytes
+
+        # AITER loads persistent weights only after KV allocation, so reserve
+        # their exact catalog footprint plus 2 GiB for staging and workspaces.
+        return persistent_checkpoint_bytes(
+            self.config.persistent_decoder_checkpoint
+        ) + (2 << 30)
 
     def is_deepseek_mla(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
@@ -2077,6 +2090,18 @@ class ModelRunner:
                     f"diff={diff_pct:.1%}"
                 )
 
+        if config.persistent_decoder != "off":
+            from atom.model_engine.persistent_decoder import AtomPersistentDecoder
+
+            try:
+                self.persistent_decoder = AtomPersistentDecoder(self)
+            except Exception:
+                if config.persistent_decoder == "required":
+                    raise
+                logger.exception(
+                    "Persistent decoder initialization failed; auto mode will use ATOM"
+                )
+
         # Skip on single-rank: a world_size==1 barrier is a no-op but still
         # forces lazy NCCL communicator creation (CUDA-allocs its buffers),
         # which can OOM/fail on single-card runs. The process group stays
@@ -3238,6 +3263,23 @@ class ModelRunner:
     @torch.inference_mode()
     @with_eplb_forward_monitor
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
+        plan = getattr(batch, "persistent_plan", None)
+        persistent = getattr(self, "persistent_decoder", None)
+        if plan is not None and persistent is not None and persistent.healthy:
+            emitted = persistent.run(plan)
+            zeros = np.zeros(1, dtype=np.int32)
+            return ScheduledBatchOutput(
+                req_ids=[plan.request_id],
+                token_ids=[emitted],
+                num_rejected=zeros,
+                num_bonus=zeros.copy(),
+                draft_token_ids=None,
+                is_deferred_out=False,
+            )
+        if plan is not None and persistent is not None and not persistent.healthy:
+            raise RuntimeError(
+                "persistent decoder is unhealthy after a backend execution failure"
+            )
         # Make this forward's staging buffers safe to overwrite before
         # prepare_inputs writes them: rotate to a free slot if there is a ring,
         # otherwise wait out the previous forward's copies.

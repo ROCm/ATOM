@@ -2559,6 +2559,25 @@ class BlockManager:
                 # correct hash here.  Just allocate the block without hashing.
                 block_table.append(self._fresh_block())
 
+    def reserve_append(self, seq: Sequence, num_new_tokens: int) -> bool:
+        """Reserve every page a multi-token resident quantum may write.
+
+        ``may_append`` intentionally follows the ordinary one-step scheduler.
+        A persistent quantum can advance several cache positions without
+        returning to the scheduler, so it needs an exact up-front reservation.
+        """
+
+        if num_new_tokens < 1:
+            return False
+        ebs = self._effective_block_size()
+        needed_blocks = (len(seq) + num_new_tokens + ebs - 1) // ebs
+        new_blocks = max(0, needed_blocks - len(seq.block_table))
+        if not self.kv.has_free(new_blocks):
+            return False
+        while len(seq.block_table) < needed_blocks:
+            seq.block_table.append(self._fresh_block())
+        return True
+
     # ---------------- KV event API ---------------- #
 
     def take_events(self) -> list[KVCacheEvent]:
