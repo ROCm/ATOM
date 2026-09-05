@@ -361,6 +361,10 @@ class FusedMoEConfig:
     def use_mori_kernels(self):
         return self.moe_parallel_config.use_mori_kernels
 
+    @property
+    def use_rccl_kernels(self):
+        return self.moe_parallel_config.use_rccl_kernels
+
 
 def moe_kernel_token_capacity(
     atom_config,

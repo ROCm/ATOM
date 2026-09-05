@@ -24,6 +24,18 @@
     "_baseline_note": "Full-eval (1319 samples) 3-shot flexible-extract = 0.9522 ± 0.0059"
   },
   {
+    "model_name": "DeepSeek-V4-Pro DEP RCCL",
+    "model_path": "deepseek-ai/DeepSeek-V4-Pro",
+    "extraArgs": "--kv_cache_dtype fp8 --index_cache_dtype fp4 -tp 8 --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}' --enable-dp-attention --enable-expert-parallel --all2all-backend rccl",
+    "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "pr",
+    "accuracy_threshold": 0.94,
+    "accuracy_baseline": 0.96,
+    "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
+    "_baseline_note": "PR #2110 regression coverage for DPA8 + EP8 using the native RCCL transport with EPLB disabled. Reuses the DeepSeek-V4-Pro 3-shot GSM8K baseline."
+  },
+  {
     "model_name": "DeepSeek-V4-Pro MTP",
     "model_path": "deepseek-ai/DeepSeek-V4-Pro",
     "extraArgs": "--kv_cache_dtype fp8 --index_cache_dtype fp4 -tp 8 --method mtp --num-speculative-tokens 3",

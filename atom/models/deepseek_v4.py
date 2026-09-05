@@ -4439,9 +4439,17 @@ class DeepseekV4ForCausalLM(nn.Module):
         # default [max_num_batched_tokens, hidden_size]. forward returns
         # the un-reduced mHC residual stack [N, hc, dim].
         self.extra_output_dims: tuple[int, ...] = (self.args.hc_mult,)
+        # Hash routing must see one token id for every MoE row. DPA gathers MoE
+        # rows when EP is disabled *and* when EP uses the collective fallback;
+        # only the mori all-to-all path keeps routing on rank-local rows.
+        uses_routed_all2all = any(
+            isinstance(module, MoE)
+            and module.experts.moe_parallel_config.use_all2all_kernels
+            for module in self.model.modules()
+        )
         self._need_ids_gather = (
             config.enable_dp_attention
-            and not config.enable_expert_parallel
+            and not uses_routed_all2all
             and self.args.n_hash_layers > 0
         )
 
@@ -4526,8 +4534,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                     full_padded_ids = pcp_allgather_rankmajor(input_ids, pcp_size)
 
         if self._need_ids_gather:
-            # DP-attention (no EP) hash routing: input_ids is local but the MoE
-            # gate sees DP-gathered gating_output, so gather ids to match. Run
+            # DP-attention collective fallback hash routing: input_ids is local
+            # but the MoE gate sees DP-gathered gating_output, so gather ids to
+            # match. This covers TP-style MoE and EP with mori disabled. Run
             # the gather INLINE on the compute stream. Running this all-gather on
             # a side stream coordinated it with a DIFFERENT stream/sync than the
             # MoE hidden/router DP gather under TBO → mismatched DP layouts →
