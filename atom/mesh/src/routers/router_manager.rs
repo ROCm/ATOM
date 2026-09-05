@@ -22,11 +22,10 @@ use crate::{
     core::{ConnectionMode, WorkerRegistry},
     protocols::{
         chat::ChatCompletionRequest,
-        completion::CompletionRequest,
         generate::GenerateRequest,
         responses::{ResponsesGetParams, ResponsesRequest},
     },
-    routers::RouterTrait,
+    routers::{completion_request::CompletionRequest, RouterTrait},
     server::ServerConfig,
 };
 
@@ -349,7 +348,7 @@ impl RouterTrait for RouterManager {
         } else {
             (
                 StatusCode::NOT_FOUND,
-                format!("Model '{}' not found or no router available", body.model),
+                format!("Model '{}' not found or no router available", body.model()),
             )
                 .into_response()
         }
