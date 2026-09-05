@@ -2055,6 +2055,9 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
 
             w13.data = shuffle_weight(w13.data)
             w2.data = shuffle_weight(w2.data)
+            # Tensor attributes do not survive assignment through Parameter.data.
+            w13.is_shuffled = True
+            w2.is_shuffled = True
 
         # Call parent class for any additional processing
         super().process_weights_after_loading(layer)
