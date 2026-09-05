@@ -30,6 +30,16 @@ on:
         type: string
         required: false
         default: ""
+      bench_kind:
+        description: "Benchmark client: random (benchmark_serving ISL/OSL sweep) or aiperf_agentic (AgentX trace replay)"
+        type: string
+        required: false
+        default: "random"
+      benchmark_duration:
+        description: "aiperf_agentic only: replay seconds. Under 900 forces --unsafe-override and stamps submission_valid=false."
+        type: string
+        required: false
+        default: ""
       env_vars:
         type: string
         required: false
@@ -152,7 +162,12 @@ jobs:
           echo "Docker: ${DOCKER_IMAGE}"
 
       - name: Run benchmark
-        timeout-minutes: 80
+        # A trace replay is an hour of profiling on top of model load, dataset
+        # configuration and a warmup that primes every lane -- 80 min killed a
+        # c=48 cell 3.5 min from the end. Kept ABOVE `atom_test.sh`'s drain
+        # budget (duration/60 + 90) so that supervisor wins the race and says
+        # why; this is only the backstop for a hang before it starts counting.
+        timeout-minutes: ${{ inputs.bench_kind == 'aiperf_agentic' && 180 || 80 }}
         env:
           EXTRA_LAUNCH_ARGS: ${{ inputs.extra_args }}
         run: |
@@ -166,8 +181,12 @@ jobs:
           # Substituting ${{ env.ARGS }} into a `bash -lc "..."` string instead
           # collides the JSON's double quotes with the outer quotes and strips
           # them (argparse: invalid loads value). Mirrors atom-test.yaml.
+          # BENCH_KIND + CONC reach `launch` too: an agentic run sizes
+          # --max-num-seqs off the cell's concurrency (AgentX counts session
+          # trees, and subagent fan-out needs the headroom).
           echo "ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
             ENABLE_RTL_PROFILER=${{ inputs.enable_rtl && '1' || '0' }} \
+            BENCH_KIND=${{ inputs.bench_kind }} CONC=$CONC \
             .github/scripts/atom_test.sh launch $model_path $ARGS $EXTRA_LAUNCH_ARGS" \
             | docker exec -i atom-benchmark bash -l
 
@@ -177,6 +196,9 @@ jobs:
             -e RESULT_FILENAME="${{ env.RESULT_FILENAME }}" \
             -e SERVER_ARGS="$ARGS" \
             -e BENCH_EXTRA_ARGS="${{ inputs.bench_args }}" \
+            -e BENCH_KIND="${{ inputs.bench_kind }}" \
+            -e CONC="$CONC" \
+            ${{ inputs.benchmark_duration != '' && format('-e AIPERF_BENCHMARK_DURATION={0}', inputs.benchmark_duration) || '' }} \
             -e MP="$model_path" \
             atom-benchmark bash -lc '.github/scripts/atom_test.sh benchmark "$MP"'
 
@@ -222,6 +244,7 @@ jobs:
         run: |
           docker exec -i \
             -e RESULT_PATH="${{ env.RESULT_FILENAME }}.json" \
+            -e BENCH_KIND="${{ inputs.bench_kind }}" \
             atom-benchmark python3 - <<'PY'
           import json, os, sys
 
@@ -229,15 +252,39 @@ jobs:
           with open(path, encoding="utf-8") as f:
               data = json.load(f)
 
-          num_prompts = int(data.get("num_prompts"))
-          completed = int(data.get("completed"))
-          if completed != num_prompts:
-              print(
-                  f"::error::Invalid benchmark result in {path}: completed requests "
-                  f"({completed}) did not match num_prompts ({num_prompts}).",
-                  file=sys.stderr,
-              )
+
+          def fail(msg):
+              print(f"::error::Invalid benchmark result in {path}: {msg}", file=sys.stderr)
               sys.exit(1)
+
+
+          if os.environ.get("BENCH_KIND") == "aiperf_agentic":
+              # A trace replay is bounded by wall clock, not by a prompt count, so
+              # there is no `num_prompts` to match `completed` against. AIPerf
+              # already fails the run itself when the failure rate crosses
+              # `--failed-request-threshold`; what it cannot catch is a run that
+              # was well-formed and simply measured nothing.
+              completed = data.get("successful_requests")
+              duration = data.get("benchmark_duration_s")
+              if not completed:
+                  fail(f"the replay completed no requests (successful_requests={completed!r})")
+              if not duration:
+                  fail(f"no benchmark duration recorded (benchmark_duration_s={duration!r})")
+              print(
+                  f"Validated agentic result {path}: {int(completed)} requests "
+                  f"over {float(duration):.0f}s."
+              )
+              sys.exit(0)
+
+          num_prompts = data.get("num_prompts")
+          completed = data.get("completed")
+          if num_prompts is None or completed is None:
+              fail(f"missing num_prompts/completed ({num_prompts!r}/{completed!r})")
+          if int(completed) != int(num_prompts):
+              fail(
+                  f"completed requests ({completed}) did not match "
+                  f"num_prompts ({num_prompts})"
+              )
 
           print(
               f"Validated benchmark result {path}: completed requests "

@@ -92,6 +92,7 @@ utilization, …) is passed verbatim through `extra_args`:
 | `extra_args` | config and/or variant | appended verbatim (server flags) |
 | `env_vars` | model and/or variant | newline-joined container env vars |
 | `bench_args` | variant | passed to the benchmark client (not the server) |
+| `bench_kind` | variant | which client runs it: `random` (default) or `aiperf_agentic` |
 | `conc_min` / `conc_max` | variant | concurrency band (filters scenarios) |
 | `scenarios` | variant or model | overrides `default_scenarios` |
 
@@ -99,6 +100,41 @@ Examples of `extra_args` content: `--method mtp --num-speculative-tokens 3`
 (MTP), `--enable-dp-attention` (DP-attention),
 `--hf-overrides '{...}'` (V4 sparse-attention index cache, set at `config`
 level so all variants share it).
+
+### Agentic variants (`bench_kind: aiperf_agentic`)
+
+`random` runs `benchmark_serving`'s ISL/OSL sweep. `aiperf_agentic` instead
+replays AgentX session traces through AIPerf's `inferencex-agentx-mvp`
+scenario, matching InferenceX's `benchmarks/single_node/agentic` recipe. The
+runner is [`../scripts/aiperf_agentic.sh`](../scripts/aiperf_agentic.sh), whose
+defaults ARE that recipe, so a variant only needs `bench_kind` plus its server
+flags. ATOMesh runs the same scenario for the PD topologies from its own copy in
+`atomesh/pd_server_atom.sh`; the two are deliberately not shared, and their
+defaults differ (dataset, failed-request threshold, max context length).
+
+The two kinds run in **separate workflows** because an agentic cell replays for
+a full hour where a random cell is minutes: `atom-benchmark.yaml` (nightly)
+selects `random`, `atom-agentic-benchmark.yaml` (weekly) selects
+`aiperf_agentic`, via the `BENCH_KIND_FILTER` env read by
+`build_benchmark_matrix.py`. Nothing else keeps them apart — adding an agentic
+variant without that field would put it in the nightly.
+
+`isl`/`osl` on an agentic variant are **labels only**: a trace replay has no
+fixed input or output length, but both are baked into the result-filename and
+dashboard contract (`catalog.scenario_tag`,
+`{prefix}{suffix}-{isl}-{osl}-{conc}-{ratio_str}`). They name the dataset's
+nominal context, not a value passed to the client -- the single-node recipe
+deliberately sets no `--max-context-length`, and `random_input_len` in the
+dashboard payload comes from AIPerf's own export. Same labelling convention as
+the ATOMesh agentic entries in `models_atomesh.yaml`.
+
+To override an AIPerf knob for one variant, put `AIPERF_*=...` in its
+`env_vars` (container env, which `docker exec` inherits) -- `extra_args` is
+server flags and never reaches the client.
+
+`--max-num-seqs` is set by the driver, not the catalog: AgentX concurrency
+counts session trees rather than in-flight requests, so the scheduler is sized
+at twice the cell's concurrency (`atom_test.sh`, launch branch).
 
 Concurrency bands replace the old hard-coded matrix `exclude` block: out-of-band
 `(variant, concurrency)` combos are never emitted, so **no GPU runner is
