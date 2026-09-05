@@ -79,6 +79,7 @@ def _make_backend(
 
 def test_static_decode_gathers_prerouted_rows_and_reduce_scatters_output():
     backend = _make_backend()
+    assert backend.needs_dispatch_output_trim() is False
     hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
     topk_ids = torch.tensor([[0, 2], [1, 3]], dtype=torch.int32)
     topk_weights = torch.tensor([[0.6, 0.4], [0.25, 0.75]])

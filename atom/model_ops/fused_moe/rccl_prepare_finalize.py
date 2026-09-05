@@ -112,6 +112,12 @@ class RcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     def output_is_reduced(self) -> bool:
         return True
 
+    def needs_dispatch_output_trim(self) -> bool:
+        # All RCCL paths allocate their result to the exact receive size. The
+        # zero-receive routed path uses one explicit dummy row that finalize
+        # already drops; neither case has a MoRI-style inactive arena tail.
+        return False
+
     def num_dispatchers(self) -> int:
         return self._world_size
 
