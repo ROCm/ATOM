@@ -70,9 +70,36 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MLA_SHUFFLE_KV": lambda: (
         os.getenv("ATOM_USE_TRITON_MLA_SHUFFLE_KV", "0") == "1"
     ),
+    # Run the routed experts with the aiter Triton/gluon MoE kernels instead of
+    # FlyDSL fused_moe, on prefill and decode alike. For SiLU models on gfx1250
+    # this selects the a8w4 GUGU (gate/up-interleaved) kernel -- the default --
+    # which fuses SiLU into GEMM1's write-back and the MXFP8 requant into its
+    # epilogue. SwiGLU models (GPT-OSS) and CDNA archs keep the general
+    # moe_gemm_a16w4 / a4w4 / a8w4 path. Defaults to on for gfx94x, and for
+    # gfx95x when ATOM_USE_TRITON_GEMM is set.
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
-    "ATOM_USE_TRITON_MOE_DECODE": lambda: os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0")
-    == "1",
+    # Split the routed experts by phase: FlyDSL fused_moe on prefill, the Triton
+    # /gluon GUGU kernel on decode. Needs ATOM_USE_TRITON_MOE=1 (it narrows that
+    # flag, it cannot enable Triton on its own) plus gfx1250 + ATOM_MOE_GU_ITLV=1
+    # + SiLU, because it keeps a single copy of the weights in the FlyDSL layout
+    # and hands Triton a zero-copy view of it -- which is only valid where the
+    # two preshuffles agree byte-for-byte. TP only; inert under EP.
+    "ATOM_USE_TRITON_MOE_DECODE": lambda: (
+        os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0") == "1"
+    ),
+    # Select the a4w4 Triton wrapper instead of the a8w4 default, on both the TP
+    # and EP paths. Only chooses *which* wrapper runs -- it cannot enable the
+    # Triton path on its own, and asserts if set without ATOM_USE_TRITON_MOE.
+    # The weights are identical (both are w4); only the activation quant
+    # differs, so no extra weight prep or memory is involved.
+    "ATOM_USE_TRITON_MOE_A4W4": lambda: (
+        os.getenv("ATOM_USE_TRITON_MOE_A4W4", "0") == "1"
+    ),
+    # Trim the dispatched-token buffer to the actual valid token count on
+    # prefill steps. Decode already trims to graph_bs; prefill otherwise keeps
+    # the full (max_batched_tokens * ep_size) buffer, so the expert GEMMs run
+    # over rows that are entirely padding.
+    "ATOM_EP_TRIM_PREFILL": lambda: os.getenv("ATOM_EP_TRIM_PREFILL", "0") == "1",
     # Use mori dispatch_combine_v2 (FlyDSL/cco, gfx1250 wave32) instead of the
     # production mori v1 (mori.ops.EpDispatchCombineOp) for the EP+DP MoE
     # all2all. v1 is authored for gfx942/950 and does not run on gfx1250; v2 is
