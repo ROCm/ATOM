@@ -19,7 +19,6 @@ import tqdm
 from aiter import destroy_dist_env, init_dist_env
 from aiter.dist.parallel_state import (
     get_dp_group,
-    get_pcp_group,
     get_pp_group,
     get_tp_group,
     graph_capture,
@@ -30,6 +29,7 @@ from torch.profiler import record_function
 from atom.config import Config, CUDAGraphMode, set_current_atom_config
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
+    get_pcp_group,
     get_pcp_world_size,
     pcp_allgather_rerange,
     pcp_pad_len,
@@ -3119,22 +3119,35 @@ class ModelRunner:
                 target_logits,
                 bonus_token_ids,
             )
-            # PCP ranks decode redundantly and are consistent only while their
-            # kernels agree bit-for-bit -- they don't (hidden differs by ~1 bf16
-            # ULP, flipping ~24% of the near-tie verify argmaxes). Accept counts
-            # then differ per rank and the emitted streams fork. Sync the
-            # decision instead: the ids and how many.
-            if get_pcp_world_size() > 1 and hasattr(self, "drafter"):
-                _g = get_pcp_group()
-                sampled_tokens = _g.broadcast(sampled_tokens.contiguous(), src=0)
-                if torch.is_tensor(num_bonus_tokens):
-                    num_bonus_tokens = _g.broadcast(
-                        num_bonus_tokens.contiguous(), src=0
-                    )
+            # How far each request's KV advances. Spec-only, and must be synced
+            # before the two values derived from it below.
+            if get_pcp_world_size() > 1:
+                num_bonus_tokens = get_pcp_group().broadcast(
+                    num_bonus_tokens.contiguous(), src=0
+                )
             num_reject_tokens = self.drafter.mtp_k - num_bonus_tokens
             next_token_locs = num_bonus_tokens
 
+        # PCP ranks run the same forward redundantly and are consistent only
+        # while their kernels agree bit-for-bit -- they don't (~1 bf16 ULP, which
+        # flips near-tie argmaxes). Measured: ~1.8% of sampled ids differ, and
+        # deferred-out feeds them straight back as the next step's input, so the
+        # moe_pcp_merge all_reduce then sums MoE partials from mismatched hidden
+        # states -- the very thing its own comment assumes cannot happen. Pin the
+        # ids to rank 0. Same condition as the TP broadcast below.
+        if get_pcp_world_size() > 1 and (
+            self.tokenID_processor.is_deferred_out or hasattr(self, "drafter")
+        ):
+            sampled_tokens = get_pcp_group().broadcast(
+                sampled_tokens.contiguous(), src=0
+            )
+
         # Drafter input must agree across TP ranks.
+        # Only the ids, on purpose: the sampler is stochastic (independent noise
+        # for n>1 fan-out). num_bonus_tokens is not -- it is a deterministic
+        # function of target_probs and the draft ids, which TP ranks share
+        # bit-for-bit, so broadcasting it here would be a no-op. Only PCP needs
+        # it (its target_probs differ), and syncs it above.
         if get_tp_group().world_size > 1 and (
             self.tokenID_processor.is_deferred_out or hasattr(self, "drafter")
         ):

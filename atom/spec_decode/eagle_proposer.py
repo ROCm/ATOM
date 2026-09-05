@@ -48,7 +48,7 @@ def _pcp_split_draft_inputs(
     A draft prefill reuses the target's attn_metadata, already reindexed to
     1/pcp by the builder, so its q rows must be split to match or aiter aborts
     on `kv_indptr_prefix length must be N+1`. Both draft prefill entry points
-    need this: `propose()`'s i==0 step and `precompute_context_kv`.
+    need this: `propose()`'s i==0 step and `compute_draft_kv`.
 
     Callers gate on `_pcp_active_for_draft_model` first. Returns the shards
     plus (n_global, pcp_ws) for callers that must all-gather back.
@@ -324,9 +324,6 @@ class EagleProposer(Drafter):
         `propose(align_only=True)` for its collectives -- the same redo -- so
         `draft_kv_duplicates_propose` has the runner skip this call there.
 
-        NOTE: unverified against real weights. `build_drafter` routes anything
-        carrying `dspark_block_size` to `DSparkProposer`, and every model on
-        hand takes that branch.
         """
         if not next_token_ids:
             return

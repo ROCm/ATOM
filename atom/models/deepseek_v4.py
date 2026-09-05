@@ -66,6 +66,7 @@ from atom.distributed.pcp_utils import (
     pcp_all_reduce,
     pcp_allgather_rankmajor,
     pcp_allgather_rerange,
+    pcp_merged_tp_grid,
     pcp_pad_len,
     pcp_reduce_scatter,
     pcp_round_robin_split,
@@ -3387,8 +3388,17 @@ class Expert(nn.Module):
         quant_config: Any | None = None,
         reduce_results: bool = True,
         prefix: str = "",
+        tp_grid: tuple[int, int] | None = None,
     ):
         super().__init__()
+        # `tp_grid` overrides the (size, rank) both projections shard on. The
+        # shared expert passes the pcp-folded grid so it shards like FusedMoE
+        # instead of being replicated on every pcp rank; None keeps the TP group.
+        grid = (
+            {"override_tp_size": tp_grid[0], "override_tp_rank": tp_grid[1]}
+            if tp_grid is not None
+            else {}
+        )
         # Fused [w1; w3] (gate_up_proj): both share input x, both ColumnParallel
         # — standard llama/dsv2 fusion. Disk still split; routed via
         # packed_modules_mapping in DeepseekV4ForCausalLM.
@@ -3398,6 +3408,7 @@ class Expert(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
+            **grid,
         )
         self.w2 = RowParallelLinear(
             inter_dim,
@@ -3406,6 +3417,7 @@ class Expert(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=f"{prefix}.w2",
+            **grid,
         )
         self.swiglu_limit = swiglu_limit
         # Switch: route clamp + silu(gate)*up [+ weights] + per-token FP8 1x128
@@ -3551,6 +3563,11 @@ class MoE(nn.Module):
 
         if not self._fuse_shared_into_routed:
             # self.experts.num_fused_shared_experts = 0
+            # Shard on the pcp-folded grid when moe_pcp_merge is on, so the
+            # shared expert stops being a full replica on every pcp rank. Its
+            # partials are then summed by the same tp all_reduce + pcp
+            # reduce_scatter/all_reduce the routed experts already ride.
+            self._shared_pcp_sharded = pcp_merged_tp_grid()
             self.shared_experts = Expert(
                 args.dim,
                 args.moe_inter_dim,
@@ -3558,8 +3575,10 @@ class MoE(nn.Module):
                 quant_config=qc,
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
+                tp_grid=self._shared_pcp_sharded,
             )
         else:
+            self._shared_pcp_sharded = None
             self.shared_experts = None
         if self.is_hash_layer:
             # Inject hash routing into FusedMoE.select_experts via the
@@ -3700,17 +3719,13 @@ class MoE(nn.Module):
         all-reduce across TP ranks.
         """
         if shared is not None:
-            # PCP with ATOM_PCP_MOE_MERGE=1 (non-fused shared only): the shared expert
-            # is NOT pcp-sharded (its MergedColumn/RowParallelLinear bind to the
-            # 4-card tp group, so every pcp rank holds the same shared weights
-            # and computes the same full shared output — pcp-redundant). After
-            # this combine the result rides through Block.forward's pcp
-            # reduce_scatter, which SUMS the pcp partners. Without correction the
-            # shared part would be summed pcp_size times (doubled for pcp=2). So
-            # pre-scale shared by 1/pcp_size: the reduce_scatter then RESTORES it
-            # to 1x instead of multiplying. routed is genuinely pcp-sharded
-            # (partial sum) so it must NOT be scaled — only shared.
-            if _moe_pcp_merge_active() or _moe_pcp_merge_decode_active():
+            # A pcp-sharded shared expert emits a partial sum, like routed, so the
+            # downstream pcp reduce_scatter/all_reduce sums it correctly as-is.
+            # A replicated one gets counted pcp_size times there instead, so it
+            # needs the 1/pcp_size pre-scale to come back out at 1x.
+            if self._shared_pcp_sharded is None and (
+                _moe_pcp_merge_active() or _moe_pcp_merge_decode_active()
+            ):
                 shared = shared * (1.0 / get_pcp_world_size())
             routed = routed + shared
         if self.tp_size > 1:
