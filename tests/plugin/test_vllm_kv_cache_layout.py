@@ -34,6 +34,31 @@ def _sparse_kv(nb: int = NB) -> torch.Tensor:
     return buf.as_strided((nb, 2, BS, 1, HD), (k_block, k_total, HD, HD, 1))
 
 
+class _SparseLayer:
+    """A stand-in for M3's sparse attention: fp8 scales live on the layer."""
+
+    def __init__(self, nb: int = NB, heads: int = 1) -> None:
+        self.kv_scale = torch.zeros((2, nb, heads, BS), dtype=torch.float32)
+
+    def get_kv_transfer_scales(self, kv_cache=None):
+        return self.kv_scale[0], self.kv_scale[1]
+
+
+class _LayerWithUnreportableScales:
+    """Per-block scales and no way to report them -- must not pass silently."""
+
+    def __init__(self) -> None:
+        self.k_scale = torch.zeros((NB, 1, BS), dtype=torch.float32)
+
+
+def _m3_layers(kv: dict[str, torch.Tensor]) -> dict[str, object]:
+    return {
+        name: _SparseLayer()
+        for name, tensor in kv.items()
+        if tensor.ndim == 5  # sparse layers are the fp8-scaled ones
+    }
+
+
 def _m3_registration() -> dict[str, torch.Tensor]:
     kv: dict[str, torch.Tensor] = {}
     for i in range(DENSE_LAYERS):  # K/V interleaved per token
@@ -91,6 +116,63 @@ def test_orphan_index_cache_is_rejected():
         build_kv_cache_tensors(
             {"model.layers.0.self_attn.attn.index_cache": torch.zeros((NB, BS, HD))}
         )
+
+
+def test_fp8_scales_travel_with_the_layer_they_belong_to():
+    """Mantissas without their scales restore as fluent garbage, silently.
+
+    M3's sparse cache scales fp8 per token AND per head, and vLLM's
+    registration dict does not carry that table -- the layer does. This is the
+    regression that made every warm hit produce garbage while every metric said
+    the transfer had succeeded.
+    """
+    kv = _m3_registration()
+    tensors = build_kv_cache_tensors(kv, _m3_layers(kv))
+
+    sparse = [t for t in tensors if t.index_cache is not None]
+    assert len(sparse) == SPARSE_LAYERS
+    for t in sparse:
+        assert t.k_scale is not None and t.v_scale is not None
+        assert t.k_scale.shape[0] == NB, "scales must be block-major"
+        assert t.k_scale.is_contiguous() and t.v_scale.is_contiguous()
+
+    dense = [t for t in tensors if t.index_cache is None]
+    assert all(t.k_scale is None for t in dense), "dense scales are per-tensor"
+
+
+def test_scales_reach_the_codec_as_extra_segments():
+    codec_mod = pytest.importorskip(
+        "atom.kv_transfer.offload.dense.kv_byte_codec",
+        reason="offload codec pulls aiter",
+    )
+    kv = _m3_registration()
+    with_scales = build_kv_cache_tensors(kv, _m3_layers(kv))
+    without = build_kv_cache_tensors(kv)
+
+    def _bytes(tensors):
+        return codec_mod.DenseKVByteCodec(
+            {str(t.layer_num): t for t in tensors}, num_blocks=NB
+        ).bytes_per_block
+
+    # 2 scales x 1 head x BS tokens x fp32, per sparse layer.
+    assert _bytes(with_scales) - _bytes(without) == SPARSE_LAYERS * 2 * BS * 4
+
+
+def test_per_block_scales_without_a_reporting_hook_are_rejected():
+    kv = {"model.layers.0.self_attn.attn": torch.zeros((NB, 1, BS, 2 * HD))}
+    with pytest.raises(ValueError, match="per-block k_scale"):
+        build_kv_cache_tensors(kv, {"model.layers.0.self_attn.attn": _LayerWithUnreportableScales()})
+
+
+def test_non_block_major_scales_are_rejected():
+    class _HeadMajor:
+        def get_kv_transfer_scales(self, kv_cache=None):
+            scale = torch.zeros((1, NB, BS), dtype=torch.float32)
+            return scale, scale
+
+    kv = {"model.layers.0.self_attn.attn": torch.zeros((NB, 1, BS, 2 * HD))}
+    with pytest.raises(ValueError, match="not block-major"):
+        build_kv_cache_tensors(kv, {"model.layers.0.self_attn.attn": _HeadMajor()})
 
 
 def test_codec_accepts_the_mapped_tensors():

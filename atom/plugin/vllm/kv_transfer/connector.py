@@ -64,6 +64,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         # rejects the 2-argument signature outright, and the base class stores
         # it for the group-aware paths.
         super().__init__(vllm_config, role, kv_cache_config)
+        self._vllm_config = vllm_config
         self._config = build_offload_config(vllm_config)
         self._worker = None
         self._scheduler = None
@@ -87,8 +88,14 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
     # ---- worker side --------------------------------------------------
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
-        """Translate vLLM's flat registration and hand it to ATOM's codec."""
-        tensors = build_kv_cache_tensors(kv_caches)
+        """Translate vLLM's flat registration and hand it to ATOM's codec.
+
+        The layer modules go along with the tensors: M3 keeps its fp8 KV scales
+        (one fp32 per token per head) on the layer, not in this dict, and a
+        transfer that moves the mantissas without them silently dequantises a
+        restored block against the previous occupant's scale.
+        """
+        tensors = build_kv_cache_tensors(kv_caches, self._attention_layers())
         if not tensors:
             raise ValueError("ATOM offload connector: vLLM registered no KV caches")
 
@@ -127,6 +134,18 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
                 shape,
                 dtype,
             )
+
+    def _attention_layers(self) -> dict[str, Any]:
+        """The layer modules behind vLLM's registered KV cache names.
+
+        vLLM keeps them in the static forward context, which is where its own
+        attention-metadata builders read layers from; there is no per-layer
+        handle in the connector API itself.
+        """
+        context = getattr(
+            self._vllm_config.compilation_config, "static_forward_context", None
+        )
+        return dict(context) if context else {}
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         metadata = self._get_connector_metadata()
