@@ -333,42 +333,44 @@ monitor_slurm_job() {
 
 read_slurm_exit_code() {
   local job_id="$1"
-  local sacct_line exit_status exit_signal
-  local attempt state
+  local sacct_line exit_status exit_signal deadline
 
   SLURM_STATE="unknown"
   SLURM_EXIT_CODE="unknown"
-  SLURM_JOB_RC=1
+  SLURM_JOB_RC=2
+
+  SLURM_ACCOUNTING_TIMEOUT="${SLURM_ACCOUNTING_TIMEOUT:-30}"
+  SLURM_ACCOUNTING_POLL_INTERVAL="${SLURM_ACCOUNTING_POLL_INTERVAL:-2}"
 
   if ! command -v sacct >/dev/null 2>&1; then
     echo "WARNING: sacct not found; unable to read Slurm job exit code" >&2
     return 0
   fi
 
-  for ((attempt = 1; attempt <= ${SLURM_SACCT_MAX_ATTEMPTS:-12}; attempt++)); do
+  deadline=$(( $(date +%s) + SLURM_ACCOUNTING_TIMEOUT ))
+  while true; do
     if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
-      sacct_line="$(sacct --accounting "${SPUR_ACCOUNTING_ADDR}" --brief --noheader 2>/dev/null | awk -v job_id="${job_id}" '$1 == job_id { print $2 "|" $3; exit }' || true)"
+      if [[ -n "${SLURM_ACCOUNT:-}" ]]; then
+        sacct_line="$(sacct --account "${SLURM_ACCOUNT}" --brief --noheader 2>/dev/null | awk -v job_id="${job_id}" '$1 == job_id { print $2 "|" $3; exit }' || true)"
+      elif [[ -n "${SPUR_ACCOUNTING_ADDR:-}" ]]; then
+        sacct_line="$(sacct --accounting "${SPUR_ACCOUNTING_ADDR}" --brief --noheader 2>/dev/null | awk -v job_id="${job_id}" '$1 == job_id { print $2 "|" $3; exit }' || true)"
+      else
+        sacct_line="$(sacct -j "${job_id}" -X -n -P -o State,ExitCode 2>/dev/null | awk -F'|' 'NF { print; exit }' || true)"
+      fi
     else
       sacct_line="$(sacct -j "${job_id}" -X -n -P -o State,ExitCode 2>/dev/null | awk -F'|' 'NF { print; exit }' || true)"
     fi
-    if [[ -n "${sacct_line}" ]]; then
-      state="${sacct_line%%|*}"
-      case "${state}" in
-        COMPLETE|COMPLETED|FAILED|CANCELLED|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL|PREEMPTED|BOOT_FAIL|DEADLINE)
-          break
-          ;;
-      esac
+    [[ -n "${sacct_line}" ]] && break
+
+    if [[ "$(date +%s)" -ge "${deadline}" ]]; then
+      echo "ERROR: unable to read final Slurm state for job ${job_id} after ${SLURM_ACCOUNTING_TIMEOUT}s" >&2
+      return 0
     fi
-    if [[ "${attempt}" -lt "${SLURM_SACCT_MAX_ATTEMPTS:-12}" ]]; then
-      sleep "${SLURM_SACCT_RETRY_INTERVAL:-5}"
-    fi
+    sleep "${SLURM_ACCOUNTING_POLL_INTERVAL}"
   done
-  if [[ -z "${sacct_line}" ]]; then
-    echo "WARNING: no Slurm accounting record found for job ${job_id}" >&2
-    return 0
-  fi
 
   SLURM_STATE="${sacct_line%%|*}"
+  SLURM_STATE="${SLURM_STATE%%+*}"
   SLURM_EXIT_CODE="${sacct_line##*|}"
   exit_status="${SLURM_EXIT_CODE%%:*}"
   exit_signal="${SLURM_EXIT_CODE##*:}"
