@@ -36,6 +36,7 @@ topk_ids carry only routed expert ids and mori routes them cleanly.
 import logging
 import os
 import sys
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
@@ -47,6 +48,7 @@ from aiter.ops.flydsl.moe_common import GateMode
 
 import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 try:
@@ -295,6 +297,15 @@ def init_mega_transport(
             else {}
         ),
     )
+    # Peer-region stride in the flat symmetric VA. triton_mega_moe needs it to
+    # address the combine staging window, and MegaMoE does not keep it.
+    #
+    # Read HERE -- every rank is constructing its transport and the barrier
+    # below follows -- because create_dev_comm() may be COLLECTIVE while the
+    # forward that consumes this is NOT rank-aligned: the Triton experts are
+    # picked per step, so a lazy first-use read could have only some ranks
+    # enter the collective, and hang.
+    mega._atom_per_rank_size = int(comm.create_dev_comm().per_rank_size)
     comm.barrier()
     _MEGA_TRANSPORTS[key] = mega
     logger.info(
@@ -469,22 +480,27 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         assert (
             not apply_router_weight_on_input
         ), "mori does not support apply_router_weight_on_input=True now."
-        assert (
-            self.mega is None
-        ), "the fused transport runs the layer in MoriV2ModularKernel.forward()"
 
         # bf16 dispatch, no wire quant: scales=None. indices carry global expert
-        # ids (0..global_num_experts-1); mori routes id -> rank = id // EPR.
-        recv_x, recv_w, _recv_s, recv_idx, _total_recv_t, routing = self._op.dispatch(
-            a1,
-            topk_weights.to(torch.float32),
-            None,
-            topk_ids.to(torch.int32),
-            return_routing=True,
+        # ids (0..global_num_experts-1); the transport routes id -> rank = id //
+        # EPR.
+        #
+        # Gather transport only. MegaMoE never reaches prepare()/finalize() any
+        # more: MoriV2ModularKernel.forward sends it to triton_mega_moe (Triton
+        # experts) or to MegaMoE's own forward (flydsl experts), and both own
+        # their dispatch and combine end to end.
+        recv_x, recv_w, _recv_s, recv_idx, _total_recv_t, routing = (
+            self._op.dispatch(
+                a1,
+                topk_weights.to(torch.float32),
+                None,
+                topk_ids.to(torch.int32),
+                return_routing=True,
+            )
         )
         self._routing = routing
 
-        # Capture-safe: do NOT call total_recv_t.item() (a GPU->CPU sync that is
+        # Capture-safe: do NOT call _total_recv_t.item() (a GPU->CPU sync that is
         # illegal during cudagraph capture). fused_moe is handed the FULL
         # fixed-size arena buffers, aliased in place rather than sliced to the
         # received count, so the shapes stay static across capture/replay.
@@ -492,11 +508,28 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         dispatch_ids = recv_idx
         dispatch_weights = recv_w
 
-        # num_local_tokens is left unset (expert_num_tokens=None): the grouped
-        # a8w4 path derives per-expert routing from the (already trimmed) global
-        # ids + expert_mask, exactly as test_moe_layer_ep.py does.
+        # The received-row count, for whoever needs it as a row mask.
+        #
+        # flydsl fused_moe does NOT: the grouped a8w4 path derives per-expert
+        # routing from the (already trimmed) global ids + expert_mask, and its
+        # kernels skip the tail past the device-side count on their own -- which
+        # is the whole correctness argument in _decode_recv_bound. So it stays
+        # None there, exactly as before.
+        #
+        # The Triton/gluon EP experts DO: ep_sort_routing hands this straight to
+        # _ep_gate_prep_scan_kernel, whose row mask is skipped entirely when it
+        # is None. The mori buffer always has M > R, so without it the garbage
+        # rows in [R, M) fold into the histogram as LIVE gates (on the rank
+        # owning global expert 0, a zeroed/stale id maps to local expert 0) and,
+        # under the scatter-fused combine, get delivered into staging slots
+        # belonging to real tokens. Silently wrong rather than an error.
+        #
+        # Capture-safe: a (1,) int32 device scalar, allocated once by the
+        # transport and re-zeroed per dispatch, so the pointer is stable across
+        # cudagraph capture/replay and nothing is read on the host.
         expert_tokens_meta = mk.ExpertTokensMetadata(
-            expert_num_tokens=None, expert_num_tokens_cpu=None
+            expert_num_tokens=(_total_recv_t if envs.ATOM_USE_TRITON_MOE else None),
+            expert_num_tokens_cpu=None,
         )
         return (
             dispatch_a1,
@@ -595,7 +628,75 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         **kwargs,
     ) -> torch.Tensor:
         mega = self.prepare_finalize.mega
-        if mega is None:
+        triton_experts = (kwargs.get("moe_extra_args") or {}).get("triton_experts")
+
+        # MegaMoE as transport, with OUR experts, driven from one place.
+        #
+        # The alternative -- and what runs when this is off -- is the normal
+        # prepare -> experts -> finalize walk, where prepare() calls MegaMoE's
+        # dispatch, GEMM2 delivers into its staging window and finalize() calls
+        # its combine. That works, but it spreads one layer's transport across
+        # three methods and needs a public transport-only API on MegaMoE
+        # (dispatch / combine_scatter_target / combine) that exists solely for
+        # ATOM. triton_mega_moe does the same three steps in one function
+        # against MegaMoE's internals instead, so aiter needs no such API and
+        # the dispatch/combine underneath can later be swapped for our own.
+        #
+        # Bit-identical to the walk it replaces (mega fp4 + a4w4, mega bf16 +
+        # a4w4, mega bf16 + a8w4 all match to the last bit). Off by default
+        # until it has run a real serve.
+        if mega is not None and triton_experts is not None:
+            from atom.model_ops.fused_moe_triton import triton_mega_moe
+
+            assert not kwargs.get("apply_router_weight_on_input", False), (
+                "mori does not support apply_router_weight_on_input=True now."
+            )
+            arena_rows = (
+                self.prepare_finalize.num_dispatchers() * mega.max_tokens_per_rank
+            )
+            bound = self._decode_recv_bound(topk_ids, arena_rows)
+            # The "Direction-3" shrink, reproduced from the base-class walk: the
+            # bound leaves graph_bs*topk*dp rows, but mori de-duplicates per
+            # destination rank, so at most graph_bs*max_seqlen_q*dp can be live.
+            # Guarded by the same uniform-decode test, via `bound`: None there
+            # means a mixed/prefill batch, which keeps the full arena.
+            #
+            # Guarded on _all_ranks_decode(), NOT on `bound is not None`:
+            # _decode_recv_bound also returns None when the bound would not
+            # actually shrink the arena, and the base walk still applies M_eff in
+            # that case. Keying off `bound` would silently skip the trim there.
+            from atom.model_ops.moe import _all_ranks_decode
+
+            m_eff = None
+            if _all_ranks_decode():
+                _fwd_ctx = get_forward_context()
+                _ctx = _fwd_ctx.context
+                tokens_per_rank = _ctx.graph_bs
+                attn_md = _fwd_ctx.attn_metadata
+                if attn_md is not None and getattr(attn_md, "max_seqlen_q", None):
+                    tokens_per_rank *= attn_md.max_seqlen_q
+                m_eff = tokens_per_rank * get_dp_group().world_size
+            return triton_mega_moe(
+                mega,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                w1=triton_experts["w13_weight"],
+                w2=triton_experts["w2_weight"],
+                w1_scale=triton_experts["w13_scale"],
+                w2_scale=triton_experts["w2_scale"],
+                expert_map=kwargs.get("expert_map"),
+                n_local_experts=w1.size(0),
+                w13_swizzle_layout=triton_experts["w13_swizzle_layout"],
+                w2_swizzle_layout=triton_experts["w2_swizzle_layout"],
+                w1_bias=triton_experts.get("w1_bias"),
+                w2_bias=triton_experts.get("w2_bias"),
+                swiglu_limit=triton_experts.get("swiglu_limit", 10.0),
+                recv_token_bound=bound,
+                m_eff=m_eff,
+            )
+
+        if mega is None or triton_experts:
             return super().forward(
                 hidden_states, w1, w2, topk_weights, topk_ids, **kwargs
             )
