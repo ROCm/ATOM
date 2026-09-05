@@ -105,6 +105,8 @@ from atom.utils.tbo import (
 logger = logging.getLogger("atom")
 
 support_model_arch_dict = {
+    "CohereForCausalLM": "atom.models.cohere.CohereForCausalLM",
+    "Cohere2ForCausalLM": "atom.models.cohere.CohereForCausalLM",
     "Qwen3ForCausalLM": "atom.models.qwen3.Qwen3ForCausalLM",
     "Qwen3MoeForCausalLM": "atom.models.qwen3_moe.Qwen3MoeForCausalLM",
     "LlamaForCausalLM": "atom.models.llama.LlamaForCausalLM",

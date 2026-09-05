@@ -86,6 +86,7 @@ class PagedAttentionImpl(nn.Module):
         self._pa_decode_bf16_asm_scale = torch.full(
             (1,), self.kv_scale_float, dtype=torch.float32, device=self.device
         )
+        self.per_tensor_scale = self.kv_scale  # set here; fp8 path overrides later
         self.per_token_quant = True
         self.sinks = sinks
         self.sliding_window = sliding_window if sliding_window is not None else -1
