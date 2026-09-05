@@ -5,13 +5,15 @@
 # uploaded workflow artifact from the current GitHub Actions run instead.
 # De-inlined from atom-test.yaml / atomesh-accuracy-validation.yaml (identical
 # blocks). Inputs via env: ATOM_PYTHON_TAG (required), GITHUB_TOKEN (required);
-# S3_MAIN_MANIFEST_URL / API_URL / AITER_TEST_WORKFLOW_ID are overridable.
+# S3_MAIN_MANIFEST_URL / S3_BASE_URL / API_URL / AITER_TEST_WORKFLOW_ID are overridable.
 # Output: ${AITER_WHEEL_OUTPUT_DIR:-aiter-whl}/amd_aiter*.whl.
 set -euo pipefail
 : "${ATOM_PYTHON_TAG:?ATOM_PYTHON_TAG must be set}"
 : "${GITHUB_TOKEN:?GITHUB_TOKEN must be set}"
 
 S3_MAIN_MANIFEST_URL="${S3_MAIN_MANIFEST_URL:-https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950/main/latest.json}"
+S3_BASE_URL="${S3_BASE_URL:-${S3_MAIN_MANIFEST_URL%/main/latest.json}}"
+S3_COMMIT_MANIFEST_URL="${S3_COMMIT_MANIFEST_URL:-}"
 API_URL="${API_URL:-https://api.github.com}"
 AUTH_HEADER="Authorization: token ${GITHUB_TOKEN}"
 AITER_TEST_WORKFLOW_ID="${AITER_TEST_WORKFLOW_ID:-179476100}"
@@ -129,13 +131,18 @@ find_latest_artifact() {
 }
 
 download_from_s3_manifest() {
+  local manifest_url skip_latest_check expected_commit
   local manifest_file manifest_fetch_url manifest_branch manifest_timestamp manifest_commit wheel_name wheel_url resolved_wheel_url
+
+  manifest_url="${1:-$S3_MAIN_MANIFEST_URL}"
+  skip_latest_check="${2:-false}"
+  expected_commit="${3:-}"
 
   prepare_output_dir
 
   manifest_file=$(mktemp)
   trap 'rm -f "$manifest_file"' RETURN
-  manifest_fetch_url="${S3_MAIN_MANIFEST_URL}?ts=$(date +%s)"
+  manifest_fetch_url="${manifest_url}?ts=$(date +%s)"
   curl_with_retry -H "Cache-Control: no-cache" "$manifest_fetch_url" -o "$manifest_file" || return 1
 
   manifest_branch=$(jq -r '.branch // empty' "$manifest_file")
@@ -162,7 +169,12 @@ download_from_s3_manifest() {
     return 1
   fi
 
-  if find_latest_artifact; then
+  if [ -n "$expected_commit" ] && [ "$manifest_commit" != "$expected_commit" ]; then
+    echo "Manifest commit $manifest_commit does not match expected commit $expected_commit"
+    return 1
+  fi
+
+  if [ "$skip_latest_check" != "true" ] && find_latest_artifact; then
     if [ -n "$ARTIFACT_RUN_SHA" ] && [ "$manifest_commit" != "$ARTIFACT_RUN_SHA" ]; then
       if [ -n "$ARTIFACT_RUN_CREATED_AT" ] && [[ "$manifest_timestamp" < "$ARTIFACT_RUN_CREATED_AT" ]]; then
         echo "Manifest commit $manifest_commit is older than latest artifact run $ARTIFACT_RUN_ID ($ARTIFACT_RUN_SHA); treating manifest as stale"
@@ -176,7 +188,7 @@ download_from_s3_manifest() {
 
   resolved_wheel_url=$(resolve_download_url "$wheel_url")
 
-  echo "Selected latest main wheel manifest: $S3_MAIN_MANIFEST_URL"
+  echo "Selected Aiter wheel manifest: $manifest_url"
   echo "Manifest timestamp: $manifest_timestamp"
   echo "Manifest commit: $manifest_commit"
   echo "Manifest wheel: $wheel_name"
@@ -261,11 +273,23 @@ download_from_workflow_artifact() {
 case "$AITER_WHEEL_DOWNLOAD_MODE" in
   resolve)
     echo "=== Trying latest main aiter wheel manifest from S3 first ==="
-    if download_from_s3_manifest; then
+    if download_from_s3_manifest "$S3_MAIN_MANIFEST_URL"; then
       echo "Using wheel from S3 main manifest"
     else
-      echo "Main wheel manifest download failed, falling back to GitHub artifact"
-      download_from_artifact
+      echo "Main wheel manifest download failed or was stale"
+      if find_latest_artifact && [ -n "$ARTIFACT_RUN_SHA" ]; then
+        commit_manifest_url="${S3_COMMIT_MANIFEST_URL:-${S3_BASE_URL}/commits/${ARTIFACT_RUN_SHA}/latest.json}"
+        echo "=== Trying commit-specific Aiter wheel manifest from S3: ${commit_manifest_url} ==="
+        if download_from_s3_manifest "$commit_manifest_url" true "$ARTIFACT_RUN_SHA"; then
+          echo "Using wheel from S3 commit-specific manifest"
+        else
+          echo "Commit-specific wheel manifest download failed, falling back to GitHub artifact"
+          download_from_artifact
+        fi
+      else
+        echo "Could not identify latest Aiter artifact commit, falling back to GitHub artifact"
+        download_from_artifact
+      fi
     fi
     ;;
   workflow_artifact|workflow-artifact)
