@@ -10,6 +10,7 @@ Only the MiniMax M3 paths are implemented: base-2 softmax, no attention sink,
 and split-K decode with a separate merge step.
 """
 
+import os
 from dataclasses import dataclass
 
 import aiter  # noqa: F401  (used by the gluon PA runners for aiter.dtypes.fp8)
@@ -1202,6 +1203,76 @@ def minimax_m3_sparse_attn_decode_asm(
     num_seqs = T * num_kv_heads
     num_kv_heads_view = 1
     query_group_size = g
+    is_fp8 = _is_fp8_kv_cache_tensor(k_cache)
+    backend = os.getenv("ATOM_M3_SPARSE_ATTN_BACKEND", "gluon").lower()
+    if backend == "flydsl":
+        if not is_fp8 or k_scale is None or v_scale is None:
+            raise ValueError(
+                "MiniMax-M3 FlyDSL sparse attention requires FP8 KV "
+                "cache with per-token K/V scales."
+            )
+        try:
+            from kernels.attention.pa_decode_tile import pa_decode_tile
+        except ImportError as exc:
+            raise ImportError(
+                "ATOM_M3_SPARSE_ATTN_BACKEND=flydsl requires matching "
+                "FlyDSL kernel sources on PYTHONPATH."
+            ) from exc
+
+        num_partitions = int(
+            os.getenv("ATOM_M3_FLYDSL_NUM_PARTITIONS", "1")
+        )
+        if num_partitions < 1:
+            raise ValueError("ATOM_M3_FLYDSL_NUM_PARTITIONS must be >= 1")
+
+        pbs = k_scale.shape[-1]
+        flydsl_k_scale = k_scale.view(nph16 * _hkv, 1, pbs)
+        flydsl_v_scale = v_scale.view(nph16 * _hkv, 1, pbs)
+        if num_partitions == 1:
+            dummy_partial = torch.empty(
+                1, dtype=torch.float32, device=q.device
+            )
+            pmax = psum = pout = dummy_partial
+        else:
+            partial_shape = (
+                num_seqs,
+                num_kv_heads_view,
+                num_partitions,
+                query_group_size,
+            )
+            pmax = torch.empty(
+                partial_shape, dtype=torch.float32, device=q.device
+            )
+            psum = torch.empty_like(pmax)
+            pout = torch.empty(
+                *partial_shape,
+                head_size,
+                dtype=q.dtype,
+                device=q.device,
+            )
+
+        pa_decode_tile(
+            output=out_view,
+            query=q_view,
+            key_cache=k_cache_view,
+            value_cache=v_cache_view,
+            block_tables=sparse_bt,
+            context_lengths=sparse_ctx,
+            key_scale=flydsl_k_scale,
+            value_scale=flydsl_v_scale,
+            softmax_scale=sm_scale,
+            num_partitions=num_partitions,
+            pmax=pmax,
+            psum=psum,
+            pout=pout,
+        )
+        return
+    if backend != "gluon":
+        raise ValueError(
+            "ATOM_M3_SPARSE_ATTN_BACKEND must be 'gluon' or 'flydsl', "
+            f"got {backend!r}."
+        )
+
     max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads_view)
     context_partition_size = 256
     intermediate_shape = (
@@ -1217,7 +1288,6 @@ def minimax_m3_sparse_attn_decode_asm(
     )
     # fp8 KV cache -> fp8 compute_type + per-token scales; bf16 otherwise. The scale
     # tensor [num_phys16, Hkv, pbs] collapses the same way as the cache.
-    is_fp8 = _is_fp8_kv_cache_tensor(k_cache)
     compute_type = aiter.dtypes.fp8 if is_fp8 else torch.bfloat16
     if is_fp8 and k_scale is not None:
         # [num_phys16, Hkv, pbs] -> [num_phys16*Hkv, 1, pbs, 1], matching the cache.
@@ -1296,6 +1366,76 @@ def _run_prefill_fp8_gluon(
     num_seqs = T * num_kv_heads
     num_kv_heads_view = 1
     query_group_size = g
+    is_fp8 = _is_fp8_kv_cache_tensor(k_cache)
+    backend = os.getenv("ATOM_M3_SPARSE_ATTN_BACKEND", "gluon").lower()
+    if backend == "flydsl":
+        if not is_fp8 or k_scale is None or v_scale is None:
+            raise ValueError(
+                "MiniMax-M3 FlyDSL sparse prefill requires FP8 KV "
+                "cache with per-token K/V scales."
+            )
+        try:
+            from kernels.attention.pa_decode_tile import pa_decode_tile
+        except ImportError as exc:
+            raise ImportError(
+                "ATOM_M3_SPARSE_ATTN_BACKEND=flydsl requires matching "
+                "FlyDSL kernel sources on PYTHONPATH."
+            ) from exc
+
+        num_partitions = int(
+            os.getenv("ATOM_M3_FLYDSL_NUM_PARTITIONS", "1")
+        )
+        if num_partitions < 1:
+            raise ValueError("ATOM_M3_FLYDSL_NUM_PARTITIONS must be >= 1")
+
+        pbs = k_scale.shape[-1]
+        flydsl_k_scale = k_scale.view(nph16 * _hkv, 1, pbs)
+        flydsl_v_scale = v_scale.view(nph16 * _hkv, 1, pbs)
+        if num_partitions == 1:
+            dummy_partial = torch.empty(
+                1, dtype=torch.float32, device=q.device
+            )
+            pmax = psum = pout = dummy_partial
+        else:
+            partial_shape = (
+                num_seqs,
+                num_kv_heads_view,
+                num_partitions,
+                query_group_size,
+            )
+            pmax = torch.empty(
+                partial_shape, dtype=torch.float32, device=q.device
+            )
+            psum = torch.empty_like(pmax)
+            pout = torch.empty(
+                *partial_shape,
+                head_size,
+                dtype=q.dtype,
+                device=q.device,
+            )
+
+        pa_decode_tile(
+            output=out_view,
+            query=q_view,
+            key_cache=k_cache_view,
+            value_cache=v_cache_view,
+            block_tables=sparse_bt,
+            context_lengths=sparse_ctx,
+            key_scale=flydsl_k_scale,
+            value_scale=flydsl_v_scale,
+            softmax_scale=sm_scale,
+            num_partitions=num_partitions,
+            pmax=pmax,
+            psum=psum,
+            pout=pout,
+        )
+        return
+    if backend != "gluon":
+        raise ValueError(
+            "ATOM_M3_SPARSE_ATTN_BACKEND must be 'gluon' or 'flydsl', "
+            f"got {backend!r}."
+        )
+
     max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads_view)
     context_partition_size = 256
     intermediate_shape = (
@@ -1311,7 +1451,6 @@ def _run_prefill_fp8_gluon(
     )
     # compute_type / scales follow the actual KV-cache dtype (this helper serves
     # both bf16 and fp8); the scale tensor collapses like the cache.
-    is_fp8 = _is_fp8_kv_cache_tensor(k_cache)
     compute_type = aiter.dtypes.fp8 if is_fp8 else torch.bfloat16
     if is_fp8 and k_scale is not None:
         pbs = k_scale.shape[-1]
