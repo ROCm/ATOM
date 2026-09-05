@@ -3515,8 +3515,30 @@ class MoE(nn.Module):
             # attribute mutation across the compile boundary, so stashing on
             # `self.foo` from inside forward is a no-op at runtime.
         assert args.n_shared_experts == 1
+        atom_config = get_current_atom_config()
+        moe_class = FusedMoE
+        self._comm_fused_moe = False
+        layer_quant = qc.get_layer_quant_config(
+            f"{prefix}.experts", check_children=True
+        )
+        if (
+            atom_config.moe_backend == "standard"
+            and not qc.online_quant
+            and layer_quant.quant_dtype == dtypes.fp4x2
+        ):
+            from atom.model_ops.fused_moe.comm_fused_moe import CommFusedMoe
+
+            self._comm_fused_moe = CommFusedMoe.supports_model(
+                model_dim=self.dim,
+                inter_dim=args.moe_inter_dim // self.tp_size,
+                experts=self.n_routed_experts,
+                topk=self.n_activated_experts,
+            )
+            if self._comm_fused_moe:
+                moe_class = CommFusedMoe
         self._fuse_shared_into_routed = (
-            is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+            not self._comm_fused_moe
+            and is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
                 qc,
                 shared_expert_prefix=f"{prefix}.shared_experts",
                 routed_expert_prefix=f"{prefix}.experts",
@@ -3528,7 +3550,7 @@ class MoE(nn.Module):
                 args.n_shared_experts if self._fuse_shared_into_routed else 0
             ),
         )
-        self.experts = FusedMoE(
+        self.experts = moe_class(
             num_experts=self.n_routed_experts,
             top_k=self.n_activated_experts,
             hidden_size=self.dim,
@@ -3657,7 +3679,11 @@ class MoE(nn.Module):
         return topk_weights, topk_ids
 
     def routed_expert_forward(
-        self, x: torch.Tensor  # [num_tokens, dim]
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]
+        shared_partial: torch.Tensor | None = None,
+        before_stage2=None,
+        stage2_stream: torch.cuda.Stream | None = None,
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Gate + FusedMoE routed-expert pass.
 
@@ -3667,7 +3693,20 @@ class MoE(nn.Module):
         `_hash_topk` (FusedMoE's custom_routing_function) reads it there.
         """
         router_logits = self.gate(x)  # [num_tokens, n_routed_experts]
+        if self._use_comm_fused(x):
+            if before_stage2 is not None:
+                return self.experts.forward_comm_fused_impl(
+                    x,
+                    router_logits,
+                    shared_partial,
+                    before_stage2=before_stage2,
+                    stage2_stream=stage2_stream,
+                )
+            return self.experts.forward_comm_fused(x, router_logits, shared_partial)
         return self.experts(hidden_states=x, router_logits=router_logits)
+
+    def _use_comm_fused(self, x: torch.Tensor) -> bool:
+        return self._comm_fused_moe and self.experts.supports_comm_fused(x.shape[0])
 
     @staticmethod
     def _gather_ids_for_dp(ids: torch.Tensor, ctx) -> torch.Tensor:
@@ -3725,9 +3764,13 @@ class MoE(nn.Module):
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Sequential: shared_experts → routed_experts → combine."""
         shared = self.shared_experts(x) if self.shared_experts is not None else None
+        if self._use_comm_fused(x):
+            return self.routed_expert_forward(x, shared_partial=shared)
         routed = self.routed_expert_forward(x)
         return self.combine_outputs(
-            routed, shared, prefix=f"{self.prefix}.combine_outputs"
+            routed,
+            shared,
+            prefix=f"{self.prefix}.combine_outputs",
         )
 
     def dual_stream_moe_forward(
@@ -3739,6 +3782,23 @@ class MoE(nn.Module):
         combining.
         """
         current_stream = get_forward_context().main_stream
+        if self._use_comm_fused(x):
+            routed_stream = torch.cuda.current_stream(x.device)
+            self.alt_stream.wait_stream(routed_stream)
+
+            def produce_shared():
+                with torch.cuda.stream(self.alt_stream):
+                    shared = self.shared_experts.forward(x)
+                routed_stream.wait_stream(self.alt_stream)
+                shared.record_stream(routed_stream)
+                return shared
+
+            with torch.cuda.stream(routed_stream):
+                return self.routed_expert_forward(
+                    x,
+                    before_stage2=produce_shared,
+                    stage2_stream=routed_stream,
+                )
         self.alt_stream.wait_stream(current_stream)
         routed = self.routed_expert_forward(x)
         with torch.cuda.stream(self.alt_stream):

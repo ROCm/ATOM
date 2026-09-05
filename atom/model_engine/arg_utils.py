@@ -334,7 +334,8 @@ class EngineArgs:
             default="standard",
             choices=["standard", "mega"],
             help="MoE implementation. 'standard' uses the existing "
-            "prepare/GEMM/finalize path; 'mega' uses fused FlyDSL MegaMoE.",
+            "path and tuned communication-fused kernels when available; "
+            "'mega' uses fused FlyDSL MegaMoE.",
         )
         parser.add_argument(
             "--method",
