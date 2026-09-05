@@ -102,8 +102,18 @@ logger = logging.getLogger("atom")
 # The attention metadata builder precomputes each path's cta_info with these
 # and the scorer passes the matching block_k, so layout and grid agree. They
 # live here (rather than in either caller) because both the builder and the
-# model-side scorer must use the SAME values. Mirrors the kernel defaults.
-FP4_MQA_PARALLEL_UNIT_NUM = 512
+# model-side scorer must use the SAME values.
+#
+# The grid floor is a CTA-count target, not the kernel default: every consumer
+# takes `max(floor, rows)`, so it only adds split-K to grids too small to fill
+# the GPU and is an identity for the wide ones. Splits are numerically inert --
+# each CTA gets a disjoint KV-column range, no cross-CTA partial sums.
+# 512 idled the machine on long contexts, where rows shrink as the logits buffer
+# widens: decode rows=128 W~32768 54.1us -> 51.2us, prefill rows=1024 224.6us ->
+# 206.2us. 4096 is not any shape's optimum (CTA-count quantization makes the
+# ordering shape-specific) but has the smallest worst-case regret of the values
+# tried; re-tune against a real workload mix.
+FP4_MQA_PARALLEL_UNIT_NUM = 4096
 FP4_MQA_BLOCK_K = 256
 
 

@@ -2236,9 +2236,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             #     one row PER QUERY TOKEN, so P must be >= prefill row count or
             #     surplus rows are silently dropped (logits stay at the -inf/NaN
             #     pre-fill -> wrong top-k). This is what `prefill_rows` covers.
-            #   - chunks (context length): the 512 floor keeps enough CTAs to
-            #     split a long context across the GPU even when rows are few
-            #     (matters for decode; harmless here where rows dominate).
+            #   - chunks (context length): the FP4_MQA_PARALLEL_UNIT_NUM floor
+            #     keeps enough CTAs to split a long context across the GPU even
+            #     when rows are few. NOT decode-only: a long-context prefill has
+            #     few rows too, because the logits budget shrinks the Q chunk as
+            #     the row widens. At rows=1024 / W~32768 the floor is worth ~8%.
             # max() of both axes -> correct rows AND adequate chunk parallelism.
             prefill_rows = int(visible_end_gpu.shape[0])
             prefill_parallel_unit_num = max(self._fp4_parallel_unit_num, prefill_rows)
