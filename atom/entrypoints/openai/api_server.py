@@ -20,6 +20,7 @@ import io
 import json
 import logging
 import os
+import tempfile
 import time
 import urllib.request
 import uuid
@@ -151,6 +152,7 @@ reasoning_dialect: Any = None
 reasoning_toggle: tuple[str, Any, Any] | None = None
 processor: Any | None = None
 model_name: str = ""
+processor_model_path: str = ""
 default_chat_template_kwargs: dict[str, Any] = {}
 custom_message_encoder: Any | None = None
 _seq_id_to_request_id: dict[int, str] = {}
@@ -625,7 +627,12 @@ def _has_multimodal_content(messages: list[Any]) -> bool:
         if not isinstance(content, list):
             continue
         for part in content:
-            if isinstance(part, dict) and part.get("type") in {"image", "image_url"}:
+            if isinstance(part, dict) and part.get("type") in {
+                "image",
+                "image_url",
+                "video",
+                "video_url",
+            }:
                 return True
     return False
 
@@ -658,17 +665,59 @@ def _load_image_from_url(url: str) -> "Image.Image":
     return Image.open(url).convert("RGB")
 
 
+def _load_video_from_url(url: str) -> list["Image.Image"]:
+    """Decode and sample a video without importing video deps for text/image use."""
+    from decord import VideoReader, cpu
+    from PIL import Image
+
+    temporary_path = None
+    if url.startswith("data:"):
+        try:
+            _, encoded = url.split(",", 1)
+            payload = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ValueError("Invalid base64 data URL for video_url") from exc
+        handle = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        handle.write(payload)
+        handle.close()
+        temporary_path = path = handle.name
+    elif url.startswith(("http://", "https://")):
+        with urllib.request.urlopen(url, timeout=60) as response:
+            payload = response.read()
+        handle = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        handle.write(payload)
+        handle.close()
+        temporary_path = path = handle.name
+    else:
+        path = url.removeprefix("file://")
+    try:
+        reader = VideoReader(path, ctx=cpu(0))
+        step = max(1, round(float(reader.get_avg_fps()) / 2.0))
+        indices = list(range(0, len(reader), step))[:256]
+        if len(indices) % 2:
+            indices.append(indices[-1])
+        return [
+            Image.fromarray(frame).convert("RGB")
+            for frame in reader.get_batch(indices).asnumpy()
+        ]
+    finally:
+        if temporary_path is not None:
+            os.unlink(temporary_path)
+
+
 def _get_multimodal_processor():
-    global processor, model_name
+    global processor, processor_model_path
     if processor is None:
-        logger.info(f"Loading multimodal processor from {model_name}...")
-        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        logger.info(f"Loading multimodal processor from {processor_model_path}...")
+        processor = AutoProcessor.from_pretrained(
+            processor_model_path, trust_remote_code=True
+        )
     return processor
 
 
 def _collect_multimodal_parts(
     messages: list[Any],
-) -> tuple[list[dict[str, Any]], list["Image.Image"]]:
+) -> tuple[list[dict[str, Any]], list["Image.Image"], list[list["Image.Image"]]]:
     """Normalize chat messages into processor form, loading every image.
 
     Content parts keep the order the client sent them in; the images are
@@ -676,6 +725,7 @@ def _collect_multimodal_parts(
     """
     processor_messages: list[dict[str, Any]] = []
     images: list[Image.Image] = []
+    videos: list[list[Image.Image]] = []
 
     for message in messages:
         content = getattr(message, "content", None)
@@ -709,9 +759,19 @@ def _collect_multimodal_parts(
                 image = _load_image_from_url(url)
                 images.append(image)
                 parts.append({"type": "image", "image": image})
+            elif part_type in {"video", "video_url"}:
+                value = part.get(part_type)
+                url = value.get("url") if isinstance(value, dict) else value
+                if not isinstance(url, str):
+                    raise ValueError(
+                        f"{part_type} content part must include a URL/path"
+                    )
+                video = _load_video_from_url(url)
+                videos.append(video)
+                parts.append({"type": "video", "video": video})
         processor_messages.append({"role": message.role, "content": parts})
 
-    return processor_messages, images
+    return processor_messages, images, videos
 
 
 def _images_before_text(
@@ -728,7 +788,7 @@ def _images_before_text(
         if not isinstance(content, list):
             reordered.append(message)
             continue
-        parts = [part for part in content if part["type"] == "image"]
+        parts = [part for part in content if part["type"] in {"image", "video"}]
         texts = [part["text"] for part in content if part["type"] == "text"]
         if texts:
             parts.append({"type": "text", "text": "\n".join(texts)})
@@ -742,22 +802,27 @@ def _prepare_multimodal_inputs(
     tools: Any = None,
 ) -> tuple[list[int], dict[str, Any]]:
     mm_processor = _get_multimodal_processor()
-    processor_messages, images = _collect_multimodal_parts(messages)
+    processor_messages, images, videos = _collect_multimodal_parts(messages)
 
-    if not images:
-        raise ValueError("Multimodal request did not contain any images")
+    if not images and not videos:
+        raise ValueError("Multimodal request did not contain images or videos")
 
     # Models whose processor deviates from the Qwen convention register their
     # own builder (e.g. Kimi-K3's messages+medias API and unexpanded
     # <|media_pad|> placeholders).
-    built = build_multimodal_inputs(
-        _get_engine_config(),
-        mm_processor,
-        processor_messages,
-        images,
-        chat_template_kwargs,
-        tools=tools,
-    )
+    if images and videos:
+        raise ValueError("Mixing images and videos in one request is not supported yet")
+
+    built = None
+    if not videos:
+        built = build_multimodal_inputs(
+            _get_engine_config(),
+            mm_processor,
+            processor_messages,
+            images,
+            chat_template_kwargs,
+            tools=tools,
+        )
     if built is not None:
         return built
 
@@ -770,12 +835,24 @@ def _prepare_multimodal_inputs(
         add_generation_prompt=True,
         **template_kwargs,
     )
-    if images and "<|image_pad|>" not in text:
+    if images and not any(token in text for token in ("<|image_pad|>", "<|image|>")):
         raise ValueError("Multimodal chat template did not emit image placeholders")
-    inputs = mm_processor(text=[text], images=images, return_tensors="pt")
+    processor_kwargs = {"do_sample_frames": False} if videos else {}
+    inputs = mm_processor(
+        text=[text],
+        images=images or None,
+        videos=videos or None,
+        return_tensors="pt",
+        **processor_kwargs,
+    )
+    pixel_values = inputs.get("pixel_values")
+    grid_thw = inputs.get("image_grid_thw")
+    if inputs.get("pixel_values_videos") is not None:
+        pixel_values = inputs["pixel_values_videos"]
+        grid_thw = inputs["video_grid_thw"]
     multimodal_data = {
-        "pixel_values": inputs["pixel_values"],
-        "image_grid_thw": inputs["image_grid_thw"],
+        "pixel_values": pixel_values,
+        "image_grid_thw": grid_thw,
     }
     return inputs["input_ids"][0].tolist(), multimodal_data
 
@@ -2473,7 +2550,8 @@ async def stop_profile():
 
 def main():
     """Main entry point for the server."""
-    global engine, tokenizer, model_name, default_chat_template_kwargs, _request_logger
+    global engine, tokenizer, model_name, processor_model_path
+    global default_chat_template_kwargs, _request_logger
     global tool_call_parser_cls, model_starts_in_reasoning, reasoning_toggle
     global reasoning_dialect, synthetic_token_text
     global custom_message_encoder, _stream_batch_dispatcher
@@ -2568,6 +2646,7 @@ def main():
             logger.info("Using inline chat template from --chat-template argument")
 
     model_name = args.served_model_name if args.served_model_name else args.model
+    processor_model_path = args.model
     custom_message_encoder = load_custom_message_encoder(args.model)
 
     logger.info(f"Initializing engine with model {args.model}...")
