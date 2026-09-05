@@ -44,6 +44,7 @@ on:
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
           - DeepSeek-V3.2-FP8 PTPC TP4
+          - DeepSeek-V3.2-FP8 DP8+EP+DBO
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -93,6 +94,7 @@ on:
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
           - DeepSeek-V3.2-FP8 PTPC TP4
+          - DeepSeek-V3.2-FP8 DP8+EP+DBO
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -142,6 +144,7 @@ on:
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
           - DeepSeek-V3.2-FP8 PTPC TP4
+          - DeepSeek-V3.2-FP8 DP8+EP+DBO
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -191,6 +194,7 @@ on:
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
           - DeepSeek-V3.2-FP8 PTPC TP4
+          - DeepSeek-V3.2-FP8 DP8+EP+DBO
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -240,6 +244,7 @@ on:
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
           - DeepSeek-V3.2-FP8 PTPC TP4
+          - DeepSeek-V3.2-FP8 DP8+EP+DBO
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -289,6 +294,7 @@ on:
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
           - DeepSeek-V3.2-FP8 PTPC TP4
+          - DeepSeek-V3.2-FP8 DP8+EP+DBO
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -338,6 +344,7 @@ on:
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
           - DeepSeek-V3.2-FP8 PTPC TP4
+          - DeepSeek-V3.2-FP8 DP8+EP+DBO
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -387,6 +394,7 @@ on:
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
           - DeepSeek-V3.2-FP8 PTPC TP4
+          - DeepSeek-V3.2-FP8 DP8+EP+DBO
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
