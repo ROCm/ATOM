@@ -1246,7 +1246,7 @@ def minimax_m3_sparse_attn_decode_asm(
         temporary_output=temporary_output,
         alibi_slopes=None,
         sinks=None,
-        sliding_window=-1,
+        sliding_window=0,
         ps=True,
     )
 
@@ -1339,7 +1339,7 @@ def _run_prefill_fp8_gluon(
         temporary_output=temporary_output,
         alibi_slopes=None,
         sinks=None,
-        sliding_window=-1,
+        sliding_window=0,
         ps=True,
     )
 
