@@ -5,10 +5,13 @@ RDNA4 GPU. ATOM runs attention and GEMM through Triton
 (`ATOM_USE_UNIFIED_ATTN=1`, `ATOM_USE_TRITON_GEMM=1`); the KV-cache write,
 RoPE and norms use native aiter HIP kernels.
 
-> **Navi (gfx1201) prerequisite:** aiter must be built for the arch — see
+> **Navi (gfx1200 / gfx1201) prerequisite:** aiter must be built for the arch — see
 > [ROCm/aiter#3846](https://github.com/ROCm/aiter/issues/3846). Short-term
-> fix: build aiter from source with `GPU_ARCHS=gfx1201` (a native build on
-> the card does this automatically).
+> fix: build aiter from source with `GPU_ARCHS=gfx1201` (Navi 48: RX 9070 /
+> RX 9070 XT / AI PRO R9700) or `GPU_ARCHS=gfx1200` (Navi 44: RX 9060 /
+> RX 9060 XT). A native build on the card does this automatically. Both are
+> RDNA4 and use the same Triton path below; the benchmarks here were
+> measured on gfx1201.
 
 ## Model
 
