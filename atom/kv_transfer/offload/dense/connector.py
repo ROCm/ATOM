@@ -168,6 +168,22 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             if req.load_spec is not None and self._do_load:
                 self._load_executor.submit(self._guard, "load", self._do_load_req, req)
             if req.save_spec is not None and self._do_save:
+                # Producer fence for the async KV save. The save gathers KV
+                # pages on a private `pack_stream` (kv_byte_codec.gpu_to_chunk_
+                # major_device_buffer) with no ordering against the forward's
+                # compute stream. The shared staging class documents that the KV
+                # caller -- this connector -- must record this fence
+                # (hybrid/kimi_k3/staging.py:43-59; hybrid/dsv4/connector.py is
+                # the only other caller that does). Record it here on the RPC
+                # thread, BEFORE this step's forward, so the event captures the
+                # prior forwards that wrote this prefix's [0, boundary) KV; the
+                # save worker waits it before the gather. Without it the gather
+                # reads torn/partially-written latent that is then faithfully
+                # reloaded -- silent, reload-count-scaling accuracy corruption.
+                if torch.cuda.is_available():
+                    ev = torch.cuda.Event()
+                    ev.record(torch.cuda.current_stream())
+                    req.producer_event = ev
                 self._save_executor.submit(self._guard, "save", self._do_save_req, req)
 
     # -- copy daemon thread ----------------------------------------------
@@ -284,6 +300,15 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         t_total0 = time.perf_counter()
         mask = torch.ones(len(toks), dtype=torch.bool)
         mask[:skip] = False
+
+        # Wait for the forward that produced these KV pages before the async
+        # gather reads them (fence recorded in `start_load_kv`). This runs on the
+        # off-TTFT save worker, so the host sync costs no serving latency; it is
+        # what makes the gather's source quiescent, the guarantee the staging
+        # class relies on but does not itself provide.
+        producer_event = getattr(req, "producer_event", None)
+        if producer_event is not None:
+            producer_event.synchronize()
 
         t_store0 = time.perf_counter()
         self._reset_gpu_connector_transfer_stats()

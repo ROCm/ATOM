@@ -169,6 +169,13 @@ class LMCacheReqMeta:
     # The recurrent-state leg of this request's load, when it has one. Appended
     # last for the same positional-compatibility reason as `load_operation`.
     state_load_spec: StateLoadSpec | None = None
+    # Producer fence for the async KV save. Recorded on the compute stream in
+    # `start_load_kv` (RPC thread) before this step's forward, and awaited in
+    # `_do_save_req` on the off-TTFT save worker before the pack_stream gather --
+    # so the gather never reads KV pages a prior forward is still writing.
+    # Without it the gather captures torn/partially-written latent that is then
+    # faithfully reloaded (silent corruption). `None` when offload runs on CPU.
+    producer_event: Any = None
 
 
 class LMCacheOffloadMetadata(ConnectorMetadata):
