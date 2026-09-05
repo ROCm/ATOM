@@ -1084,7 +1084,50 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         ), "num_attention_heads is not found in config"
 
         self.num_attention_heads = num_attention_heads // get_tp_group().world_size
-        self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
+        self.min_query_heads = _MLA_MIN_HEADS
+
+        # The layers handed to this builder are not necessarily the target's: a
+        # DSpark draft owns its own KV cache group, and therefore its own
+        # builder, while `model_config` keeps describing the target -- Kimi-K3
+        # has 96 query heads against its draft's 64. The persistent work
+        # descriptors planned below have to describe the kernel that actually
+        # runs, because planning one head width and dispatching another leaves
+        # the kernel indexing partials that were never planned. So read the
+        # width off the layers, the way ATOM native's DSparkProposer reads it
+        # off the draft's MLA module, and keep the config-derived value only as
+        # the fallback for builders constructed without layers. `min_query_heads`
+        # comes along because it is the other half of what the layer padded its
+        # queries to (see mla_min_query_heads).
+        from vllm.config import get_layers_from_vllm_config
+        from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+
+        mla_layers = [
+            layer
+            for layer in get_layers_from_vllm_config(
+                config, AttentionLayerBase, layer_names
+            ).values()
+            if getattr(layer, "num_heads", None) is not None
+        ]
+        layer_heads = {layer.num_heads for layer in mla_layers}
+        if len(layer_heads) == 1:
+            self.num_attention_heads = layer_heads.pop()
+            layer_min_heads = {
+                getattr(layer, "min_query_heads", _MLA_MIN_HEADS)
+                for layer in mla_layers
+            }
+            if len(layer_min_heads) == 1:
+                self.min_query_heads = layer_min_heads.pop()
+        elif layer_heads:
+            logger.warning(
+                "MLA metadata builder spans layers of differing query-head "
+                "counts %s; falling back to the model config (%d per rank).",
+                sorted(layer_heads),
+                self.num_attention_heads,
+            )
+
+        self.padded_num_attention_heads = max(
+            self.num_attention_heads, self.min_query_heads
+        )
         # Whether DCP decode can run in persistent mode on this GPU (gfx950 has
         # the lse persistent kernel, gfx942 does not — see dcp_utils). Cached
         # once to gate both the metadata sizing and the runtime persistent path.
@@ -1102,6 +1145,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             self.persistent_num_heads = mla_dcp_kernel_num_heads(
                 self.num_attention_heads,
                 dcp_size,
+                self.min_query_heads,
                 kv_cache_dtype=config.cache_config.cache_dtype,
                 # These descriptors are only ever handed to the kernel on the
                 # persistent path (`if use_persistent_metadata` in
