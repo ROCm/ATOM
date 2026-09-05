@@ -1207,6 +1207,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             return None
 
         block_regions: list[KVTransferRegion] = []
+        block_tensor_views: list[torch.Tensor] = []
         num_layers = runner.kv_cache.shape[0]
         for layer_id in range(num_layers):
             t = runner.kv_cache[layer_id]
@@ -1216,7 +1217,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     base_addr=t.data_ptr(),
                     total_bytes=t.numel() * t.element_size(),
                     unit_bytes=bpb,
+                    semantic_role=f"mla.kv.layer_{layer_id}",
                 )
+            )
+            block_tensor_views.append(
+                t.view(runner.config.num_kvcache_blocks, -1, t.shape[-1])
             )
 
         if hasattr(runner, "index_cache"):
@@ -1228,7 +1233,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                         base_addr=t.data_ptr(),
                         total_bytes=t.numel() * t.element_size(),
                         unit_bytes=bpb,
+                        semantic_role=f"mla.index.layer_{layer_id}",
                     )
+                )
+                block_tensor_views.append(
+                    t.view(runner.config.num_kvcache_blocks, -1, t.shape[-1])
                 )
 
         block_region_consumer_indices = None
@@ -1324,7 +1333,17 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             block_regions=block_regions,
             slot_regions=[],
             num_blocks=runner.config.num_kvcache_blocks,
+            block_tensor_views=block_tensor_views,
             block_region_consumer_indices=block_region_consumer_indices,
+            # MLA's latent projection is replicated across TP. Sparse MLA's
+            # index-key projection/cache is replicated as well; only the query
+            # heads and absorbed KV-B/output projections are TP-sharded.
+            # Consequently every PAGE byte published above is identical on
+            # every TP worker (DCP/PCP are separate axes and are rejected by
+            # the current LMCache MP connector).
+            tp_replication_factor=int(
+                getattr(runner.config, "tensor_parallel_size", 1) or 1
+            ),
         )
 
     def _build_dcp_indexer_prefill_meta(self, attn_metadata, bs: int, counts, var):

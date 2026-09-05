@@ -175,7 +175,7 @@ ARG SGLANG_REF="v0.5.17"
 LABEL com.rocm.atom.sglang_ref="${SGLANG_REF}"
 
 ENV PATH="/opt/venv/bin:${PATH}"
-ENV PYTHONPATH="/app/sglang/python:/app/ATOM:${PYTHONPATH}"
+ENV PYTHONPATH="/app/sglang/python:/app/ATOM"
 
 RUN echo "========== [SGLANG-ATOM 0/6] Check Aiter/FlyDSL/Triton versions before SGLang build ==========" && \
     "${VENV_PYTHON}" -m pip show atom amd-mori-nightly amd-aiter flydsl triton || true && \
@@ -483,37 +483,45 @@ RUN echo "========== Install atomesh binary ==========" && \
     cp target/release/atomesh /usr/local/bin/atomesh && \
     atomesh --version
 
-# ========== LMCache (HIP c_ops) for KV offload ==========
-# ATOM's KV offload uses the LMCache connector, which needs LMCache's c_ops
-# built for ROCm. NEVER `pip install lmcache` — it pulls CUDA torch and breaks
-# the ROCm stack. Build from source pinned to a release tag, against the image's
-# torch. KEY: the install must be EDITABLE (`pip install -e .`); at this tag a
-# non-editable `pip install .` silently SKIPS the c_ops extension and falls back
-# to the slow python backend. Verified end-to-end (tp8 offload store via c_ops)
-# on gfx950. NOTE: tp>1 offload also needs aiter's eager-NCCL-init fix
-# (device_id= to init_process_group); that belongs in aiter (tracked separately),
-# not here — the CI build_aiter stage picks it up once merged.
-ARG LMCACHE_TAG=v0.4.5
-# PYTORCH_ROCM_ARCH is inherited as ENV from the `base` stage (=${GPU_ARCH});
-# hipcc reads it to target both gfx942 and gfx950. Do not re-derive from
-# ${GPU_ARCH} here — ARG does not cross FROM so it would be empty in this stage.
-RUN echo "========== [ATOM] LMCache HIP c_ops (${LMCACHE_TAG}, arch=${PYTORCH_ROCM_ARCH}) ==========" && \
-    git clone https://github.com/LMCache/LMCache.git /opt/LMCache && \
-    cd /opt/LMCache && git checkout ${LMCACHE_TAG} && \
-    "${VENV_PYTHON}" -m pip install -r requirements/build.txt && \
-    CXX=hipcc BUILD_WITH_HIP=1 \
-      "${VENV_PYTHON}" -m pip install -e . --no-build-isolation --no-deps && \
-    "${VENV_PYTHON}" -m pip install --no-deps \
-        prometheus_client==0.25.0 aiofile==3.11.1 caio==0.9.25 && \
-    "${VENV_PYTHON}" -c "import torch, lmcache, lmcache.c_ops; \
+# ========== LMCache (ROCm 7.2.4 / torch 2.10) for KV offload ==========
+# Install the official wheel built for the image's exact PyTorch ABI. Keep
+# --no-deps so pip cannot replace the preinstalled ROCm torch stack.
+ARG LMCACHE_WHEEL_NAME=lmcache-0.5.5rc3+rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1-cp312-cp312-manylinux_2_39_x86_64.whl
+ARG LMCACHE_WHEEL_URL=https://github.com/LMCache/LMCache/releases/download/v0.5.5rc3-rocm-torch210/lmcache-0.5.5rc3%2Brocm7.2.4.torch2.10.git3d3aa833.cxx11abi1-cp312-cp312-manylinux_2_39_x86_64.whl
+ARG LMCACHE_WHEEL_SHA256=06cda2fef1c2cf3926ffa59c4ba13b6029c6e40d3fba6db2bc2e7350a29c280f
+RUN echo "========== [ATOM] Install LMCache ROCm torch 2.10 wheel ==========" && \
+    curl -fL "${LMCACHE_WHEEL_URL}" -o "/tmp/${LMCACHE_WHEEL_NAME}" && \
+    echo "${LMCACHE_WHEEL_SHA256}  /tmp/${LMCACHE_WHEEL_NAME}" | sha256sum -c - && \
+    "${VENV_PYTHON}" -m pip install \
+        prometheus_client==0.25.0 aiofile==3.11.1 aiofiles caio==0.9.25 \
+        blake3 redis sortedcontainers pyzmq cupy-rocm-7-0 \
+        cachetools cryptography numba openai \
+        opentelemetry-api==1.40.0 opentelemetry-sdk==1.40.0 \
+        opentelemetry-exporter-otlp==1.40.0 \
+        opentelemetry-exporter-prometheus==0.61b0 && \
+    "${VENV_PYTHON}" -m pip install --no-deps "/tmp/${LMCACHE_WHEEL_NAME}" && \
+    rm -f "/tmp/${LMCACHE_WHEEL_NAME}" && \
+    "${VENV_PYTHON}" -c "import torch; torch.cuda.is_available = lambda: True; import lmcache, lmcache.cuda_ops, lmcache.lmcache_native; \
 from lmcache.v1.cache_engine import LMCacheEngineBuilder; \
 from lmcache.v1.memory_management import MemoryFormat; \
 from lmcache.v1.lookup_client.factory import LookupClientFactory; \
 from lmcache.v1.config import LMCacheEngineConfig; \
 from lmcache.v1.metadata import LMCacheMetadata; \
+from lmcache.integration.atom import AtomMPSchedulerAdapter, AtomMPTransferSpec, AtomMPWorkerAdapter; \
+from lmcache.utils import EngineType; \
+from lmcache.v1.multiprocess.futures import DeviceMessagingFuture; \
+from lmcache.v1.multiprocess.group_view import EngineGroupInfo; \
 assert 'rocm' in torch.__version__, torch.__version__; \
-assert lmcache.c_ops.__file__.endswith('.so'), 'c_ops fell back to python backend!'; \
-print('OK: lmcache', lmcache.__version__, 'HIP c_ops; torch', torch.__version__)"
+assert lmcache.__version__.startswith('0.5.5rc3+rocm7.2.4.torch2.10'), lmcache.__version__; \
+assert lmcache.cuda_ops.__file__.endswith('.so'), lmcache.cuda_ops.__file__; \
+assert lmcache.lmcache_native.__file__.endswith('.so'), lmcache.lmcache_native.__file__; \
+assert hasattr(lmcache.cuda_ops, 'execute_object_group_transfer'), 'cuda_ops extension is incomplete'; \
+assert EngineType.ATOM.value == 'atom'; \
+assert DeviceMessagingFuture.__module__ == 'lmcache.v1.multiprocess.futures'; \
+assert AtomMPTransferSpec.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
+assert AtomMPSchedulerAdapter.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
+assert AtomMPWorkerAdapter.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
+print('OK: lmcache', lmcache.__version__, 'HIP cuda_ops; torch', torch.__version__)"
 
 # ========== SemiAnalysis aiperf agentic benchmark tool ==========
 # The SemiAnalysis fork, which is what carries the SA agentic datasets
