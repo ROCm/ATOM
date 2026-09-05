@@ -79,3 +79,60 @@ def test_empty_output_is_harmless():
     )
 
     assert scheduler.saves == [] and scheduler.loads == []
+
+
+class _ParkScheduler:
+    """A scheduler that reports a hit and then declines to load it."""
+
+    def __init__(self, hit: int, park: bool) -> None:
+        self._hit = hit
+        self._park = park
+        self.asked_park = 0
+
+    def get_num_new_matched_tokens(self, seq):
+        return self._hit, True
+
+    def should_park_for_load_after_alloc(self, seq) -> bool:
+        self.asked_park += 1
+        return self._park
+
+
+def _lookup_adapter(scheduler):
+    adapter = object.__new__(connector_mod.AtomLMCacheOffloadConnector)
+    adapter._scheduler = scheduler
+    adapter._seqs = SeqViewRegistry()
+    return adapter
+
+
+def _req(rid="r1", prompt_len=4096):
+    return SimpleNamespace(request_id=rid, prompt_token_ids=list(range(prompt_len)))
+
+
+def test_a_hit_atom_will_not_load_is_not_promised():
+    """The deadlock: vLLM parks on async=True and only the worker can release.
+
+    ATOM drops a hit that is below its transfer floor or not chunk aligned. If
+    the promise has already been made, nothing ever reports the load, the
+    request sits in WAITING_FOR_REMOTE_KVS forever and the engine spins with
+    every GPU idle.
+    """
+    scheduler = _ParkScheduler(hit=2560, park=False)
+    adapter = _lookup_adapter(scheduler)
+
+    assert adapter.get_num_new_matched_tokens(_req(), 0) == (0, False)
+    assert scheduler.asked_park == 1
+
+
+def test_a_hit_atom_will_load_is_promised_async():
+    scheduler = _ParkScheduler(hit=10496, park=True)
+    adapter = _lookup_adapter(scheduler)
+
+    assert adapter.get_num_new_matched_tokens(_req(), 0) == (10496, True)
+
+
+def test_no_hit_does_not_ask_about_parking():
+    scheduler = _ParkScheduler(hit=0, park=True)
+    adapter = _lookup_adapter(scheduler)
+
+    assert adapter.get_num_new_matched_tokens(_req(), 0) == (0, False)
+    assert scheduler.asked_park == 0
