@@ -8,6 +8,8 @@ weights live under ``language_model.*`` in the checkpoint, so this module keeps
 the same object hierarchy and skips the vision tower/projector tensors.
 """
 
+import functools
+import os
 from typing import ClassVar
 
 import torch
@@ -70,6 +72,21 @@ from atom.utils.forward_context import get_forward_context
 
 def _text_config(config):
     return getattr(config, "text_config", config)
+
+
+@functools.lru_cache(maxsize=1)
+def _flydsl_chunk_kda():
+    """aiter's FlyDSL KDA prefill (a gfx950 chunkwise forward replacing the
+    Triton prefill stack), or None if import or env-var makes it unavailable."""
+    if os.environ.get("ATOM_KDA_USE_FLYDSL", "1") == "0":
+        return None
+    try:
+        from aiter.ops.flydsl import flydsl_chunk_kda, is_flydsl_available
+    except ImportError:
+        return None
+    if not is_flydsl_available():
+        return None
+    return flydsl_chunk_kda
 
 
 def _normalize_kimi_config(config) -> None:
@@ -1130,10 +1147,38 @@ class KimiKDAAttention(nn.Module):
         initial_state: torch.Tensor | None,
         cu_seqlens: torch.Tensor | None,
         output_final_state: bool,
+        out: torch.Tensor | None = None,
+        max_query_len: int = 0,
     ):
+        flydsl_kda = _flydsl_chunk_kda()
+        if flydsl_kda is not None and max_query_len > 0 and cu_seqlens is not None:
+            # FlyDSL subsumes the prefill for shapes it covers, returning None
+            # otherwise so we fall through to chunk_kimi_delta_attn below.
+            result = flydsl_kda(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_query_len,
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=True,
+                use_gate_in_kernel=True,
+                use_beta_sigmoid_in_kernel=True,
+                lower_bound=self._kda_gate_lower_bound,
+                state_v_first=True,
+                out=out,
+            )
+            if result is not None:
+                return result
+
         from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
 
-        return chunk_kimi_delta_attn(
+        kda_out, last_state = chunk_kimi_delta_attn(
             q=q,
             k=k,
             v=v,
@@ -1160,6 +1205,10 @@ class KimiKDAAttention(nn.Module):
             # K-first and decode reads it transposed.
             state_v_first=True,
         )
+        if out is not None:
+            out.copy_(kda_out.squeeze(0))
+            return out, last_state
+        return kda_out, last_state
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # hidden_states is a (fp8, scale) tuple when input_layernorm fused the
@@ -1286,7 +1335,7 @@ class KimiKDAAttention(nn.Module):
             initial = gather_kda_initial_state(
                 ssm_state, state_indices_in, kda_metadata.has_initial_state
             )
-            kda_out, last_state = self._run_kda(
+            _, last_state = self._run_kda(
                 q,
                 k,
                 v,
@@ -1295,12 +1344,15 @@ class KimiKDAAttention(nn.Module):
                 initial,
                 query_start_loc,
                 True,
+                out=out,
+                # vLLM's GDN metadata has no equivalent field; without it the
+                # FlyDSL path cannot size its padding and defers to the fallback.
+                max_query_len=getattr(kda_metadata, "max_query_len", 0),
             )
-            # last_state already has ssm_state's dtype (fla preserves the
+            # last_state already has ssm_state's dtype (both paths preserve the
             # initial_state dtype; the gathered initial is allocated as such),
             # so no .to() cast is needed.
             ssm_state[state_indices] = last_state
-            out.copy_(kda_out.squeeze(0))
         elif kda_metadata.num_decodes > 0:
             # Slice the per-token cache-slot indices once (used for both the
             # conv update and the fused recurrence below).

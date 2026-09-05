@@ -60,6 +60,10 @@ class GDNAttentionMetadata:
     num_spec_decode_tokens: int
     num_actual_tokens: int
 
+    # Longest prefill query in the batch; the FlyDSL KDA prefill sizes its
+    # padding from it. Copied from a host int in attn metadata, so no sync.
+    max_query_len: int = 0
+
     has_initial_state: torch.Tensor | None = None
 
     spec_query_start_loc: torch.Tensor | None = None  # shape: [num_spec_decodes + 1,]
@@ -1164,6 +1168,7 @@ class GDNStateMixin:
             num_decode_tokens = 0
             num_prefill_tokens = 0
 
+        max_query_len = 0
         if num_prefills > 0:
             # Tokens already folded into each request's state before this
             # forward: earlier prefill chunks, or a resumed state checkpoint.
@@ -1182,6 +1187,7 @@ class GDNStateMixin:
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
                 compute_causal_conv1d_metadata(non_spec_query_start_loc)
             )
+            max_query_len = int(getattr(attn_metadata, "max_seqlen_q", 0) or 0)
         else:
             has_initial_state = None
 
@@ -1193,6 +1199,7 @@ class GDNStateMixin:
             num_spec_decodes=num_spec_decodes,
             num_spec_decode_tokens=num_spec_decode_tokens,
             num_actual_tokens=batch.total_tokens_num,
+            max_query_len=max_query_len,
             has_initial_state=has_initial_state,
             spec_query_start_loc=spec_query_start_loc,
             non_spec_query_start_loc=non_spec_query_start_loc,
