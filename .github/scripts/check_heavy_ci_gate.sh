@@ -13,6 +13,10 @@ EVENT_NAME="${GITHUB_EVENT_NAME:-}"
 EVENT_PATH="${GITHUB_EVENT_PATH:-}"
 REPO="${GITHUB_REPOSITORY:-}"
 CI_GATE_LABELS="${CI_GATE_LABELS:-ci:full}"
+CI_GATE_DUPLICATE_SUCCESS_JOB_PATTERN="${CI_GATE_DUPLICATE_SUCCESS_JOB_PATTERN:-}"
+DUPLICATE_RUN_ID=""
+DUPLICATE_RUN_EVENT=""
+DUPLICATE_RUN_URL=""
 
 trim() {
   sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
@@ -108,6 +112,65 @@ PY
   echo "${filter_result}"
 }
 
+find_duplicate_successful_heavy_run() {
+  if [ -z "${CI_GATE_DUPLICATE_SUCCESS_JOB_PATTERN}" ]; then
+    return 1
+  fi
+
+  local head_sha workflow_ref workflow_file current_run_id run_rows
+  local run_id run_event run_url job_names
+
+  head_sha="$(jq -r '.pull_request.head.sha // empty' "${EVENT_PATH}")"
+  workflow_ref="${GITHUB_WORKFLOW_REF:-}"
+  workflow_file="${workflow_ref%@*}"
+  workflow_file="${workflow_file##*/}"
+  current_run_id="${GITHUB_RUN_ID:-0}"
+  case "${current_run_id}" in
+    ''|*[!0-9]*) current_run_id=0 ;;
+  esac
+
+  if [ -z "${head_sha}" ] || [ -z "${workflow_file}" ]; then
+    echo "Missing head SHA or workflow file; cannot check duplicate heavy CI runs."
+    return 1
+  fi
+
+  echo "Checking for prior successful ${workflow_file} heavy CI run on head SHA ${head_sha}..."
+  if ! run_rows="$(
+    gh api "repos/${REPO}/actions/workflows/${workflow_file}/runs" \
+      --method GET \
+      -F "head_sha=${head_sha}" \
+      -F "status=success" \
+      -F "per_page=20" \
+      --jq ".workflow_runs[] | select(.id != ${current_run_id}) | [.id, .event, .html_url] | @tsv"
+  )"; then
+    echo "Failed to query existing workflow runs; continuing heavy CI gate."
+    return 1
+  fi
+
+  while IFS=$'\t' read -r run_id run_event run_url; do
+    if [ -z "${run_id}" ]; then
+      continue
+    fi
+
+    if ! job_names="$(
+      gh api --paginate "repos/${REPO}/actions/runs/${run_id}/jobs" \
+        --jq '.jobs[] | select(.conclusion == "success") | .name'
+    )"; then
+      echo "Failed to query jobs for run ${run_id}; ignoring it for duplicate detection."
+      continue
+    fi
+
+    if printf '%s\n' "${job_names}" | grep -Eq "${CI_GATE_DUPLICATE_SUCCESS_JOB_PATTERN}"; then
+      DUPLICATE_RUN_ID="${run_id}"
+      DUPLICATE_RUN_EVENT="${run_event}"
+      DUPLICATE_RUN_URL="${run_url}"
+      return 0
+    fi
+  done <<< "${run_rows}"
+
+  return 1
+}
+
 emit_decision() {
   local should_run="$1"
   local reason="$2"
@@ -115,6 +178,7 @@ emit_decision() {
   local review_decision="${4:-}"
   local approval_count="${5:-0}"
   local changes_requested_count="${6:-0}"
+  local duplicate_run_url="${7:-}"
 
   {
     echo "should_run=${should_run}"
@@ -123,6 +187,7 @@ emit_decision() {
     echo "review_decision=${review_decision}"
     echo "approval_count=${approval_count}"
     echo "changes_requested_count=${changes_requested_count}"
+    echo "duplicate_run_url=${duplicate_run_url}"
   } >> "${OUTPUT_FILE}"
 
   echo "Heavy CI gate: should_run=${should_run} reason=${reason}"
@@ -132,6 +197,9 @@ emit_decision() {
   if [ -n "${review_decision}" ]; then
     echo "Review decision: ${review_decision}"
     echo "Latest approvals: ${approval_count}; latest changes requested: ${changes_requested_count}"
+  fi
+  if [ -n "${duplicate_run_url}" ]; then
+    echo "Duplicate successful run: ${duplicate_run_url}"
   fi
 
   if [ -n "${SUMMARY_FILE}" ]; then
@@ -146,6 +214,9 @@ emit_decision() {
         echo "- Review decision: \`${review_decision}\`"
         echo "- Latest approvals: \`${approval_count}\`"
         echo "- Latest changes requested: \`${changes_requested_count}\`"
+      fi
+      if [ -n "${duplicate_run_url}" ]; then
+        echo "- Duplicate successful run: ${duplicate_run_url}"
       fi
     } >> "${SUMMARY_FILE}"
   fi
@@ -195,6 +266,11 @@ fi
 
 OWNER="${REPO%%/*}"
 NAME="${REPO#*/}"
+
+if find_duplicate_successful_heavy_run; then
+  emit_decision "false" "duplicate-successful-run" "" "" "0" "0" "${DUPLICATE_RUN_URL}"
+  exit 0
+fi
 
 MATCHED_LABEL="$(find_allowed_pr_label || true)"
 if [ -n "${MATCHED_LABEL}" ]; then
