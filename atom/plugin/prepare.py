@@ -14,22 +14,18 @@ _CURRENT_FRAMEWORK = "atom"
 
 
 def is_sglang() -> bool:
-    global _CURRENT_FRAMEWORK
     return bool(_CURRENT_FRAMEWORK.lower() in ["sglang", "sgl"])
 
 
 def is_vllm() -> bool:
-    global _CURRENT_FRAMEWORK
     return bool(_CURRENT_FRAMEWORK.lower() in ["vllm"])
 
 
 def is_rtpllm() -> bool:
-    global _CURRENT_FRAMEWORK
     return bool(_CURRENT_FRAMEWORK.lower() in ["rtpllm"])
 
 
 def is_plugin_mode() -> bool:
-    global _CURRENT_FRAMEWORK
     return bool(_CURRENT_FRAMEWORK.lower() in _SUPPORTED_FRAMEWORKS_FOR_PLUGIN_MODE)
 
 
@@ -89,7 +85,7 @@ def _prepare_model_atom_sglang(
     # Patch SGLang graph_capture to also enter aiter's ca_comm.capture(),
     # avoiding hipMemcpyAsync in aiter collectives when model uses aiter's
     # custom all_reduce (same fix as atom/plugin/vllm/graph_capture_patch.py)
-    from atom.plugin.sglang.graph_capture_patch import apply_graph_capture_patch
+    from atom.plugin.sglang.patches.graph_capture_patch import apply_graph_capture_patch
 
     apply_graph_capture_patch()
     return _instantiate_prepared_model(config, atom_config, model_cls)
@@ -149,15 +145,15 @@ def prepare_model(config: Any, engine: str):
         )
 
     # import here to avoid partial initialization
+    from atom.plugin.config import generate_atom_config_for_plugin_mode
+
     from .register import (
         _ATOM_SUPPORTED_MODELS,
+        init_aiter_dist,
         # register_ops_to_vllm,
         register_ops_to_sglang,
-        init_aiter_dist,
         set_attn_cls,
     )
-
-    from atom.plugin.config import generate_atom_config_for_plugin_mode
 
     atom_config = generate_atom_config_for_plugin_mode(config)
 

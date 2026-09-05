@@ -610,8 +610,12 @@ class SGLangGDNForwardContext:
         reuse_current_context = current_context.context is not None
         prev_attn_metadata = current_context.attn_metadata
         prev_context_kv = current_context.kv_cache_data
+        active_kv = forward_context.kv_cache_data
+        if reuse_current_context:
+            active_kv = dict(prev_context_kv or {})
+            active_kv.update(forward_context.kv_cache_data)
         try:
-            set_kv_cache_data(forward_context.kv_cache_data)
+            set_kv_cache_data(active_kv)
             attn_md = (
                 copy.copy(prev_attn_metadata)
                 if reuse_current_context and prev_attn_metadata is not None
@@ -625,7 +629,7 @@ class SGLangGDNForwardContext:
                 # ranks skip this binder and would never join that collective.
                 # Preserve all outer attention fields while injecting GDN data.
                 current_context.attn_metadata = attn_md
-                current_context.kv_cache_data = forward_context.kv_cache_data
+                current_context.kv_cache_data = active_kv
             else:
                 set_forward_context(
                     attn_metadata=attn_md,

@@ -380,6 +380,7 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                 input_ids=input_ids,
                 input_embeds=input_embeds,
                 set_forward_context=not self.model_arch_spec.wrapper_binds_gdn_context,
+                save_kv_cache=model_kwargs.get("save_kv_cache"),
             ) as runtime:
                 if self.model_arch_spec.bind_cache_views is not None:
                     self.model_arch_spec.bind_cache_views(self.model, runtime)

@@ -115,7 +115,7 @@ def prepare_model(config: Any):
     # Patch SGLang graph_capture to also enter aiter's ca_comm.capture(),
     # avoiding hipMemcpyAsync in aiter collectives when model uses aiter's
     # custom all_reduce (same fix as atom/plugin/vllm/graph_capture_patch.py).
-    from atom.plugin.sglang.graph_capture_patch import apply_graph_capture_patch
+    from atom.plugin.sglang.patches.graph_capture_patch import apply_graph_capture_patch
 
     apply_graph_capture_patch()
 

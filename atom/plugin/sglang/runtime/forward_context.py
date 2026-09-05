@@ -702,6 +702,7 @@ def _set_atom_forward_context(
     atom_config: Any,
     forward_batch: ForwardBatch,
     positions: torch.Tensor,
+    save_kv_cache: bool | None = None,
 ) -> None:
     """Bridge SGLang batch metadata into ATOM's global forward context."""
 
@@ -757,6 +758,15 @@ def _set_atom_forward_context(
         else:
             max_seqlen_q = 1 if forward_mode.is_decode_or_idle() else 0
         attn_metadata = _build_generic_attention_metadata(forward_batch, max_seqlen_q)
+    # SGLang attention backends normally honor save_kv_cache=False by skipping
+    # their explicit set_kv_buffer call. Native ATOM attention writes K/V inside
+    # its kernel instead, where slot_mapping=-1 is the established no-write
+    # sentinel. Translate the SGLang flag here to preserve the same semantics.
+    if (
+        save_kv_cache is False
+        and getattr(attn_metadata, "slot_mapping", None) is not None
+    ):
+        attn_metadata.slot_mapping = torch.full_like(attn_metadata.slot_mapping, -1)
     batch_size = int(forward_batch.batch_size)
     is_dummy_run = _is_dummy_forward(forward_batch)
     is_prefill = forward_mode.is_prefill()
@@ -837,6 +847,7 @@ class SGLangPluginRuntime:
     input_ids: torch.Tensor | None = None
     input_embeds: torch.Tensor | None = None
     set_forward_context: bool = True
+    save_kv_cache: bool | None = None
     _original_forward_batch: ForwardBatch = field(init=False, repr=False)
     _is_dummy_run: bool = field(init=False, default=False)
     _exit_stack: ExitStack = field(init=False, repr=False)
@@ -865,6 +876,7 @@ class SGLangPluginRuntime:
                 self.atom_config,
                 self.forward_batch,
                 self.positions,
+                save_kv_cache=self.save_kv_cache,
             )
             self._exit_stack.callback(_reset_atom_forward_context)
         return self
