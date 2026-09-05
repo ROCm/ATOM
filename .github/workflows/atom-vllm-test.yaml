@@ -158,13 +158,7 @@ jobs:
             model_path: "moonshotai/Kimi-K3"
             draft_model_path: "Inferact/Kimi-K3-DSpark"
             client_command: "lm_eval --model local-completions --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot ${LM_EVAL_NUM_FEWSHOT} --output_path ${OUTPUT_PATH}"
-            # K3 weights are ~190 GiB/GPU, and neither the FULL cudagraph pools nor
-            # the aiter MLA split-KV workspace is part of the KV budget vLLM profiles.
-            # Measured per GPU (288 GiB): the pool costs ~1 GiB per captured size and
-            # the workspace scales sublinearly with the capture bound (31.5 GiB at 512,
-            # 24.5 GiB at 256). So capture few sizes rather than merely smaller ones,
-            # and leave the KV cache small -- it was never the constraint here.
-            extra_args: "--trust-remote-code --language-model-only --tensor-parallel-size 8 --decode-context-parallel-size 8 --kv-cache-dtype fp8 --max-model-len 16384 --max-num-seqs 64 --max-num-batched-tokens 16384 --gpu-memory-utilization 0.75 --block-size 128 --enable-prefix-caching --mamba-cache-mode align --compilation-config '{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"cudagraph_capture_sizes\":[8,16,32,64,128,192]}' --additional-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*self_attn.[qkv]_conv1d*\",\"*block_sparse_moe.experts*\",\"*block_sparse_moe.routed_expert_*\",\"*vision_tower*\",\"*mm_projector*\"]}}' --speculative-config '{\"method\":\"dspark\",\"model\":\"/models/Inferact/Kimi-K3-DSpark\",\"num_speculative_tokens\":7}'"
+            extra_args: "--trust-remote-code --language-model-only --tensor-parallel-size 8 --decode-context-parallel-size 8 --kv-cache-dtype fp8 --max-model-len 16384 --max-num-seqs 64 --max-num-batched-tokens 16384 --gpu-memory-utilization 0.75 --block-size 128 --enable-prefix-caching --mamba-cache-mode align --compilation-config '{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\"}' --additional-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*self_attn.[qkv]_conv1d*\",\"*block_sparse_moe.experts*\",\"*block_sparse_moe.routed_expert_*\",\"*vision_tower*\",\"*mm_projector*\"]}}' --speculative-config '{\"method\":\"dspark\",\"model\":\"/models/Inferact/Kimi-K3-DSpark\",\"num_speculative_tokens\":7}'"
             lm_eval_num_fewshot: 5
             accuracy_test_threshold: 0.95
             runner: spur-runner-mi355x-8gpu
