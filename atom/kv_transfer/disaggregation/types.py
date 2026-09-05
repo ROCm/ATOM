@@ -155,6 +155,13 @@ class KVTransferTensors:
     plane count explicit so registration can reject a missing plane.
     ``staging_region`` plus ``gather_slot``/``scatter_slot`` cover only the
     compressor-state PD staging pool and are invalid as sidecar SLOT sources.
+
+    ``tp_replication_factor`` describes byte-identical PAGE replicas, not the
+    number of physical consumers. A value equal to tensor parallel size lets a
+    remote cache store one copy while every TP worker still retrieves into its
+    own local GPU cache. The declaration applies to every ``block_region``;
+    mixed replicated/sharded layouts must leave it at ``1`` until the transfer
+    protocol can describe replication per region group.
     """
 
     # Block-indexed PAGE regions, indexed forward by physical block id.
@@ -176,6 +183,15 @@ class KVTransferTensors:
     scatter_slot: Callable[[int, int], None] | None = None
     # Appended for positional compatibility with existing generic descriptors.
     expected_full_slot_region_count: int | None = None
+    # Zero-copy, physical-order views paired with block regions.
+    # Each view is [num_units, physical_slots_per_unit, opaque_width]; it may
+    # retain its native dtype, and one dim-0 unit must cover exactly the paired
+    # region's unit_bytes. The last two dimensions describe copy geometry, not
+    # a semantic token/head layout.
+    block_tensor_views: list[Any] = field(default_factory=list)
+    # Number of TP workers whose complete PAGE layout is byte-identical.
+    # ``1`` means no cross-rank deduplication is safe.
+    tp_replication_factor: int = 1
     # The attention metadata builder, published by `ModelRunner` after the tier
     # is built inside `register_kv_caches` -- the one place builder and connector
     # are both in scope. The kimi_k3 state tier reads its `state_runtime.
