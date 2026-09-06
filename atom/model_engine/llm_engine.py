@@ -388,6 +388,12 @@ class LLMEngine:
                 "wanted_tokens",
                 "reusable_tokens",
                 "full_tokens",
+                # Reuse served from the CPU offload tier. Every rank reports it
+                # in `cache_statistics()`, but it was missing from this sum, so
+                # the DP-aggregated snapshot dropped the one counter the offload
+                # feature exists to move. Shares the `reusable` denominator with
+                # the HBM series but no numerator -- scored separately below.
+                "offload_tokens",
                 "checkpoints_kept",
                 "checkpoints_dropped",
                 "checkpoints_evicted",
@@ -401,6 +407,13 @@ class LLMEngine:
                 # placement that converges from one that pays per request, and
                 # one of them missing makes the other unreadable.
                 "chunks_cut_for_end",
+                # Whether the joint state+KV load found a boundary to work
+                # with, and what the state leg cost when it did. Summed like
+                # the rest: a boundary is per admission and every rank admits
+                # the same request.
+                "joint_boundaries",
+                "state_hbm",
+                "state_tier",
             )
         }
         # `reusable`, not `full`: a request's trailing block is never a reuse
@@ -433,6 +446,12 @@ class LLMEngine:
             "state_recoverable_loss": rate(
                 totals["wanted_tokens"] - totals["cached_tokens"], compressed
             ),
+            # CPU-tier reuse against the same `reusable` denominator as `hit`,
+            # matching `EngineStats.offload_hit_rate`. Disjoint from the HBM
+            # `hit` numerator (the offload tier serves what HBM missed), so it
+            # is not part of the `hit`/`compressed_hit` product and stands on
+            # its own.
+            "offload_hit": rate(totals["offload_tokens"]),
         }
 
     def get_metrics_statistics(self) -> dict[str, Any]:
@@ -628,6 +647,7 @@ class InputOutputProcessor:
                 "qwen3_5_text",
                 "qwen3_5_moe_text",
                 "kimi_linear",
+                "glm5_next_text",
                 "deepseek_v4",
             }
         )

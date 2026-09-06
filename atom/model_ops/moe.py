@@ -4270,7 +4270,17 @@ class FusedMoE(torch.nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         if self.balance_router_logits is not None:
-            router_logits = self.balance_router_logits[: hidden_states.shape[0]]
+            # Match the dtype of the logits being replaced. The table is built
+            # once at the default dtype, but aiter's `biased_grouped_topk`
+            # dispatches on `gating_output.dtype()` and then reinterpret_casts
+            # `correction_bias` to that same scalar_t -- so handing it a bf16
+            # table for a router whose bias is fp32 makes the kernel read that
+            # fp32 buffer at half width, i.e. garbage bias over half the
+            # experts. Only fake-EPLB reaches this, so the cast costs nothing
+            # on a real run.
+            router_logits = self.balance_router_logits[: hidden_states.shape[0]].to(
+                router_logits.dtype
+            )
         return torch.ops.aiter.moe_forward(
             hidden_states, router_logits, self.layer_name
         )

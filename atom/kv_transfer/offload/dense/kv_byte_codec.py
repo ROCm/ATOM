@@ -40,7 +40,13 @@ logger = logging.getLogger("atom")
 class DenseKVByteCodec:
     """Per-block byte mover between paged GPU KV tensors and flat buffers."""
 
-    def __init__(self, kv_caches: dict, num_blocks: int | None = None) -> None:
+    def __init__(
+        self,
+        kv_caches: dict,
+        num_blocks: int | None = None,
+        *,
+        permit_per_request_state: bool = False,
+    ) -> None:
         """``kv_caches``: ordered ``{layer_name: KVCacheTensor}`` from
         ``register_kv_caches``. We flatten every movable per-layer tensor (K, V,
         and fp8 scales when present) into one ordered segment list.
@@ -61,9 +67,41 @@ class DenseKVByteCodec:
         we take ``num_blocks`` explicitly and derive each segment's per-block
         byte stride as ``segment_bytes / num_blocks``. ``num_blocks`` falls back
         to ``segment.shape[0]`` (the block-major assumption) when not supplied,
-        preserving the original non-MLA behaviour."""
+        preserving the original non-MLA behaviour.
+
+        ``permit_per_request_state`` gates whether a per-request recurrent-state
+        tensor in ``kv_caches`` is skipped or rejected. A hybrid connector that
+        moves state through its own tier (kimi_k3) sets it True to skip. The
+        plain dense path leaves it False: a GDN model (Qwen3-Next, Qwen3.5)
+        registered on ``lmcache_offload`` puts its slot-indexed mamba
+        caches in this dict, and the dense path has no rule keeping its KV
+        prefix aligned with that linear state -- restoring KV while the state is
+        stale is silent wrong output. Skipping the tensor here used to hide that
+        behind a successful registration; failing closed keeps those models off
+        the dense path, which is where the pre-PR divisibility ``ValueError``
+        left them."""
         self._segments: list[torch.Tensor] = []
         for kvt in kv_caches.values():
+            # A hybrid registers its per-request recurrent state in the same
+            # dict, because the linear-attention forward reads it from
+            # `kv_cache_data`. It is indexed by request slot, not by block, so
+            # including it either fails the divisibility check below or -- if
+            # the slot count happens to divide `num_blocks` -- inflates
+            # `bytes_per_block` past what `block_regions` describes. The tier
+            # reaches those bytes through `state_entry_views`.
+            if getattr(kvt, "per_request_state", False):
+                if not permit_per_request_state:
+                    raise ValueError(
+                        "DenseKVByteCodec: per-request recurrent state was "
+                        "registered on the plain dense offload path. This is a "
+                        "GDN/linear-attention model (e.g. Qwen3-Next, "
+                        "Qwen3.5); the dense path would restore its "
+                        "KV prefix while the recurrent state stayed stale -- "
+                        "silent wrong output. Use a connector that owns a state "
+                        "tier (kimi_k3), which passes "
+                        "permit_per_request_state=True."
+                    )
+                continue
             for t in (
                 getattr(kvt, "k_cache", None),
                 getattr(kvt, "v_cache", None),

@@ -5,23 +5,22 @@
 Two properties have to hold, and neither shows up in a throughput number:
 
 * the destination is written exactly as the pre-`array("i")` loop wrote it.
-  Both marshals hoist the per-row `[i] = 0` into one span memset, which is
+  The marshal hoists the per-row `[i] = 0` into one span memset, which is
   only equivalent because the old loop cleared precisely the rows it filled.
 * nobody may retain a zero-copy int32 view of a block_table. `array("i")`
   refuses to resize while exporting a buffer, so such a view turns the next
   `BlockManager` append into a `BufferError`, far from the code that took it.
 
-The marshals are exercised as unbound methods on a stub that supplies what
-they read, so the arithmetic under test is the shipped arithmetic. Every
-builder here lives in a module that imports AITER at load, so this file skips
-whole on a plain runner; the contract of the `pack_rows` helper they share is
-in `test_pack_rows.py`, which does not, and so runs in CI.
+The marshal is exercised as an unbound method on a stub that supplies what it
+reads, so the arithmetic under test is the shipped arithmetic. Every builder
+here lives in a module that imports AITER at load, so this file skips whole on
+a plain runner; the contract of the `pack_rows` helper it uses is in
+`test_pack_rows.py`, which does not, and so runs in CI.
 """
 
 from __future__ import annotations
 
 import array
-from functools import partial
 from types import SimpleNamespace
 
 import numpy as np
@@ -34,12 +33,6 @@ CommonAttentionBuilder = pytest.importorskip(
     reason="the common builder's module imports aiter at load",
     exc_type=ImportError,
 ).CommonAttentionBuilder
-
-V4Builder = pytest.importorskip(
-    "atom.model_ops.attentions.deepseek_v4_attn",
-    reason="the V4 builder's module imports aiter at load",
-    exc_type=ImportError,
-).DeepseekV4AttentionMetadataBuilder
 
 AiterBuilder = pytest.importorskip(
     "atom.model_ops.attentions.aiter_attention",
@@ -75,19 +68,13 @@ def _golden(rows: list[array.array]) -> np.ndarray:
 def _stub(dst: np.ndarray):
     """A builder stub whose `forward_vars["block_tables"]` wraps `dst`."""
     buf = SimpleNamespace(np=dst, copy_to_gpu=lambda n: ("gpu", n))
-    stub = SimpleNamespace(
+    return SimpleNamespace(
         model_runner=SimpleNamespace(forward_vars={"block_tables": buf})
     )
-    # The V4 marshal delegates through `self`, as it does on a real builder,
-    # which inherits exactly this method.
-    stub.prepare_block_tables = partial(
-        CommonAttentionBuilder.prepare_block_tables, stub
-    )
-    return stub
 
 
 @pytest.mark.parametrize("bs", [0, 1, 2, 50, 64, 256])
-def test_common_marshal_is_bit_exact_and_stays_in_its_rows(bs):
+def test_marshal_is_bit_exact_and_stays_in_its_rows(bs):
     rows = _rows(bs)
     dst = np.full((MAX_BS, MAX_COLS), POISON, dtype=np.int32)
 
@@ -96,23 +83,7 @@ def test_common_marshal_is_bit_exact_and_stays_in_its_rows(bs):
     )
 
     assert np.array_equal(dst, _golden(rows))
-    assert (dst[bs:] == POISON).all(), "wrote past the scheduled rows"
-
-
-@pytest.mark.parametrize("bs", [0, 1, 2, 50, 64, 256])
-def test_v4_marshal_is_bit_exact_and_stays_in_its_rows(bs):
-    # The V4 marshal takes `scheduled_bs` separately and is handed a batch that
-    # may carry more rows than are scheduled: the surplus must not be written.
-    rows = _rows(bs + 3)
-    dst = np.full((MAX_BS, MAX_COLS), POISON, dtype=np.int32)
-
-    out = V4Builder._populate_block_tables(
-        _stub(dst), SimpleNamespace(block_tables=rows), bs
-    )
-
-    assert out == ("gpu", bs)
-    assert np.array_equal(dst, _golden(rows[:bs]))
-    assert (dst[bs:] == POISON).all(), "wrote past the scheduled rows"
+    assert (dst[bs:] == POISON).all(), "wrote past the batch's rows"
 
 
 def test_empty_batch_writes_nothing():
@@ -121,7 +92,6 @@ def test_empty_batch_writes_nothing():
     batch = SimpleNamespace(block_tables=[])
 
     CommonAttentionBuilder.prepare_block_tables(_stub(dst), batch)
-    V4Builder._populate_block_tables(_stub(dst), batch, 0)
 
     assert (dst == POISON).all()
     assert batch.block_tables == []
@@ -138,9 +108,6 @@ def test_marshal_leaves_no_buffer_export_on_the_row():
 
     CommonAttentionBuilder.prepare_block_tables(
         _stub(dst), SimpleNamespace(block_tables=rows)
-    )
-    V4Builder._populate_block_tables(
-        _stub(dst), SimpleNamespace(block_tables=rows), len(rows)
     )
 
     for row in rows:

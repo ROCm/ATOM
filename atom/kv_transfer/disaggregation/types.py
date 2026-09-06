@@ -58,7 +58,31 @@ class LoadOperationId:
 
 LoadCompletionId = ReqId | LoadOperationId
 
-ConnectorCompletionId = ReqId | SaveOperationId | LoadOperationId
+
+@dataclass(frozen=True)
+class StateStoreOperationId:
+    """Exact identity of one hand-out of a state checkpoint to the CPU tier.
+
+    Not keyed by request: by the time a state store lands, the request that
+    produced the checkpoint is long gone and only the prefix hash remains. But
+    the hash alone is not an identity -- the same prefix is stored again after
+    an eviction or a load miss, and `KVOutputAggregator` tombstones every
+    `(channel, operation_id)` it has taken quorum on, so a second store under a
+    bare hash is dropped as a duplicate: its pin is never settled and its
+    bytes are never re-indexed. `generation` is what separates the attempts.
+    """
+
+    prefix_hash: int
+    generation: int
+
+    def __post_init__(self) -> None:
+        if self.generation < 0:
+            raise ValueError("state store generation must be nonnegative")
+
+
+ConnectorCompletionId = (
+    ReqId | SaveOperationId | LoadOperationId | StateStoreOperationId
+)
 ConnectorCompletionKey = tuple[str, ConnectorCompletionId]
 
 # ---------------------------------------------------------------------------
@@ -152,6 +176,15 @@ class KVTransferTensors:
     scatter_slot: Callable[[int, int], None] | None = None
     # Appended for positional compatibility with existing generic descriptors.
     expected_full_slot_region_count: int | None = None
+    # The attention metadata builder, published by `ModelRunner` after the tier
+    # is built inside `register_kv_caches` -- the one place builder and connector
+    # are both in scope. The kimi_k3 state tier reads its `state_runtime.
+    # checkpoint_spec.layout_id` to fold the state geometry into every key. Typed
+    # `object` because `types` must not import the model engine; None on every
+    # layout that has no state tier to name. Declared here rather than set as a
+    # loose runtime attribute so the field the connector reads is part of the
+    # contract, not an undocumented assignment two layers away.
+    state_backend: object | None = None
 
 
 @dataclass
@@ -271,6 +304,22 @@ class ConnectorMetadata:
     and the worker-side connector consumes it in ``start_load_kv``.
     """
 
+    #: Attributes whose truthiness means "the worker has something to do this
+    #: step". A subclass **extends** this rather than replacing it, and owns
+    #: only its own fields -- which is the point: the engine drops metadata
+    #: that reports no work, so a field added to a subclass and not listed
+    #: here leaves every request parked against it waiting for a report nobody
+    #: was asked to produce. Keeping the list next to the fields it names is
+    #: what makes that omission local instead of a shared table three
+    #: connector families have to remember to edit.
+    WORK_FIELDS: tuple[str, ...] = (
+        "reqs_to_recv",
+        "reqs_to_save",
+        "reqs_to_send",
+        "reqs_in_batch",
+        "reqs_not_processed",
+    )
+
     def __init__(self) -> None:
         self.reqs_to_recv: dict[ReqId, ReqMeta] = {}
         self.reqs_to_save: dict[ReqId, ReqMeta] = {}
@@ -278,6 +327,10 @@ class ConnectorMetadata:
         self.reqs_in_batch: set[ReqId] = set()
         self.reqs_not_processed: set[ReqId] = set()
         self.request_id_to_transfer_id: dict[ReqId, int] = {}
+
+    def has_work(self) -> bool:
+        """Whether the worker has anything to do with this snapshot."""
+        return any(bool(getattr(self, name, None)) for name in self.WORK_FIELDS)
 
     @staticmethod
     def _build_req_meta(
@@ -343,19 +396,33 @@ def completion_req_key(completion: ConnectorCompletionId) -> str:
     return str(getattr(completion, "req_id", completion))
 
 
+#: Fallback for objects that are not `ConnectorMetadata` -- test doubles and
+#: duck-typed sub-metas. Real metadata answers through `has_work`; this list is
+#: deliberately not the place to register a new field.
+_DUCK_TYPED_WORK_FIELDS = (
+    "requests",
+    "state_loads",
+    "state_stores",
+    "lookup_requests_in_step",
+    "reqs_to_recv",
+    "reqs_to_save",
+    "reqs_to_send",
+    "reqs_in_batch",
+    "reqs_not_processed",
+)
+
+
 def connector_metadata_has_work(metadata: object | None) -> bool:
-    """Return whether connector metadata contains dispatchable work."""
+    """Return whether connector metadata contains dispatchable work.
+
+    Asks the metadata rather than inspecting it, so that each connector family
+    declares its own work fields next to where it defines them. The engine
+    drops a snapshot that reports nothing, so an unreported field is a
+    permanently parked request, not a wasted step.
+    """
     if metadata is None:
         return False
-    return any(
-        bool(getattr(metadata, name, None))
-        for name in (
-            "requests",
-            "lookup_requests_in_step",
-            "reqs_to_recv",
-            "reqs_to_save",
-            "reqs_to_send",
-            "reqs_in_batch",
-            "reqs_not_processed",
-        )
-    )
+    probe = getattr(metadata, "has_work", None)
+    if callable(probe):
+        return bool(probe())
+    return any(bool(getattr(metadata, name, None)) for name in _DUCK_TYPED_WORK_FIELDS)
