@@ -1,29 +1,19 @@
-"""ATOM DeepSeek-V4 vLLM prefix-cache SWA-recompute patch.
+"""ATOM DeepSeek-V4 vLLM prefix-cache tail-recompute patch.
 
-V4's sliding-window (SWA) state is a per-request ring stored in a fixed
-per-slot region of the ATOM proxy arena -- it is NOT keyed by a vLLM block, so
-vLLM's block-level prefix cache never carries it. CSA/HCA compressed history,
-by contrast, lives in the 128-token proxy pages and is reused for free on a
-prefix-cache hit.
+V4's sliding-window state is a per-request ring in the ATOM proxy arena, not
+keyed by a vLLM block, so vLLM's block-level prefix cache never carries it. On a
+cross-request hit the new request gets an empty ring, and a tail token whose
+window reaches into the cached region reads stale data.
 
-On a cross-request prefix hit the new request gets a fresh per-request state
-slot whose SWA ring is empty; a non-block-aligned tail token whose SWA window
-reaches back into the cached (not-re-forwarded) region would then read stale
-ring data.
+Fix (mirrors native ATOM scheduler "fix B'"): roll every hit back by
+``max(win_with_spec, index_topk)`` tokens so that tail is re-forwarded,
+repopulating the ring. Compressed-KV reuse is unaffected -- ``n_committed =
+context_len // ratio`` is invariant under the shift.
 
-Fix (mirrors native ATOM scheduler "fix B'"): on a hit, drop the last
-``ceil(win_with_spec / block_size)`` cached blocks so those tail tokens are
-re-forwarded, repopulating the ring. The re-forwarded region is >= the ring
-stride, so by the last prompt token ``prefix_swa_count`` collapses to 0 and its
-whole window is served from the freshly computed extend KV. Compressed-KV reuse
-is unaffected: ``n_committed = context_len // ratio`` and
-``context_len = cached + scheduled`` is invariant under the shift.
-
-In plugin mode vLLM owns the scheduler / KVCacheManager, so the block drop is
-applied by wrapping ``KVCacheManager.get_computed_blocks`` -- the single point
-where vLLM computes the local prefix-cache hit length. It is only called when
-``request.num_computed_tokens == 0`` (a genuine cross-request hit), never on a
-chunked-prefill resume, whose SWA ring is already populated by prior chunks.
+KNOWN ISSUE: the ``index_topk`` term is empirical (512 on V4-Flash vs a
+128-token window) and the same floor appears with prefix caching off, so the
+underlying defect is in the sparse indexer whenever fewer than ``index_topk``
+rows are forwarded into a request's own state. This rollback is a workaround.
 """
 
 import functools
@@ -31,12 +21,6 @@ import logging
 import math
 
 logger = logging.getLogger("atom")
-
-
-def _mark_v4_proxy_cache_mode(static_forward_context, is_profiling: bool) -> None:
-    for layer in static_forward_context.values():
-        if getattr(layer, "_atom_v4_proxy_layer", False):
-            layer._atom_v4_profiling_kv_cache = is_profiling
 
 
 _V4_PROXY_LAYER_MARKERS = (
@@ -126,84 +110,77 @@ def apply_vllm_v4_block_reuse_patch() -> None:
     logger.info("ATOM DeepSeek-V4: installed packed-proxy block reuse patch")
 
 
-def apply_vllm_v4_profile_cache_patch() -> None:
-    """Mark vLLM 0.26's temporary CUDA-graph profiling KV cache.
-
-    The temporary cache intentionally contains only one block per captured
-    request and cannot hold V4's fixed per-request SWA arena. The V4 forward
-    must therefore stay on its existing dummy-attention path until vLLM
-    installs the real cache.
-    """
-    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-
-    original = GPUModelRunner.initialize_kv_cache
-    if getattr(original, "_atom_v4_profile_cache_patched", False):
-        return
-
-    @functools.wraps(original)
-    def wrapped_initialize_kv_cache(
-        self,
-        kv_cache_config,
-        is_profiling: bool = False,
-    ):
-        result = original(
-            self,
-            kv_cache_config,
-            is_profiling=is_profiling,
-        )
-        _mark_v4_proxy_cache_mode(
-            self.compilation_config.static_forward_context,
-            is_profiling,
-        )
-        return result
-
-    wrapped_initialize_kv_cache._atom_v4_profile_cache_patched = True
-    GPUModelRunner.initialize_kv_cache = wrapped_initialize_kv_cache
-
-
 def _v4_sliding_window(vllm_config) -> int:
     hf = vllm_config.model_config.hf_config
     return int(getattr(hf, "sliding_window", 128) or 128)
 
 
-def _drop_swa_warmup_blocks(
+def _group_block_sizes(manager):
+    """Real block size per KV cache group, in ``KVCacheBlocks.blocks`` order.
+
+    Returns [] on an unexpected manager shape; the caller then falls back to the
+    proxy block size.
+    """
+    try:
+        return [m.block_size for m in manager.coordinator.single_type_managers]
+    except AttributeError:
+        return []
+
+
+def _roll_back_prefix_hit(
     manager,
     computed_blocks,
     num_computed_tokens: int,
     shared_prefix_boundary: int,
     *,
-    warmup_blocks: int,
-    block_size: int,
+    rollback_tokens: int,
 ):
-    if num_computed_tokens <= 0:
+    """Shorten a prefix hit by ``rollback_tokens`` so the tail is re-forwarded,
+    repopulating the SWA ring and the sparse indexer's rows. Deep-prefix blocks
+    are still reused.
+
+    The rollback is expressed in **tokens**, not blocks, and converted per group
+    using that group's own block size: DSpark adds a second group at block 64
+    alongside the proxy's 128, and a shared block count would leave one group
+    holding blocks past its declared ``num_computed_tokens``.
+    """
+    # Local import: deepseek_v4_bridge imports back into this package.
+    from atom.plugin.vllm.deepseek_v4_bridge import ATOM_DEEPSEEK_V4_BLOCK_SIZE
+
+    if num_computed_tokens <= 0 or rollback_tokens <= 0:
         return computed_blocks, num_computed_tokens, shared_prefix_boundary
 
-    # Drop the trailing warmup blocks from every KV cache group (V4 runs a
-    # single proxy group). vLLM allocates fresh blocks for the dropped tail and
-    # re-forwards those tokens, repopulating the SWA ring; the deep-prefix blocks
-    # are still reused.
-    dropped = 0
+    # rollback_tokens is a multiple of every group's block size and
+    # num_computed_tokens is block-aligned, so the difference stays aligned.
+    new_num_computed_tokens = max(0, num_computed_tokens - rollback_tokens)
+
+    block_sizes = _group_block_sizes(manager)
+    groups = list(computed_blocks.blocks)
     new_groups = []
-    for group in computed_blocks.blocks:
+    dropped_any = False
+    for idx, group in enumerate(groups):
         block_list = list(group)
-        keep = max(0, len(block_list) - warmup_blocks)
-        dropped = max(dropped, len(block_list) - keep)
+        block_size = (
+            block_sizes[idx] if idx < len(block_sizes) else ATOM_DEEPSEEK_V4_BLOCK_SIZE
+        )
+        keep = min(len(block_list), new_num_computed_tokens // block_size)
+        if keep != len(block_list):
+            dropped_any = True
         new_groups.append(block_list[:keep])
-    if dropped == 0:
+    if not dropped_any:
         return computed_blocks, num_computed_tokens, shared_prefix_boundary
 
-    new_num_computed_tokens = max(0, num_computed_tokens - dropped * block_size)
     new_blocks = manager.create_kv_cache_blocks(tuple(new_groups))
     return new_blocks, new_num_computed_tokens, shared_prefix_boundary
 
 
-def apply_vllm_v4_prefix_swa_patch(vllm_config) -> None:
-    """Enable DeepSeek-V4 prefix caching by dropping the SWA warmup blocks.
+def apply_vllm_v4_prefix_recompute_patch(vllm_config) -> None:
+    """Enable DeepSeek-V4 prefix caching by recomputing the tail of every hit.
 
     Call only for a DeepSeek-V4 deployment with prefix caching enabled. The
-    number of blocks to drop is derived once from ``vllm_config`` and captured
-    in the wrapper closure, so non-V4 deployments (which never install this
-    patch) are unaffected.
+    rollback length is derived once from ``vllm_config`` and captured in the
+    wrapper closure, so non-V4 deployments (which never install this patch) are
+    unaffected.
     """
     from vllm.v1.core.kv_cache_manager import KVCacheManager
 
@@ -217,12 +194,23 @@ def apply_vllm_v4_prefix_swa_patch(vllm_config) -> None:
     # (MTP draft tokens get their own ring slots). Rolling back ceil(stride /
     # block_size) whole blocks guarantees the re-forwarded region covers the full
     # ring, so the last prompt token reads its entire window from extend KV.
-    warmup_blocks = math.ceil(win_with_spec / ATOM_DEEPSEEK_V4_BLOCK_SIZE)
-    if warmup_blocks <= 0:
+    # The ring is not the only state a hit fails to carry: leaving fewer than
+    # `index_topk` freshly-forwarded tokens makes the sparse indexer emit another
+    # request's content. Empirical on V4-Flash-0731 (TP4, greedy, long shared
+    # prefix): 128/256/384 -> 1/6 correct, 512 -> 6/6, and 512 holds at 2K/6K/17K
+    # prefixes, so it is a constant. Keep both terms.
+    index_topk = int(getattr(vllm_config.model_config.hf_config, "index_topk", 0) or 0)
+    rollback_tokens = max(win_with_spec, index_topk)
+    # Round up to a whole proxy block: the rollback must be a multiple of every
+    # group's block size, and the proxy's 128 is the coarsest in play (and a
+    # multiple of the DSpark draft group's 64).
+    rollback_blocks = math.ceil(rollback_tokens / ATOM_DEEPSEEK_V4_BLOCK_SIZE)
+    if rollback_blocks <= 0:
         return
+    rollback_tokens = rollback_blocks * ATOM_DEEPSEEK_V4_BLOCK_SIZE
 
     original = KVCacheManager.get_computed_blocks
-    if getattr(original, "_atom_v4_prefix_swa_patched", False):
+    if getattr(original, "_atom_v4_prefix_recompute_patched", False):
         return
 
     @functools.wraps(original)
@@ -230,21 +218,22 @@ def apply_vllm_v4_prefix_swa_patch(vllm_config) -> None:
         computed_blocks, num_computed_tokens, shared_prefix_boundary = original(
             self, request
         )
-        return _drop_swa_warmup_blocks(
+        return _roll_back_prefix_hit(
             self,
             computed_blocks,
             num_computed_tokens,
             shared_prefix_boundary,
-            warmup_blocks=warmup_blocks,
-            block_size=ATOM_DEEPSEEK_V4_BLOCK_SIZE,
+            rollback_tokens=rollback_tokens,
         )
 
-    wrapped_get_computed_blocks._atom_v4_prefix_swa_patched = True
+    wrapped_get_computed_blocks._atom_v4_prefix_recompute_patched = True
     KVCacheManager.get_computed_blocks = wrapped_get_computed_blocks
     logger.info(
         "ATOM DeepSeek-V4: prefix caching enabled with SWA recompute "
-        "(drop last %d cached block(s) per hit, win_with_spec=%d, block_size=%d).",
-        warmup_blocks,
+        "(roll back last %d token(s) per hit = %d proxy block(s), "
+        "win_with_spec=%d, index_topk=%d).",
+        rollback_tokens,
+        rollback_blocks,
         win_with_spec,
-        ATOM_DEEPSEEK_V4_BLOCK_SIZE,
+        index_topk,
     )

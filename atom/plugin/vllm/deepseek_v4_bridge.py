@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Hashable
 from contextlib import contextmanager
+from functools import cache
 from types import SimpleNamespace
 
 import numpy as np
@@ -32,8 +34,13 @@ logger = logging.getLogger(__name__)
 # gfx950 / gfx1250. Mirror native's guard (deepseek_v4_attn.py): a request for an
 # fp8 KV cache on any other arch degrades to a bf16 cache instead of hard-failing.
 _V4_FP8_SUPPORTED_GFX = ("gfx950", "gfx1250")
-_V4_FP8_DOWNGRADE_WARNED = False
 _V4_SWA_DEST_RATIOS = (0, 4, 128)
+
+
+@cache
+def _warn_once(msg: str, *args: Hashable) -> None:
+    """Log once per distinct message+args; callers fire from per-step paths."""
+    logger.warning(msg, *args)
 
 
 def _v4_kv_fp8(vllm_config) -> bool:
@@ -46,7 +53,6 @@ def _v4_kv_fp8(vllm_config) -> bool:
     ``get_kv_cache_spec``), the view slicing, and the per-module bind all key off
     it, so pool geometry and the runtime dispatch never disagree.
     """
-    global _V4_FP8_DOWNGRADE_WARNED
     cache_config = getattr(vllm_config, "cache_config", None)
     cache_dtype = getattr(cache_config, "cache_dtype", None) if cache_config else None
     if not (isinstance(cache_dtype, str) and cache_dtype.startswith("fp8")):
@@ -58,15 +64,13 @@ def _v4_kv_fp8(vllm_config) -> bool:
     except Exception:
         gfx = None
     if gfx not in _V4_FP8_SUPPORTED_GFX:
-        if not _V4_FP8_DOWNGRADE_WARNED:
-            logger.warning(
-                "DeepSeek-V4 --kv-cache-dtype %r (2buff fp8) is only supported on "
-                "%s (aiter op4/op5); got gfx=%r. Falling back to a bf16 KV cache.",
-                cache_dtype,
-                "/".join(_V4_FP8_SUPPORTED_GFX),
-                gfx,
-            )
-            _V4_FP8_DOWNGRADE_WARNED = True
+        _warn_once(
+            "DeepSeek-V4 --kv-cache-dtype %r (2buff fp8) is only supported on "
+            "%s (aiter op4/op5); got gfx=%r. Falling back to a bf16 KV cache.",
+            cache_dtype,
+            "/".join(_V4_FP8_SUPPORTED_GFX),
+            gfx,
+        )
         return False
     return True
 
@@ -203,6 +207,19 @@ def _proxy_region_byte_sizes(
     return regions
 
 
+def _v4_proxy_min_blocks(vllm_config) -> int:
+    """Block count ``_proxy_page_bytes`` amortizes the fixed per-slot regions
+    over. Anything less and the page is short. See
+    ``apply_vllm_v4_profiling_min_blocks_patch``.
+    """
+    max_model_len = int(vllm_config.model_config.max_model_len)
+    return max(
+        1,
+        (max_model_len + ATOM_DEEPSEEK_V4_BLOCK_SIZE - 1)
+        // ATOM_DEEPSEEK_V4_BLOCK_SIZE,
+    )
+
+
 def _proxy_page_bytes(vllm_config) -> int:
     from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
         UnifiedPoolGeometry,
@@ -217,12 +234,7 @@ def _proxy_page_bytes(vllm_config) -> int:
     _arena_planes, arena_rows, _row_widths = _v4_state_layout(vllm_config, kv_fp8)
     win = _v4_win_with_spec(vllm_config, int(getattr(hf, "sliding_window", 128)))
     max_num_seqs = int(getattr(vllm_config.scheduler_config, "max_num_seqs", 1))
-    max_model_len = int(vllm_config.model_config.max_model_len)
-    min_blocks = max(
-        1,
-        (max_model_len + ATOM_DEEPSEEK_V4_BLOCK_SIZE - 1)
-        // ATOM_DEEPSEEK_V4_BLOCK_SIZE,
-    )
+    min_blocks = _v4_proxy_min_blocks(vllm_config)
     geometry = UnifiedPoolGeometry(
         ratios,
         num_blocks=min_blocks,
@@ -429,6 +441,80 @@ def slice_deepseek_v4_proxy_cache_views(
     }
 
 
+def _is_runtime_dummy_decode(common_attn_metadata, req_ids, num_spec_tokens) -> bool:
+    """Whether this build is a dummy decode batch that reached the ordinary path.
+
+    An idle DP rank steps via ``execute_dummy_batch()``, whose batch is the same
+    degenerate ``InputBatch.make_dummy`` a capture uses but arrives with
+    ``capturing`` False -- so a capture-only repair skips it and the rank faults.
+
+    Gated on ``req_ids == []`` ("no real requests") plus a decode shape, so
+    prefill-shaped profiling dummies, whose context is coherent, are left alone.
+    """
+    if req_ids is None or len(req_ids) != 0:
+        return False
+    max_q = int(getattr(common_attn_metadata, "max_query_len", 0) or 0)
+    return 0 < max_q <= 1 + int(num_spec_tokens)
+
+
+def _synthesize_v4_decode_context(common_attn_metadata, meta_params) -> None:
+    """Give a dummy decode batch a realistic decode context.
+
+    ``InputBatch.make_dummy`` uses ``seq_len == query_len`` and zeroed
+    ``positions``, i.e. decoding at ``start_pos == 0``. V4 decode is undefined
+    there -- the SWA gather, the committed counts and the sparse top-k all
+    derive from ``seq_len - query_len``, so the paged gather addresses outside
+    the pool. Mirrors native's ``build_for_cudagraph_capture``.
+
+    In-place value rewrite only: replays refill ``seq_lens``/``positions`` from
+    the real batch and shapes stay as vLLM chose them.
+    """
+    if meta_params is None:
+        return
+    num_reqs = int(common_attn_metadata.num_reqs)
+    q_cpu = getattr(common_attn_metadata, "query_start_loc_cpu", None)
+    if num_reqs <= 0 or q_cpu is None:
+        return
+    q_np = q_cpu[: num_reqs + 1].numpy().astype(np.int32)
+    lens = np.diff(q_np).astype(np.int32)
+    total = int(lens.sum())
+    # A prefill capture already carries a coherent context.
+    if total <= 0 or lens.max() <= 0:
+        return
+    start_pos = int(meta_params.window_size)
+
+    # context_len = start_pos + query_len, matching native's synthetic batch.
+    # Zero-query CG-padding rows keep seq_len 0 so they stay inactive.
+    seq_np = np.where(lens > 0, lens + start_pos, 0).astype(np.int32)
+    seq_lens = common_attn_metadata.seq_lens
+    seq_lens[:num_reqs].copy_(
+        torch.from_numpy(seq_np).to(seq_lens.dtype), non_blocking=True
+    )
+    # Keep every host mirror in sync with the device tensor, or the metadata
+    # describes a different batch than the kernels see.
+    seq_cpu = torch.from_numpy(seq_np).to(torch.int32)
+    ub = getattr(common_attn_metadata, "seq_lens_cpu_upper_bound", None)
+    if ub is not None:
+        ub[:num_reqs].copy_(seq_cpu.to(ub.dtype))
+    if getattr(common_attn_metadata, "_seq_lens_cpu", None) is not None:
+        common_attn_metadata._seq_lens_cpu[:num_reqs].copy_(
+            seq_cpu.to(common_attn_metadata._seq_lens_cpu.dtype)
+        )
+    else:
+        common_attn_metadata._seq_lens_cpu = seq_cpu
+    common_attn_metadata.max_seq_len = int(seq_np.max())
+
+    # positions = start_pos + within-sequence offset.
+    positions = getattr(common_attn_metadata, "positions", None)
+    if positions is not None and positions.numel() >= total:
+        batch_np = np.repeat(np.arange(num_reqs, dtype=np.int32), lens)
+        within = np.arange(total, dtype=np.int32) - q_np[batch_np]
+        pos_np = (within + start_pos).astype(np.int64)
+        positions[:total].copy_(
+            torch.from_numpy(pos_np).to(positions.dtype), non_blocking=True
+        )
+
+
 class AtomDeepseekV4ProxyMetadataBuilder(AttentionMetadataBuilder):
     # Decode is full-graph safe for uniform query batches, including speculative
     # decode where each request contributes 1 + num_speculative_tokens queries.
@@ -520,11 +606,19 @@ class AtomDeepseekV4ProxyMetadataBuilder(AttentionMetadataBuilder):
             # Pre-bind (profiling / first warmup forward, before the proxy cache is
             # bound): leave common untouched. The forward detects the missing
             # atom_v4_md and falls back to an inline eager build (force_dummy).
+            _warn_once(
+                "ATOM V4: metadata builder ran unbound (layer=%r, proxy=%s, "
+                "proxy_kv_numel=%s, profiling_cache=%s, model=%s, "
+                "meta_params=%s, capturing=%s)",
+                proxy_layer_name,
+                type(proxy).__name__ if proxy is not None else None,
+                getattr(getattr(proxy, "kv_cache", None), "numel", lambda: None)(),
+                getattr(proxy, "_atom_v4_profiling_kv_cache", None),
+                model is not None,
+                meta_params is not None,
+                capturing,
+            )
             return common_attn_metadata
-        slot_allocator = (
-            None if capturing else getattr(model, "_atom_v4_slot_allocator", None)
-        )
-        decode_bufs = getattr(model, "_atom_v4_decode_bufs", None)
         # Batch-ordered req_ids exposed by the ATOM vLLM patch for this step;
         # used as the host-resident state-slot key (no block-table D2H). None
         # when the patch isn't applied (standalone/tests) -> build falls back.
@@ -536,8 +630,16 @@ class AtomDeepseekV4ProxyMetadataBuilder(AttentionMetadataBuilder):
                 )
 
                 req_ids = get_current_req_ids()
-            except Exception:
+            except Exception:  # noqa: BLE001 - passthrough patch is optional
                 req_ids = None
+        if capturing or _is_runtime_dummy_decode(
+            common_attn_metadata, req_ids, self._num_spec_tokens
+        ):
+            _synthesize_v4_decode_context(common_attn_metadata, meta_params)
+        slot_allocator = (
+            None if capturing else getattr(model, "_atom_v4_slot_allocator", None)
+        )
+        decode_bufs = getattr(model, "_atom_v4_decode_bufs", None)
         md = build_atom_v4_attention_metadata(
             common_attn_metadata,
             meta_params=meta_params,
@@ -637,7 +739,7 @@ def register_deepseek_v4_proxy_layer(
     vllm_config,
     layer_name: str = ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
 ) -> AtomDeepseekV4ProxyAttention:
-    from atom.plugin.vllm.deepseek_v4_prefix_patch import (
+    from atom.plugin.vllm.deepseek_v4_profiling_patch import (
         apply_vllm_v4_profile_cache_patch,
     )
 
@@ -853,6 +955,9 @@ class _V4DecodeMetaBuffers:
         # (padded decode batch); max_q_len == 1 + max_spec_steps.
         self.decode_running_bs = S
         self.decode_q_len = max(1, T // S)
+        # Completion of the previous build's staging H2Ds; see
+        # `gate_staging_reuse`.
+        self._h2d_done = torch.cuda.Event()
         self.plan_buffers: dict[int, dict] = {}
         for ratio, is_overlap in ratios_overlap:
             ratio = int(ratio)
@@ -862,6 +967,28 @@ class _V4DecodeMetaBuffers:
                 "compress": i32(cap, 4),
                 "write": i32(max(1, T), 4),
             }
+
+    def gate_staging_reuse(self):
+        """Block until the previous build's staging H2Ds have executed.
+
+        ``stage`` copies non-blocking out of one pinned host buffer per name.
+        Stream ordering protects the GPU side, not the host side, so the next
+        build's ``buf.np[:n] = arr`` races the previous DMA. Async scheduling
+        removes the sampled-token sync that used to drain it, and a torn
+        ``kv_indptr`` faults the decode kernel.
+
+        Depth-1, as in native's ``model_runner._gate_staging_reuse``: one host
+        buffer admits one build of lead. Skipped while capturing -- events are
+        illegal in a capture region and there is no CPU run-ahead to guard.
+        """
+        if not torch.cuda.is_current_stream_capturing():
+            self._h2d_done.synchronize()
+
+    def mark_h2d_enqueued(self):
+        """Close the window ``gate_staging_reuse`` waits on. Called once per
+        build, after the last staging copy, so one event covers them all."""
+        if not torch.cuda.is_current_stream_capturing():
+            self._h2d_done.record()
 
     def stage(self, buf, arr_np):
         """Copy ``arr_np`` into the head of CpuGpuBuffer ``buf`` and return the
@@ -1465,6 +1592,8 @@ def build_atom_v4_attention_metadata(
 
     if decode_persistent:
         bufs = decode_bufs
+        # Make the pinned host buffers safe to overwrite before staging below.
+        bufs.gate_staging_reuse()
         md.state_slot_out_cpu = physical_slot_arr
         md.state_slot_out = bufs.stage(bufs.state_slot_out, physical_slot_arr)
         md.state_slot_in = bufs.stage(bufs.state_slot_in, physical_slot_arr)
@@ -1551,6 +1680,8 @@ def build_atom_v4_attention_metadata(
             md.qo_indptr = bufs.qo_indptr.copy_to_gpu(T_pad + 1)
             bufs.kv_last_page_lens.np[:T_pad] = 1
             md.kv_last_page_lens = bufs.kv_last_page_lens.copy_to_gpu(T_pad)
+        # Last staging copy of this build is enqueued.
+        bufs.mark_h2d_enqueued()
         return md
 
     # ---- eager path: prefill, or decode without persistent buffers ----
@@ -2048,8 +2179,37 @@ def _is_vllm_decode_graph_phase(attn_metadata, atom_config) -> bool:
         if not (is_uniform_decode_bucket or is_single_query_decode):
             return False
         return bool(getattr(vllm_monitor, "cudagraph_capturing_enabled", False))
-    except Exception:
+    except Exception:  # noqa: BLE001 - vLLM capture state is best-effort
         return False
+
+
+def _warn_inline_v4_build(common_attn_metadata, proxy_layer_name) -> None:
+    """Diagnose a bound forward that still had to build metadata inline.
+
+    Once the proxy cache is bound the builder should attach ``atom_v4_md`` and
+    the forward should take the fast path, the only graph-safe one. Reaching the
+    inline fallback with a live allocator means the builder never ran, or ran
+    for a different object. Log it rather than degrade silently.
+    """
+    from vllm.forward_context import get_forward_context, is_forward_context_available
+
+    keys = None
+    if is_forward_context_available():
+        meta = get_forward_context().attn_metadata
+        if isinstance(meta, dict):
+            keys = tuple(sorted(meta))
+        elif isinstance(meta, list) and meta and isinstance(meta[0], dict):
+            keys = tuple(sorted(meta[0]))
+        else:
+            keys = f"<{type(meta).__name__}>"
+    _warn_once(
+        "ATOM V4: inline attention-metadata build on a bound forward "
+        "(proxy_layer=%r, common_attn_metadata=%s, forward-context attn keys=%s). "
+        "The prebuilt fast path was missed; decode graph capture is unsafe here.",
+        proxy_layer_name,
+        type(common_attn_metadata).__name__ if common_attn_metadata else None,
+        keys,
+    )
 
 
 @contextmanager
@@ -2096,6 +2256,8 @@ def atom_deepseek_v4_forward_context(
     if attn_metadata is None:
         # Fallback (profiling / dummy / standalone, before the proxy cache is
         # bound): build inline with fresh tensors. Never captured.
+        if slot_allocator is not None:
+            _warn_inline_v4_build(common_attn_metadata, proxy_layer_name)
         if common_attn_metadata is not None:
             common_attn_metadata.positions = positions
         _spec_cfg = getattr(atom_config, "speculative_config", None)
@@ -2104,6 +2266,18 @@ def atom_deepseek_v4_forward_context(
             if _spec_cfg is not None
             else 0
         )
+        # With a live allocator this fallback is a *real* build (the first bound
+        # forward lands here), so it needs the same host-resident slot key the
+        # fast path uses. Without it the allocator's fail-fast contract trips,
+        # or it silently uses throwaway arange slots and scribbles over live
+        # per-request state.
+        _req_ids = None
+        try:
+            from atom.plugin.vllm.req_id_passthrough_patch import get_current_req_ids
+
+            _req_ids = get_current_req_ids()
+        except Exception:  # noqa: BLE001 - passthrough patch is optional
+            _req_ids = None
         attn_metadata = build_atom_v4_attention_metadata(
             common_attn_metadata,
             meta_params=meta_params,
@@ -2113,6 +2287,7 @@ def atom_deepseek_v4_forward_context(
                 if state_model is not None
                 else None
             ),
+            req_ids=_req_ids,
             num_spec_tokens=_num_spec,
         )
         # Selective per-slot reset: clear only the slots the allocator just

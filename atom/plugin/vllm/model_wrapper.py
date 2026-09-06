@@ -531,7 +531,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             self._enable_eagle3_target_interface()
         if self.is_mtp:
             self.get_mtp_target_hidden_states = self._get_mtp_target_hidden_states
-        if self.is_mtp or self.is_eagle3:
+        if self.is_mtp or self.is_eagle3 or self.is_dspark:
             # Mirror nested attributes required by vLLM speculative decoding.
             self._expose_spec_decode_attrs()
 
@@ -643,6 +643,12 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         if inner is not None:
             if not hasattr(model, "embedding") and hasattr(inner, "embed"):
                 put(model, "embedding", inner.embed)
+            # DSpark's draft loader aliases the target embedding under
+            # `embed_tokens` only. Without this name the alias silently no-ops
+            # and the draft runs off its own all-zero table
+            # (`has_own_embed_tokens = False`, so the checkpoint never fills it).
+            if not hasattr(model, "embed_tokens") and hasattr(inner, "embed"):
+                put(model, "embed_tokens", inner.embed)
             if not hasattr(model, "lm_head") and hasattr(inner, "head"):
                 put(model, "lm_head", inner.head)
 
@@ -996,7 +1002,12 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                     )
                 else:
                     hidden_states = self.model(input_ids=input_ids, positions=positions)
-                    self._mtp_target_hidden_states = hidden_states
+                    if isinstance(hidden_states, tuple):
+                        # EAGLE3/DSpark/DFlash return `(hidden, aux_list)`; vLLM
+                        # unpacks it itself, but the MTP cache wants only hidden.
+                        self._mtp_target_hidden_states = hidden_states[0]
+                    else:
+                        self._mtp_target_hidden_states = hidden_states
         else:
             if (
                 self.model_arch in {"Qwen3NextMTP", "DeepSeekMTPModel"}

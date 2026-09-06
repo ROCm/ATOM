@@ -266,6 +266,18 @@ def register_model() -> None:
 
     apply_vllm_v4_block_reuse_patch()
 
+    # If vLLM memoized `current_platform` before our plugin resolved,
+    # ATOMPlatform is not live and its config hook never runs. Re-attach it here
+    # -- this runs from `create_engine_config()`, before vLLM calls the hook.
+    from atom.plugin.vllm.platform import install_platform_config_hook
+
+    install_platform_config_hook()
+
+    # Late-run the registrations `register_platform()` may have aborted on:
+    # `vllm.model_executor` can still be half-imported at that point.
+    _register_hf_configs()
+    _register_mxfp8_quantization_config()
+
     from atom.plugin.vllm.gdn_backend import register_gdn_attention_backend
 
     register_gdn_attention_backend()
@@ -352,3 +364,13 @@ def register_model() -> None:
     )
 
     apply_vllm_req_id_passthrough_patch()
+
+    # DeepSeek-V4 cudagraph-profiling KV-cache floor. Also installed here
+    # because mp workers only run the platform hook when a VllmConfig is
+    # (re)constructed in their process; without it an unpatched worker dies in
+    # profile_cudagraph_memory. No-ops for non-V4 models.
+    from atom.plugin.vllm.deepseek_v4_profiling_patch import (
+        apply_vllm_v4_profiling_min_blocks_patch,
+    )
+
+    apply_vllm_v4_profiling_min_blocks_patch()

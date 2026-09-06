@@ -382,7 +382,12 @@ def test_dense_mla_decode_pads_gathered_dcp_heads():
             dcp_world_size=8,
             kv_cache_dtype="fp8",
             is_sparse_mla=False,
-            dcp_persistent_supported=True,
+            # gfx942: no lse persistent decode kernel, so DCP decode runs
+            # non-persistent and the gathered width rounds up to a dispatchable
+            # one. That rounding IS the padding under test -- persistent takes
+            # the gathered 96 as-is and pads nothing. Matches the
+            # use_persistent_metadata=False decode metadata below.
+            dcp_persistent_supported=False,
             scale=1.0,
             _q_scale=None,
             _k_scale=None,
