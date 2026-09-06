@@ -28,6 +28,7 @@ import torch
 from atom.model_ops.attentions.pool_layout.entry_arena import (
     EntryField,
     LayerMajorArena,
+    carve_layer_major,
     entry_bytes_for,
 )
 
@@ -39,8 +40,8 @@ class MlaKvPool:
     `entry_bytes` before a block count exists, and the block count is what the
     byte budget buys.
 
-    The indexer cache is a second allocation when there is one at all, so a
-    model without indexers declares no field for it and pays nothing.
+    The indexer cache is a second region when there is one at all, so a model
+    without indexers declares no field for it and pays nothing.
     """
 
     def __init__(
@@ -74,28 +75,30 @@ class MlaKvPool:
             else []
         )
         self.index_dim = index_dim
-        self.entry_bytes = entry_bytes_for(self.cache_fields) + (
-            entry_bytes_for(self.index_fields) if self.index_fields else 0
-        )
+        # The regions a block is charged for, in layout order; one list for the
+        # price and the allocation both.
+        self.field_groups = [self.cache_fields, self.index_fields]
+        self.entry_bytes = sum(entry_bytes_for(g) for g in self.field_groups)
         self.cache: LayerMajorArena | None = None
         self.index: LayerMajorArena | None = None
         self._views: dict[str, torch.Tensor] = {}
 
-    def allocate(self, blocks: int, device, cache_buf=None, index_buf=None) -> None:
-        """Back the declaration, with a fresh allocation or an imported one.
+    def pool_bytes(self, blocks: int) -> int:
+        """Bytes the pool takes at `blocks` scheduler blocks -- the size of the
+        region `allocate` wants, and what sizing charged for those blocks."""
+        return self.entry_bytes * blocks
 
-        One expression for both: the decode side of a P/D pair receives the
-        pool as an IPC handle and has to read it at the layout the prefill side
-        wrote it at. Handing those buffers in is also the check -- an arena
-        refuses one that does not fit its own declaration.
-        """
-        self.cache = LayerMajorArena(self.cache_fields, blocks, device, buf=cache_buf)
-        self._views = {"kv": self.cache.view("kv")}
-        if self.index_fields:
-            self.index = LayerMajorArena(
-                self.index_fields, blocks, device, buf=index_buf
-            )
-            self._views["index"] = self.index.view("index")
+    def allocate(self, blocks: int, device, buf: torch.Tensor | None = None) -> None:
+        """Back the declaration, in memory of its own or a region of the
+        runner's paged allocation -- the MHA pool's `allocate` exactly."""
+        self.cache, self.index = carve_layer_major(
+            self.field_groups, blocks, device, buf
+        )
+        self._views = {
+            name: arena.view(name)
+            for name, arena in (("kv", self.cache), ("index", self.index))
+            if arena is not None
+        }
 
     def release(self) -> None:
         """Drop the backing, keep the declaration."""

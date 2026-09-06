@@ -196,6 +196,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         # which run long after construction. MiMo-V2 leaves it None and gives
         # each module a pool of its own instead.
         self.kv_pool: MhaKvPool | None = None
+        # MiMo-V2's region and how much of it the bind walk has handed out.
+        self._page_buf: torch.Tensor | None = None
+        self._page_cursor = 0
         config = model_runner.config
         hf_config = config.hf_config
         from atom.utils import envs as _envs
@@ -425,7 +428,15 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         }
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
-        """One paged KV pool. Per-block bytes:
+        """One paged KV pool, priced by the declaration it is built from."""
+        return [page_pool(self._paged_entry_bytes())]
+
+    def paged_pool_bytes(self, blocks: int) -> int:
+        """The same declaration, times the blocks the budget bought."""
+        return self._paged_entry_bytes() * blocks
+
+    def _paged_entry_bytes(self) -> int:
+        """What one scheduler block of this model's MHA pool costs:
 
         - Standard models: `[2, num_hidden_layers, blocks, block_size,
           num_kv_heads, head_dim]` for kv_cache + matching kv_scale (fp32).
@@ -433,6 +444,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
           have different num_kv_heads).
         - MiniMax-M3: plus the indexer key cache its sparse layers own,
           which is a field of the same pool.
+
+        One function because the byte budget, the allocation's size and the
+        per-module walk that fills it are three readings of one number.
         """
         runner = self.model_runner
         hf_config = runner.config.hf_config
@@ -456,21 +470,22 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 else (1 if _swa_raw else 0)
             )
             # Two pools' worth of block: the layer kinds differ in
-            # `num_kv_heads` and nothing else.
+            # `num_kv_heads` and nothing else. Allocation walks the modules
+            # instead and takes a one-layer pool each, which comes to the same
+            # bytes as long as a layer's own fields are whole multiples of the
+            # entry alignment -- and when they are not, the last module's
+            # arena is handed a region that is short and says so.
             block_bytes = self._declare_kv_pool(
                 num_kv_heads, layers=num_full_layers
             ).entry_bytes
-            block_bytes += self._declare_kv_pool(
-                swa_kv_heads, layers=num_swa_layers
-            ).entry_bytes
-            return [page_pool(block_bytes)]
+            return (
+                block_bytes
+                + self._declare_kv_pool(swa_kv_heads, layers=num_swa_layers).entry_bytes
+            )
 
         # Standard MHA path: the same declaration the allocation is built from,
         # indexer cache included.
-        block_bytes = self._declare_kv_pool(
-            num_kv_heads, layers=total_num_layers
-        ).entry_bytes
-        return [page_pool(block_bytes)]
+        return self._declare_kv_pool(num_kv_heads, layers=total_num_layers).entry_bytes
 
     def _kv_pool_layers(self) -> int:
         """Layers this backend's paged pool holds rows for.
@@ -526,67 +541,48 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             **self._index_cache_decl(),
         )
 
-    def adopt_imported_kv_pool(self, blocks: int) -> None:
+    def adopt_imported_kv_pool(self, blocks: int, buf) -> None:
         runner = self.model_runner
         if runner.is_mimo_v2():
+            # The pools are still one region, but which module gets which slice
+            # is decided by the bind walk, and this side's `_page_cursor` would
+            # have to be rewound to the same place first. Untried, so refused.
             raise NotImplementedError(
-                "MiMo-V2 allocates per module, so there is no single pool to "
-                "import; P/D would have to ship one handle per module."
+                "MiMo-V2 carves its region per module during the bind walk, "
+                "which the P/D decode side has not been made to replay."
             )
         self.kv_pool = self._declare_kv_pool(runner._get_num_kv_heads())
-        if self.kv_pool.index_fields:
-            # The export ships `kv_cache` and `kv_scale` and nothing else, so
-            # there is no imported buffer to read the indexer cache from. A
-            # fresh one would leave this side with zeroed indexer keys and a
-            # top-k that silently picks the wrong blocks.
-            raise NotImplementedError(
-                "P/D does not ship the sparse indexer cache, so a decode side "
-                "cannot rebuild it from the handle; the export has to carry it "
-                "before this model can be disaggregated."
-            )
-        self.kv_pool.allocate(
-            blocks,
-            runner.device,
-            cache_buf=runner.kv_cache,
-            scale_buf=runner.kv_scale,
-        )
+        self._next_index_layer = 0
+        self.kv_pool.allocate(blocks, runner.device, buf=buf)
         self.num_blocks = blocks * self.block_ratio
 
     def allocate_kv_cache_tensors(
-        self, num_kv_heads: int, num_draft_layers: int, *, blocks: int
+        self, num_kv_heads: int, num_draft_layers: int, *, blocks: int, buf
     ) -> dict:
-        """Allocate this model's MHA pool.
+        """Allocate this model's MHA pool inside the runner's paged region.
 
-        `kv_cache` and `kv_scale` stay on the runner as the flat buffers the
-        arenas own -- what the P/D IPC export ships and the rollout sleep path
-        frees by name. Every shaped view of them comes from the pool.
-
-        The indexer cache does not: nothing outside this builder reads it, and
-        neither list names it, so putting it back on the runner would only
-        re-create the reference that kept it alive across a rollout sleep. The
-        pool is its only owner, and `MhaKvPool.release` is what frees it.
+        Nothing shaped goes back to the runner: the cache, the scales and the
+        indexer keys were three named attributes and are three regions of the
+        one buffer it holds. So the only reference that can outlive a rollout
+        sleep is the pool's, and `MhaKvPool.release` is what drops it.
         """
         self.num_blocks = blocks * self.block_ratio
         runner = self.model_runner
         hf_config = runner.config.hf_config
         text_config = getattr(hf_config, "text_config", hf_config)
+        self._next_index_layer = 0
 
         if runner.is_mimo_v2():
             # Deferred to `build_kv_cache_tensor`: a module's pool is sized by
-            # its own num_kv_heads.
-            return {
-                "kv_cache": None,
-                "kv_scale": None,
-                "_kv_layer_cache_store": [],
-            }
+            # its own num_kv_heads, so the region is handed out one module at a
+            # time, in bind order.
+            self._page_buf = buf
+            self._page_cursor = 0
+            return {"_kv_layer_cache_store": []}
 
         self.kv_pool = self._declare_kv_pool(num_kv_heads)
-        self.kv_pool.allocate(blocks, runner.device)
-        self._next_index_layer = 0
-        tensors = {
-            "kv_cache": self.kv_pool.cache.buf,
-            "kv_scale": self.kv_pool.scale.buf,
-        }
+        self.kv_pool.allocate(blocks, runner.device, buf=buf)
+        tensors: dict = {}
         # Not under the indexer cache: this is a per-run memo dict, keyed off
         # `use_index_cache` alone. Its one reader is in the sparse branch of
         # `build_kv_cache_tensor`, so gating it on the pool as well would only
@@ -665,7 +661,17 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # A pool entry is a scheduler block, so back out of this backend's
             # page. `allocate_kv_cache_tensors` records the count before it
             # defers to here, which is why it does so ahead of that return.
-            pool.allocate(self.num_blocks // self.block_ratio, runner.device)
+            blocks = self.num_blocks // self.block_ratio
+            # The next slice of this builder's region, in bind order. Sizing
+            # priced the same layers in two aggregate pools rather than one per
+            # module; the two agree, and a region too short to finish the walk
+            # is refused by the arena that runs off the end of it.
+            take = pool.pool_bytes(blocks)
+            start = self._page_cursor
+            self._page_cursor += take
+            pool.allocate(
+                blocks, runner.device, buf=self._page_buf[start : start + take]
+            )
             k_cache, v_cache = pool.kv_views(0)
             if fp8:
                 module.k_scale, module.v_scale = pool.scale_views(0)

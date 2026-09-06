@@ -296,14 +296,14 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         torch._foreach_copy_(dsts, srcs)
 
     def allocate_kv_cache_tensors(
-        self, num_kv_heads: int, num_draft_layers: int, *, blocks: int
+        self, num_kv_heads: int, num_draft_layers: int, *, blocks: int, buf
     ) -> dict:
         del num_kv_heads, num_draft_layers
         self.num_blocks = blocks * self.block_ratio
         runner = self.model_runner
         self.kv_pool = self._declare_kv_pool()
-        self.kv_pool.allocate(blocks, runner.device)
-        out: dict = {"kv_cache": self.kv_pool.cache.buf}
+        self.kv_pool.allocate(blocks, runner.device, buf=buf)
+        out: dict = {}
         if runner.is_deepseek_v32:
             index_cache_layer_ids, _ = self._index_cache_layout()
             out["aligned_index_dim"] = self._aligned_index_dim()
@@ -314,7 +314,6 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                     index_cache_layer_ids
                 )
             }
-            out["index_cache"] = self.kv_pool.index.buf
         return out
 
     def _page_unit_index_cache(self) -> torch.Tensor | None:

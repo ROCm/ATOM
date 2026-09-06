@@ -154,8 +154,6 @@ class MemoryManagerMixin:
         del self.kv_cache
         self.kv_cache = None
         for attr in (
-            "kv_scale",
-            "index_cache",
             "mamba_k_cache",
             "mamba_v_cache",
             "kpool_tail_cache",

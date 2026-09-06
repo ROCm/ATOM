@@ -1073,6 +1073,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         """
         return [page_pool(self._declare_kv_pool().entry_bytes)]
 
+    def paged_pool_bytes(self, blocks: int) -> int:
+        """The same declaration `sub_pool_specs` prices, times the blocks the
+        budget bought."""
+        return self._declare_kv_pool().pool_bytes(blocks)
+
     def _kv_pool_layers(self) -> int:
         """Rows the paged pool holds, one per layer that caches KV.
 
@@ -1119,21 +1124,21 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
 
     def allocate_kv_cache_tensors(
-        self, num_kv_heads: int, num_draft_layers: int, *, blocks: int
+        self, num_kv_heads: int, num_draft_layers: int, *, blocks: int, buf
     ) -> dict:
-        """Allocate this model's MLA pool.
+        """Allocate this model's MLA pool inside the runner's paged region.
 
-        `kv_cache` and `index_cache` stay on the runner as the flat buffers the
-        arenas own -- what the P/D IPC export ships and the rollout sleep path
-        frees. The aligned dimension and compact layer map ride along so
-        `build_kv_cache_tensor` can pick the right indexer slice.
+        The KV rows and the indexer keys are regions of the one buffer the
+        runner holds, so neither goes back by name. Only the aligned dimension
+        and the compact layer map do, so `build_kv_cache_tensor` can pick the
+        right indexer slice.
         """
         self.num_blocks = blocks * self.block_ratio
         runner = self.model_runner
         hf_config = runner.config.hf_config
         self.kv_pool = self._declare_kv_pool()
-        self.kv_pool.allocate(blocks, runner.device)
-        out: dict = {"kv_cache": self.kv_pool.cache.buf}
+        self.kv_pool.allocate(blocks, runner.device, buf=buf)
+        out: dict = {}
         if runner.is_deepseek_v32:
             index_cache_layer_ids, _ = self._index_cache_layout()
             out["aligned_index_dim"] = aligned_index_cache_dim(hf_config)
@@ -1144,19 +1149,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     index_cache_layer_ids
                 )
             }
-            out["index_cache"] = self.kv_pool.index.buf
         return out
 
-    def adopt_imported_kv_pool(self, blocks: int) -> None:
+    def adopt_imported_kv_pool(self, blocks: int, buf) -> None:
         self.num_blocks = blocks * self.block_ratio
         runner = self.model_runner
         self.kv_pool = self._declare_kv_pool()
-        self.kv_pool.allocate(
-            blocks,
-            runner.device,
-            cache_buf=runner.kv_cache,
-            index_buf=getattr(runner, "index_cache", None),
-        )
+        self.kv_pool.allocate(blocks, runner.device, buf=buf)
 
     def build_kv_cache_tensor(self, layer_id: int, module):
         """Bind one MLA attention module to its KV slice.

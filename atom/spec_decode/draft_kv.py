@@ -65,17 +65,26 @@ class DraftKvBuilder:
         contributions sum into one per-block cost instead of a second pool."""
         return [page_pool(self.kv_pool.entry_bytes)]
 
+    def paged_pool_bytes(self, blocks: int) -> int:
+        """The draft's share of the runner's one paged allocation.
+
+        The same `entry_bytes` `sub_pool_specs` adds to the target's, so the
+        draft's region is exactly what the block budget already charged for
+        it -- which is what "riding the target's block ids" costs.
+        """
+        return self.kv_pool.pool_bytes(blocks)
+
     def allocate_kv_cache_tensors(
-        self, num_kv_heads, num_draft_layers, *, blocks: int
+        self, num_kv_heads, num_draft_layers, *, blocks: int, buf
     ) -> dict:
-        """Back the draft's pool. Nothing for the runner to setattr: the pool
-        is this builder's, and its hooks below are the only readers.
+        """Back the draft's pool from its region. Nothing for the runner to
+        setattr: the pool is this builder's, and its hooks below are the only
+        readers.
 
         One entry per scheduler block, the count the target was built at --
-        that is what riding the target's block ids means, and what lets
-        `sub_pool_specs` add the draft's `entry_bytes` to the target's. The
-        assertion is the other half: a pool paging at anything else would be
-        charged per scheduler block and built per its own page.
+        that is what riding the target's block ids means. The assertion is the
+        other half: a pool paging at anything else would be charged per
+        scheduler block and built per its own page.
         """
         runner = self.model_runner
         assert self.block_size == runner.block_size, (
@@ -83,12 +92,22 @@ class DraftKvBuilder:
             f"ids: pool {self.block_size} vs scheduler {runner.block_size}"
         )
         self.num_blocks = blocks
-        self.kv_pool.allocate(blocks, runner.device)
+        self.kv_pool.allocate(blocks, runner.device, buf=buf)
         logger.info(
             f"Allocated draft KV pool: {blocks} blocks, "
-            f"{blocks * self.kv_pool.entry_bytes} B"
+            f"{self.kv_pool.pool_bytes(blocks)} B of the paged allocation"
         )
         return {}
+
+    def adopt_imported_kv_pool(self, blocks: int, buf) -> None:
+        """Same declaration over the region of an imported pool.
+
+        The draft rides the target's blocks, so its bytes travel inside the
+        same handle; what makes them findable is that both sides carve with
+        the same `paged_pool_bytes` walk.
+        """
+        self.num_blocks = blocks
+        self.kv_pool.allocate(blocks, self.model_runner.device, buf=buf)
 
     def build_kv_cache_tensor(self, layer_id: int, module):
         """Bind one of the draft's attention modules to its own pool.

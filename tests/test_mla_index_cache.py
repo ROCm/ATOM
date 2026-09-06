@@ -288,8 +288,9 @@ def test_allocate_index_cache_uses_compact_shape_and_map(monkeypatch):
     # The count the pool is built at arrives as an argument: it is the one
     # EngineCore broadcast into `allocate_kv_cache`, and this rank's own sizing
     # estimate is a different number.
+    buf = torch.zeros(builder.paged_pool_bytes(blocks), dtype=torch.uint8)
     out = builder.allocate_kv_cache_tensors(
-        num_kv_heads=1, num_draft_layers=1, blocks=blocks
+        num_kv_heads=1, num_draft_layers=1, blocks=blocks, buf=buf
     )
     # MLA pages at 1, so the builder counts its own rows, not the argument.
     assert builder.num_blocks == blocks * builder.block_ratio
@@ -301,9 +302,11 @@ def test_allocate_index_cache_uses_compact_shape_and_map(monkeypatch):
     assert builder.kv_pool.index.view("index").shape == (3, blocks, 16, 144)
     assert out["index_cache_layer_ids"] == (3, 5, 6)
     assert out["index_cache_layer_map"] == {3: 0, 5: 1, 6: 2}
-    # Two allocations, and `kv_cache`/`index_cache` are the buffers they own.
-    assert out["kv_cache"].data_ptr() == builder.kv_pool.cache.buf.data_ptr()
-    assert out["index_cache"].data_ptr() == builder.kv_pool.index.buf.data_ptr()
+    # Two regions of the one buffer the runner holds, in declared order, and
+    # nothing shaped goes back by name -- the pool is the only way to a view.
+    assert builder.kv_pool.cache.buf.data_ptr() == buf.data_ptr()
+    assert builder.kv_pool.index.buf.data_ptr() > buf.data_ptr()
+    assert "kv_cache" not in out and "index_cache" not in out
 
 
 class _FakePool:

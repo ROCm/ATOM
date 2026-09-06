@@ -303,8 +303,21 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return None
 
+    def paged_pool_bytes(self, blocks: int) -> int:
+        """Bytes of the runner's one paged allocation this builder's pool takes.
+
+        Zero, the default, means "I allocate my own" -- DeepSeek-V4 does,
+        because half of what its PAGE entry is priced for lives in the plane
+        pool `allocate_per_req_cache` makes later.
+
+        An answer must come from the declaration `sub_pool_specs` prices, not
+        from a second spelling of it: the runner hands back exactly this many
+        bytes and refuses a builder that was charged for another number.
+        """
+        return 0
+
     def allocate_kv_cache_tensors(
-        self, num_kv_heads: int, num_draft_layers: int, *, blocks: int
+        self, num_kv_heads: int, num_draft_layers: int, *, blocks: int, buf
     ) -> dict[str, Any]:
         """Allocate the model's primary paged KV cache tensors.
 
@@ -315,6 +328,10 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         while something sized off another is built at a second -- a class of
         bug no unit test reaches. Overrides record it as `self.num_blocks`,
         converted to their own page.
+
+        `buf` is this builder's region of the runner's paged allocation,
+        `paged_pool_bytes` long -- empty for a builder that answered zero and
+        allocates its own.
 
         Builders own the per-attention-type tensor layout (single 576-dim MLA
         tensor vs split-K/V MHA tensor; full-rank vs hybrid-only-full-attn-rows
@@ -329,14 +346,16 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return {}
 
-    def adopt_imported_kv_pool(self, blocks: int) -> None:
+    def adopt_imported_kv_pool(self, blocks: int, buf) -> None:
         """Re-derive whatever this builder holds over the runner's KV pool.
 
         The decode side of a P/D pair receives the pool as an IPC handle, so
         `allocate_kv_cache_tensors` never runs there and anything it would have
-        built has to be rebuilt over the imported buffers before
-        `build_kv_cache_tensor` can bind to them. Same declaration, other
-        backing store. A builder that holds nothing has nothing to do.
+        built has to be rebuilt over the imported buffer before
+        `build_kv_cache_tensor` can bind to it. Same declaration, other backing
+        store -- `buf` is this builder's region of it, carved by the same
+        `paged_pool_bytes` walk the exporting side allocated with, so the two
+        agree by construction rather than by both sides spelling it out.
 
         `blocks` is passed rather than read off the runner because that side
         never ran sizing: its `pool_plan` is empty, and `num_kvcache_blocks`

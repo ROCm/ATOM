@@ -1418,11 +1418,19 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         slots, plus the per-request state pool for the linear-attention
         layers (`GDNStateMixin.state_spec`).
         """
-        pool = self._declare_kv_pool(self.model_runner._get_num_kv_heads())
-        return [page_pool(pool.entry_bytes), self.state_spec()]
+        return [page_pool(self._paged_entry_bytes()), self.state_spec()]
+
+    def _paged_entry_bytes(self) -> int:
+        """A block of the full-attention-only pool.
+
+        Overridden because the parent's asks for every layer of the model and a
+        hybrid caches for `_kv_pool_layers` of them. `paged_pool_bytes` reads
+        this too, so the budget and the region move together.
+        """
+        return self._declare_kv_pool(self.model_runner._get_num_kv_heads()).entry_bytes
 
     def allocate_kv_cache_tensors(
-        self, num_kv_heads: int, num_draft_layers: int, *, blocks: int
+        self, num_kv_heads: int, num_draft_layers: int, *, blocks: int, buf
     ) -> dict:
         """Same pool as the MHA parent's, over the shorter layer axis.
 
@@ -1435,11 +1443,8 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         self.num_blocks = blocks * self.block_ratio
         runner = self.model_runner
         self.kv_pool = self._declare_kv_pool(num_kv_heads)
-        self.kv_pool.allocate(blocks, runner.device)
-        return {
-            "kv_cache": self.kv_pool.cache.buf,
-            "kv_scale": self.kv_pool.scale.buf,
-        }
+        self.kv_pool.allocate(blocks, runner.device, buf=buf)
+        return {}
 
     def build_kv_cache_tensor(self, layer_id: int, module):
         """Dispatch by module type:

@@ -32,6 +32,7 @@ from atom.model_ops.attentions.mha_kv_pool import (
     mha_kv_fields,
     shuffle_pack,
 )
+from atom.model_ops.attentions.pool_layout.entry_arena import plan_regions
 
 # The deployed MiniMax-M3 pair, at tp4: a 60-layer target with 4 KV heads, and
 # a 1-layer EAGLE3 draft with 64 -- three heterogeneous contributors to one
@@ -333,24 +334,27 @@ class TestAdoptingSomeoneElsesAllocation:
     """
 
     def test_an_imported_buffer_is_read_at_the_same_layout(self):
-        donor = build()
-        adopter = MhaKvPool(**TARGET, kv_dtype=torch.float8_e4m3fnuz)
+        """Every field, not just the cache: the scales and the indexer keys are
+        regions of the one buffer now, so where they land is decided by the
+        declaration on each side rather than by a handle per tensor."""
+        donor = INDEXED()
+        buf = torch.zeros(donor.pool_bytes(8), dtype=torch.uint8)
+        donor.allocate(8, "cpu", buf=buf)
+        adopter = INDEXED()
 
-        adopter.allocate(8, "cpu", cache_buf=donor.cache.buf, scale_buf=donor.scale.buf)
+        adopter.allocate(8, "cpu", buf=buf)
 
-        for name in ("k", "v"):
-            assert (
-                adopter.cache.view(name).data_ptr() == donor.cache.view(name).data_ptr()
-            )
+        for name in ("k", "v", "k_scale", "v_scale", "index"):
+            assert adopter._views[name].data_ptr() == donor._views[name].data_ptr()
 
     def test_a_buffer_that_does_not_fit_the_declaration_is_refused(self):
         """Refusing is the point: the alternative is addressing past the end
         of someone else's allocation, which no shape says anything about."""
-        small = build(blocks=4)
         adopter = MhaKvPool(**TARGET, kv_dtype=torch.float8_e4m3fnuz)
+        short = torch.zeros(adopter.pool_bytes(4), dtype=torch.uint8)
 
         with pytest.raises(ValueError, match="at least"):
-            adopter.allocate(8, "cpu", cache_buf=small.cache.buf)
+            adopter.allocate(8, "cpu", buf=short)
 
     def test_release_drops_the_backing_and_keeps_the_declaration(self):
         """The rollout sleep path frees the pool by dropping the runner's
@@ -364,6 +368,68 @@ class TestAdoptingSomeoneElsesAllocation:
         assert pool.cache is None and pool.scale is None
         assert pool.region_tensors() == [], "the views would hold it alive too"
         assert pool.entry_bytes == entry_bytes
+
+
+class TestSharingOneAllocationWithADraft:
+    """M3's two pools in one buffer, the way ModelRunner carves it.
+
+    A draft riding the target's block ids was already how the *budget* worked
+    -- two specs naming one entry class sum -- while the memory was two
+    allocations reached under two names. Here it is one, so what a block costs
+    and what a block occupies are the same walk, and neither pool can be built
+    somewhere the other does not expect.
+    """
+
+    BLOCKS = 8
+
+    def _carve(self):
+        target = INDEXED()
+        draft = MhaKvPool(**DRAFT, kv_dtype=torch.float8_e4m3fnuz)
+        sizes = [p.pool_bytes(self.BLOCKS) for p in (target, draft)]
+        offsets, total = plan_regions(sizes)
+        buf = torch.zeros(total, dtype=torch.uint8)
+        for pool, start, size in zip((target, draft), offsets, sizes):
+            pool.allocate(self.BLOCKS, "cpu", buf=buf[start : start + size])
+        return buf, target, draft, list(zip(offsets, sizes))
+
+    @staticmethod
+    def _span(view):
+        """`[first, last)` byte of a field's region, relative to nothing."""
+        return view.data_ptr(), view.data_ptr() + view.numel() * view.element_size()
+
+    def test_no_view_leaves_the_region_its_pool_was_given(self):
+        buf, target, draft, extents = self._carve()
+
+        for pool, (start, size) in zip((target, draft), extents):
+            lo = buf.data_ptr() + start
+            for view in pool.region_tensors():
+                first, last = self._span(view)
+                assert lo <= first and last <= lo + size
+
+    def test_the_two_together_cost_what_a_block_was_charged(self):
+        """`sub_pool_specs` adds the draft's `entry_bytes` to the target's and
+        the budget buys blocks of the sum. Packing them adds no padding, so the
+        buffer is that price exactly -- which is what lets the sizing number and
+        the allocation be read as one."""
+        buf, target, draft, _ = self._carve()
+
+        charged = target.entry_bytes + draft.entry_bytes
+        assert buf.numel() == charged * self.BLOCKS
+
+    def test_every_region_keeps_what_was_written_to_it(self):
+        """The check the byte counts cannot do, and the reason placement is not
+        a matter of taste: regions sized right and placed wrong agree on every
+        total while writing through each other. Distinct marks over both pools
+        at once, so an overlap between two fields of one pool fails it as
+        surely as one between the two pools."""
+        _, target, draft, _ = self._carve()
+        regions = target.region_tensors() + draft.region_tensors()
+        marks = [1 + i % 251 for i in range(len(regions))]
+        for view, mark in zip(regions, marks):
+            view.view(torch.uint8).fill_(mark)
+
+        for view, mark in zip(regions, marks):
+            assert view.view(torch.uint8).eq(mark).all()
 
 
 class TestFromHfConfig:

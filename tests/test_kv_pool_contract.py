@@ -61,18 +61,27 @@ def test_every_flavor_that_owns_a_pool_is_covered():
 
 
 @pytest.mark.parametrize("path, cls, fn", ALL_HOOKS)
-def test_the_block_count_arrives_as_a_keyword_argument(path, cls, fn):
-    """Keyword-only, so a caller cannot pass it positionally into the slot
+@pytest.mark.parametrize("arg", ["blocks", "buf"])
+def test_the_pool_is_told_where_to_build_itself(path, cls, fn, arg):
+    """Keyword-only, so a caller cannot pass one positionally into the slot
     another implementation gave a different meaning, and so no implementation
-    can quietly stop taking it and go back to reading the runner."""
+    can quietly stop taking it and go back to reading the runner.
+
+    `buf` is the region of the runner's one paged allocation this builder's
+    pool lives in. Same argument as `blocks` in kind: a builder that allocated
+    its own buffer instead would leave the runner holding one pool while the
+    kernels read another.
+    """
     del path, cls
-    assert "blocks" in {arg.arg for arg in fn.args.kwonlyargs}
+    assert arg in {a.arg for a in fn.args.kwonlyargs}
 
 
 @pytest.mark.parametrize("path, cls, fn", ALL_HOOKS)
-def test_the_block_count_has_no_default(path, cls, fn):
+@pytest.mark.parametrize("arg", ["blocks", "buf"])
+def test_neither_has_a_default(path, cls, fn, arg):
     """A default would let a caller omit it and get a pool built at someone
-    else's number -- which is the failure this argument exists to remove."""
+    else's number, or in a buffer nobody else can find -- which is the failure
+    these arguments exist to remove."""
     del path, cls
     defaults = dict(zip((a.arg for a in fn.args.kwonlyargs), fn.args.kw_defaults))
-    assert defaults.get("blocks", "absent") is None
+    assert defaults.get(arg, "absent") is None

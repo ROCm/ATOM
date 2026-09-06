@@ -25,6 +25,7 @@ import torch
 from atom.model_ops.attentions.pool_layout.entry_arena import (
     EntryField,
     LayerMajorArena,
+    carve_layer_major,
     entry_bytes_for,
 )
 
@@ -65,8 +66,9 @@ def mha_kv_scale_fields(
 ) -> list[EntryField]:
     """The fp32 dequantization scales an fp8 cache reads, one per token.
 
-    A separate list because they are a separate allocation; the two merge when
-    the allocations do. Read per (kv_head, token), not as tiles, so no `x`.
+    A separate list because they are a separate region of the pool, laid out
+    after the cache rather than inside a block. Read per (kv_head, token), not
+    as tiles, so no `x`.
     """
     return [
         EntryField("k_scale", layers, (num_kv_heads, block_size), torch.float32),
@@ -120,12 +122,12 @@ class MhaKvPool:
             if index_layers
             else []
         )
-        # A block pays for the scales whatever the cache dtype: they are a
-        # second allocation, not a second configuration.
-        self.entry_bytes = sum(
-            entry_bytes_for(fields)
-            for fields in (self.cache_fields, self.scale_fields, self.index_fields)
-        )
+        # The regions a block is charged for, in layout order. One list, walked
+        # by both the price and the allocation, so a fourth group cannot be
+        # added to one and missed by the other. A block pays for the scales
+        # whatever the cache dtype: a second region, not a second config.
+        self.field_groups = [self.cache_fields, self.scale_fields, self.index_fields]
+        self.entry_bytes = sum(entry_bytes_for(g) for g in self.field_groups)
         self.cache: LayerMajorArena | None = None
         self.scale: LayerMajorArena | None = None
         self.index: LayerMajorArena | None = None
@@ -155,26 +157,22 @@ class MhaKvPool:
             kv_dtype=kv_dtype,
         )
 
-    def allocate(
-        self, blocks: int, device, cache_buf=None, scale_buf=None, index_buf=None
-    ) -> None:
-        """Back the declaration, with a fresh allocation or an imported one.
+    def pool_bytes(self, blocks: int) -> int:
+        """Bytes the pool takes at `blocks` scheduler blocks -- the size of the
+        region `allocate` wants, and what sizing charged for those blocks."""
+        return self.entry_bytes * blocks
 
-        One expression for both: the decode side of a P/D pair receives the
-        pool as an IPC handle and has to read it at the layout the prefill side
-        wrote it at. Handing those buffers in is also the check -- an arena
-        refuses one that does not fit its own declaration.
+    def allocate(self, blocks: int, device, buf: torch.Tensor | None = None) -> None:
+        """Back the declaration, in memory of its own or a region of the
+        runner's paged allocation -- which is also how the decode side of a P/D
+        pair reads the pool it was handed. Same groups, so the same layout.
 
         The per-field views are built once here rather than per bind: each is
         an `as_strided` over the same buffer, and a layer only ever indexes
         into them.
         """
-        self.cache = LayerMajorArena(self.cache_fields, blocks, device, buf=cache_buf)
-        self.scale = LayerMajorArena(self.scale_fields, blocks, device, buf=scale_buf)
-        self.index = (
-            LayerMajorArena(self.index_fields, blocks, device, buf=index_buf)
-            if self.index_fields
-            else None
+        self.cache, self.scale, self.index = carve_layer_major(
+            self.field_groups, blocks, device, buf
         )
         self._views = {
             field.name: arena.view(field.name)

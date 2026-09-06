@@ -1370,9 +1370,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         return [(runner.v4_csa_idx_kv, "dsv4.csa_indexer")]
 
     def allocate_kv_cache_tensors(
-        self, num_kv_heads: int, num_draft_layers: int, *, blocks: int
+        self, num_kv_heads: int, num_draft_layers: int, *, blocks: int, buf
     ) -> dict[str, torch.Tensor]:
         """Allocate KV pools that depend only on `num_blocks`.
+
+        `buf` is empty: this backend answers `paged_pool_bytes` with zero, since
+        the rest of what a PAGE unit is priced for lives in the plane pool
+        `allocate_per_req_cache` makes.
 
         After Phase A (CG-friendly indexer), the SWA window AND the per-layer
         compressed pool are physically merged into a single `unified_kv`
@@ -1386,6 +1390,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         index_row_bytes]` so each per-CSA slice `pool[pos]` is contiguous in
         storage; the kernel infers `block_size` from `kv_cache.shape[1]`.
         """
+        del buf
         self.num_blocks = blocks * self.block_ratio
         runner = self.model_runner
         device = runner.device

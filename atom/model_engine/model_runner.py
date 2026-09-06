@@ -54,6 +54,7 @@ from atom.model_engine.sequence import (
 )
 from atom.model_engine.state_runtime import StateRuntime
 from atom.model_loader.loader import load_model
+from atom.model_ops.attentions.pool_layout.entry_arena import plan_regions
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
     InsufficientPoolBudget,
     Pool,
@@ -1060,11 +1061,10 @@ class ModelRunner:
             self.graphs = self.graph_pool = None  # type: ignore
         if isinstance(self.model, UBatchWrapper):
             self.model.tbo_graphs.clear()
-        # 3. Release GPU tensors
+        # 3. Release GPU tensors. `kv_cache` is the whole paged pool -- the
+        # scales and any indexer cache are regions of it, not attributes.
         for attr in (
             "kv_cache",
-            "kv_scale",
-            "index_cache",
             "mamba_k_cache",
             "mamba_v_cache",
             "kpool_tail_cache",
@@ -1874,6 +1874,52 @@ class ModelRunner:
             "state_runtime": state_runtime.to_wire(),
         }
 
+    def _carve_paged_pool(self, blocks: int, buf=None):
+        """One allocation for every paged pool, and each builder's region of it.
+
+        The target's KV, its scales, whatever indexer cache rides along and a
+        draft's sibling pool were up to five allocations under five names. One
+        buffer here, for the reason the declarations were collapsed: a block's
+        bytes are one fact, and every name it is stored under is a place the
+        next reader can disagree with it. `kv_cache` is what is left, which is
+        what the IPC export ships and the sleep path frees.
+
+        Returns `(buffer, regions, builders)`, positionally aligned. `buf` is
+        the imported pool on the P/D decode side; that side carves with the
+        same walk rather than being told the offsets, so the two cannot drift.
+        A builder that allocates its own answers zero and gets an empty region.
+        """
+        builders = [self.attn_metadata_builder]
+        if hasattr(self, "draft_kv_builder"):
+            builders.append(self.draft_kv_builder)
+        sizes = [b.paged_pool_bytes(blocks) for b in builders]
+        # A builder either allocates its own pool or takes exactly what its own
+        # PAGE spec was charged -- nothing between. Checked on every start and
+        # not in a unit test because it is the claim the collapse rests on: a
+        # region sized off a second reading of the layout surfaces as a wrong
+        # answer while serving, never as a bad number here.
+        for builder, size in zip(builders, sizes):
+            if not size:
+                continue
+            charged = blocks * sum(
+                s.entry_bytes for s in builder.sub_pool_specs() if s.pool is Pool.PAGE
+            )
+            if size != charged:
+                raise ValueError(
+                    f"{type(builder).__name__} wants {size} B of the paged pool "
+                    f"at {blocks} blocks but was charged {charged} B"
+                )
+        offsets, total = plan_regions(sizes)
+        if buf is None:
+            buf = torch.zeros(total, dtype=torch.uint8, device=self.device)
+        elif buf.numel() < total:
+            raise ValueError(
+                f"the imported paged pool holds {buf.numel()} B but this side's "
+                f"declarations want {total} B at {blocks} blocks"
+            )
+        regions = [buf[o : o + n] for o, n in zip(offsets, sizes)]
+        return buf, regions, builders
+
     def allocate_kv_cache(self, num_kvcache_blocks):
         pre_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
 
@@ -1907,28 +1953,21 @@ class ModelRunner:
                 )
             )
 
-        # Primary KV cache allocation (model-agnostic, delegated to the
-        # attention builder). Each builder owns its tensor layout: MLA →
-        # single 576-dim per layer; GDN-hybrid → only num_full_attn rows;
-        # MiMo-V2 → defer per-module; standard MHA → split-K/V `[2, L, ...]`.
-        # Returned tensors are setattr'd on `self` under their conventional
-        # names (kv_cache, kv_scale, index_cache, aligned_index_dim,
-        # _kv_layer_cache_store) so binding code and downstream consumers
-        # find them where they expect.
-        main_kv = self.attn_metadata_builder.allocate_kv_cache_tensors(
-            num_kv_heads, num_draft_layers, blocks=num_kvcache_blocks
-        )
-        for name, value in main_kv.items():
-            setattr(self, name, value)
-
-        # A draft that cannot share the target's pool owns one through a
-        # sibling builder; same protocol as above, and it keeps the pool
-        # itself, so the dict it returns is normally empty.
-        if hasattr(self, "draft_kv_builder"):
-            draft_kv = self.draft_kv_builder.allocate_kv_cache_tensors(
-                num_kv_heads, num_draft_layers, blocks=num_kvcache_blocks
-            )
-            for name, value in draft_kv.items():
+        # Primary KV cache allocation: one buffer, one region per builder, each
+        # owning the layout inside its own. A draft that cannot share the
+        # target's pool is simply the next region -- no second allocation, and
+        # nothing that asks whether its attention matches the target's.
+        #
+        # What comes back is only what a region cannot carry: scalars like
+        # `aligned_index_dim` and the compact layer maps, setattr'd here so
+        # their readers find them where they always have.
+        pool, regions, builders = self._carve_paged_pool(num_kvcache_blocks)
+        if pool.numel():
+            self.kv_cache = pool
+        for builder, region in zip(builders, regions):
+            for name, value in builder.allocate_kv_cache_tensors(
+                num_kv_heads, num_draft_layers, blocks=num_kvcache_blocks, buf=region
+            ).items():
                 setattr(self, name, value)
 
         # Per-request cache allocation (model-agnostic, delegated to the
@@ -4404,7 +4443,7 @@ class RapidServeModelRunner(ModelRunner):
         return True
 
     def export_kv_cache_ipc_handle(self) -> list[str] | None:
-        """Export self.kv_cache (and self.kv_scale for fp8) as CUDA IPC handles.
+        """Export self.kv_cache — the whole paged pool — as a CUDA IPC handle.
 
         TP-aware: each rank writes its handles to a temp file.  Rank 0 waits for
         all ranks and returns the list of paths; other ranks return None.
@@ -4412,8 +4451,7 @@ class RapidServeModelRunner(ModelRunner):
         from atom.model_engine.ipc_utils import export_kv_cache_handle
 
         logger.info(f"ModelRunner rank {self.rank}: export_kv_cache_ipc_handle")
-        kv_scale = getattr(self, "kv_scale", None)
-        handles = export_kv_cache_handle(self.kv_cache, kv_scale)
+        handles = export_kv_cache_handle(self.kv_cache)
         self._disagg_write_rank_file("kvcache", handles)
         paths = self._disagg_collect_rank_files("kvcache")
         if paths is not None:
@@ -4446,9 +4484,7 @@ class RapidServeModelRunner(ModelRunner):
             meta = pickle.load(f)
         os.remove(path)
         logger.info(f"ModelRunner rank {self.rank}: hipIpcOpenMemHandle for kvcache...")
-        self.kv_cache, kv_scale = import_kv_cache(meta)
-        if kv_scale is not None:
-            self.kv_scale = kv_scale
+        self.kv_cache = import_kv_cache(meta)
         logger.info(
             f"ModelRunner rank {self.rank}: kvcache IPC import done, binding..."
         )
@@ -4466,7 +4502,11 @@ class RapidServeModelRunner(ModelRunner):
         agree on every byte and differ only in what a reader branches on. So it
         runs the same loop over the same hook.
         """
-        self.attn_metadata_builder.adopt_imported_kv_pool(num_kvcache_blocks)
+        _, regions, builders = self._carve_paged_pool(
+            num_kvcache_blocks, buf=self.kv_cache
+        )
+        for builder, region in zip(builders, regions):
+            builder.adopt_imported_kv_pool(num_kvcache_blocks, region)
 
         models_to_bind = [("target", self.model)]
         if self.config.speculative_config and hasattr(self, "drafter"):
@@ -4474,11 +4514,20 @@ class RapidServeModelRunner(ModelRunner):
 
         kv_cache_tensors = []
         layer_id = 0
-        for _model_name, model in models_to_bind:
+        for model_name, model in models_to_bind:
             for module in model.modules():
-                bound = self.attn_metadata_builder.build_kv_cache_tensor(
-                    layer_id, module
-                )
+                # Same dispatch as the allocating path's loop: a draft with a
+                # pool of its own binds through its own builder, and its pool
+                # is now a region of the same imported buffer.
+                bound = None
+                if model_name == "draft" and hasattr(self, "draft_kv_builder"):
+                    bound = self.draft_kv_builder.build_kv_cache_tensor(
+                        layer_id, module
+                    )
+                if bound is None:
+                    bound = self.attn_metadata_builder.build_kv_cache_tensor(
+                        layer_id, module
+                    )
                 if bound is not None:
                     kv_cache_tensors.append(bound)
                     layer_id += 1
