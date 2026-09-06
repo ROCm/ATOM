@@ -69,6 +69,11 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         self._scheduler = None
 
         self._seqs = SeqViewRegistry()
+        # finished_sending is only legal for a request vLLM has already
+        # finished AND whose save has landed; the two events arrive in either
+        # order, so both sides are accumulated until they meet.
+        self._saved_awaiting_finish: set[str] = set()
+        self._finished_awaiting_save: set[str] = set()
 
         if role == KVConnectorRole.WORKER:
             from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
@@ -102,6 +107,26 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
             len(tensors),
             num_blocks,
         )
+        # Layout/dtype census. The codec moves opaque bytes, so a wrong dtype
+        # never surfaces here -- it surfaces much later inside an attention
+        # kernel ("Both operands must be same dtype"), with nothing pointing
+        # back at registration. One line here makes that diagnosable.
+        census: dict[tuple, int] = {}
+        for name, tensor in sorted(kv_caches.items()):
+            key = (
+                "index" if name.endswith(".index_cache") else "kv",
+                tuple(tensor.shape[1:]),
+                str(tensor.dtype),
+            )
+            census[key] = census.get(key, 0) + 1
+        for (kind, shape, dtype), count in sorted(census.items(), key=str):
+            logger.info(
+                "ATOM LMCache offload:   %d x %s tail_shape=%s dtype=%s",
+                count,
+                kind,
+                shape,
+                dtype,
+            )
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         metadata = self._get_connector_metadata()
@@ -131,12 +156,17 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Translate ATOM's four completion sets into vLLM's two.
 
-        ``finished_saving`` HAS to surface as vLLM's ``finished_sending``:
-        ``request_finished`` defers freeing while a save is in flight, and vLLM
-        only releases those blocks once the id appears here. ATOM's own worker
-        deliberately reports an empty ``finished_sending`` because ITS scheduler
-        reads that as a P/D producer handoff -- a different contract from
-        vLLM's, so the mapping is done here rather than by changing ATOM.
+        ``finished_saving`` surfaces as vLLM's ``finished_sending``, but only
+        once the request has ALSO finished. vLLM's scheduler asserts both
+        ``req_id in self.requests`` and ``request.is_finished()`` before
+        freeing, while ATOM's saves are fire-and-forget and routinely land
+        while the request is still decoding -- reporting those crashed the
+        engine on ``assert request.is_finished()``. The two events arrive in
+        either order, so each side is held until its counterpart shows up.
+
+        ATOM's own worker deliberately reports an empty ``finished_sending``
+        because ITS scheduler reads that as a P/D producer handoff. Same name,
+        two contracts; the translation lives here rather than in either side.
 
         A failed load is reported as finished too: the request is parked
         waiting on it, and the alternative to waking it is a hang. vLLM then
@@ -152,7 +182,12 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
             )
             finished_recving |= failed
 
-        finished_sending = {_req_id_of(c) for c in out.finished_saving}
+        self._saved_awaiting_finish |= {_req_id_of(c) for c in out.finished_saving}
+        self._finished_awaiting_save |= set(finished_req_ids or ())
+        finished_sending = self._saved_awaiting_finish & self._finished_awaiting_save
+        self._saved_awaiting_finish -= finished_sending
+        self._finished_awaiting_save -= finished_sending
+
         return finished_sending, finished_recving
 
     def shutdown(self) -> None:
