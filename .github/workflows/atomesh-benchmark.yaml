@@ -714,47 +714,37 @@ jobs:
           cat /tmp/rdma-smoke-nic-priority.json
 
           target_pid=""
+          log_progress() {
+            local msg="$*"
+            echo "${msg}"
+            echo "$(date -Is) rank=${SMOKE_RANK:-?} ${msg}" >> "${SMOKE_RUN_DIR}/rank-${SMOKE_RANK:-unknown}.log" 2>/dev/null || true
+          }
+
+          start_target_process() {
+            local gpu_id="$1"
+            local log_file="$2"
+            shift 2
+            if command -v setsid >/dev/null 2>&1; then
+              HIP_VISIBLE_DEVICES="${gpu_id}" \
+                setsid "${validator_bin}" "$@" >"${log_file}" 2>&1 < /dev/null &
+            else
+              HIP_VISIBLE_DEVICES="${gpu_id}" \
+                "${validator_bin}" "$@" >"${log_file}" 2>&1 < /dev/null &
+            fi
+            target_pid=$!
+          }
+
           stop_target_process() {
             local pid="${target_pid:-}"
-            local state=""
-            local attempt
 
             [[ -n "${pid}" ]] || return 0
-            kill -TERM "${pid}" 2>/dev/null || true
-            for ((attempt = 0; attempt < 15; attempt++)); do
-              if ! kill -0 "${pid}" 2>/dev/null; then
-                break
-              fi
-              state="$(awk '{ print $3 }' "/proc/${pid}/stat" 2>/dev/null || true)"
-              [[ "${state}" == "Z" ]] && break
-              sleep 0.2
-            done
-
-            state="$(awk '{ print $3 }' "/proc/${pid}/stat" 2>/dev/null || true)"
-            if kill -0 "${pid}" 2>/dev/null && [[ "${state}" != "Z" ]]; then
-              echo "WARNING: RDMA target ${pid} did not exit after TERM; sending KILL" >&2
-              kill -KILL "${pid}" 2>/dev/null || true
-            fi
-
-            # wait is a shell builtin, so `timeout wait` cannot reap this child.
-            # Poll up to ~5s, then wait only if the process has exited or is a
-            # zombie. An uninterruptible D-state target would otherwise block
-            # the decode rank forever and stall the next GPU pair.
-            for ((attempt = 0; attempt < 25; attempt++)); do
-              if ! kill -0 "${pid}" 2>/dev/null; then
-                break
-              fi
-              state="$(awk '{ print $3 }' "/proc/${pid}/stat" 2>/dev/null || true)"
-              [[ "${state}" == "Z" ]] && break
-              sleep 0.2
-            done
-            state="$(awk '{ print $3 }' "/proc/${pid}/stat" 2>/dev/null || true)"
-            if ! kill -0 "${pid}" 2>/dev/null || [[ "${state}" == "Z" ]]; then
-              wait "${pid}" 2>/dev/null || true
-            else
-              echo "WARNING: RDMA target ${pid} still present after KILL; skipping wait" >&2
-            fi
             target_pid=""
+            # SIGTERM runs Mooncake unregisterLocalMemory(), which can hang in
+            # D-state. Smoke targets are ephemeral: KILL the process group and
+            # do not wait, so the next GPU pair can start immediately.
+            echo "WARNING: killing RDMA target process group ${pid} without waiting" >&2
+            kill -KILL -- "-${pid}" 2>/dev/null || kill -KILL "${pid}" 2>/dev/null || true
+            disown "${pid}" 2>/dev/null || true
           }
 
           cleanup_processes() {
@@ -782,7 +772,6 @@ jobs:
               if ! kill -0 "${target_pid}" 2>/dev/null; then
                 echo "ERROR: P2P target exited before publishing its listening address" >&2
                 cat "${target_log}" >&2 || true
-                wait "${target_pid}" 2>/dev/null || true
                 return 1
               fi
               if [[ "${SECONDS}" -ge "${deadline}" ]]; then
@@ -911,8 +900,7 @@ jobs:
             initiator_log="/tmp/gdr-smoke-prefill-gpu-${prefill_gpu_id}-initiator.log"
 
             echo "=== GPUDirect RDMA prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) -> decode GPU ${decode_gpu_id} (${decode_device_csv}) ==="
-            HIP_VISIBLE_DEVICES="${decode_gpu_id}" \
-            "${validator_bin}" \
+            start_target_process "${decode_gpu_id}" "${target_log}" \
               --mode=target \
               --protocol=rdma \
               --metadata_server=P2PHANDSHAKE \
@@ -921,9 +909,7 @@ jobs:
               --nic_priority_matrix="${decode_matrix}" \
               --use_vram=true \
               --gpu_id=0 \
-              --buffer_size=100663296 \
-              >"${target_log}" 2>&1 &
-            target_pid=$!
+              --buffer_size=100663296
             target_name="$(wait_for_p2p_address "${target_log}" "${target_pid}" 30)"
             echo "P2P target listening at ${target_name}"
 
@@ -1092,9 +1078,8 @@ jobs:
                 rm -f \
                   "${ready_file}" "${ready_file}.tmp" \
                   "${result_file}" "${result_file}.tmp"
-                echo "=== Cross-node decode target: ${local_ip}, GPU ${decode_gpu_id} (${decode_rdma_device}) ==="
-                HIP_VISIBLE_DEVICES="${decode_gpu_id}" \
-                "${validator_bin}" \
+                log_progress "=== Cross-node decode target: ${local_ip}, GPU ${decode_gpu_id} (${decode_rdma_device}) ==="
+                start_target_process "${decode_gpu_id}" "${target_log}" \
                   --mode=target \
                   --protocol=rdma \
                   --metadata_server=P2PHANDSHAKE \
@@ -1103,11 +1088,9 @@ jobs:
                   --nic_priority_matrix="${decode_matrix}" \
                   --use_vram=true \
                   --gpu_id=0 \
-                  --buffer_size=100663296 \
-                  >"${target_log}" 2>&1 &
-                target_pid=$!
+                  --buffer_size=100663296
                 target_name="$(wait_for_p2p_address "${target_log}" "${target_pid}" 30)"
-                echo "Cross-node P2P target listening at ${target_name}"
+                log_progress "Cross-node P2P target listening at ${target_name}"
                 echo "${target_name}" > "${ready_file}.tmp"
                 mv "${ready_file}.tmp" "${ready_file}"
 
@@ -1119,9 +1102,9 @@ jobs:
                   echo "ERROR: cross-node GPUDirect RDMA failed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}" >&2
                   exit 1
                 fi
-                echo "Cross-node GPUDirect RDMA passed on decode GPU ${decode_gpu_id}"
+                log_progress "Cross-node GPUDirect RDMA passed on decode GPU ${decode_gpu_id}"
               else
-                wait_for_file "${ready_file}" 60 "decode GPU ${decode_gpu_id} target"
+                wait_for_file "${ready_file}" 120 "decode GPU ${decode_gpu_id} target"
                 target_name="$(<"${ready_file}")"
                 initiator_log="/tmp/cross-node-prefill-${prefill_gpu_id}-decode-${decode_gpu_id}-initiator.log"
                 echo "=== Cross-node prefill initiator: ${local_ip} GPU ${prefill_gpu_id} (${prefill_rdma_device}) -> ${target_name} decode GPU ${decode_gpu_id} ==="
