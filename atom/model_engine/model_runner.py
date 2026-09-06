@@ -773,7 +773,6 @@ class ModelRunner:
         self.attn_metadata_builder = self.attn_backend.get_builder_cls()(
             model_runner=self
         )
-        self.physical_block_size = self.attn_metadata_builder.block_size
         # Sub-pool sizing needs a memory profile, so it cannot run until after
         # warmup. Install the empty plan now: `warmup_model` below drives the
         # builder through paths that ask for their entry counts, and those must
@@ -4450,11 +4449,11 @@ class RapidServeModelRunner(ModelRunner):
         logger.info(
             f"ModelRunner rank {self.rank}: kvcache IPC import done, binding..."
         )
-        self._bind_kv_cache_to_modules()
+        self._bind_kv_cache_to_modules(num_kvcache_blocks)
         logger.info(f"ModelRunner rank {self.rank}: import_kv_cache_ipc_handle done")
         return True
 
-    def _bind_kv_cache_to_modules(self):
+    def _bind_kv_cache_to_modules(self, num_kvcache_blocks: int):
         """Bind an IPC-imported KV pool to every attention module.
 
         The decode side of a P/D pair gets the pool as a handle, so it never
@@ -4464,7 +4463,7 @@ class RapidServeModelRunner(ModelRunner):
         agree on every byte and differ only in what a reader branches on. So it
         runs the same loop over the same hook.
         """
-        self.attn_metadata_builder.adopt_imported_kv_pool()
+        self.attn_metadata_builder.adopt_imported_kv_pool(num_kvcache_blocks)
 
         models_to_bind = [("target", self.model)]
         if self.config.speculative_config and hasattr(self, "drafter"):

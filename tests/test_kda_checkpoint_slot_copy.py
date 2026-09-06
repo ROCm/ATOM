@@ -304,6 +304,9 @@ class TestAStoreRestoreRoundTripMovesExactlyTheImage:
         )
         stub = SimpleNamespace(
             model_runner=runner,
+            kv_pool=SimpleNamespace(
+                cache=SimpleNamespace(view=lambda _name: runner.kv_cache), index=None
+            ),
             _state_shape_for_runner=lambda: (SHAPE_K, SHAPE_V),
             _state_dtypes=lambda: (DT_K, DT_V),
             _page_unit_region_cache=None,
@@ -318,6 +321,7 @@ class TestAStoreRestoreRoundTripMovesExactlyTheImage:
         ):
             setattr(stub, name, getattr(Mixin, name).__get__(stub, type(stub)))
         for name in (
+            "_page_unit_kv_cache",
             "_page_unit_index_cache",
             "_page_unit_regions",
             "_page_unit_bases",
@@ -463,8 +467,20 @@ class TestAnIndexerSharesThePageUnit:
             state_runtime=runtime,
             is_deepseek_v32=indexed,
         )
-        stub = SimpleNamespace(model_runner=runner, _page_unit_region_cache=None)
+        stub = SimpleNamespace(
+            model_runner=runner,
+            kv_pool=SimpleNamespace(
+                cache=SimpleNamespace(view=lambda _name: runner.kv_cache),
+                index=(
+                    None
+                    if index_cache is None
+                    else SimpleNamespace(view=lambda _name: runner.index_cache)
+                ),
+            ),
+            _page_unit_region_cache=None,
+        )
         for name in (
+            "_page_unit_kv_cache",
             "_page_unit_index_cache",
             "_page_unit_regions",
             "_page_unit_bases",

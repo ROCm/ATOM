@@ -474,7 +474,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             index_cache_dtype = _resolve_index_cache_dtype(config)
             block_bytes += (
                 sparse_layers
-                * runner.physical_block_size
+                * self.block_size
                 * index_dim
                 * torch.empty((), dtype=index_cache_dtype).element_size()
             )
@@ -502,13 +502,16 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         runner = self.model_runner
         return MhaKvPool(
             layers=self._kv_pool_layers() if layers is None else layers,
-            block_size=runner.physical_block_size,
+            # The scheduler's block, which is the entry class `page_pool`
+            # charges. How many of this backend's own pages make one up is
+            # `block_ratio`, and it stays inside the backend.
+            block_size=runner.block_size,
             num_kv_heads=num_kv_heads,
             head_dim=runner.config.hf_config.head_dim,
             kv_dtype=dtypes.d_dtypes[runner.config.kv_cache_dtype],
         )
 
-    def adopt_imported_kv_pool(self) -> None:
+    def adopt_imported_kv_pool(self, blocks: int) -> None:
         runner = self.model_runner
         if runner.is_mimo_v2():
             raise NotImplementedError(
@@ -517,7 +520,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             )
         self.kv_pool = self._declare_kv_pool(runner._get_num_kv_heads())
         self.kv_pool.allocate(
-            runner.num_physical_kvcache_blocks,
+            blocks,
             runner.device,
             cache_buf=runner.kv_cache,
             scale_buf=runner.kv_scale,
@@ -547,7 +550,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             }
 
         self.kv_pool = self._declare_kv_pool(num_kv_heads)
-        self.kv_pool.allocate(runner.num_physical_kvcache_blocks, runner.device)
+        # `config.num_kvcache_blocks`, not `pool_plan.paged_entries`: sizing
+        # runs in every runner subprocess and they disagree by a few blocks
+        # (each measures its own free memory), so EngineCore takes one answer
+        # and broadcasts it to `allocate_kv_cache`, which lands it here. The
+        # plan is this rank's own estimate; the argument is what every rank
+        # actually builds, and everything else sized off the block count --
+        # the sparse index cache below included -- follows the argument.
+        self.kv_pool.allocate(runner.config.num_kvcache_blocks, runner.device)
         tensors = {
             "kv_cache": self.kv_pool.cache.buf,
             "kv_scale": self.kv_pool.scale.buf,
@@ -561,7 +571,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             tensors["sparse_attention_index_cache"] = torch.zeros(
                 sparse_layers,
                 runner.num_physical_kvcache_blocks,
-                runner.physical_block_size,
+                self.block_size,
                 sparse_cfg["sparse_index_dim"],
                 dtype=index_cache_dtype,
                 device="cuda",
@@ -634,7 +644,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # its own per-block cost. Same declaration, kept alive by the views
             # it hands out.
             pool = self._declare_kv_pool(module.num_kv_heads, layers=1)
-            pool.allocate(runner.num_physical_kvcache_blocks, runner.device)
+            pool.allocate(runner.config.num_kvcache_blocks, runner.device)
             k_cache, v_cache = pool.kv_views(0)
             if fp8:
                 module.k_scale, module.v_scale = pool.scale_views(0)

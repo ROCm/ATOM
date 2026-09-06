@@ -270,37 +270,53 @@ def test_allocate_index_cache_uses_compact_shape_and_map(monkeypatch):
         total_local_layers=4,
     )
     _mock_pp(monkeypatch, rank=1, world_size=2)
-    fake_fp8 = SimpleNamespace(itemsize=1)
     monkeypatch.setattr(
         aiter_mla,
         "dtypes",
-        SimpleNamespace(d_dtypes={"fp8": fake_fp8}, fp8=fake_fp8),
+        SimpleNamespace(
+            d_dtypes={"fp8": torch.float8_e4m3fnuz}, fp8=torch.float8_e4m3fnuz
+        ),
     )
-    runner.num_physical_kvcache_blocks = 8
-    runner.physical_block_size = 1
-    allocations = []
-
-    def fake_zeros(*shape, **kwargs):
-        allocations.append((shape, kwargs))
-        return SimpleNamespace(shape=shape)
-
-    monkeypatch.setattr(aiter_mla.torch, "zeros", fake_zeros)
+    blocks = 8
+    # The count the pool is built at is the one EngineCore broadcast into
+    # `allocate_kv_cache`, not this rank's own sizing estimate.
+    runner.config.num_kvcache_blocks = blocks
+    runner.device = "cpu"
 
     out = builder.allocate_kv_cache_tensors(num_kv_heads=1, num_draft_layers=1)
 
-    assert out["kv_cache"].shape == (4, 8, 1, 576)
-    assert out["index_cache"].shape == (3, 8, 1, 144)
+    # Asserted through the views a reader binds, not the allocator's call
+    # shape: the pool hands out one row per layer, and only indexer-owning
+    # layers get an index row.
+    assert builder.kv_pool.cache.view("kv").shape == (4, blocks, 16, 576)
+    assert builder.kv_pool.index.view("index").shape == (3, blocks, 16, 144)
     assert out["index_cache_layer_ids"] == (3, 5, 6)
     assert out["index_cache_layer_map"] == {3: 0, 5: 1, 6: 2}
-    assert len(allocations) == 2
+    # Two allocations, and `kv_cache`/`index_cache` are the buffers they own.
+    assert out["kv_cache"].data_ptr() == builder.kv_pool.cache.buf.data_ptr()
+    assert out["index_cache"].data_ptr() == builder.kv_pool.index.buf.data_ptr()
 
 
-class _FakeCache:
-    def __init__(self, prefix):
-        self.prefix = prefix
+class _FakePool:
+    """Stands in for `MlaKvPool`.
 
-    def __getitem__(self, index):
-        return _FakeCacheSlice((self.prefix, index))
+    The binder asks it for one thing -- a layer's slice by field name -- and
+    the transfer path for the tensors those slices come from, so the double is
+    two methods rather than a tensor that has to behave like a tensor.
+    """
+
+    entry_dim = 576
+
+    def __init__(self, regions=(), index=True, layers=0):
+        self.index = object() if index else None
+        self.layers = layers
+        self._regions = list(regions)
+
+    def layer(self, name, layer):
+        return _FakeCacheSlice((name, layer))
+
+    def region_tensors(self):
+        return self._regions
 
 
 class _FakeCacheSlice:
@@ -329,23 +345,14 @@ class _FakeTransferTensor:
         return self._address
 
 
-class _FakeTransferStack:
-    def __init__(self, num_layers, address_base):
-        self.shape = (num_layers,)
-        self._layers = [
-            _FakeTransferTensor(address_base + layer_id)
-            for layer_id in range(num_layers)
-        ]
-
-    def __getitem__(self, index):
-        return self._layers[index]
+def _FakeTransferStack(num_layers, address_base):
+    """One fake tensor per layer, at distinguishable addresses."""
+    return [_FakeTransferTensor(address_base + layer) for layer in range(num_layers)]
 
 
 def test_build_kv_cache_tensor_binds_compact_index_slice():
     builder = object.__new__(AiterMLAMetadataBuilder)
     runner = SimpleNamespace(
-        kv_cache=_FakeCache("kv"),
-        index_cache=_FakeCache("index"),
         index_cache_layer_map={3: 0, 5: 1},
         is_deepseek_v32=True,
         num_physical_kvcache_blocks=8,
@@ -357,6 +364,7 @@ def test_build_kv_cache_tensor_binds_compact_index_slice():
         ),
     )
     builder.model_runner = runner
+    builder.kv_pool = _FakePool()
     module = SimpleNamespace(
         base_attention=object(),
         use_mla=True,
@@ -368,7 +376,7 @@ def test_build_kv_cache_tensor_binds_compact_index_slice():
 
     cache_tensor = builder.build_kv_cache_tensor(layer_id=2, module=module)
 
-    assert module.kv_cache == (("kv", 2), (8, 1, 576))
+    assert module.kv_cache == (("kv", 2), (-1, 1, 576))
     assert module.indexer.k_cache.kv_cache[0][0] == ("index", 1)
     assert cache_tensor.layer_num == 2
     assert cache_tensor.index_cache.identity == ("index", 1)
@@ -377,8 +385,6 @@ def test_build_kv_cache_tensor_binds_compact_index_slice():
 def test_build_shared_layer_keeps_main_kv_without_index_slice():
     builder = object.__new__(AiterMLAMetadataBuilder)
     runner = SimpleNamespace(
-        kv_cache=_FakeCache("kv"),
-        index_cache=_FakeCache("index"),
         index_cache_layer_map={0: 0},
         is_deepseek_v32=True,
         num_physical_kvcache_blocks=8,
@@ -390,6 +396,7 @@ def test_build_shared_layer_keeps_main_kv_without_index_slice():
         ),
     )
     builder.model_runner = runner
+    builder.kv_pool = _FakePool()
     module = SimpleNamespace(
         base_attention=object(),
         use_mla=True,
@@ -399,7 +406,7 @@ def test_build_shared_layer_keeps_main_kv_without_index_slice():
 
     cache_tensor = builder.build_kv_cache_tensor(layer_id=1, module=module)
 
-    assert module.kv_cache == (("kv", 1), (8, 1, 576))
+    assert module.kv_cache == (("kv", 1), (-1, 1, 576))
     assert cache_tensor.index_cache is None
 
 
@@ -410,8 +417,9 @@ def test_transfer_regions_use_explicit_compact_consumer_map(monkeypatch):
     )
     _mock_pp(monkeypatch, rank=1, world_size=2)
     builder.block_ratio = 1
-    runner.kv_cache = _FakeTransferStack(4, 100)
-    runner.index_cache = _FakeTransferStack(3, 200)
+    builder.kv_pool = _FakePool(
+        layers=4, regions=[*_FakeTransferStack(4, 100), *_FakeTransferStack(3, 200)]
+    )
     runner.index_cache_layer_ids = (3, 5, 6)
     runner.config.num_kvcache_blocks = 8
 
@@ -443,8 +451,9 @@ def test_hybrid_transfer_regions_compact_both_kv_and_index_rows(monkeypatch):
     runner.full_attention_layers = [1, 3, 5]
     _mock_pp(monkeypatch, rank=1, world_size=2)
     builder.block_ratio = 1
-    runner.kv_cache = _FakeTransferStack(2, 100)
-    runner.index_cache = _FakeTransferStack(2, 200)
+    builder.kv_pool = _FakePool(
+        layers=2, regions=[*_FakeTransferStack(2, 100), *_FakeTransferStack(2, 200)]
+    )
     runner.index_cache_layer_ids = (3, 5)
     runner.config.num_kvcache_blocks = 8
 

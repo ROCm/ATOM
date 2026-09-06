@@ -47,6 +47,7 @@ from atom.utils.block_convert import (
 from atom.utils.forward_context import AttentionMetaData, Context
 
 from .backends import AttentionBackend, CommonAttentionBuilder
+from .mla_kv_pool import MlaKvPool
 from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool
 from .token_layout.decode import decode_positions
 from .token_layout.slots import slot_mapping
@@ -305,6 +306,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 f"got --block-size {model_runner.block_size}"
             )
         CommonAttentionBuilder.__init__(self, model_runner)
+        # Set by `allocate_kv_cache_tensors` / `adopt_imported_kv_pool`, both of
+        # which run long after construction.
+        self.kv_pool: MlaKvPool | None = None
         # Single-program block for the fused MTP-decode metadata kernel. Sized
         # to the max batch (runtime bs <= max_bs) so one tl.cumsum spans the
         # whole batch in a single launch.
@@ -1060,74 +1064,78 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         return result
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
-        """One paged KV pool. Per-block bytes = a single 576-dim packed
-        tensor per layer (k_c + k_pe; V is absorbed into latent compression —
-        no separate V cache or kv_scale).
+        """One paged KV pool: a single packed tensor per layer (k_c + k_pe; V
+        is absorbed into latent compression — no separate V cache or kv_scale).
 
         DeepSeek-V3.2 sparse variants add an indexer cache contribution
         for every indexer-owning layer, including draft/MTP layers. GLM-5.2
         shared layers do not own an indexer and are excluded.
         """
-        runner = self.model_runner
-        config = runner.config
-        hf_config = config.hf_config
-        total_num_layers = runner._get_total_num_layers()
-        kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
+        return [page_pool(self._declare_kv_pool().entry_bytes)]
 
-        block_bytes = total_num_layers * runner.block_size * 576 * kv_dtype_size
-        if runner.is_deepseek_v32:
-            aligned_index_dim = aligned_index_cache_dim(hf_config)
-            index_cache_layer_ids, _ = self._index_cache_layout()
-            block_bytes += (
-                len(index_cache_layer_ids)
-                * runner.block_size
-                * aligned_index_dim
-                * dtypes.fp8.itemsize
-            )
-        return [page_pool(block_bytes)]
+    def _kv_pool_layers(self) -> int:
+        """Rows the paged pool holds, one per layer that caches KV.
 
-    def _index_cache_block_bytes(self, index_cache_layer: torch.Tensor) -> int:
-        """Bytes one SCHEDULER block owns in one layer of the index cache.
-
-        Here dim 0 counts PHYSICAL blocks and there is one row per token, so a
-        scheduler block spans `block_ratio` of them. A builder whose index
-        cache is indexed by scheduler block, or whose indexer compresses
-        several tokens into one row, overrides this -- applying `block_ratio`
-        to such a cache would over-report by exactly the compression ratio.
+        A hook because a hybrid caches for only some of its layers, and
+        sizing, allocation and the P/D adopt path have to agree on the count
+        or the arena refuses the buffer.
         """
-        t = index_cache_layer
-        return t.stride(0) * t.element_size() * self.block_ratio
+        return self.model_runner._get_total_num_layers()
+
+    def _index_rows_per_block(self) -> int:
+        """Indexer rows one scheduler block owns — one per token by default.
+
+        An indexer that pools several tokens into a row overrides this and
+        keeps fewer.
+        """
+        return self.model_runner.block_size
+
+    def _declare_kv_pool(self) -> MlaKvPool:
+        """This model's MLA layers as a pool, declared but not allocated.
+
+        Sizing asks before a block count exists, so both steps come from here
+        and the pool that is charged for is the pool that gets built.
+        """
+        runner = self.model_runner
+        hf_config = runner.config.hf_config
+        # `aligned_index_cache_dim` reads indexer config a dense model has no
+        # reason to carry, so it is asked only when there are indexer layers.
+        indexer = (
+            {
+                "index_layers": len(self._index_cache_layout()[0]),
+                "index_rows_per_block": self._index_rows_per_block(),
+                "index_dim": aligned_index_cache_dim(hf_config),
+                "index_dtype": dtypes.fp8,
+            }
+            if runner.is_deepseek_v32
+            else {}
+        )
+        return MlaKvPool(
+            layers=self._kv_pool_layers(),
+            block_size=runner.block_size,
+            entry_dim=mla_kv_entry_dim(hf_config),
+            kv_dtype=dtypes.d_dtypes[runner.config.kv_cache_dtype],
+            **indexer,
+        )
 
     def allocate_kv_cache_tensors(
         self, num_kv_heads: int, num_draft_layers: int
     ) -> dict:
-        """MLA: single 576-dim paged tensor per layer (k_c + k_pe packed,
-        no separate V cache — MLA absorbs V into the latent compression).
+        """Allocate this model's MLA pool.
 
-        DeepSeek-V3.2 sparse variants additionally allocate an `index_cache`
-        for indexer-owning layers; the aligned dimension and compact layer map
-        are returned so build_kv_cache_tensor can bind the correct slice.
+        `kv_cache` and `index_cache` stay on the runner as the flat buffers the
+        arenas own -- what the P/D IPC export ships and the rollout sleep path
+        frees. The aligned dimension and compact layer map ride along so
+        `build_kv_cache_tensor` can pick the right indexer slice.
         """
         runner = self.model_runner
-        config = runner.config
-        hf_config = config.hf_config
-        total_num_layers = runner._get_total_num_layers()
-        out: dict = {
-            "kv_cache": torch.zeros(
-                total_num_layers,
-                runner.num_physical_kvcache_blocks,
-                runner.physical_block_size,
-                576,
-                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
-                device="cuda",
-            ),
-        }
+        hf_config = runner.config.hf_config
+        self.kv_pool = self._declare_kv_pool()
+        self.kv_pool.allocate(runner.config.num_kvcache_blocks, runner.device)
+        out: dict = {"kv_cache": self.kv_pool.cache.buf}
         if runner.is_deepseek_v32:
-            # Align last dimension to 16 bytes for fp8 (1 byte per element)
-            # to avoid unaligned memory access in torch inductor.
-            aligned = aligned_index_cache_dim(hf_config)
             index_cache_layer_ids, _ = self._index_cache_layout()
-            out["aligned_index_dim"] = aligned
+            out["aligned_index_dim"] = aligned_index_cache_dim(hf_config)
             out["index_cache_layer_ids"] = index_cache_layer_ids
             out["index_cache_layer_map"] = {
                 global_layer_id: compact_layer_id
@@ -1135,20 +1143,23 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     index_cache_layer_ids
                 )
             }
-            out["index_cache"] = torch.zeros(
-                len(index_cache_layer_ids),
-                runner.num_physical_kvcache_blocks,
-                runner.physical_block_size,
-                aligned,
-                dtype=dtypes.fp8,
-                device="cuda",
-            )
+            out["index_cache"] = self.kv_pool.index.buf
         return out
+
+    def adopt_imported_kv_pool(self, blocks: int) -> None:
+        runner = self.model_runner
+        self.kv_pool = self._declare_kv_pool()
+        self.kv_pool.allocate(
+            blocks,
+            runner.device,
+            cache_buf=runner.kv_cache,
+            index_buf=getattr(runner, "index_cache", None),
+        )
 
     def build_kv_cache_tensor(self, layer_id: int, module):
         """Bind one MLA attention module to its KV slice.
 
-        Handles standard MLA (single 576-dim KV cache per layer) and the
+        Handles standard MLA (one packed KV row per token) and the
         DeepSeek-V3.2 sparse variant (additional indexer cache hooked via
         `module.indexer.k_cache.kv_cache[0]`). Returns the KVCacheTensor or
         None if the module is not an MLA attention this builder owns.
@@ -1165,8 +1176,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             return None
 
         runner = self.model_runner
-        num_slots = runner.num_physical_kvcache_blocks * runner.physical_block_size
-        kv_cache = runner.kv_cache[layer_id].view(num_slots, 1, 576)
+        # The pool's slice is `[blocks, rows, dim]`; MLA addresses by row, so
+        # the block axis folds away. Contiguous, so this is a view.
+        kv_cache = self.kv_pool.layer("kv", layer_id).view(
+            -1, 1, self.kv_pool.entry_dim
+        )
         module.max_model_len = runner.config.max_model_len
         index_cache = None
         if runner.is_deepseek_v32 and module.indexer is not None:
@@ -1181,12 +1195,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     f"cache layout: layer_num={global_layer_id}"
                 )
             index_cache_layer_id = runner.index_cache_layer_map[global_layer_id]
-            index_cache = runner.index_cache[index_cache_layer_id]
+            index_cache = self.kv_pool.layer("index", index_cache_layer_id)
             # Use aligned dimension to avoid memory copy in torch inductor
             module.indexer.k_cache.kv_cache[0] = index_cache.view(
-                runner.num_physical_kvcache_blocks * runner.physical_block_size,
-                1,
-                runner.aligned_index_dim,
+                -1, 1, runner.aligned_index_dim
             )
         module.kv_cache = kv_cache
         return KVCacheTensor(
@@ -1205,33 +1217,24 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
 
         runner = self.model_runner
-        if not hasattr(runner, "kv_cache"):
+        if self.kv_pool is None:
             return None
+        # What the pool was built with, not what the hook would recompute: a
+        # hybrid caches for fewer layers than the model has, and the consumer
+        # indices below are positions in the allocated rows.
+        num_layers = self.kv_pool.layers
 
-        block_regions: list[KVTransferRegion] = []
-        num_layers = runner.kv_cache.shape[0]
-        for layer_id in range(num_layers):
-            t = runner.kv_cache[layer_id]
-            bpb = t.stride(0) * t.element_size() * self.block_ratio
-            block_regions.append(
-                KVTransferRegion(
-                    base_addr=t.data_ptr(),
-                    total_bytes=t.numel() * t.element_size(),
-                    unit_bytes=bpb,
-                )
+        # A row of each is one scheduler block, so `stride(0)` is already the
+        # bytes a transfer moves per block -- no `block_ratio` after the fact,
+        # and no per-field override to keep in step with the pooling ones.
+        block_regions = [
+            KVTransferRegion(
+                base_addr=t.data_ptr(),
+                total_bytes=t.numel() * t.element_size(),
+                unit_bytes=t.stride(0) * t.element_size(),
             )
-
-        if hasattr(runner, "index_cache"):
-            for layer_id in range(runner.index_cache.shape[0]):
-                t = runner.index_cache[layer_id]
-                bpb = self._index_cache_block_bytes(t)
-                block_regions.append(
-                    KVTransferRegion(
-                        base_addr=t.data_ptr(),
-                        total_bytes=t.numel() * t.element_size(),
-                        unit_bytes=bpb,
-                    )
-                )
+            for t in self.kv_pool.region_tensors()
+        ]
 
         block_region_consumer_indices = None
         index_cache_layer_ids = getattr(runner, "index_cache_layer_ids", ())

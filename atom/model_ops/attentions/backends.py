@@ -322,7 +322,7 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return {}
 
-    def adopt_imported_kv_pool(self) -> None:
+    def adopt_imported_kv_pool(self, blocks: int) -> None:
         """Re-derive whatever this builder holds over the runner's KV pool.
 
         The decode side of a P/D pair receives the pool as an IPC handle, so
@@ -330,6 +330,10 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         built has to be rebuilt over the imported buffers before
         `build_kv_cache_tensor` can bind to them. Same declaration, other
         backing store. A builder that holds nothing has nothing to do.
+
+        `blocks` is passed rather than read off the runner because that side
+        never ran sizing: its `pool_plan` is empty, and `num_kvcache_blocks`
+        reaches the config only after this. The count arrives with the handle.
         """
 
     def build_kv_cache_tensor(self, layer_id: int, module):
