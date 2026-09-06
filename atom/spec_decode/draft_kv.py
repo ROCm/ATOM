@@ -20,12 +20,9 @@ def draft_kv_builder(model_runner, draft_hf):
     """
     from aiter import dtypes
 
-    from atom.utils.selector import get_attn_backend
+    from atom.utils.selector import attn_family, get_attn_backend
 
-    backend = get_attn_backend(
-        model_runner.block_size,
-        use_mla=bool(getattr(draft_hf, "kv_lora_rank", None)),
-    )
+    backend = get_attn_backend(attn_family(draft_hf))
     pool = backend.make_kv_pool(
         draft_hf,
         world_size=model_runner.world_size,

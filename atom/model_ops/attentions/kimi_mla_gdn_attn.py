@@ -199,7 +199,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
     def _kpool_tail_bytes(self) -> int:
         """Per-request tail bytes across every indexer-owning layer."""
         kpool = self._kpool_size()
-        if kpool <= 1 or not getattr(self.model_runner, "is_deepseek_v32", False):
+        if kpool <= 1 or not getattr(self.model_runner, "has_mla_indexer", False):
             return 0
         hf = self.model_runner.config.hf_config
         index_cache_layer_ids, _ = self._index_cache_layout()
@@ -296,7 +296,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         self.kv_pool = self._declare_kv_pool()
         self.kv_pool.allocate(blocks, runner.device, buf=buf)
         out: dict = {}
-        if runner.is_deepseek_v32:
+        if runner.has_mla_indexer:
             index_cache_layer_ids, _ = self._index_cache_layout()
             out["aligned_index_dim"] = self._aligned_index_dim()
             out["index_cache_layer_ids"] = index_cache_layer_ids
@@ -315,7 +315,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         two cannot disagree: a unit owns index-cache bytes exactly when the
         pool was priced with them.
         """
-        if not self.model_runner.is_deepseek_v32:
+        if not self.model_runner.has_mla_indexer:
             return None
         return None if self.kv_pool.index is None else self.kv_pool.index.view("index")
 
@@ -355,7 +355,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             )
             kv_cache = self.kv_pool.layer("kv", row).view(-1, 1, self.kv_pool.entry_dim)
             module.max_model_len = runner.config.max_model_len
-            if runner.is_deepseek_v32 and getattr(module, "indexer", None) is not None:
+            if runner.has_mla_indexer and getattr(module, "indexer", None) is not None:
                 if layer_id not in runner.index_cache_layer_map:
                     raise RuntimeError(
                         "Sparse MLA indexer layer is missing from the compact "

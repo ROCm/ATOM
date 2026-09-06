@@ -440,7 +440,7 @@ class EagleProposer(Drafter):
         attn_metadata, context = fc.attn_metadata, fc.context
         var = self.runner.forward_vars
         builder = self.runner.attn_metadata_builder
-        target_uses_mla = self.runner.use_mla
+        target_uses_mla = self.runner.attn_family.is_mla
         has_flat_kv = "kv_indices" in var
         i0_max_seqlen_q = attn_metadata.max_seqlen_q
         attn_metadata.max_seqlen_q = 1

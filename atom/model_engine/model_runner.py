@@ -95,7 +95,7 @@ from atom.utils.forward_context import (
     set_kv_cache_data,
 )
 from atom.utils.gc_utils import freeze_gc_heap
-from atom.utils.selector import get_attn_backend
+from atom.utils.selector import attn_family, get_attn_backend, has_mla_indexer
 from atom.utils.tbo import (
     UBatchSlice,
     UBatchWrapper,
@@ -645,21 +645,14 @@ class ModelRunner:
             torch.float16,
         ]:
             os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
-        self.use_mla = self.is_deepseek_mla()
-        self.use_gdn = self.is_qwen_next()
-        self.use_v4 = self.is_deepseek_v4()
-        self.use_kimi_mla = self.is_kimi_linear()
+        # Which attention this model's config asks for. The runner holds the
+        # answer, not the question: what makes a model MLA or a hybrid is the
+        # selector's to know, and it is asked the same way of a draft.
+        self.attn_family = attn_family(self.hf_text_config)
 
         rope_parameters = getattr(self.hf_text_config, "rope_parameters", None) or {}
         self.use_mrope = "mrope_section" in rope_parameters
-        # A sparse indexer is orthogonal to whether the model is pure MLA or a
-        # linear/MLA hybrid: GLM-5.3-Flash is both hybrid and sparse, so gating
-        # this on `use_mla` alone would silently leave its index cache unbound.
-        self.is_deepseek_v32 = (
-            hasattr(hf_config, "index_topk")
-            if (self.use_mla or self.use_kimi_mla)
-            else False
-        )
+        self.has_mla_indexer = has_mla_indexer(self.hf_text_config)
         # Initialize profiler for this rank (before _setup_device_and_distributed
         # so that dp config fields are still at their original values)
         self.profiler = None
@@ -696,13 +689,7 @@ class ModelRunner:
         default_dtype = self.config.torch_dtype
         torch.set_default_dtype(default_dtype)
         torch.set_default_device(self.device)
-        self.attn_backend = get_attn_backend(
-            self.block_size,
-            use_mla=self.use_mla,
-            use_gdn=self.use_gdn,
-            use_v4=self.use_v4,
-            use_kimi_mla=self.use_kimi_mla,
-        )
+        self.attn_backend = get_attn_backend(self.attn_family)
         use_spec = bool(self.config.speculative_config) and get_pp_group().is_last_rank
         self.num_spec_tokens = (
             self.config.speculative_config.num_speculative_tokens if use_spec else 0
@@ -863,66 +850,6 @@ class ModelRunner:
         base overhead. Base runner reserves nothing; override point for
         setups that share the GPU with another process."""
         return 0
-
-    def is_deepseek_mla(self) -> bool:
-        if not hasattr(self.hf_text_config, "model_type"):
-            return False
-        elif self.hf_text_config.model_type in (
-            "deepseek_v2",
-            "deepseek_v3",
-            "deepseek_v32",
-            "deepseek_mtp",
-            "glm_moe_dsa",
-            "kimi_k2",
-        ):
-            return self.hf_text_config.kv_lora_rank is not None
-        elif self.hf_text_config.model_type == "eagle":
-            # if the model is an EAGLE module, check for the
-            # underlying architecture
-            return (
-                self.hf_text_config.model.model_type in ("deepseek_v2", "deepseek_v3")
-                and self.hf_text_config.kv_lora_rank is not None
-            )
-        return False
-
-    def is_qwen_next(self) -> bool:
-        if not hasattr(self.hf_text_config, "model_type"):
-            return False
-        elif self.hf_text_config.model_type in (
-            "qwen3_next",
-            "qwen3_next_mtp",
-            "qwen3_5_text",
-            "qwen3_5_moe_text",
-        ):
-            return True
-        return False
-
-    def is_kimi_linear(self) -> bool:
-        """Hybrid MLA + KDA-linear-attention models (KimiMLAGDNBackend).
-
-        Selects the backend that allocates a paged MLA KV pool for the full
-        attention layers *and* a recurrent state pool for the linear ones.
-        GLM-5.3-Flash (``glm5_next_text``) has the same shape as Kimi-Linear:
-        11 MLA layers interleaved with 34 KDA layers.
-        """
-        return getattr(self.hf_text_config, "model_type", None) in (
-            "kimi_linear",
-            "glm5_next_text",
-        )
-
-    def is_deepseek_v4(self) -> bool:
-        # NOTE: `hf_text_config.model_type` reads "deepseek_v3" for V4 because
-        # `_CONFIG_REGISTRY` maps deepseek_v4 → deepseek_v3 (V4 reuses V3 schema).
-        # Use `architectures` (preserved by get_hf_config:567) instead. Covers
-        # both target (DeepseekV4ForCausalLM[NextN]) and draft (whose model_type
-        # SpeculativeConfig stamps as deepseek_v4_mtp).
-        arches = getattr(self.hf_text_config, "architectures", None) or []
-        if any("DeepseekV4" in str(a) for a in arches):
-            return True
-        return getattr(self.hf_text_config, "model_type", None) in (
-            "deepseek_v4",
-            "deepseek_v4_mtp",
-        )
 
     def _setup_device_and_distributed(self, rank: int, config: Config):
         # Calculate local device rank considering DP, PP and PCP.
@@ -2782,7 +2709,7 @@ class ModelRunner:
         self._pp_send_needs_sparse = False
         self._pp_recv_needs_sparse = False
         self._pp_index_topk = 0
-        if not self.is_deepseek_v32:
+        if not self.has_mla_indexer:
             return
         pp = get_pp_group()
         if pp.world_size <= 1:
@@ -3812,7 +3739,9 @@ class ModelRunner:
         self._piecewise_captured_tokens = set()
 
         self.forward_vars["kv_indptr"].gpu.zero_()
-        if self.is_deepseek_v32 and "sparse_kv_indptr" in self.forward_vars:
+        # Present exactly when the model has an indexer -- the builder makes it
+        # under the same answer -- so the buffer's own existence is the test.
+        if "sparse_kv_indptr" in self.forward_vars:
             self.forward_vars["sparse_kv_indptr"].gpu.zero_()
 
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}

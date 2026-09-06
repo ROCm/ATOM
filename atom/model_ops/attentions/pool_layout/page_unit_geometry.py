@@ -33,7 +33,7 @@ class PageUnitGeometryMixin:
         """The sparse-indexer cache that rides this PAGE unit, or `None`.
 
         Plain MLA owns only its KV rows, so the generic geometry has no index
-        cache. A sparse-indexer model (`runner.is_deepseek_v32`) overrides this
+        cache. A sparse-indexer model (`runner.has_mla_indexer`) overrides this
         to return the pool's index view, whose layers `_page_unit_regions`
         appends after the MLA rows.
         """
@@ -78,7 +78,7 @@ class PageUnitGeometryMixin:
         # any of those changing a cache miss that rebuilds. Mirrors the DSV4
         # sibling (`deepseek_v4_attn.py`), which keys on the same evidence.
         #
-        # A sparse-indexer model (`runner.is_deepseek_v32`) rides its index cache
+        # A sparse-indexer model (`runner.has_mla_indexer`) rides its index cache
         # in the same PAGE unit, appended after the MLA rows. Its layout is part
         # of the identity too -- key on it (or `None`) so a reallocated or
         # resized index cache is a miss that rebuilds, exactly like the MLA pool.

@@ -3,7 +3,6 @@
 
 # from flash_attn import flash_attn_with_kvcache
 from abc import ABC, abstractmethod
-from typing import Optional
 
 import torch
 import triton
@@ -12,7 +11,7 @@ from torch import nn
 
 from atom.config import get_current_atom_config
 from atom.utils import mark_spliting_op
-from atom.utils.selector import get_attn_backend
+from atom.utils.selector import Family, get_attn_backend
 
 from .attention_mla import MLAModules, _mla_output_width
 
@@ -50,8 +49,8 @@ def run_pa_fwd_asm(
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
     *,
-    out: Optional[torch.Tensor] = None,
-    qo_indptr: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
     max_qlen: int = 1,
     high_precision: int = 0,
 ):
@@ -87,15 +86,15 @@ def run_pa_decode_gluon(
     max_context_partition_num: int,
     context_partition_size: int,
     compute_type: torch.dtype,
-    q_scale: Optional[torch.Tensor],
-    k_scale: Optional[torch.Tensor],
-    v_scale: Optional[torch.Tensor],
+    q_scale: torch.Tensor | None,
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
     *,
     exp_sums: torch.Tensor,
     max_logits: torch.Tensor,
     temporary_output: torch.Tensor,
-    alibi_slopes: Optional[torch.Tensor] = None,
-    sinks: Optional[torch.Tensor] = None,
+    alibi_slopes: torch.Tensor | None = None,
+    sinks: torch.Tensor | None = None,
     sliding_window: int = -1,
     ps: bool = True,
 ):
@@ -252,8 +251,8 @@ def cp_mha_gather_cache(
     key: torch.Tensor,
     value: torch.Tensor,
     block_tables: torch.Tensor,
-    k_scales: Optional[torch.Tensor],
-    v_scales: Optional[torch.Tensor],
+    k_scales: torch.Tensor | None,
+    v_scales: torch.Tensor | None,
     cu_seqlens_kv: torch.Tensor,
     token_to_batch: torch.Tensor,
     seq_starts: torch.Tensor,
@@ -292,7 +291,7 @@ def cp_mha_gather_cache(
 
     k_cache_stride0 = key_cache.stride(0)
     v_cache_stride0 = value_cache.stride(0)
-    grid = lambda meta: (total_tokens, num_heads)  # noqa: E731
+    grid = lambda meta: (total_tokens, num_heads)
     cp_mha_gather_cache_kernel[grid](
         key_cache,
         value_cache,
@@ -320,7 +319,7 @@ def cp_mha_gather_cache(
 
 def fake_(
     q: torch.Tensor,
-    q_scale: Optional[torch.Tensor],
+    q_scale: torch.Tensor | None,
     k: torch.Tensor,
     v: torch.Tensor,
     positions: torch.Tensor,
@@ -347,7 +346,7 @@ def fake_(
 @mark_spliting_op(is_custom=True, gen_fake=fake_, mutates_args=[])
 def unified_attention_with_output_base(
     q: torch.Tensor,
-    q_scale: Optional[torch.Tensor],
+    q_scale: torch.Tensor | None,
     k: torch.Tensor,
     v: torch.Tensor,
     positions: torch.Tensor,
@@ -421,11 +420,11 @@ class BaseAttention(nn.Module, ABC):
         kv_cache_dtype="bf16",
         layer_num=0,
         use_mla: bool = False,
-        mla_modules: Optional[MLAModules] = None,
-        sinks: Optional[nn.Parameter] = None,
-        per_layer_sliding_window: Optional[int] = None,
-        rotary_emb: Optional[torch.nn.Module] = None,
-        prefix: Optional[str] = None,
+        mla_modules: MLAModules | None = None,
+        sinks: nn.Parameter | None = None,
+        per_layer_sliding_window: int | None = None,
+        rotary_emb: torch.nn.Module | None = None,
+        prefix: str | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -436,8 +435,8 @@ class BaseAttention(nn.Module, ABC):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        positions: Optional[torch.Tensor] = None,
-        q_scale: Optional[torch.Tensor] = None,
+        positions: torch.Tensor | None = None,
+        q_scale: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         raise NotImplementedError(
@@ -460,7 +459,7 @@ class LinearAttention(nn.Module):
         conv1d=None,
         activation=None,
         layer_num=0,
-        prefix: Optional[str] = None,
+        prefix: str | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -480,11 +479,7 @@ class LinearAttention(nn.Module):
         self.prefix = prefix
 
         atom_config = get_current_atom_config()
-        block_size = atom_config.kv_cache_block_size
-        self.attn_backend = get_attn_backend(
-            block_size,
-            use_gdn=True,
-        )
+        self.attn_backend = get_attn_backend(Family.GDN)
         impl_cls = self.attn_backend.get_impl_cls()
         self.impl = impl_cls(
             self.hidden_size,
@@ -506,7 +501,7 @@ class LinearAttention(nn.Module):
         default_name = f"Linear_{layer_num}"
         self.layer_name = prefix if prefix is not None else default_name
         if self.layer_name in compilation_config.static_forward_context:
-            raise ValueError("Duplicate layer: {}".format(self.layer_name))
+            raise ValueError(f"Duplicate layer: {self.layer_name}")
         compilation_config.static_forward_context[self.layer_name] = self
 
     def forward(

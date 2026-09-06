@@ -128,7 +128,7 @@ def _builder(
             ),
         ),
         block_size=16,
-        is_deepseek_v32=True,
+        has_mla_indexer=True,
         _get_total_num_layers=lambda: total_local_layers,
     )
     builder = object.__new__(AiterMLAMetadataBuilder)
@@ -173,7 +173,7 @@ def test_pp_shared_indexer_uses_the_producer_buffer_width(monkeypatch):
 
     runner = object.__new__(ModelRunner)
     runner._pp_share_indexer_ready = False
-    runner.is_deepseek_v32 = True
+    runner.has_mla_indexer = True
     runner.model = SimpleNamespace(start_layer=0, end_layer=2)
     runner.config = SimpleNamespace(
         hf_config=SimpleNamespace(
@@ -366,7 +366,7 @@ def test_build_kv_cache_tensor_binds_compact_index_slice():
     builder = object.__new__(AiterMLAMetadataBuilder)
     runner = SimpleNamespace(
         index_cache_layer_map={3: 0, 5: 1},
-        is_deepseek_v32=True,
+        has_mla_indexer=True,
         aligned_index_dim=144,
         config=SimpleNamespace(
             max_model_len=1024,
@@ -396,7 +396,7 @@ def test_build_shared_layer_keeps_main_kv_without_index_slice():
     builder = object.__new__(AiterMLAMetadataBuilder)
     runner = SimpleNamespace(
         index_cache_layer_map={0: 0},
-        is_deepseek_v32=True,
+        has_mla_indexer=True,
         aligned_index_dim=144,
         config=SimpleNamespace(
             max_model_len=1024,

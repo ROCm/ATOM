@@ -210,7 +210,7 @@ def hybrid_with_kpool_tail(num_slots: int = 4):
     """Small real hybrid-builder instance with all three checkpoint planes."""
     runner = SimpleNamespace(
         num_gdn_attn_state=N_LAYERS,
-        is_deepseek_v32=True,
+        has_mla_indexer=True,
         config=SimpleNamespace(
             hf_config=SimpleNamespace(index_kpool=4, index_head_dim=2)
         ),
@@ -300,7 +300,7 @@ class TestAStoreRestoreRoundTripMovesExactlyTheImage:
             block_size=self.LOGICAL_BS,
             num_gdn_attn_state=self.N_LAYERS,
             state_runtime=runtime,
-            is_deepseek_v32=False,
+            has_mla_indexer=False,
         )
         stub = SimpleNamespace(
             model_runner=runner,
@@ -465,7 +465,7 @@ class TestAnIndexerSharesThePageUnit:
             index_cache=index_cache,
             block_size=self.LOGICAL_BS,
             state_runtime=runtime,
-            is_deepseek_v32=indexed,
+            has_mla_indexer=indexed,
         )
         stub = SimpleNamespace(
             model_runner=runner,

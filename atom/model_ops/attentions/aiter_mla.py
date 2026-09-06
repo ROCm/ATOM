@@ -317,7 +317,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         hf_config = config.hf_config
         # `self.num_attention_heads` set by CommonAttentionBuilder.__init__.
         self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
-        self.is_sparse = model_runner.is_deepseek_v32
+        self.is_sparse = model_runner.has_mla_indexer
         self.index_topk = hf_config.index_topk if self.is_sparse else -1
         # GLM-5.3's pooled indexer selects `index_topk // index_kpool` POOLS --
         # index_topk tokens -- and then appends the trailing incomplete pool,
@@ -1116,7 +1116,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 "index_dim": aligned_index_cache_dim(hf_config),
                 "index_dtype": dtypes.fp8,
             }
-            if runner.is_deepseek_v32
+            if runner.has_mla_indexer
             else {}
         )
         return MlaKvPool(
@@ -1143,7 +1143,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.kv_pool = self._declare_kv_pool()
         self.kv_pool.allocate(blocks, runner.device, buf=buf)
         out: dict = {}
-        if runner.is_deepseek_v32:
+        if runner.has_mla_indexer:
             index_cache_layer_ids, _ = self._index_cache_layout()
             out["aligned_index_dim"] = aligned_index_cache_dim(hf_config)
             out["index_cache_layer_ids"] = index_cache_layer_ids
@@ -1188,7 +1188,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
         module.max_model_len = runner.config.max_model_len
         index_cache = None
-        if runner.is_deepseek_v32 and module.indexer is not None:
+        if runner.has_mla_indexer and module.indexer is not None:
             # `layer_id` is a PP-local cache-row counter, while the compact map
             # is keyed by global model layer IDs. On a non-first PP stage they
             # differ (for example local 0 may be global 39), so use layer_num
@@ -1212,7 +1212,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             v_cache=None,
             k_scale=None,
             v_scale=None,
-            index_cache=index_cache if runner.is_deepseek_v32 else None,
+            index_cache=index_cache if runner.has_mla_indexer else None,
         )
 
     def get_kv_transfer_tensors(self):
