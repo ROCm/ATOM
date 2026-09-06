@@ -45,13 +45,13 @@ Builder = pytest.importorskip(
     exc_type=ImportError,
 ).DeepseekV4AttentionMetadataBuilder
 
-from atom.model_ops.attentions.pool_layout.paged_state_copy import plan_segmented_copy
-from atom.model_ops.attentions.pool_layout.state_arena import (
-    StateField,
+from atom.model_ops.attentions.pool_layout.entry_arena import (
+    EntryField,
     checkpoint_ranges_for,
     entry_bytes_for,
     field_extents,
 )
+from atom.model_ops.attentions.pool_layout.paged_state_copy import plan_segmented_copy
 from atom.model_ops.attentions.pool_layout.v4_pool_geometry import CSA_RATIO, HCA_RATIO
 
 NEG_INF = float("-inf")
@@ -63,13 +63,13 @@ SLOTS = 3
 # stays whole. Same order as `_state_fields`, which is the order the bytes are
 # seen in.
 FIELDS = [
-    StateField("csa_main_kv", 2, (4, 8), torch.float32),
-    StateField("csa_main_score", 2, (4, 8), torch.float32, NEG_INF),
-    StateField("hca_main_kv", 2, (16, 8), torch.float32, in_checkpoint=False),
-    StateField(
+    EntryField("csa_main_kv", 2, (4, 8), torch.float32),
+    EntryField("csa_main_score", 2, (4, 8), torch.float32, NEG_INF),
+    EntryField("hca_main_kv", 2, (16, 8), torch.float32, in_checkpoint=False),
+    EntryField(
         "hca_main_score", 2, (16, 8), torch.float32, NEG_INF, in_checkpoint=False
     ),
-    StateField("state_window", 1, (6, 8), torch.float32),
+    EntryField("state_window", 1, (6, 8), torch.float32),
 ]
 ARENA_BYTES = entry_bytes_for(FIELDS)
 ARENA_ROWS = -(-ARENA_BYTES // ROW_BYTES)
@@ -433,7 +433,7 @@ class TestTheBuilderDeclaresWhatItDrops:
         return _Stub()
 
     @classmethod
-    def build_fields(cls) -> list[StateField]:
+    def build_fields(cls) -> list[EntryField]:
         return Builder._state_fields(cls.builder_stub())
 
     def test_hca_is_the_only_thing_dropped(self):

@@ -526,8 +526,10 @@ def _prepare_cpu_allocation(builder, row_widths, monkeypatch):
         def view(self, name):
             return None
 
-    monkeypatch.setitem(module_globals, "StateArena", lambda *args, **kwargs: object())
-    monkeypatch.setitem(module_globals, "SplitStateArena", lambda arenas: _Arena())
+    monkeypatch.setitem(
+        module_globals, "EntryMajorArena", lambda *args, **kwargs: object()
+    )
+    monkeypatch.setitem(module_globals, "SplitEntryMajorArena", lambda arenas: _Arena())
     builder._swa_dtype = torch.bfloat16
     builder._state_dtype = torch.float32
     builder._field_window_layers = set()

@@ -112,8 +112,8 @@ def _v4_win_with_spec(vllm_config, window_size: int) -> int:
 
 
 def _v4_state_layout(vllm_config, kv_fp8: bool):
-    from atom.model_ops.attentions.pool_layout.state_arena import (
-        StateField,
+    from atom.model_ops.attentions.pool_layout.entry_arena import (
+        EntryField,
         plan_field_planes,
     )
 
@@ -123,21 +123,21 @@ def _v4_state_layout(vllm_config, kv_fp8: bool):
     index_head_dim = int(getattr(hf, "index_head_dim", 128))
     ring_extra = _v4_spec_steps(vllm_config)
     fields = [
-        StateField("csa_main_kv", n_csa, (8 + ring_extra, 2 * head_dim), torch.float32),
-        StateField(
+        EntryField("csa_main_kv", n_csa, (8 + ring_extra, 2 * head_dim), torch.float32),
+        EntryField(
             "csa_main_score",
             n_csa,
             (8 + ring_extra, 2 * head_dim),
             torch.float32,
             float("-inf"),
         ),
-        StateField(
+        EntryField(
             "csa_idx_kv",
             n_csa,
             (8 + ring_extra, 2 * index_head_dim),
             torch.float32,
         ),
-        StateField(
+        EntryField(
             "csa_idx_score",
             n_csa,
             (8 + ring_extra, 2 * index_head_dim),
@@ -151,14 +151,14 @@ def _v4_state_layout(vllm_config, kv_fp8: bool):
         # flag, reads it — but two declarations of one layout disagreeing about
         # the one rule `layout_id` fences is exactly what that fence cannot
         # catch, since the id is derived from the native list alone.
-        StateField(
+        EntryField(
             "hca_main_kv",
             n_hca,
             (128 + ring_extra, head_dim),
             torch.float32,
             in_checkpoint=False,
         ),
-        StateField(
+        EntryField(
             "hca_main_score",
             n_hca,
             (128 + ring_extra, head_dim),
@@ -188,7 +188,8 @@ def _proxy_region_byte_sizes(
 
     Matches native ``allocate_per_req_cache``: both KV planes are adjacent and
     ``plan_regions``-aligned; indexer bytes follow. Inserting indexers between
-    the planes breaks ``StateArena``'s 256 B retype boundary on the RoPE plane.
+    the planes breaks ``EntryMajorArena``'s 256 B retype boundary on the RoPE
+    plane.
     """
     nope_row_bytes = head_dim * (1 if kv_fp8 else 2)
     regions = [geometry.plane_bytes(nope_row_bytes)]
@@ -231,7 +232,7 @@ def _proxy_page_bytes(vllm_config) -> int:
         block_size=ATOM_DEEPSEEK_V4_BLOCK_SIZE,
         arena_rows=arena_rows,
     )
-    from atom.model_ops.attentions.pool_layout.state_arena import plan_regions
+    from atom.model_ops.attentions.pool_layout.entry_arena import plan_regions
 
     regions = _proxy_region_byte_sizes(
         geometry=geometry,
@@ -245,7 +246,7 @@ def _proxy_page_bytes(vllm_config) -> int:
     _, total = plan_regions(regions)
     # vLLM 0.26 may pack this cache after another layer at a non-aligned
     # storage offset. Budget one-time leading slack so the runtime carve can
-    # move its first plane to the 256B boundary StateArena requires.
+    # move its first plane to the 256B boundary EntryMajorArena requires.
     total += ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT - 1
     page_bytes = (total + min_blocks - 1) // min_blocks
     if page_bytes % ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT:
@@ -272,9 +273,9 @@ def slice_deepseek_v4_proxy_cache_views(
     row_widths: list[int] | None = None,
 ) -> dict[str, object]:
     """Carve native-equivalent unified V4 planes from vLLM proxy storage."""
-    from atom.model_ops.attentions.pool_layout.state_arena import (
-        SplitStateArena,
-        StateArena,
+    from atom.model_ops.attentions.pool_layout.entry_arena import (
+        EntryMajorArena,
+        SplitEntryMajorArena,
         plan_regions,
     )
     from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
@@ -295,7 +296,7 @@ def slice_deepseek_v4_proxy_cache_views(
         raise ValueError(f"DeepSeek V4 proxy cache must be uint8, got {raw.dtype}")
     # Packed vLLM KV allocations can start an individual layer on only a 128B
     # boundary. Consume the sizing slack above so every plane and embedded
-    # StateArena starts on the 256B boundary its retyped field views require.
+    # EntryMajorArena starts on the 256B boundary its retyped field views require.
     alignment_pad = (-raw.storage_offset()) % ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT
     raw = raw[alignment_pad:]
     offset = 0
@@ -367,9 +368,9 @@ def slice_deepseek_v4_proxy_cache_views(
     if arena_planes is None or row_widths is None:
         arena = None
     else:
-        arena = SplitStateArena(
+        arena = SplitEntryMajorArena(
             [
-                StateArena(
+                EntryMajorArena(
                     fields,
                     geometry.slot_positions,
                     proxy_kv_cache.device,
@@ -916,7 +917,7 @@ def bind_deepseek_v4_proxy_cache_views(
     if raw.storage_offset() % 256:
         raise RuntimeError(
             f"DeepSeek V4 proxy KV storage offset {raw.storage_offset()} is not "
-            "256B-aligned; StateArena cannot retype carved planes safely"
+            "256B-aligned; EntryMajorArena cannot retype carved planes safely"
         )
     views = slice_deepseek_v4_proxy_cache_views(
         proxy.kv_cache,

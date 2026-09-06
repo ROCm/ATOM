@@ -184,7 +184,7 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         `setattr(self, name, value)` so model layers can reach them as
         `model_runner.<name>` (preserving existing names like `mamba_k_cache`).
         Values are usually tensors, but a backend may also publish the object
-        that owns them — DeepSeek-V4 publishes its `StateArena` alongside the
+        that owns them — DeepSeek-V4 publishes its `EntryMajorArena` alongside the
         per-layer views so the PD path can address a whole entry.
         """
         return {}

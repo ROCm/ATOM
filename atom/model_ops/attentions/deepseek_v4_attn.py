@@ -70,18 +70,18 @@ from atom.model_ops.attentions.backends import (
     AttentionMetadataBuilder,
     CommonAttentionBuilder,
 )
+from atom.model_ops.attentions.pool_layout.entry_arena import (
+    EntryField,
+    EntryMajorArena,
+    SplitEntryMajorArena,
+    checkpoint_ranges_for,
+    plan_field_planes,
+    plan_regions,
+)
 from atom.model_ops.attentions.pool_layout.paged_state_copy import (
     SegmentedCopyPlan,
     launch_copy_descriptor,
     plan_segmented_copy,
-)
-from atom.model_ops.attentions.pool_layout.state_arena import (
-    SplitStateArena,
-    StateArena,
-    StateField,
-    checkpoint_ranges_for,
-    plan_field_planes,
-    plan_regions,
 )
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
     SubPoolSpec,
@@ -748,7 +748,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             offset // plane_bytes, row_bytes // plane_bytes
         )
 
-    def _state_fields(self) -> list[StateField]:
+    def _state_fields(self) -> list[EntryField]:
         """The per-request state one request carries: compressor, and windows
         the planes cannot hold at their own row width.
 
@@ -769,10 +769,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         dt = self._state_dtype
         n_csa, n_hca = len(self.csa_layers), len(self.hca_layers)
         fields = [
-            StateField("csa_main_kv", n_csa, self.csa_main_state_shape, dt),
-            StateField("csa_main_score", n_csa, self.csa_main_state_shape, dt, neg_inf),
-            StateField("csa_idx_kv", n_csa, self.csa_idx_state_shape, dt),
-            StateField("csa_idx_score", n_csa, self.csa_idx_state_shape, dt, neg_inf),
+            EntryField("csa_main_kv", n_csa, self.csa_main_state_shape, dt),
+            EntryField("csa_main_score", n_csa, self.csa_main_state_shape, dt, neg_inf),
+            EntryField("csa_idx_kv", n_csa, self.csa_idx_state_shape, dt),
+            EntryField("csa_idx_score", n_csa, self.csa_idx_state_shape, dt, neg_inf),
             # HCA owes a checkpoint nothing. It pools `ratio` tokens with no
             # overlap, so the first compression at or after a boundary P
             # covers `[P, P + 128)` — every row of it written by the very
@@ -780,14 +780,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # `hash_block_size`, which `_assert_ratios_divide_the_alignment` keeps a
             # multiple of 128. The rows past `K_pool` are speculative
             # rollback slack and are never read at all.
-            StateField(
+            EntryField(
                 "hca_main_kv",
                 n_hca,
                 self.hca_main_state_shape,
                 dt,
                 in_checkpoint=False,
             ),
-            StateField(
+            EntryField(
                 "hca_main_score",
                 n_hca,
                 self.hca_main_state_shape,
@@ -798,7 +798,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         ]
         if self._field_window_dtype is not None:
             fields.append(
-                StateField(
+                EntryField(
                     STATE_WINDOW_FIELD,
                     len(self._field_window_layers),
                     (self.win_with_spec, self.head_dim),
@@ -933,7 +933,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         (`v4_pool_geometry`). The two halves answer differently: a window is a
         sliding window, so a resumer needs every row of it, while most of the
         state is dead at a boundary and says so through
-        `StateField.in_checkpoint`.
+        `EntryField.in_checkpoint`.
 
         Three kinds of byte belong to neither and are left out: the padding
         the state's byte count is rounded up by, the slot's own tail
@@ -985,7 +985,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     def _assert_ratios_divide_the_alignment(self) -> None:
         """A checkpoint boundary has to be a compression boundary too.
 
-        `StateField.in_checkpoint` says a compressor without overlap owes a
+        `EntryField.in_checkpoint` says a compressor without overlap owes a
         checkpoint nothing, because the first pool at or after the boundary
         starts exactly on it. That holds only while every ratio divides the
         quantity a checkpoint is aligned to, and HCA's ratio is 128 — let the
@@ -1440,7 +1440,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         of both address formulas, so one index buffer serves a whole compress
         class.
 
-        Compressor state comes from a `StateArena` instead of six standalone
+        Compressor state comes from an `EntryMajorArena` instead of six standalone
         tensors: the per-layer views are unchanged in shape and dtype, but a
         request's whole state is one contiguous byte range, which is what
         checkpointing, entry relocation and RDMA all need. It stays out of the
@@ -1509,7 +1509,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         row_widths = self._plane_row_widths()
         offsets, total_bytes = plan_regions([geo.plane_bytes(w) for w in row_widths])
 
-        # Zeroed once, which is also what `StateArena`'s `buf` contract asks
+        # Zeroed once, which is also what `EntryMajorArena`'s `buf` contract asks
         # for. Nothing holds the pool but the carved views — they keep the
         # allocation alive, so it must not be dropped from any of them.
         per_req_pool = torch.zeros(total_bytes, dtype=torch.uint8, device=device)
@@ -1553,9 +1553,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # sized once at startup. Each plane holds the fields `plan_field_planes`
         # gave it, strided by the whole slot; only the top `num_slots`
         # positions are the pool's, and the rest of the plane is blocks.
-        arena = SplitStateArena(
+        arena = SplitEntryMajorArena(
             [
-                StateArena(
+                EntryMajorArena(
                     fields,
                     geo.slot_positions,
                     device,
@@ -4517,7 +4517,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     def _make_gather_slot(
         buf: torch.Tensor,
         stride: int,
-        arena: SplitStateArena,
+        arena: SplitEntryMajorArena,
         geo: UnifiedPoolGeometry,
     ):
         """Callable copying one request's state → the staging buffer.
@@ -4544,7 +4544,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     def _make_scatter_slot(
         buf: torch.Tensor,
         stride: int,
-        arena: SplitStateArena,
+        arena: SplitEntryMajorArena,
         geo: UnifiedPoolGeometry,
     ):
         """Callable copying the staging buffer → one request's state."""

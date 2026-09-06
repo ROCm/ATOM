@@ -420,7 +420,7 @@ class UnifiedPoolGeometry:
 
         # A slot's start is the one address the compressor state's alignment
         # rests on, so it is rounded up: the narrow plane is 128 B wide and
-        # `StateArena` retypes from a 256 B boundary, which alone wants an even
+        # `EntryMajorArena` retypes from a 256 B boundary, which alone wants an even
         # row. Rounding the slot rather than the window is what keeps
         # `entry_rows` free of the constraint — the state sits at the front,
         # offset zero.
