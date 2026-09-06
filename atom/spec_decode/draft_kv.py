@@ -1,9 +1,14 @@
 import logging
 
 from atom.config import KVCacheTensor
+from atom.model_ops.attentions.pool_layout.pool_rows import PoolRowsMixin
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import SubPoolSpec, page_pool
 
 logger = logging.getLogger("atom")
+
+# This pool's one row space. Named, not a geometry: `make_kv_pool` already
+# settled the draft's geometry, and there is only ever the one.
+DRAFT_KV_ROWS = "draft_kv"
 
 
 def draft_kv_builder(model_runner, draft_hf):
@@ -32,7 +37,7 @@ def draft_kv_builder(model_runner, draft_hf):
     return None if pool is None else DraftKvBuilder(model_runner, pool)
 
 
-class DraftKvBuilder:
+class DraftKvBuilder(PoolRowsMixin):
     """A draft model's own KV pool, riding the target model's block ids.
 
     Implements the subset of `AttentionMetadataBuilder` hooks ModelRunner
@@ -51,7 +56,6 @@ class DraftKvBuilder:
         self.model_runner = model_runner
         self.kv_pool = kv_pool
         self.block_size = kv_pool.block_size
-        self._next_layer_id = 0  # consumed by build_kv_cache_tensor
         # Same name and unit as a real builder's, since this one also answers
         # the runner's allocate hook. No `block_ratio` factor: the assertion
         # below holds the draft's page to the scheduler's.
@@ -71,9 +75,7 @@ class DraftKvBuilder:
         """
         return self.kv_pool.pool_bytes(blocks)
 
-    def allocate_kv_cache_tensors(
-        self, num_kv_heads, num_draft_layers, *, blocks: int, buf
-    ) -> dict:
+    def allocate_kv_cache_tensors(self, *, blocks: int, buf) -> dict:
         """Back the draft's pool from its region. Nothing for the runner to
         setattr: the pool is this builder's, and its hooks below are the only
         readers.
@@ -109,25 +111,30 @@ class DraftKvBuilder:
     def release_kv_pools(self) -> None:
         self.kv_pool.release()
 
-    def reset_slots(self) -> None:
-        """Same hook the attention builders answer: the runner clears the
-        counters before a bind walk, so a re-bind starts this pool's rows at
-        the top instead of continuing past its last layer."""
-        self._next_layer_id = 0
+    def _pooled_models(self) -> list:
+        """The draft's, and only the draft's -- this pool exists precisely
+        because that model could not share the target's."""
+        return [self.model_runner.drafter.model]
 
-    def build_kv_cache_tensor(self, layer_id: int, module):
+    def _module_kinds(self, module) -> tuple:
+        """One row space, the draft's own KV rows."""
+        is_paged = (
+            hasattr(module, "base_attention")
+            and hasattr(module, "use_mla")
+            and not module.use_mla
+        )
+        return (DRAFT_KV_ROWS,) if is_paged else ()
+
+    def build_kv_cache_tensor(self, module):
         """Bind one of the draft's attention modules to its own pool.
 
         Returns None for anything this pool does not hold, so ModelRunner falls
         through to the target builder.
         """
-        if not (hasattr(module, "base_attention") and hasattr(module, "use_mla")):
-            return None
-        if module.use_mla:
+        if DRAFT_KV_ROWS not in self._module_kinds(module):
             return None
         runner = self.model_runner
-        idx = self._next_layer_id
-        self._next_layer_id += 1
+        idx = self.pool_rows[DRAFT_KV_ROWS][module]
         k_cache, v_cache = self.kv_pool.kv_views(idx)
         module.max_model_len = runner.config.max_model_len
         if runner.config.kv_cache_dtype == "fp8":
@@ -135,7 +142,7 @@ class DraftKvBuilder:
         module.k_cache = k_cache
         module.v_cache = v_cache
         return KVCacheTensor(
-            layer_num=layer_id,
+            layer_num=module.layer_num,
             k_cache=k_cache,
             v_cache=v_cache,
             k_scale=getattr(module, "k_scale", None),

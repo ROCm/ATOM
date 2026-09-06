@@ -75,20 +75,15 @@ def test_global_index_cache_layout_includes_real_stack_draft_layers():
     assert aiter_mla._global_index_cache_layer_ids(None, 61, 5) == tuple(range(61 + 5))
 
 
-def test_local_total_layers_adds_mtp_only_on_drafter_stage():
-    """Mirror ModelRunner._get_total_num_layers without importing it.
-
-    ModelRunner pulls AITER at import time; the PP/MTP accounting itself is
-    just get_pp_indices + optional draft depth on the last stage.
+def test_a_pp_stage_holds_its_own_slice_of_the_layers():
+    """What `_index_cache_layout` still reads config for: where this stage's
+    layers sit in the model's global numbering. How MANY rows it caches is the
+    modules, counted -- so a draft's depth does not appear here any more.
     """
     num_hidden = 6
-    num_draft = 2
 
-    start, end = get_pp_indices(num_hidden, 0, 2)
-    assert end - start == 3
-
-    start, end = get_pp_indices(num_hidden, 1, 2)
-    assert (end - start) + num_draft == 5
+    assert get_pp_indices(num_hidden, 0, 2) == (0, 3)
+    assert get_pp_indices(num_hidden, 1, 2) == (3, 6)
 
 
 def _mock_pp(monkeypatch, rank: int, world_size: int) -> None:
@@ -99,6 +94,31 @@ def _mock_pp(monkeypatch, rank: int, world_size: int) -> None:
         "get_pp_group",
         lambda: SimpleNamespace(rank_in_group=rank, world_size=world_size),
     )
+
+
+class _MlaLayer:
+    """What `AiterMLAMetadataBuilder._module_kinds` recognizes as its own.
+
+    A class rather than a `SimpleNamespace` because a row is keyed by the
+    module: `nn.Module` hashes by identity, and `SimpleNamespace` defines
+    equality and so hashes not at all.
+    """
+
+    base_attention = True
+    use_mla = True
+
+    def __init__(self, **attrs):
+        self.__dict__.update(attrs)
+
+
+class _MlaModel:
+    """A stage's module tree: `n` MLA layers and nothing else."""
+
+    def __init__(self, n: int):
+        self._layers = [_MlaLayer() for _ in range(n)]
+
+    def modules(self):
+        return iter(self._layers)
 
 
 def _builder(
@@ -129,42 +149,15 @@ def _builder(
         ),
         block_size=16,
         has_mla_indexer=True,
-        _get_total_num_layers=lambda: total_local_layers,
+        # The rows are the MLA modules this stage holds, target and shared
+        # draft alike, so the fixture supplies a tree rather than a count.
+        model=_MlaModel(total_local_layers),
+        draft_shares_kv_pool=lambda: False,
     )
     builder = object.__new__(AiterMLAMetadataBuilder)
     builder.model_runner = runner
+    builder.invalidate_pool_rows()
     return builder, runner
-
-
-def test_model_runner_local_total_layers_adds_mtp_only_on_drafter_stage(
-    monkeypatch,
-):
-    from atom.model_engine import model_runner
-    from atom.model_engine.model_runner import ModelRunner
-
-    runner = object.__new__(ModelRunner)
-    runner.config = SimpleNamespace(
-        hf_config=SimpleNamespace(num_hidden_layers=6),
-        speculative_config=SimpleNamespace(
-            draft_model_hf_config=SimpleNamespace(num_nextn_predict_layers=2),
-            use_dspark_with_draft=lambda: False,
-        ),
-    )
-
-    monkeypatch.setattr(
-        model_runner,
-        "get_pp_group",
-        lambda: SimpleNamespace(rank_in_group=0, world_size=2),
-    )
-    assert runner._get_total_num_layers() == 3
-
-    runner.drafter = object()
-    monkeypatch.setattr(
-        model_runner,
-        "get_pp_group",
-        lambda: SimpleNamespace(rank_in_group=1, world_size=2),
-    )
-    assert runner._get_total_num_layers() == 5
 
 
 def test_pp_shared_indexer_uses_the_producer_buffer_width(monkeypatch):
@@ -289,9 +282,7 @@ def test_allocate_index_cache_uses_compact_shape_and_map(monkeypatch):
     # EngineCore broadcast into `allocate_kv_cache`, and this rank's own sizing
     # estimate is a different number.
     buf = torch.zeros(builder.paged_pool_bytes(blocks), dtype=torch.uint8)
-    out = builder.allocate_kv_cache_tensors(
-        num_kv_heads=1, num_draft_layers=1, blocks=blocks, buf=buf
-    )
+    out = builder.allocate_kv_cache_tensors(blocks=blocks, buf=buf)
     # MLA pages at 1, so the builder counts its own rows, not the argument.
     assert builder.num_blocks == blocks * builder.block_ratio
 
@@ -362,57 +353,57 @@ def _FakeTransferStack(num_layers, address_base):
     return [_FakeTransferTensor(address_base + layer) for layer in range(num_layers)]
 
 
-def test_build_kv_cache_tensor_binds_compact_index_slice():
+def _bind_builder(module, index_cache_layer_map, *, rows_before: int):
+    """A builder whose walk reaches `module` after `rows_before` MLA layers.
+
+    The row is that position, deliberately not the module's `layer_num` -- the
+    two agree only while every layer of the model is MLA, which is what the map
+    exists to stop being assumed.
+    """
     builder = object.__new__(AiterMLAMetadataBuilder)
+    layers = [_MlaLayer() for _ in range(rows_before)] + [module]
     runner = SimpleNamespace(
-        index_cache_layer_map={3: 0, 5: 1},
+        index_cache_layer_map=index_cache_layer_map,
         has_mla_indexer=True,
         aligned_index_dim=144,
+        model=SimpleNamespace(modules=lambda: iter(layers)),
+        draft_shares_kv_pool=lambda: False,
         config=SimpleNamespace(
             max_model_len=1024,
             hf_config=SimpleNamespace(kv_lora_rank=480, qk_rope_head_dim=32),
         ),
     )
     builder.model_runner = runner
+    builder.invalidate_pool_rows()
     builder.kv_pool = _FakePool()
-    module = SimpleNamespace(
-        base_attention=object(),
-        use_mla=True,
+    return builder
+
+
+def test_build_kv_cache_tensor_binds_compact_index_slice():
+    module = _MlaLayer(
         layer_num=5,
         indexer=SimpleNamespace(
             k_cache=SimpleNamespace(kv_cache=[None]),
         ),
     )
+    builder = _bind_builder(module, {3: 0, 5: 1}, rows_before=2)
 
-    cache_tensor = builder.build_kv_cache_tensor(layer_id=2, module=module)
+    cache_tensor = builder.build_kv_cache_tensor(module)
 
     assert module.kv_cache == (("kv", 2), (-1, 1, 576))
     assert module.indexer.k_cache.kv_cache[0][0] == ("index", 1)
-    assert cache_tensor.layer_num == 2
+    assert cache_tensor.layer_num == module.layer_num
     assert cache_tensor.index_cache.identity == ("index", 1)
 
 
 def test_build_shared_layer_keeps_main_kv_without_index_slice():
-    builder = object.__new__(AiterMLAMetadataBuilder)
-    runner = SimpleNamespace(
-        index_cache_layer_map={0: 0},
-        has_mla_indexer=True,
-        aligned_index_dim=144,
-        config=SimpleNamespace(
-            max_model_len=1024,
-            hf_config=SimpleNamespace(kv_lora_rank=480, qk_rope_head_dim=32),
-        ),
-    )
-    builder.model_runner = runner
-    builder.kv_pool = _FakePool()
-    module = SimpleNamespace(
-        base_attention=object(),
-        use_mla=True,
+    module = _MlaLayer(
         layer_num=1,
         indexer=None,
     )
+    builder = _bind_builder(module, {0: 0}, rows_before=1)
 
-    cache_tensor = builder.build_kv_cache_tensor(layer_id=1, module=module)
+    cache_tensor = builder.build_kv_cache_tensor(module)
 
     assert module.kv_cache == (("kv", 1), (-1, 1, 576))
     assert cache_tensor.index_cache is None

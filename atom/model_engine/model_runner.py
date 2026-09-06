@@ -72,7 +72,6 @@ from atom.model_ops.eplb import (
 )
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
-from atom.models.utils import get_pp_indices
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.factory import build_drafter
 from atom.utils import (
@@ -1396,50 +1395,6 @@ class ModelRunner:
             (3, num_tokens), (num_tokens, 1)
         )
 
-    def _num_draft_kv_layers(self) -> int:
-        """How many KV cache slots the draft model needs, one per draft layer.
-
-        A draft with a REAL layer stack — the Eagle3 drafts and the standalone
-        DSpark drafts — runs every one of its layers on every drafting step, so
-        each needs its own slot. Serial MTP instead reuses one layer `mtp_k`
-        times and declares how many it has in `num_nextn_predict_layers`.
-
-        Single source of truth on purpose: this count drives both the pool
-        sizing (`_get_total_num_layers` -> the builders' `sub_pool_specs`) and
-        the allocation itself. Two independent spellings of it silently
-        disagreed for the standalone DSpark draft, sizing 1 slot while
-        allocating 5.
-        """
-        spec_config = self.config.speculative_config
-        draft_hf = spec_config.draft_model_hf_config
-        has_real_stack = (
-            hasattr(self, "draft_kv_builder")
-            or getattr(spec_config, "use_dspark_with_draft", lambda: False)()
-        )
-        if has_real_stack:
-            return draft_hf.num_hidden_layers
-        return getattr(draft_hf, "num_nextn_predict_layers", 1)
-
-    def _get_total_num_layers(self):
-        """Return total layer count including draft (MTP) layers.
-
-        A draft that owns an independent KV pool accounts for its layers
-        through `draft_kv_builder`, so they are NOT added here. Only drafts
-        that share the target's KV pool contribute.
-        """
-        num_hidden = self.config.hf_config.num_hidden_layers
-        pp_group = get_pp_group()
-        if pp_group.world_size > 1:
-            start, end = get_pp_indices(
-                num_hidden, pp_group.rank_in_group, pp_group.world_size
-            )
-            total = end - start
-        else:
-            total = num_hidden
-        if self.draft_shares_kv_pool():
-            total += self._num_draft_kv_layers()
-        return total
-
     def draft_shares_kv_pool(self) -> bool:
         """Whether a draft's attention layers land in the target's pools.
 
@@ -1864,22 +1819,6 @@ class ModelRunner:
         self.num_kv_heads = num_kv_heads
         self.aligned_index_dim = None  # set below for DeepSeek-V3.2
 
-        # Total layer count (target + any draft sharing the target's pool).
-        total_num_layers = self._get_total_num_layers()
-        num_draft_layers = 0
-        if self.config.speculative_config and hasattr(self, "drafter"):
-            owns_pool = hasattr(self, "draft_kv_builder")
-            num_draft_layers = self._num_draft_kv_layers()
-            logger.info(
-                f"Allocating KV cache for {hf_config.num_hidden_layers} target "
-                f"layers + {num_draft_layers} draft layers"
-                + (
-                    " (separate sibling pool)"
-                    if owns_pool
-                    else f" = {total_num_layers} total layers"
-                )
-            )
-
         # Primary KV cache allocation: one buffer, one region per builder, each
         # owning the layout inside its own. A draft that cannot share the
         # target's pool is simply the next region -- no second allocation, and
@@ -1892,11 +1831,18 @@ class ModelRunner:
         if pool.numel():
             self.kv_cache = pool
         for builder, region in zip(builders, regions):
-            builder.reset_slots()
+            builder.invalidate_pool_rows()
             for name, value in builder.allocate_kv_cache_tensors(
-                num_kv_heads, num_draft_layers, blocks=num_kvcache_blocks, buf=region
+                blocks=num_kvcache_blocks, buf=region
             ).items():
                 setattr(self, name, value)
+            counts = builder.row_counts()
+            logger.info(
+                "%s caches %s",
+                type(builder).__name__,
+                ", ".join(f"{n} {kind} rows" for kind, n in counts.items())
+                or "nothing",
+            )
 
         # Per-request cache allocation (model-agnostic, delegated to the
         # attention metadata builder). For GDN this returns
@@ -1923,52 +1869,34 @@ class ModelRunner:
         if self.config.speculative_config and hasattr(self, "drafter"):
             models_to_bind.append(("draft", self.drafter.model))
 
-        kv_cache_tensors = []
-        # Key by the module's global layer_num (what it looks up at forward time),
-        # not the local bind counter — under PP a stage's layer_num is offset.
-        kv_cache_keys = []
-        layer_id = 0
+        # Keyed by each module's own global layer_num, which is what it looks
+        # up at forward time (`kv_cache_data[f"layer_{self.layer_num}"]`). The
+        # walk's ordinal used to be passed down and stood in for this, for a
+        # pool row and for an index-map key; under PP it is none of the three.
+        kv_cache_data = {}
         for model_name, model in models_to_bind:
-            logger.info(
-                f"Binding KV cache for {model_name} model starting at layer_id={layer_id}"
-            )
-
+            logger.info("Binding KV cache for the %s model", model_name)
             for module in model.modules():
                 # A draft that owns an independent KV pool binds through its
                 # sibling builder first; for unrecognized modules it returns
                 # None and we fall through to the target builder.
+                kv_cache_tensor = None
                 if model_name == "draft" and hasattr(self, "draft_kv_builder"):
                     kv_cache_tensor = self.draft_kv_builder.build_kv_cache_tensor(
-                        layer_id, module
+                        module
                     )
-                    if kv_cache_tensor is not None:
-                        kv_cache_tensors.append(kv_cache_tensor)
-                        kv_cache_keys.append(getattr(module, "layer_num", layer_id))
-                        layer_id += 1
-                        continue
-
                 # Per-attention-type binding is owned by the attention
                 # metadata builder; ModelRunner only walks modules and
                 # collects the resulting KVCacheTensor entries. The builder
                 # returns None for modules it does not recognize (so a
-                # sibling module like nn.LayerNorm is silently skipped),
-                # and increments through MHA / MLA / GDN / V3.2-indexer
-                # internally.
-                kv_cache_tensor = self.attn_metadata_builder.build_kv_cache_tensor(
-                    layer_id, module
-                )
+                # sibling module like nn.LayerNorm is silently skipped).
+                if kv_cache_tensor is None:
+                    kv_cache_tensor = self.attn_metadata_builder.build_kv_cache_tensor(
+                        module
+                    )
                 if kv_cache_tensor is not None:
-                    kv_cache_tensors.append(kv_cache_tensor)
-                    kv_cache_keys.append(getattr(module, "layer_num", layer_id))
-                    layer_id += 1
+                    kv_cache_data[f"layer_{module.layer_num}"] = kv_cache_tensor
 
-        # Store KVCacheConfig, keyed by each module's (global) layer_num so it
-        # matches the attention's own kv_cache_data[f"layer_{self.layer_num}"]
-        # lookup under pipeline parallel.
-        kv_cache_data = {
-            f"layer_{key}": kv_cache_tensor
-            for key, kv_cache_tensor in zip(kv_cache_keys, kv_cache_tensors)
-        }
         transfer_tensors = self.attn_metadata_builder.get_kv_transfer_tensors()
         if transfer_tensors is not None:
             # The tier is built inside `register_kv_caches` and needs
@@ -4418,15 +4346,14 @@ class RapidServeModelRunner(ModelRunner):
             num_kvcache_blocks, buf=self.kv_cache
         )
         for builder, region in zip(builders, regions):
-            builder.reset_slots()
+            builder.invalidate_pool_rows()
             builder.adopt_imported_kv_pool(num_kvcache_blocks, region)
 
         models_to_bind = [("target", self.model)]
         if self.config.speculative_config and hasattr(self, "drafter"):
             models_to_bind.append(("draft", self.drafter.model))
 
-        kv_cache_tensors = []
-        layer_id = 0
+        kv_cache_data = {}
         for model_name, model in models_to_bind:
             for module in model.modules():
                 # Same dispatch as the allocating path's loop: a draft with a
@@ -4434,20 +4361,17 @@ class RapidServeModelRunner(ModelRunner):
                 # is now a region of the same imported buffer.
                 bound = None
                 if model_name == "draft" and hasattr(self, "draft_kv_builder"):
-                    bound = self.draft_kv_builder.build_kv_cache_tensor(
-                        layer_id, module
-                    )
+                    bound = self.draft_kv_builder.build_kv_cache_tensor(module)
                 if bound is None:
-                    bound = self.attn_metadata_builder.build_kv_cache_tensor(
-                        layer_id, module
-                    )
+                    bound = self.attn_metadata_builder.build_kv_cache_tensor(module)
                 if bound is not None:
-                    kv_cache_tensors.append(bound)
-                    layer_id += 1
+                    # The same key the allocating path uses. Keyed by the walk's
+                    # ordinal here until now, which agreed with it only while
+                    # the first bound module was layer 0.
+                    kv_cache_data[f"layer_{module.layer_num}"] = bound
 
         from atom.utils.forward_context import set_kv_cache_data
 
-        kv_cache_data = {f"layer_{i}": t for i, t in enumerate(kv_cache_tensors)}
         set_kv_cache_data(kv_cache_data)
 
     # ------------------------------------------------------------------

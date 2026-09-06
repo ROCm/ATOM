@@ -31,9 +31,15 @@ from .pool_layout.paged_state_copy import (
     launch_copy_descriptor,
     plan_segmented_copy,
 )
+from .pool_layout.pool_rows import PoolRowsMixin
 from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool, state_pool
 
 logger = logging.getLogger("atom")
+
+# The linear-attention state pool's row space -- one slot per recurrent layer,
+# whether GDN calls it that or K3 calls it KDA. Shared so a hybrid that binds
+# both kinds cannot number them into the same space.
+LINEAR_STATE_ROWS = "linear_state"
 
 
 class GDNAttentionBackend(AiterBackend):
@@ -108,7 +114,7 @@ class GDNAttentionMetadata:
     token_chunk_offset_ptr: torch.Tensor | None = None
 
 
-class GDNStateMixin:
+class GDNStateMixin(PoolRowsMixin):
     def __init__(self, model_runner, **kwargs):
         super().__init__(model_runner=model_runner, **kwargs)
         self._init_gdn_state(model_runner)
@@ -117,11 +123,11 @@ class GDNStateMixin:
         self,
         model_runner,
     ):
-        # How many layers of each kind a hybrid has, on the runner so the
-        # per-request cache hooks read them without a hidden ordering
-        # dependency on the KV sizing path running first. Which layer is which
-        # kind is not among them: a pool row is the position of a module among
-        # the modules of its kind, and the bind walk hands those out.
+        # Which layers are full attention, for the hybrid PAGE transfer that
+        # still names them globally. Not how MANY of either kind: those are the
+        # modules, counted (`num_state_layers`), and a config list that
+        # disagreed with what was built would size a pool the bind walk then
+        # overruns.
         hf = model_runner.config.hf_config
         model_type = getattr(hf, "model_type", None)
         if model_type in ("kimi_linear", "glm5_next_text"):
@@ -134,14 +140,10 @@ class GDNStateMixin:
                 # The model normalizer derives these from layer_types when a
                 # config revision omits the redundant linear-attn lists.
                 model_runner.full_attention_layers = list(hf.glm5_full_attn_layers)
-                kda_layers = list(hf.glm5_kda_layers)
             else:
                 model_runner.full_attention_layers = [
                     int(i) - offset for i in lin.get("full_attn_layers", [])
                 ]
-                kda_layers = [int(i) - offset for i in lin.get("kda_layers", [])]
-            model_runner.num_full_attn = len(model_runner.full_attention_layers)
-            model_runner.num_gdn_attn_state = len(kda_layers)
             hf.linear_num_key_heads = getattr(
                 hf, "linear_num_key_heads", lin.get("num_heads", hf.num_attention_heads)
             )
@@ -160,15 +162,6 @@ class GDNStateMixin:
                 hf,
                 "linear_conv_kernel_dim",
                 lin.get("short_conv_kernel_size", 4),
-            )
-        else:
-            # The interval itself stays local: nothing maps a layer id onto a
-            # pool row by it any more, so only the two counts leave here.
-            model_runner.num_full_attn = (
-                hf.num_hidden_layers // hf.full_attention_interval
-            )
-            model_runner.num_gdn_attn_state = (
-                hf.num_hidden_layers - model_runner.num_full_attn
             )
 
         self.num_spec = 0
@@ -387,7 +380,7 @@ class GDNStateMixin:
             + math.prod(su) * rec_dtype.itemsize
             + math.prod(sg) * 4  # g stays fp32: it is exponentiated on rebuild
         )
-        return self.model_runner.num_gdn_attn_state * per_layer
+        return self.num_state_layers() * per_layer
 
     def state_transfer(self) -> StateTransfer:
         """A fork whose successor forward need only carry one token.
@@ -431,6 +424,16 @@ class GDNStateMixin:
         """
         return StateTransfer.fork(1, readable_midstep=False)
 
+    def num_state_layers(self) -> int:
+        """Layers holding a recurrent state, one slot each.
+
+        The modules, counted -- so the pool sized here is the pool the bind
+        walk fills. A shared draft's linear-attention layers are in the walk
+        and were never in the config count they replace, which is a slot the
+        walk used to hand out past the end of the pool.
+        """
+        return self.row_counts().get(LINEAR_STATE_ROWS, 0)
+
     def state_spec(self) -> SubPoolSpec:
         """The GDN state pool: conv_state + temporal_state over all GDN
         layers, with one extra slot per speculative token for rollback.
@@ -458,8 +461,7 @@ class GDNStateMixin:
         )
         return state_pool(
             STATE_SLOT_CLASS,
-            self.model_runner.num_gdn_attn_state * per_layer
-            + self._replayssm_bytes_per_slot(),
+            self.num_state_layers() * per_layer + self._replayssm_bytes_per_slot(),
             entries_per_req=self.slots_per_req(),
         )
 
@@ -486,7 +488,7 @@ class GDNStateMixin:
         num_slots = entries.get(STATE_SLOT_CLASS, 0)
         shape_k, shape_v = self._state_shape_for_runner()
         dt_k, dt_v = self._state_dtypes()
-        n = self.model_runner.num_gdn_attn_state
+        n = self.num_state_layers()
         tensors = {
             "mamba_k_cache": torch.zeros(
                 (n, num_slots) + shape_k, dtype=dt_k, device="cuda"
@@ -594,7 +596,7 @@ class GDNStateMixin:
         """
         shape_k, shape_v = self._state_shape_for_runner()
         dt_k, dt_v = self._state_dtypes()
-        n = self.model_runner.num_gdn_attn_state
+        n = self.num_state_layers()
         return [
             (math.prod(shape_k) * dt_k.itemsize, n),
             (math.prod(shape_v) * dt_v.itemsize, n),
@@ -1395,6 +1397,12 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     # `update_context_lens` / `positions_out` into a signature that has neither.
     fuse_mtp_decode_position_update = False
 
+    def _module_kinds(self, module) -> tuple:
+        """The MHA row spaces, plus a slot for every linear-attention layer."""
+        if hasattr(module, "base_linear_attention"):
+            return (LINEAR_STATE_ROWS,)
+        return super()._module_kinds(module)
+
     def sub_pool_specs(self) -> list[SubPoolSpec]:
         """GDN hybrid: a paged KV pool holding ONLY the full-attention layer
         slots, plus the per-request state pool for the linear-attention
@@ -1406,7 +1414,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         """
         return [page_pool(self._paged_entry_bytes()), self.state_spec()]
 
-    def build_kv_cache_tensor(self, layer_id: int, module):
+    def build_kv_cache_tensor(self, module):
         """Dispatch by module type:
 
         - `base_linear_attention` (GDN linear attention) → wrap the slot
@@ -1418,13 +1426,11 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             from atom.config import KVCacheTensor
 
             runner = self.model_runner
-            # The next linear-attention slot the walk hands out. The mamba pool
-            # holds one per such layer, so its rows are these modules counted --
-            # not `layer_id`, which counts the full-attention layers between
-            # them too.
-            gdn_idx = self.take_slot("gdn")
+            # This module's slot: the mamba pool holds one per
+            # linear-attention layer, and its rows are those modules.
+            gdn_idx = self.pool_rows[LINEAR_STATE_ROWS][module]
             return KVCacheTensor(
-                layer_num=layer_id,
+                layer_num=module.layer_num,
                 k_cache=runner.mamba_k_cache[gdn_idx],
                 v_cache=runner.mamba_v_cache[gdn_idx],
                 k_scale=None,
@@ -1443,7 +1449,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
                 # of `kv_cache_data`), but no block-addressed mover may touch it.
                 per_request_state=True,
             )
-        return super().build_kv_cache_tensor(layer_id, module)
+        return super().build_kv_cache_tensor(module)
 
     def prepare_prefill(  # type: ignore[override]
         self,

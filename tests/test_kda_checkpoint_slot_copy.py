@@ -49,7 +49,7 @@ V_BYTES = math.prod(SHAPE_V) * 4
 
 def builder(num_slots: int = 4, allocate: bool = True):
     """A stub carrying exactly what the checkpoint-geometry methods read."""
-    runner = SimpleNamespace(num_gdn_attn_state=N_LAYERS)
+    runner = SimpleNamespace()
     if allocate:
         runner.mamba_k_cache = torch.zeros((N_LAYERS, num_slots) + SHAPE_K, dtype=DT_K)
         runner.mamba_v_cache = torch.zeros((N_LAYERS, num_slots) + SHAPE_V, dtype=DT_V)
@@ -58,6 +58,9 @@ def builder(num_slots: int = 4, allocate: bool = True):
         runner.mamba_v_cache = None
     stub = SimpleNamespace(
         model_runner=runner,
+        # What the pool is sized for: the modules the bind walk gives a state
+        # slot, which this stub has instead of a module tree.
+        num_state_layers=lambda: N_LAYERS,
         _state_shape_for_runner=lambda: (SHAPE_K, SHAPE_V),
         _state_dtypes=lambda: (DT_K, DT_V),
     )
@@ -206,10 +209,21 @@ K3 = pytest.importorskip(
 )
 
 
+class _KdaLayer:
+    """What `_KimiMLAGDNCommon._module_kinds` gives a state slot to."""
+
+    base_linear_attention = True
+
+
 def hybrid_with_kpool_tail(num_slots: int = 4):
     """Small real hybrid-builder instance with all three checkpoint planes."""
     runner = SimpleNamespace(
-        num_gdn_attn_state=N_LAYERS,
+        # The real builder counts its own state layers off the module tree,
+        # so this stub supplies one rather than the count.
+        model=SimpleNamespace(
+            modules=lambda: iter([_KdaLayer() for _ in range(N_LAYERS)])
+        ),
+        draft_shares_kv_pool=lambda: False,
         has_mla_indexer=True,
         config=SimpleNamespace(
             hf_config=SimpleNamespace(index_kpool=4, index_head_dim=2)
@@ -298,12 +312,12 @@ class TestAStoreRestoreRoundTripMovesExactlyTheImage:
             mamba_v_cache=v,
             kv_cache=pool,
             block_size=self.LOGICAL_BS,
-            num_gdn_attn_state=self.N_LAYERS,
             state_runtime=runtime,
             has_mla_indexer=False,
         )
         stub = SimpleNamespace(
             model_runner=runner,
+            num_state_layers=lambda: self.N_LAYERS,
             kv_pool=SimpleNamespace(
                 cache=SimpleNamespace(view=lambda _name: runner.kv_cache), index=None
             ),
@@ -567,7 +581,7 @@ class TestAnImageSpansBothPoolsIntact:
         runner = stub.model_runner
         runner.mamba_k_cache = k
         runner.mamba_v_cache = v
-        runner.num_gdn_attn_state = N_LAYERS
+        stub.num_state_layers = lambda: N_LAYERS
         stub._state_shape_for_runner = lambda: (SHAPE_K, SHAPE_V)
         stub._state_dtypes = lambda: (DT_K, DT_V)
         for name in (

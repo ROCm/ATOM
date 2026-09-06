@@ -88,7 +88,7 @@ class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):
 
         return attn_metadata, positions
 
-    def build_kv_cache_tensor(self, layer_id: int, module):
+    def build_kv_cache_tensor(self, module):
         """The parent's bind, plus the one thing that differs: the layout flag.
 
         Both backends read one pool at one layout, so there is nothing to say
@@ -119,7 +119,7 @@ class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):
                 "cache path; use AiterBackend for this model."
             )
 
-        bound = super().build_kv_cache_tensor(layer_id, module)
+        bound = super().build_kv_cache_tensor(module)
         if bound is not None and impl is not None:
             # KV cache is not in flash (4D) layout; unified_attention is
             # selected via ATOM_USE_UNIFIED_ATTN, and reads the SHUFFLE layout.

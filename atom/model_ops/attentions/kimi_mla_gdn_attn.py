@@ -17,11 +17,12 @@ from atom.model_ops.glm5_next.geometry import (
 from atom.utils import envs
 
 from .aiter_mla import (
+    MLA_ROWS,
     AiterMLAMetadataBuilder,
     aligned_index_cache_dim,
 )
 from .backends import AttentionBackend
-from .gdn_attn import GDNStateMixin
+from .gdn_attn import LINEAR_STATE_ROWS, GDNStateMixin
 from .pool_layout.page_unit_geometry import PageUnitGeometryMixin
 from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool, state_pool
 from .triton_mla import TritonMLAMetadataBuilder
@@ -47,22 +48,18 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
     def __init__(self, model_runner):
         super().__init__(model_runner=model_runner)
 
-    def _num_cache_rows(self) -> int:
-        """Rows in the MLA pool: the target's full-attention layers plus any
-        draft layers that share this pool.
+    def _module_kinds(self, module) -> tuple:
+        """Two row spaces: the MLA pool's rows, and the KDA state slots.
 
-        Derived from `_get_total_num_layers()` rather than from the
-        `num_draft_layers` argument ModelRunner passes to
-        `allocate_kv_cache_tensors`, so the row count the pool is SIZED for
-        (`sub_pool_specs`) and the row count it is ALLOCATED with can never
-        disagree: a draft that owns a sibling pool is excluded from both at
-        once. Mirrors `AiterMLAMetadataBuilder`, which reads the same
-        method in both places.
+        A K3 layer is one or the other, so which layers of the hybrid are full
+        attention -- and where a shared draft's stack begins -- is read off the
+        modules instead of off two config lists that have to agree.
         """
-        runner = self.model_runner
-        hf = runner.config.hf_config
-        num_draft = runner._get_total_num_layers() - hf.num_hidden_layers
-        return runner.num_full_attn + num_draft
+        if hasattr(module, "base_linear_attention"):
+            return (LINEAR_STATE_ROWS,)
+        if hasattr(module, "base_attention") and getattr(module, "use_mla", False):
+            return (MLA_ROWS,)
+        return ()
 
     def _uses_paged_checkpoints(self) -> bool:
         """Whether this run keeps checkpoints as PAGE images rather than slots.
@@ -128,7 +125,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             )
         layout_id = (
             f"kda-paged-state-{version}"
-            f":layers={self.model_runner.num_gdn_attn_state}"
+            f":layers={self.num_state_layers()}"
             f":conv={tuple(shape_k)},{dt_k}"
             f":ssm={tuple(shape_v)},{dt_v}"
             f":order={order}"
@@ -138,9 +135,6 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             ":carry=all"
         )
         return StateTransfer.copy(layout_id)
-
-    def _kv_pool_layers(self) -> int:
-        return self._num_cache_rows()
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
         """MLA paged KV for the full-attention layers, plus the KDA/GDN
@@ -287,10 +281,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             srcs.append(tail[:, src])
         torch._foreach_copy_(dsts, srcs)
 
-    def allocate_kv_cache_tensors(
-        self, num_kv_heads: int, num_draft_layers: int, *, blocks: int, buf
-    ) -> dict:
-        del num_kv_heads, num_draft_layers
+    def allocate_kv_cache_tensors(self, *, blocks: int, buf) -> dict:
         self.num_blocks = blocks * self.block_ratio
         runner = self.model_runner
         self.kv_pool = self._declare_kv_pool()
@@ -319,17 +310,16 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             return None
         return None if self.kv_pool.index is None else self.kv_pool.index.view("index")
 
-    def build_kv_cache_tensor(self, layer_id: int, module):
+    def build_kv_cache_tensor(self, module):
         from atom.config import KVCacheTensor
 
         runner = self.model_runner
         if hasattr(module, "base_linear_attention"):
-            # The next KDA slot the walk hands out: the state pool holds one
-            # per linear-attention layer, and these modules are what those rows
-            # are, in order.
-            row = self.take_slot("kda")
+            # This module's KDA slot: the state pool holds one per
+            # linear-attention layer, and these modules are what those rows are.
+            row = self.pool_rows[LINEAR_STATE_ROWS][module]
             return KVCacheTensor(
-                layer_num=layer_id,
+                layer_num=module.layer_num,
                 k_cache=runner.mamba_k_cache[row],
                 v_cache=runner.mamba_v_cache[row],
                 k_scale=None,
@@ -344,25 +334,23 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             )
 
         if hasattr(module, "base_attention") and getattr(module, "use_mla", False):
-            # The next MLA row the walk hands out. K3's linear-attention layers
-            # are bound above and take none, and a draft's layers simply
-            # continue the count, which is what the pool was sized for.
-            row = self.take_slot("mla")
-            allocated_rows = self._kv_pool_layers()
-            assert row < allocated_rows, (
-                f"MLA cache row {row} for model layer {layer_id} "
-                f"exceeds {allocated_rows} allocated rows"
-            )
+            # This module's MLA row. K3's linear-attention layers are bound
+            # above and take none, and a shared draft's layers simply continue
+            # the numbering, which is what the pool was sized for.
+            row = self.pool_rows[MLA_ROWS][module]
             kv_cache = self.kv_pool.layer("kv", row).view(-1, 1, self.kv_pool.entry_dim)
             module.max_model_len = runner.config.max_model_len
             if runner.has_mla_indexer and getattr(module, "indexer", None) is not None:
-                if layer_id not in runner.index_cache_layer_map:
+                # The module's own global layer number, not the bind
+                # ordinal: the map is keyed globally, and on a non-first PP
+                # stage local 0 may be global 39.
+                if module.layer_num not in runner.index_cache_layer_map:
                     raise RuntimeError(
                         "Sparse MLA indexer layer is missing from the compact "
-                        f"index cache layout: layer_num={layer_id}"
+                        f"index cache layout: layer_num={module.layer_num}"
                     )
                 index_cache = self.kv_pool.layer(
-                    "index", runner.index_cache_layer_map[layer_id]
+                    "index", runner.index_cache_layer_map[module.layer_num]
                 )
                 # Flat row view: `indexer_k_quant_and_cache` addresses a
                 # slot as a single row id, and the pooled writer computes that
@@ -378,11 +366,11 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                 tail = getattr(runner, "kpool_tail_cache", None)
                 if tail is not None:
                     module.indexer.kpool_tail_cache = tail[
-                        runner.index_cache_layer_map[layer_id]
+                        runner.index_cache_layer_map[module.layer_num]
                     ]
             module.kv_cache = kv_cache
             return KVCacheTensor(
-                layer_num=layer_id,
+                layer_num=module.layer_num,
                 k_cache=kv_cache,
                 v_cache=None,
                 k_scale=None,

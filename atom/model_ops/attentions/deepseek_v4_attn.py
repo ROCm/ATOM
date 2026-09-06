@@ -1374,9 +1374,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             ]
         return [(runner.v4_csa_idx_kv, "dsv4.csa_indexer")]
 
-    def allocate_kv_cache_tensors(
-        self, num_kv_heads: int, num_draft_layers: int, *, blocks: int, buf
-    ) -> dict[str, torch.Tensor]:
+    def allocate_kv_cache_tensors(self, *, blocks: int, buf) -> dict[str, torch.Tensor]:
         """Allocate KV pools that depend only on `num_blocks`.
 
         `buf` is empty: this backend answers `paged_pool_bytes` with zero, since
@@ -1637,7 +1635,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             :, base : base + rows
         ]
 
-    def build_kv_cache_tensor(self, layer_id: int, module):
+    def build_kv_cache_tensor(self, module):
         """Bind V4 modules' state-cache + classical-cache views.
 
         Called by ModelRunner.allocate_kv_cache() for every nn.Module:
@@ -1820,7 +1818,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 )
             return None
 
-        return super().build_kv_cache_tensor(layer_id, module)
+        return super().build_kv_cache_tensor(module)
 
     def get_kv_transfer_tensors(self):
         """Describe V4's compressed PAGE and full per-request SLOT storage.

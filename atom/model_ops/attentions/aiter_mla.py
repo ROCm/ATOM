@@ -54,6 +54,10 @@ from .token_layout.slots import slot_mapping
 
 logger = logging.getLogger("atom")
 
+# The MLA pool's row space. Named rather than derived from a geometry: every
+# MLA layer packs into one row of the same width, so there is only ever one.
+MLA_ROWS = "mla"
+
 # `max_split_per_batch` is only needed (and only exists in newer aiter builds)
 # for the segmented page_size>1 MLA path. Detect support once so the default
 # page_size=1 path never passes an unsupported kwarg.
@@ -272,9 +276,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             num_hidden_layers, pp_group.rank_in_group, pp_group.world_size
         )
         num_local_target_layers = end_layer - start_layer
-        num_local_draft_layers = (
-            runner._get_total_num_layers() - num_local_target_layers
-        )
+        # This stage's MLA rows less its own layers: whatever is left is a
+        # shared draft's stack, counted from the modules rather than from the
+        # config field that says how many it should have.
+        num_local_draft_layers = self._kv_pool_layers() - num_local_target_layers
         global_layer_ids = _global_index_cache_layer_ids(
             getattr(hf_config, "indexer_types", None),
             num_hidden_layers,
@@ -1082,14 +1087,23 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         if self.kv_pool is not None:
             self.kv_pool.release()
 
+    def _module_kinds(self, module) -> tuple:
+        """One row space: the MLA layers, target and shared draft alike."""
+        is_mla = (
+            hasattr(module, "base_attention")
+            and hasattr(module, "use_mla")
+            and module.use_mla
+        )
+        return (MLA_ROWS,) if is_mla else ()
+
     def _kv_pool_layers(self) -> int:
         """Rows the paged pool holds, one per layer that caches KV.
 
-        A hook because a hybrid caches for only some of its layers, and
-        sizing, allocation and the P/D adopt path have to agree on the count
-        or the arena refuses the buffer.
+        The modules, counted -- so sizing, allocation and the P/D adopt path
+        cannot disagree, and a hybrid's linear layers or a draft's stack are
+        simply not in the walk rather than something to subtract.
         """
-        return self.model_runner._get_total_num_layers()
+        return self.row_counts().get(MLA_ROWS, 0)
 
     def _index_rows_per_block(self) -> int:
         """Indexer rows one scheduler block owns — one per token by default.
@@ -1127,9 +1141,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             **indexer,
         )
 
-    def allocate_kv_cache_tensors(
-        self, num_kv_heads: int, num_draft_layers: int, *, blocks: int, buf
-    ) -> dict:
+    def allocate_kv_cache_tensors(self, *, blocks: int, buf) -> dict:
         """Allocate this model's MLA pool inside the runner's paged region.
 
         The KV rows and the indexer keys are regions of the one buffer the
@@ -1161,7 +1173,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.kv_pool = self._declare_kv_pool()
         self.kv_pool.allocate(blocks, runner.device, buf=buf)
 
-    def build_kv_cache_tensor(self, layer_id: int, module):
+    def build_kv_cache_tensor(self, module):
         """Bind one MLA attention module to its KV slice.
 
         Handles standard MLA (one packed KV row per token) and the
@@ -1173,27 +1185,23 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         """
         from atom.config import KVCacheTensor
 
-        if not (
-            hasattr(module, "base_attention")
-            and hasattr(module, "use_mla")
-            and module.use_mla
-        ):
+        if MLA_ROWS not in self._module_kinds(module):
             return None
 
         runner = self.model_runner
+        # The row the sizing walk gave this module. Its `layer_num` would
+        # agree only while every layer of the model is MLA and this is stage 0.
+        row = self.pool_rows[MLA_ROWS][module]
         # The pool's slice is `[blocks, rows, dim]`; MLA addresses by row, so
         # the block axis folds away. Contiguous, so this is a view.
-        kv_cache = self.kv_pool.layer("kv", layer_id).view(
-            -1, 1, self.kv_pool.entry_dim
-        )
+        kv_cache = self.kv_pool.layer("kv", row).view(-1, 1, self.kv_pool.entry_dim)
         module.max_model_len = runner.config.max_model_len
         index_cache = None
         if runner.has_mla_indexer and module.indexer is not None:
-            # `layer_id` is a PP-local cache-row counter, while the compact map
-            # is keyed by global model layer IDs. On a non-first PP stage they
-            # differ (for example local 0 may be global 39), so use layer_num
-            # to avoid binding this indexer to another stage's compact row.
-            global_layer_id = getattr(module, "layer_num", None)
+            # The compact map is keyed by GLOBAL model layer ids, which the
+            # pool row above is not -- on a non-first PP stage row 0 may be
+            # global layer 39.
+            global_layer_id = module.layer_num
             if global_layer_id not in runner.index_cache_layer_map:
                 raise RuntimeError(
                     "Sparse MLA indexer layer is missing from the compact index "
@@ -1207,7 +1215,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
         module.kv_cache = kv_cache
         return KVCacheTensor(
-            layer_num=layer_id,
+            layer_num=module.layer_num,
             k_cache=kv_cache,
             v_cache=None,
             k_scale=None,

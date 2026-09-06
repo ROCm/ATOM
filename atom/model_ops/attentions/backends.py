@@ -23,6 +23,7 @@ from atom.model_engine.page_unit_checkpoint import (
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAModules
+from atom.model_ops.attentions.pool_layout.pool_rows import PoolRowsMixin
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import SubPoolSpec
 from atom.model_ops.attentions.token_layout.prefill import prefill_positions
 from atom.model_ops.attentions.token_layout.slots import slot_mapping
@@ -316,9 +317,7 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return 0
 
-    def allocate_kv_cache_tensors(
-        self, num_kv_heads: int, num_draft_layers: int, *, blocks: int, buf
-    ) -> dict[str, Any]:
+    def allocate_kv_cache_tensors(self, *, blocks: int, buf) -> dict[str, Any]:
         """Allocate the model's primary paged KV cache tensors.
 
         `blocks` is the scheduler block count every rank was told to build at,
@@ -369,29 +368,7 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         backing back. A builder that holds no pool has nothing to drop.
         """
 
-    def reset_slots(self) -> None:
-        """Forget the slots handed out, before a bind walk starts one.
-
-        The runner's to call, because the walk is: a pool is re-bound on a P/D
-        import and again on a rollout wake, and a counter that survived either
-        would hand the next walk's first layer a row mid-pool.
-        """
-        self._slots: dict = {}
-
-    def take_slot(self, kind) -> int:
-        """The next row of `kind` this bind walk hands out.
-
-        A module's row is its position among the modules of its kind, which is
-        the order the walk visits them in -- counted, not recovered from the
-        layer id by knowing where a hybrid's linear layers or a draft's stack
-        begin. `kind` keeps the counters a builder runs at once apart: an MHA
-        row, a linear-attention slot, an indexer's compact row.
-        """
-        slot = self._slots.get(kind, 0)
-        self._slots[kind] = slot + 1
-        return slot
-
-    def build_kv_cache_tensor(self, layer_id: int, module):
+    def build_kv_cache_tensor(self, module):
         """Build the vLLM-style `KVCacheTensor` registration entry for one
         attention module, OR return None if this builder does not recognize
         the module type.
@@ -418,7 +395,7 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         return
 
 
-class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
+class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic[T]):
     def __init__(self, model_runner):
         self.model_runner = model_runner
         assert model_runner.block_size % self.block_size == 0
@@ -428,7 +405,6 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         # re-read off the runner: a rollout resume can re-allocate at a
         # *smaller* count, and a view addresses what it was built at.
         self.num_blocks = 0
-        self.reset_slots()
         self.device = model_runner.device
         config = model_runner.config
         hf_config = config.hf_config

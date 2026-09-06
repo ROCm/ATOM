@@ -49,7 +49,8 @@ def builder(
         enable_rapidserve=rapidserve,
     )
     stub = SimpleNamespace(
-        model_runner=SimpleNamespace(config=config, num_gdn_attn_state=layers),
+        model_runner=SimpleNamespace(config=config),
+        num_state_layers=lambda: layers,
         num_spec=num_spec,
         _state_shape_for_runner=lambda: (shape_k, shape_v),
         _state_dtypes=lambda: (dt_k, dt_v),
