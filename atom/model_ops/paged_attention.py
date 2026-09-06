@@ -25,7 +25,7 @@ class Attention(BaseAttention):
         head_dim,
         scale,
         num_kv_heads,
-        alibi_slopes: list[float] = None,
+        alibi_slopes: list[float] | None = None,
         kv_cache_dtype="bf16",
         layer_num=0,
         use_mla: bool = False,

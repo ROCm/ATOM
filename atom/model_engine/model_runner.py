@@ -10,7 +10,7 @@ import os
 import time
 from contextlib import contextmanager, nullcontext
 from functools import partial
-from typing import Any, NamedTuple
+from typing import Any, ClassVar, NamedTuple
 
 import numpy as np
 import torch
@@ -1014,9 +1014,8 @@ class ModelRunner:
                     c if c.isalnum() or c in ("_", "-", ".") else "_"
                     for c in trace_name
                 )
-            if worker_name == "capture_graph":
-                if safe_model_name:
-                    worker_name = f"{worker_name}_{safe_model_name}"
+            if worker_name == "capture_graph" and safe_model_name:
+                worker_name = f"{worker_name}_{safe_model_name}"
             output_prefix = os.path.join(self.profiler_dir, worker_name)
 
             def _on_trace_ready(prof):
@@ -3423,7 +3422,11 @@ class ModelRunner:
                 from aiter.dist import parallel_state as _ps
 
                 group = getattr(_ps, getter)()
-            except Exception:
+
+            # initialised is the ordinary case here, and which exception says
+            # so is the aiter build's business, not this probe's.
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("%s is not available: %s", getter, exc)
                 continue
             dc = getattr(group, "device_communicator", None)
             ca = getattr(dc, "ca_comm", None) if dc is not None else None
@@ -4426,7 +4429,7 @@ class RapidServeModelRunner(ModelRunner):
         return words
 
     # CU fractions for which we pre-create masked streams.
-    _CU_POOL_FRACTIONS = [0.5]
+    _CU_POOL_FRACTIONS: ClassVar[list[float]] = [0.5]
 
     def create_prefill_stream_pool(self) -> bool:
         """Create a pool of CUDA streams for disaggregated prefill.
@@ -4496,7 +4499,7 @@ class RapidServeModelRunner(ModelRunner):
                 top_ks,
                 top_ps,
                 all_greedy,
-                needs_independent_noise,
+                _needs_independent_noise,
             ) = self.prepare_model(batch)
             logits, _ = self.run_model(input_ids, batch)
             # Sample the first generated token from each sequence's last logit

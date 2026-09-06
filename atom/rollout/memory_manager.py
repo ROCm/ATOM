@@ -217,11 +217,8 @@ class MemoryManagerMixin:
             self.capture_cudagraph()
             del self._graphs_backup_keys
             logger.info(f"{self.label}: CUDA graph recapture completed")
-        except Exception as e:
-            logger.error(
-                f"{self.label}: CUDA graph recapture failed: {e}",
-                exc_info=True,
-            )
+        except Exception:
+            logger.exception(f"{self.label}: CUDA graph recapture failed")
             # Fall back to eager mode rather than crashing
             self.enforce_eager = True
             self.graphs = {}

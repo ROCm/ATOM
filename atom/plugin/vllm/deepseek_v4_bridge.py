@@ -55,7 +55,9 @@ def _v4_kv_fp8(vllm_config) -> bool:
         from aiter.jit.utils.chip_info import get_gfx
 
         gfx = get_gfx()
-    except Exception:
+    # Any failure to reach aiter's chip probe means "unknown chip", which the
+    # gate below already handles; narrowing the type would guess at the build.
+    except Exception:  # noqa: BLE001
         gfx = None
     if gfx not in _V4_FP8_SUPPORTED_GFX:
         if not _V4_FP8_DOWNGRADE_WARNED:
@@ -537,7 +539,9 @@ class AtomDeepseekV4ProxyMetadataBuilder(AttentionMetadataBuilder):
                 )
 
                 req_ids = get_current_req_ids()
-            except Exception:
+            # vLLM's accessor is optional and version-dependent; absent ids are
+            # the caller's ordinary "no ids" case.
+            except Exception:  # noqa: BLE001
                 req_ids = None
         md = build_atom_v4_attention_metadata(
             common_attn_metadata,
@@ -1280,11 +1284,10 @@ class _V4StateSlotAllocator:
             if victim_seen is None or self._last_seen[s] < victim_seen:
                 victim = s
                 victim_seen = self._last_seen[s]
-        if victim < 0:
-            # All slots belong to requests active this step: only possible if
-            # concurrency exceeds num_slots, which vLLM forbids. Fall back to
-            # slot 0 rather than crash.
-            victim = 0
+        # A negative victim means every slot belongs to a request active this
+        # step, which needs concurrency above num_slots and vLLM forbids it.
+        # Slot 0 rather than a crash.
+        victim = max(victim, 0)
         old = self._slot_to_key[victim]
         if old is not None:
             self._key_to_slot.pop(old, None)
@@ -2049,7 +2052,9 @@ def _is_vllm_decode_graph_phase(attn_metadata, atom_config) -> bool:
         if not (is_uniform_decode_bucket or is_single_query_decode):
             return False
         return bool(getattr(vllm_monitor, "cudagraph_capturing_enabled", False))
-    except Exception:
+    # A predicate over another engine's internals: anything it raises means
+    # "cannot tell", and the safe answer to that is False.
+    except Exception:  # noqa: BLE001
         return False
 
 
