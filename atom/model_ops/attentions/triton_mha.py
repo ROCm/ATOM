@@ -102,14 +102,12 @@ class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):
         ):
             return None
 
-        # Ahead of the parent call, and so duplicating its guard: both refusals
-        # below are about *this* module, and a model's non-attention modules
-        # must not trip them.
-        if self.model_runner.is_mimo_v2():
-            raise NotImplementedError(
-                "TritonMHABackend does not support MiMo-V2 (per-layer alloc path)"
-            )
-
+        # Ahead of the parent call, and so duplicating its guard: the refusal
+        # below is about *this* module, and a model's non-attention modules
+        # must not trip it. (The MiMo-V2 refusal that used to sit here went
+        # with the per-layer allocation path it named -- a second KV-head
+        # geometry is a second pool now, which this backend reads like any
+        # other.)
         impl = getattr(module, "impl", None)
         if impl is not None and (
             getattr(impl, "rotary_emb", None) is not None

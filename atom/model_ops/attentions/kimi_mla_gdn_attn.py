@@ -46,14 +46,6 @@ class KimiMLAGDNBackend(AttentionBackend):
 class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
     def __init__(self, model_runner):
         super().__init__(model_runner=model_runner)
-        self.mla_idx_by_layer = {
-            layer: index
-            for index, layer in enumerate(model_runner.full_attention_layers)
-        }
-        self.kda_idx_by_layer = {
-            layer: index
-            for index, layer in enumerate(model_runner.kda_attention_layers)
-        }
 
     def _num_cache_rows(self) -> int:
         """Rows in the MLA pool: the target's full-attention layers plus any
@@ -332,7 +324,10 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
 
         runner = self.model_runner
         if hasattr(module, "base_linear_attention"):
-            row = self.kda_idx_by_layer[layer_id]
+            # The next KDA slot the walk hands out: the state pool holds one
+            # per linear-attention layer, and these modules are what those rows
+            # are, in order.
+            row = self.take_slot("kda")
             return KVCacheTensor(
                 layer_num=layer_id,
                 k_cache=runner.mamba_k_cache[row],
@@ -349,14 +344,10 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             )
 
         if hasattr(module, "base_attention") and getattr(module, "use_mla", False):
-            hf = runner.config.hf_config
-            row = self.mla_idx_by_layer.get(layer_id)
-            if row is None:
-                assert layer_id >= hf.num_hidden_layers, (
-                    f"MLA model layer {layer_id} is neither a K3 full-attention "
-                    "layer nor a draft layer"
-                )
-                row = runner.num_full_attn + (layer_id - hf.num_hidden_layers)
+            # The next MLA row the walk hands out. K3's linear-attention layers
+            # are bound above and take none, and a draft's layers simply
+            # continue the count, which is what the pool was sized for.
+            row = self.take_slot("mla")
             allocated_rows = self._kv_pool_layers()
             assert row < allocated_rows, (
                 f"MLA cache row {row} for model layer {layer_id} "

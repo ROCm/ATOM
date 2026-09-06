@@ -1078,6 +1078,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         budget bought."""
         return self._declare_kv_pool().pool_bytes(blocks)
 
+    def release_kv_pools(self) -> None:
+        if self.kv_pool is not None:
+            self.kv_pool.release()
+
     def _kv_pool_layers(self) -> int:
         """Rows the paged pool holds, one per layer that caches KV.
 

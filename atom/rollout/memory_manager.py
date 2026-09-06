@@ -142,14 +142,14 @@ class MemoryManagerMixin:
 
         set_kv_cache_data({})
 
-        # A builder's pool holds views of the same buffers, so dropping only
-        # the runner's references frees nothing.
+        # A builder's pools hold views of the same buffer, so dropping only the
+        # runner's reference frees nothing.
         for owner in (
             getattr(self, "attn_metadata_builder", None),
             getattr(self, "draft_kv_builder", None),
         ):
-            if (pool := getattr(owner, "kv_pool", None)) is not None:
-                pool.release()
+            if owner is not None:
+                owner.release_kv_pools()
 
         del self.kv_cache
         self.kv_cache = None

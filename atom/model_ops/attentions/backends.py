@@ -362,6 +362,35 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         reaches the config only after this. The count arrives with the handle.
         """
 
+    def release_kv_pools(self) -> None:
+        """Drop the backing of every pool this builder holds, keeping the
+        declarations. A rollout sleep frees the runner's paged buffer, and a
+        pool's views would hold it alive; `allocate_kv_cache_tensors` puts the
+        backing back. A builder that holds no pool has nothing to drop.
+        """
+
+    def reset_slots(self) -> None:
+        """Forget the slots handed out, before a bind walk starts one.
+
+        The runner's to call, because the walk is: a pool is re-bound on a P/D
+        import and again on a rollout wake, and a counter that survived either
+        would hand the next walk's first layer a row mid-pool.
+        """
+        self._slots: dict = {}
+
+    def take_slot(self, kind) -> int:
+        """The next row of `kind` this bind walk hands out.
+
+        A module's row is its position among the modules of its kind, which is
+        the order the walk visits them in -- counted, not recovered from the
+        layer id by knowing where a hybrid's linear layers or a draft's stack
+        begin. `kind` keeps the counters a builder runs at once apart: an MHA
+        row, a linear-attention slot, an indexer's compact row.
+        """
+        slot = self._slots.get(kind, 0)
+        self._slots[kind] = slot + 1
+        return slot
+
     def build_kv_cache_tensor(self, layer_id: int, module):
         """Build the vLLM-style `KVCacheTensor` registration entry for one
         attention module, OR return None if this builder does not recognize
@@ -370,7 +399,8 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         Called from ModelRunner.allocate_kv_cache()'s binding loop for every
         module of the model. The builder owns:
           - module-type detection (e.g. `hasattr(module, "use_mla")`)
-          - per-attention-type slot index math (attn_idx, gdn_idx, ...)
+          - which of its pools the module's layer belongs to, its row from
+            `take_slot`
           - per-module tensor slicing from runner-owned tensors
             (self.model_runner.kv_cache, .mamba_k_cache, ...)
           - any `setattr(module, "k_cache", ...)` side effects per the
@@ -398,6 +428,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         # re-read off the runner: a rollout resume can re-allocate at a
         # *smaller* count, and a view addresses what it was built at.
         self.num_blocks = 0
+        self.reset_slots()
         self.device = model_runner.device
         config = model_runner.config
         hf_config = config.hf_config

@@ -56,8 +56,9 @@ ALL_HOOKS = [
 def test_every_flavor_that_owns_a_pool_is_covered():
     """A count of the implementations, so the per-hook checks below cannot
     quietly stop covering one. The base declaration plus MHA, MLA, Kimi's
-    MLA+GDN, GDN, V4, and the draft's."""
-    assert len(ALL_HOOKS) == 7
+    MLA+GDN, V4, and the draft's -- GDN-hybrid has none of its own: counting
+    the modules it owns leaves the linear-attention layers out by itself."""
+    assert len(ALL_HOOKS) == 6
 
 
 @pytest.mark.parametrize("path, cls, fn", ALL_HOOKS)

@@ -117,13 +117,11 @@ class GDNStateMixin:
         self,
         model_runner,
     ):
-        # Hybrid model layer-counting state (formerly set as a side effect
-        # inside the qwen_next branch of the KV sizing path).
-        # Promoted to runner attributes here so all consumers
-        # (build_kv_cache_tensor, allocate_kv_cache_tensors, the per-req
-        # cache hooks) can read them as `self.model_runner.<name>` without
-        # a hidden ordering dependency on the KV sizing path being
-        # called first.
+        # How many layers of each kind a hybrid has, on the runner so the
+        # per-request cache hooks read them without a hidden ordering
+        # dependency on the KV sizing path running first. Which layer is which
+        # kind is not among them: a pool row is the position of a module among
+        # the modules of its kind, and the bind walk hands those out.
         hf = model_runner.config.hf_config
         model_type = getattr(hf, "model_type", None)
         if model_type in ("kimi_linear", "glm5_next_text"):
@@ -136,16 +134,14 @@ class GDNStateMixin:
                 # The model normalizer derives these from layer_types when a
                 # config revision omits the redundant linear-attn lists.
                 model_runner.full_attention_layers = list(hf.glm5_full_attn_layers)
-                model_runner.kda_attention_layers = list(hf.glm5_kda_layers)
+                kda_layers = list(hf.glm5_kda_layers)
             else:
                 model_runner.full_attention_layers = [
                     int(i) - offset for i in lin.get("full_attn_layers", [])
                 ]
-                model_runner.kda_attention_layers = [
-                    int(i) - offset for i in lin.get("kda_layers", [])
-                ]
+                kda_layers = [int(i) - offset for i in lin.get("kda_layers", [])]
             model_runner.num_full_attn = len(model_runner.full_attention_layers)
-            model_runner.num_gdn_attn_state = len(model_runner.kda_attention_layers)
+            model_runner.num_gdn_attn_state = len(kda_layers)
             hf.linear_num_key_heads = getattr(
                 hf, "linear_num_key_heads", lin.get("num_heads", hf.num_attention_heads)
             )
@@ -166,9 +162,10 @@ class GDNStateMixin:
                 lin.get("short_conv_kernel_size", 4),
             )
         else:
-            model_runner.full_attention_interval = hf.full_attention_interval
+            # The interval itself stays local: nothing maps a layer id onto a
+            # pool row by it any more, so only the two counts leave here.
             model_runner.num_full_attn = (
-                hf.num_hidden_layers // model_runner.full_attention_interval
+                hf.num_hidden_layers // hf.full_attention_interval
             )
             model_runner.num_gdn_attn_state = (
                 hf.num_hidden_layers - model_runner.num_full_attn
@@ -1398,53 +1395,16 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     # `update_context_lens` / `positions_out` into a signature that has neither.
     fuse_mtp_decode_position_update = False
 
-    def _kv_pool_layers(self) -> int:
-        """Only the full-attention layers, plus any draft layers.
-
-        A linear-attention layer stores no paged KV — it keeps per-request
-        state in the mamba pool — so the paged axis is shorter than the model,
-        and `build_kv_cache_tensor`'s `attn_idx` is what maps onto it. This is
-        the expression sizing has always used; allocation now shares it rather
-        than taking the runner's separate draft-layer count.
-        """
-        runner = self.model_runner
-        num_draft = (
-            runner._get_total_num_layers() - runner.config.hf_config.num_hidden_layers
-        )
-        return runner.num_full_attn + num_draft
-
     def sub_pool_specs(self) -> list[SubPoolSpec]:
         """GDN hybrid: a paged KV pool holding ONLY the full-attention layer
         slots, plus the per-request state pool for the linear-attention
         layers (`GDNStateMixin.state_spec`).
+
+        The parent prices and allocates that pool unchanged: a linear-attention
+        layer is not a module it owns, so counting the modules leaves it out
+        without this class saying which layers those are.
         """
         return [page_pool(self._paged_entry_bytes()), self.state_spec()]
-
-    def _paged_entry_bytes(self) -> int:
-        """A block of the full-attention-only pool.
-
-        Overridden because the parent's asks for every layer of the model and a
-        hybrid caches for `_kv_pool_layers` of them. `paged_pool_bytes` reads
-        this too, so the budget and the region move together.
-        """
-        return self._declare_kv_pool(self.model_runner._get_num_kv_heads()).entry_bytes
-
-    def allocate_kv_cache_tensors(
-        self, num_kv_heads: int, num_draft_layers: int, *, blocks: int, buf
-    ) -> dict:
-        """Same pool as the MHA parent's, over the shorter layer axis.
-
-        The pool takes `blocks` and not `self.num_blocks`: `_declare_kv_pool`
-        builds it at `runner.block_size`, so one entry is one *scheduler* block
-        and the count of entries is the scheduler's. `self.num_blocks` is the
-        same capacity counted in this backend's own page, which is what its
-        kernels index and not what this pool is entry-per.
-        """
-        self.num_blocks = blocks * self.block_ratio
-        runner = self.model_runner
-        self.kv_pool = self._declare_kv_pool(num_kv_heads)
-        self.kv_pool.allocate(blocks, runner.device, buf=buf)
-        return {}
 
     def build_kv_cache_tensor(self, layer_id: int, module):
         """Dispatch by module type:
@@ -1458,8 +1418,11 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             from atom.config import KVCacheTensor
 
             runner = self.model_runner
-            interval = runner.full_attention_interval
-            gdn_idx = (layer_id // interval) * (interval - 1) + (layer_id % interval)
+            # The next linear-attention slot the walk hands out. The mamba pool
+            # holds one per such layer, so its rows are these modules counted --
+            # not `layer_id`, which counts the full-attention layers between
+            # them too.
+            gdn_idx = self.take_slot("gdn")
             return KVCacheTensor(
                 layer_num=layer_id,
                 k_cache=runner.mamba_k_cache[gdn_idx],

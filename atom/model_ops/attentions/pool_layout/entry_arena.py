@@ -105,6 +105,21 @@ def plan_regions(sizes: list[int]) -> tuple[list[int], int]:
     return offsets, _align_up(offset)
 
 
+def carve(buf: torch.Tensor | None, sizes: list[int]) -> list[torch.Tensor | None]:
+    """`buf` cut into one region per size, placed by `plan_regions`.
+
+    The one place a region's start is decided, so every consumer of a shared
+    allocation — the runner's paged pool, a pool's field groups, a builder's
+    several pools — places them the same way and none has to be told the
+    offsets. `None` in, `None`s out: a pool that owns its memory carves
+    nothing and lets each arena allocate.
+    """
+    offsets, _ = plan_regions(sizes)
+    if buf is None:
+        return [None] * len(sizes)
+    return [buf[start : start + size] for start, size in zip(offsets, sizes)]
+
+
 def plan_field_planes(
     fields: list[EntryField], plane_row_bytes: list[int]
 ) -> tuple[list[list[EntryField]], int]:
@@ -450,19 +465,9 @@ def carve_layer_major(
     groups was charged. `buf` is None for a pool that owns its memory.
     """
     sizes = [entry_bytes_for(group) * entries for group in groups]
-    offsets, _ = plan_regions(sizes)
     return [
-        (
-            LayerMajorArena(
-                group,
-                entries,
-                device,
-                buf=None if buf is None else buf[start : start + size],
-            )
-            if group
-            else None
-        )
-        for group, start, size in zip(groups, offsets, sizes)
+        LayerMajorArena(group, entries, device, buf=region) if group else None
+        for group, region in zip(groups, carve(buf, sizes))
     ]
 
 

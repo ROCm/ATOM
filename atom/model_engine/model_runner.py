@@ -924,16 +924,6 @@ class ModelRunner:
             "deepseek_v4_mtp",
         )
 
-    def is_mimo_v2(self) -> bool:
-        if not hasattr(self.hf_text_config, "model_type"):
-            return False
-        elif self.hf_text_config.model_type in (
-            "mimo_v2",
-            "mimo_v2_flash",
-        ):
-            return True
-        return False
-
     def _setup_device_and_distributed(self, rank: int, config: Config):
         # Calculate local device rank considering DP, PP and PCP.
         # On a single node the physical GPU index equals the global distributed
@@ -1519,13 +1509,23 @@ class ModelRunner:
             total = end - start
         else:
             total = num_hidden
-        if (
+        if self.draft_shares_kv_pool():
+            total += self._num_draft_kv_layers()
+        return total
+
+    def draft_shares_kv_pool(self) -> bool:
+        """Whether a draft's attention layers land in the target's pools.
+
+        A draft whose flavor asked for a pool of its own has a
+        `draft_kv_builder` and is priced and bound through that instead. One
+        spelling, because the layer count and the walk that fills those layers
+        have to answer this the same way.
+        """
+        return bool(
             self.config.speculative_config
             and hasattr(self, "drafter")
             and not hasattr(self, "draft_kv_builder")
-        ):
-            total += self._num_draft_kv_layers()
-        return total
+        )
 
     def _sub_pool_specs(self) -> list[SubPoolSpec]:
         """Cache-class declarations from every builder attached to this runner.
@@ -1965,6 +1965,7 @@ class ModelRunner:
         if pool.numel():
             self.kv_cache = pool
         for builder, region in zip(builders, regions):
+            builder.reset_slots()
             for name, value in builder.allocate_kv_cache_tensors(
                 num_kv_heads, num_draft_layers, blocks=num_kvcache_blocks, buf=region
             ).items():
@@ -2000,24 +2001,6 @@ class ModelRunner:
         # not the local bind counter — under PP a stage's layer_num is offset.
         kv_cache_keys = []
         layer_id = 0
-        # Promote to self so the attention builder's build_kv_cache_tensor()
-        # can access it without recomputing from drafter state. Heterogeneous
-        # drafts (Eagle3 MHA) own their own layer space via their builder.
-        # Eagle3 MLA drafts (K2.6) share the target's MLA pool but still
-        # appear as one extra layer at index num_hidden_layers.
-        #
-        # Only serial-MTP draft models carry `.model.mtp_start_layer_idx`; the
-        # eagle3 and standalone-DSpark drafts do not, and both simply start
-        # right after the target's last layer. Probe for the attribute instead
-        # of enumerating the flavors that lack it — the previous
-        # `not is_eagle3` spelling silently grew wrong the moment a third
-        # standalone flavor appeared.
-        drafter_model = getattr(getattr(self, "drafter", None), "model", None)
-        self.mtp_start_layer_idx = getattr(
-            getattr(drafter_model, "model", None),
-            "mtp_start_layer_idx",
-            hf_config.num_hidden_layers,
-        )
         for model_name, model in models_to_bind:
             logger.info(
                 f"Binding KV cache for {model_name} model starting at layer_id={layer_id}"
@@ -4506,6 +4489,7 @@ class RapidServeModelRunner(ModelRunner):
             num_kvcache_blocks, buf=self.kv_cache
         )
         for builder, region in zip(builders, regions):
+            builder.reset_slots()
             builder.adopt_imported_kv_pool(num_kvcache_blocks, region)
 
         models_to_bind = [("target", self.model)]

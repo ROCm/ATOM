@@ -109,6 +109,15 @@ class DraftKvBuilder:
         self.num_blocks = blocks
         self.kv_pool.allocate(blocks, self.model_runner.device, buf=buf)
 
+    def release_kv_pools(self) -> None:
+        self.kv_pool.release()
+
+    def reset_slots(self) -> None:
+        """Same hook the attention builders answer: the runner clears the
+        counters before a bind walk, so a re-bind starts this pool's rows at
+        the top instead of continuing past its last layer."""
+        self._next_layer_id = 0
+
     def build_kv_cache_tensor(self, layer_id: int, module):
         """Bind one of the draft's attention modules to its own pool.
 
