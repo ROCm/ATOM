@@ -535,10 +535,51 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
         )
 
         # Plain decode has max_query_len == 1, while MTP/spec decode verifies
-        # num_spec+1 tokens per request. Both should use the decode path, but only
-        # when the split says there are no prefill/extend requests in the batch.
+        # num_spec+1 tokens per request. A decode slice is "multi-token" (a
+        # spec/MTP verify slice) iff it carries more tokens than requests --
+        # this holds whether or not the batch also contains prefills.
+        spec_verify_decode = num_decodes > 0 and num_decode_tokens > num_decodes
+
         if num_decodes > 0 and num_extends == 0 and num_prefills == 0:
-            return self._build_uniform_decode_metadata(common_attn_metadata)
+            # Genuine single-token decode (max_query_len == 1) uses the flash-
+            # decoding split-K decode kernels (one query row per request).
+            #
+            # A spec/MTP verify batch (max_query_len > 1) MUST NOT: both decode
+            # kernels -- the plain-4D `minimax_m3_sparse_attn_decode` and the
+            # ASM/gluon `_asm` variant -- treat q.shape[0] as the request count
+            # and derive each row's causal length from the per-request seq_len.
+            # For a verify row that sits BEFORE the last position, that makes it
+            # attend its own future draft tokens (non-causal) and, since the
+            # per-request block_table/seq_lens have only num_reqs rows while q
+            # has num_reqs*max_query_len rows, indexes out of bounds -- corrupt
+            # verify logits (0 acceptance, garbage output). Route the whole
+            # verify batch through the varlen prefill/extend path instead: it
+            # reads each request's query tokens against cached context via
+            # cu_seqlens_q + context_lens with correct per-token causality (a
+            # spec-verify batch is exactly a short chunked prefill), for any
+            # query-length mix and both KV layouts. This also covers vLLM's
+            # warmup _dummy_run(uniform_decode=True) non-uniform remainder batch
+            # (num_tokens % max_query_len != 0, e.g. lens [4, 1]).
+            mql = max(1, int(common_attn_metadata.max_query_len or 1))
+            if mql == 1:
+                return self._build_uniform_decode_metadata(common_attn_metadata)
+            return self._build_prefill_only_metadata(common_attn_metadata)
+
+        # MIXED batch (decode + prefill/extend) whose decode slice is a spec/MTP
+        # verify slice (multi-token per request). The mixed path below would
+        # build a MinimaxM3SparseDecodeMetadata with max_query_len =
+        # reorder_batch_threshold (== 1) for that slice and send it through the
+        # non-causal decode kernel -- the exact corruption described above, but
+        # only at request-boundary steps where a fresh prefill rides along with
+        # in-flight verify decodes (the partial gsm8k accuracy drop). The varlen
+        # prefill path handles ANY per-request query-length mix (verify decodes,
+        # single-token decodes, and genuine prefills alike) with correct
+        # per-token causality against cached context, so route the whole batch
+        # through it whenever a multi-token verify slice is present. Pure
+        # single-token decode + prefill batches (no spec) keep the fast decode
+        # kernel via the mixed path below.
+        if spec_verify_decode:
+            return self._build_prefill_only_metadata(common_attn_metadata)
 
         num_tokens = common_attn_metadata.num_actual_tokens
         num_prefills_total = num_extends + num_prefills
@@ -629,6 +670,53 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
             max_query_len=max_query_len,
             prefill=None,
             decode=decode_metadata,
+        )
+
+    def _build_prefill_only_metadata(self, common_attn_metadata):
+        """Treat the whole batch as varlen prefill/extend (num_decodes == 0).
+
+        Used for NON-uniform "decode" batches (see build()): the sparse decode
+        kernel assumes every request has exactly max_query_len query rows, but
+        the varlen prefill kernel reads each request's query tokens against its
+        cached context via cu_seqlens_q + context_lens, so it handles any
+        per-request query length distribution correctly.
+        """
+        assert common_attn_metadata is not None
+
+        num_reqs = common_attn_metadata.num_reqs
+        num_tokens = common_attn_metadata.num_actual_tokens
+        seq_lens = common_attn_metadata.seq_lens
+        block_table = common_attn_metadata.block_table_tensor
+
+        # query_start_loc already starts at 0 for the full batch; no phase offset.
+        cu_seqlens_q = common_attn_metadata.query_start_loc[: num_reqs + 1].to(
+            torch.int32
+        )
+        context_lens = common_attn_metadata.compute_num_computed_tokens()[:num_reqs]
+        qo_indptr = self.prefill_qo_indptr[: num_tokens + 1]
+
+        prefill_metadata = MinimaxM3SparsePrefillMetadata(
+            qo_indptr=qo_indptr,
+            cu_seqlens_q=cu_seqlens_q,
+            seq_lens=seq_lens[:num_reqs],
+            context_lens=context_lens,
+            block_table=block_table[:num_reqs],
+            max_query_len=common_attn_metadata.max_query_len,
+            max_seq_len=common_attn_metadata.max_seq_len,
+        )
+        return MinimaxM3SparseMetadata(
+            seq_lens=seq_lens,
+            max_seq_len=common_attn_metadata.max_seq_len,
+            slot_mapping=common_attn_metadata.slot_mapping,
+            num_actual_tokens=num_tokens,
+            num_decodes=0,
+            num_decode_tokens=0,
+            num_prefills=num_reqs,
+            num_prefill_tokens=num_tokens,
+            block_table=block_table,
+            max_query_len=common_attn_metadata.max_query_len,
+            prefill=prefill_metadata,
+            decode=None,
         )
 
     def build_for_cudagraph_capture(self, common_attn_metadata=None):

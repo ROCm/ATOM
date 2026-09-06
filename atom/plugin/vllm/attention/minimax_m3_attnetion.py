@@ -779,6 +779,21 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             return
         decode_md = main_metadata.decode
 
+        # The sparse decode kernels assume exactly one query row per request:
+        # they index block_table/seq_lens with num_reqs rows and attend all keys
+        # < seq_len with no per-token causal mask. A multi-token spec/MTP verify
+        # slice MUST be routed to the varlen prefill path in the metadata builder
+        # (metadata.py build(): spec_verify_decode -> _build_prefill_only_metadata);
+        # if one leaks here the kernel silently produces non-causal, out-of-bounds
+        # verify logits (the ~10pt gsm8k drop). Fail loudly instead of silently.
+        num_decode_reqs = decode_md.seq_lens.shape[0]
+        assert num_decode_tokens == num_decode_reqs, (
+            "MiniMax-M3 sparse decode kernel requires one query token per request "
+            f"(single-token decode), got {num_decode_tokens} tokens for "
+            f"{num_decode_reqs} requests -- a multi-token verify slice leaked past "
+            "the metadata builder's spec-verify -> prefill routing."
+        )
+
         if self._is_plain_layout():
             from atom.model_ops.minimax_m3.sparse_attn import (
                 minimax_m3_sparse_attn_decode,

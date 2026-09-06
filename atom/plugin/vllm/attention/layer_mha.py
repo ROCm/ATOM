@@ -778,6 +778,30 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         output = output.view(-1, self.num_heads, self.head_dim)
 
         num_actual_tokens = attn_metadata.num_actual_tokens
+
+        # vLLM 0.28 (RFC #42082) hands every non-MLA attention layer a single
+        # 4-D KV view with K and V interleaved in the last dim -- logical shape
+        # (num_blocks, num_kv_heads, block_size, 2*head_size), physically
+        # contiguous as (num_blocks, block_size, num_kv_heads, 2*head_size).
+        # ATOM's shuffle-layout write/read kernels assume two separate K/V
+        # planes (a 5-D (2, ...) cache) and cannot alias this buffer, so consume
+        # it with the vLLM-native reshape_and_cache_flash write + one
+        # unified_attention read, mirroring vLLM's own ROCm backends
+        # (vllm/v1/attention/backends/{rocm_aiter_fa,triton_attn}.py). This is
+        # the path the Eagle3 MHA speculative-decode draft takes: bf16 KV,
+        # causal, multi-token decode.
+        if kv_cache.dim() == 4 and kv_cache.shape[-1] == 2 * self.head_dim:
+            return self._forward_vllm_native_combined_kv(
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                position,
+                output,
+                num_actual_tokens,
+            )
+
         k_cache, v_cache = kv_cache.unbind(0)
         num_blocks, block_size, num_kv_heads, _ = k_cache.shape
 
@@ -931,6 +955,98 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         output = output.view(-1, self.num_heads * self.head_dim)
 
         return output
+
+    def _forward_vllm_native_combined_kv(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: "AiterMhaMetadataForVllm",
+        position: torch.Tensor,
+        output: torch.Tensor,
+        num_actual_tokens: int,
+    ) -> torch.Tensor:
+        """Attention over vLLM 0.28's combined [K|V] paged KV layout.
+
+        vLLM allocates every non-MLA layer's KV cache as a single tensor of
+        logical shape (num_blocks, num_kv_heads, block_size, 2*head_size) with K
+        and V interleaved in the last dim. Split it into two aliasing views the
+        way vLLM's own ROCm backends do, write the current step's K/V with
+        reshape_and_cache_flash, then run one unified_attention over the whole
+        batch -- it handles prefill, decode, and multi-token speculative decode
+        uniformly by reading every key/value straight from the paged cache. Used
+        by the Eagle3 MHA draft, whose KV cache is bf16.
+        """
+        from aiter.ops.triton.unified_attention import unified_attention
+
+        # (B, H, N, 2*hs) -> two (B, N, H, hs) views aliasing the same buffer.
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(
+            self.head_size, dim=-1
+        )
+        if self.kv_cache_dtype.startswith("fp8"):
+            target_dtype = dtypes.d_dtypes[self.kv_cache_dtype]
+            key_cache = key_cache.view(target_dtype)
+            value_cache = value_cache.view(target_dtype)
+
+        query = query[:num_actual_tokens]
+        key = key[:num_actual_tokens]
+        value = value[:num_actual_tokens]
+        output_actual = output[:num_actual_tokens]
+        if position is not None:
+            position = position[:num_actual_tokens]
+
+        if self.rotary_emb is not None:
+            assert position is not None
+            query, key = self.rotary_emb(position, query, key)
+
+        # reshape_and_cache_flash writes num_actual_tokens rows (from
+        # slot_mapping's length), aliasing straight into the combined buffer.
+        kv_cache_dtype = (
+            self.kv_cache_dtype
+            if self.kv_cache_dtype.startswith("fp8")
+            else "auto"
+        )
+        slot_mapping = attn_metadata.slot_mapping[:num_actual_tokens]
+        torch.ops._C_cache_ops.reshape_and_cache_flash(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            kv_cache_dtype,
+            self._k_scale,
+            self._v_scale,
+        )
+
+        num_seqs = attn_metadata.query_start_loc.shape[0] - 1
+        descale_shape = (num_seqs, key_cache.shape[2])
+        window_size = (
+            (self.sliding_window, 0)
+            if self.sliding_window is not None and self.sliding_window != -1
+            else (-1, -1)
+        )
+        unified_attention(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=output_actual,
+            cu_seqlens_q=attn_metadata.query_start_loc,
+            max_seqlen_q=attn_metadata.max_query_len,
+            seqused_k=attn_metadata.seq_lens,
+            max_seqlen_k=attn_metadata.max_seq_len,
+            softmax_scale=self.scale,
+            causal=True,
+            alibi_slopes=self.alibi_slopes,
+            window_size=window_size,
+            block_table=attn_metadata.block_table,
+            softcap=0.0,
+            q_descale=None,
+            k_descale=self._k_scale.expand(descale_shape),
+            v_descale=self._v_scale.expand(descale_shape),
+            sinks=self.sinks,
+        )
+        return output.view(-1, self.num_heads * self.head_size)
 
     def get_kv_cache_spec(self, vllm_config):
         from vllm.v1.attention.backend import AttentionType
