@@ -374,6 +374,18 @@ models:
               LMCACHE_LOCAL_CPU: "True"
               LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
               LMCACHE_CHUNK_SIZE: "256"
+              # NVMe (L3) tier under the CPU hot cache. Both variables are
+              # required together; LMCACHE_MAX_LOCAL_CPU_SIZE must stay > 0
+              # because LocalDiskBackend stages through the host allocator.
+              # scale_cpu_size_for_pp splits only the CPU budget across PP
+              # stages, so this size is per rank: 4 x 500GiB on a pp4 prefill.
+              # pd_server_atom.sh empties the directory around the run.
+              # The path follows the default atomesh-cicd fleet, where /mnt is
+              # local and already holds ATOMESH_MODEL_ROOT. The mi350 and crusoe
+              # fleets keep their models on /data and /shared_nfs instead, so a
+              # dispatch onto those needs this pointed at their own local disk.
+              LMCACHE_LOCAL_DISK: "/mnt/lmcache-job"
+              LMCACHE_MAX_LOCAL_DISK_SIZE: "500"
               OFFLOAD_PROFILE: "1"
               OFFLOAD_MIN_LOAD_TOKENS: "0"
               PREFILL_KV_TRANSFER_CONFIG: >-
