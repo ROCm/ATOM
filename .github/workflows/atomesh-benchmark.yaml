@@ -441,7 +441,7 @@ jobs:
     needs: [load-config]
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.suite == 'smoke' }}
     runs-on: ${{ inputs.atomesh_slurm_submit_runner }}
-    timeout-minutes: 45
+    timeout-minutes: 75
     env:
       RDMA_SMOKE_IMAGE: ${{ needs.load-config.outputs.image }}
       RDMA_SMOKE_NODES: ${{ inputs.rdma_smoke_nodes }}
@@ -1214,7 +1214,7 @@ jobs:
             --nodes "${node_count}"
             --ntasks "${node_count}"
             --ntasks-per-node 1
-            --time 00:30:00
+            --time 01:00:00
             --output "${SLURM_OUTPUT}"
             --error "${SLURM_ERROR}"
           )
