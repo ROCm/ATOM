@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
-from typing import NamedTuple
+from typing import ClassVar, NamedTuple
 
 import aiter
 import numpy as np
@@ -156,7 +156,7 @@ class AiterBackend(AttentionBackend):
 
 
 class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
-    BLOCK_TABLE_EXTENDER: list[list[int]] = [[]]
+    BLOCK_TABLE_EXTENDER: ClassVar[list[list[int]]] = [[]]
     # EagleProposer fuses the per-draft-step position bump into
     # prepare_mtp_decode's kernel when this is set (block-paged MHA draft).
     fuse_mtp_decode_position_update = True
