@@ -12,14 +12,13 @@ and split-K decode with a separate merge step.
 
 from dataclasses import dataclass
 
-import aiter  # noqa: F401  (used by the gluon PA runners for aiter.dtypes.fp8)
+import aiter
 import torch
 
-try:
-    from vllm.triton_utils import tl, triton
-except ModuleNotFoundError:
-    import triton
-    import triton.language as tl
+# Adapted for ATOM: the vLLM original took these from `vllm.triton_utils`,
+# which couples to vLLM internals. ATOM imports triton directly everywhere else.
+import triton
+import triton.language as tl
 
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
@@ -524,7 +523,7 @@ def minimax_m3_sparse_attn(
     output: torch.Tensor,  # [total_q, num_heads, head_dim]
 ) -> None:
     """GQA block-sparse attention over the selected blocks. block_size_q == 1."""
-    total_q, num_heads, head_dim = q.shape
+    _total_q, num_heads, head_dim = q.shape
     batch = cu_seqlens_q.shape[0] - 1
     topk = topk_idx.shape[-1]
     gqa_group_size = num_heads // num_kv_heads
@@ -1163,8 +1162,9 @@ def minimax_m3_sparse_attn_decode_asm(
     Requires per-rank num_kv_heads == 1 (the indexer top-k is per-kv-head; one
     shared block_table cannot express per-kv-head selection) and head_dim == 128.
     """
-    from atom.model_ops.base_attention import run_pa_decode_gluon
     from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
+
+    from atom.model_ops.base_attention import run_pa_decode_gluon
 
     assert q.shape[-1] == 128, "Gluon paged-attention requires head_dim == 128."
 
@@ -1278,8 +1278,9 @@ def _run_prefill_fp8_gluon(
     ``num_seqs == total_q``. This avoids the pa_fwd_asm maskless-fp8 NaN bug at
     the 256-token boundary (see caller).
     """
-    from atom.model_ops.base_attention import run_pa_decode_gluon
     from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
+
+    from atom.model_ops.base_attention import run_pa_decode_gluon
 
     # Collapse (token, kv_head) -> row so gluon runs num_kv_heads_view == 1, mirroring
     # minimax_m3_sparse_attn_decode_asm. sparse_bt/ctx are already [T*Hkv, ...] with

@@ -1,18 +1,25 @@
 # SPDX-License-Identifier: MIT
 """MiniMax-M3 lightning-indexer selection.
 
-Split in two on purpose. The launch policies are plain Python, so CI runs them
-on a box with no GPU and no aiter; the kernels need both, so they sit behind a
-skip and only run where there is a device. Anything asserted about a kernel is
-asserted against the op's definition rather than against another kernel -- a
-comparison can only catch a defect the two implementations do not share, and
-the second implementation was removed once it lost.
+Split in two: the launch policies are plain Python and run wherever triton is
+installed, the kernels also need a device and sit behind `gpu` below. Anything
+asserted about a kernel is asserted against the op's definition rather than
+against another kernel -- a comparison can only catch a defect the two
+implementations do not share, and the second implementation was removed once
+it lost.
+
+The whole file needs triton, because the module under test defines
+`@triton.jit` kernels and a decorator runs at import. CI has no triton, so
+nothing here runs there; a skip rather than a collection error, which would
+abort the run for every other test as well.
 """
 
 from __future__ import annotations
 
 import pytest
 import torch
+
+pytest.importorskip("triton", reason="index_topk defines @triton.jit kernels")
 
 from atom.model_ops.minimax_m3.index_topk import (
     DECODE_SCORE_MAX_CHUNKS,

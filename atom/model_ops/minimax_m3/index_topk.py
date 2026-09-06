@@ -22,11 +22,10 @@ import functools
 
 import torch
 
-try:
-    from vllm.triton_utils import tl, triton
-except ModuleNotFoundError:
-    import triton
-    import triton.language as tl
+# Adapted for ATOM: the vLLM original took these from `vllm.triton_utils`,
+# which couples to vLLM internals. ATOM imports triton directly everywhere else.
+import triton
+import triton.language as tl
 
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
