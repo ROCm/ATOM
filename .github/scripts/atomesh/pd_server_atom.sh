@@ -531,12 +531,38 @@ terminate_process_group() {
   wait "${pid}" 2>/dev/null || true
 }
 
+# LMCache's NVMe tier lives on a host bind mount, so unlike the container's own
+# /tmp it survives `docker run --rm`. Every concurrency runs as its own job, and
+# a tier left behind would both serve the previous job's KV and hold its
+# LMCACHE_MAX_LOCAL_DISK_SIZE of disk per rank. Start empty, leave nothing.
+lmcache_disk_dir=""
+
+reset_lmcache_disk() {
+  local dir="${LMCACHE_LOCAL_DISK:-}"
+  [[ -n "${dir}" && "${dir}" != "/" ]] || return 0
+  # Several prefill workers can share this shell, so only the first one empties
+  # the tier; a later one would delete a running worker's cache underneath it.
+  [[ "${lmcache_disk_dir}" != "${dir}" ]] || return 0
+  lmcache_disk_dir="${dir}"
+  rm -rf -- "${dir}"
+  mkdir -p -- "${dir}"
+  echo "[lmcache] NVMe tier ${dir} reset (${LMCACHE_MAX_LOCAL_DISK_SIZE:-0}GiB per rank)"
+}
+
+purge_lmcache_disk() {
+  [[ -n "${lmcache_disk_dir}" ]] || return 0
+  rm -rf -- "${lmcache_disk_dir}"
+  echo "[lmcache] NVMe tier ${lmcache_disk_dir} removed"
+  lmcache_disk_dir=""
+}
+
 cleanup_processes() {
   local rc=$?
   local pid
   for pid in "$@"; do
     terminate_process_group "${pid}"
   done
+  purge_lmcache_disk
   return "${rc}"
 }
 
@@ -572,6 +598,7 @@ start_prefill() {
   local dp_master_port="${4:-${PREFILL_DP_MASTER_PORT}}"
   local dp_base_port="${5:-${PREFILL_DP_BASE_PORT}}"
   apply_role_env "ATOMESH_PREFILL_ENV_" "${host_ip}"
+  reset_lmcache_disk
   local -a prefill_cache_env=()
   build_server_cache_env "prefill" "${server_port}" prefill_cache_env
   local -a prefill_dp_env=()
