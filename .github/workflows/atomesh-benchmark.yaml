@@ -524,10 +524,15 @@ jobs:
           container="atomesh-rdma-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${job_id}-${rank}-$$"
           rank_host="$(hostname)"
           cleanup() {
-            if docker container inspect "${container}" >/dev/null 2>&1; then
-              docker rm -f "${container}" || {
-                echo "WARNING: failed to remove RDMA smoke container ${container}" >&2
-              }
+            echo "=== Removing RDMA smoke container ${container} ==="
+            # Do not wait on D-state RDMA leftovers: kill/rm with a bound so
+            # the Slurm task can exit instead of sitting in COMPLETING.
+            if command -v timeout >/dev/null 2>&1; then
+              timeout 20 docker kill "${container}" >/dev/null 2>&1 || true
+              timeout 20 docker rm -f "${container}" >/dev/null 2>&1 || true
+            else
+              docker kill "${container}" >/dev/null 2>&1 || true
+              docker rm -f "${container}" >/dev/null 2>&1 || true
             fi
           }
           on_error() {
@@ -561,7 +566,7 @@ jobs:
           docker pull "${RDMA_SMOKE_IMAGE}"
           echo "=== RDMA smoke image pull complete on rank ${rank} ==="
           docker_args=(
-            run --rm -i --name "${container}"
+            run -i --name "${container}"
             --network host --ipc host
             --privileged
             --device=/dev/kfd
@@ -749,6 +754,7 @@ jobs:
 
           cleanup_processes() {
             stop_target_process
+            pkill -KILL -f 'transfer_engine_validator' 2>/dev/null || true
           }
           trap cleanup_processes EXIT HUP INT TERM
 
@@ -1171,10 +1177,13 @@ jobs:
           if [[ "${SMOKE_RANK}" -eq 0 ]]; then
             echo "Mooncake cross-node GPUDirect RDMA passed for same-index GPU pairs 0-7 and all cross-rail pairs i < j"
           fi
+          cleanup_processes
+          log_progress "rank ${SMOKE_RANK} container script complete"
           CONTAINER_SCRIPT
           docker_rc=$?
           set -e
           echo "=== RDMA smoke container finished on rank ${rank}: rc=${docker_rc} ==="
+          cleanup
           exit "${docker_rc}"
           RANK_SCRIPT
           chmod +x "${rank_script}"
