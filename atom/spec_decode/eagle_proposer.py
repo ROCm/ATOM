@@ -15,8 +15,8 @@ from atom.distributed.pcp_utils import (
     pcp_round_robin_split,
 )
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
+from atom.spec_decode.draft_kv import draft_kv_builder
 from atom.spec_decode.drafter import Drafter
-from atom.spec_decode.eagle3_kv_builder import Eagle3DraftBuilder
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
@@ -223,16 +223,14 @@ class EagleProposer(Drafter):
                 draft_atom_config,
                 layer_offset=self.config.hf_config.num_hidden_layers,
             )
-            # MHA draft (e.g. K2.5 LlamaForCausalLMEagle3): owns an independent
-            # non-MLA KV cache via Eagle3DraftBuilder, attached to the runner.
-            # MLA draft (e.g. K2.6 EAGLE 3.1): same MLA shape as target, so
-            # it piggybacks on the target's MLA pool (model_runner accounts
-            # for the +1 draft layer via num_nextn_predict_layers default).
-            draft_is_mla = bool(getattr(draft_model_hf_config, "kv_lora_rank", None))
-            if not draft_is_mla:
-                self.runner.eagle3_draft_builder = Eagle3DraftBuilder(
-                    self.runner, draft_model_hf_config
-                )
+            # Whether this draft needs a KV pool of its own is a property of
+            # the draft's config, answered by the backend that config resolves
+            # to. A draft whose rows are the target's latent (K2.6 EAGLE 3.1)
+            # binds into the target's pool and gets None here; model_runner
+            # accounts for its +1 layer via num_nextn_predict_layers.
+            builder = draft_kv_builder(self.runner, draft_model_hf_config)
+            if builder is not None:
+                self.runner.draft_kv_builder = builder
             return model
 
         return model_class(self.config)
@@ -555,7 +553,7 @@ class EagleProposer(Drafter):
             draft_token_ids.fill_(-1)
         var = self.runner.forward_vars
         # Eaale3 only support mha currently
-        draft_uses_mha = hasattr(self.runner, "eagle3_draft_builder")
+        draft_uses_mha = hasattr(self.runner, "draft_kv_builder")
 
         # Eagle3 MHA reuses target metadata, but the target may be MLA.  Keep
         # write slots sized to this draft pass, and when prefix cache is active

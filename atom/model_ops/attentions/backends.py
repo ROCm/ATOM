@@ -86,6 +86,16 @@ class AttentionBackend(ABC):
     def get_impl_cls() -> type["AttentionImpl"]:
         return AttentionImpl
 
+    @staticmethod
+    def make_kv_pool(hf_config, *, world_size: int, block_size: int, kv_dtype):
+        """A pool holding every layer this config declares, or None.
+
+        Asked of a *draft* model's backend — the target's layers are its
+        builder's own business. None means a draft of this flavor needs no
+        pool because its rows are the target's, which is why it is the
+        default: an MLA draft's latent is the target's latent.
+        """
+
 
 class AttentionMetadataBuilder(ABC, Generic[T]):
     """Abstract class for attention metadata builders."""
@@ -311,6 +321,16 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         Returns empty dict for builders that do not own the main KV pool.
         """
         return {}
+
+    def adopt_imported_kv_pool(self) -> None:
+        """Re-derive whatever this builder holds over the runner's KV pool.
+
+        The decode side of a P/D pair receives the pool as an IPC handle, so
+        `allocate_kv_cache_tensors` never runs there and anything it would have
+        built has to be rebuilt over the imported buffers before
+        `build_kv_cache_tensor` can bind to them. Same declaration, other
+        backing store. A builder that holds nothing has nothing to do.
+        """
 
     def build_kv_cache_tensor(self, layer_id: int, module):
         """Build the vLLM-style `KVCacheTensor` registration entry for one

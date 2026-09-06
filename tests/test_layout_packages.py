@@ -29,22 +29,39 @@ MEMBERS = sorted(
 )
 
 
-def imported_roots(path: pathlib.Path) -> set[str]:
-    """Every top-level package this file imports, nested ones included.
+def imported_modules(path: pathlib.Path, package: str | None = None) -> set[str]:
+    """Every module this file imports, by dotted name, nested ones included.
 
     `ast.walk` rather than a scan of the module body: a deferred import inside
     a function costs a plain runner nothing at import time but everything at
     call time, and the rule is about what the module can reach, not when.
+
+    `package` is this file's own package, needed only to resolve relative
+    imports; without it they resolve to `atom`, which is all the rule below
+    needs and is the answer a relative import cannot escape anyway.
     """
-    roots: set[str] = set()
+    modules: set[str] = set()
     for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
         if isinstance(node, ast.Import):
-            roots.update(a.name.split(".")[0] for a in node.names)
+            modules.update(a.name for a in node.names)
         elif isinstance(node, ast.ImportFrom) and node.level:
-            roots.add("atom")  # a relative import cannot leave the package
+            if package is None:
+                modules.add("atom")  # a relative import cannot leave the tree
+            else:
+                parent = (
+                    package.rsplit(".", node.level - 1)[0]
+                    if node.level > 1
+                    else package
+                )
+                modules.add(f"{parent}.{node.module}" if node.module else parent)
         elif isinstance(node, ast.ImportFrom) and node.module:
-            roots.add(node.module.split(".")[0])
-    return roots
+            modules.add(node.module)
+    return modules
+
+
+def imported_roots(path: pathlib.Path) -> set[str]:
+    """The top-level package of each of `imported_modules`."""
+    return {m.split(".")[0] for m in imported_modules(path)}
 
 
 def test_both_packages_are_populated():

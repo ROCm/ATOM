@@ -273,21 +273,16 @@ class DSparkProposer(Drafter):
             draft_atom_config,
             layer_offset=self.config.hf_config.num_hidden_layers,
         )
-        # An MLA draft stores the same 576-wide latent (kv_lora_rank 512 +
-        # qk_rope_head_dim 64) as an MLA target's own layers, so it binds into
-        # the TARGET's pool as extra rows -- the target builder already sizes
-        # and addresses them (see `_num_cache_rows` / `build_kv_cache_tensor`),
-        # and the draft inherits `--kv_cache_dtype` for free that way.
-        #
-        # An MHA draft has no such row to borrow and needs the sibling pool.
-        # Same fork, same spelling as EagleProposer.
-        draft_is_mla = bool(getattr(draft_hf, "kv_lora_rank", None))
-        if not draft_is_mla:
-            from atom.spec_decode.eagle3_kv_builder import Eagle3DraftBuilder
+        from atom.spec_decode.draft_kv import draft_kv_builder
 
-            # ModelRunner keys its draft-pool allocation and per-module binding
-            # off the presence of this attribute.
-            self.runner.eagle3_draft_builder = Eagle3DraftBuilder(self.runner, draft_hf)
+        # Whether this draft needs a pool of its own is answered by the backend
+        # its own config resolves to -- a draft whose rows are the target's
+        # latent binds into the target's pool and answers None. ModelRunner
+        # keys its draft-pool allocation and per-module binding off the
+        # presence of this attribute, so None simply never sets it.
+        builder = draft_kv_builder(self.runner, draft_hf)
+        if builder is not None:
+            self.runner.draft_kv_builder = builder
         return model
 
     @property

@@ -430,3 +430,92 @@ class EntryMajorArena:
     def field_offset(self, name: str) -> int:
         """Byte offset of a field from the start of an entry."""
         return self._offsets[name]
+
+
+class LayerMajorArena:
+    """The same fields with the layer axis outermost instead of the entry axis.
+
+    A field's whole region comes first with the layer axis inside it, so field
+    `f` begins at `field_extents`' offset for it *times* `entries` — the same
+    walk, scaled by the axis that moved outside.
+
+    This is the shape a paged KV pool already has: `[layers, blocks, ...]` per
+    tensor, one layer's slice contiguous, which several attention kernels
+    assume. The cost is that an *entry* is not contiguous — one block's k, v
+    and scales sit `entries` apart — so there is no `entry(i)` here and nothing
+    can copy or register a block as a unit. That absence is why this is not
+    `EntryMajorArena`, and it is the deletion condition: turn the pool
+    block-major and that class serves both, `entry(i)` included.
+
+    Unlike `EntryMajorArena` it fills only the allocation it owns; a `buf`
+    handed in may already hold KV, and an IPC-imported one does. Handing one in
+    also checks the declaration against it: too few bytes, or padding the
+    allocation does not have, is refused rather than addressed past.
+    """
+
+    def __init__(
+        self,
+        fields: list[EntryField],
+        entries: int,
+        device,
+        buf: torch.Tensor | None = None,
+    ):
+        if not fields:
+            raise ValueError("a layer-major arena needs at least one field")
+        names = [f.name for f in fields]
+        if len(set(names)) != len(names):
+            raise ValueError(f"duplicate field names: {names}")
+
+        self.fields = list(fields)
+        self.entries = entries
+        self.entry_bytes = entry_bytes_for(fields)
+        self._align = max([_ALIGN] + [f.align for f in self.fields])
+        self._offsets = {f.name: start for f, start, _ in field_extents(self.fields)}
+        self._by_name = {f.name: f for f in self.fields}
+
+        want = self.entry_bytes * entries
+        if buf is None:
+            self.buf = torch.zeros(want, dtype=torch.uint8, device=device)
+            for field in self.fields:
+                self.view(field.name).fill_(field.fill)
+        else:
+            if buf.dtype is not torch.uint8 or buf.numel() < want:
+                raise ValueError(
+                    f"buf must hold at least {want} uint8 elements, got "
+                    f"{buf.numel()} {buf.dtype}"
+                )
+            if not buf.is_contiguous():
+                raise ValueError("buf must be contiguous")
+            if buf.storage_offset() % self._align:
+                raise ValueError(
+                    f"buf must start on a {self._align}B boundary, got storage "
+                    f"offset {buf.storage_offset()}: field views retype the "
+                    "buffer, which needs the offset to divide every itemsize"
+                )
+            self.buf = buf
+
+    @property
+    def total_bytes(self) -> int:
+        """Bytes the whole arena spans."""
+        return self.entry_bytes * self.entries
+
+    def view(self, name: str) -> torch.Tensor:
+        """`[layers, entries, *shape]` — the same signature `EntryMajorArena`
+        gives, and contiguous per layer, which is what the paged path binds."""
+        field = self._by_name[name]
+        itemsize = field.dtype.itemsize
+        # `as_strided`'s storage_offset is ABSOLUTE, so `typed`'s own offset has
+        # to be added -- omit it and a carved arena addresses from the front of
+        # the host allocation and writes through whatever precedes it.
+        typed = self.buf.view(field.dtype)
+        inner: tuple[int, ...] = ()
+        acc = 1
+        for dim in reversed(field.shape):
+            inner = (acc,) + inner
+            acc *= dim
+        return typed.as_strided(
+            (field.layers, self.entries) + field.shape,
+            (self.entries * field.per_layer_numel, field.per_layer_numel) + inner,
+            typed.storage_offset()
+            + self._offsets[field.name] * self.entries // itemsize,
+        )

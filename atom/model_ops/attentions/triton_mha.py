@@ -5,13 +5,13 @@ import logging
 
 import torch
 
-from atom.config import KVCacheTensor
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl
 from atom.utils import envs
 
 from .aiter_attention import AiterAttentionMetadataBuilder
 from .backends import AttentionBackend
+from .mha_kv_pool import MhaKvPool
 
 logger = logging.getLogger("atom")
 
@@ -28,6 +28,17 @@ class TritonMHABackend(AttentionBackend):
     @staticmethod
     def get_impl_cls():
         return PagedAttentionImpl
+
+    @staticmethod
+    def make_kv_pool(hf_config, *, world_size: int, block_size: int, kv_dtype):
+        # Same pool as `AiterBackend`: the two read one cache at one layout,
+        # and differ only in which kernel reads it.
+        return MhaKvPool.from_hf_config(
+            hf_config,
+            world_size=world_size,
+            block_size=block_size,
+            kv_dtype=kv_dtype,
+        )
 
 
 class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):
@@ -78,6 +89,12 @@ class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):
         return attn_metadata, positions
 
     def build_kv_cache_tensor(self, layer_id: int, module):
+        """The parent's bind, plus the one thing that differs: the layout flag.
+
+        Both backends read one pool at one layout, so there is nothing to say
+        about shapes here — this used to say it again, and was one of the four
+        copies that let a V view drift.
+        """
         if not (
             hasattr(module, "base_attention")
             and hasattr(module, "use_mla")
@@ -85,11 +102,10 @@ class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):
         ):
             return None
 
-        runner = self.model_runner
-        config = runner.config
-        hf_config = config.hf_config
-
-        if runner.is_mimo_v2():
+        # Ahead of the parent call, and so duplicating its guard: both refusals
+        # below are about *this* module, and a model's non-attention modules
+        # must not trip them.
+        if self.model_runner.is_mimo_v2():
             raise NotImplementedError(
                 "TritonMHABackend does not support MiMo-V2 (per-layer alloc path)"
             )
@@ -105,50 +121,9 @@ class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):
                 "cache path; use AiterBackend for this model."
             )
 
-        if runner.is_qwen_next():
-            mtp_start = runner.mtp_start_layer_idx
-            if layer_id < mtp_start:
-                attn_idx = layer_id // runner.full_attention_interval
-            else:
-                attn_idx = runner.num_full_attn + (layer_id - mtp_start)
-        else:
-            attn_idx = layer_id
-
-        # 5D SHUFFLE (pre-shuffled) layout, consumed by
-        # unified_attention(shuffled_kv_cache=True) for prefill+decode:
-        #   K [num_blocks, num_kv_heads, head_dim // x, block_size, x]
-        #   V [num_blocks, num_kv_heads, block_size // x, head_dim, x]
-        x = 16 // runner.kv_cache.element_size()
-        k_cache = runner.kv_cache[0, attn_idx].view(
-            runner.num_physical_kvcache_blocks,
-            runner.num_kv_heads,
-            hf_config.head_dim // x,
-            runner.physical_block_size,
-            x,
-        )
-        v_cache = runner.kv_cache[1, attn_idx].view(
-            runner.num_physical_kvcache_blocks,
-            runner.num_kv_heads,
-            runner.physical_block_size // x,
-            hf_config.head_dim,
-            x,
-        )
-        if config.kv_cache_dtype == "fp8":
-            module.k_scale = runner.kv_scale[0, attn_idx]
-            module.v_scale = runner.kv_scale[1, attn_idx]
-
-        module.max_model_len = config.max_model_len
-        module.k_cache = k_cache
-        module.v_cache = v_cache
-        if impl is not None:
-            # KV cache is no longer in flash (4D) layout; unified_attention is
+        bound = super().build_kv_cache_tensor(layer_id, module)
+        if bound is not None and impl is not None:
+            # KV cache is not in flash (4D) layout; unified_attention is
             # selected via ATOM_USE_UNIFIED_ATTN, and reads the SHUFFLE layout.
             impl.use_flash_layout = False
-
-        return KVCacheTensor(
-            layer_num=layer_id,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            k_scale=module.k_scale,
-            v_scale=module.v_scale,
-        )
+        return bound

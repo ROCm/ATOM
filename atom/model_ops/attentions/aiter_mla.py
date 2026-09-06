@@ -247,10 +247,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         """Return draft layers in the target MLA pool across all PP stages."""
         runner = self.model_runner
         spec_config = getattr(runner.config, "speculative_config", None)
-        # Eagle3 draft layers are owned by eagle3_draft_builder and use a
-        # separate KV pool. Only MTP-style draft layers share the target MLA
-        # pool and therefore belong in this pool's global KV/index-cache layout.
-        if spec_config is None or hasattr(runner, "eagle3_draft_builder"):
+        # A draft with a pool of its own is owned by `draft_kv_builder`. Only
+        # draft layers that share the target MLA pool belong in this pool's
+        # global KV/index-cache layout.
+        if spec_config is None or hasattr(runner, "draft_kv_builder"):
             return 0
         draft_hf_config = spec_config.draft_model_hf_config
         # Mirror ModelRunner._get_total_num_layers(), which is authoritative for

@@ -1398,73 +1398,39 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     # `update_context_lens` / `positions_out` into a signature that has neither.
     fuse_mtp_decode_position_update = False
 
+    def _kv_pool_layers(self) -> int:
+        """Only the full-attention layers, plus any draft layers.
+
+        A linear-attention layer stores no paged KV — it keeps per-request
+        state in the mamba pool — so the paged axis is shorter than the model,
+        and `build_kv_cache_tensor`'s `attn_idx` is what maps onto it. This is
+        the expression sizing has always used; allocation now shares it rather
+        than taking the runner's separate draft-layer count.
+        """
+        runner = self.model_runner
+        num_draft = (
+            runner._get_total_num_layers() - runner.config.hf_config.num_hidden_layers
+        )
+        return runner.num_full_attn + num_draft
+
     def sub_pool_specs(self) -> list[SubPoolSpec]:
         """GDN hybrid: a paged KV pool holding ONLY the full-attention layer
         slots, plus the per-request state pool for the linear-attention
         layers (`GDNStateMixin.state_spec`).
         """
-        from aiter import dtypes
-
-        runner = self.model_runner
-        config = runner.config
-        hf_config = config.hf_config
-        num_kv_heads = runner._get_num_kv_heads()
-        total = runner._get_total_num_layers()
-        num_draft = total - hf_config.num_hidden_layers
-        n_full = runner.num_full_attn + num_draft
-        kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
-
-        # kv_cache: [2, n_full, blocks, block_size, num_kv_heads, head_dim]
-        block_bytes = (
-            2
-            * n_full
-            * runner.physical_block_size
-            * num_kv_heads
-            * hf_config.head_dim
-            * kv_dtype_size
-        )
-        # kv_scale: [2, n_full, blocks, num_kv_heads, block_size] fp32
-        block_bytes += 2 * n_full * num_kv_heads * runner.physical_block_size * 4
-        return [page_pool(block_bytes), self.state_spec()]
+        pool = self._declare_kv_pool(self.model_runner._get_num_kv_heads())
+        return [page_pool(pool.entry_bytes), self.state_spec()]
 
     def allocate_kv_cache_tensors(
         self, num_kv_heads: int, num_draft_layers: int
     ) -> dict:
-        """GDN hybrid: KV cache only covers full-attention layer slots
-        (linear-attention layers don't store paged KV; they use the
-        per-request mamba_k/v_cache pool allocated separately).
-
-        Layout: `[2, num_full_attn + num_draft_layers, ...]` — note this
-        differs from AiterAttentionMetadataBuilder's `num_hidden_layers`
-        first dim. The slot index math is in build_kv_cache_tensor's
-        attn_idx computation (skips linear-attn slots).
-        """
-        from aiter import dtypes
-
+        """Same pool as the MHA parent's, over the shorter layer axis."""
         runner = self.model_runner
-        config = runner.config
-        hf_config = config.hf_config
-        n_full = runner.num_full_attn + num_draft_layers
+        self.kv_pool = self._declare_kv_pool(num_kv_heads)
+        self.kv_pool.allocate(runner.num_physical_kvcache_blocks, runner.device)
         return {
-            "kv_cache": torch.zeros(
-                2,
-                n_full,
-                runner.num_physical_kvcache_blocks,
-                runner.physical_block_size,
-                num_kv_heads,
-                hf_config.head_dim,
-                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
-                device="cuda",
-            ),
-            "kv_scale": torch.zeros(
-                2,
-                n_full,
-                runner.num_physical_kvcache_blocks,
-                num_kv_heads,
-                runner.physical_block_size,
-                dtype=dtypes.fp32,
-                device="cuda",
-            ),
+            "kv_cache": self.kv_pool.cache.buf,
+            "kv_scale": self.kv_pool.scale.buf,
         }
 
     def build_kv_cache_tensor(self, layer_id: int, module):

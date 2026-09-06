@@ -1497,7 +1497,7 @@ class ModelRunner:
         spec_config = self.config.speculative_config
         draft_hf = spec_config.draft_model_hf_config
         has_real_stack = (
-            hasattr(self, "eagle3_draft_builder")
+            hasattr(self, "draft_kv_builder")
             or getattr(spec_config, "use_dspark_with_draft", lambda: False)()
         )
         if has_real_stack:
@@ -1507,10 +1507,9 @@ class ModelRunner:
     def _get_total_num_layers(self):
         """Return total layer count including draft (MTP) layers.
 
-        Drafts that own an independent KV cache via their own builder
-        (e.g. Eagle3 MHA draft on an MLA target) account for their layers
-        through that builder, so they are NOT added here. Only drafts that
-        share the target's KV pool contribute.
+        A draft that owns an independent KV pool accounts for its layers
+        through `draft_kv_builder`, so they are NOT added here. Only drafts
+        that share the target's KV pool contribute.
         """
         num_hidden = self.config.hf_config.num_hidden_layers
         pp_group = get_pp_group()
@@ -1524,7 +1523,7 @@ class ModelRunner:
         if (
             self.config.speculative_config
             and hasattr(self, "drafter")
-            and not hasattr(self, "eagle3_draft_builder")
+            and not hasattr(self, "draft_kv_builder")
         ):
             total += self._num_draft_kv_layers()
         return total
@@ -1532,17 +1531,16 @@ class ModelRunner:
     def _sub_pool_specs(self) -> list[SubPoolSpec]:
         """Cache-class declarations from every builder attached to this runner.
 
-        The target builder always, plus an optional `eagle3_draft_builder`
-        when a heterogeneous spec-decode draft owns its own KV. Each builder
-        knows its own tensor layout (MLA 576-dim packed, GDN-hybrid
-        full-attn-only, MiMo-V2 per-layer-type, standard MHA split-K/V,
-        Eagle3 independent MHA); the runner only sums bytes. Specs sharing a
-        name merge in `plan_pools`, which is how the draft KV joins the
-        target's block ids instead of forming a second pool.
+        The target builder always, plus an optional `draft_kv_builder` when a
+        spec-decode draft owns its own KV. Each builder knows its own tensor
+        layout (MLA 576-dim packed, GDN-hybrid full-attn-only, MiMo-V2
+        per-layer-type, standard MHA split-K/V); the runner only sums bytes.
+        Specs sharing a name merge in `plan_pools`, which is how the draft KV
+        joins the target's block ids instead of forming a second pool.
         """
         specs = list(self.attn_metadata_builder.sub_pool_specs())
-        if hasattr(self, "eagle3_draft_builder"):
-            specs += self.eagle3_draft_builder.sub_pool_specs()
+        if hasattr(self, "draft_kv_builder"):
+            specs += self.draft_kv_builder.sub_pool_specs()
         return specs
 
     def _has_state_pool(self) -> bool:
@@ -1901,7 +1899,7 @@ class ModelRunner:
         total_num_layers = self._get_total_num_layers()
         num_draft_layers = 0
         if self.config.speculative_config and hasattr(self, "drafter"):
-            owns_pool = hasattr(self, "eagle3_draft_builder")
+            owns_pool = hasattr(self, "draft_kv_builder")
             num_draft_layers = self._num_draft_kv_layers()
             logger.info(
                 f"Allocating KV cache for {hf_config.num_hidden_layers} target "
@@ -1927,11 +1925,11 @@ class ModelRunner:
         for name, value in main_kv.items():
             setattr(self, name, value)
 
-        # Heterogeneous draft (e.g. Eagle3 MHA alongside an MLA target) owns
-        # its own KV pool through a sibling builder; same protocol as above,
-        # tensors land under namespaced keys (eagle3_kv_cache, eagle3_kv_scale).
-        if hasattr(self, "eagle3_draft_builder"):
-            draft_kv = self.eagle3_draft_builder.allocate_kv_cache_tensors(
+        # A draft that cannot share the target's pool owns one through a
+        # sibling builder; same protocol as above, and it keeps the pool
+        # itself, so the dict it returns is normally empty.
+        if hasattr(self, "draft_kv_builder"):
+            draft_kv = self.draft_kv_builder.allocate_kv_cache_tensors(
                 num_kv_heads, num_draft_layers
             )
             for name, value in draft_kv.items():
@@ -1991,11 +1989,11 @@ class ModelRunner:
             )
 
             for module in model.modules():
-                # Drafts that own an independent KV pool (Eagle3) bind through
-                # their sibling builder first; for unrecognized modules it
-                # returns None and we fall through to the target builder.
-                if model_name == "draft" and hasattr(self, "eagle3_draft_builder"):
-                    kv_cache_tensor = self.eagle3_draft_builder.build_kv_cache_tensor(
+                # A draft that owns an independent KV pool binds through its
+                # sibling builder first; for unrecognized modules it returns
+                # None and we fall through to the target builder.
+                if model_name == "draft" and hasattr(self, "draft_kv_builder"):
+                    kv_cache_tensor = self.draft_kv_builder.build_kv_cache_tensor(
                         layer_id, module
                     )
                     if kv_cache_tensor is not None:
@@ -2032,8 +2030,8 @@ class ModelRunner:
             # `state_entry_views` to name the bytes it packs. This is the only
             # place the builder and the connector are both in scope.
             transfer_tensors.state_backend = self.attn_metadata_builder
-        if hasattr(self, "eagle3_draft_builder") and transfer_tensors is not None:
-            draft_regions = self.eagle3_draft_builder.get_kv_transfer_tensors()
+        if hasattr(self, "draft_kv_builder") and transfer_tensors is not None:
+            draft_regions = self.draft_kv_builder.get_kv_transfer_tensors()
             if draft_regions:
                 transfer_tensors.block_regions.extend(draft_regions)
         # The transfer protocol addresses scheduler blocks, whose IDs index
@@ -4457,17 +4455,16 @@ class RapidServeModelRunner(ModelRunner):
         return True
 
     def _bind_kv_cache_to_modules(self):
-        """Bind self.kv_cache (and self.kv_scale if present) to all attention
-        modules.  Called after replacing self.kv_cache with an IPC-imported
-        tensor (decode process), where the builder-based binding path in
-        allocate_kv_cache() is skipped."""
-        config = self.config
-        hf_config = config.hf_config
-        if hf_config.num_key_value_heads >= self.world_size:
-            num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        else:
-            num_kv_heads = 1
-        x = 16 // self.kv_cache.element_size()
+        """Bind an IPC-imported KV pool to every attention module.
+
+        The decode side of a P/D pair gets the pool as a handle, so it never
+        reaches `allocate_kv_cache`'s bind loop. What it must not do is bind it
+        a *second way*: this used to spell the views out again, with a 4-D V
+        where every builder declared 5-D. Nothing could catch that — the two
+        agree on every byte and differ only in what a reader branches on. So it
+        runs the same loop over the same hook.
+        """
+        self.attn_metadata_builder.adopt_imported_kv_pool()
 
         models_to_bind = [("target", self.model)]
         if self.config.speculative_config and hasattr(self, "drafter"):
@@ -4477,63 +4474,12 @@ class RapidServeModelRunner(ModelRunner):
         layer_id = 0
         for _model_name, model in models_to_bind:
             for module in model.modules():
-                if hasattr(module, "base_attention"):
-                    if hasattr(module, "use_mla") and not module.use_mla:
-                        if self.is_qwen_next():
-                            attn_idx = layer_id // self.full_attention_interval
-                        else:
-                            attn_idx = layer_id
-                        k_cache = self.kv_cache[0, attn_idx].view(
-                            self.num_physical_kvcache_blocks,
-                            num_kv_heads,
-                            hf_config.head_dim // x,
-                            self.physical_block_size,
-                            x,
-                        )
-                        v_cache = self.kv_cache[1, attn_idx].view(
-                            self.num_physical_kvcache_blocks,
-                            num_kv_heads,
-                            hf_config.head_dim,
-                            self.physical_block_size,
-                        )
-                        module.max_model_len = self.config.max_model_len
-                        if config.kv_cache_dtype == "fp8":
-                            module.k_scale = self.kv_scale[0, attn_idx]
-                            module.v_scale = self.kv_scale[1, attn_idx]
-                        from atom.config import KVCacheTensor
-
-                        kv_cache_tensors.append(
-                            KVCacheTensor(
-                                layer_num=layer_id,
-                                k_cache=k_cache,
-                                v_cache=v_cache,
-                                k_scale=module.k_scale,
-                                v_scale=module.v_scale,
-                            )
-                        )
-                        module.k_cache = k_cache
-                        module.v_cache = v_cache
-                        layer_id += 1
-                    elif hasattr(module, "use_mla") and module.use_mla:
-                        kv_cache = self.kv_cache[layer_id].view(
-                            self.num_physical_kvcache_blocks * self.physical_block_size,
-                            1,
-                            576,
-                        )
-                        module.max_model_len = self.config.max_model_len
-                        from atom.config import KVCacheTensor
-
-                        kv_cache_tensors.append(
-                            KVCacheTensor(
-                                layer_num=layer_id,
-                                k_cache=kv_cache,
-                                v_cache=None,
-                                k_scale=None,
-                                v_scale=None,
-                            )
-                        )
-                        module.kv_cache = kv_cache
-                        layer_id += 1
+                bound = self.attn_metadata_builder.build_kv_cache_tensor(
+                    layer_id, module
+                )
+                if bound is not None:
+                    kv_cache_tensors.append(bound)
+                    layer_id += 1
 
         from atom.utils.forward_context import set_kv_cache_data
 
