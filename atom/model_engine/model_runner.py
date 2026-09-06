@@ -1880,9 +1880,6 @@ class ModelRunner:
         config = self.config
         config.num_kvcache_blocks = num_kvcache_blocks
         hf_config = config.hf_config
-        self.num_physical_kvcache_blocks = (
-            num_kvcache_blocks * self.attn_metadata_builder.block_ratio
-        )
         if hf_config.num_key_value_heads >= self.world_size:
             assert hf_config.num_key_value_heads % self.world_size == 0
             num_kv_heads = hf_config.num_key_value_heads // self.world_size
@@ -1919,7 +1916,7 @@ class ModelRunner:
         # _kv_layer_cache_store) so binding code and downstream consumers
         # find them where they expect.
         main_kv = self.attn_metadata_builder.allocate_kv_cache_tensors(
-            num_kv_heads, num_draft_layers
+            num_kv_heads, num_draft_layers, blocks=num_kvcache_blocks
         )
         for name, value in main_kv.items():
             setattr(self, name, value)
@@ -1929,7 +1926,7 @@ class ModelRunner:
         # itself, so the dict it returns is normally empty.
         if hasattr(self, "draft_kv_builder"):
             draft_kv = self.draft_kv_builder.allocate_kv_cache_tensors(
-                num_kv_heads, num_draft_layers
+                num_kv_heads, num_draft_layers, blocks=num_kvcache_blocks
             )
             for name, value in draft_kv.items():
                 setattr(self, name, value)
@@ -2033,11 +2030,17 @@ class ModelRunner:
             draft_regions = self.draft_kv_builder.get_kv_transfer_tensors()
             if draft_regions:
                 transfer_tensors.block_regions.extend(draft_regions)
-        # The transfer protocol addresses scheduler blocks, whose IDs index
-        # ``req.block_ids``.  MLA's cache is allocated in page-size-1 physical
-        # rows, so ``num_physical_kvcache_blocks`` is larger by block_ratio and
-        # must not be used here: doing so would make the codec treat one token
-        # as a complete scheduler block.
+        if transfer_tensors is not None:
+            # After the draft's regions are in, and here because this is the
+            # only place holding both the complete region list and the
+            # scheduler's block count. The builders cannot answer this: each
+            # counts in its own page, and the transfer protocol addresses
+            # ``req.block_ids``, which are the scheduler's.
+            transfer_tensors.set_block_count(num_kvcache_blocks)
+        # The same count reaches the codecs, which likewise index by scheduler
+        # block: MLA's cache is allocated in page-size-1 rows, so its own count
+        # is block_ratio times larger and would make a codec treat one token as
+        # a complete scheduler block.
         set_kv_cache_data(
             kv_cache_data,
             config,
@@ -4432,9 +4435,9 @@ class RapidServeModelRunner(ModelRunner):
 
         from atom.model_engine.ipc_utils import import_kv_cache
 
-        self.num_physical_kvcache_blocks = (
-            num_kvcache_blocks * self.attn_metadata_builder.block_ratio
-        )
+        # The count travels with the handle and reaches the builder through
+        # `_bind_kv_cache_to_modules` -> `adopt_imported_kv_pool` below; this
+        # side never ran sizing, so there is nothing else it could come from.
         path = paths[self.rank]
         logger.info(
             f"ModelRunner rank {self.rank}: reading kvcache handles from {path}"

@@ -922,7 +922,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             raise RuntimeError(
                 "state checkpoint PAGE-unit geometry does not match this worker"
             )
-        num_blocks = self.model_runner.num_physical_kvcache_blocks
+        num_blocks = self.num_blocks
         if any(unit_id < 0 or unit_id >= num_blocks for unit_id in op.unit_ids):
             raise RuntimeError("state checkpoint PAGE unit is out of range")
 
@@ -1370,7 +1370,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         return [(runner.v4_csa_idx_kv, "dsv4.csa_indexer")]
 
     def allocate_kv_cache_tensors(
-        self, num_kv_heads: int, num_draft_layers: int
+        self, num_kv_heads: int, num_draft_layers: int, *, blocks: int
     ) -> dict[str, torch.Tensor]:
         """Allocate KV pools that depend only on `num_blocks`.
 
@@ -1386,9 +1386,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         index_row_bytes]` so each per-CSA slice `pool[pos]` is contiguous in
         storage; the kernel infers `block_size` from `kv_cache.shape[1]`.
         """
+        self.num_blocks = blocks * self.block_ratio
         runner = self.model_runner
         device = runner.device
-        num_blocks = runner.num_physical_kvcache_blocks
+        num_blocks = self.num_blocks
         n_csa = len(self.csa_layers)
         if self._indexer_fp4:
             # FP4 indexer cache: packed E2M1 data + e8m0 scale in the
@@ -1457,7 +1458,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             "bf16 pool); a genuine mismatch corrupts the unified layout."
         )
         device = self.model_runner.device
-        num_blocks = self.model_runner.num_physical_kvcache_blocks
+        num_blocks = self.num_blocks
         head_dim = self.head_dim
         dtype = self._swa_dtype
         rope_dtype = self._rope_dtype
@@ -1615,7 +1616,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         geo = self.pool_geometry
         base = geo.layer_base_row(layer_id)
         rows = geo.layer_class(layer_id).block_rows
-        num_blocks = self.model_runner.num_physical_kvcache_blocks
+        num_blocks = self.num_blocks
         envelopes = plane[: num_blocks * geo.envelope_rows]
         return envelopes.view(num_blocks, geo.envelope_rows, width)[
             :, base : base + rows
@@ -1888,7 +1889,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             block_regions.append(
                 KVTransferRegion(
                     plane.data_ptr(),
-                    runner.num_physical_kvcache_blocks * geo.block_bytes(row_bytes),
+                    self.num_blocks * geo.block_bytes(row_bytes),
                     geo.block_bytes(row_bytes),
                     semantic_role=role,
                 )
@@ -1978,7 +1979,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             block_regions=block_regions,
             swa_block_regions=swa_block_regions,
             slot_regions=slot_regions,
-            num_blocks=runner.num_physical_kvcache_blocks,
             num_slots=num_slots,
             expected_full_slot_region_count=len(planes),
             staging_region=staging_region,

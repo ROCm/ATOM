@@ -304,17 +304,24 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         return None
 
     def allocate_kv_cache_tensors(
-        self, num_kv_heads: int, num_draft_layers: int
+        self, num_kv_heads: int, num_draft_layers: int, *, blocks: int
     ) -> dict[str, Any]:
         """Allocate the model's primary paged KV cache tensors.
 
-        Called by ModelRunner.allocate_kv_cache() after num_physical_kvcache_blocks
-        is known. Builders own the per-attention-type tensor layout (single
-        576-dim MLA tensor vs split-K/V MHA tensor; full-rank vs hybrid-only-
-        full-attn-rows for Qwen3-Next; per-module deferred for MiMo-V2). The
-        runner only setattr's the returned dict onto itself, so model layers
-        can access tensors as `model_runner.<name>` (preserving existing
-        names: kv_cache, kv_scale, index_cache, etc.).
+        `blocks` is the scheduler block count every rank was told to build at,
+        the same argument `adopt_imported_kv_pool` takes. A parameter and not a
+        runner attribute because sizing runs per subprocess and the answers
+        differ: read the local estimate and one pool is built at one count
+        while something sized off another is built at a second -- a class of
+        bug no unit test reaches. Overrides record it as `self.num_blocks`,
+        converted to their own page.
+
+        Builders own the per-attention-type tensor layout (single 576-dim MLA
+        tensor vs split-K/V MHA tensor; full-rank vs hybrid-only-full-attn-rows
+        for Qwen3-Next; per-module deferred for MiMo-V2). The runner only
+        setattr's the returned dict onto itself, so model layers can access
+        tensors as `model_runner.<name>` (preserving existing names: kv_cache,
+        kv_scale, index_cache, etc.).
 
         Values may be Tensors, None (deferred allocation), or scalar metadata
         (e.g. aligned_index_dim) needed downstream by build_kv_cache_tensor.
@@ -367,6 +374,11 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         self.model_runner = model_runner
         assert model_runner.block_size % self.block_size == 0
         self.block_ratio = model_runner.block_size // self.block_size
+        # Blocks the pools were last built at, in this backend's own page --
+        # what its kernels index; 0 until something backs them. Held, not
+        # re-read off the runner: a rollout resume can re-allocate at a
+        # *smaller* count, and a view addresses what it was built at.
+        self.num_blocks = 0
         self.device = model_runner.device
         config = model_runner.config
         hf_config = config.hf_config

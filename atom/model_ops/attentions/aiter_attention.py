@@ -152,6 +152,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         self._has_sparse_attention = bool(sparse_cfg) and _is_minimax_m3_config(
             hf_config
         )
+        # Which indexer layer the next sparse module binds. Reset by whatever
+        # backs the pool, so a rollout re-allocation hands out the same slices
+        # in the same order.
+        self._next_index_layer = 0
         if self._has_sparse_attention and (
             sparse_block_size := sparse_cfg.get("sparse_block_size")
         ):
@@ -427,11 +431,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
           num_kv_heads, head_dim]` for kv_cache + matching kv_scale (fp32).
         - MiMo-V2-Flash: per-layer-type accounting (full vs SWA layers
           have different num_kv_heads).
+        - MiniMax-M3: plus the indexer key cache its sparse layers own,
+          which is a field of the same pool.
         """
         runner = self.model_runner
-        config = runner.config
-        hf_config = config.hf_config
-        text_config = getattr(hf_config, "text_config", hf_config)
+        hf_config = runner.config.hf_config
         num_kv_heads = runner._get_num_kv_heads()
         total_num_layers = runner._get_total_num_layers()
 
@@ -461,23 +465,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             ).entry_bytes
             return [page_pool(block_bytes)]
 
-        # Standard MHA path: the same declaration the allocation is built from.
+        # Standard MHA path: the same declaration the allocation is built from,
+        # indexer cache included.
         block_bytes = self._declare_kv_pool(
             num_kv_heads, layers=total_num_layers
         ).entry_bytes
-        sparse_cfg = getattr(text_config, "sparse_attention_config", None)
-        if sparse_cfg:
-            sparse_layers = sum(
-                1 for enabled in sparse_cfg.get("sparse_attention_freq", []) if enabled
-            )
-            index_dim = sparse_cfg["sparse_index_dim"]
-            index_cache_dtype = _resolve_index_cache_dtype(config)
-            block_bytes += (
-                sparse_layers
-                * self.block_size
-                * index_dim
-                * torch.empty((), dtype=index_cache_dtype).element_size()
-            )
         return [page_pool(block_bytes)]
 
     def _kv_pool_layers(self) -> int:
@@ -488,6 +480,28 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         or the arena refuses the buffer.
         """
         return self.model_runner._get_total_num_layers()
+
+    def _index_cache_decl(self) -> dict:
+        """Indexer-cache constructor arguments, empty when there is none.
+
+        Keyed off `_has_sparse_attention` -- the same answer the block size and
+        the metadata buffers use -- not a second reading of the config. MiMo-V2
+        declares two pools and sums them, so a second predicate would have to
+        be kept from double-charging; this one is false for it by construction.
+        """
+        if not self._has_sparse_attention:
+            return {}
+        runner = self.model_runner
+        hf_config = runner.config.hf_config
+        text_config = getattr(hf_config, "text_config", hf_config)
+        sparse_cfg = text_config.sparse_attention_config
+        return {
+            "index_layers": sum(
+                1 for enabled in sparse_cfg.get("sparse_attention_freq", []) if enabled
+            ),
+            "index_dim": sparse_cfg["sparse_index_dim"],
+            "index_dtype": _resolve_index_cache_dtype(runner.config),
+        }
 
     def _declare_kv_pool(
         self, num_kv_heads: int, layers: int | None = None
@@ -509,6 +523,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             num_kv_heads=num_kv_heads,
             head_dim=runner.config.hf_config.head_dim,
             kv_dtype=dtypes.d_dtypes[runner.config.kv_cache_dtype],
+            **self._index_cache_decl(),
         )
 
     def adopt_imported_kv_pool(self, blocks: int) -> None:
@@ -519,25 +534,41 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 "import; P/D would have to ship one handle per module."
             )
         self.kv_pool = self._declare_kv_pool(runner._get_num_kv_heads())
+        if self.kv_pool.index_fields:
+            # The export ships `kv_cache` and `kv_scale` and nothing else, so
+            # there is no imported buffer to read the indexer cache from. A
+            # fresh one would leave this side with zeroed indexer keys and a
+            # top-k that silently picks the wrong blocks.
+            raise NotImplementedError(
+                "P/D does not ship the sparse indexer cache, so a decode side "
+                "cannot rebuild it from the handle; the export has to carry it "
+                "before this model can be disaggregated."
+            )
         self.kv_pool.allocate(
             blocks,
             runner.device,
             cache_buf=runner.kv_cache,
             scale_buf=runner.kv_scale,
         )
+        self.num_blocks = blocks * self.block_ratio
 
     def allocate_kv_cache_tensors(
-        self, num_kv_heads: int, num_draft_layers: int
+        self, num_kv_heads: int, num_draft_layers: int, *, blocks: int
     ) -> dict:
         """Allocate this model's MHA pool.
 
         `kv_cache` and `kv_scale` stay on the runner as the flat buffers the
         arenas own -- what the P/D IPC export ships and the rollout sleep path
-        frees. Every shaped view of them comes from the pool.
+        frees by name. Every shaped view of them comes from the pool.
+
+        The indexer cache does not: nothing outside this builder reads it, and
+        neither list names it, so putting it back on the runner would only
+        re-create the reference that kept it alive across a rollout sleep. The
+        pool is its only owner, and `MhaKvPool.release` is what frees it.
         """
+        self.num_blocks = blocks * self.block_ratio
         runner = self.model_runner
-        config = runner.config
-        hf_config = config.hf_config
+        hf_config = runner.config.hf_config
         text_config = getattr(hf_config, "text_config", hf_config)
 
         if runner.is_mimo_v2():
@@ -550,37 +581,20 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             }
 
         self.kv_pool = self._declare_kv_pool(num_kv_heads)
-        # `config.num_kvcache_blocks`, not `pool_plan.paged_entries`: sizing
-        # runs in every runner subprocess and they disagree by a few blocks
-        # (each measures its own free memory), so EngineCore takes one answer
-        # and broadcasts it to `allocate_kv_cache`, which lands it here. The
-        # plan is this rank's own estimate; the argument is what every rank
-        # actually builds, and everything else sized off the block count --
-        # the sparse index cache below included -- follows the argument.
-        self.kv_pool.allocate(runner.config.num_kvcache_blocks, runner.device)
+        self.kv_pool.allocate(blocks, runner.device)
+        self._next_index_layer = 0
         tensors = {
             "kv_cache": self.kv_pool.cache.buf,
             "kv_scale": self.kv_pool.scale.buf,
         }
-        sparse_cfg = getattr(text_config, "sparse_attention_config", None)
-        if sparse_cfg:
-            sparse_layers = sum(
-                1 for enabled in sparse_cfg.get("sparse_attention_freq", []) if enabled
-            )
-            index_cache_dtype = _resolve_index_cache_dtype(config)
-            tensors["sparse_attention_index_cache"] = torch.zeros(
-                sparse_layers,
-                runner.num_physical_kvcache_blocks,
-                self.block_size,
-                sparse_cfg["sparse_index_dim"],
-                dtype=index_cache_dtype,
-                device="cuda",
-            )
-            tensors["_sparse_attention_cache_next"] = 0
-            if getattr(text_config, "use_index_cache", False) or getattr(
-                hf_config, "use_index_cache", False
-            ):
-                tensors["_sparse_attention_topk_cache_state"] = {}
+        # Not under the indexer cache: this is a per-run memo dict, keyed off
+        # `use_index_cache` alone. Its one reader is in the sparse branch of
+        # `build_kv_cache_tensor`, so gating it on the pool as well would only
+        # claim a dependency that is not there.
+        if getattr(text_config, "use_index_cache", False) or getattr(
+            hf_config, "use_index_cache", False
+        ):
+            tensors["_sparse_attention_topk_cache_state"] = {}
         return tensors
 
     def build_kv_cache_tensor(self, layer_id: int, module):
@@ -605,12 +619,16 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # v_scale and returns the KVCacheTensor). The standard binding is
             # page-128 SHUFFLE; SparseMHAPagedAttentionImpl.rope_cache re-views it
             # to page-16 SHUFFLE (zero-copy) at attention time. index_cache is a
-            # genuinely separate cache (not derivable from the KV cache), so the
-            # runner assigns each sparse layer its own slice here.
+            # genuinely separate field (not derivable from the K/V ones), so
+            # each sparse layer takes its own slice here, in bind order. The
+            # pool shapes that slice in scheduler blocks and the impl addresses
+            # it in this backend's pages; the reshape is where that is said.
             runner = self.model_runner
-            sparse_idx = runner._sparse_attention_cache_next
-            runner._sparse_attention_cache_next += 1
-            module.impl.index_cache = runner.sparse_attention_index_cache[sparse_idx]
+            index_view = self.kv_pool.index_view(self._next_index_layer)
+            self._next_index_layer += 1
+            module.impl.index_cache = index_view.view(
+                -1, self.block_size, self.kv_pool.index_dim
+            )
             module.impl.max_model_len = runner.config.max_model_len
             module.impl.index_topk_cache_state = getattr(
                 runner, "_sparse_attention_topk_cache_state", None
@@ -644,7 +662,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # its own per-block cost. Same declaration, kept alive by the views
             # it hands out.
             pool = self._declare_kv_pool(module.num_kv_heads, layers=1)
-            pool.allocate(runner.config.num_kvcache_blocks, runner.device)
+            # A pool entry is a scheduler block, so back out of this backend's
+            # page. `allocate_kv_cache_tensors` records the count before it
+            # defers to here, which is why it does so ahead of that return.
+            pool.allocate(self.num_blocks // self.block_ratio, runner.device)
             k_cache, v_cache = pool.kv_views(0)
             if fp8:
                 module.k_scale, module.v_scale = pool.scale_views(0)
@@ -728,19 +749,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 if v_scale is not None:
                     _add_region(v_scale)
         else:
+            # Every field of the pool, indexer cache included: a region per
+            # (field, layer), in declared order.
             for tensor in self.kv_pool.region_tensors():
                 _add_region(tensor)
-            # MiniMax-M3 sparse attention's per-token indexer-key cache
-            # (used for top-k block selection on the consumer).
-            index_cache = getattr(runner, "sparse_attention_index_cache", None)
-            if index_cache is not None:
-                for sparse_idx in range(index_cache.shape[0]):
-                    _add_region(index_cache[sparse_idx])
 
         return KVTransferTensors(
             block_regions=block_regions,
             slot_regions=[],
-            num_blocks=runner.num_physical_kvcache_blocks,
         )
 
     def prepare_mtp_decode(

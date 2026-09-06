@@ -98,9 +98,8 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         rank, world = pp_aware_rank_and_world(self._config, tp)
         self._rank = rank
 
-        # num_blocks is the physical block count (num_physical_kvcache_blocks),
-        # threaded from the model runner. MLA stores its KV token-major, so the
-        # codec can't infer the block count from tensor.shape[0]; pass it.
+        # Scheduler blocks, threaded from the model runner. MLA stores its KV
+        # token-major, so the codec cannot infer the count from shape[0].
         self._codec = DenseKVByteCodec(
             kv_caches,
             num_blocks=num_blocks,

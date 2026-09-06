@@ -55,6 +55,9 @@ class DraftKvBuilder:
         self.kv_pool = kv_pool
         self.block_size = kv_pool.block_size
         self._next_layer_id = 0  # consumed by build_kv_cache_tensor
+        # Same name and unit as a real builder's, since this one also answers
+        # the runner's allocate hook. No `block_ratio` factor: the assertion
+        # below holds the draft's page to the scheduler's.
         self.num_blocks = 0  # set in allocate_kv_cache_tensors
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
@@ -62,19 +65,28 @@ class DraftKvBuilder:
         contributions sum into one per-block cost instead of a second pool."""
         return [page_pool(self.kv_pool.entry_bytes)]
 
-    def allocate_kv_cache_tensors(self, num_kv_heads, num_draft_layers) -> dict:
+    def allocate_kv_cache_tensors(
+        self, num_kv_heads, num_draft_layers, *, blocks: int
+    ) -> dict:
         """Back the draft's pool. Nothing for the runner to setattr: the pool
-        is this builder's, and its hooks below are the only readers."""
+        is this builder's, and its hooks below are the only readers.
+
+        One entry per scheduler block, the count the target was built at --
+        that is what riding the target's block ids means, and what lets
+        `sub_pool_specs` add the draft's `entry_bytes` to the target's. The
+        assertion is the other half: a pool paging at anything else would be
+        charged per scheduler block and built per its own page.
+        """
         runner = self.model_runner
-        # Same total token capacity as the target pool, paged at the draft's
-        # own block size.
-        self.num_blocks = (
-            runner.config.num_kvcache_blocks * runner.block_size // self.block_size
+        assert self.block_size == runner.block_size, (
+            f"a draft pool has to page at the scheduler block to share its "
+            f"ids: pool {self.block_size} vs scheduler {runner.block_size}"
         )
-        self.kv_pool.allocate(self.num_blocks, runner.device)
+        self.num_blocks = blocks
+        self.kv_pool.allocate(blocks, runner.device)
         logger.info(
-            f"Allocated draft KV pool: {self.num_blocks} blocks, "
-            f"{self.num_blocks * self.kv_pool.entry_bytes} B"
+            f"Allocated draft KV pool: {blocks} blocks, "
+            f"{blocks * self.kv_pool.entry_bytes} B"
         )
         return {}
 

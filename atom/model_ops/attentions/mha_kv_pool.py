@@ -80,6 +80,12 @@ class MhaKvPool:
     Declared at construction, allocated later: sizing has to answer
     `entry_bytes` before a block count exists, and the block count is what the
     byte budget buys.
+
+    A sparse-attention model (MiniMax-M3) rides an indexer key cache in the
+    same block, owned by only some of the layers. It is a field like the rest,
+    so it is charged for and allocated by the same two lines -- which is the
+    point: the two used to be a formula in sizing and a `torch.zeros` in
+    allocation, reading *different* block-count attributes.
     """
 
     def __init__(
@@ -90,8 +96,12 @@ class MhaKvPool:
         num_kv_heads: int,
         head_dim: int,
         kv_dtype: torch.dtype,
+        index_layers: int = 0,
+        index_dim: int = 0,
+        index_dtype: torch.dtype | None = None,
     ):
         self.block_size = block_size
+        self.index_dim = index_dim
         self.cache_fields = mha_kv_fields(
             layers=layers,
             block_size=block_size,
@@ -102,13 +112,23 @@ class MhaKvPool:
         self.scale_fields = mha_kv_scale_fields(
             layers=layers, block_size=block_size, num_kv_heads=num_kv_heads
         )
+        # One indexer row per token of the *scheduler* block, which is the
+        # entry `page_pool` charges. Sizing it at the backend's page instead
+        # undercharged by `block_ratio`.
+        self.index_fields = (
+            [EntryField("index", index_layers, (block_size, index_dim), index_dtype)]
+            if index_layers
+            else []
+        )
         # A block pays for the scales whatever the cache dtype: they are a
         # second allocation, not a second configuration.
-        self.entry_bytes = entry_bytes_for(self.cache_fields) + entry_bytes_for(
-            self.scale_fields
+        self.entry_bytes = sum(
+            entry_bytes_for(fields)
+            for fields in (self.cache_fields, self.scale_fields, self.index_fields)
         )
         self.cache: LayerMajorArena | None = None
         self.scale: LayerMajorArena | None = None
+        self.index: LayerMajorArena | None = None
         self._views: dict[str, torch.Tensor] = {}
 
     @classmethod
@@ -135,7 +155,9 @@ class MhaKvPool:
             kv_dtype=kv_dtype,
         )
 
-    def allocate(self, blocks: int, device, cache_buf=None, scale_buf=None) -> None:
+    def allocate(
+        self, blocks: int, device, cache_buf=None, scale_buf=None, index_buf=None
+    ) -> None:
         """Back the declaration, with a fresh allocation or an imported one.
 
         One expression for both: the decode side of a P/D pair receives the
@@ -149,9 +171,15 @@ class MhaKvPool:
         """
         self.cache = LayerMajorArena(self.cache_fields, blocks, device, buf=cache_buf)
         self.scale = LayerMajorArena(self.scale_fields, blocks, device, buf=scale_buf)
+        self.index = (
+            LayerMajorArena(self.index_fields, blocks, device, buf=index_buf)
+            if self.index_fields
+            else None
+        )
         self._views = {
             field.name: arena.view(field.name)
-            for arena in (self.cache, self.scale)
+            for arena in (self.cache, self.scale, self.index)
+            if arena is not None
             for field in arena.fields
         }
 
@@ -162,7 +190,7 @@ class MhaKvPool:
         and these views would keep the allocation alive. `allocate` puts it
         back.
         """
-        self.cache = self.scale = None
+        self.cache = self.scale = self.index = None
         self._views = {}
 
     def kv_views(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -173,6 +201,16 @@ class MhaKvPool:
         """One layer's `(k_scale, v_scale)`. Allocated for every cache dtype,
         read only by an fp8 one."""
         return self._views["k_scale"][layer], self._views["v_scale"][layer]
+
+    def index_view(self, layer: int) -> torch.Tensor:
+        """One indexer layer's rows, `[blocks, block_size, index_dim]`.
+
+        `layer` counts the layers that *own* an indexer, not the model's; the
+        caller assigns those in bind order the way it does for every other
+        compact per-layer axis. Left at the scheduler block's shape -- how many
+        of the backend's own pages that is stays with the backend.
+        """
+        return self._views["index"][layer]
 
     def region_tensors(self) -> list[torch.Tensor]:
         """One tensor per (field, layer), in declared field order.

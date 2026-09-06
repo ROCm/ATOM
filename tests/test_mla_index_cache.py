@@ -278,12 +278,21 @@ def test_allocate_index_cache_uses_compact_shape_and_map(monkeypatch):
         ),
     )
     blocks = 8
-    # The count the pool is built at is the one EngineCore broadcast into
-    # `allocate_kv_cache`, not this rank's own sizing estimate.
-    runner.config.num_kvcache_blocks = blocks
     runner.device = "cpu"
+    # MLA pages at one token, so 16 of its rows make one scheduler block --
+    # the same 16 the pool view is asserted at below. Deliberately not 1: at
+    # 1 this test could not tell the two counts apart, which is the whole
+    # thing it is here to pin.
+    builder.block_ratio = 16
 
-    out = builder.allocate_kv_cache_tensors(num_kv_heads=1, num_draft_layers=1)
+    # The count the pool is built at arrives as an argument: it is the one
+    # EngineCore broadcast into `allocate_kv_cache`, and this rank's own sizing
+    # estimate is a different number.
+    out = builder.allocate_kv_cache_tensors(
+        num_kv_heads=1, num_draft_layers=1, blocks=blocks
+    )
+    # MLA pages at 1, so the builder counts its own rows, not the argument.
+    assert builder.num_blocks == blocks * builder.block_ratio
 
     # Asserted through the views a reader binds, not the allocator's call
     # shape: the pool hands out one row per layer, and only indexer-owning
@@ -355,8 +364,6 @@ def test_build_kv_cache_tensor_binds_compact_index_slice():
     runner = SimpleNamespace(
         index_cache_layer_map={3: 0, 5: 1},
         is_deepseek_v32=True,
-        num_physical_kvcache_blocks=8,
-        physical_block_size=1,
         aligned_index_dim=144,
         config=SimpleNamespace(
             max_model_len=1024,
@@ -387,8 +394,6 @@ def test_build_shared_layer_keeps_main_kv_without_index_slice():
     runner = SimpleNamespace(
         index_cache_layer_map={0: 0},
         is_deepseek_v32=True,
-        num_physical_kvcache_blocks=8,
-        physical_block_size=1,
         aligned_index_dim=144,
         config=SimpleNamespace(
             max_model_len=1024,
@@ -421,7 +426,7 @@ def test_transfer_regions_use_explicit_compact_consumer_map(monkeypatch):
         layers=4, regions=[*_FakeTransferStack(4, 100), *_FakeTransferStack(3, 200)]
     )
     runner.index_cache_layer_ids = (3, 5, 6)
-    runner.config.num_kvcache_blocks = 8
+    builder.num_blocks = 8
 
     transfer_tensors = builder.get_kv_transfer_tensors()
 
@@ -455,7 +460,7 @@ def test_hybrid_transfer_regions_compact_both_kv_and_index_rows(monkeypatch):
         layers=2, regions=[*_FakeTransferStack(2, 100), *_FakeTransferStack(2, 200)]
     )
     runner.index_cache_layer_ids = (3, 5)
-    runner.config.num_kvcache_blocks = 8
+    builder.num_blocks = 8
 
     transfer_tensors = builder.get_kv_transfer_tensors()
 

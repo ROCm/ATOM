@@ -40,11 +40,27 @@ from atom.model_ops.attentions.mha_kv_pool import (
 TARGET = {"layers": 60, "num_kv_heads": 1, "head_dim": 128, "block_size": 128}
 DRAFT = {"layers": 1, "num_kv_heads": 16, "head_dim": 128, "block_size": 128}
 DTYPES = [torch.float8_e4m3fnuz, torch.bfloat16]
+# M3's indexer keys: 57 of the 60 layers own one, `sparse_index_dim` wide, at
+# the cache dtype (the config names no `index_cache_dtype`).
+INDEX = {
+    "index_layers": 57,
+    "index_dim": 128,
+    "index_dtype": torch.float8_e4m3fnuz,
+}
 
 
 def build(spec=TARGET, kv_dtype=torch.float8_e4m3fnuz, blocks=8) -> MhaKvPool:
     pool = MhaKvPool(**spec, kv_dtype=kv_dtype)
     pool.allocate(blocks, "cpu")
+    return pool
+
+
+def INDEXED(kv_dtype=torch.float8_e4m3fnuz, blocks=0) -> MhaKvPool:
+    """The target pool as M3 declares it. Unallocated at `blocks=0`, which is
+    the state sizing asks `entry_bytes` in."""
+    pool = MhaKvPool(**TARGET, **INDEX, kv_dtype=kv_dtype)
+    if blocks:
+        pool.allocate(blocks, "cpu")
     return pool
 
 
@@ -196,6 +212,116 @@ class TestTheTransferGranularity:
     def test_regions_are_empty_before_allocation(self):
         """Declared and allocated are two steps — sizing runs in between."""
         assert MhaKvPool(**TARGET, kv_dtype=torch.bfloat16).region_tensors() == []
+
+
+class TestTheIndexerCacheIsAField:
+    """MiniMax-M3's indexer keys, which used to be declared twice.
+
+    Sizing added `sparse_layers * page * dim * itemsize` to the block cost
+    while allocation wrote `torch.zeros(sparse_layers, blocks, page, dim)` --
+    and the two read *different* block-count attributes off the runner, which
+    is exactly how the sparse index cache ended up sized against one rank's own
+    estimate while the pool was built at the broadcast one. Being a field is
+    what makes that unrepresentable: one expression answers both.
+    """
+
+    def test_a_model_without_an_indexer_declares_none_and_pays_nothing(self):
+        """The field is opt-in, so every other MHA model is untouched."""
+        plain = MhaKvPool(**TARGET, kv_dtype=torch.float8_e4m3fnuz)
+
+        assert plain.index_fields == []
+        assert plain.entry_bytes < INDEXED(torch.float8_e4m3fnuz).entry_bytes
+
+    @pytest.mark.parametrize("kv_dtype", DTYPES, ids=lambda d: str(d).split(".")[-1])
+    def test_entry_bytes_is_what_the_two_old_declarations_charged(self, kv_dtype):
+        """The gate for the fold. `entry_bytes_for` aligns and the old formula
+        did not, so equality here is a fact about M3's numbers, not a
+        tautology -- a shape whose indexer segment is not a multiple of the
+        arena's alignment would move the pool's capacity, and has to be caught
+        before it ships rather than in a server log."""
+        raw = INDEX["index_layers"] * TARGET["block_size"] * INDEX["index_dim"]
+
+        assert (
+            INDEXED(kv_dtype).entry_bytes
+            == MhaKvPool(**TARGET, kv_dtype=kv_dtype).entry_bytes
+            + raw * INDEX["index_dtype"].itemsize
+        )
+
+    def test_the_indexer_is_its_own_allocation(self):
+        """Not carved out of the K/V buffer: it has its own dtype and its own
+        layer count, and the P/D export ships the K/V one by itself."""
+        pool = INDEXED(blocks=4)
+
+        assert pool.index is not None
+        assert pool.index.buf.data_ptr() != pool.cache.buf.data_ptr()
+        assert pool.index.buf.numel() == 4 * (
+            pool.entry_bytes
+            - MhaKvPool(**TARGET, kv_dtype=torch.float8_e4m3fnuz).entry_bytes
+        )
+
+    def test_a_layer_gets_the_scheduler_blocks_rows(self):
+        """Shaped in scheduler blocks, which is the entry class `page_pool`
+        charges. The backend reshapes to its own page when it binds -- sizing
+        it at that page instead is what undercharged by `block_ratio`."""
+        pool = INDEXED(blocks=4)
+        view = pool.index_view(0)
+
+        assert view.shape == (4, TARGET["block_size"], INDEX["index_dim"])
+        assert view.is_contiguous()
+
+    def test_each_indexer_layer_gets_its_own_slice(self):
+        """Bind order assigns these, so an off-by-one is a layer reading
+        another layer's keys — silently, with plausible top-k output."""
+        pool = INDEXED(blocks=4)
+        stride = pool.index_view(1).data_ptr() - pool.index_view(0).data_ptr()
+
+        assert stride == pool.index_view(0).numel() * pool.index_view(0).element_size()
+        for layer in range(INDEX["index_layers"]):
+            assert pool.index_view(layer).data_ptr() == (
+                pool.index_view(0).data_ptr() + layer * stride
+            )
+
+    def test_indexer_regions_come_after_the_kv_ones(self):
+        """The order a P/D peer reconstructs regions in. It used to be spelled
+        out at the call site (`region_tensors()` and then a loop over the index
+        cache); now it falls out of field order, so it is pinned here."""
+        pool = INDEXED(blocks=4)
+        regions = pool.region_tensors()
+        kv = 4 * TARGET["layers"]
+
+        assert len(regions) == kv + INDEX["index_layers"]
+        assert [r.data_ptr() for r in regions[kv:]] == [
+            pool.index_view(i).data_ptr() for i in range(INDEX["index_layers"])
+        ]
+
+    def test_an_indexer_region_is_one_scheduler_block_wide(self):
+        """`unit_bytes` is what a peer multiplies a block id by, and the ids
+        are the scheduler's, so a region's unit has to be the scheduler's block.
+
+        This is the one place the fold is *not* byte-for-byte with what it
+        replaced. The old allocation was shaped in the backend's own page
+        (`[layers, blocks * block_ratio, backend_page, dim]`), so its per-unit
+        stride was `backend_page * dim` -- the same total bytes divided into
+        `block_ratio` times as many units. No byte count distinguishes the two,
+        which is why `KVTransferTensors.set_block_count` checks the unit and
+        not the size. Where the two block sizes are equal the numbers coincide;
+        that is a property of those configs, not of the code.
+        """
+        pool = INDEXED(blocks=4)
+        region = pool.region_tensors()[-1]
+        stride = region.stride(0) * region.element_size()
+
+        assert stride == TARGET["block_size"] * INDEX["index_dim"]
+        assert region.numel() * region.element_size() // stride == 4
+
+    def test_release_drops_the_indexer_too(self):
+        """Nothing outside the pool holds this buffer, so the pool is what
+        frees it across a rollout sleep."""
+        pool = INDEXED(blocks=4)
+        pool.release()
+
+        assert pool.index is None
+        assert pool.region_tensors() == []
 
 
 class TestAdoptingSomeoneElsesAllocation:

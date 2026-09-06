@@ -1422,12 +1422,20 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         return [page_pool(pool.entry_bytes), self.state_spec()]
 
     def allocate_kv_cache_tensors(
-        self, num_kv_heads: int, num_draft_layers: int
+        self, num_kv_heads: int, num_draft_layers: int, *, blocks: int
     ) -> dict:
-        """Same pool as the MHA parent's, over the shorter layer axis."""
+        """Same pool as the MHA parent's, over the shorter layer axis.
+
+        The pool takes `blocks` and not `self.num_blocks`: `_declare_kv_pool`
+        builds it at `runner.block_size`, so one entry is one *scheduler* block
+        and the count of entries is the scheduler's. `self.num_blocks` is the
+        same capacity counted in this backend's own page, which is what its
+        kernels index and not what this pool is entry-per.
+        """
+        self.num_blocks = blocks * self.block_ratio
         runner = self.model_runner
         self.kv_pool = self._declare_kv_pool(num_kv_heads)
-        self.kv_pool.allocate(runner.num_physical_kvcache_blocks, runner.device)
+        self.kv_pool.allocate(blocks, runner.device)
         return {
             "kv_cache": self.kv_pool.cache.buf,
             "kv_scale": self.kv_pool.scale.buf,

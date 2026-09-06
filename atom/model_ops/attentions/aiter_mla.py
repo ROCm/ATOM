@@ -1119,7 +1119,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
 
     def allocate_kv_cache_tensors(
-        self, num_kv_heads: int, num_draft_layers: int
+        self, num_kv_heads: int, num_draft_layers: int, *, blocks: int
     ) -> dict:
         """Allocate this model's MLA pool.
 
@@ -1128,10 +1128,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         frees. The aligned dimension and compact layer map ride along so
         `build_kv_cache_tensor` can pick the right indexer slice.
         """
+        self.num_blocks = blocks * self.block_ratio
         runner = self.model_runner
         hf_config = runner.config.hf_config
         self.kv_pool = self._declare_kv_pool()
-        self.kv_pool.allocate(runner.config.num_kvcache_blocks, runner.device)
+        self.kv_pool.allocate(blocks, runner.device)
         out: dict = {"kv_cache": self.kv_pool.cache.buf}
         if runner.is_deepseek_v32:
             index_cache_layer_ids, _ = self._index_cache_layout()
@@ -1147,6 +1148,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         return out
 
     def adopt_imported_kv_pool(self, blocks: int) -> None:
+        self.num_blocks = blocks * self.block_ratio
         runner = self.model_runner
         self.kv_pool = self._declare_kv_pool()
         self.kv_pool.allocate(
@@ -1328,7 +1330,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         return KVTransferTensors(
             block_regions=block_regions,
             slot_regions=[],
-            num_blocks=runner.config.num_kvcache_blocks,
             block_region_consumer_indices=block_region_consumer_indices,
         )
 
