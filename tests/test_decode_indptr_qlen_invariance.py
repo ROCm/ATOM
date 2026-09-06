@@ -34,7 +34,7 @@ if not torch.cuda.is_available():
         allow_module_level=True,
     )
 
-from atom.model_ops.attentions.v4_pool_geometry import CSA_RATIO, HCA_RATIO
+from atom.model_ops.attentions.pool_layout.v4_pool_geometry import CSA_RATIO, HCA_RATIO
 from atom.model_ops.v4_kernels.paged_decode_indices import (
     build_v4_paged_decode_indptr,
 )

@@ -5,8 +5,10 @@ import ast
 from pathlib import Path
 
 ATOM_ROOT = Path(__file__).resolve().parents[1] / "atom"
+# One entry, not two: the decode and prefill FP4 scorers were unified onto the
+# varqlen (`_prefill`) kernel family, so nothing imports the rectangular
+# `pa_mqa_logits_fp4` any more. Widen this only alongside a caller.
 CURRENT_MODULES = {
-    "aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4",
     "aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
 }
 

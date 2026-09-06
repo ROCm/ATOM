@@ -1385,6 +1385,12 @@ jobs:
           test -s atomesh-dashboard-input/atomesh-benchmark-action.json
           cp .github/dashboard/index.html /tmp/atomesh_dashboard_index.html
 
+      - name: Prepare existing dashboard data
+        id: prepare_dashboard_data
+        uses: ./.github/actions/prepare-dashboard-data
+        with:
+          data-path: benchmark-dashboard/data.js
+
       - name: Store ATOMesh benchmark result to dashboard
         uses: benchmark-action/github-action-benchmark@v1
         with:
@@ -1392,9 +1398,15 @@ jobs:
           output-file-path: atomesh-dashboard-input/atomesh-benchmark-action.json
           gh-pages-branch: gh-pages
           benchmark-data-dir-path: benchmark-dashboard
-          auto-push: true
+          auto-push: false
           max-items-in-chart: 300
           github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate dashboard data after write
+        uses: ./.github/actions/validate-dashboard-data
+        with:
+          data-path: benchmark-dashboard/data.js
+          min-entries: ${{ steps.prepare_dashboard_data.outputs.entry_count }}
 
       - name: Deploy ATOMesh dashboard shell to gh-pages
         run: |

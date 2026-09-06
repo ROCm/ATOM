@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import torch
 from aiter import QuantType, dtypes, get_hip_quant
+from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from atom.utils.decorators import mark_trace
 
@@ -163,6 +164,77 @@ def situ_and_mul(
         BLOCK=BLOCK,
     )
     return y.reshape(*lead, d)
+
+
+def _situ_and_mul_quant_fake(
+    x: torch.Tensor, beta: float, linear_beta: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    *lead, two_d = x.shape
+    m = 1
+    for s in lead:
+        m *= s
+    d = two_d // 2
+    out = torch.empty((m, d), dtype=dtypes.fp8, device=x.device)
+    scale = torch.empty((m, 1), dtype=torch.float32, device=x.device)
+    return out, scale
+
+
+# mutates_args=[] -- out/scale are allocated inside, so the op is functional and
+# torch.compile treats it as opaque via the fake above (mirrors
+# atom.model_ops.activation.mxfp4_act_mul_quant_fuse).
+@torch_compile_guard(gen_fake=_situ_and_mul_quant_fake, mutates_args=[])
+def situ_and_mul_quant(
+    x: torch.Tensor, beta: float, linear_beta: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """SiTUv2 gated activation fused with per-token FP8 quant.
+
+    ``x`` is ``[m, 2*d]`` bf16 (``x[..., :d]`` gate, ``x[..., d:]`` up). Returns
+    ``(fp8 [m, d], scale [m, 1] float32)`` ready for the consuming a8w8 per-token
+    GEMM's ``x_scale=`` path (dense-MLP / shared-expert down_proj under ptpc_fp8).
+    The aiter kernel folds SiTUv2 and the amax/quant into one pass, so the bf16
+    activation never round-trips through HBM. ``linear_beta`` must be set: the
+    kernel always applies the linear-beta tanh to the up half.
+    """
+    from aiter.ops.activation import situv2_and_mul_quant as _aiter_situ_quant
+
+    assert linear_beta is not None, "situ_and_mul_quant requires linear_beta"
+    two_d = x.shape[-1]
+    d = two_d // 2
+    x2 = x.reshape(-1, two_d)
+    m = x2.shape[0]
+    out = torch.empty((m, d), dtype=dtypes.fp8, device=x.device)
+    scale = torch.empty((m, 1), dtype=torch.float32, device=x.device)
+    if m > 0:
+        _aiter_situ_quant(
+            out, x2.contiguous(), scale, d, float(beta), float(linear_beta)
+        )
+    return out, scale
+
+
+def situ_and_mul_maybe_quant(
+    x: torch.Tensor,
+    beta: float,
+    linear_beta: float | None,
+    quant: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """SiTUv2 gated activation, optionally fused with per-token FP8 quant.
+
+    Unifies the quant and non-quant paths behind one call site so the caller
+    always does ``down_proj(x, x_scale=scale)``:
+
+    - ``quant=False``: return ``(bf16 [..., d], None)``. The ``None`` scale makes
+      ``down_proj(x, x_scale=None)`` fall back to its own standalone activation
+      quant.
+    - ``quant=True``: fuse SiTUv2 + per-token FP8 quant into one aiter kernel and
+      return ``(fp8 [m, d], scale [m, 1])`` for down_proj's ``x_scale=`` path
+      (dense-MLP / shared-expert under ptpc_fp8).
+
+    Unlike :func:`fused_sigmoid_mul_maybe_quant`, there is no scheme selector: the
+    aiter ``situv2_and_mul_quant`` kernel implements only the per-token scheme.
+    """
+    if quant:
+        return situ_and_mul_quant(x, beta, linear_beta)
+    return situ_and_mul(x, beta, linear_beta), None
 
 
 @mark_trace

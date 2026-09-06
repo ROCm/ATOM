@@ -31,6 +31,7 @@ _PAGE_FINGERPRINT_BYTES = 16
 _OFFLOAD_LAYOUT_ALIASES = {
     "hybrid": "hybrid",
     "dense": "dense",
+    "kimi_k3": "kimi_k3",
     # Compatibility with the names used while the layout split was developed.
     "terminal_unit": "hybrid",
     "page_slot": "hybrid",
@@ -54,6 +55,30 @@ _HF_INTEGER_GEOMETRY_FIELDS = frozenset(_HF_PAGE_FIELDS) - {
     "compress_ratios",
     "indexer_dtype",
 }
+# GDN/linear model types carrying a per-request recurrent state but NOT in the
+# `kimi_linear` family `kimi_k3` owns. Same set as `ModelRunner.is_qwen_next()`,
+# but note the attribute skew: the guard below reads `hf_config.model_type`
+# while `is_qwen_next` reads `hf_text_config.model_type`. On the native path
+# they agree only because `get_hf_config` flattens the text type up; `is_vllm()`
+# drops `qwen3_5`/`qwen3_5_moe` from that flatten, so if offload is ever wired
+# into plugin mode this guard must switch to the text config to stay in sync.
+# Unreachable today -- no plugin caller passes a `kv_transfer_config`.
+# MiniMax-M2/M3 are absent by design: M3 is sparse *paged* attention
+# (`MiniMaxM3SparseForCausalLM` -> `SparseMHAPagedAttentionImpl`), no recurrent
+# state, so the dense offload path handles it as ordinary paged KV -- it is NOT
+# a GDN/linear model despite some sibling comments once listing it as one.
+_GDN_LINEAR_MODEL_TYPES = frozenset(
+    {"qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text"}
+)
+
+# Layouts that own a tier for a model's per-request *recurrent* state. Today only
+# `kimi_k3` (the kimi_linear KDA state); `hybrid` (DSV4 sparse-attention
+# checkpoints) is not recurrent-state and dense<->hybrid is a legitimate operator
+# override for namespace separation. An explicit `offload_layout` override may not
+# downgrade a recurrent-state model to a layout that owns no tier for it (silent
+# wrong output) -- see `select_offload_layout`. GDN/linear model types are refused
+# outright in `_layout_from_model`, so no override can resurrect them.
+_STATE_OWNING_LAYOUTS = frozenset({"kimi_k3"})
 
 logger = logging.getLogger("atom")
 
@@ -80,20 +105,83 @@ def select_offload_layout(config) -> str:
 
     kvc = getattr(config, "kv_transfer_config", {}) or {}
     override = kvc.get("offload_layout")
-    if override is not None:
-        mapped = (
-            _OFFLOAD_LAYOUT_ALIASES.get(override) if isinstance(override, str) else None
-        )
-        if mapped is not None:
-            return mapped
+    # Inspect the model *first*, always -- even with an override present. An
+    # override returning before this ran let `offload_layout: dense` on a
+    # kimi_linear/Qwen3.5 checkpoint skip the GDN refusal below and restore a KV
+    # prefix over stale recurrent state (silent wrong output). The natural layout
+    # is also what an override is validated against.
+    natural = _layout_from_model(config)
+    if override is None:
+        return natural
+    mapped = (
+        _OFFLOAD_LAYOUT_ALIASES.get(override) if isinstance(override, str) else None
+    )
+    if mapped is None:
         raise ValueError(
             f"lmcache_offload: unknown offload_layout={override!r}; "
             f"expected one of {sorted(_OFFLOAD_LAYOUT_ALIASES)}"
         )
+    # An override may pick between compatible layouts, but it may not strip a
+    # state-owning model down to a layout with no tier for its per-request state
+    # -- the same silent-wrong-output the GDN refusal pre-empts, reached by a
+    # different door (an explicit `dense` rather than a fall-through).
+    if natural in _STATE_OWNING_LAYOUTS and mapped not in _STATE_OWNING_LAYOUTS:
+        raise ValueError(
+            f"lmcache_offload: offload_layout={override!r} would run a "
+            f"{natural!r}-family model (per-request recurrent state) on the "
+            f"{mapped!r} layout, which owns no tier for that state -- its KV "
+            "prefix would be restored over stale state (silent wrong output). "
+            "Drop the override, or disable offload for this model."
+        )
+    return mapped
 
+
+def _layout_from_model(config) -> str:
+    """The dense/hybrid/kimi_k3 layout the model itself implies (no override).
+
+    May raise: a GDN/linear model that no layout owns a state tier for is
+    refused here (the message names the cause) rather than left to die deep in
+    `register_kv_caches` as a byte-layout mismatch.
+    """
     hf_config = getattr(config, "hf_config", None)
-    if hf_config is not None and getattr(hf_config, "compress_ratios", None):
+    if hf_config is None:
+        return "dense"
+    # Resolve the family off the *text* config, exactly as the model-side
+    # predicates this mirrors do (`ModelRunner.is_qwen_next`/`is_kimi_linear`
+    # read `self.hf_text_config`). Two names in `_GDN_LINEAR_MODEL_TYPES` --
+    # `qwen3_5_text`, `qwen3_5_moe_text` -- are literally text-config model
+    # types, so the bare wrapper `model_type` would be the multimodal wrapper's
+    # and neither the `kimi_linear` nor the GDN branch would fire: Qwen3.5 would
+    # fall through to `dense` and die deep in `register_kv_caches` (the exact
+    # failure the refusal below exists to pre-empt), and a `kimi_linear`
+    # checkpoint wrapped in a `text_config` would silently run with no state tier.
+    # Local import: this module is on the early config path, and `atom.utils`
+    # pulls in transformers -- keep it out of module import time.
+    from atom.utils import get_hf_text_config
+
+    text_config = get_hf_text_config(hf_config)
+    model_type = getattr(text_config, "model_type", None)
+    # K3's paged KV is ordinary dense MLA; what makes it its own family is the
+    # KDA per-request state that a reusable prefix also needs.
+    if model_type == "kimi_linear":
+        return "kimi_k3"
+    if getattr(hf_config, "compress_ratios", None):
         return "hybrid"
+    # GDN/linear models carry a per-request recurrent state no layout owns a
+    # tier for; `dense` would restore a KV prefix over stale state (silent wrong
+    # output). The dense codec fails closed on the state tensor, but that fires
+    # deep in `register_kv_caches` as a byte-layout mismatch -- refuse here where
+    # the message can name the cause.
+    if model_type in _GDN_LINEAR_MODEL_TYPES:
+        raise ValueError(
+            "lmcache_offload does not support GDN/linear-attention models "
+            f"(model_type={model_type!r}; e.g. "
+            "Qwen3-Next, Qwen3.5). These carry a per-request recurrent state "
+            "that no offload layout owns a tier for -- restoring their KV "
+            "prefix while that state is stale is silent wrong output. Disable "
+            "offload for this model, or use a state-owning layout once one "
+            "exists for it (kimi_k3 owns only the kimi_linear family)."
+        )
     return "dense"
 
 

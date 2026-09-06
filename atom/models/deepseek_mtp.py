@@ -27,7 +27,14 @@ from .deepseek_v2 import (
     _can_fuse_indexer_wk_weights_proj,
     use_replicated_vocab_embed,
 )
-from .utils import ckpt_has_tensor_suffix, maybe_prefix
+from .utils import ckpt_has_tensor_suffix, mask_pos0_inputs_embeds, maybe_prefix
+
+# Fed to the fused prologue in place of a real token id to drop that row's
+# embedding: the kernel's ``token_valid`` guard emits a zero embedding for any
+# id outside [0, vocab_size), and RMSNorm(0) is 0, so this reproduces the
+# unfused path's ``mask_pos0_inputs_embeds`` exactly -- without materializing
+# the [num_tokens, hidden] embedding the fusion exists to avoid.
+_UNEMBEDDED_TOKEN_ID = -1
 
 
 class SharedHead(nn.Module):
@@ -200,6 +207,8 @@ class DeepSeekMultiTokenPredictor(nn.Module):
                 config.vocab_size,
                 config.hidden_size,
             )
+        # Set by the vLLM plugin only; see mask_pos0_inputs_embeds.
+        self.mask_pos0_inputs_embeds = False
 
     def forward(
         self,
@@ -229,16 +238,22 @@ class DeepSeekMultiTokenPredictor(nn.Module):
             and getattr(layer.eh_proj, "input_scale", None) is None
         )
         if can_fuse_prologue:
+            embed_ids = input_ids
+            if self.mask_pos0_inputs_embeds:
+                embed_ids = torch.where(positions == 0, _UNEMBEDDED_TOKEN_ID, input_ids)
             eh_input_quant = fused_mtp_embedding_dual_rmsnorm_fp8_quant(
-                input_ids,
+                embed_ids,
                 self.embed_tokens.weight,
                 previous_hidden_states,
                 layer.enorm.weight,
                 layer.hnorm.weight,
                 layer.enorm.eps,
             )
-        elif inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+        else:
+            if inputs_embeds is None:
+                inputs_embeds = self.embed_tokens(input_ids)
+            if self.mask_pos0_inputs_embeds:
+                inputs_embeds = mask_pos0_inputs_embeds(inputs_embeds, positions)
         return layer(
             input_ids,
             positions,

@@ -167,6 +167,41 @@ def test_model_runner_local_total_layers_adds_mtp_only_on_drafter_stage(
     assert runner._get_total_num_layers() == 5
 
 
+def test_pp_shared_indexer_uses_the_producer_buffer_width(monkeypatch):
+    from atom.model_engine import model_runner
+    from atom.model_engine.model_runner import ModelRunner
+
+    runner = object.__new__(ModelRunner)
+    runner._pp_share_indexer_ready = False
+    runner.is_deepseek_v32 = True
+    runner.model = SimpleNamespace(start_layer=0, end_layer=2)
+    runner.config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            num_hidden_layers=4,
+            indexer_types=("full", "shared", "shared", "full"),
+            index_topk=2048,
+            index_topk_freq=1,
+            index_skip_topk_offset=1,
+        )
+    )
+    runner.attn_metadata_builder = SimpleNamespace(index_topk_out=2176)
+    runner.rank_name = "test"
+    monkeypatch.setattr(
+        model_runner,
+        "get_pp_group",
+        lambda: SimpleNamespace(
+            world_size=2,
+            is_first_rank=True,
+            is_last_rank=False,
+        ),
+    )
+
+    runner._setup_pp_shared_indexer()
+
+    assert runner._pp_send_needs_sparse
+    assert runner._pp_index_topk == 2176
+
+
 def test_pp_index_cache_layout_uses_global_layer_ids(monkeypatch):
     non_draft_builder, _ = _builder(
         ("full", "shared", "shared", "full", "shared", "full"),
@@ -392,6 +427,33 @@ def test_transfer_regions_use_explicit_compact_consumer_map(monkeypatch):
         9,
         10,
     ]
+
+
+def test_hybrid_transfer_regions_compact_both_kv_and_index_rows(monkeypatch):
+    builder, runner = _builder(("full",) * 6, total_local_layers=3)
+    runner.config.speculative_config = None
+    runner.config.hf_config.layer_types = [
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "full_attention",
+    ]
+    runner.full_attention_layers = [1, 3, 5]
+    _mock_pp(monkeypatch, rank=1, world_size=2)
+    builder.block_ratio = 1
+    runner.kv_cache = _FakeTransferStack(2, 100)
+    runner.index_cache = _FakeTransferStack(2, 200)
+    runner.index_cache_layer_ids = (3, 5)
+    runner.config.num_kvcache_blocks = 8
+
+    transfer_tensors = builder.get_kv_transfer_tensors()
+
+    # Global consumer layout: 3 compact MLA rows, then 3 compact index rows.
+    # This PP rank owns MLA rows 1/2 and index rows 1/2.
+    assert transfer_tensors.block_region_consumer_indices == [1, 2, 4, 5]
+    assert len(set(transfer_tensors.block_region_consumer_indices)) == 4
 
 
 class _FakeMetadataBuffer:
