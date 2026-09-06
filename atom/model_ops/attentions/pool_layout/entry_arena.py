@@ -52,9 +52,11 @@ declaration and the materializer are separate things in one module: a paged
 KV pool whose blocks are still laid out layer-major reads the same field list
 through a sibling arena. What picks between the two is where the entry axis
 sits, not which pool the entries are drawn from. They share a file because
-this package's members are leaves — `tests/test_layout_packages.py` holds
-every one of them to importing neither aiter nor atom, and a relative import
-counts, so a field list and an arena over it cannot be split apart here.
+they are one topic — neither arena means anything without the field list it
+reads, and the two differ only in that axis. Not because they have to: a
+member of this package may import a sibling member, which
+`tests/test_layout_packages.py` allows precisely so that a declaration and
+the arithmetic over it are placed by topic rather than by import rule.
 
 Backends stay in charge of what the fields are; this module only owns the
 arithmetic. The layout is deliberately the one DeepSeek-V4's PD staging path

@@ -19,15 +19,22 @@ from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.state_runtime import StateRuntime, StateTransfer
+from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+    fp4_indexer_block_fields,
+    fp8_indexer_block_fields,
+    indexer_block_regions,
+    main_kv_plane_fields,
+)
 from atom.model_ops.attentions.pool_layout.v4_pool_geometry import UnifiedPoolGeometry
 
 _MISSING = object()
 _HEAD_DIM = 16
 _ROPE_HEAD_DIM = 4
 _CSA_ROWS_PER_BLOCK = 64
-_INDEX_ROW_BYTES = 132
+_INDEX_HEAD_DIM = 128
+_INDEX_ROW_BYTES = _INDEX_HEAD_DIM + 4
 _CSA_REGION_COUNT = 2
-_FP4_K_TILES = 1
+_FP4_K_TILES = _INDEX_HEAD_DIM // 128
 
 
 def test_generic_transfer_tensors_default_to_no_full_slot_expectation():
@@ -221,13 +228,27 @@ def _transfer_builder(
     builder._kv_fp8 = kv_dtype == "fp8"
     builder._indexer_fp4 = indexer_fp4
     builder._classical_dtype = torch.uint8 if builder._kv_fp8 else torch.bfloat16
-    builder._rope_dtype = torch.bfloat16
     builder.head_dim = _HEAD_DIM
     builder.rope_head_dim = _ROPE_HEAD_DIM
     builder.csa_layers = [0, 2]
     builder.csa_rows_per_block = _CSA_ROWS_PER_BLOCK
-    builder._index_row_bytes = _INDEX_ROW_BYTES
-    builder._idx_k_tiles = _FP4_K_TILES
+    builder.index_head_dim = _INDEX_HEAD_DIM
+    # The two declarations `__init__` would have made, from the same functions
+    # the backend calls: this fixture is after the transfer regions, and a
+    # hand-written layout here would be one more copy of what they collapse.
+    builder._plane_fields = main_kv_plane_fields(
+        _HEAD_DIM,
+        builder._classical_dtype,
+        (_ROPE_HEAD_DIM, torch.bfloat16) if builder._kv_fp8 else None,
+    )
+    builder._indexer_fields = (
+        fp4_indexer_block_fields(_CSA_ROWS_PER_BLOCK, _INDEX_HEAD_DIM)
+        if indexer_fp4
+        else fp8_indexer_block_fields(_CSA_ROWS_PER_BLOCK, _INDEX_HEAD_DIM, torch.uint8)
+    )
+    builder._indexer_regions, builder._indexer_block_bytes = indexer_block_regions(
+        builder._indexer_fields
+    )
     builder.pool_geometry = geo
     builder.compress_ratios = ratios
     builder._checkpoint_range_cache = None
@@ -250,7 +271,7 @@ def _transfer_builder(
             (
                 len(builder.csa_layers),
                 num_blocks,
-                builder._idx_k_tiles,
+                _FP4_K_TILES,
                 4,
                 builder.csa_rows_per_block,
                 16,
@@ -261,7 +282,7 @@ def _transfer_builder(
             (
                 len(builder.csa_layers),
                 num_blocks,
-                builder._idx_k_tiles,
+                _FP4_K_TILES,
                 4,
                 builder.csa_rows_per_block,
             ),
@@ -269,12 +290,16 @@ def _transfer_builder(
         )
         indexer_pools = [indexers, indexer_scales]
     else:
+        # Row width spelled out rather than taken off the builder, which no
+        # longer knows one. Spelling it independently is what makes the
+        # geometry assertions a check on the declaration: change the block and
+        # this pool stops covering the sized PAGE unit.
         indexers = torch.empty(
             (
                 len(builder.csa_layers),
                 num_blocks,
                 builder.csa_rows_per_block,
-                builder._index_row_bytes,
+                _INDEX_ROW_BYTES,
             ),
             dtype=torch.uint8,
         )

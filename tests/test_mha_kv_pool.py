@@ -474,7 +474,7 @@ def test_reachable_without_a_gpu_build():
         seen.add(module)
         path = root / (module.replace(".", "/") + ".py")
         assert path.is_file(), f"{module} is not a plain module"
-        for imported in imported_modules(path, package=module.rsplit(".", 1)[0]):
+        for imported in imported_modules(path):
             assert not imported.startswith(("aiter", "triton")), (
                 f"{module} reaches {imported}, which a runner with no AITER "
                 "build does not have -- and one collection error there aborts "

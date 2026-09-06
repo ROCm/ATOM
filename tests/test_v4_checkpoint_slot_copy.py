@@ -52,6 +52,7 @@ from atom.model_ops.attentions.pool_layout.entry_arena import (
     field_extents,
 )
 from atom.model_ops.attentions.pool_layout.paged_state_copy import plan_segmented_copy
+from atom.model_ops.attentions.pool_layout.v4_pool_fields import main_kv_plane_fields
 from atom.model_ops.attentions.pool_layout.v4_pool_geometry import CSA_RATIO, HCA_RATIO
 
 NEG_INF = float("-inf")
@@ -426,6 +427,10 @@ class TestTheBuilderDeclaresWhatItDrops:
             _indexer_fp4 = False
             _field_window_dtype = torch.bfloat16
             _field_window_layers = (43,)
+            # A bf16 build's one plane. The state-carried window is a ring of
+            # these rows in its own dtype, so `_state_fields` reads its shape
+            # and its alignment from here.
+            _plane_fields = main_kv_plane_fields(head_dim, torch.bfloat16)
 
             def __init__(self):
                 pass  # the real one wants a ModelRunner, a model and a GPU

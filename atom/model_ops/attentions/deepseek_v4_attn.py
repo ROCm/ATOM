@@ -88,6 +88,14 @@ from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
     page_pool,
     state_pool,
 )
+from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+    CSA_INDEXER_SCALE,
+    MAIN_KV_NOPE,
+    fp4_indexer_block_fields,
+    fp8_indexer_block_fields,
+    indexer_block_regions,
+    main_kv_plane_fields,
+)
 from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
     ABSENT_RATIO,
     CSA_RATIO,
@@ -471,31 +479,19 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if self._kv_fp8:
             self._swa_dtype = dtypes.fp8
             self._classical_dtype = dtypes.fp8
-            self._rope_dtype = torch.bfloat16  # rope pool is always bf16
         else:
             self._swa_dtype = torch.bfloat16  # SWA window matches KV dtype
             self._classical_dtype = torch.bfloat16  # CSA / HCA Main KV is BF16
-            self._rope_dtype = torch.bfloat16  # unused in bf16 path (symmetry)
-        # CSA Indexer cache: `index_head_dim` FP8 bytes plus a 4-byte fp32
-        # scale per row. Data and scale sit in two REGIONS inside a block, NOT
-        # interleaved per row: `[rows*index_head_dim data][rows*4 scale]`. All
-        # three consumers address it that way — fused_compress.py (write),
-        # cache_kernels.cu:1638/1651 (cp_gather_indexer_k_quant_cache), and
-        # pa_mqa_logits.py:493-500 (deepgemm_fp8_paged_mqa_logits).
-        #
-        # So the alignment that matters is the BLOCK stride, and 64 * 132 =
-        # 8448 = 16 * 528 is already 16-byte aligned. Rounding this per-row
-        # value up to a multiple of 16 instead pays the 12-byte rounding once
-        # per row rather than once per block: 768 B per block per CSA layer,
-        # 1.5% of the whole KV pool.
-        self._index_row_bytes = self.index_head_dim + 4
-        indexer_block_bytes = self.csa_rows_per_block * self._index_row_bytes
-        assert indexer_block_bytes % 16 == 0, (
-            f"indexer block stride {indexer_block_bytes} B "
-            f"({self.csa_rows_per_block} rows x {self._index_row_bytes} B) must "
-            "be 16-byte aligned: the FP8 data region is read with dwordx4 loads"
+        # One row of each plane this build has: the dtype decision above is the
+        # policy, this is what follows from it, and it is what everyone
+        # downstream counts planes from. RoPE is never quantized, so its plane
+        # is bf16 whatever the main KV dtype is; a bf16 build keeps RoPE inline
+        # in the NoPE row and declares no second plane.
+        self._plane_fields = main_kv_plane_fields(
+            self.head_dim,
+            self._classical_dtype,
+            (self.rope_head_dim, torch.bfloat16) if self._kv_fp8 else None,
         )
-
         # FP4 indexer cache (the native single-node default except on gfx942).
         # When enabled, the CSA Indexer KV is
         # stored as packed FP4 E2M1 + per-group(32) e8m0 scale in the
@@ -514,8 +510,27 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._indexer_fp4 = fp4_indexer_enabled(
             getattr(model_runner.config, "index_cache_dtype", None), warn=True
         )
-        # FP4 KV tile geometry (group_size 32; 16 packed bytes per group).
-        self._idx_k_tiles = self.index_head_dim // 128
+        # What one CSA layer's indexer block holds, and where each region sits
+        # in it. Sizing, allocation and the scale view `build_kv_cache_tensor`
+        # binds all read these two, so none can place a region differently.
+        self._indexer_fields = (
+            fp4_indexer_block_fields(self.csa_rows_per_block, self.index_head_dim)
+            if self._indexer_fp4
+            else fp8_indexer_block_fields(
+                self.csa_rows_per_block, self.index_head_dim, dtypes.fp8
+            )
+        )
+        self._indexer_regions, self._indexer_block_bytes = indexer_block_regions(
+            self._indexer_fields
+        )
+        # The alignment that has to hold is the BLOCK stride, not the row:
+        # 64 * 132 = 8448 = 16 * 528 already is. Rounding the row up to 16
+        # instead pays the 12 B once per row rather than once per block —
+        # 768 B per block per CSA layer, 1.5% of the whole KV pool.
+        assert self._indexer_block_bytes % 16 == 0, (
+            f"indexer block stride {self._indexer_block_bytes} B must be "
+            "16-byte aligned: the data region is read with dwordx4 loads"
+        )
 
         # MTP token-per-fwd factor for paged-decode buffer sizing. V4-Pro
         # `num_nextn_predict_layers = 1` → mtp_k = 1 → max_q_len = 2 per req.
@@ -689,9 +704,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             for layer_id, ratio in enumerate(self.compress_ratios)
         ]
 
+    @property
+    def _main_kv_field(self) -> EntryField:
+        """The NoPE plane's row, which a state-carried window is a ring of.
+
+        By name, not by position: it is also the first plane carved, and those
+        are two facts that agree rather than one.
+        """
+        return next(f for f in self._plane_fields if f.name == MAIN_KV_NOPE)
+
     def _window_field_row_bytes(self) -> int:
-        """Bytes one window position takes: `head_dim` of the layer's dtype."""
-        return self.head_dim * self._field_window_dtype.itemsize
+        """Bytes one window position takes: a main-KV row in its own dtype."""
+        return self._main_kv_field.per_layer_numel * self._field_window_dtype.itemsize
 
     def _window_field_plane_index(self) -> int:
         """Which plane `plan_field_planes` put the state-carried window in."""
@@ -735,7 +759,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         neither of them learns that this window is not a plane of its own.
         """
         plane = self._kv_planes()[self._window_field_plane_index()]
-        return plane.view(self._field_window_dtype).view(-1, self.head_dim)
+        width = self._main_kv_field.per_layer_numel
+        return plane.view(self._field_window_dtype).view(-1, width)
 
     def _window_field_params(self, layer_id: int) -> WindowParams:
         """Where one state-carried window sits, in retyped-plane rows."""
@@ -801,7 +826,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 EntryField(
                     STATE_WINDOW_FIELD,
                     len(self._field_window_layers),
-                    (self.win_with_spec, self.head_dim),
+                    (self.win_with_spec, *self._main_kv_field.shape),
                     self._field_window_dtype,
                     # Its rows are also reached by index, so the field has to
                     # start on one of its own rows, not merely on the retype
@@ -1256,18 +1281,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             ]
         return self._slot_view_cache
 
-    def nope_row_bytes(self) -> int:
-        """Bytes one row costs in the NoPE plane (fp8-packed or bf16)."""
-        return self.head_dim * self._classical_dtype.itemsize
-
-    def rope_row_bytes(self) -> int:
-        """Bytes one row costs in the RoPE plane; 0 on a bf16 build, which
-        keeps RoPE inline in the NoPE row and has no second plane."""
-        return self.rope_head_dim * self._rope_dtype.itemsize if self._kv_fp8 else 0
-
     def plane_row_bytes(self) -> int:
-        """What one row of the shared row space costs across both planes."""
-        return self.nope_row_bytes() + self.rope_row_bytes()
+        """What one row of the shared row space costs across every plane."""
+        return sum(self._plane_row_widths())
 
     @property
     def num_state_slots(self) -> int:
@@ -1282,26 +1298,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         """
         return self._rows_per_block.get(compress_ratio, 0)
 
-    def _indexer_block_bytes(self) -> int:
-        """Bytes one V4 block costs in the CSA Indexer pool, all CSA layers.
+    def _indexer_page_bytes(self) -> int:
+        """What the CSA Indexer adds to the price of one PAGE unit.
 
         The indexer is the one classical pool outside the shared row space: it
         addresses `(block, row)` in its own dtype with a runtime block stride,
-        so it never has to agree with anyone else's row width.
+        so it never has to agree with anyone else's row width. Every CSA layer
+        holds one declared block (`_indexer_block_bytes`) per V4 block.
         """
-        if self._indexer_fp4:
-            # Packed E2M1 data (16 B per group of 32) plus one e8m0 scale byte,
-            # in the two uint8 pools `pa_mqa_logits_fp4` reads.
-            groups = self._idx_k_tiles * 4 * self.csa_rows_per_block
-            per_layer = groups * 16 + groups
-        else:
-            # Data and scale are two REGIONS inside the block, not interleaved
-            # per row: `[rows*index_head_dim FP8]` then `[rows*4 fp32 scale]`.
-            # Written by `indexer_k_quant_and_cache`, read by
-            # `cp_gather_indexer_k_quant_cache` and
-            # `deepgemm_fp8_paged_mqa_logits`.
-            per_layer = self.csa_rows_per_block * self._index_row_bytes
-        return len(self.csa_layers) * per_layer
+        return len(self.csa_layers) * self._indexer_block_bytes
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
         """Two entry classes: a paged block, and a request's slot.
@@ -1326,7 +1331,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         geo = self.pool_geometry
         row_bytes = self.plane_row_bytes()
         return [
-            page_pool(geo.block_bytes(row_bytes) + self._indexer_block_bytes()),
+            page_pool(geo.block_bytes(row_bytes) + self._indexer_page_bytes()),
             state_pool(STATE_SLOT_CLASS, geo.slot_bytes(row_bytes), entries_per_req=1),
         ]
 
@@ -1338,7 +1343,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         sizing, the carve, the compressor state's split and the checkpoint copy
         all count them from here, so none of them can disagree.
         """
-        return [w for w in (self.nope_row_bytes(), self.rope_row_bytes()) if w]
+        return [field.bytes_per_entry for field in self._plane_fields]
 
     def _kv_planes(self) -> list[torch.Tensor]:
         """The allocated plane tensors, in the order `_plane_row_widths` lists."""
@@ -1383,12 +1388,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         tensor per layer (allocated in `allocate_per_req_cache`, which is
         called later when both `num_blocks` and `num_slots` are known).
 
-        Only the CSA Indexer FP8 cache stays as a standalone batched tensor
-        — it lives in its own dtype (FP8 + fp32 scale) and is consumed by
-        `cp_gather_indexer_k_quant_cache`, not the sparse-attn kernel.
-        Layer-major axis order `[n_csa, NB, csa_rows_per_block,
-        index_row_bytes]` so each per-CSA slice `pool[pos]` is contiguous in
-        storage; the kernel infers `block_size` from `kv_cache.shape[1]`.
+        Only the CSA Indexer cache stays as a standalone batched tensor — it
+        lives in its own dtype and is consumed by
+        `cp_gather_indexer_k_quant_cache`, not the sparse-attn kernel. What one
+        of its blocks holds is `_indexer_fields`; the axes in front of it are
+        layer-major, so each per-CSA slice `pool[pos]` is contiguous.
         """
         del buf
         self.num_blocks = blocks * self.block_ratio
@@ -1397,25 +1401,32 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         num_blocks = self.num_blocks
         n_csa = len(self.csa_layers)
         if self._indexer_fp4:
-            # FP4 indexer cache: packed E2M1 data + e8m0 scale in the
-            # `pa_mqa_logits_fp4` preshuffle layout. Two uint8 pools, both
-            # layer-major so each per-CSA slice `pool[pos]` is contiguous.
-            kt = self._idx_k_tiles
+            # FP4: one pool per declared region, each `[n_csa, NB, *shape]`, so
+            # a per-CSA slice `pool[pos]` is contiguous in both.
+            def _pool(field: EntryField) -> torch.Tensor:
+                return torch.zeros(
+                    (n_csa, num_blocks, *field.shape),
+                    dtype=field.dtype,
+                    device=device,
+                )
+
+            data, scale = self._indexer_fields
             return {
-                "v4_csa_idx_kv": torch.zeros(
-                    (n_csa, num_blocks, kt, 4, self.csa_rows_per_block, 16),
-                    dtype=torch.uint8,
-                    device=device,
-                ),
-                "v4_csa_idx_kv_scale": torch.zeros(
-                    (n_csa, num_blocks, kt, 4, self.csa_rows_per_block),
-                    dtype=torch.uint8,
-                    device=device,
-                ),
+                "v4_csa_idx_kv": _pool(data),
+                "v4_csa_idx_kv_scale": _pool(scale),
             }
+        # FP8: both regions in ONE tensor, whose last axis is the block spread
+        # over its rows rather than a row of anything. The 3-D shape is the
+        # kernel's requirement — it reads the block size off `shape[1]` — so a
+        # block that did not divide would allocate a short pool, not fail.
+        rows = self.csa_rows_per_block
+        assert self._indexer_block_bytes % rows == 0, (
+            f"an indexer block of {self._indexer_block_bytes} B does not divide "
+            f"into its {rows} rows, so it has no 3-D shape"
+        )
         return {
             "v4_csa_idx_kv": torch.zeros(
-                (n_csa, num_blocks, self.csa_rows_per_block, self._index_row_bytes),
+                (n_csa, num_blocks, rows, self._indexer_block_bytes // rows),
                 dtype=dtypes.fp8,
                 device=device,
             ),
@@ -1464,9 +1475,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         device = self.model_runner.device
         num_blocks = self.num_blocks
-        head_dim = self.head_dim
-        dtype = self._swa_dtype
-        rope_dtype = self._rope_dtype
 
         # Anything already worked out from the old layout or the old pools is
         # now wrong, and wrong quietly: four of these hold raw addresses, so a
@@ -1487,7 +1495,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         actual_page_bytes = (
             sum(geo.block_bytes(width) for width in self._plane_row_widths())
-            + self._indexer_block_bytes()
+            + self._indexer_page_bytes()
         )
         actual_slot_bytes = sum(
             geo.slot_bytes(width) for width in self._plane_row_widths()
@@ -1520,17 +1528,19 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # allocation alive, so it must not be dropped from any of them.
         per_req_pool = torch.zeros(total_bytes, dtype=torch.uint8, device=device)
 
-        def _plane(start: int, width: int, elem: torch.dtype) -> torch.Tensor:
-            end = start + geo.plane_rows * width * elem.itemsize
-            return per_req_pool[start:end].view(elem).view(geo.plane_rows, width)
+        def _plane(start: int, field: EntryField) -> torch.Tensor:
+            width = field.per_layer_numel
+            end = start + geo.plane_rows * field.bytes_per_entry
+            return per_req_pool[start:end].view(field.dtype).view(geo.plane_rows, width)
 
-        kv_plane = _plane(offsets[0], head_dim, dtype)
-        # 2buff fp8: a second plane of the same rows at the RoPE width, bf16
-        # (RoPE is never quantized). bf16 builds keep RoPE inline in the NoPE
-        # row and have no second plane.
-        kv_plane_rope = (
-            _plane(offsets[1], self.rope_head_dim, rope_dtype) if self._kv_fp8 else None
-        )
+        # One plane per declared field, in declared order. A bf16 build declares
+        # one and has no RoPE plane; fp8 declares the second at the RoPE width.
+        carved = [
+            _plane(start, field)
+            for start, field in zip(offsets, self._plane_fields, strict=True)
+        ]
+        kv_plane = carved[0]
+        kv_plane_rope = carved[1] if len(carved) > 1 else None
 
         # A plain slice, not `as_strided`: the base row is a row count into the
         # plane, and letting torch derive the storage offset is what keeps it
@@ -1740,18 +1750,19 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     # the `pa_mqa_logits_fp4` preshuffle layout.
                     module.cache_scale = runner.v4_csa_idx_kv_scale[pos]
                 else:
-                    # FP8 quant path: bind a strided fp32 view of the per-block
-                    # scale region. Layout per block: [rows*head_dim FP8] then
-                    # [rows fp32 scale], exactly filling the block
-                    # (cache_kernels.cu:1209-1239). Strides in fp32 elements.
-                    nb, rows, row_bytes = idx_kv.shape
-                    head_dim = self.index_head_dim
-                    block_bytes = rows * row_bytes
-                    assert (
-                        block_bytes % 4 == 0
-                    ), f"per-block bytes ({block_bytes}) must be 4-aligned"
-                    block_fp32_stride = block_bytes // 4
-                    scale_fp32_offset = (rows * head_dim) // 4
+                    # FP8 quant path: bind a strided fp32 view of the block's
+                    # scale region (cache_kernels.cu:1209-1239), strides in
+                    # fp32 elements. Where it starts is read from the
+                    # declaration, not recomputed from the shape — a view one
+                    # region early reads valid-looking data, not a crash.
+                    nb, rows, _ = idx_kv.shape
+                    scale_start = self._indexer_regions[CSA_INDEXER_SCALE]
+                    assert scale_start % 4 == 0, (
+                        f"the scale region starts at byte {scale_start} of the "
+                        "block, which is not an fp32 boundary"
+                    )
+                    block_fp32_stride = self._indexer_block_bytes // 4
+                    scale_fp32_offset = scale_start // 4
                     # `as_strided(storage_offset=...)` is ABSOLUTE in the underlying
                     # storage, NOT relative to `idx_kv`. Since idx_kv =
                     # v4_csa_idx_kv[pos] carries its own storage_offset (pos *
@@ -1874,19 +1885,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # of that subset, so its plane is its own; `_consumer_region_map`'s
         # per-layer alignment has nothing left to align, which is why PP is
         # rejected below.
-        plane_roles = [
-            role
-            for role, row_bytes in (
-                ("dsv4.main_kv.nope", self.nope_row_bytes()),
-                ("dsv4.main_kv.rope", self.rope_row_bytes()),
-            )
-            if row_bytes
-        ]
+        # The role a consumer matches on is the plane's declared name, so a
+        # build that gains or loses a plane cannot leave this list behind.
         planes = list(
             zip(
                 self._kv_planes(),
                 self._plane_row_widths(),
-                plane_roles,
+                [field.name for field in self._plane_fields],
                 strict=True,
             )
         )
