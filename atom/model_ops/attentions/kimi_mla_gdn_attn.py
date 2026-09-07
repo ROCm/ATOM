@@ -177,17 +177,23 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         kpool = self._kpool_size()
         if not pooled_path_enabled(kpool):
             return runner.block_size
-        assert runner.block_size % kpool == 0, (
-            f"kv_cache_block_size={runner.block_size} is not divisible by "
-            f"index_kpool={kpool}; Config sets the block size for exactly this"
-        )
+        # Raised and not asserted: both are input validation on `--block-size`,
+        # and `python -O` would drop them -- the first into a truncating floor
+        # division, the second into a layout
+        # `deepgemm_fp8_paged_mqa_logits` computes wrongly.
+        if runner.block_size % kpool:
+            raise ValueError(
+                f"kv_cache_block_size={runner.block_size} is not divisible by "
+                f"index_kpool={kpool}; Config sets the block size for exactly this"
+            )
         rows = runner.block_size // kpool
-        assert rows % _MQA_LOGITS_PRESHUFFLE_ROWS == 0, (
-            f"{rows} pooled rows per block is not a multiple of "
-            f"{_MQA_LOGITS_PRESHUFFLE_ROWS}, so deepgemm_fp8_paged_mqa_logits "
-            "cannot stay in the preshuffled layout -- the only one it computes "
-            "correctly. Raise kv_cache_block_size."
-        )
+        if rows % _MQA_LOGITS_PRESHUFFLE_ROWS:
+            raise ValueError(
+                f"{rows} pooled rows per block is not a multiple of "
+                f"{_MQA_LOGITS_PRESHUFFLE_ROWS}, so deepgemm_fp8_paged_mqa_logits "
+                "cannot stay in the preshuffled layout -- the only one it computes "
+                "correctly. Raise kv_cache_block_size."
+            )
         return rows
 
     def _kpool_tail_bytes(self) -> int:

@@ -27,9 +27,9 @@ from atom.model_ops.minimax_m3.index_topk import (
     PREFILL_TOPK_MAX_BLOCK_SIZE_K,
     PREFILL_TOPK_MIN_BLOCK_SIZE_K,
     SPARSE_BLOCK_SIZE,
-    _assert_packable,
     _decode_score_chunks,
     _prefill_topk_block_size_k,
+    _require_packable,
 )
 
 TOPK = 16
@@ -82,6 +82,14 @@ class TestDecodeScoreChunks:
         assert chunk_blocks * n >= max_block
         assert chunk_blocks * (n - 1) < max_block
 
+    @pytest.mark.parametrize("batch", [1, 64])
+    def test_an_empty_bound_still_gives_a_grid(self, batch):
+        """`cdiv(max_block, cdiv(max_block, chunks))` divides by its own inner
+        result, which is zero when there is nothing to score. The exception
+        lands outside any kernel launch, so on tp>1 one rank raises and the
+        rest wait in the next collective -- the shape a hang takes."""
+        assert _decode_score_chunks(batch, 0) == 1
+
     def test_shrinks_with_batch(self):
         # The cap exists so a large batch does not multiply into a pointless
         # grid; monotonicity is what makes that statement true.
@@ -102,12 +110,14 @@ class TestPackableBound:
     """The packed key spends its low 16 bits on a 1-based block id."""
 
     def test_accepts_what_fits(self):
-        _assert_packable(0xFFFE)
+        _require_packable(0xFFFE)
 
     @pytest.mark.parametrize("max_block", [0xFFFF, 0x10000, 1 << 20])
     def test_rejects_what_does_not(self, max_block):
-        with pytest.raises(AssertionError, match="packed top-k addresses"):
-            _assert_packable(max_block)
+        # ValueError and not AssertionError: `max_block` comes from the launch
+        # flags, so `python -O` must not be able to turn this into a wrap.
+        with pytest.raises(ValueError, match="packed top-k addresses"):
+            _require_packable(max_block)
 
     def test_the_bound_is_reachable_from_a_real_config(self):
         # 0xFFFE blocks is an 8.4M-token context; the assert is a guard rail,

@@ -405,16 +405,29 @@ def _decode_score_chunks(batch: int, max_block: int) -> int:
     target = max(
         1, min(DECODE_SCORE_MAX_CHUNKS, DECODE_SCORE_TARGET_GRID // max(1, batch))
     )
+    if max_block <= 0:
+        # A grid dim still has to be positive. Capping `chunks` is not enough:
+        # the round trip below divides by its own inner `cdiv`, zero here, and
+        # the raise lands outside any launch -- one rank down while the others
+        # wait in the collective that follows.
+        return 1
     chunks = min(1 << (target.bit_length() - 1), max_block)
     return triton.cdiv(max_block, triton.cdiv(max_block, chunks))
 
 
-def _assert_packable(max_block: int) -> None:
-    """The packed key spends its low 16 bits on the 1-based block id."""
-    assert max_block < 0xFFFF, (
-        f"packed top-k addresses at most {0xFFFF - 1} blocks, got {max_block}; "
-        "widen the tie-break field"
-    )
+def _require_packable(max_block: int) -> None:
+    """The packed key spends its low 16 bits on the 1-based block id.
+
+    Raised, not asserted: this is input validation (`max_block` follows from
+    `--max-model-len` and `--block-size`), and under `python -O` an assertion
+    would vanish and let the id wrap into the tie-break field -- a top-k that
+    quietly picks the wrong blocks.
+    """
+    if max_block >= 0xFFFF:
+        raise ValueError(
+            f"packed top-k addresses at most {0xFFFF - 1} blocks, got "
+            f"{max_block}; widen the tie-break field"
+        )
 
 
 def _alloc_emit(total_q, num_idx_heads, topk, block_table, emit, device):
@@ -762,7 +775,7 @@ def minimax_m3_index_topk(
     ), "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
     batch = cu_seqlens_q.shape[0] - 1
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
-    _assert_packable(max_block)
+    _require_packable(max_block)
 
     score = torch.empty(
         (num_idx_heads, total_q, max_block),
@@ -869,7 +882,7 @@ def minimax_m3_index_topk_decode(
     ), f"total_q {total_q} not divisible by max_query_len {max_query_len}"
     batch = seq_lens.shape[0]
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
-    _assert_packable(max_block)
+    _require_packable(max_block)
     topk_idx = torch.empty(
         (num_idx_heads, total_q, topk), dtype=torch.int32, device=idx_q.device
     )
