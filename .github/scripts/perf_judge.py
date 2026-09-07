@@ -1,0 +1,720 @@
+#! /usr/bin/env python3
+"""Judge a paired base/head benchmark comparison for a pull request.
+
+Consumes the two result directories produced by the paired A/B step of the PR
+perf check (same job, same machine, same container image, same aiter wheel) and
+decides whether the head commit regressed.
+
+Usage:
+    python perf_judge.py --base-dir <dir> --head-dir <dir> \\
+        [--history data.js] [--output-json verdict.json] \\
+        [--comment-file comment.md] > "$GITHUB_STEP_SUMMARY"
+
+Design notes
+------------
+The primary criterion is *family linkage*, not a per-configuration threshold.
+A "family" here is one model entry (backend + display model + isl/osl); its
+members are the concurrency levels. Independent concurrency levels drifting in
+the same direction at the same time is far less likely than any single level
+moving, so linkage is the most noise-resistant signal available -- and, unlike a
+sigma gate, it needs no estimate of the noise band.
+
+The sigma gate is auxiliary only. Estimating sigma requires several historical
+points on the *same* container image, and those barely exist: across 52
+deduplicated perf runs on the public dashboard, 30 of 39 images were benchmarked
+exactly once and only 3 reached 3 runs. What history can offer is a cross-image
+estimate, which is inflated by image-to-image level shifts and therefore
+conservative (a loose gate that under-reports rather than over-reports).
+
+Incomplete data never produces a pass. A family that lost too many concurrency
+levels is reported as ``insufficient``; if no family survives, the whole run is
+``inconclusive``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import statistics
+import sys
+import urllib.request
+from collections import defaultdict
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from summarize import (  # the sys.path shim above must run first
+    _backend_name,
+    _config_key,
+    _display_model,
+    _pct_change,
+    load_results,
+)
+
+# --- Family linkage (primary criterion; independent of sigma) ---------------
+JUDGE_MIN_CONC = 64  # below this, a level is reference-only and never judged
+FAMILY_MIN_CONFIGS = 3  # judging levels needed before a family is judged
+FAMILY_MIN_DOWN = 3  # of those, how many must be down
+FAMILY_MEDIAN_PCT = -3.0  # family median throughput delta that trips the gate
+DOWN_EPS_PCT = -2.0  # a level counts as "down" past this
+TPOT_MIRROR_RATIO = 0.6  # |median TPOT delta / median tput delta| for mirroring
+NONMONOTONIC_MARGIN_PCT = 3.0  # interior level this far outside its neighbours
+
+# Low concurrency levels are excluded from the verdict but still measured and
+# still shown. They pollute a verdict in both directions: they manufacture false
+# positives (an entry whose large-concurrency levels sat at their historical
+# peak was flagged at -4.2% purely on c4..c32) and they dilute real ones (an
+# all-levels median of -7.1% was -12.0% when restricted to large concurrency).
+# Dropping them from the *display* as well, however, removes the very evidence a
+# reader needs to tell "small-batch path problem" from "small-c noise" -- so
+# they are reported alongside, labelled, and excluded from every computation.
+
+# FAMILY_MEDIAN_PCT is PROVISIONAL. It was derived by tightening the -4.0 used
+# for nightly time-series monitoring by one notch, on the reasoning that a
+# paired same-machine measurement is quieter than a cross-run comparison. It is
+# not backed by a measurement yet. Calibrate it against an A/A run (same commit,
+# same wheel, repeated) before treating a trip as authoritative.
+
+# --- Single-configuration escalation (auxiliary; uses history sigma) --------
+SINGLE_DROP_PCT = -8.0  # a lone level this far down is worth surfacing
+SIGMA_MULT = 2.5  # ... if it also clears this many historical sigmas
+SINGLE_STANDS_ALONE_PCT = -10.0  # a drop this large needs no corroboration
+DRAMATIC_PCT = -25.0  # too large to be ordinary variance at any concurrency
+
+# Metric keys in the benchmark result JSON.
+TPUT_KEY = "total_token_throughput"
+TPOT_KEY = "mean_tpot_ms"
+TTFT_KEY = "mean_ttft_ms"
+
+DASHBOARD_DATA_JS = "https://rocm.github.io/ATOM/benchmark-dashboard/data.js"
+
+
+# --------------------------------------------------------------------------
+# Historical noise band
+# --------------------------------------------------------------------------
+def _parse_data_js(text):
+    """Extract the BENCHMARK_DATA object from a data.js payload."""
+    start = text.find("{")
+    if start < 0:
+        return None
+    try:
+        return json.loads(text[start:].rstrip().rstrip(";"))
+    except json.JSONDecodeError:
+        return None
+
+
+def load_history_cv(source=None):
+    """Return {(model, isl_osl, conc): coefficient_of_variation} from history.
+
+    ``source`` may be a local path or None (fetch the public dashboard). Any
+    failure yields an empty mapping -- the sigma gate is optional by design and
+    must never block a verdict.
+
+    Points are deduplicated by Actions run id first: the dashboard republishes a
+    single run against several commits (9% of perf points in the sampled
+    window), and duplicates have zero spread, so leaving them in biases the
+    estimate toward "suspiciously stable".
+    """
+    try:
+        if source:
+            text = Path(source).read_text(encoding="utf-8")
+        else:
+            req = urllib.request.Request(
+                DASHBOARD_DATA_JS, headers={"User-Agent": "atom-perf-judge"}
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                text = resp.read().decode("utf-8", errors="replace")
+    except (OSError, urllib.error.URLError):
+        return {}
+
+    data = _parse_data_js(text)
+    if not data:
+        return {}
+
+    runs = []
+    for entry in data.get("entries", {}).values():
+        runs.extend(entry)
+
+    seen_run_ids = set()
+    series = defaultdict(list)
+    name_re = re.compile(r"^(ATOM[^:]*)::(.+?)\s+(\d+/\d+)\s+c=(\d+)\s+Total Tput")
+
+    for run in sorted(runs, key=lambda r: r.get("date", 0)):
+        benches = run.get("benches") or []
+        if not benches:
+            continue
+        extra = benches[0].get("extra") or ""
+        run_id_match = re.search(r"actions/runs/(\d+)", extra)
+        run_id = run_id_match.group(1) if run_id_match else None
+        if run_id and run_id in seen_run_ids:
+            continue
+        if run_id:
+            seen_run_ids.add(run_id)
+        for bench in benches:
+            if bench.get("unit") != "tok/s":
+                continue
+            match = name_re.match(bench.get("name", ""))
+            if not match:
+                continue
+            key = (match.group(2), match.group(3), int(match.group(4)))
+            series[key].append(bench.get("value"))
+
+    cv = {}
+    for key, values in series.items():
+        values = [v for v in values if isinstance(v, (int, float))]
+        if len(values) < 6:
+            continue
+        median = statistics.median(values)
+        if median:
+            cv[key] = statistics.pstdev(values) / median
+    return cv
+
+
+# --------------------------------------------------------------------------
+# Pairing
+# --------------------------------------------------------------------------
+def pair_results(base_results, head_results):
+    """Match head measurements to base measurements by configuration key."""
+    base_map = {_config_key(d): d for d in base_results}
+    pairs = []
+    for head in head_results:
+        key = _config_key(head)
+        base = base_map.get(key)
+        if base is None:
+            continue
+        base_tput = base.get(TPUT_KEY)
+        head_tput = head.get(TPUT_KEY)
+        if not base_tput or not head_tput:
+            continue
+        pairs.append(
+            {
+                "backend": _backend_name(head),
+                "model": _display_model(head),
+                "isl_osl": f"{head.get('random_input_len', 0)}/"
+                f"{head.get('random_output_len', 0)}",
+                "conc": int(head.get("max_concurrency", 0)),
+                "base_tput": base_tput,
+                "head_tput": head_tput,
+                "tput_pct": _pct_change(head_tput, base_tput),
+                "tpot_pct": _delta_or_none(base, head, TPOT_KEY),
+                "ttft_pct": _delta_or_none(base, head, TTFT_KEY),
+            }
+        )
+    return pairs
+
+
+def _delta_or_none(base, head, key):
+    base_value, head_value = base.get(key), head.get(key)
+    if not base_value or not head_value:
+        return None
+    return _pct_change(head_value, base_value)
+
+
+# --------------------------------------------------------------------------
+# Judgment
+# --------------------------------------------------------------------------
+def judge_family(members, history_cv):
+    """Judge one model entry from its concurrency levels.
+
+    Returns a dict with ``status`` in {triggered, clean, insufficient} plus the
+    evidence behind that call.
+    """
+    members = sorted(members, key=lambda m: m["conc"])
+    judging = [m for m in members if m["conc"] >= JUDGE_MIN_CONC]
+    reference = [m for m in members if m["conc"] < JUDGE_MIN_CONC]
+
+    tputs = [m["tput_pct"] for m in judging]
+    tpots = [m["tpot_pct"] for m in judging if m["tpot_pct"] is not None]
+
+    result = {
+        "backend": members[0]["backend"],
+        "model": members[0]["model"],
+        "isl_osl": members[0]["isl_osl"],
+        "members": members,
+        "judging": judging,
+        "reference": reference,
+        "median_tput_pct": statistics.median(tputs) if tputs else None,
+        "median_tpot_pct": statistics.median(tpots) if tpots else None,
+        "n_down": sum(1 for t in tputs if t <= DOWN_EPS_PCT),
+        "n_total": len(tputs),
+        "nonmonotonic": _nonmonotonic(judging),
+        "escalations": _single_escalations(judging, history_cv),
+    }
+
+    if len(tputs) < FAMILY_MIN_CONFIGS:
+        result["status"] = "insufficient"
+        result["reason"] = (
+            f"only {len(tputs)} of {FAMILY_MIN_CONFIGS} required judging levels "
+            f"(c >= {JUDGE_MIN_CONC}) reported"
+        )
+        return result
+
+    median_tput = result["median_tput_pct"]
+    median_tpot = result["median_tpot_pct"]
+
+    # Mirroring: throughput down while TPOT goes up, by a comparable magnitude.
+    # It separates a real slowdown from measurement wobble, which does not make
+    # the two metrics move in lockstep.
+    mirror = (
+        median_tpot is not None
+        and median_tput < 0
+        and median_tpot > 0
+        and abs(median_tpot / median_tput) >= TPOT_MIRROR_RATIO
+    )
+    result["mirror"] = mirror
+    result["mirror_ratio"] = (
+        abs(median_tpot / median_tput)
+        if (median_tpot is not None and median_tput)
+        else None
+    )
+
+    triggered = (
+        median_tput <= FAMILY_MEDIAN_PCT
+        and result["n_down"] >= FAMILY_MIN_DOWN
+        and mirror
+    )
+    result["status"] = "triggered" if triggered else "clean"
+    return result
+
+
+def _nonmonotonic(judging):
+    """Flag an interior level that sits well outside its immediate neighbours.
+
+    A median cannot express this shape at all: c=64 -8.6%, c=128 -0.3%,
+    c=256 -7.8% medians to -7.8% and reads as a clean two-sided drop, while the
+    actual signal is that one level behaves nothing like the ones around it --
+    often a kernel-selection fork. Worth surfacing verbatim rather than
+    summarising away.
+    """
+    if len(judging) < 3:
+        return None
+    outliers = []
+    for i in range(1, len(judging) - 1):
+        value = judging[i]["tput_pct"]
+        lo = min(judging[i - 1]["tput_pct"], judging[i + 1]["tput_pct"])
+        hi = max(judging[i - 1]["tput_pct"], judging[i + 1]["tput_pct"])
+        if value > hi + NONMONOTONIC_MARGIN_PCT or value < lo - NONMONOTONIC_MARGIN_PCT:
+            outliers.append(
+                {
+                    "conc": judging[i]["conc"],
+                    "pct": value,
+                    "neighbours": [judging[i - 1]["conc"], judging[i + 1]["conc"]],
+                    "neighbour_pcts": [
+                        judging[i - 1]["tput_pct"],
+                        judging[i + 1]["tput_pct"],
+                    ],
+                }
+            )
+    return outliers or None
+
+
+def _single_escalations(members, history_cv):
+    """Auxiliary per-level flags. Never on their own a family verdict."""
+    flags = []
+    for member in members:
+        delta = member["tput_pct"]
+        if delta > SINGLE_DROP_PCT:
+            continue
+
+        reasons = []
+        if delta <= DRAMATIC_PCT:
+            reasons.append(f"drop {delta:.1f}% exceeds {DRAMATIC_PCT:.0f}%")
+        # Only judging levels reach this function, so there is no low-c caveat
+        # left to apply -- every level here is one the verdict already trusts.
+        if delta <= SINGLE_STANDS_ALONE_PCT:
+            reasons.append(f"c={member['conc']} dropped {delta:.1f}% on its own")
+
+        cv = history_cv.get((member["model"], member["isl_osl"], member["conc"]))
+        if cv:
+            sigma_pct = cv * 100.0
+            if abs(delta) > SIGMA_MULT * sigma_pct:
+                reasons.append(
+                    f"{abs(delta) / sigma_pct:.1f}x the historical sigma "
+                    f"({sigma_pct:.2f}%)"
+                )
+            else:
+                # Inside the (conservative, cross-image) noise band: record the
+                # miss so the summary can say why nothing was escalated.
+                reasons.append(
+                    f"within {SIGMA_MULT}x historical sigma "
+                    f"({sigma_pct:.2f}%) -- not escalated"
+                )
+
+        if reasons and not any("not escalated" in r for r in reasons):
+            flags.append({"conc": member["conc"], "pct": delta, "why": reasons})
+    return flags
+
+
+def judge(pairs, history_cv, expected_entries=None):
+    """Two-layer verdict: per model entry, then across entries."""
+    families = defaultdict(list)
+    for pair in pairs:
+        families[(pair["backend"], pair["model"], pair["isl_osl"])].append(pair)
+
+    results = [judge_family(members, history_cv) for members in families.values()]
+    results.sort(
+        key=lambda r: (
+            {"triggered": 0, "insufficient": 1, "clean": 2}[r["status"]],
+            r["median_tput_pct"] if r["median_tput_pct"] is not None else 0,
+        )
+    )
+
+    triggered = [r for r in results if r["status"] == "triggered"]
+    judged = [r for r in results if r["status"] in ("triggered", "clean")]
+
+    # Entries that were expected but produced no usable pair at all (the whole
+    # job died) never reach ``results``, so they have to be counted separately.
+    n_missing = max(0, (expected_entries or 0) - len(results))
+    incomplete = (len(results) - len(judged)) + n_missing
+
+    # A positive finding stands on its own -- missing coverage elsewhere does
+    # not weaken it. But the absence of a finding is only as good as the
+    # coverage behind it, so anything short of full coverage downgrades to
+    # ``partial``: no regression *in what could be measured*, which is a
+    # different claim from "no regression".
+    # A non-monotonic family is one the criterion cannot describe: the median
+    # and the down-count both assume the levels behave alike, and here they do
+    # not. Reporting "clean" would be a claim the method does not support, so
+    # such a run is handed to the reader instead of summarised away.
+    unclear = [f for f in results if f.get("nonmonotonic")]
+
+    if triggered:
+        verdict = "regression"
+    elif not judged:
+        verdict = "inconclusive"
+    elif unclear:
+        verdict = "unclear"
+    elif incomplete:
+        verdict = "partial"
+    else:
+        verdict = "clean"
+
+    return {
+        "verdict": verdict,
+        "n_triggered": len(triggered),
+        "n_judged": len(judged),
+        "n_insufficient": len(results) - len(judged),
+        "n_missing": n_missing,
+        "n_unclear": len(unclear),
+        "expected_entries": expected_entries,
+        "scope": _scope(triggered, judged),
+        "families": results,
+        "thresholds": {
+            "family_median_pct": FAMILY_MEDIAN_PCT,
+            "family_min_down": FAMILY_MIN_DOWN,
+            "family_min_configs": FAMILY_MIN_CONFIGS,
+            "tpot_mirror_ratio": TPOT_MIRROR_RATIO,
+            "family_median_pct_is_provisional": True,
+        },
+    }
+
+
+def _scope(triggered, judged):
+    """Second layer: how wide is the blast radius."""
+    if not triggered:
+        return None
+    if len(triggered) == len(judged) and len(judged) > 1:
+        return "all_entries"
+    if len(triggered) == 1:
+        return "single_entry"
+    return "several_entries"
+
+
+# --------------------------------------------------------------------------
+# Rendering
+# --------------------------------------------------------------------------
+_HEADLINE = {
+    "clean": "### No significant performance change",
+    "partial": "### No regression found, but coverage was incomplete",
+    "unclear": "### Needs a look -- levels moved, but not in a shape the criterion can judge",
+    "regression": "### Performance regression detected",
+    "inconclusive": "### Inconclusive -- not enough data",
+}
+
+_SCOPE_NOTE = {
+    "all_entries": (
+        "Every judged entry moved, which points at a shared path "
+        "(kernel / attention / scheduler) rather than one model."
+    ),
+    "single_entry": "Only one entry moved, which points at a model-specific path.",
+    "several_entries": "Several but not all entries moved.",
+}
+
+
+def _fmt(value, suffix="%"):
+    return "n/a" if value is None else f"{value:+.1f}{suffix}"
+
+
+def _delta_table(report, members_key, concs, extra_cols=()):
+    """One row per entry over a fixed set of concurrency columns.
+
+    ``extra_cols`` appends per-family summary columns as (title, fn) pairs.
+    Cells belonging to a tripped family are emphasised so the eye lands on the
+    row that produced the verdict.
+    """
+    titles = [f"c={c}" for c in concs] + [t for t, _ in extra_cols]
+    rows = [
+        "| Entry | " + " | ".join(titles) + " |",
+        "|" + "---|" * (len(titles) + 1),
+    ]
+    for family in report["families"]:
+        tripped = family["status"] == "triggered"
+        by_conc = {m["conc"]: m["tput_pct"] for m in family[members_key]}
+        cells = []
+        for conc in concs:
+            value = by_conc.get(conc)
+            cell = "-" if value is None else f"{value:+.1f}%"
+            cells.append(f"**{cell}**" if tripped and value is not None else cell)
+        cells += [fn(family) for _, fn in extra_cols]
+        rows.append(f"| {family['model']} | " + " | ".join(cells) + " |")
+    return rows
+
+
+def _median_cell(family):
+    if family["status"] == "insufficient":
+        return "insufficient"
+    text = _fmt(family["median_tput_pct"])
+    return f"**{text}**" if family["status"] == "triggered" else text
+
+
+def render(report, context):
+    """Render the PR comment body (concise; per-config detail lives in summary)."""
+    lines = [_HEADLINE[report["verdict"]], ""]
+    if context:
+        lines += [context, ""]
+
+    judge_concs = sorted({m["conc"] for f in report["families"] for m in f["judging"]})
+    ref_concs = sorted({m["conc"] for f in report["families"] for m in f["reference"]})
+
+    # --- judging levels (these, and only these, produce the verdict) --------
+    lines += [f"**Judging levels** (c >= {JUDGE_MIN_CONC})", ""]
+    lines += _delta_table(
+        report,
+        "judging",
+        judge_concs,
+        extra_cols=(
+            ("Median", _median_cell),
+            ("TPOT", lambda f: _fmt(f["median_tpot_pct"])),
+        ),
+    )
+
+    # --- reference levels (measured, shown, never judged) -------------------
+    if ref_concs:
+        lines += [
+            "",
+            (
+                f"**Reference levels** (c < {JUDGE_MIN_CONC}, not judged) -- shown "
+                f"so the shape is visible: judging levels moving together with "
+                f"these is a broad regression; these moving alone is a small-batch "
+                f"path issue or low-concurrency noise."
+            ),
+            "",
+        ]
+        lines += _delta_table(report, "reference", ref_concs)
+
+    lines.append("")
+
+    # --- shape flags -------------------------------------------------------
+    for family in report["families"]:
+        for flag in family.get("nonmonotonic") or []:
+            lo, hi = flag["neighbour_pcts"]
+            a, b = flag["neighbours"]
+            lines += [
+                (
+                    f"**{family['model']}: c={flag['conc']} at {flag['pct']:+.1f}% "
+                    f"does not follow its neighbours** (c={a} {lo:+.1f}%, "
+                    f"c={b} {hi:+.1f}%). A median cannot express this shape; it "
+                    f"often indicates a kernel-selection fork rather than a "
+                    f"uniform slowdown."
+                ),
+                "",
+            ]
+
+    if report["verdict"] == "inconclusive":
+        lines.append(
+            "No entry reported enough judging levels. "
+            "This is **not** a pass -- treat it as no signal."
+        )
+    elif report["verdict"] in ("clean", "partial", "unclear"):
+        thresholds = report["thresholds"]
+        lines.append(
+            f"No judged entry tripped (family median <= "
+            f"{thresholds['family_median_pct']}% and >= "
+            f"{thresholds['family_min_down']} judging levels down and TPOT "
+            f"mirroring)."
+        )
+        if report["verdict"] == "unclear":
+            lines.append(
+                "The linkage criterion (median + count) assumes the judging "
+                "levels move alike. At least one entry above does not, so no "
+                "verdict is claimed either way -- read the per-level numbers."
+            )
+        if report["verdict"] == "partial":
+            lines.append(
+                f"**{report['n_judged']} of "
+                f"{report['expected_entries'] or 'an unknown number of'} entries "
+                f"were judged.** The rest did not report enough data, so this is "
+                f"not a clean bill of health -- only the absence of a finding in "
+                f"the part that was measured."
+            )
+    else:
+        for family in report["families"]:
+            if family["status"] != "triggered":
+                continue
+            ratio = family.get("mirror_ratio")
+            lines.append(
+                f"- **{family['model']}**: {family['n_down']}/{family['n_total']} "
+                f"judging levels down, median {_fmt(family['median_tput_pct'])}, "
+                f"TPOT {_fmt(family['median_tpot_pct'])}"
+                + (f" (mirror ratio {ratio:.2f})" if ratio else "")
+            )
+            for flag in family["escalations"]:
+                lines.append(
+                    f"  - c={flag['conc']} {flag['pct']:+.1f}%: "
+                    + "; ".join(flag["why"])
+                )
+        if report["scope"]:
+            lines += ["", _SCOPE_NOTE[report["scope"]]]
+
+    # An entry that could not be judged may still have reported levels that
+    # dropped hard. Burying that under "no regression found" is the same
+    # failure as passing on incomplete data, one step removed -- so say it.
+    for family in report["families"]:
+        if family["status"] != "insufficient":
+            continue
+        bad = [m for m in family["judging"] if m["tput_pct"] <= DOWN_EPS_PCT]
+        if not bad:
+            continue
+        levels = ", ".join(f"c={m['conc']} {m['tput_pct']:+.1f}%" for m in bad)
+        lines += [
+            "",
+            (
+                f"**{family['model']} could not be judged, but the judging "
+                f"level(s) that did report were down: {levels}.** Too few levels "
+                f"arrived to apply the linkage criterion -- this is missing "
+                f"evidence, not evidence of absence. Re-run before reading the "
+                f"result as a pass."
+            ),
+        ]
+
+    gaps = []
+    if report["n_insufficient"]:
+        gaps.append(
+            f"{report['n_insufficient']} entry(ies) reported too few judging levels"
+        )
+    if report.get("n_missing"):
+        gaps.append(f"{report['n_missing']} entry(ies) reported nothing at all")
+    if gaps:
+        lines += ["", "Coverage gaps: " + "; ".join(gaps) + "."]
+
+    lines += [
+        "",
+        (
+            "This check does not block merge. It reports a measured delta "
+            "between the merge-base and the head commit; deciding whether it is "
+            "an acceptable trade-off is the reviewer's call."
+        ),
+    ]
+    return "\n".join(lines)
+
+
+def render_summary(report, context):
+    """Render the full step-summary table, one row per configuration."""
+    lines = ["## PR performance check", ""]
+    if context:
+        lines += [context, ""]
+    lines += [
+        "| Entry | isl/osl | conc | role | base | head | tput | TPOT | TTFT |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for family in report["families"]:
+        for member in family["members"]:
+            role = "judging" if member["conc"] >= JUDGE_MIN_CONC else "reference"
+            lines.append(
+                f"| {family['model']} | {member['isl_osl']} | {member['conc']} "
+                f"| {role} "
+                f"| {member['base_tput']:.1f} | {member['head_tput']:.1f} "
+                f"| {member['tput_pct']:+.2f}% | {_fmt(member['tpot_pct'])} "
+                f"| {_fmt(member['ttft_pct'])} |"
+            )
+    lines += [
+        "",
+        f"Verdict: **{report['verdict']}** "
+        f"({report['n_triggered']} triggered / {report['n_judged']} judged / "
+        f"{report['n_insufficient']} insufficient / "
+        f"{report.get('n_missing', 0)} missing"
+        + (
+            f" / {report['expected_entries']} expected)"
+            if report.get("expected_entries")
+            else ")"
+        ),
+        "",
+        (
+            "> The family-median threshold is provisional and not yet calibrated "
+            "against a repeated same-commit (A/A) measurement."
+        ),
+    ]
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(
+        description="Judge a paired base/head PR benchmark comparison"
+    )
+    parser.add_argument("--base-dir", required=True)
+    parser.add_argument("--head-dir", required=True)
+    parser.add_argument(
+        "--history",
+        default=None,
+        help="Local data.js for the sigma gate; omit to fetch the dashboard",
+    )
+    parser.add_argument(
+        "--no-history",
+        action="store_true",
+        help="Skip the sigma gate entirely (family linkage still applies)",
+    )
+    parser.add_argument(
+        "--expect-entries",
+        type=int,
+        default=None,
+        help="How many model entries the matrix was supposed to produce. "
+        "Without it, an entry whose job died entirely is invisible and the "
+        "verdict can read as clean on partial coverage.",
+    )
+    parser.add_argument("--context", default="", help="Line of provenance text")
+    parser.add_argument("--output-json")
+    parser.add_argument("--comment-file")
+    args = parser.parse_args()
+
+    base_results = load_results(args.base_dir, recursive=True)
+    head_results = load_results(args.head_dir, recursive=True)
+    pairs = pair_results(base_results, head_results)
+
+    if not pairs:
+        print("No base/head pairs matched -- nothing to judge.", file=sys.stderr)
+
+    history_cv = {} if args.no_history else load_history_cv(args.history)
+    report = judge(pairs, history_cv, expected_entries=args.expect_entries)
+    report["context"] = args.context
+    report["n_pairs"] = len(pairs)
+    report["history_configs"] = len(history_cv)
+
+    print(render_summary(report, args.context))
+
+    if args.comment_file:
+        Path(args.comment_file).write_text(
+            render(report, args.context), encoding="utf-8"
+        )
+    if args.output_json:
+        Path(args.output_json).write_text(
+            json.dumps(report, indent=2, default=str), encoding="utf-8"
+        )
+
+    # Always exit 0: this check informs the reviewer, it does not gate the merge.
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
