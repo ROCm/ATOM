@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import ctypes
 import gc
 import inspect
 import logging
@@ -92,6 +91,7 @@ from atom.utils.forward_context import (
     set_kv_cache_data,
 )
 from atom.utils.gc_utils import freeze_gc_heap
+from atom.utils.hip_stream import create_hip_stream_with_cu_mask
 from atom.utils.selector import get_attn_backend
 from atom.utils.tbo import (
     UBatchSlice,
@@ -4852,20 +4852,7 @@ class RapidServeModelRunner(ModelRunner):
         mask_bits is a list of uint32 words; bit i of word w represents
         CU (w*32 + i).  Uses hipExtStreamCreateWithCUMask (ROCm only).
         """
-        hip = ctypes.CDLL("libamdhip64.so")
-        hip.hipExtStreamCreateWithCUMask.restype = ctypes.c_int
-        hip.hipExtStreamCreateWithCUMask.argtypes = [
-            ctypes.POINTER(ctypes.c_void_p),
-            ctypes.c_uint,
-            ctypes.POINTER(ctypes.c_uint),
-        ]
-        raw_stream = ctypes.c_void_p()
-        mask_arr = (ctypes.c_uint * len(mask_bits))(*mask_bits)
-        ret = hip.hipExtStreamCreateWithCUMask(
-            ctypes.byref(raw_stream), len(mask_bits), mask_arr
-        )
-        assert ret == 0, f"HIP err {ret} creating masked stream"
-        return torch.cuda.ExternalStream(raw_stream.value)
+        return create_hip_stream_with_cu_mask(mask_bits)
 
     @staticmethod
     def _cu_mask_for_fraction(fraction: float, upper: bool) -> list[int]:

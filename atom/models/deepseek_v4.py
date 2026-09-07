@@ -120,6 +120,7 @@ from atom.utils.cuda_graph import CudagraphCaptureRunner
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import AttnState, get_forward_context
+from atom.utils.hip_stream import create_full_device_hip_stream
 
 logger = logging.getLogger(__name__)
 
@@ -4498,12 +4499,27 @@ class DeepseekV4Model(nn.Module):
         # Main Compressor overlap. indexer_stream: Indexer Compressor overlap.
         # Both allocated once, shared across all blocks. Attention runs before
         # MoE in each block, so attn and MoE never contend for alt_stream.
-        self.alt_stream: torch.cuda.Stream | None = (
-            torch.cuda.Stream() if torch.cuda.is_available() else None
-        )
-        self.indexer_stream: torch.cuda.Stream | None = (
-            torch.cuda.Stream() if torch.cuda.is_available() else None
-        )
+        self.alt_stream: torch.cuda.Stream | None = None
+        self.indexer_stream: torch.cuda.Stream | None = None
+        if torch.cuda.is_available():
+            # ROCclr reuses physical HSA queues after GPU_MAX_HW_QUEUES is
+            # reached.  If alt_stream shares an AQL ring, its event barriers
+            # can hold unrelated logical streams behind them and collapse the
+            # intended compressor/main-stream overlap.  A full-device CU mask
+            # keeps normal priority and full compute capacity while forcing a
+            # dedicated HSA queue outside ROCclr's ordinary queue pool.
+            if getattr(torch.version, "hip", None) is not None:
+                try:
+                    self.alt_stream = create_full_device_hip_stream()
+                except (OSError, RuntimeError, ValueError):
+                    logger.warning(
+                        "Failed to create a dedicated ROCm queue for the V4 "
+                        "alternate stream; falling back to a regular stream",
+                        exc_info=True,
+                    )
+            if self.alt_stream is None:
+                self.alt_stream = torch.cuda.Stream()
+            self.indexer_stream = torch.cuda.Stream()
         self.layers = nn.ModuleList(
             [
                 Block(

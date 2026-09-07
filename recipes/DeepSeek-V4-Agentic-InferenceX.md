@@ -45,7 +45,7 @@ python3 -m atom.entrypoints.openai_server \
 ```bash
 export AITER_BF16_FP8_MOE_BOUND=0
 export ATOM_MOE_GU_ITLV=1
-export GPU_MAX_HW_QUEUES=4
+export GPU_MAX_HW_QUEUES=5
 export ATOM_NUMA_BIND=1
 export ATOM_DP_SESSION_AFFINITY=1
 export ATOM_DP_LB_REQ_EQUIV=512
@@ -71,26 +71,39 @@ Against the TP command this adds `--enable-dp-attention --enable-tbo`, the four
 `ATOM_DP_*` routing variables, and the two `--enable-tbo` needs
 (`GPU_MAX_HW_QUEUES`, `ATOM_NUMA_BIND`); everything else is identical.
 
-`GPU_MAX_HW_QUEUES=4` is intentional. On MI355X, allowing a fifth HIP hardware
-queue produced a poor overlap state between the main decode stream, auxiliary
-producers, and RCCL polling collectives. A controlled queue-only C48 AgentX
-qualification (exact V4-Pro revision, 300 s profiling window, 48 lanes, DP=8,
-TBO enabled, EPLB disabled) measured:
+`GPU_MAX_HW_QUEUES=5` matches the Agentic CI configuration. DeepSeek-V4 keeps
+its alternate compressor/MoE stream on a dedicated normal-priority HSA queue
+on ROCm. ROCclr otherwise starts sharing physical HSA queues between logical
+HIP streams after the ordinary queue pool reaches this limit. An event barrier
+from one logical stream can then block unrelated packets later in the shared
+AQL ring, collapsing the intended overlap even though Perfetto still displays
+separate logical stream lanes. The full-device CU mask used for the alternate
+stream does not reserve or remove any CUs; it selects ROCclr's separate
+CU-masked queue path while retaining normal priority and full compute capacity.
 
-| queues | total tok/s | tok/s/user avg | ITL avg | ITL p99 | TTFT avg |
-|---:|---:|---:|---:|---:|---:|
-| 5 | 37,539.7 | 75.43 | 13.85 ms | 28.63 ms | 9.10 s |
-| 4 | 37,259.0 | 78.69 | 13.15 ms | 22.87 ms | 9.52 s |
+A same-host C48 / DPA8 / TBO / MTP3 / FULL-CUDAGraph diagnostic held the queue
+limit at five and changed only whether the alternate stream used that dedicated
+normal queue. In the fixed 180-second sending window, the shared-queue arm
+stopped making progress after its first 24 completed requests, while the
+dedicated-queue arm continued through the corpus:
 
-Thus four queues held aggregate throughput within 0.75% while improving average
-per-user decode throughput by 4.31%, average ITL by 5.06%, and p99 ITL by
-20.13%. The tradeoff was a 4.60% increase in average TTFT. A simultaneous
-8-rank trace showed decode falling from 28--30 ms to about 20 ms and collective
-start-skew p90 falling from 240 us to 45 us. Three queues did not improve decode
-materially over four and regressed collective start-skew p99 from 182 us to
-1.01 ms, so four is the selected latency/throughput compromise. This short run
-is a directional qualification; use the scenario's required >=900 s duration
-for release-grade throughput claims.
+| Metric | Shared ordinary queue | Dedicated normal queue | Change |
+|---|---:|---:|---:|
+| Requests sent in 180 s | 47 | 145 | +208.5% |
+| Requests completed by 180 s | 24 | 130 | +441.7% |
+| Completed output tokens by 180 s | 6,389 | 50,578 | +691.6% |
+| Requests completed after 30 s grace | 24 | 140 | +483.3% |
+| Completed output tokens after grace | 6,389 | 60,529 | +847.4% |
+| Inference errors | 0 | 0 | unchanged |
+
+The short run is a mechanism qualification rather than a release-grade
+throughput result. The two arms advance to different portions of the agentic
+corpus once the shared-queue arm stalls, so latency distributions over all
+completed requests are not a paired comparison. The trace evidence isolates
+the mechanism: alternate-stream kernels shrink from roughly 40--47 us to
+4--12 us, their overlap with the main stream rises from 275/642 to 586/642
+operations, and the active-rank decode median returns from 39.35 ms to
+18.52 ms without changing kernel count or priority.
 
 `ATOM_DP_SESSION_AFFINITY` is not optional here. Without it a conversation's
 turns land on different DP ranks, so the prefix KV written by one turn sits on
