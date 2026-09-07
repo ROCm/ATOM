@@ -547,10 +547,21 @@ jobs:
             echo "ERROR: RDMA smoke rank ${rank} received ${signal} on ${rank_host}" >&2
             exit "${rc}"
           }
+          publish_rank_rc() {
+            local rc="$1"
+            local rc_file
+            [[ -n "${RDMA_SMOKE_RUN_DIR:-}" ]] || return 0
+            rc_file="${RDMA_SMOKE_RUN_DIR}/rank-rc-${rank}"
+            printf '%s\n' "${rc}" > "${rc_file}.tmp" 2>/dev/null || return 0
+            mv "${rc_file}.tmp" "${rc_file}" 2>/dev/null || true
+          }
           on_exit() {
             local rc=$?
             trap - EXIT
             echo "=== RDMA smoke rank exit: rank=${rank} host=${rank_host} pid=$$ job=${job_id} container=${container} rc=${rc} ==="
+            # Publish before cleanup: Slurm accounting is unreliable on Spur, so
+            # the workflow falls back to these per-rank codes.
+            publish_rank_rc "${rc}"
             cleanup
             exit "${rc}"
           }
@@ -1190,6 +1201,7 @@ jobs:
 
           slurm_status_file="${run_dir}/slurm-job.rc"
           rm -f "${slurm_status_file}" "${slurm_status_file}.tmp"
+          rm -f "${run_dir}"/rank-rc-*
           batch_script="${run_dir}/rdma-smoke.sbatch.sh"
           if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
             # Spur launches this script on each node with SPUR_TASK_OFFSET; srun is unavailable.
@@ -1264,6 +1276,10 @@ jobs:
           write_slurm_cancel_helper "${JOB_ID}"
           set_slurm_job_log_paths "${JOB_ID}"
           monitor_slurm_job "${JOB_ID}"
+
+          # Spur leaves the job in COMPLETING while RDMA leftovers are reaped,
+          # so give sacct longer than the 30s default to publish a final state.
+          SLURM_ACCOUNTING_TIMEOUT="${SLURM_ACCOUNTING_TIMEOUT:-180}"
           read_slurm_exit_code "${JOB_ID}"
           if [[ "${SLURM_STATE}" == "unknown" && -s "${slurm_status_file}" ]]; then
             batch_rc="$(tr -d '[:space:]' < "${slurm_status_file}")"
@@ -1278,6 +1294,34 @@ jobs:
               echo "Using batch script exit status because Slurm accounting is unavailable."
             else
               echo "WARNING: invalid batch script exit status: ${batch_rc}" >&2
+            fi
+          fi
+          if [[ "${SLURM_STATE}" == "unknown" ]]; then
+            # The Spur batch script cannot write a single status file because it
+            # runs once per node, so aggregate the per-rank codes instead.
+            ranks_reported=0
+            worst_rank_rc=0
+            for rank_rc_file in "${run_dir}"/rank-rc-*; do
+              [[ -s "${rank_rc_file}" ]] || continue
+              rank_rc="$(tr -d '[:space:]' < "${rank_rc_file}")"
+              [[ "${rank_rc}" =~ ^[0-9]+$ ]] || continue
+              ranks_reported=$((ranks_reported + 1))
+              echo "rdma smoke rank status: $(basename "${rank_rc_file}")=${rank_rc}"
+              if [[ "${rank_rc}" -gt "${worst_rank_rc}" ]]; then
+                worst_rank_rc="${rank_rc}"
+              fi
+            done
+            if [[ "${ranks_reported}" -ge "${node_count}" ]]; then
+              SLURM_JOB_RC="${worst_rank_rc}"
+              SLURM_EXIT_CODE="${worst_rank_rc}:0"
+              if [[ "${worst_rank_rc}" -eq 0 ]]; then
+                SLURM_STATE="COMPLETED"
+              else
+                SLURM_STATE="FAILED"
+              fi
+              echo "Using per-rank exit status because Slurm accounting is unavailable."
+            else
+              echo "WARNING: only ${ranks_reported}/${node_count} RDMA smoke ranks reported an exit status" >&2
             fi
           fi
           SLURM_JOB_ACTIVE=0
