@@ -218,7 +218,10 @@ class KimiRMSNormGated(nn.Module):
         # When ``quant_type`` names a fusable per-token scheme, the per-head
         # sigmoid-gated norm also emits (quantized, scale) so the consuming
         # o_proj skips its standalone quant; otherwise it returns a bf16 tensor.
-        self.quant_type = quant_type
+        # Dynamo cannot compare the pybind11 QuantType enum in the traced norm.
+        self.quant_type_value = (
+            quant_type.value if quant_type is not None else QuantType.No.value
+        )
         self.quant_dtype = quant_dtype
 
     def forward(self, x: torch.Tensor, gate: torch.Tensor):
@@ -229,7 +232,7 @@ class KimiRMSNormGated(nn.Module):
             self.weight,
             gate,
             self.variance_epsilon,
-            quant_type=self.quant_type,
+            quant_type_value=self.quant_type_value,
             quant_dtype=self.quant_dtype,
         )
 
