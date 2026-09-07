@@ -120,6 +120,7 @@ support_draft_model_arch_dict = {
     "MiMoV2MTPModel": "atom.models.mimo_v2_mtp.MiMoV2MTP",
     "MiMoV2FlashMTPModel": "atom.models.mimo_v2_mtp.MiMoV2MTP",
     "Qwen3_5MTPModel": "atom.models.qwen3_5_mtp.Qwen3_5MTP",
+    "Glm5NextMTPModel": "atom.models.glm5_next_mtp.Glm5NextMTP",
     "Eagle3LlamaModel": "atom.models.eagle3_llama.Eagle3LlamaModel",
     "Eagle3DeepseekMLAModel": "atom.models.eagle3_deepseek_mla.Eagle3DeepseekMLAModel",
     "K3DSparkModel": "atom.models.kimi_k3_dspark.KimiK3DSpark",
@@ -220,7 +221,12 @@ class Drafter(abc.ABC):
         all_gather that goes INTO the recording, so a synthetic context left
         describing the target bakes a collective the pass never runs at.
         """
-        if not self.draft_graphs:
+        from atom.utils import envs
+
+        # The forced-rejection diagnostic returns sentinel draft ids before any
+        # draft forward.  Its declared graphs are therefore unreachable, and
+        # warming them would try to compile an otherwise-uninitialized wrapper.
+        if envs.ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL or not self.draft_graphs:
             return
         runner = self.runner
         capture_sizes = sorted(runner.capture_sizes)  # capture leaves it descending

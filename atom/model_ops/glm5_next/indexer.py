@@ -141,8 +141,36 @@ def _sparse_attn_indexer_kpool(
         raise NotImplementedError(
             "GLM-5.3 kpool does not support DCP/PCP; use dcp=pcp=1"
         )
-    if not context.is_prefill and attn_metadata.max_seqlen_q > 1:
-        raise NotImplementedError("GLM-5.3 kpool does not support speculative decode")
+    # Prefer explicit scheduler metadata. The ragged-query condition covers
+    # metadata implementations that do not expose ``num_spec_decodes``.
+    is_speculative_verify = getattr(attn_metadata, "num_spec_decodes", 0) > 0 or (
+        not context.is_prefill and attn_metadata.max_seqlen_q > 1
+    )
+    if is_speculative_verify:
+        from .speculative import run_speculative_kpool_indexer
+
+        run_speculative_kpool_indexer(
+            attn_metadata,
+            kv_cache,
+            q_fp8,
+            k,
+            gate_score,
+            weights,
+            compress_ape,
+            tail_cache,
+            state_slot_idx_in,
+            state_slot_idx,
+            positions,
+            sparse_kv_indices_buffer,
+            index_kpool,
+            topk_tokens,
+            topk_out_width,
+            get_current_atom_config().kv_cache_block_size,
+            max_model_len,
+            scale_fmt,
+            stable_topk,
+        )
+        return result
 
     device = hidden_states.device
     block_size = get_current_atom_config().kv_cache_block_size

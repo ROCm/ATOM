@@ -5,8 +5,8 @@
 > vision tower is skipped) and scores **gsm8k 0.9682 / 0.9689** at 3-shot on the
 > dense path and **0.9659 / 0.9666** at 16-shot on the pooled k-pool path, over
 > all 1319 questions (chat, TP8, bf16 KV; see §7). Per-layer hidden states match
-> the transformers reference to cosine ≥ 0.9997 at all 45 layers. Not yet done:
-> the MTP draft layer or multimodal serving. See §8.
+> the transformers reference to cosine ≥ 0.9997 at all 45 layers. The GLM-5.3
+> MTP draft layer passes TP8 functional and throughput validation. See §8.
 
 ```bash
 python -m atom.examples.simple_inference --model /models/GLM-5.3-Flash -tp 4 \
@@ -91,9 +91,9 @@ as the checkpoint names them (`hc_attn_fn`, ...), keeps `q/k/v_conv1d` separate
 like the checkpoint (Kimi-K3 already does), and folds the low-rank KDA output
 gate after load, so its whole `weights_mapping` is one rule:
 `"model.language_model." -> "model."`. `model.visual.*` is dropped via
-`skip_weight_prefixes`, and checkpoint layer 45 (MTP) is dropped automatically by
-the loader's past-last-layer filter. Only the expert and q/k/v fusions go through
-`packed_modules_mapping`.
+`skip_weight_prefixes`. Checkpoint layer 45 is dropped from the target by the
+loader's past-last-layer filter and loaded separately by the MTP wrapper. Only
+the expert and q/k/v fusions go through `packed_modules_mapping`.
 
 ## 3. What is validated
 
@@ -330,7 +330,9 @@ backends forward it into their fused activation path. The dense layers use
 The model now carries `@support_torch_compile`; TP8 level-3 compilation and
 whole-forward CUDA graph capture are smoke-tested. Sharing the identity RoPE
 cache across all 11 MLA layers reduced measured `peak_torch` from 42.71 GiB to
-41.47 GiB per TP rank. MTP remains unsupported.
+41.47 GiB per TP rank. On MI308X, MTP3 raised single-request output throughput
+from 104.67 to 181.54 tok/s (+73.44%), while MTP1 raised concurrency-8 output
+throughput from 409.96 to 559.98 tok/s (+36.59%).
 
 ## 7. Measured serving accuracy
 
@@ -384,17 +386,20 @@ Three things about scoring this model that will otherwise waste a run:
    `model_ops/glm5_next/{indexer,kpool}.py` implements the paged/ragged pooled
    indexer; measured at 16-shot in §7 and checked directly against its torch
    kernel references.
-2. **MTP draft layer** (checkpoint layer 45: `eh_proj` / `enorm` / `hnorm` /
-   `shared_head.norm`, plus its own indexer). `index_share_for_mtp_iteration`
-   means it reuses the main model's top-k.
+2. ~~**MTP draft layer.**~~ Done — the GLM-specific checkpoint layer 45
+   (`eh_proj` / `enorm` / `hnorm` / `shared_head.norm`, k-pool MLA and clamped
+   SwiGLU MoE) runs through the existing NextN runtime. TP8 MTP1 and MTP3 passed
+   text requests, natural acceptance lengths 0 through 3, forced rejection,
+   concurrent short/long requests, and an 8/8 quality smoke suite.
 3. **Parallel feature coverage.** PCP, DCP and TBO remain explicitly rejected
    until their pooled-index metadata/state layouts have dedicated tests.
 4. **Multimodal serving.** Land the image processor, input builder, tower and
    packed-weight tests together. `Glm5NextProcessor` only exists in transformers
    >= 5.16 while ATOM pins 5.12.1; video additionally needs frame sampling.
    Until then `model.visual.*` is skipped so text serving does not pay its VRAM.
-5. **Performance**: tune the newly-enabled compiled path, add MTP speculative
-   decoding, and drop the `hc` torch fallback once the fused path is trusted.
+5. **Performance**: MTP3 is the measured single-request latency/throughput
+   choice; MTP1 is the concurrency-8 throughput choice. Add a sustained soak
+   and drop the `hc` torch fallback once the fused path is trusted.
 6. **Upstream the transformers FP8 bug** (§4a) and the gfx950 Triton failure (§4b).
 
 Upstream, for reference: sglang PR #36507 (16.6k lines, 144 files) and vLLM PR
