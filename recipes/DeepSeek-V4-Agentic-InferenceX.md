@@ -45,7 +45,7 @@ python3 -m atom.entrypoints.openai_server \
 ```bash
 export AITER_BF16_FP8_MOE_BOUND=0
 export ATOM_MOE_GU_ITLV=1
-export GPU_MAX_HW_QUEUES=5
+export GPU_MAX_HW_QUEUES=4
 export ATOM_NUMA_BIND=1
 export ATOM_DP_SESSION_AFFINITY=1
 export ATOM_DP_LB_REQ_EQUIV=512
@@ -70,6 +70,27 @@ python3 -m atom.entrypoints.openai_server \
 Against the TP command this adds `--enable-dp-attention --enable-tbo`, the four
 `ATOM_DP_*` routing variables, and the two `--enable-tbo` needs
 (`GPU_MAX_HW_QUEUES`, `ATOM_NUMA_BIND`); everything else is identical.
+
+`GPU_MAX_HW_QUEUES=4` is intentional. On MI355X, allowing a fifth HIP hardware
+queue produced a poor overlap state between the main decode stream, auxiliary
+producers, and RCCL polling collectives. A controlled queue-only C48 AgentX
+qualification (exact V4-Pro revision, 300 s profiling window, 48 lanes, DP=8,
+TBO enabled, EPLB disabled) measured:
+
+| queues | total tok/s | tok/s/user avg | ITL avg | ITL p99 | TTFT avg |
+|---:|---:|---:|---:|---:|---:|
+| 5 | 37,539.7 | 75.43 | 13.85 ms | 28.63 ms | 9.10 s |
+| 4 | 37,259.0 | 78.69 | 13.15 ms | 22.87 ms | 9.52 s |
+
+Thus four queues held aggregate throughput within 0.75% while improving average
+per-user decode throughput by 4.31%, average ITL by 5.06%, and p99 ITL by
+20.13%. The tradeoff was a 4.60% increase in average TTFT. A simultaneous
+8-rank trace showed decode falling from 28--30 ms to about 20 ms and collective
+start-skew p90 falling from 240 us to 45 us. Three queues did not improve decode
+materially over four and regressed collective start-skew p99 from 182 us to
+1.01 ms, so four is the selected latency/throughput compromise. This short run
+is a directional qualification; use the scenario's required >=900 s duration
+for release-grade throughput claims.
 
 `ATOM_DP_SESSION_AFFINITY` is not optional here. Without it a conversation's
 turns land on different DP ranks, so the prefix KV written by one turn sits on
