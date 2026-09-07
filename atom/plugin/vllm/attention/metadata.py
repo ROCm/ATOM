@@ -474,7 +474,26 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
     # which is exactly the FULL_AND_PIECEWISE contract this model needs. The only
     # thing given up is cudagraph capture of spec-decode verify batches (not used
     # by the MXFP8 M3 serving path); correctness of prefill takes precedence.
-    _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    #
+    # GRAPH-MODE EXPERIMENT (env-gated): the MXFP8 M3 *decode* serving path DOES
+    # use spec-decode verify (EAGLE3, query_len == 1+num_spec). Under
+    # cudagraph_mode=FULL_DECODE_ONLY, declaring UNIFORM_SINGLE_TOKEN_DECODE makes
+    # vLLM downgrade the whole decode to cudagraph_mode=NONE (fully eager) because
+    # it can't capture the uniform query_len>1 verify batch -> no graph benefit on
+    # the non-attention decode compute (MoE/norms/projections). Setting
+    # ATOM_M3_UNIFORM_BATCH_CAPTURE=1 promotes support to UNIFORM_BATCH so those
+    # verify batches full-capture. This regime differs from the prefill-corruption
+    # scenario above: (a) FULL_DECODE_ONLY never captures prefill (90k tok >> 512
+    # capture cap), (b) the eager-break op re-runs each replay (add_eager records
+    # fn; BreakableCUDAGraphCapture.replay re-invokes it with fresh forward-context
+    # metadata from build()), so KV/index writes are NOT frozen at capture time.
+    # MUST be validated with gsm8k (ref 0.9484, watch for "liclic") before shipping.
+    import os as _os
+
+    if _os.environ.get("ATOM_M3_UNIFORM_BATCH_CAPTURE", "0") == "1":
+        _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
+    else:
+        _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
     reorder_batch_threshold = 1
 
     def __init__(
@@ -720,7 +739,16 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
         )
 
     def build_for_cudagraph_capture(self, common_attn_metadata=None):
-        return self._build_uniform_decode_metadata(common_attn_metadata)
+        # Mirror build()'s mql-based kernel routing so the capture-time eager run
+        # of the sparse op uses the SAME path as every runtime replay. A uniform
+        # spec-verify capture bucket has max_query_len == 1+num_spec (> 1); it
+        # MUST go through the varlen prefill/extend path (per-token causal), not
+        # the decode kernel (which treats q.shape[0] as request count and OOBs on
+        # verify rows). Pure single-token decode (mql == 1) keeps the decode kernel.
+        mql = max(1, int(common_attn_metadata.max_query_len or 1))
+        if mql == 1:
+            return self._build_uniform_decode_metadata(common_attn_metadata)
+        return self._build_prefill_only_metadata(common_attn_metadata)
 
 
 # vLLM metadata builders
