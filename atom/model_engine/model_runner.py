@@ -54,7 +54,7 @@ from atom.model_engine.sequence import (
 )
 from atom.model_engine.state_runtime import StateRuntime
 from atom.model_loader.loader import load_model
-from atom.model_ops.attentions.sub_pool_spec import (
+from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
     InsufficientPoolBudget,
     Pool,
     PoolPlan,
@@ -193,14 +193,9 @@ class tokenIDProcessor:
         self.input_ids = CpuGpuBuffer(
             max_num_batched_tokens + 1, dtype=torch.int32, device=device
         )
-        # One per request, not per token: `decode_cu` is the exclusive prefix
-        # sum of this step's per-request token counts and `decode_src` says
-        # where each request's anchor comes from. Sized by tokens because that
-        # is the bound this class is handed; a batch can never hold more
-        # requests than tokens.
-        self.decode_cu = CpuGpuBuffer(
-            max_num_batched_tokens + 1, dtype=torch.int32, device=device
-        )
+        # One per request, not per token: where each request's anchor comes
+        # from. Sized by tokens -- a batch can never hold more requests. The
+        # matching prefix sum is `forward_vars["cu_seqlens_q"]`.
         self.decode_src = CpuGpuBuffer(
             max_num_batched_tokens, dtype=torch.int32, device=device
         )
@@ -496,15 +491,9 @@ class tokenIDProcessor:
                 total_tokens_prefill : total_tokens_prefill + total_tokens_decode
             ]
             if self.use_spec:
-                if (
-                    getattr(batch, "dynamic_spec_query_tokens_per_req", None)
-                    is not None
-                ):
-                    # RAGGED: scheduled_tokens is already the flat [anchor, drafts...]
-                    # so no rectangular reshape/overwrite is needed.
-                    pass
-                else:
-                    token_ids[:, 1:] = batch.scheduled_spec_decode_tokens
+                # Reached only under pipeline parallel, which no spec path
+                # supports yet; wants the deferred branch's per-request staging.
+                raise NotImplementedError("pipeline parallel + speculative decode")
 
             self.input_ids.np[:total_tokens_decode] = token_ids
             return self.input_ids.copy_to_gpu(total_tokens_decode)
@@ -526,12 +515,8 @@ class tokenIDProcessor:
         num_deferred_seqs = len(deferred_curr_indices)
         num_new_seqs = len(new_curr_indices)
 
-        # `max_seqlen_q` is the single source of truth for the uniform
-        # case (= mtp_k+1 for plain MTP, or the DSpark q-bucket when shrunk this
-        # step); `dynamic_spec_query_tokens_per_req` overrides it per request
-        # when DSpark runs ragged. See `ForwardMode.max_seqlen_q`, which the
-        # step settles and the batch no longer carries.
-        _per_req = getattr(batch, "dynamic_spec_query_tokens_per_req", None)
+        # The GRAPH's row stride, for sizing the padded tail only. NOT a
+        # per-request length: dp>1 raises it to the DP-wide maximum.
         tokens_per_seq = max_seqlen_q if self.use_spec else 1
 
         # Receive and map bonus_list to current batch order
@@ -548,42 +533,42 @@ class tokenIDProcessor:
             ]
 
         # ---- One path for every decode step -------------------------------
-        # DSpark's ragged buckets give each request its own length; everything
-        # else gives them all `tokens_per_seq`. Both are just `lens`.
-        ragged_lens = _per_req
-        # `lens` is the only statement of how many tokens each request gets:
-        # per-request under DSpark's ragged buckets, uniform `tokens_per_seq`
-        # otherwise. Everything below addresses through its prefix sum, so a
-        # ragged step and a rectangular one run the same code.
-        lens = (
-            np.asarray(ragged_lens, dtype=np.int32)
-            if ragged_lens is not None
-            else np.full(len(batch.req_ids), tokens_per_seq, dtype=np.int32)
-        )
-        bs = lens.shape[0]
-        cu_np = self.decode_cu.np[: bs + 1]
-        cu_np[0] = 0
-        np.cumsum(lens, out=cu_np[1:])
-        total = int(cu_np[bs])
+        # `num_scheduled_tokens` is the one statement of the per-request
+        # lengths -- the ragged shrink rewrites it in place, so ragged and
+        # rectangular are the same array. Its prefix sum is `cu_seqlens_q`,
+        # already published; a second copy is what let the two disagree under DP.
+        bs, lens, cu_np = self.runner.attn_metadata_builder.decode_spans(batch)
 
         # Stage the scheduler's ids over the whole region. For a request the
         # scheduler just admitted this is already its real anchor (and drafts);
         # for a carried-over one it is a placeholder the kernel overwrites.
-        self.input_ids.np[:total] = scheduled_tokens[
-            total_tokens_prefill : total_tokens_prefill + total
+        self.input_ids.np[:total_tokens_decode] = scheduled_tokens[
+            total_tokens_prefill : total_tokens_prefill + total_tokens_decode
         ]
-        if self.use_spec and ragged_lens is None and num_new_seqs > 0:
-            self.input_ids.np[:total].reshape(bs, tokens_per_seq)[
-                new_curr_indices, 1:
-            ] = batch.scheduled_spec_decode_tokens[new_curr_indices]
-        self.input_ids.copy_to_gpu(total)
+        # A newly admitted request has no row in `prev_token_ids`, so
+        # `fill_deferred_decode_ids` skips it (`src < 0`) and its draft columns
+        # must be staged here -- `scheduled_tokens` gave it committed history,
+        # correct only at column 0.
+        #
+        # Looped, not scattered: measured, the loop wins below ~24 admissions
+        # per step (1.2us at 2) and a ragged scatter is a flat ~8us; above it
+        # the scatter wins (12us vs 88us at bs=256). Swap if admissions stop
+        # being few.
+        if self.use_spec and num_new_seqs > 0:
+            spec = batch.scheduled_spec_decode_tokens
+            for i in new_curr_indices:
+                n_draft = int(lens[i]) - 1
+                if n_draft > 0:
+                    s = int(cu_np[i]) + 1
+                    self.input_ids.np[s : s + n_draft] = spec[i, :n_draft]
+        self.input_ids.copy_to_gpu(total_tokens_decode)
 
         src_np = self.decode_src.np[:bs]
         src_np.fill(NEW_SEQUENCE)
         src_np[deferred_curr_indices] = deferred_prev_indices
         fill_deferred_decode_ids(
             self.input_ids.gpu,
-            self.decode_cu.copy_to_gpu(bs + 1),
+            self.runner.forward_vars["cu_seqlens_q"].gpu[: bs + 1],
             self.decode_src.copy_to_gpu(bs),
             self.prev_token_ids,
             self.draft_token_ids if self.pre_num_decode_token_per_seq > 1 else None,
@@ -591,23 +576,23 @@ class tokenIDProcessor:
         )
 
         # CUDAGraph tail padding. A replayed decode graph reads a fixed
-        # `running_bs * tokens_per_seq` tokens out of this buffer, but a
-        # step writes only the `total` it scheduled, and `bs` sits between two
+        # `running_bs * tokens_per_seq` tokens out of this buffer, but a step
+        # writes only what it scheduled, and `bs` sits between two
         # captured buckets on most steps -- a 65-request batch replays the 128
         # graph, so 63 requests' worth of slots are never written. Nobody else
         # fills them: `run_model` pads `cu_seqlens_q` so the padded sequences are
         # empty for attention, but the ids stay whatever the previous forward
         # left, and the MoE path does consume padded rows. Zero is a legal vocab
         # id, so the embedding gather stays in bounds either way.
-        fill_to = total
+        fill_to = total_tokens_decode
         if not self.runner.enforce_eager:
             gbs = next(
                 (g for g in reversed(self.runner.capture_sizes) if g >= bs), None
             )
             if gbs is not None:
                 fill_to = max(fill_to, int(gbs) * tokens_per_seq)
-        if fill_to > total:
-            self.input_ids.gpu[total:fill_to].zero_()
+        if fill_to > total_tokens_decode:
+            self.input_ids.gpu[total_tokens_decode:fill_to].zero_()
 
         input_ids = self.input_ids.gpu[:total_tokens]
         return input_ids
@@ -1351,15 +1336,6 @@ class ModelRunner:
             self.forward_vars["num_accepted_tokens"] = CpuGpuBuffer(
                 self.max_bs, **i32_kwargs
             )
-            if self.config.dspark.ragged and self.drafter.uses_confidence_schedule:
-                # Pinned staging for the ragged H2D transfers (pageable would
-                # sync). Separate slots: the two are live at once within a step.
-                self.forward_vars["ragged_lens"] = CpuGpuBuffer(
-                    self.max_bs, **i32_kwargs
-                )
-                self.forward_vars["ragged_extend"] = CpuGpuBuffer(
-                    self.max_bs, **i32_kwargs
-                )
             # Per in-flight slot via forward_vars; PP ring clones it.
             self.forward_vars["draft_next_tokens"] = CpuGpuBuffer(
                 self.max_bs, **i32_kwargs
@@ -1713,7 +1689,7 @@ class ModelRunner:
         specs = self._sub_pool_specs()
 
         # Sub-pool sizing is pure arithmetic over the byte budget — see
-        # atom/model_ops/attentions/sub_pool_spec.py. STATE classes (GDN
+        # atom/model_ops/attentions/pool_layout/sub_pool_spec.py. STATE classes (GDN
         # recurrent state, the V4 compressor ring, the V4 sliding window) take
         # their floor first because a request cannot run without them; the
         # PAGE class absorbs the rest. Which classes exist, and what they are
@@ -2187,7 +2163,7 @@ class ModelRunner:
             return (False, False, 0, 0)
 
         local_tbo = local_tbo_precompute(
-            self.config, batch, is_prefill, np.asarray(batch.num_scheduled_tokens)
+            self.config, batch, is_prefill, batch.num_scheduled_tokens
         )
 
         # PCP+TBO prefill: split requests into two GROUPS at a request boundary
@@ -2301,7 +2277,7 @@ class ModelRunner:
         # the array is entirely decode segments. Keep the first q of each seq's
         # segment: token[0] is the anchor; the rest are placeholders overwritten
         # by token_ids[:, 1:] = scheduled_spec_decode_tokens downstream.
-        old_nst = np.asarray(batch.num_scheduled_tokens, dtype=np.int32)
+        old_nst = batch.num_scheduled_tokens
         sched = np.asarray(batch.scheduled_tokens)
         old_cu = np.zeros(scheduled_bs + 1, dtype=np.int64)
         np.cumsum(old_nst[:scheduled_bs], out=old_cu[1:])
@@ -2327,13 +2303,14 @@ class ModelRunner:
     def _dspark_apply_ragged(self, batch, scheduled_bs, full_q, by_req):
         """DSpark per-request RAGGED verify (paper §5.2 avoid-padding).
 
-        Sets num_scheduled_tokens[i] = len_i PER REQUEST (no batch-level pad to a
-        single q), where len_i = max(ell_i, max_num_bonus) + 1, clamped to
-        [1, full_q]. Downstream V4 attn is marker-driven (cu_seqlens etc.) so a
-        ragged num_scheduled_tokens flows through unchanged; dropped draft suffix
-        is re-drafted next step -> lossless. KV stays reserved at mtp_k+1.
+        Sets num_scheduled_tokens[i] = max(ell_i, num_bonus_i) + 1, clamped to
+        [1, full_q] -- both terms request i's own, so two requests that accepted
+        2 and 5 forward 3 and 6 tokens, not 6 and 6. Downstream V4 attn is
+        marker-driven (cu_seqlens etc.), so ragged lengths flow through
+        unchanged; the dropped draft suffix is re-drafted next step (lossless).
+        KV stays reserved at mtp_k+1.
         """
-        old_nst = np.asarray(batch.num_scheduled_tokens, dtype=np.int32)
+        old_nst = batch.num_scheduled_tokens
 
         tp = getattr(self, "tokenID_processor", None)
         prev_b = getattr(tp, "prev_batch", None) if tp is not None else None
@@ -2346,35 +2323,30 @@ class ModelRunner:
         if prev_req is None or prev_req != cur_req:
             return  # boundary / reorder step: skip ragged, stay rectangular
 
-        num_bonus_arr = getattr(batch, "num_bonus", None)
-        nb = (
-            np.asarray(num_bonus_arr)[:scheduled_bs]
-            if num_bonus_arr is not None
-            else None
-        )
-        max_nb = int(nb.max()) if nb is not None and nb.size > 0 else 0
+        # Positional, which is what the `prev_req == cur_req` guard buys: entry
+        # i is request i's own count from the step that produced it, before
+        # `prepare_input_ids` remaps the deferred rows.
+        nb = batch.num_bonus[:scheduled_bs]
 
         from atom.spec_decode.dspark_scheduler import (
             quantize_to_bucket,
-            ragged_verify_len,
+            ragged_verify_lens,
             resolve_q_buckets,
         )
 
-        # Per-request forward length, bounded by BOTH max_nb+1 (the anchor must
-        # stay inside the segment) and old_nst[i] (a stale ell must never grow a
-        # seq past what the scheduler scheduled). See `ragged_verify_len`; None
-        # means the two bounds cross and ragged is not representable this step.
-        new_len = np.empty(scheduled_bs, dtype=np.int32)
-        any_shrink = False
-        for i, rid in enumerate(batch.req_ids[:scheduled_bs]):
-            li = ragged_verify_len(by_req.get(rid), full_q, max_nb, int(old_nst[i]))
-            if li is None:
-                return  # stay rectangular
-            new_len[i] = li
-            if li < int(old_nst[i]):
-                any_shrink = True
+        # Bounded per request by nb[i]+1 (its anchor must stay inside its OWN
+        # segment) and old_nst[i] (a stale ell must not grow a seq past what the
+        # scheduler scheduled). None -> some request's bounds cross.
+        new_len = ragged_verify_lens(
+            (by_req.get(rid) for rid in batch.req_ids[:scheduled_bs]),
+            full_q,
+            nb,
+            old_nst[:scheduled_bs],
+        )
+        if new_len is None:
+            return  # stay rectangular
 
-        if not any_shrink:
+        if not (new_len < old_nst[:scheduled_bs]).any():
             return  # nothing to shrink this step -> Phase-1 layout
 
         # q_eff, and the replay-shape feasibility check, BEFORE anything on the
@@ -2436,18 +2408,10 @@ class ModelRunner:
         prefill_tok = int(batch.total_tokens_num_prefill)
         batch.total_tokens_num_decode = total_new
         batch.total_tokens_num = prefill_tok + total_new
-        # Two sources of truth (TRUE FLAT, paper §5.2): tokens are flat-packed
-        # [0:Σ] with the per-seq ragged new_len.
-        #   * dynamic_spec_query_tokens_per_req : the true ragged per-seq lengths.
-        #   * the scalar q_eff, RETURNED to `prepare_model` -- computed above,
-        #     before the rebuild, together with the replay-shape feasibility
-        #     check.
-        batch.dynamic_spec_query_tokens_per_req = new_len
-
-        # (No flat scheduled_spec_decode_tokens is built here: the ragged
-        # input_ids are assembled downstream by `fill_deferred_decode_ids` from
-        # prev_token_ids (anchor) + draft_token_ids, which never consults
-        # scheduled_spec_decode_tokens.)
+        # No marker is published for "this step shrank": a shrunk step is
+        # `num_scheduled_tokens` with smaller entries, and every reader reads
+        # those. `scheduled_spec_decode_tokens` keeps its full width --
+        # `prepare_input_ids` slices it per request (`spec[i, :len_i - 1]`).
         return int(q_eff)
 
     def prepare_inputs(
@@ -2462,8 +2426,7 @@ class ModelRunner:
         is_prefill = batch.total_tokens_num_prefill > 0
         scheduled_bs = batch.total_seqs_num
         scheduled_tokens = batch.total_tokens_num
-        num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
-        cu_seqlens_q, _arange = self._get_cumsum_and_arange(num_scheduled_tokens)
+        num_scheduled_tokens = batch.num_scheduled_tokens
         sync = forward_mode.sync
         num_tokens_across_dp = None if sync is None else sync.num_tokens_across_dp
         tbo_collective_active = forward_mode.tbo_collective_active
@@ -2473,20 +2436,6 @@ class ModelRunner:
         if not tbo_collective_active:
             self._pcp_tbo_balanced_active = False
 
-        self.forward_vars["cu_seqlens_q"].np[1 : scheduled_bs + 1] = cu_seqlens_q
-
-        if not is_prefill:
-            assert forward_mode.running_bs >= scheduled_bs, (
-                f"running_bs={forward_mode.running_bs} < "
-                f"scheduled_bs={scheduled_bs}; ForwardMode.decide invariant violated"
-            )
-            # Flat-extend the cumsum over the fabricated rows. Attention runs at
-            # `running_bs` on every decode step, replayed or not: keeping the
-            # scheduled rows when eager made a third width nobody could name,
-            # and every consumer had to know which of the two it was holding.
-            self.forward_vars["cu_seqlens_q"].np[
-                scheduled_bs + 1 : forward_mode.running_bs + 1
-            ] = self.forward_vars["cu_seqlens_q"].np[scheduled_bs]
         # The step's two units, read from where they were settled: `running_bs`
         # sizes everything per-sequence, `running_tokens` everything per-row.
         running_bs = forward_mode.running_bs
@@ -2511,11 +2460,11 @@ class ModelRunner:
 
         spec_decode_metadata = None
         if not is_prefill and hasattr(self, "drafter") and not batch.is_dummy_run:
-            scheduled_bs = batch.total_seqs_num_decode
+            _, lens, cu = self.attn_metadata_builder.decode_spans(batch)
+            # `cu[1:]` is the segment ENDS, which is what
+            # `cu_num_sampled_tokens` means.
             spec_decode_metadata = self.drafter.calc_spec_decode_metadata(
-                num_scheduled_tokens[:scheduled_bs],
-                cu_seqlens_q[:scheduled_bs],
-                input_ids,
+                lens, cu[1:], input_ids
             )
 
         pcp_size = self.config.prefill_context_parallel_size
@@ -2637,6 +2586,8 @@ class ModelRunner:
         temperatures, top_ks, top_ps, all_greedy, needs_independent_noise = (
             self.prepare_sample(batch)
         )
+        # Publishes the buffer `prepare_input_ids` addresses spans through.
+        self.attn_metadata_builder.publish_cu_seqlens_q(batch, forward_mode)
         input_ids = self.tokenID_processor.prepare_input_ids(
             batch, forward_mode.max_seqlen_q
         )
@@ -2651,14 +2602,6 @@ class ModelRunner:
             if batch.next_token_ids is not None:
                 forward_context.context.draft_anchor_overrides = (
                     self.drafter.anchors_to_gpu(batch.next_token_ids)
-                )
-            ragged_lens = getattr(batch, "dynamic_spec_query_tokens_per_req", None)
-            if ragged_lens is not None and batch.total_tokens_num_prefill == 0:
-                scheduled_bs = batch.total_seqs_num_decode
-                lens_buf = self.forward_vars["ragged_lens"]
-                lens_buf.np[:scheduled_bs] = np.asarray(ragged_lens)[:scheduled_bs]
-                forward_context.context.draft_ragged_lens = lens_buf.copy_to_gpu(
-                    scheduled_bs
                 )
         return (
             input_ids,
@@ -3144,6 +3087,9 @@ class ModelRunner:
             )
             num_reject_tokens = self.tokenID_processor.default_num_rejected_tokens[:bs]
             next_token_locs = num_reject_tokens
+            # No drafts scored -> no accept count; anchor on the segment's last
+            # row. NOT `mtp_k - num_reject_tokens`, which is a zero buffer here.
+            num_bonus_tokens = None
         else:
             assert logits is not None
             bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
@@ -3236,6 +3182,7 @@ class ModelRunner:
                     hidden_states,
                     next_token_ids,
                     num_reject_tokens,
+                    num_bonus_tokens,
                 )
                 # self.debug(f"{num_bonus_tokens=}")
 
@@ -3264,6 +3211,7 @@ class ModelRunner:
                     hidden_states,
                     next_token_ids,
                     num_reject_tokens,
+                    num_bonus_tokens,
                 )
 
         # DSpark Phase 2: carry this step's per-request ell back to the scheduler
@@ -3351,6 +3299,7 @@ class ModelRunner:
                     torch.zeros(
                         batch.total_seqs_num, dtype=torch.int32, device=self.device
                     ),
+                    None,  # nothing verified -> segment's last row
                     align_only=True,
                 )
             reset_forward_context()
@@ -3434,7 +3383,13 @@ class ModelRunner:
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
+        # Complements today but against DIFFERENT baselines, which ragged
+        # verify pulls apart -- neither can be dropped for the other.
+        # num_reject_tokens: KV rows to release, against the `mtp_k` RESERVATION.
+        # num_bonus_tokens: anchor row within the SEGMENT (`len_i`); None when
+        # nothing was verified.
         num_reject_tokens: torch.Tensor,
+        num_bonus_tokens: torch.Tensor | None,
         align_only: bool = False,
     ):
         """`align_only` runs the draft purely for its DP collectives.
@@ -3463,40 +3418,14 @@ class ModelRunner:
             )
 
         positions = forward_context.context.positions
-        # Anchor (last verified target token) flat index = segment_start +
-        # num_bonus. prepare_inputs counts back from each segment's END
-        # (cu_seqlens_q[1:]), so offset = full_q - num_bonus = 1 + num_reject.
-        last_token_offset = 1 + num_reject_tokens
-
-        # DSpark q-shrink: segments are length q<full_q but the end-relative
-        # offset is measured against full_q, over-counting by (full_q-q) -> OOB.
-        # Subtract the shrink. No-op when q==full_q or on prefill/mixed steps.
-        ragged_lens = getattr(batch, "dynamic_spec_query_tokens_per_req", None)
-        if ragged_lens is not None and batch.total_tokens_num_prefill == 0:
-            # RAGGED: each seg has its own len_i; anchor offset = len_i - num_bonus_i
-            # (num_bonus_i = mtp_k - num_reject_i), applied to cu_seqlens_q ends.
-            sbs = batch.total_seqs_num_decode
-            # This pinned H2D was staged in prepare_model(), before the
-            # forward's staging event was recorded. int32 matches
-            # num_reject_tokens, so the arithmetic keeps its original dtype.
-            lens_t = forward_context.context.draft_ragged_lens
-            assert lens_t is not None and lens_t.shape[0] == sbs
-            num_bonus = self.drafter.mtp_k - num_reject_tokens[:sbs]
-            last_token_offset = lens_t - num_bonus
-        elif (
-            hasattr(self, "drafter")
-            and self.drafter.uses_confidence_schedule
-            and batch.total_tokens_num_prefill == 0
-        ):
-            full_q = self.drafter.mtp_k + 1
-            q_actual = forward_context.context.forward_mode.max_seqlen_q
-            if 1 <= q_actual < full_q:
-                last_token_offset = last_token_offset - (full_q - q_actual)
 
         assert isinstance(self.drafter, Drafter)
 
+        # The sampler's own count, not `mtp_k - num_reject_tokens`: that
+        # identity holds only where `num_reject_tokens` was defined as its
+        # complement, and is a zero buffer on a step that scored no drafts.
         last_token_indices = self.drafter.prepare_inputs(
-            batch.total_seqs_num, last_token_offset
+            batch.total_seqs_num, anchor_in_seq=num_bonus_tokens
         )
 
         draft_token = self.drafter.propose(

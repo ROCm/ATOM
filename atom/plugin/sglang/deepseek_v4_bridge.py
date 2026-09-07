@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from atom.model_ops.attentions.v4_pool_geometry import (
+from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
     CSA_RATIO,
     DENSE_RATIO,
     HCA_RATIO,

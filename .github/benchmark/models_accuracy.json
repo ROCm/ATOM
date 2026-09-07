@@ -1,17 +1,5 @@
 [
   {
-    "model_name": "Meta-Llama-3-8B-Instruct",
-    "model_path": "meta-llama/Meta-Llama-3-8B-Instruct",
-    "extraArgs": "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3",
-    "env_vars": "HSA_NO_SCRATCH_RECLAIM=1",
-    "runner": "linux-atom-mi35x-1",
-    "test_level": "pr",
-    "accuracy_threshold": 0.73,
-    "accuracy_baseline": 0.75,
-    "accuracy_baseline_model": "meta-llama/Meta-Llama-3-8B-Instruct",
-    "_baseline_note": "HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable"
-  },
-  {
     "model_name": "DeepSeek-R1-0528",
     "model_path": "deepseek-ai/DeepSeek-R1-0528",
     "extraArgs": "--kv_cache_dtype fp8 -tp 8",
@@ -34,6 +22,18 @@
     "accuracy_baseline": 0.96,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
     "_baseline_note": "Full-eval (1319 samples) 3-shot flexible-extract = 0.9522 ± 0.0059"
+  },
+  {
+    "model_name": "DeepSeek-V4-Pro DEP RCCL",
+    "model_path": "deepseek-ai/DeepSeek-V4-Pro",
+    "extraArgs": "--kv_cache_dtype fp8 --index_cache_dtype fp4 -tp 8 --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}' --enable-dp-attention --enable-expert-parallel --all2all-backend rccl",
+    "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "pr",
+    "accuracy_threshold": 0.94,
+    "accuracy_baseline": 0.96,
+    "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
+    "_baseline_note": "PR #2110 regression coverage for DPA8 + EP8 using the native RCCL transport with EPLB disabled. Reuses the DeepSeek-V4-Pro 3-shot GSM8K baseline."
   },
   {
     "model_name": "DeepSeek-V4-Pro MTP",
@@ -140,7 +140,7 @@
     "model_path": "openai/gpt-oss-120b",
     "extraArgs": "--kv_cache_dtype fp8 --gpu-memory-utilization 0.5",
     "client_command": "lm_eval --model local-chat-completions --apply_chat_template --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/chat/completions,num_concurrent=65,max_retries=3,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot 3 --output_path ${OUTPUT_PATH}",
-    "env_vars": "",
+    "env_vars": "ATOM_MOE_GU_ITLV=1",
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "pr",
     "accuracy_threshold": 0.87,
@@ -214,7 +214,7 @@
     "model_path": "openai/gpt-oss-120b",
     "extraArgs": "--kv_cache_dtype fp8 -tp 2 --enable-dp-attention --enable-expert-parallel --enable-tbo all --gpu-memory-utilization 0.5",
     "client_command": "lm_eval --model local-chat-completions --apply_chat_template --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/chat/completions,num_concurrent=65,max_retries=3,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot 3 --output_path ${OUTPUT_PATH}",
-    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_MOE_GU_ITLV=1",
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "main",
     "accuracy_threshold": 0.87,

@@ -80,6 +80,10 @@ class FusedMoEPrepareAndFinalize(ABC):
     def supports_async(self) -> bool:
         return False
 
+    def needs_dispatch_output_trim(self) -> bool:
+        """Whether prepare may return a fixed-capacity buffer with a dead tail."""
+        return True
+
     def prepare_async(
         self,
         a1: torch.Tensor,
@@ -282,6 +286,29 @@ class FusedMoEModularKernel(torch.nn.Module):
                 output = result()
         return output
 
+    def _trim_dispatch_output_if_needed(
+        self,
+        dispatch_a1: torch.Tensor,
+        dispatch_scale: torch.Tensor | None,
+        dispatch_ids: torch.Tensor,
+        dispatch_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        expert_tokens_meta,
+    ):
+        # Exact-size transports such as RCCL have no inactive arena tail. Keep
+        # this gate outside _maybe_trim_dispatch_output so frontend overrides
+        # of the MoRI-specific policy cannot accidentally trim exact outputs.
+        if not self.prepare_finalize.needs_dispatch_output_trim():
+            return dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights
+        return self._maybe_trim_dispatch_output(
+            dispatch_a1,
+            dispatch_scale,
+            dispatch_ids,
+            dispatch_weights,
+            topk_ids,
+            expert_tokens_meta,
+        )
+
     def _maybe_trim_dispatch_output(
         self,
         dispatch_a1: torch.Tensor,
@@ -380,7 +407,7 @@ class FusedMoEModularKernel(torch.nn.Module):
             dispatch_scale,
             dispatch_ids,
             dispatch_weights,
-        ) = self._maybe_trim_dispatch_output(
+        ) = self._trim_dispatch_output_if_needed(
             dispatch_a1,
             dispatch_scale,
             dispatch_ids,

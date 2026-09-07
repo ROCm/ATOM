@@ -49,7 +49,7 @@ import torch
 import triton
 import triton.language as tl
 
-from atom.model_ops.attentions.v4_pool_geometry import (
+from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
     CSA_RATIO,
     DENSE_RATIO,
     HCA_RATIO,

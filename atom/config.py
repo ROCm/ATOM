@@ -1640,6 +1640,12 @@ class Config:
     enable_tbo: bool = False
     enable_tbo_decode: bool = False
     enable_low_latency: bool = False
+    # Routed MoE transport selection. ``auto`` preserves the historical
+    # behavior (MoRI when importable, otherwise gather/scatter). ``rccl`` uses
+    # a graph-safe pre-routed collective for uniform decode, variable-size
+    # gather/scatter for matching DP/EP groups, and dynamic routed all-to-all
+    # for other prefill/mixed topologies.
+    moe_all2all_backend: str = "auto"
     # Post-routing routed-MoE implementation. This is deliberately separate
     # from all2all backend/mode: Mega owns dispatch, both GEMMs, and combine.
     moe_backend: str = "standard"
@@ -1719,6 +1725,23 @@ class Config:
         return list(sizes)
 
     def __post_init__(self):
+        self.moe_all2all_backend = (
+            str(self.moe_all2all_backend or "auto").strip().lower()
+        )
+        if self.moe_all2all_backend not in ("auto", "mori", "rccl", "none"):
+            raise ValueError(
+                "moe_all2all_backend must be one of "
+                "{'auto', 'mori', 'rccl', 'none'}, "
+                f"got {self.moe_all2all_backend!r}"
+            )
+        if self.moe_all2all_backend == "rccl" and self.enable_tbo:
+            logger.warning(
+                "Disabling TBO for the experimental RCCL routed MoE backend; "
+                "the first implementation is synchronous."
+            )
+            self.enable_tbo = False
+            self.enable_tbo_decode = False
+
         self.moe_backend = self.moe_backend.strip().lower()
         if self.moe_backend not in ("standard", "mega"):
             raise ValueError(
@@ -1729,6 +1752,11 @@ class Config:
             raise ValueError(
                 "moe_backend='mega' requires expert parallelism; "
                 "pass --enable-expert-parallel."
+            )
+        if self.moe_backend == "mega" and self.moe_all2all_backend == "rccl":
+            raise ValueError(
+                "moe_backend='mega' owns its MoRI transport and cannot use the "
+                "experimental RCCL prepare/finalize backend"
             )
 
         if isinstance(self.compilation_config, dict):

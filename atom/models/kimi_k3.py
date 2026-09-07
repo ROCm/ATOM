@@ -1305,42 +1305,6 @@ class KimiKDAAttention(nn.Module):
             # Slice the per-token cache-slot indices once (used for both the
             # conv update and the fused recurrence below).
             decode_state_indices = state_indices[:num_actual_tokens]
-            if num_actual_tokens <= 64:
-                from aiter.ops.triton.gated_delta_net.fused_kda_decode_unified import (
-                    fused_kda_decode_unified,
-                )
-
-                replay_kwargs = {}
-                if getattr(kda_metadata, "replayssm", False):
-                    nd = kda_metadata.num_decodes
-                    replay_kwargs = {
-                        "buf_k": cache.replay_buf_k,
-                        "buf_u": cache.replay_buf_u,
-                        "buf_g": cache.replay_buf_g,
-                        "write_pos": kda_metadata.write_pos,
-                        "slot_idx": kda_metadata.slot_idx[:nd],
-                        "max_query_len": kda_metadata.replayssm_max_query_len,
-                    }
-                fused_out = fused_kda_decode_unified(
-                    mixed_qkv=mixed_qkv,
-                    conv_state=conv_state,
-                    conv_weight=conv_weights,
-                    gate=gate,
-                    beta=beta,
-                    out_gate=out_gate,
-                    A_log=self.A_log,
-                    dt_bias=self.dt_bias,
-                    state=ssm_state,
-                    cu_seqlens=query_start_loc[: kda_metadata.num_decodes + 1],
-                    norm_weight=self.o_norm.weight,
-                    norm_eps=self.o_norm.variance_epsilon,
-                    head_dim=self.head_dim,
-                    num_local_heads=self.num_local_heads,
-                    lower_bound=self._kda_gate_lower_bound,
-                    state_indices=decode_state_indices,
-                    **replay_kwargs,
-                )
-                return self.o_proj(fused_out)
             q, k, v = causal_conv1d_update(
                 mixed_qkv,
                 conv_state,
@@ -1411,44 +1375,6 @@ class KimiKDAAttention(nn.Module):
             spec_state_indices = kda_metadata.spec_state_indices_tensor
             spec_query_start_loc = kda_metadata.spec_query_start_loc
             num_accepted_tokens = kda_metadata.num_accepted_tokens
-            nsd = kda_metadata.num_spec_decodes
-            if num_actual_tokens <= 64:
-                from aiter.ops.triton.gated_delta_net.fused_kda_decode_unified import (
-                    fused_kda_decode_unified,
-                )
-
-                replay_kwargs = {}
-                if getattr(kda_metadata, "replayssm", False):
-                    replay_kwargs = {
-                        "buf_k": cache.replay_buf_k,
-                        "buf_u": cache.replay_buf_u,
-                        "buf_g": cache.replay_buf_g,
-                        "write_pos": kda_metadata.write_pos,
-                        "slot_idx": kda_metadata.slot_idx[:nsd],
-                        "max_query_len": kda_metadata.replayssm_max_query_len,
-                    }
-                fused_out = fused_kda_decode_unified(
-                    mixed_qkv=mixed_qkv,
-                    conv_state=conv_state,
-                    conv_weight=conv_weights,
-                    gate=gate,
-                    beta=beta,
-                    out_gate=out_gate,
-                    A_log=self.A_log,
-                    dt_bias=self.dt_bias,
-                    state=ssm_state,
-                    cu_seqlens=spec_query_start_loc[: nsd + 1],
-                    norm_weight=self.o_norm.weight,
-                    norm_eps=self.o_norm.variance_epsilon,
-                    head_dim=self.head_dim,
-                    num_local_heads=self.num_local_heads,
-                    lower_bound=self._kda_gate_lower_bound,
-                    state_indices=spec_state_indices,
-                    num_accepted_tokens=num_accepted_tokens,
-                    conv_state_indices=spec_state_indices[:, 0][:nsd],
-                    **replay_kwargs,
-                )
-                return self.o_proj(fused_out)
             q, k, v = causal_conv1d_update(
                 mixed_qkv,
                 conv_state,

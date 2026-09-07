@@ -16,7 +16,10 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
-from atom.model_ops.attentions.v4_pool_geometry import visible_csa, visible_hca
+from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
+    visible_csa,
+    visible_hca,
+)
 
 ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME = "model.layers.0.atom_deepseek_v4_proxy"
 ATOM_DEEPSEEK_V4_DRAFT_PROXY_LAYER_PREFIX = "atom_deepseek_v4_draft_proxy"
@@ -109,7 +112,10 @@ def _v4_win_with_spec(vllm_config, window_size: int) -> int:
 
 
 def _v4_state_layout(vllm_config, kv_fp8: bool):
-    from atom.model_ops.attentions.state_arena import StateField, plan_field_planes
+    from atom.model_ops.attentions.pool_layout.state_arena import (
+        StateField,
+        plan_field_planes,
+    )
 
     hf = vllm_config.model_config.hf_config
     _ratios, _dense, n_csa, n_hca = _layer_counts(hf)
@@ -198,7 +204,9 @@ def _proxy_region_byte_sizes(
 
 
 def _proxy_page_bytes(vllm_config) -> int:
-    from atom.model_ops.attentions.v4_pool_geometry import UnifiedPoolGeometry
+    from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
+        UnifiedPoolGeometry,
+    )
 
     hf = vllm_config.model_config.hf_config
     ratios, _dense, csa_layers, _hca = _layer_counts(hf)
@@ -223,7 +231,7 @@ def _proxy_page_bytes(vllm_config) -> int:
         block_size=ATOM_DEEPSEEK_V4_BLOCK_SIZE,
         arena_rows=arena_rows,
     )
-    from atom.model_ops.attentions.state_arena import plan_regions
+    from atom.model_ops.attentions.pool_layout.state_arena import plan_regions
 
     regions = _proxy_region_byte_sizes(
         geometry=geometry,
@@ -264,12 +272,14 @@ def slice_deepseek_v4_proxy_cache_views(
     row_widths: list[int] | None = None,
 ) -> dict[str, object]:
     """Carve native-equivalent unified V4 planes from vLLM proxy storage."""
-    from atom.model_ops.attentions.state_arena import (
+    from atom.model_ops.attentions.pool_layout.state_arena import (
         SplitStateArena,
         StateArena,
         plan_regions,
     )
-    from atom.model_ops.attentions.v4_pool_geometry import UnifiedPoolGeometry
+    from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
+        UnifiedPoolGeometry,
+    )
 
     if compress_ratios is None:
         assert csa_layer_count is not None and hca_layer_count is not None

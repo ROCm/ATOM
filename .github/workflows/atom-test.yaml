@@ -183,7 +183,10 @@ jobs:
     env:
       CONTAINER_NAME: atom_smoke_test
       SMOKE_MODEL: meta-llama/Meta-Llama-3-8B-Instruct
-      # Matches this model's entry in models_accuracy.json.
+      # These were this model's settings in models_accuracy.json before its
+      # accuracy entry was dropped. This job is not an accuracy test: it asserts
+      # the offline entrypoint completes, so it keeps the small model and its
+      # settings regardless of what the accuracy matrix tracks.
       SMOKE_EXTRA_ARGS: --kv_cache_dtype fp8 --gpu-memory-utilization 0.3
     steps:
       - name: Kill stale containers

@@ -73,6 +73,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
     "ATOM_USE_TRITON_MOE_DECODE": lambda: os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0")
     == "1",
+    # Force DP-attention + EP through the collective fallback even when mori is
+    # installed. This is useful for controlled A/B tests and for deployments
+    # where the mori shared-memory transport is unavailable or undesirable.
+    # The fallback gathers hidden/router rows across DP ranks, computes only
+    # the locally owned experts, then reduce-scatters the outputs.
+    "ATOM_DISABLE_MORI_EP": lambda: os.getenv("ATOM_DISABLE_MORI_EP", "0").lower()
+    in {"1", "true", "yes", "on"},
     # Use mori dispatch_combine_v2 (FlyDSL/cco, gfx1250 wave32) instead of the
     # production mori v1 (mori.ops.EpDispatchCombineOp) for the EP+DP MoE
     # all2all. v1 is authored for gfx942/950 and does not run on gfx1250; v2 is
@@ -378,6 +385,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_LM_HEAD_MODE": lambda: os.getenv(
         "ATOM_DP_LM_HEAD_MODE", "all2all"
     ).lower(),
+    # Pure-DP draft greedy argmax: shard the draft lm_head vocab across the DP
+    # group so each rank reads [H, V/dp] instead of the full [H, V], exchanging
+    # only the packed [N, 2]. Active only for a unified (rectangular) pure-DP
+    # draft step; everything else falls back to the replicated local argmax.
+    "ATOM_DP_DRAFT_ARGMAX": lambda: os.getenv("ATOM_DP_DRAFT_ARGMAX", "1").lower()
+    in ("1", "true"),
+    # Row count (running_tokens) above which it falls back: the hidden gather
+    # grows with rows, so the shard only pays at small M. ~256 is the V4-Pro
+    # crossover.
+    "ATOM_DP_DRAFT_ARGMAX_MAX_ROWS": lambda: int(
+        os.getenv("ATOM_DP_DRAFT_ARGMAX_MAX_ROWS", "256")
+    ),
     "ATOM_USE_FLYDSL_GDR": lambda: os.getenv("ATOM_USE_FLYDSL_GDR", "0").lower() == "1",
     # Capture each declared draft pass into a per-captured-size CUDAGraph as it is
     # warmed, so the draft replays instead of relaunching every kernel. 0 drafts

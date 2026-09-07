@@ -80,13 +80,13 @@ on:
         type: string
         default: ""
       publish_to_dashboard:
-        description: "Upload SGLang-OOB results to the ATOM dashboard."
+        description: "Upload SGLang-OOB results to the ATOM dashboard (off by default for manual runs; schedule always publishes)"
         type: boolean
-        default: true
+        default: false
       upload_to_custom_dashboard:
-        description: "Upload benchmark results to the LLM-Booster dashboard"
+        description: "Upload benchmark results to the LLM-Booster dashboard (off by default for manual runs)"
         type: boolean
-        default: true
+        default: false
       param_lists:
         description: |
           "Optional benchmark parameter lists.
@@ -1078,8 +1078,11 @@ jobs:
           echo "sglang_image_tag=${SGLANG_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Push custom SGLang image
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
-          docker push "${{ steps.image-meta.outputs.sglang_image_tag }}"
+          .github/scripts/docker_push_retry.sh "${{ steps.image-meta.outputs.sglang_image_tag }}"
 
       - name: Clean up build images
         if: always()
