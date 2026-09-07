@@ -243,15 +243,15 @@ def rmsnorm_gated(
     weight: torch.Tensor,
     gate: torch.Tensor,
     eps: float,
-    quant_type: QuantType | None = None,
+    quant_type_value: int = QuantType.No.value,
     quant_dtype: torch.dtype | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """rmsnorm(x) over last dim * weight * sigmoid(gate).
 
-    When ``(quant_type, quant_dtype)`` is the per-token FP8 scheme, the normed
+    When ``(quant_type_value, quant_dtype)`` is the per-token FP8 scheme, the normed
     output is also quantized and the function returns
     ``(fp8 [t, heads*H], scale [t, 1])`` ready for the consuming GEMM's
-    ``x_scale=`` path. With no quant (``None``/``QuantType.No``) it returns the
+    ``x_scale=`` path. With no quant (``QuantType.No.value``) it returns the
     bf16 tensor shaped like ``x``. Per-token FP8 is the only fused scheme today
     (the consuming o_proj's a8w8 scheme); any other requested scheme asserts.
 
@@ -260,14 +260,14 @@ def rmsnorm_gated(
     ``x`` is normed row-wise and is made contiguous (cheap; the caller's ``out``
     already is). Supports a 2D ``[M, H]`` or 3D ``[outer, heads, H]`` gate.
     """
-    if quant_type == QuantType.per_Token and quant_dtype == dtypes.fp8:
+    if quant_type_value == QuantType.per_Token.value and quant_dtype == dtypes.fp8:
         return _rmsnorm_gated_per_token_quant(x, weight, gate, eps, quant_dtype)
     # Only the no-quant (bf16) path remains. Any other requested scheme is
     # unsupported here -- fail loud rather than silently feed bf16 activations to
     # a GEMM that expects quantized input.
-    assert quant_type in (None, QuantType.No), (
+    assert quant_type_value == QuantType.No.value, (
         "rmsnorm_gated only fuses per-token FP8 quant; got "
-        f"quant_type={quant_type}, quant_dtype={quant_dtype}"
+        f"quant_type_value={quant_type_value}, quant_dtype={quant_dtype}"
     )
     h = x.shape[-1]
     x2 = x.reshape(-1, h)
