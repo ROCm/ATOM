@@ -534,6 +534,18 @@ class MiniMaxM3SparseAttentionBackend(_VllmAttentionBackendCompat):
 
     @staticmethod
     def get_required_kv_cache_layout():
+        # When AITER sparse-PA (fp8 gluon paged-attention) is requested, the
+        # K/V slot axis (num_head_slots=2) must sit OUTSIDE the block dim so
+        # unbind(1) yields two CONTIGUOUS K/V regions the page-16 ASM/gluon
+        # kernels can .view() without a copy. LHBNC = [L, H, B, N, C] does
+        # exactly that. Gated on VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT so the
+        # working plain-4-D Triton path stays the default when the env is off.
+        # Mirrors vllm/models/minimax_m3/common/sparse_attention.py
+        # supported_kv_cache_layouts (LHBNC under the same gate).
+        from vllm import envs
+
+        if bool(getattr(envs, "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT", False)):
+            return KVCacheLayout.LHBNC
         return None
 
     @classmethod

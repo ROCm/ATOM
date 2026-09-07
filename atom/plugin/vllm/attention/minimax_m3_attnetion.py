@@ -298,7 +298,8 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
         return self.attn_backend
 
     def get_kv_cache_spec(self, vllm_config):
-        from vllm.v1.kv_cache_interface import FullAttentionSpec
+        from vllm import envs
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, get_kv_quant_mode
 
         block_size = vllm_config.cache_config.block_size
         if block_size != SPARSE_BLOCK_SIZE:
@@ -306,12 +307,42 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
                 f"MiniMax-M3 sparse block size must be {SPARSE_BLOCK_SIZE}."
             )
 
+        # Request K/V-SEPARATED (sparse-PA) storage so vLLM 0.28 binds a 5-D
+        # [num_blocks, 2, block_size, num_kv_heads, head_dim] cache (K and V as
+        # two head slots) instead of collapsing K/V into the content dim (the
+        # plain 4-D layout). RFC#42082's default per-layer view is 4-D
+        # (B, H, N, C) with K/V packed atomically in C, which forces the
+        # layout-agnostic strided-Triton reader (fp8 -> bf16 upcast, no fp8
+        # MFMA). The K/V-separated 5-D layout is what lets the native fp8 gluon
+        # paged-attention kernel (aiter pa_decode_gluon) read K and V as two
+        # contiguous page-16 regions -- i.e. what lights up ATOM's existing
+        # ASM/gluon path (_page16_shuffle_cache_for_sparse_kernel +
+        # minimax_m3_sparse_attn_decode_asm, ndim==5 branch of
+        # _insert_qkv_and_index / _run_*_sparse_attention).
+        #
+        # num_head_slots=2 makes the "2" a real separable axis;
+        # state_content_bytes excludes the x2 (per-slot K or V content only).
+        # VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=1 is required so unbind(1) yields
+        # CONTIGUOUS K/V (the page-16 shuffle); without it, gate off and keep
+        # the working plain-4-D Triton path. Gluon needs num_kv_heads==1 per TP
+        # rank (M3 has 4 kv heads -> satisfied at TP4). Mirrors
+        # vllm/models/minimax_m3/amd/model.py get_kv_cache_spec.
+        use_sparse_pa = (
+            self.num_kv_heads == 1
+            and bool(getattr(envs, "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT", False))
+        )
+        kv_bytes = (
+            self.num_kv_heads * self.head_dim * self.kv_cache_torch_dtype.itemsize
+        )
         return FullAttentionSpec(
             block_size=block_size,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_dim,
             head_size_v=self.head_dim,
             dtype=self.kv_cache_torch_dtype,
+            kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+            num_head_slots=2 if use_sparse_pa else None,
+            state_content_bytes=kv_bytes if use_sparse_pa else None,
         )
 
     @staticmethod
@@ -380,7 +411,30 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
         #     per-layer view is 4-D and K/V are packed in the content axis.
         #     We reconstruct a zero-copy strided 5-D view and drive the fully
         #     strided Triton readers (see _kv_cache_5d).
-        if self.kv_cache.ndim == 4:
+        if self._is_sparse_pa_layout():
+            # K/V-separated (sparse-PA / gluon): LHBNC 4-D
+            # [num_blocks, 2, block_size, head_dim] (num_kv_heads==1 folded) or
+            # legacy 5-D [num_blocks, 2, block_size, num_kv_heads, head_dim].
+            # Normalize to 5-D and validate.
+            kv5 = self._asm_kv_cache_5d()
+            if kv5.shape[1] != 2:
+                raise ValueError(
+                    "MiniMax-M3 sparse KV cache must store K and V, got shape "
+                    f"{tuple(self.kv_cache.shape)}."
+                )
+            if kv5.shape[2] != SPARSE_BLOCK_SIZE:
+                raise ValueError(
+                    f"MiniMax-M3 sparse KV block size must be {SPARSE_BLOCK_SIZE}, "
+                    f"got shape {tuple(self.kv_cache.shape)}."
+                )
+            if kv5.shape[3] != self.num_kv_heads:
+                raise ValueError(
+                    f"MiniMax-M3 sparse KV cache head count mismatch: expected "
+                    f"{self.num_kv_heads}, got shape {tuple(self.kv_cache.shape)}."
+                )
+            if kv5.shape[4] != self.head_dim:
+                raise ValueError("MiniMax-M3 sparse KV cache head dim mismatch.")
+        elif self.kv_cache.ndim == 4:
             nb, h, bs, c = self.kv_cache.shape
             if h != self.num_kv_heads:
                 raise ValueError(
@@ -398,28 +452,10 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
                     f"2*head_dim={2 * self.head_dim}, got "
                     f"shape {tuple(self.kv_cache.shape)}."
                 )
-        elif self.kv_cache.ndim == 5:
-            if self.kv_cache.shape[1] != 2:
-                raise ValueError(
-                    "MiniMax-M3 sparse KV cache must store K and V, got shape "
-                    f"{tuple(self.kv_cache.shape)}."
-                )
-            if self.kv_cache.shape[2] != SPARSE_BLOCK_SIZE:
-                raise ValueError(
-                    f"MiniMax-M3 sparse KV block size must be {SPARSE_BLOCK_SIZE}, "
-                    f"got shape {tuple(self.kv_cache.shape)}."
-                )
-            if self.kv_cache.shape[3] != self.num_kv_heads:
-                raise ValueError(
-                    f"MiniMax-M3 sparse KV cache head count mismatch: expected "
-                    f"{self.num_kv_heads}, got shape {tuple(self.kv_cache.shape)}."
-                )
-            if self.kv_cache.shape[4] != self.head_dim:
-                raise ValueError("MiniMax-M3 sparse KV cache head dim mismatch.")
         else:
             raise ValueError(
-                "MiniMax-M3 sparse KV cache must be 4-D (plain vLLM) or 5-D "
-                "(ASM SHUFFLE), got "
+                "MiniMax-M3 sparse KV cache must be 4-D (plain vLLM / LHBNC "
+                "sparse-PA) or 5-D (ASM SHUFFLE), got "
                 f"{tuple(self.kv_cache.shape)} (dtype={self.kv_cache.dtype})."
             )
 
@@ -456,9 +492,43 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
                 f"{tuple(ic.shape)}."
             )
 
+    def _is_sparse_pa_layout(self) -> bool:
+        """True when vLLM binds the K/V-SEPARATED (sparse-PA / gluon) cache.
+
+        Requested via get_kv_cache_spec num_head_slots=2 +
+        VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=1 (LHBNC). vLLM folds the singleton
+        num_kv_heads axis, so the per-layer view is 4-D
+        (num_blocks, 2, block_size, head_dim) -- K/V split into the "2" slot
+        axis (dim1), head_dim last -- or the legacy 5-D
+        (num_blocks, 2, block_size, num_kv_heads, head_dim). Distinguished from
+        the plain interleaved 4-D (num_blocks, num_kv_heads, block_size,
+        2*head_dim) by dim1==2 with head_dim (not 2*head_dim) trailing.
+        """
+        kc = self.kv_cache
+        if kc.ndim == 5:
+            return kc.shape[1] == 2
+        if kc.ndim == 4:
+            return kc.shape[1] == 2 and kc.shape[-1] == self.head_dim
+        return False
+
+    def _asm_kv_cache_5d(self) -> torch.Tensor:
+        """5-D (num_blocks, 2, block_size, num_kv_heads, head_dim) view of the
+        sparse-PA cache, for the page-16 ASM/gluon helpers.
+
+        The LHBNC 4-D (num_blocks, 2, block_size, head_dim) has the folded
+        num_kv_heads==1 axis re-inserted with unsqueeze(3) (a no-op on memory,
+        so unbind(1) stays contiguous); a real 5-D cache passes through.
+        """
+        kc = self.kv_cache
+        if kc.ndim == 5:
+            return kc
+        return kc.unsqueeze(3)
+
     def _is_plain_layout(self) -> bool:
-        """True when vLLM binds the plain 4-D KV cache (0.28 KVCacheLayout)."""
-        return self.kv_cache.ndim == 4
+        """True when vLLM binds the plain interleaved 4-D KV cache (0.28
+        KVCacheLayout, K/V packed in the content dim). The K/V-separated
+        sparse-PA 4-D (dim1==2) routes to the ASM/gluon path instead."""
+        return self.kv_cache.ndim == 4 and not self._is_sparse_pa_layout()
 
     def _kv_cache_5d(self) -> torch.Tensor:
         """Zero-copy strided [num_blocks, 2, block_size, num_kv_heads, head_dim]
@@ -520,10 +590,11 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
     def _page16_shuffle_cache_for_sparse_kernel(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, object, object]:
-        num_blocks, _kv, block_size, num_kv_heads, head_dim = self.kv_cache.shape
+        kv5 = self._asm_kv_cache_5d()
+        num_blocks, _kv, block_size, num_kv_heads, head_dim = kv5.shape
         if block_size != SPARSE_BLOCK_SIZE:
             raise ValueError("MiniMax-M3 sparse cache must use page size 128.")
-        k_cache, v_cache = self.kv_cache.unbind(1)
+        k_cache, v_cache = kv5.unbind(1)
         if self.kv_cache_dtype == "fp8":
             target_dtype = dtypes.d_dtypes[self.kv_cache_dtype]
             k_cache = k_cache.view(target_dtype)
@@ -579,14 +650,28 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
         if self._is_plain_layout():
             # vLLM-0.28 plain 4-D cache: write via the strided fused-cache
             # slices (asm_layout=False) and hand the full strided 5-D view to
-            # the Triton readers. fp8 scales are not wired on this path yet, so
-            # bf16 KV is required for a correctness run.
-            if self.kv_cache_dtype == "fp8":
-                raise NotImplementedError(
-                    "MiniMax-M3 plain (4-D) KV layout does not yet support fp8 "
-                    "KV cache; run with --kv-cache-dtype bf16."
-                )
+            # the Triton readers.
+            #
+            # fp8 KV on the plain path: the plain-Triton readers
+            # (model_ops/minimax_m3/sparse_attn.py `_gqa_sparse_decode_kernel`,
+            # :409/:428) dequant fp8 by a bare `k.to(q.dtype)` cast -- i.e. an
+            # implicit unit scale, no per-token scale tensor is consumed. To
+            # stay read/write consistent we therefore write with
+            # `fp8_e4m3_static` and a scalar scale of 1.0 (the aiter CUDA
+            # store does `cast(float(src)/scale)`; scale==1.0 => plain fp8
+            # round-trip). Post-qknorm K/V are O(1) << e4m3 max (448), so unit
+            # scale loses only e4m3 rounding -- no dynamic-range benefit, but
+            # the plain readers cannot apply a per-token scale anyway. This
+            # halves the decode KV-read bandwidth (the 90k-ctx D bottleneck)
+            # that the bf16-only plain path was forfeiting vs the 5-D ASM path.
             kv5d = self._kv_cache_5d()
+            if self.kv_cache_dtype == "fp8":
+                plain_kv_dtype = "fp8_e4m3_static"
+                plain_scale = torch.ones(1, dtype=torch.float32, device=qkv.device)
+                plain_k_scale = plain_v_scale = plain_scale
+            else:
+                plain_kv_dtype = "auto"
+                plain_k_scale = plain_v_scale = None
             aiter.fused_qknorm_idxrqknorm(
                 qkv,
                 self.q_norm.weight,
@@ -608,15 +693,15 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
                 q_out=q_out,
                 index_q_out=index_q,
                 index_slot_mapping=index_metadata.slot_mapping,
-                kv_cache_dtype="auto",
-                k_scale=None,
-                v_scale=None,
+                kv_cache_dtype=plain_kv_dtype,
+                k_scale=plain_k_scale,
+                v_scale=plain_v_scale,
                 asm_layout=False,
             )
             # k_cache carries the full [nb,2,bs,H,hd] view for the readers.
             return q_out, index_q, kv5d, None, None, None
 
-        self._ensure_fp8_scales(self.kv_cache)
+        self._ensure_fp8_scales(self._asm_kv_cache_5d())
         k_cache, v_cache, k_scale, v_scale = (
             self._page16_shuffle_cache_for_sparse_kernel()
         )
