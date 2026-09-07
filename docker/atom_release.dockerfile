@@ -582,11 +582,11 @@ RUN if [ "${ATOM_BASE_IMAGE}" = "rocm10-base" ]; then \
         else \
             echo "pip check clean"; \
         fi; \
-        python -c "import torch, triton, torchvision, torchaudio; \
+        python -c "import torch, triton, torchvision, torchaudio; from importlib.metadata import version; \
 assert torch.version.hip is not None, torch.__version__; \
 assert '+rocm10' in torch.__version__, torch.__version__; \
-assert 'rocm10' in triton.__version__, triton.__version__; \
-print('final stack: torch', torch.__version__, '| triton', triton.__version__, \
+assert 'rocm10' in version('triton'), version('triton'); \
+print('final stack: torch', torch.__version__, '| triton', version('triton'), \
       '| torchvision', torchvision.__version__, '| torchaudio', torchaudio.__version__)" && \
         if pip list --format=freeze 2>/dev/null | grep -Eq '^nvidia-.*-cu[0-9]+'; then \
             echo "ERROR: NVIDIA CUDA runtime packages leaked into the final image"; \
