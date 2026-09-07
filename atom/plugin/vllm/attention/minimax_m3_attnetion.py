@@ -16,6 +16,9 @@ import aiter
 import torch
 from aiter import dtypes
 from torch import nn
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
 from atom.config import get_current_atom_config
 from atom.model_ops.minimax_m3.sparse_attn import (
@@ -31,9 +34,6 @@ from atom.plugin.vllm.attention.layer_common import (
     _register_vllm_static_forward_context,
 )
 from atom.utils import mark_spliting_op
-from vllm.compilation.breakable_cudagraph import eager_break_during_capture
-from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
 _MINIMAX_M3_TOPK_CACHE_STATE: dict = {}
 
@@ -83,8 +83,8 @@ class MiniMaxM3SparseIndexerCache(nn.Module, AttentionLayerBase):
         head_dim: int,
         kv_cache_dtype: str,
     ) -> None:
-        from vllm.v1.attention.backend import AttentionType
         from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+        from vllm.v1.attention.backend import AttentionType
 
         super().__init__()
         atom_config = get_current_atom_config()
