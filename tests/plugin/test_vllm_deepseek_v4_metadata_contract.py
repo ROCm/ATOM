@@ -30,7 +30,7 @@ def test_vllm_eager_metadata_satisfies_split_state_slot_contract():
 
 def test_vllm_proxy_embeds_compressor_state_in_unified_slot_planes():
     assert "arena_rows=arena_rows" in BRIDGE_SOURCE
-    assert "StateArena(" in BRIDGE_SOURCE
+    assert "EntryMajorArena(" in BRIDGE_SOURCE
     assert "geometry.slot_positions" in BRIDGE_SOURCE
     assert 'kv_state=arena.view("csa_main_kv")[csa_i]' in BRIDGE_SOURCE
     assert 'kv_state=arena.view("hca_main_kv")[hca_i]' in BRIDGE_SOURCE

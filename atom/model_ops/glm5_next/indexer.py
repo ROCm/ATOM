@@ -279,7 +279,7 @@ def _sparse_attn_indexer_kpool(
         triton_convert_req_index_to_global_index_dsa_prefill(
             attn_metadata.sparse_cu_seqlens_q,
             attn_metadata.sparse_kv_indptr,
-            attn_metadata.token_to_seq_idxs,
+            attn_metadata.batch_id_per_q_token,
             topk_indices,
             attn_metadata.block_tables,
             attn_metadata.cu_seqlens_k,

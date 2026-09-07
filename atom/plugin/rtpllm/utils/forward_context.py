@@ -892,7 +892,7 @@ class RTPForwardContext:
         )
 
     @staticmethod
-    def _build_req_id_per_token(
+    def _build_batch_id_per_q_token(
         *,
         query_start_loc: torch.Tensor,
         num_tokens: int,
@@ -902,7 +902,7 @@ class RTPForwardContext:
         batch_size = int(query_start_loc.numel()) - 1
         if batch_size <= 0:
             raise ValueError(
-                "RTP plugin cannot build req_id_per_token for empty batch."
+                "RTP plugin cannot build batch_id_per_q_token for empty batch."
             )
         in_capture = torch.cuda.is_current_stream_capturing()
         if cg_bufs is not None and "seq_id_i32" in cg_bufs:
@@ -927,7 +927,7 @@ class RTPForwardContext:
             return seq_id_i32[:num_tokens]
         if in_capture:
             raise RuntimeError(
-                "RTP plugin capture requires prewarmed seq_id_i32 for req_id_per_token."
+                "RTP plugin capture requires prewarmed seq_id_i32 for batch_id_per_q_token."
             )
         if int(num_tokens) == 0:
             return torch.empty((0,), dtype=torch.int32, device=device)
@@ -936,7 +936,7 @@ class RTPForwardContext:
             lengths.sum().item()
         ) != int(num_tokens):
             raise ValueError(
-                "RTP plugin query_start_loc/num_tokens mismatch for req_id_per_token "
+                "RTP plugin query_start_loc/num_tokens mismatch for batch_id_per_q_token "
                 f"(query_start_loc[-1]={int(query_start_loc[-1].item())}, "
                 f"num_tokens={int(num_tokens)})."
             )
@@ -1152,7 +1152,7 @@ class RTPForwardContext:
             seq_size_per_block=seq_size_per_block,
             cg_bufs=cg_bufs,
         )
-        req_id_per_token = cls._build_req_id_per_token(
+        batch_id_per_q_token = cls._build_batch_id_per_q_token(
             query_start_loc=query_start_loc,
             num_tokens=num_actual_tokens,
             device=device,
@@ -1270,7 +1270,7 @@ class RTPForwardContext:
         )
         # Prefill-only fields shared across all full-attn layers in the step.
         plugin_md.rtp_cu_seqlens_q = query_start_loc
-        plugin_md.req_id_per_token = req_id_per_token
+        plugin_md.batch_id_per_q_token = batch_id_per_q_token
         plugin_md.topk_tokens = 0
         plugin_md.sparse_block_size = int(seq_size_per_block)
         plugin_md.cg_bufs = cg_bufs
