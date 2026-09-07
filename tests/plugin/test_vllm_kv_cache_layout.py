@@ -161,7 +161,9 @@ def test_scales_reach_the_codec_as_extra_segments():
 def test_per_block_scales_without_a_reporting_hook_are_rejected():
     kv = {"model.layers.0.self_attn.attn": torch.zeros((NB, 1, BS, 2 * HD))}
     with pytest.raises(ValueError, match="per-block k_scale"):
-        build_kv_cache_tensors(kv, {"model.layers.0.self_attn.attn": _LayerWithUnreportableScales()})
+        build_kv_cache_tensors(
+            kv, {"model.layers.0.self_attn.attn": _LayerWithUnreportableScales()}
+        )
 
 
 def test_non_block_major_scales_are_rejected():
