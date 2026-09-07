@@ -163,6 +163,8 @@ def test_a_dispatched_load_is_not_reported():
     adapter = _lookup_adapter(scheduler)
     adapter.get_num_new_matched_tokens(_req("ok"), 0)
 
-    adapter._check_promised_loads(SimpleNamespace(requests=[SimpleNamespace(req_id="ok")]))
+    adapter._check_promised_loads(
+        SimpleNamespace(requests=[SimpleNamespace(req_id="ok")])
+    )
 
     assert adapter._promised_loads == {}

@@ -139,9 +139,7 @@ def build_kv_cache_tensors(
     for layer_num, name in enumerate(sorted(main, key=_layer_sort_key)):
         k_cache, v_cache = split_kv_tensor(main[name])
         index_cache = index_caches.get(name)
-        k_scale, v_scale = _transfer_scales(
-            name, (layers or {}).get(name), main[name]
-        )
+        k_scale, v_scale = _transfer_scales(name, (layers or {}).get(name), main[name])
 
         for role, seg in (
             ("k_cache", k_cache),
