@@ -34,6 +34,15 @@ esac
 OUT_DIR="perf-pair/${HALF}"
 mkdir -p "$OUT_DIR"
 
+echo "========== ${HALF}: reclaiming workspace ownership =========="
+# The container runs as root against a bind-mounted workspace, so anything it
+# writes (__pycache__, build output) ends up owned by root. The checkout and
+# clean below run as the runner user and fail with EACCES on those files, as
+# does the next job's actions/checkout. Hand them back before touching the
+# tree; the container is already up, so this costs nothing.
+docker exec "$CONTAINER" bash -lc \
+  "chown -R $(id -u):$(id -g) /workspace" || true
+
 echo "========== ${HALF}: checking out ${COMMIT} =========="
 # Discard whatever the previous half left behind before moving: a dirty tree
 # makes the checkout fail, and a half-applied one would measure neither commit.
