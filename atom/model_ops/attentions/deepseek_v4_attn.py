@@ -4346,10 +4346,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             #     so P must be >= max_decode_tokens (T_dec) or surplus rows are
             #     silently dropped (logits stay at the -inf pre-fill -> wrong
             #     top-k).
-            #   - chunks: the 512 floor keeps enough CTAs to split a long
-            #     context across the GPU when the batch is small (e.g. bs=8,
-            #     ctx=128k -> only 8 rows; without the floor the schedule would
-            #     fold the whole context onto 8 serial CTAs and starve the GPU).
+            #   - chunks: the `FP4_MQA_PARALLEL_UNIT_NUM` floor (4096) keeps
+            #     enough CTAs to split a long context across the GPU when the
+            #     batch is small (e.g. bs=8, ctx=128k -> only 8 rows; without
+            #     the floor the schedule would fold the whole context onto 8
+            #     serial CTAs and starve the GPU).
             # The fixed CG cta_info buffer below is sized to this same P.
             self._fp4_parallel_unit_num = max(FP4_MQA_PARALLEL_UNIT_NUM, T_dec)
             self._fp4_block_k = FP4_MQA_BLOCK_K

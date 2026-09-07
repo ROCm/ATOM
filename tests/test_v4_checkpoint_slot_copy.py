@@ -3,7 +3,7 @@
 """Which bytes of a DeepSeek-V4 Active Slot a checkpoint carries, and that a
 store/restore round trip moves exactly those and nothing else.
 
-`checkpoint_ranges_for` (tested in `test_state_arena.py`) says which bytes of the
+`checkpoint_ranges_for` (tested in `test_entry_arena.py`) says which bytes of the
 compressor *arena* are live. This file covers the step after it: composing
 those with the sliding-window rows that share the slot, turning the result into
 byte segments at a slot's real address, and round-tripping them through the

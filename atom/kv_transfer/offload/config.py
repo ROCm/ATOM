@@ -56,12 +56,13 @@ _HF_INTEGER_GEOMETRY_FIELDS = frozenset(_HF_PAGE_FIELDS) - {
     "indexer_dtype",
 }
 # GDN/linear model types carrying a per-request recurrent state but NOT in the
-# `kimi_linear` family `kimi_k3` owns. Same set as `ModelRunner.is_qwen_next()`,
-# but note the attribute skew: the guard below reads `hf_config.model_type`
-# while `is_qwen_next` reads `hf_text_config.model_type`. On the native path
-# they agree only because `get_hf_config` flattens the text type up; `is_vllm()`
-# drops `qwen3_5`/`qwen3_5_moe` from that flatten, so if offload is ever wired
-# into plugin mode this guard must switch to the text config to stay in sync.
+# `kimi_linear` family `kimi_k3` owns. Same set as `attn_family` resolves to
+# `Family.GDN`, but note the attribute skew: the guard below reads
+# `hf_config.model_type` while `attn_family` reads the text config. On the
+# native path they agree only because `get_hf_config` flattens the text type
+# up; `is_vllm()` drops `qwen3_5`/`qwen3_5_moe` from that flatten, so if
+# offload is ever wired into plugin mode this guard must switch to the text
+# config to stay in sync.
 # Unreachable today -- no plugin caller passes a `kv_transfer_config`.
 # MiniMax-M2/M3 are absent by design: M3 is sparse *paged* attention
 # (`MiniMaxM3SparseForCausalLM` -> `SparseMHAPagedAttentionImpl`), no recurrent
@@ -147,8 +148,8 @@ def _layout_from_model(config) -> str:
     if hf_config is None:
         return "dense"
     # Resolve the family off the *text* config, exactly as the model-side
-    # predicates this mirrors do (`ModelRunner.is_qwen_next`/`is_kimi_linear`
-    # read `self.hf_text_config`). Two names in `_GDN_LINEAR_MODEL_TYPES` --
+    # predicate this mirrors does (`attn_family(hf_text_config)`, which the
+    # backend selector runs). Two names in `_GDN_LINEAR_MODEL_TYPES` --
     # `qwen3_5_text`, `qwen3_5_moe_text` -- are literally text-config model
     # types, so the bare wrapper `model_type` would be the multimodal wrapper's
     # and neither the `kimi_linear` nor the GDN branch would fire: Qwen3.5 would

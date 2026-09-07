@@ -45,7 +45,7 @@ to the internal name:
 
 | Target stack            | Draft HF arch (in `config.json`)        | Internal class (in `support_eagle_model_arch_dict`) | Source file                              | KV cache                                                                 |
 |-------------------------|-----------------------------------------|-----------------------------------------------------|------------------------------------------|--------------------------------------------------------------------------|
-| MHA / GQA (Llama-style) | `LlamaForCausalLMEagle3`                | `Eagle3LlamaModel`                                  | `atom/models/eagle3_llama.py`            | Independent draft pool via `Eagle3DraftBuilder`                          |
+| MHA / GQA (Llama-style) | `LlamaForCausalLMEagle3`                | `Eagle3LlamaModel`                                  | `atom/models/eagle3_llama.py`            | Independent draft pool via `DraftKvBuilder`                          |
 | MLA (DeepSeek V3 / K2.6)| `Eagle3DeepseekV2ForCausalLM`           | `Eagle3DeepseekMLAModel`                            | `atom/models/eagle3_deepseek_mla.py`     | Piggybacks the target's MLA KV pool at `layer_id = num_hidden_layers`    |
 
 Both classes implement the same set of EAGLE 3.1 toggles. The MLA variant
