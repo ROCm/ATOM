@@ -538,7 +538,7 @@ positions are ragged, and the one-token decode slot mapping comes from
 | `token_layout/prefill.py` | `prefill_positions` — where a ragged prefill chunk's tokens sit in their own sequences |
 | `token_layout/decode.py` | `decode_positions` — the same for the rectangular speculative decode step |
 | `token_layout/slots.py` | `slot_mapping` — which KV slot a token is written to, one gather for both sides |
-| `token_layout/batch_ids.py` | `batch_id_per_token` — the token → sequence map both sides build and every kernel resolves per-sequence data through |
+| `token_layout/batch_ids.py` | `build_batch_ids` — builds the token → sequence map every kernel resolves per-sequence data through. Query lengths in gives `batch_id_per_q_token`, context lengths in gives `batch_id_per_k_token`; the two axes are not interchangeable |
 
 ### `atom/model_ops/fused_moe/`
 

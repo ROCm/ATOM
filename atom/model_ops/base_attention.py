@@ -136,7 +136,7 @@ def cp_mha_gather_cache_kernel(
     value_ptr,  # [num_tokens, num_heads, head_size]
     block_table_ptr,  # [num_batches, max_block_num]
     cu_seqlens_kv_ptr,  # [num_batches + 1]
-    token_to_batch_ptr,  # [max_cum_tokens]
+    batch_id_per_k_token_ptr,  # [max_cum_tokens]
     seq_start_ptr,  # [num_batches]
     k_scale_ptr,  # [1] / [num_blocks, num_kv_heads, page_size]
     v_scale_ptr,
@@ -163,7 +163,7 @@ def cp_mha_gather_cache_kernel(
     value_ptr_offset = (
         value_ptr + token_id * head_size * num_heads + head_id * head_size
     )
-    batch_idx = tl.load(token_to_batch_ptr + token_id)
+    batch_idx = tl.load(batch_id_per_k_token_ptr + token_id)
     batch_start = tl.load(seq_start_ptr + batch_idx)
     token_start = tl.load(cu_seqlens_kv_ptr + batch_idx)
     batch_offset = token_id - token_start + batch_start
@@ -254,7 +254,7 @@ def cp_mha_gather_cache(
     k_scales: torch.Tensor | None,
     v_scales: torch.Tensor | None,
     cu_seqlens_kv: torch.Tensor,
-    token_to_batch: torch.Tensor,
+    batch_id_per_k_token: torch.Tensor,
     seq_starts: torch.Tensor,
     dequant: bool,
     kv_cache_layout: str,
@@ -299,7 +299,7 @@ def cp_mha_gather_cache(
         value,
         block_tables,
         cu_seqlens_kv,
-        token_to_batch,
+        batch_id_per_k_token,
         seq_starts,
         k_scales,
         v_scales,

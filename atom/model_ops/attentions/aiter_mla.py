@@ -672,11 +672,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     tgt.sparse_kv_indices_buffer = self._sparse_kv_indices_gpu
                     tgt.dcp_sparse_kv_indptr_buffer = self._dcp_sparse_kv_indptr_gpu
                     tgt.dcp_owned_counts_buffer = self._dcp_owned_counts_gpu
-            self._token_to_seq_idxs_gpu = torch.zeros(
-                self.max_num_batched_tokens,
-                dtype=torch.int32,
-                device=self.device,
-            )
 
         # Per-ubatch buffers for CUDAGraph TBO
         if config.enable_tbo:
@@ -1530,9 +1525,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
             # Per-query req_id: token_id 0..scheduled_tokens-1 maps to batch id.
             # Use counts (new tokens per batch), not context_lens (full seq len).
-            attn_metadata.token_to_seq_idxs = torch.repeat_interleave(
-                torch.arange(bs, dtype=torch.int32, device=self.device),
-                torch.tensor(counts, dtype=torch.int64, device=self.device),
+            attn_metadata.batch_id_per_q_token = self.publish_batch_ids(
+                np.asarray(counts, dtype=np.int32)
             )
             var["sparse_kv_indptr"].np[0] = 0
             var["sparse_kv_indptr"].np[1 : scheduled_tokens + 1] = np.cumsum(
@@ -1907,8 +1901,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.cu_seqlen_ks = ks_padded[owned_q].contiguous()
         ke_padded = pcp_pad_dense(attn_metadata.cu_seqlen_ke, n_pad)
         attn_metadata.cu_seqlen_ke = ke_padded[owned_q].contiguous()
-        t2s_padded = pcp_pad_dense(attn_metadata.token_to_seq_idxs, n_pad)
-        attn_metadata.token_to_seq_idxs = t2s_padded[owned_q].contiguous()
+        bid_padded = pcp_pad_dense(attn_metadata.batch_id_per_q_token, n_pad)
+        attn_metadata.batch_id_per_q_token = bid_padded[owned_q].contiguous()
 
         # --- one query per row (incl dummies) -> sparse_cu_seqlens_q = arange.
         attn_metadata.sparse_cu_seqlens_q = torch.arange(
@@ -2302,13 +2296,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.sparse_kv_last_page_lens = var[
                 "sparse_kv_last_page_lens"
             ].gpu[:running_tokens]
-            self._token_to_seq_idxs_gpu[:scheduled_tokens] = torch.arange(
-                scheduled_bs, dtype=torch.int32, device=self.device
-            ).repeat_interleave(max_seqlen_q)
-            self._token_to_seq_idxs_gpu[scheduled_tokens:running_tokens] = 0
-            attn_metadata.token_to_seq_idxs = self._token_to_seq_idxs_gpu[
-                :running_tokens
-            ]
+            # Rectangular step: `max_seqlen_q` tokens per scheduled sequence.
+            attn_metadata.batch_id_per_q_token = self.publish_batch_ids(
+                np.full(scheduled_bs, max_seqlen_q, dtype=np.int32),
+                pad_to=running_tokens,
+            )
         elif self.is_sparse:
             # Non-MTP sparse decode (single token per seq): the sparse KV is
             # packed at page_size=1, so last_page_len is 1 for every seq. Expose
@@ -2614,12 +2606,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_matadata.sparse_kv_last_page_lens = var[
                 "sparse_kv_last_page_lens"
             ].gpu[:scheduled_tokens]
-            self._token_to_seq_idxs_gpu[:scheduled_tokens] = torch.arange(
-                bs, dtype=torch.int32, device=self.device
-            ).repeat_interleave(max_q_len)
-            attn_matadata.token_to_seq_idxs = self._token_to_seq_idxs_gpu[
-                :scheduled_tokens
-            ]
+            attn_matadata.batch_id_per_q_token = self.publish_batch_ids(
+                np.full(bs, max_q_len, dtype=np.int32)
+            )
         elif self.is_sparse:
             # Non-MTP sparse decode capture: all-1s per-token last-page lens,
             # matching prepare_decode so _forward_decode reads the sparse buffer.
@@ -2746,11 +2735,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 attn_metadata.sparse_cu_seqlens_q[ts.start : ts.stop + 1] - base
             )
 
-        if (
-            hasattr(attn_metadata, "token_to_seq_idxs")
-            and attn_metadata.token_to_seq_idxs is not None
-        ):
-            ub_attn.token_to_seq_idxs = attn_metadata.token_to_seq_idxs[ts] - req_start
+        if attn_metadata.batch_id_per_q_token is not None:
+            ub_attn.batch_id_per_q_token = (
+                attn_metadata.batch_id_per_q_token[ts] - req_start
+            )
 
         total_tokens = (
             attn_metadata.slot_mapping.shape[0]

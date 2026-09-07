@@ -59,7 +59,7 @@ def _csa_translate_pack_kernel(
     block_tables_ptr,  # [bs, mnbps] int32 — page table
     positions_ptr,  # [T] int — global token positions (only read under INLINE_SKIP_FROM_POS)
     kv_indptr_csa_ptr,  # [T+1] int32 — packed cumsum; per-token valid_k = indptr[t+1]-indptr[t]-skip[t]
-    batch_id_per_token_ptr,  # [T] int32 — token → seq, sentinel -1
+    batch_id_per_q_token_ptr,  # [T] int32 — token → seq, sentinel -1
     skip_prefix_len_per_token_ptr,  # [T] int32 — per-token write offset; ignored when INLINE_SKIP_FROM_POS
     kv_indices_csa_ptr,  # [total_indices] int32 — destination
     mnbps,  # i32 — max blocks per seq, runtime int
@@ -75,7 +75,7 @@ def _csa_translate_pack_kernel(
 
     # CG-padded slot sentinel: builder fills [actual_T:padded_T] with -1
     # so the captured kernel grid (= padded_T) bails on padded entries.
-    bid = tl.load(batch_id_per_token_ptr + pid_t)
+    bid = tl.load(batch_id_per_q_token_ptr + pid_t)
     if bid < 0:
         return
 
@@ -145,7 +145,7 @@ def csa_translate_pack(
     block_tables: torch.Tensor,
     positions: torch.Tensor,
     kv_indptr_csa: torch.Tensor,
-    batch_id_per_token: torch.Tensor,
+    batch_id_per_q_token: torch.Tensor,
     skip_prefix_len_per_token: torch.Tensor | None,
     kv_indices_csa: torch.Tensor,
     *,
@@ -182,7 +182,7 @@ def csa_translate_pack(
                                    → kv_len=0). The kernel reads both
                                    `[t]` and `[t+1]` so `valid_k[t]` is
                                    recovered as `indptr[t+1] - indptr[t] - skip[t]`.
-      batch_id_per_token:          [T] int32 — token → seq, sentinel -1 for
+      batch_id_per_q_token:          [T] int32 — token → seq, sentinel -1 for
                                    CG-padded slots.
       skip_prefix_len_per_token:   [T] int32 OR None — per-token SWA prefix
                                    length (the tail segment of each token's
@@ -219,9 +219,9 @@ def csa_translate_pack(
         raise ValueError("skip_prefix_len_per_token is required when window_size == 0")
     if kv_indptr_csa.numel() < T + 1:
         raise ValueError(f"kv_indptr_csa.numel()={kv_indptr_csa.numel()} < T+1={T + 1}")
-    if batch_id_per_token.numel() < T:
+    if batch_id_per_q_token.numel() < T:
         raise ValueError(
-            f"batch_id_per_token.numel()={batch_id_per_token.numel()} < T={T}"
+            f"batch_id_per_q_token.numel()={batch_id_per_q_token.numel()} < T={T}"
         )
     if not inline_skip and skip_prefix_len_per_token.numel() < T:
         raise ValueError(
@@ -257,7 +257,7 @@ def csa_translate_pack(
         block_tables,
         positions,
         kv_indptr_csa,
-        batch_id_per_token,
+        batch_id_per_q_token,
         skip_ptr,
         kv_indices_csa,
         mnbps,
@@ -275,7 +275,7 @@ def csa_translate_pack_reference(
     block_tables: torch.Tensor,
     positions: torch.Tensor,
     kv_indptr_csa: torch.Tensor,
-    batch_id_per_token: torch.Tensor,
+    batch_id_per_q_token: torch.Tensor,
     skip_prefix_len_per_token: torch.Tensor | None,
     kv_indices_csa: torch.Tensor,
     *,
@@ -291,7 +291,7 @@ def csa_translate_pack_reference(
     T, _ = topk_local.shape
     indptr = kv_indptr_csa.to(torch.int64)
     poses = positions.to(torch.int64)
-    bids = batch_id_per_token.to(torch.int64)
+    bids = batch_id_per_q_token.to(torch.int64)
     inline_skip = window_size > 0
     skips = (
         skip_prefix_len_per_token.to(torch.int64)

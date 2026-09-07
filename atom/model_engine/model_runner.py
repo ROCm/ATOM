@@ -1336,9 +1336,9 @@ class ModelRunner:
         by accident, since `postprocess` synchronizes to read the sampled ids,
         but a chunked prefill's middle chunk returns before `postprocess` and
         closes nothing. Measured: the host reached 4042 packets ahead and the
-        GPU read a `batch_id_per_token` from a later batch (id 3 in a `bs=2`
+        GPU read a `batch_id_per_q_token` from a later batch (id 3 in a `bs=2`
         batch), tripping the bounds assert in
-        `cu_committed_gpu[batch_id_per_token]` -- which wedges the queue with
+        `cu_committed_gpu[batch_id_per_q_token]` -- which wedges the queue with
         no fault line and no traceback.
 
         One buffer admits one forward of lead, so the gate is depth-1. Decode
@@ -3509,7 +3509,7 @@ class ModelRunner:
 
         Two guards, both DP-safe (the decision must be identical on every rank,
         else capture loops desync and the next get_dp_padding all_reduce couples
-        mismatched num_tokens -> "batch_id_per_token len < T"):
+        mismatched num_tokens -> "batch_id_per_q_token len < T"):
 
         1. DP+spec hard cap: big bs*q buckets never run under DP but bloat the
            pool and don't overlap comm, so cap at ATOM_PIECEWISE_DP_MAX_TOKENS.

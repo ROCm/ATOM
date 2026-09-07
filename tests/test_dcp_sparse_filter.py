@@ -79,7 +79,7 @@ def _build_prefill_case(seq_lens):
     np.cumsum(seq_lens, out=cu_k[1:])
     num_tokens = int(cu_k[bs])
 
-    token_to_seq = np.repeat(np.arange(bs, dtype=np.int32), seq_lens)
+    batch_id_per_q_token = np.repeat(np.arange(bs, dtype=np.int32), seq_lens)
     # position of each query token within its sequence
     local_off = np.concatenate([np.arange(s, dtype=np.int32) for s in seq_lens])
     counts = np.minimum(local_off + 1, PRE_TOPK).astype(np.int32)
@@ -94,7 +94,7 @@ def _build_prefill_case(seq_lens):
     # a strided-then-wrapped pick keeps the selection non-contiguous.
     topk = np.full((num_tokens, PRE_TOPK), -1, dtype=np.int32)
     for t in range(num_tokens):
-        b = token_to_seq[t]
+        b = batch_id_per_q_token[t]
         n = counts[t]
         p = local_off[t]
         sel = (np.arange(n, dtype=np.int64) * 7919) % (p + 1)
@@ -116,7 +116,7 @@ def _build_prefill_case(seq_lens):
         "bs": bs,
         "num_tokens": num_tokens,
         "cu_k": cu_k,
-        "token_to_seq": token_to_seq,
+        "batch_id_per_q_token": batch_id_per_q_token,
         "kv_indptr": kv_indptr,
         "topk": topk,
         "block_table": block_table.astype(np.int32),
@@ -140,7 +140,7 @@ def _run_prefill(case, interleave=1):
         counts_scratch.fill_(-1)
         triton_filter_and_convert_dcp_index_prefill(
             g["kv_indptr"],
-            g["token_to_seq"],
+            g["batch_id_per_q_token"],
             g["topk"],
             g["cu_k"],
             g["block_table"],
@@ -176,7 +176,7 @@ def test_prefill_filter(seq_lens, interleave, world):
     per_rank = _run_prefill(case, interleave)
 
     cu_k = case["cu_k"]
-    tts = case["token_to_seq"]
+    bid = case["batch_id_per_q_token"]
     bt = case["block_table"]
     topk = case["topk"]
     kvp = case["kv_indptr"]
@@ -202,7 +202,7 @@ def test_prefill_filter(seq_lens, interleave, world):
 
     n_empty = 0
     for t in range(case["num_tokens"]):
-        b = tts[t]
+        b = bid[t]
         want = topk[t, : kvp[t + 1] - kvp[t]]
         want = want[want >= 0]
         n_claimed = 0

@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import aiter
 import torch
@@ -89,17 +89,17 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         head_dim,
         scale,
         num_kv_heads,
-        alibi_slopes: list[float] = None,
+        alibi_slopes: list[float] | None = None,
         kv_cache_dtype="bf16",
         layer_num=0,
         use_mla: bool = False,
-        mla_modules: Optional[MLAModules] = None,
-        sinks: Optional[nn.Parameter] = None,
-        per_layer_sliding_window: Optional[int] = None,
-        rotary_emb: Optional[torch.nn.Module] = None,
-        prefix: Optional[str] = None,
-        q_norm: Optional[torch.nn.Module] = None,
-        k_norm: Optional[torch.nn.Module] = None,
+        mla_modules: MLAModules | None = None,
+        sinks: nn.Parameter | None = None,
+        per_layer_sliding_window: int | None = None,
+        rotary_emb: torch.nn.Module | None = None,
+        prefix: str | None = None,
+        q_norm: torch.nn.Module | None = None,
+        k_norm: torch.nn.Module | None = None,
         **kwargs,
     ):
         from vllm.v1.attention.backend import AttentionType
@@ -193,7 +193,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         key: torch.Tensor,
         value: torch.Tensor,
         positions: torch.Tensor = None,
-        q_scale: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
         qkv: torch.Tensor = None,
         **kwargs,
     ):
@@ -419,7 +419,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         # `num_decodes` (not q.shape[0]) and `query_group_size` must include
         # the max_qlen multiplier — mirroring server-mode `paged_attention_triton`.
         _, num_q_heads_total, head_size = q.shape
-        num_blocks, num_kv_heads, _, block_size, _ = k_cache.shape
+        _, num_kv_heads, _, _, _ = k_cache.shape
         decode_metadata = attn_metadata.decode_metadata
         max_qlen = decode_metadata.max_query_len if decode_metadata is not None else 1
         assert num_q_heads_total % num_kv_heads == 0
@@ -527,8 +527,6 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             high_precision=0,
         )
 
-        return
-
     def extend_for_sliding_window(
         self,
         attn_metadata: "AiterMhaMetadataForVllm",
@@ -539,8 +537,8 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         cu_seqlens_q: torch.Tensor,
         max_seqlen_q: int,
         block_table: torch.Tensor,
-        k_scale: Optional[torch.Tensor],
-        v_scale: Optional[torch.Tensor],
+        k_scale: torch.Tensor | None,
+        v_scale: torch.Tensor | None,
     ):
         assert attn_metadata.extend_metadata is not None
         assert attn_metadata.extend_metadata.chunk_context_metadata is not None
@@ -549,7 +547,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         assert swa_metadata is not None
         swa_cu_seqlens = swa_metadata.swa_cu_seqlens
         swa_seq_starts = swa_metadata.swa_seq_starts
-        swa_token_to_batch = swa_metadata.swa_token_to_batch
+        swa_batch_id_per_k_token = swa_metadata.swa_batch_id_per_k_token
         swa_max_seqlens = swa_metadata.swa_max_seqlens
         swa_total_tokens = swa_metadata.swa_total_tokens
         key_fetched, value_fetched = (
@@ -566,7 +564,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             k_scales=k_scale,
             v_scales=v_scale,
             cu_seqlens_kv=swa_cu_seqlens,
-            token_to_batch=swa_token_to_batch,
+            batch_id_per_k_token=swa_batch_id_per_k_token,
             seq_starts=swa_seq_starts,
             dequant=self.kv_cache_dtype.startswith("fp8"),
             kv_cache_layout="SHUFFLE",
@@ -613,8 +611,8 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         min_seqlen_q: int,
         block_table: torch.Tensor,
         slot_mapping: torch.Tensor,
-        k_scale: Optional[torch.Tensor],
-        v_scale: Optional[torch.Tensor],
+        k_scale: torch.Tensor | None,
+        v_scale: torch.Tensor | None,
     ):
         from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
@@ -655,7 +653,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         cu_seqlens_kv = chunk_context_metadata.cu_seq_lens_chunk
         max_seqlens = chunk_context_metadata.max_seq_lens
         chunk_starts = chunk_context_metadata.chunk_starts
-        token_to_batch = chunk_context_metadata.token_to_batch
+        batch_id_per_k_token = chunk_context_metadata.batch_id_per_k_token
         total_token_per_batch = chunk_context_metadata.total_token_per_batch
         key_fetched, value_fetched = workspace[0], workspace[1]
         chunked_output = None
@@ -670,7 +668,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
                 k_scales=k_scale,
                 v_scales=v_scale,
                 cu_seqlens_kv=cu_seqlens_kv[chunk_idx],
-                token_to_batch=token_to_batch[chunk_idx],
+                batch_id_per_k_token=batch_id_per_k_token[chunk_idx],
                 seq_starts=chunk_starts[chunk_idx],
                 dequant=self.kv_cache_dtype.startswith("fp8"),
                 kv_cache_layout="SHUFFLE",
@@ -788,20 +786,21 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
 
         # create kv scale according to the num_blocks
         # usually it is created when cuda graph capture for decode phase
-        if self.kv_cache_dtype == "fp8":
-            if self.k_scale is None or self.v_scale is None:
-                # origin kv_scale is per tensor scale of value one.
-                self.per_tensor_scale = self.kv_scale
-                self.kv_scale = torch.zeros(
-                    2,
-                    num_blocks,
-                    num_kv_heads,
-                    block_size,
-                    dtype=dtypes.fp32,
-                    device=self.device,
-                )
-                self.k_scale = self.kv_scale[0]
-                self.v_scale = self.kv_scale[1]
+        if self.kv_cache_dtype == "fp8" and (
+            self.k_scale is None or self.v_scale is None
+        ):
+            # origin kv_scale is per tensor scale of value one.
+            self.per_tensor_scale = self.kv_scale
+            self.kv_scale = torch.zeros(
+                2,
+                num_blocks,
+                num_kv_heads,
+                block_size,
+                dtype=dtypes.fp32,
+                device=self.device,
+            )
+            self.k_scale = self.kv_scale[0]
+            self.v_scale = self.kv_scale[1]
 
         # as vLLM cuda graph capture padding mechanism, here split the qkvo with
         # the actual tokens

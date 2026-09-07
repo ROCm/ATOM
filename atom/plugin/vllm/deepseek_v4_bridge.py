@@ -742,9 +742,9 @@ def _v4_round_to_cudagraph_bucket(n: int, sizes) -> int:
     ``positions``/hidden states padded to a piecewise capture-size bucket
     (fixed shapes are required to replay the captured piecewise regions). The
     fused decode ``qk_norm_rope`` reads ``T = positions.shape[0]`` (the padded
-    forward width) and asserts ``len(batch_id_per_token) >= T``; if the V4
+    forward width) and asserts ``len(batch_id_per_q_token) >= T``; if the V4
     decode metadata is sized to the unpadded count the padded tail tokens read
-    ``batch_id_per_token`` out of bounds (illegal access / launch failure under
+    ``batch_id_per_q_token`` out of bounds (illegal access / launch failure under
     load). Rounding the decode token-pad count up to the same bucket vLLM pads
     the forward to keeps the ``batch_id == -1`` sentinel tail long enough to
     cover those padded rows. Batches larger than the max capture size run eager
@@ -1417,7 +1417,7 @@ def build_atom_v4_attention_metadata(
     # count unpadded (PIECEWISE decode: ``pad_attn`` is FULL-only). Size the
     # decode token-pad (and thus the ``batch_id == -1`` sentinel tail) to that
     # same bucket so the fused decode ``qk_norm_rope`` never reads
-    # ``batch_id_per_token`` past its end for the padded tail rows.
+    # ``batch_id_per_q_token`` past its end for the padded tail rows.
     if is_decode:
         T_pad = _v4_round_to_cudagraph_bucket(T_pad, cudagraph_token_sizes)
 
@@ -1482,7 +1482,7 @@ def build_atom_v4_attention_metadata(
             bufs.batch_id.np[:total] = batch_np
         if T_pad > total:
             bufs.batch_id.np[total:T_pad] = -1
-        md.batch_id_per_token = bufs.batch_id.copy_to_gpu(T_pad)
+        md.batch_id_per_q_token = bufs.batch_id.copy_to_gpu(T_pad)
         # Pad CSA committed count with index_topk (aiter top_k_per_row_decode
         # derives a per-row length from this for the whole captured grid; a
         # stale/zero value on a pad row can make that length negative -> hang).
@@ -1513,7 +1513,7 @@ def build_atom_v4_attention_metadata(
         )
         block_cols = int(common_attn_metadata.block_table_tensor.shape[1])
         block_rows = bufs.block_tables_per_token.gpu[:T_pad, :block_cols]
-        safe_batch_ids = md.batch_id_per_token[:T_pad].clamp_min(0).long()
+        safe_batch_ids = md.batch_id_per_q_token[:T_pad].clamp_min(0).long()
         torch.index_select(
             common_attn_metadata.block_table_tensor,
             0,
@@ -1536,7 +1536,7 @@ def build_atom_v4_attention_metadata(
             "total_committed": 0,
             "cu_committed_gpu": None,
             "n_committed_per_seq_gpu": md.n_committed_csa_per_seq,
-            "batch_id_per_token_gpu": md.batch_id_per_token,
+            "batch_id_per_q_token": md.batch_id_per_q_token,
             "seq_base_per_token_gpu": None,
             "cu_starts_gpu": None,
             "cu_ends_gpu": None,
@@ -1563,7 +1563,7 @@ def build_atom_v4_attention_metadata(
     md.state_slot_out_cpu = physical_slot_arr
     md.state_slot_mapping = md.state_slot_out
     md.state_slot_mapping_cpu = physical_slot_arr
-    md.batch_id_per_token = torch.from_numpy(batch_np).to(device)
+    md.batch_id_per_q_token = torch.from_numpy(batch_np).to(device)
     md.n_committed_csa_per_seq = torch.from_numpy(n_csa_cpu).to(device)
     md.compress_plans = _make_compress_plans(
         lens, seq_np, [(4, True), (128, False)], device, is_decode
@@ -1713,7 +1713,7 @@ def _populate_decode_persistent(md, common, pos_np, bufs, total, T_pad, position
     dest_rows = {ratio: buf.gpu for ratio, buf in bufs.swa_dest_rows.items()}
     write_v4_paged_decode_indices(
         state_slot_per_seq=md.state_slot_out,
-        batch_id_per_token=md.batch_id_per_token,
+        batch_id_per_q_token=md.batch_id_per_q_token,
         positions=positions_gpu,
         swa_indptr=swa_indptr_gpu,
         csa_indptr=csa_indptr_gpu,
@@ -1727,7 +1727,7 @@ def _populate_decode_persistent(md, common, pos_np, bufs, total, T_pad, position
         geometry=md.pool_geometry,
     )
     write_v4_decode_hca_compress_tail(
-        batch_id_per_token=md.batch_id_per_token,
+        batch_id_per_q_token=md.batch_id_per_q_token,
         positions=positions_gpu,
         hca_indptr=hca_indptr_gpu,
         block_tables=common.block_table_tensor,
@@ -1770,8 +1770,8 @@ def _populate_indexer(
     cu[-1] = max(int(cu[-1]), 1)
     cu_gpu = torch.from_numpy(cu).to(device)
     # Per-prefill-token batch id, rebased to 0-based prefill-seq indexing.
-    bid = (md.batch_id_per_token[num_decode_tokens:] - num_decodes).to(
-        md.batch_id_per_token.dtype
+    bid = (md.batch_id_per_q_token[num_decode_tokens:] - num_decodes).to(
+        md.batch_id_per_q_token.dtype
     )
     pos_pref = positions[num_decode_tokens:]
     base = cu_gpu[bid].to(torch.int32)
@@ -1782,7 +1782,7 @@ def _populate_indexer(
         # FULL per-seq committed (decode-first order): the decode sub-call
         # slices [:num_decodes]; the pure-decode path reads it whole.
         "n_committed_per_seq_gpu": md.n_committed_csa_per_seq,
-        "batch_id_per_token_gpu": md.batch_id_per_token,
+        "batch_id_per_q_token": md.batch_id_per_q_token,
         "seq_base_per_token_gpu": base,
         "cu_starts_gpu": base,
         "cu_ends_gpu": end,
@@ -1902,7 +1902,7 @@ def _populate_prefill(md, common, batch_np, pos_np, q_np, positions_gpu):
     cu_q_g = torch.from_numpy(np.ascontiguousarray(q_np[:num_reqs])).to(device)
     write_v4_paged_prefill_indices(
         positions=positions_gpu[:T].to(torch.int32),
-        bid_per_token=md.batch_id_per_token[:T],
+        bid_per_token=md.batch_id_per_q_token[:T],
         chunk_start_per_seq=chunk_start_g,
         cu_seqlens_q_per_seq=cu_q_g,
         state_slot_per_seq=md.state_slot_out[:num_reqs],
@@ -1965,7 +1965,7 @@ def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
     }
     write_v4_paged_decode_indices(
         state_slot_per_seq=md.state_slot_out,
-        batch_id_per_token=md.batch_id_per_token,
+        batch_id_per_q_token=md.batch_id_per_q_token,
         positions=positions_gpu,
         swa_indptr=swa_indptr,
         csa_indptr=csa_indptr,
@@ -1979,7 +1979,7 @@ def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
         geometry=md.pool_geometry,
     )
     write_v4_decode_hca_compress_tail(
-        batch_id_per_token=md.batch_id_per_token,
+        batch_id_per_q_token=md.batch_id_per_q_token,
         positions=positions_gpu,
         hca_indptr=hca_indptr,
         block_tables=common.block_table_tensor,

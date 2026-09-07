@@ -25,6 +25,10 @@ from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.attentions.pool_layout.pool_rows import PoolRowsMixin
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import SubPoolSpec
+from atom.model_ops.attentions.token_layout.batch_ids import (
+    build_batch_ids,
+    build_batch_ids_device,
+)
 from atom.model_ops.attentions.token_layout.prefill import prefill_positions
 from atom.model_ops.attentions.token_layout.slots import slot_mapping
 from atom.model_ops.dcp_ops import dcp_prefill_slot_mapping
@@ -423,9 +427,8 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         # allocation costs, not what a warm free-list hit costs.
         self.token_axis_scratch = np.empty(self.max_num_batched_tokens, dtype=np.int64)
         # Every row's own index, resident so no step rebuilds it. One buffer for
-        # three readers that each want the same numbers: a cu_seqlens ramp at one
-        # token per sequence (hence `+ 1`), the real prefix a padded
-        # `batch_id_per_token` is restored from, and DSpark's token -> request map.
+        # two readers that each want the same numbers: a cu_seqlens ramp at one
+        # token per sequence (hence `+ 1`), and DSpark's token -> request map.
         self.row_ids = torch.arange(
             self.max_bs + 1, device=self.device, dtype=torch.int32
         )
@@ -458,6 +461,11 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             "num_cached_tokens": CpuGpuBuffer(self.max_bs, **i32_kwargs),
             # seq_starts for cp_mha_gather_cache: always zeros (prefix at position 0)
             "seq_starts": CpuGpuBuffer(self.max_bs, **i32_kwargs),
+            # token -> seq over this fwd's QUERY tokens; `-1` on the CUDAGraph
+            # pad tail. Every backend needs it (see token_layout/batch_ids.py).
+            "batch_id_per_q_token": CpuGpuBuffer(
+                self.max_num_batched_tokens, **i32_kwargs
+            ),
         }
 
         attn_metadata["cu_seqlens_q"].cpu.copy_(
@@ -660,6 +668,14 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             scratch=self.token_axis_scratch,
         )
 
+    def publish_batch_ids(
+        self, seqlens: np.ndarray, pad_to: int | None = None
+    ) -> torch.Tensor:
+        """Build the token -> seq map into the shared buffer and upload it."""
+        buf = self.model_runner.forward_vars["batch_id_per_q_token"]
+        build_batch_ids(seqlens, pad_to=pad_to, out=buf.np)
+        return buf.copy_to_gpu(pad_to or int(seqlens.sum()))
+
     def _upload_prefill_mirrors(
         self,
         scheduled_bs: int,
@@ -752,6 +768,15 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         ctx = self._upload_prefill_mirrors(
             scheduled_bs, running_bs, scheduled_tokens, has_cached, cached_lens
         )
+        if has_cached:
+            # Layer-invariant, so built once here rather than in every layer's
+            # prefix gather. On the device: `total_kv` has no upper bound.
+            # `context_lens` is `running_bs` wide and its padded tail is zero,
+            # so it still sums to exactly `total_kv` -- which is handed over so
+            # the build does not stop the device to measure itself.
+            ctx["batch_id_per_k_token"] = build_batch_ids_device(
+                ctx["context_lens"], total=total_kv
+            )
         attn_metadata = AttentionMetaData(
             # Cast to python int — numpy.int32 leaks in via batch.context_lens
             # (numpy array) and breaks downstream Triton kernel constexpr

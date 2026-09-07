@@ -179,7 +179,7 @@ class EagleProposer(Drafter):
 
         Nothing of the target's metadata is installed here. The pad rows are
         already masked where it matters: `prepare_mtp_decode` writes `-1` into
-        `batch_id_per_token`, and the index kernel returns on `bid < 0` before it
+        `batch_id_per_q_token`, and the index kernel returns on `bid < 0` before it
         ever loads a ring slot.
         """
         return self.model(
