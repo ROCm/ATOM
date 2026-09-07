@@ -95,10 +95,13 @@ def kda_attention_vllm(
 ) -> None:
     """Opaque splitting-op boundary for the KDA mixer, vLLM plugin flavour.
 
-    Mirrors ``aiter.kda_attention_with_output`` but takes an ``output`` buffer
-    instead of returning one, which ``@eager_break_during_capture`` requires.
-    Registering it here rather than widening the shared op keeps the native
-    ATOM and SGLang paths on the original signature.
+    Mirrors ``aiter.kda_attention_with_output``'s ``output``-buffer contract,
+    which ``@eager_break_during_capture`` requires, but keeps the mixer input on
+    this side of the boundary: the native op's prologue runs in the compiled
+    graph, which the plugin cannot do because ``_forward_segments`` re-runs the
+    mixer per row-segment of a mixed spec/non-spec batch. So this one still
+    takes ``hidden_states`` and goes through ``_forward_impl``, which is why
+    that method keeps its original signature.
     """
     self = get_current_atom_config().compilation_config.static_forward_context[
         layer_name

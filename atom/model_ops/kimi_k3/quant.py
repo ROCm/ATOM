@@ -36,6 +36,7 @@ from __future__ import annotations
 import torch
 from aiter import QuantType, get_hip_quant
 
+from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace
 
 try:
@@ -95,24 +96,10 @@ if _HAS_TRITON:
         tl.store(s_ptr + tok, scale)
 
 
-@mark_trace
-def strided_per_token_quant(
+def _strided_per_token_quant_impl(
     x: torch.Tensor,
     quant_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-token quantize a possibly-strided ``[T, D]`` activation.
-
-    Fuses the row gather into the quant: ``x`` may be a column slice of a wider
-    tensor (feature stride 1, row stride > D), which the kernel reads at its
-    own stride. The result is a fresh contiguous ``[T, D]`` tensor, so the
-    ``.contiguous()`` such a slice would otherwise need before its consuming
-    GEMM is subsumed rather than merely reordered.
-
-    Returns ``(quantized [T, D], scale [T, 1] float32)``, the layout a
-    per-token a8w8 GEMM takes as ``x_scale=``. Bit-exact against
-    ``get_hip_quant(QuantType.per_Token)`` -- which is the fallback when triton
-    is unavailable -- including the zero scale on an all-zero row.
-    """
     assert x.ndim == 2, f"expected [T, D], got {tuple(x.shape)}"
     t, d = x.shape
     if not _HAS_TRITON or t == 0:
@@ -140,3 +127,57 @@ def strided_per_token_quant(
         BLOCK=triton.next_power_of_2(d),
     )
     return out, scale
+
+
+def _strided_per_token_quant_fake(
+    x: torch.Tensor,
+    quant_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    t, d = x.shape
+    return (
+        torch.empty((t, d), dtype=quant_dtype, device=x.device),
+        torch.empty((t, 1), dtype=torch.float32, device=x.device),
+    )
+
+
+direct_register_custom_op(
+    op_name="kimi_k3_strided_per_token_quant",
+    op_func=_strided_per_token_quant_impl,
+    mutates_args=[],
+    fake_impl=_strided_per_token_quant_fake,
+    # The kernel reads rows at x.stride(0) with a unit feature stride, which is
+    # exactly the layout a column slice of a fused GEMM output already has --
+    # so pinning the eager strides costs nothing and keeps the fused gather.
+    # Under the default flexible layout inductor would be free to realize the
+    # slice contiguous first, silently reintroducing the copy this kernel exists
+    # to avoid (correct, but pointless).
+    tags=(torch.Tag.needs_exact_strides,),
+)
+
+
+@mark_trace
+def strided_per_token_quant(
+    x: torch.Tensor,
+    quant_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-token quantize a possibly-strided ``[T, D]`` activation.
+
+    Fuses the row gather into the quant: ``x`` may be a column slice of a wider
+    tensor (feature stride 1, row stride > D), which the kernel reads at its
+    own stride. The result is a fresh contiguous ``[T, D]`` tensor, so the
+    ``.contiguous()`` such a slice would otherwise need before its consuming
+    GEMM is subsumed rather than merely reordered.
+
+    Returns ``(quantized [T, D], scale [T, 1] float32)``, the layout a
+    per-token a8w8 GEMM takes as ``x_scale=``. Bit-exact against
+    ``get_hip_quant(QuantType.per_Token)`` -- which is the fallback when triton
+    is unavailable -- including the zero scale on an all-zero row.
+
+    Dispatched through a registered custom op so torch.compile sees one opaque
+    node instead of tracing the body. The body is not traceable: it branches on
+    ``t == 0`` (a data-dependent guard on the dynamic token dim), asserts with
+    f-strings over ``x.shape``, and launches on a symbolic grid ``(t,)``. This
+    matters now that the KDA prologue runs inside the compiled graph rather than
+    inside the splitting op -- see ``KimiKDAAttention._kda_prologue``.
+    """
+    return torch.ops.aiter.kimi_k3_strided_per_token_quant(x, quant_dtype)
