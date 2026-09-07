@@ -24,7 +24,6 @@
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
 import logging
-import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -860,7 +859,7 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4(
             skip_reduce=True,
         )
 
-    if os.getenv("ATOM_DSV4_0731_OPTIMIZATIONS", "0") == "1":
+    if envs.ATOM_DSV4_0731_OPTIMIZATIONS:
         logical_qkv_width = q_lora_rank + kv_lora_rank + qk_rope_head_dim
         qkv_lora = qkv_lora[..., :logical_qkv_width]
     q_c, kv_c, k_pe = torch.split(

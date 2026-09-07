@@ -70,6 +70,9 @@ no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only whe
 | **ATOM_USE_TRITON_GEMM** | bool | 0 (false) | If set to `1`, use AITER Triton FP4 weight preshuffled GEMM. Otherwise use AITER ASM FP4 weight preshuffled GEMM. |
 | **ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM** | bool | 0 (false) | If set to `1`, use AITER Triton FP4 GEMM with non-shuffled weights. Takes precedence over the FP4 preshuffled GEMM path selected by `ATOM_USE_TRITON_GEMM`. |
 | **ATOM_USE_TRITON_MXFP4_BMM** | bool | 0 (false) | If set to `1`, use FP4 BMM in MLA attention module. |
+| **ATOM_DSV4_0731_OPTIMIZATIONS** | bool | 0 (false) | Enable the kernel and padded-QKV optimizations used by the DeepSeek-V4-Flash-0731 MI308X recipe. Keep disabled for other checkpoints. |
+| **ATOM_INDEXER_PREFILL_ROW_SHARD** | bool | 0 (false) | Shard replicated DeepSeek-V4 indexer prefill rows cyclically across TP ranks and all-gather their compact top-k outputs. |
+| **ATOM_ENABLE_MXFP4_SOURCE_ONLINE_QUANT** | bool | 0 (false) | Allow supported per-1x32 MXFP4 checkpoint weights to enter the online-quantization conversion path. |
 
 ### GLM-5.3
 

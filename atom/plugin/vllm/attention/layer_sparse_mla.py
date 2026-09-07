@@ -13,7 +13,6 @@ write, Q absorption, topk index conversion, sparse kernel, V up-projection.
 """
 
 import logging
-import os
 
 import torch
 import triton
@@ -31,7 +30,7 @@ from atom.plugin.prepare import is_vllm
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 
-if os.getenv("ATOM_DSV4_0731_OPTIMIZATIONS", "0") == "1":
+if envs.ATOM_DSV4_0731_OPTIMIZATIONS:
     from aiter.ops.flydsl import flydsl_fp8_mqa_logits as fp8_mqa_logits
 else:
     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits

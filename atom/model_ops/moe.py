@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
-import os
 from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -3337,7 +3336,7 @@ class FusedMoE(torch.nn.Module):
             # Online conversion already emits the architecture-native FP8 dtype.
             # Reapplying the checkpoint FN-to-FNUZ normalization on gfx942 would
             # double the scales and corrupt every converted expert layer.
-            if os.getenv("ATOM_DSV4_0731_OPTIMIZATIONS", "0") == "1":
+            if envs.ATOM_DSV4_0731_OPTIMIZATIONS:
                 self.quant_method.need_normalize_e4m3fn_to_e4m3fnuz = False
         elif online_quant_dtype == dtypes.fp4x2:
             self.quant_method = _make_mxfp4_moe_method(

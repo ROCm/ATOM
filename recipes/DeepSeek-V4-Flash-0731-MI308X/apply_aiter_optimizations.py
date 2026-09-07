@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Apply the AITER-side pieces of the DSV4-0731 MI308X recipe."""
 
 import argparse
@@ -47,7 +46,10 @@ def main() -> None:
 
     patch = assets / "hca-plan1024-nw4.patch"
     check = subprocess.run(
-        ["patch", "--dry-run", "-p1", "-i", str(patch)], cwd=root, capture_output=True
+        ["patch", "--dry-run", "-p1", "-i", str(patch)],
+        cwd=root,
+        capture_output=True,
+        check=False,
     )
     if check.returncode == 0:
         subprocess.run(["patch", "-p1", "-i", str(patch)], cwd=root, check=True)
@@ -58,8 +60,8 @@ def main() -> None:
     replace_once(
         mqa,
         "    if tag not in _VARIANT_BUILDERS:\n",
-        "    if tag == \"mfma_r4_adaptive\":\n"
-        "        tag = \"mfma_r4_w2\" if seq_len_kv <= 8192 else \"mfma_r4_w4\"\n"
+        '    if tag == "mfma_r4_adaptive":\n'
+        '        tag = "mfma_r4_w2" if seq_len_kv <= 8192 else "mfma_r4_w4"\n'
         "    if tag not in _VARIANT_BUILDERS:\n",
     )
 
@@ -75,8 +77,14 @@ def main() -> None:
         "    tile_k = 32 if (hidden_size <= 4096 and m <= 128) else 64\n",
     )
 
-    sparse = root / "aiter/ops/triton/_triton_kernels/attention/sparse_attention_dsv4.py"
-    replace_once(sparse, "        for BLOCK_H in [32, 64]\n", "        for BLOCK_H in [16, 32, 64]\n")
+    sparse = (
+        root / "aiter/ops/triton/_triton_kernels/attention/sparse_attention_dsv4.py"
+    )
+    replace_once(
+        sparse,
+        "        for BLOCK_H in [32, 64]\n",
+        "        for BLOCK_H in [16, 32, 64]\n",
+    )
 
     configs = root / "aiter/configs"
     merge_csv(
@@ -93,12 +101,37 @@ def main() -> None:
     merge_csv(
         configs / "model_configs/dsv4_bf16_tuned_gemm.csv",
         [assets / "bf16_longchunk.csv"],
-        ("gfx", "cu_num", "M", "N", "K", "bias", "dtype", "outdtype", "scaleAB", "bpreshuffle"),
+        (
+            "gfx",
+            "cu_num",
+            "M",
+            "N",
+            "K",
+            "bias",
+            "dtype",
+            "outdtype",
+            "scaleAB",
+            "bpreshuffle",
+        ),
     )
     merge_csv(
         configs / "tuned_fmoe.csv",
         [assets / "fmoe_m131072.csv"],
-        ("cu_num", "token", "model_dim", "inter_dim", "expert", "topk", "act_type", "dtype", "q_dtype_a", "q_dtype_w", "q_type", "use_g1u1", "doweight_stage1"),
+        (
+            "cu_num",
+            "token",
+            "model_dim",
+            "inter_dim",
+            "expert",
+            "topk",
+            "act_type",
+            "dtype",
+            "q_dtype_a",
+            "q_dtype_w",
+            "q_type",
+            "use_g1u1",
+            "doweight_stage1",
+        ),
     )
 
 

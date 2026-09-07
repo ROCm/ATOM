@@ -29,6 +29,9 @@ _ATOM_ENV_VARS = [
     "ATOM_DISABLE_VLLM_PLUGIN",
     "ATOM_USE_CUSTOM_ALL_GATHER",
     "ATOM_ENABLE_RELAXED_MTP",
+    "ATOM_DSV4_0731_OPTIMIZATIONS",
+    "ATOM_INDEXER_PREFILL_ROW_SHARD",
+    "ATOM_ENABLE_MXFP4_SOURCE_ONLINE_QUANT",
 ]
 
 
@@ -100,6 +103,15 @@ class TestEnvsDefaults:
     def test_atom_enable_gdn_decode_lossy_fast_default(self):
         assert _get_envs().ATOM_ENABLE_GDN_DECODE_LOSSY_FAST is False
 
+    def test_dsv4_recipe_optimizations_default_disabled(self):
+        assert _get_envs().ATOM_DSV4_0731_OPTIMIZATIONS is False
+
+    def test_indexer_prefill_row_shard_default_disabled(self):
+        assert _get_envs().ATOM_INDEXER_PREFILL_ROW_SHARD is False
+
+    def test_mxfp4_source_online_quant_default_disabled(self):
+        assert _get_envs().ATOM_ENABLE_MXFP4_SOURCE_ONLINE_QUANT is False
+
     def test_unknown_attr_raises(self):
         with pytest.raises(AttributeError):
             _ = _get_envs().ATOM_NONEXISTENT_VAR
@@ -165,6 +177,16 @@ class TestEnvsOverrides:
     def test_atom_enable_gdn_decode_lossy_fast_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", "1")
         assert _get_envs().ATOM_ENABLE_GDN_DECODE_LOSSY_FAST is True
+
+    def test_dsv4_recipe_flags_enabled(self, monkeypatch):
+        monkeypatch.setenv("ATOM_DSV4_0731_OPTIMIZATIONS", "1")
+        monkeypatch.setenv("ATOM_INDEXER_PREFILL_ROW_SHARD", "1")
+        monkeypatch.setenv("ATOM_ENABLE_MXFP4_SOURCE_ONLINE_QUANT", "1")
+
+        envs = _get_envs()
+        assert envs.ATOM_DSV4_0731_OPTIMIZATIONS is True
+        assert envs.ATOM_INDEXER_PREFILL_ROW_SHARD is True
+        assert envs.ATOM_ENABLE_MXFP4_SOURCE_ONLINE_QUANT is True
 
 
 class TestIsSet:

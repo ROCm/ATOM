@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
-import os
 from functools import partial as functools_partial
 from typing import Callable, Optional
 
@@ -897,7 +896,7 @@ class LinearBase(nn.Module):
             self.quant_type == QuantType.per_Token and self.params_dtype == dtypes.fp8
         )
         is_dsv4_fused_qkv_block = (
-            os.getenv("ATOM_DSV4_0731_OPTIMIZATIONS", "0") == "1"
+            envs.ATOM_DSV4_0731_OPTIMIZATIONS
             and self.quant_type == QuantType.per_1x128
             and self.params_dtype == dtypes.fp8
             and getattr(self, "needs_preshuffled_weight", False)

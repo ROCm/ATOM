@@ -17,10 +17,47 @@ from aiter import QuantType, dtypes
 
 from atom.model_ops.moe import FusedMoE
 from atom.quantization.quark.utils import (
+    can_dequant_weight_online,
     dequant_moe_weight_online,
     dequant_weight_online,
     quant_weight_online,
 )
+
+
+def test_mxfp4_source_capability_requires_opt_in(monkeypatch):
+    monkeypatch.delenv("ATOM_ENABLE_MXFP4_SOURCE_ONLINE_QUANT", raising=False)
+    assert not can_dequant_weight_online(QuantType.per_1x32, dtypes.fp4x2)
+
+    monkeypatch.setenv("ATOM_ENABLE_MXFP4_SOURCE_ONLINE_QUANT", "1")
+    assert can_dequant_weight_online(QuantType.per_1x32, dtypes.fp4x2)
+    assert not can_dequant_weight_online(QuantType.per_1x128, dtypes.fp4x2)
+
+
+def test_mxfp4_source_dequant_matches_aiter_upcast(monkeypatch):
+    from aiter.ops.triton.moe.quant_moe import upcast_from_mxfp
+
+    monkeypatch.setenv("ATOM_ENABLE_MXFP4_SOURCE_ONLINE_QUANT", "1")
+    source = torch.randn(32, 256, dtype=torch.bfloat16, device="cuda")
+    weight, scale = quant_weight_online(
+        source,
+        online_quant_type=QuantType.per_1x32,
+        online_quant_dtype=dtypes.fp4x2,
+    )
+
+    actual = dequant_weight_online(
+        weight,
+        scale,
+        QuantType.per_1x32,
+        dtypes.fp4x2,
+    )
+    expected = upcast_from_mxfp(
+        weight.view(torch.uint8),
+        scale.view(torch.uint8),
+        torch.bfloat16,
+        axis=-1,
+    )
+
+    assert torch.equal(actual, expected)
 
 
 def _quantize_expertwise(weight, scale):

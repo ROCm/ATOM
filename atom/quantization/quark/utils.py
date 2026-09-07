@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -10,6 +9,8 @@ import torch
 import triton
 import triton.language as tl
 from aiter import QuantType, dtypes
+
+from atom.utils import envs
 
 _FP8_SOURCE_DTYPES = frozenset(
     {
@@ -208,6 +209,11 @@ def can_dequant_weight_online(
     """Return whether the online path can dequantize this source."""
     if source_quant_type == QuantType.No:
         return True
+    if source_quant_dtype == dtypes.fp4x2:
+        return (
+            envs.ATOM_ENABLE_MXFP4_SOURCE_ONLINE_QUANT
+            and source_quant_type == QuantType.per_1x32
+        )
     if source_quant_dtype is not None and source_quant_dtype not in _FP8_SOURCE_DTYPES:
         return False
     return source_quant_type in (
@@ -234,21 +240,22 @@ def dequant_weight_online(
 
     A source is identified by BOTH its ``quant_type`` (the block layout) and its
     element ``quant_dtype``. The layout alone is not enough: ``per_1x32`` is the
-    MX layout, which the format allows to carry 4-bit elements as well, and only
-    the 8-bit (MXFP8) form is accepted here. Supported sources:
+    MX layout, which can carry 4-bit or 8-bit elements. MXFP4 is accepted only
+    for ``per_1x32`` when its explicit recipe flag is enabled. Supported sources:
 
     - ``No``: unquantized, returned unchanged.
     - ``per_Tensor``: per-tensor FP8, one scalar scale per output partition.
     - ``per_Token`` (ptpc_fp8): per-output-channel FP8, scale ``(N, 1)``.
     - ``per_1x128``: DeepSeek-style 128x128 block FP8.
-    - ``per_1x32``: MXFP8 (1x32 E8M0 shared scale).
+    - ``per_1x32``: MXFP8, or opted-in MXFP4 (1x32 E8M0 shared scale).
 
     :param weight: The quantized (or float, for ``No``) weight tensor.
     :param weight_scale: The source weight scale (``None`` for ``No``).
     :param source_quant_type: The source quantization scheme (block layout).
     :param source_quant_dtype: The source element dtype. Used together with
-        ``source_quant_type`` to reject non-8-bit (e.g. MXFP4) sources. When
-        ``None`` the dtype check is skipped (caller vouches for an 8-bit source).
+        ``source_quant_type`` to validate the source format. Opted-in MXFP4
+        sources require ``per_1x32``; when ``None`` the dtype check is skipped
+        (the caller vouches for an 8-bit source).
     :param output_partition_sizes: row counts of each merged output partition,
         only used (and required) by ``per_Tensor`` merged layers.
     :return: The dequantized weight in the default float dtype.
@@ -257,21 +264,20 @@ def dequant_weight_online(
         return weight
 
     is_mxfp4_source = source_quant_dtype == dtypes.fp4x2
-    enable_mxfp4_source = os.environ.get(
-        "ATOM_ENABLE_MXFP4_SOURCE_ONLINE_QUANT", "0"
-    ).lower() in {"1", "true", "yes", "on"}
+    enable_mxfp4_source = envs.ATOM_ENABLE_MXFP4_SOURCE_ONLINE_QUANT
     if is_mxfp4_source and enable_mxfp4_source:
         if source_quant_type != QuantType.per_1x32:
-            raise ValueError(
-                f"MXFP4 source requires per_1x32, got {source_quant_type}"
-            )
+            raise ValueError(f"MXFP4 source requires per_1x32, got {source_quant_type}")
         from aiter.ops.triton.moe.quant_moe import upcast_from_mxfp
 
         output_dtype = torch.get_default_dtype()
         if output_dtype not in (torch.float16, torch.bfloat16):
             output_dtype = torch.bfloat16
         return upcast_from_mxfp(
-            weight.view(torch.uint8), weight_scale, output_dtype, axis=-1
+            weight.view(torch.uint8),
+            weight_scale.view(torch.uint8),
+            output_dtype,
+            axis=-1,
         )
     if source_quant_dtype is not None and source_quant_dtype not in _FP8_SOURCE_DTYPES:
         raise ValueError(

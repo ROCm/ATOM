@@ -147,6 +147,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB": lambda: int(
         os.getenv("ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB", "2048")
     ),
+    # DeepSeek-V4-Flash-0731 MI308X recipe optimizations.  Keep this off for
+    # every other model/checkpoint; the recipe enables it explicitly.
+    "ATOM_DSV4_0731_OPTIMIZATIONS": lambda: (
+        os.getenv("ATOM_DSV4_0731_OPTIMIZATIONS", "0") == "1"
+    ),
+    # Split replicated V4 indexer prefill rows cyclically across TP ranks, then
+    # gather only their compact top-k outputs.
+    "ATOM_INDEXER_PREFILL_ROW_SHARD": lambda: (
+        os.getenv("ATOM_INDEXER_PREFILL_ROW_SHARD", "0") == "1"
+    ),
+    # Permit an MXFP4 checkpoint to be dequantized and converted by the normal
+    # online-quantization pipeline.  This is opt-in until all source layouts
+    # supported by checkpoints have dedicated coverage.
+    "ATOM_ENABLE_MXFP4_SOURCE_ONLINE_QUANT": lambda: (
+        os.getenv("ATOM_ENABLE_MXFP4_SOURCE_ONLINE_QUANT", "0") == "1"
+    ),
     # GLM-5.2 (glm_moe_dsa): enable the fused indexer qk-rope + fp8-quant + kv-cache
     # kernel (indexer_qk_rope_quant_and_cache), same path DeepSeek-V3.2 uses. GLM's
     # indexer dims (index_head_dim=128, qk_rope_head_dim=64, per_1x128, neox rope) are

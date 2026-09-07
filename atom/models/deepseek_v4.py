@@ -38,8 +38,8 @@ from aiter import (
 )
 from aiter import silu_and_mul as aiter_silu_and_mul
 from aiter.dist.parallel_state import (
-    get_tp_group,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.batched_gemm_op_a8w8 import (
@@ -71,13 +71,6 @@ from atom.distributed.pcp_utils import (
     pcp_round_robin_split,
 )
 from atom.model_loader.loader import WeightsMapper
-from atom.model_ops.v4_indexer_utils import restore_cyclic_row_order
-
-if os.getenv("ATOM_DSV4_0731_OPTIMIZATIONS", "0") == "1":
-    from aiter.ops.flydsl import flydsl_fp8_mqa_logits as fp8_mqa_logits
-else:
-    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
-
 
 # Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`
 # (shared with deepseek_v2) and `torch.ops.aiter.indexer_score_topk` (V4-only).
@@ -108,6 +101,10 @@ from atom.model_ops.topK import (
 from atom.model_ops.triton_hash_topk import hash_topk_triton
 from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.utils import atom_parameter, shuffle_weights
+from atom.model_ops.v4_indexer_utils import (
+    cyclic_row_indices,
+    restore_cyclic_row_order,
+)
 from atom.model_ops.v4_kernels import (
     FP4_MQA_BLOCK_K,
     FP4_MQA_PARALLEL_UNIT_NUM,
@@ -130,6 +127,11 @@ from atom.utils.cuda_graph import CudagraphCaptureRunner
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import AttnState, get_forward_context
+
+if envs.ATOM_DSV4_0731_OPTIMIZATIONS:
+    from aiter.ops.flydsl import flydsl_fp8_mqa_logits as fp8_mqa_logits
+else:
+    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
 logger = logging.getLogger(__name__)
 
@@ -706,9 +708,7 @@ def make_v4_quant_config(hf_config, model_path=None, online_quant_config=None):
         # dequant→requant round-trip for these layers (which would either
         # crash on the moe assert or further damage already-quantized weights).
         if ".ffn.experts" in layer_name:
-            if use_online_quant and os.environ.get(
-                "ATOM_ENABLE_MXFP4_SOURCE_ONLINE_QUANT", "0"
-            ).lower() in {"1", "true", "yes", "on"}:
+            if use_online_quant and envs.ATOM_ENABLE_MXFP4_SOURCE_ONLINE_QUANT:
                 online_spec = orig_lookup(
                     layer_name,
                     use_online_quant=True,
@@ -1854,16 +1854,15 @@ class Indexer(nn.Module):
         """
         device = q_fp8.device
         total_tokens = q_fp8.size(0)
+        if total_tokens == 0:
+            return torch.empty((0, topk), dtype=torch.int32, device=device)
         # The V4 indexer is replicated across tensor-parallel ranks.  During
         # prefill every rank therefore used to score and radix-select the same
         # query rows.  Shard rows (not heads/columns) so each row's exact top-k
         # remains local, then all-gather only the int32 indices.  This avoids an
         # all-reduce of the much larger dense fp32 logits matrix.
         tp_group = get_tp_group()
-        row_shard = (
-            os.getenv("ATOM_INDEXER_PREFILL_ROW_SHARD", "0") == "1"
-            and tp_group.world_size > 1
-        )
+        row_shard = envs.ATOM_INDEXER_PREFILL_ROW_SHARD and tp_group.world_size > 1
         global_total_tokens = total_tokens
         shard_rows = total_tokens
         row_indices = None
@@ -1872,11 +1871,10 @@ class Indexer(nn.Module):
             # Cyclic rows balance causal-window work across ranks. Contiguous
             # quarters make the last rank own systematically longer windows,
             # turning the following collective into a multi-ms wait.
-            row_indices = torch.arange(
-                tp_group.rank_in_group,
+            row_indices = cyclic_row_indices(
                 total_tokens,
                 tp_group.world_size,
-                dtype=torch.int64,
+                tp_group.rank_in_group,
                 device=device,
             )
             q_fp8 = q_fp8[row_indices]
@@ -1948,9 +1946,9 @@ class Indexer(nn.Module):
             device=device,
             score_chunk=_score,
         )
-        seq_base = (
-            seq_base_all[row_indices] if row_shard else seq_base_all
-        ).unsqueeze(1)
+        seq_base = (seq_base_all[row_indices] if row_shard else seq_base_all).unsqueeze(
+            1
+        )
         topk_local = torch.where(
             topk_global < 0,
             topk_global,  # preserve -1 sentinel

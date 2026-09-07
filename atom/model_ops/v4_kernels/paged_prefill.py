@@ -46,8 +46,6 @@ Numerics: identical online-softmax + sink finalization to
 (then equivalent to a decode call with the same prefix indices).
 """
 
-import os
-
 import torch
 import triton
 import triton.language as tl
@@ -56,9 +54,7 @@ from atom.model_ops.v4_kernels.pool_index import row_offset
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
 
-_ENABLE_DSV4_0731_OPTIMIZATIONS = (
-    os.getenv("ATOM_DSV4_0731_OPTIMIZATIONS", "0") == "1"
-)
+_ENABLE_DSV4_0731_OPTIMIZATIONS = envs.ATOM_DSV4_0731_OPTIMIZATIONS
 
 try:
     from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_opus
@@ -342,9 +338,7 @@ def _sparse_attn_v4_paged_prefill_csa_kernel(
                 other=0,
             )
         else:
-            slot = tl.load(
-                kv_indices_prefix_ptr + p_start + k_pos, mask=valid, other=0
-            )
+            slot = tl.load(kv_indices_prefix_ptr + p_start + k_pos, mask=valid, other=0)
         kv_ptrs = (
             unified_kv_ptr
             + row_offset(slot, pkv_stride_n)[:, None]
@@ -389,9 +383,7 @@ def _sparse_attn_v4_paged_prefill_csa_kernel(
                 other=0,
             )
         else:
-            slot = tl.load(
-                kv_indices_extend_ptr + e_start + k_pos, mask=valid, other=0
-            )
+            slot = tl.load(kv_indices_extend_ptr + e_start + k_pos, mask=valid, other=0)
         kv_ptrs = kv_ptr + slot[:, None] * ekv_stride_n + d_offs[None, :] * ekv_stride_d
         kv = tl.load(kv_ptrs, mask=valid[:, None], other=0.0)
 
