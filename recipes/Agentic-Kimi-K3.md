@@ -58,6 +58,7 @@ changes.
 | 4 | 1 | 7 | 3.84 | off | 0 | 32 | 8192 | 0.88 | 64 |
 | 8 | 8 | 3 | 3.00 | 128 GiB | 1 | 32 | 4096 | 0.88 | 64 |
 | 12 | 8 | 3 | 3.00 | 128 GiB | 1 | 24 | 4096 | 0.88 | 96 |
+| 14 | 8 | 3 | 3.00 | 128 GiB | 1 | 32 | 8192 | 0.86 | 128 |
 | 16 | 8 | 3 | 3.00 | 128 GiB | 1 | 32 | 8192 | 0.86 | 128 |
 | 32 | 8 | 0 | — | 128 GiB | 0 | 64 | 8192 | 0.86 | 64 |
 | 40 | 8 | 0 | — | 128 GiB | 0 | 80 | 8192 | 0.86 | 80 |
@@ -68,6 +69,45 @@ C8–C40 use 128 GiB LMCache; C56/C64 use **192 GiB**.
 `AITER_REUSE_IDENTICAL_COMM_GROUPS=1` only on C56/C64; every other CONC leaves
 it off. LMCache CPU size is `LMCACHE_MAX_LOCAL_CPU_SIZE`; chunk size is 1024
 tokens.
+
+## 0. Container prerequisites
+
+Two things about the container decide whether the numbers above are
+reproducible at all. Both fail quietly rather than loudly, so they are worth
+checking before the first run.
+
+### triton must be 3.7.x
+
+```bash
+python3 -c "import triton; print(triton.__version__)"   # expect 3.7.x
+```
+
+The `kimi_k3_agentic_0903` image shipped triton `3.8.0`, and that upgrade costs
+roughly **2.1x on prefill TTFT** for this workload — C1 p50 TTFT goes from
+~0.79 s on 3.7.0 to ~1.5 s on 3.8.0, with decode (ITL) completely unaffected.
+Nothing about aiter or ATOM changes the outcome: the same 2x gap survives
+swapping aiter's `.so` between revisions, swapping the ATOM checkout, and
+switching between a full CI prebuild and a lean JIT build. Use an image with
+triton 3.7.x, such as `kimi_k3_agentic_0907`.
+
+### `DRAFT_MODEL_PATH` must point at a local copy
+
+```bash
+export DRAFT_MODEL_PATH=/path/to/Kimi-K3-DSpark   # a directory, not a repo id
+```
+
+The default is the Hugging Face repo id `Inferact/Kimi-K3-DSpark`, and the
+image carries no cache entry for it, so an unset `DRAFT_MODEL_PATH` makes every
+rank download the same 7 GB checkpoint. **The failure mode is silent**: the log
+stops after `Loading drafter model...`, no error is printed, every GPU sits at
+0% utilization with weights already resident, and the download proceeds at
+whatever the node can manage — measured at ~0.7 MB/s on one cluster, i.e. about
+three hours. A healthy drafter load finishes in under a second and prints
+`Checkpoint prefetch finished: 1/1 shards`.
+
+To turn that hang into an immediate error while debugging, add
+`HF_HUB_OFFLINE=1` for the run. Do not bake it into the image: it also blocks
+the trace-dataset download the client needs on first use.
 
 ## 1. Start the ATOM Server
 
@@ -122,6 +162,21 @@ case "${CONC}" in
     ATOM_ENABLE_REPLAYSSM=1
     NUM_SPECULATIVE_TOKENS=3
     SPEC_DECODE_ACCEPTANCE_LENGTH=3.00
+    ;;
+  14)
+    # Mid-tier: the C16 server recipe verbatim, including the pinned CUDA-graph
+    # width. Only the client concurrency is 14. Deriving graph_max from 2*CONC
+    # here would give 28 and the server fails during CUDA-graph warmup.
+    DCP=8
+    MAX_NUM_SEQS=32
+    MAX_NUM_BATCHED_TOKENS=8192
+    GPU_MEMORY_UTILIZATION=0.86
+    ENABLE_LMCACHE=1
+    LMCACHE_MAX_LOCAL_CPU_SIZE=128
+    ATOM_ENABLE_REPLAYSSM=1
+    NUM_SPECULATIVE_TOKENS=3
+    SPEC_DECODE_ACCEPTANCE_LENGTH=3.00
+    CUDAGRAPH_MAX_NUM_SEQS=32
     ;;
   16)
     DCP=8
@@ -181,7 +236,7 @@ case "${CONC}" in
     SPEC_DECODE_ACCEPTANCE_LENGTH=""
     ;;
   *)
-    echo "Unsupported CONC=${CONC}; AgentX Kimi-K3 covers 1,2,4,8,12,16,32,40,56,64." >&2
+    echo "Unsupported CONC=${CONC}; AgentX Kimi-K3 covers 1,2,4,8,12,14,16,32,40,56,64." >&2
     exit 2
     ;;
 esac
@@ -193,7 +248,8 @@ SPEC_TOKENS_FOR_GRAPH=0
 if [[ "${NUM_SPECULATIVE_TOKENS}" != "0" ]]; then
   SPEC_TOKENS_FOR_GRAPH="${NUM_SPECULATIVE_TOKENS}"
 fi
-GRAPH_MAX=$((2 * CONC * (1 + SPEC_TOKENS_FOR_GRAPH)))
+CUDAGRAPH_MAX_NUM_SEQS="${CUDAGRAPH_MAX_NUM_SEQS:-$((2 * CONC))}"
+GRAPH_MAX=$((CUDAGRAPH_MAX_NUM_SEQS * (1 + SPEC_TOKENS_FOR_GRAPH)))
 CUDAGRAPH_CAPTURE_SIZES="[$(seq -s, 2 "${GRAPH_MAX}")]"
 
 ATOM_CMD=(
