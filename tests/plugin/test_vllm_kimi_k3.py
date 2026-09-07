@@ -361,10 +361,7 @@ def test_dense_mla_decode_keeps_supported_persistent_gathered_head_width():
 
         import torch
 
-        from atom.model_ops.attention_mla import (
-            MLAAttention,
-            _aiter_supports_mla_dcp_head_fold,
-        )
+        from atom.model_ops.attention_mla import MLAAttention
         from atom.plugin.vllm.attention import layer_mla
 
         seen = {}
@@ -417,36 +414,14 @@ def test_dense_mla_decode_keeps_supported_persistent_gathered_head_width():
             torch.zeros(1, 8, dtype=torch.bfloat16),
             SimpleNamespace(decode=decode),
         )
-        # New aiter folds width 96 directly. Release-image builds predate the
-        # DCP round-robin fold fix and must stay on the native width-128 kernel.
-        expected_heads = 96 if _aiter_supports_mla_dcp_head_fold() else 128
-        assert attention.dcp_kernel_num_heads == expected_heads
-        assert attention.dcp_head_pad == expected_heads - 96
-        assert seen["num_heads"] == expected_heads
+        # A persistent DCP decode takes the gathered width as-is: aiter folds
+        # the round-robin metadata onto the 16-head kernel, so 96 needs no pad.
+        assert attention.dcp_kernel_num_heads == 96
+        assert attention.dcp_head_pad == 0
+        assert seen["num_heads"] == 96
         assert output.shape == (1, 96, 8)
         assert lse.shape == (1, 96)
         """)
-
-
-def test_dense_mla_dcp_width_tracks_aiter_head_fold_capability(monkeypatch):
-    from atom.model_ops import attention_mla
-
-    args = (12, 8, 16)
-    kwargs = {"kv_cache_dtype": "fp8", "persistent": True}
-
-    monkeypatch.setattr(
-        attention_mla,
-        "_aiter_supports_mla_dcp_head_fold",
-        lambda: False,
-    )
-    assert attention_mla.mla_dcp_kernel_num_heads(*args, **kwargs) == 128
-
-    monkeypatch.setattr(
-        attention_mla,
-        "_aiter_supports_mla_dcp_head_fold",
-        lambda: True,
-    )
-    assert attention_mla.mla_dcp_kernel_num_heads(*args, **kwargs) == 96
 
 
 def test_dcp_local_slots_match_the_unsharded_layout_at_cp1():
