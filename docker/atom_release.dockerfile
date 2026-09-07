@@ -592,8 +592,12 @@ print('final stack: torch', torch.__version__, '| triton', version('triton'), \
             echo "ERROR: NVIDIA CUDA runtime packages leaked into the final image"; \
             exit 1; \
         fi && \
-        python -c "import amdsmi, aiter, mori, atom; \
-print('component imports ok: amdsmi, aiter, mori, atom')"; \
+        # aiter is deliberately absent: its import runs chip detection
+        # (rocminfo) and there is no GPU during a docker build, so the import
+        # dies on CalledProcessError — an environment limit, not a stack
+        # problem. aiter imports fine at runtime (the golden test covers it).
+        python -c "import amdsmi, mori, atom; \
+print('component imports ok: amdsmi, mori, atom (aiter needs a GPU: runtime-only)")"; \
     fi
 
 CMD ["/bin/bash"]
