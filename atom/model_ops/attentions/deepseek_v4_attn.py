@@ -2192,8 +2192,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         meta = {
             "total_committed": total_committed,
             "cu_committed_gpu": cu_committed_gpu,
-            # int32, [padded_T] — full width; consumers slice to their own.
-            "batch_id_per_q_token": attn_metadata.batch_id_per_q_token,
             # Prefill-only fields below — decode never consults them. NOT
             # in pre-allocated buffers (per-fwd derived); CG capture path
             # would see stale pointers, but the decode path doesn't touch
@@ -3169,8 +3167,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             im = ub_attn.indexer_meta
             if im.get("cu_committed_gpu") is not None:
                 im["cu_committed_gpu"] = im["cu_committed_gpu"].clone()
-            if im.get("batch_id_per_q_token") is not None:
-                im["batch_id_per_q_token"] = im["batch_id_per_q_token"].clone()
 
         return ub_attn
 
@@ -3297,12 +3293,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # ubatch's data (mirrors the token-split path's clones).
         if ub.indexer_meta is not None:
             im = ub.indexer_meta
-            for k in (
-                "cu_committed_gpu",
-                "batch_id_per_q_token",
-            ):
-                if im.get(k) is not None:
-                    im[k] = im[k].clone()
+            if im.get("cu_committed_gpu") is not None:
+                im["cu_committed_gpu"] = im["cu_committed_gpu"].clone()
         return ub
 
     def _attach_v4_per_fwd_meta(

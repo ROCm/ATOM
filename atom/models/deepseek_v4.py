@@ -2023,7 +2023,13 @@ class Indexer(nn.Module):
 
         device = q_fp4.device
         total_tokens = q_fp4.size(0)
-        batch_id_per_q_token = indexer_meta["batch_id_per_q_token"][:total_tokens]
+        # Off the metadata, not the dict: `indexer_meta` IS
+        # `attn_metadata.indexer_meta`, so the tensor is already reachable and
+        # copying it in gave the decode branch -- which builds its own dict --
+        # a second place to forget.
+        batch_id_per_q_token = get_forward_context().attn_metadata.batch_id_per_q_token[
+            :total_tokens
+        ]
         local_ends = indexer_meta["visible_end_gpu"]  # [total_tokens] int32
         local_starts = indexer_meta["fp4_prefill_local_starts"]
         # Full-batch schedule precomputed once (outside the fwd) in the metadata
@@ -2158,7 +2164,10 @@ class Indexer(nn.Module):
         # so the full padded q_fp4 is scored single-shot: pad rows are skipped by
         # the kernel (empty window → 0 CTAs → no paged KV read) and their top-k is
         # -1 (ignored downstream by csa_translate_pack). No strip / pad-back.
-        batch_id_per_q_token = indexer_meta["batch_id_per_q_token"][: q_fp4.size(0)]
+        # Off the metadata, not the dict -- see `_score_topk_prefill_fp4`.
+        batch_id_per_q_token = get_forward_context().attn_metadata.batch_id_per_q_token[
+            : q_fp4.size(0)
+        ]
         local_starts = indexer_meta["fp4_local_starts"]
         local_ends = indexer_meta["fp4_local_ends"]
         cta_info = indexer_meta["fp4_cta_info"]
