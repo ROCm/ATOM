@@ -475,9 +475,10 @@ RUN echo "========== Install atomesh binary ==========" && \
 # validation import chain trips on each missing one (py-cpuinfo, then
 # sortedcontainers). PIP_CONSTRAINT (set in the rocm10-base stage) keeps the
 # torch trio pinned to the +rocm10.x builds while these resolve.
-# rocm_core.txt (cupy-rocm-7-0) is deliberately skipped: cupy bundles its own
-# ROCm 7 runtime libs which would shadow the pip SDK's ROCm 10 stack, and the
-# c_ops import chain does not touch cupy.
+# cupy-rocm-7-0 (rocm_core.txt's only entry) is installed alongside: lmcache's
+# metadata declares it and pip check enforces it. cupy bundles its ROCm libs
+# inside the wheel (loaded via its own rpath at import time), so it does not
+# shadow the pip SDK's ROCm 10 stack.
 ARG LMCACHE_TAG=v0.4.5
 # PYTORCH_ROCM_ARCH is inherited as ENV from the `base` stage (=${GPU_ARCH});
 # hipcc reads it to target both gfx942 and gfx950. Do not re-derive from
@@ -492,7 +493,11 @@ RUN echo "========== [ATOM] LMCache HIP c_ops (${LMCACHE_TAG}, arch=${PYTORCH_RO
       "${VENV_PYTHON}" -m pip install -e . --no-build-isolation --no-deps && \
     "${VENV_PYTHON}" -m pip install \
         --extra-index-url "${ROCM_INDEX_URL}" \
-        -r requirements/common.txt && \
+        -r requirements/common.txt \
+        cupy-rocm-7-0 && \
+    # common.txt pins prometheus_client<=0.24.1, downgrading ATOM's required
+    # >=0.25; restore ATOM's pin (lmcache only uses it for optional metrics).
+    "${VENV_PYTHON}" -m pip install "prometheus_client==0.25.0" && \
     "${VENV_PYTHON}" -c "import glob, torch; \
 c_ops_paths = glob.glob('/opt/LMCache/lmcache/c_ops*.so'); \
 assert c_ops_paths, 'LMCache HIP c_ops extension was not built'; \
