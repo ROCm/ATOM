@@ -532,6 +532,72 @@ def test_archiving_survives_the_second_checkout(workspace, fake_docker):
     assert json.loads(head_files[0].read_text())["total_token_throughput"] == 16000
 
 
+def test_runs_when_the_target_commit_does_not_contain_the_script(tmp_path, fake_docker):
+    """The merge-base predates this feature, so checking it out removes the
+    script from the workspace. Invoking it from the workspace therefore works
+    for the first half and fails with "No such file or directory" for the
+    second -- the script deletes itself partway through the pairing.
+
+    Guards the fix: the workflow stages the script outside the workspace and
+    runs it from there. Reproduced from a real CI failure (exit 127 on the
+    HEAD half after the BASE half had succeeded).
+    """
+    bindir, _ = fake_docker
+
+    ws = tmp_path / "selfhost"
+    ws.mkdir()
+    _git(ws, "init", "-q")
+    _git(ws, "config", "user.email", "t@example.com")
+    _git(ws, "config", "user.name", "t")
+
+    # base: no .github/scripts at all, exactly like a merge-base predating this
+    (ws / "marker.txt").write_text("base\n")
+    _git(ws, "add", "-A")
+    _git(ws, "commit", "-qm", "base without the pairing script")
+    base_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=ws, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    # head: adds the script, as this PR does
+    scripts = ws / ".github" / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "perf_check_half.sh").write_text(HALF_SH.read_text())
+    (scripts / "perf_check_half.sh").chmod(0o755)
+    (ws / "marker.txt").write_text("head\n")
+    _git(ws, "add", "-A")
+    _git(ws, "commit", "-qm", "head adds the pairing script")
+    head_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=ws, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    # Staged outside the workspace, which is what the workflow does.
+    staged = tmp_path / "staged.sh"
+    staged.write_text(HALF_SH.read_text())
+    staged.chmod(0o755)
+
+    env = {
+        **os.environ,
+        "PATH": f"{bindir}:{os.environ['PATH']}",
+        "CONTAINER": "atom-perf-check",
+        "MODEL_PATH": "m",
+        "ARGS": "",
+        "RESULT_FILENAME": RESULT_FILENAME,
+    }
+    for sha, half in ((base_sha, "base"), (head_sha, "head")):
+        result = subprocess.run(
+            ["bash", str(staged), sha, half],
+            cwd=ws,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert result.returncode == 0, f"{half} half failed: {result.stderr[-400:]}"
+
+    assert len(list((ws / "perf-pair/base").glob("*.json"))) == 1
+    assert len(list((ws / "perf-pair/head").glob("*.json"))) == 1
+
+
 def test_pipeline_end_to_end_reaches_a_verdict(workspace, fake_docker):
     """Both halves, then the judge, on files the script actually produced --
     rather than on fixtures hand-shaped to match what it is assumed to write."""
