@@ -2352,11 +2352,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # Not a slice of `cu_seqlens_q` either: that one is also the q indptr,
         # and a sentinel in it would corrupt the other reader.
         #
-        # One token per sequence, so every length is 1. The shared buffer is
-        # what makes the returned view the same object every step.
-        batch_id_per_q_token = self.publish_batch_ids(
-            np.ones(bs, dtype=np.int32), pad_to=running_bs
-        )
+        # Written on the device from the resident arange, NOT through
+        # `publish_batch_ids`: that one stages via this buffer's pinned host
+        # mirror, and `model_runner._gate_staging_reuse` -- which names this
+        # very tensor -- only fences that mirror once per FORWARD. A draft step
+        # runs between two forwards, so its host write is behind no fence and
+        # overwrites the source of the verify forward's still-in-flight H2D.
+        # That is why the contract above is "no CPU mirror touch".
+        batch_id_per_q_token = var["batch_id_per_q_token"].gpu[:running_bs]
+        batch_id_per_q_token[:bs].copy_(self.row_ids[:bs])
+        if running_bs > bs:
+            batch_id_per_q_token[bs:] = -1
 
         # ----- Kernel: write SWA prefix paged offsets -----
         # MTP layers are dense, so only the dense class's buffer is asked for;

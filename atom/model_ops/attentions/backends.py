@@ -427,8 +427,10 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         # allocation costs, not what a warm free-list hit costs.
         self.token_axis_scratch = np.empty(self.max_num_batched_tokens, dtype=np.int64)
         # Every row's own index, resident so no step rebuilds it. One buffer for
-        # two readers that each want the same numbers: a cu_seqlens ramp at one
-        # token per sequence (hence `+ 1`), and DSpark's token -> request map.
+        # three readers that each want the same numbers: a cu_seqlens ramp at
+        # one token per sequence (hence `+ 1`), DSpark's token -> request map,
+        # and the MTP draft's, which needs a source already on the device (see
+        # `prepare_mtp_decode`).
         self.row_ids = torch.arange(
             self.max_bs + 1, device=self.device, dtype=torch.int32
         )
