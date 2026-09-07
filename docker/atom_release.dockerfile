@@ -2,6 +2,11 @@
 # The digest prevents this historical tag from being moved underneath us.
 ARG BASE_IMAGE="rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0"
 ARG GPU_ARCH="gfx942;gfx950"
+# ROCm 10 flavor: pass --build-arg BASE_IMAGE=rocm10-base to build the whole
+# image on the pip-installed ROCm 10 SDK below instead of the rocm/pytorch
+# apt image. All ROCm 10 component versions are ARGs so the 10.1 tracking
+# line only changes build-args (see ROCM_INDEX_URL / ROCM_SDK_VERSION).
+ARG BASE_IMAGE_ROCM10="ubuntu:24.04"
 
 # ====================================================================
 # ATOM image: multi-stage parallel build
@@ -17,13 +22,158 @@ ARG GPU_ARCH="gfx942;gfx950"
 # ====================================================================
 
 # --------------------------------------------------------------------
+# Stage -1: ROCm 10 base (pip SDK assembly on plain Ubuntu).
+#
+# Assemble the ROCm 10 stack from AMD's stable wheel channel instead of a
+# rocm/pytorch apt image (the TheRock distribution model: ROCm ships as pip
+# wheels, installed into site-packages rather than /opt/rocm). Ported from
+# sglang's docker/rocm.Dockerfile rocm1000-base stage.
+#
+# Version policy (ticket: ATOM v0.1.7 for ROCm 10.1, GA 2026-10-05):
+#   - Main line: stable channel 10.0.0 (the combination sglang validated).
+#   - 10.1 tracking line: nightly channel with 10.1.0a<date> versions
+#     (rc.repo.amd.com has no 10.1 artifacts yet). NOT a release artifact;
+#     it exists to surface 10.1 breaks early. Once 10.1 RC/GA lands on the
+#     stable channel, flip these ARGs and re-run the golden test.
+#
+# Python 3.12 (Ubuntu 24.04 default): the wheel channel publishes cp312 for
+# the whole stack; torch 2.11+rocm10.0.0 is the version sglang validated.
+# --------------------------------------------------------------------
+FROM ${BASE_IMAGE_ROCM10} AS rocm10-base
+
+# Redeclare the global selector here so --build-arg GPU_ARCH lands in this
+# stage too; every device payload below is derived from it.
+ARG GPU_ARCH
+
+# ROCM_TRITON_VERSION rather than TRITON_VERSION to leave room for a
+# stage-local TRITON_VERSION without a --build-arg landing on both.
+ARG ROCM_SDK_VERSION="10.0.0"
+ARG ROCM_TORCH_VERSION="2.11.0"
+ARG ROCM_TORCHVISION_VERSION="0.26.0"
+ARG ROCM_TORCHAUDIO_VERSION="2.11.0"
+ARG ROCM_TRITON_VERSION="3.8.0+git4cff872c"
+ARG ROCM_INDEX_URL="https://stable.repo.amd.com/rocm/whl-next/"
+# 10.1 tracking line overrides (nightly channel, date-stamped versions):
+#   --build-arg ROCM_SDK_VERSION=10.1.0a<yyyymmdd>
+#   --build-arg ROCM_TORCH_VERSION=2.12.0
+#   --build-arg ROCM_TRITON_VERSION=3.8.0+gitc01b6774
+#   --build-arg ROCM_INDEX_URL=https://nightly.repo.amd.com/rocm/whl-next/
+# (the +rocm10.1.0a<date> local version suffix is derived from
+#  ROCM_SDK_VERSION below, so only the base version needs overriding)
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        git \
+        gnupg \
+        libstdc++-12-dev \
+        python-is-python3 \
+        python3 \
+        python3-dev \
+        python3-pip \
+        python3.12-venv \
+        wget \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV VIRTUAL_ENV=/opt/venv
+RUN python3 -m venv "$VIRTUAL_ENV"
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+RUN python3 -m pip install --no-cache-dir -U pip setuptools setuptools_scm wheel
+
+# Unlike the sglang rocm1000 flavors (one device payload per image), the ATOM
+# release image is a single multi-arch image: GPU_ARCH="gfx942;gfx950" gets a
+# device payload for every listed arch. Loop over GPU_ARCH_LIST so adding an
+# arch stays a GPU_ARCH change, not a new package list.
+RUN set -eux; \
+    for arch in $(printf '%s' "${GPU_ARCH}" | tr ';' ' '); do \
+        python3 -m pip install --no-cache-dir \
+            --index-url ${ROCM_INDEX_URL} \
+            "rocm-sdk-device-${arch}==${ROCM_SDK_VERSION}" \
+            "amd-torch-device-${arch}==${ROCM_TORCH_VERSION}+rocm${ROCM_SDK_VERSION}" \
+            "amd-torchvision-device-${arch}==${ROCM_TORCHVISION_VERSION}+rocm${ROCM_SDK_VERSION}"; \
+    done; \
+    python3 -m pip install --no-cache-dir \
+        --index-url ${ROCM_INDEX_URL} \
+        "rocm-sdk-core==${ROCM_SDK_VERSION}" \
+        "rocm-sdk-libraries==${ROCM_SDK_VERSION}" \
+        "rocm-sdk-devel==${ROCM_SDK_VERSION}" \
+        "torch==${ROCM_TORCH_VERSION}+rocm${ROCM_SDK_VERSION}" \
+        "torchvision==${ROCM_TORCHVISION_VERSION}+rocm${ROCM_SDK_VERSION}" \
+        "torchaudio==${ROCM_TORCHAUDIO_VERSION}+rocm${ROCM_SDK_VERSION}" \
+        "triton==${ROCM_TRITON_VERSION}.rocm${ROCM_SDK_VERSION}"; \
+    for arch in $(printf '%s' "${GPU_ARCH}" | tr ';' ' '); do \
+        python3 -m pip show "rocm-sdk-device-${arch}" >/dev/null; \
+        python3 -m pip show "amd-torch-device-${arch}" >/dev/null; \
+    done
+
+RUN rocm-sdk init && rocm-sdk targets
+
+# rocm-sdk init expands a devel tree that carries its own copy of libamd_smi,
+# byte-identical to the one in _rocm_sdk_core that HIP loads through its RPATH.
+# Since ROCM_HOME below puts the devel tree on LD_LIBRARY_PATH, the amdsmi
+# python package binds that second copy while torch already holds the first,
+# and two independent copies in one process each keep their own global state:
+# whichever initialises second enumerates no devices. torch asks amdsmi for the
+# device count before HIP, so `torch.cuda.device_count()` comes back 0 on a
+# machine where hipGetDeviceCount() says 8. Collapse the duplicate so both land
+# on the same library. Idempotent when the SDK already ships a symlink here.
+RUN set -eux; \
+    SP="$VIRTUAL_ENV/lib/python3.12/site-packages"; \
+    CORE=$(ls "$SP"/_rocm_sdk_core/lib/libamd_smi.so.* 2>/dev/null | head -1); \
+    DEVEL="$SP/_rocm_sdk_devel/lib/libamd_smi.so"; \
+    if [ -n "${CORE}" ] && [ -e "${DEVEL}" ] && [ ! -L "${DEVEL}" ]; then \
+        ln -sf "${CORE}" "${DEVEL}"; \
+        echo "linked ${DEVEL} -> ${CORE}"; \
+    fi
+
+ENV ROCM_HOME=$VIRTUAL_ENV/lib/python3.12/site-packages/_rocm_sdk_devel
+ENV ROCM_PATH=$ROCM_HOME
+ENV CPATH=$ROCM_HOME/include
+ENV LIBRARY_PATH=$ROCM_HOME/lib
+ENV LD_LIBRARY_PATH=$ROCM_HOME/lib
+RUN echo 'export PATH=$ROCM_HOME/llvm/bin:$ROCM_HOME/bin:$PATH' >> /etc/bash.bashrc
+
+# The SDK's hsakmtTargets.cmake hardcodes /usr/lib64/libc.so from its own build
+# host; Ubuntu keeps libc in /lib/x86_64-linux-gnu, so cmake would otherwise
+# fail with "ninja: error: /usr/lib64/libc.so missing and no known rule to make it".
+RUN mkdir -p /usr/lib64 && ln -sf /lib/x86_64-linux-gnu/libc.so /usr/lib64/libc.so
+
+# ROCm lives in site-packages here, but AITER shells out to
+# /opt/rocm/llvm/bin/amdgpu-arch at runtime to pick DEFAULT_GPU_ARCH, RCCL's
+# install.sh and Mooncake's cmake both expect /opt/rocm, and the amdsmi pip
+# install below refers to /opt/rocm/share/amd_smi.
+RUN ln -s ${ROCM_HOME} /opt/rocm
+
+# amdsmi: the pip SDK (unlike the rocm/pytorch apt images) does not preinstall
+# the AMD SMI python package; ATOM and the validation steps import it.
+RUN cd /opt/rocm/share/amd_smi && python3 -m pip install --no-cache-dir . && \
+    python3 -c "import amdsmi; print('amdsmi ok')"
+
+# Keep pip from resolving the ROCm torch stack away to PyPI CUDA builds in any
+# later pip install (AITER requirements, MORI, ATOM deps, ...). The local
+# +rocm10.x version numbers lose to plain "torch==X" specs from PyPI unless
+# constrained. Deliberately shipped in the image (not just build-time) so user
+# pip installs stay on the ROCm stack too. Only the torch trio is named.
+ENV PIP_CONSTRAINT="/etc/atom/constraints/torch-rocm.txt"
+RUN mkdir -p /etc/atom/constraints && \
+    python3 -m pip freeze | grep -E '^(torch|torchvision|torchaudio)(==| @ )' \
+        > /etc/atom/constraints/torch-rocm.txt && \
+    cat /etc/atom/constraints/torch-rocm.txt
+
+# --------------------------------------------------------------------
 # Stage 0: Common base (apt + pip foundations, shared by all builders)
 # --------------------------------------------------------------------
 FROM ${BASE_IMAGE} AS base
 
 ARG GPU_ARCH
+ARG BASE_IMAGE
 ENV GPU_ARCH_LIST=$GPU_ARCH
 ENV PYTORCH_ROCM_ARCH=$GPU_ARCH
+# Stamp the chosen base so later stages can branch on "is this the rocm10
+# flavor" without guessing from torch/HIP versions (10.0 and 10.1 both
+# report torch 2.11+ in some combinations).
+ENV ATOM_BASE_IMAGE=${BASE_IMAGE}
 
 # AITER's prebuilt and runtime-JIT modules must use the same pybind ABI.
 RUN pip install --upgrade pip "pybind11==3.0.4" && \
@@ -37,12 +187,27 @@ RUN pip install --upgrade pip "pybind11==3.0.4" && \
 # Newer rocm/pytorch images install ROCm libraries through Python wheels
 # instead of /opt/rocm. Register those directories so dpkg-shlibdeps can
 # resolve RCCL's dependencies while retaining compatibility with /opt/rocm.
+# Covers both the rocm10-base layout (SDK under /opt/venv, /opt/rocm symlink)
+# and any future rocm/pytorch image that moves to the same wheel layout.
 RUN ROCM_SDK_LIB_DIRS="$(python -c \
         'import glob, os; print("\n".join(sorted({os.path.dirname(p) for p in glob.glob("/opt/venv/lib/python*/site-packages/_rocm_sdk*/lib/*.so*")})))')" && \
     if [ -n "${ROCM_SDK_LIB_DIRS}" ]; then \
         printf '%s\n' "${ROCM_SDK_LIB_DIRS}" \
             > /etc/ld.so.conf.d/rocm-python-sdk.conf; \
         ldconfig; \
+    fi
+
+# ROCm 10 torch stack tripwire: fail the build right here if any earlier step
+# let a PyPI CUDA torch replace the +rocm10.x stack, or if the venv carries
+# NVIDIA runtime packages. Only the rocm10 flavor asserts (the rocm/pytorch
+# apt images ship their own, differently-versioned, stacks).
+RUN if [ "${ATOM_BASE_IMAGE}" = "rocm10-base" ]; then \
+        python -m pip check && \
+        python -c "import torch; assert torch.version.hip is not None, torch.__version__; print('rocm10 base torch:', torch.__version__, 'hip:', torch.version.hip)" && \
+        if pip list --format=freeze 2>/dev/null | grep -Eq '^nvidia-.*-cu[0-9]+'; then \
+            echo "ERROR: NVIDIA CUDA runtime packages leaked into the ROCm 10 image"; \
+            exit 1; \
+        fi; \
     fi
 
 # --------------------------------------------------------------------
