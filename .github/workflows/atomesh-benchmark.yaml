@@ -1290,6 +1290,15 @@ jobs:
 
           cat "${SUMMARY_PATH}"
 
+      - name: Upload AIPerf Perfetto traces
+        if: ${{ always() && matrix.benchmark.kind == 'aiperf_agentic' }}
+        uses: ./.github/actions/upload-aiperf-traces
+        with:
+          result-dir: atomesh-results/${{ matrix.id }}
+          artifact-name: aiperf-chrome-traces-${{ matrix.id }}
+          output-dir: aiperf-traces/${{ matrix.id }}
+          run-url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
       - name: Upload model benchmark artifacts
         if: always()
         uses: actions/upload-artifact@v7
@@ -1344,6 +1353,15 @@ jobs:
             echo "has_results=false" >> "$GITHUB_OUTPUT"
             echo "No successful ATOMesh benchmark result JSONs were produced; dashboard publish will be skipped." >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Upload AIPerf Perfetto traces
+        if: always()
+        uses: ./.github/actions/upload-aiperf-traces
+        with:
+          result-dir: atomesh-results
+          artifact-name: aiperf-chrome-traces-${{ github.run_id }}
+          output-dir: aiperf-traces
+          run-url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
       - name: Upload benchmark summary
         if: ${{ steps.summary.outputs.has_results == 'true' }}
