@@ -474,7 +474,7 @@ RUN echo "========== [ATOM] LMCache HIP c_ops (${LMCACHE_TAG}, arch=${PYTORCH_RO
     CXX=hipcc BUILD_WITH_HIP=1 \
       "${VENV_PYTHON}" -m pip install -e . --no-build-isolation --no-deps && \
     "${VENV_PYTHON}" -m pip install --no-deps \
-        prometheus_client==0.25.0 aiofile==3.11.1 caio==0.9.25 && \
+        prometheus_client==0.25.0 aiofile==3.11.1 caio==0.9.25 py-cpuinfo && \
     "${VENV_PYTHON}" -c "import glob, torch; \
 c_ops_paths = glob.glob('/opt/LMCache/lmcache/c_ops*.so'); \
 assert c_ops_paths, 'LMCache HIP c_ops extension was not built'; \
