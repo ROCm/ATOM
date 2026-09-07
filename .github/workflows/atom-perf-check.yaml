@@ -153,8 +153,20 @@ jobs:
       RESULT_FILENAME: ${{ matrix.cell.result_filename }}
       CONTAINER: atom-perf-check
     steps:
-      - name: Kill leftover containers
-        run: docker ps -aq | xargs -r docker rm -f || true
+      - name: Kill leftover containers and reclaim the workspace
+        run: |
+          docker ps -aq | xargs -r docker rm -f || true
+          # A previous run's container wrote into the bind-mounted workspace as
+          # root, and actions/checkout runs as the runner user -- it cannot
+          # delete those files and fails before any step of ours executes. The
+          # halves hand ownership back as they go, but a job that died early
+          # never got the chance, so the debris outlives it and lands on
+          # whoever schedules here next. Clear it before checkout, not after.
+          if [ -d "${GITHUB_WORKSPACE}" ]; then
+            docker run --rm -v "${GITHUB_WORKSPACE}":/workspace -w /workspace --privileged \
+              rocm/atom-dev:latest bash -lc \
+              "chown -R $(id -u):$(id -g) /workspace" || true
+          fi
 
       - uses: actions/checkout@v4
         with:
@@ -289,7 +301,9 @@ jobs:
           DIGEST=$(find pairs -name provenance.json -print -quit \
                    | xargs -r python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["image_digest"])' \
                    || echo unknown)
-          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          # xargs -r with no input succeeds silently, so the `|| echo` above
+          # never fires and DIGEST ends up empty rather than "unknown".
+          echo "digest=${DIGEST:-unknown}" >> "$GITHUB_OUTPUT"
 
       - name: Judge
         run: |
