@@ -597,7 +597,7 @@ print('final stack: torch', torch.__version__, '| triton', version('triton'), \
         # dies on CalledProcessError — an environment limit, not a stack
         # problem. aiter imports fine at runtime (the golden test covers it).
         python -c "import amdsmi, mori, atom; \
-print('component imports ok: amdsmi, mori, atom (aiter needs a GPU: runtime-only)")"; \
+print('component imports ok: amdsmi, mori, atom (aiter needs a GPU: runtime-only)')"; \
     fi
 
 CMD ["/bin/bash"]
