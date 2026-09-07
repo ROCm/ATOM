@@ -46,17 +46,6 @@ on:
         options:
           - '1'
           - '2'
-      rdma_smoke_decode_hca_mode:
-        description: 'Decode HCA registration mode for cross-rail RDMA diagnosis'
-        required: false
-        default: all
-        type: choice
-        options:
-          - all
-          - same-gpu
-          - local
-          - peer
-          - local-peer
       run_all_models:
         description: 'Run all models from models_atomesh.yaml'
         required: false
@@ -446,7 +435,7 @@ jobs:
       RDMA_SMOKE_IMAGE: ${{ needs.load-config.outputs.image }}
       RDMA_SMOKE_NODES: ${{ inputs.rdma_smoke_nodes }}
       RDMA_SMOKE_NODE_COUNT: ${{ inputs.rdma_smoke_node_count }}
-      RDMA_SMOKE_DECODE_HCA_MODE: ${{ inputs.rdma_smoke_decode_hca_mode }}
+      RDMA_SMOKE_DECODE_HCA_MODE: all
       SLURM_SUBMIT_RUNNER: ${{ inputs.atomesh_slurm_submit_runner }}
     steps:
       - name: Checkout repository
