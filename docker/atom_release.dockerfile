@@ -197,6 +197,21 @@ RUN ROCM_SDK_LIB_DIRS="$(python -c \
         ldconfig; \
     fi
 
+# ROCm 10 flavor: the pip SDK's rocm_smi cmake config requires
+# `pkg-config libdrm` (rocm_smi.h -> kfd_ioctl.h -> libdrm/drm.h), and the
+# SDK vendors the libdrm headers under lib/rocm_sysdeps/include without a
+# .pc file, so pkg-config cannot see them. Install Ubuntu's libdrm-dev +
+# pkg-config so RCCL's find_package(rocm_smi) resolves; without it the
+# config sets rocm_smi_FOUND=FALSE and RCCL's cmake dies at the
+# rocm_smi.h file(READ) fallback.
+RUN if [ "${ATOM_BASE_IMAGE}" = "rocm10-base" ]; then \
+        apt-get update && \
+        apt-get install -y --no-install-recommends pkg-config libdrm-dev && \
+        rm -rf /var/lib/apt/lists/* && \
+        pkg-config --exists libdrm && \
+        echo "libdrm for rocm_smi cmake: $(pkg-config --modversion libdrm)"; \
+    fi
+
 # ROCm 10 torch stack tripwire: fail the build right here if any earlier step
 # let a PyPI CUDA torch replace the +rocm10.x stack, or if the venv carries
 # NVIDIA runtime packages. Only the rocm10 flavor asserts (the rocm/pytorch
