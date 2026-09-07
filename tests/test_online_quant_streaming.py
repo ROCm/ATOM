@@ -674,7 +674,10 @@ class StreamingTriggerTest(unittest.TestCase):
             def __exit__(self, exc_type, exc_value, traceback):
                 return False
 
-        with env_overrides(ATOM_ONLINE_QUANT_STREAMING_HOST_STAGING="1"):
+        with env_overrides(
+            ATOM_ONLINE_QUANT_STREAMING="1",
+            ATOM_ONLINE_QUANT_STREAMING_HOST_STAGING="1",
+        ):
             model = StreamModel(1, NUM_EXPERTS, stream=True)
             streamer = OnlineQuantStreamer.maybe_create(model, None)
             experts = model.model.layers[0].mlp.experts
@@ -691,7 +694,10 @@ class StreamingTriggerTest(unittest.TestCase):
 
     def test_fused_param_declines_later_semantic_staging(self):
         """A fused writer owns the parameter even if expert shards follow."""
-        with env_overrides(ATOM_ONLINE_QUANT_STREAMING_HOST_STAGING="1"):
+        with env_overrides(
+            ATOM_ONLINE_QUANT_STREAMING="1",
+            ATOM_ONLINE_QUANT_STREAMING_HOST_STAGING="1",
+        ):
             model = StreamModel(1, NUM_EXPERTS, stream=True)
             streamer = OnlineQuantStreamer.maybe_create(model, None)
             experts = model.model.layers[0].mlp.experts

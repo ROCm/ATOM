@@ -34,6 +34,7 @@ from atom.entrypoints.openai.serving_chat import (
 )
 from atom.entrypoints.openai.streaming_dispatch import StreamOutputCollector
 from atom.entrypoints.openai.tool_parser import ToolCallStreamParser, parse_tool_calls
+from atom.entrypoints.openai.tool_parser.glm_tool_parser import GlmParser
 from atom.entrypoints.openai.tool_parser.kimi_k3_tool_parser import KimiK3Parser
 from atom.entrypoints.openai.tool_parser.kimi_tool_parser import KimiParser
 from atom.entrypoints.openai.tool_parser.qwen3_tool_parser import QwenXmlParser
@@ -203,7 +204,17 @@ class TestBuildChatResponse:
         # Leaving it off used to reach a cascade over the *output*, which is
         # how an answer quoting these tokens got its text deleted.
         resp = build_chat_response(
-            "req-1", "model", raw, output, tool_parser_cls=KimiParser
+            "req-1",
+            "model",
+            raw,
+            output,
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": "exec", "parameters": {}},
+                }
+            ],
+            tool_parser_cls=KimiParser,
         )
         assert resp.choices[0]["message"]["content"] == "Hi"
         assert "tool_calls" in resp.choices[0]["message"]
@@ -427,6 +438,64 @@ class TestFanoutCleanupSplit:
         _, request_calls = self._cleanup_calls([70, 71, 72, 73])
 
         assert request_calls == ["req-3"]
+
+
+class TestNoToolsMeansNoToolReadAhead:
+    """Match SGLang: a request with no tools does not enter a tool region."""
+
+    def test_an_unclosed_literal_does_not_stall_the_stream(self):
+        async def run():
+            collector = StreamOutputCollector("req-no-tools")
+            collector.put_nowait(
+                {
+                    "text": "<tool_call> is syntax being discussed",
+                    "token_ids": [1],
+                    "finished": False,
+                }
+            )
+            gen = stream_chat_response(
+                request_id="req-no-tools",
+                model="model",
+                stream_collector=collector,
+                seq_id=1,
+                num_prompt_tokens=1,
+                cleanup_stream=lambda *args, **kwargs: None,
+                cleanup_request=lambda *args, **kwargs: None,
+                tools=None,
+                tool_parser_cls=GlmParser,
+            )
+            await gen.__anext__()  # role
+            content = await asyncio.wait_for(gen.__anext__(), timeout=0.1)
+            await gen.aclose()
+            return json.loads(content[6:])["choices"][0]["delta"]["content"]
+
+        assert asyncio.run(run()) == "<tool_call> is syntax being discussed"
+
+    def test_non_streaming_path_matches(self):
+        text = "<tool_call> is syntax being discussed"
+        choice = _build_chat_choice(
+            text,
+            "eos",
+            tools=None,
+            tool_parser_cls=GlmParser,
+        )
+
+        assert choice["message"]["content"] == text
+        assert "tool_calls" not in choice["message"]
+
+    def test_channel_framing_is_still_consumed_without_tools(self):
+        framed = (
+            "<|open|>response<|sep|>Hello there."
+            "<|close|>response<|sep|><|end_of_msg|>"
+        )
+        choice = _build_chat_choice(
+            framed,
+            "eos",
+            tools=None,
+            tool_parser_cls=KimiK3Parser,
+        )
+
+        assert choice["message"]["content"] == "Hello there."
 
 
 TOOLS = [

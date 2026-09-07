@@ -222,7 +222,20 @@ class EngineCore:
         maybe_attach_gc_debug_callback(name)
 
     def _send_ready_signal(self):
-        self.output_queue.put_nowait(("READY", None))
+        self.output_queue.put_nowait(("READY", self._ready_payload()))
+
+    def _ready_payload(self) -> dict[str, int] | None:
+        """Startup facts the frontend cannot read off its own Config.
+
+        `num_kvcache_blocks` is measured in this subprocess, so the API server's
+        Config still holds the placeholder. Publishing the derived prompt
+        ceiling rather than the raw block count leaves the dcp arithmetic with
+        its owner, `BlockManager`, and gives the frontend a single number to
+        compare a prompt against.
+        """
+        if self.scheduler is None:
+            return None
+        return {"max_pool_tokens": self.scheduler.block_manager.max_pool_tokens}
 
     def _post_model_load_hook(self):
         """Called after ModelRunner is initialized (model loaded) but before
@@ -254,6 +267,35 @@ class EngineCore:
                 continue  # process object already closed by CoreManager
             if alive:
                 proc.join(timeout=5)
+                # The join above has a timeout; nothing after it did. A worker
+                # that outlives it keeps its VRAM slice and its all-reduce IPC
+                # handles, and `multiprocessing`'s atexit handler then joins the
+                # same process again with NO timeout -- so an engine that is
+                # already on its way out hangs there forever. Seen twice on the
+                # k3-dev line: the MainThread parks in `_exit_function -> join`,
+                # all TP workers stay alive, /metrics keeps answering 200, and
+                # only a manual kill recovers the node. `enable_orphan_reaping`
+                # cannot help, because PR_SET_PDEATHSIG fires when the parent
+                # *dies* and this parent never does.
+                try:
+                    if proc.is_alive():
+                        logger.warning(
+                            "%s: worker pid=%s still alive after 5s; terminating",
+                            self.label,
+                            getattr(proc, "pid", "?"),
+                        )
+                        proc.terminate()
+                        proc.join(timeout=5)
+                    if proc.is_alive():
+                        logger.error(
+                            "%s: worker pid=%s ignored SIGTERM; killing",
+                            self.label,
+                            getattr(proc, "pid", "?"),
+                        )
+                        proc.kill()
+                        proc.join(timeout=5)
+                except (ValueError, OSError):
+                    pass  # process object already closed / already reaped
         self._send_engine_dead()
         logger.debug(f"{self.label}: model runner exit")
 
@@ -305,6 +347,7 @@ class EngineCore:
                 if now >= next_metrics_push:
                     next_metrics_push = now + METRICS_PUSH_INTERVAL_S
                     self.utility_handler.push_metrics()
+                self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 if shutdown:
                     break
@@ -373,6 +416,14 @@ class EngineCore:
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )
+            if (
+                self.scheduler.prefill_delayer is not None
+                and scheduled_batch.total_seqs_num_prefill > 0
+            ):
+                # Arm post-prefill decode protection only after the prefill
+                # forward really completed. A delayer FIRE merely grants
+                # admission and can still result in a decode/empty batch.
+                self.scheduler.prefill_delayer.notify_prefill_executed()
 
         # Aggregate KV transfer status from all workers (only when PD disaggregation is active)
         self._poll_kv_transfer_progress()
@@ -422,19 +473,31 @@ class EngineCore:
             return False
         if getattr(self.scheduler, "deferred_free_blocks", None):
             return True
+        # Unit-store twin of `deferred_free_blocks`: a state store handed to the
+        # worker keeps its PAGE units pinned out of the KV pool until its report
+        # settles them or the reclaim ages them out. Both exits run only from
+        # `_poll_kv_transfer_progress`, so the loop must keep polling while a
+        # pin is outstanding or the units leak until the abandon window. Guarded
+        # for the scheduler doubles that implement only the connector surface.
+        bm = getattr(self.scheduler, "block_manager", None)
+        pending_pins = getattr(bm, "has_pending_state_store_pins", None)
+        if pending_pins is not None and pending_pins():
+            return True
         connector = getattr(self.scheduler, "kv_connector", None)
         if connector is None or not hasattr(connector, "has_pending_work"):
             return False
         return bool(connector.has_pending_work())
 
-    def _advance_idle_kv_transfer(self) -> None:
+    def _advance_idle_kv_transfer(self, dispatch_new: bool = True) -> None:
         # No forward batch will run this tick, but offload load/save work may
         # still need to be dispatched or reported back to the scheduler.
+        # `dispatch_new=False` on the shutdown drain: report in-flight work
+        # back, but start no new transfers (see `_dispatch_idle_offload_work`).
         now = time.monotonic()
         if now < self._next_idle_kv_drain:
             return
         self._next_idle_kv_drain = now + KV_IDLE_DRAIN_INTERVAL_S
-        self._dispatch_idle_offload_work()
+        self._dispatch_idle_offload_work(dispatch_new=dispatch_new)
         self._poll_kv_transfer_progress()
 
     def _drain_kv_work_at_exit(self) -> None:
@@ -443,6 +506,12 @@ class EngineCore:
         The loop exits as soon as its queues are empty, so a save dispatched
         by the final batch would otherwise be abandoned with its completion
         unrecorded and its blocks still deferred.
+
+        Drains with `dispatch_new=False`: it must let already-dispatched
+        transfers finish and report, but must not publish new state loads/stores.
+        A fresh store dispatched here spills bytes nothing will read back, and --
+        worse -- keeps `has_pending_kv_work()` True, so this very loop could
+        manufacture its own work and never converge before the deadline.
         """
         if not self.kv_transfer_enabled:
             return
@@ -456,7 +525,7 @@ class EngineCore:
                         KV_SHUTDOWN_DRAIN_TIMEOUT_S,
                     )
                     break
-                self._advance_idle_kv_transfer()
+                self._advance_idle_kv_transfer(dispatch_new=False)
                 time.sleep(KV_IDLE_DRAIN_INTERVAL_S)
         except Exception:
             logger.exception("KV transfer drain during shutdown failed")
@@ -466,13 +535,34 @@ class EngineCore:
             return
         kvoutput = self.runner_mgr.call_func_with_aggregation("async_proc_aggregation")
         self.scheduler._update_from_kv_xfer_finished(kvoutput)
+        # Reclaim any offload save whose completion report never came (LMCache
+        # force-unpinned it upstream). Self-throttled, so calling it on every
+        # poll is cheap; without it a stalled save hangs the engine forever.
+        reconcile = getattr(self.scheduler, "_reconcile_stalled_deferred_saves", None)
+        if callable(reconcile):
+            reconcile()
 
-    def _dispatch_idle_offload_work(self) -> None:
+    def _dispatch_idle_offload_work(self, dispatch_new: bool = True) -> None:
         if not self.kv_transfer_enabled:
             return
         connector = getattr(self.scheduler, "kv_connector", None)
         if connector is None or not getattr(connector, "is_offload", False):
             return
+        # getattr for the same reason as `kv_connector` above: this path is
+        # reached with scheduler doubles that implement only the connector
+        # surface.
+        #
+        # `dispatch_new=False` on the shutdown drain: publishing new state
+        # loads/stores there hands the connector work whose bytes nothing will
+        # read back, and -- worse -- each fresh store keeps `has_pending_kv_work`
+        # True, so the drain loop that waits on it manufactures its own exit
+        # condition and never converges. Still build/process the meta so
+        # already-dispatched transfers finish and report.
+        if dispatch_new:
+            for name in ("_publish_state_loads", "_publish_state_stores"):
+                publish = getattr(self.scheduler, name, None)
+                if publish is not None:
+                    publish()
         meta = connector.build_connector_meta()
         if not connector_metadata_has_work(meta):
             return
@@ -574,7 +664,7 @@ class EngineCore:
 
                 if isinstance(item, tuple) and item[0] == "READY":
                     # Send READY signal to indicate EngineCore is fully initialized
-                    obj = pickle.dumps((EngineCoreRequestType.READY, None))
+                    obj = pickle.dumps((EngineCoreRequestType.READY, item[1]))
                     socket.send(obj)
                     logger.debug(f"{self.label}: sent READY signal")
                     continue
@@ -636,6 +726,7 @@ class DPEngineCoreProc(EngineCore):
                     kv_high_watermark=envs.ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK,
                     token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
                     max_queue_ms=envs.ATOM_PREFILL_DELAYER_MAX_QUEUE_MS,
+                    prefill_decode_interval=envs.ATOM_PREFILL_DECODE_INTERVAL,
                 )
             )
 
@@ -643,10 +734,17 @@ class DPEngineCoreProc(EngineCore):
         dp_rank = config.parallel_config.data_parallel_rank
         dp_size = config.parallel_config.data_parallel_size
         local_dp_rank = config.parallel_config.data_parallel_rank_local
+        local_dp_size = config.parallel_config.data_parallel_size_local
 
         assert dp_size > 1
         assert local_dp_rank is not None
-        assert 0 <= local_dp_rank <= dp_rank < dp_size
+        # Two independent bounds. The old chained form (local <= global) held
+        # only by coincidence on one node: the second node of a 2x4 run has
+        # local ranks 0..3 against global ranks 4..7.
+        assert 0 <= dp_rank < dp_size, f"dp_rank={dp_rank} outside [0,{dp_size})"
+        assert (
+            0 <= local_dp_rank < local_dp_size
+        ), f"local_dp_rank={local_dp_rank} outside [0,{local_dp_size})"
 
         self.dp_rank = dp_rank
         self.dp_group = config.parallel_config.stateless_init_dp_group()
@@ -670,6 +768,7 @@ class DPEngineCoreProc(EngineCore):
                 if now >= next_metrics_push:
                     next_metrics_push = now + METRICS_PUSH_INTERVAL_S
                     self.utility_handler.push_metrics()
+                self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 local_unfinished = (
                     not self.scheduler.is_finished()
@@ -829,6 +928,7 @@ class PrefillEngineCore(EngineCore):
         self.scheduler = PrefillScheduler(
             config, disagg_cu_shm_name=config.disagg_cu_shm_name
         )
+        self.utility_handler.scheduler = self.scheduler
 
     def _post_model_load_hook(self):
         """Round 1 bootstrap: export weights → send to decode → wait for ACK.

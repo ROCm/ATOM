@@ -149,6 +149,11 @@ class AiterMlaDecodeMetadataForVllm:
     # to the whole block. The asm kernel picks a different .co by this and the
     # persistent work descriptors are planned for it, so the two have to agree.
     causal: bool = True
+    # Global (pre-DCP-shard) cumulative KV lengths, shape [num_decode + 1].
+    # Only built for a causal multi-token decode under DCP, where the kernel
+    # needs them to place the intra-block mask on global positions; None
+    # otherwise, which is what selects the plain (non-cprr) kernel.
+    g_kv_indptr: torch.Tensor | None = None
     # The fold factor for handling mqa_ratio=64 in non-persistent mode
     fold_factor: int | None = None
     # Fold buffers for the MLA nhead-fold workaround. These are populated by
@@ -1036,7 +1041,22 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         device=None,
         model_runner=None,
     ):
-        super().__init__(kv_cache_spec, layer_names, config, device)
+        # supports_dcp_with_varlen: without it vLLM clamps
+        # reorder_batch_threshold to 1 under DCP, which sends every
+        # speculative q > 1 batch -- the target's verify pass and DSpark's
+        # draft block alike -- down the prefill path. That path is causal-only,
+        # so a bidirectional draft block would come out wrong, and no decode
+        # batch would ever reach a FULL cudagraph. This backend handles varlen
+        # DCP decode instead: causal batches through aiter's round-robin (cprr)
+        # kernel via g_kv_indptr, non-causal ones through the plain kernel,
+        # which needs no mask at all.
+        super().__init__(
+            kv_cache_spec,
+            layer_names,
+            config,
+            device,
+            supports_dcp_with_varlen=True,
+        )
         logger.info("init AiterMlaMetadataBuilderForVllm")
         from vllm.config import VllmConfig
 
@@ -1091,6 +1111,24 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             )
         else:
             self.persistent_num_heads = self.padded_num_attention_heads
+        # DCP rank + a persistent buffer for locally derived decode seq lens.
+        # Only the DSpark draft step needs the buffer (see build()); allocating
+        # it unconditionally under DCP keeps that branch allocation-free.
+        self.dcp_rank = 0
+        self._dcp_local_seq_lens_buf = None
+        self._g_kv_indptr_buf = None
+        if self.dcp_world_size > 1:
+            from vllm.distributed.parallel_state import get_dcp_group
+
+            self.dcp_rank = get_dcp_group().rank_in_group
+            self._dcp_local_seq_lens_buf = torch.zeros(
+                max_num_reqs, dtype=torch.int32, device=device
+            )
+            # Global cumulative KV lengths for the cprr decode kernel. Persistent
+            # for the same reason: a captured decode graph re-reads it on replay.
+            self._g_kv_indptr_buf = torch.zeros(
+                max_num_reqs + 1, dtype=torch.int32, device=device
+            )
         self.block_size = kv_cache_spec.block_size
         self.max_bs = max_num_reqs
         self.dtype_kv = get_aiter_kv_cache_dtype(config)
@@ -1223,6 +1261,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         cu_seqlens_q: torch.Tensor,
         max_q_len: int = 1,
         causal: bool = True,
+        is_cp_round_robin: bool = False,
     ):
         split_params = {
             "kv_granularity": max(self.block_size, 16),
@@ -1238,6 +1277,15 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         reduce_indptr = var["reduce_indptr"]
         reduce_final_map = var["reduce_final_map"]
         reduce_partial_map = var["reduce_partial_map"]
+        # paged_kv_indices are generated at token granularity (block size 1),
+        # and mla_decode_fwd is handed the cache as page_size=1 to match. The
+        # page_size below only feeds the work partitioning, which is size-based,
+        # so the two have disagreed harmlessly. cprr is the exception: it
+        # reconstructs each work row's GLOBAL token position from this, and a
+        # page_size of block_size scales that mapping by block_size -- a causal
+        # mask placed at the wrong positions, silently. Tell it what the kernel
+        # actually gets.
+        page_size = 1 if is_cp_round_robin else self.block_size
         get_mla_metadata_v1(
             cu_seqlens_q,
             self.paged_kv_indptr[: bs + 1],  # TODO: support sparse
@@ -1251,9 +1299,10 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             reduce_indptr,
             reduce_final_map,
             reduce_partial_map,
-            page_size=self.block_size,
+            page_size=page_size,
             dtype_q=self.dtype_q,
             dtype_kv=self.dtype_kv,
+            is_cp_round_robin=is_cp_round_robin,
             **split_params,
         )
         return {
@@ -1380,12 +1429,23 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             f"decode query length {max_qo_len} exceeds the persistent MLA "
             f"work-descriptor capacity {self.reorder_batch_threshold}"
         )
+        # DCP shards KV round-robin, so a causal multi-token decode cannot read
+        # its mask off the rank-local row order: local position j is global
+        # position j * world + rank. aiter's cprr variant reconstructs that, but
+        # only if BOTH halves agree -- the work descriptors are planned for it
+        # here and the global cumulative lengths are handed over below. Planning
+        # one way and dispatching the other leaves the persistent kernel
+        # spinning on a work queue whose indptr disagrees with its work set.
+        # A single-token decode sees all of its local KV and a bidirectional
+        # block masks nothing, so both keep the plain kernel.
+        cp_round_robin = self.dcp_world_size > 1 and max_qo_len > 1 and causal
         if use_persistent_metadata:
             ctx_mla_ps = self._set_mla_persistent_worker_buffers(
                 num_reqs,
                 qo_indptr,
                 max_qo_len,
                 causal=causal,
+                is_cp_round_robin=cp_round_robin,
             )
             self.mla_persistent_metadata.update(ctx_mla_ps)
 
@@ -1427,6 +1487,21 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                 num_reqs=num_reqs,
             )
 
+        g_kv_indptr = None
+        if cp_round_robin:
+            # cprr ships only as a persistent kernel; the non-persistent decode
+            # would ignore g_kv_indptr and mask on local row order instead --
+            # wrong output, no error. Refuse the batch rather than serve it.
+            assert use_persistent_metadata and dcp_tot_seq_lens_device is not None, (
+                f"causal decode of query length {max_qo_len} under DCP"
+                f"{self.dcp_world_size} needs the persistent round-robin kernel, "
+                "which is unavailable here (non-gfx950, or DP > 1)"
+            )
+            g_kv_indptr = self._g_kv_indptr_buf[: num_reqs + 1]
+            # [0] stays 0 (zero-init, never written). cumsum promotes to int64,
+            # so land it through copy_ rather than out=.
+            g_kv_indptr[1:].copy_(torch.cumsum(dcp_tot_seq_lens_device, dim=0))
+
         attn_metadata = AiterMlaDecodeMetadataForVllm(
             block_table=block_table_tensor,
             seq_lens=seq_lens_device,
@@ -1439,6 +1514,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             attn_out_dtype=self.decode_attn_out_dtype,
             use_persistent_metadata=use_persistent_metadata,
             causal=causal,
+            g_kv_indptr=g_kv_indptr,
             fold_factor=fold_factor,
             fold_kv_indptr=fold_kv_indptr,
             fold_kv_indices=fold_kv_indices,
@@ -1489,6 +1565,24 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         seq_lens = common_attn_metadata.seq_lens
         dcp_local_seq_lens = common_attn_metadata.dcp_local_seq_lens
+        if self.dcp_world_size > 1 and dcp_local_seq_lens is None:
+            # DSpark's draft step builds its own attention metadata inside
+            # vLLM's DFlash speculator, which never fills this in -- the target
+            # model runner is its only producer. The local lengths are a pure
+            # function of the global ones, so derive them here rather than
+            # teaching that path about DCP. It lands in a persistent buffer
+            # because the draft's FULL graph captures whatever tensor the decode
+            # metadata carries and re-reads it on every replay.
+            assert self._dcp_local_seq_lens_buf is not None
+            dcp_local_seq_lens = self._dcp_local_seq_lens_buf[:num_reqs]
+            dcp_local_seq_lens.copy_(
+                get_dcp_local_seq_lens(
+                    seq_lens,
+                    self.dcp_world_size,
+                    self.dcp_rank,
+                    self.cp_kv_cache_interleave_size,
+                )
+            )
 
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(

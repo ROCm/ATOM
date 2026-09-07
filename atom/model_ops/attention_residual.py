@@ -18,6 +18,7 @@ already normed rather than the caller norming it.
 from __future__ import annotations
 
 import torch
+from aiter import QuantType, dtypes
 from torch import nn
 
 from atom.model_ops.layernorm import RMSNorm
@@ -28,6 +29,28 @@ __all__ = ["AttnRes"]
 
 def _rms_eps(norm: RMSNorm) -> float:
     return getattr(norm, "variance_epsilon", getattr(norm, "eps", 1e-6))
+
+
+def _fused_quant_dtype(norm: RMSNorm | None) -> torch.dtype | None:
+    """The activation dtype ``norm`` would have quantized to, or None.
+
+    Per-token FP8 only. That is the one scheme this kernel emits: a per-token
+    scale is a single scalar per row, which the fused kernel already has in
+    registers when the row is formed. Block schemes (per_1x128 / per_1x32) need
+    a scale PER GROUP of channels plus a choice of scale layout, so they stay on
+    the standalone quant path -- unfused, exactly as before this fold existed.
+    """
+    if norm is None or not getattr(norm, "use_fused_quant", False):
+        return None
+    quant_type = getattr(norm, "quant_type", None)
+    params_dtype = getattr(norm, "params_dtype", None)
+    if quant_type is None or params_dtype not in (dtypes.fp8, torch.float8_e4m3fn):
+        return None
+    # QuantType is compared by .value throughout ATOM: the enum can be re-imported
+    # under a different module identity, which breaks `is`/`==` on the members.
+    if getattr(quant_type, "value", None) != QuantType.per_Token.value:
+        return None
+    return params_dtype
 
 
 class AttnRes(nn.Module):
@@ -50,12 +73,16 @@ class AttnRes(nn.Module):
     * ``out_norm`` -- the caller's rmsnorm OF THE RESULT. Passing one is what
       decides the fusion: it is folded into the kernel's store and the returned
       mix comes back already normed and scaled, so the caller must not norm it
-      again. Given None, the mix is returned raw.
+      again. Given None, the mix is returned raw. If that out_norm was built to
+      fuse a per-token FP8 quant for its consumer, the quant is folded in too
+      and ``mixed_output`` is a ``(quantized, scale)`` tuple -- which is exactly
+      what the same out_norm returns when called directly, so a caller that
+      already handles one handles both paths unchanged.
 
     The upshot for callers is that forward() has one shape in every mode:
     hand it the prefix, the block, and any pending addends; get back
     ``(mixed_output, prefix_out)``. It never returns a mix that still needs
-    norming, and never asks the caller which path it took.
+    norming or quantizing, and never asks the caller which path it took.
 
     ``proj``/``norm``/``out_norm`` are passed in already constructed and stay
     owned by the caller. That is deliberate: weights load by exact
@@ -89,6 +116,27 @@ class AttnRes(nn.Module):
         self.block_size = block_size
         self.layer_idx = layer_idx
 
+    @property
+    def out_quant_dtype(self) -> torch.dtype | None:
+        """Activation dtype to fold the consumer's quant to, or None for bf16.
+
+        Read off ``out_norm`` on every call rather than cached at init: that
+        module was constructed against the CONSUMER's prefix and already decided,
+        from the consumer's quant scheme, whether fusing is right -- including
+        declining to on MoE layers, where the normed output feeds an unquantized
+        router gate alongside the quantized experts. Its answer is also not final
+        until load time, since ``online_quantize_activation`` may rewrite the
+        scheme after this module was built. Deferring the read is what keeps the
+        two in agreement; it is a static attribute lookup that folds away at
+        trace time.
+
+        Without this fold, passing ``out_norm`` to the kernel would silently
+        DISABLE that RMSNorm's own quant fusion -- the module is bypassed on this
+        path, so its quant never runs and the consumer re-quantizes the whole
+        [T, H] standalone.
+        """
+        return _fused_quant_dtype(self.out_norm)
+
     def process_weights_after_loading(self) -> None:
         # Fold the static rmsnorm gain and the scoring projection into one [H]
         # vector. Both operands are load-time constants, so the kernel reads a
@@ -106,7 +154,7 @@ class AttnRes(nn.Module):
         block_residual: torch.Tensor | None = None,
         add_hidden: torch.Tensor | None = None,
         add_hidden2: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         """Returns ``(mixed_output, prefix_out)``.
 
         The addends are the caller's ``prefix_sum = prefix_sum + ...``, folded
@@ -114,6 +162,10 @@ class AttnRes(nn.Module):
         ``prefix_out`` is that sum. A None ``prefix_sum`` means the block was
         just closed out and this site starts a fresh one, so the first addend
         IS the prefix.
+
+        ``mixed_output`` is a ``(quantized, scale)`` tuple when ``out_norm``
+        fuses a per-token quant, on BOTH branches below -- the kernel folds it,
+        and the fallback gets it from calling that same out_norm.
         """
         if prefix_sum is None:
             prefix_sum, add_hidden, add_hidden2 = add_hidden, add_hidden2, None
@@ -135,6 +187,7 @@ class AttnRes(nn.Module):
                 None if self.out_norm is None else self.out_norm.weight,
                 self.out_eps,
                 add_hidden2,
+                self.out_quant_dtype,
             )
 
         # Nothing to mix (residuals off, or no candidates yet). Apply by hand

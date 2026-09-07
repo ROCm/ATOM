@@ -25,20 +25,46 @@ from atom.model_engine.engine_core_mgr import (
 class _FakeSeq:
     """Minimal stand-in for Sequence: routing only reads id/num_prompt_tokens."""
 
-    def __init__(self, seq_id, num_prompt_tokens=1, data_parallel_rank=None):
+    def __init__(
+        self,
+        seq_id,
+        num_prompt_tokens=1,
+        data_parallel_rank=None,
+        dp_session_id=None,
+        dp_parent_session_id=None,
+    ):
         self.id = seq_id
         self.num_prompt_tokens = num_prompt_tokens
+        self.dp_session_id = dp_session_id
+        self.dp_parent_session_id = dp_parent_session_id
         if data_parallel_rank is not None:
             self.data_parallel_rank = data_parallel_rank
 
 
-def _make_mgr(n_ranks, strategy="least_tokens", req_equiv=512):
+def _make_mgr(
+    n_ranks,
+    strategy="least_tokens",
+    req_equiv=512,
+    session_affinity=False,
+):
     """Build a bare CoreManager with just the routing state initialized."""
     mgr = CoreManager.__new__(CoreManager)
     mgr.label = "Engine Core Mgr"
     mgr.local_engine_count = n_ranks
     mgr._dp_lb_strategy = strategy
     mgr._dp_lb_req_equiv = req_equiv
+    mgr._dp_session_affinity_enabled = session_affinity
+    mgr._dp_session_owners = {}
+    mgr._dp_session_prompt_tokens = {}
+    mgr._dp_route_counters = {
+        "affinity_new_total": 0,
+        "affinity_owner_hit_total": 0,
+        "affinity_spill_total": 0,
+        "affinity_parent_ignored_total": 0,
+        "explicit_total": 0,
+        "load_balanced_total": 0,
+    }
+    mgr._rank_routed_total = [0] * n_ranks
     mgr._rank_rotation_cursor = 0
     mgr._rank_reqs = [0] * n_ranks
     mgr._rank_tokens = [0] * n_ranks
@@ -53,7 +79,8 @@ def _route(mgr, seqs):
     with mgr._lb_lock:
         for seq in seqs:
             hint = getattr(seq, "data_parallel_rank", None)
-            rank = int(hint) if hint is not None else mgr._select_dp_rank_locked()
+            hint = int(hint) if hint is not None else None
+            rank = mgr._select_dp_rank_for_seq_locked(seq, hint)
             mgr._charge_seq_load_locked(seq, rank)
             assigned.append(rank)
     return assigned
@@ -126,6 +153,168 @@ def test_least_tokens_combined_signal_counts_requests():
     assert sorted(ranks) == [0, 0, 0, 1, 1, 1]
 
 
+def test_affinity_new_session_uses_token_load_before_stable_tiebreak():
+    mgr = _make_mgr(3, session_affinity=True)
+    expected = mgr._stable_session_rank("session-root")
+    mgr._rank_tokens[expected] = 500_000
+    rank = _route(
+        mgr,
+        [_FakeSeq("root", 1000, dp_session_id="session-root")],
+    )[0]
+    assert rank != expected
+    assert mgr._rank_tokens[rank] == 1000
+    assert mgr._dp_session_owners["session-root"] == rank
+
+
+def test_affinity_hash_is_deterministic_across_managers():
+    first = _make_mgr(8, session_affinity=True)
+    second = _make_mgr(8, session_affinity=True)
+    assert first._stable_session_rank("stable-correlation-id") == (
+        second._stable_session_rank("stable-correlation-id")
+    )
+    assert first._select_new_session_rank_locked("stable-correlation-id") == (
+        second._select_new_session_rank_locked("stable-correlation-id")
+    )
+
+
+def test_affinity_existing_session_always_uses_cache_owner():
+    mgr = _make_mgr(2, session_affinity=True)
+    mgr._dp_session_owners["s"] = 0
+    # Even extreme transient backlog cannot move an existing session. Replaying
+    # a long agent prefix is more expensive than waiting for its cache owner.
+    mgr._rank_tokens = [10_000_000, 0]
+    rank = _route(mgr, [_FakeSeq("turn", 1000, dp_session_id="s")])[0]
+    assert rank == 0
+    assert mgr._dp_route_counters["affinity_spill_total"] == 0
+
+
+def test_affinity_later_turn_charges_only_prompt_growth():
+    mgr = _make_mgr(2, session_affinity=True, req_equiv=512)
+    first = _FakeSeq("first", 100_000, dp_session_id="s")
+    second = _FakeSeq("second", 101_500, dp_session_id="s")
+
+    owner = _route(mgr, [first])[0]
+    mgr._mark_seq_prefill_complete(first.id)
+    assert mgr._rank_tokens[owner] == 0
+
+    assert _route(mgr, [second]) == [owner]
+    assert mgr._rank_tokens[owner] == 1_500
+    assert mgr._seq_load[second.id][2] == 1_500
+
+
+def test_affinity_new_session_accounts_for_decode_pressure():
+    mgr = _make_mgr(2, session_affinity=True, req_equiv=512)
+    mgr._rank_reqs = [4, 0]
+    mgr._rank_tokens = [0, 1_000]
+
+    rank = _route(mgr, [_FakeSeq("new", 100, dp_session_id="new-session")])[0]
+    # score(rank0)=2048, score(rank1)=1000 before the new request is charged.
+    assert rank == 1
+
+
+def test_affinity_routes_across_global_ranks_on_multinode_coordinator():
+    mgr = _make_mgr(2, session_affinity=True)
+    # A coordinator owns two local engines but routes across all four global
+    # ranks. Routing state must use the global width so a remote rank can win.
+    mgr.global_engine_count = 4
+    mgr._rank_reqs = [0, 0, 0, 0]
+    mgr._rank_tokens = [1000, 1000, 1000, 0]
+    mgr._rank_routed_total = [0, 0, 0, 0]
+
+    rank = _route(mgr, [_FakeSeq("new", 100, dp_session_id="global-session")])[0]
+
+    assert rank == 3
+    assert mgr._dp_session_owners["global-session"] == 3
+    assert len(mgr.get_dp_router_statistics()["requests_per_rank"]) == 4
+
+
+def test_affinity_child_is_independent_of_parent_cache_owner():
+    mgr = _make_mgr(4, session_affinity=True)
+    parent_owner = 0
+    mgr._dp_session_owners["parent"] = parent_owner
+    mgr._rank_tokens[parent_owner] = 100_000
+    rank = _route(
+        mgr,
+        [
+            _FakeSeq(
+                "child-seq",
+                100,
+                dp_session_id="child",
+                dp_parent_session_id="parent",
+            )
+        ],
+    )[0]
+    assert rank != parent_owner
+    assert mgr._dp_session_owners["child"] == rank
+    assert mgr._dp_session_owners["parent"] == parent_owner
+    assert mgr._dp_route_counters["affinity_parent_ignored_total"] == 1
+
+
+def test_affinity_child_does_not_reserve_parent_owner():
+    mgr = _make_mgr(3, session_affinity=True)
+    child_rank = _route(
+        mgr,
+        [
+            _FakeSeq(
+                "child-seq",
+                100,
+                dp_session_id="child",
+                dp_parent_session_id="parent",
+            )
+        ],
+    )[0]
+    parent_rank = _route(
+        mgr,
+        [_FakeSeq("parent-seq", 100, dp_session_id="parent")],
+    )[0]
+    # The child's first-turn charge participates in the parent's independent
+    # placement instead of reserving or forcing the parent owner.
+    assert parent_rank != child_rank
+    assert mgr._dp_session_owners["parent"] == parent_rank
+
+
+def test_explicit_rank_is_authoritative_and_becomes_session_owner():
+    mgr = _make_mgr(4, session_affinity=True)
+    mgr._rank_tokens = [0, 0, 0, 100_000]
+    rank = _route(
+        mgr,
+        [
+            _FakeSeq(
+                "explicit",
+                100,
+                data_parallel_rank=3,
+                dp_session_id="s",
+            )
+        ],
+    )[0]
+    assert rank == 3
+    assert mgr._dp_session_owners["s"] == 3
+
+
+def test_dp_router_statistics_exposes_locality_and_rank_load():
+    mgr = _make_mgr(4, session_affinity=True)
+    session = "observed-session"
+    ranks = _route(
+        mgr,
+        [
+            _FakeSeq("first", 100, dp_session_id=session),
+            _FakeSeq("second", 200, dp_session_id=session),
+        ],
+    )
+    owner = ranks[0]
+
+    stats = mgr.get_dp_router_statistics()
+    assert stats["affinity_new_total"] == 1
+    assert stats["affinity_owner_hit_total"] == 1
+    assert stats["affinity_spill_total"] == 0
+    assert stats["requests_per_rank"][owner] == 2
+    assert stats["inflight_requests_per_rank"][owner] == 2
+    # First turn charges 100; the sticky second turn charges only its 100-token
+    # growth, not the full cached 200-token prompt.
+    assert stats["queued_prefill_tokens_per_rank"][owner] == 200
+    assert stats["session_count_per_rank"][owner] == 1
+
+
 def test_release_restores_counts():
     mgr = _make_mgr(3, strategy="least_tokens")
     seqs = [_FakeSeq(i, num_prompt_tokens=50) for i in range(6)]
@@ -147,6 +336,21 @@ def test_release_is_idempotent_no_leak_no_negative():
     mgr._release_seq_load("never-seen")
     assert mgr._rank_reqs == [0, 0]
     assert mgr._rank_tokens == [0, 0]
+
+
+def test_first_output_releases_prefill_tokens_but_not_request_count():
+    mgr = _make_mgr(2, strategy="least_tokens")
+    seq = _FakeSeq("a", num_prompt_tokens=20)
+    _route(mgr, [seq])
+    rank = mgr._seq_load[seq.id][0]
+
+    mgr._mark_seq_prefill_complete(seq.id)
+    mgr._mark_seq_prefill_complete(seq.id)  # idempotent across stream chunks
+    assert mgr._rank_tokens[rank] == 0
+    assert mgr._rank_reqs[rank] == 1
+
+    mgr._release_seq_load(seq.id)
+    assert mgr._rank_reqs == [0, 0]
 
 
 def test_burst_does_not_dogpile_one_rank():
@@ -216,12 +420,16 @@ def test_invalid_hint_still_supported_via_add_request_validation():
 
 def test_reset_dp_router_clears_all_state():
     mgr = _make_mgr(3, strategy="least_tokens")
+    mgr._dp_session_owners["session"] = 1
+    mgr._dp_session_prompt_tokens["session"] = 1234
     _route(mgr, [_FakeSeq(i, num_prompt_tokens=40) for i in range(5)])
     mgr.reset_dp_router()
     assert mgr._rank_rotation_cursor == 0
     assert mgr._rank_reqs == [0, 0, 0]
     assert mgr._rank_tokens == [0, 0, 0]
     assert mgr._seq_load == {}
+    assert mgr._dp_session_owners == {}
+    assert mgr._dp_session_prompt_tokens == {}
 
 
 def test_tie_break_rotates_starting_rank():

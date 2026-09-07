@@ -35,12 +35,14 @@ from aiter import (
     gemm_a8w8_blockscale_bpreshuffle,
     get_hip_quant,
     indexer_k_quant_and_cache,
-    indexer_qk_rope_quant_and_cache,
     top_k_per_row_decode,
     top_k_per_row_prefill,
 )
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
-from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_world_size
+from aiter.dist.parallel_state import (
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+)
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fused_fp8_quant import fused_reduce_rms_fp8_group_quant
@@ -78,15 +80,16 @@ from atom.model_ops import module_dispatch_ops as _module_dispatch_ops
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.attention_mla import (
     MLAModules,
+    indexer_qk_rope_quant_and_cache,
     is_rocm_aiter_fp4bmm_enabled,
+    qrep_tp_override,
     triton_convert_req_index_to_global_index,
     triton_convert_req_index_to_global_index_dsa_prefill,
     triton_gather_kv_indices_sparse,
 )
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.dcp_ops import (
-    dcp_pack_topk_candidates,
-    triton_filter_and_convert_dcp_index,
+    dcp_decode_candidate_exchange_fused,
     triton_filter_and_convert_dcp_index_prefill,
 )
 from atom.model_ops.embed_head import (
@@ -318,9 +321,52 @@ def _is_neox_rope_style(
     return not bool(interleave)
 
 
+def _moe_router_dtype(config: PretrainedConfig) -> torch.dtype | None:
+    """Dtype the MoE router must run in, or None to keep the model dtype.
+
+    None preserves the historical behaviour and is what every model that does
+    not ask for something else gets.
+
+    GLM's `noaux_tc` correction bias is ~256 values packed into [6.02, 8.11]
+    with a median spacing of 6e-6 between neighbours. bf16 carries 8 mantissa
+    bits, so its ULP up there is 1/64 -- four orders of magnitude coarser than
+    the spacing. Storing that tensor at the model dtype collapses 238 distinct
+    values onto 8 and discards almost all of the selection signal it exists to
+    carry. Every `glm_moe_dsa` checkpoint on disk ships it as fp32, and vLLM
+    forces fp32 routing for this model_type unconditionally -- including
+    GLM-5/5.1/5.2, whose configs predate `moe_router_dtype` and therefore
+    cannot ask for it. Match that, keyed on the same signal, so a model does
+    not silently depend on whether its config generation happened to carry
+    the key.
+
+    The gate output dtype is not separately useful -- rounding the logits to
+    bf16 barely moves the top-k -- but it is not independent either: aiter's
+    `biased_grouped_topk` dispatches on `gating_output.dtype()` and then
+    reinterpret_casts `correction_bias` to that same `scalar_t`. The two must
+    agree or the kernel reads the bias buffer at the wrong width, so this one
+    dtype governs both.
+    """
+    # The MTP draft must match the target or speculation degrades: its config
+    # has `model_type` rewritten to "deepseek_mtp" by
+    # `SpeculativeConfig._MTP_TYPE_MAP` while keeping the GLM-only
+    # `index_share_for_mtp_iteration` marker, so a model_type test alone leaves
+    # the draft router in bf16 while the target runs fp32. The two then select
+    # different experts and the acceptance rate drops -- a throughput
+    # regression that leaves task accuracy intact and is correspondingly hard
+    # to attribute later. Same either/or the sibling predicates in this file
+    # use for exactly this reason.
+    if getattr(config, "model_type", None) == "glm_moe_dsa" or bool(
+        getattr(config, "index_share_for_mtp_iteration", False)
+    ):
+        return torch.float32
+    if getattr(config, "moe_router_dtype", None) == "float32":
+        return torch.float32
+    return None
+
+
 def _can_fuse_indexer_wk_weights_proj(
     config: PretrainedConfig,
-    quant_config: Optional[QuantizationConfig],
+    quant_config: QuantizationConfig | None,
     indexer_prefixes: list[str],
 ) -> bool:
     if not ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION:
@@ -1074,10 +1120,10 @@ class DeepseekV2MoE(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
         prefix: str = "",
-        alt_stream: Optional[torch.cuda.Stream] = None,
+        alt_stream: torch.cuda.Stream | None = None,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -1091,6 +1137,10 @@ class DeepseekV2MoE(nn.Module):
                 "Only silu is supported for now."
             )
 
+        # None here means "model dtype", i.e. `torch.empty` and `gate()` behave
+        # exactly as they did before this was introduced.
+        self.router_dtype = _moe_router_dtype(config)
+
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.n_routed_experts,
@@ -1100,8 +1150,13 @@ class DeepseekV2MoE(nn.Module):
             prefix=f"{prefix}.gate",
         )
         if config.topk_method == "noaux_tc":
+            # The dtype has to be right HERE, at parameter creation: the loader
+            # casts the checkpoint tensor into whatever this holds, so an fp32
+            # bias landing in a bf16 parameter is rounded once, on load, and
+            # every later `.to(torch.float32)` in the MoE backends widens a
+            # number whose low bits are already gone.
             self.gate.e_score_correction_bias = atom_parameter(
-                torch.empty(config.n_routed_experts)
+                torch.empty(config.n_routed_experts, dtype=self.router_dtype)
             )
         else:
             self.gate.e_score_correction_bias = None
@@ -1164,7 +1219,12 @@ class DeepseekV2MoE(nn.Module):
             compilation_config.static_forward_context[prefix] = self
 
     def routed_expert_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        router_logits = self.gate(hidden_states)
+        # `otype` must match the correction bias -- see `_moe_router_dtype`.
+        router_logits = (
+            self.gate(hidden_states)
+            if self.router_dtype is None
+            else self.gate(hidden_states, otype=self.router_dtype)
+        )
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
@@ -1173,7 +1233,7 @@ class DeepseekV2MoE(nn.Module):
     def combine_outputs(
         self,
         final_hidden_states: torch.Tensor,
-        shared_output: Optional[torch.Tensor],
+        shared_output: torch.Tensor | None,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         if shared_output is not None:
@@ -1394,141 +1454,6 @@ def _dcp_gather_indexer_k_prefill(
     return k_fp8, k_scale
 
 
-def _dcp_decode_candidate_exchange(
-    attn_metadata,
-    padded_q_fp8_decode_tokens: torch.Tensor,
-    kv_cache: torch.Tensor,
-    weights: torch.Tensor,
-    topk_indices: torch.Tensor,
-    dcp_rank: int,
-    num_decode_tokens: int,
-    topk_tokens: int,
-    max_model_len: int,
-    runner_block_size: int,
-    stable_topk: bool,
-    cp_kv_cache_interleave_size: int = 1,
-) -> None:
-    """DCP decode candidate exchange -> deterministic merge into global top-k.
-
-    Each rank holds only 1/W of the KV (index_cache is sharded, same slot_mapping
-    as the main KV). Score the LOCAL shard — block_tables already point at it, so
-    only context_lens must be localized — take a LOCAL top-k, and all-gather just
-    the W*topk (score, global_id) candidates. Because fewer tokens outrank a given
-    token locally than globally, a token in the global top-K is in its own rank's
-    local top-K, so the merge reconstructs the global top-K. Caveat: the local
-    top-k is a score-only radix-select whose tie handling differs from the global
-    gid-ordered tie-break, so when the local boundary (2048th) sits on a score tie
-    a tied token may be dropped before the exchange -- the merged set can then
-    differ from dcp=1 at that boundary. Exact fp32 score ties are rare, so this is
-    a negligible boundary effect, not a systematic loss.
-
-    Writes the merged global top-k in place into
-    topk_indices[:num_decode_tokens, :topk_tokens].
-    """
-    dcp_world_size = get_dcp_world_size()
-    batch_size, next_n = padded_q_fp8_decode_tokens.shape[:2]
-    num_rows = batch_size * next_n
-    num_padded_tokens = num_rows
-    assert attn_metadata.max_seqlen_q == 1, (
-        "DCP + DeepSeek-V3.2 sparse indexer (DSA) currently supports "
-        "qlen=1 decode only (MTP verify not yet supported)."
-    )
-    g_ctx = attn_metadata.context_lens
-    # Interleave-S local length (matches get_dcp_local_seq_lens / prepare_decode's
-    # slot split): each full S*W super-block gives every rank S tokens, and the
-    # tail remainder is handed out S at a time by rank. S=1 -> the round-robin
-    # base + (this rank owns the +1 tail?) split.
-    S = cp_kv_cache_interleave_size
-    W = dcp_world_size
-    full_chunks = g_ctx // (S * W)
-    base = full_chunks * S
-    remainder = (g_ctx - base * W - dcp_rank * S).clamp(0, S)
-    local_ctx = (base + remainder).to(torch.int32)
-    l_max = (max_model_len + dcp_world_size - 1) // dcp_world_size
-    local_logits = torch.empty([num_rows, l_max], dtype=torch.float32, device="cuda")
-    deepgemm_fp8_paged_mqa_logits(
-        padded_q_fp8_decode_tokens,
-        kv_cache,
-        weights[:num_padded_tokens],
-        local_logits,
-        local_ctx,
-        attn_metadata.block_tables,
-        l_max,
-        KVBlockSize=runner_block_size,
-        Preshuffle=True,
-    )
-    # ---- local top-k -> exchange candidates -> deterministic merge ----
-    # k_loc is the constant `topk_tokens`, never the live local length: the
-    # exchanged size must be static for CUDAGraph. Short contexts therefore ship
-    # (-inf, -1) padding, which the merge drops.
-    k_loc = topk_tokens
-    local_idx = torch.empty(
-        num_rows, k_loc, dtype=torch.int32, device=local_logits.device
-    )
-    top_k_per_row_decode(
-        local_logits,
-        next_n,
-        local_ctx,
-        local_idx,
-        num_rows,
-        local_logits.stride(0),
-        local_logits.stride(1),
-        k_loc,
-        stable=stable_topk,
-    )
-    # [2, rows, k_loc]: plane 0 = score, plane 1 = int32 gid bits.
-    send = torch.empty(
-        2, num_rows, k_loc, dtype=torch.float32, device=local_logits.device
-    )
-    dcp_pack_topk_candidates(
-        local_logits,
-        local_idx,
-        local_ctx,
-        dcp_rank,
-        dcp_world_size,
-        send,
-        cp_kv_cache_interleave_size,
-    )
-    # Exchange as int32 so the gid bit patterns cannot be touched by any float
-    # canonicalization along the way; the score plane is bitcast back at the end
-    # (free, no copy).
-    recv = (
-        get_dcp_group()
-        .all_gather(send.view(torch.int32), dim=0)
-        .view(dcp_world_size, 2, num_rows, k_loc)
-    )
-    n_cand = dcp_world_size * k_loc
-    # Rank is the outer dim after all-gather but the merge wants it on the
-    # candidate dim. Selection is provably order-independent, so any consistent
-    # permutation works — but scores and gids must use the SAME one.
-    gathered_sc = recv[:, 0].permute(1, 0, 2).reshape(num_rows, n_cand).contiguous()
-    # gid plane: [rows, W, k_loc] AllGather view, innermost dim contiguous.
-    gathered_gid = recv[:, 1].permute(1, 0, 2)
-    topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
-    cand_idx = torch.empty(
-        num_rows, topk_tokens, dtype=torch.int32, device=gathered_sc.device
-    )
-    cand_lens = torch.full(
-        (num_rows,), n_cand, dtype=torch.int32, device=gathered_sc.device
-    )
-    top_k_per_row_decode(
-        gathered_sc.view(torch.float32),
-        1,
-        cand_lens,
-        cand_idx,
-        num_rows,
-        gathered_sc.stride(0),
-        gathered_sc.stride(1),
-        topk_tokens,
-        stable=True,
-    )
-    # Map row-local candidate index -> global id. gathered_gid is the 3D
-    # [rows, W, k_loc] view; reshape materializes a contiguous copy (a few us,
-    # << the second-pass topk this eliminated). gather requires an int64 index.
-    gathered_gid_flat = gathered_gid.reshape(num_rows, n_cand)
-    topk_indices_decode.copy_(torch.gather(gathered_gid_flat, 1, cand_idx.long()))
-
-
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: str,
@@ -1573,7 +1498,9 @@ def sparse_attn_indexer(
         return torch.zeros_like(weights, dtype=torch.float32)
     # For MTP verify decode, max_seqlen_q > 1 so total decode tokens = batch_size * max_seqlen_q
     num_decode_tokens = (
-        context.batch_size * attn_metadata.max_seqlen_q if not context.is_prefill else 0
+        context.scheduled_bs * attn_metadata.max_seqlen_q
+        if not context.is_prefill
+        else 0
     )
     runner_block_size = get_current_atom_config().kv_cache_block_size
     cp_kv_cache_interleave_size = get_current_atom_config().dcp_config.interleave_size
@@ -1638,7 +1565,7 @@ def sparse_attn_indexer(
         if attn_metadata.max_seqlen_k <= topk_tokens:
             return weights
         prefill_metadata = attn_metadata
-        num_prefills = context.batch_size
+        num_prefills = context.scheduled_bs
         # Size the gathered-KV buffer off the KEY length, not the hidden/query
         # length. Under PCP the query side (hidden_states) is 1/pcp while `k` is
         # the full all-gathered key set, so `k.shape[0]` is the correct full
@@ -1781,63 +1708,68 @@ def sparse_attn_indexer(
         # we only have [num_block, block_size, head_dim],
         kv_cache = kv_cache.unsqueeze(-2)
         padded_q_fp8_decode_tokens = q_fp8[:num_decode_tokens].reshape(
-            context.batch_size, -1, *q_fp8.shape[1:]
+            context.scheduled_bs, -1, *q_fp8.shape[1:]
         )
         # TODO: move and optimize below logic with triton kernels
         batch_size = padded_q_fp8_decode_tokens.shape[0]
         next_n = padded_q_fp8_decode_tokens.shape[1]
-        assert batch_size == context.batch_size
+        assert batch_size == context.scheduled_bs
         num_padded_tokens = batch_size * next_n
         batch_size, next_n, _heads, _ = padded_q_fp8_decode_tokens.shape
         num_rows = batch_size * next_n
         dcp_world_size = get_dcp_world_size()
-        logits = None
+        assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
         if dcp_world_size > 1:
-            dcp_rank = get_dcp_rank()
-            _dcp_decode_candidate_exchange(
+            # The fused exchange scores this rank's own shard and writes the KV
+            # slots it owns -- ownership filter, slot localize and compaction all
+            # inside the op -- straight into sparse_kv_indices_buffer and
+            # dcp_sparse_kv_indptr_buffer. So there is no global logits plane
+            # left to rank and no topk_indices left to convert: everything the
+            # non-DCP path does below has already happened, and we return here.
+            dcp_decode_candidate_exchange_fused(
                 attn_metadata,
                 padded_q_fp8_decode_tokens,
                 kv_cache,
                 weights,
-                topk_indices,
-                dcp_rank,
+                get_dcp_rank(),
                 num_decode_tokens,
                 topk_tokens,
                 max_model_len,
                 runner_block_size,
                 stable_topk,
                 cp_kv_cache_interleave_size,
+                out_kv_indices=sparse_kv_indices_buffer,
+                out_kv_indptr=dcp_sparse_kv_indptr_buffer,
+                owned_counts=dcp_owned_counts_buffer,
             )
-        else:
-            logits = torch.empty(
-                [num_rows, max_model_len], dtype=torch.float32, device="cuda"
-            )
-            deepgemm_fp8_paged_mqa_logits(
-                padded_q_fp8_decode_tokens,
-                kv_cache,
-                weights[:num_padded_tokens],
-                logits,
-                decode_metadata.context_lens,
-                attn_metadata.block_tables,
-                max_model_len,
-                KVBlockSize=runner_block_size,
-                Preshuffle=True,
-            )
-        assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
-        if logits is not None:
-            # Non-DCP: one rank holds the whole plane, so top-k is already
-            # global. The DCP branch produced topk_indices_decode itself.
-            topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
-            top_k_per_row_decode(
-                logits,
-                next_n,
-                decode_metadata.context_lens,
-                topk_indices_decode,
-                num_rows,
-                logits.stride(0),
-                logits.stride(1),
-                stable=stable_topk,
-            )
+            return weights
+        # Non-DCP: this rank holds the whole plane, so its top-k is already the
+        # global one.
+        logits = torch.empty(
+            [num_rows, max_model_len], dtype=torch.float32, device="cuda"
+        )
+        deepgemm_fp8_paged_mqa_logits(
+            padded_q_fp8_decode_tokens,
+            kv_cache,
+            weights[:num_padded_tokens],
+            logits,
+            decode_metadata.context_lens,
+            attn_metadata.block_tables,
+            max_model_len,
+            KVBlockSize=runner_block_size,
+            Preshuffle=True,
+        )
+        topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
+        top_k_per_row_decode(
+            logits,
+            next_n,
+            decode_metadata.context_lens,
+            topk_indices_decode,
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            stable=stable_topk,
+        )
         if attn_metadata.max_seqlen_q > 1:
             triton_gather_kv_indices_sparse(
                 attn_metadata.sparse_kv_indptr,
@@ -1847,27 +1779,6 @@ def sparse_attn_indexer(
                 attn_metadata.kv_indptr,
                 NUM_TOPK_TOKENS=topk_tokens,
                 out=sparse_kv_indices_buffer,
-            )
-        elif dcp_world_size > 1:
-            # topk_indices now hold GLOBAL positions. Keep only this rank's owned
-            # tokens ((p//S)%W == r), de-interleave to the local index, map to the
-            # local main-KV slot, and COMPACT them to the front -- non-owned
-            # positions are dropped, not marked with -1, because holes break
-            # aiter's lse output. The compacted per-request lengths are written
-            # into dcp_sparse_kv_indptr_buffer for this layer's attention.
-            triton_filter_and_convert_dcp_index(
-                attn_metadata.cu_seqlens_q,
-                attn_metadata.g_kv_indptr,
-                attn_metadata.block_tables,
-                topk_indices,
-                dcp_rank,
-                dcp_world_size,
-                runner_block_size,
-                out_kv_indptr=dcp_sparse_kv_indptr_buffer,
-                owned_counts=dcp_owned_counts_buffer,
-                NUM_TOPK_TOKENS=topk_tokens,
-                out=sparse_kv_indices_buffer,
-                cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
             )
         else:
             triton_convert_req_index_to_global_index(
@@ -2315,14 +2226,10 @@ class Indexer(nn.Module):
         # rope q (1/pcp) and k (full) separately. The op then scores 1/pcp
         # queries against the gathered full KV and writes the full k-cache.
         pcp = _pcp_active()
-        # DCP must also take the unfused path: the fused q-rope/quant+cache op is
-        # driven by slot_mapping, which is -1 on every rank that does not own the
-        # current token, so those ranks skip it entirely and leave q_fp8 /
-        # weights_out uninitialized. Only the owner rank ends up with a valid
-        # query -- invisible while ctx <= index_topk (top-k selects everything
-        # anyway), garbage beyond it.
-        dcp = get_dcp_world_size() > 1
-        unfused_qk_rope = (not self.use_qk_rope_cache_fusion) or pcp or dcp
+        # With compute_all_q_rope, DCP uses the fused path even when this rank's
+        # slot is -1: Q/weights are produced on every rank, positions are clamped
+        # for padded rows, and only the owner rank writes K cache.
+        unfused_qk_rope = (not self.use_qk_rope_cache_fusion) or pcp
         positions_op = positions
         if unfused_qk_rope:
             q_pe, _ = torch.split(
@@ -2430,6 +2337,9 @@ class DeepseekV2MLAAttention(nn.Module):
         assert num_heads % tp_size == 0
         self.num_local_heads = num_heads // tp_size
 
+        # DCP Query Replication: {} unless QREP is on -- see qrep_tp_override.
+        q_qrep_override = qrep_tp_override(tp_size)
+
         self.scaling = self.qk_head_dim**-0.5
         self.max_position_embeddings = max_position_embeddings
         self.layer_num = layer_num
@@ -2501,6 +2411,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_b_proj",
                 source_quant_dtype=source_quant_dtype,
+                **q_qrep_override,
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -2510,6 +2421,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_proj",
                 source_quant_dtype=source_quant_dtype,
+                **q_qrep_override,
             )
 
             self.kv_a_proj_with_mqa = ReplicatedLinear(

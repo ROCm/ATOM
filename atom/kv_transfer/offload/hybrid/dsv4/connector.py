@@ -55,6 +55,7 @@ from atom.kv_transfer.offload._offload_common import (
     OffloadSchedulerMixin,
     OffloadWorkerMixin,
     build_offload_engine,
+    max_pending_saves,
     pp_aware_rank_and_world,
     validated_kv_role,
 )
@@ -89,29 +90,6 @@ from atom.kv_transfer.offload.metadata import (
 logger = logging.getLogger("atom")
 
 DSV4_CHECKPOINT_SAVE_CHANNEL = "atom.dsv4.checkpoint.save"
-
-
-def _max_pending_saves(kvc, save_workers: int) -> int:
-    """Return the maximum running-plus-queued worker save operations."""
-
-    extra = (kvc or {}).get("kv_connector_extra_config", kvc or {}) or {}
-    configured = extra.get("max_pending_saves")
-    if configured is None:
-        configured = os.environ.get(
-            "OFFLOAD_MAX_PENDING_SAVES",
-            str(max(2, 2 * save_workers)),
-        )
-        try:
-            capacity = int(configured)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("max pending saves must be a positive integer") from exc
-    else:
-        if isinstance(configured, bool) or not isinstance(configured, int):
-            raise ValueError("max pending saves must be a positive integer")
-        capacity = configured
-    if capacity <= 0:
-        raise ValueError("max pending saves must be a positive integer")
-    return capacity
 
 
 def _wait_for_publication(
@@ -243,7 +221,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         # The ATOM LMCache GPU connector owns per-thread staging streams.
         # OFFLOAD_COPY_WORKERS tunes the SAVE pool only.
         n_save_workers = int(os.environ.get("OFFLOAD_COPY_WORKERS", "1"))
-        self._max_pending_saves = _max_pending_saves(kvc, n_save_workers)
+        self._max_pending_saves = max_pending_saves(kvc, n_save_workers)
         self._save_admission = threading.BoundedSemaphore(self._max_pending_saves)
         self._init_worker_common(
             config,
@@ -1964,7 +1942,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             int(getattr(seq, "num_cached_tokens", -1)),
         )
         pending_slot = self._pending_slot_loads.get(sid)
-        destination_group = getattr(seq, "per_req_cache_group", -1)
+        destination_group = getattr(seq, "state_slot", -1)
         if pending_slot is not None and (
             not isinstance(destination_group, int) or destination_group < 0
         ):
@@ -2041,7 +2019,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         computed: int,
     ) -> tuple[int, int] | None:
         sid = str(seq.id)
-        source_group = getattr(seq, "per_req_cache_group", -1)
+        source_group = getattr(seq, "state_slot", -1)
         if (
             not bool(getattr(seq, "_state_initialized_after_alloc", False))
             or not isinstance(source_group, int)
@@ -2066,7 +2044,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         start: int,
         end: int,
     ) -> tuple[int, int] | None:
-        source_group = getattr(seq, "per_req_cache_group", -1)
+        source_group = getattr(seq, "state_slot", -1)
         if (
             not bool(getattr(seq, "_state_initialized_after_alloc", False))
             or not isinstance(source_group, int)
@@ -2215,7 +2193,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             slot_load_spec = None
             if bool(getattr(seq, "has_per_req_cache", False)):
                 pending_slot = self._pending_slot_loads.get(sid)
-                destination_group = getattr(seq, "per_req_cache_group", -1)
+                destination_group = getattr(seq, "state_slot", -1)
                 if (
                     pending_slot is None
                     or not isinstance(destination_group, int)
@@ -2241,7 +2219,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             # combines it with offload_loaded_tokens after all TP workers
             # succeed to publish the restored GPU prefix.
             seq.offload_load_start_tokens = hbm
-            seq.offload_loaded_tokens = max(hbm, lmc)
+            seq.offload_loaded_tokens = self._claim_after_load(seq, hbm, lmc)
             # req_id MUST be the raw seq.id (the type the scheduler compares
             # against in _update_waiting_for_remote_kv); str(seq.id) is only for
             # LMCache's lookup/pin API. A str here silently never wakes the seq.
@@ -2310,7 +2288,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                 slot_save_spec = SlotSaveSpec(
                     boundary_tokens=boundary,
                     boundary_block_hash=boundary_hash,
-                    source_group=int(seq.per_req_cache_group),
+                    source_group=int(seq.state_slot),
                 )
             token_end = max(
                 aligned if page_save_due else 0,
@@ -2420,6 +2398,40 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             return
         self._save_inflight.pop(sid, None)
         self._finish_save_statistics(req_id)
+
+    def abandon_save(self, req_id) -> None:
+        """Force-drop a save the scheduler reclaimed after it stalled.
+
+        The completion path (`save_finished`) is precise: it discards one exact
+        `SaveOperationId` and leaves the rest of the request's inflight set. This
+        is the opposite need. `_reconcile_stalled_deferred_saves` has already
+        freed the blocks of a save the backend never reported, and holds only
+        the raw request id, so drop the *whole* request unconditionally -- the
+        page set and the SLOT sidecar. Without this the entries linger,
+        `should_defer_free` stays True and `has_pending_work` never clears, and
+        the engine busy-loops with every GPU idle (the DSV4 twin of the dense
+        stall). Not a completion: the bytes were never persisted, so every
+        operation's statistics are *cancelled*, not finished, and the tracker
+        entry is dropped so the save loop cannot re-emit against freed blocks.
+        """
+        sid = str(req_id.req_id if isinstance(req_id, SaveOperationId) else req_id)
+        inflight = self._save_inflight.pop(sid, None)
+        if inflight is not None:
+            for operation in inflight:
+                self._cancel_save_statistics(operation)
+        sidecar = self._sidecar_save_inflight.pop(sid, None)
+        if sidecar is not None:
+            self._cancel_save_statistics(sidecar[0])
+        self._save_tracker.pop(sid, None)
+
+    def release_stalled_save(self, seq) -> None:
+        """Drop bookkeeping for a stall-escaped save the scheduler is freeing.
+
+        No-op on DSV4: like dense, its `should_defer_free` has no stall escape,
+        so a request with a pending page or sidecar save always defers and is
+        never preemptable. Defined so every offload impl answers the scheduler's
+        `release_stalled_save` forward uniformly (the mixin declares it abstract).
+        """
 
     def connector_completion(self, completion: ConnectorCompletion) -> bool:
         """Apply one TP-aggregated completion owned by the DSV4 scheduler."""

@@ -36,6 +36,13 @@ _WAITING_SINCE: dict[int, float] = {}
 # merging this way hands them what reading each chunk separately would have.
 _LATEST_WINS = ("finish_reason", "kv_transfer_params", "num_cached_tokens")
 
+# Stands in for the decoded text of one token when the run has declared its own
+# output meaningless -- forced speculative acceptance, today. It says what it is,
+# so a dump of such a run cannot be mistaken for something the model wrote, and
+# it carries no marker any dialect or tool-call format intercepts, so it reaches
+# the client whatever the model is.
+SYNTHETIC_TOKEN_TEXT = "synthetic "
+
 
 @dataclass
 class IncrementalStreamDetokenizer:
@@ -48,8 +55,19 @@ class IncrementalStreamDetokenizer:
     tokens: array.array = field(default_factory=new_token_ids)
     prefix_offset: int = 0
     read_offset: int = 0
+    # Emitted once per token in place of the decoded text, for runs whose text
+    # is a byproduct rather than an answer. See `SYNTHETIC_TOKEN_TEXT`.
+    synthetic_text: str | None = None
 
     def update(self, token_ids: list[int], finished: bool) -> str:
+        decoded = self._decode(token_ids, finished)
+        if self.synthetic_text is None:
+            return decoded
+        # Decoded and thrown away: the run is measuring throughput, and skipping
+        # the work would make the server look faster than the one being measured.
+        return self.synthetic_text * len(token_ids)
+
+    def _decode(self, token_ids: list[int], finished: bool) -> str:
         self.tokens.extend(token_ids)
         prefix_text = self.tokenizer.decode(
             self.tokens[self.prefix_offset : self.read_offset],
@@ -73,12 +91,17 @@ class IncrementalStreamDetokenizer:
 def merge_chunk(into: dict, new: dict) -> None:
     """Fold ``new`` into the chunk already waiting. ``into`` is modified.
 
-    ``text`` and ``token_ids`` are deltas, so concatenating them is exact.
-    ``token_ids`` is rebuilt rather than extended: the first chunk's list is the
-    engine's own ``output_tokens``, which must not be appended to.
+    Both deltas extend in place: ``into`` holds the copy ``put_nowait`` took,
+    and rebuilding them walked the whole accumulation on every merge.
     """
-    into["token_ids"] = [*into.get("token_ids", ()), *new.get("token_ids", ())]
-    into["text"] = into.get("text", "") + new.get("text", "")
+    into["token_ids"].extend(new.get("token_ids") or ())
+    # Popped so the string has one reference and CPython grows it in place;
+    # assigning `into["text"] + ...` back reallocates and copies per merge.
+    text = into.pop("text", "")
+    try:
+        text += new.get("text", "")
+    finally:
+        into["text"] = text
     into["finished"] = bool(into.get("finished") or new.get("finished"))
     for key in _LATEST_WINS:
         if new.get(key):
@@ -117,6 +140,9 @@ class StreamOutputCollector:
             tag, chunk = None, payload
         waiting = self._pending.get(tag)
         if waiting is None:
+            # A merge extends this list, so it has to be ours. The scheduler
+            # already copies per step, but that is too far away to rely on.
+            chunk["token_ids"] = list(chunk.get("token_ids") or ())
             self._pending[tag] = chunk
         else:
             merge_chunk(waiting, chunk)
@@ -222,13 +248,16 @@ class StreamBatchDispatcher:
     remember to remove.
     """
 
-    def __init__(self, tokenizer: Any):
+    def __init__(self, tokenizer: Any, synthetic_text: str | None = None):
         self.tokenizer = tokenizer
+        self.synthetic_text = synthetic_text
         self._thread_local = threading.local()
 
     def new_state(self) -> IncrementalStreamDetokenizer:
         """Make the detokenizer for one stream, for its callback to hold."""
-        return IncrementalStreamDetokenizer(self.tokenizer)
+        return IncrementalStreamDetokenizer(
+            self.tokenizer, synthetic_text=self.synthetic_text
+        )
 
     def enqueue(
         self,

@@ -287,6 +287,7 @@ existing TP ranks, so `world = tp` and `tp` must be divisible by `dcp`.
 | Flag / Variable | Default | Purpose |
 |-----------------|---------|---------|
 | `-dcp N` / `--decode-context-parallel-size N` | `1` | Enable DCP with size `N`. `world = tp`; requires `tp % N == 0` |
+| `--dcp-config '{...}'` | see below | JSON dict of the four DCP knobs (`interleave_size`, `enable_query_replication`, `enable_project_before_merge`, `comm_backend`). Unknown keys raise. See [`--dcp-config`](#--dcp-config-the-four-dcp-knobs) |
 | `--kv-cache-dtype fp8` | `auto` | Supported with DCP (per-tensor scale). `auto`/`bf16` also fine |
 | `--enable_prefix_caching` | off | Supported with DCP |
 | `--enable_chunked_prefill` / `--no-enable_chunked_prefill` | on | Chunked prefill is supported with DCP; on by default |
@@ -301,7 +302,92 @@ existing TP ranks, so `world = tp` and `tp` must be divisible by `dcp`.
 
 ```bash
 -dcp N                          # or --decode-context-parallel-size N; world = tp, tp % N == 0
+--dcp-config '{"..."}'          # JSON dict of DCP tuning knobs; see below
 ```
+
+## `--dcp-config`: the four DCP knobs
+
+Everything DCP-specific beyond `-dcp N` lives in one JSON dict rather than four
+top-level flags. It is parsed straight into `DCPConfig` (`atom/config.py`), and
+**unknown keys raise** so a typo fails at startup instead of silently doing
+nothing.
+
+```bash
+--dcp-config '{"interleave_size": 16, "enable_query_replication": true}'
+```
+
+| Key | Type | Default | What it does |
+|-----|------|---------|--------------|
+| `interleave_size` | int | `1` | KV-cache interleave granularity `S`: token `i` lives on DCP rank `(i // S) % W`. `1` = token-level round-robin |
+| `enable_query_replication` | bool | `true` | Replicate the MLA query projection across the DCP group at load time, so each rank produces the whole group's head set locally and the per-step decode AllGather Q disappears |
+| `enable_project_before_merge` | bool | `true` | Apply the V up-projection *before* the DCP output merge, so the merge exchanges `v_head_dim` per head instead of `kv_lora_rank` |
+| `comm_backend` | str | `"a2a"` | Which collective pattern merges the per-rank partial attention: `"a2a"` or `"ag_rs"` |
+
+> **Three of the four default to the new behaviour.** A control run that wants
+> the old path must say so **explicitly** — passing nothing re-runs the new
+> configuration, which silently turns an A/B into a no-op:
+>
+> ```bash
+> --dcp-config '{"enable_query_replication": false, "enable_project_before_merge": false, "comm_backend": "ag_rs"}'
+> ```
+
+### `interleave_size`
+
+Block-level interleave (`S > 1`) keeps `S` consecutive tokens on one rank
+instead of striping every token. Constraints, all asserted at startup:
+
+- `1 <= interleave_size <= kv_cache_block_size`
+- `kv_cache_block_size % interleave_size == 0` when `S > 1` — the local-index
+  math `(i // (S*W)) * S + i % S` depends on it
+- `S > 1` requires `-dcp > 1`, and is **incompatible with speculative decode**
+  (the `qlen>1` verify cprr MLA kernel assumes token-level interleave)
+
+### `enable_query_replication` (QREP)
+
+Removes one collective per decode step by paying for it once at load time. It is
+**auto-disabled with a warning** (not an error) when the combination is not
+wired, so it can default on without breaking mixed runs:
+
+| Condition | Reason logged |
+|-----------|---------------|
+| `-dcp 1` | `decode_context_parallel_size <= 1 (no DCP group)` — no AllGather Q to remove |
+| speculative decode (MTP / eagle3 / DSpark) | `speculative decode (qlen>1 cprr path)` |
+| fp4 (`ATOM_USE_TRITON_MXFP4_BMM=1`) | `fp4 (mxfp4) BMM weights` — different scale structure |
+
+Check the server log for `query_replication disabled: ...` to see whether it
+actually took effect; the flag being `true` is not the same as QREP running.
+
+Note it costs KV budget: replicating the query heads shrinks the KV pool by
+roughly 5% (measured on DeepSeek-R1 tp8/dcp8: 235 016 → 221 020 blocks).
+
+### `enable_project_before_merge` (PBM)
+
+The merge is a per-(token, head) scalar weighting plus a cross-rank sum, and
+`W_V` is a per-head linear map, so the two commute — the merged output is the
+same either way, but merging *after* the projection moves `v_head_dim` per head
+instead of `kv_lora_rank`. The payload ratio is `kv_lora_rank / v_head_dim`:
+
+| Model | Ratio |
+|-------|-------|
+| DeepSeek-R1 / V3.2 | 4x |
+| GLM-5.2 (`v_head_dim=256`) | 2x |
+
+Covers both decode and sparse prefill. Costs a DCP-group-wide copy of `W_V`
+(gathered at load time). Auto-disabled for fp4 and for `-dcp 1`.
+
+### `comm_backend`
+
+Both backends compute the same thing and are **mathematically equivalent but not
+bitwise identical** (different summation order, and `a2a` round-trips the fp32
+LSE through two 16-bit halves of a bf16 buffer).
+
+| Value | Pattern | Collectives |
+|-------|---------|-------------|
+| `a2a` (default) | one all-to-all with the LSE packed alongside the output, combine done locally | **1** |
+| `ag_rs` | AllGather LSE + local correct + ReduceScatter output | 2 |
+
+Byte counts are about the same; what `a2a` saves is one collective's launch and
+sync.
 
 ## Launching server
 
@@ -434,30 +520,38 @@ hit it.
 DeepSeek-R1 never needed this: 128 heads at `-tp 8` is 16 per rank, and the dcp8
 gather lands on 128 exactly.
 
-### The gqa=64 exception (non-persistent fp8 decode)
+### Sparse DCP persistent attention and gqa=64
 
-One of those four native widths is not always available: with an **fp8 Q and an
-fp8 KV cache**, aiter serves gqa=64 only from the **persistent** decode kernel
-and aborts the process otherwise (`asm_mla.cu`: *"fp8/fp8 with gqa_ratio=64 only
-supports persistent mode"*). A DCP decode that cannot be persistent therefore
-rounds a gathered 64 up to **128** instead of taking 64. Two situations force
-non-persistent:
+With an **fp8 Q and an fp8 KV cache**, aiter serves gqa=64 only from the
+**persistent** decode kernel and aborts the process otherwise (`asm_mla.cu`:
+*"fp8/fp8 with gqa_ratio=64 only supports persistent mode"*).
 
-- **sparse MLA / DSA under DCP** — the per-rank top-k compaction makes the sparse
-  region length depend on the layer, which work metadata built once per step
-  cannot describe (see `_forward_decode`);
-- **gfx942**, which ships no lse-emitting persistent kernel at all.
+Native sparse MLA / DSA attention under DCP handles this on gfx950 by rebuilding
+the persistent work/reduce metadata after every **full IndexShare layer**
+compacts its rank-local top-k. The rebuild consumes that layer's
+`dcp_sparse_kv_indptr`; following shared layers reuse the same indices, compact
+indptr, and work plan. This makes the persistent descriptors and the actual
+sparse regions agree without rebuilding metadata on shared layers.
 
-`mla_dcp_decode_is_persistent` decides this once at construction, so the width
-the module pads to and the width the persistent descriptors are planned for
-cannot disagree.
+The implementation is scoped to native, non-speculative serving on gfx950 with
+page size 1: decode is q_len=1, while sparse prefill is represented as per-token
+virtual q_len=1 rows. Unsupported paths (including gfx942 and plugin or
+speculative sparse DCP paths without the per-layer rebuild) remain
+non-persistent and round a gathered 64 up to **128**.
 
-**GLM-5.2 is the model that lands on it**: 64 query heads at `-tp 8` is 8 per
-rank, so `-dcp 8` gathers exactly 64 — sparse, hence non-persistent, hence padded
-to 128. Half the kernel's heads are padding in that configuration; making it 64
-means giving sparse + DCP a persistent path first.
+**GLM-5.2 is the model that benefits**: 64 query heads at `-tp 8` is 8 per
+rank, so `-dcp 8` gathers exactly 64 and now dispatches the native persistent
+gqa64 kernel instead of padding to 128. `-tp 4 -dcp 4` has the same gathered
+width and uses the same persistent gqa64 path.
 
-**Validated** (ATOM server, 8×MI355 gfx950, `-tp 8 -dcp 8`, fp8 KV, full 1319
+**Validated** (native ATOM, MI355 gfx950, GLM-5.2-MXFP4, fp8 KV, no
+speculative decode): both `-tp 8 -dcp 8` and `-tp 4 -dcp 4` complete CUDA graph
+capture, short decode, 7.7k-token sparse prefill/decode, and the full 1319
+GSM8K 5-shot set. Both topologies score **flexible-extract 0.9689 /
+strict-match 0.9666**. The TP8/DCP8 run also completes a 32-concurrent graph
+smoke with no traceback, HIP error, or engine failure.
+
+**Kimi-K3 validated** (ATOM server, 8×MI355 gfx950, `-tp 8 -dcp 8`, fp8 KV, full 1319
 GSM8K 5-shot at 64 concurrency): **flexible-extract 0.9553 / strict-match
 0.9553**, inside the [Kimi-K3 recipe](../recipes/Kimi-K3.md)'s
 0.9538–0.9591 band. Prefix caching was **off** for that run, matching the
@@ -558,7 +652,7 @@ contributing under DCP rather than collapsing back to single-token decode.
 | prefix caching / chunked prefill | Supported (dense and sparse / DSA). On **Kimi-K3** the validated configuration has prefix caching **off**, per its recipe |
 | Kimi-K3 KDA layers | Not sharded — the KDA recurrent state is per-request, not paged, so DCP frees only the MLA share of attention memory |
 | Kimi-K3 gathered head width | Padded to a natively dispatched MLA width (16 / 32 / 64 / 128); past 128 it falls back to the folded kernel with a warning — lower `-dcp` or raise `-tp` |
-| gathered head width 64 + fp8 KV | Only the persistent kernel serves gqa=64 on fp8 Q/KV, so a non-persistent DCP decode (sparse / DSA, or any DCP decode on gfx942) pads to 128 instead — see [the gqa=64 exception](#the-gqa64-exception-non-persistent-fp8-decode) |
+| gathered head width 64 + fp8 KV | Native sparse / DSA prefill and q_len=1 decode on gfx950 rebuild persistent metadata per full IndexShare layer and run gqa64 directly; unsupported non-persistent paths still pad to 128 — see [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64) |
 | speculative decode (MTP), dense MLA | Supported on **gfx950 only** (bf16/fp8, `num_speculative_tokens` 1–3); raises at startup on gfx942 |
 | speculative decode (DSpark), Kimi-K3 | Supported on gfx950; validated at `tp8 -dcp 8` with `num_speculative_tokens 2` |
 | speculative decode (MTP), sparse / DSA | **Not supported** — sparse decode with `q > 1` under DCP is rejected by an assert |
@@ -570,10 +664,10 @@ contributing under DCP rather than collapsing back to single-token decode.
 | File | Description |
 |------|-------------|
 | `atom/model_engine/arg_utils.py` | `--decode-context-parallel-size` / `-dcp` CLI |
-| `atom/config.py` | DCP validation (`tp % dcp == 0`); spec-decode + DCP arch gate (gfx950) |
+| `atom/config.py` | `DCPConfig` (the four `--dcp-config` knobs) + their validation; `qrep_unsupported_reason` auto-gating; DCP validation (`tp % dcp == 0`); spec-decode + DCP arch gate (gfx950) |
 | `atom/model_engine/block_manager.py` | Interleaved block allocation; prefix-cache virtual-block accounting |
 | `atom/distributed/dcp_utils.py` | DCP distributed-access layer: `get_dcp_world_size` / `dcp_is_enabled` / `get_dcp_group` / `get_dcp_rank` |
-| `atom/model_ops/dcp_ops.py` | AG+RS LSE-combine, `reorg_kvcache`, local compressed-KV gather, `dcp_all_gather` / `dcp_all_gather_query_heads` (custom-collective AllGather) |
+| `atom/model_ops/dcp_ops.py` | Both merge backends -- `cp_lse_ag_out_rs` (AG+RS LSE-combine) and `cp_lse_a2a` (all-to-all pack / unpack-combine kernels); `reorg_kvcache`, local compressed-KV gather, `dcp_all_gather` / `dcp_all_gather_query_heads` (custom-collective AllGather) |
 | `atom/model_ops/attention_mla.py` | Server-mode DCP decode + prefix-cache / chunked-prefill context; `mla_dcp_kernel_num_heads` / `mla_dcp_decode_is_persistent` gathered-head-width padding |
 | `atom/model_ops/attentions/aiter_mla.py`, `attentions/backends.py` | DCP decode / prefill metadata (interleaved slot_mapping, local seq lens) |
 | `atom/plugin/vllm/attention/layer_mla.py`, `attention/metadata.py` | vllm-atom plugin DCP decode + prefill context; persistent-metadata head sizing |

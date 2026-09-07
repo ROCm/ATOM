@@ -431,6 +431,9 @@ class SGLangGDNForwardContext:
                 v_cache=layer_cache.temporal,
                 k_scale=None,
                 v_scale=None,
+                # Slot-addressed recurrent state, not paged KV -- see
+                # `KVCacheTensor.per_request_state`.
+                per_request_state=True,
             )
         return out
 
@@ -454,7 +457,7 @@ class SGLangGDNForwardContext:
         effective_forward_mode = (
             global_forward_mode if global_forward_mode is not None else mode
         )
-        dp_uniform_decode = not enable_dp_attention or bool(
+        running_tokens_are_unified = not enable_dp_attention or bool(
             effective_forward_mode.is_decode_or_idle()
         )
         return (
@@ -462,9 +465,13 @@ class SGLangGDNForwardContext:
                 positions=forward_batch.positions,
                 is_prefill=is_prefill,
                 is_dummy_run=mode.is_idle(),
-                batch_size=forward_batch.batch_size,
-                graph_bs=forward_batch.batch_size,
-                dp_uniform_decode=dp_uniform_decode,
+                scheduled_bs=forward_batch.batch_size,
+                running_bs=forward_batch.batch_size,
+                # `num_tokens` is already this step's flat row count, so no
+                # per-request multiplier is needed (nor available here).
+                scheduled_tokens=num_tokens,
+                running_tokens=num_tokens,
+                running_tokens_are_unified=running_tokens_are_unified,
             ),
             num_tokens,
         )

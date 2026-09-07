@@ -182,6 +182,40 @@ class TestBuildSamplingParams:
             )
 
 
+class TestDPSessionAffinityHeaders:
+    def test_disabled_drops_session_metadata(self, monkeypatch):
+        monkeypatch.setenv("ATOM_DP_SESSION_AFFINITY", "0")
+        request = SimpleNamespace(
+            headers={
+                "x-dynamo-session-id": "child",
+                "x-dynamo-parent-session-id": "parent",
+            }
+        )
+        assert api_server._get_dp_session_affinity_ids(request) == (None, None)
+
+    def test_extracts_dynamo_session_lineage(self, monkeypatch):
+        monkeypatch.setenv("ATOM_DP_SESSION_AFFINITY", "1")
+        request = SimpleNamespace(
+            headers={
+                "x-dynamo-session-id": "child",
+                "x-dynamo-parent-session-id": "parent",
+                "x-correlation-id": "fallback",
+            }
+        )
+        assert api_server._get_dp_session_affinity_ids(request) == (
+            "child",
+            "parent",
+        )
+
+    def test_correlation_id_is_session_fallback(self, monkeypatch):
+        monkeypatch.setenv("ATOM_DP_SESSION_AFFINITY", "true")
+        request = SimpleNamespace(headers={"x-correlation-id": "session"})
+        assert api_server._get_dp_session_affinity_ids(request) == (
+            "session",
+            None,
+        )
+
+
 class TestAnthropicSamplingParams:
     def test_request_overrides_model_then_neutral_defaults(self, monkeypatch):
         captured = {}

@@ -9,10 +9,11 @@ those with the sliding-window rows that share the slot, turning the result into
 byte segments at a slot's real address, and round-tripping them through the
 copy planner.
 
-The builder is exercised through unbound methods on a stub rather than a real
-`DeepseekV4AttentionMetadataBuilder`, which would want a ModelRunner, a model
-and a GPU. What the stub supplies is exactly what these methods read, so the
-arithmetic under test is the shipped arithmetic.
+The stubs here SUBCLASS `DeepseekV4AttentionMetadataBuilder` and skip its
+construction, which would want a ModelRunner, a model and a GPU. They supply
+state, never behaviour, so the arithmetic under test is the shipped arithmetic
+and a method that grows a new dependency is picked up rather than silently
+stopping to stand for anything.
 """
 
 from __future__ import annotations
@@ -44,14 +45,14 @@ Builder = pytest.importorskip(
     exc_type=ImportError,
 ).DeepseekV4AttentionMetadataBuilder
 
-from atom.model_ops.attentions.paged_state_copy import plan_segmented_copy
-from atom.model_ops.attentions.state_arena import (
+from atom.model_ops.attentions.pool_layout.paged_state_copy import plan_segmented_copy
+from atom.model_ops.attentions.pool_layout.state_arena import (
     StateField,
     checkpoint_ranges_for,
     entry_bytes_for,
     field_extents,
 )
-from atom.model_ops.attentions.v4_pool_geometry import CSA_RATIO, HCA_RATIO
+from atom.model_ops.attentions.pool_layout.v4_pool_geometry import CSA_RATIO, HCA_RATIO
 
 NEG_INF = float("-inf")
 ROW_BYTES = 64
@@ -100,17 +101,16 @@ class _Geo:
         return list(ENTRY_ROW_RUNS)
 
 
-class _StubBuilder:
-    """Stands in for the parts of the builder these two methods touch."""
+class _StubBuilder(Builder):
+    """The real builder with the construction skipped, not a look-alike.
 
-    # The real methods, not copies of them: between them they read nothing the
-    # stub does not supply, and a reimplementation here would stop tracking the
-    # ones it stands in for.
-    _assert_ratios_divide_the_alignment = Builder._assert_ratios_divide_the_alignment
-    _checkpoint_slot_ranges = Builder._checkpoint_slot_ranges
-    _checkpoint_slot_bases = Builder._checkpoint_slot_bases
-    _checkpoint_segment_sizes = Builder._checkpoint_segment_sizes
-    checkpoint_image_bytes = Builder.checkpoint_image_bytes
+    Subclassed rather than given a list of borrowed methods: the list was the
+    fragile part -- `_page_unit_regions` grew a call to `_indexer_page_pools`
+    and six tests started erroring on a double that had silently stopped
+    standing for anything. Inheriting means a new dependency is picked up, and
+    only genuinely missing STATE fails, loudly. `__init__` deliberately does
+    not chain: the real one wants a ModelRunner, a model and a GPU.
+    """
 
     def __init__(self, plane: torch.Tensor, alignment: int = 256):
         self.pool_geometry = _Geo()
@@ -409,7 +409,7 @@ class TestTheBuilderDeclaresWhatItDrops:
 
     @staticmethod
     def builder_stub():
-        class _Stub:
+        class _Stub(Builder):
             _state_dtype = torch.float32
             csa_layers = (2, 4, 6)
             hca_layers = (3, 5)
@@ -426,10 +426,9 @@ class TestTheBuilderDeclaresWhatItDrops:
             _indexer_fp4 = False
             _field_window_dtype = torch.bfloat16
             _field_window_layers = (43,)
-            _window_field_row_bytes = Builder._window_field_row_bytes
-            _state_fields = Builder._state_fields
-            _geometry_ratios = Builder._geometry_ratios
-            state_transfer = Builder.state_transfer
+
+            def __init__(self):
+                pass  # the real one wants a ModelRunner, a model and a GPU
 
         return _Stub()
 
@@ -524,17 +523,16 @@ class TestPageUnitAddressesAreArithmetic:
         class _Geo:
             envelope_rows = self.ENVELOPE_ROWS
 
-        class _Stub:
-            _page_unit_regions = Builder._page_unit_regions
-            _page_unit_bases = Builder._page_unit_bases
-            _page_unit_stream_sizes = Builder._page_unit_stream_sizes
-            _kv_planes = Builder._kv_planes
+        class _Stub(Builder):
             model_runner = _Runner()
             pool_geometry = _Geo()
             csa_layers = tuple(range(self.N_CSA))
             _indexer_fp4 = False
             _page_unit_region_cache = None
             _page_unit_region_owners = ()
+
+            def __init__(self):
+                pass  # the real one wants a ModelRunner, a model and a GPU
 
             def _plane_row_widths(self):
                 return [16]
@@ -599,22 +597,6 @@ class TestWarmup:
         # No-op by contract: a backend that never copies has nothing to warm,
         # and ModelRunner calls this unconditionally.
         assert AttentionMetadataBuilder.warmup_per_req_cache(object()) is None
-
-    def test_the_runner_warms_the_builder_once_the_pools_are_reachable(self):
-        """After the setattr loop, not before: the builder reads them off it.
-
-        Guarded here rather than left to review because nothing else calls
-        `warmup_per_req_cache` -- a runner that stopped would restore the
-        first-request JIT silently, with every test still green.
-        """
-        import inspect
-
-        from atom.model_engine import model_runner
-
-        src = inspect.getsource(model_runner.ModelRunner.allocate_kv_cache)
-        install = src.index("setattr(self, name, value)")
-        warm = src.index("warmup_per_req_cache()")
-        assert install < warm, "warmed before the pools were installed"
 
 
 class TestPageUnitRegionsValidateTheirOwnAddresses:

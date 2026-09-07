@@ -45,6 +45,7 @@ class PluginConfig:
     vllm_scheduler_config: Any = None
     vllm_cache_config: Any = None
     vllm_quant_config: Any = None
+    vllm_use_atom_attention: bool = True
 
     # sglang specific
     sglang_model_opt_config: Any = None
@@ -300,6 +301,9 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
     )
 
     vllm_quant_config = config.quant_config
+    vllm_use_atom_attention = os.getenv(
+        "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", "0"
+    ).lower() not in ("1", "true", "yes")
 
     plugin_config = PluginConfig(
         # common config
@@ -314,6 +318,7 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         vllm_scheduler_config=vllm_scheduler_config,
         vllm_cache_config=vllm_cache_config,
         vllm_quant_config=vllm_quant_config,
+        vllm_use_atom_attention=vllm_use_atom_attention,
     )
 
     # specific

@@ -302,7 +302,7 @@ def patch_deepseek_v4_attention_for_sglang(attn: nn.Module) -> None:
                 num_reqs = (
                     int(state_slots.shape[0])
                     if torch.is_tensor(state_slots)
-                    else int(getattr(fc.context, "batch_size", 1))
+                    else int(getattr(fc.context, "scheduled_bs", 1))
                 )
                 num_real = int(getattr(attn_md, "max_seqlen_q", 1)) * num_reqs
             else:
@@ -326,7 +326,6 @@ def patch_deepseek_v4_attention_for_sglang(attn: nn.Module) -> None:
 
                 for name in (
                     "batch_id_per_token",
-                    "batch_id_per_token_cpu",
                     "skip_prefix_len_csa",
                 ):
                     slice_attr(name, num_real)

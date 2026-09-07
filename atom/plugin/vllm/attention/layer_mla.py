@@ -798,10 +798,16 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         q,
         kv_c_and_k_pe_cache,
         attn_metadata,
+        q_prepadded: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         assert isinstance(q, torch.Tensor)
-        original_num_heads = q.shape[1]
-        q = self._pad_decode_query_heads(q)
+        if q_prepadded:
+            # The fused q write already produced the padded width, so q.shape[1]
+            # is the kernel width and the real head count is this rank's own.
+            original_num_heads = self.num_heads
+        else:
+            original_num_heads = q.shape[1]
+            q = self._pad_decode_query_heads(q)
         B = q.shape[0]
         num_heads_q = q.shape[1]
         o = torch.empty(
@@ -862,6 +868,27 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
 
         return_lse = self.dcp_world_size > 1
 
+        # DCP + multi-token decode (DSpark verify, MTP): KV is round-robin
+        # sharded, so a causal intra-block mask has to be placed on GLOBAL
+        # positions g(j) = j * world + rank rather than on the rank-local row
+        # order the kernel otherwise sees. Handing over g_kv_indptr plus the
+        # cp world/rank selects aiter's cprr variant, which does exactly that.
+        # A single-token decode needs no mask (one query, all local KV), and
+        # neither does a bidirectional block -- DSpark drafts non-causally, so
+        # every query legitimately sees every KV row.
+        decode_md = attn_metadata.decode
+        cp_world_size = 1
+        cp_rank = 0
+        g_kv_indptr = None
+        if self.dcp_world_size > 1 and decode_md.max_qo_len > 1 and decode_md.causal:
+            cp_world_size = self.dcp_world_size
+            cp_rank = self.dcp_rank
+            g_kv_indptr = decode_md.g_kv_indptr
+            assert g_kv_indptr is not None, (
+                "causal multi-token decode under DCP requires "
+                "attn_metadata.decode.g_kv_indptr from the metadata builder"
+            )
+
         _, lse = mla_decode_fwd(
             q,
             kv_buffer.view(-1, 1, 1, q.shape[-1]),
@@ -881,6 +908,10 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             q_scale=self._q_scale,
             kv_scale=self._k_scale,
             return_lse=return_lse,
+            g_kv_indptr=g_kv_indptr,
+            cp_world_size=cp_world_size,
+            cp_rank=cp_rank,
+            causal=decode_md.causal,
         )
         if do_fold:
             o = o.view(ori_total_s, ori_nhead, -1)
@@ -1093,20 +1124,37 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                     transpose_bm=True,
                 )
 
+            # Fold the query-head pad into the fused q write instead of paying a
+            # separate pad kernel per layer: allocate at the width the MLA kernel
+            # dispatches on, zeroed so the dead lanes match what F.pad produced,
+            # and hand the writer the real-head slice, which it fills through the
+            # runtime q_out strides it already takes. Only the fused write can do
+            # this, and not under DCP -- decode_q is all-gathered on the head dim
+            # below, so there the pad has to go on after the gather.
+            fused_q_head_pad = (
+                decode_only and self.head_pad > 0 and self.dcp_world_size <= 1
+            )
             if decode_only:
-                decode_q = torch.empty(
-                    (
-                        decode_ql_nope.shape[0],
-                        self.num_heads,
-                        self.kv_lora_rank + self.qk_rope_head_dim,
-                    ),
-                    dtype=(
-                        dtypes.fp8
-                        if self.kv_cache_dtype.startswith("fp8")
-                        else self.dtype
-                    ),
-                    device=decode_ql_nope.device,
+                decode_q_dtype = (
+                    dtypes.fp8 if self.kv_cache_dtype.startswith("fp8") else self.dtype
                 )
+                decode_q_shape = (
+                    decode_ql_nope.shape[0],
+                    self.padded_num_heads if fused_q_head_pad else self.num_heads,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                )
+                if fused_q_head_pad:
+                    decode_q = torch.zeros(
+                        decode_q_shape,
+                        dtype=decode_q_dtype,
+                        device=decode_ql_nope.device,
+                    )
+                else:
+                    decode_q = torch.empty(
+                        decode_q_shape,
+                        dtype=decode_q_dtype,
+                        device=decode_ql_nope.device,
+                    )
                 aiter.fused_qk_rope_concat_and_cache_mla(
                     decode_ql_nope,
                     decode_q_pe,
@@ -1117,7 +1165,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                         -1,
                         self.kv_lora_rank + self.qk_rope_head_dim,
                     ),
-                    decode_q,
+                    decode_q[:, : self.num_heads] if fused_q_head_pad else decode_q,
                     attn_metadata.slot_mapping,
                     self._k_scale,
                     self._q_scale,
@@ -1170,7 +1218,9 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 decode_q = dcp_all_gather_query_heads(self.dcp_group, decode_q)
 
             # call decode attn
-            attn_out, lse = self._forward_decode(decode_q, kv_cache, attn_metadata)
+            attn_out, lse = self._forward_decode(
+                decode_q, kv_cache, attn_metadata, q_prepadded=fused_q_head_pad
+            )
 
             # correct dcp attn_out with lse.
             if self.dcp_world_size > 1:

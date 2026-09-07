@@ -53,45 +53,51 @@ def _fused_cumsum_kkt_kernel(
 
     o_t = tl.arange(0, BT)
 
-    p_g = tl.make_block_ptr(
-        g_ptr + bos * H + i_h, (T_seq,), (H,), (i_t * BT,), (BT,), (0,)
-    )
-    b_g = tl.load(p_g, boundary_check=(0,)).to(tl.float32)
+    _p_g_0 = (i_t * BT) + tl.arange(0, BT)
+    b_g = tl.load(
+        g_ptr + bos * H + i_h + _p_g_0 * (H), mask=(_p_g_0 < (T_seq)), other=0.0
+    ).to(tl.float32)
     b_g_cumsum = tl.cumsum(b_g, axis=0)
-    p_g_out = tl.make_block_ptr(
-        g_cumsum_ptr + bos * H + i_h, (T_seq,), (H,), (i_t * BT,), (BT,), (0,)
+    _p_g_out_0 = (i_t * BT) + tl.arange(0, BT)
+    tl.store(
+        g_cumsum_ptr + bos * H + i_h + _p_g_out_0 * (H),
+        b_g_cumsum.to(g_cumsum_ptr.dtype.element_ty),
+        mask=(_p_g_out_0 < (T_seq)),
     )
-    tl.store(p_g_out, b_g_cumsum.to(p_g_out.dtype.element_ty), boundary_check=(0,))
 
-    p_beta = tl.make_block_ptr(
-        beta_ptr + bos * H + i_h, (T_seq,), (H,), (i_t * BT,), (BT,), (0,)
-    )
-    b_beta = tl.load(p_beta, boundary_check=(0,)).to(tl.float32)
+    _p_beta_0 = (i_t * BT) + tl.arange(0, BT)
+    b_beta = tl.load(
+        beta_ptr + bos * H + i_h + _p_beta_0 * (H),
+        mask=(_p_beta_0 < (T_seq)),
+        other=0.0,
+    ).to(tl.float32)
 
-    p_k = tl.make_block_ptr(
-        k_ptr + (bos * Hg + i_h // (H // Hg)) * K,
-        (T_seq, K),
-        (Hg * K, 1),
-        (i_t * BT, 0),
-        (BT, K),
-        (1, 0),
-    )
-    b_k = tl.load(p_k, boundary_check=(0, 1)).to(tl.float32)
+    _p_k_0 = (i_t * BT) + tl.arange(0, BT)
+    _p_k_1 = (0) + tl.arange(0, K)
+    b_k = tl.load(
+        k_ptr
+        + (bos * Hg + i_h // (H // Hg)) * K
+        + _p_k_0[:, None] * (Hg * K)
+        + _p_k_1[None, :] * (1),
+        mask=(_p_k_0[:, None] < (T_seq)) & (_p_k_1[None, :] < (K)),
+        other=0.0,
+    ).to(tl.float32)
 
     b_A = tl.dot(b_k, tl.trans(b_k))
     b_g_diff = b_g_cumsum[:, None] - b_g_cumsum[None, :]
     b_A = b_A * safe_exp(b_g_diff) * b_beta[:, None]
     b_A = tl.where(o_t[:, None] > o_t[None, :], b_A, 0.0)
 
-    p_A = tl.make_block_ptr(
-        A_ptr + (bos * H + i_h) * BT,
-        (T_seq, BT),
-        (BT * H, 1),
-        (i_t * BT, 0),
-        (BT, BT),
-        (1, 0),
+    _p_A_0 = (i_t * BT) + tl.arange(0, BT)
+    _p_A_1 = (0) + tl.arange(0, BT)
+    tl.store(
+        A_ptr
+        + (bos * H + i_h) * BT
+        + _p_A_0[:, None] * (BT * H)
+        + _p_A_1[None, :] * (1),
+        b_A.to(A_ptr.dtype.element_ty),
+        mask=(_p_A_0[:, None] < (T_seq)) & (_p_A_1[None, :] < (BT)),
     )
-    tl.store(p_A, b_A.to(A_ptr.dtype.element_ty), boundary_check=(0, 1))
 
 
 def fused_cumsum_kkt(
