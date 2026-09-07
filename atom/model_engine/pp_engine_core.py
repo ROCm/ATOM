@@ -63,11 +63,25 @@ class PPEngineCoreProc(EngineCore):
             self._downstream_busy_loop()
 
     def _head_busy_loop(self):
+        from atom.model_engine.engine_core import (
+            METRICS_PUSH_INTERVAL_S,
+            SCHEDULING_METRICS_INTERVAL_S,
+        )
+
         shutdown = False
+        next_metrics_push = 0.0
+        next_scheduling_push = 0.0
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
-                self.scheduler.heartbeat_throughput(time.monotonic())
+                now = time.monotonic()
+                if now >= next_metrics_push:
+                    next_metrics_push = now + METRICS_PUSH_INTERVAL_S
+                    self.utility_handler.push_metrics()
+                if SCHEDULING_METRICS_INTERVAL_S and now >= next_scheduling_push:
+                    next_scheduling_push = now + SCHEDULING_METRICS_INTERVAL_S
+                    self.utility_handler.push_scheduling_metrics()
+                self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 if shutdown:
                     break
@@ -117,6 +131,7 @@ class PPEngineCoreProc(EngineCore):
                     scheduled_batch.connector_meta_output,
                 )
             self.pp_transport.send_metadata(scheduled_batch)
+            self.scheduler.scheduling_metrics.execute(scheduled_batch, seqs)
             self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
             self.scheduler.mark_pp_inflight(scheduled_batch)
             self._in_flight.append((scheduled_batch, seqs, needs_output))

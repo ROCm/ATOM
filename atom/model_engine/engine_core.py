@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 import pickle
 import queue
 import threading
@@ -47,7 +48,17 @@ logger = logging.getLogger("atom")
 # How often each EngineCore publishes its metrics snapshot. Kept at the API
 # server's scrape interval: the exporter reads a cache, so this bounds how
 # stale a Prometheus sample can be.
-METRICS_PUSH_INTERVAL_S = 5.0
+METRICS_PUSH_INTERVAL_S = float(
+    os.environ.get("ATOM_METRICS_REFRESH_INTERVAL_SECONDS", "5")
+)
+if not 0 < METRICS_PUSH_INTERVAL_S <= 60:
+    raise ValueError("ATOM_METRICS_REFRESH_INTERVAL_SECONDS must be in (0, 60]")
+
+SCHEDULING_METRICS_INTERVAL_S = float(
+    os.environ.get("ATOM_SCHEDULING_METRICS_INTERVAL_SECONDS", "0")
+)
+if not 0 <= SCHEDULING_METRICS_INTERVAL_S <= 60:
+    raise ValueError("ATOM_SCHEDULING_METRICS_INTERVAL_SECONDS must be in [0, 60]")
 
 # Pace of the idle KV drain. The busy loops never block, so an unpaced drain
 # would fire one worker RPC round per spin; 1ms matches the PP head's existing
@@ -340,6 +351,7 @@ class EngineCore:
     def busy_loop(self):
         shutdown = False
         next_metrics_push = 0.0
+        next_scheduling_push = 0.0
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
@@ -347,6 +359,9 @@ class EngineCore:
                 if now >= next_metrics_push:
                     next_metrics_push = now + METRICS_PUSH_INTERVAL_S
                     self.utility_handler.push_metrics()
+                if SCHEDULING_METRICS_INTERVAL_S and now >= next_scheduling_push:
+                    next_scheduling_push = now + SCHEDULING_METRICS_INTERVAL_S
+                    self.utility_handler.push_scheduling_metrics()
                 self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 if shutdown:
@@ -413,6 +428,7 @@ class EngineCore:
         has_seqs = len(scheduled_batch.req_ids) > 0
         if has_seqs:
             self.scheduler.compute_detailed_aggregates(scheduled_batch, seqs)
+            self.scheduler.scheduling_metrics.execute(scheduled_batch, seqs)
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )
@@ -669,6 +685,14 @@ class EngineCore:
                     logger.debug(f"{self.label}: sent READY signal")
                     continue
 
+                if isinstance(item, tuple) and item[0] == "SCHEDULING_METRICS":
+                    socket.send(
+                        pickle.dumps(
+                            (EngineCoreRequestType.SCHEDULING_METRICS, item[1])
+                        )
+                    )
+                    continue
+
                 if isinstance(item, tuple) and item[0] == "METRICS":
                     obj = pickle.dumps((EngineCoreRequestType.METRICS, item[1]))
                     socket.send(obj)
@@ -761,6 +785,7 @@ class DPEngineCoreProc(EngineCore):
     def busy_loop(self):
         shutdown = False
         next_metrics_push = 0.0
+        next_scheduling_push = 0.0
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
@@ -768,6 +793,9 @@ class DPEngineCoreProc(EngineCore):
                 if now >= next_metrics_push:
                     next_metrics_push = now + METRICS_PUSH_INTERVAL_S
                     self.utility_handler.push_metrics()
+                if SCHEDULING_METRICS_INTERVAL_S and now >= next_scheduling_push:
+                    next_scheduling_push = now + SCHEDULING_METRICS_INTERVAL_S
+                    self.utility_handler.push_scheduling_metrics()
                 self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 local_unfinished = (
@@ -1060,6 +1088,7 @@ class PrefillEngineCore(EngineCore):
 
         # Run on the dedicated prefill stream; returns sampled token IDs (one per seq).
         t0 = time.perf_counter()
+        self.scheduler.scheduling_metrics.execute(scheduled_batch, seqs)
         sampled_token_ids = self.runner_mgr.call_func(
             "prefill_forward", scheduled_batch, wait_out=True
         )
@@ -1332,6 +1361,7 @@ class DecodeEngineCore(EngineCore):
         if scheduled_batch is None:
             return False
         t0 = time.perf_counter()
+        self.scheduler.scheduling_metrics.execute(scheduled_batch, seqs)
         fwd_out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
         iter_ms = (time.perf_counter() - t0) * 1000
         logger.info(

@@ -1,0 +1,10 @@
+apiVersion: 1
+datasources:
+  - name: VictoriaMetrics
+    uid: atom-vm
+    type: prometheus
+    access: proxy
+    url: http://victoriametrics:8428
+    isDefault: true
+    jsonData:
+      timeInterval: 1s

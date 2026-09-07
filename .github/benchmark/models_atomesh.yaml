@@ -243,7 +243,7 @@ models:
         # from a fresh ATOM service instead of inheriting HBM prefix-cache state.
         - <<: &glm52_agentic_tp4_tp4
             topology: 1p1d
-            pd_worker_layout: multi_node
+            pd_worker_layout: single_node
             nodes: "${ATOMESH_1P1D_NODES}"
             isl: [1048576]
             osl: 1024
@@ -267,9 +267,12 @@ models:
               tp: 4
               cudagraph: none
             env:
+              prefill:
+                HIP_VISIBLE_DEVICES: "0,1,2,3"
               decode:
+                HIP_VISIBLE_DEVICES: "4,5,6,7"
                 MAX_JOBS: "16"
-            benchmark:
+            benchmark: &glm52_agentic_benchmark
               kind: aiperf_agentic
               aiperf_commit: b7b16cf851885567988a643282266bce74e34437
               scenario: inferencex-agentx-mvp
@@ -321,6 +324,9 @@ models:
         - &glm52_agentic_lmcache_cpp4_dcp4
           <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c48
+          benchmark:
+            <<: *glm52_agentic_benchmark
+            observability: true
           topology: 1p1d_cpp4_dcp4
           pd_worker_layout: single_node
           concurrency: [48]

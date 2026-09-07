@@ -3,6 +3,7 @@
 
 import logging
 import queue
+import time
 from typing import ClassVar
 
 from atom.model_engine.sequence import SequenceStatus
@@ -335,6 +336,21 @@ class EngineUtilityHandler:
         """
         self.output_queue.put_nowait(("METRICS", self.collect_metrics()))
 
+    def push_scheduling_metrics(self) -> None:
+        """Small independent snapshot; never scan KV block/cache accounting here."""
+        snapshot = self.scheduler.scheduling_metrics.snapshot()
+        running, waiting = self.scheduler.get_request_counts()
+        snapshot.update(
+            snapshot_timestamp_seconds=time.time(),
+            requests_waiting=waiting,
+            requests_running=running,
+            requests_partial_prefill=getattr(
+                self.scheduler, "_partial_prefill_count", 0
+            ),
+            requests_parked_kv_load=getattr(self.scheduler, "_num_parked_remote_kv", 0),
+        )
+        self.output_queue.put_nowait(("SCHEDULING_METRICS", snapshot))
+
     def collect_metrics(self) -> dict:
         """One rank's scheduler, KV, MTP, and cache metrics."""
         if self.scheduler is None:
@@ -394,6 +410,7 @@ class EngineUtilityHandler:
                 "mtp": mtp,
                 "cache": cache,
                 "offload": offload,
+                "scheduling": self.scheduler.scheduling_metrics.snapshot(),
             }
             if kv_pool is not None:
                 result |= {

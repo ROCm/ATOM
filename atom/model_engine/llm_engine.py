@@ -332,6 +332,11 @@ class LLMEngine:
 
         return {
             "enabled": bool(rank_stats),
+            "scheduling": {
+                str(rank): stats["scheduling"]
+                for rank, stats in self.core_mgr.latest_metrics.items()
+                if stats.get("enabled", False) and "scheduling" in stats
+            },
             "total_draft_tokens": total_draft_tokens,
             "total_accepted_tokens": total_accepted_tokens,
             "acceptance_rate": (

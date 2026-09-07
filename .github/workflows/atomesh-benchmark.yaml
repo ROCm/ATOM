@@ -78,6 +78,12 @@ on:
         required: false
         default: ''
         type: string
+      observability:
+        description: 'Collect role-separated metrics, streaming events and HTML report (auto enables CPP4+DCP4 agentic cases)'
+        required: false
+        default: auto
+        type: choice
+        options: [auto, 'on', 'off']
       atomesh_image:
         description: 'Override ATOM docker image'
         required: false
@@ -155,12 +161,14 @@ on:
         default: false
         type: boolean
       publish_dashboard:
-        description: 'Publish workflow_dispatch results to the benchmark dashboard'
+        description: 'Publish benchmark dashboard results and clickable observability HTML reports to GitHub Pages'
         required: false
         default: false
         type: boolean
 
 env:
+  ATOMESH_OBSERVABILITY_MODE: ${{ inputs.observability || 'auto' }}
+  ATOMESH_VM_REMOTE_WRITE_URL: ${{ vars.ATOMESH_VM_REMOTE_WRITE_URL || '' }}
   ATOMESH_SLURM_ACCOUNT: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_account != 'auto' && inputs.atomesh_slurm_account || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd' && 'amd-frameworks' || '') }}
   ATOMESH_SLURM_PARTITION: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_partition != 'auto' && inputs.atomesh_slurm_partition || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd' && 'amd-frameworks' || (((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-crusoe-mi355' || (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi355-crusoe') && 'amd-spur' || '')) }}
   ATOMESH_SLURM_SUBMIT_RUNNER: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd') }}
@@ -1312,6 +1320,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       has_results: ${{ steps.summary.outputs.has_results }}
+      has_observability: ${{ steps.observability.outputs.has_reports }}
+      observability_path: ${{ steps.observability.outputs.report_path }}
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
@@ -1322,6 +1332,21 @@ jobs:
           pattern: atomesh-model-benchmark-*
           merge-multiple: true
           path: atomesh-results
+
+      - name: Stage observability pages
+        id: observability
+        run: |
+          python3 .github/scripts/atomesh/observability_pages.py \
+            --source atomesh-results --destination atomesh-observability-site \
+            --run-id "${{ github.run_id }}" --attempt "${{ github.run_attempt }}" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Upload observability pages
+        if: steps.observability.outputs.has_reports == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: atomesh-observability-site
+          path: atomesh-observability-site/
 
       - name: Build benchmark summary
         id: summary
@@ -1430,3 +1455,68 @@ jobs:
           git add benchmark-dashboard/index.html
           git diff --cached --quiet || git commit -m "Update ATOMesh benchmark dashboard"
           git push origin gh-pages
+
+  observability-pages:
+    name: Publish ATOMesh Observability Reports
+    needs: [summarize-results, dashboard]
+    if: >-
+      !cancelled()
+      && needs.summarize-results.result == 'success'
+      && needs.summarize-results.outputs.has_observability == 'true'
+      && (github.event_name == 'schedule'
+          || (github.event_name == 'workflow_dispatch' && inputs.publish_dashboard))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    concurrency:
+      group: gh-pages-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: gh-pages
+
+      - name: Download observability site
+        uses: actions/download-artifact@v8
+        with:
+          name: atomesh-observability-site
+          path: /tmp/atomesh-observability-site
+
+      - name: Configure GitHub Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
+      - name: Store observability reports on gh-pages
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --ff-only origin gh-pages
+          mkdir -p observability
+          cp -a /tmp/atomesh-observability-site/observability/. observability/
+          git add observability
+          git diff --cached --quiet || git commit -m "Publish ATOMesh observability run ${GITHUB_RUN_ID}"
+          git push origin gh-pages
+
+      - name: Upload complete Pages site
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: .
+
+      - name: Deploy Pages site
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Link HTML reports from CI
+        env:
+          REPORT_PATH: ${{ needs.summarize-results.outputs.observability_path }}
+          PAGES_BASE_URL: ${{ vars.ATOMESH_PAGES_BASE_URL || steps.pages.outputs.base_url }}
+        run: |
+          echo "### ATOMesh Observability" >> "$GITHUB_STEP_SUMMARY"
+          echo "[Open HTML reports](${PAGES_BASE_URL%/}/${REPORT_PATH})" >> "$GITHUB_STEP_SUMMARY"
+          echo "Detailed request events remain in the model benchmark artifact." >> "$GITHUB_STEP_SUMMARY"

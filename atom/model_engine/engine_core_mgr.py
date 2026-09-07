@@ -263,6 +263,7 @@ class CoreManager:
         # from EngineCore's own periodic push. Read directly by the exporter, so
         # scraping costs no round trip and cannot time out.
         self.latest_metrics: dict[int, dict] = {}
+        self.latest_scheduling_metrics: dict[int, dict] = {}
 
     def __init__(self, config: Config):
         pp_size = config.pipeline_parallel_size
@@ -650,6 +651,8 @@ class CoreManager:
                                     f"{self.label}: flush_stream_batch failed: {e}",
                                     exc_info=True,
                                 )
+                    elif request_type == EngineCoreRequestType.SCHEDULING_METRICS:
+                        self.latest_scheduling_metrics[dp_rank] = data
                     elif request_type == EngineCoreRequestType.METRICS:
                         self.latest_metrics[dp_rank] = data
                     elif request_type == EngineCoreRequestType.UTILITY_RESPONSE:

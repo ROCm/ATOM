@@ -74,6 +74,7 @@ from .reasoning import (
     thinking_switched_off,
 )
 from .reasoning_dialects import resolve_dialect
+from .request_metrics import RequestObservation
 from .serving_anthropic import (
     AnthropicBlocks,
     AnthropicMessagesRequest,
@@ -357,7 +358,11 @@ _ANTHROPIC_PING_FRAME = event_frame("ping", {"type": "ping"})
 _ANTHROPIC_PING_INTERVAL_SECONDS = 5.0
 _metrics_exporter = AtomMetricsExporter()
 _metrics_refresh_task: asyncio.Task | None = None
-_METRICS_REFRESH_INTERVAL_SECONDS = 5.0
+_METRICS_REFRESH_INTERVAL_SECONDS = float(
+    os.environ.get("ATOM_METRICS_REFRESH_INTERVAL_SECONDS", "5")
+)
+if not 0 < _METRICS_REFRESH_INTERVAL_SECONDS <= 60:
+    raise ValueError("ATOM_METRICS_REFRESH_INTERVAL_SECONDS must be in (0, 60]")
 
 
 def _get_dp_session_affinity_ids(
@@ -863,6 +868,9 @@ async def generate_async(
     token_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
+    observation = RequestObservation(
+        _metrics_exporter.requests, request_id, data_parallel_rank
+    )
     started_at = time.time()
     first_token_at: float | None = None
     last_token_at: float | None = None
@@ -879,6 +887,7 @@ async def generate_async(
     num_cached_tokens_seen = 0
 
     def completion_callback(request_output: RequestOutput):
+        observation.on_output(request_output)
         nonlocal kv_transfer_output_meta_info, num_cached_tokens_seen
         kv_transfer_output_meta_info = getattr(
             request_output, "kv_transfer_params_output", None
@@ -914,6 +923,7 @@ async def generate_async(
     except Exception:
         engine.io_processor.requests.pop(seq.id, None)
         raise
+    observation.num_prompt_tokens = seq.num_prompt_tokens
     engine.core_mgr.add_request([seq])
 
     _finished_ok = False
@@ -990,6 +1000,9 @@ async def generate_async_multimodal(
     token_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
+    observation = RequestObservation(
+        _metrics_exporter.requests, request_id, data_parallel_rank
+    )
     started_at = time.time()
     first_token_at: float | None = None
     last_token_at: float | None = None
@@ -998,6 +1011,7 @@ async def generate_async_multimodal(
     seq = None
 
     def completion_callback(request_output: RequestOutput):
+        observation.on_output(request_output)
         now = time.time()
         loop.call_soon_threadsafe(
             token_queue.put_nowait,
@@ -1026,6 +1040,7 @@ async def generate_async_multimodal(
     except Exception:
         engine.io_processor.requests.pop(seq.id, None)
         raise
+    observation.num_prompt_tokens = seq.num_prompt_tokens
     engine.core_mgr.add_request([seq])
 
     _finished_ok = False
@@ -1107,8 +1122,16 @@ async def generate_async_fanout(
     per_finish_reason: list[str | None] = [None] * n
     finished = [False] * n
 
+    observations = [
+        RequestObservation(
+            _metrics_exporter.requests, request_id, data_parallel_rank, i
+        )
+        for i in range(n)
+    ]
+
     def make_callback(idx: int):
         def _cb(request_output: RequestOutput) -> None:
+            observations[idx].on_output(request_output)
             now = time.time()
             loop.call_soon_threadsafe(
                 shared_queue.put_nowait,
@@ -1147,6 +1170,8 @@ async def generate_async_fanout(
         for seq in seqs:
             engine.io_processor.requests.pop(seq.id, None)
         raise
+    for observation, seq in zip(observations, seqs):
+        observation.num_prompt_tokens = seq.num_prompt_tokens
     engine.core_mgr.add_request(seqs)
     num_tokens_input = seqs[0].num_prompt_tokens
 
@@ -1249,7 +1274,12 @@ async def setup_streaming_request(
     assert _stream_batch_dispatcher is not None
     detokenizer = _stream_batch_dispatcher.new_state()
 
+    observation = RequestObservation(
+        _metrics_exporter.requests, request_id, data_parallel_rank
+    )
+
     def stream_callback(request_output: RequestOutput) -> None:
+        observation.on_output(request_output)
         _send_stream_chunk_direct(
             request_output, request_id, stream_collector, stream_loop, detokenizer
         )
@@ -1292,6 +1322,7 @@ async def setup_streaming_request(
     # %-style, not an f-string: the arguments are formatted only if the
     # record is emitted, and this runs once per request with debug off.
     logger.debug("API: Created request_id=%s, seq_id=%s", request_id, seq_id)
+    observation.num_prompt_tokens = seq.num_prompt_tokens
     engine.core_mgr.add_request([seq])
 
     return seq_id, stream_collector, seq.num_prompt_tokens
@@ -1456,11 +1487,19 @@ async def setup_streaming_request_fanout(
 
     assert _stream_batch_dispatcher is not None
 
+    observations = [
+        RequestObservation(
+            _metrics_exporter.requests, request_id, data_parallel_rank, i
+        )
+        for i in range(n)
+    ]
+
     def make_callback(idx: int):
         # One detokenizer per sibling, held by the closure that feeds it.
         detokenizer = _stream_batch_dispatcher.new_state()
 
         def _cb(request_output: RequestOutput) -> None:
+            observations[idx].on_output(request_output)
             _send_stream_chunk_tagged(
                 request_output,
                 request_id,
@@ -1509,6 +1548,8 @@ async def setup_streaming_request_fanout(
     logger.debug(
         f"API: Created fan-out request_id={request_id}, n={n}, seq_ids={seq_ids}"
     )
+    for observation, seq in zip(observations, seqs):
+        observation.num_prompt_tokens = seq.num_prompt_tokens
     engine.core_mgr.add_request(seqs)
     return seq_ids, shared_collector, seqs[0].num_prompt_tokens
 
@@ -1545,6 +1586,21 @@ async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown."""
     global _metrics_refresh_task
     logger.info("Server started successfully and ready to accept requests")
+    kv_role, _ = (
+        _resolve_kv_transfer_role(engine.config.kv_transfer_config or {})
+        if engine is not None
+        else (None, 0)
+    )
+    _metrics_exporter.requests.configure(
+        model=model_name or "unknown",
+        role={"kv_producer": "prefill", "kv_consumer": "decode"}.get(kv_role, "hybrid"),
+        events_path=os.environ.get("ATOM_REQUEST_EVENTS_PATH"),
+        run_id=os.environ.get("ATOM_OBSERVABILITY_RUN_ID", ""),
+    )
+    if engine is not None:
+        _metrics_exporter.scheduling_provider = (
+            lambda: engine.core_mgr.latest_scheduling_metrics
+        )
     tune_gc()
     maybe_attach_gc_debug_callback("api_server")
     await _refresh_metrics_once()
@@ -1562,6 +1618,7 @@ async def lifespan(app: FastAPI):
             except asyncio.CancelledError:
                 pass
             _metrics_refresh_task = None
+        await asyncio.to_thread(_metrics_exporter.requests.close)
         logger.info("Server shutting down, releasing resources...")
         if engine is not None:
             engine.close()
@@ -2348,6 +2405,15 @@ async def list_models():
 async def health():
     """Health check endpoint."""
     return {"status": "ok"}
+
+
+@app.api_route("/metrics/scheduling", methods=["GET", "HEAD"], include_in_schema=False)
+async def scheduling_metrics():
+    """Expose only cached CPU scheduling data; no engine RPC or KV scan."""
+    return Response(
+        content=_metrics_exporter.render_scheduling(),
+        headers={"Content-Type": _metrics_exporter.content_type},
+    )
 
 
 @app.api_route("/metrics", methods=["GET", "HEAD"], include_in_schema=False)

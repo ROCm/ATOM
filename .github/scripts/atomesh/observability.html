@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ATOM CI · Observability</title>
+<style>
+:root{color-scheme:dark;--bg:#101722;--card:#182333;--border:#30435b;--muted:#aab9cc;--blue:#80bbff}
+*{box-sizing:border-box}body{font:15px system-ui;margin:0;background:var(--bg);color:#e5edf7}main{max-width:1450px;margin:auto;padding:28px}h1{font-size:25px}p{color:var(--muted);line-height:1.6}select,input,button,summary{font:inherit}select,input,button{background:#223047;color:inherit;border:1px solid #526681;border-radius:5px;padding:8px}button,summary,input[type=checkbox]{cursor:pointer}button:hover{background:#304563}button:focus-visible,summary:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--blue);outline-offset:3px}header{display:flex;align-items:center;gap:16px;flex-wrap:wrap}.controls{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin:10px 0 18px}.controls>label{display:flex;align-items:center;gap:8px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(400px,100%),1fr));gap:16px}.card{min-width:0;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:15px}.card-head{display:flex;gap:12px;align-items:flex-start;justify-content:space-between}h3{margin:0 0 10px;font-size:15px}.close-chart{font-size:22px;line-height:20px;padding:0 6px;background:transparent;border-color:transparent;color:var(--muted);flex:none}.plot{position:relative}svg{display:block;width:100%;height:220px;touch-action:pan-y}.plot-tip{position:absolute;z-index:3;pointer-events:none;padding:10px 12px;border:1px solid #6883a6;border-radius:6px;background:#0d1524f5;box-shadow:0 5px 20px #0007;font-size:12px;max-width:min(440px,100%);max-height:220px;overflow:hidden;white-space:pre-line;overflow-wrap:anywhere}.tip-heading{font-weight:600;margin-bottom:6px}.tip-row{margin-top:3px}.chart-note{font-size:12px;margin:0 0 8px;min-height:18px}.legend{display:flex;gap:5px 14px;flex-wrap:wrap;font-size:12px;max-height:80px;overflow:auto}.legend-line{display:inline-block;width:18px;margin-right:5px;border-top:2px solid;vertical-align:middle}.bad{color:#ff9a9a}.good{color:#85ddb3}.info{color:var(--blue)}small{color:var(--muted)}a{color:var(--blue)}pre{white-space:pre-wrap;word-break:break-word}label{display:inline-block;margin:4px 0}#request{margin-top:25px}#hint{min-height:24px}.dropdown{position:relative}.dropdown>summary{border:1px solid #526681;border-radius:5px;background:#223047;padding:8px}.menu{position:absolute;top:calc(100% + 6px);left:0;z-index:10;width:290px;max-width:85vw;padding:12px;background:#182333;border:1px solid #526681;border-radius:8px;box-shadow:0 8px 25px #0008}.menu label{display:flex;align-items:center;gap:9px;margin:0;padding:7px 2px;cursor:pointer}.menu input[type=checkbox]{accent-color:var(--blue);width:16px;height:16px}.menu small{display:block;margin-top:8px}.chart-menu{width:430px}.chart-menu input[type=search]{width:100%}.menu-actions{display:flex;gap:8px;margin:10px 0}.chart-options{max-height:330px;overflow:auto}.timeline{padding:14px 18px;margin-bottom:18px;background:var(--card);border:1px solid var(--border);border-radius:8px}.timeline-head{display:flex;gap:12px;justify-content:space-between;flex-wrap:wrap}.timeline input[type=range]{display:block;width:100%;height:30px;margin:8px 0;padding:0;accent-color:var(--blue);cursor:ew-resize}.timeline-ends{display:flex;justify-content:space-between;font-size:12px;color:var(--muted)}.request-metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:14px 0}.request-metric{border:1px solid var(--border);border-radius:6px;padding:12px}.request-metric strong{display:block;font-size:21px;margin-top:6px}.empty{padding:20px;color:var(--muted)}[hidden]{display:none!important}@media(max-width:600px){main{padding:14px}.controls{gap:10px}.menu{position:fixed;top:20%;left:5%;max-width:90vw;width:90vw}svg{height:195px}}
+</style>
+<main>
+<header><h1>ATOM CI · Observability</h1><small>Interactive metrics report</small></header>
+<div class="controls">
+<details class="dropdown" id="quantiles"><summary>Quantiles: <span id="quantileSummary">P50 + P90</span></summary><div class="menu">
+<label><input type="checkbox" name="quantile" value="0.5" checked>P50</label><label><input type="checkbox" name="quantile" value="0.9" checked>P90</label><label><input type="checkbox" name="quantile" value="0.95">P95</label><label><input type="checkbox" name="quantile" value="0.99">P99</label><small>Select one or more quantiles. Gauges are shown once and do not have quantiles.</small></div></details>
+<label>Layout <select id="layout"><option value="overlay">Overlay</option><option value="separate">Separate charts</option></select></label>
+<label>Role <select id="role"><option value="all">All</option><option>prefill</option><option>decode</option><option>router</option><option>gpu</option><option>collection</option></select></label>
+<label>Time window <select id="window"><option value="10">10 seconds</option><option value="60" selected>1 minute</option><option value="300">5 minutes</option><option value="0">All</option></select></label>
+<details class="dropdown" id="chartVisibility"><summary>Charts: <span id="chartCount"></span></summary><div class="menu chart-menu"><input id="chartSearch" type="search" placeholder="Find a chart" aria-label="Find a chart"><div class="menu-actions"><button id="showCharts">Show matching</button><button id="hideCharts">Hide matching</button></div><div class="chart-options" id="chartOptions"></div><small>Close a chart with ×. Check its name here to restore it.</small></div></details>
+</div>
+<div class="timeline"><div class="timeline-head"><label for="position">Move time window</label><output id="timeWindow" for="position window"></output></div><input id="position" type="range" min="0" max="1000" step="1" value="1000" aria-label="Move time window"><div class="timeline-ends"><span id="runStart"></span><span id="runEnd"></span></div></div>
+<p id="run"></p><div id="checks"></div>
+<p>All timestamps are UTC. Full metrics are sampled every 1 second; scheduling and batch metrics every 100ms. Request quantiles use a 30-second window and scheduling/batch quantiles a 1-second window. Histogram quantiles are approximate; last-value curves show the most recently submitted real batch. Prefill and decode are aggregated separately. Hover over a chart to see sample values and a shared time cursor.</p>
+<p>TPOT is computed once per completed request choice: (last output time − first output time) / (output tokens − 1). The overview shows quantiles across completed request choices, not one request's token-by-token latency. Inspect a request below for its own TPOT and output batch intervals. ATOM measures engine callbacks; see AIPerf for client-side SSE timing.</p>
+<details><summary>Request event summary for the entire run (exact sample quantiles)</summary><pre id="eventSummary"></pre></details>
+<div class="grid" id="panels"></div>
+<section class="card" id="request"><h2>Streaming requests · Per-request metrics</h2>
+<p>Select a prefill or decode JSONL file from the artifact events/ directory. Load request IDs, then select a request and choice. MTP may emit multiple tokens per callback: the charts retain output batch intervals and token counts, not client SSE arrival times or inferred per-token timestamps. Unfinished or cancelled requests may have only output_chunk events. Event logs remain in the CI artifact.</p>
+<label>Event file <input type="file" id="eventFile" accept=".jsonl"></label>
+<button id="scan">Load request IDs</button><label>Request <input id="requestId" list="requests" placeholder="request ID"><datalist id="requests"></datalist></label>
+<label>Choice <input type="number" id="choice" min="0" value="0" style="width:60px"></label><button id="inspect">Inspect</button>
+<div id="hint" role="status"></div><div id="requestMetrics" class="request-metrics"></div><details><summary>Raw request completion event</summary><pre id="requestSummary"></pre></details><div class="grid" id="requestPlots"></div>
+</section>
+<p>Full time series: timeseries.jsonl.gz (VictoriaMetrics native JSONL, importable for replay). Validation and curves: validation.json. Raw metric snapshots: before-*.prom / after-*.prom.</p>
+</main>
+<script>
+const report=/*REPORT_DATA*/null;
+const $=id=>document.getElementById(id), ns='http://www.w3.org/2000/svg';
+const labels={ttft:'Per-request TTFT quantiles / seconds',tpot:'Per-request TPOT quantiles / seconds per token',e2e_latency:'Per-request completion latency quantiles / seconds',output_chunk_interval:'Engine output batch interval quantiles / seconds',scheduler_duration:'Scheduler CPU duration / seconds',scheduler_queue:'Initial queue-to-execution wait / seconds',executed_batch_size:'Batch size quantile (bucket approximation)',executed_batch_size_last:'Last real batch size (valid requests)',executed_query_tokens:'Per-sequence query length distribution',executed_context_tokens:'Per-sequence context length distribution',executed_query_tokens_last:'Total query tokens in the last batch',executed_query_tokens_min_last:'Query length: minimum',executed_query_tokens_mean_last:'Query length: mean',executed_query_tokens_max_last:'Query length: maximum',executed_context_tokens_min_last:'Context length: minimum',executed_context_tokens_mean_last:'Context length: mean',executed_context_tokens_max_last:'Context length: maximum',scheduling_snapshot_age:'Scheduling snapshot age / seconds',scheduling_last_execution_age:'Last execution age / seconds',scheduling_requests_waiting:'Waiting requests (100ms)',scheduling_requests_running:'Running requests (100ms)',requests_running:'Running requests (1s)',requests_waiting:'Waiting requests (1s)',kv_cache_usage_ratio:'KV cache utilization',prefix_cache_hit_ratio:'Prefix cache hit ratio'};
+const quantileColors={'0.5':'#63b4ff','0.9':'#81dab2','0.95':'#edbd6a','0.99':'#d69aee'};
+const colors=Object.values(quantileColors).concat(['#fd8a8a','#b0b9ff','#72dfdf','#dedb7e']);
+const hiddenCharts=new Set(), hoverGroups={overview:[],request:[]};
+const names=[...new Set(Object.keys(report.series).map(k=>k.split('@')[0]))];
+let viewStart=report.run.start,viewEnd=report.run.end,requestCharts=[],activeCharts=[],drawFrame=0;
+const valid=v=>v!==null&&v!==undefined&&v!==''&&Number.isFinite(Number(v));
+const number=v=>valid(v)?Number(v).toLocaleString('en-US',{maximumSignificantDigits:6}):'N/A';
+const utc=t=>new Date(t*1000).toISOString().replace('T',' ').replace('Z',' UTC');
+const qLabel=q=>'P'+Math.round(Number(q)*100);
+function node(tag,text,className){const el=document.createElement(tag);if(text!==undefined)el.textContent=text;if(className)el.className=className;return el}
+function svgNode(tag,attrs,parent){const el=document.createElementNS(ns,tag);for(const [k,v] of Object.entries(attrs))el.setAttribute(k,v);parent.append(el);return el}
+function titleFor(name){const split=name.indexOf('/');return split<0?name:name.slice(0,split)+' · '+(labels[name.slice(split+1)]||name.slice(split+1))}
+function metricLabel(s){const parts=Object.entries(s.metric||{}).filter(([key])=>key!=='__name__').map(([key,value])=>`${key}=${value}`);return [s.quantile?qLabel(s.quantile):'',...parts].filter(Boolean).join(' · ')||'Value'}
+function selectedQuantiles(){return [...document.querySelectorAll('input[name="quantile"]:checked')].map(el=>el.value)}
+function overviewCharts(){
+ const qs=selectedQuantiles(),separate=$('layout').value==='separate',role=$('role').value;
+ const result=[];
+ for(const name of names){
+  if(role!=='all'&&!name.startsWith(role+'/'))continue;
+  const keys=Object.keys(quantileColors).filter(q=>Object.hasOwn(report.series,`${name}@${q}`));
+  const distribution=keys.length>1;
+  const groups=distribution?(separate?qs.map(q=>[q]):[qs]):[keys];
+  for(const group of groups){
+   const suffix=distribution&&separate?'@'+group[0]:'';
+   result.push({id:name+suffix,title:titleFor(name)+(suffix?' · '+qLabel(group[0]):''),name,distribution,
+    series:group.flatMap(q=>(report.series[`${name}@${q}`]||[]).map(s=>({...s,quantile:distribution?q:null}))),relative:false});
+  }
+ }
+ return result;
+}
+function updateChartMenu(){
+ const query=$('chartSearch').value.trim().toLowerCase();$('chartOptions').replaceChildren();
+ for(const spec of activeCharts){
+  if(!spec.title.toLowerCase().includes(query))continue;
+  const label=node('label'),input=node('input');input.type='checkbox';input.checked=!hiddenCharts.has(spec.id);input.dataset.chartId=spec.id;
+  input.onchange=()=>{if(input.checked)hiddenCharts.delete(spec.id);else hiddenCharts.add(spec.id);draw();drawRequests()};
+  label.append(input,node('span',spec.title));$('chartOptions').append(label);
+ }
+ if(!$('chartOptions').childElementCount)$('chartOptions').append(node('p','No matching charts.'));
+ $('chartCount').textContent=`${activeCharts.filter(s=>!hiddenCharts.has(s.id)).length} / ${activeCharts.length}`;
+}
+function setMatchingVisibility(visible){const query=$('chartSearch').value.trim().toLowerCase();for(const s of activeCharts){if(s.title.toLowerCase().includes(query)){if(visible)hiddenCharts.delete(s.id);else hiddenCharts.add(s.id)}}draw();drawRequests()}
+function clearHover(group){for(const plot of hoverGroups[group])plot.hide()}
+function nearest(values,t){
+ let lo=0,hi=values.length;while(lo<hi){const mid=(lo+hi)>>1;if(Number(values[mid][0])<t)lo=mid+1;else hi=mid}
+ if(!lo)return values[0];if(lo===values.length)return values[lo-1];
+ return t-Number(values[lo-1][0])<=Number(values[lo][0])-t?values[lo-1]:values[lo];
+}
+function chart(parent,spec){
+ if(hiddenCharts.has(spec.id))return;
+ const {title,relative}=spec,group=relative?'request':'overview';
+ const series=spec.series.map(s=>({...s,values:s.values.filter(p=>relative||(p[0]>=viewStart&&p[0]<=viewEnd))}));
+ const card=node('div',undefined,'card');card.dataset.chartId=spec.id;
+ const head=node('div',undefined,'card-head'),close=node('button','×','close-chart');
+ close.type='button';close.title='Hide chart';close.setAttribute('aria-label','Hide '+title);
+ close.onclick=()=>{hiddenCharts.add(spec.id);draw();drawRequests()};
+ head.append(node('h3',title),close);card.append(head);
+ const note=relative?'Individual request choice · engine callback timestamps':spec.distribution?
+  (spec.name.startsWith('router/')?'MESH router observations · 30-second histogram window':['ttft','tpot','e2e_latency'].includes(spec.name.split('/')[1])?'Completed request choices · 30-second histogram window':spec.name.endsWith('/output_chunk_interval')?'Output batches · 30-second histogram window':'Scheduled work · 1-second histogram window'):
+  'Raw metric · quantile selection does not apply';
+ card.append(node('p',note,'chart-note'));
+ const plot=node('div',undefined,'plot'),svg=svgNode('svg',{viewBox:'0 0 620 220',role:'img','aria-label':title},plot);
+ card.append(plot);
+ let count=0,min=Infinity,max=-Infinity,ymin=0,ymax=0;
+ for(const s of series)for(const [t,v] of s.values){if(valid(v)){count++;min=Math.min(min,Number(t));max=Math.max(max,Number(t));ymin=Math.min(ymin,Number(v));ymax=Math.max(ymax,Number(v))}}
+ if(!count){plot.remove();card.append(node('p','No samples / not applicable to this role'));parent.append(card);return}
+ const xmin=relative?min:viewStart,xmax=relative?max:viewEnd,span=Math.max(.001,xmax-xmin);
+ if(ymin===ymax)ymax=ymin+1;else {const pad=(ymax-ymin)*.05;ymax+=pad;if(ymin<0)ymin-=pad}
+ const x=v=>55+550*(v-xmin)/span,y=v=>185-155*(Number(v)-ymin)/(ymax-ymin);
+ function axisText(px,py,t,anchor='start'){const el=svgNode('text',{x:px,y:py,fill:'#aab9cc','font-size':11,'text-anchor':anchor},svg);el.textContent=t}
+ for(let i=0;i<4;i++){const v=ymin+(ymax-ymin)*i/3;svgNode('path',{d:`M55 ${y(v)}H605`,stroke:'#30435b'},svg);axisText(1,y(v),v.toPrecision(3))}
+ axisText(55,209,relative?`${xmin.toFixed(2)}s`:utc(xmin).slice(11,23));axisText(605,209,relative?`${xmax.toFixed(2)}s`:utc(xmax).slice(11,23),'end');
+ const legend=node('div',undefined,'legend'),quantileIndices={};
+ const styled=series.map((s,i)=>{
+  const color=s.quantile?quantileColors[s.quantile]:colors[i%colors.length];
+  const rank=s.quantile?(quantileIndices[s.quantile]||0):0;if(s.quantile)quantileIndices[s.quantile]=rank+1;
+  const dash=['','7 3','2 3','8 3 2 3'][rank%4];
+  let path='',pen=false;
+  for(const [t,v] of s.values){if(!valid(v)){pen=false;continue}path+=`${pen?'L':'M'}${x(t).toFixed(2)} ${y(v).toFixed(2)} `;pen=true}
+  svgNode('path',{d:path,stroke:color,fill:'none','stroke-width':1.7,'stroke-dasharray':dash,'data-series':metricLabel(s)},svg);
+  const label=node('span',undefined,'legend-item'),swatch=node('span',undefined,'legend-line');label.style.color=color;if(dash)swatch.style.borderTopStyle='dashed';label.append(swatch,document.createTextNode(metricLabel(s)));legend.append(label);
+  return {...s,color};
+ });card.append(legend);
+ const cursor=svgNode('line',{x1:55,x2:55,y1:25,y2:185,stroke:'#b8cbe3','stroke-dasharray':'4 3',visibility:'hidden','pointer-events':'none'},svg);
+ const markers=styled.map(s=>svgNode('circle',{r:3.5,fill:s.color,stroke:'#101722',visibility:'hidden','pointer-events':'none'},svg));
+ const tip=node('div',undefined,'plot-tip');tip.hidden=true;plot.append(tip);
+ const sync={move(t){const visible=t>=xmin&&t<=xmax;cursor.setAttribute('visibility',visible?'visible':'hidden');if(visible){cursor.setAttribute('x1',x(t));cursor.setAttribute('x2',x(t))}},hide(){cursor.setAttribute('visibility','hidden');tip.hidden=true;for(const m of markers)m.setAttribute('visibility','hidden')}};
+ hoverGroups[group].push(sync);
+ svg.onpointermove=event=>{
+  const matrix=svg.getScreenCTM();if(!matrix)return;
+  const point=new DOMPoint(event.clientX,event.clientY).matrixTransform(matrix.inverse());
+  if(point.x<55||point.x>605||point.y<25||point.y>185){clearHover(group);return}
+  const t=xmin+(point.x-55)*span/550;
+  for(const other of hoverGroups[group]){if(other!==sync)other.hide();other.move(t)}
+  tip.replaceChildren(node('div',relative?`Elapsed ${t.toFixed(3)} s`:utc(t),'tip-heading'));
+  styled.forEach((s,i)=>{
+   const sample=nearest(s.values,t),marker=markers[i];marker.setAttribute('visibility','hidden');
+   const row=node('div',undefined,'tip-row');row.style.color=s.color;
+   if(!sample)row.textContent=metricLabel(s)+': No sample in this window';
+   else {
+    const [ts,value]=sample,stamp=relative?`${Number(ts).toFixed(3)} s`:utc(Number(ts)).slice(11);
+    row.textContent=`${metricLabel(s)}: ${number(value)}\nSample: ${stamp}`;
+    if(valid(value)){marker.setAttribute('cx',x(ts));marker.setAttribute('cy',y(value));marker.setAttribute('visibility','visible')}
+   }
+   tip.append(row);
+  });
+  tip.hidden=false;
+  const rect=plot.getBoundingClientRect(),left=event.clientX-rect.left,top=event.clientY-rect.top;
+  tip.style.left=Math.max(0,Math.min(left+16,rect.width-tip.offsetWidth))+'px';
+  tip.style.top=Math.max(0,Math.min(top+14,rect.height-tip.offsetHeight))+'px';
+ };
+ svg.onpointerleave=()=>clearHover(group);
+ parent.append(card);
+}
+function setTimeWindow(){
+ const total=Math.max(0,report.run.end-report.run.start),chosen=Number($('window').value),duration=chosen?Math.min(chosen,total):total;
+ const travel=total-duration;viewStart=report.run.start+travel*Number($('position').value)/1000;viewEnd=viewStart+duration;
+ $('position').disabled=travel<=0;
+ const display=utc(viewStart).slice(11,23)+' — '+utc(viewEnd).slice(11,23)+' UTC';
+ $('timeWindow').textContent=display;$('position').setAttribute('aria-valuetext',display);
+}
+function draw(){
+ setTimeWindow();clearHover('overview');hoverGroups.overview=[];$('panels').replaceChildren();
+ const specs=overviewCharts();for(const spec of specs)chart($('panels'),spec);
+ if(!$('panels').childElementCount)$('panels').append(node('p','No charts visible. Open Charts to restore them, or change the role filter.','empty'));
+ activeCharts=[...specs,...requestCharts];updateChartMenu();
+}
+function drawRequests(){
+ clearHover('request');hoverGroups.request=[];$('requestPlots').replaceChildren();for(const spec of requestCharts)chart($('requestPlots'),spec);
+ if(requestCharts.length&&!$('requestPlots').childElementCount)$('requestPlots').append(node('p','Request charts are hidden. Open Charts to restore them.','empty'));
+ activeCharts=[...overviewCharts(),...requestCharts];updateChartMenu();
+}
+function queueDraw(){if(!drawFrame)drawFrame=requestAnimationFrame(()=>{drawFrame=0;draw()})}
+for(const input of document.querySelectorAll('input[name="quantile"]'))input.onchange=()=>{
+ if(!selectedQuantiles().length)input.checked=true;
+ $('quantileSummary').textContent=selectedQuantiles().map(qLabel).join(' + ');draw();
+};
+$('layout').onchange=draw;$('role').onchange=draw;$('window').onchange=draw;$('position').oninput=queueDraw;
+$('chartSearch').oninput=updateChartMenu;$('showCharts').onclick=()=>setMatchingVisibility(true);$('hideCharts').onclick=()=>setMatchingVisibility(false);
+document.addEventListener('click',event=>{for(const menu of document.querySelectorAll('.dropdown[open]'))if(!menu.contains(event.target))menu.open=false});
+document.addEventListener('keydown',event=>{if(event.key==='Escape'){for(const menu of document.querySelectorAll('.dropdown[open]')){menu.open=false;menu.querySelector('summary').focus()}clearHover('overview');clearHover('request')}});
+$('run').textContent=`Run ${report.run.run_id} · ${report.run.topo} · ${report.run.case} · ${utc(report.run.start)} — ${utc(report.run.end)}`;
+$('runStart').textContent=utc(report.run.start);$('runEnd').textContent=utc(report.run.end);
+const status=node('h3',`CI metric validation: ${report.status.toUpperCase()}`,report.status==='pass'?'good':report.status==='preview'?'info':'bad');$('checks').append(status);
+for(const message of [...report.errors,...report.warnings])$('checks').append(node('p',message));
+$('eventSummary').textContent=JSON.stringify(report.request_events||{},null,2);
+async function readEvents(callback){
+ const file=$('eventFile').files[0];if(!file&&report.preview_events){for(const event of report.preview_events)callback(event);return}
+ if(!file)throw Error('Select an event file first');
+ const reader=file.stream().pipeThrough(new TextDecoderStream()).getReader();let pending='';
+ try{while(true){const {value,done}=await reader.read();if(done)break;pending+=value;let end;while((end=pending.indexOf('\n'))>=0){const line=pending.slice(0,end);pending=pending.slice(end+1);if(line.trim())callback(JSON.parse(line))}}
+  if(pending.trim()){try{callback(JSON.parse(pending))}catch(error){if(!(error instanceof SyntaxError))throw error;$('hint').textContent+=' Incomplete trailing line ignored.'}}
+ }finally{await reader.cancel();reader.releaseLock()}
+}
+$('scan').onclick=async()=>{try{
+ $('hint').textContent='Reading…';$('requests').replaceChildren();const ids=new Set();await readEvents(e=>{if(e.request_id&&ids.size<20000)ids.add(e.request_id)});
+ for(const id of ids){const option=node('option');option.value=id;$('requests').append(option)}
+ $('hint').textContent=`Loaded ${ids.size} request IDs (up to 20000 listed; manual entry is supported)`;
+ if(!$('requestId').value&&ids.size)$('requestId').value=ids.values().next().value;
+}catch(error){$('hint').textContent=error.message}};
+function requestMetric(title,value,unit=''){
+ const card=node('div',undefined,'request-metric');card.append(node('small',title),node('strong',number(value)+(valid(value)&&unit?' '+unit:'')));$('requestMetrics').append(card);
+}
+$('inspect').onclick=async()=>{try{
+ $('hint').textContent='Reading…';$('requestMetrics').replaceChildren();$('requestSummary').textContent='';requestCharts=[];drawRequests();
+ let summary=null,eventRole='';const gap=[],tokens=[],id=$('requestId').value,choice=Number($('choice').value);
+ if(!id)throw Error('Select or enter a request ID first');
+ if(!Number.isInteger(choice)||choice<0)throw Error('Choice must be a non-negative integer');
+ await readEvents(e=>{if(e.request_id!==id||e.choice_index!==choice)return;eventRole=e.role||eventRole;if(e.event==='request_finished')summary=e;if(e.event==='output_chunk'){gap.push([e.elapsed,e.interval]);tokens.push([e.elapsed,e.token_count])}});
+ gap.sort((a,b)=>a[0]-b[0]);tokens.sort((a,b)=>a[0]-b[0]);
+ $('requestSummary').textContent=summary?JSON.stringify(summary,null,2):'No completion event (request may have been cancelled or file is still being written)';
+ requestMetric('Request TPOT',summary?.tpot,'s/token');requestMetric('Request TTFT',summary?.ttft,'s');requestMetric('Completion latency',summary?.latency,'s');requestMetric('Output tokens',summary?.osl);requestMetric('Input tokens',summary?.isl);requestMetric('Cached tokens',summary?.cached);
+ const metric={request_id:id,choice,role:eventRole||'unknown'};
+ requestCharts=[{id:'request/output_interval',title:'Request · Engine output batch interval / seconds',series:[{metric,values:gap}],relative:true},{id:'request/output_tokens',title:'Request · Tokens per output batch',series:[{metric,values:tokens}],relative:true}];drawRequests();
+ $('hint').textContent=`${eventRole||'Unknown role'} · ${id} · choice ${choice} · ${gap.length} output batches. TPOT is a single completed-choice average; N/A means unavailable or fewer than two output tokens.`;
+}catch(error){$('hint').textContent=error.message}};
+draw();
+if(report.preview_events?.length){$('requestId').value=report.preview_events[0].request_id;$('choice').value=report.preview_events[0].choice_index||0;$('scan').click();$('inspect').click()}
+</script>
+</html>

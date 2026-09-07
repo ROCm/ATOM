@@ -1,0 +1,20 @@
+services:
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.111.0
+    ports: ["${OBS_BIND_HOST:-127.0.0.1}:8428:8428"]
+    command: ["-storageDataPath=/vmdata", "-retentionPeriod=6"]
+    volumes: ["vmdata:/vmdata"]
+    restart: unless-stopped
+  grafana:
+    image: grafana/grafana:11.3.0
+    ports: ["${OBS_BIND_HOST:-127.0.0.1}:3000:3000"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-admin}"
+    volumes:
+      - grafana:/var/lib/grafana
+      - ./provisioning:/etc/grafana/provisioning:ro
+      - ./dashboard.json:/var/lib/grafana/dashboards/atom.json:ro
+    restart: unless-stopped
+volumes:
+  vmdata:
+  grafana:

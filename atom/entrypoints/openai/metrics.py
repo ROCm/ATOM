@@ -9,9 +9,14 @@ from collections.abc import Iterable
 from typing import Any
 
 from prometheus_client import CollectorRegistry, generate_latest
-from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
+from prometheus_client.core import (
+    CounterMetricFamily,
+    GaugeMetricFamily,
+    HistogramMetricFamily,
+)
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 
+from .request_metrics import RequestMetrics
 from .streaming_dispatch import longest_silence_seconds
 
 
@@ -389,6 +394,79 @@ class _AtomMetricsCollector:
         yield distribution
 
 
+class _SchedulingMetricsCollector:
+    def __init__(self, exporter):
+        self.exporter = exporter
+
+    def collect(self):
+        snapshots = self.exporter.read_scheduling()
+        for key, name, help_text in (
+            (
+                "duration",
+                "atom:scheduler_duration_seconds",
+                "CPU wall time spent selecting a batch, including empty scheduling passes.",
+            ),
+            (
+                "queue",
+                "atom:scheduler_queue_seconds",
+                "Time from scheduler admission to first model execution; includes KV readiness waits, excludes API preprocessing and later preemption waits.",
+            ),
+        ):
+            metric = HistogramMetricFamily(name, help_text, labels=["rank"])
+            for rank, data in snapshots.items():
+                if key in data:
+                    metric.add_metric(
+                        [str(rank)], data[key]["buckets"], data[key]["sum"]
+                    )
+            yield metric
+        for key in ("batch_size", "query_tokens", "context_tokens"):
+            metric = HistogramMetricFamily(
+                f"atom:executed_{key}",
+                f"Actual executed {key}, before graph padding; query/context lengths are per sequence per step.",
+                labels=["rank", "stage"],
+            )
+            for rank, data in snapshots.items():
+                for stage, histograms in data.get("stages", {}).items():
+                    histogram = histograms[key]
+                    metric.add_metric(
+                        [str(rank), stage], histogram["buckets"], histogram["sum"]
+                    )
+            yield metric
+        for key in (
+            "batch_size",
+            "query_tokens",
+            "query_tokens_min",
+            "query_tokens_max",
+            "query_tokens_mean",
+            "context_tokens_min",
+            "context_tokens_max",
+            "context_tokens_mean",
+        ):
+            metric = GaugeMetricFamily(
+                f"atom:executed_{key}_last",
+                f"{key} in the most recently submitted real batch (may be stale when idle).",
+                labels=["rank", "stage"],
+            )
+            for rank, data in snapshots.items():
+                for stage, values in data.get("last", {}).items():
+                    metric.add_metric([str(rank), stage], values[key])
+            yield metric
+        for key in (
+            "last_execution_timestamp_seconds",
+            "snapshot_timestamp_seconds",
+            "requests_waiting",
+            "requests_running",
+            "requests_partial_prefill",
+            "requests_parked_kv_load",
+        ):
+            metric = GaugeMetricFamily(
+                f"atom:scheduling_{key}", f"Scheduler snapshot {key}.", labels=["rank"]
+            )
+            for rank, data in snapshots.items():
+                metric.add_metric([str(rank)], data.get(key, 0))
+            yield metric
+
+
 class AtomMetricsExporter:
     """Own a cached runtime snapshot and render it without engine RPCs."""
 
@@ -401,6 +479,23 @@ class AtomMetricsExporter:
         self._last_refresh = 0.0
         self._registry = CollectorRegistry(auto_describe=False)
         self._registry.register(_AtomMetricsCollector(self))
+        self.requests = RequestMetrics(self._registry)
+        self.scheduling_provider = None
+        self._scheduling_registry = CollectorRegistry(auto_describe=False)
+        collector = _SchedulingMetricsCollector(self)
+        self._registry.register(collector)
+        self._scheduling_registry.register(collector)
+
+    def read_scheduling(self):
+        if self.scheduling_provider is not None:
+            snapshots = self.scheduling_provider()
+            if snapshots:
+                return dict(snapshots)
+        with self._lock:
+            return copy.deepcopy(self._snapshot.get("scheduling", {}))
+
+    def render_scheduling(self) -> bytes:
+        return generate_latest(self._scheduling_registry)
 
     def update(self, snapshot: dict[str, Any]) -> None:
         with self._lock:

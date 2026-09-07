@@ -129,6 +129,13 @@ exports = {
     "REQUEST_RATE": cell["request_rate"],
     "BENCH_NUM_PROMPTS_MULTIPLIER": cell["num_prompts_multiplier"],
     "BENCHMARK_KIND": benchmark.get("kind", "random"),
+    "ATOMESH_OBSERVABILITY": (
+        "1" if os.environ.get("ATOMESH_OBSERVABILITY_MODE", "auto") == "on"
+        or (os.environ.get("ATOMESH_OBSERVABILITY_MODE", "auto") == "auto"
+            and benchmark.get("observability", False)) else "0"
+    ),
+    "ATOMESH_OBSERVABILITY_EVENTS": os.environ.get("ATOMESH_OBSERVABILITY_EVENTS", "1"),
+    "ATOMESH_VM_REMOTE_WRITE_URL": os.environ.get("ATOMESH_VM_REMOTE_WRITE_URL", ""),
     "AIPERF_DIR": benchmark.get("aiperf_dir", ""),
     "AIPERF_VENV": benchmark.get("aiperf_venv", ""),
     "AIPERF_COMMIT": benchmark.get("aiperf_commit", ""),

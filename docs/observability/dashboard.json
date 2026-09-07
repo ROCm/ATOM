@@ -1,0 +1,2559 @@
+{
+  "uid": "atom-ci-observability",
+  "title": "ATOM CI \u2014 Prefill / Decode / MESH",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "timezone": "utc",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "quantile",
+        "type": "custom",
+        "query": "0.5,0.9,0.95,0.99",
+        "current": {
+          "text": "0.95",
+          "value": "0.95"
+        }
+      },
+      {
+        "name": "run_id",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "atom-vm"
+        },
+        "query": "label_values(up, run_id)",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "case",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "atom-vm"
+        },
+        "query": "label_values(up{run_id=~\"$run_id\"}, case)",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "phase",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "atom-vm"
+        },
+        "query": "label_values(up{run_id=~\"$run_id\"}, phase)",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "prefill/ttft",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile($quantile, sum by (le, run_id) (rate(atom:ttft_seconds_bucket{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}[30s])))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 2,
+      "title": "prefill/tpot",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile($quantile, sum by (le, run_id) (rate(atom:tpot_seconds_bucket{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}[30s])))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "title": "prefill/e2e_latency",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile($quantile, sum by (le, run_id) (rate(atom:e2e_latency_seconds_bucket{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}[30s])))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "title": "prefill/output_chunk_interval",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile($quantile, sum by (le, run_id) (rate(atom:output_chunk_interval_seconds_bucket{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}[30s])))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "title": "prefill/requests_running",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (run_id) (atom:requests_running{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"})",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 6,
+      "title": "prefill/requests_waiting",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (run_id) (atom:requests_waiting{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"})",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 7,
+      "title": "prefill/requests_parked_kv_load",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (run_id) (atom:requests_parked_kv_load{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"})",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 8,
+      "title": "prefill/kv_cache_usage_ratio",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (run_id) (atom:kv_cache_usage_ratio{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"})",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 9,
+      "title": "prefill/prefix_cache_hit_ratio",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (run_id) (atom:prefix_cache_hit_ratio{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"})",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 10,
+      "title": "prefill/lmcache_loads_pending",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (run_id) (atom:lmcache_loads_pending{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"})",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 11,
+      "title": "prefill/lmcache_saves_pending",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 40,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (run_id) (atom:lmcache_saves_pending{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"})",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 12,
+      "title": "prefill/prompt_tokens/s",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 40,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (run_id) (rate(atom:prompt_tokens_total{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}[30s]))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 13,
+      "title": "prefill/generation_tokens/s",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 48,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (run_id) (rate(atom:generation_tokens_total{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}[30s]))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 14,
+      "title": "prefill/preemptions/s",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 48,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (run_id) (rate(atom:preemptions_total{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}[30s]))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 15,
+      "title": "prefill/lmcache_loaded_tokens/s",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 56,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (run_id) (rate(atom:lmcache_loaded_tokens_total{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}[30s]))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 16,
+      "title": "prefill/lmcache_saved_tokens/s",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 56,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (run_id) (rate(atom:lmcache_saved_tokens_total{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}[30s]))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 17,
+      "title": "decode/ttft",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 64,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile($quantile, sum by (le, run_id) (rate(atom:ttft_seconds_bucket{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}[30s])))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 18,
+      "title": "decode/tpot",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 64,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile($quantile, sum by (le, run_id) (rate(atom:tpot_seconds_bucket{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}[30s])))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 19,
+      "title": "decode/e2e_latency",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 72,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile($quantile, sum by (le, run_id) (rate(atom:e2e_latency_seconds_bucket{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}[30s])))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 20,
+      "title": "decode/output_chunk_interval",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 72,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile($quantile, sum by (le, run_id) (rate(atom:output_chunk_interval_seconds_bucket{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}[30s])))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 21,
+      "title": "decode/requests_running",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 80,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (run_id) (atom:requests_running{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"})",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 22,
+      "title": "decode/requests_waiting",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 80,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (run_id) (atom:requests_waiting{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"})",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 23,
+      "title": "decode/requests_parked_kv_load",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 88,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (run_id) (atom:requests_parked_kv_load{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"})",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 24,
+      "title": "decode/kv_cache_usage_ratio",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 88,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (run_id) (atom:kv_cache_usage_ratio{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"})",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 25,
+      "title": "decode/prefix_cache_hit_ratio",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 96,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (run_id) (atom:prefix_cache_hit_ratio{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"})",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 26,
+      "title": "decode/lmcache_loads_pending",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 96,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (run_id) (atom:lmcache_loads_pending{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"})",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 27,
+      "title": "decode/lmcache_saves_pending",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 104,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (run_id) (atom:lmcache_saves_pending{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"})",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 28,
+      "title": "decode/prompt_tokens/s",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 104,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (run_id) (rate(atom:prompt_tokens_total{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}[30s]))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 29,
+      "title": "decode/generation_tokens/s",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 112,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (run_id) (rate(atom:generation_tokens_total{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}[30s]))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 30,
+      "title": "decode/preemptions/s",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 112,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (run_id) (rate(atom:preemptions_total{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}[30s]))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 31,
+      "title": "decode/lmcache_loaded_tokens/s",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 120,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (run_id) (rate(atom:lmcache_loaded_tokens_total{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}[30s]))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 32,
+      "title": "decode/lmcache_saved_tokens/s",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 120,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (run_id) (rate(atom:lmcache_saved_tokens_total{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}[30s]))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 33,
+      "title": "prefill/scheduler_duration",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 128,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile($quantile, sum by (le, run_id, rank) (rate(atom:scheduler_duration_seconds_bucket{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}[1s])))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 34,
+      "title": "prefill/scheduler_queue",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 128,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile($quantile, sum by (le, run_id, rank) (rate(atom:scheduler_queue_seconds_bucket{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}[1s])))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 35,
+      "title": "prefill/executed_batch_size",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 136,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile($quantile, sum by (le, run_id, rank, stage) (rate(atom:executed_batch_size_bucket{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}[1s])))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 36,
+      "title": "prefill/executed_query_tokens",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 136,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile($quantile, sum by (le, run_id, rank, stage) (rate(atom:executed_query_tokens_bucket{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}[1s])))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 37,
+      "title": "prefill/executed_context_tokens",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 144,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile($quantile, sum by (le, run_id, rank, stage) (rate(atom:executed_context_tokens_bucket{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}[1s])))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 38,
+      "title": "prefill/executed_batch_size_last",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 144,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom:executed_batch_size_last{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 39,
+      "title": "prefill/executed_query_tokens_last",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 152,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom:executed_query_tokens_last{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 40,
+      "title": "prefill/executed_query_tokens_min_last",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 152,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom:executed_query_tokens_min_last{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 41,
+      "title": "prefill/executed_query_tokens_max_last",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 160,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom:executed_query_tokens_max_last{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 42,
+      "title": "prefill/executed_query_tokens_mean_last",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 160,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom:executed_query_tokens_mean_last{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 43,
+      "title": "prefill/executed_context_tokens_min_last",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 168,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom:executed_context_tokens_min_last{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 44,
+      "title": "prefill/executed_context_tokens_max_last",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 168,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom:executed_context_tokens_max_last{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 45,
+      "title": "prefill/executed_context_tokens_mean_last",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 176,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom:executed_context_tokens_mean_last{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 46,
+      "title": "prefill/scheduling_last_execution_age",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 176,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "time() - atom:scheduling_last_execution_timestamp_seconds{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 47,
+      "title": "prefill/scheduling_snapshot_age",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 184,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "time() - atom:scheduling_snapshot_timestamp_seconds{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 48,
+      "title": "prefill/scheduling_requests_waiting",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 184,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom:scheduling_requests_waiting{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 49,
+      "title": "prefill/scheduling_requests_running",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 192,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom:scheduling_requests_running{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 50,
+      "title": "prefill/scheduling_requests_partial_prefill",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 192,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom:scheduling_requests_partial_prefill{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 51,
+      "title": "prefill/scheduling_requests_parked_kv_load",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 200,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom:scheduling_requests_parked_kv_load{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 52,
+      "title": "prefill/mtp_acceptance_rate",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 200,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom:mtp_acceptance_rate{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"prefill\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 53,
+      "title": "decode/scheduler_duration",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 208,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile($quantile, sum by (le, run_id, rank) (rate(atom:scheduler_duration_seconds_bucket{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}[1s])))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 54,
+      "title": "decode/scheduler_queue",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 208,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile($quantile, sum by (le, run_id, rank) (rate(atom:scheduler_queue_seconds_bucket{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}[1s])))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 55,
+      "title": "decode/executed_batch_size",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 216,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile($quantile, sum by (le, run_id, rank, stage) (rate(atom:executed_batch_size_bucket{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}[1s])))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 56,
+      "title": "decode/executed_query_tokens",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 216,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile($quantile, sum by (le, run_id, rank, stage) (rate(atom:executed_query_tokens_bucket{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}[1s])))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 57,
+      "title": "decode/executed_context_tokens",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 224,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile($quantile, sum by (le, run_id, rank, stage) (rate(atom:executed_context_tokens_bucket{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}[1s])))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 58,
+      "title": "decode/executed_batch_size_last",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 224,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom:executed_batch_size_last{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 59,
+      "title": "decode/executed_query_tokens_last",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 232,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom:executed_query_tokens_last{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 60,
+      "title": "decode/executed_query_tokens_min_last",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 232,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom:executed_query_tokens_min_last{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 61,
+      "title": "decode/executed_query_tokens_max_last",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 240,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom:executed_query_tokens_max_last{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 62,
+      "title": "decode/executed_query_tokens_mean_last",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 240,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom:executed_query_tokens_mean_last{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 63,
+      "title": "decode/executed_context_tokens_min_last",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 248,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom:executed_context_tokens_min_last{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 64,
+      "title": "decode/executed_context_tokens_max_last",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 248,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom:executed_context_tokens_max_last{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 65,
+      "title": "decode/executed_context_tokens_mean_last",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 256,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom:executed_context_tokens_mean_last{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 66,
+      "title": "decode/scheduling_last_execution_age",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 256,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "time() - atom:scheduling_last_execution_timestamp_seconds{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 67,
+      "title": "decode/scheduling_snapshot_age",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 264,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "time() - atom:scheduling_snapshot_timestamp_seconds{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 68,
+      "title": "decode/scheduling_requests_waiting",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 264,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom:scheduling_requests_waiting{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 69,
+      "title": "decode/scheduling_requests_running",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 272,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom:scheduling_requests_running{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 70,
+      "title": "decode/scheduling_requests_partial_prefill",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 272,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom:scheduling_requests_partial_prefill{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 71,
+      "title": "decode/scheduling_requests_parked_kv_load",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 280,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "100ms",
+      "maxDataPoints": 40000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom:scheduling_requests_parked_kv_load{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "100ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 72,
+      "title": "decode/mtp_acceptance_rate",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 280,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom:mtp_acceptance_rate{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\",role=\"decode\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 73,
+      "title": "collection/scrape_duration_seconds",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 288,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "scrape_duration_seconds{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 74,
+      "title": "router/ttft",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 288,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile($quantile, sum by (le, run_id) (rate(mesh_router_ttft_seconds_bucket{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\"}[30s])))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 75,
+      "title": "router/tpot",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 296,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile($quantile, sum by (le, run_id) (rate(mesh_router_tpot_seconds_bucket{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\"}[30s])))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 76,
+      "title": "router/request_duration",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 296,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile($quantile, sum by (le, run_id) (rate(mesh_router_request_duration_seconds_bucket{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\"}[30s])))",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 77,
+      "title": "gpu/busy_ratio",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 304,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom_ci_gpu_busy_ratio{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 78,
+      "title": "gpu/vram_used_bytes",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 304,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom_ci_gpu_vram_used_bytes{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 79,
+      "title": "gpu/temperature_celsius",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 312,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom_ci_gpu_temperature_celsius{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 80,
+      "title": "gpu/power_watts",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "atom-vm"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 312,
+        "w": 12,
+        "h": 8
+      },
+      "interval": "1s",
+      "maxDataPoints": 4000,
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atom_ci_gpu_power_watts{run_id=~\"$run_id\",case=~\"$case\",phase=~\"$phase\"}",
+          "legendFormat": "{{run_id}} {{instance}} {{rank}} {{stage}} {{gpu}}",
+          "interval": "1s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    }
+  ],
+  "description": "Engine output batch interval is not per-token ITL under MTP. Request TTFT/TPOT histograms count completed sequences; prefill normally emits a single token."
+}

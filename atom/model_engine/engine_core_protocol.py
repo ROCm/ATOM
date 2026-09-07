@@ -33,3 +33,5 @@ class EngineCoreRequestType(enum.Enum):
     UTILITY_RESPONSE = b"\x08"
     # Unsolicited metrics snapshot, pushed by EngineCore on its own clock.
     METRICS = b"\x09"
+    # Optional lightweight scheduler snapshots for high-frequency monitoring.
+    SCHEDULING_METRICS = b"\x0a"

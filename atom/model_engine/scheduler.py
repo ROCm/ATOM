@@ -34,6 +34,7 @@ from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.request import RequestOutput
+from atom.model_engine.scheduling_metrics import SchedulingMetrics
 from atom.model_engine.sequence import (
     Sequence,
     SequenceStatus,
@@ -580,6 +581,7 @@ class Scheduler:
             if parallel_cfg is not None
             else None
         )
+        self.scheduling_metrics = SchedulingMetrics()
         self.engine_stats = EngineStats(
             engine_index=dp_rank or 0,
             label=self._ENGINE_LABEL,
@@ -836,11 +838,13 @@ class Scheduler:
         )
 
     def add(self, seq: Sequence):
+        self.scheduling_metrics.enqueue(seq)
         self._warn_if_unschedulable(seq)
         self.waiting.append(seq)
 
     def extend(self, seqs: list[Sequence]):
         for seq in seqs:
+            self.scheduling_metrics.enqueue(seq)
             self._warn_if_unschedulable(seq)
         self.waiting.extend(seqs)
 
@@ -1110,7 +1114,11 @@ class Scheduler:
         as long as it fires, and nothing would fail — the log would just go
         quiet, which is indistinguishable from an idle engine.
         """
-        result = self._schedule()
+        started = time.perf_counter()
+        try:
+            result = self._schedule()
+        finally:
+            self.scheduling_metrics.duration.observe(time.perf_counter() - started)
         self._record_throughput(num_prompt_tokens=_prompt_tokens_of(result))
         return result
 
@@ -3330,6 +3338,7 @@ class PrefillScheduler:
             if parallel_cfg is not None
             else None
         )
+        self.scheduling_metrics = SchedulingMetrics()
         self.engine_stats = EngineStats(
             engine_index=dp_rank or 0,
             label="Prefill ",
@@ -3370,9 +3379,12 @@ class PrefillScheduler:
         pass
 
     def add(self, seq: Sequence):
+        self.scheduling_metrics.enqueue(seq)
         self.waiting.append(seq)
 
     def extend(self, seqs: list):
+        for seq in seqs:
+            self.scheduling_metrics.enqueue(seq)
         self.waiting.extend(seqs)
 
     def schedule(self):
@@ -3381,7 +3393,11 @@ class PrefillScheduler:
         Override `_schedule`, not this — see `Scheduler.schedule` for why the
         tick lives at the one entry point instead of at each early return.
         """
-        result = self._schedule()
+        started = time.perf_counter()
+        try:
+            result = self._schedule()
+        finally:
+            self.scheduling_metrics.duration.observe(time.perf_counter() - started)
         self._record_throughput(num_prompt_tokens=_prompt_tokens_of(result))
         return result
 

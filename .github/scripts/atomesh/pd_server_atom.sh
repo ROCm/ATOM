@@ -559,6 +559,7 @@ purge_lmcache_disk() {
 cleanup_processes() {
   local rc=$?
   local pid
+  obs_cleanup
   for pid in "$@"; do
     terminate_process_group "${pid}"
   done
@@ -598,6 +599,7 @@ start_prefill() {
   local dp_master_port="${4:-${PREFILL_DP_MASTER_PORT}}"
   local dp_base_port="${5:-${PREFILL_DP_BASE_PORT}}"
   apply_role_env "ATOMESH_PREFILL_ENV_" "${host_ip}"
+  obs_server_env prefill "${server_port}"
   reset_lmcache_disk
   local -a prefill_cache_env=()
   build_server_cache_env "prefill" "${server_port}" prefill_cache_env
@@ -636,6 +638,7 @@ start_decode() {
   local dp_master_port="${4:-${DECODE_DP_MASTER_PORT}}"
   local dp_base_port="${5:-${DECODE_DP_BASE_PORT}}"
   apply_role_env "ATOMESH_DECODE_ENV_" "${host_ip}"
+  obs_server_env decode "${server_port}"
   local max_conc
   max_conc="$(echo "${BENCH_MAX_CONCURRENCY}" | tr 'x,' '\n' | sort -n | tail -1)"
   local decode_max_num_seqs="${MAX_NUM_SEQS}"
@@ -728,8 +731,10 @@ start_router() {
 }
 
 run_benchmark() {
+  obs_start
   if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" ]]; then
     run_aiperf_agentic_benchmark
+    obs_finish
     return
   fi
 
@@ -1195,6 +1200,9 @@ run_benchmark_and_eval() {
   fi
 }
 
+source "${ATOMESH_SCRIPT_DIR}/observability.sh"
+trap 'obs_cleanup' EXIT
+obs_prepare
 write_metadata
 
 if [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
@@ -1213,6 +1221,7 @@ if [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
   start_router
   wait_http "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
   run_benchmark_and_eval
+  obs_finish
   cleanup_processes "${router_pid}" "${prefill_pid}" "${decode_pid}"
 elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   prefill_pids=()
@@ -1241,6 +1250,7 @@ elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   start_router
   wait_http "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
   run_benchmark_and_eval
+  obs_finish
   cleanup_processes "${router_pid}" "${prefill_pids[@]}"
 elif [[ "${NODE_RANK}" -eq 0 ]]; then
   start_prefill "prefill-rank-0"
@@ -1258,6 +1268,7 @@ elif [[ "${NODE_RANK}" -eq 0 ]]; then
   start_router
   wait_http "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
   run_benchmark_and_eval
+  obs_finish
   kill "${router_pid}" "${server_pid}" 2>/dev/null || true
 elif [[ "${DECODE_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -eq "${xP}" ]]; then
   decode_pids=()
