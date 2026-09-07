@@ -102,12 +102,10 @@ RUN echo "========== [ATOM] Installing MORI nightly ==========" && \
 # ROCm build whose version string doesn't match rocm-hip's declared dependency,
 # leaving dpkg in a broken state that blocks all subsequent apt-get install calls.
 ARG INSTALL_MOONCAKE=1
-# Upstream Mooncake (includes HIP dma-buf MR via ibv_reg_dmabuf_mr, PR #2225).
-# Pin a SHA: floating `main` would silently drop dma-buf / ionic behavior.
-# Jasen2201 `fix/ionic-mr-and-qp-resource-fixes` only has CUDA dma-buf; HIP
-# still falls back to ibv_reg_mr (EINVAL 22 on ionic GPU VAs).
+# Upstream Mooncake release tag with HIP dma-buf MR support.
+# Note: this tag does not include the Ionic QP atomic resource clamp.
 ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
-ARG MOONCAKE_COMMIT="bfca1ce2af8419c50dc8d464820a95d97d43c930"
+ARG MOONCAKE_COMMIT="v0.3.14-rc1"
 ARG USE_HIP_DMABUF=ON
 ARG VENV_PYTHON="/opt/venv/bin/python"
 
