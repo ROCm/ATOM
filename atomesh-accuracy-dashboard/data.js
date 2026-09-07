@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788716560821,
+  "lastUpdate": 1788809908896,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -2713,6 +2713,40 @@ window.BENCHMARK_DATA = {
             "value": 0.8946,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34044915725 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609051454 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.2032 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "ZhangLirong",
+            "username": "ZhangLirong-amd",
+            "email": "lirzhang@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "83a22aa72075016832ab7a6b72946c6fcaacc373",
+          "message": "kv_transfer/offload: add PAGE-only m3 layout for MiniMax-M3 (#2140)\n\n* kv_transfer/offload: add PAGE-only m3 layout for MiniMax-M3\n\nMiniMax-M3 is a 60-layer MoE + NSA sparse-attention model: PAGE-only KV,\nno per-request SLOT/compression state. With no offload layout of its own it\nfell through to \"dense\", whose byte codec is built from the per-layer\nKVCacheTensor K/V and never sees the NSA index_cache -- that region is\ndelivered only via transfer_tensors.block_regions. So dense would offload\nK/V and silently drop the index cache, corrupting restored prefixes; in\npractice evicted-prefix KV was dropped and every request re-prefilled\n(prefix_cache_hit_ratio ~= 0).\n\n- config.py: register the \"m3\" alias; add _is_minimax_m3() arch/model_type\n  detection; route it to \"m3\" in _layout_from_model() ahead of the\n  text-config family probe; add the \"m3-page-regions\" page namespace mode.\n- connector.py: route _build_worker/_build_scheduler to M3Offload*.\n- hybrid/m3/: new PAGE-only connector = DenseOffloadConnector whose\n  register_kv_caches builds a page-only DSV4PageSlotCodec from\n  block_regions (slot_regions=(), num_slots=0); scheduler reused unchanged.\n\nServing-layer only; no model files touched. Validated on node 027 (tp4):\nload_failures=0, prefix_cache_hit_ratio 0 -> 0.76 and climbing, ttft p50\n~327ms, ~3x output throughput vs the no-offload baseline.\n\n* tests: expect MiniMax-M3 -> m3 offload layout, add detection coverage\n\nselect_offload_layout now routes MiniMax-M3 to the PAGE-only \"m3\" layout,\nso test_minimax_and_dense_model_types_still_route_to_dense (which asserted\nminimax_m3 -> dense) no longer holds and failed the non-GPU unit-test job.\n\nSplit it: MiniMax-M2 / llama / None still route to dense, and add two focused\ntests for the M3 detection paths flagged in review -- model_type and the\narchitecture-name path (architectures=[MiniMaxM3ForCausalLM]).\n\n* docs: add MiniMax-M3 agentic KV-offload serving recipe\n\nConcurrency ladder for the PAGE offload connector: no offload <=16c,\nsingle-TP4 + offload at 32-48c, DP2 + offload at >=64c. Documents the\nKV-uncompressed HBM ceiling that drives the ladder, the disjoint two-tier\ncache composition (measured 32c/48c), per-rank CPU pool sizing, the\nmandatory env (ATOM_FORCE_ATTN_TRITON, PYTHONHASHSEED=0, session affinity),\nand the fully expanded server command for each concurrency band.\n\n---------\n\nCo-authored-by: ZhangLirong-amd <ZhangLirong-amd@users.noreply.github.com>",
+          "timestamp": "2026-09-07T14:47:40Z",
+          "url": "https://github.com/ROCm/ATOM/commit/83a22aa72075016832ab7a6b72946c6fcaacc373"
+        },
+        "date": 1788809908368,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9545,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34142623212 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202609071454 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9492 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8976,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34142623212 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609071454 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1592 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
