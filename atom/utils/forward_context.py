@@ -538,6 +538,10 @@ class Context:
     positions: torch.Tensor
     is_prefill: bool = False
     is_dummy_run: bool = False
+    # Set by ModelRunner right after the target forward: did it PCP row-split?
+    # A fact about a finished forward, not a rule -- drafters mutate the state
+    # the rule reads. See Drafter.aux_for.
+    pcp_split_rows: bool = False
     # What this rank was handed. Duplicated from `forward_mode` because a
     # capture context has none; `scheduled_tokens` counts this rank's real rows.
     scheduled_bs: int = 0

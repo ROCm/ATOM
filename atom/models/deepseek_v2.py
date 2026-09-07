@@ -62,6 +62,7 @@ from atom.distributed.dcp_utils import (
     get_dcp_world_size,
 )
 from atom.distributed.pcp_utils import (
+    pcp_split_active,
     get_pcp_world_size,
     pcp_all_reduce,
     pcp_allgather_rankmajor,
@@ -206,19 +207,14 @@ def _pcp_active() -> bool:
     reindex) keys off the SAME batch-global condition so they agree within a
     forward.
     """
-    if not pcp_is_enabled():
-        return False
-    ctx = get_forward_context()
-    context = getattr(ctx, "context", None)
-    attn_metadata = getattr(ctx, "attn_metadata", None)
-    if context is None or attn_metadata is None:
-        return False
-    if not bool(context.is_prefill) or bool(getattr(context, "is_dummy_run", False)):
-        return False
+    # Policy: this family only wires PCP into the sparse-MLA path, so a model
+    # without index_topk never splits, and one with it splits only above the
+    # threshold (`aiter_mla.py:1254` is where the dense fallback actually
+    # branches). The mechanism itself is shared -- see pcp_split_active.
     index_topk = getattr(get_current_atom_config().hf_config, "index_topk", None)
     if index_topk is None:
         return False
-    return int(getattr(attn_metadata, "max_seqlen_k", 0)) > int(index_topk)
+    return pcp_split_active(int(index_topk))
 
 
 def _install_increment_version_pcp_shim() -> None:
@@ -3453,6 +3449,12 @@ class DeepseekV2Model(nn.Module):
 
 
 class DeepseekV2ForCausalLM(nn.Module):
+    def pcp_split_active(self) -> bool:
+        """Did this model's last forward PCP row-split? Callers outside the model
+        (the drafter, via ModelRunner) ask here rather than re-deriving the gate,
+        so the family-specific policy stays in one place."""
+        return _pcp_active()
+
     def __init__(
         self,
         atom_config: Config,

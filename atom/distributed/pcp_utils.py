@@ -60,6 +60,46 @@ def pcp_is_enabled() -> bool:
     return get_pcp_world_size() > 1
 
 
+def pcp_split_active(dsa_fallback_topk: Optional[int]) -> bool:
+    """Did PCP row-split the CURRENT prefill forward?
+
+    The mechanism every model shares -- pcp enabled, real prefill, not a
+    dummy/warmup run -- lives here once. The one genuine difference stays a
+    parameter: a backend that falls back to dense MHA on short batches is not
+    PCP-wired there, so it must pass its threshold and gets False below it.
+    `aiter_mla.py` (the V3.2 / deepseek_v2 family) has that fallback keyed on
+    `max_seqlen_k > index_topk`; DeepSeek-V4's attention has no such branch, so
+    it passes None and every prefill counts.
+
+    Merging the two conditions instead of parameterising them would be wrong in
+    both directions: V4 would wrongly report "not split" for prompts under its
+    own index_topk, and the v2 family would wrongly report "split" for batches
+    that never reached the sparse path.
+
+    Reads only batch-global state, so every PCP rank gets the same answer --
+    which is what lets a caller gate a collective on it. It is NOT stable across
+    a step: a drafter that rewrites `is_prefill` or bumps `max_seqlen_k` changes
+    the answer, so evaluate it while the target's own forward context still
+    stands, not partway through drafting.
+    """
+    from atom.utils.forward_context import get_forward_context
+
+    if not pcp_is_enabled():
+        return False
+    ctx = get_forward_context()
+    context = getattr(ctx, "context", None)
+    if context is None:
+        return False
+    if not bool(context.is_prefill) or bool(getattr(context, "is_dummy_run", False)):
+        return False
+    if dsa_fallback_topk is None:
+        return True
+    attn_metadata = getattr(ctx, "attn_metadata", None)
+    if attn_metadata is None:
+        return False
+    return int(getattr(attn_metadata, "max_seqlen_k", 0)) > int(dsa_fallback_topk)
+
+
 def pcp_merged_tp_grid() -> Optional[tuple[int, int]]:
     """`(size, rank)` of the pcp-folded TP grid, or None when the fold is off.
 

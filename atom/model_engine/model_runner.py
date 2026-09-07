@@ -3480,10 +3480,23 @@ class ModelRunner:
         self._mark_staging_h2d_enqueued()
         logits, hidden_states = self.run_model(input_ids, batch)
 
+        # Whether that forward row-split for PCP, settled HERE and cached: the
+        # drafters below rewrite the very state the gate reads (is_prefill,
+        # max_seqlen_k), so it has only one truthful moment. This also has to be
+        # plain Python on the caller side -- a hook or a model-side assignment
+        # would be skipped on a cudagraph replay while its device work still ran,
+        # leaving per-rank answers that deadlock anything gated on them.
+        drafter = getattr(self, "drafter", None)
+        if drafter is not None:
+            get_forward_context().context.pcp_split_rows = (
+                self.model.pcp_split_active()
+                if hasattr(self.model, "pcp_split_active")
+                else False
+            )
+
         pp_group = get_pp_group()
         pp_non_last = pp_group.world_size > 1 and not pp_group.is_last_rank
 
-        drafter = getattr(self, "drafter", None)
         # An output-less batch still runs propose() for its DP collectives.
         will_align_draft = (
             self._dp_draft_lockstep_active()

@@ -68,6 +68,7 @@ from atom.distributed.pcp_utils import (
     pcp_allgather_rankmajor,
     pcp_allgather_rerange,
     pcp_merged_tp_grid,
+    pcp_split_active,
     pcp_pad_len,
     pcp_reduce_scatter,
     pcp_round_robin_split,
@@ -4609,10 +4610,10 @@ def _pcp_active() -> bool:
     not dummy/warmup run). Decode runs PCP-redundant (full KV, no split); the
     warmup dummy run has no valid KV cache so it must skip the split path.
     """
-    if get_pcp_world_size() <= 1:
-        return False
-    fc = get_forward_context()
-    return fc.context.is_prefill and not fc.context.is_dummy_run
+    # Policy: V4's attention has no length-keyed dense fallback (that branch is
+    # aiter_mla.py's, i.e. the deepseek_v2 family), so every real prefill splits
+    # -- hence None. Mechanism shared with deepseek_v2 via pcp_split_active.
+    return pcp_split_active(None)
 
 
 def _moe_pcp_merge_active() -> bool:
@@ -4838,6 +4839,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         "shared_experts.w1": ("shared_experts.gate_up_proj", 0),
         "shared_experts.w3": ("shared_experts.gate_up_proj", 1),
     }
+
+    def pcp_split_active(self) -> bool:
+        """Did this model's last forward PCP row-split? Callers outside the model
+        (the drafter, via ModelRunner) ask here rather than re-deriving the gate,
+        so the family-specific policy stays in one place."""
+        return _pcp_active()
 
     def __init__(self, config: Config, prefix: str = "") -> None:
         super().__init__()
