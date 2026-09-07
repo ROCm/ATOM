@@ -185,6 +185,7 @@ models:
       common:
         AITER_QUICK_REDUCE_QUANTIZATION: INT4
         AITER_USE_FLYDSL_MOE_SORTING: "1"
+        MC_ENABLE_DEST_DEVICE_AFFINITY: "1"
       prefill: {}
       decode: {}
     server:
@@ -213,12 +214,12 @@ models:
             workers: 1
             tp: 4
           env:
-            common:
-              MC_ENABLE_DEST_DEVICE_AFFINITY: "1"
             prefill:
               HIP_VISIBLE_DEVICES: "0,1,2,3"
             decode:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":6301,"ib_enable_alternate_hca":true,"ib_hca_count":8}
           benchmark:
             wait_server_timeout: 1800
           run_eval: true
@@ -237,9 +238,6 @@ models:
           decode:
             workers: 1
             tp: 8
-          env:
-            common:
-              MC_ENABLE_DEST_DEVICE_AFFINITY: "1"
           benchmark:
             wait_server_timeout: 1800
           run_eval: true
@@ -362,6 +360,8 @@ models:
             decode:
               MAX_JOBS: "16"
               HIP_VISIBLE_DEVICES: "4,5,6,7"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":6301,"ib_enable_alternate_hca":true,"ib_hca_count":8}
 
         - <<: *glm52_agentic_lmcache_tp4_dpa
           name: glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c32
@@ -560,6 +560,8 @@ models:
               HIP_VISIBLE_DEVICES: "0,1,2,3"
             decode:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":6301,"ib_enable_alternate_hca":true,"ib_hca_count":8}
           benchmark:
             wait_server_timeout: 1800
           run_eval: true
@@ -611,6 +613,8 @@ models:
               HIP_VISIBLE_DEVICES: "0,1,2,3"
             decode:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":6301,"ib_enable_alternate_hca":true,"ib_hca_count":8}
           benchmark:
             wait_server_timeout: 1800
           run_eval: true
@@ -700,6 +704,8 @@ models:
               HIP_VISIBLE_DEVICES: "0,1,2,3"
             decode:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":6301,"ib_enable_alternate_hca":true,"ib_hca_count":8}
           benchmark:
             wait_server_timeout: 1800
           run_eval: true
@@ -752,6 +758,8 @@ models:
               HIP_VISIBLE_DEVICES: "0,1,2,3"
             decode:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":6301,"ib_enable_alternate_hca":true,"ib_hca_count":8}
           benchmark:
             wait_server_timeout: 1800
           run_eval: true

@@ -67,6 +67,7 @@ export PYTHONHASHSEED=0
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
 export AITER_LOG_LEVEL=WARNING
+export MC_ENABLE_DEST_DEVICE_AFFINITY=1
 
 # Avoid stale compiled kernels from previous experiments.
 rm -rf "${HOME}/.cache/atom/"* 2>/dev/null || true
