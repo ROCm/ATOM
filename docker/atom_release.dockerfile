@@ -434,11 +434,15 @@ RUN pip install rocm-trace-lite && \
     rtl --version || true
 
 # ATOM: Python package install (editable) with the atomesh build hook enabled.
-# CACHEBUST invalidates only this layer so parallel stages stay cached
+# CACHEBUST invalidates only this layer so parallel stages stay cached.
+# ulimit: the atomesh cargo build spawns one rustc per crate in parallel and
+# runs out of file descriptors on the docker default nofile limit (os error 24,
+# "could not execute process rustc (never executed)"); raise it for this step.
 ARG CACHEBUST=1
 RUN git clone $ATOM_REPO /app/ATOM && \
     cd /app/ATOM && \
     git checkout $ATOM_COMMIT && \
+    ulimit -n 65536 && \
     ATOM_MESH_BUILD=1 python -m pip install -e .
 RUN pip show atom || true
 
