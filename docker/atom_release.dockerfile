@@ -277,7 +277,7 @@ from pathlib import Path
 if os.environ.get("ATOM_BASE_IMAGE") != "rocm10-base":
     print("not the rocm10 flavor; skipping torch.Stream patch")
 else:
-    p = Path("/app/aiter-test/aiter/csrc/cpp_itfs/torch_utils.py")
+    p = Path("/app/aiter-test/csrc/cpp_itfs/torch_utils.py")
     s = p.read_text()
     old = """        elif isinstance(arg, torch.cuda.Stream):
             c_args.append(ctypes.cast(arg.cuda_stream, ctypes.c_void_p))
