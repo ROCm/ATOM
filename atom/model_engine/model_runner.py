@@ -773,7 +773,7 @@ class ModelRunner:
         # never assign them a slot, and the builder will silently read
         # tensor[-1] on first decode. Catch the misconfiguration up front
         # rather than producing wrong outputs at inference time.
-        if self._has_state_pool():
+        if self._state_pool_names():
             from atom.model_engine.llm_engine import InputOutputProcessor as _IOProc
 
             mt = self.config.hf_config.model_type
@@ -1423,9 +1423,14 @@ class ModelRunner:
             specs += self.draft_kv_builder.sub_pool_specs()
         return specs
 
-    def _has_state_pool(self) -> bool:
-        """Whether any attached builder declares a per-request STATE class."""
-        return any(s.pool is Pool.STATE for s in self._sub_pool_specs())
+    def _state_pool_names(self) -> list[str]:
+        """The per-request STATE classes the attached builders declare.
+
+        Named rather than counted because both callers want to say which: one
+        refuses a model whose `model_type` is missing from the per-req-cache
+        set, the other refuses P/D for it.
+        """
+        return [s.name for s in self._sub_pool_specs() if s.pool is Pool.STATE]
 
     def _estimate_cudagraph_overhead(self):
         """Estimate GPU memory consumed by CUDA graph capture.
@@ -4362,7 +4367,21 @@ class RapidServeModelRunner(ModelRunner):
         where every builder declared 5-D. Nothing could catch that — the two
         agree on every byte and differ only in what a reader branches on. So it
         runs the same loop over the same hook, down to backing the pools.
+
+        The paged pool only. A per-request STATE class is sized by `pool_plan`,
+        which is empty here -- the block count arrives with the handle and
+        nothing else does -- so `allocate_per_req_cache` cannot run and the
+        attributes it publishes do not exist. Refused up front rather than met
+        as an `AttributeError` on whichever layer binds first.
         """
+        stateful = self._state_pool_names()
+        if stateful:
+            raise NotImplementedError(
+                f"per-request state {stateful} has no entry count on the decode "
+                "side of a P/D pair: only the paged pool arrives with the "
+                "handle, and this side never ran sizing. Run this model "
+                "without disaggregation."
+            )
         self._back_paged_pools(num_kvcache_blocks, buf=self.kv_cache)
 
         models_to_bind = [("target", self.model)]
