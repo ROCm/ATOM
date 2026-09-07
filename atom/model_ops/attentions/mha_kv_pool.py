@@ -165,10 +165,16 @@ class MhaKvPool:
         *,
         world_size: int,
         block_size: int,
+        layers: int,
         blocks_per_entry: int = 1,
         kv_dtype: torch.dtype,
     ) -> MhaKvPool:
-        """A pool for every attention layer a model config declares.
+        """A pool at the geometry a model config declares, for `layers` of them.
+
+        The config says what one row holds; it does not say how many rows this
+        pool has. Only the walk over the built model knows that, and reading
+        `num_hidden_layers` here instead is how a pool comes to be sized off
+        one count and addressed by another.
 
         Sharded by `ModelRunner._get_num_kv_heads`' rule -- one head per rank
         is the floor -- so a draft's layers divide the way the target's do.
@@ -189,7 +195,7 @@ class MhaKvPool:
                 f"{heads} KV heads and {world_size} ranks do not divide either way"
             )
         return cls(
-            layers=hf_config.num_hidden_layers,
+            layers=layers,
             block_size=block_size,
             blocks_per_entry=blocks_per_entry,
             num_kv_heads=per_rank,
@@ -277,9 +283,11 @@ class MhaKvPool:
         the pool is layer-major: an entry's bytes are `entries` apart, so no
         contiguous range is one entry.
 
-        Named because position is otherwise a region's only identity to the far
-        end, and reordering the fields keeps every count and every byte: a
-        mismatched pair then transfers K into V and says nothing.
+        Named for the reader, not for the wire: the mooncake connector pairs
+        the two ends by list position and drops the role. What a name buys is
+        that `set_block_count`'s refusal says which region is wrong -- `k` of
+        layer 12, not region 37 -- and the folded order (all of K, then all of
+        V) makes that worth having.
         """
         return [
             (f"{name}.layer_{layer}", view[layer])

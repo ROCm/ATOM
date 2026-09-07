@@ -17,6 +17,28 @@ an attention builder and whose package promises to import no attention at all.
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
+
+class KvGeometry(NamedTuple):
+    """A KV row space, keyed by what one of its rows holds.
+
+    A type rather than a bare tuple so that "which row spaces are pools" is a
+    question with an answer -- a hybrid adds named row spaces of its own (the
+    indexer's keys, a linear-attention slot), and telling them apart by
+    exclusion means every new one has to be added to a list it does not know
+    about.
+    """
+
+    num_kv_heads: int
+    head_dim: int
+
+    def __str__(self) -> str:
+        """What this row space is called, wherever one is named -- the startup
+        log, and the `semantic_role` its transfer regions carry. Both are for a
+        person: the default repr would print the class and field names."""
+        return f"h{self.num_kv_heads}d{self.head_dim}"
+
 
 class PoolRowsMixin:
     """`self.model_runner`'s modules, assigned to this builder's rows."""

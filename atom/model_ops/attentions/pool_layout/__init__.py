@@ -8,10 +8,10 @@ One topic across seven modules -- how many entries a byte budget buys
 or compressed group occupies (`v4_pool_geometry`), what one of those rows and
 one indexer block hold (`v4_pool_fields`), where a checkpoint image's bytes
 land in the MLA paged pool (`page_unit_geometry`), what one entry holds and
-where those bytes are put (`entry_arena`), which row of a pool each module was
-given (`pool_rows`), and how one entry's run is scattered across PAGE units and
-gathered back (`paged_state_copy`). All of it answers a question about the
-pool, none of it about a particular step.
+where those bytes are put (`entry_arena`), what the row spaces are and which
+row of one each module was given (`pool_rows`), and how one entry's run is
+scattered across PAGE units and gathered back (`paged_state_copy`). All of it
+answers a question about the pool, none of it about a particular step.
 
 `..token_layout` is the other axis, and the two share a membership rule with
 three parts.

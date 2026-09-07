@@ -612,23 +612,30 @@ class TestFromHfConfig:
         num_key_value_heads = 4
         head_dim = 128
 
-    def test_kv_heads_are_sharded_by_world_size(self):
-        pool = MhaKvPool.from_hf_config(
-            self._Cfg(), world_size=4, block_size=128, kv_dtype=torch.bfloat16
+    def _pool(self, world_size: int, layers: int = 2) -> MhaKvPool:
+        return MhaKvPool.from_hf_config(
+            self._Cfg(),
+            world_size=world_size,
+            block_size=128,
+            layers=layers,
+            kv_dtype=torch.bfloat16,
         )
 
+    def test_kv_heads_are_sharded_by_world_size(self):
         # One KV head's worth of bytes per block, at bf16.
-        assert pool.cache_fields[0].shape == (1 * 128 * 128 * 2,)
+        assert self._pool(world_size=4).cache_fields[0].shape == (1 * 128 * 128 * 2,)
 
     def test_a_head_per_rank_is_the_floor(self):
         """More ranks than KV heads replicates rather than allocating none --
         the rule `ModelRunner._get_num_kv_heads` has always applied."""
-        pool = MhaKvPool.from_hf_config(
-            self._Cfg(), world_size=8, block_size=128, kv_dtype=torch.bfloat16
-        )
+        assert self._pool(world_size=8).cache_fields[0].shape == (1 * 128 * 128 * 2,)
 
-        # One KV head's worth of bytes per block, at bf16.
-        assert pool.cache_fields[0].shape == (1 * 128 * 128 * 2,)
+    def test_the_caller_says_how_many_rows_not_the_config(self):
+        """`num_hidden_layers` is 60 here and is not what comes back. Only the
+        walk over the built model knows how many rows a pool has -- reading the
+        config instead sizes it off one count and addresses it by another."""
+        assert self._Cfg.num_hidden_layers == 60
+        assert self._pool(world_size=4, layers=3).cache_fields[0].layers == 3
 
 
 def test_reachable_without_a_gpu_build():

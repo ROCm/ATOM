@@ -1,4 +1,5 @@
 import logging
+from functools import partial
 
 from atom.config import KVCacheTensor
 from atom.model_ops.attentions.pool_layout.pool_rows import PoolRowsMixin
@@ -16,19 +17,22 @@ def draft_kv_builder(model_runner, draft_hf):
 
     A draft is not an attention flavor; it is a model that has one. So the
     flavor comes from the draft's own config through the same selector the
-    target uses, and that backend says whether a draft of its flavor wants a
-    pool (`make_kv_pool`). None means it shares the target's, and the runner
-    never sees a draft builder at all.
+    target uses, and that backend says whether a draft of its flavor caches
+    into a pool of its own (`DRAFT_OWNS_KV_POOL`). Where it does not, the
+    runner never sees a draft builder at all.
 
     Which is why speculative decoding imports no attention anywhere: adding a
-    flavor is one `make_kv_pool` on that backend.
+    flavor is a flag and a `make_kv_pool` on that backend.
     """
     from aiter import dtypes
 
     from atom.utils.selector import attn_family, get_attn_backend
 
     backend = get_attn_backend(attn_family(draft_hf))
-    pool = backend.make_kv_pool(
+    if not backend.DRAFT_OWNS_KV_POOL:
+        return None
+    make_pool = partial(
+        backend.make_kv_pool,
         draft_hf,
         world_size=model_runner.world_size,
         # The scheduler's, which every model in the process shares. Which block
@@ -37,7 +41,10 @@ def draft_kv_builder(model_runner, draft_hf):
         scheduler_block_size=model_runner.block_size,
         kv_dtype=dtypes.d_dtypes[model_runner.config.kv_cache_dtype],
     )
-    return None if pool is None else DraftKvBuilder(model_runner, pool)
+    # A way to build it, not the pool: how many rows it has is the walk's to
+    # say, and this runs from the proposer's `__init__` -- `build_drafter`
+    # still running, `runner.drafter` not yet set, nothing to walk.
+    return DraftKvBuilder(model_runner, make_pool)
 
 
 class DraftKvBuilder(PoolRowsMixin):
@@ -50,18 +57,39 @@ class DraftKvBuilder(PoolRowsMixin):
     piggybacks on the target builder's metadata flow during propose.
 
     It knows nothing about attention: the caller that resolved the draft's
-    flavor hands the pool in. What is left is the part that is genuinely about
-    being a draft -- its blocks are the target's blocks, re-paged at its own
-    block size.
+    flavor hands over a way to build the pool. What is left is the part that is
+    genuinely about being a draft -- its blocks are the target's blocks,
+    re-paged at its own block size.
     """
 
-    def __init__(self, model_runner, kv_pool):
+    def __init__(self, model_runner, make_pool):
         self.model_runner = model_runner
-        self.kv_pool = kv_pool
-        # The draft's own block, from its own backend -- a different flavor
-        # answers differently, and only the scheduler's is shared.
-        self.block_size = kv_pool.block_size
+        self._make_pool = make_pool
+        self._kv_pool = None
         self.num_blocks = 0  # set in allocate_kv_cache_tensors
+
+    @property
+    def kv_pool(self):
+        """The pool, built at the row count the walk found.
+
+        On demand because the draft model does not exist at `__init__`; every
+        reader is a sizing or binding step, which all run after it does. The
+        count is the walk's and not `num_hidden_layers`, or the pool is sized
+        off one number and addressed by another.
+
+        Indexed and not `.get(..., 0)`: this builder exists because the flavor
+        owns a pool, so no rows is a contradiction, and a pool of none prices
+        at zero and binds nothing -- a draft running on no KV at all. The
+        `KeyError` is the one `pool_rows` promises.
+        """
+        if self._kv_pool is None:
+            self._kv_pool = self._make_pool(layers=self.row_counts()[DRAFT_KV_ROWS])
+        return self._kv_pool
+
+    def invalidate_pool_rows(self) -> None:
+        """Drop the pool with the walk that sized it, so the two cannot part."""
+        super().invalidate_pool_rows()
+        self._kv_pool = None
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
         """`page_pool` puts the draft in the target's entry class, so the two
@@ -86,27 +114,31 @@ class DraftKvBuilder(PoolRowsMixin):
         that is what riding the target's block ids means.
         """
         runner = self.model_runner
+        pool, target = self.kv_pool, runner.attn_metadata_builder
         # The two blocks may differ in principle -- each backend picks its own
         # -- but a draft has no metadata of its own yet: `propose` hands it the
         # target builder's block tables, whose ids are at the target's block.
-        # So until it builds its own, they have to agree. Checked here because
-        # the draft's flavor resolves before the target's builder exists.
-        target = runner.attn_metadata_builder
-        assert self.kv_pool.block_size == target.block_size, (
-            f"the draft's blocks are {self.kv_pool.block_size} tokens and the "
-            f"target's {target.block_size}; a draft is indexed by the target's "
-            "block tables, so it cannot yet block at anything else"
-        )
+        # Raised and not asserted because both come from `--block-size` and two
+        # model configs, and `python -O` drops what it does not run.
+        if pool.block_size != target.block_size:
+            raise ValueError(
+                f"the draft's blocks are {pool.block_size} tokens and the "
+                f"target's {target.block_size}; a draft is indexed by the "
+                "target's block tables, so it cannot yet block at anything else"
+            )
         self.num_blocks = blocks
-        self.kv_pool.allocate(blocks, runner.device, buf=buf)
+        pool.allocate(blocks, runner.device, buf=buf)
         logger.info(
-            f"Allocated draft KV pool: {blocks} blocks, "
-            f"{self.kv_pool.pool_bytes(blocks)} B of the paged allocation"
+            "Allocated draft KV pool: %d blocks, %d B of the paged allocation",
+            blocks,
+            pool.pool_bytes(blocks),
         )
         return {}
 
     def release_kv_pools(self) -> None:
-        self.kv_pool.release()
+        # The field, not the property: releasing one nobody built would build it.
+        if self._kv_pool is not None:
+            self._kv_pool.release()
 
     def _pooled_models(self) -> list:
         """The draft's, and only the draft's -- this pool exists precisely

@@ -161,3 +161,81 @@ def test_neither_has_a_default(path, cls, fn, arg):
     del path, cls
     defaults = dict(zip((a.arg for a in fn.args.kwonlyargs), fn.args.kw_defaults))
     assert defaults.get(arg, "absent") is None
+
+
+# ── Who builds a draft a pool of its own ───────────────────────────────────
+#
+# Two members that have to agree: the flag `draft_kv_builder` reads, and the
+# factory it calls once the flag says yes. Getting the flag wrong is the silent
+# half -- a backend that builds pools but forgets to say so leaves its drafts
+# sharing the target's rows, which is a real layout for MLA and a wrong one
+# here. The other half is loud: the base factory raises.
+
+POOL_FACTORY = "make_kv_pool"
+DRAFT_FLAG = "DRAFT_OWNS_KV_POOL"
+# The declaration, which defines the factory in order to refuse it.
+FACTORY_DECLARATION = "AttentionBackend"
+
+
+def _classes_defining_the_factory() -> list[tuple[str, ast.ClassDef]]:
+    return [
+        (path.stem, cls)
+        for path in SOURCES
+        for cls in ast.walk(ast.parse(path.read_text(), filename=str(path)))
+        if isinstance(cls, ast.ClassDef)
+        and any(
+            isinstance(fn, ast.FunctionDef) and fn.name == POOL_FACTORY
+            for fn in cls.body
+        )
+    ]
+
+
+def _sets_the_flag_true(cls: ast.ClassDef) -> bool:
+    """Whether this class body assigns `DRAFT_OWNS_KV_POOL = True`, annotated
+    or not. Its own body: an inheriting backend gets the answer with the
+    factory, and the two cannot part."""
+    for stmt in cls.body:
+        targets = (
+            [stmt.target]
+            if isinstance(stmt, ast.AnnAssign)
+            else getattr(stmt, "targets", [])
+        )
+        if any(isinstance(t, ast.Name) and t.id == DRAFT_FLAG for t in targets):
+            return stmt.value is not None and getattr(stmt.value, "value", None) is True
+    return False
+
+
+def test_the_factory_is_declared_where_the_flag_is():
+    """Both on `AttentionBackend`, so a backend inherits a coherent pair
+    (no pool, and a factory that says so) rather than half of one."""
+    declarations = _classes_defining_the_factory()
+
+    assert FACTORY_DECLARATION in [cls.name for _, cls in declarations]
+
+
+@pytest.mark.parametrize(
+    "cls",
+    [
+        pytest.param(cls, id=f"{stem}.{cls.name}")
+        for stem, cls in _classes_defining_the_factory()
+        if cls.name != FACTORY_DECLARATION
+    ],
+)
+def test_a_backend_that_can_build_a_draft_pool_says_so(cls):
+    """The silent direction. Without the flag `draft_kv_builder` returns None
+    and the draft binds into the target's rows -- no error, no log, and a
+    draft reading K and V that are not its own."""
+    assert _sets_the_flag_true(cls)
+
+
+def test_a_geometry_row_space_names_itself_readably():
+    """`KvGeometry` is the one row space that is not a plain string, so it is
+    the one that needs a `__str__`: the default repr put
+    `KvGeometry(num_kv_heads=2, head_dim=256)` in a startup log beside
+    `linear_state`, and into the `semantic_role` a transfer region carries into
+    its error messages. Pinned by value because a shape is what a reader
+    recognizes."""
+    from atom.model_ops.attentions.pool_layout.pool_rows import KvGeometry
+
+    assert str(KvGeometry(2, 256)) == "h2d256"
+    assert f"mha.{KvGeometry(8, 128)}.k.layer_0" == "mha.h8d128.k.layer_0"

@@ -4,7 +4,7 @@
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, Optional, TypeVar
 
 if TYPE_CHECKING:
     from atom.kv_transfer.disaggregation.types import KVTransferTensors
@@ -73,6 +73,12 @@ class AttentionBackend(ABC):
     # makes sure the output tensor is allocated inside the cudagraph.
     accept_output_buffer: bool = False
 
+    #: Whether a *draft* of this flavor caches into a pool of its own. False
+    #: means its rows are the target's -- an MLA draft's latent is the target's
+    #: latent -- and `make_kv_pool` below is never asked. A property of the
+    #: flavor, so a class answer and not a call.
+    DRAFT_OWNS_KV_POOL: ClassVar[bool] = False
+
     @staticmethod
     @abstractmethod
     def get_name() -> str:
@@ -89,19 +95,22 @@ class AttentionBackend(ABC):
 
     @staticmethod
     def make_kv_pool(
-        hf_config, *, world_size: int, scheduler_block_size: int, kv_dtype
+        hf_config,
+        *,
+        world_size: int,
+        scheduler_block_size: int,
+        layers: int,
+        kv_dtype,
     ):
-        """A pool holding every layer this config declares, or None.
+        """A pool of `layers` rows at this config's geometry.
 
-        Asked of a *draft* model's backend — the target's layers are its
-        builder's own business. None means a draft of this flavor needs no
-        pool because its rows are the target's, which is why it is the
-        default: an MLA draft's latent is the target's latent.
-
-        Given the scheduler's block, which is one for the whole process: the
-        block its own kernels index is this backend's to pick, and it picks it
-        from `hf_config` rather than being told.
+        Asked of a *draft* model's backend, and only where `DRAFT_OWNS_KV_POOL`
+        — the target's layers are its builder's own business. `layers` and
+        `scheduler_block_size` are both told rather than read: the first only
+        the walk knows, the second is one for the whole process. The block this
+        backend's own kernels index it picks itself, from `hf_config`.
         """
+        raise NotImplementedError
 
 
 class AttentionMetadataBuilder(ABC, Generic[T]):

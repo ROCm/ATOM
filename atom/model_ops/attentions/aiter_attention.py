@@ -25,6 +25,7 @@ from atom.utils.tbo import TokenSplitPrefillState
 from .backends import AttentionBackend, CommonAttentionBuilder
 from .mha_kv_pool import MhaKvPool
 from .pool_layout.entry_arena import EntryField, carve
+from .pool_layout.pool_rows import KvGeometry
 from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool
 from .token_layout.decode import decode_positions
 from .token_layout.slots import slot_mapping
@@ -34,20 +35,6 @@ logger = logging.getLogger("atom")
 
 def cdiv(a, b):
     return (a + b - 1) // b
-
-
-class KvGeometry(NamedTuple):
-    """A KV row space, keyed by what one of its rows holds.
-
-    A type rather than a bare tuple so that "which row spaces are pools" is a
-    question with an answer -- a hybrid adds named row spaces of its own (the
-    indexer's keys, a linear-attention slot), and telling them apart by
-    exclusion means every new one has to be added to a list it does not know
-    about.
-    """
-
-    num_kv_heads: int
-    head_dim: int
 
 
 class _IndexCacheSpec(NamedTuple):
@@ -143,6 +130,10 @@ def _mtp_prepare_decode_metadata_kernel(
 
 
 class AiterBackend(AttentionBackend):
+    # An MHA draft keeps its own K and V; there is no target tensor its rows
+    # could be.
+    DRAFT_OWNS_KV_POOL: ClassVar[bool] = True
+
     @staticmethod
     def get_name() -> str:
         return "ATOM_ATTENTION"
@@ -179,13 +170,20 @@ class AiterBackend(AttentionBackend):
 
     @classmethod
     def make_kv_pool(
-        cls, hf_config, *, world_size: int, scheduler_block_size: int, kv_dtype
+        cls,
+        hf_config,
+        *,
+        world_size: int,
+        scheduler_block_size: int,
+        layers: int,
+        kv_dtype,
     ):
         attn_block_size = cls.attn_block_size(hf_config, scheduler_block_size)
         return MhaKvPool.from_hf_config(
             hf_config,
             world_size=world_size,
             block_size=attn_block_size,
+            layers=layers,
             blocks_per_entry=scheduler_block_size // attn_block_size,
             kv_dtype=kv_dtype,
         )
@@ -737,13 +735,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                     total_bytes=tensor.numel() * tensor.element_size(),
                     unit_bytes=tensor.stride(0) * tensor.element_size(),
                     # The geometry, because a hybrid declares two pools whose
-                    # per-layer regions are otherwise named alike. Spelled out
-                    # rather than interpolating the NamedTuple: this string is
-                    # the far end's only handle on a region, and its repr
-                    # carries the class and field names with it.
-                    semantic_role=(
-                        f"mha.h{geometry.num_kv_heads}" f"d{geometry.head_dim}.{role}"
-                    ),
+                    # per-layer regions are otherwise named alike.
+                    semantic_role=f"mha.{geometry}.{role}",
                 )
                 for geometry, pool in self.kv_pools.items()
                 for role, tensor in pool.region_tensors()
