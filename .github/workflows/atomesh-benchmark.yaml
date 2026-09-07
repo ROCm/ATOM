@@ -972,6 +972,7 @@ jobs:
               echo "WARNING: RDMA WRITE completed, but HCA affinity logging was unavailable for prefill GPU ${prefill_gpu_id}" >&2
             fi
             stop_target_process
+            touch "${SMOKE_RUN_DIR}/node-local-passed-${SMOKE_RANK}-${prefill_gpu_id}-${decode_gpu_id}"
             echo "GPUDirect RDMA passed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id} via decode HCAs ${decode_device_csv}"
           done
           echo "Node-local GPUDirect RDMA passed for all ${#local_prefill_gpu_ids[@]} prefill/decode GPU pairs"
@@ -1180,6 +1181,7 @@ jobs:
                   echo "ERROR: cross-node GPUDirect RDMA WRITE failed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}" >&2
                   exit 1
                 fi
+                touch "${SMOKE_RUN_DIR}/cross-node-passed-${prefill_gpu_id}-${decode_gpu_id}"
                 echo "Cross-node GPUDirect RDMA passed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}"
               fi
             done
@@ -1201,7 +1203,10 @@ jobs:
 
           slurm_status_file="${run_dir}/slurm-job.rc"
           rm -f "${slurm_status_file}" "${slurm_status_file}.tmp"
-          rm -f "${run_dir}"/rank-rc-*
+          rm -f \
+            "${run_dir}"/rank-rc-* \
+            "${run_dir}"/node-local-passed-* \
+            "${run_dir}"/cross-node-passed-*
           batch_script="${run_dir}/rdma-smoke.sbatch.sh"
           if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
             # Spur launches this script on each node with SPUR_TASK_OFFSET; srun is unavailable.
@@ -1370,45 +1375,41 @@ jobs:
             echo
 
             echo "### RDMA WRITE results"
-            python3 - "${log_files[@]}" <<'PY'
-          import re
+            python3 - "${run_dir}" <<'PY'
+          import os
           import sys
           from pathlib import Path
 
-          log_text = ""
-          for raw_path in sys.argv[1:]:
-              path = Path(raw_path)
+          run_dir = Path(sys.argv[1])
+          node_local_results = set()
+          for path in run_dir.glob("node-local-passed-*-*-*"):
               try:
-                  log_text += path.read_text(encoding="utf-8", errors="replace")
-              except OSError:
-                  pass
+                  _, _, _, rank, src, dst = path.name.split("-")
+                  node_local_results.add((int(rank), int(src), int(dst)))
+              except ValueError:
+                  continue
 
-          node_local_pairs = {
-              (int(src), int(dst))
-              for src, dst in re.findall(
-                  r"^GPUDirect RDMA passed from prefill GPU (\d+) "
-                  r"to decode GPU (\d+)",
-                  log_text,
-                  re.MULTILINE,
-              )
-          }
-          cross_node_pairs = {
-              (int(src), int(dst))
-              for src, dst in re.findall(
-                  r"^Cross-node GPUDirect RDMA passed from prefill GPU (\d+) "
-                  r"to decode GPU (\d+)",
-                  log_text,
-                  re.MULTILINE,
-              )
-          }
+          cross_node_pairs = set()
+          for path in run_dir.glob("cross-node-passed-*-*"):
+              try:
+                  _, _, _, src, dst = path.name.split("-")
+                  cross_node_pairs.add((int(src), int(dst)))
+              except ValueError:
+                  continue
 
           cross_rail_pairs = {(src, dst) for src in range(7) for dst in range(src + 1, 8)}
           same_index_pairs = {(gpu, gpu) for gpu in range(8)}
+          node_count = int(os.environ.get("RDMA_SMOKE_NODE_COUNT", "2"))
+          expected_node_local_results = {
+              (rank, src, dst)
+              for rank in range(node_count)
+              for src, dst in cross_rail_pairs
+          }
           pair_label = "GPU" + "、".join(
               f"{src}→{dst}" for src, dst in sorted(cross_rail_pairs)
           )
 
-          node_local_icon = "✅" if cross_rail_pairs <= node_local_pairs else "❌"
+          node_local_icon = "✅" if expected_node_local_results <= node_local_results else "❌"
           same_index_icon = "✅" if same_index_pairs <= cross_node_pairs else "❌"
           cross_rail_icon = "✅" if cross_rail_pairs <= cross_node_pairs else "❌"
 
