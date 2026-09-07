@@ -218,6 +218,7 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
+          mkdir -p perf-pair
           python3 - <<'PY'
           import json, os, pathlib
           meta = {
@@ -246,6 +247,13 @@ jobs:
         run: |
           docker exec ${{ env.CONTAINER }} bash -lc '.github/scripts/atom_test.sh stop' || true
           docker rm -f ${{ env.CONTAINER }} || true
+          # Safety net for a job that died before the halves could hand the
+          # workspace back: root-owned leftovers break the *next* job's
+          # actions/checkout, not this one, so the failure surfaces somewhere
+          # unrelated. Mirrors benchmark-tmpl.yml's Clean Up.
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged \
+            rocm/atom-dev:latest bash -lc \
+            "chown -R $(id -u):$(id -g) /workspace" || true
           git checkout -- . || true
 
   # ---------------------------------------------------------------- judge ---
