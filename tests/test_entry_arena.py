@@ -22,6 +22,8 @@ import torch
 from atom.model_ops.attentions.pool_layout.entry_arena import (
     EntryField,
     EntryMajorArena,
+    LayerMajorArena,
+    carve,
     checkpoint_ranges_for,
     entry_bytes_for,
     field_extents,
@@ -177,6 +179,44 @@ class TestInitialFill:
         arena.view("a").fill_(1.0)
         for i in range(arena.entries):
             assert (arena.entry(i)[12:] == 0).all()
+
+
+def test_carving_more_than_the_buffer_holds_is_refused():
+    """Python truncates an over-long slice instead of raising, so a short
+    buffer used to come back as a short last region and fail deeper in, as an
+    arena quoting its own field bytes -- a number the caller never chose."""
+    with pytest.raises(ValueError, match="cannot hold"):
+        carve(torch.zeros(300, dtype=torch.uint8), [256, 256])
+
+
+class TestALayerMajorArenaCannotFillSomeoneElsesBuffer:
+    """It is handed a buffer by two callers that want opposite things.
+
+    One is the runner's freshly zeroed paged allocation, where applying the
+    declared fill is right. The other is an IPC-imported pool that already
+    holds the peer's KV, where applying it would erase that. The arena cannot
+    tell which it got, so it refuses the only declaration where the answer
+    matters instead of picking one and being wrong half the time.
+    """
+
+    def test_a_zero_fill_field_is_fine(self):
+        """Which is every field a paged pool declares today -- the refusal
+        below costs nothing until someone adds one that is not."""
+        fields = [EntryField("k", 2, (4,), torch.float32)]
+        buf = torch.zeros(LayerMajorArena(fields, 3, device="cpu").total_bytes)
+
+        LayerMajorArena(fields, 3, device="cpu", buf=buf.to(torch.uint8))
+
+    def test_a_non_zero_fill_field_is_refused(self):
+        """Silently dropping it is the failure this replaces: a `-inf` score
+        plane arriving as 0.0 turns "never selected" into "always selected",
+        and no allocation or byte count is wrong."""
+        fields = [EntryField("score", 2, (4,), torch.float32, fill=NEG_INF)]
+        want = LayerMajorArena(fields, 3, device="cpu").total_bytes
+        buf = torch.zeros(want, dtype=torch.uint8)
+
+        with pytest.raises(ValueError, match="non-zero fill"):
+            LayerMajorArena(fields, 3, device="cpu", buf=buf)
 
 
 class TestMixedDtypes:

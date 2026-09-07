@@ -116,9 +116,17 @@ def carve(buf: torch.Tensor | None, sizes: list[int]) -> list[torch.Tensor | Non
     offsets. `None` in, `None`s out: a pool that owns its memory carves
     nothing and lets each arena allocate.
     """
-    offsets, _ = plan_regions(sizes)
+    offsets, total = plan_regions(sizes)
     if buf is None:
         return [None] * len(sizes)
+    # Slicing past the end truncates rather than raising, so a short buffer
+    # comes back as a short last region and surfaces as an arena complaining
+    # about bytes the caller never chose.
+    if buf.numel() < total:
+        raise ValueError(
+            f"a buffer of {buf.numel()} B cannot hold {len(sizes)} regions "
+            f"needing {total} B"
+        )
     return [buf[start : start + size] for start, size in zip(offsets, sizes)]
 
 
@@ -532,6 +540,17 @@ class LayerMajorArena:
                     f"buf must start on a {self._align}B boundary, got storage "
                     f"offset {buf.storage_offset()}: field views retype the "
                     "buffer, which needs the offset to divide every itemsize"
+                )
+            # Refused and not applied: the buffer may be an imported pool
+            # already holding the peer's KV, which the arena cannot tell from a
+            # fresh one. Refused and not dropped either -- a `-inf` score plane
+            # arriving as 0.0 turns "never selected" into "always".
+            unfillable = [f.name for f in self.fields if f.fill]
+            if unfillable:
+                raise ValueError(
+                    f"fields {unfillable} declare a non-zero fill, which an "
+                    "arena over a caller's buffer cannot apply; give the "
+                    "caller the fill before declaring one"
                 )
             self.buf = buf
 
