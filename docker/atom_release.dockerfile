@@ -232,6 +232,12 @@ ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT="HEAD"
 ARG PREBUILD_KERNELS=1
 ARG MAX_JOBS
+# Keep AITER compiled against the Triton the base image ships (the ROCm 10
+# SDK's 3.8.0 build). Without this, AITER's setup resolves its own Triton
+# from PyPI and the prebuilt kernels then mismatch the runtime Triton.
+# Only meaningful on the rocm10 flavor (the rocm/pytorch apt images carry a
+# Triton AITER already agrees with), but harmless to set everywhere.
+ENV AITER_USE_SYSTEM_TRITON=1
 
 RUN pip install --upgrade setuptools_scm
 RUN echo "========== [Parallel] Building Aiter ==========" && \
@@ -242,6 +248,41 @@ RUN echo "========== [Parallel] Building Aiter ==========" && \
     pip install -r requirements.txt && \
     MAX_JOBS=$MAX_JOBS PREBUILD_KERNELS=$PREBUILD_KERNELS \
     GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop
+
+# torch 2.11 (the ROCm 10 stack) Dynamo may pass a base torch.Stream where
+# older torch passed torch.cuda.Stream; AITER's ctypes bridge then reads
+# .cuda_stream off a stream that does not carry it. Backport the torch.Stream
+# branch from ROCm/aiter#4817 until AITER_COMMIT contains it upstream.
+# The guard is inside the python (a no-op on non-rocm10 flavors) because a
+# Dockerfile heredoc cannot sit inside a shell if/then block.
+RUN python3 - <<'PY'
+import os
+from pathlib import Path
+
+if os.environ.get("ATOM_BASE_IMAGE") != "rocm10-base":
+    print("not the rocm10 flavor; skipping torch.Stream patch")
+else:
+    p = Path("/app/aiter-test/aiter/csrc/cpp_itfs/torch_utils.py")
+    s = p.read_text()
+    old = """        elif isinstance(arg, torch.cuda.Stream):
+            c_args.append(ctypes.cast(arg.cuda_stream, ctypes.c_void_p))
+"""
+    new = """        elif isinstance(arg, torch.Stream):
+            handle = getattr(arg, "cuda_stream", None)
+            if handle is None:
+                handle = torch.cuda.Stream(
+                    stream_id=arg.stream_id,
+                    device_index=arg.device_index,
+                    device_type=arg.device_type,
+                ).cuda_stream
+            c_args.append(ctypes.cast(handle, ctypes.c_void_p))
+"""
+    if old in s:
+        p.write_text(s.replace(old, new))
+        print("patched torch_utils.py for torch 2.11 torch.Stream")
+    else:
+        print("torch_utils.py already carries the torch.Stream branch (upstream fix landed)")
+PY
 
 # --------------------------------------------------------------------
 # Stage 3: Final merge — collect all build artifacts + install MORI/ATOM
@@ -256,7 +297,23 @@ RUN pip install lm-eval[api]
 # MORI: install the prebuilt nightly wheel directly (no source build needed).
 # The `amd-mori-nightly` PyPI package provides the `mori` Python module.
 # See: https://pypi.org/project/amd-mori-nightly/
+# On the rocm10 flavor the pip SDK vendors NUMA and libdrm under
+# _rocm_sdk_devel/lib/rocm_sysdeps, which is on none of the search paths the
+# MORI import path needs (rocm_smi.h reaches for <libdrm/drm.h>, mori_application
+# links -ldrm/-ldrm_amdgpu). Register it via ldconfig like sglang does for its
+# rocm1000 MORI build; every soname in there is librocm_sysdeps_*-prefixed, so
+# it shadows nothing system-wide.
 RUN echo "========== [ATOM] Installing MORI nightly ==========" && \
+    if [ "${ATOM_BASE_IMAGE}" = "rocm10-base" ]; then \
+        ROCM_SYSDEPS="${ROCM_HOME:-/opt/rocm}/lib/rocm_sysdeps"; \
+        if [ -d "${ROCM_SYSDEPS}" ]; then \
+            echo "${ROCM_SYSDEPS}/lib" > /etc/ld.so.conf.d/rocm-sysdeps.conf; \
+            export CPATH="${ROCM_SYSDEPS}/include${CPATH:+:${CPATH}}"; \
+            export LIBRARY_PATH="${ROCM_SYSDEPS}/lib${LIBRARY_PATH:+:${LIBRARY_PATH}}"; \
+            ldconfig; \
+            echo "registered rocm_sysdeps: ${ROCM_SYSDEPS}"; \
+        fi; \
+    fi && \
     pip install --pre amd-mori-nightly && \
     python -c "import mori; print(f'mori: {mori.__file__}')" && \
     pip show amd-mori-nightly
@@ -452,6 +509,30 @@ RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
         command -v aiperf && aiperf --help >/dev/null; \
     else \
         echo "========== Skipped SemiAnalysis aiperf (INSTALL_SA_AIPERF=0) =========="; \
+    fi
+
+# ========== Final ROCm 10 stack validation ==========
+# Last line of defense, after every component install has had its chance to
+# perturb the stack: the torch trio must still be the +rocm10.x builds, Triton
+# must still be the SDK's, no NVIDIA CUDA runtime package may be present, and
+# pip check must be clean. A failure here means some component's requirements
+# silently replaced the ROCm stack — the exact failure mode PIP_CONSTRAINT
+# exists to prevent, so treat it as a broken image, not a warning.
+RUN if [ "${ATOM_BASE_IMAGE}" = "rocm10-base" ]; then \
+        echo "========== [ATOM] Final ROCm 10 stack validation =========="; \
+        python -m pip check && \
+        python -c "import torch, triton, torchvision, torchaudio; \
+assert torch.version.hip is not None, torch.__version__; \
+assert '+rocm10' in torch.__version__, torch.__version__; \
+assert 'rocm10' in triton.__version__, triton.__version__; \
+print('final stack: torch', torch.__version__, '| triton', triton.__version__, \
+      '| torchvision', torchvision.__version__, '| torchaudio', torchaudio.__version__)" && \
+        if pip list --format=freeze 2>/dev/null | grep -Eq '^nvidia-.*-cu[0-9]+'; then \
+            echo "ERROR: NVIDIA CUDA runtime packages leaked into the final image"; \
+            exit 1; \
+        fi && \
+        python -c "import amdsmi, aiter, mori, atom; \
+print('component imports ok: amdsmi, aiter, mori, atom')"; \
     fi
 
 CMD ["/bin/bash"]
