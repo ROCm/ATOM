@@ -1574,26 +1574,23 @@ def test_warming_the_block_on_a_dummy_context_is_refused(monkeypatch):
     assert reached == ["backbone"]
 
 
-def test_the_separate_draft_model_path_declares_no_draft_graph(monkeypatch):
-    """Kimi-K3 must declare NO pass, not merely an unpaddable one.
+def test_both_flavors_declare_one_block_pass_bound_to_their_own_halves(monkeypatch):
+    """Each flavor declares exactly one block pass, bound to its own functions.
 
-    Its draft carries neither `window_size` nor `model.head_and_sample`, which
-    the warmup and epilogue reach for -- and `warmup` runs both BEFORE it
-    consults the pad/capture gates. So an unpaddable-but-declared pass still
-    takes the startup sweep through `_block_warmup_inputs` and dies with an
-    AttributeError, so declining to pad was never enough to keep it out.
+    The bindings are the whole point of the declaration: both flavors reach
+    `propose`'s one stage/run/label path, and the backbones differ in shape.
     """
     from atom.spec_decode.dspark_proposer import DSparkProposer
 
     p = _proposer_with_graph_bs(monkeypatch)
-    assert p.draft_graphs and p.block is not None
+    assert p.draft_graphs == (p.block,)
+    assert p.block.forward == p._block_backbone
 
     monkeypatch.setattr(DSparkProposer, "_with_draft", True, raising=False)
     p._build_draft_graphs()
-    assert p.draft_graphs == ()
-    # None, not absent and not the pass a previous build left behind: rebuilding
-    # is what the flavor probes in these tests do, and `propose` reads this.
-    assert p.block is None
+    assert p.draft_graphs == (p.block,)
+    assert p.block.forward == p._paged_block_backbone
+    assert p.block.epilogue == p._paged_block_head
 
 
 def test_qk_norm_rope_short_circuits_dummy_run():
