@@ -2,21 +2,27 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+from typing import ClassVar
 
 import torch
 
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_ops.attention_mha import PagedAttentionImpl
 from atom.utils import envs
 
-from .aiter_attention import AiterAttentionMetadataBuilder
-from .backends import AttentionBackend
-from .mha_kv_pool import MhaKvPool
+from .aiter_attention import AiterAttentionMetadataBuilder, AiterBackend
 
 logger = logging.getLogger("atom")
 
 
-class TritonMHABackend(AttentionBackend):
+class TritonMHABackend(AiterBackend):
+    """`AiterBackend`'s cache read by a different kernel.
+
+    A subclass and not a peer because that is the whole difference: one pool,
+    one layout, one block rule, and the two answer `get_impl_cls` alike. Stated
+    by inheritance so a rule added to the base cannot be forgotten here -- the
+    pool and the block size used to be forwarded by hand.
+    """
+
     @staticmethod
     def get_name() -> str:
         return "ROCM_TRITON_MHA"
@@ -24,21 +30,6 @@ class TritonMHABackend(AttentionBackend):
     @staticmethod
     def get_builder_cls() -> type["TritonMHAMetadataBuilder"]:
         return TritonMHAMetadataBuilder
-
-    @staticmethod
-    def get_impl_cls():
-        return PagedAttentionImpl
-
-    @staticmethod
-    def make_kv_pool(hf_config, *, world_size: int, block_size: int, kv_dtype):
-        # Same pool as `AiterBackend`: the two read one cache at one layout,
-        # and differ only in which kernel reads it.
-        return MhaKvPool.from_hf_config(
-            hf_config,
-            world_size=world_size,
-            block_size=block_size,
-            kv_dtype=kv_dtype,
-        )
 
 
 class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):
@@ -50,6 +41,8 @@ class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):
     Consumed by aiter triton `unified_attention` with `shuffled_kv_cache=True`
     for both prefill and decode.
     """
+
+    BACKEND: ClassVar[type[AiterBackend]] = TritonMHABackend
 
     def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
         attn_metadata, positions = super().prepare_prefill(batch, running_bs)

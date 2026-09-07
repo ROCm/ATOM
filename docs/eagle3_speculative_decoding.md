@@ -185,7 +185,7 @@ draft sized to K2.6, which is not yet publicly available.
   custom HF modeling code, and `Stream` cannot be pickled.
 - **`mtp_start_layer_idx` dispatch** in `atom/model_engine/model_runner.py`
   branches on `speculative_config.method == "eagle3"`, not on the presence
-  of `eagle3_draft_builder`. MLA drafts piggyback the target pool and so
+  of `draft_kv_builder`. MLA drafts piggyback the target pool and so
   have no draft builder, but they still need the layer-index offset.
 - **Do not modify `@support_torch_compile`-decorated model files** for
   EAGLE-related changes — instrument at call sites (`EagleProposer.propose`,

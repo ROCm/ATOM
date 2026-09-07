@@ -31,7 +31,10 @@ def draft_kv_builder(model_runner, draft_hf):
     pool = backend.make_kv_pool(
         draft_hf,
         world_size=model_runner.world_size,
-        block_size=model_runner.block_size,
+        # The scheduler's, which every model in the process shares. Which block
+        # the draft's own kernels index is its backend's to decide, from the
+        # draft's config -- another flavor is free to answer differently.
+        scheduler_block_size=model_runner.block_size,
         kv_dtype=dtypes.d_dtypes[model_runner.config.kv_cache_dtype],
     )
     return None if pool is None else DraftKvBuilder(model_runner, pool)
@@ -55,10 +58,9 @@ class DraftKvBuilder(PoolRowsMixin):
     def __init__(self, model_runner, kv_pool):
         self.model_runner = model_runner
         self.kv_pool = kv_pool
+        # The draft's own block, from its own backend -- a different flavor
+        # answers differently, and only the scheduler's is shared.
         self.block_size = kv_pool.block_size
-        # Same name and unit as a real builder's, since this one also answers
-        # the runner's allocate hook. No `block_ratio` factor: the assertion
-        # below holds the draft's page to the scheduler's.
         self.num_blocks = 0  # set in allocate_kv_cache_tensors
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
@@ -81,14 +83,19 @@ class DraftKvBuilder(PoolRowsMixin):
         readers.
 
         One entry per scheduler block, the count the target was built at --
-        that is what riding the target's block ids means. The assertion is the
-        other half: a pool paging at anything else would be charged per
-        scheduler block and built per its own page.
+        that is what riding the target's block ids means.
         """
         runner = self.model_runner
-        assert self.block_size == runner.block_size, (
-            f"a draft pool has to page at the scheduler block to share its "
-            f"ids: pool {self.block_size} vs scheduler {runner.block_size}"
+        # The two blocks may differ in principle -- each backend picks its own
+        # -- but a draft has no metadata of its own yet: `propose` hands it the
+        # target builder's block tables, whose ids are at the target's block.
+        # So until it builds its own, they have to agree. Checked here because
+        # the draft's flavor resolves before the target's builder exists.
+        target = runner.attn_metadata_builder
+        assert self.kv_pool.block_size == target.block_size, (
+            f"the draft's blocks are {self.kv_pool.block_size} tokens and the "
+            f"target's {target.block_size}; a draft is indexed by the target's "
+            "block tables, so it cannot yet block at anything else"
         )
         self.num_blocks = blocks
         self.kv_pool.allocate(blocks, runner.device, buf=buf)
@@ -97,16 +104,6 @@ class DraftKvBuilder(PoolRowsMixin):
             f"{self.kv_pool.pool_bytes(blocks)} B of the paged allocation"
         )
         return {}
-
-    def adopt_imported_kv_pool(self, blocks: int, buf) -> None:
-        """Same declaration over the region of an imported pool.
-
-        The draft rides the target's blocks, so its bytes travel inside the
-        same handle; what makes them findable is that both sides carve with
-        the same `paged_pool_bytes` walk.
-        """
-        self.num_blocks = blocks
-        self.kv_pool.allocate(blocks, self.model_runner.device, buf=buf)
 
     def release_kv_pools(self) -> None:
         self.kv_pool.release()
@@ -157,6 +154,9 @@ class DraftKvBuilder(PoolRowsMixin):
                 base_addr=t.data_ptr(),
                 total_bytes=t.numel() * t.element_size(),
                 unit_bytes=t.stride(0) * t.element_size(),
+                # The draft's rows sit in the same block ids as the target's,
+                # so its regions need a name that says which stack they are.
+                semantic_role=f"draft.{role}",
             )
-            for t in self.kv_pool.region_tensors()
+            for role, t in self.kv_pool.region_tensors()
         ]

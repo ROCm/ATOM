@@ -29,10 +29,9 @@ from test_layout_packages import imported_modules
 
 from atom.model_ops.attentions.mha_kv_pool import (
     MhaKvPool,
-    mha_kv_fields,
     shuffle_pack,
 )
-from atom.model_ops.attentions.pool_layout.entry_arena import plan_regions
+from atom.model_ops.attentions.pool_layout.entry_arena import EntryField, plan_regions
 
 # The deployed MiniMax-M3 pair, at tp4: a 60-layer target with 4 KV heads, and
 # a 1-layer EAGLE3 draft with 64 -- three heterogeneous contributors to one
@@ -40,80 +39,209 @@ from atom.model_ops.attentions.pool_layout.entry_arena import plan_regions
 # e2e gate for this.
 TARGET = {"layers": 60, "num_kv_heads": 1, "head_dim": 128, "block_size": 128}
 DRAFT = {"layers": 1, "num_kv_heads": 16, "head_dim": 128, "block_size": 128}
-DTYPES = [torch.float8_e4m3fnuz, torch.bfloat16]
+FP8 = torch.float8_e4m3fnuz
+DTYPES = [FP8, torch.bfloat16]
+# The backend that pages at 16 while the scheduler blocks at 128, on a shape
+# where nothing coincides: `head_dim != block_size` so `hd // x` and
+# `block_size // x` differ, and bf16's pack of 8 differs from the block so V's
+# outer half is not one. At fp8 every one of those collapses.
+SMALL_BLOCK = {"layers": 2, "num_kv_heads": 1, "head_dim": 64, "block_size": 16}
+BLOCKS_PER_ENTRY, ENTRIES = 8, 2
 # M3's indexer keys: 57 of the 60 layers own one, `sparse_index_dim` wide, at
 # the cache dtype (the config names no `index_cache_dtype`).
-INDEX = {
-    "index_layers": 57,
-    "index_dim": 128,
-    "index_dtype": torch.float8_e4m3fnuz,
-}
+INDEX_LAYERS, INDEX_DIM, INDEX_DTYPE = 57, 128, torch.float8_e4m3fnuz
 
 
-def build(spec=TARGET, kv_dtype=torch.float8_e4m3fnuz, blocks=8) -> MhaKvPool:
+def index_field(spec=TARGET, blocks_per_entry=1) -> EntryField:
+    """The indexer field as `AiterAttentionMetadataBuilder` declares it.
+
+    Spelled out here, not imported: the backend owns this arithmetic now, and
+    a test that shared the expression with it would only restate it.
+    """
+    per_entry = spec["block_size"] * blocks_per_entry * INDEX_DIM * INDEX_DTYPE.itemsize
+    return EntryField("index", INDEX_LAYERS, (per_entry,), torch.uint8)
+
+
+def index_view(pool: MhaKvPool, layer: int) -> torch.Tensor:
+    """And what the binder shapes it back into."""
+    return pool.field_view(
+        "index", layer, INDEX_DTYPE, (-1, pool.block_size, INDEX_DIM)
+    )
+
+
+def build(spec=TARGET, kv_dtype=torch.float8_e4m3fnuz, entries=8) -> MhaKvPool:
     pool = MhaKvPool(**spec, kv_dtype=kv_dtype)
-    pool.allocate(blocks, "cpu")
+    pool.allocate(entries, "cpu")
     return pool
 
 
-def INDEXED(kv_dtype=torch.float8_e4m3fnuz, blocks=0) -> MhaKvPool:
-    """The target pool as M3 declares it. Unallocated at `blocks=0`, which is
+def INDEXED(kv_dtype=torch.float8_e4m3fnuz, entries=0) -> MhaKvPool:
+    """The target pool as M3 declares it. Unallocated at `entries=0`, which is
     the state sizing asks `entry_bytes` in."""
-    pool = MhaKvPool(**TARGET, **INDEX, kv_dtype=kv_dtype)
-    if blocks:
-        pool.allocate(blocks, "cpu")
+    pool = MhaKvPool(**TARGET, extra_fields=(index_field(),), kv_dtype=kv_dtype)
+    if entries:
+        pool.allocate(entries, "cpu")
     return pool
 
 
+@pytest.mark.parametrize("blocks_per_entry", [1, 8], ids=["one", "eight"])
 @pytest.mark.parametrize("kv_dtype", DTYPES, ids=lambda d: str(d).split(".")[-1])
 @pytest.mark.parametrize("spec", [TARGET, DRAFT], ids=["target", "draft"])
-class TestTheDeclaredElementOrder:
-    """K `[nh, hd//x, bs, x]` and V `[nh, bs//x, hd, x]` — the SHUFFLE layout.
+class TestTheElementOrderABinderGets:
+    """K `[blocks, nh, hd//x, bs, x]` and V `[blocks, nh, bs//x, hd, x]`.
+
+    Asserted on `kv_views` and not on the fields, because that is where the
+    order is: a field says what an entry costs, which is the same number
+    whichever way its tokens lie, and nothing outside this module reads a
+    field's shape.
 
     Not a formatting preference. The fused writer produces this order and
     `cp_mha_gather_cache_kernel` reads it in place; declaring V the other way
     round sends `_gather_prefix_and_concat_kv` down its densifying branch,
     which relaid a 1.4 GiB draft pool once per chunked-prefill forward.
+
+    `blocks_per_entry` moves the block count and nothing else, which is the
+    claim: an entry is an accounting unit and no shape is taken at it.
     """
 
-    def test_k_and_v_are_the_shuffle_shapes(self, spec, kv_dtype):
-        k, v = mha_kv_fields(**spec, kv_dtype=kv_dtype)
+    ENTRIES = 4
+
+    def _views(self, spec, kv_dtype, blocks_per_entry):
+        pool = MhaKvPool(**spec, kv_dtype=kv_dtype, blocks_per_entry=blocks_per_entry)
+        pool.allocate(self.ENTRIES, "cpu")
+        return pool.kv_views(0)
+
+    def test_k_and_v_are_the_shuffle_shapes(self, spec, kv_dtype, blocks_per_entry):
+        k, v = self._views(spec, kv_dtype, blocks_per_entry)
         x = shuffle_pack(kv_dtype)
         nh, hd, bs = spec["num_kv_heads"], spec["head_dim"], spec["block_size"]
+        blocks = self.ENTRIES * blocks_per_entry
 
-        assert k.shape == (nh, hd // x, bs, x)
-        assert v.shape == (nh, bs // x, hd, x)
+        assert k.shape == (blocks, nh, hd // x, bs, x)
+        assert v.shape == (blocks, nh, bs // x, hd, x)
 
-    def test_v_is_five_dimensional(self, spec, kv_dtype):
+    def test_v_is_five_dimensional(self, spec, kv_dtype, blocks_per_entry):
         """The ndim is load-bearing on its own, which is why it gets its own
         assertion: the reader branches on it and accepts either answer."""
-        _, v = mha_kv_fields(**spec, kv_dtype=kv_dtype)
+        _, v = self._views(spec, kv_dtype, blocks_per_entry)
 
-        assert len(v.shape) == 4, "plus the leading (layer, block) pair = 5-D"
+        assert v.ndim == 5
 
-    def test_one_pack_serves_both_views(self, spec, kv_dtype):
+    def test_one_pack_serves_both_views(self, spec, kv_dtype, blocks_per_entry):
         """A mismatch would misread V only, and only for some head_dims."""
-        k, v = mha_kv_fields(**spec, kv_dtype=kv_dtype)
+        k, v = self._views(spec, kv_dtype, blocks_per_entry)
 
         assert k.shape[-1] == v.shape[-1] == shuffle_pack(kv_dtype)
 
-    def test_k_and_v_are_the_same_size(self, spec, kv_dtype):
+    def test_k_and_v_are_the_same_size(self, spec, kv_dtype, blocks_per_entry):
         """Whatever the order, a block holds as much V as K."""
-        k, v = mha_kv_fields(**spec, kv_dtype=kv_dtype)
+        k, v = self._views(spec, kv_dtype, blocks_per_entry)
 
-        assert k.per_layer_numel == v.per_layer_numel
+        assert k.numel() == v.numel()
+
+
+class TestAnEntryIsSeveralBlocksAndNothingReadsAtIt:
+    """The pool holds `entries * blocks_per_entry` blocks, laid end to end.
+
+    An entry is what `page_pool` charges per, because that is the scheduler's
+    unit and the index space a draft shares. Nothing reads at it: the block
+    tables a kernel gets were expanded by `block_ratio`, so its ids run over
+    every block, and `asm_pa.cu` multiplies one by a single `K->stride(0)`.
+    Binding a layer per entry instead leaves the ids eight times too large for
+    the tensor and the stride eight times too long -- the same bytes, addressed
+    as a different number of units, which no byte total distinguishes.
+
+    bf16 throughout: at fp8 the pack is 16 and so is the block, which collapses
+    V's `block_size // x` to one and makes K and V look alike.
+    """
+
+    def _bound(self, name):
+        """`(the layer's region, what a binder gets, the shape it must have)`."""
+        pool = MhaKvPool(
+            **SMALL_BLOCK, kv_dtype=torch.bfloat16, blocks_per_entry=BLOCKS_PER_ENTRY
+        )
+        pool.allocate(ENTRIES, "cpu")
+        x = shuffle_pack(torch.bfloat16)
+        nh, hd, bs = (
+            SMALL_BLOCK["num_kv_heads"],
+            SMALL_BLOCK["head_dim"],
+            SMALL_BLOCK["block_size"],
+        )
+        per_block = (nh, hd // x, bs, x) if name == "k" else (nh, bs // x, hd, x)
+        bound = pool.kv_views(0)[0 if name == "k" else 1]
+        return pool._views[name][0], bound, (ENTRIES * BLOCKS_PER_ENTRY, *per_block)
+
+    @pytest.mark.parametrize("name", ["k", "v"])
+    def test_a_layer_binds_at_the_block(self, name):
+        """Every block of every entry, which is the id space the block tables
+        address -- not one unit per entry."""
+        _, bound, want = self._bound(name)
+
+        assert bound.shape == want
+
+    @pytest.mark.parametrize("name", ["k", "v"])
+    def test_the_view_is_not_a_copy(self, name):
+        """The pool is gigabytes; a relayout here would move all of it once per
+        bind. Free because an entry's bytes are contiguous, so the blocks in it
+        are just the leading dim shaped out."""
+        region, bound, _ = self._bound(name)
+
+        assert bound.data_ptr() == region.data_ptr()
+        assert bound.is_contiguous()
+
+    @pytest.mark.parametrize("name", ["k", "v"])
+    def test_one_stride_reaches_every_block(self, name):
+        """`asm_pa.cu` reads `K->stride(0)` and multiplies a block id by it, so
+        the step across an entry boundary has to be the step inside one."""
+        _, bound, _ = self._bound(name)
+        steps = {
+            bound[b + 1].data_ptr() - bound[b].data_ptr()
+            for b in range(bound.shape[0] - 1)
+        }
+
+        assert steps == {bound.stride(0) * bound.element_size()}
+
+    @pytest.mark.parametrize("name", ["k", "v"])
+    def test_the_bytes_are_the_layout_this_replaced(self, name):
+        """The gate for the change: not "equivalent", identical.
+
+        What shipped before was `[blocks, ...]` dense at the backend's block.
+        Marking the region in storage order and reading it back through the
+        binder's view has to give exactly that -- otherwise a kernel reads the
+        right count of the wrong bytes, which no shape or byte total says
+        anything about.
+        """
+        region, bound, want = self._bound(name)
+        # `region` is the field's bytes; two of them make one bf16 element, so
+        # the marks are counted in elements.
+        marked = region.view(torch.int16).reshape(-1)
+        marks = torch.arange(marked.numel(), dtype=torch.int16)
+        marked.copy_(marks)
+
+        assert torch.equal(bound.view(torch.int16), marks.reshape(want))
 
 
 def test_a_pack_that_does_not_divide_the_shapes_is_refused():
-    """Silently rounding would give a cache a fraction of a tile per head."""
+    """Silently rounding would give a cache a fraction of a tile per head.
+
+    On the pool and not on the fields: the fields are bytes now, and bytes
+    divide by anything. The pack is a property of how they are read.
+    """
     with pytest.raises(ValueError, match="head_dim 100"):
-        mha_kv_fields(
+        MhaKvPool(
             layers=1,
             block_size=128,
             num_kv_heads=1,
             head_dim=100,
             kv_dtype=torch.bfloat16,
         )
+
+
+def test_an_entry_of_no_blocks_is_refused():
+    """`blocks_per_entry` is `block_ratio`, which comes of a launch flag over
+    the backend's own block -- so zero is a bad pairing, not a code change."""
+    with pytest.raises(ValueError, match="at least one block"):
+        MhaKvPool(**TARGET, kv_dtype=torch.bfloat16, blocks_per_entry=0)
 
 
 class TestTheBytesItLaysOut:
@@ -125,15 +253,20 @@ class TestTheBytesItLaysOut:
     which this refactor is allowed to do.
     """
 
-    @pytest.mark.parametrize("kv_dtype", DTYPES, ids=lambda d: str(d).split(".")[-1])
-    def test_entry_bytes_is_what_the_old_formula_charged(self, kv_dtype):
+    def test_entry_bytes_is_what_the_old_formula_charged(self):
         """Byte-exact, not "about the same": this number times the block count
-        is the pool, so a difference is capacity moving."""
-        s, itemsize = TARGET, kv_dtype.itemsize
+        is the pool, so a difference is capacity moving.
+
+        fp8 only. The old formula charged the fp32 scale planes at every dtype,
+        and a bf16 cache no longer declares them -- deliberately, since nothing
+        binds them there; `test_a_bf16_cache_declares_no_scales_at_all` is that
+        departure, stated as its own claim rather than folded in here.
+        """
+        s = TARGET
         cache = 2 * s["layers"] * s["block_size"] * s["num_kv_heads"] * s["head_dim"]
         scale = 2 * s["layers"] * s["num_kv_heads"] * s["block_size"] * 4
 
-        assert MhaKvPool(**s, kv_dtype=kv_dtype).entry_bytes == cache * itemsize + scale
+        assert MhaKvPool(**s, kv_dtype=FP8).entry_bytes == cache * FP8.itemsize + scale
 
     def test_k_comes_first_and_v_follows_it(self):
         """The order the `[2, layers, ...]` allocation held them in."""
@@ -156,7 +289,7 @@ class TestTheBytesItLaysOut:
     def test_the_allocation_is_no_larger_than_the_budget(self):
         """Sizing calls `entry_bytes` before any GPU exists; the allocation
         must come out of the same expression or the two drift."""
-        pool = build(blocks=8)
+        pool = build(entries=8)
 
         held = pool.cache.buf.numel() + pool.scale.buf.numel()
         assert held == 8 * pool.entry_bytes
@@ -178,7 +311,7 @@ class TestWhatABinderGetsBack:
 
     def test_each_layer_gets_its_own_slice(self):
         """One layer is the shipped draft, which would hide an indexing bug."""
-        pool = build(blocks=4)
+        pool = build(entries=4)
         k = pool.cache.view("k")
         stride = k[1].data_ptr() - k[0].data_ptr()
 
@@ -188,12 +321,32 @@ class TestWhatABinderGetsBack:
                 k[0].data_ptr() + layer * stride
             )
 
-    def test_the_scales_are_allocated_for_a_bf16_cache_too(self):
-        """The byte budget has always priced them; only an fp8 cache reads
-        through them, which is the binder's call and not the pool's."""
+    def test_a_bf16_cache_declares_no_scales_at_all(self):
+        """Nothing binds them: `build_kv_cache_tensor` sets `k_scale`/`v_scale`
+        on a module only for fp8, and every reader is guarded on that. So the
+        two fp32 planes a bf16 entry used to buy per layer were unreachable --
+        charged, allocated, and registered for P/D transfer with no consumer.
+
+        Asserted on the declaration and not just the allocation because the
+        declaration is what sizing charges: leaving the fields in and skipping
+        the `torch.zeros` would still take the entries out of the budget.
+        """
         pool = build(kv_dtype=torch.bfloat16)
 
-        assert pool.scale_views(0)[0].numel() > 0
+        assert pool.scale_fields == []
+        assert pool.scale is None
+        assert not any(name.endswith("_scale") for name in pool._views)
+
+    def test_dropping_them_is_worth_a_block_in_sixty_four(self):
+        """The size of the thing, so a later change that quietly puts them back
+        fails here rather than surfacing as a capacity number in a server log.
+        """
+        rows = 2 * TARGET["layers"] * TARGET["num_kv_heads"] * TARGET["block_size"]
+        cache = rows * TARGET["head_dim"] * torch.bfloat16.itemsize
+        scales = rows * 4  # what the fp32 planes cost when they were declared
+
+        assert MhaKvPool(**TARGET, kv_dtype=torch.bfloat16).entry_bytes == cache
+        assert scales * 64 == cache
 
 
 class TestTheTransferGranularity:
@@ -206,9 +359,22 @@ class TestTheTransferGranularity:
         regions = pool.region_tensors()
 
         assert len(regions) == 4 * TARGET["layers"]
-        assert [r.dtype for r in regions[: 2 * TARGET["layers"]]] == [
-            torch.float8_e4m3fnuz
-        ] * (2 * TARGET["layers"])
+        # Bytes, which is what a transfer moves and all it needs to know: a
+        # region carries a base, a span and a per-block stride, and none of
+        # those is a dtype.
+        assert {t.dtype for _, t in regions} == {torch.uint8}
+
+    def test_every_region_is_named_and_no_two_alike(self):
+        """Position is the only other identity a region has to the far end, and
+        folding the fields into a pool changed it: `K0,V0,K1,V1…` became all of
+        K then all of V, at the same count and the same bytes. A name is what
+        lets a mismatched pair notice instead of transferring K into V."""
+        pool = INDEXED(entries=4)
+        roles = [role for role, _ in pool.region_tensors()]
+
+        assert all(roles)
+        assert len(set(roles)) == len(roles)
+        assert roles[0] == "k.layer_0"
 
     def test_regions_are_empty_before_allocation(self):
         """Declared and allocated are two steps — sizing runs in between."""
@@ -230,7 +396,7 @@ class TestTheIndexerCacheIsAField:
         """The field is opt-in, so every other MHA model is untouched."""
         plain = MhaKvPool(**TARGET, kv_dtype=torch.float8_e4m3fnuz)
 
-        assert plain.index_fields == []
+        assert plain.extra_fields == []
         assert plain.entry_bytes < INDEXED(torch.float8_e4m3fnuz).entry_bytes
 
     @pytest.mark.parametrize("kv_dtype", DTYPES, ids=lambda d: str(d).split(".")[-1])
@@ -240,22 +406,22 @@ class TestTheIndexerCacheIsAField:
         tautology -- a shape whose indexer segment is not a multiple of the
         arena's alignment would move the pool's capacity, and has to be caught
         before it ships rather than in a server log."""
-        raw = INDEX["index_layers"] * TARGET["block_size"] * INDEX["index_dim"]
+        raw = INDEX_LAYERS * TARGET["block_size"] * INDEX_DIM
 
         assert (
             INDEXED(kv_dtype).entry_bytes
             == MhaKvPool(**TARGET, kv_dtype=kv_dtype).entry_bytes
-            + raw * INDEX["index_dtype"].itemsize
+            + raw * INDEX_DTYPE.itemsize
         )
 
     def test_the_indexer_is_its_own_allocation(self):
         """Not carved out of the K/V buffer: it has its own dtype and its own
         layer count, and the P/D export ships the K/V one by itself."""
-        pool = INDEXED(blocks=4)
+        pool = INDEXED(entries=4)
 
-        assert pool.index is not None
-        assert pool.index.buf.data_ptr() != pool.cache.buf.data_ptr()
-        assert pool.index.buf.numel() == 4 * (
+        assert pool.extra is not None
+        assert pool.extra.buf.data_ptr() != pool.cache.buf.data_ptr()
+        assert pool.extra.buf.numel() == 4 * (
             pool.entry_bytes
             - MhaKvPool(**TARGET, kv_dtype=torch.float8_e4m3fnuz).entry_bytes
         )
@@ -264,35 +430,36 @@ class TestTheIndexerCacheIsAField:
         """Shaped in scheduler blocks, which is the entry class `page_pool`
         charges. The backend reshapes to its own page when it binds -- sizing
         it at that page instead is what undercharged by `block_ratio`."""
-        pool = INDEXED(blocks=4)
-        view = pool.index_view(0)
+        pool = INDEXED(entries=4)
+        view = index_view(pool, 0)
 
-        assert view.shape == (4, TARGET["block_size"], INDEX["index_dim"])
+        assert view.shape == (4, TARGET["block_size"], INDEX_DIM)
         assert view.is_contiguous()
 
     def test_each_indexer_layer_gets_its_own_slice(self):
         """Bind order assigns these, so an off-by-one is a layer reading
         another layer's keys — silently, with plausible top-k output."""
-        pool = INDEXED(blocks=4)
-        stride = pool.index_view(1).data_ptr() - pool.index_view(0).data_ptr()
+        pool = INDEXED(entries=4)
+        first = index_view(pool, 0)
+        stride = index_view(pool, 1).data_ptr() - first.data_ptr()
 
-        assert stride == pool.index_view(0).numel() * pool.index_view(0).element_size()
-        for layer in range(INDEX["index_layers"]):
-            assert pool.index_view(layer).data_ptr() == (
-                pool.index_view(0).data_ptr() + layer * stride
+        assert stride == first.numel() * first.element_size()
+        for layer in range(INDEX_LAYERS):
+            assert index_view(pool, layer).data_ptr() == (
+                first.data_ptr() + layer * stride
             )
 
     def test_indexer_regions_come_after_the_kv_ones(self):
         """The order a P/D peer reconstructs regions in. It used to be spelled
         out at the call site (`region_tensors()` and then a loop over the index
         cache); now it falls out of field order, so it is pinned here."""
-        pool = INDEXED(blocks=4)
+        pool = INDEXED(entries=4)
         regions = pool.region_tensors()
         kv = 4 * TARGET["layers"]
 
-        assert len(regions) == kv + INDEX["index_layers"]
-        assert [r.data_ptr() for r in regions[kv:]] == [
-            pool.index_view(i).data_ptr() for i in range(INDEX["index_layers"])
+        assert len(regions) == kv + INDEX_LAYERS
+        assert [t.data_ptr() for _, t in regions[kv:]] == [
+            index_view(pool, i).data_ptr() for i in range(INDEX_LAYERS)
         ]
 
     def test_an_indexer_region_is_one_scheduler_block_wide(self):
@@ -308,20 +475,20 @@ class TestTheIndexerCacheIsAField:
         not the size. Where the two block sizes are equal the numbers coincide;
         that is a property of those configs, not of the code.
         """
-        pool = INDEXED(blocks=4)
-        region = pool.region_tensors()[-1]
+        pool = INDEXED(entries=4)
+        _, region = pool.region_tensors()[-1]
         stride = region.stride(0) * region.element_size()
 
-        assert stride == TARGET["block_size"] * INDEX["index_dim"]
+        assert stride == TARGET["block_size"] * INDEX_DIM
         assert region.numel() * region.element_size() // stride == 4
 
     def test_release_drops_the_indexer_too(self):
         """Nothing outside the pool holds this buffer, so the pool is what
         frees it across a rollout sleep."""
-        pool = INDEXED(blocks=4)
+        pool = INDEXED(entries=4)
         pool.release()
 
-        assert pool.index is None
+        assert pool.extra is None
         assert pool.region_tensors() == []
 
 
@@ -349,11 +516,17 @@ class TestAdoptingSomeoneElsesAllocation:
 
     def test_a_buffer_that_does_not_fit_the_declaration_is_refused(self):
         """Refusing is the point: the alternative is addressing past the end
-        of someone else's allocation, which no shape says anything about."""
+        of someone else's allocation, which no shape says anything about.
+
+        Raised where the buffer is cut, quoting what the pool asked for. It
+        used to slip past that -- an over-long slice truncates instead of
+        raising -- and land on whichever arena got the short region, quoting
+        that arena's own field bytes, a number the caller never named.
+        """
         adopter = MhaKvPool(**TARGET, kv_dtype=torch.float8_e4m3fnuz)
         short = torch.zeros(adopter.pool_bytes(4), dtype=torch.uint8)
 
-        with pytest.raises(ValueError, match="at least"):
+        with pytest.raises(ValueError, match="regions needing"):
             adopter.allocate(8, "cpu", buf=short)
 
     def test_release_drops_the_backing_and_keeps_the_declaration(self):
@@ -380,16 +553,16 @@ class TestSharingOneAllocationWithADraft:
     somewhere the other does not expect.
     """
 
-    BLOCKS = 8
+    ENTRIES = 8
 
     def _carve(self):
         target = INDEXED()
         draft = MhaKvPool(**DRAFT, kv_dtype=torch.float8_e4m3fnuz)
-        sizes = [p.pool_bytes(self.BLOCKS) for p in (target, draft)]
+        sizes = [p.pool_bytes(self.ENTRIES) for p in (target, draft)]
         offsets, total = plan_regions(sizes)
         buf = torch.zeros(total, dtype=torch.uint8)
         for pool, start, size in zip((target, draft), offsets, sizes):
-            pool.allocate(self.BLOCKS, "cpu", buf=buf[start : start + size])
+            pool.allocate(self.ENTRIES, "cpu", buf=buf[start : start + size])
         return buf, target, draft, list(zip(offsets, sizes))
 
     @staticmethod
@@ -402,7 +575,7 @@ class TestSharingOneAllocationWithADraft:
 
         for pool, (start, size) in zip((target, draft), extents):
             lo = buf.data_ptr() + start
-            for view in pool.region_tensors():
+            for _, view in pool.region_tensors():
                 first, last = self._span(view)
                 assert lo <= first and last <= lo + size
 
@@ -414,7 +587,7 @@ class TestSharingOneAllocationWithADraft:
         buf, target, draft, _ = self._carve()
 
         charged = target.entry_bytes + draft.entry_bytes
-        assert buf.numel() == charged * self.BLOCKS
+        assert buf.numel() == charged * self.ENTRIES
 
     def test_every_region_keeps_what_was_written_to_it(self):
         """The check the byte counts cannot do, and the reason placement is not
@@ -423,7 +596,7 @@ class TestSharingOneAllocationWithADraft:
         at once, so an overlap between two fields of one pool fails it as
         surely as one between the two pools."""
         _, target, draft, _ = self._carve()
-        regions = target.region_tensors() + draft.region_tensors()
+        regions = [t for _, t in target.region_tensors() + draft.region_tensors()]
         marks = [1 + i % 251 for i in range(len(regions))]
         for view, mark in zip(regions, marks):
             view.view(torch.uint8).fill_(mark)
@@ -444,7 +617,8 @@ class TestFromHfConfig:
             self._Cfg(), world_size=4, block_size=128, kv_dtype=torch.bfloat16
         )
 
-        assert pool.cache_fields[0].shape[0] == 1
+        # One KV head's worth of bytes per block, at bf16.
+        assert pool.cache_fields[0].shape == (1 * 128 * 128 * 2,)
 
     def test_a_head_per_rank_is_the_floor(self):
         """More ranks than KV heads replicates rather than allocating none --
@@ -453,7 +627,8 @@ class TestFromHfConfig:
             self._Cfg(), world_size=8, block_size=128, kv_dtype=torch.bfloat16
         )
 
-        assert pool.cache_fields[0].shape[0] == 1
+        # One KV head's worth of bytes per block, at bf16.
+        assert pool.cache_fields[0].shape == (1 * 128 * 128 * 2,)
 
 
 def test_reachable_without_a_gpu_build():

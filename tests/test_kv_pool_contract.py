@@ -32,6 +32,17 @@ SOURCES = sorted(ATTENTIONS.glob("*.py")) + [
 ]
 
 HOOK = "allocate_kv_cache_tensors"
+RUNNER = (
+    pathlib.Path(__file__).resolve().parent.parent / "atom/model_engine/model_runner.py"
+)
+# The one place a pool is backed, and the two that reach it: one allocates the
+# buffer, the other receives it over IPC. Named with their class because
+# `RapidServeModelRunner` holds the second.
+BACKER = "_back_paged_pools"
+BACKING_PATHS = [
+    ("ModelRunner", "allocate_kv_cache"),
+    ("RapidServeModelRunner", "_bind_kv_cache_to_modules"),
+]
 
 
 def _hooks(path: pathlib.Path) -> list[tuple[str, ast.FunctionDef]]:
@@ -75,6 +86,70 @@ def test_the_pool_is_told_where_to_build_itself(path, cls, fn, arg):
     """
     del path, cls
     assert arg in {a.arg for a in fn.args.kwonlyargs}
+
+
+def _publishes_the_hooks_result(fn: ast.FunctionDef) -> bool:
+    """Whether `fn` loops over `<...>.allocate_kv_cache_tensors(...).items()`
+    and `setattr`s each pair."""
+    for loop in ast.walk(fn):
+        if not isinstance(loop, ast.For):
+            continue
+        items = loop.iter
+        if not (
+            isinstance(items, ast.Call)
+            and isinstance(items.func, ast.Attribute)
+            and items.func.attr == "items"
+            and isinstance(items.func.value, ast.Call)
+            and isinstance(items.func.value.func, ast.Attribute)
+            and items.func.value.func.attr == HOOK
+        ):
+            continue
+        if any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "setattr"
+            for node in ast.walk(loop)
+        ):
+            return True
+    return False
+
+
+def _method(owner: str, name: str) -> ast.FunctionDef:
+    tree = ast.parse(RUNNER.read_text(), filename=str(RUNNER))
+    found = [
+        fn
+        for cls in ast.walk(tree)
+        if isinstance(cls, ast.ClassDef) and cls.name == owner
+        for fn in cls.body
+        if isinstance(fn, ast.FunctionDef) and fn.name == name
+    ]
+    assert len(found) == 1, f"{owner}.{name} is defined {len(found)} times"
+    return found[0]
+
+
+def test_the_one_backer_publishes_what_the_hook_returns():
+    """What the hook returns is not decoration: the aligned indexer dimension,
+    the compact index-cache layer maps and GLM-5.3's k-pool tail reach their
+    readers as runner attributes, and `build_kv_cache_tensor` dereferences them
+    right after. The decode side of a P/D pair used to back its pool through a
+    hook of its own that returned nothing, and bound against attributes nobody
+    set -- on a decode rank only, which no test here reaches."""
+    assert _publishes_the_hooks_result(_method("ModelRunner", BACKER))
+
+
+@pytest.mark.parametrize("owner, method", BACKING_PATHS)
+def test_both_backing_paths_go_through_it(owner, method):
+    """And neither reaches the hook on its own, which is what stops the two
+    from drifting again."""
+    fn = _method(owner, method)
+    called = {
+        node.func.attr
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+
+    assert BACKER in called
+    assert HOOK not in called
 
 
 @pytest.mark.parametrize("path, cls, fn", ALL_HOOKS)

@@ -5,6 +5,7 @@ import logging
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import ClassVar
 
 import numpy as np
 import torch
@@ -1390,6 +1391,7 @@ class GDNStateMixin(PoolRowsMixin):
 
 class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 
+    BACKEND: ClassVar[type[AiterBackend]] = GDNAttentionBackend
     reorder_batch_threshold: int = 1
     # `prepare_mtp_decode` below regenerates kv_indices and nothing else, so it
     # cannot absorb the position bump the fused path hands off to the backend.

@@ -258,9 +258,46 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         if spec_config is None or hasattr(runner, "draft_kv_builder"):
             return 0
         draft_hf_config = spec_config.draft_model_hf_config
-        # Mirror ModelRunner._get_total_num_layers(), which is authoritative for
-        # the rows actually allocated in this target MLA pool.
+        # Every PP stage sees the whole draft stack: a draft is not split, so
+        # `get_pp_indices` never covers it and this count is the same on each.
         return getattr(draft_hf_config, "num_nextn_predict_layers", 1)
+
+    def _local_draft_rows(self) -> int:
+        """Rows of this stage's pool that a shared draft's stack holds.
+
+        Counted from the draft's own modules under the same predicate the walk
+        uses. Not `pool rows - this stage's layer span`: those are different
+        units on a hybrid -- the span counts every layer of the stage, the pool
+        only the MLA ones -- and the difference goes negative, which empties the
+        draft's half of the index-cache layout.
+
+        The asserts below are what "a draft under PP" means, stated once so
+        nothing re-derives it from the rank.
+        """
+        from aiter.dist.parallel_state import get_pp_group
+
+        runner = self.model_runner
+        if not runner.draft_shares_kv_pool():
+            return 0
+        rows = sum(
+            1
+            for module in runner.drafter.model.modules()
+            if MLA_ROWS in self._module_kinds(module)
+        )
+        # An earlier stage reaching here would be counting rows nobody
+        # allocated.
+        assert get_pp_group().is_last_rank, (
+            "a draft's KV rows reached a PP stage that is not the last; the "
+            "drafter is built whole on the last stage and split across none"
+        )
+        # The walk against the config. Where they differ the pool is sized off
+        # one and addressed by the other.
+        declared = self._global_num_draft_layers()
+        assert rows == declared, (
+            f"the draft has {rows} MLA modules on this stage but declares "
+            f"{declared} layers; an unsplit draft's rows are all of them"
+        )
+        return rows
 
     def _index_cache_layout(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
         """Return (local, global) global-layer IDs owning index cache slices."""
@@ -275,11 +312,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         start_layer, end_layer = get_pp_indices(
             num_hidden_layers, pp_group.rank_in_group, pp_group.world_size
         )
-        num_local_target_layers = end_layer - start_layer
-        # This stage's MLA rows less its own layers: whatever is left is a
-        # shared draft's stack, counted from the modules rather than from the
-        # config field that says how many it should have.
-        num_local_draft_layers = self._kv_pool_layers() - num_local_target_layers
+        num_local_draft_layers = self._local_draft_rows()
         global_layer_ids = _global_index_cache_layer_ids(
             getattr(hf_config, "indexer_types", None),
             num_hidden_layers,
@@ -311,8 +344,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 f"got --block-size {model_runner.block_size}"
             )
         CommonAttentionBuilder.__init__(self, model_runner)
-        # Set by `allocate_kv_cache_tensors` / `adopt_imported_kv_pool`, both of
-        # which run long after construction.
+        # Set by `allocate_kv_cache_tensors`, which runs long after
+        # construction -- on the P/D decode side too, over the imported pool.
         self.kv_pool: MlaKvPool | None = None
         # Single-program block for the fused MTP-decode metadata kernel. Sized
         # to the max batch (runtime bs <= max_bs) so one tl.cumsum spans the
@@ -1167,12 +1200,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             }
         return out
 
-    def adopt_imported_kv_pool(self, blocks: int, buf) -> None:
-        self.num_blocks = blocks * self.block_ratio
-        runner = self.model_runner
-        self.kv_pool = self._declare_kv_pool()
-        self.kv_pool.allocate(blocks, runner.device, buf=buf)
-
     def build_kv_cache_tensor(self, module):
         """Bind one MLA attention module to its KV slice.
 
@@ -1245,8 +1272,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 base_addr=t.data_ptr(),
                 total_bytes=t.numel() * t.element_size(),
                 unit_bytes=t.stride(0) * t.element_size(),
+                semantic_role=f"mla.{role}",
             )
-            for t in self.kv_pool.region_tensors()
+            for role, t in self.kv_pool.region_tensors()
         ]
 
         block_region_consumer_indices = None
@@ -1319,7 +1347,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 local_target_layer_ids = tuple(range(start_layer, end_layer))
                 local_target_consumer_indices = local_target_layer_ids
             num_local_target_layers = len(local_target_layer_ids)
-            num_local_draft_layers = num_layers - num_local_target_layers
+            # From the draft's modules, not `num_layers - target`: derived that
+            # way the count below adds back up to `num_layers` by construction
+            # and the check cannot fail. Two independent walks make it a check.
+            num_local_draft_layers = self._local_draft_rows()
             local_kv_consumer_indices = local_target_consumer_indices + tuple(
                 range(
                     num_global_mla_layers,

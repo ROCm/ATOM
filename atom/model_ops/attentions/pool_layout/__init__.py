@@ -3,14 +3,15 @@
 
 """Where a byte lives in the cache pools: sizing, addressing, and moving.
 
-One topic across six modules -- how many entries a byte budget buys
+One topic across seven modules -- how many entries a byte budget buys
 (`sub_pool_spec`), which row of the unified pool a DeepSeek-V4 layer's window
 or compressed group occupies (`v4_pool_geometry`), what one of those rows and
 one indexer block hold (`v4_pool_fields`), where a checkpoint image's bytes
 land in the MLA paged pool (`page_unit_geometry`), what one entry holds and
-where those bytes are put (`entry_arena`), and how one entry's run is
-scattered across PAGE units and gathered back (`paged_state_copy`). All of it
-answers a question about the pool, none of it about a particular step.
+where those bytes are put (`entry_arena`), which row of a pool each module was
+given (`pool_rows`), and how one entry's run is scattered across PAGE units and
+gathered back (`paged_state_copy`). All of it answers a question about the
+pool, none of it about a particular step.
 
 `..token_layout` is the other axis, and the two share a membership rule with
 three parts.
@@ -38,7 +39,7 @@ address the pool. It stays with the kernels -- the split is by execution tier,
 which is a real axis too -- but a layout change lands in both places, and
 `tests/test_pool_index.py` is what pins the two sides together.
 
-Nothing is re-exported here: a convenience import would pull all six in
+Nothing is re-exported here: a convenience import would pull all seven in
 whenever one is wanted. A member importing a *sibling* is a different thing
 and is allowed -- the sibling obeys the same rule, so nothing new is reached,
 and a declaration is free to sit apart from the arithmetic over it.

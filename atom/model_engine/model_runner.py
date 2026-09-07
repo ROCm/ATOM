@@ -1773,12 +1773,17 @@ class ModelRunner:
         builders = [self.attn_metadata_builder]
         if hasattr(self, "draft_kv_builder"):
             builders.append(self.draft_kv_builder)
+        # Before pricing, not between pricing and filling: the price below
+        # comes from the walk.
+        for builder in builders:
+            builder.invalidate_pool_rows()
         sizes = [b.paged_pool_bytes(blocks) for b in builders]
         # A builder either allocates its own pool or takes exactly what its own
-        # PAGE spec was charged -- nothing between. Checked on every start and
-        # not in a unit test because it is the claim the collapse rests on: a
-        # region sized off a second reading of the layout surfaces as a wrong
-        # answer while serving, never as a bad number here.
+        # PAGE spec was charged -- nothing between. It catches the two hooks
+        # disagreeing (separate overrides; a field added to one), not a stale
+        # walk, which both readings share. A startup check and not a unit test
+        # because what it catches surfaces while serving, never as a bad number
+        # here.
         for builder, size in zip(builders, sizes):
             if not size:
                 continue
@@ -1800,6 +1805,32 @@ class ModelRunner:
             )
         regions = [buf[o : o + n] for o, n in zip(offsets, sizes)]
         return buf, regions, builders
+
+    def _back_paged_pools(self, blocks: int, buf=None):
+        """Back every builder's paged pool and publish what comes back.
+
+        The one place, because there are two callers: this side allocates the
+        buffer and the decode side of a P/D pair imports it. What the hook
+        returns -- the aligned indexer dimension, the compact layer maps,
+        GLM-5.3's k-pool tail -- has to reach its readers as a runner attribute
+        on both, and a path that only backed the pool leaves the other half
+        dereferencing attributes nobody set.
+        """
+        pool, regions, builders = self._carve_paged_pool(blocks, buf=buf)
+        for builder, region in zip(builders, regions):
+            for name, value in builder.allocate_kv_cache_tensors(
+                blocks=blocks, buf=region
+            ).items():
+                setattr(self, name, value)
+            logger.info(
+                "%s caches %s",
+                type(builder).__name__,
+                ", ".join(
+                    f"{n} {kind} rows" for kind, n in builder.row_counts().items()
+                )
+                or "nothing",
+            )
+        return pool
 
     def allocate_kv_cache(self, num_kvcache_blocks):
         pre_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
@@ -1826,22 +1857,9 @@ class ModelRunner:
         # What comes back is only what a region cannot carry: scalars like
         # `aligned_index_dim` and the compact layer maps, setattr'd here so
         # their readers find them where they always have.
-        pool, regions, builders = self._carve_paged_pool(num_kvcache_blocks)
+        pool = self._back_paged_pools(num_kvcache_blocks)
         if pool.numel():
             self.kv_cache = pool
-        for builder, region in zip(builders, regions):
-            builder.invalidate_pool_rows()
-            for name, value in builder.allocate_kv_cache_tensors(
-                blocks=num_kvcache_blocks, buf=region
-            ).items():
-                setattr(self, name, value)
-            counts = builder.row_counts()
-            logger.info(
-                "%s caches %s",
-                type(builder).__name__,
-                ", ".join(f"{n} {kind} rows" for kind, n in counts.items())
-                or "nothing",
-            )
 
         # Per-request cache allocation (model-agnostic, delegated to the
         # attention metadata builder). For GDN this returns
@@ -4317,7 +4335,7 @@ class RapidServeModelRunner(ModelRunner):
         from atom.model_engine.ipc_utils import import_kv_cache
 
         # The count travels with the handle and reaches the builder through
-        # `_bind_kv_cache_to_modules` -> `adopt_imported_kv_pool` below; this
+        # `_bind_kv_cache_to_modules` -> `allocate_kv_cache_tensors` below; this
         # side never ran sizing, so there is nothing else it could come from.
         path = paths[self.rank]
         logger.info(
@@ -4343,14 +4361,9 @@ class RapidServeModelRunner(ModelRunner):
         a *second way*: this used to spell the views out again, with a 4-D V
         where every builder declared 5-D. Nothing could catch that — the two
         agree on every byte and differ only in what a reader branches on. So it
-        runs the same loop over the same hook.
+        runs the same loop over the same hook, down to backing the pools.
         """
-        _, regions, builders = self._carve_paged_pool(
-            num_kvcache_blocks, buf=self.kv_cache
-        )
-        for builder, region in zip(builders, regions):
-            builder.invalidate_pool_rows()
-            builder.adopt_imported_kv_pool(num_kvcache_blocks, region)
+        self._back_paged_pools(num_kvcache_blocks, buf=self.kv_cache)
 
         models_to_bind = [("target", self.model)]
         if self.config.speculative_config and hasattr(self, "drafter"):

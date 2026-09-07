@@ -88,13 +88,19 @@ class AttentionBackend(ABC):
         return AttentionImpl
 
     @staticmethod
-    def make_kv_pool(hf_config, *, world_size: int, block_size: int, kv_dtype):
+    def make_kv_pool(
+        hf_config, *, world_size: int, scheduler_block_size: int, kv_dtype
+    ):
         """A pool holding every layer this config declares, or None.
 
         Asked of a *draft* model's backend — the target's layers are its
         builder's own business. None means a draft of this flavor needs no
         pool because its rows are the target's, which is why it is the
         default: an MLA draft's latent is the target's latent.
+
+        Given the scheduler's block, which is one for the whole process: the
+        block its own kernels index is this backend's to pick, and it picks it
+        from `hf_config` rather than being told.
         """
 
 
@@ -320,17 +326,20 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
     def allocate_kv_cache_tensors(self, *, blocks: int, buf) -> dict[str, Any]:
         """Allocate the model's primary paged KV cache tensors.
 
-        `blocks` is the scheduler block count every rank was told to build at,
-        the same argument `adopt_imported_kv_pool` takes. A parameter and not a
-        runner attribute because sizing runs per subprocess and the answers
-        differ: read the local estimate and one pool is built at one count
-        while something sized off another is built at a second -- a class of
-        bug no unit test reaches. Overrides record it as `self.num_blocks`,
-        converted to their own page.
+        `blocks` is the scheduler block count every rank was told to build at.
+        A parameter and not a runner attribute because sizing runs per
+        subprocess and the answers differ: read the local estimate and one pool
+        is built at one count while something sized off another is built at a
+        second -- a class of bug no unit test reaches. Overrides record it as
+        `self.num_blocks`, converted to their own page.
 
         `buf` is this builder's region of the runner's paged allocation,
         `paged_pool_bytes` long -- empty for a builder that answered zero and
         allocates its own.
+
+        The decode side of a P/D pair calls this too, with `buf` a region of an
+        imported pool. Nothing here may write into `buf`: that one arrives
+        already holding the peer's KV.
 
         Builders own the per-attention-type tensor layout (single 576-dim MLA
         tensor vs split-K/V MHA tensor; full-rank vs hybrid-only-full-attn-rows
@@ -344,22 +353,6 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         Returns empty dict for builders that do not own the main KV pool.
         """
         return {}
-
-    def adopt_imported_kv_pool(self, blocks: int, buf) -> None:
-        """Re-derive whatever this builder holds over the runner's KV pool.
-
-        The decode side of a P/D pair receives the pool as an IPC handle, so
-        `allocate_kv_cache_tensors` never runs there and anything it would have
-        built has to be rebuilt over the imported buffer before
-        `build_kv_cache_tensor` can bind to it. Same declaration, other backing
-        store -- `buf` is this builder's region of it, carved by the same
-        `paged_pool_bytes` walk the exporting side allocated with, so the two
-        agree by construction rather than by both sides spelling it out.
-
-        `blocks` is passed rather than read off the runner because that side
-        never ran sizing: its `pool_plan` is empty, and `num_kvcache_blocks`
-        reaches the config only after this. The count arrives with the handle.
-        """
 
     def release_kv_pools(self) -> None:
         """Drop the backing of every pool this builder holds, keeping the
@@ -376,10 +369,9 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         Called from ModelRunner.allocate_kv_cache()'s binding loop for every
         module of the model. The builder owns:
           - module-type detection (e.g. `hasattr(module, "use_mla")`)
-          - which of its pools the module's layer belongs to, its row from
-            `take_slot`
-          - per-module tensor slicing from runner-owned tensors
-            (self.model_runner.kv_cache, .mamba_k_cache, ...)
+          - which of its pools the module's layer belongs to, and its row in
+            that pool from `pool_rows`
+          - per-module tensor slicing out of the pool that holds the row
           - any `setattr(module, "k_cache", ...)` side effects per the
             existing module convention
           - returning a `KVCacheTensor` ModelRunner appends to its registry

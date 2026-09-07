@@ -87,12 +87,19 @@ def test_a_pp_stage_holds_its_own_slice_of_the_layers():
 
 
 def _mock_pp(monkeypatch, rank: int, world_size: int) -> None:
+    """`is_last_rank` derived, not passed: it is the same fact as the rank, and
+    a fixture free to disagree with itself is one the code can be tested
+    against in a state that cannot happen."""
     from aiter.dist import parallel_state
 
     monkeypatch.setattr(
         parallel_state,
         "get_pp_group",
-        lambda: SimpleNamespace(rank_in_group=rank, world_size=world_size),
+        lambda: SimpleNamespace(
+            rank_in_group=rank,
+            world_size=world_size,
+            is_last_rank=rank == world_size - 1,
+        ),
     )
 
 
@@ -125,10 +132,20 @@ def _builder(
     indexer_types,
     total_local_layers: int,
     *,
+    draft_layers: int = 0,
     kv_lora_rank: int = 512,
     qk_rope_head_dim: int = 64,
     index_head_dim: int = 128,
 ):
+    """A stage's pool: `total_local_layers` rows, `draft_layers` of them a
+    shared draft's.
+
+    The split is a parameter and not something the builder infers, which it
+    used to have to: the fixture handed over one number and the code under
+    test recovered the draft's share by subtracting this stage's layer span
+    from it. That arithmetic is wrong on a hybrid -- and a fixture that can
+    only express the answer through it cannot fail when it is.
+    """
     hf_config = SimpleNamespace(
         num_hidden_layers=len(indexer_types) if indexer_types is not None else 6,
         indexer_types=indexer_types,
@@ -151,8 +168,9 @@ def _builder(
         has_mla_indexer=True,
         # The rows are the MLA modules this stage holds, target and shared
         # draft alike, so the fixture supplies a tree rather than a count.
-        model=_MlaModel(total_local_layers),
-        draft_shares_kv_pool=lambda: False,
+        model=_MlaModel(total_local_layers - draft_layers),
+        drafter=SimpleNamespace(model=_MlaModel(draft_layers)),
+        draft_shares_kv_pool=lambda: draft_layers > 0,
     )
     builder = object.__new__(AiterMLAMetadataBuilder)
     builder.model_runner = runner
@@ -209,6 +227,7 @@ def test_pp_index_cache_layout_uses_global_layer_ids(monkeypatch):
     draft_builder, _ = _builder(
         ("full", "shared", "shared", "full", "shared", "full"),
         total_local_layers=4,
+        draft_layers=1,
     )
     _mock_pp(monkeypatch, rank=1, world_size=2)
     local_layer_ids, global_layer_ids = draft_builder._index_cache_layout()
@@ -217,10 +236,63 @@ def test_pp_index_cache_layout_uses_global_layer_ids(monkeypatch):
     assert local_layer_ids == (3, 5, 6)
 
 
+def test_a_hybrid_stage_still_finds_its_shared_draft(monkeypatch):
+    """The draft's rows come from the draft's modules, not from a subtraction.
+
+    GLM-5.3-Flash's shape: linear and MLA layers interleaved, so this stage
+    spans three layers but owns only two MLA rows. Recovering the draft's
+    share as `pool rows - span` subtracts a layer count from a row count and
+    lands at zero or below, which drops the draft's indexer layer out of the
+    local layout -- and binding it then fails with "indexer layer is missing".
+    """
+    builder, runner = _builder(("full",) * 6, total_local_layers=3, draft_layers=1)
+    runner.config.hf_config.layer_types = [
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "full_attention",
+    ]
+    _mock_pp(monkeypatch, rank=1, world_size=2)
+
+    local_layer_ids, global_layer_ids = builder._index_cache_layout()
+
+    # Layers 1/3/5 are the MLA ones; 6 is the draft's. This stage spans 3..6,
+    # so it owns 3 and 5 of the target's -- two rows over a three-layer span,
+    # which is the difference the subtraction could not see.
+    assert global_layer_ids == (1, 3, 5, 6)
+    assert local_layer_ids == (3, 5, 6)
+
+
+def test_a_draft_cannot_appear_on_a_stage_that_is_not_the_last(monkeypatch):
+    """`ModelRunner` builds the drafter under `pp_group().is_last_rank`, so an
+    earlier stage owning draft rows means something else already went wrong --
+    it would be sizing and binding rows no stage allocated."""
+    builder, _ = _builder(("full",) * 6, total_local_layers=3, draft_layers=1)
+    _mock_pp(monkeypatch, rank=0, world_size=2)
+
+    with pytest.raises(AssertionError, match="not the last"):
+        builder._index_cache_layout()
+
+
+def test_a_draft_row_count_that_disagrees_with_its_config_is_caught(monkeypatch):
+    """The walk against the declaration. A draft is not split, so every layer
+    it declares is a row on the last stage; the pool is sized off the config
+    and addressed by the walk, and nothing else compares the two."""
+    builder, _ = _builder(("full",) * 6, total_local_layers=4, draft_layers=2)
+    _mock_pp(monkeypatch, rank=1, world_size=2)
+
+    # The fixture's draft declares one layer, and two modules were built.
+    with pytest.raises(AssertionError, match="declares 1 layers"):
+        builder._index_cache_layout()
+
+
 def test_sub_pool_entry_bytes_uses_compact_index_layer_count(monkeypatch):
     builder, _ = _builder(
         ("full", "shared", "shared", "full", "shared", "full"),
         total_local_layers=4,
+        draft_layers=1,
     )
     _mock_pp(monkeypatch, rank=1, world_size=2)
     fake_fp8 = SimpleNamespace(itemsize=1)
@@ -242,8 +314,9 @@ def test_compact_layout_uses_fewer_bytes_than_full_layout(monkeypatch):
     compact, _ = _builder(
         ("full", "shared", "shared", "full", "shared", "full"),
         total_local_layers=4,
+        draft_layers=1,
     )
-    full, _ = _builder(None, total_local_layers=4)
+    full, _ = _builder(None, total_local_layers=4, draft_layers=1)
     _mock_pp(monkeypatch, rank=1, world_size=2)
     fake_fp8 = SimpleNamespace(itemsize=1)
     monkeypatch.setattr(
@@ -261,6 +334,7 @@ def test_allocate_index_cache_uses_compact_shape_and_map(monkeypatch):
     builder, runner = _builder(
         ("full", "shared", "shared", "full", "shared", "full"),
         total_local_layers=4,
+        draft_layers=1,
     )
     _mock_pp(monkeypatch, rank=1, world_size=2)
     monkeypatch.setattr(
@@ -319,7 +393,9 @@ class _FakePool:
         return _FakeCacheSlice((name, layer))
 
     def region_tensors(self):
-        return self._regions
+        # `(role, tensor)`, as the real pool answers: the role is what a P/D
+        # peer matches on instead of the list position.
+        return [(f"fake.{i}", t) for i, t in enumerate(self._regions)]
 
 
 class _FakeCacheSlice:
@@ -413,6 +489,7 @@ def test_transfer_regions_use_explicit_compact_consumer_map(monkeypatch):
     builder, runner = _builder(
         ("full", "shared", "shared", "full", "shared", "full"),
         total_local_layers=4,
+        draft_layers=1,
     )
     _mock_pp(monkeypatch, rank=1, world_size=2)
     builder.block_ratio = 1

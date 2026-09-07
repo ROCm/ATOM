@@ -11,6 +11,7 @@ import triton
 import triton.language as tl
 from aiter.dist.parallel_state import get_tp_group
 
+from atom.config import _is_minimax_m3_config
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
 from atom.utils import CpuGpuBuffer, envs, pack_rows, upload_numpy
@@ -23,7 +24,7 @@ from atom.utils.tbo import TokenSplitPrefillState
 
 from .backends import AttentionBackend, CommonAttentionBuilder
 from .mha_kv_pool import MhaKvPool
-from .pool_layout.entry_arena import carve
+from .pool_layout.entry_arena import EntryField, carve
 from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool
 from .token_layout.decode import decode_positions
 from .token_layout.slots import slot_mapping
@@ -47,6 +48,15 @@ class KvGeometry(NamedTuple):
 
     num_kv_heads: int
     head_dim: int
+
+
+class _IndexCacheSpec(NamedTuple):
+    """MiniMax-M3's indexer key cache: one `dim`-wide key per token, on `rows`
+    of this stage's layers. The pool is told its bytes and nothing else."""
+
+    rows: int
+    dim: int
+    dtype: torch.dtype
 
     def __str__(self) -> str:
         """How a row space names itself in a log line."""
@@ -146,16 +156,47 @@ class AiterBackend(AttentionBackend):
         return PagedAttentionImpl
 
     @staticmethod
-    def make_kv_pool(hf_config, *, world_size: int, block_size: int, kv_dtype):
+    def attn_block_size(hf_config, scheduler_block_size: int) -> int:
+        """Tokens in the block this backend's kernels index.
+
+        Two different things, tied only by the scheduler's being a whole number
+        of these: the scheduler's is what prefix caching and the block manager
+        work in, one for the whole process, while this one is a kernel detail
+        each backend picks for itself. A draft resolving to another backend
+        gets another answer, and should.
+        """
+        if envs.ATOM_USE_UNIFIED_ATTN:
+            # SHUFFLE cache read straight through, so the two coincide and
+            # `unified_attention`'s block table needs no conversion.
+            return scheduler_block_size
+        # MiniMax-M3's sparse kernels index the block its config names.
+        text_config = getattr(hf_config, "text_config", hf_config)
+        sparse_cfg = getattr(text_config, "sparse_attention_config", None)
+        sparse_block_size = sparse_cfg.get("sparse_block_size") if sparse_cfg else None
+        if sparse_block_size and _is_minimax_m3_config(hf_config):
+            return sparse_block_size
+        return scheduler_block_size if scheduler_block_size in (256, 1024) else 16
+
+    @classmethod
+    def make_kv_pool(
+        cls, hf_config, *, world_size: int, scheduler_block_size: int, kv_dtype
+    ):
+        attn_block_size = cls.attn_block_size(hf_config, scheduler_block_size)
         return MhaKvPool.from_hf_config(
             hf_config,
             world_size=world_size,
-            block_size=block_size,
+            block_size=attn_block_size,
+            blocks_per_entry=scheduler_block_size // attn_block_size,
             kv_dtype=kv_dtype,
         )
 
 
 class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
+    # Whose kernels this builder feeds. Read for `attn_block_size` below, so a
+    # subclass that names another backend gets that backend's rule -- naming
+    # this one outright would size the pool at one block and index it at
+    # another the day the two stop agreeing.
+    BACKEND: ClassVar[type[AiterBackend]] = AiterBackend
     BLOCK_TABLE_EXTENDER: ClassVar[list[list[int]]] = [[]]
     # EagleProposer fuses the per-draft-step position bump into
     # prepare_mtp_decode's kernel when this is set (block-paged MHA draft).
@@ -172,50 +213,32 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         hf_config = model_runner.config.hf_config
         text_config = getattr(hf_config, "text_config", hf_config)
         sparse_cfg = getattr(text_config, "sparse_attention_config", None)
-        from atom.config import _is_minimax_m3_config
-
         self._has_sparse_attention = bool(sparse_cfg) and _is_minimax_m3_config(
             hf_config
         )
-        if self._has_sparse_attention and (
-            sparse_block_size := sparse_cfg.get("sparse_block_size")
-        ):
-            # MiniMax-M3 sparse kernels operate on sparse_attention_config's
-            # block size. The scheduler/KV manager block size may be larger as
-            # long as it is divisible by this logical attention block size.
-            self.block_size = sparse_block_size
-        else:
-            self.block_size = (
-                model_runner.block_size
-                if model_runner.block_size in (256, 1024)
-                else 16
-            )
+        # The backend's own, from the one rule `make_kv_pool` also reads, so a
+        # draft resolving here gets it from its own config the same way.
+        # `CommonAttentionBuilder` holds it to dividing the scheduler's.
+        self.block_size = type(self).BACKEND.attn_block_size(
+            hf_config, model_runner.block_size
+        )
         if envs.ATOM_USE_UNIFIED_ATTN:
-            # SHUFFLE (pre-shuffled) KV cache: use the logical block size directly
-            # as the physical block size so block_ratio == 1 and
-            # unified_attention's block_table needs no logical->physical
-            # conversion. Pass --block-size equal to the performant physical
-            # page: fp8 packs x=16 - 128; bf16 packs x=8 - 64 (both keep a
-            # 128-byte physical page, i.e. block_size // x == 8).
+            # The two coincide there, and only one scheduler block reads well:
+            # fp8 packs x=16 -> 128, bf16 x=8 -> 64, both a 128 B physical page.
             expected = 128 if model_runner.kv_cache_dtype in ("fp8",) else 64
             if model_runner.block_size != expected:
                 logger.warning(
                     "ATOM_USE_UNIFIED_ATTN=1 expects --block-size %s for %s KV "
-                    "cache (so block_ratio == 1), got --block-size %s. Continuing "
-                    "with the requested block size.",
+                    "cache, got --block-size %s. Continuing with the requested "
+                    "block size.",
                     expected,
                     model_runner.kv_cache_dtype,
                     model_runner.block_size,
                 )
-            self.block_size = model_runner.block_size
-
-        assert (
-            model_runner.block_size % self.block_size == 0
-        ), f"model_runner.block_size must be divisible by block_size but got {model_runner.block_size=}, block_size={self.block_size}, please set --block-size (model_runner.block_size) to be divisible by {self.block_size}"
         super().__init__(model_runner)
         # Keyed by `(num_kv_heads, head_dim)` and filled by
-        # `allocate_kv_cache_tensors` / `adopt_imported_kv_pool`, both of which
-        # run long after construction.
+        # `allocate_kv_cache_tensors`, which runs long after construction --
+        # on the P/D decode side too, over the imported pool.
         self.kv_pools: dict[tuple[int, int], MhaKvPool] = {}
         config = model_runner.config
         hf_config = config.hf_config
@@ -492,27 +515,34 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         # first geometry's pool, since declaring them per pool would charge for
         # the cache once per geometry. Insertion order is the walk's, so
         # "first" is the same pool every run.
-        index = self._index_cache_decl()
+        # One expression, handed to both: the field is priced per entry and the
+        # pool is built per entry, and the two are a byte apart if they each
+        # multiply it out.
+        entry_tokens = self.block_size * self.block_ratio
+        extra_fields = self._index_cache_fields(entry_tokens)
         pools = {}
         for geometry, count in self.row_counts().items():
             if not isinstance(geometry, KvGeometry):
                 continue
             pools[geometry] = MhaKvPool(
                 layers=count,
-                # The scheduler's block, which is the entry class `page_pool`
-                # charges. How many of this backend's own pages make one up is
-                # `block_ratio`, and it stays inside the backend.
-                block_size=runner.block_size,
+                # This backend's block, which is the only one its kernels
+                # index: the block tables they read were expanded by
+                # `block_ratio`, so their ids run over `blocks * ratio`. The
+                # scheduler's block is `block_ratio` of ours and reaches the
+                # pool only as the count `page_pool` charges per.
+                block_size=self.block_size,
+                blocks_per_entry=self.block_ratio,
                 num_kv_heads=geometry.num_kv_heads,
                 head_dim=geometry.head_dim,
                 kv_dtype=dtypes.d_dtypes[runner.config.kv_cache_dtype],
-                **index,
+                extra_fields=extra_fields,
             )
-            index = {}
+            extra_fields = ()
         return pools
 
-    def _index_cache_decl(self) -> dict:
-        """Indexer-cache constructor arguments, empty when there is none.
+    def _index_cache_spec(self) -> _IndexCacheSpec | None:
+        """MiniMax-M3's indexer key cache, or None where there is none.
 
         Keyed off `_has_sparse_attention` -- the same answer the block size and
         the metadata buffers use -- not a second reading of the config. MiMo-V2
@@ -520,18 +550,41 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         be kept from double-charging; this one is false for it by construction.
         """
         if not self._has_sparse_attention:
-            return {}
+            return None
         runner = self.model_runner
         hf_config = runner.config.hf_config
         text_config = getattr(hf_config, "text_config", hf_config)
         sparse_cfg = text_config.sparse_attention_config
-        return {
-            "index_layers": sum(
-                1 for enabled in sparse_cfg.get("sparse_attention_freq", []) if enabled
+        return _IndexCacheSpec(
+            # The walk, like every other count here. The config's
+            # `sparse_attention_freq` says how many layers the *model* has an
+            # indexer on; the rows are how many this stage holds, and on PP > 1
+            # those differ -- the pool would be charged for the model's and
+            # addressed by the stage's.
+            rows=self.row_counts().get(INDEX_ROWS, 0),
+            dim=sparse_cfg["sparse_index_dim"],
+            dtype=_resolve_index_cache_dtype(runner.config),
+        )
+
+    def _index_cache_fields(self, entry_tokens: int) -> tuple[EntryField, ...]:
+        """The indexer cache as a field of the KV entry, priced in bytes.
+
+        Declared here and not in `MhaKvPool` because what it holds is this
+        backend's subject; the pool is told how many bytes ride along, and
+        gives them back through `field_view` in the shape `build_kv_cache_
+        tensor` asks for.
+        """
+        spec = self._index_cache_spec()
+        if spec is None:
+            return ()
+        return (
+            EntryField(
+                "index",
+                spec.rows,
+                (entry_tokens * spec.dim * spec.dtype.itemsize,),
+                torch.uint8,
             ),
-            "index_dim": sparse_cfg["sparse_index_dim"],
-            "index_dtype": _resolve_index_cache_dtype(runner.config),
-        }
+        )
 
     def release_kv_pools(self) -> None:
         for pool in self.kv_pools.values():
@@ -550,9 +603,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         for pool, region in zip(pools, regions):
             pool.allocate(blocks, self.model_runner.device, buf=region)
         self.num_blocks = blocks * self.block_ratio
-
-    def adopt_imported_kv_pool(self, blocks: int, buf) -> None:
-        self._allocate_kv_pools(blocks, buf)
 
     def allocate_kv_cache_tensors(self, *, blocks: int, buf) -> dict:
         """Allocate this model's MHA pools inside the runner's paged region.
@@ -601,13 +651,15 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # to page-16 SHUFFLE (zero-copy) at attention time. index_cache is a
             # genuinely separate field (not derivable from the K/V ones), so
             # each sparse layer has its own row in that second space. The pool
-            # shapes that slice in scheduler blocks and the impl addresses it
-            # in this backend's pages; the reshape is where that is said.
+            # was built at this backend's block, so its slice already is.
             runner = self.model_runner
-            pool = next(p for p in self.kv_pools.values() if p.index_fields)
-            index_view = pool.index_view(self.pool_rows[INDEX_ROWS][module])
-            module.impl.index_cache = index_view.view(
-                -1, self.block_size, pool.index_dim
+            pool = next(p for p in self.kv_pools.values() if p.extra_fields)
+            spec = self._index_cache_spec()
+            module.impl.index_cache = pool.field_view(
+                "index",
+                self.pool_rows[INDEX_ROWS][module],
+                spec.dtype,
+                (-1, self.block_size, spec.dim),
             )
             module.impl.max_model_len = runner.config.max_model_len
             module.impl.index_topk_cache_state = getattr(
@@ -684,9 +736,17 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                     base_addr=tensor.data_ptr(),
                     total_bytes=tensor.numel() * tensor.element_size(),
                     unit_bytes=tensor.stride(0) * tensor.element_size(),
+                    # The geometry, because a hybrid declares two pools whose
+                    # per-layer regions are otherwise named alike. Spelled out
+                    # rather than interpolating the NamedTuple: this string is
+                    # the far end's only handle on a region, and its repr
+                    # carries the class and field names with it.
+                    semantic_role=(
+                        f"mha.h{geometry.num_kv_heads}" f"d{geometry.head_dim}.{role}"
+                    ),
                 )
-                for pool in self.kv_pools.values()
-                for tensor in pool.region_tensors()
+                for geometry, pool in self.kv_pools.items()
+                for role, tensor in pool.region_tensors()
             ],
             slot_regions=[],
         )

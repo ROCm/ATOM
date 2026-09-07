@@ -65,7 +65,7 @@ class PageUnitGeometryMixin:
         cache = self._page_unit_kv_cache()
         index_cache = self._page_unit_index_cache()
         # Key on the full layout, not `data_ptr()` alone. The pool is rebuilt in
-        # two places -- the P/D IPC import (`adopt_imported_kv_pool`) and the
+        # two places -- the P/D IPC import (`_bind_kv_cache_to_modules`) and the
         # rollout sleep/wake path (`rollout/memory_manager.py` releases it, then
         # `_resume_kv_cache` -> `allocate_kv_cache` with a possibly *reduced*
         # block count). Address

@@ -83,16 +83,16 @@ class MlaKvPool:
         self.index: LayerMajorArena | None = None
         self._views: dict[str, torch.Tensor] = {}
 
-    def pool_bytes(self, blocks: int) -> int:
-        """Bytes the pool takes at `blocks` scheduler blocks -- the size of the
-        region `allocate` wants, and what sizing charged for those blocks."""
-        return self.entry_bytes * blocks
+    def pool_bytes(self, entries: int) -> int:
+        """Bytes the pool takes at `entries` entries -- the size of the region
+        `allocate` wants, and what sizing charged for them."""
+        return self.entry_bytes * entries
 
-    def allocate(self, blocks: int, device, buf: torch.Tensor | None = None) -> None:
+    def allocate(self, entries: int, device, buf: torch.Tensor | None = None) -> None:
         """Back the declaration, in memory of its own or a region of the
         runner's paged allocation -- the MHA pool's `allocate` exactly."""
         self.cache, self.index = carve_layer_major(
-            self.field_groups, blocks, device, buf
+            self.field_groups, entries, device, buf
         )
         self._views = {
             name: arena.view(name)
@@ -115,13 +115,15 @@ class MlaKvPool:
         """
         return self._views[name][layer]
 
-    def region_tensors(self) -> list[torch.Tensor]:
-        """One tensor per (field, layer), in declared field order.
+    def region_tensors(self) -> list[tuple[str, torch.Tensor]]:
+        """One `(role, tensor)` per (field, layer), in declared field order.
 
         A row of each is one scheduler block, which is the unit a transfer
         registers -- so `stride(0)` is already the bytes per block and needs no
-        `block_ratio` applied to it.
+        `block_ratio` applied. Named for `MhaKvPool.region_tensors`' reason.
         """
         return [
-            view[layer] for view in self._views.values() for layer in range(len(view))
+            (f"{name}.layer_{layer}", view[layer])
+            for name, view in self._views.items()
+            for layer in range(len(view))
         ]
