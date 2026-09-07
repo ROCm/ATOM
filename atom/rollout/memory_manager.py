@@ -9,6 +9,20 @@ from atom.utils.forward_context import set_kv_cache_data
 
 logger = logging.getLogger("atom")
 
+# Every name a binder may have set to a view of the KV pool. Not just the cache
+# ones: the pool is a single buffer now, so one surviving scale plane or
+# indexer slice pins all of it -- what used to leak a scale tensor leaks the
+# whole pool.
+_POOL_VIEW_ATTRS = (
+    "k_cache",
+    "v_cache",
+    "kv_cache",
+    "kpool_tail_cache",
+    "k_scale",
+    "v_scale",
+    "index_cache",
+)
+
 
 class MemoryManagerMixin:
     """Mixin providing GPU memory lifecycle management for ModelRunner.
@@ -134,11 +148,23 @@ class MemoryManagerMixin:
 
         # Clear per-module KV cache views that share the underlying storage.
         # Without this, del self.kv_cache alone cannot free GPU memory.
+        #
+        # On the value and not the name: these names are not unique, and
+        # `MiMoV2Attention.v_scale` is a float multiplier on V rather than a
+        # dequant plane, which blanking would silently stop applying. Gating on
+        # a sibling name instead would answer the wrong question -- and did:
+        # `index_cache` lives on the `impl` that never holds a `k_cache`.
         for model_obj in self._get_models_with_kv():
             for module in model_obj.modules():
-                for attr in ("k_cache", "v_cache", "kv_cache", "kpool_tail_cache"):
-                    if hasattr(module, attr):
+                for attr in _POOL_VIEW_ATTRS:
+                    if isinstance(getattr(module, attr, None), torch.Tensor):
                         setattr(module, attr, None)
+                # `DeepseekV32IndexerCache` holds its slice in a one-element
+                # list the binder assigns *into*. Emptying the element and not
+                # the list: waking rebinds with `kv_cache[0] = ...`, which
+                # needs a list to still be there.
+                if isinstance(getattr(module, "kv_cache", None), list):
+                    module.kv_cache = [torch.tensor([])]
 
         set_kv_cache_data({})
 
