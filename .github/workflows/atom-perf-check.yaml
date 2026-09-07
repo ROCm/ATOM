@@ -196,14 +196,23 @@ jobs:
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
           echo "Image: $DIGEST"
 
+      - name: Stage the pairing script outside the workspace
+        run: |
+          set -euo pipefail
+          # The script checks out the merge-base, which predates this file --
+          # so running it from the workspace deletes it before the second half
+          # can start. Copy it somewhere the checkouts do not reach.
+          cp .github/scripts/perf_check_half.sh "$RUNNER_TEMP/perf_check_half.sh"
+          chmod +x "$RUNNER_TEMP/perf_check_half.sh"
+
       # Base runs first on purpose: the head half then measures on a warm
       # machine. Reversed, head would systematically absorb cold-start cost and
       # read low for reasons that have nothing to do with the change.
       - name: Bench BASE
-        run: .github/scripts/perf_check_half.sh "${{ steps.refs.outputs.base_sha }}" base
+        run: bash "$RUNNER_TEMP/perf_check_half.sh" "${{ steps.refs.outputs.base_sha }}" base
 
       - name: Bench HEAD
-        run: .github/scripts/perf_check_half.sh "${{ steps.refs.outputs.head_sha }}" head
+        run: bash "$RUNNER_TEMP/perf_check_half.sh" "${{ steps.refs.outputs.head_sha }}" head
 
       - name: Record provenance
         if: always()
