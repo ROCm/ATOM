@@ -21,7 +21,9 @@ from atom.utils.forward_context import AttentionMetaData, Context, get_forward_c
 from atom.utils.tbo import TokenSplitPrefillState
 
 from .backends import AttentionBackend, CommonAttentionBuilder
-from .sub_pool_spec import SubPoolSpec, page_pool
+from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool
+from .token_layout.decode import decode_positions
+from .token_layout.slots import slot_mapping
 
 logger = logging.getLogger("atom")
 
@@ -879,20 +881,18 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
         if self._has_sparse_attention and not attn_metadata.has_cached:
             bs = batch.total_seqs_num_prefill
-            self.prepare_block_tables(batch)
             attn_metadata.block_tables = self.model_runner.forward_vars[
                 "block_tables"
             ].copy_to_gpu(bs)
         # `prefill_attention_triton` reads the paged KV cache, so it needs a
-        # block_table even with no cached tokens. The base builder only uploads
-        # one when `has_cached`.
+        # block_table even with no cached tokens. The base builder marshals one
+        # every step but only uploads it when `has_cached`.
         if (
             attn_metadata.block_tables is None
             and envs.ATOM_USE_UNIFIED_ATTN
             and batch.block_tables
         ):
             bs = batch.total_seqs_num_prefill
-            self.prepare_block_tables(batch)
             attn_metadata.block_tables = self.model_runner.forward_vars[
                 "block_tables"
             ].copy_to_gpu(bs)
@@ -1086,39 +1086,36 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             num_rejected = self.model_runner.tokenID_processor.num_rejected
             if num_rejected is not None:
                 context_lens -= num_rejected
-                num_blocks = cdiv(context_lens, self.model_runner.block_size)
-                block_tables = [bt[:n] for bt, n in zip(block_tables, num_blocks)]
+        positions = decode_positions(context_lens, max_seqlen_q)
+        max_seqlen_k = np.max(context_lens)
 
-            slot_mapping = [
-                block_table[pos // self.model_runner.block_size]
-                * self.model_runner.block_size
-                + (pos % self.model_runner.block_size)
-                for block_table, seq_len in zip(block_tables, context_lens)
-                for pos in range(seq_len - max_seqlen_q, seq_len)
-            ]
+        # Before the slots, not after: `slot_mapping` reads this packed table.
+        self.prepare_block_tables(batch)
+
+        var = self.model_runner.forward_vars
+        scheduled_tokens = batch.total_tokens_num_decode
+        var["slot_mapping"].np[:running_tokens] = -1
+        if max_seqlen_q > 1:
+            slots = slot_mapping(
+                positions,
+                np.full(scheduled_bs, max_seqlen_q, dtype=np.int32),
+                var["block_tables"].np,
+                self.model_runner.block_size,
+                scratch=self.token_axis_scratch,
+            )
         else:
-            slot_mapping = [
+            # One token per sequence reduces the gather to its last row, and
+            # `last_block_num_tokens` names the offset without a position.
+            slots = [
                 block_table[-1] * self.model_runner.block_size + last_block_num - 1
                 for block_table, last_block_num in zip(
                     block_tables, batch.last_block_num_tokens
                 )
             ]
-        positions = np.tile(
-            np.arange(max_seqlen_q, dtype=np.int32), scheduled_bs
-        ) + np.repeat(context_lens - max_seqlen_q, max_seqlen_q)
-        max_seqlen_k = np.max(context_lens)
-
-        self.prepare_block_tables(batch)
-
-        var = self.model_runner.forward_vars
-        sum_scheduled_tokens = batch.total_tokens_num_decode
-        var["slot_mapping"].np[:running_tokens] = -1
         if not batch.is_dummy_run:
-            var["slot_mapping"].np[:sum_scheduled_tokens] = slot_mapping[
-                :sum_scheduled_tokens
-            ]
+            var["slot_mapping"].np[:scheduled_tokens] = slots[:scheduled_tokens]
 
-        var["positions"].np[:sum_scheduled_tokens] = positions
+        var["positions"].np[:scheduled_tokens] = positions
         var["context_lens"].np[:scheduled_bs] = context_lens
         var["context_lens"].np[scheduled_bs:running_bs] = 0
 
@@ -1134,12 +1131,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         vars_used = [
             ("slot_mapping", running_tokens),
             ("context_lens", running_bs),
-            ("cu_seqlens_q", running_bs + 1),
             ("block_tables", running_bs),
             ("kv_indptr", running_bs + 1),
         ]
 
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
+        # A view: `publish_cu_seqlens_q` already uploaded it this step, and
+        # nothing here writes the host copy.
+        ctx["cu_seqlens_q"] = var["cu_seqlens_q"].gpu[: running_bs + 1]
         if self.block_size in (256, 1024):
             ctx_pa_ps = self.set_aiter_persistent_worker_buffers(running_bs)
             ctx.update(ctx_pa_ps)
@@ -1186,7 +1185,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         if mrope_positions is not None:
             positions = mrope_positions
         else:
-            positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
+            positions = var["positions"].copy_to_gpu(scheduled_tokens)
         if self.model_runner.config.enable_tbo_decode and running_bs >= 2:
             self._prepare_ubatch_decode(
                 scheduled_bs,
@@ -1229,11 +1228,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
             tok_start = req_start * max_seqlen_q
             ub_real_tokens = ub_real_reqs * max_seqlen_q
-            padded_tok_count = running_bs * max_seqlen_q
+            ub_running_tokens = running_bs * max_seqlen_q
             var[f"{p}slot_mapping"].np[:ub_real_tokens] = var["slot_mapping"].np[
                 tok_start : tok_start + ub_real_tokens
             ]
-            var[f"{p}slot_mapping"].np[ub_real_tokens:padded_tok_count] = -1
+            var[f"{p}slot_mapping"].np[ub_real_tokens:ub_running_tokens] = -1
 
             var[f"{p}block_tables"].np[:ub_real_reqs] = var["block_tables"].np[
                 req_start : req_start + ub_real_reqs
@@ -1250,18 +1249,20 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             last_val = var[f"{p}kv_indptr"].np[ub_real_reqs] if ub_real_reqs > 0 else 0
             var[f"{p}kv_indptr"].np[ub_real_reqs + 1 : running_bs + 1] = last_val
 
-            last_cu = ub_real_reqs * max_seqlen_q
             var[f"{p}cu_seqlens_q"].np[: ub_real_reqs + 1] = np.arange(
                 0,
                 (ub_real_reqs + 1) * max_seqlen_q,
                 max_seqlen_q,
                 dtype=np.int32,
             )
-            var[f"{p}cu_seqlens_q"].np[ub_real_reqs + 1 : running_bs + 1] = last_cu
+            # The flat cumsum past the real requests is where the real ones end.
+            var[f"{p}cu_seqlens_q"].np[
+                ub_real_reqs + 1 : running_bs + 1
+            ] = ub_real_tokens
 
             vars_used = [
                 (f"{p}context_lens", running_bs),
-                (f"{p}slot_mapping", padded_tok_count),
+                (f"{p}slot_mapping", ub_running_tokens),
                 (f"{p}block_tables", running_bs),
                 (f"{p}kv_indptr", running_bs + 1),
                 (f"{p}cu_seqlens_q", running_bs + 1),
@@ -1380,9 +1381,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
         else:
             ctx_pa_ps = {}
-        total_tokens = bs * max_q_len
+        scheduled_tokens = bs * max_q_len
         attn_metadata = AttentionMetaData(
-            slot_mapping=var["slot_mapping"].gpu[:total_tokens],
+            slot_mapping=var["slot_mapping"].gpu[:scheduled_tokens],
             context_lens=var["context_lens"].gpu[:bs],
             block_tables=var["block_tables"].gpu[:bs],
             max_seqlen_q=max_q_len,
@@ -1414,14 +1415,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=max_q_len,
             )
 
-        positions = var["positions"].copy_to_gpu(total_tokens)
+        positions = var["positions"].copy_to_gpu(scheduled_tokens)
         context = Context(
             positions=positions,
             is_prefill=False,
             scheduled_bs=bs,
             running_bs=bs,
             # A capture runs a full synthetic batch: nothing is padded.
-            scheduled_tokens=total_tokens,
-            running_tokens=total_tokens,
+            scheduled_tokens=scheduled_tokens,
+            running_tokens=scheduled_tokens,
         )
         return attn_metadata, context

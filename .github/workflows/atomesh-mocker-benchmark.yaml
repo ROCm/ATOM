@@ -259,6 +259,13 @@ jobs:
           print(f"Generated {len(entries)} dashboard entries")
           PY
 
+      - name: Prepare existing dashboard data
+        if: hashFiles('atomesh-mocker-dashboard-input.json') != ''
+        id: prepare_dashboard_data
+        uses: ./.github/actions/prepare-dashboard-data
+        with:
+          data-path: atomesh-mocker-dashboard/data.js
+
       - name: Store benchmark result to dashboard
         if: hashFiles('atomesh-mocker-dashboard-input.json') != ''
         uses: benchmark-action/github-action-benchmark@v1
@@ -270,6 +277,13 @@ jobs:
           auto-push: false
           max-items-in-chart: 300
           github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate dashboard data after write
+        if: hashFiles('atomesh-mocker-dashboard-input.json') != ''
+        uses: ./.github/actions/validate-dashboard-data
+        with:
+          data-path: atomesh-mocker-dashboard/data.js
+          min-entries: ${{ steps.prepare_dashboard_data.outputs.entry_count }}
 
       - name: Deploy mocker benchmark dashboard to gh-pages
         if: hashFiles('atomesh-mocker-dashboard-input.json') != ''

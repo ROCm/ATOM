@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Tests for atom/model_engine/block_manager.py — public API only
 
+import logging
 
 from conftest import MockConfig
 
@@ -49,6 +50,155 @@ class TestCanAllocate:
     def test_can_allocate_multi_block(self, block_manager, seq_factory):
         seq = seq_factory([1, 2, 3, 4, 5])
         assert block_manager.can_allocate(seq) >= 0
+
+
+# ── the widened claim behind a joint boundary ──────────────────────────────
+
+
+class TestJointClaimReusesResidentBlocks:
+    """`can_allocate` returns one number, and the request needs two.
+
+    What it may call *cached* is gated on a resumable state behind it. What it
+    may point its block table at is every block the prefix walk matched -- the
+    state gate cut resumability, not residency. Without the second number the
+    KV leg pays LMCache to resend blocks the pool is already holding, and the
+    reply lands in *fresh* blocks, so HBM ends up with two copies of the same
+    prefix.
+    """
+
+    def _resident_prefix(self, seq_factory):
+        """A 4-block prefix published in the index, then released."""
+        cfg = MockConfig(
+            num_kvcache_blocks=32, kv_cache_block_size=4, enable_prefix_caching=True
+        )
+        bm = BlockManager(cfg)
+        tokens = list(range(20))
+        first = seq_factory(tokens)
+        bm.allocate(first, 0)
+        bm.hash_blocks(first, len(tokens))
+        resident = list(first.block_table[:4])
+        bm.deallocate(first)
+        return bm, tokens, resident
+
+    def test_without_a_joint_boundary_the_claim_stops_at_the_gated_hit(
+        self, seq_factory
+    ):
+        bm, tokens, resident = self._resident_prefix(seq_factory)
+        seq = seq_factory(tokens)
+        bm.allocate(seq, 2)
+        assert list(seq.block_table[:2]) == resident[:2]
+        # Blocks 2 and 3 are resident and match, but nothing above the hit will
+        # ever be treated as computed, so claiming them would pin blocks the
+        # forward is about to overwrite.
+        assert seq.block_table[2] not in resident[2:]
+        assert seq.num_cached_tokens == 8
+
+    def test_a_joint_boundary_widens_the_claim_without_widening_the_hit(
+        self, seq_factory
+    ):
+        bm, tokens, resident = self._resident_prefix(seq_factory)
+        seq = seq_factory(tokens)
+        # The state gate cut the hit to 2 blocks; the walk had matched 4.
+        seq.offload_joint.claim_tokens = 16
+        bm.allocate(seq, 2)
+
+        # All four resident blocks are reused -- that is the transfer the KV
+        # leg no longer has to make, and the second copy that no longer lands.
+        assert list(seq.block_table[:4]) == resident
+        # ...and the request still only calls two of them cached, so a failed
+        # leg leaves the forward recomputing rather than skipping.
+        assert seq.num_cached_tokens == 8
+
+    def test_the_widened_claim_still_gives_every_position_a_block(self, seq_factory):
+        bm, tokens, _ = self._resident_prefix(seq_factory)
+        seq = seq_factory(tokens)
+        seq.offload_joint.claim_tokens = 16
+        bm.allocate(seq, 2)
+        assert len(seq.block_table) == 5
+        assert len(set(seq.block_table)) == 5
+
+
+class TestDisownClaimedPrefix:
+    """A disown recomputes from token 0 while the block table still points at
+    hash-indexed blocks a *live* peer is decoding out of. Recomputing writes KV
+    in place into those shared blocks and tears the peer's values (review
+    finding #2 -- the precision-corruption main suspect). `disown_claimed_prefix`
+    hands each shared claimed block back and drops a fresh private block into the
+    same slot, so the forward can only overwrite blocks this seq owns alone.
+    """
+
+    def _shared_prefix(self, seq_factory, num_kvcache_blocks=32):
+        """Two live seqs sharing a 4-block claimed prefix (ref_count == 2)."""
+        cfg = MockConfig(
+            num_kvcache_blocks=num_kvcache_blocks,
+            kv_cache_block_size=4,
+            enable_prefix_caching=True,
+        )
+        bm = BlockManager(cfg)
+        tokens = list(range(20))
+        holder = seq_factory(tokens)
+        bm.allocate(holder, 0)
+        bm.hash_blocks(holder, len(tokens))
+        # A second live seq claims the same 4 resident blocks via the joint
+        # boundary -- now every prefix block is held at ref_count == 2.
+        seq = seq_factory(tokens)
+        seq.offload_joint.claim_tokens = 16
+        bm.allocate(seq, 2)
+        shared = list(seq.block_table[:4])
+        assert all(bm.kv.block(b).ref_count == 2 for b in shared)
+        return bm, holder, seq, shared
+
+    def test_disown_privatizes_shared_blocks_in_place(self, seq_factory):
+        bm, holder, seq, shared = self._shared_prefix(seq_factory)
+        table_before = list(seq.block_table)
+
+        assert bm.disown_claimed_prefix(seq) is True
+
+        # Same length, same tail slot -- only the shared prefix slots changed.
+        assert len(seq.block_table) == len(table_before)
+        assert seq.block_table[4] == table_before[4]
+        # The four claimed slots now hold fresh private blocks: none is one of
+        # the shared canonical blocks, and each is hash == -1 (private).
+        for i in range(4):
+            assert seq.block_table[i] not in shared
+            assert bm.kv.block(seq.block_table[i]).hash == -1
+        # The peer still holds every shared block, now back at ref_count == 1.
+        assert list(holder.block_table[:4]) == shared
+        for b in shared:
+            assert bm.kv.block(b).ref_count == 1
+
+    def test_disown_leaves_no_leak_after_deallocate(self, seq_factory):
+        bm, holder, seq, _ = self._shared_prefix(seq_factory)
+        bm.disown_claimed_prefix(seq)
+        bm.deallocate(seq)
+        bm.deallocate(holder)
+        assert bm.kv.num_used == 0
+
+    def test_disown_fails_when_pool_cannot_back_private_copies(self, seq_factory):
+        # 6 blocks: holder takes 4, seq's fresh tail takes 1, leaving 1 free --
+        # fewer than the 4 private copies the disown needs, so it must refuse
+        # rather than silently reuse the shared blocks.
+        bm, _holder, seq, shared = self._shared_prefix(
+            seq_factory, num_kvcache_blocks=6
+        )
+        assert bm.kv.has_free(4) is False
+
+        assert bm.disown_claimed_prefix(seq) is False
+
+        # Refusal is total: the table is untouched and the peer's blocks are
+        # still shared, so the caller can safely deallocate + requeue.
+        assert list(seq.block_table[:4]) == shared
+        for b in shared:
+            assert bm.kv.block(b).ref_count == 2
+
+    def test_disown_is_a_noop_without_prefix_caching(self, seq_factory):
+        cfg = MockConfig(num_kvcache_blocks=8, kv_cache_block_size=4)
+        bm = BlockManager(cfg)
+        seq = seq_factory(list(range(16)))
+        bm.allocate(seq)
+        table_before = list(seq.block_table)
+        assert bm.disown_claimed_prefix(seq) is True
+        assert list(seq.block_table) == table_before
 
 
 # ── allocate / deallocate ──────────────────────────────────────────────────
@@ -653,3 +803,413 @@ class TestRegisterReceivedPrefix:
         assert all(
             bm.kv.block(block_id).hash != -1 for block_id in received.block_table[2:]
         )
+
+
+# ── state_offload disabled by default ─────────────────────────────────────
+
+
+def test_state_offload_is_none_when_tier_is_off(block_manager):
+    """No `lmcache_offload` connector means no tier, whatever the ring size:
+    the connector is the feature's only on/off switch."""
+    assert block_manager.state_offload is None
+
+
+# ── the index is built only where something can report to it ─────────────
+
+# The layout is part of the capability, not an incidental detail: only K3
+# offloads per-request state, so an offload connector on a dense model hosts no
+# tier however it is configured.
+_OFFLOAD_KVC = {
+    "kv_connector": "lmcache_offload",
+    "kv_role": "offload",
+    "offload_layout": "kimi_k3",
+}
+
+
+def _bm_with_state_tier(monkeypatch, kv_transfer_config):
+    cfg = MockConfig(
+        enable_prefix_caching=True,
+        kv_transfer_config=kv_transfer_config,
+        pool_entries={"state": 4},
+        pool_entries_per_req={"state": 1},
+    )
+    return BlockManager(cfg)
+
+
+def test_no_ring_is_installed_without_a_connector_that_hosts_the_tier(
+    monkeypatch, caplog
+):
+    """The silent-permanent failure. A load is resolved only by a worker
+    report, and without a hosting connector no report ever comes -- so an index
+    built here would offer loads that park their request forever. Refuse to
+    build it."""
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        bm = _bm_with_state_tier(monkeypatch, None)
+
+    assert bm.state_offload is None
+
+
+def test_a_connector_that_cannot_host_the_tier_gets_no_index_either(
+    monkeypatch, caplog
+):
+    """Same failure, one step subtler: moriio is a KV connector, so a plain
+    truthiness test on kv_transfer_config would build the index, but only
+    lmcache_offload's worker half ever builds a `_state_tier`."""
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        bm = _bm_with_state_tier(monkeypatch, {"kv_connector": "moriio"})
+
+    assert bm.state_offload is None
+
+
+def test_the_index_is_built_for_the_offload_connector(monkeypatch):
+    bm = _bm_with_state_tier(monkeypatch, _OFFLOAD_KVC)
+    assert bm.state_offload is not None
+    # #2045 moved the checkpoint into the KV pool, so the tier no longer
+    # reaches into the slot pool at all -- that coupling was the staging ring.
+    assert not any(hasattr(cache, "offload") for cache in bm.state_caches)
+
+
+def test_a_dense_layout_hosts_no_state_tier_however_it_is_configured(monkeypatch):
+    """The name check said yes to every `lmcache_offload`. Only K3's worker
+    half builds a `StateOffloadTier`: dense has no per-request state and DSV4
+    keeps its own in the SLOT sidecar."""
+    for layout in ("dense", "hybrid"):
+        bm = _bm_with_state_tier(
+            monkeypatch, {**_OFFLOAD_KVC, "offload_layout": layout}
+        )
+        assert bm.state_offload is None, layout
+        assert layout in bm.state_tier_capability.reason
+
+
+def test_pipeline_parallelism_hosts_no_state_tier(monkeypatch):
+    """The worker refuses PP outright -- `CacheEngineKey` has no PP component,
+    so two stages at one TP rank would overwrite each other. The engine used to
+    build an index anyway and emit stores with nowhere to go."""
+    cfg = MockConfig(
+        enable_prefix_caching=True,
+        kv_transfer_config=_OFFLOAD_KVC,
+        pool_entries={"state": 4},
+        pool_entries_per_req={"state": 1},
+    )
+    cfg.pipeline_parallel_size = 2
+    bm = BlockManager(cfg)
+    assert bm.state_offload is None
+    assert "pipeline_parallel_size=2" in bm.state_tier_capability.reason
+
+
+def test_a_producer_role_stores_but_never_votes_for_a_load(monkeypatch):
+    bm = _bm_with_state_tier(monkeypatch, {**_OFFLOAD_KVC, "kv_role": "kv_producer"})
+    assert bm.state_offload is not None
+    assert bm.state_offload.can_store and not bm.state_offload.can_load
+    bm.state_offload.note_stored(11)
+    assert bm.state_offload.request_load("r1", 11) is False
+
+
+def test_a_consumer_role_votes_but_never_hands_over_a_store(monkeypatch):
+    bm = _bm_with_state_tier(monkeypatch, {**_OFFLOAD_KVC, "kv_role": "kv_consumer"})
+    assert bm.state_offload is not None
+    assert bm.state_offload.can_load and not bm.state_offload.can_store
+    assert bm.take_state_stores(4) == []
+
+
+def test_a_multi_listing_two_offload_connectors_is_refused(monkeypatch):
+    """The tier's bytes ride one connector's worker half and its completions
+    ride that connector's `get_finished`, so two providers would each hold half
+    an answer. Refused *loudly* at startup, not degraded to a no-tier fallback:
+    the silent fallback left the KV load path live over a block table the other
+    sub was writing (review round 5, finding 0)."""
+    try:
+        _bm_with_state_tier(
+            monkeypatch,
+            {
+                "kv_connector": "multi",
+                "connectors": [_OFFLOAD_KVC, dict(_OFFLOAD_KVC)],
+            },
+        )
+    except ValueError as exc:
+        assert "offload connectors" in str(exc)
+        assert "at most one" in str(exc)
+    else:
+        raise AssertionError("two offload sub-connectors must raise at startup")
+
+
+def test_the_index_is_built_for_a_multi_that_lists_the_offload_backend(
+    monkeypatch,
+):
+    bm = _bm_with_state_tier(
+        monkeypatch,
+        {
+            "kv_connector": "multi",
+            "connectors": [{"kv_connector": "moriio"}, _OFFLOAD_KVC],
+        },
+    )
+    assert bm.state_offload is not None
+
+
+def test_a_multi_without_the_offload_backend_gets_no_index(monkeypatch):
+    bm = _bm_with_state_tier(
+        monkeypatch,
+        {"kv_connector": "multi", "connectors": [{"kv_connector": "moriio"}]},
+    )
+    assert bm.state_offload is None
+
+
+# ── a store whose source was reclaimed must not be indexed ─────────────────
+
+
+class TestReclaimedStoresAreNotIndexed:
+    """`reclaim_stale_offload_pins` cannot prove the worker stopped reading:
+    a K3 state store bypasses `CacheEngine.store()` and gathers ATOM PAGE units
+    directly, so LMCache's GPU-source pin monitor does not cover them. If the
+    reader had not stopped, the pool may have handed those units to another
+    request whose writes the gather picked up -- a CPU image that is a mix of
+    two prefixes under the first one's hash."""
+
+    class _Coordinator:
+        def __init__(self, reclaimed):
+            self._reclaimed = reclaimed
+            self.settled = []
+            self.released = []
+
+        def was_reclaimed(self, op):
+            return op in self._reclaimed
+
+        def settle_offload_store(self, op):
+            self.settled.append(op)
+
+        def release_offload_store_source(self, op):
+            self.released.append(op)
+
+    def _bm(self, reclaimed=()):
+        from atom.model_engine.state_offload import StateOffloadIndex
+
+        bm = object.__new__(BlockManager)
+        bm.paged_state_checkpoints = self._Coordinator(set(reclaimed))
+        bm.state_offload = StateOffloadIndex()
+        return bm
+
+    def test_a_normal_store_is_indexed(self):
+        from atom.kv_transfer.disaggregation.types import StateStoreOperationId
+
+        bm = self._bm()
+        op = StateStoreOperationId(11, 1)
+        bm.settle_state_store(op, ok=True)
+        assert 11 in bm.state_offload.hashes
+        assert bm.state_offload.stores_completed == 1
+        assert bm.state_offload.stores_untrusted == 0
+
+    def test_a_reclaimed_store_reporting_success_is_forfeited(self):
+        from atom.kv_transfer.disaggregation.types import StateStoreOperationId
+
+        op = StateStoreOperationId(11, 1)
+        bm = self._bm(reclaimed=[op])
+        bm.settle_state_store(op, ok=True)
+        assert 11 not in bm.state_offload.hashes, "voting for it is wrong output"
+        assert bm.state_offload.stores_completed == 0
+        assert bm.state_offload.stores_untrusted == 1
+
+    def test_the_units_go_back_either_way(self):
+        from atom.kv_transfer.disaggregation.types import StateStoreOperationId
+
+        op = StateStoreOperationId(11, 1)
+        bm = self._bm(reclaimed=[op])
+        bm.settle_state_store(op, ok=True)
+        assert bm.paged_state_checkpoints.settled == [op]
+
+    def test_the_source_release_is_what_normally_returns_them(self):
+        from atom.kv_transfer.disaggregation.types import StateStoreOperationId
+
+        bm = self._bm()
+        op = StateStoreOperationId(11, 1)
+        bm.release_state_store_source(op)
+        # Phase one hands the units back but leaves the pin in place, so the
+        # store still reads as dispatched-but-unreported until its report lands.
+        assert bm.paged_state_checkpoints.released == [op]
+        assert bm.paged_state_checkpoints.settled == [], "the pin is not retired"
+        # ...and it does not touch the index, which the store report owns.
+        assert bm.state_offload.hashes == set()
+
+
+# ── the orphan load slot lives in one dict of (slot, stamp) ────────────────
+
+
+class TestOrphanLoadSlotSingleDict:
+    """A load slot whose request was torn down before its bytes landed is
+    parked in one dict of `(slot, stamp)`. It used to live across two parallel
+    dicts keyed the same way, mutated in pairs at four sites -- a shape where an
+    overwrite or a half-applied pop could desync them, so the reconciler
+    (iterating the stamp dict) and the release (reading the slot dict) could
+    disagree and strand a slot off the pool free list. One dict makes that
+    unrepresentable: an entry is present with its slot and stamp together, or it
+    is gone."""
+
+    class _Pool:
+        def __init__(self):
+            self.released = []
+
+        def release(self, slot):
+            self.released.append(slot)
+
+    class _Index:
+        def __init__(self):
+            self.abandoned, self.completed, self.failed = [], [], []
+
+        def abandon_load(self, req_id):
+            self.abandoned.append(req_id)
+
+        def complete_load(self, req_id):
+            self.completed.append(req_id)
+
+        def fail_load(self, req_id):
+            self.failed.append(req_id)
+
+    def _bm(self):
+        bm = object.__new__(BlockManager)
+        bm.state = self._Pool()
+        bm.state_offload = self._Index()
+        bm._orphan_load_slots = {}
+        bm._orphan_load_slots_reclaimed = 0
+        return bm
+
+    def test_settle_frees_the_parked_slot_and_clears_the_entry(self):
+        from time import monotonic
+
+        bm = self._bm()
+        bm._orphan_load_slots["r"] = [(7, monotonic())]
+        bm.settle_state_load("r", ok=True)
+        assert bm.state.released == [7]
+        assert "r" not in bm._orphan_load_slots
+        assert bm.state_offload.completed == ["r"]
+
+    def test_abandon_frees_the_parked_slot(self):
+        from time import monotonic
+
+        bm = self._bm()
+        bm._orphan_load_slots["r"] = [(7, monotonic())]
+        bm.abandon_state_load("r")
+        assert bm.state.released == [7]
+        assert "r" not in bm._orphan_load_slots
+
+    def test_reconcile_frees_a_slot_whose_report_never_came(self):
+        from time import monotonic
+
+        bm = self._bm()
+        bm._orphan_load_slots["r"] = [(7, monotonic())]
+        assert bm.reconcile_orphan_load_slots(timeout_s=1e-9) == 1
+        assert bm.state.released == [7]
+        assert bm._orphan_load_slots_reclaimed == 1
+        assert "r" not in bm._orphan_load_slots
+
+    def test_reconcile_spares_a_slot_still_inside_its_window(self):
+        from time import monotonic
+
+        bm = self._bm()
+        bm._orphan_load_slots["r"] = [(7, monotonic())]
+        assert bm.reconcile_orphan_load_slots(timeout_s=3600) == 0
+        assert bm.state.released == []
+        assert "r" in bm._orphan_load_slots
+
+    def test_a_late_report_after_reconcile_releases_nothing(self):
+        from time import monotonic
+
+        bm = self._bm()
+        bm._orphan_load_slots["r"] = [(7, monotonic())]
+        bm.reconcile_orphan_load_slots(timeout_s=1e-9)
+        bm.settle_state_load("r", ok=True)  # the report finally arrives
+        assert bm.state.released == [7], "freed once by reconcile, not twice"
+
+    def test_a_preempt_readmit_parks_the_same_id_twice_without_dropping_a_slot(
+        self,
+    ):
+        # `seq.id` is per-request, not per-admission: a preempt/re-admit can park
+        # the same id twice while the first load is still in flight. A single
+        # tuple would overwrite -- leaking slot 7 forever and, worse, releasing
+        # slot 8 (still being written) when the first report lands. Appended and
+        # released oldest-first, each report frees the slot its load actually
+        # settled.
+        from time import monotonic
+
+        bm = self._bm()
+        first = (7, monotonic())
+        second = (8, monotonic())
+        bm._orphan_load_slots["r"] = [first]  # first admission
+        bm._orphan_load_slots["r"].append(second)  # re-admission, load in flight
+
+        bm.settle_state_load("r", ok=True)  # first (oldest) load reports
+        assert bm.state.released == [7]
+        assert bm._orphan_load_slots["r"] == [second]  # slot 8 still parked
+
+        bm.settle_state_load("r", ok=True)  # second load reports
+        assert bm.state.released == [7, 8]
+        assert "r" not in bm._orphan_load_slots  # entry cleared when empty
+
+    def test_reconcile_expires_one_admission_and_keeps_the_fresh_one(self):
+        # Each parked admission ages on its own stamp: a stale one is reclaimed
+        # even while a newer park for the same id is still inside the window.
+        from time import monotonic
+
+        bm = self._bm()
+        now = monotonic()
+        bm._orphan_load_slots["r"] = [(7, now - 3600), (8, now)]  # old, fresh
+
+        assert bm.reconcile_orphan_load_slots(timeout_s=1.0) == 1
+        assert bm.state.released == [7]
+        assert bm._orphan_load_slots["r"] == [(8, now)]
+        assert bm._orphan_load_slots_reclaimed == 1
+
+
+# ── the LMCache chunk probe is gated on the capability ─────────────────────
+
+
+class TestJointChunkProbeIsGated:
+    """Reading the chunk size imports LMCache, which is an optional dependency.
+    Doing it unconditionally meant every engine without an offload connector
+    logged a full `ModuleNotFoundError` traceback at WARNING on startup, for a
+    number it has no use for -- and any caplog assertion downstream inherited
+    that noise."""
+
+    def _bm(self, kv_transfer_config):
+        cfg = MockConfig(
+            enable_prefix_caching=True,
+            kv_transfer_config=kv_transfer_config,
+            pool_entries={"state": 4},
+            pool_entries_per_req={"state": 1},
+        )
+        return BlockManager(cfg)
+
+    def test_an_engine_with_no_tier_does_not_probe_or_warn(self, caplog):
+        with caplog.at_level(logging.DEBUG, logger="atom"):
+            bm = self._bm({"kv_connector": "moriio"})
+        assert bm._joint_chunk_tokens == 0
+        assert "LMCache chunk size" not in caplog.text
+        assert "lmcache" not in caplog.text.lower()
+
+    def test_a_dense_offload_engine_does_not_probe_either(self, caplog):
+        """It has an offload connector but no state to offload, so a joint KV
+        load is impossible and the chunk grid is not its business."""
+        with caplog.at_level(logging.DEBUG, logger="atom"):
+            bm = self._bm(
+                {
+                    "kv_connector": "lmcache_offload",
+                    "kv_role": "offload",
+                    "offload_layout": "dense",
+                }
+            )
+        assert bm._joint_chunk_tokens == 0
+        assert "LMCache chunk size" not in caplog.text
+
+    def test_a_hosted_tier_still_probes_and_says_so_when_it_cannot_read(self, caplog):
+        """The warning is worth printing exactly here: the tier is on, so a
+        missing chunk size really does disable the joint KV load."""
+        with caplog.at_level(logging.WARNING, logger="atom"):
+            bm = self._bm(
+                {
+                    "kv_connector": "lmcache_offload",
+                    "kv_role": "offload",
+                    "offload_layout": "kimi_k3",
+                }
+            )
+        # lmcache is not installed in the unit-test environment, so the probe
+        # runs and fails -- which is the point: it ran.
+        assert bm._joint_chunk_tokens == 0
+        assert "LMCache chunk size" in caplog.text

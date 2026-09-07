@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
-from typing import Type
 
 import torch
 
@@ -23,7 +22,7 @@ class TritonMHABackend(AttentionBackend):
         return "ROCM_TRITON_MHA"
 
     @staticmethod
-    def get_builder_cls() -> Type["TritonMHAMetadataBuilder"]:
+    def get_builder_cls() -> type["TritonMHAMetadataBuilder"]:
         return TritonMHAMetadataBuilder
 
     @staticmethod
@@ -57,11 +56,10 @@ class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):
                 # tokens straight from the paged flash-layout KV cache (already
                 # written during rope_cache via slot_mapping) using the real
                 # per-seq block_table, identical to the prefix-cache-hit path.
-                # The base builder only uploads `block_tables` when `has_cached`,
-                # so do it here for pure prefill and flag the consumer to read
-                # from the cache.
+                # The base builder marshals `block_tables` every step but only
+                # uploads it when `has_cached`, so upload it here for pure
+                # prefill and flag the consumer to read from the cache.
                 bs = batch.total_seqs_num_prefill
-                self.prepare_block_tables(batch)
                 attn_metadata.block_tables = self.model_runner.forward_vars[
                     "block_tables"
                 ].copy_to_gpu(bs)

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import importlib.util
 import itertools
 import logging
 import time
@@ -62,6 +63,30 @@ class LLMEngine:
                     data_parallel_master_port
                 )
         self.data_parallel_size = config.parallel_config.data_parallel_size
+        # TBO's two concurrent ubatches are supported by the mori EP
+        # dispatch/combine path. The EP collective fallback instead issues
+        # full DP all-gather/reduce-scatter operations from both ubatch streams;
+        # those streams can enter the collectives in opposite order and hang.
+        # Keep the fallback usable by serializing it until it has dedicated
+        # per-ubatch communicators, analogous to the PCP/TP guard below.
+        mori_ep_enabled = (
+            getattr(config, "moe_all2all_backend", "auto") in {"auto", "mori"}
+            and not envs.ATOM_DISABLE_MORI_EP
+            and importlib.util.find_spec("mori") is not None
+        )
+        if (
+            config.enable_dp_attention
+            and config.enable_expert_parallel
+            and config.enable_tbo
+            and not mori_ep_enabled
+        ):
+            logger.warning(
+                "Disabling TBO for the DP-attention + EP collective fallback: "
+                "concurrent all-gather/reduce-scatter ubatches can deadlock. "
+                "Use mori EP or run the fallback without --enable-tbo."
+            )
+            config.enable_tbo = False
+            config.enable_tbo_decode = False
         # PCP and DP-attention are not yet compatible: PCP stripe-splits
         # input_ids to 1/pcp_size in ForCausalLM.forward, but DP-attention's
         # `_gather_ids_for_dp` all-gathers using dp_metadata sizes computed on
@@ -388,6 +413,12 @@ class LLMEngine:
                 "wanted_tokens",
                 "reusable_tokens",
                 "full_tokens",
+                # Reuse served from the CPU offload tier. Every rank reports it
+                # in `cache_statistics()`, but it was missing from this sum, so
+                # the DP-aggregated snapshot dropped the one counter the offload
+                # feature exists to move. Shares the `reusable` denominator with
+                # the HBM series but no numerator -- scored separately below.
+                "offload_tokens",
                 "checkpoints_kept",
                 "checkpoints_dropped",
                 "checkpoints_evicted",
@@ -401,12 +432,19 @@ class LLMEngine:
                 # placement that converges from one that pays per request, and
                 # one of them missing makes the other unreadable.
                 "chunks_cut_for_end",
+                # Whether the joint state+KV load found a boundary to work
+                # with, and what the state leg cost when it did. Summed like
+                # the rest: a boundary is per admission and every rank admits
+                # the same request.
+                "joint_boundaries",
+                "state_hbm",
+                "state_tier",
             )
         }
         # `reusable`, not `full`: a request's trailing block is never a reuse
         # candidate (prefill must forward one block for logits), so `full`
         # charges both pools for tokens neither was offered and caps every
-        # rate below 100%. See `CacheStats.total_reusable_tokens`.
+        # rate below 100%. See `EngineStats.total_reusable_tokens`.
         reusable = totals["reusable_tokens"]
 
         def rate(num: int, den: int = reusable) -> float:
@@ -428,11 +466,17 @@ class LLMEngine:
             # wrong pool. `compressed_hit` above is already the paged pool's
             # half of the same split and the two multiply back to `hit`, so a
             # `paged_hit` alias for it was a second name for one number.
-            # See `CacheStats.paged_hit_rate` / `state_hit_rate`.
+            # See `EngineStats.paged_hit_rate` / `state_hit_rate`.
             "state_hit": rate(totals["cached_tokens"], compressed),
             "state_recoverable_loss": rate(
                 totals["wanted_tokens"] - totals["cached_tokens"], compressed
             ),
+            # CPU-tier reuse against the same `reusable` denominator as `hit`,
+            # matching `EngineStats.offload_hit_rate`. Disjoint from the HBM
+            # `hit` numerator (the offload tier serves what HBM missed), so it
+            # is not part of the `hit`/`compressed_hit` product and stands on
+            # its own.
+            "offload_hit": rate(totals["offload_tokens"]),
         }
 
     def get_metrics_statistics(self) -> dict[str, Any]:
@@ -450,6 +494,17 @@ class LLMEngine:
 
         def summed(key: str) -> int:
             return sum(int(stats.get(key, 0)) for stats in rank_stats)
+
+        # Queue depths cannot be summed across a P/D pair: one in-flight
+        # request sits in the prefill rank's `running` and the decode rank's
+        # `prefill_waiting` at once. The decode side's four queues already
+        # span the whole lifetime, so it alone is the full picture. Falls back
+        # to every rank when no decode rank reported — non-P/D, or before the
+        # decode engine's first push, where nothing is duplicated yet.
+        queue_stats = [s for s in rank_stats if s.get("role") == "decode"] or rank_stats
+
+        def summed_queues(key: str) -> int:
+            return sum(int(stats.get(key, 0)) for stats in queue_stats)
 
         kv_total = summed("kv_blocks_total")
         kv_used = summed("kv_blocks_used")
@@ -499,6 +554,10 @@ class LLMEngine:
             key: sum(int(stats.get(key, 0)) for stats in cache_rank_stats)
             for key in cache_keys
         }
+        # NOTE: `full`, while `get_cache_statistics` divides by `reusable`, so
+        # this endpoint reads lower for the same engine — `full` counts the
+        # trailing block no cache is offered, and that fixed size weighs more
+        # on shorter prompts. Pre-existing; don't compare the two endpoints.
         cache_full = cache_totals["full_tokens"]
         offload_rank_stats = [
             stats.get("offload", {}) for stats in rank_stats if stats.get("offload")
@@ -519,8 +578,8 @@ class LLMEngine:
 
         return {
             "enabled": bool(rank_stats),
-            "requests_running": summed("requests_running"),
-            "requests_waiting": summed("requests_waiting"),
+            "requests_running": summed_queues("requests_running"),
+            "requests_waiting": summed_queues("requests_waiting"),
             "requests_parked_kv_load": summed("requests_parked_kv_load"),
             "requests_partial_prefill": summed("requests_partial_prefill"),
             "requests_finished": summed("requests_finished"),
@@ -613,6 +672,7 @@ class InputOutputProcessor:
                 "qwen3_5_text",
                 "qwen3_5_moe_text",
                 "kimi_linear",
+                "glm5_next_text",
                 "deepseek_v4",
             }
         )

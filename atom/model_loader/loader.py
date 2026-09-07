@@ -200,10 +200,17 @@ def initialize_dummy_weights(model: nn.Module, mode: str) -> None:
     for name, param in model.named_parameters():
         data = param.data
         if mode == "zero":
-            # zero_() works in place for every dtype (incl. fp4x2/fp8/int) and
-            # every shape; a uint8 byte-view would crash on 0-dim scalar or
-            # non-contiguous params (view requires stride(-1)==1, dim>0).
-            data.zero_()
+            # zero_() is the fast path: valid for every shape and every
+            # standard dtype (fp8/int/bf16/...). Packed sub-byte dtypes
+            # (e.g. Float4_e2m1fn_x2) have no CUDA fill kernel, so zero_()
+            # raises ("fill_cuda" not implemented for that dtype); fall back
+            # to zeroing the raw bytes instead (all-zero bytes == zero-valued
+            # weights). Only packed weights reach the fallback, and those are
+            # contiguous and >=1D, so the uint8 view is always valid there.
+            try:
+                data.zero_()
+            except (NotImplementedError, RuntimeError):
+                data.view(torch.uint8).zero_()
             continue
         # mode == "xavier"
         dt = data.dtype

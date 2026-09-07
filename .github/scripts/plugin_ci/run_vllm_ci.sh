@@ -42,6 +42,7 @@ trap cleanup EXIT
 
 MODEL_NAME="${MATRIX_MODEL_NAME:-}"
 MODEL_PATH="${MATRIX_MODEL_PATH:-}"
+DRAFT_MODEL_PATH="${MATRIX_DRAFT_MODEL_PATH:-}"
 EXTRA_ARGS="${MATRIX_EXTRA_ARGS:-}"
 CLIENT_COMMAND="${MATRIX_CLIENT_COMMAND:-}"
 ENV_VARS="${MATRIX_ENV_VARS:-}"
@@ -55,6 +56,8 @@ fi
 
 # shellcheck disable=SC1091
 source atom/plugin/vllm/vllm-version.env
+# shellcheck disable=SC1091
+source .github/scripts/plugin_ci/cache_model.sh
 
 REBUILD_ATOM_BASE=false
 if [[ -n "${PR_BASE_SHA}" && -n "${PR_HEAD_SHA}" ]]; then
@@ -204,24 +207,16 @@ docker run -dt --device=/dev/kfd ${DEVICE_FLAG} \
   --name "${CONTAINER_NAME}" \
   "${OOT_IMAGE_TAG}"
 
-bash .github/scripts/gpu_preflight_check.sh "${CONTAINER_NAME}" docker
+GPU_PREFLIGHT_KILL_DOCKER=1 bash .github/scripts/gpu_preflight_check.sh "${CONTAINER_NAME}" docker
 
-model_dir="/models/${MODEL_PATH}"
-if [[ -n "${MODEL_CACHE_MOUNT}" ]]; then
-  docker exec \
-    -e HF_TOKEN="${HF_TOKEN:-}" \
-    -e MODEL_ID="${MODEL_PATH}" \
-    -e TARGET_DIR="${model_dir}" \
-    -e MODEL_USE_LOCK="true" \
-    -e MODEL_DOWNLOAD_TIMEOUT="3h" \
-    -e MODEL_LOCK_WAIT_SECONDS="7200" \
-    -e MODEL_LOCK_POLL_INTERVAL="30" \
-    -e MODEL_PROGRESS_INTERVAL="60" \
-    "${CONTAINER_NAME}" \
-    bash -lc 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'
-  OOT_RESOLVED_MODEL_PATH="/models/${MODEL_PATH}"
-else
-  OOT_RESOLVED_MODEL_PATH="${MODEL_PATH}"
+OOT_RESOLVED_MODEL_PATH="$(plugin_ci_download_model "${MODEL_PATH}")"
+DRAFT_ID="$(plugin_ci_infer_draft_model_id "${DRAFT_MODEL_PATH}" "${EXTRA_ARGS}")"
+if [[ -n "${DRAFT_ID}" ]]; then
+  DRAFT_HF_ID="$(plugin_ci_hf_id "${DRAFT_ID}")"
+  if [[ "${DRAFT_HF_ID}" != "$(plugin_ci_hf_id "${MODEL_PATH}")" ]]; then
+    DRAFT_RESOLVED_PATH="$(plugin_ci_download_model "${DRAFT_HF_ID}")"
+    EXTRA_ARGS="$(plugin_ci_rewrite_extra_args "${EXTRA_ARGS}" "${DRAFT_HF_ID}" "${DRAFT_RESOLVED_PATH}")"
+  fi
 fi
 
 docker exec \

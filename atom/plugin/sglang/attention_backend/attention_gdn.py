@@ -431,6 +431,9 @@ class SGLangGDNForwardContext:
                 v_cache=layer_cache.temporal,
                 k_scale=None,
                 v_scale=None,
+                # Slot-addressed recurrent state, not paged KV -- see
+                # `KVCacheTensor.per_request_state`.
+                per_request_state=True,
             )
         return out
 
