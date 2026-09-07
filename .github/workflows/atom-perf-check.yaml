@@ -1,0 +1,323 @@
+name: ATOM Perf Check (PR)
+
+# Opt-in, non-blocking performance check for pull requests.
+#
+# Measures the merge-base and the PR head back to back inside ONE job, so both
+# halves land on the same machine and the same container instance. GitHub
+# Actions offers no way to pin two jobs to one machine, which is why this
+# cannot reuse benchmark-tmpl.yml (one job per concurrency level).
+#
+# The pairing is not a preference. Per-image historical baselines do not exist:
+# across 52 deduplicated perf runs on the public dashboard, 30 of 39 images were
+# benchmarked exactly once and only 3 reached three runs, while cross-image
+# comparison spreads 11-21% against 0.57% median CV within one image.
+#
+# Because the workspace is bind-mounted into the container (setup-gpu-container
+# passes -v "$GITHUB_WORKSPACE":/workspace), switching commits is a host-side
+# `git checkout` that the running container picks up immediately. No second
+# container, and no new script duplicating benchmark-tmpl.yml's launch/bench
+# logic -- atom_test.sh already does all of it.
+#
+# Concurrency levels split into two roles. Levels at or above 64 decide the
+# verdict; 4 and 32 are measured and displayed but never judged, because low
+# concurrency pollutes a verdict in both directions -- it manufactures false
+# positives and dilutes real ones -- while hiding it altogether removes the
+# evidence a reader needs to tell a small-batch path problem from noise.
+#
+# This workflow never fails the PR. It posts a comment and writes a step
+# summary; the merge decision stays with the reviewer.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, ready_for_review]
+
+concurrency:
+  group: perf-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# Smoke configuration. The full set is five entries across five concurrency
+# levels (25 jobs); this cuts it to the cheapest single entry and the three
+# judging levels (3 jobs) so the first real run exercises every code path --
+# same runner, same catalog, same criterion -- at a fraction of the machine
+# time. Widen these once the mechanics are proven; nothing else changes.
+env:
+  PERF_MODELS: glm-5-2-fp8          # tp=4, the only target that is not whole-node
+  PERF_ISL: 8192
+  PERF_OSL: 1024
+  PERF_RATIO: "0.8"
+  PERF_JUDGING_CONCS: 64,128,256
+  PERF_REFERENCE_CONCS: ""          # smoke: skip reference levels
+  PERF_EXPECTED_ENTRIES: 1
+
+jobs:
+  # ---------------------------------------------------------------- gate ---
+  gate:
+    name: perf-check-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require the ci:perf label
+        env:
+          # Deliberately NOT ci:full -- that label already fans out the heavy
+          # accuracy suites, and folding a paired benchmark into it would double
+          # GPU time for every PR that asks for a full run.
+          CI_GATE_LABELS: ci:perf
+        run: .github/scripts/check_heavy_ci_gate.sh
+
+  # -------------------------------------------------------- build matrix ---
+  build-matrix:
+    name: Build perf matrix
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      cells: ${{ steps.build.outputs.cells }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive cells from the benchmark catalog
+        id: build
+        run: |
+          set -euo pipefail
+          # Server args, env vars, model paths and result filenames all come
+          # from models.json via catalog.py -- the same source the nightly
+          # matrix uses. Hard-coding them here would fork the definition of what
+          # each model *is* and drift the moment someone tunes a flag.
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, sys
+          sys.path.insert(0, ".github/scripts")
+          import catalog
+
+          raw = os.environ["PERF_JUDGING_CONCS"] + "," + \
+                os.environ.get("PERF_REFERENCE_CONCS", "")
+          concs = [c for c in (x.strip() for x in raw.split(",")) if c]
+          isl, osl = os.environ["PERF_ISL"], os.environ["PERF_OSL"]
+          ratio = os.environ["PERF_RATIO"]
+          param_lists = ";".join(f"{isl},{osl},{c},{ratio}" for c in concs)
+
+          wanted = set(os.environ["PERF_MODELS"].split(","))
+          cells = catalog.build_cells(
+              ".github/benchmark/models.json",
+              param_lists=param_lists,
+              model_filter=wanted,
+          )
+          # Base variant for every selected model, plus DeepSeek-V4-Pro MTP3
+          # when that model is in play: base and MTP3 as a pair separate a
+          # speculative-decoding regression from a model-wide one.
+          keep = {(p, "") for p in wanted}
+          if "deepseek-v4-pro" in wanted:
+              keep.add(("deepseek-v4-pro", "-mtp3"))
+          cells = [c for c in cells if (c["prefix"], c["suffix"]) in keep]
+          if len(cells) != len(concs) * len(keep):
+              # A silent shortfall here becomes "insufficient coverage" much
+              # later, in the judge, where the cause is no longer visible.
+              print(
+                  f"::warning::expected {len(concs) * len(keep)} cells, "
+                  f"built {len(cells)}",
+                  file=sys.stderr,
+              )
+          print(f"cells={json.dumps(cells)}")
+          PY
+        env:
+          PERF_MODELS: ${{ env.PERF_MODELS }}
+          PERF_ISL: ${{ env.PERF_ISL }}
+          PERF_OSL: ${{ env.PERF_OSL }}
+          PERF_RATIO: ${{ env.PERF_RATIO }}
+          PERF_JUDGING_CONCS: ${{ env.PERF_JUDGING_CONCS }}
+          PERF_REFERENCE_CONCS: ${{ env.PERF_REFERENCE_CONCS }}
+
+  # -------------------------------------------------------- paired bench ---
+  paired-bench:
+    name: ${{ matrix.cell.display }} c=${{ matrix.cell.conc }}
+    needs: [gate, build-matrix]
+    strategy:
+      fail-fast: false
+      matrix:
+        cell: ${{ fromJson(needs.build-matrix.outputs.cells) }}
+    runs-on: ${{ matrix.cell.runner }}
+    timeout-minutes: 150
+    env:
+      MODEL_PATH: ${{ matrix.cell.model_path }}
+      ARGS: ${{ matrix.cell.server_args }}
+      ISL: ${{ matrix.cell.isl }}
+      OSL: ${{ matrix.cell.osl }}
+      CONC: ${{ matrix.cell.conc }}
+      RANDOM_RANGE_RATIO: ${{ matrix.cell.ratio }}
+      RESULT_FILENAME: ${{ matrix.cell.result_filename }}
+      CONTAINER: atom-perf-check
+    steps:
+      - name: Kill leftover containers
+        run: docker ps -aq | xargs -r docker rm -f || true
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # merge-base needs full history
+
+      - name: Resolve merge-base
+        id: refs
+        run: |
+          set -euo pipefail
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          # The merge-base, not the base branch tip: the tip moves as other PRs
+          # land, so the same PR measured twice would not be comparable.
+          BASE_SHA=$(git merge-base "origin/${{ github.base_ref }}" "$HEAD_SHA")
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "Base $BASE_SHA -> head $HEAD_SHA"
+
+      - name: Start container and download model
+        uses: ./.github/actions/atom-bench-container
+        with:
+          image: rocm/atom-dev:latest
+          container-name: ${{ env.CONTAINER }}
+          model-path: ${{ env.MODEL_PATH }}
+          env-vars: ${{ matrix.cell.env_vars }}
+          hf-token: ${{ secrets.AMD_HF_TOKEN }}
+          download-required: "true"
+          container-env: -e ISL=${{ env.ISL }} -e OSL=${{ env.OSL }} -e CONC=${{ env.CONC }} -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }}
+
+      - name: Pin the image digest
+        id: image
+        run: |
+          set -euo pipefail
+          # `latest` is a floating tag pulled with --pull always. Both halves
+          # share this one container so the pairing is safe regardless, but the
+          # digest has to be recorded or the run cannot be placed against any
+          # other run, and the PR comment cannot say what was measured.
+          DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' \
+                     rocm/atom-dev:latest 2>/dev/null || echo "unknown")
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Image: $DIGEST"
+
+      # Base runs first on purpose: the head half then measures on a warm
+      # machine. Reversed, head would systematically absorb cold-start cost and
+      # read low for reasons that have nothing to do with the change.
+      - name: Bench BASE
+        run: .github/scripts/perf_check_half.sh "${{ steps.refs.outputs.base_sha }}" base
+
+      - name: Bench HEAD
+        run: .github/scripts/perf_check_half.sh "${{ steps.refs.outputs.head_sha }}" head
+
+      - name: Record provenance
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib
+          meta = {
+              "image_digest": os.environ["IMAGE_DIGEST"],
+              "base_sha": os.environ["BASE_SHA"],
+              "head_sha": os.environ["HEAD_SHA"],
+              "runner": os.environ["RUNNER_NAME"],
+          }
+          pathlib.Path("perf-pair/provenance.json").write_text(json.dumps(meta))
+          PY
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          BASE_SHA: ${{ steps.refs.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.refs.outputs.head_sha }}
+
+      - name: Upload pair
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: perf-pair-${{ matrix.cell.result_filename }}
+          path: perf-pair
+          if-no-files-found: warn
+
+      - name: Clean up
+        if: always()
+        run: |
+          docker exec ${{ env.CONTAINER }} bash -lc '.github/scripts/atom_test.sh stop' || true
+          docker rm -f ${{ env.CONTAINER }} || true
+          git checkout -- . || true
+
+  # ---------------------------------------------------------------- judge ---
+  judge:
+    name: perf-check-judge
+    # gate must stay in `needs` even though paired-bench already depends on it:
+    # `needs.gate` is only in scope for jobs that list it, so referencing it
+    # below without this is an unresolved expression, not a false condition.
+    needs: [gate, paired-bench]
+    if: always() && needs.gate.result == 'success'
+    runs-on: ubuntu-latest        # pure CPU, seconds
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download every pair
+        uses: actions/download-artifact@v7
+        with:
+          pattern: perf-pair-*
+          path: pairs
+
+      - name: Collect base and head halves
+        id: collect
+        run: |
+          set -euo pipefail
+          mkdir -p collected/base collected/head
+          # Artifacts nest one directory per matrix cell; flatten both halves so
+          # the judge sees one base dir and one head dir.
+          find pairs -path '*/base/*.json' -exec cp {} collected/base/ \; || true
+          find pairs -path '*/head/*.json' -exec cp {} collected/head/ \; || true
+          echo "base=$(find collected/base -name '*.json' | wc -l)" >> "$GITHUB_OUTPUT"
+          echo "head=$(find collected/head -name '*.json' | wc -l)" >> "$GITHUB_OUTPUT"
+          DIGEST=$(find pairs -name provenance.json -print -quit \
+                   | xargs -r python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["image_digest"])' \
+                   || echo unknown)
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Judge
+        run: |
+          set -euo pipefail
+          CONTEXT="base \`${{ github.event.pull_request.base.sha }}\` -> head \`${{ github.event.pull_request.head.sha }}\` · \`${{ steps.collect.outputs.digest }}\`"
+          # --expect-entries is not optional: an entry whose job died entirely
+          # produces no files at all, so without it a run where most jobs failed
+          # reads as clean.
+          python3 .github/scripts/perf_judge.py \
+            --base-dir collected/base \
+            --head-dir collected/head \
+            --expect-entries "${{ env.PERF_EXPECTED_ENTRIES }}" \
+            --context "$CONTEXT" \
+            --output-json verdict.json \
+            --comment-file comment.md \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post or update the PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- atom-perf-check -->';
+            const body = marker + '\n' + fs.readFileSync('comment.md', 'utf8');
+            const {owner, repo} = context.repo;
+            const issue_number = context.issue.number;
+            // Update in place rather than appending: a PR that is pushed to
+            // repeatedly should carry one current result, not a pile of stale
+            // ones a reader has to date-sort by hand.
+            const existing = await github.paginate(
+              github.rest.issues.listComments, {owner, repo, issue_number});
+            const mine = existing.find(c => c.body && c.body.includes(marker));
+            if (mine) {
+              await github.rest.issues.updateComment(
+                {owner, repo, comment_id: mine.id, body});
+            } else {
+              await github.rest.issues.createComment(
+                {owner, repo, issue_number, body});
+            }
+
+      - name: Upload verdict
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: perf-verdict
+          path: |
+            verdict.json
+            comment.md
