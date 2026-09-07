@@ -873,10 +873,11 @@ class KimiFullAttention(nn.Module):
 
 
 def _kda_attention_with_output_fake(
-    hidden_states: torch.Tensor,
-    hidden_states_scale: torch.Tensor | None,
+    mixed_qkv: torch.Tensor,
+    beta: torch.Tensor,
+    gate: torch.Tensor,
+    out: torch.Tensor,
     layer_name: str,
-    output: torch.Tensor,
 ) -> None:
     return None
 
@@ -884,24 +885,32 @@ def _kda_attention_with_output_fake(
 @mark_spliting_op(
     is_custom=True,
     gen_fake=_kda_attention_with_output_fake,
-    mutates_args=["output"],
+    mutates_args=["out"],
 )
 def kda_attention_with_output(
-    hidden_states: torch.Tensor,
-    hidden_states_scale: torch.Tensor | None,
+    mixed_qkv: torch.Tensor,
+    beta: torch.Tensor,
+    gate: torch.Tensor,
+    out: torch.Tensor,
     layer_name: str,
-    output: torch.Tensor,
 ) -> None:
-    """Opaque splitting-op boundary for the KDA mixer.
+    """Opaque splitting-op boundary for the KDA causal-conv + recurrence.
 
-    The KDA recurrence reads the forward context, calls fla causal-conv/kda
-    kernels and mutates the per-request conv/ssm cache in place. torch.compile
-    (level 3) mis-compiles that stateful path into garbage if it is allowed to
-    trace through it, so the whole mixer is wrapped in a custom op — inductor
-    treats it as opaque and the piecewise backend splits the graph here,
-    exactly as the GDN path does via aiter.linear_attention_with_output_base.
+    The recurrence reads the forward context, calls fla causal-conv/kda kernels
+    and mutates the per-request conv/ssm cache in place. torch.compile (level 3)
+    mis-compiles that stateful path into garbage if it is allowed to trace
+    through it, so it is wrapped in a custom op — inductor treats it as opaque
+    and the piecewise backend splits the graph here, exactly as the GDN path
+    does via aiter.linear_attention_with_output_base.
 
-    ``output`` is allocated by the caller *inside* the traced region and only
+    The boundary is drawn as tightly as the untraceable work requires: only the
+    conv and the recurrence are inside. Every GEMM around them (in_proj,
+    f_b_proj, o_proj) and the gated norm stay in the traced region, where they
+    are captured instead of paying eager dispatch on all ~69 KDA layers. This
+    mirrors Qwen3NextGatedDeltaNet.forward, whose three parts (project / core
+    attention / norm+out-project) split the same way.
+
+    ``out`` is allocated by the caller *inside* the traced region and only
     mutated here, so the op returns nothing. That is what makes the mixer safe
     under PIECEWISE: the splitting submodule runs eager between two captured
     pieces, and a returned tensor would be a fresh allocation every step while
@@ -912,12 +921,7 @@ def kda_attention_with_output(
     self = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
-    mixed = self._forward_impl(hidden_states, hidden_states_scale)
-    # _forward_impl returns only the num_actual_tokens rows it computed; the
-    # padded tail of `output` is left as-is, matching attention_gdn.py's
-    # core_attn_out. The copy cannot be folded into o_proj's out=: o_proj is a
-    # RowParallelLinear and its TP all-reduce returns a fresh tensor anyway.
-    output[: mixed.shape[0]] = mixed
+    self._kda_core(mixed_qkv, beta, gate, out)
 
 
 class KimiKDAAttention(nn.Module):
@@ -1173,62 +1177,58 @@ class KimiKDAAttention(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Three stages, only the middle one opaque -- the same shape
+        # Qwen3NextGatedDeltaNet.forward has. The projections and the gated norm
+        # run here, in the traced region, and are captured; only the conv and the
+        # recurrence cross the split.
+        #
+        # They run at the *padded* graph-bucket height rather than the
+        # num_actual_tokens slice _forward_impl takes, because a captured piece
+        # has one shape. Padding is bounded by the capture ladder, and capture
+        # metadata reports the full bucket as num_actual_tokens anyway
+        # (gdn_attn._build_gdn_capture_metadata), so the graph is built at this
+        # width regardless.
+        #
         # hidden_states is a (fp8, scale) tuple when input_layernorm fused the
-        # per-token quant; carry the scale through the opaque splitting custom op
-        # so in_proj consumes it in _forward_impl.
+        # per-token quant; in_proj consumes the scale directly.
         hidden_states_scale = None
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_scale = hidden_states
-        # Allocate the mixer output here, in the traced region, so it belongs to
-        # the captured piece upstream of the split rather than to the eager op.
-        # See kda_attention_with_output's docstring. The mixer output is always
-        # bf16 even when the activation is fp8 (fused input_layernorm+quant), so
-        # pin the dtype rather than empty_like.
-        output = torch.empty(
-            hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
+        mixed_qkv, out_gate, beta, gate = self._project(
+            hidden_states, hidden_states_scale
         )
-        # Route through the opaque custom op so torch.compile splits the graph
-        # here instead of tracing the stateful recurrence in _forward_impl.
+        # Allocate the recurrence output here, in the traced region, so it
+        # belongs to the captured piece upstream of the split rather than to the
+        # eager op -- see kda_attention_with_output's docstring. From mixed_qkv
+        # (bf16), not hidden_states, which may be fp8.
+        core = mixed_qkv.new_empty(
+            (mixed_qkv.shape[0], self.num_local_heads, self.head_dim)
+        )
         torch.ops.aiter.kda_attention_with_output(
-            hidden_states, hidden_states_scale, self.layer_name, output
+            mixed_qkv, beta, gate, core, self.layer_name
         )
-        return output
+        return self._out(core, out_gate)
 
     @mark_trace
-    def _forward_impl(
+    def _project(
         self,
         hidden_states: torch.Tensor,
-        hidden_states_scale: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        fwd_ctx = get_forward_context()
-        kda_metadata = getattr(fwd_ctx.attn_metadata, "kda_metadata", None)
-        if kda_metadata is None:
-            # Native ATOM/SGLang integrations still expose the shared legacy
-            # field. vLLM 0.26+ uses the dedicated KDA metadata adapter.
-            kda_metadata = getattr(fwd_ctx.attn_metadata, "gdn_metadata", None)
-        if kda_metadata is None:
-            # Output is bf16 even when the input activation is fp8 (fused quant).
-            return torch.zeros(
-                hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
-            )
+        hidden_states_scale: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The GEMMs feeding the recurrence: ``(mixed_qkv, out_gate, beta, gate)``.
 
-        cache = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
-        conv_state = cache.k_cache
-        ssm_state = cache.v_cache
-        if conv_state.size(1) != self.local_proj_size * 3:
-            conv_state = conv_state.transpose(-1, -2)
+        Single fused in-proj GEMM producing [q | k | v | g | b | f_a]; slice out
+        each part. ``out_gate`` is the KDA output gate consumed at o_norm in
+        :meth:`_out` (computed here so it rides the same GEMM instead of a
+        separate one after the recurrence). in_proj's weight was grown in
+        process_weights_after_loading to the fused width, so this single
+        unquantized call emits all six; f_b_proj stays a separate GEMM because it
+        consumes f_a's output, not hidden_states.
 
-        num_actual_tokens = kda_metadata.num_actual_tokens
-        hidden_states = hidden_states[:num_actual_tokens]
-        if hidden_states_scale is not None:
-            hidden_states_scale = hidden_states_scale[:num_actual_tokens]
-        # Single fused in-proj GEMM producing [q | k | v | g]; slice out each
-        # part. `out_gate` is the KDA output gate consumed at o_norm below
-        # (computed here so it rides the same GEMM instead of a separate one
-        # after the recurrence). in_proj's weight was grown in
-        # process_weights_after_loading to the fused [q | k | v | g | b | f_a],
-        # so this single unquantized call emits all six; f_b_proj stays a
-        # separate GEMM because it consumes f_a's output, not hidden_states.
+        ``beta`` and ``gate`` come back as plain 2D [T, ...] tensors; the batch
+        unsqueeze/rearrange the fla kernels want happens in :meth:`_kda_core`, so
+        the splitting op's signature stays unbatched.
+        """
         lp = self.local_proj_size
         nlh = self.num_local_heads
         hd = self.head_dim
@@ -1242,7 +1242,7 @@ class KimiKDAAttention(nn.Module):
         out_gate = fused_in[..., 3 * lp : 4 * lp]
         # beta is widened to fp32 inside _run_kda (see the note there): the KDA
         # delta-rule write strength must stay fp32 for accuracy.
-        beta = fused_in[..., 4 * lp : 4 * lp + nlh].unsqueeze(0)
+        beta = fused_in[..., 4 * lp : 4 * lp + nlh]
         # f_a feeds a second GEMM (f_b_proj) and is a column slice of the fused
         # output, so it needs a unit row stride rather than the fused N_fused one.
         # Under a per-token FP8 f_b_proj that copy would be followed by a quant
@@ -1258,11 +1258,115 @@ class KimiKDAAttention(nn.Module):
             gate = self.f_b_proj(f_a, x_scale=f_a_scale)
         else:
             gate = self.f_b_proj(f_a_view.contiguous())
-        gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
-        # Allocate from fused_in (bf16), not hidden_states, which may be fp8.
-        out = fused_in.new_empty(
+        return mixed_qkv, out_gate, beta, gate
+
+    @mark_trace
+    def _out(self, out: torch.Tensor, out_gate: torch.Tensor) -> torch.Tensor:
+        """Gated norm + output projection over the recurrence result."""
+        normed = self.o_norm(
+            out, rearrange(out_gate, "t (h d) -> t h d", d=self.head_dim)
+        )
+        # A fused per-token quant makes o_norm return (quantized, scale); feed it
+        # straight to o_proj's x_scale path. Otherwise it is a bf16 tensor.
+        if isinstance(normed, tuple):
+            o_fp8, o_scale = normed
+            return self.o_proj(o_fp8, x_scale=o_scale)
+        return self.o_proj(rearrange(normed, "t h d -> t (h d)"))
+
+    @mark_trace
+    def _forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run the whole mixer eagerly, returning only the computed rows.
+
+        The same three stages :meth:`forward` composes, but with everything on
+        one side of the boundary and sized to ``num_actual_tokens`` rather than a
+        graph bucket. Kept for the callers that need a plain tensor back from an
+        arbitrary row subset: the vLLM plugin's ``_forward_segments`` slices the
+        batch by request class, runs this per class, and scatters the rows.
+        """
+        fwd_ctx = get_forward_context()
+        kda_metadata = self._kda_metadata(fwd_ctx)
+        if kda_metadata is None:
+            # Output is bf16 even when the input activation is fp8 (fused quant).
+            return torch.zeros(
+                hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
+            )
+
+        num_actual_tokens = kda_metadata.num_actual_tokens
+        hidden_states = hidden_states[:num_actual_tokens]
+        if hidden_states_scale is not None:
+            hidden_states_scale = hidden_states_scale[:num_actual_tokens]
+        mixed_qkv, out_gate, beta, gate = self._project(
+            hidden_states, hidden_states_scale
+        )
+        # Allocate from mixed_qkv (bf16), not hidden_states, which may be fp8.
+        # Exactly num_actual_tokens rows, so _kda_core's slicing is a no-op and
+        # its tail zeroing never runs.
+        out = mixed_qkv.new_empty(
             (num_actual_tokens, self.num_local_heads, self.head_dim)
         )
+        self._kda_core(mixed_qkv, beta, gate, out)
+        return self._out(out, out_gate)
+
+    @staticmethod
+    def _kda_metadata(fwd_ctx):
+        """This step's KDA metadata, or None when there is no attention state."""
+        kda_metadata = getattr(fwd_ctx.attn_metadata, "kda_metadata", None)
+        if kda_metadata is None:
+            # Native ATOM/SGLang integrations still expose the shared legacy
+            # field. vLLM 0.26+ uses the dedicated KDA metadata adapter.
+            kda_metadata = getattr(fwd_ctx.attn_metadata, "gdn_metadata", None)
+        return kda_metadata
+
+    def _kda_core(
+        self,
+        mixed_qkv: torch.Tensor,
+        beta: torch.Tensor,
+        gate: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        """Causal conv + KDA recurrence, writing into ``out``.
+
+        The untraceable half of the mixer, and the only thing
+        :func:`kda_attention_with_output` wraps. Inputs may be longer than the
+        step's real token count -- ``forward`` hands over full graph-bucket rows
+        -- so everything is sliced to ``num_actual_tokens`` here rather than by
+        the caller.
+        """
+        fwd_ctx = get_forward_context()
+        kda_metadata = self._kda_metadata(fwd_ctx)
+        if kda_metadata is None:
+            out.zero_()
+            return
+
+        cache = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
+        conv_state = cache.k_cache
+        ssm_state = cache.v_cache
+        if conv_state.size(1) != self.local_proj_size * 3:
+            conv_state = conv_state.transpose(-1, -2)
+
+        num_actual_tokens = kda_metadata.num_actual_tokens
+        # o_norm and o_proj run downstream of the split over the *whole* buffer,
+        # but the recurrence below only ever writes the first num_actual_tokens
+        # rows. `out` came from torch.empty, so the tail has to be defined here
+        # or stale bits turn into Inf/NaN in o_norm's per-row reduction. Mirrors
+        # attention_gdn.py's core_attn_out. No-op on the _forward_impl path,
+        # which sizes `out` to exactly these rows.
+        if num_actual_tokens < out.shape[0]:
+            out[num_actual_tokens:].zero_()
+
+        # Everything below works on just the real rows.
+        mixed_qkv = mixed_qkv[:num_actual_tokens]
+        # beta is widened to fp32 inside _run_kda (see the note there): the KDA
+        # delta-rule write strength must stay fp32 for accuracy.
+        beta = beta[:num_actual_tokens].unsqueeze(0)
+        gate = rearrange(
+            gate[:num_actual_tokens], "t (h d) -> 1 t h d", d=self.head_dim
+        )
+        out = out[:num_actual_tokens]
 
         conv_weights = self.conv_weight
         state_indices = kda_metadata.non_spec_state_indices_tensor
@@ -1472,16 +1576,6 @@ class KimiKDAAttention(nn.Module):
                 )
         else:
             out.zero_()
-
-        normed = self.o_norm(
-            out, rearrange(out_gate, "t (h d) -> t h d", d=self.head_dim)
-        )
-        # A fused per-token quant makes o_norm return (quantized, scale); feed it
-        # straight to o_proj's x_scale path. Otherwise it is a bf16 tensor.
-        if isinstance(normed, tuple):
-            o_fp8, o_scale = normed
-            return self.o_proj(o_fp8, x_scale=o_scale)
-        return self.o_proj(rearrange(normed, "t h d -> t (h d)"))
 
 
 class KimiDecoderLayer(nn.Module):
