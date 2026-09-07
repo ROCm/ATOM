@@ -1182,13 +1182,6 @@ class KimiKDAAttention(nn.Module):
         # run here, in the traced region, and are captured; only the conv and the
         # recurrence cross the split.
         #
-        # They run at the *padded* graph-bucket height rather than the
-        # num_actual_tokens slice _forward_impl takes, because a captured piece
-        # has one shape. Padding is bounded by the capture ladder, and capture
-        # metadata reports the full bucket as num_actual_tokens anyway
-        # (gdn_attn._build_gdn_capture_metadata), so the graph is built at this
-        # width regardless.
-        #
         # hidden_states is a (fp8, scale) tuple when input_layernorm fused the
         # per-token quant; in_proj consumes the scale directly.
         hidden_states_scale = None
@@ -1303,8 +1296,8 @@ class KimiKDAAttention(nn.Module):
             hidden_states, hidden_states_scale
         )
         # Allocate from mixed_qkv (bf16), not hidden_states, which may be fp8.
-        # Exactly num_actual_tokens rows, so _kda_core's slicing is a no-op and
-        # its tail zeroing never runs.
+        # Exactly num_actual_tokens rows, so _kda_core sees no padded tail and
+        # its prefill-branch zeroing never runs.
         out = mixed_qkv.new_empty(
             (num_actual_tokens, self.num_local_heads, self.head_dim)
         )
@@ -1331,10 +1324,21 @@ class KimiKDAAttention(nn.Module):
         """Causal conv + KDA recurrence, writing into ``out``.
 
         The untraceable half of the mixer, and the only thing
-        :func:`kda_attention_with_output` wraps. Inputs may be longer than the
-        step's real token count -- ``forward`` hands over full graph-bucket rows
-        -- so everything is sliced to ``num_actual_tokens`` here rather than by
-        the caller.
+        :func:`kda_attention_with_output` wraps. This runs *eager* between two
+        captured pieces -- the piecewise backend excludes splitting submodules
+        from compilation -- so the host values read here are this step's, not
+        capture's.
+
+        Inputs span the caller's full buffer. On a captured decode that is the
+        graph bucket, whose tail rows are padding, and they are deliberately
+        *not* sliced off: a decode step's shapes must not depend on a host value
+        that differed at capture. The padding is made harmless by value instead
+        --  ``gdn_attn`` fills the padded state slots with ``PAD_SLOT_ID`` and
+        the recurrence kernels skip any row whose slot is negative (see
+        fused_sigmoid_gating's `if state_idx < 0: return`), so those rows read
+        and write nothing. Only the ragged prefill branch, which is never
+        captured and whose kernels are driven by ``query_start_loc`` rather than
+        a slot table, slices to the real token count.
         """
         fwd_ctx = get_forward_context()
         kda_metadata = self._kda_metadata(fwd_ctx)
@@ -1349,24 +1353,10 @@ class KimiKDAAttention(nn.Module):
             conv_state = conv_state.transpose(-1, -2)
 
         num_actual_tokens = kda_metadata.num_actual_tokens
-        # o_norm and o_proj run downstream of the split over the *whole* buffer,
-        # but the recurrence below only ever writes the first num_actual_tokens
-        # rows. `out` came from torch.empty, so the tail has to be defined here
-        # or stale bits turn into Inf/NaN in o_norm's per-row reduction. Mirrors
-        # attention_gdn.py's core_attn_out. No-op on the _forward_impl path,
-        # which sizes `out` to exactly these rows.
-        if num_actual_tokens < out.shape[0]:
-            out[num_actual_tokens:].zero_()
-
-        # Everything below works on just the real rows.
-        mixed_qkv = mixed_qkv[:num_actual_tokens]
         # beta is widened to fp32 inside _run_kda (see the note there): the KDA
         # delta-rule write strength must stay fp32 for accuracy.
-        beta = beta[:num_actual_tokens].unsqueeze(0)
-        gate = rearrange(
-            gate[:num_actual_tokens], "t (h d) -> 1 t h d", d=self.head_dim
-        )
-        out = out[:num_actual_tokens]
+        beta = beta.unsqueeze(0)
+        gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
 
         conv_weights = self.conv_weight
         state_indices = kda_metadata.non_spec_state_indices_tensor
@@ -1385,8 +1375,13 @@ class KimiKDAAttention(nn.Module):
         query_start_loc = kda_metadata.non_spec_query_start_loc
 
         if kda_metadata.num_prefills > 0:
+            # Prefill is ragged and never captured: `query_start_loc` -- not a
+            # padded slot table -- drives both the conv and the chunked
+            # recurrence, and a row past the last cu_seqlen belongs to no
+            # sequence. So this branch, alone, works on just the real rows.
+            n = num_actual_tokens
             q, k, v = causal_conv1d_fn(
-                mixed_qkv.transpose(0, 1),
+                mixed_qkv[:n].transpose(0, 1),
                 conv_weights,
                 None,
                 activation=self.activation,
@@ -1414,8 +1409,8 @@ class KimiKDAAttention(nn.Module):
                 q,
                 k,
                 v,
-                gate,
-                beta,
+                gate[:, :n],
+                beta[:, :n],
                 initial,
                 query_start_loc,
                 True,
@@ -1424,10 +1419,25 @@ class KimiKDAAttention(nn.Module):
             # initial_state dtype; the gathered initial is allocated as such),
             # so no .to() cast is needed.
             ssm_state[state_indices] = last_state
-            out.copy_(kda_out.squeeze(0))
+            out[:n].copy_(kda_out.squeeze(0))
+            # This branch is the only one that leaves rows unwritten, and
+            # o_norm downstream of the split reads the whole buffer -- `out`
+            # came from torch.empty, so stale bits there would surface as
+            # Inf/NaN in its per-row reduction. The other branches cover every
+            # row (their padding is skipped by slot, not by shape).
+            if n < out.shape[0]:
+                out[n:].zero_()
         elif kda_metadata.num_decodes > 0:
-            # Slice the per-token cache-slot indices once (used for both the
-            # conv update and the fused recurrence below).
+            # The one surviving token-dim slice, and it is not padding-trimming:
+            # it makes the slot table agree with the row count. causal_conv1d_update
+            # takes `batch` from x.shape[0] when query_start_loc is None, so it
+            # reads conv_state_indices[row] for every row of the padded buffer,
+            # while the builder publishes a num_reqs-wide view of a max_bs buffer
+            # (gdn_attn.prepare_gdn_metadata). The underlying storage past that
+            # view is PAD_SLOT_ID-filled and the kernels skip negative slots, so
+            # widening the view is what makes the padded rows harmless -- and
+            # `state_indices` is a device tensor, so slicing it costs no host
+            # value the capture did not also see.
             decode_state_indices = state_indices[:num_actual_tokens]
             q, k, v = causal_conv1d_update(
                 mixed_qkv,
