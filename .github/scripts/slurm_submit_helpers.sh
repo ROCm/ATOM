@@ -334,6 +334,7 @@ monitor_slurm_job() {
 read_slurm_exit_code() {
   local job_id="$1"
   local sacct_line exit_status exit_signal deadline
+  local state=""
 
   SLURM_STATE="unknown"
   SLURM_EXIT_CODE="unknown"
@@ -360,10 +361,27 @@ read_slurm_exit_code() {
     else
       sacct_line="$(sacct -j "${job_id}" -X -n -P -o State,ExitCode 2>/dev/null | awk -F'|' 'NF { print; exit }' || true)"
     fi
-    [[ -n "${sacct_line}" ]] && break
+    if [[ -n "${sacct_line}" ]]; then
+      state="${sacct_line%%|*}"
+      state="${state%%+*}"
+      case "${state}" in
+        COMPLETE|COMPLETED|FAILED|CANCELLED|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL|PREEMPTED|BOOT_FAIL|DEADLINE)
+          break
+          ;;
+      esac
+    fi
 
     if [[ "$(date +%s)" -ge "${deadline}" ]]; then
-      echo "ERROR: unable to read final Slurm state for job ${job_id} after ${SLURM_ACCOUNTING_TIMEOUT}s" >&2
+      if [[ -z "${sacct_line}" ]]; then
+        echo "ERROR: unable to read final Slurm state for job ${job_id} after ${SLURM_ACCOUNTING_TIMEOUT}s" >&2
+        return 0
+      fi
+      # COMPLETING (and similar) is not a final state on Spur; let callers
+      # fall back to rank-rc / batch-script status instead of treating 0:0 as fail.
+      echo "WARNING: Slurm job ${job_id} still in ${state:-unknown} after ${SLURM_ACCOUNTING_TIMEOUT}s; treating accounting as unavailable" >&2
+      SLURM_STATE="unknown"
+      SLURM_EXIT_CODE="unknown"
+      SLURM_JOB_RC=2
       return 0
     fi
     sleep "${SLURM_ACCOUNTING_POLL_INTERVAL}"
