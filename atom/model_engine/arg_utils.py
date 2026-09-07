@@ -323,10 +323,11 @@ class EngineArgs:
             nargs="?",
             const="high-throughput",
             default=None,
-            choices=["high-throughput", "low-latency"],
-            help="All2all backend mode for MORI. "
-            "Default is 'high-throughput'. "
-            "Use '--all2all-backend low-latency' for AsyncLL MORI kernel overlap.",
+            choices=["high-throughput", "low-latency", "rccl", "none"],
+            help="Routed MoE transport. 'high-throughput' and 'low-latency' "
+            "select MORI modes, 'rccl' selects ATOM's native RCCL MoE "
+            "transport, and 'none' forces the DP "
+            "AllGather/ReduceScatter fallback. Default is auto-detect MORI.",
         )
         parser.add_argument(
             "--moe-backend",
@@ -717,6 +718,13 @@ class EngineArgs:
 
         all2all_backend = kwargs.pop("all2all_backend", None)
         kwargs["enable_low_latency"] = all2all_backend == "low-latency"
+        kwargs["moe_all2all_backend"] = {
+            None: "auto",
+            "high-throughput": "mori",
+            "low-latency": "mori",
+            "rccl": "rccl",
+            "none": "none",
+        }[all2all_backend]
 
         # --dspark-config (JSON dict) → DSparkConfig object, passed through as
         # Config.dspark (no env vars).

@@ -45,14 +45,14 @@ Builder = pytest.importorskip(
     exc_type=ImportError,
 ).DeepseekV4AttentionMetadataBuilder
 
-from atom.model_ops.attentions.paged_state_copy import plan_segmented_copy
-from atom.model_ops.attentions.state_arena import (
+from atom.model_ops.attentions.pool_layout.paged_state_copy import plan_segmented_copy
+from atom.model_ops.attentions.pool_layout.state_arena import (
     StateField,
     checkpoint_ranges_for,
     entry_bytes_for,
     field_extents,
 )
-from atom.model_ops.attentions.v4_pool_geometry import CSA_RATIO, HCA_RATIO
+from atom.model_ops.attentions.pool_layout.v4_pool_geometry import CSA_RATIO, HCA_RATIO
 
 NEG_INF = float("-inf")
 ROW_BYTES = 64

@@ -17,6 +17,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from atom.model_ops.v4_kernels.compress_plan import (
     CompressPlan,
     make_compress_plans,
+    plan_context_lens,
 )
 from atom.model_ops.v4_kernels.csa_translate_pack import (
     csa_translate_pack,
@@ -76,6 +77,7 @@ __all__ = [
     "hca_compress_paged_offsets",
     "inverse_rope_inplace",
     "make_compress_plans",
+    "plan_context_lens",
     "qk_norm_rope_maybe_quant",
     "qk_norm_rope_maybe_quant_fp8_2buff",
     "qk_norm_rope_maybe_quant_reference",
@@ -95,8 +97,8 @@ __all__ = [
 
 logger = logging.getLogger("atom")
 
-# FP4 indexer persistent-grid schedule params, shared by the decode
-# (`pa_mqa_logits_fp4`) and prefill (`pa_mqa_logits_fp4_prefill`) kernels.
+# FP4 indexer persistent-grid schedule params for the `pa_mqa_logits_fp4_prefill`
+# kernels, which decode and prefill both score through.
 # The attention metadata builder precomputes each path's cta_info with these
 # and the scorer passes the matching block_k, so layout and grid agree. They
 # live here (rather than in either caller) because both the builder and the

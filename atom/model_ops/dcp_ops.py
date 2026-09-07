@@ -812,6 +812,45 @@ def dcp_local_index(pos, dcp_size, cp_kv_cache_interleave_size=1):
     )
 
 
+def dcp_prefill_slot_mapping(
+    block_tables,
+    cached_lens,
+    context_lens,
+    block_size,
+    dcp_size,
+    dcp_rank,
+    cp_kv_cache_interleave_size=1,
+):
+    """Per-token KV slots for a prefill step, ``-1`` where another rank owns it.
+
+    ``block_tables`` is one ragged per-sequence row per sequence, and the two
+    length arrays bound each sequence's span; the result is the flattened token
+    axis in sequence order. The body is the slot formula ``dcp_local_index``
+    documents above, applied per token -- kept here rather than in the
+    attention builder so the rank filter and the addressing it depends on stay
+    in one file, and so the builder needs to know nothing about interleaving.
+
+    A loop, not array arithmetic: this axis is a per-rank filter, and no
+    configuration in this tree runs ``dcp_size > 1`` to check a vectorized
+    rewrite against.
+    """
+    virtual_block_size = block_size * dcp_size
+    slot_mapping = []
+    rows = zip(block_tables, cached_lens, context_lens)
+    for block_table, cached_seqlen, seqlen in rows:
+        for pos in range(cached_seqlen, seqlen):
+            if dcp_owner_rank(pos, dcp_size, cp_kv_cache_interleave_size) != dcp_rank:
+                slot_mapping.append(-1)
+                continue
+            local_offset = (
+                dcp_local_index(pos, dcp_size, cp_kv_cache_interleave_size) % block_size
+            )
+            slot_mapping.append(
+                block_table[pos // virtual_block_size] * block_size + local_offset
+            )
+    return slot_mapping
+
+
 def dcp_global_pos(local_index, dcp_rank, dcp_size, cp_kv_cache_interleave_size=1):
     """Inverse of ``dcp_local_index``: global token position of local KV index
     ``local_index`` held on ``dcp_rank``.

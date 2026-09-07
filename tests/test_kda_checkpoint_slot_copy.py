@@ -270,7 +270,9 @@ class TestAStoreRestoreRoundTripMovesExactlyTheImage:
     N_UNITS = 24  # generous: the image must not need all of them
 
     def build(self):
-        from atom.model_ops.attentions.paged_state_copy import plan_segmented_copy
+        from atom.model_ops.attentions.pool_layout.paged_state_copy import (
+            plan_segmented_copy,
+        )
 
         k = torch.zeros((self.N_LAYERS, self.SLOTS) + SHAPE_K, dtype=DT_K)
         v = torch.zeros((self.N_LAYERS, self.SLOTS) + SHAPE_V, dtype=DT_V)
@@ -536,7 +538,9 @@ class TestAnImageSpansBothPoolsIntact:
     GEO = TestAnIndexerSharesThePageUnit()
 
     def build(self):
-        from atom.model_ops.attentions.paged_state_copy import plan_segmented_copy
+        from atom.model_ops.attentions.pool_layout.paged_state_copy import (
+            plan_segmented_copy,
+        )
 
         stub, pool, index_cache = self.GEO.build()
         k = torch.zeros((N_LAYERS, self.SLOTS) + SHAPE_K, dtype=DT_K)

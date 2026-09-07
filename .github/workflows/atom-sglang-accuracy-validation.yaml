@@ -638,7 +638,7 @@ jobs:
               -f "${BUILD_CONTEXT}/docker/sglang_release.dockerfile" \
               "${BUILD_CONTEXT}"
 
-            docker push "${SGLANG_IMAGE_TAG}"
+            .github/scripts/docker_push_retry.sh "${SGLANG_IMAGE_TAG}"
             exit 0
           fi
 
@@ -692,7 +692,7 @@ jobs:
             -f "${BUILD_CONTEXT}/docker/sglang_release.dockerfile" \
             "${BUILD_CONTEXT}"
 
-          docker push "${SGLANG_IMAGE_TAG}"
+          .github/scripts/docker_push_retry.sh "${SGLANG_IMAGE_TAG}"
 
       - name: Clean up builder images
         if: ${{ always() && steps.meta.outputs.cleanup_temp_image == 'true' }}

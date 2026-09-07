@@ -4,12 +4,12 @@
 import pytest
 import torch
 
-from atom.model_ops.attentions.state_arena import (
+from atom.model_ops.attentions.pool_layout.state_arena import (
     StateField,
     plan_field_planes,
     plan_regions,
 )
-from atom.model_ops.attentions.v4_pool_geometry import UnifiedPoolGeometry
+from atom.model_ops.attentions.pool_layout.v4_pool_geometry import UnifiedPoolGeometry
 from atom.plugin.vllm.deepseek_v4_bridge import (
     ATOM_DEEPSEEK_V4_BLOCK_SIZE,
     ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT,

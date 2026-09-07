@@ -82,3 +82,35 @@ def test_no_trim_when_bound_exceeds_buffer(monkeypatch):
     # below the bound.
     a1, _, _, _ = _trim(monkeypatch, running_tokens=64, dp_size=8, topk=4, recv_rows=16)
     assert a1.shape[0] == 16
+
+
+def test_exact_dispatch_output_bypasses_mori_trim(monkeypatch):
+    """An EP-wide exact RCCL buffer must not be cut to the smaller DP bound."""
+    running_tokens, dp_size, ep_size, topk = 32, 2, 8, 6
+    context = SimpleNamespace(
+        running_tokens=running_tokens,
+        is_prefill=False,
+        running_tokens_are_unified=True,
+    )
+    monkeypatch.setattr(
+        mk, "get_forward_context", lambda: SimpleNamespace(context=context)
+    )
+    monkeypatch.setattr(mk, "get_dp_group", lambda: SimpleNamespace(world_size=dp_size))
+
+    kernel = mk.FusedMoEModularKernel.__new__(mk.FusedMoEModularKernel)
+    kernel.prepare_finalize = SimpleNamespace(needs_dispatch_output_trim=lambda: False)
+    recv_rows = ep_size * running_tokens
+    hidden = 8
+    a1 = torch.arange(recv_rows * hidden, dtype=torch.float32).reshape(
+        recv_rows, hidden
+    )
+    ids = torch.zeros(recv_rows, topk, dtype=torch.int32)
+    weights = torch.ones(recv_rows, topk, dtype=torch.float32)
+    scale = torch.ones(recv_rows, 4, dtype=torch.float32)
+    topk_ids = torch.zeros(running_tokens, topk, dtype=torch.int32)
+
+    trimmed = kernel._trim_dispatch_output_if_needed(
+        a1, scale, ids, weights, topk_ids, expert_tokens_meta=None
+    )
+
+    assert [tensor.shape[0] for tensor in trimmed] == [recv_rows] * 4

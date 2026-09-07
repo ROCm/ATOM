@@ -204,7 +204,7 @@ The `AttentionBackend` abstract class defines three required methods:
 - `get_builder_cls()` — Returns the `AttentionMetadataBuilder` subclass.
 - `get_impl_cls()` — Returns the attention implementation class.
 
-`CommonAttentionBuilder` provides shared metadata preparation (slot mapping, block tables, cumulative sequence lengths) used by both `AiterBackend` and `AiterMLABackend`.
+`CommonAttentionBuilder` provides shared metadata preparation (slot mapping, block tables, cumulative sequence lengths) used by both `AiterBackend` and `AiterMLABackend`. It marshals `block_tables` on every prefill step, whether or not that step also uploads the buffer, because the slot arithmetic in `token_layout/prefill.py` reads the packed table back rather than the batch's ragged rows.
 
 ### KV cache operations
 
@@ -501,6 +501,44 @@ ATOM uses fused kernels to reduce memory traffic by combining multiple operation
 | `backends.py` | `AttentionBackend`, `AttentionMetadataBuilder`, `CommonAttentionBuilder`, `AttentionImpl` abstract classes |
 | `aiter_attention.py` | `AiterBackend`, `AiterAttentionMetadataBuilder` — MHA backend with persistent ASM paged attention support |
 | `aiter_mla.py` | `AiterMLABackend`, `AiterMLAMetadataBuilder` — MLA backend with sparse attention support |
+
+### `atom/model_ops/attentions/pool_layout/` and `.../token_layout/`
+
+Two packages, two axes. `pool_layout` answers **where a byte lives** in the
+cache pools and is a function of the config; `token_layout` answers **where
+this step's tokens go** and is a function of the batch, so it is rebuilt every
+step. A backend consumes both and belongs to neither.
+
+Membership has three parts, and only the third is machine-checkable. **By
+topic** — the axis decides, not the dependencies. **Arithmetic, not staging** —
+a member computes an answer and does not write or upload a `forward_vars`
+mirror; `page_unit_geometry` is a mixin over `self.model_runner` and still
+qualifies because it only reads, so taking `self` is not the line, having a
+side effect on the step's buffers is. **Reachable without `aiter` or the rest
+of `atom`**, so a member is importable on a runner with no AITER build and no
+GPU — CI is such a runner, and one import failure during collection aborts the
+whole run rather than one test, so `tests/test_layout_packages.py` enforces
+that part over both packages. Do not mistake the checkable part for the rule.
+
+Two absences are deliberate. `v4_kernels/pool_index.py` is
+`v4_pool_geometry`'s device-side half — the same row formulas as `@triton.jit`
+device functions for the eight kernels that address the pool — and stays with
+the kernels; `tests/test_pool_index.py` pins the two sides together. And a
+per-token shape that only one caller has stays with that caller: V4's decode
+positions are ragged, and the one-token decode slot mapping comes from
+`last_block_num_tokens` rather than from a position.
+
+| File | Description |
+|---|---|
+| `pool_layout/sub_pool_spec.py` | `SubPoolSpec`, `page_pool`, `state_pool`, `plan_pools` — sub-pool sizing as arithmetic over a byte budget |
+| `pool_layout/v4_pool_geometry.py` | `UnifiedPoolGeometry`, `WindowParams`, the compress ratios — where a DeepSeek-V4 row lives, and which rows a step may see |
+| `pool_layout/page_unit_geometry.py` | `PageUnitGeometryMixin` — where a K3 checkpoint image's bytes land in the MLA paged pool |
+| `pool_layout/state_arena.py` | `StateArena`, `StateField`, `plan_regions` — one request's per-layer state as a contiguous byte run |
+| `pool_layout/paged_state_copy.py` | `plan_segmented_copy`, `launch_copy_descriptor` — scattering that byte run across PAGE units and back |
+| `token_layout/prefill.py` | `prefill_positions` — where a ragged prefill chunk's tokens sit in their own sequences |
+| `token_layout/decode.py` | `decode_positions` — the same for the rectangular speculative decode step |
+| `token_layout/slots.py` | `slot_mapping` — which KV slot a token is written to, one gather for both sides |
+| `token_layout/batch_ids.py` | `batch_id_per_token` — the token → sequence map both sides build and every kernel resolves per-sequence data through |
 
 ### `atom/model_ops/fused_moe/`
 

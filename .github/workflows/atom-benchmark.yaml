@@ -10,6 +10,10 @@ on:
     - cron: '12 16 * * *'
   workflow_dispatch:
     inputs:
+      publish_to_dashboard:
+        description: "Upload results to the dashboard (off by default for manual runs; schedule always publishes)"
+        type: boolean
+        default: false
       deepseek-v4-pro:
         description: "Benchmark DeepSeek-V4-Pro"
         type: boolean
@@ -169,6 +173,10 @@ jobs:
     name: Summarize benchmark result
     needs: [benchmark]
     runs-on: ubuntu-latest
+    env:
+      # Per-step rather than a job-level `if`: the summary steps in this job
+      # must run either way.
+      PUBLISH_DASHBOARD: ${{ github.event_name != 'workflow_dispatch' || inputs.publish_to_dashboard }}
     outputs:
       has_regression: ${{ steps.check-regression.outputs.has_regression }}
     steps:
@@ -254,6 +262,7 @@ jobs:
           path: regression_report.json
 
       - name: Transform results for benchmark dashboard
+        if: env.PUBLISH_DASHBOARD == 'true'
         run: |
           python3 .github/scripts/plugin_benchmark_to_dashboard.py \
             . \
@@ -262,12 +271,14 @@ jobs:
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       - name: Prepare existing dashboard data
+        if: env.PUBLISH_DASHBOARD == 'true'
         id: prepare_dashboard_data
         uses: ./.github/actions/prepare-dashboard-data
         with:
           data-path: benchmark-dashboard/data.js
 
       - name: Store benchmark result to dashboard
+        if: env.PUBLISH_DASHBOARD == 'true'
         uses: benchmark-action/github-action-benchmark@v1
         with:
           tool: customBiggerIsBetter
@@ -282,12 +293,14 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Validate dashboard data after write
+        if: env.PUBLISH_DASHBOARD == 'true'
         uses: ./.github/actions/validate-dashboard-data
         with:
           data-path: benchmark-dashboard/data.js
           min-entries: ${{ steps.prepare_dashboard_data.outputs.entry_count }}
 
       - name: Deploy custom dashboard to gh-pages
+        if: env.PUBLISH_DASHBOARD == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"

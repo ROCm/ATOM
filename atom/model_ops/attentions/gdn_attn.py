@@ -26,12 +26,12 @@ from .aiter_attention import (
     AiterBackend,
     kv_indices_generate_triton,
 )
-from .paged_state_copy import (
+from .pool_layout.paged_state_copy import (
     SegmentedCopyPlan,
     launch_copy_descriptor,
     plan_segmented_copy,
 )
-from .sub_pool_spec import SubPoolSpec, page_pool, state_pool
+from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool, state_pool
 
 logger = logging.getLogger("atom")
 
@@ -1512,7 +1512,11 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         if batch.block_tables == []:
             attn_metadata.gdn_metadata = None
             return attn_metadata, positions
-        gdn_metadata = self.prepare_gdn_metadata(batch, attn_metadata, is_prefill=True)
+        # `super().prepare_prefill` has already marshalled them, and the early
+        # return above is the only case where it would not have.
+        gdn_metadata = self.prepare_gdn_metadata(
+            batch, attn_metadata, is_prefill=True, prepare_block_tables=False
+        )
 
         gdn_metadata.ssm_checkpoints = self._checkpoint_targets(batch)
         if gdn_metadata.ssm_checkpoints is not None:

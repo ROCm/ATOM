@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+import numpy as np
 import torch
 
 # Early-stop in the greedy admission loop. Required for losslessness under the
@@ -281,17 +282,21 @@ def schedule_prefix_lengths_tensor(
 
 
 def ragged_verify_len(
-    ell: int | None, full_q: int, max_num_bonus: int, scheduled_len: int
+    ell: int | None, full_q: int, num_bonus: int, scheduled_len: int
 ) -> int | None:
     """Per-request RAGGED verify length (paper §5.2 avoid-padding), or None when
     no length is representable and the caller must stay rectangular.
+
+    `num_bonus` is THIS request's count, never the batch's largest: the anchor
+    sits at `segment_start_i + num_bonus_i`, so a request that accepted 2 needs
+    3 tokens whatever its neighbours accepted.
     """
-    lo = max(max_num_bonus + 1, 1)
+    lo = max(num_bonus + 1, 1)
     if 0 < scheduled_len < lo:
         return None  # bounds cross -> no representable ragged length
 
     ell_i = full_q - 1 if ell is None else int(ell)
-    li = max(ell_i, max_num_bonus) + 1
+    li = max(ell_i, num_bonus) + 1
     if li < lo:
         li = lo
     elif li > full_q:
@@ -299,6 +304,34 @@ def ragged_verify_len(
     if 0 < scheduled_len < li:
         li = scheduled_len
     return li
+
+
+def ragged_verify_lens(
+    ells: Sequence[int | None],
+    full_q: int,
+    num_bonus: np.ndarray,
+    scheduled_lens: np.ndarray,
+) -> np.ndarray | None:
+    """Vectorized `ragged_verify_len` over a batch, or None to stay rectangular.
+
+    Takes the bonus counts as an ARRAY so no caller can reach for a batch-wide
+    summary of them: the maximum would lift every request to the largest one's
+    floor, which at real concurrency is `full_q` -- the ragged path silently
+    doing nothing. One unrepresentable request aborts the batch, since the
+    layout is chosen once per step.
+    """
+    bs = len(scheduled_lens)
+    nb = np.asarray(num_bonus, dtype=np.int64)
+    sched = np.asarray(scheduled_lens, dtype=np.int64)
+    lo = np.maximum(nb + 1, 1)
+    bounded = sched > 0  # 0 means "no scheduler bound to honor"
+    if np.any(bounded & (sched < lo)):
+        return None
+    ell = np.fromiter(
+        (full_q - 1 if e is None else e for e in ells), dtype=np.int64, count=bs
+    )
+    li = np.clip(np.maximum(ell, nb) + 1, lo, full_q)
+    return np.where(bounded & (sched < li), sched, li).astype(np.int32)
 
 
 def resolve_q_buckets(spec: str, max_q: int) -> list[int]:

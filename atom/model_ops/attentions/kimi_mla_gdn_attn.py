@@ -24,8 +24,8 @@ from .aiter_mla import (
 )
 from .backends import AttentionBackend
 from .gdn_attn import GDNStateMixin
-from .page_unit_geometry import PageUnitGeometryMixin
-from .sub_pool_spec import SubPoolSpec, page_pool, state_pool
+from .pool_layout.page_unit_geometry import PageUnitGeometryMixin
+from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool, state_pool
 from .triton_mla import TritonMLAMetadataBuilder
 
 
