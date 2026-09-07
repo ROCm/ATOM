@@ -39,9 +39,9 @@ if TYPE_CHECKING:
 from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
-from atom.model_engine.multimodal import build_multimodal_inputs
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import new_token_ids
+from atom.multimodal import build_multimodal_inputs
 from atom.utils.arg_parser import FlexibleArgumentParser
 from atom.utils.gc_utils import (
     freeze_gc_heap,

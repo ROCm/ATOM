@@ -30,9 +30,11 @@ _MULTIMODAL_ARCH_TO_MODEL: dict[str, str] = {
 }
 
 _MULTIMODAL_ARCH_TO_INPUT_BUILDER: dict[str, str] = {
-    "KimiK3ForConditionalGeneration": (
-        "atom.model_engine.multimodal.build_kimi_k3_inputs"
-    ),
+    "KimiK3ForConditionalGeneration": ("atom.models.kimi_k3_vl.build_kimi_k3_inputs"),
+    # DeepSeek-V4 is one architecture with an optional vision tower, so this
+    # builder returns None when the config has none and the caller falls back
+    # to its text path.
+    "DeepseekV4ForCausalLM": ("atom.models.deepseek_v4_vl.build_deepseek_v4_inputs"),
 }
 
 
@@ -121,76 +123,3 @@ def expand_media_placeholders(
         else:
             expanded.append(token)
     return expanded
-
-
-def _as_pair(value) -> tuple[int, int]:
-    if isinstance(value, int):
-        return (value, value)
-    return (int(value[0]), int(value[1]))
-
-
-def kimi_k3_tokens_per_image(grid_thws, merge_kernel_size) -> list[int]:
-    """Image-token count per grid after the ``sd2_tpool`` merge.
-
-    The merge pools the temporal axis away and downsamples each spatial axis by
-    the merge kernel, so a ``(t, h, w)`` patch grid yields ``(h // kh) * (w //
-    kw)`` tokens regardless of ``t``.
-    """
-    kernel_h, kernel_w = _as_pair(merge_kernel_size)
-    grids = grid_thws.tolist() if hasattr(grid_thws, "tolist") else grid_thws
-    return [(int(h) // kernel_h) * (int(w) // kernel_w) for _, h, w in grids]
-
-
-def build_kimi_k3_inputs(
-    atom_config: Config,
-    processor: Any,
-    messages: list[dict],
-    images: list,
-    chat_template_kwargs: dict,
-    tools: Any = None,
-) -> tuple[list[int], dict]:
-    """Build Kimi-K3 inputs via ``KimiK3Processor``.
-
-    The K3 processor takes messages plus a separate ``medias`` list (its chat
-    encoder is Python, not Jinja), returns ``grid_thws`` rather than
-    ``image_grid_thw``, and emits a single ``<|media_pad|>`` per image that the
-    reference model expands while merging embeddings. Normalize all three so the
-    engine sees the same contract as every other multimodal model.
-    """
-    multimodal_config = getattr(atom_config, "multimodal_config", None)
-    if multimodal_config is None:
-        raise ValueError(
-            "Kimi-K3 image requests need the full HF config; start the server "
-            "with --trust-remote-code."
-        )
-
-    template_kwargs = dict(chat_template_kwargs)
-    template_kwargs.pop("tokenize", None)
-    if tools:
-        template_kwargs["tools"] = tools
-
-    medias = [{"type": "image", "image": image} for image in images]
-    inputs = processor(
-        messages=messages,
-        medias=medias,
-        return_tensors="pt",
-        **template_kwargs,
-    )
-
-    grid_thws = inputs["grid_thws"]
-    input_ids = inputs["input_ids"][0].tolist()
-    placeholder_token_id = int(
-        getattr(multimodal_config, "media_placeholder_token_id", 163605)
-    )
-    tokens_per_image = kimi_k3_tokens_per_image(
-        grid_thws, multimodal_config.vision_config.merge_kernel_size
-    )
-    input_ids = expand_media_placeholders(
-        input_ids, tokens_per_image, placeholder_token_id
-    )
-
-    multimodal_data = {
-        "pixel_values": inputs["pixel_values"],
-        "image_grid_thw": grid_thws,
-    }
-    return input_ids, multimodal_data

@@ -38,6 +38,13 @@ Per-token quantities (kernel-computed from inputs; mirror the formulas in
   extend_count[t]       = min(token_pos_in_chunk[t] + 1, win)
   prefix_swa_count[t]   = max(chunk_start[bid] - swa_low[t], 0)
 
+On a DeepSeek-V4 VISION prefill the caller instead passes per-token
+``extend_start`` / ``extend_count`` (``HAS_VISIBILITY``), widening each token's
+span to its whole ``[IMAGE_START, IMAGE_END]`` block in BOTH directions so
+in-image attention is bidirectional. Nothing here masks by position, so the
+non-causal span is expressed entirely by those indices. Text forwards pass
+neither and keep the causal formulas above, byte for byte.
+
 Per-token pool row for SWA prefix entries (the same formula `swa_write` and
 `_attach_v4_paged_decode_meta` use, from `pool_index.window_row`):
   row[t,k] = window.index(state_slot[bid], swa_low[t] + k)
@@ -85,7 +92,11 @@ def _v4_paged_prefill_indices_kernel(
     prefix_swa_indices_ptr,
     prefix_csa_indices_ptr,
     prefix_hca_indices_ptr,
+    # Per-token in-image visibility (vision prefill only; see HAS_VISIBILITY).
+    extend_start_ptr,  # [T] int — global position the extend span starts at
+    extend_count_ptr,  # [T] int — length of that span
     # Constants.
+    HAS_VISIBILITY: tl.constexpr,
     win: tl.constexpr,
     dense_ring_start,  # per-class window bases; the only terms the boundary moves
     csa_ring_start,
@@ -137,17 +148,31 @@ def _v4_paged_prefill_indices_kernel(
     # Per-token derived quantities (single-pass arithmetic).
     token_pos_in_chunk = pos - chunk_start
     swa_low = tl.maximum(pos - win + 1, 0)
-    extend_count = tl.minimum(token_pos_in_chunk + 1, win)
     prefix_swa_count = tl.maximum(chunk_start - swa_low, 0)
 
     i = tl.arange(0, BLOCK_N)
 
     # ---- Extend kv_indices: rows in per-fwd kv tensor ----
-    # row = cu_q + token_pos_in_chunk - extend_count + 1 + k, k in [0, extend_count)
     ext_base = tl.load(extend_indptr_ptr + t)
-    ext_mask = i < extend_count
-    ext_start_row = cu_q + token_pos_in_chunk - extend_count + 1
-    tl.store(extend_indices_ptr + ext_base + i, ext_start_row + i, mask=ext_mask)
+    if HAS_VISIBILITY:
+        # Vision prefill: the host widened this token's span to its whole image
+        # block, which can exceed BLOCK_N = next_pow2(win), so loop.
+        # `extend_start` is a GLOBAL position.
+        ext_start_row = cu_q + tl.load(extend_start_ptr + t) - chunk_start
+        vis_count = tl.load(extend_count_ptr + t)
+        for j in tl.range(0, vis_count, BLOCK_N):
+            k = j + i
+            tl.store(
+                extend_indices_ptr + ext_base + k,
+                ext_start_row + k,
+                mask=k < vis_count,
+            )
+    else:
+        # row = cu_q + token_pos_in_chunk - extend_count + 1 + k, k in [0, extend_count)
+        extend_count = tl.minimum(token_pos_in_chunk + 1, win)
+        ext_mask = i < extend_count
+        ext_start_row = cu_q + token_pos_in_chunk - extend_count + 1
+        tl.store(extend_indices_ptr + ext_base + i, ext_start_row + i, mask=ext_mask)
 
     # ---- SWA prefix rows: written to all three prefix buffers ----
     #   row = window.index(state_slot_per_seq[bid], gp) for that buffer's class,
@@ -255,6 +280,8 @@ def write_v4_paged_prefill_indices(
     T: int,
     win: int,
     geometry: UnifiedPoolGeometry,
+    extend_start: torch.Tensor | None = None,
+    extend_count: torch.Tensor | None = None,
     hca_ratio: int = 128,
     hca_rows_per_block: int = 1,
     prefix: str = "",
@@ -365,6 +392,10 @@ def write_v4_paged_prefill_indices(
         prefix_swa_indices,
         prefix_csa_indices,
         prefix_hca_indices,
+        # None on a text forward; the kernel then derives the window from `win`.
+        extend_start,
+        extend_count,
+        HAS_VISIBILITY=extend_start is not None,
         win=win,
         dense_ring_start=dense.ring_start,
         csa_ring_start=csa.ring_start,
@@ -399,6 +430,8 @@ def write_v4_paged_prefill_indices_reference(
     T: int,
     win: int,
     geometry: UnifiedPoolGeometry,
+    extend_start: torch.Tensor | None = None,
+    extend_count: torch.Tensor | None = None,
     hca_ratio: int = 128,
     hca_rows_per_block: int = 1,
 ) -> None:
@@ -426,6 +459,8 @@ def write_v4_paged_prefill_indices_reference(
     csa_indptr_cpu = prefix_csa_indptr.cpu().tolist()
     hca_indptr_cpu = prefix_hca_indptr.cpu().tolist()
     device = extend_indices.device
+    ext_start_cpu = extend_start.cpu().tolist() if extend_start is not None else None
+    ext_count_cpu = extend_count.cpu().tolist() if extend_count is not None else None
 
     for t in range(T):
         bid = bid_cpu[t]
@@ -438,12 +473,17 @@ def write_v4_paged_prefill_indices_reference(
 
         token_pos_in_chunk = pos - chunk_start
         swa_low = max(pos - win + 1, 0)
-        extend_count = min(token_pos_in_chunk + 1, win)
         prefix_swa_count = max(chunk_start - swa_low, 0)
 
         # Extend
         ext_base = ext_indptr_cpu[t]
-        ext_start_row = cu_q + token_pos_in_chunk - extend_count + 1
+        if extend_start is not None:
+            # Vision prefill: span widened on the host over the whole image block.
+            ext_start_row = cu_q + int(ext_start_cpu[t]) - chunk_start
+            extend_count = int(ext_count_cpu[t])
+        else:
+            extend_count = min(token_pos_in_chunk + 1, win)
+            ext_start_row = cu_q + token_pos_in_chunk - extend_count + 1
         ext_rows = torch.arange(
             ext_start_row,
             ext_start_row + extend_count,

@@ -246,3 +246,119 @@ def test_hca_k2_offsets_are_block_packed(hca_k2):
         f"(the HCA paged-gather bug)\n"
         f"got={ker.tolist()}\nexp={oracle.tolist()}"
     )
+
+
+# ---------------------------------------------------------------------------
+# In-image bidirectional visibility (DeepSeek-V4 vision)
+# ---------------------------------------------------------------------------
+
+
+def _visibility_case(geometry):
+    """One unchunked sequence holding a small image block.
+
+    Mirrors what `_build_paged_prefill_meta` hands the kernel on a vision
+    prefill: a per-token `(extend_start, extend_count)` widened to each image
+    token's whole span, with `chunk_start == 0` throughout.
+    """
+    from atom.models.deepseek_v4_vl import (
+        IMAGE,
+        IMAGE_END,
+        IMAGE_START,
+        image_aware_extend_window,
+        image_visible_spans,
+    )
+
+    vocab, max_img = 1000, 32
+    ids = (
+        [7, 8]
+        + [vocab + IMAGE_START]
+        + [vocab + IMAGE] * 9
+        + [vocab + IMAGE_END]
+        + [9, 10, 11]
+    )
+    total = len(ids)
+    positions = torch.arange(total, dtype=torch.int32, device=DEV)
+    bid_per_token = torch.zeros(total, dtype=torch.int32, device=DEV)
+    chunk_start = torch.zeros(1, dtype=torch.int32, device=DEV)
+    state_slot = torch.tensor([1], dtype=torch.int32, device=DEV)
+    block_tables = torch.zeros((1, 8), dtype=torch.int32, device=DEV)
+
+    left, right = image_visible_spans(np.array(ids), vocab, max_img)
+    start_np, count_np = image_aware_extend_window(
+        np.arange(total), left, right, WIN, WIN + max_img
+    )
+    extend_start = torch.tensor(start_np, dtype=torch.int32, device=DEV)
+    extend_count_t = torch.tensor(count_np, dtype=torch.int32, device=DEV)
+
+    # chunk_start == 0 everywhere, so there is no SWA/CSA prefix; HCA rows the
+    # reference derives from position still need room (same count as upstream's
+    # own case builds).
+    prefix_swa_count = np.zeros(total, dtype=np.int64)
+    n_hca = (np.arange(total, dtype=np.int64) + 1) // HCA_RATIO
+    ptrs = {
+        "extend_indptr": _indptr(count_np.astype(np.int64), total),
+        "prefix_swa_indptr": _indptr(prefix_swa_count, total),
+        "prefix_csa_indptr": _indptr(prefix_swa_count, total),
+        "prefix_hca_indptr": _indptr(n_hca, total),
+    }
+
+    def run(fn):
+        bufs = {
+            name.replace("_indptr", "_indices"): torch.full(
+                (max(int(p[-1]), 1),), -9, dtype=torch.int32, device=DEV
+            )
+            for name, p in ptrs.items()
+        }
+        fn(
+            positions=positions,
+            bid_per_token=bid_per_token,
+            chunk_start_per_seq=chunk_start,
+            cu_seqlens_q_per_seq=torch.zeros(1, dtype=torch.int32, device=DEV),
+            state_slot_per_seq=state_slot,
+            block_tables=block_tables,
+            T=total,
+            win=WIN,
+            geometry=geometry,
+            hca_ratio=HCA_RATIO,
+            extend_start=extend_start,
+            extend_count=extend_count_t,
+            **ptrs,
+            **bufs,
+        )
+        return bufs
+
+    return ids, vocab, count_np, ptrs, run
+
+
+def test_visibility_kernel_matches_reference(geometry=GEOMETRY):
+    _, _, _, _, run = _visibility_case(geometry)
+    ref = run(write_v4_paged_prefill_indices_reference)
+    ker = run(write_v4_paged_prefill_indices)
+    torch.cuda.synchronize()
+    assert torch.equal(ker["extend_indices"], ref["extend_indices"])
+
+
+def test_visibility_lets_image_tokens_read_forward(geometry=GEOMETRY):
+    """An in-image token's index list must include rows AFTER its own.
+
+    The whole point of the change: without it the kernel would still be causal
+    and every set-equality check against a causal reference would pass while
+    the model quietly never saw the rest of the image.
+    """
+    from atom.models.deepseek_v4_vl import IMAGE_END, IMAGE_START
+
+    ids, vocab, _count_np, ptrs, run = _visibility_case(geometry)
+    out = run(write_v4_paged_prefill_indices)["extend_indices"].cpu().numpy()
+    indptr = ptrs["extend_indptr"].cpu().numpy()
+
+    start_idx = ids.index(vocab + IMAGE_START)
+    end_idx = ids.index(vocab + IMAGE_END)
+    for t in range(len(ids)):
+        rows = out[indptr[t] : indptr[t + 1]]
+        assert rows.min() >= 0 and rows.max() < len(ids)
+        if start_idx <= t < end_idx:
+            assert rows.max() == end_idx, f"token {t} cannot see its IMAGE_END"
+            assert rows.min() <= start_idx, f"token {t} cannot see its IMAGE_START"
+        elif t < start_idx or t > end_idx:
+            # Outside any span the window stays strictly causal.
+            assert rows.max() == t, f"text token {t} reads the future"
