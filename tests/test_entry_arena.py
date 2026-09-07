@@ -353,10 +353,6 @@ class TestCarvedBuf:
 
 class TestRejectsBadFieldLists:
 
-    def test_empty(self):
-        with pytest.raises(ValueError, match="at least one field"):
-            EntryMajorArena([], 4, device="cpu")
-
     def test_duplicate_names(self):
         dup = [
             EntryField("a", 1, (4,), torch.float32),
@@ -364,6 +360,37 @@ class TestRejectsBadFieldLists:
         ]
         with pytest.raises(ValueError, match="duplicate field names"):
             EntryMajorArena(dup, 4, device="cpu")
+
+
+class TestAPlaneMayHoldNothing:
+    """`plan_field_planes` empties a plane whenever the fields fit in fewer,
+    which needs no unusual shape -- one field over two planes does it. The
+    plane still costs its rows and still has to answer at its index, so the
+    arena has to exist. Refusing it turned a legal layout into a startup
+    crash, and `carve_layer_major` has always allowed the layer-major
+    equivalent by dropping the group to None."""
+
+    def test_plan_field_planes_produces_one(self):
+        planes, _ = plan_field_planes(
+            [EntryField("a", 2, (4,), torch.float32)], [64, 64]
+        )
+        assert [] in planes
+
+    def test_such_a_plane_costs_an_entry_nothing(self):
+        arena = EntryMajorArena([], 4, device="cpu")
+        assert arena.entry_bytes == 0
+        assert arena.entry(0).numel() == 0
+
+    def test_it_still_spans_the_stride_its_rows_were_priced_at(self):
+        """The rows belong to the row space, not to this plane's fields, so a
+        caller's slot stride still has to be honored -- the next plane's
+        offsets are computed from it."""
+        arena = EntryMajorArena([], 4, device="cpu", slot_stride=512)
+        assert arena.buf.numel() == 3 * 512
+
+    def test_it_answers_no_field(self):
+        with pytest.raises(KeyError):
+            EntryMajorArena([], 4, device="cpu").view("a")
 
 
 # ── An arena strided by something bigger than itself ───────────────────────

@@ -342,8 +342,11 @@ class EntryMajorArena:
         slot_stride: int | None = None,
         live_entries: int | None = None,
     ):
-        if not fields:
-            raise ValueError("an entry arena needs at least one field")
+        # No fields is legal here and not in `LayerMajorArena`, because "empty"
+        # differs: a layer-major group is a region a model may not want, and
+        # `carve_layer_major` drops it to None; a plane is addressed by index,
+        # still costs its rows, and `plan_field_planes` empties one whenever
+        # the fields fit in fewer.
         names = [f.name for f in fields]
         if len(set(names)) != len(names):
             raise ValueError(f"duplicate field names: {names}")
