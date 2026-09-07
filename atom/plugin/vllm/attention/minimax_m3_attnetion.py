@@ -864,19 +864,21 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             return
         decode_md = main_metadata.decode
 
-        # The sparse decode kernels assume exactly one query row per request:
-        # they index block_table/seq_lens with num_reqs rows and attend all keys
-        # < seq_len with no per-token causal mask. A multi-token spec/MTP verify
-        # slice MUST be routed to the varlen prefill path in the metadata builder
-        # (metadata.py build(): spec_verify_decode -> _build_prefill_only_metadata);
-        # if one leaks here the kernel silently produces non-causal, out-of-bounds
-        # verify logits (the ~10pt gsm8k drop). Fail loudly instead of silently.
+        # Each request owns decode_query_len (== max_query_len) consecutive query
+        # rows: 1 for plain decode, or 1+num_spec for a uniform spec/MTP verify
+        # batch. The plain-4D decode kernel + indexer apply per-token causal
+        # masking (query_pos = seq_len - decode_query_len + q_offset) so a verify
+        # row that sits before the last position attends only its own causal
+        # prefix. A NON-uniform verify slice (num_decode_tokens != num_reqs *
+        # decode_query_len) must never reach here -- the metadata builder routes
+        # it to the varlen prefill path; fail loudly if one leaks through.
         num_decode_reqs = decode_md.seq_lens.shape[0]
-        assert num_decode_tokens == num_decode_reqs, (
-            "MiniMax-M3 sparse decode kernel requires one query token per request "
-            f"(single-token decode), got {num_decode_tokens} tokens for "
-            f"{num_decode_reqs} requests -- a multi-token verify slice leaked past "
-            "the metadata builder's spec-verify -> prefill routing."
+        decode_query_len = max(1, int(getattr(decode_md, "max_query_len", 1) or 1))
+        assert num_decode_tokens == num_decode_reqs * decode_query_len, (
+            "MiniMax-M3 sparse decode kernel requires a uniform "
+            f"decode_query_len={decode_query_len} per request, got "
+            f"{num_decode_tokens} tokens for {num_decode_reqs} requests -- a "
+            "non-uniform verify slice leaked past the metadata builder's routing."
         )
 
         if self._is_plain_layout():
@@ -895,8 +897,17 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
                 self.num_kv_heads,
                 self.scale,
                 out[:num_decode_tokens],
+                decode_query_len=decode_query_len,
             )
             return
+
+        # The ASM/gluon decode variant does not yet carry per-token causal
+        # masking; uniform multi-query verify is only wired on the plain-4D path.
+        assert decode_query_len == 1, (
+            "MiniMax-M3 ASM decode kernel supports only single-token decode "
+            f"(decode_query_len=1), got {decode_query_len}; run the plain-4D "
+            "layout for uniform spec-verify decode."
+        )
 
         from atom.model_ops.minimax_m3.sparse_attn import (
             minimax_m3_sparse_attn_decode_asm,

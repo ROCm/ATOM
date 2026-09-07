@@ -492,8 +492,13 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
 
     if _os.environ.get("ATOM_M3_UNIFORM_BATCH_CAPTURE", "0") == "1":
         _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
+        # Route uniform spec/MTP verify (max_query_len > 1) through the
+        # per-token-causal decode kernel (decode_query_len=mql) instead of the
+        # varlen prefill path, so the verify batch is cudagraph-capturable.
+        _uniform_batch_capture = True
     else:
         _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+        _uniform_batch_capture = False
     reorder_batch_threshold = 1
 
     def __init__(
@@ -581,6 +586,15 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
             # (num_tokens % max_query_len != 0, e.g. lens [4, 1]).
             mql = max(1, int(common_attn_metadata.max_query_len or 1))
             if mql == 1:
+                return self._build_uniform_decode_metadata(common_attn_metadata)
+            # Uniform spec/MTP verify (every request has exactly mql query rows):
+            # the decode kernel now applies per-token causal masking
+            # (decode_query_len=mql, per-token top-k) and is cudagraph-capturable,
+            # so under UNIFORM_BATCH capture route it through the fast decode
+            # kernel to match the captured graph. Ragged remainders
+            # (num_decode_tokens % mql != 0, e.g. vLLM warmup lens [4, 1]) and the
+            # no-capture default fall back to the varlen prefill path.
+            if self._uniform_batch_capture and num_decode_tokens == num_decodes * mql:
                 return self._build_uniform_decode_metadata(common_attn_metadata)
             return self._build_prefill_only_metadata(common_attn_metadata)
 
@@ -741,12 +755,15 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
     def build_for_cudagraph_capture(self, common_attn_metadata=None):
         # Mirror build()'s mql-based kernel routing so the capture-time eager run
         # of the sparse op uses the SAME path as every runtime replay. A uniform
-        # spec-verify capture bucket has max_query_len == 1+num_spec (> 1); it
-        # MUST go through the varlen prefill/extend path (per-token causal), not
-        # the decode kernel (which treats q.shape[0] as request count and OOBs on
-        # verify rows). Pure single-token decode (mql == 1) keeps the decode kernel.
+        # spec-verify capture bucket has max_query_len == 1+num_spec (> 1). Under
+        # UNIFORM_BATCH capture it goes through the per-token-causal decode kernel
+        # (decode_query_len=mql) -- cudagraph-capturable and matching build()'s
+        # uniform-decode routing. Otherwise it MUST take the varlen prefill/extend
+        # path (the decode kernel would treat q.shape[0] as request count and OOB
+        # on verify rows). Pure single-token decode (mql == 1) keeps the decode
+        # kernel unconditionally.
         mql = max(1, int(common_attn_metadata.max_query_len or 1))
-        if mql == 1:
+        if mql == 1 or self._uniform_batch_capture:
             return self._build_uniform_decode_metadata(common_attn_metadata)
         return self._build_prefill_only_metadata(common_attn_metadata)
 
