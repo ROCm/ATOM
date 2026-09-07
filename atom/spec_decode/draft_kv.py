@@ -35,10 +35,6 @@ def draft_kv_builder(model_runner, draft_hf):
         backend.make_kv_pool,
         draft_hf,
         world_size=model_runner.world_size,
-        # The scheduler's, which every model in the process shares. Which block
-        # the draft's own kernels index is its backend's to decide, from the
-        # draft's config -- another flavor is free to answer differently.
-        scheduler_block_size=model_runner.block_size,
         kv_dtype=dtypes.d_dtypes[model_runner.config.kv_cache_dtype],
     )
     # A way to build it, not the pool: how many rows it has is the walk's to
@@ -81,9 +77,20 @@ class DraftKvBuilder(PoolRowsMixin):
         owns a pool, so no rows is a contradiction, and a pool of none prices
         at zero and binds nothing -- a draft running on no KV at all. The
         `KeyError` is the one `pool_rows` promises.
+
+        On demand is also what makes the block reachable, and it is the target
+        builder's: `propose` hands the draft the target's block tables, and the
+        draft's kernels take the block off the cache they were bound to, so a
+        block of its own would address one page with an id that counted
+        another. There is nowhere in a draft to convert between the two -- it
+        has no metadata of its own. The builder is constructed after
+        `build_drafter`, which is why this is read here and not bound earlier.
         """
         if self._kv_pool is None:
-            self._kv_pool = self._make_pool(layers=self.row_counts()[DRAFT_KV_ROWS])
+            self._kv_pool = self._make_pool(
+                layers=self.row_counts()[DRAFT_KV_ROWS],
+                target_block_size=self.model_runner.attn_metadata_builder.block_size,
+            )
         return self._kv_pool
 
     def invalidate_pool_rows(self) -> None:
@@ -114,17 +121,19 @@ class DraftKvBuilder(PoolRowsMixin):
         that is what riding the target's block ids means.
         """
         runner = self.model_runner
-        pool, target = self.kv_pool, runner.attn_metadata_builder
-        # The two blocks may differ in principle -- each backend picks its own
-        # -- but a draft has no metadata of its own yet: `propose` hands it the
-        # target builder's block tables, whose ids are at the target's block.
-        # Raised and not asserted because both come from `--block-size` and two
-        # model configs, and `python -O` drops what it does not run.
-        if pool.block_size != target.block_size:
+        pool = self.kv_pool
+        # `blocks` counts SCHEDULER blocks -- it is the budget `paged_pool_bytes`
+        # charged per -- and one entry answers one of them, so the block the
+        # pool took has to be that one too. It took the target builder's, which
+        # makes this the check that the target's and the scheduler's agree.
+        # Raised and not asserted because `python -O` drops what it does not
+        # run, and a short pool reads the next request's page rather than fault.
+        if pool.block_size != runner.block_size:
             raise ValueError(
                 f"the draft's blocks are {pool.block_size} tokens and the "
-                f"target's {target.block_size}; a draft is indexed by the "
-                "target's block tables, so it cannot yet block at anything else"
+                f"scheduler's {runner.block_size}; a draft is allocated one "
+                "entry per scheduler block and indexed by the target's block "
+                "tables, so all three are one number"
             )
         self.num_blocks = blocks
         pool.allocate(blocks, runner.device, buf=buf)

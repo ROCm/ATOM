@@ -102,17 +102,17 @@ class AttentionBackend(ABC):
         hf_config,
         *,
         world_size: int,
-        scheduler_block_size: int,
+        target_block_size: int,
         layers: int,
         kv_dtype,
     ):
         """A pool of `layers` rows at this config's geometry.
 
         Asked of a *draft* model's backend, and only where `DRAFT_OWNS_KV_POOL`
-        — the target's layers are its builder's own business. `layers` and
-        `scheduler_block_size` are both told rather than read: the first only
-        the walk knows, the second is one for the whole process. The block this
-        backend's own kernels index it picks itself, from `hf_config`.
+        — the target's layers are its builder's own business. Both counts are
+        told rather than read: `layers` only the walk knows, and the block only
+        the target builder, whose it is and not this backend's for the reason
+        in `DraftKvBuilder.kv_pool`.
         """
         raise NotImplementedError
 

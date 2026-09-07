@@ -37,19 +37,27 @@ class _Norm(nn.Module):
     """A sibling the walk must not count."""
 
 
-def _runner(draft_layers: int):
+# The target builder's block. A draft's pool takes it rather than picking one,
+# because the draft indexes that pool with the target's block tables.
+TARGET_BLOCK = 128
+
+
+def _runner(draft_layers: int, block_size: int = TARGET_BLOCK):
     model = nn.Sequential(
         *[m for _ in range(draft_layers) for m in (_PagedAttention(), _Norm())]
     )
-    return SimpleNamespace(drafter=SimpleNamespace(model=model))
+    return SimpleNamespace(
+        drafter=SimpleNamespace(model=model),
+        attn_metadata_builder=SimpleNamespace(block_size=block_size),
+    )
 
 
 def _recording_factory(pool):
     """A stand-in for the backend's `make_kv_pool`, keeping what it was asked."""
-    asked: list[int] = []
+    asked: list[tuple[int, int]] = []
 
-    def make(*, layers: int):
-        asked.append(layers)
+    def make(*, layers: int, target_block_size: int):
+        asked.append((layers, target_block_size))
         return pool
 
     return make, asked
@@ -63,7 +71,21 @@ def test_the_pool_is_built_at_the_row_count_the_walk_found():
     builder = DraftKvBuilder(_runner(draft_layers=3), make)
 
     assert builder.kv_pool is pool
-    assert asked == [3]
+    assert asked == [(3, TARGET_BLOCK)]
+
+
+def test_the_pool_is_built_at_the_target_builders_block():
+    """Not at one the draft's own backend would pick: `propose` hands the draft
+    the target's block tables, and its kernels read the block off the cache it
+    was bound to, so the two are the same number or it reads another page.
+
+    An off-default value, because a number every side agrees on by accident
+    proves nothing about which side it came from."""
+    make, asked = _recording_factory(object())
+    builder = DraftKvBuilder(_runner(draft_layers=2, block_size=256), make)
+
+    assert builder.kv_pool is not None
+    assert asked == [(2, 256)]
 
 
 def test_siblings_are_not_rows():
@@ -74,7 +96,7 @@ def test_siblings_are_not_rows():
 
     assert len(list(builder.model_runner.drafter.model.modules())) > 4 + 1
     assert builder.kv_pool is not None
-    assert asked == [4]
+    assert asked == [(4, TARGET_BLOCK)]
 
 
 def test_a_draft_with_no_rows_is_a_contradiction_not_an_empty_pool():
@@ -100,7 +122,7 @@ def test_the_pool_is_built_once():
     builder = DraftKvBuilder(_runner(draft_layers=2), make)
 
     assert builder.kv_pool is builder.kv_pool is builder.kv_pool
-    assert asked == [2]
+    assert asked == [(2, TARGET_BLOCK)]
 
 
 def test_it_is_not_built_before_the_draft_model_exists():
@@ -120,7 +142,9 @@ def test_invalidating_the_walk_drops_the_pool_that_came_from_it():
     class was rewritten to close, just deferred by one rebind."""
     first, second = object(), object()
     pools = iter((first, second))
-    builder = DraftKvBuilder(_runner(draft_layers=2), lambda *, layers: next(pools))
+    builder = DraftKvBuilder(
+        _runner(draft_layers=2), lambda *, layers, target_block_size: next(pools)
+    )
 
     assert builder.kv_pool is first
     builder.invalidate_pool_rows()
@@ -158,4 +182,4 @@ def test_the_count_tracks_the_model_it_walked(draft_layers):
 
     assert builder.kv_pool is not None
 
-    assert asked == [draft_layers]
+    assert asked == [(draft_layers, TARGET_BLOCK)]

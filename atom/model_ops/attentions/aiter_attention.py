@@ -153,8 +153,9 @@ class AiterBackend(AttentionBackend):
         Two different things, tied only by the scheduler's being a whole number
         of these: the scheduler's is what prefix caching and the block manager
         work in, one for the whole process, while this one is a kernel detail
-        each backend picks for itself. A draft resolving to another backend
-        gets another answer, and should.
+        each backend picks for itself. A target's, only: a draft takes the
+        target builder's answer instead, for the reason in
+        `DraftKvBuilder.kv_pool`.
         """
         if envs.ATOM_USE_UNIFIED_ATTN:
             # SHUFFLE cache read straight through, so the two coincide and
@@ -168,23 +169,21 @@ class AiterBackend(AttentionBackend):
             return sparse_block_size
         return scheduler_block_size if scheduler_block_size in (256, 1024) else 16
 
-    @classmethod
+    @staticmethod
     def make_kv_pool(
-        cls,
         hf_config,
         *,
         world_size: int,
-        scheduler_block_size: int,
+        target_block_size: int,
         layers: int,
         kv_dtype,
     ):
-        attn_block_size = cls.attn_block_size(hf_config, scheduler_block_size)
+        """An MHA pool, which is the one this backend's kernels read."""
         return MhaKvPool.from_hf_config(
             hf_config,
             world_size=world_size,
-            block_size=attn_block_size,
+            block_size=target_block_size,
             layers=layers,
-            blocks_per_entry=scheduler_block_size // attn_block_size,
             kv_dtype=kv_dtype,
         )
 
