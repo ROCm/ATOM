@@ -558,6 +558,11 @@ RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
 # exists to prevent, so treat it as a broken image, not a warning.
 RUN if [ "${ATOM_BASE_IMAGE}" = "rocm10-base" ]; then \
         echo "========== [ATOM] Final ROCm 10 stack validation =========="; \
+        # aiperf's dependency resolution downgrades prometheus_client to
+        # 0.23.x (it even prints the incompatibility mid-install and pip
+        # continues); restore ATOM's pin before the check so the tripwire
+        # validates the stack we actually intend to ship.
+        python -m pip install "prometheus_client==0.25.0" && \
         python -m pip check && \
         python -c "import torch, triton, torchvision, torchaudio; \
 assert torch.version.hip is not None, torch.__version__; \
