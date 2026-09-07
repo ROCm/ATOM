@@ -53,6 +53,10 @@ ARG ROCM_TORCHVISION_VERSION="0.26.0"
 ARG ROCM_TORCHAUDIO_VERSION="2.11.0"
 ARG ROCM_TRITON_VERSION="3.8.0+git4cff872c"
 ARG ROCM_INDEX_URL="https://stable.repo.amd.com/rocm/whl-next/"
+# ENV (not just ARG) so downstream stages (base, atom_image, ...) can pass it
+# as --extra-index-url when resolving packages whose only home is the AMD
+# channel (e.g. torch's Requires-Dist: triton==<local rocm version>).
+ENV ROCM_INDEX_URL=${ROCM_INDEX_URL}
 # 10.1 tracking line overrides (nightly channel, date-stamped versions):
 #   --build-arg ROCM_SDK_VERSION=10.1.0a<yyyymmdd>
 #   --build-arg ROCM_TORCH_VERSION=2.12.0
@@ -487,6 +491,7 @@ RUN echo "========== [ATOM] LMCache HIP c_ops (${LMCACHE_TAG}, arch=${PYTORCH_RO
     CXX=hipcc BUILD_WITH_HIP=1 \
       "${VENV_PYTHON}" -m pip install -e . --no-build-isolation --no-deps && \
     "${VENV_PYTHON}" -m pip install \
+        --extra-index-url "${ROCM_INDEX_URL}" \
         -r requirements/common.txt && \
     "${VENV_PYTHON}" -c "import glob, torch; \
 c_ops_paths = glob.glob('/opt/LMCache/lmcache/c_ops*.so'); \
