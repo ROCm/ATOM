@@ -31,6 +31,8 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `trust_remote_code` | `bool` | `False` | Trust remote code when loading the model from HuggingFace |
 | `max_num_batched_tokens` | `int` | `16384` | Maximum number of tokens batched together per scheduler step |
 | `scheduler_delay_factor` | `float` | `0.0` | Multiplicative delay (factor x previous prompt latency) before scheduling the next prompt |
+| `scheduling_policy` | `str` | `"fcfs"` | Waiting-queue order: `"fcfs"` (arrival) or `"sjf"` (shortest job first — lowers p90 TTFT, raises it for the longest prompts) |
+| `sjf_max_skip_steps` | `int` | `64` | Under `"sjf"`, promote a request skipped this many steps regardless of length. `0` removes the starvation bound |
 | `max_num_seqs` | `int` | `512` | Maximum number of sequences batched together |
 | `max_model_len` | `int \| None` | `None` | Maximum context length; defaults to `hf_config.max_position_embeddings` (capped by it when set) |
 | `gpu_memory_utilization` | `float` | `0.9` | Fraction of GPU memory available for KV cache and weights (0.0 — 1.0) |
