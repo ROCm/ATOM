@@ -465,6 +465,15 @@ RUN echo "========== Install atomesh binary ==========" && \
 # on gfx950. NOTE: tp>1 offload also needs aiter's eager-NCCL-init fix
 # (device_id= to init_process_group); that belongs in aiter (tracked separately),
 # not here — the CI build_aiter stage picks it up once merged.
+# Runtime deps come from LMCache's own requirements files (common.txt +
+# rocm_core.txt) rather than a hand-picked subset: the rocm/pytorch apt images
+# carried several of them transitively, the pip SDK venv does not, and the
+# validation import chain trips on each missing one (py-cpuinfo, then
+# sortedcontainers). PIP_CONSTRAINT (set in the rocm10-base stage) keeps the
+# torch trio pinned to the +rocm10.x builds while these resolve.
+# rocm_core.txt (cupy-rocm-7-0) is deliberately skipped: cupy bundles its own
+# ROCm 7 runtime libs which would shadow the pip SDK's ROCm 10 stack, and the
+# c_ops import chain does not touch cupy.
 ARG LMCACHE_TAG=v0.4.5
 # PYTORCH_ROCM_ARCH is inherited as ENV from the `base` stage (=${GPU_ARCH});
 # hipcc reads it to target both gfx942 and gfx950. Do not re-derive from
@@ -477,8 +486,8 @@ RUN echo "========== [ATOM] LMCache HIP c_ops (${LMCACHE_TAG}, arch=${PYTORCH_RO
     "${VENV_PYTHON}" -m pip install -r requirements/build.txt && \
     CXX=hipcc BUILD_WITH_HIP=1 \
       "${VENV_PYTHON}" -m pip install -e . --no-build-isolation --no-deps && \
-    "${VENV_PYTHON}" -m pip install --no-deps \
-        prometheus_client==0.25.0 aiofile==3.11.1 caio==0.9.25 py-cpuinfo && \
+    "${VENV_PYTHON}" -m pip install \
+        -r requirements/common.txt && \
     "${VENV_PYTHON}" -c "import glob, torch; \
 c_ops_paths = glob.glob('/opt/LMCache/lmcache/c_ops*.so'); \
 assert c_ops_paths, 'LMCache HIP c_ops extension was not built'; \
