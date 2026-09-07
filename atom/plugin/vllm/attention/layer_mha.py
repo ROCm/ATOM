@@ -76,8 +76,22 @@ def _set_default_mha_scales(layer) -> None:
 
 
 def _mha_backend_for_layer(layer_num: int, hf_config):
+    import os
+
     num_hidden_layers = int(getattr(hf_config, "num_hidden_layers", 1 << 30))
     if layer_num >= num_hidden_layers:
+        return AiterMhaFlexibleBlockBackendForVllm
+    # M3's dense layers (routed to this MHA path by ATOM_M3_DENSE_ATTN_BACKEND=aiter)
+    # share a single KV-cache group with the sparse layers, which mandate
+    # block_size == 128. The strict backend advertises only kernel block 16, so
+    # vLLM's per-group select_common_block_size finds no size common to
+    # {16 (dense), 128 (sparse)} and aborts ("No common block size for 128").
+    # The flexible backend advertises MultipleOf(16), so 128 is a valid common
+    # kernel block. M3 dense always runs at block != 16, which forces the
+    # block-size-agnostic Triton path (use_triton_attn=True), so executing the
+    # cache/PA kernels at the logical 128 page is correct here rather than the
+    # page-16 asm path the strict [16] guard exists to protect.
+    if os.environ.get("ATOM_M3_DENSE_ATTN_BACKEND", "triton").lower() == "aiter":
         return AiterMhaFlexibleBlockBackendForVllm
     return AiterMhaBackendForVllm
 

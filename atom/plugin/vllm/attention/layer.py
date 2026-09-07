@@ -45,6 +45,31 @@ def _minimax_m3_attention_cls_for_vllm(atom_config, kwargs):
         and kwargs.get("q_norm") is not None
         and kwargs.get("k_norm") is not None
     ):
+        # M3's first 3 layers run FULL (non-sparse) attention. By default they go
+        # through `MiniMaxM3DenseAttentionForVllm`, whose read is vLLM's Triton
+        # `unified_attention` custom op (`kernel_unified_attention`) -- a per-kernel
+        # breakdown shows it is the dense-layer hotspot (~93% of prefill / ~95% of
+        # decode dense-layer time; the generic kernel upcasts fp8 KV to bf16).
+        #
+        # ATOM_M3_DENSE_ATTN_BACKEND=aiter instead routes the dense layers through
+        # ATOM's own MHA path (`AttentionForVllmMHA`): prefill via
+        # `aiter.flash_attn_varlen_func`, decode via `run_pa_decode_gluon` (native
+        # fp8 MFMA paged-attention), on a 5-D shuffle KV cache. For M3 dense that
+        # path selects the *flexible* backend (`AiterMhaFlexibleBlockBackendForVllm`,
+        # see `_mha_backend_for_layer`), which advertises MultipleOf(16) so the
+        # dense group coexists with the sparse group's mandatory block_size=128
+        # (negotiation settles on the logical 128 page) instead of crashing
+        # block-size negotiation the way the strict [16] backend -- or vLLM's own
+        # AiterFA backend (kernel pages [16, 32] only) -- does. M3 dense uses
+        # GemmaRMSNorm q/k-norm, which `AttentionForVllmMHA.rope_cache` already
+        # handles via `triton_fused_norm_rope_cache` (norm + RoPE + fp8 shuffle
+        # cache write), and at block != 16 always takes the block-agnostic Triton
+        # read, so running at the 128 page is correct.
+        import os
+
+        if os.environ.get("ATOM_M3_DENSE_ATTN_BACKEND", "triton").lower() == "aiter":
+            return AttentionForVllmMHA
+
         from atom.plugin.vllm.attention.minimax_m3_attnetion import (
             MiniMaxM3DenseAttentionForVllm,
         )
