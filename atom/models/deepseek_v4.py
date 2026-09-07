@@ -4952,6 +4952,19 @@ class DeepseekV4ForCausalLM(nn.Module):
         ``image_*``) are top-level and match these attributes verbatim — none of
         the ``weights_mapper`` prefix rules touch them, so no rename is needed.
         """
+        if config.speculative_config is not None:
+            # The draft heads carry their own `mtp.N.ffn.gate.bias_vl`, so the
+            # draft MoE would have to route image tokens the way the target
+            # does, and the draft path has no handling for the out-of-vocab
+            # image sentinel ids the target clamps in `embed_input_ids`.
+            # Neither is implemented, and neither fails on its own: the draft
+            # would route images with the text bias and index past the
+            # embedding table. Refuse instead.
+            raise NotImplementedError(
+                "speculative decoding (MTP/DSpark) is not supported on a "
+                "DeepSeek-V4 vision checkpoint. Re-run without "
+                "--method/--num-speculative-tokens."
+            )
         hf_config = config.hf_config
         from atom.models.deepseek_v4_vl import (
             DeepseekV4VisionConfig,
