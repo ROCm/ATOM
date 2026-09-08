@@ -162,9 +162,17 @@ RUN mkdir -p /usr/lib64 && ln -sf /lib/x86_64-linux-gnu/libc.so /usr/lib64/libc.
 RUN ln -s ${ROCM_HOME} /opt/rocm
 
 # amdsmi: the pip SDK (unlike the rocm/pytorch apt images) does not preinstall
-# the AMD SMI python package; ATOM and the validation steps import it.
-RUN cd /opt/rocm/share/amd_smi && python3 -m pip install --no-cache-dir . && \
-    python3 -c "import amdsmi; print('amdsmi ok')"
+# the AMD SMI python package; ATOM's numa_utils imports it. The SDK's
+# share/amd_smi dir carries a pip-installable package on the stable channel,
+# but the 10.1 nightly SDK dropped it (no setup.py/pyproject.toml) — fall back
+# to the PyPI amdsmi wheel, and only fail if neither source works.
+RUN if [ -f /opt/rocm/share/amd_smi/setup.py ] || [ -f /opt/rocm/share/amd_smi/pyproject.toml ]; then \
+        cd /opt/rocm/share/amd_smi && python3 -m pip install --no-cache-dir .; \
+    elif python3 -m pip install --no-cache-dir amdsmi; then \
+        echo "amdsmi installed from PyPI (SDK share/amd_smi not pip-installable on this SDK)"; \
+    else \
+        echo "WARNING: amdsmi not installable (no SDK package, PyPI failed); numa_utils amdsmi path will be unavailable"; \
+    fi && python3 -c "import amdsmi; print('amdsmi ok')"
 
 # Keep pip from resolving the ROCm torch stack away to PyPI CUDA builds in any
 # later pip install (AITER requirements, MORI, ATOM deps, ...). The local
