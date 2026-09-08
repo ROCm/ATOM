@@ -10,7 +10,7 @@ import os
 import time
 from contextlib import contextmanager, nullcontext
 from functools import partial
-from typing import Any, NamedTuple
+from typing import Any, ClassVar, NamedTuple
 
 import numpy as np
 import torch
@@ -54,6 +54,7 @@ from atom.model_engine.sequence import (
 )
 from atom.model_engine.state_runtime import StateRuntime
 from atom.model_loader.loader import load_model
+from atom.model_ops.attentions.pool_layout.entry_arena import plan_regions
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
     InsufficientPoolBudget,
     Pool,
@@ -71,7 +72,6 @@ from atom.model_ops.eplb import (
 )
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
-from atom.models.utils import get_pp_indices
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.factory import build_drafter
 from atom.utils import (
@@ -94,7 +94,7 @@ from atom.utils.forward_context import (
     set_kv_cache_data,
 )
 from atom.utils.gc_utils import freeze_gc_heap
-from atom.utils.selector import get_attn_backend
+from atom.utils.selector import attn_family, get_attn_backend, has_mla_indexer
 from atom.utils.tbo import (
     UBatchSlice,
     UBatchWrapper,
@@ -644,21 +644,14 @@ class ModelRunner:
             torch.float16,
         ]:
             os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
-        self.use_mla = self.is_deepseek_mla()
-        self.use_gdn = self.is_qwen_next()
-        self.use_v4 = self.is_deepseek_v4()
-        self.use_kimi_mla = self.is_kimi_linear()
+        # Which attention this model's config asks for. The runner holds the
+        # answer, not the question: what makes a model MLA or a hybrid is the
+        # selector's to know, and it is asked the same way of a draft.
+        self.attn_family = attn_family(self.hf_text_config)
 
         rope_parameters = getattr(self.hf_text_config, "rope_parameters", None) or {}
         self.use_mrope = "mrope_section" in rope_parameters
-        # A sparse indexer is orthogonal to whether the model is pure MLA or a
-        # linear/MLA hybrid: GLM-5.3-Flash is both hybrid and sparse, so gating
-        # this on `use_mla` alone would silently leave its index cache unbound.
-        self.is_deepseek_v32 = (
-            hasattr(hf_config, "index_topk")
-            if (self.use_mla or self.use_kimi_mla)
-            else False
-        )
+        self.has_mla_indexer = has_mla_indexer(self.hf_text_config)
         # Initialize profiler for this rank (before _setup_device_and_distributed
         # so that dp config fields are still at their original values)
         self.profiler = None
@@ -695,13 +688,7 @@ class ModelRunner:
         default_dtype = self.config.torch_dtype
         torch.set_default_dtype(default_dtype)
         torch.set_default_device(self.device)
-        self.attn_backend = get_attn_backend(
-            self.block_size,
-            use_mla=self.use_mla,
-            use_gdn=self.use_gdn,
-            use_v4=self.use_v4,
-            use_kimi_mla=self.use_kimi_mla,
-        )
+        self.attn_backend = get_attn_backend(self.attn_family)
         use_spec = bool(self.config.speculative_config) and get_pp_group().is_last_rank
         self.num_spec_tokens = (
             self.config.speculative_config.num_speculative_tokens if use_spec else 0
@@ -773,7 +760,6 @@ class ModelRunner:
         self.attn_metadata_builder = self.attn_backend.get_builder_cls()(
             model_runner=self
         )
-        self.physical_block_size = self.attn_metadata_builder.block_size
         # Sub-pool sizing needs a memory profile, so it cannot run until after
         # warmup. Install the empty plan now: `warmup_model` below drives the
         # builder through paths that ask for their entry counts, and those must
@@ -787,7 +773,7 @@ class ModelRunner:
         # never assign them a slot, and the builder will silently read
         # tensor[-1] on first decode. Catch the misconfiguration up front
         # rather than producing wrong outputs at inference time.
-        if self._has_state_pool():
+        if self._state_pool_names():
             from atom.model_engine.llm_engine import InputOutputProcessor as _IOProc
 
             mt = self.config.hf_config.model_type
@@ -863,76 +849,6 @@ class ModelRunner:
         base overhead. Base runner reserves nothing; override point for
         setups that share the GPU with another process."""
         return 0
-
-    def is_deepseek_mla(self) -> bool:
-        if not hasattr(self.hf_text_config, "model_type"):
-            return False
-        elif self.hf_text_config.model_type in (
-            "deepseek_v2",
-            "deepseek_v3",
-            "deepseek_v32",
-            "deepseek_mtp",
-            "glm_moe_dsa",
-            "kimi_k2",
-        ):
-            return self.hf_text_config.kv_lora_rank is not None
-        elif self.hf_text_config.model_type == "eagle":
-            # if the model is an EAGLE module, check for the
-            # underlying architecture
-            return (
-                self.hf_text_config.model.model_type in ("deepseek_v2", "deepseek_v3")
-                and self.hf_text_config.kv_lora_rank is not None
-            )
-        return False
-
-    def is_qwen_next(self) -> bool:
-        if not hasattr(self.hf_text_config, "model_type"):
-            return False
-        elif self.hf_text_config.model_type in (
-            "qwen3_next",
-            "qwen3_next_mtp",
-            "qwen3_5_text",
-            "qwen3_5_moe_text",
-        ):
-            return True
-        return False
-
-    def is_kimi_linear(self) -> bool:
-        """Hybrid MLA + KDA-linear-attention models (KimiMLAGDNBackend).
-
-        Selects the backend that allocates a paged MLA KV pool for the full
-        attention layers *and* a recurrent state pool for the linear ones.
-        GLM-5.3-Flash (``glm5_next_text``) has the same shape as Kimi-Linear:
-        11 MLA layers interleaved with 34 KDA layers.
-        """
-        return getattr(self.hf_text_config, "model_type", None) in (
-            "kimi_linear",
-            "glm5_next_text",
-        )
-
-    def is_deepseek_v4(self) -> bool:
-        # NOTE: `hf_text_config.model_type` reads "deepseek_v3" for V4 because
-        # `_CONFIG_REGISTRY` maps deepseek_v4 → deepseek_v3 (V4 reuses V3 schema).
-        # Use `architectures` (preserved by get_hf_config:567) instead. Covers
-        # both target (DeepseekV4ForCausalLM[NextN]) and draft (whose model_type
-        # SpeculativeConfig stamps as deepseek_v4_mtp).
-        arches = getattr(self.hf_text_config, "architectures", None) or []
-        if any("DeepseekV4" in str(a) for a in arches):
-            return True
-        return getattr(self.hf_text_config, "model_type", None) in (
-            "deepseek_v4",
-            "deepseek_v4_mtp",
-        )
-
-    def is_mimo_v2(self) -> bool:
-        if not hasattr(self.hf_text_config, "model_type"):
-            return False
-        elif self.hf_text_config.model_type in (
-            "mimo_v2",
-            "mimo_v2_flash",
-        ):
-            return True
-        return False
 
     def _setup_device_and_distributed(self, rank: int, config: Config):
         # Calculate local device rank considering DP, PP and PCP.
@@ -1061,11 +977,10 @@ class ModelRunner:
             self.graphs = self.graph_pool = None  # type: ignore
         if isinstance(self.model, UBatchWrapper):
             self.model.tbo_graphs.clear()
-        # 3. Release GPU tensors
+        # 3. Release GPU tensors. `kv_cache` is the whole paged pool -- the
+        # scales and any indexer cache are regions of it, not attributes.
         for attr in (
             "kv_cache",
-            "kv_scale",
-            "index_cache",
             "mamba_k_cache",
             "mamba_v_cache",
             "kpool_tail_cache",
@@ -1099,9 +1014,8 @@ class ModelRunner:
                     c if c.isalnum() or c in ("_", "-", ".") else "_"
                     for c in trace_name
                 )
-            if worker_name == "capture_graph":
-                if safe_model_name:
-                    worker_name = f"{worker_name}_{safe_model_name}"
+            if worker_name == "capture_graph" and safe_model_name:
+                worker_name = f"{worker_name}_{safe_model_name}"
             output_prefix = os.path.join(self.profiler_dir, worker_name)
 
             def _on_trace_ready(prof):
@@ -1422,9 +1336,9 @@ class ModelRunner:
         by accident, since `postprocess` synchronizes to read the sampled ids,
         but a chunked prefill's middle chunk returns before `postprocess` and
         closes nothing. Measured: the host reached 4042 packets ahead and the
-        GPU read a `batch_id_per_token` from a later batch (id 3 in a `bs=2`
+        GPU read a `batch_id_per_q_token` from a later batch (id 3 in a `bs=2`
         batch), tripping the bounds assert in
-        `cu_committed_gpu[batch_id_per_token]` -- which wedges the queue with
+        `cu_committed_gpu[batch_id_per_q_token]` -- which wedges the queue with
         no fault line and no traceback.
 
         One buffer admits one forward of lead, so the gate is depth-1. Decode
@@ -1480,74 +1394,43 @@ class ModelRunner:
             (3, num_tokens), (num_tokens, 1)
         )
 
-    def _num_draft_kv_layers(self) -> int:
-        """How many KV cache slots the draft model needs, one per draft layer.
+    def draft_shares_kv_pool(self) -> bool:
+        """Whether a draft's attention layers land in the target's pools.
 
-        A draft with a REAL layer stack — the Eagle3 drafts and the standalone
-        DSpark drafts — runs every one of its layers on every drafting step, so
-        each needs its own slot. Serial MTP instead reuses one layer `mtp_k`
-        times and declares how many it has in `num_nextn_predict_layers`.
-
-        Single source of truth on purpose: this count drives both the pool
-        sizing (`_get_total_num_layers` -> the builders' `sub_pool_specs`) and
-        the allocation itself. Two independent spellings of it silently
-        disagreed for the standalone DSpark draft, sizing 1 slot while
-        allocating 5.
+        A draft whose flavor asked for a pool of its own has a
+        `draft_kv_builder` and is priced and bound through that instead. One
+        spelling, because the layer count and the walk that fills those layers
+        have to answer this the same way.
         """
-        spec_config = self.config.speculative_config
-        draft_hf = spec_config.draft_model_hf_config
-        has_real_stack = (
-            hasattr(self, "eagle3_draft_builder")
-            or getattr(spec_config, "use_dspark_with_draft", lambda: False)()
-        )
-        if has_real_stack:
-            return draft_hf.num_hidden_layers
-        return getattr(draft_hf, "num_nextn_predict_layers", 1)
-
-    def _get_total_num_layers(self):
-        """Return total layer count including draft (MTP) layers.
-
-        Drafts that own an independent KV cache via their own builder
-        (e.g. Eagle3 MHA draft on an MLA target) account for their layers
-        through that builder, so they are NOT added here. Only drafts that
-        share the target's KV pool contribute.
-        """
-        num_hidden = self.config.hf_config.num_hidden_layers
-        pp_group = get_pp_group()
-        if pp_group.world_size > 1:
-            start, end = get_pp_indices(
-                num_hidden, pp_group.rank_in_group, pp_group.world_size
-            )
-            total = end - start
-        else:
-            total = num_hidden
-        if (
+        return bool(
             self.config.speculative_config
             and hasattr(self, "drafter")
-            and not hasattr(self, "eagle3_draft_builder")
-        ):
-            total += self._num_draft_kv_layers()
-        return total
+            and not hasattr(self, "draft_kv_builder")
+        )
 
     def _sub_pool_specs(self) -> list[SubPoolSpec]:
         """Cache-class declarations from every builder attached to this runner.
 
-        The target builder always, plus an optional `eagle3_draft_builder`
-        when a heterogeneous spec-decode draft owns its own KV. Each builder
-        knows its own tensor layout (MLA 576-dim packed, GDN-hybrid
-        full-attn-only, MiMo-V2 per-layer-type, standard MHA split-K/V,
-        Eagle3 independent MHA); the runner only sums bytes. Specs sharing a
-        name merge in `plan_pools`, which is how the draft KV joins the
-        target's block ids instead of forming a second pool.
+        The target builder always, plus an optional `draft_kv_builder` when a
+        spec-decode draft owns its own KV. Each builder knows its own tensor
+        layout (MLA 576-dim packed, GDN-hybrid full-attn-only, MiMo-V2
+        per-layer-type, standard MHA split-K/V); the runner only sums bytes.
+        Specs sharing a name merge in `plan_pools`, which is how the draft KV
+        joins the target's block ids instead of forming a second pool.
         """
         specs = list(self.attn_metadata_builder.sub_pool_specs())
-        if hasattr(self, "eagle3_draft_builder"):
-            specs += self.eagle3_draft_builder.sub_pool_specs()
+        if hasattr(self, "draft_kv_builder"):
+            specs += self.draft_kv_builder.sub_pool_specs()
         return specs
 
-    def _has_state_pool(self) -> bool:
-        """Whether any attached builder declares a per-request STATE class."""
-        return any(s.pool is Pool.STATE for s in self._sub_pool_specs())
+    def _state_pool_names(self) -> list[str]:
+        """The per-request STATE classes the attached builders declare.
+
+        Named rather than counted because both callers want to say which: one
+        refuses a model whose `model_type` is missing from the per-req-cache
+        set, the other refuses P/D for it.
+        """
+        return [s.name for s in self._sub_pool_specs() if s.pool is Pool.STATE]
 
     def _estimate_cudagraph_overhead(self):
         """Estimate GPU memory consumed by CUDA graph capture.
@@ -1877,15 +1760,89 @@ class ModelRunner:
             "state_runtime": state_runtime.to_wire(),
         }
 
+    def _carve_paged_pool(self, blocks: int, buf=None):
+        """One allocation for every paged pool, and each builder's region of it.
+
+        The target's KV, its scales, whatever indexer cache rides along and a
+        draft's sibling pool were up to five allocations under five names. One
+        buffer here, for the reason the declarations were collapsed: a block's
+        bytes are one fact, and every name it is stored under is a place the
+        next reader can disagree with it. `kv_cache` is what is left, which is
+        what the IPC export ships and the sleep path frees.
+
+        Returns `(buffer, regions, builders)`, positionally aligned. `buf` is
+        the imported pool on the P/D decode side; that side carves with the
+        same walk rather than being told the offsets, so the two cannot drift.
+        A builder that allocates its own answers zero and gets an empty region.
+        """
+        builders = [self.attn_metadata_builder]
+        if hasattr(self, "draft_kv_builder"):
+            builders.append(self.draft_kv_builder)
+        # Before pricing, not between pricing and filling: the price below
+        # comes from the walk.
+        for builder in builders:
+            builder.invalidate_pool_rows()
+        sizes = [b.paged_pool_bytes(blocks) for b in builders]
+        # A builder either allocates its own pool or takes exactly what its own
+        # PAGE spec was charged -- nothing between. It catches the two hooks
+        # disagreeing (separate overrides; a field added to one), not a stale
+        # walk, which both readings share. A startup check and not a unit test
+        # because what it catches surfaces while serving, never as a bad number
+        # here.
+        for builder, size in zip(builders, sizes):
+            if not size:
+                continue
+            charged = blocks * sum(
+                s.entry_bytes for s in builder.sub_pool_specs() if s.pool is Pool.PAGE
+            )
+            if size != charged:
+                raise ValueError(
+                    f"{type(builder).__name__} wants {size} B of the paged pool "
+                    f"at {blocks} blocks but was charged {charged} B"
+                )
+        offsets, total = plan_regions(sizes)
+        if buf is None:
+            buf = torch.zeros(total, dtype=torch.uint8, device=self.device)
+        elif buf.numel() < total:
+            raise ValueError(
+                f"the imported paged pool holds {buf.numel()} B but this side's "
+                f"declarations want {total} B at {blocks} blocks"
+            )
+        regions = [buf[o : o + n] for o, n in zip(offsets, sizes)]
+        return buf, regions, builders
+
+    def _back_paged_pools(self, blocks: int, buf=None):
+        """Back every builder's paged pool and publish what comes back.
+
+        The one place, because there are two callers: this side allocates the
+        buffer and the decode side of a P/D pair imports it. What the hook
+        returns -- the aligned indexer dimension, the compact layer maps,
+        GLM-5.3's k-pool tail -- has to reach its readers as a runner attribute
+        on both, and a path that only backed the pool leaves the other half
+        dereferencing attributes nobody set.
+        """
+        pool, regions, builders = self._carve_paged_pool(blocks, buf=buf)
+        for builder, region in zip(builders, regions):
+            for name, value in builder.allocate_kv_cache_tensors(
+                blocks=blocks, buf=region
+            ).items():
+                setattr(self, name, value)
+            logger.info(
+                "%s caches %s",
+                type(builder).__name__,
+                ", ".join(
+                    f"{n} {kind} rows" for kind, n in builder.row_counts().items()
+                )
+                or "nothing",
+            )
+        return pool
+
     def allocate_kv_cache(self, num_kvcache_blocks):
         pre_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
 
         config = self.config
         config.num_kvcache_blocks = num_kvcache_blocks
         hf_config = config.hf_config
-        self.num_physical_kvcache_blocks = (
-            num_kvcache_blocks * self.attn_metadata_builder.block_ratio
-        )
         if hf_config.num_key_value_heads >= self.world_size:
             assert hf_config.num_key_value_heads % self.world_size == 0
             num_kv_heads = hf_config.num_key_value_heads // self.world_size
@@ -1897,45 +1854,17 @@ class ModelRunner:
         self.num_kv_heads = num_kv_heads
         self.aligned_index_dim = None  # set below for DeepSeek-V3.2
 
-        # Total layer count (target + any draft sharing the target's pool).
-        total_num_layers = self._get_total_num_layers()
-        num_draft_layers = 0
-        if self.config.speculative_config and hasattr(self, "drafter"):
-            owns_pool = hasattr(self, "eagle3_draft_builder")
-            num_draft_layers = self._num_draft_kv_layers()
-            logger.info(
-                f"Allocating KV cache for {hf_config.num_hidden_layers} target "
-                f"layers + {num_draft_layers} draft layers"
-                + (
-                    " (separate sibling pool)"
-                    if owns_pool
-                    else f" = {total_num_layers} total layers"
-                )
-            )
-
-        # Primary KV cache allocation (model-agnostic, delegated to the
-        # attention builder). Each builder owns its tensor layout: MLA →
-        # single 576-dim per layer; GDN-hybrid → only num_full_attn rows;
-        # MiMo-V2 → defer per-module; standard MHA → split-K/V `[2, L, ...]`.
-        # Returned tensors are setattr'd on `self` under their conventional
-        # names (kv_cache, kv_scale, index_cache, aligned_index_dim,
-        # _kv_layer_cache_store) so binding code and downstream consumers
-        # find them where they expect.
-        main_kv = self.attn_metadata_builder.allocate_kv_cache_tensors(
-            num_kv_heads, num_draft_layers
-        )
-        for name, value in main_kv.items():
-            setattr(self, name, value)
-
-        # Heterogeneous draft (e.g. Eagle3 MHA alongside an MLA target) owns
-        # its own KV pool through a sibling builder; same protocol as above,
-        # tensors land under namespaced keys (eagle3_kv_cache, eagle3_kv_scale).
-        if hasattr(self, "eagle3_draft_builder"):
-            draft_kv = self.eagle3_draft_builder.allocate_kv_cache_tensors(
-                num_kv_heads, num_draft_layers
-            )
-            for name, value in draft_kv.items():
-                setattr(self, name, value)
+        # Primary KV cache allocation: one buffer, one region per builder, each
+        # owning the layout inside its own. A draft that cannot share the
+        # target's pool is simply the next region -- no second allocation, and
+        # nothing that asks whether its attention matches the target's.
+        #
+        # What comes back is only what a region cannot carry: scalars like
+        # `aligned_index_dim` and the compact layer maps, setattr'd here so
+        # their readers find them where they always have.
+        pool = self._back_paged_pools(num_kvcache_blocks)
+        if pool.numel():
+            self.kv_cache = pool
 
         # Per-request cache allocation (model-agnostic, delegated to the
         # attention metadata builder). For GDN this returns
@@ -1962,85 +1891,55 @@ class ModelRunner:
         if self.config.speculative_config and hasattr(self, "drafter"):
             models_to_bind.append(("draft", self.drafter.model))
 
-        kv_cache_tensors = []
-        # Key by the module's global layer_num (what it looks up at forward time),
-        # not the local bind counter — under PP a stage's layer_num is offset.
-        kv_cache_keys = []
-        layer_id = 0
-        # Promote to self so the attention builder's build_kv_cache_tensor()
-        # can access it without recomputing from drafter state. Heterogeneous
-        # drafts (Eagle3 MHA) own their own layer space via their builder.
-        # Eagle3 MLA drafts (K2.6) share the target's MLA pool but still
-        # appear as one extra layer at index num_hidden_layers.
-        #
-        # Only serial-MTP draft models carry `.model.mtp_start_layer_idx`; the
-        # eagle3 and standalone-DSpark drafts do not, and both simply start
-        # right after the target's last layer. Probe for the attribute instead
-        # of enumerating the flavors that lack it — the previous
-        # `not is_eagle3` spelling silently grew wrong the moment a third
-        # standalone flavor appeared.
-        drafter_model = getattr(getattr(self, "drafter", None), "model", None)
-        self.mtp_start_layer_idx = getattr(
-            getattr(drafter_model, "model", None),
-            "mtp_start_layer_idx",
-            hf_config.num_hidden_layers,
-        )
+        # Keyed by each module's own global layer_num, which is what it looks
+        # up at forward time (`kv_cache_data[f"layer_{self.layer_num}"]`). The
+        # walk's ordinal used to be passed down and stood in for this, for a
+        # pool row and for an index-map key; under PP it is none of the three.
+        kv_cache_data = {}
         for model_name, model in models_to_bind:
-            logger.info(
-                f"Binding KV cache for {model_name} model starting at layer_id={layer_id}"
-            )
-
+            logger.info("Binding KV cache for the %s model", model_name)
             for module in model.modules():
-                # Drafts that own an independent KV pool (Eagle3) bind through
-                # their sibling builder first; for unrecognized modules it
-                # returns None and we fall through to the target builder.
-                if model_name == "draft" and hasattr(self, "eagle3_draft_builder"):
-                    kv_cache_tensor = self.eagle3_draft_builder.build_kv_cache_tensor(
-                        layer_id, module
+                # A draft that owns an independent KV pool binds through its
+                # sibling builder first; for unrecognized modules it returns
+                # None and we fall through to the target builder.
+                kv_cache_tensor = None
+                if model_name == "draft" and hasattr(self, "draft_kv_builder"):
+                    kv_cache_tensor = self.draft_kv_builder.build_kv_cache_tensor(
+                        module
                     )
-                    if kv_cache_tensor is not None:
-                        kv_cache_tensors.append(kv_cache_tensor)
-                        kv_cache_keys.append(getattr(module, "layer_num", layer_id))
-                        layer_id += 1
-                        continue
-
                 # Per-attention-type binding is owned by the attention
                 # metadata builder; ModelRunner only walks modules and
                 # collects the resulting KVCacheTensor entries. The builder
                 # returns None for modules it does not recognize (so a
-                # sibling module like nn.LayerNorm is silently skipped),
-                # and increments through MHA / MLA / GDN / V3.2-indexer
-                # internally.
-                kv_cache_tensor = self.attn_metadata_builder.build_kv_cache_tensor(
-                    layer_id, module
-                )
+                # sibling module like nn.LayerNorm is silently skipped).
+                if kv_cache_tensor is None:
+                    kv_cache_tensor = self.attn_metadata_builder.build_kv_cache_tensor(
+                        module
+                    )
                 if kv_cache_tensor is not None:
-                    kv_cache_tensors.append(kv_cache_tensor)
-                    kv_cache_keys.append(getattr(module, "layer_num", layer_id))
-                    layer_id += 1
+                    kv_cache_data[f"layer_{module.layer_num}"] = kv_cache_tensor
 
-        # Store KVCacheConfig, keyed by each module's (global) layer_num so it
-        # matches the attention's own kv_cache_data[f"layer_{self.layer_num}"]
-        # lookup under pipeline parallel.
-        kv_cache_data = {
-            f"layer_{key}": kv_cache_tensor
-            for key, kv_cache_tensor in zip(kv_cache_keys, kv_cache_tensors)
-        }
         transfer_tensors = self.attn_metadata_builder.get_kv_transfer_tensors()
         if transfer_tensors is not None:
             # The tier is built inside `register_kv_caches` and needs
             # `state_entry_views` to name the bytes it packs. This is the only
             # place the builder and the connector are both in scope.
             transfer_tensors.state_backend = self.attn_metadata_builder
-        if hasattr(self, "eagle3_draft_builder") and transfer_tensors is not None:
-            draft_regions = self.eagle3_draft_builder.get_kv_transfer_tensors()
+        if hasattr(self, "draft_kv_builder") and transfer_tensors is not None:
+            draft_regions = self.draft_kv_builder.get_kv_transfer_tensors()
             if draft_regions:
                 transfer_tensors.block_regions.extend(draft_regions)
-        # The transfer protocol addresses scheduler blocks, whose IDs index
-        # ``req.block_ids``.  MLA's cache is allocated in page-size-1 physical
-        # rows, so ``num_physical_kvcache_blocks`` is larger by block_ratio and
-        # must not be used here: doing so would make the codec treat one token
-        # as a complete scheduler block.
+        if transfer_tensors is not None:
+            # After the draft's regions are in, and here because this is the
+            # only place holding both the complete region list and the
+            # scheduler's block count. The builders cannot answer this: each
+            # counts in its own page, and the transfer protocol addresses
+            # ``req.block_ids``, which are the scheduler's.
+            transfer_tensors.set_block_count(num_kvcache_blocks)
+        # The same count reaches the codecs, which likewise index by scheduler
+        # block: MLA's cache is allocated in page-size-1 rows, so its own count
+        # is block_ratio times larger and would make a codec treat one token as
+        # a complete scheduler block.
         set_kv_cache_data(
             kv_cache_data,
             config,
@@ -2760,7 +2659,7 @@ class ModelRunner:
         self._pp_send_needs_sparse = False
         self._pp_recv_needs_sparse = False
         self._pp_index_topk = 0
-        if not self.is_deepseek_v32:
+        if not self.has_mla_indexer:
             return
         pp = get_pp_group()
         if pp.world_size <= 1:
@@ -3546,7 +3445,11 @@ class ModelRunner:
                 from aiter.dist import parallel_state as _ps
 
                 group = getattr(_ps, getter)()
-            except Exception:
+
+            # initialised is the ordinary case here, and which exception says
+            # so is the aiter build's business, not this probe's.
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("%s is not available: %s", getter, exc)
                 continue
             dc = getattr(group, "device_communicator", None)
             ca = getattr(dc, "ca_comm", None) if dc is not None else None
@@ -3606,7 +3509,7 @@ class ModelRunner:
 
         Two guards, both DP-safe (the decision must be identical on every rank,
         else capture loops desync and the next get_dp_padding all_reduce couples
-        mismatched num_tokens -> "batch_id_per_token len < T"):
+        mismatched num_tokens -> "batch_id_per_q_token len < T"):
 
         1. DP+spec hard cap: big bs*q buckets never run under DP but bloat the
            pool and don't overlap comm, so cap at ATOM_PIECEWISE_DP_MAX_TOKENS.
@@ -3790,7 +3693,9 @@ class ModelRunner:
         self._piecewise_captured_tokens = set()
 
         self.forward_vars["kv_indptr"].gpu.zero_()
-        if self.is_deepseek_v32 and "sparse_kv_indptr" in self.forward_vars:
+        # Present exactly when the model has an indexer -- the builder makes it
+        # under the same answer -- so the buffer's own existence is the test.
+        if "sparse_kv_indptr" in self.forward_vars:
             self.forward_vars["sparse_kv_indptr"].gpu.zero_()
 
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
@@ -4404,7 +4309,7 @@ class RapidServeModelRunner(ModelRunner):
         return True
 
     def export_kv_cache_ipc_handle(self) -> list[str] | None:
-        """Export self.kv_cache (and self.kv_scale for fp8) as CUDA IPC handles.
+        """Export self.kv_cache — the whole paged pool — as a CUDA IPC handle.
 
         TP-aware: each rank writes its handles to a temp file.  Rank 0 waits for
         all ranks and returns the list of paths; other ranks return None.
@@ -4412,8 +4317,7 @@ class RapidServeModelRunner(ModelRunner):
         from atom.model_engine.ipc_utils import export_kv_cache_handle
 
         logger.info(f"ModelRunner rank {self.rank}: export_kv_cache_ipc_handle")
-        kv_scale = getattr(self, "kv_scale", None)
-        handles = export_kv_cache_handle(self.kv_cache, kv_scale)
+        handles = export_kv_cache_handle(self.kv_cache)
         self._disagg_write_rank_file("kvcache", handles)
         paths = self._disagg_collect_rank_files("kvcache")
         if paths is not None:
@@ -4435,9 +4339,9 @@ class RapidServeModelRunner(ModelRunner):
 
         from atom.model_engine.ipc_utils import import_kv_cache
 
-        self.num_physical_kvcache_blocks = (
-            num_kvcache_blocks * self.attn_metadata_builder.block_ratio
-        )
+        # The count travels with the handle and reaches the builder through
+        # `_bind_kv_cache_to_modules` -> `allocate_kv_cache_tensors` below; this
+        # side never ran sizing, so there is nothing else it could come from.
         path = paths[self.rank]
         logger.info(
             f"ModelRunner rank {self.rank}: reading kvcache handles from {path}"
@@ -4446,98 +4350,63 @@ class RapidServeModelRunner(ModelRunner):
             meta = pickle.load(f)
         os.remove(path)
         logger.info(f"ModelRunner rank {self.rank}: hipIpcOpenMemHandle for kvcache...")
-        self.kv_cache, kv_scale = import_kv_cache(meta)
-        if kv_scale is not None:
-            self.kv_scale = kv_scale
+        self.kv_cache = import_kv_cache(meta)
         logger.info(
             f"ModelRunner rank {self.rank}: kvcache IPC import done, binding..."
         )
-        self._bind_kv_cache_to_modules()
+        self._bind_kv_cache_to_modules(num_kvcache_blocks)
         logger.info(f"ModelRunner rank {self.rank}: import_kv_cache_ipc_handle done")
         return True
 
-    def _bind_kv_cache_to_modules(self):
-        """Bind self.kv_cache (and self.kv_scale if present) to all attention
-        modules.  Called after replacing self.kv_cache with an IPC-imported
-        tensor (decode process), where the builder-based binding path in
-        allocate_kv_cache() is skipped."""
-        config = self.config
-        hf_config = config.hf_config
-        if hf_config.num_key_value_heads >= self.world_size:
-            num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        else:
-            num_kv_heads = 1
-        x = 16 // self.kv_cache.element_size()
+    def _bind_kv_cache_to_modules(self, num_kvcache_blocks: int):
+        """Bind an IPC-imported KV pool to every attention module.
+
+        The decode side of a P/D pair gets the pool as a handle, so it never
+        reaches `allocate_kv_cache`'s bind loop. What it must not do is bind it
+        a *second way*: this used to spell the views out again, with a 4-D V
+        where every builder declared 5-D. Nothing could catch that — the two
+        agree on every byte and differ only in what a reader branches on. So it
+        runs the same loop over the same hook, down to backing the pools.
+
+        The paged pool only. A per-request STATE class is sized by `pool_plan`,
+        which is empty here -- the block count arrives with the handle and
+        nothing else does -- so `allocate_per_req_cache` cannot run and the
+        attributes it publishes do not exist. Refused up front rather than met
+        as an `AttributeError` on whichever layer binds first.
+        """
+        stateful = self._state_pool_names()
+        if stateful:
+            raise NotImplementedError(
+                f"per-request state {stateful} has no entry count on the decode "
+                "side of a P/D pair: only the paged pool arrives with the "
+                "handle, and this side never ran sizing. Run this model "
+                "without disaggregation."
+            )
+        self._back_paged_pools(num_kvcache_blocks, buf=self.kv_cache)
 
         models_to_bind = [("target", self.model)]
         if self.config.speculative_config and hasattr(self, "drafter"):
             models_to_bind.append(("draft", self.drafter.model))
 
-        kv_cache_tensors = []
-        layer_id = 0
-        for _model_name, model in models_to_bind:
+        kv_cache_data = {}
+        for model_name, model in models_to_bind:
             for module in model.modules():
-                if hasattr(module, "base_attention"):
-                    if hasattr(module, "use_mla") and not module.use_mla:
-                        if self.is_qwen_next():
-                            attn_idx = layer_id // self.full_attention_interval
-                        else:
-                            attn_idx = layer_id
-                        k_cache = self.kv_cache[0, attn_idx].view(
-                            self.num_physical_kvcache_blocks,
-                            num_kv_heads,
-                            hf_config.head_dim // x,
-                            self.physical_block_size,
-                            x,
-                        )
-                        v_cache = self.kv_cache[1, attn_idx].view(
-                            self.num_physical_kvcache_blocks,
-                            num_kv_heads,
-                            hf_config.head_dim,
-                            self.physical_block_size,
-                        )
-                        module.max_model_len = self.config.max_model_len
-                        if config.kv_cache_dtype == "fp8":
-                            module.k_scale = self.kv_scale[0, attn_idx]
-                            module.v_scale = self.kv_scale[1, attn_idx]
-                        from atom.config import KVCacheTensor
-
-                        kv_cache_tensors.append(
-                            KVCacheTensor(
-                                layer_num=layer_id,
-                                k_cache=k_cache,
-                                v_cache=v_cache,
-                                k_scale=module.k_scale,
-                                v_scale=module.v_scale,
-                            )
-                        )
-                        module.k_cache = k_cache
-                        module.v_cache = v_cache
-                        layer_id += 1
-                    elif hasattr(module, "use_mla") and module.use_mla:
-                        kv_cache = self.kv_cache[layer_id].view(
-                            self.num_physical_kvcache_blocks * self.physical_block_size,
-                            1,
-                            576,
-                        )
-                        module.max_model_len = self.config.max_model_len
-                        from atom.config import KVCacheTensor
-
-                        kv_cache_tensors.append(
-                            KVCacheTensor(
-                                layer_num=layer_id,
-                                k_cache=kv_cache,
-                                v_cache=None,
-                                k_scale=None,
-                                v_scale=None,
-                            )
-                        )
-                        module.kv_cache = kv_cache
-                        layer_id += 1
+                # Same dispatch as the allocating path's loop: a draft with a
+                # pool of its own binds through its own builder, and its pool
+                # is now a region of the same imported buffer.
+                bound = None
+                if model_name == "draft" and hasattr(self, "draft_kv_builder"):
+                    bound = self.draft_kv_builder.build_kv_cache_tensor(module)
+                if bound is None:
+                    bound = self.attn_metadata_builder.build_kv_cache_tensor(module)
+                if bound is not None:
+                    # The same key the allocating path uses. Keyed by the walk's
+                    # ordinal here until now, which agreed with it only while
+                    # the first bound module was layer 0.
+                    kv_cache_data[f"layer_{module.layer_num}"] = bound
 
         from atom.utils.forward_context import set_kv_cache_data
 
-        kv_cache_data = {f"layer_{i}": t for i, t in enumerate(kv_cache_tensors)}
         set_kv_cache_data(kv_cache_data)
 
     # ------------------------------------------------------------------
@@ -4592,7 +4461,7 @@ class RapidServeModelRunner(ModelRunner):
         return words
 
     # CU fractions for which we pre-create masked streams.
-    _CU_POOL_FRACTIONS = [0.5]
+    _CU_POOL_FRACTIONS: ClassVar[list[float]] = [0.5]
 
     def create_prefill_stream_pool(self) -> bool:
         """Create a pool of CUDA streams for disaggregated prefill.
@@ -4662,7 +4531,7 @@ class RapidServeModelRunner(ModelRunner):
                 top_ks,
                 top_ps,
                 all_greedy,
-                needs_independent_noise,
+                _needs_independent_noise,
             ) = self.prepare_model(batch)
             logits, _ = self.run_model(input_ids, batch)
             # Sample the first generated token from each sequence's last logit

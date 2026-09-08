@@ -2,12 +2,26 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
-from typing import Optional
 
 import torch
+
 from atom.utils.forward_context import set_kv_cache_data
 
 logger = logging.getLogger("atom")
+
+# Every name a binder may have set to a view of the KV pool. Not just the cache
+# ones: the pool is a single buffer now, so one surviving scale plane or
+# indexer slice pins all of it -- what used to leak a scale tensor leaks the
+# whole pool.
+_POOL_VIEW_ATTRS = (
+    "k_cache",
+    "v_cache",
+    "kv_cache",
+    "kpool_tail_cache",
+    "k_scale",
+    "v_scale",
+    "index_cache",
+)
 
 
 class MemoryManagerMixin:
@@ -38,7 +52,7 @@ class MemoryManagerMixin:
         logger.debug(f"{self.label}: KV cache cleared")
         return True
 
-    def release_memory(self, tags: Optional[list[str]] = None) -> bool:
+    def release_memory(self, tags: list[str] | None = None) -> bool:
 
         if tags is None:
             tags = ["weights", "kv_cache"]
@@ -67,7 +81,7 @@ class MemoryManagerMixin:
         logger.info(f"{self.label}: GPU memory released, tags={tags}")
         return True
 
-    def resume_memory(self, tags: Optional[list[str]] = None) -> bool:
+    def resume_memory(self, tags: list[str] | None = None) -> bool:
 
         if tags is None:
             tags = ["weights", "kv_cache"]
@@ -134,19 +148,38 @@ class MemoryManagerMixin:
 
         # Clear per-module KV cache views that share the underlying storage.
         # Without this, del self.kv_cache alone cannot free GPU memory.
+        #
+        # On the value and not the name: these names are not unique, and
+        # `MiMoV2Attention.v_scale` is a float multiplier on V rather than a
+        # dequant plane, which blanking would silently stop applying. Gating on
+        # a sibling name instead would answer the wrong question -- and did:
+        # `index_cache` lives on the `impl` that never holds a `k_cache`.
         for model_obj in self._get_models_with_kv():
             for module in model_obj.modules():
-                for attr in ("k_cache", "v_cache", "kv_cache", "kpool_tail_cache"):
-                    if hasattr(module, attr):
+                for attr in _POOL_VIEW_ATTRS:
+                    if isinstance(getattr(module, attr, None), torch.Tensor):
                         setattr(module, attr, None)
+                # `DeepseekV32IndexerCache` holds its slice in a one-element
+                # list the binder assigns *into*. Emptying the element and not
+                # the list: waking rebinds with `kv_cache[0] = ...`, which
+                # needs a list to still be there.
+                if isinstance(getattr(module, "kv_cache", None), list):
+                    module.kv_cache = [torch.tensor([])]
 
         set_kv_cache_data({})
+
+        # A builder's pools hold views of the same buffer, so dropping only the
+        # runner's reference frees nothing.
+        for owner in (
+            getattr(self, "attn_metadata_builder", None),
+            getattr(self, "draft_kv_builder", None),
+        ):
+            if owner is not None:
+                owner.release_kv_pools()
 
         del self.kv_cache
         self.kv_cache = None
         for attr in (
-            "kv_scale",
-            "index_cache",
             "mamba_k_cache",
             "mamba_v_cache",
             "kpool_tail_cache",
@@ -210,11 +243,8 @@ class MemoryManagerMixin:
             self.capture_cudagraph()
             del self._graphs_backup_keys
             logger.info(f"{self.label}: CUDA graph recapture completed")
-        except Exception as e:
-            logger.error(
-                f"{self.label}: CUDA graph recapture failed: {e}",
-                exc_info=True,
-            )
+        except Exception:
+            logger.exception(f"{self.label}: CUDA graph recapture failed")
             # Fall back to eager mode rather than crashing
             self.enforce_eager = True
             self.graphs = {}

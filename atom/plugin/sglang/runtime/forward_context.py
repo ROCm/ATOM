@@ -235,7 +235,7 @@ def _slice_v4_graph_metadata_for_capture(
                 pass
 
     for name in (
-        "batch_id_per_token",
+        "batch_id_per_q_token",
         "slot_mapping",
         "kv_indices_swa",
         "kv_indices_csa",
@@ -279,7 +279,7 @@ def _slice_v4_graph_metadata_for_capture(
     if isinstance(indexer_meta, dict):
         indexer_meta = dict(indexer_meta)
         for key in (
-            "batch_id_per_token_gpu",
+            "batch_id_per_q_token",
             "seq_base_per_token_gpu",
             "cu_starts_gpu",
             "cu_ends_gpu",
@@ -466,7 +466,7 @@ def stage_glm52_draft_decode_graph_metadata(
         "sparse_kv_indptr",
         "sparse_kv_last_page_lens",
         "sparse_cu_seqlens_q",
-        "token_to_seq_idxs",
+        "batch_id_per_q_token",
         "work_meta_data",
         "work_indptr",
         "work_info_set",

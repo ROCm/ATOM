@@ -273,6 +273,8 @@ def sparse_attn_indexer_plugin_mode(
     try:
         from vllm.forward_context import (
             get_forward_context as get_vllm_forward_context,
+        )
+        from vllm.forward_context import (
             is_forward_context_available as is_vllm_ctx_available,
         )
 
@@ -517,7 +519,7 @@ def sparse_attn_indexer_plugin_mode(
             )
 
     triton_convert_req_index_to_global_index(
-        sparse_meta.req_id_per_token.to(dtype=torch.int32),
+        sparse_meta.batch_id_per_q_token.to(dtype=torch.int32),
         sparse_meta.block_table.to(dtype=torch.int32),
         topk_indices[: sparse_meta.num_actual_tokens].to(dtype=torch.int32),
         sparse_meta.paged_kv_indptr,

@@ -3,7 +3,7 @@
 """Which bytes of a DeepSeek-V4 Active Slot a checkpoint carries, and that a
 store/restore round trip moves exactly those and nothing else.
 
-`checkpoint_ranges_for` (tested in `test_state_arena.py`) says which bytes of the
+`checkpoint_ranges_for` (tested in `test_entry_arena.py`) says which bytes of the
 compressor *arena* are live. This file covers the step after it: composing
 those with the sliding-window rows that share the slot, turning the result into
 byte segments at a slot's real address, and round-tripping them through the
@@ -45,13 +45,14 @@ Builder = pytest.importorskip(
     exc_type=ImportError,
 ).DeepseekV4AttentionMetadataBuilder
 
-from atom.model_ops.attentions.pool_layout.paged_state_copy import plan_segmented_copy
-from atom.model_ops.attentions.pool_layout.state_arena import (
-    StateField,
+from atom.model_ops.attentions.pool_layout.entry_arena import (
+    EntryField,
     checkpoint_ranges_for,
     entry_bytes_for,
     field_extents,
 )
+from atom.model_ops.attentions.pool_layout.paged_state_copy import plan_segmented_copy
+from atom.model_ops.attentions.pool_layout.v4_pool_fields import main_kv_plane_fields
 from atom.model_ops.attentions.pool_layout.v4_pool_geometry import CSA_RATIO, HCA_RATIO
 
 NEG_INF = float("-inf")
@@ -63,13 +64,13 @@ SLOTS = 3
 # stays whole. Same order as `_state_fields`, which is the order the bytes are
 # seen in.
 FIELDS = [
-    StateField("csa_main_kv", 2, (4, 8), torch.float32),
-    StateField("csa_main_score", 2, (4, 8), torch.float32, NEG_INF),
-    StateField("hca_main_kv", 2, (16, 8), torch.float32, in_checkpoint=False),
-    StateField(
+    EntryField("csa_main_kv", 2, (4, 8), torch.float32),
+    EntryField("csa_main_score", 2, (4, 8), torch.float32, NEG_INF),
+    EntryField("hca_main_kv", 2, (16, 8), torch.float32, in_checkpoint=False),
+    EntryField(
         "hca_main_score", 2, (16, 8), torch.float32, NEG_INF, in_checkpoint=False
     ),
-    StateField("state_window", 1, (6, 8), torch.float32),
+    EntryField("state_window", 1, (6, 8), torch.float32),
 ]
 ARENA_BYTES = entry_bytes_for(FIELDS)
 ARENA_ROWS = -(-ARENA_BYTES // ROW_BYTES)
@@ -426,6 +427,10 @@ class TestTheBuilderDeclaresWhatItDrops:
             _indexer_fp4 = False
             _field_window_dtype = torch.bfloat16
             _field_window_layers = (43,)
+            # A bf16 build's one plane. The state-carried window is a ring of
+            # these rows in its own dtype, so `_state_fields` reads its shape
+            # and its alignment from here.
+            _plane_fields = main_kv_plane_fields(head_dim, torch.bfloat16)
 
             def __init__(self):
                 pass  # the real one wants a ModelRunner, a model and a GPU
@@ -433,7 +438,7 @@ class TestTheBuilderDeclaresWhatItDrops:
         return _Stub()
 
     @classmethod
-    def build_fields(cls) -> list[StateField]:
+    def build_fields(cls) -> list[EntryField]:
         return Builder._state_fields(cls.builder_stub())
 
     def test_hca_is_the_only_thing_dropped(self):
