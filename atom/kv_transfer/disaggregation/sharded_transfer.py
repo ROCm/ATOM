@@ -10,6 +10,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from atom.distributed.dcp_layout import dcp_global_pos
+
 
 def coalesce_contiguous(
     src: np.ndarray, dst: np.ndarray, length: np.ndarray
@@ -131,9 +133,10 @@ def build_dcp_shard_plan(
 
     local_token = np.arange(0, dst_pages * block_size, interleave_size, dtype=np.int64)
     dst_page, dst_token = np.divmod(local_token, block_size)
-    global_token = (
-        (local_token // interleave_size) * dcp_size + dcp_rank
-    ) * interleave_size
+    # Sampled at S-aligned run starts, so local_token % S is 0 and the extra
+    # term in dcp_global_pos is unused -- still call the canonical inverse so
+    # a layout change in attention cannot silently skip the RDMA plan.
+    global_token = dcp_global_pos(local_token, dcp_rank, dcp_size, interleave_size)
     src_ordinal, src_token = np.divmod(global_token, block_size)
     valid = src_ordinal < src_ids.size
 

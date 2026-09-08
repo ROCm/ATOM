@@ -4,6 +4,11 @@
 import numpy as np
 import pytest
 
+from atom.distributed.dcp_layout import (
+    dcp_global_pos,
+    dcp_local_index,
+    dcp_owner_rank,
+)
 from atom.kv_transfer.disaggregation.sharded_transfer import (
     build_dcp_shard_plan,
     coalesce_contiguous,
@@ -14,6 +19,15 @@ def _expand_runs(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
     return np.concatenate(
         [np.arange(start, start + length) for start, length in zip(starts, lengths)]
     )
+
+
+@pytest.mark.parametrize("dcp_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("interleave", [1, 2, 4])
+def test_dcp_layout_helpers_round_trip(dcp_size, interleave):
+    for pos in range(dcp_size * interleave * 8):
+        rank = dcp_owner_rank(pos, dcp_size, interleave)
+        local = dcp_local_index(pos, dcp_size, interleave)
+        assert dcp_global_pos(local, rank, dcp_size, interleave) == pos
 
 
 @pytest.mark.parametrize(
@@ -43,9 +57,7 @@ def test_shard_plan_matches_dcp_token_ownership(dcp_size, dcp_rank, interleave):
     expected_src = []
     expected_dst = []
     for local_token in range(dst_pages * block_size):
-        global_token = (
-            (local_token // interleave) * dcp_size + dcp_rank
-        ) * interleave + local_token % interleave
+        global_token = dcp_global_pos(local_token, dcp_rank, dcp_size, interleave)
         src_ordinal, src_token = divmod(global_token, block_size)
         if src_ordinal >= len(src_block_ids):
             continue

@@ -324,6 +324,10 @@ class ReqMeta:
     # PD incremental: blocks already in decode's prefix cache; both sides
     # skip block_ids[:num_computed_blocks]. 0 = full transfer.
     num_computed_blocks: int = 0
+    # How many producer blocks correspond to one destination block. 1 when
+    # producer and consumer share a DCP world, consumer dcp_size when the
+    # producer is unsharded.
+    src_block_skip_factor: int = 1
     # The request's SWA ring slot, as a one-element list so it zips with the
     # region loop like block ids do. Empty for backends with no SWA state.
     local_swa_block_ids: list[int] = field(default_factory=list)
@@ -415,6 +419,7 @@ class ConnectorMetadata:
             transfer_id=kv_transfer_params.get("transfer_id", 0),
             local_slot_index=kv_transfer_params.get("local_slot_index", -1),
             num_computed_blocks=kv_transfer_params.get("num_computed_blocks", 0),
+            src_block_skip_factor=kv_transfer_params.get("src_block_skip_factor", 1),
         )
 
     def add_new_req_to_save(
