@@ -34,12 +34,12 @@ levels is reported as ``insufficient``; if no family survives, the whole run is
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import re
 import statistics
 import sys
 import urllib.request
-from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -67,6 +67,27 @@ BASELINE_SANITY_PCT = -25.0  # base this far under main's recent median
 BASELINE_SANITY_SIGMA = 2.5  # ... and clear of that configuration's own noise
 BASELINE_SANITY_MIN_LEVELS = 2  # ... on at least this many judged levels
 BASELINE_SANITY_MIN_POINTS = 6  # ... judged against at least this much history
+
+# --- Main-side drift (context, never a verdict on the PR) -------------------
+# Ported from the nightly monitor's trend criterion, with its constants intact.
+# A paired comparison cannot see a level that has been sliding for weeks: base
+# and head both sit on top of it, so the delta is honest and the absolute
+# number is not. This reads the same dashboard file already fetched for the
+# noise band and says so separately.
+#
+# Judged per family -- one model at one input/output shape, across its
+# concurrency levels -- because a single configuration's slope carries no
+# information. Measured across 414 configurations, the 14-day change is
+# symmetric: 18 below -10% and 22 above +10%. Amplitude alone cannot separate
+# signal from noise. Several independent levels sliding together can.
+DRIFT_MIN_CONC = 64  # small concurrency both invents and dilutes drift
+DRIFT_HORIZONS = (7, 14)  # days
+DRIFT_FAM_MIN_CONFIGS = 3  # levels needed before a family is judged
+DRIFT_MEDIAN_TH = -4.0  # family median change that counts as drift
+DRIFT_MIN_DOWN = 3  # ... on at least this many levels
+DRIFT_DOWN_EPS = -2.0  # a level counts as "down" past this
+DRIFT_TPOT_MIRROR = 0.6  # |TPOT change / throughput change| confirming it
+DRIFT_SMOOTH_K = 3  # points averaged at each end, to flatten run-to-run jitter
 
 # A paired comparison answers "did this change make it worse" and is blind to
 # "main was already broken": if base and head are both 20% down, the delta is
@@ -145,8 +166,12 @@ def _parse_data_js(text):
         return None
 
 
-def load_history_cv(source=None):
-    """Return {(model, isl_osl, conc): {"cv", "median", "n"}} from history.
+def load_history(source=None):
+    """Return (series, stats) from the dashboard history file.
+
+    ``series`` maps each configuration to its points in time, which the drift
+    criterion needs; ``stats`` is the per-configuration summary the noise band
+    and the baseline check use. Both come from one parse of one file.
 
     ``source`` may be a local path or None (fetch the public dashboard). Any
     failure yields an empty mapping -- the sigma gate is optional by design and
@@ -167,19 +192,24 @@ def load_history_cv(source=None):
             with urllib.request.urlopen(req, timeout=60) as resp:
                 text = resp.read().decode("utf-8", errors="replace")
     except (OSError, urllib.error.URLError):
-        return {}
+        return {}, {}
 
     data = _parse_data_js(text)
     if not data:
-        return {}
+        return {}, {}
 
     runs = []
     for entry in data.get("entries", {}).values():
         runs.extend(entry)
 
     seen_run_ids = set()
-    series = defaultdict(list)
-    name_re = re.compile(r"^(ATOM[^:]*)::(.+?)\s+(\d+/\d+)\s+c=(\d+)\s+Total Tput")
+    series = collections.defaultdict(list)
+    # Throughput and TPOT both, keyed together: the drift criterion confirms a
+    # slide by requiring TPOT to move the other way by a comparable amount,
+    # which separates a real slowdown from measurement wobble.
+    name_re = re.compile(
+        r"^(ATOM[^:]*)::(.+?)\s+(\d+/\d+)\s+c=(\d+)\s+(Total Tput|TPOT)"
+    )
 
     for run in sorted(runs, key=lambda r: r.get("date", 0)):
         benches = run.get("benches") or []
@@ -192,18 +222,25 @@ def load_history_cv(source=None):
             continue
         if run_id:
             seen_run_ids.add(run_id)
+        per_run = {}
         for bench in benches:
-            if bench.get("unit") != "tok/s":
+            if bench.get("unit") not in ("tok/s", "ms"):
                 continue
             match = name_re.match(bench.get("name", ""))
             if not match:
                 continue
             key = (match.group(2), match.group(3), int(match.group(4)))
-            series[key].append(bench.get("value"))
+            field = "tput" if match.group(5) == "Total Tput" else "tpot"
+            per_run.setdefault(key, {"date": run.get("date", 0)})[field] = bench.get(
+                "value"
+            )
+        for key, point in per_run.items():
+            if point.get("tput") is not None:
+                series[key].append(point)
 
     stats = {}
-    for key, values in series.items():
-        values = [v for v in values if isinstance(v, (int, float))]
+    for key, points in series.items():
+        values = [p["tput"] for p in points if p.get("tput") is not None]
         if len(values) < BASELINE_SANITY_MIN_POINTS:
             continue
         # The last few runs, not the whole window: a level that shifted weeks
@@ -217,7 +254,98 @@ def load_history_cv(source=None):
                 "median": median,
                 "n": len(recent),
             }
-    return stats
+    ordered = {
+        key: sorted(points, key=lambda p: p["date"]) for key, points in series.items()
+    }
+    return ordered, stats
+
+
+def _drift_lag(points, days, field):
+    """Change from `days` ago to now, each end averaged over DRIFT_SMOOTH_K
+    points so a single jumpy run does not set the slope. None when either end
+    is short of history."""
+    if not points:
+        return None
+    cutoff = points[-1]["date"] - days * 86400 * 1000
+    now = [p[field] for p in reversed(points) if p.get(field) is not None]
+    then = [
+        p[field] for p in points if p["date"] <= cutoff and p.get(field) is not None
+    ]
+    if len(now) < DRIFT_SMOOTH_K or len(then) < DRIFT_SMOOTH_K:
+        return None
+    base = statistics.mean(then[-DRIFT_SMOOTH_K:])
+    if not base:
+        return None
+    return (statistics.mean(now[:DRIFT_SMOOTH_K]) / base - 1) * 100
+
+
+def main_drift(series, models):
+    """Families on main that have been sliding, restricted to `models`.
+
+    Context for reading the paired result, never a judgement on the PR: base
+    and head both sit on top of whatever main is doing, so a slide leaves the
+    delta honest and the absolute number wrong. A reviewer told only "no
+    change" would take that as "fine".
+
+    Reports the worst horizon per family. Scoped to the models this run
+    measured -- listing every drifting family in the repository would bury the
+    one the reader is looking at.
+    """
+    families = collections.defaultdict(list)
+    for (model, isl_osl, conc), points in series.items():
+        if conc < DRIFT_MIN_CONC or model not in models:
+            continue
+        if len(points) < 2 * DRIFT_SMOOTH_K:
+            continue
+        families[(model, isl_osl)].append(sorted(points, key=lambda p: p["date"]))
+
+    found = []
+    for (model, isl_osl), members in families.items():
+        if len(members) < DRIFT_FAM_MIN_CONFIGS:
+            continue
+        worst = None
+        for horizon in DRIFT_HORIZONS:
+            tputs = [
+                d
+                for d in (_drift_lag(m, horizon, "tput") for m in members)
+                if d is not None
+            ]
+            tpots = [
+                d
+                for d in (_drift_lag(m, horizon, "tpot") for m in members)
+                if d is not None
+            ]
+            if len(tputs) < DRIFT_FAM_MIN_CONFIGS:
+                continue
+            median = statistics.median(tputs)
+            n_down = sum(1 for d in tputs if d <= DRIFT_DOWN_EPS)
+            median_tpot = statistics.median(tpots) if tpots else None
+            # Mirror confirmation: throughput down while TPOT goes up, by a
+            # comparable amount. Measurement wobble does not move the two in
+            # lockstep.
+            mirrored = (
+                median_tpot is not None
+                and median < 0
+                and median_tpot > 0
+                and abs(median_tpot / median) >= DRIFT_TPOT_MIRROR
+            )
+            tripped = (
+                median <= DRIFT_MEDIAN_TH and n_down >= DRIFT_MIN_DOWN and mirrored
+            )
+            if tripped and (worst is None or median < worst["median_pct"]):
+                worst = {
+                    "model": model,
+                    "isl_osl": isl_osl,
+                    "horizon_days": horizon,
+                    "median_pct": median,
+                    "median_tpot_pct": median_tpot,
+                    "n_down": n_down,
+                    "n_total": len(tputs),
+                }
+        if worst:
+            found.append(worst)
+    found.sort(key=lambda f: f["median_pct"])
+    return found
 
 
 # --------------------------------------------------------------------------
@@ -473,9 +601,9 @@ def _single_escalations(members, history_cv):
     return flags
 
 
-def judge(pairs, history_cv, expected_entries=None):
+def judge(pairs, history_cv, expected_entries=None, drift=None):
     """Two-layer verdict: per model entry, then across entries."""
-    families = defaultdict(list)
+    families = collections.defaultdict(list)
     for pair in pairs:
         families[(pair["backend"], pair["model"], pair["isl_osl"])].append(pair)
 
@@ -543,6 +671,9 @@ def judge(pairs, history_cv, expected_entries=None):
         "n_unclear": len(unclear),
         "n_drifted": len(drifted),
         "n_bad_baseline": len(bad_baseline),
+        # Context, deliberately outside the verdict: main sliding is not
+        # something this PR did, and folding it in would blame the author.
+        "main_drift": drift or [],
         "median_drift_pct": _median_or_none(
             [
                 f["median_drift_pct"]
@@ -718,6 +849,40 @@ def render(report, context):
                 "or the base half was contaminated and every number here is "
                 "measured against a bad one. Both need looking at before the PR "
                 "is judged on this."
+            ),
+            "",
+        ]
+
+    # --- main-side context, kept apart from the verdict --------------------
+    if report.get("main_drift"):
+        lines += [
+            "---",
+            "",
+            (
+                "**Main-side context — not caused by this PR.** The baseline "
+                "above was measured on main, and these models have been sliding "
+                "there. A paired comparison sits on top of that: the delta is "
+                "honest and the absolute level is not."
+            ),
+            "",
+            "| Model | Input/output | Window | Throughput | TPOT | Levels down |",
+            "|---|---|---|---|---|---|",
+        ]
+        for d in report["main_drift"]:
+            lines.append(
+                f"| {d['model']} | {d['isl_osl']} | {d['horizon_days']}d "
+                f"| {d['median_pct']:+.1f}% | {_fmt(d['median_tpot_pct'])} "
+                f"| {d['n_down']}/{d['n_total']} |"
+            )
+        lines += [
+            "",
+            (
+                "Read from the nightly history on the dashboard, over the "
+                "concurrency levels this check judges. Reported when several "
+                "levels of one model slide together and TPOT mirrors the move "
+                "-- a single level's slope carries no information, and across "
+                "414 configurations the 14-day change is symmetric enough that "
+                "amplitude alone cannot separate signal from noise."
             ),
             "",
         ]
@@ -936,8 +1101,13 @@ def main():
 
     # Only a path enables history. Reaching for the network because no flag was
     # given would put an outbound request behind an omission.
-    history_cv = load_history_cv(args.history) if args.history else {}
-    report = judge(pairs, history_cv, expected_entries=args.expect_entries)
+    if args.history:
+        history_series, history_cv = load_history(args.history)
+    else:
+        history_series, history_cv = {}, {}
+    models = {p["model"] for p in pairs}
+    drift = main_drift(history_series, models) if history_series else []
+    report = judge(pairs, history_cv, expected_entries=args.expect_entries, drift=drift)
     report["context"] = args.context
     report["n_pairs"] = len(pairs)
     report["history_configs"] = len(history_cv)
