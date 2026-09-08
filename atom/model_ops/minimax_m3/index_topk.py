@@ -47,10 +47,13 @@ SCORE_CHUNK_CTAS_PER_CU = 8
 # short-context rows, which is not where a step spends its time.
 SCORE_NUM_STAGES = 3
 DECODE_SCORE_NUM_STAGES = 3
-# Grid the tiled decode score aims for, and the per-request chunk ceiling that
-# keeps a large batch from multiplying into a pointless one (_decode_score_chunks).
-DECODE_SCORE_TARGET_GRID = 2048
-DECODE_SCORE_MAX_CHUNKS = 64
+# Bounds on the decode score split (_decode_score_chunks). MIN_BLOCKS is the
+# only one that binds; the other two are kept as escape hatches. A flat chunk
+# ceiling cannot work -- the best count depends on the context length, while
+# the best blocks per chunk is 2-4 across 32K/131K/315K.
+DECODE_SCORE_TARGET_GRID = 1 << 20
+DECODE_SCORE_MAX_CHUNKS = 1 << 16
+DECODE_SCORE_MIN_BLOCKS = 3
 # Physical 16-pages per logical 128-block for the page-16 SHUFFLE ASM/gluon cache
 # (must match sparse_attn.PAGES_PER_SPARSE_BLOCK). Used by the fused block-table
 # emission in the topk kernels.
@@ -412,6 +415,10 @@ def _decode_score_chunks(batch: int, max_block: int) -> int:
         # wait in the collective that follows.
         return 1
     chunks = min(1 << (target.bit_length() - 1), max_block)
+    # Floor the blocks one chunk walks. The query tile is loaded once outside
+    # the block loop, so at one block per chunk that fixed cost is the whole
+    # cost -- every measured regression was a chunk down to a single block.
+    chunks = min(chunks, max(1, triton.cdiv(max_block, DECODE_SCORE_MIN_BLOCKS)))
     return triton.cdiv(max_block, triton.cdiv(max_block, chunks))
 
 
