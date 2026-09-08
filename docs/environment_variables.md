@@ -228,7 +228,22 @@ objects once startup was done. See `atom/utils/gc_utils.py`.
 |----------|------|---------|-------------|
 | **ATOM_GC_FREEZE** | bool | 1 (true) | Move the startup heap into CPython's permanent generation once warmup is done, so collections stop scanning it. Applied in every process that outlives startup — the API server, the atomesh frontend, every EngineCore and every ModelRunner worker; undone on engine shutdown so an in-process teardown does not leak. Set `0` to keep the pre-freeze behaviour. |
 | **ATOM_GC_DEBUG** | bool | 0 (false) | Log every collection: generation, duration, objects reclaimed, objects tracked. Costly — counting the tracked set on every pass added ~90s of startup on a V4-Flash tp1 — but the only way to see these pauses, since a stall in the EngineCore idles the workers with no event in their torch trace. |
-| **ATOM_GC_THRESHOLD** | csv int | "" (= CPython default 700,10,10) | `t0,t1,t2` for `gc.set_threshold()`. Thresholds are per-interpreter, so each process reads it independently. A fallback for `ATOM_GC_FREEZE=0`: this spaces collections out, freezing removes what one costs. |
+| **ATOM_GC_THRESHOLD** | csv int | "" (see below) | `t0,t1,t2` for `gc.set_threshold()`, overriding whatever default the process picked. Thresholds are per-interpreter, so each process reads it independently. Unset, the **API server** runs at `gc_utils.FRONTEND_GC_THRESHOLD` (20000,50,50) and every other process keeps CPython's 700,10,10. The split is measured, not stylistic: at concurrency 4096 the frontend's collector ran 13,956 times in twenty minutes over a set that grew to 688,646 objects and reclaimed **zero**, while each ModelRunner worker reclaimed thousands per pass — raising it there would defer real work. A malformed value is logged and ignored, leaving the thresholds untouched rather than silently falling back. |
+
+The API server's raised default is free only while its collector keeps finding
+nothing to free, so that condition is exported rather than assumed:
+
+- **`atom:gc_collected`** (`/metrics`, per generation) is the invariant as a
+  series. Flat after startup is the expected shape; a rising line means the
+  process has started building reference cycles, and the spacing is now
+  deferring real work into a growing heap. `atom:gc_collections`,
+  `atom:gc_threshold` and `atom:gc_frozen_objects` sit beside it for context.
+  All are O(1) reads taken at scrape time.
+- **`reclaim_watch`** logs one warning — once, not per check — if that line
+  ever rises, because a counter nobody looks at is not a safeguard.
+- **`GET /debug/gc_census`** breaks the scanned set down by type, by shape and
+  by owning library. Unlike the metrics it walks every tracked object (~1s at a
+  million), so it is asked for, never scraped.
 
 ### Debug dump (`atom.utils.debug_helper`)
 

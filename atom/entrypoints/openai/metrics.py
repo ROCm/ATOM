@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import gc
 import threading
 import time
 from collections.abc import Iterable
@@ -387,6 +388,66 @@ class _AtomMetricsCollector:
         for accepted, steps in sorted(mtp.get("distribution", {}).items()):
             distribution.add_metric([str(accepted)], float(steps))
         yield distribution
+
+        yield from _gc_metrics()
+
+
+def _gc_metrics() -> Iterable[GaugeMetricFamily | CounterMetricFamily]:
+    """This process's own collector -- the frontend's, not the engine's, since
+    each interpreter keeps its own counters.
+
+    `atom:gc_collected_total` is the one to watch, and why the rest are here:
+    the API server runs on raised thresholds (`gc_utils.FRONTEND_GC_THRESHOLD`),
+    which is free only while the collector finds nothing to free. Flat after
+    startup holds the assumption; a rising line means it now builds reference
+    cycles and the spacing is deferring real work.
+
+    Every source is O(1). The number a reader wants next -- how many objects are
+    tracked -- walks the whole heap, so it lives in `/debug/gc_census`, which is
+    asked for rather than scraped.
+    """
+    stats = gc.get_stats()
+    for name, key, doc in (
+        (
+            "atom:gc_collections",
+            "collections",
+            "Collections run by this process's collector, per generation.",
+        ),
+        (
+            "atom:gc_collected",
+            "collected",
+            (
+                "Objects reclaimed by this process's collector, per generation. "
+                "Expected flat after startup; growth means the raised thresholds "
+                "are deferring real work."
+            ),
+        ),
+        (
+            "atom:gc_uncollectable",
+            "uncollectable",
+            "Objects found unreclaimable by this process's collector.",
+        ),
+    ):
+        metric = CounterMetricFamily(name, doc, labels=["generation"])
+        for generation, per_gen in enumerate(stats):
+            metric.add_metric([str(generation)], float(per_gen.get(key, 0)))
+        yield metric
+
+    threshold = GaugeMetricFamily(
+        "atom:gc_threshold",
+        "Collection threshold in effect in this process, per generation.",
+        labels=["generation"],
+    )
+    for generation, value in enumerate(gc.get_threshold()):
+        threshold.add_metric([str(generation)], float(value))
+    yield threshold
+
+    frozen = GaugeMetricFamily(
+        "atom:gc_frozen_objects",
+        "Objects in the permanent generation, which collections skip.",
+    )
+    frozen.add_metric([], float(gc.get_freeze_count()))
+    yield frozen
 
 
 class AtomMetricsExporter:

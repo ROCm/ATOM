@@ -17,7 +17,16 @@ import gc
 
 import pytest
 
-from atom.utils.gc_utils import freeze_gc_heap, unfreeze_gc_heap
+from atom.utils.gc_utils import (
+    FRONTEND_GC_THRESHOLD,
+    _owner,
+    arm_reclaim_watch,
+    freeze_gc_heap,
+    gc_census,
+    reclaim_watch,
+    tune_gc,
+    unfreeze_gc_heap,
+)
 
 
 class _Cycle:
@@ -29,11 +38,22 @@ class _Cycle:
 
 @pytest.fixture(autouse=True)
 def _leave_gc_as_found():
-    """Every test here mutates interpreter-global state."""
+    """Every test here mutates interpreter-global state.
+
+    Thresholds and the reclaim watch are restored too: they are process-wide,
+    and a test that left them raised would silently change how often the
+    collector runs for every test after it in the same process.
+    """
+    from atom.utils import gc_utils
+
     was_enabled = gc.isenabled()
+    thresholds = gc.get_threshold()
+    baseline, warned = gc_utils._reclaim_baseline, gc_utils._reclaim_warned
     yield
     gc.unfreeze()
     gc.collect()
+    gc.set_threshold(*thresholds)
+    gc_utils._reclaim_baseline, gc_utils._reclaim_warned = baseline, warned
     if was_enabled:
         gc.enable()
 
@@ -242,3 +262,280 @@ def test_the_env_gate_turns_it_off(monkeypatch):
     before = gc.get_freeze_count()
     freeze_gc_heap("test")
     assert gc.get_freeze_count() == before
+
+
+class _Counted:
+    """A type distinctive enough that the census cannot find it by accident."""
+
+
+class _HostileDict(dict):
+    """A dict subclass whose iteration raises, standing in for any mapping
+    that computes its keys. The census walks whatever the process allocated,
+    so it meets these; it must not run their code to describe them."""
+
+    def __iter__(self):
+        raise AssertionError("the census iterated a subclass it should skip")
+
+
+def test_the_census_counts_by_type():
+    """The whole point is naming the type that dominates, so a census that
+    reported only totals -- which the generation sizes already give -- would
+    pass a shape-only assertion."""
+    held = [_Counted() for _ in range(37)]
+    gc.collect()  # promote to gen 2, which is what the census reads
+
+    # Untruncated: `top` is a display bound, and in a full test run this
+    # process holds thousands of distinct types, so a ranked slice drops a
+    # 37-instance one and the assertion below fails for a reason that has
+    # nothing to do with counting.
+    counts = {r["type"]: r["count"] for r in gc_census(top=10**6)["by_type"]}
+
+    assert counts.get("_Counted", 0) >= 37
+    assert len(held) == 37
+
+
+def test_a_dict_is_named_by_its_keys_and_ranked_by_how_many():
+    """`300k dicts` is not an answer. Keys are what turn the count into one,
+    and the ranking is what keeps the answer from being whichever dict the
+    walk reached first.
+
+    Two shapes of our own, compared against each other: ranking is relative,
+    and an interpreter running a test suite holds tens of thousands of dicts
+    of its own, so an absolute "mine is first" assertion would be testing the
+    process rather than the census."""
+    many = [{"request_id": i, "token_ids": [i], "text": ""} for i in range(400)]
+    # A container value in this one too, or the collector untracks it and the
+    # census correctly never sees it -- see `gc_census` on what "tracked" omits.
+    few = [{"request_id": i, "unusual_key": [i]} for i in range(120)]
+    gc.collect()
+
+    shapes = gc_census(top=200, samples=500)["shapes"]["dict"]
+    ranked = [s for s in shapes if "request_id" in s]
+
+    assert [s.rsplit(" x", 1)[1] for s in ranked] == ["400", "120"]
+    assert "token_ids" in ranked[0] and "unusual_key" in ranked[1]
+    assert len(many) == 400 and len(few) == 120
+
+
+def test_the_census_does_not_run_the_code_it_measures():
+    """Fingerprinting is exact-type-only for this reason. A subclass may
+    compute its keys, and a debug endpoint that trips over one is a debug
+    endpoint you cannot call on the process you need it for."""
+    held = [_HostileDict(a=1) for _ in range(4)]
+    gc.collect()
+
+    census = gc_census(top=200)  # must not raise
+
+    assert "_HostileDict" not in census["shapes"]
+    assert len(held) == 4
+
+
+def test_a_caller_that_can_say_why_gets_a_default(monkeypatch):
+    """The API server's collector reclaims nothing at a serving concurrency
+    while the engine's and the workers' reclaim thousands, so the default is
+    per-caller and not per-interpreter-wide."""
+    from atom.utils import envs
+
+    monkeypatch.setattr(envs, "ATOM_GC_THRESHOLD", "")
+    gc.set_threshold(700, 10, 10)
+
+    tune_gc(FRONTEND_GC_THRESHOLD)
+
+    assert gc.get_threshold() == FRONTEND_GC_THRESHOLD
+
+
+def test_a_caller_with_no_reason_changes_nothing(monkeypatch):
+    """The engine and the workers pass nothing and must come out exactly as
+    they went in -- this is the whole reason the default is an argument."""
+    from atom.utils import envs
+
+    monkeypatch.setattr(envs, "ATOM_GC_THRESHOLD", "")
+    gc.set_threshold(700, 10, 10)
+
+    tune_gc()
+
+    assert gc.get_threshold() == (700, 10, 10)
+
+
+def test_the_env_still_overrides_the_default(monkeypatch):
+    """The escape hatch has to outrank the default, or a bad default cannot be
+    pinned in production without a redeploy."""
+    from atom.utils import envs
+
+    monkeypatch.setattr(envs, "ATOM_GC_THRESHOLD", "123,4,5")
+    gc.set_threshold(700, 10, 10)
+
+    tune_gc(FRONTEND_GC_THRESHOLD)
+
+    assert gc.get_threshold() == (123, 4, 5)
+
+
+def test_a_malformed_env_leaves_the_thresholds_alone(monkeypatch):
+    """Not "fall back to the default": a typo in an override is a mistake to
+    surface, and silently running someone else's numbers would present as an
+    unexplained performance change."""
+    from atom.utils import envs
+
+    monkeypatch.setattr(envs, "ATOM_GC_THRESHOLD", "20000,fifty,50")
+    gc.set_threshold(700, 10, 10)
+
+    tune_gc(FRONTEND_GC_THRESHOLD)
+
+    assert gc.get_threshold() == (700, 10, 10)
+
+
+def test_the_watch_is_quiet_while_nothing_is_reclaimed():
+    """The expected steady state, and the condition the raised thresholds
+    assume."""
+    gc.collect()
+    arm_reclaim_watch()
+
+    assert reclaim_watch("test") == 0
+
+
+def test_the_watch_notices_a_cycle_being_reclaimed():
+    """The positive control. Without it the test above passes against a watch
+    that returns zero unconditionally -- which is exactly what a watch whose
+    baseline was armed at the wrong moment would do."""
+    gc.collect()
+    arm_reclaim_watch()
+    _Cycle()  # unreachable by refcount; only the collector frees it
+    gc.collect()
+
+    assert reclaim_watch("test") > 0
+
+
+def test_the_watch_warns_once():
+    """At four thousand streams a per-check line would bury the log. The
+    counter in /metrics is the continuous signal; the warning only has to make
+    someone look at it."""
+    gc.collect()
+    arm_reclaim_watch()
+    _Cycle()
+    gc.collect()
+
+    first = reclaim_watch("test")
+    from atom.utils import gc_utils
+
+    warned_after_first = gc_utils._reclaim_warned
+    second = reclaim_watch("test")
+
+    assert first > 0 and second > 0  # still reports, just does not re-warn
+    assert warned_after_first is True
+
+
+def test_an_unarmed_watch_reports_nothing_rather_than_guessing():
+    """Before the baseline exists the counters carry startup's own collections
+    -- 18,826 objects in one measured run -- and reporting those would fire the
+    warning on every process at boot."""
+    from atom.utils import gc_utils
+
+    gc_utils._reclaim_baseline = None
+
+    assert reclaim_watch("test") == 0
+
+
+def _fn_from(path: str):
+    """A function whose code claims to come from `path`, to test attribution
+    without importing the library it names."""
+    import types
+
+    return types.FunctionType(compile("x = 1", path, "exec"), {})
+
+
+def test_objects_are_attributed_to_the_library_that_built_them():
+    """The type table says "22.8 coroutines per stream"; the question it does
+    not answer is whose they are, which is the one that decides whether the
+    count can be reduced at all."""
+    assert _owner(_fn_from("/x/site-packages/fastapi/routing.py")) == "fastapi"
+    assert _owner(_fn_from("/x/site-packages/starlette/responses.py")) == "starlette"
+    assert _owner(_fn_from("/app/ATOM/atom/entrypoints/openai/api_server.py")) == "atom"
+    # Longest-match ordering: a starlette path must not fall into a shorter one.
+    assert _owner(_fn_from("/x/site-packages/uvicorn/protocols/http/h11_impl.py")) == (
+        "uvicorn"
+    )
+    # Instances are attributed by their class's module, not by any code object.
+    assert _owner(gc.callbacks) == "unattributable"  # a plain list
+    assert _owner(_Counted()).startswith(("module:", "stdlib"))
+
+
+def test_a_module_prefix_does_not_swallow_a_longer_name():
+    """`atom` must not claim `atomic_whatever`. Matching on the root package
+    and not `startswith` is the difference, and nothing in this repo's own
+    imports would have shown it."""
+
+    class _Impostor:
+        pass
+
+    _Impostor.__module__ = "atomicwrites.core"
+
+    assert _owner(_Impostor()) == "module:atomicwrites"
+
+
+def test_a_container_is_reported_as_unattributable_rather_than_guessed():
+    """A tuple of two cells belongs to whoever built the closure, and that is
+    not recoverable from the tuple. Guessing would make the breakdown read as
+    precision it does not have."""
+    for obj in ({}, [], (), set(), frozenset()):
+        assert _owner(obj) == "unattributable"
+
+
+def test_attribution_does_not_touch_the_object_it_attributes():
+    """`getattr(obj, "__code__", None)` looks harmless and is not: it runs the
+    object's `__getattr__` and its descriptors, so a census would execute the
+    code it is measuring. A torch module's deprecation shim firing a warning
+    from inside this probe is how it was found, so the guard is a dispatch on
+    `type(obj)` and this pins it."""
+    touched = []
+
+    class _Watched:
+        def __getattr__(self, name):
+            touched.append(name)
+            raise AttributeError(name)
+
+    who = _owner(_Watched())
+
+    assert touched == [], f"attribution read {touched} off the object"
+    assert who != "error"
+
+
+def test_one_hostile_object_does_not_take_down_the_census():
+    """Whatever the process allocated ends up here, including objects whose
+    class attributes raise. It is the diagnostic path; it must not be the
+    reason a debug call fails."""
+
+    class _Meta(type):
+        @property
+        def __module__(cls):
+            raise RuntimeError("nope")
+
+    class _Hostile(metaclass=_Meta):
+        pass
+
+    assert _owner(_Hostile()) == "error"
+
+
+def test_the_owner_breakdown_accounts_for_every_object():
+    """Sums to the generation size. A breakdown that silently dropped a third
+    of the set would still look like a clean answer, and the whole point of it
+    is deciding what fraction is reducible."""
+    held = [_Counted() for _ in range(50)]
+    gc.collect()
+
+    census = gc_census(top=5, samples=1)
+    total = sum(row["count"] for row in census["by_owner"])
+
+    assert total == census["generations"]["2"]
+    assert len(held) == 50
+
+
+def test_the_free_counters_ride_along():
+    """`collected` is the number that says whether raising thresholds defers
+    real work, and it costs nothing -- a caller that walked every object to
+    learn it would be paying a second time."""
+    census = gc_census(top=1)
+
+    assert len(census["stats"]) == 3
+    assert all("collected" in s for s in census["stats"])
+    assert set(census["generations"]) == {"0", "1", "2"}
+    assert len(census["thresholds"]) == 3
