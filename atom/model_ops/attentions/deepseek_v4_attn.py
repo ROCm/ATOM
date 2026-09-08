@@ -3689,17 +3689,28 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         arithmetic it used before, rather than a widened path that happens to
         reduce to it.
         """
-        self._forward_has_images = False
-        if self.vision_max_n_token == 0:
+        # `batch.multimodal_data` is the authoritative, stateless statement that
+        # this batch carries images (the scheduler fills it per request). Derive
+        # from it rather than sniffing token ids, so the fact does not depend on
+        # this method having run -- the ubatch-splitting guard reads the same
+        # flag and used to disarm whenever an early return skipped the write.
+        self._forward_has_images = bool(getattr(batch, "multimodal_data", None))
+        if self.vision_max_n_token == 0 or not self._forward_has_images:
             return None
         tokens = getattr(batch, "scheduled_tokens", None)
         if tokens is None or tokens.shape[0] < total_tokens:
-            return None
+            # Fail loudly: the batch says it has images, so returning None here
+            # would build plain causal windows for an image block and the model
+            # would answer fluently off a partly-visible picture.
+            raise AssertionError(
+                "batch carries multimodal_data but scheduled_tokens is "
+                f"{'missing' if tokens is None else 'too short'} "
+                f"(need {total_tokens}); cannot build in-image visibility."
+            )
         tokens = tokens[:total_tokens]
         # Image sentinel ids are the only ones at or above the vocabulary.
         if int(tokens.max(initial=0)) < self.vocab_size:
             return None
-        self._forward_has_images = True
 
         from atom.models.deepseek_v4_vl import image_visible_spans
 
@@ -3735,7 +3746,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
           - extend region (shared): in-chunk SWA tail from per-fwd `kv`
             tensor. One buffer.
 
-        Per-token length formulas:
+        Per-token length formulas (text, i.e. `image_visibility is None`; a
+        vision prefill widens the extend span in BOTH directions instead --
+        see `image_aware_extend_window`):
           extend_count[t]      = min(token_pos_in_chunk[t] + 1, win)
           prefix_swa_count[t]  = max(0, chunk_start[bid] - max(0, p_global - win + 1))
           prefix_swa_count[t] + extend_count[t] = min(p_global + 1, win)
@@ -3816,7 +3829,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             )
 
             img_left, img_right = image_visibility
-            if chunk_start_pt.any():
+            # Scope the check to tokens INSIDE an image span. `chunk_start_pt`
+            # spans every sequence in the batch, so a plain `.any()` also fired
+            # on a co-scheduled text prefill continuing its own chunk -- legal,
+            # and nothing to do with the image request it blamed. Spans are at
+            # least [START, END], so every in-span token has a nonzero side.
+            in_image = (img_left > 0) | (img_right > 0)
+            if chunk_start_pt[in_image].any():
                 raise AssertionError(
                     "a multimodal prefill reached the attention builder with "
                     "chunk_start > 0, i.e. it was chunked. In-image attention "

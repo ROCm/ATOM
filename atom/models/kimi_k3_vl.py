@@ -503,12 +503,6 @@ def build_vision_modules(vision_config) -> tuple[nn.Module, nn.Module]:
 # reference model expands while merging embeddings. This normalizes all three.
 
 
-def _as_pair(value) -> tuple[int, int]:
-    if isinstance(value, int):
-        return (value, value)
-    return (int(value[0]), int(value[1]))
-
-
 def kimi_k3_tokens_per_image(grid_thws, merge_kernel_size) -> list[int]:
     """Image-token count per grid after the ``sd2_tpool`` merge.
 

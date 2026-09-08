@@ -34,7 +34,7 @@ to its text path.
 
 **No HF processor.** The checkpoint ships no `preprocessor_config.json` and no
 chat template. Image preprocessing is ported into
-`atom/model_engine/deepseek_v4_mm.py`, and the prompt template is loaded at
+`atom/models/deepseek_v4_vl.py`, and the prompt template is loaded at
 runtime from the checkpoint's own `encoding/encoding_dsv4.py` — versioned with
 the weights, so it cannot drift the way a vendored copy would. That executes
 code from the model directory, the same trust boundary
@@ -47,7 +47,7 @@ routing kernel treats `>= vocab_size` as the image predicate.
 
 **Two router biases.** Every layer carries `gate.bias_vl` alongside `gate.bias`,
 selected per token. `FusedMoE.select_experts` takes a single `[E]` bias, so
-vision checkpoints route through `atom/model_ops/triton_vl_topk.py` on every
+vision checkpoints route through `atom/model_ops/triton_mm_topk.py` on every
 layer via the `custom_routing_function` hook.
 
 **Bidirectional attention inside an image.** Tokens within an
@@ -60,9 +60,10 @@ compressed (CSA/HCA) paths stay causal, matching the reference.
 **Multimodal prefills are never chunked.** The vision embeddings are produced
 for the whole prompt and scattered onto its placeholder positions, and in-image
 attention reads across the whole block. The scheduler takes such a prompt whole
-or waits; `_finalize_prefill_chunk(atomic=True)` also suppresses the checkpoint
-cut, which means **no state checkpoint is kept for a multimodal request** — the
-cost is prefix-cache reuse on image prompts, which are single-shot anyway.
+or waits; `_finalize_prefill_chunk` also skips the state-checkpoint rung cut
+for a sequence carrying `multimodal_data` (#2110), which means **no state
+checkpoint is kept for a multimodal request** — the cost is prefix-cache reuse
+on image prompts, which are single-shot anyway.
 `max_num_batched_tokens` therefore caps multimodal prompt length even with
 chunked prefill enabled.
 
@@ -91,18 +92,15 @@ only during prefill.
   too and the draft path has no sentinel handling yet. Raises at startup rather
   than routing images with the text bias; run without `--method`.
 - **Chunked multimodal prefill** — see above.
-- **Images behind a KV connector (PD disaggregation).** A request parked for a
-  remote KV load still carries its `multimodal_data`, and the resume path's
-  `_finalize_prefill_chunk` call does not pass `atomic`, so the checkpoint cut
-  could split its image block — silently, the same way the main path did before
-  it was fixed. Left alone deliberately: that path cannot be exercised here, and
-  changing behaviour on an untestable path is worse than recording the gap.
+- **Images behind a KV connector (PD disaggregation).** Untested here; the
+  resume path is not exercisable on this machine, so the interaction between a
+  parked `multimodal_data` request and its resumed prefill is unverified.
 - **TBO prefill micro-batching** with images — a token-split ubatch would cut an
   image span in half. Raises; start without `--enable-tbo`.
-- **Images at TP > 1 are unverified.** The language stack is exercised at `tp=8`
-  (GSM8K below), but every image request so far has run at `tp=1`. The tower is
-  replicated per rank like Kimi-K3's, so nothing in the design is TP-specific —
-  it simply has not been run.
+- **Images at TP > 1 are lightly covered.** The ChartQA and ZeroBench runs below
+  were served at `tp=8`; the interactive/offline checks were `tp=1`. The tower is
+  replicated per rank like Kimi-K3's, so nothing in the design is TP-specific,
+  but no test pins per-rank image-embedding equality.
 
 ## Accuracy
 
@@ -164,11 +162,11 @@ public benchmark — do not compare it to the card's Chartography row.
 ## Tests
 
 ```bash
-python -m pytest tests/test_deepseek_v4_vl.py          # CPU, vs the reference impl
+python -m pytest tests/test_deepseek_v4_vl_cpu.py          # CPU, vs the reference impl
 python -m pytest tests/test_prefill_indices_paged.py   # needs a GPU
 ```
 
-`tests/test_deepseek_v4_vl.py` compares against the reference implementation
+`tests/test_deepseek_v4_vl_cpu.py` compares against the reference implementation
 shipped inside the checkpoint (`inference/vision.py`,
 `inference/image_processor.py`, `encoding/encoding_dsv4.py`) rather than against
 hand-written expectations, and skips when the checkpoint is not present.

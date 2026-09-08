@@ -14,12 +14,13 @@ Two model-specific hooks live here:
   deviate register a builder below.
 """
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
 
 from atom.config import Config
+from atom.multimodal.protocol import MultiModalInputBuilder
 from atom.utils import resolve_obj_by_qualname
 
 _MULTIMODAL_ARCH_TO_MODEL: dict[str, str] = {
@@ -84,7 +85,7 @@ def build_multimodal_inputs(
     if builder_qualname is None:
         return None
 
-    builder: Callable = resolve_obj_by_qualname(builder_qualname)
+    builder: MultiModalInputBuilder = resolve_obj_by_qualname(builder_qualname)
     return builder(
         atom_config,
         processor,

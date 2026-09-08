@@ -76,7 +76,7 @@ The tower is replicated on every TP rank rather than sharded, costing ~0.9 GB bf
 
 ### How images reach the model
 
-Kimi-K3's processor differs from the Qwen convention in two ways that ATOM handles in `atom/model_engine/multimodal.py`:
+Kimi-K3's processor differs from the Qwen convention in two ways that ATOM handles in `atom/models/kimi_k3_vl.py`:
 
 - it takes `messages` plus a separate `medias` list (chat rendering is Python, not Jinja) and returns `grid_thws` rather than `image_grid_thw`;
 - it emits **one** `<|media_pad|>` token per image, leaving the expansion to the model. ATOM expands it to `(h // 2) * (w // 2)` tokens up front so the scheduler, KV blocks and positions all see the real prompt length.

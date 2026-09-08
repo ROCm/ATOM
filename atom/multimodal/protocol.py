@@ -9,7 +9,6 @@ model whose processor deviates registers a builder in
 :mod:`atom.multimodal.registry` instead; this is the shape that builder has.
 """
 
-from collections.abc import Sequence
 from typing import Any, Protocol
 
 from atom.config import Config
@@ -35,7 +34,7 @@ class MultiModalInputBuilder(Protocol):
         atom_config: Config,
         processor: Any,
         messages: list[dict],
-        images: Sequence[Any],
+        images: list,
         chat_template_kwargs: dict,
         tools: Any = None,
     ) -> tuple[list[int], dict] | None: ...

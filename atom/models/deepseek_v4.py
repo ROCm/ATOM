@@ -4980,10 +4980,19 @@ class DeepseekV4ForCausalLM(nn.Module):
         # and is then overwritten with the aligner output, exactly as the
         # reference `merge_image_embeddings` does.
         dim = self.args.dim
-        self.image_start = nn.Parameter(torch.empty(dim))
-        self.image_pad = nn.Parameter(torch.empty(dim))
-        self.image_newline = nn.Parameter(torch.empty(dim))
-        self.image_end = nn.Parameter(torch.empty(dim))
+        # `atom_parameter` (not bare `nn.Parameter`) is the single control that
+        # forces requires_grad off under ATOM_REQUIRES_GRAD, and the dtype is
+        # pinned rather than left to `torch.get_default_dtype()`. NaN-filled,
+        # not `empty`: if a checkpoint lacks these tensors the loader only logs
+        # a warning, and uninitialized memory would render as fluent text --
+        # NaN propagates into the logits instead, which is visible.
+        dtype = config.torch_dtype
+        for name in ("image_start", "image_pad", "image_newline", "image_end"):
+            setattr(
+                self,
+                name,
+                atom_parameter(torch.full((dim,), float("nan"), dtype=dtype)),
+            )
 
     # -- ATOM multimodal contract -------------------------------------------
 
@@ -5047,7 +5056,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         is_sentinel = offsets >= 0
         inputs_embeds = torch.where(
             is_sentinel.unsqueeze(-1),
-            sentinels[offsets.clamp(min=0)],
+            sentinels[offsets.clamp(0, sentinels.shape[0] - 1)],
             inputs_embeds,
         )
 
@@ -5077,8 +5086,16 @@ class DeepseekV4ForCausalLM(nn.Module):
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # Keep the compiled language model on the inputs_embeds path so vision
-        # embeddings are not dropped after text-only CUDAGraph capture.
+        # ALWAYS pass a tensor when this checkpoint has a vision tower: Dynamo
+        # specializes on None-ness, so mixing None (decode) and a tensor
+        # (prefill) compiles two graphs and the captured one then reads the
+        # wrong branch -- measured as `AttributeError: 'NoneType' has no
+        # attribute 'size'` inside the compiled region.
+        #
+        # KNOWN COST, not fixed here: this allocates a fresh `[N, dim]` on every
+        # decode step, outside the CUDAGraph. Making it conditional is what the
+        # paragraph above rules out; the real fix is a persistent buffer, which
+        # is not attempted in this change.
         if self.has_vision and inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
         return DeepseekV4ForCausalLM._forward_impl(
@@ -5086,9 +5103,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         )
 
 
-# Sentinel type code for a pixel-bearing image slot (`IMAGE` in
-# `deepseek_v4_mm`). Duplicated as a literal rather than imported at module
-# scope: `deepseek_v4_mm` pulls in PIL and the engine Config, and this file is
-# imported by weight-loading tests that must stay light. Kept in sync by
-# `tests/test_deepseek_v4_vl.py::test_image_sentinel_code_agrees`.
+# Sentinel type code for a pixel-bearing image slot -- `IMAGE` in
+# `atom.models.deepseek_v4_vl`. Duplicated as a literal rather than imported at
+# module scope so this file stays importable by the light weight-loading tests.
+# `tests/test_deepseek_v4_vl_cpu.py::test_image_sentinel_code_agrees` pins the
+# two together.
 _IMAGE_SENTINEL = 2

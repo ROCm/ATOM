@@ -33,15 +33,17 @@ import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image, ImageOps
 from torch import nn
 
 from atom.config import Config
+
+if TYPE_CHECKING:
+    from PIL import Image
 
 
 @dataclass(frozen=True)
@@ -409,7 +411,7 @@ IMAGE_PLACEHOLDER = "<｜deepseek_image｜>"
 # Prompt encoding: loaded from the checkpoint, not vendored
 # ---------------------------------------------------------------------------
 
-_encoding_module = None
+_encoding_modules: dict[str, object] = {}
 _encoding_lock = threading.Lock()
 
 
@@ -425,13 +427,20 @@ def load_checkpoint_encoding(model_path: str):
     This executes code from the model directory, the same trust boundary
     ``AutoProcessor(trust_remote_code=True)`` already crosses for Kimi-K3.
     """
-    global _encoding_module
     with _encoding_lock:
-        if _encoding_module is not None:
-            return _encoding_module
+        # Keyed on `model_path`: a process that touches two V4 vision
+        # checkpoints (an eval harness comparing revisions, a heterogeneous
+        # disagg/PP setup) must not serve the first checkpoint's roles,
+        # thinking modes and tool rendering against the second's weights --
+        # that is the stale-template regression this function exists to
+        # prevent, just moved from disk into memory.
+        cached = _encoding_modules.get(model_path)
+        if cached is not None:
+            return cached
 
         path = f"{model_path}/encoding/encoding_dsv4.py"
-        spec = importlib.util.spec_from_file_location("atom_dsv4_encoding", path)
+        mod_name = f"atom_dsv4_encoding_{abs(hash(model_path)):x}"
+        spec = importlib.util.spec_from_file_location(mod_name, path)
         if spec is None or spec.loader is None:
             raise FileNotFoundError(
                 f"DeepSeek-V4 vision needs the checkpoint's prompt encoder at "
@@ -442,10 +451,10 @@ def load_checkpoint_encoding(model_path: str):
         module = importlib.util.module_from_spec(spec)
         # encoding_dsv4 is self-contained (stdlib only), but register it so a
         # traceback inside it resolves its source lines.
-        sys.modules["atom_dsv4_encoding"] = module
+        sys.modules[mod_name] = module
         spec.loader.exec_module(module)
         logger.info(f"Loaded DeepSeek-V4 prompt encoder from {path}")
-        _encoding_module = module
+        _encoding_modules[model_path] = module
         return module
 
 
@@ -532,8 +541,22 @@ def safe_resize(
     n_llm_h, n_llm_w, num_tokens = grid_tokens(
         best_height, best_width, patch_size, downsample_ratio
     )
+    # The walk needs a floor. `solve_resize_ratio` evaluates
+    # `sqrt((budget - 2) / r + 0.25)`, so a budget below 2 drives the radicand
+    # negative and raises `math domain error` -- and `r` is the aspect ratio of
+    # a caller-supplied image, i.e. request-controlled. `grid_tokens` is not
+    # monotonic in the budget, so non-convergence is a real case rather than a
+    # theoretical one; stop at the smallest budget that still admits a grid.
+    _MIN_BUDGET = 3
     budget = max_n_token
     while num_tokens > max_n_token:
+        if budget < _MIN_BUDGET:
+            raise ValueError(
+                f"cannot fit a {height}x{width} image into {max_n_token} "
+                f"language tokens: the grid solver stopped converging at "
+                f"{num_tokens} tokens. The aspect ratio is too extreme for "
+                f"this checkpoint's token budget."
+            )
         n_llm_h, n_llm_w, best_height, best_width, num_tokens = solve_resize_ratio(
             height, width, patch_size, downsample_ratio, budget
         )
@@ -595,6 +618,13 @@ def preprocess_image(
     "tidying" it changes which images get letterboxed and silently shifts
     outputs away from the reference.
     """
+    # Pillow is not a declared base dependency (pyproject lists it only under
+    # the diffusion extra), and this module is imported by the model
+    # constructor and by the attention builder on every prefill -- a
+    # module-scope PIL import would make a base install fail to build a V4
+    # vision model with an ImportError instead of a named error.
+    from PIL import ImageOps
+
     p = cfg.patch_size
     image = image.convert("RGB")
     width, height = image.size
@@ -734,10 +764,21 @@ def _resolve_thinking(chat_template_kwargs: dict) -> tuple[str, str | None]:
     mode = chat_template_kwargs.get("thinking_mode")
     if mode is None:
         enable = chat_template_kwargs.get("enable_thinking")
-        mode = "thinking" if enable else "chat"
+        # Default ON, matching the text path for this same model: the server
+        # builds its adapter with `defaults={"thinking_mode": "thinking"}`
+        # (chat_encoders.py) and only writes `thinking_mode` when the request
+        # says something about it. Defaulting to "chat" here gave one server
+        # thinking-on for text and thinking-off for images.
+        mode = "chat" if enable is False else "thinking"
     if mode not in ("chat", "thinking"):
         raise ValueError(f"thinking_mode must be 'chat' or 'thinking', got {mode!r}")
-    return mode, chat_template_kwargs.get("reasoning_effort")
+    # The server writes `thinking_effort` (api_server.py); `reasoning_effort` is
+    # what a client passing raw `chat_template_kwargs` would use. Read both, or
+    # the effort is silently dropped on every image request served over HTTP.
+    effort = chat_template_kwargs.get("thinking_effort")
+    if effort is None:
+        effort = chat_template_kwargs.get("reasoning_effort")
+    return mode, effort
 
 
 def _messages_for_encoder(messages: list[dict]) -> list[dict]:

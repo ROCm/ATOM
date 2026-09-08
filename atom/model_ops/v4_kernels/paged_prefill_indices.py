@@ -348,6 +348,23 @@ def write_v4_paged_prefill_indices(
     assert chunk_start_per_seq.dim() == 1
     assert cu_seqlens_q_per_seq.dim() == 1
     assert state_slot_per_seq.dim() == 1
+    # The kernel does unmasked `tl.load(extend_start_ptr + t)` for t in [0, T).
+    # An int64 array -- numpy's default, and `image_aware_extend_window` only
+    # casts on its final line -- would make every load read half of two adjacent
+    # elements; a short array reads past the allocation. Either way the row
+    # indices come out non-negative, pass `CHECK_NEG_ONE_SENTINEL`, and index
+    # arbitrary rows of the per-forward kv tensor: fluent wrong output, no fault.
+    if extend_start is not None:
+        assert extend_count is not None, "extend_start and extend_count are a pair"
+        for name, t in (("extend_start", extend_start), ("extend_count", extend_count)):
+            assert t.dim() == 1 and t.shape[0] >= T, (
+                f"{name} must be 1-D with at least T={T} elements, got "
+                f"shape {tuple(t.shape)}"
+            )
+            assert t.dtype == torch.int32, (
+                f"{name} must be int32 (the kernel loads 4-byte elements), "
+                f"got {t.dtype}"
+            )
     assert block_tables.dim() == 2
     for idp in (extend_indptr, prefix_swa_indptr, prefix_csa_indptr, prefix_hca_indptr):
         assert idp.dim() == 1 and idp.shape[0] >= T + 1

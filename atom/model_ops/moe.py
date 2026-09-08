@@ -1442,6 +1442,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         prefix: str = "",
     ) -> torch.Tensor:
         if self.use_triton_decode and not get_forward_context().context.is_prefill:
+            if custom_routing_function is not None:
+                # Same gap as the prefill Triton path below: `routing()` is
+                # called instead of the hook, so a model's custom routing is
+                # silently replaced by plain bias-corrected top-k.
+                raise NotImplementedError(
+                    "the Triton MoE decode path does not support "
+                    "custom_routing_function (it never calls it). Disable it "
+                    "with ATOM_USE_TRITON_MOE_DECODE=0 for this model."
+                )
             # Triton decode is GGUU-only; GUGU uses the FlyDSL path.
             from aiter.ops.triton.moe.moe_routing.routing import routing
 
@@ -1490,6 +1499,20 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 triton_kernel_fused_experts,
                 triton_kernel_moe_forward,
             )
+
+            if custom_routing_function is not None:
+                # This path calls aiter's `routing()` below and never invokes
+                # the callable, so a model that installed a routing hook would
+                # be silently routed by `e_score_correction_bias` alone --
+                # DeepSeek-V4 vision loses `bias_vl` on image tokens and
+                # `tid2eid` on the hash layers, with fluent wrong output. The
+                # Triton MoE path is on by default on gfx94x, so this cannot be
+                # left to an env-var check at startup.
+                raise NotImplementedError(
+                    "the Triton MoE path does not support "
+                    "custom_routing_function (it never calls it). Disable it "
+                    "with ATOM_USE_TRITON_MOE=0 for this model."
+                )
 
             # Check if the model needs custom routing that triton routing()
             # does not support (grouped topk, sigmoid scoring, bias correction).

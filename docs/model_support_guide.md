@@ -154,7 +154,7 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 - **KDA Recurrent State:** The KDA layers keep per-request recurrent state in the generic per-request slot pool, like Qwen3-Next's Gated DeltaNet.
 - **MoE:** MXFP4 latent MoE (`KimiSparseMoeBlock`) with SiTU activation and optional dual-stream shared/routed overlap (`ATOM_K3_SHARED_EXPERT_OVERLAP`).
 - **Vision:** `atom/models/kimi_k3_vl.py` implements MoonViT3d — patch embed with a bilinearly resampled learnable position grid, 27 blocks with packed `wqkv` and complex 2D RoPE over non-causal varlen attention, then an `sd2_tpool` 2x2 merge and a `patchmergerv2` projector into the 7168-wide text space. Replicated per TP rank (~0.9 GB bf16), built only on the first pipeline rank.
-- **Image tokens:** The HF processor emits one `<|media_pad|>` per image and expands it inside the model. ATOM instead expands it during input processing (`atom/model_engine/multimodal.py`) so the scheduler, KV blocks and positions see the true prompt length. Multimodal prefills are consequently never chunked.
+- **Image tokens:** The HF processor emits one `<|media_pad|>` per image and expands it inside the model. ATOM instead expands it during input processing (`atom/multimodal/`) so the scheduler, KV blocks and positions see the true prompt length. Multimodal prefills are consequently never chunked.
 
 ### Qwen3.5 MTP (`Qwen3_5MTP`)
 
