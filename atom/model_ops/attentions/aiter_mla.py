@@ -1002,6 +1002,21 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             var["context_lens"].gpu[:running_bs] if update_context_lens else None
         )
 
+        # A padded row's `kv_indptr` entry is a range from whatever batch last
+        # occupied it, and `_enter_decode_metadata` rebases only the real rows,
+        # so the tail no longer continues them. Once the real rows total more
+        # tokens than that stale value the array runs BACKWARDS and the pad row
+        # comes out with a NEGATIVE length -- which the kernel below turns into
+        # a negative sparse count, and sparse decode into a wild kv_start/kv_end
+        # that faults. A long request landing on a bucket a shorter batch left
+        # behind is enough. Close the tail the way a draft PREFILL's widened
+        # rows already are (`_pad_prefill_mla_draft_tail`) -- repeat the last
+        # real end. This has to precede the kernel, which reads the diffs; the
+        # `+= cu_seqlens_q` it applies then leaves each pad row holding the same
+        # single token it leaves every real one.
+        if running_bs > bs:
+            kv_indptr[bs + 1 : running_bs + 1] = kv_indptr[bs]
+
         mtp_prepare_decode_mla_kernel[(1,)](
             kv_indptr,
             cu_seqlens_q,
