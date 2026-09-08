@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 import pytest
 
@@ -794,13 +795,11 @@ def test_disabling_reaches_streams_already_in_flight():
     inflight.update(list(b"xy"), False)
 
     streaming_dispatch._DELTA_REUSE.enabled = False
-    tokenizer_calls_before = None
     counting = _CountingTokenizer()
     inflight.tokenizer = counting
     counting.calls = 0
     inflight.update(list(b"z"), True)
 
-    assert tokenizer_calls_before is None
     assert counting.calls == 2, "still trusting the delta after reuse was off"
 
 
@@ -818,3 +817,79 @@ def test_an_empty_update_does_not_disturb_the_stream():
     assert state.update([], False) == ""
     assert state.last_delta == carried
     assert state.update(list(b"cd"), True) == "cd"
+
+
+@pytest.mark.parametrize("spelling", ["off", "OFF", "Off", " off ", "  OfF"])
+def test_the_kill_switch_is_not_case_sensitive(spelling):
+    """Whoever sets this has just read the mismatch ERROR. A spelling that
+    silently means `auto` hands them back the behaviour they were disabling,
+    and `_Utf8ByteTokenizer` passes the probe, so `auto` here means on."""
+    assert enable_delta_reuse(_Utf8ByteTokenizer(), spelling) is False
+    assert streaming_dispatch._DELTA_REUSE.enabled is False
+
+
+@pytest.mark.parametrize("spelling", ["0", "false", "no", "disabled", "", "atuo"])
+def test_an_unreadable_mode_leaves_reuse_off(spelling, caplog):
+    """`auto` is the wrong fallback for a value nobody can parse: every
+    plausible misspelling here is someone reaching for off, and the tokenizer
+    that would then be trusted was never the thing in doubt."""
+    with caplog.at_level(logging.WARNING):
+        assert enable_delta_reuse(_Utf8ByteTokenizer(), spelling) is False
+    assert "unknown delta reuse mode" in caplog.text
+
+
+@pytest.mark.parametrize("spelling", ["on", "ON", " On "])
+def test_the_mode_still_pins_reuse_on(spelling):
+    """The negative control for the two above: normalising must not have made
+    every value mean off."""
+    assert enable_delta_reuse(_Utf8ByteTokenizer(), spelling) is True
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("", streaming_dispatch.DEFAULT_AUDIT_EVERY),
+        (None, streaming_dispatch.DEFAULT_AUDIT_EVERY),
+        ("abc", streaming_dispatch.DEFAULT_AUDIT_EVERY),
+        ("1_000ms", streaming_dispatch.DEFAULT_AUDIT_EVERY),
+        ("0", streaming_dispatch.DEFAULT_AUDIT_EVERY),
+        ("-5", streaming_dispatch.DEFAULT_AUDIT_EVERY),
+        ("7", 7),
+        (250, 250),
+    ],
+)
+def test_an_unusable_audit_interval_falls_back_instead_of_raising(value, expected):
+    """This is read as an argument at a callsite that has already loaded the
+    weights onto eight GPUs, so a typo in an optional tuning knob must not be
+    what ends the process -- and `0`, which reads like "never audit", would
+    divide by zero."""
+    assert enable_delta_reuse(_Utf8ByteTokenizer(), "on", value) is True
+    assert streaming_dispatch._DELTA_REUSE.audit_every == expected
+
+
+@pytest.mark.parametrize("value", ["abc", "1_000ms", "", "0", "-5"])
+def test_the_audit_interval_env_survives_a_typo(value, monkeypatch):
+    """The raise this guards against is in `envs`, one frame above
+    `enable_delta_reuse`, where its own try/except cannot reach it. Its sibling
+    `ATOM_GC_THRESHOLD` is text for the same reason."""
+    from atom.utils import envs
+
+    monkeypatch.setenv("ATOM_DETOKENIZER_AUDIT_EVERY", value)
+
+    assert enable_delta_reuse(
+        _Utf8ByteTokenizer(), "on", envs.ATOM_DETOKENIZER_AUDIT_EVERY
+    )
+
+
+@pytest.mark.parametrize(
+    ("raw", "normalized"), [("OFF", "off"), (" Auto ", "auto"), ("On", "on")]
+)
+def test_the_mode_env_is_normalized_where_it_is_read(raw, normalized, monkeypatch):
+    """Normalising in both places would be redundant; normalising in neither is
+    what shipped. `envs` owns it, and `enable_delta_reuse` keeps its own guard
+    because it is also called directly."""
+    from atom.utils import envs
+
+    monkeypatch.setenv("ATOM_DETOKENIZER_DELTA_REUSE", raw)
+
+    assert envs.ATOM_DETOKENIZER_DELTA_REUSE == normalized

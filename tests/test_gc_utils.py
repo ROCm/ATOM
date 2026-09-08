@@ -14,6 +14,7 @@ would pass against a `freeze_gc_heap` that did nothing at all.
 from __future__ import annotations
 
 import gc
+import json
 
 import pytest
 
@@ -293,40 +294,50 @@ def test_the_census_counts_by_type():
     assert len(held) == 37
 
 
-def test_a_dict_is_named_by_its_keys_and_ranked_by_how_many():
-    """`300k dicts` is not an answer. Keys are what turn the count into one,
-    and the ranking is what keeps the answer from being whichever dict the
-    walk reached first.
+def test_the_census_never_reads_what_a_container_holds():
+    """The tracked dicts on this process are overwhelmingly parsed request
+    state -- tool schemas, metadata maps, `extra_body` -- whose keys the client
+    chose. An earlier version fingerprinted containers by their contents, which
+    put those keys in the body of an endpoint that has no authentication and no
+    rate limit, so one tenant could read another's.
 
-    Two shapes of our own, compared against each other: ranking is relative,
-    and an interpreter running a test suite holds tens of thousands of dicts
-    of its own, so an absolute "mine is first" assertion would be testing the
-    process rather than the census."""
-    many = [{"request_id": i, "token_ids": [i], "text": ""} for i in range(400)]
-    # A container value in this one too, or the collector untracks it and the
-    # census correctly never sees it -- see `gc_census` on what "tracked" omits.
-    few = [{"request_id": i, "unusual_key": [i]} for i in range(120)]
+    `_HostileDict` is the enforcement rather than the illustration: it raises
+    if anything iterates it, so reintroducing the fingerprint fails here
+    instead of in production.
+    """
+    client_supplied = "acme_internal_tool_id"
+    held = [{client_supplied: i, "payload": [i]} for i in range(400)]
+    hostile = [_HostileDict(a=1) for _ in range(4)]
     gc.collect()
 
-    shapes = gc_census(top=200, samples=500)["shapes"]["dict"]
-    ranked = [s for s in shapes if "request_id" in s]
+    census = gc_census(top=10**6)  # must not raise
 
-    assert [s.rsplit(" x", 1)[1] for s in ranked] == ["400", "120"]
-    assert "token_ids" in ranked[0] and "unusual_key" in ranked[1]
-    assert len(many) == 400 and len(few) == 120
+    # Serialised, because the endpoint returns it as JSON: the key must not
+    # reach the client through any field, not merely through the one removed.
+    assert client_supplied not in json.dumps(census)
+    assert len(held) == 400 and len(hostile) == 4
 
 
-def test_the_census_does_not_run_the_code_it_measures():
-    """Fingerprinting is exact-type-only for this reason. A subclass may
-    compute its keys, and a debug endpoint that trips over one is a debug
-    endpoint you cannot call on the process you need it for."""
-    held = [_HostileDict(a=1) for _ in range(4)]
+@pytest.mark.parametrize("top", [0, -1, -100])
+def test_a_nonsensical_row_bound_does_not_silently_shorten_the_answer(top):
+    """Slicing is the trap: `[:0]` returns nothing and `[:-1]` drops the
+    smallest row, and both read as a complete census rather than as a bad
+    argument. The bound is caller-controlled -- it is a query parameter."""
+    held = [_Counted() for _ in range(37)]
     gc.collect()
 
-    census = gc_census(top=200)  # must not raise
+    rows = gc_census(top=top)["by_type"]
 
-    assert "_HostileDict" not in census["shapes"]
-    assert len(held) == 4
+    assert len(rows) == 1, "a clamped bound must still return the ranking's head"
+    assert len(held) == 37
+
+
+def test_a_negative_type_bound_yields_no_types_rather_than_almost_all():
+    """`[:-3]` is "all but the last three", which is not what anyone typing a
+    negative number meant, and the row still looks well formed."""
+    census = gc_census(top=5, types_per_owner=-3)
+
+    assert all(row["types"] == [] for row in census["by_owner"])
 
 
 def test_no_env_means_no_process_touches_its_thresholds(monkeypatch):
@@ -356,12 +367,25 @@ def test_the_env_sets_the_thresholds(monkeypatch):
     assert gc.get_threshold() == (123, 4, 5)
 
 
-def test_a_malformed_env_leaves_the_thresholds_alone(monkeypatch):
+@pytest.mark.parametrize(
+    "value",
+    [
+        "20000,fifty,50",  # not a number
+        "20000,50,50,50",  # one too many -- set_threshold raises on this
+        "999",  # one too few -- set_threshold would half-apply it
+        ",,",
+        "  ",
+    ],
+)
+def test_a_malformed_env_leaves_the_thresholds_alone(monkeypatch, value):
     """A typo is a mistake to surface. Running on half-parsed numbers would
-    present as an unexplained performance change, not as a typo."""
+    present as an unexplained performance change, not as a typo -- and running
+    on none at all is worse: `tune_gc` is called unguarded in four processes,
+    and in a worker a raise lands between "load model runner success" and
+    "ready", where `wait_server_ready.sh` reports nothing."""
     from atom.utils import envs
 
-    monkeypatch.setattr(envs, "ATOM_GC_THRESHOLD", "20000,fifty,50")
+    monkeypatch.setattr(envs, "ATOM_GC_THRESHOLD", value)
     gc.set_threshold(700, 10, 10)
 
     tune_gc()
@@ -507,7 +531,7 @@ def test_the_owner_breakdown_accounts_for_every_object():
     held = [_Counted() for _ in range(50)]
     gc.collect()
 
-    census = gc_census(top=5, samples=1)
+    census = gc_census(top=5, types_per_owner=1)
     total = sum(row["count"] for row in census["by_owner"])
 
     assert total == census["generations"]["2"]

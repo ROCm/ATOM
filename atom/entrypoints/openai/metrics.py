@@ -418,8 +418,8 @@ def _gc_metrics() -> Iterable[GaugeMetricFamily | CounterMetricFamily]:
             "collected",
             (
                 "Objects reclaimed by this process's collector, per generation. "
-                "Expected flat after startup; growth means the raised thresholds "
-                "are deferring real work."
+                "Expected flat after startup; growth means raising this "
+                "process's ATOM_GC_THRESHOLD would defer real work."
             ),
         ),
         (

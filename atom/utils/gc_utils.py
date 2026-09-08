@@ -18,7 +18,6 @@ import gc
 import logging
 import time
 import types
-from itertools import islice
 
 logger = logging.getLogger("atom")
 
@@ -40,14 +39,19 @@ def tune_gc() -> None:
     thresholds = envs.ATOM_GC_THRESHOLD
     if not thresholds:
         return
+    old = gc.get_threshold()
+    # Ignoring a bad value has to cover applying it too: this runs unguarded in
+    # four processes, and in a ModelRunner worker a raise here lands between
+    # "load model runner success" and "ready", where nothing reports it.
     try:
         t = tuple(int(x) for x in thresholds.split(","))
-    except (ValueError, TypeError):
-        logger.warning("[gc] bad ATOM_GC_THRESHOLD=%r, ignored", thresholds)
+        if len(t) != len(old):
+            raise ValueError(f"want {len(old)} values, got {len(t)}")
+        gc.set_threshold(*t)
+    except (ValueError, TypeError) as exc:
+        logger.warning("[gc] bad ATOM_GC_THRESHOLD=%r (%s), ignored", thresholds, exc)
         return
-    old = gc.get_threshold()
-    gc.set_threshold(*t)
-    logger.info("[gc] thresholds %s -> %s", old, t)
+    logger.info("[gc] thresholds %s -> %s", old, gc.get_threshold())
 
 
 # Whether this process's collector finds anything at all -- the number that
@@ -84,7 +88,8 @@ def reclaim_watch(context: str) -> int:
     reports the gen-2 size, which is what would show it.
 
     Warns once -- at four thousand streams a repeating line buries the log.
-    `atom:gc_collected` is the continuous signal; this only makes someone look.
+    `atom:gc_collected_total` is the continuous signal; this only makes someone
+    look.
     """
     global _reclaim_warned
     if _reclaim_baseline is None:
@@ -95,8 +100,8 @@ def reclaim_watch(context: str) -> int:
         _reclaim_warned = True
         logger.warning(
             "[gc] %s: generations %s reclaimed objects since startup (%s -> %s). "
-            "Raised thresholds assume this process builds no cycles; it does, "
-            "so collections are now deferring real work. See "
+            "This process builds reference cycles, so raising its "
+            "ATOM_GC_THRESHOLD would defer real work rather than nothing. See "
             "atom:gc_collected_total.",
             context,
             grew,
@@ -188,25 +193,6 @@ def _most_common(counts: dict[str, int], n: int) -> list[str]:
     return [f"{k} x{c}" for k, c in sorted(counts.items(), key=lambda kv: -kv[1])[:n]]
 
 
-def _shape(obj: object, fields: int) -> str:
-    """A one-line fingerprint of a plain container, naming it by its contents.
-
-    A type census answers "300k dicts", which is not yet an answer; keys tell
-    you *which* dicts. Exact types only -- a subclass may compute `keys` or
-    `__getitem__`, and a census must not run the code it is measuring.
-    """
-    if type(obj) is dict:
-        # Empty gets its own bucket: "a million empty dicts" is an answer, and
-        # folding it in with the unnameable ones buries whatever is second.
-        if not obj:
-            return "{}"
-        keys = [k for k in islice(obj, fields) if isinstance(k, str)]
-        return "{" + ",".join(keys) + "}" if keys else "{non-str keys}"
-    if type(obj) in (list, tuple):
-        return "[" + ",".join(type(x).__name__ for x in islice(obj, fields)) + "]"
-    return ""
-
-
 # (label, path marker, module prefix). Ordered: the first hit wins, so a more
 # specific entry must come before any prefix of it.
 _OWNERS = tuple(
@@ -271,7 +257,7 @@ def _owner(obj: object) -> str:
         return "error"
 
 
-def gc_census(top: int = 30, samples: int = 2, fields: int = 8) -> dict:
+def gc_census(top: int = 30, types_per_owner: int = 2) -> dict:
     """What the collector actually rescans, broken down by type.
 
     The generation sizes say the collector is expensive; this says what it is
@@ -281,10 +267,16 @@ def gc_census(top: int = 30, samples: int = 2, fields: int = 8) -> dict:
     by the in-flight request count gives the per-stream object cost that
     thresholds do not change.
 
-    On demand and never on a timer: it walks every tracked object and holds
-    the event loop for roughly a second at a million of them. That is also why
-    `gc.get_stats()` is included -- those counters are free, so a caller that
-    only needs "is anything being reclaimed" should read them and not this.
+    On demand and never on a timer: it walks every tracked object, which takes
+    roughly a second at a million of them, so the caller runs it off the event
+    loop. That is also why `gc.get_stats()` is included -- those counters are
+    free, so a caller that only needs "is anything being reclaimed" should read
+    them and not this.
+
+    Types and owners only. An earlier version also fingerprinted plain
+    containers by their contents, which on this process meant serialising the
+    keys of parsed request bodies into the response; naming what a dict holds
+    is exactly the thing that cannot be reported from a live serving heap.
 
     What is absent is as informative as what is here. A dict or tuple whose
     contents are all atomic is *untracked* by the collector on its first pass,
@@ -293,6 +285,10 @@ def gc_census(top: int = 30, samples: int = 2, fields: int = 8) -> dict:
     and the same state with one list in it is not -- which is the difference
     this census exists to find.
     """
+    # Slicing is silent about a nonsensical bound: `[:0]` returns nothing and
+    # `[:-1]` drops the smallest row, both of which read as a real answer.
+    top = max(1, top)
+    types_per_owner = max(0, types_per_owner)
     gen2 = gc.get_objects(2)
 
     by_type: dict[str, int] = {}
@@ -306,21 +302,6 @@ def gc_census(top: int = 30, samples: int = 2, fields: int = 8) -> dict:
         per_owner = owner_types.setdefault(who, {})
         per_owner[name] = per_owner.get(name, 0) + 1
     ranked = sorted(by_type.items(), key=lambda kv: -kv[1])[:top]
-
-    # A second walk, because a shape is only worth tallying for a type that
-    # ranked and ranking needs the first walk finished. Tallied and not
-    # sampled: which shape you meet first is an artifact of allocation order,
-    # and the question is which one there are a million of.
-    shapes: dict[str, list[str]] = {}
-    if samples:
-        wanted = {name for name, _ in ranked}
-        tallies: dict[str, dict[str, int]] = {}
-        for obj in gen2:
-            name = type(obj).__qualname__
-            if name in wanted and (shape := _shape(obj, fields)):
-                per_shape = tallies.setdefault(name, {})
-                per_shape[shape] = per_shape.get(shape, 0) + 1
-        shapes = {name: _most_common(per, samples) for name, per in tallies.items()}
 
     return {
         # `len(gen2)` rather than a third `get_objects(2)`: that call
@@ -336,9 +317,12 @@ def gc_census(top: int = 30, samples: int = 2, fields: int = 8) -> dict:
         # free here or is deferring real work.
         "stats": gc.get_stats(),
         "by_type": [{"type": n, "count": c} for n, c in ranked],
-        "shapes": shapes,
         "by_owner": [
-            {"owner": who, "count": c, "types": _most_common(owner_types[who], samples)}
+            {
+                "owner": who,
+                "count": c,
+                "types": _most_common(owner_types[who], types_per_owner),
+            }
             for who, c in sorted(by_owner.items(), key=lambda kv: -kv[1])
         ],
     }

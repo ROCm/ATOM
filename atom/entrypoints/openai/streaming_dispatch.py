@@ -44,6 +44,9 @@ _LATEST_WINS = ("finish_reason", "kv_transfer_params", "num_cached_tokens")
 # the client whatever the model is.
 SYNTHETIC_TOKEN_TEXT = "synthetic "
 
+# One audit per thousand reuses, which is what the shipped 1.7x was measured at.
+DEFAULT_AUDIT_EVERY = 1000
+
 
 @dataclass
 class _DeltaReuse:
@@ -55,7 +58,7 @@ class _DeltaReuse:
     """
 
     enabled: bool = False
-    audit_every: int = 1000
+    audit_every: int = DEFAULT_AUDIT_EVERY
     calls: int = 0
     audits: int = 0  # comparisons that had something to compare
     mismatches: int = 0
@@ -274,7 +277,33 @@ def _probe(tokenizer) -> tuple[str | None, int]:
     return None, _DELTA_REUSE.audits
 
 
-def enable_delta_reuse(tokenizer, mode: str = "auto", audit_every: int = 1000) -> bool:
+def _audit_interval(value: int | str) -> int:
+    """How often to check a reused delta, from `ATOM_DETOKENIZER_AUDIT_EVERY`.
+
+    Empty means the default. Anything else unusable warns and takes the default
+    as well -- including 0, which reads like "never audit" but would divide by
+    zero, and is not how reuse is turned off.
+    """
+    if value is None or value == "":
+        return DEFAULT_AUDIT_EVERY
+    try:
+        interval = int(value)
+    except (TypeError, ValueError):
+        interval = 0
+    if interval < 1:
+        logger.warning(
+            "[detokenizer] unusable ATOM_DETOKENIZER_AUDIT_EVERY=%r, using %d; "
+            "reuse is turned off with ATOM_DETOKENIZER_DELTA_REUSE=off",
+            value,
+            DEFAULT_AUDIT_EVERY,
+        )
+        return DEFAULT_AUDIT_EVERY
+    return interval
+
+
+def enable_delta_reuse(
+    tokenizer, mode: str = "auto", audit_every: int | str = ""
+) -> bool:
     """Let `_decode` skip its first decode, if this tokenizer allows it.
 
     The shortcut holds where decoding a token span does not depend on where the
@@ -287,14 +316,22 @@ def enable_delta_reuse(tokenizer, mode: str = "auto", audit_every: int = 1000) -
 
     Unrelated to the KV prefix cache, which is what "cache" means everywhere
     else in this repository.
+
+    Neither setting may end the process or turn reuse on by accident: an
+    unreadable mode leaves reuse off, which is what someone spelling this
+    setting is reaching for, and an unreadable audit interval falls back to the
+    default, since it is read at a callsite that has already loaded the weights.
     """
-    if mode not in ("auto", "on", "off"):
-        logger.warning("[detokenizer] unknown delta reuse mode %r, using auto", mode)
-        mode = "auto"
-    _DELTA_REUSE.audit_every = max(1, audit_every)
-    if mode != "auto":
-        _DELTA_REUSE.enabled = mode == "on"
-        logger.info("[detokenizer] delta reuse forced %s", mode)
+    setting = str(mode).strip().lower()
+    if setting not in ("auto", "on", "off"):
+        logger.warning(
+            "[detokenizer] unknown delta reuse mode %r, leaving reuse off", mode
+        )
+        setting = "off"
+    _DELTA_REUSE.audit_every = _audit_interval(audit_every)
+    if setting != "auto":
+        _DELTA_REUSE.enabled = setting == "on"
+        logger.info("[detokenizer] delta reuse forced %s", setting)
         return _DELTA_REUSE.enabled
 
     before = replace(_DELTA_REUSE)

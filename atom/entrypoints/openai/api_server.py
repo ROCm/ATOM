@@ -16,6 +16,7 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import functools
 import io
 import json
 import logging
@@ -1539,13 +1540,30 @@ async def _refresh_metrics_once() -> None:
 
 
 async def _metrics_refresh_loop() -> None:
+    """Refresh the cached snapshot forever, and outlive anything in the body.
+
+    Nothing awaits this task until shutdown, so an escaping exception is
+    silent: asyncio records "never retrieved", `/metrics` keeps serving the
+    last snapshot, `metrics_snapshot_available` still reads 1, and the gc
+    gauges keep moving because they are read at scrape time -- a dashboard that
+    looks alive while every engine-derived series is frozen. The whole body is
+    guarded for that reason, not just the call that happens to raise today.
+    """
     while True:
         await asyncio.sleep(_METRICS_REFRESH_INTERVAL_SECONDS)
-        await _refresh_metrics_once()
-        # Rides this loop rather than owning a task: one `gc.get_stats()` read
-        # and a comparison, against something that changes on the scale of
-        # minutes if it changes at all.
-        reclaim_watch("api_server")
+        try:
+            await _refresh_metrics_once()
+            # Rides this loop rather than owning a task: one `gc.get_stats()`
+            # read and a comparison, against something that changes on the
+            # scale of minutes if it changes at all.
+            reclaim_watch("api_server")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Counted, not only logged: `metrics_refresh_errors` is what says
+            # the series went stale, and a log line alone is not a signal.
+            _metrics_exporter.record_refresh_error()
+            logger.warning("Metrics refresh pass failed", exc_info=True)
 
 
 @asynccontextmanager
@@ -2396,15 +2414,23 @@ async def get_cache_stats():
 
 
 @app.get("/debug/gc_census")
-async def get_gc_census(top: int = 30, samples: int = 2):
+async def get_gc_census(top: int = 30, types_per_owner: int = 2):
     """Break the collector's scan set down by type, for this process.
 
     Frontend-local on purpose: the engine and the workers each have their own
     interpreter and their own answer, and it is this process whose scan set
     grows with in-flight streams.
+
+    In a thread because the walk is seconds long at a serving heap and this
+    loop is the one delivering every open SSE stream -- inline, one GET would
+    stall token delivery for all of them, on a server whose product is
+    inter-token latency. The GIL still makes it a pause; it becomes one the
+    loop can interleave around rather than a single blocking call.
     """
     try:
-        return gc_census(top=top, samples=samples)
+        return await asyncio.get_running_loop().run_in_executor(
+            None, functools.partial(gc_census, top=top, types_per_owner=types_per_owner)
+        )
     except Exception as e:
         logger.exception("Failed to take a GC census")
         raise HTTPException(

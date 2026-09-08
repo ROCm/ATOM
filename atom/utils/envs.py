@@ -289,13 +289,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # See enable_delta_reuse in atom/entrypoints/openai/streaming_dispatch.py.
     "ATOM_DETOKENIZER_DELTA_REUSE": lambda: os.getenv(
         "ATOM_DETOKENIZER_DELTA_REUSE", "auto"
-    ).strip(),
+    )
+    .strip()
+    .lower(),
     # How often the reused delta is checked against a real decode once reuse is
     # on. 1 checks every update; a mismatch corrects that call's output and
-    # turns reuse off for the process.
-    "ATOM_DETOKENIZER_AUDIT_EVERY": lambda: max(
-        1, int(os.getenv("ATOM_DETOKENIZER_AUDIT_EVERY", "1000"))
-    ),
+    # turns reuse off for the process.  Text, not int, for the reason
+    # ATOM_GC_THRESHOLD is: it is read as an argument at a callsite that has
+    # already loaded the weights, so it is parsed where a bad value can be
+    # answered with a warning instead of a traceback.
+    "ATOM_DETOKENIZER_AUDIT_EVERY": lambda: os.getenv(
+        "ATOM_DETOKENIZER_AUDIT_EVERY", ""
+    ).strip(),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
     # When profiling is active, append detailed attention aggregates (sqsq, sqsk, sk)
     # to the prefill[]/decode[] trace labels emitted by ModelRunner.run_model.

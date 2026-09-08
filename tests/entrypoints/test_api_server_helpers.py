@@ -17,6 +17,7 @@ import ast
 import asyncio
 import inspect
 import sys
+import threading
 import types
 from types import SimpleNamespace
 
@@ -400,3 +401,105 @@ class TestARequestIsNotSerialisedForALogNobodyKeeps:
             "_log_request_event is being handed a model_dump() built before "
             f"the guard can decline it: {eager}. Use _log_request_model."
         )
+
+
+class TestTheMetricsRefreshLoopOutlivesItsBody:
+    """The loop is the only writer of the cached snapshot, and nothing awaits
+    it until shutdown.
+
+    So an exception escaping it is silent: asyncio records "never retrieved"
+    and no more. `/metrics` keeps answering from the last snapshot,
+    `metrics_snapshot_available` still reads 1, and the gc gauges keep moving
+    because they are read at scrape time -- the dashboard looks alive while
+    every engine-derived series is frozen at whatever it was. That failure is
+    invisible by construction, which is why it is pinned here.
+    """
+
+    @staticmethod
+    def _run_until(monkeypatch, failure, rounds=4):
+        """Drive the real loop with a body that fails, and stop deterministically.
+
+        `CancelledError` is the stop signal rather than a timer: the loop must
+        re-raise it for shutdown to work, so the same run checks both that the
+        loop survived `rounds - 1` failures and that it still exits when told.
+        The interval is zeroed, so this waits on nothing.
+        """
+        calls, errors = [], []
+
+        def body(context):
+            calls.append(context)
+            if len(calls) == rounds:
+                raise asyncio.CancelledError
+            raise failure
+
+        monkeypatch.setattr(api_server, "_METRICS_REFRESH_INTERVAL_SECONDS", 0)
+        monkeypatch.setattr(api_server, "reclaim_watch", body)
+        monkeypatch.setattr(api_server, "engine", None)
+        monkeypatch.setattr(
+            api_server._metrics_exporter,
+            "record_refresh_error",
+            lambda: errors.append(1),
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(api_server._metrics_refresh_loop())
+        return calls, errors
+
+    def test_a_raising_body_does_not_end_the_loop(self, monkeypatch):
+        """A logging handler raising while it formats the warning's four
+        arguments is enough, and so is `MemoryError` under exactly the load
+        this instrumentation was added to watch."""
+        calls, _ = self._run_until(
+            monkeypatch, RuntimeError("handler raised while formatting")
+        )
+
+        assert len(calls) == 4, f"the loop stopped after {len(calls)} passes"
+
+    def test_the_failure_is_counted_and_not_only_logged(self, monkeypatch):
+        """`metrics_refresh_errors` is what says the series went stale. A log
+        line alone is not a signal -- nobody is grepping the frontend log to
+        find out why a Grafana panel is flat."""
+        _, errors = self._run_until(monkeypatch, RuntimeError("boom"))
+
+        assert len(errors) == 3, "a pass failed without incrementing the counter"
+
+    def test_cancellation_still_stops_it(self, monkeypatch):
+        """The negative control for the two above: a guard broad enough to
+        swallow `CancelledError` would make the loop unkillable, and shutdown
+        would hang on the `await` in the lifespan's `finally`."""
+        calls, errors = self._run_until(monkeypatch, RuntimeError("boom"), rounds=1)
+
+        assert calls == ["api_server"]
+        assert errors == []
+
+
+class TestTheCensusEndpointKeepsTheLoopFree:
+    """`/debug/gc_census` walks every tracked object -- seconds at a serving
+    heap -- on the one loop that delivers every open SSE stream."""
+
+    def test_the_walk_does_not_run_on_the_event_loop(self, monkeypatch):
+        """Inline, a single unauthenticated GET stalls token delivery for every
+        stream in flight, on a server whose product is inter-token latency.
+
+        The thread identity is the assertion, not the presence of the call: a
+        later refactor that awaits the walk directly would keep the executor
+        import and lose the property.
+        """
+        seen = {}
+
+        def fake_census(top, types_per_owner):
+            seen["walk_thread"] = threading.current_thread()
+            seen["args"] = (top, types_per_owner)
+            return {"by_type": []}
+
+        monkeypatch.setattr(api_server, "gc_census", fake_census)
+
+        async def call():
+            seen["loop_thread"] = threading.current_thread()
+            return await api_server.get_gc_census(top=7, types_per_owner=3)
+
+        assert asyncio.run(call()) == {"by_type": []}
+        assert (
+            seen["walk_thread"] is not seen["loop_thread"]
+        ), "the census ran on the event loop"
+        assert seen["args"] == (7, 3), "the query parameters did not reach the walk"
