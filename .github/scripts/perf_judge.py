@@ -1007,26 +1007,54 @@ def render(report, context):
 
 
 def render_summary(report, context):
-    """Render the full step-summary table, one row per configuration."""
+    """Render the full step-summary table, one row per configuration.
+
+    Same vocabulary as the PR comment -- a reader moving between the two should
+    not have to learn two names for the same thing. Columns that carry nothing
+    on a given run (base2 when the flow measured the base once, drift when
+    there is no history) are left out rather than printed empty: a column of
+    dashes reads as missing data rather than as a phase that did not run.
+    """
+    members = [m for f in report["families"] for m in f["members"]]
+    show_base2 = any(m.get("base2_tput") for m in members)
+    show_drift = any(m.get("drift_pct") is not None for m in members)
+
+    header = ["Model", "isl/osl", "Concurrency", "base"]
+    if show_base2:
+        header.append("base2")
+    header += ["head", "Total Tput"]
+    if show_drift:
+        header.append("drift")
+    header += ["TPOT", "TTFT"]
+
     lines = ["## PR performance check", ""]
     if context:
         lines += [context, ""]
     lines += [
-        "| Entry | isl/osl | conc | role | base | base2 | head | tput | drift | TPOT | TTFT |",
-        "|---|---|---|---|---|---|---|---|---|---|---|",
+        "| " + " | ".join(header) + " |",
+        "|" + "---|" * len(header),
     ]
     for family in report["families"]:
         for member in family["members"]:
-            role = "judging" if member["conc"] >= JUDGE_MIN_CONC else "reference"
-            lines.append(
-                f"| {family['model']} | {member['isl_osl']} | {member['conc']} "
-                f"| {role} "
-                f"| {member['base_tput']:.1f} "
-                f"| {format(member['base2_tput'], '.1f') if member.get('base2_tput') else '-'} "
-                f"| {member['head_tput']:.1f} "
-                f"| {member['tput_pct']:+.2f}% | {_fmt(member.get('drift_pct'))} "
-                f"| {_fmt(member['tpot_pct'])} | {_fmt(member['ttft_pct'])} |"
-            )
+            judged = member["conc"] >= JUDGE_MIN_CONC
+            conc = f"{member['conc']}" if judged else f"{member['conc']} (not judged)"
+            row = [
+                family["model"],
+                member["isl_osl"],
+                conc,
+                f"{member['base_tput']:.1f}",
+            ]
+            if show_base2:
+                row.append(
+                    format(member["base2_tput"], ".1f")
+                    if member.get("base2_tput")
+                    else "-"
+                )
+            row += [f"{member['head_tput']:.1f}", f"{member['tput_pct']:+.2f}%"]
+            if show_drift:
+                row.append(_fmt(member.get("drift_pct")))
+            row += [_fmt(member["tpot_pct"]), _fmt(member["ttft_pct"])]
+            lines.append("| " + " | ".join(row) + " |")
     lines += [
         "",
         f"Verdict: **{report['verdict']}** "
@@ -1037,6 +1065,13 @@ def render_summary(report, context):
             f" / {report['expected_entries']} expected)"
             if report.get("expected_entries")
             else ")"
+        ),
+        "",
+        (
+            "Rows marked *(not judged)* were measured and are shown, but "
+            f"excluded from every calculation: below {JUDGE_MIN_CONC} requests "
+            "in flight the numbers swing enough to both invent regressions and "
+            "hide real ones."
         ),
         "",
         (
