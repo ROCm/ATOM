@@ -60,13 +60,15 @@ FAMILY_MEDIAN_PCT = -3.0  # family median throughput delta that trips the gate
 DOWN_EPS_PCT = -2.0  # a level counts as "down" past this
 TPOT_MIRROR_RATIO = 0.6  # |median TPOT delta / median tput delta| for mirroring
 NONMONOTONIC_MARGIN_PCT = 3.0  # interior level this far outside its neighbours
-# A/A residual after the warmup, measured on the platform this runs on.
-# MI308 gave 1.35% with a 1x-concurrency warmup; MI355X gave 4.19% under
-# the same warmup (run 34233036220: +4.19/+5.65/+3.10 at c=64/128/256, on
-# three separate machines, TPOT mirroring each one). The warmup now runs
-# the same prompt count as the measurement; update this to whatever that
-# leaves behind.
-MEASURED_RESIDUAL_BIAS_PCT = 4.19
+# A/A residual after the warmup, measured on the platform this runs on. With
+# a 1x-concurrency warmup MI355X held a systematic +4.19% (run 34233036220:
+# +4.19/+5.65/+3.10 at c=64/128/256, TPOT mirroring each). Warming up with the
+# measurement's own prompt count removed it: run 34247362619 gave -0.39/+0.27/
+# +1.84, two of the three on the same machines as before. What is left is
+# spread rather than bias, so this is the median and RESIDUAL_SPREAD_PCT is
+# how far a single level wandered from it.
+MEASURED_RESIDUAL_BIAS_PCT = 0.27
+RESIDUAL_SPREAD_PCT = 1.8
 
 # --- Baseline sanity (crimson only) ----------------------------------------
 BASELINE_SANITY_PCT = -25.0  # base this far under main's recent median
@@ -843,11 +845,12 @@ def render(report, context):
         # nothing changed. Say so next to the table rather than only in the
         # step summary, because the comment is what gets read.
         (
-            f"> A residual bias of about {MEASURED_RESIDUAL_BIAS_PCT}% favours "
-            f"head even when both halves run identical code, so small positive "
-            f"numbers here mean *no change*, not an improvement. A drop trips "
-            f"at roughly {FAMILY_MEDIAN_PCT - MEASURED_RESIDUAL_BIAS_PCT:.2f}% "
-            f"rather than {FAMILY_MEDIAN_PCT}%."
+            f"> Measured on identical code, the paired delta comes out at "
+            f"{MEASURED_RESIDUAL_BIAS_PCT}% with individual levels landing up "
+            f"to {RESIDUAL_SPREAD_PCT} points either side. Read a single level "
+            f"as carrying about that much slack, and treat anything inside it "
+            f"as no change. The verdict uses the family median across levels "
+            f"for the same reason."
         ),
         "",
     ]
@@ -1104,12 +1107,12 @@ def render_summary(report, context):
         ),
         "",
         (
-            f"> Measured residual bias after the warmup is "
-            f"{MEASURED_RESIDUAL_BIAS_PCT}%, systematic and favouring head, so "
-            f"a drop trips at roughly "
-            f"{FAMILY_MEDIAN_PCT - MEASURED_RESIDUAL_BIAS_PCT:.2f}% rather than "
-            f"{FAMILY_MEDIAN_PCT}%. Fine for the regressions worth catching; not "
-            f"a resolution of {abs(FAMILY_MEDIAN_PCT)}%."
+            f"> Measured on identical code, the paired delta comes out at "
+            f"{MEASURED_RESIDUAL_BIAS_PCT}% with individual levels landing up "
+            f"to {RESIDUAL_SPREAD_PCT} points either side. The warmup removed "
+            f"the systematic part; what is left is spread, which is why the "
+            f"verdict is taken on the family median across levels rather than "
+            f"on any single one."
         ),
     ]
     return "\n".join(lines)
