@@ -1,5 +1,17 @@
 [
   {
+    "model_name": "Command-R-7B TP1",
+    "model_path": "CohereLabs/c4ai-command-r7b-12-2024",
+    "extra_args": "--tensor-parallel-size 1 --enable-chunked-prefill --max-num-batched-tokens 65536 --max-model-len 131072 --no-enable-prefix-caching",
+    "env_vars": "",
+    "runner": "atom-plugin-acc-validation-runner-vllm",
+    "test_level": "nightly",
+    "priority": "P2",
+    "accuracy_test_threshold": 0.7,
+    "accuracy_baseline": 0.75,
+    "accuracy_baseline_model": "CohereLabs/c4ai-command-r7b-12-2024"
+  },
+  {
     "model_name": "Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8",
     "model_path": "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8",
     "extra_args": "--tensor-parallel-size 8 --enable-expert-parallel",

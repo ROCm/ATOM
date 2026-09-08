@@ -138,6 +138,8 @@ def _maybe_set_v4_expert_dtype(atom_config, vllm_config) -> None:
 
 
 _ATOM_MODEL_CLASSES: dict[str, str] = {
+    "CohereForCausalLM": "atom.models.cohere:CohereForCausalLM",
+    "Cohere2ForCausalLM": "atom.models.cohere:CohereForCausalLM",
     "LlamaForCausalLM": "atom.models.llama:LlamaForCausalLM",
     "Qwen3ForCausalLM": "atom.models.qwen3:Qwen3ForCausalLM",
     "Qwen3MoeForCausalLM": "atom.models.qwen3_moe:Qwen3MoeForCausalLM",
