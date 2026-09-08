@@ -8,11 +8,11 @@ from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 from torch import nn
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
+from atom.config import get_current_atom_config
 from atom.model_ops.attention_mha import (
     PA_GLUON_MAX_QUERY_GROUP_SIZE,
     PA_GLUON_MAX_QUERY_LEN,
 )
-from atom.config import get_current_atom_config
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import (
     cp_mha_gather_cache,
