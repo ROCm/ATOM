@@ -413,6 +413,16 @@ one group copies host↔staging, the next packs/unpacks on a separate CUDA strea
 handed off via ready/free events. Transfers larger than the buffer are split into
 groups, so HBM staging cost is capped regardless of prefix length.
 
+SAVE chunk staging is scheduled strictly tail-to-head by token range. For B1–B8
+with two-block LMCache chunks, GPU source reads and source-safe notifications are
+B7–B8, B5–B6, B3–B4, B1–B2. Each assembled transfer record keeps its original
+MemoryObj, token range, and block-ID slice together, so reversing scheduling
+cannot cross-wire payloads. LOAD remains head-to-tail. LMCache's current
+`CacheEngine.store` API retains the cache-key list internally and exposes only
+MemoryObjs/ranges to the GPU connector; therefore ATOM cannot safely reorder the
+later `StorageManager.batched_put` batch. Backend submission remains one opaque
+batch in LMCache's original key/object order, after tail-to-head GPU staging.
+
 **`OFFLOAD_GPU_STAGING_CHUNKS` sizes *each* staging buffer, and there is more than
 one.** The buffer is thread-local (`threading.local`), and load and save run on
 separate executors (§ worker side). So the **load path** owns one staging buffer
@@ -868,6 +878,7 @@ Connector-specific tuning (env):
 | `OFFLOAD_MAX_PENDING_SAVES` | `max(2, 2 × OFFLOAD_COPY_WORKERS)` | Positive integer bound on total admitted worker saves (running + queued), acquired before SLOT snapshot or executor submission. |
 | `OFFLOAD_GPU_STAGING_CHUNKS` | 2 | Chunks per bounded GPU staging buffer. Sizes **each** buffer — load and save own separate ones, so resident HBM ≈ `(1 + OFFLOAD_COPY_WORKERS) × chunks × chunk_bytes`. |
 | `OFFLOAD_GPU_STAGING_MAX_BYTES` | — | Hard cap on staging bytes (clamps the chunk count). |
+| `ATOM_OFFLOAD_EARLY_BLOCK_RELEASE` | 0 | Experimental dense/M3 PAGE path: release non-source blocks at request finish and source leases after TP/PP-quorumed GPU staging completion. ATOM records one event per bounded staging group and polls it off-thread; when it becomes ready, the group emits an exact range identity per LMCache chunk. This avoids per-chunk host synchronization and can release earlier groups while later staging or storage-manager work continues. Store commitment remains a later, separate success/failure event. Disabled for Kimi-K3 and DSV4 state/SLOT layouts. |
 | `OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER` | 0 | Free the staging buffer after each transfer (lower idle HBM, higher churn). |
 | `OFFLOAD_SLOT_STAGING_SLOTS` | 1 | DSV4 only: number of persistent full-SLOT GPU staging rows. Must be at least 1; HBM cost is this value × `slot_bytes`. |
 | `OFFLOAD_PUBLICATION_TIMEOUT_S` | 5.0 | Finite, nonnegative maximum wait after PAGE or AOS1 submission for session visibility. `0` performs exactly one immediate probe. |

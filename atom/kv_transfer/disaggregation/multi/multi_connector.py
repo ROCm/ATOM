@@ -689,6 +689,51 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             for c in self._connectors
         )
 
+    def protected_block_ids(self, seq: Any):
+        """Union exact protections only when every deferring sub can narrow."""
+
+        protected: set[int] = set()
+        for connector in self._connectors:
+            should_defer = getattr(connector, "should_defer_free", None)
+            if not callable(should_defer) or not should_defer(seq):
+                continue
+            callback = getattr(connector, "protected_block_ids", None)
+            if not callable(callback):
+                return None
+            blocks = callback(seq)
+            if blocks is None:
+                return None
+            protected.update(blocks)
+        return frozenset(protected)
+
+    def activate_block_leases(self, seq: Any, block_ids) -> None:
+        for connector in self._connectors:
+            callback = getattr(connector, "activate_block_leases", None)
+            if callable(callback):
+                callback(seq, block_ids)
+
+    def take_source_safe_releases(self):
+        releases = []
+        for connector in self._connectors:
+            callback = getattr(connector, "take_source_safe_releases", None)
+            if callable(callback):
+                releases.extend(callback())
+        return releases
+
+    def reclaim_stale_leases(self, timeout_s: float):
+        releases = []
+        for connector in self._connectors:
+            callback = getattr(connector, "reclaim_stale_leases", None)
+            if callable(callback):
+                releases.extend(callback(timeout_s))
+        return releases
+
+    def record_early_release(self, count: int) -> None:
+        for connector in self._connectors:
+            callback = getattr(connector, "record_early_release", None)
+            if callable(callback):
+                callback(count)
+
     def has_pending_work(self) -> bool:
         # Scheduler-side only: the send/save pairing state lives on the worker
         # instance, and a pending send is already visible to the engine through
