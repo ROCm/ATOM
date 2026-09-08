@@ -205,10 +205,16 @@ jobs:
                 exit 1
               fi
               echo "Resolved 10.1 nightly torchaudio version: ${NIGHTLY_TORCHAUDIO_VERSION}"
+              # ROCM_TRITON_VERSION is deliberately empty: torch's own
+              # metadata pins the exact triton it was built against, and the
+              # nightly channel carries several triton variants per date whose
+              # commit drifts independently of torch — any explicit pick can
+              # fight torch's pin and die with ResolutionImpossible. Empty
+              # means the dockerfile lets torch's dependency decide.
               EXTRA_BUILD_ARGS="--build-arg ROCM_SDK_VERSION=${NIGHTLY_SDK_VERSION} \
                 --build-arg ROCM_TORCH_VERSION=2.12.0 \
                 --build-arg ROCM_TORCHAUDIO_VERSION=${NIGHTLY_TORCHAUDIO_VERSION} \
-                --build-arg ROCM_TRITON_VERSION=3.8.0+gitc01b6774 \
+                --build-arg ROCM_TRITON_VERSION= \
                 --build-arg ROCM_INDEX_URL=https://nightly.repo.amd.com/rocm/whl-next/"
               ;;
           esac

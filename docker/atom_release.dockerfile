@@ -97,6 +97,18 @@ RUN set -eux; \
             "amd-torch-device-${arch}==${ROCM_TORCH_VERSION}+rocm${ROCM_SDK_VERSION}" \
             "amd-torchvision-device-${arch}==${ROCM_TORCHVISION_VERSION}+rocm${ROCM_SDK_VERSION}"; \
     done; \
+    # Triton pin is conditional: torch's own metadata pins an exact triton
+    # (e.g. torch 2.12.0+rocm10.1.0a20260907 depends on
+    # triton==3.8.0+git4cff872c.rocm10.1.0a20260907), and a mismatched explicit
+    # pin makes pip die with ResolutionImpossible. On the nightly channel the
+    # triton commit drifts independently of torch, so an empty
+    # ROCM_TRITON_VERSION means "let torch's dependency decide" — the only
+    # source of truth that cannot conflict.
+    if [ -n "${ROCM_TRITON_VERSION}" ]; then \
+        TRITON_SPEC="triton==${ROCM_TRITON_VERSION}.rocm${ROCM_SDK_VERSION}"; \
+    else \
+        TRITON_SPEC="triton"; \
+    fi; \
     python3 -m pip install --no-cache-dir \
         --index-url ${ROCM_INDEX_URL} \
         "rocm-sdk-core==${ROCM_SDK_VERSION}" \
@@ -105,7 +117,7 @@ RUN set -eux; \
         "torch==${ROCM_TORCH_VERSION}+rocm${ROCM_SDK_VERSION}" \
         "torchvision==${ROCM_TORCHVISION_VERSION}+rocm${ROCM_SDK_VERSION}" \
         "torchaudio==${ROCM_TORCHAUDIO_VERSION}+rocm${ROCM_SDK_VERSION}" \
-        "triton==${ROCM_TRITON_VERSION}.rocm${ROCM_SDK_VERSION}"; \
+        "${TRITON_SPEC}"; \
     for arch in $(printf '%s' "${GPU_ARCH}" | tr ';' ' '); do \
         python3 -m pip show "rocm-sdk-device-${arch}" >/dev/null; \
         python3 -m pip show "amd-torch-device-${arch}" >/dev/null; \
