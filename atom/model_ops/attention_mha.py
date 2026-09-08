@@ -39,6 +39,25 @@ def use_pa_decode_bf16_asm() -> bool:
 # a gqa=8 model reaches the length one first.
 PA_GLUON_MAX_QUERY_LEN = 4
 PA_GLUON_MAX_QUERY_GROUP_SIZE = 64
+# ASM paged attention's own envelope, well inside gluon's.
+PA_ASM_MAX_QUERY_GROUP_SIZE = 16
+
+
+def gluon_decode_over_limit(max_qlen: int, num_heads: int, num_kv_heads: int) -> bool:
+    """Whether decode is past what the gluon kernel takes.
+
+    pow2, not the raw product: that is what the kernel indexes its layout table
+    with, and it rounds a small group up to fill 16.
+    """
+    max_qlen = int(max_qlen)
+    qlen_p2 = 1 << (max_qlen - 1).bit_length()
+    group_p2 = qlen_p2 * max(
+        16 // qlen_p2, 1 << (num_heads // num_kv_heads - 1).bit_length()
+    )
+    return (
+        max_qlen > PA_GLUON_MAX_QUERY_LEN
+        or group_p2 > PA_GLUON_MAX_QUERY_GROUP_SIZE
+    )
 
 
 class PagedAttentionImpl(nn.Module):
@@ -498,20 +517,14 @@ class PagedAttentionImpl(nn.Module):
 
         num_seqs = attn_metadata.context_lens.shape[0]
 
-        # pow2, not the raw product: that is what the kernel indexes its
-        # layout table with, and it rounds a small group up to fill 16.
-        qlen_p2 = 1 << (attn_metadata.max_seqlen_q - 1).bit_length()
-        group = self.num_heads // self.num_kv_heads
-        group_p2 = qlen_p2 * max(16 // qlen_p2, 1 << (group - 1).bit_length())
-        gluon_over_limit = (
-            attn_metadata.max_seqlen_q > PA_GLUON_MAX_QUERY_LEN
-            or group_p2 > PA_GLUON_MAX_QUERY_GROUP_SIZE
+        gluon_over_limit = gluon_decode_over_limit(
+            attn_metadata.max_seqlen_q, self.num_heads, self.num_kv_heads
         )
         # unified takes one descale for the whole tensor. Running a per-token
         # cache through it is not an error downstream, just wrong numbers.
         if gluon_over_limit and k_scale is not None and k_scale.numel() > 1:
             raise NotImplementedError(
-                f"query length {attn_metadata.max_seqlen_q} / group {group_p2} "
+                f"query length {attn_metadata.max_seqlen_q} "
                 "is past what the gluon decode kernel takes, and the unified "
                 "fallback cannot carry this layer's per-token KV scales"
             )

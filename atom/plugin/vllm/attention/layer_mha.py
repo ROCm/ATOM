@@ -10,8 +10,8 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
 from atom.config import get_current_atom_config
 from atom.model_ops.attention_mha import (
-    PA_GLUON_MAX_QUERY_GROUP_SIZE,
-    PA_GLUON_MAX_QUERY_LEN,
+    PA_ASM_MAX_QUERY_GROUP_SIZE,
+    gluon_decode_over_limit,
 )
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import (
@@ -725,29 +725,25 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
 
     def _dispatch_decode_backend(self, num_decodes, max_qlen):
         # No fallback exists here: this bridge has no unified branch, and ASM
-        # tops out lower still (qlen * gqa <= 16), where an unmatched mtp picks
-        # a kernel built for another qlen and computes instead of asserting.
-        qlen_p2 = 1 << (max_qlen - 1).bit_length()
-        group = self.num_heads // self.num_kv_heads
-        group_p2 = qlen_p2 * max(16 // qlen_p2, 1 << (group - 1).bit_length())
-        if (
-            max_qlen > PA_GLUON_MAX_QUERY_LEN
-            or group_p2 > PA_GLUON_MAX_QUERY_GROUP_SIZE
-        ):
+        # tops out lower still, where an unmatched mtp picks a kernel built for
+        # another qlen and computes instead of asserting.
+        if gluon_decode_over_limit(max_qlen, self.num_heads, self.num_kv_heads):
             raise NotImplementedError(
-                f"query length {max_qlen} / group {group_p2} is past the "
-                "gluon decode kernel, and this bridge has no fallback that "
-                "takes it"
+                f"query length {max_qlen} is past the gluon decode kernel, and "
+                "this bridge has no fallback that takes it"
             )
-        # use asm pa for models without setting gluon pa decode bs
         gluon_pa_decode_bs = _GLUON_PA_DECODE_BS_MAPPING.get(self.model_type, -1)
         if self.use_triton_attn:
             return self.paged_attention_triton
-        else:
-            if ATOM_USE_GLUON_PA_DECODE and num_decodes <= gluon_pa_decode_bs:
-                return self.paged_attention_triton
-            else:
-                return self.paged_attention_asm
+        if ATOM_USE_GLUON_PA_DECODE and num_decodes <= gluon_pa_decode_bs:
+            return self.paged_attention_triton
+        # Past ASM's envelope prefer the wider kernel: ASM would silently fall
+        # back to one built for a different qlen rather than refuse.
+        if int(max_qlen) * (self.num_heads // self.num_kv_heads) > (
+            PA_ASM_MAX_QUERY_GROUP_SIZE
+        ):
+            return self.paged_attention_triton
+        return self.paged_attention_asm
 
     def forward_impl(
         self,
