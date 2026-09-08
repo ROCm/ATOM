@@ -282,6 +282,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ATOM_GC_FREEZE=0: freezing removes the cost of a pass, this only spaces
     # the passes out.  See tune_gc in atom/utils/gc_utils.py.
     "ATOM_GC_THRESHOLD": lambda: os.getenv("ATOM_GC_THRESHOLD", "").strip(),
+    # Whether the incremental detokenizer may reuse the delta it last emitted
+    # in place of one of its two decodes per update. "auto" verifies at startup
+    # that this tokenizer decodes a token span the same way wherever the window
+    # starts; "on"/"off" pin it. Unrelated to the KV prefix cache.
+    # See enable_delta_reuse in atom/entrypoints/openai/streaming_dispatch.py.
+    "ATOM_DETOKENIZER_DELTA_REUSE": lambda: os.getenv(
+        "ATOM_DETOKENIZER_DELTA_REUSE", "auto"
+    ).strip(),
+    # How often the reused delta is checked against a real decode once reuse is
+    # on. 1 checks every update; a mismatch corrects that call's output and
+    # turns reuse off for the process.
+    "ATOM_DETOKENIZER_AUDIT_EVERY": lambda: max(
+        1, int(os.getenv("ATOM_DETOKENIZER_AUDIT_EVERY", "1000"))
+    ),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
     # When profiling is active, append detailed attention aggregates (sqsq, sqsk, sk)
     # to the prefill[]/decode[] trace labels emitted by ModelRunner.run_model.

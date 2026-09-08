@@ -2,15 +2,24 @@ import asyncio
 
 import pytest
 
+from atom.entrypoints.openai import streaming_dispatch
 from atom.entrypoints.openai.streaming_dispatch import (
     IncrementalStreamDetokenizer,
     StreamBatchDispatcher,
     StreamOutputCollector,
+    enable_delta_reuse,
     merge_chunk,
 )
 
 
 class _Utf8ByteTokenizer:
+    # One token per byte, so the delta-reuse probe's sampled-vocabulary
+    # streams reach every id this double can produce.
+    vocab_size = 256
+
+    def encode(self, text, add_special_tokens=False):
+        return list(text.encode())
+
     def decode(self, token_ids, skip_special_tokens=True):
         # `bytes(x)` of an `array("i")` copies its buffer -- four bytes per id
         # -- where from a list it takes the values. A real tokenizer reads ids,
@@ -685,3 +694,127 @@ def test_failed_terminal_decode_preserves_metadata_and_fanout(fail_on, caplog):
     assert not collector._ready.is_set()
     assert "Error detokenizing stream fanout-error (tag=0)" in caplog.text
     assert "injected decode failure" in caplog.text
+
+
+class _PositionSensitiveTokenizer(_Utf8ByteTokenizer):
+    """A tokenizer whose span text depends on where the window starts.
+
+    What SentencePiece does with a leading space, in miniature. No such
+    tokenizer is installed here, so the probe's ability to reject one has to be
+    modelled or it is only ever exercised on tokenizers that pass.
+    """
+
+    def decode(self, token_ids, skip_special_tokens=True):
+        text = super().decode(token_ids, skip_special_tokens)
+        return text.lstrip(" ") if text.startswith(" ") else text
+
+
+@pytest.fixture(autouse=True)
+def _leave_delta_reuse_as_found():
+    """Process-wide state; a test that left it on would change how every later
+    test decodes."""
+    from dataclasses import replace as _replace
+
+    before = _replace(streaming_dispatch._DELTA_REUSE)
+    yield
+    for f, v in vars(before).items():
+        setattr(streaming_dispatch._DELTA_REUSE, f, v)
+
+
+def test_reuse_is_off_until_a_tokenizer_has_been_checked():
+    """Default-off, so a path that forgets to probe is slow rather than wrong."""
+    assert streaming_dispatch._DeltaReuse().enabled is False
+
+
+def test_a_well_behaved_tokenizer_is_accepted_and_skips_a_decode():
+    tokenizer = _CountingTokenizer()
+    assert enable_delta_reuse(tokenizer, "auto", audit_every=10**9) is True
+
+    tokenizer.calls = 0
+    state = IncrementalStreamDetokenizer(tokenizer)
+    text = "".join(state.update([b], b == ord("!")) for b in b"hello world!")
+
+    assert text == "hello world!"
+    # 12 tokens: without reuse each update decodes twice. The first update
+    # is audited (calls starts at zero), so one extra.
+    assert tokenizer.calls == 13
+
+
+def test_a_position_sensitive_tokenizer_is_rejected():
+    """The control the installed tokenizers cannot provide: the probe has to
+    say no to something, or "it passed" carries no information."""
+    assert enable_delta_reuse(_PositionSensitiveTokenizer(), "auto") is False
+    assert streaming_dispatch._DELTA_REUSE.enabled is False
+
+
+def test_output_is_identical_with_and_without_reuse():
+    """The property that matters. Same streams, same merge depths, both paths."""
+    tokenizer = _Utf8ByteTokenizer()
+    payload = ("你好 🎉 world ゆ\t x  " * 3).encode()
+    ids = list(payload)
+
+    def run(chunk):
+        state = IncrementalStreamDetokenizer(tokenizer)
+        return "".join(
+            state.update(ids[i : i + chunk], i + chunk >= len(ids))
+            for i in range(0, len(ids), chunk)
+        )
+
+    for chunk in (1, 2, 3, 7, 64):
+        enable_delta_reuse(tokenizer, "off")
+        plain = run(chunk)
+        enable_delta_reuse(tokenizer, "on")
+        assert run(chunk) == plain == payload.decode(), f"chunk {chunk}"
+
+
+def test_an_audit_mismatch_corrects_the_output_and_turns_reuse_off():
+    """A wrong delta must not reach the client. The audit that catches it also
+    has the decoded value in hand, so this call is answered correctly and only
+    later calls lose the shortcut."""
+    tokenizer = _Utf8ByteTokenizer()
+    enable_delta_reuse(tokenizer, "on", audit_every=1)
+    state = IncrementalStreamDetokenizer(tokenizer)
+    state.update(list(b"ab"), False)
+    state.last_delta = "wrong"
+
+    delta = state.update(list(b"cd"), True)
+
+    assert delta == "cd"
+    assert streaming_dispatch._DELTA_REUSE.enabled is False
+    assert streaming_dispatch._DELTA_REUSE.mismatches == 1
+
+
+def test_disabling_reaches_streams_already_in_flight():
+    """The flag is read per call, not captured per stream: four thousand
+    streams are open when a mismatch is found, and they must all stop trusting
+    reuse, not just the next one to arrive."""
+    tokenizer = _Utf8ByteTokenizer()
+    enable_delta_reuse(tokenizer, "on", audit_every=10**9)
+    inflight = IncrementalStreamDetokenizer(tokenizer)
+    inflight.update(list(b"xy"), False)
+
+    streaming_dispatch._DELTA_REUSE.enabled = False
+    tokenizer_calls_before = None
+    counting = _CountingTokenizer()
+    inflight.tokenizer = counting
+    counting.calls = 0
+    inflight.update(list(b"z"), True)
+
+    assert tokenizer_calls_before is None
+    assert counting.calls == 2, "still trusting the delta after reuse was off"
+
+
+def test_an_empty_update_does_not_disturb_the_stream():
+    """`update()` documents this as legal, and delta reuse is why it now
+    matters: an empty call that touched `last_delta` would leave it naming a
+    span it does not describe, and every later delta would be cut at the wrong
+    length. Nothing would raise."""
+    tokenizer = _Utf8ByteTokenizer()
+    enable_delta_reuse(tokenizer, "on", audit_every=10**9)
+    state = IncrementalStreamDetokenizer(tokenizer)
+
+    assert state.update(list(b"ab"), False) == "ab"
+    carried = state.last_delta
+    assert state.update([], False) == ""
+    assert state.last_delta == carried
+    assert state.update(list(b"cd"), True) == "cd"

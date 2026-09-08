@@ -42,6 +42,7 @@ from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.multimodal import build_multimodal_inputs
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import new_token_ids
+from atom.utils import envs
 from atom.utils.arg_parser import FlexibleArgumentParser
 from atom.utils.gc_utils import (
     FRONTEND_GC_THRESHOLD,
@@ -114,6 +115,7 @@ from .streaming_dispatch import (
     FrameWait,
     StreamBatchDispatcher,
     StreamOutputCollector,
+    enable_delta_reuse,
 )
 from .tool_parser import (
     ToolCallStreamParser,
@@ -663,7 +665,7 @@ def _load_image_from_url(url: str) -> "Image.Image":
 
 
 def _get_multimodal_processor():
-    global processor, model_name
+    global processor
     if processor is None:
         logger.info(f"Loading multimodal processor from {model_name}...")
         processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
@@ -1096,7 +1098,6 @@ async def generate_async_fanout(
     :func:`generate_async` yields for n==1, so response builders can treat
     each entry the same way.
     """
-    global engine, tokenizer
 
     n = int(sampling_params.n)
     assert n >= 1
@@ -1618,7 +1619,6 @@ async def general_error_handler(request: Request, exc: Exception):
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest, raw_request: Request):
     """Handle chat completion requests (OpenAI-compatible)."""
-    global engine, tokenizer, model_name
 
     validate_model(request.model)
 
@@ -1882,7 +1882,6 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
 @app.post("/v1/completions")
 async def completions(request: CompletionRequest, raw_request: Request):
     """Handle text completion requests (OpenAI-compatible)."""
-    global engine, tokenizer, model_name
 
     validate_model(request.model)
 
@@ -2659,6 +2658,13 @@ def main():
         )
     _stream_batch_dispatcher = StreamBatchDispatcher(
         tokenizer, synthetic_text=synthetic_token_text
+    )
+    # Here and not in the dispatcher's constructor: it replays a few thousand
+    # updates, which every test that builds a dispatcher would then pay for.
+    enable_delta_reuse(
+        tokenizer,
+        envs.ATOM_DETOKENIZER_DELTA_REUSE,
+        envs.ATOM_DETOKENIZER_AUDIT_EVERY,
     )
 
     # Wire the batched stream-flush hook: per-seq stream callbacks only buffer
