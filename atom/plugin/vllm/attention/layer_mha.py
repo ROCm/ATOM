@@ -723,18 +723,25 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             suffix_lse=lse,
         )
 
-    def _dispatch_decode_backend(self, num_decodes, max_qlen=1):
-        # The gluon decode kernel asserts on two independent limits (aiter
-        # pa_decode_gluon.py): the query length, and the query group
-        # max_qlen * (q_heads / kv_heads). Drafting multiplies both, and a model
-        # can hit either first. Route to asm instead of reaching the assert --
-        # this mirrors the same check in model_ops/attention_mha.py.
+    def _dispatch_decode_backend(self, num_decodes, max_qlen):
+        # Past the gluon decode kernel's limits there is nowhere to go on this
+        # bridge: it has no unified branch (the server-side impl does), and the
+        # ASM path tops out lower still at qlen * gqa <= 16 (asm_pa.cu:113) --
+        # M3 already fails to start on it at 64. Worse, ASM does not always
+        # assert: an unmatched mtp falls back to a kernel compiled for a
+        # different qlen and computes. Refuse here instead.
+        qlen_p2 = 1 << (max_qlen - 1).bit_length()
+        group = self.num_heads // self.num_kv_heads
+        group_p2 = qlen_p2 * max(16 // qlen_p2, 1 << (group - 1).bit_length())
         if (
             max_qlen > PA_GLUON_MAX_QUERY_LEN
-            or max_qlen * (self.num_heads // self.num_kv_heads)
-            > PA_GLUON_MAX_QUERY_GROUP_SIZE
+            or group_p2 > PA_GLUON_MAX_QUERY_GROUP_SIZE
         ):
-            return self.paged_attention_asm
+            raise NotImplementedError(
+                f"query length {max_qlen} / group {group_p2} is past the "
+                "gluon decode kernel, and this bridge has no fallback that "
+                "takes it"
+            )
         # use asm pa for models without setting gluon pa decode bs
         gluon_pa_decode_bs = _GLUON_PA_DECODE_BS_MAPPING.get(self.model_type, -1)
         if self.use_triton_attn:

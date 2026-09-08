@@ -35,12 +35,13 @@ def use_pa_decode_bf16_asm() -> bool:
 
 
 # Two independent limits the gluon decode kernel asserts on
-# (aiter pa_decode_gluon.py): the query length itself, and the query group
-# max_seqlen_q * (q_heads / kv_heads). Drafting multiplies both, so a model can
-# hit either one first -- M3 sits exactly on the group limit today (16 x 4 draft
-# positions) while a gqa=8 model reaches the length limit with the group still
-# at 40. Checked here so the choice of backend accounts for them, rather than
-# reaching the kernel and asserting.
+# (aiter pa_decode_gluon.py): the query length itself, and the query group.
+# Drafting multiplies both, so a model can hit either one first -- M3 sits
+# exactly on the group limit today (16 x 4 draft positions) while a gqa=8 model
+# reaches the length limit with its group still at 40. Both are checked against
+# the pow2 forms the kernel actually indexes its layout table with, not the raw
+# product, so the choice of backend accounts for them rather than reaching the
+# kernel and asserting.
 PA_GLUON_MAX_QUERY_LEN = 4
 PA_GLUON_MAX_QUERY_GROUP_SIZE = 64
 
@@ -89,7 +90,9 @@ class PagedAttentionImpl(nn.Module):
             if self.kv_cache_dtype == "fp8"
             else 1.0
         )
-        self.kv_scale = torch.tensor(self.kv_scale_float, dtype=torch.float32)
+        self.kv_scale = torch.tensor(
+            self.kv_scale_float, dtype=torch.float32, device=self.device
+        )
         # Pre-allocated fp8 dequant scale for the pa_decode_bf16_asm path. Built
         # here (outside CUDAGraph capture) and reused so the kernel wrapper never
         # allocates a tensor mid-capture.
@@ -500,10 +503,16 @@ class PagedAttentionImpl(nn.Module):
 
         num_seqs = attn_metadata.context_lens.shape[0]
 
+        # The kernel sizes its register layout from the pow2 forms, not the
+        # raw product (aiter pa_decode_gluon.py:383-389), and rounds a small
+        # group up to fill 16. Checking the raw product lets qlen=3 with
+        # gqa 17-21 through at 4*32=128, which has no arm in the table.
+        qlen_p2 = 1 << (attn_metadata.max_seqlen_q - 1).bit_length()
+        group = self.num_heads // self.num_kv_heads
+        group_p2 = qlen_p2 * max(16 // qlen_p2, 1 << (group - 1).bit_length())
         gluon_over_limit = (
             attn_metadata.max_seqlen_q > PA_GLUON_MAX_QUERY_LEN
-            or attn_metadata.max_seqlen_q * (self.num_heads // self.num_kv_heads)
-            > PA_GLUON_MAX_QUERY_GROUP_SIZE
+            or group_p2 > PA_GLUON_MAX_QUERY_GROUP_SIZE
         )
         # unified takes one descale for the whole tensor, so a per-token
         # quantized cache cannot be expressed on this path. Refuse rather than
@@ -511,8 +520,7 @@ class PagedAttentionImpl(nn.Module):
         # wrong numbers. The gluon branch below is what handles per-token.
         if gluon_over_limit and k_scale is not None and k_scale.numel() > 1:
             raise NotImplementedError(
-                f"query length {attn_metadata.max_seqlen_q} / group "
-                f"{attn_metadata.max_seqlen_q * (self.num_heads // self.num_kv_heads)} "
+                f"query length {attn_metadata.max_seqlen_q} / group {group_p2} "
                 "is past what the gluon decode kernel takes, and the unified "
                 "fallback cannot carry this layer's per-token KV scales"
             )

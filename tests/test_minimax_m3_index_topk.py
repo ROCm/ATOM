@@ -22,9 +22,7 @@ import torch
 pytest.importorskip("triton", reason="index_topk defines @triton.jit kernels")
 
 from atom.model_ops.minimax_m3.index_topk import (
-    DECODE_SCORE_MAX_CHUNKS,
     DECODE_SCORE_MIN_BLOCKS,
-    DECODE_SCORE_TARGET_GRID,
     PREFILL_TOPK_MAX_BLOCK_SIZE_K,
     PREFILL_TOPK_MIN_BLOCK_SIZE_K,
     SPARSE_BLOCK_SIZE,
@@ -102,14 +100,7 @@ class TestDecodeScoreChunks:
             assert cur <= prev
             prev = cur
 
-    def test_grid_stays_near_the_target(self):
-        # KNOWN GAP: TARGET_GRID is raised out of the way, so it only binds at
-        # batch > 3 * TARGET_GRID / max_block. What still holds at every batch
-        # is the per-request count, which MIN_BLOCKS caps.
-        for batch in (1, 8, 50, 64):
-            assert _decode_score_chunks(batch, 4096) <= -(-4096 // DECODE_SCORE_MIN_BLOCKS)
-
-    @pytest.mark.parametrize("max_block", [3, 64, 800, 2464, 8192, 65534])
+    @pytest.mark.parametrize("max_block", [3, 5, 64, 800, 2464, 8192, 65534])
     @pytest.mark.parametrize("batch", [1, 8, 64])
     def test_a_chunk_walks_at_least_min_blocks(self, batch, max_block):
         """The floor is the whole point of the split rule: a chunk down to one
@@ -118,11 +109,14 @@ class TestDecodeScoreChunks:
         n = _decode_score_chunks(batch, max_block)
         assert -(-max_block // n) >= DECODE_SCORE_MIN_BLOCKS
 
-    def test_the_floor_is_a_target_not_a_guarantee(self):
-        # Below MIN_BLOCKS worth of work there is nothing to floor: one chunk
-        # is already the whole row.
-        for max_block in (1, 2):
-            assert _decode_score_chunks(1, max_block) == 1
+    @pytest.mark.parametrize("max_block,want_chunks", [(1, 1), (2, 1), (4, 2)])
+    def test_the_floor_is_a_target_not_a_guarantee(self, max_block, want_chunks):
+        """Right above MIN_BLOCKS the floor cannot hand out a second full
+        chunk: max_block=4 splits into 2 chunks of 2, under the floor. Nothing
+        is wrong with that -- 2 blocks still amortize the query tile -- but the
+        floor is a target, so `test_a_chunk_walks_at_least_min_blocks` skips
+        this range rather than asserting something untrue about it."""
+        assert _decode_score_chunks(1, max_block) == want_chunks
 
 
 class TestPackableBound:
