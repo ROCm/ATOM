@@ -8,6 +8,10 @@ from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 from torch import nn
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
+from atom.model_ops.attention_mha import (
+    PA_GLUON_MAX_QUERY_GROUP_SIZE,
+    PA_GLUON_MAX_QUERY_LEN,
+)
 from atom.config import get_current_atom_config
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import (
@@ -719,7 +723,18 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             suffix_lse=lse,
         )
 
-    def _dispatch_decode_backend(self, num_decodes):
+    def _dispatch_decode_backend(self, num_decodes, max_qlen=1):
+        # The gluon decode kernel asserts on two independent limits (aiter
+        # pa_decode_gluon.py): the query length, and the query group
+        # max_qlen * (q_heads / kv_heads). Drafting multiplies both, and a model
+        # can hit either first. Route to asm instead of reaching the assert --
+        # this mirrors the same check in model_ops/attention_mha.py.
+        if (
+            max_qlen > PA_GLUON_MAX_QUERY_LEN
+            or max_qlen * (self.num_heads // self.num_kv_heads)
+            > PA_GLUON_MAX_QUERY_GROUP_SIZE
+        ):
+            return self.paged_attention_asm
         # use asm pa for models without setting gluon pa decode bs
         gluon_pa_decode_bs = _GLUON_PA_DECODE_BS_MAPPING.get(self.model_type, -1)
         if self.use_triton_attn:
@@ -915,7 +930,9 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         if num_decodes > 0:
             assert attn_metadata.decode_metadata is not None
 
-            decode_backend_func = self._dispatch_decode_backend(num_decodes)
+            decode_backend_func = self._dispatch_decode_backend(
+                num_decodes, attn_metadata.decode_metadata.max_query_len
+            )
             decode_backend_func(
                 q=query[:num_decode_tokens],
                 k_cache=new_key_cache,

@@ -34,12 +34,14 @@ def use_pa_decode_bf16_asm() -> bool:
     )
 
 
-# Largest query group the gluon decode kernel can take: its register-layout
-# table has arms for 16/32/64 only, and past 64 nothing binds `register_bases`
-# -- the failure is a Triton compile error that never mentions speculation.
-# The group is max_seqlen_q * (q_heads / kv_heads), so drafting multiplies it:
-# M3 sits exactly on the limit today (16 x 4 draft positions), and one more
-# draft token would overflow it. vLLM guards the same bound.
+# Two independent limits the gluon decode kernel asserts on
+# (aiter pa_decode_gluon.py): the query length itself, and the query group
+# max_seqlen_q * (q_heads / kv_heads). Drafting multiplies both, so a model can
+# hit either one first -- M3 sits exactly on the group limit today (16 x 4 draft
+# positions) while a gqa=8 model reaches the length limit with the group still
+# at 40. Checked here so the choice of backend accounts for them, rather than
+# reaching the kernel and asserting.
+PA_GLUON_MAX_QUERY_LEN = 4
 PA_GLUON_MAX_QUERY_GROUP_SIZE = 64
 
 
@@ -498,14 +500,23 @@ class PagedAttentionImpl(nn.Module):
 
         num_seqs = attn_metadata.context_lens.shape[0]
 
-        # Group-size term last: k_cache only carries the 5D shuffle layout this
-        # indexing assumes when the gluon path is otherwise the choice.
-        if (
-            envs.ATOM_USE_UNIFIED_ATTN
-            or self.use_flash_layout
-            or attn_metadata.max_seqlen_q * (q.shape[1] // k_cache.shape[1])
+        gluon_over_limit = (
+            attn_metadata.max_seqlen_q > PA_GLUON_MAX_QUERY_LEN
+            or attn_metadata.max_seqlen_q * (self.num_heads // self.num_kv_heads)
             > PA_GLUON_MAX_QUERY_GROUP_SIZE
-        ):
+        )
+        # unified takes one descale for the whole tensor, so a per-token
+        # quantized cache cannot be expressed on this path. Refuse rather than
+        # run: the wrong descale is not an error anywhere downstream, it is just
+        # wrong numbers. The gluon branch below is what handles per-token.
+        if gluon_over_limit and k_scale is not None and k_scale.numel() > 1:
+            raise NotImplementedError(
+                f"query length {attn_metadata.max_seqlen_q} / group "
+                f"{attn_metadata.max_seqlen_q * (self.num_heads // self.num_kv_heads)} "
+                "is past what the gluon decode kernel takes, and the unified "
+                "fallback cannot carry this layer's per-token KV scales"
+            )
+        if envs.ATOM_USE_UNIFIED_ATTN or self.use_flash_layout or gluon_over_limit:
             # print(q.shape, k_cache.shape, v_cache.shape)
             sliding_window = (
                 (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
