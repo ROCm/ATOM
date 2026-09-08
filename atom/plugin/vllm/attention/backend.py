@@ -172,11 +172,49 @@ class AiterMhaBackendForVllm(_VllmAttentionBackendCompat):
 
 
 class AiterMhaFlexibleBlockBackendForVllm(AiterMhaBackendForVllm):
-    """Draft-only backend whose Triton path accepts the logical KV page size."""
+    """MHA surface whose Triton path accepts the logical KV page size.
+
+    The strict parent pins the kernel page at 16 to keep fp8 hybrid models off
+    the page-16 asm kernels when vLLM's manager page is larger. That guard is
+    about the asm path: at any block != 16 ``AttentionForVllmMHA`` sets
+    ``use_triton_attn`` and runs the block-size-agnostic Triton insert/decode
+    instead, which is safe at the logical page. Used by the Eagle3 draft (which
+    shares the target's page so it can join one uniform-type group) and by M3's
+    dense layers (whose group is pinned to the sparse backend's page 128).
+    """
 
     @staticmethod
     def get_supported_kernel_block_sizes():
         return [MultipleOf(16)]
+
+
+class AiterMhaM3DenseBackendForVllm(AiterMhaFlexibleBlockBackendForVllm):
+    """MiniMax-M3 dense layers under ATOM_M3_DENSE_ATTN_BACKEND=gluon.
+
+    Separate from the shared MHA surfaces so the layout request below reaches
+    only M3's 3 dense layers: ``resolve_kv_cache_layout`` intersects what every
+    backend publishes, so a preference declared on a shared class would follow
+    every MHA model into the negotiation.
+    """
+
+    @classmethod
+    def supported_kv_cache_layouts(cls):
+        """Publish the layouts whose K/V slot axis stays outside N.
+
+        ``num_head_slots=2`` only separates K and V if the layout does not put
+        N between H and C -- ``LBNHC``/``BLNHC`` would re-interleave the sides
+        per token, which no later reinterpretation can undo. Of the layouts
+        that keep them apart, only ``LBHNC`` is block-compact, which vLLM
+        requires once specs disagree on HNC (M3's key-only indexer spec makes
+        them disagree). ``LHBNC`` trails it for a vLLM carrying the
+        single-uniform-group exemption; a single-element tuple would leave the
+        candidate list empty and abort startup.
+        """
+        from atom.utils import envs
+
+        if envs.ATOM_M3_DENSE_ATTN_BACKEND != "gluon":
+            return None
+        return (KVCacheLayout.LBHNC, KVCacheLayout.LHBNC)
 
 
 class AiterMlaBackendForVllm(_VllmAttentionBackendCompat):

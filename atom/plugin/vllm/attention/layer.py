@@ -65,9 +65,9 @@ def _minimax_m3_attention_cls_for_vllm(atom_config, kwargs):
         # handles via `triton_fused_norm_rope_cache` (norm + RoPE + fp8 shuffle
         # cache write), and at block != 16 always takes the block-agnostic Triton
         # read, so running at the 128 page is correct.
-        import os
+        from atom.utils import envs
 
-        if os.environ.get("ATOM_M3_DENSE_ATTN_BACKEND", "triton").lower() == "aiter":
+        if envs.ATOM_M3_DENSE_ATTN_BACKEND in ("aiter", "gluon"):
             return AttentionForVllmMHA
 
         from atom.plugin.vllm.attention.minimax_m3_attnetion import (

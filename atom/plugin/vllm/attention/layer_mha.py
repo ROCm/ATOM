@@ -18,6 +18,7 @@ from atom.model_ops.base_attention import (
 from atom.plugin.vllm.attention.backend import (
     AiterMhaBackendForVllm,
     AiterMhaFlexibleBlockBackendForVllm,
+    AiterMhaM3DenseBackendForVllm,
 )
 from atom.plugin.vllm.attention.layer_common import (
     _register_vllm_static_forward_context,
@@ -75,8 +76,26 @@ def _set_default_mha_scales(layer) -> None:
         layer._o_scale_float = None
 
 
+_M3_MODEL_TYPES = ("minimax_m3", "minimax_m3_sparse")
+
+
+def _m3_dense_attn_mode(hf_config) -> str:
+    """Dense-attention mode, but only for MiniMax-M3.
+
+    The env name says M3 and the behaviour must match it: `_mha_backend_for_layer`
+    and `get_kv_cache_spec` run for every model that uses this layer, so reading
+    the variable unconditionally would let a stray export follow Llama or Qwen
+    into a different backend and KV spec.
+    """
+    from atom.utils import envs
+
+    model_type = str(getattr(hf_config, "model_type", "") or "").lower()
+    if model_type not in _M3_MODEL_TYPES:
+        return "triton"
+    return envs.ATOM_M3_DENSE_ATTN_BACKEND
+
+
 def _mha_backend_for_layer(layer_num: int, hf_config):
-    import os
 
     num_hidden_layers = int(getattr(hf_config, "num_hidden_layers", 1 << 30))
     if layer_num >= num_hidden_layers:
@@ -91,7 +110,11 @@ def _mha_backend_for_layer(layer_num: int, hf_config):
     # block-size-agnostic Triton path (use_triton_attn=True), so executing the
     # cache/PA kernels at the logical 128 page is correct here rather than the
     # page-16 asm path the strict [16] guard exists to protect.
-    if os.environ.get("ATOM_M3_DENSE_ATTN_BACKEND", "triton").lower() == "aiter":
+    mode = _m3_dense_attn_mode(hf_config)
+    if mode == "gluon":
+        # Also requests the K/V-separated cache; see the backend's docstring.
+        return AiterMhaM3DenseBackendForVllm
+    if mode == "aiter":
         return AiterMhaFlexibleBlockBackendForVllm
     return AiterMhaBackendForVllm
 
@@ -169,6 +192,10 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         self.supports_quant_query_input = False
 
         self.model_type = getattr(hf_config, "model_type", "")
+        # One source of truth for the three code paths that must agree: the
+        # backend published above, the KV spec below, and forward_impl.
+        self.m3_dense_attn_mode = _m3_dense_attn_mode(hf_config)
+        self.kv_separated = self.m3_dense_attn_mode == "gluon"
 
         _init_vllm_mha_layer_state(
             self,
@@ -804,6 +831,29 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         # (vllm/v1/attention/backends/{rocm_aiter_fa,triton_attn}.py). This is
         # the path the Eagle3 MHA speculative-decode draft takes: bf16 KV,
         # causal, multi-token decode.
+        if self.kv_separated:
+            # ATOM_M3_DENSE_ATTN_BACKEND=gluon got vLLM to allocate the
+            # K/V-separated cache the page-16 shuffle kernels need, and
+            # m3_dense_kv_layout turns it into their view pair. What is not
+            # wired yet is the read side: rope_cache, extend_forward and
+            # _dispatch_decode_backend all index the cache and the block table
+            # in manager blocks, and under this layout both have to be restated
+            # in 16-token pages (m3_dense_kv_layout.rebase_slots_to_page16 and
+            # expand_block_table_to_page16 do the arithmetic; the metadata
+            # rebasing that feeds them does not exist yet).
+            #
+            # Refuse rather than fall through. Running the manager-block
+            # arithmetic against this cache does not fault -- it reads real KV
+            # from the wrong page, and the model keeps answering.
+            raise NotImplementedError(
+                "ATOM_M3_DENSE_ATTN_BACKEND=gluon allocated a K/V-separated KV "
+                f"cache (shape {tuple(kv_cache.shape)}), but the dense read path "
+                "still addresses it in manager blocks. Rebase "
+                "attn_metadata.slot_mapping and .block_table onto 16-token pages "
+                "first (see atom/plugin/vllm/attention/m3_dense_kv_layout.py). "
+                "Use ATOM_M3_DENSE_ATTN_BACKEND=aiter for the validated path."
+            )
+
         if kv_cache.dim() == 4 and kv_cache.shape[-1] == 2 * self.head_dim:
             return self._forward_vllm_native_combined_kv(
                 query,
@@ -995,9 +1045,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         from aiter.ops.triton.unified_attention import unified_attention
 
         # (B, H, N, 2*hs) -> two (B, N, H, hs) views aliasing the same buffer.
-        key_cache, value_cache = kv_cache.transpose(1, 2).split(
-            self.head_size, dim=-1
-        )
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
         if self.kv_cache_dtype.startswith("fp8"):
             target_dtype = dtypes.d_dtypes[self.kv_cache_dtype]
             key_cache = key_cache.view(target_dtype)
@@ -1034,9 +1082,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         # reshape_and_cache_flash writes num_actual_tokens rows (from
         # slot_mapping's length), aliasing straight into the combined buffer.
         kv_cache_dtype = (
-            self.kv_cache_dtype
-            if self.kv_cache_dtype.startswith("fp8")
-            else "auto"
+            self.kv_cache_dtype if self.kv_cache_dtype.startswith("fp8") else "auto"
         )
         slot_mapping = attn_metadata.slot_mapping[:num_actual_tokens]
         torch.ops._C_cache_ops.reshape_and_cache_flash(
@@ -1100,6 +1146,27 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
                 head_size=self.head_size,
                 dtype=self.kv_cache_torch_dtype,
                 sliding_window=self.sliding_window,
+            )
+        if self.kv_separated:
+            # Ask vLLM to put K and V on the H axis instead of packing both into
+            # the content dim. RFC #42082's default (C = head_size + head_size_v)
+            # interleaves the two sides per token, and the shuffle kernels
+            # rearrange a whole head_size x block_size tile per side, so no
+            # stride permutation can separate them afterwards. Two head slots
+            # plus a per-side content size keeps the page byte count identical
+            # and makes the sides addressable.
+            return FullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=self.head_size_v,
+                dtype=self.kv_cache_torch_dtype,
+                num_head_slots=2,
+                state_content_bytes=(
+                    self.num_kv_heads
+                    * self.head_size
+                    * self.kv_cache_torch_dtype.itemsize
+                ),
             )
         return FullAttentionSpec(
             block_size=block_size,

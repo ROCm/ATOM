@@ -347,6 +347,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
     ),
+    # MiniMax-M3's 3 dense (full-attention) layers. "triton" keeps vLLM's own
+    # unified_attention; "aiter" routes them through ATOM's MHA layer, which on
+    # vLLM 0.28's combined [K|V] cache still lands on aiter's unified_attention
+    # (native fp8 instead of a bf16 upcast); "gluon" additionally asks vLLM for a
+    # K/V-separated cache so the page-16 shuffle kernels become reachable.
+    "ATOM_M3_DENSE_ATTN_BACKEND": lambda: (
+        os.getenv("ATOM_M3_DENSE_ATTN_BACKEND", "triton").strip().lower()
+    ),
     # --- Plugin Mode ---
     "ATOM_DISABLE_VLLM_PLUGIN": lambda: (
         os.getenv("ATOM_DISABLE_VLLM_PLUGIN", "0").lower() == "1"
