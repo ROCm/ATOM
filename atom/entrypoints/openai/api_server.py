@@ -74,6 +74,7 @@ from .reasoning import (
     thinking_switched_off,
 )
 from .reasoning_dialects import resolve_dialect
+from .request_timing import RequestTimingMiddleware, record_nonstream_first_token
 from .serving_anthropic import (
     AnthropicBlocks,
     AnthropicMessagesRequest,
@@ -924,6 +925,7 @@ async def generate_async(
             if token_ids:
                 if first_token_at is None:
                     first_token_at = item.get("ts", time.time())
+                    record_nonstream_first_token()
                 last_token_at = item.get("ts", time.time())
                 all_token_ids.extend(token_ids)
             if item.get("finished", False):
@@ -1036,6 +1038,7 @@ async def generate_async_multimodal(
             if token_ids_out:
                 if first_token_at is None:
                     first_token_at = item.get("ts", time.time())
+                    record_nonstream_first_token()
                 last_token_at = item.get("ts", time.time())
                 all_token_ids.extend(token_ids_out)
             if item.get("finished", False):
@@ -1160,6 +1163,7 @@ async def generate_async_fanout(
             if tokens:
                 if per_first_token_at[idx] is None:
                     per_first_token_at[idx] = item.get("ts", time.time())
+                    record_nonstream_first_token()
                 per_last_token_at[idx] = item.get("ts", time.time())
                 per_tokens[idx].extend(tokens)
             if item.get("finished", False):
@@ -1568,6 +1572,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="ATOM OpenAI API Server", lifespan=lifespan)
+app.add_middleware(
+    RequestTimingMiddleware,
+    observe_ttft=_metrics_exporter.observe_time_to_first_token,
+)
 
 
 # ---- Error handlers ----

@@ -8,7 +8,17 @@ scrape_configs:
     static_configs:
       - targets: ["127.0.0.1:8010"]
         labels:
+          observer: api
           role: prefill
       - targets: ["127.0.0.1:8020"]
         labels:
+          observer: api
           role: decode
+  - job_name: atom-mesh
+    metrics_path: /metrics
+    static_configs:
+      # Mesh's dedicated metrics listener (set with --prometheus-port).
+      - targets: ["127.0.0.1:29000"]
+        labels:
+          observer: mesh
+          role: router

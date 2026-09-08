@@ -432,6 +432,41 @@ class AtomMetricsExporter:
             ),
             registry=self._registry,
         )
+        self._time_to_first_token = Histogram(
+            "atom:time_to_first_token_seconds",
+            "Local API request arrival to first output. Streaming observes the "
+            "first generated SSE payload; non-streaming observes the first "
+            "internal token delivery. One sample per request.",
+            labelnames=("streaming",),
+            buckets=(
+                0.001,
+                0.005,
+                0.010,
+                0.025,
+                0.050,
+                0.100,
+                0.250,
+                0.500,
+                1.0,
+                2.5,
+                5.0,
+                10.0,
+                15.0,
+                30.0,
+                45.0,
+                60.0,
+                90.0,
+                120.0,
+                180.0,
+                240.0,
+            ),
+            registry=self._registry,
+        )
+
+    def observe_time_to_first_token(self, interval: float, streaming: bool) -> None:
+        self._time_to_first_token.labels(streaming=str(streaming).lower()).observe(
+            interval
+        )
 
     def observe_inter_token_latency(self, interval: float, num_new_tokens: int) -> None:
         """Record token-weighted output intervals using public Histogram APIs.

@@ -10,3 +10,6 @@ scrape_configs:
       # With Docker on Linux, the documented --network host uses the host's
       # loopback interface. Change this if ATOM runs on another machine.
       - targets: ["127.0.0.1:8000"]
+        labels:
+          observer: api
+          role: standalone
