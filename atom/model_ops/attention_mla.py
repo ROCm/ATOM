@@ -3,6 +3,7 @@
 
 import logging
 from dataclasses import dataclass
+from functools import lru_cache
 from functools import partial as functools_partial
 from typing import ClassVar, Protocol
 
@@ -470,6 +471,43 @@ if is_rocm_aiter_fp4bmm_enabled():
     from atom.model_ops.utils import quark_post_load_weights
 
 
+# --------------------------------------------------------------------------
+# Optional flydsl backend for `_kv_b_proj_gather` (ATOM_USE_FLYDSL_GATHER_KV_B_PROJ)
+# --------------------------------------------------------------------------
+# The flydsl gather-GEMM covers one shape family -- page_size-1 fp8 (OCP e4m3)
+# KV rows of kv_lora_rank + rope == 512 + 64, an fp8 weight, and bf16 outputs on
+# gfx950 -- which is precisely Kimi-K3 / DeepSeek MLA under `--kv-cache-dtype
+# fp8` with ptpc_fp8 online quant. It validates all of that itself and raises
+# ValueError, so we do not restate its preconditions here: we call it, and on
+# ValueError fall back to the Triton op, which covers the general case (paged
+# blocks, mxfp4 weights, shuffled cache). The fallback is decided once, on the
+# first call, because every subsequent call in a process has the same shapes.
+_flydsl_gather_logged: set[str] = set()
+
+
+@lru_cache(maxsize=1)
+def _load_flydsl_gather_kv_b_proj():
+    """Import the flydsl gather lazily -- it pulls in the flydsl compiler and
+    JIT-builds on first launch, which nothing should pay for while the flag is
+    off. Returns ``None`` when flydsl is unavailable."""
+    try:
+        from aiter.ops.flydsl import gather_kv_b_proj_flydsl
+
+        return gather_kv_b_proj_flydsl
+    except Exception as exc:  # noqa: BLE001 - flydsl may fail to import or JIT
+        logger.warning("[MLA] flydsl gather_kv_b_proj unavailable: %s", exc)
+        return None
+
+
+def _log_flydsl_gather_once(key: str, level: int, msg: str, *args) -> None:
+    """One line per distinct outcome per process -- the gather runs once per
+    full-attention layer per chunk, so an unguarded log would flood."""
+    if key in _flydsl_gather_logged:
+        return
+    _flydsl_gather_logged.add(key)
+    logger.log(level, msg, *args)
+
+
 # MLA Specific Arguments
 @dataclass
 class MLAModules:
@@ -661,6 +699,10 @@ class MLAAttention(nn.Module):
         # ==1 falls back to the original interleaved per-token (page_size=1)
         # kernels with an unpadded 576-wide q_out. The triton path never uses seg.
         self.use_seg_mla = (not self.use_triton_mla) and envs.ATOM_MLA_PAGE_SIZE > 1
+        # Backend for the cached-prefix gather in `_kv_b_proj_gather`. Read once
+        # here rather than per call: the gather runs once per full-attention
+        # layer per prefill chunk.
+        self.use_flydsl_gather = bool(envs.ATOM_USE_FLYDSL_GATHER_KV_B_PROJ)
         if self.use_seg_mla:
             if envs.ATOM_MLA_PAGE_SIZE != _MLA_SEG_PAGE_SIZE:
                 raise RuntimeError(
@@ -1376,17 +1418,63 @@ class MLAAttention(nn.Module):
         DCP -- and ``kv_indices`` selects rows out of it.
         """
         weight = self.kv_b_proj.weight
+        gather_weight = _maybe_view_mxfp4_weight_for_gather(self.kv_b_proj, weight)
+        weight_scale = getattr(self.kv_b_proj, "weight_scale", None)
+        preshuffled = getattr(weight, "is_shuffled", False)
+
+        if self.use_flydsl_gather:
+            flydsl_gather = _load_flydsl_gather_kv_b_proj()
+            if flydsl_gather is None:
+                self.use_flydsl_gather = False
+            else:
+                try:
+                    flydsl_gather(
+                        kv_buffer,
+                        self._k_scale,
+                        kv_indptr,
+                        kv_indices,
+                        cu_seqlens_k,
+                        gather_weight,
+                        weight_scale,
+                        k_out,
+                        v_out,
+                        weight_preshuffle=preshuffled,
+                    )
+                except ValueError as exc:
+                    # The backend rejects unsupported shapes before it launches
+                    # anything, so the outputs are untouched and Triton can still
+                    # serve this call. Stop trying: the shapes do not change.
+                    self.use_flydsl_gather = False
+                    _log_flydsl_gather_once(
+                        "fallback",
+                        logging.WARNING,
+                        "[MLA] ATOM_USE_FLYDSL_GATHER_KV_B_PROJ=1 but the flydsl "
+                        "gather rejected this call (%s); falling back to Triton.",
+                        exc,
+                    )
+                else:
+                    _log_flydsl_gather_once(
+                        "used",
+                        logging.INFO,
+                        "[MLA] gather_kv_b_proj: using the flydsl backend "
+                        "(kv=%s weight=%s preshuffle=%s)",
+                        tuple(kv_buffer.shape),
+                        tuple(gather_weight.shape),
+                        preshuffled,
+                    )
+                    return
+
         gather_kv_b_proj(
             kv_buffer,
             self._k_scale,
             kv_indptr,
             kv_indices,
             cu_seqlens_k,
-            _maybe_view_mxfp4_weight_for_gather(self.kv_b_proj, weight),
-            getattr(self.kv_b_proj, "weight_scale", None),
+            gather_weight,
+            weight_scale,
             k_out,
             v_out,
-            weight_preshuffle=getattr(weight, "is_shuffled", False),
+            weight_preshuffle=preshuffled,
         )
 
     def _forward_prefill_cached_chunked(
