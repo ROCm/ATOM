@@ -1546,7 +1546,7 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     md.state_slot_mapping = bufs.stage(bufs.state_slot, slot_arr, bs)
     _resolve_v4_pool_geometry(md, proxy_pool, model)
     _bind_v4_state_slots(md)
-    md.batch_id_per_token_cpu = batch_np
+    md.batch_id_per_q_token_cpu = batch_np
     md.batch_id_per_q_token = bufs.stage(bufs.batch_id, batch_pad, t_pad)
     n_csa = (seq_np // 4).astype(np.int32)
     md.n_committed_csa_per_seq_cpu = n_csa
@@ -1818,7 +1818,7 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
     md.state_slot_mapping = bufs.state_slot.gpu[:bs]
     _resolve_v4_pool_geometry(md, proxy_pool, model)
     _bind_v4_state_slots(md)
-    md.batch_id_per_token_cpu = batch_np
+    md.batch_id_per_q_token_cpu = batch_np
     md.batch_id_per_q_token = bufs.stage(bufs.batch_id, batch_np, total)
 
     n_csa = (seq_np // 4).astype(np.int32)
@@ -2044,7 +2044,7 @@ def build_atom_v4_attention_metadata_from_sglang(
         )
     _resolve_v4_pool_geometry(md, proxy_pool)
     _bind_v4_state_slots(md)
-    md.batch_id_per_token_cpu = batch_np
+    md.batch_id_per_q_token_cpu = batch_np
     md.batch_id_per_q_token = torch.from_numpy(batch_np).to(device=device)
     md.n_committed_csa_per_seq_cpu = (seq_np // 4).astype(np.int32)
     md.n_committed_csa_per_seq = torch.from_numpy(md.n_committed_csa_per_seq_cpu).to(
