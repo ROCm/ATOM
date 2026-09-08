@@ -9,20 +9,27 @@ them into the content dim, which is what the AITER shuffle kernels need: each
 side must be its own run of whole 16-token pages.
 
 Of the six ``KVCacheLayout`` permutations only the ones that keep ``H`` outside
-``N`` preserve that, and of those only ``LBHNC`` is block-compact -- the property
-vLLM demands once a model mixes page sizes (M3's key-only indexer spec does).
-So ``LBHNC`` is what this module adapts:
+``N`` preserve that: ``LHBNC`` and ``LBHNC``.
+
+``LHBNC`` is the one to want. It stores one dense K plane then one dense V
+plane, which is byte-for-byte the geometry ATOM allocates natively, so
+:func:`as_atom_5d` reaches it with two free views and every caller's "block b's
+page starts at ``b * page_size``" still holds. It is not block-compact, though,
+so vLLM only resolves it for a model whose specs agree on HNC -- or, for M3,
+on a vLLM carrying the single-uniform-type-group exemption.
+
+``LBHNC`` is the fallback for a vLLM without that exemption. It packs both
+planes inside each block:
 
     per-layer view   [B, 2, N, C]      C = num_kv_heads * head_size elements
     memory order     block-major, then the K plane, then the V plane
 
-A block therefore spans ``2 * block_size / 16`` physical 16-token pages -- K in
-the first half, V in the second -- rather than the ``block_size / 16`` a
-dense-plane (``LHBNC``) layout would give. AITER's writer derives its page from
-``slot // 16`` and assumes consecutive numbering, so the slot mapping has to be
-rebased or every write after block 0 lands in the wrong page. That single factor
-of two is the whole hazard this module exists to contain: it does not crash, it
-silently attends to the wrong tokens.
+so a block spans ``2 * block_size / 16`` physical 16-token pages instead of
+``block_size / 16``. AITER's writer derives its page from ``slot // 16`` and
+assumes consecutive numbering, so the slot mapping and the block table both
+have to be restated in pages or every access past block 0 lands one plane off.
+That single factor of two is the whole hazard the rebasing helpers exist to
+contain: it does not crash, it silently attends to the wrong tokens.
 """
 
 from __future__ import annotations
@@ -31,6 +38,47 @@ import torch
 
 # AITER's shuffled KV kernels address memory in 16-token physical pages.
 ASM_PAGE_SIZE = 16
+
+
+def as_atom_5d(
+    kv_cache: torch.Tensor,
+    num_kv_heads: int,
+    head_size: int,
+) -> torch.Tensor:
+    """``[B, 2, N, C]`` under ``LHBNC`` -> ATOM's native 5-D KV cache.
+
+    Returns a view shaped ``(2, num_blocks, block_size, num_kv_heads,
+    head_size)`` -- exactly what ``AttentionForVllmMHA`` allocates for itself
+    outside the plugin, so ``rope_cache``, the page-16 reinterpretation,
+    ``extend_forward`` and the gluon decode all keep working unchanged.
+
+    Raises if the resolved layout is not ``LHBNC``: under ``LBHNC`` the same two
+    views produce a non-contiguous tensor, and letting that reach the callers'
+    ``.view()`` would either fault far from here or, worse, succeed against the
+    wrong strides.
+    """
+    if kv_cache.dim() != 4 or kv_cache.shape[1] != 2:
+        raise ValueError(
+            "expected a K/V-separated [B, 2, N, C] cache (num_head_slots=2); got "
+            f"shape {tuple(kv_cache.shape)}. Does the layer's KV spec declare "
+            "num_head_slots=2 and state_content_bytes?"
+        )
+    if kv_cache.shape[-1] != num_kv_heads * head_size:
+        raise ValueError(
+            f"content dim {kv_cache.shape[-1]} != num_kv_heads * head_size "
+            f"({num_kv_heads} * {head_size})"
+        )
+
+    adapted = kv_cache.transpose(0, 1).unflatten(-1, (num_kv_heads, head_size))
+    if not adapted.is_contiguous():
+        raise ValueError(
+            "the K/V-separated cache does not store one dense plane per side, so "
+            "the resolved KV cache layout is not LHBNC (LBHNC packs both planes "
+            "inside a block). Check the 'Using ... KV cache layout' line in the "
+            "server log; LHBNC needs a vLLM carrying the single-uniform-type-"
+            "group layout exemption."
+        )
+    return adapted
 
 
 def pages_per_side(block_size: int) -> int:

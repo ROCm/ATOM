@@ -294,3 +294,79 @@ def test_lbhnc_cannot_be_adapted_the_same_way():
     assert not adapted.is_contiguous()
     key, _ = adapted.unbind(0)
     assert not key.is_contiguous()
+
+
+# ── as_atom_5d: the LHBNC path the dense layer actually takes ─────────────
+
+
+def test_as_atom_5d_matches_atoms_native_shape():
+    from atom.plugin.vllm.attention.m3_dense_kv_layout import as_atom_5d
+
+    adapted = as_atom_5d(_per_layer_view("LHBNC"), NUM_KV_HEADS, HEAD_SIZE)
+
+    # exactly what AttentionForVllmMHA allocates for itself outside the plugin
+    assert adapted.shape == (2, NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE)
+    assert adapted.is_contiguous()
+
+
+def test_as_atom_5d_addresses_the_same_bytes_as_the_vllm_view():
+    """Every (block, side, token, head, dim) cell must survive the two views.
+
+    This is the assertion that would catch a transposed or mis-unflattened
+    adaptation -- which reads real KV from the wrong cell and never faults.
+    """
+    from atom.plugin.vllm.attention.m3_dense_kv_layout import as_atom_5d
+
+    vllm_view = _per_layer_view("LHBNC")
+    adapted = as_atom_5d(vllm_view, NUM_KV_HEADS, HEAD_SIZE)
+
+    for block in (0, 1, NUM_BLOCKS - 1):
+        for side in (0, 1):
+            for token in (0, 17, BLOCK_SIZE - 1):
+                for head in range(NUM_KV_HEADS):
+                    for dim in (0, 63, HEAD_SIZE - 1):
+                        marker = (block * 7 + side * 3 + token + dim) % 251 + 1
+                        vllm_view[block, side, token, head * HEAD_SIZE + dim] = marker
+                        assert (
+                            adapted[side, block, token, head, dim].item() == marker
+                        ), f"cell drift at {(block, side, token, head, dim)}"
+
+
+def test_as_atom_5d_keeps_block_pages_at_their_natural_offset():
+    """The property every caller relies on: block b's page starts at
+    b * page_size, so slot // 16 needs no rebasing."""
+    from atom.plugin.vllm.attention.m3_dense_kv_layout import as_atom_5d
+
+    adapted = as_atom_5d(_per_layer_view("LHBNC"), NUM_KV_HEADS, HEAD_SIZE)
+    key = adapted[0]
+    page_elems = BLOCK_SIZE * NUM_KV_HEADS * HEAD_SIZE
+    base = key.data_ptr()
+
+    for block in range(NUM_BLOCKS):
+        offset = (key[block].data_ptr() - base) // key.element_size()
+        assert offset == block * page_elems
+
+
+def test_as_atom_5d_refuses_the_packed_layout():
+    from atom.plugin.vllm.attention.m3_dense_kv_layout import as_atom_5d
+
+    with pytest.raises(ValueError, match="LHBNC"):
+        as_atom_5d(_per_layer_view("LBHNC"), NUM_KV_HEADS, HEAD_SIZE)
+
+
+def test_as_atom_5d_refuses_a_cache_that_was_never_separated():
+    from atom.plugin.vllm.attention.m3_dense_kv_layout import as_atom_5d
+
+    packed = torch.zeros(
+        NUM_BLOCKS, NUM_KV_HEADS, BLOCK_SIZE, 2 * HEAD_SIZE, dtype=torch.uint8
+    )
+
+    with pytest.raises(ValueError, match="num_head_slots"):
+        as_atom_5d(packed, NUM_KV_HEADS, HEAD_SIZE)
+
+
+def test_as_atom_5d_refuses_a_mismatched_content_dim():
+    from atom.plugin.vllm.attention.m3_dense_kv_layout import as_atom_5d
+
+    with pytest.raises(ValueError, match="content dim"):
+        as_atom_5d(_per_layer_view("LHBNC"), NUM_KV_HEADS, HEAD_SIZE * 2)

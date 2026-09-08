@@ -203,18 +203,27 @@ class AiterMhaM3DenseBackendForVllm(AiterMhaFlexibleBlockBackendForVllm):
 
         ``num_head_slots=2`` only separates K and V if the layout does not put
         N between H and C -- ``LBNHC``/``BLNHC`` would re-interleave the sides
-        per token, which no later reinterpretation can undo. Of the layouts
-        that keep them apart, only ``LBHNC`` is block-compact, which vLLM
-        requires once specs disagree on HNC (M3's key-only indexer spec makes
-        them disagree). ``LHBNC`` trails it for a vLLM carrying the
-        single-uniform-group exemption; a single-element tuple would leave the
-        candidate list empty and abort startup.
+        per token, which no later reinterpretation can undo.
+
+        ``LHBNC`` leads: one dense plane per side is ATOM's own KV geometry, so
+        the layer adapts it with two free views and every "block b's page starts
+        at b * page_size" caller keeps working. It is not block-compact, so vLLM
+        resolves it only with the single-uniform-type-group exemption for a
+        model whose specs disagree on HNC -- which M3's key-only indexer spec
+        makes them do.
+
+        ``LBHNC`` follows as the fallback for a vLLM without that exemption: it
+        is block-compact so it survives the mixed-HNC narrowing, at the cost of
+        packing both planes into each block, which the page-16 rebasing in
+        m3_dense_kv_layout then has to undo. Publishing both is what keeps the
+        candidate list non-empty either way; a single-element tuple aborts
+        startup on whichever vLLM does not match it.
         """
         from atom.utils import envs
 
         if envs.ATOM_M3_DENSE_ATTN_BACKEND != "gluon":
             return None
-        return (KVCacheLayout.LBHNC, KVCacheLayout.LHBNC)
+        return (KVCacheLayout.LHBNC, KVCacheLayout.LBHNC)
 
 
 class AiterMlaBackendForVllm(_VllmAttentionBackendCompat):

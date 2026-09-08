@@ -23,6 +23,7 @@ from atom.plugin.vllm.attention.backend import (
 from atom.plugin.vllm.attention.layer_common import (
     _register_vllm_static_forward_context,
 )
+from atom.plugin.vllm.attention.m3_dense_kv_layout import as_atom_5d
 from atom.utils import envs
 
 if TYPE_CHECKING:
@@ -832,27 +833,15 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         # the path the Eagle3 MHA speculative-decode draft takes: bf16 KV,
         # causal, multi-token decode.
         if self.kv_separated:
-            # ATOM_M3_DENSE_ATTN_BACKEND=gluon got vLLM to allocate the
-            # K/V-separated cache the page-16 shuffle kernels need, and
-            # m3_dense_kv_layout turns it into their view pair. What is not
-            # wired yet is the read side: rope_cache, extend_forward and
-            # _dispatch_decode_backend all index the cache and the block table
-            # in manager blocks, and under this layout both have to be restated
-            # in 16-token pages (m3_dense_kv_layout.rebase_slots_to_page16 and
-            # expand_block_table_to_page16 do the arithmetic; the metadata
-            # rebasing that feeds them does not exist yet).
-            #
-            # Refuse rather than fall through. Running the manager-block
-            # arithmetic against this cache does not fault -- it reads real KV
-            # from the wrong page, and the model keeps answering.
-            raise NotImplementedError(
-                "ATOM_M3_DENSE_ATTN_BACKEND=gluon allocated a K/V-separated KV "
-                f"cache (shape {tuple(kv_cache.shape)}), but the dense read path "
-                "still addresses it in manager blocks. Rebase "
-                "attn_metadata.slot_mapping and .block_table onto 16-token pages "
-                "first (see atom/plugin/vllm/attention/m3_dense_kv_layout.py). "
-                "Use ATOM_M3_DENSE_ATTN_BACKEND=aiter for the validated path."
-            )
+            # ATOM_M3_DENSE_ATTN_BACKEND=gluon asked vLLM for a K/V-separated
+            # cache (num_head_slots=2) and for LHBNC, which stores one dense K
+            # plane then one dense V plane. That is byte-for-byte the geometry
+            # this layer allocates for itself outside the plugin, so two free
+            # views restore the 5-D cache the rest of forward_impl already
+            # expects -- and with it aiter.flash_attn_varlen_func for prefill
+            # and run_pa_decode_gluon for decode, instead of the combined-KV
+            # unified_attention below.
+            kv_cache = as_atom_5d(kv_cache, self.num_kv_heads, self.head_size)
 
         if kv_cache.dim() == 4 and kv_cache.shape[-1] == 2 * self.head_dim:
             return self._forward_vllm_native_combined_kv(
@@ -1148,6 +1137,15 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
                 sliding_window=self.sliding_window,
             )
         if self.kv_separated:
+            if self.head_size != self.head_size_v:
+                # One content size covers both slots, so asymmetric sides would
+                # silently give V the K byte count. Upstream's own shuffle path
+                # asserts the same (rocm_aiter_fa.customize_spec).
+                raise ValueError(
+                    "ATOM_M3_DENSE_ATTN_BACKEND=gluon needs symmetric K/V head "
+                    f"sizes for the two head slots, got {self.head_size} and "
+                    f"{self.head_size_v}"
+                )
             # Ask vLLM to put K and V on the H axis instead of packing both into
             # the content dim. RFC #42082's default (C = head_size + head_size_v)
             # interleaves the two sides per token, and the shuffle kernels
