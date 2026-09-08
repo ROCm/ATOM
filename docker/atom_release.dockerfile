@@ -164,15 +164,22 @@ RUN ln -s ${ROCM_HOME} /opt/rocm
 # amdsmi: the pip SDK (unlike the rocm/pytorch apt images) does not preinstall
 # the AMD SMI python package; ATOM's numa_utils imports it. The SDK's
 # share/amd_smi dir carries a pip-installable package on the stable channel,
-# but the 10.1 nightly SDK dropped it (no setup.py/pyproject.toml) — fall back
-# to the PyPI amdsmi wheel, and only fail if neither source works.
+# but the 10.1 nightly SDK dropped it (no setup.py/pyproject.toml), and the
+# PyPI amdsmi wheel (7.0.2) is ABI-incompatible with the 10.1 nightly SDK's
+# libamd_smi.so (undefined symbol amdsmi_set_gpu_clk_range). amdsmi only backs
+# numa_utils' NUMA topology detection — an optional path — so a failed import
+# is a warning, never a build failure. The stable line still installs and
+# imports it cleanly.
 RUN if [ -f /opt/rocm/share/amd_smi/setup.py ] || [ -f /opt/rocm/share/amd_smi/pyproject.toml ]; then \
         cd /opt/rocm/share/amd_smi && python3 -m pip install --no-cache-dir .; \
-    elif python3 -m pip install --no-cache-dir amdsmi; then \
+    elif python3 -m pip install --no-cache-dir amdsmi 2>/dev/null; then \
         echo "amdsmi installed from PyPI (SDK share/amd_smi not pip-installable on this SDK)"; \
+    fi; \
+    if python3 -c "import amdsmi" 2>/dev/null; then \
+        echo "amdsmi ok"; \
     else \
-        echo "WARNING: amdsmi not installable (no SDK package, PyPI failed); numa_utils amdsmi path will be unavailable"; \
-    fi && python3 -c "import amdsmi; print('amdsmi ok')"
+        echo "WARNING: amdsmi import failed (SDK package absent and PyPI wheel ABI-incompatible on this SDK); numa_utils amdsmi path will be unavailable"; \
+    fi
 
 # Keep pip from resolving the ROCm torch stack away to PyPI CUDA builds in any
 # later pip install (AITER requirements, MORI, ATOM deps, ...). The local
@@ -616,8 +623,11 @@ print('final stack: torch', torch.__version__, '| triton', version('triton'), \
         # (rocminfo) and there is no GPU during a docker build, so the import
         # dies on CalledProcessError — an environment limit, not a stack
         # problem. aiter imports fine at runtime (the golden test covers it).
-        python -c "import amdsmi, mori, atom; \
-print('component imports ok: amdsmi, mori, atom (aiter needs a GPU: runtime-only)')"; \
+        # amdsmi is likewise optional: on the 10.1 nightly SDK neither the
+        # SDK's share/amd_smi nor the ABI-incompatible PyPI wheel can import
+        # (see the rocm10-base amdsmi step); numa_utils degrades gracefully.
+        python -c "import mori, atom; \
+print('component imports ok: mori, atom (aiter needs a GPU: runtime-only; amdsmi optional)')"; \
     fi
 
 CMD ["/bin/bash"]
