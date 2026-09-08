@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run one half of the PR perf check pairing.
 #
-#   perf_check_half.sh <commit-sha> <base|head>
+#   perf_check_half.sh <commit-sha> <warmup|base|head|base2>
 #
 # The container is already running and has the workspace bind-mounted at
 # /workspace, so checking out a commit on the host is immediately visible
@@ -20,19 +20,39 @@
 set -euo pipefail
 
 COMMIT="${1:?commit sha required}"
-HALF="${2:?half must be 'base' or 'head'}"
+HALF="${2:?half must be one of warmup|base|head|base2}"
 
+# warmup  discarded; exists only to fill the JIT/autotune caches that persist
+#         inside the shared container. Without it the first measured half pays
+#         for populating them and the second reads 6-9% faster on identical
+#         code -- larger than the regression threshold, and in the direction
+#         that hides regressions rather than inventing them.
+# base2   a second measurement of the base commit, after head. Its distance
+#         from the first is the drift the pairing accumulated; without it a
+#         head-vs-base delta cannot be told apart from time passing.
 case "$HALF" in
-  base|head) ;;
-  *) echo "ERROR: half must be 'base' or 'head', got '$HALF'" >&2; exit 2 ;;
+  warmup|base|head|base2) ;;
+  *) echo "ERROR: half must be warmup|base|head|base2, got '$HALF'" >&2; exit 2 ;;
 esac
 
 : "${CONTAINER:?CONTAINER must be set}"
 : "${MODEL_PATH:?MODEL_PATH must be set}"
 : "${RESULT_FILENAME:?RESULT_FILENAME must be set}"
+# atom_test.sh reads CONC for every phase; the warmup additionally derives its
+# shortened prompt count from it. Checked here so a missing value fails with a
+# name rather than "unbound variable" from wherever it is first dereferenced.
+: "${CONC:?CONC must be set}"
 
 OUT_DIR="perf-pair/${HALF}"
 mkdir -p "$OUT_DIR"
+
+if [ "$HALF" = "warmup" ]; then
+  # A tenth of the usual prompt count. atom_test.sh already honours this, and
+  # the caches are filled by compiling and tuning kernels, not by request
+  # volume -- whether that holds is exactly what this run is measuring.
+  export NUM_PROMPTS_OVERRIDE="${WARMUP_PROMPTS:-$CONC}"
+  echo "warmup: NUM_PROMPTS_OVERRIDE=${NUM_PROMPTS_OVERRIDE} (results discarded)"
+fi
 
 echo "========== ${HALF}: reclaiming workspace ownership =========="
 # The container runs as root against a bind-mounted workspace, so anything it
@@ -77,6 +97,14 @@ echo "========== ${HALF}: stopping server =========="
 # the GPUs to actually free, and starting the next server against a partially
 # released device measures the teardown, not the commit.
 docker exec "$CONTAINER" bash -lc '.github/scripts/atom_test.sh stop'
+
+if [ "$HALF" = "warmup" ]; then
+  # Deliberately not collected: a warmup result that reached the judge would be
+  # indistinguishable from a measurement.
+  rm -f "${RESULT_FILENAME}"*.json
+  echo "warmup: results discarded"
+  exit 0
+fi
 
 echo "========== ${HALF}: collecting results =========="
 # Copy out before the next checkout wipes the tree. Nothing is judged here --

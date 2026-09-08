@@ -60,6 +60,15 @@ FAMILY_MEDIAN_PCT = -3.0  # family median throughput delta that trips the gate
 DOWN_EPS_PCT = -2.0  # a level counts as "down" past this
 TPOT_MIRROR_RATIO = 0.6  # |median TPOT delta / median tput delta| for mirroring
 NONMONOTONIC_MARGIN_PCT = 3.0  # interior level this far outside its neighbours
+DRIFT_TRUST_PCT = 3.0  # base repeated this far apart -> the pairing cannot resolve
+
+# The base commit is measured twice, before and after head. The distance
+# between those two readings is drift the pairing accumulated -- caches warming,
+# clocks settling, a neighbour arriving -- and it bounds what the comparison can
+# resolve. A head-vs-base delta smaller than the drift is not a measurement of
+# the change; it is a measurement of time passing. Where both readings exist the
+# baseline is their mean, which cancels drift to first order, and the residual
+# drift is reported so the reader can see how much was cancelled.
 
 # Low concurrency levels are excluded from the verdict but still measured and
 # still shown. They pollute a verdict in both directions: they manufacture false
@@ -174,9 +183,15 @@ def load_history_cv(source=None):
 # --------------------------------------------------------------------------
 # Pairing
 # --------------------------------------------------------------------------
-def pair_results(base_results, head_results):
-    """Match head measurements to base measurements by configuration key."""
+def pair_results(base_results, head_results, base2_results=None):
+    """Match head measurements to base measurements by configuration key.
+
+    ``base2_results`` is an optional second reading of the base commit taken
+    after head. When present the baseline is the mean of the two readings and
+    the drift between them is carried through for reporting.
+    """
     base_map = {_config_key(d): d for d in base_results}
+    base2_map = {_config_key(d): d for d in (base2_results or [])}
     pairs = []
     for head in head_results:
         key = _config_key(head)
@@ -187,6 +202,15 @@ def pair_results(base_results, head_results):
         head_tput = head.get(TPUT_KEY)
         if not base_tput or not head_tput:
             continue
+        base2 = base2_map.get(key)
+        base2_tput = base2.get(TPUT_KEY) if base2 else None
+        if base2_tput:
+            baseline = (base_tput + base2_tput) / 2
+            drift_pct = _pct_change(base2_tput, base_tput)
+        else:
+            baseline = base_tput
+            drift_pct = None
+
         pairs.append(
             {
                 "backend": _backend_name(head),
@@ -195,8 +219,11 @@ def pair_results(base_results, head_results):
                 f"{head.get('random_output_len', 0)}",
                 "conc": int(head.get("max_concurrency", 0)),
                 "base_tput": base_tput,
+                "base2_tput": base2_tput,
                 "head_tput": head_tput,
-                "tput_pct": _pct_change(head_tput, base_tput),
+                "baseline_tput": baseline,
+                "drift_pct": drift_pct,
+                "tput_pct": _pct_change(head_tput, baseline),
                 "tpot_pct": _delta_or_none(base, head, TPOT_KEY),
                 "ttft_pct": _delta_or_none(base, head, TTFT_KEY),
             }
@@ -238,6 +265,15 @@ def judge_family(members, history_cv):
         "median_tpot_pct": statistics.median(tpots) if tpots else None,
         "n_down": sum(1 for t in tputs if t <= DOWN_EPS_PCT),
         "n_total": len(tputs),
+        "median_drift_pct": (
+            statistics.median(drifts)
+            if (
+                drifts := [
+                    m["drift_pct"] for m in judging if m["drift_pct"] is not None
+                ]
+            )
+            else None
+        ),
         "nonmonotonic": _nonmonotonic(judging),
         "escalations": _single_escalations(judging, history_cv),
     }
@@ -379,10 +415,21 @@ def judge(pairs, history_cv, expected_entries=None):
     # such a run is handed to the reader instead of summarised away.
     unclear = [f for f in results if f.get("nonmonotonic")]
 
-    if triggered:
+    # Drift larger than the threshold the criterion is asked to resolve means
+    # the comparison cannot answer the question, whatever the deltas look like.
+    drifted = [
+        f
+        for f in results
+        if f.get("median_drift_pct") is not None
+        and abs(f["median_drift_pct"]) > DRIFT_TRUST_PCT
+    ]
+
+    if triggered and not drifted:
         verdict = "regression"
     elif not judged:
         verdict = "inconclusive"
+    elif drifted:
+        verdict = "untrustworthy"
     elif unclear:
         verdict = "unclear"
     elif incomplete:
@@ -397,6 +444,18 @@ def judge(pairs, history_cv, expected_entries=None):
         "n_insufficient": len(results) - len(judged),
         "n_missing": n_missing,
         "n_unclear": len(unclear),
+        "n_drifted": len(drifted),
+        "median_drift_pct": (
+            statistics.median(d)
+            if (
+                d := [
+                    f["median_drift_pct"]
+                    for f in results
+                    if f.get("median_drift_pct") is not None
+                ]
+            )
+            else None
+        ),
         "expected_entries": expected_entries,
         "scope": _scope(triggered, judged),
         "families": results,
@@ -428,6 +487,7 @@ _HEADLINE = {
     "clean": "### No significant performance change",
     "partial": "### No regression found, but coverage was incomplete",
     "unclear": "### Needs a look -- levels moved, but not in a shape the criterion can judge",
+    "untrustworthy": "### Cannot be trusted -- the base commit did not measure the same twice",
     "regression": "### Performance regression detected",
     "inconclusive": "### Inconclusive -- not enough data",
 }
@@ -496,6 +556,7 @@ def render(report, context):
         extra_cols=(
             ("Median", _median_cell),
             ("TPOT", lambda f: _fmt(f["median_tpot_pct"])),
+            ("Drift", lambda f: _fmt(f.get("median_drift_pct"))),
         ),
     )
 
@@ -536,7 +597,7 @@ def render(report, context):
             "No entry reported enough judging levels. "
             "This is **not** a pass -- treat it as no signal."
         )
-    elif report["verdict"] in ("clean", "partial", "unclear"):
+    elif report["verdict"] in ("clean", "partial", "unclear", "untrustworthy"):
         thresholds = report["thresholds"]
         lines.append(
             f"No judged entry tripped (family median <= "
@@ -544,6 +605,15 @@ def render(report, context):
             f"{thresholds['family_min_down']} judging levels down and TPOT "
             f"mirroring)."
         )
+        if report["verdict"] == "untrustworthy":
+            lines.append(
+                f"The base commit was measured twice, before and after head, and "
+                f"the two readings differ by {_fmt(report['median_drift_pct'])} -- "
+                f"more than the {report['thresholds']['family_median_pct']}% the "
+                f"criterion is asked to resolve. Whatever moved between them would "
+                f"also have moved under head, so a delta this size cannot be "
+                f"attributed to the change."
+            )
         if report["verdict"] == "unclear":
             lines.append(
                 "The linkage criterion (median + count) assumes the judging "
@@ -625,8 +695,8 @@ def render_summary(report, context):
     if context:
         lines += [context, ""]
     lines += [
-        "| Entry | isl/osl | conc | role | base | head | tput | TPOT | TTFT |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| Entry | isl/osl | conc | role | base | base2 | head | tput | drift | TPOT | TTFT |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for family in report["families"]:
         for member in family["members"]:
@@ -634,9 +704,11 @@ def render_summary(report, context):
             lines.append(
                 f"| {family['model']} | {member['isl_osl']} | {member['conc']} "
                 f"| {role} "
-                f"| {member['base_tput']:.1f} | {member['head_tput']:.1f} "
-                f"| {member['tput_pct']:+.2f}% | {_fmt(member['tpot_pct'])} "
-                f"| {_fmt(member['ttft_pct'])} |"
+                f"| {member['base_tput']:.1f} "
+                f"| {format(member['base2_tput'], '.1f') if member.get('base2_tput') else '-'} "
+                f"| {member['head_tput']:.1f} "
+                f"| {member['tput_pct']:+.2f}% | {_fmt(member.get('drift_pct'))} "
+                f"| {_fmt(member['tpot_pct'])} | {_fmt(member['ttft_pct'])} |"
             )
     lines += [
         "",
@@ -666,6 +738,12 @@ def main():
     parser.add_argument("--base-dir", required=True)
     parser.add_argument("--head-dir", required=True)
     parser.add_argument(
+        "--base2-dir",
+        default=None,
+        help="Second reading of the base commit, taken after head. Its distance "
+        "from the first bounds what the comparison can resolve.",
+    )
+    parser.add_argument(
         "--history",
         default=None,
         help="Local data.js for the sigma gate; omit to fetch the dashboard",
@@ -690,7 +768,10 @@ def main():
 
     base_results = load_results(args.base_dir, recursive=True)
     head_results = load_results(args.head_dir, recursive=True)
-    pairs = pair_results(base_results, head_results)
+    base2_results = (
+        load_results(args.base2_dir, recursive=True) if args.base2_dir else []
+    )
+    pairs = pair_results(base_results, head_results, base2_results)
 
     if not pairs:
         print("No base/head pairs matched -- nothing to judge.", file=sys.stderr)

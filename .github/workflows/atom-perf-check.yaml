@@ -142,7 +142,7 @@ jobs:
       matrix:
         cell: ${{ fromJson(needs.build-matrix.outputs.cells) }}
     runs-on: ${{ matrix.cell.runner }}
-    timeout-minutes: 150
+    timeout-minutes: 240
     env:
       MODEL_PATH: ${{ matrix.cell.model_path }}
       ARGS: ${{ matrix.cell.server_args }}
@@ -217,14 +217,30 @@ jobs:
           cp .github/scripts/perf_check_half.sh "$RUNNER_TEMP/perf_check_half.sh"
           chmod +x "$RUNNER_TEMP/perf_check_half.sh"
 
-      # Base runs first on purpose: the head half then measures on a warm
-      # machine. Reversed, head would systematically absorb cold-start cost and
-      # read low for reasons that have nothing to do with the change.
+      # warmup -> base -> head -> base2.
+      #
+      # The container is shared by both halves, which is what keeps machine and
+      # image fixed -- but it also carries the JIT/autotune caches the first run
+      # populates. Measured on identical code, the second half read 5.9% (c=64)
+      # and 9.1% (c=128) faster than the first, with TPOT and TTFT agreeing.
+      # That is larger than the regression threshold and points the wrong way:
+      # it hides regressions rather than inventing them. The discarded warmup
+      # pays that cost before either measurement.
+      #
+      # base2 repeats the base commit after head. Its distance from the first
+      # base is whatever drifted while the pairing ran; without it, head-vs-base
+      # cannot be separated from time passing.
+      - name: Bench WARMUP (discarded)
+        run: bash "$RUNNER_TEMP/perf_check_half.sh" "${{ steps.refs.outputs.base_sha }}" warmup
+
       - name: Bench BASE
         run: bash "$RUNNER_TEMP/perf_check_half.sh" "${{ steps.refs.outputs.base_sha }}" base
 
       - name: Bench HEAD
         run: bash "$RUNNER_TEMP/perf_check_half.sh" "${{ steps.refs.outputs.head_sha }}" head
+
+      - name: Bench BASE again (drift probe)
+        run: bash "$RUNNER_TEMP/perf_check_half.sh" "${{ steps.refs.outputs.base_sha }}" base2
 
       - name: Record provenance
         if: always()
@@ -291,11 +307,12 @@ jobs:
         id: collect
         run: |
           set -euo pipefail
-          mkdir -p collected/base collected/head
+          mkdir -p collected/base collected/head collected/base2
           # Artifacts nest one directory per matrix cell; flatten both halves so
           # the judge sees one base dir and one head dir.
           find pairs -path '*/base/*.json' -exec cp {} collected/base/ \; || true
           find pairs -path '*/head/*.json' -exec cp {} collected/head/ \; || true
+          find pairs -path '*/base2/*.json' -exec cp {} collected/base2/ \; || true
           echo "base=$(find collected/base -name '*.json' | wc -l)" >> "$GITHUB_OUTPUT"
           echo "head=$(find collected/head -name '*.json' | wc -l)" >> "$GITHUB_OUTPUT"
           DIGEST=$(find pairs -name provenance.json -print -quit \
@@ -315,6 +332,7 @@ jobs:
           python3 .github/scripts/perf_judge.py \
             --base-dir collected/base \
             --head-dir collected/head \
+            --base2-dir collected/base2 \
             --expect-entries "${{ env.PERF_EXPECTED_ENTRIES }}" \
             --context "$CONTEXT" \
             --output-json verdict.json \

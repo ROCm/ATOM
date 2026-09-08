@@ -433,6 +433,7 @@ def run_half(ws, bindir, sha, half, **env):
             "MODEL_PATH": "deepseek-ai/DeepSeek-V4-Pro",
             "ARGS": "--kv_cache_dtype fp8 -tp 8 --method mtp",
             "RESULT_FILENAME": RESULT_FILENAME,
+            "CONC": "128",
             **env,
         },
     )
@@ -445,7 +446,7 @@ def test_rejects_an_unknown_half(workspace, fake_docker):
     bindir, _ = fake_docker
     result = run_half(ws, bindir, base_sha, "middle")
     assert result.returncode == 2
-    assert "must be 'base' or 'head'" in result.stderr
+    assert "must be warmup|base|head|base2" in result.stderr
 
 
 def test_requires_its_environment(workspace, fake_docker):
@@ -582,6 +583,7 @@ def test_runs_when_the_target_commit_does_not_contain_the_script(tmp_path, fake_
         "MODEL_PATH": "m",
         "ARGS": "",
         "RESULT_FILENAME": RESULT_FILENAME,
+        "CONC": "128",
     }
     for sha, half in ((base_sha, "base"), (head_sha, "head")):
         result = subprocess.run(
@@ -596,6 +598,63 @@ def test_runs_when_the_target_commit_does_not_contain_the_script(tmp_path, fake_
 
     assert len(list((ws / "perf-pair/base").glob("*.json"))) == 1
     assert len(list((ws / "perf-pair/head").glob("*.json"))) == 1
+
+
+def test_warmup_half_discards_its_results(workspace, fake_docker):
+    """The warmup exists to pay for the caches the first measured half would
+    otherwise populate. A warmup result reaching the judge would be
+    indistinguishable from a measurement, so it must not be collected."""
+    ws, base_sha, _ = workspace
+    bindir, _log = fake_docker
+
+    result = run_half(ws, bindir, base_sha, "warmup")
+    assert result.returncode == 0
+    assert "results discarded" in result.stdout
+    assert list((ws / "perf-pair/warmup").glob("*.json")) == []
+    # ... and it asks for a shorter run rather than a full one.
+    assert "NUM_PROMPTS_OVERRIDE" in result.stdout
+
+
+def test_repeated_base_reading_yields_a_drift_figure(tmp_path):
+    """base is measured twice, before and after head. The distance between the
+    two readings is what drifted while the pairing ran, and the baseline is
+    their mean so that drift cancels to first order."""
+    base = [_result("M", c, 10000.0, 30.0) for c in JUDGING]
+    base2 = [_result("M", c, 10200.0, 30.0) for c in JUDGING]  # +2% over the run
+    head = [_result("M", c, 10100.0, 30.0) for c in JUDGING]
+
+    pairs = pj.pair_results(base, head, base2)
+    assert len(pairs) == 3
+    for p in pairs:
+        assert p["drift_pct"] == pytest.approx(2.0, abs=0.01)
+        # Naively head/base reads +1%; against the mean of the two it is flat,
+        # which is what a commit that changed nothing should look like.
+        assert p["tput_pct"] == pytest.approx(0.0, abs=0.02)
+
+
+def test_drift_beyond_the_resolvable_threshold_is_not_trusted(tmp_path):
+    """When the base commit does not measure the same twice, the comparison
+    cannot answer the question, whatever the deltas look like."""
+    base = [_result("M", c, 10000.0, 30.0) for c in JUDGING]
+    base2 = [_result("M", c, 10800.0, 30.0) for c in JUDGING]  # +8%
+    head = [_result("M", c, 9600.0, 33.0) for c in JUDGING]  # would look like -8%
+
+    report = pj.judge(pj.pair_results(base, head, base2), {}, expected_entries=1)
+    assert report["verdict"] == "untrustworthy"
+    assert report["n_drifted"] == 1
+    body = pj.render(report, "")
+    assert "did not measure the same twice" in body
+    assert "cannot be attributed to the change" in body
+
+
+def test_absent_second_reading_falls_back_to_a_single_baseline(tmp_path):
+    base = [_result("M", c, 10000.0, 30.0) for c in JUDGING]
+    head = [_result("M", c, 9000.0, 33.0) for c in JUDGING]
+    pairs = pj.pair_results(base, head)
+    assert all(p["drift_pct"] is None for p in pairs)
+    assert pairs[0]["tput_pct"] == pytest.approx(-10.0, abs=0.01)
+    report = pj.judge(pairs, {}, expected_entries=1)
+    assert report["verdict"] == "regression"
 
 
 def test_pipeline_end_to_end_reaches_a_verdict(workspace, fake_docker):
