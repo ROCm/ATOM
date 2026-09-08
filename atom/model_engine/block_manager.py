@@ -846,6 +846,40 @@ class BlockManager:
             chain.append(h)
         return chain
 
+    def _match_prefix(self, seq: Sequence) -> tuple[int, list[int]]:
+        """Read-only usable hit and compressed-prefix hashes, shared with admission.
+
+        Excludes the last block: prefill must still produce sampler logits. The
+        joint SWA/state-checkpoint gate may shorten the compressed hit to a
+        boundary every cache can resume from. Neither sequence bookkeeping nor
+        cache ownership is touched here.
+        """
+        h = -1
+        block_hashes: list[int] = []
+        for i in range(self._n_hash_blocks(seq) - 1):
+            token_ids = self._hash_block_tokens(seq, i)
+            h = self.compute_hash(token_ids, h)
+            block_id = self.kv.lookup(h)
+            if block_id == -1 or self.kv.block(block_id).token_ids != token_ids:
+                break
+            block_hashes.append(h)
+        hit = self._gated_hit(seq, len(block_hashes), block_hashes)
+        return hit, block_hashes
+
+    def prefix_cached_tokens(self, seq: Sequence) -> int:
+        """Reusable prefix tokens, probed without allocating or bookkeeping.
+
+        Only `scheduling_policy="sjf"` calls this, to rank a waiter by the work
+        prefill still has to do instead of by raw prompt length. FCFS never
+        reaches it. Admission probes again through `can_allocate`, because an
+        earlier admission in the same pass can evict the blocks or checkpoints
+        counted here.
+        """
+        if not self.enable_prefix_caching:
+            return 0
+        hit, _ = self._match_prefix(seq)
+        return hit * self.hash_block_size
+
     def can_allocate(self, seq: Sequence, record: bool = True) -> int:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
 
@@ -881,18 +915,8 @@ class BlockManager:
             return 0
         # Step 1: compressed prefix (CSA/HCA/indexer share the block hash and
         # read the WHOLE history, so this stays a full front-to-back chained
-        # match). Record each block's hash for the SWA scan below.
-        h = -1
-        compressed_hit = 0
-        block_hashes: list[int] = []
-        for i in range(self._n_hash_blocks(seq) - 1):
-            token_ids = self._hash_block_tokens(seq, i)
-            h = self.compute_hash(token_ids, h)
-            block_id = self.kv.lookup(h)
-            if block_id == -1 or self.kv.block(block_id).token_ids != token_ids:
-                break
-            block_hashes.append(h)
-            compressed_hit += 1
+        # match). `_match_prefix` records each block's hash for the SWA scan.
+        #
         # Step 2: SWA only needs the trailing window before the boundary to be
         # present (SWA is local). Scan right-to-left within the compressed prefix
         # for the largest boundary whose window is SWA-cached (vLLM
@@ -906,7 +930,8 @@ class BlockManager:
         # so a boundary is only resumable where somebody checkpointed the state.
         # `_gated_hit` settles the two gates jointly; neither can be applied to
         # the other's answer.
-        num_cached_blocks = self._gated_hit(seq, compressed_hit, block_hashes)
+        num_cached_blocks, block_hashes = self._match_prefix(seq)
+        compressed_hit = len(block_hashes)
         # Instrumentation: the pre-gate hit, so EngineStats can separate reuse
         # the gates declined (compressed_hit - num_cached_blocks) from reuse
         # lost to compressed eviction (everything above compressed_hit).
