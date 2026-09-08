@@ -61,6 +61,23 @@ DOWN_EPS_PCT = -2.0  # a level counts as "down" past this
 TPOT_MIRROR_RATIO = 0.6  # |median TPOT delta / median tput delta| for mirroring
 NONMONOTONIC_MARGIN_PCT = 3.0  # interior level this far outside its neighbours
 MEASURED_RESIDUAL_BIAS_PCT = 1.35  # A/A residual after the warmup; see below
+
+# --- Baseline sanity (crimson only) ----------------------------------------
+BASELINE_SANITY_PCT = -25.0  # base this far under main's recent median
+BASELINE_SANITY_SIGMA = 2.5  # ... and clear of that configuration's own noise
+BASELINE_SANITY_MIN_LEVELS = 2  # ... on at least this many judged levels
+BASELINE_SANITY_MIN_POINTS = 6  # ... judged against at least this much history
+
+# A paired comparison answers "did this change make it worse" and is blind to
+# "main was already broken": if base and head are both 20% down, the delta is
+# zero and the run reports clean. This check reads the base measurement against
+# main's recent history to catch that -- but only at crimson magnitude. Across
+# 372 configurations the 8-run spread on the public dashboard is 7.7% at the
+# median, 13.7% at P75 and 25.1% at P90, all of it ordinary cross-image
+# variation. Anything finer than that is indistinguishable from noise here.
+#
+# Slow drift on main -- the 5% kind that accumulates over weeks -- needs a time
+# series and a trend criterion, which is a nightly-side job, not a PR one.
 DRIFT_TRUST_PCT = 3.0  # base repeated this far apart -> the pairing cannot resolve
 
 # The base commit is measured twice, before and after head. The distance
@@ -129,7 +146,7 @@ def _parse_data_js(text):
 
 
 def load_history_cv(source=None):
-    """Return {(model, isl_osl, conc): coefficient_of_variation} from history.
+    """Return {(model, isl_osl, conc): {"cv", "median", "n"}} from history.
 
     ``source`` may be a local path or None (fetch the public dashboard). Any
     failure yields an empty mapping -- the sigma gate is optional by design and
@@ -184,15 +201,23 @@ def load_history_cv(source=None):
             key = (match.group(2), match.group(3), int(match.group(4)))
             series[key].append(bench.get("value"))
 
-    cv = {}
+    stats = {}
     for key, values in series.items():
         values = [v for v in values if isinstance(v, (int, float))]
-        if len(values) < 6:
+        if len(values) < BASELINE_SANITY_MIN_POINTS:
             continue
-        median = statistics.median(values)
+        # The last few runs, not the whole window: a level that shifted weeks
+        # ago is the current normal, and holding a run against a long-gone one
+        # is the "compared against a peak" mistake in slow motion.
+        recent = values[-8:]
+        median = statistics.median(recent)
         if median:
-            cv[key] = statistics.pstdev(values) / median
-    return cv
+            stats[key] = {
+                "cv": statistics.pstdev(recent) / median,
+                "median": median,
+                "n": len(recent),
+            }
+    return stats
 
 
 # --------------------------------------------------------------------------
@@ -284,6 +309,7 @@ def judge_family(members, history_cv):
             [m["drift_pct"] for m in judging if m["drift_pct"] is not None]
         ),
         "nonmonotonic": _nonmonotonic(judging),
+        "baseline_sanity": _baseline_sanity(judging, history_cv),
         "escalations": _single_escalations(judging, history_cv),
     }
 
@@ -333,6 +359,52 @@ def _median_or_none(values):
     return statistics.median(values) if values else None
 
 
+def _baseline_sanity(judging, history):
+    """Flag a base measurement that sits far under main's recent level.
+
+    Three gates, all required, following the same shape the nightly monitor
+    uses for its highest-confidence class:
+
+    - magnitude: at least BASELINE_SANITY_PCT under the recent median
+    - variance: and clear of that configuration's own noise band, because a
+      fixed percentage condemns a naturally jumpy configuration for behaving
+      normally -- the 8-run spread reaches 25% at P90 across the dashboard
+    - corroboration: on at least BASELINE_SANITY_MIN_LEVELS judged levels,
+      because one level alone is the shape a scheduling blip takes
+
+    Returns the offending levels, or None.
+    """
+    flagged = []
+    for member in judging:
+        hist = history.get((member["model"], member["isl_osl"], member["conc"]))
+        if not hist or not hist["median"]:
+            continue
+        median = hist["median"]
+        delta = (member["base_tput"] - median) / median * 100
+        if delta > BASELINE_SANITY_PCT:
+            continue
+        # Variance gate. A configuration whose own history swings this much is
+        # not saying anything by swinging again.
+        sigma = hist["cv"] * median
+        if sigma > 0 and (median - member["base_tput"]) < BASELINE_SANITY_SIGMA * sigma:
+            continue
+        flagged.append(
+            {
+                "conc": member["conc"],
+                "base_tput": member["base_tput"],
+                "history_median": median,
+                "pct": delta,
+                "sigma_pct": hist["cv"] * 100,
+                "n": hist["n"],
+            }
+        )
+    # Corroboration gate: one level is a blip, several at once is the machine
+    # or the commit.
+    if len(flagged) < BASELINE_SANITY_MIN_LEVELS:
+        return None
+    return flagged
+
+
 def _nonmonotonic(judging):
     """Flag an interior level that sits well outside its immediate neighbours.
 
@@ -380,9 +452,9 @@ def _single_escalations(members, history_cv):
         if delta <= SINGLE_STANDS_ALONE_PCT:
             reasons.append(f"c={member['conc']} dropped {delta:.1f}% on its own")
 
-        cv = history_cv.get((member["model"], member["isl_osl"], member["conc"]))
-        if cv:
-            sigma_pct = cv * 100.0
+        hist = history_cv.get((member["model"], member["isl_osl"], member["conc"]))
+        if hist and hist["cv"]:
+            sigma_pct = hist["cv"] * 100.0
             if abs(delta) > SIGMA_MULT * sigma_pct:
                 reasons.append(
                     f"{abs(delta) / sigma_pct:.1f}x the historical sigma "
@@ -433,6 +505,7 @@ def judge(pairs, history_cv, expected_entries=None):
     # not. Reporting "clean" would be a claim the method does not support, so
     # such a run is handed to the reader instead of summarised away.
     unclear = [f for f in results if f.get("nonmonotonic")]
+    bad_baseline = [f for f in results if f.get("baseline_sanity")]
 
     # Drift larger than the threshold the criterion is asked to resolve means
     # the comparison cannot answer the question, whatever the deltas look like.
@@ -443,7 +516,12 @@ def judge(pairs, history_cv, expected_entries=None):
         and abs(f["median_drift_pct"]) > DRIFT_TRUST_PCT
     ]
 
-    if triggered and not drifted:
+    # A broken baseline outranks every other reading, including a trip: a
+    # regression measured against a bad number is not a regression, and a clean
+    # result against one says nothing at all.
+    if bad_baseline:
+        verdict = "bad_baseline"
+    elif triggered and not drifted:
         verdict = "regression"
     elif not judged:
         verdict = "inconclusive"
@@ -464,6 +542,7 @@ def judge(pairs, history_cv, expected_entries=None):
         "n_missing": n_missing,
         "n_unclear": len(unclear),
         "n_drifted": len(drifted),
+        "n_bad_baseline": len(bad_baseline),
         "median_drift_pct": _median_or_none(
             [
                 f["median_drift_pct"]
@@ -506,6 +585,7 @@ _HEADLINE = {
     "partial": "### No regression found, but coverage was incomplete",
     "unclear": "### Needs a look -- levels moved, but not in a shape the criterion can judge",
     "untrustworthy": "### Cannot be trusted -- the base commit did not measure the same twice",
+    "bad_baseline": "### Do not act on this -- the baseline itself is far below normal",
     "regression": "### Performance regression detected",
     "inconclusive": "### Inconclusive -- not enough data",
 }
@@ -612,6 +692,36 @@ def render(report, context):
         "",
     ]
 
+    # --- baseline sanity: loudest thing on the page when it fires ----------
+    for family in report["families"]:
+        flags = family.get("baseline_sanity") or []
+        if not flags:
+            continue
+        worst = min(flags, key=lambda f: f["pct"])
+        levels = ", ".join(
+            f"c={f['conc']} {f['base_tput']:.0f} vs {f['history_median']:.0f}"
+            for f in flags
+        )
+        lines += [
+            (
+                f"**{family['model']}: the base commit measured "
+                f"{abs(worst['pct']):.0f}% under main's recent level on "
+                f"{len(flags)} of {len(family['judging'])} judged levels** "
+                f"({levels} tok/s, median of the last {worst['n']} nightly "
+                f"runs, {worst['sigma_pct']:.1f}% typical spread)."
+            ),
+            "",
+            (
+                "This comparison cannot be acted on either way. Either main has "
+                "regressed and head merely inherits it -- in which case the "
+                "delta above is correctly near zero and entirely misleading -- "
+                "or the base half was contaminated and every number here is "
+                "measured against a bad one. Both need looking at before the PR "
+                "is judged on this."
+            ),
+            "",
+        ]
+
     # --- shape flags -------------------------------------------------------
     for family in report["families"]:
         for flag in family.get("nonmonotonic") or []:
@@ -633,7 +743,13 @@ def render(report, context):
             "No model reported enough judged levels. "
             "This is **not** a pass -- treat it as no signal."
         )
-    elif report["verdict"] in ("clean", "partial", "unclear", "untrustworthy"):
+    elif report["verdict"] in (
+        "clean",
+        "partial",
+        "unclear",
+        "untrustworthy",
+        "bad_baseline",
+    ):
         thresholds = report["thresholds"]
         lines.append(
             f"No judged entry tripped (family median <= "
@@ -786,7 +902,9 @@ def main():
     parser.add_argument(
         "--history",
         default=None,
-        help="Local data.js for the sigma gate; omit to fetch the dashboard",
+        help="Local data.js. Without it the sigma gate and the baseline sanity "
+        "check are skipped -- this tool does not reach the network on its own, "
+        "so a caller that wants them fetches the file and says so.",
     )
     parser.add_argument(
         "--no-history",
@@ -816,7 +934,9 @@ def main():
     if not pairs:
         print("No base/head pairs matched -- nothing to judge.", file=sys.stderr)
 
-    history_cv = {} if args.no_history else load_history_cv(args.history)
+    # Only a path enables history. Reaching for the network because no flag was
+    # given would put an outbound request behind an omission.
+    history_cv = load_history_cv(args.history) if args.history else {}
     report = judge(pairs, history_cv, expected_entries=args.expect_entries)
     report["context"] = args.context
     report["n_pairs"] = len(pairs)
