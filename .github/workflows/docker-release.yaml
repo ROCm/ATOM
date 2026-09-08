@@ -193,8 +193,21 @@ jobs:
                 exit 1
               fi
               echo "Resolved 10.1 nightly SDK version: ${NIGHTLY_SDK_VERSION}"
+              # torchaudio on the 10.1 nightly channel is 2.11.0.3 (not the
+              # stable channel's 2.11.0); resolve it from the channel like the
+              # SDK version so the date-stamped line never pins a stale number.
+              NIGHTLY_TORCHAUDIO_VERSION=$(curl -sL --max-time 60 \
+                "https://nightly.repo.amd.com/rocm/whl-next/torchaudio/" \
+                | grep -oE 'torchaudio-2\.11[^"<>]*cp312[^"<>]*linux[^"<>]*\.whl' \
+                | grep "rocm${NIGHTLY_SDK_VERSION}" | sed 's/torchaudio-//; s/+rocm.*//' | sort -V | tail -1)
+              if [ -z "${NIGHTLY_TORCHAUDIO_VERSION}" ]; then
+                echo "ERROR: could not resolve a torchaudio version for ${NIGHTLY_SDK_VERSION} from the nightly channel"
+                exit 1
+              fi
+              echo "Resolved 10.1 nightly torchaudio version: ${NIGHTLY_TORCHAUDIO_VERSION}"
               EXTRA_BUILD_ARGS="--build-arg ROCM_SDK_VERSION=${NIGHTLY_SDK_VERSION} \
                 --build-arg ROCM_TORCH_VERSION=2.12.0 \
+                --build-arg ROCM_TORCHAUDIO_VERSION=${NIGHTLY_TORCHAUDIO_VERSION} \
                 --build-arg ROCM_TRITON_VERSION=3.8.0+gitc01b6774 \
                 --build-arg ROCM_INDEX_URL=https://nightly.repo.amd.com/rocm/whl-next/"
               ;;
