@@ -10,7 +10,7 @@
 # conftest.py supplies the atom.* / zmq stubs the import chain needs.
 
 import pickle
-from threading import Lock
+from threading import Event, Lock, Thread
 
 import pytest
 
@@ -521,12 +521,13 @@ def test_dp_lb_strategies_constant():
 
 
 def test_decode_bookkeeping_does_not_wait_for_an_unrelated_router_lock():
-    from threading import Event, Thread
-
     mgr = _make_mgr(2, strategy="least_tokens")
     seq = _FakeSeq("a", num_prompt_tokens=20)
     _route(mgr, [seq])
+    assert sum(mgr._rank_reqs) == 1
+    assert sum(mgr._rank_tokens) == 20
     mgr._mark_seq_prefill_complete(seq.id)
+    assert sum(mgr._rank_tokens) == 0
     completed = Event()
 
     def receive_decode_token():

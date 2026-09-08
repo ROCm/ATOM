@@ -116,10 +116,10 @@ class StreamOutputCollector:
     and socket writing. Detokenizer state is advanced only by ``get()``, on the
     event loop; the engine output threads never decode collector-bound chunks.
 
-    Nothing is ever held back. With a consumer that keeps up nothing ever
-    merges, and delivery is identical to the queue this replaces. Merging only
-    covers chunks that were already waiting, so a token is never delivered later
-    than it would have been.
+    There is no timer or minimum batch size: get() can consume any pending
+    delta immediately. Merging covers only unread chunks, but decoding runs
+    synchronously on the event loop, so this is not a delivery-latency bound.
+    Large backlogs can delay other consumers while their text is decoded.
 
     ``tag`` is the fan-out sibling index (``SamplingParams.n>1``) or ``None`` for
     a plain single-sequence stream. Chunks merge per tag, so siblings never mix.
@@ -156,9 +156,18 @@ class StreamOutputCollector:
             self._ready.clear()
         state = chunk.pop("_detokenizer", None)
         if state is not None:
-            chunk["text"] = state.update(
-                chunk["token_ids"], bool(chunk.get("finished"))
-            )
+            try:
+                chunk["text"] = state.update(
+                    chunk["token_ids"], bool(chunk.get("finished"))
+                )
+            except Exception:
+                logger.exception(
+                    "Error detokenizing stream %s (tag=%s)", self.request_id, tag
+                )
+                # Keep token accounting and terminal metadata, and let fan-out
+                # siblings continue. Failed tokens remain in the detokenizer;
+                # a later update can decode them without appending them twice.
+                chunk["text"] = ""
         return chunk if tag is None else (tag, chunk)
 
 
@@ -238,17 +247,18 @@ class _BufferedChunk(NamedTuple):
 class StreamBatchDispatcher:
     """Collect one engine step per output thread and dispatch it by event loop.
 
-    Holds no per-stream state. Each stream's detokenizer belongs to the engine
-    callback that feeds it, and rides along on every chunk, so nothing here is
-    shared between the output threads and the event loop and nothing has to be
-    cleaned up: when the engine drops a finished stream's callback the
-    detokenizer goes with it.
+    The dispatcher has no persistent per-stream registry. Each engine callback
+    creates one detokenizer and must reuse it for every chunk of its
+    (collector, tag); every collector-bound chunk carries that same state.
+    Merging keeps the first pending chunk's state, so it must not be replaced
+    partway through a stream.
 
-    It used to live in a dict here, which cost a lock -- 27% of the API
-    server's CPU, since every buffered chunk looked its state up with all
-    output threads contending -- and then, without the lock, cost an entry
-    that two threads had to keep in agreement and that teardown had to
-    remember to remove.
+    For StreamOutputCollector, references cross threads but only get() on the
+    event loop mutates the state. Output threads just pass it through. An unread
+    chunk or queued delivery keeps the state (including its token history) alive
+    after the engine drops the finished callback; consuming or discarding those
+    references allows it to be reclaimed. Queue consumers use eager decoding
+    on their output thread instead.
     """
 
     def __init__(self, tokenizer: Any, synthetic_text: str | None = None):
