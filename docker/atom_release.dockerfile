@@ -170,15 +170,21 @@ RUN ln -s ${ROCM_HOME} /opt/rocm
 # numa_utils' NUMA topology detection — an optional path — so a failed import
 # is a warning, never a build failure. The stable line still installs and
 # imports it cleanly.
+# Do NOT fall back to the PyPI amdsmi wheel when the SDK package is absent:
+# PyPI amdsmi 7.0.2 is ABI-incompatible with the 10.1 nightly SDK's
+# libamd_smi.so (undefined symbol amdsmi_set_gpu_clk_range), and once
+# installed it poisons every import that touches amdsmi — including torch's
+# own import chain (the base tripwire died on it). Absent SDK package = no
+# amdsmi; numa_utils' amdsmi path degrades gracefully at runtime.
 RUN if [ -f /opt/rocm/share/amd_smi/setup.py ] || [ -f /opt/rocm/share/amd_smi/pyproject.toml ]; then \
         cd /opt/rocm/share/amd_smi && python3 -m pip install --no-cache-dir .; \
-    elif python3 -m pip install --no-cache-dir amdsmi 2>/dev/null; then \
-        echo "amdsmi installed from PyPI (SDK share/amd_smi not pip-installable on this SDK)"; \
+    else \
+        echo "WARNING: SDK share/amd_smi not pip-installable on this SDK; skipping amdsmi (numa_utils amdsmi path will be unavailable)"; \
     fi; \
     if python3 -c "import amdsmi" 2>/dev/null; then \
         echo "amdsmi ok"; \
     else \
-        echo "WARNING: amdsmi import failed (SDK package absent and PyPI wheel ABI-incompatible on this SDK); numa_utils amdsmi path will be unavailable"; \
+        echo "amdsmi absent on this SDK (expected on 10.1 nightly)"; \
     fi
 
 # Keep pip from resolving the ROCm torch stack away to PyPI CUDA builds in any
