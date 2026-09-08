@@ -77,7 +77,12 @@ def _set_default_mha_scales(layer) -> None:
         layer._o_scale_float = None
 
 
-_M3_MODEL_TYPES = ("minimax_m3", "minimax_m3_sparse")
+_M3_MODEL_TYPES = (
+    "minimax_m3",
+    "minimax_m3_sparse",
+    "minimax_m3_text",
+    "minimax_m3_vl",
+)
 
 
 def _m3_dense_attn_mode(hf_config, layer_num: int = 0) -> str:
@@ -88,7 +93,13 @@ def _m3_dense_attn_mode(hf_config, layer_num: int = 0) -> str:
     Other models. `_mha_backend_for_layer` and `get_kv_cache_spec` run for every
     model that uses this layer, so reading the variable unconditionally would
     let a stray export follow Llama or Qwen into a different backend and KV
-    spec.
+    spec. The served checkpoint is the multimodal wrapper (`minimax_m3_vl`),
+    whose top-level `model_type` is the VL wrapper and whose
+    `text_config.model_type` can be unset, so recognise the whole M3 family
+    across both the top-level and the nested text config (mirroring
+    `layer._is_minimax_m3_model`) -- otherwise the dense layers silently fall
+    back to the strict page-16 backend and collide with the sparse group's
+    block_size==128 ("No common block size for 128").
 
     The speculative-decode draft (`layer_num >= num_hidden_layers`). It is
     routed to `AiterMhaFlexibleBlockBackendForVllm` before the mode is even
@@ -100,7 +111,9 @@ def _m3_dense_attn_mode(hf_config, layer_num: int = 0) -> str:
     from atom.utils import envs
 
     model_type = str(getattr(hf_config, "model_type", "") or "").lower()
-    if model_type not in _M3_MODEL_TYPES:
+    text_config = getattr(hf_config, "text_config", None)
+    text_model_type = str(getattr(text_config, "model_type", "") or "").lower()
+    if model_type not in _M3_MODEL_TYPES and text_model_type not in _M3_MODEL_TYPES:
         return "triton"
     if layer_num >= int(getattr(hf_config, "num_hidden_layers", 1 << 30)):
         return "triton"
