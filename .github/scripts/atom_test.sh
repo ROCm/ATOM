@@ -59,6 +59,7 @@ if [ "$TYPE" == "launch" ]; then
     AGENTIC_LAUNCH_ARGS=(--max-num-seqs "$(( CONC * 2 ))")
     echo "Agentic run: --max-num-seqs $(( CONC * 2 )) (2x concurrency ${CONC})"
   fi
+
   PROFILER_ARGS=""
   if [ "${ENABLE_TORCH_PROFILER:-0}" == "1" ]; then
     PROFILER_ARGS="--torch-profiler-dir /app/trace --mark-trace"

@@ -75,7 +75,7 @@ on:
         type: boolean
         default: false
       agentic_concurrency:
-        description: "Agentic concurrencies to run, comma-separated (e.g. 48,64). 'all' = the whole curve. Catalog has 1,2,8,16,24,30,32,48,64,96,128,256; each cell is ~1h GPU. Ignored unless an agentic model box is ticked."
+        description: "Agentic concurrencies to run, comma-separated (e.g. 48,64). 'all' = the whole curve. Catalog has 1,2,8,16,24,30,32,40,48,64,96,128,256; each cell is ~1h GPU. Ignored unless an agentic model box is ticked."
         type: string
         default: "all"
       agentic_duration:
