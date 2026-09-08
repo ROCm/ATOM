@@ -506,29 +506,11 @@ def _fmt(value, suffix="%"):
     return "n/a" if value is None else f"{value:+.1f}{suffix}"
 
 
-def _delta_table(report, members_key, concs, extra_cols=()):
-    """One row per entry over a fixed set of concurrency columns.
-
-    ``extra_cols`` appends per-family summary columns as (title, fn) pairs.
-    Cells belonging to a tripped family are emphasised so the eye lands on the
-    row that produced the verdict.
-    """
-    titles = [f"c={c}" for c in concs] + [t for t, _ in extra_cols]
-    rows = [
-        "| Entry | " + " | ".join(titles) + " |",
-        "|" + "---|" * (len(titles) + 1),
-    ]
-    for family in report["families"]:
-        tripped = family["status"] == "triggered"
-        by_conc = {m["conc"]: m["tput_pct"] for m in family[members_key]}
-        cells = []
-        for conc in concs:
-            value = by_conc.get(conc)
-            cell = "-" if value is None else f"{value:+.1f}%"
-            cells.append(f"**{cell}**" if tripped and value is not None else cell)
-        cells += [fn(family) for _, fn in extra_cols]
-        rows.append(f"| {family['model']} | " + " | ".join(cells) + " |")
-    return rows
+def _pct(value, bold=False):
+    if value is None:
+        return "-"
+    text = f"{value:+.1f}%"
+    return f"**{text}**" if bold else text
 
 
 def _median_cell(family):
@@ -538,43 +520,75 @@ def _median_cell(family):
     return f"**{text}**" if family["status"] == "triggered" else text
 
 
+def _entry_rows(family):
+    """One row per concurrency level, then the family's median.
+
+    Throughput, TTFT and TPOT are the three independent measurements here --
+    output throughput is total throughput divided by a constant (the prompt
+    length ratio, fixed by --ignore-eos), and ITL and E2EL are recoverable from
+    TTFT and TPOT. Listing those too would spend width without adding a fact.
+
+    Judging and reference levels share the table and are labelled, so the shape
+    stays visible: judging levels moving with the reference ones is a broad
+    change, reference levels moving alone is a small-batch path or noise.
+    """
+    tripped = family["status"] == "triggered"
+    rows = []
+    first = True
+    for member in family["judging"] + family["reference"]:
+        role = "judge" if member["conc"] >= JUDGE_MIN_CONC else "ref"
+        judged = role == "judge"
+        rows.append(
+            "| {entry} | {c} | {role} | {tput} | {ttft} | {tpot} | {drift} |".format(
+                entry=family["model"] if first else "",
+                c=member["conc"],
+                role=role,
+                tput=_pct(member["tput_pct"], bold=tripped and judged),
+                ttft=_pct(member["ttft_pct"]),
+                tpot=_pct(member["tpot_pct"]),
+                drift=_pct(member.get("drift_pct")),
+            )
+        )
+        first = False
+
+    if family["status"] == "insufficient":
+        rows.append("| | **median** | judge | insufficient | | | |")
+    else:
+        rows.append(
+            "| | **median** | judge | {tput} | {ttft} | {tpot} | {drift} |".format(
+                tput=_pct(family["median_tput_pct"], bold=tripped),
+                ttft="-",
+                tpot=_pct(family["median_tpot_pct"], bold=tripped),
+                drift=_pct(family.get("median_drift_pct")),
+            )
+        )
+    return rows
+
+
 def render(report, context):
-    """Render the PR comment body (concise; per-config detail lives in summary)."""
+    """Render the PR comment body."""
     lines = [_HEADLINE[report["verdict"]], ""]
     if context:
         lines += [context, ""]
 
-    judge_concs = sorted({m["conc"] for f in report["families"] for m in f["judging"]})
-    ref_concs = sorted({m["conc"] for f in report["families"] for m in f["reference"]})
+    lines += [
+        "| Entry | c | role | Tput | TTFT | TPOT | Drift |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for family in report["families"]:
+        lines += _entry_rows(family)
 
-    # --- judging levels (these, and only these, produce the verdict) --------
-    lines += [f"**Judging levels** (c >= {JUDGE_MIN_CONC})", ""]
-    lines += _delta_table(
-        report,
-        "judging",
-        judge_concs,
-        extra_cols=(
-            ("Median", _median_cell),
-            ("TPOT", lambda f: _fmt(f["median_tpot_pct"])),
-            ("Drift", lambda f: _fmt(f.get("median_drift_pct"))),
+    lines += [
+        "",
+        (
+            f"`judge` = levels the verdict is drawn from (c >= {JUDGE_MIN_CONC}); "
+            f"`ref` = measured and shown but never judged, because low "
+            f"concurrency both manufactures false positives and dilutes real "
+            f"ones. `Drift` is how far the base commit moved between its two "
+            f"readings -- the floor on what this comparison can resolve."
         ),
-    )
-
-    # --- reference levels (measured, shown, never judged) -------------------
-    if ref_concs:
-        lines += [
-            "",
-            (
-                f"**Reference levels** (c < {JUDGE_MIN_CONC}, not judged) -- shown "
-                f"so the shape is visible: judging levels moving together with "
-                f"these is a broad regression; these moving alone is a small-batch "
-                f"path issue or low-concurrency noise."
-            ),
-            "",
-        ]
-        lines += _delta_table(report, "reference", ref_concs)
-
-    lines.append("")
+        "",
+    ]
 
     # --- shape flags -------------------------------------------------------
     for family in report["families"]:
@@ -609,9 +623,9 @@ def render(report, context):
             lines.append(
                 f"The base commit was measured twice, before and after head, and "
                 f"the two readings differ by {_fmt(report['median_drift_pct'])} -- "
-                f"more than the {report['thresholds']['family_median_pct']}% the "
-                f"criterion is asked to resolve. Whatever moved between them would "
-                f"also have moved under head, so a delta this size cannot be "
+                f"more than the {thresholds['family_median_pct']}% the criterion "
+                f"is asked to resolve. Whatever moved between them would also "
+                f"have moved under head, so a delta this size cannot be "
                 f"attributed to the change."
             )
         if report["verdict"] == "unclear":
