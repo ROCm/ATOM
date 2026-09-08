@@ -34,6 +34,15 @@ def use_pa_decode_bf16_asm() -> bool:
     )
 
 
+# Largest query group the gluon decode kernel can take: its register-layout
+# table has arms for 16/32/64 only, and past 64 nothing binds `register_bases`
+# -- the failure is a Triton compile error that never mentions speculation.
+# The group is max_seqlen_q * (q_heads / kv_heads), so drafting multiplies it:
+# M3 sits exactly on the limit today (16 x 4 draft positions), and one more
+# draft token would overflow it. vLLM guards the same bound.
+PA_GLUON_MAX_QUERY_GROUP_SIZE = 64
+
+
 class PagedAttentionImpl(nn.Module):
     """
     Attention paged implementation
@@ -489,7 +498,14 @@ class PagedAttentionImpl(nn.Module):
 
         num_seqs = attn_metadata.context_lens.shape[0]
 
-        if envs.ATOM_USE_UNIFIED_ATTN or self.use_flash_layout:
+        # Group-size term last: k_cache only carries the 5D shuffle layout this
+        # indexing assumes when the gluon path is otherwise the choice.
+        if (
+            envs.ATOM_USE_UNIFIED_ATTN
+            or self.use_flash_layout
+            or attn_metadata.max_seqlen_q * (q.shape[1] // k_cache.shape[1])
+            > PA_GLUON_MAX_QUERY_GROUP_SIZE
+        ):
             # print(q.shape, k_cache.shape, v_cache.shape)
             sliding_window = (
                 (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
