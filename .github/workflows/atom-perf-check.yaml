@@ -195,6 +195,23 @@ jobs:
           download-required: "true"
           container-env: -e ISL=${{ env.ISL }} -e OSL=${{ env.OSL }} -e CONC=${{ env.CONC }} -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }}
 
+      - name: GPU preflight check
+        timeout-minutes: 6
+        env:
+          # A container that dies without stopping its server leaves KFD
+          # processes holding VRAM: atom_test.sh's pkill runs inside the
+          # container, so once the container is gone nothing reaches them. The
+          # next job cannot allocate, and the failure reads as a slow load
+          # rather than a collision. Observed locally -- four workers held 664GB
+          # across four cards after an aborted run, and only a host-side kill
+          # cleared them.
+          #
+          # Native ATOM CI leaves this off because its jobs start one server;
+          # this workflow starts four in a row, so an abort leaves more behind.
+          GPU_PREFLIGHT_KILL_KFD: "1"
+          GPU_PREFLIGHT_ALLOCATION_MB: "8"
+        run: bash .github/scripts/gpu_preflight_check.sh "${{ env.CONTAINER }}" docker
+
       - name: Pin the image digest
         id: image
         run: |

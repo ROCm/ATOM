@@ -218,8 +218,8 @@ def test_low_concurrency_never_reaches_the_verdict(tmp_path):
     # Excluded from the verdict, but not hidden -- that is the whole point.
     body = pj.render(report, "")
     assert "-19.8%" in body
-    assert "| ref |" in body
-    assert "| judge |" in body
+    assert "(not judged)" in body
+    assert "median of judged" in body
 
 
 def test_reference_only_entry_is_insufficient(tmp_path):
