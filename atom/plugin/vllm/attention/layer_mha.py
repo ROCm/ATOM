@@ -85,6 +85,27 @@ _M3_MODEL_TYPES = (
 )
 
 
+def _m3_num_hidden_layers(hf_config) -> int:
+    """Decoder layer count, tolerant of the M3 VL wrapper config.
+
+    The served ``minimax_m3_vl`` checkpoint carries ``num_hidden_layers`` only
+    under ``text_config`` (the top-level wrapper leaves it unset/None). Reading
+    it top-level therefore either raises (``int(None)``) or silently returns the
+    ``1 << 30`` sentinel -- and the sentinel is the quieter bug: it stops the
+    speculative-draft guard from ever excluding the draft's layers (60/61), so
+    the draft would request the gluon K/V-separated spec its own backend never
+    voted for. Prefer the top-level count when it is a real positive int, else
+    the nested ``text_config`` one, else a sentinel too large to gate any real
+    decoder layer. Mirrors the top-level/text_config fallback used for
+    ``model_type`` above.
+    """
+    for cfg in (hf_config, getattr(hf_config, "text_config", None)):
+        n = getattr(cfg, "num_hidden_layers", None)
+        if isinstance(n, int) and n > 0:
+            return n
+    return 1 << 30
+
+
 def _m3_dense_attn_mode(hf_config, layer_num: int = 0) -> str:
     """Dense-attention mode -- M3's own target layers only.
 
@@ -115,14 +136,14 @@ def _m3_dense_attn_mode(hf_config, layer_num: int = 0) -> str:
     text_model_type = str(getattr(text_config, "model_type", "") or "").lower()
     if model_type not in _M3_MODEL_TYPES and text_model_type not in _M3_MODEL_TYPES:
         return "triton"
-    if layer_num >= int(getattr(hf_config, "num_hidden_layers", 1 << 30)):
+    if layer_num >= _m3_num_hidden_layers(hf_config):
         return "triton"
     return envs.ATOM_M3_DENSE_ATTN_BACKEND
 
 
 def _mha_backend_for_layer(layer_num: int, hf_config):
 
-    num_hidden_layers = int(getattr(hf_config, "num_hidden_layers", 1 << 30))
+    num_hidden_layers = _m3_num_hidden_layers(hf_config)
     if layer_num >= num_hidden_layers:
         return AiterMhaFlexibleBlockBackendForVllm
     # M3's dense layers (routed to this MHA path by ATOM_M3_DENSE_ATTN_BACKEND=aiter)
