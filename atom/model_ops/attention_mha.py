@@ -34,14 +34,9 @@ def use_pa_decode_bf16_asm() -> bool:
     )
 
 
-# Two independent limits the gluon decode kernel asserts on
-# (aiter pa_decode_gluon.py): the query length itself, and the query group.
-# Drafting multiplies both, so a model can hit either one first -- M3 sits
-# exactly on the group limit today (16 x 4 draft positions) while a gqa=8 model
-# reaches the length limit with its group still at 40. Both are checked against
-# the pow2 forms the kernel actually indexes its layout table with, not the raw
-# product, so the choice of backend accounts for them rather than reaching the
-# kernel and asserting.
+# Two limits the gluon decode kernel asserts on independently, both multiplied
+# by drafting: M3 sits exactly on the group one today (16 x 4 draft positions),
+# a gqa=8 model reaches the length one first.
 PA_GLUON_MAX_QUERY_LEN = 4
 PA_GLUON_MAX_QUERY_GROUP_SIZE = 64
 
@@ -503,10 +498,8 @@ class PagedAttentionImpl(nn.Module):
 
         num_seqs = attn_metadata.context_lens.shape[0]
 
-        # The kernel sizes its register layout from the pow2 forms, not the
-        # raw product (aiter pa_decode_gluon.py:383-389), and rounds a small
-        # group up to fill 16. Checking the raw product lets qlen=3 with
-        # gqa 17-21 through at 4*32=128, which has no arm in the table.
+        # pow2, not the raw product: that is what the kernel indexes its
+        # layout table with, and it rounds a small group up to fill 16.
         qlen_p2 = 1 << (attn_metadata.max_seqlen_q - 1).bit_length()
         group = self.num_heads // self.num_kv_heads
         group_p2 = qlen_p2 * max(16 // qlen_p2, 1 << (group - 1).bit_length())
@@ -514,10 +507,8 @@ class PagedAttentionImpl(nn.Module):
             attn_metadata.max_seqlen_q > PA_GLUON_MAX_QUERY_LEN
             or group_p2 > PA_GLUON_MAX_QUERY_GROUP_SIZE
         )
-        # unified takes one descale for the whole tensor, so a per-token
-        # quantized cache cannot be expressed on this path. Refuse rather than
-        # run: the wrong descale is not an error anywhere downstream, it is just
-        # wrong numbers. The gluon branch below is what handles per-token.
+        # unified takes one descale for the whole tensor. Running a per-token
+        # cache through it is not an error downstream, just wrong numbers.
         if gluon_over_limit and k_scale is not None and k_scale.numel() > 1:
             raise NotImplementedError(
                 f"query length {attn_metadata.max_seqlen_q} / group {group_p2} "

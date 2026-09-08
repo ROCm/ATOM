@@ -724,12 +724,9 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         )
 
     def _dispatch_decode_backend(self, num_decodes, max_qlen):
-        # Past the gluon decode kernel's limits there is nowhere to go on this
-        # bridge: it has no unified branch (the server-side impl does), and the
-        # ASM path tops out lower still at qlen * gqa <= 16 (asm_pa.cu:113) --
-        # M3 already fails to start on it at 64. Worse, ASM does not always
-        # assert: an unmatched mtp falls back to a kernel compiled for a
-        # different qlen and computes. Refuse here instead.
+        # No fallback exists here: this bridge has no unified branch, and ASM
+        # tops out lower still (qlen * gqa <= 16), where an unmatched mtp picks
+        # a kernel built for another qlen and computes instead of asserting.
         qlen_p2 = 1 << (max_qlen - 1).bit_length()
         group = self.num_heads // self.num_kv_heads
         group_p2 = qlen_p2 * max(16 // qlen_p2, 1 << (group - 1).bit_length())
