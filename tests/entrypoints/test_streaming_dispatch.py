@@ -444,3 +444,148 @@ def test_each_stream_gets_its_own_detokenizer():
 
     assert first is not second
     assert not first.tokens and not second.tokens
+
+
+class _CountingTokenizer(_Utf8ByteTokenizer):
+    def __init__(self):
+        self.calls = 0
+
+    def decode(self, token_ids, skip_special_tokens=True):
+        self.calls += 1
+        return super().decode(token_ids, skip_special_tokens)
+
+
+def test_backlogged_tokens_are_merged_before_decoding():
+    tokenizer = _CountingTokenizer()
+    dispatcher = StreamBatchDispatcher(tokenizer)
+    loop = _RecordingLoop()
+    collector = StreamOutputCollector("slow-reader")
+    state = dispatcher.new_state()
+    payload = ("你好 🎉 " * 40).encode()
+    for i, byte in enumerate(payload):
+        dispatcher.enqueue(
+            loop=loop,
+            collector=collector,
+            state=state,
+            chunk={
+                "token_ids": [byte],
+                "finished": i == len(payload) - 1,
+                "finish_reason": "length" if i == len(payload) - 1 else None,
+                "num_cached_tokens": 7 if i == 0 else 0,
+            },
+        )
+        dispatcher.flush()
+    loop.run()
+
+    # Producers and delivery callbacks must not spend time decoding a backlog
+    # the consumer will fold into a single response anyway.
+    assert tokenizer.calls == 0
+    chunk = _resolve(collector.get())
+    assert chunk["text"] == payload.decode()
+    assert chunk["token_ids"] == list(payload)
+    assert chunk["finished"] is True
+    assert chunk["finish_reason"] == "length"
+    assert chunk["num_cached_tokens"] == 7
+    assert "_detokenizer" not in chunk
+    assert tokenizer.calls <= 2
+
+
+def test_deferred_decode_keeps_fanout_and_partial_unicode_separate():
+    dispatcher = StreamBatchDispatcher(_Utf8ByteTokenizer())
+    loop = _ImmediateLoop()
+    collector = StreamOutputCollector("fanout")
+    states = [dispatcher.new_state(), dispatcher.new_state()]
+
+    def send(tag, ids, finished=False):
+        dispatcher.enqueue(
+            loop=loop,
+            collector=collector,
+            state=states[tag],
+            chunk={"token_ids": ids, "finished": finished},
+            tag=tag,
+        )
+        dispatcher.flush()
+
+    send(0, [0xE4])
+    assert _resolve(collector.get())[1]["text"] == ""
+    send(1, list(b"other"), True)
+    send(0, [0xBD])
+    send(0, [0xA0], True)
+    assert _resolve(collector.get()) == (
+        1,
+        {"token_ids": list(b"other"), "text": "other", "finished": True},
+    )
+    assert _resolve(collector.get()) == (
+        0,
+        {"token_ids": [0xBD, 0xA0], "text": "你", "finished": True},
+    )
+
+
+def test_deferred_synthetic_stream_preserves_token_count():
+    tokenizer = _CountingTokenizer()
+    dispatcher = StreamBatchDispatcher(tokenizer, synthetic_text="synthetic ")
+    loop = _ImmediateLoop()
+    collector = StreamOutputCollector("synthetic")
+    state = dispatcher.new_state()
+    for byte in b"abc":
+        dispatcher.enqueue(
+            loop=loop,
+            collector=collector,
+            state=state,
+            chunk={"token_ids": [byte], "finished": byte == ord("c")},
+        )
+        dispatcher.flush()
+    chunk = _resolve(collector.get())
+    assert chunk["text"] == "synthetic " * 3
+    assert chunk["token_ids"] == list(b"abc")
+    assert chunk["finished"] is True
+    assert tokenizer.calls > 0  # synthetic output still pays the decoding cost
+
+
+def test_concurrent_output_threads_preserve_stream_contents_and_termination():
+    async def scenario():
+        dispatcher = StreamBatchDispatcher(_Utf8ByteTokenizer())
+        loop = asyncio.get_running_loop()
+        collectors = [StreamOutputCollector(str(i)) for i in range(16)]
+        states = [dispatcher.new_state() for _ in collectors]
+        payloads = [(f"stream {i}: 你好 🎉 " * 5).encode() for i in range(16)]
+
+        def produce(rank):
+            for step in range(max(map(len, payloads))):
+                for i in range(rank, len(collectors), 4):
+                    if step >= len(payloads[i]):
+                        continue
+                    dispatcher.enqueue(
+                        loop=loop,
+                        collector=collectors[i],
+                        state=states[i],
+                        chunk={
+                            "token_ids": [payloads[i][step]],
+                            "finished": step == len(payloads[i]) - 1,
+                        },
+                    )
+                dispatcher.flush()
+
+        async def consume(i):
+            text = ""
+            tokens = []
+            while True:
+                chunk = await collectors[i].get()
+                text += chunk["text"]
+                tokens.extend(chunk["token_ids"])
+                if chunk["finished"]:
+                    break
+                await asyncio.sleep(0)
+            assert text == payloads[i].decode()
+            assert tokens == list(payloads[i])
+            assert not collectors[i]._pending
+
+        await asyncio.wait_for(
+            asyncio.gather(
+                *(asyncio.to_thread(produce, rank) for rank in range(4)),
+                *(consume(i) for i in range(len(collectors))),
+            ),
+            timeout=5,
+        )
+
+    asyncio.run(scenario())

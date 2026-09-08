@@ -4,9 +4,9 @@
 """Cross-thread dispatch and per-request delivery for streaming model output.
 
 Two halves of one hand-off. :class:`StreamBatchDispatcher` runs on the engine
-output threads: it buffers a whole engine step, detokenizes it, and schedules a
-single callback per event loop. :class:`StreamOutputCollector` is the loop-side
-landing point each stream's SSE generator reads from.
+output threads and schedules a whole engine step per event loop.
+:class:`StreamOutputCollector` merges pending token deltas before decoding them
+when the SSE consumer reads, so a slow consumer does not accumulate decode work.
 """
 
 import array
@@ -111,12 +111,10 @@ def merge_chunk(into: dict, new: dict) -> None:
 class StreamOutputCollector:
     """Per-request delivery point that merges chunks when the consumer lags.
 
-    Replaces the unbounded ``asyncio.Queue`` that used to sit between the engine
-    output threads and the SSE response generators. A queue hands over one item
-    per ``get()``, so when the frontend cannot keep up with the GPU the backlog
-    grows without bound and every queued item still costs its own coroutine
-    wakeup, JSON encode and socket write. Here a stream holds at most one chunk:
-    anything arriving behind an unread one merges into it.
+    A stream holds at most one pending chunk per tag. Raw token deltas from the
+    dispatcher merge here before detokenization, coroutine wakeup, JSON encoding
+    and socket writing. Detokenizer state is advanced only by ``get()``, on the
+    event loop; the engine output threads never decode collector-bound chunks.
 
     Nothing is ever held back. With a consumer that keeps up nothing ever
     merges, and delivery is identical to the queue this replaces. Merging only
@@ -156,6 +154,11 @@ class StreamOutputCollector:
         del self._pending[tag]
         if not self._pending:
             self._ready.clear()
+        state = chunk.pop("_detokenizer", None)
+        if state is not None:
+            chunk["text"] = state.update(
+                chunk["token_ids"], bool(chunk.get("finished"))
+            )
         return chunk if tag is None else (tag, chunk)
 
 
@@ -275,7 +278,7 @@ class StreamBatchDispatcher:
         buf.append(_BufferedChunk(loop, collector, state, chunk, tag))
 
     def flush(self) -> None:
-        """Detokenize buffered chunks and schedule one delivery per event loop."""
+        """Schedule raw chunks, letting each consumer coalesce before decoding."""
         tl = self._thread_local
         buf = getattr(tl, "buf", None)
         if not buf:
@@ -284,10 +287,18 @@ class StreamBatchDispatcher:
 
         by_loop: dict[AbstractEventLoop, list[tuple[Any, Any]]] = {}
         for item in buf:
-            item.chunk["text"] = item.state.update(
-                item.chunk.get("token_ids") or [],
-                bool(item.chunk.get("finished")),
-            )
+            if isinstance(item.collector, StreamOutputCollector):
+                # Keep this state with the pending chunk until get(). Moving
+                # only the JSON/socket work downstream still made four output
+                # threads decode every token while contending for the GIL.
+                item.chunk["_detokenizer"] = item.state
+            else:
+                # Queue consumers cannot decode on read and still receive a
+                # prepared chunk, as before.
+                item.chunk["text"] = item.state.update(
+                    item.chunk.get("token_ids") or [],
+                    bool(item.chunk.get("finished")),
+                )
             payload = item.chunk if item.tag is None else (item.tag, item.chunk)
             by_loop.setdefault(item.loop, []).append((item.collector, payload))
 

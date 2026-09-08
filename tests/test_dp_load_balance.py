@@ -518,3 +518,26 @@ def test_reset_clears_even_with_charged_in_flight():
 def test_dp_lb_strategies_constant():
     assert DP_LB_STRATEGIES == ("round_robin", "least_requests", "least_tokens")
     assert "least_request" not in DP_LB_STRATEGIES  # guards against typos
+
+
+def test_decode_bookkeeping_does_not_wait_for_an_unrelated_router_lock():
+    from threading import Event, Thread
+
+    mgr = _make_mgr(2, strategy="least_tokens")
+    seq = _FakeSeq("a", num_prompt_tokens=20)
+    _route(mgr, [seq])
+    mgr._mark_seq_prefill_complete(seq.id)
+    completed = Event()
+
+    def receive_decode_token():
+        mgr._mark_seq_prefill_complete(seq.id)
+        completed.set()
+
+    with mgr._lb_lock:
+        worker = Thread(target=receive_decode_token)
+        worker.start()
+        progressed_while_router_locked = completed.wait(timeout=2)
+    worker.join(timeout=2)
+    assert progressed_while_router_locked
+    assert sum(mgr._rank_reqs) == 1
+    assert sum(mgr._rank_tokens) == 0
