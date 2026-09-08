@@ -80,18 +80,29 @@ def _set_default_mha_scales(layer) -> None:
 _M3_MODEL_TYPES = ("minimax_m3", "minimax_m3_sparse")
 
 
-def _m3_dense_attn_mode(hf_config) -> str:
-    """Dense-attention mode, but only for MiniMax-M3.
+def _m3_dense_attn_mode(hf_config, layer_num: int = 0) -> str:
+    """Dense-attention mode -- M3's own target layers only.
 
-    The env name says M3 and the behaviour must match it: `_mha_backend_for_layer`
-    and `get_kv_cache_spec` run for every model that uses this layer, so reading
-    the variable unconditionally would let a stray export follow Llama or Qwen
-    into a different backend and KV spec.
+    Two exclusions, and both matter:
+
+    Other models. `_mha_backend_for_layer` and `get_kv_cache_spec` run for every
+    model that uses this layer, so reading the variable unconditionally would
+    let a stray export follow Llama or Qwen into a different backend and KV
+    spec.
+
+    The speculative-decode draft (`layer_num >= num_hidden_layers`). It is
+    routed to `AiterMhaFlexibleBlockBackendForVllm` before the mode is even
+    consulted, so letting the mode reach its KV spec would have it request a
+    K/V-separated cache that its own backend never voted for -- and move it off
+    `_forward_vllm_native_combined_kv`, the bf16 combined-KV path it was written
+    for. The guard here has to match the one in `_mha_backend_for_layer`.
     """
     from atom.utils import envs
 
     model_type = str(getattr(hf_config, "model_type", "") or "").lower()
     if model_type not in _M3_MODEL_TYPES:
+        return "triton"
+    if layer_num >= int(getattr(hf_config, "num_hidden_layers", 1 << 30)):
         return "triton"
     return envs.ATOM_M3_DENSE_ATTN_BACKEND
 
@@ -111,7 +122,7 @@ def _mha_backend_for_layer(layer_num: int, hf_config):
     # block-size-agnostic Triton path (use_triton_attn=True), so executing the
     # cache/PA kernels at the logical 128 page is correct here rather than the
     # page-16 asm path the strict [16] guard exists to protect.
-    mode = _m3_dense_attn_mode(hf_config)
+    mode = _m3_dense_attn_mode(hf_config, layer_num)
     if mode == "gluon":
         # Also requests the K/V-separated cache; see the backend's docstring.
         return AiterMhaM3DenseBackendForVllm
@@ -195,7 +206,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         self.model_type = getattr(hf_config, "model_type", "")
         # One source of truth for the three code paths that must agree: the
         # backend published above, the KV spec below, and forward_impl.
-        self.m3_dense_attn_mode = _m3_dense_attn_mode(hf_config)
+        self.m3_dense_attn_mode = _m3_dense_attn_mode(hf_config, layer_num)
         self.kv_separated = self.m3_dense_attn_mode == "gluon"
 
         _init_vllm_mha_layer_state(
