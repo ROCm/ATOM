@@ -901,14 +901,19 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             )
             return
 
-        # The ASM/gluon decode variant does not yet carry per-token causal
-        # masking; uniform multi-query verify is only wired on the plain-4D path.
-        assert decode_query_len == 1, (
-            "MiniMax-M3 ASM decode kernel supports only single-token decode "
-            f"(decode_query_len=1), got {decode_query_len}; run the plain-4D "
-            "layout for uniform spec-verify decode."
-        )
-
+        # ASM/gluon decode carries per-token causal masking for uniform
+        # spec/MTP verify (decode_query_len == 1 + num_spec) exactly like the
+        # plain-4D path. The indexer emit (minimax_m3_index_topk_decode,
+        # max_query_len=decode_query_len) treats each of the decode_query_len
+        # query tokens of a request as an independent row with its own causal
+        # cutoff (causal_len = seq_len - max_query_len + tok + 1) and fuses a
+        # PER-TOKEN page-16 SHUFFLE table -- sparse_bt [total_q, topk*8] /
+        # sparse_ctx [total_q]. minimax_m3_sparse_attn_decode_asm then runs all
+        # total_q (== num_reqs * decode_query_len) rows through the gluon
+        # split-KV decode kernel at max_seqlen_q == 1, each row an independent
+        # length-1 sequence trimmed to its own causal_len -- so per-token causal
+        # masking falls out of the compacted block-table + exact context_len,
+        # no separate decode_query_len knob needed here.
         from atom.model_ops.minimax_m3.sparse_attn import (
             minimax_m3_sparse_attn_decode_asm,
         )
