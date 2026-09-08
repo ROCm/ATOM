@@ -1010,6 +1010,23 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         if position is not None:
             position = position[:num_actual_tokens]
 
+        # Apply q/k RMSNorm BEFORE rope, matching the shuffle-layout path
+        # (triton_fused_norm_rope_cache, norm->rope) and the reference
+        # MiniMaxM3DenseAttentionForVllm (fused_qknorm_idxrqknorm). M3 dense
+        # attention is trained with GemmaRMSNorm(1+w) on q and k over head_dim;
+        # omitting it here ran the 3 dense layers on un-normalized q/k and cost
+        # ~3.4pt gsm8k. Guarded because the Eagle3 MHA draft routed here has no
+        # q_norm/k_norm.
+        # reshape to contiguous 2-D [tokens*heads, head_dim] so GemmaRMSNorm's
+        # internal view(-1, head_dim) is valid (query/key here are sliced views
+        # and may be non-contiguous); norm is per-head over head_dim.
+        if self.q_norm is not None:
+            q_shape = query.shape
+            query = self.q_norm(query.reshape(-1, self.head_dim)).view(q_shape)
+        if self.k_norm is not None:
+            k_shape = key.shape
+            key = self.k_norm(key.reshape(-1, self.head_dim)).view(k_shape)
+
         if self.rotary_emb is not None:
             assert position is not None
             query, key = self.rotary_emb(position, query, key)
