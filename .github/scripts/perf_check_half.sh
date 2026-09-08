@@ -42,6 +42,9 @@ esac
 # shortened prompt count from it. Checked here so a missing value fails with a
 # name rather than "unbound variable" from wherever it is first dereferenced.
 : "${CONC:?CONC must be set}"
+: "${ISL:?ISL must be set}"
+: "${OSL:?OSL must be set}"
+: "${RANDOM_RANGE_RATIO:?RANDOM_RANGE_RATIO must be set}"
 
 OUT_DIR="perf-pair/${HALF}"
 mkdir -p "$OUT_DIR"
@@ -85,10 +88,22 @@ echo ".github/scripts/atom_test.sh launch ${model_path} ${ARGS:-}" \
   | docker exec -i "$CONTAINER" bash -l
 
 echo "========== ${HALF}: running benchmark =========="
+# ISL/OSL/CONC/RANDOM_RANGE_RATIO are read by atom_test.sh itself, under
+# `set -u`, so a missing one aborts the benchmark after the model has already
+# loaded. In CI the container is started with them injected (via
+# atom-bench-container's container-env), which makes passing them here look
+# redundant -- until the container is started any other way and the run fails
+# with "ISL: unbound variable". Passing them explicitly removes the dependency
+# on how the container was created.
 docker exec \
   -e RESULT_FILENAME="${RESULT_FILENAME}" \
   -e SERVER_ARGS="${ARGS:-}" \
   -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS:-}" \
+  -e ISL="${ISL}" \
+  -e OSL="${OSL}" \
+  -e CONC="${CONC}" \
+  -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO}" \
+  -e NUM_PROMPTS_OVERRIDE="${NUM_PROMPTS_OVERRIDE:-}" \
   -e MP="$model_path" \
   "$CONTAINER" bash -lc '.github/scripts/atom_test.sh benchmark "$MP"'
 
