@@ -448,7 +448,7 @@ def _maybe_apply_pcp_prefill_reindex(
 
     md.cu_seqlen_ks = pcp_pad_dense(md.cu_seqlen_ks, n_pad)[owned_q].contiguous()
     md.cu_seqlen_ke = pcp_pad_dense(md.cu_seqlen_ke, n_pad)[owned_q].contiguous()
-    md.token_to_seq_idxs = pcp_pad_dense(md.token_to_seq_idxs, n_pad)[
+    md.batch_id_per_q_token = pcp_pad_dense(md.batch_id_per_q_token, n_pad)[
         owned_q
     ].contiguous()
     md.sparse_cu_seqlens_q = torch.arange(n_owned + 1, dtype=torch.int32, device=device)
@@ -724,7 +724,7 @@ def build_mtp_multi_token_decode_metadata(
     sparse_kv_last_page_lens = torch.ones(
         sum_scheduled_tokens, dtype=torch.int32, device=device
     )
-    token_to_seq_idxs = torch.repeat_interleave(
+    batch_id_per_q_token = torch.repeat_interleave(
         torch.arange(bs, dtype=torch.int32, device=device),
         torch.from_numpy(extend_lens.astype(np.int64)).to(device=device),
     )
@@ -778,7 +778,7 @@ def build_mtp_multi_token_decode_metadata(
         kv_last_page_lens=kv_last_page_lens,
         sparse_kv_indptr=sparse_kv_indptr,
         sparse_cu_seqlens_q=sparse_cu,
-        token_to_seq_idxs=token_to_seq_idxs,
+        batch_id_per_q_token=batch_id_per_q_token,
         **work,
     )
     md.dtype_q = dtype_q
@@ -971,7 +971,7 @@ def _build_mtp_draft_decode_metadata(
     sparse_kv_indptr = counts_to_indptr(sparse_per_token_lens, device)
     sparse_cu = torch.arange(bs + 1, dtype=torch.int32, device=device)
     sparse_kv_last_page_lens = torch.ones(bs, dtype=torch.int32, device=device)
-    token_to_seq_idxs = torch.arange(bs, dtype=torch.int32, device=device)
+    batch_id_per_q_token = torch.arange(bs, dtype=torch.int32, device=device)
 
     ensure_shared_sparse_buffer(
         token_to_kv_pool,
@@ -1028,7 +1028,7 @@ def _build_mtp_draft_decode_metadata(
         kv_last_page_lens=kv_last_page_lens,
         sparse_kv_indptr=sparse_kv_indptr,
         sparse_cu_seqlens_q=sparse_cu,
-        token_to_seq_idxs=token_to_seq_idxs,
+        batch_id_per_q_token=batch_id_per_q_token,
         **work,
     )
     md.dtype_q = dtype_q
@@ -1340,7 +1340,7 @@ def build_mtp_draft_extend_prefill_metadata(
         md.sparse_cu_seqlens_q = sparse_cu
         md.sparse_kv_indptr = sparse_kv_indptr
         md.sparse_kv_last_page_lens = sparse_last_page_lens
-        md.token_to_seq_idxs = torch.repeat_interleave(
+        md.batch_id_per_q_token = torch.repeat_interleave(
             torch.arange(bs, dtype=torch.int32, device=device),
             torch.from_numpy(counts.astype(np.int64)).to(device=device),
         )
@@ -1472,7 +1472,7 @@ def build_prefill_metadata(
         md.sparse_cu_seqlens_q = sparse_cu
         md.sparse_kv_indptr = sparse_kv_indptr
         md.sparse_kv_last_page_lens = sparse_last_page_lens
-        md.token_to_seq_idxs = torch.repeat_interleave(
+        md.batch_id_per_q_token = torch.repeat_interleave(
             torch.arange(bs, dtype=torch.int32, device=device),
             torch.from_numpy(counts.astype(np.int64)).to(device=device),
         )

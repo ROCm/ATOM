@@ -1390,7 +1390,237 @@ class TestPagedCopyCheckpoint:
         assert third.state_slot == dst
         assert bm.take_state_maintenance_ops().checkpoint_restores == ()
 
-    def test_missing_gated_checkpoint_releases_the_new_slot_and_raises(self):
+    # ── the CPU tier's leg of a PAGE resume ────────────────────────────
+
+    class _TierIndex:
+        """The engine-side index, reduced to what `_attach_state_slots` reads."""
+
+        def __init__(self, *hashes):
+            self.hashes = set(hashes)
+            self.pending_loads = {}
+            self.requested = []
+
+        def could_serve(self, h):
+            return h in self.hashes
+
+        def request_load(self, req_id, h):
+            if h not in self.hashes:
+                return False
+            self.pending_loads[req_id] = h
+            self.requested.append((req_id, h))
+            return True
+
+    def _with_tier(self, bm, *hashes):
+        index = self._TierIndex(*hashes)
+        bm.state_offload = index
+        bm.paged_state_checkpoints.attach_offload(index)
+        return index
+
+    def test_a_boundary_only_the_tier_has_becomes_a_load(self):
+        """The path the whole tier exists for. HBM misses, the tier votes, and
+        the request parks on a load instead of disowning the boundary."""
+        bm = make_block_manager(paged_copy_config(), state_runtime=PAGED_COPY_RUNTIME)
+        first = self._admitted(bm)
+        bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
+        h = boundary_hash(bm, first)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        # The image left HBM but the tier still advertises it.
+        bm.paged_state_checkpoints.unindex(h)
+        index = self._with_tier(bm, h)
+
+        second = stateful_seq(list(range(48)))
+        assert bm._attach_state_slots(second, h) is True
+
+        assert second.offload_joint.load_hash == h
+        assert second.state_slot >= 0, "the H2D writes this slot directly"
+        assert index.requested == [(second.id, h)]
+        # No restore queued: there is nothing in HBM to gather from, and the
+        # bytes land in the slot rather than in PAGE units.
+        assert bm.take_state_maintenance_ops().checkpoint_restores == ()
+        assert bm.take_state_loads() == [(second.id, h, second.state_slot)]
+
+    def test_hbm_is_preferred_over_the_tier(self):
+        """Both tiers are keyed by the same hash, so the gate does not say which
+        one answered -- `_attach_state_slots` tries HBM first and only falls to
+        a load on a miss. A resident image must not pay a park."""
+        bm = make_block_manager(paged_copy_config(), state_runtime=PAGED_COPY_RUNTIME)
+        first = self._admitted(bm)
+        bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
+        h = boundary_hash(bm, first)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        index = self._with_tier(bm, h)  # advertised in BOTH
+
+        second = stateful_seq(list(range(48)))
+        assert bm._attach_state_slots(second, h) is True
+
+        assert second.offload_joint.load_hash == -1
+        assert index.requested == [], "a resident image must not pay a park"
+        assert len(bm.take_state_maintenance_ops().checkpoint_restores) == 1
+
+    def test_a_tier_that_declines_disowns_rather_than_parking(self):
+        """`request_load` refuses a hash it never stored, because a load is
+        resolved only by a report -- offering one would park the request
+        against bytes no `get` can produce."""
+        bm = make_block_manager(paged_copy_config(), state_runtime=PAGED_COPY_RUNTIME)
+        first = self._admitted(bm)
+        bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
+        h = boundary_hash(bm, first)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.unindex(h)
+        self._with_tier(bm)  # votes for nothing
+
+        second = stateful_seq(list(range(48)))
+        assert bm._attach_state_slots(second, h) is False
+        assert second.offload_joint.load_hash == -1
+        assert bm.checkpoint_funnel()["state_gate_lost_boundary"] == 1
+
+    # ── the joint boundary, which #2045 makes the only source of value ──
+
+    def _joint_bm(self, chunk=BLOCK, **overrides):
+        bm = make_block_manager(
+            paged_copy_config(**overrides), state_runtime=PAGED_COPY_RUNTIME
+        )
+        # Normally read off the LMCache config at construction; that import is
+        # unavailable here, and the value is the KV leg's transfer grid.
+        bm._joint_chunk_tokens = chunk
+        return bm
+
+    def _prompt_with_a_rung_at(self, bm, blocks: int):
+        """Run PROMPT once and leave one READY checkpoint `blocks` blocks in.
+
+        Placed explicitly rather than by the ladder because the position
+        matters: `can_allocate` matches over `range(n_hash_blocks - 1)`, so a
+        checkpoint filed under the LAST block is one no scan can ever look up.
+        An interior rung is what a resume actually lands on.
+        """
+        seq = self._admitted(bm, PROMPT)
+        # Publish the prefix, which is what makes its blocks lookup-able and so
+        # what a second request's walk can match against.
+        bm.hash_blocks(seq, seq.num_prompt_tokens)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        # Whatever the ladder placed is not the subject here; keep exactly one
+        # rung, at a position chosen for being interior.
+        bm.paged_state_checkpoints.clear_index()
+
+        h = bm._chain_to(seq, [], blocks)[blocks - 1]
+        bm.paged_state_checkpoints.checkpoint(seq, blocks, h)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        assert bm.paged_state_checkpoints.contains(h), "precondition: it is READY"
+        assert bm.kv.lookup(h) >= 0, "precondition: its KV block is published"
+        return seq, h
+
+    @staticmethod
+    def _break_the_kv_chain_at(bm, block_id: int) -> None:
+        """Evict one published KV block so the prefix walk stops before the rung.
+
+        Without this there is nothing for a joint boundary to do: a fully
+        resident prefix already gates to its rung, `_attach_state_slots` issues
+        the state load on its own, and the KV leg has nothing to fetch. The
+        joint path exists for exactly the case this creates -- HBM lost the KV,
+        LMCache still has it.
+
+        Call after `deallocate`: `allocate` is the eviction event and it asserts
+        the block is unheld.
+        """
+        assert bm.kv.block(block_id).hash != -1, "precondition: it was published"
+        bm.kv.allocate(block_id)  # takes it for fresh content, dropping the hash
+
+    def _reset_joint_counters(self, bm):
+        bm.joint_boundaries = bm.state_hbm_boundaries = bm.state_tier_boundaries = 0
+        bm.joint_skips.clear()
+
+    def test_a_page_class_now_gets_a_joint_boundary(self):
+        """The inversion, and the single most important assertion in Phase 5.
+
+        This gate used to refuse every PAGE seq (`not_hybrid`), which was right
+        while a K3 checkpoint was an Active Slot the tier spilled out of the
+        slot pool. #2045 moved the image into the KV pool, and HBM's
+        `state ⊆ KV` means a checkpoint can no longer outlive its KV there --
+        so when LMCache hands the KV back, nothing hands the state back unless
+        the two are fetched together. Refusing here makes the whole tier dead
+        weight, and no other counter in the system would say so.
+        """
+        bm = self._joint_bm()
+        first, h = self._prompt_with_a_rung_at(bm, 8)  # 32 tokens in
+
+        victim = first.block_table[1]
+        bm.deallocate(first)
+        self._break_the_kv_chain_at(bm, victim)
+        bm.paged_state_checkpoints.unindex(h)  # the image left HBM with it
+        self._with_tier(bm, h)  # ...but LMCache still has it
+        self._reset_joint_counters(bm)
+
+        second = stateful_seq(PROMPT)
+        second.offload_joint.kv_prefix_tokens = len(PROMPT)
+        hbm_hit = bm.can_allocate(second)
+
+        assert bm.joint_boundaries == 1, bm.joint_skips
+        assert second.offload_joint.boundary_hash == h
+        assert second.offload_joint.boundary_tokens == 8 * BLOCK
+        # The KV leg has real work: the walk stopped well below the boundary.
+        assert hbm_hit * BLOCK < second.offload_joint.kv_tokens
+
+    def test_the_split_says_which_tier_the_state_leg_came_from(self):
+        """`state_tier` is the only counter here that cannot be non-zero with
+        the CPU tier switched off, which makes it the honest test of "did this
+        feature run" -- no passing unit test can produce it in production."""
+        bm = self._joint_bm()
+        first, h = self._prompt_with_a_rung_at(bm, 8)
+        victim = first.block_table[1]
+        bm.deallocate(first)
+        self._break_the_kv_chain_at(bm, victim)
+        self._with_tier(bm, h)
+        self._reset_joint_counters(bm)
+
+        # The checkpoint outlived the block that broke the chain, so the state
+        # leg is free -- a gather out of resident units, no transfer.
+        resident = stateful_seq(PROMPT)
+        resident.offload_joint.kv_prefix_tokens = len(PROMPT)
+        bm.can_allocate(resident)
+        assert (bm.state_hbm_boundaries, bm.state_tier_boundaries) == (1, 0)
+
+        # Drop it from HBM too: now the state leg costs an image-sized H2D.
+        bm.paged_state_checkpoints.unindex(h)
+        from_cpu = stateful_seq(PROMPT)
+        from_cpu.offload_joint.kv_prefix_tokens = len(PROMPT)
+        bm.can_allocate(from_cpu)
+        assert (bm.state_hbm_boundaries, bm.state_tier_boundaries) == (1, 1)
+
+    def test_no_tier_means_no_joint_boundary(self):
+        """`state_offload is None` short-circuits before anything else: a
+        boundary both legs must reach is meaningless with one leg missing."""
+        bm = self._joint_bm()
+        first, _h = self._prompt_with_a_rung_at(bm, 8)
+        victim = first.block_table[1]
+        bm.deallocate(first)
+        self._break_the_kv_chain_at(bm, victim)
+        self._reset_joint_counters(bm)
+
+        seq = stateful_seq(PROMPT)
+        seq.offload_joint.kv_prefix_tokens = len(PROMPT)
+        bm.can_allocate(seq)
+        assert bm.joint_boundaries == 0
+        assert bm.joint_skips.get("off") == 1
+
+    def test_a_gated_boundary_neither_tier_has_is_disowned_not_raised(self):
+        """This used to raise, and could not stay that way.
+
+        The raise asserted that the gate and the HBM store agree, which held
+        while `can_allocate` only ever accepted boundaries the HBM index
+        carried. The gate now consults the CPU tier as well, so a hash it
+        accepted may live only there -- and with no tier able to produce it,
+        the answer is to disown the boundary, not to take the engine down.
+
+        The slots are KEPT, unlike the old abort: the request is about to
+        recompute its whole prefix and it writes that state into these very
+        slots. Releasing them here would hand the next request a buffer this
+        one is still filling.
+        """
         bm = make_block_manager(
             paged_copy_config(),
             state_runtime=PAGED_COPY_RUNTIME,
@@ -1404,11 +1634,11 @@ class TestPagedCopyCheckpoint:
         bm.paged_state_checkpoints.unindex(h)
 
         second = stateful_seq(list(range(48)))
-        with pytest.raises(RuntimeError, match="disappeared"):
-            bm._attach_state_slots(second, h)
+        assert bm._attach_state_slots(second, h) is False
 
-        assert second.state_slot == -1
-        assert bm.state.num_free() == free_slots
+        assert second.state_slot >= 0, "the seq keeps slots to recompute into"
+        assert bm.state.num_free() == free_slots - bm.state_slots_per_req
+        assert bm.checkpoint_funnel()["state_gate_lost_boundary"] == 1
 
     def test_copy_transfer_can_checkpoint_a_speculative_decode_boundary(self):
         spec = SimpleNamespace(num_speculative_tokens=3, use_dspark=lambda: False)
@@ -3157,3 +3387,247 @@ class TestMidstepCheckpoints:
         bm.can_allocate(cold)
         assert cold.block_hashes == []
         assert bm.midstep_positions(cold, 0, 44) == []
+
+
+def test_fates_report_every_counter():
+    """checkpoint_fates() must expose all four fate counters.
+
+    NOTE: the actual dict keys carry the ``checkpoints_`` prefix
+    (``checkpoints_kept``, ``checkpoints_evicted``, ``checkpoints_orphaned``,
+    ``checkpoints_dropped``).  The task-0 brief assumed short keys
+    (``kept`` / ``evicted`` / …); those differ — see the report for the
+    discrepancy note and the rationale for leaving the public API unchanged.
+    """
+    pool = StateSlotPool(num_slots=2, transfer=StateTransfer.fork(1), hash_block_size=4)
+    fates = pool.checkpoint_fates()
+    assert set(fates) == {
+        "checkpoints_kept",
+        "checkpoints_evicted",
+        "checkpoints_orphaned",
+        "checkpoints_dropped",
+    }
+
+
+def test_state_checkpoint_fates_warns_on_missing_method(caplog):
+    """A state cache that lacks checkpoint_fates() emits a warning.
+
+    The aggregator must not silently under-count: when a class registered in
+    ``state_caches`` does not implement ``checkpoint_fates()``, a WARNING is
+    logged naming the skipped class so an operator knows the total is partial.
+    """
+    import logging
+
+    bm = BlockManager(ckpt_config())
+    # StubStateCache (defined above) satisfies StateCache but has no
+    # checkpoint_fates — exactly the class of future lightweight implementations
+    # the warning is meant to catch.
+    bm.state_caches = (bm.state_caches[0], StubStateCache())
+
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        bm.state_checkpoint_fates()
+
+    assert any(
+        "StubStateCache" in r.message and "checkpoint_fates" in r.message
+        for r in caplog.records
+    ), "expected a WARNING naming StubStateCache; got: " + str(
+        [r.message for r in caplog.records]
+    )
+
+
+def test_state_checkpoint_fates_warns_once_per_class(caplog):
+    """The caller is the scheduler's every-100-ticks stats line and
+    `state_caches` never changes during a run, so an unlatched warning is the
+    same line forever -- drowning the log it is trying to draw attention to.
+    What it reports is a static property of the build: true on tick 1, no
+    truer on tick 10000.
+    """
+    import logging
+
+    bm = BlockManager(ckpt_config())
+    bm.state_caches = (bm.state_caches[0], StubStateCache())
+
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        for _ in range(5):
+            bm.state_checkpoint_fates()
+
+    hits = [r for r in caplog.records if "StubStateCache" in r.message]
+    assert len(hits) == 1, [r.message for r in hits]
+
+
+def test_state_checkpoint_fates_log_order_is_stable(caplog):
+    """The periodic log line emitted by `Scheduler.schedule()` sorts its keys.
+
+    Read by an operator diffing one stats line against the next, so the field
+    order has to be a property of the line rather than of whichever order the
+    counters happen to be declared in — `StateSlotPool.checkpoint_fates()`
+    returns them kept/dropped/evicted/orphaned, which is not alphabetical, and
+    a new counter appended to that dict would otherwise land in the middle of
+    the line for every deployment at once.
+
+    Asserted against the emitted message, not against a `sorted()` this test
+    applies itself: dropping the `sorted()` from the scheduler's join has to be
+    what fails here, and the non-alphabetical insertion order above is what
+    makes the two distinguishable.
+    """
+    import logging
+
+    sched = Scheduler(ckpt_config())
+    sched.add(stateful_seq(list(range(40))))
+    pool = sched.block_manager.state
+    pool.checkpoints_kept += 3
+    pool.checkpoints_dropped += 1
+    # The premise: if the counters were declared alphabetically the emitted
+    # line would be sorted whether or not the scheduler sorted it.
+    assert list(pool.checkpoint_fates()) != sorted(pool.checkpoint_fates())
+
+    # The line is periodic — one pass in a hundred — so the batch has to be
+    # driven to the tick that emits it.
+    with caplog.at_level(logging.INFO, logger="atom"):
+        for _ in range(100):
+            sched.schedule()
+
+    lines = [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("state checkpoints: ")
+    ]
+    assert lines, "the periodic state-checkpoint line was never emitted"
+
+    fields = lines[-1].removeprefix("state checkpoints: ").split()
+    keys = [f.split("=")[0] for f in fields]
+    assert keys == [
+        "checkpoints_dropped",
+        "checkpoints_evicted",
+        "checkpoints_kept",
+        "checkpoints_orphaned",
+    ], f"fields are not in alphabetical order: {lines[-1]}"
+    # The values ride along with their keys rather than being sorted apart.
+    assert "checkpoints_kept=3" in fields and "checkpoints_dropped=1" in fields
+
+
+def test_checkpoint_funnel_includes_second_state_class():
+    """checkpoint_funnel() must aggregate fates across ALL state classes.
+
+    Prior to the fix, ``checkpoint_funnel()`` called ``self.state.checkpoint_fates()``
+    directly, which would miss any second state class added to ``state_caches``.
+    After routing through ``state_checkpoint_fates()``, a second class that
+    implements ``checkpoint_fates()`` is included in the funnel output.
+    """
+
+    class SecondPoolStub:
+        """Minimal StateCache with checkpoint_fates — mimics a second real class."""
+
+        successor_room = 0
+
+        def applies(self, seq):
+            return False
+
+        def resumable_hit(self, seq, P, block_hashes, assume_checkpointed=False):
+            return 0
+
+        def checkpoint(self, seq, boundary_blocks, h):
+            pass
+
+        def checkpoint_fates(self) -> dict:
+            return {"checkpoints_kept": 7, "checkpoints_dropped": 2}
+
+    bm = BlockManager(ckpt_config())
+    bm.state_caches = (bm.state_caches[0], SecondPoolStub())
+
+    funnel = bm.checkpoint_funnel()
+
+    # The two ladder-level counters must still be present.
+    assert "demands_recorded" in funnel
+    assert "chunks_cut_for_demand" in funnel
+
+    # The second class's counters must appear in the funnel — they would have
+    # been absent before the fix.
+    assert (
+        funnel.get("checkpoints_kept", 0) >= 7
+    ), "checkpoints_kept from SecondPoolStub missing from checkpoint_funnel()"
+    assert (
+        funnel.get("checkpoints_dropped", 0) >= 2
+    ), "checkpoints_dropped from SecondPoolStub missing from checkpoint_funnel()"
+
+
+# ── a claimed joint boundary must have a state leg behind it ───────────────
+
+
+class TestPagedAllocateAimsTheStateLegAtTheJointBoundary:
+    """`can_allocate` picks the boundary and `_attach_state_slots` secures the
+    state, and the PAGE branch of `allocate` used to hand it `hit_hash` -- the
+    hash at the *HBM* hit -- while the fork branch already used the joint one.
+
+    Both ways of getting that wrong end identically: the KV leg loads to the
+    boundary, `_claim_after_load` raises `num_cached_tokens` to it, and the
+    forward resumes over a prefix the recurrent state does not cover.
+    """
+
+    class _TierIndex:
+        def __init__(self, *hashes):
+            self.hashes = set(hashes)
+            self.pending_loads = {}
+            self.requested = []
+            self.can_store = True
+            self.can_load = True
+
+        def could_serve(self, h):
+            return self.can_load and h in self.hashes
+
+        def request_load(self, req_id, h):
+            if h not in self.hashes:
+                return False
+            self.pending_loads[req_id] = h
+            self.requested.append((req_id, h))
+            return True
+
+    def _bm(self, *tier_hashes):
+        bm = make_block_manager(paged_copy_config(), state_runtime=PAGED_COPY_RUNTIME)
+        index = self._TierIndex(*tier_hashes)
+        bm.state_offload = index
+        bm.paged_state_checkpoints.attach_offload(index)
+        return bm, index
+
+    def _joint_seq(self, bm, tokens, *, boundary_hash_value, claim_tokens):
+        seq = stateful_seq(list(tokens))
+        seq.offload_joint.boundary_hash = boundary_hash_value
+        seq.offload_joint.boundary_tokens = claim_tokens
+        seq.offload_joint.claim_tokens = claim_tokens
+        return seq
+
+    def test_the_state_leg_is_aimed_at_the_boundary_not_the_hbm_hit(self):
+        """`num_cached_blocks == 0`, so `hit_hash` is never assigned and the
+        old code took the cold-start exit: no restore, no load, and a boundary
+        still claimed."""
+        bm, index = self._bm(4242)
+        seq = self._joint_seq(bm, range(48), boundary_hash_value=4242, claim_tokens=0)
+        bm.allocate(seq, 0)
+
+        assert index.requested == [
+            (seq.id, 4242)
+        ], "the state leg must be aimed at the joint boundary"
+        assert seq.offload_joint.boundary_hash == 4242, "the boundary still stands"
+
+    def test_a_boundary_with_no_state_behind_it_is_disowned(self):
+        """The backstop. Whatever the gate decided, a request may not resume
+        over a prefix nothing put state behind."""
+        bm, _index = self._bm()  # the tier has nothing
+        seq = self._joint_seq(bm, range(48), boundary_hash_value=4242, claim_tokens=0)
+        before = bm.state_gate_lost_boundary
+        bm.allocate(seq, 0)
+
+        assert seq.offload_joint.boundary_hash == -1
+        assert seq.offload_joint.boundary_tokens == 0
+        assert seq.num_cached_tokens == 0
+        assert bm.state_gate_lost_boundary > before
+
+    def test_a_cold_start_without_a_boundary_is_untouched(self):
+        """The gate must not fire on the ordinary path: no boundary claimed,
+        so a cold slot is exactly right."""
+        bm, _index = self._bm()
+        seq = stateful_seq(list(range(48)))
+        before = bm.state_gate_lost_boundary
+        bm.allocate(seq, 0)
+
+        assert seq.state_slot >= 0
+        assert bm.state_gate_lost_boundary == before

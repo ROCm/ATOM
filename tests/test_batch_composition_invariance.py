@@ -175,7 +175,7 @@ def _swa_env():
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("swa_write is a Triton kernel; needs a real GPU")
-    from atom.model_ops.attentions.v4_pool_geometry import (
+    from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
         CSA_RATIO,
         DENSE_RATIO,
         HCA_RATIO,

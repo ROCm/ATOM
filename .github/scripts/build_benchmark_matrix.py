@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from catalog import (  # noqa: E402
+from catalog import (
     build_cell_configs,
     load_variants,
     validate_dispatch_inputs,
@@ -42,6 +42,7 @@ RESERVED_INPUTS = {
     "enable_rtl",
     "param_lists",
     "atom_commit",
+    "publish_to_dashboard",
 }
 
 
