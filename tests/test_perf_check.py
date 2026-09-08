@@ -290,13 +290,13 @@ def test_history_deduplicates_by_actions_run_id(tmp_path):
     )
     # Three of five points collapse to one, leaving three observations -- below
     # the six required, so nothing is reported rather than a fabricated sigma.
-    assert pj.load_history_cv(str(src)) == {}
+    assert pj.load_history(str(src))[1] == {}
 
 
 def test_history_failure_is_not_fatal(tmp_path):
-    assert pj.load_history_cv(str(tmp_path / "absent.js")) == {}
+    assert pj.load_history(str(tmp_path / "absent.js")) == ({}, {})
     (tmp_path / "junk.js").write_text("not json at all")
-    assert pj.load_history_cv(str(tmp_path / "junk.js")) == {}
+    assert pj.load_history(str(tmp_path / "junk.js")) == ({}, {})
 
 
 def test_verdict_holds_without_history(tmp_path):
@@ -391,6 +391,64 @@ def test_sanity_check_is_skipped_without_history(tmp_path):
     report = pj.judge(pj.pair_results(base, head), {}, expected_entries=1)
     assert report["verdict"] == "clean"
     assert report["n_bad_baseline"] == 0
+
+
+def _series(model, concs, days, start, end, tpot_start=30.0, tpot_end=30.0):
+    """A per-configuration series sliding linearly from start to end."""
+    out = {}
+    n = 8
+    for c in concs:
+        pts = []
+        for i in range(n):
+            frac = i / (n - 1)
+            pts.append(
+                {
+                    "date": (days * 86400 * 1000 * i) // (n - 1),
+                    "tput": start + (end - start) * frac,
+                    "tpot": tpot_start + (tpot_end - tpot_start) * frac,
+                }
+            )
+        out[(model, "8192/1024", c)] = pts
+    return out
+
+
+def test_main_side_drift_is_reported_apart_from_the_verdict(tmp_path):
+    """A slide on main leaves the paired delta honest and the absolute level
+    wrong. Reporting only "no change" would read as "fine"."""
+    series = _series("M", JUDGING, 14, 10000.0, 9000.0, 30.0, 33.0)  # -10%, TPOT +10%
+    drift = pj.main_drift(series, {"M"})
+    assert len(drift) == 1
+    assert drift[0]["median_pct"] < pj.DRIFT_MEDIAN_TH
+    assert drift[0]["n_down"] == len(JUDGING)
+
+    base = [_result("M", c, 9000.0, 33.0) for c in JUDGING]
+    head = [_result("M", c, 8995.0, 33.0) for c in JUDGING]
+    report = pj.judge(pj.pair_results(base, head), {}, expected_entries=1, drift=drift)
+
+    # The PR itself is clean, and the drift does not change that.
+    assert report["verdict"] == "clean"
+    body = pj.render(report, "")
+    assert "not caused by this PR" in body
+    assert "Main-side context" in body
+
+
+def test_drift_needs_tpot_to_mirror(tmp_path):
+    """Throughput sliding with TPOT flat is measurement wobble, not a slowdown."""
+    series = _series("M", JUDGING, 14, 10000.0, 9000.0, 30.0, 30.0)
+    assert pj.main_drift(series, {"M"}) == []
+
+
+def test_drift_is_scoped_to_the_models_measured(tmp_path):
+    """Listing every drifting family in the repository would bury the one the
+    reader came for."""
+    series = _series("Other", JUDGING, 14, 10000.0, 9000.0, 30.0, 33.0)
+    assert pj.main_drift(series, {"M"}) == []
+    assert pj.main_drift(series, {"Other"}) != []
+
+
+def test_drift_ignores_low_concurrency(tmp_path):
+    series = _series("M", [4, 8, 32], 14, 10000.0, 9000.0, 30.0, 33.0)
+    assert pj.main_drift(series, {"M"}) == []
 
 
 # ------------------------------------------------------------- contract ---
