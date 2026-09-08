@@ -307,9 +307,14 @@ def test_verdict_holds_without_history(tmp_path):
 
 
 # ------------------------------------------------------------- contract ---
-def test_thresholds_are_reported_as_provisional(tmp_path):
+def test_thresholds_report_the_measured_residual_bias(tmp_path):
+    """The trip point is not the threshold: a measured, systematic bias favours
+    head, so a real drop has to exceed both before it registers. Reporting the
+    threshold alone would overstate what the check resolves."""
     report = run_judge(tmp_path, flat())
-    assert report["thresholds"]["family_median_pct_is_provisional"] is True
+    bias = report["thresholds"]["measured_residual_bias_pct"]
+    assert bias > 0
+    assert bias == pj.MEASURED_RESIDUAL_BIAS_PCT
 
 
 def test_judging_levels_start_at_the_documented_boundary():
