@@ -60,6 +60,7 @@ FAMILY_MEDIAN_PCT = -3.0  # family median throughput delta that trips the gate
 DOWN_EPS_PCT = -2.0  # a level counts as "down" past this
 TPOT_MIRROR_RATIO = 0.6  # |median TPOT delta / median tput delta| for mirroring
 NONMONOTONIC_MARGIN_PCT = 3.0  # interior level this far outside its neighbours
+MEASURED_RESIDUAL_BIAS_PCT = 1.35  # A/A residual after the warmup; see below
 DRIFT_TRUST_PCT = 3.0  # base repeated this far apart -> the pairing cannot resolve
 
 # The base commit is measured twice, before and after head. The distance
@@ -79,11 +80,25 @@ DRIFT_TRUST_PCT = 3.0  # base repeated this far apart -> the pairing cannot reso
 # reader needs to tell "small-batch path problem" from "small-c noise" -- so
 # they are reported alongside, labelled, and excluded from every computation.
 
-# FAMILY_MEDIAN_PCT is PROVISIONAL. It was derived by tightening the -4.0 used
-# for nightly time-series monitoring by one notch, on the reasoning that a
-# paired same-machine measurement is quieter than a cross-run comparison. It is
-# not backed by a measurement yet. Calibrate it against an A/A run (same commit,
-# same wheel, repeated) before treating a trip as authoritative.
+# What FAMILY_MEDIAN_PCT can actually resolve, measured rather than assumed.
+#
+# An A/A run -- every phase on one commit, so every delta is noise -- gave
+# +1.35% on MI308 with DeepSeek-V4-Flash at tp=8, after the warmup. A third
+# measurement of the same base commit landed at +1.26%, so the residual is
+# drift over the run, not anything specific to the second half: later readings
+# are faster than earlier ones by about that much, whichever commit they carry.
+#
+# The bias is systematic and favours head, so it subtracts from any regression
+# rather than inventing one. A true -3% reads as roughly -1.65% and does not
+# trip; tripping needs about -4.35%. That is the honest sensitivity of this
+# check, and it is fine for the regressions worth catching -- 5% and up -- but
+# a reader should not take -3.0 as the resolution.
+#
+# One run on one shared machine, and drift varied visibly within it (the
+# benchmark slowed from 1.07 to 1.65 s/it partway through and recovered), so
+# treat 1.35% as an order of magnitude rather than a constant. Averaging a
+# repeated base reading halves it, at the cost of a third measurement; see the
+# workflow for why that trade was declined.
 
 # --- Single-configuration escalation (auxiliary; uses history sigma) --------
 SINGLE_DROP_PCT = -8.0  # a lone level this far down is worth surfacing
@@ -464,7 +479,10 @@ def judge(pairs, history_cv, expected_entries=None):
             "family_min_down": FAMILY_MIN_DOWN,
             "family_min_configs": FAMILY_MIN_CONFIGS,
             "tpot_mirror_ratio": TPOT_MIRROR_RATIO,
-            "family_median_pct_is_provisional": True,
+            # Measured residual bias after the warmup, from an A/A run. It is
+            # systematic and favours head, so the effective trip point is this
+            # much further down than family_median_pct.
+            "measured_residual_bias_pct": MEASURED_RESIDUAL_BIAS_PCT,
         },
     }
 
@@ -741,8 +759,12 @@ def render_summary(report, context):
         ),
         "",
         (
-            "> The family-median threshold is provisional and not yet calibrated "
-            "against a repeated same-commit (A/A) measurement."
+            f"> Measured residual bias after the warmup is "
+            f"{MEASURED_RESIDUAL_BIAS_PCT}%, systematic and favouring head, so "
+            f"a drop trips at roughly "
+            f"{FAMILY_MEDIAN_PCT - MEASURED_RESIDUAL_BIAS_PCT:.2f}% rather than "
+            f"{FAMILY_MEDIAN_PCT}%. Fine for the regressions worth catching; not "
+            f"a resolution of {abs(FAMILY_MEDIAN_PCT)}%."
         ),
     ]
     return "\n".join(lines)

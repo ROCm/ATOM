@@ -142,7 +142,7 @@ jobs:
       matrix:
         cell: ${{ fromJson(needs.build-matrix.outputs.cells) }}
     runs-on: ${{ matrix.cell.runner }}
-    timeout-minutes: 240
+    timeout-minutes: 180
     env:
       MODEL_PATH: ${{ matrix.cell.model_path }}
       ARGS: ${{ matrix.cell.server_args }}
@@ -234,19 +234,28 @@ jobs:
           cp .github/scripts/perf_check_half.sh "$RUNNER_TEMP/perf_check_half.sh"
           chmod +x "$RUNNER_TEMP/perf_check_half.sh"
 
-      # warmup -> base -> head -> base2.
+      # warmup -> base -> head.
       #
       # The container is shared by both halves, which is what keeps machine and
       # image fixed -- but it also carries the JIT/autotune caches the first run
-      # populates. Measured on identical code, the second half read 5.9% (c=64)
-      # and 9.1% (c=128) faster than the first, with TPOT and TTFT agreeing.
-      # That is larger than the regression threshold and points the wrong way:
-      # it hides regressions rather than inventing them. The discarded warmup
-      # pays that cost before either measurement.
+      # populates. Measured on identical code with no warmup, the second half
+      # read 5.9% (c=64) and 9.1% (c=128) faster than the first, with TPOT and
+      # TTFT agreeing: larger than the regression threshold, and pointing the
+      # wrong way, since it hides regressions rather than inventing them. The
+      # discarded warmup pays that cost before either measurement.
       #
-      # base2 repeats the base commit after head. Its distance from the first
-      # base is whatever drifted while the pairing ran; without it, head-vs-base
-      # cannot be separated from time passing.
+      # An A/A run (every phase on one commit, MI308, DeepSeek-V4-Flash tp=8)
+      # measured what the warmup leaves behind:
+      #
+      #     head vs base    +1.35%    was +5.9% / +9.1% / +2.8% without warmup
+      #     base2 vs base   +1.26%    a third measurement of the base commit
+      #
+      # The two agree, so the residual is drift over the run rather than
+      # anything specific to head. Averaging a repeated base reading halves it
+      # (+0.71%), but costs a third measurement -- 0.65 percentage points of
+      # sensitivity for 33% more GPU time, which is a bad trade against
+      # regressions worth catching. perf_judge.py still accepts --base2-dir;
+      # add a base2 phase and pass it when a run needs its drift quantified.
       - name: Bench WARMUP (discarded)
         run: bash "$RUNNER_TEMP/perf_check_half.sh" "${{ steps.refs.outputs.base_sha }}" warmup
 
@@ -256,8 +265,6 @@ jobs:
       - name: Bench HEAD
         run: bash "$RUNNER_TEMP/perf_check_half.sh" "${{ steps.refs.outputs.head_sha }}" head
 
-      - name: Bench BASE again (drift probe)
-        run: bash "$RUNNER_TEMP/perf_check_half.sh" "${{ steps.refs.outputs.base_sha }}" base2
 
       - name: Record provenance
         if: always()
@@ -324,12 +331,11 @@ jobs:
         id: collect
         run: |
           set -euo pipefail
-          mkdir -p collected/base collected/head collected/base2
+          mkdir -p collected/base collected/head
           # Artifacts nest one directory per matrix cell; flatten both halves so
           # the judge sees one base dir and one head dir.
           find pairs -path '*/base/*.json' -exec cp {} collected/base/ \; || true
           find pairs -path '*/head/*.json' -exec cp {} collected/head/ \; || true
-          find pairs -path '*/base2/*.json' -exec cp {} collected/base2/ \; || true
           echo "base=$(find collected/base -name '*.json' | wc -l)" >> "$GITHUB_OUTPUT"
           echo "head=$(find collected/head -name '*.json' | wc -l)" >> "$GITHUB_OUTPUT"
           DIGEST=$(find pairs -name provenance.json -print -quit \
@@ -349,7 +355,6 @@ jobs:
           python3 .github/scripts/perf_judge.py \
             --base-dir collected/base \
             --head-dir collected/head \
-            --base2-dir collected/base2 \
             --expect-entries "${{ env.PERF_EXPECTED_ENTRIES }}" \
             --context "$CONTEXT" \
             --output-json verdict.json \
