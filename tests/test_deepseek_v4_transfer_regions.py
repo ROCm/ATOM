@@ -14,26 +14,99 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from atom.kv_transfer.disaggregation.types import KVTransferTensors
+from atom.kv_transfer.disaggregation.types import KVTransferRegion, KVTransferTensors
 from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.state_runtime import StateRuntime, StateTransfer
+from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+    fp4_indexer_block_fields,
+    fp8_indexer_block_fields,
+    indexer_block_regions,
+    main_kv_plane_fields,
+)
 from atom.model_ops.attentions.pool_layout.v4_pool_geometry import UnifiedPoolGeometry
 
 _MISSING = object()
 _HEAD_DIM = 16
 _ROPE_HEAD_DIM = 4
 _CSA_ROWS_PER_BLOCK = 64
-_INDEX_ROW_BYTES = 132
+_INDEX_HEAD_DIM = 128
+_INDEX_ROW_BYTES = _INDEX_HEAD_DIM + 4
 _CSA_REGION_COUNT = 2
-_FP4_K_TILES = 1
+_FP4_K_TILES = _INDEX_HEAD_DIM // 128
 
 
 def test_generic_transfer_tensors_default_to_no_full_slot_expectation():
-    transfer = KVTransferTensors(block_regions=[], slot_regions=[], num_blocks=1)
+    transfer = KVTransferTensors(block_regions=[], slot_regions=[])
 
     assert transfer.expected_full_slot_region_count is None
+
+
+def _page_region(blocks: int, unit_bytes: int, role: str) -> KVTransferRegion:
+    return KVTransferRegion(
+        base_addr=0x1000,
+        total_bytes=blocks * unit_bytes,
+        unit_bytes=unit_bytes,
+        semantic_role=role,
+    )
+
+
+class TestTheBlockIdSpacePageRegionsAreAddressedIn:
+    """`num_blocks` is the scheduler's count, and every region has to hold it.
+
+    Three backends used to state it themselves, in two different units -- one
+    in scheduler blocks and one in its own page. Where a backend's page and the
+    scheduler's block are the same *size* the two spell the same number, so the
+    disagreement is invisible until a config makes them differ, at which point a
+    peer computes `base + block_id * unit_bytes` against a stride the other end
+    does not share. Same number is not same unit; the count comes from the one
+    caller holding the scheduler's, and every region is checked against it.
+    """
+
+    def test_regions_in_the_scheduler_block_are_accepted(self):
+        transfer = KVTransferTensors(
+            block_regions=[
+                _page_region(8, 2080, "kv.layer_0"),
+                _page_region(8, 132, "index.layer_0"),
+            ],
+            slot_regions=[],
+        )
+
+        transfer.set_block_count(8)
+
+        assert transfer.num_blocks == 8
+
+    def test_a_region_registered_in_another_unit_is_refused(self):
+        """MLA pages at one token: registering per row rather than per
+        scheduler block gives `block_ratio` times as many units of
+        `1/block_ratio` the bytes -- the same total, which is why no byte count
+        catches it."""
+        transfer = KVTransferTensors(
+            block_regions=[
+                _page_region(8, 2080, "kv.layer_0"),
+                _page_region(8 * 16, 2080 // 16, "kv.layer_1"),
+            ],
+            slot_regions=[],
+        )
+
+        with pytest.raises(ValueError, match="kv.layer_1 holds 128 blocks"):
+            transfer.set_block_count(8)
+
+    def test_a_region_that_does_not_divide_into_whole_blocks_is_refused(self):
+        transfer = KVTransferTensors(
+            block_regions=[KVTransferRegion(0x1000, 100, 32, semantic_role="ragged")],
+            slot_regions=[],
+        )
+
+        with pytest.raises(ValueError, match="does not divide into whole blocks"):
+            transfer.set_block_count(3)
+
+    def test_the_count_is_not_something_a_backend_can_pass(self):
+        """`init=False` is the enforcement: a backend cannot state a count that
+        its own regions contradict, because it cannot state one at all."""
+        with pytest.raises(TypeError):
+            KVTransferTensors(block_regions=[], slot_regions=[], num_blocks=8)
 
 
 @contextmanager
@@ -147,16 +220,35 @@ def _transfer_builder(
     )
 
     builder = builder_cls.__new__(builder_cls)
+    # `_stub_v4_runtime_imports` replaces `CommonAttentionBuilder` with an empty
+    # class, so nothing the real base sets exists here. This is V4's own block
+    # count -- the unit `UnifiedPoolGeometry` above was built in, which is why
+    # it is the same `num_blocks` handed to both.
+    builder.num_blocks = num_blocks
     builder._kv_fp8 = kv_dtype == "fp8"
     builder._indexer_fp4 = indexer_fp4
     builder._classical_dtype = torch.uint8 if builder._kv_fp8 else torch.bfloat16
-    builder._rope_dtype = torch.bfloat16
     builder.head_dim = _HEAD_DIM
     builder.rope_head_dim = _ROPE_HEAD_DIM
     builder.csa_layers = [0, 2]
     builder.csa_rows_per_block = _CSA_ROWS_PER_BLOCK
-    builder._index_row_bytes = _INDEX_ROW_BYTES
-    builder._idx_k_tiles = _FP4_K_TILES
+    builder.index_head_dim = _INDEX_HEAD_DIM
+    # The two declarations `__init__` would have made, from the same functions
+    # the backend calls: this fixture is after the transfer regions, and a
+    # hand-written layout here would be one more copy of what they collapse.
+    builder._plane_fields = main_kv_plane_fields(
+        _HEAD_DIM,
+        builder._classical_dtype,
+        (_ROPE_HEAD_DIM, torch.bfloat16) if builder._kv_fp8 else None,
+    )
+    builder._indexer_fields = (
+        fp4_indexer_block_fields(_CSA_ROWS_PER_BLOCK, _INDEX_HEAD_DIM)
+        if indexer_fp4
+        else fp8_indexer_block_fields(_CSA_ROWS_PER_BLOCK, _INDEX_HEAD_DIM, torch.uint8)
+    )
+    builder._indexer_regions, builder._indexer_block_bytes = indexer_block_regions(
+        builder._indexer_fields
+    )
     builder.pool_geometry = geo
     builder.compress_ratios = ratios
     builder._checkpoint_range_cache = None
@@ -179,7 +271,7 @@ def _transfer_builder(
             (
                 len(builder.csa_layers),
                 num_blocks,
-                builder._idx_k_tiles,
+                _FP4_K_TILES,
                 4,
                 builder.csa_rows_per_block,
                 16,
@@ -190,7 +282,7 @@ def _transfer_builder(
             (
                 len(builder.csa_layers),
                 num_blocks,
-                builder._idx_k_tiles,
+                _FP4_K_TILES,
                 4,
                 builder.csa_rows_per_block,
             ),
@@ -198,12 +290,16 @@ def _transfer_builder(
         )
         indexer_pools = [indexers, indexer_scales]
     else:
+        # Row width spelled out rather than taken off the builder, which no
+        # longer knows one. Spelling it independently is what makes the
+        # geometry assertions a check on the declaration: change the block and
+        # this pool stops covering the sized PAGE unit.
         indexers = torch.empty(
             (
                 len(builder.csa_layers),
                 num_blocks,
                 builder.csa_rows_per_block,
-                builder._index_row_bytes,
+                _INDEX_ROW_BYTES,
             ),
             dtype=torch.uint8,
         )
@@ -240,7 +336,6 @@ def _transfer_builder(
     runner_values = {
         "config": config,
         "state_runtime": state_runtime,
-        "num_physical_kvcache_blocks": num_blocks,
         "pool_plan": SimpleNamespace(entries={STATE_SLOT_CLASS: num_slots}),
         "v4_unified_kv": planes[0],
         "v4_kv_plane": planes[0],
@@ -285,6 +380,11 @@ def _assert_transfer_geometry(
 ):
     transfer = builder.get_kv_transfer_tensors()
     assert transfer is not None
+    # ModelRunner's job in production, and it is the gate as well as the
+    # assignment: it refuses a PAGE region that does not divide into exactly
+    # this many blocks. Passing the geometry's count here is the claim that
+    # V4's PAGE regions are registered per scheduler block.
+    transfer.set_block_count(geo.num_blocks)
     assert transfer.num_blocks == geo.num_blocks
     assert transfer.num_slots == geo.num_slots
     assert transfer.expected_full_slot_region_count == len(planes)
@@ -526,8 +626,10 @@ def _prepare_cpu_allocation(builder, row_widths, monkeypatch):
         def view(self, name):
             return None
 
-    monkeypatch.setitem(module_globals, "StateArena", lambda *args, **kwargs: object())
-    monkeypatch.setitem(module_globals, "SplitStateArena", lambda arenas: _Arena())
+    monkeypatch.setitem(
+        module_globals, "EntryMajorArena", lambda *args, **kwargs: object()
+    )
+    monkeypatch.setitem(module_globals, "SplitEntryMajorArena", lambda arenas: _Arena())
     builder._swa_dtype = torch.bfloat16
     builder._state_dtype = torch.float32
     builder._field_window_layers = set()

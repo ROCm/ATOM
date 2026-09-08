@@ -24,7 +24,7 @@ HCA committed) occupies the head.
 
 Caller contract:
 - Grid = T (one program per token).
-- `batch_id_per_token[:T]` may carry `-1` sentinels in the CG-padded tail —
+- `batch_id_per_q_token[:T]` may carry `-1` sentinels in the CG-padded tail —
   kernel checks and bails (matches `_attach_v4_per_fwd_meta` convention).
 - `swa_indptr` / `csa_indptr` / `hca_indptr` must reflect the ragged-packed
   sizing: per-token slot count = `min(positions[t]+1, win) + n_compress[t]`,
@@ -84,7 +84,7 @@ def hca_compress_paged_offsets(
 @triton.jit
 def _v4_paged_decode_indices_kernel(
     state_slot_per_seq_ptr,  # [bs] int32 — per-request SWA ring slot
-    batch_id_per_token_ptr,  # [T+pad] int — sentinel -1 in pad tail
+    batch_id_per_q_token_ptr,  # [T+pad] int — sentinel -1 in pad tail
     positions_ptr,  # [T+pad] int — global token position
     swa_indptr_ptr,  # [T+1] int32 — ragged SWA-prefix cumsum
     csa_indptr_ptr,  # [T+1] int32 — ragged (SWA + CSA topk)
@@ -132,7 +132,7 @@ def _v4_paged_decode_indices_kernel(
     blocks, which is exactly the arrangement that pinned the pool's split.
     """
     t = tl.program_id(0)
-    bid = tl.load(batch_id_per_token_ptr + t)
+    bid = tl.load(batch_id_per_q_token_ptr + t)
     if bid < 0:
         return  # CG-padded sentinel — leave outputs untouched
 
@@ -266,7 +266,7 @@ def _v4_paged_decode_indices_kernel(
 def write_v4_paged_decode_indices(
     *,
     state_slot_per_seq: torch.Tensor,
-    batch_id_per_token: torch.Tensor,
+    batch_id_per_q_token: torch.Tensor,
     positions: torch.Tensor,
     swa_indptr: torch.Tensor,
     csa_indptr: torch.Tensor | None,
@@ -294,7 +294,7 @@ def write_v4_paged_decode_indices(
 
     Args (all GPU tensors except T/win/geometry):
       state_slot_per_seq:  [bs] int32 — per-request SWA ring slot.
-      batch_id_per_token:  [>=T]  int   — token→seq map; -1 sentinel skipped.
+      batch_id_per_q_token:  [>=T]  int   — token→seq map; -1 sentinel skipped.
       positions:           [>=T]  int   — global token position
                                    (forward_vars["positions"]); used to derive
                                    `n = min(pos+1, win)` per token + the paged
@@ -329,7 +329,7 @@ def write_v4_paged_decode_indices(
                                    the bridges fill that section themselves,
                                    from a different row formula.
       hca_block_tables:    [bs, cols] int32 — the source for that fill. Must
-                                   be numbered like `batch_id_per_token`: in a
+                                   be numbered like `batch_id_per_q_token`: in a
                                    TBO ubatch, the ubatch-sliced buffer, not
                                    the global one.
       hca_rows_per_block:  int — `block_size // HCA_RATIO`, the rows the
@@ -343,7 +343,7 @@ def write_v4_paged_decode_indices(
                                    instead of deriving
                                    the row itself, which is what keeps the pool
                                    layout out of the fused kernels.
-                                   **Defined only where `batch_id_per_token[t]
+                                   **Defined only where `batch_id_per_q_token[t]
                                    >= 0`**, and only for `t < T`: these are
                                    persistent buffers, so everywhere else holds
                                    an earlier forward's rows. Every consumer
@@ -360,7 +360,7 @@ def write_v4_paged_decode_indices(
     if T == 0:
         return
     assert state_slot_per_seq.dim() == 1
-    assert batch_id_per_token.dim() == 1 and batch_id_per_token.shape[0] >= T
+    assert batch_id_per_q_token.dim() == 1 and batch_id_per_q_token.shape[0] >= T
     assert positions.dim() == 1 and positions.shape[0] >= T
     assert swa_indptr.dim() == 1 and swa_indptr.shape[0] >= T + 1
     assert swa_indices.dim() == 1
@@ -398,7 +398,7 @@ def write_v4_paged_decode_indices(
     BLOCK_N = triton.next_power_of_2(win)
     _v4_paged_decode_indices_kernel[(T,)](
         state_slot_per_seq,
-        batch_id_per_token,
+        batch_id_per_q_token,
         positions,
         swa_indptr,
         # Triton wants a pointer even for a class the caller switched off, and
@@ -433,7 +433,7 @@ def write_v4_paged_decode_indices(
 def write_v4_paged_decode_indices_reference(
     *,
     state_slot_per_seq: torch.Tensor,
-    batch_id_per_token: torch.Tensor,
+    batch_id_per_q_token: torch.Tensor,
     positions: torch.Tensor,
     swa_indptr: torch.Tensor,
     csa_indptr: torch.Tensor | None,
@@ -459,7 +459,7 @@ def write_v4_paged_decode_indices_reference(
         CSA_RATIO: (csa_indices, csa_indptr),
         HCA_RATIO: (hca_indices, hca_indptr),
     }
-    bid = batch_id_per_token[:T].long()
+    bid = batch_id_per_q_token[:T].long()
     pos_t = positions[:T].long()
     valid = bid >= 0
     # n = min(pos+1, win) per token; clamp invalid rows to 0 to skip writes.
@@ -495,7 +495,7 @@ def write_v4_paged_decode_indices_reference(
 
 @triton.jit
 def _v4_decode_indptr_kernel(
-    batch_id_per_token_ptr,  # [T_pad] int — -1 sentinel in the CG-padded tail
+    batch_id_per_q_token_ptr,  # [T_pad] int — -1 sentinel in the CG-padded tail
     positions_ptr,  # [T_pad] int — global token position (int64 in production)
     swa_indptr_ptr,  # [T_pad+1] int32 OUT
     csa_indptr_ptr,  # [T_pad+1] int32 OUT
@@ -536,7 +536,7 @@ def _v4_decode_indptr_kernel(
     for base in tl.range(0, t_pad, BLOCK):
         idx = base + tl.arange(0, BLOCK)
         in_range = idx < t_pad
-        bid = tl.load(batch_id_per_token_ptr + idx, mask=in_range, other=-1)
+        bid = tl.load(batch_id_per_q_token_ptr + idx, mask=in_range, other=-1)
         # A padded slot contributes 0 to every class, which is what makes the
         # tail of each indptr flat — the `kv_len == 0` the readers bail on.
         live = in_range & (bid >= 0)
@@ -577,7 +577,7 @@ def _v4_decode_indptr_kernel(
 @mark_trace
 def build_v4_paged_decode_indptr(
     *,
-    batch_id_per_token: torch.Tensor,
+    batch_id_per_q_token: torch.Tensor,
     positions: torch.Tensor,
     swa_indptr: torch.Tensor,
     csa_indptr: torch.Tensor,
@@ -613,7 +613,7 @@ def build_v4_paged_decode_indptr(
     # reason `write_v4_paged_decode_indices` gives above: it holds under
     # `python -O`.
     for name, buf, want in (
-        ("batch_id_per_token", batch_id_per_token, T_pad),
+        ("batch_id_per_q_token", batch_id_per_q_token, T_pad),
         ("positions", positions, T_pad),
         ("swa_indptr", swa_indptr, T_pad + 1),
         ("csa_indptr", csa_indptr, T_pad + 1),
@@ -634,7 +634,7 @@ def build_v4_paged_decode_indptr(
             f"{n_rows}; slice it"
         )
     _v4_decode_indptr_kernel[(1,)](
-        batch_id_per_token,
+        batch_id_per_q_token,
         positions,
         swa_indptr,
         csa_indptr,
@@ -651,7 +651,7 @@ def build_v4_paged_decode_indptr(
 
 def build_v4_paged_decode_indptr_reference(
     *,
-    batch_id_per_token: torch.Tensor,
+    batch_id_per_q_token: torch.Tensor,
     positions: torch.Tensor,
     swa_indptr: torch.Tensor,
     csa_indptr: torch.Tensor,
@@ -665,7 +665,7 @@ def build_v4_paged_decode_indptr_reference(
     kernel-vs-reference tests. Same argument contract, including owning the
     whole of `csa_n_committed_per_token`.
     """
-    bid = batch_id_per_token[:T_pad].long()
+    bid = batch_id_per_q_token[:T_pad].long()
     live = bid >= 0
     pos = positions[:T_pad].long()
     n = torch.minimum(pos + 1, torch.full_like(pos, win))

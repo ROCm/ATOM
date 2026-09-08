@@ -333,7 +333,7 @@ def test_base_context_capture_recovers_physical_table_with_prewarmed_buffer():
     assert block_table.cpu().tolist() == [[56]]
 
 
-def test_plugin_attention_metadata_builds_req_id_per_token():
+def test_plugin_attention_metadata_builds_batch_id_per_q_token():
     attn_inputs = _make_attn_inputs(
         input_lengths=torch.tensor([2, 1], dtype=torch.int32),
         prefix_lengths=torch.tensor([0, 0], dtype=torch.int32),
@@ -349,7 +349,7 @@ def test_plugin_attention_metadata_builds_req_id_per_token():
         seq_size_per_block=1024,
     )
 
-    assert md.plugin_metadata.req_id_per_token.cpu().tolist() == [0, 0, 1]
+    assert md.plugin_metadata.batch_id_per_q_token.cpu().tolist() == [0, 0, 1]
     assert md.plugin_metadata.sparse_block_size == 1024
     assert md.cu_seqlens_q.cpu().tolist() == [0, 2, 3]
     assert md.cu_seqlens_k.cpu().tolist() == [0, 2, 3]
@@ -358,13 +358,13 @@ def test_plugin_attention_metadata_builds_req_id_per_token():
     assert md.total_kv == 3
 
 
-def test_build_req_id_per_token_prefers_prewarmed_i32_buffer(monkeypatch):
+def test_build_batch_id_per_q_token_prefers_prewarmed_i32_buffer(monkeypatch):
     query_start_loc = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
     seq_id_i32 = torch.arange(8, dtype=torch.int32)
 
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
 
-    req_id = RTPForwardContext._build_req_id_per_token(
+    req_id = RTPForwardContext._build_batch_id_per_q_token(
         query_start_loc=query_start_loc,
         num_tokens=3,
         device=query_start_loc.device,
@@ -379,13 +379,15 @@ def test_build_req_id_per_token_prefers_prewarmed_i32_buffer(monkeypatch):
     assert req_id.cpu().tolist() == [0, 1, 2]
 
 
-def test_build_req_id_per_token_requires_prewarmed_i32_buffer_in_capture(monkeypatch):
+def test_build_batch_id_per_q_token_requires_prewarmed_i32_buffer_in_capture(
+    monkeypatch,
+):
     query_start_loc = torch.tensor([0, 1], dtype=torch.int32)
 
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
 
     try:
-        RTPForwardContext._build_req_id_per_token(
+        RTPForwardContext._build_batch_id_per_q_token(
             query_start_loc=query_start_loc,
             num_tokens=1,
             device=query_start_loc.device,

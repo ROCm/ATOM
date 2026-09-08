@@ -1249,7 +1249,7 @@ def _get_extend_lens_cpu(
 
     Prefix-cache hits have `seq_lens = cached prefix + suffix`, but ATOM's
     prefill metadata needs only the suffix token counts to build cu_seqlens_q and
-    batch_id_per_token.  Different SGLang paths expose that length under slightly
+    batch_id_per_q_token.  Different SGLang paths expose that length under slightly
     different fields, so this helper normalizes them.
     """
     extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
@@ -1547,7 +1547,7 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     _resolve_v4_pool_geometry(md, proxy_pool, model)
     _bind_v4_state_slots(md)
     md.batch_id_per_token_cpu = batch_np
-    md.batch_id_per_token = bufs.stage(bufs.batch_id, batch_pad, t_pad)
+    md.batch_id_per_q_token = bufs.stage(bufs.batch_id, batch_pad, t_pad)
     n_csa = (seq_np // 4).astype(np.int32)
     md.n_committed_csa_per_seq_cpu = n_csa
     md.n_committed_csa_per_seq = bufs.stage(bufs.n_csa, n_csa, bs)
@@ -1586,7 +1586,7 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     )
     block_cols = int(block_tables.shape[1])
     block_rows = bufs.block_tables_per_token.gpu[:t_pad, :block_cols]
-    safe_batch_ids = md.batch_id_per_token[:t_pad].clamp_min(0).long()
+    safe_batch_ids = md.batch_id_per_q_token[:t_pad].clamp_min(0).long()
     torch.index_select(block_tables, 0, safe_batch_ids, out=block_rows)
     md.block_tables_per_token = block_rows
 
@@ -1601,7 +1601,7 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     }
     write_v4_paged_decode_indices(
         state_slot_per_seq=md.state_slot_mapping,
-        batch_id_per_token=md.batch_id_per_token,
+        batch_id_per_q_token=md.batch_id_per_q_token,
         positions=positions_gpu,
         swa_indptr=swa_indptr,
         csa_indptr=csa_indptr if has_csa else None,
@@ -1616,7 +1616,7 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     )
     if has_hca:
         write_v4_decode_hca_compress_tail(
-            batch_id_per_token=md.batch_id_per_token,
+            batch_id_per_q_token=md.batch_id_per_q_token,
             positions=positions_gpu,
             hca_indptr=hca_indptr,
             block_tables=md.block_tables,
@@ -1644,14 +1644,14 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     cu_committed_gpu = torch.from_numpy(cu_committed_cpu).to(
         device=device, dtype=torch.int32
     )
-    safe_batch_id = md.batch_id_per_token.clamp_min(0)
+    safe_batch_id = md.batch_id_per_q_token.clamp_min(0)
     seq_base = cu_committed_gpu[safe_batch_id].to(torch.int32)
     visible_end = seq_base + visible_csa(positions_gpu.to(torch.int32))
     md.indexer_meta = {
         "total_committed": int(cu_committed_cpu[-1]),
         "cu_committed_gpu": cu_committed_gpu,
         "n_committed_per_seq_gpu": md.n_committed_csa_per_seq,
-        "batch_id_per_token_gpu": md.batch_id_per_token,
+        "batch_id_per_q_token": md.batch_id_per_q_token,
         "seq_base_per_token_gpu": seq_base,
         "cu_starts_gpu": seq_base,
         "cu_ends_gpu": visible_end,
@@ -1819,7 +1819,7 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
     _resolve_v4_pool_geometry(md, proxy_pool, model)
     _bind_v4_state_slots(md)
     md.batch_id_per_token_cpu = batch_np
-    md.batch_id_per_token = bufs.stage(bufs.batch_id, batch_np, total)
+    md.batch_id_per_q_token = bufs.stage(bufs.batch_id, batch_np, total)
 
     n_csa = (seq_np // 4).astype(np.int32)
     md.n_committed_csa_per_seq_cpu = n_csa
@@ -1858,7 +1858,7 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
 
     write_v4_paged_prefill_indices(
         positions=positions[:total].to(torch.int32),
-        bid_per_token=md.batch_id_per_token.to(torch.int64),
+        bid_per_token=md.batch_id_per_q_token.to(torch.int64),
         chunk_start_per_seq=chunk_start_gpu,
         cu_seqlens_q_per_seq=cu_q[:-1],
         state_slot_per_seq=md.state_slot_mapping,
@@ -1905,7 +1905,7 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
         "total_committed": int(cu_committed_cpu[-1]),
         "cu_committed_gpu": cu_committed_gpu,
         "n_committed_per_seq_gpu": md.n_committed_csa_per_seq,
-        "batch_id_per_token_gpu": md.batch_id_per_token,
+        "batch_id_per_q_token": md.batch_id_per_q_token,
         "seq_base_per_token_gpu": seq_base_gpu,
         "cu_starts_gpu": seq_base_gpu,
         "cu_ends_gpu": visible_end_gpu,
@@ -2045,7 +2045,7 @@ def build_atom_v4_attention_metadata_from_sglang(
     _resolve_v4_pool_geometry(md, proxy_pool)
     _bind_v4_state_slots(md)
     md.batch_id_per_token_cpu = batch_np
-    md.batch_id_per_token = torch.from_numpy(batch_np).to(device=device)
+    md.batch_id_per_q_token = torch.from_numpy(batch_np).to(device=device)
     md.n_committed_csa_per_seq_cpu = (seq_np // 4).astype(np.int32)
     md.n_committed_csa_per_seq = torch.from_numpy(md.n_committed_csa_per_seq_cpu).to(
         device=device
@@ -2116,7 +2116,7 @@ def _populate_decode_indices(md, block_tables, batch_np, pos_np, device) -> None
     }
     write_v4_paged_decode_indices(
         state_slot_per_seq=md.state_slot_mapping,
-        batch_id_per_token=md.batch_id_per_token,
+        batch_id_per_q_token=md.batch_id_per_q_token,
         positions=positions_gpu,
         swa_indptr=swa_indptr,
         csa_indptr=csa_indptr if has_csa else None,
@@ -2131,7 +2131,7 @@ def _populate_decode_indices(md, block_tables, batch_np, pos_np, device) -> None
     )
     if has_hca:
         write_v4_decode_hca_compress_tail(
-            batch_id_per_token=md.batch_id_per_token,
+            batch_id_per_q_token=md.batch_id_per_q_token,
             positions=positions_gpu,
             hca_indptr=hca_indptr,
             block_tables=block_tables,
@@ -2214,7 +2214,7 @@ def _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device) 
     )
     write_v4_paged_prefill_indices(
         positions=t(pos_np),
-        bid_per_token=md.batch_id_per_token.to(torch.int64),
+        bid_per_token=md.batch_id_per_q_token.to(torch.int64),
         chunk_start_per_seq=t(chunk_start_per_seq),
         cu_seqlens_q_per_seq=t(q_np[:-1]),
         state_slot_per_seq=md.state_slot_mapping,
@@ -2249,13 +2249,13 @@ def _populate_indexer(md, batch_np, positions, device) -> None:
     cu = np.concatenate([np.zeros(1, dtype=np.int32), np.cumsum(n_csa, dtype=np.int32)])
     cu[-1] = max(int(cu[-1]), 1)
     cu_gpu = torch.from_numpy(cu).to(device=device, dtype=torch.int32)
-    bid = md.batch_id_per_token
+    bid = md.batch_id_per_q_token
     if bid.numel() == 0:
         md.indexer_meta = {
             "total_committed": int(cu[-1]),
             "cu_committed_gpu": cu_gpu,
             "n_committed_per_seq_gpu": md.n_committed_csa_per_seq,
-            "batch_id_per_token_gpu": bid,
+            "batch_id_per_q_token": bid,
             "seq_base_per_token_gpu": None,
             "cu_starts_gpu": None,
             "cu_ends_gpu": None,
@@ -2267,7 +2267,7 @@ def _populate_indexer(md, batch_np, positions, device) -> None:
         "total_committed": int(cu[-1]),
         "cu_committed_gpu": cu_gpu,
         "n_committed_per_seq_gpu": md.n_committed_csa_per_seq,
-        "batch_id_per_token_gpu": bid,
+        "batch_id_per_q_token": bid,
         "seq_base_per_token_gpu": base,
         "cu_starts_gpu": base,
         "cu_ends_gpu": end,
