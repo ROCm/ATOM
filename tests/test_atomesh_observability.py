@@ -1,10 +1,10 @@
 """CI collection contract; optional integration with pinned real VM binaries."""
 
-import gzip
 import importlib.util
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -71,30 +71,97 @@ def test_prepare_separates_fast_and_full_scrapes_without_duplicate_families(tmp_
     assert config["global"]["scrape_interval"] == "1s"
 
 
-def test_pages_publish_only_compressed_html_and_escape_destinations(tmp_path):
-    spec = importlib.util.spec_from_file_location(
-        "obs_pages", SCRIPT.with_name("observability_pages.py")
+@pytest.mark.parametrize("case_id", ["c32", "c40", "c48"])
+def test_each_case_stages_only_its_current_offline_reports(tmp_path, case_id):
+    source = tmp_path / "artifacts"
+    expected = {}
+    for case in ("c32", "c40", "c48"):
+        for run_id in ("111", "222"):
+            for phase in ("combined", "benchmark"):
+                report = source / case / run_id / "observability" / phase
+                report.mkdir(parents=True)
+                page = (
+                    '<!doctype html><html lang="en"><title>Test report</title>'
+                    f"<body>{case} / {run_id} / {phase} / validation: FAIL</body></html>"
+                )
+                (report / "index.html").write_text(page)
+                (report / "run.json").write_text(
+                    json.dumps({"case": case, "run_id": run_id, "phase": phase})
+                )
+                (report / "events.jsonl").write_text('{"request_id":"detail"}\n')
+                if case == case_id and run_id == "222":
+                    expected[phase] = page
+    job_id_file = tmp_path / "slurm-job-id"
+    job_id_file.write_text("222\n")
+    outputs = tmp_path / "github-output"
+    dest = tmp_path / "html"
+    subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT.with_name("observability_artifacts.py")),
+            "--source",
+            str(source),
+            "--destination",
+            str(dest),
+            "--case-id",
+            case_id,
+            "--slurm-job-id-file",
+            str(job_id_file),
+            "--github-output",
+            str(outputs),
+        ],
+        check=True,
     )
-    pages = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(pages)
-    source = tmp_path / "artifacts/job/observability/benchmark"
-    source.mkdir(parents=True)
-    page = '<!doctype html><html lang="en"><title>Test report</title></html>'
-    (source / "index.html").write_text(page)
-    (source / "run.json").write_text(
-        json.dumps({"case": "case c48", "phase": "benchmark"})
-    )
-    (source / "events.jsonl").write_text('{"request_id":"private-detail"}\n')
-    dest = tmp_path / "site"
-    path, count = pages.stage_reports(tmp_path / "artifacts", dest, "123", "2")
-    assert count == 1
-    target = dest / path / "case-c48/benchmark"
-    assert gzip.decompress((target / "report.html.gz").read_bytes()).decode() == page
-    assert "DecompressionStream" in (target / "index.html").read_text()
+    assert outputs.read_text() == "has_reports=true\nreport_count=2\n"
+    assert len(list(dest.rglob("*.html"))) == 3
     assert not list(dest.rglob("*.jsonl"))
-    assert "case-c48/benchmark/" in (dest / path / "index.html").read_text()
-    with pytest.raises(ValueError):
-        pages.stage_reports(tmp_path / "artifacts", dest, "../123", "1")
+    assert not list(dest.rglob("*.gz"))
+    index = (dest / "index.html").read_text()
+    assert "fetch(" not in index and "DecompressionStream" not in index
+    for phase, original in expected.items():
+        # Failure reports survive, and each phase opens directly under file://.
+        assert (dest / phase / "index.html").read_text() == original
+        assert f'href="{phase}/index.html"' in index
+
+
+def test_report_staging_without_submitted_job_does_not_reuse_old_results(tmp_path):
+    outputs = tmp_path / "github-output"
+    dest = tmp_path / "html"
+    subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT.with_name("observability_artifacts.py")),
+            "--source",
+            str(tmp_path),
+            "--destination",
+            str(dest),
+            "--case-id",
+            "c48",
+            "--slurm-job-id-file",
+            str(tmp_path / "missing-job-id"),
+            "--github-output",
+            str(outputs),
+        ],
+        check=True,
+    )
+    assert outputs.read_text() == "has_reports=false\nreport_count=0\n"
+    assert not dest.exists()
+
+
+def test_report_staging_rejects_invalid_phase(tmp_path):
+    spec = importlib.util.spec_from_file_location(
+        "obs_artifacts", SCRIPT.with_name("observability_artifacts.py")
+    )
+    artifacts = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(artifacts)
+    source = tmp_path / "artifacts/observability/benchmark"
+    source.mkdir(parents=True)
+    (source / "index.html").write_text("report")
+    (source / "run.json").write_text(
+        json.dumps({"case": "c48", "run_id": "222", "phase": "../../escape"})
+    )
+    with pytest.raises(ValueError, match="Invalid report destination"):
+        artifacts.stage_reports(tmp_path / "artifacts", tmp_path / "html", "c48", "222")
 
 
 BIN = Path(os.environ.get("ATOM_OBSERVABILITY_TEST_BIN", "/tmp/atom-observability-bin"))

@@ -161,7 +161,7 @@ on:
         default: false
         type: boolean
       publish_dashboard:
-        description: 'Publish benchmark dashboard results and clickable observability HTML reports to GitHub Pages'
+        description: 'Publish benchmark dashboard results (per-case observability HTML artifacts are uploaded independently)'
         required: false
         default: false
         type: boolean
@@ -1304,7 +1304,30 @@ jobs:
 
           cat "${SUMMARY_PATH}"
 
+      - name: Stage ${{ matrix.id }} observability HTML
+        id: observability
+        if: always()
+        env:
+          MATRIX_ID: ${{ matrix.id }}
+        run: |
+          python3 .github/scripts/atomesh/observability_artifacts.py \
+            --source "atomesh-results/${MATRIX_ID}" \
+            --destination "atomesh-observability/${MATRIX_ID}" \
+            --case-id "${MATRIX_ID}" \
+            --slurm-job-id-file "atomesh-results/${MATRIX_ID}.slurm-job-id" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Upload ${{ matrix.id }} observability HTML
+        id: observability_artifact
+        if: ${{ always() && steps.observability.outputs.has_reports == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: atomesh-observability-${{ matrix.id }}
+          path: atomesh-observability/${{ matrix.id }}/
+          if-no-files-found: error
+
       - name: Upload model benchmark artifacts
+        id: model_artifact
         if: always()
         uses: actions/upload-artifact@v7
         with:
@@ -1313,6 +1336,26 @@ jobs:
             atomesh-results/
           if-no-files-found: ignore
 
+      - name: Link ${{ matrix.id }} observability report
+        if: always()
+        env:
+          MATRIX_ID: ${{ matrix.id }}
+          REPORT_ARTIFACT_URL: ${{ steps.observability_artifact.outputs.artifact-url }}
+          MODEL_ARTIFACT_URL: ${{ steps.model_artifact.outputs.artifact-url }}
+        run: |
+          {
+            printf '### Observability · %s\n\n' "${MATRIX_ID}"
+            if [[ -n "${REPORT_ARTIFACT_URL}" ]]; then
+              printf '[Download HTML report](%s)\n\n' "${REPORT_ARTIFACT_URL}"
+              printf 'Extract the ZIP and open `index.html` in your local browser. Each phase report is self-contained; no server is required.\n\n'
+            else
+              printf 'No separate HTML artifact is available. Observability may be disabled, the run may have stopped before report generation, or the report upload may have failed. Check this job’s steps and full artifact below.\n\n'
+            fi
+            if [[ -n "${MODEL_ARTIFACT_URL}" ]]; then
+              printf '[Download full metrics and streaming request events](%s)\n\n' "${MODEL_ARTIFACT_URL}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
   summarize-results:
     name: Summarize ATOMesh benchmark results
     needs: [run-model-benchmark]
@@ -1320,8 +1363,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       has_results: ${{ steps.summary.outputs.has_results }}
-      has_observability: ${{ steps.observability.outputs.has_reports }}
-      observability_path: ${{ steps.observability.outputs.report_path }}
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
@@ -1332,21 +1373,6 @@ jobs:
           pattern: atomesh-model-benchmark-*
           merge-multiple: true
           path: atomesh-results
-
-      - name: Stage observability pages
-        id: observability
-        run: |
-          python3 .github/scripts/atomesh/observability_pages.py \
-            --source atomesh-results --destination atomesh-observability-site \
-            --run-id "${{ github.run_id }}" --attempt "${{ github.run_attempt }}" \
-            --github-output "$GITHUB_OUTPUT"
-
-      - name: Upload observability pages
-        if: steps.observability.outputs.has_reports == 'true'
-        uses: actions/upload-artifact@v7
-        with:
-          name: atomesh-observability-site
-          path: atomesh-observability-site/
 
       - name: Build benchmark summary
         id: summary
@@ -1455,68 +1481,3 @@ jobs:
           git add benchmark-dashboard/index.html
           git diff --cached --quiet || git commit -m "Update ATOMesh benchmark dashboard"
           git push origin gh-pages
-
-  observability-pages:
-    name: Publish ATOMesh Observability Reports
-    needs: [summarize-results, dashboard]
-    if: >-
-      !cancelled()
-      && needs.summarize-results.result == 'success'
-      && needs.summarize-results.outputs.has_observability == 'true'
-      && (github.event_name == 'schedule'
-          || (github.event_name == 'workflow_dispatch' && inputs.publish_dashboard))
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    concurrency:
-      group: gh-pages-deploy
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: gh-pages
-
-      - name: Download observability site
-        uses: actions/download-artifact@v8
-        with:
-          name: atomesh-observability-site
-          path: /tmp/atomesh-observability-site
-
-      - name: Configure GitHub Pages
-        id: pages
-        uses: actions/configure-pages@v5
-
-      - name: Store observability reports on gh-pages
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git pull --ff-only origin gh-pages
-          mkdir -p observability
-          cp -a /tmp/atomesh-observability-site/observability/. observability/
-          git add observability
-          git diff --cached --quiet || git commit -m "Publish ATOMesh observability run ${GITHUB_RUN_ID}"
-          git push origin gh-pages
-
-      - name: Upload complete Pages site
-        uses: actions/upload-pages-artifact@v4
-        with:
-          path: .
-
-      - name: Deploy Pages site
-        id: deployment
-        uses: actions/deploy-pages@v4
-
-      - name: Link HTML reports from CI
-        env:
-          REPORT_PATH: ${{ needs.summarize-results.outputs.observability_path }}
-          PAGES_BASE_URL: ${{ vars.ATOMESH_PAGES_BASE_URL || steps.pages.outputs.base_url }}
-        run: |
-          echo "### ATOMesh Observability" >> "$GITHUB_STEP_SUMMARY"
-          echo "[Open HTML reports](${PAGES_BASE_URL%/}/${REPORT_PATH})" >> "$GITHUB_STEP_SUMMARY"
-          echo "Detailed request events remain in the model benchmark artifact." >> "$GITHUB_STEP_SUMMARY"

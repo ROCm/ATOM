@@ -8,7 +8,7 @@
 | `case_names` | `glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c48` |
 | `observability` | `on`（该 CPP4/DCP4 系列在 `auto` 下也启用） |
 | `run_model_benchmark` | `true` |
-| `publish_dashboard` | `true`：发布可直接打开的 HTML；`false`：仅下载 artifact |
+| `publish_dashboard` | 仅控制原有 benchmark dashboard；每个任务的 HTML artifact 独立上传 |
 | `atomesh_1p1d_nodes` | 可运行该模型的一台 8 GPU 节点 |
 
 此用例：单节点，prefill 为 PP4×TP1，decode 为 TP4+DCP4，并发 48。
@@ -80,14 +80,24 @@ executed 指标，这些由快档独立抓取。**原 `/metrics` 端点仍包含
   preflight.json / *.log
 ```
 
-开启 `publish_dashboard=true` 后，`Publish ATOMesh Observability Reports` job 会将报告
-发布到 GitHub Pages，并在 CI Summary 中提供 **Open HTML reports** 链接。
-地址为 `https://rocm.github.io/ATOM/observability/<GitHub run ID>/<attempt>/`。
-仓库需启用 GitHub Pages 并允许该 workflow 在 `github-pages` environment 部署；
-workflow 显式上传/部署完整 gh-pages 站点，保留已有看板，不依赖 GITHUB_TOKEN push 自动触发 Pages build。
-HTML 发布前压缩，通过英文加载页解压显示，避免高频曲线的单个 HTML 超过 Git 文件大小限制。
-原始事件和 VM 数据保留在 artifact；在线页面可以用文件选择器打开下载的事件文件。
-发布失败可继续下载原 HTML 离线查看。`ATOMESH_PAGES_BASE_URL` 可覆盖自定义站点的链接基址。
+每个 benchmark matrix 任务都在自己的收尾步骤中整理并上传独立的
+`atomesh-observability-<matrix.id>` artifact。例如 c32、c40、c48 三个任务会分别
+提供三个 HTML 下载包，不需要等待其他实验或汇总任务完成。
+
+打开对应任务的 Summary，点击 **Download HTML report**，下载并解压 ZIP，
+再用本地浏览器打开根目录 `index.html`，选择 `combined` / `benchmark` 报告。
+每个 phase 的 `index.html` 都内嵌曲线和交互脚本，不使用 HTTP 加载器，也无需启动服务。
+GitHub artifact 链接用于下载，不能在 GitHub 的任务页面中直接运行交互 HTML。
+逐请求事件和 VM 原始数据仍在同一个任务的完整 benchmark artifact 中，Summary 另有
+**Download full metrics and streaming request events** 链接。
+
+报告整理、上传和链接步骤均可在 benchmark 失败后执行，保留已经生成的失败/部分报告。
+采集未开启或尚未生成报告时，Summary 会说明没有 HTML。共享日志目录可能含有其他实验
+或旧运行，因此打包同时匹配当前 `matrix.id` 和本次 Slurm job ID，避免 c32/c40/c48 混用。
+
+不再创建单独的 `Publish ATOMesh Observability Reports` 部署任务。此前该任务在
+`dpp-dcp-ci` 上被 `github-pages` 的分支部署保护拒绝；下载报告不依赖 Pages 部署权限，
+也不需要调整仓库保护规则。`publish_dashboard` 继续控制原有 benchmark dashboard。
 
 `index.html` 无 CDN 依赖，页面指标和控件均为英文：
 
