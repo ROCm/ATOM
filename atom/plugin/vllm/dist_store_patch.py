@@ -29,7 +29,10 @@ _EXECUTOR_MODULES = (
 )
 
 
-def _atom_requires_tcp_store() -> bool:
+def _atom_requires_tcp_store(model_config=None) -> bool:
+    # vLLM 0.28 (>= 8a9bad879) calls this helper with ``model_config``; older
+    # 0.28 builds called it with no args. ATOM forces the TCP rendezvous
+    # unconditionally, so accept and ignore whatever vLLM passes.
     return True
 
 
