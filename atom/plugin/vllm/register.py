@@ -159,6 +159,15 @@ def register_platform() -> str | None:
 
     apply_vllm_tcp_store_patch()
 
+    # The shuffled-KV layout the M3 gluon path needs would otherwise force
+    # vLLM's block zeroer onto a native op absent from this build; route it
+    # through vLLM's own Triton fallback instead.
+    from atom.plugin.vllm.kv_block_zeroer_patch import (
+        apply_vllm_kv_block_zeroer_patch,
+    )
+
+    apply_vllm_kv_block_zeroer_patch()
+
     # Do not call _set_plugin_mode() here. SGLang (and other stacks) discover
     # vllm.platform_plugins and would set atom's backbone to "vllm" before
     # importing SGLang plugin modules — then atom.models.qwen3_5's ``if is_vllm():``
