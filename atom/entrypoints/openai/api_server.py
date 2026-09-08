@@ -2631,7 +2631,9 @@ def main():
             SYNTHETIC_TOKEN_TEXT,
         )
     _stream_batch_dispatcher = StreamBatchDispatcher(
-        tokenizer, synthetic_text=synthetic_token_text
+        tokenizer,
+        synthetic_text=synthetic_token_text,
+        observe_inter_token_latency=_metrics_exporter.observe_inter_token_latency,
     )
 
     # Wire the batched stream-flush hook: per-seq stream callbacks only buffer
