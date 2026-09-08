@@ -45,6 +45,22 @@ RUN ROCM_SDK_LIB_DIRS="$(python -c \
         ldconfig; \
     fi
 
+# Pin Triton to the perf-good ROCm build. The base rocm/pytorch image ships a
+# newer Triton (3.8.0) that regressed benchmark throughput; install the
+# AMD-published 3.7.0 wheel plus its matching triton_kernels from AMD's index,
+# here in the shared base so every downstream stage (the aiter build included)
+# links the same Triton. Empty TRITON_PIN_VERSION keeps the base image's Triton.
+ARG TRITON_INDEX_URL="https://pypi.amd.com/triton/release/rocm-7.2.0/simple/"
+ARG TRITON_PIN_VERSION="3.7.0+amd.rocm7.2.0.git89002410"
+ARG TRITON_KERNELS_PIN_VERSION="1.0.0+amd.rocm7.2.0.git89002410"
+RUN if [ -n "${TRITON_PIN_VERSION}" ]; then \
+        echo "========== [base] Pin Triton ${TRITON_PIN_VERSION} (index ${TRITON_INDEX_URL}) =========="; \
+        pip install --index-url "${TRITON_INDEX_URL}" --force-reinstall --no-deps \
+            "triton==${TRITON_PIN_VERSION}" \
+            "triton_kernels==${TRITON_KERNELS_PIN_VERSION}" && \
+        python -c "import importlib.metadata as m; print('triton pinned ->', m.version('triton'))"; \
+    fi
+
 # --------------------------------------------------------------------
 # Stage 1: RCCL — parallel
 # --------------------------------------------------------------------
@@ -287,6 +303,22 @@ RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
         command -v aiperf && aiperf --help >/dev/null; \
     else \
         echo "========== Skipped SemiAnalysis aiperf (INSTALL_SA_AIPERF=0) =========="; \
+    fi
+
+# Guarantee the perf-good Triton survived every install above: re-pin if
+# something pulled a different one, then assert the exact version or fail the
+# build -- the image must never silently ship the base image's newer Triton.
+ARG TRITON_INDEX_URL="https://pypi.amd.com/triton/release/rocm-7.2.0/simple/"
+ARG TRITON_PIN_VERSION="3.7.0+amd.rocm7.2.0.git89002410"
+ARG TRITON_KERNELS_PIN_VERSION="1.0.0+amd.rocm7.2.0.git89002410"
+RUN if [ -n "${TRITON_PIN_VERSION}" ]; then \
+        cur="$("${VENV_PYTHON}" -c 'import importlib.metadata as m; print(m.version("triton"))' 2>/dev/null || echo none)"; \
+        if [ "${cur}" != "${TRITON_PIN_VERSION}" ]; then \
+            echo "[atom_image] Triton drifted to ${cur}; re-pinning ${TRITON_PIN_VERSION}"; \
+            "${VENV_PYTHON}" -m pip install --index-url "${TRITON_INDEX_URL}" --force-reinstall --no-deps \
+                "triton==${TRITON_PIN_VERSION}" "triton_kernels==${TRITON_KERNELS_PIN_VERSION}"; \
+        fi; \
+        "${VENV_PYTHON}" -c "import importlib.metadata as m; v=m.version('triton'); assert v == '${TRITON_PIN_VERSION}', 'Triton dist is '+v+', expected ${TRITON_PIN_VERSION}'; print('[atom_image] final triton', v)"; \
     fi
 
 CMD ["/bin/bash"]
