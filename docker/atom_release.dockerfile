@@ -268,13 +268,29 @@ RUN if [ "${ATOM_BASE_IMAGE}" = "rocm10-base" ]; then \
 FROM base AS build_rccl
 ARG RCCL_REPO="https://github.com/ROCm/rccl.git"
 ARG RCCL_BRANCH="29e1567b95e28823b0beb1a988adc587bfab5b4f"
+# BUILD_RCCL=0 skips the source build and keeps whatever RCCL the base image
+# already provides. Required on the ROCm 10.1 nightly line for two reasons:
+#   1. the ROCm SDK wheels already ship a matching librccl (2.30.7, built
+#      against the same ROCm, with gfx942 + gfx950), so rebuilding is redundant;
+#   2. ROCm/rccl no longer builds at all -- RCCL development moved into the
+#      ROCm/rocm-systems monorepo (projects/rccl), and the standalone
+#      ROCm/rccl mirror is missing commits, so its develop tip references
+#      ncclComm::forcePatEnable and rcclUseAinic without declaring them.
+# The default stays 1 so every existing line keeps building RCCL from source.
+ARG BUILD_RCCL=1
 
-RUN echo "========== [Parallel] Building RCCL ==========" && \
-    pip install cmake && \
-    git clone "$RCCL_REPO" /app/rccl && \
-    cd /app/rccl && \
-    git checkout "$RCCL_BRANCH" && \
-    ./install.sh -p --amdgpu_targets=$GPU_ARCH_LIST
+RUN echo "========== [Parallel] Building RCCL (BUILD_RCCL=${BUILD_RCCL}) ==========" && \
+    mkdir -p /rccl-pkgs && \
+    if [ "${BUILD_RCCL}" = "1" ]; then \
+        pip install cmake && \
+        git clone "$RCCL_REPO" /app/rccl && \
+        cd /app/rccl && \
+        git checkout "$RCCL_BRANCH" && \
+        ./install.sh -p --amdgpu_targets=$GPU_ARCH_LIST && \
+        cp /app/rccl/build/release/*.deb /rccl-pkgs/; \
+    else \
+        echo "BUILD_RCCL=0 -- keeping the base image's own RCCL"; \
+    fi
 
 # --------------------------------------------------------------------
 # Stage 2: Aiter — parallel
@@ -453,8 +469,12 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 # WARNING: dpkg -i --force-all overwrites Ubuntu-repo rccl with the ROCm custom
 # build, breaking rocm-hip's version dep in dpkg metadata. All apt-get install
 # operations (Mooncake, Rust, etc.) MUST be completed before this step.
-COPY --from=build_rccl /app/rccl/build/release/*.deb /tmp/rccl/
-RUN DEBIAN_FRONTEND=noninteractive dpkg -i --force-all /tmp/rccl/*.deb && \
+COPY --from=build_rccl /rccl-pkgs/ /tmp/rccl/
+RUN if ls /tmp/rccl/*.deb >/dev/null 2>&1; then \
+        DEBIAN_FRONTEND=noninteractive dpkg -i --force-all /tmp/rccl/*.deb; \
+    else \
+        echo "no RCCL .deb staged (BUILD_RCCL=0) -- keeping the base image's RCCL"; \
+    fi && \
     rm -rf /tmp/rccl
 
 # Triton ships with the ROCm PyTorch base image (installed as a torch dependency);
