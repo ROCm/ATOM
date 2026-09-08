@@ -265,14 +265,8 @@ def judge_family(members, history_cv):
         "median_tpot_pct": statistics.median(tpots) if tpots else None,
         "n_down": sum(1 for t in tputs if t <= DOWN_EPS_PCT),
         "n_total": len(tputs),
-        "median_drift_pct": (
-            statistics.median(drifts)
-            if (
-                drifts := [
-                    m["drift_pct"] for m in judging if m["drift_pct"] is not None
-                ]
-            )
-            else None
+        "median_drift_pct": _median_or_none(
+            [m["drift_pct"] for m in judging if m["drift_pct"] is not None]
         ),
         "nonmonotonic": _nonmonotonic(judging),
         "escalations": _single_escalations(judging, history_cv),
@@ -312,6 +306,16 @@ def judge_family(members, history_cv):
     )
     result["status"] = "triggered" if triggered else "clean"
     return result
+
+
+def _median_or_none(values):
+    """Median, or None for an empty sample.
+
+    Spelled out rather than inlined with a walrus so the module keeps parsing
+    on older interpreters: CI runs 3.12, but this also has to run wherever
+    someone points it at a pair of result directories.
+    """
+    return statistics.median(values) if values else None
 
 
 def _nonmonotonic(judging):
@@ -445,16 +449,12 @@ def judge(pairs, history_cv, expected_entries=None):
         "n_missing": n_missing,
         "n_unclear": len(unclear),
         "n_drifted": len(drifted),
-        "median_drift_pct": (
-            statistics.median(d)
-            if (
-                d := [
-                    f["median_drift_pct"]
-                    for f in results
-                    if f.get("median_drift_pct") is not None
-                ]
-            )
-            else None
+        "median_drift_pct": _median_or_none(
+            [
+                f["median_drift_pct"]
+                for f in results
+                if f.get("median_drift_pct") is not None
+            ]
         ),
         "expected_entries": expected_entries,
         "scope": _scope(triggered, judged),
@@ -536,13 +536,15 @@ def _entry_rows(family):
     rows = []
     first = True
     for member in family["judging"] + family["reference"]:
-        role = "judge" if member["conc"] >= JUDGE_MIN_CONC else "ref"
-        judged = role == "judge"
+        judged = member["conc"] >= JUDGE_MIN_CONC
+        # The marker rides with the number rather than occupying its own
+        # column, and says what it does rather than naming a category: a reader
+        # should not have to reach the legend to learn that a row does not count.
+        label = f"{member['conc']}" if judged else f"{member['conc']} (not judged)"
         rows.append(
-            "| {entry} | {c} | {role} | {tput} | {ttft} | {tpot} | {drift} |".format(
+            "| {entry} | {c} | {tput} | {ttft} | {tpot} | {drift} |".format(
                 entry=family["model"] if first else "",
-                c=member["conc"],
-                role=role,
+                c=label,
                 tput=_pct(member["tput_pct"], bold=tripped and judged),
                 ttft=_pct(member["ttft_pct"]),
                 tpot=_pct(member["tpot_pct"]),
@@ -552,10 +554,10 @@ def _entry_rows(family):
         first = False
 
     if family["status"] == "insufficient":
-        rows.append("| | **median** | judge | insufficient | | | |")
+        rows.append("| | **median of judged** | insufficient | | | |")
     else:
         rows.append(
-            "| | **median** | judge | {tput} | {ttft} | {tpot} | {drift} |".format(
+            "| | **median of judged** | {tput} | {ttft} | {tpot} | {drift} |".format(
                 tput=_pct(family["median_tput_pct"], bold=tripped),
                 ttft="-",
                 tpot=_pct(family["median_tpot_pct"], bold=tripped),
@@ -572,8 +574,8 @@ def render(report, context):
         lines += [context, ""]
 
     lines += [
-        "| Entry | c | role | Tput | TTFT | TPOT | Drift |",
-        "|---|---|---|---|---|---|---|",
+        "| Model | Concurrency | Total Tput | TTFT | TPOT | Drift |",
+        "|---|---|---|---|---|---|",
     ]
     for family in report["families"]:
         lines += _entry_rows(family)
@@ -581,11 +583,13 @@ def render(report, context):
     lines += [
         "",
         (
-            f"`judge` = levels the verdict is drawn from (c >= {JUDGE_MIN_CONC}); "
-            f"`ref` = measured and shown but never judged, because low "
-            f"concurrency both manufactures false positives and dilutes real "
-            f"ones. `Drift` is how far the base commit moved between its two "
-            f"readings -- the floor on what this comparison can resolve."
+            f"**Concurrency** is how many requests are in flight at once. Only "
+            f"levels at or above {JUDGE_MIN_CONC} decide the verdict. The rows "
+            f"marked *(not judged)* were measured and are shown, but excluded "
+            f"from every calculation: at low concurrency the numbers swing "
+            f"enough to both invent regressions and hide real ones. They are "
+            f"here because dropping them entirely would leave no way to tell a "
+            f"small-batch problem from ordinary low-concurrency noise."
         ),
         "",
     ]
@@ -608,7 +612,7 @@ def render(report, context):
 
     if report["verdict"] == "inconclusive":
         lines.append(
-            "No entry reported enough judging levels. "
+            "No model reported enough judged levels. "
             "This is **not** a pass -- treat it as no signal."
         )
     elif report["verdict"] in ("clean", "partial", "unclear", "untrustworthy"):
@@ -685,10 +689,10 @@ def render(report, context):
     gaps = []
     if report["n_insufficient"]:
         gaps.append(
-            f"{report['n_insufficient']} entry(ies) reported too few judging levels"
+            f"{report['n_insufficient']} model(s) reported too few judged levels"
         )
     if report.get("n_missing"):
-        gaps.append(f"{report['n_missing']} entry(ies) reported nothing at all")
+        gaps.append(f"{report['n_missing']} model(s) reported nothing at all")
     if gaps:
         lines += ["", "Coverage gaps: " + "; ".join(gaps) + "."]
 
