@@ -53,6 +53,15 @@ env:
   PERF_JUDGING_CONCS: 64,128,256
   PERF_REFERENCE_CONCS: ""          # smoke: skip reference levels
   PERF_EXPECTED_ENTRIES: 1
+  # Warmup length as a multiple of the concurrency level, matching the
+  # measurement at 10. Set to 1 to reproduce the short warmup the residual
+  # was first measured under -- the only single-variable way to separate
+  # the warmup from the nightly image, which moves underneath every run.
+  # Not PERF_-prefixed like the others: workflow-level env is inherited
+  # straight into every step, and perf_check_half.sh reads this name, so
+  # no mapping is needed (and a job-level one is not even allowed to
+  # reference env).
+  WARMUP_MULT: 10
 
 jobs:
   # ---------------------------------------------------------------- gate ---
