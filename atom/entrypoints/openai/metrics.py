@@ -397,10 +397,10 @@ def _gc_metrics() -> Iterable[GaugeMetricFamily | CounterMetricFamily]:
     each interpreter keeps its own counters.
 
     `atom:gc_collected_total` is the one to watch, and why the rest are here:
-    the API server runs on raised thresholds (`gc_utils.FRONTEND_GC_THRESHOLD`),
-    which is free only while the collector finds nothing to free. Flat after
-    startup holds the assumption; a rising line means it now builds reference
-    cycles and the spacing is deferring real work.
+    it is what decides whether spacing this process's collections out with
+    `ATOM_GC_THRESHOLD` would cost nothing or would defer real work. Flat after
+    startup means the collector is finding nothing; a rising line means the
+    process builds reference cycles and raising thresholds has a price.
 
     Every source is O(1). The number a reader wants next -- how many objects are
     tracked -- walks the whole heap, so it lives in `/debug/gc_census`, which is

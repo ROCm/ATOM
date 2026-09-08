@@ -23,49 +23,37 @@ from itertools import islice
 logger = logging.getLogger("atom")
 
 
-# The API server's default, and only its own. At concurrency 4096 its collector
-# ran 13,956 times in twenty minutes over a set that grew to 688,646 objects and
-# reclaimed *zero*; each ModelRunner worker reclaims thousands per pass, so
-# raising it there would defer real work. `reclaim_watch` is what keeps the
-# "reclaims nothing" premise honest now that it is a default.
-#
-# The triple is the one measured end-to-end (+20% on an EPLB c=4096 benchmark);
-# the split between t0 and t1/t2 was not measured separately.
-FRONTEND_GC_THRESHOLD = (20000, 50, 50)
+def tune_gc() -> None:
+    """Raise this interpreter's collection thresholds from `ATOM_GC_THRESHOLD`.
 
+    Per-interpreter, so every process that serves calls it for itself -- an
+    enumeration here has gone stale twice, so the rule is the documentation and
+    `tests/test_gc_utils.py` is what checks it.
 
-def tune_gc(default: tuple[int, int, int] | None = None) -> None:
-    """Raise this interpreter's collection thresholds.
-
-    `ATOM_GC_THRESHOLD` wins if set; otherwise `default`, which callers pass
-    only where they can say why. Per-interpreter, so every process that serves
-    calls it for itself -- an enumeration here has gone stale twice, so the rule
-    is the documentation and `tests/test_gc_utils.py` is what checks it.
-
-    Spacing passes out is a different lever from `freeze_gc_heap`, not a
-    fallback for it: freezing removes the startup heap from every pass, and
-    what is left is per-request state that a serving frontend rebuilds faster
-    than any freeze can help with.
+    No default: raising these spaces passes out without making one cheaper, so
+    the same total scan lands in fewer, longer stop-the-world pauses -- a trade
+    against tail latency that nothing here has measured. `freeze_gc_heap` is
+    the lever that removes work rather than rescheduling it.
     """
     from atom.utils import envs
 
     thresholds = envs.ATOM_GC_THRESHOLD
-    if thresholds:
-        try:
-            default = tuple(int(x) for x in thresholds.split(","))
-        except (ValueError, TypeError):
-            logger.warning("[gc] bad ATOM_GC_THRESHOLD=%r, ignored", thresholds)
-            return
-    if default is None:
+    if not thresholds:
+        return
+    try:
+        t = tuple(int(x) for x in thresholds.split(","))
+    except (ValueError, TypeError):
+        logger.warning("[gc] bad ATOM_GC_THRESHOLD=%r, ignored", thresholds)
         return
     old = gc.get_threshold()
-    gc.set_threshold(*default)
-    logger.info("[gc] thresholds %s -> %s", old, default)
+    gc.set_threshold(*t)
+    logger.info("[gc] thresholds %s -> %s", old, t)
 
 
-# The premise the raised thresholds rest on, and the only part of it that can
-# go stale: they are free exactly while the collector finds nothing. Baseline
-# after the freeze, because everything before it reclaimed plenty.
+# Whether this process's collector finds anything at all -- the number that
+# decides whether spacing its passes out would be free, and the one thing about
+# it that can change without anyone noticing. Baseline after the freeze,
+# because everything before it reclaimed plenty.
 _reclaim_baseline: tuple[int, ...] | None = None
 _reclaim_warned = False
 
@@ -85,10 +73,15 @@ def arm_reclaim_watch() -> None:
 def reclaim_watch(context: str) -> int:
     """How many generations have reclaimed something since the watch was armed.
 
-    Zero is the expected answer and the one the raised thresholds assume. A
-    non-zero answer is not yet a fault: it says this process builds reference
-    cycles, so spacing collections out is no longer free and is deferring real
-    work into a growing heap.
+    Zero is the expected answer for the API server, measured over a full GSM8K
+    run at its thresholds. A non-zero answer is not a fault: it says this
+    process builds reference cycles, which is what would make spacing its
+    collections out cost something rather than nothing.
+
+    Blind to one case, and it is the one that matters most: a cycle promoted to
+    gen-2 before it becomes garbage is reclaimed only by a gen-2 pass, so where
+    those are rare it is neither collected nor counted here. `/debug/gc_census`
+    reports the gen-2 size, which is what would show it.
 
     Warns once -- at four thousand streams a repeating line buries the log.
     `atom:gc_collected` is the continuous signal; this only makes someone look.

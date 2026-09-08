@@ -45,7 +45,6 @@ from atom.model_engine.sequence import new_token_ids
 from atom.utils import envs
 from atom.utils.arg_parser import FlexibleArgumentParser
 from atom.utils.gc_utils import (
-    FRONTEND_GC_THRESHOLD,
     arm_reclaim_watch,
     freeze_gc_heap,
     gc_census,
@@ -1554,7 +1553,7 @@ async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown."""
     global _metrics_refresh_task
     logger.info("Server started successfully and ready to accept requests")
-    tune_gc(FRONTEND_GC_THRESHOLD)
+    tune_gc()
     maybe_attach_gc_debug_callback("api_server")
     await _refresh_metrics_once()
     _metrics_refresh_task = asyncio.create_task(_metrics_refresh_loop())

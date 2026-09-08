@@ -18,7 +18,6 @@ import gc
 import pytest
 
 from atom.utils.gc_utils import (
-    FRONTEND_GC_THRESHOLD,
     _owner,
     arm_reclaim_watch,
     freeze_gc_heap,
@@ -330,23 +329,11 @@ def test_the_census_does_not_run_the_code_it_measures():
     assert len(held) == 4
 
 
-def test_a_caller_that_can_say_why_gets_a_default(monkeypatch):
-    """The API server's collector reclaims nothing at a serving concurrency
-    while the engine's and the workers' reclaim thousands, so the default is
-    per-caller and not per-interpreter-wide."""
-    from atom.utils import envs
-
-    monkeypatch.setattr(envs, "ATOM_GC_THRESHOLD", "")
-    gc.set_threshold(700, 10, 10)
-
-    tune_gc(FRONTEND_GC_THRESHOLD)
-
-    assert gc.get_threshold() == FRONTEND_GC_THRESHOLD
-
-
-def test_a_caller_with_no_reason_changes_nothing(monkeypatch):
-    """The engine and the workers pass nothing and must come out exactly as
-    they went in -- this is the whole reason the default is an argument."""
+def test_no_env_means_no_process_touches_its_thresholds(monkeypatch):
+    """There is no per-process default. Raising these does not make a pass
+    cheaper, only rarer, so the same scan lands in fewer and longer pauses --
+    a trade nothing here has measured, and one the API server and a worker
+    would not make on the same terms anyway."""
     from atom.utils import envs
 
     monkeypatch.setattr(envs, "ATOM_GC_THRESHOLD", "")
@@ -357,36 +344,34 @@ def test_a_caller_with_no_reason_changes_nothing(monkeypatch):
     assert gc.get_threshold() == (700, 10, 10)
 
 
-def test_the_env_still_overrides_the_default(monkeypatch):
-    """The escape hatch has to outrank the default, or a bad default cannot be
-    pinned in production without a redeploy."""
+def test_the_env_sets_the_thresholds(monkeypatch):
+    """The one way to change them, and it has to work without a redeploy."""
     from atom.utils import envs
 
     monkeypatch.setattr(envs, "ATOM_GC_THRESHOLD", "123,4,5")
     gc.set_threshold(700, 10, 10)
 
-    tune_gc(FRONTEND_GC_THRESHOLD)
+    tune_gc()
 
     assert gc.get_threshold() == (123, 4, 5)
 
 
 def test_a_malformed_env_leaves_the_thresholds_alone(monkeypatch):
-    """Not "fall back to the default": a typo in an override is a mistake to
-    surface, and silently running someone else's numbers would present as an
-    unexplained performance change."""
+    """A typo is a mistake to surface. Running on half-parsed numbers would
+    present as an unexplained performance change, not as a typo."""
     from atom.utils import envs
 
     monkeypatch.setattr(envs, "ATOM_GC_THRESHOLD", "20000,fifty,50")
     gc.set_threshold(700, 10, 10)
 
-    tune_gc(FRONTEND_GC_THRESHOLD)
+    tune_gc()
 
     assert gc.get_threshold() == (700, 10, 10)
 
 
 def test_the_watch_is_quiet_while_nothing_is_reclaimed():
-    """The expected steady state, and the condition the raised thresholds
-    assume."""
+    """The expected steady state for this process, and what says that spacing
+    its collections out would be free."""
     gc.collect()
     arm_reclaim_watch()
 
