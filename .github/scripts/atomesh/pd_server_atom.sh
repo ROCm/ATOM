@@ -629,6 +629,12 @@ start_decode() {
 
 start_router() {
   echo "[router] prefill=${prefill_args[*]} decode=${decode_args[*]}"
+  local mesh_binary="/app/ATOM/atom/mesh/target/release/atomesh"
+  if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" && "${ATOMESH_EXECUTION_PHASE}" != "eval" ]]; then
+    # The image can predate the checkout's HTTP TTFT instrumentation.
+    mesh_binary="$(bash "${ATOMESH_SCRIPT_DIR}/observability/build_mesh.sh" \
+      "${ATOMESH_SCRIPT_DIR}/../../../atom/mesh" "${RUNTIME_LOG_DIR}")"
+  fi
   case "${ATOM_PD_RANK_MAPPING_POLICY}" in
     none|idx2idx) ;;
     *)
@@ -654,7 +660,7 @@ start_router() {
     router_dp_aware_args=(--dp-aware)
   fi
   local -a router_cmd=(
-    /app/ATOM/atom/mesh/target/release/atomesh launch
+    "${mesh_binary}" launch
     --host 0.0.0.0
     --port "${ROUTER_PORT}"
     --pd-disaggregation
@@ -880,12 +886,18 @@ run_aiperf_agentic_benchmark() {
 
   local safe_model="${MODEL_NAME//\//-}"
   local -a server_metrics_args=(--server-metrics)
+  local -a report_args=(
+    --model "${MODEL_NAME} · ${DISPLAY_TOPOLOGY}"
+    --mesh "127.0.0.1:${PROMETHEUS_PORT}"
+  )
   local idx
   for idx in "${!prefill_ips[@]}"; do
     server_metrics_args+=("http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/metrics")
+    report_args+=(--prefill "${prefill_ips[$idx]}:${prefill_ports[$idx]}")
   done
   for idx in "${!decode_ips[@]}"; do
     server_metrics_args+=("http://${decode_ips[$idx]}:${decode_ports[$idx]}/metrics")
+    report_args+=(--decode "${decode_ips[$idx]}:${decode_ports[$idx]}")
   done
 
   local conc
@@ -911,6 +923,8 @@ run_aiperf_agentic_benchmark() {
     AIPERF_DATASET_CONFIGURATION_TIMEOUT="${AIPERF_DATASET_CONFIGURATION_TIMEOUT}" \
     AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT="${AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT}" \
     AIPERF_UI_REALTIME_METRICS_ENABLED=true \
+      python3 "${ATOMESH_SCRIPT_DIR}/observability/collect_metrics.py" \
+      --output "${out_dir}/metrics" "${report_args[@]}" -- \
       "${AIPERF_VENV}/bin/aiperf" profile \
       "${unsafe_args[@]}" \
       --scenario "${AIPERF_SCENARIO}" \

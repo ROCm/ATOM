@@ -7,6 +7,7 @@ on:
       - 'atom/mesh/**'
       - '.github/benchmark/models_atomesh.yaml'
       - '.github/scripts/atomesh/**'
+      - 'atom/entrypoints/openai/**'
       - '.github/scripts/slurm_submit_helpers.sh'
       - '.github/workflows/atomesh-benchmark.yaml'
   pull_request:
@@ -16,6 +17,7 @@ on:
       - 'atom/mesh/**'
       - '.github/benchmark/models_atomesh.yaml'
       - '.github/scripts/atomesh/**'
+      - 'atom/entrypoints/openai/**'
       - '.github/scripts/slurm_submit_helpers.sh'
       - '.github/workflows/atomesh-benchmark.yaml'
   schedule:
@@ -1297,6 +1299,36 @@ jobs:
           artifact-name: aiperf-chrome-traces-${{ matrix.id }}
           output-dir: aiperf-traces/${{ matrix.id }}
           run-url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Prepare agentic PD latency reports
+        if: ${{ always() && matrix.benchmark.kind == 'aiperf_agentic' }}
+        id: metrics-reports
+        env:
+          MATRIX_ID: ${{ matrix.id }}
+        run: |
+          python3 .github/scripts/atomesh/observability/stage_reports.py \
+            --cell "$MATRIX_ID" \
+            --output "atomesh-reports/$MATRIX_ID"
+
+      - name: Upload agentic PD latency reports
+        if: ${{ always() && steps.metrics-reports.outcome == 'success' }}
+        id: metrics-artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: atomesh-latency-${{ matrix.id }}-${{ github.run_attempt }}
+          path: atomesh-reports/${{ matrix.id }}/
+          if-no-files-found: error
+
+      - name: Link latency reports in job summary
+        if: ${{ always() && steps.metrics-artifact.outcome == 'success' }}
+        env:
+          MATRIX_ID: ${{ matrix.id }}
+          METRICS_ARTIFACT_URL: ${{ steps.metrics-artifact.outputs.artifact-url }}
+        run: |
+          python3 .github/scripts/atomesh/observability/stage_reports.py \
+            --cell "$MATRIX_ID" \
+            --output "atomesh-reports/$MATRIX_ID" \
+            --summary-only
 
       - name: Upload model benchmark artifacts
         if: always()
