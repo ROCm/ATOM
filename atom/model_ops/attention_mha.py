@@ -54,10 +54,7 @@ def gluon_decode_over_limit(max_qlen: int, num_heads: int, num_kv_heads: int) ->
     group_p2 = qlen_p2 * max(
         16 // qlen_p2, 1 << (num_heads // num_kv_heads - 1).bit_length()
     )
-    return (
-        max_qlen > PA_GLUON_MAX_QUERY_LEN
-        or group_p2 > PA_GLUON_MAX_QUERY_GROUP_SIZE
-    )
+    return max_qlen > PA_GLUON_MAX_QUERY_LEN or group_p2 > PA_GLUON_MAX_QUERY_GROUP_SIZE
 
 
 class PagedAttentionImpl(nn.Module):

@@ -739,9 +739,8 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             return self.paged_attention_triton
         # Past ASM's envelope prefer the wider kernel: ASM would silently fall
         # back to one built for a different qlen rather than refuse.
-        if int(max_qlen) * (self.num_heads // self.num_kv_heads) > (
-            PA_ASM_MAX_QUERY_GROUP_SIZE
-        ):
+        asm_group = int(max_qlen) * (self.num_heads // self.num_kv_heads)
+        if asm_group > PA_ASM_MAX_QUERY_GROUP_SIZE:
             return self.paged_attention_triton
         return self.paged_attention_asm
 
