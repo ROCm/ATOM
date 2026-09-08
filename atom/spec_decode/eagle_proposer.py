@@ -483,10 +483,11 @@ class EagleProposer(Drafter):
         cu_seqlens_q[: running_bs + 1] = builder.row_ids[: running_bs + 1]
         if target_uses_mla and has_flat_kv:
             # MLA: block_size=1, kv_indptr tracks tokens
-            # Per REAL request: `num_reject_tokens` is scheduled_bs-long, a pad row
-            # rejected nothing. Their `kv_indptr` keeps what the target left,
-            # which is one of its own valid ranges, so their reads stay in
-            # bounds; their WRITES are what has to be neutralized, below.
+            # Per REAL request: `num_reject_tokens` is scheduled_bs-long, a pad
+            # row rejected nothing. That leaves the tail holding whatever batch
+            # last occupied those rows, which no longer continues the rows just
+            # rebased here -- `prepare_mtp_decode` closes it, per backend.
+            # Their WRITES are neutralized below.
             kv_indptr[1 : scheduled_bs + 1] -= torch.cumsum(num_reject_tokens, dim=0)
         if positions.ndim == 1:
             positions = torch.index_select(positions, 0, last_token_indices)
