@@ -248,3 +248,49 @@ def test_expansion_can_write_into_a_preallocated_buffer():
 
     assert result.data_ptr() == out.data_ptr()
     assert out[0, :8].tolist() == list(range(8))
+
+
+# ── why LHBNC would need none of the above ────────────────────────────────
+
+
+def _per_layer_view(layout: str):
+    """The [B, H, N, C] view vLLM builds; the layout only changes the strides."""
+    content = NUM_KV_HEADS * HEAD_SIZE
+    strides = {
+        # physical [H][B][N][C]: one dense K plane, then one dense V plane
+        "LHBNC": (BLOCK_SIZE * content, NUM_BLOCKS * BLOCK_SIZE * content, content, 1),
+        # physical [B][H][N][C]: both planes packed inside each block
+        "LBHNC": (2 * BLOCK_SIZE * content, BLOCK_SIZE * content, content, 1),
+    }[layout]
+    buf = torch.zeros(NUM_BLOCKS * 2 * BLOCK_SIZE * content, dtype=torch.uint8)
+    return torch.as_strided(buf, (NUM_BLOCKS, 2, BLOCK_SIZE, content), strides)
+
+
+def test_lhbnc_is_atoms_native_geometry_and_needs_no_rebasing():
+    """Under dense planes the adaptation is two free views, and block b's page
+    still starts at b * page_size -- which is what every caller assumes."""
+    adapted = (
+        _per_layer_view("LHBNC")
+        .transpose(0, 1)
+        .unflatten(-1, (NUM_KV_HEADS, HEAD_SIZE))
+    )
+
+    assert adapted.shape == (2, NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE)
+    assert adapted.is_contiguous()
+    key, value = adapted.unbind(0)
+    assert key.is_contiguous() and value.is_contiguous()
+
+
+def test_lbhnc_cannot_be_adapted_the_same_way():
+    """Packing both planes into a block is what forces the page-16 rebasing:
+    neither side is a contiguous run any more."""
+    adapted = (
+        _per_layer_view("LBHNC")
+        .transpose(0, 1)
+        .unflatten(-1, (NUM_KV_HEADS, HEAD_SIZE))
+    )
+
+    assert adapted.shape == (2, NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE)
+    assert not adapted.is_contiguous()
+    key, _ = adapted.unbind(0)
+    assert not key.is_contiguous()
