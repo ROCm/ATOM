@@ -345,9 +345,34 @@ jobs:
           # never fires and DIGEST ends up empty rather than "unknown".
           echo "digest=${DIGEST:-unknown}" >> "$GITHUB_OUTPUT"
 
+      - name: Fetch the dashboard history
+        id: history
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # Used for two things, both secondary to the paired comparison: the
+          # noise band behind the single-level escalation, and the sanity check
+          # that reads the base measurement against main's recent level. Fetched
+          # as its own step so the network access is visible in the log and a
+          # failure is attributable, rather than hiding inside the judge.
+          curl -sSfL --max-time 120 \
+            https://rocm.github.io/ATOM/benchmark-dashboard/data.js \
+            -o dashboard-data.js
+          echo "bytes=$(wc -c < dashboard-data.js)"
+
       - name: Judge
         run: |
           set -euo pipefail
+          # Without history the judge keeps its primary criterion -- levels
+          # moving together needs no noise estimate -- and loses the escalation
+          # and the baseline check. Degrading is correct; pretending we have a
+          # baseline reference we could not fetch would not be.
+          if [ -s dashboard-data.js ]; then
+            HISTORY_ARG="--history dashboard-data.js"
+          else
+            echo "::warning::no dashboard history -- baseline sanity check and sigma gate are off"
+            HISTORY_ARG="--no-history"
+          fi
           CONTEXT="base \`${{ github.event.pull_request.base.sha }}\` -> head \`${{ github.event.pull_request.head.sha }}\` · \`${{ steps.collect.outputs.digest }}\`"
           # --expect-entries is not optional: an entry whose job died entirely
           # produces no files at all, so without it a run where most jobs failed
@@ -355,6 +380,7 @@ jobs:
           python3 .github/scripts/perf_judge.py \
             --base-dir collected/base \
             --head-dir collected/head \
+            $HISTORY_ARG \
             --expect-entries "${{ env.PERF_EXPECTED_ENTRIES }}" \
             --context "$CONTEXT" \
             --output-json verdict.json \

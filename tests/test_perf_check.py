@@ -306,6 +306,93 @@ def test_verdict_holds_without_history(tmp_path):
     assert run_judge(tmp_path, spec)["verdict"] == "regression"
 
 
+def test_a_baseline_far_below_normal_outranks_everything(tmp_path):
+    """A paired comparison is blind to main already being broken: base and head
+    both down 30% gives a delta of zero and reads as clean. Checking the base
+    measurement against main's recent level is the only thing here that can
+    see it."""
+    history = {
+        ("M", "8192/1024", c): {"cv": 0.01, "median": 10000.0, "n": 8} for c in JUDGING
+    }
+    # Both halves sit 30% under what main normally does.
+    base = [_result("M", c, 7000.0, 30.0) for c in JUDGING]
+    head = [_result("M", c, 7000.0, 30.0) for c in JUDGING]
+
+    report = pj.judge(pj.pair_results(base, head), history, expected_entries=1)
+    assert report["verdict"] == "bad_baseline"
+    assert report["n_bad_baseline"] == 1
+
+    body = pj.render(report, "")
+    assert "under main's recent level" in body
+    assert "cannot be acted on" in body
+    # Reported once for the model, not repeated per level.
+    assert body.count("cannot be acted on") == 1
+
+
+def test_a_naturally_jumpy_configuration_is_not_condemned(tmp_path):
+    """A fixed percentage alone condemns a configuration for behaving the way
+    it always has. The 8-run spread on the dashboard reaches 25% at P90, so the
+    deviation has to clear the configuration's own noise as well."""
+    history = {
+        ("M", "8192/1024", c): {"cv": 0.20, "median": 10000.0, "n": 8} for c in JUDGING
+    }
+    base = [_result("M", c, 7400.0, 30.0) for c in JUDGING]  # -26%, but 1.3 sigma
+    head = [_result("M", c, 7400.0, 30.0) for c in JUDGING]
+    report = pj.judge(pj.pair_results(base, head), history, expected_entries=1)
+    assert report["verdict"] == "clean"
+    assert report["n_bad_baseline"] == 0
+
+
+def test_one_level_alone_is_not_enough_to_condemn_the_baseline(tmp_path):
+    """One level off is the shape a scheduling blip takes; several at once is
+    the machine or the commit."""
+    history = {
+        ("M", "8192/1024", c): {"cv": 0.01, "median": 10000.0, "n": 8} for c in JUDGING
+    }
+    base = [
+        _result("M", 64, 7000.0, 30.0),  # only this one is far down
+        _result("M", 128, 9900.0, 30.0),
+        _result("M", 256, 9950.0, 30.0),
+    ]
+    head = [
+        _result("M", c, v, 30.0)
+        for c, v in ((64, 7000.0), (128, 9900.0), (256, 9950.0))
+    ]
+    report = pj.judge(pj.pair_results(base, head), history, expected_entries=1)
+    assert report["n_bad_baseline"] == 0
+
+
+def test_a_healthy_baseline_does_not_trip_the_sanity_check(tmp_path):
+    history = {
+        ("M", "8192/1024", c): {"cv": 0.01, "median": 10000.0, "n": 8} for c in JUDGING
+    }
+    base = [_result("M", c, 9800.0, 30.0) for c in JUDGING]
+    head = [_result("M", c, 9750.0, 30.0) for c in JUDGING]
+    report = pj.judge(pj.pair_results(base, head), history, expected_entries=1)
+    assert report["verdict"] == "clean"
+    assert report["n_bad_baseline"] == 0
+
+
+def test_bad_baseline_outranks_a_trip(tmp_path):
+    """Even a clear regression is not reportable against a broken baseline."""
+    history = {
+        ("M", "8192/1024", c): {"cv": 0.01, "median": 10000.0, "n": 8} for c in JUDGING
+    }
+    base = [_result("M", c, 7000.0, 30.0) for c in JUDGING]
+    head = [_result("M", c, 6300.0, 33.0) for c in JUDGING]  # -10% on top
+    report = pj.judge(pj.pair_results(base, head), history, expected_entries=1)
+    assert report["verdict"] == "bad_baseline"
+
+
+def test_sanity_check_is_skipped_without_history(tmp_path):
+    """No history, no check -- it must not invent a verdict from absence."""
+    base = [_result("M", c, 7000.0, 30.0) for c in JUDGING]
+    head = [_result("M", c, 7000.0, 30.0) for c in JUDGING]
+    report = pj.judge(pj.pair_results(base, head), {}, expected_entries=1)
+    assert report["verdict"] == "clean"
+    assert report["n_bad_baseline"] == 0
+
+
 # ------------------------------------------------------------- contract ---
 def test_thresholds_report_the_measured_residual_bias(tmp_path):
     """The trip point is not the threshold: a measured, systematic bias favours
