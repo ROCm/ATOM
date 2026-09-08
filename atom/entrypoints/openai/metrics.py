@@ -8,7 +8,7 @@ import time
 from collections.abc import Iterable
 from typing import Any
 
-from prometheus_client import CollectorRegistry, generate_latest
+from prometheus_client import CollectorRegistry, Histogram, generate_latest
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 
@@ -401,6 +401,49 @@ class AtomMetricsExporter:
         self._last_refresh = 0.0
         self._registry = CollectorRegistry(auto_describe=False)
         self._registry.register(_AtomMetricsCollector(self))
+        self._inter_token_latency = Histogram(
+            "atom:inter_token_latency_seconds",
+            "Frontend-observed streaming output interval divided by new token "
+            "count, weighted by that count. Excludes the first output batch.",
+            buckets=(
+                0.002,
+                0.004,
+                0.006,
+                0.008,
+                0.010,
+                0.015,
+                0.020,
+                0.025,
+                0.030,
+                0.035,
+                0.040,
+                0.060,
+                0.080,
+                0.100,
+                0.200,
+                0.400,
+                0.600,
+                0.800,
+                1.000,
+                2.000,
+                4.000,
+                6.000,
+                8.000,
+            ),
+            registry=self._registry,
+        )
+
+    def observe_inter_token_latency(self, interval: float, num_new_tokens: int) -> None:
+        """Record token-weighted output intervals using public Histogram APIs.
+
+        These cumulative observations are independent of the engine snapshot;
+        neither refreshing that snapshot nor scraping resets the histogram.
+        """
+        if num_new_tokens <= 0:
+            return
+        per_token = interval / num_new_tokens
+        for _ in range(num_new_tokens):
+            self._inter_token_latency.observe(per_token)
 
     def update(self, snapshot: dict[str, Any]) -> None:
         with self._lock:

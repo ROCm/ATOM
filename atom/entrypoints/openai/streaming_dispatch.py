@@ -14,6 +14,7 @@ import logging
 import threading
 import time
 from asyncio import AbstractEventLoop, Event
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
@@ -58,6 +59,8 @@ class IncrementalStreamDetokenizer:
     # Emitted once per token in place of the decoded text, for runs whose text
     # is a byproduct rather than an answer. See `SYNTHETIC_TOKEN_TEXT`.
     synthetic_text: str | None = None
+    # Used only by frontend delivery, after detokenization and before merging.
+    last_output_at: float | None = None
 
     def update(self, token_ids: list[int], finished: bool) -> str:
         decoded = self._decode(token_ids, finished)
@@ -236,10 +239,10 @@ class StreamBatchDispatcher:
     """Collect one engine step per output thread and dispatch it by event loop.
 
     Holds no per-stream state. Each stream's detokenizer belongs to the engine
-    callback that feeds it, and rides along on every chunk, so nothing here is
-    shared between the output threads and the event loop and nothing has to be
-    cleaned up: when the engine drops a finished stream's callback the
-    detokenizer goes with it.
+    callback that feeds it and rides along on every chunk, so there is no
+    per-stream registry to synchronize or clean up. It is released after the
+    callback and pending deliveries are gone. Its timing field is updated only
+    on the receiving event loop; decoding fields belong to the output thread.
 
     It used to live in a dict here, which cost a lock -- 27% of the API
     server's CPU, since every buffered chunk looked its state up with all
@@ -248,9 +251,15 @@ class StreamBatchDispatcher:
     remember to remove.
     """
 
-    def __init__(self, tokenizer: Any, synthetic_text: str | None = None):
+    def __init__(
+        self,
+        tokenizer: Any,
+        synthetic_text: str | None = None,
+        observe_inter_token_latency: Callable[[float, int], None] | None = None,
+    ):
         self.tokenizer = tokenizer
         self.synthetic_text = synthetic_text
+        self._observe_inter_token_latency = observe_inter_token_latency
         self._thread_local = threading.local()
 
     def new_state(self) -> IncrementalStreamDetokenizer:
@@ -282,20 +291,18 @@ class StreamBatchDispatcher:
             return
         tl.buf = []
 
-        by_loop: dict[AbstractEventLoop, list[tuple[Any, Any]]] = {}
+        by_loop: dict[AbstractEventLoop, list[_BufferedChunk]] = {}
         for item in buf:
             item.chunk["text"] = item.state.update(
                 item.chunk.get("token_ids") or [],
                 bool(item.chunk.get("finished")),
             )
-            payload = item.chunk if item.tag is None else (item.tag, item.chunk)
-            by_loop.setdefault(item.loop, []).append((item.collector, payload))
+            by_loop.setdefault(item.loop, []).append(item)
 
         for loop, items in by_loop.items():
             loop.call_soon_threadsafe(self._deliver, items)
 
-    @staticmethod
-    def _deliver(items: list[tuple[Any, Any]]) -> None:
+    def _deliver(self, items: list[_BufferedChunk]) -> None:
         """Run on the target event loop and hand a whole step to its collectors.
 
         A step is delivered in one callback, never split across loop iterations.
@@ -306,5 +313,18 @@ class StreamBatchDispatcher:
         wrong order, and an end-of-stream that lands before a straggler is
         overwritten by it, hanging that client for good.
         """
-        for collector, payload in items:
-            collector.put_nowait(payload)
+        for item in items:
+            num_new_tokens = len(item.chunk.get("token_ids") or ())
+            if num_new_tokens and self._observe_inter_token_latency is not None:
+                now = time.perf_counter()
+                if item.state.last_output_at is None:
+                    item.state.last_output_at = now
+                else:
+                    self._observe_inter_token_latency(
+                        now - item.state.last_output_at, num_new_tokens
+                    )
+                    # Update the baseline after recording the sample to
+                    # exclude observation work from the next interval.
+                    item.state.last_output_at = time.perf_counter()
+            payload = item.chunk if item.tag is None else (item.tag, item.chunk)
+            item.collector.put_nowait(payload)
