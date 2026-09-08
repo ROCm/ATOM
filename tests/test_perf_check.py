@@ -435,6 +435,9 @@ def run_half(ws, bindir, sha, half, **env):
             "ARGS": "--kv_cache_dtype fp8 -tp 8 --method mtp",
             "RESULT_FILENAME": RESULT_FILENAME,
             "CONC": "128",
+            "ISL": "8192",
+            "OSL": "1024",
+            "RANDOM_RANGE_RATIO": "0.8",
             **env,
         },
     )
@@ -488,6 +491,28 @@ def test_passes_server_args_through_stdin_not_the_command_line(workspace, fake_d
     text = log.read_text()
     assert "STDIN: .github/scripts/atom_test.sh launch" in text
     assert "--method mtp" in text
+
+
+def test_benchmark_parameters_reach_the_container(workspace, fake_docker):
+    """atom_test.sh reads ISL/OSL/CONC/RANDOM_RANGE_RATIO from its own
+    environment under `set -u`, so anything missing aborts the benchmark after
+    the model has already loaded. CI injects them when the container starts,
+    which hides the omission wherever the container was started that way -- it
+    surfaced only against a locally started container, as
+    "line 447: ISL: unbound variable".
+    """
+    ws, base_sha, _ = workspace
+    bindir, log = fake_docker
+    run_half(ws, bindir, base_sha, "base")
+
+    bench_call = [
+        ln
+        for ln in log.read_text().splitlines()
+        if ln.startswith("ARGS:") and "benchmark" in ln
+    ]
+    assert bench_call, "no benchmark invocation recorded"
+    for var in ("ISL=8192", "OSL=1024", "CONC=128", "RANDOM_RANGE_RATIO=0.8"):
+        assert var in bench_call[0], f"{var} not passed to the container"
 
 
 def test_stops_the_server_after_measuring(workspace, fake_docker):
@@ -585,6 +610,9 @@ def test_runs_when_the_target_commit_does_not_contain_the_script(tmp_path, fake_
         "ARGS": "",
         "RESULT_FILENAME": RESULT_FILENAME,
         "CONC": "128",
+        "ISL": "8192",
+        "OSL": "1024",
+        "RANDOM_RANGE_RATIO": "0.8",
     }
     for sha, half in ((base_sha, "base"), (head_sha, "head")):
         result = subprocess.run(
