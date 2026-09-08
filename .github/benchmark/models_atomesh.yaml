@@ -269,7 +269,7 @@ models:
             env:
               decode:
                 MAX_JOBS: "16"
-            benchmark: &glm52_agentic_benchmark
+            benchmark:
               kind: aiperf_agentic
               aiperf_commit: b7b16cf851885567988a643282266bce74e34437
               scenario: inferencex-agentx-mvp
@@ -312,9 +312,6 @@ models:
         - <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c2
           concurrency: [2]
-          benchmark:
-            <<: *glm52_agentic_benchmark
-            benchmark_duration: 1500
 
         - <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c4
