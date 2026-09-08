@@ -153,6 +153,46 @@ jobs:
       RESULT_FILENAME: ${{ matrix.cell.result_filename }}
       CONTAINER: atom-perf-check
     steps:
+      - name: Reclaim disk before starting
+        timeout-minutes: 15
+        run: |
+          set -uo pipefail
+          # This workflow is heavier on disk than the accuracy suites it shares
+          # runners with: it pulls a ~47GB image with pull-policy always, and
+          # starts three servers in one job. Two jobs of this run died on a
+          # runner that filled up -- one could not write its own diagnostic log
+          # ("No space left on device" under _diag/), the other lost contact
+          # with the server, which is what a full disk looks like from outside.
+          #
+          # Mirrors atom-test.yaml's guard, plus the runner work tree, since
+          # the failure was in the runner's own space rather than Docker's.
+          docker_root="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)"
+          docker_root="${docker_root:-/var/lib/docker}"
+          echo "runner: ${RUNNER_NAME:-$(hostname)}"
+          df -h / "${docker_root}" "${RUNNER_WORKSPACE:-/tmp}" || true
+
+          available_kb="$(df -Pk "${docker_root}" 2>/dev/null | awk 'NR == 2 {print $4}' || true)"
+          threshold_kb=$((500 * 1024 * 1024))
+          if [ "${available_kb:-0}" -lt "${threshold_kb}" ]; then
+            echo "Docker root under 500 GiB free -- pruning resources older than 30 days"
+            docker container prune -f --filter "until=720h" || true
+            docker image prune -af --filter "until=720h" || true
+            docker builder prune -af --filter "until=720h" || true
+            docker system df || true
+          else
+            echo "Docker root has at least 500 GiB free"
+          fi
+
+          # Runner-side leftovers. Old diagnostic logs are what actually ran the
+          # disk out, and nothing else prunes them.
+          diag="$(dirname "${RUNNER_WORKSPACE:-/tmp}")/_diag"
+          if [ -d "$diag" ]; then
+            before=$(du -sm "$diag" 2>/dev/null | cut -f1)
+            find "$diag" -type f -mtime +7 -delete 2>/dev/null || true
+            echo "runner _diag: ${before:-?}MB -> $(du -sm "$diag" 2>/dev/null | cut -f1)MB"
+          fi
+          df -h / "${docker_root}" || true
+
       - name: Kill leftover containers and reclaim the workspace
         run: |
           docker ps -aq | xargs -r docker rm -f || true
