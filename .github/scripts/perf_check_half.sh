@@ -57,7 +57,7 @@ if [ "$HALF" = "warmup" ]; then
   # at c=64/128/256 across three machines. Launch and model load dominate a
   # phase (~10.4 of 17.6 min at c=64), so matching the measurement costs about
   # 14% of job wall clock rather than a whole extra phase.
-  export NUM_PROMPTS_OVERRIDE="${WARMUP_PROMPTS:-$(( CONC * 10 ))}"
+  export NUM_PROMPTS_OVERRIDE="${WARMUP_PROMPTS:-$(( CONC * ${WARMUP_MULT:-10} ))}"
   echo "warmup: NUM_PROMPTS_OVERRIDE=${NUM_PROMPTS_OVERRIDE} (results discarded)"
 fi
 
