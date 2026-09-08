@@ -104,20 +104,38 @@ Two tiers keep the sort honest (`shortest_first_key`):
   had their KV freed, so re-sorting them by length would re-preempt them
   forever) and any request skipped past `sjf_max_skip_steps`. This is the
   starvation bound; `0` removes it, giving pure SJF.
-- **Everything else** — ranked by `num_tokens - num_cached_tokens`, stably, so
-  equal-cost requests keep arrival order.
+- **Everything else** — ranked by the tokens prefill still has to compute
+  *after prefix reuse*, stably, so equal-cost requests keep arrival order.
 
 A skip is only charged on a step that actually admitted a prefill. On a
 KV-starved or delayer-held step nobody was passed over, and counting it would
 age the whole queue into the front tier at once — FCFS with extra steps.
 
-One caveat on the cost metric: `num_cached_tokens` is advanced by
-`postprocess`, not by the admission-loop prefix probe (which writes
-`prefix_cache_hit_tokens`), and `deallocate` zeroes it. So for a request that
-has not yet run a prefill chunk the key equals the raw prompt length, and a
-long-but-cache-hot prompt is ordered as if it were cold. Making the key
-cache-aware means probing per waiting request per step; that cost has not been
-measured and is deliberately not paid here.
+**How the cost is measured.** `num_cached_tokens` is advanced by `postprocess`,
+so a request that has not yet run a prefill chunk carries 0 — using it alone
+would rank a cache-hot 20k prompt as 20k of work and let a cold 500-token
+request cut in front. Instead the key splits on whether the waiter owns blocks:
+
+- **Fresh waiter** (`not seq.block_table`) — `BlockManager.prefix_cached_tokens`
+  probes the live cache. It shares `_match_prefix` with `can_allocate`, so it
+  applies the same joint SWA / state-checkpoint gate and never counts a prefix
+  no cache could resume from. The probe is read-only: no allocation, no
+  refcount, no `checkpoint_demand_pos`, no funnel counters.
+- **Waiter that already owns blocks** — an offload resume, a parked partial
+  prefill, or anything in the disaggregated `PrefillScheduler`'s ready set uses
+  its own `num_cached_tokens`. That KV is real whether or not it is reachable
+  through the prefix index, so probing would under-report it.
+
+Hits are re-probed on every sort rather than memoised, because an admission
+earlier in the same pass can evict blocks a later waiter matched. Admission
+probes again for the same reason — the sort's answer is a ranking input, never
+an admission decision.
+
+**Cost, and who pays it.** One chained-hash walk per fresh waiter per
+scheduling pass, on top of the walk admission already does. That is charged to
+`sjf` alone: `_reorder_waiting_shortest_first` returns before touching the
+block manager under any other policy, so FCFS walks the prefix exactly once per
+`can_allocate`, as it always has.
 
 The sort runs *before* `_promote_ready_remote_kv_requests` and
 `_park_ready_offload_partial_prefills`, so those passes' front-of-queue

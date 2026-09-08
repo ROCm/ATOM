@@ -139,7 +139,9 @@ def validate_scheduling_policy(policy: str) -> str:
     return policy
 
 
-def shortest_first_key(seq: Sequence, max_skip_steps: int) -> tuple[int, int]:
+def shortest_first_key(
+    seq: Sequence, max_skip_steps: int, block_manager: BlockManager | None = None
+) -> tuple[int, int]:
     """Waiting-queue sort key for `scheduling_policy="sjf"`.
 
     Two tiers. The front tier holds requests that must not be reordered by
@@ -147,6 +149,14 @@ def shortest_first_key(seq: Sequence, max_skip_steps: int) -> tuple[int, int]:
     had its KV thrown away, and any request skipped `max_skip_steps` times,
     which is the bound on how long SJF may starve a long prompt. Everything
     else is ranked by remaining prefill work.
+
+    "Remaining" means after prefix reuse. A fresh waiter owns no blocks and
+    carries `num_cached_tokens == 0`, so `block_manager` is asked what the cache
+    can actually serve it. A waiter that already owns blocks -- an offload resume
+    or a parked partial prefill, and every request in the disaggregated
+    `PrefillScheduler`'s ready set -- instead uses its own computed-token count:
+    that KV is real whether or not it is reachable through the prefix index, so
+    probing would under-report it. Pass `block_manager=None` to skip the probe.
 
     Both tiers sort stably, so equal-cost requests keep arrival order and the
     policy degrades to FCFS on a uniform workload.
@@ -156,7 +166,11 @@ def shortest_first_key(seq: Sequence, max_skip_steps: int) -> tuple[int, int]:
     """
     if seq.is_preempted or 0 < max_skip_steps <= seq.num_skipped_steps:
         return (0, 0)
-    return (1, seq.num_tokens - seq.num_cached_tokens)
+    if block_manager is not None and not seq.block_table:
+        cached = block_manager.prefix_cached_tokens(seq)
+    else:
+        cached = seq.num_cached_tokens
+    return (1, seq.num_tokens - cached)
 
 
 class ScheduledBatch:
@@ -3077,28 +3091,29 @@ class Scheduler:
         """Order the waiting queue by remaining prefill work, cheapest first.
 
         The cost of a request is its uncached token count -- what prefill
-        actually still has to compute.
+        actually still has to compute, after prefix reuse. A fresh waiter has
+        `num_cached_tokens == 0` until it runs a chunk, so the key would read a
+        cache-hot 20k prompt as 20k of work; `prefix_cached_tokens` probes the
+        live cache read-only instead, under the same SWA/state-checkpoint gate
+        admission uses, so an unresumable prefix is not counted as free.
 
-        Note what that does NOT include today: the prefix-cache probe lives in
-        the admission loop (`can_allocate`, whose hit count lands in
-        `prefix_cache_hit_tokens`) and never writes `num_cached_tokens`, and
-        `deallocate` zeroes the field on preemption. So for a request that has
-        not yet run a prefill chunk this key equals the raw prompt length, and
-        a long-but-cache-hot prompt is ordered as if it were cold. Only
-        offload-resumed requests (`_resolve_waiting_remote_kv`) carry a
-        non-zero count into the waiting queue. Making the key cache-aware means
-        probing per waiting request per step -- a real cost that deserves its
-        own measurement, not a silent addition here.
+        Hits are re-probed every sort rather than memoised: an admission earlier
+        in the same pass can evict the blocks a later waiter matched.
+
+        The probe costs one chained-hash walk per fresh waiter per scheduling
+        pass. That is charged to `sjf` alone -- the early return below is what
+        keeps FCFS off this path entirely.
 
         The sort is stable, so requests of equal cost keep arrival order and
         the policy degrades to FCFS on a uniform workload.
         """
         if self.scheduling_policy != "sjf" or len(self.waiting) < 2:
             return
+        bm = self.block_manager
         self.waiting = deque(
             sorted(
                 self.waiting,
-                key=lambda seq: shortest_first_key(seq, self.sjf_max_skip_steps),
+                key=lambda seq: shortest_first_key(seq, self.sjf_max_skip_steps, bm),
             )
         )
 
