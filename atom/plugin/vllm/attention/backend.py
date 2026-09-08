@@ -530,16 +530,26 @@ class MiniMaxM3SparseAttentionBackend(_VllmAttentionBackendCompat):
         single-LHBNC tuple leaves an empty candidate list -> raise. ``LBHNC =
         (0,1,2,3,4)`` IS block-compact and still keeps the K/V slot axis outside
         N, so it survives both the resolve narrowing and validate_kv_cache_layout
-        while giving the page-16 shuffle two separable K/V regions. Publish LBHNC
-        first, LHBNC as a fallback for a vLLM carrying the single-uniform-group
-        exemption. Mirrors
-        vllm/models/minimax_m3/common/sparse_attention.py supported_kv_cache_layouts.
+        while giving the page-16 shuffle two separable K/V regions.
+
+        ``LHBNC`` leads anyway, for two reasons. It is what this layer's own
+        readers assume: ``_asm_kv_cache_5d`` re-inserts the folded head axis
+        with ``unsqueeze(3)`` so ``unbind(1)`` stays contiguous, and
+        ``num_phys16 = num_blocks * PAGES_PER_SPARSE_BLOCK`` counts one plane's
+        worth of pages per block -- both hold only for dense planes. And the
+        dense layers' backend leads with LHBNC too; a disagreement is
+        tie-broken by enum order in get_supported_kv_cache_layouts, which would
+        hand the whole model LBHNC and make the dense adapter refuse.
+
+        LBHNC trails as the layout a vLLM WITHOUT the single-uniform-group
+        exemption can still resolve, where the page-16 rebasing in
+        m3_dense_kv_layout has to make up the difference.
         """
         from vllm import envs
 
         if not bool(getattr(envs, "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT", False)):
             return None
-        return (KVCacheLayout.LBHNC, KVCacheLayout.LHBNC)
+        return (KVCacheLayout.LHBNC, KVCacheLayout.LBHNC)
 
     @staticmethod
     def get_supported_kernel_block_sizes():

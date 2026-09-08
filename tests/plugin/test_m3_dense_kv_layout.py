@@ -370,3 +370,67 @@ def test_as_atom_5d_refuses_a_mismatched_content_dim():
 
     with pytest.raises(ValueError, match="content dim"):
         as_atom_5d(_per_layer_view("LHBNC"), NUM_KV_HEADS, HEAD_SIZE * 2)
+
+
+# ── dense and sparse must not disagree about the layout ───────────────────
+
+
+def _resolve(published):
+    """vLLM's get_supported_kv_cache_layouts, reduced to its ordering rule.
+
+    Reimplemented rather than imported because the test suite has no vLLM. If
+    upstream changes the tie-break, this test stops matching reality -- which is
+    why it asserts the ordering rule itself, not just our own two tuples.
+    """
+    from collections import defaultdict
+
+    first = published[0]
+    if all(p == first for p in published[1:]):
+        return list(first)
+    priorities = defaultdict(int)
+    for preferred, *_ in published:
+        priorities[preferred] += 1
+    common = set.intersection(*map(set, published))
+    order = ["LBHNC", "LBNHC", "LHBNC", "BLHNC", "BLNHC", "BHLNC"]
+    return sorted(
+        (name for name in order if name in common),
+        key=lambda name: priorities[name],
+        reverse=True,
+    )
+
+
+def test_a_layout_disagreement_resolves_to_the_wrong_one():
+    """Why both M3 backends have to lead with the same layout.
+
+    One backend preferring LHBNC and the other LBHNC is a tie, and the tie-break
+    is enum order -- where LBHNC comes first. The model would then get the
+    packed layout while the dense adapter expects dense planes.
+    """
+    assert _resolve([("LHBNC", "LBHNC"), ("LBHNC", "LHBNC")])[0] == "LBHNC"
+
+
+def test_agreeing_backends_resolve_to_lhbnc():
+    assert _resolve([("LHBNC", "LBHNC"), ("LHBNC", "LBHNC")])[0] == "LHBNC"
+
+
+def test_both_m3_backends_lead_with_the_same_layout():
+    """The regression guard: read the preference out of the source rather than
+    importing the classes, which would need aiter."""
+    import re
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[2] / (
+        "atom/plugin/vllm/attention/backend.py"
+    )
+    preferences = re.findall(
+        r"return \(KVCacheLayout\.(\w+), KVCacheLayout\.(\w+)\)", source.read_text()
+    )
+
+    assert (
+        len(preferences) == 2
+    ), f"expected two published preferences, got {preferences}"
+    assert preferences[0] == preferences[1], (
+        f"M3's dense and sparse backends publish different layout orders: "
+        f"{preferences}. A disagreement is tie-broken by enum order to LBHNC."
+    )
+    assert preferences[0][0] == "LHBNC"
