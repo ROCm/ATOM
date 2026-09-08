@@ -50,10 +50,14 @@ OUT_DIR="perf-pair/${HALF}"
 mkdir -p "$OUT_DIR"
 
 if [ "$HALF" = "warmup" ]; then
-  # A tenth of the usual prompt count. atom_test.sh already honours this, and
-  # the caches are filled by compiling and tuning kernels, not by request
-  # volume -- whether that holds is exactly what this run is measuring.
-  export NUM_PROMPTS_OVERRIDE="${WARMUP_PROMPTS:-$CONC}"
+  # Same prompt count as the measurement. A tenth of it was tried first, on
+  # the theory that the caches are filled by compiling and tuning kernels
+  # rather than by request volume. That holds on MI308 (1.35% residual) and
+  # does not on MI355X, where run 34233036220 still showed +4.19/+5.65/+3.10%
+  # at c=64/128/256 across three machines. Launch and model load dominate a
+  # phase (~10.4 of 17.6 min at c=64), so matching the measurement costs about
+  # 14% of job wall clock rather than a whole extra phase.
+  export NUM_PROMPTS_OVERRIDE="${WARMUP_PROMPTS:-$(( CONC * 10 ))}"
   echo "warmup: NUM_PROMPTS_OVERRIDE=${NUM_PROMPTS_OVERRIDE} (results discarded)"
 fi
 

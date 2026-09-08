@@ -60,7 +60,13 @@ FAMILY_MEDIAN_PCT = -3.0  # family median throughput delta that trips the gate
 DOWN_EPS_PCT = -2.0  # a level counts as "down" past this
 TPOT_MIRROR_RATIO = 0.6  # |median TPOT delta / median tput delta| for mirroring
 NONMONOTONIC_MARGIN_PCT = 3.0  # interior level this far outside its neighbours
-MEASURED_RESIDUAL_BIAS_PCT = 1.35  # A/A residual after the warmup; see below
+# A/A residual after the warmup, measured on the platform this runs on.
+# MI308 gave 1.35% with a 1x-concurrency warmup; MI355X gave 4.19% under
+# the same warmup (run 34233036220: +4.19/+5.65/+3.10 at c=64/128/256, on
+# three separate machines, TPOT mirroring each one). The warmup now runs
+# the same prompt count as the measurement; update this to whatever that
+# leaves behind.
+MEASURED_RESIDUAL_BIAS_PCT = 4.19
 
 # --- Baseline sanity (crimson only) ----------------------------------------
 BASELINE_SANITY_PCT = -25.0  # base this far under main's recent median
@@ -809,16 +815,39 @@ def render(report, context):
     for family in report["families"]:
         lines += _entry_rows(family)
 
+    has_unjudged = any(
+        m["conc"] < JUDGE_MIN_CONC for f in report["families"] for m in f["members"]
+    )
+    legend = (
+        f"**Concurrency** is how many requests are in flight at once. Only "
+        f"levels at or above {JUDGE_MIN_CONC} decide the verdict."
+    )
+    # Only describe the marked rows when the run actually produced some.
+    # Explaining a marker that appears nowhere on the page sends the reader
+    # looking for something that is not there.
+    if has_unjudged:
+        legend += (
+            " The rows marked *(not judged)* were measured and are shown, but "
+            "excluded from every calculation: at low concurrency the numbers "
+            "swing enough to both invent regressions and hide real ones. They "
+            "are here because dropping them entirely would leave no way to "
+            "tell a small-batch problem from ordinary low-concurrency noise."
+        )
     lines += [
         "",
+        legend,
+        "",
+        # The paired measurement carries a systematic bias toward whichever
+        # half ran second, and it is large enough that a reader who takes a
+        # small positive number at face value will conclude the PR helped when
+        # nothing changed. Say so next to the table rather than only in the
+        # step summary, because the comment is what gets read.
         (
-            f"**Concurrency** is how many requests are in flight at once. Only "
-            f"levels at or above {JUDGE_MIN_CONC} decide the verdict. The rows "
-            f"marked *(not judged)* were measured and are shown, but excluded "
-            f"from every calculation: at low concurrency the numbers swing "
-            f"enough to both invent regressions and hide real ones. They are "
-            f"here because dropping them entirely would leave no way to tell a "
-            f"small-batch problem from ordinary low-concurrency noise."
+            f"> A residual bias of about {MEASURED_RESIDUAL_BIAS_PCT}% favours "
+            f"head even when both halves run identical code, so small positive "
+            f"numbers here mean *no change*, not an improvement. A drop trips "
+            f"at roughly {FAMILY_MEDIAN_PCT - MEASURED_RESIDUAL_BIAS_PCT:.2f}% "
+            f"rather than {FAMILY_MEDIAN_PCT}%."
         ),
         "",
     ]
