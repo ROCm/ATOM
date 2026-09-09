@@ -1583,10 +1583,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 n_expts_act = routing_data.n_expts_act
 
                 # Convert to triton routing data structures
-                num_tokens, n_expts_tot = router_logits.shape
+                _, n_expts_tot = router_logits.shape
 
                 if global_num_experts > 0:
-                _num_tokenss_tot = global_num_experts
+                    n_expts_tot = global_num_experts
 
                 # Both preps publish the same six names, so there is nothing to
                 # select here -- only which kernel consumes them.
