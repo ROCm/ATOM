@@ -27,7 +27,10 @@ All metrics to inspect the full set. Desktop charts use two columns:
   together, each divided by input tokens. The panel also shows estimated
   Reused / Input and LMCache / GPU tokens in the same window.
 - Uncached prompt tokens per request and actual prefill tokens per forward.
-- Decode context tokens: sum of logical sequence lengths per real batch.
+- Decode batch context tokens: sum of logical sequence lengths per real batch.
+- Decode request context tokens: one context-length sample per real request row
+  on every decode forward. Requests participating in more forwards contribute
+  more samples; this is not one observation per request lifetime.
 - Prefill and Decode GPU forward: per-worker device-event duration, including
   stream communication/waits; PP samples cover each local stage, not the full pipeline.
 

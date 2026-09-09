@@ -499,6 +499,11 @@ class _AtomMetricsCollector:
                 "atom:decode_context_tokens",
                 "Sum of logical decode sequence lengths per real forward, without padding or TP multiplication.",
             ),
+            (
+                "decode_request_context_tokens",
+                "atom:decode_request_context_tokens",
+                "Logical context length per real decode request row on each forward; request-forward weighted, without padding or TP multiplication.",
+            ),
         ):
             metric = HistogramMetricFamily(name, help_text, labels=labels)
             for rank in ranks:

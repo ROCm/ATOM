@@ -148,6 +148,21 @@ def test_grouped_queries_preserve_instances_and_weight_ratios():
     aggregate = report.query_for(panels["decode_gpu_forward"], "p99", 60)
     assert "sum by (le)" in aggregate and "instance" not in aggregate
     assert panels["decode_context_tokens"]["unit"] == "tokens"
+    assert panels["decode_context_tokens"]["title"] == "Decode batch context tokens"
+    request = panels["decode_request_context_tokens"]
+    assert request["title"] == "Decode request context tokens"
+    assert request["unit"] == "tokens" and request["category"] == "workload"
+    assert 'role="decode"' in request["selector"]
+    assert "sum by (instance, le)" in report.query_for(
+        request, "p99", 60, by_instance=True
+    )
+    assert "rate(atom:decode_request_context_tokens_sum" in report.query_for(
+        request, "mean", 60
+    )
+    standalone = {p["id"]: p for p in report.panels_for("standalone")}
+    assert (
+        'role="standalone"' in standalone["decode_request_context_tokens"]["selector"]
+    )
     assert panels["prefill_batch_tokens"]["metric"] == "atom:prefill_batch_tokens"
 
 

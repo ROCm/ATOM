@@ -91,6 +91,7 @@ class SchedulerMetrics:
         self.prefill_request_tokens = CumulativeHistogram(TOKEN_BUCKETS)
         self.prefill_batch_tokens = CumulativeHistogram(TOKEN_BUCKETS)
         self.decode_context_tokens = CumulativeHistogram(TOKEN_BUCKETS)
+        self.decode_request_context_tokens = CumulativeHistogram(TOKEN_BUCKETS)
         # Only in-flight external loads are retained; removed on every terminal
         # path, including abort and fallback. Sequence timing dies with the seq.
         self._loads: dict[str, tuple[object, float]] = {}
@@ -144,9 +145,12 @@ class SchedulerMetrics:
             self.decode_batch_size.observe(batch.total_seqs_num_decode)
             context_lens = getattr(batch, "context_lens", None)
             if context_lens is not None:
-                self.decode_context_tokens.observe(
-                    sum(int(n) for n in context_lens[: batch.total_seqs_num_decode])
-                )
+                total_context = 0
+                for length in context_lens[: batch.total_seqs_num_decode]:
+                    tokens = int(length)
+                    self.decode_request_context_tokens.observe(tokens)
+                    total_context += tokens
+                self.decode_context_tokens.observe(total_context)
         if getattr(batch, "total_seqs_num_prefill", 0) > 0:
             self.prefill_batch_tokens.observe(batch.total_tokens_num_prefill)
             # ScheduledBatch packs decode rows before prefill rows. Use its
@@ -168,4 +172,5 @@ class SchedulerMetrics:
             "prefill_request_tokens": self.prefill_request_tokens.snapshot(),
             "prefill_batch_tokens": self.prefill_batch_tokens.snapshot(),
             "decode_context_tokens": self.decode_context_tokens.snapshot(),
+            "decode_request_context_tokens": self.decode_request_context_tokens.snapshot(),
         }
