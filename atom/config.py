@@ -809,8 +809,7 @@ def _is_minimax_m3_config(hf_config: PretrainedConfig) -> bool:
             continue
         architectures = getattr(candidate, "architectures", None) or ()
         if any(
-            "minimax_m3" in str(arch).lower()
-            or "minimaxm3" in str(arch).lower()
+            "minimax_m3" in str(arch).lower() or "minimaxm3" in str(arch).lower()
             for arch in architectures
         ):
             return True
