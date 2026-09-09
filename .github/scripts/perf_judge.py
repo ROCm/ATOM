@@ -884,6 +884,42 @@ def render(report, context):
         "",
     ]
 
+    status = report.get("history_status")
+    if status in ("unavailable", "unmatched"):
+        why = (
+            "could not be read"
+            if status == "unavailable"
+            else (
+                "was read but matched none of the configurations measured here, "
+                "which is what a renamed model or a changed dashboard format "
+                "looks like"
+            )
+        )
+        lines += [
+            "> [!WARNING]",
+            f"> **The baseline check did not run.** The nightly history {why}.",
+            (
+                "> Without it there is nothing confirming the base measurement "
+                "is at main's usual level, and a base that is itself broken "
+                "produces a delta near zero -- the one shape where a green "
+                "verdict is exactly wrong. The paired numbers above stand; the "
+                "verdict is held at `partial` rather than `clean` because of "
+                "this."
+            ),
+            "",
+        ]
+    elif status == "ok":
+        lines += [
+            (
+                "Baseline checked against nightly history for "
+                "{} of {} judged configurations.".format(
+                    report.get("history_matched", 0),
+                    len(report.get("families", [])) * 3,
+                )
+            ),
+            "",
+        ]
+
     # --- baseline sanity: loudest thing on the page when it fires ----------
     for family in report["families"]:
         flags = family.get("baseline_sanity") or []
@@ -977,12 +1013,25 @@ def render(report, context):
         "bad_baseline",
     ):
         thresholds = report["thresholds"]
-        lines.append(
-            f"No judged entry tripped (family median <= "
-            f"{thresholds['family_median_pct']}% and >= "
-            f"{thresholds['family_min_down']} judging levels down and TPOT "
-            f"mirroring)."
-        )
+        # `bad_baseline` outranks `regression` in the ladder, so a run can carry
+        # tripped entries and still land here. Saying nothing tripped in that
+        # case contradicts the table directly above and reads as reassurance.
+        tripped = [f for f in report["families"] if f["status"] == "triggered"]
+        if tripped:
+            names = ", ".join(f["model"] for f in tripped)
+            lines.append(
+                f"{names} tripped the criterion, but the verdict above takes "
+                "precedence: the comparison it rests on cannot be trusted "
+                "yet."
+            )
+        else:
+            lines.append(
+                "No judged entry tripped (family median <= {}% and >= {} "
+                "judging levels down, with TPOT or TTFT confirming).".format(
+                    thresholds["family_median_pct"],
+                    thresholds["family_min_down"],
+                )
+            )
         if report["verdict"] == "untrustworthy":
             lines.append(
                 f"The base commit was measured twice, before and after head, and "
@@ -1206,12 +1255,44 @@ def main():
         history_series, history_cv = load_history(args.history)
     else:
         history_series, history_cv = {}, {}
+
+    # The baseline check is the one thing that catches a base measurement which
+    # is itself broken -- the shape where the paired delta is zero and a green
+    # verdict is exactly wrong. If it cannot run, that must change the verdict,
+    # not just go unmentioned: a check that goes quiet when it breaks is worse
+    # than no check, because the report looks identical either way.
+    # Judged configurations only. Counting the reference levels too produced
+    # "25 of 15", which is worse than saying nothing.
+    measured = {
+        (p["model"], p["isl_osl"], p["conc"])
+        for p in pairs
+        if p["conc"] >= JUDGE_MIN_CONC
+    }
+    if not args.history:
+        # Explicitly opted out (local A/A runs). Not a degradation.
+        history_status = "disabled"
+    elif not history_cv:
+        history_status = "unavailable"
+    elif not (measured & set(history_cv)):
+        # Loaded, but nothing in it lines up with what was measured. This is
+        # what a renamed model or a changed dashboard format looks like, and
+        # it is indistinguishable from a working check unless it is said.
+        history_status = "unmatched"
+    else:
+        history_status = "ok"
+
     models = {p["model"] for p in pairs}
     drift = main_drift(history_series, models) if history_series else []
     report = judge(pairs, history_cv, expected_entries=args.expect_entries, drift=drift)
     report["context"] = args.context
     report["n_pairs"] = len(pairs)
     report["history_configs"] = len(history_cv)
+    report["history_status"] = history_status
+    report["history_matched"] = len(measured & set(history_cv))
+
+    if history_status in ("unavailable", "unmatched") and report["verdict"] == "clean":
+        report["verdict"] = "partial"
+        report["history_downgraded"] = True
 
     print(render_summary(report, args.context))
 
