@@ -10,7 +10,7 @@ import os
 import time
 from contextlib import contextmanager, nullcontext
 from functools import partial
-from typing import Any, NamedTuple
+from typing import Any, ClassVar, NamedTuple
 
 import numpy as np
 import torch
@@ -54,7 +54,8 @@ from atom.model_engine.sequence import (
 )
 from atom.model_engine.state_runtime import StateRuntime
 from atom.model_loader.loader import load_model
-from atom.model_ops.attentions.sub_pool_spec import (
+from atom.model_ops.attentions.pool_layout.entry_arena import plan_regions
+from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
     InsufficientPoolBudget,
     Pool,
     PoolPlan,
@@ -71,7 +72,6 @@ from atom.model_ops.eplb import (
 )
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
-from atom.models.utils import get_pp_indices
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.factory import build_drafter
 from atom.utils import (
@@ -94,7 +94,7 @@ from atom.utils.forward_context import (
     set_kv_cache_data,
 )
 from atom.utils.gc_utils import freeze_gc_heap
-from atom.utils.selector import get_attn_backend
+from atom.utils.selector import attn_family, get_attn_backend, has_mla_indexer
 from atom.utils.tbo import (
     UBatchSlice,
     UBatchWrapper,
@@ -130,6 +130,9 @@ support_model_arch_dict = {
     "MistralForCausalLM": "atom.models.mistral3.Mistral3ForCausalLM",
     "MiniMaxM3SparseForCausalLM": "atom.models.minimax_m3.MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration": "atom.models.minimax_m3.MiniMaxM3SparseForConditionalGeneration",
+    "Glm5NextForConditionalGeneration": (
+        "atom.models.glm5_next.Glm5NextForConditionalGeneration"
+    ),
 }
 # seed = 34567
 # np.random.seed(seed)
@@ -190,14 +193,9 @@ class tokenIDProcessor:
         self.input_ids = CpuGpuBuffer(
             max_num_batched_tokens + 1, dtype=torch.int32, device=device
         )
-        # One per request, not per token: `decode_cu` is the exclusive prefix
-        # sum of this step's per-request token counts and `decode_src` says
-        # where each request's anchor comes from. Sized by tokens because that
-        # is the bound this class is handed; a batch can never hold more
-        # requests than tokens.
-        self.decode_cu = CpuGpuBuffer(
-            max_num_batched_tokens + 1, dtype=torch.int32, device=device
-        )
+        # One per request, not per token: where each request's anchor comes
+        # from. Sized by tokens -- a batch can never hold more requests. The
+        # matching prefix sum is `forward_vars["cu_seqlens_q"]`.
         self.decode_src = CpuGpuBuffer(
             max_num_batched_tokens, dtype=torch.int32, device=device
         )
@@ -493,15 +491,9 @@ class tokenIDProcessor:
                 total_tokens_prefill : total_tokens_prefill + total_tokens_decode
             ]
             if self.use_spec:
-                if (
-                    getattr(batch, "dynamic_spec_query_tokens_per_req", None)
-                    is not None
-                ):
-                    # RAGGED: scheduled_tokens is already the flat [anchor, drafts...]
-                    # so no rectangular reshape/overwrite is needed.
-                    pass
-                else:
-                    token_ids[:, 1:] = batch.scheduled_spec_decode_tokens
+                # Reached only under pipeline parallel, which no spec path
+                # supports yet; wants the deferred branch's per-request staging.
+                raise NotImplementedError("pipeline parallel + speculative decode")
 
             self.input_ids.np[:total_tokens_decode] = token_ids
             return self.input_ids.copy_to_gpu(total_tokens_decode)
@@ -523,12 +515,8 @@ class tokenIDProcessor:
         num_deferred_seqs = len(deferred_curr_indices)
         num_new_seqs = len(new_curr_indices)
 
-        # `max_seqlen_q` is the single source of truth for the uniform
-        # case (= mtp_k+1 for plain MTP, or the DSpark q-bucket when shrunk this
-        # step); `dynamic_spec_query_tokens_per_req` overrides it per request
-        # when DSpark runs ragged. See `ForwardMode.max_seqlen_q`, which the
-        # step settles and the batch no longer carries.
-        _per_req = getattr(batch, "dynamic_spec_query_tokens_per_req", None)
+        # The GRAPH's row stride, for sizing the padded tail only. NOT a
+        # per-request length: dp>1 raises it to the DP-wide maximum.
         tokens_per_seq = max_seqlen_q if self.use_spec else 1
 
         # Receive and map bonus_list to current batch order
@@ -545,42 +533,42 @@ class tokenIDProcessor:
             ]
 
         # ---- One path for every decode step -------------------------------
-        # DSpark's ragged buckets give each request its own length; everything
-        # else gives them all `tokens_per_seq`. Both are just `lens`.
-        ragged_lens = _per_req
-        # `lens` is the only statement of how many tokens each request gets:
-        # per-request under DSpark's ragged buckets, uniform `tokens_per_seq`
-        # otherwise. Everything below addresses through its prefix sum, so a
-        # ragged step and a rectangular one run the same code.
-        lens = (
-            np.asarray(ragged_lens, dtype=np.int32)
-            if ragged_lens is not None
-            else np.full(len(batch.req_ids), tokens_per_seq, dtype=np.int32)
-        )
-        bs = lens.shape[0]
-        cu_np = self.decode_cu.np[: bs + 1]
-        cu_np[0] = 0
-        np.cumsum(lens, out=cu_np[1:])
-        total = int(cu_np[bs])
+        # `num_scheduled_tokens` is the one statement of the per-request
+        # lengths -- the ragged shrink rewrites it in place, so ragged and
+        # rectangular are the same array. Its prefix sum is `cu_seqlens_q`,
+        # already published; a second copy is what let the two disagree under DP.
+        bs, lens, cu_np = self.runner.attn_metadata_builder.decode_spans(batch)
 
         # Stage the scheduler's ids over the whole region. For a request the
         # scheduler just admitted this is already its real anchor (and drafts);
         # for a carried-over one it is a placeholder the kernel overwrites.
-        self.input_ids.np[:total] = scheduled_tokens[
-            total_tokens_prefill : total_tokens_prefill + total
+        self.input_ids.np[:total_tokens_decode] = scheduled_tokens[
+            total_tokens_prefill : total_tokens_prefill + total_tokens_decode
         ]
-        if self.use_spec and ragged_lens is None and num_new_seqs > 0:
-            self.input_ids.np[:total].reshape(bs, tokens_per_seq)[
-                new_curr_indices, 1:
-            ] = batch.scheduled_spec_decode_tokens[new_curr_indices]
-        self.input_ids.copy_to_gpu(total)
+        # A newly admitted request has no row in `prev_token_ids`, so
+        # `fill_deferred_decode_ids` skips it (`src < 0`) and its draft columns
+        # must be staged here -- `scheduled_tokens` gave it committed history,
+        # correct only at column 0.
+        #
+        # Looped, not scattered: measured, the loop wins below ~24 admissions
+        # per step (1.2us at 2) and a ragged scatter is a flat ~8us; above it
+        # the scatter wins (12us vs 88us at bs=256). Swap if admissions stop
+        # being few.
+        if self.use_spec and num_new_seqs > 0:
+            spec = batch.scheduled_spec_decode_tokens
+            for i in new_curr_indices:
+                n_draft = int(lens[i]) - 1
+                if n_draft > 0:
+                    s = int(cu_np[i]) + 1
+                    self.input_ids.np[s : s + n_draft] = spec[i, :n_draft]
+        self.input_ids.copy_to_gpu(total_tokens_decode)
 
         src_np = self.decode_src.np[:bs]
         src_np.fill(NEW_SEQUENCE)
         src_np[deferred_curr_indices] = deferred_prev_indices
         fill_deferred_decode_ids(
             self.input_ids.gpu,
-            self.decode_cu.copy_to_gpu(bs + 1),
+            self.runner.forward_vars["cu_seqlens_q"].gpu[: bs + 1],
             self.decode_src.copy_to_gpu(bs),
             self.prev_token_ids,
             self.draft_token_ids if self.pre_num_decode_token_per_seq > 1 else None,
@@ -588,23 +576,23 @@ class tokenIDProcessor:
         )
 
         # CUDAGraph tail padding. A replayed decode graph reads a fixed
-        # `running_bs * tokens_per_seq` tokens out of this buffer, but a
-        # step writes only the `total` it scheduled, and `bs` sits between two
+        # `running_bs * tokens_per_seq` tokens out of this buffer, but a step
+        # writes only what it scheduled, and `bs` sits between two
         # captured buckets on most steps -- a 65-request batch replays the 128
         # graph, so 63 requests' worth of slots are never written. Nobody else
         # fills them: `run_model` pads `cu_seqlens_q` so the padded sequences are
         # empty for attention, but the ids stay whatever the previous forward
         # left, and the MoE path does consume padded rows. Zero is a legal vocab
         # id, so the embedding gather stays in bounds either way.
-        fill_to = total
+        fill_to = total_tokens_decode
         if not self.runner.enforce_eager:
             gbs = next(
                 (g for g in reversed(self.runner.capture_sizes) if g >= bs), None
             )
             if gbs is not None:
                 fill_to = max(fill_to, int(gbs) * tokens_per_seq)
-        if fill_to > total:
-            self.input_ids.gpu[total:fill_to].zero_()
+        if fill_to > total_tokens_decode:
+            self.input_ids.gpu[total_tokens_decode:fill_to].zero_()
 
         input_ids = self.input_ids.gpu[:total_tokens]
         return input_ids
@@ -656,16 +644,14 @@ class ModelRunner:
             torch.float16,
         ]:
             os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
-        self.use_mla = self.is_deepseek_mla()
-        self.use_gdn = self.is_qwen_next()
-        self.use_v4 = self.is_deepseek_v4()
-        self.use_kimi_mla = self.is_kimi_linear()
+        # Which attention this model's config asks for. The runner holds the
+        # answer, not the question: what makes a model MLA or a hybrid is the
+        # selector's to know, and it is asked the same way of a draft.
+        self.attn_family = attn_family(self.hf_text_config)
 
         rope_parameters = getattr(self.hf_text_config, "rope_parameters", None) or {}
         self.use_mrope = "mrope_section" in rope_parameters
-        self.is_deepseek_v32 = (
-            hasattr(hf_config, "index_topk") if self.use_mla else False
-        )
+        self.has_mla_indexer = has_mla_indexer(self.hf_text_config)
         # Initialize profiler for this rank (before _setup_device_and_distributed
         # so that dp config fields are still at their original values)
         self.profiler = None
@@ -702,13 +688,7 @@ class ModelRunner:
         default_dtype = self.config.torch_dtype
         torch.set_default_dtype(default_dtype)
         torch.set_default_device(self.device)
-        self.attn_backend = get_attn_backend(
-            self.block_size,
-            use_mla=self.use_mla,
-            use_gdn=self.use_gdn,
-            use_v4=self.use_v4,
-            use_kimi_mla=self.use_kimi_mla,
-        )
+        self.attn_backend = get_attn_backend(self.attn_family)
         use_spec = bool(self.config.speculative_config) and get_pp_group().is_last_rank
         self.num_spec_tokens = (
             self.config.speculative_config.num_speculative_tokens if use_spec else 0
@@ -780,7 +760,6 @@ class ModelRunner:
         self.attn_metadata_builder = self.attn_backend.get_builder_cls()(
             model_runner=self
         )
-        self.physical_block_size = self.attn_metadata_builder.block_size
         # Sub-pool sizing needs a memory profile, so it cannot run until after
         # warmup. Install the empty plan now: `warmup_model` below drives the
         # builder through paths that ask for their entry counts, and those must
@@ -794,7 +773,7 @@ class ModelRunner:
         # never assign them a slot, and the builder will silently read
         # tensor[-1] on first decode. Catch the misconfiguration up front
         # rather than producing wrong outputs at inference time.
-        if self._has_state_pool():
+        if self._state_pool_names():
             from atom.model_engine.llm_engine import InputOutputProcessor as _IOProc
 
             mt = self.config.hf_config.model_type
@@ -870,66 +849,6 @@ class ModelRunner:
         base overhead. Base runner reserves nothing; override point for
         setups that share the GPU with another process."""
         return 0
-
-    def is_deepseek_mla(self) -> bool:
-        if not hasattr(self.hf_text_config, "model_type"):
-            return False
-        elif self.hf_text_config.model_type in (
-            "deepseek_v2",
-            "deepseek_v3",
-            "deepseek_v32",
-            "deepseek_mtp",
-            "glm_moe_dsa",
-            "kimi_k2",
-        ):
-            return self.hf_text_config.kv_lora_rank is not None
-        elif self.hf_text_config.model_type == "eagle":
-            # if the model is an EAGLE module, check for the
-            # underlying architecture
-            return (
-                self.hf_text_config.model.model_type in ("deepseek_v2", "deepseek_v3")
-                and self.hf_text_config.kv_lora_rank is not None
-            )
-        return False
-
-    def is_qwen_next(self) -> bool:
-        if not hasattr(self.hf_text_config, "model_type"):
-            return False
-        elif self.hf_text_config.model_type in (
-            "qwen3_next",
-            "qwen3_next_mtp",
-            "qwen3_5_text",
-            "qwen3_5_moe_text",
-        ):
-            return True
-        return False
-
-    def is_kimi_linear(self) -> bool:
-        return getattr(self.hf_text_config, "model_type", None) == "kimi_linear"
-
-    def is_deepseek_v4(self) -> bool:
-        # NOTE: `hf_text_config.model_type` reads "deepseek_v3" for V4 because
-        # `_CONFIG_REGISTRY` maps deepseek_v4 → deepseek_v3 (V4 reuses V3 schema).
-        # Use `architectures` (preserved by get_hf_config:567) instead. Covers
-        # both target (DeepseekV4ForCausalLM[NextN]) and draft (whose model_type
-        # SpeculativeConfig stamps as deepseek_v4_mtp).
-        arches = getattr(self.hf_text_config, "architectures", None) or []
-        if any("DeepseekV4" in str(a) for a in arches):
-            return True
-        return getattr(self.hf_text_config, "model_type", None) in (
-            "deepseek_v4",
-            "deepseek_v4_mtp",
-        )
-
-    def is_mimo_v2(self) -> bool:
-        if not hasattr(self.hf_text_config, "model_type"):
-            return False
-        elif self.hf_text_config.model_type in (
-            "mimo_v2",
-            "mimo_v2_flash",
-        ):
-            return True
-        return False
 
     def _setup_device_and_distributed(self, rank: int, config: Config):
         # Calculate local device rank considering DP, PP and PCP.
@@ -1041,6 +960,15 @@ class ModelRunner:
         if not self.still_running:
             return
         self.still_running = False
+        # 0. Join any offload connector's copy threads. Its ThreadPoolExecutors
+        #    are non-daemon, so leaving them running wedges interpreter shutdown
+        #    or races an in-flight copy against atexit. Must run BEFORE the KV
+        #    pool it copies out of is dropped and before the dist env goes away.
+        #    Guarded: only offload workers define close() (moriio etc. do not).
+        connector = get_kvconnector()
+        close = getattr(connector, "close", None) if connector is not None else None
+        if callable(close):
+            close()
         # 1. Destroy distributed env (NCCL + CustomAllreduce + process groups)
         #    Must happen while ops module is still alive for CustomAllreduce cleanup.
         destroy_dist_env()
@@ -1049,13 +977,13 @@ class ModelRunner:
             self.graphs = self.graph_pool = None  # type: ignore
         if isinstance(self.model, UBatchWrapper):
             self.model.tbo_graphs.clear()
-        # 3. Release GPU tensors
+        # 3. Release GPU tensors. `kv_cache` is the whole paged pool -- the
+        # scales and any indexer cache are regions of it, not attributes.
         for attr in (
             "kv_cache",
-            "kv_scale",
-            "index_cache",
             "mamba_k_cache",
             "mamba_v_cache",
+            "kpool_tail_cache",
         ):
             if hasattr(self, attr):
                 delattr(self, attr)
@@ -1086,9 +1014,8 @@ class ModelRunner:
                     c if c.isalnum() or c in ("_", "-", ".") else "_"
                     for c in trace_name
                 )
-            if worker_name == "capture_graph":
-                if safe_model_name:
-                    worker_name = f"{worker_name}_{safe_model_name}"
+            if worker_name == "capture_graph" and safe_model_name:
+                worker_name = f"{worker_name}_{safe_model_name}"
             output_prefix = os.path.join(self.profiler_dir, worker_name)
 
             def _on_trace_ready(prof):
@@ -1323,15 +1250,6 @@ class ModelRunner:
             self.forward_vars["num_accepted_tokens"] = CpuGpuBuffer(
                 self.max_bs, **i32_kwargs
             )
-            if self.config.dspark.ragged and self.drafter.uses_confidence_schedule:
-                # Pinned staging for the ragged H2D transfers (pageable would
-                # sync). Separate slots: the two are live at once within a step.
-                self.forward_vars["ragged_lens"] = CpuGpuBuffer(
-                    self.max_bs, **i32_kwargs
-                )
-                self.forward_vars["ragged_extend"] = CpuGpuBuffer(
-                    self.max_bs, **i32_kwargs
-                )
             # Per in-flight slot via forward_vars; PP ring clones it.
             self.forward_vars["draft_next_tokens"] = CpuGpuBuffer(
                 self.max_bs, **i32_kwargs
@@ -1418,9 +1336,9 @@ class ModelRunner:
         by accident, since `postprocess` synchronizes to read the sampled ids,
         but a chunked prefill's middle chunk returns before `postprocess` and
         closes nothing. Measured: the host reached 4042 packets ahead and the
-        GPU read a `batch_id_per_token` from a later batch (id 3 in a `bs=2`
+        GPU read a `batch_id_per_q_token` from a later batch (id 3 in a `bs=2`
         batch), tripping the bounds assert in
-        `cu_committed_gpu[batch_id_per_token]` -- which wedges the queue with
+        `cu_committed_gpu[batch_id_per_q_token]` -- which wedges the queue with
         no fault line and no traceback.
 
         One buffer admits one forward of lead, so the gate is depth-1. Decode
@@ -1476,74 +1394,43 @@ class ModelRunner:
             (3, num_tokens), (num_tokens, 1)
         )
 
-    def _num_draft_kv_layers(self) -> int:
-        """How many KV cache slots the draft model needs, one per draft layer.
+    def draft_shares_kv_pool(self) -> bool:
+        """Whether a draft's attention layers land in the target's pools.
 
-        A draft with a REAL layer stack — the Eagle3 drafts and the standalone
-        DSpark drafts — runs every one of its layers on every drafting step, so
-        each needs its own slot. Serial MTP instead reuses one layer `mtp_k`
-        times and declares how many it has in `num_nextn_predict_layers`.
-
-        Single source of truth on purpose: this count drives both the pool
-        sizing (`_get_total_num_layers` -> the builders' `sub_pool_specs`) and
-        the allocation itself. Two independent spellings of it silently
-        disagreed for the standalone DSpark draft, sizing 1 slot while
-        allocating 5.
+        A draft whose flavor asked for a pool of its own has a
+        `draft_kv_builder` and is priced and bound through that instead. One
+        spelling, because the layer count and the walk that fills those layers
+        have to answer this the same way.
         """
-        spec_config = self.config.speculative_config
-        draft_hf = spec_config.draft_model_hf_config
-        has_real_stack = (
-            hasattr(self, "eagle3_draft_builder")
-            or getattr(spec_config, "use_dspark_with_draft", lambda: False)()
-        )
-        if has_real_stack:
-            return draft_hf.num_hidden_layers
-        return getattr(draft_hf, "num_nextn_predict_layers", 1)
-
-    def _get_total_num_layers(self):
-        """Return total layer count including draft (MTP) layers.
-
-        Drafts that own an independent KV cache via their own builder
-        (e.g. Eagle3 MHA draft on an MLA target) account for their layers
-        through that builder, so they are NOT added here. Only drafts that
-        share the target's KV pool contribute.
-        """
-        num_hidden = self.config.hf_config.num_hidden_layers
-        pp_group = get_pp_group()
-        if pp_group.world_size > 1:
-            start, end = get_pp_indices(
-                num_hidden, pp_group.rank_in_group, pp_group.world_size
-            )
-            total = end - start
-        else:
-            total = num_hidden
-        if (
+        return bool(
             self.config.speculative_config
             and hasattr(self, "drafter")
-            and not hasattr(self, "eagle3_draft_builder")
-        ):
-            total += self._num_draft_kv_layers()
-        return total
+            and not hasattr(self, "draft_kv_builder")
+        )
 
     def _sub_pool_specs(self) -> list[SubPoolSpec]:
         """Cache-class declarations from every builder attached to this runner.
 
-        The target builder always, plus an optional `eagle3_draft_builder`
-        when a heterogeneous spec-decode draft owns its own KV. Each builder
-        knows its own tensor layout (MLA 576-dim packed, GDN-hybrid
-        full-attn-only, MiMo-V2 per-layer-type, standard MHA split-K/V,
-        Eagle3 independent MHA); the runner only sums bytes. Specs sharing a
-        name merge in `plan_pools`, which is how the draft KV joins the
-        target's block ids instead of forming a second pool.
+        The target builder always, plus an optional `draft_kv_builder` when a
+        spec-decode draft owns its own KV. Each builder knows its own tensor
+        layout (MLA 576-dim packed, GDN-hybrid full-attn-only, MiMo-V2
+        per-layer-type, standard MHA split-K/V); the runner only sums bytes.
+        Specs sharing a name merge in `plan_pools`, which is how the draft KV
+        joins the target's block ids instead of forming a second pool.
         """
         specs = list(self.attn_metadata_builder.sub_pool_specs())
-        if hasattr(self, "eagle3_draft_builder"):
-            specs += self.eagle3_draft_builder.sub_pool_specs()
+        if hasattr(self, "draft_kv_builder"):
+            specs += self.draft_kv_builder.sub_pool_specs()
         return specs
 
-    def _has_state_pool(self) -> bool:
-        """Whether any attached builder declares a per-request STATE class."""
-        return any(s.pool is Pool.STATE for s in self._sub_pool_specs())
+    def _state_pool_names(self) -> list[str]:
+        """The per-request STATE classes the attached builders declare.
+
+        Named rather than counted because both callers want to say which: one
+        refuses a model whose `model_type` is missing from the per-req-cache
+        set, the other refuses P/D for it.
+        """
+        return [s.name for s in self._sub_pool_specs() if s.pool is Pool.STATE]
 
     def _estimate_cudagraph_overhead(self):
         """Estimate GPU memory consumed by CUDA graph capture.
@@ -1685,7 +1572,7 @@ class ModelRunner:
         specs = self._sub_pool_specs()
 
         # Sub-pool sizing is pure arithmetic over the byte budget — see
-        # atom/model_ops/attentions/sub_pool_spec.py. STATE classes (GDN
+        # atom/model_ops/attentions/pool_layout/sub_pool_spec.py. STATE classes (GDN
         # recurrent state, the V4 compressor ring, the V4 sliding window) take
         # their floor first because a request cannot run without them; the
         # PAGE class absorbs the rest. Which classes exist, and what they are
@@ -1873,15 +1760,89 @@ class ModelRunner:
             "state_runtime": state_runtime.to_wire(),
         }
 
+    def _carve_paged_pool(self, blocks: int, buf=None):
+        """One allocation for every paged pool, and each builder's region of it.
+
+        The target's KV, its scales, whatever indexer cache rides along and a
+        draft's sibling pool were up to five allocations under five names. One
+        buffer here, for the reason the declarations were collapsed: a block's
+        bytes are one fact, and every name it is stored under is a place the
+        next reader can disagree with it. `kv_cache` is what is left, which is
+        what the IPC export ships and the sleep path frees.
+
+        Returns `(buffer, regions, builders)`, positionally aligned. `buf` is
+        the imported pool on the P/D decode side; that side carves with the
+        same walk rather than being told the offsets, so the two cannot drift.
+        A builder that allocates its own answers zero and gets an empty region.
+        """
+        builders = [self.attn_metadata_builder]
+        if hasattr(self, "draft_kv_builder"):
+            builders.append(self.draft_kv_builder)
+        # Before pricing, not between pricing and filling: the price below
+        # comes from the walk.
+        for builder in builders:
+            builder.invalidate_pool_rows()
+        sizes = [b.paged_pool_bytes(blocks) for b in builders]
+        # A builder either allocates its own pool or takes exactly what its own
+        # PAGE spec was charged -- nothing between. It catches the two hooks
+        # disagreeing (separate overrides; a field added to one), not a stale
+        # walk, which both readings share. A startup check and not a unit test
+        # because what it catches surfaces while serving, never as a bad number
+        # here.
+        for builder, size in zip(builders, sizes):
+            if not size:
+                continue
+            charged = blocks * sum(
+                s.entry_bytes for s in builder.sub_pool_specs() if s.pool is Pool.PAGE
+            )
+            if size != charged:
+                raise ValueError(
+                    f"{type(builder).__name__} wants {size} B of the paged pool "
+                    f"at {blocks} blocks but was charged {charged} B"
+                )
+        offsets, total = plan_regions(sizes)
+        if buf is None:
+            buf = torch.zeros(total, dtype=torch.uint8, device=self.device)
+        elif buf.numel() < total:
+            raise ValueError(
+                f"the imported paged pool holds {buf.numel()} B but this side's "
+                f"declarations want {total} B at {blocks} blocks"
+            )
+        regions = [buf[o : o + n] for o, n in zip(offsets, sizes)]
+        return buf, regions, builders
+
+    def _back_paged_pools(self, blocks: int, buf=None):
+        """Back every builder's paged pool and publish what comes back.
+
+        The one place, because there are two callers: this side allocates the
+        buffer and the decode side of a P/D pair imports it. What the hook
+        returns -- the aligned indexer dimension, the compact layer maps,
+        GLM-5.3's k-pool tail -- has to reach its readers as a runner attribute
+        on both, and a path that only backed the pool leaves the other half
+        dereferencing attributes nobody set.
+        """
+        pool, regions, builders = self._carve_paged_pool(blocks, buf=buf)
+        for builder, region in zip(builders, regions):
+            for name, value in builder.allocate_kv_cache_tensors(
+                blocks=blocks, buf=region
+            ).items():
+                setattr(self, name, value)
+            logger.info(
+                "%s caches %s",
+                type(builder).__name__,
+                ", ".join(
+                    f"{n} {kind} rows" for kind, n in builder.row_counts().items()
+                )
+                or "nothing",
+            )
+        return pool
+
     def allocate_kv_cache(self, num_kvcache_blocks):
         pre_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
 
         config = self.config
         config.num_kvcache_blocks = num_kvcache_blocks
         hf_config = config.hf_config
-        self.num_physical_kvcache_blocks = (
-            num_kvcache_blocks * self.attn_metadata_builder.block_ratio
-        )
         if hf_config.num_key_value_heads >= self.world_size:
             assert hf_config.num_key_value_heads % self.world_size == 0
             num_kv_heads = hf_config.num_key_value_heads // self.world_size
@@ -1893,45 +1854,17 @@ class ModelRunner:
         self.num_kv_heads = num_kv_heads
         self.aligned_index_dim = None  # set below for DeepSeek-V3.2
 
-        # Total layer count (target + any draft sharing the target's pool).
-        total_num_layers = self._get_total_num_layers()
-        num_draft_layers = 0
-        if self.config.speculative_config and hasattr(self, "drafter"):
-            owns_pool = hasattr(self, "eagle3_draft_builder")
-            num_draft_layers = self._num_draft_kv_layers()
-            logger.info(
-                f"Allocating KV cache for {hf_config.num_hidden_layers} target "
-                f"layers + {num_draft_layers} draft layers"
-                + (
-                    " (separate sibling pool)"
-                    if owns_pool
-                    else f" = {total_num_layers} total layers"
-                )
-            )
-
-        # Primary KV cache allocation (model-agnostic, delegated to the
-        # attention builder). Each builder owns its tensor layout: MLA →
-        # single 576-dim per layer; GDN-hybrid → only num_full_attn rows;
-        # MiMo-V2 → defer per-module; standard MHA → split-K/V `[2, L, ...]`.
-        # Returned tensors are setattr'd on `self` under their conventional
-        # names (kv_cache, kv_scale, index_cache, aligned_index_dim,
-        # _kv_layer_cache_store) so binding code and downstream consumers
-        # find them where they expect.
-        main_kv = self.attn_metadata_builder.allocate_kv_cache_tensors(
-            num_kv_heads, num_draft_layers
-        )
-        for name, value in main_kv.items():
-            setattr(self, name, value)
-
-        # Heterogeneous draft (e.g. Eagle3 MHA alongside an MLA target) owns
-        # its own KV pool through a sibling builder; same protocol as above,
-        # tensors land under namespaced keys (eagle3_kv_cache, eagle3_kv_scale).
-        if hasattr(self, "eagle3_draft_builder"):
-            draft_kv = self.eagle3_draft_builder.allocate_kv_cache_tensors(
-                num_kv_heads, num_draft_layers
-            )
-            for name, value in draft_kv.items():
-                setattr(self, name, value)
+        # Primary KV cache allocation: one buffer, one region per builder, each
+        # owning the layout inside its own. A draft that cannot share the
+        # target's pool is simply the next region -- no second allocation, and
+        # nothing that asks whether its attention matches the target's.
+        #
+        # What comes back is only what a region cannot carry: scalars like
+        # `aligned_index_dim` and the compact layer maps, setattr'd here so
+        # their readers find them where they always have.
+        pool = self._back_paged_pools(num_kvcache_blocks)
+        if pool.numel():
+            self.kv_cache = pool
 
         # Per-request cache allocation (model-agnostic, delegated to the
         # attention metadata builder). For GDN this returns
@@ -1958,80 +1891,55 @@ class ModelRunner:
         if self.config.speculative_config and hasattr(self, "drafter"):
             models_to_bind.append(("draft", self.drafter.model))
 
-        kv_cache_tensors = []
-        # Key by the module's global layer_num (what it looks up at forward time),
-        # not the local bind counter — under PP a stage's layer_num is offset.
-        kv_cache_keys = []
-        layer_id = 0
-        # Promote to self so the attention builder's build_kv_cache_tensor()
-        # can access it without recomputing from drafter state. Heterogeneous
-        # drafts (Eagle3 MHA) own their own layer space via their builder.
-        # Eagle3 MLA drafts (K2.6) share the target's MLA pool but still
-        # appear as one extra layer at index num_hidden_layers.
-        #
-        # Only serial-MTP draft models carry `.model.mtp_start_layer_idx`; the
-        # eagle3 and standalone-DSpark drafts do not, and both simply start
-        # right after the target's last layer. Probe for the attribute instead
-        # of enumerating the flavors that lack it — the previous
-        # `not is_eagle3` spelling silently grew wrong the moment a third
-        # standalone flavor appeared.
-        drafter_model = getattr(getattr(self, "drafter", None), "model", None)
-        self.mtp_start_layer_idx = getattr(
-            getattr(drafter_model, "model", None),
-            "mtp_start_layer_idx",
-            hf_config.num_hidden_layers,
-        )
+        # Keyed by each module's own global layer_num, which is what it looks
+        # up at forward time (`kv_cache_data[f"layer_{self.layer_num}"]`). The
+        # walk's ordinal used to be passed down and stood in for this, for a
+        # pool row and for an index-map key; under PP it is none of the three.
+        kv_cache_data = {}
         for model_name, model in models_to_bind:
-            logger.info(
-                f"Binding KV cache for {model_name} model starting at layer_id={layer_id}"
-            )
-
+            logger.info("Binding KV cache for the %s model", model_name)
             for module in model.modules():
-                # Drafts that own an independent KV pool (Eagle3) bind through
-                # their sibling builder first; for unrecognized modules it
-                # returns None and we fall through to the target builder.
-                if model_name == "draft" and hasattr(self, "eagle3_draft_builder"):
-                    kv_cache_tensor = self.eagle3_draft_builder.build_kv_cache_tensor(
-                        layer_id, module
+                # A draft that owns an independent KV pool binds through its
+                # sibling builder first; for unrecognized modules it returns
+                # None and we fall through to the target builder.
+                kv_cache_tensor = None
+                if model_name == "draft" and hasattr(self, "draft_kv_builder"):
+                    kv_cache_tensor = self.draft_kv_builder.build_kv_cache_tensor(
+                        module
                     )
-                    if kv_cache_tensor is not None:
-                        kv_cache_tensors.append(kv_cache_tensor)
-                        kv_cache_keys.append(getattr(module, "layer_num", layer_id))
-                        layer_id += 1
-                        continue
-
                 # Per-attention-type binding is owned by the attention
                 # metadata builder; ModelRunner only walks modules and
                 # collects the resulting KVCacheTensor entries. The builder
                 # returns None for modules it does not recognize (so a
-                # sibling module like nn.LayerNorm is silently skipped),
-                # and increments through MHA / MLA / GDN / V3.2-indexer
-                # internally.
-                kv_cache_tensor = self.attn_metadata_builder.build_kv_cache_tensor(
-                    layer_id, module
-                )
+                # sibling module like nn.LayerNorm is silently skipped).
+                if kv_cache_tensor is None:
+                    kv_cache_tensor = self.attn_metadata_builder.build_kv_cache_tensor(
+                        module
+                    )
                 if kv_cache_tensor is not None:
-                    kv_cache_tensors.append(kv_cache_tensor)
-                    kv_cache_keys.append(getattr(module, "layer_num", layer_id))
-                    layer_id += 1
+                    kv_cache_data[f"layer_{module.layer_num}"] = kv_cache_tensor
 
-        # Store KVCacheConfig, keyed by each module's (global) layer_num so it
-        # matches the attention's own kv_cache_data[f"layer_{self.layer_num}"]
-        # lookup under pipeline parallel.
-        kv_cache_data = {
-            f"layer_{key}": kv_cache_tensor
-            for key, kv_cache_tensor in zip(kv_cache_keys, kv_cache_tensors)
-        }
         transfer_tensors = self.attn_metadata_builder.get_kv_transfer_tensors()
-        if hasattr(self, "eagle3_draft_builder") and transfer_tensors is not None:
-            draft_regions = self.eagle3_draft_builder.get_kv_transfer_tensors()
+        if transfer_tensors is not None:
+            # The tier is built inside `register_kv_caches` and needs
+            # `state_entry_views` to name the bytes it packs. This is the only
+            # place the builder and the connector are both in scope.
+            transfer_tensors.state_backend = self.attn_metadata_builder
+        if hasattr(self, "draft_kv_builder") and transfer_tensors is not None:
+            draft_regions = self.draft_kv_builder.get_kv_transfer_tensors()
             if draft_regions:
                 transfer_tensors.block_regions.extend(draft_regions)
-        # The transfer protocol addresses scheduler blocks, whose IDs index
-        # ``req.block_ids``.  MLA's cache is allocated in page-size-1 physical
-        # rows, so ``num_physical_kvcache_blocks`` is larger by block_ratio and
-        # must not be used here: doing so would make the codec treat one token
-        # as a complete scheduler block.
+        if transfer_tensors is not None:
+            # After the draft's regions are in, and here because this is the
+            # only place holding both the complete region list and the
+            # scheduler's block count. The builders cannot answer this: each
+            # counts in its own page, and the transfer protocol addresses
+            # ``req.block_ids``, which are the scheduler's.
+            transfer_tensors.set_block_count(num_kvcache_blocks)
+        # The same count reaches the codecs, which likewise index by scheduler
+        # block: MLA's cache is allocated in page-size-1 rows, so its own count
+        # is block_ratio times larger and would make a codec treat one token as
+        # a complete scheduler block.
         set_kv_cache_data(
             kv_cache_data,
             config,
@@ -2154,7 +2062,7 @@ class ModelRunner:
             return (False, False, 0, 0)
 
         local_tbo = local_tbo_precompute(
-            self.config, batch, is_prefill, np.asarray(batch.num_scheduled_tokens)
+            self.config, batch, is_prefill, batch.num_scheduled_tokens
         )
 
         # PCP+TBO prefill: split requests into two GROUPS at a request boundary
@@ -2268,7 +2176,7 @@ class ModelRunner:
         # the array is entirely decode segments. Keep the first q of each seq's
         # segment: token[0] is the anchor; the rest are placeholders overwritten
         # by token_ids[:, 1:] = scheduled_spec_decode_tokens downstream.
-        old_nst = np.asarray(batch.num_scheduled_tokens, dtype=np.int32)
+        old_nst = batch.num_scheduled_tokens
         sched = np.asarray(batch.scheduled_tokens)
         old_cu = np.zeros(scheduled_bs + 1, dtype=np.int64)
         np.cumsum(old_nst[:scheduled_bs], out=old_cu[1:])
@@ -2294,13 +2202,14 @@ class ModelRunner:
     def _dspark_apply_ragged(self, batch, scheduled_bs, full_q, by_req):
         """DSpark per-request RAGGED verify (paper §5.2 avoid-padding).
 
-        Sets num_scheduled_tokens[i] = len_i PER REQUEST (no batch-level pad to a
-        single q), where len_i = max(ell_i, max_num_bonus) + 1, clamped to
-        [1, full_q]. Downstream V4 attn is marker-driven (cu_seqlens etc.) so a
-        ragged num_scheduled_tokens flows through unchanged; dropped draft suffix
-        is re-drafted next step -> lossless. KV stays reserved at mtp_k+1.
+        Sets num_scheduled_tokens[i] = max(ell_i, num_bonus_i) + 1, clamped to
+        [1, full_q] -- both terms request i's own, so two requests that accepted
+        2 and 5 forward 3 and 6 tokens, not 6 and 6. Downstream V4 attn is
+        marker-driven (cu_seqlens etc.), so ragged lengths flow through
+        unchanged; the dropped draft suffix is re-drafted next step (lossless).
+        KV stays reserved at mtp_k+1.
         """
-        old_nst = np.asarray(batch.num_scheduled_tokens, dtype=np.int32)
+        old_nst = batch.num_scheduled_tokens
 
         tp = getattr(self, "tokenID_processor", None)
         prev_b = getattr(tp, "prev_batch", None) if tp is not None else None
@@ -2313,35 +2222,30 @@ class ModelRunner:
         if prev_req is None or prev_req != cur_req:
             return  # boundary / reorder step: skip ragged, stay rectangular
 
-        num_bonus_arr = getattr(batch, "num_bonus", None)
-        nb = (
-            np.asarray(num_bonus_arr)[:scheduled_bs]
-            if num_bonus_arr is not None
-            else None
-        )
-        max_nb = int(nb.max()) if nb is not None and nb.size > 0 else 0
+        # Positional, which is what the `prev_req == cur_req` guard buys: entry
+        # i is request i's own count from the step that produced it, before
+        # `prepare_input_ids` remaps the deferred rows.
+        nb = batch.num_bonus[:scheduled_bs]
 
         from atom.spec_decode.dspark_scheduler import (
             quantize_to_bucket,
-            ragged_verify_len,
+            ragged_verify_lens,
             resolve_q_buckets,
         )
 
-        # Per-request forward length, bounded by BOTH max_nb+1 (the anchor must
-        # stay inside the segment) and old_nst[i] (a stale ell must never grow a
-        # seq past what the scheduler scheduled). See `ragged_verify_len`; None
-        # means the two bounds cross and ragged is not representable this step.
-        new_len = np.empty(scheduled_bs, dtype=np.int32)
-        any_shrink = False
-        for i, rid in enumerate(batch.req_ids[:scheduled_bs]):
-            li = ragged_verify_len(by_req.get(rid), full_q, max_nb, int(old_nst[i]))
-            if li is None:
-                return  # stay rectangular
-            new_len[i] = li
-            if li < int(old_nst[i]):
-                any_shrink = True
+        # Bounded per request by nb[i]+1 (its anchor must stay inside its OWN
+        # segment) and old_nst[i] (a stale ell must not grow a seq past what the
+        # scheduler scheduled). None -> some request's bounds cross.
+        new_len = ragged_verify_lens(
+            (by_req.get(rid) for rid in batch.req_ids[:scheduled_bs]),
+            full_q,
+            nb,
+            old_nst[:scheduled_bs],
+        )
+        if new_len is None:
+            return  # stay rectangular
 
-        if not any_shrink:
+        if not (new_len < old_nst[:scheduled_bs]).any():
             return  # nothing to shrink this step -> Phase-1 layout
 
         # q_eff, and the replay-shape feasibility check, BEFORE anything on the
@@ -2403,18 +2307,10 @@ class ModelRunner:
         prefill_tok = int(batch.total_tokens_num_prefill)
         batch.total_tokens_num_decode = total_new
         batch.total_tokens_num = prefill_tok + total_new
-        # Two sources of truth (TRUE FLAT, paper §5.2): tokens are flat-packed
-        # [0:Σ] with the per-seq ragged new_len.
-        #   * dynamic_spec_query_tokens_per_req : the true ragged per-seq lengths.
-        #   * the scalar q_eff, RETURNED to `prepare_model` -- computed above,
-        #     before the rebuild, together with the replay-shape feasibility
-        #     check.
-        batch.dynamic_spec_query_tokens_per_req = new_len
-
-        # (No flat scheduled_spec_decode_tokens is built here: the ragged
-        # input_ids are assembled downstream by `fill_deferred_decode_ids` from
-        # prev_token_ids (anchor) + draft_token_ids, which never consults
-        # scheduled_spec_decode_tokens.)
+        # No marker is published for "this step shrank": a shrunk step is
+        # `num_scheduled_tokens` with smaller entries, and every reader reads
+        # those. `scheduled_spec_decode_tokens` keeps its full width --
+        # `prepare_input_ids` slices it per request (`spec[i, :len_i - 1]`).
         return int(q_eff)
 
     def prepare_inputs(
@@ -2429,8 +2325,7 @@ class ModelRunner:
         is_prefill = batch.total_tokens_num_prefill > 0
         scheduled_bs = batch.total_seqs_num
         scheduled_tokens = batch.total_tokens_num
-        num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
-        cu_seqlens_q, _arange = self._get_cumsum_and_arange(num_scheduled_tokens)
+        num_scheduled_tokens = batch.num_scheduled_tokens
         sync = forward_mode.sync
         num_tokens_across_dp = None if sync is None else sync.num_tokens_across_dp
         tbo_collective_active = forward_mode.tbo_collective_active
@@ -2440,20 +2335,6 @@ class ModelRunner:
         if not tbo_collective_active:
             self._pcp_tbo_balanced_active = False
 
-        self.forward_vars["cu_seqlens_q"].np[1 : scheduled_bs + 1] = cu_seqlens_q
-
-        if not is_prefill:
-            assert forward_mode.running_bs >= scheduled_bs, (
-                f"running_bs={forward_mode.running_bs} < "
-                f"scheduled_bs={scheduled_bs}; ForwardMode.decide invariant violated"
-            )
-            # Flat-extend the cumsum over the fabricated rows. Attention runs at
-            # `running_bs` on every decode step, replayed or not: keeping the
-            # scheduled rows when eager made a third width nobody could name,
-            # and every consumer had to know which of the two it was holding.
-            self.forward_vars["cu_seqlens_q"].np[
-                scheduled_bs + 1 : forward_mode.running_bs + 1
-            ] = self.forward_vars["cu_seqlens_q"].np[scheduled_bs]
         # The step's two units, read from where they were settled: `running_bs`
         # sizes everything per-sequence, `running_tokens` everything per-row.
         running_bs = forward_mode.running_bs
@@ -2478,11 +2359,11 @@ class ModelRunner:
 
         spec_decode_metadata = None
         if not is_prefill and hasattr(self, "drafter") and not batch.is_dummy_run:
-            scheduled_bs = batch.total_seqs_num_decode
+            _, lens, cu = self.attn_metadata_builder.decode_spans(batch)
+            # `cu[1:]` is the segment ENDS, which is what
+            # `cu_num_sampled_tokens` means.
             spec_decode_metadata = self.drafter.calc_spec_decode_metadata(
-                num_scheduled_tokens[:scheduled_bs],
-                cu_seqlens_q[:scheduled_bs],
-                input_ids,
+                lens, cu[1:], input_ids
             )
 
         pcp_size = self.config.prefill_context_parallel_size
@@ -2604,6 +2485,8 @@ class ModelRunner:
         temperatures, top_ks, top_ps, all_greedy, needs_independent_noise = (
             self.prepare_sample(batch)
         )
+        # Publishes the buffer `prepare_input_ids` addresses spans through.
+        self.attn_metadata_builder.publish_cu_seqlens_q(batch, forward_mode)
         input_ids = self.tokenID_processor.prepare_input_ids(
             batch, forward_mode.max_seqlen_q
         )
@@ -2618,14 +2501,6 @@ class ModelRunner:
             if batch.next_token_ids is not None:
                 forward_context.context.draft_anchor_overrides = (
                     self.drafter.anchors_to_gpu(batch.next_token_ids)
-                )
-            ragged_lens = getattr(batch, "dynamic_spec_query_tokens_per_req", None)
-            if ragged_lens is not None and batch.total_tokens_num_prefill == 0:
-                scheduled_bs = batch.total_seqs_num_decode
-                lens_buf = self.forward_vars["ragged_lens"]
-                lens_buf.np[:scheduled_bs] = np.asarray(ragged_lens)[:scheduled_bs]
-                forward_context.context.draft_ragged_lens = lens_buf.copy_to_gpu(
-                    scheduled_bs
                 )
         return (
             input_ids,
@@ -2784,7 +2659,7 @@ class ModelRunner:
         self._pp_send_needs_sparse = False
         self._pp_recv_needs_sparse = False
         self._pp_index_topk = 0
-        if not self.is_deepseek_v32:
+        if not self.has_mla_indexer:
             return
         pp = get_pp_group()
         if pp.world_size <= 1:
@@ -2826,7 +2701,17 @@ class ModelRunner:
         self._pp_send_needs_sparse = (not pp.is_last_rank) and _is_shared(
             inner.end_layer
         )
-        self._pp_index_topk = int(self.config.hf_config.index_topk)
+        # Transfer the physical producer row width, not the logical top-k.
+        # GLM-5.3 appends up to index_kpool-1 tail tokens and rounds each row
+        # to 128 columns; slicing at index_topk would start every later row at
+        # the wrong offset.
+        self._pp_index_topk = int(
+            getattr(
+                self.attn_metadata_builder,
+                "index_topk_out",
+                self.config.hf_config.index_topk,
+            )
+        )
         if self._pp_recv_needs_sparse or self._pp_send_needs_sparse:
             logger.info(
                 "[%s] PP shared-indexer transfer: recv=%s send=%s "
@@ -3101,6 +2986,9 @@ class ModelRunner:
             )
             num_reject_tokens = self.tokenID_processor.default_num_rejected_tokens[:bs]
             next_token_locs = num_reject_tokens
+            # No drafts scored -> no accept count; anchor on the segment's last
+            # row. NOT `mtp_k - num_reject_tokens`, which is a zero buffer here.
+            num_bonus_tokens = None
         else:
             assert logits is not None
             bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
@@ -3193,6 +3081,7 @@ class ModelRunner:
                     hidden_states,
                     next_token_ids,
                     num_reject_tokens,
+                    num_bonus_tokens,
                 )
                 # self.debug(f"{num_bonus_tokens=}")
 
@@ -3221,6 +3110,7 @@ class ModelRunner:
                     hidden_states,
                     next_token_ids,
                     num_reject_tokens,
+                    num_bonus_tokens,
                 )
 
         # DSpark Phase 2: carry this step's per-request ell back to the scheduler
@@ -3308,6 +3198,7 @@ class ModelRunner:
                     torch.zeros(
                         batch.total_seqs_num, dtype=torch.int32, device=self.device
                     ),
+                    None,  # nothing verified -> segment's last row
                     align_only=True,
                 )
             reset_forward_context()
@@ -3391,7 +3282,13 @@ class ModelRunner:
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
+        # Complements today but against DIFFERENT baselines, which ragged
+        # verify pulls apart -- neither can be dropped for the other.
+        # num_reject_tokens: KV rows to release, against the `mtp_k` RESERVATION.
+        # num_bonus_tokens: anchor row within the SEGMENT (`len_i`); None when
+        # nothing was verified.
         num_reject_tokens: torch.Tensor,
+        num_bonus_tokens: torch.Tensor | None,
         align_only: bool = False,
     ):
         """`align_only` runs the draft purely for its DP collectives.
@@ -3420,40 +3317,14 @@ class ModelRunner:
             )
 
         positions = forward_context.context.positions
-        # Anchor (last verified target token) flat index = segment_start +
-        # num_bonus. prepare_inputs counts back from each segment's END
-        # (cu_seqlens_q[1:]), so offset = full_q - num_bonus = 1 + num_reject.
-        last_token_offset = 1 + num_reject_tokens
-
-        # DSpark q-shrink: segments are length q<full_q but the end-relative
-        # offset is measured against full_q, over-counting by (full_q-q) -> OOB.
-        # Subtract the shrink. No-op when q==full_q or on prefill/mixed steps.
-        ragged_lens = getattr(batch, "dynamic_spec_query_tokens_per_req", None)
-        if ragged_lens is not None and batch.total_tokens_num_prefill == 0:
-            # RAGGED: each seg has its own len_i; anchor offset = len_i - num_bonus_i
-            # (num_bonus_i = mtp_k - num_reject_i), applied to cu_seqlens_q ends.
-            sbs = batch.total_seqs_num_decode
-            # This pinned H2D was staged in prepare_model(), before the
-            # forward's staging event was recorded. int32 matches
-            # num_reject_tokens, so the arithmetic keeps its original dtype.
-            lens_t = forward_context.context.draft_ragged_lens
-            assert lens_t is not None and lens_t.shape[0] == sbs
-            num_bonus = self.drafter.mtp_k - num_reject_tokens[:sbs]
-            last_token_offset = lens_t - num_bonus
-        elif (
-            hasattr(self, "drafter")
-            and self.drafter.uses_confidence_schedule
-            and batch.total_tokens_num_prefill == 0
-        ):
-            full_q = self.drafter.mtp_k + 1
-            q_actual = forward_context.context.forward_mode.max_seqlen_q
-            if 1 <= q_actual < full_q:
-                last_token_offset = last_token_offset - (full_q - q_actual)
 
         assert isinstance(self.drafter, Drafter)
 
+        # The sampler's own count, not `mtp_k - num_reject_tokens`: that
+        # identity holds only where `num_reject_tokens` was defined as its
+        # complement, and is a zero buffer on a step that scored no drafts.
         last_token_indices = self.drafter.prepare_inputs(
-            batch.total_seqs_num, last_token_offset
+            batch.total_seqs_num, anchor_in_seq=num_bonus_tokens
         )
 
         draft_token = self.drafter.propose(
@@ -3574,7 +3445,11 @@ class ModelRunner:
                 from aiter.dist import parallel_state as _ps
 
                 group = getattr(_ps, getter)()
-            except Exception:
+
+            # initialised is the ordinary case here, and which exception says
+            # so is the aiter build's business, not this probe's.
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("%s is not available: %s", getter, exc)
                 continue
             dc = getattr(group, "device_communicator", None)
             ca = getattr(dc, "ca_comm", None) if dc is not None else None
@@ -3634,7 +3509,7 @@ class ModelRunner:
 
         Two guards, both DP-safe (the decision must be identical on every rank,
         else capture loops desync and the next get_dp_padding all_reduce couples
-        mismatched num_tokens -> "batch_id_per_token len < T"):
+        mismatched num_tokens -> "batch_id_per_q_token len < T"):
 
         1. DP+spec hard cap: big bs*q buckets never run under DP but bloat the
            pool and don't overlap comm, so cap at ATOM_PIECEWISE_DP_MAX_TOKENS.
@@ -3818,7 +3693,9 @@ class ModelRunner:
         self._piecewise_captured_tokens = set()
 
         self.forward_vars["kv_indptr"].gpu.zero_()
-        if self.is_deepseek_v32 and "sparse_kv_indptr" in self.forward_vars:
+        # Present exactly when the model has an indexer -- the builder makes it
+        # under the same answer -- so the buffer's own existence is the test.
+        if "sparse_kv_indptr" in self.forward_vars:
             self.forward_vars["sparse_kv_indptr"].gpu.zero_()
 
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
@@ -4432,7 +4309,7 @@ class RapidServeModelRunner(ModelRunner):
         return True
 
     def export_kv_cache_ipc_handle(self) -> list[str] | None:
-        """Export self.kv_cache (and self.kv_scale for fp8) as CUDA IPC handles.
+        """Export self.kv_cache — the whole paged pool — as a CUDA IPC handle.
 
         TP-aware: each rank writes its handles to a temp file.  Rank 0 waits for
         all ranks and returns the list of paths; other ranks return None.
@@ -4440,8 +4317,7 @@ class RapidServeModelRunner(ModelRunner):
         from atom.model_engine.ipc_utils import export_kv_cache_handle
 
         logger.info(f"ModelRunner rank {self.rank}: export_kv_cache_ipc_handle")
-        kv_scale = getattr(self, "kv_scale", None)
-        handles = export_kv_cache_handle(self.kv_cache, kv_scale)
+        handles = export_kv_cache_handle(self.kv_cache)
         self._disagg_write_rank_file("kvcache", handles)
         paths = self._disagg_collect_rank_files("kvcache")
         if paths is not None:
@@ -4463,9 +4339,9 @@ class RapidServeModelRunner(ModelRunner):
 
         from atom.model_engine.ipc_utils import import_kv_cache
 
-        self.num_physical_kvcache_blocks = (
-            num_kvcache_blocks * self.attn_metadata_builder.block_ratio
-        )
+        # The count travels with the handle and reaches the builder through
+        # `_bind_kv_cache_to_modules` -> `allocate_kv_cache_tensors` below; this
+        # side never ran sizing, so there is nothing else it could come from.
         path = paths[self.rank]
         logger.info(
             f"ModelRunner rank {self.rank}: reading kvcache handles from {path}"
@@ -4474,98 +4350,63 @@ class RapidServeModelRunner(ModelRunner):
             meta = pickle.load(f)
         os.remove(path)
         logger.info(f"ModelRunner rank {self.rank}: hipIpcOpenMemHandle for kvcache...")
-        self.kv_cache, kv_scale = import_kv_cache(meta)
-        if kv_scale is not None:
-            self.kv_scale = kv_scale
+        self.kv_cache = import_kv_cache(meta)
         logger.info(
             f"ModelRunner rank {self.rank}: kvcache IPC import done, binding..."
         )
-        self._bind_kv_cache_to_modules()
+        self._bind_kv_cache_to_modules(num_kvcache_blocks)
         logger.info(f"ModelRunner rank {self.rank}: import_kv_cache_ipc_handle done")
         return True
 
-    def _bind_kv_cache_to_modules(self):
-        """Bind self.kv_cache (and self.kv_scale if present) to all attention
-        modules.  Called after replacing self.kv_cache with an IPC-imported
-        tensor (decode process), where the builder-based binding path in
-        allocate_kv_cache() is skipped."""
-        config = self.config
-        hf_config = config.hf_config
-        if hf_config.num_key_value_heads >= self.world_size:
-            num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        else:
-            num_kv_heads = 1
-        x = 16 // self.kv_cache.element_size()
+    def _bind_kv_cache_to_modules(self, num_kvcache_blocks: int):
+        """Bind an IPC-imported KV pool to every attention module.
+
+        The decode side of a P/D pair gets the pool as a handle, so it never
+        reaches `allocate_kv_cache`'s bind loop. What it must not do is bind it
+        a *second way*: this used to spell the views out again, with a 4-D V
+        where every builder declared 5-D. Nothing could catch that — the two
+        agree on every byte and differ only in what a reader branches on. So it
+        runs the same loop over the same hook, down to backing the pools.
+
+        The paged pool only. A per-request STATE class is sized by `pool_plan`,
+        which is empty here -- the block count arrives with the handle and
+        nothing else does -- so `allocate_per_req_cache` cannot run and the
+        attributes it publishes do not exist. Refused up front rather than met
+        as an `AttributeError` on whichever layer binds first.
+        """
+        stateful = self._state_pool_names()
+        if stateful:
+            raise NotImplementedError(
+                f"per-request state {stateful} has no entry count on the decode "
+                "side of a P/D pair: only the paged pool arrives with the "
+                "handle, and this side never ran sizing. Run this model "
+                "without disaggregation."
+            )
+        self._back_paged_pools(num_kvcache_blocks, buf=self.kv_cache)
 
         models_to_bind = [("target", self.model)]
         if self.config.speculative_config and hasattr(self, "drafter"):
             models_to_bind.append(("draft", self.drafter.model))
 
-        kv_cache_tensors = []
-        layer_id = 0
-        for _model_name, model in models_to_bind:
+        kv_cache_data = {}
+        for model_name, model in models_to_bind:
             for module in model.modules():
-                if hasattr(module, "base_attention"):
-                    if hasattr(module, "use_mla") and not module.use_mla:
-                        if self.is_qwen_next():
-                            attn_idx = layer_id // self.full_attention_interval
-                        else:
-                            attn_idx = layer_id
-                        k_cache = self.kv_cache[0, attn_idx].view(
-                            self.num_physical_kvcache_blocks,
-                            num_kv_heads,
-                            hf_config.head_dim // x,
-                            self.physical_block_size,
-                            x,
-                        )
-                        v_cache = self.kv_cache[1, attn_idx].view(
-                            self.num_physical_kvcache_blocks,
-                            num_kv_heads,
-                            hf_config.head_dim,
-                            self.physical_block_size,
-                        )
-                        module.max_model_len = self.config.max_model_len
-                        if config.kv_cache_dtype == "fp8":
-                            module.k_scale = self.kv_scale[0, attn_idx]
-                            module.v_scale = self.kv_scale[1, attn_idx]
-                        from atom.config import KVCacheTensor
-
-                        kv_cache_tensors.append(
-                            KVCacheTensor(
-                                layer_num=layer_id,
-                                k_cache=k_cache,
-                                v_cache=v_cache,
-                                k_scale=module.k_scale,
-                                v_scale=module.v_scale,
-                            )
-                        )
-                        module.k_cache = k_cache
-                        module.v_cache = v_cache
-                        layer_id += 1
-                    elif hasattr(module, "use_mla") and module.use_mla:
-                        kv_cache = self.kv_cache[layer_id].view(
-                            self.num_physical_kvcache_blocks * self.physical_block_size,
-                            1,
-                            576,
-                        )
-                        module.max_model_len = self.config.max_model_len
-                        from atom.config import KVCacheTensor
-
-                        kv_cache_tensors.append(
-                            KVCacheTensor(
-                                layer_num=layer_id,
-                                k_cache=kv_cache,
-                                v_cache=None,
-                                k_scale=None,
-                                v_scale=None,
-                            )
-                        )
-                        module.kv_cache = kv_cache
-                        layer_id += 1
+                # Same dispatch as the allocating path's loop: a draft with a
+                # pool of its own binds through its own builder, and its pool
+                # is now a region of the same imported buffer.
+                bound = None
+                if model_name == "draft" and hasattr(self, "draft_kv_builder"):
+                    bound = self.draft_kv_builder.build_kv_cache_tensor(module)
+                if bound is None:
+                    bound = self.attn_metadata_builder.build_kv_cache_tensor(module)
+                if bound is not None:
+                    # The same key the allocating path uses. Keyed by the walk's
+                    # ordinal here until now, which agreed with it only while
+                    # the first bound module was layer 0.
+                    kv_cache_data[f"layer_{module.layer_num}"] = bound
 
         from atom.utils.forward_context import set_kv_cache_data
 
-        kv_cache_data = {f"layer_{i}": t for i, t in enumerate(kv_cache_tensors)}
         set_kv_cache_data(kv_cache_data)
 
     # ------------------------------------------------------------------
@@ -4620,7 +4461,7 @@ class RapidServeModelRunner(ModelRunner):
         return words
 
     # CU fractions for which we pre-create masked streams.
-    _CU_POOL_FRACTIONS = [0.5]
+    _CU_POOL_FRACTIONS: ClassVar[list[float]] = [0.5]
 
     def create_prefill_stream_pool(self) -> bool:
         """Create a pool of CUDA streams for disaggregated prefill.
@@ -4690,7 +4531,7 @@ class RapidServeModelRunner(ModelRunner):
                 top_ks,
                 top_ps,
                 all_greedy,
-                needs_independent_noise,
+                _needs_independent_noise,
             ) = self.prepare_model(batch)
             logits, _ = self.run_model(input_ids, batch)
             # Sample the first generated token from each sequence's last logit

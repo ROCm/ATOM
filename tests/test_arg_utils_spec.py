@@ -132,6 +132,36 @@ class TestMoEBackendCli:
         assert args._get_engine_kwargs()["moe_backend"] == "mega"
 
 
+class TestMoEAll2AllBackendCli:
+    def _parse(self, argv):
+        parser = argparse.ArgumentParser()
+        EngineArgs.add_cli_args(parser)
+        return EngineArgs.from_cli_args(parser.parse_args(argv))
+
+    def test_default_preserves_auto_mori_detection(self):
+        kwargs = self._parse([])._get_engine_kwargs()
+
+        assert kwargs["moe_all2all_backend"] == "auto"
+        assert kwargs["enable_low_latency"] is False
+
+    def test_rccl_selects_native_backend(self):
+        kwargs = self._parse(["--all2all-backend", "rccl"])._get_engine_kwargs()
+
+        assert kwargs["moe_all2all_backend"] == "rccl"
+        assert kwargs["enable_low_latency"] is False
+
+    def test_low_latency_still_selects_mori(self):
+        kwargs = self._parse(["--all2all-backend", "low-latency"])._get_engine_kwargs()
+
+        assert kwargs["moe_all2all_backend"] == "mori"
+        assert kwargs["enable_low_latency"] is True
+
+    def test_none_forces_collective_fallback(self):
+        kwargs = self._parse(["--all2all-backend", "none"])._get_engine_kwargs()
+
+        assert kwargs["moe_all2all_backend"] == "none"
+
+
 class TestEngineArgsSpeculativeValidation:
     """Regression tests for speculative-config construction in _get_engine_kwargs."""
 

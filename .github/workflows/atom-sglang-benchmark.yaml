@@ -80,13 +80,13 @@ on:
         type: string
         default: ""
       publish_to_dashboard:
-        description: "Upload SGLang-OOB results to the ATOM dashboard."
+        description: "Upload SGLang-OOB results to the ATOM dashboard (off by default for manual runs; schedule always publishes)"
         type: boolean
-        default: true
+        default: false
       upload_to_custom_dashboard:
-        description: "Upload benchmark results to the LLM-Booster dashboard"
+        description: "Upload benchmark results to the LLM-Booster dashboard (off by default for manual runs)"
         type: boolean
-        default: true
+        default: false
       param_lists:
         description: |
           "Optional benchmark parameter lists.
@@ -1078,8 +1078,11 @@ jobs:
           echo "sglang_image_tag=${SGLANG_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Push custom SGLang image
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
-          docker push "${{ steps.image-meta.outputs.sglang_image_tag }}"
+          .github/scripts/docker_push_retry.sh "${{ steps.image-meta.outputs.sglang_image_tag }}"
 
       - name: Clean up build images
         if: always()
@@ -1636,6 +1639,13 @@ jobs:
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --default-backend "ATOM-SGLang"
 
+      - name: Prepare existing dashboard data
+        if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
+        id: prepare_dashboard_data
+        uses: ./.github/actions/prepare-dashboard-data
+        with:
+          data-path: benchmark-dashboard/data.js
+
       - name: Store benchmark result to dashboard
         if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
         uses: benchmark-action/github-action-benchmark@v1
@@ -1650,6 +1660,13 @@ jobs:
           fail-on-alert: false
           max-items-in-chart: 300
           github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate dashboard data after write
+        if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
+        uses: ./.github/actions/validate-dashboard-data
+        with:
+          data-path: benchmark-dashboard/data.js
+          min-entries: ${{ steps.prepare_dashboard_data.outputs.entry_count }}
 
       - name: Push dashboard data to gh-pages
         if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'

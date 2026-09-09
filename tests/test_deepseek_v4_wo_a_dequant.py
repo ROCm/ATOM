@@ -90,8 +90,8 @@ class _FakeAttention:
 
     Values coherent with ``_make_wo_a``'s 256 x 128 weight: the gfx950
     batched-GEMM path wants ``out_dim == n_local_groups * o_lora_rank``, so
-    2 x 128. ``_is_gfx950`` is False because this is the gfx942 dtype gate --
-    the BF16 fallback is the path under test, and that flag selects it.
+    2 x 128. ``_is_gfx950`` and ``_is_preshuffle`` are False because this is
+    the gfx942 dtype gate -- the BF16 fallback is the path under test.
     """
 
     def __init__(self, wo_a):
@@ -99,6 +99,7 @@ class _FakeAttention:
         self.n_local_groups = 2
         self.o_lora_rank = 128
         self._is_gfx950 = False
+        self._is_preshuffle = False
 
     def __getattr__(self, name):
         raise AttributeError(

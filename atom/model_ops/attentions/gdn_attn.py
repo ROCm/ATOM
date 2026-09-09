@@ -5,6 +5,7 @@ import logging
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import ClassVar
 
 import numpy as np
 import torch
@@ -26,14 +27,26 @@ from .aiter_attention import (
     AiterBackend,
     kv_indices_generate_triton,
 )
-from .paged_state_copy import (
+from .pool_layout.paged_state_copy import (
     SegmentedCopyPlan,
     launch_copy_descriptor,
     plan_segmented_copy,
 )
-from .sub_pool_spec import SubPoolSpec, page_pool, state_pool
+from .pool_layout.pool_rows import PoolRowsMixin
+from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool, state_pool
 
 logger = logging.getLogger("atom")
+
+# The linear-attention state pool's row space -- one slot per recurrent layer,
+# whether GDN calls it that or K3 calls it KDA. Shared so a hybrid that binds
+# both kinds cannot number them into the same space.
+LINEAR_STATE_ROWS = "linear_state"
+
+_GDN_SSM_DTYPES = {
+    "fp32": torch.float32,
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+}
 
 
 class GDNAttentionBackend(AiterBackend):
@@ -108,7 +121,7 @@ class GDNAttentionMetadata:
     token_chunk_offset_ptr: torch.Tensor | None = None
 
 
-class GDNStateMixin:
+class GDNStateMixin(PoolRowsMixin):
     def __init__(self, model_runner, **kwargs):
         super().__init__(model_runner=model_runner, **kwargs)
         self._init_gdn_state(model_runner)
@@ -117,24 +130,27 @@ class GDNStateMixin:
         self,
         model_runner,
     ):
-        # Hybrid model layer-counting state (formerly set as a side effect
-        # inside the qwen_next branch of the KV sizing path).
-        # Promoted to runner attributes here so all consumers
-        # (build_kv_cache_tensor, allocate_kv_cache_tensors, the per-req
-        # cache hooks) can read them as `self.model_runner.<name>` without
-        # a hidden ordering dependency on the KV sizing path being
-        # called first.
+        # Which layers are full attention, for the hybrid PAGE transfer that
+        # still names them globally. Not how MANY of either kind: those are the
+        # modules, counted (`num_state_layers`), and a config list that
+        # disagreed with what was built would size a pool the bind walk then
+        # overruns.
         hf = model_runner.config.hf_config
-        if getattr(hf, "model_type", None) == "kimi_linear":
+        model_type = getattr(hf, "model_type", None)
+        if model_type in ("kimi_linear", "glm5_next_text"):
             lin = getattr(hf, "linear_attn_config", {}) or {}
-            model_runner.full_attention_layers = [
-                int(i) - 1 for i in lin.get("full_attn_layers", [])
-            ]
-            model_runner.kda_attention_layers = [
-                int(i) - 1 for i in lin.get("kda_layers", [])
-            ]
-            model_runner.num_full_attn = len(model_runner.full_attention_layers)
-            model_runner.num_gdn_attn_state = len(model_runner.kda_attention_layers)
+            # Kimi-Linear numbers these 1-based; GLM-5.3-Flash numbers them
+            # 0-based (its layer_types[3] is the first full-attention layer, and
+            # full_attn_layers correspondingly starts at 3).
+            offset = 0 if model_type == "glm5_next_text" else 1
+            if model_type == "glm5_next_text" and hasattr(hf, "glm5_full_attn_layers"):
+                # The model normalizer derives these from layer_types when a
+                # config revision omits the redundant linear-attn lists.
+                model_runner.full_attention_layers = list(hf.glm5_full_attn_layers)
+            else:
+                model_runner.full_attention_layers = [
+                    int(i) - offset for i in lin.get("full_attn_layers", [])
+                ]
             hf.linear_num_key_heads = getattr(
                 hf, "linear_num_key_heads", lin.get("num_heads", hf.num_attention_heads)
             )
@@ -153,14 +169,6 @@ class GDNStateMixin:
                 hf,
                 "linear_conv_kernel_dim",
                 lin.get("short_conv_kernel_size", 4),
-            )
-        else:
-            model_runner.full_attention_interval = hf.full_attention_interval
-            model_runner.num_full_attn = (
-                hf.num_hidden_layers // model_runner.full_attention_interval
-            )
-            model_runner.num_gdn_attn_state = (
-                hf.num_hidden_layers - model_runner.num_full_attn
             )
 
         self.num_spec = 0
@@ -314,14 +322,21 @@ class GDNStateMixin:
         return conv_state_shape, temporal_state_shape
 
     def _state_dtypes(self) -> tuple[torch.dtype, torch.dtype]:
-        if (
-            getattr(self.model_runner.config.hf_config, "model_type", None)
-            == "kimi_linear"
+        # The KDA recurrence accumulates in fp32 whatever the pool stores, so
+        # the KDA models pick their storage dtype; everyone else keeps the
+        # state at the model dtype.
+        if getattr(self.model_runner.config.hf_config, "model_type", None) in (
+            "kimi_linear",
+            "glm5_next_text",
         ):
-            return (
-                self.model_runner.config.torch_dtype,
-                torch.float32,
-            )
+            requested = envs.ATOM_GDN_SSM_DTYPE
+            temporal_dtype = _GDN_SSM_DTYPES.get(requested)
+            if temporal_dtype is None:
+                raise ValueError(
+                    f"ATOM_GDN_SSM_DTYPE={requested!r} is not one of "
+                    f"{sorted(_GDN_SSM_DTYPES)}."
+                )
+            return (self.model_runner.config.torch_dtype, temporal_dtype)
         return (
             self.model_runner.config.torch_dtype,
             self.model_runner.config.torch_dtype,
@@ -354,9 +369,14 @@ class GDNStateMixin:
         )
 
     def _is_kda(self) -> bool:
-        return (
-            getattr(self.model_runner.config.hf_config, "model_type", None)
-            == "kimi_linear"
+        # Both KDA models, matching the two sibling checks above. GLM-5.3-Flash
+        # was added to those and missed here, which mattered because this one
+        # feeds `_replayssm_buffer_shapes()`: answering "not KDA" for a KDA
+        # model sizes the ReplaySSM record buffers for the wrong head geometry
+        # and the recurrence writes past them.
+        return getattr(self.model_runner.config.hf_config, "model_type", None) in (
+            "kimi_linear",
+            "glm5_next_text",
         )
 
     def _replayssm_bytes_per_slot(self) -> int:
@@ -371,7 +391,7 @@ class GDNStateMixin:
             + math.prod(su) * rec_dtype.itemsize
             + math.prod(sg) * 4  # g stays fp32: it is exponentiated on rebuild
         )
-        return self.model_runner.num_gdn_attn_state * per_layer
+        return self.num_state_layers() * per_layer
 
     def state_transfer(self) -> StateTransfer:
         """A fork whose successor forward need only carry one token.
@@ -410,10 +430,21 @@ class GDNStateMixin:
         Exact, not approximate, when it is turned back on: `h` is `k.new_empty`
         and `_state_dtypes` returns `config.torch_dtype`, so slicing `h` rounds
         exactly where a shortened forward would. That rests on the two dtypes
-        agreeing; kimi_linear's fp32 v side is the one pool that breaks it, and
-        it overrides (`_KimiMLAGDNCommon.state_transfer`).
+        agreeing; kimi_linear's temporal side is `ATOM_GDN_SSM_DTYPE` and need
+        not, so it overrides unconditionally
+        (`_KimiMLAGDNCommon.state_transfer`).
         """
         return StateTransfer.fork(1, readable_midstep=False)
+
+    def num_state_layers(self) -> int:
+        """Layers holding a recurrent state, one slot each.
+
+        The modules, counted -- so the pool sized here is the pool the bind
+        walk fills. A shared draft's linear-attention layers are in the walk
+        and were never in the config count they replace, which is a slot the
+        walk used to hand out past the end of the pool.
+        """
+        return self.row_counts().get(LINEAR_STATE_ROWS, 0)
 
     def state_spec(self) -> SubPoolSpec:
         """The GDN state pool: conv_state + temporal_state over all GDN
@@ -442,8 +473,7 @@ class GDNStateMixin:
         )
         return state_pool(
             STATE_SLOT_CLASS,
-            self.model_runner.num_gdn_attn_state * per_layer
-            + self._replayssm_bytes_per_slot(),
+            self.num_state_layers() * per_layer + self._replayssm_bytes_per_slot(),
             entries_per_req=self.slots_per_req(),
         )
 
@@ -470,7 +500,7 @@ class GDNStateMixin:
         num_slots = entries.get(STATE_SLOT_CLASS, 0)
         shape_k, shape_v = self._state_shape_for_runner()
         dt_k, dt_v = self._state_dtypes()
-        n = self.model_runner.num_gdn_attn_state
+        n = self.num_state_layers()
         tensors = {
             "mamba_k_cache": torch.zeros(
                 (n, num_slots) + shape_k, dtype=dt_k, device="cuda"
@@ -578,10 +608,22 @@ class GDNStateMixin:
         """
         shape_k, shape_v = self._state_shape_for_runner()
         dt_k, dt_v = self._state_dtypes()
-        n = self.model_runner.num_gdn_attn_state
+        n = self.num_state_layers()
         return [
             (math.prod(shape_k) * dt_k.itemsize, n),
             (math.prod(shape_v) * dt_v.itemsize, n),
+        ]
+
+    def _checkpoint_plane_tensors(self) -> list[torch.Tensor]:
+        """Allocated source planes in the order `_checkpoint_plane_shapes` names.
+
+        Kept separate from the pure geometry method because checkpoint sizing
+        runs before these tensors exist. Hybrid backends may extend both lists
+        with state that shares the same slot lifetime.
+        """
+        return [
+            self.model_runner.mamba_k_cache,
+            self.model_runner.mamba_v_cache,
         ]
 
     def _checkpoint_num_slots(self) -> int:
@@ -630,10 +672,14 @@ class GDNStateMixin:
         than cleared by a hook, so a pool that moves underneath invalidates
         this by disagreeing with its own key.
         """
-        runner = self.model_runner
-        k_cache, v_cache = runner.mamba_k_cache, runner.mamba_v_cache
-        num_slots = int(k_cache.shape[1])
-        key = (k_cache.data_ptr(), v_cache.data_ptr(), num_slots)
+        plane_tensors = getattr(self, "_checkpoint_plane_tensors", None)
+        planes = (
+            GDNStateMixin._checkpoint_plane_tensors(self)
+            if plane_tensors is None
+            else plane_tensors()
+        )
+        num_slots = int(planes[0].shape[1])
+        key = tuple(cache.data_ptr() for cache in planes) + (num_slots,)
         cached = getattr(self, "_checkpoint_slot_base_cache", None)
         if cached is not None and cached[0] == key:
             return cached[1]
@@ -641,12 +687,18 @@ class GDNStateMixin:
         slots = np.arange(num_slots, dtype=np.int64)[:, None]
         columns = []
         for cache, (nbytes, n_layers) in zip(
-            (k_cache, v_cache), self._checkpoint_plane_shapes(), strict=True
+            planes, self._checkpoint_plane_shapes(), strict=True
         ):
             if not cache.is_contiguous():
                 raise RuntimeError(
                     "a PAGE-copy state plane must be contiguous; "
                     f"{tuple(cache.shape)} stride {cache.stride()} is not"
+                )
+            if int(cache.shape[0]) != n_layers or int(cache.shape[1]) != num_slots:
+                raise RuntimeError(
+                    "a PAGE-copy state plane disagrees with its checkpoint "
+                    f"geometry: tensor={tuple(cache.shape[:2])}, "
+                    f"geometry=({n_layers}, {num_slots})"
                 )
             layers = np.arange(n_layers, dtype=np.int64)[None, :]
             columns.append(cache.data_ptr() + (layers * num_slots + slots) * nbytes)
@@ -822,6 +874,48 @@ class GDNStateMixin:
             self._page_unit_bases([list(range(spec.units_per_checkpoint))]),
         )
         launch_copy_descriptor(staging.copy_to_gpu(plan.num_spans), plan)
+
+    def state_entry_views(self, slot: int) -> list[torch.Tensor]:
+        """One contiguous slice per (cache, layer) — the slot's whole state.
+
+        Both caches are layer-major with the slot on axis 1, so one slot's rows
+        are strided and there is no single range covering them. Slicing per
+        layer makes each piece contiguous, which is what the staging packer
+        requires; `relocate_state_slots` keeps its own strided views because
+        `_foreach_copy_` has no such constraint and one launch beats `LAYERS`.
+
+        One slot, not a request's whole set: a checkpoint is exactly the
+        committed state (#2045), and the speculation scratch beside it is this
+        request's own and resumable by nobody.
+        """
+        # Reject an out-of-range slot in BOTH directions, for parity with the
+        # DSV4 twin (`deepseek_v4_attn.py`), whose `self._slot_views()[slot]` is
+        # a list index and raises `IndexError` on a stray -1 *or* an
+        # out-of-range positive. Here `cache[layer, slot : slot + 1]` clamps
+        # silently instead: a -1 (the "no slot" sentinel used elsewhere on this
+        # path) gathers/scatters the last slot's state under this request's
+        # identity, and a too-large slot yields a zero-element view
+        # (`numel() == 0`, no error) that the staging packer moves as 0 bytes --
+        # `StateByteCodec.get` then returns True on state never written and the
+        # request resumes on whatever the slot already held. Either way: silent
+        # cross-request corruption. The upstream invariant is a real, in-range
+        # slot (`StateSlotPool.pop` never returns negative, and
+        # `_attach_state_slots` pops before requesting the load), so this guards
+        # the shape rather than a demonstrated path; fail loudly if it is ever
+        # violated instead of corrupting silently.
+        num_slots = self.model_runner.mamba_k_cache.shape[1]
+        if not 0 <= slot < num_slots:
+            raise IndexError(
+                f"state_entry_views: slot {slot} out of range [0, {num_slots})"
+            )
+        views = []
+        for cache in (
+            self.model_runner.mamba_k_cache,
+            self.model_runner.mamba_v_cache,
+        ):
+            for layer in range(cache.shape[0]):
+                views.append(cache[layer, slot : slot + 1])
+        return views
 
     def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
         """Relocate a live GDN state slot between Active Slot positions.
@@ -1308,6 +1402,7 @@ class GDNStateMixin:
 
 class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 
+    BACKEND: ClassVar[type[AiterBackend]] = GDNAttentionBackend
     reorder_batch_threshold: int = 1
     # `prepare_mtp_decode` below regenerates kv_indices and nothing else, so it
     # cannot absorb the position bump the fused path hands off to the backend.
@@ -1315,76 +1410,24 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     # `update_context_lens` / `positions_out` into a signature that has neither.
     fuse_mtp_decode_position_update = False
 
+    def _module_kinds(self, module) -> tuple:
+        """The MHA row spaces, plus a slot for every linear-attention layer."""
+        if hasattr(module, "base_linear_attention"):
+            return (LINEAR_STATE_ROWS,)
+        return super()._module_kinds(module)
+
     def sub_pool_specs(self) -> list[SubPoolSpec]:
         """GDN hybrid: a paged KV pool holding ONLY the full-attention layer
         slots, plus the per-request state pool for the linear-attention
         layers (`GDNStateMixin.state_spec`).
+
+        The parent prices and allocates that pool unchanged: a linear-attention
+        layer is not a module it owns, so counting the modules leaves it out
+        without this class saying which layers those are.
         """
-        from aiter import dtypes
+        return [page_pool(self._paged_entry_bytes()), self.state_spec()]
 
-        runner = self.model_runner
-        config = runner.config
-        hf_config = config.hf_config
-        num_kv_heads = runner._get_num_kv_heads()
-        total = runner._get_total_num_layers()
-        num_draft = total - hf_config.num_hidden_layers
-        n_full = runner.num_full_attn + num_draft
-        kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
-
-        # kv_cache: [2, n_full, blocks, block_size, num_kv_heads, head_dim]
-        block_bytes = (
-            2
-            * n_full
-            * runner.physical_block_size
-            * num_kv_heads
-            * hf_config.head_dim
-            * kv_dtype_size
-        )
-        # kv_scale: [2, n_full, blocks, num_kv_heads, block_size] fp32
-        block_bytes += 2 * n_full * num_kv_heads * runner.physical_block_size * 4
-        return [page_pool(block_bytes), self.state_spec()]
-
-    def allocate_kv_cache_tensors(
-        self, num_kv_heads: int, num_draft_layers: int
-    ) -> dict:
-        """GDN hybrid: KV cache only covers full-attention layer slots
-        (linear-attention layers don't store paged KV; they use the
-        per-request mamba_k/v_cache pool allocated separately).
-
-        Layout: `[2, num_full_attn + num_draft_layers, ...]` — note this
-        differs from AiterAttentionMetadataBuilder's `num_hidden_layers`
-        first dim. The slot index math is in build_kv_cache_tensor's
-        attn_idx computation (skips linear-attn slots).
-        """
-        from aiter import dtypes
-
-        runner = self.model_runner
-        config = runner.config
-        hf_config = config.hf_config
-        n_full = runner.num_full_attn + num_draft_layers
-        return {
-            "kv_cache": torch.zeros(
-                2,
-                n_full,
-                runner.num_physical_kvcache_blocks,
-                runner.physical_block_size,
-                num_kv_heads,
-                hf_config.head_dim,
-                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
-                device="cuda",
-            ),
-            "kv_scale": torch.zeros(
-                2,
-                n_full,
-                runner.num_physical_kvcache_blocks,
-                num_kv_heads,
-                runner.physical_block_size,
-                dtype=dtypes.fp32,
-                device="cuda",
-            ),
-        }
-
-    def build_kv_cache_tensor(self, layer_id: int, module):
+    def build_kv_cache_tensor(self, module):
         """Dispatch by module type:
 
         - `base_linear_attention` (GDN linear attention) → wrap the slot
@@ -1396,10 +1439,11 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             from atom.config import KVCacheTensor
 
             runner = self.model_runner
-            interval = runner.full_attention_interval
-            gdn_idx = (layer_id // interval) * (interval - 1) + (layer_id % interval)
+            # This module's slot: the mamba pool holds one per
+            # linear-attention layer, and its rows are those modules.
+            gdn_idx = self.pool_rows[LINEAR_STATE_ROWS][module]
             return KVCacheTensor(
-                layer_num=layer_id,
+                layer_num=module.layer_num,
                 k_cache=runner.mamba_k_cache[gdn_idx],
                 v_cache=runner.mamba_v_cache[gdn_idx],
                 k_scale=None,
@@ -1413,8 +1457,12 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
                 replay_buf_g=(
                     runner.replayssm_buf_g[gdn_idx] if self.replayssm else None
                 ),
+                # Slot-addressed recurrent state, not paged KV. It has to be
+                # registered (the linear-attention forward reads its state out
+                # of `kv_cache_data`), but no block-addressed mover may touch it.
+                per_request_state=True,
             )
-        return super().build_kv_cache_tensor(layer_id, module)
+        return super().build_kv_cache_tensor(module)
 
     def prepare_prefill(  # type: ignore[override]
         self,
@@ -1425,7 +1473,11 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         if batch.block_tables == []:
             attn_metadata.gdn_metadata = None
             return attn_metadata, positions
-        gdn_metadata = self.prepare_gdn_metadata(batch, attn_metadata, is_prefill=True)
+        # `super().prepare_prefill` has already marshalled them, and the early
+        # return above is the only case where it would not have.
+        gdn_metadata = self.prepare_gdn_metadata(
+            batch, attn_metadata, is_prefill=True, prepare_block_tables=False
+        )
 
         gdn_metadata.ssm_checkpoints = self._checkpoint_targets(batch)
         if gdn_metadata.ssm_checkpoints is not None:

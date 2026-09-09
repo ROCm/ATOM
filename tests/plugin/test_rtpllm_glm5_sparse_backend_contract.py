@@ -556,7 +556,7 @@ def test_sparse_backend_converts_request_local_topk_to_global_slots(monkeypatch)
     convert = module._RealSparseMlaImpl._convert_topk_to_global
     plugin_metadata = SimpleNamespace(
         block_table=torch.tensor([[7, 8], [20, 21]], dtype=torch.int32),
-        req_id_per_token=torch.tensor([0, 1], dtype=torch.int32),
+        batch_id_per_q_token=torch.tensor([0, 1], dtype=torch.int32),
     )
     attn_metadata = SimpleNamespace(plugin_metadata=plugin_metadata)
     topk = torch.tensor(
@@ -684,7 +684,7 @@ def test_real_sparse_decode_uses_atom_aiter_metadata(monkeypatch):
         plugin_metadata=SimpleNamespace(
             query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
             seq_lens=torch.tensor([3, 2], dtype=torch.int32),
-            req_id_per_token=torch.tensor([0, 1], dtype=torch.int32),
+            batch_id_per_q_token=torch.tensor([0, 1], dtype=torch.int32),
             block_table=torch.tensor([[0], [1]], dtype=torch.int32),
         )
     )
@@ -815,7 +815,7 @@ def test_real_sparse_eager_metadata_workspace_skips_refill(monkeypatch):
     plugin_metadata = SimpleNamespace(
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         seq_lens=torch.tensor([3, 2], dtype=torch.int32),
-        req_id_per_token=torch.tensor([0, 1], dtype=torch.int32),
+        batch_id_per_q_token=torch.tensor([0, 1], dtype=torch.int32),
         block_table=torch.tensor([[0], [1]], dtype=torch.int32),
     )
     attn_metadata = SimpleNamespace(plugin_metadata=plugin_metadata)

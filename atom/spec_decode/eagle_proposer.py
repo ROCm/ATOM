@@ -6,6 +6,7 @@ from torch import nn
 from torch.profiler import record_function
 
 from atom.config import CompilationLevel
+from atom.distributed.dcp_utils import get_dcp_world_size
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
     pcp_allgather_rerange,
@@ -14,8 +15,8 @@ from atom.distributed.pcp_utils import (
     pcp_round_robin_split,
 )
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
+from atom.spec_decode.draft_kv import draft_kv_builder
 from atom.spec_decode.drafter import Drafter
-from atom.spec_decode.eagle3_kv_builder import Eagle3DraftBuilder
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
@@ -87,6 +88,10 @@ class EagleProposer(Drafter):
         # Gated on method=mtp, DSA index_topk and the config flag, so other
         # draft backends are unchanged. (DSpark is DSparkProposer, not this
         # class, so it cannot reach here.)
+        #
+        # Not under DCP: the reuse gathers indices at a fixed stride, while DCP
+        # compacts each rank's owned slots to a data-dependent length recorded
+        # in dcp_sparse_kv_indptr_buffer.
         draft_hf = self.speculative_config.draft_model_hf_config
         mtp_inner = getattr(self.model, "model", None)
         self._share_mtp_indices = (
@@ -95,6 +100,7 @@ class EagleProposer(Drafter):
             and hasattr(draft_hf, "index_topk")
             and mtp_inner is not None
             and hasattr(mtp_inner, "set_skip_topk")
+            and get_dcp_world_size() == 1
         )
         if self._share_mtp_indices:
             logger.info(
@@ -173,7 +179,7 @@ class EagleProposer(Drafter):
 
         Nothing of the target's metadata is installed here. The pad rows are
         already masked where it matters: `prepare_mtp_decode` writes `-1` into
-        `batch_id_per_token`, and the index kernel returns on `bid < 0` before it
+        `batch_id_per_q_token`, and the index kernel returns on `bid < 0` before it
         ever loads a ring slot.
         """
         return self.model(
@@ -217,16 +223,14 @@ class EagleProposer(Drafter):
                 draft_atom_config,
                 layer_offset=self.config.hf_config.num_hidden_layers,
             )
-            # MHA draft (e.g. K2.5 LlamaForCausalLMEagle3): owns an independent
-            # non-MLA KV cache via Eagle3DraftBuilder, attached to the runner.
-            # MLA draft (e.g. K2.6 EAGLE 3.1): same MLA shape as target, so
-            # it piggybacks on the target's MLA pool (model_runner accounts
-            # for the +1 draft layer via num_nextn_predict_layers default).
-            draft_is_mla = bool(getattr(draft_model_hf_config, "kv_lora_rank", None))
-            if not draft_is_mla:
-                self.runner.eagle3_draft_builder = Eagle3DraftBuilder(
-                    self.runner, draft_model_hf_config
-                )
+            # Whether this draft needs a KV pool of its own is a property of
+            # the draft's config, answered by the backend that config resolves
+            # to. A draft whose rows are the target's latent (K2.6 EAGLE 3.1)
+            # binds into the target's pool and gets None here; model_runner
+            # accounts for its +1 layer via num_nextn_predict_layers.
+            builder = draft_kv_builder(self.runner, draft_model_hf_config)
+            if builder is not None:
+                self.runner.draft_kv_builder = builder
             return model
 
         return model_class(self.config)
@@ -331,9 +335,10 @@ class EagleProposer(Drafter):
         if any(t < 0 for t in anchors):
             return
 
-        # Anchor row per sequence = `cu_seqlens_q[1:] - 1`, the rule
-        # `propose_draft_token_ids` uses on a pure prefill step.
-        last_token_indices = self.prepare_inputs(scheduled_bs, 1)
+        # Nothing was verified here, so every sequence anchors on its segment's
+        # last row -- the same rule `propose_draft_token_ids` applies to the
+        # prefill head of a batch.
+        last_token_indices = self.prepare_inputs(scheduled_bs)
         anchor_ids = forward_context.context.draft_anchor_overrides
         assert anchor_ids is not None
         anchor_ids = anchor_ids[:scheduled_bs]
@@ -435,7 +440,7 @@ class EagleProposer(Drafter):
         attn_metadata, context = fc.attn_metadata, fc.context
         var = self.runner.forward_vars
         builder = self.runner.attn_metadata_builder
-        target_uses_mla = self.runner.use_mla
+        target_uses_mla = self.runner.attn_family.is_mla
         has_flat_kv = "kv_indices" in var
         i0_max_seqlen_q = attn_metadata.max_seqlen_q
         attn_metadata.max_seqlen_q = 1
@@ -466,6 +471,10 @@ class EagleProposer(Drafter):
         # block_tables, context_lens, and sparse_kv_indptr are
         # needed by both MHA and MLA+sparse attention
         attn_metadata.block_tables = var["block_tables"].gpu[:running_bs]
+        if attn_metadata.dcp_token_block_tables is not None:
+            # One query per sequence, so the per-token table is block_tables
+            # itself; the verify step's has the right row count, wrong rows.
+            attn_metadata.dcp_token_block_tables = attn_metadata.block_tables
         attn_metadata.context_lens = var["context_lens"].gpu[:running_bs]
         if "sparse_kv_indptr" in var:
             attn_metadata.sparse_kv_indptr = var["sparse_kv_indptr"].gpu[
@@ -474,10 +483,11 @@ class EagleProposer(Drafter):
         cu_seqlens_q[: running_bs + 1] = builder.row_ids[: running_bs + 1]
         if target_uses_mla and has_flat_kv:
             # MLA: block_size=1, kv_indptr tracks tokens
-            # Per REAL request: `num_reject_tokens` is scheduled_bs-long, a pad row
-            # rejected nothing. Their `kv_indptr` keeps what the target left,
-            # which is one of its own valid ranges, so their reads stay in
-            # bounds; their WRITES are what has to be neutralized, below.
+            # Per REAL request: `num_reject_tokens` is scheduled_bs-long, a pad
+            # row rejected nothing. That leaves the tail holding whatever batch
+            # last occupied those rows, which no longer continues the rows just
+            # rebased here -- `prepare_mtp_decode` closes it, per backend.
+            # Their WRITES are neutralized below.
             kv_indptr[1 : scheduled_bs + 1] -= torch.cumsum(num_reject_tokens, dim=0)
         if positions.ndim == 1:
             positions = torch.index_select(positions, 0, last_token_indices)
@@ -544,7 +554,7 @@ class EagleProposer(Drafter):
             draft_token_ids.fill_(-1)
         var = self.runner.forward_vars
         # Eaale3 only support mha currently
-        draft_uses_mha = hasattr(self.runner, "eagle3_draft_builder")
+        draft_uses_mha = hasattr(self.runner, "draft_kv_builder")
 
         # Eagle3 MHA reuses target metadata, but the target may be MLA.  Keep
         # write slots sized to this draft pass, and when prefix cache is active
