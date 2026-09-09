@@ -14,7 +14,9 @@ from torch import nn
 
 from atom.config import get_current_atom_config
 from atom.model_ops.base_attention import (
+    PA_ASM_MAX_QUERY_GROUP_SIZE,
     cp_mha_gather_cache,
+    gluon_decode_over_limit,
     run_pa_decode_gluon,
     run_pa_fwd_asm,
 )
@@ -78,7 +80,9 @@ class PagedAttentionImpl(nn.Module):
             if self.kv_cache_dtype == "fp8"
             else 1.0
         )
-        self.kv_scale = torch.tensor(self.kv_scale_float, dtype=torch.float32)
+        self.kv_scale = torch.tensor(
+            self.kv_scale_float, dtype=torch.float32, device=self.device
+        )
         # Pre-allocated fp8 dequant scale for the pa_decode_bf16_asm path. Built
         # here (outside CUDAGraph capture) and reused so the kernel wrapper never
         # allocates a tensor mid-capture.
@@ -162,6 +166,21 @@ class PagedAttentionImpl(nn.Module):
         if q.shape[0] != k.shape[0] or k.shape[0] != v.shape[0]:
             return False
         return q.shape[1] % k.shape[1] == 0
+
+    def _reject_per_token_scales_on_unified(self, k_scale, v_scale, phase: str):
+        """unified_attention carries one descale for the whole tensor.
+
+        Feeding it a per-token cache is not an error downstream, just wrong
+        numbers, so it has to be refused here. Both phases route into unified on
+        the same conditions, so both check.
+        """
+        if (k_scale is not None and k_scale.numel() > 1) or (
+            v_scale is not None and v_scale.numel() > 1
+        ):
+            raise NotImplementedError(
+                f"layer {self.layer_num} takes unified_attention for {phase}, "
+                "which cannot carry its per-token KV scales"
+            )
 
     def forward_impl(
         self,
@@ -475,113 +494,124 @@ class PagedAttentionImpl(nn.Module):
         x = int(k_cache.shape[-1])
         return v_cache.view(n, nh, block_size // x, head_dim, x)
 
-    @mark_trace(prefix="paged_attention_triton", torch_compile=False)
-    def paged_attention_triton(
+    @mark_trace(prefix="paged_attention_unified", torch_compile=False)
+    def paged_attention_unified(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
+        """Decode through unified_attention: the widest envelope, no q-len cap.
 
+        _dispatch_decode sends every shape here that the paged kernels decline,
+        so the per-token check belongs to arriving here rather than to any one
+        of the reasons for it.
+        """
         attn_metadata = fwd_ctx.attn_metadata
+        self._reject_per_token_scales_on_unified(k_scale, v_scale, "decode")
 
         if envs.ATOM_USE_UNIFIED_ATTN and self.kv_cache_dtype.startswith("fp8"):
             o = torch.empty(*q.shape, dtype=torch.bfloat16, device=q.device)
         else:
             o = torch.empty_like(q)
 
+        sliding_window = (
+            (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
+        )
+        unified_attention(
+            q,
+            k_cache,
+            v_cache,
+            o,
+            cu_seqlens_q=attn_metadata.cu_seqlens_q,
+            seqused_k=attn_metadata.context_lens,
+            max_seqlen_q=attn_metadata.max_seqlen_q,
+            max_seqlen_k=attn_metadata.max_seqlen_k,
+            softmax_scale=self.scale,
+            causal=True,
+            alibi_slopes=None,
+            window_size=sliding_window,
+            block_table=attn_metadata.block_tables,
+            softcap=0,
+            q_descale=None,
+            k_descale=self.kv_scale,
+            v_descale=self.kv_scale,
+            sinks=self.sinks,
+            shuffled_kv_cache=not self.use_flash_layout,
+        )
+        return o
+
+    @mark_trace(prefix="paged_attention_triton", torch_compile=False)
+    def paged_attention_triton(
+        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
+    ):
+        """Decode through the gluon paged kernel. Callers must have cleared
+        gluon_decode_over_limit -- _dispatch_decode is where that happens."""
+
+        attn_metadata = fwd_ctx.attn_metadata
+
+        o = torch.empty_like(q)
+
         num_seqs = attn_metadata.context_lens.shape[0]
 
-        if envs.ATOM_USE_UNIFIED_ATTN or self.use_flash_layout:
-            # print(q.shape, k_cache.shape, v_cache.shape)
-            sliding_window = (
-                (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
-            )
+        _, num_q_heads_total, head_size = q.shape
+        _, num_kv_heads, _, _, _ = k_cache.shape
+        query_group_size = attn_metadata.max_seqlen_q * (
+            num_q_heads_total // num_kv_heads
+        )
+        assert num_q_heads_total % num_kv_heads == 0
 
-            shuffled_kv_cache = not self.use_flash_layout
+        max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
 
-            unified_attention(
-                q,
-                k_cache,
-                v_cache,
-                o,
-                cu_seqlens_q=attn_metadata.cu_seqlens_q,
-                seqused_k=attn_metadata.context_lens,
-                max_seqlen_q=attn_metadata.max_seqlen_q,
-                max_seqlen_k=attn_metadata.max_seqlen_k,
-                softmax_scale=self.scale,
-                causal=True,
-                alibi_slopes=None,
-                window_size=sliding_window,
-                block_table=attn_metadata.block_tables,
-                softcap=0,
-                q_descale=None,
-                k_descale=self.kv_scale,
-                v_descale=self.kv_scale,
-                sinks=self.sinks,
-                shuffled_kv_cache=shuffled_kv_cache,
-            )
-        else:
-            _, num_q_heads_total, head_size = q.shape
-            _, num_kv_heads, _, _, _ = k_cache.shape
-            query_group_size = attn_metadata.max_seqlen_q * (
-                num_q_heads_total // num_kv_heads
-            )
-            assert num_q_heads_total % num_kv_heads == 0
+        context_partition_size = 256
+        if self.sliding_window > 0:
+            max_context_partition_num = 1
+            context_partition_size = 128
 
-            max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
+        intermediate_shape = (
+            num_seqs,
+            num_kv_heads,
+            max_context_partition_num,
+            query_group_size,
+        )
+        exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
+        max_logits = torch.empty(
+            intermediate_shape, dtype=torch.float32, device=q.device
+        )
+        temporary_output = torch.empty(
+            *intermediate_shape,
+            head_size,
+            dtype=q.dtype,
+            device=q.device,
+        )
 
-            context_partition_size = 256
-            if self.sliding_window > 0:
-                max_context_partition_num = 1
-                context_partition_size = 128
+        if k_scale is not None and k_scale.numel() > 1:
+            k_scale = k_scale.unsqueeze(-1)
+            v_scale = v_scale.unsqueeze(-1)
 
-            intermediate_shape = (
-                num_seqs,
-                num_kv_heads,
-                max_context_partition_num,
-                query_group_size,
-            )
-            exp_sums = torch.empty(
-                intermediate_shape, dtype=torch.float32, device=q.device
-            )
-            max_logits = torch.empty(
-                intermediate_shape, dtype=torch.float32, device=q.device
-            )
-            temporary_output = torch.empty(
-                *intermediate_shape,
-                head_size,
-                dtype=q.dtype,
-                device=q.device,
-            )
-
-            if k_scale is not None and k_scale.numel() > 1:
-                k_scale = k_scale.unsqueeze(-1)
-                v_scale = v_scale.unsqueeze(-1)
-
-            compute_type = (
-                torch.bfloat16 if self.kv_cache_dtype == "bf16" else aiter.dtypes.fp8
-            )
-            run_pa_decode_gluon(
-                output=o,
-                q=q,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                context_lens=attn_metadata.context_lens,
-                block_tables=attn_metadata.block_tables,
-                softmax_scale=self.scale,
-                max_seqlen_q=attn_metadata.max_seqlen_q,
-                max_context_partition_num=max_context_partition_num,
-                context_partition_size=context_partition_size,
-                compute_type=compute_type,
-                q_scale=None,
-                k_scale=None if self.kv_cache_dtype == "bf16" else k_scale,
-                v_scale=None if self.kv_cache_dtype == "bf16" else v_scale,
-                exp_sums=exp_sums,
-                max_logits=max_logits,
-                temporary_output=temporary_output,
-                alibi_slopes=None,
-                sinks=self.sinks,
-                sliding_window=self.sliding_window,
-                ps=True,
-            )
+        compute_type = (
+            torch.bfloat16 if self.kv_cache_dtype == "bf16" else aiter.dtypes.fp8
+        )
+        run_pa_decode_gluon(
+            output=o,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            context_lens=attn_metadata.context_lens,
+            block_tables=attn_metadata.block_tables,
+            softmax_scale=self.scale,
+            max_seqlen_q=attn_metadata.max_seqlen_q,
+            max_context_partition_num=max_context_partition_num,
+            context_partition_size=context_partition_size,
+            compute_type=compute_type,
+            q_scale=None,
+            k_scale=None if self.kv_cache_dtype == "bf16" else k_scale,
+            v_scale=None if self.kv_cache_dtype == "bf16" else v_scale,
+            exp_sums=exp_sums,
+            max_logits=max_logits,
+            temporary_output=temporary_output,
+            alibi_slopes=None,
+            sinks=self.sinks,
+            sliding_window=self.sliding_window,
+            ps=True,
+        )
 
         return o
 
@@ -763,7 +793,6 @@ class PagedAttentionImpl(nn.Module):
     def prefill_attention_triton(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
-
         # unified_attention supports both prefill and decode, over either the 4D
         # flash layout (shuffled_kv_cache=False) or the 5D SHUFFLE layout
         # (shuffled_kv_cache=True):
@@ -801,6 +830,9 @@ class PagedAttentionImpl(nn.Module):
         # are read straight from `k_cache`/`v_cache`, identical to the
         # prefix-cache-hit path.
         if envs.ATOM_USE_UNIFIED_ATTN or attn_metadata.has_cached:
+            # Only this branch reads the quantized cache; the else below passes
+            # raw bf16 K/V, where a per-token scale never reaches the kernel.
+            self._reject_per_token_scales_on_unified(k_scale, v_scale, "prefill")
             k_for_attn = k_cache
             v_for_attn = v_cache
             # Reads the paged KV cache, which is 5D SHUFFLE unless the (default)
@@ -849,25 +881,65 @@ class PagedAttentionImpl(nn.Module):
 
         return o
 
-    def _dispatch_decode(self):
+    def _dispatch_decode(self, max_qlen: int = 1):
+        """The single place that answers which decode kernel runs.
+
+        The runners do not re-decide. The vLLM bridge shares the constants and
+        the predicate, not this order -- its arms differ (no unified fallback,
+        no sliding-window arm). Both
+        paged kernels stop short of unified, at different points, and drafting
+        multiplies the query group into both limits. ASM is the one that must be
+        checked here rather than inside its runner: past its envelope
+        get_heuristic_kernel silently re-runs with mtp=1, a kernel built for
+        another query length, and computes a wrong answer instead of refusing.
+        """
+        # Clamped once here so both gates see the same value; the predicate
+        # clamps internally too, and a sentinel would otherwise split them.
+        max_qlen = max(1, int(max_qlen))
+        over_gluon = gluon_decode_over_limit(
+            max_qlen, self.num_heads, self.num_kv_heads
+        )
+        over_asm = (
+            max_qlen * (self.num_heads // self.num_kv_heads)
+            > PA_ASM_MAX_QUERY_GROUP_SIZE
+        )
+
+        # unified takes any shape; the two paged kernels do not. Kept as one
+        # expression because a sliding-window layer needs the same answer, and
+        # it returns before the env checks below.
+        wants_unified = (
+            envs.ATOM_USE_UNIFIED_ATTN or self.use_flash_layout or over_gluon
+        )
+
         # Sliding-window layers must use triton (ASM paths don't support it)
         if self.sliding_window != -1:
-            return self.paged_attention_triton
+            return (
+                self.paged_attention_unified
+                if wants_unified
+                else self.paged_attention_triton
+            )
 
         atom_config = get_current_atom_config()
 
         if envs.ATOM_USE_UNIFIED_ATTN:
             if envs.ATOM_FORCE_ATTN_TRITON:
-                return self.paged_attention_triton
+                return self.paged_attention_unified
             if atom_config.kv_cache_block_size == 256:
                 return self.paged_attention_persistent_asm
+            return self.paged_attention_unified
+
+        if wants_unified:
+            return self.paged_attention_unified
+        if self.use_triton_attn:
             return self.paged_attention_triton
 
-        if self.use_triton_attn or self.use_flash_layout:
+        # use_pa_decode_bf16_asm() requires ATOM_USE_UNIFIED_ATTN, which the
+        # block above has already returned on, so it cannot be reached here.
+        # Only run_pa_fwd_asm is bounded here. The persistent paths above call
+        # pa_persistent_fwd / pa_decode_bf16_asm, different kernels with their
+        # own tables, so this envelope does not describe them.
+        if over_asm:
             return self.paged_attention_triton
-
-        if use_pa_decode_bf16_asm():
-            return self.paged_attention_persistent_asm
         return self.paged_attention_asm
 
     def dispatch_backend(
@@ -886,7 +958,9 @@ class PagedAttentionImpl(nn.Module):
             if envs.ATOM_USE_UNIFIED_ATTN or self.use_flash_layout:
                 return self.prefill_attention_triton
             return self.prefill_attention
-        return self._dispatch_decode()
+        attn_metadata = fwd_ctx.attn_metadata
+        max_qlen = 1 if attn_metadata is None else attn_metadata.max_seqlen_q
+        return self._dispatch_decode(max_qlen)
 
     def forward(
         self,
