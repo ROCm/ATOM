@@ -171,6 +171,9 @@ class Sequence:
         self.mrope_position_delta = mrope_position_delta
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
+        # Initial local prefill telemetry; kept across preemption/recomputation.
+        self.prefill_gpu_chunks = 0
+        self.prefill_gpu_complete = False
         self.num_rejected = 0
         self.num_cached_tokens = 0
         # Tokens whose blocks are registered in the prefix cache: through the

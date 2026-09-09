@@ -1,15 +1,26 @@
 """Nonblocking, bounded device-event timing for real target-model forwards."""
 
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import wraps
 
 from atom.model_engine.scheduler_metrics import LATENCY_BUCKETS, CumulativeHistogram
 
 
+@dataclass
+class _RequestTiming:
+    req_id: int
+    chunks: int = 0
+    pending: int = 0
+    final: bool = False
+    valid: bool = True
+    total: float = 0.0
+
+
 class GPUForwardMetrics:
-    def __init__(self, event_factory, max_pending=256):
+    def __init__(self, event_factory, max_pending=256, max_requests=4096):
         self.event_factory = event_factory
         self.max_pending = max_pending
         self.pending = deque()
@@ -19,17 +30,61 @@ class GPUForwardMetrics:
             for phase in ("prefill", "decode", "mixed")
         }
         self.dropped = 0
+        self.prefill_requests = CumulativeHistogram(LATENCY_BUCKETS)
+        self.max_requests = max_requests
+        self.requests = OrderedDict()
+        self.request_dropped = 0
+
+    def _discard_request(self, req_id):
+        state = self.requests.pop(req_id, None)
+        if state is not None:
+            state.valid = False
+            self.request_dropped += 1
+
+    def _request_chunks(self, batch):
+        states = []
+        for req_id, chunk, final in getattr(batch, "prefill_gpu_requests", ()):
+            if chunk == 1:
+                # Request IDs may be reused; pending events keep the old state
+                # object and must never finish a newly admitted request.
+                self._discard_request(req_id)
+                if len(self.requests) >= self.max_requests:
+                    self._discard_request(next(iter(self.requests)))
+                self.requests[req_id] = _RequestTiming(req_id)
+            state = self.requests.get(req_id)
+            if state is None:
+                continue  # Missing/evicted first chunk: never publish a partial sum.
+            if chunk != state.chunks + 1 or state.final:
+                self._discard_request(req_id)
+                continue
+            state.chunks = chunk
+            state.pending += 1
+            state.final = final
+            states.append(state)
+            self.requests.move_to_end(req_id)
+        return states
 
     def poll(self):
         # query() never waits for the GPU. Different streams can complete out
         # of order; retain unready pairs without blocking completed samples.
         for _ in range(len(self.pending)):
-            phase, start, end = self.pending.popleft()
+            phase, start, end, requests = self.pending.popleft()
             if end.query():
-                self.histograms[phase].observe(start.elapsed_time(end) / 1000)
+                seconds = start.elapsed_time(end) / 1000
+                self.histograms[phase].observe(seconds)
+                for state in requests:
+                    state.pending -= 1
+                    if not state.valid:
+                        continue
+                    state.total += seconds
+                    # Last chunk can finish on a different stream before earlier
+                    # events are ready. Publish only once every chunk is measured.
+                    if state.final and state.pending == 0:
+                        self.prefill_requests.observe(state.total)
+                        del self.requests[state.req_id]
                 self.free.append((start, end))
             else:
-                self.pending.append((phase, start, end))
+                self.pending.append((phase, start, end, requests))
 
     @contextmanager
     def measure(self, batch):
@@ -37,8 +92,11 @@ class GPUForwardMetrics:
         if batch is None or batch.is_dummy_run or not batch.req_ids:
             yield
             return
+        requests = self._request_chunks(batch)
         if len(self.pending) >= self.max_pending:
             self.dropped += 1
+            for state in requests:
+                self._discard_request(state.req_id)
             yield
             return
         p = batch.total_seqs_num_prefill > 0
@@ -50,10 +108,14 @@ class GPUForwardMetrics:
             else (self.event_factory(), self.event_factory())
         )
         start.record()
-        # An exception thrown through yield skips publication of this sample.
-        yield
-        end.record()
-        self.pending.append((phase, start, end))
+        try:
+            yield
+            end.record()
+        except BaseException:
+            for state in requests:
+                self._discard_request(state.req_id)
+            raise
+        self.pending.append((phase, start, end, requests))
 
     def snapshot(self):
         self.poll()
@@ -61,6 +123,9 @@ class GPUForwardMetrics:
             "phases": {k: h.snapshot() for k, h in self.histograms.items()},
             "pending": len(self.pending),
             "dropped": self.dropped,
+            "prefill_requests": self.prefill_requests.snapshot(),
+            "prefill_requests_tracked": len(self.requests),
+            "prefill_requests_dropped": self.request_dropped,
             "timestamp": time.time(),
         }
 

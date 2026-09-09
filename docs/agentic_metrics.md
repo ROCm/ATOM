@@ -202,6 +202,38 @@ Engine 每秒异步请求一次设备计时快照；结果通过现有 worker �
 设备快照，只有 head 推送调度器计数，避免重复累计请求、缓存和 KV 池。
 快照与 API 刷新存在延迟，设备直方图记录的是已完成且已上报的事件。
 
+### 每请求累计 Prefill GPU forward
+
+`atom:prefill_request_gpu_forward_seconds` 将同一请求首次本地 prefill
+各个 chunk 参与的 forward 耗时加和，在最后一个 chunk 及其之前所有 GPU
+计时事件都完成后，每个 worker 上报一条样本。不切 chunk 时就是一次
+forward 的耗时。例如三个 chunk 分别耗时 10、12、8 ms，请求指标记录
+一条 30 ms 样本，原来的 forward 指标仍记录三条样本。
+
+一次 forward 包含多个请求时，每个 prefill 请求都累计该 batch 的完整
+耗时；mixed batch 也按整个 forward 计时。它表示请求参与的 GPU forward
+时间之和，**不是该请求独占的 GPU 计算时间**，也不包含 chunk 之间的
+排队、KV 加载、输入准备、采样或 drafting。缓存前缀不产生额外样本；
+开始生成之后的重新 prefill 不再计入。初始 prefill 完成前发生的重新计算
+仍累计到同一个请求样本中。D 端仅接收远端 KV、直接 decode 的请求不产生
+本地 prefill 样本。
+
+标签为 `dp_rank, pp_rank, tp_rank, engine_role`，不带 request ID。
+TP/PP 的统计口径与每次 forward 指标相同：每个 worker 独立累计，PP 仅为
+本地 stage；看板合并 worker 的样本分布，不把不同 rank 的时间相加。
+`Prefill request GPU forward` 位于 Latency 分类，支持实例筛选、
+Mean/P50/P90/P95/P99、表格和 CSV，保持默认 Overview 面板数量不变。
+曲线按最近采样窗口内**完成并上报累计计时**的样本统计；该样本可包含
+窗口之前执行的 chunk。
+
+每个 worker 最多保存 4096 个未完成请求的累计状态，达到上限时淘汰最久
+未更新的状态。中止在半途的 prefill 不上报请求样本，残留状态受此上限
+约束。若某个 chunk 的事件被跳过、执行失败、chunk 序号不连续或状态被
+淘汰，整个请求计时作废，不把部分和作为完整耗时发布。
+`atom:prefill_request_gpu_forward_tracked` 显示保留的累计状态数量（可能包含
+尚未被淘汰的中止请求）；`atom:prefill_request_gpu_forward_dropped_total`
+记录作废的累计状态数。读取事件仍通过非阻塞 `query()`，没有新增 GPU 同步。
+
 ## 多实例看板
 
 报告默认进入 **Overview**，展示 P/D 各四项：TTFT、排队时间、缓存命中、GPU

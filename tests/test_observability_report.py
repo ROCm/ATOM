@@ -166,6 +166,30 @@ def test_grouped_queries_preserve_instances_and_weight_ratios():
     assert panels["prefill_batch_tokens"]["metric"] == "atom:prefill_batch_tokens"
 
 
+def test_request_gpu_time_uses_completed_request_histograms_and_instance_filters():
+    panels = {p["id"]: p for p in report.panels_for("pd")}
+    request = panels["prefill_request_gpu_forward"]
+    assert request["title"] == "Prefill request GPU forward"
+    assert request["category"] == "latency" and request["unit"] == "ms"
+    assert not request["overview"]
+    assert sum(p["overview"] for p in panels.values()) == 8
+    assert report.statistics_for(request) == ("mean", "p50", "p90", "p95", "p99")
+    mean = report.query_for(request, "mean", 60)
+    assert mean.startswith("1000 * ")
+    assert (
+        'rate(atom:prefill_request_gpu_forward_seconds_sum{job="atom",role="prefill"}[60s])'
+        in mean
+    )
+    assert "atom:prefill_request_gpu_forward_seconds_count" in mean
+    percentile = report.query_for(request, "p99", 60, by_instance=True)
+    assert "sum by (instance, le)" in percentile and "avg(" not in percentile
+    assert "phase=" not in percentile
+    standalone = {p["id"]: p for p in report.panels_for("standalone")}
+    assert (
+        'role="standalone"' in standalone["standalone_request_gpu_forward"]["selector"]
+    )
+
+
 def test_instance_queries_retain_missing_values_and_do_not_average_percentiles(
     monkeypatch, tmp_path
 ):
