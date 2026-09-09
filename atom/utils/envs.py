@@ -277,11 +277,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Log every garbage collection: generation, duration, objects reclaimed.
     "ATOM_GC_DEBUG": lambda: os.getenv("ATOM_GC_DEBUG", "0") == "1",
     # "t0,t1,t2" for gc.set_threshold(); empty keeps CPython's default.
-    # Read independently by the API server, each EngineCore and each
-    # ModelRunner worker -- thresholds are per-interpreter.  A fallback for
-    # ATOM_GC_FREEZE=0: freezing removes the cost of a pass, this only spaces
-    # the passes out.  See tune_gc in atom/utils/gc_utils.py.
+    # Thresholds are per-interpreter, but this is one variable, read by every
+    # process that serves -- and only the frontend was measured to reclaim
+    # nothing, so setting it tunes three others blind. t0 must be >= 1: zero
+    # stops collection while the watch still reports the healthy shape.
+    # See tune_gc in atom/utils/gc_utils.py.
     "ATOM_GC_THRESHOLD": lambda: os.getenv("ATOM_GC_THRESHOLD", "").strip(),
+    # Whether the incremental detokenizer may reuse the delta it last emitted
+    # in place of one of its two decodes per update. "auto" verifies at startup
+    # that this tokenizer decodes a token span the same way wherever the window
+    # starts; "on"/"off" pin it. Unrelated to the KV prefix cache.
+    # See enable_delta_reuse in atom/entrypoints/openai/streaming_dispatch.py.
+    "ATOM_DETOKENIZER_DELTA_REUSE": lambda: os.getenv(
+        "ATOM_DETOKENIZER_DELTA_REUSE", "auto"
+    )
+    .strip()
+    .lower(),
+    # How often the reused delta is checked against a real decode once reuse is
+    # on. 1 checks every update; a mismatch corrects that call's output and
+    # turns reuse off for the process.  Text, not int, for the reason
+    # ATOM_GC_THRESHOLD is: it is read as an argument at a callsite that has
+    # already loaded the weights, so it is parsed where a bad value can be
+    # answered with a warning instead of a traceback.
+    "ATOM_DETOKENIZER_AUDIT_EVERY": lambda: os.getenv(
+        "ATOM_DETOKENIZER_AUDIT_EVERY", ""
+    ).strip(),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
     # When profiling is active, append detailed attention aggregates (sqsq, sqsk, sk)
     # to the prefill[]/decode[] trace labels emitted by ModelRunner.run_model.
