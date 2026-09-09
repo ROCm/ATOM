@@ -33,6 +33,7 @@ levels is reported as ``insufficient``; if no family survives, the whole run is
 
 import argparse
 import collections
+import datetime
 import json
 import re
 import statistics
@@ -98,6 +99,7 @@ DRIFT_MEDIAN_TH = -4.0  # family median change that counts as drift
 DRIFT_MIN_DOWN = 3  # ... on at least this many levels
 DRIFT_DOWN_EPS = -2.0  # a level counts as "down" past this
 DRIFT_TPOT_MIRROR = 0.6  # |TPOT change / throughput change| confirming it
+DRIFT_MIN_RUNS = 7  # runs a level needs before it counts toward a family
 DRIFT_SMOOTH_K = 3  # points averaged at each end, to flatten run-to-run jitter
 
 # A paired comparison answers "did this change make it worse" and is blind to
@@ -290,6 +292,54 @@ def _drift_lag(points, days, field):
     return (statistics.mean(now[:DRIFT_SMOOTH_K]) / base - 1) * 100
 
 
+def _drift_onset(members):
+    """The day the level actually changed, found in the data.
+
+    Reporting the horizon instead ("7d") says the slide lasted as long as the
+    window, whatever the data did -- and the two are routinely different: a
+    single night's step reads as a week of decline. The upstream monitor was
+    rewritten for exactly this, having reported 17 days for a drop that
+    happened over one.
+
+    Each level is normalised by its own mean before the daily index is built,
+    so a high-throughput level cannot dominate the shape, then every split with
+    at least two points on each side is scored by how far the mean falls across
+    it. The steepest split is the onset.
+    """
+    per_day = collections.defaultdict(list)
+    for points in members:
+        values = [p["tput"] for p in points if p.get("tput")]
+        if not values:
+            continue
+        mean = statistics.mean(values)
+        if not mean:
+            continue
+        for p in points:
+            if p.get("tput"):
+                day = datetime.datetime.fromtimestamp(
+                    p["date"] / 1000, datetime.timezone.utc
+                ).strftime("%Y-%m-%d")
+                per_day[day].append(p["tput"] / mean)
+
+    seq = [(d, statistics.mean(v)) for d, v in sorted(per_day.items())]
+    if len(seq) < 5:
+        return None
+    best, best_drop = None, 0.0
+    for i in range(2, len(seq) - 1):
+        pre = statistics.mean(v for _, v in seq[:i])
+        post = statistics.mean(v for _, v in seq[i:])
+        if not pre:
+            continue
+        drop = (pre - post) / pre * 100
+        if drop > best_drop:
+            best, best_drop = seq[i][0], drop
+    # A shallow best split is a slope, not a step -- naming a day for it would
+    # be false precision.
+    if best is None or best_drop < abs(DRIFT_MEDIAN_TH):
+        return None
+    return {"date": best, "drop_pct": -best_drop}
+
+
 def main_drift(series, models):
     """Families on main that have been sliding, restricted to `models`.
 
@@ -303,16 +353,28 @@ def main_drift(series, models):
     one the reader is looking at.
     """
     families = collections.defaultdict(list)
+    # Why a family did not qualify, so a family outside coverage is visible
+    # rather than absent. A silent skip and a clean result look identical.
+    short = collections.defaultdict(list)
     for (model, isl_osl, conc), points in series.items():
         if conc < DRIFT_MIN_CONC or model not in models:
             continue
-        if len(points) < 2 * DRIFT_SMOOTH_K:
+        if len(points) < max(DRIFT_MIN_RUNS, 2 * DRIFT_SMOOTH_K):
+            short[(model, isl_osl)].append((conc, len(points)))
             continue
         families[(model, isl_osl)].append(sorted(points, key=lambda p: p["date"]))
 
     found = []
+    waiting = []
     for (model, isl_osl), members in families.items():
         if len(members) < DRIFT_FAM_MIN_CONFIGS:
+            waiting.append(
+                (
+                    model,
+                    isl_osl,
+                    f"{len(members)} of {DRIFT_FAM_MIN_CONFIGS} levels have enough history",
+                )
+            )
             continue
         worst = None
         for horizon in DRIFT_HORIZONS:
@@ -347,6 +409,20 @@ def main_drift(series, models):
                 worst = {
                     "model": model,
                     "isl_osl": isl_osl,
+                    "onset": _drift_onset(members),
+                    "per_conc": sorted(
+                        (c, round(d, 1))
+                        for c, d in zip(
+                            sorted(
+                                k[2]
+                                for k in series
+                                if k[0] == model
+                                and k[1] == isl_osl
+                                and k[2] >= DRIFT_MIN_CONC
+                            ),
+                            tputs,
+                        )
+                    ),
                     "horizon_days": horizon,
                     "median_pct": median,
                     "median_tpot_pct": median_tpot,
@@ -355,8 +431,19 @@ def main_drift(series, models):
                 }
         if worst:
             found.append(worst)
+    for key, levels in short.items():
+        if key in families:
+            continue
+        best = max(n for _, n in levels)
+        waiting.append(
+            (
+                key[0],
+                key[1],
+                f"no level has {DRIFT_MIN_RUNS} runs yet (most is {best})",
+            )
+        )
     found.sort(key=lambda f: f["median_pct"])
-    return found
+    return {"rows": found, "waiting": sorted(waiting)}
 
 
 # --------------------------------------------------------------------------
@@ -710,7 +797,8 @@ def judge(pairs, history_cv, expected_entries=None, drift=None):
         "n_bad_baseline": len(bad_baseline),
         # Context, deliberately outside the verdict: main sliding is not
         # something this PR did, and folding it in would blame the author.
-        "main_drift": drift or [],
+        "main_drift": (drift or {}).get("rows", []),
+        "drift_waiting": (drift or {}).get("waiting", []),
         "median_drift_pct": _median_or_none(
             [
                 f["median_drift_pct"]
@@ -855,7 +943,7 @@ def render(report, context):
     # in the per-level table. The breakdown is one click away and carries the
     # shape the criterion actually rests on.
     lines += [
-        "| Model | Levels slower | Total Tput | TPOT | TTFT |",
+        f"| Model | Levels &le; {DOWN_EPS_PCT}% | Total Tput | TPOT | TTFT |",
         "|---|---|---|---|---|",
     ]
     for family in report["families"]:
@@ -989,24 +1077,61 @@ def render(report, context):
             "<summary><b>Sliding on main — not this PR</b> "
             "({} {})</summary>".format(n, "family" if n == 1 else "families"),
             "",
-            "| Model | Input/output | Window | Throughput | TPOT | Levels slower |",
+            "| Model | Input/output | Onset | Throughput | TPOT | Levels &le; -2% |",
             "|---|---|---|---|---|---|",
         ]
         for d in report["main_drift"]:
             drift_lines.append(
-                f"| {d['model']} | {d['isl_osl']} | {d['horizon_days']}d "
-                f"| {d['median_pct']:+.1f}% | {_fmt(d['median_tpot_pct'])} "
-                f"| {d['n_down']}/{d['n_total']} |"
+                "| {model} | {shape} | {onset} | {tput} | {tpot} | {down} of {tot} |".format(
+                    model=d["model"],
+                    shape=d["isl_osl"],
+                    onset=(
+                        "{} ({:+.0f}%)".format(
+                            d["onset"]["date"][5:], d["onset"]["drop_pct"]
+                        )
+                        if d.get("onset")
+                        else "{}d window".format(d["horizon_days"])
+                    ),
+                    tput="{:+.1f}%".format(d["median_pct"]),
+                    tpot=_fmt(d["median_tpot_pct"]),
+                    down=d["n_down"],
+                    tot=d["n_total"],
+                )
             )
+        for d in report["main_drift"]:
+            if d.get("per_conc"):
+                drift_lines.append(
+                    "",
+                )
+                drift_lines.append(
+                    "{}: ".format(d["model"])
+                    + ", ".join(f"c={c} {v:+.1f}%" for c, v in d["per_conc"])
+                )
         drift_lines += [
             "",
             (
-                "The delta above is honest, the absolute level is not. Several "
-                "levels of one model sliding together, TPOT mirroring."
+                "The delta above is honest, the absolute level is not. Onset is "
+                "the day the level actually moved, found in the data -- a step "
+                "and a slow slide look the same in a window figure."
             ),
             "</details>",
             "",
         ]
+
+    # Families the trend criterion could not reach. Absent and clean look the
+    # same otherwise, and a model that has just started running would sit
+    # outside coverage indefinitely with nobody noticing.
+    if report.get("drift_waiting"):
+        drift_lines += [
+            "<details>",
+            "<summary>Not checked for drift ({})</summary>".format(
+                len(report["drift_waiting"])
+            ),
+            "",
+        ]
+        for model, shape, why in report["drift_waiting"]:
+            drift_lines.append(f"- {model} {shape} -- {why}")
+        drift_lines += ["", "</details>", ""]
 
     # --- shape flags -------------------------------------------------------
     for family in report["families"]:
@@ -1091,7 +1216,7 @@ def render(report, context):
             )
             lines.append(
                 f"- **{family['model']}**: {family['n_down']} of "
-                f"{family['n_total']} levels slower, median "
+                f"{family['n_total']} levels at or past {DOWN_EPS_PCT}%, median "
                 f"{_fmt(family['median_tput_pct'])}, "
                 f"TPOT {_fmt(family['median_tpot_pct'])}"
                 + (f" (confirmed by {via}, ratio {ratio:.2f})" if ratio and via else "")
@@ -1302,7 +1427,7 @@ def main():
         history_status = "ok"
 
     models = {p["model"] for p in pairs}
-    drift = main_drift(history_series, models) if history_series else []
+    drift = main_drift(history_series, models) if history_series else None
     report = judge(pairs, history_cv, expected_entries=args.expect_entries, drift=drift)
     report["context"] = args.context
     report["n_pairs"] = len(pairs)
