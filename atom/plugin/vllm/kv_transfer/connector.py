@@ -271,11 +271,32 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         The frontier of every scheduled request is refreshed first: ATOM decides
         which chunks are safe to save by comparing against it, and a stale value
         would either skip chunks or offer up tokens that are not computed yet.
+
+        The frontier is also capped at what the block table actually covers.
+        On ATOM's native path these two quantities live on one Sequence and
+        advance together; here they arrive through two independent vLLM
+        callbacks -- ``num_computed_tokens`` rides on scheduler_output, the
+        block table on ``update_state_after_alloc`` -- and under chunked
+        prefill they separate by a block. ATOM then sizes a save from the
+        frontier and hands the (shorter) block table to LMCache alongside it,
+        which fails the transfer with "LMCache token range exceeds ATOM block
+        table: needed_blocks=N+1, available_blocks=N".
+
+        Capping is the correct semantics, not just a guard: KV for tokens past
+        the block table is not in any block this connector knows about, so
+        offering it up was never right. The remainder is saved on a later step,
+        once the allocation catches up.
+
+        Only long prompts reach this: a chat-sized prompt is allocated in one
+        go, so the two quantities never separate and every gsm8k-scale test
+        passes. It took an ISL-90k aiperf run to surface.
         """
+        block_size = int(self._config.kv_cache_block_size)
         for req_id, num_tokens in _scheduled_frontiers(scheduler_output):
             seq = self._seqs.get(req_id)
             if seq is not None:
-                seq.set_num_cached_tokens(num_tokens)
+                covered = len(seq.block_table) * block_size
+                seq.set_num_cached_tokens(min(int(num_tokens), covered))
         inner = self._scheduler.build_connector_meta()
         self._check_promised_loads(inner)
         return AtomOffloadMetadata(inner)
