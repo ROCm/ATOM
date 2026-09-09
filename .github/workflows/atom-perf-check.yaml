@@ -46,13 +46,16 @@ permissions:
 # same runner, same catalog, same criterion -- at a fraction of the machine
 # time. Widen these once the mechanics are proven; nothing else changes.
 env:
-  PERF_MODELS: glm-5-2-fp8          # tp=4, the only target that is not whole-node
+  # Catalog prefixes, not display names -- MiniMax-M3-MXFP8 is `m3-mxfp8` here.
+  # DeepSeek-V4-Pro MTP3 is added automatically alongside its base by the matrix
+  # step, so four names produce five entries.
+  PERF_MODELS: deepseek-v4-pro,kimi-k3,m3-mxfp8,glm-5-2-fp8
   PERF_ISL: 8192
   PERF_OSL: 1024
   PERF_RATIO: "0.8"
   PERF_JUDGING_CONCS: 64,128,256
-  PERF_REFERENCE_CONCS: ""          # smoke: skip reference levels
-  PERF_EXPECTED_ENTRIES: 1
+  PERF_REFERENCE_CONCS: 4,32        # measured and shown, never judged
+  PERF_EXPECTED_ENTRIES: 5
   # Warmup length as a multiple of the concurrency level, matching the
   # measurement at 10. Set to 1 to reproduce the short warmup the residual
   # was first measured under -- the only single-variable way to separate
@@ -125,13 +128,20 @@ jobs:
               keep.add(("deepseek-v4-pro", "-mtp3"))
           cells = [c for c in cells if (c["prefix"], c["suffix"]) in keep]
           if len(cells) != len(concs) * len(keep):
-              # A silent shortfall here becomes "insufficient coverage" much
-              # later, in the judge, where the cause is no longer visible.
+              # Fail here rather than warn. A name that is not in the catalog
+              # builds fewer cells, and every GPU job still runs; the shortfall
+              # only surfaces at the judge, as `partial`, which reads like a job
+              # died rather than like a typo. `minimax-m3-mxfp8` did exactly
+              # that -- the catalog calls it `m3-mxfp8`. This step is free.
+              built = sorted({c["prefix"] + c["suffix"] for c in cells})
+              missing = sorted({p + s for p, s in keep} - set(built))
               print(
-                  f"::warning::expected {len(concs) * len(keep)} cells, "
-                  f"built {len(cells)}",
+                  f"::error::expected {len(concs) * len(keep)} cells, built "
+                  f"{len(cells)}; missing entries: {missing or 'none'} "
+                  f"(check PERF_MODELS against catalog prefixes)",
                   file=sys.stderr,
               )
+              sys.exit(1)
           print(f"cells={json.dumps(cells)}")
           PY
         env:
