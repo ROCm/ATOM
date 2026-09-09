@@ -405,6 +405,16 @@ def test_the_env_sets_the_thresholds(monkeypatch):
         # lets through the one exception this call actually produces.
         "70000000000000000000,10,10",
         "9223372036854775808,10,10",
+        # The same overflow further along the tuple, which is a different bug:
+        # `set_threshold` converts and stores one argument at a time, so these
+        # raise only after the earlier values are live. Measured on 3.12.3,
+        # they left (1, 10, 10) and (100000, 50, 10) behind -- the first
+        # collecting on nearly every allocation -- while the log said the value
+        # had been ignored. Overflowing only `t0` cannot catch this: nothing is
+        # written before it fails.
+        "1,9223372036854775808,10",
+        "100000,50,9223372036854775808",
+        "700,50,70000000000000000000",
     ],
 )
 def test_a_malformed_env_leaves_the_thresholds_alone(monkeypatch, value):

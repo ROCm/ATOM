@@ -58,6 +58,12 @@ def tune_gc() -> None:
             raise ValueError(f"t0 must be >= 1 and none negative, got {t}")
         gc.set_threshold(*t)
     except (ValueError, TypeError, OverflowError) as exc:
+        # `set_threshold` converts and stores one argument at a time, so an
+        # overflow on the second or third leaves the earlier ones applied:
+        # `1,2**63,10` lands on `(1, 10, 10)` and logs that it ignored the
+        # value. Restoring is what makes "ignored" true, whatever the reason --
+        # and it is a no-op on the paths that never reached the call.
+        gc.set_threshold(*old)
         logger.warning("[gc] bad ATOM_GC_THRESHOLD=%r (%s), ignored", thresholds, exc)
         return
     logger.info("[gc] thresholds %s -> %s", old, gc.get_threshold())
