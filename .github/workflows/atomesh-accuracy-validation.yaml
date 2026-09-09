@@ -105,8 +105,12 @@ jobs:
           current = level_map.get(event, "pr")
           allowed = {"pr": {"pr"}, "main": {"pr", "main"}, "nightly": {"pr", "main", "nightly"}}[current]
           models = json.load(open(".github/benchmark/models_accuracy.json", encoding="utf-8"))
+          # NOTE: Meta-Llama-3-8B-Instruct was this whitelist's only "pr" entry
+          # and has been removed from models_accuracy.json, so atomesh
+          # standalone currently validates nothing on a pull request. Promoting
+          # a replacement changes what every atomesh PR pays for, so it is left
+          # to the job owner rather than decided here.
           atomesh_levels = {
-              "Meta-Llama-3-8B-Instruct": "pr",
               "DeepSeek-R1-0528": "main",
               "DeepSeek-V4-Pro MTP": "nightly",
               "gpt-oss-120b": "nightly",
@@ -565,6 +569,13 @@ jobs:
           echo "=== Generated entries ==="
           cat accuracy-benchmark-input.json
 
+      - name: Prepare existing dashboard data
+        if: hashFiles('accuracy-benchmark-input.json') != ''
+        id: prepare_dashboard_data
+        uses: ./.github/actions/prepare-dashboard-data
+        with:
+          data-path: atomesh-accuracy-dashboard/data.js
+
       - name: Store Atomesh accuracy data
         if: hashFiles('accuracy-benchmark-input.json') != ''
         uses: benchmark-action/github-action-benchmark@v1
@@ -573,7 +584,18 @@ jobs:
           output-file-path: accuracy-benchmark-input.json
           gh-pages-branch: gh-pages
           benchmark-data-dir-path: atomesh-accuracy-dashboard
-          auto-push: true
+          auto-push: false
           max-items-in-chart: 300
           github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate dashboard data after write
+        if: hashFiles('accuracy-benchmark-input.json') != ''
+        uses: ./.github/actions/validate-dashboard-data
+        with:
+          data-path: atomesh-accuracy-dashboard/data.js
+          min-entries: ${{ steps.prepare_dashboard_data.outputs.entry_count }}
+
+      - name: Push dashboard data
+        if: hashFiles('accuracy-benchmark-input.json') != ''
+        run: git push origin gh-pages
 

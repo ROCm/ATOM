@@ -41,6 +41,7 @@ trap cleanup EXIT
 
 MODEL_NAME="${MATRIX_MODEL_NAME:-}"
 MODEL_PATH="${MATRIX_MODEL_PATH:-}"
+DRAFT_MODEL_PATH="${MATRIX_DRAFT_MODEL_PATH:-}"
 EXTRA_ARGS="${MATRIX_EXTRA_ARGS:-}"
 ENV_VARS="${MATRIX_ENV_VARS:-}"
 LM_EVAL_NUM_FEWSHOT="${MATRIX_LM_EVAL_NUM_FEWSHOT:-3}"
@@ -48,6 +49,9 @@ LM_EVAL_NUM_CONCURRENT="${MATRIX_LM_EVAL_NUM_CONCURRENT:-65}"
 LM_EVAL_USE_CHAT_COMPLETIONS="${MATRIX_LM_EVAL_USE_CHAT_COMPLETIONS:-0}"
 LM_EVAL_EXTRA_MODEL_ARGS="${MATRIX_LM_EVAL_EXTRA_MODEL_ARGS:-}"
 ACCURACY_TEST_THRESHOLD="${MATRIX_ACCURACY_TEST_THRESHOLD:-0.0}"
+
+# shellcheck disable=SC1091
+source .github/scripts/plugin_ci/cache_model.sh
 
 if [[ -z "${MODEL_NAME}" || -z "${MODEL_PATH}" ]]; then
   echo "ERROR: MATRIX_MODEL_NAME and MATRIX_MODEL_PATH are required" >&2
@@ -188,22 +192,16 @@ docker run -dt --device=/dev/kfd ${DEVICE_FLAG} \
   --name "${CONTAINER_NAME}" \
   "${SGLANG_IMAGE_TAG}"
 
-model_dir="/models/${MODEL_PATH}"
-if [[ -n "${MODEL_CACHE_MOUNT}" ]]; then
-  docker exec \
-    -e HF_TOKEN="${HF_TOKEN:-}" \
-    -e MODEL_ID="${MODEL_PATH}" \
-    -e TARGET_DIR="${model_dir}" \
-    -e MODEL_USE_LOCK="true" \
-    -e MODEL_DOWNLOAD_TIMEOUT="3h" \
-    -e MODEL_LOCK_WAIT_SECONDS="7200" \
-    -e MODEL_LOCK_POLL_INTERVAL="30" \
-    -e MODEL_PROGRESS_INTERVAL="60" \
-    "${CONTAINER_NAME}" \
-    bash -lc 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'
-  SGLANG_RESOLVED_MODEL_PATH="/models/${MODEL_PATH}"
-else
-  SGLANG_RESOLVED_MODEL_PATH="${MODEL_PATH}"
+GPU_PREFLIGHT_KILL_DOCKER=1 bash .github/scripts/gpu_preflight_check.sh "${CONTAINER_NAME}" docker
+
+SGLANG_RESOLVED_MODEL_PATH="$(plugin_ci_download_model "${MODEL_PATH}")"
+DRAFT_ID="$(plugin_ci_infer_draft_model_id "${DRAFT_MODEL_PATH}" "${EXTRA_ARGS}")"
+if [[ -n "${DRAFT_ID}" ]]; then
+  DRAFT_HF_ID="$(plugin_ci_hf_id "${DRAFT_ID}")"
+  if [[ "${DRAFT_HF_ID}" != "$(plugin_ci_hf_id "${MODEL_PATH}")" ]]; then
+    DRAFT_RESOLVED_PATH="$(plugin_ci_download_model "${DRAFT_HF_ID}")"
+    EXTRA_ARGS="$(plugin_ci_rewrite_extra_args "${EXTRA_ARGS}" "${DRAFT_HF_ID}" "${DRAFT_RESOLVED_PATH}")"
+  fi
 fi
 
 docker exec \

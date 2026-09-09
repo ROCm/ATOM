@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+from typing import ClassVar, NamedTuple
 
 import aiter
 import numpy as np
@@ -10,6 +11,7 @@ import triton
 import triton.language as tl
 from aiter.dist.parallel_state import get_tp_group
 
+from atom.config import _is_minimax_m3_config
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
 from atom.utils import CpuGpuBuffer, envs, pack_rows, upload_numpy
@@ -21,13 +23,36 @@ from atom.utils.forward_context import AttentionMetaData, Context, get_forward_c
 from atom.utils.tbo import TokenSplitPrefillState
 
 from .backends import AttentionBackend, CommonAttentionBuilder
-from .sub_pool_spec import SubPoolSpec, page_pool
+from .mha_kv_pool import MhaKvPool
+from .pool_layout.entry_arena import EntryField, carve
+from .pool_layout.pool_rows import KvGeometry
+from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool
+from .token_layout.decode import decode_positions
+from .token_layout.slots import slot_mapping
 
 logger = logging.getLogger("atom")
 
 
 def cdiv(a, b):
     return (a + b - 1) // b
+
+
+class _IndexCacheSpec(NamedTuple):
+    """MiniMax-M3's indexer key cache: one `dim`-wide key per token, on `rows`
+    of this stage's layers. The pool is told its bytes and nothing else."""
+
+    rows: int
+    dim: int
+    dtype: torch.dtype
+
+    def __str__(self) -> str:
+        """How a row space names itself in a log line."""
+        return f"kv[{self.num_kv_heads}x{self.head_dim}]"
+
+
+# The indexer keys' row space: a second numbering over the same modules, not a
+# pool of its own.
+INDEX_ROWS = "index"
 
 
 def _is_indexed_sparse_attention(module) -> bool:
@@ -105,6 +130,10 @@ def _mtp_prepare_decode_metadata_kernel(
 
 
 class AiterBackend(AttentionBackend):
+    # An MHA draft keeps its own K and V; there is no target tensor its rows
+    # could be.
+    DRAFT_OWNS_KV_POOL: ClassVar[bool] = True
+
     @staticmethod
     def get_name() -> str:
         return "ATOM_ATTENTION"
@@ -117,9 +146,55 @@ class AiterBackend(AttentionBackend):
     def get_impl_cls():
         return PagedAttentionImpl
 
+    @staticmethod
+    def attn_block_size(hf_config, scheduler_block_size: int) -> int:
+        """Tokens in the block this backend's kernels index.
+
+        Two different things, tied only by the scheduler's being a whole number
+        of these: the scheduler's is what prefix caching and the block manager
+        work in, one for the whole process, while this one is a kernel detail
+        each backend picks for itself. A target's, only: a draft takes the
+        target builder's answer instead, for the reason in
+        `DraftKvBuilder.kv_pool`.
+        """
+        if envs.ATOM_USE_UNIFIED_ATTN:
+            # SHUFFLE cache read straight through, so the two coincide and
+            # `unified_attention`'s block table needs no conversion.
+            return scheduler_block_size
+        # MiniMax-M3's sparse kernels index the block its config names.
+        text_config = getattr(hf_config, "text_config", hf_config)
+        sparse_cfg = getattr(text_config, "sparse_attention_config", None)
+        sparse_block_size = sparse_cfg.get("sparse_block_size") if sparse_cfg else None
+        if sparse_block_size and _is_minimax_m3_config(hf_config):
+            return sparse_block_size
+        return scheduler_block_size if scheduler_block_size in (256, 1024) else 16
+
+    @staticmethod
+    def make_kv_pool(
+        hf_config,
+        *,
+        world_size: int,
+        target_block_size: int,
+        layers: int,
+        kv_dtype,
+    ):
+        """An MHA pool, which is the one this backend's kernels read."""
+        return MhaKvPool.from_hf_config(
+            hf_config,
+            world_size=world_size,
+            block_size=target_block_size,
+            layers=layers,
+            kv_dtype=kv_dtype,
+        )
+
 
 class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
-    BLOCK_TABLE_EXTENDER: list[list[int]] = [[]]
+    # Whose kernels this builder feeds. Read for `attn_block_size` below, so a
+    # subclass that names another backend gets that backend's rule -- naming
+    # this one outright would size the pool at one block and index it at
+    # another the day the two stop agreeing.
+    BACKEND: ClassVar[type[AiterBackend]] = AiterBackend
+    BLOCK_TABLE_EXTENDER: ClassVar[list[list[int]]] = [[]]
     # EagleProposer fuses the per-draft-step position bump into
     # prepare_mtp_decode's kernel when this is set (block-paged MHA draft).
     fuse_mtp_decode_position_update = True
@@ -135,47 +210,33 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         hf_config = model_runner.config.hf_config
         text_config = getattr(hf_config, "text_config", hf_config)
         sparse_cfg = getattr(text_config, "sparse_attention_config", None)
-        from atom.config import _is_minimax_m3_config
-
         self._has_sparse_attention = bool(sparse_cfg) and _is_minimax_m3_config(
             hf_config
         )
-        if self._has_sparse_attention and (
-            sparse_block_size := sparse_cfg.get("sparse_block_size")
-        ):
-            # MiniMax-M3 sparse kernels operate on sparse_attention_config's
-            # block size. The scheduler/KV manager block size may be larger as
-            # long as it is divisible by this logical attention block size.
-            self.block_size = sparse_block_size
-        else:
-            self.block_size = (
-                model_runner.block_size
-                if model_runner.block_size in (256, 1024)
-                else 16
-            )
+        # The backend's own, from the one rule `make_kv_pool` also reads, so a
+        # draft resolving here gets it from its own config the same way.
+        # `CommonAttentionBuilder` holds it to dividing the scheduler's.
+        self.block_size = type(self).BACKEND.attn_block_size(
+            hf_config, model_runner.block_size
+        )
         if envs.ATOM_USE_UNIFIED_ATTN:
-            # SHUFFLE (pre-shuffled) KV cache: use the logical block size directly
-            # as the physical block size so block_ratio == 1 and
-            # unified_attention's block_table needs no logical->physical
-            # conversion. Pass --block-size equal to the performant physical
-            # page: fp8 packs x=16 - 128; bf16 packs x=8 - 64 (both keep a
-            # 128-byte physical page, i.e. block_size // x == 8).
+            # The two coincide there, and only one scheduler block reads well:
+            # fp8 packs x=16 -> 128, bf16 x=8 -> 64, both a 128 B physical page.
             expected = 128 if model_runner.kv_cache_dtype in ("fp8",) else 64
             if model_runner.block_size != expected:
                 logger.warning(
                     "ATOM_USE_UNIFIED_ATTN=1 expects --block-size %s for %s KV "
-                    "cache (so block_ratio == 1), got --block-size %s. Continuing "
-                    "with the requested block size.",
+                    "cache, got --block-size %s. Continuing with the requested "
+                    "block size.",
                     expected,
                     model_runner.kv_cache_dtype,
                     model_runner.block_size,
                 )
-            self.block_size = model_runner.block_size
-
-        assert (
-            model_runner.block_size % self.block_size == 0
-        ), f"model_runner.block_size must be divisible by block_size but got {model_runner.block_size=}, block_size={self.block_size}, please set --block-size (model_runner.block_size) to be divisible by {self.block_size}"
         super().__init__(model_runner)
+        # Keyed by `(num_kv_heads, head_dim)` and filled by
+        # `allocate_kv_cache_tensors`, which runs long after construction --
+        # on the P/D decode side too, over the imported pool.
+        self.kv_pools: dict[tuple[int, int], MhaKvPool] = {}
         config = model_runner.config
         hf_config = config.hf_config
         from atom.utils import envs as _envs
@@ -405,183 +466,175 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         }
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
-        """One paged KV pool. Per-block bytes:
+        """One paged KV pool, priced by the declaration it is built from."""
+        return [page_pool(self._paged_entry_bytes())]
 
-        - Standard models: `[2, num_hidden_layers, blocks, block_size,
-          num_kv_heads, head_dim]` for kv_cache + matching kv_scale (fp32).
-        - MiMo-V2-Flash: per-layer-type accounting (full vs SWA layers
-          have different num_kv_heads).
+    def paged_pool_bytes(self, blocks: int) -> int:
+        """The same declaration, times the blocks the budget bought."""
+        return self._paged_entry_bytes() * blocks
+
+    def _paged_entry_bytes(self) -> int:
+        """What one scheduler block costs, over every pool this model needs."""
+        return sum(pool.entry_bytes for pool in self._declare_kv_pools().values())
+
+    def _module_kinds(self, module) -> tuple:
+        """A KV row keyed by the module's own geometry, and an indexer row.
+
+        Two row spaces over one module on MiniMax-M3: the indexer keys are a
+        field of their own, so a sparse layer numbers separately there. The
+        geometry is the key rather than a name because a hybrid can carry two
+        head counts in one block-id space, and each needs its own pool.
+        """
+        kinds = []
+        if _is_indexed_sparse_attention(module):
+            kinds.append(INDEX_ROWS)
+        if (
+            hasattr(module, "base_attention")
+            and hasattr(module, "use_mla")
+            and not module.use_mla
+        ):
+            kinds.append(KvGeometry(module.num_kv_heads, module.head_dim))
+        return tuple(kinds)
+
+    def _declare_kv_pools(self) -> dict[KvGeometry, MhaKvPool]:
+        """One pool per KV-head geometry, keyed by it, declared not allocated.
+
+        A module says what it caches, so the pools are the rows the walk
+        assigned per geometry: one pool for almost every model, and two for
+        MiMo-V2-Flash, whose sliding-window layers carry a second head count --
+        a second geometry sharing one block-id space, which is what sizing
+        summed for it all along. Nothing here asks which model it is.
         """
         from aiter import dtypes
 
         runner = self.model_runner
-        config = runner.config
-        hf_config = config.hf_config
-        text_config = getattr(hf_config, "text_config", hf_config)
-        num_kv_heads = runner._get_num_kv_heads()
-        total_num_layers = runner._get_total_num_layers()
-        kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
+        # `INDEX_ROWS` is a row space, not a pool: the indexer keys ride the
+        # first geometry's pool, since declaring them per pool would charge for
+        # the cache once per geometry. Insertion order is the walk's, so
+        # "first" is the same pool every run.
+        # One expression, handed to both: the field is priced per entry and the
+        # pool is built per entry, and the two are a byte apart if they each
+        # multiply it out.
+        entry_tokens = self.block_size * self.block_ratio
+        extra_fields = self._index_cache_fields(entry_tokens)
+        pools = {}
+        for geometry, count in self.row_counts().items():
+            if not isinstance(geometry, KvGeometry):
+                continue
+            pools[geometry] = MhaKvPool(
+                layers=count,
+                # This backend's block, which is the only one its kernels
+                # index: the block tables they read were expanded by
+                # `block_ratio`, so their ids run over `blocks * ratio`. The
+                # scheduler's block is `block_ratio` of ours and reaches the
+                # pool only as the count `page_pool` charges per.
+                block_size=self.block_size,
+                blocks_per_entry=self.block_ratio,
+                num_kv_heads=geometry.num_kv_heads,
+                head_dim=geometry.head_dim,
+                kv_dtype=dtypes.d_dtypes[runner.config.kv_cache_dtype],
+                extra_fields=extra_fields,
+            )
+            extra_fields = ()
+        return pools
 
-        if runner.is_mimo_v2():
-            # Mixed full + SWA layers, possibly different num_kv_heads.
-            pattern = hf_config.hybrid_layer_pattern
-            num_swa_layers = sum(
-                1 for i in range(hf_config.num_hidden_layers) if pattern[i] == 1
-            )
-            num_full_layers = hf_config.num_hidden_layers - num_swa_layers
-            num_draft_layers = total_num_layers - hf_config.num_hidden_layers
-            num_swa_layers += num_draft_layers
+    def _index_cache_spec(self) -> _IndexCacheSpec | None:
+        """MiniMax-M3's indexer key cache, or None where there is none.
 
-            _swa_raw = getattr(hf_config, "swa_num_key_value_heads", 0)
-            swa_kv_heads = (
-                _swa_raw // runner.world_size
-                if _swa_raw >= runner.world_size
-                else (1 if _swa_raw else 0)
-            )
-            block_bytes = (
-                2
-                * num_full_layers
-                * runner.block_size
-                * num_kv_heads
-                * hf_config.head_dim
-                * kv_dtype_size
-            )
-            block_bytes += (
-                2
-                * num_swa_layers
-                * runner.block_size
-                * swa_kv_heads
-                * hf_config.head_dim
-                * kv_dtype_size
-            )
-            block_bytes += (
-                2
-                * num_full_layers
-                * num_kv_heads
-                * runner.physical_block_size
-                * 4  # float32 kv_scale
-            )
-            block_bytes += (
-                2
-                * num_swa_layers
-                * swa_kv_heads
-                * runner.physical_block_size
-                * 4  # float32 kv_scale
-            )
-            return [page_pool(block_bytes)]
-
-        # Standard MHA path.
-        block_bytes = (
-            2
-            * total_num_layers
-            * runner.block_size
-            * num_kv_heads
-            * hf_config.head_dim
-            * kv_dtype_size
-        )
-        block_bytes += (
-            2
-            * total_num_layers
-            * num_kv_heads
-            * runner.physical_block_size
-            * 4  # float32 kv_scale
-        )
-        sparse_cfg = getattr(text_config, "sparse_attention_config", None)
-        if sparse_cfg:
-            sparse_layers = sum(
-                1 for enabled in sparse_cfg.get("sparse_attention_freq", []) if enabled
-            )
-            index_dim = sparse_cfg["sparse_index_dim"]
-            index_cache_dtype = _resolve_index_cache_dtype(config)
-            block_bytes += (
-                sparse_layers
-                * runner.physical_block_size
-                * index_dim
-                * torch.empty((), dtype=index_cache_dtype).element_size()
-            )
-        return [page_pool(block_bytes)]
-
-    def allocate_kv_cache_tensors(
-        self, num_kv_heads: int, num_draft_layers: int
-    ) -> dict:
-        """Allocate the standard split-K/V paged KV cache.
-
-        - MiMo-V2-Flash defers per-module allocation to build_kv_cache_tensor
-          (each module has its own num_kv_heads), returning sentinels here.
-        - All other models use a single `[2, num_hidden_layers, ...]` tensor
-          shared across layers; per-layer slicing happens in build_kv_cache_tensor.
+        Keyed off `_has_sparse_attention` -- the same answer the block size and
+        the metadata buffers use -- not a second reading of the config. MiMo-V2
+        declares two pools and sums them, so a second predicate would have to
+        be kept from double-charging; this one is false for it by construction.
         """
-        from aiter import dtypes
-
+        if not self._has_sparse_attention:
+            return None
         runner = self.model_runner
-        config = runner.config
-        hf_config = config.hf_config
+        hf_config = runner.config.hf_config
         text_config = getattr(hf_config, "text_config", hf_config)
+        sparse_cfg = text_config.sparse_attention_config
+        return _IndexCacheSpec(
+            # The walk, like every other count here. The config's
+            # `sparse_attention_freq` says how many layers the *model* has an
+            # indexer on; the rows are how many this stage holds, and on PP > 1
+            # those differ -- the pool would be charged for the model's and
+            # addressed by the stage's.
+            rows=self.row_counts().get(INDEX_ROWS, 0),
+            dim=sparse_cfg["sparse_index_dim"],
+            dtype=_resolve_index_cache_dtype(runner.config),
+        )
 
-        if runner.is_mimo_v2():
-            # Per-layer allocation deferred (each module gets its own
-            # correctly-sized tensor matching its num_kv_heads).
-            return {
-                "kv_cache": None,
-                "kv_scale": None,
-                "_kv_layer_cache_store": [],
-            }
+    def _index_cache_fields(self, entry_tokens: int) -> tuple[EntryField, ...]:
+        """The indexer cache as a field of the KV entry, priced in bytes.
 
-        total_num_layers = runner._get_total_num_layers()
-        tensors = {
-            "kv_cache": torch.zeros(
-                2,
-                total_num_layers,
-                runner.num_physical_kvcache_blocks,
-                runner.physical_block_size,
-                num_kv_heads,
-                hf_config.head_dim,
-                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
-                device="cuda",
+        Declared here and not in `MhaKvPool` because what it holds is this
+        backend's subject; the pool is told how many bytes ride along, and
+        gives them back through `field_view` in the shape `build_kv_cache_
+        tensor` asks for.
+        """
+        spec = self._index_cache_spec()
+        if spec is None:
+            return ()
+        return (
+            EntryField(
+                "index",
+                spec.rows,
+                (entry_tokens * spec.dim * spec.dtype.itemsize,),
+                torch.uint8,
             ),
-            "kv_scale": torch.zeros(
-                2,
-                total_num_layers,
-                runner.num_physical_kvcache_blocks,
-                num_kv_heads,
-                runner.physical_block_size,
-                dtype=dtypes.fp32,
-                device="cuda",
-            ),
-        }
-        sparse_cfg = getattr(text_config, "sparse_attention_config", None)
-        if sparse_cfg:
-            sparse_layers = sum(
-                1 for enabled in sparse_cfg.get("sparse_attention_freq", []) if enabled
-            )
-            index_cache_dtype = _resolve_index_cache_dtype(config)
-            tensors["sparse_attention_index_cache"] = torch.zeros(
-                sparse_layers,
-                runner.num_physical_kvcache_blocks,
-                runner.physical_block_size,
-                sparse_cfg["sparse_index_dim"],
-                dtype=index_cache_dtype,
-                device="cuda",
-            )
-            tensors["_sparse_attention_cache_next"] = 0
-            if getattr(text_config, "use_index_cache", False) or getattr(
-                hf_config, "use_index_cache", False
-            ):
-                tensors["_sparse_attention_topk_cache_state"] = {}
+        )
+
+    def release_kv_pools(self) -> None:
+        for pool in self.kv_pools.values():
+            pool.release()
+
+    def _allocate_kv_pools(self, blocks: int, buf) -> None:
+        """Back every declared pool, side by side in this builder's region.
+
+        Same `carve` the runner placed that region with, so a model with two
+        geometries is laid out by the rule one with a single geometry already
+        was.
+        """
+        self.kv_pools = self._declare_kv_pools()
+        pools = list(self.kv_pools.values())
+        regions = carve(buf, [pool.pool_bytes(blocks) for pool in pools])
+        for pool, region in zip(pools, regions):
+            pool.allocate(blocks, self.model_runner.device, buf=region)
+        self.num_blocks = blocks * self.block_ratio
+
+    def allocate_kv_cache_tensors(self, *, blocks: int, buf) -> dict:
+        """Allocate this model's MHA pools inside the runner's paged region.
+
+        Nothing shaped goes back to the runner: the cache, the scales and the
+        indexer keys were three named attributes and are three regions of the
+        one buffer it holds. So the only reference that can outlive a rollout
+        sleep is a pool's, and `MhaKvPool.release` is what drops it.
+        """
+        runner = self.model_runner
+        hf_config = runner.config.hf_config
+        text_config = getattr(hf_config, "text_config", hf_config)
+        self._allocate_kv_pools(blocks, buf)
+        tensors: dict = {}
+        # Not under the indexer cache: this is a per-run memo dict, keyed off
+        # `use_index_cache` alone. Its one reader is in the sparse branch of
+        # `build_kv_cache_tensor`, so gating it on the pool as well would only
+        # claim a dependency that is not there.
+        if getattr(text_config, "use_index_cache", False) or getattr(
+            hf_config, "use_index_cache", False
+        ):
+            tensors["_sparse_attention_topk_cache_state"] = {}
         return tensors
 
-    def build_kv_cache_tensor(self, layer_id: int, module):
+    def build_kv_cache_tensor(self, module):
         """Bind one MHA (non-MLA) attention module to its KV slice.
 
-        Handles both standard hybrid models (Qwen3-Next pattern: full-attn
-        layers interleaved with linear-attn) and MiMo-V2-Flash (per-layer
-        allocation with potentially different num_kv_heads per module).
+        Its row is the next one of its geometry -- a hybrid's linear layers and
+        a draft's stack are simply not modules this builder owns, so nothing
+        here has to know where they sit.
 
         Returns the KVCacheTensor to register, or None if the module is not
         an MHA attention this builder owns. Side effects: sets module
         `k_cache`, `v_cache`, `k_scale`, `v_scale`, `max_model_len`.
         """
-        from aiter import dtypes
 
         from atom.config import KVCacheTensor
 
@@ -593,109 +646,46 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # v_scale and returns the KVCacheTensor). The standard binding is
             # page-128 SHUFFLE; SparseMHAPagedAttentionImpl.rope_cache re-views it
             # to page-16 SHUFFLE (zero-copy) at attention time. index_cache is a
-            # genuinely separate cache (not derivable from the KV cache), so the
-            # runner assigns each sparse layer its own slice here.
+            # genuinely separate field (not derivable from the K/V ones), so
+            # each sparse layer has its own row in that second space. The pool
+            # was built at this backend's block, so its slice already is.
             runner = self.model_runner
-            sparse_idx = runner._sparse_attention_cache_next
-            runner._sparse_attention_cache_next += 1
-            module.impl.index_cache = runner.sparse_attention_index_cache[sparse_idx]
+            pool = next(p for p in self.kv_pools.values() if p.extra_fields)
+            spec = self._index_cache_spec()
+            module.impl.index_cache = pool.field_view(
+                "index",
+                self.pool_rows[INDEX_ROWS][module],
+                spec.dtype,
+                (-1, self.block_size, spec.dim),
+            )
             module.impl.max_model_len = runner.config.max_model_len
             module.impl.index_topk_cache_state = getattr(
                 runner, "_sparse_attention_topk_cache_state", None
             )
             # NOTE: no return — fall through to the standard MHA binding below.
 
-        if not (
-            hasattr(module, "base_attention")
-            and hasattr(module, "use_mla")
-            and not module.use_mla
-        ):
+        geometry = next(
+            (k for k in self._module_kinds(module) if isinstance(k, KvGeometry)), None
+        )
+        if geometry is None:
             return None
 
-        runner = self.model_runner
-        config = runner.config
-        hf_config = config.hf_config
+        config = self.model_runner.config
+        # The module's own geometry picks its pool, and the walk that sized
+        # that pool says which of its rows this module got. Both are what the
+        # module declared.
+        pool = self.kv_pools[geometry]
+        row = self.pool_rows[geometry][module]
 
-        # attn_idx: hybrid models (Qwen3-Next) skip linear-attention layers
-        # in the kv_cache slot ordering; non-hybrid models use layer_id 1:1.
-        if runner.is_qwen_next():
-            mtp_start = runner.mtp_start_layer_idx
-            if layer_id < mtp_start:
-                attn_idx = layer_id // runner.full_attention_interval
-            else:
-                attn_idx = runner.num_full_attn + (layer_id - mtp_start)
-        else:
-            attn_idx = layer_id
-
-        if runner.is_mimo_v2():
-            # Per-layer allocation: each module gets its own correctly-sized
-            # tensor matching its num_kv_heads.
-            kv_dtype = dtypes.d_dtypes[config.kv_cache_dtype]
-            x = 16 // kv_dtype.itemsize
-            module_kv_heads = module.num_kv_heads
-            k_cache = torch.zeros(
-                runner.num_physical_kvcache_blocks,
-                module_kv_heads,
-                hf_config.head_dim // x,
-                runner.physical_block_size,
-                x,
-                dtype=kv_dtype,
-                device="cuda",
-            )
-            v_cache = torch.zeros(
-                runner.num_physical_kvcache_blocks,
-                module_kv_heads,
-                runner.physical_block_size // x,
-                hf_config.head_dim,
-                x,
-                dtype=kv_dtype,
-                device="cuda",
-            )
-            if config.kv_cache_dtype == "fp8":
-                module.k_scale = torch.zeros(
-                    runner.num_physical_kvcache_blocks,
-                    module_kv_heads,
-                    runner.physical_block_size,
-                    dtype=dtypes.fp32,
-                    device="cuda",
-                )
-                module.v_scale = torch.zeros(
-                    runner.num_physical_kvcache_blocks,
-                    module_kv_heads,
-                    runner.physical_block_size,
-                    dtype=dtypes.fp32,
-                    device="cuda",
-                )
-            runner._kv_layer_cache_store.append(
-                (k_cache, v_cache, module.k_scale, module.v_scale)
-            )
-        else:
-            x = 16 // runner.kv_cache.element_size()
-            k_cache = runner.kv_cache[0, attn_idx].view(
-                runner.num_physical_kvcache_blocks,
-                runner.num_kv_heads,
-                hf_config.head_dim // x,
-                runner.physical_block_size,
-                x,
-            )
-            # V cache uses the same 5D SHUFFLE layout as the MiMo-V2 per-module
-            # allocator above: [num_blocks, num_kv_heads, block_size//x, head_dim, x].
-            v_cache = runner.kv_cache[1, attn_idx].view(
-                runner.num_physical_kvcache_blocks,
-                runner.num_kv_heads,
-                runner.physical_block_size // x,
-                hf_config.head_dim,
-                x,
-            )
-            if config.kv_cache_dtype == "fp8":
-                module.k_scale = runner.kv_scale[0, attn_idx]
-                module.v_scale = runner.kv_scale[1, attn_idx]
+        k_cache, v_cache = pool.kv_views(row)
+        if config.kv_cache_dtype == "fp8":
+            module.k_scale, module.v_scale = pool.scale_views(row)
 
         module.max_model_len = config.max_model_len
         module.k_cache = k_cache
         module.v_cache = v_cache
         return KVCacheTensor(
-            layer_num=layer_id,
+            layer_num=module.layer_num,
             k_cache=k_cache,
             v_cache=v_cache,
             k_scale=module.k_scale,
@@ -733,55 +723,24 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             KVTransferTensors,
         )
 
-        runner = self.model_runner
-        has_unified_kv = hasattr(runner, "kv_cache") and runner.kv_cache is not None
-        # for MiMoV2 model per layer kv binding
-        has_per_layer_kv = (
-            hasattr(runner, "_kv_layer_cache_store") and runner._kv_layer_cache_store
-        )
-        if not has_unified_kv and not has_per_layer_kv:
+        if not self.kv_pools:
             return None
-
-        block_regions: list[KVTransferRegion] = []
-
-        def _add_region(tensor):
-            bpb = tensor.stride(0) * tensor.element_size()
-            block_regions.append(
+        # Every field of every pool, indexer cache included: a region per
+        # (pool, field, layer), in declared order.
+        return KVTransferTensors(
+            block_regions=[
                 KVTransferRegion(
                     base_addr=tensor.data_ptr(),
                     total_bytes=tensor.numel() * tensor.element_size(),
-                    unit_bytes=bpb,
+                    unit_bytes=tensor.stride(0) * tensor.element_size(),
+                    # The geometry, because a hybrid declares two pools whose
+                    # per-layer regions are otherwise named alike.
+                    semantic_role=f"mha.{geometry}.{role}",
                 )
-            )
-
-        if hasattr(runner, "_kv_layer_cache_store") and runner._kv_layer_cache_store:
-            for k_cache, v_cache, k_scale, v_scale in runner._kv_layer_cache_store:
-                _add_region(k_cache)
-                _add_region(v_cache)
-                if k_scale is not None:
-                    _add_region(k_scale)
-                if v_scale is not None:
-                    _add_region(v_scale)
-        else:
-            num_layers = runner.kv_cache.shape[1]
-            for layer_id in range(num_layers):
-                _add_region(runner.kv_cache[0, layer_id])  # K
-                _add_region(runner.kv_cache[1, layer_id])  # V
-            if hasattr(runner, "kv_scale") and runner.kv_scale is not None:
-                for layer_id in range(num_layers):
-                    _add_region(runner.kv_scale[0, layer_id])
-                    _add_region(runner.kv_scale[1, layer_id])
-            # MiniMax-M3 sparse attention's per-token indexer-key cache
-            # (used for top-k block selection on the consumer).
-            index_cache = getattr(runner, "sparse_attention_index_cache", None)
-            if index_cache is not None:
-                for sparse_idx in range(index_cache.shape[0]):
-                    _add_region(index_cache[sparse_idx])
-
-        return KVTransferTensors(
-            block_regions=block_regions,
+                for geometry, pool in self.kv_pools.items()
+                for role, tensor in pool.region_tensors()
+            ],
             slot_regions=[],
-            num_blocks=runner.num_physical_kvcache_blocks,
         )
 
     def prepare_mtp_decode(
@@ -879,20 +838,18 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
         if self._has_sparse_attention and not attn_metadata.has_cached:
             bs = batch.total_seqs_num_prefill
-            self.prepare_block_tables(batch)
             attn_metadata.block_tables = self.model_runner.forward_vars[
                 "block_tables"
             ].copy_to_gpu(bs)
         # `prefill_attention_triton` reads the paged KV cache, so it needs a
-        # block_table even with no cached tokens. The base builder only uploads
-        # one when `has_cached`.
+        # block_table even with no cached tokens. The base builder marshals one
+        # every step but only uploads it when `has_cached`.
         if (
             attn_metadata.block_tables is None
             and envs.ATOM_USE_UNIFIED_ATTN
             and batch.block_tables
         ):
             bs = batch.total_seqs_num_prefill
-            self.prepare_block_tables(batch)
             attn_metadata.block_tables = self.model_runner.forward_vars[
                 "block_tables"
             ].copy_to_gpu(bs)
@@ -1086,39 +1043,36 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             num_rejected = self.model_runner.tokenID_processor.num_rejected
             if num_rejected is not None:
                 context_lens -= num_rejected
-                num_blocks = cdiv(context_lens, self.model_runner.block_size)
-                block_tables = [bt[:n] for bt, n in zip(block_tables, num_blocks)]
+        positions = decode_positions(context_lens, max_seqlen_q)
+        max_seqlen_k = np.max(context_lens)
 
-            slot_mapping = [
-                block_table[pos // self.model_runner.block_size]
-                * self.model_runner.block_size
-                + (pos % self.model_runner.block_size)
-                for block_table, seq_len in zip(block_tables, context_lens)
-                for pos in range(seq_len - max_seqlen_q, seq_len)
-            ]
+        # Before the slots, not after: `slot_mapping` reads this packed table.
+        self.prepare_block_tables(batch)
+
+        var = self.model_runner.forward_vars
+        scheduled_tokens = batch.total_tokens_num_decode
+        var["slot_mapping"].np[:running_tokens] = -1
+        if max_seqlen_q > 1:
+            slots = slot_mapping(
+                positions,
+                np.full(scheduled_bs, max_seqlen_q, dtype=np.int32),
+                var["block_tables"].np,
+                self.model_runner.block_size,
+                scratch=self.token_axis_scratch,
+            )
         else:
-            slot_mapping = [
+            # One token per sequence reduces the gather to its last row, and
+            # `last_block_num_tokens` names the offset without a position.
+            slots = [
                 block_table[-1] * self.model_runner.block_size + last_block_num - 1
                 for block_table, last_block_num in zip(
                     block_tables, batch.last_block_num_tokens
                 )
             ]
-        positions = np.tile(
-            np.arange(max_seqlen_q, dtype=np.int32), scheduled_bs
-        ) + np.repeat(context_lens - max_seqlen_q, max_seqlen_q)
-        max_seqlen_k = np.max(context_lens)
-
-        self.prepare_block_tables(batch)
-
-        var = self.model_runner.forward_vars
-        sum_scheduled_tokens = batch.total_tokens_num_decode
-        var["slot_mapping"].np[:running_tokens] = -1
         if not batch.is_dummy_run:
-            var["slot_mapping"].np[:sum_scheduled_tokens] = slot_mapping[
-                :sum_scheduled_tokens
-            ]
+            var["slot_mapping"].np[:scheduled_tokens] = slots[:scheduled_tokens]
 
-        var["positions"].np[:sum_scheduled_tokens] = positions
+        var["positions"].np[:scheduled_tokens] = positions
         var["context_lens"].np[:scheduled_bs] = context_lens
         var["context_lens"].np[scheduled_bs:running_bs] = 0
 
@@ -1134,12 +1088,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         vars_used = [
             ("slot_mapping", running_tokens),
             ("context_lens", running_bs),
-            ("cu_seqlens_q", running_bs + 1),
             ("block_tables", running_bs),
             ("kv_indptr", running_bs + 1),
         ]
 
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
+        # A view: `publish_cu_seqlens_q` already uploaded it this step, and
+        # nothing here writes the host copy.
+        ctx["cu_seqlens_q"] = var["cu_seqlens_q"].gpu[: running_bs + 1]
         if self.block_size in (256, 1024):
             ctx_pa_ps = self.set_aiter_persistent_worker_buffers(running_bs)
             ctx.update(ctx_pa_ps)
@@ -1186,7 +1142,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         if mrope_positions is not None:
             positions = mrope_positions
         else:
-            positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
+            positions = var["positions"].copy_to_gpu(scheduled_tokens)
         if self.model_runner.config.enable_tbo_decode and running_bs >= 2:
             self._prepare_ubatch_decode(
                 scheduled_bs,
@@ -1229,11 +1185,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
             tok_start = req_start * max_seqlen_q
             ub_real_tokens = ub_real_reqs * max_seqlen_q
-            padded_tok_count = running_bs * max_seqlen_q
+            ub_running_tokens = running_bs * max_seqlen_q
             var[f"{p}slot_mapping"].np[:ub_real_tokens] = var["slot_mapping"].np[
                 tok_start : tok_start + ub_real_tokens
             ]
-            var[f"{p}slot_mapping"].np[ub_real_tokens:padded_tok_count] = -1
+            var[f"{p}slot_mapping"].np[ub_real_tokens:ub_running_tokens] = -1
 
             var[f"{p}block_tables"].np[:ub_real_reqs] = var["block_tables"].np[
                 req_start : req_start + ub_real_reqs
@@ -1250,18 +1206,20 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             last_val = var[f"{p}kv_indptr"].np[ub_real_reqs] if ub_real_reqs > 0 else 0
             var[f"{p}kv_indptr"].np[ub_real_reqs + 1 : running_bs + 1] = last_val
 
-            last_cu = ub_real_reqs * max_seqlen_q
             var[f"{p}cu_seqlens_q"].np[: ub_real_reqs + 1] = np.arange(
                 0,
                 (ub_real_reqs + 1) * max_seqlen_q,
                 max_seqlen_q,
                 dtype=np.int32,
             )
-            var[f"{p}cu_seqlens_q"].np[ub_real_reqs + 1 : running_bs + 1] = last_cu
+            # The flat cumsum past the real requests is where the real ones end.
+            var[f"{p}cu_seqlens_q"].np[
+                ub_real_reqs + 1 : running_bs + 1
+            ] = ub_real_tokens
 
             vars_used = [
                 (f"{p}context_lens", running_bs),
-                (f"{p}slot_mapping", padded_tok_count),
+                (f"{p}slot_mapping", ub_running_tokens),
                 (f"{p}block_tables", running_bs),
                 (f"{p}kv_indptr", running_bs + 1),
                 (f"{p}cu_seqlens_q", running_bs + 1),
@@ -1380,9 +1338,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
         else:
             ctx_pa_ps = {}
-        total_tokens = bs * max_q_len
+        scheduled_tokens = bs * max_q_len
         attn_metadata = AttentionMetaData(
-            slot_mapping=var["slot_mapping"].gpu[:total_tokens],
+            slot_mapping=var["slot_mapping"].gpu[:scheduled_tokens],
             context_lens=var["context_lens"].gpu[:bs],
             block_tables=var["block_tables"].gpu[:bs],
             max_seqlen_q=max_q_len,
@@ -1414,14 +1372,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=max_q_len,
             )
 
-        positions = var["positions"].copy_to_gpu(total_tokens)
+        positions = var["positions"].copy_to_gpu(scheduled_tokens)
         context = Context(
             positions=positions,
             is_prefill=False,
             scheduled_bs=bs,
             running_bs=bs,
             # A capture runs a full synthetic batch: nothing is padded.
-            scheduled_tokens=total_tokens,
-            running_tokens=total_tokens,
+            scheduled_tokens=scheduled_tokens,
+            running_tokens=scheduled_tokens,
         )
         return attn_metadata, context

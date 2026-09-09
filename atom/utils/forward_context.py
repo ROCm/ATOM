@@ -498,6 +498,12 @@ class Context:
     # stood for "dp-attention is off", and readers needing the strong claim --
     # `_can_use_dp_sharded_head` above all -- silently got the weak one.
     running_tokens_are_unified: bool = True
+    # `running_tokens` for every rank, unreduced; this rank's entry IS
+    # `running_tokens`. Consumers reduce it, because they want different
+    # reductions: padding each rank up to the group is a MAX, an all2all's
+    # receive width holds what every rank sent and is a SUM. None where no DP
+    # reduction produced one, which is where the two coincide.
+    running_tokens_across_dp: tuple[int, ...] | None = None
     # The step's whole shape decision. Set by `prepare_model` via
     # `ForwardMode.decide`; None only on a capture context, which declares its
     # shape rather than reading one.
@@ -517,7 +523,6 @@ class Context:
     # forward's other host-to-device copies. Keeping these on the per-forward
     # context avoids launching pinned-buffer H2Ds later from postprocess.
     draft_anchor_overrides: torch.Tensor | None = None
-    draft_ragged_lens: torch.Tensor | None = None
 
     def __init__(
         self,
@@ -530,11 +535,11 @@ class Context:
         running_tokens: int = 0,
         is_draft: bool = False,
         running_tokens_are_unified: bool = True,
+        running_tokens_across_dp: tuple[int, ...] | None = None,
         forward_mode: ForwardMode | None = None,
         input_ids: torch.Tensor | None = None,
         ubatch_token_offset: int = 0,
         draft_anchor_overrides: torch.Tensor | None = None,
-        draft_ragged_lens: torch.Tensor | None = None,
     ):
         self.positions = positions
         self.is_prefill = is_prefill
@@ -545,11 +550,11 @@ class Context:
         self.running_tokens = running_tokens
         self.is_draft = is_draft
         self.running_tokens_are_unified = running_tokens_are_unified
+        self.running_tokens_across_dp = running_tokens_across_dp
         self.forward_mode = forward_mode
         self.input_ids = input_ids
         self.ubatch_token_offset = ubatch_token_offset
         self.draft_anchor_overrides = draft_anchor_overrides
-        self.draft_ragged_lens = draft_ragged_lens
 
 
 @dataclass
@@ -587,9 +592,15 @@ class AttentionMetaData:
     # prefill/MTP-verify and per seq in decode. Separate from kv_last_page_lens
     # (the dense per-seq buffer) so the two never clobber each other.
     sparse_kv_last_page_lens: torch.Tensor | None = None
-    # Precomputed per-rank context lengths for qlen=1 sparse DSA + DCP decode.
+    # Per-rank KV length of each query token's causal window, for the sparse
+    # DSA + DCP indexer: MTP verify gives each draft position its own window.
     # The padded running-width buffer is shared by eager, graph and TBO paths.
     dcp_local_context_lens: torch.Tensor | None = None
+    # Block-table row per query token, for the same indexer -- both aiter ops
+    # address the table by row. Aliases block_tables at one query per sequence.
+    # Every producer that rewrites block_tables must rewrite this too: a stale
+    # one has the right length and the wrong rows.
+    dcp_token_block_tables: torch.Tensor | None = None
 
     work_meta_data: torch.Tensor | None = None
     work_indptr: torch.Tensor | None = None
@@ -601,6 +612,7 @@ class AttentionMetaData:
     # for prefix cache
     has_cached: bool = False
     total_kv: int | None = None
+    kpool_total_pools: int | None = None
     num_cached_tokens: torch.Tensor | None = None
     seq_starts: torch.Tensor | None = None
 
@@ -633,14 +645,17 @@ class AttentionMetaData:
         reduce_final_map: torch.Tensor | None = None,
         reduce_partial_map: torch.Tensor | None = None,
         sparse_cu_seqlens_q: torch.Tensor | None = None,
-        token_to_seq_idxs: torch.Tensor | None = None,
+        batch_id_per_q_token: torch.Tensor | None = None,
+        batch_id_per_k_token: torch.Tensor | None = None,
         has_cached: bool = False,
         total_kv: int | None = None,
+        kpool_total_pools: int | None = None,
         num_cached_tokens: torch.Tensor | None = None,
         seq_starts: torch.Tensor | None = None,
     ):
         self.has_cached = has_cached
         self.total_kv = total_kv
+        self.kpool_total_pools = kpool_total_pools
         self.num_cached_tokens = num_cached_tokens
         self.seq_starts = seq_starts
         self.cu_seqlens_q = cu_seqlens_q
@@ -670,7 +685,10 @@ class AttentionMetaData:
         self.reduce_final_map = reduce_final_map
         self.reduce_partial_map = reduce_partial_map
         self.sparse_cu_seqlens_q = sparse_cu_seqlens_q
-        self.token_to_seq_idxs = token_to_seq_idxs
+        self.batch_id_per_q_token = batch_id_per_q_token
+        # [total_kv] int32 — the KV-axis twin, over the gathered cached+new KV.
+        # Layer-invariant, so the prefill builder makes it once per fwd.
+        self.batch_id_per_k_token = batch_id_per_k_token
 
     def asdict_zerocopy(self, skip_fields: set[str] | None = None) -> dict[str, Any]:
         """Similar to dataclasses.asdict, but avoids deepcopying."""
@@ -760,6 +778,10 @@ class ForwardContext:
     # per-ubatch all_reduce. Shape: tuple of length N == len(ubatch_slices).
     # None when DP is off or when TBO is not active this step.
     ub_max_tokens_across_dp: tuple | None = None
+    # The same counts UNREDUCED: per ubatch, every rank's. The MAX above is one
+    # reduction of it and an all2all's receive width wants the SUM, so consumers
+    # take their own. Same None conditions as the MAX.
+    ub_tokens_across_dp: tuple | None = None
 
     # Cached current_stream() captured at set_forward_context() time, so
     # downstream code (V4 attention / MoE / metadata builder) doesn't have
@@ -884,6 +906,7 @@ def set_forward_context(
     ubatch_slices: list[Any] | None = None,
     in_hipgraph: bool = False,
     ub_max_tokens_across_dp: tuple | None = None,
+    ub_tokens_across_dp: tuple | None = None,
 ) -> None:
     global _forward_context
     dp_metadata: DPMetadata | None = None
@@ -895,6 +918,14 @@ def set_forward_context(
             num_tokens_across_dp,
         )
 
+    # Mirrored here rather than at each caller: the two going out of step is how
+    # an all2all comes to bound its receive buffer by one rank's count. Assigned
+    # unconditionally, because the capture loop reuses one Context across
+    # buckets and a set-only write would leave the last table behind.
+    context.running_tokens_across_dp = (
+        None if num_tokens_across_dp is None else tuple(num_tokens_across_dp.tolist())
+    )
+
     _forward_context = ForwardContext(
         attn_metadata=attn_metadata,
         no_compile_layers=atom_config.compilation_config.static_forward_context,
@@ -904,6 +935,7 @@ def set_forward_context(
         spec_decode_metadata=spec_decode_metadata,
         ubatch_slices=ubatch_slices,
         ub_max_tokens_across_dp=ub_max_tokens_across_dp,
+        ub_tokens_across_dp=ub_tokens_across_dp,
         main_stream=(torch.cuda.current_stream() if _CUDA_AVAILABLE else None),
         in_hipgraph=in_hipgraph,
     )  # _forward_context.attn_metadata = attn_metadata
@@ -953,7 +985,7 @@ def get_kvconnector(role: str = "worker", config: Config | None = None) -> Any:
 
         try:
             tp_rank = get_tp_group().rank_in_group
-        except Exception:
+        except Exception:  # noqa: BLE001 -- logged; any failure means "no group"
             _logger.warning(
                 "get_tp_group() failed (dist not initialized?), returning None"
             )

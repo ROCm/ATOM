@@ -4,12 +4,12 @@
 import pytest
 import torch
 
-from atom.model_ops.attentions.state_arena import (
-    StateField,
+from atom.model_ops.attentions.pool_layout.entry_arena import (
+    EntryField,
     plan_field_planes,
     plan_regions,
 )
-from atom.model_ops.attentions.v4_pool_geometry import UnifiedPoolGeometry
+from atom.model_ops.attentions.pool_layout.v4_pool_geometry import UnifiedPoolGeometry
 from atom.plugin.vllm.deepseek_v4_bridge import (
     ATOM_DEEPSEEK_V4_BLOCK_SIZE,
     ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT,
@@ -27,21 +27,21 @@ def _flash_state_layout(kv_fp8: bool, *, ring_extra: int = 1):
     n_csa = sum(1 for r in FLASH_RATIOS if r == 4)
     n_hca = sum(1 for r in FLASH_RATIOS if r == 128)
     fields = [
-        StateField("csa_main_kv", n_csa, (8 + ring_extra, 2 * head_dim), torch.float32),
-        StateField(
+        EntryField("csa_main_kv", n_csa, (8 + ring_extra, 2 * head_dim), torch.float32),
+        EntryField(
             "csa_main_score",
             n_csa,
             (8 + ring_extra, 2 * head_dim),
             torch.float32,
             float("-inf"),
         ),
-        StateField(
+        EntryField(
             "csa_idx_kv",
             n_csa,
             (8 + ring_extra, 2 * index_head_dim),
             torch.float32,
         ),
-        StateField(
+        EntryField(
             "csa_idx_score",
             n_csa,
             (8 + ring_extra, 2 * index_head_dim),
@@ -50,14 +50,14 @@ def _flash_state_layout(kv_fp8: bool, *, ring_extra: int = 1):
         ),
         # Mirrors the bridge, `in_checkpoint` included: this list is that
         # list's oracle, so a difference here is a difference nobody catches.
-        StateField(
+        EntryField(
             "hca_main_kv",
             n_hca,
             (128 + ring_extra, head_dim),
             torch.float32,
             in_checkpoint=False,
         ),
-        StateField(
+        EntryField(
             "hca_main_score",
             n_hca,
             (128 + ring_extra, head_dim),

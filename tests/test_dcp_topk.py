@@ -1,44 +1,58 @@
 # SPDX-License-Identifier: MIT
 """DCP decode candidate exchange: does it reproduce the global top-k?
 
-Tests the substitution ``dcp_pack_topk_candidates`` + merge performs: does
-"local top-k, exchange W*topk (score, gid) pairs, merge" reproduce the global
-top-k it replaced, and is the merged set a pure FUNCTION of the gathered buffer?
+The decode indexer replaces a global top-k over the whole context with "local
+top-k per rank, exchange the W*topk scores, merge". These tests drive that
+substitution end to end -- from a real global logits plane, through each rank's
+shard, to the physical KV slots the rank ends up attending over -- and ask
+whether the answer is still the global top-k.
 
-The merge is aiter's ``top_k_per_row_decode(..., stable=True)`` plus a gid
-gather, mirrored here by ``_merge`` from `_dcp_decode_candidate_exchange`.
-(Until 2026-08-13 it was a hand-written ``dcp_stable_topk`` in
-``atom/model_ops/dcp_ops.py``; that kernel and its dedicated tests were removed
-once aiter's stable path proved both faster and sufficient.)
+The merge is ``aiter.flydsl_dcp_topk_merge``, which selects the global threshold
+and emits only THIS rank's owned slots, already localized and compacted. The
+exchange therefore carries the score plane alone: ownership is positional
+(candidate column c came from rank c // k_loc), so global ids never travel.
 
 Why determinism is the property under test rather than a nicety: each rank runs
-the merge independently, so an ambiguous choice resolved differently on two
-ranks breaks the disjoint-partition premise ``cp_lse_ag_out_rs`` needs.
-Ambiguity can only arise among candidates whose score exactly equals the
-selection threshold, which is why the tie-heavy cases below matter more than the
-random-float ones -- on real workloads only ~0.06% of rows have such a tie, so a
-random-data-only test would almost never exercise the path that matters.
+the merge independently, so an ambiguous choice resolved differently on two ranks
+breaks the disjoint-partition premise ``cp_lse_ag_out_rs`` needs. Ambiguity can
+only arise among candidates whose score exactly equals the selection threshold,
+which is why the tie-heavy cases below matter more than the random-float ones --
+on real workloads only ~0.06% of rows have such a tie, so a random-data-only test
+would almost never exercise the path that matters.
 
 Note what the exchange does NOT promise. If a rank's own top-k boundary lands on
 a tie, aiter's kernel may keep either tied token, so the exchanged candidate set
-can differ from a gid-stable local top-k and the merged answer can be a
-DIFFERENT valid top-k. It is still valid (same score multiset) and still
-identical on every rank -- every rank merges the same gathered buffer with the
-same total order -- and cross-rank agreement is what the partition needs. The
-assertions below are written to that weaker, real contract.
+can differ from a gid-stable local top-k and the merged answer can be a DIFFERENT
+valid top-k. It is still valid (same score multiset) and the ranks still partition
+the KV disjointly, which is what the partition needs. The assertions below are
+written to that weaker, real contract.
+
+A row is a QUERY TOKEN, not a request. At qlen=1 the distinction never shows. An
+MTP verify step scores ``next_n`` draft positions per sequence, and draft
+position j attends to one more global position than j-1 -- a position that under
+DCP belongs to exactly ONE rank, so the ranks' local lengths do not all advance
+with j. aiter's paged MQA-logits kernel derives row (b, j)'s window as
+``context_lens[b] - next_n + j + 1``, which assumes every rank owns all of the
+last ``next_n``; handing it per-token lengths at ``next_n == 1`` instead is what
+makes it right. The last section pins the two pieces that substitution rests on.
 """
 
+from types import SimpleNamespace
+
+import numpy as np
 import pytest
 import torch
 
 try:
-    from aiter.ops.topk import top_k_per_row_decode
+    from aiter.ops.topk import flydsl_dcp_topk_merge, top_k_per_row_decode
 
+    from atom.model_ops import dcp_ops
+    from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
     from atom.model_ops.dcp_ops import (
-        dcp_global_pos,
+        dcp_decode_candidate_exchange_fused,
         dcp_local_context_lens,
-        dcp_merge_candidates,
-        dcp_pack_topk_candidates,
+        get_dcp_local_seq_lens,
+        get_dcp_local_window_lens,
     )
 except ImportError as _e:  # triton/aiter absent on a CPU-only runner
     pytest.skip(f"requires full atom import env: {_e}", allow_module_level=True)
@@ -51,57 +65,14 @@ TOPK = 2048
 # The decode indexer sizes its local plane from max_model_len, not from the live
 # context, so every rank's shard is padded with uninitialised memory.
 MAX_MODEL_LEN = 1 << 20
+# Page size for the identity block_table these tests build.
+PAGE = 16
 
 
-# ───────────────────────────────────────────── pack kernel == reference ──
-#
-# `dcp_pack_topk_candidates` became a single Triton kernel on 2026-08-24 (it was
-# 19 eager ops; see DCP_Further_Optimization.md ch.6). The end-to-end tests below
-# only ever run it at S == 1, so pin it against the eager formulation directly,
-# across interleave sizes and including the padding / out-of-range slots.
-
-
-def _pack_reference(local_logits, local_idx, local_lens, rank, world, s_itl):
-    """The pre-2026-08-24 eager implementation, verbatim."""
-    rows, _k = local_idx.shape
-    valid = (local_idx >= 0) & (local_idx < local_lens.view(rows, 1))
-    safe = torch.where(valid, local_idx, torch.zeros_like(local_idx))
-    sc = torch.gather(local_logits, 1, safe.to(torch.int64))
-    gid = torch.where(
-        valid,
-        dcp_global_pos(local_idx, rank, world, s_itl),
-        torch.full_like(local_idx, -1),
-    )
-    return (
-        torch.where(valid, sc, torch.full_like(sc, -float("inf"))),
-        gid,
-    )
-
-
-@pytest.mark.parametrize("s_itl", [1, 4, 16])
-@pytest.mark.parametrize("rank, world", [(0, 8), (3, 8), (7, 8), (1, 2)])
-@pytest.mark.parametrize("rows, k, l_max", [(8, TOPK, 4096), (1, 37, 64)])
-def test_pack_matches_eager_reference(s_itl, rank, world, rows, k, l_max):
-    g = torch.Generator(device=DEV).manual_seed(1000 + rank * 17 + s_itl)
-    logits = torch.randn(rows, l_max, generator=g, device=DEV, dtype=torch.float32)
-    # Mix in-range ids with the two padding conventions the bound check exists
-    # for: negative slots and ids past the live local length.
-    idx = torch.randint(
-        -3, l_max, (rows, k), generator=g, device=DEV, dtype=torch.int32
-    )
-    lens = torch.randint(0, l_max, (rows,), generator=g, device=DEV, dtype=torch.int32)
-
-    out = torch.empty(2, rows, k, dtype=torch.float32, device=DEV)
-    dcp_pack_topk_candidates(logits, idx, lens, rank, world, out, s_itl)
-    ref_sc, ref_gid = _pack_reference(logits, idx, lens, rank, world, s_itl)
-
-    assert torch.equal(out[0], ref_sc), "score plane differs from the eager reference"
-    assert torch.equal(
-        out.view(torch.int32)[1], ref_gid
-    ), "gid plane differs from the eager reference"
-
-
-# ───────────────────────────────────────── pack + merge == global top-k ──
+def _ctx_rows(ctx, rows, dev):
+    """Per-row context length; a scalar means every row has the same window."""
+    t = torch.as_tensor(ctx, device=dev).to(torch.int64).reshape(-1)
+    return t.expand(rows) if t.numel() == 1 else t
 
 
 def _build_gathered(global_logits, ctx, world, k=TOPK):
@@ -111,51 +82,112 @@ def _build_gathered(global_logits, ctx, world, k=TOPK):
     carved out of the global plane by the round-robin rule (position p lives on
     rank p % W, at local index p // W).
 
-    Returns the buffer in the layout production hands the merge: the int32 view
-    of ``[W, 2, rows, k]`` (rank outermost, plane 0 score / plane 1 gid).
+    ``ctx`` is per row, since rows of one sequence differ in length by a token
+    on an MTP verify step; a scalar is the qlen=1 case.
+
+    Returns what production hands the merge: the [rows, W*k] score plane with
+    column block r owned by rank r, plus each rank's local_idx.
     """
     rows = global_logits.shape[0]
     dev = global_logits.device
+    ctx_rows = _ctx_rows(ctx, rows, dev)
     l_max = (MAX_MODEL_LEN + world - 1) // world
-    sends = []
+    scores, idxs = [], []
 
     for r in range(world):
-        local_ctx = (ctx - r + world - 1) // world  # #positions p<ctx, p%W==r
-        # torch.empty in the real path: everything past local_ctx is garbage, so
-        # seed it with garbage that would WIN if it were ever read.
+        # torch.empty in the real path: everything past the local length is
+        # garbage, so seed it with garbage that would WIN if it were ever read.
         local = torch.rand(rows, l_max, device=dev, dtype=torch.float32) * 1e4
-        if local_ctx > 0:
-            local[:, :local_ctx] = global_logits[:, r:ctx:world]
-        lens = torch.full((rows,), local_ctx, dtype=torch.int32, device=dev)
+        lens = torch.zeros(rows, dtype=torch.int32, device=dev)
+        for row in range(rows):
+            shard = global_logits[row, r : int(ctx_rows[row]) : world]
+            local[row, : shard.numel()] = shard
+            lens[row] = shard.numel()
 
         idx = torch.empty(rows, k, dtype=torch.int32, device=dev)
+        val = torch.empty(rows, k, dtype=torch.float32, device=dev)
+        # values= is what lets the exchange drop the separate score gather. Short
+        # rows pad the index with -1 and the score with -inf, so the merge sinks
+        # them with no masking here.
         top_k_per_row_decode(
-            local, 1, lens, idx, rows, local.stride(0), local.stride(1), k
+            local,
+            1,
+            lens,
+            idx,
+            rows,
+            local.stride(0),
+            local.stride(1),
+            k,
+            stable=True,
+            values=val,
         )
-        send = torch.empty(2, rows, k, dtype=torch.float32, device=dev)
-        dcp_pack_topk_candidates(local, idx, lens, r, world, send)
-        sends.append(send.clone())
+        scores.append(val.clone())
+        idxs.append(idx.clone())
 
-    return torch.stack(sends, dim=0).view(torch.int32)
+    # all_gather -> [W, rows, k] -> [rows, W*k], rank-major within a row.
+    gathered = torch.stack(scores, dim=0).permute(1, 0, 2).reshape(rows, world * k)
+    return gathered.contiguous(), idxs
 
 
-def _merge(recv, k=TOPK):
-    """The production merge -- the real one, not a copy of it.
+def _identity_block_table(rows, ctx, world, dev, page=PAGE):
+    """A block_table whose slot arithmetic inverts back to a local index.
 
-    This used to be a hand-written mirror of the block inlined in
-    `dcp_decode_candidate_exchange`, and the two silently diverged the moment
-    that function was moved between modules (the fused gid map was replaced by
-    a reshape+gather and no test noticed). Call the shared helper instead so a
-    divergence is impossible by construction.
+    The merge emits physical slots; an identity table lets the tests assert on
+    positions instead. Local index j maps to
+    ``block_table[j // page] * page + j % page``, which with this table is
+    ``row * n_blocks * page + j``.
     """
-    rows = recv.shape[2]
-    out = torch.empty(rows, k, dtype=torch.int32, device=recv.device)
-    dcp_merge_candidates(recv, out)
-    return out
+    l_max = (ctx + world - 1) // world
+    n_blocks = (l_max + page - 1) // page + 1
+    bt = torch.arange(rows * n_blocks, dtype=torch.int32, device=dev).reshape(
+        rows, n_blocks
+    )
+    return bt, n_blocks
 
 
-def _simulate(global_logits, ctx, world, k=TOPK):
-    return _merge(_build_gathered(global_logits, ctx, world, k), k), None
+def _merge_owned(gathered, local_idx, block_table, rank, world, k_loc, topk=TOPK):
+    """The production merge for one rank -- the real op, not a copy of it."""
+    rows = gathered.shape[0]
+    dev = gathered.device
+    indptr = torch.zeros(rows + 1, dtype=torch.int32, device=dev)
+    counts = torch.zeros(rows, dtype=torch.int32, device=dev)
+    out = torch.zeros(rows * max(topk, k_loc), dtype=torch.int32, device=dev)
+    staging = torch.empty(rows, k_loc, dtype=torch.int32, device=dev)
+    flydsl_dcp_topk_merge(
+        gathered,
+        local_idx,
+        block_table,
+        out,
+        indptr,
+        counts,
+        staging,
+        rank,
+        world,
+        topk,
+        PAGE,
+    )
+    return out, indptr
+
+
+def _owned_global_positions(gathered, idxs, ctx, world, k=TOPK):
+    """Merge on every rank; return each rank's owned GLOBAL positions per row.
+
+    Inverts the slot arithmetic through the identity block_table, then undoes the
+    round-robin shard: local index j on rank r is global position j*W + r.
+    """
+    rows = gathered.shape[0]
+    ctx_max = int(_ctx_rows(ctx, rows, gathered.device).max())
+    bt, n_blocks = _identity_block_table(rows, ctx_max, world, gathered.device)
+    per_rank = []
+    for r in range(world):
+        out, indptr = _merge_owned(gathered, idxs[r], bt, r, world, k)
+        rows_out = []
+        for row in range(rows):
+            s, e = int(indptr[row]), int(indptr[row + 1])
+            j = out[s:e].to(torch.int64) - row * n_blocks * PAGE
+            rows_out.append(j * world + r)
+        per_rank.append(rows_out)
+    return per_rank
 
 
 def _global_reference(global_logits, ctx, k=TOPK):
@@ -165,6 +197,11 @@ def _global_reference(global_logits, ctx, k=TOPK):
     # stable argsort on -score keeps ascending position order within a tie
     idx = torch.argsort(-sc, dim=-1, stable=True)[:, :n_keep]
     return idx.to(torch.int32)
+
+
+def _owned_before(limit, rank, world, interleave):
+    """How many global positions p < limit does `rank` own? The slow way."""
+    return sum(1 for p in range(int(limit)) if (p // interleave) % world == rank)
 
 
 def _make_logits(rows, ctx, seed, tie_frac=0.0):
@@ -194,30 +231,37 @@ def _make_logits(rows, ctx, seed, tie_frac=0.0):
 def test_candidate_exchange_reproduces_global_topk(
     name, rows, ctx, world, tie_frac, seed
 ):
+    """The union over ranks of what each one owns == the global top-k.
+
+    No rank sees the whole set any more -- the merge emits only its own share --
+    so the invariant lives in the union, not in any single rank's output.
+    """
     gl = _make_logits(rows, ctx, seed, tie_frac)
-    out, _ = _simulate(gl, ctx, world)
+    gathered, idxs = _build_gathered(gl, ctx, world)
+    per_rank = _owned_global_positions(gathered, idxs, ctx, world)
     ref = _global_reference(gl, ctx)
     n_keep = min(TOPK, ctx)
 
-    # Assert on the SET, not the layout. aiter's stable top-k returns candidate
-    # ARRAY-index order, so when ctx < topk the real ids are interleaved with the
-    # (-inf, -1) padding across the full width instead of packed into the first
-    # n_keep columns. Nothing downstream needs the packed layout -- the filter
-    # kernels scan all NUM_TOPK_TOKENS columns and gate on `tok >= 0` -- so
-    # asserting it would only re-freeze an obsolete convention.
-    valid = out >= 0
-    assert int(valid.sum()) == rows * n_keep, f"[{name}] wrong number of valid ids"
-    assert bool((out[valid] < ctx).all()), f"[{name}] id out of range"
-    for r in range(rows):
-        row = out[r][valid[r]].cpu().tolist()
-        assert len(set(row)) == n_keep, f"[{name}] duplicate id in a row"
-    # Compact the valid ids per row so the score comparison below is layout-free.
-    got = torch.stack([out[r][valid[r]] for r in range(rows)])
+    # Check the counts BEFORE stacking: a merge that drops tokens gives ragged
+    # rows, and torch.stack would raise a shape error that says nothing about
+    # what actually went wrong.
+    unions = [torch.cat([per_rank[w][r] for w in range(world)]) for r in range(rows)]
+    for r, union in enumerate(unions):
+        assert (
+            union.numel() == n_keep
+        ), f"[{name}] row {r}: {union.numel()} owned tokens, expected {n_keep}"
+        assert bool(
+            ((union >= 0) & (union < ctx)).all()
+        ), f"[{name}] row {r}: position out of range"
+        assert (
+            union.unique().numel() == n_keep
+        ), f"[{name}] row {r}: the same token is owned twice"
+    got = torch.stack(unions)
 
     # The invariant that survives a local boundary tie reshuffling WHICH of two
     # equal-scored tokens was exchanged: the selected score multiset is still
     # exactly the global top-k's.
-    sc_got = torch.gather(gl, 1, got.long()).sort(-1).values
+    sc_got = torch.gather(gl, 1, got).sort(-1).values
     sc_ref = torch.gather(gl, 1, ref.long()).sort(-1).values
     assert torch.equal(sc_got, sc_ref), f"[{name}] selected scores are not the top-k"
 
@@ -226,147 +270,130 @@ def test_candidate_exchange_reproduces_global_topk(
     thr = gl[:, :ctx].topk(n_keep, dim=-1).values[:, -1:]
     if int((gl[:, :ctx] == thr).sum(-1).max()) == 1:
         assert torch.equal(
-            got.sort(-1).values, ref.sort(-1).values
+            got.sort(-1).values, ref.sort(-1).values.long()
         ), f"[{name}] ids differ from the reference with no threshold tie"
 
 
-def test_merge_agrees_across_ranks_on_a_fixed_buffer():
-    """The property the partition actually needs.
+@pytest.mark.parametrize(
+    "bs, next_n, base_ctx, world, seed",
+    [
+        (4, 4, 131072, 8, 11),  # long context, production verify width
+        (4, 2, 65536, 4, 12),
+        (8, 3, 4096, 4, 13),  # short rows: every candidate selected, padding path
+        (2, 4, 2500, 8, 14),  # ctx just over topk
+        (4, 4, 131071, 8, 15),  # ctx not divisible by W
+        (4, 4, 900, 8, 16),  # ctx below topk: nothing is selected away
+    ],
+)
+def test_each_draft_position_gets_its_own_global_topk(
+    bs, next_n, base_ctx, world, seed
+):
+    """Same question, MTP row shape: is each row's union still ITS OWN top-k?
 
-    NOT "the pipeline returns the same answer every run" -- it cannot, because
-    aiter's local top-k picks arbitrarily among tied candidates (measured: with
-    ties, 18/20 repeats swap one id on some row; with no ties, 0/20). What must
-    hold is that every rank merging the SAME gathered buffer returns the same
-    answer, which is what all-gather actually hands them.
+    Rows of a sequence differ in length by one token, the case a per-request
+    length cannot express. Ties resolve by the kernel's own rule, so the
+    assertion is on the score multiset -- the weaker contract above.
     """
-    gl = _make_logits(16, 65536, seed=9, tie_frac=0.99)
-    recv = _build_gathered(gl, 65536, 8)
-    first = _merge(recv).clone()
-    for i in range(20):
+    rows = bs * next_n
+    seq_ctx = base_ctx + torch.arange(bs, device=DEV) * 7
+    ctx_rows = (
+        seq_ctx[:, None] - next_n + 1 + torch.arange(next_n, device=DEV)
+    ).reshape(-1)
+    gl = _make_logits(rows, int(ctx_rows.max()), seed)
+
+    gathered, idxs = _build_gathered(gl, ctx_rows, world)
+    per_rank = _owned_global_positions(gathered, idxs, ctx_rows, world)
+
+    for row in range(rows):
+        ctx = int(ctx_rows[row])
+        owned = [per_rank[w][row] for w in range(world)]
+        union = torch.cat(owned)
+        n_keep = min(TOPK, ctx)
+
+        assert (
+            union.numel() == n_keep
+        ), f"row {row}: {union.numel()} owned, want {n_keep}"
+        assert union.unique().numel() == n_keep, f"row {row}: the same token twice"
+        assert bool(
+            ((union >= 0) & (union < ctx)).all()
+        ), f"row {row}: a position outside its own window"
+        for w in range(world):
+            assert bool(
+                ((owned[w] % world) == w).all()
+            ), f"row {row}: rank {w} claimed a position it does not own"
+
+        ref = _global_reference(gl[row : row + 1], ctx)[0].long()
         assert torch.equal(
-            _merge(recv), first
-        ), f"merge {i} disagrees -- ranks would build overlapping candidate sets"
+            gl[row][union].sort().values, gl[row][ref].sort().values
+        ), f"row {row}: selected scores are not this row's top-k"
+
+
+# Re-merging the SAME gathered buffer must return the same answer, or two ranks
+# could claim the same token. That is a property of the op alone, and aiter owns
+# it: op_tests/test_flydsl_dcp_topk_merge.py::check_deterministic_across_runs
+# re-runs it 200 times per rank on tie-heavy and random inputs. Not duplicated
+# here. What this file still has to prove is the weaker end-to-end statement
+# below: the PIPELINE may return a different valid answer between runs, because
+# aiter's local top-k picks arbitrarily among tied candidates before the merge
+# ever sees them.
 
 
 def test_reruns_stay_valid_even_when_the_set_shifts():
     """End to end, with ties: the chosen set may move, but never off the top-k."""
-    gl = _make_logits(16, 65536, seed=9, tie_frac=0.99)
-    ref_sc = torch.gather(gl, 1, _global_reference(gl, 65536).long()).sort(-1).values
-    for i in range(10):
-        out, _ = _simulate(gl, 65536, 8)
+    rows, world, ctx = 16, 8, 65536
+    gl = _make_logits(rows, ctx, seed=9, tie_frac=0.99)
+    ref_sc = torch.gather(gl, 1, _global_reference(gl, ctx).long()).sort(-1).values
+    for i in range(5):
+        gathered, idxs = _build_gathered(gl, ctx, world)
+        per_rank = _owned_global_positions(gathered, idxs, ctx, world)
+        got = torch.stack(
+            [torch.cat([per_rank[w][r] for w in range(world)]) for r in range(rows)]
+        )
         # Range-check BEFORE the gather. An out-of-range index would trip a
         # device-side assert, and on ROCm that leaves the HIP context unusable --
         # every later GPU test in the same process fails with an error that
         # points nowhere near here. (Clamping instead would hide the regression.)
-        assert bool(((out >= 0) & (out < 65536)).all()), f"rerun {i}: id out of range"
-        got_sc = torch.gather(gl, 1, out.long()).sort(-1).values
+        assert bool(((got >= 0) & (got < ctx)).all()), f"rerun {i}: id out of range"
+        got_sc = torch.gather(gl, 1, got).sort(-1).values
         assert torch.equal(got_sc, ref_sc), f"rerun {i} selected outside the top-k"
 
 
-# ─────────────────────────────── filter: disjoint union == global top-k ──
+# ─────────────────────────────── the ranks partition the KV disjointly ──
 #
-# The gap this closes: every test above stops at `topk_indices`, so the
-# `triton_filter_and_convert_dcp_index` kernels -- which turn that into each
-# rank's owned slot list -- had NO coverage. A 2026-08-13 regression lived
-# exactly there: the count/compact kernels masked columns on `indice_id <
-# g_kv_len`, which silently assumed the merge packs valid ids into the first
-# min(ctx, topk) columns. When ctx < topk and aiter's stable top-k interleaves
-# ids with (-inf, -1) padding, 875 of 1000 candidates were dropped -- invisible
-# to a test that only inspects topk_indices.
-
-
-def _filter_owned(token_indices, ctx, rank, world, block_size=16):
-    """Run the production filter for one rank; return its owned GLOBAL positions.
-
-    The kernel emits physical slots, so this rebuilds the slot->global mapping
-    with an identity block_table, letting the test assert on positions.
-    """
-    from atom.model_ops.dcp_ops import triton_filter_and_convert_dcp_index
-
-    rows = token_indices.shape[0]
-    dev = token_indices.device
-    vbs = block_size * world
-    n_blocks = (ctx + vbs - 1) // vbs
-    block_table = torch.arange(rows * n_blocks, dtype=torch.int32, device=dev).reshape(
-        rows, n_blocks
-    )
-    qo_indptr = torch.arange(rows + 1, dtype=torch.int32, device=dev)
-    g_kv_indptr = torch.arange(rows + 1, dtype=torch.int32, device=dev) * ctx
-    out_kv_indptr = torch.zeros(rows + 1, dtype=torch.int32, device=dev)
-    owned_counts = torch.zeros(rows, dtype=torch.int32, device=dev)
-    out = torch.zeros(rows * TOPK, dtype=torch.int32, device=dev)
-
-    triton_filter_and_convert_dcp_index(
-        qo_indptr,
-        g_kv_indptr,
-        block_table,
-        token_indices,
-        rank,
-        world,
-        block_size,
-        out_kv_indptr,
-        owned_counts,
-        NUM_TOPK_TOKENS=TOPK,
-        out=out,
-    )
-
-    # slot = block_table[req, g // vbs] * block_size + (g % vbs) // W, and the
-    # block_table is the identity, so invert it back to g.
-    per_row = []
-    for r in range(rows):
-        s, e = int(out_kv_indptr[r]), int(out_kv_indptr[r + 1])
-        slots = out[s:e]
-        blk, off = slots // block_size, slots % block_size
-        g = (blk - r * n_blocks) * vbs + off * world + rank
-        per_row.append(g)
-    return per_row
+# What the merge promises beyond "the union is the global top-k": no token is
+# owned twice. ``cp_lse_ag_out_rs`` combines the per-rank partial attentions by
+# summing them, so a token counted on two ranks is silently double-weighted --
+# no crash, just a wrong answer.
 
 
 @pytest.mark.parametrize(
     "name, rows, ctx, world",
     [
-        ("ctx < topk (the regression case)", 4, 1000, 8),
+        ("ctx < topk (the padding case)", 4, 1000, 8),
         ("ctx just over topk", 4, 2500, 8),
         ("long ctx", 4, 32768, 8),
-        ("W=2", 4, 1000, 2),
+        ("heavy ties", 4, 32768, 8),
     ],
 )
 def test_filter_partitions_topk_disjointly(name, rows, ctx, world):
-    gl = _make_logits(rows, ctx, seed=11)
-    out, _ = _simulate(gl, ctx, world)
-    expected = [set(out[r][out[r] >= 0].cpu().tolist()) for r in range(rows)]
-
-    union = [set() for _ in range(rows)]
-    for rank in range(world):
-        for r, g in enumerate(_filter_owned(out, ctx, rank, world)):
-            ids = set(g.cpu().tolist())
-            assert all(
-                i % world == rank for i in ids
-            ), f"[{name}] rank {rank} kept a foreign position"
-            assert not (union[r] & ids), f"[{name}] rank {rank} overlaps another rank"
-            union[r] |= ids
+    tie = 0.99 if "ties" in name else 0.0
+    gl = _make_logits(rows, ctx, seed=11, tie_frac=tie)
+    gathered, idxs = _build_gathered(gl, ctx, world)
+    per_rank = _owned_global_positions(gathered, idxs, ctx, world)
 
     for r in range(rows):
-        assert union[r] == expected[r], (
-            f"[{name}] row {r}: union of the ranks' kept sets != the global top-k "
-            f"(missing {len(expected[r] - union[r])}, extra {len(union[r] - expected[r])})"
-        )
-
-
-# ─────────────────────────────────── prefill filter: layout independence ──
-#
-# `triton_filter_and_convert_dcp_index_prefill` carried the same truncation
-# (`col_id < kv_len`) as the decode twin. It never broke in production because
-# aiter's prefill kernels short-circuit `row_len <= k` and emit every candidate
-# in order with the tail filled to -1 -- on both the one-block (stable=True,
-# GLM-5.2) and multi-block (stable=False, V3.2) paths. But that is aiter's
-# layout contract, not an invariant of our kernel, and the decode path proved
-# what happens when such a contract silently changes.
-#
-# So these tests do NOT assert the layout. They feed the SAME candidate set in
-# two placements -- compact (what aiter emits today) and scattered across the
-# full 2048 width (what broke decode) -- and require an identical partition from
-# both. That is the property we actually depend on.
+        seen = torch.cat([per_rank[w][r] for w in range(world)])
+        assert (
+            seen.unique().numel() == seen.numel()
+        ), f"[{name}] row {r}: ranks overlap -- a token would be double-counted"
+        # Ownership is positional: rank w may only ever emit positions p with
+        # p % W == w (round-robin shard, S=1).
+        for w in range(world):
+            owned = per_rank[w][r]
+            if owned.numel():
+                assert bool(
+                    ((owned % world) == w).all()
+                ), f"[{name}] row {r}: rank {w} emitted a token it does not own"
 
 
 def _build_prefill_topk(kv_lens, bases, layout, k=TOPK, seed=7):
@@ -492,15 +519,189 @@ def test_prefill_filter_is_layout_independent(
         )
 
 
+# ─────────────────────────────────────────── per-query-token row metadata ──
+#
+# The end-to-end test above assumes each row was handed its own window and its
+# own request's block table. These pin the two producers of that.
+
+
+@pytest.mark.parametrize("world", [2, 4, 8])
+@pytest.mark.parametrize("interleave", [1, 16])
+@pytest.mark.parametrize("max_seqlen_q", [1, 2, 4])
+def test_window_lens_count_the_positions_this_rank_owns(
+    world, interleave, max_seqlen_q
+):
+    # Lengths straddling a super-block boundary in both directions, so the tail
+    # remainder is exercised on every rank rather than only the first.
+    seq_lens = np.array(
+        [1, max_seqlen_q, 97, 128, 129, world * interleave * 3 + 1, 1024],
+        dtype=np.int64,
+    )
+    for rank in range(world):
+        got = get_dcp_local_window_lens(seq_lens, max_seqlen_q, world, rank, interleave)
+        want = [
+            _owned_before(ctx - max_seqlen_q + 1 + j, rank, world, interleave)
+            for ctx in seq_lens
+            for j in range(max_seqlen_q)
+        ]
+        assert list(got) == want, f"rank {rank}"
+
+
+@pytest.mark.parametrize("world", [4, 8])
+@pytest.mark.parametrize("interleave", [1, 16])
+def test_one_query_per_sequence_reproduces_the_per_request_lengths(world, interleave):
+    """qlen=1 is not a special case in the code, so it must not be one here."""
+    seq_lens = np.array([1, 63, 64, 65, 4096], dtype=np.int64)
+    for rank in range(world):
+        assert list(
+            get_dcp_local_window_lens(seq_lens, 1, world, rank, interleave)
+        ) == list(get_dcp_local_seq_lens(seq_lens, world, rank, interleave))
+
+
+def test_window_lens_advance_only_on_the_rank_that_owns_the_new_token():
+    """Summed over ranks, the per-row advance is exactly one token per position.
+
+    This is the property the aiter kernel's uniform `- next_n + j` gets wrong:
+    it advances EVERY rank's length by one per draft position, so W-1 of the W
+    ranks over-read while the owner under-reads.
+    """
+    world, q, ctx = 4, 4, 1000
+    per_rank = np.stack(
+        [
+            get_dcp_local_window_lens(np.array([ctx]), q, world, r, 1)
+            for r in range(world)
+        ]
+    )
+    advances = np.diff(per_rank, axis=1)
+    assert advances.sum(axis=0).tolist() == [1] * (q - 1)
+    # ...and each single advance lands on one rank alone.
+    assert set(advances.ravel().tolist()) <= {0, 1}
+
+
+def _publish(bs, q, world, cols=6, is_sparse=True):
+    block_tables = torch.arange(bs * cols, dtype=torch.int32, device=DEV).reshape(
+        bs, cols
+    )
+    stub = SimpleNamespace(
+        is_sparse=is_sparse,
+        dcp_world_size=world,
+        _dcp_token_block_tables_gpu=torch.zeros(
+            bs * q, cols, dtype=torch.int32, device=DEV
+        ),
+    )
+    meta = SimpleNamespace(block_tables=block_tables, dcp_token_block_tables=None)
+    AiterMLAMetadataBuilder._publish_dcp_token_block_tables(stub, meta, bs, q)
+    return meta
+
+
+@pytest.mark.parametrize("bs, q", [(1, 4), (3, 2), (8, 3), (5, 4)])
+def test_token_block_table_row_belongs_to_the_draft_position_s_request(bs, q):
+    meta = _publish(bs, q, world=4)
+    rows = meta.dcp_token_block_tables
+    assert rows.shape == (bs * q, meta.block_tables.shape[1])
+    assert rows.dtype == torch.int32
+    for b in range(bs):
+        for j in range(q):
+            assert torch.equal(rows[b * q + j], meta.block_tables[b]), (b, j)
+
+
+def test_one_query_per_sequence_aliases_the_request_table():
+    """No copy when there is nothing to expand -- and no chance of drift."""
+    meta = _publish(bs=8, q=1, world=4)
+    assert meta.dcp_token_block_tables is meta.block_tables
+
+
+def test_nothing_published_off_the_dcp_sparse_path():
+    """A leftover table is worse than none: same row count, wrong rows."""
+    assert _publish(bs=4, q=2, world=1).dcp_token_block_tables is None
+    assert _publish(bs=4, q=2, world=4, is_sparse=False).dcp_token_block_tables is None
+
+
+def test_fused_exchange_passes_the_kernels_one_row_per_query_token(monkeypatch):
+    """Pin what the ops receive: the flatten to next_n=1 is invisible to every
+    assertion above, and getting it wrong faults nothing and produces no NaN."""
+    import importlib
+    import sys
+
+    import aiter.ops.topk as topk_mod
+
+    # aiter binds this one lazily, so patch the sys.modules entry -- the module
+    # attribute of the same name is a second, stale copy.
+    importlib.import_module("aiter.ops.triton.pa_mqa_logits")
+    logits_mod = sys.modules["aiter.ops.triton.pa_mqa_logits"]
+
+    bs, q, world, cols = 3, 4, 4, 6
+    rows = bs * q
+    seen = {}
+
+    def fake_logits(q_rows, kv, w, out, ctx, bt, *a, **kw):
+        seen["q_rows"], seen["logits_ctx"], seen["logits_bt"] = q_rows, ctx, bt
+
+    def fake_topk(logits, next_n, ctx, idx, n_rows, *a, **kw):
+        seen["next_n"], seen["topk_ctx"], seen["topk_rows"] = next_n, ctx, n_rows
+
+    def fake_merge(scores, local_idx, bt, *a, **kw):
+        seen["merge_bt"] = bt
+
+    monkeypatch.setattr(logits_mod, "deepgemm_fp8_paged_mqa_logits", fake_logits)
+    monkeypatch.setattr(topk_mod, "top_k_per_row_decode", fake_topk)
+    monkeypatch.setattr(topk_mod, "flydsl_dcp_topk_merge", fake_merge)
+    monkeypatch.setattr(dcp_ops, "get_dcp_world_size", lambda: world)
+    monkeypatch.setattr(
+        dcp_ops,
+        "get_dcp_group",
+        lambda: SimpleNamespace(
+            all_gather=lambda t, dim: t.repeat(world, *([1] * (t.dim() - 1)))
+        ),
+    )
+
+    # A recognisable value per row, so a slice or permute cannot pass.
+    windows = torch.arange(1, rows + 1, dtype=torch.int32, device=DEV)
+    token_bt = torch.arange(rows * cols, dtype=torch.int32, device=DEV).reshape(
+        rows, cols
+    )
+    meta = SimpleNamespace(
+        dcp_local_context_lens=windows,
+        dcp_token_block_tables=token_bt,
+        context_lens=torch.full((bs,), 64, dtype=torch.int32, device=DEV),
+    )
+    query = torch.randn(bs, q, 8, 16, device=DEV)
+    dcp_decode_candidate_exchange_fused(
+        meta,
+        query,
+        kv_cache=torch.empty(0, device=DEV),
+        weights=torch.empty(rows, 8, device=DEV),
+        dcp_rank=0,
+        num_decode_tokens=rows,
+        topk_tokens=TOPK,
+        max_model_len=MAX_MODEL_LEN,
+        runner_block_size=PAGE,
+        stable_topk=True,
+        cp_kv_cache_interleave_size=1,
+        out_kv_indices=torch.empty(rows * TOPK, dtype=torch.int32, device=DEV),
+        out_kv_indptr=torch.empty(rows + 1, dtype=torch.int32, device=DEV),
+        owned_counts=torch.empty(rows, dtype=torch.int32, device=DEV),
+    )
+
+    assert seen["next_n"] == 1 and seen["topk_rows"] == rows
+    assert seen["q_rows"].shape == (rows, 1, 8, 16)
+    for b in range(bs):
+        for j in range(q):
+            assert torch.equal(seen["q_rows"][b * q + j, 0], query[b, j])
+    for name in ("logits_ctx", "topk_ctx"):
+        assert torch.equal(seen[name], windows), name
+    for name in ("logits_bt", "merge_bt"):
+        assert torch.equal(seen[name], token_bt), name
+
+
 # ---------------------------------------------------------------------------
 # Regression guards for the fusions themselves.
 #
-# The two checks below exist because both existing safety nets are blind to a
-# production path that stops *using* a fused helper: the correctness tests drove
-# a hand-written copy of the merge, and bench_dcp_indexer_fuse.py times the
-# primitives directly. When `dcp_decode_candidate_exchange` was moved between
-# modules its fused local_ctx read and fused gid map were replaced by the old
-# eager code, and every test and the benchmark still passed.
+# These exist because the correctness tests above are blind to a production path
+# that stops *using* a fused helper: they drive the ops directly, so swapping a
+# fused read back out for eager code keeps every assertion green. That has
+# happened before -- a move between modules silently replaced the fused local_ctx
+# read, and every test still passed.
 # ---------------------------------------------------------------------------
 
 
@@ -531,15 +732,10 @@ def test_local_context_lens_fallback_matches_reference(world, interleave):
     """No published buffer (or a stale one) -> derive, and match the split."""
     rows = 37
     ctx = torch.randint(1, 100000, (rows,), dtype=torch.int32, device=DEV)
-    ref = torch.stack(
-        [
-            torch.tensor(
-                sum(1 for p in range(int(c)) if (p // interleave) % world == 0),
-                dtype=torch.int32,
-                device=DEV,
-            )
-            for c in ctx
-        ]
+    ref = torch.tensor(
+        [_owned_before(c, 0, world, interleave) for c in ctx],
+        dtype=torch.int32,
+        device=DEV,
     )
     for meta in (
         _FakeMeta(ctx),  # non-DCP or non-sparse metadata builder
@@ -550,33 +746,64 @@ def test_local_context_lens_fallback_matches_reference(world, interleave):
         torch.testing.assert_close(got, ref, rtol=0, atol=0)
 
 
+def test_local_context_lens_refuses_a_multi_token_step_with_nothing_published():
+    """The fallback reads per-request lengths, so it cannot answer for MTP."""
+    meta = _FakeMeta(torch.tensor([64, 64], dtype=torch.int32, device=DEV))
+    with pytest.raises(ValueError, match="query tokens"):
+        dcp_local_context_lens(meta, 0, 4, 1, num_rows=8)
+
+
 @pytest.mark.parametrize("world", [2, 8])
 def test_merge_launches_the_fused_kernel_count(world):
-    """The merge must stay at 3 device kernels (score copy, top-k, gid map).
+    """The merge must stay at 2 device kernels (select, pack).
 
-    The pre-fusion form of this block was 6+ (reshape copy, int64 index cast,
-    gather, copy_ on top of the same three), so this trips the moment the fused
-    gid map is swapped back out for a reshape+gather.
+    The sequence it replaced was ~16, and every correctness assertion above would
+    happily accept a return to it -- they drive the op, not the op count.
+
+    It was 3 until the cross-row prefix sum moved into pack: that scan used to be
+    its own grid=(1,) kernel walking the rows on one thread, which cost 37% of the
+    op at rows=128. Each pack block now recomputes the prefix it needs in
+    parallel, so a regression back to a separate scan kernel trips this.
     """
-    rows, k_loc = 8, 256
-    recv = torch.empty(world, 2, rows, k_loc, dtype=torch.int32, device=DEV)
-    recv[:, 0] = torch.randn(world, rows, k_loc, device=DEV).view(torch.int32)
-    recv[:, 1] = torch.randint(
-        0, 1 << 20, (world, rows, k_loc), dtype=torch.int32, device=DEV
-    )
-    out = torch.empty(rows, k_loc, dtype=torch.int32, device=DEV)
+    rows, k_loc, topk = 8, 256, 256
+    gathered = torch.randn(rows, world * k_loc, device=DEV)
+    local_idx = torch.stack(
+        [torch.randperm(k_loc, device=DEV)[:k_loc] for _ in range(rows)]
+    ).to(torch.int32)
+    bt = torch.randint(0, 500, (rows, 512), dtype=torch.int32, device=DEV)
+    # Allocate the outputs OUTSIDE the profiled region: _merge_owned's zeros()
+    # are the test harness, not the op, and would be counted as launches.
+    indptr = torch.zeros(rows + 1, dtype=torch.int32, device=DEV)
+    counts = torch.zeros(rows, dtype=torch.int32, device=DEV)
+    out = torch.zeros(rows * max(topk, k_loc), dtype=torch.int32, device=DEV)
+    staging = torch.empty(rows, k_loc, dtype=torch.int32, device=DEV)
 
-    dcp_merge_candidates(recv, out)  # warm up any JIT before counting
+    def merge():
+        flydsl_dcp_topk_merge(
+            gathered,
+            local_idx,
+            bt,
+            out,
+            indptr,
+            counts,
+            staging,
+            0,
+            world,
+            topk,
+            PAGE,
+        )
+
+    merge()  # warm up JIT
     torch.cuda.synchronize()
 
     from torch.profiler import ProfilerActivity, profile
 
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
-        dcp_merge_candidates(recv, out)
+        merge()
         torch.cuda.synchronize()
     launches = sum(
         e.count
         for e in prof.key_averages()
         if e.device_type == torch.autograd.DeviceType.CUDA and e.self_device_time_total
     )
-    assert launches <= 4, f"merge launched {launches} kernels, expected <=4"
+    assert launches == 2, f"merge launched {launches} kernels, expected 2"

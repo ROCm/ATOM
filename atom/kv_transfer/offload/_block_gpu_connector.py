@@ -26,6 +26,7 @@ from atom.kv_transfer.offload.atom_lmcache_staging import (
     _PipelineStage,
     _StagingBuffer,
     _ThreadTransferState,
+    memory_object_as_uint8,
     run_staged_pipeline,
 )
 
@@ -270,29 +271,6 @@ class BlockGPUConnector:
             "loads successfully"
         )
 
-    def _memory_tensor(self, memory_obj: Any, nbytes: int) -> torch.Tensor:
-        tensor = getattr(memory_obj, "tensor", None)
-        if tensor is None and hasattr(memory_obj, "get_tensor"):
-            tensor = memory_obj.get_tensor(0)
-        if tensor is None:
-            raise RuntimeError("ATOM LMCache connector: invalid MemoryObj tensor")
-        if tensor.dtype != torch.uint8:
-            raise TypeError(
-                "ATOM LMCache connector: MemoryObj tensor must be uint8, "
-                f"got {tensor.dtype}"
-            )
-        if not tensor.is_contiguous():
-            raise RuntimeError(
-                "ATOM LMCache connector: MemoryObj tensor not contiguous"
-            )
-        flat = tensor.reshape(-1)
-        if int(flat.numel()) < int(nbytes):
-            raise ValueError(
-                "ATOM LMCache connector: MemoryObj tensor is too small "
-                f"for {nbytes} bytes; got {int(flat.numel())}"
-            )
-        return flat[: int(nbytes)]
-
     def _range_block_ids(
         self,
         all_block_ids: list[int],
@@ -360,7 +338,7 @@ class BlockGPUConnector:
                 _TransferChunk(
                     memory_obj=memory_obj,
                     block_ids=block_ids,
-                    tensor=self._memory_tensor(memory_obj, nbytes),
+                    tensor=memory_object_as_uint8(memory_obj, nbytes),
                     nbytes=nbytes,
                 )
             )

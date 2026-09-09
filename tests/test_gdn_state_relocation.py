@@ -21,6 +21,12 @@ pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
 
 from atom.model_ops.attentions.gdn_attn import GDNStateMixin
 
+K3 = pytest.importorskip(
+    "atom.model_ops.attentions.kimi_mla_gdn_attn",
+    reason="needs the hybrid KDA/MLA backend",
+    exc_type=ImportError,
+)
+
 LAYERS = 3
 SLOTS = 12
 SHAPE_K = (2, 5)
@@ -187,3 +193,26 @@ def test_baseline_relocation_does_not_look_for_replay_buffers():
     GDNStateMixin.relocate_state_slots(stub, [(0, 2)])
 
     assert torch.equal(k[:, 2], before_k[:, 0])
+
+
+@pytest.mark.parametrize("num_spec", [0, 3])
+def test_kpool_tail_relocation_uses_raw_slot_indices(num_spec):
+    """The hybrid override receives the same raw-slot pairs as its base."""
+    base, _, _ = build(num_spec=num_spec)
+    tail = torch.zeros((2, SLOTS, 2, 4, 3))
+    for layer in range(tail.shape[0]):
+        for slot in range(SLOTS):
+            tail[layer, slot] = layer * 100 + slot
+    before = tail.clone()
+    base.model_runner.kpool_tail_cache = tail
+    hybrid = object.__new__(K3._KimiMLAGDNCommon)
+    hybrid.model_runner = base.model_runner
+    hybrid.num_spec = num_spec
+    hybrid.replayssm = False
+
+    hybrid.relocate_state_slots([(1, 3)])
+
+    assert torch.equal(tail[:, 3], before[:, 1])
+    for slot in range(SLOTS):
+        if slot != 3:
+            assert torch.equal(tail[:, slot], before[:, slot])

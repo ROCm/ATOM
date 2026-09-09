@@ -98,6 +98,13 @@ count_in() {
     echo "${c:-0}"
 }
 
+count_excluding() {
+    local pat=$1 file=$2 c
+    { [ -z "$file" ] || [ ! -r "$file" ]; } && { echo 0; return; }
+    c=$(grep -cvE "$pat" "$file" 2>/dev/null | head -1)
+    echo "${c:-0}"
+}
+
 mtime_of() {
     local file=$1
     [ -z "$file" ] || [ ! -r "$file" ] && { echo 0; return; }
@@ -106,9 +113,16 @@ mtime_of() {
 
 FAULT_PATTERN='stopped, reason|MEMORY_VIOLATION|ASSERT_TRAP|proc died unexpectedly|Memory access fault by GPU'
 
+# Server-log lines that must not count as progress. aiter prints this one from
+# a rank that is ALREADY blocked on the broadcast ring, so reading it as
+# liveness inverts its meaning -- and it repeats every 60s, exactly the default
+# STUCK_POLLS*POLL quiet window, so it resets the counter one poll before it can
+# fire and the hang only ever surfaces at MAX_MIN.
+IDLE_NOISE_PATTERN='No available shared memory broadcast block'
+
 prev_outputs=0
 prev_mtime=0
-prev_server_mtime=0
+prev_server_lines=0
 stuck=0
 server_log=""
 # Whether we've ever observed the workload python process. Until this flips
@@ -170,29 +184,32 @@ for ((i=1; i<=ITERS; i++)); do
     #   2. Caller LOG_FILE mtime advancing (covers client logs / offline
     #      stdout where engine marker is absent: benchmark tqdm,
     #      simple_inference, etc. — but tqdm may not flush during warmup).
-    #   3. Server log mtime advancing (universal "server is busy" signal:
-    #      uvicorn HTTP access logs, scheduler trace, request arrival —
-    #      grows during warmup even before any output ships, so it
-    #      prevents false HANG during long warmup phases).
+    #   3. Server log GROWING IN LINES, ignoring IDLE_NOISE_PATTERN (universal
+    #      "server is busy" signal: uvicorn HTTP access logs, scheduler trace,
+    #      request arrival — grows during warmup even before any output ships,
+    #      so it prevents false HANG during long warmup phases). Counted by
+    #      line rather than by mtime because mtime cannot tell what was
+    #      written, and a wedge that keeps one periodic logger alive would
+    #      otherwise read as progress.
     cur_outputs=$(count_in "Engine Core: output send" "$server_log")
     delta_out=$(( cur_outputs - prev_outputs ))
     cur_mtime=$(mtime_of "$LOG_FILE")
     delta_mtime=$(( cur_mtime - prev_mtime ))
-    cur_server_mtime=$(mtime_of "$server_log")
-    delta_server_mtime=$(( cur_server_mtime - prev_server_mtime ))
+    cur_server_lines=$(count_excluding "$IDLE_NOISE_PATTERN" "$server_log")
+    delta_server_lines=$(( cur_server_lines - prev_server_lines ))
 
     # Client still running?
     client_alive=$(pgrep -af "$CLIENT_PATTERN" 2>/dev/null | grep -v grep | wc -l)
 
-    echo "[t=$((i*POLL))s] outputs=${cur_outputs} (+${delta_out}) mtime+${delta_mtime}s srv_mtime+${delta_server_mtime}s clients=${client_alive} stuck=${stuck}/${STUCK_POLLS}"
+    echo "[t=$((i*POLL))s] outputs=${cur_outputs} (+${delta_out}) mtime+${delta_mtime}s srv+${delta_server_lines}ln clients=${client_alive} stuck=${stuck}/${STUCK_POLLS}"
 
-    if [ "$delta_out" -eq 0 ] && [ "$delta_mtime" -eq 0 ] && [ "$delta_server_mtime" -eq 0 ]; then
+    if [ "$delta_out" -eq 0 ] && [ "$delta_mtime" -eq 0 ] && [ "$delta_server_lines" -eq 0 ]; then
         stuck=$(( stuck + 1 ))
     else
         stuck=0
         prev_outputs=$cur_outputs
         prev_mtime=$cur_mtime
-        prev_server_mtime=$cur_server_mtime
+        prev_server_lines=$cur_server_lines
     fi
 
     # Drained cleanly: client gone AND no new output this poll → done.

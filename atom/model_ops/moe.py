@@ -219,23 +219,33 @@ class FusedMoEParallelConfig:
     # deployment wider than the box, in which case experts shard that many
     # times finer and each rank repeats the gathered tokens that many times.
     dp_logical_ratio: int = 1
+    requested_all2all_backend: str = "auto"
+
+    @property
+    def selected_all2all_backend(self) -> str | None:
+        if self.dp_size <= 1 or not self.use_ep or self.dp_logical_ratio != 1:
+            return None
+        if self.requested_all2all_backend == "none":
+            return None
+        if self.requested_all2all_backend == "rccl":
+            return "rccl"
+        if not envs.ATOM_DISABLE_MORI_EP and _has_module("mori"):
+            return "mori"
+        return None
 
     @property
     def use_all2all_kernels(self):
-        # Only use mori all2all kernels when expert parallel is enabled.
-        # Never while simulating: mori is real peer-to-peer, so absent ranks
-        # cannot be stood in for, and it derives a token's destination from
-        # num_experts // real peer count -- which disagrees with a finer map.
-        return (
-            self.dp_size > 1
-            and self.use_ep
-            and self.dp_logical_ratio == 1
-            and _has_module("mori")
-        )
+        # Routed all-to-all requires real peers. Simulated DP has a finer
+        # expert map than the launched process group and stays on the fallback.
+        return self.selected_all2all_backend is not None
 
     @property
     def use_mori_kernels(self):
-        return True
+        return self.selected_all2all_backend == "mori"
+
+    @property
+    def use_rccl_kernels(self):
+        return self.selected_all2all_backend == "rccl"
 
     @staticmethod
     def make(
@@ -257,6 +267,9 @@ class FusedMoEParallelConfig:
         # Only flatten DP into TP/EP when enable_dp_attention is True.
         # Otherwise, use pure DP for MoE.
         enable_dp_attention = parallel_config.enable_dp_attention
+        requested_all2all_backend = getattr(
+            parallel_config, "moe_all2all_backend", "auto"
+        )
 
         # When EP shards across the flattened DP * TP space (vLLM plugin under
         # EP), the ep rank must be computed in that flattened group space.
@@ -314,6 +327,7 @@ class FusedMoEParallelConfig:
                 ep_rank=0,
                 use_ep=False,
                 local_ep_size=1,
+                requested_all2all_backend=requested_all2all_backend,
             )
         # DP + EP / TP + EP / DP + TP + EP
         assert use_ep
@@ -335,6 +349,7 @@ class FusedMoEParallelConfig:
             ),
             local_ep_size=atom_config.parallel_config.data_parallel_size_local
             * tp_size_,
+            requested_all2all_backend=requested_all2all_backend,
         )
 
 
@@ -621,10 +636,30 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     ) -> FusedMoEPrepareAndFinalize | None:
         from aiter.dist.parallel_state import get_ep_group
 
-        all2all_manager = get_ep_group().device_communicator.all2all_manager
-        assert all2all_manager is not None
-
         prepare_finalize: FusedMoEPrepareAndFinalize | None = None
+        ep_group = get_ep_group()
+
+        if moe.use_rccl_kernels:
+            from atom.model_ops.fused_moe.rccl_prepare_finalize import (
+                RcclPrepareAndFinalize,
+            )
+
+            return RcclPrepareAndFinalize(
+                ep_group,
+                num_local_experts=moe.num_local_experts,
+                max_tokens_per_rank=moe.max_num_tokens,
+                num_replicated_shared_experts=(
+                    moe.expert_layout.num_fused_shared_experts
+                    if moe.expert_layout.uses_dispatch_remap
+                    else 0
+                ),
+                num_routed_experts_per_rank=(
+                    moe.expert_layout.routed_physical_per_rank
+                ),
+            )
+
+        all2all_manager = ep_group.device_communicator.all2all_manager
+        assert all2all_manager is not None
 
         # TODO: could allow this now
         # assert not moe.use_flashinfer_cutlass_kernels, "Must be created in modelopt.py"
@@ -3021,6 +3056,7 @@ class FusedMoE(torch.nn.Module):
         config: PretrainedConfig | None = None,
         shared_expert_prefix: str | None = None,
         pad_align: int | None = None,
+        enable_comm_fused: bool = False,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -3048,10 +3084,28 @@ class FusedMoE(torch.nn.Module):
         self.moe_parallel_config = FusedMoEParallelConfig.make(
             tp_size, dp_size, atom_config
         )
+        self._comm_fused_moe = None
+        if enable_comm_fused:
+            from atom.model_ops.fused_moe.comm_fused_moe import (
+                create_comm_fused_moe_backend,
+            )
+
+            self._comm_fused_moe = create_comm_fused_moe_backend(
+                layer_quant_config=layer_quant_config,
+                online_quant=quant_config is not None and quant_config.online_quant,
+                parallel_config=self.moe_parallel_config,
+                model_dim=hidden_size,
+                inter_dim=intermediate_size // self.tp_size,
+                experts=num_experts,
+                topk=top_k,
+                activation=activation,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
         if shared_expert_prefix is None and prefix.endswith(".experts"):
             shared_expert_prefix = prefix[: -len(".experts")] + ".shared_experts"
         fuse_shared_experts = (
-            is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+            self._comm_fused_moe is None
+            and is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
                 quant_config,
                 shared_expert_prefix=shared_expert_prefix,
                 routed_expert_prefix=prefix,
@@ -3373,6 +3427,8 @@ class FusedMoE(torch.nn.Module):
     def process_weights_after_loading(self):
         self._online_quant()
         self._validate_moe_backend()
+        if self._comm_fused_moe is not None:
+            self._comm_fused_moe.initialize(self)
 
     def _validate_moe_backend(self) -> None:
         if get_current_atom_config().moe_backend != "mega":
@@ -4593,10 +4649,47 @@ class FusedMoE(torch.nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         if self.balance_router_logits is not None:
-            router_logits = self.balance_router_logits[: hidden_states.shape[0]]
+            # Match the dtype of the logits being replaced. The table is built
+            # once at the default dtype, but aiter's `biased_grouped_topk`
+            # dispatches on `gating_output.dtype()` and then reinterpret_casts
+            # `correction_bias` to that same scalar_t -- so handing it a bf16
+            # table for a router whose bias is fp32 makes the kernel read that
+            # fp32 buffer at half width, i.e. garbage bias over half the
+            # experts. Only fake-EPLB reaches this, so the cast costs nothing
+            # on a real run.
+            router_logits = self.balance_router_logits[: hidden_states.shape[0]].to(
+                router_logits.dtype
+            )
         return torch.ops.aiter.moe_forward(
             hidden_states, router_logits, self.layer_name
         )
+
+    def forward_maybe_comm_fused(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        shared_partial: torch.Tensor | None,
+        before_stage2: Callable[[], torch.Tensor] | None = None,
+        stage2_stream: torch.cuda.Stream | None = None,
+    ) -> tuple[torch.Tensor, bool]:
+        """Return ``(output, complete)`` after fused or ordinary dispatch.
+
+        A complete output already contains the shared expert and TP reduction.
+        """
+        backend = self._comm_fused_moe
+        if backend is not None and backend.supports(hidden_states.shape[0]):
+            return (
+                backend.forward(
+                    self,
+                    hidden_states,
+                    router_logits,
+                    shared_partial,
+                    before_stage2=before_stage2,
+                    stage2_stream=stage2_stream,
+                ),
+                True,
+            )
+        return self(hidden_states, router_logits), False
 
     def forward_impl_graph(
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor

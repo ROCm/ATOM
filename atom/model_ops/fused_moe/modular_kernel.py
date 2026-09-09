@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import final
@@ -13,6 +14,7 @@ from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
 from atom.model_ops.fused_moe.utils import disable_inplace
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
+from atom.utils.tbo.ubatching import tbo_overlap_enabled
 from atom.utils.tbo.ubatching import tbo_overlap_enabled
 
 
@@ -82,6 +84,10 @@ class FusedMoEPrepareAndFinalize(ABC):
 
     def supports_async(self) -> bool:
         return False
+
+    def needs_dispatch_output_trim(self) -> bool:
+        """Whether prepare may return a fixed-capacity buffer with a dead tail."""
+        return True
 
     def prepare_async(
         self,
@@ -285,6 +291,29 @@ class FusedMoEModularKernel(torch.nn.Module):
                 output = result()
         return output
 
+    def _trim_dispatch_output_if_needed(
+        self,
+        dispatch_a1: torch.Tensor,
+        dispatch_scale: torch.Tensor | None,
+        dispatch_ids: torch.Tensor,
+        dispatch_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        expert_tokens_meta,
+    ):
+        # Exact-size transports such as RCCL have no inactive arena tail. Keep
+        # this gate outside _maybe_trim_dispatch_output so frontend overrides
+        # of the MoRI-specific policy cannot accidentally trim exact outputs.
+        if not self.prepare_finalize.needs_dispatch_output_trim():
+            return dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights
+        return self._maybe_trim_dispatch_output(
+            dispatch_a1,
+            dispatch_scale,
+            dispatch_ids,
+            dispatch_weights,
+            topk_ids,
+            expert_tokens_meta,
+        )
+
     def _maybe_trim_dispatch_output(
         self,
         dispatch_a1: torch.Tensor,
@@ -296,25 +325,30 @@ class FusedMoEModularKernel(torch.nn.Module):
     ):
         """Trim the mori dispatch buffer's dead tail before fused_moe.
 
-        Default (native/sglang/rtp) policy: under a uniform all-ranks-decode
-        batch, trim to the static running_tokens*dp bound so the shape is
-        consistent across cudagraph capture/replay. mori dispatch dedups per
-        destination rank, so a rank receives at most running_tokens per source
-        rank -- the bound must not multiply by topk. atom-vllm needs a different,
-        exact received-token trim for DP+EP mixed batches and overrides this
-        method via a plugin patch -- keep this body frontend-agnostic.
+        The bound is what the GROUP sent -- mori dedups per destination, so each
+        source rank contributes at most its own count, and never that times
+        topk. `running_tokens * dp_size` is the same number only while the group
+        is uniform; a TBO ubatch splits per-rank, and on the smaller rank the
+        product trims BELOW the `expert_num_tokens` fused_moe is driven by,
+        which walks moe_sorting's zero-fill off a workspace sized from the
+        trimmed width. A sum is the group's count however unevenly it was
+        reached, so nothing here excludes a ragged step either.
+
+        atom-vllm needs a different, exact received-token trim for DP+EP mixed
+        batches and overrides this method via a plugin patch -- keep this body
+        frontend-agnostic.
         """
         context = get_forward_context().context
         if context is None:
             return dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights
 
-        dp_size = get_dp_group().world_size
-        # running_tokens keeps the trimmed shape consistent capture-to-replay.
-        total_valid_tokens = context.running_tokens * dp_size
-        tokens_unified = getattr(
-            context, "running_tokens_are_unified", not context.is_prefill
+        across_dp = context.running_tokens_across_dp
+        assert across_dp is not None, (
+            "an all2all MoE needs the group's per-rank counts to bound what its "
+            "dispatch delivered; this step reached it with none reduced"
         )
-        if total_valid_tokens < dispatch_a1.shape[0] and tokens_unified:
+        total_valid_tokens = sum(across_dp)
+        if total_valid_tokens < dispatch_a1.shape[0]:
             dispatch_a1 = dispatch_a1[:total_valid_tokens]
             dispatch_ids = dispatch_ids[:total_valid_tokens]
             dispatch_weights = dispatch_weights[:total_valid_tokens]
@@ -407,7 +441,7 @@ class FusedMoEModularKernel(torch.nn.Module):
             dispatch_scale,
             dispatch_ids,
             dispatch_weights,
-        ) = self._maybe_trim_dispatch_output(
+        ) = self._trim_dispatch_output_if_needed(
             dispatch_a1,
             dispatch_scale,
             dispatch_ids,
