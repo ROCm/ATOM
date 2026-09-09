@@ -339,8 +339,8 @@ class OffloadSchedulerMixin(ABC):
         self.total_saved_tokens = 0
         self._load_inflight_tokens: dict[object, int] = {}
         self._save_inflight_tokens: dict[object, int] = {}
-        # Early block-release observability (see `offload_early_block_release_enabled`).
-        # Populated only when the feature is on; all remain 0 otherwise.
+        # Early block-release observability. Populated by layouts that support
+        # exact source-block leases; unsupported layouts leave these at 0.
         self.total_early_released_blocks = 0  # freed at request-finish, not save-gated
         self.total_leased_source_blocks = 0  # ever protected by a save lease
         self.total_source_safe_released_blocks = 0  # freed once their save reported
@@ -740,20 +740,3 @@ def offload_save_abandon_timeout_s() -> float:
             )
     _save_abandon_timeout_s = pin + _SAVE_ABANDON_MARGIN_S if pin > 0 else 0.0
     return _save_abandon_timeout_s
-
-
-def offload_early_block_release_enabled() -> bool:
-    """Whether a finished request's non-save-source blocks free immediately.
-
-    Default off (A/B + rollback): with this unset, a request whose save is
-    still in flight keeps its *entire* block table pinned via
-    `deferred_free_blocks` until the save reports. Enabling
-    `ATOM_OFFLOAD_EARLY_BLOCK_RELEASE=1` narrows that to only the block IDs the
-    pending save actually reads (see `DenseOffloadScheduler.protected_block_ids`
-    / `BlockManager.deallocate_partial`); every other block (decode blocks,
-    unaligned prompt tail, already-saved ranges) is freed at request-finish
-    time instead of waiting on the save. Scoped to dense/M3 PAGE-only for now
-    -- DSV4/K3 keep the pre-existing whole-table defer.
-    """
-    raw = os.environ.get("ATOM_OFFLOAD_EARLY_BLOCK_RELEASE", "0").strip().lower()
-    return bool(raw) and raw not in {"0", "false", "no", "off"}

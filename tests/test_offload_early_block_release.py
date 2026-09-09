@@ -42,7 +42,6 @@ def _config(role="kv_producer", *, block_size=4):
 
 
 def _early_release_scheduler(monkeypatch, role="kv_producer", *, chunk_size=8):
-    monkeypatch.setenv("ATOM_OFFLOAD_EARLY_BLOCK_RELEASE", "1")
     monkeypatch.setattr(
         offcfg,
         "build_lmcache_config",
@@ -478,9 +477,8 @@ class TestNoDoubleFree:
         assert scheduler.take_source_safe_releases() == []
 
 
-class TestFeatureFlagDefaultsOff:
-    def test_disabled_by_default_uses_whole_request_defer(self, monkeypatch):
-        monkeypatch.delenv("ATOM_OFFLOAD_EARLY_BLOCK_RELEASE", raising=False)
+class TestEarlyReleaseDefaultsOn:
+    def test_supported_layout_uses_exact_source_protection(self, monkeypatch):
         monkeypatch.setattr(
             offcfg,
             "build_lmcache_config",
@@ -493,5 +491,6 @@ class TestFeatureFlagDefaultsOff:
         seq.num_cached_tokens = 8
         scheduler.build_connector_meta()
 
-        assert scheduler.protected_block_ids(seq) is None
+        assert scheduler._early_release is True
+        assert scheduler.protected_block_ids(seq) == frozenset({0, 1})
         assert scheduler.should_defer_free(seq) is True

@@ -48,7 +48,6 @@ from atom.kv_transfer.offload._offload_common import (
     OffloadSchedulerMixin,
     OffloadWorkerMixin,
     build_offload_engine,
-    offload_early_block_release_enabled,
     pp_aware_rank_and_world,
     validated_kv_role,
 )
@@ -95,9 +94,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         self._engine = None
         self._codec: DenseKVByteCodec | None = None
         self._lookup_server = None
-        self._early_release = bool(
-            self._supports_early_block_release and offload_early_block_release_enabled()
-        )
+        self._early_release = bool(self._supports_early_block_release)
 
     def close(self) -> None:
         super().close()
@@ -441,9 +438,7 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         # per-request lease set exists only after request teardown transfers a
         # refcount share from the request to the save. Source-safe and
         # store-terminal are separate connector completions.
-        self._early_release = bool(
-            self._supports_early_block_release and offload_early_block_release_enabled()
-        )
+        self._early_release = bool(self._supports_early_block_release)
         self._save_operation_blocks: dict[SaveOperationId, dict[int, int]] = {}
         self._save_operation_safe: dict[SaveOperationId, set[int]] = {}
         self._save_operation_owner: dict[SaveOperationId, object] = {}
@@ -843,8 +838,8 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
     def protected_block_ids(self, seq) -> frozenset | None:
         """Exact pending/in-flight source blocks not yet known source-safe.
 
-        None means "this connector cannot narrow the protection" (feature
-        disabled, or a load is in flight, since a load also
+        None means "this connector cannot narrow the protection" (the layout
+        does not support exact leases, or a load is in flight, since a load also
         touches HBM blocks this connector does not track per-range) -- the
         scheduler falls back to deferring the whole request. This includes a
         final save that has not been emitted yet: request teardown freezes its
