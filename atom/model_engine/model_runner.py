@@ -2330,6 +2330,7 @@ class ModelRunner:
         num_tokens_across_dp = None if sync is None else sync.num_tokens_across_dp
         tbo_collective_active = forward_mode.tbo_collective_active
         ub_max_tokens_across_dp = None if sync is None else sync.ub_max_tokens_across_dp
+        ub_tokens_across_dp = None if sync is None else sync.ub_tokens_across_dp
         running_tokens_are_unified = forward_mode.running_tokens_are_unified
 
         if not tbo_collective_active:
@@ -2399,6 +2400,7 @@ class ModelRunner:
             spec_decode_metadata=spec_decode_metadata,
             ubatch_slices=ubatch_slices,
             ub_max_tokens_across_dp=ub_max_tokens_across_dp,
+            ub_tokens_across_dp=ub_tokens_across_dp,
         )
 
     def prepare_sample(
@@ -3811,11 +3813,24 @@ class ModelRunner:
                         )
                     # Create ubatch slices for TBO capture (need > 2 requests)
                     ubatch_slices = None
+                    ub_tokens_across_dp = None
                     if is_tbo and self.config.enable_tbo_decode and bs > 2:
                         ubatch_slices = maybe_create_ubatch_slices(
                             num_reqs=bs,
                             num_tokens=num_tokens,
                         )
+                        # The rebuild above's symmetry, one level down: every
+                        # rank splits this bucket the same way, so a ubatch's
+                        # per-rank counts are its own repeated. Stated, because
+                        # a capture context declares its shape where a real step
+                        # reduces one, and no consumer can tell an absent
+                        # reduction from a uniform answer.
+                        if ubatch_slices and num_tokens_across_dp is not None:
+                            dp = len(num_tokens_across_dp)
+                            ub_tokens_across_dp = tuple(
+                                (s.token_slice.stop - s.token_slice.start,) * dp
+                                for s in ubatch_slices
+                            )
 
                     set_forward_context(
                         attn_metadata=attn_metadata,
@@ -3824,6 +3839,7 @@ class ModelRunner:
                         num_tokens=num_tokens,
                         num_tokens_across_dp=num_tokens_across_dp,
                         ubatch_slices=ubatch_slices,
+                        ub_tokens_across_dp=ub_tokens_across_dp,
                         in_hipgraph=True,
                     )
 
