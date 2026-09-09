@@ -687,20 +687,35 @@ def _base_vs_main(judging, history):
     only large deviations carry meaning. `_baseline_sanity` is the gate; this
     is the reading.
     """
-    med, peak = [], []
+    per_conc = []
     for member in judging:
         hist = history.get((member["model"], member["isl_osl"], member["conc"]))
         if not hist or not hist.get("median"):
             continue
-        med.append((member["base_tput"] / hist["median"] - 1) * 100)
-        if hist.get("peak"):
-            peak.append((member["base_tput"] / hist["peak"] - 1) * 100)
-    if not med:
+        per_conc.append(
+            {
+                "conc": member["conc"],
+                "vs_median_pct": (member["base_tput"] / hist["median"] - 1) * 100,
+                "vs_peak_pct": (
+                    (member["base_tput"] / hist["peak"] - 1) * 100
+                    if hist.get("peak")
+                    else None
+                ),
+            }
+        )
+    if not per_conc:
         return None
+    per_conc.sort(key=lambda x: x["conc"])
     return {
-        "vs_median_pct": statistics.median(med),
-        "vs_peak_pct": _median_or_none(peak),
-        "n_levels": len(med),
+        # Kept for the ordering and for anything reading the JSON, but the
+        # report shows the levels: a median hides the split where one level is
+        # fine and another is far under, which is what says where to look.
+        "vs_median_pct": statistics.median(x["vs_median_pct"] for x in per_conc),
+        "vs_peak_pct": _median_or_none(
+            [x["vs_peak_pct"] for x in per_conc if x["vs_peak_pct"] is not None]
+        ),
+        "per_conc": per_conc,
+        "n_levels": len(per_conc),
     }
 
 
@@ -1185,8 +1200,8 @@ def render(report, context):
 
     if rows:
         drift_lines += [
-            "| Model | isl/osl | vs main now | vs main peak | Main trend |",
-            "|---|---|---|---|---|",
+            "| Model | isl/osl | c | vs main now | vs main peak | Main trend |",
+            "|---|---|---|---|---|---|",
         ]
         for family in rows:
             v = family["base_vs_main"]
@@ -1205,19 +1220,23 @@ def render(report, context):
                 )
             else:
                 trend = "steady"
-            drift_lines.append(
-                "| {} | {} | {:+.1f}% | {} | {} |".format(
-                    family["model"],
-                    family["isl_osl"],
-                    v["vs_median_pct"],
-                    (
-                        "{:+.1f}%".format(v["vs_peak_pct"])
-                        if v["vs_peak_pct"] is not None
-                        else "-"
-                    ),
-                    trend,
+            first = True
+            for lvl in v["per_conc"]:
+                drift_lines.append(
+                    "| {} | {} | {} | {:+.1f}% | {} | {} |".format(
+                        family["model"] if first else "",
+                        family["isl_osl"] if first else "",
+                        lvl["conc"],
+                        lvl["vs_median_pct"],
+                        (
+                            "{:+.1f}%".format(lvl["vs_peak_pct"])
+                            if lvl["vs_peak_pct"] is not None
+                            else "-"
+                        ),
+                        trend if first else "",
+                    )
                 )
-            )
+                first = False
         drift_lines += [
             "",
             (
