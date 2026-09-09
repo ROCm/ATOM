@@ -376,7 +376,7 @@ _ANTHROPIC_PING_FRAME = event_frame("ping", {"type": "ping"})
 _ANTHROPIC_PING_INTERVAL_SECONDS = 5.0
 _metrics_exporter = AtomMetricsExporter()
 _background_tasks: list[asyncio.Task] = []
-_METRICS_REFRESH_INTERVAL_SECONDS = 5.0
+_METRICS_REFRESH_INTERVAL_SECONDS = 1.0
 # The watch compares two `gc.get_stats()` reads against something that moves on
 # the scale of minutes, so it has no reason to ride the metrics cadence.
 _GC_WATCH_INTERVAL_SECONDS = 60.0

@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
-from prometheus_client import CollectorRegistry, Histogram, generate_latest
+from prometheus_client import CollectorRegistry, Gauge, Histogram, generate_latest
 
 SCRIPTS = Path(__file__).resolve().parents[1] / ".github/scripts/atomesh/observability"
 
@@ -143,7 +143,11 @@ def test_collection_diagnostics_are_finalized_once_before_rendering(
     report = collector.export_report
 
     def fetch(url, query, start, end, step):
-        if 'role="prefill"' in query and "histogram_quantile(0.9," in query:
+        if (
+            'role="prefill"' in query
+            and "atom:time_to_first_token_seconds_bucket" in query
+            and "histogram_quantile(0.9," in query
+        ):
             raise OSError("one query failed")
         return [[start, 10.0], [end, 20.0]]
 
@@ -388,6 +392,19 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
         ["router_type", "backend_type"],
         registry=registry,
     ).labels("http", "pd")
+    queue_time = Histogram(
+        "atom:request_queue_time_seconds", "fixture", registry=registry
+    )
+    batch = Histogram("atom:decode_batch_size", "fixture", registry=registry)
+    transfer = Histogram("atom:pd_kv_transfer_seconds", "fixture", registry=registry)
+    queues = Gauge("atom:scheduler_requests", "fixture", ["state"], registry=registry)
+    blocks = Gauge(
+        "atom:scheduler_kv_cache_blocks", "fixture", ["state"], registry=registry
+    )
+    for state in ("running", "waiting", "waiting_kv"):
+        queues.labels(state).set(2)
+    for state, value in (("used", 2), ("evictable", 3), ("vacant", 5), ("total", 10)):
+        blocks.labels(state).set(value)
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -396,6 +413,9 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
                 decode.observe(0.01)
                 mesh.observe(0.035)
                 itl.observe(0.006)
+                queue_time.observe(0.01)
+                batch.observe(4)
+                transfer.observe(0.02)
             body = generate_latest(registry)
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; version=0.0.4")
@@ -457,6 +477,13 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
             for panel in data["panels"]
             for series in panel["series"].values()
         )
+        for panel in data["panels"]:
+            if panel.get("kind") == "blocks":
+                for state, expected in (("used", 2), ("total", 10)):
+                    values = [
+                        v for _, v in panel["block_counts"][state] if v is not None
+                    ]
+                    assert values and all(v == expected for v in values)
         assert "Server is ready" in (output / "prometheus.log").read_text()
         assert "See you next time!" in (output / "prometheus.log").read_text()
     finally:

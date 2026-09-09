@@ -44,7 +44,7 @@ def scrape_config(prefill: list[str], decode: list[str], mesh: str) -> dict:
         return address
 
     return {
-        "global": {"scrape_interval": "5s", "scrape_timeout": "4s"},
+        "global": {"scrape_interval": "1s", "scrape_timeout": "1s"},
         "scrape_configs": [
             {
                 "job_name": "atom",
@@ -194,10 +194,10 @@ def wait_for_final_scrape(
 def empty_report(start, end, model, notes):
     panels = export_report.panels_for("pd")
     for panel in panels:
-        panel["series"] = {key: [] for key in export_report.STATISTICS}
+        panel["series"] = {key: [] for key in export_report.statistics_for(panel)}
     return {
         "meta": {
-            "title": "Agentic PD latency report",
+            "title": "Agentic PD inference report",
             "model": model,
             "start": start,
             "end": max(end, start + 1),
@@ -344,7 +344,7 @@ def run(args) -> int:
             notes = [
                 (
                     "Collected during the complete AIPerf invocation, including its warmup and drain. "
-                    "Each point summarizes the preceding 60 seconds; percentiles are histogram estimates."
+                    "Histogram points summarize the preceding 60 seconds; queue and KV curves show sampled state. Percentiles are histogram estimates."
                 )
             ]
             if benchmark_rc:
@@ -374,7 +374,7 @@ def run(args) -> int:
                     max(collection_end, start + 1),
                     step=REPORT_STEP,
                     model=args.model,
-                    title="Agentic PD latency report",
+                    title="Agentic PD inference report",
                     diagnostics=status["errors"],
                 )
                 targets = get_json(prometheus_url + "/api/v1/targets")
