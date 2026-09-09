@@ -143,7 +143,7 @@ def test_batch_counts_request_rows_and_ignores_dummy_prefill_and_empty(clock):
 
 
 def test_scheduler_abort_releases_pending_metric_state(clock):
-    scheduler = Scheduler(MockConfig())
+    scheduler = Scheduler(MockConfig(enable_prefix_caching=True))
     seq = Sequence(
         [1, 3, 4], block_size=4, kv_transfer_params={"do_remote_prefill": True}
     )
@@ -155,6 +155,7 @@ def test_scheduler_abort_releases_pending_metric_state(clock):
     )
     assert not scheduler.metrics._loads
     assert scheduler.metrics.snapshot()["pd_kv_transfer"]["buckets"][-1][1] == 0
+    assert scheduler.engine_stats.total_requests == 0
 
 
 def test_scheduler_success_closes_timer_at_completion_before_next_schedule(clock):
@@ -256,6 +257,142 @@ def test_engine_snapshots_reach_exporter_with_distinct_dp_ranks():
         assert data[("atom:decode_batch_size_sum", labels)] == size
 
 
+def test_cache_tiers_preserve_admitted_reuse_through_snapshots():
+    from aiter_stub import stubbed_aiter
+
+    with stubbed_aiter():
+        from atom.model_engine.llm_engine import LLMEngine
+
+    ranks = {}
+    for rank, (gpu, offload) in enumerate(((6000, 3000), (1000, 0))):
+        scheduler = Scheduler(MockConfig(enable_prefix_caching=True))
+        scheduler.engine_stats.update_cache(
+            gpu, 10000, gpu, gpu, 9500, num_offload_tokens=offload
+        )
+        ranks[rank] = EngineUtilityHandler(
+            None, Queue(), scheduler=scheduler
+        ).collect_metrics()
+    # Transfer volume and PP copies must not enter admitted cache accounting.
+    ranks[0]["offload"] = {"loaded_tokens": 99999}
+    ranks[2] = {"enabled": False, "cache": ranks[0]["cache"]}
+    engine = SimpleNamespace(
+        core_mgr=SimpleNamespace(latest_metrics=ranks, get_dp_router_statistics=dict)
+    )
+    exporter = AtomMetricsExporter()
+    for _ in range(2):
+        exporter.update(LLMEngine.get_metrics_statistics(engine))
+        values = samples(exporter)
+        assert values[("atom:prefix_cache_cached_tokens_total", ())] == 7000
+        assert values[("atom:prefix_cache_offload_tokens_total", ())] == 3000
+        assert values[("atom:prefix_cache_full_tokens_total", ())] == 20000
+        assert values[("atom:lmcache_loaded_tokens_total", ())] == 99999
+    # No-LMCache is a measured zero, while an old snapshot is unknown.
+    engine.core_mgr.latest_metrics = {1: ranks[1]}
+    exporter.update(LLMEngine.get_metrics_statistics(engine))
+    assert samples(exporter)[("atom:prefix_cache_offload_tokens_total", ())] == 0
+    del ranks[1]["cache"]["offload_tokens"]
+    engine.core_mgr.latest_metrics = ranks
+    exporter.update(LLMEngine.get_metrics_statistics(engine))
+    assert ("atom:prefix_cache_offload_tokens_total", ()) not in samples(exporter)
+
+
+@pytest.mark.parametrize("dcp", [1, 2])
+@pytest.mark.parametrize("warm_cache", [False, True])
+def test_pd_consumer_counts_its_own_prefix_once_after_transfer(
+    dcp, warm_cache, monkeypatch
+):
+    scheduler = Scheduler(
+        MockConfig(
+            enable_prefix_caching=True,
+            num_kvcache_blocks=50,
+            decode_context_parallel_size=dcp,
+        )
+    )
+    scheduler.kv_connector = SimpleNamespace(
+        is_producer=False,
+        is_offload=False,
+        build_connector_meta=lambda: None,
+    )
+    bm = scheduler.block_manager
+    if dcp > 1:
+        # Keep the real cache matching/publication path, with virtual-block
+        # allocation independent of the GPU-only DCP kernel module.
+        monkeypatch.setattr(
+            bm,
+            "num_pool_blocks",
+            lambda length: (length + bm.hash_block_size - 1) // bm.hash_block_size,
+        )
+    prompt = list(range(100, 100 + 4 * bm.hash_block_size))
+    if warm_cache:
+        seed = Sequence(prompt, block_size=4)
+        assert bm.allocate(seed, bm.can_allocate(seed))
+        bm.register_received_prefix(seed)
+        bm.deallocate(seed)
+    seq = Sequence(prompt, block_size=4, kv_transfer_params={"first_token_id": 999})
+    # This API field came from P and must never become D's cache numerator.
+    seq.prefix_cache_hit_tokens = len(prompt) - 1
+    scheduler.add(seq)
+    assert bm.allocate(seq, bm.can_allocate(seq))
+    expected_hit = 3 * bm.hash_block_size if warm_cache else 0
+    assert seq.num_cached_tokens == expected_hit
+    seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+    scheduler._count_inflight_load(seq)
+    idle, idle_seqs = scheduler.schedule()
+    assert not idle_seqs and idle.total_seqs_num == 0
+    assert scheduler.engine_stats.total_requests == 0
+
+    scheduler._update_from_kv_xfer_finished(
+        KVConnectorOutput(finished_recving={seq.id})
+    )
+    scheduled, _ = scheduler.schedule()
+    assert scheduled.total_seqs_num_decode == 1
+    assert scheduled.total_seqs_num_prefill == 0
+    assert seq.num_tokens == len(prompt) + 1
+    stats = scheduler.engine_stats.cache_statistics()
+    assert stats["requests"] == 1
+    assert stats["full_tokens"] == len(prompt)
+    assert stats["cached_tokens"] == expected_hit
+    assert stats["offload_tokens"] == 0
+    assert seq.prefix_cache_hit_tokens == len(prompt) - 1
+    # Further decode steps and repeated snapshots do not count another hit.
+    scheduler._update_from_kv_xfer_finished(
+        KVConnectorOutput(finished_recving={seq.id})
+    )
+    scheduler.schedule()
+    assert scheduler.engine_stats.cache_statistics() == stats
+
+
+def test_failed_pd_transfer_does_not_record_successful_cache_admission():
+    scheduler = Scheduler(MockConfig(enable_prefix_caching=True))
+    scheduler.kv_connector = SimpleNamespace(
+        is_producer=False,
+        is_offload=False,
+        build_connector_meta=lambda: None,
+        get_num_new_matched_tokens=lambda seq: (0, False),
+        update_state_after_alloc=lambda seq: None,
+    )
+    seq = Sequence(
+        list(range(100, 116)), block_size=4, kv_transfer_params={"first_token_id": 999}
+    )
+    seq.prefix_cache_hit_tokens = 15
+    scheduler.add(seq)
+    bm = scheduler.block_manager
+    assert bm.allocate(seq, bm.can_allocate(seq))
+    seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+    scheduler._count_inflight_load(seq)
+    scheduler._update_from_kv_xfer_finished(KVConnectorOutput(failed_recving={seq.id}))
+    assert scheduler.engine_stats.total_requests == 0
+    # At the failure/success branch, choose fallback without counting a PD hit.
+    # Local prefill admission is covered separately; block recovery is not part
+    # of this metrics change.
+    assert scheduler._resolve_waiting_remote_kv(seq, deque()) is False
+    assert scheduler.engine_stats.total_requests == 0
+    assert scheduler.engine_stats.total_full_tokens == 0
+    assert scheduler.engine_stats.total_cached_tokens == 0
+    assert scheduler.engine_stats.total_offload_tokens == 0
+    assert seq.num_tokens == 16  # P's first output token was not injected.
+
+
 def test_pp_head_records_once_when_dispatching_a_real_forward(clock):
     from aiter_stub import stubbed_aiter
 
@@ -291,3 +428,82 @@ def test_pp_head_records_once_when_dispatching_a_real_forward(clock):
     assert dispatched == ["forward", "flush_pp_send"]
     assert metrics.snapshot()["decode_batch_size"]["buckets"][-1][1] == 1
     assert metrics.snapshot()["queue_time"]["buckets"][-1][1] == 1
+
+
+def test_workload_uses_dispatch_snapshot_and_observes_prompt_once(clock):
+    metrics = SchedulerMetrics()
+    decode = SimpleNamespace(id=1, num_prompt_tokens=1000)
+    prefill = SimpleNamespace(id=2, num_prompt_tokens=10000)
+    seqs = {1: decode, 2: prefill}
+    for seq in seqs.values():
+        metrics.enqueue(seq)
+    mixed = SimpleNamespace(
+        req_ids=[1, 2],
+        is_dummy_run=False,
+        total_seqs_num_decode=1,
+        total_seqs_num_prefill=1,
+        total_tokens_num_prefill=1024,
+        num_cached_tokens=[1999, 8000],
+        context_lens=[2000, 9024],
+    )
+    metrics.record_forward(mixed, seqs)
+    mixed.num_cached_tokens[1] = 9024
+    mixed.total_tokens_num_prefill = 976
+    mixed.context_lens = [2001, 10000]
+    metrics.record_forward(mixed, seqs)
+    snapshot = metrics.snapshot()
+    assert snapshot["prefill_request_tokens"]["sum"] == 2000
+    assert snapshot["prefill_request_tokens"]["buckets"][-1][1] == 1
+    assert snapshot["prefill_batch_tokens"]["sum"] == 2000
+    assert snapshot["prefill_batch_tokens"]["buckets"][-1][1] == 2
+    assert snapshot["decode_context_tokens"]["sum"] == 4001
+    assert snapshot["decode_context_tokens"]["buckets"][-1][1] == 2
+    mixed.is_dummy_run = True
+    metrics.record_forward(mixed, seqs)
+    assert metrics.snapshot() == snapshot
+
+
+def test_worker_snapshots_include_all_pp_tp_workers_without_duplicate_queues():
+    from aiter_stub import stubbed_aiter
+
+    with stubbed_aiter():
+        from atom.model_engine.llm_engine import LLMEngine
+    from atom.model_engine.gpu_metrics import GPUForwardMetrics
+
+    worker = GPUForwardMetrics(lambda: None).snapshot()
+    worker["phases"]["prefill"] = {
+        "buckets": [(0.1, 1), (float("inf"), 1)],
+        "sum": 0.08,
+    }
+    snapshots = {
+        0: {
+            "enabled": True,
+            "requests_running": 2,
+            "forward_metrics": [
+                {**worker, "dp_rank": 0, "pp_rank": 0, "tp_rank": tp} for tp in (0, 1)
+            ],
+        },
+        1: {
+            "enabled": False,
+            "forward_metrics": [
+                {**worker, "dp_rank": 0, "pp_rank": 1, "tp_rank": tp} for tp in (0, 1)
+            ],
+        },
+    }
+    engine = SimpleNamespace(
+        core_mgr=SimpleNamespace(
+            latest_metrics=snapshots, get_dp_router_statistics=dict
+        )
+    )
+    result = LLMEngine.get_metrics_statistics(engine)
+    assert result["requests_running"] == 2
+    assert len(result["forward_metrics"]) == 4
+    exporter = AtomMetricsExporter()
+    exporter.update(result)
+    counts = {
+        labels: v
+        for (name, labels), v in samples(exporter).items()
+        if name == "atom:gpu_forward_seconds_count" and ("phase", "prefill") in labels
+    }
+    assert len(counts) == 4 and set(counts.values()) == {1}
+    assert exporter.render() == exporter.render()

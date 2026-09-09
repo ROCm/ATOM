@@ -99,6 +99,7 @@ class _AtomMetricsCollector:
         yield from self._collect_scheduler_metrics(
             snapshot.get("scheduler_metrics", [])
         )
+        yield from self._collect_forward_metrics(snapshot.get("forward_metrics", []))
 
         # Read live rather than from the snapshot: the snapshot is refreshed by
         # the engine, and a stream starved by the engine is exactly the case
@@ -338,6 +339,14 @@ class _AtomMetricsCollector:
             metric.add_metric([], float(value))
             yield metric
 
+        if "offload_tokens" in cache:
+            metric = CounterMetricFamily(
+                "atom:prefix_cache_offload_tokens",
+                "Prompt tokens reused from LMCache beyond the admitted GPU prefix; shares prefix-cache input accounting, not transfer volume.",
+            )
+            metric.add_metric([], float(cache["offload_tokens"]))
+            yield metric
+
         for name, documentation, value in (
             (
                 "atom:prefix_cache_hit_ratio",
@@ -475,9 +484,26 @@ class _AtomMetricsCollector:
                 "atom:pd_kv_transfer_seconds",
                 "Decode-side PD KV load wait until all workers complete; includes dispatch, handshake and notification.",
             ),
+            (
+                "prefill_request_tokens",
+                "atom:prefill_request_tokens",
+                "Prompt tokens remaining at first local prefill dispatch, once per request.",
+            ),
+            (
+                "prefill_batch_tokens",
+                "atom:prefill_batch_tokens",
+                "Real prefill tokens scheduled per forward, excluding cached prefix and padding.",
+            ),
+            (
+                "decode_context_tokens",
+                "atom:decode_context_tokens",
+                "Sum of logical decode sequence lengths per real forward, without padding or TP multiplication.",
+            ),
         ):
             metric = HistogramMetricFamily(name, help_text, labels=labels)
             for rank in ranks:
+                if key not in rank:
+                    continue
                 hist = rank[key]
                 metric.add_metric(
                     [str(rank["dp_rank"]), rank["engine_role"]],
@@ -513,6 +539,48 @@ class _AtomMetricsCollector:
             timestamp.add_metric(values, rank["timestamp"])
         yield queues
         yield blocks
+        yield timestamp
+
+    @staticmethod
+    def _collect_forward_metrics(workers):
+        labels = ["dp_rank", "pp_rank", "tp_rank", "engine_role"]
+        duration = HistogramMetricFamily(
+            "atom:gpu_forward_seconds",
+            "Per-worker target forward device-event duration, including stream communication/waits; excludes input preparation, sampling and drafting.",
+            labels=[*labels, "phase"],
+        )
+        pending = GaugeMetricFamily(
+            "atom:gpu_forward_pending",
+            "Unfinished device timing samples.",
+            labels=labels,
+        )
+        dropped = CounterMetricFamily(
+            "atom:gpu_forward_dropped",
+            "Device timings skipped because the bounded event queue was full.",
+            labels=labels,
+        )
+        timestamp = GaugeMetricFamily(
+            "atom:gpu_forward_snapshot_timestamp_seconds",
+            "Worker device timing snapshot time.",
+            labels=labels,
+        )
+        for worker in workers:
+            values = [str(worker[k]) for k in labels]
+            for phase, hist in worker["phases"].items():
+                duration.add_metric(
+                    [*values, phase],
+                    buckets=[
+                        ("+Inf" if bound == float("inf") else str(bound), count)
+                        for bound, count in hist["buckets"]
+                    ],
+                    sum_value=hist["sum"],
+                )
+            pending.add_metric(values, worker["pending"])
+            dropped.add_metric(values, worker["dropped"])
+            timestamp.add_metric(values, worker["timestamp"])
+        yield duration
+        yield pending
+        yield dropped
         yield timestamp
 
 

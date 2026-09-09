@@ -9,7 +9,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
-from prometheus_client import CollectorRegistry, Gauge, Histogram, generate_latest
+from prometheus_client import (
+    CollectorRegistry,
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
+)
 
 SCRIPTS = Path(__file__).resolve().parents[1] / ".github/scripts/atomesh/observability"
 
@@ -75,6 +81,10 @@ def test_collector_setup_failure_preserves_benchmark_exit_and_diagnostic_report(
     assert "download unavailable" in status["errors"][0]
     data = json.loads((args.output / "report-data.json").read_text())
     assert data["meta"]["kind"] == "recorded"
+    assert data["meta"]["instances"] == [
+        {"role": "prefill", "instance": "127.0.0.1:8010"},
+        {"role": "decode", "instance": "127.0.0.1:8020"},
+    ]
     assert all(not points for p in data["panels"] for points in p["series"].values())
     assert (args.output / "report.html").is_file()
 
@@ -152,6 +162,7 @@ def test_collection_diagnostics_are_finalized_once_before_rendering(
         return [[start, 10.0], [end, 20.0]]
 
     monkeypatch.setattr(report, "fetch_series", fetch)
+    monkeypatch.setattr(report, "fetch_instance_series", lambda *args: {})
     renders = []
     original = report.write_report
 
@@ -401,10 +412,40 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
     blocks = Gauge(
         "atom:scheduler_kv_cache_blocks", "fixture", ["state"], registry=registry
     )
+    workload = [
+        Histogram(name, "fixture", registry=registry)
+        for name in (
+            "atom:prefill_request_tokens",
+            "atom:prefill_batch_tokens",
+            "atom:decode_context_tokens",
+            "atom:gpu_forward_seconds",
+        )
+    ]
+    cached = Counter("atom:prefix_cache_cached_tokens", "fixture", registry=registry)
+    offload = Counter("atom:prefix_cache_offload_tokens", "fixture", registry=registry)
+    prompt = Counter("atom:prefix_cache_full_tokens", "fixture", registry=registry)
     for state in ("running", "waiting", "waiting_kv"):
         queues.labels(state).set(2)
     for state, value in (("used", 2), ("evictable", 3), ("vacant", 5), ("total", 10)):
         blocks.labels(state).set(value)
+
+    other_registry = CollectorRegistry()
+    for metric in (ttft, itl, queue_time, batch, transfer, queues, *workload):
+        other_registry.register(metric)
+    other_blocks = Gauge(
+        "atom:scheduler_kv_cache_blocks", "fixture", ["state"], registry=other_registry
+    )
+    for state, value in (("used", 18), ("evictable", 6), ("vacant", 6), ("total", 30)):
+        other_blocks.labels(state).set(value)
+    other_cached = Counter(
+        "atom:prefix_cache_cached_tokens", "fixture", registry=other_registry
+    )
+    other_offload = Counter(
+        "atom:prefix_cache_offload_tokens", "fixture", registry=other_registry
+    )
+    other_prompt = Counter(
+        "atom:prefix_cache_full_tokens", "fixture", registry=other_registry
+    )
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -416,7 +457,15 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
                 queue_time.observe(0.01)
                 batch.observe(4)
                 transfer.observe(0.02)
-            body = generate_latest(registry)
+                for hist, value in zip(workload, (2000, 512, 32000, 0.008)):
+                    hist.observe(value)
+                cached.inc(8)
+                offload.inc(1)
+                prompt.inc(10)
+                other_cached.inc(20)
+                other_offload.inc(30)
+                other_prompt.inc(100)
+            body = generate_latest(getattr(self.server, "metrics_registry", registry))
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; version=0.0.4")
             self.send_header("Content-Length", str(len(body)))
@@ -430,6 +479,11 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     target = f"127.0.0.1:{server.server_port}"
+    other_server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    other_server.metrics_registry = other_registry
+    other_thread = threading.Thread(target=other_server.serve_forever, daemon=True)
+    other_thread.start()
+    other_target = f"127.0.0.1:{other_server.server_port}"
     benchmark = tmp_path / "benchmark.py"
     benchmark.write_text(
         "import sys,time,urllib.request\n"
@@ -450,8 +504,12 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
                 "Synthetic HTTP fixture",
                 "--prefill",
                 target,
+                "--prefill",
+                other_target,
                 "--decode",
                 target,
+                "--decode",
+                other_target,
                 "--mesh",
                 target,
                 "--",
@@ -479,14 +537,69 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
         )
         for panel in data["panels"]:
             if panel.get("kind") == "blocks":
-                for state, expected in (("used", 2), ("total", 10)):
+                for state, expected in (("used", 20), ("total", 40)):
                     values = [
                         v for _, v in panel["block_counts"][state] if v is not None
                     ]
                     assert values and all(v == expected for v in values)
+        assert {entry["role"] for entry in data["meta"]["instances"]} == {
+            "prefill",
+            "decode",
+        }
+        for panel in data["panels"]:
+            if panel["role"] != "overall":
+                assert set(panel["instances"]) == {target, other_target}
+                assert any(
+                    v is not None
+                    for points in panel["instances"][target]["series"].values()
+                    for _, v in points
+                )
+        panels = {panel["id"]: panel for panel in data["panels"]}
+        kv = panels["prefill_kv_blocks"]
+        assert {v for _, v in kv["series"]["used"] if v is not None} == {50.0}
+        assert {
+            v for _, v in kv["instances"][target]["series"]["used"] if v is not None
+        } == {20.0}
+        assert {
+            v
+            for _, v in kv["instances"][other_target]["series"]["used"]
+            if v is not None
+        } == {60.0}
+        cache = panels["prefill_cache_hit"]
+        timestamp, actual = next(
+            (t, v) for t, v in reversed(cache["series"]["reuse"]) if v is not None
+        )
+        cached_total = sum(
+            dict(bundle["cache_counts"]["reused"])[timestamp]
+            for bundle in cache["instances"].values()
+        )
+        prompt_total = sum(
+            dict(bundle["cache_counts"]["prompt"])[timestamp]
+            for bundle in cache["instances"].values()
+        )
+        unweighted = (
+            sum(
+                dict(bundle["series"]["reuse"])[timestamp]
+                for bundle in cache["instances"].values()
+            )
+            / 2
+        )
+        assert actual == pytest.approx(100 * cached_total / prompt_total)
+        assert abs(actual - unweighted) > 10
+        for bundle in (cache, *cache["instances"].values()):
+            counts = {k: dict(v)[timestamp] for k, v in bundle["cache_counts"].items()}
+            values = {k: dict(v)[timestamp] for k, v in bundle["series"].items()}
+            assert counts["reused"] == pytest.approx(counts["gpu"] + counts["lmcache"])
+            assert values["reuse"] == pytest.approx(values["gpu"] + values["lmcache"])
+            assert values["lmcache"] == pytest.approx(
+                100 * counts["lmcache"] / counts["prompt"]
+            )
         assert "Server is ready" in (output / "prometheus.log").read_text()
         assert "See you next time!" in (output / "prometheus.log").read_text()
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+        other_server.shutdown()
+        other_server.server_close()
+        other_thread.join(timeout=5)

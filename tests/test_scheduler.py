@@ -284,9 +284,9 @@ class TestThroughputSection:
 
     def test_hit_rate_is_na_until_something_is_measured(self, caplog):
         """Prefix caching enabled but nothing observed yet — "0.0%" would be a
-        claim about reuse made without ever having looked. This is the shape a
-        P/D decode engine is in permanently (it never reaches `update_cache`)
-        and the aggregated scheduler is in until its first prefill."""
+        claim about reuse made without ever having looked. This is the shape
+        a scheduler is in before its first local prefill or completed remote
+        prefill admission."""
         stats = EngineStats(
             enable_log_stats=True,
             enable_prefix_caching=True,

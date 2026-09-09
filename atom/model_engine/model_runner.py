@@ -42,6 +42,7 @@ from atom.distributed.pp_comm import (
 )
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
 from atom.kv_transfer.disaggregation import KVConnectorOutput
+from atom.model_engine.gpu_metrics import GPUForwardMetrics, record_gpu_forward
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
@@ -811,6 +812,20 @@ class ModelRunner:
                 self.drafter.model = torch.compile(
                     self.drafter.model, fullgraph=True, backend="eager"
                 )
+
+        # Install after startup profiling/warmup/capture, which are not traffic.
+        self.gpu_forward_metrics = GPUForwardMetrics(
+            lambda: torch.cuda.Event(enable_timing=True)
+        )
+
+    def collect_forward_metrics(self):
+        pc = self.config.parallel_config
+        return {
+            **self.gpu_forward_metrics.snapshot(),
+            "dp_rank": pc.data_parallel_rank,
+            "pp_rank": pc.pipeline_parallel_rank,
+            "tp_rank": self.rank,
+        }
 
     def _build_and_load_model(self, model_class):
         """Construct the model and load its weights from disk.
@@ -2726,6 +2741,7 @@ class ModelRunner:
                 self._pp_index_topk,
             )
 
+    @record_gpu_forward
     def run_model(
         self,
         input_ids: torch.Tensor,

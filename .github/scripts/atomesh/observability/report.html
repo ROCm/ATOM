@@ -12,7 +12,10 @@
 @media(max-width:480px){.brand-sub,.brand-divider,.offline span:last-child{display:none}.summary{gap:8px}.summary-card{padding:12px 10px}.summary-label{font-size:9px}.summary-sub{font-size:8px}.summary-value{font-size:20px}.hero>.action{padding:9px}.hero>.action span{display:none}.title-row{gap:8px}.subtitle{font-size:10px}.panel-head{padding:17px 18px 10px}.range-time{font-size:9px}}
 @media print{header{height:50px}.toolbar,.hero>.action,.tooltip{display:none}.panel{break-inside:avoid;box-shadow:none}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}body{background:white}main{padding:20px}.plot-shell{height:200px}}
 .block-counts{margin:10px 22px 0;padding:8px 10px;border-radius:6px;background:#f6f8fc;display:flex;flex-wrap:wrap;align-items:baseline;gap:5px;font-size:11px;color:#76849b;font-variant-numeric:tabular-nums}.block-counts strong{color:#324866;font-weight:650}.block-counts small{margin-left:auto;font-size:9px;color:#98a2b5}
-.chip[hidden],.toolbar-row[hidden]{display:none}
+.tier-count{white-space:nowrap}
+.chip[hidden],.toolbar-row[hidden],.instance-picker[hidden]{display:none}
+.instance-picker{display:flex;align-items:center;gap:8px;min-width:0;color:#71819a;font-size:11px}.instance-picker select{max-width:100%;min-width:0;border:1px solid #dfe5ef;border-radius:6px;background:#fff;color:#53617a;padding:6px 9px;font:inherit}.instance-controls{display:flex;flex-wrap:wrap;gap:12px;min-width:0}.scope-note{font-size:10px;color:#91a0b5}.category-controls{gap:6px}.category-controls button{padding:5px 11px}.toolbar-row .chips{min-width:0}
+@media(max-width:480px){.instance-controls,.instance-picker{width:100%}.instance-picker select{flex:1;width:0}.category-controls{flex-wrap:wrap}.drag-hint{display:none}}
 @media(min-width:851px){.grid.role-all .panel{grid-row:var(--panel-row);grid-column:var(--panel-column)}}
 </style>
 </head>
@@ -28,6 +31,8 @@
 </section>
 <section class="toolbar" aria-label="Report display settings">
 <div class="toolbar-row"><span class="toolbar-label">View</span><div class="segmented" id="role-controls" role="group" aria-label="Engine role"><button data-role="all" aria-pressed="true">All</button><button data-role="prefill" aria-pressed="false">Prefill</button><button data-role="decode" aria-pressed="false">Decode</button></div><div class="toolbar-space"></div><div class="segmented" aria-label="Display mode"><button id="chart-view" aria-pressed="true">Charts</button><button id="table-view" aria-pressed="false">Data table</button></div></div>
+<div class="toolbar-row" id="instance-row"><span class="toolbar-label">Instances</span><div class="instance-controls" id="instance-controls"></div><span class="scope-note" id="scope-note">Select P and D independently · Mesh remains global</span></div>
+<div class="toolbar-row"><span class="toolbar-label">Focus</span><div class="chips category-controls" id="category-controls" role="group" aria-label="Metric category"></div></div>
 <div class="toolbar-row"><span class="toolbar-label">Metrics</span><div class="chips" id="panel-controls"></div></div>
 <div class="toolbar-row"><span class="toolbar-label">Statistics</span><div class="chips" id="stat-controls"></div><span class="toolbar-space"></span><span class="drag-hint">Click a legend to hide or show a series</span></div>
 <div class="toolbar-row range-row"><span class="toolbar-label">Time range</span><span class="range-time" id="range-start-label"></span><div class="range-controls"><input type="range" min="0" max="1000" value="0" id="range-start" aria-label="Visible range start"><input type="range" min="0" max="1000" value="1000" id="range-end" aria-label="Visible range end"></div><span class="range-time" id="range-end-label"></span><button class="range-reset" id="range-reset">Reset</button></div>
@@ -42,25 +47,45 @@
 "use strict";
 const DATA=JSON.parse(document.getElementById("report-data").textContent);
 const META=DATA.meta, GLOBAL_STAT_KEYS=["mean","p50","p90","p95","p99"];
-const STAT_KEYS=[...GLOBAL_STAT_KEYS,"running","waiting","waiting_kv","used","evictable","vacant"].filter(k=>DATA.panels.some(p=>k in p.series));
-const LABELS={mean:"Mean",p50:"P50",p90:"P90",p95:"P95",p99:"P99",running:"Running",waiting:"Waiting",waiting_kv:"KV waiting",used:"Used",evictable:"Cached / evictable",vacant:"Vacant"};
-const COLORS={mean:"#8490a8",p50:"#22a69a",p90:"#6382ef",p95:"#b483da",p99:"#f09b58",running:"#3864e8",waiting:"#f09b58",waiting_kv:"#b483da",used:"#3864e8",evictable:"#22a69a",vacant:"#8490a8"};
+const STAT_KEYS=[...GLOBAL_STAT_KEYS,"running","waiting","waiting_kv","used","evictable","vacant","hit","reuse","lmcache","gpu"].filter(k=>DATA.panels.some(p=>k in p.series));
+const LABELS={mean:"Mean",p50:"P50",p90:"P90",p95:"P95",p99:"P99",running:"Running",waiting:"Waiting",waiting_kv:"KV waiting",used:"Used",evictable:"Cached / evictable",vacant:"Vacant",hit:"Cache hit",reuse:"Total reuse",gpu:"GPU",lmcache:"LMCache"};
+const COLORS={mean:"#8490a8",p50:"#22a69a",p90:"#6382ef",p95:"#b483da",p99:"#f09b58",running:"#3864e8",waiting:"#f09b58",waiting_kv:"#b483da",used:"#3864e8",evictable:"#22a69a",vacant:"#8490a8",hit:"#22a69a",reuse:"#22a69a",gpu:"#6382ef",lmcache:"#b483da"};
 const $=id=>document.getElementById(id), finite=v=>typeof v==="number"&&Number.isFinite(v);
 const fmt=v=>finite(v)?v.toLocaleString("en-US",{maximumFractionDigits:v<10?2:1}):"—";
 const fmtCount=v=>finite(v)?v.toLocaleString("en-US",{maximumFractionDigits:0}):"—";
 const utc=t=>new Date(t*1000).toISOString().slice(11,19);
 const timeSpan=META.end-META.start;
-let range=[META.start,META.end],view="chart",roleFilter="all",hoverTime=null,activePanel=null;
+let range=[META.start,META.end],view="chart",roleFilter="all",categoryFilter=DATA.panels.some(p=>p.overview!==undefined)?"overview":"all",hoverTime=null,activePanel=null;
 function panelRole(p){
+ if(p.role)return p.role;
  const role=p.selector?.match(/(?:^|,)role="(prefill|decode|standalone)"/)?.[1]||p.label?.match(/\b(prefill|decode|standalone)\b/i)?.[1];
  return role?.toLowerCase()||p.id.match(/^(prefill|decode|standalone)_/)?.[1]||(p.id==="pd_kv_transfer"?"decode":"overall");
 }
-const states=DATA.panels.map(p=>({p,role:panelRole(p),family:p.id.replace(/^(prefill|decode)_/,""),enabled:true,visible:new Set((p.kind?Object.keys(p.series):["p50","p90","p99"]).filter(k=>(p.series[k]||[]).some(v=>finite(v[1]))))}));
+const states=DATA.panels.map(p=>({base:p,p:{...p},scope:"",role:panelRole(p),family:p.id.replace(/^(prefill|decode)_/,""),enabled:true,visible:new Set(p.cache_breakdown?["reuse","lmcache","gpu"]:(p.kind?Object.keys(p.series):["p50","p90","p99"]).filter(k=>(p.series[k]||[]).some(v=>finite(v[1]))))}));
 const pairedRows=states.filter(s=>s.role==="prefill").map(s=>[s,states.find(d=>d.role==="decode"&&d.family===s.family)]).filter(pair=>pair[1]);
 const pairedStates=new Set(pairedRows.flat());
 const orderedStates=[...pairedRows.flat(),...states.filter(s=>!pairedStates.has(s))];
 const matchesRole=s=>roleFilter==="all"||s.role===roleFilter;
-const isShown=s=>s.enabled&&matchesRole(s);
+const matchesCategory=s=>categoryFilter==="all"||(categoryFilter==="overview"?s.p.overview:s.p.category===categoryFilter);
+const isShown=s=>s.enabled&&matchesRole(s)&&matchesCategory(s);
+const selectedInstances={prefill:"",decode:"",standalone:""};
+const instancePickers={};
+function countSpec(p){
+ if(p.kind==="blocks")return {field:"block_counts",keys:["used","total"],labels:["Used","Total"],unit:"blocks",note:""};
+ if(p.cache_breakdown)return {field:"cache_counts",keys:["reused","prompt","lmcache","gpu"],labels:["Reused","Input","LMCache","GPU"],unit:"tokens",note:"Estimated · last "+META.window+" s"};
+ if(p.kind==="cache")return {field:"cache_counts",keys:["cached","prompt"],labels:["Cached","Input"],unit:"tokens",note:"Estimated · last "+META.window+" s"};
+ return null;
+}
+function setPanelScope(s){
+ s.scope=selectedInstances[s.role]||"";
+ const bundle=s.scope?s.base.instances?.[s.scope]:s.base;
+ s.p={...s.base,series:bundle?.series||{},block_counts:bundle?.block_counts,cache_counts:bundle?.cache_counts};
+ const spec=countSpec(s.p);
+ if(spec){
+  s.countMaps=Object.fromEntries(spec.keys.map(k=>[k,new Map(s.p[spec.field]?.[k]||[])]));
+  s.countTimes=[...new Set(spec.keys.flatMap(k=>[...s.countMaps[k].keys()]))].sort((a,b)=>a-b).map(t=>[t,0]);
+ }
+}
 function node(tag,cls,text){const el=document.createElement(tag);if(cls)el.className=cls;if(text!==undefined)el.textContent=text;return el;}
 function latest(points,t=META.end,lower=-Infinity){let result=null;for(const point of points||[])if(point[0]>=lower&&point[0]<=t&&finite(point[1]))result=point[1];return result;}
 function near(points,t){if(!points?.length)return null;let a=0,b=points.length-1;while(a<b){const m=(a+b)>>1;if(points[m][0]<t)a=m+1;else b=m;}if(a>0&&Math.abs(points[a-1][0]-t)<Math.abs(points[a][0]-t))a--;return Math.abs(points[a][0]-t)<=META.step*1.5?points[a]:null;}
@@ -78,6 +103,21 @@ for(const b of $("role-controls").querySelectorAll("button")){
  b.disabled=b.dataset.role!=="all"&&!states.some(s=>s.role===b.dataset.role);
  b.onclick=()=>{roleFilter=b.dataset.role;hoverTime=null;activePanel=null;refresh();};
 }
+for(const [key,label] of [["overview","Overview"],["latency","Latency"],["workload","Workload"],["cache","Cache & KV"],["all","All metrics"]]){
+ const b=node("button","chip",label);b.dataset.category=key;
+ b.onclick=()=>{categoryFilter=key;hoverTime=null;activePanel=null;refresh();};
+ $("category-controls").append(b);
+}
+if(!states.some(s=>s.role==="overall"))$("scope-note").textContent="Service instances are identified by host and port";
+for(const [role,label] of [["prefill","Prefill"],["decode","Decode"],["standalone","Service"]]){
+ if(!states.some(s=>s.role===role))continue;
+ const instances=[...new Set([...(META.instances||[]).filter(i=>i.role===role).map(i=>i.instance),...states.filter(s=>s.role===role).flatMap(s=>Object.keys(s.base.instances||{}))])].sort();
+ const wrapper=node("label","instance-picker"),select=node("select");select.dataset.role=role;select.setAttribute("aria-label",label+" instance");
+ const all=node("option","",instances.length?"All instances ("+instances.length+")":"All instances · no breakdown");all.value="";select.append(all);
+ for(const instance of instances){const option=node("option","",instance);option.value=instance;select.append(option);}
+ select.disabled=!instances.length;select.onchange=()=>{selectedInstances[role]=select.value;hoverTime=null;activePanel=null;states.filter(s=>s.role===role).forEach(setPanelScope);refresh();};
+ wrapper.append(node("span","",label),select);$("instance-controls").append(wrapper);instancePickers[role]=wrapper;
+}
 function setRange(a,b){const minWidth=Math.min(META.step,timeSpan);a=Math.max(META.start,Math.min(a,META.end-minWidth));b=Math.min(META.end,Math.max(b,a+minWidth));range=[a,b];hoverTime=null;$("range-start").value=Math.round((a-META.start)/timeSpan*1000);$("range-end").value=Math.round((b-META.start)/timeSpan*1000);refresh();}
 $("range-start").oninput=e=>setRange(Math.min(META.start+Number(e.target.value)/1000*timeSpan,range[1]-META.step),range[1]);
 $("range-end").oninput=e=>setRange(range[0],Math.max(META.start+Number(e.target.value)/1000*timeSpan,range[0]+META.step));
@@ -86,19 +126,18 @@ for(const mode of ["chart","table"])$(mode+"-view").onclick=()=>{view=mode;refre
 function buildPanel(s){
  const toggle=node("button","chip");toggle.dataset.panel=s.p.id;toggle.append(node("span","tick","✓"),node("span","",s.p.title));toggle.onclick=()=>{s.enabled=!s.enabled;refresh();};$("panel-controls").append(toggle);s.toggle=toggle;
  const card=node("article","panel");card.dataset.panel=s.p.id;
- const head=node("div","panel-head"),titles=node("div");titles.append(node("h2","panel-title",s.p.title),node("div","panel-source",s.p.label));
+ const head=node("div","panel-head"),titles=node("div");s.source=node("div","panel-source",s.p.label);titles.append(node("h2","panel-title",s.p.title),s.source);
  const reading=node("div","panel-reading");s.value=node("div","panel-value");s.stat=node("div","panel-stat");reading.append(s.value,s.stat);head.append(titles,reading);
  const legend=node("div","legend");s.legends={};for(const k of STAT_KEYS.filter(k=>k in s.p.series)){const b=node("button","");b.dataset.stat=k;b.style.setProperty("--series",COLORS[k]);b.append(node("i","dot"),node("span","",LABELS[k]));b.onclick=()=>{s.visible.has(k)?s.visible.delete(k):s.visible.add(k);refresh();};legend.append(b);s.legends[k]=b;}
  s.shell=node("div","plot-shell");s.canvas=node("canvas");s.canvas.setAttribute("role","img");s.canvas.setAttribute("aria-label",s.p.title+", "+s.p.unit+"; switch to Data table for all values");s.empty=node("div","empty-chart");s.tip=node("div","tooltip");s.tip.hidden=true;s.shell.append(s.canvas,s.empty,s.tip);
  s.table=node("div","table-shell");s.table.hidden=true;
- const foot=node("div","panel-foot");foot.append(node("span","source-tag",s.p.kind?"Sampled state · Pooled across instances":"Window "+META.window+" s · Pooled across instances"),node("span","",META.kind==="demo"?"Synthetic data":"Recorded data"));
+ const foot=node("div","panel-foot");s.footLabel=node("span","source-tag");foot.append(s.footLabel,node("span","",META.kind==="demo"?"Synthetic data":"Recorded data"));
  card.append(head,node("div","panel-description",s.p.detail));
- if(s.p.kind==="blocks"){
+ if(countSpec(s.p)){
   s.blockCounts=node("div","block-counts");
-  s.blockMaps=Object.fromEntries(["used","total"].map(k=>[k,new Map(s.p.block_counts?.[k]||[])]));
-  s.blockTimes=[...new Set([...(s.blockMaps.used.keys()),...(s.blockMaps.total.keys())])].sort((a,b)=>a-b).map(t=>[t,0]);
   card.append(s.blockCounts);
  }
+ setPanelScope(s);
  card.append(legend,s.shell,s.table,foot);$("chart-grid").append(card);s.card=card;
  function pointerTime(e){const r=s.canvas.getBoundingClientRect();return range[0]+Math.max(0,Math.min(1,(e.clientX-r.left-49)/(r.width-67)))*(range[1]-range[0]);}
  s.canvas.onpointermove=e=>{hoverTime=pointerTime(e);activePanel=s;for(const st of states)if(isShown(st))draw(st);};
@@ -108,12 +147,15 @@ function buildPanel(s){
  s.canvas.onpointercancel=()=>{delete s.dragStart;hoverTime=null;draw(s);};s.canvas.ondblclick=()=>setRange(META.start,META.end);
  new ResizeObserver(()=>{if(isShown(s)&&view==="chart")draw(s);}).observe(s.shell);
 }
+function selectedCountTime(s){const times=s.countTimes.filter(p=>p[0]>=range[0]&&p[0]<=range[1]);return (hoverTime===null?times.at(-1):near(times,hoverTime))?.[0];}
 function updateBlockCounts(s){
  if(!s.blockCounts)return;
- const times=s.blockTimes.filter(p=>p[0]>=range[0]&&p[0]<=range[1]);
- const point=hoverTime===null?times.at(-1):near(times,hoverTime),t=point?.[0];
- s.blockCounts.replaceChildren(node("span","","Used"),node("strong","",fmtCount(s.blockMaps.used.get(t))),node("span","","/ Total"),node("strong","",fmtCount(s.blockMaps.total.get(t))),node("span","","blocks"),node("small","",t===undefined?"No data":utc(t)+" UTC"));
+ const spec=countSpec(s.p),t=selectedCountTime(s);
+ s.blockCounts.replaceChildren(node("span","",spec.labels[0]),node("strong","",fmtCount(s.countMaps[spec.keys[0]].get(t))),node("span","","/ "+spec.labels[1]),node("strong","",fmtCount(s.countMaps[spec.keys[1]].get(t))),node("span","",spec.unit));
+ spec.keys.slice(2).forEach((k,i)=>{const pair=node("span","tier-count","· "+spec.labels[i+2]+" ");pair.append(node("strong","",fmtCount(s.countMaps[k].get(t))));s.blockCounts.append(pair);});
+ s.blockCounts.append(node("small","",(spec.note?spec.note+" · ":"")+(t===undefined?"No data":utc(t)+" UTC")));
 }
+
 function draw(s){
  if(view!=="chart"||!isShown(s))return;
  updateBlockCounts(s);
@@ -121,7 +163,7 @@ function draw(s){
  const dpr=window.devicePixelRatio||1;c.width=Math.round(w*dpr);c.height=Math.round(h*dpr);const ctx=c.getContext("2d");ctx.scale(dpr,dpr);
  const left=49,right=w-18,top=24,bottom=h-31,pw=right-left,ph=bottom-top;
  const keys=STAT_KEYS.filter(k=>s.visible.has(k)),points=keys.flatMap(k=>(s.p.series[k]||[]).filter(p=>p[0]>=range[0]&&p[0]<=range[1]&&finite(p[1])));
- const max=points.length?points.reduce((peak,p)=>Math.max(peak,p[1]),0):1;const rough=Math.max(max*1.12,0.01)/4;const magnitude=10**Math.floor(Math.log10(rough));const step=[1,2,2.5,5,10].map(v=>v*magnitude).find(v=>v>=rough)||rough;const ceiling=step*4;
+ const max=points.length?points.reduce((peak,p)=>Math.max(peak,p[1]),0):1;const rough=Math.max(max*1.12,0.01)/4;const magnitude=10**Math.floor(Math.log10(rough));const step=s.p.kind==="cache"?25:[1,2,2.5,5,10].map(v=>v*magnitude).find(v=>v>=rough)||rough;const ceiling=step*4;
  const x=t=>left+(t-range[0])/(range[1]-range[0])*pw,y=v=>bottom-v/ceiling*ph;
  ctx.font="10px -apple-system, sans-serif";ctx.textBaseline="middle";ctx.lineWidth=1;
  for(let i=0;i<=4;i++){const yy=top+i/4*ph;ctx.strokeStyle="#eef1f6";ctx.beginPath();ctx.moveTo(left,yy+.5);ctx.lineTo(right,yy+.5);ctx.stroke();ctx.fillStyle="#a1adc0";ctx.textAlign="right";ctx.fillText(fmt(ceiling-i*step),left-10,yy);}
@@ -132,15 +174,19 @@ function draw(s){
  if(s.dragStart!==undefined&&hoverTime!==null){ctx.fillStyle="#3864e812";ctx.fillRect(x(Math.min(s.dragStart,hoverTime)),top,Math.abs(x(s.dragStart)-x(hoverTime)),ph);}
  if(hoverTime!==null){ctx.strokeStyle="#bbc8dd";ctx.setLineDash([3,3]);ctx.beginPath();ctx.moveTo(x(hoverTime),top);ctx.lineTo(x(hoverTime),bottom);ctx.stroke();ctx.setLineDash([]);for(const k of keys){const p=near(s.p.series[k],hoverTime);if(p&&finite(p[1])){ctx.fillStyle=COLORS[k];ctx.beginPath();ctx.arc(x(p[0]),y(p[1]),3,0,Math.PI*2);ctx.fill();ctx.strokeStyle="white";ctx.lineWidth=1.5;ctx.stroke();}}}
  ctx.restore();s.empty.hidden=points.length>0;s.empty.textContent=!STAT_KEYS.some(k=>(s.p.series[k]||[]).some(p=>finite(p[1])))?"No samples collected for this metric":keys.length?"No data in this time range":"Select a statistic in the legend to show a series";
- const key=[...STAT_KEYS].reverse().find(k=>s.visible.has(k));const point=key&&hoverTime!==null?near(s.p.series[key],hoverTime):null;const value=hoverTime!==null?point?.[1]:latest(s.p.series[key],range[1],range[0]);s.value.replaceChildren(node("span","",fmt(value)),node("small","",s.p.unit));s.stat.textContent=key?LABELS[key]+(hoverTime!==null?" · "+utc(hoverTime):" · Latest in range"):"No series selected";
+ updateReading(s);
  s.tip.hidden=activePanel!==s||hoverTime===null||!points.length;
  if(!s.tip.hidden){s.tip.replaceChildren(node("div","tooltip-time",utc(hoverTime)+" UTC"));for(const k of keys){const p=near(s.p.series[k],hoverTime),row=node("div","tooltip-row");row.style.setProperty("--series",COLORS[k]);row.append(node("i","dot"),node("span","",LABELS[k]),node("strong","",fmt(p?.[1])+" "+s.p.unit));s.tip.append(row);}s.tip.style.left=Math.min(Math.max(left,x(hoverTime)+13),w-155)+"px";s.tip.style.top="35px";}
 }
+function updateReading(s){
+ const key=s.p.cache_breakdown?"reuse":[...STAT_KEYS].reverse().find(k=>s.visible.has(k));const point=key&&hoverTime!==null?near(s.p.series[key],hoverTime):null;const value=s.p.cache_breakdown?(s.p.series.reuse||[]).find(p=>p[0]===selectedCountTime(s))?.[1]:hoverTime!==null?point?.[1]:latest(s.p.series[key],range[1],range[0]);s.value.replaceChildren(node("span","",fmt(value)),node("small","",s.p.unit));s.stat.textContent=key?LABELS[key]+(hoverTime!==null?" · "+utc(hoverTime):" · Latest in range"):"No series selected";
+}
 function renderTable(s){
  updateBlockCounts(s);
+ updateReading(s);
  const keys=STAT_KEYS.filter(k=>s.visible.has(k));
  const columns=keys.map(k=>({label:LABELS[k]+" · "+s.p.unit,points:s.p.series[k]||[],format:fmt}));
- if(s.p.kind==="blocks")for(const k of ["used","total"])columns.push({label:(k==="used"?"Used":"Total")+" · blocks",points:s.p.block_counts?.[k]||[],format:fmtCount});
+ const spec=countSpec(s.p);if(spec)spec.keys.forEach((k,i)=>columns.push({label:spec.labels[i]+" · "+spec.unit,points:s.p[spec.field]?.[k]||[],format:fmtCount}));
  const ts=[...new Set(columns.flatMap(c=>c.points.map(p=>p[0])))].filter(t=>t>=range[0]&&t<=range[1]).sort((a,b)=>a-b);
  const table=node("table"),head=node("thead"),hr=node("tr");hr.append(node("th","","Time · UTC"));for(const c of columns)hr.append(node("th","",c.label));head.append(hr);table.append(head);
  const body=node("tbody"),maps=columns.map(c=>new Map(c.points));for(const t of ts){const row=node("tr");row.append(node("td","",utc(t)));for(let i=0;i<columns.length;i++)row.append(node("td","",columns[i].format(maps[i].get(t))));body.append(row);}table.append(body);s.table.replaceChildren(table);if(!ts.length)s.table.append(node("div","nothing","No data for the current selection"));
@@ -148,6 +194,13 @@ function renderTable(s){
 function refresh(){
  $("range-start-label").textContent=utc(range[0]);$("range-end-label").textContent=utc(range[1]);$("range-reset").disabled=range[0]===META.start&&range[1]===META.end;$("chart-view").setAttribute("aria-pressed",view==="chart");$("table-view").setAttribute("aria-pressed",view==="table");
  $("panel-count").textContent=states.filter(isShown).length+" metrics";$("no-panels").hidden=states.some(isShown);
+ for(const b of $("category-controls").querySelectorAll("button")){
+  b.setAttribute("aria-pressed",b.dataset.category===categoryFilter);
+  b.disabled=b.dataset.category!=="all"&&!states.some(s=>matchesRole(s)&&(b.dataset.category==="overview"?s.p.overview:s.p.category===b.dataset.category));
+ }
+ for(const [role,picker] of Object.entries(instancePickers))picker.hidden=roleFilter!=="all"&&roleFilter!==role;
+ $("ttft-summary").textContent=fmt(latest(states.find(s=>["mesh_ttft","api_ttft"].includes(s.p.id))?.p.series.p99,range[1],range[0]));
+ $("itl-summary").textContent=fmt(latest(states.find(s=>s.p.id==="decode_itl")?.p.series.p99,range[1],range[0]));
  for(const b of $("role-controls").querySelectorAll("button"))b.setAttribute("aria-pressed",b.dataset.role===roleFilter);
  $("chart-grid").classList.toggle("role-all",roleFilter==="all");
  let row=1;
@@ -155,9 +208,19 @@ function refresh(){
  let column=1;
  for(const s of orderedStates.filter(s=>!pairedStates.has(s)&&isShown(s))){s.card.style.setProperty("--panel-row",row);s.card.style.setProperty("--panel-column",column);if(column===2)row++;column=3-column;}
  for(const k of GLOBAL_STAT_KEYS){const available=states.filter(s=>(s.p.series[k]||[]).some(v=>finite(v[1])));statButtons[k].disabled=!available.length;statButtons[k].setAttribute("aria-pressed",available.length>0&&available.every(s=>s.visible.has(k)));}
- for(const s of states){s.toggle.hidden=!matchesRole(s);s.toggle.setAttribute("aria-pressed",s.enabled);s.card.hidden=!isShown(s);s.shell.hidden=view!=="chart";s.table.hidden=view!=="table";for(const k of Object.keys(s.legends)){s.legends[k].setAttribute("aria-pressed",s.visible.has(k));s.legends[k].disabled=!(s.p.series[k]||[]).some(v=>finite(v[1]));}if(isShown(s)){if(view==="table")renderTable(s);else draw(s);}}
+ for(const s of states){s.toggle.hidden=!(matchesRole(s)&&matchesCategory(s));s.source.textContent=s.p.label+" · "+(s.role==="overall"?"Global":s.scope||"All instances");s.footLabel.textContent=(s.p.kind&&s.p.kind!=="cache"?"Sampled state":"Window "+META.window+" s")+" · "+(s.scope||"Pooled across instances");s.toggle.setAttribute("aria-pressed",s.enabled);s.card.hidden=!isShown(s);s.shell.hidden=view!=="chart";s.table.hidden=view!=="table";for(const k of Object.keys(s.legends)){s.legends[k].setAttribute("aria-pressed",s.visible.has(k));s.legends[k].disabled=!(s.p.series[k]||[]).some(v=>finite(v[1]));}if(isShown(s)){if(view==="table")renderTable(s);else draw(s);}}
 }
-$("export-csv").onclick=()=>{const rows=[["panel","statistic","timestamp_utc","value","unit"]];for(const s of orderedStates.filter(isShown))for(const k of STAT_KEYS.filter(k=>s.visible.has(k)))for(const [t,v] of s.p.series[k]||[])if(t>=range[0]&&t<=range[1])rows.push([s.p.title,LABELS[k],new Date(t*1000).toISOString(),finite(v)?v:"",s.p.unit]);for(const s of orderedStates.filter(s=>isShown(s)&&s.p.kind==="blocks"))for(const k of ["used","total"])for(const [t,v] of s.p.block_counts?.[k]||[])if(t>=range[0]&&t<=range[1])rows.push([s.p.title,k==="used"?"Used":"Total",new Date(t*1000).toISOString(),finite(v)?v:"","blocks"]);const quote=v=>'"'+String(v).replaceAll('"','""')+'"';const blob=new Blob(["\ufeff"+rows.map(r=>r.map(quote).join(",")).join("\r\n")],{type:"text/csv;charset=utf-8"});const url=URL.createObjectURL(blob),a=node("a");a.href=url;a.download="atom-metrics.csv";a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
+$("export-csv").onclick=()=>{
+ const rows=[["panel","statistic","timestamp_utc","value","unit","instance"]];
+ for(const s of orderedStates.filter(isShown)){
+  const columns=STAT_KEYS.filter(k=>s.visible.has(k)).map(k=>({label:LABELS[k],unit:s.p.unit,points:s.p.series[k]||[]}));
+  const spec=countSpec(s.p);if(spec)spec.keys.forEach((k,i)=>columns.push({label:spec.labels[i],unit:spec.unit,points:s.p[spec.field]?.[k]||[]}));
+  for(const c of columns)for(const [t,v] of c.points)if(t>=range[0]&&t<=range[1])rows.push([s.p.title,c.label,new Date(t*1000).toISOString(),finite(v)?v:"",c.unit,s.scope||"all"]);
+ }
+ const quote=v=>'"'+String(v).replaceAll('"','""')+'"';
+ const blob=new Blob(["\ufeff"+rows.map(r=>r.map(quote).join(",")).join("\r\n")],{type:"text/csv;charset=utf-8"});
+ const url=URL.createObjectURL(blob),a=node("a");a.href=url;a.download="atom-metrics.csv";a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+};
 orderedStates.forEach(buildPanel);refresh();
 </script>
 </body>

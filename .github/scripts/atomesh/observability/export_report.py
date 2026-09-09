@@ -22,7 +22,18 @@ from pathlib import Path
 from types import SimpleNamespace
 
 STATISTICS = {"mean": None, "p50": 0.50, "p90": 0.90, "p95": 0.95, "p99": 0.99}
-GAUGE_SERIES = {"running", "waiting", "waiting_kv", "used", "evictable", "vacant"}
+GAUGE_SERIES = {
+    "running",
+    "waiting",
+    "waiting_kv",
+    "used",
+    "evictable",
+    "vacant",
+    "hit",
+    "reuse",
+    "gpu",
+    "lmcache",
+}
 
 
 def timestamp(value: str) -> float:
@@ -164,10 +175,98 @@ def panels_for(deployment: str) -> list[dict]:
                 "unit": "ms",
             }
         )
+    for role in roles:
+        common = {"selector": f'job="atom",role="{role}"', "role": role}
+        panels.extend(
+            [
+                {
+                    **common,
+                    "id": f"{role}_cache_hit",
+                    "title": f"{role.title()} cache reuse",
+                    "label": f"{role.upper()} · PREFIX CACHE",
+                    "kind": "cache",
+                    "cache_breakdown": True,
+                    "unit": "%",
+                    "metric": "atom:prefix_cache_cached_tokens_total",
+                    "detail": "Total reuse = GPU + LMCache · all three curves share the input-token denominator",
+                },
+                {
+                    **common,
+                    "id": f"{role}_gpu_forward",
+                    "title": f"{role.title()} GPU forward",
+                    "label": f"{role.upper()} · GPU WORKERS",
+                    "unit": "ms",
+                    "metric": "atom:gpu_forward_seconds",
+                    "detail": "Per-worker target forward · includes GPU stream communication/waits · excludes input prep, sampling and drafting",
+                },
+            ]
+        )
+    role = roles[0]
+    for suffix, title, detail in (
+        (
+            "request_tokens",
+            "Uncached prompt tokens",
+            "Prompt remainder at first local prefill dispatch · once per request",
+        ),
+        (
+            "batch_tokens",
+            "Actual prefill tokens",
+            "Real scheduled prefill tokens per forward · each chunk counted · no cached prefix or padding",
+        ),
+    ):
+        panels.append(
+            {
+                "id": f"{role}_{suffix}",
+                "role": role,
+                "title": title,
+                "label": f"{role.upper()} · WORKLOAD",
+                "detail": detail,
+                "metric": f"atom:prefill_{suffix}",
+                "selector": f'job="atom",role="{role}"',
+                "unit": "tokens",
+                "scale": 1,
+            }
+        )
+    role = roles[-1]
+    panels.append(
+        {
+            "id": "decode_context_tokens",
+            "role": role,
+            "title": "Decode context tokens",
+            "label": f"{role.upper()} · WORKLOAD",
+            "detail": "Sum of logical context lengths per real decode batch · no TP duplication or graph padding",
+            "metric": "atom:decode_context_tokens",
+            "selector": f'job="atom",role="{role}"',
+            "unit": "tokens",
+            "scale": 1,
+        }
+    )
+    for panel in panels:
+        match = re.search(r'role="([^"]+)"', panel["selector"])
+        panel.setdefault("role", match[1] if match else "overall")
+        panel["category"] = (
+            "cache"
+            if panel.get("kind") in {"cache", "blocks"}
+            else (
+                "workload"
+                if panel.get("kind") == "queues"
+                or panel["unit"] in {"requests", "tokens"}
+                else "latency"
+            )
+        )
+        panel["overview"] = (
+            any(
+                panel["id"].endswith(suffix)
+                for suffix in ("_ttft", "_queue_time", "_gpu_forward", "_cache_hit")
+            )
+            and panel["role"] != "overall"
+        )
     return panels
 
 
 def statistics_for(panel: dict):
+    if panel.get("kind") == "cache":
+        return ("reuse", "lmcache", "gpu") if panel.get("cache_breakdown") else ("hit",)
     if panel.get("kind") == "queues":
         return ("running", "waiting", "waiting_kv")
     if panel.get("kind") == "blocks":
@@ -175,28 +274,70 @@ def statistics_for(panel: dict):
     return tuple(STATISTICS)
 
 
-def block_count_query_for(panel: dict, state: str) -> str:
-    return f'sum({panel["metric"]}{{{panel["selector"]},state="{state}"}})'
+def block_count_query_for(panel: dict, state: str, *, by_instance=False) -> str:
+    aggregate = "sum by (instance)" if by_instance else "sum"
+    return f'{aggregate}({panel["metric"]}{{{panel["selector"]},state="{state}"}})'
 
 
-def query_for(panel: dict, statistic: str, window: int) -> str:
+def cache_count_query_for(panel, state, window, *, by_instance=False):
+    aggregate = "sum by (instance)" if by_instance else "sum"
+    count = "count by (instance)" if by_instance else "count"
+    metrics = {
+        "cached": "atom:prefix_cache_cached_tokens_total",
+        "gpu": "atom:prefix_cache_cached_tokens_total",
+        "lmcache": "atom:prefix_cache_offload_tokens_total",
+        "prompt": "atom:prefix_cache_full_tokens_total",
+    }
+    if state == "reused":
+        gpu = cache_count_query_for(panel, "gpu", window, by_instance=by_instance)
+        offload = cache_count_query_for(
+            panel, "lmcache", window, by_instance=by_instance
+        )
+        return f"({gpu} + {offload})"
+
+    def increase(metric):
+        return f'increase({metric}{{{panel["selector"]}}}[{window}s])'
+
+    values = increase(metrics[state])
+    result = f"{aggregate}({values})"
+    if panel.get("cache_breakdown") and state in {"gpu", "lmcache"}:
+        # A partial rollout/missing tier must not silently lower total reuse.
+        # Zero counters from a service without LMCache remain valid samples.
+        inputs = increase(metrics["prompt"])
+        result = f"({result} and ({count}({values}) == {count}({inputs})))"
+    return result
+
+
+def query_for(panel: dict, statistic: str, window: int, *, by_instance=False) -> str:
     metric, selector = panel["metric"], panel["selector"]
+    aggregate = "sum by (instance)" if by_instance else "sum"
+    if panel.get("kind") == "cache":
+        state = {
+            "hit": "cached",
+            "reuse": "reused",
+            "gpu": "gpu",
+            "lmcache": "lmcache",
+        }[statistic]
+        hit = cache_count_query_for(panel, state, window, by_instance=by_instance)
+        total = cache_count_query_for(panel, "prompt", window, by_instance=by_instance)
+        return f"100 * {hit} / {total}"
     if panel.get("kind") in {"queues", "blocks"}:
-        numerator = f'sum({metric}{{{selector},state="{statistic}"}})'
+        numerator = f'{aggregate}({metric}{{{selector},state="{statistic}"}})'
         if panel["kind"] == "queues":
             return numerator
-        return f'100 * {numerator} / sum({metric}{{{selector},state="total"}})'
+        return f'100 * {numerator} / {aggregate}({metric}{{{selector},state="total"}})'
     scale = panel.get("scale", 1000)
 
     def rate(suffix):
         return f"rate({metric}_{suffix}{{{selector}}}[{window}s])"
 
     if statistic == "mean":
-        return f"{scale} * sum({rate('sum')}) / sum({rate('count')})"
-    return f"{scale} * histogram_quantile({STATISTICS[statistic]}, sum by (le) ({rate('bucket')}))"
+        return f"{scale} * {aggregate}({rate('sum')}) / {aggregate}({rate('count')})"
+    labels = "instance, le" if by_instance else "le"
+    return f"{scale} * histogram_quantile({STATISTICS[statistic]}, sum by ({labels}) ({rate('bucket')}))"
 
 
-def fetch_series(url: str, query: str, start: float, end: float, step: int) -> list:
+def _fetch_vectors(url, query, start, end, step):
     args = urllib.parse.urlencode(
         {"query": query, "start": start, "end": end, "step": step}
     )
@@ -205,64 +346,105 @@ def fetch_series(url: str, query: str, start: float, end: float, step: int) -> l
         result = json.load(response)
     if result.get("status") != "success":
         raise RuntimeError(result.get("error", "Prometheus query failed"))
-    series = result["data"]["result"]
+    return result["data"]["result"]
+
+
+def _points(vector):
+    return [
+        [float(t), float(v) if math.isfinite(float(v)) else None]
+        for t, v in vector.get("values", [])
+    ]
+
+
+def fetch_series(url: str, query: str, start: float, end: float, step: int) -> list:
+    series = _fetch_vectors(url, query, start, end, step)
     if len(series) > 1:
         raise ValueError("Expected one aggregated series per panel statistic")
-    points = series[0]["values"] if series else []
-    return [
-        [float(t), float(v) if math.isfinite(float(v)) else None] for t, v in points
-    ]
+    return _points(series[0]) if series else []
+
+
+def fetch_instance_series(url, query, start, end, step):
+    result = {}
+    for vector in _fetch_vectors(url, query, start, end, step):
+        instance = vector.get("metric", {}).get("instance")
+        if not instance:
+            continue
+        if instance in result:
+            raise ValueError("Expected one series per instance and statistic")
+        result[instance] = _points(vector)
+    return result
+
+
+def panel_queries(panel, window, *, by_instance=False):
+    for statistic in statistics_for(panel):
+        yield "series", statistic, query_for(
+            panel, statistic, window, by_instance=by_instance
+        )
+    if panel.get("kind") == "blocks":
+        for state in ("used", "total"):
+            yield "block_counts", state, block_count_query_for(
+                panel, state, by_instance=by_instance
+            )
+    if panel.get("kind") == "cache":
+        states = (
+            ("reused", "prompt", "gpu", "lmcache")
+            if panel.get("cache_breakdown")
+            else ("cached", "prompt")
+        )
+        for state in states:
+            yield "cache_counts", state, cache_count_query_for(
+                panel, state, window, by_instance=by_instance
+            )
 
 
 def collect(args, *, diagnostics: list[str] | None = None) -> dict:
     panels = panels_for(args.deployment)
     errors = [] if diagnostics is None else diagnostics
     failed = 0
+    aggregate_total = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
         pending = {}
         for panel in panels:
-            panel["series"], panel["queries"] = {}, {}
-            queries = [
-                (
-                    "series",
-                    "queries",
-                    statistic,
-                    query_for(panel, statistic, args.window),
-                )
-                for statistic in statistics_for(panel)
-            ]
-            if panel.get("kind") == "blocks":
-                panel["block_counts"], panel["block_count_queries"] = {}, {}
-                queries.extend(
-                    (
-                        "block_counts",
-                        "block_count_queries",
-                        state,
-                        block_count_query_for(panel, state),
+            panel["series"], panel["queries"], panel["instances"] = {}, {}, {}
+            for grouped in (False, True):
+                if grouped and panel["role"] == "overall":
+                    continue
+                for field, statistic, query in panel_queries(
+                    panel, args.window, by_instance=grouped
+                ):
+                    panel["queries"][
+                        f"{'instances' if grouped else 'all'}/{field}/{statistic}"
+                    ] = query
+                    if not grouped:
+                        panel.setdefault(field, {})[statistic] = []
+                        aggregate_total += 1
+                    future = pool.submit(
+                        fetch_instance_series if grouped else fetch_series,
+                        args.prometheus_url,
+                        query,
+                        args.start,
+                        args.end,
+                        args.step,
                     )
-                    for state in ("used", "total")
-                )
-            for field, query_field, statistic, query in queries:
-                panel[query_field][statistic] = query
-                future = pool.submit(
-                    fetch_series,
-                    args.prometheus_url,
-                    query,
-                    args.start,
-                    args.end,
-                    args.step,
-                )
-                pending[future] = panel, field, statistic
+                    pending[future] = panel, field, statistic, grouped
         for future in concurrent.futures.as_completed(pending):
-            panel, field, statistic = pending[future]
+            panel, field, statistic, grouped = pending[future]
             try:
-                panel[field][statistic] = future.result()
+                result = future.result()
+                if grouped:
+                    for instance, points in result.items():
+                        scoped = panel["instances"].setdefault(instance, {"series": {}})
+                        scoped.setdefault(field, {})[statistic] = points
+                else:
+                    panel[field][statistic] = result
             except (OSError, ValueError, RuntimeError, KeyError) as exc:
-                failed += 1
-                panel[field][statistic] = []
-                errors.append(f"{panel['title']} / {field} / {statistic}: {exc}")
-    if failed == len(pending):
-        raise RuntimeError("All Prometheus queries failed: " + errors[-failed])
+                if not grouped:
+                    failed += 1
+                errors.append(
+                    f"{panel['title']} / {'instances' if grouped else 'all'} / {field} / {statistic}: {exc}"
+                )
+    if failed == aggregate_total:
+        raise RuntimeError("All Prometheus queries failed: " + errors[-1])
     return {
         "meta": {
             "title": args.title,
@@ -275,6 +457,16 @@ def collect(args, *, diagnostics: list[str] | None = None) -> dict:
             "kind": "prometheus",
             "exported_at": time.time(),
             "notes": errors if diagnostics is None else [],
+            "instances": [
+                {"role": role, "instance": instance}
+                for role, instance in sorted(
+                    {
+                        (p["role"], instance)
+                        for p in panels
+                        for instance in p["instances"]
+                    }
+                )
+            ],
         },
         "panels": panels,
     }
@@ -301,6 +493,26 @@ def demo_data() -> dict:
                 statistics_for(panel), (1.0, 0.89, 1.16, 1.28, 1.53)
             )
         }
+        if panel["unit"] == "tokens":
+            factor = 2000 if panel["id"] == "decode_context_tokens" else 150
+            panel["series"] = {
+                k: [[t, round(v * factor)] for t, v in points]
+                for k, points in panel["series"].items()
+            }
+        if panel.get("kind") == "cache":
+            panel["series"] = {
+                k: [[start + i * step, v] for i in range(count)]
+                for k, v in (("reuse", 84), ("gpu", 46), ("lmcache", 38))
+            }
+            panel["cache_counts"] = {
+                k: [[start + i * step, v] for i in range(count)]
+                for k, v in (
+                    ("reused", 84000),
+                    ("gpu", 46000),
+                    ("lmcache", 38000),
+                    ("prompt", 100000),
+                )
+            }
         if panel.get("kind") == "blocks":
             total = 10000 if panel["id"].startswith("prefill_") else 20000
             panel["block_counts"] = {
@@ -311,6 +523,64 @@ def demo_data() -> dict:
                 key: [[start + i * step, round(value, 3)] for i in range(count)]
                 for key, value in (("used", 40), ("evictable", 35), ("vacant", 25))
             }
+        if panel["role"] != "overall":
+            panel["instances"] = {}
+            for index, factor in enumerate((0.8, 1.2)):
+                role = panel["role"]
+                instance = f"{role}-{'a' if index == 0 else 'b'}:{8010 if role == 'prefill' else 8020}"
+                scoped = {
+                    "series": {
+                        k: [[t, round(v * factor, 3)] for t, v in points]
+                        for k, points in panel["series"].items()
+                    }
+                }
+                if panel.get("kind") == "queues":
+                    scoped["series"] = {
+                        k: [[t, v * (0.4 if index == 0 else 0.6)] for t, v in points]
+                        for k, points in panel["series"].items()
+                    }
+                if panel.get("kind") == "blocks":
+                    share = 0.4 if index == 0 else 0.6
+                    scoped["block_counts"] = {
+                        "total": [
+                            [t, v * share] for t, v in panel["block_counts"]["total"]
+                        ],
+                        "used": [
+                            [t, v * (0.25 if index == 0 else 0.75)]
+                            for t, v in panel["block_counts"]["used"]
+                        ],
+                    }
+                    used = 25 if index == 0 else 50
+                    scoped["series"] = {
+                        k: [[start + i * step, v] for i in range(count)]
+                        for k, v in (
+                            ("used", used),
+                            ("evictable", 35),
+                            ("vacant", 65 - used),
+                        )
+                    }
+                if panel.get("kind") == "cache":
+                    gpu, lmcache, prompt = (
+                        (10000, 20000, 40000) if index == 0 else (36000, 18000, 60000)
+                    )
+                    scoped["cache_counts"] = {
+                        k: [[start + i * step, v] for i in range(count)]
+                        for k, v in (
+                            ("reused", gpu + lmcache),
+                            ("gpu", gpu),
+                            ("lmcache", lmcache),
+                            ("prompt", prompt),
+                        )
+                    }
+                    scoped["series"] = {
+                        k: [[start + i * step, 100 * v / prompt] for i in range(count)]
+                        for k, v in (
+                            ("reuse", gpu + lmcache),
+                            ("gpu", gpu),
+                            ("lmcache", lmcache),
+                        )
+                    }
+                panel["instances"][instance] = scoped
     return {
         "meta": {
             "title": "Agentic inference report",
@@ -321,6 +591,16 @@ def demo_data() -> dict:
             "window": 60,
             "kind": "demo",
             "source": "Layout preview · synthetic data",
+            "instances": [
+                {"role": role, "instance": instance}
+                for role, instance in sorted(
+                    {
+                        (p["role"], instance)
+                        for p in panels
+                        for instance in p.get("instances", {})
+                    }
+                )
+            ],
             "exported_at": time.time(),
             "notes": [],
         },
@@ -358,34 +638,52 @@ def validate_data(data: dict) -> None:
         if panel["id"] in identifiers:
             raise ValueError("Panel identifiers must be unique")
         identifiers.add(panel["id"])
-        if panel.get("unit", "ms") not in {"ms", "requests", "%"}:
-            raise ValueError("Panel unit must be ms, requests or %")
-        if not isinstance(panel.get("series"), dict):
-            raise TypeError("Each panel requires a series object")
-        counts = panel.get("block_counts", {})
-        if not isinstance(counts, dict) or counts.keys() - {"used", "total"}:
-            raise ValueError("block_counts must map used/total to arrays")
-        for statistic, points in [*panel["series"].items(), *counts.items()]:
-            if statistic not in (
-                STATISTICS.keys() | GAUGE_SERIES | {"total"}
-            ) or not isinstance(points, list):
-                raise ValueError(
-                    "Series must map a supported statistic or state to arrays"
-                )
-            previous = -math.inf
-            for point in points:
-                if not isinstance(point, (list, tuple)) or len(point) != 2:
-                    raise ValueError("Each point must be [unix_seconds, value_or_null]")
-                t, value = point
-                if not number(t) or t <= previous:
+        if panel.get("unit", "ms") not in {"ms", "requests", "%", "tokens"}:
+            raise ValueError("Panel unit must be ms, requests, tokens or %")
+        instances = panel.get("instances", {})
+        if not isinstance(instances, dict) or any(
+            not isinstance(k, str) or not k for k in instances
+        ):
+            raise ValueError(
+                "instances must map nonempty service addresses to series objects"
+            )
+        for bundle in [panel, *instances.values()]:
+            if not isinstance(bundle, dict) or not isinstance(
+                bundle.get("series"), dict
+            ):
+                raise TypeError("Each panel or instance requires a series object")
+            fields = [
+                ("series", STATISTICS.keys() | GAUGE_SERIES),
+                ("block_counts", {"used", "total"}),
+                ("cache_counts", {"cached", "prompt", "reused", "gpu", "lmcache"}),
+            ]
+            for field, allowed in fields:
+                series = bundle.get(field, {})
+                if not isinstance(series, dict) or series.keys() - allowed:
                     raise ValueError(
-                        "Point timestamps must be finite and strictly increasing"
+                        f"{field} must map supported statistics or states to arrays"
                     )
-                if value is not None and (not number(value) or value < 0):
-                    raise ValueError(
-                        "Metric values must be nonnegative numbers or null"
-                    )
-                previous = t
+                for points in series.values():
+                    if not isinstance(points, list):
+                        raise TypeError(
+                            "Series must map a supported statistic or state to arrays"
+                        )
+                    previous = -math.inf
+                    for point in points:
+                        if not isinstance(point, (list, tuple)) or len(point) != 2:
+                            raise ValueError(
+                                "Each point must be [unix_seconds, value_or_null]"
+                            )
+                        t, value = point
+                        if not number(t) or t <= previous:
+                            raise ValueError(
+                                "Point timestamps must be finite and strictly increasing"
+                            )
+                        if value is not None and (not number(value) or value < 0):
+                            raise ValueError(
+                                "Metric values must be nonnegative numbers or null"
+                            )
+                        previous = t
 
 
 def write_report(data: dict, output: str | Path) -> None:

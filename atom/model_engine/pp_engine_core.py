@@ -383,9 +383,14 @@ class PPEngineCoreProc(EngineCore):
 
     def _downstream_busy_loop(self):
         shutdown = False
+        next_metrics_push = 0.0
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
+                now = time.monotonic()
+                if now >= next_metrics_push:
+                    next_metrics_push = now + METRICS_PUSH_INTERVAL_S
+                    self.utility_handler.push_metrics(scheduler_metrics=False)
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 if shutdown:
                     break
