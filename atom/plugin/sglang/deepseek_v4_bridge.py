@@ -260,6 +260,83 @@ def _geometry_serves_ratio(geometry, ratio: int) -> bool:
     return ratio in geometry.classes
 
 
+def _geometry_supports_shared_prefill_writer(geometry) -> bool:
+    """Shared ``write_v4_paged_prefill_indices`` asserts CSA and HCA are served.
+
+    MTP draft / NextN proxy pools are often dense-only (``classes == (0,)``).
+    Calling the shared writer then crashes draft-extend; keep that path in the
+    SGLang bridge instead of changing the shared kernel.
+    """
+    return _geometry_serves_ratio(geometry, CSA_RATIO) and _geometry_serves_ratio(
+        geometry, HCA_RATIO
+    )
+
+
+def _write_dense_only_prefill_indices(
+    *,
+    positions: torch.Tensor,
+    bid_per_token: torch.Tensor,
+    chunk_start_per_seq: torch.Tensor,
+    cu_seqlens_q_per_seq: torch.Tensor,
+    state_slot_per_seq: torch.Tensor,
+    extend_indptr: torch.Tensor,
+    prefix_swa_indptr: torch.Tensor,
+    extend_indices: torch.Tensor,
+    prefix_swa_indices: torch.Tensor,
+    T: int,
+    win: int,
+    geometry,
+) -> None:
+    """Fill extend + dense SWA prefix only (MTP draft dense-only geometry)."""
+    if T == 0:
+        return
+    if not _geometry_serves_ratio(geometry, DENSE_RATIO):
+        raise RuntimeError(
+            "SGLang V4 prefill without CSA/HCA requires a dense class; "
+            f"geometry serves {tuple(geometry.classes)}"
+        )
+    dense = geometry.window_params(DENSE_RATIO)
+    bid_cpu = bid_per_token[:T].detach().cpu().tolist()
+    pos_cpu = positions[:T].detach().cpu().tolist()
+    cs_cpu = chunk_start_per_seq.detach().cpu().tolist()
+    cu_q_cpu = cu_seqlens_q_per_seq.detach().cpu().tolist()
+    slot_cpu = state_slot_per_seq.detach().cpu().tolist()
+    ext_ptr = extend_indptr.detach().cpu().tolist()
+    swa_ptr = prefix_swa_indptr.detach().cpu().tolist()
+    device = extend_indices.device
+    dtype = extend_indices.dtype
+
+    for t in range(T):
+        bid = int(bid_cpu[t])
+        pos = int(pos_cpu[t])
+        chunk_start = int(cs_cpu[bid])
+        cu_q = int(cu_q_cpu[bid])
+        token_pos_in_chunk = pos - chunk_start
+        swa_low = max(pos - win + 1, 0)
+        extend_count = min(token_pos_in_chunk + 1, win)
+        prefix_swa_count = max(chunk_start - swa_low, 0)
+
+        ext_base = int(ext_ptr[t])
+        ext_start = cu_q + token_pos_in_chunk - extend_count + 1
+        if extend_count:
+            extend_indices[ext_base : ext_base + extend_count] = torch.arange(
+                ext_start,
+                ext_start + extend_count,
+                device=device,
+                dtype=dtype,
+            )
+
+        if prefix_swa_count:
+            slot = int(slot_cpu[bid])
+            rows = torch.tensor(
+                [dense.index(slot, swa_low + k) for k in range(prefix_swa_count)],
+                device=device,
+                dtype=dtype,
+            )
+            swa_base = int(swa_ptr[t])
+            prefix_swa_indices[swa_base : swa_base + prefix_swa_count] = rows
+
+
 try:
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 except Exception:  # noqa: BLE001  # pragma: no cover - SGLang import-time fallback
@@ -1903,34 +1980,60 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
         bufs.skip_prefix_len_csa, prefix_swa_count.astype(np.int32), total
     )
 
-    write_v4_paged_prefill_indices(
-        positions=positions[:total].to(torch.int32),
-        bid_per_token=md.batch_id_per_q_token.to(torch.int64),
-        chunk_start_per_seq=chunk_start_gpu,
-        cu_seqlens_q_per_seq=cu_q[:-1],
-        state_slot_per_seq=md.state_slot_out,
-        block_tables=block_tables,
-        extend_indptr=ext_indptr,
-        prefix_swa_indptr=swa_indptr,
-        prefix_csa_indptr=csa_indptr,
-        prefix_hca_indptr=hca_indptr,
-        extend_indices=bufs.idx_extend.gpu,
-        prefix_swa_indices=bufs.idx_prefix_swa.gpu,
-        prefix_csa_indices=bufs.idx_prefix_csa.gpu,
-        prefix_hca_indices=bufs.idx_prefix_hca.gpu,
-        T=total,
-        win=win,
-        geometry=md.pool_geometry,
-        hca_rows_per_block=md.pool_geometry.block_rows(HCA_RATIO),
-    )
+    geometry = md.pool_geometry
+    if _geometry_supports_shared_prefill_writer(geometry):
+        write_v4_paged_prefill_indices(
+            positions=positions[:total].to(torch.int32),
+            bid_per_token=md.batch_id_per_q_token.to(torch.int64),
+            chunk_start_per_seq=chunk_start_gpu,
+            cu_seqlens_q_per_seq=cu_q[:-1],
+            state_slot_per_seq=md.state_slot_out,
+            block_tables=block_tables,
+            extend_indptr=ext_indptr,
+            prefix_swa_indptr=swa_indptr,
+            prefix_csa_indptr=csa_indptr,
+            prefix_hca_indptr=hca_indptr,
+            extend_indices=bufs.idx_extend.gpu,
+            prefix_swa_indices=bufs.idx_prefix_swa.gpu,
+            prefix_csa_indices=bufs.idx_prefix_csa.gpu,
+            prefix_hca_indices=bufs.idx_prefix_hca.gpu,
+            T=total,
+            win=win,
+            geometry=geometry,
+            hca_rows_per_block=geometry.block_rows(HCA_RATIO),
+        )
+        md.kv_indices_prefix_csa = bufs.idx_prefix_csa.gpu
+        md.kv_indices_prefix_hca = bufs.idx_prefix_hca.gpu
+        md.kv_indptr_prefix_csa = csa_indptr
+        md.kv_indptr_prefix_hca = hca_indptr
+    else:
+        # Dense-only MTP draft: shared writer asserts CSA+HCA. Publish empty
+        # compress prefix buffers and only fill extend + dense SWA.
+        empty_indptr = torch.zeros(
+            total + 1, dtype=torch.int32, device=positions.device
+        )
+        _write_dense_only_prefill_indices(
+            positions=positions[:total].to(torch.int32),
+            bid_per_token=md.batch_id_per_q_token.to(torch.int64),
+            chunk_start_per_seq=chunk_start_gpu,
+            cu_seqlens_q_per_seq=cu_q[:-1],
+            state_slot_per_seq=md.state_slot_out,
+            extend_indptr=ext_indptr,
+            prefix_swa_indptr=swa_indptr,
+            extend_indices=bufs.idx_extend.gpu,
+            prefix_swa_indices=bufs.idx_prefix_swa.gpu,
+            T=total,
+            win=win,
+            geometry=geometry,
+        )
+        md.kv_indices_prefix_csa = bufs.idx_prefix_csa.gpu[:0]
+        md.kv_indices_prefix_hca = bufs.idx_prefix_hca.gpu[:0]
+        md.kv_indptr_prefix_csa = empty_indptr
+        md.kv_indptr_prefix_hca = empty_indptr
     md.kv_indices_extend = bufs.idx_extend.gpu
     md.kv_indices_prefix_swa = bufs.idx_prefix_swa.gpu
-    md.kv_indices_prefix_csa = bufs.idx_prefix_csa.gpu
-    md.kv_indices_prefix_hca = bufs.idx_prefix_hca.gpu
     md.kv_indptr_extend = ext_indptr
     md.kv_indptr_prefix_swa = swa_indptr
-    md.kv_indptr_prefix_csa = csa_indptr
-    md.kv_indptr_prefix_hca = hca_indptr
     md.skip_prefix_len_csa = skip_prefix_len_csa
     md.chunk_start_per_seq_cpu = chunk_start_per_seq.astype(np.int32)
 
@@ -2257,34 +2360,57 @@ def _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device) 
     hca_indices = torch.empty(
         max(1, int(hca_indptr_np[-1])), dtype=torch.int32, device=device
     )
-    write_v4_paged_prefill_indices(
-        positions=t(pos_np),
-        bid_per_token=md.batch_id_per_q_token.to(torch.int64),
-        chunk_start_per_seq=t(chunk_start_per_seq),
-        cu_seqlens_q_per_seq=t(q_np[:-1]),
-        state_slot_per_seq=md.state_slot_out,
-        block_tables=block_tables,
-        extend_indptr=t(ext_indptr_np),
-        prefix_swa_indptr=t(swa_indptr_np),
-        prefix_csa_indptr=t(csa_indptr_np),
-        prefix_hca_indptr=t(hca_indptr_np),
-        extend_indices=ext_indices,
-        prefix_swa_indices=swa_indices,
-        prefix_csa_indices=csa_indices,
-        prefix_hca_indices=hca_indices,
-        T=T,
-        win=win,
-        geometry=md.pool_geometry,
-        hca_rows_per_block=md.pool_geometry.block_rows(HCA_RATIO),
-    )
+    geometry = md.pool_geometry
+    if _geometry_supports_shared_prefill_writer(geometry):
+        write_v4_paged_prefill_indices(
+            positions=t(pos_np),
+            bid_per_token=md.batch_id_per_q_token.to(torch.int64),
+            chunk_start_per_seq=t(chunk_start_per_seq),
+            cu_seqlens_q_per_seq=t(q_np[:-1]),
+            state_slot_per_seq=md.state_slot_out,
+            block_tables=block_tables,
+            extend_indptr=t(ext_indptr_np),
+            prefix_swa_indptr=t(swa_indptr_np),
+            prefix_csa_indptr=t(csa_indptr_np),
+            prefix_hca_indptr=t(hca_indptr_np),
+            extend_indices=ext_indices,
+            prefix_swa_indices=swa_indices,
+            prefix_csa_indices=csa_indices,
+            prefix_hca_indices=hca_indices,
+            T=T,
+            win=win,
+            geometry=geometry,
+            hca_rows_per_block=geometry.block_rows(HCA_RATIO),
+        )
+        md.kv_indices_prefix_csa = csa_indices[: int(csa_indptr_np[-1])]
+        md.kv_indices_prefix_hca = hca_indices[: int(hca_indptr_np[-1])]
+        md.kv_indptr_prefix_csa = t(csa_indptr_np)
+        md.kv_indptr_prefix_hca = t(hca_indptr_np)
+    else:
+        empty = torch.empty(0, dtype=torch.int32, device=device)
+        zero_indptr = torch.zeros(T + 1, dtype=torch.int32, device=device)
+        _write_dense_only_prefill_indices(
+            positions=t(pos_np),
+            bid_per_token=md.batch_id_per_q_token.to(torch.int64),
+            chunk_start_per_seq=t(chunk_start_per_seq),
+            cu_seqlens_q_per_seq=t(q_np[:-1]),
+            state_slot_per_seq=md.state_slot_out,
+            extend_indptr=t(ext_indptr_np),
+            prefix_swa_indptr=t(swa_indptr_np),
+            extend_indices=ext_indices,
+            prefix_swa_indices=swa_indices,
+            T=T,
+            win=win,
+            geometry=geometry,
+        )
+        md.kv_indices_prefix_csa = empty
+        md.kv_indices_prefix_hca = empty
+        md.kv_indptr_prefix_csa = zero_indptr
+        md.kv_indptr_prefix_hca = zero_indptr
     md.kv_indices_extend = ext_indices[: int(ext_indptr_np[-1])]
     md.kv_indices_prefix_swa = swa_indices[: int(swa_indptr_np[-1])]
-    md.kv_indices_prefix_csa = csa_indices[: int(csa_indptr_np[-1])]
-    md.kv_indices_prefix_hca = hca_indices[: int(hca_indptr_np[-1])]
     md.kv_indptr_extend = t(ext_indptr_np)
     md.kv_indptr_prefix_swa = t(swa_indptr_np)
-    md.kv_indptr_prefix_csa = t(csa_indptr_np)
-    md.kv_indptr_prefix_hca = t(hca_indptr_np)
     md.skip_prefix_len_csa = t(prefix_swa_count)
     md.chunk_start_per_seq_cpu = chunk_start_per_seq.astype(np.int32)
 

@@ -95,8 +95,6 @@ def _v4_paged_prefill_indices_kernel(
     ENVELOPE_ROWS: tl.constexpr,  # rows one block occupies across all layers
     BLOCK_N: tl.constexpr,  # next_pow2(win) — covers SWA prefix and extend segments
     HAS_DENSE: tl.constexpr,  # geometry has layers of this class to serve
-    HAS_CSA: tl.constexpr,
-    HAS_HCA: tl.constexpr,
     DENSE_RING_SLOTS: tl.constexpr,
     DENSE_SLOT_ROWS: tl.constexpr,
     DENSE_RING_STRIDE: tl.constexpr,
@@ -130,6 +128,11 @@ def _v4_paged_prefill_indices_kernel(
     pos = tl.load(positions_ptr + t)
     chunk_start = tl.load(chunk_start_per_seq_ptr + bid)
     cu_q = tl.load(cu_seqlens_q_per_seq_ptr + bid)
+    # Per-token causal HCA visibility (see `v4_pool_geometry`; matches the
+    # reference `get_compress_topk_idxs` prefill mask). Here specifically, the
+    # sequence's `ctx_end//128` would make a token's output depend on the
+    # forward's total length -- chunked and single-shot would disagree.
+    n_hca = (pos + 1) // HCA_RATIO
 
     # Per-token derived quantities (single-pass arithmetic).
     token_pos_in_chunk = pos - chunk_start
@@ -146,7 +149,7 @@ def _v4_paged_prefill_indices_kernel(
     ext_start_row = cu_q + token_pos_in_chunk - extend_count + 1
     tl.store(extend_indices_ptr + ext_base + i, ext_start_row + i, mask=ext_mask)
 
-    # ---- SWA prefix rows: written only for classes this geometry serves ----
+    # ---- SWA prefix rows: written to all three prefix buffers ----
     #   row = window.index(state_slot_per_seq[bid], gp) for that buffer's class,
     #   gp = swa_low + k, k in [0, prefix_swa_count)
     # `prefix_swa_count <= win - 1 < ring_slots` (it is `chunk_start - swa_low`
@@ -154,6 +157,7 @@ def _v4_paged_prefill_indices_kernel(
     # this reads is inside the ring's last lap. That bound is what lets a ring
     # serve chunked prefill at all — the in-chunk part comes from the extend
     # tensor, never from the pool.
+    swa_base_hca = tl.load(prefix_hca_indptr_ptr + t)
     swa_mask = i < prefix_swa_count
     global_pos = swa_low + i
     swa_slot = tl.load(state_slot_per_seq_ptr + bid)
@@ -180,61 +184,55 @@ def _v4_paged_prefill_indices_kernel(
     # head write and leaves the tail uninitialized — #1116 moved decode and
     # csa_translate_pack to this head-CSA / tail-SWA convention but missed this
     # prefill writer, corrupting chunked-prefill CSA slices (prefix_swa_count>0).
-    if HAS_CSA:
-        csa_end = tl.load(prefix_csa_indptr_ptr + t + 1)
-        csa_tail_base = csa_end - prefix_swa_count
-        tl.store(
-            prefix_csa_indices_ptr + csa_tail_base + i,
-            window_row(
-                swa_slot,
-                global_pos,
-                csa_ring_start,
-                CSA_RING_SLOTS,
-                CSA_SLOT_ROWS,
-                CSA_RING_STRIDE,
-                CSA_RUN_ROWS,
-            ),
-            mask=swa_mask,
-        )
-    if HAS_HCA:
-        # Per-token causal HCA visibility (see `v4_pool_geometry`; matches the
-        # reference `get_compress_topk_idxs` prefill mask). Here specifically,
-        # the sequence's `ctx_end//128` would make a token's output depend on
-        # the forward's total length -- chunked and single-shot would disagree.
-        n_hca = (pos + 1) // HCA_RATIO
-        swa_base_hca = tl.load(prefix_hca_indptr_ptr + t)
-        tl.store(
-            prefix_hca_indices_ptr + swa_base_hca + i,
-            window_row(
-                swa_slot,
-                global_pos,
-                hca_ring_start,
-                HCA_RING_SLOTS,
-                HCA_SLOT_ROWS,
-                HCA_RING_STRIDE,
-                HCA_RUN_ROWS,
-            ),
-            mask=swa_mask,
-        )
+    csa_end = tl.load(prefix_csa_indptr_ptr + t + 1)
+    csa_tail_base = csa_end - prefix_swa_count
+    tl.store(
+        prefix_csa_indices_ptr + csa_tail_base + i,
+        window_row(
+            swa_slot,
+            global_pos,
+            csa_ring_start,
+            CSA_RING_SLOTS,
+            CSA_SLOT_ROWS,
+            CSA_RING_STRIDE,
+            CSA_RUN_ROWS,
+        ),
+        mask=swa_mask,
+    )
+    tl.store(
+        prefix_hca_indices_ptr + swa_base_hca + i,
+        window_row(
+            swa_slot,
+            global_pos,
+            hca_ring_start,
+            HCA_RING_SLOTS,
+            HCA_SLOT_ROWS,
+            HCA_RING_STRIDE,
+            HCA_RUN_ROWS,
+        ),
+        mask=swa_mask,
+    )
 
-        # ---- HCA compress section ----
-        # Written at offset prefix_swa_count past the SWA prefix segment.
-        # Each physical block packs HCA_ROWS_PER_BLOCK rows
-        # (block_size // ratio): entry k -> block_tables[bid, k // rows]
-        # at row k % rows.
-        hca_dst_base = swa_base_hca + prefix_swa_count
-        bt_row_base = bid * bt_stride_bs
-        for j in tl.range(0, n_hca, BLOCK_N):
-            k = j + i
-            hca_mask = k < n_hca
-            blk = k // HCA_ROWS_PER_BLOCK
-            slot = k % HCA_ROWS_PER_BLOCK
-            bt = tl.load(block_tables_ptr + bt_row_base + blk, mask=hca_mask, other=0)
-            tl.store(
-                prefix_hca_indices_ptr + hca_dst_base + k,
-                compress_row(bt, slot, ENVELOPE_ROWS),
-                mask=hca_mask,
-            )
+    # ---- HCA compress section: HCA entry k -> paged offset for k in [0, n_hca) ----
+    # Written at offset prefix_swa_count past the SWA prefix segment in HCA buffer.
+    # Each physical block packs HCA_ROWS_PER_BLOCK rows (block_size // ratio),
+    # matching the compressor's cache view [num_blocks, HCA_ROWS_PER_BLOCK,
+    # head_dim]: entry k lives in physical block
+    # block_tables[bid, k // HCA_ROWS_PER_BLOCK] at row k % HCA_ROWS_PER_BLOCK.
+    hca_dst_base = swa_base_hca + prefix_swa_count
+    # block_tables row stride is `bt_stride_bs` int32 elements (== max_num_blocks_per_seq).
+    bt_row_base = bid * bt_stride_bs
+    for j in tl.range(0, n_hca, BLOCK_N):
+        k = j + i
+        hca_mask = k < n_hca
+        blk = k // HCA_ROWS_PER_BLOCK
+        slot = k % HCA_ROWS_PER_BLOCK
+        bt = tl.load(block_tables_ptr + bt_row_base + blk, mask=hca_mask, other=0)
+        tl.store(
+            prefix_hca_indices_ptr + hca_dst_base + k,
+            compress_row(bt, slot, ENVELOPE_ROWS),
+            mask=hca_mask,
+        )
 
 
 @mark_trace
@@ -306,12 +304,10 @@ def write_v4_paged_prefill_indices(
                                   ``torch.empty`` and publishes it either way,
                                   so in that case it holds whatever was there.
       prefix_csa_indices:        ``[csa_total]`` int OUT — SWA prefix
-                                  segment written at the slice TAIL when CSA
-                                  is served; otherwise left untouched. CSA
-                                  topk HEAD is filled per layer by
+                                  segment written at the slice TAIL; CSA topk
+                                  HEAD section filled per layer by
                                   ``csa_translate_pack``.
-      prefix_hca_indices:        ``[hca_total]`` int OUT — fully written when
-                                  HCA is served; otherwise left untouched.
+      prefix_hca_indices:        ``[hca_total]`` int OUT — fully written.
       T:                         int — token count (grid size).
       win:                       int — SWA window size (per-token SWA cap).
       geometry:                  the pool's `UnifiedPoolGeometry`; supplies one
@@ -336,19 +332,22 @@ def write_v4_paged_prefill_indices(
     ):
         assert idx.dim() == 1
 
-    # Each compress class may be absent: DSpark trunks drop dense; MTP draft
-    # pools are often dense-only. Gate stores with HAS_* and borrow constexpr
-    # window params from any served class so the launch stays well-typed.
+    # DENSE is the one class a V4 config can turn out not to have: a layer that
+    # carries its window in a state field leaves the row space entirely, and on
+    # a trunk that is all CSA and HCA the draft layer is the only ratio-0 one
+    # there was. `prefix_swa_indices` then has no reader, so `HAS_DENSE` skips
+    # it and the borrowed parameters below never reach a store. CSA and HCA
+    # have no such exit today; the assert is there so the day one appears it
+    # says so instead of raising a bare KeyError out of the geometry.
     served = served_window_params(geometry)
-    if not served:
-        raise ValueError("V4 paged prefill geometry must serve at least one class")
+    assert CSA_RATIO in served and HCA_RATIO in served, (
+        "V4 paged prefill writes the CSA and HCA prefix buffers unconditionally; "
+        f"this pool serves only {sorted(served)}"
+    )
     has_dense = DENSE_RATIO in served
-    has_csa = CSA_RATIO in served
-    has_hca = HCA_RATIO in served
-    fallback = next(iter(served.values()))
-    dense = served.get(DENSE_RATIO, fallback)
-    csa = served.get(CSA_RATIO, fallback)
-    hca = served.get(HCA_RATIO, fallback)
+    csa = served[CSA_RATIO]
+    hca = served[HCA_RATIO]
+    dense = served.get(DENSE_RATIO, csa)
     BLOCK_N = triton.next_power_of_2(win)
     _v4_paged_prefill_indices_kernel[(T,)](
         positions,
@@ -375,8 +374,6 @@ def write_v4_paged_prefill_indices(
         ENVELOPE_ROWS=geometry.envelope_rows,
         BLOCK_N=BLOCK_N,
         HAS_DENSE=has_dense,
-        HAS_CSA=has_csa,
-        HAS_HCA=has_hca,
         **window_constexprs(dense, "DENSE_"),
         **window_constexprs(csa, "CSA_"),
         **window_constexprs(hca, "HCA_"),
@@ -417,8 +414,8 @@ def write_v4_paged_prefill_indices_reference(
         return
     served = served_window_params(geometry)
     dense = served.get(DENSE_RATIO)
-    csa = served.get(CSA_RATIO)
-    hca = served.get(HCA_RATIO)
+    csa = served[CSA_RATIO]
+    hca = served[HCA_RATIO]
     bid_cpu = bid_per_token[:T].cpu().tolist()
     pos_cpu = positions[:T].cpu().tolist()
     cs_per_seq_cpu = chunk_start_per_seq.cpu().tolist()
@@ -469,28 +466,26 @@ def write_v4_paged_prefill_indices_reference(
                     device=device,
                 )
 
-            # Absent classes leave their buffers untouched — same HAS_* gates
-            # as the Triton kernel (dense-only MTP draft, no-dense DSpark).
+            # No dense layer means no reader for this buffer — the kernel
+            # leaves it alone too, on `HAS_DENSE`.
             if dense is not None:
                 prefix_swa_indices[sb_swa : sb_swa + prefix_swa_count] = rows(
                     dense, prefix_swa_indices
                 )
             # CSA: SWA prefix at the slice TAIL (head holds the CSA topk section
             # filled by csa_translate_pack). See the kernel comment above.
-            if csa is not None:
-                csa_end = csa_indptr_cpu[t + 1]
-                prefix_csa_indices[csa_end - prefix_swa_count : csa_end] = rows(
-                    csa, prefix_csa_indices
-                )
-            if hca is not None:
-                prefix_hca_indices[sb_hca : sb_hca + prefix_swa_count] = rows(
-                    hca, prefix_hca_indices
-                )
+            csa_end = csa_indptr_cpu[t + 1]
+            prefix_csa_indices[csa_end - prefix_swa_count : csa_end] = rows(
+                csa, prefix_csa_indices
+            )
+            prefix_hca_indices[sb_hca : sb_hca + prefix_swa_count] = rows(
+                hca, prefix_hca_indices
+            )
 
         # HCA compress: entry k lives in physical block
         # block_tables[bid, k // hca_rows_per_block] at row
         # k % hca_rows_per_block.
-        if hca is not None and n_hca > 0:
+        if n_hca > 0:
             ks = torch.arange(n_hca, device=device)
             blk = (ks // hca_rows_per_block).cpu()
             row = (ks % hca_rows_per_block).to(prefix_hca_indices.dtype)
