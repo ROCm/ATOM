@@ -323,6 +323,22 @@ class DSparkProposer(Drafter):
         # width; default to the full block (a static verify length == block).
         return num_spec or self.dspark_block_size
 
+    def _bound_draft_k_cache(self, forward_context) -> "torch.Tensor | None":
+        """The draft's own paged K cache, or None while the pool is unallocated.
+
+        Whether there is paged state to describe is a property of the POOL, not
+        of ``is_dummy_run``. Two passes carry that flag and only one of them
+        lacks a pool: ``warmup_model()`` runs before ``allocate_kv_cache()``,
+        while ``dummy_execution()``'s DP-alignment step is a dummy whose pool is
+        fully bound. Gating on the flag would let the second one through
+        describing whatever the previous real step left behind.
+        """
+        layer_num = self.model.layers[0].self_attn.mla_attn.layer_num
+        cache_data = forward_context.kv_cache_data or {}
+        entry = cache_data.get(f"layer_{layer_num}")
+        bound = getattr(entry, "k_cache", None) if entry is not None else None
+        return None if bound is None or bound.numel() == 0 else bound
+
     def _resolve_dtype_q(self, forward_context) -> "tuple[torch.dtype, bool]":
         """q_out dtype for the draft's MLA decode, read from its bound cache.
 
@@ -344,11 +360,8 @@ class DSparkProposer(Drafter):
         # silently read that as float32 rather than the model dtype.
         from_config = dtypes.d_dtypes.get(self.config.kv_cache_dtype) or self.dtype
 
-        layer_num = self.model.layers[0].self_attn.mla_attn.layer_num
-        cache_data = forward_context.kv_cache_data or {}
-        entry = cache_data.get(f"layer_{layer_num}")
-        bound = getattr(entry, "k_cache", None) if entry is not None else None
-        if bound is None or bound.numel() == 0:
+        bound = self._bound_draft_k_cache(forward_context)
+        if bound is None:
             # warmup_model() runs before allocate_kv_cache(), so on that pass
             # there is no pool to read. Answer from the config and return None
             # for `final` so the caller does not cache a warmup-time guess.
@@ -759,11 +772,17 @@ class DSparkProposer(Drafter):
                 self._blk_dtype_q = dtype_q
         attn_metadata.dtype_q = dtype_q
 
-        if forward_context.context.is_dummy_run:
+        if self._bound_draft_k_cache(forward_context) is None:
             # warmup_model() runs before allocate_kv_cache(), so there is no
             # paged state to describe. The block forward still runs on that
             # pass -- it doubles as memory profiling, and omitting the draft
             # would leave its activations out of the KV budget.
+            #
+            # Keyed on the POOL and not on `is_dummy_run`: a replay reads the
+            # buffers filled below at the addresses the capture saw, so a pass
+            # that returns here while the pool IS bound leaves the block
+            # writing its KV through the last real step's slots. See
+            # `_bound_draft_k_cache`.
             return
 
         block_tables = self.runner.forward_vars["block_tables"].gpu[:running_bs]
@@ -777,7 +796,7 @@ class DSparkProposer(Drafter):
             # positions p with p % dcp_world_size == r, packed densely into its
             # page. Rows this rank does not own go to -1 (dropped).
             virtual_block = block_size * self.dcp_world_size
-            page_idx = self._block_page_idx(
+            page_idx, in_table = self._block_page_idx(
                 block_positions, virtual_block, block_tables
             )
             local_off = torch.div(
@@ -787,8 +806,11 @@ class DSparkProposer(Drafter):
             )
             slots.copy_(
                 torch.where(
-                    torch.remainder(block_positions, self.dcp_world_size)
-                    == self.dcp_rank,
+                    in_table
+                    & (
+                        torch.remainder(block_positions, self.dcp_world_size)
+                        == self.dcp_rank
+                    ),
                     torch.gather(block_tables, 1, page_idx) * block_size + local_off,
                     -1,
                 )
@@ -804,11 +826,26 @@ class DSparkProposer(Drafter):
         else:
             # slot = page_id * block_size + offset_in_page, derived on-device
             # from the block table so there is no host sync.
-            page_idx = self._block_page_idx(block_positions, block_size, block_tables)
+            page_idx, in_table = self._block_page_idx(
+                block_positions, block_size, block_tables
+            )
             slots.copy_(torch.gather(block_tables, 1, page_idx))
             slots.mul_(block_size)
             slots.add_(torch.remainder(block_positions, block_size))
+            # Positions the table cannot address are dropped, not clamped --
+            # see `_block_page_idx`.
+            slots.masked_fill_(~in_table, -1)
             ctx_lens.copy_(global_lens)
+
+        # `kv_indptr` is a cumsum of these, and it must not promise more
+        # indices than the generator writes: `kv_indices_generate_kernel` masks
+        # its store with `block_cols < n_cols` (block_convert.py), so entries
+        # past the block table's width are simply skipped and the decode would
+        # read whatever the previous step left in `_blk_kv_indices`. The bound
+        # is the same in either branch's units -- one entry holds `block_size`
+        # of THIS rank's tokens under DCP too, since a rank packs its
+        # round-robin share of a virtual block densely into one page.
+        ctx_lens.clamp_(max=block_tables.shape[1] * block_size)
 
         if running_bs > scheduled_bs:
             # See the docstring for why this tail reads a page rather than
@@ -844,21 +881,28 @@ class DSparkProposer(Drafter):
         # These rows belong to the target, which never reads past
         # `[:scheduled_bs]` -- but a row that is padding now may be real next
         # step, and would come back blanked if overwritten outright.
+        # The give-back is a `finally` because the borrowed column is another
+        # component's live state: anything raising out of the generator (a
+        # first-seen grid failing to JIT, an allocation) would otherwise leave
+        # those target rows permanently pointing at page 0, and the request that
+        # lands on one next step would read page 0 as its own first page.
         n_pad = running_bs - scheduled_bs
         if n_pad:
             borrowed = block_tables[scheduled_bs:, 0]
             saved_page0 = self._blk_saved_page0[:n_pad]
             saved_page0.copy_(borrowed)
             borrowed.zero_()
-        kv_indices_generate_triton(
-            block_tables,
-            self._blk_kv_indices,
-            kv_indptr,
-            block_size,
-            index_max_k,
-        )
-        if n_pad:
-            block_tables[scheduled_bs:, 0].copy_(saved_page0)
+        try:
+            kv_indices_generate_triton(
+                block_tables,
+                self._blk_kv_indices,
+                kv_indptr,
+                block_size,
+                index_max_k,
+            )
+        finally:
+            if n_pad:
+                block_tables[scheduled_bs:, 0].copy_(saved_page0)
         attn_metadata.kv_indptr = kv_indptr
         attn_metadata.kv_indices = self._blk_kv_indices
         attn_metadata.kv_last_page_lens = self._blk_last_page_lens[:running_bs]
@@ -922,17 +966,24 @@ class DSparkProposer(Drafter):
         block_positions: torch.Tensor,
         tokens_per_entry: int,
         block_tables: torch.Tensor,
-    ) -> torch.Tensor:
-        """Block-table column for each block position, clamped to the table.
+    ) -> "tuple[torch.Tensor, torch.Tensor]":
+        """Block-table column per block position, and which columns exist.
 
         The block drafts T positions PAST the anchor, so a request whose anchor
-        sits in its final page addresses a column that does not exist and the
-        gather reads out of bounds. Clamping costs nothing real -- those
-        positions are past the model length, so their draft tokens cannot
-        survive verification -- and keeps the row on its own allocation.
+        sits in its final page addresses a column the table does not have. The
+        index is clamped to keep the gather in bounds, but the clamp is not an
+        answer: it names the row's LAST column, which this request may never
+        have been given, and the slot derived from it keeps the original
+        position's in-page offset. Writing that would carry this block's KV
+        into whatever request owns the page that column points at.
+
+        So the mask is the real return value. Those rows want the same `-1` the
+        pad tail uses -- their draft tokens sit past the model length and cannot
+        survive verification anyway, so dropping them costs nothing.
         """
         page_idx = torch.div(block_positions, tokens_per_entry, rounding_mode="floor")
-        return page_idx.clamp_(max=block_tables.shape[1] - 1)
+        in_table = page_idx < block_tables.shape[1]
+        return page_idx.clamp_(max=block_tables.shape[1] - 1), in_table
 
     def _propose_with_draft(
         self,
@@ -959,11 +1010,19 @@ class DSparkProposer(Drafter):
             running_bs,
             {"anchor_ids": anchor_ids, "anchor_positions": anchor_positions},
         )
+        # A DP-alignment dummy (`dummy_execution`) arrives with the pool bound
+        # but not one row that owns a page: its sequence is fabricated and its
+        # block table is [0]. It still has to run -- the peers mirror the
+        # collectives this pass carries -- so describe every row as PAD, which
+        # is the shape that already means "aimed at nowhere, writes nothing".
+        # `scheduled_bs` itself keeps counting the real rows: it is what the
+        # caller's ids are sliced back to.
+        described_bs = 0 if context.is_dummy_run else scheduled_bs
         self._build_paged_block_metadata(
             forward_context,
             attn_metadata,
             staged["anchor_positions"],
-            scheduled_bs=scheduled_bs,
+            scheduled_bs=described_bs,
             # Upper bound rather than a .max() host sync: every context_len is
             # at most the target pass's longest sequence plus the block.
             max_seqlen_k=int(attn_metadata.max_seqlen_k) + T,
