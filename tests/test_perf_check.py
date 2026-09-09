@@ -297,6 +297,30 @@ def test_families_outside_drift_coverage_are_listed(tmp_path):
     assert "M" not in named
 
 
+def test_peak_does_not_forget_a_drop_that_aged_out(tmp_path):
+    """A level that dropped long ago and never recovered still reads as down.
+
+    Every window rolls forward. Once the good runs leave it the baseline falls
+    with them, the shortfall shrinks, and a permanent regression becomes the
+    new normal -- upstream closed a family as healthy while it sat 12.3% under
+    its peak. The anchor is taken over all history for that reason.
+    """
+    old_high = [1000.0, 1010.0, 1005.0]
+    settled = [900.0] * 12  # dropped 10%, long enough to fill any window
+    values = old_high + settled
+    anchor = pj._anchor(values)
+    assert anchor == pytest.approx(1005.0, abs=1.0)
+
+    points = [
+        {"date": 1786149015906 + i * 86400000, "tput": v, "tpot": 30.0}
+        for i, v in enumerate(values)
+    ]
+    # The level window sees only the settled runs...
+    assert pj._level_window(points) == pytest.approx([900.0] * 3, abs=0.1)
+    # ...but the anchor still remembers what main used to do.
+    assert (900.0 / anchor - 1) * 100 < -9
+
+
 # ------------------------------------------------- incomplete data is not a pass ---
 def test_regressed_entry_missing_a_level_does_not_read_as_clean(tmp_path):
     """The failure this guards against: the one entry that regressed loses a

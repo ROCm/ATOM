@@ -87,6 +87,13 @@ BASELINE_SANITY_MIN_POINTS = 6  # ... judged against at least this much history
 # by the onset instead -- see _level_window.
 LEVEL_WINDOW = 3
 VAR_WINDOW = 8
+# The best main has sustained, over all recorded history rather than a window.
+# A windowed peak forgets: once the good runs roll out of it the baseline falls
+# with them, the shortfall shrinks, and a level that never recovered reads as
+# recovered. Upstream hit exactly that -- a family closed as healthy while
+# sitting 12.3% under its peak. Three-point rolling mean rather than a single
+# best run, so one lucky night cannot become the anchor.
+ANCHOR_ROLL = 3
 
 # --- Main-side drift (context, never a verdict on the PR) -------------------
 # Ported from the nightly monitor's trend criterion, with its constants intact.
@@ -274,10 +281,9 @@ def load_history(source=None):
             stats[key] = {
                 "cv": statistics.pstdev(var) / median,
                 "median": median,
-                # Best of the same window the level came from. The median says
-                # what main does now; the best says how good it has been, which
-                # is what a reader asks when the paired delta is near zero.
-                "peak": max(level),
+                # Deliberately not from the level window: this is the number
+                # that must not move as history rolls forward.
+                "peak": _anchor(values),
                 "n": len(level),
             }
     ordered = {
@@ -303,6 +309,22 @@ def _drift_lag(points, days, field):
     if not base:
         return None
     return (statistics.mean(now[:DRIFT_SMOOTH_K]) / base - 1) * 100
+
+
+def _anchor(values):
+    """The best level main has sustained, over everything on record.
+
+    Not a window and not a single run: the maximum of a three-point rolling
+    mean across the whole series. A window would let a drop age out of the
+    comparison, which turns a permanent regression into the new normal; a
+    single run would anchor on one good night.
+    """
+    if len(values) < ANCHOR_ROLL:
+        return max(values) if values else None
+    return max(
+        statistics.mean(values[i : i + ANCHOR_ROLL])
+        for i in range(len(values) - ANCHOR_ROLL + 1)
+    )
 
 
 def _level_window(points):
@@ -1163,7 +1185,7 @@ def render(report, context):
 
     if rows:
         drift_lines += [
-            "| Model | isl/osl | vs recent median | vs recent best | Main trend |",
+            "| Model | isl/osl | vs main now | vs main peak | Main trend |",
             "|---|---|---|---|---|",
         ]
         for family in rows:
@@ -1199,13 +1221,14 @@ def render(report, context):
         drift_lines += [
             "",
             (
-                "Against main's recent nightly runs at the same "
-                "configuration -- the last 3, or everything since the step if "
-                "one is visible, so a median never straddles a level change. "
-                "The comparison crosses container images, where the spread is "
-                "11-21% against 0.6% within one image; read it for order of "
-                "magnitude. Trend is the nightly monitor's criterion, dated "
-                "from the data rather than from the window."
+                "*now* is main's current level -- the last 3 nightly runs, or "
+                "everything since the step when one is visible, so a median "
+                "never straddles a level change. *peak* is the best main has "
+                "sustained across all recorded history, which does not move as "
+                "history rolls forward: a drop that ages out of every window "
+                "still shows here. Both cross container images, where the "
+                "spread is 11-21% against 0.6% within one image; read them for "
+                "order of magnitude."
             ),
         ]
         measured = {(f["model"], f["isl_osl"]) for f in rows}
