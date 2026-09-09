@@ -43,12 +43,21 @@ def tune_gc() -> None:
     # Ignoring a bad value has to cover applying it too: this runs unguarded in
     # four processes, and in a ModelRunner worker a raise here lands between
     # "load model runner success" and "ready", where nothing reports it.
+    # `OverflowError` is the one `set_threshold` actually raises, and it is an
+    # ArithmeticError, so the other two do not cover it.
     try:
         t = tuple(int(x) for x in thresholds.split(","))
         if len(t) != len(old):
             raise ValueError(f"want {len(old)} values, got {len(t)}")
+        # CPython accepts both of these and neither means what it looks like.
+        # `t[0] == 0` stops automatic collection (measured: nothing reclaimed
+        # over 50k cycles) while `reclaim_watch` and `atom:gc_collected` read
+        # like the healthy case. The other two are ratios, where zero means
+        # *more* collection, so only a negative one is meaningless.
+        if t[0] < 1 or min(t) < 0:
+            raise ValueError(f"t0 must be >= 1 and none negative, got {t}")
         gc.set_threshold(*t)
-    except (ValueError, TypeError) as exc:
+    except (ValueError, TypeError, OverflowError) as exc:
         logger.warning("[gc] bad ATOM_GC_THRESHOLD=%r (%s), ignored", thresholds, exc)
         return
     logger.info("[gc] thresholds %s -> %s", old, gc.get_threshold())
@@ -311,6 +320,8 @@ def gc_census(top: int = 30, types_per_owner: int = 2) -> dict:
             "1": len(gc.get_objects(1)),
             "2": len(gen2),
         },
+        # Walks the permanent generation, so it belongs to a caller that is
+        # already walking. Nothing on a scrape path may ask for it.
         "frozen": gc.get_freeze_count(),
         "thresholds": list(gc.get_threshold()),
         # `collected` is the one that decides whether raising thresholds is

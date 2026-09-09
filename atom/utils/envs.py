@@ -277,10 +277,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Log every garbage collection: generation, duration, objects reclaimed.
     "ATOM_GC_DEBUG": lambda: os.getenv("ATOM_GC_DEBUG", "0") == "1",
     # "t0,t1,t2" for gc.set_threshold(); empty keeps CPython's default.
-    # Read independently by the API server, each EngineCore and each
-    # ModelRunner worker -- thresholds are per-interpreter.  A fallback for
-    # ATOM_GC_FREEZE=0: freezing removes the cost of a pass, this only spaces
-    # the passes out.  See tune_gc in atom/utils/gc_utils.py.
+    # Thresholds are per-interpreter, but this is one variable, read by every
+    # process that serves -- and only the frontend was measured to reclaim
+    # nothing, so setting it tunes three others blind. t0 must be >= 1: zero
+    # stops collection while the watch still reports the healthy shape.
+    # See tune_gc in atom/utils/gc_utils.py.
     "ATOM_GC_THRESHOLD": lambda: os.getenv("ATOM_GC_THRESHOLD", "").strip(),
     # Whether the incremental detokenizer may reuse the delta it last emitted
     # in place of one of its two decodes per update. "auto" verifies at startup

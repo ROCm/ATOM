@@ -149,6 +149,25 @@ def test_freezing_twice_is_additive_and_harmless():
     assert len(later) == 64  # and did not disturb what it froze
 
 
+def test_the_frozen_count_cannot_be_mirrored_so_nothing_scrape_side_reads_it():
+    """`gc.get_freeze_count()` is too slow for a scrape -- `_gc_metrics` has
+    the measurement -- and caching it here, the obvious answer, is wrong: the
+    count is not a function of this module's calls, which is what the middle of
+    this test shows. Hence no `atom:gc_frozen_objects` gauge to keep in step.
+    """
+    freeze_gc_heap("test")
+    unfreeze_gc_heap()
+    assert gc.get_freeze_count() == 0
+
+    gc.collect()  # touches nothing this module owns
+
+    assert gc.get_freeze_count() > 0, (
+        "CPython no longer repopulates the permanent generation on its own -- "
+        "a mirror maintained at freeze/unfreeze would now be safe, and this "
+        "test is the reason there isn't one"
+    )
+
+
 def test_every_serving_frontend_applies_the_gc_policy():
     """The axis, not one instance of it.
 
@@ -375,6 +394,17 @@ def test_the_env_sets_the_thresholds(monkeypatch):
         "999",  # one too few -- set_threshold would half-apply it
         ",,",
         "  ",
+        # Out of range. CPython accepts each of these and stores it: `0,...`
+        # turns automatic collection off, and negatives are nonsense.
+        "0,0,0",
+        "0,10,10",
+        "-1,10,10",
+        "700,-1,10",
+        # Past C long. `set_threshold` raises OverflowError here, which is an
+        # ArithmeticError -- so a guard catching only ValueError and TypeError
+        # lets through the one exception this call actually produces.
+        "70000000000000000000,10,10",
+        "9223372036854775808,10,10",
     ],
 )
 def test_a_malformed_env_leaves_the_thresholds_alone(monkeypatch, value):
@@ -391,6 +421,23 @@ def test_a_malformed_env_leaves_the_thresholds_alone(monkeypatch, value):
     tune_gc()
 
     assert gc.get_threshold() == (700, 10, 10)
+
+
+@pytest.mark.parametrize("value", ["700,0,0", "1,1,1", "100000,50,50"])
+def test_an_aggressive_setting_is_the_operators_call(monkeypatch, value):
+    """The negative control for the range check, and the reason it is not
+    `all(x >= 1)`. Only `t0` gates collection; `t1` and `t2` are ratios, where
+    zero means gen-1 and gen-2 run on *every* gen-0 pass. That is expensive
+    here -- gen 2 was measured at 979 ms in a worker -- but it is a coherent
+    thing to ask a tuning knob for, and refusing it needs a reason this has."""
+    from atom.utils import envs
+
+    monkeypatch.setattr(envs, "ATOM_GC_THRESHOLD", value)
+    gc.set_threshold(700, 10, 10)
+
+    tune_gc()
+
+    assert gc.get_threshold() == tuple(int(x) for x in value.split(","))
 
 
 def test_the_watch_is_quiet_while_nothing_is_reclaimed():

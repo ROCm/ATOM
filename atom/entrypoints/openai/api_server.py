@@ -16,7 +16,6 @@ import asyncio
 import base64
 import binascii
 import contextlib
-import functools
 import io
 import json
 import logging
@@ -25,7 +24,8 @@ import time
 import urllib.request
 import uuid
 from asyncio import AbstractEventLoop
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -362,8 +362,19 @@ _ANTHROPIC_PING_FRAME = event_frame("ping", {"type": "ping"})
 # timeouts, which are tens of seconds.
 _ANTHROPIC_PING_INTERVAL_SECONDS = 5.0
 _metrics_exporter = AtomMetricsExporter()
-_metrics_refresh_task: asyncio.Task | None = None
+_background_tasks: list[asyncio.Task] = []
 _METRICS_REFRESH_INTERVAL_SECONDS = 5.0
+# The watch compares two `gc.get_stats()` reads against something that moves on
+# the scale of minutes, so it has no reason to ride the metrics cadence.
+_GC_WATCH_INTERVAL_SECONDS = 60.0
+
+# Not the default pool: that one runs every request's prompt preprocessing, so
+# a curl loop against `/debug/gc_census` would fill it with heap walks and block
+# admission. One worker is also the single-flight -- each walk pins a gen-2
+# snapshot. Starts no thread until first submit, and is never shut down: the
+# interpreter joins it at exit, while a per-app teardown would leave the
+# endpoint dead if the app ever restarted in-process.
+_gc_census_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gc-census")
 
 
 def _get_dp_session_affinity_ids(
@@ -1524,72 +1535,76 @@ async def setup_streaming_request_fanout(
 
 
 async def _refresh_metrics_once() -> None:
+    """Take one snapshot from the engine and publish it.
+
+    Owns its own accounting: `metrics_refresh_errors` means "the exported
+    series are stale", which is this function not completing and nothing else.
+    """
     if engine is None:
         return
     try:
         # A local read of the snapshots EngineCore pushes, so it runs inline on
         # the loop -- no executor thread, and no writer on the control socket.
-        snapshot = engine.get_metrics_statistics()
-    except asyncio.CancelledError:
-        raise
+        _metrics_exporter.update(engine.get_metrics_statistics())
     except Exception:
         _metrics_exporter.record_refresh_error()
         logger.warning("Failed to refresh Prometheus metrics", exc_info=True)
-    else:
-        _metrics_exporter.update(snapshot)
 
 
-async def _metrics_refresh_loop() -> None:
-    """Refresh the cached snapshot forever, and outlive anything in the body.
+async def _reclaim_watch_once() -> None:
+    """Check whether this process's collector has started finding cycles."""
+    reclaim_watch("api_server")
 
-    Nothing awaits this task until shutdown, so an escaping exception is
-    silent: asyncio records "never retrieved", `/metrics` keeps serving the
-    last snapshot, `metrics_snapshot_available` still reads 1, and the gc
-    gauges keep moving because they are read at scrape time -- a dashboard that
-    looks alive while every engine-derived series is frozen. The whole body is
-    guarded for that reason, not just the call that happens to raise today.
+
+async def _periodic(interval: float, step: Callable[[], Awaitable[None]]) -> None:
+    """Run `step` on a fixed cadence for the life of the process.
+
+    The guard is the point, and there is one copy of it because that is the
+    invariant a second copy loses. Nothing awaits these tasks until shutdown,
+    so an exception escaping here is silent: asyncio records "never retrieved"
+    and the job stops, leaving whatever it maintained frozen at its last value
+    and still being served.
+
+    `CancelledError` needs no clause -- it is a BaseException, so shutdown
+    stops these regardless.
     """
     while True:
-        await asyncio.sleep(_METRICS_REFRESH_INTERVAL_SECONDS)
+        await asyncio.sleep(interval)
         try:
-            await _refresh_metrics_once()
-            # Rides this loop rather than owning a task: one `gc.get_stats()`
-            # read and a comparison, against something that changes on the
-            # scale of minutes if it changes at all.
-            reclaim_watch("api_server")
-        except asyncio.CancelledError:
-            raise
+            await step()
         except Exception:
-            # Counted, not only logged: `metrics_refresh_errors` is what says
-            # the series went stale, and a log line alone is not a signal.
-            _metrics_exporter.record_refresh_error()
-            logger.warning("Metrics refresh pass failed", exc_info=True)
+            logger.warning("%s failed", step.__name__, exc_info=True)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown."""
-    global _metrics_refresh_task
     logger.info("Server started successfully and ready to accept requests")
     tune_gc()
     maybe_attach_gc_debug_callback("api_server")
     await _refresh_metrics_once()
-    _metrics_refresh_task = asyncio.create_task(_metrics_refresh_loop())
     # The engine was built in `main()`, so this is the last point before the
     # first request at which everything reachable is still startup state.
     freeze_gc_heap("api_server")
     # After the freeze, or the baseline carries startup's own collections.
     arm_reclaim_watch()
+    _background_tasks[:] = [
+        asyncio.create_task(_periodic(interval, step), name=step.__name__)
+        for interval, step in (
+            (_METRICS_REFRESH_INTERVAL_SECONDS, _refresh_metrics_once),
+            (_GC_WATCH_INTERVAL_SECONDS, _reclaim_watch_once),
+        )
+    ]
     try:
         yield
     finally:
-        if _metrics_refresh_task is not None:
-            _metrics_refresh_task.cancel()
-            try:
-                await _metrics_refresh_task
-            except asyncio.CancelledError:
-                pass
-            _metrics_refresh_task = None
+        for task in _background_tasks:
+            task.cancel()
+        # `gather` rather than suppressing `CancelledError` around each await:
+        # that swallows a cancellation aimed at shutdown itself, which makes
+        # shutdown the thing that cannot be stopped.
+        await asyncio.gather(*_background_tasks, return_exceptions=True)
+        _background_tasks.clear()
         logger.info("Server shutting down, releasing resources...")
         if engine is not None:
             engine.close()
@@ -2429,7 +2444,7 @@ async def get_gc_census(top: int = 30, types_per_owner: int = 2):
     """
     try:
         return await asyncio.get_running_loop().run_in_executor(
-            None, functools.partial(gc_census, top=top, types_per_owner=types_per_owner)
+            _gc_census_executor, gc_census, top, types_per_owner
         )
     except Exception as e:
         logger.exception("Failed to take a GC census")

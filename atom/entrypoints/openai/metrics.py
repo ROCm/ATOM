@@ -402,9 +402,13 @@ def _gc_metrics() -> Iterable[GaugeMetricFamily | CounterMetricFamily]:
     startup means the collector is finding nothing; a rising line means the
     process builds reference cycles and raising thresholds has a price.
 
-    Every source is O(1). The number a reader wants next -- how many objects are
-    tracked -- walks the whole heap, so it lives in `/debug/gc_census`, which is
-    asked for rather than scraped.
+    O(1) per source is a bound, not a preference: rendering runs inline on the
+    loop that delivers every stream, so a scrape pauses all of them. It cost a
+    metric. `atom:gc_frozen_objects` came from `gc.get_freeze_count()`, which
+    walks the permanent generation -- 11.9 ms at 430k frozen against 0.5 us for
+    `gc.get_stats()`, i.e. the cost freezing exists to remove -- for a number
+    that changes twice in a process's life. It and the tracked-set size both
+    live in `/debug/gc_census` now, which is asked for rather than scraped.
     """
     stats = gc.get_stats()
     for name, key, doc in (
@@ -441,13 +445,6 @@ def _gc_metrics() -> Iterable[GaugeMetricFamily | CounterMetricFamily]:
     for generation, value in enumerate(gc.get_threshold()):
         threshold.add_metric([str(generation)], float(value))
     yield threshold
-
-    frozen = GaugeMetricFamily(
-        "atom:gc_frozen_objects",
-        "Objects in the permanent generation, which collections skip.",
-    )
-    frozen.add_metric([], float(gc.get_freeze_count()))
-    yield frozen
 
 
 class AtomMetricsExporter:
