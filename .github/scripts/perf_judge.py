@@ -763,7 +763,7 @@ _SCOPE_NOTE = {
         "Every judged entry moved, which points at a shared path "
         "(kernel / attention / scheduler) rather than one model."
     ),
-    "single_entry": "Only one entry moved, which points at a model-specific path.",
+    "single_entry": "One entry only -- a model-specific path.",
     "several_entries": "Several but not all entries moved.",
 }
 
@@ -794,14 +794,17 @@ def _entry_rows(family, show_drift=False):
     length ratio, fixed by --ignore-eos), and ITL and E2EL are recoverable from
     TTFT and TPOT. Listing those too would spend width without adding a fact.
 
-    Judging and reference levels share the table and are labelled, so the shape
-    stays visible: judging levels moving with the reference ones is a broad
-    change, reference levels moving alone is a small-batch path or noise.
+    Judging and reference levels share the table in concurrency order, so the
+    shape stays visible: judging levels moving with the reference ones is a
+    broad change, reference levels moving alone is a small-batch path or noise.
     """
     tripped = family["status"] == "triggered"
     rows = []
     first = True
-    for member in family["judging"] + family["reference"]:
+    # By concurrency, not judged-then-reference: the shape of a regression
+    # across levels is what a reader is scanning for, and a reordered axis
+    # hides it.
+    for member in family["members"]:
         judged = member["conc"] >= JUDGE_MIN_CONC
         # The marker rides with the number rather than occupying its own
         # column, and says what it does rather than naming a category: a reader
@@ -848,31 +851,51 @@ def render(report, context):
     if context:
         lines += [context, ""]
 
-    # Drift only exists when the base was measured twice. Printing a column of
-    # dashes reads as missing data rather than as a phase that did not run.
+    # One row per entry first: five rows a reader can take in, against thirty
+    # in the per-level table. The breakdown is one click away and carries the
+    # shape the criterion actually rests on.
+    lines += [
+        "| Model | Levels down | Total Tput | TPOT | TTFT |",
+        "|---|---|---|---|---|",
+    ]
+    for family in report["families"]:
+        tripped = family["status"] == "triggered"
+        if family["status"] == "insufficient":
+            lines.append("| {} | insufficient | | | |".format(family["model"]))
+            continue
+        lines.append(
+            "| {model} | {down}/{tot} | {tput} | {tpot} | {ttft} |".format(
+                model=(
+                    "**{}**".format(family["model"]) if tripped else family["model"]
+                ),
+                down=family["n_down"],
+                tot=family["n_total"],
+                tput=_pct(family["median_tput_pct"], bold=tripped),
+                tpot=_pct(family["median_tpot_pct"], bold=tripped),
+                ttft=_pct(family.get("median_ttft_pct")),
+            )
+        )
+    lines.append("")
+
     show_drift = any(
         m.get("drift_pct") is not None for f in report["families"] for m in f["members"]
     )
     lines += [
+        "<details>",
+        "<summary>Per-level breakdown</summary>",
+        "",
+        # Stated where the italics actually appear, not after the block closes.
+        f"Italic levels are measured but not judged (c < {JUDGE_MIN_CONC}).",
+        "",
         "| Model | Concurrency | Total Tput | TTFT | TPOT |"
         + (" Drift |" if show_drift else ""),
         "|---|---|---|---|---|" + ("---|" if show_drift else ""),
     ]
     for family in report["families"]:
         lines += _entry_rows(family, show_drift)
+    lines += ["", "</details>", ""]
 
-    has_unjudged = any(
-        m["conc"] < JUDGE_MIN_CONC for f in report["families"] for m in f["members"]
-    )
-    legend = f"Italic levels are measured but not judged (c < {JUDGE_MIN_CONC})."
-    # Only describe the marked rows when the run actually produced some.
-    # Explaining a marker that appears nowhere on the page sends the reader
-    # looking for something that is not there.
-    if not has_unjudged:
-        legend = ""
     lines += [
-        "",
-        legend,
         "",
         # The paired measurement carries a systematic bias toward whichever
         # half ran second, and it is large enough that a reader who takes a
@@ -902,12 +925,8 @@ def render(report, context):
             "> [!WARNING]",
             f"> **The baseline check did not run.** The nightly history {why}.",
             (
-                "> Without it there is nothing confirming the base measurement "
-                "is at main's usual level, and a base that is itself broken "
-                "produces a delta near zero -- the one shape where a green "
-                "verdict is exactly wrong. The paired numbers above stand; the "
-                "verdict is held at `partial` rather than `clean` because of "
-                "this."
+                "> Nothing confirms the base sits at main's usual level, and a "
+                "broken base yields a delta near zero. Held at `partial`."
             ),
             "",
         ]
@@ -962,14 +981,13 @@ def render(report, context):
     drift_lines = [""]
     # --- main-side context, kept apart from the verdict --------------------
     if report.get("main_drift"):
+        n = len(report["main_drift"])
+        # Context, not a finding: collapsed so the comment opens on the verdict
+        # and the table. GitHub renders <details> inline in comments.
         drift_lines += [
-            "---",
-            "",
-            (
-                "**Main-side context — not caused by this PR.** These models "
-                "are sliding on main; the delta above is honest, the absolute "
-                "level is not."
-            ),
+            "<details>",
+            "<summary><b>Sliding on main — not this PR</b> "
+            "({} {})</summary>".format(n, "family" if n == 1 else "families"),
             "",
             "| Model | Input/output | Window | Throughput | TPOT | Levels down |",
             "|---|---|---|---|---|---|",
@@ -983,9 +1001,10 @@ def render(report, context):
         drift_lines += [
             "",
             (
-                "From nightly history: several levels of one model sliding "
-                "together, TPOT mirroring."
+                "The delta above is honest, the absolute level is not. Several "
+                "levels of one model sliding together, TPOT mirroring."
             ),
+            "</details>",
             "",
         ]
 
