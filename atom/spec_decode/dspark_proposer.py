@@ -175,6 +175,9 @@ class DSparkProposer(Drafter):
         place each step."""
         if self._blk_ps_bufs is not None:
             return self._blk_ps_bufs
+        from aiter.dist.parallel_state import get_dp_group
+
+        from atom.model_ops.attention_mla import should_use_persistent_mode
         from atom.model_ops.attentions.aiter_mla import (
             _MLA_META_SUPPORTS_MAX_SPLIT,
             _MLA_SPLIT_BUDGET_AUTO,
@@ -194,6 +197,37 @@ class DSparkProposer(Drafter):
             self._blk_padded_heads = impl.dcp_kernel_num_heads
         else:
             self._blk_padded_heads = impl.padded_num_heads
+        # These buffers ARE the block's answer to "how does a recording made on
+        # a 1 + T context stay right against a 100k one" (see
+        # `_paged_block_warmup_inputs`): the capture bakes their addresses,
+        # `get_mla_metadata_v1` re-plans their contents every step from the real
+        # lengths, and their capacity below is a function of batch, block width
+        # and head count -- never of context length.
+        #
+        # The split-KV fallback has no such re-plan. It decides its split count
+        # HOST-side, from `kv_indices.shape[0]` and the fp8 min-block cap
+        # (aiter/mla.py `get_meta_param`, reached only when the work descriptors
+        # are None), and a capture freezes host decisions by value -- so a
+        # recording made at the warmup context would carry that context's split
+        # plan into every replay. Refuse the configuration rather than record
+        # against it: today it dies as a `KeyError` in that same cap
+        # (`get_block_n_fp8` has no key at this block's gqa x T), which says
+        # nothing about the reason. Read off the draft's own impl so the check
+        # describes the kernel that will actually run, as the head count above.
+        assert should_use_persistent_mode(
+            dp_size=get_dp_group().world_size,
+            dpa_persistent_supported=impl._dpa_persistent_supported,
+            page_size=envs.ATOM_MLA_PAGE_SIZE,
+            dcp_world_size=impl.dcp_world_size,
+            dcp_persistent_supported=impl.dcp_persistent_supported,
+        ), (
+            "the Kimi-K3 draft block records its MLA decode at a 1 + T context, "
+            "which only the persistent (ps=1) kernel makes safe; this "
+            "configuration resolves to the split-KV fallback "
+            f"(ATOM_MLA_PAGE_SIZE={envs.ATOM_MLA_PAGE_SIZE}, "
+            f"dcp_world_size={impl.dcp_world_size}, "
+            f"dcp_persistent_supported={impl.dcp_persistent_supported})"
+        )
         # max_split_per_batch only exists in newer aiter builds; feature-detect
         # it (as aiter_mla does) so old builds don't hit a TypeError. Cache the
         # kwargs so the sizing (info) and fill (get_mla_metadata_v1) calls agree.
@@ -653,10 +687,17 @@ class DSparkProposer(Drafter):
         rank owns. Position 0 keeps the whole block inside it.
 
         The recording is therefore made on a `1 + T` token context and replayed
-        against thousand-token ones. Sound because the MLA decode runs the
-        PERSISTENT (ps=1) kernel: its grid is fixed and its per-batch work comes
-        from the descriptor buffers `_build_paged_block_metadata` refreshes every
-        step, so the context length picks what those say, not which kernel runs.
+        against thousand-token ones. The decode does depend on that length --
+        it arrives in `kv_indptr` and in the work plan derived from it -- so
+        what makes this sound is WHERE the dependence lives: the PERSISTENT
+        (ps=1) kernel has a fixed grid and takes its per-batch work from
+        descriptor buffers whose capacity is context-independent
+        (`get_mla_metadata_info_v1` is keyed on batch, block width and heads)
+        and whose contents `_build_paged_block_metadata` re-plans every step.
+        Nothing about the length is decided host-side, which is the only kind
+        of decision a capture can freeze. `_init_block_persistent_buffers`
+        asserts that premise rather than trusting it -- the split-KV fallback
+        breaks exactly this property.
 
         The metadata build runs HERE, once per size, which is the point of the
         split: everything host-side about the batch (`get_mla_metadata_v1`, the

@@ -2533,3 +2533,88 @@ def test_a_dp_sync_dummy_describes_every_row_of_the_block_as_pad(monkeypatch):
         assert seen["described_bs"] == expect, f"is_dummy_run={dummy}"
         assert seen["rows"] == 4, "the width is the agreed batch either way"
         assert out.shape == (1, T), "the ids are still sliced to the real rows"
+
+
+def _persistent_probe(monkeypatch, *, page_size, dcp_world_size, dcp_persistent):
+    """Call the real `_init_block_persistent_buffers` with a stubbed draft impl.
+
+    The buffer sizing itself is aiter's, and irrelevant here -- what is under
+    test is the premise checked just before it.
+    """
+    import sys
+
+    import atom.model_ops.attentions.aiter_mla as mod_mla
+    from atom.spec_decode.dspark_proposer import DSparkProposer
+    from atom.utils import envs
+
+    # `aiter.dist` is aliased to `torch.distributed`, so `import
+    # aiter.dist.parallel_state` does not resolve even though the module is
+    # registered -- which is why the code under test uses a `from` import.
+    mod_ps = sys.modules["aiter.dist.parallel_state"]
+
+    p = DSparkProposer.__new__(DSparkProposer)
+    p.device = torch.device("cpu")
+    p.mtp_k = 7
+    p.dcp_world_size = dcp_world_size
+    p.config = types.SimpleNamespace(max_num_seqs=8)
+    p._blk_ps_bufs = None
+    impl = types.SimpleNamespace(
+        _dpa_persistent_supported=True,
+        dcp_world_size=dcp_world_size,
+        dcp_persistent_supported=dcp_persistent,
+        padded_num_heads=16,
+        dcp_kernel_num_heads=16,
+    )
+    p.model = types.SimpleNamespace(
+        layers=[
+            types.SimpleNamespace(
+                self_attn=types.SimpleNamespace(
+                    mla_attn=types.SimpleNamespace(impl=impl)
+                )
+            )
+        ]
+    )
+    monkeypatch.setattr(envs, "ATOM_MLA_PAGE_SIZE", page_size, raising=False)
+    monkeypatch.setattr(
+        mod_ps, "get_dp_group", lambda: types.SimpleNamespace(world_size=1)
+    )
+    monkeypatch.setattr(
+        mod_mla,
+        "get_mla_metadata_info_v1",
+        lambda *a, **k: tuple(((8, torch.int32),) * 6),
+    )
+    return p._init_block_persistent_buffers(torch.bfloat16, torch.bfloat16)
+
+
+def test_the_capture_refuses_a_config_the_split_kv_fallback_would_serve(monkeypatch):
+    """The warmup records at a `1 + T` context, which only the persistent
+    kernel makes safe: it takes the length from descriptors re-planned every
+    step, while the split-KV fallback decides its split count host-side, where
+    a capture freezes it. The premise was documented but never checked.
+    """
+    for page_size, dcp, dcp_ps in (
+        (64, 1, True),  # seg MLA
+        (1, 2, False),  # DCP on anything but gfx950
+    ):
+        with pytest.raises(AssertionError, match="split-KV fallback"):
+            _persistent_probe(
+                monkeypatch,
+                page_size=page_size,
+                dcp_world_size=dcp,
+                dcp_persistent=dcp_ps,
+            )
+
+
+def test_the_premise_check_passes_the_configuration_k3_actually_ships(monkeypatch):
+    """`recipes/Kimi-K3.md`: gfx950, `-tp 8`, no DCP, default page size."""
+    bufs = _persistent_probe(
+        monkeypatch, page_size=1, dcp_world_size=1, dcp_persistent=True
+    )
+    assert set(bufs) == {
+        "work_meta_data",
+        "work_indptr",
+        "work_info_set",
+        "reduce_indptr",
+        "reduce_final_map",
+        "reduce_partial_map",
+    }
