@@ -118,6 +118,27 @@ def run_judge(tmp_path, spec, expect=5, concs=ALL_CONCS, drop=()):
     return pj.judge(pairs, {}, expected_entries=expect)
 
 
+def _run_cli(tmp_path, base_dir, head_dir, history=None, expect=5):
+    """Drive the judge through its command line, the way CI does."""
+    out = tmp_path / "verdict.json"
+    cmd = [
+        sys.executable,
+        str(SCRIPTS / "perf_judge.py"),
+        "--base-dir",
+        str(base_dir),
+        "--head-dir",
+        str(head_dir),
+        "--expect-entries",
+        str(expect),
+        "--output-json",
+        str(out),
+    ]
+    cmd += ["--history", str(history)] if history else ["--no-history"]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(out.read_text())
+
+
 def flat(tput=0.0, tpot=0.0):
     return {m: {"tput": tput, "tpot": tpot} for m in BASE_TPUT}
 
@@ -185,6 +206,61 @@ def test_drop_with_neither_latency_moving_does_not_trip(tmp_path):
     kimi = next(f for f in report["families"] if f["model"] == "Kimi-K3")
     assert kimi["mirror"] is False
     assert kimi["mirror_via"] is None
+
+
+def test_missing_history_cannot_report_clean(tmp_path):
+    """A run whose baseline check could not execute is not a green run.
+
+    The baseline check is what catches a base measurement that is itself
+    broken, where the delta is near zero and clean is exactly the wrong call.
+    Degrading quietly would leave a report indistinguishable from one that was
+    actually checked.
+    """
+    base_dir, head_dir = write_pair(tmp_path, flat(tput=-0.4, tpot=-0.1))
+    missing = tmp_path / "nope.js"
+    report = _run_cli(tmp_path, base_dir, head_dir, history=missing)
+    assert report["history_status"] == "unavailable"
+    assert report["verdict"] == "partial"
+    assert report["history_downgraded"] is True
+
+
+def test_history_that_matches_nothing_is_not_a_pass(tmp_path):
+    """History that lines up with no measured configuration is not history.
+
+    This is what a renamed model or a changed dashboard format produces, and
+    from inside the judge it is indistinguishable from a healthy check unless
+    the mismatch is stated.
+    """
+    base_dir, head_dir = write_pair(tmp_path, flat(tput=-0.4, tpot=-0.1))
+    stale = tmp_path / "stale.js"
+    # Enough runs for the history to be usable -- a single point yields no
+    # spread and would read as "unavailable", which is a different failure.
+    runs = [
+        {
+            "date": 1786149015906 + i * 86400000,
+            "commit": {"id": chr(97 + i) * 40},
+            "benches": [
+                {
+                    "name": "ATOM::Renamed-Model 8192/1024 c=%d %s" % (c, metric),
+                    "value": value,
+                    "unit": unit,
+                    "extra": "Run: actions/runs/%d" % i,
+                }
+                for c in (64, 128, 256)
+                for metric, value, unit in (
+                    ("Total Tput", 1000.0 + i, "tok/s"),
+                    ("TPOT", 30.0, "ms"),
+                )
+            ],
+        }
+        for i in range(8)
+    ]
+    stale.write_text(
+        "window.BENCHMARK_DATA = " + json.dumps({"entries": {"Benchmark": runs}})
+    )
+    report = _run_cli(tmp_path, base_dir, head_dir, history=stale)
+    assert report["history_status"] == "unmatched"
+    assert report["verdict"] == "partial"
 
 
 # ------------------------------------------------- incomplete data is not a pass ---
