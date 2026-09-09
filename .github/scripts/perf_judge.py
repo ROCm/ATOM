@@ -265,6 +265,10 @@ def load_history(source=None):
             stats[key] = {
                 "cv": statistics.pstdev(recent) / median,
                 "median": median,
+                # Best of the same window. The median says what main normally
+                # does; the peak says how good it has been, which is the
+                # question a reader asks when the paired delta is near zero.
+                "peak": max(recent),
                 "n": len(recent),
             }
     ordered = {
@@ -539,6 +543,7 @@ def judge_family(members, history_cv):
         ),
         "nonmonotonic": _nonmonotonic(judging),
         "baseline_sanity": _baseline_sanity(judging, history_cv),
+        "base_vs_main": _base_vs_main(judging, history_cv),
         "escalations": _single_escalations(judging, history_cv),
     }
 
@@ -609,6 +614,36 @@ def _median_or_none(values):
     someone points it at a pair of result directories.
     """
     return statistics.median(values) if values else None
+
+
+def _base_vs_main(judging, history):
+    """Where this run's base sits against main's recent nightly level.
+
+    Cross-validation for the paired table, which on its own cannot tell a base
+    at main's usual level from one well under it -- both give the same delta.
+    Reported whether or not anything is wrong, because a reference that only
+    appears when it fires is not a reference.
+
+    The comparison crosses container images (this run's against each nightly's)
+    and that spreads 11-21% where a within-image comparison spreads 0.6%, so
+    only large deviations carry meaning. `_baseline_sanity` is the gate; this
+    is the reading.
+    """
+    med, peak = [], []
+    for member in judging:
+        hist = history.get((member["model"], member["isl_osl"], member["conc"]))
+        if not hist or not hist.get("median"):
+            continue
+        med.append((member["base_tput"] / hist["median"] - 1) * 100)
+        if hist.get("peak"):
+            peak.append((member["base_tput"] / hist["peak"] - 1) * 100)
+    if not med:
+        return None
+    return {
+        "vs_median_pct": statistics.median(med),
+        "vs_peak_pct": _median_or_none(peak),
+        "n_levels": len(med),
+    }
 
 
 def _baseline_sanity(judging, history):
@@ -1067,22 +1102,62 @@ def render(report, context):
     # not a rule: the sentence above it renders as a full-width H2. The blank
     # line is load-bearing.
     drift_lines = [""]
-    # --- main-side context, kept apart from the verdict --------------------
+
+    # Cross-check for the paired table. A paired delta cannot distinguish a
+    # base at main's usual level from one well under it, so the base is read
+    # against main's recent nightly level whether or not anything is wrong.
+    rows = [
+        (f["model"], f["base_vs_main"])
+        for f in report["families"]
+        if f.get("base_vs_main")
+    ]
+    if rows or report.get("main_drift") or report.get("drift_waiting"):
+        drift_lines += ["<details>", "<summary>Base against main</summary>", ""]
+    if rows:
+        drift_lines += [
+            "| Model | vs main median | vs main peak |",
+            "|---|---|---|",
+        ]
+        for model, v in rows:
+            drift_lines.append(
+                "| {} | {:+.1f}% | {} |".format(
+                    model,
+                    v["vs_median_pct"],
+                    (
+                        "{:+.1f}%".format(v["vs_peak_pct"])
+                        if v["vs_peak_pct"] is not None
+                        else "-"
+                    ),
+                )
+            )
+        drift_lines += [
+            "",
+            (
+                "Median and best of main's last 8 nightly runs at the same "
+                "configurations. This crosses container images, which spreads "
+                "11-21% against 0.6% within one image, so read it for order of "
+                "magnitude, not precision."
+            ),
+        ]
+
     if report.get("main_drift"):
         n = len(report["main_drift"])
-        # Context, not a finding: collapsed so the comment opens on the verdict
-        # and the table. GitHub renders <details> inline in comments.
         drift_lines += [
-            "<details>",
-            "<summary><b>Sliding on main — not this PR</b> "
-            "({} {})</summary>".format(n, "family" if n == 1 else "families"),
             "",
-            "| Model | Input/output | Onset | Throughput | TPOT | Levels &le; -2% |",
+            "**Sliding on main** ({} {})".format(n, "family" if n == 1 else "families"),
+            "",
+            (
+                "| Model | Input/output | Onset | Throughput | TPOT "
+                "| Levels &le; -2% |"
+            ),
             "|---|---|---|---|---|---|",
         ]
         for d in report["main_drift"]:
             drift_lines.append(
-                "| {model} | {shape} | {onset} | {tput} | {tpot} | {down} of {tot} |".format(
+                (
+                    "| {model} | {shape} | {onset} | {tput} | {tpot} "
+                    "| {down} of {tot} |"
+                ).format(
                     model=d["model"],
                     shape=d["isl_osl"],
                     onset=(
@@ -1100,37 +1175,29 @@ def render(report, context):
             )
         for d in report["main_drift"]:
             if d.get("per_conc"):
-                drift_lines.append(
+                drift_lines += [
                     "",
-                )
-                drift_lines.append(
                     "{}: ".format(d["model"])
-                    + ", ".join(f"c={c} {v:+.1f}%" for c, v in d["per_conc"])
-                )
+                    + ", ".join(f"c={c} {v:+.1f}%" for c, v in d["per_conc"]),
+                ]
         drift_lines += [
             "",
             (
-                "The delta above is honest, the absolute level is not. Onset is "
-                "the day the level actually moved, found in the data -- a step "
-                "and a slow slide look the same in a window figure."
+                "Onset is the day the level actually moved, found in the "
+                "data -- a step and a slow slide look alike in a window "
+                "figure. The paired delta stays honest either way; the "
+                "absolute level does not."
             ),
-            "</details>",
-            "",
         ]
 
-    # Families the trend criterion could not reach. Absent and clean look the
-    # same otherwise, and a model that has just started running would sit
-    # outside coverage indefinitely with nobody noticing.
     if report.get("drift_waiting"):
         drift_lines += [
-            "<details>",
-            "<summary>Not checked for drift ({})</summary>".format(
-                len(report["drift_waiting"])
-            ),
             "",
+            "Not checked for drift: "
+            + "; ".join(f"{m} {sh} ({why})" for m, sh, why in report["drift_waiting"]),
         ]
-        for model, shape, why in report["drift_waiting"]:
-            drift_lines.append(f"- {model} {shape} -- {why}")
+
+    if rows or report.get("main_drift") or report.get("drift_waiting"):
         drift_lines += ["", "</details>", ""]
 
     # --- shape flags -------------------------------------------------------
