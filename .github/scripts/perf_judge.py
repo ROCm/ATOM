@@ -31,8 +31,6 @@ levels is reported as ``insufficient``; if no family survives, the whole run is
 ``inconclusive``.
 """
 
-from __future__ import annotations
-
 import argparse
 import collections
 import json
@@ -59,6 +57,11 @@ FAMILY_MIN_DOWN = 3  # of those, how many must be down
 FAMILY_MEDIAN_PCT = -3.0  # family median throughput delta that trips the gate
 DOWN_EPS_PCT = -2.0  # a level counts as "down" past this
 TPOT_MIRROR_RATIO = 0.6  # |median TPOT delta / median tput delta| for mirroring
+# TTFT is the other way capacity is lost: requests queue instead of slowing
+# down. It moves much harder than TPOT when it moves at all (+300-700%
+# against a 30% throughput drop in the measured case), so the bar is the
+# same ratio -- it is cleared by a wide margin or not at all.
+TTFT_MIRROR_RATIO = 0.6
 NONMONOTONIC_MARGIN_PCT = 3.0  # interior level this far outside its neighbours
 # A/A residual after the warmup, measured on the platform this runs on. With
 # a 1x-concurrency warmup MI355X held a systematic +4.19% (run 34233036220:
@@ -439,6 +442,9 @@ def judge_family(members, history_cv):
         "reference": reference,
         "median_tput_pct": statistics.median(tputs) if tputs else None,
         "median_tpot_pct": statistics.median(tpots) if tpots else None,
+        "median_ttft_pct": _median_or_none(
+            [m["ttft_pct"] for m in judging if m.get("ttft_pct") is not None]
+        ),
         "n_down": sum(1 for t in tputs if t <= DOWN_EPS_PCT),
         "n_total": len(tputs),
         "median_drift_pct": _median_or_none(
@@ -460,19 +466,42 @@ def judge_family(members, history_cv):
     median_tput = result["median_tput_pct"]
     median_tpot = result["median_tpot_pct"]
 
-    # Mirroring: throughput down while TPOT goes up, by a comparable magnitude.
-    # It separates a real slowdown from measurement wobble, which does not make
-    # the two metrics move in lockstep.
-    mirror = (
+    # Confirmation: throughput down while a latency metric degrades to a
+    # comparable degree. Measurement wobble does not move two metrics in
+    # lockstep, which is what this gate is for.
+    #
+    # TPOT alone is not enough, and assuming it was hid a whole class of
+    # regression. A change that caps how many requests run at once drops
+    # throughput while making each *served* request faster -- TPOT goes DOWN
+    # while the queue behind it grows. Measured on MI308 with max_num_seqs
+    # capped at 16: throughput -25/-33/-29%, TTFT +681/+495/+307%, and TPOT
+    # -64/-78/-88%. The old gate called that `unclear` and reported nothing.
+    # Per-token slowdown and queueing are both real losses of capacity, so
+    # either one confirms.
+    median_ttft = result["median_ttft_pct"]
+    mirror_tpot = (
         median_tpot is not None
         and median_tput < 0
         and median_tpot > 0
         and abs(median_tpot / median_tput) >= TPOT_MIRROR_RATIO
     )
+    mirror_ttft = (
+        median_ttft is not None
+        and median_tput < 0
+        and median_ttft > 0
+        and abs(median_ttft / median_tput) >= TTFT_MIRROR_RATIO
+    )
+    mirror = mirror_tpot or mirror_ttft
     result["mirror"] = mirror
+    result["mirror_via"] = "TPOT" if mirror_tpot else ("TTFT" if mirror_ttft else None)
     result["mirror_ratio"] = (
         abs(median_tpot / median_tput)
         if (median_tpot is not None and median_tput)
+        else None
+    )
+    result["mirror_ratio_ttft"] = (
+        abs(median_ttft / median_tput)
+        if (median_ttft is not None and median_tput)
         else None
     )
 
@@ -981,12 +1010,17 @@ def render(report, context):
         for family in report["families"]:
             if family["status"] != "triggered":
                 continue
-            ratio = family.get("mirror_ratio")
+            via = family.get("mirror_via")
+            ratio = (
+                family.get("mirror_ratio_ttft")
+                if via == "TTFT"
+                else family.get("mirror_ratio")
+            )
             lines.append(
                 f"- **{family['model']}**: {family['n_down']}/{family['n_total']} "
                 f"judging levels down, median {_fmt(family['median_tput_pct'])}, "
                 f"TPOT {_fmt(family['median_tpot_pct'])}"
-                + (f" (mirror ratio {ratio:.2f})" if ratio else "")
+                + (f" (confirmed by {via}, ratio {ratio:.2f})" if ratio and via else "")
             )
             for flag in family["escalations"]:
                 lines.append(
