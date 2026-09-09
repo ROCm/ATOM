@@ -1163,6 +1163,7 @@ mod j_stream_event_emitter {
         ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice,
     };
     use crate::protocols::common::{FunctionCallDelta, ToolCallDelta};
+    use crate::routers::openai::responses::codex::{take_context, CodexResponsesRequest};
     use crate::routers::openai::responses::streaming::{
         OutputItemType, ResponseStreamEventEmitter,
     };
@@ -1367,6 +1368,79 @@ mod j_stream_event_emitter {
         let s = collect_lines(&mut rx);
         assert!(s.contains("response.function_call_arguments.done"));
         assert!(s.contains("response.output_item.done"));
+    }
+
+    #[test]
+    fn test_process_chunk_custom_tool_uses_codex_event_shape() {
+        let raw = json!({
+            "model": "m",
+            "input": "edit",
+            "tools": [{"type": "custom", "name": "apply_patch", "description": "patch"}]
+        });
+        let mut request: CodexResponsesRequest = serde_json::from_value(raw).unwrap();
+        let context = take_context(&mut request.0);
+        let mut e = emitter();
+        e.set_codex_context(context);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let deltas = vec![ToolCallDelta {
+            index: 0,
+            id: Some("call_patch".to_string()),
+            tool_type: Some("function".to_string()),
+            function: Some(FunctionCallDelta {
+                name: Some("apply_patch".to_string()),
+                arguments: Some("{\"input\":\"*** Begin Patch\"}".to_string()),
+            }),
+        }];
+        e.process_chunk(&chunk_with(None, Some(deltas), None), &tx)
+            .unwrap();
+        e.process_chunk(&chunk_with(None, None, Some("tool_calls")), &tx)
+            .unwrap();
+        let s = collect_lines(&mut rx);
+        assert!(s.contains("\"type\":\"custom_tool_call\""));
+        assert!(s.contains("response.custom_tool_call_input.delta"));
+        assert!(s.contains("response.custom_tool_call_input.done"));
+        assert!(s.contains("*** Begin Patch"));
+        assert!(!s.contains("response.function_call_arguments.delta"));
+    }
+
+    #[test]
+    fn test_process_chunk_delays_arguments_until_tool_item_is_added() {
+        let mut e = emitter();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let arguments_first = vec![ToolCallDelta {
+            index: 0,
+            id: None,
+            tool_type: Some("function".to_string()),
+            function: Some(FunctionCallDelta {
+                name: None,
+                arguments: Some("{\"city\":\"Paris\"}".to_string()),
+            }),
+        }];
+        e.process_chunk(&chunk_with(None, Some(arguments_first), None), &tx)
+            .unwrap();
+        assert!(rx.try_recv().is_err());
+
+        let identity_later = vec![ToolCallDelta {
+            index: 0,
+            id: Some("call_weather".to_string()),
+            tool_type: Some("function".to_string()),
+            function: Some(FunctionCallDelta {
+                name: Some("get_weather".to_string()),
+                arguments: None,
+            }),
+        }];
+        e.process_chunk(&chunk_with(None, Some(identity_later), None), &tx)
+            .unwrap();
+        e.process_chunk(&chunk_with(None, None, Some("tool_calls")), &tx)
+            .unwrap();
+
+        let s = collect_lines(&mut rx);
+        let added = s.find("response.output_item.added").unwrap();
+        let delta = s.find("response.function_call_arguments.delta").unwrap();
+        assert!(added < delta);
+        assert!(s.contains("call_weather"));
+        assert!(s.contains("{\\\"city\\\":\\\"Paris\\\"}"));
     }
 
     #[test]

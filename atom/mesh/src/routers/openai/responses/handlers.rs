@@ -10,8 +10,10 @@ use axum::{
 use uuid::Uuid;
 
 use super::{
-    context::ResponsesContext, conversation::load_conversation_history, conversions, non_streaming,
-    streaming,
+    codex::{take_context, CodexToolContext},
+    context::ResponsesContext,
+    conversation::load_conversation_history,
+    conversions, non_streaming, streaming,
 };
 use crate::{protocols::responses::ResponsesRequest, routers::comm::error};
 
@@ -21,6 +23,9 @@ pub(crate) async fn route_responses(
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
 ) -> Response {
+    let mut request = (*request).clone();
+    let codex_context = take_context(&mut request);
+    let request = Arc::new(request);
     let is_background = request.background.unwrap_or(false);
     if is_background {
         return error::bad_request(
@@ -31,10 +36,10 @@ pub(crate) async fn route_responses(
 
     let is_streaming = request.stream.unwrap_or(false);
     if is_streaming {
-        route_responses_streaming(ctx, request, headers, model_id).await
+        route_responses_streaming(ctx, request, headers, model_id, codex_context).await
     } else {
         let response_id = Some(format!("resp_{}", Uuid::new_v4()));
-        route_responses_sync(ctx, request, headers, model_id, response_id).await
+        route_responses_sync(ctx, request, headers, model_id, response_id, codex_context).await
     }
 }
 
@@ -44,11 +49,24 @@ async fn route_responses_sync(
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
     response_id: Option<String>,
+    codex_context: CodexToolContext,
 ) -> Response {
     match non_streaming::route_responses_internal(ctx, request, headers, model_id, response_id)
         .await
     {
-        Ok(responses_response) => axum::Json(responses_response).into_response(),
+        Ok(responses_response) => {
+            let mut value = match serde_json::to_value(responses_response) {
+                Ok(value) => value,
+                Err(error) => {
+                    return error::internal_error(
+                        "serialize_responses_failed",
+                        format!("Failed to serialize response: {error}"),
+                    );
+                }
+            };
+            codex_context.rewrite_response(&mut value);
+            axum::Json(value).into_response()
+        }
         Err(response) => response,
     }
 }
@@ -58,6 +76,7 @@ async fn route_responses_streaming(
     request: Arc<ResponsesRequest>,
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
+    codex_context: CodexToolContext,
 ) -> Response {
     let modified_request = match load_conversation_history(ctx, &request).await {
         Ok(req) => req,
@@ -80,6 +99,7 @@ async fn route_responses_streaming(
         headers,
         model_id,
         &request,
+        codex_context,
     )
     .await
 }

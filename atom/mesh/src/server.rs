@@ -40,7 +40,7 @@ use crate::{
         completion::CompletionRequest,
         generate::GenerateRequest,
         parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
-        responses::{ResponsesGetParams, ResponsesRequest},
+        responses::ResponsesGetParams,
         tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
         validated::ValidatedJson,
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
@@ -48,6 +48,7 @@ use crate::{
     routers::{
         atom_standalone::AtomStandaloneRuntime,
         comm::{conversations, parse, tokenize},
+        openai::responses::codex::CodexResponsesRequest,
         router_manager::RouterManager,
         RouterTrait,
     },
@@ -154,7 +155,7 @@ async fn v1_completions(
 async fn v1_responses(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ResponsesRequest>,
+    ValidatedJson(CodexResponsesRequest(body)): ValidatedJson<CodexResponsesRequest>,
 ) -> Response {
     state
         .router
