@@ -463,6 +463,63 @@ def test_workload_uses_dispatch_snapshot_and_observes_prompt_once(clock):
     assert metrics.snapshot() == snapshot
 
 
+def test_decode_request_context_histogram_counts_each_real_row_on_each_forward():
+    metrics = SchedulerMetrics()
+    seqs = {i: SimpleNamespace(num_tokens=999999) for i in (1, 2, 3)}
+    mixed = SimpleNamespace(
+        req_ids=[1, 2, 3],
+        is_dummy_run=False,
+        total_seqs_num_decode=2,
+        total_seqs_num_prefill=1,
+        total_tokens_num_prefill=50,
+        # Decode rows, then prefill, then a padded entry. Only the first two count.
+        context_lens=[1000, 9000, 300, 999999],
+    )
+    metrics.record_forward(mixed, seqs)
+    first = metrics.snapshot()
+    assert first["decode_context_tokens"]["sum"] == 10000
+    assert first["decode_context_tokens"]["buckets"][-1][1] == 1
+    assert first["decode_request_context_tokens"]["sum"] == 10000
+    assert first["decode_request_context_tokens"]["buckets"][-1][1] == 2
+    assert dict(first["decode_request_context_tokens"]["buckets"])[1024] == 1
+    assert dict(first["decode_request_context_tokens"]["buckets"])[16384] == 2
+
+    # The shorter request participates again: this is not a lifetime sample.
+    mixed.req_ids = [1]
+    mixed.total_seqs_num_decode = 1
+    mixed.total_seqs_num_prefill = 0
+    mixed.context_lens = [1001]
+    metrics.record_forward(mixed, seqs)
+    second = metrics.snapshot()
+    assert second["decode_context_tokens"]["sum"] == 11001
+    assert second["decode_context_tokens"]["buckets"][-1][1] == 2
+    assert second["decode_request_context_tokens"]["sum"] == 11001
+    assert second["decode_request_context_tokens"]["buckets"][-1][1] == 3
+    mixed.is_dummy_run = True
+    metrics.record_forward(mixed, seqs)
+    assert metrics.snapshot() == second
+
+    # Repeated exposition must not re-observe any request or forward.
+    rank = dict(
+        second,
+        dp_rank=0,
+        engine_role="decode",
+        timestamp=100,
+        running=1,
+        waiting=0,
+        waiting_kv=0,
+        kv_blocks={},
+    )
+    exporter = AtomMetricsExporter()
+    for _ in range(2):
+        exporter.update({"enabled": True, "scheduler_metrics": [rank]})
+        values = samples(exporter)
+        labels = (("dp_rank", "0"), ("engine_role", "decode"))
+        assert values[("atom:decode_request_context_tokens_count", labels)] == 3
+        assert values[("atom:decode_request_context_tokens_sum", labels)] == 11001
+        assert values[("atom:decode_context_tokens_count", labels)] == 2
+
+
 def test_worker_snapshots_include_all_pp_tp_workers_without_duplicate_queues():
     from aiter_stub import stubbed_aiter
 

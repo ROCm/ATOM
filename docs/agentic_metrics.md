@@ -121,18 +121,25 @@ time() - atom:scheduler_snapshot_timestamp_seconds{job="atom"}
 
 ## 缓存有效性与实际工作量
 
-新增三个调度直方图，在真实 forward 下发处采集，dummy 和空批次不计入：
+以下四个调度直方图在真实 forward 下发处采集，dummy 和空批次不计入：
 
 | 指标 | 单位 | 口径 |
 | --- | --- | --- |
 | `atom:prefill_request_tokens` | tokens | 请求首次执行本地 prefill 时，`num_prompt_tokens - batch.num_cached_tokens`，最小为 0；每个请求一次。后续 chunk 或抢占重入不重复计数。 |
 | `atom:prefill_batch_tokens` | tokens | 每次真实 forward 的 `total_tokens_num_prefill`；每个 chunk 分别计数，排除已缓存前缀、decode tokens 和图 padding。 |
-| `atom:decode_context_tokens` | tokens | 每次真实 forward 中 decode 行的 `batch.context_lens` 之和；不乘 TP 数，也不将同一请求按 MTP token 数重复计算。 |
+| `atom:decode_context_tokens` | tokens | **Decode batch context tokens**：每次真实 forward 中 decode 行的 `batch.context_lens` 之和，每轮一个样本；不乘 TP 数，也不将同一请求按 MTP token 数重复计算。 |
+| `atom:decode_request_context_tokens` | tokens | **Decode request context tokens**：每轮真实 decode 中，对每个请求行的 `batch.context_lens` 各记录一个样本；排除 prefill 行、padding 和 TP 重复。 |
 
 例如输入 100K tokens、首次 prefill 时已有 95K KV：请求直方图记录 5K；
 若分成 2K、2K、1K 三个 chunk，下发直方图记录三个样本。后者统计实际调度的
 计算，包括抢占后的重新计算；前者描述首次本地 prefill 的未缓存输入量。
 Decode 上下文长度是逻辑长度，稀疏 attention 下不等于实际读取 KV 的字节数。
+
+例如第一轮有两个 decode 请求，上下文分别为 1K、9K：batch 指标记录一个 10K
+样本，request 指标记录 1K、9K 两个样本。下一轮同一请求再次参与 decode 时会
+再次记录，因此 request 指标按“请求参与一轮 forward”统计，不是每个请求生命周期
+只统计一次。长生成请求会贡献更多样本。两者在同一时间窗口中计算 Mean/P50/P90/P95/P99，
+不通过 batch 总量除以 batch size 伪造单请求分位数；也不导出 request ID 标签。
 
 缓存面板默认同时展示 **Total reuse / LMCache / GPU 三条曲线**，使用同一批缓存记账中的三个计数：
 
@@ -198,7 +205,7 @@ Engine 每秒异步请求一次设备计时快照；结果通过现有 worker �
 ## 多实例看板
 
 报告默认进入 **Overview**，展示 P/D 各四项：TTFT、排队时间、缓存命中、GPU
-forward。可切换 **Latency / Workload / Cache & KV / All metrics**，当前共 19 个
+forward。可切换 **Latency / Workload / Cache & KV / All metrics**，当前共 20 个
 指标面板。保留 All / Prefill / Decode 角色筛选；共有指标在桌面上 P 左 D 右，
 移动端按相同顺序纵向排列。全局 Statistics 仍只有 Mean/P50/P90/P95/P99，
 队列状态、KV 状态和缓存命中开关留在相应面板。

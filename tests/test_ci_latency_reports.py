@@ -17,6 +17,8 @@ from prometheus_client import (
     generate_latest,
 )
 
+from atom.model_engine.scheduler_metrics import TOKEN_BUCKETS
+
 SCRIPTS = Path(__file__).resolve().parents[1] / ".github/scripts/atomesh/observability"
 
 
@@ -413,11 +415,21 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
         "atom:scheduler_kv_cache_blocks", "fixture", ["state"], registry=registry
     )
     workload = [
-        Histogram(name, "fixture", registry=registry)
+        Histogram(
+            name,
+            "fixture",
+            registry=registry,
+            buckets=(
+                Histogram.DEFAULT_BUCKETS
+                if name == "atom:gpu_forward_seconds"
+                else TOKEN_BUCKETS
+            ),
+        )
         for name in (
             "atom:prefill_request_tokens",
             "atom:prefill_batch_tokens",
             "atom:decode_context_tokens",
+            "atom:decode_request_context_tokens",
             "atom:gpu_forward_seconds",
         )
     ]
@@ -457,7 +469,7 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
                 queue_time.observe(0.01)
                 batch.observe(4)
                 transfer.observe(0.02)
-                for hist, value in zip(workload, (2000, 512, 32000, 0.008)):
+                for hist, value in zip(workload, (2000, 512, 32000, 8000, 0.008)):
                     hist.observe(value)
                 cached.inc(8)
                 offload.inc(1)
@@ -555,6 +567,15 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
                     for _, v in points
                 )
         panels = {panel["id"]: panel for panel in data["panels"]}
+        request_context = panels["decode_request_context_tokens"]
+        assert request_context["title"] == "Decode request context tokens"
+        assert panels["decode_context_tokens"]["title"] == "Decode batch context tokens"
+        for bundle in (request_context, *request_context["instances"].values()):
+            assert all(
+                value == pytest.approx(8000)
+                for _, value in bundle["series"]["mean"]
+                if value is not None
+            )
         kv = panels["prefill_kv_blocks"]
         assert {v for _, v in kv["series"]["used"] if v is not None} == {50.0}
         assert {

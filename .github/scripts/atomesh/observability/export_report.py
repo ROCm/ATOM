@@ -232,10 +232,23 @@ def panels_for(deployment: str) -> list[dict]:
         {
             "id": "decode_context_tokens",
             "role": role,
-            "title": "Decode context tokens",
+            "title": "Decode batch context tokens",
             "label": f"{role.upper()} · WORKLOAD",
             "detail": "Sum of logical context lengths per real decode batch · no TP duplication or graph padding",
             "metric": "atom:decode_context_tokens",
+            "selector": f'job="atom",role="{role}"',
+            "unit": "tokens",
+            "scale": 1,
+        }
+    )
+    panels.append(
+        {
+            "id": "decode_request_context_tokens",
+            "role": role,
+            "title": "Decode request context tokens",
+            "label": f"{role.upper()} · WORKLOAD",
+            "detail": "Logical context per request on every decode forward · request-forward weighted · no padding",
+            "metric": "atom:decode_request_context_tokens",
             "selector": f'job="atom",role="{role}"',
             "unit": "tokens",
             "scale": 1,
