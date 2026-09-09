@@ -15,6 +15,7 @@ import random
 import threading
 import time
 from asyncio import AbstractEventLoop, Event
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any, NamedTuple
 
@@ -507,12 +508,36 @@ def longest_silence_seconds() -> float:
     return now - min(_WAITING_SINCE.values())
 
 
+@dataclass
+class StreamDeliveryTiming:
+    """Track frontend delivery intervals independently of token decoding."""
+
+    last_output_at: float | None = None
+
+    def record(
+        self, num_new_tokens: int, observe: Callable[[float, int], None]
+    ) -> None:
+        now = time.perf_counter()
+        if self.last_output_at is None:
+            self.last_output_at = now
+        else:
+            observe(now - self.last_output_at, num_new_tokens)
+            # Keep instrumentation work out of the next interval.
+            self.last_output_at = time.perf_counter()
+
+
+@dataclass
+class StreamState:
+    detokenizer: IncrementalStreamDetokenizer
+    timing: StreamDeliveryTiming = field(default_factory=StreamDeliveryTiming)
+
+
 class _BufferedChunk(NamedTuple):
     """One stream's chunk, waiting for the end of the current engine step."""
 
     loop: AbstractEventLoop
     collector: Any
-    state: IncrementalStreamDetokenizer
+    state: StreamState
     chunk: dict
     tag: int | None
 
@@ -521,28 +546,37 @@ class StreamBatchDispatcher:
     """Collect one engine step per output thread and dispatch it by event loop.
 
     The dispatcher has no persistent per-stream registry. Each engine callback
-    creates one detokenizer and must reuse it for every chunk of its
+    creates one composed stream state and must reuse it for every chunk of its
     (collector, tag); every collector-bound chunk carries that same state.
     Merging keeps the first pending chunk's state, so it must not be replaced
     partway through a stream.
 
     For StreamOutputCollector, references cross threads but only get() on the
-    event loop mutates the state. Output threads just pass it through. An unread
-    chunk or queued delivery keeps the state (including its token history) alive
-    after the engine drops the finished callback; consuming or discarding those
-    references allows it to be reclaimed. Queue consumers use eager decoding
-    on their output thread instead.
+    event loop mutates the detokenizer. Frontend delivery updates the separate
+    timing state on that same loop, before merging. Output threads pass the state
+    through. An unread chunk or queued delivery keeps the state (including its
+    token history) alive after the engine drops the finished callback; consuming
+    or discarding those references allows it to be reclaimed. Queue consumers use
+    eager decoding on their output thread instead.
     """
 
-    def __init__(self, tokenizer: Any, synthetic_text: str | None = None):
+    def __init__(
+        self,
+        tokenizer: Any,
+        synthetic_text: str | None = None,
+        observe_inter_token_latency: Callable[[float, int], None] | None = None,
+    ):
         self.tokenizer = tokenizer
         self.synthetic_text = synthetic_text
+        self._observe_inter_token_latency = observe_inter_token_latency
         self._thread_local = threading.local()
 
-    def new_state(self) -> IncrementalStreamDetokenizer:
-        """Make the detokenizer for one stream, for its callback to hold."""
-        return IncrementalStreamDetokenizer(
-            self.tokenizer, synthetic_text=self.synthetic_text
+    def new_state(self) -> StreamState:
+        """Make decoding and delivery timing state for one stream's callback."""
+        return StreamState(
+            IncrementalStreamDetokenizer(
+                self.tokenizer, synthetic_text=self.synthetic_text
+            )
         )
 
     def enqueue(
@@ -550,7 +584,7 @@ class StreamBatchDispatcher:
         *,
         loop: AbstractEventLoop,
         collector: Any,
-        state: IncrementalStreamDetokenizer,
+        state: StreamState,
         chunk: dict,
         tag: int | None = None,
     ) -> None:
@@ -568,28 +602,26 @@ class StreamBatchDispatcher:
             return
         tl.buf = []
 
-        by_loop: dict[AbstractEventLoop, list[tuple[Any, Any]]] = {}
+        by_loop: dict[AbstractEventLoop, list[_BufferedChunk]] = {}
         for item in buf:
             if isinstance(item.collector, StreamOutputCollector):
                 # Keep this state with the pending chunk until get(). Moving
                 # only the JSON/socket work downstream still made four output
                 # threads decode every token while contending for the GIL.
-                item.chunk["_detokenizer"] = item.state
+                item.chunk["_detokenizer"] = item.state.detokenizer
             else:
                 # Queue consumers cannot decode on read and still receive a
                 # prepared chunk, as before.
-                item.chunk["text"] = item.state.update(
+                item.chunk["text"] = item.state.detokenizer.update(
                     item.chunk.get("token_ids") or [],
                     bool(item.chunk.get("finished")),
                 )
-            payload = item.chunk if item.tag is None else (item.tag, item.chunk)
-            by_loop.setdefault(item.loop, []).append((item.collector, payload))
+            by_loop.setdefault(item.loop, []).append(item)
 
         for loop, items in by_loop.items():
             loop.call_soon_threadsafe(self._deliver, items)
 
-    @staticmethod
-    def _deliver(items: list[tuple[Any, Any]]) -> None:
+    def _deliver(self, items: list[_BufferedChunk]) -> None:
         """Run on the target event loop and hand a whole step to its collectors.
 
         A step is delivered in one callback, never split across loop iterations.
@@ -600,5 +632,11 @@ class StreamBatchDispatcher:
         wrong order, and an end-of-stream that lands before a straggler is
         overwritten by it, hanging that client for good.
         """
-        for collector, payload in items:
-            collector.put_nowait(payload)
+        for item in items:
+            num_new_tokens = len(item.chunk.get("token_ids") or ())
+            if num_new_tokens and self._observe_inter_token_latency is not None:
+                item.state.timing.record(
+                    num_new_tokens, self._observe_inter_token_latency
+                )
+            payload = item.chunk if item.tag is None else (item.tag, item.chunk)
+            item.collector.put_nowait(payload)

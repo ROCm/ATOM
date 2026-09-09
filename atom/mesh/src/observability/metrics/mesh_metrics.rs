@@ -33,6 +33,11 @@ pub fn start_prometheus(config: PrometheusConfig) {
         .upkeep_timeout(Duration::from_secs(5 * 60))
         .set_buckets_for_metric(duration_matcher, &duration_bucket)
         .expect("failed to set duration bucket")
+        .set_buckets_for_metric(
+            Matcher::Full(schema::names::ROUTER_TTFT_SECONDS.to_string()),
+            &duration_bucket,
+        )
+        .expect("failed to set TTFT buckets")
         .install()
         .expect("failed to install Prometheus metrics exporter");
 }

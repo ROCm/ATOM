@@ -2,8 +2,11 @@ import asyncio
 import logging
 
 import pytest
+from prometheus_client import CollectorRegistry, Histogram, generate_latest
+from prometheus_client.parser import text_string_to_metric_families
 
 from atom.entrypoints.openai import streaming_dispatch
+from atom.entrypoints.openai.metrics import AtomMetricsExporter
 from atom.entrypoints.openai.streaming_dispatch import (
     IncrementalStreamDetokenizer,
     StreamBatchDispatcher,
@@ -68,6 +71,176 @@ def _resolve(coro):
         return stop.value
     coro.close()
     raise AssertionError("coroutine suspended when it should have had a value ready")
+
+
+def _itl_samples(exporter):
+    return {
+        (sample.name, sample.labels.get("le")): sample.value
+        for family in text_string_to_metric_families(exporter.render().decode())
+        for sample in family.samples
+        if sample.name.startswith("atom:inter_token_latency_seconds_")
+        and not sample.name.endswith("_created")
+    }
+
+
+def test_weighted_itl_matches_histogram_buckets_and_handles_large_batches():
+    exporter = AtomMetricsExporter()
+    registry = CollectorRegistry()
+    reference = Histogram(
+        "atom:inter_token_latency_seconds",
+        "reference",
+        buckets=exporter._inter_token_latency._bounds,
+        registry=registry,
+    )
+    for interval, tokens in ((0.0, 3), (0.008, 4), (0.09, 3), (32.0, 2)):
+        exporter.observe_inter_token_latency(interval, tokens)
+        for _ in range(tokens):
+            reference.observe(interval / tokens)
+    expected = {
+        (s.name, s.labels.get("le")): s.value
+        for f in text_string_to_metric_families(generate_latest(registry).decode())
+        for s in f.samples
+        if not s.name.endswith("_created")
+    }
+    assert _itl_samples(exporter) == pytest.approx(expected)
+    exporter.observe_inter_token_latency(5000.0, 10_000_000)
+    exporter.observe_inter_token_latency(1.0, 0)
+    samples = _itl_samples(exporter)
+    prefix = "atom:inter_token_latency_seconds"
+    assert samples[(prefix + "_count", None)] == 10_000_012
+    assert samples[(prefix + "_bucket", "0.002")] == 10_000_007
+    assert samples[(prefix + "_sum", None)] == pytest.approx(5032.098)
+
+
+def test_itl_preserves_token_weighted_intervals_when_stream_chunks_coalesce(
+    monkeypatch,
+):
+    exporter = AtomMetricsExporter()
+    tokenizer = _CountingTokenizer()
+    dispatcher = StreamBatchDispatcher(
+        tokenizer,
+        observe_inter_token_latency=exporter.observe_inter_token_latency,
+    )
+    state = dispatcher.new_state()
+    collector = StreamOutputCollector("itl")
+    loop = _ImmediateLoop()
+    timestamps = iter((1.0, 1.125, 1.125, 1.375, 1.375))
+    monkeypatch.setattr(
+        "atom.entrypoints.openai.streaming_dispatch.time.perf_counter",
+        lambda: next(timestamps),
+    )
+    # Four speculative tokens after 125 ms contribute four 31.25 ms
+    # observations; the next token contributes one 250 ms observation.
+    # An empty terminal output must not contribute another sample.
+    for tokens in ([65], [66, 67, 68, 69], [70], []):
+        dispatcher.enqueue(
+            loop=loop,
+            collector=collector,
+            state=state,
+            chunk={"token_ids": tokens, "finished": not tokens},
+        )
+        dispatcher.flush()
+
+    # ITL still samples each delivered batch while decoding waits for a read.
+    assert tokenizer.calls == 0
+    samples = _itl_samples(exporter)
+    assert _resolve(collector.get())["text"] == "ABCDEF"
+    assert tokenizer.calls == 2
+    assert _itl_samples(exporter) == samples
+    prefix = "atom:inter_token_latency_seconds"
+    assert samples[(prefix + "_count", None)] == 5
+    assert samples[(prefix + "_sum", None)] == pytest.approx(0.375)
+    assert samples[(prefix + "_bucket", "0.03")] == 0
+    assert samples[(prefix + "_bucket", "0.035")] == 4
+    assert samples[(prefix + "_bucket", "+Inf")] == 5
+
+    # The 5-second runtime snapshot and repeated scrapes must neither reset
+    # these streaming samples nor count them again.
+    exporter.update({"enabled": True})
+    exporter.update({"enabled": True, "requests_running": 0})
+    assert _itl_samples(exporter) == samples
+    assert _itl_samples(exporter) == samples
+
+
+@pytest.mark.parametrize("collector_type", [asyncio.Queue, StreamOutputCollector])
+def test_itl_keeps_independent_clocks_for_interleaved_fanout_choices(
+    monkeypatch, collector_type
+):
+    exporter = AtomMetricsExporter()
+    dispatcher = StreamBatchDispatcher(
+        _Utf8ByteTokenizer(),
+        observe_inter_token_latency=exporter.observe_inter_token_latency,
+    )
+    states = [dispatcher.new_state(), dispatcher.new_state()]
+    loop = _ImmediateLoop()
+    queue = collector_type()
+    timestamps = iter((1.0, 2.0, 2.5, 2.5, 3.0, 3.0))
+    monkeypatch.setattr(
+        "atom.entrypoints.openai.streaming_dispatch.time.perf_counter",
+        lambda: next(timestamps),
+    )
+    for tag, token in ((0, 65), (1, 66), (1, 67), (0, 68)):
+        dispatcher.enqueue(
+            loop=loop,
+            collector=queue,
+            state=states[tag],
+            chunk={"token_ids": [token], "finished": False},
+            tag=tag,
+        )
+    dispatcher.flush()
+    samples = _itl_samples(exporter)
+    prefix = "atom:inter_token_latency_seconds"
+    assert samples[(prefix + "_count", None)] == 2
+    assert samples[(prefix + "_sum", None)] == pytest.approx(2.5)
+    assert samples[(prefix + "_bucket", "0.6")] == 1
+    assert samples[(prefix + "_bucket", "2.0")] == 2
+
+
+def test_itl_includes_frontend_queueing_but_excludes_observation_work(monkeypatch):
+    exporter = AtomMetricsExporter()
+    clock = [0.0]
+    monkeypatch.setattr(
+        "atom.entrypoints.openai.streaming_dispatch.time.perf_counter",
+        lambda: clock[0],
+    )
+
+    def observe(interval, tokens):
+        exporter.observe_inter_token_latency(interval, tokens)
+        clock[0] += 0.125
+
+    dispatcher = StreamBatchDispatcher(
+        _Utf8ByteTokenizer(), observe_inter_token_latency=observe
+    )
+    loop = _RecordingLoop()
+    collector = StreamOutputCollector("frontend-itl")
+    state = dispatcher.new_state()
+    prefix = "atom:inter_token_latency_seconds"
+
+    for arrival, delivery, tokens in (
+        (1.0, 2.0, [65, 66, 67, 68]),  # Entire first batch is excluded.
+        (3.0, 4.5, [69, 70, 71, 72]),  # 2.5 seconds / 4 new tokens.
+        (5.0, 5.5, []),  # Empty output does not advance the last-token clock.
+        (6.0, 6.625, [73]),  # 2 seconds since observation ended at 4.625.
+    ):
+        before = _itl_samples(exporter)
+        clock[0] = arrival
+        dispatcher.enqueue(
+            loop=loop,
+            collector=collector,
+            state=state,
+            chunk={"token_ids": tokens, "finished": tokens == [73]},
+        )
+        dispatcher.flush()
+        assert _itl_samples(exporter) == before
+        clock[0] = delivery
+        loop.run()
+
+    samples = _itl_samples(exporter)
+    assert samples[(prefix + "_count", None)] == 5
+    assert samples[(prefix + "_sum", None)] == pytest.approx(4.5)
+    assert samples[(prefix + "_bucket", "0.6")] == 0
+    assert samples[(prefix + "_bucket", "0.8")] == 4
+    assert _resolve(collector.get())["text"] == "ABCDEFGHI"
 
 
 def test_incremental_detokenizer_holds_incomplete_utf8():
@@ -452,6 +625,7 @@ def test_dispatcher_keeps_no_per_stream_state():
     assert vars(dispatcher).keys() == {
         "tokenizer",
         "synthetic_text",
+        "_observe_inter_token_latency",
         "_thread_local",
     }
     for collector in collectors:
@@ -464,7 +638,9 @@ def test_each_stream_gets_its_own_detokenizer():
     first, second = dispatcher.new_state(), dispatcher.new_state()
 
     assert first is not second
-    assert not first.tokens and not second.tokens
+    assert first.detokenizer is not second.detokenizer
+    assert first.timing is not second.timing
+    assert not first.detokenizer.tokens and not second.detokenizer.tokens
 
 
 class _CountingTokenizer(_Utf8ByteTokenizer):
@@ -649,7 +825,7 @@ def test_decode_failure_keeps_tokens_for_a_later_update(fail_on, caplog):
     assert failed == {"token_ids": [ord("B")], "text": "", "finished": False}
     recovered = send(ord("C"), finished=True)
     assert recovered == {"token_ids": [ord("C")], "text": "BC", "finished": True}
-    assert list(state.tokens) == list(b"ABC")
+    assert list(state.detokenizer.tokens) == list(b"ABC")
     assert "Error detokenizing stream recoverable (tag=None)" in caplog.text
     assert "injected decode failure" in caplog.text
 
