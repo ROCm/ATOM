@@ -325,7 +325,10 @@ def test_low_concurrency_never_reaches_the_verdict(tmp_path):
     # Excluded from the verdict, but not hidden -- that is the whole point.
     body = pj.render(report, "")
     assert "-19.8%" in body
-    assert "(not judged)" in body
+    # Shown, and marked as excluded -- italic rather than a parenthetical: the
+    # audience already knows small batches are noisy.
+    assert "| *4* |" in body
+    assert "Italic levels are measured but not judged" in body
     assert "median of judged" in body
 
 

@@ -611,11 +611,11 @@ def _single_escalations(members, history_cv):
 
         reasons = []
         if delta <= DRAMATIC_PCT:
-            reasons.append(f"drop {delta:.1f}% exceeds {DRAMATIC_PCT:.0f}%")
+            reasons.append(f"past the {DRAMATIC_PCT:.0f}% mark")
         # Only judging levels reach this function, so there is no low-c caveat
         # left to apply -- every level here is one the verdict already trusts.
         if delta <= SINGLE_STANDS_ALONE_PCT:
-            reasons.append(f"c={member['conc']} dropped {delta:.1f}% on its own")
+            reasons.append("this level alone would qualify")
 
         hist = history_cv.get((member["model"], member["isl_osl"], member["conc"]))
         if hist and hist["cv"]:
@@ -786,7 +786,7 @@ def _median_cell(family):
     return f"**{text}**" if family["status"] == "triggered" else text
 
 
-def _entry_rows(family):
+def _entry_rows(family, show_drift=False):
     """One row per concurrency level, then the family's median.
 
     Throughput, TTFT and TPOT are the three independent measurements here --
@@ -806,28 +806,37 @@ def _entry_rows(family):
         # The marker rides with the number rather than occupying its own
         # column, and says what it does rather than naming a category: a reader
         # should not have to reach the legend to learn that a row does not count.
-        label = f"{member['conc']}" if judged else f"{member['conc']} (not judged)"
+        label = f"{member['conc']}" if judged else f"*{member['conc']}*"
         rows.append(
-            "| {entry} | {c} | {tput} | {ttft} | {tpot} | {drift} |".format(
+            "| {entry} | {c} | {tput} | {ttft} | {tpot} |{drift}".format(
                 entry=family["model"] if first else "",
                 c=label,
                 tput=_pct(member["tput_pct"], bold=tripped and judged),
                 ttft=_pct(member["ttft_pct"]),
                 tpot=_pct(member["tpot_pct"]),
-                drift=_pct(member.get("drift_pct")),
+                drift=(
+                    " {} |".format(_pct(member.get("drift_pct"))) if show_drift else ""
+                ),
             )
         )
         first = False
 
     if family["status"] == "insufficient":
-        rows.append("| | **median of judged** | insufficient | | | |")
+        rows.append(
+            "| | **median of judged** | insufficient | | |"
+            + (" |" if show_drift else "")
+        )
     else:
         rows.append(
-            "| | **median of judged** | {tput} | {ttft} | {tpot} | {drift} |".format(
+            "| | **median of judged** | {tput} | {ttft} | {tpot} |{drift}".format(
                 tput=_pct(family["median_tput_pct"], bold=tripped),
                 ttft="-",
                 tpot=_pct(family["median_tpot_pct"], bold=tripped),
-                drift=_pct(family.get("median_drift_pct")),
+                drift=(
+                    " {} |".format(_pct(family.get("median_drift_pct")))
+                    if show_drift
+                    else ""
+                ),
             )
         )
     return rows
@@ -839,31 +848,28 @@ def render(report, context):
     if context:
         lines += [context, ""]
 
+    # Drift only exists when the base was measured twice. Printing a column of
+    # dashes reads as missing data rather than as a phase that did not run.
+    show_drift = any(
+        m.get("drift_pct") is not None for f in report["families"] for m in f["members"]
+    )
     lines += [
-        "| Model | Concurrency | Total Tput | TTFT | TPOT | Drift |",
-        "|---|---|---|---|---|---|",
+        "| Model | Concurrency | Total Tput | TTFT | TPOT |"
+        + (" Drift |" if show_drift else ""),
+        "|---|---|---|---|---|" + ("---|" if show_drift else ""),
     ]
     for family in report["families"]:
-        lines += _entry_rows(family)
+        lines += _entry_rows(family, show_drift)
 
     has_unjudged = any(
         m["conc"] < JUDGE_MIN_CONC for f in report["families"] for m in f["members"]
     )
-    legend = (
-        f"**Concurrency** is how many requests are in flight at once. Only "
-        f"levels at or above {JUDGE_MIN_CONC} decide the verdict."
-    )
+    legend = f"Italic levels are measured but not judged (c < {JUDGE_MIN_CONC})."
     # Only describe the marked rows when the run actually produced some.
     # Explaining a marker that appears nowhere on the page sends the reader
     # looking for something that is not there.
-    if has_unjudged:
-        legend += (
-            " The rows marked *(not judged)* were measured and are shown, but "
-            "excluded from every calculation: at low concurrency the numbers "
-            "swing enough to both invent regressions and hide real ones. They "
-            "are here because dropping them entirely would leave no way to "
-            "tell a small-batch problem from ordinary low-concurrency noise."
-        )
+    if not has_unjudged:
+        legend = ""
     lines += [
         "",
         legend,
@@ -874,12 +880,9 @@ def render(report, context):
         # nothing changed. Say so next to the table rather than only in the
         # step summary, because the comment is what gets read.
         (
-            f"> Measured on identical code, the paired delta comes out at "
-            f"{MEASURED_RESIDUAL_BIAS_PCT}% with individual levels landing up "
-            f"to {RESIDUAL_SPREAD_PCT} points either side. Read a single level "
-            f"as carrying about that much slack, and treat anything inside it "
-            f"as no change. The verdict uses the family median across levels "
-            f"for the same reason."
+            f"> Identical code measures {MEASURED_RESIDUAL_BIAS_PCT}%, individual "
+            f"levels within {RESIDUAL_SPREAD_PCT} points of that. The verdict "
+            f"takes the family median for that reason."
         ),
         "",
     ]
@@ -950,36 +953,38 @@ def render(report, context):
             "",
         ]
 
+    # Held back and appended below the verdict. It is context, and printing
+    # it between the table and the reason for the verdict puts other
+    # models' problems ahead of this PR's on the way down the page.
+    # A "---" directly under a line of text is a setext heading in Markdown,
+    # not a rule: the sentence above it renders as a full-width H2. The blank
+    # line is load-bearing.
+    drift_lines = [""]
     # --- main-side context, kept apart from the verdict --------------------
     if report.get("main_drift"):
-        lines += [
+        drift_lines += [
             "---",
             "",
             (
-                "**Main-side context — not caused by this PR.** The baseline "
-                "above was measured on main, and these models have been sliding "
-                "there. A paired comparison sits on top of that: the delta is "
-                "honest and the absolute level is not."
+                "**Main-side context — not caused by this PR.** These models "
+                "are sliding on main; the delta above is honest, the absolute "
+                "level is not."
             ),
             "",
             "| Model | Input/output | Window | Throughput | TPOT | Levels down |",
             "|---|---|---|---|---|---|",
         ]
         for d in report["main_drift"]:
-            lines.append(
+            drift_lines.append(
                 f"| {d['model']} | {d['isl_osl']} | {d['horizon_days']}d "
                 f"| {d['median_pct']:+.1f}% | {_fmt(d['median_tpot_pct'])} "
                 f"| {d['n_down']}/{d['n_total']} |"
             )
-        lines += [
+        drift_lines += [
             "",
             (
-                "Read from the nightly history on the dashboard, over the "
-                "concurrency levels this check judges. Reported when several "
-                "levels of one model slide together and TPOT mirrors the move "
-                "-- a single level's slope carries no information, and across "
-                "414 configurations the 14-day change is symmetric enough that "
-                "amplitude alone cannot separate signal from noise."
+                "From nightly history: several levels of one model sliding "
+                "together, TPOT mirroring."
             ),
             "",
         ]
@@ -1071,10 +1076,20 @@ def render(report, context):
                 f"TPOT {_fmt(family['median_tpot_pct'])}"
                 + (f" (confirmed by {via}, ratio {ratio:.2f})" if ratio and via else "")
             )
-            for flag in family["escalations"]:
+            # One line per level repeating the same two reasons reads as
+            # padding. Keep the part that differs -- how far outside that
+            # level's own history it sits -- and state the shared reason once.
+            sigmas = [
+                (f["conc"], w)
+                for f in family["escalations"]
+                for w in f["why"]
+                if "sigma" in w
+            ]
+            if sigmas:
                 lines.append(
-                    f"  - c={flag['conc']} {flag['pct']:+.1f}%: "
-                    + "; ".join(flag["why"])
+                    "  - "
+                    + ", ".join(f"c={c} at {w.split(' the')[0]}" for c, w in sigmas)
+                    + " of that level's own history"
                 )
         if report["scope"]:
             lines += ["", _SCOPE_NOTE[report["scope"]]]
@@ -1110,14 +1125,8 @@ def render(report, context):
     if gaps:
         lines += ["", "Coverage gaps: " + "; ".join(gaps) + "."]
 
-    lines += [
-        "",
-        (
-            "This check does not block merge. It reports a measured delta "
-            "between the merge-base and the head commit; deciding whether it is "
-            "an acceptable trade-off is the reviewer's call."
-        ),
-    ]
+    lines += drift_lines
+    lines += ["", "Advisory. This check does not block merge."]
     return "\n".join(lines)
 
 
@@ -1152,7 +1161,7 @@ def render_summary(report, context):
     for family in report["families"]:
         for member in family["members"]:
             judged = member["conc"] >= JUDGE_MIN_CONC
-            conc = f"{member['conc']}" if judged else f"{member['conc']} (not judged)"
+            conc = f"{member['conc']}" if judged else f"*{member['conc']}*"
             row = [
                 family["model"],
                 member["isl_osl"],
@@ -1182,20 +1191,11 @@ def render_summary(report, context):
             else ")"
         ),
         "",
-        (
-            "Rows marked *(not judged)* were measured and are shown, but "
-            f"excluded from every calculation: below {JUDGE_MIN_CONC} requests "
-            "in flight the numbers swing enough to both invent regressions and "
-            "hide real ones."
-        ),
+        (f"Italic levels are measured but not judged " f"(c < {JUDGE_MIN_CONC})."),
         "",
         (
-            f"> Measured on identical code, the paired delta comes out at "
-            f"{MEASURED_RESIDUAL_BIAS_PCT}% with individual levels landing up "
-            f"to {RESIDUAL_SPREAD_PCT} points either side. The warmup removed "
-            f"the systematic part; what is left is spread, which is why the "
-            f"verdict is taken on the family median across levels rather than "
-            f"on any single one."
+            f"> Identical code measures {MEASURED_RESIDUAL_BIAS_PCT}%, individual "
+            f"levels within {RESIDUAL_SPREAD_PCT} points of that."
         ),
     ]
     return "\n".join(lines)
