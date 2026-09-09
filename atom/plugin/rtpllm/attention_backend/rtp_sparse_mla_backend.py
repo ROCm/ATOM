@@ -6,7 +6,7 @@ import importlib
 import inspect
 import os
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -28,8 +28,8 @@ def _resolve_plugin_sparse_index_converter():
     ):
         try:
             module = importlib.import_module(module_name)
-            return getattr(module, "triton_convert_req_index_to_global_index")
-        except Exception as exc:
+            return module.triton_convert_req_index_to_global_index
+        except Exception as exc:  # noqa: BLE001 -- collected and re-raised below
             errors.append(f"{module_name}: {exc}")
     raise _SparseUnavailable(
         "plugin sparse MLA index converter unavailable; " + "; ".join(errors)
@@ -76,7 +76,7 @@ class _LightweightSparseMlaImpl:
         *,
         topk_indices: torch.Tensor,
         attn_metadata: object,
-        positions: Optional[torch.Tensor] = None,
+        positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         self.calls.append(
             {
@@ -101,13 +101,13 @@ class _RealSparseMlaImpl:
         *,
         mla_modules: Any,
         v_head_dim: int,
-        scale: Optional[float] = None,
+        scale: float | None = None,
     ) -> None:
         self.mla_modules = mla_modules
         self.v_head_dim = int(v_head_dim)
-        self.kv_lora_rank = int(getattr(mla_modules, "kv_lora_rank"))
-        self.qk_nope_head_dim = int(getattr(mla_modules, "qk_nope_head_dim"))
-        self.qk_rope_head_dim = int(getattr(mla_modules, "qk_rope_head_dim"))
+        self.kv_lora_rank = int(mla_modules.kv_lora_rank)
+        self.qk_nope_head_dim = int(mla_modules.qk_nope_head_dim)
+        self.qk_rope_head_dim = int(mla_modules.qk_rope_head_dim)
         self.num_heads = int(getattr(mla_modules, "num_heads", 0) or 0)
         self.rotary_emb = getattr(mla_modules, "rotary_emb", None)
         self.kv_b_proj = getattr(mla_modules, "kv_b_proj", None)
@@ -218,7 +218,7 @@ class _RealSparseMlaImpl:
     def _infer_num_heads_from_weight(self, fallback: int) -> int:
         try:
             weight = self._read_kv_b_proj_weight()
-        except Exception:
+        except Exception:  # noqa: BLE001 -- a probe; any unreadable weight falls back
             return int(fallback)
         per_head_dim = int(self.qk_nope_head_dim + self.v_head_dim)
         if per_head_dim <= 0 or weight.ndim != 2:
@@ -238,7 +238,7 @@ class _RealSparseMlaImpl:
             from atom.model_ops.utils import get_and_maybe_dequant_weights
 
             weight = get_and_maybe_dequant_weights(self.kv_b_proj)
-        except Exception:
+        except Exception:  # noqa: BLE001 -- falls back to the undequantized weight
             weight = getattr(self.kv_b_proj, "weight", None)
         if not isinstance(weight, torch.Tensor):
             raise _SparseUnavailable(
@@ -302,7 +302,7 @@ class _RealSparseMlaImpl:
         self,
         q: torch.Tensor,
         k_pe: torch.Tensor,
-        positions: Optional[torch.Tensor],
+        positions: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         rope_dim = int(self.qk_rope_head_dim)
         if rope_dim == 0:
@@ -465,13 +465,13 @@ class _RealSparseMlaImpl:
         return kv_cache_base
 
     @staticmethod
-    def _build_req_id_per_token(
+    def _build_batch_id_per_q_token(
         attn_metadata: Any,
         num_tokens: int,
         device: torch.device,
     ) -> torch.Tensor:
         plugin_metadata = getattr(attn_metadata, "plugin_metadata", None)
-        req_id = getattr(plugin_metadata, "req_id_per_token", None)
+        req_id = getattr(plugin_metadata, "batch_id_per_q_token", None)
         if isinstance(req_id, torch.Tensor) and int(req_id.numel()) >= num_tokens:
             return req_id[:num_tokens].to(device=device, dtype=torch.int32)
         query_start_loc = getattr(plugin_metadata, "query_start_loc", None)
@@ -514,10 +514,10 @@ class _RealSparseMlaImpl:
             raise _SparseUnavailable(
                 f"GLM5 RTP sparse MLA requires positive block_size, got {block_size}."
             )
-        num_tokens, topk = topk_indices.shape
+        num_tokens, _ = topk_indices.shape
         device = topk_indices.device
         block_table = _RealSparseMlaImpl._block_table(attn_metadata, device)
-        req_id = _RealSparseMlaImpl._build_req_id_per_token(
+        req_id = _RealSparseMlaImpl._build_batch_id_per_q_token(
             attn_metadata, num_tokens, device
         ).to(dtype=torch.long)
         token_indices = topk_indices.to(device=device, dtype=torch.long)
@@ -887,9 +887,9 @@ class _RealSparseMlaImpl:
             torch.clamp(seq_lens[:num_tokens], min=0, max=topk, out=sparse_seqlen)
             max_query_len_for_sparse = 1
         else:
-            req_id = self._build_req_id_per_token(attn_metadata, num_tokens, device).to(
-                dtype=torch.int32
-            )
+            req_id = self._build_batch_id_per_q_token(
+                attn_metadata, num_tokens, device
+            ).to(dtype=torch.int32)
             block_table = self._block_table(attn_metadata, device).to(dtype=torch.int32)
             topk_indices_i32 = topk_indices.to(
                 device=device, dtype=torch.int32
@@ -943,7 +943,9 @@ class _RealSparseMlaImpl:
                         "paged_kv_last_page_len": paged_kv_last_page_len,
                         "paged_kv_indices": paged_kv_indices,
                     }
-                except Exception:
+                # Best-effort capture bookkeeping: failing it only costs the
+                # next capture's reuse.
+                except Exception:  # noqa: BLE001, S110
                     pass
             qo_indptr.copy_(
                 torch.arange(num_tokens + 1, device=device, dtype=torch.int32)
@@ -1059,7 +1061,8 @@ class _RealSparseMlaImpl:
                         "reduce_partial_map": reduce_partial_map,
                         "metadata_ready": False,
                     }
-                except Exception:
+                # Best-effort capture bookkeeping, as above.
+                except Exception:  # noqa: BLE001, S110
                     pass
         capture_meta_sig = (
             int(num_tokens),
@@ -1295,7 +1298,7 @@ class _RealSparseMlaImpl:
         *,
         topk_indices: torch.Tensor,
         attn_metadata: object,
-        positions: Optional[torch.Tensor] = None,
+        positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         del layer_id
         if attn_metadata is None:
@@ -1401,17 +1404,17 @@ class RTPSparseMlaBackend:
     def __init__(
         self,
         *,
-        sparse_impl: Optional[object] = None,
-        v_head_dim: Optional[int] = None,
-        mla_modules: Optional[object] = None,
-        scale: Optional[float] = None,
+        sparse_impl: object | None = None,
+        v_head_dim: int | None = None,
+        mla_modules: object | None = None,
+        scale: float | None = None,
     ) -> None:
         if v_head_dim is None:
             if mla_modules is None or not hasattr(mla_modules, "v_head_dim"):
                 raise ValueError(
                     "RTPSparseMlaBackend requires v_head_dim or mla_modules.v_head_dim."
                 )
-            v_head_dim = getattr(mla_modules, "v_head_dim")
+            v_head_dim = mla_modules.v_head_dim
         self.v_head_dim = int(v_head_dim)
         if sparse_impl is not None:
             self.sparse_impl = sparse_impl
@@ -1439,7 +1442,7 @@ class RTPSparseMlaBackend:
             self.sparse_impl
         )
 
-    def prepare_cuda_graph(self, attn_inputs) -> None:  # noqa: ANN001
+    def prepare_cuda_graph(self, attn_inputs) -> None:
         del attn_inputs
 
     def prewarm_for_cuda_graph(
@@ -1465,7 +1468,7 @@ class RTPSparseMlaBackend:
             from atom.utils.forward_context import get_forward_context
 
             return getattr(get_forward_context(), "attn_metadata", None)
-        except Exception:
+        except Exception:  # noqa: BLE001 -- no forward context is the answer
             return None
 
     @staticmethod
@@ -1503,8 +1506,8 @@ class RTPSparseMlaBackend:
         k_pe: torch.Tensor,
         kv_cache: object,
         layer_id: int,
-        topk_indices: Optional[torch.Tensor] = None,
-        positions: Optional[torch.Tensor] = None,
+        topk_indices: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         attn_metadata = self._get_attn_metadata()
         if getattr(
@@ -1555,7 +1558,7 @@ def _run_rtp_sparse_attn_indexer_topk_only(
     k: torch.Tensor,
     weights: torch.Tensor,
     quant_block_size: int,
-    scale_fmt: Optional[str],
+    scale_fmt: str | None,
     topk_tokens: int,
     head_dim: int,
     max_model_len: int,
@@ -1584,6 +1587,7 @@ def _run_rtp_sparse_attn_indexer_topk_only(
     )
     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
     from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+
     from atom.config import get_current_atom_config
 
     slot_mapping = getattr(attn_metadata, "slot_mapping", None)
@@ -1764,7 +1768,7 @@ def rtp_sparse_attn_indexer(
     k: torch.Tensor,
     weights: torch.Tensor,
     quant_block_size: int,
-    scale_fmt: Optional[str],
+    scale_fmt: str | None,
     topk_tokens: int,
     head_dim: int,
     max_model_len: int,
@@ -1787,7 +1791,7 @@ def rtp_sparse_attn_indexer(
         from atom.utils.forward_context import get_forward_context
 
         forward_context = get_forward_context()
-    except Exception:
+    except Exception:  # noqa: BLE001 -- no forward context is the answer
         forward_context = None
     context = getattr(forward_context, "context", None)
     attn_metadata = getattr(forward_context, "attn_metadata", None)
@@ -1899,7 +1903,7 @@ def rtp_sparse_attn_indexer_fake(
     k: torch.Tensor,
     weights: torch.Tensor,
     quant_block_size: int,
-    scale_fmt: Optional[str],
+    scale_fmt: str | None,
     topk_tokens: int,
     head_dim: int,
     max_model_len: int,

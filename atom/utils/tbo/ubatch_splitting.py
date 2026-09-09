@@ -167,14 +167,15 @@ def _split_prefill_balanced(
     ub1_tokens = total_tokens - tok_boundary
 
     # Reject if either ubatch exceeds the AsyncLL buffer
-    if max_tokens_per_ubatch is not None:
-        if ub0_tokens > max_tokens_per_ubatch or ub1_tokens > max_tokens_per_ubatch:
-            logger.info(
-                f"[TBO] prefill split rejected: ubatch tokens "
-                f"({ub0_tokens}, {ub1_tokens}) exceed buffer "
-                f"{max_tokens_per_ubatch}"
-            )
-            return None
+    if max_tokens_per_ubatch is not None and (
+        ub0_tokens > max_tokens_per_ubatch or ub1_tokens > max_tokens_per_ubatch
+    ):
+        logger.info(
+            f"[TBO] prefill split rejected: ubatch tokens "
+            f"({ub0_tokens}, {ub1_tokens}) exceed buffer "
+            f"{max_tokens_per_ubatch}"
+        )
+        return None
 
     return [
         UBatchSlice(
@@ -361,6 +362,14 @@ def split_attn_metadata(
     # kv_indices: shared (indexed via kv_indptr, no slicing needed)
     ub_kv_indices = attn_metadata.kv_indices
 
+    # batch_id_per_k_token: sliced and re-based, not rebuilt -- the parent laid
+    # the requests out contiguously and `cu_seqlens_k` says where this one starts.
+    ub_batch_id_per_k_token = None
+    if attn_metadata.batch_id_per_k_token is not None:
+        cuk_cpu = _get_tbo_cpu_lens(attn_metadata, "cu_seqlens_k")
+        kv = slice(int(cuk_cpu[req_start]), int(cuk_cpu[req_end]))
+        ub_batch_id_per_k_token = attn_metadata.batch_id_per_k_token[kv] - req_start
+
     # kv_last_page_lens: slice by request
     ub_kv_last_page_lens = None
     if attn_metadata.kv_last_page_lens is not None:
@@ -480,6 +489,7 @@ def split_attn_metadata(
         sparse_kv_indptr=ub_sparse_kv_indptr,
         has_cached=attn_metadata.has_cached,
         total_kv=ub_total_kv,
+        batch_id_per_k_token=ub_batch_id_per_k_token,
         num_cached_tokens=ub_num_cached_tokens,
         seq_starts=ub_seq_starts,
         work_meta_data=None,

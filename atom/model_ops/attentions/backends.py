@@ -4,7 +4,7 @@
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, Optional, TypeVar
 
 if TYPE_CHECKING:
     from atom.kv_transfer.disaggregation.types import KVTransferTensors
@@ -23,7 +23,12 @@ from atom.model_engine.page_unit_checkpoint import (
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAModules
+from atom.model_ops.attentions.pool_layout.pool_rows import PoolRowsMixin
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import SubPoolSpec
+from atom.model_ops.attentions.token_layout.batch_ids import (
+    build_batch_ids,
+    build_batch_ids_device,
+)
 from atom.model_ops.attentions.token_layout.prefill import prefill_positions
 from atom.model_ops.attentions.token_layout.slots import slot_mapping
 from atom.model_ops.dcp_ops import dcp_prefill_slot_mapping
@@ -72,6 +77,12 @@ class AttentionBackend(ABC):
     # makes sure the output tensor is allocated inside the cudagraph.
     accept_output_buffer: bool = False
 
+    #: Whether a *draft* of this flavor caches into a pool of its own. False
+    #: means its rows are the target's -- an MLA draft's latent is the target's
+    #: latent -- and `make_kv_pool` below is never asked. A property of the
+    #: flavor, so a class answer and not a call.
+    DRAFT_OWNS_KV_POOL: ClassVar[bool] = False
+
     @staticmethod
     @abstractmethod
     def get_name() -> str:
@@ -85,6 +96,25 @@ class AttentionBackend(ABC):
     @staticmethod
     def get_impl_cls() -> type["AttentionImpl"]:
         return AttentionImpl
+
+    @staticmethod
+    def make_kv_pool(
+        hf_config,
+        *,
+        world_size: int,
+        target_block_size: int,
+        layers: int,
+        kv_dtype,
+    ):
+        """A pool of `layers` rows at this config's geometry.
+
+        Asked of a *draft* model's backend, and only where `DRAFT_OWNS_KV_POOL`
+        — the target's layers are its builder's own business. Both counts are
+        told rather than read: `layers` only the walk knows, and the block only
+        the target builder, whose it is and not this backend's for the reason
+        in `DraftKvBuilder.kv_pool`.
+        """
+        raise NotImplementedError
 
 
 class AttentionMetadataBuilder(ABC, Generic[T]):
@@ -184,7 +214,7 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         `setattr(self, name, value)` so model layers can reach them as
         `model_runner.<name>` (preserving existing names like `mamba_k_cache`).
         Values are usually tensors, but a backend may also publish the object
-        that owns them — DeepSeek-V4 publishes its `StateArena` alongside the
+        that owns them — DeepSeek-V4 publishes its `EntryMajorArena` alongside the
         per-layer views so the PD path can address a whole entry.
         """
         return {}
@@ -293,18 +323,43 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return None
 
-    def allocate_kv_cache_tensors(
-        self, num_kv_heads: int, num_draft_layers: int
-    ) -> dict[str, Any]:
+    def paged_pool_bytes(self, blocks: int) -> int:
+        """Bytes of the runner's one paged allocation this builder's pool takes.
+
+        Zero, the default, means "I allocate my own" -- DeepSeek-V4 does,
+        because half of what its PAGE entry is priced for lives in the plane
+        pool `allocate_per_req_cache` makes later.
+
+        An answer must come from the declaration `sub_pool_specs` prices, not
+        from a second spelling of it: the runner hands back exactly this many
+        bytes and refuses a builder that was charged for another number.
+        """
+        return 0
+
+    def allocate_kv_cache_tensors(self, *, blocks: int, buf) -> dict[str, Any]:
         """Allocate the model's primary paged KV cache tensors.
 
-        Called by ModelRunner.allocate_kv_cache() after num_physical_kvcache_blocks
-        is known. Builders own the per-attention-type tensor layout (single
-        576-dim MLA tensor vs split-K/V MHA tensor; full-rank vs hybrid-only-
-        full-attn-rows for Qwen3-Next; per-module deferred for MiMo-V2). The
-        runner only setattr's the returned dict onto itself, so model layers
-        can access tensors as `model_runner.<name>` (preserving existing
-        names: kv_cache, kv_scale, index_cache, etc.).
+        `blocks` is the scheduler block count every rank was told to build at.
+        A parameter and not a runner attribute because sizing runs per
+        subprocess and the answers differ: read the local estimate and one pool
+        is built at one count while something sized off another is built at a
+        second -- a class of bug no unit test reaches. Overrides record it as
+        `self.num_blocks`, converted to their own page.
+
+        `buf` is this builder's region of the runner's paged allocation,
+        `paged_pool_bytes` long -- empty for a builder that answered zero and
+        allocates its own.
+
+        The decode side of a P/D pair calls this too, with `buf` a region of an
+        imported pool. Nothing here may write into `buf`: that one arrives
+        already holding the peer's KV.
+
+        Builders own the per-attention-type tensor layout (single 576-dim MLA
+        tensor vs split-K/V MHA tensor; full-rank vs hybrid-only-full-attn-rows
+        for Qwen3-Next; per-module deferred for MiMo-V2). The runner only
+        setattr's the returned dict onto itself, so model layers can access
+        tensors as `model_runner.<name>` (preserving existing names: kv_cache,
+        kv_scale, index_cache, etc.).
 
         Values may be Tensors, None (deferred allocation), or scalar metadata
         (e.g. aligned_index_dim) needed downstream by build_kv_cache_tensor.
@@ -312,7 +367,14 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return {}
 
-    def build_kv_cache_tensor(self, layer_id: int, module):
+    def release_kv_pools(self) -> None:
+        """Drop the backing of every pool this builder holds, keeping the
+        declarations. A rollout sleep frees the runner's paged buffer, and a
+        pool's views would hold it alive; `allocate_kv_cache_tensors` puts the
+        backing back. A builder that holds no pool has nothing to drop.
+        """
+
+    def build_kv_cache_tensor(self, module):
         """Build the vLLM-style `KVCacheTensor` registration entry for one
         attention module, OR return None if this builder does not recognize
         the module type.
@@ -320,9 +382,9 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         Called from ModelRunner.allocate_kv_cache()'s binding loop for every
         module of the model. The builder owns:
           - module-type detection (e.g. `hasattr(module, "use_mla")`)
-          - per-attention-type slot index math (attn_idx, gdn_idx, ...)
-          - per-module tensor slicing from runner-owned tensors
-            (self.model_runner.kv_cache, .mamba_k_cache, ...)
+          - which of its pools the module's layer belongs to, and its row in
+            that pool from `pool_rows`
+          - per-module tensor slicing out of the pool that holds the row
           - any `setattr(module, "k_cache", ...)` side effects per the
             existing module convention
           - returning a `KVCacheTensor` ModelRunner appends to its registry
@@ -338,11 +400,16 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         return
 
 
-class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
+class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic[T]):
     def __init__(self, model_runner):
         self.model_runner = model_runner
         assert model_runner.block_size % self.block_size == 0
         self.block_ratio = model_runner.block_size // self.block_size
+        # Blocks the pools were last built at, in this backend's own page --
+        # what its kernels index; 0 until something backs them. Held, not
+        # re-read off the runner: a rollout resume can re-allocate at a
+        # *smaller* count, and a view addresses what it was built at.
+        self.num_blocks = 0
         self.device = model_runner.device
         config = model_runner.config
         hf_config = config.hf_config
@@ -360,9 +427,10 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         # allocation costs, not what a warm free-list hit costs.
         self.token_axis_scratch = np.empty(self.max_num_batched_tokens, dtype=np.int64)
         # Every row's own index, resident so no step rebuilds it. One buffer for
-        # three readers that each want the same numbers: a cu_seqlens ramp at one
-        # token per sequence (hence `+ 1`), the real prefix a padded
-        # `batch_id_per_token` is restored from, and DSpark's token -> request map.
+        # three readers that each want the same numbers: a cu_seqlens ramp at
+        # one token per sequence (hence `+ 1`), DSpark's token -> request map,
+        # and the MTP draft's, which needs a source already on the device (see
+        # `prepare_mtp_decode`).
         self.row_ids = torch.arange(
             self.max_bs + 1, device=self.device, dtype=torch.int32
         )
@@ -395,6 +463,11 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             "num_cached_tokens": CpuGpuBuffer(self.max_bs, **i32_kwargs),
             # seq_starts for cp_mha_gather_cache: always zeros (prefix at position 0)
             "seq_starts": CpuGpuBuffer(self.max_bs, **i32_kwargs),
+            # token -> seq over this fwd's QUERY tokens; `-1` on the CUDAGraph
+            # pad tail. Every backend needs it (see token_layout/batch_ids.py).
+            "batch_id_per_q_token": CpuGpuBuffer(
+                self.max_num_batched_tokens, **i32_kwargs
+            ),
         }
 
         attn_metadata["cu_seqlens_q"].cpu.copy_(
@@ -597,6 +670,14 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             scratch=self.token_axis_scratch,
         )
 
+    def publish_batch_ids(
+        self, seqlens: np.ndarray, pad_to: int | None = None
+    ) -> torch.Tensor:
+        """Build the token -> seq map into the shared buffer and upload it."""
+        buf = self.model_runner.forward_vars["batch_id_per_q_token"]
+        build_batch_ids(seqlens, pad_to=pad_to, out=buf.np)
+        return buf.copy_to_gpu(pad_to or int(seqlens.sum()))
+
     def _upload_prefill_mirrors(
         self,
         scheduled_bs: int,
@@ -689,6 +770,15 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         ctx = self._upload_prefill_mirrors(
             scheduled_bs, running_bs, scheduled_tokens, has_cached, cached_lens
         )
+        if has_cached:
+            # Layer-invariant, so built once here rather than in every layer's
+            # prefix gather. On the device: `total_kv` has no upper bound.
+            # `context_lens` is `running_bs` wide and its padded tail is zero,
+            # so it still sums to exactly `total_kv` -- which is handed over so
+            # the build does not stop the device to measure itself.
+            ctx["batch_id_per_k_token"] = build_batch_ids_device(
+                ctx["context_lens"], total=total_kv
+            )
         attn_metadata = AttentionMetaData(
             # Cast to python int — numpy.int32 leaks in via batch.context_lens
             # (numpy array) and breaks downstream Triton kernel constexpr

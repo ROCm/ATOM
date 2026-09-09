@@ -637,7 +637,8 @@ class AttentionMetaData:
         reduce_final_map: torch.Tensor | None = None,
         reduce_partial_map: torch.Tensor | None = None,
         sparse_cu_seqlens_q: torch.Tensor | None = None,
-        token_to_seq_idxs: torch.Tensor | None = None,
+        batch_id_per_q_token: torch.Tensor | None = None,
+        batch_id_per_k_token: torch.Tensor | None = None,
         has_cached: bool = False,
         total_kv: int | None = None,
         kpool_total_pools: int | None = None,
@@ -676,7 +677,10 @@ class AttentionMetaData:
         self.reduce_final_map = reduce_final_map
         self.reduce_partial_map = reduce_partial_map
         self.sparse_cu_seqlens_q = sparse_cu_seqlens_q
-        self.token_to_seq_idxs = token_to_seq_idxs
+        self.batch_id_per_q_token = batch_id_per_q_token
+        # [total_kv] int32 — the KV-axis twin, over the gathered cached+new KV.
+        # Layer-invariant, so the prefill builder makes it once per fwd.
+        self.batch_id_per_k_token = batch_id_per_k_token
 
     def asdict_zerocopy(self, skip_fields: set[str] | None = None) -> dict[str, Any]:
         """Similar to dataclasses.asdict, but avoids deepcopying."""
@@ -959,7 +963,7 @@ def get_kvconnector(role: str = "worker", config: Config | None = None) -> Any:
 
         try:
             tp_rank = get_tp_group().rank_in_group
-        except Exception:
+        except Exception:  # noqa: BLE001 -- logged; any failure means "no group"
             _logger.warning(
                 "get_tp_group() failed (dist not initialized?), returning None"
             )
