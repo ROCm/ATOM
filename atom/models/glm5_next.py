@@ -185,8 +185,6 @@ def _normalize_glm5_next_config(config) -> None:
         if len(layer_types) != config.num_hidden_layers or typed_kda != kda_layers:
             raise ValueError("GLM-5.3 linear_attn_config disagrees with layer_types")
 
-    config.num_gdn_attn_state = len(config.glm5_kda_layers)
-    config.num_full_attn = len(config.glm5_full_attn_layers)
     # KimiKDAAttention keys its layer membership off this name.
     config.kimi_kda_layers = config.glm5_kda_layers
     config.kimi_full_attn_layers = config.glm5_full_attn_layers

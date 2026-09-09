@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Layout arithmetic for `StateArena`.
+"""`entry_arena`: the layout arithmetic, and `EntryMajorArena` reading it.
 
 The property under test throughout is that the two ways of looking at the
 same memory agree: the per-layer views the kernels bind, and the contiguous
-per-entry byte range that checkpointing and RDMA use. Everything runs on CPU
-— the arena is pure indexing, no kernels.
+per-entry byte range that checkpointing and RDMA use. That is why the two
+modules are tested together rather than one file each — the arithmetic is
+what an arena must not disagree with, so half these assertions have a term
+from each side. Everything runs on CPU — the arena is pure indexing, no
+kernels.
 """
 
 import math
@@ -16,9 +19,11 @@ from itertools import pairwise
 import pytest
 import torch
 
-from atom.model_ops.attentions.pool_layout.state_arena import (
-    StateArena,
-    StateField,
+from atom.model_ops.attentions.pool_layout.entry_arena import (
+    EntryField,
+    EntryMajorArena,
+    LayerMajorArena,
+    carve,
     checkpoint_ranges_for,
     entry_bytes_for,
     field_extents,
@@ -30,17 +35,17 @@ from atom.model_ops.attentions.pool_layout.state_arena import (
 # each a (kv, score) pair, two of them on the CSA layer count and one on HCA.
 NEG_INF = float("-inf")
 V4_LIKE = [
-    StateField("csa_main_kv", 3, (8, 32), torch.float32),
-    StateField("csa_main_score", 3, (8, 32), torch.float32, fill=NEG_INF),
-    StateField("csa_idx_kv", 3, (8, 16), torch.float32),
-    StateField("csa_idx_score", 3, (8, 16), torch.float32, fill=NEG_INF),
-    StateField("hca_main_kv", 2, (128, 32), torch.float32),
-    StateField("hca_main_score", 2, (128, 32), torch.float32, fill=NEG_INF),
+    EntryField("csa_main_kv", 3, (8, 32), torch.float32),
+    EntryField("csa_main_score", 3, (8, 32), torch.float32, fill=NEG_INF),
+    EntryField("csa_idx_kv", 3, (8, 16), torch.float32),
+    EntryField("csa_idx_score", 3, (8, 16), torch.float32, fill=NEG_INF),
+    EntryField("hca_main_kv", 2, (128, 32), torch.float32),
+    EntryField("hca_main_score", 2, (128, 32), torch.float32, fill=NEG_INF),
 ]
 
 
-def build(fields=V4_LIKE, entries=5) -> StateArena:
-    return StateArena(fields, entries, device="cpu")
+def build(fields=V4_LIKE, entries=5) -> EntryMajorArena:
+    return EntryMajorArena(fields, entries, device="cpu")
 
 
 def carried_bytes(fields) -> int:
@@ -65,8 +70,8 @@ class TestEntryBytes:
 
     def test_pads_between_misaligned_fields(self):
         odd = [
-            StateField("a", 1, (3,), torch.float32),  # 12 B
-            StateField("b", 1, (3,), torch.float32),  # 12 B
+            EntryField("a", 1, (3,), torch.float32),  # 12 B
+            EntryField("b", 1, (3,), torch.float32),  # 12 B
         ]
         # Each field starts on its own 256 B boundary, and the entry as a
         # whole is rounded so entry i+1 starts aligned too.
@@ -169,11 +174,49 @@ class TestInitialFill:
         """Padding falls outside every field view, but an entry is copied
         whole by checkpointing and RDMA — so it must not be whatever the
         allocator last left there."""
-        arena = build([StateField("a", 1, (3,), torch.float32)], entries=2)
+        arena = build([EntryField("a", 1, (3,), torch.float32)], entries=2)
         assert arena.entry_bytes == 256  # 12 B of field, 244 B of padding
         arena.view("a").fill_(1.0)
         for i in range(arena.entries):
             assert (arena.entry(i)[12:] == 0).all()
+
+
+def test_carving_more_than_the_buffer_holds_is_refused():
+    """Python truncates an over-long slice instead of raising, so a short
+    buffer used to come back as a short last region and fail deeper in, as an
+    arena quoting its own field bytes -- a number the caller never chose."""
+    with pytest.raises(ValueError, match="cannot hold"):
+        carve(torch.zeros(300, dtype=torch.uint8), [256, 256])
+
+
+class TestALayerMajorArenaCannotFillSomeoneElsesBuffer:
+    """It is handed a buffer by two callers that want opposite things.
+
+    One is the runner's freshly zeroed paged allocation, where applying the
+    declared fill is right. The other is an IPC-imported pool that already
+    holds the peer's KV, where applying it would erase that. The arena cannot
+    tell which it got, so it refuses the only declaration where the answer
+    matters instead of picking one and being wrong half the time.
+    """
+
+    def test_a_zero_fill_field_is_fine(self):
+        """Which is every field a paged pool declares today -- the refusal
+        below costs nothing until someone adds one that is not."""
+        fields = [EntryField("k", 2, (4,), torch.float32)]
+        buf = torch.zeros(LayerMajorArena(fields, 3, device="cpu").total_bytes)
+
+        LayerMajorArena(fields, 3, device="cpu", buf=buf.to(torch.uint8))
+
+    def test_a_non_zero_fill_field_is_refused(self):
+        """Silently dropping it is the failure this replaces: a `-inf` score
+        plane arriving as 0.0 turns "never selected" into "always selected",
+        and no allocation or byte count is wrong."""
+        fields = [EntryField("score", 2, (4,), torch.float32, fill=NEG_INF)]
+        want = LayerMajorArena(fields, 3, device="cpu").total_bytes
+        buf = torch.zeros(want, dtype=torch.uint8)
+
+        with pytest.raises(ValueError, match="non-zero fill"):
+            LayerMajorArena(fields, 3, device="cpu", buf=buf)
 
 
 class TestMixedDtypes:
@@ -181,10 +224,10 @@ class TestMixedDtypes:
     def test_fields_may_differ_in_dtype(self):
         """GDN keeps its recurrent k and v in different dtypes."""
         fields = [
-            StateField("k", 2, (4, 8), torch.bfloat16),
-            StateField("v", 2, (4, 8), torch.float32),
+            EntryField("k", 2, (4, 8), torch.bfloat16),
+            EntryField("v", 2, (4, 8), torch.float32),
         ]
-        arena = StateArena(fields, 3, device="cpu")
+        arena = EntryMajorArena(fields, 3, device="cpu")
         assert arena.view("k").dtype == torch.bfloat16
         assert arena.view("v").dtype == torch.float32
         arena.view("k")[1, 2].fill_(1.5)
@@ -248,7 +291,7 @@ class TestPlanRegions:
 
         assert len(rope) == (layers if with_rope else 0)
         # The arena must clear every pool, which is the invariant that broke
-        # when `StateArena.view()` addressed from the host allocation's base.
+        # when `EntryMajorArena.view()` addressed from the host allocation's base.
         assert arena >= max(o + s for o, s in zip(offsets[:-1], sizes[:-1]))
         assert arena + arena_bytes <= total
         assert all(a < b for a, b in pairwise(kv))
@@ -268,7 +311,7 @@ class TestCarvedBuf:
     def _carve(head_bytes: int, entries: int = 5):
         want = entry_bytes_for(V4_LIKE) * entries
         host = torch.zeros(head_bytes + want, dtype=torch.uint8)
-        arena = StateArena(V4_LIKE, entries, device="cpu", buf=host[head_bytes:])
+        arena = EntryMajorArena(V4_LIKE, entries, device="cpu", buf=host[head_bytes:])
         return host, arena
 
     def test_views_start_inside_the_slice_not_at_the_host_base(self):
@@ -294,7 +337,7 @@ class TestCarvedBuf:
         want = entry_bytes_for(V4_LIKE) * 2
         host = torch.zeros(8 + want, dtype=torch.uint8)
         with pytest.raises(ValueError, match="boundary"):
-            StateArena(V4_LIKE, 2, device="cpu", buf=host[8:])
+            EntryMajorArena(V4_LIKE, 2, device="cpu", buf=host[8:])
 
     def test_carved_and_owned_agree_field_for_field(self):
         _, carved = self._carve(4096)
@@ -310,17 +353,44 @@ class TestCarvedBuf:
 
 class TestRejectsBadFieldLists:
 
-    def test_empty(self):
-        with pytest.raises(ValueError, match="at least one field"):
-            StateArena([], 4, device="cpu")
-
     def test_duplicate_names(self):
         dup = [
-            StateField("a", 1, (4,), torch.float32),
-            StateField("a", 1, (4,), torch.float32),
+            EntryField("a", 1, (4,), torch.float32),
+            EntryField("a", 1, (4,), torch.float32),
         ]
         with pytest.raises(ValueError, match="duplicate field names"):
-            StateArena(dup, 4, device="cpu")
+            EntryMajorArena(dup, 4, device="cpu")
+
+
+class TestAPlaneMayHoldNothing:
+    """`plan_field_planes` empties a plane whenever the fields fit in fewer,
+    which needs no unusual shape -- one field over two planes does it. The
+    plane still costs its rows and still has to answer at its index, so the
+    arena has to exist. Refusing it turned a legal layout into a startup
+    crash, and `carve_layer_major` has always allowed the layer-major
+    equivalent by dropping the group to None."""
+
+    def test_plan_field_planes_produces_one(self):
+        planes, _ = plan_field_planes(
+            [EntryField("a", 2, (4,), torch.float32)], [64, 64]
+        )
+        assert [] in planes
+
+    def test_such_a_plane_costs_an_entry_nothing(self):
+        arena = EntryMajorArena([], 4, device="cpu")
+        assert arena.entry_bytes == 0
+        assert arena.entry(0).numel() == 0
+
+    def test_it_still_spans_the_stride_its_rows_were_priced_at(self):
+        """The rows belong to the row space, not to this plane's fields, so a
+        caller's slot stride still has to be honored -- the next plane's
+        offsets are computed from it."""
+        arena = EntryMajorArena([], 4, device="cpu", slot_stride=512)
+        assert arena.buf.numel() == 3 * 512
+
+    def test_it_answers_no_field(self):
+        with pytest.raises(KeyError):
+            EntryMajorArena([], 4, device="cpu").view("a")
 
 
 # ── An arena strided by something bigger than itself ───────────────────────
@@ -334,7 +404,7 @@ class TestRejectsBadFieldLists:
 class TestSlotStride:
     def build(self, entries=5, live=None, stride=None):
         stride = stride or (entry_bytes_for(V4_LIKE) + 4 * 256)
-        return StateArena(
+        return EntryMajorArena(
             V4_LIKE, entries, device="cpu", slot_stride=stride, live_entries=live
         )
 
@@ -371,11 +441,11 @@ class TestSlotStride:
 
     def test_a_stride_under_one_entry_is_rejected(self):
         with pytest.raises(ValueError, match="under the"):
-            StateArena(V4_LIKE, 2, device="cpu", slot_stride=256)
+            EntryMajorArena(V4_LIKE, 2, device="cpu", slot_stride=256)
 
     def test_a_misaligned_stride_is_rejected(self):
         with pytest.raises(ValueError, match="multiple of"):
-            StateArena(
+            EntryMajorArena(
                 V4_LIKE, 2, device="cpu", slot_stride=entry_bytes_for(V4_LIKE) + 8
             )
 
@@ -451,7 +521,7 @@ class TestCheckpointRanges:
 
     def test_a_dropped_field_is_not_in_the_image(self):
         fields = self.without_hca()
-        arena = StateArena(fields, 5, device="cpu")
+        arena = EntryMajorArena(fields, 5, device="cpu")
 
         (start, nbytes), *rest = checkpoint_ranges_for(fields)
         assert not rest, "the four CSA fields are adjacent, so they merge"
@@ -463,11 +533,11 @@ class TestCheckpointRanges:
     def test_a_dropped_field_breaks_the_run_it_sits_in(self):
         """Merging across it would put it back in the image."""
         fields = [
-            StateField("a", 1, (4, 8), torch.float32),
-            StateField("dead", 1, (64, 8), torch.float32, in_checkpoint=False),
-            StateField("b", 1, (4, 8), torch.float32),
+            EntryField("a", 1, (4, 8), torch.float32),
+            EntryField("dead", 1, (64, 8), torch.float32, in_checkpoint=False),
+            EntryField("b", 1, (4, 8), torch.float32),
         ]
-        arena = StateArena(fields, 2, device="cpu")
+        arena = EntryMajorArena(fields, 2, device="cpu")
         dead_start = arena.field_offset("dead")
         dead_end = dead_start + fields[1].bytes_per_entry
 
@@ -499,7 +569,7 @@ class TestCheckpointRanges:
     def test_the_ranges_land_where_the_arena_put_the_fields(self):
         """Sizing and the copy have to read one layout, not two."""
         fields = self.without_hca()
-        arena = StateArena(fields, 5, device="cpu")
+        arena = EntryMajorArena(fields, 5, device="cpu")
 
         carried = [f for f in fields if f.in_checkpoint]
         (start, nbytes), *rest = checkpoint_ranges_for(fields)
@@ -509,7 +579,7 @@ class TestCheckpointRanges:
         assert start + nbytes == arena.field_offset(last.name) + last.bytes_per_entry
 
     def test_a_wholly_dropped_entry_has_no_ranges(self):
-        fields = [StateField("dead", 1, (8, 8), torch.float32, in_checkpoint=False)]
+        fields = [EntryField("dead", 1, (8, 8), torch.float32, in_checkpoint=False)]
 
         assert checkpoint_ranges_for(fields) == []
         assert carried_bytes(fields) == 0
@@ -522,8 +592,8 @@ class TestCheckpointRanges:
         size, cross-check and start cleanly, then abort mid-serving on the
         first request to cross a rung.
         """
-        empty = StateField("no_layers", 0, (4, 4), torch.float32)
-        dead = StateField("dead", 1, (8, 8), torch.float32, in_checkpoint=False)
+        empty = EntryField("no_layers", 0, (4, 4), torch.float32)
+        dead = EntryField("dead", 1, (8, 8), torch.float32, in_checkpoint=False)
 
         assert checkpoint_ranges_for([empty]) == []
         # Between two dropped fields it is a run of its own, so nothing merges

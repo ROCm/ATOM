@@ -488,7 +488,9 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                     cu_seq_lens=prefill_metadata.chunked_context.padded_local_cu_seq_lens[
                         i
                     ],
-                    token_to_seq=prefill_metadata.chunked_context.padded_local_token_to_seq[
+                    # vLLM's parameter name -- NOT ours. Do not sweep it along
+                    # when renaming the ATOM-side spelling.
+                    token_to_seq=prefill_metadata.chunked_context.padded_local_batch_id_per_k_token[
                         i
                     ],
                     num_tokens=toks,
@@ -603,7 +605,8 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 dst=workspace,
                 block_table=prefill_metadata.block_table,
                 cu_seq_lens=prefill_metadata.chunked_context.cu_seq_lens[i],
-                token_to_seq=prefill_metadata.chunked_context.token_to_seq[i],
+                # vLLM's parameter name -- NOT ours (see the DCP call above).
+                token_to_seq=prefill_metadata.chunked_context.batch_id_per_k_token[i],
                 num_tokens=prefill_metadata.chunked_context.chunk_total_token[i],
                 kv_cache_dtype=self.kv_cache_dtype,
                 scale=k_scale,

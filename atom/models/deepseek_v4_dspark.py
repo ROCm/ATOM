@@ -42,7 +42,7 @@ Checkpoint layout (DeepSeek-V4-Pro-DSpark):
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from torch import nn
@@ -257,7 +257,7 @@ def _count_dspark_stages(model_path, default: int = 0) -> int:
     try:
         with open(idx_path) as f:
             weight_map = json.load(f)["weight_map"]
-    except Exception:
+    except Exception:  # noqa: BLE001 -- a probe: any unreadable index means "no"
         return default
     stages = set()
     for name in weight_map:
@@ -408,7 +408,7 @@ def _dspark_block_sparse_attention_torch(
     Kept as a kernel-free, inspectable reference. The production path
     (``_dspark_block_sparse_attention``) dispatches to the fused flash kernel.
     """
-    B, T, H, D = q.shape
+    B, T, H, _ = q.shape
     W = kv.shape[1] - T
     # Scores: [B, H, T, W+T]  (broadcast single KV head over H query heads).
     scores = torch.einsum("bthd,bsd->bhts", q.float(), kv.float()) * scale
@@ -514,7 +514,7 @@ try:
     )
 
     _ATOM_V4_AVAILABLE = True
-except Exception:  # pragma: no cover - exercised only in the stubbed test sandbox
+except Exception:  # noqa: BLE001  # pragma: no cover - stubbed test sandbox only
     _ATOM_V4_AVAILABLE = False
     Block = object  # type: ignore
 
@@ -848,7 +848,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
             swa_nope_scale_buff=a.swa_plane if use_fp8 else None,
             swa_rope_buff=a.swa_plane_rope if use_fp8 else None,
             swa_dest_rows=draft_rows if use_fp8 else None,
-            batch_id_per_token=batch_ids if use_fp8 else None,
+            batch_id_per_q_token=batch_ids if use_fp8 else None,
             prefix=f"{a.layer_name}.dspark_qk_norm_rope",
         )
 
@@ -997,11 +997,11 @@ class DeepseekV4DSpark(DSparkDraftModel):
         from atom.model_loader.loader import WeightsMapper
 
         weights_mapper = WeightsMapper(orig_to_new_prefix={"mtp.": "model.mtp."})
-    weights_mapping = {
+    weights_mapping: ClassVar[dict[str, str]] = {
         ".gate.bias": ".gate.e_score_correction_bias",
         ".scale": ".weight_scale_inv",
     }
-    packed_modules_mapping = {
+    packed_modules_mapping: ClassVar[dict[str, tuple[str, int]]] = {
         "attn.wq_a": ("attn.wqkv_a", 0),
         "attn.wkv": ("attn.wqkv_a", 1),
         "compressor.wkv": ("compressor.wkv_gate", 0),

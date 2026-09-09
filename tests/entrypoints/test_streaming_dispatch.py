@@ -71,8 +71,8 @@ def test_incremental_detokenizer_holds_incomplete_utf8():
 def test_dispatcher_batches_direct_and_tagged_chunks_per_loop():
     dispatcher = StreamBatchDispatcher(_Utf8ByteTokenizer())
     loop = _ImmediateLoop()
-    direct_queue = asyncio.Queue()
-    tagged_queue = asyncio.Queue()
+    direct_queue = StreamOutputCollector("direct")
+    tagged_queue = StreamOutputCollector("fanout")
 
     dispatcher.enqueue(
         loop=loop,
@@ -90,8 +90,8 @@ def test_dispatcher_batches_direct_and_tagged_chunks_per_loop():
     dispatcher.flush()
 
     assert len(loop.calls) == 1
-    assert direct_queue.get_nowait()["text"] == "A"
-    sibling_index, chunk = tagged_queue.get_nowait()
+    assert _resolve(direct_queue.get())["text"] == "A"
+    sibling_index, chunk = _resolve(tagged_queue.get())
     assert sibling_index == 0
     assert chunk["text"] == "B"
 
@@ -99,7 +99,7 @@ def test_dispatcher_batches_direct_and_tagged_chunks_per_loop():
 def test_dispatcher_keeps_fanout_detokenizer_state_separate():
     dispatcher = StreamBatchDispatcher(_Utf8ByteTokenizer())
     loop = _ImmediateLoop()
-    queue = asyncio.Queue()
+    queue = StreamOutputCollector("fanout")
     sibling_0, sibling_1 = dispatcher.new_state(), dispatcher.new_state()
 
     dispatcher.enqueue(
@@ -118,8 +118,8 @@ def test_dispatcher_keeps_fanout_detokenizer_state_separate():
     )
     dispatcher.flush()
 
-    assert queue.get_nowait()[1]["text"] == ""
-    assert queue.get_nowait()[1]["text"] == "X"
+    assert _resolve(queue.get())[1]["text"] == ""
+    assert _resolve(queue.get())[1]["text"] == "X"
 
     # Sibling 0's half character survives sibling 1 finishing in between.
     dispatcher.enqueue(
@@ -131,46 +131,63 @@ def test_dispatcher_keeps_fanout_detokenizer_state_separate():
     )
     dispatcher.flush()
 
-    assert queue.get_nowait()[1]["text"] == "你"
+    assert _resolve(queue.get())[1]["text"] == "你"
 
 
 def test_a_fresh_stream_does_not_inherit_a_half_decoded_character():
-    """Each stream's detokenizer is its own object, so bytes cannot leak over."""
+    """Two fresh states in the same batch cannot share a partial character."""
     dispatcher = StreamBatchDispatcher(_Utf8ByteTokenizer())
     loop = _ImmediateLoop()
-    queue = asyncio.Queue()
-
-    for _ in range(2):
-        dispatcher.enqueue(
-            loop=loop,
-            collector=queue,
-            state=dispatcher.new_state(),
-            chunk={"token_ids": [0xE4], "finished": False},
-        )
+    partial = StreamOutputCollector("partial")
+    fresh = StreamOutputCollector("fresh")
+    partial_state = dispatcher.new_state()
+    dispatcher.enqueue(
+        loop=loop,
+        collector=partial,
+        state=partial_state,
+        chunk={"token_ids": [0xE4], "finished": False},
+    )
+    dispatcher.enqueue(
+        loop=loop,
+        collector=fresh,
+        state=dispatcher.new_state(),
+        chunk={"token_ids": [ord("A")], "finished": True},
+    )
     dispatcher.flush()
 
-    for _ in range(2):
-        dispatcher.enqueue(
-            loop=loop,
-            collector=queue,
-            state=dispatcher.new_state(),
-            chunk={"token_ids": [ord("A")], "finished": True},
-        )
+    assert len(loop.calls) == 1
+    assert _resolve(partial.get())["text"] == ""
+    assert _resolve(fresh.get())["text"] == "A"
+    dispatcher.enqueue(
+        loop=loop,
+        collector=partial,
+        state=partial_state,
+        chunk={"token_ids": [0xBD, 0xA0], "finished": True},
+    )
     dispatcher.flush()
-
-    assert queue.get_nowait()["text"] == ""
-    assert queue.get_nowait()["text"] == ""
-    assert queue.get_nowait()["text"] == "A"
-    assert queue.get_nowait()["text"] == "A"
+    assert _resolve(partial.get())["text"] == "你"
 
 
-def test_collector_hands_over_a_lone_chunk_untouched():
-    """A consumer that keeps up must see exactly what the queue used to give."""
+def test_collector_decodes_a_lone_chunk_without_waiting_for_more():
+    """The shipped dispatcher path is immediately readable without a timer."""
+    tokenizer = _CountingTokenizer()
+    dispatcher = StreamBatchDispatcher(tokenizer)
     collector = StreamOutputCollector("request-1")
-    chunk = {"token_ids": [1], "text": "a", "finished": False}
-    collector.put_nowait(chunk)
+    dispatcher.enqueue(
+        loop=_ImmediateLoop(),
+        collector=collector,
+        state=dispatcher.new_state(),
+        chunk={"token_ids": [ord("a")], "finished": False},
+    )
+    dispatcher.flush()
 
-    assert _resolve(collector.get()) is chunk
+    assert tokenizer.calls == 0
+    assert _resolve(collector.get()) == {
+        "token_ids": [ord("a")],
+        "text": "a",
+        "finished": False,
+    }
+    assert tokenizer.calls == 2
 
 
 def test_collector_merges_a_backlog_into_one_chunk():
@@ -312,6 +329,7 @@ def test_a_step_is_delivered_in_a_single_loop_callback():
         )
     dispatcher.flush()
 
+    assert len(loop.pending) == 1
     assert loop.run() == 1
     for collector in collectors:
         assert _resolve(collector.get())["text"] == "A"
@@ -408,23 +426,14 @@ def test_merge_keeps_the_text_it_had_when_the_delta_is_not_a_string():
 
 
 def test_dispatcher_keeps_no_per_stream_state():
-    """The dispatcher must stay stateless between streams.
-
-    Detokenizers used to live in a dict here: first behind a lock that cost 27%
-    of the API server's CPU, then lock-free with an index two threads had to
-    keep in agreement and teardown had to remember to clear -- draining 8192
-    streams cost 894 ms of scanning, and a missed removal leaked a detokenizer
-    whose token list grows without bound. Now each one belongs to the engine
-    callback that feeds it, so there is nothing here to leak or to race on.
-    """
+    """Finished callbacks may go away while collectors still own unread state."""
     dispatcher = StreamBatchDispatcher(_Utf8ByteTokenizer())
     loop = _ImmediateLoop()
-    queue = asyncio.Queue()
-
-    for _ in range(64):
+    collectors = [StreamOutputCollector(str(i)) for i in range(64)]
+    for collector in collectors:
         dispatcher.enqueue(
             loop=loop,
-            collector=queue,
+            collector=collector,
             state=dispatcher.new_state(),
             chunk={"token_ids": [ord("A")], "finished": True},
         )
@@ -435,6 +444,8 @@ def test_dispatcher_keeps_no_per_stream_state():
         "synthetic_text",
         "_thread_local",
     }
+    for collector in collectors:
+        assert _resolve(collector.get())["text"] == "A"
 
 
 def test_each_stream_gets_its_own_detokenizer():
@@ -444,3 +455,233 @@ def test_each_stream_gets_its_own_detokenizer():
 
     assert first is not second
     assert not first.tokens and not second.tokens
+
+
+class _CountingTokenizer(_Utf8ByteTokenizer):
+    def __init__(self):
+        self.calls = 0
+
+    def decode(self, token_ids, skip_special_tokens=True):
+        self.calls += 1
+        return super().decode(token_ids, skip_special_tokens)
+
+
+def test_backlogged_tokens_are_merged_before_decoding():
+    tokenizer = _CountingTokenizer()
+    dispatcher = StreamBatchDispatcher(tokenizer)
+    loop = _RecordingLoop()
+    collector = StreamOutputCollector("slow-reader")
+    state = dispatcher.new_state()
+    payload = ("你好 🎉 " * 40).encode()
+    for i, byte in enumerate(payload):
+        dispatcher.enqueue(
+            loop=loop,
+            collector=collector,
+            state=state,
+            chunk={
+                "token_ids": [byte],
+                "finished": i == len(payload) - 1,
+                "finish_reason": "length" if i == len(payload) - 1 else None,
+                "num_cached_tokens": 7 if i == 0 else 0,
+            },
+        )
+        dispatcher.flush()
+    loop.run()
+
+    # Producers and delivery callbacks must not spend time decoding a backlog
+    # the consumer will fold into a single response anyway.
+    assert tokenizer.calls == 0
+    chunk = _resolve(collector.get())
+    assert chunk["text"] == payload.decode()
+    assert chunk["token_ids"] == list(payload)
+    assert chunk["finished"] is True
+    assert chunk["finish_reason"] == "length"
+    assert chunk["num_cached_tokens"] == 7
+    assert "_detokenizer" not in chunk
+    assert tokenizer.calls <= 2
+
+
+def test_deferred_decode_keeps_fanout_and_partial_unicode_separate():
+    dispatcher = StreamBatchDispatcher(_Utf8ByteTokenizer())
+    loop = _ImmediateLoop()
+    collector = StreamOutputCollector("fanout")
+    states = [dispatcher.new_state(), dispatcher.new_state()]
+
+    def send(tag, ids, finished=False):
+        dispatcher.enqueue(
+            loop=loop,
+            collector=collector,
+            state=states[tag],
+            chunk={"token_ids": ids, "finished": finished},
+            tag=tag,
+        )
+        dispatcher.flush()
+
+    send(0, [0xE4])
+    assert _resolve(collector.get())[1]["text"] == ""
+    send(1, list(b"other"), True)
+    send(0, [0xBD])
+    send(0, [0xA0], True)
+    assert _resolve(collector.get()) == (
+        1,
+        {"token_ids": list(b"other"), "text": "other", "finished": True},
+    )
+    assert _resolve(collector.get()) == (
+        0,
+        {"token_ids": [0xBD, 0xA0], "text": "你", "finished": True},
+    )
+
+
+def test_deferred_synthetic_stream_preserves_token_count():
+    tokenizer = _CountingTokenizer()
+    dispatcher = StreamBatchDispatcher(tokenizer, synthetic_text="synthetic ")
+    loop = _ImmediateLoop()
+    collector = StreamOutputCollector("synthetic")
+    state = dispatcher.new_state()
+    for byte in b"abc":
+        dispatcher.enqueue(
+            loop=loop,
+            collector=collector,
+            state=state,
+            chunk={"token_ids": [byte], "finished": byte == ord("c")},
+        )
+        dispatcher.flush()
+    assert tokenizer.calls == 0
+    chunk = _resolve(collector.get())
+    assert chunk["text"] == "synthetic " * 3
+    assert chunk["token_ids"] == list(b"abc")
+    assert chunk["finished"] is True
+    assert tokenizer.calls == 2  # one real update for three accumulated tokens
+
+
+def test_concurrent_output_threads_preserve_stream_contents_and_termination():
+    async def scenario():
+        dispatcher = StreamBatchDispatcher(_Utf8ByteTokenizer())
+        loop = asyncio.get_running_loop()
+        collectors = [StreamOutputCollector(str(i)) for i in range(16)]
+        states = [dispatcher.new_state() for _ in collectors]
+        payloads = [(f"stream {i}: 你好 🎉 " * 5).encode() for i in range(16)]
+
+        def produce(rank):
+            for step in range(max(map(len, payloads))):
+                for i in range(rank, len(collectors), 4):
+                    if step >= len(payloads[i]):
+                        continue
+                    dispatcher.enqueue(
+                        loop=loop,
+                        collector=collectors[i],
+                        state=states[i],
+                        chunk={
+                            "token_ids": [payloads[i][step]],
+                            "finished": step == len(payloads[i]) - 1,
+                        },
+                    )
+                dispatcher.flush()
+
+        async def consume(i):
+            text = ""
+            tokens = []
+            while True:
+                chunk = await collectors[i].get()
+                text += chunk["text"]
+                tokens.extend(chunk["token_ids"])
+                if chunk["finished"]:
+                    break
+                await asyncio.sleep(0)
+            assert text == payloads[i].decode()
+            assert tokens == list(payloads[i])
+            assert not collectors[i]._pending
+
+        await asyncio.wait_for(
+            asyncio.gather(
+                *(asyncio.to_thread(produce, rank) for rank in range(4)),
+                *(consume(i) for i in range(len(collectors))),
+            ),
+            timeout=5,
+        )
+
+    asyncio.run(scenario())
+
+
+class _FailOnceTokenizer(_CountingTokenizer):
+    def __init__(self, fail_on):
+        super().__init__()
+        self.fail_on = fail_on
+
+    def decode(self, token_ids, skip_special_tokens=True):
+        if self.calls + 1 == self.fail_on:
+            self.calls += 1
+            raise ValueError("injected decode failure")
+        return super().decode(token_ids, skip_special_tokens)
+
+
+@pytest.mark.parametrize("fail_on", (3, 4), ids=("prefix", "new-text"))
+def test_decode_failure_keeps_tokens_for_a_later_update(fail_on, caplog):
+    # Each update decodes the prefix and then the new text. Either call can
+    # fail after tokens.extend(), before the prefix/read offsets advance.
+    dispatcher = StreamBatchDispatcher(_FailOnceTokenizer(fail_on))
+    collector = StreamOutputCollector("recoverable")
+    state = dispatcher.new_state()
+    loop = _ImmediateLoop()
+
+    def send(byte, finished=False):
+        dispatcher.enqueue(
+            loop=loop,
+            collector=collector,
+            state=state,
+            chunk={"token_ids": [byte], "finished": finished},
+        )
+        dispatcher.flush()
+        return _resolve(collector.get())
+
+    assert send(ord("A"))["text"] == "A"
+    failed = send(ord("B"))
+    assert failed == {"token_ids": [ord("B")], "text": "", "finished": False}
+    recovered = send(ord("C"), finished=True)
+    assert recovered == {"token_ids": [ord("C")], "text": "BC", "finished": True}
+    assert list(state.tokens) == list(b"ABC")
+    assert "Error detokenizing stream recoverable (tag=None)" in caplog.text
+    assert "injected decode failure" in caplog.text
+
+
+@pytest.mark.parametrize("fail_on", (1, 2), ids=("prefix", "new-text"))
+def test_failed_terminal_decode_preserves_metadata_and_fanout(fail_on, caplog):
+    dispatcher = StreamBatchDispatcher(_FailOnceTokenizer(fail_on))
+    collector = StreamOutputCollector("fanout-error")
+    loop = _ImmediateLoop()
+    states = [dispatcher.new_state(), dispatcher.new_state()]
+    for tag, ids, finished in ((0, [65], False), (0, [66], True), (1, [90], True)):
+        dispatcher.enqueue(
+            loop=loop,
+            collector=collector,
+            state=states[tag],
+            chunk={
+                "token_ids": ids,
+                "finished": finished,
+                "finish_reason": "length" if finished else None,
+                "num_cached_tokens": 7,
+                "kv_transfer_params": {"source": "prefill"},
+            },
+            tag=tag,
+        )
+    dispatcher.flush()
+
+    tag, failed = _resolve(collector.get())
+    assert tag == 0
+    assert failed == {
+        "token_ids": [65, 66],
+        "text": "",
+        "finished": True,
+        "finish_reason": "length",
+        "num_cached_tokens": 7,
+        "kv_transfer_params": {"source": "prefill"},
+    }
+    tag, healthy = _resolve(collector.get())
+    assert tag == 1
+    assert healthy["text"] == "Z"
+    assert healthy["token_ids"] == [90]
+    assert healthy["finished"] is True
+    assert not collector._pending
+    assert not collector._ready.is_set()
+    assert "Error detokenizing stream fanout-error (tag=0)" in caplog.text
+    assert "injected decode failure" in caplog.text
