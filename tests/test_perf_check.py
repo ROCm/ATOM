@@ -538,8 +538,8 @@ def test_main_side_drift_is_reported_apart_from_the_verdict(tmp_path):
     # The PR itself is clean, and the drift does not change that.
     assert report["verdict"] == "clean"
     body = pj.render(report, "")
-    assert "not caused by this PR" in body
-    assert "Main-side context" in body
+    assert "<details>" in body
+    assert "Sliding on main" in body
 
 
 def test_drift_needs_tpot_to_mirror(tmp_path):
