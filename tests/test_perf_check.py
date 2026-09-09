@@ -87,6 +87,7 @@ def write_pair(tmp_path, spec, concs=ALL_CONCS, drop=()):
             base_value = BASE_TPUT[model] * (0.6 if conc < 64 else 1.0)
             delta = entry.get("per_conc", {}).get(conc, entry.get("tput", 0.0))
             tpot_delta = entry.get("tpot", 0.0)
+            ttft_delta = entry.get("ttft", 0.0)
 
             name = f"{model}-8192-1024-{conc}-0.8.json"
             (base_dir / name).write_text(
@@ -101,6 +102,7 @@ def write_pair(tmp_path, spec, concs=ALL_CONCS, drop=()):
                         conc,
                         base_value * (1 + delta / 100),
                         30.0 * (1 + tpot_delta / 100),
+                        420.0 * (1 + ttft_delta / 100),
                     )
                 )
             )
@@ -154,6 +156,35 @@ def test_drop_without_tpot_mirroring_does_not_trip(tmp_path):
     kimi = next(f for f in report["families"] if f["model"] == "Kimi-K3")
     assert kimi["status"] == "clean"
     assert kimi["mirror"] is False
+
+
+def test_queueing_regression_trips_via_ttft(tmp_path):
+    """Throughput down while requests queue is a regression, even as TPOT falls.
+
+    Measured on MI308 with max_num_seqs capped at 16: -29% throughput, TTFT
+    +495%, TPOT -78%. Capping how many requests run at once makes each served
+    request faster while the queue behind it grows, so a gate that demanded
+    TPOT rise called a 29% capacity loss `unclear` and reported nothing.
+    """
+    spec = flat(tput=-0.4, tpot=-0.1)
+    spec["Kimi-K3"] = {"tput": -29.3, "tpot": -77.8, "ttft": 494.8}
+    report = run_judge(tmp_path, spec)
+    assert report["verdict"] == "regression"
+    kimi = next(f for f in report["families"] if f["model"] == "Kimi-K3")
+    assert kimi["status"] == "triggered"
+    assert kimi["mirror"] is True
+    assert kimi["mirror_via"] == "TTFT"
+
+
+def test_drop_with_neither_latency_moving_does_not_trip(tmp_path):
+    """Widening the gate to TTFT must not turn it into no gate at all."""
+    spec = flat(tput=-0.4, tpot=-0.1)
+    spec["Kimi-K3"] = {"tput": -4.0, "tpot": 0.5, "ttft": 0.2}
+    report = run_judge(tmp_path, spec)
+    assert report["verdict"] == "clean"
+    kimi = next(f for f in report["families"] if f["model"] == "Kimi-K3")
+    assert kimi["mirror"] is False
+    assert kimi["mirror_via"] is None
 
 
 # ------------------------------------------------- incomplete data is not a pass ---
