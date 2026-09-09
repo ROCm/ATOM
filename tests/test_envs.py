@@ -102,7 +102,7 @@ class TestEnvsDefaults:
         assert _get_envs().ATOM_ENABLE_GDN_DECODE_LOSSY_FAST is False
 
     def test_use_flydsl_gather_kv_b_proj_default(self):
-        assert _get_envs().ATOM_USE_FLYDSL_GATHER_KV_B_PROJ is False
+        assert _get_envs().ATOM_USE_FLYDSL_GATHER_KV_B_PROJ is True
 
     def test_unknown_attr_raises(self):
         with pytest.raises(AttributeError):
@@ -170,9 +170,11 @@ class TestEnvsOverrides:
         monkeypatch.setenv("ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", "1")
         assert _get_envs().ATOM_ENABLE_GDN_DECODE_LOSSY_FAST is True
 
-    def test_use_flydsl_gather_kv_b_proj_enabled(self, monkeypatch):
-        monkeypatch.setenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "1")
-        assert _get_envs().ATOM_USE_FLYDSL_GATHER_KV_B_PROJ is True
+    def test_use_flydsl_gather_kv_b_proj_disabled(self, monkeypatch):
+        # The interesting lever now that the default is on: "1" would pass even
+        # against a hard-coded True, so assert the opt-out instead.
+        monkeypatch.setenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "0")
+        assert _get_envs().ATOM_USE_FLYDSL_GATHER_KV_B_PROJ is False
 
     def test_use_flydsl_gather_kv_b_proj_only_one_enables(self, monkeypatch):
         monkeypatch.setenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "true")

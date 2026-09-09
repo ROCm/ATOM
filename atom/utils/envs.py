@@ -107,12 +107,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_FUSED_COMPRESS_USE_FLYDSL", "auto"
     ).lower(),
     # gather_kv_b_proj (the MLA cached-prefix expansion): swap the Triton op for
-    # the flydsl a8w8 gather-GEMM. The flydsl backend only covers page_size-1 fp8
-    # KV with an fp8 per-output-row-scaled weight and 128-wide nope/v halves on
-    # gfx950 -- i.e. Kimi-K3 / DeepSeek MLA under --kv-cache-dtype fp8 +
-    # ptpc_fp8. Any other shape falls back to Triton with a one-time warning.
+    # the flydsl a8w8 gather-GEMM.
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ": lambda: (
-        os.getenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "0") == "1"
+        os.getenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "1") == "1"
     ),
     # QK-norm-rope-cache-quant fusion for Qwen3 dense and MoE; disabled by default.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
