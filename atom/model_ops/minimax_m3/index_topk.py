@@ -47,12 +47,14 @@ SCORE_CHUNK_CTAS_PER_CU = 8
 # short-context rows, which is not where a step spends its time.
 SCORE_NUM_STAGES = 3
 DECODE_SCORE_NUM_STAGES = 3
-# Bounds on the decode score split (_decode_score_chunks). MIN_BLOCKS is the
-# only one that binds; the other two are kept as escape hatches. A flat chunk
-# ceiling cannot work -- the best count depends on the context length, while
-# the best blocks per chunk is 2-4 across 32K/131K/315K.
-DECODE_SCORE_TARGET_GRID = 1 << 20
-DECODE_SCORE_MAX_CHUNKS = 1 << 16
+# Bounds on the decode score split, one per end of the batch range. MIN_BLOCKS
+# floors the blocks a chunk walks -- the query tile is loaded once outside the
+# block loop, so at one block per chunk that fixed cost is the whole cost.
+# TARGET_GRID caps total workgroups, which MIN_BLOCKS alone cannot: it ignores
+# batch, so the grid grows without limit (275 us at batch 128 vs 202 capped).
+# Both are fits, not derivations -- the best (batch x chunks) runs 8k-44k over
+# batch 16-128, and 1<<14 stays within 5% of the per-batch optimum there.
+DECODE_SCORE_TARGET_GRID = 1 << 14
 DECODE_SCORE_MIN_BLOCKS = 3
 # Physical 16-pages per logical 128-block for the page-16 SHUFFLE ASM/gluon cache
 # (must match sparse_attn.PAGES_PER_SPARSE_BLOCK). Used by the fused block-table
@@ -395,7 +397,8 @@ def _decode_score_chunks(batch: int, max_block: int) -> int:
     A count, not a size: the grid is (request, chunk), so this IS the second
     grid dim and it must stay shape-constant for a cuda graph to replay it.
     Enough chunks that a long context is not serialized inside a handful of
-    CTAs, capped so a large batch does not multiply into a pointless grid.
+    CTAs, floored so no chunk shrinks to a single block -- DECODE_SCORE_MIN_BLOCKS
+    is what bounds the split, and TARGET_GRID still caps the largest batches.
 
     The round trip through the size is not redundant. The caller turns this
     count back into a size with the same cdiv, and a count that does not divide
@@ -405,9 +408,7 @@ def _decode_score_chunks(batch: int, max_block: int) -> int:
     chunk non-empty, and both are still pure functions of launch-time bounds,
     so a cuda graph replays the grid it captured.
     """
-    target = max(
-        1, min(DECODE_SCORE_MAX_CHUNKS, DECODE_SCORE_TARGET_GRID // max(1, batch))
-    )
+    target = max(1, DECODE_SCORE_TARGET_GRID // max(1, batch))
     if max_block <= 0:
         # A grid dim still has to be positive. Capping `chunks` is not enough:
         # the round trip below divides by its own inner `cdiv`, zero here, and

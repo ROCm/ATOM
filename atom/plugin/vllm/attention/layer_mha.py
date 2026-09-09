@@ -9,13 +9,11 @@ from torch import nn
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
 from atom.config import get_current_atom_config
-from atom.model_ops.attention_mha import (
-    PA_ASM_MAX_QUERY_GROUP_SIZE,
-    gluon_decode_over_limit,
-)
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import (
+    PA_ASM_MAX_QUERY_GROUP_SIZE,
     cp_mha_gather_cache,
+    gluon_decode_over_limit,
     run_pa_decode_gluon,
     run_pa_fwd_asm,
 )
@@ -146,7 +144,11 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             if cache_dtype == "fp8"
             else 1.0
         )
-        self.kv_scale = torch.tensor(self.kv_scale_float, dtype=torch.float32)
+        # On device: this is aliased into self.per_tensor_scale and reaches
+        # fused_qk_rope_reshape_and_cache, which dereferences it in the kernel.
+        self.kv_scale = torch.tensor(
+            self.kv_scale_float, dtype=torch.float32, device=self.device
+        )
         self.per_token_quant = True
         self.sinks = sinks
         self.sliding_window = (
@@ -424,8 +426,11 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         # the max_qlen multiplier — mirroring server-mode `paged_attention_triton`.
         _, num_q_heads_total, head_size = q.shape
         _, num_kv_heads, _, _, _ = k_cache.shape
+        # Only reached through _dispatch_decode_backend, which asserts
+        # decode_metadata is present and reads the same field to pick this
+        # function -- so no default, and one read per step rather than two.
         decode_metadata = attn_metadata.decode_metadata
-        max_qlen = decode_metadata.max_query_len if decode_metadata is not None else 1
+        max_qlen = decode_metadata.max_query_len
         assert num_q_heads_total % num_kv_heads == 0
 
         seq_lens = attn_metadata.seq_lens[:num_decodes]
@@ -512,11 +517,11 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         attn_metadata: "AiterMhaMetadataForVllm",
         out: torch.Tensor,
     ):
+        # Same as paged_attention_triton: only reached through the decode
+        # dispatcher, which has already asserted decode_metadata is present.
         decode_metadata = attn_metadata.decode_metadata
-        max_qlen = decode_metadata.max_query_len if decode_metadata is not None else 1
-        qo_indptr = (
-            decode_metadata.query_start_loc if decode_metadata is not None else None
-        )
+        max_qlen = decode_metadata.max_query_len
+        qo_indptr = decode_metadata.query_start_loc
         run_pa_fwd_asm(
             q=q,
             k_cache=k_cache,
