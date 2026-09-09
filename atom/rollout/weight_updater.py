@@ -17,6 +17,19 @@ _EXPERT_BUFFER_SHARDS = {
     "w2_weight": frozenset({"w2"}),
 }
 
+# A trainer whose transformers keeps MoE experts fused sends one 3D tensor per
+# layer instead of three per expert: (E, 2I, H) gate_up_proj and (E, H, I)
+# down_proj. Same buffers, same dim order, w13's first half along the
+# intermediate dim being the gate projection -- only the leaf name differs.
+# Accepting both means a caller does not have to know which convention ATOM
+# happens to use, nor pre-apply the kernel layout on ATOM's behalf.
+_FUSED_EXPERT_LEAVES = {
+    "gate_up_proj": ("w13_weight", ("w1", "w3")),
+    "down_proj": ("w2_weight", ("w2",)),
+}
+
+_EXPERTS_PREFIX_SUFFIX = ".experts"
+
 
 class WeightUpdaterMixin:
     """Mixin providing weight update capabilities for ModelRunner.
@@ -223,6 +236,10 @@ class WeightUpdaterMixin:
         Returns 'updated' or 'skipped'. Never 'updated' for a combination
         this path does not implement: see _check_expert_sync_supported.
         """
+        fused = self._apply_fused_expert_weight(name, tensor, param_to_module)
+        if fused != "skipped":
+            return fused
+
         for (
             weight_name_part,
             param_name_part,
@@ -255,6 +272,67 @@ class WeightUpdaterMixin:
             arrived.setdefault(expert_id, set()).add(shard_id)
             return "updated"
         return "skipped"
+
+    def _apply_fused_expert_weight(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        param_to_module: dict,
+    ) -> str:
+        """Route a trainer's fused 3D expert tensor into the same buffers.
+
+        One (E, 2I, H) ``...experts.gate_up_proj`` covers every expert and both
+        halves of w13, so it is driven through ``weight_loader`` once per half:
+        a 3D ``loaded_weight`` puts the loader on its full-load path, where the
+        expert dimension is written whole and the intermediate dimension is
+        still narrowed by TP rank.
+
+        Returns 'updated' or 'skipped'.
+        """
+        prefix, _, leaf = name.rpartition(".")
+        entry = _FUSED_EXPERT_LEAVES.get(leaf)
+        if entry is None or not prefix.endswith(_EXPERTS_PREFIX_SUFFIX):
+            return "skipped"
+        atom_leaf, shard_ids = entry
+        atom_name = f"{prefix}.{atom_leaf}"
+        if atom_name not in param_to_module:
+            return "skipped"
+        module, param_name, param = param_to_module[atom_name]
+        weight_loader = getattr(module, "weight_loader", None)
+        if not callable(weight_loader):
+            return "skipped"
+
+        self._check_expert_sync_supported(
+            name, atom_name, param_name, module, param, tensor
+        )
+        if tensor.dim() != 3:
+            raise NotImplementedError(
+                f"{self.label}: {name} resolves to the fused expert buffer "
+                f"{atom_name}, which needs a 3D (experts, out, in) tensor; got "
+                f"{tuple(tensor.shape)}."
+            )
+
+        gpu = tensor.to(device=self.device)
+        # Split w13's gate and up halves along the intermediate dim, the way
+        # the buffer stacks them. w2 arrives whole. Views, not copies: the
+        # loader's copy handles a strided source, and materialising these
+        # would double the largest tensor in the sync.
+        for shard_id, chunk in zip(shard_ids, gpu.chunk(len(shard_ids), dim=1)):
+            weight_loader(
+                param,
+                chunk,
+                # _copy_expert_shard dispatches on the name containing
+                # "weight"; the fused leaf names do not, so hand it the
+                # resolved ATOM name.
+                weight_name=atom_name,
+                shard_id=shard_id,
+                expert_id=0,
+            )
+        # One tensor covers every expert, so every slice of the buffer is new.
+        arrived = self._pending_expert_relayout.setdefault((module, param_name), {})
+        for expert_id in range(param.shape[0]):
+            arrived.setdefault(expert_id, set()).update(shard_ids)
+        return "updated"
 
     def _check_expert_sync_supported(
         self,

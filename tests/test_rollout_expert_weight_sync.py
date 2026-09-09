@@ -421,6 +421,111 @@ def test_the_fp8_post_load_hook_cannot_be_run_twice(monkeypatch):
         method.process_weights_after_loading(layer)
 
 
+# ── the fused naming a transformers-5.x trainer emits ─────────────────────
+
+
+def _fused_trainer_tensors(seed, dtype=torch.bfloat16):
+    """The same weights, as one 3D tensor per layer per projection."""
+    per_expert = dict(_trainer_tensors(seed, dtype))
+    gate_up = torch.stack(
+        [
+            torch.cat(
+                [
+                    per_expert[f"layers.0.mlp.experts.{e}.gate_proj.weight"],
+                    per_expert[f"layers.0.mlp.experts.{e}.up_proj.weight"],
+                ],
+                dim=0,
+            )
+            for e in range(NUM_EXPERTS)
+        ]
+    )
+    down = torch.stack(
+        [
+            per_expert[f"layers.0.mlp.experts.{e}.down_proj.weight"]
+            for e in range(NUM_EXPERTS)
+        ]
+    )
+    return [
+        ("layers.0.mlp.experts.gate_up_proj", gate_up),
+        ("layers.0.mlp.experts.down_proj", down),
+    ]
+
+
+def test_a_fused_expert_tensor_lands_where_the_per_expert_ones_do():
+    """Byte-identical to the per-expert route, and to a fresh load.
+
+    A caller whose trainer fuses its experts should not have to rename them,
+    split them, or apply the aiter permutation on ATOM's behalf -- which is
+    what it takes today, because the fused name reaches `named_parameters()`
+    only after the caller has renamed it, and then lands on the plain-copy
+    path with no layout step at all.
+    """
+    reference = _load_from_scratch(_trainer_tensors(16))
+    moe = _sync_target()
+
+    updated = _Runner(_ModelDouble(moe)).update_weights(_fused_trainer_tensors(16))
+
+    assert updated == 2
+    assert torch.equal(moe.w13_weight.data, reference.w13_weight.data)
+    assert torch.equal(moe.w2_weight.data, reference.w2_weight.data)
+
+
+def test_two_consecutive_fused_syncs_both_land():
+    moe = _sync_target()
+    runner = _Runner(_ModelDouble(moe))
+
+    for seed in (17, 18):
+        runner.update_weights(_fused_trainer_tensors(seed))
+        reference = _load_from_scratch(_trainer_tensors(seed))
+        assert torch.equal(moe.w13_weight.data, reference.w13_weight.data)
+        assert torch.equal(moe.w2_weight.data, reference.w2_weight.data)
+
+
+def test_the_fused_path_keeps_the_buffer_addresses():
+    moe = _sync_target()
+    runner = _Runner(_ModelDouble(moe))
+    before = (moe.w13_weight.data_ptr(), moe.w2_weight.data_ptr())
+
+    runner.update_weights(_fused_trainer_tensors(19))
+
+    assert (moe.w13_weight.data_ptr(), moe.w2_weight.data_ptr()) == before
+
+
+def test_a_fused_name_that_is_not_3d_is_refused():
+    moe = _sync_target()
+    runner = _Runner(_ModelDouble(moe))
+    flat = torch.zeros(2 * INTERMEDIATE, HIDDEN, dtype=torch.bfloat16)
+
+    with pytest.raises(NotImplementedError, match="3D"):
+        runner.update_weights([("layers.0.mlp.experts.gate_up_proj", flat)])
+
+
+def test_a_fused_name_on_a_quantized_layer_is_refused():
+    moe = _FusedMoEDouble(dtype=dtypes.fp8)
+    runner = _Runner(_ModelDouble(moe))
+
+    with pytest.raises(NotImplementedError, match="quantized storage format"):
+        runner.update_weights(_fused_trainer_tensors(20))
+
+
+def test_a_dense_gate_up_proj_is_not_mistaken_for_an_expert_one():
+    """`.experts` is what makes the leaf an expert leaf.
+
+    A dense MLP's gate_up_proj shares the leaf name and must keep going
+    through packed_modules_mapping.
+    """
+    moe = _sync_target()
+    runner = _Runner(_ModelDouble(moe))
+
+    result = runner._apply_expert_weight(
+        "layers.0.mlp.gate_up_proj",
+        torch.zeros(4, 4, 4, dtype=torch.bfloat16),
+        runner._get_param_to_module_mapping(),
+    )
+
+    assert result == "skipped"
+
+
 # ── the transports ────────────────────────────────────────────────────────
 
 
