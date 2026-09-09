@@ -855,7 +855,7 @@ def render(report, context):
     # in the per-level table. The breakdown is one click away and carries the
     # shape the criterion actually rests on.
     lines += [
-        "| Model | Levels down | Total Tput | TPOT | TTFT |",
+        "| Model | Levels slower | Total Tput | TPOT | TTFT |",
         "|---|---|---|---|---|",
     ]
     for family in report["families"]:
@@ -864,7 +864,7 @@ def render(report, context):
             lines.append("| {} | insufficient | | | |".format(family["model"]))
             continue
         lines.append(
-            "| {model} | {down}/{tot} | {tput} | {tpot} | {ttft} |".format(
+            "| {model} | {down} of {tot} | {tput} | {tpot} | {ttft} |".format(
                 model=(
                     "**{}**".format(family["model"]) if tripped else family["model"]
                 ),
@@ -989,7 +989,7 @@ def render(report, context):
             "<summary><b>Sliding on main — not this PR</b> "
             "({} {})</summary>".format(n, "family" if n == 1 else "families"),
             "",
-            "| Model | Input/output | Window | Throughput | TPOT | Levels down |",
+            "| Model | Input/output | Window | Throughput | TPOT | Levels slower |",
             "|---|---|---|---|---|---|",
         ]
         for d in report["main_drift"]:
@@ -1090,8 +1090,9 @@ def render(report, context):
                 else family.get("mirror_ratio")
             )
             lines.append(
-                f"- **{family['model']}**: {family['n_down']}/{family['n_total']} "
-                f"judging levels down, median {_fmt(family['median_tput_pct'])}, "
+                f"- **{family['model']}**: {family['n_down']} of "
+                f"{family['n_total']} levels slower, median "
+                f"{_fmt(family['median_tput_pct'])}, "
                 f"TPOT {_fmt(family['median_tpot_pct'])}"
                 + (f" (confirmed by {via}, ratio {ratio:.2f})" if ratio and via else "")
             )
