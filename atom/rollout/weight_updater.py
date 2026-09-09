@@ -311,29 +311,20 @@ class WeightUpdaterMixin:
         if quant_type is None:
             return
 
-        from aiter import QuantType as _QT
-
+        from atom.model_ops.linear import weight_is_stored_preshuffled
         from atom.model_ops.utils import shuffle_weights
-        from atom.utils import envs
 
-        needs_shuffle = False
-        if quant_type.value == _QT.per_1x128.value:
-            # Match LinearBase.process_weights_after_loading(): blockscale FP8
-            # weights are only preshuffled when ATOM is configured to use the
-            # preshuffle GEMM path. Forcing a shuffle here makes post-sync
-            # weights use a different layout from initial online quantization.
-            needs_shuffle = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
-        elif quant_type.value == _QT.per_1x32.value:
-            needs_shuffle = True
-        elif quant_type.value == _QT.per_Token.value:
-            try:
-                from atom.model_ops import dtypes
+        # The same decision the initial load makes, from the same function.
+        needs_shuffle = weight_is_stored_preshuffled(
+            quant_type,
+            getattr(module, "params_dtype", param.dtype),
+            needs_preshuffled_weight=getattr(module, "needs_preshuffled_weight", False),
+        )
 
-                needs_shuffle = param.dtype == dtypes.fp8
-            except ImportError:
-                needs_shuffle = param.element_size() < 2
-
-        if needs_shuffle and param.dim() in (2, 3):
+        # And the same rank check. 3D is Qwen3-Next's GDN conv1d, which the
+        # loader deliberately leaves row-major; shuffling it here would be the
+        # divergence rather than the fix.
+        if needs_shuffle and param.dim() == 2:
             shuffle_weights(param)
 
     def update_weights(

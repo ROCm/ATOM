@@ -428,6 +428,44 @@ def _a8w8_preshuffle_output_padding(output_size: int) -> int:
     return 0 if remainder == 0 else 128 - remainder
 
 
+def weight_is_stored_preshuffled(
+    quant_type: QuantType,
+    params_dtype: torch.dtype,
+    *,
+    needs_preshuffled_weight: bool = False,
+) -> bool:
+    """Whether a quantized 2D GEMM weight of this kind is held preshuffled.
+
+    One answer for both sides of a weight's life: the initial load
+    (``LinearBase.process_weights_after_loading``) and an online weight update
+    (``WeightUpdaterMixin._post_process_fp8_weight``). Deciding it twice is how
+    a synced weight ends up in a layout the loaded one would never have had,
+    which the kernel then reads through the wrong permutation.
+
+    ``needs_preshuffled_weight`` is the module's own override: a fused forward
+    that calls the *preshuffle* blockscale GEMM directly (DeepSeek's fused
+    qkv_a_proj) needs the 16x16-shuffled weight even when the global
+    preshuffle path is off, so it is shuffled once at load rather than per
+    forward.
+
+    Says nothing about rank. Only 2D weights are shuffled -- Qwen3-Next's GDN
+    conv1d expands its weight to 3D and must stay row-major -- so the caller
+    that holds the tensor checks that.
+    """
+    if quant_type == QuantType.per_Token:
+        # The triton a8w8 per_Token GEMM consumes the unshuffled (N, K)
+        # weight; only the AITER bpreshuffle fallback needs the shuffle.
+        return params_dtype == dtypes.fp8 and not (
+            use_triton_gemm() and gemm_a8w8_triton is not None
+        )
+    if quant_type == QuantType.per_1x32:
+        is_fp4_blockscale = params_dtype == dtypes.fp4x2
+        return not is_fp4_blockscale or not use_fp4_non_shuffle_triton_gemm()
+    if quant_type == QuantType.per_1x128:
+        return envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE or needs_preshuffled_weight
+    return False
+
+
 class LinearBase(nn.Module):
     def __init__(
         self,
@@ -769,6 +807,10 @@ class LinearBase(nn.Module):
             )
         self.weight = nn.Parameter(q_weight, requires_grad=False)
         self.weight_scale = nn.Parameter(weight_scale, requires_grad=False)
+        # Both are fresh Parameters, so they carry none of the attributes
+        # __init__ hung on the originals. weight_loader() reads
+        # weight_loader_process off the parameter it is handed, so a later
+        # weight update -- an RLHF rollout sync -- would fail on it.
         self.weight.weight_loader_process = self.weight_loader_process
         self.weight_scale.weight_loader_process = self.weight_loader_process
 
@@ -776,8 +818,6 @@ class LinearBase(nn.Module):
         self.quant_type = online_quant_type
         self.params_dtype = online_quant_dtype
         self.quant_func = get_hip_quant(online_quant_type)
-        # get_hip_quant already returns fnuz when quant_dtype=fnuz on gfx942;
-        # only normalize when output is still non-fnuz.
         self.need_normalize_e4m3fn_to_e4m3fnuz = (
             online_quant_dtype == torch.float8_e4m3fnuz
             and online_quant_type == QuantType.per_Token
@@ -859,32 +899,13 @@ class LinearBase(nn.Module):
                 shuffle_weights(self.weight)
             # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         else:
-            is_fp4_blockscale = (
-                self.quant_type == QuantType.per_1x32
-                and self.params_dtype == dtypes.fp4x2
-            )
-            need_shuffle = (
-                self.quant_type == QuantType.per_Token
-                and self.params_dtype == dtypes.fp8
-                # The triton a8w8 per_Token GEMM consumes the unshuffled (N, K)
-                # weight; only the AITER bpreshuffle fallback needs the shuffle.
-                and not (use_triton_gemm() and gemm_a8w8_triton is not None)
-            ) or (
-                self.quant_type == QuantType.per_1x32
-                and (not is_fp4_blockscale or not use_fp4_non_shuffle_triton_gemm())
-            )
-            # per_1x128 only needs shuffle when using the preshuffle GEMM path
-            if not need_shuffle and self.quant_type == QuantType.per_1x128:
-                need_shuffle = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
-                # Modules whose fused forward calls a *preshuffle* blockscale GEMM
-                # directly (e.g. DeepSeek fused qkv_a_proj) need the 16x16-shuffled
-                # weight even under the non-preshuffle path
-                # (ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0). Shuffle once here at
-                # load time instead of per-forward.
-                if not envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE and getattr(
+            need_shuffle = weight_is_stored_preshuffled(
+                self.quant_type,
+                self.params_dtype,
+                needs_preshuffled_weight=getattr(
                     self, "needs_preshuffled_weight", False
-                ):
-                    need_shuffle = True
+                ),
+            )
             if need_shuffle and self.weight.dim() == 2:
                 self.is_output_padded = self._maybe_pad_a8w8_preshuffle_output()
                 shuffle_weights(self.weight)
