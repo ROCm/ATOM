@@ -79,6 +79,14 @@ BASELINE_SANITY_PCT = -25.0  # base this far under main's recent median
 BASELINE_SANITY_SIGMA = 2.5  # ... and clear of that configuration's own noise
 BASELINE_SANITY_MIN_LEVELS = 2  # ... on at least this many judged levels
 BASELINE_SANITY_MIN_POINTS = 6  # ... judged against at least this much history
+# Two windows for two jobs, following the nightly monitor: the level is the
+# median of a short window (a level that shifted weeks ago is not the current
+# normal), the noise band is estimated over a longer one (short windows make a
+# jumpy configuration look stable). Upstream uses 3 and 8; the level window is
+# a floor here rather than a fixed count, because a step inside it is resolved
+# by the onset instead -- see _level_window.
+LEVEL_WINDOW = 3
+VAR_WINDOW = 8
 
 # --- Main-side drift (context, never a verdict on the PR) -------------------
 # Ported from the nightly monitor's trend criterion, with its constants intact.
@@ -253,23 +261,24 @@ def load_history(source=None):
 
     stats = {}
     for key, points in series.items():
-        values = [p["tput"] for p in points if p.get("tput") is not None]
+        ordered_pts = sorted(points, key=lambda p: p["date"])
+        values = [p["tput"] for p in ordered_pts if p.get("tput") is not None]
         if len(values) < BASELINE_SANITY_MIN_POINTS:
             continue
-        # The last few runs, not the whole window: a level that shifted weeks
-        # ago is the current normal, and holding a run against a long-gone one
-        # is the "compared against a peak" mistake in slow motion.
-        recent = values[-8:]
-        median = statistics.median(recent)
+        level = _level_window(ordered_pts)
+        median = statistics.median(level)
+        # The noise band comes from the longer window whatever the level does:
+        # estimating it over three points calls a jumpy configuration stable.
+        var = values[-VAR_WINDOW:]
         if median:
             stats[key] = {
-                "cv": statistics.pstdev(recent) / median,
+                "cv": statistics.pstdev(var) / median,
                 "median": median,
-                # Best of the same window. The median says what main normally
-                # does; the peak says how good it has been, which is the
-                # question a reader asks when the paired delta is near zero.
-                "peak": max(recent),
-                "n": len(recent),
+                # Best of the same window the level came from. The median says
+                # what main does now; the best says how good it has been, which
+                # is what a reader asks when the paired delta is near zero.
+                "peak": max(level),
+                "n": len(level),
             }
     ordered = {
         key: sorted(points, key=lambda p: p["date"]) for key, points in series.items()
@@ -296,7 +305,34 @@ def _drift_lag(points, days, field):
     return (statistics.mean(now[:DRIFT_SMOOTH_K]) / base - 1) * 100
 
 
-def _drift_onset(members):
+def _level_window(points):
+    """The runs that describe main's level *now*.
+
+    A fixed count straddles a step: eight runs across the night something
+    changed give a median that is neither the old level nor the new one, and
+    every comparison against it is wrong by half the step. When a step is
+    visible in the window, only what came after it counts; otherwise the last
+    few runs, which is what the nightly monitor uses.
+    """
+    values = [p["tput"] for p in points if p.get("tput") is not None]
+    recent = points[-VAR_WINDOW:]
+    step = _series_onset([recent])
+    if step:
+        after = [
+            p["tput"]
+            for p in recent
+            if p.get("tput") is not None
+            and datetime.datetime.fromtimestamp(
+                p["date"] / 1000, datetime.timezone.utc
+            ).strftime("%Y-%m-%d")
+            >= step["date"]
+        ]
+        if len(after) >= 2:
+            return after
+    return values[-LEVEL_WINDOW:]
+
+
+def _series_onset(members):
     """The day the level actually changed, found in the data.
 
     Reporting the horizon instead ("7d") says the slide lasted as long as the
@@ -413,7 +449,7 @@ def main_drift(series, models):
                 worst = {
                     "model": model,
                     "isl_osl": isl_osl,
-                    "onset": _drift_onset(members),
+                    "onset": _series_onset(members),
                     "per_conc": sorted(
                         (c, round(d, 1))
                         for c, d in zip(
@@ -1105,88 +1141,99 @@ def render(report, context):
 
     # Cross-check for the paired table. A paired delta cannot distinguish a
     # base at main's usual level from one well under it, so the base is read
-    # against main's recent nightly level whether or not anything is wrong.
-    rows = [
-        (f["model"], f["base_vs_main"])
-        for f in report["families"]
-        if f.get("base_vs_main")
-    ]
+    # against main's recent nightly level whether or not anything is wrong,
+    # with main's own trend beside it in the same row -- they answer one
+    # question together and were two tables under one heading before.
+    drift_by_key = {
+        (d["model"], d["isl_osl"]): d for d in report.get("main_drift") or []
+    }
+    rows = [f for f in report["families"] if f.get("base_vs_main")]
+    # From what this run measured, not from what has history statistics: a
+    # configuration that was measured but has no statistics is still measured,
+    # and calling it otherwise puts it under the wrong heading.
+    measured = {(f["model"], f["isl_osl"]) for f in report["families"]}
+    elsewhere = [d for k, d in drift_by_key.items() if k not in measured]
+    # Drift on configurations this run did measure, when the table that would
+    # carry it cannot be built. Dropping it because a different column is
+    # missing is the silent-skip failure in another costume.
+    orphaned = [d for k, d in drift_by_key.items() if k in measured] if not rows else []
+
     if rows or report.get("main_drift") or report.get("drift_waiting"):
         drift_lines += ["<details>", "<summary>Base against main</summary>", ""]
+
     if rows:
         drift_lines += [
-            "| Model | vs main median | vs main peak |",
-            "|---|---|---|",
+            "| Model | isl/osl | vs recent median | vs recent best | Main trend |",
+            "|---|---|---|---|---|",
         ]
-        for model, v in rows:
+        for family in rows:
+            v = family["base_vs_main"]
+            # Only the shape this run measured. The same model drifting at
+            # another input/output length is a different configuration and
+            # belongs in its own line, not in this row.
+            d = drift_by_key.get((family["model"], family["isl_osl"]))
+            if d:
+                trend = "{:+.1f}% {}".format(
+                    d["median_pct"],
+                    (
+                        "since " + d["onset"]["date"][5:]
+                        if d.get("onset")
+                        else "over {}d".format(d["horizon_days"])
+                    ),
+                )
+            else:
+                trend = "steady"
             drift_lines.append(
-                "| {} | {:+.1f}% | {} |".format(
-                    model,
+                "| {} | {} | {:+.1f}% | {} | {} |".format(
+                    family["model"],
+                    family["isl_osl"],
                     v["vs_median_pct"],
                     (
                         "{:+.1f}%".format(v["vs_peak_pct"])
                         if v["vs_peak_pct"] is not None
                         else "-"
                     ),
+                    trend,
                 )
             )
         drift_lines += [
             "",
             (
-                "Median and best of main's last 8 nightly runs at the same "
-                "configurations. This crosses container images, which spreads "
-                "11-21% against 0.6% within one image, so read it for order of "
-                "magnitude, not precision."
+                "Against main's recent nightly runs at the same "
+                "configuration -- the last 3, or everything since the step if "
+                "one is visible, so a median never straddles a level change. "
+                "The comparison crosses container images, where the spread is "
+                "11-21% against 0.6% within one image; read it for order of "
+                "magnitude. Trend is the nightly monitor's criterion, dated "
+                "from the data rather than from the window."
+            ),
+        ]
+        measured = {(f["model"], f["isl_osl"]) for f in rows}
+        elsewhere = [d for k, d in drift_by_key.items() if k not in measured]
+
+    if orphaned:
+        drift_lines += [
+            "",
+            "Sliding on main: "
+            + "; ".join(
+                "{} {} {:+.1f}%{}".format(
+                    d["model"],
+                    d["isl_osl"],
+                    d["median_pct"],
+                    " since " + d["onset"]["date"][5:] if d.get("onset") else "",
+                )
+                for d in orphaned
             ),
         ]
 
-    if report.get("main_drift"):
-        n = len(report["main_drift"])
+    if elsewhere:
         drift_lines += [
             "",
-            "**Sliding on main** ({} {})".format(n, "family" if n == 1 else "families"),
-            "",
-            (
-                "| Model | Input/output | Onset | Throughput | TPOT "
-                "| Levels &le; -2% |"
-            ),
-            "|---|---|---|---|---|---|",
-        ]
-        for d in report["main_drift"]:
-            drift_lines.append(
-                (
-                    "| {model} | {shape} | {onset} | {tput} | {tpot} "
-                    "| {down} of {tot} |"
-                ).format(
-                    model=d["model"],
-                    shape=d["isl_osl"],
-                    onset=(
-                        "{} ({:+.0f}%)".format(
-                            d["onset"]["date"][5:], d["onset"]["drop_pct"]
-                        )
-                        if d.get("onset")
-                        else "{}d window".format(d["horizon_days"])
-                    ),
-                    tput="{:+.1f}%".format(d["median_pct"]),
-                    tpot=_fmt(d["median_tpot_pct"]),
-                    down=d["n_down"],
-                    tot=d["n_total"],
-                )
-            )
-        for d in report["main_drift"]:
-            if d.get("per_conc"):
-                drift_lines += [
-                    "",
-                    "{}: ".format(d["model"])
-                    + ", ".join(f"c={c} {v:+.1f}%" for c, v in d["per_conc"]),
-                ]
-        drift_lines += [
-            "",
-            (
-                "Onset is the day the level actually moved, found in the "
-                "data -- a step and a slow slide look alike in a window "
-                "figure. The paired delta stays honest either way; the "
-                "absolute level does not."
+            "Also sliding on main, at input/output lengths this run does not "
+            "measure: "
+            + "; ".join(
+                "{} {} {:+.1f}%".format(d["model"], d["isl_osl"], d["median_pct"])
+                for d in elsewhere
             ),
         ]
 

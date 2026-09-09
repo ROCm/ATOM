@@ -574,7 +574,7 @@ def test_main_side_drift_is_reported_apart_from_the_verdict(tmp_path):
     assert report["verdict"] == "clean"
     body = pj.render(report, "")
     assert "<details>" in body
-    assert "Sliding on main" in body
+    assert "Sliding on main" in body  # no history stats: falls back to a line
 
 
 def test_drift_needs_tpot_to_mirror(tmp_path):
