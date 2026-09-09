@@ -356,23 +356,36 @@ def build_lmcache_config(
 
     Raises:
         ValueError: If the local-disk path, capacity, or CPU staging capacity
-            is incomplete.
+            is incomplete, or asynchronous loading is requested.
     """
     from lmcache.v1.config import LMCacheEngineConfig
 
     cfg = LMCacheEngineConfig.from_env()
+    # Preserve the legacy rank-0 default; explicit overrides can opt into
+    # all-rank lookup ([]) so every shard gets matching touches and pins.
+    if getattr(cfg, "lookup_server_worker_ids", None) is None:
+        cfg.lookup_server_worker_ids = [0]
     apply_extra_overrides(cfg, kv_transfer_config)
+    # Async lookup has a separate polling/cancellation contract. This
+    # connector currently implements only synchronous lookup; do not let an
+    # unsupported mode issue duplicate lookups or release late-arriving pins.
+    if getattr(cfg, "enable_async_loading", False):
+        raise ValueError(
+            "ATOM LMCache offload does not support enable_async_loading=True; "
+            "set LMCACHE_ENABLE_ASYNC_LOADING=false and remove any conflicting "
+            "lmcache.enable_async_loading override."
+        )
+    if str(getattr(cfg, "cache_policy", "")).strip().upper() == "ATOM_SLRU":
+        from atom.kv_transfer.offload.cache_policy import register_slru_policy
+
+        cfg.cache_policy = "ATOM_SLRU"
+        register_slru_policy()
     # cufile GDS has no NVMe-GDS hardware here and hangs on init; force off.
     if getattr(cfg, "use_gds", False):
         cfg.use_gds = False
-    # TP>1 fix: only rank 0 serves/answers the ZMQ lookup. Without this the
-    # client queries all ranks and takes min() over results; we observed rank!=0
-    # engine.lookup returning 0 even though that rank stored the chunk
-    # (contains()=True) -> min(0, hit)=0 -> the scheduler never sees the hit and
-    # always recomputes. Our connector saves on ALL ranks in lockstep, so rank 0
-    # is authoritative for "is it offloaded?"; each rank still loads its own KV
-    # shard, and _do_load is all-or-nothing (re-prefills if a shard is missing).
-    cfg.lookup_server_worker_ids = [0]
+    # Legacy rank-0 lookup avoids cold-rank false negatives. Under capacity
+    # pressure it cannot guarantee residency or pins on other shards; callers
+    # may explicitly request all ranks, whose minimum is the loadable prefix.
     validate_lmcache_storage_config(cfg)
     return cfg
 
@@ -407,7 +420,7 @@ def lmcache_replica_world_size(config) -> int:
 
     Worker ids index this replica-local grid rather than the global one.
     LMCache selects its lookup servers by worker id
-    (``cfg.lookup_server_worker_ids``, pinned to ``[0]`` above), so global
+    (``cfg.lookup_server_worker_ids``, defaulting to ``[0]``), so global
     numbering would leave every replica except the first without a server.
     Replica-local ids are also the right cache-key component: id ``i`` means
     "shard i of the model", which holds the same bytes in every replica, so
