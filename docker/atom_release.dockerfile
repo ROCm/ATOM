@@ -171,7 +171,7 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
 RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         echo "========== [MC 3/4] Build and install Mooncake (USE_HIP=ON) =========="; \
         mkdir -p /app/mooncake/build && cd /app/mooncake/build \
-        && cmake .. -DUSE_HIP=ON -DUSE_ETCD=ON \
+        && cmake .. -DUSE_HIP=ON -DUSE_ETCD=ON -DBUILD_UNIT_TESTS=OFF \
         && make -j$(nproc) && make install \
         && ldconfig \
         && echo "--- Clean up build artifacts ---" \
