@@ -702,7 +702,7 @@ class MLAAttention(nn.Module):
         # Backend for the cached-prefix gather in `_kv_b_proj_gather`. Read once
         # here rather than per call: the gather runs once per full-attention
         # layer per prefill chunk.
-        self.use_flydsl_gather = bool(envs.ATOM_USE_FLYDSL_GATHER_KV_B_PROJ)
+        self.use_flydsl_gather_kv_b_proj = bool(envs.ATOM_USE_FLYDSL_GATHER_KV_B_PROJ)
         if self.use_seg_mla:
             if envs.ATOM_MLA_PAGE_SIZE != _MLA_SEG_PAGE_SIZE:
                 raise RuntimeError(
@@ -1422,13 +1422,13 @@ class MLAAttention(nn.Module):
         weight_scale = getattr(self.kv_b_proj, "weight_scale", None)
         preshuffled = getattr(weight, "is_shuffled", False)
 
-        if self.use_flydsl_gather:
-            flydsl_gather = _load_flydsl_gather_kv_b_proj()
-            if flydsl_gather is None:
-                self.use_flydsl_gather = False
+        if self.use_flydsl_gather_kv_b_proj:
+            flydsl_gather_kv_b_proj = _load_flydsl_gather_kv_b_proj()
+            if flydsl_gather_kv_b_proj is None:
+                self.use_flydsl_gather_kv_b_proj = False
             else:
                 try:
-                    flydsl_gather(
+                    flydsl_gather_kv_b_proj(
                         kv_buffer,
                         self._k_scale,
                         kv_indptr,
@@ -1444,7 +1444,7 @@ class MLAAttention(nn.Module):
                     # The backend rejects unsupported shapes before it launches
                     # anything, so the outputs are untouched and Triton can still
                     # serve this call. Stop trying: the shapes do not change.
-                    self.use_flydsl_gather = False
+                    self.use_flydsl_gather_kv_b_proj = False
                     _log_flydsl_gather_once(
                         "fallback",
                         logging.WARNING,
