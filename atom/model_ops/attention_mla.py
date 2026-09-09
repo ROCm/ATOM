@@ -3,7 +3,6 @@
 
 import logging
 from dataclasses import dataclass
-from functools import lru_cache
 from functools import partial as functools_partial
 from typing import ClassVar, Protocol
 
@@ -471,22 +470,14 @@ if is_rocm_aiter_fp4bmm_enabled():
     from atom.model_ops.utils import quark_post_load_weights
 
 
-# --------------------------------------------------------------------------
-# Optional flydsl backend for `_kv_b_proj_gather` (ATOM_USE_FLYDSL_GATHER_KV_B_PROJ)
-# --------------------------------------------------------------------------
-_flydsl_gather_fallback_logged = False
+# Optional flydsl backend for `_kv_b_proj_gather`, gated by
+# ATOM_USE_FLYDSL_GATHER_KV_B_PROJ.
+try:
+    from aiter.ops.flydsl import gather_kv_b_proj_flydsl
 
-
-@lru_cache(maxsize=1)
-def _load_flydsl_gather_kv_b_proj():
-    """Import the flydsl gather lazily, returns None when flydsl is unavailable."""
-    try:
-        from aiter.ops.flydsl import gather_kv_b_proj_flydsl
-
-        return gather_kv_b_proj_flydsl
-    except Exception as exc:  # noqa: BLE001 - flydsl may fail to import or JIT
-        logger.warning("[MLA] flydsl gather_kv_b_proj unavailable: %s", exc)
-        return None
+    _FLYDSL_GATHER_AVAILABLE = True
+except Exception:  # noqa: BLE001 -- optional kernel; absence is the whole answer
+    _FLYDSL_GATHER_AVAILABLE = False
 
 
 # MLA Specific Arguments
@@ -680,9 +671,6 @@ class MLAAttention(nn.Module):
         # ==1 falls back to the original interleaved per-token (page_size=1)
         # kernels with an unpadded 576-wide q_out. The triton path never uses seg.
         self.use_seg_mla = (not self.use_triton_mla) and envs.ATOM_MLA_PAGE_SIZE > 1
-        # Backend for the cached-prefix gather in `_kv_b_proj_gather`. Read once
-        # here rather than per call: the gather runs once per full-attention
-        # layer per prefill chunk.
         self.use_flydsl_gather_kv_b_proj = bool(envs.ATOM_USE_FLYDSL_GATHER_KV_B_PROJ)
         if self.use_seg_mla:
             if envs.ATOM_MLA_PAGE_SIZE != _MLA_SEG_PAGE_SIZE:
@@ -1403,40 +1391,20 @@ class MLAAttention(nn.Module):
         weight_scale = getattr(self.kv_b_proj, "weight_scale", None)
         preshuffled = getattr(weight, "is_shuffled", False)
 
-        if self.use_flydsl_gather_kv_b_proj:
-            flydsl_gather_kv_b_proj = _load_flydsl_gather_kv_b_proj()
-            if flydsl_gather_kv_b_proj is None:
-                self.use_flydsl_gather_kv_b_proj = False
-            else:
-                try:
-                    flydsl_gather_kv_b_proj(
-                        kv_buffer,
-                        self._k_scale,
-                        kv_indptr,
-                        kv_indices,
-                        cu_seqlens_k,
-                        gather_weight,
-                        weight_scale,
-                        k_out,
-                        v_out,
-                        weight_preshuffle=preshuffled,
-                    )
-                except ValueError as exc:
-                    # The backend rejects unsupported shapes before it launches
-                    # anything, so the outputs are untouched and Triton can still
-                    # serve this call. Stop trying: the shapes do not change.
-                    self.use_flydsl_gather_kv_b_proj = False
-                    global _flydsl_gather_fallback_logged
-                    if not _flydsl_gather_fallback_logged:
-                        _flydsl_gather_fallback_logged = True
-                        logger.warning(
-                            "[MLA] ATOM_USE_FLYDSL_GATHER_KV_B_PROJ=1 but the "
-                            "flydsl gather rejected this call (%s); falling back "
-                            "to Triton.",
-                            exc,
-                        )
-                else:
-                    return
+        if self.use_flydsl_gather_kv_b_proj and _FLYDSL_GATHER_AVAILABLE:
+            gather_kv_b_proj_flydsl(
+                kv_buffer,
+                self._k_scale,
+                kv_indptr,
+                kv_indices,
+                cu_seqlens_k,
+                gather_weight,
+                weight_scale,
+                k_out,
+                v_out,
+                weight_preshuffle=preshuffled,
+            )
+            return
 
         gather_kv_b_proj(
             kv_buffer,
