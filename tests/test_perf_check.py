@@ -134,7 +134,7 @@ def _run_cli(tmp_path, base_dir, head_dir, history=None, expect=5):
         str(out),
     ]
     cmd += ["--history", str(history)] if history else ["--no-history"]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     assert proc.returncode == 0, proc.stderr
     return json.loads(out.read_text())
 
@@ -241,10 +241,10 @@ def test_history_that_matches_nothing_is_not_a_pass(tmp_path):
             "commit": {"id": chr(97 + i) * 40},
             "benches": [
                 {
-                    "name": "ATOM::Renamed-Model 8192/1024 c=%d %s" % (c, metric),
+                    "name": f"ATOM::Renamed-Model 8192/1024 c={c} {metric}",
                     "value": value,
                     "unit": unit,
-                    "extra": "Run: actions/runs/%d" % i,
+                    "extra": f"Run: actions/runs/{i}",
                 }
                 for c in (64, 128, 256)
                 for metric, value, unit in (
@@ -261,6 +261,40 @@ def test_history_that_matches_nothing_is_not_a_pass(tmp_path):
     report = _run_cli(tmp_path, base_dir, head_dir, history=stale)
     assert report["history_status"] == "unmatched"
     assert report["verdict"] == "partial"
+
+
+def test_families_outside_drift_coverage_are_listed(tmp_path):
+    """A family the trend criterion cannot reach is named, not skipped.
+
+    Absent and clean look the same in a report, so a model that has just
+    started running would sit outside coverage indefinitely with nobody
+    noticing it never got checked.
+    """
+    now = 1786149015906
+    day = 86400000
+    series = {}
+    # Enough history to be judged.
+    for c in JUDGING:
+        series[("M", "8192/1024", c)] = [
+            {"date": now - i * day, "tput": 1000.0 - i, "tpot": 30.0 + i}
+            for i in range(pj.DRIFT_MIN_RUNS + 2)
+        ]
+    # Two levels only, so the family cannot form.
+    for c in (64, 128):
+        series[("Thin", "8192/1024", c)] = [
+            {"date": now - i * day, "tput": 1000.0, "tpot": 30.0}
+            for i in range(pj.DRIFT_MIN_RUNS + 2)
+        ]
+    # Enough levels, but none has run often enough.
+    for c in JUDGING:
+        series[("New", "8192/1024", c)] = [
+            {"date": now - i * day, "tput": 1000.0, "tpot": 30.0} for i in range(3)
+        ]
+    waiting = pj.main_drift(series, {"M", "Thin", "New"})["waiting"]
+    named = {w[0]: w[2] for w in waiting}
+    assert "Thin" in named and "levels have enough history" in named["Thin"]
+    assert "New" in named and "runs yet" in named["New"]
+    assert "M" not in named
 
 
 # ------------------------------------------------- incomplete data is not a pass ---
@@ -526,14 +560,15 @@ def test_main_side_drift_is_reported_apart_from_the_verdict(tmp_path):
     """A slide on main leaves the paired delta honest and the absolute level
     wrong. Reporting only "no change" would read as "fine"."""
     series = _series("M", JUDGING, 14, 10000.0, 9000.0, 30.0, 33.0)  # -10%, TPOT +10%
-    drift = pj.main_drift(series, {"M"})
+    result = pj.main_drift(series, {"M"})
+    drift = result["rows"]
     assert len(drift) == 1
     assert drift[0]["median_pct"] < pj.DRIFT_MEDIAN_TH
     assert drift[0]["n_down"] == len(JUDGING)
 
     base = [_result("M", c, 9000.0, 33.0) for c in JUDGING]
     head = [_result("M", c, 8995.0, 33.0) for c in JUDGING]
-    report = pj.judge(pj.pair_results(base, head), {}, expected_entries=1, drift=drift)
+    report = pj.judge(pj.pair_results(base, head), {}, expected_entries=1, drift=result)
 
     # The PR itself is clean, and the drift does not change that.
     assert report["verdict"] == "clean"
@@ -545,20 +580,20 @@ def test_main_side_drift_is_reported_apart_from_the_verdict(tmp_path):
 def test_drift_needs_tpot_to_mirror(tmp_path):
     """Throughput sliding with TPOT flat is measurement wobble, not a slowdown."""
     series = _series("M", JUDGING, 14, 10000.0, 9000.0, 30.0, 30.0)
-    assert pj.main_drift(series, {"M"}) == []
+    assert pj.main_drift(series, {"M"})["rows"] == []
 
 
 def test_drift_is_scoped_to_the_models_measured(tmp_path):
     """Listing every drifting family in the repository would bury the one the
     reader came for."""
     series = _series("Other", JUDGING, 14, 10000.0, 9000.0, 30.0, 33.0)
-    assert pj.main_drift(series, {"M"}) == []
-    assert pj.main_drift(series, {"Other"}) != []
+    assert pj.main_drift(series, {"M"})["rows"] == []
+    assert pj.main_drift(series, {"Other"})["rows"] != []
 
 
 def test_drift_ignores_low_concurrency(tmp_path):
     series = _series("M", [4, 8, 32], 14, 10000.0, 9000.0, 30.0, 33.0)
-    assert pj.main_drift(series, {"M"}) == []
+    assert pj.main_drift(series, {"M"})["rows"] == []
 
 
 # ------------------------------------------------------------- contract ---
