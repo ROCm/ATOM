@@ -1,6 +1,5 @@
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import final
@@ -12,9 +11,7 @@ from aiter.fused_moe import fused_moe
 
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
 from atom.model_ops.fused_moe.utils import disable_inplace
-from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
-from atom.utils.tbo.ubatching import tbo_overlap_enabled
 from atom.utils.tbo.ubatching import tbo_overlap_enabled
 
 
@@ -354,30 +351,6 @@ class FusedMoEModularKernel(torch.nn.Module):
             dispatch_weights = dispatch_weights[:total_valid_tokens]
             if dispatch_scale is not None:
                 dispatch_scale = dispatch_scale[:total_valid_tokens]
-        elif envs.ATOM_EP_TRIM_PREFILL and not all_ranks_decode:
-            # Prefill keeps the whole (mbt * ep_size) buffer above, since
-            # graph_bs is meaningless here. But rows are per-token and
-            # de-duplicated per destination rank, so at most ONE row can arrive
-            # per cluster token -- making the cross-rank token total an exact
-            # upper bound on received rows.
-            #
-            # cu_tokens_across_dp_cpu is already on the host, so reading it costs
-            # no sync. Using this rank's own count instead would be WRONG: under
-            # non-uniform prefill another rank can hold more tokens and send more
-            # rows here, and under-sizing drops received tokens silently.
-            #
-            # Prefill is not cudagraph-captured, so a per-pass dynamic bound is
-            # fine (the static graph_bs bound above is what capture needs).
-            dp_meta = getattr(get_forward_context(), "dp_metadata", None)
-            cu = getattr(dp_meta, "cu_tokens_across_dp_cpu", None)
-            if cu is not None:
-                cluster_tokens = int(cu[-1])
-                if 0 < cluster_tokens < dispatch_a1.shape[0]:
-                    dispatch_a1 = dispatch_a1[:cluster_tokens]
-                    dispatch_ids = dispatch_ids[:cluster_tokens]
-                    dispatch_weights = dispatch_weights[:cluster_tokens]
-                    if dispatch_scale is not None:
-                        dispatch_scale = dispatch_scale[:cluster_tokens]
         return dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights
 
     def forward(
@@ -508,24 +481,33 @@ class FusedMoEModularKernel(torch.nn.Module):
             # `_finalize` and the buffer handed to mori's combine byte-identical:
             # only the slice fed to the Triton experts shrinks, and the result is
             # written back into a full-M tensor below. A measured probe
-            # (ATOM_EP_TRIM_PROBE) saw R reach exactly graph_bs*dp and never
-            # exceed it, so the bound is exact -- but it has NO margin, hence the
-            # all_ranks_decode guard below (a non-uniform batch makes graph_bs
-            # this rank's size only, which under-counts the cluster).
+            # (ATOM_EP_TRIM_PROBE) saw R reach exactly running_tokens*dp and
+            # never exceed it, so the bound is exact -- but it has NO margin,
+            # hence the unified-decode guard below (a non-uniform batch makes
+            # running_tokens this rank size only, under-counting the cluster).
             M_full = dispatch_a1.shape[0]
             M_eff = M_full
             _fwd_ctx = get_forward_context()
             _ctx = _fwd_ctx.context
-            if _ctx is not None and getattr(
-                _ctx, "dp_uniform_decode", not _ctx.is_prefill
+            if (
+                _ctx is not None
+                and not _ctx.is_prefill
+                and getattr(_ctx, "running_tokens_are_unified", True)
             ):
-                # All host-side ints (max_seqlen_q is `int`, see
-                # forward_context.ForwardMetadata) -- no sync, and constant
-                # per captured graph exactly like graph_bs itself.
-                tokens_per_rank = _ctx.graph_bs
-                attn_md = _fwd_ctx.attn_metadata
-                if attn_md is not None:
-                    tokens_per_rank *= attn_md.max_seqlen_q
+                # `running_tokens_are_unified` is only the token-AGREEMENT half of
+                # the old dp_uniform_decode. At dp_size 1 ForwardMode.decide sets
+                # it True unconditionally ("a group of one is unified whatever it
+                # runs"), so on its own it does NOT mean "every rank is decoding"
+                # -- it stays True through prefill and would hand the Triton
+                # experts a prefill-sized M. Conjoin is_prefill, exactly as
+                # forward_context does right after computing `unified`.
+                # `running_tokens` IS the hidden_states rows MoE pads to, host
+                # side and constant per captured graph. Read directly rather than
+                # rebuilt as running_bs*max_seqlen_q: Context says the ratio is
+                # not always max_seqlen_q -- a DSpark ragged step runs a packed
+                # width no rectangular bs*q recovers -- so the product would be
+                # wrong exactly where it matters.
+                tokens_per_rank = _ctx.running_tokens
                 M_eff = min(M_full, tokens_per_rank * get_dp_group().world_size)
 
             if M_eff < M_full:

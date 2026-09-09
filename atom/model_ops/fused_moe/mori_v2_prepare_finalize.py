@@ -43,6 +43,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from aiter import ActivationType, QuantType
+from aiter.dist.parallel_state import get_dp_group
 from aiter.ops.flydsl.moe_common import GateMode
 
 import atom.model_ops.fused_moe.modular_kernel as mk
@@ -512,7 +513,7 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # flydsl fused_moe does NOT: the grouped a8w4 path derives per-expert
         # routing from the (already trimmed) global ids + expert_mask, and its
         # kernels skip the tail past the device-side count on their own -- which
-        # is the whole correctness argument in _decode_recv_bound. So it stays
+        # is the whole correctness argument in _recv_bound. So it stays
         # None there, exactly as before.
         #
         # The Triton/gluon EP experts DO: ep_sort_routing hands this straight to
@@ -651,28 +652,27 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
             arena_rows = (
                 self.prepare_finalize.num_dispatchers() * mega.max_tokens_per_rank
             )
-            bound = self._decode_recv_bound(topk_ids, arena_rows)
+            bound = self._recv_bound(topk_ids, arena_rows)
             # The "Direction-3" shrink, reproduced from the base-class walk: the
             # bound leaves graph_bs*topk*dp rows, but mori de-duplicates per
             # destination rank, so at most graph_bs*max_seqlen_q*dp can be live.
             # Guarded by the same uniform-decode test, via `bound`: None there
             # means a mixed/prefill batch, which keeps the full arena.
             #
-            # Guarded on _all_ranks_decode(), NOT on `bound is not None`:
-            # _decode_recv_bound also returns None when the bound would not
+            # Guarded on the unified-decode test below, NOT on `bound is not
+            # None`: _recv_bound also returns None when the bound would not
             # actually shrink the arena, and the base walk still applies M_eff in
             # that case. Keying off `bound` would silently skip the trim there.
-            from atom.model_ops.moe import _all_ranks_decode
-
+            # Same test and same quantity the base walk uses. Inlined rather
+            # than imported: the flag it mirrors is a local in moe.apply().
             m_eff = None
-            if _all_ranks_decode():
-                _fwd_ctx = get_forward_context()
-                _ctx = _fwd_ctx.context
-                tokens_per_rank = _ctx.graph_bs
-                attn_md = _fwd_ctx.attn_metadata
-                if attn_md is not None and getattr(attn_md, "max_seqlen_q", None):
-                    tokens_per_rank *= attn_md.max_seqlen_q
-                m_eff = tokens_per_rank * get_dp_group().world_size
+            _ctx = get_forward_context().context
+            if (
+                _ctx is not None
+                and not _ctx.is_prefill
+                and getattr(_ctx, "running_tokens_are_unified", True)
+            ):
+                m_eff = _ctx.running_tokens * get_dp_group().world_size
             return triton_mega_moe(
                 mega,
                 hidden_states,

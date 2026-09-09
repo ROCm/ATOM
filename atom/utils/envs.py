@@ -95,11 +95,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MOE_A4W4": lambda: (
         os.getenv("ATOM_USE_TRITON_MOE_A4W4", "0") == "1"
     ),
-    # Trim the dispatched-token buffer to the actual valid token count on
-    # prefill steps. Decode already trims to graph_bs; prefill otherwise keeps
-    # the full (max_batched_tokens * ep_size) buffer, so the expert GEMMs run
-    # over rows that are entirely padding.
-    "ATOM_EP_TRIM_PREFILL": lambda: os.getenv("ATOM_EP_TRIM_PREFILL", "0") == "1",
     # Force DP-attention + EP through the collective fallback even when mori is
     # installed. This is useful for controlled A/B tests and for deployments
     # where the mori shared-memory transport is unavailable or undesirable.

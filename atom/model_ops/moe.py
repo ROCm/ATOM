@@ -89,29 +89,6 @@ from atom.utils.forward_context import get_forward_context
 logger = logging.getLogger("atom")
 
 
-def _all_ranks_decode() -> bool:
-    """True only when EVERY rank is decoding this step.
-
-    ``not is_prefill`` is only THIS rank's phase. On a mixed batch a peer can be
-    prefilling, and then the ranks disagree about which expert backend to run --
-    Triton here, FlyDSL there -- on the same step. ATOM_USE_TRITON_MOE_DECODE is
-    meant to say "use the Triton experts for pure decode", not "for whatever
-    this rank happens to be doing", so it needs the collective answer.
-
-    ``dp_uniform_decode`` is that answer, and it is the SAME guard the shape
-    narrowing already uses (the M_eff trim in modular_kernel.forward, and
-    MoriV2ModularKernel._decode_recv_bound). Sharing it keeps the phase split
-    and the trims agreeing on what a decode step is; they disagreed before.
-
-    No context means we cannot tell, so: not a decode step. The bare attribute
-    read this replaces would have raised there.
-    """
-    ctx = get_forward_context().context
-    if ctx is None:
-        return False
-    return bool(getattr(ctx, "dp_uniform_decode", not ctx.is_prefill))
-
-
 class MoEActivationQuant(Enum):
     BF16 = "bf16"
     FP8 = "fp8"
@@ -1620,6 +1597,37 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # sit in the FlyDSL layout, so prefill falls through to the FlyDSL tail
         # below and only decode takes the Triton block (over a view of the very
         # same storage, see _triton_views_of_flydsl_weights).
+        # True only when EVERY rank is decoding this step.
+        #
+        # `not is_prefill` is only THIS rank's phase. On a mixed batch a peer can
+        # be prefilling, and the ranks then disagree about which expert backend
+        # to run on the same step; a batch that merely CONTAINS prefill tokens
+        # can also read is_prefill False, handing the Triton experts a
+        # prefill-sized M under a flag that says decode.
+        #
+        # `running_tokens_are_unified` is the collective answer -- "every rank of
+        # the group is decoding, so running_tokens is the group's number" -- and
+        # it is the SAME guard the shape narrowing uses (the M_eff trim in
+        # modular_kernel.forward, and MoriV2ModularKernel._recv_bound), so
+        # the phase split and the trims agree on what a decode step is.
+        #
+        # Asked only under use_triton_decode: every reader below is behind that
+        # flag, and get_forward_context() ASSERTS when unset, so a bare call
+        # would raise on any apply() outside a forward. No context means we
+        # cannot tell, so: not a decode step.
+        # NOTE `running_tokens_are_unified` is only the token-AGREEMENT half of
+        # the old dp_uniform_decode. At dp_size 1 ForwardMode.decide sets it True
+        # unconditionally ("a group of one is unified whatever it runs"), so it
+        # stays True through prefill; alone it would hand the Triton experts a
+        # prefill-sized M under a flag that says decode. Conjoin is_prefill, as
+        # forward_context itself does right after computing `unified`.
+        _ctx = get_forward_context().context if self.use_triton_decode else None
+        all_ranks_decode = (
+            _ctx is not None
+            and not _ctx.is_prefill
+            and bool(getattr(_ctx, "running_tokens_are_unified", True))
+        )
+
         use_triton_now = self.use_triton
         # `and self.use_triton` guards the EP case: there self.use_triton is
         # False, and without it a decode step would flip use_triton_now True and
@@ -1627,7 +1635,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # branch-A weight names. EP does its phase split in the no-transport
         # block further down.
         if self.use_triton and self.use_triton_decode:
-            use_triton_now = _all_ranks_decode()
+            use_triton_now = all_ranks_decode
 
         if use_triton_now:
             from atom.model_ops.fused_moe_triton import (
@@ -1813,7 +1821,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # _process_weight_layout_after_loading enforce it.
             _ep_triton_now = True
             if self.use_triton_decode:
-                _ep_triton_now = _all_ranks_decode()
+                _ep_triton_now = all_ranks_decode
             if self.use_triton_decode:
                 (
                     _tw13,
@@ -1871,7 +1879,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # below. Mirrors what the TP path does, one screen up.
             _ep_triton_now = self.use_triton_ep
             if self.use_triton_decode:
-                _ep_triton_now = _all_ranks_decode()
+                _ep_triton_now = all_ranks_decode
             _ep_weights_ready = self.use_triton_decode or (
                 getattr(layer, "w13_swizzle_layout", None) is not None
             )

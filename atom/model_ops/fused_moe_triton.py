@@ -989,7 +989,11 @@ def triton_mega_moe(
     # On a quantizing wire the payload arrives already MXFP4/MXFP8 and its e8m0
     # rows sit in the arena. Take them as a view: the experts consume the
     # transport's own buffers, with nothing quantized or allocated on arrival.
-    a13_scale = mega._recv_scales() if mega._config.is_quant_wire else None
+    a13_scale = (
+        mega._recv_dispatch_scales()
+        if mega._config.is_quant_dispatch_wire
+        else None
+    )
 
     if recv_token_bound is not None:
         bound = min(int(recv_token_bound), recv_x.shape[0])
