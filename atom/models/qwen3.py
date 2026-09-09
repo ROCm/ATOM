@@ -24,8 +24,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Iterable
-from typing import Any, Union
+from typing import Any, Iterable, Union
 
 import torch
 
@@ -357,7 +356,8 @@ class Qwen3ForCausalLM(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        return self.lm_head(hidden_states)
+        logits = self.lm_head(hidden_states)
+        return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # load weights in plugin mode and discard passed weights generator
