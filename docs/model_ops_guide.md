@@ -533,12 +533,12 @@ positions are ragged, and the one-token decode slot mapping comes from
 | `pool_layout/sub_pool_spec.py` | `SubPoolSpec`, `page_pool`, `state_pool`, `plan_pools` — sub-pool sizing as arithmetic over a byte budget |
 | `pool_layout/v4_pool_geometry.py` | `UnifiedPoolGeometry`, `WindowParams`, the compress ratios — where a DeepSeek-V4 row lives, and which rows a step may see |
 | `pool_layout/page_unit_geometry.py` | `PageUnitGeometryMixin` — where a K3 checkpoint image's bytes land in the MLA paged pool |
-| `pool_layout/state_arena.py` | `StateArena`, `StateField`, `plan_regions` — one request's per-layer state as a contiguous byte run |
+| `pool_layout/entry_arena.py` | `EntryField`, `entry_bytes_for`, `plan_regions`, `EntryMajorArena` — what one entry of a cache class holds, and where those bytes are put |
 | `pool_layout/paged_state_copy.py` | `plan_segmented_copy`, `launch_copy_descriptor` — scattering that byte run across PAGE units and back |
 | `token_layout/prefill.py` | `prefill_positions` — where a ragged prefill chunk's tokens sit in their own sequences |
 | `token_layout/decode.py` | `decode_positions` — the same for the rectangular speculative decode step |
 | `token_layout/slots.py` | `slot_mapping` — which KV slot a token is written to, one gather for both sides |
-| `token_layout/batch_ids.py` | `batch_id_per_token` — the token → sequence map both sides build and every kernel resolves per-sequence data through |
+| `token_layout/batch_ids.py` | `build_batch_ids` — builds the token → sequence map every kernel resolves per-sequence data through. Query lengths in gives `batch_id_per_q_token`, context lengths in gives `batch_id_per_k_token`; the two axes are not interchangeable |
 
 ### `atom/model_ops/fused_moe/`
 

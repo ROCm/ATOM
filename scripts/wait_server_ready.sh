@@ -37,8 +37,16 @@ for ((i=1; i<=ITERS; i++)); do
             echo "[t=$((i*POLL))s] log truncated (cur=$CUR_BYTES < snapshot=$LOG_START_BYTES), scanning from offset 0"
             LOG_START_BYTES=0
         fi
+        # `openai_server.py: error:` is argparse refusing the command line --
+        # a bad flag, or a quoted arg that word-split on its way through
+        # EXTRA_ARGS. The process is gone in under a second, so without this
+        # the poll waits out its whole budget for a server that never started.
+        #
+        # A bare `Traceback` does NOT belong here: torch logs whole tracebacks
+        # at WARNING (`triton_kernel_wrap.py` does it hundreds of times during
+        # a normal Inductor warmup), so matching it fails a healthy start.
         ERR=$(tail -c "+$((LOG_START_BYTES + 1))" "$LOG_FILE" 2>/dev/null \
-            | grep -c "cluster_dims\|InductorError\|SHUTDOWN signal\|proc died\|Memory access fault\|HSA_STATUS_ERROR")
+            | grep -c "cluster_dims\|InductorError\|SHUTDOWN signal\|proc died\|Memory access fault\|HSA_STATUS_ERROR\|openai_server.py: error:")
     else
         ERR=0
     fi

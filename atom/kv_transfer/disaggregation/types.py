@@ -157,10 +157,9 @@ class KVTransferTensors:
     compressor-state PD staging pool and are invalid as sidecar SLOT sources.
     """
 
-    # Block-indexed PAGE regions, indexed forward by physical block id.
+    # Block-indexed PAGE regions, indexed forward by block id.
     block_regions: list[KVTransferRegion]
     slot_regions: list[KVTransferRegion]
-    num_blocks: int
     num_slots: int = 0
     # Optional producer-local -> consumer-global mapping for non-uniform block
     # region layouts. Uniform per-layer groups leave this unset and use the
@@ -185,6 +184,38 @@ class KVTransferTensors:
     # loose runtime attribute so the field the connector reads is part of the
     # contract, not an undocumented assignment two layers away.
     state_backend: object | None = None
+    # Scheduler blocks the PAGE regions are addressed in. `init=False` because
+    # a backend cannot answer it: `req.block_ids` is the scheduler's id space,
+    # and a backend counts in its own page -- a different unit even where it is
+    # the same number. Set through `set_block_count`.
+    num_blocks: int = field(init=False, default=0)
+
+    def set_block_count(self, num_blocks: int) -> None:
+        """Fix the block id space, and check every region is in it.
+
+        Called once the last contributor's regions are in the list; a draft
+        appends its own after construction, so this cannot be a `__post_init__`.
+
+        A region that does not divide into exactly `num_blocks` units was
+        registered in some other unit. Both ends would still agree on
+        `base + id * unit_bytes` and disagree on the stride, so the wrong bytes
+        move and nothing reports it.
+        """
+        for i, region in enumerate(self.block_regions):
+            name = region.semantic_role or i
+            if not region.unit_bytes or region.total_bytes % region.unit_bytes:
+                raise ValueError(
+                    f"PAGE region {name} does not divide into whole blocks: "
+                    f"{region.total_bytes} B in units of {region.unit_bytes} B"
+                )
+            held = region.total_bytes // region.unit_bytes
+            if held != num_blocks:
+                raise ValueError(
+                    f"PAGE region {name} holds {held} blocks but the scheduler "
+                    f"addresses {num_blocks}; it is registered in some unit "
+                    "other than the scheduler's block"
+                )
+        self.num_blocks = num_blocks
 
 
 @dataclass
