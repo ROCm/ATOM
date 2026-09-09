@@ -30,6 +30,7 @@ _ATOM_ENV_VARS = [
     "ATOM_USE_CUSTOM_ALL_GATHER",
     "ATOM_ENABLE_RELAXED_MTP",
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ",
+    "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN",
 ]
 
 
@@ -103,6 +104,9 @@ class TestEnvsDefaults:
 
     def test_use_flydsl_gather_kv_b_proj_default(self):
         assert _get_envs().ATOM_USE_FLYDSL_GATHER_KV_B_PROJ is True
+
+    def test_use_flydsl_fp8_prefill_attn_default(self):
+        assert _get_envs().ATOM_USE_FLYDSL_FP8_PREFILL_ATTN is False
 
     def test_unknown_attr_raises(self):
         with pytest.raises(AttributeError):

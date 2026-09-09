@@ -3,7 +3,7 @@
 
 """Gate and dispatch logic for the flydsl fp8 prefill FMHA backend.
 
-CPU-only: the flydsl callable and the CK fallback are both mocked, so what is
+CPU-only: the flydsl callable and the aiter fallback are both mocked, so what is
 under test is the eligibility predicate, the softmax-scale fold, the descale ABI,
 and the fallback state machine -- not kernel numerics.
 """
@@ -37,7 +37,7 @@ def _layer(
     """
     self = types.SimpleNamespace()
     self.scale = scale
-    self.layer_num = 0  # the once-log keys and the call tally are per layer
+    self.layer_num = 0
     self.qk_nope_head_dim = qk_nope_head_dim
     self.qk_rope_head_dim = qk_rope_head_dim
     self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
@@ -206,21 +206,62 @@ def test_descales_are_one_dimensional():
         assert got.shape == (1,), f"{name} is {tuple(got.shape)}, must be (1,)"
 
 
-def test_exception_permanently_disables_the_layer():
+def test_kernel_exception_propagates():
+    """A kernel failure must reach the caller, not degrade to aiter.
+
+    The old code caught it, latched the layer off and logged a warning, so a
+    JIT or ABI break turned an A/B into a silent baseline re-run: the score
+    still looked like flydsl's. Losing the run is the cheaper failure.
+    """
     layer = _layer(scale=_K3_SCALE)
     q, k, v = _qkv()
     fly = mock.Mock(side_effect=RuntimeError("JIT boom"))
     ck = mock.Mock(return_value=torch.zeros(8, 4, 128))
-    mla._flydsl_fmha_logged.clear()
     with (
         mock.patch.object(mla, "_load_flydsl_fp8_fmha", lambda: fly),
         mock.patch.object(mla, "flash_attn_varlen_func", ck),
+        pytest.raises(RuntimeError, match="JIT boom"),
     ):
         layer._flash_attn_prefill(q, k, v, **_call_kwargs())
+    assert ck.call_count == 0, "must not silently fall back to aiter"
+    # Write-once at __init__: nothing may flip the backend mid-run any more.
+    assert layer.use_flydsl_fp8_prefill_attn
+
+
+def test_missing_kernel_raises_rather_than_falling_back():
+    """`_load_flydsl_fp8_fmha` no longer returns None for an absent kernel."""
+    layer = _layer(scale=_K3_SCALE)
+    q, k, v = _qkv()
+    ck = mock.Mock(return_value=torch.zeros(8, 4, 128))
+
+    def _boom():
+        raise ImportError("no flydsl_flash_attn_fp8_func in this build")
+
+    with (
+        mock.patch.object(mla, "_load_flydsl_fp8_fmha", _boom),
+        mock.patch.object(mla, "flash_attn_varlen_func", ck),
+        pytest.raises(ImportError),
+    ):
         layer._flash_attn_prefill(q, k, v, **_call_kwargs())
-    assert fly.call_count == 1
-    assert ck.call_count == 2
-    assert not layer.use_flydsl_fp8_prefill_attn
+    assert ck.call_count == 0
+
+
+def test_callable_at_the_k3_production_prefill_shape():
+    """Closes the one gap the armed-line count cannot see.
+
+    The server log now proves only that every layer passed the *static* gate.
+    An armed layer whose every call missed `_flydsl_fmha_callable` would still
+    run on aiter silently, so pin the real K3 prefill shape here instead:
+    12 heads/rank at TP8, D=192 (128 nope + 64 rope), Dv=128, one full
+    attn_prefill_chunk_size tile.
+    """
+    layer = _layer(scale=_K3_SCALE, v_head_dim=128)
+    # `meta` because the predicate only reads shapes and numel -- materializing
+    # these would cost ~450 MB in a suite that must run without a GPU.
+    q = torch.empty(16384, 12, 192, device="meta")
+    k = torch.empty(16384, 12, 192, device="meta")
+    v = torch.empty(16384, 12, 128, device="meta")
+    assert layer._flydsl_fmha_callable(q, k, v, 0.0)
 
 
 # --------------------------------------------------------------------------
@@ -230,7 +271,7 @@ def test_exception_permanently_disables_the_layer():
 
 @pytest.mark.parametrize("return_lse", [False, True])
 def test_kernel_result_is_passed_through_untouched(return_lse):
-    """A seqlen_kv == 0 entry once came back all NaN where CK writes 0.0, and
+    """A seqlen_kv == 0 entry once came back all NaN where aiter writes 0.0, and
     merge_attn_states spread it across the layer output. That is fixed in the
     kernel (the unconditional floor_masked_max in _merge_tile_max), so this
     helper hands the result back verbatim -- no masking pass, no copy.

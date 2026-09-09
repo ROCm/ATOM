@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import atexit
-import collections
 import logging
 from dataclasses import dataclass
 from functools import partial as functools_partial
@@ -503,75 +501,19 @@ def _log_flydsl_gather_once(key: str, level: int, msg: str, *args) -> None:
 # Optional flydsl fp8 backend for the prefill flash-attention sites
 # (ATOM_USE_FLYDSL_FP8_PREFILL_ATTN)
 # --------------------------------------------------------------------------
-_flydsl_fmha_logged: set[str] = set()
-
 # The wrapper packs the flattened q/k/v extent as an int32 for the C ABI.
 _FLYDSL_FMHA_MAX_FLAT_ELEMS = 2**31
-
-# Per-process tally of which backend each prefill attention call actually took.
-# A once-per-process log line cannot answer "what fraction of prefills ran on
-# flydsl" -- it is satisfied by a single call on a single layer on a single rank,
-# which is indistinguishable from full coverage in the server log. An A/B whose
-# treatment silently applied to 1 of 24 layers is the headline failure mode of
-# this backend, so count instead of flagging, and dump the tally at exit.
-_flydsl_fmha_calls: "collections.Counter[str]" = collections.Counter()
-
-
-def _dump_flydsl_fmha_tally() -> None:
-    if not _flydsl_fmha_calls:
-        return
-    # logging traps write errors internally and prints its own traceback, which
-    # `try` here cannot intercept; by atexit the stream may already be closed
-    # (pytest closes its capture). Silence that path rather than emit a scary
-    # traceback after a clean run.
-    logging.raiseExceptions = False
-    try:
-        total = sum(_flydsl_fmha_calls.values())
-        fly = _flydsl_fmha_calls["flydsl"]
-        try:
-            rank = get_tensor_model_parallel_rank()
-        except Exception:  # noqa: BLE001 - the group is often already torn down
-            rank = "?"
-        # WARNING, not INFO: this is the evidence an A/B is scored against, and
-        # it must survive a run that raised the log level.
-        logger.warning(
-            "[MLA] prefill attention backend tally (rank %s): %d/%d calls on "
-            "flydsl (%.1f%%); breakdown %s",
-            rank,
-            fly,
-            total,
-            100.0 * fly / total,
-            dict(sorted(_flydsl_fmha_calls.items())),
-        )
-    except Exception:  # noqa: BLE001, S110 - runs at interpreter exit
-        # By atexit the log stream may already be closed, and there is nowhere
-        # left to report to. Diagnostics must never turn a clean shutdown into a
-        # traceback, so this swallow is deliberate.
-        pass
-
-
-atexit.register(_dump_flydsl_fmha_tally)
 
 
 @lru_cache(maxsize=1)
 def _load_flydsl_fp8_fmha():
-    """Import the flydsl fp8 FMHA lazily, like the gather above: it drags in the
-    flydsl compiler and JIT-builds on first launch. Returns ``None`` when
-    flydsl (or this build of it) does not have the kernel."""
-    try:
-        from aiter.ops.flydsl import flydsl_flash_attn_fp8_func
+    """Import the flydsl fp8 FMHA lazily: it drags in the flydsl compiler and
+    JIT-builds on first launch, which nothing should pay for while
+    ATOM_USE_FLYDSL_FP8_PREFILL_ATTN is off. Raises if this build lacks the
+    kernel -- the caller asked for it explicitly, so that is a config error."""
+    from aiter.ops.flydsl import flydsl_flash_attn_fp8_func
 
-        return flydsl_flash_attn_fp8_func
-    except Exception as exc:  # noqa: BLE001 - flydsl may fail to import or JIT
-        logger.warning("[MLA] flydsl fp8 FMHA unavailable: %s", exc)
-        return None
-
-
-def _log_flydsl_fmha_once(key: str, level: int, msg: str, *args) -> None:
-    if key in _flydsl_fmha_logged:
-        return
-    _flydsl_fmha_logged.add(key)
-    logger.log(level, msg, *args)
+    return flydsl_flash_attn_fp8_func
 
 
 @lru_cache(maxsize=1)
@@ -802,20 +744,29 @@ class MLAAttention(nn.Module):
             and 64 <= self.v_head_dim <= 192  # builder: D_CHUNKS = Dv/32 in [2,6]
             and self.v_head_dim % 32 == 0
         )
-        if (
-            envs.ATOM_USE_FLYDSL_FP8_PREFILL_ATTN
-            and not self.use_flydsl_fp8_prefill_attn
-        ):
-            _log_flydsl_fmha_once(
-                "rejected",
-                logging.WARNING,
-                "[MLA] ATOM_USE_FLYDSL_FP8_PREFILL_ATTN=1 but this layer is not "
-                "eligible (gfx950=%s dtype=%s head_dim=%d v_head_dim=%d); "
-                "prefill attention stays on the CK kernel.",
-                _is_gfx950(),
-                self.dtype,
+        if envs.ATOM_USE_FLYDSL_FP8_PREFILL_ATTN:
+            if not self.use_flydsl_fp8_prefill_attn:
+                raise RuntimeError(
+                    "[MLA] ATOM_USE_FLYDSL_FP8_PREFILL_ATTN=1 but layer "
+                    f"{self.layer_num} is not eligible for the flydsl fp8 "
+                    f"prefill FMHA (gfx950={_is_gfx950()} dtype={self.dtype} "
+                    f"head_dim={self._fmha_d} v_head_dim={self.v_head_dim}); "
+                    "the kernel needs gfx950, bf16, head_dim%64==0 and "
+                    "64<=v_head_dim<=192 with v_head_dim%32==0. Unset the env "
+                    "var to run this model on aiter's varlen dispatch."
+                )
+            # Exactly one line per layer per rank, at construction, never in the
+            # hot path. An A/B counts these to prove the treatment was armed on
+            # every layer (expect n_mla_layers x TP); a treatment that silently
+            # reached 1 of 24 layers is this backend's headline failure mode,
+            # and a single flag line cannot tell that apart from full coverage.
+            logger.info(
+                "[MLA] prefill attention: flydsl fp8 backend armed at layer %d "
+                "(head_dim=%d v_head_dim=%d scale_fixup=%.12g)",
+                self.layer_num,
                 self._fmha_d,
                 self.v_head_dim,
+                self._fmha_scale_fixup,
             )
         if self.use_seg_mla:
             if envs.ATOM_MLA_PAGE_SIZE != _MLA_SEG_PAGE_SIZE:
@@ -1123,119 +1074,67 @@ class MLAAttention(nn.Module):
         """Prefill flash-attention for every MLA site, over one of two backends.
 
         Runs the flydsl gfx950 fp8 FMHA when the layer is eligible
-        (``ATOM_USE_FLYDSL_FP8_PREFILL_ATTN``), else aiter's CK varlen kernel.
-        The two are semantically equivalent at these shapes: both are
-        BOTTOM-RIGHT causal (measured against explicit bottom-right and top-left
-        torch references that differ by max_abs 3.199 -- both land on
-        bottom-right to ~1e-3), and flydsl's LSE is the same [H, total_q] fp32
-        contiguous NATURAL-log tensor CK returns, agreeing to 1.3e-3 abs. The
+        (``ATOM_USE_FLYDSL_FP8_PREFILL_ATTN``), else ``flash_attn_varlen_func``.
+        That fallback is a dispatch, not one kernel: it screens a flydsl bf16
+        path (which our bf16/no-descale args always fail), then Triton if
+        ``ENABLE_CK=0``, then ``FlashAttnVarlenFunc``, which itself prefers the
+        gfx950 OPUS ``gqa_d192_v128`` bf16 varlen kernel -- on by default and
+        matching MLA's D=192/Dv=128 exactly -- over v3/CK. So on this box the
+        baseline is OPUS; ``AITER_DISABLE_FMHA_OPUS=1`` drops it to v3/CK.
+
+        flydsl is semantically equivalent at these shapes: both are BOTTOM-RIGHT
+        causal (measured against explicit bottom-right and top-left torch
+        references that differ by max_abs 3.199 -- both land on bottom-right to
+        ~1e-3), and flydsl's LSE is the same [H, total_q] fp32 contiguous
+        NATURAL-log tensor the fallback returns, agreeing to 1.3e-3 abs. The
         difference is fp8: q/k/v are quantized here to per-tensor e4m3, which
-        costs mean_abs ~5.5e-4 against an output rms of ~0.013.
+        costs mean_abs ~5.5e-4 against an output rms of ~0.013. gsm8k over the
+        pair: 0.9636 both, 30 flips split 15/15.
 
         ``q_fp8`` lets the chunk loop hand in an already-quantized
         ``(q8, q_descale)`` so the amax reduction over Q runs once per layer-step
         instead of once per chunk.
         """
-        if not self._flydsl_fmha_callable(q, k, v, dropout_p):
-            # Distinguish "the gate is off" from "the gate is on but this call's
-            # shapes miss it". The latter used to route to CK silently and
-            # forever, which reads in the log exactly like a successful run.
-            if self.use_flydsl_fp8_prefill_attn:
-                _flydsl_fmha_calls["ck:shape-miss"] += 1
-                _log_flydsl_fmha_once(
-                    f"shape-miss:{self.layer_num}",
-                    logging.WARNING,
-                    "[MLA] flydsl fp8 FMHA enabled but not callable at layer %d "
-                    "(q=%s k=%s v=%s dropout=%s); this call takes CK.",
-                    self.layer_num,
-                    tuple(q.shape),
-                    tuple(k.shape),
-                    tuple(v.shape),
-                    dropout_p,
-                )
-            else:
-                _flydsl_fmha_calls["ck:disabled"] += 1
-        else:
+        if self._flydsl_fmha_callable(q, k, v, dropout_p):
             fn = _load_flydsl_fp8_fmha()
-            if fn is None:
-                self.use_flydsl_fp8_prefill_attn = False
-                _flydsl_fmha_calls["ck:unavailable"] += 1
-            else:
-                try:
-                    q8, q_descale = q_fp8 or self._quant_fmha_q(q)
-                    k8, k_descale = dynamic_per_batched_tensor_quant(k)
-                    v8, v_descale = dynamic_per_batched_tensor_quant(v)
-                    # flydsl wraps every tensor argument as a layout-dynamic
-                    # memref, which needs an axis of stride 1; the 0-dim scalar
-                    # `dynamic_per_batched_tensor_quant` returns has no axis at
-                    # all and is rejected at trace time.
-                    k_descale = k_descale.reshape(1)
-                    v_descale = v_descale.reshape(1)
-                    res = fn(
-                        q8,
-                        k8,
-                        v8,
-                        cu_seqlens_q=cu_seqlens_q,
-                        cu_seqlens_kv=cu_seqlens_k,
-                        max_seqlen_q=max_seqlen_q,
-                        max_seqlen_kv=max_seqlen_k,
-                        cross_seqlen=True,
-                        causal=causal,
-                        return_lse=return_lse,
-                        q_descale=q_descale,
-                        k_descale=k_descale,
-                        v_descale=v_descale,
-                        # Never pass a stream: the wrapper's internal
-                        # `.contiguous()` would be issued on the *current* stream
-                        # with no event against the launch stream, and the
-                        # `record_stream` it then does is illegal under capture.
-                        stream=None,
-                    )
-                except Exception as exc:  # noqa: BLE001 - JIT / arch / shape
-                    # Failures here come from build-time conditions that recur on
-                    # every call, so retrying would pay a failed JIT each time.
-                    # Disabling mid-chunk-loop is safe: chunks already computed by
-                    # either backend LSE-merge correctly, differing only by fp8
-                    # quantization noise.
-                    self.use_flydsl_fp8_prefill_attn = False
-                    _flydsl_fmha_calls["ck:raised"] += 1
-                    _log_flydsl_fmha_once(
-                        f"fallback:{self.layer_num}",
-                        logging.WARNING,
-                        "[MLA] flydsl fp8 FMHA raised (%s) at layer %d q=%s k=%s "
-                        "causal=%s; falling back to CK for this layer from here on.",
-                        exc,
-                        self.layer_num,
-                        tuple(q.shape),
-                        tuple(k.shape),
-                        causal,
-                    )
-                else:
-                    _flydsl_fmha_calls["flydsl"] += 1
-                    _log_flydsl_fmha_once(
-                        f"used:{self.layer_num}",
-                        logging.INFO,
-                        "[MLA] prefill attention: using the flydsl fp8 backend at "
-                        "layer %d (q=%s k=%s head_dim=%d v_head_dim=%d "
-                        "scale_fixup=%.12g)",
-                        self.layer_num,
-                        tuple(q.shape),
-                        tuple(k.shape),
-                        self._fmha_d,
-                        self.v_head_dim,
-                        self._fmha_scale_fixup,
-                    )
-                    # A varlen entry with seqlen_kv == 0 used to come back all
-                    # NaN where CK writes exact 0.0, and merge_attn_states then
-                    # spread the NaN across the layer output. Empty per-seq
-                    # chunks are the norm, not an edge case: the chunk-meta
-                    # builder emits `max(seq_hi - seq_lo, 0)` per seq, so any
-                    # multi-request batch with unequal cached lengths has them.
-                    # Fixed in the kernel instead of repaired here -- an
-                    # lse == -inf mask can only run when return_lse is set, so
-                    # it left the causal sites unprotected. See the unconditional
-                    # floor_masked_max in flash_attn_fp8_gfx950._merge_tile_max.
-                    return res
+            q8, q_descale = q_fp8 or self._quant_fmha_q(q)
+            k8, k_descale = dynamic_per_batched_tensor_quant(k)
+            v8, v_descale = dynamic_per_batched_tensor_quant(v)
+            # flydsl wraps every tensor argument as a layout-dynamic memref,
+            # which needs an axis of stride 1; the 0-dim scalar
+            # `dynamic_per_batched_tensor_quant` returns has no axis at all and
+            # is rejected at trace time.
+            k_descale = k_descale.reshape(1)
+            v_descale = v_descale.reshape(1)
+            # A varlen entry with seqlen_kv == 0 used to come back all NaN where
+            # aiter writes exact 0.0, and merge_attn_states then spread the NaN
+            # across the layer output. Empty per-seq chunks are the norm, not an
+            # edge case: the chunk-meta builder emits `max(seq_hi - seq_lo, 0)`
+            # per seq, so any multi-request batch with unequal cached lengths
+            # has them. Fixed in the kernel instead of repaired here -- an
+            # lse == -inf mask can only run when return_lse is set, so it left
+            # the causal sites unprotected. See the unconditional
+            # floor_masked_max in flash_attn_fp8_gfx950._merge_tile_max.
+            return fn(
+                q8,
+                k8,
+                v8,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_kv=max_seqlen_k,
+                cross_seqlen=True,
+                causal=causal,
+                return_lse=return_lse,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                # Never pass a stream: the wrapper's internal `.contiguous()`
+                # would be issued on the *current* stream with no event against
+                # the launch stream, and the `record_stream` it then does is
+                # illegal under capture.
+                stream=None,
+            )
 
         return flash_attn_varlen_func(
             q=q,
