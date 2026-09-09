@@ -199,9 +199,7 @@ class TestDecodeRouting:
         )
 
     def test_sliding_window_without_the_env_uses_gluon(self, monkeypatch):
-        assert (
-            _route(monkeypatch, 4, sliding_window=128) == "paged_attention_triton"
-        )
+        assert _route(monkeypatch, 4, sliding_window=128) == "paged_attention_triton"
 
     def test_flash_layout_routes_to_unified(self, monkeypatch):
         assert (
@@ -218,9 +216,7 @@ class TestDecodeRouting:
     def test_use_triton_attn_diverts_off_asm(self, monkeypatch):
         """Same shape reaches ASM without the flag, so this arm is load-bearing."""
         assert _route(monkeypatch, 1) == "paged_attention_asm"
-        assert (
-            _route(monkeypatch, 1, use_triton_attn=True) == "paged_attention_triton"
-        )
+        assert _route(monkeypatch, 1, use_triton_attn=True) == "paged_attention_triton"
 
     def test_a_sentinel_query_length_routes_as_one(self, monkeypatch):
         """Clamped at the top, so both gates see the same value.
