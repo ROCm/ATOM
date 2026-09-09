@@ -1,13 +1,27 @@
 name: ATOM Benchmark
 
+# The run title IS the cadence label: the baseline lookup below matches on it to
+# keep the nightly and weekly comparison chains apart. Both crons live in this
+# workflow, so without that a weekly run would become the next nightly's
+# baseline and silently blank out its whole regression table.
+run-name: >-
+  ${{ github.event_name == 'schedule'
+      && (github.event.schedule == '37 4 * * 0' && 'weekly' || 'nightly')
+      || format('manual ({0})', github.actor) }}
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 on:
   schedule:
-    # Nightly at 00:12 Beijing time (16:12 UTC)
+    # Nightly at 00:12 Beijing time (16:12 UTC). Runs the 8k/1k grid only.
     - cron: '12 16 * * *'
+    # Weekly at 12:37 Beijing time on Sunday (04:37 UTC). Runs the 1k/1k grid,
+    # which is half the catalog's cells and was making the nightly too long.
+    # Daytime and on a weekend, well clear of the 15:00-19:00 UTC cron cluster
+    # the other benchmark workflows sit in.
+    - cron: '37 4 * * 0'
   workflow_dispatch:
     inputs:
       publish_to_dashboard:
@@ -104,6 +118,11 @@ permissions:
   contents: write
   issues: write
 
+env:
+  # Which slice of the catalog to build, and which chain to take a baseline
+  # from. A manual run compares against the nightly, as it always has.
+  CADENCE: ${{ github.event_name == 'schedule' && github.event.schedule == '37 4 * * 0' && 'weekly' || 'nightly' }}
+
 jobs:
   # Single source of the benchmark matrix. Expands the structured catalog
   # (.github/benchmark/models.json) into fully-resolved per-run "cells" — one
@@ -124,6 +143,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           INPUTS_JSON: ${{ toJson(inputs) }}
+          CADENCE: ${{ env.CADENCE }}
         run: python3 .github/scripts/build_benchmark_matrix.py
 
   # Top-level fan-out: one matrix entry per (model variant × scenario) config.
@@ -192,19 +212,29 @@ jobs:
           merge-multiple: true
           path: .
 
-      - name: Download baseline from previous nightly run
+      - name: Download baseline from previous run of the same cadence
         id: baseline
         run: |
-          # Use the most recent completed nightly run (regardless of success/failure)
+          # Use the most recent completed run (regardless of success/failure)
           # because even failed runs have valid per-model benchmark artifacts.
           # Only requiring --status=success misses baselines when any single job fails.
+          #
+          # Matched on the run title, which `run-name` sets to the cadence: the
+          # nightly and weekly crons run different grids out of this one
+          # workflow, so comparing across them would leave every cell without a
+          # counterpart. A manual run reads CADENCE as `nightly` and so keeps
+          # comparing against the nightly, as before.
+          #
+          # limit=20 spans more than a week of nightlies, so a weekly run can
+          # still reach the previous weekly seven runs back.
           PREV_RUN_ID=$(gh run list \
             --workflow="ATOM Benchmark" \
             --branch=main \
             --event=schedule \
-            --limit=5 \
-            --json databaseId,status \
-            --jq '[.[] | select(.status == "completed")][0].databaseId // empty')
+            --limit=20 \
+            --json databaseId,status,displayTitle \
+            | jq -r --arg cadence "$CADENCE" \
+                '[.[] | select(.status == "completed" and .displayTitle == $cadence)][0].databaseId // empty')
 
           if [ -n "$PREV_RUN_ID" ] && [ "$PREV_RUN_ID" != "${{ github.run_id }}" ]; then
             echo "Downloading baseline from run #$PREV_RUN_ID"
