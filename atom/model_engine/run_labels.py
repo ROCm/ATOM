@@ -12,7 +12,7 @@ Kinds (label prefix — groups in Perfetto UI, greppable):
   - ``dummy_prefill``      warmup dummy prefill
 
 Fields (``key=value`` inside brackets):
-  - ``bs``   effective (real) batch size; on the CUDAGraph path shown as
+  - ``bs``   the scheduled (real) batch size; on the CUDAGraph path shown as
              ``<real>/<graph>`` when the replayed graph is padded above the real
              batch (e.g. ``bs=117/128``). ``parse_trace.py`` reads the leading
              ``\\d+`` so the real batch is still what it extracts.
@@ -29,7 +29,7 @@ fall outside those, so dummies never pollute the prefill/decode statistics.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from atom.model_engine.scheduler import ScheduledBatch
@@ -41,10 +41,10 @@ def build_run_label(
     use_cudagraph: bool,
     is_dummy: bool,
     tbo_on: bool,
-    bs: int,
-    batch: Optional["ScheduledBatch"],
+    scheduled_bs: int,
+    batch: ScheduledBatch | None,
+    running_bs: int,
     detailed_suffix: str = "",
-    graph_bs: Optional[int] = None,
 ) -> str:
     """Build the ``record_function`` label for one forward pass.
 
@@ -54,16 +54,20 @@ def build_run_label(
     (empty on the normal path) appended inside the brackets; see
     ``ModelRunner._detailed_label_suffix``.
 
-    ``graph_bs`` is the padded batch size the CUDAGraph actually replays. When it
-    is given and exceeds the real ``bs`` (CUDAGraph path only), the label shows
-    ``bs=<real>/<graph>`` so the padding is visible in the trace.
+    Both batch sizes are required: every step has both, and a step that ran
+    padded is exactly the one worth seeing in a trace. The cudagraph path
+    reports ``running_bs`` -- what actually ran -- and prefixes the real
+    ``scheduled_bs`` as ``bs=<real>/<graph>`` when the two differ. The eager
+    path reports ``scheduled_bs``, because eager attention runs the scheduled
+    rows even where MoE pads past them.
     """
     if use_cudagraph:
         kind = "dummy_decode" if is_dummy else "decode"
-        if graph_bs is not None and graph_bs > bs:
-            label = f"{kind}[bs={bs}/{graph_bs}"
+        if running_bs > scheduled_bs:
+            label = f"{kind}[bs={scheduled_bs}/{running_bs}"
         else:
-            label = f"{kind}[bs={bs}"
+            # `decide` ceils to a captured size, so not-greater means equal.
+            label = f"{kind}[bs={running_bs}"
         if batch is not None:
             label += f" tok={batch.total_tokens_num}"
             if batch.total_seqs_num_prefill > 0:
@@ -76,7 +80,7 @@ def build_run_label(
             kind = "dummy_prefill" if is_dummy else "prefill"
         else:
             kind = "dummy_eager_decode" if is_dummy else "eager_decode"
-        label = f"{kind}[bs={bs}"
+        label = f"{kind}[bs={scheduled_bs}"
         if batch is not None:
             ctx = batch.context_lens
             if len(ctx) == 1:

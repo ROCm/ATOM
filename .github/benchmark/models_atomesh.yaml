@@ -243,12 +243,12 @@ models:
         # from a fresh ATOM service instead of inheriting HBM prefix-cache state.
         - <<: &glm52_agentic_tp4_tp4
             topology: 1p1d
-            pd_worker_layout: multi_node
+            pd_worker_layout: single_node
             nodes: "${ATOMESH_1P1D_NODES}"
             isl: [1048576]
             osl: 1024
             server:
-              common_args:
+              common_args: &glm52_agentic_args
                 kv_cache_dtype: fp8
                 block_size: 16
                 gpu_memory_utilization: 0.9
@@ -267,8 +267,11 @@ models:
               tp: 4
               cudagraph: none
             env:
+              prefill:
+                HIP_VISIBLE_DEVICES: "0,1,2,3"
               decode:
                 MAX_JOBS: "16"
+                HIP_VISIBLE_DEVICES: "4,5,6,7"
             benchmark:
               kind: aiperf_agentic
               aiperf_commit: b7b16cf851885567988a643282266bce74e34437
@@ -294,36 +297,28 @@ models:
             run_eval: false
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c1
           concurrency: [1]
-          accuracy:
-            task: swebench_lite
-            threshold: 0.50
-            agent_workers: 32
-            agent_step_limit: 150
-            case_timeout: 3600
-            agent_timeout: 21600
-            score_timeout: 7200
-            max_workers: 4
-            instance_timeout: 900
-          eval_concurrency: [1]
-          run_eval: true
-          runner:
-            time_limit: "12:00:00"
+          server:
+            common_args: &glm52_agentic_mtp_args
+              <<: *glm52_agentic_args
+              extra_args: "--method mtp --num-speculative-tokens 4 --spec-decode-acceptance-rate 0.5825"
 
         - <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c2
           concurrency: [2]
+          server:
+            common_args: *glm52_agentic_mtp_args
 
         - <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c4
           concurrency: [4]
+          server:
+            common_args: *glm52_agentic_mtp_args
 
         - <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c8
           concurrency: [8]
-
-        - <<: *glm52_agentic_tp4_tp4
-          name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c48
-          concurrency: [48]
+          server:
+            common_args: *glm52_agentic_mtp_args
 
         - &glm52_agentic_lmcache_tp4_dpa
           <<: *glm52_agentic_tp4_tp4

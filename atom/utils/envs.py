@@ -39,6 +39,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # pressure) and a smaller value toward prompt-token balance (prefill
     # pressure). See engine_core_mgr.CoreManager._select_dp_rank_locked.
     "ATOM_DP_LB_REQ_EQUIV": lambda: int(os.getenv("ATOM_DP_LB_REQ_EQUIV", "512")),
+    # Place a new agent session on the lightest DP rank, then keep every later
+    # request on that immutable cache owner. Existing sessions never spill;
+    # child correlation ids are independently load-placed rather than
+    # inheriting their parent's owner.
+    "ATOM_DP_SESSION_AFFINITY": lambda: os.getenv(
+        "ATOM_DP_SESSION_AFFINITY", "0"
+    ).lower()
+    in {"1", "true", "yes", "on"},
     # Prefix for process titles set via set_process_title (shown in ps/top/rocm-smi)
     "ATOM_PROCESS_NAME_PREFIX": lambda: os.getenv("ATOM_PROCESS_NAME_PREFIX", "ATOM"),
     # SGLang's GLM-5.2 and DeepSeek V4 prefill CP paths still force
@@ -92,6 +100,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MOE_A4W4": lambda: (
         os.getenv("ATOM_USE_TRITON_MOE_A4W4", "0") == "1"
     ),
+    # Force DP-attention + EP through the collective fallback even when mori is
+    # installed. This is useful for controlled A/B tests and for deployments
+    # where the mori shared-memory transport is unavailable or undesirable.
+    # The fallback gathers hidden/router rows across DP ranks, computes only
+    # the locally owned experts, then reduce-scatters the outputs.
+    "ATOM_DISABLE_MORI_EP": lambda: os.getenv("ATOM_DISABLE_MORI_EP", "0").lower()
+    in {"1", "true", "yes", "on"},
     # Use mori dispatch_combine_v2 (FlyDSL/cco, gfx1250 wave32) instead of the
     # production mori v1 (mori.ops.EpDispatchCombineOp) for the EP+DP MoE
     # all2all. v1 is authored for gfx942/950 and does not run on gfx1250; v2 is
@@ -134,6 +149,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION", "1") == "1"
     ),
+    # Set to 0 to stop a refused state-cache hit from placing a checkpoint of
+    # its own, leaving the prompt-end anchor as the only placement. Overrides
+    # --state-checkpoint-demand so the policy can be flipped without touching a
+    # launch script. The rung's write traffic may cost more in evictions than
+    # its reuse is worth — see `BlockManager._record_checkpoint_demand`.
+    "ATOM_STATE_CHECKPOINT_DEMAND": lambda: (
+        os.getenv("ATOM_STATE_CHECKPOINT_DEMAND", "1") == "1"
+    ),
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
     # total_kv = sum of all co-scheduled prefill contexts and is NOT bounded by
@@ -158,6 +181,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "0" to fall back to the per-op Python path if a regression is suspected.
     "ATOM_ENABLE_GLM_FUSED_INDEXER": lambda: (
         os.getenv("ATOM_ENABLE_GLM_FUSED_INDEXER", "1") == "1"
+    ),
+    # GLM-5.3 pooled sparse indexer. Disabling it is an exact A/B only while
+    # sequence length <= index_topk; the model refuses longer requests.
+    "ATOM_GLM5_KPOOL": lambda: os.getenv("ATOM_GLM5_KPOOL", "1") == "1",
+    # Bring-up/debug controls for the GLM-5.3 text path.
+    "ATOM_GLM5_FORCE_DENSE_MLA": lambda: (
+        os.getenv("ATOM_GLM5_FORCE_DENSE_MLA", "0") == "1"
+    ),
+    "ATOM_GLM5_DISABLE_FUSED_MHC": lambda: (
+        os.getenv("ATOM_GLM5_DISABLE_FUSED_MHC", "0") == "1"
     ),
     # Kimi-K3 DSpark draft: fuse the per-layer context-row KV write
     # (K3DSparkMLAAttention.write_context_kv) into one Triton kernel --
@@ -228,6 +261,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST": lambda: (
         os.getenv("ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", "0").lower() == "1"
     ),
+    # --- ReplaySSM (linear-attention state) ---
+    # Cache the SSM *inputs* (k, u, g) instead of one full recurrent state per
+    # speculative token.  The state pool stops scaling with the MTP window --
+    # e.g. Kimi-K3 at mtp_k=2, 64 seqs, tp=8 drops from 10.3 GiB to ~3.5 GiB --
+    # and the full-state write moves off the per-step path (rewritten only when
+    # the record buffer fills).  Rollback becomes a cursor move.
+    # See atom/model_ops/fla_ops/replayssm.py.
+    "ATOM_ENABLE_REPLAYSSM": lambda: (
+        None
+        if os.getenv("ATOM_ENABLE_REPLAYSSM") is None
+        else os.getenv("ATOM_ENABLE_REPLAYSSM", "0").lower() == "1"
+    ),
+    # Record-buffer depth L.  Must be >= 2*(mtp_k+1); raised automatically if
+    # set too low.  Larger L means fewer checkpoint write-backs but a longer
+    # rebuild each step; upstream measured 8-16 as the sweet spot.
+    "ATOM_REPLAYSSM_CACHE_LEN": lambda: int(
+        os.getenv("ATOM_REPLAYSSM_CACHE_LEN", "16")
+    ),
+    # "auto" | "serial" | "ut".  The UT-transform verify route only beats the
+    # serial one at verify windows >= ~12 tokens (measured on gfx950), so
+    # "auto" keeps practical MTP windows on the serial route.
+    "ATOM_REPLAYSSM_ROUTE": lambda: os.getenv("ATOM_REPLAYSSM_ROUTE", "auto").lower(),
+    # "fp32" | "fp16" | "bf16".  Storage dtype of the KDA temporal state pool,
+    # whose per-token traffic dominates KDA decode; the recurrence itself
+    # always accumulates in fp32.  fp16 over bf16 when narrowing: the state is
+    # O(1), so bf16's range buys nothing and its short mantissa costs accuracy.
+    "ATOM_GDN_SSM_DTYPE": lambda: os.getenv("ATOM_GDN_SSM_DTYPE", "fp32").lower(),
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT": lambda: (
         os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT", "1") == "1"
     ),
@@ -244,11 +304,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Log every garbage collection: generation, duration, objects reclaimed.
     "ATOM_GC_DEBUG": lambda: os.getenv("ATOM_GC_DEBUG", "0") == "1",
     # "t0,t1,t2" for gc.set_threshold(); empty keeps CPython's default.
-    # Read independently by the API server, each EngineCore and each
-    # ModelRunner worker -- thresholds are per-interpreter.  A fallback for
-    # ATOM_GC_FREEZE=0: freezing removes the cost of a pass, this only spaces
-    # the passes out.  See tune_gc in atom/utils/gc_utils.py.
+    # Thresholds are per-interpreter, but this is one variable, read by every
+    # process that serves -- and only the frontend was measured to reclaim
+    # nothing, so setting it tunes three others blind. t0 must be >= 1: zero
+    # stops collection while the watch still reports the healthy shape.
+    # See tune_gc in atom/utils/gc_utils.py.
     "ATOM_GC_THRESHOLD": lambda: os.getenv("ATOM_GC_THRESHOLD", "").strip(),
+    # Whether the incremental detokenizer may reuse the delta it last emitted
+    # in place of one of its two decodes per update. "auto" verifies at startup
+    # that this tokenizer decodes a token span the same way wherever the window
+    # starts; "on"/"off" pin it. Unrelated to the KV prefix cache.
+    # See enable_delta_reuse in atom/entrypoints/openai/streaming_dispatch.py.
+    "ATOM_DETOKENIZER_DELTA_REUSE": lambda: os.getenv(
+        "ATOM_DETOKENIZER_DELTA_REUSE", "auto"
+    )
+    .strip()
+    .lower(),
+    # How often the reused delta is checked against a real decode once reuse is
+    # on. 1 checks every update; a mismatch corrects that call's output and
+    # turns reuse off for the process.  Text, not int, for the reason
+    # ATOM_GC_THRESHOLD is: it is read as an argument at a callsite that has
+    # already loaded the weights, so it is parsed where a bad value can be
+    # answered with a warning instead of a traceback.
+    "ATOM_DETOKENIZER_AUDIT_EVERY": lambda: os.getenv(
+        "ATOM_DETOKENIZER_AUDIT_EVERY", ""
+    ).strip(),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
     # When profiling is active, append detailed attention aggregates (sqsq, sqsk, sk)
     # to the prefill[]/decode[] trace labels emitted by ModelRunner.run_model.
@@ -343,7 +423,40 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_CUSTOM_ALL_GATHER": lambda: (
         os.getenv("ATOM_USE_CUSTOM_ALL_GATHER", "1").lower() == "1"
     ),
+    # Pure-DP LM head strategy (only active when the model TP group is size 1 and
+    # the DP group is size > 1, i.e. pure DP attention on decode; every other
+    # case — TP>1, DP off, prefill, ragged/draft rows — auto-falls back to the
+    # replicated path via `_can_use_dp_sharded_head`):
+    #   "all2all"   -> shard vocab across the DP group + gather hidden, then a
+    #                  single all-to-all delivers each rank its own rows x full
+    #                  vocab (config ③, minimal comm). DEFAULT.
+    #   "allgather" -> same shard/gather, but vocab all-gather + scatter rows
+    #                  (config ②); kept for A/B and as a fallback.
+    #   "default"   -> replicated full-vocab GEMM per DP rank (big GEMM, no comm);
+    #                  explicit opt-out.
+    "ATOM_DP_LM_HEAD_MODE": lambda: os.getenv(
+        "ATOM_DP_LM_HEAD_MODE", "all2all"
+    ).lower(),
+    # Pure-DP draft greedy argmax: shard the draft lm_head vocab across the DP
+    # group so each rank reads [H, V/dp] instead of the full [H, V], exchanging
+    # only the packed [N, 2]. Active only for a unified (rectangular) pure-DP
+    # draft step; everything else falls back to the replicated local argmax.
+    "ATOM_DP_DRAFT_ARGMAX": lambda: os.getenv("ATOM_DP_DRAFT_ARGMAX", "1").lower()
+    in ("1", "true"),
+    # Row count (running_tokens) above which it falls back: the hidden gather
+    # grows with rows, so the shard only pays at small M. ~256 is the V4-Pro
+    # crossover.
+    "ATOM_DP_DRAFT_ARGMAX_MAX_ROWS": lambda: int(
+        os.getenv("ATOM_DP_DRAFT_ARGMAX_MAX_ROWS", "256")
+    ),
     "ATOM_USE_FLYDSL_GDR": lambda: os.getenv("ATOM_USE_FLYDSL_GDR", "0").lower() == "1",
+    # Capture each declared draft pass into a per-captured-size CUDAGraph as it is
+    # warmed, so the draft replays instead of relaunching every kernel. 0 drafts
+    # eagerly. On by default: DSpark tp1 acceptance is 65.25% captured vs 65.21%
+    # eager. Named for the draft, not a flavor -- see `DraftGraph.will_capture`.
+    "ATOM_DRAFT_CUDAGRAPH": lambda: (
+        os.getenv("ATOM_DRAFT_CUDAGRAPH", "1").lower() == "1"
+    ),
     # --- MoE (DeepSeek-style shared experts) ---
     # Dual-stream MoE only when num_tokens <= threshold; 0 disables dual-stream registration.
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
@@ -510,6 +623,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if os.getenv("ATOM_PREFILL_DELAYER_MAX_QUEUE_MS", "") == ""
         else float(os.getenv("ATOM_PREFILL_DELAYER_MAX_QUEUE_MS"))
     ),
+    # After a prefill forward, protect this many scheduler passes for decode
+    # before allowing another prefill. Mirrors SGLang's
+    # --prefill-decode-interval; 0 disables the hard interval.
+    "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
+        os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
+    ),
     # --- TBO prefill ubatch splitting ---
     # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),
     # cutting through a request if needed for perfectly balanced 50/50 ubatches.
@@ -585,3 +704,17 @@ def __getattr__(name: str):
 #   FLA_TRIL_PRECISION             — FLA ops library
 # VLLM_PP_LAYER_PARTITION         — vLLM legacy (still active in models/utils.py)
 # VLLM_USE_MODELSCOPE             — vLLM legacy (benchmarks)
+# LMCACHE_EC_PIN_TIMEOUT_SEC      — LMCache library's own source-pin timeout;
+#                                   read in kv_transfer/offload/_offload_common.py
+#                                   (offload_save_abandon_timeout_s) to derive the
+#                                   engine's save-abandon window from it, so the
+#                                   two stay ordered. The scheduler never reads the
+#                                   env itself -- it asks the connector, via
+#                                   save_abandon_timeout_s. ATOM does not own the
+#                                   knob, hence no default of its own here.
+# OFFLOAD_MAX_PENDING_SAVES       — offload connector queue-depth bound;
+#                                   defined/defaulted in
+#                                   kv_transfer/offload/_offload_common.py and
+#                                   documented in kv_transfer/offload/README.md.
+#                                   The state tier shares it (scheduler.py)
+#                                   rather than adding a second knob.

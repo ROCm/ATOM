@@ -7,6 +7,8 @@ on:
       - 'atom/mesh/**'
       - '.github/benchmark/models_atomesh.yaml'
       - '.github/scripts/atomesh/**'
+      - 'atom/entrypoints/openai/**'
+      - '.github/scripts/slurm_submit_helpers.sh'
       - '.github/workflows/atomesh-benchmark.yaml'
   pull_request:
     branches: [main]
@@ -15,6 +17,8 @@ on:
       - 'atom/mesh/**'
       - '.github/benchmark/models_atomesh.yaml'
       - '.github/scripts/atomesh/**'
+      - 'atom/entrypoints/openai/**'
+      - '.github/scripts/slurm_submit_helpers.sh'
       - '.github/workflows/atomesh-benchmark.yaml'
   schedule:
     # TW nightly for DeepSeek and GLM-Agentic cases only at 00:00 Beijing time (16:00 UTC).
@@ -57,7 +61,6 @@ on:
             glm-52-mxfp4-1p1d-tp4,glm-52-mxfp4-1p1d-tp8,
             glm-52-mxfp4-1p1d-tp4-agentic-1m-c1,glm-52-mxfp4-1p1d-tp4-agentic-1m-c2,
             glm-52-mxfp4-1p1d-tp4-agentic-1m-c4,glm-52-mxfp4-1p1d-tp4-agentic-1m-c8,
-            glm-52-mxfp4-1p1d-tp4-agentic-1m-c48,
             glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c24,
             glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c32,
             glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c48
@@ -460,7 +463,7 @@ jobs:
             SPUR_CONTROLLER_ADDR="http://crs-m2m-cpu-spur-005.crusoe.amd.com:6817"
             SPUR_ACCOUNTING_ADDR="http://crs-m2m-cpu-spur-005.crusoe.amd.com:6819"
           fi
-          source "${GITHUB_WORKSPACE}/.github/scripts/atomesh/slurm_submit_helpers.sh"
+          source "${GITHUB_WORKSPACE}/.github/scripts/slurm_submit_helpers.sh"
           install_slurm_cancel_traps
 
           rank_script="${run_dir}/run-rdma-smoke-rank.sh"
@@ -1187,6 +1190,10 @@ jobs:
 
       - name: Run Slurm benchmark cell
         env:
+          # Build the reviewed source in a separate setup container. Use the
+          # existing release profile for both benchmark and eval services.
+          ATOMESH_BUILD_MESH: ${{ matrix.benchmark.kind == 'aiperf_agentic' && 'true' || 'false' }}
+          ATOMESH_MESH_BUILD_PROFILE: release
           CELL_JSON: ${{ toJson(matrix) }}
           RESULT_DIR: atomesh-results
           SLURM_SUBMIT_RUNNER: ${{ matrix.runner.slurm_submit_runner }}
@@ -1288,6 +1295,45 @@ jobs:
 
           cat "${SUMMARY_PATH}"
 
+      - name: Upload AIPerf Perfetto traces
+        if: ${{ always() && matrix.benchmark.kind == 'aiperf_agentic' }}
+        uses: ./.github/actions/upload-aiperf-traces
+        with:
+          result-dir: atomesh-results/${{ matrix.id }}
+          artifact-name: aiperf-chrome-traces-${{ matrix.id }}
+          output-dir: aiperf-traces/${{ matrix.id }}
+          run-url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Prepare agentic PD latency reports
+        if: ${{ always() && matrix.benchmark.kind == 'aiperf_agentic' }}
+        id: metrics-reports
+        env:
+          MATRIX_ID: ${{ matrix.id }}
+        run: |
+          python3 .github/scripts/atomesh/observability/stage_reports.py \
+            --cell "$MATRIX_ID" \
+            --output "atomesh-reports/$MATRIX_ID"
+
+      - name: Upload agentic PD latency reports
+        if: ${{ always() && steps.metrics-reports.outcome == 'success' }}
+        id: metrics-artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: atomesh-latency-${{ matrix.id }}-${{ github.run_attempt }}
+          path: atomesh-reports/${{ matrix.id }}/
+          if-no-files-found: error
+
+      - name: Link latency reports in job summary
+        if: ${{ always() && steps.metrics-artifact.outcome == 'success' }}
+        env:
+          MATRIX_ID: ${{ matrix.id }}
+          METRICS_ARTIFACT_URL: ${{ steps.metrics-artifact.outputs.artifact-url }}
+        run: |
+          python3 .github/scripts/atomesh/observability/stage_reports.py \
+            --cell "$MATRIX_ID" \
+            --output "atomesh-reports/$MATRIX_ID" \
+            --summary-only
+
       - name: Upload model benchmark artifacts
         if: always()
         uses: actions/upload-artifact@v7
@@ -1343,6 +1389,15 @@ jobs:
             echo "No successful ATOMesh benchmark result JSONs were produced; dashboard publish will be skipped." >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: Upload AIPerf Perfetto traces
+        if: always()
+        uses: ./.github/actions/upload-aiperf-traces
+        with:
+          result-dir: atomesh-results
+          artifact-name: aiperf-chrome-traces-${{ github.run_id }}
+          output-dir: aiperf-traces
+          run-url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
       - name: Upload benchmark summary
         if: ${{ steps.summary.outputs.has_results == 'true' }}
         uses: actions/upload-artifact@v7
@@ -1383,6 +1438,12 @@ jobs:
           test -s atomesh-dashboard-input/atomesh-benchmark-action.json
           cp .github/dashboard/index.html /tmp/atomesh_dashboard_index.html
 
+      - name: Prepare existing dashboard data
+        id: prepare_dashboard_data
+        uses: ./.github/actions/prepare-dashboard-data
+        with:
+          data-path: benchmark-dashboard/data.js
+
       - name: Store ATOMesh benchmark result to dashboard
         uses: benchmark-action/github-action-benchmark@v1
         with:
@@ -1390,9 +1451,15 @@ jobs:
           output-file-path: atomesh-dashboard-input/atomesh-benchmark-action.json
           gh-pages-branch: gh-pages
           benchmark-data-dir-path: benchmark-dashboard
-          auto-push: true
+          auto-push: false
           max-items-in-chart: 300
           github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate dashboard data after write
+        uses: ./.github/actions/validate-dashboard-data
+        with:
+          data-path: benchmark-dashboard/data.js
+          min-entries: ${{ steps.prepare_dashboard_data.outputs.entry_count }}
 
       - name: Deploy ATOMesh dashboard shell to gh-pages
         run: |

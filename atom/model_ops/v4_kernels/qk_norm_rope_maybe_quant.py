@@ -71,6 +71,22 @@ class QKNormRopeOut:
     k_packed: torch.Tensor | None = None
     k_rope: torch.Tensor | None = None
 
+    def custom_op_return(self) -> list["torch.Tensor"]:
+        """This struct as a custom op's return value: the active layout's
+        tensors, in the order the boundary carries them.
+
+        A custom op schema cannot express this struct. It has no dataclass, and
+        `Tensor[]` cannot hold None (`infer_schema` rejects
+        `list[Tensor | None]` outright), while half of these fields always are
+        None -- so what crosses is the live ones only, and the ORDER is the
+        contract the caller re-expands by. Which layout is live is readable off
+        the struct itself -- the inactive path's fields stay None, as above --
+        so callers do not thread `kv_fp8` through to say it a second time.
+        """
+        if self.q_packed is not None:
+            return [self.q_packed, self.q_rope, self.k_packed, self.k_rope]
+        return [self.q_sa, self.kv]
+
 
 # Lazy-imported flydsl path (optional dependency). Set to None when flydsl
 # is unavailable; the dispatch in ``qk_norm_rope_maybe_quant`` will fall
@@ -79,7 +95,7 @@ try:
     from aiter.ops.flydsl import flydsl_qk_norm_rope_quant
 
     _FLYDSL_AVAILABLE = True
-except Exception:
+except Exception:  # noqa: BLE001 -- optional kernel; absence is the whole answer
     _FLYDSL_AVAILABLE = False
 
 
@@ -355,7 +371,7 @@ def _qk_norm_rope_maybe_quant_bf16(
     quant_k: bool = False,
     swa_kv: torch.Tensor | None = None,
     swa_dest_rows: torch.Tensor | None = None,
-    batch_id_per_token: torch.Tensor | None = None,
+    batch_id_per_q_token: torch.Tensor | None = None,
     prefix: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Fused per-token RMSNorm + GPT-J interleaved RoPE (+ optional FP8 quant).
@@ -386,7 +402,7 @@ def _qk_norm_rope_maybe_quant_bf16(
             ``swa_kv`` is set. The row is handed in rather than derived because
             the window's layout is not something a kernel in another repo
             should have to restate.
-        batch_id_per_token: ``[T]`` int32, ``-1`` on CG-pad tokens — token→seq
+        batch_id_per_q_token: ``[T]`` int32, ``-1`` on CG-pad tokens — token→seq
             map; padded tokens are skipped.
 
     Returns:
@@ -472,7 +488,9 @@ def _qk_norm_rope_maybe_quant_bf16(
             kv_out=kv_out,
             swa_kv=swa_kv,
             swa_dest_rows=swa_dest_rows,
-            batch_id_per_token=batch_id_per_token,
+            # aiter's parameter name -- NOT ours. Do not sweep it along when
+            # renaming the ATOM-side spelling.
+            batch_id_per_token=batch_id_per_q_token,
         )
 
     q_scale = (
@@ -546,15 +564,15 @@ def _qk_norm_rope_maybe_quant_bf16(
     # requested it (swa_kv provided) AND supplied the fallback's cu_seqlens_q
     # path args.
     if swa_kv is not None:
-        if swa_dest_rows is None or batch_id_per_token is None:
+        if swa_dest_rows is None or batch_id_per_q_token is None:
             raise ValueError(
                 "swa_kv on the Triton fallback path requires swa_dest_rows "
-                "and batch_id_per_token"
+                "and batch_id_per_q_token"
             )
         swa_scatter_rows(
             kv_out,
             swa_dest_rows,
-            batch_id_per_token,
+            batch_id_per_q_token,
             swa_kv,
             prefix=f"{prefix}.swa_scatter_rows" if prefix else "",
         )
@@ -578,7 +596,7 @@ def qk_norm_rope_maybe_quant(
     quant_k: bool = False,
     swa_kv: torch.Tensor | None = None,
     swa_dest_rows: torch.Tensor | None = None,
-    batch_id_per_token: torch.Tensor | None = None,
+    batch_id_per_q_token: torch.Tensor | None = None,
     prefix: str = "",
     *,
     fp8_2buff: bool = False,
@@ -603,7 +621,7 @@ def qk_norm_rope_maybe_quant(
       (prefill) / op5 (decode) with no requant. The decode path additionally
       fuses the SWA scatter into the same launch via ``swa_nope_scale_buff``
       / ``swa_rope_buff`` / ``swa_dest_rows`` /
-      ``batch_id_per_token`` (pass ``None`` for prefill, which scatters its
+      ``batch_id_per_q_token`` (pass ``None`` for prefill, which scatters its
       window tail post-attention). Returns a :class:`QKNormRopeOut` with
       ``q_packed`` / ``q_rope`` / ``k_packed`` / ``k_rope`` populated.
 
@@ -625,7 +643,7 @@ def qk_norm_rope_maybe_quant(
             quant_k=quant_k,
             swa_kv=swa_kv,
             swa_dest_rows=swa_dest_rows,
-            batch_id_per_token=batch_id_per_token,
+            batch_id_per_q_token=batch_id_per_q_token,
             prefix=prefix,
         )
         return QKNormRopeOut(q_sa=q_out, kv=kv_out, q_scale=q_scale, kv_scale=kv_scale)
@@ -667,7 +685,8 @@ def qk_norm_rope_maybe_quant(
         # (which entry, which run inside it) stays in `v4_pool_geometry`, so a
         # layout change never needs this kernel rebuilt.
         swa_dest_row=swa_dest_rows,
-        batch_id_per_token=batch_id_per_token,
+        # aiter's parameter name -- NOT ours (see the flydsl call above).
+        batch_id_per_token=batch_id_per_q_token,
     )
     return QKNormRopeOut(
         q_packed=q_packed, q_rope=q_rope, k_packed=k_packed, k_rope=k_rope

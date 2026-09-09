@@ -48,6 +48,7 @@ def make_delayer(**kw):
         "stall_ticks": 3,
         "kv_high_watermark": 0.9,
         "token_usage_low_watermark": None,
+        "prefill_decode_interval": 0,
     }
     defaults.update(kw)
     # The cross-DP all_reduce only runs when cpu_group is not None (dp=1/TP-only
@@ -284,6 +285,67 @@ class TestParamClamps:
         assert d.ttft_max_ticks == 1
         assert d.partial_max_ticks == 1
         assert d.stall_ticks == 1
+
+    def test_negative_prefill_decode_interval_rejected(self):
+        with pytest.raises(ValueError, match="must be non-negative"):
+            make_delayer(prefill_decode_interval=-1)
+
+
+class TestPrefillDecodeInterval:
+    def test_protects_exact_number_of_decode_passes(self):
+        d = make_delayer(
+            prefill_decode_interval=3,
+            ttft_max_ticks=1,
+            stall_ticks=1,
+            kv_high_watermark=0.1,
+        )
+        # FIRE only grants admission; the completed prefill forward arms it.
+        assert call(d, pending_tokens=MAX_BATCHED, kv_usage=1.0) is True
+        d.notify_prefill_executed()
+        # The hard interval takes precedence over all ordinary coalescer
+        # release conditions and does not consume the coalescer TTFT budget.
+        for _ in range(3):
+            assert call(d, pending_tokens=MAX_BATCHED, kv_usage=1.0) is False
+        assert d._hold_ticks == 0
+        assert d._stat_hold_decode_interval == 3
+        # The next pass reaches the normal decision and fires on KV pressure.
+        assert call(d, pending_tokens=MAX_BATCHED, kv_usage=1.0) is True
+
+    def test_countdown_advances_when_no_prefill_is_waiting(self):
+        d = make_delayer(prefill_decode_interval=2)
+        assert call(d, pending_tokens=MAX_BATCHED) is True
+        d.notify_prefill_executed()
+        assert call(d, prefillable=False, pending_tokens=0) is True
+        assert call(d, prefillable=False, pending_tokens=0) is True
+        assert d._decode_interval_remaining == 0
+
+    def test_no_decode_does_not_block_prefill_progress(self):
+        d = make_delayer(prefill_decode_interval=10)
+        assert call(d, pending_tokens=MAX_BATCHED, running_decode_batch=0) is True
+        d.notify_prefill_executed()
+        # A partial-only workload has no decode pass to protect, so it may
+        # continue instead of producing ten empty scheduler iterations.
+        assert call(d, pending_tokens=1000, running_decode_batch=0) is True
+
+    def test_fire_without_executed_prefill_does_not_arm_interval(self):
+        d = make_delayer(
+            prefill_decode_interval=3,
+            ttft_max_ticks=1,
+            stall_ticks=1,
+            kv_high_watermark=0.1,
+        )
+        assert call(d, pending_tokens=MAX_BATCHED, kv_usage=1.0) is True
+        # Admission may still yield no prefill batch. Without an execution
+        # notification, the next eligible prefill must not be delayed.
+        assert call(d, pending_tokens=MAX_BATCHED, kv_usage=1.0) is True
+        assert d._stat_hold_decode_interval == 0
+
+    def test_execution_on_peer_arms_all_ranks(self):
+        d = make_delayer(dp_size=2, prefill_decode_interval=1)
+        skip_first(d)
+        peer_prefill_ran = _add_rank({7: 1})
+        assert call(d, pending_tokens=1000, reduce=peer_prefill_ran) is False
+        assert d._stat_hold_decode_interval == 1
 
 
 class TestStatsDistinct:

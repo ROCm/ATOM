@@ -427,10 +427,10 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
 
                     original_batch_size = forward_batch.batch_size
                     original_out_cache_loc = forward_batch.out_cache_loc
-                    graph_bs = int(self.bs)
-                    forward_batch.batch_size = graph_bs
+                    running_bs = int(self.bs)
+                    forward_batch.batch_size = running_bs
                     forward_batch.out_cache_loc = self.buffers.out_cache_loc[
-                        : graph_bs * self.topk * self.speculative_num_steps
+                        : running_bs * self.topk * self.speculative_num_steps
                     ]
                     try:
                         stage_glm52_draft_decode_graph_metadata(

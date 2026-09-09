@@ -78,7 +78,7 @@ def test_build_context_falls_back_to_local_decode_mode(monkeypatch):
 
     context, num_tokens = SGLangGDNForwardContext._build_context(forward_batch)
 
-    assert context.dp_uniform_decode
+    assert context.running_tokens_are_unified
     assert num_tokens == 2
 
 

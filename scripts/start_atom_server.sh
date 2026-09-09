@@ -56,7 +56,13 @@ done
 
 # 4. Clear stale compile cache
 rm -rf ~/.cache/atom/*
-rm -rf ./gpucore.*
+
+# 5. Reclaim ROCm core dumps from a previous fault: one 8-rank fault writes
+# ~283GB and fills the disk. HSA_ENABLE_COREDUMP=0 does NOT prevent them
+# (measured), so clearing here is the only thing that works. Anchored to the
+# repo, since the dumps land next to the server's CWD, not the caller's.
+REPO_ROOT="$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")"
+rm -rf "$REPO_ROOT"/gpucore.* ./gpucore.*
 
 # Write config header to log (truncates old content).
 # Inherited env vars are dumped explicitly so you never have to wonder

@@ -7,7 +7,9 @@
 set -euo pipefail
 
 CHECKS_WORKFLOW_NAME="${CHECKS_WORKFLOW_NAME:-Pre Checkin}"
-MAX_RETRIES="${MAX_RETRIES:-5}"
+# Pre Checkin can spend several minutes queued before it starts. Keep polling
+# long enough to cover normal CI startup and scheduling delays.
+MAX_RETRIES="${MAX_RETRIES:-20}"
 RETRY_INTERVAL_SECONDS="${RETRY_INTERVAL_SECONDS:-30}"
 REPO="${GITHUB_REPOSITORY:-}"
 SIGNAL_EVENT_NAME="${CHECK_SIGNAL_EVENT_NAME:-${GITHUB_EVENT_NAME:-}}"

@@ -253,16 +253,32 @@ assert lmcache.c_ops.__file__.endswith('.so'), 'c_ops fell back to python backen
 print('OK: lmcache', lmcache.__version__, 'HIP c_ops; torch', torch.__version__)"
 
 # ========== SemiAnalysis aiperf agentic benchmark tool ==========
-# Install the SemiAnalysis fork pinned to the commit that supports the SA
-# agentic datasets (semianalysis_cc_traces_weka_062126*).
+# The SemiAnalysis fork, which is what carries the SA agentic datasets
+# (semianalysis_cc_traces_weka_062126*).
+#
+# Pinned to the commit InferenceX's `utils/aiperf` submodule points at, so our
+# image ships the aiperf they measure with. Their pointer is a deliberate,
+# frequently-moved pin -- four bumps in the first half of August 2026, and a
+# same-day revert on 2026-07-28 -- with commit titles that read "pin AIPerf v1
+# timing watchdog", "pin additive AIPerf main warmup". Tracking aiperf's master
+# instead would take in exactly the upstream changes they evaluate and
+# sometimes reject.
+#
+# It therefore has to be followed by hand. To re-check:
+#   git ls-tree main utils/aiperf     # in a clone of SemiAnalysisAI/InferenceX
+#
+# `SA_AIPERF_REF` accepts any ref; empty means "whatever HEAD points at", which
+# is why the checkout below is conditional rather than naming a branch (an
+# upstream default-branch rename would otherwise break unrelated builds).
 ARG INSTALL_SA_AIPERF=1
-ARG SA_AIPERF_COMMIT="0d2aa0572ac685943d38c580675c4a61023581d3"
+ARG SA_AIPERF_REF="754356e9a39acc6cc6afb242d123bb57c3fb6f75"
 RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
-        echo "========== [ATOM] Install SemiAnalysis aiperf (${SA_AIPERF_COMMIT}) =========="; \
+        echo "========== [ATOM] Install SemiAnalysis aiperf (ref=${SA_AIPERF_REF:-<default branch>}) =========="; \
         rm -rf /opt/aiperf && \
         git clone https://github.com/SemiAnalysisAI/aiperf.git /opt/aiperf && \
         cd /opt/aiperf && \
-        git checkout "${SA_AIPERF_COMMIT}" && \
+        { [ -z "${SA_AIPERF_REF}" ] || git checkout "${SA_AIPERF_REF}"; } && \
+        echo "[ATOM] aiperf resolved to $(git rev-parse HEAD)" && \
         sed -i '/^[[:space:]]*"transformers @ git+/d' pyproject.toml && \
         ! grep -q '^[[:space:]]*"transformers @ git+' pyproject.toml && \
         "${VENV_PYTHON}" -m pip install -e . && \

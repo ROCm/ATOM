@@ -42,7 +42,11 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `kv_cache_dtype` | `str` | `"bf16"` | KV cache data type (`"bf16"` or `"fp8"`) |
 | `index_cache_dtype` | `str \| None` | `None` | Indexer-cache dtype, resolved after model detection. Native single-node DeepSeek-V4 defaults to `"fp4"` except on gfx942; plugin and KV-transfer integrations retain `"fp8"`. Other models inherit `kv_cache_dtype`. An explicit `"bf16"`, `"fp8"`, or `"fp4"` value is preserved. |
 | `enable_prefix_caching` | `bool` | `False` | Enable prefix caching to reuse KV blocks across requests sharing the same prefix |
-| `state_checkpoint_interval_tokens` | `int` | `8192` | For models with per-request state (DeepSeek-V4 compressor ring, GDN recurrent state): keep a state checkpoint every N tokens of context, so a later prefix hit can resume there. A prompt shorter than N checkpoints nothing. Must be a multiple of the prefix-cache hash block size; `0` disables checkpoints. See the state-checkpoint section of the [scheduling & KV cache guide](scheduling_kv_cache_guide.md) |
+| `enable_log_stats` | `bool` | `True` | Emit the periodic engine-status line (running/waiting reqs, KV usage, prefix-cache hit rate, prompt/generation throughput). Applies to offline `LLM(...)` as well as to the server. Scoped to that line: `[MTP Stats]` and `[Cache Stats]` have their own gates |
+| `throughput_log_interval` | `float` | `10.0` | Seconds between engine-status lines. Must be > 0 |
+| `cache_hit_rate_window` | `int` | `1000` | Requests in the sliding window behind the engine-status line's prefix-cache hit rate. Must be > 0. Only that line is windowed; `/metrics` and `[Cache Stats]` stay cumulative |
+| `state_checkpoint_interval_tokens` | `int` | `8192` | For models with per-request state (DeepSeek-V4 compressor ring, GDN recurrent state, Kimi-K3 KDA): tokens between rungs of the checkpoint ladder. The sign carries three policies — `>0` a rung every N tokens (must be a multiple of the prefix-cache hash block size), `0` checkpointing off entirely, `-1` ladder off while the prompt-end anchor and the demand rung still place. See the state-checkpoint section of the [scheduling & KV cache guide](scheduling_kv_cache_guide.md) |
+| `state_checkpoint_demand` | `bool` | `True` | Whether a prefix hit refused for want of a checkpoint may place a rung of its own. Off leaves the prompt-end anchor as the only placement. Overridden by `ATOM_STATE_CHECKPOINT_DEMAND` |
 | `port` | `int` | `8006` | Engine internal communication port |
 | `torch_profiler_dir` | `str \| None` | `os.getenv("ATOM_TORCH_PROFILER_DIR", None)` | Directory for saving PyTorch profiler traces; creates the directory if it does not exist |
 | `compilation_config` | `CompilationConfig` | `CompilationConfig()` | Compilation and CUDA graph settings (see Section 2) |
@@ -51,7 +55,7 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `load_dummy` | `Optional[str]` | `None` | Dummy-weight mode (no checkpoint read): `None` off; `"empty"` skip load (uninitialized, legacy); `"zero"` all-zero; `"xavier"` xavier for bf16, constant target magnitude for fp4/fp8 |
 | `enable_expert_parallel` | `bool` | `False` | Enable Expert Parallelism for MoE models |
 | `master_addr` | `str` | `"127.0.0.1"` | Master address for distributed communication |
-| `graph_bs` | `Optional[list[int]]` | `None` | Explicit list of batch sizes for CUDA graph capture; derived from `compilation_config` during init |
+| `capture_sizes` | `Optional[list[int]]` | `None` | Explicit list of batch sizes for CUDA graph capture; derived from `compilation_config` during init |
 | `enable_dp_attention` | `bool` | `False` | Enable data-parallel attention |
 | `dp_load_balance` | `str` | `"least_requests"` | DP request-routing strategy: `"round_robin"` (legacy), `"least_requests"` (default; fewest in-flight requests, ties broken by lighter in-flight prompt-token load), or `"least_tokens"` (lowest `sum_prompt_tokens + ATOM_DP_LB_REQ_EQUIV * num_reqs`). Only effective when >1 DP rank. See distributed guide §2 |
 | `torch_dtype` | `torch.dtype` | *(computed)* | Inferred from `hf_config.torch_dtype`; falls back to `torch.bfloat16` |
@@ -355,6 +359,8 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--data-parallel-size` | `-dp` | `int` | `1` | Data parallel size |
 | `--enforce-eager` | | flag | `False` | Enforce eager mode execution |
 | `--enable_prefix_caching` | | flag | `False` | Enable prefix caching |
+| `--enable-log-stats` / `--no-enable-log-stats` | | flag | `True` | Emit the periodic engine-status line |
+| `--throughput-log-interval` | | `float` | `10.0` | Seconds between engine-status lines |
 | `--port` | | `int` | `8006` | Engine internal port |
 | `--kv_cache_dtype` | | `str` | `"bf16"` | KV cache dtype; choices: `bf16`, `fp8` |
 | `--index-cache-dtype`, `--index_cache_dtype` | | `str` | `None` | Indexer-cache dtype; choices: `bf16`, `fp8`, `fp4`. When omitted, uses the architecture- and integration-aware `Config.index_cache_dtype` defaults described above. |
@@ -369,7 +375,8 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--method` | | `str` | `None` | Speculative method; choices: `mtp` |
 | `--num-speculative-tokens` | | `int` | `1` | Number of speculative tokens per iteration |
 | `--max-num-batched-tokens` | | `int` | `16384` | Maximum number of tokens to batch in the async engine |
-| `--state-checkpoint-interval-tokens` | | `int` | `8192` | Tokens between per-request state checkpoints; must be a multiple of the prefix-cache hash block size, `0` disables them. Prompts shorter than one interval publish nothing, which is what keeps the feature free on workloads that never reuse a prefix. Also quantizes prefill chunk boundaries, since a checkpoint is only valid where a forward ends exactly on one |
+| `--state-checkpoint-interval-tokens` | | `int` | `8192` | Tokens between rungs of the per-request state checkpoint ladder; must be a multiple of the prefix-cache hash block size. `0` turns checkpointing off entirely; **`-1` turns off only the ladder**, leaving the prompt-end anchor and the demand rung as the placements. Prompts shorter than one interval publish no rung. A rung also quantizes prefill chunk boundaries, since a checkpoint is only valid where a forward ends exactly on one — which is most of what `-1` buys back |
+| `--state-checkpoint-demand` / `--no-state-checkpoint-demand` | | `bool` | on | Let a prefix hit that was refused for want of a checkpoint place a rung of its own. Off leaves the prompt-end anchor as the only placement. `ATOM_STATE_CHECKPOINT_DEMAND=0` overrides this without touching a launch script |
 | `--max-num-seqs` | | `int` | `512` | Maximum number of sequences to batch together |
 | `--gpu-memory-utilization` | | `float` | `0.9` | Fraction of GPU memory to use (0.0 — 1.0) |
 | `--scheduler-delay-factor` | | `float` | `0.0` | Delay factor multiplied by previous prompt latency before scheduling next prompt |

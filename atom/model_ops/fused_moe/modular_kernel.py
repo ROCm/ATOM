@@ -1,16 +1,17 @@
 from abc import ABC, abstractmethod
-
+from collections.abc import Callable
 from dataclasses import dataclass
-from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
-from atom.model_ops.fused_moe.utils import disable_inplace
-from atom.utils.tbo.ubatching import tbo_overlap_enabled
-from atom.utils.forward_context import get_forward_context
-import torch
-from typing import Callable, Optional, final
 from enum import Enum
+from typing import final
+
+import torch
 from aiter import ActivationType, QuantType
 from aiter.fused_moe import fused_moe
-from aiter.dist.parallel_state import get_dp_group
+
+from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
+from atom.model_ops.fused_moe.utils import disable_inplace
+from atom.utils.forward_context import get_forward_context
+from atom.utils.tbo.ubatching import tbo_overlap_enabled
 
 
 class FusedMoEActivationFormat(Enum):
@@ -79,6 +80,10 @@ class FusedMoEPrepareAndFinalize(ABC):
 
     def supports_async(self) -> bool:
         return False
+
+    def needs_dispatch_output_trim(self) -> bool:
+        """Whether prepare may return a fixed-capacity buffer with a dead tail."""
+        return True
 
     def prepare_async(
         self,
@@ -282,6 +287,29 @@ class FusedMoEModularKernel(torch.nn.Module):
                 output = result()
         return output
 
+    def _trim_dispatch_output_if_needed(
+        self,
+        dispatch_a1: torch.Tensor,
+        dispatch_scale: torch.Tensor | None,
+        dispatch_ids: torch.Tensor,
+        dispatch_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        expert_tokens_meta,
+    ):
+        # Exact-size transports such as RCCL have no inactive arena tail. Keep
+        # this gate outside _maybe_trim_dispatch_output so frontend overrides
+        # of the MoRI-specific policy cannot accidentally trim exact outputs.
+        if not self.prepare_finalize.needs_dispatch_output_trim():
+            return dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights
+        return self._maybe_trim_dispatch_output(
+            dispatch_a1,
+            dispatch_scale,
+            dispatch_ids,
+            dispatch_weights,
+            topk_ids,
+            expert_tokens_meta,
+        )
+
     def _maybe_trim_dispatch_output(
         self,
         dispatch_a1: torch.Tensor,
@@ -293,23 +321,30 @@ class FusedMoEModularKernel(torch.nn.Module):
     ):
         """Trim the mori dispatch buffer's dead tail before fused_moe.
 
-        Default (native/sglang/rtp) policy: under a uniform all-ranks-decode
-        batch, trim to the static graph_bs*dp bound so the shape is
-        consistent across cudagraph capture/replay. mori dispatch dedups per
-        destination rank, so a rank receives at most graph_bs tokens per source
-        rank -- the bound must not multiply by topk. atom-vllm needs a different,
-        exact received-token trim for DP+EP mixed batches and overrides this
-        method via a plugin patch -- keep this body frontend-agnostic.
+        The bound is what the GROUP sent -- mori dedups per destination, so each
+        source rank contributes at most its own count, and never that times
+        topk. `running_tokens * dp_size` is the same number only while the group
+        is uniform; a TBO ubatch splits per-rank, and on the smaller rank the
+        product trims BELOW the `expert_num_tokens` fused_moe is driven by,
+        which walks moe_sorting's zero-fill off a workspace sized from the
+        trimmed width. A sum is the group's count however unevenly it was
+        reached, so nothing here excludes a ragged step either.
+
+        atom-vllm needs a different, exact received-token trim for DP+EP mixed
+        batches and overrides this method via a plugin patch -- keep this body
+        frontend-agnostic.
         """
         context = get_forward_context().context
         if context is None:
             return dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights
 
-        dp_size = get_dp_group().world_size
-        # graph_bs keeps the trimmed shape consistent during capture/replay.
-        total_valid_tokens = context.graph_bs * dp_size
-        all_ranks_decode = getattr(context, "dp_uniform_decode", not context.is_prefill)
-        if total_valid_tokens < dispatch_a1.shape[0] and all_ranks_decode:
+        across_dp = context.running_tokens_across_dp
+        assert across_dp is not None, (
+            "an all2all MoE needs the group's per-rank counts to bound what its "
+            "dispatch delivered; this step reached it with none reduced"
+        )
+        total_valid_tokens = sum(across_dp)
+        if total_valid_tokens < dispatch_a1.shape[0]:
             dispatch_a1 = dispatch_a1[:total_valid_tokens]
             dispatch_ids = dispatch_ids[:total_valid_tokens]
             dispatch_weights = dispatch_weights[:total_valid_tokens]
@@ -331,15 +366,15 @@ class FusedMoEModularKernel(torch.nn.Module):
         expert_map: torch.Tensor | None = None,
         expert_mask: torch.Tensor | None = None,
         apply_router_weight_on_input: bool = False,
-        w1_scale: Optional[torch.Tensor] = None,
-        w2_scale: Optional[torch.Tensor] = None,
-        a1_scale: Optional[torch.Tensor] = None,
-        a2_scale: Optional[torch.Tensor] = None,
-        bias1: Optional[torch.Tensor] = None,
-        bias2: Optional[torch.Tensor] = None,
-        hidden_pad: Optional[int] = 0,
-        intermediate_pad: Optional[int] = 0,
-        moe_extra_args: Optional[dict] = None,
+        w1_scale: torch.Tensor | None = None,
+        w2_scale: torch.Tensor | None = None,
+        a1_scale: torch.Tensor | None = None,
+        a2_scale: torch.Tensor | None = None,
+        bias1: torch.Tensor | None = None,
+        bias2: torch.Tensor | None = None,
+        hidden_pad: int | None = 0,
+        intermediate_pad: int | None = 0,
+        moe_extra_args: dict | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
 
         if inplace and self.shared_experts is None and not disable_inplace():
@@ -378,7 +413,7 @@ class FusedMoEModularKernel(torch.nn.Module):
             dispatch_scale,
             dispatch_ids,
             dispatch_weights,
-        ) = self._maybe_trim_dispatch_output(
+        ) = self._trim_dispatch_output_if_needed(
             dispatch_a1,
             dispatch_scale,
             dispatch_ids,
