@@ -167,6 +167,21 @@ class PagedAttentionImpl(nn.Module):
             return False
         return q.shape[1] % k.shape[1] == 0
 
+    def _reject_per_token_scales_on_unified(self, k_scale, v_scale, phase: str):
+        """unified_attention carries one descale for the whole tensor.
+
+        Feeding it a per-token cache is not an error downstream, just wrong
+        numbers, so it has to be refused here. Both phases route into unified on
+        the same conditions, so both check.
+        """
+        if (k_scale is not None and k_scale.numel() > 1) or (
+            v_scale is not None and v_scale.numel() > 1
+        ):
+            raise NotImplementedError(
+                f"layer {self.layer_num} takes unified_attention for {phase}, "
+                "which cannot carry its per-token KV scales"
+            )
+
     def forward_impl(
         self,
         q: torch.Tensor,
@@ -490,16 +505,7 @@ class PagedAttentionImpl(nn.Module):
         of the reasons for it.
         """
         attn_metadata = fwd_ctx.attn_metadata
-
-        # unified takes a single descale for the whole tensor. Feeding it a
-        # per-token cache is not an error downstream, just wrong numbers.
-        if (k_scale is not None and k_scale.numel() > 1) or (
-            v_scale is not None and v_scale.numel() > 1
-        ):
-            raise NotImplementedError(
-                f"query length {attn_metadata.max_seqlen_q} routes this layer to "
-                "unified_attention, which cannot carry its per-token KV scales"
-            )
+        self._reject_per_token_scales_on_unified(k_scale, v_scale, "decode")
 
         if envs.ATOM_USE_UNIFIED_ATTN and self.kv_cache_dtype.startswith("fp8"):
             o = torch.empty(*q.shape, dtype=torch.bfloat16, device=q.device)
@@ -787,7 +793,6 @@ class PagedAttentionImpl(nn.Module):
     def prefill_attention_triton(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
-
         # unified_attention supports both prefill and decode, over either the 4D
         # flash layout (shuffled_kv_cache=False) or the 5D SHUFFLE layout
         # (shuffled_kv_cache=True):
@@ -825,6 +830,9 @@ class PagedAttentionImpl(nn.Module):
         # are read straight from `k_cache`/`v_cache`, identical to the
         # prefix-cache-hit path.
         if envs.ATOM_USE_UNIFIED_ATTN or attn_metadata.has_cached:
+            # Only this branch reads the quantized cache; the else below passes
+            # raw bf16 K/V, where a per-token scale never reaches the kernel.
+            self._reject_per_token_scales_on_unified(k_scale, v_scale, "prefill")
             k_for_attn = k_cache
             v_for_attn = v_cache
             # Reads the paged KV cache, which is 5D SHUFFLE unless the (default)
@@ -876,26 +884,38 @@ class PagedAttentionImpl(nn.Module):
     def _dispatch_decode(self, max_qlen: int = 1):
         """The single place that answers which decode kernel runs.
 
-        The runners do not re-decide; the vLLM bridge mirrors this order. Both
+        The runners do not re-decide. The vLLM bridge shares the constants and
+        the predicate, not this order -- its arms differ (no unified fallback,
+        no sliding-window arm). Both
         paged kernels stop short of unified, at different points, and drafting
         multiplies the query group into both limits. ASM is the one that must be
         checked here rather than inside its runner: past its envelope
         get_heuristic_kernel silently re-runs with mtp=1, a kernel built for
         another query length, and computes a wrong answer instead of refusing.
         """
+        # Clamped once here so both gates see the same value; the predicate
+        # clamps internally too, and a sentinel would otherwise split them.
+        max_qlen = max(1, int(max_qlen))
         over_gluon = gluon_decode_over_limit(
             max_qlen, self.num_heads, self.num_kv_heads
         )
         over_asm = (
-            int(max_qlen) * (self.num_heads // self.num_kv_heads)
+            max_qlen * (self.num_heads // self.num_kv_heads)
             > PA_ASM_MAX_QUERY_GROUP_SIZE
+        )
+
+        # unified takes any shape; the two paged kernels do not. Kept as one
+        # expression because a sliding-window layer needs the same answer, and
+        # it returns before the env checks below.
+        wants_unified = (
+            envs.ATOM_USE_UNIFIED_ATTN or self.use_flash_layout or over_gluon
         )
 
         # Sliding-window layers must use triton (ASM paths don't support it)
         if self.sliding_window != -1:
             return (
                 self.paged_attention_unified
-                if over_gluon
+                if wants_unified
                 else self.paged_attention_triton
             )
 
@@ -904,17 +924,20 @@ class PagedAttentionImpl(nn.Module):
         if envs.ATOM_USE_UNIFIED_ATTN:
             if envs.ATOM_FORCE_ATTN_TRITON:
                 return self.paged_attention_unified
-            if atom_config.kv_cache_block_size == 256 and not over_asm:
+            if atom_config.kv_cache_block_size == 256:
                 return self.paged_attention_persistent_asm
             return self.paged_attention_unified
 
-        if self.use_flash_layout or over_gluon:
+        if wants_unified:
             return self.paged_attention_unified
         if self.use_triton_attn:
             return self.paged_attention_triton
 
-        if use_pa_decode_bf16_asm() and not over_asm:
-            return self.paged_attention_persistent_asm
+        # use_pa_decode_bf16_asm() requires ATOM_USE_UNIFIED_ATTN, which the
+        # block above has already returned on, so it cannot be reached here.
+        # Only run_pa_fwd_asm is bounded here. The persistent paths above call
+        # pa_persistent_fwd / pa_decode_bf16_asm, different kernels with their
+        # own tables, so this envelope does not describe them.
         if over_asm:
             return self.paged_attention_triton
         return self.paged_attention_asm

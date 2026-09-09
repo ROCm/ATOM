@@ -23,6 +23,7 @@ pytest.importorskip("triton", reason="index_topk defines @triton.jit kernels")
 
 from atom.model_ops.minimax_m3.index_topk import (
     DECODE_SCORE_MIN_BLOCKS,
+    DECODE_SCORE_TARGET_GRID,
     PREFILL_TOPK_MAX_BLOCK_SIZE_K,
     PREFILL_TOPK_MIN_BLOCK_SIZE_K,
     SPARSE_BLOCK_SIZE,
@@ -76,12 +77,22 @@ class TestDecodeScoreChunks:
         # block and that none of them is empty by construction.
         n = _decode_score_chunks(batch, max_block)
         assert 1 <= n <= max_block
-        # MIN_BLOCKS is what bounds the count now; MAX_CHUNKS sits above
-        # `_require_packable`'s ceiling and can no longer bind.
+        # Two bounds, one per end of the batch range.
         assert n <= max(1, -(-max_block // DECODE_SCORE_MIN_BLOCKS))
+        assert batch * n <= max(DECODE_SCORE_TARGET_GRID, batch)
         chunk_blocks = -(-max_block // n)
         assert chunk_blocks * n >= max_block
         assert chunk_blocks * (n - 1) < max_block
+
+    def test_the_ceiling_binds_at_high_batch(self):
+        """The floor alone would return the same count at every batch.
+
+        Asserted against a literal rather than DECODE_SCORE_TARGET_GRID: a bound
+        read from the constant moves with it, so raising the constant back out
+        of range would satisfy the assertion instead of failing it.
+        """
+        assert _decode_score_chunks(8, 8192) > _decode_score_chunks(128, 8192)
+        assert _decode_score_chunks(128, 8192) * 128 <= 16384
 
     @pytest.mark.parametrize("batch", [1, 64])
     def test_an_empty_bound_still_gives_a_grid(self, batch):

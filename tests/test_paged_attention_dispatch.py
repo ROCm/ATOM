@@ -17,6 +17,8 @@ bound -- a Triton compile error with nothing in it about speculative length.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 pytest.importorskip("triton", reason="base_attention defines @triton.jit kernels")
@@ -48,7 +50,7 @@ class TestGluonEnvelope:
                 False,
                 "M3 dense at tp4 with 3 draft tokens: 16*4=64, on the limit",
             ),
-            (5, 16, 1, True, "one more draft token: 80 rounds to 128, off the table"),
+            (5, 16, 1, True, "one more draft token: past both limits at once"),
             (4, 32, 2, False, "M3 dense at tp2 -- ratio is still 16"),
             (
                 5,
@@ -76,13 +78,12 @@ class TestGluonEnvelope:
         assert 3 * (17 // 1) <= PA_GLUON_MAX_QUERY_GROUP_SIZE
         assert gluon_decode_over_limit(3, 17, 1) is True
 
-    @pytest.mark.parametrize("max_qlen", [0, -1, -100])
+    # 0 and -1 pass with or without the clamp -- they are boundary shapes, not
+    # evidence. -5 and -100 are: unclamped their bit_length alone synthesises a
+    # 128- and 2048-wide group out of what is really one position.
+    @pytest.mark.parametrize("max_qlen", [0, -1, -5, -100])
     def test_non_positive_query_length_is_clamped(self, max_qlen):
-        """A sentinel or unset length must not synthesise a large group.
-
-        Without the clamp `(-100).bit_length()` alone yields a 128-wide query
-        tile and the call reports over-limit for what is really one position.
-        """
+        """A sentinel or unset length must not synthesise a large group."""
         assert gluon_decode_over_limit(max_qlen, 16, 1) is False
         assert gluon_decode_over_limit(max_qlen, 16, 1) == gluon_decode_over_limit(
             1, 16, 1
@@ -123,3 +124,122 @@ class TestEnvelopeConstants:
         asm_pa.cu:113-116 carries `# mtp * gqa <= 16` as a source comment.
         """
         assert PA_ASM_MAX_QUERY_GROUP_SIZE < PA_GLUON_MAX_QUERY_GROUP_SIZE
+
+
+class _Layer:
+    """Just the attributes _dispatch_decode reads.
+
+    It touches six of them plus two env flags and returns a bound method, so the
+    routing table can be driven without a device -- which the envelope tests
+    above cannot do, and which is the gap a sliding-window regression slipped
+    through once already.
+    """
+
+    def __init__(self, sliding_window=-1, num_heads=16, num_kv_heads=1, **flags):
+        self.sliding_window = sliding_window
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.use_triton_attn = flags.get("use_triton_attn", False)
+        self.use_flash_layout = flags.get("use_flash_layout", False)
+        for name in (
+            "paged_attention_unified",
+            "paged_attention_triton",
+            "paged_attention_asm",
+            "paged_attention_persistent_asm",
+        ):
+            setattr(self, name, name)
+
+
+def _route(monkeypatch, max_qlen, block_size=128, unified=False, force=False, **kw):
+    from atom.model_ops import attention_mha as mha
+
+    monkeypatch.setattr(mha.envs, "ATOM_USE_UNIFIED_ATTN", unified)
+    monkeypatch.setattr(mha.envs, "ATOM_FORCE_ATTN_TRITON", force)
+    monkeypatch.setattr(
+        mha,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(kv_cache_block_size=block_size),
+    )
+    return mha.PagedAttentionImpl._dispatch_decode(_Layer(**kw), max_qlen)
+
+
+class TestDecodeRouting:
+    """Which backend _dispatch_decode picks, for the shapes that reach it."""
+
+    def test_m3_dense_production_shape_stays_on_gluon(self, monkeypatch):
+        """TP4, 3 draft tokens. The shape this change is measured on."""
+        assert _route(monkeypatch, 4) == "paged_attention_triton"
+
+    def test_no_drafting_still_reaches_asm(self, monkeypatch):
+        assert _route(monkeypatch, 1) == "paged_attention_asm"
+
+    def test_past_gluon_falls_back_to_unified(self, monkeypatch):
+        assert _route(monkeypatch, 5) == "paged_attention_unified"
+
+    def test_past_asm_but_within_gluon_takes_gluon(self, monkeypatch):
+        """4 x 16 = 64 clears gluon and is four times ASM's envelope.
+
+        Without the check it would reach run_pa_fwd_asm, where an unmatched mtp
+        silently re-runs with mtp=1 rather than refusing.
+        """
+        assert _route(monkeypatch, 4) == "paged_attention_triton"
+        assert _route(monkeypatch, 1, num_heads=64) == "paged_attention_triton"
+
+    @pytest.mark.parametrize("max_qlen", [1, 4])
+    def test_sliding_window_honours_unified_env(self, monkeypatch, max_qlen):
+        """The env has to reach the sliding-window branch too.
+
+        It returns before the ATOM_USE_UNIFIED_ATTN block below it, so dropping
+        the flag from this one expression silently moves sliding-window layers
+        onto a kernel whose output dtype the caller has already fixed as fp8.
+        """
+        assert (
+            _route(monkeypatch, max_qlen, sliding_window=128, unified=True)
+            == "paged_attention_unified"
+        )
+
+    def test_sliding_window_without_the_env_uses_gluon(self, monkeypatch):
+        assert (
+            _route(monkeypatch, 4, sliding_window=128) == "paged_attention_triton"
+        )
+
+    def test_flash_layout_routes_to_unified(self, monkeypatch):
+        assert (
+            _route(monkeypatch, 1, use_flash_layout=True) == "paged_attention_unified"
+        )
+
+    def test_force_triton_takes_unified(self, monkeypatch):
+        """ATOM_FORCE_ATTN_TRITON short-circuits the block-256 ASM route."""
+        assert (
+            _route(monkeypatch, 1, block_size=256, unified=True, force=True)
+            == "paged_attention_unified"
+        )
+
+    def test_use_triton_attn_diverts_off_asm(self, monkeypatch):
+        """Same shape reaches ASM without the flag, so this arm is load-bearing."""
+        assert _route(monkeypatch, 1) == "paged_attention_asm"
+        assert (
+            _route(monkeypatch, 1, use_triton_attn=True) == "paged_attention_triton"
+        )
+
+    def test_a_sentinel_query_length_routes_as_one(self, monkeypatch):
+        """Clamped at the top, so both gates see the same value.
+
+        Unclamped, `0 * ratio > 16` is false and this would reach ASM instead.
+        """
+        assert _route(monkeypatch, 0, num_heads=64) == _route(
+            monkeypatch, 1, num_heads=64
+        )
+
+    def test_persistent_asm_is_not_bounded_by_the_run_pa_fwd_envelope(
+        self, monkeypatch
+    ):
+        """pa_persistent_fwd is a different kernel with its own table.
+
+        4 x 16 = 64 is past run_pa_fwd_asm's 16, but that says nothing about
+        the persistent path, so the block-256 route must still be taken.
+        """
+        assert (
+            _route(monkeypatch, 4, block_size=256, unified=True)
+            == "paged_attention_persistent_asm"
+        )
