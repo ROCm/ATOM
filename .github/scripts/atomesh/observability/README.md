@@ -9,7 +9,9 @@ The job summary contains **Download HTML reports and data**. Download and extrac
 that artifact, then open a `report.html` file. GitHub Actions summaries cannot
 execute the report's JavaScript; the report runs locally without a server.
 
-The report shows two charts per row:
+The report defaults to an eight-panel Overview with Prefill/Decode TTFT, queue
+time, total cache reuse, and GPU forward latency. Use Latency, Workload, Cache & KV, or
+All metrics to inspect the full set. Desktop charts use two columns:
 
 - Mesh overall TTFT: ingress to first generated streaming output.
 - Decode ITL: output intervals normalized and weighted by new token count.
@@ -21,6 +23,13 @@ The report shows two charts per row:
 - Actual decode batch size: real decode request rows in each forward.
 - PD KV transfer wait: Decode-side remote load wait until all workers finish.
 - Prefill and Decode KV block utilization: used, evictable cached, and vacant.
+- Prefill and Decode cache reuse: Total reuse, LMCache and GPU curves shown
+  together, each divided by input tokens. The panel also shows estimated
+  Reused / Input and LMCache / GPU tokens in the same window.
+- Uncached prompt tokens per request and actual prefill tokens per forward.
+- Decode context tokens: sum of logical sequence lengths per real batch.
+- Prefill and Decode GPU forward: per-worker device-event duration, including
+  stream communication/waits; PP samples cover each local stage, not the full pipeline.
 
 Mean, P50, P90, P95, and P99 can be toggled globally or per chart. The report also
 supports hiding charts, time-range selection, a data table, and CSV export.
@@ -31,10 +40,30 @@ chart and series selections are retained when switching roles. Small screens
 stack charts in the same order.
 The global Statistics controls contain only Mean, P50, P90, P95, and P99.
 Queue and KV state controls stay inside their own panels. Units are milliseconds,
-requests, or percent as indicated on each chart and in the CSV.
+requests, tokens, or percent as indicated on each chart and in the CSV.
 The existing KV utilization panels also display summed Used / Total block
 counts for the latest point in the selected range, or the hovered point.
 Their data tables and CSV include the raw counts with unit `blocks`.
+
+Independent Prefill/Decode instance selectors use host:port addresses, including
+multiple services on one machine. The default pools all instances. Selecting an
+instance updates charts, counts, tables and CSV (`instance` column); missing data
+stays missing. Configured unavailable targets remain selectable. Mesh TTFT stays
+global. Instance percentiles are computed from grouped histogram buckets; global
+percentiles and ratios pool raw observations/counts rather than averaging
+instance quantiles or percentages. Archived JSON without an instance breakdown
+still renders its aggregate data.
+Cache contributions share the full-input denominator and admission accounting.
+The LMCache numerator is `atom:prefix_cache_offload_tokens_total`, which counts
+supplemental admitted reuse beyond the GPU prefix, rather than physical transfer
+volume or backend lookup success. Disabled LMCache reports zero contribution;
+missing tier telemetry remains unknown, including incomplete instance coverage.
+Pure PD consumers record their own pre-existing prefix once on first-decode
+admission after successful KV receive. Received KV and the producer's inherited
+API cache-hit value are excluded. Cache hits do not measure PD transfer savings:
+the transfer backend may still require a full transfer for its topology/state.
+Use each panel's legend to toggle the three curves independently. Tables and CSV
+include the tier quantities and selected percentage curves.
 See [metric definitions](../../../../docs/agentic_metrics.md) for timing boundaries
 and the distinction between PD transfer wait and pure RDMA time.
 
@@ -133,3 +162,11 @@ reports), and `null` for missing points. Gauge panels set `kind` to `queues` or
 a small synthetic latency example.
 KV panels additionally carry `block_counts.used` and `block_counts.total`
 time series; older JSON without these fields displays unavailable counts as a dash.
+Cache panels use `kind: "cache"`, `cache_breakdown: true`, percentage series
+`reuse/gpu/lmcache`, and `cache_counts.reused/prompt/gpu/lmcache` (rolling
+`increase()` estimates, in tokens). Archived cache panels without the breakdown
+flag retain their original GPU-only `hit` and `cache_counts.cached/prompt` meaning.
+Each panel can also supply `instances: {"host:port": {"series": ..., ...}}` with
+the same series/count fields. `meta.instances` lists configured role/instance
+pairs, including unavailable services. Optional `category` and `overview` fields
+control the focus filters.

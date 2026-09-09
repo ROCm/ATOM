@@ -1970,6 +1970,10 @@ class Scheduler:
 
     def _schedule_first_decode_after_remote_kv(self, seq: Sequence) -> None:
         """P/D path: a remote prefill completed, so schedule first decode."""
+        # num_cached_tokens still describes this consumer's pre-existing prefix.
+        # Received suffix blocks and the producer's inherited API hit are not
+        # local hits. Record before appending the producer's first output token.
+        self._record_cache_reuse(seq)
         seq.status = SequenceStatus.RUNNING
         seq.is_first_decode = True
         first_token_id = (seq.kv_transfer_params or {}).get("first_token_id")
@@ -2125,16 +2129,8 @@ class Scheduler:
             f"{num_new_tokens=}, {budget_remaining=}"
         )
 
-    def _schedule_prefill_seq(
-        self,
-        seq: Sequence,
-        chunk: int,
-        scheduled_seqs: dict[int, Sequence],
-        num_scheduled_tokens: list[int],
-        num_seqs_prefill: int,
-        num_batched_tokens: int,
-    ) -> tuple[int, int]:
-        num_seqs_prefill += 1
+    def _record_cache_reuse(self, seq: Sequence) -> None:
+        """Account local prefix reuse at prefill or first PD decode admission."""
         if self.engine_stats.cache_enabled:
             # Hit counts are in hash blocks — one block_table entry spans
             # `block_size * dcp_world_size` tokens — so scaling by block_size
@@ -2164,6 +2160,18 @@ class Scheduler:
                 num_reusable_tokens,
                 num_offload_tokens=offload_tokens,
             )
+
+    def _schedule_prefill_seq(
+        self,
+        seq: Sequence,
+        chunk: int,
+        scheduled_seqs: dict[int, Sequence],
+        num_scheduled_tokens: list[int],
+        num_seqs_prefill: int,
+        num_batched_tokens: int,
+    ) -> tuple[int, int]:
+        num_seqs_prefill += 1
+        self._record_cache_reuse(seq)
         num_batched_tokens += chunk
         seq.status = SequenceStatus.RUNNING
         seq.type = SequenceType.PREFILL

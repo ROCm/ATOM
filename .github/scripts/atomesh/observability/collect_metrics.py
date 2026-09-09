@@ -411,6 +411,13 @@ def run(args) -> int:
                 end=max(collection_end, start + 1),
                 benchmark_end=end,
                 collection_end=collection_end,
+                instances=[
+                    {"role": group["labels"]["role"], "instance": target}
+                    for job in config["scrape_configs"]
+                    if job["job_name"] == "atom"
+                    for group in job["static_configs"]
+                    for target in group["targets"]
+                ],
             )
             notes.append(
                 f"The report includes {max(0, collection_end - end):.3f} seconds "

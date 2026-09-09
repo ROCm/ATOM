@@ -34,6 +34,26 @@ LATENCY_BUCKETS = (
     600,
 )
 BATCH_BUCKETS = (1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 512, 1024)
+TOKEN_BUCKETS = (
+    0,
+    16,
+    64,
+    256,
+    1024,
+    2048,
+    4096,
+    8192,
+    16384,
+    32768,
+    65536,
+    131072,
+    262144,
+    524288,
+    1048576,
+    2097152,
+    4194304,
+    8388608,
+)
 
 
 class CumulativeHistogram:
@@ -60,6 +80,7 @@ class RequestQueueTiming:
     received_at: float
     observed: bool = False
     is_pd: bool = False
+    prefill_observed: bool = False
 
 
 class SchedulerMetrics:
@@ -67,6 +88,9 @@ class SchedulerMetrics:
         self.queue_time = CumulativeHistogram(LATENCY_BUCKETS)
         self.decode_batch_size = CumulativeHistogram(BATCH_BUCKETS)
         self.pd_transfer = CumulativeHistogram(LATENCY_BUCKETS)
+        self.prefill_request_tokens = CumulativeHistogram(TOKEN_BUCKETS)
+        self.prefill_batch_tokens = CumulativeHistogram(TOKEN_BUCKETS)
+        self.decode_context_tokens = CumulativeHistogram(TOKEN_BUCKETS)
         # Only in-flight external loads are retained; removed on every terminal
         # path, including abort and fallback. Sequence timing dies with the seq.
         self._loads: dict[str, tuple[object, float]] = {}
@@ -118,10 +142,30 @@ class SchedulerMetrics:
         # Count real request rows, not MTP tokens or a padded graph size.
         if batch.total_seqs_num_decode > 0:
             self.decode_batch_size.observe(batch.total_seqs_num_decode)
+            context_lens = getattr(batch, "context_lens", None)
+            if context_lens is not None:
+                self.decode_context_tokens.observe(
+                    sum(int(n) for n in context_lens[: batch.total_seqs_num_decode])
+                )
+        if getattr(batch, "total_seqs_num_prefill", 0) > 0:
+            self.prefill_batch_tokens.observe(batch.total_tokens_num_prefill)
+            # ScheduledBatch packs decode rows before prefill rows. Use its
+            # immutable offsets: scheduling may already have advanced the seq.
+            for i in range(batch.total_seqs_num_decode, len(batch.req_ids)):
+                seq = seqs[batch.req_ids[i]]
+                timing = getattr(seq, "queue_timing", None)
+                if timing is not None and not timing.prefill_observed:
+                    self.prefill_request_tokens.observe(
+                        max(0, seq.num_prompt_tokens - batch.num_cached_tokens[i])
+                    )
+                    timing.prefill_observed = True
 
     def snapshot(self) -> dict:
         return {
             "queue_time": self.queue_time.snapshot(),
             "decode_batch_size": self.decode_batch_size.snapshot(),
             "pd_kv_transfer": self.pd_transfer.snapshot(),
+            "prefill_request_tokens": self.prefill_request_tokens.snapshot(),
+            "prefill_batch_tokens": self.prefill_batch_tokens.snapshot(),
+            "decode_context_tokens": self.decode_context_tokens.snapshot(),
         }

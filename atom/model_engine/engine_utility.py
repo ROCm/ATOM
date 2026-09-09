@@ -322,7 +322,7 @@ class EngineUtilityHandler:
             ("UTILITY_RESPONSE", {"cmd": "get_cache_statistics", "result": result})
         )
 
-    def push_metrics(self) -> None:
+    def push_metrics(self, *, scheduler_metrics: bool = True) -> None:
         """Publish this rank's metrics snapshot on the output socket.
 
         Pushed on the engine's own clock rather than answered on demand. The
@@ -334,7 +334,16 @@ class EngineUtilityHandler:
         caller to mistake for its own. Pushing removes the deadline, and with it
         the last off-loop writer on the control socket.
         """
-        self.output_queue.put_nowait(("METRICS", self.collect_metrics()))
+        # Telemetry replies use their own tagged path, never the forward/KV
+        # result queues. No wait for a worker response or device completion.
+        if hasattr(self.runner_mgr, "latest_forward_metrics"):
+            self.runner_mgr.call_func("collect_forward_metrics")
+        snapshot = self.collect_metrics() if scheduler_metrics else {"enabled": False}
+        snapshot["forward_metrics"] = list(
+            getattr(self.runner_mgr, "latest_forward_metrics", {}).copy().values()
+        )
+        snapshot["role"] = getattr(self.scheduler, "_METRICS_ROLE", "")
+        self.output_queue.put_nowait(("METRICS", snapshot))
 
     def collect_metrics(self) -> dict:
         """One rank's scheduler, KV, MTP, and cache metrics."""
