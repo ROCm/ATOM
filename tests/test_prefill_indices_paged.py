@@ -134,6 +134,35 @@ def no_dense():
     return build(NO_DENSE_GEOMETRY)
 
 
+# MTP draft / NextN pools are often dense-only (stage_ratios=[0]). Prefill used
+# to assert CSA+HCA unconditionally and crash draft-extend on Pro MTP3.
+DENSE_ONLY_GEOMETRY = UnifiedPoolGeometry(
+    [DENSE_RATIO],
+    num_blocks=40,
+    num_slots=4,
+    ring_slots=CACHE_SIZE,
+    block_size=256,
+)
+
+
+@pytest.fixture(scope="module")
+def dense_only():
+    return build(DENSE_ONLY_GEOMETRY)
+
+
+@pytest.mark.parametrize("section", ["extend_indices", "prefix_swa_indices"])
+def test_dense_only_served_classes_are_written(dense_only, section):
+    ref, ker = dense_only["ref"][section], dense_only["ker"][section]
+    assert (ref != -9).any(), f"{section} was not written"
+    assert torch.equal(ker, ref), f"{section} mismatch\nref={ref}\nker={ker}"
+
+
+@pytest.mark.parametrize("section", ["prefix_csa_indices", "prefix_hca_indices"])
+def test_dense_only_absent_classes_get_no_rows(dense_only, section):
+    for side in ("ref", "ker"):
+        assert (dense_only[side][section] == -9).all(), side
+
+
 @pytest.mark.parametrize(
     "section", ["extend_indices", "prefix_csa_indices", "prefix_hca_indices"]
 )
