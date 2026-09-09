@@ -15,6 +15,7 @@ import subprocess
 import tarfile
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 from urllib.request import urlopen
@@ -22,6 +23,7 @@ from urllib.request import urlopen
 import export_report
 
 PROMETHEUS_VERSION = "3.5.0"
+REPORT_STEP = 5
 
 
 def save_json(path: Path, value) -> None:
@@ -150,6 +152,45 @@ def stop_process(process) -> None:
         process.wait(timeout=5)
 
 
+def wait_for_final_scrape(
+    process,
+    url: str,
+    start: float,
+    benchmark_end: float,
+    target_count: int,
+    interrupted: Callable[[], bool],
+) -> float:
+    """Wait for post-benchmark scrapes and a query step that includes them."""
+    deadline = time.monotonic() + 30
+    query_end = None
+    while time.monotonic() < deadline:
+        if interrupted():
+            return time.time()
+        if process.poll() is not None:
+            raise RuntimeError("Prometheus exited before the final scrape")
+        if query_end is None:
+            try:
+                targets = get_json(url + "/api/v1/targets")["data"]["activeTargets"]
+                if len(targets) == target_count and all(
+                    t["health"] == "up"
+                    and export_report.timestamp(t["lastScrape"]) > benchmark_end
+                    for t in targets
+                ):
+                    # query_range evaluates start + n * step, not necessarily
+                    # its end parameter. Wait until that grid includes the
+                    # completed scrapes, without requesting future data points.
+                    query_end = (
+                        start
+                        + math.ceil((time.time() - start) / REPORT_STEP) * REPORT_STEP
+                    )
+            except (OSError, ValueError, KeyError):
+                pass
+        if query_end is not None and time.time() >= query_end:
+            return query_end
+        time.sleep(0.2)
+    raise RuntimeError("Final metrics scrapes did not complete in 30 seconds")
+
+
 def empty_report(start, end, model, notes):
     panels = export_report.panels_for("pd")
     for panel in panels:
@@ -160,7 +201,7 @@ def empty_report(start, end, model, notes):
             "model": model,
             "start": start,
             "end": max(end, start + 1),
-            "step": 5,
+            "step": REPORT_STEP,
             "window": 60,
             "kind": "recorded",
             "notes": notes,
@@ -174,7 +215,7 @@ def finalize_report(data: dict, status: dict, notes: list[str]) -> None:
     missing = [
         p["id"]
         for p in data["panels"]
-        if not all(
+        if not any(
             any(v is not None for _, v in points) for points in p["series"].values()
         )
     ]
@@ -292,7 +333,14 @@ def run(args) -> int:
                 status["errors"].append(f"Benchmark could not start: {exc}")
                 benchmark_rc = 127
             end = time.time()
-            status.update(start=start, end=end, benchmark_exit_code=benchmark_rc)
+            # Keep the command's end separate from the report's collection end.
+            status.update(
+                start=start,
+                end=end,
+                benchmark_end=end,
+                benchmark_exit_code=benchmark_rc,
+            )
+            collection_end = end
             notes = [
                 (
                     "Collected during the complete AIPerf invocation, including its warmup and drain. "
@@ -307,12 +355,24 @@ def run(args) -> int:
             try:
                 if prometheus_url is None:
                     raise RuntimeError("No Prometheus collector is available")
-                if received_signal is None:
-                    time.sleep(6)
+                try:
+                    collection_end = wait_for_final_scrape(
+                        collector,
+                        prometheus_url,
+                        start,
+                        end,
+                        len(args.prefill) + len(args.decode) + 1,
+                        lambda: received_signal is not None,
+                    )
+                except (OSError, ValueError, KeyError, RuntimeError) as exc:
+                    # Export whatever is available even if a target stays down.
+                    collection_end = time.time()
+                    status["errors"].append(f"Final scrape incomplete: {exc}")
                 data = export_report.collect_report(
                     prometheus_url,
                     start,
-                    max(end, start + 1),
+                    max(collection_end, start + 1),
+                    step=REPORT_STEP,
                     model=args.model,
                     title="Agentic PD latency report",
                     diagnostics=status["errors"],
@@ -323,7 +383,9 @@ def run(args) -> int:
                     "min_over_time(up[" + str(max(1, math.ceil(end - start))) + "s])"
                 )
                 health = get_json(
-                    prometheus_url + "/api/v1/query?" + urlencode({"query": up_query})
+                    prometheus_url
+                    + "/api/v1/query?"
+                    + urlencode({"query": up_query, "time": end})
                 )
                 save_json(output / "scrape-health.json", health)
                 if any(
@@ -344,6 +406,18 @@ def run(args) -> int:
             finally:
                 stop_process(collector)
 
+            status["collection_end"] = collection_end
+            data["meta"].update(
+                end=max(collection_end, start + 1),
+                benchmark_end=end,
+                collection_end=collection_end,
+            )
+            notes.append(
+                f"The report includes {max(0, collection_end - end):.3f} seconds "
+                "of post-benchmark collection to capture final observations. "
+                "This interval is excluded from the benchmark duration and may "
+                "include other traffic after the benchmark."
+            )
             finalize_report(data, status, notes)
             publish_report(output, data, status)
             print(

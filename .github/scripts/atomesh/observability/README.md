@@ -50,17 +50,32 @@ The TSDB uses temporary node-local storage. Scraping runs every five seconds;
 each plotted point summarizes the preceding 60 seconds. Each invocation uses a
 fresh TSDB and counter baselines, so previous benchmark traffic is excluded.
 Collection covers the complete AIPerf invocation, including its warmup and drain.
+API TTFT exposes zero-valued `streaming=true` and `streaming=false` series at
+startup, so the collector can scrape a baseline before the first request.
 Percentiles are histogram estimates; Prefill and Decode percentiles cannot be
 added to obtain Mesh percentiles.
 
-After the command finishes, the wrapper collects report data, terminates
-Prometheus, finalizes diagnostics, and renders HTML once. Benchmark failures
+After the command finishes, the wrapper waits for a successful scrape from each
+target with a scrape timestamp after the benchmark end, then waits until the
+next five-second query step includes those scrapes. This wait is bounded to 30
+seconds and stops early on interruption; failures are reported while retaining
+available data. `status.json` keeps `end` and `benchmark_end` as the command's end
+and records the export cutoff separately as `collection_end`. Report metadata
+also includes `benchmark_end` and `collection_end`; its `end` covers the export
+range. Report notes identify the extra collection interval, which is excluded
+from the benchmark duration and may include other traffic during that interval.
+
+The wrapper then collects report data, terminates Prometheus, finalizes
+diagnostics, and renders HTML once. Benchmark failures
 retain the original exit code and any available metrics. Publication failures
 are recorded separately in `status.json` under `publication_errors`, and do not
 replace the benchmark exit code. If the status file itself cannot be written,
 the error is printed in the job log. Collection failures produce an explicitly
 incomplete report and a warning in Actions instead of fabricated data.
 Hard termination before export can leave only status and logs.
+A panel is marked missing only when all its statistics lack valid samples.
+Failed statistic queries still mark the report partial when other data is
+available; a missing quantile alone does not make the report unavailable.
 
 Reports live under
 `slurm_job-<job-id>/benchmark_results/aiperf-<model>-<topology>-c<concurrency>/metrics/`.

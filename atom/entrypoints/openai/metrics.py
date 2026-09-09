@@ -512,6 +512,11 @@ class AtomMetricsExporter:
             registry=self._registry,
         )
 
+        # Expose zero-valued children before traffic so Prometheus can establish
+        # a baseline for rate(). Registering labels does not record a sample.
+        for streaming in ("true", "false"):
+            self._time_to_first_token.labels(streaming=streaming)
+
     def observe_time_to_first_token(self, interval: float, streaming: bool) -> None:
         self._time_to_first_token.labels(streaming=str(streaming).lower()).observe(
             interval
