@@ -110,6 +110,18 @@ startup, so the collector can scrape a baseline before the first request.
 Percentiles are histogram estimates; Prefill and Decode percentiles cannot be
 added to obtain Mesh percentiles.
 
+The Latency view also includes **Prefill request GPU forward**. Each worker sums
+the batch forward durations in which a request participates across its initial
+local prefill chunks, then records one sample after all those timings complete.
+Three chunks taking 10, 12 and 8 ms yield one 30 ms request sample. Shared or
+mixed batches contribute their full duration to each participating prefill
+request; this is not exclusive per-request compute time. Inter-chunk queue/KV
+waits are excluded. Missing chunk timings invalidate the entire request sample.
+PP samples cover each local stage, and worker distributions are pooled rather
+than summing rank times. The rolling window selects completed timing samples,
+which may include chunks executed before the window. Instance filters, the five
+statistics, tables and CSV work as for the existing per-forward panel.
+
 After the command finishes, the wrapper waits for a successful scrape from each
 target with a scrape timestamp after the benchmark end, then waits until the
 next five-second query step includes those scrapes. This wait is bounded to 30

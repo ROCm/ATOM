@@ -421,7 +421,7 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
             registry=registry,
             buckets=(
                 Histogram.DEFAULT_BUCKETS
-                if name == "atom:gpu_forward_seconds"
+                if name.endswith("_seconds")
                 else TOKEN_BUCKETS
             ),
         )
@@ -431,6 +431,7 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
             "atom:decode_context_tokens",
             "atom:decode_request_context_tokens",
             "atom:gpu_forward_seconds",
+            "atom:prefill_request_gpu_forward_seconds",
         )
     ]
     cached = Counter("atom:prefix_cache_cached_tokens", "fixture", registry=registry)
@@ -469,7 +470,9 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
                 queue_time.observe(0.01)
                 batch.observe(4)
                 transfer.observe(0.02)
-                for hist, value in zip(workload, (2000, 512, 32000, 8000, 0.008)):
+                for hist, value in zip(
+                    workload, (2000, 512, 32000, 8000, 0.008, 0.030)
+                ):
                     hist.observe(value)
                 cached.inc(8)
                 offload.inc(1)
@@ -567,6 +570,12 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
                     for _, v in points
                 )
         panels = {panel["id"]: panel for panel in data["panels"]}
+        request_gpu = panels["prefill_request_gpu_forward"]
+        for bundle in (request_gpu, *request_gpu["instances"].values()):
+            means = [
+                value for _, value in bundle["series"]["mean"] if value is not None
+            ]
+            assert means and all(value == pytest.approx(30) for value in means)
         request_context = panels["decode_request_context_tokens"]
         assert request_context["title"] == "Decode request context tokens"
         assert panels["decode_context_tokens"]["title"] == "Decode batch context tokens"

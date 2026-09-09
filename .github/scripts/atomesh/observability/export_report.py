@@ -202,6 +202,19 @@ def panels_for(deployment: str) -> list[dict]:
             ]
         )
     role = roles[0]
+    panels.append(
+        {
+            "id": f"{role}_request_gpu_forward",
+            "role": role,
+            "title": "Prefill request GPU forward",
+            "label": f"{role.upper()} · GPU WORKERS",
+            "detail": "Sum of participating batch times across initial prefill chunks · once per completed request per worker · shared batch time, not exclusive compute",
+            "metric": "atom:prefill_request_gpu_forward_seconds",
+            "selector": f'job="atom",role="{role}"',
+            "unit": "ms",
+            "overview": False,
+        }
+    )
     for suffix, title, detail in (
         (
             "request_tokens",
@@ -267,12 +280,15 @@ def panels_for(deployment: str) -> list[dict]:
                 else "latency"
             )
         )
-        panel["overview"] = (
-            any(
-                panel["id"].endswith(suffix)
-                for suffix in ("_ttft", "_queue_time", "_gpu_forward", "_cache_hit")
-            )
-            and panel["role"] != "overall"
+        panel.setdefault(
+            "overview",
+            (
+                any(
+                    panel["id"].endswith(suffix)
+                    for suffix in ("_ttft", "_queue_time", "_gpu_forward", "_cache_hit")
+                )
+                and panel["role"] != "overall"
+            ),
         )
     return panels
 

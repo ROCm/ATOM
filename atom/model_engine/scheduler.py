@@ -374,6 +374,29 @@ class ScheduledBatch:
                 seq.multimodal_data = None
         self.external_request_ids = [seq.external_request_id for seq in seqs.values()]
 
+        # Freeze request chunk boundaries before schedule-time advancement.
+        # Workers receive copies of the batch, not the mutable Sequence objects.
+        self.prefill_gpu_requests = []
+        if not is_dummy_run and total_seqs_num_prefill:
+            for i, seq in enumerate(seqs.values()):
+                if i < total_seqs_num_decode or seq.prefill_gpu_complete:
+                    continue
+                # Re-prefill after generation has started is not initial prefill
+                # (also excludes D recomputation following a remote prefill).
+                if seq.num_tokens > seq.num_prompt_tokens:
+                    continue
+                final = (
+                    bool(is_final_chunk[i])
+                    if is_final_chunk is not None
+                    else self.num_cached_tokens[i] + int(num_scheduled_tokens[i])
+                    >= seq.num_prompt_tokens
+                )
+                seq.prefill_gpu_chunks += 1
+                seq.prefill_gpu_complete = final
+                self.prefill_gpu_requests.append(
+                    (seq.id, seq.prefill_gpu_chunks, final)
+                )
+
         # logger.info(f"{[el for el in scheduled_spec_decode_tokens.keys()]=}")
         # logger.info(f"{self.num_scheduled_tokens=}")
         # logger.info(f"{self.context_lens=}")
