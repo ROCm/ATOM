@@ -15,6 +15,18 @@ report = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(report)
 
 
+@pytest.mark.parametrize(
+    "fraction", ["2", "27", "274", "2741", "27414", "274144", "274144682"]
+)
+@pytest.mark.parametrize("zone", ["Z", "+00:00"])
+def test_prometheus_scrape_timestamps_accept_variable_fractional_precision(
+    fraction, zone
+):
+    timestamp = report.timestamp(f"2026-09-09T09:03:10.{fraction}{zone}")
+    expected = report.timestamp("2026-09-09T09:03:10Z") + float("0." + fraction)
+    assert abs(timestamp - expected) < 0.000002
+
+
 def test_prometheus_export_uses_real_response_values_and_keeps_missing_points(
     monkeypatch, tmp_path
 ):
@@ -35,11 +47,17 @@ def test_prometheus_export_uses_real_response_values_and_keeps_missing_points(
     monkeypatch.setattr(report.urllib.request, "urlopen", response)
     output = tmp_path / "report.html"
     data = report.generate_report("http://prometheus.example", 100, 110, output)
-    assert len(queries) == 20
+    assert len(queries) == sum(
+        len(report.statistics_for(p)) + (2 if p.get("kind") == "blocks" else 0)
+        for p in data["panels"]
+    )
     assert any('role="prefill",streaming="false"' in q for q in queries)
     assert any("histogram_quantile(0.9," in q for q in queries)
     for panel in data["panels"]:
-        for points in panel["series"].values():
+        for points in [
+            *panel["series"].values(),
+            *panel.get("block_counts", {}).values(),
+        ]:
             assert points == [[100.0, None], [105.0, 6.25], [110.0, None]]
     text = output.read_text()
     embedded = text.split('<script id="report-data" type="application/json">')[1].split(
@@ -82,5 +100,31 @@ def test_failed_source_does_not_overwrite_previous_report(monkeypatch, tmp_path)
 def test_invalid_json_values_are_rejected(value, tmp_path):
     data = report.demo_data()
     data["panels"][0]["series"]["p99"][0][1] = value
-    with pytest.raises(ValueError, match="Latency"):
+    with pytest.raises(ValueError, match="Metric values"):
         report.write_report(data, tmp_path / "report.html")
+
+
+def test_scheduler_queries_keep_units_and_gauge_semantics():
+    panels = {p["id"]: p for p in report.panels_for("pd")}
+    batch = report.query_for(panels["decode_batch_size"], "mean", 60)
+    assert batch.startswith("1 * ") and "rate(atom:decode_batch_size_sum" in batch
+    queue = report.query_for(panels["decode_queues"], "waiting", 60)
+    assert 'state="waiting"' in queue and "rate(" not in queue
+    kv = report.query_for(panels["prefill_kv_blocks"], "used", 60)
+    assert kv.startswith("100 * sum(") and 'state="total"' in kv
+    assert "rate(" not in kv
+    used_count = report.block_count_query_for(panels["prefill_kv_blocks"], "used")
+    total_count = report.block_count_query_for(panels["decode_kv_blocks"], "total")
+    assert (
+        used_count
+        == 'sum(atom:scheduler_kv_cache_blocks{job="atom",role="prefill",state="used"})'
+    )
+    assert (
+        total_count
+        == 'sum(atom:scheduler_kv_cache_blocks{job="atom",role="decode",state="total"})'
+    )
+    transfer = report.query_for(panels["pd_kv_transfer"], "p99", 60)
+    assert 'role="decode"' in transfer and "histogram_quantile(0.99," in transfer
+    assert panels["decode_batch_size"]["unit"] == "requests"
+    assert panels["prefill_kv_blocks"]["unit"] == "%"
+    assert "pd_kv_transfer" not in {p["id"] for p in report.panels_for("standalone")}

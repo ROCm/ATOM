@@ -3,6 +3,7 @@
 
 import logging
 import queue
+import time
 from typing import ClassVar
 
 from atom.model_engine.sequence import SequenceStatus
@@ -396,11 +397,31 @@ class EngineUtilityHandler:
                 "offload": offload,
             }
             if kv_pool is not None:
+                reusable = kv_pool.num_reusable_free
                 result |= {
                     "kv_blocks_used": kv_pool.num_used,
                     "kv_blocks_free": kv_pool.num_free,
                     "kv_blocks_total": kv_pool.num_blocks,
                     "kv_blocks_indexed": kv_pool.num_indexed,
+                    "kv_blocks_evictable": reusable,
+                    "kv_blocks_vacant": kv_pool.num_free - reusable,
+                }
+
+            metrics = getattr(self.scheduler, "metrics", None)
+            if metrics is not None:
+                parked = sum(
+                    seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+                    for seq in self.scheduler.waiting
+                )
+                # Shared-cache disaggregation has a separate prefill queue,
+                # whereas connector-based PD parks requests in `waiting`.
+                external = parked + len(getattr(self.scheduler, "prefill_waiting", ()))
+                result["scheduler_metrics"] = {
+                    **metrics.snapshot(),
+                    "timestamp": time.time(),
+                    "running": running,
+                    "waiting": max(0, waiting - external),
+                    "waiting_kv": external,
                 }
 
         return result

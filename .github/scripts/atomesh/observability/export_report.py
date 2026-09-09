@@ -1,4 +1,4 @@
-"""Export Prometheus latency data as a self-contained interactive HTML report.
+"""Export Prometheus inference metrics as a self-contained interactive HTML report.
 
 Example: python .github/scripts/atomesh/observability/export_report.py --prometheus-url
 http://127.0.0.1:9090 --start 2026-09-08T08:16:20Z --end 2026-09-08T08:17:28Z
@@ -14,6 +14,7 @@ import datetime as dt
 import json
 import math
 import random
+import re
 import time
 import urllib.parse
 import urllib.request
@@ -21,19 +22,28 @@ from pathlib import Path
 from types import SimpleNamespace
 
 STATISTICS = {"mean": None, "p50": 0.50, "p90": 0.90, "p95": 0.95, "p99": 0.99}
+GAUGE_SERIES = {"running", "waiting", "waiting_kv", "used", "evictable", "vacant"}
 
 
 def timestamp(value: str) -> float:
     try:
         return float(value)
     except ValueError:
+        # Prometheus uses nanosecond RFC3339 timestamps. Python 3.10 accepts
+        # only 3 or 6 fractional digits, so normalize to microseconds first.
+        value = re.sub(
+            r"(\d{2}:\d{2}:\d{2})\.(\d+)",
+            lambda m: m[1] + "." + m[2][:6].ljust(6, "0"),
+            value,
+            count=1,
+        )
         parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
         if parsed.tzinfo is None:
             raise argparse.ArgumentTypeError("ISO timestamps must include a timezone")
         return parsed.timestamp()
 
 
-def panels_for(deployment: str) -> list[dict]:
+def latency_panels_for(deployment: str) -> list[dict]:
     api_ttft = "atom:time_to_first_token_seconds"
     itl = "atom:inter_token_latency_seconds"
     if deployment == "standalone":
@@ -91,15 +101,99 @@ def panels_for(deployment: str) -> list[dict]:
     ]
 
 
+def panels_for(deployment: str) -> list[dict]:
+    panels = latency_panels_for(deployment)
+    for panel in panels:
+        panel["unit"] = "ms"
+    roles = ("standalone",) if deployment == "standalone" else ("prefill", "decode")
+    for role in roles:
+        selector = f'job="atom",role="{role}"'
+        common = {"selector": selector, "label": f"{role.upper()} · SCHEDULER"}
+        panels.extend(
+            [
+                {
+                    **common,
+                    "id": f"{role}_queues",
+                    "title": f"{role.title()} requests",
+                    "detail": "Running, waiting for admission, and waiting for external KV · sampled state",
+                    "metric": "atom:scheduler_requests",
+                    "unit": "requests",
+                    "kind": "queues",
+                },
+                {
+                    **common,
+                    "id": f"{role}_queue_time",
+                    "title": f"{role.title()} queue time",
+                    "detail": "Engine receipt → first forward dispatch · includes KV loading waits · one sample per request",
+                    "metric": "atom:request_queue_time_seconds",
+                    "unit": "ms",
+                },
+                {
+                    **common,
+                    "id": f"{role}_kv_blocks",
+                    "title": f"{role.title()} KV block utilization",
+                    "detail": "Used, evictable cached, and vacant blocks · capacity-weighted across pools",
+                    "metric": "atom:scheduler_kv_cache_blocks",
+                    "unit": "%",
+                    "kind": "blocks",
+                },
+            ]
+        )
+    role = roles[-1]
+    panels.append(
+        {
+            "id": "decode_batch_size",
+            "title": "Actual decode batch size",
+            "label": f"{role.upper()} · FORWARD",
+            "detail": "Real decode request rows per forward · no dummy work, padding, or token weighting",
+            "metric": "atom:decode_batch_size",
+            "selector": f'job="atom",role="{role}"',
+            "unit": "requests",
+            "scale": 1,
+        }
+    )
+    if deployment == "pd":
+        panels.append(
+            {
+                "id": "pd_kv_transfer",
+                "title": "PD KV transfer wait",
+                "label": "DECODE · KV LOAD",
+                "detail": "Enter remote KV wait → all workers complete · includes dispatch, handshake and notification",
+                "metric": "atom:pd_kv_transfer_seconds",
+                "selector": 'job="atom",role="decode"',
+                "unit": "ms",
+            }
+        )
+    return panels
+
+
+def statistics_for(panel: dict):
+    if panel.get("kind") == "queues":
+        return ("running", "waiting", "waiting_kv")
+    if panel.get("kind") == "blocks":
+        return ("used", "evictable", "vacant")
+    return tuple(STATISTICS)
+
+
+def block_count_query_for(panel: dict, state: str) -> str:
+    return f'sum({panel["metric"]}{{{panel["selector"]},state="{state}"}})'
+
+
 def query_for(panel: dict, statistic: str, window: int) -> str:
     metric, selector = panel["metric"], panel["selector"]
+    if panel.get("kind") in {"queues", "blocks"}:
+        numerator = f'sum({metric}{{{selector},state="{statistic}"}})'
+        if panel["kind"] == "queues":
+            return numerator
+        return f'100 * {numerator} / sum({metric}{{{selector},state="total"}})'
+    scale = panel.get("scale", 1000)
 
     def rate(suffix):
         return f"rate({metric}_{suffix}{{{selector}}}[{window}s])"
 
     if statistic == "mean":
-        return f"1000 * sum({rate('sum')}) / sum({rate('count')})"
-    return f"1000 * histogram_quantile({STATISTICS[statistic]}, sum by (le) ({rate('bucket')}))"
+        return f"{scale} * sum({rate('sum')}) / sum({rate('count')})"
+    return f"{scale} * histogram_quantile({STATISTICS[statistic]}, sum by (le) ({rate('bucket')}))"
 
 
 def fetch_series(url: str, query: str, start: float, end: float, step: int) -> list:
@@ -128,9 +222,28 @@ def collect(args, *, diagnostics: list[str] | None = None) -> dict:
         pending = {}
         for panel in panels:
             panel["series"], panel["queries"] = {}, {}
-            for statistic in STATISTICS:
-                query = query_for(panel, statistic, args.window)
-                panel["queries"][statistic] = query
+            queries = [
+                (
+                    "series",
+                    "queries",
+                    statistic,
+                    query_for(panel, statistic, args.window),
+                )
+                for statistic in statistics_for(panel)
+            ]
+            if panel.get("kind") == "blocks":
+                panel["block_counts"], panel["block_count_queries"] = {}, {}
+                queries.extend(
+                    (
+                        "block_counts",
+                        "block_count_queries",
+                        state,
+                        block_count_query_for(panel, state),
+                    )
+                    for state in ("used", "total")
+                )
+            for field, query_field, statistic, query in queries:
+                panel[query_field][statistic] = query
                 future = pool.submit(
                     fetch_series,
                     args.prometheus_url,
@@ -139,15 +252,15 @@ def collect(args, *, diagnostics: list[str] | None = None) -> dict:
                     args.end,
                     args.step,
                 )
-                pending[future] = panel, statistic
+                pending[future] = panel, field, statistic
         for future in concurrent.futures.as_completed(pending):
-            panel, statistic = pending[future]
+            panel, field, statistic = pending[future]
             try:
-                panel["series"][statistic] = future.result()
+                panel[field][statistic] = future.result()
             except (OSError, ValueError, RuntimeError, KeyError) as exc:
                 failed += 1
-                panel["series"][statistic] = []
-                errors.append(f"{panel['title']} / {statistic}: {exc}")
+                panel[field][statistic] = []
+                errors.append(f"{panel['title']} / {field} / {statistic}: {exc}")
     if failed == len(pending):
         raise RuntimeError("All Prometheus queries failed: " + errors[-failed])
     return {
@@ -173,7 +286,7 @@ def demo_data() -> dict:
     start, step, count = 1788854400, 5, 121
     panels = panels_for("pd")
     for index, panel in enumerate(panels):
-        base = [420, 6.8, 290, 76][index]
+        base = [420, 6.8, 290, 76][index] if index < 4 else 12
         points = []
         for i in range(count):
             wave = 1 + 0.12 * math.sin(i / 10 + index) + 0.04 * rng.random()
@@ -184,11 +297,23 @@ def demo_data() -> dict:
                 [start + i * step, round(value * factor, 3)]
                 for i, value in enumerate(points)
             ]
-            for stat, factor in zip(STATISTICS, (1.0, 0.89, 1.16, 1.28, 1.53))
+            for stat, factor in zip(
+                statistics_for(panel), (1.0, 0.89, 1.16, 1.28, 1.53)
+            )
         }
+        if panel.get("kind") == "blocks":
+            total = 10000 if panel["id"].startswith("prefill_") else 20000
+            panel["block_counts"] = {
+                key: [[start + i * step, value] for i in range(count)]
+                for key, value in (("used", total * 0.4), ("total", total))
+            }
+            panel["series"] = {
+                key: [[start + i * step, round(value, 3)] for i in range(count)]
+                for key, value in (("used", 40), ("evictable", 35), ("vacant", 25))
+            }
     return {
         "meta": {
-            "title": "Inference latency report",
+            "title": "Agentic inference report",
             "model": "GLM-5.2 · CPP4 + DCP4",
             "start": start,
             "end": start + step * (count - 1),
@@ -204,7 +329,7 @@ def demo_data() -> dict:
 
 
 def validate_data(data: dict) -> None:
-    """Validate the JSON interface: Unix seconds for time, milliseconds for values."""
+    """Validate Unix timestamps and nonnegative values in each panel's unit."""
 
     def number(value):
         return (
@@ -233,24 +358,33 @@ def validate_data(data: dict) -> None:
         if panel["id"] in identifiers:
             raise ValueError("Panel identifiers must be unique")
         identifiers.add(panel["id"])
+        if panel.get("unit", "ms") not in {"ms", "requests", "%"}:
+            raise ValueError("Panel unit must be ms, requests or %")
         if not isinstance(panel.get("series"), dict):
             raise TypeError("Each panel requires a series object")
-        for statistic, points in panel["series"].items():
-            if statistic not in STATISTICS or not isinstance(points, list):
-                raise ValueError("Series must map mean/p50/p90/p95/p99 to arrays")
+        counts = panel.get("block_counts", {})
+        if not isinstance(counts, dict) or counts.keys() - {"used", "total"}:
+            raise ValueError("block_counts must map used/total to arrays")
+        for statistic, points in [*panel["series"].items(), *counts.items()]:
+            if statistic not in (
+                STATISTICS.keys() | GAUGE_SERIES | {"total"}
+            ) or not isinstance(points, list):
+                raise ValueError(
+                    "Series must map a supported statistic or state to arrays"
+                )
             previous = -math.inf
             for point in points:
                 if not isinstance(point, (list, tuple)) or len(point) != 2:
-                    raise ValueError(
-                        "Each point must be [unix_seconds, milliseconds_or_null]"
-                    )
+                    raise ValueError("Each point must be [unix_seconds, value_or_null]")
                 t, value = point
                 if not number(t) or t <= previous:
                     raise ValueError(
                         "Point timestamps must be finite and strictly increasing"
                     )
                 if value is not None and (not number(value) or value < 0):
-                    raise ValueError("Latency must be nonnegative milliseconds or null")
+                    raise ValueError(
+                        "Metric values must be nonnegative numbers or null"
+                    )
                 previous = t
 
 
@@ -258,8 +392,9 @@ def write_report(data: dict, output: str | Path) -> None:
     """Public JSON-to-HTML API. The report embeds data and needs no server or CDN.
 
     Required meta fields: start/end (Unix seconds), step/window (seconds).
-    Each panel supplies id, title and series; series keys are mean/p50/p90/p95/p99,
-    and values are arrays of [Unix timestamp, milliseconds or None] pairs.
+    Each panel supplies id, title, unit (default ms), and series. Series contain
+    statistics or scheduler states as [Unix timestamp, value or None] pairs.
+    KV panels may also supply block_counts.used/total with raw block quantities.
     Set meta.kind='demo' only for explicitly synthetic preview data.
     """
     validate_data(data)
@@ -268,6 +403,7 @@ def write_report(data: dict, output: str | Path) -> None:
     for panel in data["panels"]:
         panel.setdefault("label", "RECORDED DATA")
         panel.setdefault("detail", "")
+        panel.setdefault("unit", "ms")
     output = Path(output)
     template = Path(__file__).with_name("report.html").read_text()
     payload = (
@@ -288,7 +424,7 @@ def collect_report(
     deployment: str = "pd",
     step: int = 5,
     window: int = 60,
-    title: str = "Inference latency report",
+    title: str = "Agentic inference report",
     model: str = "ATOM",
     diagnostics: list[str] | None = None,
 ) -> dict:
@@ -347,7 +483,7 @@ def main() -> None:
         "--window", type=int, default=60, help="PromQL rate window, seconds"
     )
     parser.add_argument("--deployment", choices=("pd", "standalone"), default="pd")
-    parser.add_argument("--title", default="Inference latency report")
+    parser.add_argument("--title", default="Agentic inference report")
     parser.add_argument("--model", default="ATOM")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--save-data", type=Path)

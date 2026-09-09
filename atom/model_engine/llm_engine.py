@@ -590,7 +590,30 @@ class LLMEngine:
             "kv_blocks_free": summed("kv_blocks_free"),
             "kv_blocks_total": kv_total,
             "kv_blocks_indexed": summed("kv_blocks_indexed"),
+            "kv_blocks_evictable": summed("kv_blocks_evictable"),
+            "kv_blocks_vacant": summed("kv_blocks_vacant"),
             "kv_cache_usage_ratio": kv_used / kv_total if kv_total else 0.0,
+            # Keep cumulative observations per scheduler: exposing each rank
+            # preserves reset detection and avoids counting a PP batch twice.
+            "scheduler_metrics": [
+                {
+                    "dp_rank": rank,
+                    "engine_role": stats.get("role") or "default",
+                    **stats["scheduler_metrics"],
+                    "kv_blocks": (
+                        {
+                            "used": stats["kv_blocks_used"],
+                            "evictable": stats["kv_blocks_evictable"],
+                            "vacant": stats["kv_blocks_vacant"],
+                            "total": stats["kv_blocks_total"],
+                        }
+                        if "kv_blocks_total" in stats
+                        else {}
+                    ),
+                }
+                for rank, stats in self.core_mgr.latest_metrics.items()
+                if stats.get("enabled") and "scheduler_metrics" in stats
+            ],
             "mtp": {
                 "enabled": bool(mtp_rank_stats),
                 "total_draft_tokens": mtp_draft,

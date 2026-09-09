@@ -1,4 +1,4 @@
-# Agentic PD latency reports
+# Agentic PD inference reports
 
 Agentic PD benchmarks (`benchmark.kind: aiperf_agentic`) automatically collect
 metrics and generate an offline HTML report for each concurrency setting. No
@@ -15,9 +15,28 @@ The report shows two charts per row:
 - Decode ITL: output intervals normalized and weighted by new token count.
 - Prefill local TTFT: request arrival to first internal token delivery.
 - Decode local TTFT: request arrival to first generated streaming output.
+- Prefill and Decode request queues: running, waiting, and external KV waits.
+- Prefill and Decode queue time: engine receipt to first forward dispatch,
+  including input queue residence, scheduling, and KV loading waits.
+- Actual decode batch size: real decode request rows in each forward.
+- PD KV transfer wait: Decode-side remote load wait until all workers finish.
+- Prefill and Decode KV block utilization: used, evictable cached, and vacant.
 
 Mean, P50, P90, P95, and P99 can be toggled globally or per chart. The report also
 supports hiding charts, time-range selection, a data table, and CSV export.
+All / Prefill / Decode buttons filter both charts and metric selection buttons;
+CSV exports follow that selection. In All view, shared metrics align Prefill on
+the left and Decode on the right, followed by the remaining metrics. Individual
+chart and series selections are retained when switching roles. Small screens
+stack charts in the same order.
+The global Statistics controls contain only Mean, P50, P90, P95, and P99.
+Queue and KV state controls stay inside their own panels. Units are milliseconds,
+requests, or percent as indicated on each chart and in the CSV.
+The existing KV utilization panels also display summed Used / Total block
+counts for the latest point in the selected range, or the hovered point.
+Their data tables and CSV include the raw counts with unit `blocks`.
+See [metric definitions](../../../../docs/agentic_metrics.md) for timing boundaries
+and the distinction between PD transfer wait and pure RDMA time.
 
 ## Collection lifecycle
 
@@ -46,8 +65,12 @@ user, setup installs Rust 1.94.0 into that cache; `ATOMESH_MESH_RUST_TOOLCHAIN`
 can select another fallback version. These settings pass through the existing
 CI environment handling and are independent of metrics collection.
 
-The TSDB uses temporary node-local storage. Scraping runs every five seconds;
-each plotted point summarizes the preceding 60 seconds. Each invocation uses a
+The TSDB uses temporary node-local storage. Scraping and engine/API snapshots run
+every second (subject to engine progress). Histogram observations accumulate at
+each event, including events between scrapes. Plots use five-second steps;
+histogram points summarize the preceding 60 seconds, while queues and KV panels
+show sampled state. Brief queue peaks between snapshots may be missed.
+Each invocation uses a
 fresh TSDB and counter baselines, so previous benchmark traffic is excluded.
 Collection covers the complete AIPerf invocation, including its warmup and drain.
 API TTFT exposes zero-valued `streaming=true` and `streaming=false` series at
@@ -104,5 +127,9 @@ python .github/scripts/atomesh/observability/export_report.py \
 Python callers can use `collect_report(...)` to fetch data without writing files,
 `write_report(data, output)` to render data, or `generate_report(...)` as a
 convenience API that does both. The JSON interface uses
-Unix timestamps in seconds, latency values in milliseconds, and `null` for
-missing points. See `report-data.example.json` for a small synthetic example.
+Unix timestamps in seconds, values in the panel's `unit` (default `ms` for older
+reports), and `null` for missing points. Gauge panels set `kind` to `queues` or
+`blocks` and use state names as series keys. See `report-data.example.json` for
+a small synthetic latency example.
+KV panels additionally carry `block_counts.used` and `block_counts.total`
+time series; older JSON without these fields displays unavailable counts as a dash.

@@ -69,7 +69,9 @@ class _AtomMetricsCollector:
     def __init__(self, exporter: AtomMetricsExporter):
         self._exporter = exporter
 
-    def collect(self) -> Iterable[GaugeMetricFamily | CounterMetricFamily]:
+    def collect(
+        self,
+    ) -> Iterable[GaugeMetricFamily | CounterMetricFamily | HistogramMetricFamily]:
         snapshot, refresh_errors, last_refresh = self._exporter.read()
         available = bool(snapshot.get("enabled", False))
 
@@ -93,6 +95,10 @@ class _AtomMetricsCollector:
         )
         metric.add_metric([], last_refresh)
         yield metric
+
+        yield from self._collect_scheduler_metrics(
+            snapshot.get("scheduler_metrics", [])
+        )
 
         # Read live rather than from the snapshot: the snapshot is refreshed by
         # the engine, and a stream starved by the engine is exactly the case
@@ -147,6 +153,16 @@ class _AtomMetricsCollector:
                 "atom:kv_cache_blocks_indexed",
                 "Number of KV-cache blocks reachable by prefix hash.",
                 snapshot.get("kv_blocks_indexed", 0),
+            ),
+            (
+                "atom:kv_cache_blocks_evictable",
+                "Free KV blocks retaining cached content; included in blocks_free.",
+                snapshot.get("kv_blocks_evictable", 0),
+            ),
+            (
+                "atom:kv_cache_blocks_vacant",
+                "Free KV blocks with no retained cached content.",
+                snapshot.get("kv_blocks_vacant", 0),
             ),
             (
                 "atom:kv_cache_usage_ratio",
@@ -439,6 +455,65 @@ class _AtomMetricsCollector:
         yield distribution
 
         yield from _gc_metrics()
+
+    @staticmethod
+    def _collect_scheduler_metrics(ranks):
+        labels = ["dp_rank", "engine_role"]
+        for key, name, help_text in (
+            (
+                "queue_time",
+                "atom:request_queue_time_seconds",
+                "Time from engine receipt to first real forward dispatch, including KV loading waits.",
+            ),
+            (
+                "decode_batch_size",
+                "atom:decode_batch_size",
+                "Real decode request rows per forward; excludes dummy work and graph padding.",
+            ),
+            (
+                "pd_kv_transfer",
+                "atom:pd_kv_transfer_seconds",
+                "Decode-side PD KV load wait until all workers complete; includes dispatch, handshake and notification.",
+            ),
+        ):
+            metric = HistogramMetricFamily(name, help_text, labels=labels)
+            for rank in ranks:
+                hist = rank[key]
+                metric.add_metric(
+                    [str(rank["dp_rank"]), rank["engine_role"]],
+                    buckets=[
+                        ["+Inf" if bound == float("inf") else str(bound), count]
+                        for bound, count in hist["buckets"]
+                    ],
+                    sum_value=hist["sum"],
+                )
+            yield metric
+
+        queues = GaugeMetricFamily(
+            "atom:scheduler_requests",
+            "Requests by scheduler state; waiting excludes KV waits.",
+            labels=[*labels, "state"],
+        )
+        blocks = GaugeMetricFamily(
+            "atom:scheduler_kv_cache_blocks",
+            "KV block pool by state; used + evictable + vacant = total.",
+            labels=[*labels, "state"],
+        )
+        timestamp = GaugeMetricFamily(
+            "atom:scheduler_snapshot_timestamp_seconds",
+            "Unix time of the engine scheduler snapshot.",
+            labels=labels,
+        )
+        for rank in ranks:
+            values = [str(rank["dp_rank"]), rank["engine_role"]]
+            for state in ("running", "waiting", "waiting_kv"):
+                queues.add_metric([*values, state], rank[state])
+            for state, count in rank["kv_blocks"].items():
+                blocks.add_metric([*values, state], count)
+            timestamp.add_metric(values, rank["timestamp"])
+        yield queues
+        yield blocks
+        yield timestamp
 
 
 def _gc_metrics() -> Iterable[GaugeMetricFamily | CounterMetricFamily]:
