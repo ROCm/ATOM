@@ -13,12 +13,14 @@ A DSV4 boundary is reusable only when both PAGE and SLOT restore successfully.
 Missing, incompatible, or corrupt sidecar data fails closed to recomputation.
 
 The public configuration remains `kv_connector: "lmcache_offload"`. The thin
-top-level shell resolves one of three layouts: `kimi_k3` when
-`hf_config.model_type == "kimi_linear"` (dense paged MLA KV plus a KDA
-per-request state tier), `hybrid` when `hf_config.compress_ratios` is present
-(DSV4 PAGE+SLOT), and `dense` otherwise. `kv_transfer_config.offload_layout` can
-override that choice without giving scheduler and worker different connector
-names.
+top-level shell resolves one of four layouts: `m3` for MiniMax-M3 PAGE regions
+(including its NSA index cache), `kimi_k3` when the text config has
+`model_type == "kimi_linear"` (dense paged MLA KV plus a KDA per-request state
+tier), `hybrid` when `hf_config.compress_ratios` is present (DSV4 PAGE+SLOT),
+and `dense` otherwise. `kv_transfer_config.offload_layout` can override
+compatible choices without giving scheduler and worker different connector
+names. MiniMax-M3 cannot be overridden away from `m3`, because the other codecs
+do not preserve its NSA index cache.
 
 GDN/linear-attention models (`qwen3_next`, `qwen3_5_*`; e.g. Qwen3-Next,
 Qwen3.5) are the one family the resolver does **not** map to a layout: they carry
