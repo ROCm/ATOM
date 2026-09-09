@@ -1200,7 +1200,7 @@ def render(report, context):
 
     if rows:
         drift_lines += [
-            "| Model | isl/osl | c | vs main now | vs main peak | Main trend |",
+            "| Model | isl/osl | c | vs main median | vs main peak | Main trend |",
             "|---|---|---|---|---|---|",
         ]
         for family in rows:
@@ -1240,14 +1240,15 @@ def render(report, context):
         drift_lines += [
             "",
             (
-                "*now* is main's current level -- the last 3 nightly runs, or "
-                "everything since the step when one is visible, so a median "
-                "never straddles a level change. *peak* is the best main has "
-                "sustained across all recorded history, which does not move as "
-                "history rolls forward: a drop that ages out of every window "
-                "still shows here. Both cross container images, where the "
-                "spread is 11-21% against 0.6% within one image; read them for "
-                "order of magnitude."
+                "**median** is main's level now: the median of its last 3 "
+                "nightly runs, or of everything since the step when one is "
+                "visible, so it never straddles a level change. **peak** is the "
+                "best main has sustained: the highest 3-run mean anywhere in "
+                "recorded history, which does not move as history rolls "
+                "forward, so a drop that has aged out of every window still "
+                "shows. Both cross container images, where the spread is "
+                "11-21% against 0.6% within one image; read them for order of "
+                "magnitude."
             ),
         ]
         measured = {(f["model"], f["isl_osl"]) for f in rows}
