@@ -6,7 +6,10 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-_path = Path(__file__).resolve().parents[1] / ".github/scripts/atomesh/observability/export_report.py"
+_path = (
+    Path(__file__).resolve().parents[1]
+    / ".github/scripts/atomesh/observability/export_report.py"
+)
 _spec = importlib.util.spec_from_file_location("export_report", _path)
 report = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(report)
