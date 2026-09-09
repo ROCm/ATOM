@@ -505,6 +505,10 @@ models:
           env:
             common:
               ATOM_ENABLE_REPLAYSSM: "0"
+            decode:
+              # Log each decode batch as a join/leave delta so the per-step
+              # batch membership can be replayed from the decode log.
+              ATOM_LOG_STEP_MEMBERSHIP: "1"
             prefill:
               <<: *kimi_k3_agentic_lmcache100_env
               LMCACHE_MAX_LOCAL_CPU_SIZE: "96"
