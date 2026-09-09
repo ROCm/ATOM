@@ -22,7 +22,7 @@ import pytest
 pytest.importorskip("triton", reason="base_attention defines @triton.jit kernels")
 pytest.importorskip("aiter", reason="base_attention imports the AITER runtime")
 
-from atom.model_ops.base_attention import (  # noqa: E402
+from atom.model_ops.base_attention import (
     PA_ASM_MAX_QUERY_GROUP_SIZE,
     PA_GLUON_MAX_QUERY_GROUP_SIZE,
     PA_GLUON_MAX_QUERY_LEN,
@@ -41,11 +41,29 @@ class TestGluonEnvelope:
         "max_qlen, num_heads, num_kv_heads, over, why",
         [
             (1, 16, 1, False, "M3 dense at tp4, no drafting"),
-            (4, 16, 1, False, "M3 dense at tp4 with 3 draft tokens: 16*4=64, on the limit"),
+            (
+                4,
+                16,
+                1,
+                False,
+                "M3 dense at tp4 with 3 draft tokens: 16*4=64, on the limit",
+            ),
             (5, 16, 1, True, "one more draft token: 80 rounds to 128, off the table"),
             (4, 32, 2, False, "M3 dense at tp2 -- ratio is still 16"),
-            (5, 8, 1, True, "gqa=8 reaches the query-length limit before the group one"),
-            (3, 17, 1, True, "ratio 17 rounds to 32, 3 rounds to 4: 128, no arm for it"),
+            (
+                5,
+                8,
+                1,
+                True,
+                "gqa=8 reaches the query-length limit before the group one",
+            ),
+            (
+                3,
+                17,
+                1,
+                True,
+                "ratio 17 rounds to 32, 3 rounds to 4: 128, no arm for it",
+            ),
             (2, 64, 1, True, "ratio 64 doubled by two query positions"),
         ],
     )
@@ -93,9 +111,7 @@ class TestEnvelopeConstants:
                 if gluon_decode_over_limit(qlen, ratio, 1):
                     continue
                 qlen_p2 = 1 << (qlen - 1).bit_length()
-                group_p2 = qlen_p2 * max(
-                    16 // qlen_p2, 1 << (ratio - 1).bit_length()
-                )
+                group_p2 = qlen_p2 * max(16 // qlen_p2, 1 << (ratio - 1).bit_length())
                 assert group_p2 in AITER_GLUON_GROUP_ARMS, (
                     f"qlen={qlen} ratio={ratio} passes as safe but needs a "
                     f"{group_p2}-wide layout, which aiter does not define"
