@@ -155,13 +155,13 @@ def shuffle_weights(*tensors: torch.nn.Parameter, layout: tuple[int, int] = (16,
         weight = tensor.data
         if weight.dim() == 2:
             shuffled = shuffle_weight(weight, layout=layout)
-            # Preserve the parameter's storage/address when possible so CUDA
-            # graphs captured against it remain valid across in-place online
-            # weight updates (no recapture needed). Fall back to reassignment
-            # only if the shuffled layout changes shape/dtype.
+            # Write through the existing storage, the way the 3D branch below
+            # already does, so that an online weight update does not move an
+            # address a captured CUDA graph holds. Rebind only when shuffling
+            # changes the shape or dtype, which no captured graph can survive
+            # anyway.
             if shuffled.shape == weight.shape and shuffled.dtype == weight.dtype:
                 weight.copy_(shuffled)
-                tensor.data = weight
             else:
                 tensor.data = shuffled
         elif weight.dim() == 3:
