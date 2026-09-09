@@ -234,6 +234,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "ATOM_PROFILER_TIMEOUT": lambda: float(os.getenv("ATOM_PROFILER_TIMEOUT", "300")),
     "ATOM_LOG_MORE": lambda: int(os.getenv("ATOM_LOG_MORE", "0")) != 0,
+    # Log the decode batch's membership as joins/leaves against the previous
+    # decode step, at INFO. Emits nothing on a step whose membership is
+    # unchanged, which is the great majority of them, so the volume scales with
+    # the number of requests rather than steps x batch size. Prefill membership
+    # is already logged unconditionally by the "Scheduled prefill batch" line.
+    "ATOM_LOG_STEP_MEMBERSHIP": lambda: (
+        os.getenv("ATOM_LOG_STEP_MEMBERSHIP", "0") == "1"
+    ),
     # RTL (rocm-trace-lite) GPU kernel tracing — set to output directory to enable.
     # When set, the server launch is wrapped with `rtl trace` to collect per-kernel
     # GPU timestamps for both prefill and decode phases.

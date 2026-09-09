@@ -1076,6 +1076,12 @@ class Scheduler:
         # pure-decode steps (the common case).
         self._partial_prefill_count: int = 0
         self._schedule_tick: int = 0
+        # Previous decode batch's membership, for the joins/leaves log. Decode
+        # only: the prefill batch already logs its req_ids in full, and diffing
+        # the two kinds against one shared set would report the entire decode
+        # batch as leaving and rejoining on every prefill-only step.
+        self._log_members_enabled = envs.ATOM_LOG_STEP_MEMBERSHIP
+        self._prev_decode_members: set[int] = set()
 
         self._num_parked_remote_kv: int = 0
 
@@ -1826,7 +1832,8 @@ class Scheduler:
                 seq.num_cached_tokens for seq in scheduled_seqs.values()
             ]
             logger.info(
-                f"Scheduled prefill batch: {num_seqs_prefill} reqs, "
+                f"Scheduled prefill batch: step={self._schedule_tick}, "
+                f"{num_seqs_prefill} reqs, "
                 f"{total_tokens_num_prefill} new tokens "
                 f"(done: {num_cached_tokens_list}, new: {num_scheduled_tokens}), "
                 f"req_ids: {tuple(scheduled_seqs.keys())}"
@@ -2025,6 +2032,7 @@ class Scheduler:
             ),
         )
         self._consume_state_forks(scheduled_seqs)
+        self._log_decode_members(scheduled_seqs, total_tokens_num_decode)
         return (decode_batch, scheduled_seqs)
 
     @staticmethod
@@ -2461,6 +2469,49 @@ class Scheduler:
         ):
             return self.kv_connector.adjust_prefill_chunk_after_alloc(seq, chunk)
         return chunk
+
+    def _log_decode_members(
+        self, scheduled_seqs: dict[int, Sequence], total_tokens: int
+    ) -> None:
+        """Record this decode batch as a delta against the previous one.
+
+        Logging the membership in full would be ~14 KB per line at 2048 seqs
+        and ~1 ms per step. The delta is empty on almost every decode step --
+        in steady state only `batch_size / output_len` seqs turn over -- so the
+        volume tracks the request count rather than steps x batch size, two
+        orders of magnitude less. It degrades to the full thing only when
+        output lengths approach 1, where every step does churn its whole batch.
+
+        Offline, replay every line with `step` <= N to rebuild the batch at step
+        N; `n=` is the invariant to check that replay against, so a dropped line
+        shows up as a mismatch instead of a silently wrong reconstruction.
+
+        Step numbers come from `_schedule_tick`, which counts scheduling passes
+        including those that return no batch, so the numbering has gaps wherever
+        the engine idled or scheduled a prefill.
+
+        An empty batch is skipped rather than recorded as a step with no
+        members: `_schedule` returns one whenever admission was granted but
+        nothing could be scheduled (see the delayer note in
+        `EngineCore._process_engine_step_inner`), the engine runs no forward for
+        it (`has_seqs`), and diffing against it would report the whole batch
+        leaving and rejoining across two steps that never ran.
+        """
+        if not self._log_members_enabled or not scheduled_seqs:
+            return
+        cur = set(scheduled_seqs.keys())
+        joins = cur - self._prev_decode_members
+        leaves = self._prev_decode_members - cur
+        self._prev_decode_members = cur
+        if joins or leaves:
+            logger.info(
+                "[StepMembers] step=%d decode n=%d tokens=%d +%s -%s",
+                self._schedule_tick,
+                len(cur),
+                total_tokens,
+                sorted(joins),
+                sorted(leaves),
+            )
 
     def preempt(self, seq: Sequence):
         self.total_preemptions += 1
@@ -2915,12 +2966,31 @@ class Scheduler:
                 )
 
             if leave_reason is not None:
-                # logger.info(
-                #     f"Sequence {seq.id} finished with reason: {leave_reason}, {seq.token_ids[-8:]=}"
-                # )
                 seq.num_tokens = num_tokens
                 seq.leave_reason = leave_reason
                 seq.status = SequenceStatus.FINISHED
+                # The one point every request shape passes through. The API
+                # server counts output tokens separately per shape -- streaming
+                # chat (serving_chat.py), streaming completion, non-stream
+                # (api_server.py `generate_async`), fanout -- and logs none of
+                # them, so only `InputOutputProcessor.postprocess` (offline
+                # `generate()`) ever reported a length. Under PD the prefill
+                # instance finishes each seq here too, always at output=1; read
+                # the DECODE instance's log for real generation lengths.
+                # `step` is the live tick, not one carried on the batch: this
+                # runs between the forward and the next schedule() on every
+                # path except PP, where the head keeps pp_size batches in
+                # flight and the counter may already have moved past the batch
+                # being postprocessed. Read it as "no later than", not "exactly".
+                logger.info(
+                    "Sequence %s finished at step %d with reason %s. "
+                    "Input tokens: %d, output tokens: %d",
+                    seq.id,
+                    self._schedule_tick,
+                    leave_reason,
+                    seq.num_prompt_tokens,
+                    num_tokens - seq.num_prompt_tokens,
+                )
                 self.total_finished_requests += 1
                 self.total_prompt_tokens += int(seq.num_prompt_tokens)
                 self.total_generation_tokens += max(
