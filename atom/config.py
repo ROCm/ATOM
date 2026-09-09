@@ -1586,6 +1586,17 @@ class Config:
     # from the model card. 0 means "not padded", which is the right answer for
     # every model whose embedding matrix matches its tokenizer.
     true_vocab_size: int = 0
+    # Sleep (`release_memory`) normally frees the weights and the KV pool and
+    # recaptures the decode CUDA graphs on wake. Set this to keep both
+    # allocated instead, so the addresses the graphs captured stay valid and
+    # nothing is recaptured -- recapture is what faults under
+    # PYTORCH_CUDA_ALLOC_CONF=expandable_segments.
+    #
+    # The cost is that sleep no longer returns that memory to the allocator, so
+    # a colocated trainer that sleeps the rollout engine to get its memory back
+    # will not get it back. That is why it is opt-in. No effect under
+    # `enforce_eager`, where there are no graphs to keep valid.
+    sleep_keeps_memory_resident: bool = False
     hf_config: PretrainedConfig = field(init=False)
     generation_config: GenerationConfig = field(init=False)
     parallel_config: ParallelConfig = field(default_factory=ParallelConfig)
