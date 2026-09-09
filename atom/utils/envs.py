@@ -116,6 +116,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ": lambda: (
         os.getenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "1") == "1"
     ),
+    # MLA prefill flash-attention: swap aiter's CK varlen kernel for the flydsl
+    # gfx950 fp8 FMHA, quantizing q/k/v to per-tensor e4m3 at the call site. The
+    # kernel bakes rsqrt(head_dim) as its softmax scale, so a layer whose scale
+    # differs (the YaRN mscale**2 that DeepSeek V3/V3.2/K2.5 carry) is served by
+    # folding the ratio into q_descale rather than by falling back. Requires
+    # gfx950, head_dim % 64 == 0 and 64 <= v_head_dim <= 192; anything else
+    # falls back to CK with a one-time warning.
+    "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN": lambda: (
+        os.getenv("ATOM_USE_FLYDSL_FP8_PREFILL_ATTN", "0") == "1"
+    ),
     # QK-norm-rope-cache-quant fusion for Qwen3 dense and MoE; disabled by default.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"
