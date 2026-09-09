@@ -852,6 +852,23 @@ print(f"[aiperf] dashboard json: {dst}")
 PY
 }
 
+write_aiperf_chrome_trace() {
+  local out_dir="$1"
+  local generator="${ATOMESH_SCRIPT_DIR}/../generate_aiperf_traces.py"
+  local jsonl="${out_dir}/profile_export.jsonl"
+  if [[ ! -f "${jsonl}" ]]; then
+    echo "[aiperf] skip chrome trace: ${jsonl} was not produced"
+    return 0
+  fi
+  if [[ ! -f "${generator}" ]]; then
+    echo "[aiperf] skip chrome trace: ${generator} not found"
+    return 0
+  fi
+  echo "[aiperf] converting ${jsonl} to Perfetto/Chrome trace"
+  python3 "${generator}" "${out_dir}" \
+    || echo "[aiperf] WARNING: chrome trace conversion failed for ${out_dir}" >&2
+}
+
 run_aiperf_agentic_benchmark() {
   ensure_aiperf
 
@@ -929,6 +946,7 @@ run_aiperf_agentic_benchmark() {
       return 1
     fi
     write_aiperf_dashboard_json "${aiperf_json}" "${dashboard_json}" "${conc}"
+    write_aiperf_chrome_trace "${out_dir}"
   done
 }
 
