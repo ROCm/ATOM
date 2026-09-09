@@ -5,14 +5,63 @@ from __future__ import annotations
 import copy
 import threading
 import time
+from bisect import bisect_left
 from collections.abc import Iterable
 from typing import Any
 
 from prometheus_client import CollectorRegistry, Histogram, generate_latest
-from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
+from prometheus_client.core import (
+    CounterMetricFamily,
+    GaugeMetricFamily,
+    HistogramMetricFamily,
+)
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 
 from .streaming_dispatch import longest_silence_seconds
+
+
+class _WeightedHistogram:
+    """Aggregate equal observations with one bucket lookup and one lock.
+
+    Own the counters and expose them through Prometheus' public collector API.
+    A scrape snapshots bucket counts and the sum under the same lock.
+    """
+
+    def __init__(self, name, documentation, *, buckets, registry):
+        self._name = name
+        self._documentation = documentation
+        self._bounds = (*buckets, float("inf"))
+        self._counts = [0] * len(self._bounds)
+        self._sum = 0.0
+        self._created = time.time()
+        self._lock = threading.Lock()
+        registry.register(self)
+
+    def observe_weighted(self, total: float, weight: int) -> None:
+        """Record ``weight`` equal samples whose sum is ``total``."""
+        if weight <= 0:
+            return
+        index = bisect_left(self._bounds, total / weight)
+        with self._lock:
+            self._counts[index] += weight
+            self._sum += total
+
+    def collect(self):
+        with self._lock:
+            counts, total = self._counts.copy(), self._sum
+        cumulative = 0
+        buckets = []
+        for bound, count in zip(self._bounds, counts):
+            cumulative += count
+            buckets.append(
+                ("+Inf" if bound == float("inf") else str(bound), cumulative)
+            )
+        yield HistogramMetricFamily(
+            self._name, self._documentation, buckets=buckets, sum_value=total
+        )
+        yield GaugeMetricFamily(
+            self._name + "_created", self._documentation, value=self._created
+        )
 
 
 class _AtomMetricsCollector:
@@ -401,7 +450,7 @@ class AtomMetricsExporter:
         self._last_refresh = 0.0
         self._registry = CollectorRegistry(auto_describe=False)
         self._registry.register(_AtomMetricsCollector(self))
-        self._inter_token_latency = Histogram(
+        self._inter_token_latency = _WeightedHistogram(
             "atom:inter_token_latency_seconds",
             "Frontend-observed streaming output interval divided by new token "
             "count, weighted by that count. Excludes the first output batch.",
@@ -469,16 +518,12 @@ class AtomMetricsExporter:
         )
 
     def observe_inter_token_latency(self, interval: float, num_new_tokens: int) -> None:
-        """Record token-weighted output intervals using public Histogram APIs.
+        """Record token-weighted intervals in one aggregation update.
 
         These cumulative observations are independent of the engine snapshot;
         neither refreshing that snapshot nor scraping resets the histogram.
         """
-        if num_new_tokens <= 0:
-            return
-        per_token = interval / num_new_tokens
-        for _ in range(num_new_tokens):
-            self._inter_token_latency.observe(per_token)
+        self._inter_token_latency.observe_weighted(interval, num_new_tokens)
 
     def update(self, snapshot: dict[str, Any]) -> None:
         with self._lock:

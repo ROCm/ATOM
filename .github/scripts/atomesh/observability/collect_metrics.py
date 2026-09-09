@@ -169,6 +169,46 @@ def empty_report(start, end, model, notes):
     }
 
 
+def finalize_report(data: dict, status: dict, notes: list[str]) -> None:
+    """Finalize collection diagnostics and report metadata in one place."""
+    missing = [
+        p["id"]
+        for p in data["panels"]
+        if not all(
+            any(v is not None for _, v in points) for points in p["series"].values()
+        )
+    ]
+    if missing:
+        status["errors"].append("No samples for: " + ", ".join(missing))
+    status["errors"] = list(dict.fromkeys(status["errors"]))
+    status["status"] = (
+        "partial" if status["errors"] or status["benchmark_exit_code"] else "complete"
+    )
+    if len(missing) == len(data["panels"]):
+        status["status"] = "unavailable"
+    data["meta"]["notes"] = list(dict.fromkeys([*notes, *status["errors"]]))
+
+
+def publish_report(output: Path, data: dict, status: dict) -> None:
+    """Publish once, retaining benchmark status even when an artifact fails."""
+    status["publication_errors"] = []
+    for name, write in (
+        ("report.html", lambda path: export_report.write_report(data, path)),
+        ("report-data.json", lambda path: save_json(path, data)),
+        ("status.json", lambda path: save_json(path, status)),
+    ):
+        try:
+            write(output / name)
+        except Exception as exc:  # noqa: BLE001
+            # Publication is best effort after the benchmark has completed.
+            # Keep errors out of collection diagnostics and try other artifacts.
+            message = f"Could not publish {name}: {exc}"
+            status["publication_errors"].append(message)
+            if status["status"] == "complete":
+                status["status"] = "partial"
+            print(f"[metrics] {message}", flush=True)
+
+
 def run(args) -> int:
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -263,22 +303,20 @@ def run(args) -> int:
                 notes.append(
                     f"Benchmark exited with code {benchmark_rc}; available samples are retained."
                 )
-            data = empty_report(start, end, args.model, notes)
+            data = empty_report(start, end, args.model, [])
             try:
                 if prometheus_url is None:
                     raise RuntimeError("No Prometheus collector is available")
                 if received_signal is None:
                     time.sleep(6)
-                data = export_report.generate_report(
+                data = export_report.collect_report(
                     prometheus_url,
                     start,
                     max(end, start + 1),
-                    output / "report.html",
                     model=args.model,
                     title="Agentic PD latency report",
+                    diagnostics=status["errors"],
                 )
-                status["errors"].extend(data["meta"].get("notes", []))
-                data["meta"]["notes"].extend(notes)
                 targets = get_json(prometheus_url + "/api/v1/targets")
                 save_json(output / "targets-after.json", targets)
                 up_query = (
@@ -306,25 +344,8 @@ def run(args) -> int:
             finally:
                 stop_process(collector)
 
-            missing = [
-                p["id"]
-                for p in data["panels"]
-                if not all(
-                    any(v is not None for _, v in points)
-                    for points in p["series"].values()
-                )
-            ]
-            if missing:
-                status["errors"].append("No samples for: " + ", ".join(missing))
-            status["status"] = (
-                "partial" if status["errors"] or benchmark_rc else "complete"
-            )
-            if len(missing) == len(data["panels"]):
-                status["status"] = "unavailable"
-            data["meta"]["notes"].extend(status["errors"])
-            save_json(output / "report-data.json", data)
-            export_report.write_report(data, output / "report.html")
-            save_json(output / "status.json", status)
+            finalize_report(data, status, notes)
+            publish_report(output, data, status)
             print(
                 f"[metrics] {status['status']}: {output / 'report.html'}",
                 flush=True,

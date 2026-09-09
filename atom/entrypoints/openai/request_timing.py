@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Callable
 from contextvars import ContextVar
@@ -48,44 +49,70 @@ def _has_generated_output(payload: Any) -> bool:
     return False
 
 
+class SSEFrames:
+    """Incrementally frame SSE bytes with amortized linear scanning and copying."""
+
+    _ENDING = re.compile(rb"\n\n|\r\n\r\n")
+
+    def __init__(self, max_frame_bytes: int):
+        self.pending = bytearray()
+        self._start = 0
+        self._search = 0
+        self._limit = max_frame_bytes
+        self.oversized = False
+
+    def append(self, chunk: bytes) -> None:
+        # Compact only after consuming at least half the buffer. Each copied
+        # byte can be charged to consumed bytes, even with a large partial frame.
+        if self._start and self._start >= len(self.pending) // 2:
+            del self.pending[: self._start]
+            self._search -= self._start
+            self._start = 0
+        self.pending.extend(chunk)
+
+    def next_frame(self) -> bytes | None:
+        ending = self._ENDING.search(self.pending, self._search)
+        if ending is None:
+            self._search = max(self._start, len(self.pending) - 3)
+            self.oversized = len(self.pending) - self._start > self._limit
+            return None
+        if ending.start() - self._start > self._limit:
+            self.oversized = True
+            return None
+        frame = bytes(self.pending[self._start : ending.start()])
+        self._start = self._search = ending.end()
+        return frame
+
+    def clear(self) -> None:
+        self.pending.clear()
+        self._start = self._search = 0
+
+
 class FirstOutputSSE:
     """Inspect SSE until the first generation event, without altering the stream."""
 
     MAX_PENDING_BYTES = 1024 * 1024
 
     def __init__(self):
-        self.pending = b""
+        self._frames = SSEFrames(self.MAX_PENDING_BYTES)
         self.done = False
+
+    def _finish(self) -> None:
+        self.done = True
+        self._frames.clear()
 
     def feed(self, chunk: bytes) -> bool:
         if self.done:
             return False
-        self.pending += chunk
-        while True:
-            endings = [
-                (self.pending.find(marker), len(marker))
-                for marker in (b"\n\n", b"\r\n\r\n")
-            ]
-            endings = [(pos, size) for pos, size in endings if pos >= 0]
-            if not endings:
-                if len(self.pending) > self.MAX_PENDING_BYTES:
-                    self.done = True
-                    self.pending = b""
-                return False
-            pos, size = min(endings)
-            if pos > self.MAX_PENDING_BYTES:
-                self.done = True
-                self.pending = b""
-                return False
-            frame, self.pending = self.pending[:pos], self.pending[pos + size :]
+        self._frames.append(chunk)
+        while (frame := self._frames.next_frame()) is not None:
             data = b"\n".join(
                 line[5:].lstrip(b" ")
                 for line in frame.splitlines()
                 if line.startswith(b"data:")
             )
             if data == b"[DONE]":
-                self.done = True
-                self.pending = b""
+                self._finish()
                 return False
             try:
                 payload = json.loads(data)
@@ -94,13 +121,14 @@ class FirstOutputSSE:
             if isinstance(payload, dict) and (
                 "error" in payload or payload.get("type") == "error"
             ):
-                self.done = True
-                self.pending = b""
+                self._finish()
                 return False
             if _has_generated_output(payload):
-                self.done = True
-                self.pending = b""
+                self._finish()
                 return True
+        if self._frames.oversized:
+            self._finish()
+        return False
 
 
 @dataclass

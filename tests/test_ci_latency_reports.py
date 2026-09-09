@@ -91,6 +91,85 @@ def make_report(results, cell, job, name="aiperf-model-pd-c4"):
     return folder
 
 
+@pytest.mark.parametrize("exit_code", [0, 17])
+@pytest.mark.parametrize(
+    "failed_artifact", ["report.html", "report-data.json", "status.json"]
+)
+def test_publication_failure_preserves_benchmark_exit(
+    collector, monkeypatch, tmp_path, capsys, exit_code, failed_artifact
+):
+    def unavailable(_):
+        raise OSError("collector unavailable")
+
+    monkeypatch.setattr(collector, "ensure_prometheus", unavailable)
+    original_save = collector.save_json
+    original_write = collector.export_report.write_report
+    renders = []
+
+    def save(path, data):
+        if path.name == failed_artifact and data.get("status") != "collecting":
+            raise OSError("injected publication failure")
+        original_save(path, data)
+
+    def render(data, path):
+        renders.append(path)
+        if path.name == failed_artifact:
+            raise OSError("injected publication failure")
+        original_write(data, path)
+
+    monkeypatch.setattr(collector, "save_json", save)
+    monkeypatch.setattr(collector.export_report, "write_report", render)
+    args = argparse.Namespace(
+        output=tmp_path / "report",
+        model="test",
+        prefill=["127.0.0.1:8010"],
+        decode=["127.0.0.1:8020"],
+        mesh="127.0.0.1:29100",
+        command=[sys.executable, "-c", f"raise SystemExit({exit_code})"],
+    )
+    assert collector.run(args) == exit_code
+    assert len(renders) == 1
+    assert f"Could not publish {failed_artifact}" in capsys.readouterr().out
+    if failed_artifact != "status.json":
+        status = json.loads((args.output / "status.json").read_text())
+        assert status["benchmark_exit_code"] == exit_code
+        assert status["status"] != "collecting"
+        assert failed_artifact in status["publication_errors"][0]
+
+
+def test_collection_diagnostics_are_finalized_once_before_rendering(
+    collector, monkeypatch, tmp_path
+):
+    report = collector.export_report
+
+    def fetch(url, query, start, end, step):
+        if 'role="prefill"' in query and "histogram_quantile(0.9," in query:
+            raise OSError("one query failed")
+        return [[start, 10.0], [end, 20.0]]
+
+    monkeypatch.setattr(report, "fetch_series", fetch)
+    renders = []
+    original = report.write_report
+
+    def render(data, path):
+        renders.append(data)
+        original(data, path)
+
+    monkeypatch.setattr(report, "write_report", render)
+    status = {"benchmark_exit_code": 17, "errors": []}
+    data = report.collect_report(
+        "http://fixture", 100, 110, diagnostics=status["errors"]
+    )
+    assert not renders
+    assert len(status["errors"]) == 1 and data["meta"]["notes"] == []
+    collector.finalize_report(data, status, ["benchmark notes"])
+    collector.publish_report(tmp_path, data, status)
+    assert len(renders) == 1
+    assert data["meta"]["notes"].count(status["errors"][0]) == 1
+    saved = json.loads((tmp_path / "status.json").read_text())
+    assert saved["status"] == "partial" and saved["publication_errors"] == []
+
+
 def test_staging_selects_current_cell_and_job_and_links_the_artifact(tmp_path):
     stage = load_module("stage_reports")
     results, output = tmp_path / "results", tmp_path / "staged"
@@ -138,8 +217,9 @@ def test_interrupted_status_keeps_report_and_logs_available(tmp_path):
 
 
 @pytest.mark.parametrize("has_lock", [False, True])
+@pytest.mark.parametrize("profile", ["release", "ci"])
 def test_mesh_build_uses_writable_copy_and_archives_resolved_dependencies(
-    tmp_path, has_lock
+    tmp_path, has_lock, profile
 ):
     source = tmp_path / "read only source"
     source.mkdir()
@@ -155,29 +235,39 @@ def test_mesh_build_uses_writable_copy_and_archives_resolved_dependencies(
         "#!" + sys.executable + "\n"
         "import sys\nfrom pathlib import Path\n"
         "args=sys.argv[1:]\n"
+        "if args == ['--version']: print('cargo test-fixture'); sys.exit(0)\n"
         "source=Path(args[args.index('--manifest-path')+1]).parent\n"
         "target=Path(args[args.index('--target-dir')+1])\n"
         "assert not (source/'target').exists()\n"
         "assert ('--locked' in args)==(source/'Cargo.lock').exists()\n"
         "(source/'Cargo.lock').write_text('resolved dependencies')\n"
-        "(target/'ci').mkdir(parents=True)\n"
-        "(target/'ci/atomesh').touch()\n"
+        "profile=args[args.index('--profile')+1]\n"
+        "(target/profile).mkdir(parents=True, exist_ok=True)\n"
+        "(target/profile/'atomesh').write_text('binary')\n"
+        "(target/profile/'atomesh').chmod(0o755)\n"
     )
     cargo.chmod(0o755)
     logs = tmp_path / "logs"
     result = subprocess.run(
-        ["bash", str(SCRIPTS / "build_mesh.sh"), str(source), str(logs)],
+        ["bash", str(SCRIPTS.parent / "build_mesh.sh"), str(source), str(logs)],
         env={
             **os.environ,
             "PATH": str(binary_dir) + os.pathsep + os.environ["PATH"],
             "TMPDIR": str(tmp_path),
             "ATOMESH_MESH_TARGET_DIR": str(tmp_path / "cache"),
+            "ATOMESH_MESH_BUILD_PROFILE": profile,
+            "ATOMESH_MESH_SOURCE_COMMIT": "reviewed-commit",
         },
         capture_output=True,
         text=True,
         check=True,
     )
     assert Path(result.stdout.strip()).is_file()
+    metadata = json.loads((logs / "mesh-build.json").read_text())
+    assert metadata["commit"] == "reviewed-commit"
+    assert metadata["profile"] == profile
+    assert len(metadata["binary_sha256"]) == 64
+    assert not list(tmp_path.glob("atomesh-ci-mesh.*"))
     assert (logs / "mesh-Cargo.lock").read_text() == "resolved dependencies"
     assert (source / "Cargo.lock").exists() == has_lock
     if has_lock:
@@ -197,6 +287,88 @@ def test_partial_report_remains_downloadable_and_path_traversal_is_rejected(tmp_
     assert manifest["reports"][0]["html"]
     with pytest.raises(ValueError):
         stage.stage_reports(results, "../cell-a", tmp_path / "bad")
+
+
+def test_mesh_setup_builds_once_and_passes_a_reusable_binary_path(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "fixture",
+        ],
+        check=True,
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    docker = bin_dir / "docker"
+    calls = tmp_path / "docker-calls.jsonl"
+    docker.write_text(
+        "#!" + sys.executable + "\n"
+        "import json,os,sys\nfrom pathlib import Path\n"
+        "args=sys.argv[1:]\n"
+        "with open(os.environ['TEST_DOCKER_CALLS'], 'a') as f: f.write(json.dumps(args)+'\\n')\n"
+        "mounts=[args[i+1] for i,a in enumerate(args) if a=='-v']\n"
+        "artifact=Path(next(m for m in mounts if m.endswith('/mesh-build')).split(':')[0])\n"
+        "(artifact/'atomesh').write_text('binary')\n"
+        "(artifact/'atomesh').chmod(0o755)\n"
+        "(artifact/'mesh-build.json').write_text('{}')\n"
+    )
+    docker.chmod(0o755)
+    env_file = tmp_path / "docker.env"
+    env_file.write_text("ATOMESH_MESH_BUILD_PROFILE=release\n")
+    env = {
+        **os.environ,
+        "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+        "ATOMESH_BUILD_MESH": "true",
+        "ATOMESH_MESH_BINARY": "",
+        "ATOMESH_MESH_TARGET_DIR": str(tmp_path / "cache"),
+        "TEST_DOCKER_CALLS": str(calls),
+    }
+    command = [
+        "bash",
+        str(SCRIPTS.parent / "setup_mesh.sh"),
+        str(repo),
+        str(tmp_path / "run"),
+        "test-image",
+        str(env_file),
+        "123",
+    ]
+    for _ in range(2):
+        result = subprocess.run(
+            command, env=env, capture_output=True, text=True, check=False
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "/run_logs/slurm_job-123/mesh-build/atomesh"
+    recorded = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert len(recorded) == 1
+    assert "--user" in recorded[0] and "--env-file" in recorded[0]
+    assert any(arg.startswith("ATOMESH_MESH_SOURCE_COMMIT=") for arg in recorded[0])
+    assert f"{tmp_path / 'cache'}:/mesh-cache" in recorded[0]
+    for overrides, expected in (
+        ({"ATOMESH_MESH_BINARY": "/custom/atomesh"}, "/custom/atomesh"),
+        ({"ATOMESH_BUILD_MESH": "false"}, "/app/ATOM/atom/mesh/target/release/atomesh"),
+    ):
+        result = subprocess.run(
+            command,
+            env={**env, **overrides},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == expected
+    assert len(calls.read_text().splitlines()) == 1
 
 
 @pytest.mark.skipif(

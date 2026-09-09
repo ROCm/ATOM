@@ -629,12 +629,7 @@ start_decode() {
 
 start_router() {
   echo "[router] prefill=${prefill_args[*]} decode=${decode_args[*]}"
-  local mesh_binary="/app/ATOM/atom/mesh/target/release/atomesh"
-  if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" && "${ATOMESH_EXECUTION_PHASE}" != "eval" ]]; then
-    # The image can predate the checkout's HTTP TTFT instrumentation.
-    mesh_binary="$(bash "${ATOMESH_SCRIPT_DIR}/observability/build_mesh.sh" \
-      "${ATOMESH_SCRIPT_DIR}/../../../atom/mesh" "${RUNTIME_LOG_DIR}")"
-  fi
+  local mesh_binary="${ATOMESH_MESH_BINARY:-/app/ATOM/atom/mesh/target/release/atomesh}"
   case "${ATOM_PD_RANK_MAPPING_POLICY}" in
     none|idx2idx) ;;
     *)

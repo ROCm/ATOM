@@ -130,39 +130,70 @@ impl http_body::Body for FirstOutputBody {
 }
 
 #[derive(Default)]
-struct FirstOutputSse {
+struct SseFrames {
     pending: Vec<u8>,
+    start: usize,
+    search: usize,
+    oversized: bool,
+}
+
+impl SseFrames {
+    const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+    fn append(&mut self, chunk: &[u8]) {
+        // Amortize compaction over the consumed bytes, not over frames.
+        if self.start > 0 && self.start >= self.pending.len() / 2 {
+            self.pending.drain(..self.start);
+            self.search -= self.start;
+            self.start = 0;
+        }
+        self.pending.extend_from_slice(chunk);
+    }
+
+    fn next_frame(&mut self) -> Option<&[u8]> {
+        while let Some(offset) = memchr::memchr(b'\n', &self.pending[self.search..]) {
+            let end = self.search + offset;
+            self.search = end + 1;
+            // Inspect preceding bytes so delimiters spanning appends require no
+            // rescan of the buffered prefix. Each newline is visited once.
+            let frame_end = if end > self.start && self.pending[end - 1] == b'\n' {
+                Some(end - 1)
+            } else if end >= self.start + 3 && &self.pending[end - 3..end] == b"\r\n\r" {
+                Some(end - 3)
+            } else {
+                None
+            };
+            if let Some(frame_end) = frame_end {
+                if frame_end - self.start > Self::MAX_FRAME_BYTES {
+                    self.oversized = true;
+                    return None;
+                }
+                let start = self.start;
+                self.start = self.search;
+                return Some(&self.pending[start..frame_end]);
+            }
+        }
+        self.search = self.pending.len();
+        self.oversized = self.pending.len() - self.start > Self::MAX_FRAME_BYTES;
+        None
+    }
+}
+
+#[derive(Default)]
+struct FirstOutputSse {
+    frames: SseFrames,
     model: Option<String>,
     done: bool,
 }
 
 impl FirstOutputSse {
-    const MAX_PENDING_BYTES: usize = 1024 * 1024;
-
     fn feed(&mut self, chunk: &[u8]) -> bool {
         if self.done {
             return false;
         }
-        self.pending.extend_from_slice(chunk);
-        loop {
-            let ending = [b"\n\n".as_slice(), b"\r\n\r\n".as_slice()]
-                .iter()
-                .filter_map(|marker| {
-                    memchr::memmem::find(&self.pending, marker).map(|pos| (pos, marker.len()))
-                })
-                .min();
-            let Some((pos, size)) = ending else {
-                if self.pending.len() > Self::MAX_PENDING_BYTES {
-                    self.finish();
-                }
-                return false;
-            };
-            if pos > Self::MAX_PENDING_BYTES {
-                self.finish();
-                return false;
-            }
-            let frame = self.pending.drain(..pos + size).collect::<Vec<_>>();
-            let Ok(frame) = std::str::from_utf8(&frame[..pos]) else {
+        self.frames.append(chunk);
+        while let Some(frame) = self.frames.next_frame() {
+            let Ok(frame) = std::str::from_utf8(frame) else {
                 continue;
             };
             let data = frame
@@ -192,11 +223,15 @@ impl FirstOutputSse {
                 return true;
             }
         }
+        if self.frames.oversized {
+            self.finish();
+        }
+        false
     }
 
     fn finish(&mut self) {
         self.done = true;
-        self.pending = Vec::new();
+        self.frames = SseFrames::default();
     }
 }
 
@@ -308,8 +343,8 @@ mod tests {
         }
         assert!(detector.feed(&valid));
         let mut detector = FirstOutputSse::default();
-        assert!(!detector.feed(&vec![b'x'; FirstOutputSse::MAX_PENDING_BYTES + 1]));
-        assert!(detector.done && detector.pending.is_empty());
+        assert!(!detector.feed(&vec![b'x'; SseFrames::MAX_FRAME_BYTES + 1]));
+        assert!(detector.done && detector.frames.pending.is_empty());
     }
 
     fn sample(rendered: &str, suffix: &str) -> f64 {
@@ -322,6 +357,30 @@ mod tests {
             .1
             .parse()
             .unwrap()
+    }
+
+    #[test]
+    fn many_metadata_frames_and_large_fragmented_output() {
+        let mut payload = b": keepalive\n\ndata: {}\r\n\r\n".repeat(100);
+        payload.extend(sse(json!({"choices": [{"text": "x".repeat(65536)}]})));
+        for chunk_size in [1, 3, 1024, 65536] {
+            let mut detector = FirstOutputSse::default();
+            let count = payload.chunks(chunk_size).len();
+            for (index, chunk) in payload.chunks(chunk_size).enumerate() {
+                assert_eq!(detector.feed(chunk), index + 1 == count);
+            }
+            assert!(detector.frames.pending.is_empty());
+        }
+    }
+
+    #[test]
+    fn frame_limit_applies_after_consumed_metadata() {
+        let mut payload = b"data: {}\r\n\r\ndata: ".to_vec();
+        payload.extend(vec![b'x'; SseFrames::MAX_FRAME_BYTES]);
+        payload.extend_from_slice(b"\n\n");
+        let mut detector = FirstOutputSse::default();
+        assert!(!detector.feed(&payload));
+        assert!(detector.done);
     }
 
     #[tokio::test(flavor = "current_thread")]

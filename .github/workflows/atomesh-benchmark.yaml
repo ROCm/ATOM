@@ -1190,6 +1190,10 @@ jobs:
 
       - name: Run Slurm benchmark cell
         env:
+          # Build the reviewed source in a separate setup container. Use the
+          # existing release profile for both benchmark and eval services.
+          ATOMESH_BUILD_MESH: ${{ matrix.benchmark.kind == 'aiperf_agentic' && 'true' || 'false' }}
+          ATOMESH_MESH_BUILD_PROFILE: release
           CELL_JSON: ${{ toJson(matrix) }}
           RESULT_DIR: atomesh-results
           SLURM_SUBMIT_RUNNER: ${{ matrix.runner.slurm_submit_runner }}

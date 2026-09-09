@@ -79,7 +79,27 @@ def test_no_ttft_after_error_or_empty_completion(terminal):
 def test_incomplete_event_buffer_is_bounded():
     detector = FirstOutputSSE()
     assert not detector.feed(b"x" * (detector.MAX_PENDING_BYTES + 1))
-    assert detector.done and not detector.pending
+    assert detector.done and not detector._frames.pending
+
+
+@pytest.mark.parametrize("chunk_size", [1, 3, 1024, 65536])
+def test_many_metadata_frames_and_large_fragmented_output(chunk_size):
+    prefix = (b": keepalive\n\n" + b"data: {}\r\n\r\n") * 100
+    output = _sse({"choices": [{"text": "x" * 65536}]}, "\r\n")
+    payload = prefix + output
+    detector = FirstOutputSSE()
+    found = []
+    for start in range(0, len(payload), chunk_size):
+        found.append(detector.feed(payload[start : start + chunk_size]))
+    assert found == [False] * (len(found) - 1) + [True]
+    assert not detector._frames.pending
+
+
+def test_frame_limit_applies_after_consumed_metadata():
+    detector = FirstOutputSSE()
+    oversized = b"data: " + b"x" * detector.MAX_PENDING_BYTES + b"\n\n"
+    assert not detector.feed(b"data: {}\r\n\r\n" + oversized)
+    assert detector.done
 
 
 def _metrics(exporter):

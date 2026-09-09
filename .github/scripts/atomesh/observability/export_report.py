@@ -120,9 +120,10 @@ def fetch_series(url: str, query: str, start: float, end: float, step: int) -> l
     ]
 
 
-def collect(args) -> dict:
+def collect(args, *, diagnostics: list[str] | None = None) -> dict:
     panels = panels_for(args.deployment)
-    errors = []
+    errors = [] if diagnostics is None else diagnostics
+    failed = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
         pending = {}
         for panel in panels:
@@ -144,10 +145,11 @@ def collect(args) -> dict:
             try:
                 panel["series"][statistic] = future.result()
             except (OSError, ValueError, RuntimeError, KeyError) as exc:
+                failed += 1
                 panel["series"][statistic] = []
                 errors.append(f"{panel['title']} / {statistic}: {exc}")
-    if len(errors) == len(pending):
-        raise RuntimeError("All Prometheus queries failed: " + errors[0])
+    if failed == len(pending):
+        raise RuntimeError("All Prometheus queries failed: " + errors[-failed])
     return {
         "meta": {
             "title": args.title,
@@ -159,7 +161,7 @@ def collect(args) -> dict:
             "source": args.prometheus_url,
             "kind": "prometheus",
             "exported_at": time.time(),
-            "notes": errors,
+            "notes": errors if diagnostics is None else [],
         },
         "panels": panels,
     }
@@ -278,19 +280,23 @@ def write_report(data: dict, output: str | Path) -> None:
     output.write_text(template.replace("__REPORT_DATA__", payload), encoding="utf-8")
 
 
-def generate_report(
+def collect_report(
     prometheus_url: str,
     start: float,
     end: float,
-    output: str | Path,
     *,
     deployment: str = "pd",
     step: int = 5,
     window: int = 60,
     title: str = "Inference latency report",
     model: str = "ATOM",
+    diagnostics: list[str] | None = None,
 ) -> dict:
-    """Public Prometheus-to-HTML API; return the same data for archival/replay."""
+    """Fetch report data without publishing files.
+
+    Callers managing run status can own query errors through ``diagnostics``;
+    otherwise they are included in the returned report notes.
+    """
     if (
         deployment not in {"pd", "standalone"}
         or start >= end
@@ -298,7 +304,7 @@ def generate_report(
         or window <= 0
     ):
         raise ValueError("Invalid deployment or time range")
-    data = collect(
+    return collect(
         SimpleNamespace(
             prometheus_url=prometheus_url,
             start=start,
@@ -308,8 +314,20 @@ def generate_report(
             window=window,
             title=title,
             model=model,
-        )
+        ),
+        diagnostics=diagnostics,
     )
+
+
+def generate_report(
+    prometheus_url: str,
+    start: float,
+    end: float,
+    output: str | Path,
+    **options,
+) -> dict:
+    """Convenience API to collect and publish a standalone report once."""
+    data = collect_report(prometheus_url, start, end, **options)
     write_report(data, output)
     return data
 

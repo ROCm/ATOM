@@ -1,6 +1,7 @@
 import asyncio
 
 import pytest
+from prometheus_client import CollectorRegistry, Histogram, generate_latest
 from prometheus_client.parser import text_string_to_metric_families
 
 from atom.entrypoints.openai.metrics import AtomMetricsExporter
@@ -70,6 +71,35 @@ def _itl_samples(exporter):
         if sample.name.startswith("atom:inter_token_latency_seconds_")
         and not sample.name.endswith("_created")
     }
+
+
+def test_weighted_itl_matches_histogram_buckets_and_handles_large_batches():
+    exporter = AtomMetricsExporter()
+    registry = CollectorRegistry()
+    reference = Histogram(
+        "atom:inter_token_latency_seconds",
+        "reference",
+        buckets=exporter._inter_token_latency._bounds,
+        registry=registry,
+    )
+    for interval, tokens in ((0.0, 3), (0.008, 4), (0.09, 3), (32.0, 2)):
+        exporter.observe_inter_token_latency(interval, tokens)
+        for _ in range(tokens):
+            reference.observe(interval / tokens)
+    expected = {
+        (s.name, s.labels.get("le")): s.value
+        for f in text_string_to_metric_families(generate_latest(registry).decode())
+        for s in f.samples
+        if not s.name.endswith("_created")
+    }
+    assert _itl_samples(exporter) == pytest.approx(expected)
+    exporter.observe_inter_token_latency(5000.0, 10_000_000)
+    exporter.observe_inter_token_latency(1.0, 0)
+    samples = _itl_samples(exporter)
+    prefix = "atom:inter_token_latency_seconds"
+    assert samples[(prefix + "_count", None)] == 10_000_012
+    assert samples[(prefix + "_bucket", "0.002")] == 10_000_007
+    assert samples[(prefix + "_sum", None)] == pytest.approx(5032.098)
 
 
 def test_itl_preserves_token_weighted_intervals_when_stream_chunks_coalesce(
@@ -598,7 +628,9 @@ def test_each_stream_gets_its_own_detokenizer():
     first, second = dispatcher.new_state(), dispatcher.new_state()
 
     assert first is not second
-    assert not first.tokens and not second.tokens
+    assert first.detokenizer is not second.detokenizer
+    assert first.timing is not second.timing
+    assert not first.detokenizer.tokens and not second.detokenizer.tokens
 
 
 class _CountingTokenizer(_Utf8ByteTokenizer):
@@ -783,7 +815,7 @@ def test_decode_failure_keeps_tokens_for_a_later_update(fail_on, caplog):
     assert failed == {"token_ids": [ord("B")], "text": "", "finished": False}
     recovered = send(ord("C"), finished=True)
     assert recovered == {"token_ids": [ord("C")], "text": "BC", "finished": True}
-    assert list(state.tokens) == list(b"ABC")
+    assert list(state.detokenizer.tokens) == list(b"ABC")
     assert "Error detokenizing stream recoverable (tag=None)" in caplog.text
     assert "injected decode failure" in caplog.text
 

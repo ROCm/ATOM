@@ -59,6 +59,7 @@ def stage_reports(results: Path, cell: str, output: Path) -> dict:
                     ),
                     "benchmark_exit_code": status.get("benchmark_exit_code"),
                     "errors": status.get("errors", []),
+                    "publication_errors": status.get("publication_errors", []),
                 }
             )
         if not manifest["reports"]:
