@@ -107,7 +107,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_FUSED_COMPRESS_USE_FLYDSL", "auto"
     ).lower(),
     # gather_kv_b_proj (the MLA cached-prefix expansion): swap the Triton op for
-    # the flydsl a8w8 gather-GEMM.
+    # the flydsl a8w8 gather-GEMM. Added 2026-09-09.
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ": lambda: (
         os.getenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "1") == "1"
     ),
