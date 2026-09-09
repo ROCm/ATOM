@@ -2077,6 +2077,45 @@ class Config:
         # 16. Same reasoning and same mechanism as the V4 override above: the
         # BlockManager and slot_mapping assume one global block size, so it is
         # set here and the attention builder sizes the index cache from it.
+        # ----- DeepSeek-V4 vision: reject unverified feature combinations -----
+        # Collected here rather than as scattered asserts so a request never
+        # reaches a half-supported path. Each of these silently corrupts rather
+        # than failing on its own.
+        if int(getattr(self.hf_config, "vision_n_layers", 0) or 0) > 0:
+            if self.enable_prefix_caching:
+                # Turned off rather than rejected: it is on by default, so
+                # raising would make every vision checkpoint fail to start.
+                # The block hash covers token ids only, and an image block's
+                # sentinel run is byte-identical for any two images of the same
+                # grid -- one request could be served another's image KV. A hit
+                # also restarts the prompt mid-block, which the in-image
+                # visibility math cannot express.
+                logger.warning(
+                    "Disabling prefix caching: DeepSeek-V4 vision block hashes "
+                    "cover token ids only, and image placeholder runs collide "
+                    "across different images of the same grid."
+                )
+                self.enable_prefix_caching = False
+            unsupported = []
+            if self.enable_tbo or self.enable_tbo_decode:
+                unsupported.append("TBO")
+            if self.prefill_context_parallel_size > 1:
+                unsupported.append("PCP")
+            from atom.utils import envs as _envs
+
+            if _envs.is_set("ATOM_USE_TRITON_MOE") and _envs.ATOM_USE_TRITON_MOE:
+                # `FusedMoE`'s Triton path checks `custom_routing_function is
+                # not None` and then calls aiter's `routing()` -- it never
+                # invokes the callable. Image tokens would route with the text
+                # bias and the hash layers would lose `tid2eid` entirely, with
+                # fluent wrong output and no warning.
+                unsupported.append("ATOM_USE_TRITON_MOE=1")
+            if unsupported:
+                raise ValueError(
+                    "DeepSeek-V4 vision checkpoints do not support "
+                    f"{', '.join(unsupported)}."
+                )
+
         is_glm5_next = any("Glm5Next" in str(a) for a in arches)
         if is_glm5_next:
             unsupported_features = []

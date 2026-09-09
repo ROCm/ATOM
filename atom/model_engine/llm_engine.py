@@ -13,8 +13,8 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
-from atom.model_engine.multimodal import get_mrope_input_positions
 from atom.model_engine.sequence import Sequence
+from atom.multimodal import get_mrope_input_positions
 from atom.sampling_params import SamplingParams
 from atom.utils import envs
 

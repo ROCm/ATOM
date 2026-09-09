@@ -39,9 +39,9 @@ if TYPE_CHECKING:
 from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
-from atom.model_engine.multimodal import build_multimodal_inputs
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import new_token_ids
+from atom.multimodal import build_multimodal_inputs
 from atom.utils.arg_parser import FlexibleArgumentParser
 from atom.utils.gc_utils import (
     freeze_gc_heap,
@@ -662,7 +662,25 @@ def _get_multimodal_processor():
     global processor, model_name
     if processor is None:
         logger.info(f"Loading multimodal processor from {model_name}...")
-        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        try:
+            processor = AutoProcessor.from_pretrained(
+                model_name, trust_remote_code=True
+            )
+        except (OSError, ValueError, KeyError) as exc:
+            # Some checkpoints ship no `preprocessor_config.json` and do their
+            # own preprocessing inside the registered input builder
+            # (DeepSeek-V4-Flash-Vision is one). Without this the request 500s
+            # inside AutoProcessor before any model-specific handling runs, so
+            # the server could not serve an image the offline example can.
+            from transformers import AutoTokenizer
+
+            logger.info(
+                f"No HF processor for {model_name} ({exc}); "
+                "falling back to the tokenizer."
+            )
+            processor = AutoTokenizer.from_pretrained(
+                model_name, trust_remote_code=True
+            )
     return processor
 
 

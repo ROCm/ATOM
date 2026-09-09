@@ -9,7 +9,7 @@ from transformers import AutoProcessor
 
 from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
-from atom.model_engine.multimodal import build_multimodal_inputs
+from atom.multimodal import build_multimodal_inputs
 from atom.utils.arg_parser import FlexibleArgumentParser
 
 parser = FlexibleArgumentParser(
@@ -18,7 +18,7 @@ parser = FlexibleArgumentParser(
         "Generic image+text multimodal offline inference using the native ATOM engine.\n"
         "Validated with Qwen3.5 and Kimi-K3. The script relies on the model's\n"
         "Hugging Face processor and chat template, plus the architecture-specific\n"
-        "input builders in atom.model_engine.multimodal for processors that do not\n"
+        "input builders in atom.multimodal for processors that do not\n"
         "follow the Qwen convention."
     ),
 )
@@ -59,8 +59,15 @@ def main():
     # Force eager mode and single-batch cudagraph sizes for simplicity
     args.cudagraph_capture_sizes = "[1]"
 
-    # Load processor (handles media preprocessing and chat template)
-    processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
+    # Load processor (handles media preprocessing and chat template). Some
+    # checkpoints ship none and preprocess inside their input builder instead.
+    try:
+        processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
+    except (OSError, ValueError, KeyError) as exc:
+        from transformers import AutoTokenizer
+
+        print(f"No HF processor for {args.model} ({exc}); using the tokenizer.")
+        processor = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
     images = [Image.open(path).convert("RGB") for path in args.image]
 

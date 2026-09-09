@@ -426,6 +426,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self.index_head_dim = getattr(hf, "index_head_dim", 128)
         self.window_size = getattr(hf, "sliding_window", 128)
         self.index_topk = getattr(hf, "index_topk", 1024)
+        # Vision checkpoints attend BIDIRECTIONALLY inside an image span, which
+        # widens the per-token sliding window. Zero on text-only V4, where every
+        # visibility term below collapses and the causal formulas are untouched.
+        self.vision_max_n_token = (
+            int(getattr(hf, "vision_max_n_token", 384))
+            if int(getattr(hf, "vision_n_layers", 0) or 0) > 0
+            else 0
+        )
+        self.vocab_size = int(getattr(hf, "vocab_size", 0))
         self.rope_head_dim = getattr(hf, "qk_rope_head_dim", 64)
         # MTP-portion of compress_ratios. `prepare_mtp_decode`'s direct-kernel
         # fast path only handles SWA (ratio=0) draft layers; non-zero ratios
@@ -2877,6 +2886,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.state_slot_out_cpu,
             scheduled_bs,
             scheduled_tokens,
+            image_visibility=self._image_visibility(
+                batch, extend_lens_np, scheduled_tokens
+            ),
         )
 
         # ----- PCP: reindex per-query metadata to this rank's 1/W shard -----
@@ -3041,6 +3053,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         - Token-split TBO (default, §11): uses `ub_slice` / `running_bs`.
         """
         from atom.utils.tbo.ubatch_splitting import split_attn_metadata
+
+        if getattr(self, "_forward_has_images", False):
+            # An image block's tokens attend across the whole span, so the rows
+            # they name must all live in ONE forward's `kv`. A token-split TBO
+            # micro-batch cuts that span in half and the second half's rows
+            # simply are not there. Nothing downstream would notice: the indices
+            # stay in range and the model answers fluently off half a picture.
+            raise NotImplementedError(
+                "DeepSeek-V4 vision does not support TBO prefill micro-batching "
+                "(in-image attention spans the whole prompt). Start the server "
+                "without --enable-tbo."
+            )
 
         # PCP+TBO request-boundary split: each ubatch = one request group processed as an
         # independent non-TBO PCP mini-batch. Slice the FULL (un-reindexed)
@@ -3655,6 +3679,48 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             qo_buf.np[T + 1 : T_pad + 1] = T
             attn_metadata.qo_indptr = qo_buf.copy_to_gpu(T_pad + 1)
 
+    def _image_visibility(
+        self, batch, extend_lens_np: np.ndarray, total_tokens: int
+    ) -> "tuple[np.ndarray, np.ndarray] | None":
+        """Per-token left/right in-image visibility, or None for a text batch.
+
+        Returns None on text-only V4, and on any vision batch with no image
+        sentinels — which keeps every text forward on exactly the causal
+        arithmetic it used before, rather than a widened path that happens to
+        reduce to it.
+        """
+        # `batch.multimodal_data` is the authoritative, stateless statement that
+        # this batch carries images (the scheduler fills it per request). Derive
+        # from it rather than sniffing token ids, so the fact does not depend on
+        # this method having run -- the ubatch-splitting guard reads the same
+        # flag and used to disarm whenever an early return skipped the write.
+        self._forward_has_images = bool(getattr(batch, "multimodal_data", None))
+        if self.vision_max_n_token == 0 or not self._forward_has_images:
+            return None
+        tokens = getattr(batch, "scheduled_tokens", None)
+        if tokens is None or tokens.shape[0] < total_tokens:
+            # Fail loudly: the batch says it has images, so returning None here
+            # would build plain causal windows for an image block and the model
+            # would answer fluently off a partly-visible picture.
+            raise AssertionError(
+                "batch carries multimodal_data but scheduled_tokens is "
+                f"{'missing' if tokens is None else 'too short'} "
+                f"(need {total_tokens}); cannot build in-image visibility."
+            )
+        tokens = tokens[:total_tokens]
+        # Image sentinel ids are the only ones at or above the vocabulary.
+        if int(tokens.max(initial=0)) < self.vocab_size:
+            return None
+
+        from atom.models.deepseek_v4_vl import image_visible_spans
+
+        return image_visible_spans(
+            tokens,
+            self.vocab_size,
+            self.vision_max_n_token,
+            seq_lens=extend_lens_np.tolist(),
+        )
+
     def _build_paged_prefill_meta(
         self,
         attn_metadata: AttentionMetaData_DSV4,
@@ -3669,6 +3735,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         positions_gpu: torch.Tensor | None = None,
         cu_q_per_seq_gpu: torch.Tensor | None = None,
         block_tables_gpu: torch.Tensor | None = None,
+        image_visibility: "tuple[np.ndarray, np.ndarray] | None" = None,
     ) -> None:
         """Build per-fwd index buffers consumed by sparse_attn_v4_paged_prefill.
 
@@ -3679,7 +3746,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
           - extend region (shared): in-chunk SWA tail from per-fwd `kv`
             tensor. One buffer.
 
-        Per-token length formulas:
+        Per-token length formulas (text, i.e. `image_visibility is None`; a
+        vision prefill widens the extend span in BOTH directions instead --
+        see `image_aware_extend_window`):
           extend_count[t]      = min(token_pos_in_chunk[t] + 1, win)
           prefix_swa_count[t]  = max(0, chunk_start[bid] - max(0, p_global - win + 1))
           prefix_swa_count[t] + extend_count[t] = min(p_global + 1, win)
@@ -3745,6 +3814,43 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         extend_count_np = np.minimum(token_pos_in_chunk + 1, win).astype(np.int32)
         prefix_swa_count_np = np.maximum(chunk_start_pt - swa_low, 0).astype(np.int32)
+        # ----- in-image bidirectional visibility (vision checkpoints only) -----
+        # Widens each token's SWA span to cover its whole [IMAGE_START,
+        # IMAGE_END] block, in BOTH directions. Sound only because the prefill
+        # attention kernel is purely index-driven with no causal mask, and the
+        # scheduler forwards a multimodal prompt whole — so every future row
+        # named here is already materialized in this forward's `kv` tensor.
+        # `extend_start_np` is a global position; the kernel turns it into a row.
+        extend_start_np = None
+        if image_visibility is not None:
+            from atom.models.deepseek_v4_vl import (
+                image_aware_extend_window,
+                image_window_width,
+            )
+
+            img_left, img_right = image_visibility
+            # Scope the check to tokens INSIDE an image span. `chunk_start_pt`
+            # spans every sequence in the batch, so a plain `.any()` also fired
+            # on a co-scheduled text prefill continuing its own chunk -- legal,
+            # and nothing to do with the image request it blamed. Spans are at
+            # least [START, END], so every in-span token has a nonzero side.
+            in_image = (img_left > 0) | (img_right > 0)
+            if chunk_start_pt[in_image].any():
+                raise AssertionError(
+                    "a multimodal prefill reached the attention builder with "
+                    "chunk_start > 0, i.e. it was chunked. In-image attention "
+                    "reads rows across the whole image block, which a chunk "
+                    "boundary would cut in half."
+                )
+            extend_start_np, extend_count_np = image_aware_extend_window(
+                positions_arr,
+                img_left,
+                img_right,
+                win,
+                image_window_width(
+                    int(positions_arr.max()) + 1, win, self.vision_max_n_token
+                ),
+            )
         # These SIZE each slice while `_v4_paged_prefill_indices_kernel` FILLS
         # it, so both must stay the geometry's spelling or the tail is
         # uninitialized. Buffer size ↔ kernel-writes then match exactly and no
@@ -3842,6 +3948,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             win=win,
             geometry=self.pool_geometry,
             hca_rows_per_block=self.hca_rows_per_block,
+            # None on every text forward, which keeps the kernel deriving the
+            # causal window from `win` exactly as before.
+            extend_start=(
+                upload_numpy(extend_start_np, device)
+                if extend_start_np is not None
+                else None
+            ),
+            extend_count=(
+                upload_numpy(extend_count_np, device)
+                if extend_start_np is not None
+                else None
+            ),
         )
 
         # ----- skip_prefix_len_csa: per-token SWA prefix length -----

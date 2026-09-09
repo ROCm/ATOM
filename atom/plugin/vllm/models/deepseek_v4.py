@@ -375,8 +375,18 @@ class DeepseekV4ModelVllm(DeepseekV4ModelBase):
             device=self.embed.weight.device,
         )
 
-    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        h = super().forward(input_ids, positions)
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # Mirror the base signature exactly: `DeepseekV4ForCausalLM.forward`
+        # calls `self.model(input_ids, positions, inputs_embeds)` positionally,
+        # and the plugin rebinds this class over `DeepseekV4Model`, so a
+        # narrower signature here breaks every V4 forward under the plugin --
+        # text-only included, since `inputs_embeds=None` is still passed.
+        h = super().forward(input_ids, positions, inputs_embeds)
         # In-graph copy_: captured into the CUDAGraph so it refreshes the buffer
         # on every replay, keeping the MTP draft's input hidden states current.
         num_tokens = h.shape[0]

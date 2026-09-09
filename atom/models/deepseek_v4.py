@@ -440,6 +440,13 @@ class DeepseekV4Args:
     route_scale: float = 2.5  # routed_scaling_factor
     swiglu_limit: float = 10.0
 
+    # Vision (0 on a text-only checkpoint). Only the two knobs the LANGUAGE side
+    # needs live here: whether there is a tower at all, and the per-image token
+    # budget that bounds in-image attention visibility. The tower's own geometry
+    # lives in `deepseek_v4_vl.DeepseekV4VisionConfig`.
+    vision_n_layers: int = 0
+    vision_max_n_token: int = 384
+
     # Hyper-Connections (mHC)
     hc_mult: int = 4
     hc_sinkhorn_iters: int = 20
@@ -502,6 +509,8 @@ class DeepseekV4Args:
             score_func=g("scoring_func", "sqrtsoftplus"),
             route_scale=g("routed_scaling_factor", 1.5),
             swiglu_limit=g("swiglu_limit", 10.0),
+            vision_n_layers=g("vision_n_layers", 0) or 0,
+            vision_max_n_token=g("vision_max_n_token", 384) or 384,
             hc_mult=g("hc_mult", 4),
             hc_sinkhorn_iters=g("hc_sinkhorn_iters", 20),
             hc_eps=g("hc_eps", 1e-6),
@@ -3505,15 +3514,24 @@ class MoE(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.gate",
         )
+        # Vision checkpoints carry a per-layer `bias_vl` for image tokens, and
+        # ship `gate.bias` on the hash layers too.
+        self.is_vl = args.vision_n_layers > 0
+        self.vocab_size = args.vocab_size
+
         # V4 hash-routed layers (layer_id < n_hash_layers) use tid2eid lookup,
-        # not bias-corrected gate-logit routing — checkpoint has no
+        # not bias-corrected gate-logit routing — a text-only checkpoint has no
         # `gate.bias` for those layers. Only allocate the bias for
         # sqrtsoftplus layers to avoid 3 spurious unloaded-param warnings.
-        if not self.is_hash_layer:
+        if self.is_vl:
+            self.gate.e_score_correction_bias_vl = atom_parameter(
+                torch.empty(self.n_routed_experts, dtype=torch.float32)
+            )
+        if not self.is_hash_layer or self.is_vl:
             self.gate.e_score_correction_bias = atom_parameter(
                 torch.empty(self.n_routed_experts, dtype=torch.float32)
             )
-        else:
+        if self.is_hash_layer:
             # tid2eid: per-token-id top-k expert lookup table (V4 first 3
             # layers use this in lieu of gate-logit routing).
             self.gate.tid2eid = atom_parameter(
@@ -3572,7 +3590,12 @@ class MoE(nn.Module):
             )
         else:
             self.shared_experts = None
-        if self.is_hash_layer:
+        if self.is_vl:
+            # One kernel covers both tid2eid (hash layers) and the two-bias
+            # top-k, so every layer routes through it. `select_experts` takes a
+            # single [E] bias and cannot express the per-token choice.
+            self.experts.custom_routing_function = self._mm_topk
+        elif self.is_hash_layer:
             # Inject hash routing into FusedMoE.select_experts via the
             # custom_routing_function hook (added in atom/model_ops/moe.py).
             self.experts.custom_routing_function = self._hash_topk
@@ -3598,6 +3621,81 @@ class MoE(nn.Module):
             get_current_atom_config().compilation_config.static_forward_context[
                 prefix
             ] = self
+
+    def _routing_dest(self, num_tokens: int, topk: int):
+        """Destination buffers for a custom_routing_function result.
+
+        Custom routing bypasses `select_experts`' shared-expert append, so with a
+        fused shared expert the routed result goes in the first `topk` columns of
+        the global buffer and the full view is returned — otherwise the shared
+        expert is silently dropped.
+
+        Returns `(ids_view, weights_view, result_ids, result_weights)`.
+        """
+        num_fused_shared = getattr(self.experts, "num_fused_shared_experts", 0)
+        if num_fused_shared > 0:
+            import atom.model_ops.topK as _topK_mod
+
+            assert _topK_mod.aiter_topK_meta_data is not None, (
+                "AITER topK meta data is not initialized. "
+                "init_aiter_topK_meta_data must run before MoE routing."
+            )
+            total_weights, total_ids = _topK_mod.aiter_topK_meta_data
+            assert total_weights.shape[0] >= num_tokens
+            return (
+                total_ids[:num_tokens, :topk],
+                total_weights[:num_tokens, :topk],
+                total_ids[:num_tokens],
+                total_weights[:num_tokens],
+            )
+        ids = torch.empty(
+            (num_tokens, topk), dtype=torch.int32, device=self.gate.weight.device
+        )
+        weights = torch.empty(
+            (num_tokens, topk), dtype=torch.float32, device=self.gate.weight.device
+        )
+        return ids, weights, ids, weights
+
+    def _mm_topk(
+        self,
+        hidden_states: torch.Tensor,
+        gating_output: torch.Tensor,
+        topk: int,
+        renormalize: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """V4 vision routing: per-token `bias` vs `bias_vl`, plus hash lookup.
+
+        Runs inside FusedMoE's Dynamo-opaque dispatch; the Triton kernel's JIT
+        builder cannot be traced (see `deepseek_v4_dspark.py`).
+        """
+        from atom.model_ops.topK import mm_topk
+
+        ids = get_forward_context().context.input_ids
+        assert ids is not None, (
+            "forward_context.context.input_ids is None — caller must invoke "
+            "DeepseekV4ForCausalLM.forward, not DeepseekV4Model.forward directly."
+        )
+        ids = ids.flatten()
+        num_tokens = gating_output.shape[0]
+        assert ids.shape[0] == num_tokens, (
+            f"input_ids length {ids.shape[0]} does not match gating_output "
+            f"num_tokens {num_tokens}"
+        )
+
+        ids_view, w_view, out_ids, out_weights = self._routing_dest(num_tokens, topk)
+        mm_topk(
+            ids,
+            gating_output,
+            self.gate.e_score_correction_bias,
+            self.gate.e_score_correction_bias_vl,
+            self.gate.tid2eid if self.is_hash_layer else None,
+            self.vocab_size,
+            renormalize,
+            self.routed_scaling_factor,
+            ids_view,
+            w_view,
+        )
+        return out_weights, out_ids
 
     def _hash_topk(
         self,
@@ -4341,6 +4439,7 @@ class DeepseekV4Model(nn.Module):
         self,
         input_ids: torch.Tensor,  # [num_tokens] int  flat ragged-batch token ids
         positions: torch.Tensor,  # [num_tokens] int  abs positions (required)
+        inputs_embeds: torch.Tensor | None = None,  # [num_tokens, dim]
     ) -> torch.Tensor:  # [num_tokens, hc, dim]  pre-hc_head residual stream
         """Forward over `num_tokens` flat ragged-batch tokens.
 
@@ -4348,6 +4447,10 @@ class DeepseekV4Model(nn.Module):
         reduction — `hc_head + RMSNorm + LM head` are all deferred to
         `compute_logits`. Returning the hc-shaped residual lets the (future)
         MTP draft consume it without re-expanding from a dim-reduced state.
+
+        `inputs_embeds` is how the vision model injects image embeddings. Dynamo
+        specializes on whether it is None, so a caller must pass it consistently
+        across warmup, capture and steady state.
         """
         assert input_ids.dim() == 1, f"input_ids must be 1D, got {input_ids.shape}"
         # PCP note: under PCP, `input_ids`/`positions` arrive already round-robin-
@@ -4356,7 +4459,11 @@ class DeepseekV4Model(nn.Module):
         # out of the compiled graph). So everything here runs on the 1/W shard;
         # the K/V all-gather inside attention reconstructs full KV per layer,
         # and the final all-gather + un-pad happens back in the caller.
-        h = self.embed(input_ids)  # [num_tokens, dim]
+        h = (
+            inputs_embeds
+            if inputs_embeds is not None
+            else self.embed(input_ids)  # [num_tokens, dim]
+        )
         # Expand to hc_mult copies for Hyper-Connections: [num_tokens, hc, dim]
         h = h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
         hc_state = HCState(residual=h, post_mix=None, comb_mix=None, x_prev=None)
@@ -4412,6 +4519,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         }
     )
     weights_mapping: ClassVar[dict[str, str]] = {
+        # Must precede `.gate.bias`: rules apply in order by substring, and
+        # the shorter key is a prefix of this one.
+        ".gate.bias_vl": ".gate.e_score_correction_bias_vl",
         ".gate.bias": ".gate.e_score_correction_bias",
         ".scale": ".weight_scale_inv",
     }
@@ -4463,6 +4573,12 @@ class DeepseekV4ForCausalLM(nn.Module):
             and not uses_routed_all2all
             and self.args.n_hash_layers > 0
         )
+        # One architecture, optional vision tower — the reference
+        # `inference/model.py` builds it under the same condition, which is why
+        # both checkpoints legitimately declare `DeepseekV4ForCausalLM`.
+        self.has_vision = self.args.vision_n_layers > 0
+        if self.has_vision:
+            self._build_vision(config)
 
     @property
     def disable_fused_shared_loading(self) -> bool:
@@ -4476,10 +4592,11 @@ class DeepseekV4ForCausalLM(nn.Module):
                 return not getattr(m, "_fuse_shared_into_routed", True)
         return False
 
-    def forward(
+    def _forward_impl(
         self,
         input_ids: torch.Tensor,  # [num_tokens] int
         positions: torch.Tensor,  # [num_tokens] int  required
+        inputs_embeds: torch.Tensor | None = None,  # [num_tokens, dim]
     ) -> torch.Tensor:  # [num_tokens, dim]  hidden_states
         # Stash input_ids on forward_context for the V4 hash MoE routing
         # callback (`MoE._hash_topk`), which runs inside the Dynamo-opaque
@@ -4503,6 +4620,15 @@ class DeepseekV4ForCausalLM(nn.Module):
         # runs entirely on 1/W; the final hidden is all-gathered + un-padded
         # after self.model(...) returns.
         use_pcp = _pcp_active()
+        if inputs_embeds is not None and use_pcp:
+            # PCP round-robin-splits input_ids/positions below; inputs_embeds
+            # would have to be split identically and gathered back. Unverified,
+            # and silently mis-splitting it would misalign every token's hidden
+            # state against its position. Refuse instead of guessing.
+            raise NotImplementedError(
+                "DeepSeek-V4 vision (inputs_embeds) with PCP is not supported. "
+                "Start the server without prefill context parallelism."
+            )
         # NOTE: moe_merge here is the OUT-OF-GRAPH gate, used only for the
         # input_ids gather below (round-robin split + hash-MoE id alignment).
         # The MoE merge collectives gate themselves separately inside the opaque
@@ -4573,7 +4699,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 )
         else:
             ctx.context.input_ids = input_ids
-        h = self.model(input_ids, positions)
+        h = self.model(input_ids, positions, inputs_embeds)
 
         # ----- PCP: all-gather shards, restore original order, drop pad -----
         if use_pcp:
@@ -4818,3 +4944,168 @@ class DeepseekV4ForCausalLM(nn.Module):
                 else:
                     ppl()
         return loaded
+
+    def _build_vision(self, config: Config) -> None:
+        """Attach the ViT + aligner. Called only when the config carries one.
+
+        Checkpoint names for the vision half (``vision.*``, ``aligner.*``,
+        ``image_*``) are top-level and match these attributes verbatim — none of
+        the ``weights_mapper`` prefix rules touch them, so no rename is needed.
+        """
+        if config.speculative_config is not None:
+            # The draft heads carry their own `mtp.N.ffn.gate.bias_vl`, so the
+            # draft MoE would have to route image tokens the way the target
+            # does, and the draft path has no handling for the out-of-vocab
+            # image sentinel ids the target clamps in `embed_input_ids`.
+            # Neither is implemented, and neither fails on its own: the draft
+            # would route images with the text bias and index past the
+            # embedding table. Refuse instead.
+            raise NotImplementedError(
+                "speculative decoding (MTP/DSpark) is not supported on a "
+                "DeepSeek-V4 vision checkpoint. Re-run without "
+                "--method/--num-speculative-tokens."
+            )
+        hf_config = config.hf_config
+        from atom.models.deepseek_v4_vl import (
+            DeepseekV4VisionConfig,
+            build_vision_modules,
+        )
+
+        self.vision_cfg = DeepseekV4VisionConfig.from_hf_config(hf_config)
+        self.vision, self.aligner = build_vision_modules(self.vision_cfg)
+        self.vocab_size = int(hf_config.vocab_size)
+
+        # Learned embeddings for the four non-pixel sentinel slots. Stacked in
+        # sentinel-type order at merge time; the IMAGE slot borrows `image_pad`
+        # and is then overwritten with the aligner output, exactly as the
+        # reference `merge_image_embeddings` does.
+        dim = self.args.dim
+        # `atom_parameter` (not bare `nn.Parameter`) is the single control that
+        # forces requires_grad off under ATOM_REQUIRES_GRAD, and the dtype is
+        # pinned rather than left to `torch.get_default_dtype()`. NaN-filled,
+        # not `empty`: if a checkpoint lacks these tensors the loader only logs
+        # a warning, and uninitialized memory would render as fluent text --
+        # NaN propagates into the logits instead, which is visible.
+        dtype = config.torch_dtype
+        for name in ("image_start", "image_pad", "image_newline", "image_end"):
+            setattr(
+                self,
+                name,
+                atom_parameter(torch.full((dim,), float("nan"), dtype=dtype)),
+            )
+
+    # -- ATOM multimodal contract -------------------------------------------
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Embed token ids, tolerating the above-vocab image sentinels.
+
+        Sentinel ids (>= vocab_size) would index the embedding table out of
+        bounds, so clamp them to a valid row; every clamped position is
+        overwritten by :meth:`merge_multimodal_embeddings` before the value is
+        ever used.
+        """
+        return self.model.embed(input_ids.clamp(max=self.vocab_size - 1))
+
+    def get_vision_embeddings(
+        self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
+    ) -> torch.Tensor:
+        """Run the tower over every image and return rows in token order.
+
+        ``grid_thw`` rows are ``(1, n_vit_h, n_vit_w)``. The aligner emits rows
+        row-major over the downsampled grid, but the prompt lays them out in the
+        N-layout (row pairs walked column-first), so each image's rows are
+        permuted before concatenation. The permutation is derived from the grid
+        — see :func:`atom.models.deepseek_v4_vl.image_block_perm`.
+        """
+        from atom.models.deepseek_v4_vl import image_block_perm, llm_grid_hw
+
+        grids = [(int(h), int(w)) for _, h, w in grid_thw.tolist()]
+        device = self.aligner.w1.weight.device
+        dtype = self.aligner.w1.weight.dtype
+        features = self.vision(pixel_values.to(device=device, dtype=dtype), grids)
+
+        ratio = self.vision_cfg.downsample_ratio
+        out, offset = [], 0
+        for n_vit_h, n_vit_w in grids:
+            count = n_vit_h * n_vit_w
+            aligned = self.aligner(features[offset : offset + count], n_vit_h, n_vit_w)
+            n_llm_h, n_llm_w = llm_grid_hw(n_vit_h, n_vit_w, ratio)
+            perm = image_block_perm(n_llm_h, n_llm_w).to(device)
+            out.append(aligned[perm])
+            offset += count
+        return torch.cat(out)
+
+    def merge_multimodal_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        vision_embeds: torch.Tensor,
+    ) -> torch.Tensor:
+        """Write sentinel and image embeddings over their token positions."""
+        sentinels = torch.stack(
+            [
+                self.image_start,
+                self.image_pad,
+                self.image_pad,  # IMAGE — placeholder, overwritten below
+                self.image_newline,
+                self.image_end,
+            ]
+        ).to(inputs_embeds.dtype)
+
+        offsets = input_ids - self.vocab_size
+        is_sentinel = offsets >= 0
+        inputs_embeds = torch.where(
+            is_sentinel.unsqueeze(-1),
+            sentinels[offsets.clamp(0, sentinels.shape[0] - 1)],
+            inputs_embeds,
+        )
+
+        image_mask = input_ids == self.vocab_size + _IMAGE_SENTINEL
+        num_slots = int(image_mask.sum())
+        if num_slots != vision_embeds.shape[0]:
+            # The sentinel census tells the two failures apart: a short block
+            # means the prefill was chunked, a wrong IMAGE count means the
+            # layout disagrees.
+            counts = {
+                int(code): int((offsets == code).sum())
+                for code in range(sentinels.shape[0])
+            }
+            raise ValueError(
+                f"DeepSeek-V4 vision produced {vision_embeds.shape[0]} image "
+                f"embeddings for {num_slots} IMAGE token slots over "
+                f"{input_ids.numel()} tokens (sentinel census by type code: "
+                f"{counts}). The prompt's image blocks and its pixel data "
+                "disagree, or a multimodal prefill was chunked."
+            )
+        inputs_embeds[image_mask] = vision_embeds.to(inputs_embeds.dtype)
+        return inputs_embeds
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # ALWAYS pass a tensor when this checkpoint has a vision tower: Dynamo
+        # specializes on None-ness, so mixing None (decode) and a tensor
+        # (prefill) compiles two graphs and the captured one then reads the
+        # wrong branch -- measured as `AttributeError: 'NoneType' has no
+        # attribute 'size'` inside the compiled region.
+        #
+        # KNOWN COST, not fixed here: this allocates a fresh `[N, dim]` on every
+        # decode step, outside the CUDAGraph. Making it conditional is what the
+        # paragraph above rules out; the real fix is a persistent buffer, which
+        # is not attempted in this change.
+        if self.has_vision and inputs_embeds is None:
+            inputs_embeds = self.embed_input_ids(input_ids)
+        return DeepseekV4ForCausalLM._forward_impl(
+            self, input_ids, positions, inputs_embeds
+        )
+
+
+# Sentinel type code for a pixel-bearing image slot -- `IMAGE` in
+# `atom.models.deepseek_v4_vl`. Duplicated as a literal rather than imported at
+# module scope so this file stays importable by the light weight-loading tests.
+# `tests/test_deepseek_v4_vl_cpu.py::test_image_sentinel_code_agrees` pins the
+# two together.
+_IMAGE_SENTINEL = 2

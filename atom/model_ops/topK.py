@@ -488,3 +488,46 @@ def rocm_aiter_grouped_topk(
             routed_scaling_factor,
             num_fused_shared_experts,
         )
+
+
+def mm_topk(
+    ids: torch.Tensor,
+    gating_output: torch.Tensor,
+    bias: torch.Tensor,
+    bias_alt: torch.Tensor,
+    hash_table: torch.Tensor | None,
+    vocab_size: int,
+    renormalize: bool,
+    scaling: float,
+    out_ids: torch.Tensor,
+    out_weights: torch.Tensor,
+) -> None:
+    """Top-k where each token picks one of two router correction biases.
+
+    Tokens with an id at or above ``vocab_size`` -- multimodal placeholders,
+    whose ids sit above the text vocabulary -- select experts with ``bias_alt``;
+    every other token uses ``bias``. aiter's topk takes a single ``[E]`` bias
+    and cannot express that per-token choice, so this routes to a Triton kernel
+    instead. Reached through `FusedMoE`'s ``custom_routing_function`` hook.
+
+    ``hash_table`` (``[vocab, topk]``) switches text tokens to table lookup
+    rather than top-k, which is what DeepSeek-V4's first three layers do.
+    Pass None on layers that route every text token through the gate.
+
+    Fills ``out_ids`` / ``out_weights`` in place; they may be ``[:, :topk]``
+    views of a wider buffer.
+    """
+    from atom.model_ops.triton_mm_topk import mm_topk_triton
+
+    mm_topk_triton(
+        ids,
+        gating_output,
+        bias,
+        bias_alt,
+        hash_table,
+        vocab_size,
+        renormalize,
+        scaling,
+        out_ids,
+        out_weights,
+    )
