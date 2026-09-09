@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788891851679,
+  "lastUpdate": 1788973759671,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -2798,6 +2798,57 @@ window.BENCHMARK_DATA = {
             "value": 0.8954,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34250392196 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609081546 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1926 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "jasen",
+            "username": "Jasen2201",
+            "email": "yajizhan@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "5b78f17b3f567e3b5fff0da711ec5ffcef0549e6",
+          "message": "Expose streaming ITL and API TTFT histograms with latency reports (#2165)\n\n* feat(metrics): expose streaming ITL histogram\n\nObserve frontend output intervals after detokenization and before stream\ncoalescing. Exclude the first token batch and normalize later intervals by\nnew token count, weighting the histogram by that count.\n\nKeep the cumulative histogram independent of runtime snapshot refreshes.\nAdd streaming regression coverage and Prometheus scrape configurations\nfor standalone and prefill/decode deployments. No TPOT metric is added.\n\nValidation: 25 streaming tests passed; 375 histogram parity cases\npassed. Standard GLM-5.2 CPP4+DCP4 P/D verification completed 120 streaming\nrequests with 30,242 ITL samples and both Prometheus targets UP.\n\n* feat(metrics): expose API and Mesh TTFT histograms\n\nRecord one local API TTFT sample per request for streaming output or the first internal token delivery. Measure HTTP Mesh TTFT from ingress through queueing and routing to the first generated SSE payload.\n\nAdd Prometheus scrape labels and a Mesh target, with regression coverage for event parsing, request isolation, and managed router selection.\n\nValidated with 49 Python timing/streaming tests, 5 Rust TTFT tests, and a 10-minute GLM-5.2 CPP4+DCP4 run: 1150 successful requests and exactly 1150 TTFT observations at each of Prefill, Decode, and Mesh.\n\n* ci: generate latency reports for agentic PD benchmarks\n\nBuild Mesh from the current checkout and collect Prefill, Decode, and Mesh metrics with an isolated Prometheus instance for each agentic benchmark invocation. Export interactive offline HTML and JSON while preserving benchmark exit codes and partial results.\n\nUpload a separate report artifact for each matrix job and link it from the Actions summary, selecting only the current Slurm job. Include the reusable report interface, examples, documentation, and regression tests.\n\nValidation: 16 tests passed, including real Prometheus integration; 10 agentic matrix cells passed submit dry-run; workflow, shell, lint, and whitespace checks passed. The Mesh build helper was verified inside the requested development image.\n\n* chore: remove unused Prometheus example configurations\n\n* fix(observability): address latency instrumentation review\n\nAggregate ITL samples with weighted histogram updates and separate delivery timing from detokenization. Parse fragmented SSE incrementally in Python and Rust.\n\nSeparate report collection, finalization and publication while preserving benchmark exit codes. Build Mesh in an explicit CI setup container with release profile, persistent cache and recorded provenance.\n\nValidated in the ATOM image: 90 focused Python tests, 7 Rust tests, real Prometheus collection, non-root Mesh release build, report CLI checks and formatting checks. The full unit suite encountered AITER/rocminfo collection errors without GPU devices.\n\n* fix(observability): preserve cold-start and final latency samples",
+          "timestamp": "2026-09-09T15:31:30Z",
+          "url": "https://github.com/ROCm/ATOM/commit/5b78f17b3f567e3b5fff0da711ec5ffcef0549e6"
+        },
+        "date": 1788973758779,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9492,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34375993124 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202609091600 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9447 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
+            "value": 0.9507,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34375993124 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609091600 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9515 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP MTP acceptance (%)",
+            "value": 66.31,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34375993124 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609091600 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9515 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
+            "value": 2.99,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.9014,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34375993124 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609091600 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.2055 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
