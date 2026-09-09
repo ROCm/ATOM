@@ -131,7 +131,9 @@ length 3.78 over 7 positions it reads `2.78 / 7 ≈ 0.396`. That is the rate for
 of the same target, not a shortfall.
 
 The same values are on `/metrics` as `atom:mtp_average_tokens_per_forward`,
-`atom:mtp_accepted_tokens`, and `atom:mtp_decode_steps{accepted_tokens="..."}`.
+`atom:mtp_accepted_tokens_total`, and
+`atom:mtp_decode_steps_total{accepted_tokens="..."}` — the first is a gauge, the
+other two are counters, and `prometheus_client` appends `_total` to those.
 
 ## Replaying an InferenceX golden AL
 

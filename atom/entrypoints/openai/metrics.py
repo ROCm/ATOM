@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import gc
 import threading
 import time
 from bisect import bisect_left
@@ -436,6 +437,63 @@ class _AtomMetricsCollector:
         for accepted, steps in sorted(mtp.get("distribution", {}).items()):
             distribution.add_metric([str(accepted)], float(steps))
         yield distribution
+
+        yield from _gc_metrics()
+
+
+def _gc_metrics() -> Iterable[GaugeMetricFamily | CounterMetricFamily]:
+    """This process's own collector -- the frontend's, not the engine's, since
+    each interpreter keeps its own counters.
+
+    `atom:gc_collected_total` is the one to watch, and why the rest are here:
+    it is what decides whether spacing this process's collections out with
+    `ATOM_GC_THRESHOLD` would cost nothing or would defer real work. Flat after
+    startup means the collector is finding nothing; a rising line means the
+    process builds reference cycles and raising thresholds has a price.
+
+    O(1) per source is a bound, not a preference: rendering runs inline on the
+    loop that delivers every stream, so a scrape pauses all of them. It cost a
+    metric. `atom:gc_frozen_objects` came from `gc.get_freeze_count()`, which
+    walks the permanent generation -- 11.9 ms at 430k frozen against 0.5 us for
+    `gc.get_stats()`, i.e. the cost freezing exists to remove -- for a number
+    that changes twice in a process's life. It and the tracked-set size both
+    live in `/debug/gc_census` now, which is asked for rather than scraped.
+    """
+    stats = gc.get_stats()
+    for name, key, doc in (
+        (
+            "atom:gc_collections",
+            "collections",
+            "Collections run by this process's collector, per generation.",
+        ),
+        (
+            "atom:gc_collected",
+            "collected",
+            (
+                "Objects reclaimed by this process's collector, per generation. "
+                "Expected flat after startup; growth means raising this "
+                "process's ATOM_GC_THRESHOLD would defer real work."
+            ),
+        ),
+        (
+            "atom:gc_uncollectable",
+            "uncollectable",
+            "Objects found unreclaimable by this process's collector.",
+        ),
+    ):
+        metric = CounterMetricFamily(name, doc, labels=["generation"])
+        for generation, per_gen in enumerate(stats):
+            metric.add_metric([str(generation)], float(per_gen.get(key, 0)))
+        yield metric
+
+    threshold = GaugeMetricFamily(
+        "atom:gc_threshold",
+        "Collection threshold in effect in this process, per generation.",
+        labels=["generation"],
+    )
+    for generation, value in enumerate(gc.get_threshold()):
+        threshold.add_metric([str(generation)], float(value))
+    yield threshold
 
 
 class AtomMetricsExporter:
