@@ -177,6 +177,34 @@ def shuffle_weights(*tensors: torch.nn.Parameter, layout: tuple[int, int] = (16,
         tensor.is_shuffled = True
 
 
+def shuffle_expert_slices(
+    tensor: torch.nn.Parameter,
+    expert_ids: list[int],
+    layout: tuple[int, int] = (16, 16),
+) -> None:
+    """Re-apply the expert layout to selected slices of a 3D expert buffer.
+
+    ``shuffle_weights`` covers the whole buffer, which is what an initial load
+    wants. An online weight update rewrites some experts and must leave the
+    rest alone: shuffling an already-shuffled slice does not undo the first
+    shuffle, it produces a third layout.
+
+    Per slice and in place, so the buffer keeps the address a captured CUDA
+    graph holds. Equivalent to what the load did, because
+    ``shuffle_weights``'s own 3D branch shuffles each slice independently.
+    """
+    if not isinstance(tensor, torch.nn.Parameter):
+        raise TypeError(f"Expected torch.nn.Parameter, but got {type(tensor)}")
+    weight = tensor.data
+    if weight.dim() != 3:
+        raise ValueError(
+            f"Expected a 3D expert buffer to shuffle per expert, got {weight.dim()}D"
+        )
+    for expert_id in expert_ids:
+        weight[expert_id].copy_(shuffle_weight(weight[expert_id], layout=layout))
+    tensor.is_shuffled = True
+
+
 def all_close_1d(x: torch.Tensor) -> bool:
     assert len(x.shape) == 1
     return all(torch.allclose(x[0], x[i]) for i in range(x.shape[0]))

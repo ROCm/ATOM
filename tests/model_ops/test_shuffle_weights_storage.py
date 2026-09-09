@@ -22,7 +22,10 @@ if not torch.cuda.is_available():
 
 from aiter.ops.shuffle import shuffle_weight
 
-from atom.model_ops.utils import shuffle_weights
+from atom.model_ops.utils import (
+    shuffle_expert_slices,
+    shuffle_weights,
+)
 
 DEVICE = torch.device("cuda")
 
@@ -87,3 +90,37 @@ def test_a_1d_weight_is_refused():
 def test_a_plain_tensor_is_refused():
     with pytest.raises(TypeError, match="Parameter"):
         shuffle_weights(torch.zeros(64, 64, device=DEVICE))
+
+
+# ── the per-slice variant a weight sync uses ──────────────────────────────
+
+
+def test_selected_expert_slices_match_the_whole_buffer_shuffle():
+    """The sync's relayout has to reproduce the load's, slice for slice."""
+    weight = _param(4, 64, 64)
+    reference = _param(4, 64, 64)
+    reference.data.copy_(weight.data)
+    shuffle_weights(reference)
+
+    shuffle_expert_slices(weight, list(range(4)))
+
+    assert torch.equal(weight.data, reference.data)
+
+
+def test_unselected_expert_slices_are_untouched():
+    weight = _param(4, 64, 64)
+    original = weight.data.clone()
+    live = weight.data
+
+    shuffle_expert_slices(weight, [0, 2])
+
+    assert not torch.equal(weight.data[0], original[0])
+    assert torch.equal(weight.data[1], original[1])
+    assert not torch.equal(weight.data[2], original[2])
+    assert torch.equal(weight.data[3], original[3])
+    assert weight.data_ptr() == live.data_ptr()
+
+
+def test_a_2d_buffer_has_no_expert_slices():
+    with pytest.raises(ValueError, match="3D expert buffer"):
+        shuffle_expert_slices(_param(64, 64), [0])
