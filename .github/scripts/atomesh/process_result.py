@@ -15,11 +15,18 @@ from urllib.parse import quote
 from interactivity import (
     METHOD_MEDIAN_TPOT,
     METHOD_P90_E2E,
+    agentic_interactivity,
     locate_records,
-    p90_e2e_normalized_interactivity,
 )
 
 AGENTIC_BENCHMARK_KIND = "aiperf_agentic"
+
+# How each interactivity definition is spelled out in the markdown summary, so a
+# reader never has to guess which formula produced the number in the column.
+INTERACTIVITY_LABELS = {
+    METHOD_P90_E2E: "P90 E2E Normalized",
+    METHOD_MEDIAN_TPOT: "1 / median_tpot_s",
+}
 
 RESULT_RE = re.compile(
     r"^pd-(?P<backend>[^-]+)-(?P<model>.+)-(?P<topology>[^-]+(?:-[^-]+)*)-"
@@ -27,6 +34,7 @@ RESULT_RE = re.compile(
 )
 TOPOLOGY_RE = re.compile(r"(?P<p>\d+)p(?P<d>\d+)d", re.IGNORECASE)
 TP_RE = re.compile(r"tp(?P<tp>\d+)", re.IGNORECASE)
+DCP_RE = re.compile(r"dcp(?P<dcp>\d+)", re.IGNORECASE)
 EVAL_CONC_RE = re.compile(r"(?:^|[_-])c(?P<conc>\d+)(?:$|[_-])", re.IGNORECASE)
 EVAL_TOPOLOGY_RE = re.compile(
     r"(?:^|[_-])(?P<topology>\d+p\d+d(?:[_-]dpa)?)(?:$|[_-])",
@@ -106,6 +114,28 @@ def round_or_none(*values: Any, digits: int = 4) -> float | None:
     return round(parsed, digits) if parsed is not None else None
 
 
+def speculative_label(payload: dict[str, Any]) -> str | None:
+    method = string_value(
+        payload.get("speculative_method"), payload.get("spec_method")
+    ).lower()
+    tokens = int_value(
+        payload.get("num_speculative_tokens"), payload.get("num_spec_tokens")
+    )
+    # Separated, because concatenating a method that already ends in a digit onto
+    # its token count is unreadable: eagle3 with 2 tokens rendered as "eagle32".
+    if method and tokens is not None:
+        return f"{method}-{tokens}"
+    return method or None
+
+
+def pd_label(prefill: Any, decode: Any) -> str:
+    """Render a prefill/decode pair as P8/D4, or as a bare value when they agree."""
+    if prefill is not None and decode is not None:
+        return str(prefill) if prefill == decode else f"P{prefill}/D{decode}"
+    value = prefill if prefill is not None else decode
+    return "--" if value is None else str(value)
+
+
 def interactivity_value(payload: dict[str, Any]) -> float | None:
     # An already-resolved value wins: apply_p90_e2e_interactivity() writes the
     # p90 e2e normalized number here, and without this branch perf_point() would
@@ -125,10 +155,10 @@ def interactivity_value(payload: dict[str, Any]) -> float | None:
     return None
 
 
-def apply_p90_e2e_interactivity(
+def apply_agentic_interactivity(
     path: Path, payload: dict[str, Any], fields: dict[str, Any]
 ) -> None:
-    """Set interactivity from the per-request AIPerf records when they exist.
+    """Set both interactivity definitions from the per-request AIPerf records.
 
     Agentic traces run a ~1M-token prefill per turn, so 1000/median_TPOT sees
     only the decode phase and hides the prefill cost entirely. The InferenceX
@@ -136,6 +166,10 @@ def apply_p90_e2e_interactivity(
     result -- see interactivity.py. It needs profile_export.jsonl, which only
     AIPerf writes, so standard ISL/OSL runs keep the legacy formula and are
     tagged as such.
+
+    The same pass also yields the plain 1/p90(ITL) number InferenceX plots as
+    "Interactivity", stored alongside as ``interactivity_p90_itl`` so the
+    dashboard can offer both as x-axes for the same point.
     """
     if string_value(payload.get("benchmark_kind")) != AGENTIC_BENCHMARK_KIND:
         payload.setdefault("interactivity_method", METHOD_MEDIAN_TPOT)
@@ -159,7 +193,7 @@ def apply_p90_e2e_interactivity(
         return
 
     try:
-        result = p90_e2e_normalized_interactivity(records)
+        result = agentic_interactivity(records)
     except (OSError, ValueError) as exc:
         print(
             f"WARNING: cannot compute {METHOD_P90_E2E} interactivity from "
@@ -172,6 +206,7 @@ def apply_p90_e2e_interactivity(
     payload["interactivity"] = result["value"]
     payload["interactivity_method"] = METHOD_P90_E2E
     payload["interactivity_n_requests"] = result["n_requests"]
+    payload["interactivity_p90_itl"] = result["itl_value"]
 
 
 def parse_payload_date(payload: dict[str, Any]) -> tuple[str | None, int | None]:
@@ -218,6 +253,17 @@ def topology_resources(
         prefill_tp = prefill_tp or int(tp.group("tp"))
         decode_tp = decode_tp or int(tp.group("tp"))
 
+    prefill_dcp = int_value(
+        payload.get("prefill_dcp"), payload.get("prefill_decode_context_parallel_size")
+    )
+    decode_dcp = int_value(
+        payload.get("decode_dcp"), payload.get("decode_context_parallel_size")
+    )
+    dcp = DCP_RE.search(text)
+    if dcp:
+        prefill_dcp = prefill_dcp or int(dcp.group("dcp"))
+        decode_dcp = decode_dcp or int(dcp.group("dcp"))
+
     num_prefill_gpu = int_value(payload.get("num_prefill_gpu"))
     num_decode_gpu = int_value(payload.get("num_decode_gpu"))
     if num_prefill_gpu is None and prefill_workers and prefill_tp:
@@ -234,6 +280,8 @@ def topology_resources(
         "decode_workers": decode_workers,
         "prefill_tp": prefill_tp,
         "decode_tp": decode_tp,
+        "prefill_dcp": prefill_dcp,
+        "decode_dcp": decode_dcp,
         "num_prefill_gpu": num_prefill_gpu,
         "num_decode_gpu": num_decode_gpu,
         "total_gpu": total_gpu,
@@ -334,6 +382,10 @@ def enrich_payload(
     enriched.setdefault("decode_workers", env.get("DECODE_WORKERS"))
     enriched.setdefault("prefill_tp", env.get("PREFILL_TP"))
     enriched.setdefault("decode_tp", env.get("DECODE_TP"))
+    enriched.setdefault("prefill_dcp", env.get("PREFILL_DCP_SIZE"))
+    enriched.setdefault("decode_dcp", env.get("DECODE_DCP_SIZE"))
+    enriched.setdefault("speculative_method", env.get("SPEC_METHOD"))
+    enriched.setdefault("num_speculative_tokens", env.get("NUM_SPEC_TOKENS"))
     runner = env.get("SLURM_SUBMIT_RUNNER", "")
     if hardware:
         enriched["hardware"] = hardware
@@ -364,7 +416,7 @@ def enrich_payload(
         "mean_tpot_ms",
         number(enriched.get("mean_tpot_ms"), enriched.get("mean_itl_ms")),
     )
-    apply_p90_e2e_interactivity(path, enriched, fields)
+    apply_agentic_interactivity(path, enriched, fields)
     enriched.setdefault("interactivity", interactivity_value(enriched))
     resources = topology_resources(enriched, fields)
     total_gpu = resources["total_gpu"]
@@ -426,6 +478,9 @@ def perf_point(
     input_tput = number(payload.get("input_throughput"))
     tpot_ms = number(payload.get("mean_tpot_ms"), payload.get("mean_itl_ms"))
     interactivity = interactivity_value(payload)
+    num_speculative_tokens = int_value(
+        payload.get("num_speculative_tokens"), payload.get("num_spec_tokens")
+    )
 
     config_label = "_".join(
         part
@@ -460,15 +515,21 @@ def perf_point(
         "concurrency": int(payload["max_concurrency"]),
         "ratio": ratio,
         "ttft_ms": round_or_none(payload.get("mean_ttft_ms")),
+        "ttft_p90": round_or_none(payload.get("p90_ttft_ms")),
         "ttft_p99": round_or_none(payload.get("p99_ttft_ms")),
         "tpot_ms": round_or_none(tpot_ms),
+        "tpot_p90": round_or_none(
+            payload.get("p90_tpot_ms"), payload.get("p90_itl_ms")
+        ),
         "tpot_p99": round_or_none(
             payload.get("p99_tpot_ms"), payload.get("p99_itl_ms")
         ),
         "itl_ms": round_or_none(
             payload.get("mean_itl_ms"), payload.get("mean_tpot_ms")
         ),
+        "itl_p90": round_or_none(payload.get("p90_itl_ms"), payload.get("p90_tpot_ms")),
         "e2el_ms": round_or_none(payload.get("mean_e2el_ms")),
+        "e2el_p90": round_or_none(payload.get("p90_e2el_ms")),
         "e2el_p99": round_or_none(payload.get("p99_e2el_ms")),
         "median_ttft_ms": round_or_none(payload.get("median_ttft_ms")),
         "median_tpot_ms": round_or_none(
@@ -489,6 +550,10 @@ def perf_point(
         "num_prompts": int_value(payload.get("num_prompts")),
         "prefill_tp": resources["prefill_tp"],
         "decode_tp": resources["decode_tp"],
+        "prefill_dcp": resources["prefill_dcp"],
+        "decode_dcp": resources["decode_dcp"],
+        "speculative_method": speculative_label(payload),
+        "num_speculative_tokens": num_speculative_tokens,
         "prefill_workers": resources["prefill_workers"],
         "decode_workers": resources["decode_workers"],
         "prefill_dpa": resources["prefill_dpa"],
@@ -503,6 +568,11 @@ def perf_point(
         "interactivity_method": string_value(payload.get("interactivity_method"))
         or METHOD_MEDIAN_TPOT,
         "interactivity_n_requests": int_value(payload.get("interactivity_n_requests")),
+        # 1/p90(ITL) -- what InferenceX plots as plain "Interactivity", as opposed
+        # to the E2E-normalized number in "interactivity" above. Only points
+        # computed from per-request records carry it, so its presence is its
+        # definition and no companion _method field is needed.
+        "interactivity_p90_itl": round_or_none(payload.get("interactivity_p90_itl")),
         # Prefill prefix-cache token hit rate as a 0-1 fraction. Absent unless the
         # case enables prefix caching and the run was long enough for the engine
         # to print a "[Cache Stats]" line.
@@ -700,42 +770,144 @@ def find_eval_scores(root: Path) -> dict[tuple[str, str, int], dict[str, Any]]:
     return scores
 
 
+INTERACTIVITY_HEADER = "Interactivity"
+
+# (header, right-aligned). The interactivity header is rewritten per table by
+# summary_headers() so it can name the definition behind its numbers.
+SUMMARY_LAYOUT: list[tuple[str, bool]] = [
+    ("Hardware", False),
+    ("Model", False),
+    ("Topology", False),
+    ("ISL/OSL", False),
+    ("Concurrency", True),
+    (INTERACTIVITY_HEADER, True),
+    ("TP", False),
+    ("DCP", False),
+    ("Spec", False),
+    ("Total tok/s", True),
+    ("Input tok/s", True),
+    ("Output tok/s", True),
+    ("Total tok/s/GPU", True),
+    ("Input tok/s/GPU", True),
+    ("Output tok/s/GPU", True),
+    ("TTFT mean ms", True),
+    ("TTFT p90 ms", True),
+    ("TTFT p99 ms", True),
+    ("TPOT mean ms", True),
+    ("TPOT p90 ms", True),
+    ("TPOT p99 ms", True),
+    ("E2E mean ms", True),
+    ("E2E p90 ms", True),
+    ("E2E p99 ms", True),
+    ("Cache Hit", True),
+    ("Accuracy Task", False),
+    ("Accuracy", True),
+]
+INTERACTIVITY_COLUMN = SUMMARY_LAYOUT.index((INTERACTIVITY_HEADER, True))
+
+
+def interactivity_method(row: dict[str, Any]) -> str:
+    return string_value(row.get("interactivity_method")) or METHOD_MEDIAN_TPOT
+
+
+def summary_headers(rows: list[dict[str, Any]]) -> list[str]:
+    """Column headers, with the interactivity definition named in its own header.
+
+    Only possible when every row shares one definition. The aggregate summary
+    merges agentic and fixed ISL/OSL cases, so a mixed table is normal there and
+    keeps the plain header; summary_note() carries the definitions instead.
+    """
+    methods = {interactivity_method(row) for row in rows}
+    label = INTERACTIVITY_LABELS.get(methods.pop()) if len(methods) == 1 else None
+    headers = [header for header, _ in SUMMARY_LAYOUT]
+    if label:
+        headers[INTERACTIVITY_COLUMN] = f"{INTERACTIVITY_HEADER} ({label})"
+    return headers
+
+
+def summary_note(rows: list[dict[str, Any]]) -> str:
+    """Spell out the interactivity definitions when the header cannot.
+
+    Which one applies to a row is decided entirely by whether that row is an
+    agentic trace, so naming both is a complete specification -- no per-row
+    column needed.
+    """
+    if len({interactivity_method(row) for row in rows}) < 2:
+        return ""
+    return (
+        f"Interactivity definition varies by row: "
+        f"{INTERACTIVITY_LABELS[METHOD_P90_E2E]} for agentic traces, "
+        f"{INTERACTIVITY_LABELS[METHOD_MEDIAN_TPOT]} for fixed ISL/OSL cases."
+    )
+
+
+def summary_cells(row: dict[str, Any]) -> list[str]:
+    resources = topology_resources(row, {})
+    return [
+        string_value(row.get("hardware"), default="--"),
+        string_value(row.get("benchmark_model_name"), default="--"),
+        string_value(row.get("display_topology"), row.get("topology"), default="--"),
+        "{}/{}".format(
+            row.get("random_input_len", "--"), row.get("random_output_len", "--")
+        ),
+        string_value(row.get("max_concurrency"), default="--"),
+        fmt(row.get("interactivity")),
+        pd_label(resources["prefill_tp"], resources["decode_tp"]),
+        pd_label(resources["prefill_dcp"], resources["decode_dcp"]),
+        speculative_label(row) or "--",
+        fmt(row.get("total_token_throughput")),
+        fmt(row.get("input_throughput")),
+        fmt(row.get("output_throughput")),
+        fmt(row.get("tput_per_gpu")),
+        fmt(row.get("input_tput_per_gpu")),
+        fmt(row.get("output_tput_per_gpu")),
+        fmt(row.get("mean_ttft_ms")),
+        fmt(row.get("p90_ttft_ms")),
+        fmt(row.get("p99_ttft_ms")),
+        fmt(number(row.get("mean_tpot_ms"), row.get("mean_itl_ms"))),
+        fmt(number(row.get("p90_tpot_ms"), row.get("p90_itl_ms"))),
+        fmt(number(row.get("p99_tpot_ms"), row.get("p99_itl_ms"))),
+        fmt(row.get("mean_e2el_ms")),
+        fmt(row.get("p90_e2el_ms")),
+        fmt(row.get("p99_e2el_ms")),
+        fmt_pct(row.get("cache_hit_rate")),
+        string_value(row.get("accuracy_task"), default="--"),
+        fmt(row.get("accuracy_score"), digits=4),
+    ]
+
+
+def summary_sort_key(row: dict[str, Any]) -> tuple[str, int, int, int]:
+    """Group the table by model, then walk each concurrency ladder upward.
+
+    Without this the rows arrive in result-path order, which interleaves the
+    serving bands of a single model (c32, c40, c12, c16, c8, c1 ...) because the
+    band name sits ahead of the concurrency in every cell id.
+    """
+    return (
+        model_key(row.get("benchmark_model_name")),
+        int(number(row.get("max_concurrency")) or 0),
+        int(number(row.get("random_input_len")) or 0),
+        int(number(row.get("random_output_len")) or 0),
+    )
+
+
 def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
+    headers = summary_headers(rows)
     lines = [
         "### ATOMesh Model Performance Benchmark Summary",
         "",
-        "| Hardware | Model | Topology | ISL/OSL | Concurrency | Interactivity | Intvty def | Total tok/s | Input tok/s | Output tok/s | Total tok/s/GPU | Input tok/s/GPU | Output tok/s/GPU | TTFT ms | TPOT ms | E2E ms | Cache Hit | Accuracy Task | Accuracy |",
-        "| --- | --- | --- | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |",
+        "| " + " | ".join(headers) + " |",
+        "| "
+        + " | ".join("---:" if right else "---" for _, right in SUMMARY_LAYOUT)
+        + " |",
     ]
-    for row in rows:
-        lines.append(
-            "| {hardware} | {model} | {topology} | {isl}/{osl} | {conc} | {interactivity} | {intvty_def} | {total} | {input_} | {output} | {total_per_gpu} | {input_per_gpu} | {output_per_gpu} | {ttft} | {tpot} | {e2e} | {cache_hit} | {accuracy_task} | {accuracy} |".format(
-                hardware=row.get("hardware", "--"),
-                model=row.get("benchmark_model_name", "--"),
-                topology=row.get("display_topology") or row.get("topology", "--"),
-                isl=row.get("random_input_len", "--"),
-                osl=row.get("random_output_len", "--"),
-                conc=row.get("max_concurrency", "--"),
-                interactivity=fmt(row.get("interactivity")),
-                intvty_def=(
-                    "p90 e2e"
-                    if row.get("interactivity_method") == METHOD_P90_E2E
-                    else "median TPOT"
-                ),
-                total=fmt(row.get("total_token_throughput")),
-                input_=fmt(row.get("input_throughput")),
-                output=fmt(row.get("output_throughput")),
-                total_per_gpu=fmt(row.get("tput_per_gpu")),
-                input_per_gpu=fmt(row.get("input_tput_per_gpu")),
-                output_per_gpu=fmt(row.get("output_tput_per_gpu")),
-                ttft=fmt(row.get("mean_ttft_ms")),
-                tpot=fmt(row.get("mean_tpot_ms")),
-                e2e=fmt(row.get("mean_e2el_ms")),
-                cache_hit=fmt_pct(row.get("cache_hit_rate")),
-                accuracy_task=row.get("accuracy_task") or "--",
-                accuracy=fmt(row.get("accuracy_score"), digits=4),
-            )
-        )
+    lines.extend(
+        "| " + " | ".join(summary_cells(row)) + " |"
+        for row in sorted(rows, key=summary_sort_key)
+    )
+    note = summary_note(rows)
+    if note:
+        lines.extend(["", note])
     summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

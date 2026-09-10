@@ -29,7 +29,7 @@ if not torch.cuda.is_available():
         allow_module_level=True,
     )
 
-from atom.model_ops.attentions.v4_pool_geometry import (
+from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
     CSA_RATIO,
     DENSE_RATIO,
     HCA_RATIO,

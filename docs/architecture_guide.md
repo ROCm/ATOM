@@ -180,7 +180,8 @@ The `Sequence` class (in `atom/model_engine/sequence.py`) is the central data st
 | `num_prompt_tokens` | `int` | Length of the original prompt |
 | `num_tokens` | `int` (property) | Total length including generated tokens |
 | `block_table` | `list[int]` | KV cache block IDs allocated to this sequence |
-| `per_req_cache_group` | `int` | Per-request stateful-attention slot index (currently used by hybrid Qwen3-Next / Qwen3.5 GDN layers; future stateful attentions plug in via the same mechanism); `-1` if unallocated or not a stateful-attention model |
+| `state_slots` | `list[int]` | Every per-request stateful-attention slot the sequence holds: `[0]` committed, `[1:]` speculation rollback (Qwen3-Next / Qwen3.5 GDN layers, Kimi-K3 KDA, the DeepSeek-V4 compressor ring; future stateful attentions plug in via the same mechanism). Empty if unallocated or not a stateful-attention model |
+| `state_slot` | `int` (property) | `state_slots[0]`, or `-1` — the slot the forward reads and writes |
 | `status` | `SequenceStatus` | Current lifecycle state |
 | `type` | `SequenceType` | Current execution type |
 | `temperature` | `float` | Sampling temperature |
@@ -235,14 +236,21 @@ Two sharing patterns are handled:
 
 The `embed_tokens` layer is always shared when shapes match and pipeline parallelism is not used.
 
-### Propose loop: MHA vs MLA branching
+### Propose loop: metadata is the backend's, not the proposer's
 
-The `propose()` method iterates `mtp_k` draft steps. On the first iteration (`i == 0`), it sets up attention metadata for single-token decode. The metadata setup branches based on `runner.use_mla`:
+The `propose()` method iterates `mtp_k` draft steps. Every step calls
+`runner.attn_metadata_builder.prepare_mtp_decode()` and merges the dict it
+returns into `attn_metadata`, so *which* fields a step updates — `kv_indptr`
+and `kv_indices` for MLA, `block_tables` and `context_lens` for MHA — is the
+backend's answer and not a branch here. The proposer passes
+`num_reject_tokens` on `i == 0` only, which is how the previous step's
+rejected speculative tokens are taken back out.
 
-- **MLA models** (DeepSeek, Qwen3 MoE) — use `kv_indptr` and `kv_last_page_lens` with block_size=1 paged KV cache. `kv_indptr` is adjusted by subtracting the cumulative `num_reject_tokens` to account for rejected speculative tokens from the previous step.
-- **MHA models** (GDN/hybrid architectures) — use `block_tables` and `context_lens`. `context_lens` is incremented by 1 at each draft step to reflect the additional KV entries.
-
-On subsequent iterations (`i > 0`), `max_seqlen_k` is incremented and `prepare_mtp_decode()` is called to update backend-specific attention metadata.
+One thing does branch, on a builder capability rather than a model family:
+`fuse_mtp_decode_position_update`. Where a builder sets it, the per-step
+position bump and the `context_lens` increment ride into its kernel through
+`update_context_lens` / `positions_out`; where it does not, `propose()` does
+both itself before the call.
 
 ### `prepare_mtp_decode()`
 
@@ -260,6 +268,7 @@ Each attention backend provides its own `prepare_mtp_decode()` implementation:
 | `atom/model_engine/engine_core_mgr.py` | `CoreManager` ZMQ orchestration, process launching, load-balanced DP dispatch |
 | `atom/model_engine/model_runner.py` | `ModelRunner` per-GPU execution (model loading, CUDA graph capture, forward pass), `tokenIDProcessor` deferred output handling |
 | `atom/model_engine/scheduler.py` | `Scheduler` prefill-first scheduling, `ScheduledBatch` batch descriptor, `ScheduledBatchOutput` forward results |
+| `atom/model_engine/engine_stats.py` | `EngineStats` — MTP acceptance, prefix-cache hits, and the periodic engine-status line, each on its own cadence |
 | `atom/model_engine/sequence.py` | `Sequence` request state, `SequenceStatus` and `SequenceType` enums |
 | `atom/model_engine/block_manager.py` | `BlockManager` KV cache block allocation with optional prefix caching |
 | `atom/model_engine/request.py` | `RequestOutput` dataclass for streaming callbacks |

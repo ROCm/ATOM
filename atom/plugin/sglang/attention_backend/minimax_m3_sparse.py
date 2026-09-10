@@ -204,15 +204,21 @@ def _sgl_m3_sparse_fwd_kernel(
         off_t = tl.arange(0, BLOCK_SIZE_T)
         topk_idx = tl.load(t_ptr_j + off_t * stride_tk, mask=off_t < max_topk, other=-1)
         real_topk = tl.sum((topk_idx >= 0).to(tl.int32), axis=0)
-        q_ptrs = tl.make_block_ptr(
-            base=q_ptr + q_start * stride_qn + pid_h * stride_qh,
-            shape=(q_len, gqa_group_size, head_dim),
-            strides=(stride_qn, stride_qh, stride_qd),
-            offsets=(pid_q_j * BLOCK_SIZE_Q, 0, 0),
-            block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D),
-            order=(2, 1, 0),
+        _q_ptrs_0 = (pid_q_j * BLOCK_SIZE_Q) + tl.arange(0, BLOCK_SIZE_Q)
+        _q_ptrs_1 = (0) + tl.arange(0, BLOCK_SIZE_H)
+        _q_ptrs_2 = (0) + tl.arange(0, BLOCK_SIZE_D)
+        q = tl.load(
+            q_ptr
+            + q_start * stride_qn
+            + pid_h * stride_qh
+            + _q_ptrs_0[:, None, None] * (stride_qn)
+            + _q_ptrs_1[None, :, None] * (stride_qh)
+            + _q_ptrs_2[None, None, :] * (stride_qd),
+            mask=(_q_ptrs_0[:, None, None] < (q_len))
+            & (_q_ptrs_1[None, :, None] < (gqa_group_size))
+            & (_q_ptrs_2[None, None, :] < (head_dim)),
+            other=0.0,
         )
-        q = tl.load(q_ptrs, boundary_check=(0, 1, 2), padding_option="zero")
         off_q = (
             tl.arange(0, BLOCK_SIZE_Q)[:, None]
             + pid_q_j * BLOCK_SIZE_Q
@@ -266,15 +272,21 @@ def _sgl_m3_sparse_fwd_kernel(
             lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
         acc_o = acc_o * tl.exp2(m_i - lse_i)[:, None]
         acc_o = tl.reshape(acc_o, BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D)
-        o_ptrs = tl.make_block_ptr(
-            base=o_ptr + q_start * stride_on + pid_h * stride_oh,
-            shape=(q_len, gqa_group_size, head_dim),
-            strides=(stride_on, stride_oh, stride_od),
-            offsets=(pid_q_j * BLOCK_SIZE_Q, 0, 0),
-            block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D),
-            order=(2, 1, 0),
+        _o_ptrs_0 = (pid_q_j * BLOCK_SIZE_Q) + tl.arange(0, BLOCK_SIZE_Q)
+        _o_ptrs_1 = (0) + tl.arange(0, BLOCK_SIZE_H)
+        _o_ptrs_2 = (0) + tl.arange(0, BLOCK_SIZE_D)
+        tl.store(
+            o_ptr
+            + q_start * stride_on
+            + pid_h * stride_oh
+            + _o_ptrs_0[:, None, None] * (stride_on)
+            + _o_ptrs_1[None, :, None] * (stride_oh)
+            + _o_ptrs_2[None, None, :] * (stride_od),
+            acc_o.to(o_ptr.dtype.element_ty),
+            mask=(_o_ptrs_0[:, None, None] < (q_len))
+            & (_o_ptrs_1[None, :, None] < (gqa_group_size))
+            & (_o_ptrs_2[None, None, :] < (head_dim)),
         )
-        tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1, 2))
 
 
 @triton.heuristics(
@@ -352,15 +364,18 @@ def _sgl_m3_sparse_decode_kernel(
     m_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
     lse_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
     acc_o = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_D), dtype=tl.float32)
-    q_ptrs = tl.make_block_ptr(
-        base=q_ptr + pid_b * stride_qn + pid_h * stride_qh,
-        shape=(gqa_group_size, head_dim),
-        strides=(stride_qh, stride_qd),
-        offsets=(0, 0),
-        block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
-        order=(1, 0),
+    _q_ptrs_0 = (0) + tl.arange(0, BLOCK_SIZE_H)
+    _q_ptrs_1 = (0) + tl.arange(0, BLOCK_SIZE_D)
+    q = tl.load(
+        q_ptr
+        + pid_b * stride_qn
+        + pid_h * stride_qh
+        + _q_ptrs_0[:, None] * (stride_qh)
+        + _q_ptrs_1[None, :] * (stride_qd),
+        mask=(_q_ptrs_0[:, None] < (gqa_group_size))
+        & (_q_ptrs_1[None, :] < (head_dim)),
+        other=0.0,
     )
-    q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
 
     cur_idx_ptr = idx_base + chunk_start_topk * stride_tk
     for _ in tl.range(chunk_start_topk, chunk_end_topk):
@@ -404,15 +419,19 @@ def _sgl_m3_sparse_decode_kernel(
         lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
     scale = tl.where(lse_i > float("-inf"), tl.exp2(m_i - lse_i), tl.zeros_like(lse_i))
     acc_o = acc_o * scale[:, None]
-    o_ptrs = tl.make_block_ptr(
-        base=o_ptr + pid_c * stride_o_c + pid_b * stride_o_b + pid_h * stride_o_h,
-        shape=(gqa_group_size, head_dim),
-        strides=(stride_o_h, stride_o_d),
-        offsets=(0, 0),
-        block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
-        order=(1, 0),
+    _o_ptrs_0 = (0) + tl.arange(0, BLOCK_SIZE_H)
+    _o_ptrs_1 = (0) + tl.arange(0, BLOCK_SIZE_D)
+    tl.store(
+        o_ptr
+        + pid_c * stride_o_c
+        + pid_b * stride_o_b
+        + pid_h * stride_o_h
+        + _o_ptrs_0[:, None] * (stride_o_h)
+        + _o_ptrs_1[None, :] * (stride_o_d),
+        acc_o.to(o_ptr.dtype.element_ty),
+        mask=(_o_ptrs_0[:, None] < (gqa_group_size))
+        & (_o_ptrs_1[None, :] < (head_dim)),
     )
-    tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1))
     l_ptrs = (
         lse_ptr
         + pid_c * stride_l_c

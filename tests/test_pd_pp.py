@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # PD-disaggregation + pipeline-parallel unit tests (GPU-free).
 
+import logging
 import os
 import sys
 import threading
@@ -105,7 +106,7 @@ def test_consumer_targets_every_producer_stage_port():
 
 
 # ---------------------------------------------------------------------------
-# remote_pp_size plumbing
+# remote topology metadata plumbing
 # ---------------------------------------------------------------------------
 
 
@@ -147,6 +148,7 @@ def test_producer_advertises_remote_pp_size():
     sched = object.__new__(mc.MooncakeConnectorScheduler)
     sched.pp_size = 4
     sched.tp_size = 1
+    sched.hash_block_size = 64
     sched.dp_rank = 0
     sched.engine_id = "eng"
     sched.host_ip = "10.0.0.1"
@@ -159,12 +161,67 @@ def test_producer_advertises_remote_pp_size():
         spec_token_ids=None,
         block_table=[1, 2, 3],
         id=99,
-        per_req_cache_group=-1,
+        state_slots=[],
         kv_transfer_params_output=None,
     )
     mc.MooncakeConnectorScheduler.request_finished(sched, seq)
     assert seq.kv_transfer_params_output["remote_pp_size"] == 4
+    assert seq.kv_transfer_params_output["hash_block_size"] == 64
     assert seq.kv_transfer_params_output["remote_block_ids"] == [1, 2, 3]
+
+
+def _mooncake_consumer_scheduler(mc, hash_block_size=64):
+    sched = object.__new__(mc.MooncakeConnectorScheduler)
+    sched.is_producer = False
+    sched.hash_block_size = hash_block_size
+    sched.request_id_to_transfer_id = {}
+    sched.transfer_id_to_request_id = {}
+    sched._reqs_need_recv = {}
+    sched._reqs_need_save = {}
+    return sched
+
+
+def _remote_prefill_seq(remote_hash_block_size):
+    params = {"do_remote_prefill": True}
+    if remote_hash_block_size is not None:
+        params["hash_block_size"] = remote_hash_block_size
+    return SimpleNamespace(
+        id=99,
+        kv_transfer_params=params,
+        block_table=[1, 2, 3],
+        per_req_cache_group=-1,
+        has_per_req_cache=False,
+        num_cached_tokens=128,
+    )
+
+
+def test_matching_hash_block_size_enables_incremental_transfer():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    sched = _mooncake_consumer_scheduler(mc)
+    seq = _remote_prefill_seq(remote_hash_block_size=64)
+
+    sched.update_state_after_alloc(seq)
+
+    assert seq.kv_transfer_params["num_computed_blocks"] == 2
+
+
+@pytest.mark.parametrize("remote_hash_block_size", [32, None])
+def test_mismatched_or_missing_hash_block_size_forces_full_transfer(
+    remote_hash_block_size, caplog
+):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    sched = _mooncake_consumer_scheduler(mc)
+    seq = _remote_prefill_seq(remote_hash_block_size)
+
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        sched.update_state_after_alloc(seq)
+
+    assert seq.kv_transfer_params["num_computed_blocks"] == 0
+    assert "falling back to full transfer" in caplog.text
 
 
 # ---------------------------------------------------------------------------

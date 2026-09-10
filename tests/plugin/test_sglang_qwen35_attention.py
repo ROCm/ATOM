@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from atom.model_ops.attention_mha import PagedAttentionImpl
@@ -295,6 +296,7 @@ def test_qwen35_prefill_metadata_matches_atom_contract(monkeypatch):
     assert metadata.cu_seqlens_k.tolist() == [0, 3, 5]
     assert metadata.context_lens.tolist() == [3, 2]
     assert metadata.block_tables.tolist() == [[0, 1, 2], [3, 4, 5]]
+    assert metadata.batch_id_per_k_token is None
 
 
 def test_qwen35_prefix_prefill_separates_total_and_cached_lengths(monkeypatch):
@@ -321,11 +323,79 @@ def test_qwen35_prefix_prefill_separates_total_and_cached_lengths(monkeypatch):
     assert metadata.state is AttnState.PREFILL_PREFIX
     assert metadata.context_lens.tolist() == [5, 4]
     assert metadata.num_cached_tokens.tolist() == [3, 1]
+    assert metadata.total_kv == 9
+    assert metadata.batch_id_per_k_token.tolist() == [0, 0, 0, 0, 0, 1, 1, 1, 1]
     assert metadata.seq_starts.tolist() == [0, 0]
     assert metadata.block_tables.tolist() == [
         [0, 1, 2, 0, 1],
         [6, 2, 3, 4, 10],
     ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_qwen35_prefix_metadata_drives_native_kv_gather(monkeypatch):
+    """Gather both requests' cached and new tokens through the real kernel."""
+    monkeypatch.setattr("atom.utils.envs.ATOM_USE_UNIFIED_ATTN", False)
+    forward_batch = _forward_batch(decode=False, seq_lens=[5, 4], extend_lens=[2, 3])
+    forward_batch.seq_lens = forward_batch.seq_lens.to("cuda")
+    forward_batch.req_pool_indices = forward_batch.req_pool_indices.to("cuda")
+    forward_batch.out_cache_loc = torch.tensor([3, 4, 6, 7, 8], device="cuda")
+    req_pool = SimpleNamespace(req_to_token=torch.arange(10, device="cuda").view(2, 5))
+    metadata = bridge.build_qwen35_attention_metadata(
+        forward_batch,
+        torch.arange(5, device="cuda"),
+        token_pool=SimpleNamespace(page_size=1),
+        req_pool=req_pool,
+    )
+    # NHD page-size-one cache: each physical slot has distinct K/V values.
+    k_cache = (
+        torch.arange(10 * 2 * 64, device="cuda").to(torch.bfloat16).view(10, 1, 2, 64)
+    )
+    v_cache = -k_cache
+    q = torch.empty(5, 2, 64, device="cuda", dtype=torch.bfloat16)
+    impl = SimpleNamespace(kv_cache_dtype="bf16")
+
+    _, gathered_k, gathered_v, *_ = PagedAttentionImpl._gather_prefix_and_concat_kv(
+        impl, q, q, q, k_cache, v_cache, None, None, metadata
+    )
+
+    assert metadata.batch_id_per_k_token.device == q.device
+    torch.testing.assert_close(gathered_k, k_cache[:9, 0], rtol=0, atol=0)
+    torch.testing.assert_close(gathered_v, v_cache[:9, 0], rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_native_unified_decode_after_cpu_default_construction(monkeypatch):
+    """The unified kernel must receive device-resident per-tensor KV scales."""
+    import aiter
+
+    monkeypatch.setattr("atom.utils.envs.ATOM_USE_UNIFIED_ATTN", False)
+    with torch.device("cpu"):
+        impl = PagedAttentionImpl(
+            num_heads=1,
+            head_dim=64,
+            scale=0.125,
+            num_kv_heads=1,
+            alibi_slopes=None,
+            kv_cache_dtype="fp8",
+        )
+    impl.use_flash_layout = True
+    q = torch.ones(1, 1, 64, device="cuda", dtype=torch.bfloat16)
+    cache = torch.ones(1, 16, 1, 64, device="cuda").to(aiter.dtypes.fp8)
+    metadata = SimpleNamespace(
+        cu_seqlens_q=torch.tensor([0, 1], device="cuda", dtype=torch.int32),
+        context_lens=torch.tensor([1], device="cuda", dtype=torch.int32),
+        max_seqlen_q=1,
+        max_seqlen_k=1,
+        block_tables=torch.tensor([[0]], device="cuda", dtype=torch.int32),
+    )
+
+    output = impl.paged_attention_unified(
+        q, q, q, cache, cache, None, None, SimpleNamespace(attn_metadata=metadata)
+    )
+
+    assert impl.kv_scale.device == q.device
+    torch.testing.assert_close(output, torch.full_like(output, impl.kv_scale_float))
 
 
 def test_qwen35_prefill_metadata_uses_real_token_count(monkeypatch):

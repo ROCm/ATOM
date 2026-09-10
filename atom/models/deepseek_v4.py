@@ -22,7 +22,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from functools import lru_cache
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 if TYPE_CHECKING:
     from atom.model_ops.attentions.deepseek_v4_attn import AttentionMetaData_DSV4
@@ -41,7 +41,10 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale
+from aiter.ops.batched_gemm_op_a8w8 import (
+    batched_gemm_a8w8_mxscale,
+    batched_gemm_a8w8_mxscale_bpreshuffle,
+)
 from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
@@ -92,12 +95,9 @@ from atom.model_ops.quant_v4 import act_quant_inplace
 from atom.model_ops.sparse_attn_v4 import (
     hc_split_sinkhorn,
 )
-from atom.model_ops.topK import (
-    is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
-)
 from atom.model_ops.triton_hash_topk import hash_topk_triton
 from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
-from atom.model_ops.utils import atom_parameter
+from atom.model_ops.utils import atom_parameter, shuffle_weights
 from atom.model_ops.v4_kernels import (
     FP4_MQA_BLOCK_K,
     FP4_MQA_PARALLEL_UNIT_NUM,
@@ -207,10 +207,9 @@ def v4_attn_compress(x: torch.Tensor, layer_name: str) -> None:
 
     Its grid is `plan_gpu.shape[0] = graph_bs * per_seq_bound`, which is why
     this graph keys on `(layer, num_tokens, bucket_bs, q_eff)` while a dense
-    piece keys on num_tokens alone. The indexer top-k would belong here on the
-    FP8 path (`_score_topk_decode_ragged` pads to a `bs * full_q` rectangle),
-    but FP4 is the default and its varqlen path is token-shaped, so it sits in
-    `_sparse_attention` with the rest of that granularity.
+    piece keys on num_tokens alone. The indexer top-k is token-shaped on both
+    the FP8 and FP4 paths, so it sits in `_sparse_attention` with the rest of
+    that granularity.
 
     It returns NOTHING, and does not need to: a split op's submodule is the one
     piece the backend leaves uncompiled (`backends.py`, `submod_names_to_compile`
@@ -349,16 +348,6 @@ def _qkn_placeholder(layer, q: torch.Tensor, num_tokens: int, *, zeros: bool):
     return QKNormRopeOut(q_sa=alloc((num_tokens, h, d)), kv=alloc((num_tokens, d)))
 
 
-def _qkn_to_list(qkn: "QKNormRopeOut", kv_fp8: bool) -> list[torch.Tensor]:
-    """Flatten for the op boundary: a custom op schema carries no dataclass, and
-    no Optionals in a tuple return, so this is the active layout's fields as a
-    list. Shared with the fake impl, which is what keeps the two from
-    disagreeing on length."""
-    if kv_fp8:
-        return [qkn.q_packed, qkn.q_rope, qkn.k_packed, qkn.k_rope]
-    return [qkn.q_sa, qkn.kv]
-
-
 def _v4_qk_norm_rope_fake(
     q: torch.Tensor,
     kv_pre: torch.Tensor,
@@ -367,7 +356,7 @@ def _v4_qk_norm_rope_fake(
 ) -> list[torch.Tensor]:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    return _qkn_to_list(_qkn_placeholder(self, q, q.shape[0], zeros=False), self.kv_fp8)
+    return _qkn_placeholder(self, q, q.shape[0], zeros=False).custom_op_return()
 
 
 def v4_qk_norm_rope(
@@ -385,7 +374,7 @@ def v4_qk_norm_rope(
     """
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    return _qkn_to_list(self._qk_norm_rope(q, kv_pre, positions), self.kv_fp8)
+    return self._qk_norm_rope(q, kv_pre, positions).custom_op_return()
 
 
 direct_register_custom_op(
@@ -596,7 +585,7 @@ def _wo_a_is_bf16_on_disk(model_path):
         with open(idx_path) as f:
             idx = json.load(f)
         wmap = idx.get("weight_map", {})
-    except Exception:
+    except Exception:  # noqa: BLE001 -- a probe: any unreadable index means "no"
         return False
     probe = "layers.0.attn.wo_a.weight"
     if probe not in wmap:
@@ -616,12 +605,14 @@ def _wo_a_is_bf16_on_disk(model_path):
                 return True  # BF16 weight; no scale needed regardless of index
             if not scale_present_in_idx:
                 return False
-            if "layers.0.attn.wo_a.scale" not in h.keys():
+            # `.keys()` is not redundant: safetensors' handle has no
+            # `__contains__`, so `not in h` would raise. noqa: SIM118
+            if "layers.0.attn.wo_a.scale" not in h.keys():  # noqa: SIM118
                 # Index lies. wo_a still FP8 but no scale → loader will fail
                 # anyway; safer to fall back to no_spec, although this case is
                 # unexpected.
                 return True
-    except Exception:
+    except Exception:  # noqa: BLE001 -- a probe: any unreadable shard means "no"
         return False
     return False
 
@@ -1085,6 +1076,13 @@ class _V4RoPE(nn.Module):
                 reuse_freqs_front_part=True,
                 nope_first=False,
             )
+
+    def cos_sin_2d(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """2D ``[max_pos, rd//2]`` cos/sin for ops that take the flat cache."""
+        return (
+            self.cos_cache.squeeze(-2).squeeze(-2),
+            self.sin_cache.squeeze(-2).squeeze(-2),
+        )
 
     def inverse(
         self,
@@ -1856,7 +1854,9 @@ class Indexer(nn.Module):
             preshuffle=True,
         )
 
-        cu_starts = indexer_meta["cu_starts_gpu"]  # [total_tokens] int32
+        # Same tensor `seq_base` is read from below -- one name for it here, so
+        # a reader does not have to discover that they are the same thing.
+        cu_starts = indexer_meta["seq_base_per_token_gpu"]  # [total_tokens] int32
         cu_ends = indexer_meta["cu_ends_gpu"]  # [total_tokens] int32
 
         # aiter `top_k_per_row_prefill` (radix kernel, parametric `k` via the
@@ -1930,25 +1930,6 @@ class Indexer(nn.Module):
         total_tokens = q_fp8.size(0)
         attn_md = get_forward_context().attn_metadata
 
-        # DSpark RAGGED (paper §5.2): the decode indexer kernel
-        # `deepgemm_fp8_paged_mqa_logits` is RECTANGULAR-ONLY — its grid maps
-        # rows via `pid % next_n` / `pid // next_n`, assuming every seq has
-        # exactly next_n queries. Under per-request ragged verify each seq has
-        # its own len_i (!= a shared next_n), so total_tokens != bs*next_n and a
-        # plain `.view(bs, next_n, ...)` is impossible.
-
-        ragged_lens = getattr(attn_md, "dspark_ragged_lens_gpu", None)
-        is_ragged = ragged_lens is not None and attn_md.dspark_full_q > 0
-        if is_ragged:
-            return self._score_topk_decode_ragged(
-                q_fp8,
-                weights,
-                block_tables,
-                ragged_lens,
-                int(attn_md.dspark_full_q),
-                topk,
-            )
-
         # Treat each query row as an independent batch item (`next_n=1`).
         # The expanded block table preserves its source sequence mapping while
         # the uncapped row end supplies the exact ratio-4 causal boundary.
@@ -1977,7 +1958,7 @@ class Indexer(nn.Module):
             kv_cache_4d,
             weights,
             logits,
-            attn_md.n_committed_per_token[:total_tokens],
+            attn_md.csa_n_committed_per_token[:total_tokens],
             attn_md.block_tables_per_token[:total_tokens],
             self._max_model_len_idx,
             KVBlockSize=self.kv_cache.size(1),  # csa_rows_per_block = 64
@@ -1992,7 +1973,7 @@ class Indexer(nn.Module):
         top_k_per_row_decode(
             logits,
             1,
-            attn_md.n_committed_per_token[:total_tokens],
+            attn_md.csa_n_committed_per_token[:total_tokens],
             topk_local,
             total_tokens,
             logits.stride(0),
@@ -2039,7 +2020,13 @@ class Indexer(nn.Module):
 
         device = q_fp4.device
         total_tokens = q_fp4.size(0)
-        row_to_batch = indexer_meta["batch_id_per_token_gpu"].to(torch.int32)
+        # Off the metadata, not the dict: `indexer_meta` IS
+        # `attn_metadata.indexer_meta`, so the tensor is already reachable and
+        # copying it in gave the decode branch -- which builds its own dict --
+        # a second place to forget.
+        batch_id_per_q_token = get_forward_context().attn_metadata.batch_id_per_q_token[
+            :total_tokens
+        ]
         local_ends = indexer_meta["visible_end_gpu"]  # [total_tokens] int32
         local_starts = indexer_meta["fp4_prefill_local_starts"]
         # Full-batch schedule precomputed once (outside the fwd) in the metadata
@@ -2079,7 +2066,7 @@ class Indexer(nn.Module):
                 # dropped (their logits stay -inf -> wrong top-k); the shared CTA
                 # floor keeps a small chunk spread across the GPU.
                 _, cta_info, n_ctas = compute_prefill_schedule(
-                    row_to_batch[chunk_start:chunk_end],
+                    batch_id_per_q_token[chunk_start:chunk_end],
                     rs,
                     re,
                     FP4_MQA_BLOCK_K,
@@ -2100,7 +2087,7 @@ class Indexer(nn.Module):
                 self.kv_scale,
                 block_tables,
                 weights[chunk_start:chunk_end],
-                row_to_batch[chunk_start:chunk_end],
+                batch_id_per_q_token[chunk_start:chunk_end],
                 rs,
                 re,
                 max_seq_len,
@@ -2126,121 +2113,6 @@ class Indexer(nn.Module):
 
     def _score_topk_decode_fp4(
         self,
-        q_fp4: torch.Tensor,  # [total_tokens, n_heads, head_dim//2] uint8
-        q_scale: torch.Tensor,  # [total_tokens, K_TILES, 4, 16, QS_PAD] uint8
-        block_tables: torch.Tensor,  # [bs, max_blocks_per_seq] int32
-        weights: torch.Tensor,  # [total_tokens, n_heads] fp32
-        indexer_meta: dict,
-        topk: int,
-    ) -> torch.Tensor:
-        """Decode/varctx FP4: `flydsl_pa_mqa_logits_fp4` reads the paged FP4
-        cache directly over each query row's exact CSA-visible window. Output is
-        seq-local `[total_tokens, max_model_len_idx]`, consumed by
-        `top_k_per_row_decode` exactly like the FP8 deepgemm path.
-
-        CUDAGraph-safe: the persistent-grid schedule (`cta_info`/`total_ctas`)
-        is precomputed eagerly by `_build_v4_indexer_meta` into a fixed-address
-        buffer (pre-replay) and passed in here, so the captured kernel uses a
-        fixed grid (== `total_ctas`) reading fresh per-fwd schedule contents from
-        a stable pointer — no host sync, no data-dependent grid. Passing
-        `cta_info`/`total_ctas` makes the kernel skip its own schedule build, so
-        `parallel_unit_num` is not passed (it would be ignored); only `block_k`
-        must match the value the schedule was built with (see `FP4_MQA_BLOCK_K`).
-        """
-        from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
-            flydsl_pa_mqa_logits_fp4,
-        )
-
-        fc = get_forward_context()
-        total_tokens = q_fp4.size(0)
-        # DSpark RAGGED decode (per-request variable query lengths): route to the
-        # varqlen FP4 path (aiter `flydsl_pa_mqa_logits_fp4_varqlen` via the
-        # ragged-prefill kernel). The rectangular path below does
-        # `q_fp4.view(bs, next_n, ...)` + a uniform-next_n cta_info schedule, so a
-        # ragged batch (total_tokens != bs*next_n) can't take it. Ragged is
-        # eager-only (CUDAGraph rectangularizes it upstream — see
-        # `deepseek_v4_attn.py` TRUE-FLAT graph), so this only triggers under
-        # --enforce-eager + MTP per-request verify, mirroring the FP8
-        # `_score_topk_decode_ragged` scope.
-        attn_md = fc.attn_metadata
-        ragged_lens = getattr(attn_md, "dspark_ragged_lens_gpu", None)
-        if ragged_lens is not None and getattr(attn_md, "dspark_full_q", 0) > 0:
-            return self._score_topk_decode_ragged_fp4(
-                q_fp4, q_scale, block_tables, weights, indexer_meta, topk
-            )
-        k_tiles = self.head_dim // 128
-        qs_pad = q_scale.shape[-1]
-        q_4d = q_fp4.view(total_tokens, 1, self.n_heads, self.head_dim // 2)
-        q_scale_6d = q_scale.view(total_tokens, 1, k_tiles, 4, 16, qs_pad)
-        max_seq_len = self._max_model_len_idx
-        kv_block_size = self.kv_cache.size(3)  # csa_rows_per_block = 64
-        # The packed-dword scale readers in pa_mqa_logits_fp4* require N_PHYS==1
-        # (NTPW=4 N-tiles share one physical block), i.e. kv_block_size == 64
-        # (TILES_PER_BLOCK = 64/MFMA_N(16) = 4 = NTPW). block_size=256 gives
-        # 64 CSA rows per block, which
-        # satisfies this; guard so an unsupported block size fails loudly here
-        # instead of reading scales with the wrong interleave.
-        assert kv_block_size == 64, (
-            f"FP4 indexer requires kv_block_size (CSA rows per block) == 64 "
-            f"for the packed "
-            f"N_PHYS==1 mqa-logits readers, got {kv_block_size}. Set V4 "
-            f"block_size=256 (CSA rows per block = block_size // 4)."
-        )
-
-        # Precomputed schedule from the metadata builder (always present on the
-        # FP4 decode path). When `cta_info` is passed the kernel skips its
-        # internal compute_varctx_schedule AND its out.fill_(-inf).
-        cta_info = indexer_meta["fp4_cta_info"]
-        total_ctas = indexer_meta["fp4_total_ctas"]
-        # Write-once GPU scratch, NOT -inf-filled (mirrors the FP8 decode path).
-        # The kernel writes every column in `[0, context_len)` per row and
-        # `top_k_per_row_decode` scans only the exact ratio-4 per-token prefix
-        # below, so cells past it are never read. A `torch.full(-inf)`
-        # pre-fill would be wasted ~290μs FillFunc work at width
-        # `max_model_len_idx`. CG-safe: torch.empty lands in the graph's private
-        # pool at a stable address across replays at this captured shape.
-        logits = torch.empty(
-            total_tokens, max_seq_len, dtype=torch.float32, device=q_fp4.device
-        )
-        flydsl_pa_mqa_logits_fp4(
-            q_4d,
-            q_scale_6d,
-            self.kv_cache,
-            self.kv_scale,
-            attn_md.block_tables_per_token[:total_tokens],
-            weights,
-            attn_md.n_committed_per_token[:total_tokens],
-            max_seq_len,
-            weight_scale=self._weights_scale,
-            next_n=1,
-            block_k=FP4_MQA_BLOCK_K,
-            kv_block_size=kv_block_size,
-            # Grid is driven by the pre-built `cta_info`/`total_ctas`; the kernel
-            # ignores `parallel_unit_num` unless it builds the schedule itself
-            # (cta_info is None). Do NOT pass it here — the builder's real P is
-            # max(512, T_dec), so a hardcoded value would just mislead readers.
-            out=logits,
-            cta_info=cta_info,
-            total_ctas=total_ctas,
-        )  # [bs*next_n, max_seq_len] fp32, seq-local
-
-        topk_local = torch.empty(
-            total_tokens, self.index_topk, dtype=torch.int32, device=q_fp4.device
-        )
-        top_k_per_row_decode(
-            logits,
-            1,
-            attn_md.n_committed_per_token[:total_tokens],
-            topk_local,
-            total_tokens,
-            logits.stride(0),
-            logits.stride(1),
-            k=topk,
-        )
-        return topk_local  # [total_tokens, index_topk] int32, raw seq-local
-
-    def _score_topk_decode_ragged_fp4(
-        self,
         q_fp4: torch.Tensor,  # [padded_tokens, n_heads, head_dim//2] uint8
         q_scale: torch.Tensor,  # [padded_tokens, K_TILES, 4, 16, QS_PAD] uint8
         block_tables: torch.Tensor,  # [bs, max_blocks_per_seq] int32
@@ -2250,15 +2122,11 @@ class Indexer(nn.Module):
     ) -> torch.Tensor:
         """RAGGED decode FP4 via the varqlen (ragged-prefill) MQA-logits kernel.
 
-        DSpark per-request variable query lengths (paper §5.2): seq b forwards
-        its own `qlen_b` query tokens, so `total_tokens = Σ qlen_b != bs*next_n`
-        and the rectangular `_score_topk_decode_fp4` view()/uniform-next_n
-        schedule can't apply. Instead of the FP8 path's pad-to-rectangle+gather
-        (`_score_topk_decode_ragged`), this uses aiter's native varqlen path: the
-        decode tokens are already laid out per-seq ascending (the natural DSpark
-        ragged order, `batch_id_per_token = repeat(arange(bs), qlen)`), which is
-        exactly what the ragged-prefill kernel + `compute_varqlen_windows`
-        consume — no scatter needed.
+        A sequence forwards its own number of query tokens, so `total_tokens` is
+        their sum and a `[bs, next_n]` view does not exist. None is needed: the
+        decode tokens are already laid out per-seq ascending, so row `r` IS token
+        `r` and `batch_id_per_q_token` is the row-to-sequence map the ragged-prefill
+        kernel wants — no scatter, no second layout.
 
         Per-row MTP tail-causal window: row n of seq b scores compressed KV
         `[0, n_committed_b - qlen_b + n + 1)`, identical to the rectangular decode
@@ -2293,11 +2161,14 @@ class Indexer(nn.Module):
         # so the full padded q_fp4 is scored single-shot: pad rows are skipped by
         # the kernel (empty window → 0 CTAs → no paged KV read) and their top-k is
         # -1 (ignored downstream by csa_translate_pack). No strip / pad-back.
-        row_to_batch = indexer_meta["fp4_ragged_row_to_batch"]
-        local_starts = indexer_meta["fp4_ragged_local_starts"]
-        local_ends = indexer_meta["fp4_ragged_local_ends"]
-        cta_info = indexer_meta["fp4_ragged_cta_info"]
-        n_ctas = indexer_meta["fp4_ragged_n_ctas"]
+        # Off the metadata, not the dict -- see `_score_topk_prefill_fp4`.
+        batch_id_per_q_token = get_forward_context().attn_metadata.batch_id_per_q_token[
+            : q_fp4.size(0)
+        ]
+        local_starts = indexer_meta["fp4_local_starts"]
+        local_ends = indexer_meta["fp4_local_ends"]
+        cta_info = indexer_meta["fp4_cta_info"]
+        n_ctas = indexer_meta["fp4_n_ctas"]
         # Fixed logits width → static `[padded, W]` shape (CG-capturable), same as
         # the rectangular decode path.
         max_seq_len = self._max_model_len_idx
@@ -2325,7 +2196,7 @@ class Indexer(nn.Module):
             self.kv_scale,
             block_tables,
             weights,
-            row_to_batch,
+            batch_id_per_q_token,
             local_starts,
             local_ends,
             max_seq_len,
@@ -2339,115 +2210,24 @@ class Indexer(nn.Module):
         # Seq-local output → indices returned directly. top_k writes every row
         # (real + empty pad rows → -1), so a bare torch.empty output is fine.
         topk_out = torch.empty((padded_tokens, topk), dtype=torch.int32, device=device)
-        top_k_per_row_prefill(
+        # DECODE top-k even though the logits came from the prefill-shaped
+        # scorer: `local_starts` is all zeros, the `rowStart == 0` this entry
+        # assumes. The prefill entry dispatches on `topk_use_mulblocks(rows,
+        # stride0)` with `stride0 = max_position_embeddings // 4` (262144, which
+        # no serving flag lowers), so every step under 128 rows would land on
+        # the multi-block kernel aiter removed from decode. Revisit if
+        # `local_starts` ever stops being zero.
+        top_k_per_row_decode(
             logits,
-            local_starts,
+            1,
             local_ends,
             topk_out,
-            None,  # values not needed, only indices
             padded_tokens,
             logits.stride(0),
             logits.stride(1),
             k=topk,
         )
         return topk_out  # [padded_tokens, topk] int32, raw seq-local
-
-    def _score_topk_decode_ragged(
-        self,
-        q_fp8: torch.Tensor,  # [total_tokens, n_heads, head_dim] fp8
-        weights: torch.Tensor,  # [total_tokens, n_heads] fp32
-        block_tables: torch.Tensor,  # [bs, max_blocks_per_seq] int32
-        ragged_lens: torch.Tensor,  # int32 [bs] — per-seq len_i (= ell_i+1)
-        full_q: int,  # full draft span width (mtp_k + 1)
-        topk: int,
-    ) -> torch.Tensor:
-        """RAGGED decode indexer via pad-to-rectangle + gather (paper §5.2).
-
-        EAGER-ONLY: this per-seq ragged path runs only under --enforce-eager. The
-        CUDAGraph path uses a rectangular (uniform q_eff) decode layout (see
-        `_dspark_apply_ragged`'s graph branch), so under graph the indexer takes
-        the plain `_score_topk_decode` and never reaches here. True per-seq flat
-        under graph is a follow-up.
-
-        The decode indexer kernel is rectangular-only (see `_score_topk_decode`).
-        We scatter the ragged Q/weights into a [bs, full_q] rectangle at each
-        token's original in-span slot j, flatten its rows into independent
-        `next_n=1` batch items, then gather real rows back. The expanded per-row
-        block table preserves sequence ownership and the right-aligned row-end
-        metadata supplies each row's exact CSA-visible range.
-        """
-        device = q_fp8.device
-        total_tokens = q_fp8.size(0)
-        bs = int(ragged_lens.shape[0])
-        H, D = self.n_heads, self.head_dim
-        R = bs * full_q  # padded rectangle rows (fixed per (bs, full_q) graph)
-
-        # CUDAGraph-SAFE pad-to-rectangle. RIGHT-ALIGN: token j of seq i goes to
-        # row i*full_q + (full_q-len_i) + j, so a len_i seq fills the TAIL slots
-        # [full_q-len_i .. full_q-1] and sees ctx-len_i+j (matches the indexer's
-        # causal bound, identical to the rectangular path). dst is built without
-        # data-dependent-shape ops (repeat_interleave banned under CG); clamp the
-        # -1 pad ids to 0 here (redirected to the dump row below).
-        attn_md = get_forward_context().attn_metadata
-        bid_raw = attn_md.batch_id_per_token[:total_tokens].to(torch.int64)
-        bid = torch.clamp(bid_raw, min=0)  # [total_tokens]
-        lens_i64 = ragged_lens.to(torch.int64)
-        cu = torch.zeros(bs + 1, dtype=torch.int64, device=device)
-        torch.cumsum(lens_i64, dim=0, out=cu[1:])
-        tok_arange = torch.arange(total_tokens, device=device, dtype=torch.int64)
-        j_in_seq = tok_arange - cu[bid]  # in-span slot 0..len_i-1 (real tokens)
-        pad_i = full_q - lens_i64  # [bs] leading pad per seq (right-align)
-        dst = bid * full_q + pad_i[bid] + j_in_seq  # [total_tokens]
-        # Redirect CG tail-padding tokens (bid == -1) to a dedicated DUMP row R
-        # (one past the real rect) so they never clobber a real token's q. Fixed
-        # shape (total_tokens) → CG-safe; only rows [0:R] feed the kernel.
-        is_pad = bid_raw < 0
-        dst = torch.where(is_pad, torch.full_like(dst, R), dst)  # pad → row R
-        dst = torch.clamp(dst, 0, R)  # defensive: never OOB the [R+1] rect
-
-        # Zero the [R+1] rectangle (last row = pad dump), scatter all tokens.
-        q_rect = torch.zeros(R + 1, H, D, dtype=q_fp8.dtype, device=device)
-        w_rect = torch.zeros(R + 1, weights.size(1), dtype=weights.dtype, device=device)
-        q_rect[dst] = q_fp8
-        w_rect[dst] = weights
-        q_4d = q_rect[:R].view(R, 1, H, D)
-
-        kv_cache_4d = self.kv_cache.unsqueeze(-2)
-        # kernel operates on the real [R] rect (bs*full_q rows); the dump row R is
-        # only a scatter sink, excluded from the kernel + topk.
-        logits = torch.empty(
-            R, self._max_model_len_idx, dtype=torch.float32, device=device
-        )
-        deepgemm_fp8_paged_mqa_logits(
-            q_4d,
-            kv_cache_4d,
-            w_rect[:R],
-            logits,
-            attn_md.n_committed_per_token[:R],
-            attn_md.block_tables_per_token[:R],
-            self._max_model_len_idx,
-            KVBlockSize=self.kv_cache.size(1),
-            Preshuffle=True,
-        )
-        # topk_rect has R+1 rows: [0:R] real, row R is the pad dump so that
-        # gather with dst∈{..,R} stays in-bounds. Fill row R with -1 sentinels
-        # (csa_translate_pack skips topk<0), the rest by the kernel.
-        topk_rect = torch.full(
-            (R + 1, self.index_topk), -1, dtype=torch.int32, device=device
-        )
-        top_k_per_row_decode(
-            logits,
-            1,
-            attn_md.n_committed_per_token[:R],
-            topk_rect[:R],
-            R,
-            logits.stride(0),
-            logits.stride(1),
-            k=topk,
-        )
-        # Gather each seq's real rows back to the ragged [total_tokens] layout.
-        # Pad tokens (dst==R) read the -1 sentinel row → harmless downstream.
-        return topk_rect[dst]  # [total_tokens, index_topk] int32, seq-local
 
 
 # ---------------------------------------------------------------------------
@@ -2568,6 +2348,9 @@ class DeepseekV4Attention(nn.Module):
         # the graphed dense piece — doesn't graph-break on a runtime get_gfx().
         self._is_gfx1250 = get_gfx() == "gfx1250"
         self._is_gfx950 = get_gfx() == "gfx950"
+        self._is_preshuffle = (
+            self._is_gfx1250
+        )  # TODO: gfx950 will support preshuffle in the future
         # Flipped by process_weights_after_loading when wo_a is eligible for the
         # mxscale BMM; off means the BF16 grouped-LoRA path.
         self._wo_a_mxscale = False
@@ -2681,6 +2464,8 @@ class DeepseekV4Attention(nn.Module):
 
         * gfx950 + 128-aligned shape: keep wo_a FP8 and cache the uint8 e8m0
           [G, N/128, K/128] block scale for `batched_gemm_a8w8_mxscale`.
+        * gfx1250 + same shape: preshuffle the FP8 weight for
+          `batched_gemm_a8w8_mxscale_bpreshuffle`.
         * otherwise: dequant to BF16 for the grouped LoRA einsum
           (`sgd,grd->sgr`) / `batched_gemm_bf16` — aiter has no FP8 grouped
           einsum.
@@ -2696,7 +2481,7 @@ class DeepseekV4Attention(nn.Module):
         if w.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz) or scale is None:
             return  # nothing to do
 
-        # ---- fp8 e8m0 mxscale batched-GEMM path (gfx950) --------------------
+        # ---- fp8 e8m0 mxscale batched-GEMM path (gfx950 / gfx1250) ---------
         # The 128x128 weight block scale and per-128 activation groups need
         # N % 128 == 0 and K % 128 == 0; anything else falls through to BF16,
         # as does a block scale with no exact e8m0 form.
@@ -2704,8 +2489,9 @@ class DeepseekV4Attention(nn.Module):
         N = self.o_lora_rank
         out_dim, K = int(w.shape[0]), int(w.shape[1])
         w_scale = None
+        use_mxscale = self._is_gfx950 or self._is_gfx1250
         if (
-            self._is_gfx950
+            use_mxscale
             and out_dim == G * N
             and N % 128 == 0
             and K % 128 == 0
@@ -2716,6 +2502,10 @@ class DeepseekV4Attention(nn.Module):
             w_scale = _wo_a_block_scale_to_e8m0(scale.data, G)
         if w_scale is not None:
             self._wo_a_fp8_dtype = w.dtype
+            if self._is_preshuffle:
+                # The A8W8 BMM expects a 16x16 preshuffled weight. Its
+                # block scale remains in [G, N/128, K/128] e8m0 layout.
+                shuffle_weights(w, layout=(16, 16))
             # Cached as module attrs so the forward skips the reshape and the
             # scale conversion on every call.
             self._wo_a_w_fp8 = w.data.view(G, N, K)
@@ -2723,16 +2513,16 @@ class DeepseekV4Attention(nn.Module):
             self._wo_a_mxscale = True
             if self.layer_id == 0:
                 logger.info(
-                    "wo_a using fp8 e8m0 mxscale batched GEMM "
-                    "(G=%d, N=%d, K=%d, keeping FP8 weight); "
+                    "wo_a using fp8 e8m0 mxscale batched GEMM (preshuffle=%s, "
+                    "G=%d, N=%d, K=%d, keeping FP8 weight); "
                     "every layer with this shape takes the same path.",
+                    self._is_preshuffle,
                     G,
                     N,
                     K,
                 )
             # Suppress the LinearBase CK-layout shuffle, same as the BF16 branch
-            # below: the mxscale kernel reads `wo_a.weight` directly and needs
-            # the plain row-major [G*N, K] layout.
+            # below: gfx1250 was preshuffled above; gfx950 needs plain row-major.
             self.wo_a.quant_type = QuantType.No
             self.wo_a.need_normalize_e4m3fn_to_e4m3fnuz = False
             return
@@ -2958,9 +2748,9 @@ class DeepseekV4Attention(nn.Module):
     ) -> torch.Tensor:
         """Output inverse RoPE + grouped output LoRA.
 
-        `o` arrives un-inverse-RoPE'd from `_sparse_attention` on both paths. Owning the
-        inverse RoPE here is what lets the mxscale branch fuse it into the
-        group-quant, and keeps the attention halves free of wo_a path knowledge.
+        `o` arrives un-inverse-RoPE'd from `_sparse_attention` on all paths.
+        Owning the inverse RoPE here lets the mxscale branches fuse it into
+        group quant and keeps the attention halves free of wo_a path knowledge.
         """
         num_tokens = o.size(0)
         if self._wo_a_mxscale:
@@ -2978,12 +2768,12 @@ class DeepseekV4Attention(nn.Module):
             x_scale = torch.empty(
                 (num_tokens, G, D // 128), dtype=torch.uint8, device=o.device
             )
-            cos, sin = self.rotary_emb.cos_cache, self.rotary_emb.sin_cache
+            cos, sin = self.rotary_emb.cos_sin_2d()
             inverse_rope_group_quant(
                 o,
                 positions.to(torch.int64),
-                cos.reshape(cos.shape[0], -1),
-                sin.reshape(sin.shape[0], -1),
+                cos,
+                sin,
                 num_groups=G,
                 quant_group_size=128,
                 # Row-major [S, G, Ks], which is how `x_scale` is allocated
@@ -2996,7 +2786,12 @@ class DeepseekV4Attention(nn.Module):
             # Guarded aiter entry returns a fresh token-major [M, G, o_lora_rank]
             # (same layout as the old out= buffer); N is contiguous so the
             # flatten below is a free view.
-            y = batched_gemm_a8w8_mxscale(
+            bmm = (
+                batched_gemm_a8w8_mxscale_bpreshuffle
+                if self._is_preshuffle
+                else batched_gemm_a8w8_mxscale
+            )
+            y = bmm(
                 x_fp8,
                 self._wo_a_w_fp8,
                 x_scale,
@@ -3176,7 +2971,7 @@ class DeepseekV4Attention(nn.Module):
 
         Split out of the attention body so it can run one graph piece earlier, in
         the compiled dense piece, via the opaque `v4_qk_norm_rope` op -- its grid is
-        `q.shape[0]`, `batch_id_per_token` is `[T]` and only gates the store, and
+        `q.shape[0]`, `batch_id_per_q_token` is `[T]` and only gates the store, and
         `swa_dest_rows` is a whole buffer, so a num_tokens-keyed piece holds it.
 
         Running AHEAD of the compressor is safe: nothing here reads what the
@@ -3235,7 +3030,7 @@ class DeepseekV4Attention(nn.Module):
             quant_q=False,
             quant_k=False,
             fp8_2buff=self.kv_fp8,
-            batch_id_per_token=attn_md.batch_id_per_token if is_decode else None,
+            batch_id_per_q_token=attn_md.batch_id_per_q_token if is_decode else None,
             # Where each token's own KV row goes, built once per forward for
             # this layer's compress class. The fused write takes the row rather
             # than the slot because a window row is no longer `slot * cs +
@@ -3281,12 +3076,12 @@ class DeepseekV4Attention(nn.Module):
         fc = get_forward_context()
         # Row count off the Q, NOT off `positions`. The Q descends from the
         # hidden state through `wqkv_a`/`wq_b`, so it carries the same token
-        # count the residual stream does. `positions` does not have to: under
-        # `--enable-dp-attention`, a step where any rank is prefilling takes the
-        # variable-length path (`model_runner.py`, `dp_uniform_decode`) and the
-        # two can differ. Sizing the attention output by `positions` then hands
-        # the mHC residual a mismatched `m` -- an aiter shape assert deep inside
-        # a compiled piece, far from here.
+        # count the residual stream does. `positions` does not have to: a step
+        # where any DP rank is prefilling takes the variable-length path (see
+        # `running_tokens_are_unified` in `forward_context.py`) and the two can
+        # differ. Sizing the attention output by `positions` then hands the mHC
+        # residual a mismatched `m` -- an aiter shape assert deep inside a
+        # compiled piece, far from here.
         q_rows = qkn.q_sa if qkn.q_sa is not None else qkn.q_packed
         assert q_rows is not None, (
             "_sparse_attention got no Q: `_qk_norm_rope` did not run upstream. "
@@ -3502,8 +3297,8 @@ class DeepseekV4Attention(nn.Module):
             )
 
         # `o` is returned un-inverse-RoPE'd: `_wo_a_grouped_lora` removes the
-        # absolute-position contribution the value-side RoPE carried in, on both
-        # paths, so the positions travel downstream instead.
+        # absolute-position contribution the value-side RoPE carried in, on every
+        # path, so the positions travel downstream instead.
         return o.reshape(num_tokens, -1)  # [num_tokens, n_local_heads*head_dim]
 
     def _fill_csa_paged_compress(
@@ -3526,15 +3321,15 @@ class DeepseekV4Attention(nn.Module):
         Per doc §6.4:
           block_idx_in_seq = topk_local // csa_block_capacity
           slot_in_block    = topk_local %  csa_block_capacity
-          physical_block   = block_tables[batch_id_per_token[t], block_idx_in_seq]
+          physical_block   = block_tables[batch_id_per_q_token[t], block_idx_in_seq]
           row              = physical_block * envelope_rows + slot_in_block
 
         Fully fused into one triton kernel — no [T, index_topk] intermediates,
         no PyTorch fancy index. CG sentinel (batch_id=-1) and OOB clamp are
-        handled in-kernel. The kernel derives per-token `valid_k` inline from
-        `(positions[t]+1)//ratio` clamped by `n_committed_csa[bid]` and
-        `index_topk`, matching Indexer's per-row visibility — so every
-        reserved CSA cell gets written and no `-1` sentinel pre-fill is needed.
+        handled in-kernel. The kernel takes each token's `valid_k` from its own
+        `kv_indptr_csa` delta, which the builders sized as
+        `min(visible_csa(pos), index_topk)` — Indexer's per-row visibility — so
+        every reserved CSA cell gets written and no `-1` pre-fill is needed.
 
         Args:
           topk_local_raw: [total_tokens, index_topk] int32 — RAW seq-local
@@ -3574,7 +3369,7 @@ class DeepseekV4Attention(nn.Module):
             attn_md.block_tables,
             positions,
             kv_indptr,
-            attn_md.batch_id_per_token,
+            attn_md.batch_id_per_q_token,
             skip_buf,
             kv_indices,
             envelope_rows=attn_md.envelope_rows,
@@ -3728,18 +3523,9 @@ class MoE(nn.Module):
             # attribute mutation across the compile boundary, so stashing on
             # `self.foo` from inside forward is a no-op at runtime.
         assert args.n_shared_experts == 1
-        self._fuse_shared_into_routed = (
-            is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
-                qc,
-                shared_expert_prefix=f"{prefix}.shared_experts",
-                routed_expert_prefix=f"{prefix}.experts",
-            )
-        )
         moe_cfg = SimpleNamespace(
             routed_scaling_factor=self.routed_scaling_factor,
-            n_shared_experts=(
-                args.n_shared_experts if self._fuse_shared_into_routed else 0
-            ),
+            n_shared_experts=args.n_shared_experts,
         )
         self.experts = FusedMoE(
             num_experts=self.n_routed_experts,
@@ -3759,8 +3545,10 @@ class MoE(nn.Module):
             # inter=3072/TP8=384 is a 128-multiple; pad to 128 (not the 256
             # default) to avoid padding the MoE intermediate up to 512.
             pad_align=128,
+            enable_comm_fused=True,
         )
         self.experts.swiglu_limit = args.swiglu_limit
+        self._fuse_shared_into_routed = self.experts.num_fused_shared_experts > 0
 
         if not self._fuse_shared_into_routed:
             # self.experts.num_fused_shared_experts = 0
@@ -3790,13 +3578,15 @@ class MoE(nn.Module):
             and self.alt_stream is not None
             and envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
         )
+        # Keep comm-fused token-bucket dispatch dynamic under torch.compile.
+        self._use_comm_fused_dispatch = self.experts._comm_fused_moe is not None
         # Register self in static_forward_context so the custom op dispatcher
         # can look us up by `layer_name` (= self.prefix). Needed by
         # maybe_dual_stream_forward (dual-stream) AND moe_pcp_merge_forward
         # — the latter requires registration regardless of
         # dual-stream, so register whenever either consumer is active.
         _pcp_merge_on = get_pcp_world_size() > 1 and bool(envs.ATOM_PCP_MOE_MERGE)
-        if self._use_dual_stream or _pcp_merge_on:
+        if self._use_dual_stream or self._use_comm_fused_dispatch or _pcp_merge_on:
             get_current_atom_config().compilation_config.static_forward_context[
                 prefix
             ] = self
@@ -3870,8 +3660,12 @@ class MoE(nn.Module):
         return topk_weights, topk_ids
 
     def routed_expert_forward(
-        self, x: torch.Tensor  # [num_tokens, dim]
-    ) -> torch.Tensor:  # [num_tokens, dim]
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]
+        shared_partial: torch.Tensor | None = None,
+        before_stage2=None,
+        stage2_stream: torch.cuda.Stream | None = None,
+    ) -> tuple[torch.Tensor, bool]:
         """Gate + FusedMoE routed-expert pass.
 
         For hash layers the gate's `tid2eid` lookup needs `input_ids`;
@@ -3880,7 +3674,13 @@ class MoE(nn.Module):
         `_hash_topk` (FusedMoE's custom_routing_function) reads it there.
         """
         router_logits = self.gate(x)  # [num_tokens, n_routed_experts]
-        return self.experts(hidden_states=x, router_logits=router_logits)
+        return self.experts.forward_maybe_comm_fused(
+            x,
+            router_logits,
+            shared_partial,
+            before_stage2=before_stage2,
+            stage2_stream=stage2_stream,
+        )
 
     @staticmethod
     def _gather_ids_for_dp(ids: torch.Tensor, ctx) -> torch.Tensor:
@@ -3889,7 +3689,7 @@ class MoE(nn.Module):
 
         ids_2d = ids.unsqueeze(-1)
         dp_eager_mode = (
-            not ctx.context.dp_uniform_decode
+            not ctx.context.running_tokens_are_unified
         ) and ctx.dp_metadata is not None
         if dp_eager_mode:
             from atom.model_ops.moe import all_gatherv
@@ -3938,9 +3738,13 @@ class MoE(nn.Module):
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Sequential: shared_experts → routed_experts → combine."""
         shared = self.shared_experts(x) if self.shared_experts is not None else None
-        routed = self.routed_expert_forward(x)
+        routed, is_complete = self.routed_expert_forward(x, shared_partial=shared)
+        if is_complete:
+            return routed
         return self.combine_outputs(
-            routed, shared, prefix=f"{self.prefix}.combine_outputs"
+            routed,
+            shared,
+            prefix=f"{self.prefix}.combine_outputs",
         )
 
     def dual_stream_moe_forward(
@@ -3951,12 +3755,26 @@ class MoE(nn.Module):
         independent; main stream waits on alt_stream's completion before
         combining.
         """
-        current_stream = get_forward_context().main_stream
-        self.alt_stream.wait_stream(current_stream)
-        routed = self.routed_expert_forward(x)
+        routed_stream = torch.cuda.current_stream(x.device)
+        self.alt_stream.wait_stream(routed_stream)
+
+        def produce_shared():
+            with torch.cuda.stream(self.alt_stream):
+                shared = self.shared_experts.forward(x)
+            routed_stream.wait_stream(self.alt_stream)
+            shared.record_stream(routed_stream)
+            return shared
+
+        routed, is_complete = self.routed_expert_forward(
+            x,
+            before_stage2=produce_shared,
+            stage2_stream=routed_stream,
+        )
+        if is_complete:
+            return routed
         with torch.cuda.stream(self.alt_stream):
             shared = self.shared_experts.forward(x)
-        current_stream.wait_stream(self.alt_stream)
+        routed_stream.wait_stream(self.alt_stream)
         return self.combine_outputs(
             routed, shared, prefix=f"{self.prefix}.combine_outputs"
         )
@@ -3971,11 +3789,8 @@ class MoE(nn.Module):
         assert (
             x.dim() == 2 and x.shape[-1] == self.dim
         ), f"MoE expects 2D [num_tokens, {self.dim}], got {tuple(x.shape)}"
-        if self._use_dual_stream:
-            # Shared custom op (also used by V2). Dispatcher reads
-            # `_use_dual_stream` + per-call num_tokens vs threshold to pick
-            # dual vs single. Custom op = Dynamo barrier so stream context
-            # inside `dual_stream_moe_forward` is opaque to torch.compile.
+        if self._use_dual_stream or self._use_comm_fused_dispatch:
+            # Keep stream and comm-fused dispatch opaque to torch.compile.
             return torch.ops.aiter.maybe_dual_stream_forward(x, self.prefix)
         return self.single_stream_moe_forward(x)
 
@@ -4057,7 +3872,7 @@ class Block(nn.Module):
             getattr(aiter, "mhc_fused_post_pre", None) if _dim_ok else None
         )
         self.enable_fused_hc = (
-            hasattr(aiter, "mhc_fused_post_pre") and not self.layer_id == 0
+            hasattr(aiter, "mhc_fused_post_pre") and self.layer_id != 0
         )
 
     # mHC `hc_post_mult_value`: V4 uses `2.0 * sigmoid(post)` for the post gate.
@@ -4613,11 +4428,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             "hc_head_": "model.hc_head_",
         }
     )
-    weights_mapping = {
+    weights_mapping: ClassVar[dict[str, str]] = {
         ".gate.bias": ".gate.e_score_correction_bias",
         ".scale": ".weight_scale_inv",
     }
-    packed_modules_mapping = {
+    packed_modules_mapping: ClassVar[dict[str, tuple[str, int]]] = {
         "attn.wq_a": ("attn.wqkv_a", 0),
         "attn.wkv": ("attn.wqkv_a", 1),
         "compressor.wkv": ("compressor.wkv_gate", 0),
@@ -4652,9 +4467,17 @@ class DeepseekV4ForCausalLM(nn.Module):
         # default [max_num_batched_tokens, hidden_size]. forward returns
         # the un-reduced mHC residual stack [N, hc, dim].
         self.extra_output_dims: tuple[int, ...] = (self.args.hc_mult,)
+        # Hash routing must see one token id for every MoE row. DPA gathers MoE
+        # rows when EP is disabled *and* when EP uses the collective fallback;
+        # only the mori all-to-all path keeps routing on rank-local rows.
+        uses_routed_all2all = any(
+            isinstance(module, MoE)
+            and module.experts.moe_parallel_config.use_all2all_kernels
+            for module in self.model.modules()
+        )
         self._need_ids_gather = (
             config.enable_dp_attention
-            and not config.enable_expert_parallel
+            and not uses_routed_all2all
             and self.args.n_hash_layers > 0
         )
 
@@ -4739,8 +4562,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                     full_padded_ids = pcp_allgather_rankmajor(input_ids, pcp_size)
 
         if self._need_ids_gather:
-            # DP-attention (no EP) hash routing: input_ids is local but the MoE
-            # gate sees DP-gathered gating_output, so gather ids to match. Run
+            # DP-attention collective fallback hash routing: input_ids is local
+            # but the MoE gate sees DP-gathered gating_output, so gather ids to
+            # match. This covers TP-style MoE and EP with mori disabled. Run
             # the gather INLINE on the compute stream. Running this all-gather on
             # a side stream coordinated it with a DIFFERENT stream/sync than the
             # MoE hidden/router DP gather under TBO → mismatched DP layouts →
@@ -4889,7 +4713,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # → `experts.w13_` (param_name_part), keeping the `weight` / `scale` suffix.
         try:
             expert_mapping = self.get_expert_mapping()
-        except Exception:
+        except Exception:  # noqa: BLE001 -- optional; a model without one loads fine
             expert_mapping = []
         # Build longest-first index for unambiguous matching (shared with std loader).
         expert_index: dict[str, tuple[str, int, str]] = {}

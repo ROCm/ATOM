@@ -27,11 +27,19 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
     # layout (set by the vLLM plugin under DP+EP); disable it there.
     if dp_size > 1 and config.moe_ep_flatten_tp_across_dp:
         return False
-    # Only MoRI needs the switch; the TP fusion is a different mechanism.
+    # Only the selected MoRI transport needs this switch; the TP fusion is a
+    # different mechanism, and an explicitly selected RCCL/none backend must
+    # not be inferred from the mere presence of the ``mori`` Python package.
     # EPLB always fuses, otherwise the env decides.
+    requested_all2all = getattr(config, "moe_all2all_backend", "auto")
+    mori_selected = (
+        requested_all2all in {"auto", "mori"}
+        and not envs.ATOM_DISABLE_MORI_EP
+        and _has_module("mori")
+    )
     if (
         dp_size > 1
-        and _has_module("mori")
+        and mori_selected
         and config.enable_dp_attention
         and not (getattr(config, "eplb_enable", False) or envs.ATOM_FUSE_SHARED_EXPERT)
     ):

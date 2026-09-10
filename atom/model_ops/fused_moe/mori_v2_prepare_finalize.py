@@ -42,7 +42,6 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from aiter import ActivationType, QuantType
-from aiter.dist.parallel_state import get_dp_group
 from aiter.ops.flydsl.moe_common import GateMode
 
 import atom.model_ops.fused_moe.modular_kernel as mk
@@ -193,6 +192,19 @@ def _cco_per_rank_vmm(
 # are config-wide, so the first layer's are the model's.
 _MEGA_TRANSPORTS: dict = {}
 
+# bf16 | fp8 | fp4, and it must MATCH the expert GEMM's A operand -- on gfx1250
+# that is fp4 unless AITER_FORCE_A8W4=1. A mismatch is a row-width error, not a
+# slow path. Read once: init_mega_transport runs per MoE layer (61x for V4-Pro).
+#
+# Checked here as well as in aiter: this module passes dispatch_wire= down
+# explicitly, so aiter's own env read -- and its guard -- never runs for us.
+if os.environ.get("MEGA_WIRE") not in (None, os.environ.get("MEGA_DISPATCH_WIRE")):
+    raise RuntimeError(
+        "MEGA_WIRE was renamed to MEGA_DISPATCH_WIRE; update the launch script, "
+        "the old name is no longer read"
+    )
+_MEGA_DISPATCH_WIRE = os.environ.get("MEGA_DISPATCH_WIRE", "bf16")
+
 
 def init_mega_transport(
     *,
@@ -235,6 +247,9 @@ def init_mega_transport(
         hidden_pad,
         intermediate_pad,
         swiglu_limit,
+        # Keyed on: the wire sets the payload width and whether the scale
+        # region exists.
+        _MEGA_DISPATCH_WIRE,
     )
     cached = _MEGA_TRANSPORTS.get(key)
     if cached is not None:
@@ -266,13 +281,25 @@ def init_mega_transport(
         swiglu_limit=swiglu_limit,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        # Passed, not left to aiter's own read of the env, so the key and the
+        # transport cannot drift.
+        dispatch_wire=_MEGA_DISPATCH_WIRE,
+        # Only mori's dispatch carries the scale row, so a quantizing wire has
+        # no other backend to run on. Named here rather than left to
+        # $MEGA_DISPATCH, whose default is flydsl: otherwise asking for fp4 is
+        # rejected at the first MoE layer for a reason the operator did not set.
+        **(
+            {"dispatch_backend": "mori"}
+            if _MEGA_DISPATCH_WIRE in ("fp8", "fp4")
+            else {}
+        ),
     )
     comm.barrier()
     _MEGA_TRANSPORTS[key] = mega
     logger.info(
         "[MORI-V2] Created MegaMoE: ep_rank=%d ep_size=%d hidden=%d inter=%d "
         "experts=%d topk=%d M=%d act=%s gate=%s quant=%s pad=(%d,%d) "
-        "swiglu_limit=%s dispatch=%s",
+        "swiglu_limit=%s dispatch=%s wire=%s force_a8w4=%s",
         ep_rank,
         ep_size,
         hidden_dim,
@@ -287,6 +314,9 @@ def init_mega_transport(
         intermediate_pad,
         swiglu_limit,
         mega._config.dispatch_backend,
+        mega._config.dispatch_wire,
+        # The other half of the pair: logged together so a mismatch is readable.
+        os.environ.get("AITER_FORCE_A8W4", "0"),
     )
     return mega
 
@@ -500,38 +530,38 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
 
     Both transports get the same grid shrink. The dispatch arena is padded to a
     huge static token_num (ws * max_num_inp_token_per_rank) while the received
-    tokens occupy only the first ``total_recv`` rows, so under a uniform
-    all-ranks-decode batch it is capped at the static ``running_tokens*topk*dp``
-    bound (the V1/base policy): the grid-bound aiter kernels (route-ksplit
-    preshuffle, gather-reduce) then launch a grid sized to the decode bucket
-    instead of the full arena, and the single-block route/psum kernels shrink too.
+    tokens occupy only the first ``total_recv`` rows, so it is capped at the
+    static ``sum(running_tokens_across_dp)*topk`` bound (the V1/base policy):
+    the grid-bound aiter kernels (route-ksplit preshuffle, gather-reduce) then
+    launch a grid sized to what the group actually sent instead of the full
+    arena, and the single-block route/psum kernels shrink too.
     Gather slices the buffers here; the fused path passes the bound down as
     ``recv_token_bound`` because it never sees them.
     """
 
-    def _decode_recv_bound(self, topk_ids: torch.Tensor, arena_rows: int) -> int | None:
-        """Static recv-row bound for a uniform decode batch, else None (no shrink).
+    def _recv_bound(self, topk_ids: torch.Tensor, arena_rows: int) -> int | None:
+        """Recv-row bound for this step, or None when it does not shrink.
 
         Correctness / capture-safety:
-          * ``running_tokens`` is a python int, fixed per captured graph, so the
-            bound is static across capture/replay and no GPU->CPU sync is needed
-            (unlike reading the device ``total_recv``).
-          * Under uniform decode each of ``dp`` ranks holds ``running_tokens``,
-            each routed to ``topk`` experts; worst case every route lands on this
-            rank, so ``total_recv <= running_tokens*topk*dp``. The bound therefore
-            never drops a valid row, and the aiter kernels' device-side
-            ``num_valid_routes`` guard still skips the exact within-buffer tail
-            [total_recv, bound).
-          * Mixed/prefill batches keep the full arena, matching the base-class
-            guard.
+          * The counts are python ints, fixed per captured graph, so the bound is
+            static across capture/replay and no GPU->CPU sync is needed (unlike
+            reading the device ``total_recv``).
+          * The group holds ``sum(running_tokens_across_dp)`` rows, each routed
+            to ``topk`` experts; worst case every route lands on this rank, so
+            ``total_recv <= that_sum * topk``. The bound therefore never drops a
+            valid row, and the aiter kernels' device-side ``num_valid_routes``
+            guard still skips the exact within-buffer tail [total_recv, bound).
+            Why the sum and not ``running_tokens * dp``: see the base method.
         """
         context = get_forward_context().context
         if context is None:
             return None
-        all_ranks_decode = getattr(context, "dp_uniform_decode", not context.is_prefill)
-        if not all_ranks_decode:
-            return None
-        bound = context.running_tokens * topk_ids.shape[1] * get_dp_group().world_size
+        across_dp = context.running_tokens_across_dp
+        assert across_dp is not None, (
+            "an all2all MoE needs the group's per-rank counts to bound what its "
+            "dispatch delivered; this step reached it with none reduced"
+        )
+        bound = sum(across_dp) * topk_ids.shape[1]
         return bound if bound < arena_rows else None
 
     def _maybe_trim_dispatch_output(
@@ -543,7 +573,7 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         topk_ids: torch.Tensor,
         expert_tokens_meta,
     ):
-        bound = self._decode_recv_bound(topk_ids, dispatch_a1.shape[0])
+        bound = self._recv_bound(topk_ids, dispatch_a1.shape[0])
         if bound is not None:
             dispatch_a1 = dispatch_a1[:bound]
             dispatch_ids = dispatch_ids[:bound]
@@ -584,7 +614,7 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
             bias2=kwargs.get("bias2"),
             a1_scale=kwargs.get("a1_scale"),
             a2_scale=kwargs.get("a2_scale"),
-            recv_token_bound=self._decode_recv_bound(
+            recv_token_bound=self._recv_bound(
                 topk_ids,
                 self.prepare_finalize.num_dispatchers() * mega.max_tokens_per_rank,
             ),

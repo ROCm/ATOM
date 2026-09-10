@@ -130,12 +130,13 @@ class IndexerVllm(IndexerBase):
         """Paged decode top-k, extended for the DECODE slice of a mixed batch.
 
         Native ATOM only ever calls this for a *pure* decode forward, where the
-        step size is the batch-wide ``max_seqlen_q`` and the committed tensor is
-        the whole ``indexer_meta["n_committed_per_seq_gpu"]``. Under vLLM
-        continuous batching this also runs on the leading decode slice of a
-        MIXED batch, where neither holds: ``max_seqlen_q`` is the prefill max
-        (not the decode step size) and the committed tensor must be sliced to
-        the decode sub-batch. So ``indexer_score_topk`` passes ``next_n`` and
+        step size is the batch-wide ``max_seqlen_q`` and the bound is per TOKEN
+        (``csa_n_committed_per_token``); it puts no per-seq committed tensor in
+        ``indexer_meta`` at all. This bridge still stages one, because under
+        vLLM continuous batching the call also runs on the leading decode slice
+        of a MIXED batch, where ``max_seqlen_q`` is the prefill max (not the
+        decode step size) and the committed tensor must be sliced to the decode
+        sub-batch. So ``indexer_score_topk`` passes ``next_n`` and
         ``n_committed_per_seq`` explicitly for that case.
 
         When both are ``None`` (the pure-decode / spec-verify step) this is
@@ -226,7 +227,7 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
     for a prefill/mixed batch whose bucket was captured, ``x`` / ``positions``
     (and every downstream per-token projection) arrive padded to ``T_pad``, but
     the sparse-attention metadata is built for the *real* token count (the
-    bridge's prefill path sets ``batch_id_per_token`` to length == real tokens).
+    bridge's prefill path sets ``batch_id_per_q_token`` to length == real tokens).
 
     There are two eager entry points, and ``DeepseekV4Attention.forward`` picks
     between them by cudagraph mode, so BOTH must reconcile the padding:
@@ -267,7 +268,7 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
             attn_md = fc.attn_metadata
             if attn_md is not None and attn_md.state is not AttnState.DECODE:
                 num_in = x.size(0)
-                bid = attn_md.batch_id_per_token
+                bid = attn_md.batch_id_per_q_token
                 num_real = bid.shape[0] if bid is not None else num_in
                 if num_real < num_in:
                     out = super().forward_impl(x[:num_real], positions[:num_real])
@@ -287,7 +288,7 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
     ) -> torch.Tensor:
         # NARROW entry (see class docstring). The pieces upstream produced every
         # per-token tensor at the padded bucket width, but the sparse-attention
-        # metadata this half reads (`batch_id_per_token`, `kv_indptr_*`) is sized
+        # metadata this half reads (`batch_id_per_q_token`, `kv_indptr_*`) is sized
         # to the real token count -- and this is the half that reads it, so this
         # is where the two have to be reconciled. Clip in, pad out: the padded
         # width is what the piecewise output buffer and the graphed `_attn_post`
@@ -305,7 +306,7 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
             attn_md = fc.attn_metadata
             if attn_md is not None and attn_md.state is not AttnState.DECODE:
                 num_in = positions.size(0)
-                bid = attn_md.batch_id_per_token
+                bid = attn_md.batch_id_per_q_token
                 num_real = bid.shape[0] if bid is not None else num_in
                 if num_real < num_in:
 

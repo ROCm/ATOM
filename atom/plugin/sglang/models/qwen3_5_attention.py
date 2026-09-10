@@ -15,6 +15,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 
 from atom.config import KVCacheTensor, get_current_atom_config
 from atom.model_ops.attention_mha import PagedAttentionImpl
+from atom.model_ops.attentions.token_layout.batch_ids import build_batch_ids_device
 from atom.model_ops.base_attention import BaseAttention, LinearAttention
 from atom.plugin.sglang.patches.prefill_compile_only_patch import (
     is_compile_only_prefill_active,
@@ -695,6 +696,7 @@ def build_qwen35_attention_metadata(
     # cold prefill advertise zero valid keys and corrupts every full-attention
     # layer's output.
     context_lens = seq_lens.to(device=positions.device, dtype=torch.int32)
+    total_kv = sum(seq_lens_cpu) if has_cached else int(positions.shape[0])
     metadata = AttentionMetaData(
         cu_seqlens_q=cu_q,
         cu_seqlens_k=cu_k,
@@ -708,7 +710,12 @@ def build_qwen35_attention_metadata(
         context_lens=context_lens,
         block_tables=block_tables,
         has_cached=has_cached,
-        total_kv=sum(seq_lens_cpu) if has_cached else int(positions.shape[0]),
+        total_kv=total_kv,
+        # Native prefix gather reuses this per-forward map in every layer.
+        # Include cached and new K/V tokens, not just the query tokens.
+        batch_id_per_k_token=(
+            build_batch_ids_device(context_lens, total=total_kv) if has_cached else None
+        ),
         num_cached_tokens=(
             torch.as_tensor(prefix_lens_cpu, dtype=torch.int32, device=positions.device)
             if has_cached

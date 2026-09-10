@@ -152,7 +152,7 @@ def _resolve_num_tokens_across_dp(
     return num_tokens_across_dp
 
 
-def _resolve_dp_uniform_decode(
+def _resolve_running_tokens_are_unified(
     atom_config: Any,
     forward_batch: ForwardBatch,
 ) -> bool:
@@ -235,8 +235,7 @@ def _slice_v4_graph_metadata_for_capture(
                 pass
 
     for name in (
-        "batch_id_per_token",
-        "batch_id_per_token_cpu",
+        "batch_id_per_q_token",
         "slot_mapping",
         "kv_indices_swa",
         "kv_indices_csa",
@@ -265,8 +264,6 @@ def _slice_v4_graph_metadata_for_capture(
         "state_slot_mapping_cpu",
         "n_committed_csa_per_seq",
         "n_committed_csa_per_seq_cpu",
-        "n_committed_hca_per_seq",
-        "n_committed_hca_per_seq_cpu",
         "context_lens",
     ):
         _slice_attr(name, bs)
@@ -282,7 +279,7 @@ def _slice_v4_graph_metadata_for_capture(
     if isinstance(indexer_meta, dict):
         indexer_meta = dict(indexer_meta)
         for key in (
-            "batch_id_per_token_gpu",
+            "batch_id_per_q_token",
             "seq_base_per_token_gpu",
             "cu_starts_gpu",
             "cu_ends_gpu",
@@ -469,7 +466,7 @@ def stage_glm52_draft_decode_graph_metadata(
         "sparse_kv_indptr",
         "sparse_kv_last_page_lens",
         "sparse_cu_seqlens_q",
-        "token_to_seq_idxs",
+        "batch_id_per_q_token",
         "work_meta_data",
         "work_indptr",
         "work_info_set",
@@ -806,7 +803,9 @@ def _set_atom_forward_context(
     # ubatch `max_seqlen_q` times too wide. Prefill's value is unread there.
     running_bs = batch_size if is_prefill else max(1, running_tokens // max_q)
 
-    dp_uniform_decode = _resolve_dp_uniform_decode(atom_config, forward_batch)
+    running_tokens_are_unified = _resolve_running_tokens_are_unified(
+        atom_config, forward_batch
+    )
     context = Context(
         positions=positions,
         is_prefill=is_prefill,
@@ -815,7 +814,7 @@ def _set_atom_forward_context(
         scheduled_tokens=num_tokens,
         running_bs=running_bs,
         running_tokens=running_tokens,
-        dp_uniform_decode=dp_uniform_decode,
+        running_tokens_are_unified=running_tokens_are_unified,
     )
     set_forward_context(
         attn_metadata=attn_metadata,

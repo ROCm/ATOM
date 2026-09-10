@@ -145,6 +145,7 @@ class UBatchWrapper(nn.Module):
                 ub_num_reqs,
                 ub_running_tokens=ub_running_tokens_list[i],
                 dp_metadata=ub_dp_metadata[i] if ub_dp_metadata is not None else None,
+                running_tokens_across_dp=self._ub_tokens_across_dp(ctx, N, i),
             )
             forward_contexts.append(ub_ctx)
             ub_token_slice = (
@@ -270,6 +271,7 @@ class UBatchWrapper(nn.Module):
                 i,
                 ub_running_tokens=ub_running_bs * max_q,
                 dp_metadata=ub_dp_metadata[i] if ub_dp_metadata is not None else None,
+                running_tokens_across_dp=self._ub_tokens_across_dp(ctx, N, i),
             )
             forward_contexts.append(ub_ctx)
             ub_inputs.append(
@@ -450,6 +452,15 @@ class UBatchWrapper(nn.Module):
         return metas
 
     @staticmethod
+    def _ub_tokens_across_dp(ctx: ForwardContext, N: int, i: int):
+        """Ubatch ``i``'s per-rank token counts, or None if none were reduced.
+
+        Passed down because inside a ubatch only this rank's split is in reach.
+        """
+        rows = ctx.ub_tokens_across_dp
+        return None if rows is None or len(rows) != N else rows[i]
+
+    @staticmethod
     def _decode_ub_running_bs(
         ctx: ForwardContext, i: int, N: int, full_running_bs: int
     ) -> int:
@@ -459,7 +470,7 @@ class UBatchWrapper(nn.Module):
         pads each ubatch to this size, so a per-rank-local split (which differs
         when ranks carry different decode batch sizes, e.g. during drain)
         desyncs the collective and faults. Derive it from the DP-unified
-        ``ub_max_tokens_across_dp`` (MAX-reduced in ModelRunner._preprocess),
+        ``ub_max_tokens_across_dp`` (MAX-reduced in ``ForwardMode.decide``),
         converting the per-ubatch token max back to a request count via
         ``max_seqlen_q``. Falls back to the local split only when DP is off or
         the precomputed value is unavailable.
@@ -487,7 +498,7 @@ class UBatchWrapper(nn.Module):
         ``dp_size``: pad_for_all_gather gathers across ranks itself.
 
         For prefill (eager only): the cross-DP per-ubatch token MAX that
-            ``ModelRunner._preprocess`` already packed into the single DP
+            ``ForwardMode.decide`` already packed into the single DP
             all_reduce (``ctx.ub_max_tokens_across_dp``). Falls back to
             local sizes when DP is off / value not precomputed.
         For decode: the per-ubatch padded request count times ``max_seqlen_q``.
@@ -520,6 +531,7 @@ class UBatchWrapper(nn.Module):
         actual_num_reqs: int | None = None,
         ub_running_tokens: int | None = None,
         dp_metadata=None,
+        running_tokens_across_dp: tuple[int, ...] | None = None,
     ) -> ForwardContext:
         """Build a ForwardContext for a single micro-batch."""
         ub_num_reqs = ub_slice.request_slice.stop - ub_slice.request_slice.start
@@ -556,6 +568,7 @@ class UBatchWrapper(nn.Module):
             scheduled_tokens=ub_num_tokens,
             running_bs=ub_running_bs,
             running_tokens=running_tokens,
+            running_tokens_across_dp=running_tokens_across_dp,
             is_draft=ctx.context.is_draft,
             # Carry over per-ubatch slice of input_ids for hash MoE (PCP+TBO mode).
             # run_model stores local (1/pcp) ids; each ubatch takes its token_slice.

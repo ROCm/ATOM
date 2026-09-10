@@ -20,7 +20,7 @@ Phase 2 (weight sharing):
 import logging
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 logger = logging.getLogger("atom")
 
@@ -58,30 +58,27 @@ def _import_tensor(meta: dict) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
-def export_kv_cache_handle(
-    kv_cache: torch.Tensor, kv_scale: torch.Tensor | None = None
-) -> dict:
-    """Export kv_cache (and optionally kv_scale for fp8) as CUDA IPC handles.
+def export_kv_cache_handle(kv_cache: torch.Tensor) -> dict:
+    """Export the paged pool as a CUDA IPC handle.
+
+    One handle because there is one allocation: the dequantization scales, any
+    indexer key cache and a draft's sibling pool are regions of it, and the
+    decode side finds them by carving with the same declarations rather than by
+    being sent a tensor per region.
 
     Must be called from the process that allocated the tensor (prefill).
     Returns a dict that can be pickled and sent over ZMQ to the decode process.
     """
-    result = {"kv_cache": _export_tensor(kv_cache)}
-    if kv_scale is not None:
-        result["kv_scale"] = _export_tensor(kv_scale)
-    return result
+    return {"kv_cache": _export_tensor(kv_cache)}
 
 
-def import_kv_cache(meta: dict) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Reconstruct kv_cache (and kv_scale if present) from CUDA IPC handles.
+def import_kv_cache(meta: dict) -> torch.Tensor:
+    """Reconstruct the paged pool from its CUDA IPC handle.
 
-    Must be called from the consumer process (decode).
-    Returns (kv_cache, kv_scale) — kv_scale is None when not fp8.
-    The returned tensors share GPU memory with prefill's allocation — no copy.
+    Must be called from the consumer process (decode). The returned tensor
+    shares GPU memory with prefill's allocation — no copy.
     """
-    kv_cache = _import_tensor(meta["kv_cache"])
-    kv_scale = _import_tensor(meta["kv_scale"]) if "kv_scale" in meta else None
-    return kv_cache, kv_scale
+    return _import_tensor(meta["kv_cache"])
 
 
 # ---------------------------------------------------------------------------

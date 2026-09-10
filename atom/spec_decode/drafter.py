@@ -230,6 +230,11 @@ class Drafter(abc.ABC):
             for bs in capture_sizes:
                 attn_metadata, context = build_context(bs=bs)
                 context.is_draft = True
+                # Every warmed pass is decode-shaped and DP-uniform: the graphs
+                # belong to the DSpark block and Eagle's mid-steps, and step 0
+                # has none. Stated, not inherited, per the rule above.
+                context.is_prefill = False
+                context.running_tokens_are_unified = True
                 # The synthetic batch is full, so the pass's scheduled and
                 # running counts are the same number.
                 local_tokens = bs * self.draft_tokens_per_seq
@@ -551,7 +556,12 @@ class Drafter(abc.ABC):
         )
 
     def _publish_draft_shape(
-        self, forward_context, scheduled_tokens: int, running_tokens: int
+        self,
+        forward_context,
+        scheduled_tokens: int,
+        running_tokens: int,
+        *,
+        running_tokens_are_unified: bool,
     ) -> None:
         """Re-point the forward context at the pass about to run.
 
@@ -559,36 +569,57 @@ class Drafter(abc.ABC):
         tokens -- not the draft's own width. Anything sizing a collective off
         the context (MoE's `pad_for_all_gather` above all) would then use the
         wrong height, so the draft states its shape here rather than letting
-        each consumer special-case `is_draft`. Both units: DP's variable-length
-        gather takes `running_tokens`, the pad needs to know how much is real.
+        each consumer special-case `is_draft`.
+
+        Both units: `scheduled_tokens` is how many rows carry a real request,
+        `running_tokens` how many the pass runs -- they differ exactly when the
+        batch was widened.
+
+        Both flags below are the caller's to answer, because this seam cannot
+        see either. `running_tokens_are_unified` claims every OTHER rank runs
+        this height too -- true where it is `context.running_bs` (`decide`'s
+        reduction) times a config width, false where it came off this rank's
+        own batch or token stream. `is_prefill` is left alone for the same
+        reason: a pass on its own `[bs, T]` shape must clear it, one carrying
+        the target's stream must not.
         """
         context = forward_context.context
         context.scheduled_tokens = scheduled_tokens
         context.running_tokens = running_tokens
         parallel_config = self.config.parallel_config
+        # A group of one is uniform whatever it runs; only the table needs peers.
         if parallel_config.data_parallel_size <= 1:
             return
-        context.dp_uniform_decode = False
+        context.running_tokens_are_unified = running_tokens_are_unified
+        # The answer travels, not the table it implies -- `make` owns both ways
+        # of reaching one, and skipping its all_reduce is why this is worth
+        # stating at all.
         forward_context.dp_metadata = DPMetadata.make(
             parallel_config,
             running_tokens,
+            unified=running_tokens_are_unified,
         )
 
     def prepare_inputs(
         self,
         scheduled_bs: int,
-        # [batch_size]
-        last_token_offset: int | torch.Tensor,
+        # [scheduled_bs] each request's anchor offset WITHIN its own segment;
+        # for a verified request that is its accepted-draft count. None ->
+        # every segment's last row, what a step that verified nothing wants.
+        anchor_in_seq: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        forward_context = get_forward_context()
-        attn_metadata = forward_context.attn_metadata
+        """Anchor row per request = its segment start + `anchor_in_seq`.
 
-        cu_seqlens_q = attn_metadata.cu_seqlens_q
-        # Only use decode sequences' cu_seqlens_q (num_rejected_tokens length
-        # matches decode sequences). cu_seqlens_q has length scheduled_bs + 1.
+        Reading forward from the start is what keeps this length-free; counting
+        back from the segment end needs the segment length, which DSpark's
+        ragged verify makes a per-request number.
+        """
+        cu_seqlens_q = get_forward_context().attn_metadata.cu_seqlens_q
         cu_seqlens_q = cu_seqlens_q[: scheduled_bs + 1]
 
-        token_indices = cu_seqlens_q[1:] - last_token_offset
+        if anchor_in_seq is None:
+            anchor_in_seq = cu_seqlens_q[1:] - cu_seqlens_q[:-1] - 1
+        token_indices = cu_seqlens_q[:-1] + anchor_in_seq
 
         # Defensive clamp to the valid flat-token range [0, total_tokens-1].
         # Under DSpark flat-ragged CUDA graph, the drain-phase corner (tiny /

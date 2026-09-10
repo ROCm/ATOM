@@ -154,6 +154,11 @@ def register_platform() -> str | None:
 
     apply_vllm_rocm_dcp_full_graph_patch()
 
+    # aiter's custom all-reduce needs vLLM's rendezvous to stay on a TCPStore.
+    from atom.plugin.vllm.dist_store_patch import apply_vllm_tcp_store_patch
+
+    apply_vllm_tcp_store_patch()
+
     # Do not call _set_plugin_mode() here. SGLang (and other stacks) discover
     # vllm.platform_plugins and would set atom's backbone to "vllm" before
     # importing SGLang plugin modules — then atom.models.qwen3_5's ``if is_vllm():``
@@ -293,6 +298,16 @@ def register_model() -> None:
     if any_updated:
         vllm_model_registry._try_load_model_cls.cache_clear()
         vllm_model_registry._try_inspect_model_cls.cache_clear()
+
+    # vLLM rejects Kimi-K3 DSpark under DCP while validating the speculative
+    # config. That validation runs later than this hook but earlier than any
+    # model is built, and unlike register_platform -- which vLLM invokes from
+    # inside its own import -- here vllm.engine is safe to import.
+    from atom.plugin.vllm.dspark_dcp_patch import (
+        apply_vllm_dspark_dcp_config_patch,
+    )
+
+    apply_vllm_dspark_dcp_config_patch()
 
     # patch attention process weights after loading
     # to avoid the specific handle in ATOM loader

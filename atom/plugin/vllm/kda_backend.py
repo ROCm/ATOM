@@ -27,6 +27,21 @@ KimiK3KDAMetadata.non_spec_state_indices_in_tensor = None
 class AtomKimiK3KDAMetadataBuilder(KimiK3KDAMetadataBuilder):
     """Adapt vLLM's KDA metadata to ATOM's request-indexed decode kernel."""
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # vLLM clamps every backend's reorder_batch_threshold to 1 under DCP
+        # unless the backend declares it handles varlen decode there. That is a
+        # statement about a *paged* cache being round-robin sharded, and KDA has
+        # none: its state is a per-request recurrent tensor that DCP leaves
+        # replicated -- only the MLA latent cache is sharded. So the clamp buys
+        # nothing here and costs a lot, reclassifying the speculative verify
+        # batch as prefill and moving KDA off its fused spec-decode path onto
+        # the chunked one, which is also the path that cannot be captured.
+        # Restore the threshold this builder picks when DCP is off.
+        self._init_reorder_batch_threshold(
+            1, self.use_spec_decode, supports_dcp_with_varlen=True
+        )
+
     def build(  # type: ignore[override]
         self,
         common_prefix_len: int,

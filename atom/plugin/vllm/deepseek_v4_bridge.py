@@ -16,6 +16,11 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
+from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
+    visible_csa,
+    visible_hca,
+)
+
 ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME = "model.layers.0.atom_deepseek_v4_proxy"
 ATOM_DEEPSEEK_V4_DRAFT_PROXY_LAYER_PREFIX = "atom_deepseek_v4_draft_proxy"
 ATOM_DEEPSEEK_V4_BLOCK_SIZE = 128
@@ -50,7 +55,9 @@ def _v4_kv_fp8(vllm_config) -> bool:
         from aiter.jit.utils.chip_info import get_gfx
 
         gfx = get_gfx()
-    except Exception:
+    # Any failure to reach aiter's chip probe means "unknown chip", which the
+    # gate below already handles; narrowing the type would guess at the build.
+    except Exception:  # noqa: BLE001
         gfx = None
     if gfx not in _V4_FP8_SUPPORTED_GFX:
         if not _V4_FP8_DOWNGRADE_WARNED:
@@ -107,7 +114,10 @@ def _v4_win_with_spec(vllm_config, window_size: int) -> int:
 
 
 def _v4_state_layout(vllm_config, kv_fp8: bool):
-    from atom.model_ops.attentions.state_arena import StateField, plan_field_planes
+    from atom.model_ops.attentions.pool_layout.entry_arena import (
+        EntryField,
+        plan_field_planes,
+    )
 
     hf = vllm_config.model_config.hf_config
     _ratios, _dense, n_csa, n_hca = _layer_counts(hf)
@@ -115,21 +125,21 @@ def _v4_state_layout(vllm_config, kv_fp8: bool):
     index_head_dim = int(getattr(hf, "index_head_dim", 128))
     ring_extra = _v4_spec_steps(vllm_config)
     fields = [
-        StateField("csa_main_kv", n_csa, (8 + ring_extra, 2 * head_dim), torch.float32),
-        StateField(
+        EntryField("csa_main_kv", n_csa, (8 + ring_extra, 2 * head_dim), torch.float32),
+        EntryField(
             "csa_main_score",
             n_csa,
             (8 + ring_extra, 2 * head_dim),
             torch.float32,
             float("-inf"),
         ),
-        StateField(
+        EntryField(
             "csa_idx_kv",
             n_csa,
             (8 + ring_extra, 2 * index_head_dim),
             torch.float32,
         ),
-        StateField(
+        EntryField(
             "csa_idx_score",
             n_csa,
             (8 + ring_extra, 2 * index_head_dim),
@@ -143,14 +153,14 @@ def _v4_state_layout(vllm_config, kv_fp8: bool):
         # flag, reads it — but two declarations of one layout disagreeing about
         # the one rule `layout_id` fences is exactly what that fence cannot
         # catch, since the id is derived from the native list alone.
-        StateField(
+        EntryField(
             "hca_main_kv",
             n_hca,
             (128 + ring_extra, head_dim),
             torch.float32,
             in_checkpoint=False,
         ),
-        StateField(
+        EntryField(
             "hca_main_score",
             n_hca,
             (128 + ring_extra, head_dim),
@@ -180,7 +190,8 @@ def _proxy_region_byte_sizes(
 
     Matches native ``allocate_per_req_cache``: both KV planes are adjacent and
     ``plan_regions``-aligned; indexer bytes follow. Inserting indexers between
-    the planes breaks ``StateArena``'s 256 B retype boundary on the RoPE plane.
+    the planes breaks ``EntryMajorArena``'s 256 B retype boundary on the RoPE
+    plane.
     """
     nope_row_bytes = head_dim * (1 if kv_fp8 else 2)
     regions = [geometry.plane_bytes(nope_row_bytes)]
@@ -196,7 +207,9 @@ def _proxy_region_byte_sizes(
 
 
 def _proxy_page_bytes(vllm_config) -> int:
-    from atom.model_ops.attentions.v4_pool_geometry import UnifiedPoolGeometry
+    from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
+        UnifiedPoolGeometry,
+    )
 
     hf = vllm_config.model_config.hf_config
     ratios, _dense, csa_layers, _hca = _layer_counts(hf)
@@ -221,7 +234,7 @@ def _proxy_page_bytes(vllm_config) -> int:
         block_size=ATOM_DEEPSEEK_V4_BLOCK_SIZE,
         arena_rows=arena_rows,
     )
-    from atom.model_ops.attentions.state_arena import plan_regions
+    from atom.model_ops.attentions.pool_layout.entry_arena import plan_regions
 
     regions = _proxy_region_byte_sizes(
         geometry=geometry,
@@ -235,7 +248,7 @@ def _proxy_page_bytes(vllm_config) -> int:
     _, total = plan_regions(regions)
     # vLLM 0.26 may pack this cache after another layer at a non-aligned
     # storage offset. Budget one-time leading slack so the runtime carve can
-    # move its first plane to the 256B boundary StateArena requires.
+    # move its first plane to the 256B boundary EntryMajorArena requires.
     total += ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT - 1
     page_bytes = (total + min_blocks - 1) // min_blocks
     if page_bytes % ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT:
@@ -262,12 +275,14 @@ def slice_deepseek_v4_proxy_cache_views(
     row_widths: list[int] | None = None,
 ) -> dict[str, object]:
     """Carve native-equivalent unified V4 planes from vLLM proxy storage."""
-    from atom.model_ops.attentions.state_arena import (
-        SplitStateArena,
-        StateArena,
+    from atom.model_ops.attentions.pool_layout.entry_arena import (
+        EntryMajorArena,
+        SplitEntryMajorArena,
         plan_regions,
     )
-    from atom.model_ops.attentions.v4_pool_geometry import UnifiedPoolGeometry
+    from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
+        UnifiedPoolGeometry,
+    )
 
     if compress_ratios is None:
         assert csa_layer_count is not None and hca_layer_count is not None
@@ -283,7 +298,7 @@ def slice_deepseek_v4_proxy_cache_views(
         raise ValueError(f"DeepSeek V4 proxy cache must be uint8, got {raw.dtype}")
     # Packed vLLM KV allocations can start an individual layer on only a 128B
     # boundary. Consume the sizing slack above so every plane and embedded
-    # StateArena starts on the 256B boundary its retyped field views require.
+    # EntryMajorArena starts on the 256B boundary its retyped field views require.
     alignment_pad = (-raw.storage_offset()) % ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT
     raw = raw[alignment_pad:]
     offset = 0
@@ -355,9 +370,9 @@ def slice_deepseek_v4_proxy_cache_views(
     if arena_planes is None or row_widths is None:
         arena = None
     else:
-        arena = SplitStateArena(
+        arena = SplitEntryMajorArena(
             [
-                StateArena(
+                EntryMajorArena(
                     fields,
                     geometry.slot_positions,
                     proxy_kv_cache.device,
@@ -524,7 +539,9 @@ class AtomDeepseekV4ProxyMetadataBuilder(AttentionMetadataBuilder):
                 )
 
                 req_ids = get_current_req_ids()
-            except Exception:
+            # vLLM's accessor is optional and version-dependent; absent ids are
+            # the caller's ordinary "no ids" case.
+            except Exception:  # noqa: BLE001
                 req_ids = None
         md = build_atom_v4_attention_metadata(
             common_attn_metadata,
@@ -725,9 +742,9 @@ def _v4_round_to_cudagraph_bucket(n: int, sizes) -> int:
     ``positions``/hidden states padded to a piecewise capture-size bucket
     (fixed shapes are required to replay the captured piecewise regions). The
     fused decode ``qk_norm_rope`` reads ``T = positions.shape[0]`` (the padded
-    forward width) and asserts ``len(batch_id_per_token) >= T``; if the V4
+    forward width) and asserts ``len(batch_id_per_q_token) >= T``; if the V4
     decode metadata is sized to the unpadded count the padded tail tokens read
-    ``batch_id_per_token`` out of bounds (illegal access / launch failure under
+    ``batch_id_per_q_token`` out of bounds (illegal access / launch failure under
     load). Rounding the decode token-pad count up to the same bucket vLLM pads
     the forward to keeps the ``batch_id == -1`` sentinel tail long enough to
     cover those padded rows. Batches larger than the max capture size run eager
@@ -793,13 +810,12 @@ class _V4DecodeMetaBuffers:
         self.state_slot_in = i32(S)
         self.state_slot_out = i32(S)
         self.n_csa = i32(S)
-        self.n_hca = i32(S)
         # Per-token mapping (sized to padded token count). int32: accepted by
         # torch advanced-indexing AND by the fused flydsl SWA scatter (which
         # loads batch_id as int32); matches the in-tree model_runner path.
         self.batch_id = CpuGpuBuffer(T, dtype=torch.int32, device=device)
         self.swa_dest_rows = {ratio: i32(T) for ratio in _V4_SWA_DEST_RATIOS}
-        self.n_committed_per_token = i32(T)
+        self.csa_n_committed_per_token = i32(T)
         self.block_tables_per_token = i32(T, self.max_blocks)
         # Ragged cumsums (T + 1) and ragged index pools (worst-case per-token
         # slot counts): SWA = win, CSA = win + index_topk, HCA = win + hca.
@@ -905,7 +921,7 @@ def bind_deepseek_v4_proxy_cache_views(
     if raw.storage_offset() % 256:
         raise RuntimeError(
             f"DeepSeek V4 proxy KV storage offset {raw.storage_offset()} is not "
-            "256B-aligned; StateArena cannot retype carved planes safely"
+            "256B-aligned; EntryMajorArena cannot retype carved planes safely"
         )
     views = slice_deepseek_v4_proxy_cache_views(
         proxy.kv_cache,
@@ -1268,11 +1284,10 @@ class _V4StateSlotAllocator:
             if victim_seen is None or self._last_seen[s] < victim_seen:
                 victim = s
                 victim_seen = self._last_seen[s]
-        if victim < 0:
-            # All slots belong to requests active this step: only possible if
-            # concurrency exceeds num_slots, which vLLM forbids. Fall back to
-            # slot 0 rather than crash.
-            victim = 0
+        # A negative victim means every slot belongs to a request active this
+        # step, which needs concurrency above num_slots and vLLM forbids it.
+        # Slot 0 rather than a crash.
+        victim = max(victim, 0)
         old = self._slot_to_key[victim]
         if old is not None:
             self._key_to_slot.pop(old, None)
@@ -1402,7 +1417,7 @@ def build_atom_v4_attention_metadata(
     # count unpadded (PIECEWISE decode: ``pad_attn`` is FULL-only). Size the
     # decode token-pad (and thus the ``batch_id == -1`` sentinel tail) to that
     # same bucket so the fused decode ``qk_norm_rope`` never reads
-    # ``batch_id_per_token`` past its end for the padded tail rows.
+    # ``batch_id_per_q_token`` past its end for the padded tail rows.
     if is_decode:
         T_pad = _v4_round_to_cudagraph_bucket(T_pad, cudagraph_token_sizes)
 
@@ -1449,10 +1464,7 @@ def build_atom_v4_attention_metadata(
     md.reset_slots = {md.pool_geometry.physical_slot(int(slot)) for slot in reset_slots}
 
     n_csa_cpu = (seq_np // 4).astype(np.int32)
-    n_hca_cpu = (seq_np // 128).astype(np.int32)
     md.n_committed_csa_per_seq_cpu = n_csa_cpu
-    md.n_committed_hca_per_seq_cpu = n_hca_cpu
-    md.batch_id_per_token_cpu = batch_np
     index_topk = int(md.index_topk)
 
     if decode_persistent:
@@ -1470,16 +1482,14 @@ def build_atom_v4_attention_metadata(
             bufs.batch_id.np[:total] = batch_np
         if T_pad > total:
             bufs.batch_id.np[total:T_pad] = -1
-        md.batch_id_per_token = bufs.batch_id.copy_to_gpu(T_pad)
+        md.batch_id_per_q_token = bufs.batch_id.copy_to_gpu(T_pad)
         # Pad CSA committed count with index_topk (aiter top_k_per_row_decode
         # derives a per-row length from this for the whole captured grid; a
         # stale/zero value on a pad row can make that length negative -> hang).
         bufs.n_csa.np[:num_reqs] = n_csa_cpu
         if num_reqs > scheduled_bs:
             bufs.n_csa.np[scheduled_bs:num_reqs] = index_topk
-        bufs.n_hca.np[:num_reqs] = n_hca_cpu
         md.n_committed_csa_per_seq = bufs.n_csa.copy_to_gpu(num_reqs)
-        md.n_committed_hca_per_seq = bufs.n_hca.copy_to_gpu(num_reqs)
         md.compress_plans = _make_decode_compress_plans(
             lens[:scheduled_bs], seq_np[:scheduled_bs], bufs
         )
@@ -1497,13 +1507,13 @@ def build_atom_v4_attention_metadata(
             pos_np = np.zeros(0, dtype=np.int32)
         visible_np = np.zeros(T_pad, dtype=np.int32)
         if total:
-            visible_np[:total] = np.minimum(
-                (pos_np + 1) // 4, n_csa_cpu[batch_np]
-            ).astype(np.int32)
-        md.n_committed_per_token = bufs.stage(bufs.n_committed_per_token, visible_np)
+            visible_np[:total] = visible_csa(pos_np).astype(np.int32)
+        md.csa_n_committed_per_token = bufs.stage(
+            bufs.csa_n_committed_per_token, visible_np
+        )
         block_cols = int(common_attn_metadata.block_table_tensor.shape[1])
         block_rows = bufs.block_tables_per_token.gpu[:T_pad, :block_cols]
-        safe_batch_ids = md.batch_id_per_token[:T_pad].clamp_min(0).long()
+        safe_batch_ids = md.batch_id_per_q_token[:T_pad].clamp_min(0).long()
         torch.index_select(
             common_attn_metadata.block_table_tensor,
             0,
@@ -1514,10 +1524,8 @@ def build_atom_v4_attention_metadata(
         _populate_decode_persistent(
             md,
             common_attn_metadata,
-            batch_np,
             pos_np,
             bufs,
-            scheduled_bs,
             total,
             T_pad,
             positions,
@@ -1528,7 +1536,7 @@ def build_atom_v4_attention_metadata(
             "total_committed": 0,
             "cu_committed_gpu": None,
             "n_committed_per_seq_gpu": md.n_committed_csa_per_seq,
-            "batch_id_per_token_gpu": md.batch_id_per_token,
+            "batch_id_per_q_token": md.batch_id_per_q_token,
             "seq_base_per_token_gpu": None,
             "cu_starts_gpu": None,
             "cu_ends_gpu": None,
@@ -1555,9 +1563,8 @@ def build_atom_v4_attention_metadata(
     md.state_slot_out_cpu = physical_slot_arr
     md.state_slot_mapping = md.state_slot_out
     md.state_slot_mapping_cpu = physical_slot_arr
-    md.batch_id_per_token = torch.from_numpy(batch_np).to(device)
+    md.batch_id_per_q_token = torch.from_numpy(batch_np).to(device)
     md.n_committed_csa_per_seq = torch.from_numpy(n_csa_cpu).to(device)
-    md.n_committed_hca_per_seq = torch.from_numpy(n_hca_cpu).to(device)
     md.compress_plans = _make_compress_plans(
         lens, seq_np, [(4, True), (128, False)], device, is_decode
     )
@@ -1566,8 +1573,8 @@ def build_atom_v4_attention_metadata(
         positions = torch.arange(total, dtype=torch.int64, device=device)
     pos_np = positions[:total].detach().cpu().numpy().astype(np.int32)
     if is_decode:
-        visible_np = np.minimum((pos_np + 1) // 4, n_csa_cpu[batch_np]).astype(np.int32)
-        md.n_committed_per_token = torch.from_numpy(visible_np).to(device)
+        visible_np = visible_csa(pos_np).astype(np.int32)
+        md.csa_n_committed_per_token = torch.from_numpy(visible_np).to(device)
         batch_ids = torch.from_numpy(batch_np).to(device=device, dtype=torch.long)
         md.block_tables_per_token = common_attn_metadata.block_table_tensor[batch_ids]
         _populate_decode(md, common_attn_metadata, batch_np, pos_np, positions)
@@ -1654,9 +1661,7 @@ def _make_decode_compress_plans(extend_lens_cpu, context_lens_cpu, bufs):
     )
 
 
-def _populate_decode_persistent(
-    md, common, batch_np, pos_np, bufs, scheduled_bs, total, T_pad, positions_gpu
-):
+def _populate_decode_persistent(md, common, pos_np, bufs, total, T_pad, positions_gpu):
     """Decode index/indptr build into persistent fixed-address buffers.
 
     Faithful port of ATOM's ``_attach_v4_paged_decode_meta`` for plugin mode:
@@ -1674,15 +1679,11 @@ def _populate_decode_persistent(
 
     win = int(md.swa_window)
     index_topk = int(md.index_topk)
-    n_csa_cpu = md.n_committed_csa_per_seq_cpu
-    n_hca_cpu = md.n_committed_hca_per_seq_cpu
 
     # Per-token slot counts over the real tokens [0:total].
     actual_swa = np.minimum(pos_np + 1, win).astype(np.int32)
-    csa_valid_k = np.minimum(
-        np.minimum((pos_np + 1) // 4, n_csa_cpu[batch_np]), index_topk
-    ).astype(np.int32)
-    n_h_per_token = n_hca_cpu[batch_np].astype(np.int32)
+    csa_valid_k = np.minimum(visible_csa(pos_np), index_topk).astype(np.int32)
+    n_h_per_token = visible_hca(pos_np).astype(np.int32)
 
     def _indptr(counts):
         out = np.zeros(T_pad + 1, dtype=np.int32)
@@ -1712,7 +1713,7 @@ def _populate_decode_persistent(
     dest_rows = {ratio: buf.gpu for ratio, buf in bufs.swa_dest_rows.items()}
     write_v4_paged_decode_indices(
         state_slot_per_seq=md.state_slot_out,
-        batch_id_per_token=md.batch_id_per_token,
+        batch_id_per_q_token=md.batch_id_per_q_token,
         positions=positions_gpu,
         swa_indptr=swa_indptr_gpu,
         csa_indptr=csa_indptr_gpu,
@@ -1726,10 +1727,9 @@ def _populate_decode_persistent(
         geometry=md.pool_geometry,
     )
     write_v4_decode_hca_compress_tail(
-        batch_id_per_token=md.batch_id_per_token,
+        batch_id_per_q_token=md.batch_id_per_q_token,
         positions=positions_gpu,
         hca_indptr=hca_indptr_gpu,
-        n_committed_hca_per_seq=md.n_committed_hca_per_seq,
         block_tables=common.block_table_tensor,
         hca_indices=bufs.idx_hca.gpu,
         T=total,
@@ -1770,22 +1770,19 @@ def _populate_indexer(
     cu[-1] = max(int(cu[-1]), 1)
     cu_gpu = torch.from_numpy(cu).to(device)
     # Per-prefill-token batch id, rebased to 0-based prefill-seq indexing.
-    bid = (md.batch_id_per_token[num_decode_tokens:] - num_decodes).to(
-        md.batch_id_per_token.dtype
+    bid = (md.batch_id_per_q_token[num_decode_tokens:] - num_decodes).to(
+        md.batch_id_per_q_token.dtype
     )
-    n_committed_pref = md.n_committed_csa_per_seq[num_decodes:]
     pos_pref = positions[num_decode_tokens:]
     base = cu_gpu[bid].to(torch.int32)
-    end = base + torch.minimum((pos_pref + 1) // 4, n_committed_pref[bid]).to(
-        torch.int32
-    )
+    end = base + visible_csa(pos_pref).to(torch.int32)
     md.indexer_meta = {
         "total_committed": int(cu[-1]),
         "cu_committed_gpu": cu_gpu,
         # FULL per-seq committed (decode-first order): the decode sub-call
         # slices [:num_decodes]; the pure-decode path reads it whole.
         "n_committed_per_seq_gpu": md.n_committed_csa_per_seq,
-        "batch_id_per_token_gpu": md.batch_id_per_token,
+        "batch_id_per_q_token": md.batch_id_per_q_token,
         "seq_base_per_token_gpu": base,
         "cu_starts_gpu": base,
         "cu_ends_gpu": end,
@@ -1871,17 +1868,10 @@ def _populate_prefill(md, common, batch_np, pos_np, q_np, positions_gpu):
     swa_low = np.maximum(pos_np - win + 1, 0)
     extend_count = np.minimum(token_pos_in_chunk + 1, win).astype(np.int32)
     prefix_swa_count = np.maximum(chunk_start_pt - swa_low, 0).astype(np.int32)
-    n_csa_pt = md.n_committed_csa_per_seq_cpu[batch_np]
-    csa_valid_k = np.minimum(
-        np.minimum((pos_np + 1) // 4, n_csa_pt), index_topk
-    ).astype(np.int32)
-    # Per-token causal cap, mirroring CSA above and the kernel
-    # (write_v4_paged_prefill_indices: n_hca = min((pos+1)//128, committed)).
-    # Without it the indptr reserves `committed` HCA slots but the kernel only
-    # writes min((pos+1)//128, committed), leaving uninitialized tail garbage.
-    n_hca_pt = np.minimum(
-        (pos_np + 1) // 128, md.n_committed_hca_per_seq_cpu[batch_np]
-    ).astype(np.int32)
+    # These SIZE each slice; `write_v4_paged_prefill_indices` FILLS it from the
+    # same two counts. Reserve exactly what it writes or the tail is garbage.
+    csa_valid_k = np.minimum(visible_csa(pos_np), index_topk).astype(np.int32)
+    n_hca_pt = visible_hca(pos_np).astype(np.int32)
 
     ext_indptr_np = _counts_to_indptr(extend_count)
     swa_indptr_np = _counts_to_indptr(prefix_swa_count)
@@ -1910,16 +1900,12 @@ def _populate_prefill(md, common, batch_np, pos_np, q_np, positions_gpu):
         np.ascontiguousarray(md.chunk_start_per_seq_cpu[:num_reqs])
     ).to(device)
     cu_q_g = torch.from_numpy(np.ascontiguousarray(q_np[:num_reqs])).to(device)
-    n_hca_seq_g = torch.from_numpy(
-        np.ascontiguousarray(md.n_committed_hca_per_seq_cpu[:num_reqs])
-    ).to(device)
     write_v4_paged_prefill_indices(
         positions=positions_gpu[:T].to(torch.int32),
-        bid_per_token=md.batch_id_per_token[:T],
+        bid_per_token=md.batch_id_per_q_token[:T],
         chunk_start_per_seq=chunk_start_g,
         cu_seqlens_q_per_seq=cu_q_g,
         state_slot_per_seq=md.state_slot_out[:num_reqs],
-        n_committed_hca_per_seq=n_hca_seq_g,
         block_tables=common.block_table_tensor[:num_reqs],
         extend_indptr=ext_indptr,
         prefix_swa_indptr=swa_indptr,
@@ -1951,11 +1937,8 @@ def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
     win = int(md.swa_window)
     index_topk = int(md.index_topk)
     swa_counts = np.minimum(pos_np + 1, win).astype(np.int32)
-    csa_counts = np.minimum(
-        np.minimum((pos_np + 1) // 4, index_topk),
-        md.n_committed_csa_per_seq_cpu[batch_np],
-    ).astype(np.int32)
-    hca_counts = md.n_committed_hca_per_seq_cpu[batch_np].astype(np.int32)
+    csa_counts = np.minimum(visible_csa(pos_np), index_topk).astype(np.int32)
+    hca_counts = visible_hca(pos_np).astype(np.int32)
     swa_indptr_np = _counts_to_indptr(swa_counts)
     csa_indptr_np = _counts_to_indptr(swa_counts + csa_counts)
     hca_indptr_np = _counts_to_indptr(swa_counts + hca_counts)
@@ -1982,7 +1965,7 @@ def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
     }
     write_v4_paged_decode_indices(
         state_slot_per_seq=md.state_slot_out,
-        batch_id_per_token=md.batch_id_per_token,
+        batch_id_per_q_token=md.batch_id_per_q_token,
         positions=positions_gpu,
         swa_indptr=swa_indptr,
         csa_indptr=csa_indptr,
@@ -1996,10 +1979,9 @@ def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
         geometry=md.pool_geometry,
     )
     write_v4_decode_hca_compress_tail(
-        batch_id_per_token=md.batch_id_per_token,
+        batch_id_per_q_token=md.batch_id_per_q_token,
         positions=positions_gpu,
         hca_indptr=hca_indptr,
-        n_committed_hca_per_seq=md.n_committed_hca_per_seq,
         block_tables=common.block_table_tensor,
         hca_indices=hca_indices,
         T=T,
@@ -2070,7 +2052,9 @@ def _is_vllm_decode_graph_phase(attn_metadata, atom_config) -> bool:
         if not (is_uniform_decode_bucket or is_single_query_decode):
             return False
         return bool(getattr(vllm_monitor, "cudagraph_capturing_enabled", False))
-    except Exception:
+    # A predicate over another engine's internals: anything it raises means
+    # "cannot tell", and the safe answer to that is False.
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -2162,7 +2146,17 @@ def atom_deepseek_v4_forward_context(
         scheduled_tokens=int(input_ids.shape[0]) if input_ids is not None else 0,
         running_bs=batch_size,
         running_tokens=running_tokens_from_bs(
-            batch_size, is_prefill=is_prefill, attn_metadata=attn_metadata
+            batch_size,
+            is_prefill=is_prefill,
+            # A `force_dummy` forward profiles memory on a throwaway batch, and
+            # its `attn_metadata` is the bare namespace built above -- `state`
+            # and `in_hipgraph` only, deliberately, because building real
+            # metadata here allocates and copies, which HIP forbids under
+            # stream capture. It therefore carries no sequence length, and
+            # there is no height to derive from it. Hand the helper the `None`
+            # it already documents as "count only", which is exactly the
+            # `graph_bs=batch_size` this call replaced.
+            attn_metadata=None if force_dummy else attn_metadata,
         ),
         input_ids=input_ids,
     )
