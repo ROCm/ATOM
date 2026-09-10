@@ -273,6 +273,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT", "1") == "1"
     ),
     # --- Profiling & Logging ---
+    "ATOM_ENABLE_METRICS_DEVICE_TIMER": lambda: os.getenv(
+        "ATOM_ENABLE_METRICS_DEVICE_TIMER", "0"
+    )
+    == "1",
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     # Move the startup heap (model, compiled graph, tokenizer, KV block pool)
     # into CPython's permanent generation once warmup is done, so collections

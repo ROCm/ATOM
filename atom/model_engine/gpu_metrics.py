@@ -65,26 +65,25 @@ class GPUForwardMetrics:
         return states
 
     def poll(self):
-        # query() never waits for the GPU. Different streams can complete out
-        # of order; retain unready pairs without blocking completed samples.
-        for _ in range(len(self.pending)):
-            phase, start, end, requests = self.pending.popleft()
-            if end.query():
-                seconds = start.elapsed_time(end) / 1000
-                self.histograms[phase].observe(seconds)
-                for state in requests:
-                    state.pending -= 1
-                    if not state.valid:
-                        continue
-                    state.total += seconds
-                    # Last chunk can finish on a different stream before earlier
-                    # events are ready. Publish only once every chunk is measured.
-                    if state.final and state.pending == 0:
-                        self.prefill_requests.observe(state.total)
-                        del self.requests[state.req_id]
-                self.free.append((start, end))
-            else:
-                self.pending.append((phase, start, end, requests))
+        # Stop at the first unfinished event instead of scanning the backlog.
+        # Other streams may finish sooner; their samples wait for the head.
+        while self.pending:
+            phase, start, end, requests = self.pending[0]
+            if not end.query():
+                break
+            self.pending.popleft()
+            seconds = start.elapsed_time(end) / 1000
+            self.histograms[phase].observe(seconds)
+            for state in requests:
+                state.pending -= 1
+                if not state.valid:
+                    continue
+                state.total += seconds
+                # Publish only once every chunk has been measured.
+                if state.final and state.pending == 0:
+                    self.prefill_requests.observe(state.total)
+                    del self.requests[state.req_id]
+            self.free.append((start, end))
 
     @contextmanager
     def measure(self, batch):

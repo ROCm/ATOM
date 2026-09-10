@@ -377,7 +377,11 @@ class ScheduledBatch:
         # Freeze request chunk boundaries before schedule-time advancement.
         # Workers receive copies of the batch, not the mutable Sequence objects.
         self.prefill_gpu_requests = []
-        if not is_dummy_run and total_seqs_num_prefill:
+        if (
+            not is_dummy_run
+            and total_seqs_num_prefill
+            and envs.ATOM_ENABLE_METRICS_DEVICE_TIMER
+        ):
             for i, seq in enumerate(seqs.values()):
                 if i < total_seqs_num_decode or seq.prefill_gpu_complete:
                     continue

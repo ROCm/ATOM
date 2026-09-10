@@ -4,6 +4,13 @@ Agentic PD benchmarks (`benchmark.kind: aiperf_agentic`) automatically collect
 metrics and generate an offline HTML report for each concurrency setting. No
 additional workflow input or long-running monitoring server is required.
 
+GPU event timing is disabled by default in ATOM. Agentic CI sets
+`ATOM_ENABLE_METRICS_DEVICE_TIMER=1` on the prefill and decode services so their
+GPU panels have data. Set `env.common.ATOM_ENABLE_METRICS_DEVICE_TIMER: "0"` in the job
+configuration to disable it; GPU panels then have no samples. Other metrics
+remain available. Event polling stops at the first unfinished event and reuses
+completed pairs, with at most 256 pending pairs per worker and no GPU synchronization.
+
 Each matrix job uploads its own `atomesh-latency-<matrix-id>-<attempt>` artifact.
 The job summary contains **Download HTML reports and data**. Download and extract
 that artifact, then open a `report.html` file. GitHub Actions summaries cannot
