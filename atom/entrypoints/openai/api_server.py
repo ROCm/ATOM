@@ -24,7 +24,8 @@ import time
 import urllib.request
 import uuid
 from asyncio import AbstractEventLoop
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -42,10 +43,14 @@ from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.multimodal import build_multimodal_inputs
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import new_token_ids
+from atom.utils import envs
 from atom.utils.arg_parser import FlexibleArgumentParser
 from atom.utils.gc_utils import (
+    arm_reclaim_watch,
     freeze_gc_heap,
+    gc_census,
     maybe_attach_gc_debug_callback,
+    reclaim_watch,
     tune_gc,
 )
 
@@ -74,6 +79,7 @@ from .reasoning import (
     thinking_switched_off,
 )
 from .reasoning_dialects import resolve_dialect
+from .request_timing import RequestTimingMiddleware, record_nonstream_first_token
 from .serving_anthropic import (
     AnthropicBlocks,
     AnthropicMessagesRequest,
@@ -110,6 +116,7 @@ from .streaming_dispatch import (
     FrameWait,
     StreamBatchDispatcher,
     StreamOutputCollector,
+    enable_delta_reuse,
 )
 from .tool_parser import (
     ToolCallStreamParser,
@@ -356,8 +363,19 @@ _ANTHROPIC_PING_FRAME = event_frame("ping", {"type": "ping"})
 # timeouts, which are tens of seconds.
 _ANTHROPIC_PING_INTERVAL_SECONDS = 5.0
 _metrics_exporter = AtomMetricsExporter()
-_metrics_refresh_task: asyncio.Task | None = None
+_background_tasks: list[asyncio.Task] = []
 _METRICS_REFRESH_INTERVAL_SECONDS = 5.0
+# The watch compares two `gc.get_stats()` reads against something that moves on
+# the scale of minutes, so it has no reason to ride the metrics cadence.
+_GC_WATCH_INTERVAL_SECONDS = 60.0
+
+# Not the default pool: that one runs every request's prompt preprocessing, so
+# a curl loop against `/debug/gc_census` would fill it with heap walks and block
+# admission. One worker is also the single-flight -- each walk pins a gen-2
+# snapshot. Starts no thread until first submit, and is never shut down: the
+# interpreter joins it at exit, while a per-app teardown would leave the
+# endpoint dead if the app ever restarted in-process.
+_gc_census_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gc-census")
 
 
 def _get_dp_session_affinity_ids(
@@ -659,7 +677,7 @@ def _load_image_from_url(url: str) -> "Image.Image":
 
 
 def _get_multimodal_processor():
-    global processor, model_name
+    global processor
     if processor is None:
         logger.info(f"Loading multimodal processor from {model_name}...")
         processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
@@ -924,6 +942,7 @@ async def generate_async(
             if token_ids:
                 if first_token_at is None:
                     first_token_at = item.get("ts", time.time())
+                    record_nonstream_first_token()
                 last_token_at = item.get("ts", time.time())
                 all_token_ids.extend(token_ids)
             if item.get("finished", False):
@@ -1036,6 +1055,7 @@ async def generate_async_multimodal(
             if token_ids_out:
                 if first_token_at is None:
                     first_token_at = item.get("ts", time.time())
+                    record_nonstream_first_token()
                 last_token_at = item.get("ts", time.time())
                 all_token_ids.extend(token_ids_out)
             if item.get("finished", False):
@@ -1092,7 +1112,6 @@ async def generate_async_fanout(
     :func:`generate_async` yields for n==1, so response builders can treat
     each entry the same way.
     """
-    global engine, tokenizer
 
     n = int(sampling_params.n)
     assert n >= 1
@@ -1160,6 +1179,7 @@ async def generate_async_fanout(
             if tokens:
                 if per_first_token_at[idx] is None:
                     per_first_token_at[idx] = item.get("ts", time.time())
+                    record_nonstream_first_token()
                 per_last_token_at[idx] = item.get("ts", time.time())
                 per_tokens[idx].extend(tokens)
             if item.get("finished", False):
@@ -1519,55 +1539,86 @@ async def setup_streaming_request_fanout(
 
 
 async def _refresh_metrics_once() -> None:
+    """Take one snapshot from the engine and publish it.
+
+    Owns its own accounting: `metrics_refresh_errors` means "the exported
+    series are stale", which is this function not completing and nothing else.
+    """
     if engine is None:
         return
     try:
         # A local read of the snapshots EngineCore pushes, so it runs inline on
         # the loop -- no executor thread, and no writer on the control socket.
-        snapshot = engine.get_metrics_statistics()
-    except asyncio.CancelledError:
-        raise
+        _metrics_exporter.update(engine.get_metrics_statistics())
     except Exception:
         _metrics_exporter.record_refresh_error()
         logger.warning("Failed to refresh Prometheus metrics", exc_info=True)
-    else:
-        _metrics_exporter.update(snapshot)
 
 
-async def _metrics_refresh_loop() -> None:
+async def _reclaim_watch_once() -> None:
+    """Check whether this process's collector has started finding cycles."""
+    reclaim_watch("api_server")
+
+
+async def _periodic(interval: float, step: Callable[[], Awaitable[None]]) -> None:
+    """Run `step` on a fixed cadence for the life of the process.
+
+    The guard is the point, and there is one copy of it because that is the
+    invariant a second copy loses. Nothing awaits these tasks until shutdown,
+    so an exception escaping here is silent: asyncio records "never retrieved"
+    and the job stops, leaving whatever it maintained frozen at its last value
+    and still being served.
+
+    `CancelledError` needs no clause -- it is a BaseException, so shutdown
+    stops these regardless.
+    """
     while True:
-        await asyncio.sleep(_METRICS_REFRESH_INTERVAL_SECONDS)
-        await _refresh_metrics_once()
+        await asyncio.sleep(interval)
+        try:
+            await step()
+        except Exception:
+            logger.warning("%s failed", step.__name__, exc_info=True)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown."""
-    global _metrics_refresh_task
     logger.info("Server started successfully and ready to accept requests")
     tune_gc()
     maybe_attach_gc_debug_callback("api_server")
     await _refresh_metrics_once()
-    _metrics_refresh_task = asyncio.create_task(_metrics_refresh_loop())
     # The engine was built in `main()`, so this is the last point before the
     # first request at which everything reachable is still startup state.
     freeze_gc_heap("api_server")
+    # After the freeze, or the baseline carries startup's own collections.
+    arm_reclaim_watch()
+    _background_tasks[:] = [
+        asyncio.create_task(_periodic(interval, step), name=step.__name__)
+        for interval, step in (
+            (_METRICS_REFRESH_INTERVAL_SECONDS, _refresh_metrics_once),
+            (_GC_WATCH_INTERVAL_SECONDS, _reclaim_watch_once),
+        )
+    ]
     try:
         yield
     finally:
-        if _metrics_refresh_task is not None:
-            _metrics_refresh_task.cancel()
-            try:
-                await _metrics_refresh_task
-            except asyncio.CancelledError:
-                pass
-            _metrics_refresh_task = None
+        for task in _background_tasks:
+            task.cancel()
+        # `gather` rather than suppressing `CancelledError` around each await:
+        # that swallows a cancellation aimed at shutdown itself, which makes
+        # shutdown the thing that cannot be stopped.
+        await asyncio.gather(*_background_tasks, return_exceptions=True)
+        _background_tasks.clear()
         logger.info("Server shutting down, releasing resources...")
         if engine is not None:
             engine.close()
 
 
 app = FastAPI(title="ATOM OpenAI API Server", lifespan=lifespan)
+app.add_middleware(
+    RequestTimingMiddleware,
+    observe_ttft=_metrics_exporter.observe_time_to_first_token,
+)
 
 
 # ---- Error handlers ----
@@ -1608,7 +1659,6 @@ async def general_error_handler(request: Request, exc: Exception):
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest, raw_request: Request):
     """Handle chat completion requests (OpenAI-compatible)."""
-    global engine, tokenizer, model_name
 
     validate_model(request.model)
 
@@ -1872,7 +1922,6 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
 @app.post("/v1/completions")
 async def completions(request: CompletionRequest, raw_request: Request):
     """Handle text completion requests (OpenAI-compatible)."""
-    global engine, tokenizer, model_name
 
     validate_model(request.model)
 
@@ -2387,6 +2436,31 @@ async def get_cache_stats():
         ) from e
 
 
+@app.get("/debug/gc_census")
+async def get_gc_census(top: int = 30, types_per_owner: int = 2):
+    """Break the collector's scan set down by type, for this process.
+
+    Frontend-local on purpose: the engine and the workers each have their own
+    interpreter and their own answer, and it is this process whose scan set
+    grows with in-flight streams.
+
+    In a thread because the walk is seconds long at a serving heap and this
+    loop is the one delivering every open SSE stream -- inline, one GET would
+    stall token delivery for all of them, on a server whose product is
+    inter-token latency. The GIL still makes it a pause; it becomes one the
+    loop can interleave around rather than a single blocking call.
+    """
+    try:
+        return await asyncio.get_running_loop().run_in_executor(
+            _gc_census_executor, gc_census, top, types_per_owner
+        )
+    except Exception as e:
+        logger.exception("Failed to take a GC census")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to take a GC census: {e}"
+        ) from e
+
+
 def _resolve_kv_transfer_role(kv_cfg: dict) -> tuple[str | None, int]:
     kv_role = kv_cfg.get("kv_role")
     handshake_port = kv_cfg.get("handshake_port", 6301)
@@ -2631,7 +2705,16 @@ def main():
             SYNTHETIC_TOKEN_TEXT,
         )
     _stream_batch_dispatcher = StreamBatchDispatcher(
-        tokenizer, synthetic_text=synthetic_token_text
+        tokenizer,
+        synthetic_text=synthetic_token_text,
+        observe_inter_token_latency=_metrics_exporter.observe_inter_token_latency,
+    )
+    # Here and not in the dispatcher's constructor: it replays a few thousand
+    # updates, which every test that builds a dispatcher would then pay for.
+    enable_delta_reuse(
+        tokenizer,
+        envs.ATOM_DETOKENIZER_DELTA_REUSE,
+        envs.ATOM_DETOKENIZER_AUDIT_EVERY,
     )
 
     # Wire the batched stream-flush hook: per-seq stream callbacks only buffer

@@ -14,11 +14,16 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
+from collections import deque
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 import torch
 
+from atom.kv_transfer.disaggregation.types import SaveOperationId, SaveSourceGroupId
 from atom.kv_transfer.offload.atom_lmcache_staging import (
     _env_flag,
     _env_int,
@@ -70,6 +75,8 @@ def _cdiv(a: int, b: int) -> int:
 @dataclass(frozen=True)
 class _TransferChunk:
     memory_obj: Any
+    start: int
+    end: int
     block_ids: list[int]
     tensor: torch.Tensor
     nbytes: int
@@ -79,6 +86,82 @@ class _TransferChunk:
 class _TransferGroup:
     chunks: list[_TransferChunk]
     nbytes: int
+
+
+class _SourceSafeEventPoller:
+    """Poll staging-group CUDA events without synchronizing the save thread."""
+
+    def __init__(
+        self,
+        device: torch.device,
+        callback: Callable[[SaveSourceGroupId], None],
+    ) -> None:
+        self._device = device
+        self._callback = callback
+        self._pending = deque()
+        self._condition = threading.Condition()
+        self._thread: threading.Thread | None = None
+        self._closed = False
+
+    def submit(self, event, identities: tuple[SaveSourceGroupId, ...]) -> None:
+        with self._condition:
+            if self._closed:
+                return
+            self._pending.append((event, identities))
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run,
+                    name="offload-source-safe",
+                    daemon=True,
+                )
+                self._thread.start()
+            self._condition.notify()
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while not self._pending and not self._closed:
+                    self._condition.wait()
+                if not self._pending:
+                    return
+                event, identities = self._pending[0]
+            try:
+                with torch.cuda.device(self._device):
+                    ready = bool(event.query())
+            except Exception:
+                # An unqueryable event is not evidence of source safety. Leave
+                # release to the scheduler's conservative abandon timeout.
+                logger.exception(
+                    "ATOM LMCache connector: source-safe event query failed"
+                )
+                with self._condition:
+                    if self._pending and self._pending[0][0] is event:
+                        self._pending.popleft()
+                continue
+            if not ready:
+                time.sleep(0.001)
+                continue
+            with self._condition:
+                if self._pending and self._pending[0][0] is event:
+                    self._pending.popleft()
+            for identity in identities:
+                try:
+                    self._callback(identity)
+                except Exception:
+                    logger.exception(
+                        "ATOM LMCache connector: source-safe callback failed for %s",
+                        identity,
+                    )
+
+    def close(self) -> None:
+        """Drain ready events after save workers stop, then retire the poller."""
+
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout=1.0)
 
 
 class BlockGPUConnector:
@@ -91,6 +174,7 @@ class BlockGPUConnector:
         *,
         chunk_size: int | None = None,
         virtual_block_size: int | None = None,
+        source_safe_callback: Callable[[SaveSourceGroupId], None] | None = None,
     ) -> None:
         self.codec = codec
         self.physical_block_size = int(block_size)
@@ -134,6 +218,12 @@ class BlockGPUConnector:
             )
         self.device = torch.device(codec.device)
         self._tls = threading.local()
+        self._source_safe_callback = source_safe_callback
+        self._source_safe_poller = (
+            _SourceSafeEventPoller(self.device, source_safe_callback)
+            if source_safe_callback is not None and self._use_cuda()
+            else None
+        )
         # A tensor is held here only when stream synchronization failed, so
         # freeing it could race still-running GPU work. Each failed pipeline
         # recovery adds at most one tensor; healthy devices fence successfully
@@ -179,6 +269,10 @@ class BlockGPUConnector:
     @property
     def release_gpu_staging_after_transfer(self) -> bool:
         return self._release_gpu_staging_after_transfer
+
+    def close(self) -> None:
+        if self._source_safe_poller is not None:
+            self._source_safe_poller.close()
 
     def _use_cuda(self) -> bool:
         return self.device.type == "cuda"
@@ -317,9 +411,13 @@ class BlockGPUConnector:
         self,
         memory_objs: list[Any],
         block_id_groups: list[list[int]],
+        starts: list[int],
+        ends: list[int],
     ) -> list[_TransferChunk]:
         chunks: list[_TransferChunk] = []
-        for memory_obj, block_ids in zip(memory_objs, block_id_groups, strict=True):
+        for memory_obj, block_ids, start, end in zip(
+            memory_objs, block_id_groups, starts, ends, strict=True
+        ):
             block_count = len(block_ids)
             if block_count == 0:
                 continue
@@ -337,6 +435,8 @@ class BlockGPUConnector:
             chunks.append(
                 _TransferChunk(
                     memory_obj=memory_obj,
+                    start=int(start),
+                    end=int(end),
                     block_ids=block_ids,
                     tensor=memory_object_as_uint8(memory_obj, nbytes),
                     nbytes=nbytes,
@@ -395,9 +495,24 @@ class BlockGPUConnector:
         memory_objs: list[Any] | None,
         starts: list[int] | None,
         ends: list[int] | None,
+        *,
+        tail_to_head: bool = False,
         **kwargs,
     ) -> tuple[_ThreadTransferState, list[_TransferGroup]] | None:
-        """Validate inputs and build the chunk/group transfer plan."""
+        """Validate inputs and build the chunk/group transfer plan.
+
+        LMCache gives the GPU connector parallel ``MemoryObj``/range lists.
+        Sorting the assembled chunk records keeps each object attached to its
+        exact token range and block IDs. Save staging is deliberately
+        tail-to-head so the highest source blocks become reusable first; load
+        staging retains LMCache's ordinary head-to-tail order.
+
+        This does not mutate LMCache's input lists. In the current LMCache API,
+        ``CacheEngine.store`` owns the separate key list and later passes it,
+        together with the original ``memory_objs`` list, to ``batched_put``.
+        The connector cannot safely reorder that opaque backend batch without
+        also receiving the keys.
+        """
         if memory_objs is None or starts is None or ends is None:
             raise ValueError("memory_objs, starts, and ends are required")
         if not (len(memory_objs) == len(starts) == len(ends)):
@@ -406,10 +521,65 @@ class BlockGPUConnector:
         if not memory_objs:
             return None
         state = self._thread_state()
-        chunks = self._iter_transfer_chunks(memory_objs, block_id_groups)
+        chunks = self._iter_transfer_chunks(memory_objs, block_id_groups, starts, ends)
         if not chunks:
             return None
+        if tail_to_head:
+            chunks.sort(key=lambda chunk: (chunk.start, chunk.end), reverse=True)
         return state, self._iter_transfer_groups(chunks)
+
+    @contextmanager
+    def track_save_source(self, operation: SaveOperationId | None) -> Iterator[None]:
+        """Associate this thread's next LMCache store with an exact save.
+
+        LMCache forwards ``req_id`` to the GPU connector but not ATOM's save
+        generation.  The store runs synchronously on this same executor thread,
+        so a thread-local context carries the exact identity without changing
+        LMCache's public API or encoding generations into user request IDs.
+        """
+
+        previous = getattr(self._tls, "save_operation", None)
+        self._tls.save_operation = operation
+        try:
+            yield
+        finally:
+            self._tls.save_operation = previous
+
+    def _source_safe_identities(
+        self, group: _TransferGroup
+    ) -> tuple[SaveSourceGroupId, ...]:
+        callback = self._source_safe_callback
+        operation = getattr(self._tls, "save_operation", None)
+        if callback is None or not isinstance(operation, SaveOperationId):
+            return ()
+        return tuple(
+            SaveSourceGroupId(
+                save_operation=operation,
+                ranges=((chunk.start, chunk.end),),
+            )
+            for chunk in group.chunks
+        )
+
+    def _queue_source_safe_group(self, group: _TransferGroup, stream) -> None:
+        """Fence one staging group and publish its exact chunk identities.
+
+        A fresh event is required because the pipeline's reusable ``free_event``
+        is recorded again for the next group. The poller queries it from a
+        daemon thread, so the save thread never host-synchronizes per chunk or
+        per group and can continue into LMCache's storage-manager put.
+        """
+
+        identities = self._source_safe_identities(group)
+        if not identities:
+            return
+        if stream is None:
+            for identity in identities:
+                self._source_safe_callback(identity)
+            return
+        event = torch.cuda.Event(blocking=False)
+        event.record(stream)
+        assert self._source_safe_poller is not None
+        self._source_safe_poller.submit(event, identities)
 
     def _run_staged_pipeline(
         self,
@@ -417,6 +587,7 @@ class BlockGPUConnector:
         groups: list[_TransferGroup],
         stage_a: _PipelineStage,
         stage_b: _PipelineStage,
+        stage_b_enqueued: Callable[[_TransferGroup, Any], None] | None = None,
     ) -> None:
         """Drive an event-synced two-stage staging pipeline.
 
@@ -444,6 +615,7 @@ class BlockGPUConnector:
             group_nbytes=lambda group: group.nbytes,
             release_buffer=self._release_staging_buffer_if_requested,
             recover_buffer=recover,
+            stage_b_enqueued=stage_b_enqueued,
         )
 
     def from_gpu(self, memory_obj: Any, start: int, end: int, **kwargs) -> None:
@@ -459,8 +631,14 @@ class BlockGPUConnector:
         ends: list[int],
         **kwargs,
     ) -> None:
-        """Pack ATOM KV blocks to LMCache MemoryObjs via bounded staging."""
-        prepared = self._prepare_transfer(memory_objs, starts, ends, **kwargs)
+        """Pack ATOM KV blocks tail-to-head into LMCache MemoryObjs."""
+        prepared = self._prepare_transfer(
+            memory_objs,
+            starts,
+            ends,
+            tail_to_head=True,
+            **kwargs,
+        )
         if prepared is None:
             return
         state, groups = prepared
@@ -477,6 +655,7 @@ class BlockGPUConnector:
                 state.copy_stream,
                 lambda group, buf: self._slice_to_memory_objs(group, buf),
             ),
+            stage_b_enqueued=self._queue_source_safe_group,
         )
 
     def batched_to_gpu(

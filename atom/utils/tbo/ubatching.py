@@ -189,6 +189,11 @@ class DPSyncResult:
     tbo_collective_active: bool
     # (ub0_max, ub1_max) across DP — only set when tbo_collective_active.
     ub_max_tokens_across_dp: tuple[int, int] | None
+    # The same two rows UNREDUCED, per ubatch. The MAX above is one reduction of
+    # this and an all2all's receive width takes the SUM, so the row is what
+    # travels and each consumer reduces it. (The MAX stays a field only because
+    # it is a ForwardContext constructor kwarg the sglang bridge passes.)
+    ub_tokens_across_dp: tuple[tuple[int, ...], ...] | None
     # DP-MAX of the per-seq decode length — only set when ``max_seqlen_q`` was
     # passed in (a block drafter under DP). Folded into this packed all_gather so
     # the graph-shape sync no longer needs its own separate all_reduce (halves
@@ -230,8 +235,8 @@ def sync_dp_metadata(
       row 2 : is_prefill (0/1)         -> any_rank_has_prefill (OR)
       row 3 : meets_min_tokens (0/1)   -> OR  -> any rank reached the min-token bar [TBO only]
       row 4 : can_split (0/1)          -> AND -> every rank can split              [TBO only]
-      row 5 : ub0_tokens               -> ub_max_tokens_across_dp[0]              [TBO only]
-      row 6 : ub1_tokens               -> ub_max_tokens_across_dp[1]              [TBO only]
+      row 5 : ub0_tokens               -> ub_{max,total}_tokens_across_dp[0]      [TBO only]
+      row 6 : ub1_tokens               -> ub_{max,total}_tokens_across_dp[1]      [TBO only]
       row k+0 : max_seqlen_q           -> max_seqlen_q_across_dp (MAX)  [DSpark only]
 
     Rows 0 and 1 are the same batch in ATOM's two units; both ride this one
@@ -273,6 +278,7 @@ def sync_dp_metadata(
     any_rank_has_prefill = bool(sync[2].any())
     tbo_collective_active = False
     ub_max_tokens_across_dp: tuple[int, int] | None = None
+    ub_tokens_across_dp: tuple[tuple[int, ...], ...] | None = None
     if tbo_on:
         # OR(meets_min_tokens): one rank reaching the min-token bar turns TBO on
         # for all. AND(can_split): but EVERY rank must be structurally splittable, else
@@ -290,10 +296,8 @@ def sync_dp_metadata(
             uniform_mode = prefill_rank_count == 0 or prefill_rank_count == dp_size
             tbo_collective_active = uniform_mode
         if tbo_collective_active:
-            ub_max_tokens_across_dp = (
-                int(sync[5].max()),
-                int(sync[6].max()),
-            )
+            ub_tokens_across_dp = (tuple(sync[5].tolist()), tuple(sync[6].tolist()))
+            ub_max_tokens_across_dp = tuple(max(row) for row in ub_tokens_across_dp)
 
     max_seqlen_q_across_dp: int | None = None
     if dspark_on:
@@ -305,6 +309,7 @@ def sync_dp_metadata(
         any_rank_has_prefill=any_rank_has_prefill,
         tbo_collective_active=tbo_collective_active,
         ub_max_tokens_across_dp=ub_max_tokens_across_dp,
+        ub_tokens_across_dp=ub_tokens_across_dp,
         max_seqlen_q_across_dp=max_seqlen_q_across_dp,
     )
 

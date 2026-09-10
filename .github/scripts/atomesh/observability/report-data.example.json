@@ -1,0 +1,26 @@
+{
+  "meta": {
+    "title": "Inference latency report",
+    "model": "Example model",
+    "kind": "demo",
+    "start": 1788854400,
+    "end": 1788854410,
+    "step": 5,
+    "window": 60
+  },
+  "panels": [
+    {
+      "id": "decode_itl",
+      "title": "Inter-token latency",
+      "label": "DECODE · OUTPUT",
+      "detail": "Example only. Values are milliseconds; timestamps are Unix seconds.",
+      "series": {
+        "mean": [[1788854400, 6.6], [1788854405, 6.9], [1788854410, 6.8]],
+        "p50": [[1788854400, 6.2], [1788854405, 6.5], [1788854410, 6.3]],
+        "p90": [[1788854400, 7.4], [1788854405, 7.8], [1788854410, 7.7]],
+        "p95": [[1788854400, 7.8], [1788854405, 8.2], [1788854410, 8.1]],
+        "p99": [[1788854400, 8.8], [1788854405, 9.2], [1788854410, null]]
+      }
+    }
+  ]
+}
