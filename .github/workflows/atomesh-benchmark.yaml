@@ -63,7 +63,9 @@ on:
             glm-52-mxfp4-1p1d-tp4-agentic-1m-c4,glm-52-mxfp4-1p1d-tp4-agentic-1m-c8,
             glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c24,
             glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c32,
-            glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c48
+            glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c48,
+            glm-52-mxfp4-standalone-tp4-dcp4-sharded-index-no-mtp-lmcache512-chunk256-agentic-1m-c48,
+            glm-52-mxfp4-standalone-tp4-dcp4-sharded-index-no-mtp-lmcache512-chunk256-agentic-1m-c56
 
           Kimi-K3:
             kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c1,
@@ -1174,6 +1176,7 @@ jobs:
               "image": get("image"),
               "model_path": get("model_path"),
               "precision": get("precision"),
+              "deployment": get("deployment"),
               "runner": get("runner.slurm_submit_runner"),
               "slurm_account": get("runner.slurm_account"),
               "slurm_partition": get("runner.slurm_partition"),
@@ -1184,6 +1187,7 @@ jobs:
               "pd_worker_layout": get("pd_worker_layout"),
               "prefill": get("service.prefill"),
               "decode": get("service.decode"),
+              "standalone": get("service.standalone"),
               "router": get("service.router"),
               "server_args": get("server_args"),
               "isl": get("isl"),

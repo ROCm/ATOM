@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert ATOMesh real P/D benchmark artifacts to dashboard input."""
+"""Convert ATOMesh model benchmark artifacts to dashboard input."""
 
 from __future__ import annotations
 
@@ -29,7 +29,8 @@ INTERACTIVITY_LABELS = {
 }
 
 RESULT_RE = re.compile(
-    r"^pd-(?P<backend>[^-]+)-(?P<model>.+)-(?P<topology>[^-]+(?:-[^-]+)*)-"
+    r"^(?P<deployment>pd|standalone)-(?P<backend>[^-]+)-"
+    r"(?P<model>.+)-(?P<topology>[^-]+(?:-[^-]+)*)-"
     r"isl(?P<isl>\d+)-osl(?P<osl>\d+)-conc(?P<conc>\d+)-(?P<ratio>[0-9.]+)\.json$"
 )
 TOPOLOGY_RE = re.compile(r"(?P<p>\d+)p(?P<d>\d+)d", re.IGNORECASE)
@@ -231,6 +232,10 @@ def topology_resources(
             fields.get("topology"),
         )
     )
+    deployment = string_value(
+        payload.get("deployment"), fields.get("deployment"), default="pd"
+    ).lower()
+    standalone = deployment == "standalone"
     topology = TOPOLOGY_RE.search(text)
     tp = TP_RE.search(text)
     prefill_workers = int_value(
@@ -263,6 +268,16 @@ def topology_resources(
     if dcp:
         prefill_dcp = prefill_dcp or int(dcp.group("dcp"))
         decode_dcp = decode_dcp or int(dcp.group("dcp"))
+    if standalone:
+        standalone_tp = int_value(payload.get("standalone_tp"))
+        standalone_dcp = int_value(payload.get("standalone_dcp"))
+        if standalone_tp is None and tp:
+            standalone_tp = int(tp.group("tp"))
+        if standalone_dcp is None and dcp:
+            standalone_dcp = int(dcp.group("dcp"))
+        prefill_workers = decode_workers = 1
+        prefill_tp = decode_tp = standalone_tp
+        prefill_dcp = decode_dcp = standalone_dcp
 
     num_prefill_gpu = int_value(payload.get("num_prefill_gpu"))
     num_decode_gpu = int_value(payload.get("num_decode_gpu"))
@@ -271,7 +286,11 @@ def topology_resources(
     if num_decode_gpu is None and decode_workers and decode_tp:
         num_decode_gpu = decode_workers * decode_tp
     total_gpu = int_value(payload.get("total_gpu"))
-    if total_gpu is None and num_prefill_gpu is not None and num_decode_gpu is not None:
+    if standalone and total_gpu is None:
+        total_gpu = prefill_tp
+    elif (
+        total_gpu is None and num_prefill_gpu is not None and num_decode_gpu is not None
+    ):
         total_gpu = num_prefill_gpu + num_decode_gpu
 
     lowered = text.lower()
@@ -367,6 +386,9 @@ def enrich_payload(
     enriched = dict(payload)
     enriched.setdefault("benchmark_backend", "Atomesh")
     enriched.setdefault("dashboard_backend", "Atomesh")
+    enriched.setdefault(
+        "deployment", fields.get("deployment") or env.get("ATOMESH_DEPLOYMENT", "pd")
+    )
     enriched.setdefault("benchmark_model_name", fields["model"])
     enriched.setdefault("topology", fields["topology"])
     enriched.setdefault(
@@ -384,6 +406,8 @@ def enrich_payload(
     enriched.setdefault("decode_tp", env.get("DECODE_TP"))
     enriched.setdefault("prefill_dcp", env.get("PREFILL_DCP_SIZE"))
     enriched.setdefault("decode_dcp", env.get("DECODE_DCP_SIZE"))
+    enriched.setdefault("standalone_tp", env.get("STANDALONE_TP_SIZE"))
+    enriched.setdefault("standalone_dcp", env.get("STANDALONE_DCP_SIZE"))
     enriched.setdefault("speculative_method", env.get("SPEC_METHOD"))
     enriched.setdefault("num_speculative_tokens", env.get("NUM_SPEC_TOKENS"))
     runner = env.get("SLURM_SUBMIT_RUNNER", "")

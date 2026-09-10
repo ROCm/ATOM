@@ -365,6 +365,49 @@ models:
           name: glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c48
           concurrency: [48]
 
+        # One regular ATOM worker handles both prefill and decode; ATOMesh uses
+        # normal worker routing rather than --pd-disaggregation.
+        - &glm52_agentic_lmcache_standalone_tp4_dcp4_sharded_index
+          name: glm-52-mxfp4-standalone-tp4-dcp4-sharded-index-no-mtp-lmcache512-chunk256-agentic-1m-c48
+          deployment: standalone
+          topology: standalone_dcp4
+          display_topology: STANDALONE-TP4-DCP4-SHARDED-INDEX-NO-MTP
+          pd_worker_layout: standalone
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [48]
+          server:
+            common_args: *glm52_agentic_args
+          standalone: &glm52_agentic_lmcache_standalone_tp4_dcp4
+            port: 8010
+            tp: 4
+            dcp: 4
+            cudagraph: >-
+              [1,2,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96]
+            kv_transfer_config: '{"kv_connector":"lmcache_offload","kv_role":"offload"}'
+          env:
+            common:
+              PYTHONHASHSEED: "0"
+            standalone:
+              LMCACHE_LOCAL_CPU: "True"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "512"
+              LMCACHE_CHUNK_SIZE: "256"
+              OFFLOAD_MIN_LOAD_TOKENS: "8192"
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+          benchmark:
+            <<: *agentic_1m_aiperf
+            benchmark_duration: 1800
+          run_eval: false
+
+        - <<: *glm52_agentic_lmcache_standalone_tp4_dcp4_sharded_index
+          name: glm-52-mxfp4-standalone-tp4-dcp4-sharded-index-no-mtp-lmcache512-chunk256-agentic-1m-c56
+          concurrency: [56]
+          standalone:
+            <<: *glm52_agentic_lmcache_standalone_tp4_dcp4
+            cudagraph: >-
+              [1,2,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96,100,104,108,112]
+
     accuracy:
       task: gsm8k
       fewshot: 20

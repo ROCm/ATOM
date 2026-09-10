@@ -8,7 +8,7 @@ usage() {
 Usage:
   pd_submit.sh --cell-json <json> [--result-dir <dir>] [--dry-run]
 
-Submits one expanded ATOMesh real P/D benchmark cell to Slurm. The cell JSON is
+Submits one expanded ATOMesh model benchmark cell to Slurm. The cell JSON is
 produced by .github/scripts/atomesh/pd_matrix.py.
 USAGE
 }
@@ -69,6 +69,7 @@ runner = cell.get("runner", {})
 service = cell.get("service", {})
 prefill = service.get("prefill", {})
 decode = service.get("decode", {})
+standalone = service.get("standalone", {})
 router = service.get("router", {})
 benchmark = cell.get("benchmark", {})
 accuracy = cell.get("accuracy", {})
@@ -130,6 +131,7 @@ exports = {
     "DOCKER_IMAGE": cell["image"],
     "MODEL_PATH": cell["model_path"],
     "PRECISION": cell.get("precision", ""),
+    "ATOMESH_DEPLOYMENT": cell.get("deployment", "pd"),
     "TOPOLOGY": cell["topology"],
     "DISPLAY_TOPOLOGY": cell.get("display_topology", cell["topology"]),
     "ATOMESH_PD_WORKER_LAYOUT": cell.get("pd_worker_layout", "multi_node"),
@@ -191,18 +193,28 @@ exports = {
     "DECODE_TP": decode.get("tp", 8),
     "PREFILL_DCP_SIZE": prefill.get("dcp", 1),
     "DECODE_DCP_SIZE": decode.get("dcp", 1),
+    "STANDALONE_TP_SIZE": standalone.get("tp", 8),
+    "STANDALONE_DCP_SIZE": standalone.get("dcp", 1),
     "PREFILL_ENABLE_DP": str(prefill.get("enable_dp_attention", False)).lower(),
     "DECODE_ENABLE_DP": str(decode.get("enable_dp_attention", False)).lower(),
     "PREFILL_CUDAGRAPH": prefill.get("cudagraph", ""),
     "DECODE_CUDAGRAPH": decode.get("cudagraph", ""),
+    "STANDALONE_CUDAGRAPH": standalone.get("cudagraph", ""),
     "PREFILL_CUDAGRAPH_MODE": prefill.get("cudagraph_mode", ""),
     "DECODE_CUDAGRAPH_MODE": decode.get("cudagraph_mode", ""),
+    "STANDALONE_CUDAGRAPH_MODE": standalone.get("cudagraph_mode", ""),
     "PREFILL_COMPILATION_LEVEL": prefill.get("compilation_level", ""),
     "DECODE_COMPILATION_LEVEL": decode.get("compilation_level", ""),
+    "STANDALONE_COMPILATION_LEVEL": standalone.get("compilation_level", ""),
     "PREFILL_CUDAGRAPH_MAX_NUM_SEQS": prefill.get("cudagraph_max_num_seqs", ""),
     "DECODE_CUDAGRAPH_MAX_NUM_SEQS": decode.get("cudagraph_max_num_seqs", ""),
+    "STANDALONE_CUDAGRAPH_MAX_NUM_SEQS": standalone.get(
+        "cudagraph_max_num_seqs", ""
+    ),
     "PREFILL_PORT": prefill.get("port", 8010),
     "DECODE_PORT": decode.get("port", 8020),
+    "STANDALONE_PORT": standalone.get("port", 8010),
+    "STANDALONE_KV_TRANSFER_CONFIG": standalone.get("kv_transfer_config", ""),
     "ROUTER_PORT": router.get("port", 8000),
     "ROUTER_POLICY": router.get("policy", "random"),
     "PROMETHEUS_PORT": router.get("prometheus_port", 29100),
@@ -233,6 +245,7 @@ exports = {
     "EXTRA_SERVER_ARGS": server_args.get("extra_args", ""),
     "PREFILL_EXTRA_SERVER_ARGS": prefill.get("extra_args", ""),
     "DECODE_EXTRA_SERVER_ARGS": decode.get("extra_args", ""),
+    "STANDALONE_EXTRA_SERVER_ARGS": standalone.get("extra_args", ""),
     "RUN_EVAL": str(cell.get("run_eval", False)).lower(),
     "EVAL_TASK": accuracy.get("task", "gsm8k"),
     "EVAL_FEWSHOT": accuracy.get("fewshot", 3),
@@ -291,6 +304,8 @@ for key, value in cell.get("env", {}).get("prefill", {}).items():
     print(f"export ATOMESH_PREFILL_ENV_{key}={q(value)}")
 for key, value in cell.get("env", {}).get("decode", {}).items():
     print(f"export ATOMESH_DECODE_ENV_{key}={q(value)}")
+for key, value in cell.get("env", {}).get("standalone", {}).items():
+    print(f"export ATOMESH_STANDALONE_ENV_{key}={q(value)}")
 PY
 )"
 

@@ -58,6 +58,7 @@ allow = (
     "WAIT_",
     "PREFILL_",
     "DECODE_",
+    "STANDALONE_",
     "ROUTER_",
     "PROMETHEUS_PORT",
     "KV_CACHE_DTYPE",

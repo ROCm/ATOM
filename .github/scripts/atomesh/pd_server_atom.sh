@@ -10,8 +10,16 @@ RUN_DIR="${RUN_DIR:-/run_logs/slurm_job-${SLURM_JOB_ID:-local}}"
 MODEL_NAME="${MODEL_NAME:?MODEL_NAME is required}"
 MODEL_PATH="${MODEL_PATH:?MODEL_PATH is required}"
 BACKEND="${BACKEND:-atom}"
+ATOMESH_DEPLOYMENT="${ATOMESH_DEPLOYMENT:-pd}"
 TOPOLOGY="${TOPOLOGY:-unknown}"
 DISPLAY_TOPOLOGY="${DISPLAY_TOPOLOGY:-${TOPOLOGY}}"
+case "${ATOMESH_DEPLOYMENT}" in
+  pd|standalone) ;;
+  *)
+    echo "ERROR: unsupported ATOMESH_DEPLOYMENT=${ATOMESH_DEPLOYMENT}" >&2
+    exit 2
+    ;;
+esac
 ATOMESH_PD_WORKER_LAYOUT="${ATOMESH_PD_WORKER_LAYOUT:-multi_node}"
 SINGLE_NODE_PD=0
 PREFILL_SINGLE_NODE_PD=0
@@ -32,13 +40,16 @@ xP="${xP:-1}"
 yD="${yD:-1}"
 PREFILL_TP_SIZE="${PREFILL_TP_SIZE:-8}"
 DECODE_TP_SIZE="${DECODE_TP_SIZE:-8}"
+STANDALONE_TP_SIZE="${STANDALONE_TP_SIZE:-8}"
 PREFILL_DCP_SIZE="${PREFILL_DCP_SIZE:-1}"
 DECODE_DCP_SIZE="${DECODE_DCP_SIZE:-1}"
+STANDALONE_DCP_SIZE="${STANDALONE_DCP_SIZE:-1}"
 PREFILL_ENABLE_DP="${PREFILL_ENABLE_DP:-false}"
 DECODE_ENABLE_DP="${DECODE_ENABLE_DP:-false}"
 
 PREFILL_PORT="${PREFILL_PORT:-8010}"
 DECODE_PORT="${DECODE_PORT:-8020}"
+STANDALONE_PORT="${STANDALONE_PORT:-8010}"
 ROUTER_PORT="${ROUTER_PORT:-8000}"
 ROUTER_POLICY="${ROUTER_POLICY:-random}"
 ATOM_PD_RANK_MAPPING_POLICY="${ATOM_PD_RANK_MAPPING_POLICY:-none}"
@@ -63,6 +74,7 @@ if [[ ! "${ATOMESH_SERVICE_PORT_OFFSET}" =~ ^[0-9]+$ ]]; then
 fi
 PREFILL_PORT=$((PREFILL_PORT + ATOMESH_SERVICE_PORT_OFFSET))
 DECODE_PORT=$((DECODE_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+STANDALONE_PORT=$((STANDALONE_PORT + ATOMESH_SERVICE_PORT_OFFSET))
 ROUTER_PORT=$((ROUTER_PORT + ATOMESH_SERVICE_PORT_OFFSET))
 PROMETHEUS_PORT=$((PROMETHEUS_PORT + ATOMESH_SERVICE_PORT_OFFSET))
 HANDSHAKE_PORT=$((HANDSHAKE_PORT + ATOMESH_SERVICE_PORT_OFFSET))
@@ -81,6 +93,7 @@ validate_shifted_port() {
 for shifted_port_name in \
   PREFILL_PORT \
   DECODE_PORT \
+  STANDALONE_PORT \
   ROUTER_PORT \
   PROMETHEUS_PORT \
   HANDSHAKE_PORT \
@@ -116,13 +129,18 @@ STATE_CHECKPOINT_INTERVAL_TOKENS="${STATE_CHECKPOINT_INTERVAL_TOKENS:-}"
 EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:-}"
 PREFILL_EXTRA_SERVER_ARGS="${PREFILL_EXTRA_SERVER_ARGS:-}"
 DECODE_EXTRA_SERVER_ARGS="${DECODE_EXTRA_SERVER_ARGS:-}"
+STANDALONE_EXTRA_SERVER_ARGS="${STANDALONE_EXTRA_SERVER_ARGS:-}"
 PREFILL_SERVER_ARGS="${EXTRA_SERVER_ARGS}"
 DECODE_SERVER_ARGS="${EXTRA_SERVER_ARGS}"
+STANDALONE_SERVER_ARGS="${EXTRA_SERVER_ARGS}"
 if [[ -n "${PREFILL_EXTRA_SERVER_ARGS}" ]]; then
   PREFILL_SERVER_ARGS="${PREFILL_SERVER_ARGS:+${PREFILL_SERVER_ARGS} }${PREFILL_EXTRA_SERVER_ARGS}"
 fi
 if [[ -n "${DECODE_EXTRA_SERVER_ARGS}" ]]; then
   DECODE_SERVER_ARGS="${DECODE_SERVER_ARGS:+${DECODE_SERVER_ARGS} }${DECODE_EXTRA_SERVER_ARGS}"
+fi
+if [[ -n "${STANDALONE_EXTRA_SERVER_ARGS}" ]]; then
+  STANDALONE_SERVER_ARGS="${STANDALONE_SERVER_ARGS:+${STANDALONE_SERVER_ARGS} }${STANDALONE_EXTRA_SERVER_ARGS}"
 fi
 
 has_cli_flag() {
@@ -203,6 +221,7 @@ AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT="${AIPERF_SERVICE_PROFILE_CONFIGURE_TIM
 AIPERF_UNSAFE_OVERRIDE="${AIPERF_UNSAFE_OVERRIDE:-}"
 PREFILL_KV_TRANSFER_CONFIG="${PREFILL_KV_TRANSFER_CONFIG:-}"
 DECODE_KV_TRANSFER_CONFIG="${DECODE_KV_TRANSFER_CONFIG:-}"
+STANDALONE_KV_TRANSFER_CONFIG="${STANDALONE_KV_TRANSFER_CONFIG:-}"
 
 default_profiler_dir="${RUN_DIR}/online_quant/rank-${NODE_RANK}"
 if [[ "${ATOMESH_EXECUTION_PHASE}" != "combined" ]]; then
@@ -216,7 +235,9 @@ fi
 mkdir -p "${RUNTIME_LOG_DIR}" "${RUN_DIR}"/{benchmark_results,eval_results} "${ATOM_TORCH_PROFILER_DIR}"
 
 role_tp="${PREFILL_TP_SIZE}"
-if [[ "${PREFILL_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -gt 0 ]]; then
+if [[ "${ATOMESH_DEPLOYMENT}" == "standalone" ]]; then
+  role_tp="${STANDALONE_TP_SIZE}"
+elif [[ "${PREFILL_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -gt 0 ]]; then
   role_tp="${DECODE_TP_SIZE}"
 elif [[ "${NODE_RANK}" -ge "${xP}" ]]; then
   role_tp="${DECODE_TP_SIZE}"
@@ -277,7 +298,14 @@ prefill_ports=()
 decode_args=()
 decode_ips=()
 decode_ports=()
-if [[ "${SINGLE_NODE_PD}" == "1" ]]; then
+standalone_args=()
+standalone_ips=()
+standalone_ports=()
+if [[ "${ATOMESH_DEPLOYMENT}" == "standalone" ]]; then
+  standalone_ips+=("${IP_ARRAY[0]}")
+  standalone_ports+=("${STANDALONE_PORT}")
+  standalone_args+=(--worker-urls "http://${IP_ARRAY[0]}:${STANDALONE_PORT}")
+elif [[ "${SINGLE_NODE_PD}" == "1" ]]; then
   if [[ "${xP}" != "1" || "${yD}" != "1" ]]; then
     echo "ERROR: single_node PD worker layout currently supports only 1 prefill and 1 decode worker" >&2
     exit 1
@@ -343,6 +371,10 @@ decode_parallel=(
   -tp "${DECODE_TP_SIZE}"
   --decode-context-parallel-size "${DECODE_DCP_SIZE}"
 )
+standalone_parallel=(
+  -tp "${STANDALONE_TP_SIZE}"
+  --decode-context-parallel-size "${STANDALONE_DCP_SIZE}"
+)
 if [[ "${DECODE_ENABLE_DP}" == "true" ]]; then
   decode_parallel+=("--enable-dp-attention")
 fi
@@ -404,8 +436,10 @@ build_cudagraph_args() {
 
 prefill_cudagraph_args=()
 decode_cudagraph_args=()
+standalone_cudagraph_args=()
 build_cudagraph_args prefill prefill_cudagraph_args
 build_cudagraph_args decode decode_cudagraph_args
+build_cudagraph_args standalone standalone_cudagraph_args
 
 build_server_cache_env() {
   local role="$1"
@@ -599,15 +633,44 @@ write_metadata() {
   "model": "${MODEL_NAME}",
   "model_path": "${MODEL_PATH}",
   "backend": "${BACKEND}",
+  "deployment": "${ATOMESH_DEPLOYMENT}",
   "topology": "${TOPOLOGY}",
   "display_topology": "${DISPLAY_TOPOLOGY}",
   "pd_worker_layout": "${ATOMESH_PD_WORKER_LAYOUT}",
   "prefill_ips": "$(IFS=,; echo "${prefill_ips[*]}")",
   "prefill_ports": "$(IFS=,; echo "${prefill_ports[*]}")",
   "decode_ips": "$(IFS=,; echo "${decode_ips[*]}")",
-  "decode_ports": "$(IFS=,; echo "${decode_ports[*]}")"
+  "decode_ports": "$(IFS=,; echo "${decode_ports[*]}")",
+  "standalone_ips": "$(IFS=,; echo "${standalone_ips[*]}")",
+  "standalone_ports": "$(IFS=,; echo "${standalone_ports[*]}")"
 }
 EOF
+}
+
+start_standalone() {
+  local log_name="${1:-standalone-rank-${NODE_RANK}}"
+  apply_prefixed_env "ATOMESH_STANDALONE_ENV_" "${host_ip}"
+  local -a standalone_cache_env=()
+  local -a standalone_kv_transfer_args=()
+  build_server_cache_env "standalone" "${STANDALONE_PORT}" standalone_cache_env
+  if [[ -n "${STANDALONE_KV_TRANSFER_CONFIG}" ]]; then
+    standalone_kv_transfer_args=(
+      --kv-transfer-config "${STANDALONE_KV_TRANSFER_CONFIG}"
+    )
+  fi
+  echo "[standalone] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${STANDALONE_PORT} cudagraph=${standalone_cudagraph_args[*]:-none}"
+  local -a standalone_cmd=(
+    python3 -m atom.entrypoints.openai_server
+    "${server_common[@]}"
+    --server-port "${STANDALONE_PORT}"
+    "${standalone_parallel[@]}"
+    --max-num-seqs "${MAX_NUM_SEQS}"
+    "${standalone_kv_transfer_args[@]}"
+    "${standalone_cudagraph_args[@]}"
+    ${STANDALONE_SERVER_ARGS}
+  )
+  dump_launch_info "STANDALONE" "${standalone_cmd[@]}"
+  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${standalone_cache_env[@]}" "${standalone_cmd[@]}"
 }
 
 start_prefill() {
@@ -701,7 +764,11 @@ start_decode() {
 }
 
 start_router() {
-  echo "[router] prefill=${prefill_args[*]} decode=${decode_args[*]}"
+  if [[ "${ATOMESH_DEPLOYMENT}" == "standalone" ]]; then
+    echo "[router] standalone=${standalone_args[*]}"
+  else
+    echo "[router] prefill=${prefill_args[*]} decode=${decode_args[*]}"
+  fi
   local mesh_binary="${ATOMESH_MESH_BINARY:-/app/ATOM/atom/mesh/target/release/atomesh}"
   case "${ATOM_PD_RANK_MAPPING_POLICY}" in
     none|idx2idx) ;;
@@ -727,21 +794,36 @@ start_router() {
   elif [[ "${#router_rank_mapping_args[@]}" -gt 0 ]]; then
     router_dp_aware_args=(--dp-aware)
   fi
-  local -a router_cmd=(
-    "${mesh_binary}" launch
-    --host 0.0.0.0
-    --port "${ROUTER_PORT}"
-    --pd-disaggregation
-    "${prefill_args[@]}"
-    "${decode_args[@]}"
-    --policy "${router_policy}"
-    "${router_rank_mapping_args[@]}"
-    "${router_dp_aware_args[@]}"
-    --backend atom
-    --log-level info
-    --disable-circuit-breaker
-    --prometheus-port "${PROMETHEUS_PORT}"
-  )
+  local -a router_cmd
+  if [[ "${ATOMESH_DEPLOYMENT}" == "standalone" ]]; then
+    router_cmd=(
+      "${mesh_binary}" launch
+      --host 0.0.0.0
+      --port "${ROUTER_PORT}"
+      "${standalone_args[@]}"
+      --policy "${router_policy}"
+      --backend atom
+      --log-level info
+      --disable-circuit-breaker
+      --prometheus-port "${PROMETHEUS_PORT}"
+    )
+  else
+    router_cmd=(
+      "${mesh_binary}" launch
+      --host 0.0.0.0
+      --port "${ROUTER_PORT}"
+      --pd-disaggregation
+      "${prefill_args[@]}"
+      "${decode_args[@]}"
+      --policy "${router_policy}"
+      "${router_rank_mapping_args[@]}"
+      "${router_dp_aware_args[@]}"
+      --backend atom
+      --log-level info
+      --disable-circuit-breaker
+      --prometheus-port "${PROMETHEUS_PORT}"
+    )
+  fi
   dump_launch_info "ROUTER" "${router_cmd[@]}"
   start_logged_process router_pid "${RUNTIME_LOG_DIR}/router.log" "${router_cmd[@]}"
 }
@@ -768,7 +850,7 @@ run_benchmark() {
   local safe_model="${MODEL_NAME//\//-}"
   for isl in "${isls[@]}"; do
     for conc in "${concs[@]}"; do
-      local result_file="pd-${BACKEND}-${safe_model}-${TOPOLOGY}-isl${isl}-osl${OSL}-conc${conc}-${RANDOM_RANGE_RATIO}.json"
+      local result_file="${ATOMESH_DEPLOYMENT}-${BACKEND}-${safe_model}-${TOPOLOGY}-isl${isl}-osl${OSL}-conc${conc}-${RANDOM_RANGE_RATIO}.json"
       echo "[bench] ${result_file}"
       PYTHONDONTWRITEBYTECODE=1 python "${bench_script}" \
         --model="${MODEL_PATH}" \
@@ -963,14 +1045,21 @@ run_aiperf_agentic_benchmark() {
     --mesh "127.0.0.1:${PROMETHEUS_PORT}"
   )
   local idx
-  for idx in "${!prefill_ips[@]}"; do
-    server_metrics_args+=("http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/metrics")
-    report_args+=(--prefill "${prefill_ips[$idx]}:${prefill_ports[$idx]}")
-  done
-  for idx in "${!decode_ips[@]}"; do
-    server_metrics_args+=("http://${decode_ips[$idx]}:${decode_ports[$idx]}/metrics")
-    report_args+=(--decode "${decode_ips[$idx]}:${decode_ports[$idx]}")
-  done
+  if [[ "${ATOMESH_DEPLOYMENT}" == "standalone" ]]; then
+    for idx in "${!standalone_ips[@]}"; do
+      server_metrics_args+=("http://${standalone_ips[$idx]}:${standalone_ports[$idx]}/metrics")
+      report_args+=(--standalone "${standalone_ips[$idx]}:${standalone_ports[$idx]}")
+    done
+  else
+    for idx in "${!prefill_ips[@]}"; do
+      server_metrics_args+=("http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/metrics")
+      report_args+=(--prefill "${prefill_ips[$idx]}:${prefill_ports[$idx]}")
+    done
+    for idx in "${!decode_ips[@]}"; do
+      server_metrics_args+=("http://${decode_ips[$idx]}:${decode_ports[$idx]}/metrics")
+      report_args+=(--decode "${decode_ips[$idx]}:${decode_ports[$idx]}")
+    done
+  fi
 
   local conc
   IFS=',' read -r -a concs <<< "${CONC_LIST}"
@@ -978,7 +1067,7 @@ run_aiperf_agentic_benchmark() {
     conc="${conc//[[:space:]]/}"
     [[ -n "${conc}" ]] || continue
     local out_dir="${RUN_DIR}/benchmark_results/aiperf-${safe_model}-${TOPOLOGY}-c${conc}"
-    local result_file="pd-${BACKEND}-${safe_model}-${TOPOLOGY}-isl${AIPERF_MAX_CONTEXT_LENGTH}-osl1024-conc${conc}-${RANDOM_RANGE_RATIO}.json"
+    local result_file="${ATOMESH_DEPLOYMENT}-${BACKEND}-${safe_model}-${TOPOLOGY}-isl${AIPERF_MAX_CONTEXT_LENGTH}-osl1024-conc${conc}-${RANDOM_RANGE_RATIO}.json"
     local aiperf_json="${out_dir}/profile_export_aiperf.json"
     local dashboard_json="${RUN_DIR}/benchmark_results/${result_file}"
     local -a unsafe_args=()
@@ -1252,7 +1341,17 @@ run_benchmark_and_eval() {
 
 write_metadata
 
-if [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
+if [[ "${NODE_RANK}" -eq 0 && "${ATOMESH_DEPLOYMENT}" == "standalone" ]]; then
+  start_standalone
+  trap 'cleanup_processes ${router_pid:-} ${server_pid:-}' EXIT
+  wait_http "http://${standalone_ips[0]}:${standalone_ports[0]}/health" \
+    "standalone-${standalone_ips[0]}:${standalone_ports[0]}" \
+    "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
+  start_router
+  wait_http "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
+  run_benchmark_and_eval
+  cleanup_processes "${router_pid}" "${server_pid}"
+elif [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
   start_prefill "prefill-rank-0"
   prefill_pid="${server_pid}"
   decode_handshake_port=$((HANDSHAKE_PORT + PREFILL_TP_SIZE))

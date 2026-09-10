@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Expand ATOMesh real P/D benchmark YAML into workflow matrix cells."""
+"""Expand ATOMesh model benchmark YAML into workflow matrix cells."""
 
 from __future__ import annotations
 
@@ -143,10 +143,13 @@ def resolve_runner(runner_cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 def required_node_count(
+    deployment: str,
     pd_worker_layout: str,
     prefill_cfg: dict[str, Any],
     decode_cfg: dict[str, Any],
 ) -> int:
+    if deployment == "standalone":
+        return 1
     if pd_worker_layout == "single_node":
         return 1
     if pd_worker_layout == "prefill_single_node":
@@ -243,18 +246,32 @@ def build_cell(
         model_cfg.get("service", {}).get("decode", {}),
         suite_cfg.get("decode", {}),
     )
+    standalone_cfg = deep_merge(
+        backend_cfg.get("service", {}).get("standalone", {}),
+        model_cfg.get("service", {}).get("standalone", {}),
+        suite_cfg.get("standalone", {}),
+    )
     router_cfg = deep_merge(
         backend_cfg.get("service", {}).get("router", {}),
         model_cfg.get("service", {}).get("router", {}),
         suite_cfg.get("router", {}),
     )
+    deployment = str(suite_cfg.get("deployment", "pd"))
+    if deployment not in {"pd", "standalone"}:
+        raise ValueError(
+            f"{suite_cfg.get('name', model_name)} has unsupported deployment "
+            f"{deployment!r}"
+        )
+    standalone_deployment = deployment == "standalone"
     pd_worker_layout = str(suite_cfg.get("pd_worker_layout", "multi_node"))
     single_node_pd = pd_worker_layout == "single_node"
     prefill_single_node_pd = pd_worker_layout == "prefill_single_node"
     runner_cfg = resolve_runner(
         deep_merge(defaults.get("runner", {}), suite_cfg.get("runner", {}))
     )
-    required_nodes = required_node_count(pd_worker_layout, prefill_cfg, decode_cfg)
+    required_nodes = required_node_count(
+        deployment, pd_worker_layout, prefill_cfg, decode_cfg
+    )
     slurm_submit_runner = str(runner_cfg.get("slurm_submit_runner", ""))
     allow_auto_nodes = slurm_submit_runner in {
         "atomesh-cicd-mi350",
@@ -277,7 +294,7 @@ def build_cell(
                 f"{suite_cfg.get('name', model_name)} needs at least "
                 f"{required_nodes} node(s)"
             )
-    elif single_node_pd:
+    elif standalone_deployment or single_node_pd:
         if not nodes and not allow_auto_nodes:
             raise ValueError(
                 f"{suite_cfg.get('name', model_name)} needs at least one node"
@@ -295,12 +312,7 @@ def build_cell(
                 f"{required_nodes} node(s)"
             )
         nodes = nodes[:required_nodes]
-    elif nodes and len(nodes) < required_nodes:
-        raise ValueError(
-            f"{suite_cfg.get('name', model_name)} needs at least "
-            f"{required_nodes} node(s)"
-        )
-    elif not nodes and not allow_auto_nodes:
+    elif nodes and len(nodes) < required_nodes or not nodes and not allow_auto_nodes:
         raise ValueError(
             f"{suite_cfg.get('name', model_name)} needs at least "
             f"{required_nodes} node(s)"
@@ -343,6 +355,22 @@ def build_cell(
     )
     cell_id = slug(f"{model_name}-{suite_cfg.get('name', topology)}-{suite_name}")
     image = override_image or str(backend_cfg.get("image"))
+    service_cfg = {"router": router_cfg}
+    env_cfg = {
+        "common": role_env(defaults, backend_cfg, model_cfg, suite_cfg, "common"),
+        "router": role_env(defaults, backend_cfg, model_cfg, suite_cfg, "router"),
+    }
+    if standalone_deployment:
+        service_cfg["standalone"] = standalone_cfg
+        env_cfg["standalone"] = role_env(
+            defaults, backend_cfg, model_cfg, suite_cfg, "standalone"
+        )
+    else:
+        service_cfg.update(prefill=prefill_cfg, decode=decode_cfg)
+        env_cfg.update(
+            prefill=role_env(defaults, backend_cfg, model_cfg, suite_cfg, "prefill"),
+            decode=role_env(defaults, backend_cfg, model_cfg, suite_cfg, "decode"),
+        )
     return {
         "id": cell_id,
         "suite": suite_name,
@@ -352,6 +380,7 @@ def build_cell(
         "image": image,
         "model_path": resolve_model_path(model_name, model_cfg),
         "precision": str(model_cfg.get("precision", "")),
+        "deployment": deployment,
         "topology": topology,
         "display_topology": display_topology,
         "pd_worker_layout": pd_worker_layout,
@@ -368,18 +397,9 @@ def build_cell(
         "wait_router_timeout": int(benchmark_cfg.get("wait_router_timeout", 300)),
         "benchmark": benchmark_cfg,
         "runner": runner_cfg,
-        "service": {
-            "prefill": prefill_cfg,
-            "decode": decode_cfg,
-            "router": router_cfg,
-        },
+        "service": service_cfg,
         "server_args": server_args,
-        "env": {
-            "common": role_env(defaults, backend_cfg, model_cfg, suite_cfg, "common"),
-            "prefill": role_env(defaults, backend_cfg, model_cfg, suite_cfg, "prefill"),
-            "decode": role_env(defaults, backend_cfg, model_cfg, suite_cfg, "decode"),
-            "router": role_env(defaults, backend_cfg, model_cfg, suite_cfg, "router"),
-        },
+        "env": env_cfg,
         "run_eval": bool(suite_cfg.get("run_eval", False)),
         "accuracy": {
             "task": str(accuracy_cfg.get("task", "gsm8k")),

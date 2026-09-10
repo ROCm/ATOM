@@ -32,7 +32,9 @@ def save_json(path: Path, value) -> None:
     temporary.replace(path)
 
 
-def scrape_config(prefill: list[str], decode: list[str], mesh: str) -> dict:
+def scrape_config(
+    prefill: list[str], decode: list[str], standalone: list[str], mesh: str
+) -> dict:
     """Accept the server script's resolved addresses, including per-worker ports."""
 
     def target(address):
@@ -42,6 +44,11 @@ def scrape_config(prefill: list[str], decode: list[str], mesh: str) -> dict:
         if parsed.username or parsed.password or parsed.fragment:
             raise ValueError(f"Invalid metrics target: {address}")
         return address
+
+    if standalone:
+        atom_roles = (("standalone", standalone),)
+    else:
+        atom_roles = (("prefill", prefill), ("decode", decode))
 
     return {
         "global": {"scrape_interval": "1s", "scrape_timeout": "1s"},
@@ -53,7 +60,7 @@ def scrape_config(prefill: list[str], decode: list[str], mesh: str) -> dict:
                         "targets": [target(t) for t in addresses],
                         "labels": {"observer": "api", "role": role},
                     }
-                    for role, addresses in (("prefill", prefill), ("decode", decode))
+                    for role, addresses in atom_roles
                 ],
             },
             {
@@ -191,13 +198,13 @@ def wait_for_final_scrape(
     raise RuntimeError("Final metrics scrapes did not complete in 30 seconds")
 
 
-def empty_report(start, end, model, notes):
-    panels = export_report.panels_for("pd")
+def empty_report(start, end, model, notes, deployment):
+    panels = export_report.panels_for(deployment)
     for panel in panels:
         panel["series"] = {key: [] for key in export_report.statistics_for(panel)}
     return {
         "meta": {
-            "title": "Agentic PD inference report",
+            "title": f"Agentic {deployment} inference report",
             "model": model,
             "start": start,
             "end": max(end, start + 1),
@@ -253,7 +260,13 @@ def publish_report(output: Path, data: dict, status: dict) -> None:
 def run(args) -> int:
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
-    config = scrape_config(args.prefill, args.decode, args.mesh)
+    deployment = "standalone" if args.standalone else "pd"
+    config = scrape_config(args.prefill, args.decode, args.standalone, args.mesh)
+    target_count = sum(
+        len(group["targets"])
+        for job in config["scrape_configs"]
+        for group in job["static_configs"]
+    )
     # JSON is valid YAML and avoids a YAML dependency inside the model image.
     save_json(output / "prometheus.yml", config)
     status = {
@@ -299,7 +312,7 @@ def run(args) -> int:
                 prometheus_url = wait_for_prometheus(
                     collector,
                     output / "prometheus.log",
-                    len(args.prefill) + len(args.decode) + 1,
+                    target_count,
                 )
                 # Establish counter baselines before the next benchmark begins.
                 time.sleep(6)
@@ -351,7 +364,7 @@ def run(args) -> int:
                 notes.append(
                     f"Benchmark exited with code {benchmark_rc}; available samples are retained."
                 )
-            data = empty_report(start, end, args.model, [])
+            data = empty_report(start, end, args.model, [], deployment)
             try:
                 if prometheus_url is None:
                     raise RuntimeError("No Prometheus collector is available")
@@ -361,7 +374,7 @@ def run(args) -> int:
                         prometheus_url,
                         start,
                         end,
-                        len(args.prefill) + len(args.decode) + 1,
+                        target_count,
                         lambda: received_signal is not None,
                     )
                 except (OSError, ValueError, KeyError, RuntimeError) as exc:
@@ -372,9 +385,10 @@ def run(args) -> int:
                     prometheus_url,
                     start,
                     max(collection_end, start + 1),
+                    deployment=deployment,
                     step=REPORT_STEP,
                     model=args.model,
-                    title="Agentic PD inference report",
+                    title=f"Agentic {deployment} inference report",
                     diagnostics=status["errors"],
                 )
                 targets = get_json(prometheus_url + "/api/v1/targets")
@@ -446,8 +460,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--prefill", action="append", required=True)
-    parser.add_argument("--decode", action="append", required=True)
+    parser.add_argument("--prefill", action="append", default=[])
+    parser.add_argument("--decode", action="append", default=[])
+    parser.add_argument("--standalone", action="append", default=[])
     parser.add_argument("--mesh", required=True)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -455,6 +470,10 @@ def main():
         args.command.pop(0)
     if not args.command:
         parser.error("A benchmark command is required after --")
+    if args.standalone and (args.prefill or args.decode):
+        parser.error("--standalone cannot be combined with --prefill/--decode")
+    if not args.standalone and (not args.prefill or not args.decode):
+        parser.error("PD collection requires both --prefill and --decode")
     return run(args)
 
 
