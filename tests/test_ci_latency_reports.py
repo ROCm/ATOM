@@ -39,6 +39,7 @@ def test_targets_preserve_distinct_hosts_ports_and_roles(collector):
     config = collector.scrape_config(
         ["10.0.0.1:8010", "10.0.0.1:8011"],
         ["10.0.0.2:8020", "10.0.0.3:8020"],
+        [],
         "127.0.0.1:30100",
     )
     api, mesh = config["scrape_configs"]
@@ -49,7 +50,9 @@ def test_targets_preserve_distinct_hosts_ports_and_roles(collector):
     assert api["static_configs"][1]["targets"] == ["10.0.0.2:8020", "10.0.0.3:8020"]
     assert mesh["static_configs"][0]["targets"] == ["127.0.0.1:30100"]
     with pytest.raises(ValueError):
-        collector.scrape_config(["user:secret@host:8010"], ["host:8020"], "host:29100")
+        collector.scrape_config(
+            ["user:secret@host:8010"], ["host:8020"], [], "host:29100"
+        )
 
 
 @pytest.mark.parametrize("exit_code", [0, 17])
@@ -66,6 +69,7 @@ def test_collector_setup_failure_preserves_benchmark_exit_and_diagnostic_report(
         model="test",
         prefill=["127.0.0.1:8010"],
         decode=["127.0.0.1:8020"],
+        standalone=[],
         mesh="127.0.0.1:29100",
         command=[
             sys.executable,
@@ -136,6 +140,7 @@ def test_publication_failure_preserves_benchmark_exit(
         model="test",
         prefill=["127.0.0.1:8010"],
         decode=["127.0.0.1:8020"],
+        standalone=[],
         mesh="127.0.0.1:29100",
         command=[sys.executable, "-c", f"raise SystemExit({exit_code})"],
     )

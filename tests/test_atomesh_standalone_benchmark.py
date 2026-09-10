@@ -66,6 +66,7 @@ def test_glm52_standalone_agentic_cases(monkeypatch):
         )
         assert cell["env"]["standalone"]["LMCACHE_MAX_LOCAL_CPU_SIZE"] == "256"
         assert cell["env"]["standalone"]["LMCACHE_CHUNK_SIZE"] == "256"
+        assert cell["env"]["standalone"]["ATOM_ENABLE_METRICS_DEVICE_TIMER"] == "1"
         assert "method" not in cell["server_args"]
 
 
