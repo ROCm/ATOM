@@ -314,7 +314,7 @@
         "tp": 4,
         "kv_cache_dtype": "fp8",
         "trust_remote_code": true,
-        "extra_args": "--gpu-memory-utilization 0.9 --block-size 128 --max-num-batched-tokens 8192 --attn-prefill-chunk-size 16384 --state-checkpoint-interval-tokens 32768 --enable_prefix_caching --online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"vision_tower\", \"multi_modal_projector\", \"patch_merge_mlp\", \"*block_sparse_moe\"]}' --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}' --default-chat-template-kwargs '{\"thinking_mode\": \"enabled\"}'"
+        "extra_args": "--gpu-memory-utilization 0.9 --block-size 128 --max-num-batched-tokens 8192 --attn-prefill-chunk-size 16384 --state-checkpoint-interval-tokens 32768 --enable_prefix_caching --online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"vision_tower\", \"multi_modal_projector\", \"patch_merge_mlp\", \"*block_sparse_moe\"]}' --default-chat-template-kwargs '{\"thinking_mode\": \"enabled\"}'"
       },
       "variants": [
         {
