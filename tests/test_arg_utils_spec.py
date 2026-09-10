@@ -131,6 +131,11 @@ class TestMoEBackendCli:
         assert args.moe_backend == "mega"
         assert args._get_engine_kwargs()["moe_backend"] == "mega"
 
+    def test_wideep_backend(self):
+        args = self._parse(["--moe-backend", "wideep"])
+        assert args.moe_backend == "wideep"
+        assert args._get_engine_kwargs()["moe_backend"] == "wideep"
+
 
 class TestMoEAll2AllBackendCli:
     def _parse(self, argv):
