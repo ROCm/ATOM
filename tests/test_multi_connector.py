@@ -893,3 +893,14 @@ def test_real_constructor_populates_the_pairing_state(monkeypatch, pp_rank, hold
     w.start_load_kv(MultiConnectorMetadata([ConnectorMetadata(), _save_meta(9)]))
     out = w.get_finished()
     assert out.finished_sending == (set() if holds_send else {9})
+
+
+def test_worker_forwards_kv_cache_ready_hook_to_capable_sub_connectors():
+    ready_calls = []
+    capable = FakeWorkerSub()
+    capable.record_kv_cache_ready = lambda req_ids: ready_calls.append(req_ids)
+    worker = _worker([FakeWorkerSub(), capable])
+
+    worker.record_kv_cache_ready([11, 12])
+
+    assert ready_calls == [[11, 12]]

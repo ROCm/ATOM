@@ -130,6 +130,17 @@ class LMCacheOffloadConnector(KVConnectorBase):
     def get_finished_recv_blocks(self):
         return self._impl.get_finished_recv_blocks()
 
+    def record_kv_cache_ready(self, req_ids) -> None:
+        """Pass the prefill-ready event on to an impl that wants one.
+
+        Guarded rather than a plain forward because no offload impl needs it
+        now: the event exists only for the Mooncake producer's DSA index
+        staging stream.
+        """
+        callback = getattr(self._impl, "record_kv_cache_ready", None)
+        if callable(callback):
+            callback(req_ids)
+
     def close(self) -> None:
         """Join the impl's save/load executors at worker teardown.
 

@@ -319,6 +319,13 @@ class MultiConnector(KVConnectorBase):
                         ).add(operation if operation is not None else req.req_id)
             c.start_load_kv(m)
 
+    def record_kv_cache_ready(self, req_ids: list) -> None:
+        """Forward a prefill-ready event hook to connector implementations."""
+        for connector in self._connectors:
+            callback = getattr(connector, "record_kv_cache_ready", None)
+            if callable(callback):
+                callback(req_ids)
+
     def get_finished(self) -> KVConnectorOutput:
         recv: set = set()
         failed: set = set()

@@ -430,7 +430,8 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
 
 
 class KimiAiterMLAGDNMetadataBuilder(_KimiMLAGDNCommon, AiterMLAMetadataBuilder):
-    pass
+    def _supports_dcp_index_staging(self) -> bool:
+        return False
 
 
 class KimiTritonMLAGDNMetadataBuilder(_KimiMLAGDNCommon, TritonMLAMetadataBuilder):
