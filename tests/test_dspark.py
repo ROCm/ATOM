@@ -1049,6 +1049,19 @@ def _proposer_with_graph_bs(
     return p
 
 
+def _install_block_halves(p, inner):
+    """Give a stub draft model the two halves ``DSparkDraftModel`` declares.
+
+    V4 keeps its backbone and head on an inner compiled module and the real
+    ``DeepseekV4DSpark`` forwards to them exactly like this, so the double
+    stays on the surface the proposer actually uses.
+    """
+    p.model.model = inner
+    p.model.block_backbone = lambda ids, pos, num_draft: inner(ids, pos, num_draft)
+    p.model.head_and_sample = lambda out, ids, _: inner.head_and_sample(*out, ids)
+    return p
+
+
 def _run_propose(p, fc, scheduled_bs, monkeypatch, seen):
     import atom.spec_decode.dspark_proposer as mod
 
@@ -1081,7 +1094,7 @@ def _run_propose(p, fc, scheduled_bs, monkeypatch, seen):
                 torch.zeros(hc_hidden, p.mtp_k),
             )
 
-    p.model.model = _Inner()
+    _install_block_halves(p, _Inner())
     monkeypatch.setattr(mod, "get_forward_context", lambda: fc)
     return p.propose(
         target_token_ids=None,
@@ -1409,7 +1422,7 @@ def test_the_warm_marks_its_context_as_a_draft(monkeypatch):
         def head_and_sample(normed, hc_hidden, anchor_ids):
             return None, None
 
-    p.model.model = _Inner()
+    _install_block_halves(p, _Inner())
     import atom.spec_decode.dspark_proposer as mod
 
     monkeypatch.setattr(mod, "get_forward_context", lambda: fc)
@@ -1477,7 +1490,7 @@ def test_the_block_wires_both_its_backbone_and_its_head_into_the_pass(monkeypatc
             ran.append("head")
             return None, None
 
-    p.model.model = _Inner()
+    _install_block_halves(p, _Inner())
     fc = _stub_forward_context(scheduled_bs=8, target_bs=8)
     import atom.spec_decode.dspark_proposer as mod
 
@@ -1523,7 +1536,7 @@ def test_the_block_warms_where_the_whole_rolling_window_is_valid(monkeypatch, wi
         def head_and_sample(normed, hc_hidden, anchor_ids):
             return None, None
 
-    p.model.model = _Inner()
+    _install_block_halves(p, _Inner())
     fc = _stub_forward_context(scheduled_bs=8, target_bs=8)
     import atom.spec_decode.dspark_proposer as mod
 
@@ -1558,7 +1571,7 @@ def test_warming_the_block_on_a_dummy_context_is_refused(monkeypatch):
         def head_and_sample(normed, hc_hidden, anchor_ids):
             return None, None
 
-    p.model.model = _Inner()
+    _install_block_halves(p, _Inner())
     fc = _stub_forward_context(scheduled_bs=8, target_bs=8)
     import atom.spec_decode.dspark_proposer as mod
 
@@ -1574,23 +1587,47 @@ def test_warming_the_block_on_a_dummy_context_is_refused(monkeypatch):
     assert reached == ["backbone"]
 
 
-def test_both_flavors_declare_one_block_pass_bound_to_their_own_halves(monkeypatch):
-    """Each flavor declares exactly one block pass, bound to its own functions.
+def test_both_flavors_declare_one_block_pass_bound_to_the_same_halves(monkeypatch):
+    """One block pass with one set of bindings, whichever flavor this is.
 
-    The bindings are the whole point of the declaration: both flavors reach
-    `propose`'s one stage/run/label path, and the backbones differ in shape.
+    The bindings used to be chosen per flavor; the halves they name now live on
+    the draft model, so the declaration no longer knows which drafter it serves.
     """
     from atom.spec_decode.dspark_proposer import DSparkProposer
 
     p = _proposer_with_graph_bs(monkeypatch)
     assert p.draft_graphs == (p.block,)
     assert p.block.forward == p._block_backbone
+    assert p.block.epilogue == p._block_head
 
     monkeypatch.setattr(DSparkProposer, "_with_draft", True, raising=False)
     p._build_draft_graphs()
     assert p.draft_graphs == (p.block,)
-    assert p.block.forward == p._paged_block_backbone
-    assert p.block.epilogue == p._paged_block_head
+    assert p.block.forward == p._block_backbone
+    assert p.block.epilogue == p._block_head
+
+
+def test_the_backbone_gets_the_positions_the_slot_mapping_was_built_from(monkeypatch):
+    """The paged flavor hands over `_blk_positions`, not the staged anchors.
+
+    The slot mapping and the positions the layers see have to be one tensor.
+    The window flavor has no such buffer and passes the anchors straight
+    through -- the whole of the difference left after the halves moved onto
+    the model.
+    """
+    from atom.spec_decode.dspark_proposer import DSparkProposer
+
+    p = _proposer_with_graph_bs(monkeypatch)
+    anchors = torch.arange(4, dtype=torch.int64)
+    assert p._block_positions(4, anchors) is anchors
+
+    t = p.draft_tokens_per_seq
+    monkeypatch.setattr(DSparkProposer, "_with_draft", True, raising=False)
+    p._blk_positions = torch.arange(8 * t, dtype=torch.int64).view(8, t)
+    got = p._block_positions(4, anchors)
+    assert got.data_ptr() == p._blk_positions.data_ptr()
+    assert got.shape == (4 * t,)
+    assert torch.equal(got, p._blk_positions[:4].reshape(-1))
 
 
 def test_qk_norm_rope_short_circuits_dummy_run():

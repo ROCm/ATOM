@@ -1159,9 +1159,32 @@ class DeepseekV4DSpark(DSparkDraftModel):
                 f"the compiled graph at CompilationLevel >= DYNAMO_ONCE."
             )
 
+        return self.head_and_sample(
+            self.block_backbone(input_ids, positions, T), input_ids, T
+        )
+
+    def block_backbone(
+        self,
+        input_ids: torch.Tensor,  # [B]  anchor token per request (x0)
+        positions: torch.Tensor,  # [B]  anchor position per request
+        num_draft: int,
+    ):
+        """The parallel half: the compiled backbone over the whole draft width.
+
+        Returns the inner's ``(normed, hc_hidden)`` pair untouched -- the mHC
+        hidden is the pre-norm reduction the confidence head needs. Positions
+        are the ANCHOR's; expanding them across the block happens inside the
+        compiled region.
+        """
         # __call__, not .forward -- the decorator's compiled dispatch lives there.
-        normed, hc_hidden = self.model(input_ids, positions, T)
-        return self.model.head_and_sample(normed, hc_hidden, input_ids)
+        return self.model(input_ids, positions, num_draft)
+
+    def head_and_sample(self, out, anchor_ids: torch.Tensor, num_draft: int):
+        """The sequential half: LM head, then the Markov sampler. ``num_draft``
+        is taken for the shared surface and unused -- the width is carried by
+        ``hc_hidden``'s middle dimension."""
+        normed, hc_hidden = out
+        return self.model.head_and_sample(normed, hc_hidden, anchor_ids)
 
 
 @support_torch_compile

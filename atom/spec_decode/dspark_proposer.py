@@ -60,47 +60,56 @@ class DSparkProposer(Drafter):
         would claim a pass is warmable when it is not.
 
         Both flavors declare the same two-part pass -- backbone, then LM head
-        plus Markov sampler, captured together -- and differ only in the
-        bindings, because the backbones take different shapes (V4 ``[bs, T]``
-        positions and an mHC hidden; K3 flat ``[bs*T]`` and none) and reach
-        their context differently (private rolling window vs shared paged pool).
+        plus Markov sampler, captured together -- with the same bindings. What
+        differs lives behind ``DSparkDraftModel``'s two halves, not here; the
+        one exception is which positions the backbone gets, and
+        ``_block_positions`` is the only place that knows.
 
         No ``mtp_k`` floor, unlike eagle's: the whole width drafts in ONE pass.
         """
-        forward, epilogue, warmup_inputs = (
-            (
-                self._paged_block_backbone,
-                self._paged_block_head,
-                self._paged_block_warmup_inputs,
-            )
-            if self._with_draft
-            else (self._block_backbone, self._block_head, self._block_warmup_inputs)
-        )
         self.block = DraftGraph(
-            forward=forward,
-            epilogue=epilogue,
+            forward=self._block_backbone,
+            epilogue=self._block_head,
             capture_epilogue=True,
             inputs={
                 "anchor_ids": StagedInput(dtype=torch.int32),
                 "anchor_positions": StagedInput(dtype=torch.int64),
             },
-            warmup_inputs=warmup_inputs,
+            warmup_inputs=self._block_warmup_inputs,
         )
         return (self.block,)
 
     def _block_warmup_inputs(self, running_bs, *, anchor_positions, **_):
-        """A plausible warmup batch: anchors past the window, real ring slots.
+        """A plausible warmup batch, in whichever terms the context is addressed.
 
-        Anchors at position ``window`` leave every window slot valid, which is
-        what a steady-state decode draws. Warming at position 0 would mask all
-        but the last slot and compile a shape serving never asks for.
+        Both flavors want the anchor that leaves the whole block reachable and
+        reach it from opposite ends: on the rolling window position ``window``
+        leaves every slot valid, where 0 would mask all but the last; on the
+        paged pool block 0 is the only page a synthetic batch can be sure this
+        rank owns, so anchors sit at 0 to stay inside it.
+
+        The paged metadata build runs HERE, once per size, because everything
+        host-side about the batch must stay outside a recording. That makes the
+        recording a ``1 + T`` context replayed against thousand-token ones --
+        argued, and asserted, in `_init_block_persistent_buffers`.
         """
         fc = get_forward_context()
         assert not fc.context.is_dummy_run, (
-            "warmup needs a real forward context; a dummy one bakes the "
-            "all-zero rolling window and only shows up as lost acceptance"
+            "warmup needs a real forward context; a dummy one has neither a "
+            "populated rolling window nor any paged state"
         )
-        anchor_positions.fill_(int(self.model.window_size))
+        if not self._with_draft:
+            anchor_positions.fill_(int(self.model.window_size))
+            return
+        anchor_positions.zero_()
+        self._build_paged_block_metadata(
+            fc,
+            fc.attn_metadata,
+            anchor_positions,
+            scheduled_bs=running_bs,
+            # Anchors at 0, so every row's context is exactly the block.
+            max_seqlen_k=1 + self.draft_tokens_per_seq,
+        )
 
     def _block_head(self, out, running_bs, *, anchor_ids, **_):
         """The block's epilogue: LM head, then the sequential Markov sampler.
@@ -119,17 +128,32 @@ class DSparkProposer(Drafter):
         builder, and leaving it out of the warm is exactly how
         `hipModuleLoadData` went 0 -> 4 on the reproducer once.
         """
-        normed, hc_hidden = out
-        return self.model.model.head_and_sample(normed, hc_hidden, anchor_ids)
+        return self.model.head_and_sample(out, anchor_ids, self.draft_tokens_per_seq)
 
     def _block_backbone(self, running_bs, *, anchor_ids, anchor_positions):
         """The block's forward: the parallel backbone over the whole draft width.
 
-        Nothing of the target's metadata is installed. The ring slots the model
-        reads off the forward context are already this length: `prepare_decode`
-        publishes them at the padded batch, which is the batch this runs at.
+        Nothing of the target's metadata is installed. Whatever addressing the
+        model reads off the forward context is already this length, published
+        at the padded batch by `prepare_decode` or `_build_paged_block_metadata`.
         """
-        return self.model.model(anchor_ids, anchor_positions, self.draft_tokens_per_seq)
+        return self.model.block_backbone(
+            anchor_ids,
+            self._block_positions(running_bs, anchor_positions),
+            self.draft_tokens_per_seq,
+        )
+
+    def _block_positions(self, running_bs, anchor_positions):
+        """The ``positions`` this drafter's backbone takes; see
+        `DSparkDraftModel.block_backbone` for why the flavors disagree.
+
+        The paged flavor reads `_blk_positions` rather than the staged anchors
+        they derive from: the slot mapping was built from those exact numbers,
+        so the block's two descriptions of itself stay one tensor.
+        """
+        if not self._with_draft:
+            return anchor_positions
+        return self._blk_positions[:running_bs].view(-1)
 
     def _init_draft_block_buffers(self) -> None:
         """Preallocate the block-pass metadata the separate-draft path rebinds."""
@@ -199,7 +223,7 @@ class DSparkProposer(Drafter):
             self._blk_padded_heads = impl.padded_num_heads
         # These buffers ARE the block's answer to "how does a recording made on
         # a 1 + T context stay right against a 100k one" (see
-        # `_paged_block_warmup_inputs`): the capture bakes their addresses,
+        # `_block_warmup_inputs`): the capture bakes their addresses,
         # `get_mla_metadata_v1` re-plans their contents every step from the real
         # lengths, and their capacity below is a function of batch, block width
         # and head count -- never of context length.
@@ -679,70 +703,6 @@ class DSparkProposer(Drafter):
 
     # ---- separate-draft-model path (Kimi-K3) --------------------------------
 
-    def _paged_block_warmup_inputs(self, running_bs, *, anchor_positions, **_):
-        """A plausible warmup batch: anchors in page 0, real block metadata.
-
-        Anchors at position 0, the opposite of V4's choice: the context here is
-        paged, and block 0 is the only page a synthetic one can be sure this
-        rank owns. Position 0 keeps the whole block inside it.
-
-        The recording is therefore made on a `1 + T` token context and replayed
-        against thousand-token ones. The decode does depend on that length --
-        it arrives in `kv_indptr` and in the work plan derived from it -- so
-        what makes this sound is WHERE the dependence lives: the PERSISTENT
-        (ps=1) kernel has a fixed grid and takes its per-batch work from
-        descriptor buffers whose capacity is context-independent
-        (`get_mla_metadata_info_v1` is keyed on batch, block width and heads)
-        and whose contents `_build_paged_block_metadata` re-plans every step.
-        Nothing about the length is decided host-side, which is the only kind
-        of decision a capture can freeze. `_init_block_persistent_buffers`
-        asserts that premise rather than trusting it -- the split-KV fallback
-        breaks exactly this property.
-
-        The metadata build runs HERE, once per size, which is the point of the
-        split: everything host-side about the batch (`get_mla_metadata_v1`, the
-        Triton index generator's grid) must stay outside a recording. `warmup`
-        calls this before the eager pass and not again for the capture, so the
-        recording sees buffers already filled.
-        """
-        fc = get_forward_context()
-        assert not fc.context.is_dummy_run, (
-            "warmup needs a real forward context; a dummy one has no paged "
-            "state, so the block would record against an unallocated cache"
-        )
-        anchor_positions.zero_()
-        self._build_paged_block_metadata(
-            fc,
-            fc.attn_metadata,
-            anchor_positions,
-            scheduled_bs=running_bs,
-            # Anchors at 0, so every row's context is exactly the block.
-            max_seqlen_k=1 + self.draft_tokens_per_seq,
-        )
-
-    def _paged_block_backbone(self, running_bs, *, anchor_ids, **_):
-        """The block's forward: the parallel backbone over the whole draft width.
-
-        Positions come from `_blk_positions`, not the staged `anchor_positions`
-        they derive from: the slot mapping was built against those exact
-        numbers, so reading the buffer keeps the block's two descriptions of
-        itself one tensor instead of two that have to agree.
-        """
-        return self.model.block_backbone(
-            anchor_ids,
-            self._blk_positions[:running_bs].view(-1),
-            self.draft_tokens_per_seq,
-        )
-
-    def _paged_block_head(self, out, running_bs, *, anchor_ids, **_):
-        """The block's epilogue: LM head, then the sequential Markov sampler.
-
-        Captured for the reasons V4's is: a fixed-trip loop over the draft
-        width, no data-dependent step, and a per-shape flydsl builder that JITs
-        mid-serve unless warmed.
-        """
-        return self.model.head_and_sample(out, anchor_ids, self.draft_tokens_per_seq)
-
     def _build_paged_block_metadata(
         self,
         forward_context,
@@ -986,7 +946,7 @@ class DSparkProposer(Drafter):
     def _paged_pad_ctx_len(self) -> int:
         """A pad row's KV length, in this rank's own units.
 
-        The block anchored at position 0 -- the row `_paged_block_warmup_inputs`
+        The block anchored at position 0 -- the row `_block_warmup_inputs`
         builds, and so the row every recording was captured on. Under DCP the
         rank holds its round-robin share of those `1 + T` tokens.
 
