@@ -1289,9 +1289,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # Checked BEFORE the use_triton_decode override below, which forces this
         # local False (sending prep down branch C) while apply() still runs the
         # GUGU kernel on decode over a view of those FlyDSL weights.
-        assert not (
-            use_triton_gfx1250_silu and layer.num_fused_shared_experts > 0
-        ), (
+        assert not (use_triton_gfx1250_silu and layer.num_fused_shared_experts > 0), (
             "the Triton GUGU MoE path cannot serve fused shared experts "
             f"(num_fused_shared_experts={layer.num_fused_shared_experts}): its "
             "weight prep does not stash the dense shared-expert slices that "
