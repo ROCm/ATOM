@@ -67,8 +67,6 @@ API cache-hit value are excluded. Cache hits do not measure PD transfer savings:
 the transfer backend may still require a full transfer for its topology/state.
 Use each panel's legend to toggle the three curves independently. Tables and CSV
 include the tier quantities and selected percentage curves.
-See [metric definitions](../../../../docs/agentic_metrics.md) for timing boundaries
-and the distinction between PD transfer wait and pure RDMA time.
 
 ## Collection lifecycle
 
