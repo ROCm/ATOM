@@ -33,7 +33,14 @@ pytestmark = pytest.mark.skipif(
 def _reset_once_log(monkeypatch):
     """The one-time log latch is module state; keep tests independent."""
     attention_mla._flydsl_gather_logged.clear()
+    monkeypatch.setattr(attention_mla, "_FLYDSL_GATHER_AVAILABLE", True)
     monkeypatch.setattr(attention_mla, "_FLYDSL_GATHER_FP8_AVAILABLE", True)
+    monkeypatch.setattr(
+        attention_mla,
+        "gather_kv_b_proj_flydsl",
+        lambda *a, **k: pytest.fail("unexpected FlyDSL gather call"),
+        raising=False,
+    )
     yield
     attention_mla._flydsl_gather_logged.clear()
 
@@ -46,9 +53,7 @@ def _fake_self(use_flydsl):
             weight_scale=torch.empty(3072, 1, dtype=torch.float32, device="meta"),
         ),
         _k_scale=torch.ones(1, device="meta"),
-        use_flydsl_gather_kv_b_proj=(
-            use_flydsl and attention_mla.gather_kv_b_proj_flydsl is not None
-        ),
+        use_flydsl_gather_kv_b_proj=bool(use_flydsl),
     )
 
 
@@ -89,12 +94,16 @@ def test_flag_on_uses_flydsl(_spies, monkeypatch):
     assert _spies == ["flydsl"]
 
 
-def test_unavailable_flydsl_falls_back_to_triton(_spies, monkeypatch):
-    monkeypatch.setattr(attention_mla, "gather_kv_b_proj_flydsl", None)
+@pytest.mark.parametrize("symbol_present", [False, True])
+def test_unavailable_flydsl_falls_back_to_triton(_spies, monkeypatch, symbol_present):
+    monkeypatch.setattr(attention_mla, "_FLYDSL_GATHER_AVAILABLE", False)
+    monkeypatch.setattr(attention_mla, "_FLYDSL_GATHER_FP8_AVAILABLE", False)
+    if not symbol_present:
+        monkeypatch.delattr(attention_mla, "gather_kv_b_proj_flydsl")
     obj = _fake_self(use_flydsl=True)
     _call(obj)
     assert _spies == ["triton"]
-    assert obj.use_flydsl_gather_kv_b_proj is False
+    assert obj.use_flydsl_gather_kv_b_proj is True  # Env preference is unchanged.
 
 
 def test_rejected_shape_falls_back_and_stops_retrying(_spies, monkeypatch, caplog):

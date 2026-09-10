@@ -473,19 +473,23 @@ if is_rocm_aiter_fp4bmm_enabled():
     from atom.model_ops.utils import quark_post_load_weights
 
 
-# Optional kernels are imported independently: older AITER builds can provide
-# the BF16 gather without FP8 FMHA or the FP8-output gather API.
+# Optional flydsl backend for `_kv_b_proj_gather`, gated by
+# ATOM_USE_FLYDSL_GATHER_KV_B_PROJ.
 try:
     from aiter.ops.flydsl import gather_kv_b_proj_flydsl
-except ImportError:
-    gather_kv_b_proj_flydsl = None
 
+    _FLYDSL_GATHER_AVAILABLE = True
+except Exception:  # noqa: BLE001 -- optional kernel; absence is the whole answer
+    _FLYDSL_GATHER_AVAILABLE = False
+
+# Import FP8 FMHA independently so older AITER builds can still use BF16 gather.
 try:
     from aiter.ops.flydsl import flydsl_flash_attn_fp8_func
 except ImportError:
     flydsl_flash_attn_fp8_func = None
 
-_FLYDSL_GATHER_FP8_AVAILABLE = gather_kv_b_proj_flydsl is not None and {
+# Import success and support for FP8 output are separate capabilities.
+_FLYDSL_GATHER_FP8_AVAILABLE = _FLYDSL_GATHER_AVAILABLE and {
     "k_out_scale",
     "v_out_scale",
 }.issubset(signature(gather_kv_b_proj_flydsl).parameters)
@@ -752,10 +756,7 @@ class MLAAttention(nn.Module):
         # Backend for the cached-prefix gather in `_kv_b_proj_gather`. Read once
         # here rather than per call: the gather runs once per full-attention
         # layer per prefill chunk.
-        self.use_flydsl_gather_kv_b_proj = (
-            envs.ATOM_USE_FLYDSL_GATHER_KV_B_PROJ
-            and gather_kv_b_proj_flydsl is not None
-        )
+        self.use_flydsl_gather_kv_b_proj = bool(envs.ATOM_USE_FLYDSL_GATHER_KV_B_PROJ)
         # Backend for the prefill flash-attention sites. `_fmha_d` is the head dim
         # flash-attention actually sees, which is NEITHER `self.head_dim`
         # (kv_lora_rank + qk_rope_head_dim, 576) NOR always `self.qk_head_dim`
@@ -1667,7 +1668,7 @@ class MLAAttention(nn.Module):
         weight_scale = getattr(self.kv_b_proj, "weight_scale", None)
         preshuffled = getattr(weight, "is_shuffled", False)
 
-        if self.use_flydsl_gather_kv_b_proj and gather_kv_b_proj_flydsl is not None:
+        if self.use_flydsl_gather_kv_b_proj and _FLYDSL_GATHER_AVAILABLE:
             fp8_outputs = (
                 _FLYDSL_GATHER_FP8_AVAILABLE
                 and kv_out_scales is not None
