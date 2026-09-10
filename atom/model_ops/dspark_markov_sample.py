@@ -37,6 +37,16 @@ lowest index attaining the tile max is taken, and the cross-tile reduce takes
 the lowest index among tiles attaining the global max -- tiles being ordered by
 vocab id, that is the global lowest index.
 
+NaN. ``torch.argmax`` orders NaN above every number, so a row carrying one
+returns that lane rather than the largest finite one, and an all-NaN row
+returns 0. The reduce here is written around ``==``, which no NaN lane
+satisfies, so both stages carry NaN candidates on the side and prefer them --
+without that, an all-NaN row leaves the ``vocab_size`` tie-break sentinel
+standing and returns it as the id, which the caller then gathers a ``[V, r]``
+embedding row with. A NaN reaching this op means the draft logits are already
+garbage and the block will be rejected by the target either way; what matters
+is that the id stays inside the table.
+
 CUDA-graph safety. Both launches have host-int grids derived from static
 shapes, no host sync and no ``.item()``; the ``prev_ids`` dependence is a
 data-dependent *address* inside the W1 gather the caller already does, never a
@@ -120,6 +130,23 @@ def _dspark_markov_argmax_stage1(
         other=0.0,
     )
     vals = tl.where(v_mask[None, :], base.to(tl.float32) + acc, float("-inf"))
+    # NaN lanes are taken out of the max/equality reduce and carried separately.
+    # `x == max` is false for every lane of an all-NaN row, so the plain reduce
+    # would leave `cand` at the `vocab_size` tie-break sentinel and return it as
+    # the id -- one past the table the caller gathers with. torch.argmax instead
+    # orders NaN above every number, lowest index winning ties, so that is what
+    # the split below reproduces.
+    nan_mask = (vals != vals) & v_mask[None, :]  # noqa: PLR0124 - Triton NaN check
+    # `vals` reduces directly rather than through a NaN-scrubbed copy. Holding
+    # a second [BLOCK_ROW, BLOCK_V] fp32 tile beside the register-resident
+    # accumulator costs occupancy: the scrubbed copy measured +14% on the
+    # BLOCK_ROW=32 specialisation (36.3 -> 41.5us at V=163840, against a 0.3us
+    # spread; the 16 and 64 tiles moved less than their noise). It buys nothing,
+    # because either tl.max NaN convention lands somewhere the row-level
+    # overwrite below covers -- propagating leaves `tile_max` NaN so no lane
+    # matches and `cand` stays at the sentinel, ignoring leaves the largest
+    # number and its id -- and a row with a NaN takes `nan_idx`/NaN regardless.
+    # A row without one never differed to begin with.
     tile_max = tl.max(vals, axis=1)
     # `& v_mask` also covers the all--inf row: without it a padded lane, which
     # is -inf too, could win the id.
@@ -127,6 +154,13 @@ def _dspark_markov_argmax_stage1(
         (vals == tile_max[:, None]) & v_mask[None, :], offs_v[None, :], vocab_size
     )
     tile_idx = tl.min(cand, axis=1)
+    # Lowest NaN id in this tile, or `vocab_size` when the tile has none.
+    nan_idx = tl.min(tl.where(nan_mask, offs_v[None, :], vocab_size), axis=1)
+    row_has_nan = nan_idx < vocab_size
+    # A NaN partial value is the marker stage 2 reads to order this tile above
+    # every finite one, mirroring the ordering applied within the tile here.
+    tile_max = tl.where(row_has_nan, float("nan"), tile_max)
+    tile_idx = tl.where(row_has_nan, nan_idx, tile_idx)
 
     tl.store(part_val_ptr + tile * num_rows + offs_row, tile_max, mask=row_mask)
     tl.store(part_idx_ptr + tile * num_rows + offs_row, tile_idx, mask=row_mask)
@@ -154,9 +188,22 @@ def _dspark_markov_argmax_stage2(
     idxs = tl.load(
         part_idx_ptr + offs_tile * num_rows + row, mask=tile_mask, other=vocab_size
     )
+    # Same NaN ordering as stage 1, now across tiles: a tile that saw a NaN
+    # carries a NaN partial value and wins over every finite tile, and tiles
+    # being ordered by vocab id the lowest such tile holds the lowest NaN id.
+    nan_mask = (vals != vals) & tile_mask  # noqa: PLR0124 - Triton NaN check
+    # Reduced over `vals` rather than a scrubbed copy for the reason stage 1
+    # gives: `nan_res` below overwrites every row this could differ on.
     best = tl.max(vals, axis=0)
     cand = tl.where((vals == best) & tile_mask, idxs, vocab_size)
-    tl.store(out_ptr + row, tl.min(cand, axis=0).to(tl.int64))
+    res = tl.min(cand, axis=0)
+    nan_res = tl.min(tl.where(nan_mask, idxs, vocab_size), axis=0)
+    res = tl.where(nan_res < vocab_size, nan_res, res)
+    # Belt and braces: the caller feeds this id straight into a [V, r] embedding
+    # gather, where an out-of-range id is an illegal access on a device queue
+    # rather than an exception. Nothing above can reach the sentinel any more,
+    # so this only bounds a future reduce that regresses the property.
+    tl.store(out_ptr + row, tl.minimum(res, vocab_size - 1).to(tl.int64))
 
 
 def _dspark_markov_argmax_fake(
