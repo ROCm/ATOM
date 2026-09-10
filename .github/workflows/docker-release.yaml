@@ -305,8 +305,11 @@ jobs:
             echo "rocm101-nightly tracking build: build + test only, skipping push."
             exit 0
           fi
-          # rocm10 flavor tags carry a -rocm10 suffix and never update
-          # latest (the ROCm 7 apt-image line stays the default).
+          # rocm10 flavor tags carry a -rocm10 suffix: an immutable
+          # nightly_<ts>-rocm10 plus a rolling latest-rocm10, so the line has a
+          # stable name to pull while it runs alongside ROCm 7. Bare latest is
+          # left alone (the ROCm 7 apt-image line stays the default) — the
+          # eventual switch moves that pointer and nothing else.
           FLAVOR_SUFFIX=""
           if [ "${{ matrix.base_image }}" = "rocm10" ]; then
             FLAVOR_SUFFIX="-rocm10"
@@ -333,8 +336,9 @@ jobs:
             else
               if [ -n "${FLAVOR_SUFFIX}" ]; then
                 docker tag atom_release:ci rocm/atom-dev:${TAG}
-                .github/scripts/docker_push_retry.sh rocm/atom-dev:${TAG}
-                echo "rocm10 flavor: tag rocm/atom-dev:${TAG}. Skipping latest update."
+                docker tag atom_release:ci rocm/atom-dev:latest${FLAVOR_SUFFIX}
+                .github/scripts/docker_push_retry.sh rocm/atom-dev:${TAG} rocm/atom-dev:latest${FLAVOR_SUFFIX}
+                echo "rocm10 flavor: tags rocm/atom-dev:${TAG} and rocm/atom-dev:latest${FLAVOR_SUFFIX}. Skipping latest update."
               else
                 docker tag atom_release:ci rocm/atom-dev:latest
                 docker tag atom_release:ci rocm/atom-dev:${TAG}
@@ -442,8 +446,9 @@ jobs:
             echo "rocm101-nightly tracking build: skipping SGLang push."
             exit 0
           fi
-          # rocm10 flavor tags carry a -rocm10 suffix; sglang-latest is NOT
-          # updated (the ROCm 7 line stays the default).
+          # rocm10 flavor tags carry a -rocm10 suffix, including a rolling
+          # sglang-latest-rocm10. Bare sglang-latest is left alone (the ROCm 7
+          # line stays the default).
           FLAVOR_SUFFIX=""
           if [ "${{ matrix.base_image }}" = "rocm10" ]; then
             FLAVOR_SUFFIX="-rocm10"
@@ -462,7 +467,13 @@ jobs:
           docker tag atom_sglang_release:ci rocm/atom-dev:${SGLANG_TAG}
           .github/scripts/docker_push_retry.sh rocm/atom-dev:${SGLANG_TAG}
           if [ -n "${FLAVOR_SUFFIX}" ]; then
-            echo "rocm10 flavor: tag rocm/atom-dev:${SGLANG_TAG}. Skipping sglang-latest update."
+            if [ -z "${SGLANG_TAG_SUFFIX}" ]; then
+              docker tag atom_sglang_release:ci rocm/atom-dev:${SGLANG_LATEST_TAG}${FLAVOR_SUFFIX}
+              .github/scripts/docker_push_retry.sh rocm/atom-dev:${SGLANG_LATEST_TAG}${FLAVOR_SUFFIX}
+              echo "rocm10 flavor: tags rocm/atom-dev:${SGLANG_TAG} and rocm/atom-dev:${SGLANG_LATEST_TAG}${FLAVOR_SUFFIX}. Skipping sglang-latest update."
+            else
+              echo "rocm10 flavor with a custom suffix: tag rocm/atom-dev:${SGLANG_TAG} only. Skipping the rolling and sglang-latest updates."
+            fi
           elif [ -z "${SGLANG_TAG_SUFFIX}" ]; then
             docker tag atom_sglang_release:ci rocm/atom-dev:${SGLANG_LATEST_TAG}
             .github/scripts/docker_push_retry.sh rocm/atom-dev:${SGLANG_LATEST_TAG}
