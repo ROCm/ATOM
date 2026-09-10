@@ -112,6 +112,66 @@ def _make_layer(num_experts, hidden, inter, use_bias, device, seed=0):
     )
 
 
+def _device_us(evt):
+    """Self device (GPU) time for a profiler event, in us, across torch versions."""
+    for attr in (
+        "self_device_time_total",
+        "self_cuda_time_total",
+        "self_hip_time_total",
+    ):
+        v = getattr(evt, attr, None)
+        if v:
+            return float(v)
+    return 0.0
+
+
+def _profile_kernels(args, tokens, step):
+    """Run the eager decode step under the profiler and dump per-kernel GPU time.
+
+    Eager (not graph replay) so kineto/ROCTracer attributes every kernel by
+    name; the per-kernel *device* durations are the same ones the graph replays,
+    so they sum to the graph number -- only the launch gaps between them differ.
+    """
+    from torch.profiler import ProfilerActivity, profile
+
+    activities = [ProfilerActivity.CPU]
+    if hasattr(ProfilerActivity, "CUDA"):
+        activities.append(ProfilerActivity.CUDA)
+
+    for _ in range(5):
+        step()
+    torch.cuda.synchronize()
+
+    with profile(activities=activities) as prof:
+        for _ in range(args.profile_iters):
+            step()
+        torch.cuda.synchronize()
+
+    rows = [
+        (evt.key, evt.count, _device_us(evt))
+        for evt in prof.key_averages()
+        if _device_us(evt) > 0
+    ]
+    rows.sort(key=lambda r: -r[2])
+    total = sum(r[2] for r in rows) or 1.0
+    n = args.profile_iters
+
+    w = 72
+    print(f"\n  ── per-kernel GPU time, tokens={tokens} "
+          f"(eager, {n} iters) ─────────────────────")
+    print(f"  {'kernel':<{w}} {'calls/it':>8} {'us/it':>9} {'%':>6}")
+    print("  " + "-" * (w + 26))
+    for key, count, dev in rows[:35]:
+        name = key if len(key) <= w else key[: w - 3] + "..."
+        print(f"  {name:<{w}} {count / n:>8.1f} {dev / n:>9.2f} {100 * dev / total:>5.1f}")
+    print("  " + "-" * (w + 26))
+    print(f"  {'TOTAL device time / iter':<{w}} {'':>8} {total / n:>9.2f} {100.0:>5.1f}")
+
+    trace_path = f"decode_trace_tokens{tokens}.json"
+    prof.export_chrome_trace(trace_path)
+    print(f"  chrome trace -> {trace_path}")
+
+
 def _run_one(args, tokens):
     device = "cuda"
     act_quant = _ACT_QUANT_BY_FORMAT[args.data_format]
@@ -147,51 +207,24 @@ def _run_one(args, tokens):
             activation=ActivationType.Silu,
         )
 
-    out = step()
-    torch.cuda.synchronize()
+    # Same statistic as op_tests/test_flydsl_grouped_gemm_gfx1250.py: aiter's
+    # run_perftest profiles num_iters calls and returns the average per-iter sum
+    # of every kernel's self_device_time_total (warm iter dropped, IQR-filtered).
+    # That is GPU device time, so it excludes launch latency without needing a
+    # CUDA graph -- testGraph=False matches the FlyDSL bench's `bench` scenario.
+    from aiter.test_common import run_perftest
 
-    # The production decode path replays a CUDA graph, so eager per-call time is
-    # dominated by kernel-launch latency (a ~2.5ms floor at these expert counts)
-    # and is NOT representative. Capture the step into a graph and time replays;
-    # that is the apples-to-apples number vs the FlyDSL bench's graph=True.
-    graph = None
-    if not args.eager:
-        try:
-            side = torch.cuda.Stream()
-            side.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(side):
-                for _ in range(3):
-                    step()
-            torch.cuda.current_stream().wait_stream(side)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                out = step()
-        except Exception as exc:  # noqa: BLE001
-            print(f"  [graph capture failed, falling back to eager: {exc}]", flush=True)
-            graph = None
+    out, us = run_perftest(
+        step,
+        num_warmup=args.warmup,
+        num_iters=args.iters,
+        testGraph=args.test_graph,
+    )
+    stats = {"us": float(us)}
 
-    run = graph.replay if graph is not None else step
-    mode = "graph" if graph is not None else "eager"
+    if args.profile:
+        _profile_kernels(args, tokens, step)
 
-    for _ in range(args.warmup):
-        run()
-    torch.cuda.synchronize()
-
-    starts = [torch.cuda.Event(enable_timing=True) for _ in range(args.iters)]
-    ends = [torch.cuda.Event(enable_timing=True) for _ in range(args.iters)]
-    for i in range(args.iters):
-        starts[i].record()
-        run()
-        ends[i].record()
-    torch.cuda.synchronize()
-
-    per_us = sorted(s.elapsed_time(e) * 1e3 for s, e in zip(starts, ends))
-    stats = {
-        "mode": mode,
-        "min": per_us[0],
-        "median": per_us[len(per_us) // 2],
-        "mean": sum(per_us) / len(per_us),
-    }
     return stats, out
 
 
@@ -208,15 +241,21 @@ def main():
     parser.add_argument("--tokens", type=int, nargs="+", default=[512], metavar="N",
                         help="one or more decode token counts; timed once per value")
     parser.add_argument("--no-bias", action="store_true")
-    parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--iters", type=int, default=100)
+    # FlyDSL bench defaults (op_tests/test_flydsl_grouped_gemm_gfx1250.py).
+    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--iters", type=int, default=101)
+    parser.add_argument("--test-graph", action="store_true",
+                        help="run_perftest testGraph=True (extra hipgraph timing "
+                        "pass); off matches the FlyDSL bench scenario")
     # Accepted for command-line compatibility with the aiter FlyDSL bench; the
     # decode path JITs the triton/gluon kernels and has no FlyDSL AOT cache.
     parser.add_argument("--no-check-aot-cache", action="store_true",
                         help="ignored (no FlyDSL AOT cache on the triton decode path)")
-    parser.add_argument("--eager", action="store_true",
-                        help="skip CUDA-graph capture; time eager apply() (launch-"
-                        "latency bound, not representative of production decode)")
+    parser.add_argument("--profile", action="store_true",
+                        help="dump a per-kernel GPU-time breakdown (torch profiler) "
+                        "and a chrome trace per token count")
+    parser.add_argument("--profile-iters", type=int, default=10,
+                        help="decode steps to profile per token count")
     args = parser.parse_args()
 
     from aiter.jit.utils.chip_info import get_gfx
@@ -235,21 +274,19 @@ def main():
     for tok in args.tokens:
         stats, out = _run_one(args, tok)
         rows.append((tok, stats))
+        # Same statistic and phrasing as the FlyDSL bench: average per-iter GPU
+        # device time from run_perftest.
         print(
-            f"  tokens={tok:<6d} [{stats['mode']}] apply() decode us: "
-            f"min={stats['min']:8.2f} median={stats['median']:8.2f} "
-            f"mean={stats['mean']:8.2f}  "
+            f"[bench {args.data_format} {args.act}] apply() decode "
+            f"device us/iter = {stats['us']:.2f}  tokens={tok} "
             f"(out {tuple(out.shape)} {out.dtype}, ||out||={out.float().norm():.3e})",
             flush=True,
         )
 
-    print("\n| tokens | mode | min_us | median_us | mean_us |")
-    print("|-------:|:-----|-------:|----------:|--------:|")
+    print("\n| tokens | device_us_per_iter |")
+    print("|-------:|-------------------:|")
     for tok, s in rows:
-        print(
-            f"| {tok:6d} | {s['mode']} | {s['min']:6.2f} | "
-            f"{s['median']:9.2f} | {s['mean']:7.2f} |"
-        )
+        print(f"| {tok:6d} | {s['us']:18.2f} |")
 
 
 if __name__ == "__main__":
