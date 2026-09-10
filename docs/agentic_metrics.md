@@ -11,7 +11,6 @@ TTFT、ITL 的名称和采集边界保持不变。
 | 实际 decode batch | `atom:decode_batch_size` | Histogram，请求数 | 每次有 decode 请求的真实 forward 观察一次，以 `ScheduledBatch.total_seqs_num_decode` 为值。 |
 | PD 传输等待 | `atom:pd_kv_transfer_seconds` | Histogram，秒 | D 侧请求进入远端 KV 等待，到 scheduler 收到全部 worker 完成报告。只统计成功的 PD KV 加载。 |
 | KV block 状态 | `atom:scheduler_kv_cache_blocks{state="used\|evictable\|vacant\|total"}` | Gauge，block 数 | 每个调度器管理的 KV 块池，按占用、可回收缓存、空闲拆分。 |
-| 快照时间 | `atom:scheduler_snapshot_timestamp_seconds` | Gauge，Unix 秒 | engine 生成快照的时间，用来检查忙碌时采集是否滞后。 |
 
 新指标保留 `dp_rank` 和 `engine_role` 标签。普通 connector 服务的
 `engine_role="default"`，进程内共享缓存 P/D 分别为 `prefill`、`decode`。
@@ -68,8 +67,8 @@ used / total = KV 块池当前占用率
 缓存保留不等于请求占用了这些块。`indexed` 可能同时包含使用中和空闲的块，
 不能直接拿它当作占用量。
 
-保留原有 `atom:kv_cache_usage_ratio`、`atom:kv_cache_blocks_*` 和请求数指标，
-补充 `atom:kv_cache_blocks_evictable`、`atom:kv_cache_blocks_vacant`。
+保留原有 `atom:kv_cache_usage_ratio`、`atom:kv_cache_blocks_*` 和请求数指标。
+看板使用 `atom:scheduler_kv_cache_blocks` 的分状态计数。
 报告按块池容量汇总 Used/Cached/Vacant 百分比。
 同一个 KV 占比面板内同时显示该角色的 **Used 总数 / Total 总数（blocks）**。
 默认显示所选时间范围内最新采样点；鼠标悬停时跟随时间显示对应数量。
@@ -114,9 +113,6 @@ sum(rate(atom:decode_batch_size_sum{job="atom",role="decode"}[60s]))
 
 # 各队列当前请求数
 sum by (role,state) (atom:scheduler_requests{job="atom"})
-
-# 各 engine 快照年龄，秒
-time() - atom:scheduler_snapshot_timestamp_seconds{job="atom"}
 ```
 
 ## 缓存有效性与实际工作量
@@ -192,10 +188,8 @@ PromQL 检查各 tier 与输入计数的服务样本覆盖是否一致，避免�
 rank 标签查询；报告的实例选择器定位服务端点，不定位服务内部的某张卡。
 
 事件结果通过 `query()` 就绪检查读取，没有增加 `synchronize()`。每个 worker
-最多保留 256 对未完成事件，事件仅完成后复用。若积压达到上限，跳过后续计时
-并增加 `atom:gpu_forward_dropped_total`，不阻塞推理；失败 forward 不记成功样本。
-`atom:gpu_forward_pending` 显示未完成计时数，
-`atom:gpu_forward_snapshot_timestamp_seconds` 标识 worker 快照时间。
+最多保留 256 对未完成事件，事件仅完成后复用。若积压达到上限，跳过后续计时，
+不阻塞推理；失败 forward 不记成功样本。
 
 Engine 每秒异步请求一次设备计时快照；结果通过现有 worker 输出通道中的独立
 消息类型传回，不进入 forward 结果队列或 KV quorum 聚合。PP 每个 stage 都推送
@@ -230,9 +224,7 @@ Mean/P50/P90/P95/P99、表格和 CSV，保持默认 Overview 面板数量不变�
 未更新的状态。中止在半途的 prefill 不上报请求样本，残留状态受此上限
 约束。若某个 chunk 的事件被跳过、执行失败、chunk 序号不连续或状态被
 淘汰，整个请求计时作废，不把部分和作为完整耗时发布。
-`atom:prefill_request_gpu_forward_tracked` 显示保留的累计状态数量（可能包含
-尚未被淘汰的中止请求）；`atom:prefill_request_gpu_forward_dropped_total`
-记录作废的累计状态数。读取事件仍通过非阻塞 `query()`，没有新增 GPU 同步。
+读取事件仍通过非阻塞 `query()`，没有新增 GPU 同步。
 
 ## 多实例看板
 
@@ -284,29 +276,28 @@ HTML 和 CI 导出位于 `.github/scripts/atomesh/observability/`。
 
 ## 指标定义与注册
 
-Python 指标由所属模块定义，API 在 `entrypoints/openai/metrics_setup.py` 中显式组合。
-`AtomMetricsExporter` 只管理快照缓存、registry、渲染及自身刷新健康指标。
-指标名称、HELP、标签和桶边界跟随所属模块，不再集中在 exporter 中。
+已有引擎、DP、offload、GC、流静默和刷新健康指标保留在
+`entrypoints/openai/metrics.py` 中。请求计时和新增看板指标由 API 在
+`entrypoints/openai/metrics_setup.py` 中显式组合；`AtomMetricsExporter` 管理快照缓存、
+registry 和渲染。
 
 | 所属模块 | 定义及采集接口 |
 | --- | --- |
 | `entrypoints/openai/request_timing.py` | `RequestMetrics` 定义 TTFT；middleware 和请求计时通过观察回调记录。 |
-| `entrypoints/openai/streaming_dispatch.py` | `StreamMetrics` 定义 ITL 和实时流静默时长；dispatcher 通过观察回调记录 ITL。 |
+| `entrypoints/openai/streaming_dispatch.py` | `StreamMetrics` 定义 ITL；dispatcher 通过观察回调记录 ITL。 |
 | `model_engine/scheduler_metrics.py` | scheduler 采样及 `collect_scheduler_metrics`，包括排队、batch、token 和 KV 状态。 |
 | `model_engine/gpu_metrics.py` | GPU 事件采样及 `collect_gpu_metrics`，包括单次 forward 和请求累计 prefill 时长。 |
-| `model_engine/engine_stats.py` | `collect_engine_metrics`，导出引擎聚合状态、cache 和 MTP 统计。 |
-| `model_engine/dp_metrics.py` | `collect_dp_metrics`，导出相邻 `EngineCoreMgr` 的 DP 路由统计。 |
-| `kv_transfer/offload/metrics.py` | `collect_offload_metrics`，导出 offload connector 的累计统计。 |
-| `utils/gc_utils.py` | `GCMetricsCollector`，读取 API 进程的实时 GC 统计。 |
+| `model_engine/engine_stats.py` | `collect_engine_metrics`，导出缓存看板所需的补充前缀复用计数。 |
+| `entrypoints/openai/metrics.py` | 已有 `_AtomMetricsCollector` 和 `_gc_metrics`，导出引擎、DP、offload、GC、流静默及刷新健康指标。 |
 
-API 进程内的 Histogram/Gauge 显式传入 `exporter.registry`，由标准
+API 进程内的计时 Histogram 显式传入 `exporter.registry`，由标准
 `prometheus_client.CollectorRegistry` 注册。引擎和 worker 仍然通过现有累计快照传输；
 注册函数用很薄的 adapter 把快照转换为标准 MetricFamily。
 同一次 `exporter.render()` 中所有快照 collector 共用一份快照，后台刷新不会造成
 一份响应混入多个版本。不同 API 实例使用独立 registry。
 GC 和流静默指标依旧在抓取时读取本进程实时状态。
 
-给已有模块增加指标时，在所属的 metrics 类或 `collect_*_metrics` 中添加定义，
+扩展看板指标时，在所属的 metrics 类或 `collect_*_metrics` 中添加定义，
 并在事件发生处更新。只有新增整个组件时，才需要在 `metrics_setup.py` 注册一次。
 例如新组件通过快照报告队列长度，可在该组件的 metrics 模块中定义：
 
@@ -329,7 +320,7 @@ def collect_component_metrics(snapshot):
 生产端将观测值加入已有快照，在 `metrics_setup.py` 的组件列表中加入
 `collect_component_metrics` 即可；exporter 无需修改。
 `collect(None)` 不能做 RPC 或 GPU 同步，并须声明包括可选指标在内的全部名称；
-registry 会检查重名及 `_total`、`_bucket`、`_count`、`_sum` 等生成序列的冲突。
+对于这些显式声明的 collector，registry 会检查重名及 `_total`、`_bucket`、`_count`、`_sum` 等生成序列的冲突。
 实际 `collect(snapshot)` 只能读取快照，不得修改共享快照、重新 observe 或清空计数。
 已有指标缺字段时的零值或缺失行为保持原有约定。
 
@@ -341,5 +332,5 @@ ITL 使用 `utils/histogram.py` 中的 `WeightedHistogram` 扩展标准 Histogra
 `prometheus-client` 时运行 `tests/test_histogram.py` 和 streaming metrics 回归。
 引擎侧 `CumulativeHistogram` 继续生成可传输的累计桶，抓取时直接导出。
 
-这里参考 SGLang 的组件 collector 和原生 Prometheus 注册方式。
+看板 collector 参考 SGLang 的组件 collector 和原生 Prometheus 注册方式。
 ATOM 保留自身快照 IPC，没有引入 SGLang 的文件式 multiprocess 聚合。

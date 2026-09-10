@@ -45,15 +45,16 @@ def test_events_are_polled_without_waiting_and_reused_only_after_completion():
         pass
     with metrics.measure(batch(prefill=1, decode=0)):
         pass
-    assert metrics.snapshot()["pending"] == 2
+    metrics.poll()
+    assert len(metrics.pending) == 2
     with metrics.measure(batch()):
         pass
-    assert metrics.snapshot()["dropped"] == 1
+    assert len(metrics.pending) == 2
     # A different stream may complete the second pair before the first.
     for event in metrics.pending[1][1:3]:
         event.ready = True
     snapshot = metrics.snapshot()
-    assert snapshot["pending"] == 1
+    assert len(metrics.pending) == 1
     assert snapshot["phases"]["prefill"]["sum"] == 0.008
     assert snapshot["phases"]["decode"]["sum"] == 0
     reused = tuple(metrics.free[-1])
@@ -63,7 +64,7 @@ def test_events_are_polled_without_waiting_and_reused_only_after_completion():
     for _, start, end, _ in metrics.pending:
         start.ready = end.ready = True
     snapshot = metrics.snapshot()
-    assert snapshot["pending"] == 0
+    assert len(metrics.pending) == 0
     assert snapshot["phases"]["decode"]["sum"] == 0.008
     assert snapshot["phases"]["mixed"]["sum"] == 0.008
     assert metrics.snapshot()["phases"] == snapshot["phases"]
@@ -76,7 +77,8 @@ def test_warmup_dummy_failure_and_decorator_do_not_create_spurious_samples():
             pass
     with pytest.raises(RuntimeError), metrics.measure(batch()):
         raise RuntimeError("model failed")
-    assert metrics.snapshot()["pending"] == 0
+    metrics.poll()
+    assert len(metrics.pending) == 0
 
     @record_gpu_forward
     def model(self, inputs, batch=None):
@@ -84,7 +86,8 @@ def test_warmup_dummy_failure_and_decorator_do_not_create_spurious_samples():
 
     assert model(SimpleNamespace(), 4, batch()) == 5
     assert model(SimpleNamespace(gpu_forward_metrics=metrics), 4, batch()) == 5
-    assert metrics.snapshot()["pending"] == 1
+    metrics.poll()
+    assert len(metrics.pending) == 1
 
 
 def test_device_snapshot_push_never_waits_or_duplicates_downstream_scheduler():
@@ -153,7 +156,7 @@ def test_device_events_measure_graph_replay_on_a_nondefault_stream():
     # Synchronization is only in this test, never in the telemetry path.
     stream.synchronize()
     snapshot = metrics.snapshot()
-    assert snapshot["pending"] == 0
+    assert len(metrics.pending) == 0
     assert snapshot["phases"]["decode"]["buckets"][-1][1] == 1
     assert snapshot["phases"]["decode"]["sum"] > 0
     assert output[0, 0].item() == 64
@@ -188,7 +191,7 @@ def test_request_sum_waits_for_every_chunk_even_if_last_event_finishes_first():
     assert final["prefill_requests"]["sum"] == pytest.approx(0.030)
     assert final["prefill_requests"]["buckets"][-1][1] == 1
     assert final["phases"]["prefill"]["buckets"][-1][1] == 3
-    assert final["prefill_requests_tracked"] == 0
+    assert not metrics.requests
     for _ in range(2):
         assert metrics.snapshot()["prefill_requests"] == final["prefill_requests"]
     assert first["prefill_requests"]["sum"] == 0  # published copies stay immutable
@@ -234,8 +237,7 @@ def test_incomplete_request_timing_is_never_published(failure):
     complete_event(metrics)
     final = metrics.snapshot()
     assert final["prefill_requests"]["buckets"][-1][1] == 0
-    assert final["prefill_requests_tracked"] == 0
-    assert final["prefill_requests_dropped"] == 1
+    assert not metrics.requests
 
 
 def test_abandoned_partial_requests_are_bounded_and_evicted_tails_are_not_samples():
@@ -246,7 +248,7 @@ def test_abandoned_partial_requests_are_bounded_and_evicted_tails_are_not_sample
         complete_event(metrics)
         metrics.poll()
         assert len(metrics.requests) <= 2
-    assert metrics.snapshot()["prefill_requests_dropped"] == 3
+    assert set(metrics.requests) == {3, 4}
     # A late final chunk cannot recreate an evicted accumulator.
     with metrics.measure(prefill_batch((0, 2, True))):
         pass
@@ -266,7 +268,6 @@ def test_reused_request_id_cannot_be_finished_by_an_old_pending_event():
     final = metrics.snapshot()
     assert final["prefill_requests"]["sum"] == pytest.approx(0.020)
     assert final["prefill_requests"]["buckets"][-1][1] == 1
-    assert final["prefill_requests_dropped"] == 1
 
 
 def test_scheduler_freezes_chunk_boundaries_and_excludes_later_recomputation():

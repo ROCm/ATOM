@@ -3,7 +3,6 @@
 
 import logging
 import queue
-import time
 from typing import ClassVar
 
 from atom.model_engine.sequence import SequenceStatus
@@ -427,7 +426,6 @@ class EngineUtilityHandler:
                 external = parked + len(getattr(self.scheduler, "prefill_waiting", ()))
                 result["scheduler_metrics"] = {
                     **metrics.snapshot(),
-                    "timestamp": time.time(),
                     "running": running,
                     "waiting": max(0, waiting - external),
                     "waiting_kv": external,

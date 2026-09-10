@@ -1,6 +1,5 @@
 """Nonblocking, bounded device-event timing for real target-model forwards."""
 
-import time
 from collections import OrderedDict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -33,17 +32,14 @@ class GPUForwardMetrics:
             phase: CumulativeHistogram(LATENCY_BUCKETS)
             for phase in ("prefill", "decode", "mixed")
         }
-        self.dropped = 0
         self.prefill_requests = CumulativeHistogram(LATENCY_BUCKETS)
         self.max_requests = max_requests
         self.requests = OrderedDict()
-        self.request_dropped = 0
 
     def _discard_request(self, req_id):
         state = self.requests.pop(req_id, None)
         if state is not None:
             state.valid = False
-            self.request_dropped += 1
 
     def _request_chunks(self, batch):
         states = []
@@ -98,7 +94,6 @@ class GPUForwardMetrics:
             return
         requests = self._request_chunks(batch)
         if len(self.pending) >= self.max_pending:
-            self.dropped += 1
             for state in requests:
                 self._discard_request(state.req_id)
             yield
@@ -125,12 +120,7 @@ class GPUForwardMetrics:
         self.poll()
         return {
             "phases": {k: h.snapshot() for k, h in self.histograms.items()},
-            "pending": len(self.pending),
-            "dropped": self.dropped,
             "prefill_requests": self.prefill_requests.snapshot(),
-            "prefill_requests_tracked": len(self.requests),
-            "prefill_requests_dropped": self.request_dropped,
-            "timestamp": time.time(),
         }
 
 
@@ -148,11 +138,7 @@ def record_gpu_forward(func):
 
 def collect_gpu_metrics(snapshot):
     """Export worker snapshots without synchronizing devices or re-observing."""
-    from prometheus_client.core import (
-        CounterMetricFamily,
-        GaugeMetricFamily,
-        HistogramMetricFamily,
-    )
+    from prometheus_client.core import HistogramMetricFamily
 
     workers = (snapshot or {}).get("forward_metrics", [])
     labels = ["dp_rank", "pp_rank", "tp_rank", "engine_role"]
@@ -164,31 +150,6 @@ def collect_gpu_metrics(snapshot):
     request_duration = HistogramMetricFamily(
         "atom:prefill_request_gpu_forward_seconds",
         "Per-worker sum of participating batch device durations across a request's initial local prefill chunks; once after all chunks complete, not exclusive request compute time.",
-        labels=labels,
-    )
-    request_tracked = GaugeMetricFamily(
-        "atom:prefill_request_gpu_forward_tracked",
-        "Bounded unfinished request timing accumulators; may include abandoned partial prefills until eviction.",
-        labels=labels,
-    )
-    request_dropped = CounterMetricFamily(
-        "atom:prefill_request_gpu_forward_dropped",
-        "Request timing accumulators discarded because of missing/failed timings, replacement or capacity eviction.",
-        labels=labels,
-    )
-    pending = GaugeMetricFamily(
-        "atom:gpu_forward_pending",
-        "Unfinished device timing samples.",
-        labels=labels,
-    )
-    dropped = CounterMetricFamily(
-        "atom:gpu_forward_dropped",
-        "Device timings skipped because the bounded event queue was full.",
-        labels=labels,
-    )
-    timestamp = GaugeMetricFamily(
-        "atom:gpu_forward_snapshot_timestamp_seconds",
-        "Worker device timing snapshot time.",
         labels=labels,
     )
     for worker in workers:
@@ -206,15 +167,5 @@ def collect_gpu_metrics(snapshot):
                 buckets=prometheus_buckets(hist),
                 sum_value=hist["sum"],
             )
-            request_tracked.add_metric(values, worker["prefill_requests_tracked"])
-            request_dropped.add_metric(values, worker["prefill_requests_dropped"])
-        pending.add_metric(values, worker["pending"])
-        dropped.add_metric(values, worker["dropped"])
-        timestamp.add_metric(values, worker["timestamp"])
     yield duration
     yield request_duration
-    yield request_tracked
-    yield request_dropped
-    yield pending
-    yield dropped
-    yield timestamp

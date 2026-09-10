@@ -207,7 +207,6 @@ def test_histograms_preserve_rank_counts_and_do_not_reobserve_snapshots(clock):
             metrics.snapshot(),
             dp_rank=rank,
             engine_role="default",
-            timestamp=100,
             running=3,
             waiting=0,
             waiting_kv=0,
@@ -504,7 +503,6 @@ def test_decode_request_context_histogram_counts_each_real_row_on_each_forward()
         second,
         dp_rank=0,
         engine_role="decode",
-        timestamp=100,
         running=1,
         waiting=0,
         waiting_kv=0,
@@ -563,4 +561,8 @@ def test_worker_snapshots_include_all_pp_tp_workers_without_duplicate_queues():
         if name == "atom:gpu_forward_seconds_count" and ("phase", "prefill") in labels
     }
     assert len(counts) == 4 and set(counts.values()) == {1}
-    assert exporter.render() == exporter.render()
+    before, after = samples(exporter), samples(exporter)
+    for key, value in before.items():
+        # GC counters are live process state, independent of worker snapshots.
+        if not key[0].startswith("atom:gc_"):
+            assert after[key] == value
