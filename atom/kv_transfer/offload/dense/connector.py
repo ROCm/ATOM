@@ -152,7 +152,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             "LMCache offload worker rank=%d: bytes_per_block=%d chunk=%d "
             "gpu_staging_chunk_bytes=%d gpu_staging_buffer_chunks=%d "
             "gpu_staging_buffer_bytes=%d release_gpu_staging=%s "
-            "save=%s load=%s",
+            "save=%s load=%s save_workers=%d load_workers=%d",
             rank,
             self._codec.bytes_per_block,
             self.chunk_size,
@@ -162,6 +162,8 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             gpu_connector.release_gpu_staging_after_transfer,
             self._do_save,
             self._do_load,
+            self._save_executor._max_workers,
+            self._load_executor._max_workers,
         )
 
     # -- per-step (RPC thread): only enqueue, never copy ------------------
