@@ -314,7 +314,7 @@ def test_scheduler_freezes_chunk_boundaries_and_excludes_later_recomputation():
 def test_request_gpu_histogram_export_is_per_worker_and_backward_compatible():
     from prometheus_client.parser import text_string_to_metric_families
 
-    from atom.entrypoints.openai.metrics import AtomMetricsExporter
+    from atom.entrypoints.openai.metrics_setup import create_metrics_exporter
 
     metrics = GPUForwardMetrics(Event)
     with metrics.measure(prefill_batch((1, 1, True))):
@@ -329,7 +329,7 @@ def test_request_gpu_histogram_export_is_per_worker_and_backward_compatible():
         k: v for k, v in workers[0].items() if not k.startswith("prefill_requests")
     }
     legacy["dp_rank"] = 1
-    exporter = AtomMetricsExporter()
+    exporter, _, _ = create_metrics_exporter()
     exporter.update({"forward_metrics": [*workers, legacy]})
     for _ in range(2):
         samples = [

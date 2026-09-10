@@ -8,7 +8,7 @@ import pytest
 from conftest import MockConfig
 from prometheus_client.parser import text_string_to_metric_families
 
-from atom.entrypoints.openai.metrics import AtomMetricsExporter
+from atom.entrypoints.openai.metrics_setup import create_metrics_exporter
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import Scheduler
@@ -215,7 +215,7 @@ def test_histograms_preserve_rank_counts_and_do_not_reobserve_snapshots(clock):
         )
         for rank in (0, 1)
     ]
-    exporter = AtomMetricsExporter()
+    exporter, _, _ = create_metrics_exporter()
     exporter.update({"enabled": True, "scheduler_metrics": ranks})
     before = samples(exporter)
     exporter.update({"enabled": True, "scheduler_metrics": ranks})
@@ -248,7 +248,7 @@ def test_engine_snapshots_reach_exporter_with_distinct_dp_ranks():
             get_dp_router_statistics=dict,
         )
     )
-    exporter = AtomMetricsExporter()
+    exporter, _, _ = create_metrics_exporter()
     exporter.update(LLMEngine.get_metrics_statistics(engine))
     data = samples(exporter)
     for rank, size in ((0, 3), (1, 7)):
@@ -278,7 +278,7 @@ def test_cache_tiers_preserve_admitted_reuse_through_snapshots():
     engine = SimpleNamespace(
         core_mgr=SimpleNamespace(latest_metrics=ranks, get_dp_router_statistics=dict)
     )
-    exporter = AtomMetricsExporter()
+    exporter, _, _ = create_metrics_exporter()
     for _ in range(2):
         exporter.update(LLMEngine.get_metrics_statistics(engine))
         values = samples(exporter)
@@ -510,7 +510,7 @@ def test_decode_request_context_histogram_counts_each_real_row_on_each_forward()
         waiting_kv=0,
         kv_blocks={},
     )
-    exporter = AtomMetricsExporter()
+    exporter, _, _ = create_metrics_exporter()
     for _ in range(2):
         exporter.update({"enabled": True, "scheduler_metrics": [rank]})
         values = samples(exporter)
@@ -555,7 +555,7 @@ def test_worker_snapshots_include_all_pp_tp_workers_without_duplicate_queues():
     result = LLMEngine.get_metrics_statistics(engine)
     assert result["requests_running"] == 2
     assert len(result["forward_metrics"]) == 4
-    exporter = AtomMetricsExporter()
+    exporter, _, _ = create_metrics_exporter()
     exporter.update(result)
     counts = {
         labels: v

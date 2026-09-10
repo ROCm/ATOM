@@ -61,7 +61,7 @@ from .chat_encoders import (
     render_probe_prompt,
     resolve_reasoning_toggle,
 )
-from .metrics import AtomMetricsExporter
+from .metrics_setup import create_metrics_exporter
 from .protocol import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_K,
@@ -379,7 +379,7 @@ _ANTHROPIC_PING_FRAME = event_frame("ping", {"type": "ping"})
 # 35 discarded bytes. The keepalive only has to beat proxy and SDK idle-read
 # timeouts, which are tens of seconds.
 _ANTHROPIC_PING_INTERVAL_SECONDS = 5.0
-_metrics_exporter = AtomMetricsExporter()
+_metrics_exporter, _request_metrics, _stream_metrics = create_metrics_exporter()
 _background_tasks: list[asyncio.Task] = []
 _METRICS_REFRESH_INTERVAL_SECONDS = 1.0
 # The watch compares two `gc.get_stats()` reads against something that moves on
@@ -1622,7 +1622,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="ATOM OpenAI API Server", lifespan=lifespan)
 app.add_middleware(
     RequestTimingMiddleware,
-    observe_ttft=_metrics_exporter.observe_time_to_first_token,
+    observe_ttft=_request_metrics.observe_time_to_first_token,
 )
 
 
@@ -2997,7 +2997,7 @@ def main():
     _stream_batch_dispatcher = StreamBatchDispatcher(
         tokenizer,
         synthetic_text=synthetic_token_text,
-        observe_inter_token_latency=_metrics_exporter.observe_inter_token_latency,
+        observe_inter_token_latency=_stream_metrics.observe_inter_token_latency,
     )
     # Here and not in the dispatcher's constructor: it replays a few thousand
     # updates, which every test that builds a dispatcher would then pay for.
