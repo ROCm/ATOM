@@ -28,18 +28,11 @@ STREAM_DONE_MESSAGE = "data: [DONE]\n\n"
 TOOL_CHOICE_VALUES = frozenset({"auto", "none", "required"})
 
 
-def validated_max_tokens(value: int, field: str) -> int:
-    """The generation cap, rejecting values the engine cannot honour.
-
-    A cap below 1 leaves nothing to generate, and the engine returns an empty
-    completion with `finish_reason: length` rather than refusing it -- a 200
-    that reads as a successful empty answer instead of the client error it is.
-
-    Raises `ValueError`, which both completion endpoints surface as HTTP 400.
-    """
-    if value < 1:
-        raise ValueError(f"{field} must be at least 1, got {value}")
-    return value
+def validate_max_tokens(max_tokens: int) -> int:
+    """Return a valid generation limit or raise a client-facing error."""
+    if max_tokens < 1:
+        raise ValueError(f"max_tokens must be at least 1, got {max_tokens}")
+    return max_tokens
 
 
 def openai_stop_reason(finish_reason: str | None) -> str | None:
@@ -229,11 +222,9 @@ class ChatCompletionRequest(BaseModel):
     def get_max_tokens(self) -> int:
         """Return the effective generation cap for OpenAI chat requests."""
         if self.max_completion_tokens is not None:
-            return validated_max_tokens(
-                self.max_completion_tokens, "max_completion_tokens"
-            )
+            return validate_max_tokens(self.max_completion_tokens)
         if self.max_tokens is not None:
-            return validated_max_tokens(self.max_tokens, "max_tokens")
+            return validate_max_tokens(self.max_tokens)
         return DEFAULT_MAX_TOKENS
 
     def get_messages(self) -> list[ChatMessage]:
@@ -270,11 +261,9 @@ class CompletionRequest(BaseModel):
     def get_max_tokens(self) -> int:
         """Return the effective generation cap for completion requests."""
         if self.max_completion_tokens is not None:
-            return validated_max_tokens(
-                self.max_completion_tokens, "max_completion_tokens"
-            )
+            return validate_max_tokens(self.max_completion_tokens)
         if self.max_tokens is not None:
-            return validated_max_tokens(self.max_tokens, "max_tokens")
+            return validate_max_tokens(self.max_tokens)
         return DEFAULT_MAX_TOKENS
 
 
