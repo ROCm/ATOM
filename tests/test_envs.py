@@ -29,6 +29,10 @@ _ATOM_ENV_VARS = [
     "ATOM_DISABLE_VLLM_PLUGIN",
     "ATOM_USE_CUSTOM_ALL_GATHER",
     "ATOM_ENABLE_RELAXED_MTP",
+    "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ",
+    "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN",
+    "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ_FP8",
+    "ATOM_USE_FUSED_MLA_QKV_QUANT",
 ]
 
 
@@ -100,6 +104,12 @@ class TestEnvsDefaults:
     def test_atom_enable_gdn_decode_lossy_fast_default(self):
         assert _get_envs().ATOM_ENABLE_GDN_DECODE_LOSSY_FAST is False
 
+    def test_use_flydsl_gather_kv_b_proj_default(self):
+        assert _get_envs().ATOM_USE_FLYDSL_GATHER_KV_B_PROJ is True
+
+    def test_use_flydsl_fp8_prefill_attn_default(self):
+        assert _get_envs().ATOM_USE_FLYDSL_FP8_PREFILL_ATTN is False
+
     def test_unknown_attr_raises(self):
         with pytest.raises(AttributeError):
             _ = _get_envs().ATOM_NONEXISTENT_VAR
@@ -166,6 +176,16 @@ class TestEnvsOverrides:
         monkeypatch.setenv("ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", "1")
         assert _get_envs().ATOM_ENABLE_GDN_DECODE_LOSSY_FAST is True
 
+    def test_use_flydsl_gather_kv_b_proj_disabled(self, monkeypatch):
+        # The interesting lever now that the default is on: "1" would pass even
+        # against a hard-coded True, so assert the opt-out instead.
+        monkeypatch.setenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "0")
+        assert _get_envs().ATOM_USE_FLYDSL_GATHER_KV_B_PROJ is False
+
+    def test_use_flydsl_gather_kv_b_proj_only_one_enables(self, monkeypatch):
+        monkeypatch.setenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "true")
+        assert _get_envs().ATOM_USE_FLYDSL_GATHER_KV_B_PROJ is False
+
 
 class TestIsSet:
     """Test the is_set() helper function."""
@@ -193,3 +213,18 @@ def test_parallel_config_applies_explicit_dp_endpoint_env(monkeypatch):
     assert config.data_parallel_master_ip == "127.0.0.2"
     assert config.data_parallel_master_port == 29700
     assert config.data_parallel_base_port == 29800
+
+
+@pytest.mark.parametrize(
+    "name,default",
+    [
+        ("ATOM_USE_FLYDSL_FP8_PREFILL_ATTN", False),
+        ("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ_FP8", True),
+        ("ATOM_USE_FUSED_MLA_QKV_QUANT", True),
+    ],
+)
+def test_mla_fp8_feature_flags(name, default, monkeypatch):
+    assert getattr(_get_envs(), name) is default
+    for value, expected in [("0", False), ("1", True), ("true", False)]:
+        monkeypatch.setenv(name, value)
+        assert getattr(_get_envs(), name) is expected
