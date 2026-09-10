@@ -230,6 +230,9 @@ EOF
     -v /mnt:/mnt
     -v /data:/data
   )
+  if [[ -d /shared_nfs ]]; then
+    docker_args+=(-v /shared_nfs:/shared_nfs:ro)
+  fi
 
   if [[ "${rank}" -eq 0 \
     && "${EVAL_TASK:-}" == "swebench_lite" \
@@ -549,6 +552,9 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
           "'"${REPO_ROOT}"'" "'"${RUN_DIR}"'" "'"${DOCKER_IMAGE}"'" "'"${ENV_FILE}"'" "'"${SLURM_JOB_ID}"'")"
       fi
       nested_docker_args=()
+      if [[ -d /shared_nfs ]]; then
+        nested_docker_args+=(-v /shared_nfs:/shared_nfs:ro)
+      fi
       if [[ "${rank}" -eq 0 \
         && "${EVAL_TASK:-}" == "swebench_lite" \
         && ( "${RUN_EVAL:-false}" == "true" || "${RUN_EVAL:-false}" == "1" ) ]]; then

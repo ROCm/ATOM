@@ -4,11 +4,10 @@
 """CPU-only Slurm result tests; also runnable directly with Python."""
 
 import os
-from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-
+from pathlib import Path
 
 HELPERS = (
     Path(__file__).resolve().parents[1] / ".github/scripts/slurm_submit_helpers.sh"
@@ -39,6 +38,7 @@ class SlurmResultsTest(unittest.TestCase):
                 **env,
             },
             capture_output=True,
+            check=False,
             text=True,
             timeout=10,
         )
@@ -141,7 +141,7 @@ read_slurm_exit_code 5147
                     (status_dir / name).write_text(value + "\n")
                 self.assertEqual(
                     self.run_shell(
-                        'sacct() { return 1; }\nread_slurm_exit_code 5147\n'
+                        "sacct() { return 1; }\nread_slurm_exit_code 5147\n"
                         'read_slurm_status_files "$STATUS_DIR" 2',
                         STATUS_DIR=str(status_dir),
                     ),
