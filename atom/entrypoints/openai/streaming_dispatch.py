@@ -673,8 +673,6 @@ class StreamMetrics:
     """Delivery metrics owned by the API stream dispatcher."""
 
     def __init__(self, registry):
-        from prometheus_client import Gauge
-
         from atom.utils.histogram import WeightedHistogram
 
         self._inter_token_latency = WeightedHistogram(
@@ -684,15 +682,6 @@ class StreamMetrics:
             buckets=INTER_TOKEN_LATENCY_BUCKETS,
             registry=registry,
         )
-
-        self._silence = Gauge(
-            "atom:stream_longest_silence_seconds",
-            "Seconds the most starved in-flight SSE stream has gone without a "
-            "chunk. Zero when none is waiting. Non-zero and growing is a "
-            "response that has stopped delivering while the client waits.",
-            registry=registry,
-        )
-        self._silence.set_function(longest_silence_seconds)
 
     def observe_inter_token_latency(self, interval: float, num_new_tokens: int) -> None:
         """Record token-weighted intervals in one aggregation update.

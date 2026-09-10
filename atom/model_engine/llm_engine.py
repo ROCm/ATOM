@@ -595,8 +595,6 @@ class LLMEngine:
             "kv_blocks_free": summed("kv_blocks_free"),
             "kv_blocks_total": kv_total,
             "kv_blocks_indexed": summed("kv_blocks_indexed"),
-            "kv_blocks_evictable": summed("kv_blocks_evictable"),
-            "kv_blocks_vacant": summed("kv_blocks_vacant"),
             "kv_cache_usage_ratio": kv_used / kv_total if kv_total else 0.0,
             "forward_metrics": [
                 {**worker, "engine_role": stats.get("role") or "default"}

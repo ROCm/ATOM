@@ -20,14 +20,17 @@ from prometheus_client import REGISTRY, CollectorRegistry, Gauge, generate_lates
 from prometheus_client.core import GaugeMetricFamily
 from prometheus_client.parser import text_string_to_metric_families
 
-from atom.entrypoints.openai.metrics import AtomMetricsExporter
+from atom.entrypoints.openai.metrics import AtomMetricsExporter, _gc_metrics
 from atom.entrypoints.openai.metrics_setup import create_metrics_exporter
-from atom.utils.gc_utils import GCMetricsCollector
 
 
 def _render() -> str:
+    class _Collector:
+        def collect(self):
+            yield from _gc_metrics()
+
     registry = CollectorRegistry()
-    registry.register(GCMetricsCollector())
+    registry.register(_Collector())
     return generate_latest(registry).decode()
 
 
@@ -44,7 +47,7 @@ def test_a_scrape_never_walks_the_heap(monkeypatch):
 
     `atom:gc_frozen_objects` was one of them and had to go. Caching the count
     in `gc_utils` is not the way back: `gc.collect()` moves it without going
-    through that module, so any mirror drifts. See `GCMetricsCollector.collect` for the cost.
+    through that module, so any mirror drifts. See `_gc_metrics` for the cost.
     """
     walked: list[str] = []
 
@@ -128,10 +131,8 @@ def test_new_component_registers_without_exporter_changes_and_reads_cached_data(
         "atom:request_queue_time_seconds_count",
         "atom:request_queue_time_seconds_sum",
         "atom:prefix_cache_offload_tokens_total",  # Absent on legacy snapshots.
-        "atom:metrics_refresh_errors_total",
         "atom:time_to_first_token_seconds_count",
         "atom:inter_token_latency_seconds_sum",
-        "atom:gc_collections_total",
     ],
 )
 def test_registration_reserves_optional_families_and_generated_series(name):

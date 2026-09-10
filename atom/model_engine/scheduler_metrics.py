@@ -204,18 +204,11 @@ def collect_scheduler_metrics(snapshot):
         "KV block pool by state; used + evictable + vacant = total.",
         labels=[*labels, "state"],
     )
-    timestamp = GaugeMetricFamily(
-        "atom:scheduler_snapshot_timestamp_seconds",
-        "Unix time of the engine scheduler snapshot.",
-        labels=labels,
-    )
     for rank in ranks:
         values = [str(rank["dp_rank"]), rank["engine_role"]]
         for state in ("running", "waiting", "waiting_kv"):
             queues.add_metric([*values, state], rank[state])
         for state, count in rank["kv_blocks"].items():
             blocks.add_metric([*values, state], count)
-        timestamp.add_metric(values, rank["timestamp"])
     yield queues
     yield blocks
-    yield timestamp
