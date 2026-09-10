@@ -80,7 +80,12 @@ from .reasoning import (
     thinking_switched_off,
 )
 from .reasoning_dialects import resolve_dialect
-from .request_timing import RequestTimingMiddleware, record_nonstream_first_token
+from .request_timing import (
+    RequestTimingMiddleware,
+    get_stream_timing,
+    has_generated_output,
+    record_nonstream_first_token,
+)
 from .serving_anthropic import (
     AnthropicBlocks,
     AnthropicMessagesRequest,
@@ -122,7 +127,7 @@ from .serving_responses import (
     unsupported_responses_parameter,
 )
 from .serving_responses import stream_failure_frames as responses_stream_failure_frames
-from .sse import event_frame
+from .sse import event_frame, iter_sse_data
 from .streaming_dispatch import (
     SYNTHETIC_TOKEN_TEXT,
     FrameWait,
@@ -447,50 +452,11 @@ def _log_request_model(event_type: str, request_id: str, model: Any) -> None:
     request logging off. Measured 20-26 us on an agent-shaped request against
     0.07 us for the guard.
 
-    `_log_sse` directly below already asks the question in this order. Two
-    spellings of one rule in one module is what this removes.
+    The client stream wrapper also skips parsing when no observer needs it.
     """
     if _request_logger is None:
         return
     _log_request_event(event_type, request_id, model.model_dump())
-
-
-def _log_sse(chunk: str, request_id: str) -> None:
-    """Log every SSE frame in `chunk`, and never fail the stream doing it.
-
-    One yield can carry several frames: `serving_chat` deliberately coalesces
-    finish + usage + `[DONE]` into one send, because at a wave boundary many
-    requests finalize at once and collapsing three socket writes per request
-    to one relieves the event loop. This used to `json.loads` the whole send
-    as a single payload, which raises `Extra data:` on exactly that frame --
-    out of the generator, so with `--request-log` on, the *last* frame of
-    every OpenAI stream never reached the client and no `[DONE]` was sent.
-
-    And frames are not all `data:`-first. Anthropic writes `event: NAME` on
-    the line above, so a `startswith("data: ")` test skipped every frame that
-    endpoint produces -- silently, which for a log is the worst failure it
-    can have.
-
-    A payload that will not parse is logged as text rather than dropped or
-    raised: this is the diagnostic path, and it must not be the reason a
-    response fails.
-    """
-    if _request_logger is None:
-        return
-    for frame in chunk.split("\n\n"):
-        payload = None
-        for line in frame.splitlines():
-            if line.startswith("data:"):
-                payload = line[5:].strip()
-        if payload is None:
-            continue
-        if payload == "[DONE]":
-            _log_request_event("stream_done", request_id, None)
-            continue
-        try:
-            _log_request_event("stream_chunk", request_id, json.loads(payload))
-        except ValueError:
-            _log_request_event("stream_chunk_unparsed", request_id, payload)
 
 
 async def _client_stream(
@@ -510,6 +476,9 @@ async def _client_stream(
     with an endpoint-shaped hole in it is worse than none, because the zero it
     reports looks like an answer.
     """
+    # StreamingResponse sends its headers before iterating this generator, so
+    # the middleware has already marked whether this response is eligible.
+    timing = get_stream_timing()
     it = gen.__aiter__()
     delivered = False
     while True:
@@ -521,7 +490,31 @@ async def _client_stream(
             except StopAsyncIteration:
                 return
         delivered = True
-        _log_sse(chunk, request_id)
+        # Parse each complete local frame once for both logging and TTFT.
+        # After first output (or a terminal event), logging alone needs parsing.
+        if timing is not None or _request_logger is not None:
+            for data in iter_sse_data(chunk):
+                if data == "[DONE]":
+                    timing = None
+                    _log_request_event("stream_done", request_id, None)
+                else:
+                    try:
+                        payload = json.loads(data)
+                    except ValueError:
+                        # Diagnostics must not swallow malformed output.
+                        _log_request_event("stream_chunk_unparsed", request_id, data)
+                        continue
+                    _log_request_event("stream_chunk", request_id, payload)
+                    if timing is not None:
+                        if isinstance(payload, dict) and (
+                            "error" in payload or payload.get("type") == "error"
+                        ):
+                            timing = None
+                        elif has_generated_output(payload):
+                            timing.first_output(streaming=True)
+                            timing = None
+                if timing is None and _request_logger is None:
+                    break
         yield chunk
 
 
