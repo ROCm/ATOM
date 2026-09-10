@@ -36,7 +36,6 @@ topk_ids carry only routed expert ids and mori routes them cleanly.
 import logging
 import os
 import sys
-from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 

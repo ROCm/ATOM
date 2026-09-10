@@ -20,8 +20,6 @@
 
 from math import prod
 
-import os
-
 import torch
 import triton
 from aiter import ActivationType
@@ -365,18 +363,18 @@ def _fused_experts_silu_gugu(
         # gather_indx where a8w4 has eight, so the a8w4 positional layout landed
         # routing_data on gather_indx and raised "got multiple values for
         # argument 'gather_indx'".
-        _gemm1_kwargs = dict(
-            bias=w1_bias,
-            routing_data=routing_data,
-            preshuffle_weights=_preshuffled,
-            gather_indx=gather_indx,
-            gammas=gammas if apply_router_weight_on_input else None,
-            swizzle_mx_scale=w13_swizzle_layout,
-            apply_swiglu=True,
-            alpha=1.0,
-            limit=swiglu_limit,
-            swiglu_add_residual=False,
-        )
+        _gemm1_kwargs = {
+            "bias": w1_bias,
+            "routing_data": routing_data,
+            "preshuffle_weights": _preshuffled,
+            "gather_indx": gather_indx,
+            "gammas": gammas if apply_router_weight_on_input else None,
+            "swizzle_mx_scale": w13_swizzle_layout,
+            "apply_swiglu": True,
+            "alpha": 1.0,
+            "limit": swiglu_limit,
+            "swiglu_add_residual": False,
+        }
         # out_mx_quant folds the intermediate's MXFP4 requant into GEMM1's
         # epilogue -- the launch a8w4 has always avoided -- returning exactly the
         # (packed e2m1, e8m0 scales) pair mxfp4_quant would have produced, bit
@@ -896,7 +894,6 @@ def _mega_combine_window(mega):
         return cached
 
     import torch
-
     from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import _from_gpu_ptr
 
     cfg = mega._config
