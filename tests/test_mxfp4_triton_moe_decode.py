@@ -305,6 +305,14 @@ def _apply_dispatch_probe(monkeypatch, *, use_triton_decode, is_prefill):
         w2_weight_scale="flydsl_w2_scale",
         w13_swizzle_layout=None,
         w2_swizzle_layout=None,
+        # _process_weight_layout_after_loading sets this to
+        # ``is_gfx1250 and is_silu``, and apply() then reads it
+        # UNCONDITIONALLY (use_triton_gfx1250_silu = layer.use_fused_silu_gugu).
+        # _make_layer above can omit it because those tests run the real prep,
+        # which assigns it; this probe stands in for the prep, so without it the
+        # decode path raises AttributeError before it ever picks a kernel.
+        # True matches the probe's is_gfx1250=True and the Silu activation.
+        use_fused_silu_gugu=True,
         w13_input_scale=None,
         w2_input_scale=None,
         w13_bias=None,

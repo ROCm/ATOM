@@ -1273,6 +1273,31 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         use_triton_gfx1250_silu = self.use_triton and self.is_gfx1250 and is_silu
 
+        # Refuse a combination that is already fully decided here, instead of on
+        # the first token. Only branch B stashes the dense shared-expert slices
+        # that _apply_shared_experts_dense consumes in apply(); branch A (GUGU)
+        # and branch C (FlyDSL) both return without them.
+        #
+        # Deliberately gated on `use_triton_gfx1250_silu` rather than on
+        # `layer.use_fused_silu_gugu` alone: that flag is
+        # `is_gfx1250 and is_silu` with no `use_triton` term, so asserting on it
+        # by itself would also reject a plain ATOM_USE_TRITON_MOE=0 FlyDSL run on
+        # gfx1250 -- where apply() never reads it, because the read sits inside
+        # the `use_triton_now` branch. This form fires in exactly the cases
+        # apply() would have, only at load time and off the per-forward path.
+        #
+        # Checked BEFORE the use_triton_decode override below, which forces this
+        # local False (sending prep down branch C) while apply() still runs the
+        # GUGU kernel on decode over a view of those FlyDSL weights.
+        assert not (
+            use_triton_gfx1250_silu and layer.num_fused_shared_experts > 0
+        ), (
+            "the Triton GUGU MoE path cannot serve fused shared experts "
+            f"(num_fused_shared_experts={layer.num_fused_shared_experts}): its "
+            "weight prep does not stash the dense shared-expert slices that "
+            "_apply_shared_experts_dense consumes."
+        )
+
         # Decode-only Triton leaves the layout to the FlyDSL prep (branch C) and
         # rebuilds the Triton view per decode call in apply(). That single copy
         # can serve both kernels only where the two preps write the same bytes:
@@ -1661,14 +1686,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 # this the shared expert is silently dropped -- and the GUGU prep
                 # does not stash the dense slices _apply_shared_experts_dense
                 # needs, so refuse rather than lose it.
+                # The GUGU-vs-fused-shared-experts refusal now lives in
+                # _process_weight_layout_after_loading, where it is decided --
+                # so this stays a plain add and costs no per-forward check.
                 if layer.num_fused_shared_experts > 0:
-                    assert not use_triton_gfx1250_silu, (
-                        "the Triton GUGU MoE path cannot serve fused shared "
-                        "experts (num_fused_shared_experts="
-                        f"{layer.num_fused_shared_experts}): its weight prep "
-                        "does not stash the dense shared-expert slices that "
-                        "_apply_shared_experts_dense consumes."
-                    )
                     _moe_result = _moe_result + self._apply_shared_experts_dense(
                         layer, x, activation
                     )

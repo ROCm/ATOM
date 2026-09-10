@@ -106,32 +106,60 @@ def _resize_cache(x: torch.Tensor, v: tuple[int, ...]) -> torch.Tensor:
     return x.flatten()[: prod(v)].view(*v)
 
 
+def _swiglu_limit_or_none(limit) -> float | None:
+    """Translate ATOM's ``<= 0`` "off" sentinel into what aiter's _swiglu tests.
+
+    ``fused_clamp_act_mul`` documents ``swiglu_limit: clamp threshold, to skip
+    set <= 0``, and ``apply()`` leans on that sentinel: models that never set
+    ``layer.swiglu_limit`` -- ``deepseek_v2`` (R1 / V3) and the Qwen family
+    never mention it -- reach the kernels through
+    ``getattr(layer, "swiglu_limit", 0.0)``.
+
+    aiter's ``_swiglu`` tests ``if limit is not None``, so a 0.0 arrives as a
+    REAL bound rather than "off": ``gelu = min(g, 0)`` and
+    ``linear = clamp(l, -0, 0) == 0``, so ``s * linear`` is identically zero and
+    the whole MoE layer outputs zeros -- silently, with no assert anywhere.
+    ``None`` is the only value that skips both clips (and lets them compile
+    away). See ROCm/ATOM#2046 review.
+    """
+    return limit if limit is not None and limit > 0 else None
+
+
 def _gluon_fused_quant_supported(m, n, k, routing_data) -> bool:
-    """Will the gfx1250 kernel that moe_gemm_a8w4 picks support out_mx_quant?
+    """Does the kernel ``moe_gemm_a8w4`` will pick support ``out_mx_quant``?
 
-    moe_gemm_a8w4 chooses between three gluon kernels, in this order, and only
-    the middle one implements the fused MXFP8 requant epilogue:
+    Currently: always. Every launch site in ``moe_gemm_a8w4`` passes
+    ``HAS_MX_OUT=out_mx_quant`` -- ``_moe_gemm_a8w4_decode_persistent_gluon``,
+    ``_moe_gemm_a8w4_decode_gluon``, ``_moe_gemm_a8w4_prefill_gluon`` and the
+    ``_moe_gemm_a8w4_triton`` fallback alike -- so the fused MXFP8 requant
+    epilogue is available whichever one the selector lands on, and this guard
+    no longer protects against anything. Kept as a conservative gate only; it
+    can be dropped (see the ROCm/ATOM#2046 review).
 
-        persistent_iters > 1      -> _moe_gemm_a8w4_decode_persistent   no
-        block_m == 16             -> _moe_gemm_a8w4_decode              YES
-        (otherwise)               -> _moe_gemm_a8w4_prefill             no
+    It used to matter: only the plain decode kernel implemented the epilogue,
+    and an unsupported pick returned an allocated-but-never-written ``y_scale``
+    with no assert on the aiter side -- silently wrong rather than an error.
 
-    This must be exact, because getting it wrong is silently WRONG rather than
-    an error: moe_gemm_a8w4 allocates and returns the y_scale buffer whenever
-    out_mx_quant is set, but only the kernels that take HAS_MX_OUT ever write
-    it -- an unsupported pick returns uninitialised scales, and there is no
-    assert on the aiter side to catch it.
+    What aiter does still restrict, all of it through asserts (loud, not
+    silent): ``split_k == 1``, GEMM1-style only (no ``scatter_indx``),
+    ``N_out % 32 == 0``, and mutual exclusion with ``ep_scatter``.
 
-    block_m comes from routing_data (tokens-per-expert), NOT from a prefill
-    /decode flag: a decode step at high enough concurrency raises block_m above
-    16 and lands on the prefill kernel. So this has to be recomputed per call,
-    not cached per layer.
+    Two caveats about what this function actually tests:
 
-    Defers the persistent decision to aiter's own selector instead of restating
-    its thresholds, so this stays correct if that heuristic moves. The selector
-    reports it as `persistent_iters` -- the count of N-tiles one program walks --
-    and the persistent kernel is the one launched when that exceeds 1, matching
-    moe_gemm_a8w4's own `config["persistent_iters"] > 1` test.
+    * ``persistent_iters <= 1`` is aiter's gate for folding the EP SCATTER into
+      the epilogue -- only the two non-persistent gluon kernels have one, the
+      persistent kernel writes back inside its N-tile loop -- and NOT its gate
+      for ``HAS_MX_OUT``. Reusing it here only disables the requant fusion on
+      the persistent decode kernel, which does in fact support it.
+    * it calls ``get_kernel_config_gluon`` WITHOUT ``out_mx_quant``, while the
+      real GEMM passes it, and that argument changes the config selected
+      (``block_n`` is floored at 64 so ``OUT_BLOCK_N = BLOCK_N // 2 >= 32``).
+      So the config predicted here is not necessarily the one the GEMM runs.
+
+    ``block_m`` comes from ``routing_data`` (tokens-per-expert), NOT from a
+    prefill/decode flag: a decode step at high enough concurrency raises
+    ``block_m`` above 16 and lands on the prefill kernel. So anything derived
+    from it must be recomputed per call, not cached per layer.
     """
     if routing_data is None or getattr(routing_data, "block_m", None) is None:
         return False
@@ -225,7 +253,7 @@ def _fused_experts_silu_gugu(
             swizzle_mx_scale=w13_swizzle_layout,
             apply_swiglu=True,
             alpha=1.0,
-            limit=swiglu_limit,
+            limit=_swiglu_limit_or_none(swiglu_limit),
             swiglu_add_residual=False,
         )
         # The launch a8w4 avoids via out_mx_quant=True.
@@ -281,7 +309,7 @@ def _fused_experts_silu_gugu(
         swizzle_mx_scale=w13_swizzle_layout,
         apply_swiglu=True,
         alpha=1.0,
-        limit=swiglu_limit,
+        limit=_swiglu_limit_or_none(swiglu_limit),
         swiglu_add_residual=False,
         out_mx_quant=_fuse_requant,
         out_dtype=torch.float8_e4m3fn if _fuse_requant else torch.bfloat16,
@@ -496,7 +524,7 @@ def triton_kernel_fused_experts(
                 out_dtype=quant_dtype,
                 apply_swiglu=True,
                 alpha=swiglu_alpha,
-                limit=swiglu_limit,
+                limit=_swiglu_limit_or_none(swiglu_limit),
                 swiglu_add_residual=True,
             )
             output_tensor = moe_gemm_a8w4(
@@ -527,7 +555,7 @@ def triton_kernel_fused_experts(
                 swizzle_mx_scale=w13_swizzle_layout,
                 apply_swiglu=True,
                 alpha=swiglu_alpha,
-                limit=swiglu_limit,
+                limit=_swiglu_limit_or_none(swiglu_limit),
                 swiglu_add_residual=True,  # gpt-oss `(up + 1)`
             )
             output_tensor = moe_gemm_a16w4(
