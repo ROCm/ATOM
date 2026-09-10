@@ -1,15 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-"""Which backend `_kv_b_proj_gather` dispatches to, and what happens on refusal.
-
-`ATOM_USE_FLYDSL_GATHER_KV_B_PROJ` swaps the Triton gather for the flydsl
-gather-GEMM. The flydsl backend covers exactly one shape family and validates
-that itself, raising ValueError before it launches anything -- ATOM does not
-restate those preconditions, it just calls and catches. So what needs pinning
-here is the dispatch: off means Triton, on means flydsl, and a refusal must fall
-back to Triton (with the outputs still produced) rather than take the server
-down, and must not re-attempt on every later chunk.
-"""
+"""Gather dispatch, FP8 output reuse, and kernel error propagation."""
 
 from types import SimpleNamespace
 
@@ -30,9 +21,7 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(autouse=True)
-def _reset_once_log(monkeypatch):
-    """The one-time log latch is module state; keep tests independent."""
-    attention_mla._flydsl_gather_logged.clear()
+def _gather_backend(monkeypatch):
     monkeypatch.setattr(attention_mla, "_FLYDSL_GATHER_AVAILABLE", True)
     monkeypatch.setattr(attention_mla, "_FLYDSL_GATHER_FP8_AVAILABLE", True)
     monkeypatch.setattr(
@@ -41,8 +30,6 @@ def _reset_once_log(monkeypatch):
         lambda *a, **k: pytest.fail("unexpected FlyDSL gather call"),
         raising=False,
     )
-    yield
-    attention_mla._flydsl_gather_logged.clear()
 
 
 def _fake_self(use_flydsl):
@@ -106,37 +93,20 @@ def test_unavailable_flydsl_falls_back_to_triton(_spies, monkeypatch, symbol_pre
     assert obj.use_flydsl_gather_kv_b_proj is True  # Env preference is unchanged.
 
 
-def test_rejected_shape_falls_back_and_stops_retrying(_spies, monkeypatch, caplog):
-    def _reject(*a, **k):
-        _spies.append("flydsl")
-        raise ValueError("[FlyDSL gather_kv_b_proj] page_size 1 only")
-
-    monkeypatch.setattr(attention_mla, "gather_kv_b_proj_flydsl", _reject)
-    obj = _fake_self(use_flydsl=True)
-    with caplog.at_level("WARNING"):
-        _call(obj)
-    assert _spies == ["flydsl", "triton"]
-    assert obj.use_flydsl_gather_kv_b_proj is False
-    assert "page_size 1 only" in caplog.text
-
-    # A second chunk must go straight to Triton, not re-raise through flydsl.
-    _spies.clear()
-    _call(obj)
-    assert _spies == ["triton"]
-
-
-def test_non_value_error_is_not_swallowed(_spies, monkeypatch):
+@pytest.mark.parametrize("error", [ValueError, RuntimeError])
+def test_kernel_errors_propagate(_spies, monkeypatch, error):
     def _boom(*a, **k):
-        raise RuntimeError("HIP error: illegal memory access")
+        raise error("gather failed")
 
     monkeypatch.setattr(attention_mla, "gather_kv_b_proj_flydsl", _boom)
-    with pytest.raises(RuntimeError, match="illegal memory access"):
-        _call(_fake_self(use_flydsl=True))
+    obj = _fake_self(use_flydsl=True)
+    with pytest.raises(error, match="gather failed"):
+        _call(obj)
     assert _spies == []
+    assert obj.use_flydsl_gather_kv_b_proj
 
 
-@pytest.mark.parametrize("reject", [False, True])
-def test_fp8_output_alias_and_bf16_fallback(monkeypatch, reject):
+def test_fp8_output_alias(monkeypatch):
     obj = _fake_self(True)
     k = torch.full((17, 12, 192), 9, dtype=torch.bfloat16)
     v = torch.full((17, 12, 128), 9, dtype=torch.bfloat16)
@@ -151,31 +121,23 @@ def test_fp8_output_alias_and_bf16_fallback(monkeypatch, reject):
         assert ko.is_contiguous() and vo.is_contiguous()
         assert kwargs["k_out_scale"] is ks
         assert kwargs["v_out_scale"] is vs
-        if reject:
-            raise ValueError("unsupported shape")
         ko.fill_(2)
         vo.fill_(3)
         seen.extend([ko, vo])
 
-    def triton(*args, **kwargs):
-        assert args[7] is k and args[8] is v
-        k.fill_(4)
-        v.fill_(5)
-
     monkeypatch.setattr(attention_mla, "gather_kv_b_proj_flydsl", fly)
-    monkeypatch.setattr(attention_mla, "gather_kv_b_proj", triton)
+    monkeypatch.setattr(
+        attention_mla,
+        "gather_kv_b_proj",
+        lambda *a, **k: pytest.fail("unexpected Triton fallback"),
+    )
     unused = torch.empty(0, device="meta")
     result = MLAAttention._kv_b_proj_gather(
         obj, unused, unused, unused, unused, k, v, kv_out_scales=(ks, vs)
     )
-    if reject:
-        assert result is None
-        assert (k == 4).all() and (v == 5).all()
-        assert not obj.use_flydsl_gather_kv_b_proj
-    else:
-        assert result[0] is seen[0] and result[1] is seen[1]
-        assert result[2] is ks and result[3] is vs
-        assert (result[0].float() == 2).all() and (result[1].float() == 3).all()
+    assert result[0] is seen[0] and result[1] is seen[1]
+    assert result[2] is ks and result[3] is vs
+    assert (result[0].float() == 2).all() and (result[1].float() == 3).all()
 
 
 def test_bf16_only_gather_retains_dynamic_quantization(monkeypatch):

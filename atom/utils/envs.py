@@ -131,8 +131,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Use FlyDSL gfx950 FP8 FMHA for eligible MLA prefill calls. Quantizes
     # Q/K/V to E4M3 and folds the softmax-scale correction into Q's descale.
-    # Missing kernels or unsupported layers raise at startup; unsupported
-    # per-call features use AITER varlen attention (OPUS on gfx950).
+    # Unavailable kernels or unsupported calls use AITER varlen attention.
     # Disabled by default. Added 2026-09-10.
     "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN": lambda: (
         os.getenv("ATOM_USE_FLYDSL_FP8_PREFILL_ATTN", "0") == "1"

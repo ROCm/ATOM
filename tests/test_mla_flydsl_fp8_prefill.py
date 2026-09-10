@@ -5,7 +5,7 @@
 
 CPU-only: the flydsl callable, the aiter fallback and the aiter q/k/v quantizer
 are all mocked, so what is under test is the eligibility predicate, the
-softmax-scale fold, the descale ABI, and the fallback state machine -- not
+softmax-scale fold, the descale ABI, and the AITER fallback -- not
 kernel numerics.
 """
 
@@ -20,7 +20,7 @@ from atom.model_ops import attention_mla as mla
 
 
 @pytest.fixture(autouse=True)
-def cpu_quantizer():
+def cpu_quantizer(monkeypatch):
     """Stand a torch quantizer in for the aiter one, for every test in the file.
 
     `quant_fp8_per_tensor` wraps an aiter HIP kernel. Handed a CPU tensor it
@@ -29,6 +29,15 @@ def cpu_quantizer():
     stand-in keeps the only part of the contract these tests lean on:
     ``(x_fp8, descale)`` with descale a shape-[1] tensor.
     """
+
+    monkeypatch.setattr(mla, "_FLYDSL_FP8_MHA_AVAILABLE", True)
+    monkeypatch.setattr(mla, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(
+        mla,
+        "flydsl_flash_attn_fp8_func",
+        lambda *a, **k: pytest.fail("unexpected FlyDSL FP8 MHA call"),
+        raising=False,
+    )
 
     def quant(x):
         x8, descale = mla.dynamic_per_batched_tensor_quant(x)
@@ -65,7 +74,6 @@ def _layer(
     rope_is_zero_pad=False,
     dtype=torch.bfloat16,
     enabled=True,
-    gfx950=True,
 ):
     """Build the attribute subset of MLAAttention that the gate reads.
 
@@ -85,15 +93,7 @@ def _layer(
     # Mirror of the production __init__ block.
     self._fmha_d = qk_nope_head_dim if rope_is_zero_pad else self.qk_head_dim
     self._fmha_scale_fixup = scale * self._fmha_d**0.5
-    with mock.patch.object(mla, "_is_gfx950", lambda: gfx950):
-        self.use_flydsl_fp8_prefill_attn = bool(
-            enabled
-            and mla._is_gfx950()
-            and dtype == torch.bfloat16
-            and self._fmha_d % 64 == 0
-            and 64 <= v_head_dim <= 192
-            and v_head_dim % 32 == 0
-        )
+    self.use_flydsl_fp8_prefill_attn = bool(enabled)
     self._flydsl_fmha_callable = types.MethodType(
         mla.MLAAttention._flydsl_fmha_callable, self
     )
@@ -141,12 +141,12 @@ def test_gate_uses_post_drop_rope_pad_dim():
         scale=256**-0.5, qk_nope_head_dim=256, rope_is_zero_pad=True, v_head_dim=128
     )
     assert glm._fmha_d == 256
-    assert glm.use_flydsl_fp8_prefill_attn
+    assert glm._flydsl_fmha_callable(*_qkv(d=256), 0.0)
     assert glm._fmha_scale_fixup == pytest.approx(1.0)
 
     k3 = _layer(scale=_K3_SCALE)
     assert k3._fmha_d == 192
-    assert k3.use_flydsl_fp8_prefill_attn
+    assert k3._flydsl_fmha_callable(*_qkv(), 0.0)
 
 
 def test_yarn_mscale_scale_is_folded_not_rejected():
@@ -182,14 +182,22 @@ def test_scale_fold_is_skipped_when_exactly_one():
         {"gfx950": False},
     ],
 )
-def test_gate_rejects_unsupported_layers(kw):
-    scale = kw.pop("scale", None)
-    layer = _layer(scale=scale or _K3_SCALE, **kw)
-    assert not layer.use_flydsl_fp8_prefill_attn
+def test_gate_rejects_unsupported_layers(kw, monkeypatch):
+    kw = dict(kw)
+    if not kw.pop("gfx950", True):
+        monkeypatch.setattr(mla, "get_gfx", lambda: "gfx942")
+    layer = _layer(scale=_K3_SCALE, **kw)
+    q, k, v = _qkv(d=layer._fmha_d, dv=layer.v_head_dim)
+    assert not layer._flydsl_fmha_callable(q, k, v, 0.0)
+    ck = mock.Mock()
+    with mock.patch.object(mla, "flash_attn_varlen_func", ck):
+        layer._flash_attn_prefill(q, k, v, **_call_kwargs())
+    ck.assert_called_once()
 
 
 def test_gate_off_when_env_off():
-    assert not _layer(scale=_K3_SCALE, enabled=False).use_flydsl_fp8_prefill_attn
+    layer = _layer(scale=_K3_SCALE, enabled=False)
+    assert not layer._flydsl_fmha_callable(*_qkv(), 0.0)
 
 
 # --------------------------------------------------------------------------
@@ -245,12 +253,7 @@ def test_descales_are_one_dimensional():
 
 
 def test_kernel_exception_propagates():
-    """A kernel failure must reach the caller, not degrade to aiter.
-
-    The old code caught it, latched the layer off and logged a warning, so a
-    JIT or ABI break turned an A/B into a silent baseline re-run: the score
-    still looked like flydsl's. Losing the run is the cheaper failure.
-    """
+    """Kernel execution errors propagate without changing the selected backend."""
     layer = _layer(scale=_K3_SCALE)
     q, k, v = _qkv()
     fly = mock.Mock(side_effect=RuntimeError("JIT boom"))
@@ -266,30 +269,22 @@ def test_kernel_exception_propagates():
     assert layer.use_flydsl_fp8_prefill_attn
 
 
-def test_missing_kernel_raises_rather_than_falling_back():
-    """An unavailable explicitly selected FMHA must not use BF16 silently."""
+@pytest.mark.parametrize("symbol_present", [False, True])
+def test_missing_kernel_uses_aiter(monkeypatch, symbol_present):
+    monkeypatch.setattr(mla, "_FLYDSL_FP8_MHA_AVAILABLE", False)
+    if not symbol_present:
+        monkeypatch.delattr(mla, "flydsl_flash_attn_fp8_func")
     layer = _layer(scale=_K3_SCALE)
     q, k, v = _qkv()
     ck = mock.Mock(return_value=torch.zeros(8, 4, 128))
-
-    with (
-        mock.patch.object(mla, "flydsl_flash_attn_fp8_func", None),
-        mock.patch.object(mla, "flash_attn_varlen_func", ck),
-        pytest.raises(RuntimeError, match="unavailable"),
-    ):
-        layer._flash_attn_prefill(q, k, v, **_call_kwargs())
-    assert ck.call_count == 0
+    with mock.patch.object(mla, "flash_attn_varlen_func", ck):
+        result = layer._flash_attn_prefill(q, k, v, **_call_kwargs())
+    ck.assert_called_once()
+    assert result is ck.return_value
 
 
 def test_callable_at_the_k3_production_prefill_shape():
-    """Closes the one gap the armed-line count cannot see.
-
-    The server log now proves only that every layer passed the *static* gate.
-    An armed layer whose every call missed `_flydsl_fmha_callable` would still
-    run on aiter silently, so pin the real K3 prefill shape here instead:
-    12 heads/rank at TP8, D=192 (128 nope + 64 rope), Dv=128, one full
-    attn_prefill_chunk_size tile.
-    """
+    """Production K3 dimensions must pass the per-call eligibility checks."""
     layer = _layer(scale=_K3_SCALE, v_head_dim=128)
     # `meta` because the predicate only reads shapes and numel -- materializing
     # these would cost ~450 MB in a suite that must run without a GPU.
