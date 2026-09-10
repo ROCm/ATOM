@@ -102,10 +102,10 @@ RUN echo "========== [ATOM] Installing MORI nightly ==========" && \
 # ROCm build whose version string doesn't match rocm-hip's declared dependency,
 # leaving dpkg in a broken state that blocks all subsequent apt-get install calls.
 ARG INSTALL_MOONCAKE=1
-# Upstream Mooncake release tag with HIP dma-buf MR support.
-# Note: this tag does not include the Ionic QP atomic resource clamp.
+# Upstream Mooncake release with HIP dma-buf MR support.
 ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
-ARG MOONCAKE_COMMIT="v0.3.14-rc1"
+# v0.3.12.post1
+ARG MOONCAKE_COMMIT="6041a609a8c3af35e778f70db344f145c2914980"
 ARG USE_HIP_DMABUF=ON
 ARG VENV_PYTHON="/opt/venv/bin/python"
 
@@ -179,7 +179,7 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         || { cat /tmp/mooncake-cmake.log; exit 1; } \
         && cat /tmp/mooncake-cmake.log \
         && if [ "${USE_HIP_DMABUF}" = "ON" ]; then \
-             grep -q "HIP dmabuf MR registration enabled" /tmp/mooncake-cmake.log \
+             grep -Fq "HIP dmabuf MR registration enabled (hsa-runtime64 found)" /tmp/mooncake-cmake.log \
                || { echo "ERROR: HIP dma-buf was not enabled (hsa-runtime64 missing?)"; \
                     grep -E "HIP dmabuf|hsa-runtime64" /tmp/mooncake-cmake.log || true; \
                     exit 1; }; \
@@ -199,7 +199,7 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         && rm -rf /app/mooncake/build /app/mooncake/.git; \
     fi
 
-# Runtime: do not set MOONCAKE_DISABLE_HIP_DMABUF (any non-0 forces ibv_reg_mr).
+# Keep the HIP dma-buf path enabled at runtime (any non-0 forces ibv_reg_mr).
 ENV MOONCAKE_DISABLE_HIP_DMABUF=0
 
 # ========== Install Rust toolchain ==========
