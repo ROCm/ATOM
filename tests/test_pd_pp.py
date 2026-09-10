@@ -569,11 +569,13 @@ def _make_transfer_connector(prefill_data, captured):
     conn.pp_size = 1
     conn.pp_rank = 0
     conn.tp_size = 1
+    conn.dcp_size = 1
     conn.transfer_engine = object()
     conn._transfer_refcount_lock = threading.Lock()
     conn._transfer_refcount = {}
     conn._completed_prefills_lock = threading.Lock()
     conn._completed_prefills = {}
+    conn._kv_cache_ready_events = {}
     conn.done_sending = set()
     conn._wait_for_prefill_data = lambda _transfer_id: dict(prefill_data)
     conn._execute_block_slot_transfer = (
@@ -582,7 +584,7 @@ def _make_transfer_connector(prefill_data, captured):
         )
         or True
     )
-    conn._send_write_done = lambda *_args: None
+    conn._send_write_done = lambda *_args, **_kwargs: None
     return conn
 
 
