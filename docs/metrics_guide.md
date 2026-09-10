@@ -109,6 +109,12 @@ Observed in each scheduler; transported per DP rank (Path B). All carry
 | `atom:scheduler_requests` | Gauge, requests | Requests by scheduler state. Label `state`: `running`, `waiting` (excludes KV waits), `waiting_kv` (external KV load or shared-cache prefill wait). |
 | `atom:scheduler_kv_cache_blocks` | Gauge, blocks | KV block pool by state. Label `state`: `used`, `evictable`, `vacant`, `total`, where `used + evictable + vacant = total`. |
 
+Batch context histograms use fixed buckets through 8,589,934,592 tokens
+(1024 rows of 8,388,608 tokens). Per-request context buckets end at 8,388,608.
+This keeps long-context batch totals in finite buckets when computing
+percentiles. KV block partition counts are maintained as blocks change state;
+snapshot collection does not scan the free block pool.
+
 ### GPU forward timing
 
 Device-event histograms, one entry per worker (Path B). Labels: `dp_rank`,

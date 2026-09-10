@@ -44,8 +44,19 @@ class _AtomMetricsCollector:
     def __init__(self, exporter: AtomMetricsExporter):
         self._exporter = exporter
 
+    def describe(self):
+        # Reserve all original families, including data-dependent label sets,
+        # without reading the runtime snapshot or live process state.
+        return self._collect(None)
+
     def collect(self) -> Iterable[GaugeMetricFamily | CounterMetricFamily]:
-        snapshot, refresh_errors, last_refresh = self._exporter.read()
+        return self._collect(self._exporter.read())
+
+    def _collect(
+        self, state: SnapshotState | None
+    ) -> Iterable[GaugeMetricFamily | CounterMetricFamily]:
+        describe = state is None
+        snapshot, refresh_errors, last_refresh = ({}, 0, 0.0) if describe else state
         available = bool(snapshot.get("enabled", False))
 
         metric = GaugeMetricFamily(
@@ -79,7 +90,7 @@ class _AtomMetricsCollector:
             "chunk. Zero when none is waiting. Non-zero and growing is a "
             "response that has stopped delivering while the client waits.",
         )
-        metric.add_metric([], longest_silence_seconds())
+        metric.add_metric([], 0.0 if describe else longest_silence_seconds())
         yield metric
 
         gauges = (
@@ -413,10 +424,12 @@ class _AtomMetricsCollector:
             distribution.add_metric([str(accepted)], float(steps))
         yield distribution
 
-        yield from _gc_metrics()
+        yield from _gc_metrics(describe=describe)
 
 
-def _gc_metrics() -> Iterable[GaugeMetricFamily | CounterMetricFamily]:
+def _gc_metrics(
+    *, describe: bool = False
+) -> Iterable[GaugeMetricFamily | CounterMetricFamily]:
     """This process's own collector -- the frontend's, not the engine's, since
     each interpreter keeps its own counters.
 
@@ -434,7 +447,7 @@ def _gc_metrics() -> Iterable[GaugeMetricFamily | CounterMetricFamily]:
     that changes twice in a process's life. It and the tracked-set size both
     live in `/debug/gc_census` now, which is asked for rather than scraped.
     """
-    stats = gc.get_stats()
+    stats = [] if describe else gc.get_stats()
     for name, key, doc in (
         (
             "atom:gc_collections",
@@ -466,7 +479,7 @@ def _gc_metrics() -> Iterable[GaugeMetricFamily | CounterMetricFamily]:
         "Collection threshold in effect in this process, per generation.",
         labels=["generation"],
     )
-    for generation, value in enumerate(gc.get_threshold()):
+    for generation, value in enumerate(() if describe else gc.get_threshold()):
         threshold.add_metric([str(generation)], float(value))
     yield threshold
 

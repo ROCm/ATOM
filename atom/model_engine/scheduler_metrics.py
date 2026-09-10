@@ -36,6 +36,9 @@ TOKEN_BUCKETS = (
     4194304,
     8388608,
 )
+# A batch sums many contexts. Keep fixed bounds across schedulers so their
+# histograms can be pooled, covering up to 1024 rows of 8M tokens each.
+BATCH_CONTEXT_BUCKETS = (*TOKEN_BUCKETS, *(2**power for power in range(24, 34)))
 
 
 @dataclass
@@ -53,9 +56,9 @@ class SchedulerMetrics:
         self.pd_transfer = CumulativeHistogram(LATENCY_BUCKETS)
         self.prefill_request_tokens = CumulativeHistogram(TOKEN_BUCKETS)
         self.prefill_batch_tokens = CumulativeHistogram(TOKEN_BUCKETS)
-        self.prefill_context_tokens = CumulativeHistogram(TOKEN_BUCKETS)
+        self.prefill_context_tokens = CumulativeHistogram(BATCH_CONTEXT_BUCKETS)
         self.prefill_request_context_tokens = CumulativeHistogram(TOKEN_BUCKETS)
-        self.decode_context_tokens = CumulativeHistogram(TOKEN_BUCKETS)
+        self.decode_context_tokens = CumulativeHistogram(BATCH_CONTEXT_BUCKETS)
         self.decode_request_context_tokens = CumulativeHistogram(TOKEN_BUCKETS)
         # Only in-flight external loads are retained; removed on every terminal
         # path, including abort and fallback. Sequence timing dies with the seq.

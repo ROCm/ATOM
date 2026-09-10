@@ -602,6 +602,59 @@ def test_decode_request_context_histogram_counts_each_real_row_on_each_forward()
         assert values[("atom:decode_context_tokens_count", labels)] == 2
 
 
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+@pytest.mark.parametrize(
+    "rows,context", [(128, 131072), (512, 1048576), (1024, 8388608)]
+)
+def test_large_batch_contexts_have_finite_buckets_through_exposition(
+    phase, rows, context
+):
+    metrics = SchedulerMetrics()
+    seqs = {i: SimpleNamespace(id=i) for i in range(rows)}
+    scheduled = SimpleNamespace(
+        req_ids=list(seqs),
+        is_dummy_run=False,
+        total_seqs_num_decode=rows if phase == "decode" else 0,
+        total_seqs_num_prefill=rows if phase == "prefill" else 0,
+        total_tokens_num_prefill=rows if phase == "prefill" else 0,
+        context_lens=[context] * rows,
+    )
+    metrics.record_forward(scheduled, seqs)
+    snapshot = metrics.snapshot()
+    total = rows * context
+    histogram = snapshot[f"{phase}_context_tokens"]
+    assert histogram["sum"] == total
+    assert dict(histogram["buckets"])[8388608] == 0
+    # Finite buckets must contain the observations; otherwise Prometheus
+    # clips any quantile in +Inf to the highest finite bound.
+    assert dict(histogram["buckets"])[total] == 1
+    request_histogram = snapshot[f"{phase}_request_context_tokens"]
+    assert request_histogram["buckets"][-2] == (8388608, rows)
+
+    exporter, _, _ = create_metrics_exporter()
+    exporter.update(
+        {
+            "scheduler_metrics": [
+                dict(
+                    snapshot,
+                    dp_rank=0,
+                    engine_role=phase,
+                    running=rows,
+                    waiting=0,
+                    waiting_kv=0,
+                    kv_blocks={},
+                )
+            ]
+        }
+    )
+    values = samples(exporter)
+    labels = (("dp_rank", "0"), ("engine_role", phase))
+    bucket_labels = (*labels, ("le", str(total)))
+    assert values[(f"atom:{phase}_context_tokens_bucket", bucket_labels)] == 1
+    assert values[(f"atom:{phase}_context_tokens_sum", labels)] == total
+    assert values[(f"atom:{phase}_context_tokens_count", labels)] == 1
+
+
 def test_worker_snapshots_include_all_pp_tp_workers_without_duplicate_queues():
     from aiter_stub import stubbed_aiter
 

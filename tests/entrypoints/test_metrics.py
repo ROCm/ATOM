@@ -127,6 +127,14 @@ def test_new_component_registers_without_exporter_changes_and_reads_cached_data(
 @pytest.mark.parametrize(
     "name",
     [
+        "atom:requests_running",
+        "atom:requests_finished_total",
+        "atom:metrics_refresh_errors_total",
+        "atom:dp_requests_routed_total",  # No rank samples at startup.
+        "atom:mtp_decode_steps_total",  # No MTP distribution at startup.
+        "atom:lmcache_loaded_tokens_total",
+        "atom:gc_collections_total",
+        "atom:gc_threshold",
         "atom:request_queue_time_seconds_bucket",
         "atom:request_queue_time_seconds_count",
         "atom:request_queue_time_seconds_sum",
@@ -142,6 +150,25 @@ def test_registration_reserves_optional_families_and_generated_series(name):
     )
     with pytest.raises(ValueError, match="Duplicated timeseries"):
         Gauge(name, "Conflicting instrument", registry=exporter.registry)
+    with pytest.raises(ValueError, match="Duplicated timeseries"):
+        exporter.register_snapshot_collector(
+            lambda snapshot: [GaugeMetricFamily(name, "Conflicting component")]
+        )
+
+
+def test_registration_never_reads_snapshots_or_live_process_metrics(monkeypatch):
+    def unexpected_read(*args, **kwargs):
+        raise AssertionError("registration must only describe metric names")
+
+    monkeypatch.setattr(AtomMetricsExporter, "read", unexpected_read)
+    monkeypatch.setattr(gc, "get_stats", unexpected_read)
+    monkeypatch.setattr(gc, "get_threshold", unexpected_read)
+    monkeypatch.setattr(
+        "atom.entrypoints.openai.metrics.longest_silence_seconds", unexpected_read
+    )
+    exporter, _, _ = create_metrics_exporter()
+    with pytest.raises(ValueError, match="Duplicated timeseries"):
+        Gauge("atom:requests_running", "Duplicate", registry=exporter.registry)
 
 
 def test_components_do_not_pollute_default_registry_or_other_api_instances():

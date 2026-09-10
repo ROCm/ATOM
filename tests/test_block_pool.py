@@ -131,6 +131,9 @@ class TestHandOutOrder:
                 holders[block_id] = 1
             assert pool.num_used == len(holders)
             assert pool.num_free + pool.num_used == 16
+            assert pool.num_reusable_free == sum(
+                pool.block(i).hash != -1 for i in pool._free
+            )
             for block_id, count in holders.items():
                 assert pool.block(block_id).ref_count == count
 
@@ -376,3 +379,77 @@ class TestEvictionAccounting:
         assert stats["blocks_free_reusable"] == 1
         assert stats["blocks_free"] - stats["blocks_free_reusable"] == 2
         assert stats["blocks_indexed"] == 1
+
+    @pytest.mark.parametrize("policy", ["lru", "slru"])
+    def test_reusable_count_survives_resize_clear_and_raw_unit_churn(self, policy):
+        import random
+
+        rng = random.Random(2186)
+        pool = BlockPool(12, max_blocks=16, cache_policy=policy)
+        reservations = {}
+        for step in range(1000):
+            held = [i for i in pool._used if i not in pool._raw_unit_owner]
+            action = rng.randrange(8)
+            if action == 0 and pool.num_free:
+                # Both direct allocation and pop+allocate are supported.
+                block_id = pool.pop() if step % 2 else rng.choice(sorted(pool._free))
+                pool.allocate(block_id)
+                pool.publish(block_id, step, toks(step))
+            elif action == 1 and held:
+                pool.free(rng.choice(held))
+            elif action == 2 and pool.num_indexed:
+                pool.claim(rng.choice(list(pool._hash_to_block_id.values())))
+            elif action == 3:
+                pool.retire_top()
+            elif action == 4:
+                pool.extend(rng.randrange(1, 4))
+            elif action == 5:
+                pool.clear_index()
+            elif action == 6:
+                units = pool.reserve_units(rng.randrange(1, 4), owner=step)
+                if units is not None:
+                    reservations[step] = units
+            elif reservations:
+                owner = rng.choice(list(reservations))
+                pool.release_units(reservations.pop(owner), owner)
+            assert pool.num_reusable_free == sum(
+                pool.block(i).hash != -1 for i in pool._free
+            )
+            assert 0 <= pool.num_reusable_free <= pool.num_free
+            assert pool.num_free + pool.num_used == pool.num_blocks
+
+    def test_hash_changes_count_physical_free_blocks(self):
+        pool = BlockPool(3)
+        published(pool, 0, 100)
+        # A duplicate physical block can carry the canonical hash without
+        # owning its index entry, as with a received/offloaded prefix.
+        pool.allocate(1)
+        pool.block(1).update(100, toks(100))
+        pool.free(1)
+        assert pool.num_reusable_free == 2
+        pool.allocate(1)
+        assert pool.num_reusable_free == 1
+        assert pool.lookup(100) == 0
+        pool.free(1)
+        pool.publish(1, 200, toks(200))
+        assert pool.num_reusable_free == 2
+        pool.publish(1, 201, toks(201))
+        assert pool.num_reusable_free == 2
+        pool.claim(0)
+        pool.clear_index()
+        assert pool.num_reusable_free == 0
+        # clear_index retains the hash of blocks with live references.
+        pool.free(0)
+        assert pool.num_reusable_free == 1
+
+    def test_reusable_count_does_not_traverse_free_blocks(self):
+        pool = BlockPool(3)
+        published(pool, 0, 100)
+
+        class NoIteration(set):
+            def __iter__(self):
+                raise AssertionError("metrics must not scan free blocks")
+
+        pool._free = NoIteration(pool._free)
+        assert pool.num_reusable_free == 1
+        assert pool.eviction_stats()["blocks_free_reusable"] == 1
