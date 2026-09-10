@@ -2738,7 +2738,7 @@ class Scheduler:
             # Every stop this block can decide is a *token* comparison, which
             # needs no tokenizer and so belongs here. Stop strings are the
             # exception and are matched on detokenized text by the frontend --
-            # see `atom.model_engine.stop_strings`.
+            # see `atom.entrypoints.detokenizer`.
             # A speculative step can return several tokens.  The floor must be
             # checked at each candidate's position, not against the post-step
             # total: an EOS at row 0 is still below min_tokens even when later

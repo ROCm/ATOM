@@ -14,10 +14,6 @@ from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.multimodal import get_mrope_input_positions
 from atom.model_engine.sequence import Sequence
-from atom.model_engine.stop_strings import (
-    IncrementalDetokenizer,
-    check_stop_strings,
-)
 from atom.sampling_params import SamplingParams
 from atom.utils import envs
 
@@ -676,101 +672,31 @@ class InputOutputProcessor:
     def _wrap_for_stop_strings(self, sampling_params, callback):
         """Wrap a stream callback so a stop string ends the request.
 
-        This is the frontend half of the split described in
-        `atom.model_engine.stop_strings`: the engine core cannot see text, so
-        the one stop condition defined over text is decided here, against the
-        detokenized output the client will actually receive, and the request
-        is then aborted.
+        The implementation lives in `atom.entrypoints.detokenizer`, next to
+        the detokenizer it needs: a stop string is matched on text, text only
+        exists where a tokenizer does, and that is the frontend. This stays
+        the single point every request path passes through, so a new caller
+        cannot forget to apply it.
 
-        Requests without stop strings are handed back their own callback
-        unchanged -- no detokenizer, no wrapper, no per-step work. That is the
-        overwhelming majority of them.
+        Imported inside the call rather than at module scope: the GPU workers
+        import `atom.model_engine`, and it must not drag the serving package
+        in behind it.
         """
-        stops = [stop for stop in (sampling_params.stop_strings or ()) if stop]
-        if not stops:
-            return callback
+        from atom.entrypoints.detokenizer import wrap_for_stop_strings
 
-        detokenizer = IncrementalDetokenizer(self.tokenizer)
-        include = sampling_params.include_stop_str_in_output
-        min_tokens = sampling_params.min_tokens
-        # The abort is fire-and-forget and the engine keeps producing until it
-        # lands, so more output can arrive for a request already stopped.
-        # Everything after the first hit is dropped rather than re-checked.
-        state = {
-            "stopped": False,
-            "abort_sent": False,
-            "completion_tokens": 0,
-            "truncate_to": -1,
-        }
-
-        def request_abort(request_id):
-            if state["abort_sent"] or self.abort_request is None:
-                return
-            try:
-                self.abort_request(request_id)
-                state["abort_sent"] = True
-            except Exception:
-                # Keep abort_sent false so a later engine chunk retries. The
-                # client waits for the genuine terminal output rather than
-                # being told the request finished while it still runs.
-                logger.warning(
-                    "Abort after stop string failed for request %s",
-                    request_id,
-                    exc_info=True,
-                )
-
-        def on_output(request_output):
-            state["completion_tokens"] += len(request_output.output_tokens or ())
-            if not state["stopped"]:
-                delta = detokenizer.update(
-                    request_output.output_tokens or (), request_output.finished
-                )
-                # A stop string itself may consume one or more tokens. Waiting
-                # until the cumulative count is above the floor guarantees at
-                # least min_tokens tokens precede the terminal condition.
-                hit = (
-                    check_stop_strings(detokenizer.text, len(delta), stops, include)
-                    if state["completion_tokens"] > min_tokens
-                    else None
-                )
-                if hit is not None:
-                    # Only the cut is kept. Which stop string matched is not
-                    # reported: `finish_reason` already says one did, and
-                    # OpenAI's schema has no field for the identity.
-                    _stop_string, truncate_to = hit
-                    if truncate_to < 0:
-                        # `check_stop_strings` says -1 when the match already
-                        # ends the text, so there is nothing to cut *yet*. The
-                        # abort is asynchronous, though, and whatever the
-                        # engine emits before it lands still reaches
-                        # `completion_token_ids`. Pinning the length here is
-                        # what keeps that tail out of the final text.
-                        truncate_to = len(detokenizer.text)
-                    state["stopped"] = True
-                    state["truncate_to"] = truncate_to
-                    request_output.stop_truncate_to = truncate_to
-                    seq = getattr(self, "requests", {}).get(request_output.request_id)
-                    if seq is not None:
-                        seq.stop_truncate_to = truncate_to
-                    if request_output.finished:
-                        request_output.finish_reason = "stop_sequence"
-                    else:
-                        request_abort(request_output.request_id)
-            elif not request_output.finished:
-                # Trailing output from before the abort landed.
-                request_abort(request_output.request_id)
-                return
-            else:
-                # Do not synthesize a terminal event at the text match. The
-                # real one may carry P/D KV-transfer metadata and is what lets
-                # EngineCoreManager retire the callback safely.
-                request_output.finish_reason = "stop_sequence"
-                request_output.stop_truncate_to = state["truncate_to"]
-
-            if callback is not None:
-                callback(request_output)
-
-        return on_output
+        # Read defensively and bound at wrap time. `LLMEngine.__init__` wires
+        # `abort_request` immediately after building this processor and long
+        # before any request is preprocessed, so binding here rather than at
+        # abort time sees the same callable -- but a processor built without
+        # an engine (the unit tests do) has neither attribute, and a request
+        # with no stop strings must not need them.
+        return wrap_for_stop_strings(
+            self.tokenizer,
+            getattr(self, "abort_request", None),
+            getattr(self, "requests", None),
+            sampling_params,
+            callback,
+        )
 
     def preprocess(
         self,

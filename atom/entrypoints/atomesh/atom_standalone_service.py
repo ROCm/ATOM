@@ -18,6 +18,7 @@ import uuid
 from typing import Any
 
 from atom import SamplingParams
+from atom.entrypoints.detokenizer import StreamingTextState
 from atom.entrypoints.openai.api_server import _build_sampling_params, _coerce_n
 from atom.entrypoints.openai.chat_encoders import (
     apply_chat_template,
@@ -63,7 +64,6 @@ from atom.entrypoints.openai.tool_parser.registry import (
     resolve_tool_call_parser,
 )
 from atom.model_engine.sequence import new_token_ids
-from atom.model_engine.stop_strings import StreamingTextState
 
 logger = logging.getLogger("atom")
 

@@ -266,5 +266,6 @@ Each attention backend provides its own `prepare_mtp_decode()` implementation:
 | `atom/model_engine/block_manager.py` | `BlockManager` KV cache block allocation with optional prefix caching |
 | `atom/model_engine/request.py` | `RequestOutput` dataclass for streaming callbacks |
 | `atom/model_engine/async_proc.py` | `AsyncIOProcManager` and `AsyncIOProc` for spawning and managing ModelRunner subprocesses |
+| `atom/entrypoints/detokenizer.py` | `IncrementalDetokenizer` and `StreamingTextState` incremental detokenization, `check_stop_strings` and `wrap_for_stop_strings` text-level stop matching (frontend-side: needs a tokenizer) |
 | `atom/utils/forward_context.py` | `ForwardContext`, `Context`, `DPMetadata`, `SpecDecodeMetadata`, `AttentionMetaData` dataclasses and global accessors |
 | `atom/config.py` | `Config` master configuration, `ParallelConfig`, `CompilationConfig`, `QuantizationConfig`, `SpeculativeConfig`, `KVCacheTensor` |

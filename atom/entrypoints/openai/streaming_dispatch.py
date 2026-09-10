@@ -15,7 +15,7 @@ import time
 from asyncio import AbstractEventLoop, Event
 from typing import Any, NamedTuple
 
-from atom.model_engine.stop_strings import StreamingTextState
+from atom.entrypoints.detokenizer import StreamingTextState
 
 logger = logging.getLogger("atom")
 

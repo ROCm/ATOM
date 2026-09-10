@@ -16,7 +16,7 @@ class SamplingParams:
     min_tokens: int = 0
     ignore_eos: bool = False
     # Stop strings, matched on the *detokenized* text by whoever holds the
-    # tokenizer -- see `atom.model_engine.stop_strings`. Not encoded to token
+    # tokenizer -- see `atom.entrypoints.detokenizer`. Not encoded to token
     # ids: a client's spelling of a stop string need not tokenize the way the
     # model emits it, and when it does not, token matching just never fires.
     stop_strings: list[str] | None = None

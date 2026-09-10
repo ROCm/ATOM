@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Stop strings, matched on text rather than on token ids."""
+"""Incremental detokenization, and stop strings matched on text not token ids."""
 
-from atom.model_engine.request import RequestOutput
-from atom.model_engine.stop_strings import (
+from atom.entrypoints.detokenizer import (
     IncrementalDetokenizer,
     StreamingTextState,
     check_stop_strings,
 )
+from atom.model_engine.request import RequestOutput
 from atom.sampling_params import SamplingParams
 
 

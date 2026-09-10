@@ -2,12 +2,12 @@ import asyncio
 
 import pytest
 
+from atom.entrypoints.detokenizer import IncrementalDetokenizer
 from atom.entrypoints.openai.streaming_dispatch import (
     StreamBatchDispatcher,
     StreamOutputCollector,
     merge_chunk,
 )
-from atom.model_engine.stop_strings import IncrementalDetokenizer
 
 
 class _Utf8ByteTokenizer:
