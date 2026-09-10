@@ -13,6 +13,7 @@ _ATOM_ENV_VARS = [
     "ATOM_DP_BASE_PORT",
     "ATOM_USE_TRITON_GEMM",
     "ATOM_USE_TRITON_MXFP4_BMM",
+    "ATOM_MHC_USE_BF16",
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION",
     "ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION",
     "ATOM_ENABLE_DS_QKNORM_QUANT_FUSION",
@@ -67,6 +68,9 @@ class TestEnvsDefaults:
     def test_dp_base_port_default(self):
         assert _get_envs().ATOM_DP_BASE_PORT == 0
 
+    def test_mhc_use_bf16_default(self):
+        assert _get_envs().ATOM_MHC_USE_BF16 is True
+
     def test_use_triton_gemm_default(self):
         assert _get_envs().ATOM_USE_TRITON_GEMM is False
 
@@ -107,6 +111,11 @@ class TestEnvsDefaults:
 
 class TestEnvsOverrides:
     """Test that env vars are read dynamically (lazy evaluation)."""
+
+    @pytest.mark.parametrize("value, expected", [("0", False), ("1", True)])
+    def test_mhc_use_bf16_override(self, monkeypatch, value, expected):
+        monkeypatch.setenv("ATOM_MHC_USE_BF16", value)
+        assert _get_envs().ATOM_MHC_USE_BF16 is expected
 
     def test_dp_rank_override(self, monkeypatch):
         monkeypatch.setenv("ATOM_DP_RANK", "3")

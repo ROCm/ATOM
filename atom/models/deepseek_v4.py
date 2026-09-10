@@ -3848,7 +3848,8 @@ class Block(nn.Module):
         self.hc_eps = args.hc_eps
         mix_hc = (2 + hc_mult) * hc_mult
         hc_dim = hc_mult * args.dim
-        # All HC params stored in fp32 (matches reference's `set_dtype(torch.float32)`).
+        # Load HC params in FP32. BF16 mode replaces fn storage after loading;
+        # base and scale remain FP32.
         self.hc_attn_fn = atom_parameter(
             torch.empty(mix_hc, hc_dim, dtype=torch.float32)
         )
@@ -3871,32 +3872,33 @@ class Block(nn.Module):
         self._mhc_fused_post_pre = (
             getattr(aiter, "mhc_fused_post_pre", None) if _dim_ok else None
         )
-        self.enable_fused_hc = (
-            hasattr(aiter, "mhc_fused_post_pre") and self.layer_id != 0
-        )
         self.enable_hc_fn_pack_bf16 = (
-            hasattr(aiter, "mhc_pre_convert_fn") if _dim_ok else False
+            envs.ATOM_MHC_USE_BF16
+            and self._mhc_pre is not None
+            and hasattr(aiter, "mhc_shuffle_fn")
+        )
+        self.enable_fused_hc = (
+            self._mhc_fused_post_pre is not None and self.layer_id != 0
         )
 
     # mHC `hc_post_mult_value`: V4 uses `2.0 * sigmoid(post)` for the post gate.
     HC_POST_MULT = 2.0
 
     def process_weights_after_loading(self):
-        """Pack the fp32 mHC fn weights into int32 (bf16 hi<<16 | lo) in place.
+        """Pack constant mHC fn weights into AITER's BF16 hi/lo block layout.
 
-        The bf16 mHC kernels then bit-extract hi/lo instead of recomputing the
-        fp32->bf16 split per token (passed with is_fn_pack_bf16=1). fn are constant
-        weights, so this runs once here (after the checkpoint is loaded and the
-        module is on-device). No-op unless enable_hc_fn_pack_bf16.
+        AITER selects the block size for the runtime GPU architecture. Pack once
+        after loading, then use w_preshuffle_bf16=1 without shuffling residuals.
+        No-op unless enable_hc_fn_pack_bf16.
         """
         if not self.enable_hc_fn_pack_bf16:
             return
         for name in ("hc_attn_fn", "hc_ffn_fn"):
-            fn = getattr(self, name).data
-            packed = torch.empty(fn.shape, dtype=torch.int32, device=fn.device)
-            # mhc_pre_convert_fn requires contiguous fp32 in.
-            aiter.mhc_pre_convert_fn(packed, fn.contiguous().float())
-            setattr(self, name, atom_parameter(packed))
+            fn = getattr(self, name)
+            if fn.dtype == torch.int32:
+                continue
+            # Replace storage on the existing Parameter: retain no FP32 copy.
+            fn.data = aiter.mhc_shuffle_fn(fn.data.contiguous().float())
 
     def hc_pre(
         self,
@@ -3922,10 +3924,10 @@ class Block(nn.Module):
         if self._mhc_pre is not None:
             # aiter mhc_pre wants [M, hc, dim] and returns
             # (post [M, hc, 1], comb [M, hc, hc], y [M, dim]).
-            # hc_fn is pre-packed int32 (bf16 hi/lo) when enable_hc_fn_pack_bf16 -> pass
-            # is_fn_pack_bf16=1. Only add the kwarg when enabled so the fp32 path stays
-            # identical to the pre-bf16 call.
-            pack_kw = {"is_fn_pack_bf16": 1} if self.enable_hc_fn_pack_bf16 else {}
+            # The standalone pre kernel uses ordinary residual layout even with
+            # w_preshuffle_bf16=1; only fn is packed into BF16 hi/lo.
+            # Omit the flag when packing is unavailable to preserve the FP32 path.
+            pack_kw = {"w_preshuffle_bf16": 1} if self.enable_hc_fn_pack_bf16 else {}
             post, comb, y = self._mhc_pre(
                 residual,
                 hc_fn,
@@ -4009,7 +4011,12 @@ class Block(nn.Module):
         norm_eps: float = 1e-6,
         prefix: str = "",
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        pack_kw = {"is_fn_pack_bf16": 1} if self.enable_hc_fn_pack_bf16 else {}
+        # BF16 weight packing is independent of the residual layout.
+        pack_kw = (
+            {"w_preshuffle_bf16": True, "res_preshuffle": False}
+            if self.enable_hc_fn_pack_bf16
+            else {}
+        )
         return self._mhc_fused_post_pre(
             x,
             residual,
@@ -4077,6 +4084,8 @@ class Block(nn.Module):
                 norm_eps,
                 prefix=f"{self.prefix}.mhc_fused_post_pre",
             )
+            # Match hc_pre's [tokens, hc] state for subsequent post/pre calls.
+            post = post.squeeze(-1)
         else:
             x, post, comb, res = self.mhc_post_pre(
                 x,
@@ -4177,7 +4186,14 @@ class ParallelHead(ParallelLMHead):
         via Sigmoid-gated weighted sum (vs Block.hc_pre's Sinkhorn variant).
         """
         _, _, y = aiter.mhc_pre(
-            x, hc_fn, hc_scale, hc_base, self.norm_eps, self.hc_eps, sinkhorn_repeat=0
+            x,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            self.norm_eps,
+            self.hc_eps,
+            sinkhorn_repeat=0,
+            **({"w_preshuffle_bf16": 1} if hc_fn.dtype == torch.int32 else {}),
         )
         return y
 
@@ -4380,6 +4396,19 @@ class DeepseekV4Model(nn.Module):
         )
         self.hc_head_base = atom_parameter(torch.empty(hc_mult, dtype=torch.float32))
         self.hc_head_scale = atom_parameter(torch.empty(1, dtype=torch.float32))
+
+    def process_weights_after_loading(self):
+        """Pack the head's constant fn using AITER's architecture-specific layout."""
+        if (
+            not envs.ATOM_MHC_USE_BF16
+            or not hasattr(aiter, "mhc_shuffle_fn")
+            or self.hc_head_fn.dtype == torch.int32
+        ):
+            return
+        # Replace storage instead of keeping a second packed Parameter.
+        self.hc_head_fn.data = aiter.mhc_shuffle_fn(
+            self.hc_head_fn.data.contiguous().float()
+        )
 
     def forward(
         self,
