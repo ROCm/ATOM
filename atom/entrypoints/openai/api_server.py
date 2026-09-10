@@ -70,6 +70,7 @@ from .protocol import (
     CompletionRequest,
     ModelCard,
     ModelList,
+    validated_max_tokens,
 )
 from .reasoning import (
     ReasoningChannel,
@@ -2056,6 +2057,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
     # streaming it arrives after the client was told the request succeeded.
     try:
         validate_tool_list(anthropic_to_openai_tools(request.tools))
+        validated_max_tokens(request.max_tokens, "max_tokens")
     except ValueError as exc:
         return JSONResponse(
             status_code=400,
