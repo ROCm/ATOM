@@ -674,6 +674,9 @@ class InputOutputProcessor:
                 "kimi_linear",
                 "glm5_next_text",
                 "deepseek_v4",
+                # V4.1's text half is served through the V4 attention builder
+                # today, which declares a per-request state sub-pool.
+                "deepseek_v41_text",
             }
         )
 

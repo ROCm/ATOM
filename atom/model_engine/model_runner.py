@@ -112,6 +112,7 @@ support_model_arch_dict = {
     "DeepseekV3ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
     "DeepseekV32ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
     "DeepseekV4ForCausalLM": "atom.models.deepseek_v4.DeepseekV4ForCausalLM",
+    "DeepseekV41ForCausalLM": "atom.models.deepseek_v41.DeepseekV41ForCausalLM",
     "GptOssForCausalLM": "atom.models.gpt_oss.GptOssForCausalLM",
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2.GlmMoeDsaForCausalLM",
     "Glm4MoeForCausalLM": "atom.models.glm4_moe.Glm4MoeForCausalLM",
@@ -837,6 +838,55 @@ class ModelRunner:
             f"[{self.rank_name}] Model load done: {config.model} "
             f"(weights loaded in {load_elapsed:.2f}s)"
         )
+        self._init_engram_runtime()
+
+    def _init_engram_runtime(self) -> None:
+        """Attach the engram host path, for models that have engram layers.
+
+        The model owns its tables (it is what loaded them) and hands back a
+        runtime; the runner owns the lifecycle and the two hooks below. Models
+        without engram leave this None and pay nothing but the attribute.
+        """
+        self.engram = None
+        build = getattr(self.model, "build_engram_runtime", None)
+        if build is None:
+            return
+        self.engram = build(
+            device=self.device,
+            max_num_tokens=self.config.max_num_batched_tokens,
+        )
+        if self.engram is not None:
+            logger.info(
+                f"[{self.rank_name}] engram host path active on layers "
+                f"{list(self.engram.layer_ids)}"
+            )
+
+    def _stage_engram(self, batch: ScheduledBatch) -> None:
+        """Move this step's engram rows to the device before the model runs.
+
+        Decode is the real path: one row per sequence, keyed on the token the
+        previous step sampled, which the prefetch has usually already gathered.
+        Prefill and dummy passes stage zeros -- engram then contributes exactly
+        nothing, which is wrong for a real model and has to be replaced by a
+        per-prompt-token gather before this serves anything for accuracy.
+        """
+        seq_ids = list(batch.req_ids)
+        # A dummy pass runs the engram layers with nothing to look up, and a
+        # prefill needs a row per prompt token, which the host path does not
+        # gather yet. Both stage zeros: the shapes stay right and the copy still
+        # happens, so warmup touches the real path and a prefill produces a
+        # defined engram contribution instead of crashing. Zeros propagate to
+        # exactly zero through EngramOp, so prefill currently contributes
+        # nothing at all -- see the gap noted in the docstring below.
+        if batch.is_dummy_run or not seq_ids or batch.total_tokens_num != len(seq_ids):
+            self.engram.stage_dummy(batch.total_tokens_num)
+            self.engram.wait_for_copy()
+            return
+        last_tokens = np.array(
+            [[batch.seqs[seq_id].last_token] for seq_id in seq_ids], dtype=np.int64
+        )
+        self.engram.stage(seq_ids, last_tokens)
+        self.engram.wait_for_copy()
 
     def _maybe_warmup(self):
         """Run model warmup. Override point: the rapidserve decode process
@@ -3063,6 +3113,17 @@ class ModelRunner:
         req_ids_out = [k for k in token_id_dict if k != -1]
         token_ids_out = [token_id_dict[k] for k in req_ids_out]
 
+        # These ids were copied to the host by the sampler's async path and are
+        # already synchronized here, so queuing the engram gather costs no extra
+        # synchronization -- it runs on a worker while the next step's GPU work
+        # is being issued. Hooking this into the copy itself (as the #168
+        # prototype did) would force a device sync and give the overlap back.
+        if getattr(self, "engram", None) is not None and req_ids_out:
+            self.engram.prefetch_next(
+                req_ids_out,
+                np.array([[ids[-1]] for ids in token_ids_out], dtype=np.int64),
+            )
+
         draft_token_ids: np.ndarray | None = None
         if self.tokenID_processor.is_deferred_out:
             if hasattr(self, "drafter"):
@@ -3157,6 +3218,8 @@ class ModelRunner:
             needs_independent_noise,
         ) = self.prepare_model(batch)
         self._mark_staging_h2d_enqueued()
+        if getattr(self, "engram", None) is not None:
+            self._stage_engram(batch)
         logits, hidden_states = self.run_model(input_ids, batch)
 
         pp_group = get_pp_group()
