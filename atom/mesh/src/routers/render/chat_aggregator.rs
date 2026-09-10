@@ -17,10 +17,7 @@ use crate::{
     routers::{
         comm::error,
         prepare::{
-            parser_factory_lookup::{
-                check_reasoning_parser_availability, check_tool_parser_availability,
-                get_reasoning_parser, get_tool_parser,
-            },
+            parser_factory_lookup::{check_reasoning_parser_availability, get_reasoning_parser},
             response_context::{ProtocolRequest, ResponseContext},
             tool_constraints::{
                 generate_tool_call_id, get_history_tool_calls_count, parse_json_schema_response,
@@ -37,7 +34,10 @@ use crate::{
         stop::{SequenceDecoderOutput, StopSequenceDecoder},
         traits::Tokenizer,
     },
-    tool_parser::ParserFactory as ToolParserFactory,
+    tool_parser::{
+        registry::{check_tool_parser_availability, get_tool_parser},
+        ParserFactory as ToolParserFactory,
+    },
 };
 
 pub async fn process(stream: TokenHandle, ctx: ResponseContext) -> Response {

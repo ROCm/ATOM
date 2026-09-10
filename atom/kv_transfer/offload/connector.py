@@ -202,6 +202,32 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
     def should_defer_free(self, seq) -> bool:
         return self._impl.should_defer_free(seq)
 
+    def protected_block_ids(self, seq):
+        callback = getattr(self._impl, "protected_block_ids", None)
+        return callback(seq) if callback is not None else None
+
+    def activate_block_leases(self, seq, block_ids) -> None:
+        callback = getattr(self._impl, "activate_block_leases", None)
+        if callback is not None:
+            callback(seq, block_ids)
+
+    def take_source_safe_releases(self):
+        callback = getattr(self._impl, "take_source_safe_releases", None)
+        return callback() if callback is not None else []
+
+    def reclaim_stale_leases(self, timeout_s: float):
+        callback = getattr(self._impl, "reclaim_stale_leases", None)
+        return callback(timeout_s) if callback is not None else []
+
+    def record_early_release(self, count: int) -> None:
+        callback = getattr(self._impl, "record_early_release", None)
+        if callback is not None:
+            callback(count)
+
+    def connector_completion(self, completion):
+        callback = getattr(self._impl, "connector_completion", None)
+        return callback(completion) if callback is not None else False
+
     def release_stalled_save(self, seq) -> None:
         # Plain forward, not getattr-guarded: OffloadSchedulerMixin declares the
         # save/load lifecycle abstract, so every _impl defines all six methods or

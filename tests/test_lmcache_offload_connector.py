@@ -1396,7 +1396,9 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
             original["l0"].v_cache[[3]].reshape(-1),
         ]
     )
-    assert pack_groups == [[[1, 2], [3]]]
+    # Save staging is tail-to-head, but every MemoryObj still receives the
+    # bytes for its original exact range.
+    assert pack_groups == [[[3], [1, 2]]]
     assert all(nbytes <= 4 * codec.bytes_per_block for nbytes, _ in buffer_requests)
     assert all(capacity == 4 * codec.bytes_per_block for _, capacity in buffer_requests)
     assert torch.equal(memory_objs[0].tensor, expected0)
@@ -1411,6 +1413,7 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
         block_ids=[0, 1, 2, 3, 4, 5],
     )
 
+    # Load/retrieve remains in ordinary head-to-tail order.
     assert unpack_groups == [[[1, 2], [3]]]
     for bid in [1, 2, 3]:
         assert torch.equal(kv_caches["l0"].k_cache[bid], original["l0"].k_cache[bid])
