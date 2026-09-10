@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788973759671,
+  "lastUpdate": 1789062309896,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -2849,6 +2849,51 @@ window.BENCHMARK_DATA = {
             "value": 0.9014,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34375993124 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609091600 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.2055 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "gbyu-amd",
+            "username": "gbyu-amd",
+            "email": "Guanbao.Yu@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "23a99bc5bbc72afa838947a88c5985e4dcce4fc4",
+          "message": "add flydsl backend for gather_kv_b_proj (#2170)\n\n* add flydsl backend for gather_kv_b_proj\n\n* test(mla): cover the flydsl gather dispatch, and name the gate for what it gates\n\nThe backend swap had no tests. What needs pinning is not the kernel -- flydsl\nvalidates its own preconditions and raises ValueError before it launches -- but\nATOM's dispatch around it: off means Triton, on means flydsl, an unavailable\nimport means Triton, and a refusal must fall back with the outputs still\nproduced rather than take the server down, and must not re-attempt on every\nlater chunk. The last of those is the one worth a test: the retry guard is a\nmutation of self inside an except branch, and losing it would cost a failed\nlaunch per layer per chunk while still returning correct results, so nothing\ndownstream would show it.\n\nRename use_flydsl_gather to use_flydsl_gather_kv_b_proj. There is now a second\nflydsl gate in this module (the fp8 prefill FMHA), and the short name no longer\nsays which one it is at the call site.\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n\n* clean code and update env doc\n\n* delete unnecessary test file\n\n* clear code\n\n* add a date to better track the env var\n\n---------\n\nCo-authored-by: ganyi <ygan@amd.com>\nCo-authored-by: Claude <noreply@anthropic.com>",
+          "timestamp": "2026-09-10T14:46:56Z",
+          "url": "https://github.com/ROCm/ATOM/commit/23a99bc5bbc72afa838947a88c5985e4dcce4fc4"
+        },
+        "date": 1789062309227,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
+            "value": 0.9492,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34501149102 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609101456 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9484 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP MTP acceptance (%)",
+            "value": 66.08,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34501149102 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609101456 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9484 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
+            "value": 2.98,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8992,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34501149102 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609101456 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1638 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
