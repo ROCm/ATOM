@@ -1509,10 +1509,14 @@ class MooncakeConnector(KVConnectorBase):
                 )
                 self._notify_transfer_result(request_data, success=False)
                 return
-            if has_slot_data and consumer_dcp_size > 1:
+            if (
+                has_slot_data
+                and consumer_dcp_size > 1
+                and self.dcp_size != consumer_dcp_size
+            ):
                 raise RuntimeError(
-                    "P/D slot-region transfer does not support a DCP consumer "
-                    f"(consumer_dcp_size={consumer_dcp_size})"
+                    "P/D slot-region transfer does not support asymmetric DCP "
+                    f"(producer_dcp={self.dcp_size}, consumer_dcp={consumer_dcp_size})"
                 )
             if has_slot_data:
                 initial_src_slot = int(prefill_data.get("slot_index", -1))
