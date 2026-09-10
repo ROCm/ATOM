@@ -428,6 +428,8 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
         for name in (
             "atom:prefill_request_tokens",
             "atom:prefill_batch_tokens",
+            "atom:prefill_context_tokens",
+            "atom:prefill_request_context_tokens",
             "atom:decode_context_tokens",
             "atom:decode_request_context_tokens",
             "atom:gpu_forward_seconds",
@@ -471,7 +473,7 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
                 batch.observe(4)
                 transfer.observe(0.02)
                 for hist, value in zip(
-                    workload, (2000, 512, 32000, 8000, 0.008, 0.030)
+                    workload, (2000, 512, 48000, 12000, 32000, 8000, 0.008, 0.030)
                 ):
                     hist.observe(value)
                 cached.inc(8)
@@ -576,6 +578,14 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
                 value for _, value in bundle["series"]["mean"] if value is not None
             ]
             assert means and all(value == pytest.approx(30) for value in means)
+        for panel_id, expected in (
+            ("prefill_context_tokens", 48000),
+            ("prefill_request_context_tokens", 12000),
+        ):
+            panel = panels[panel_id]
+            for bundle in (panel, *panel["instances"].values()):
+                means = [v for _, v in bundle["series"]["mean"] if v is not None]
+                assert means and all(v == pytest.approx(expected) for v in means)
         request_context = panels["decode_request_context_tokens"]
         assert request_context["title"] == "Decode request context tokens"
         assert panels["decode_context_tokens"]["title"] == "Decode batch context tokens"

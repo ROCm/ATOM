@@ -53,6 +53,8 @@ class SchedulerMetrics:
         self.pd_transfer = CumulativeHistogram(LATENCY_BUCKETS)
         self.prefill_request_tokens = CumulativeHistogram(TOKEN_BUCKETS)
         self.prefill_batch_tokens = CumulativeHistogram(TOKEN_BUCKETS)
+        self.prefill_context_tokens = CumulativeHistogram(TOKEN_BUCKETS)
+        self.prefill_request_context_tokens = CumulativeHistogram(TOKEN_BUCKETS)
         self.decode_context_tokens = CumulativeHistogram(TOKEN_BUCKETS)
         self.decode_request_context_tokens = CumulativeHistogram(TOKEN_BUCKETS)
         # Only in-flight external loads are retained; removed on every terminal
@@ -116,9 +118,15 @@ class SchedulerMetrics:
                 self.decode_context_tokens.observe(total_context)
         if getattr(batch, "total_seqs_num_prefill", 0) > 0:
             self.prefill_batch_tokens.observe(batch.total_tokens_num_prefill)
+            context_lens = getattr(batch, "context_lens", None)
+            total_context = 0
             # ScheduledBatch packs decode rows before prefill rows. Use its
             # immutable offsets: scheduling may already have advanced the seq.
             for i in range(batch.total_seqs_num_decode, len(batch.req_ids)):
+                if context_lens is not None:
+                    tokens = int(context_lens[i])
+                    self.prefill_request_context_tokens.observe(tokens)
+                    total_context += tokens
                 seq = seqs[batch.req_ids[i]]
                 timing = getattr(seq, "queue_timing", None)
                 if timing is not None and not timing.prefill_observed:
@@ -126,6 +134,8 @@ class SchedulerMetrics:
                         max(0, seq.num_prompt_tokens - batch.num_cached_tokens[i])
                     )
                     timing.prefill_observed = True
+            if context_lens is not None:
+                self.prefill_context_tokens.observe(total_context)
 
     def snapshot(self) -> dict:
         return {
@@ -134,6 +144,8 @@ class SchedulerMetrics:
             "pd_kv_transfer": self.pd_transfer.snapshot(),
             "prefill_request_tokens": self.prefill_request_tokens.snapshot(),
             "prefill_batch_tokens": self.prefill_batch_tokens.snapshot(),
+            "prefill_context_tokens": self.prefill_context_tokens.snapshot(),
+            "prefill_request_context_tokens": self.prefill_request_context_tokens.snapshot(),
             "decode_context_tokens": self.decode_context_tokens.snapshot(),
             "decode_request_context_tokens": self.decode_request_context_tokens.snapshot(),
         }
@@ -170,6 +182,16 @@ def collect_scheduler_metrics(snapshot):
             "prefill_batch_tokens",
             "atom:prefill_batch_tokens",
             "Real prefill tokens scheduled per forward, excluding cached prefix and padding.",
+        ),
+        (
+            "prefill_context_tokens",
+            "atom:prefill_context_tokens",
+            "Sum of logical prefill context lengths at the current chunk end per real forward, including cached prefixes and excluding decode rows and padding.",
+        ),
+        (
+            "prefill_request_context_tokens",
+            "atom:prefill_request_context_tokens",
+            "Logical context length per real prefill request row on each forward, including cached prefixes through the current chunk; request-forward weighted, without padding or TP multiplication.",
         ),
         (
             "decode_context_tokens",
