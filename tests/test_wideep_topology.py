@@ -175,6 +175,19 @@ class TestFromParallelConfig:
         assert a == b
         assert (a.nnodes, a.node_rank, a.ep_size, a.gpu_per_node) == (2, 1, 16, 8)
 
+    def test_post_fold_worker_rank_is_normalized_to_node_offset(self):
+        pc = _FakeParallelConfig(
+            data_parallel_size=16,
+            data_parallel_size_local=8,
+            data_parallel_rank=13,
+            data_parallel_rank_local=5,
+        )
+        topo = WideEPTopology.from_parallel_config(
+            pc, tensor_parallel_size=1, dp_attention=True
+        )
+        assert (topo.nnodes, topo.node_rank) == (2, 1)
+        assert (topo.ep_size, topo.gpu_per_node) == (16, 8)
+
     def test_single_node_defaults_local_to_global(self):
         pc = _FakeParallelConfig(
             data_parallel_size=1, data_parallel_size_local=None, data_parallel_rank=0

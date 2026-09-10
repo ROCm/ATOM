@@ -161,6 +161,12 @@ class WideEPTopology:
         global_dp_size = parallel_config.data_parallel_size
         local_engine_count = parallel_config.data_parallel_size_local
         rank_offset = parallel_config.data_parallel_rank
+        # CoreManager gives each spawned worker its global DP rank. Recover
+        # the node's slice offset before deriving node_rank; the topology
+        # object describes the node, not the individual worker.
+        rank_local = getattr(parallel_config, "data_parallel_rank_local", None)
+        if rank_local is not None:
+            rank_offset -= rank_local
         if local_engine_count is None:
             local_engine_count = global_dp_size
         if dp_attention:

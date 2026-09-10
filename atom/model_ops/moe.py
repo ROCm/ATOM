@@ -1801,11 +1801,97 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
         return views
 
 
+def _is_wideep_topology(moe: FusedMoEConfig) -> bool:
+    parallel = getattr(moe, "moe_parallel_config", None)
+    return (
+        parallel is not None
+        and getattr(parallel, "use_ep", False)
+        and getattr(parallel, "ep_size", 1) == 16
+        and getattr(parallel, "local_ep_size", 1) == 8
+    )
+
+
+def _validate_wideep_mxfp4_config(
+    quant_config: LayerQuantConfig, moe: FusedMoEConfig
+) -> None:
+    """Reject EP16 combinations that TestWideEpMoe has not implemented."""
+    problems = []
+    parallel = moe.moe_parallel_config
+    atom_config = get_current_atom_config()
+
+    if get_gfx() != "gfx950":
+        problems.append("GPU architecture must be gfx950")
+    if parallel.dp_logical_ratio != 1:
+        problems.append("logical DP simulation is unsupported")
+    if not parallel.use_all2all_kernels:
+        problems.append("the MORI all-to-all runtime is unavailable")
+    if not quant_config.is_dynamic:
+        problems.append("activation quantization must be dynamic")
+    if not envs.ATOM_MOE_GU_ITLV:
+        problems.append("ATOM_MOE_GU_ITLV=1 is required")
+    if getattr(atom_config, "eplb_enable", False):
+        problems.append("EPLB must be disabled")
+    if moe.expert_layout.mode is not SharedExpertMode.NONE:
+        problems.append("fused shared experts are unsupported")
+    if moe.has_bias:
+        problems.append("expert bias is unsupported")
+    if moe.in_dtype != torch.bfloat16:
+        problems.append(f"model dtype must be torch.bfloat16, got {moe.in_dtype}")
+
+    if problems:
+        raise ValueError(
+            "The EP16 (2 nodes x 8 GPUs) MXFP4 configuration selects AITER "
+            "TestWideEpMoe, but its contract is not satisfied: " + "; ".join(problems)
+        )
+
+
+class WideEpMxfp4MoEMethod(Mxfp4MoEMethod):
+    """MXFP4 method backed by AITER's EP16 InterNodeV1LL pipeline."""
+
+    def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
+        super().__init__(quant_config, moe)
+        _validate_wideep_mxfp4_config(quant_config, moe)
+        self.use_triton = False
+        self.use_triton_decode = False
+
+    def _process_weight_layout_after_loading(self, layer) -> None:
+        from atom.model_ops.fused_moe.wideep_experts import build_wideep_weights
+
+        build_wideep_weights(layer)
+        layer.w13_weight.data = torch.empty(
+            0, dtype=layer.w13_weight.dtype, device=layer.w13_weight.device
+        )
+        layer.w2_weight.data = torch.empty(
+            0, dtype=layer.w2_weight.dtype, device=layer.w2_weight.device
+        )
+        logger.info("Prepared WideEP weights for the EP16 InterNodeV1LL MoE path")
+
+    def init_prepare_finalize(self, layer: torch.nn.Module):
+        from atom.model_ops.fused_moe.wideep_experts import WideEpFusedExperts
+
+        if self.hidden_pad or self.intermediate_pad:
+            raise ValueError(
+                "WideEP does not support padded MoE dimensions: "
+                f"hidden_pad={self.hidden_pad}, intermediate_pad={self.intermediate_pad}"
+            )
+        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        self.fused_experts = WideEpFusedExperts(
+            layer,
+            model_dim=self.hidden_size,
+            inter_dim=self.intermediate_size,
+            experts=self.moe.num_experts,
+            mtpr=self.moe.max_num_tokens,
+            quant="a8w4",
+        )
+
+
 def _make_mxfp4_moe_method(
     quant_config: LayerQuantConfig, moe: FusedMoEConfig
 ) -> Mxfp4MoEMethod:
     if get_current_atom_config().moe_backend == "mega":
         return MegaMxfp4MoEMethod(quant_config, moe)
+    if _is_wideep_topology(moe):
+        return WideEpMxfp4MoEMethod(quant_config, moe)
     return Mxfp4MoEMethod(quant_config, moe)
 
 
