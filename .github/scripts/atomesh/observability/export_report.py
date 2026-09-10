@@ -240,6 +240,31 @@ def panels_for(deployment: str) -> list[dict]:
                 "scale": 1,
             }
         )
+    for metric, title, detail in (
+        (
+            "prefill_context_tokens",
+            "Prefill batch context tokens",
+            "Sum of logical prefill contexts through the current chunk · includes cached prefixes · excludes decode rows and padding",
+        ),
+        (
+            "prefill_request_context_tokens",
+            "Prefill request context tokens",
+            "Logical context per request on every prefill forward · cached prefix + current chunk · request-forward weighted",
+        ),
+    ):
+        panels.append(
+            {
+                "id": metric,
+                "role": role,
+                "title": title,
+                "label": f"{role.upper()} · WORKLOAD",
+                "detail": detail,
+                "metric": f"atom:{metric}",
+                "selector": f'job="atom",role="{role}"',
+                "unit": "tokens",
+                "scale": 1,
+            }
+        )
     role = roles[-1]
     panels.append(
         {
@@ -523,7 +548,11 @@ def demo_data() -> dict:
             )
         }
         if panel["unit"] == "tokens":
-            factor = 2000 if panel["id"] == "decode_context_tokens" else 150
+            factor = (
+                2000
+                if panel["id"] in {"prefill_context_tokens", "decode_context_tokens"}
+                else 150
+            )
             panel["series"] = {
                 k: [[t, round(v * factor)] for t, v in points]
                 for k, points in panel["series"].items()

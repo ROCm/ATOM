@@ -166,6 +166,28 @@ def test_grouped_queries_preserve_instances_and_weight_ratios():
     assert panels["prefill_batch_tokens"]["metric"] == "atom:prefill_batch_tokens"
 
 
+@pytest.mark.parametrize("deployment", ["pd", "standalone"])
+def test_prefill_context_panels_use_token_histograms_and_instance_filters(deployment):
+    panels = {p["id"]: p for p in report.panels_for(deployment)}
+    role = "prefill" if deployment == "pd" else "standalone"
+    for metric, title in (
+        ("prefill_context_tokens", "Prefill batch context tokens"),
+        ("prefill_request_context_tokens", "Prefill request context tokens"),
+    ):
+        panel = panels[metric]
+        assert panel["title"] == title
+        assert panel["category"] == "workload" and panel["unit"] == "tokens"
+        assert panel["role"] == role and not panel["overview"]
+        assert report.statistics_for(panel) == ("mean", "p50", "p90", "p95", "p99")
+        mean = report.query_for(panel, "mean", 60, by_instance=True)
+        assert f'atom:{metric}_sum{{job="atom",role="{role}"}}' in mean
+        assert f'atom:{metric}_count{{job="atom",role="{role}"}}' in mean
+        assert "sum by (instance)" in mean and "1000 *" not in mean
+        percentile = report.query_for(panel, "p99", 60, by_instance=True)
+        assert "histogram_quantile(0.99, sum by (instance, le)" in percentile
+        assert f"atom:{metric}_bucket" in percentile
+
+
 def test_request_gpu_time_uses_completed_request_histograms_and_instance_filters():
     panels = {p["id"]: p for p in report.panels_for("pd")}
     request = panels["prefill_request_gpu_forward"]

@@ -455,11 +455,95 @@ def test_workload_uses_dispatch_snapshot_and_observes_prompt_once(clock):
     assert snapshot["prefill_request_tokens"]["buckets"][-1][1] == 1
     assert snapshot["prefill_batch_tokens"]["sum"] == 2000
     assert snapshot["prefill_batch_tokens"]["buckets"][-1][1] == 2
+    assert snapshot["prefill_context_tokens"]["sum"] == 19024
+    assert snapshot["prefill_context_tokens"]["buckets"][-1][1] == 2
+    assert snapshot["prefill_request_context_tokens"]["sum"] == 19024
+    assert snapshot["prefill_request_context_tokens"]["buckets"][-1][1] == 2
     assert snapshot["decode_context_tokens"]["sum"] == 4001
     assert snapshot["decode_context_tokens"]["buckets"][-1][1] == 2
     mixed.is_dummy_run = True
     metrics.record_forward(mixed, seqs)
     assert metrics.snapshot() == snapshot
+
+
+def test_prefill_context_uses_chunk_end_and_excludes_decode_and_padding(monkeypatch):
+    import numpy as np
+
+    from atom.model_engine.scheduler import ScheduledBatch
+    from atom.model_engine.sequence import SequenceType
+
+    monkeypatch.delenv("ATOM_ENABLE_METRICS_DEVICE_TIMER", raising=False)
+    metrics = SchedulerMetrics()
+    decode = Sequence([1, 2], block_size=4)
+    decode.type = SequenceType.DECODE
+    first = Sequence(list(range(12)), block_size=4)
+    second = Sequence(list(range(20)), block_size=4)
+    first.type = second.type = SequenceType.PREFILL
+    first.num_cached_tokens, second.num_cached_tokens = 4, 8
+    seqs = {seq.id: seq for seq in (decode, first, second)}
+    scheduled = ScheduledBatch(
+        seqs,
+        [1, 3, 4],
+        8,
+        total_tokens_num_decode=1,
+        total_tokens_num_prefill=7,
+        total_seqs_num=3,
+        total_seqs_num_decode=1,
+        total_seqs_num_prefill=2,
+    )
+    scheduled.context_lens = np.append(scheduled.context_lens, 999999)
+    # Scheduling can advance the live sequences before dispatch.
+    first.num_cached_tokens = 7
+    second.num_cached_tokens = 12
+    metrics.record_forward(scheduled, seqs)
+    initial = metrics.snapshot()
+    assert initial["prefill_context_tokens"]["sum"] == 19  # 7 + 12
+    assert initial["prefill_context_tokens"]["buckets"][-1][1] == 1
+    assert initial["prefill_request_context_tokens"]["sum"] == 19
+    assert initial["prefill_request_context_tokens"]["buckets"][-1][1] == 2
+    assert initial["prefill_batch_tokens"]["sum"] == 7
+    assert initial["decode_context_tokens"]["sum"] == 2
+
+    tail = ScheduledBatch(
+        {first.id: first},
+        [5],
+        5,
+        total_tokens_num_prefill=5,
+        total_seqs_num=1,
+        total_seqs_num_prefill=1,
+    )
+    metrics.record_forward(tail, seqs)
+    final = metrics.snapshot()
+    assert final["prefill_context_tokens"]["sum"] == 31  # 19 + 12
+    assert final["prefill_context_tokens"]["buckets"][-1][1] == 2
+    assert final["prefill_request_context_tokens"]["sum"] == 31
+    assert final["prefill_request_context_tokens"]["buckets"][-1][1] == 3
+    tail.is_dummy_run = True
+    metrics.record_forward(tail, seqs)
+    assert metrics.snapshot() == final
+
+    rank = dict(
+        final,
+        dp_rank=2,
+        engine_role="prefill",
+        running=1,
+        waiting=0,
+        waiting_kv=0,
+        kv_blocks={},
+    )
+    exporter, _, _ = create_metrics_exporter()
+    labels = (("dp_rank", "2"), ("engine_role", "prefill"))
+    for _ in range(2):
+        exporter.update({"enabled": True, "scheduler_metrics": [rank]})
+        values = samples(exporter)
+        assert values[("atom:prefill_context_tokens_count", labels)] == 2
+        assert values[("atom:prefill_request_context_tokens_count", labels)] == 3
+        assert values[("atom:prefill_request_context_tokens_sum", labels)] == 31
+    # Older workers must remain missing, not produce synthetic zero samples.
+    for key in ("prefill_context_tokens", "prefill_request_context_tokens"):
+        del rank[key]
+    exporter.update({"enabled": True, "scheduler_metrics": [rank]})
+    assert ("atom:prefill_context_tokens_count", labels) not in samples(exporter)
 
 
 def test_decode_request_context_histogram_counts_each_real_row_on_each_forward():

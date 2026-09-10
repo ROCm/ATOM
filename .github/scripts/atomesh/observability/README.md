@@ -34,6 +34,13 @@ All metrics to inspect the full set. Desktop charts use two columns:
   together, each divided by input tokens. The panel also shows estimated
   Reused / Input and LMCache / GPU tokens in the same window.
 - Uncached prompt tokens per request and actual prefill tokens per forward.
+- Prefill batch context tokens: sum of the prefill rows' logical context lengths
+  through the current chunk, including cached and previously computed prefixes.
+- Prefill request context tokens: one sample per prefill row on every real forward.
+  For an 80K cached prefix plus a 4K chunk, context is 84K while actual prefill work
+  is 4K. Later chunks contribute new samples; future prompt chunks, decode rows,
+  and graph padding are excluded. These CPU scheduler metrics are available even
+  when GPU event timing is disabled.
 - Decode batch context tokens: sum of logical sequence lengths per real batch.
 - Decode request context tokens: one context-length sample per real request row
   on every decode forward. Requests participating in more forwards contribute
