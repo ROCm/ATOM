@@ -705,3 +705,36 @@ def test_dense_load_failure_by_request_resolves_the_parked_generation(monkeypatc
 
     assert connector._save_tracker["81"] == [seq, 8]
     assert "81" not in connector._active_load_operations
+
+
+def test_dense_worker_pool_widths_follow_env(monkeypatch):
+    """A single load thread saturates once the CPU tier serves real traffic.
+
+    Measured on the radix workload with the HBM pool squeezed to 7900 blocks:
+    88% duty cycle inside `retrieve` on every rank, which turned a +57.8pp
+    hit-rate win into a throughput loss. Both pools must be tunable, and both
+    must keep their one-thread default so existing deployments are unchanged.
+    """
+
+    worker = DenseOffloadConnector(_config())
+    try:
+        assert worker._save_executor._max_workers == 1
+        assert worker._load_executor._max_workers == 1
+    finally:
+        worker.close()
+
+    monkeypatch.setenv("OFFLOAD_COPY_WORKERS", "4")
+    monkeypatch.setenv("OFFLOAD_LOAD_WORKERS", "3")
+    worker = DenseOffloadConnector(_config())
+    try:
+        assert worker._save_executor._max_workers == 4
+        assert worker._load_executor._max_workers == 3
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize("var", ["OFFLOAD_COPY_WORKERS", "OFFLOAD_LOAD_WORKERS"])
+def test_dense_worker_rejects_non_positive_pool_width(monkeypatch, var):
+    monkeypatch.setenv(var, "0")
+    with pytest.raises(ValueError, match="worker count must be positive"):
+        DenseOffloadConnector(_config())

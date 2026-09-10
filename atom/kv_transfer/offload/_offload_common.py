@@ -141,6 +141,7 @@ class OffloadWorkerMixin:
         config,
         *,
         save_workers: int | None = None,
+        load_workers: int | None = None,
         thread_name_prefix: str = "offload",
     ) -> None:
         kvc = getattr(config, "kv_transfer_config", {}) or {}
@@ -148,7 +149,8 @@ class OffloadWorkerMixin:
         self._do_save = self.kv_role in ("offload", "kv_both", "kv_producer")
         self._do_load = self.kv_role in ("offload", "kv_both", "kv_consumer")
         # Separate executors so a load (on the TTFT critical path) never queues
-        # behind fire-and-forget saves. OFFLOAD_COPY_WORKERS tunes the save pool.
+        # behind fire-and-forget saves. OFFLOAD_COPY_WORKERS tunes the save pool,
+        # OFFLOAD_LOAD_WORKERS the load pool.
         n_save = (
             int(os.environ.get("OFFLOAD_COPY_WORKERS", "1"))
             if save_workers is None
@@ -156,11 +158,26 @@ class OffloadWorkerMixin:
         )
         if n_save <= 0:
             raise ValueError("offload save worker count must be positive")
+        # A single load thread saturates once the HBM pool is small enough for
+        # the CPU tier to serve real traffic: measured 143s of `retrieve` inside
+        # a 163s window (88% duty cycle) on the radix workload at 7900 blocks,
+        # which turned a +57.8pp hit-rate win into a 4% throughput loss. The
+        # byte-copy path keeps its staging buffers and CUDA streams in
+        # thread-local state (`_BlockGpuConnector._thread_state`), so extra load
+        # threads are independent; each costs one more
+        # `gpu_staging_buffer_bytes` allocation per rank.
+        n_load = (
+            int(os.environ.get("OFFLOAD_LOAD_WORKERS", "1"))
+            if load_workers is None
+            else int(load_workers)
+        )
+        if n_load <= 0:
+            raise ValueError("offload load worker count must be positive")
         self._save_executor = ThreadPoolExecutor(
             max_workers=n_save, thread_name_prefix=f"{thread_name_prefix}-save"
         )
         self._load_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix=f"{thread_name_prefix}-load"
+            max_workers=n_load, thread_name_prefix=f"{thread_name_prefix}-load"
         )
         self._lock = threading.Lock()
         self._done_save: set[SaveCompletionId] = set()
