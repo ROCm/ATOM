@@ -361,6 +361,7 @@ models:
             extra_args: "--decode-context-parallel-size 4 --cudagraph-mode FULL"
           env:
             common:
+              ATOM_ENABLE_METRICS_DEVICE_TIMER: "1"
               ATOM_MLA_PAGE_SIZE: "1"
               ATOM_ONLINE_QUANT_STREAMING: "0"
               ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB: "2047"
