@@ -6227,6 +6227,8 @@ def _dense_sched(lookup):
     sched._reqs_need_recv = {}
     sched._save_tracker = {}
     sched._hit_save_floors = {}
+    sched._lookup_results = {}
+    sched._lookup_in_step = []
     sched._begin_load_lifecycle = lambda seq: None
     sched._lmcache_hit_save_floor = lambda ls: 0
     return sched
