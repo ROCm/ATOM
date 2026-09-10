@@ -147,6 +147,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB": lambda: int(
         os.getenv("ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB", "2048")
     ),
+    # Which MQA-logits kernel family the DeepSeek-V4 sparse indexer scores with.
+    # "opus" (default) uses aiter's schedule-free OPUS kernels, which derive each
+    # CTA's assignment from blockIdx instead of a host-built cta_info; "flydsl"
+    # falls back to the FlyDSL ragged kernel both paths used before. The fallback
+    # exists so one build can A/B the two without a rebuild — it reads the same
+    # cache pools and returns the same seq-local logits, so only the kernel differs.
+    # CTA fill target for the OPUS decode context split. There is really only
+    # one right value on gfx950 and 1024 is it: the decode kernel is the 1-wave
+    # variant (NUM_WARPS=1 -> BLOCK_SIZE=64) built with
+    # `__launch_bounds__(64, OPUS_LOGITS_MIN_WAVES=2)`, which pins VGPR near 256
+    # to keep 2 waves/SIMD -- 4 resident CTAs per CU, so 256 CUs saturate at
+    # 256*4 = 1024. Measured at bs=32 (us/launch): 256 -> 8.30 (quarter
+    # occupancy, nothing to hide latency behind), 1024 -> 7.30 (full), 2048 ->
+    # 7.34 (a second wave that just queues). The knob exists to re-derive this
+    # if the kernel's register budget changes, not as a tuning dial.
+    # Baked into the decode CUDAGraph at capture, so a sweep needs a restart.
+    "ATOM_V4_INDEXER_DECODE_CTA_TARGET": lambda: int(
+        os.getenv("ATOM_V4_INDEXER_DECODE_CTA_TARGET", "1024")
+    ),
+    "ATOM_V4_INDEXER_MQA_KERNEL": lambda: os.getenv(
+        "ATOM_V4_INDEXER_MQA_KERNEL", "opus"
+    ).lower(),
     # GLM-5.2 (glm_moe_dsa): enable the fused indexer qk-rope + fp8-quant + kv-cache
     # kernel (indexer_qk_rope_quant_and_cache), same path DeepSeek-V3.2 uses. GLM's
     # indexer dims (index_head_dim=128, qk_rope_head_dim=64, per_1x128, neox rope) are

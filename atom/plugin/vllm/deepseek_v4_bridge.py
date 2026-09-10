@@ -816,7 +816,7 @@ class _V4DecodeMetaBuffers:
         self.batch_id = CpuGpuBuffer(T, dtype=torch.int32, device=device)
         self.swa_dest_rows = {ratio: i32(T) for ratio in _V4_SWA_DEST_RATIOS}
         self.csa_n_committed_per_token = i32(T)
-        self.block_tables_per_token = i32(T, self.max_blocks)
+        self.block_tables_tile = i32(T, self.max_blocks)
         # Ragged cumsums (T + 1) and ragged index pools (worst-case per-token
         # slot counts): SWA = win, CSA = win + index_topk, HCA = win + hca.
         self.indptr_swa = i32(T + 1)
@@ -1512,7 +1512,7 @@ def build_atom_v4_attention_metadata(
             bufs.csa_n_committed_per_token, visible_np
         )
         block_cols = int(common_attn_metadata.block_table_tensor.shape[1])
-        block_rows = bufs.block_tables_per_token.gpu[:T_pad, :block_cols]
+        block_rows = bufs.block_tables_tile.gpu[:T_pad, :block_cols]
         safe_batch_ids = md.batch_id_per_q_token[:T_pad].clamp_min(0).long()
         torch.index_select(
             common_attn_metadata.block_table_tensor,
@@ -1520,7 +1520,7 @@ def build_atom_v4_attention_metadata(
             safe_batch_ids,
             out=block_rows,
         )
-        md.block_tables_per_token = block_rows
+        md.block_tables_tile = block_rows
         _populate_decode_persistent(
             md,
             common_attn_metadata,
@@ -1576,7 +1576,7 @@ def build_atom_v4_attention_metadata(
         visible_np = visible_csa(pos_np).astype(np.int32)
         md.csa_n_committed_per_token = torch.from_numpy(visible_np).to(device)
         batch_ids = torch.from_numpy(batch_np).to(device=device, dtype=torch.long)
-        md.block_tables_per_token = common_attn_metadata.block_table_tensor[batch_ids]
+        md.block_tables_tile = common_attn_metadata.block_table_tensor[batch_ids]
         _populate_decode(md, common_attn_metadata, batch_np, pos_np, positions)
         # Eager fp8 decode (no persistent buffers -- standalone/tests, or a
         # batch that skips CG capture): fresh per-token op5 index tensors. Not

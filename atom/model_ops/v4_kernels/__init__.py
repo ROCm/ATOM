@@ -64,7 +64,8 @@ from atom.model_ops.v4_kernels.state_writes import (
 
 __all__ = [
     "FP4_MQA_BLOCK_K",
-    "FP4_MQA_PARALLEL_UNIT_NUM",
+    "FP4_MQA_DECODE_BLOCK_K",
+    "MQA_TILE_QLEN",
     "CompressPlan",
     "QKNormRopeOut",
     "build_v4_paged_decode_indptr",
@@ -97,24 +98,25 @@ __all__ = [
 
 logger = logging.getLogger("atom")
 
-# FP4 indexer persistent-grid schedule params for the `pa_mqa_logits_fp4_prefill`
-# kernels, which decode and prefill both score through.
-# The attention metadata builder precomputes each path's cta_info with these
-# and the scorer passes the matching block_k, so layout and grid agree. They
-# live here (rather than in either caller) because both the builder and the
-# model-side scorer must use the SAME values.
-#
-# The grid floor is a CTA-count target, not the kernel default: every consumer
-# takes `max(floor, rows)`, so it only adds split-K to grids too small to fill
-# the GPU and is an identity for the wide ones. Splits are numerically inert --
-# each CTA gets a disjoint KV-column range, no cross-CTA partial sums.
-# 512 idled the machine on long contexts, where rows shrink as the logits buffer
-# widens: decode rows=128 W~32768 54.1us -> 51.2us, prefill rows=1024 224.6us ->
-# 206.2us. 4096 is not any shape's optimum (CTA-count quantization makes the
-# ordering shape-specific) but has the smallest worst-case regret of the values
-# tried; re-tune against a real workload mix.
-FP4_MQA_PARALLEL_UNIT_NUM = 4096
+# KV columns one MQA-logits CTA tile spans, for the OPUS FP4 kernels. Purely a
+# performance knob -- both compiled variants (64 = 1-wave, 256 = 4-wave) produce
+# identical results. Prefill and decode want different values, so there are two.
 FP4_MQA_BLOCK_K = 256
+
+# Query rows one MQA-logits CTA covers. The OPUS kernels ship at 1; a 4-row
+# variant that reuses a tile's compressed-KV load across the CSA compress ratio
+# is coming. Everything CTA-shaped derives from `ceil(rows / MQA_TILE_QLEN)`
+# rather than the row count, so adopting the 4-row kernel is this constant plus
+# the metadata builder -- no call-site change. Metadata sized this way carries a
+# `_tile` suffix (`v4_block_tables_tile`).
+MQA_TILE_QLEN = 1
+
+
+# Decode splits a row's context across CTAs and a split cannot be finer than one
+# `block_k` tile, so decode wants the 1-wave variant where prefill wants 4-wave:
+# at bs=32 / ctx~4096 a 256-wide tile leaves only 16 tiles for 32 splits (half
+# idle), where 64 gives 64 tiles (2 per split, all busy). Both are compiled.
+FP4_MQA_DECODE_BLOCK_K = 64
 
 
 def fp4_indexer_enabled(index_cache_dtype: Any, *, warn: bool = False) -> bool:

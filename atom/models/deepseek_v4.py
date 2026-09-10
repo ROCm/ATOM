@@ -103,7 +103,8 @@ from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.utils import atom_parameter, shuffle_weights
 from atom.model_ops.v4_kernels import (
     FP4_MQA_BLOCK_K,
-    FP4_MQA_PARALLEL_UNIT_NUM,
+    FP4_MQA_DECODE_BLOCK_K,
+    MQA_TILE_QLEN,
     CompressPlan,
     QKNormRopeOut,
     csa_translate_pack,
@@ -157,6 +158,15 @@ _V4_USE_REF_QUANT = os.environ.get("V4_USE_REF_QUANT", "0") == "1"
 _V4_USE_TRITON_FUSION = os.environ.get("ATOM_V4_USE_TRITON_FUSION", "0") == "1"
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 SPARSE_INDEXER_LOGITS_BUDGET_MB = envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
+
+# CTA fill target for the OPUS decode context split: `split_kv` is chosen so the
+# launch has roughly this many CTAs, i.e. `bs * split_kv ~= target`. See
+# `ATOM_V4_INDEXER_DECODE_CTA_TARGET` for why 1024 is the only sensible value on
+# gfx950 (it is the occupancy ceiling, not a tuning dial) and for the measured
+# curve. Read through envs so it can be re-derived by restart if the kernel's
+# register budget ever changes -- it is baked into the decode CUDAGraph at
+# capture, so it cannot be swept in-process.
+_OPUS_DECODE_CTA_TARGET = envs.ATOM_V4_INDEXER_DECODE_CTA_TARGET
 
 
 def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
@@ -1256,7 +1266,7 @@ class Compressor(nn.Module):
             → preshuffled (MFMA 16x16 tile) write into `self.kv_cache`, plus
             fp32 scale into `self.cache_scale` (a strided view of the same
             allocation built by the V4 builder). Bit-exact with
-            `indexer_k_quant_and_cache` / `cp_gather_indexer_k_quant_cache`
+            `fused_compress_attn(quant_mode=...)`
             (cache_kernels.cu:1145+).
 
         Side-effecting only — no return value (cache scatter IS the output).
@@ -1475,7 +1485,7 @@ class Indexer(nn.Module):
         # head dim (128), so there is exactly one scale per (token, head).
         self._q_quant_group = self.head_dim
         self._weights_scale = self.softmax_scale * self.n_heads**-0.5
-        # `deepgemm_fp8_paged_mqa_logits` decode-path output column count:
+        # OPUS decode-path output column count:
         # one indexer slot per `compress_ratio` source tokens.
         self._max_model_len_idx = args.max_seq_len // compress_ratio
 
@@ -1492,6 +1502,13 @@ class Indexer(nn.Module):
         self._indexer_fp4 = fp4_indexer_enabled(
             get_current_atom_config().index_cache_dtype
         )
+        # Tile width per phase, resolved once here rather than per call so it
+        # stays stable across the graphed trace (same reason `_indexer_fp4` is).
+        # Prefill takes the 4-wave tile; decode takes the 1-wave one, because a
+        # context split cannot go finer than one tile and 256 would leave half
+        # the splits idle at bs=32 / ctx~4096.
+        self._mqa_prefill_block_k = FP4_MQA_BLOCK_K
+        self._mqa_decode_block_k = FP4_MQA_DECODE_BLOCK_K
 
         self.compressor = Compressor(
             args,
@@ -1722,31 +1739,33 @@ class Indexer(nn.Module):
         indexer_meta = fc.attn_metadata.indexer_meta
         block_tables = fc.attn_metadata.block_tables  # [bs, max_blocks_per_seq] int32
 
-        # FP4 indexer → FP4 paged MQA-logits kernels; FP8 stays on the
-        # cp_gather/deepgemm paths. Branch on the STABLE `_indexer_fp4` flag (not
-        # `kv_cache.dtype`) so this eager dispatch always agrees with the branch
-        # `forward_pre` baked into the graphed projection piece. `q_quant` is the
-        # packed q_fp4 and `q_scale` its paired e8m0 scale — both value-passed from
-        # `forward_pre` (q_scale rides its own op arg; no per-module state).
+        # FP4 scores through the OPUS paged MQA-logits kernels off
+        # `block_tables`; FP8 stays on the cp_gather/deepgemm paths. Branch on
+        # the STABLE `_indexer_fp4` flag (not `kv_cache.dtype`) so this eager
+        # dispatch always agrees with the branch `forward_pre` baked into the
+        # graphed projection piece. `q_quant` is the packed q_fp4 and `q_scale`
+        # its paired e8m0 plane -- both value-passed from `forward_pre`.
         if self._indexer_fp4:
             if fc.context.is_prefill:
                 return self._score_topk_prefill_fp4(
                     q_quant, q_scale, block_tables, weights, indexer_meta, topk
-                )
+                )  # [total_tokens, topk] int32, raw seq-local
             return self._score_topk_decode_fp4(
                 q_quant, q_scale, block_tables, weights, indexer_meta, topk
-            )
+            )  # [total_tokens, topk] int32, raw seq-local
 
         # No host-side `if total_committed == 0: return torch.full(-1)`
-        # short-circuit — that would freeze a Python branch into the
-        # CUDAGraph at capture time. The hot path handles the corner
-        # natively: when n_committed == 0 the per-token K bound is 0, the
-        # underlying top-k kernels write -1 sentinels across the row, and
-        # `csa_translate_pack` skips them via its `topk >= 0` mask.
+        # short-circuit -- that would freeze a Python branch into the CUDAGraph
+        # at capture time. The hot path handles the corner natively: when
+        # n_committed == 0 the per-token K bound is 0, the top-k kernels leave
+        # the row's tail untouched, and `csa_translate_pack` masks it off.
         if fc.context.is_prefill:
             return self._score_topk_prefill(
                 q_quant, weights, block_tables, indexer_meta, topk
             )  # [total_tokens, topk] int32
+        return self._score_topk_decode(
+            q_quant, weights, block_tables, indexer_meta, topk
+        )  # [total_tokens, topk] int32
         return self._score_topk_decode(
             q_quant, weights, block_tables, indexer_meta, topk
         )  # [total_tokens, topk] int32
@@ -2003,23 +2022,18 @@ class Indexer(nn.Module):
         indexer_meta: dict,
         topk: int,
     ) -> torch.Tensor:
-        """Ragged-prefill FP4: `flydsl_pa_mqa_logits_fp4_prefill` reads the
-        paged FP4 cache per query row over its seq-local window
-        `[0, visible_end)`. Output logits are seq-local, so the prefill top-k
-        indices are returned directly (no `seq_base` subtraction, unlike the FP8
-        GLOBAL-output path). Eager-only (dynamic total_tokens).
+        """Ragged-prefill FP4: one OPUS CTA per query row, over that row's
+        seq-local window `[0, visible_end)` of the paged FP4 cache. Output logits
+        are seq-local, so the prefill top-k indices are returned directly (no
+        `seq_base` subtraction, unlike the FP8 GLOBAL-output path). Eager-only
+        (dynamic total_tokens).
 
         The dense `[chunk_rows, max_model_len_idx]` fp32 logits is chunked on the
-        Q dim via `_prefill_chunked_topk` (same OOM guard as FP8). In the common
-        SINGLE-chunk case the schedule (cta_info/n_ctas) precomputed ONCE outside
-        the fwd by the metadata builder is reused as-is (no schedule work in the
-        fwd). Only when the buffer would exceed budget and the loop actually
-        splits does each chunk rebuild the schedule for its rows (cta_info
-        encodes absolute row ids, so a slice of the full schedule won't do)."""
-        from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
-            compute_prefill_schedule,
-            flydsl_pa_mqa_logits_fp4_prefill,
-        )
+        Q dim via `_prefill_chunked_topk` (same OOM guard as FP8). The kernel is
+        schedule-free -- each CTA derives its row from `blockIdx` and reads that
+        row's window from the three per-row arrays -- so a chunk is just a slice
+        of those arrays, with no schedule to rebuild per chunk."""
+        from aiter import pa_mqa_logits_mxfp4_fwd_prefill
 
         device = q_fp4.device
         total_tokens = q_fp4.size(0)
@@ -2032,10 +2046,6 @@ class Indexer(nn.Module):
         ]
         local_ends = indexer_meta["visible_end_gpu"]  # [total_tokens] int32
         local_starts = indexer_meta["fp4_prefill_local_starts"]
-        # Full-batch schedule precomputed once (outside the fwd) in the metadata
-        # builder; reused directly on the single-chunk path.
-        full_cta_info = indexer_meta["fp4_prefill_cta_info"]
-        full_n_ctas = indexer_meta["fp4_prefill_n_ctas"]
         # Seq-local logits width = this batch's ACTUAL max committed index length
         # (right-sized in the metadata builder, CPU-derived), NOT the model max
         # `_max_model_len_idx`. Keeps the [total_tokens, W] fp32 buffer small so
@@ -2057,33 +2067,21 @@ class Indexer(nn.Module):
         )
 
         def _score(chunk_start, chunk_end, rs, re):
-            if chunk_start == 0 and chunk_end == total_tokens:
-                # Single chunk (common case): reuse the schedule precomputed once
-                # outside the fwd (metadata builder, sized to the full
-                # prefill_rows) — no compute_prefill_schedule here.
-                cta_info, n_ctas = full_cta_info, full_n_ctas
-            else:
-                # Multi-chunk (logits would exceed budget): rebuild the schedule
-                # for this chunk's rows. Prefill has one row per query token, so
-                # the grid MUST cover this chunk's rows or surplus rows are
-                # dropped (their logits stay -inf -> wrong top-k); the shared CTA
-                # floor keeps a small chunk spread across the GPU.
-                _, cta_info, n_ctas = compute_prefill_schedule(
-                    batch_id_per_q_token[chunk_start:chunk_end],
-                    rs,
-                    re,
-                    FP4_MQA_BLOCK_K,
-                    max(FP4_MQA_PARALLEL_UNIT_NUM, chunk_end - chunk_start),
-                    max_seq_len,
-                )
             # Write-once, NOT -inf-filled: the kernel writes every column in
             # `[rs, re)` per row and `top_k_per_row_prefill` scans only that
             # range, so a `torch.full(-inf)` pre-fill would be pure waste (~290μs
-            # FillFunc at max_model_len_idx width vs a ~6μs mqa kernel).
+            # FillFunc at max_model_len_idx width vs a ~6μs mqa kernel). OPUS
+            # keeps this contract: its store masks on `abs_tok - local_start <
+            # win`, so it too touches only `[rs, re)`.
+            chunk_rows = chunk_end - chunk_start
             logits = torch.empty(
-                chunk_end - chunk_start, max_seq_len, dtype=torch.float32, device=device
+                chunk_rows, max_seq_len, dtype=torch.float32, device=device
             )
-            flydsl_pa_mqa_logits_fp4_prefill(
+            # Raw JIT stub, not the `pa_mqa_logits_mxfp4_prefill` wrapper: the
+            # wrapper re-detects the gfx target through rocminfo on EVERY call,
+            # and would allocate a `torch.full(-inf)` out when `out=None`.
+            # 15 positional args, order fixed by the pybind macro.
+            pa_mqa_logits_mxfp4_fwd_prefill(
                 q_fp4[chunk_start:chunk_end],
                 q_scale[chunk_start:chunk_end],
                 self.kv_cache,
@@ -2093,13 +2091,12 @@ class Indexer(nn.Module):
                 batch_id_per_q_token[chunk_start:chunk_end],
                 rs,
                 re,
+                logits,
+                chunk_rows,
+                self._weights_scale,
+                self._mqa_prefill_block_k,
+                kv_block_size,
                 max_seq_len,
-                weight_scale=self._weights_scale,
-                block_k=FP4_MQA_BLOCK_K,
-                kv_block_size=kv_block_size,
-                out=logits,
-                cta_info=cta_info,
-                n_ctas=n_ctas,
             )  # [chunk_rows, max_seq_len] fp32, seq-local; only [rs,re) written
             return logits
 
@@ -2116,114 +2113,112 @@ class Indexer(nn.Module):
 
     def _score_topk_decode_fp4(
         self,
-        q_fp4: torch.Tensor,  # [padded_tokens, n_heads, head_dim//2] uint8
+        q_fp4: torch.Tensor,  # [padded_tokens, n_heads, head_dim(/2 for fp4)] uint8
         q_scale: torch.Tensor,  # [padded_tokens, K_TILES, 4, 16, QS_PAD] uint8
-        block_tables: torch.Tensor,  # [bs, max_blocks_per_seq] int32
-        weights: torch.Tensor,  # [padded_tokens, n_heads] fp32
-        indexer_meta: dict,  # carries the varlen windows built by the attn builder
+        block_tables: torch.Tensor,  # unused: OPUS decode reads the TILE table
+        weights: torch.Tensor,  # [padded_tokens, n_heads] bf16
+        indexer_meta: dict,
         topk: int,
     ) -> torch.Tensor:
-        """RAGGED decode FP4 via the varqlen (ragged-prefill) MQA-logits kernel.
+        """Decode on the OPUS decode kernel, one pseudo-batch per tile.
 
-        A sequence forwards its own number of query tokens, so `total_tokens` is
-        their sum and a `[bs, next_n]` view does not exist. None is needed: the
-        decode tokens are already laid out per-seq ascending, so row `r` IS token
-        `r` and `batch_id_per_q_token` is the row-to-sequence map the ragged-prefill
-        kernel wants — no scatter, no second layout.
+        OPUS derives its window in-kernel from per-BATCH `context_lens` as
+        `context_lens[b] - (qlen - 1 - mtp_pos)`. That is a per-token DECREMENT,
+        while ours is a per-token FLOOR (`(pos - d + 1) // CSA_RATIO`), and the
+        two differ: `floor((x-d)/4) >= floor(x/4) - d`. Mapping a real sequence
+        onto one batch item would therefore UNDER-score every MTP row but the
+        last, by up to `next_n - 1` compressed columns -- memory-safe, silently
+        wrong, and invisible to any test that only runs next_n == 1.
 
-        Per-row MTP tail-causal window: row n of seq b scores compressed KV
-        `[0, n_committed_b - qlen_b + n + 1)`, identical to the rectangular decode
-        kernel's `rowEnds - next_n + r + 1` bound but with per-seq `qlen_b` in
-        place of a uniform `next_n`. Windows are precomputed once/fwd by the attn
-        builder over ALL padded rows (pad tail forced to empty), so the full
-        padded q_fp4 is scored single-shot and the seq-local top-k is returned
-        directly (pad rows → -1, ignored downstream).
+        So each TILE becomes its own batch item (`qlen == MQA_TILE_QLEN`), the
+        same trick the FP8 decode path uses. At TILE_QLEN 1 the correction term
+        is identically zero and `local_end` is `context_lens[row]` verbatim --
+        i.e. `csa_n_committed_per_token`, the exact tensor the FlyDSL path passes
+        as `local_ends`. Bit-identical windows, and correct for any next_n
+        because the floor is precomputed per token rather than re-derived.
 
-        The scorer itself is CG-safe: windows + persistent-grid schedule are
-        precomputed once/fwd into fixed-address buffers by the attn builder and the
-        logits width is the static `_max_model_len_idx`, so it captures/replays at a
-        static shape from stable pointers (like the rectangular decode path). It is
-        exercised eagerly under PIECEWISE (the paged core is an eager splitting op).
+        `row_id = cu_seq_q[b] + n == b`, so "row r IS token r" survives and both
+        the `[padded, W]` out layout and `top_k_per_row_decode` are unchanged.
 
-        `--cudagraph-mode FULL` works too: `graph_key` is only
-        `(running_bs, max_q_len)`, so a rectangular step (DP-sync dummy, boundary,
-        no-shrink) can replay a ragged-captured graph. The attn builder therefore
-        refreshes these windows on EVERY decode fwd — rectangular ones included —
-        so a replay never reads the previous step's stale windows (which faulted
-        the bounds-check-off paged-KV load in `pa_mqa_logits_fp4_prefill_kernel_0`).
+        CG-safe: grid is `(n_tiles, TILE_QLEN, split_kv)`, all from static shapes
+        (`padded_tokens` is pinned by the graph key), `cu_seq_q` is a constant
+        iota, and `context_lens` is refreshed on-device every decode fwd by
+        `build_v4_paged_decode_indptr`. Nothing here allocates but `logits`.
         """
-        from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
-            flydsl_pa_mqa_logits_fp4_prefill,
-        )
+        from aiter import pa_mqa_logits_mxfp4_fwd_decode
 
         device = q_fp4.device
         padded_tokens = q_fp4.size(0)
-        # Windows + persistent-grid schedule precomputed once/fwd by the attn
-        # builder into FIXED-address buffers (`_build_v4_indexer_meta`). Windows
-        # span ALL padded rows with the pad tail forced empty (local_ends == 0),
-        # so the full padded q_fp4 is scored single-shot: pad rows are skipped by
-        # the kernel (empty window → 0 CTAs → no paged KV read) and their top-k is
-        # -1 (ignored downstream by csa_translate_pack). No strip / pad-back.
-        # Off the metadata, not the dict -- see `_score_topk_prefill_fp4`.
-        batch_id_per_q_token = get_forward_context().attn_metadata.batch_id_per_q_token[
-            : q_fp4.size(0)
-        ]
-        local_starts = indexer_meta["fp4_local_starts"]
-        local_ends = indexer_meta["fp4_local_ends"]
-        cta_info = indexer_meta["fp4_cta_info"]
-        n_ctas = indexer_meta["fp4_n_ctas"]
-        # Fixed logits width → static `[padded, W]` shape (CG-capturable), same as
-        # the rectangular decode path.
+
+        fc = get_forward_context()
+        # Read at forward time, not from `indexer_meta`: `block_tables_tile` is
+        # published by `_attach_v4_paged_decode_meta`, which does not run before
+        # the indexer meta builder at every call site.
+        block_tables_tile = fc.attn_metadata.block_tables_tile
+        context_lens = indexer_meta["fp4_context_lens"]
+        cu_seq_q = indexer_meta["fp4_cu_seq_q"]
+        n_tiles = indexer_meta["fp4_n_tiles"]
+
         max_seq_len = self._max_model_len_idx
         kv_block_size = self.kv_cache.size(3)  # csa_rows_per_block = 64
-        # Same N_PHYS==1 packed-dword-scale contract as the other FP4 paths
-        # (see `_score_topk_decode_fp4`): fail loudly on an unsupported block size.
         assert kv_block_size == 64, (
             f"FP4 indexer requires kv_block_size (CSA rows per block) == 64 "
-            f"for the packed "
-            f"N_PHYS==1 mqa-logits readers, got {kv_block_size}. Set V4 "
-            f"block_size=256 (CSA rows per block = block_size // 4)."
+            f"for the packed N_PHYS==1 mqa-logits readers, got {kv_block_size}. "
+            f"Set V4 block_size=256 (CSA rows per block = block_size // 4)."
         )
 
-        # Write-once, NOT -inf-filled: passing the precomputed `cta_info`/`n_ctas`
-        # makes the kernel skip its internal schedule build AND its out.fill_(-inf);
-        # the captured grid (n_ctas) is constant. The kernel writes every column in
-        # [rs, re) per row; top_k scans only that range.
+        # Context split, mirroring the aiter wrapper's rule but with the pieces
+        # we already know statically. `split_ctx_len` is the fixed logits width,
+        # NOT this step's real context: sizing it off live data would need a D2H
+        # sync and would bake a step-dependent grid into the captured graph.
+        # Over-splitting is free -- a split past `window_tiles` gets tile_count
+        # 0 and returns before any global load.
+        max_chunks = max(
+            1,
+            (max_seq_len + self._mqa_decode_block_k - 1) // self._mqa_decode_block_k,
+        )
+        split_kv = (
+            1
+            if padded_tokens >= _OPUS_DECODE_CTA_TARGET
+            else min(
+                max_chunks,
+                (_OPUS_DECODE_CTA_TARGET + padded_tokens - 1) // padded_tokens,
+            )
+        )
+
+        # Write-once, NOT -inf-filled: OPUS masks its store on
+        # `abs_tok - local_start < win` and the split_kv shards partition the
+        # window disjointly and exhaustively, so every column in [0, local_end)
+        # is written -- exactly the range `top_k_per_row_decode` scans.
         logits = torch.empty(
             padded_tokens, max_seq_len, dtype=torch.float32, device=device
         )
-        flydsl_pa_mqa_logits_fp4_prefill(
+        # Raw stub, not the wrapper: the wrapper re-detects gfx through rocminfo
+        # per call and would build `cu_seq_q` with a `torch.arange` inside the
+        # captured region. 16 positional args, order fixed by the pybind macro.
+        pa_mqa_logits_mxfp4_fwd_decode(
             q_fp4,
             q_scale,
             self.kv_cache,
             self.kv_scale,
-            block_tables,
+            block_tables_tile,
             weights,
-            batch_id_per_q_token,
-            local_starts,
-            local_ends,
+            cu_seq_q,
+            context_lens,
+            logits,
+            n_tiles,
+            MQA_TILE_QLEN,
+            split_kv,
+            self._weights_scale,
+            self._mqa_decode_block_k,
+            kv_block_size,
             max_seq_len,
-            weight_scale=self._weights_scale,
-            block_k=FP4_MQA_BLOCK_K,
-            kv_block_size=kv_block_size,
-            out=logits,
-            cta_info=cta_info,
-            n_ctas=n_ctas,
         )  # [padded_tokens, max_seq_len] fp32, seq-local
-        # Seq-local output → indices returned directly. top_k writes every row
-        # (real + empty pad rows → -1), so a bare torch.empty output is fine.
         topk_out = torch.empty((padded_tokens, topk), dtype=torch.int32, device=device)
-        # DECODE top-k even though the logits came from the prefill-shaped
-        # scorer: `local_starts` is all zeros, the `rowStart == 0` this entry
-        # assumes. The prefill entry dispatches on `topk_use_mulblocks(rows,
-        # stride0)` with `stride0 = max_position_embeddings // 4` (262144, which
-        # no serving flag lowers), so every step under 128 rows would land on
-        # the multi-block kernel aiter removed from decode. Revisit if
-        # `local_starts` ever stops being zero.
         top_k_per_row_decode(
             logits,
             1,
-            local_ends,
+            context_lens,
             topk_out,
             padded_tokens,
             logits.stride(0),

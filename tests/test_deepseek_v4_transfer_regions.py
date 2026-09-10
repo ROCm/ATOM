@@ -145,7 +145,7 @@ def _stub_v4_runtime_imports():
 
     kernels = types.ModuleType("atom.model_ops.v4_kernels")
     kernels.FP4_MQA_BLOCK_K = 128
-    kernels.FP4_MQA_PARALLEL_UNIT_NUM = 1
+    kernels.MQA_TILE_QLEN = 1
     for name in (
         "build_v4_paged_decode_indptr",
         "fp4_indexer_enabled",
