@@ -332,12 +332,12 @@
           "label": "EAGLE3 GQA Offload",
           "suffix": "-eagle3-gqa-offload",
           "bench_kind": "aiperf_agentic",
-          "env_vars": "PYTHONHASHSEED=0\nLMCACHE_LOCAL_CPU=True\nLMCACHE_MAX_LOCAL_CPU_SIZE=256\nLMCACHE_CHUNK_SIZE=256",
+          "env_vars": "PYTHONHASHSEED=0\nLMCACHE_LOCAL_CPU=True\nLMCACHE_MAX_LOCAL_CPU_SIZE=256\nLMCACHE_CHUNK_SIZE=256\nATOM_PREFIX_CACHE_POLICY=slru\nATOM_PREFIX_CACHE_PROTECTED_RATIO=0.5\nLMCACHE_CACHE_POLICY=ATOM_SLRU\nLMCACHE_LOOKUP_SERVER_WORKER_IDS=0,1,2,3",
           "extra_args": "--method eagle3 --draft-model Inferact/MiniMax-M3-EAGLE3-GQA --num-speculative-tokens 3 --spec-decode-acceptance-rate 0.5933 --kv-transfer-config '{\"kv_connector\":\"lmcache_offload\",\"kv_role\":\"offload\"}'",
-          "conc_min": 40,
-          "conc_max": 48,
+          "conc_min": 48,
+          "conc_max": 64,
           "scenarios": [
-            {"isl": 262144, "osl": 1024, "concurrency": [40, 48], "random_range_ratio": 0.8}
+            {"isl": 262144, "osl": 1024, "concurrency": [48, 64], "random_range_ratio": 0.8}
           ]
         }
       ]
