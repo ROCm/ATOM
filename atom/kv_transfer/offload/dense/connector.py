@@ -423,6 +423,8 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         self._load_lifecycles[sid] = seq
 
     def get_num_new_matched_tokens(self, seq) -> tuple[int, bool]:
+        if self.skips_offload(seq):
+            return 0, False
         if not self._do_load or self._lookup_client is None:
             return 0, False
         self._begin_load_lifecycle(seq)
@@ -506,7 +508,7 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             self._lmcache_hit_save_floor(ls),
             int(self._hit_save_floors.get(sid, 0)),
         )
-        if self._do_save:
+        if self._do_save and not self.skips_offload(seq):
             entry = self._save_tracker.get(sid)
             if entry is None or entry[0] is not seq:
                 self._save_tracker[sid] = [seq, initial_saved]
