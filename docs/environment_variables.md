@@ -193,12 +193,10 @@ flag below. Details in the state-checkpoint section of the
 
 ### LMCache offload tier
 
-Two knobs that govern the LMCache CPU/NVMe offload connector are read directly
-via `os.environ` rather than through `atom.utils.envs`, because ATOM does not
-own either default: one belongs to the LMCache library, the other to the
-offload connector itself (defined in
-`atom/kv_transfer/offload/_offload_common.py` and documented in full in
-`atom/kv_transfer/offload/README.md`). They are listed here so they are
+The LMCache source-pin timeout and ATOM's pending-save bound are read directly
+via `os.environ` rather than through `atom.utils.envs`. Their behavior is
+defined in `atom/kv_transfer/offload/_offload_common.py` and documented in full
+in `atom/kv_transfer/offload/README.md`; they are also listed here so they are
 discoverable from the central env reference despite bypassing the registry.
 
 | Variable | Type | Default | Description |

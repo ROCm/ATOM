@@ -45,6 +45,31 @@ SaveCompletionId = ReqId | SaveOperationId
 
 
 @dataclass(frozen=True)
+class SaveSourceGroupId:
+    """Exact source-safe identity for one batched PAGE staging group.
+
+    ``ranges`` are the absolute token ranges copied from scheduler-owned GPU
+    blocks into independent LMCache MemoryObjs by one ``batched_from_gpu``
+    call.  The enclosing :class:`SaveOperationId` prevents a late callback for
+    an older request lifecycle from releasing a newer lifecycle's blocks.
+    """
+
+    save_operation: SaveOperationId
+    ranges: tuple[tuple[int, int], ...]
+
+    def __post_init__(self) -> None:
+        if not self.ranges:
+            raise ValueError("save source group must contain at least one range")
+        for start, end in self.ranges:
+            if start < 0 or end <= start:
+                raise ValueError(f"invalid save source range: {start}:{end}")
+
+    @property
+    def req_id(self) -> ReqId:
+        return self.save_operation.req_id
+
+
+@dataclass(frozen=True)
 class LoadOperationId:
     """Exact identity of one scheduler-issued PAGE/SLOT load generation."""
 
@@ -81,7 +106,11 @@ class StateStoreOperationId:
 
 
 ConnectorCompletionId = (
-    ReqId | SaveOperationId | LoadOperationId | StateStoreOperationId
+    ReqId
+    | SaveOperationId
+    | SaveSourceGroupId
+    | LoadOperationId
+    | StateStoreOperationId
 )
 ConnectorCompletionKey = tuple[str, ConnectorCompletionId]
 
