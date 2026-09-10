@@ -2226,3 +2226,21 @@ class TestMultimodalSkipsConnectorLookup:
 
         assert sched._query_connector_prefill_match(seq, skip=False) is False
         assert calls == []
+
+    def test_media_prompts_do_not_write_either(self, seq_factory):
+        """Reads alone are not enough: LMCache keys on the raw token ids, so a
+        media entry is reachable by any request carrying the same placeholder
+        ids -- including a text one that passed them in as `prompt_token_ids`."""
+        calls = []
+        sched = Scheduler.__new__(Scheduler)
+        sched.kv_connector = SimpleNamespace(
+            update_state_after_alloc=lambda seq: calls.append(seq.id)
+        )
+
+        text = seq_factory(list(range(8)))
+        sched._notify_connector_after_prefill_alloc(text)
+        assert calls == [text.id]
+
+        media = seq_factory(list(range(8)), multimodal_data={"pixel_values": object()})
+        sched._notify_connector_after_prefill_alloc(media)
+        assert calls == [text.id]

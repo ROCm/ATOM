@@ -2013,7 +2013,7 @@ class Scheduler:
         # which is correct for a single-shot prefill (there is no later chunk to
         # resume from anyway). Forks do not arise on a fresh multimodal prompt
         # (`state_fork_src < 0`), so the fork-vetting below is likewise moot.
-        if getattr(seq, "multimodal_data", None) is not None:
+        if seq.is_multimodal:
             return chunk
         target = bm.checkpoint_cut(seq, start, start + chunk)
         if target:
@@ -2118,6 +2118,12 @@ class Scheduler:
         return num_seqs_prefill, num_batched_tokens
 
     def _notify_connector_after_prefill_alloc(self, seq: Sequence) -> None:
+        # Media writes nothing to the offload tier either. LMCache keys on the
+        # raw token ids we hand it, so the entry would be reachable by any
+        # request carrying the same placeholder ids -- including a text one that
+        # passed them in as `prompt_token_ids`.
+        if seq.is_multimodal:
+            return
         if self.kv_connector is not None:
             self.kv_connector.update_state_after_alloc(seq)
 

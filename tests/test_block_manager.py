@@ -1279,18 +1279,38 @@ class TestMultimodalSkipsPrefixCache:
         bm.deallocate(media)
         assert bm.can_allocate(seq_factory(tokens)) == 0
 
-    def test_the_chain_is_still_walked_for_the_decode_watermark(self, seq_factory):
-        """Only the publish is skipped, not the walk.
+    def test_decode_steps_stay_quiet(self, seq_factory):
+        """A first cut skipped only `kv.publish`, which left every block
+        unhashed -- so `_chain_parent_hash` took its gap branch and logged an
+        error on every decode step of every media request. Media has to take the
+        same path prefix caching off takes: nothing hashed, nothing published,
+        nothing logged."""
+        errors = []
 
-        `h` feeds the state checkpoints and `num_hashed_tokens` keeps the
-        decode-side continuation from re-hashing the prompt every step.
-        """
+        class _Catch(logging.Handler):
+            def emit(self, record):
+                if record.levelno >= logging.ERROR:
+                    errors.append(record.getMessage())
+
         bm = self._bm()
         tokens = list(range(20))
         media = self._media(seq_factory, tokens)
         bm.allocate(media, 0)
         bm.hash_blocks(media, len(tokens))
-        assert media.num_hashed_tokens == 20
+
+        handler = _Catch()
+        logging.getLogger("atom").addHandler(handler)
+        try:
+            for token in range(1000, 1016):
+                media.token_ids.append(token)
+                media.num_tokens += 1
+                bm.may_append(media)
+                bm.hash_decode_blocks(media, media.num_tokens)
+        finally:
+            logging.getLogger("atom").removeHandler(handler)
+
+        assert errors == []
+        assert media.num_hashed_tokens == 0
 
     def test_no_block_stored_events_for_media(self, seq_factory):
         bm = self._bm()

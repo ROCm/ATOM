@@ -875,7 +875,14 @@ class BlockManager:
         # rollback set to.
         if seq.has_per_req_cache and not self.state.has_free(self.state_slots_per_req):
             return -1
-        if not self.enable_prefix_caching:
+        # Temporary: a media prompt is served as if prefix caching were off. Its
+        # placeholder tokens are the same token id whatever image they stand for,
+        # so the keys collide. Folded into this early return rather than guarded
+        # further down, so media also skips the checkpoint bookkeeping below --
+        # those checkpoints could never be hit, and never being indexed they
+        # would never be evicted either. Per-block image keys would lift this:
+        # branch `whn/mm_prefix_cache`.
+        if not self.enable_prefix_caching or seq.is_multimodal:
             if not self._has_page_units(self.num_pool_blocks(len(seq))):
                 return -1
             return 0
@@ -885,19 +892,14 @@ class BlockManager:
         h = -1
         compressed_hit = 0
         block_hashes: list[int] = []
-        # Temporary: a media prompt takes no hit. Its placeholder tokens are the
-        # same token id whatever image they stand for, so the keys collide. Zero
-        # hits is the cold-prompt path, so everything below runs unchanged.
-        # Per-block image keys: branch `whn/mm_prefix_cache`.
-        if not seq.is_multimodal:
-            for i in range(self._n_hash_blocks(seq) - 1):
-                token_ids = self._hash_block_tokens(seq, i)
-                h = self.compute_hash(token_ids, h)
-                block_id = self.kv.lookup(h)
-                if block_id == -1 or self.kv.block(block_id).token_ids != token_ids:
-                    break
-                block_hashes.append(h)
-                compressed_hit += 1
+        for i in range(self._n_hash_blocks(seq) - 1):
+            token_ids = self._hash_block_tokens(seq, i)
+            h = self.compute_hash(token_ids, h)
+            block_id = self.kv.lookup(h)
+            if block_id == -1 or self.kv.block(block_id).token_ids != token_ids:
+                break
+            block_hashes.append(h)
+            compressed_hit += 1
         # Step 2: SWA only needs the trailing window before the boundary to be
         # present (SWA is local). Scan right-to-left within the compressed prefix
         # for the largest boundary whose window is SWA-cached (vLLM
@@ -1590,7 +1592,9 @@ class BlockManager:
         `next_forward_tokens` reaches `checkpointers_at`; see there. Left
         unset it reads the prompt's remainder, which is the prefill answer.
         """
-        if not self.enable_prefix_caching:
+        # Media publishes nothing, exactly as prefix caching off does; see
+        # `can_allocate`.
+        if not self.enable_prefix_caching or seq.is_multimodal:
             return
         hbs = self._hash_block_size()
         base = seq.num_cached_tokens if start_tokens is None else start_tokens
@@ -1607,19 +1611,13 @@ class BlockManager:
         # Watermark for the decode-side continuation, maintained here so every
         # prefill path feeds it without knowing about it.
         seq.num_hashed_tokens = max(seq.num_hashed_tokens, end * hbs)
-        # Media blocks are hashed but not indexed (see `can_allocate`). Reads
-        # `is_multimodal`, not `multimodal_data` -- the scheduler drops that dict
-        # before this runs. The walk still feeds `h` and `num_hashed_tokens`.
-        publish = not seq.is_multimodal
-        record = self._event_log is not None and publish
+        record = self._event_log is not None
         store_run_parent: int | None = h if h != -1 else None
         store_run_hashes: list[int] = []
         store_run_tokens: list[int] = []
         for i in range(start, end):
             token_ids = self._hash_block_tokens(seq, i)
             h = self.compute_hash(token_ids, h)
-            if not publish:
-                continue
             self.kv.publish(seq.block_table[i], h, token_ids)
             if record:
                 store_run_hashes.append(h)
