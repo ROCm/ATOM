@@ -110,7 +110,6 @@ is_crusoe_v2 = slurm_submit_runner == "atomesh-cicd-mi355-crusoe"
 spur_controller_addr = runner.get("spur_controller_addr")
 spur_accounting_addr = os.environ.get("SPUR_ACCOUNTING_ADDR", "")
 if is_crusoe_v2:
-    # Match plugin_ci/submit.sh's plugin_runner_crusoe_v2_01/_02 settings.
     spur_controller_addr = "http://crs-m2m-cpu-spur-v2-001.crusoe.amd.com:6817"
     spur_accounting_addr = os.environ.get("SPUR_V2_ACCOUNTING_ADDR") or (
         "http://crs-m2m-cpu-spur-v2-001.crusoe.amd.com:6819"
