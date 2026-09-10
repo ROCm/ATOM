@@ -137,12 +137,21 @@ def _dspark_markov_argmax_stage1(
     # orders NaN above every number, lowest index winning ties, so that is what
     # the split below reproduces.
     nan_mask = (vals != vals) & v_mask[None, :]  # noqa: PLR0124 - Triton NaN check
-    finite = tl.where(nan_mask, float("-inf"), vals)
-    tile_max = tl.max(finite, axis=1)
+    # `vals` reduces directly rather than through a NaN-scrubbed copy. Holding
+    # a second [BLOCK_ROW, BLOCK_V] fp32 tile beside the register-resident
+    # accumulator costs occupancy: the scrubbed copy measured +14% on the
+    # BLOCK_ROW=32 specialisation (36.3 -> 41.5us at V=163840, against a 0.3us
+    # spread; the 16 and 64 tiles moved less than their noise). It buys nothing,
+    # because either tl.max NaN convention lands somewhere the row-level
+    # overwrite below covers -- propagating leaves `tile_max` NaN so no lane
+    # matches and `cand` stays at the sentinel, ignoring leaves the largest
+    # number and its id -- and a row with a NaN takes `nan_idx`/NaN regardless.
+    # A row without one never differed to begin with.
+    tile_max = tl.max(vals, axis=1)
     # `& v_mask` also covers the all--inf row: without it a padded lane, which
     # is -inf too, could win the id.
     cand = tl.where(
-        (finite == tile_max[:, None]) & v_mask[None, :], offs_v[None, :], vocab_size
+        (vals == tile_max[:, None]) & v_mask[None, :], offs_v[None, :], vocab_size
     )
     tile_idx = tl.min(cand, axis=1)
     # Lowest NaN id in this tile, or `vocab_size` when the tile has none.
@@ -183,9 +192,10 @@ def _dspark_markov_argmax_stage2(
     # carries a NaN partial value and wins over every finite tile, and tiles
     # being ordered by vocab id the lowest such tile holds the lowest NaN id.
     nan_mask = (vals != vals) & tile_mask  # noqa: PLR0124 - Triton NaN check
-    finite = tl.where(nan_mask, float("-inf"), vals)
-    best = tl.max(finite, axis=0)
-    cand = tl.where((finite == best) & tile_mask, idxs, vocab_size)
+    # Reduced over `vals` rather than a scrubbed copy for the reason stage 1
+    # gives: `nan_res` below overwrites every row this could differ on.
+    best = tl.max(vals, axis=0)
+    cand = tl.where((vals == best) & tile_mask, idxs, vocab_size)
     res = tl.min(cand, axis=0)
     nan_res = tl.min(tl.where(nan_mask, idxs, vocab_size), axis=0)
     res = tl.where(nan_res < vocab_size, nan_res, res)

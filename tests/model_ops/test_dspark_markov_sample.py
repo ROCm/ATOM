@@ -36,6 +36,11 @@ needs_gpu = pytest.mark.skipif(
 # the cross-tile stage 2 reduce is exercised rather than short-circuited.
 VOCAB = 1024
 RANK = 64
+# One row count per BLOCK_ROW specialisation the launcher can pick
+# (min(64, max(16, next_pow2(rows)))). The NaN cases below sweep these because
+# the NaN handling is what varies with the reduce, and only the 32 tile is
+# wide enough to feel the register pressure the reduce was written to avoid.
+BLOCK_ROW_ROWS = [8, 32, 64]
 
 
 def _inputs(num_rows, dtype=torch.bfloat16, seed=0):
@@ -71,9 +76,10 @@ def test_lowest_index_wins_ties():
 
 @needs_gpu
 @pytest.mark.parametrize("source", ["base", "embed", "w2"])
-def test_nan_row_stays_in_range_and_matches_torch(source):
+@pytest.mark.parametrize("num_rows", BLOCK_ROW_ROWS)
+def test_nan_row_stays_in_range_and_matches_torch(source, num_rows):
     """A NaN anywhere in the inputs must not push the id past the table."""
-    base, embed, w2 = _inputs(8, seed=1)
+    base, embed, w2 = _inputs(num_rows, seed=1)
     if source == "base":
         base[3, 512] = float("nan")
     elif source == "embed":
@@ -89,8 +95,9 @@ def test_nan_row_stays_in_range_and_matches_torch(source):
 
 
 @needs_gpu
-def test_all_nan_row_returns_zero_like_torch():
-    base, embed, w2 = _inputs(4, seed=2)
+@pytest.mark.parametrize("num_rows", BLOCK_ROW_ROWS)
+def test_all_nan_row_returns_zero_like_torch(num_rows):
+    base, embed, w2 = _inputs(num_rows, seed=2)
     base[2].fill_(float("nan"))
     got = dspark_markov_argmax(base, embed, w2)
     assert int(got[2]) == 0
