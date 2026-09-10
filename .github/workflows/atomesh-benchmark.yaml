@@ -46,7 +46,7 @@ on:
         default: false
         type: boolean
       model_names:
-        description: 'When run_all_models=false, run all cases in the selected suite for these model families. Comma-separated: DeepSeek-V4-Pro,GLM-5.2-MXFP4,Kimi-K2.5-MXFP4,MiniMax-M3-MXFP4,MiniMax-M3-MXFP8'
+        description: 'When run_all_models=false, run all cases in the selected suite for these model families. Comma-separated: DeepSeek-V4-Pro,GLM-5.2-MXFP4,Kimi-K3-MXFP4,Kimi-K2.5-MXFP4,MiniMax-M3-MXFP4,MiniMax-M3-MXFP8'
         required: false
         default: ''
         type: string
@@ -65,7 +65,20 @@ on:
             glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c32,
             glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c48
 
-          Kimi:
+          Kimi-K3:
+            kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c1,
+            kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c2,
+            kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c4,
+            kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c8,
+            kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c12,
+            kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c14,
+            kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c16,
+            kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c32,
+            kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c40,
+            kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c56,
+            kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c64
+
+          Kimi-K2.5:
             kimi-k25-1p1d-tp4,kimi-k25-1p1d-tp4-tp8,
             kimi-k25-2p1d-tp4,kimi-k25-1p2d-tp4
 
@@ -1274,6 +1287,7 @@ jobs:
           set -euo pipefail
           mkdir -p atomesh-results
           SUMMARY_PATH="atomesh-results/${MATRIX_ID}-summary.md"
+          AIPERF_RAW_PATH="atomesh-results/${MATRIX_ID}-aiperf-raw.md"
           BENCHMARK_ACTION_INPUT="atomesh-results/${MATRIX_ID}-benchmark-action.json"
 
           python3 .github/scripts/atomesh/process_result.py \
@@ -1283,6 +1297,11 @@ jobs:
             --hardware "${ATOMESH_DASHBOARD_HARDWARE}" \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
+          # Empty for standard ISL/OSL cases: only AIPerf writes the console dump.
+          python3 .github/scripts/atomesh/aiperf_console_report.py \
+            "atomesh-results/${MATRIX_ID}" \
+            --output "${AIPERF_RAW_PATH}"
+
           {
             echo "## ${MATRIX_ID}"
             echo
@@ -1290,10 +1309,21 @@ jobs:
               echo "Slurm job: $(cat "atomesh-results/${MATRIX_ID}.slurm-job-id")"
               echo
             fi
+            if [ -f "atomesh-results/${MATRIX_ID}.log-root" ]; then
+              echo "Log path: \`$(cat "atomesh-results/${MATRIX_ID}.log-root")\`"
+              echo
+            fi
             cat "${SUMMARY_PATH}"
+            if [ -s "${AIPERF_RAW_PATH}" ]; then
+              echo
+              cat "${AIPERF_RAW_PATH}"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
           cat "${SUMMARY_PATH}"
+          if [ -s "${AIPERF_RAW_PATH}" ]; then
+            cat "${AIPERF_RAW_PATH}"
+          fi
 
       - name: Upload AIPerf Perfetto traces
         if: ${{ always() && matrix.benchmark.kind == 'aiperf_agentic' }}
@@ -1372,7 +1402,73 @@ jobs:
             --summary atomesh-benchmark-summary.md \
             --hardware "${ATOMESH_DASHBOARD_HARDWARE}" \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # Empty for standard ISL/OSL cases: only AIPerf writes the console dump.
+          python3 .github/scripts/atomesh/aiperf_console_report.py \
+            atomesh-results \
+            --output atomesh-aiperf-raw.md
+          python3 - <<'PY' > atomesh-case-log-paths.md
+          import json
+          import re
+          from pathlib import Path
+
+          results = Path("atomesh-results")
+
+
+          def sort_key(case_id):
+              """Order this table like the perf summary: (benchmark_model_name,
+              max_concurrency), read from the case's own result JSON so both tables
+              key off the same fields. A cell that sweeps several concurrencies
+              leads at its lowest one; a case that died before writing any result
+              falls back to its id, whose prefix ahead of the NpMd topology token is
+              the model name.
+              """
+              keys = []
+              for path in sorted((results / case_id).rglob("pd-*.json")):
+                  try:
+                      payload = json.loads(path.read_text(encoding="utf-8"))
+                      model = str(payload.get("benchmark_model_name") or "")
+                      conc = int(payload.get("max_concurrency") or 0)
+                  except (OSError, ValueError, TypeError):
+                      continue
+                  keys.append((model.rstrip("/").split("/")[-1].lower(), conc))
+              if keys:
+                  return min(keys)
+              topology = re.search(r"-\d+p\d+d-", case_id)
+              found = re.findall(r"-c(\d+)-", case_id)
+              return (
+                  case_id[: topology.start()] if topology else case_id,
+                  int(found[-1]) if found else 0,
+              )
+
+
+          rows = []
+          for path in results.glob("*.log-root"):
+              case_id = path.name[: -len(".log-root")]
+              job_file = path.with_name(f"{case_id}.slurm-job-id")
+              job_id = job_file.read_text().strip() if job_file.is_file() else ""
+              rows.append((case_id, job_id or "--", path.read_text().strip()))
+
+          if rows:
+              print("### ATOMesh Case Log Paths")
+              print()
+              print("| Case | Slurm job | Log path |")
+              print("| --- | --- | --- |")
+              for case_id, job_id, log_root in sorted(
+                  rows, key=lambda row: sort_key(row[0]) + (row[0],)
+              ):
+                  print(f"| {case_id} | {job_id} | `{log_root}` |")
+              print()
+          PY
+          if [[ -s atomesh-case-log-paths.md ]]; then
+            cat atomesh-case-log-paths.md >> "$GITHUB_STEP_SUMMARY"
+          fi
           cat atomesh-benchmark-summary.md >> "$GITHUB_STEP_SUMMARY"
+          if [[ -s atomesh-aiperf-raw.md ]]; then
+            {
+              echo
+              cat atomesh-aiperf-raw.md
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
           ENTRY_COUNT="$(python3 - <<'PY'
           import json
           from pathlib import Path
@@ -1406,6 +1502,9 @@ jobs:
           path: |
             atomesh-benchmark-action.json
             atomesh-benchmark-summary.md
+            atomesh-aiperf-raw.md
+            atomesh-case-log-paths.md
+          if-no-files-found: ignore
 
   dashboard:
     concurrency:

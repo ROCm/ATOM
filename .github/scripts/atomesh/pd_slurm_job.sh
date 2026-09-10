@@ -15,7 +15,8 @@ mkdir -p "${RUN_DIR}"
 
 EXECUTION_PHASES=(combined)
 if [[ "${BENCHMARK_KIND:-random}" == "aiperf_agentic" \
-  && "${EVAL_TASK:-gsm8k}" == "swebench_lite" \
+  && ( "${EVAL_TASK:-gsm8k}" == "swebench_lite" \
+    || "${EVAL_TASK:-gsm8k}" == "gsm8k" ) \
   && ( "${RUN_EVAL:-false}" == "true" || "${RUN_EVAL:-false}" == "1" ) ]]; then
   EXECUTION_PHASES=(benchmark eval)
 fi
@@ -73,6 +74,7 @@ allow = (
     # Preserve FlyDSL cache overrides for non-root Spur containers.
     "FLYDSL_",
     "SPEC_",
+    "STATE_CHECKPOINT_",
     "DRAFT_MODEL_PATH",
     "NUM_SPEC_TOKENS",
     "EXTRA_SERVER_ARGS",

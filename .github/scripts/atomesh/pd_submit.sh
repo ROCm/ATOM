@@ -70,9 +70,23 @@ service = cell.get("service", {})
 prefill = service.get("prefill", {})
 decode = service.get("decode", {})
 router = service.get("router", {})
-server_args = cell.get("server_args", {})
 benchmark = cell.get("benchmark", {})
 accuracy = cell.get("accuracy", {})
+
+
+class TrackedArgs(dict):
+    """Remembers which keys the export mapping below actually reads."""
+
+    def __init__(self, data):
+        super().__init__(data)
+        self.seen = set()
+
+    def get(self, key, default=None):
+        self.seen.add(key)
+        return super().get(key, default)
+
+
+server_args = TrackedArgs(cell.get("server_args", {}))
 
 def shell_value(value):
     if isinstance(value, (list, dict)):
@@ -134,6 +148,9 @@ exports = {
     "AIPERF_COMMIT": benchmark.get("aiperf_commit", ""),
     "AIPERF_SCENARIO": benchmark.get("scenario", ""),
     "AIPERF_PUBLIC_DATASET": benchmark.get("public_dataset", ""),
+    "AIPERF_APPLY_CHAT_TEMPLATE": str(
+        benchmark.get("apply_chat_template", False)
+    ).lower(),
     "AIPERF_MAX_CONTEXT_LENGTH": benchmark.get("max_context_length", ""),
     "AIPERF_NUM_DATASET_ENTRIES": benchmark.get("num_dataset_entries", ""),
     "AIPERF_BENCHMARK_DURATION": benchmark.get("benchmark_duration", ""),
@@ -172,10 +189,18 @@ exports = {
     "DECODE_WORKERS": decode.get("workers", 1),
     "PREFILL_TP": prefill.get("tp", 8),
     "DECODE_TP": decode.get("tp", 8),
+    "PREFILL_DCP_SIZE": prefill.get("dcp", 1),
+    "DECODE_DCP_SIZE": decode.get("dcp", 1),
     "PREFILL_ENABLE_DP": str(prefill.get("enable_dp_attention", False)).lower(),
     "DECODE_ENABLE_DP": str(decode.get("enable_dp_attention", False)).lower(),
     "PREFILL_CUDAGRAPH": prefill.get("cudagraph", ""),
     "DECODE_CUDAGRAPH": decode.get("cudagraph", ""),
+    "PREFILL_CUDAGRAPH_MODE": prefill.get("cudagraph_mode", ""),
+    "DECODE_CUDAGRAPH_MODE": decode.get("cudagraph_mode", ""),
+    "PREFILL_COMPILATION_LEVEL": prefill.get("compilation_level", ""),
+    "DECODE_COMPILATION_LEVEL": decode.get("compilation_level", ""),
+    "PREFILL_CUDAGRAPH_MAX_NUM_SEQS": prefill.get("cudagraph_max_num_seqs", ""),
+    "DECODE_CUDAGRAPH_MAX_NUM_SEQS": decode.get("cudagraph_max_num_seqs", ""),
     "PREFILL_PORT": prefill.get("port", 8010),
     "DECODE_PORT": decode.get("port", 8020),
     "ROUTER_PORT": router.get("port", 8000),
@@ -199,6 +224,12 @@ exports = {
     "SPEC_METHOD": server_args.get("method", ""),
     "DRAFT_MODEL_PATH": server_args.get("draft_model", ""),
     "NUM_SPEC_TOKENS": server_args.get("num_speculative_tokens", ""),
+    "SPEC_DECODE_ACCEPTANCE_LENGTH": server_args.get(
+        "spec_decode_acceptance_length", ""
+    ),
+    "STATE_CHECKPOINT_INTERVAL_TOKENS": server_args.get(
+        "state_checkpoint_interval_tokens", ""
+    ),
     "EXTRA_SERVER_ARGS": server_args.get("extra_args", ""),
     "PREFILL_EXTRA_SERVER_ARGS": prefill.get("extra_args", ""),
     "DECODE_EXTRA_SERVER_ARGS": decode.get("extra_args", ""),
@@ -236,6 +267,20 @@ exports = {
         os.environ.get("SPUR_ACCOUNTING_ADDR", default_spur_accounting_addr),
     ),
 }
+
+# server_args is mapped key by key above, so a key the mapping never read would
+# be dropped without a trace. The launcher always passes --trust-remote-code.
+server_args.get("trust_remote_code")
+dropped = sorted(set(server_args) - server_args.seen)
+if dropped:
+    reason = (
+        f"ERROR: {cell['id']} sets unsupported server_args {dropped}; "
+        "raw server flags belong in extra_args"
+    )
+    # A non-zero exit here is swallowed by `eval "$(...)"`, so fail via the shell.
+    print(f"echo {shlex.quote(reason)} >&2")
+    print("exit 1")
+    raise SystemExit(0)
 
 for key, value in exports.items():
     print(f"export {key}={q(value)}")
@@ -303,6 +348,9 @@ PY
 fi
 
 mkdir -p "${LOG_ROOT}"
+# Recorded before sbatch so the job summary can point at the logs even when the
+# Slurm job never starts or dies before copying anything back.
+printf '%s\n' "${LOG_ROOT}" > "${RESULT_DIR}/${ATOMESH_CELL_ID}.log-root"
 
 if ! command -v sbatch >/dev/null 2>&1; then
   echo "ERROR: sbatch not found; use --dry-run on non-Slurm runners" >&2
