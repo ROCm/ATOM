@@ -412,7 +412,7 @@ def fused_compress_attn(
     use_ue8m0: bool = True,  # round scale to power-of-2 (UE8M0); only when quant=True
     preshuffle: bool = True,  # MFMA 16x16 preshuffled FP8 layout; only when quant=True
     fp8_max: float | None = None,  # E4M3 max; required for FP8 quant
-    quant_mode: str | None = None,  # "none"|"fp8"|"fp4"; default from `quant`
+    quant_mode: str | None = None,  # none|fp8|group_fp8|{flydsl16,opus32}_fp4
     # V4-Main native fp8 2buff path (CSA/HCA Main under --kv_cache_dtype fp8).
     # Distinct from `quant` (Indexer-inner per-row preshuffle): writes per-64-tile
     # e8m0 nope-fp8 + inline dup-scale into `kv_cache` (fp8 [NB,k,512]) and bf16

@@ -100,8 +100,13 @@ logger = logging.getLogger("atom")
 
 # KV columns one MQA-logits CTA tile spans, for the OPUS FP4 kernels. Purely a
 # performance knob -- both compiled variants (64 = 1-wave, 256 = 4-wave) produce
-# identical results. Prefill and decode want different values, so there are two.
-FP4_MQA_BLOCK_K = 256
+# identical results.
+#
+# 64, not FlyDSL's shipping 256: a 256-wide tile over-fetches once the window is
+# only a few tiles long, and this model's prefill windows are ~1300-2000
+# compressed columns. The penalty grows as windows shrink, so it does not show
+# up in any sweep that keeps ctx == qlen.
+FP4_MQA_BLOCK_K = 64
 
 # Query rows one MQA-logits CTA covers. The OPUS kernels ship at 1; a 4-row
 # variant that reuses a tile's compressed-KV load across the CSA compress ratio
@@ -112,10 +117,10 @@ FP4_MQA_BLOCK_K = 256
 MQA_TILE_QLEN = 1
 
 
-# Decode splits a row's context across CTAs and a split cannot be finer than one
-# `block_k` tile, so decode wants the 1-wave variant where prefill wants 4-wave:
-# at bs=32 / ctx~4096 a 256-wide tile leaves only 16 tiles for 32 splits (half
-# idle), where 64 gives 64 tiles (2 per split, all busy). Both are compiled.
+# Decode wants 64 for a second reason: a split cannot be finer than one
+# `block_k` tile, so at bs=32 / ctx~4096 a 256-wide tile leaves 16 tiles for 32
+# splits (half idle) where 64 gives 64. Kept separate from the prefill constant
+# despite the equal value -- different arguments set them.
 FP4_MQA_DECODE_BLOCK_K = 64
 
 

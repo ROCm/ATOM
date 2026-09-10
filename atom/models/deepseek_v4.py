@@ -569,7 +569,9 @@ def _should_skip_v4_index_topk(args: DeepseekV4Args, layer_id: int) -> bool:
 # ---------------------------------------------------------------------------
 
 # PR1 always runs single-rank; TP comes in PR3.
-_FP4_BLOCK_SIZE = 32  # matches reference's fp4_block_size
+# Elements per e8m0 scale group in the FP4 indexer (OCP microscaling). Not to
+# be confused with `_V4_BLOCK_SIZE`, the paged-KV block.
+_FP4_SCALE_GROUP = 32
 
 
 # ---------------------------------------------------------------------------
@@ -1638,15 +1640,22 @@ class Indexer(nn.Module):
             # dequants Q internally via e8m0, so `weights` carry ONLY the
             # static `_weights_scale` (no per-row q_scale premultiply).
             d_packed = self.head_dim // 2
-            k_tiles = self.head_dim // 128
-            qs_pad = ((self.n_heads // 16 + 3) // 4) * 4
+            # OPUS/MFMA-32x32 e8m0 layout [T, K_CHUNKS, 32, SCALE_BYTES].
+            # Every fp4 scale layout is the same size, so feeding the OPUS
+            # kernel the FlyDSL permutation is silent -- it reads plausible
+            # scales at wrong offsets.
+            mfma_n = 32
+            n_tiles = self.n_heads // mfma_n
+            k_tiles = self.head_dim // 64
+            k_chunks = (self.head_dim // _FP4_SCALE_GROUP) // k_tiles
+            scale_bytes = k_tiles * n_tiles
             q_fp4 = torch.empty(
                 (total_tokens, self.n_heads, d_packed),
                 dtype=torch.uint8,
                 device=q.device,
             )
             q_scale = torch.empty(
-                (total_tokens, k_tiles, 4, 16, qs_pad),
+                (total_tokens, k_chunks, mfma_n, scale_bytes),
                 dtype=torch.uint8,
                 device=q.device,
             )
@@ -1658,8 +1667,8 @@ class Indexer(nn.Module):
                 positions,
                 rd,
                 out_scale=q_scale,
-                group_size=32,
-                shuffle_scale=True,
+                group_size=_FP4_SCALE_GROUP,
+                scale_layout="opus32",
                 do_rotate_act=False,
             )
             # weights_proj output (bf16) goes straight to the MQA-logits kernel:
@@ -2016,7 +2025,7 @@ class Indexer(nn.Module):
     def _score_topk_prefill_fp4(
         self,
         q_fp4: torch.Tensor,  # [total_tokens, n_heads, head_dim//2] uint8
-        q_scale: torch.Tensor,  # [total_tokens, K_TILES, 4, 16, QS_PAD] uint8
+        q_scale: torch.Tensor,  # [total_tokens, K_CHUNKS, 32, SCALE_BYTES] uint8
         block_tables: torch.Tensor,  # [bs, max_blocks_per_seq] int32
         weights: torch.Tensor,  # [total_tokens, n_heads] fp32
         indexer_meta: dict,
@@ -2114,35 +2123,30 @@ class Indexer(nn.Module):
     def _score_topk_decode_fp4(
         self,
         q_fp4: torch.Tensor,  # [padded_tokens, n_heads, head_dim(/2 for fp4)] uint8
-        q_scale: torch.Tensor,  # [padded_tokens, K_TILES, 4, 16, QS_PAD] uint8
+        q_scale: torch.Tensor,  # [padded_tokens, K_CHUNKS, 32, SCALE_BYTES] uint8
         block_tables: torch.Tensor,  # unused: OPUS decode reads the TILE table
         weights: torch.Tensor,  # [padded_tokens, n_heads] bf16
         indexer_meta: dict,
         topk: int,
     ) -> torch.Tensor:
-        """Decode on the OPUS decode kernel, one pseudo-batch per tile.
+        """Decode on the OPUS decode kernel, one batch item per query ROW.
 
-        OPUS derives its window in-kernel from per-BATCH `context_lens` as
-        `context_lens[b] - (qlen - 1 - mtp_pos)`. That is a per-token DECREMENT,
-        while ours is a per-token FLOOR (`(pos - d + 1) // CSA_RATIO`), and the
-        two differ: `floor((x-d)/4) >= floor(x/4) - d`. Mapping a real sequence
-        onto one batch item would therefore UNDER-score every MTP row but the
-        last, by up to `next_n - 1` compressed columns -- memory-safe, silently
-        wrong, and invisible to any test that only runs next_n == 1.
+        OPUS reads each row's window end from `local_ends` rather than deriving
+        it from a per-batch context length: a compressed KV cache gives row n
+        `floor((pos + 1) / CSA_RATIO)`, which is not `ctx - (next_n - 1 - n)`.
+        `csa_n_committed_per_token` IS that array, so the window needs no
+        translation and is correct at any `next_n`.
 
-        So each TILE becomes its own batch item (`qlen == MQA_TILE_QLEN`), the
-        same trick the FP8 decode path uses. At TILE_QLEN 1 the correction term
-        is identically zero and `local_end` is `context_lens[row]` verbatim --
-        i.e. `csa_n_committed_per_token`, the exact tensor the FlyDSL path passes
-        as `local_ends`. Bit-identical windows, and correct for any next_n
-        because the floor is precomputed per token rather than re-derived.
+        Mapping every ROW to its own batch item (`cu_seq_q` an iota,
+        `next_n_max == 1`) keeps `next_n` out of this path entirely -- see
+        `_refresh_fp4_decode_meta`. `row_id = cu_seq_q[b] + 0 == b`, so "row r IS
+        token r" holds and both the `[padded, W]` out layout and
+        `top_k_per_row_decode` are unchanged. Its one cost is that `batch_id`
+        (grid.x) is a row, so the block table must be the per-row expansion.
 
-        `row_id = cu_seq_q[b] + n == b`, so "row r IS token r" survives and both
-        the `[padded, W]` out layout and `top_k_per_row_decode` are unchanged.
-
-        CG-safe: grid is `(n_tiles, TILE_QLEN, split_kv)`, all from static shapes
+        CG-safe: the grid is `(batch, 1, split_kv)`, all from static shapes
         (`padded_tokens` is pinned by the graph key), `cu_seq_q` is a constant
-        iota, and `context_lens` is refreshed on-device every decode fwd by
+        iota, and `local_ends` is refreshed on-device every decode fwd by
         `build_v4_paged_decode_indptr`. Nothing here allocates but `logits`.
         """
         from aiter import pa_mqa_logits_mxfp4_fwd_decode
@@ -2155,9 +2159,12 @@ class Indexer(nn.Module):
         # published by `_attach_v4_paged_decode_meta`, which does not run before
         # the indexer meta builder at every call site.
         block_tables_tile = fc.attn_metadata.block_tables_tile
-        context_lens = indexer_meta["fp4_context_lens"]
+        # OPUS reads each row's window end directly (`local_ends`), so a
+        # compressed cache's per-row floor needs no re-derivation -- see
+        # `_refresh_fp4_decode_meta` for why the mapping is one batch item per ROW.
+        local_ends = indexer_meta["fp4_local_ends"]
         cu_seq_q = indexer_meta["fp4_cu_seq_q"]
-        n_tiles = indexer_meta["fp4_n_tiles"]
+        batch = indexer_meta["fp4_batch"]
 
         max_seq_len = self._max_model_len_idx
         kv_block_size = self.kv_cache.size(3)  # csa_rows_per_block = 64
@@ -2204,9 +2211,9 @@ class Indexer(nn.Module):
             block_tables_tile,
             weights,
             cu_seq_q,
-            context_lens,
+            local_ends,
             logits,
-            n_tiles,
+            batch,
             MQA_TILE_QLEN,
             split_kv,
             self._weights_scale,
@@ -2218,7 +2225,7 @@ class Indexer(nn.Module):
         top_k_per_row_decode(
             logits,
             1,
-            context_lens,
+            local_ends,
             topk_out,
             padded_tokens,
             logits.stride(0),

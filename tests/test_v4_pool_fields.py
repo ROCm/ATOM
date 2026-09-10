@@ -15,6 +15,8 @@ and those are the two answers that differ by a silently-misplaced scale region.
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 
@@ -77,8 +79,10 @@ class TestIndexerBlockRegions:
         assert regions[CSA_INDEXER_SCALE] == rows * index_head_dim
         assert block_bytes == rows * (index_head_dim + 4)
 
+    # The OPUS e8m0 layout tiles rows by 32, so an fp4 page must be a multiple
+    # of it; `fp4_indexer_block_fields` rejects anything else.
     @pytest.mark.parametrize("index_head_dim", [128, 256, 384])
-    @pytest.mark.parametrize("rows", [3, 32, 64])
+    @pytest.mark.parametrize("rows", [32, 64])
     def test_fp4_block_is_16_packed_bytes_and_one_scale_per_group(
         self, rows, index_head_dim
     ):
@@ -96,7 +100,10 @@ class TestIndexerBlockRegions:
         data, scale = fp4_indexer_block_fields(64, 256)
 
         assert data.shape == (2, 4, 64, 16)
-        assert scale.shape == (2, 4, 64)
+        # [K_CHUNKS, MFMA_N, SCALE_BYTES] -- the OPUS permutation, same 512 B as
+        # FlyDSL's [k_tiles, 4, rows].
+        assert scale.shape == (2, 32, 8)
+        assert math.prod(scale.shape) == 64 * 256 // 32
         assert data.dtype is scale.dtype is torch.uint8
 
     def test_regions_are_a_prefix_sum_with_nothing_between_them(self):
@@ -113,7 +120,10 @@ class TestIndexerBlockRegions:
         "fields",
         [
             fp8_indexer_block_fields(3, 5, torch.uint8),
-            fp4_indexer_block_fields(3, 128),
+            # 32 rows, not 3: the OPUS e8m0 layout needs a multiple of 32, and
+            # this still leaves a scale region (128 B) that is not a multiple
+            # of 256, which is what this test turns on.
+            fp4_indexer_block_fields(32, 128),
         ],
         ids=["fp8", "fp4"],
     )

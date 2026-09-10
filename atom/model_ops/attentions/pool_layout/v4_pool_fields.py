@@ -63,17 +63,38 @@ def fp8_indexer_block_fields(
     ]
 
 
+# Elements per e8m0 scale group (OCP microscaling).
+FP4_SCALE_GROUP = 32
+
+
 def fp4_indexer_block_fields(rows: int, index_head_dim: int) -> list[EntryField]:
     """Packed E2M1 plus one e8m0 byte per group of 32, one layer's block.
 
     The `pa_mqa_logits_fp4` preshuffle layout, which is why the group axes sit
     outside the row axis. One pool per region here, so a region's shape is a
     pool's shape after the layer and block axes.
+
+    DATA is shared by every fp4 mqa-logits kernel. SCALE is not: the OPUS
+    MFMA-32x32 kernels read [K_CHUNKS, 32, SCALE_BYTES] where FlyDSL's 16x16
+    ones read [k_tiles, 4, rows]. Both are `rows * index_head_dim / 32` bytes,
+    so the wrong one is accepted silently.
     """
     k_tiles = index_head_dim // 128
+    mfma_n, mfma_k = 32, 64
+    # The OPUS scale layout tiles rows by MFMA_N, so a page that does not divide
+    # cannot express it -- and since the region is sized from the tile count, a
+    # short page would silently allocate a zero-length scale region rather than
+    # fail. The kernel static_asserts the same thing (PAGE % MFMA_N == 0).
+    assert rows % mfma_n == 0, (
+        f"fp4 indexer page must be a multiple of {mfma_n} rows for the OPUS "
+        f"e8m0 layout, got {rows}"
+    )
+    o_k_tiles = index_head_dim // mfma_k
+    k_chunks = (index_head_dim // FP4_SCALE_GROUP) // o_k_tiles
+    scale_bytes = o_k_tiles * (rows // mfma_n)
     return [
         EntryField(CSA_INDEXER_DATA, 1, (k_tiles, 4, rows, 16), torch.uint8),
-        EntryField(CSA_INDEXER_SCALE, 1, (k_tiles, 4, rows), torch.uint8),
+        EntryField(CSA_INDEXER_SCALE, 1, (k_chunks, mfma_n, scale_bytes), torch.uint8),
     ]
 
 

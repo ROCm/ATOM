@@ -496,7 +496,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # stored as packed FP4 E2M1 + per-group(32) e8m0 scale in the
         # `pa_mqa_logits_fp4` preshuffle layout (data
         # [NB, k_tiles, 4, rows, 16] uint8 + scale [NB, k_tiles, 4, rows] uint8)
-        # written by `fused_compress_attn(quant_mode="fp4")`. The scoring path
+        # written by `fused_compress_attn(quant_mode="opus32_fp4")`. The scoring path
         # auto-detects FP4 via `kv_cache.dtype == uint8`. Explicit fp8 keeps the
         # existing FP8 (+fp32 scale) path byte-identical.
         # `--index_cache_dtype` remains an explicit override. This is the
@@ -1742,7 +1742,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 module.kv_cache = idx_kv
                 if self._indexer_fp4:
                     # FP4 path: bind the matching uint8 e8m0 scale pool.
-                    # `fused_compress_attn(quant_mode="fp4")` writes both in
+                    # `fused_compress_attn(quant_mode="opus32_fp4")` writes both in
                     # the `pa_mqa_logits_fp4` preshuffle layout.
                     module.cache_scale = runner.v4_csa_idx_kv_scale[pos]
                 else:
@@ -1776,7 +1776,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     )
                 # Indexer-inner cache is always fp8 (independent of
                 # kv_cache_dtype); it has no separate rope pool.
-                module.quant_mode = "fp4" if self._indexer_fp4 else "per_row_fp8"
+                # "opus32_fp4", not plain "fp4": the mode also picks the e8m0
+                # permutation, and the OPUS mqa-logits readers want MFMA 32x32
+                # where FlyDSL wants 16x16. Same byte count, so a mismatch is
+                # silent.
+                module.quant_mode = (
+                    "opus32_fp4" if self._indexer_fp4 else "per_row_fp8"
+                )
                 module.kv_cache_rope = None
             elif ratio in (CSA_RATIO, HCA_RATIO):
                 table = (
@@ -2031,7 +2037,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata: AttentionMetaData_DSV4,
         positions_gpu,
         meta: dict[str, Any],
-        buf_prefix_ubatch: str = "",
     ) -> None:
         """Publish what the OPUS FP4 decode scorer needs. Nothing is built here.
 
@@ -2051,16 +2056,38 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         `build_v4_paged_decode_indptr`; give them different sources and this
         becomes an out-of-bounds read.
 
+        The window is READ by the kernel, not derived: a compressed KV cache's
+        `floor((pos + 1) / CSA_RATIO)` is not expressible as `ctx - (next_n-1-n)`,
+        so OPUS takes per-ROW `local_ends`. `csa_n_committed_per_token` is exactly
+        that array, and `build_v4_paged_decode_indptr` already refreshes it on
+        device every decode fwd -- so this publishes two slices and builds nothing.
+
+        One batch item per ROW (`cu_seq_q` an iota, `next_n_max == 1`) rather than
+        per sequence. Both are correct now that the kernel reads each row's own
+        end, but the per-row form needs no `next_n`: this builder sees
+        `scheduled_bs`, while the padded row count is `running_bs * max_q_len`, so
+        dividing to recover `next_n` would be wrong exactly when they differ --
+        and wrong there means a silently misplaced MTP window, not a crash.
+
+        The cost is that `batch_id` (grid.x) is then a ROW, so the scorer must
+        hand the kernel `block_tables_tile` (the per-row expansion) rather than
+        the plain `[bs, cols]` table.
+
+        CONSTRAINT: a pad row must carry `csa_n_committed_per_token == 0`. A zero
+        end costs one workgroup that exits before any global read; a nonzero one
+        would read a block-table entry nobody wrote, with the paged load's
+        bounds-checking off. Both the end and the liveness come from the one
+        `live` mask in `build_v4_paged_decode_indptr`.
+
         `block_tables_tile` is NOT cached here: it is published by
         `_attach_v4_paged_decode_meta`, whose order relative to this builder
         differs across the decode / ubatch / spec call sites. The scorer reads it
         off `attn_metadata` at forward time, by which point every attach has run.
         """
         _padded = int(positions_gpu.shape[0])
-        _n_tiles = -(-_padded // MQA_TILE_QLEN)
-        meta["fp4_context_lens"] = attn_metadata.csa_n_committed_per_token[:_padded]
-        meta["fp4_cu_seq_q"] = self._v4_fp4_cu_seq_q[: _n_tiles + 1]
-        meta["fp4_n_tiles"] = _n_tiles
+        meta["fp4_local_ends"] = attn_metadata.csa_n_committed_per_token[:_padded]
+        meta["fp4_cu_seq_q"] = self._v4_fp4_cu_seq_q[: _padded + 1]
+        meta["fp4_batch"] = _padded
 
     def _build_v4_indexer_meta(
         self,
@@ -2112,9 +2139,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # Per-row windows, once per fwd rather than per CSA layer. Equal
             # spans are not a separate case: every window is its own row's bound.
             if self._indexer_fp4:
-                self._refresh_fp4_decode_meta(
-                    attn_metadata, positions_gpu, meta, buf_prefix_ubatch
-                )
+                self._refresh_fp4_decode_meta(attn_metadata, positions_gpu, meta)
             return meta
 
         n_committed_per_seq = attn_metadata.n_committed_csa_per_seq_cpu[:bs]

@@ -20,7 +20,7 @@ MODEL = (
     Path(__file__).resolve().parents[1] / "atom" / "models" / "deepseek_v4.py"
 )
 DISPATCH = "indexer_score_topk"
-SCORERS = ("_score_topk_prefill_mx", "_score_topk_decode_mx")
+SCORERS = ("_score_topk_prefill_fp4", "_score_topk_decode_fp4")
 
 
 def _tree():
