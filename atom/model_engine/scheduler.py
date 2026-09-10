@@ -1803,6 +1803,13 @@ class Scheduler:
         seq.status = SequenceStatus.FINISHED
         seq.leave_reason = "aborted"
         self._rejected.append(seq)
+        if not has_inflight_load and self._connector_flag("is_offload"):
+            # A lookup can pin CPU KV before HBM allocation succeeds. No load
+            # is in flight yet, but the connector still owns cleanup work.
+            # Already-dispatched loads retain the completion-driven path below.
+            self.kv_connector.cancel_pending_load(seq)
+            self.deferred_free_blocks[seq.id] = seq
+            self._maybe_release_deferred(seq)
         if not has_inflight_load or not self._connector_flag("is_offload"):
             self._uncount_inflight_load(seq)
             return

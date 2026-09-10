@@ -372,6 +372,7 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         self._load_lifecycles: dict[str, object] = {}
         self._active_load_operations: dict[str, tuple[object, LoadOperationId]] = {}
         self._lookup_in_step: list[str] = []
+        self._lookup_results: dict[str, tuple[object, int]] = {}
         self._handoff_loads: set[str] = set()
         # Unaligned handoff is always on: when the HBM prefix-cache hit is not
         # chunk-aligned, recompute the misaligned head up to the next chunk
@@ -428,8 +429,24 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         self._begin_load_lifecycle(seq)
         num_prompt = seq.num_prompt_tokens
         token_ids = list(seq.token_ids[:num_prompt])
+        sid = str(seq.id)
+        pending = self._lookup_results.get(sid)
+        if pending is not None and pending[0] is not seq:
+            # An older lifecycle still owns this worker-side pin. Its cleanup
+            # must be dispatched before the ID can acquire a new lease.
+            return 0, False
         try:
-            hit = self._lookup_client.lookup(token_ids, lookup_id=str(seq.id))
+            if pending is None:
+                if sid not in self._lookup_in_step:
+                    self._lookup_in_step.append(sid)
+                self._lookup_results[sid] = (seq, 0)
+                hit = self._lookup_client.lookup(token_ids, lookup_id=sid)
+                if hit is None:
+                    self._lookup_results.pop(sid, None)
+                else:
+                    self._lookup_results[sid] = (seq, int(hit))
+            else:
+                hit = pending[1]
         except Exception:
             logger.exception("LMCache offload lookup failed for seq %s", seq.id)
             return 0, False
@@ -463,17 +480,9 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         self._hit_save_floors[sid] = self._chunk_floor(hit)
         need = hit - int(seq.num_cached_tokens)
         if need <= 0:
-            if self._lookup_client is not None:
-                try:
-                    self._lookup_client.clear_lookup_status(sid)
-                except Exception:
-                    logger.debug(
-                        "LMCache offload: lookup status cleanup failed for req=%s",
-                        sid,
-                        exc_info=True,
-                    )
+            self._clear_pending_load(sid)
+            self._hit_save_floors[sid] = self._chunk_floor(hit)
             return 0, False
-        self._lookup_in_step.append(sid)
         self._load_specs[sid] = LoadSpec(
             hbm_cached_tokens=int(seq.num_cached_tokens),
             lmcache_cached_tokens=hit,
@@ -519,9 +528,8 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         self._handoff_loads.discard(sid)
         self._load_save_floors.pop(sid, None)
         self._hit_save_floors.pop(sid, None)
-        self._lookup_in_step = [
-            req_id for req_id in self._lookup_in_step if req_id != sid
-        ]
+        # clear_lookup_status only clears the client's memo; it does not
+        # release worker pins. Keep the ID for the next metadata dispatch.
         if self._lookup_client is not None:
             try:
                 self._lookup_client.clear_lookup_status(sid)
@@ -635,7 +643,11 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                     load_operation=load_operation,
                 )
             )
-        meta.lookup_requests_in_step = list(self._lookup_in_step)
+        meta.lookup_requests_in_step = [
+            sid
+            for sid in self._lookup_in_step
+            if sid in loading_sids or sid not in self._load_specs
+        ]
         # Saves: store fully computed prompt chunks. Under scheduler-side
         # chunked prefill, seq.num_cached_tokens advances after each prefill
         # chunk's forward has completed; use it as the D2H-safe frontier.
@@ -691,6 +703,8 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             self._save_inflight[sid] = save_operation
             self._save_rr_last = sid
         dispatched = set(meta.lookup_requests_in_step)
+        for sid in dispatched:
+            self._lookup_results.pop(sid, None)
         self._lookup_in_step = [
             sid for sid in self._lookup_in_step if sid not in dispatched
         ]
@@ -715,7 +729,7 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         """
 
     def has_pending_work(self) -> bool:
-        """True while a load still needs dispatch or a save is unreported.
+        """True while a load/cleanup is dispatchable or a save is unreported.
 
         Feeds ``EngineCore.has_pending_kv_work()``, so it reads only state
         that clears itself: ``_reqs_need_recv`` is emptied by every
@@ -724,8 +738,16 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         Saves that are queued but not yet dispatched are covered there by the
         scheduler's ``deferred_free_blocks``, which ``should_defer_free``
         keeps populated for exactly those requests.
+
+        A pre-allocation lookup belongs to a waiting request. Keep its pin,
+        but do not advertise idle work until allocation or cancellation makes
+        a load or cleanup dispatchable in ``build_connector_meta``.
         """
-        return bool(self._reqs_need_recv) or bool(self._save_inflight)
+        return (
+            bool(self._reqs_need_recv)
+            or bool(self._save_inflight)
+            or any(sid not in self._load_specs for sid in self._lookup_in_step)
+        )
 
     def save_finished(self, req_id) -> None:
         sid = str(req_id.req_id if isinstance(req_id, SaveOperationId) else req_id)

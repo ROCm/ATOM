@@ -23,6 +23,11 @@ from collections.abc import Callable
 from typing import Any
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Protect reused KV prefixes from one-off prefill scans. Opt-in.
+    "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
+    "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
+        os.getenv("ATOM_PREFIX_CACHE_PROTECTED_RATIO", "0.5")
+    ),
     # --- Data Parallelism ---
     "ATOM_DP_RANK": lambda: int(os.getenv("ATOM_DP_RANK", "0")),
     "ATOM_DP_RANK_LOCAL": lambda: int(os.getenv("ATOM_DP_RANK_LOCAL", "0")),

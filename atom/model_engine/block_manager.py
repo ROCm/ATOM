@@ -131,7 +131,12 @@ class BlockManager:
         # The compressed KV blocks. Same class the sliding window uses for its
         # own index space — hash eviction has to happen at the same moment in
         # both or a prefix hit could be honoured by one pool and not the other.
-        self.kv = BlockPool(num_blocks, on_evict=self._record_evicted)
+        self.kv = BlockPool(
+            num_blocks,
+            on_evict=self._record_evicted,
+            cache_policy=envs.ATOM_PREFIX_CACHE_POLICY,
+            protected_ratio=envs.ATOM_PREFIX_CACHE_PROTECTED_RATIO,
+        )
         # Per-request cache slot pool. Used by attention types with a
         # stateful per-request buffer (GDN recurrent state, V4 compressor
         # state). The backing tensor is pre-allocated by ModelRunner and
