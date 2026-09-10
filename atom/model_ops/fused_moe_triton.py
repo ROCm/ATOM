@@ -324,7 +324,11 @@ def _fused_experts_silu_gugu(
     )
 
     _prequant = _is_prequant_mxfp4(hidden_states, a13_scale)
-    if envs.ATOM_USE_TRITON_MOE_A4W4 or act_quant == MoEActivationQuant.FP4 or _prequant:
+    if (
+        envs.ATOM_USE_TRITON_MOE_A4W4
+        or act_quant == MoEActivationQuant.FP4
+        or _prequant
+    ):
         # a4w4 takes the preshuffled gfx1250 weight through `preshuffle_weights`
         # -- a different parameter name from a8w4's `preshuffled`, which is why
         # this branch used to assert it did not exist. It does, it asserts the
@@ -987,9 +991,7 @@ def triton_mega_moe(
     # rows sit in the arena. Take them as a view: the experts consume the
     # transport's own buffers, with nothing quantized or allocated on arrival.
     a13_scale = (
-        mega._recv_dispatch_scales()
-        if mega._config.is_quant_dispatch_wire
-        else None
+        mega._recv_dispatch_scales() if mega._config.is_quant_dispatch_wire else None
     )
 
     if recv_token_bound is not None:

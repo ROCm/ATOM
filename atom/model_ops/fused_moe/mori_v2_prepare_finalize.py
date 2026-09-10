@@ -488,14 +488,12 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # more: MoriV2ModularKernel.forward sends it to triton_mega_moe (Triton
         # experts) or to MegaMoE's own forward (flydsl experts), and both own
         # their dispatch and combine end to end.
-        recv_x, recv_w, _recv_s, recv_idx, _total_recv_t, routing = (
-            self._op.dispatch(
-                a1,
-                topk_weights.to(torch.float32),
-                None,
-                topk_ids.to(torch.int32),
-                return_routing=True,
-            )
+        recv_x, recv_w, _recv_s, recv_idx, _total_recv_t, routing = self._op.dispatch(
+            a1,
+            topk_weights.to(torch.float32),
+            None,
+            topk_ids.to(torch.int32),
+            return_routing=True,
         )
         self._routing = routing
 
@@ -645,9 +643,9 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         if mega is not None and triton_experts is not None:
             from atom.model_ops.fused_moe_triton import triton_mega_moe
 
-            assert not kwargs.get("apply_router_weight_on_input", False), (
-                "mori does not support apply_router_weight_on_input=True now."
-            )
+            assert not kwargs.get(
+                "apply_router_weight_on_input", False
+            ), "mori does not support apply_router_weight_on_input=True now."
             arena_rows = (
                 self.prepare_finalize.num_dispatchers() * mega.max_tokens_per_rank
             )
