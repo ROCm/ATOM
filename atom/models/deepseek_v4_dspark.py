@@ -239,23 +239,39 @@ def _linear_out(output):
     return output[0] if isinstance(output, tuple) else output
 
 
+def _ckpt_index_path(model_path: str) -> str:
+    """Locate the shard index of a checkpoint named by directory or hub repo.
+
+    ``--model`` accepts either, and the hub form is not hypothetical: CI passes
+    the bare repo id on any runner without a local model mirror mounted. Only
+    the index is wanted here, so fetch that one file, never the shards.
+    """
+    import os
+
+    if os.path.isdir(model_path):
+        return os.path.join(model_path, "model.safetensors.index.json")
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(model_path, "model.safetensors.index.json")
+
+
 def _count_dspark_stages(model_path, default: int = 0) -> int:
     """Count distinct ``mtp.{i}.*`` stages in the checkpoint index.
 
     DSpark stores its backbone as ``mtp.0 .. mtp.{N-1}`` in the V4 checkpoint
     (N=3 for V4-Pro-DSpark). We must build exactly N stages or the last stage's
     Markov/confidence-head weights get dropped at load. The HF config's
-    ``num_nextn_predict_layers`` is unrelated (it is 1, a serial-MTP field).
+    ``num_nextn_predict_layers`` is unrelated (it is 1, a serial-MTP field),
+    and neither is ``dspark_target_layer_ids``, whose length counts the target
+    hidden states stage 0 concatenates, not the stages downstream of it.
     """
     import json
-    import os
     import re
 
     if not model_path:
         return default
-    idx_path = os.path.join(model_path, "model.safetensors.index.json")
     try:
-        with open(idx_path) as f:
+        with open(_ckpt_index_path(model_path)) as f:
             weight_map = json.load(f)["weight_map"]
     except Exception:  # noqa: BLE001 -- a probe: any unreadable index means "no"
         return default
@@ -1056,7 +1072,9 @@ class DeepseekV4DSpark(DSparkDraftModel):
         )
         if self.num_stages <= 0:
             raise ValueError(
-                "Could not determine DSpark stage count from the checkpoint; "
+                "Could not determine DSpark stage count from the checkpoint at "
+                f"{getattr(config, 'model', None)!r} (no readable "
+                "model.safetensors.index.json holding mtp.{i}.* weights); "
                 "set dspark_num_layers in the config."
             )
 
