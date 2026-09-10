@@ -81,6 +81,8 @@ API cache-hit value are excluded. Cache hits do not measure PD transfer savings:
 the transfer backend may still require a full transfer for its topology/state.
 Use each panel's legend to toggle the three curves independently. Tables and CSV
 include the tier quantities and selected percentage curves.
+See [metric definitions](../../../../docs/metrics_guide.md) for the full metric
+reference and how to add a new metric.
 
 ## Collection lifecycle
 
