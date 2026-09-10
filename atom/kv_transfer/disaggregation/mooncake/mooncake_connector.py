@@ -729,7 +729,14 @@ class MooncakeConnector(KVConnectorBase):
         self._release_targets: dict[ReqId, tuple[str, int, int]] = {}
         self._release_count: dict[TransferId, int] = {}
         self._released_transfers: set[TransferId] = set()
-        self._notification_port = get_open_port()
+        # Filled in by the listener thread once it has actually bound. Picking a
+        # free port here and binding it later leaves a window in which any of
+        # the other ranks starting up on this node can take it, and the loser
+        # used to die silently -- leaving producers with nowhere to report
+        # write-done, so every request on this rank hung until it was aborted.
+        self._notification_port: int | None = None
+        self._listener_bound = threading.Event()
+        self._listener_error: BaseException | None = None
 
         # --- Completion tracking ---
         self.done_sending: set[str] = set()
@@ -996,6 +1003,11 @@ class MooncakeConnector(KVConnectorBase):
                 name="mooncake-notify-listener",
             )
             self._notification_listener_thread.start()
+        # Fail registration instead of coming up healthy behind a dead listener.
+        # An unreachable side channel does not surface as an error anywhere: the
+        # peer simply never hears back, and every request hangs until the client
+        # gives up.
+        self._await_listener()
 
     # -----------------------------------------------------------------
     # KVConnectorBase: start_load_kv
@@ -1116,7 +1128,7 @@ class MooncakeConnector(KVConnectorBase):
                 "num_computed_blocks": off,
                 "src_block_skip_factor": src_block_skip_factor,
                 "notify_host": self.local_ip,
-                "notify_port": self._notification_port,
+                "notify_port": self.notification_port,
                 "consumer_tp_size": self.tp_size,
                 "write_nonce": write_nonce,
                 # DCP relayout: which shard of each block this rank owns.
@@ -1287,41 +1299,79 @@ class MooncakeConnector(KVConnectorBase):
     # Producer: write listener (ZMQ ROUTER)
     # -----------------------------------------------------------------
 
+    @property
+    def notification_port(self) -> int:
+        """Port the consumer's notification listener owns.
+
+        Only meaningful after ``_await_listener`` has returned; reading it
+        earlier is a bug, not a value to guess at.
+        """
+        port = self._notification_port
+        if port is None:
+            raise RuntimeError("Mooncake notification listener is not bound yet")
+        return port
+
+    def _publish_listener_state(self, exc: BaseException | None = None) -> None:
+        """Hand this listener's bind outcome to whoever is waiting on it."""
+        if exc is not None:
+            self._listener_error = exc
+            logger.exception("Mooncake side-channel listener died")
+        self._listener_bound.set()
+
+    def _await_listener(self, timeout: float = 60.0) -> None:
+        """Block until the side-channel listener owns its socket, else raise."""
+        role = "write" if self.is_producer else "notification"
+        if not self._listener_bound.wait(timeout):
+            raise RuntimeError(
+                f"Mooncake {role} listener did not bind within {timeout}s"
+            )
+        if self._listener_error is not None:
+            raise RuntimeError(
+                f"Mooncake {role} listener failed to bind"
+            ) from self._listener_error
+
     def _write_listener(self) -> None:
         """Accept write requests from consumers and dispatch RDMA writes."""
+        # Unlike the consumer's notification port this one is derived from
+        # handshake_port, so consumers can address it without a handshake; it
+        # cannot be delegated to the kernel.
         path = make_zmq_path("tcp", "*", self._side_channel_port)
-        logger.info("Mooncake write listener bound to %s", path)
+        try:
+            with zmq_socket_ctx(path, zmq.ROUTER, bind=True) as sock:
+                logger.info("Mooncake write listener bound to %s", path)
+                self._publish_listener_state()
+                while True:
+                    parts = sock.recv_multipart()
+                    identity, msg_type = parts[0], parts[1]
 
-        with zmq_socket_ctx(path, zmq.ROUTER, bind=True) as sock:
-            while True:
-                parts = sock.recv_multipart()
-                identity, msg_type = parts[0], parts[1]
+                    if msg_type == MSG_GET_META:
+                        encoded = self._encoder.encode(self._local_metadata)
+                        sock.send_multipart([identity, b"", encoded])
+                        logger.debug("Sent metadata to peer")
 
-                if msg_type == MSG_GET_META:
-                    encoded = self._encoder.encode(self._local_metadata)
-                    sock.send_multipart([identity, b"", encoded])
-                    logger.debug("Sent metadata to peer")
+                    elif msg_type == MSG_WRITE_REQUEST:
+                        request_data = msgpack.loads(parts[2])
+                        logger.debug(
+                            "[PRODUCER] Received write_request for req %s "
+                            "(transfer_id=%s, consumer=%s:%s)",
+                            request_data["request_id"],
+                            request_data.get("transfer_id"),
+                            request_data.get("consumer_host"),
+                            request_data.get("consumer_rpc_port"),
+                        )
+                        self._send_executor.submit(self._execute_transfer, request_data)
 
-                elif msg_type == MSG_WRITE_REQUEST:
-                    request_data = msgpack.loads(parts[2])
-                    logger.debug(
-                        "[PRODUCER] Received write_request for req %s "
-                        "(transfer_id=%s, consumer=%s:%s)",
-                        request_data["request_id"],
-                        request_data.get("transfer_id"),
-                        request_data.get("consumer_host"),
-                        request_data.get("consumer_rpc_port"),
-                    )
-                    self._send_executor.submit(self._execute_transfer, request_data)
+                    elif msg_type == MSG_RELEASE:
+                        data = msgpack.loads(parts[2])
+                        self._record_release(
+                            data["transfer_id"], data.get("consumer_tp_size", 1)
+                        )
 
-                elif msg_type == MSG_RELEASE:
-                    data = msgpack.loads(parts[2])
-                    self._record_release(
-                        data["transfer_id"], data.get("consumer_tp_size", 1)
-                    )
-
-                else:
-                    logger.error("Unknown message type: %s", msg_type)
+                    else:
+                        logger.error("Unknown message type: %s", msg_type)
+        except BaseException as exc:
+            self._publish_listener_state(exc)
+            raise
 
     def _record_release(self, transfer_id: TransferId, consumer_tp_size: int) -> None:
         """Count a consumer-rank release; free the shared page after all ranks.
@@ -2205,25 +2255,36 @@ class MooncakeConnector(KVConnectorBase):
 
     def _notification_listener(self) -> None:
         """Receive write-done notifications from producers."""
-        path = make_zmq_path("tcp", "*", self._notification_port)
-        logger.info("Mooncake notification listener bound to %s", path)
+        try:
+            # Port 0: let the kernel hand out the port to the socket we keep,
+            # so there is no interval between choosing it and owning it. The
+            # port only has to be known before the first start_load_kv puts it
+            # in the handshake, which _await_listener guarantees.
+            path = make_zmq_path("tcp", "*", 0)
+            with zmq_socket_ctx(path, zmq.ROUTER, bind=True) as sock:
+                endpoint = sock.getsockopt(zmq.LAST_ENDPOINT).decode()
+                self._notification_port = int(endpoint.rsplit(":", 1)[1])
+                logger.info("Mooncake notification listener bound to %s", endpoint)
+                self._publish_listener_state()
 
-        with zmq_socket_ctx(path, zmq.ROUTER, bind=True) as sock:
-            while True:
-                parts = sock.recv_multipart()
-                msg_type = parts[1]
+                while True:
+                    parts = sock.recv_multipart()
+                    msg_type = parts[1]
 
-                if msg_type == MSG_WRITE_DONE:
-                    data = msgpack.loads(parts[2])
-                    self._record_write_done(
-                        data["request_id"],
-                        data.get("pp_rank", 0),
-                        data.get("tp_rank", 0),
-                        data.get("write_nonce", 0),
-                        success=data.get("success", True),
-                    )
-                else:
-                    logger.error("Unknown notification type: %s", msg_type)
+                    if msg_type == MSG_WRITE_DONE:
+                        data = msgpack.loads(parts[2])
+                        self._record_write_done(
+                            data["request_id"],
+                            data.get("pp_rank", 0),
+                            data.get("tp_rank", 0),
+                            data.get("write_nonce", 0),
+                            success=data.get("success", True),
+                        )
+                    else:
+                        logger.error("Unknown notification type: %s", msg_type)
+        except BaseException as exc:
+            self._publish_listener_state(exc)
+            raise
 
     def _send_release(self, req_id: str) -> None:
         """Tell stage-0 this request's KV is fully received from every stage.
