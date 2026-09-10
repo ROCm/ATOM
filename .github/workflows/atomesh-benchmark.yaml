@@ -64,8 +64,8 @@ on:
             glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c24,
             glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c32,
             glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c48,
-            glm-52-mxfp4-standalone-tp4-dcp4-sharded-index-no-mtp-lmcache512-chunk256-agentic-1m-c48,
-            glm-52-mxfp4-standalone-tp4-dcp4-sharded-index-no-mtp-lmcache512-chunk256-agentic-1m-c56
+            glm-52-mxfp4-standalone-tp4-dcp4-sharded-index-no-mtp-lmcache256-chunk256-agentic-1m-c48,
+            glm-52-mxfp4-standalone-tp4-dcp4-sharded-index-no-mtp-lmcache256-chunk256-agentic-1m-c56
 
           Kimi-K3:
             kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c1,

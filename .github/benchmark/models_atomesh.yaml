@@ -368,7 +368,7 @@ models:
         # One regular ATOM worker handles both prefill and decode; ATOMesh uses
         # normal worker routing rather than --pd-disaggregation.
         - &glm52_agentic_lmcache_standalone_tp4_dcp4_sharded_index
-          name: glm-52-mxfp4-standalone-tp4-dcp4-sharded-index-no-mtp-lmcache512-chunk256-agentic-1m-c48
+          name: glm-52-mxfp4-standalone-tp4-dcp4-sharded-index-no-mtp-lmcache256-chunk256-agentic-1m-c48
           deployment: standalone
           topology: standalone_dcp4
           display_topology: STANDALONE-TP4-DCP4-SHARDED-INDEX-NO-MTP
@@ -391,7 +391,7 @@ models:
               PYTHONHASHSEED: "0"
             standalone:
               LMCACHE_LOCAL_CPU: "True"
-              LMCACHE_MAX_LOCAL_CPU_SIZE: "512"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
               LMCACHE_CHUNK_SIZE: "256"
               OFFLOAD_MIN_LOAD_TOKENS: "8192"
               HIP_VISIBLE_DEVICES: "0,1,2,3"
@@ -401,7 +401,7 @@ models:
           run_eval: false
 
         - <<: *glm52_agentic_lmcache_standalone_tp4_dcp4_sharded_index
-          name: glm-52-mxfp4-standalone-tp4-dcp4-sharded-index-no-mtp-lmcache512-chunk256-agentic-1m-c56
+          name: glm-52-mxfp4-standalone-tp4-dcp4-sharded-index-no-mtp-lmcache256-chunk256-agentic-1m-c56
           concurrency: [56]
           standalone:
             <<: *glm52_agentic_lmcache_standalone_tp4_dcp4

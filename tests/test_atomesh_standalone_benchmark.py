@@ -33,7 +33,7 @@ def test_glm52_standalone_agentic_cases(monkeypatch):
     )
     case_prefix = (
         "glm-52-mxfp4-standalone-tp4-dcp4-sharded-index-no-mtp-"
-        "lmcache512-chunk256-agentic-1m-"
+        "lmcache256-chunk256-agentic-1m-"
     )
     cases = {f"{case_prefix}c48", f"{case_prefix}c56"}
     cells = pd_matrix.build_cells(
@@ -64,7 +64,7 @@ def test_glm52_standalone_agentic_cases(monkeypatch):
         assert standalone["kv_transfer_config"] == (
             '{"kv_connector":"lmcache_offload","kv_role":"offload"}'
         )
-        assert cell["env"]["standalone"]["LMCACHE_MAX_LOCAL_CPU_SIZE"] == "512"
+        assert cell["env"]["standalone"]["LMCACHE_MAX_LOCAL_CPU_SIZE"] == "256"
         assert cell["env"]["standalone"]["LMCACHE_CHUNK_SIZE"] == "256"
         assert "method" not in cell["server_args"]
 
