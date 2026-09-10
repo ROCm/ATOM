@@ -108,7 +108,7 @@ on:
           - atomesh-cicd-crusoe-mi355
           - atomesh-cicd-mi355-crusoe
       atomesh_slurm_account:
-        description: 'Slurm account: amd-frameworks[42/44/47], amd-tw[36/43]'
+        description: 'Slurm account: amd-frameworks[42/44/47], amd-tw[36/43/64]'
         required: false
         default: auto
         type: choice
@@ -117,7 +117,7 @@ on:
           - amd-frameworks
           - amd-tw
       atomesh_slurm_partition:
-        description: 'Slurm partition: amd-frameworks[42/44/47], amd-tw[36/43]'
+        description: 'Slurm partition: amd-frameworks[42/44/47], amd-tw[36/43/64]'
         required: false
         default: auto
         type: choice
@@ -141,6 +141,8 @@ on:
           - mia1-p02-g42,mia1-p02-g47
           - mia1-p02-g44,mia1-p02-g47
           - mia1-p01-g36,mia1-p01-g43
+          - mia1-p01-g64,mia1-p01-g36
+          - mia1-p01-g43,mia1-p01-g64
       atomesh_2p1d_nodes:
         description: 'ATOMesh 2P1D nodes'
         required: false
@@ -149,6 +151,7 @@ on:
         options:
           - auto
           - mia1-p02-g42,mia1-p02-g44,mia1-p02-g47
+          - mia1-p01-g36,mia1-p01-g43,mia1-p01-g64
       benchmark_concurrency:
         description: 'Optional benchmark concurrency override, e.g. 1,2,4 (no quotes)'
         required: false
@@ -335,8 +338,8 @@ jobs:
             ATOMESH_SLURM_ACCOUNT=amd-tw \
             ATOMESH_SLURM_PARTITION=amd-tw \
             ATOMESH_SLURM_SUBMIT_RUNNER=atomesh-cicd \
-            ATOMESH_1P1D_NODES=mia1-p01-g36,mia1-p01-g43 \
-            ATOMESH_2P1D_NODES=mia1-p01-g36,mia1-p01-g43 \
+            ATOMESH_1P1D_NODES=mia1-p01-g36,mia1-p01-g43,mia1-p01-g64 \
+            ATOMESH_2P1D_NODES=mia1-p01-g36,mia1-p01-g43,mia1-p01-g64 \
               python3 .github/scripts/atomesh/pd_matrix.py \
               --suite nightly \
               --model GLM-5.2-MXFP4 \
