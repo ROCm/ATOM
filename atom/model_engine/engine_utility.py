@@ -6,6 +6,7 @@ import queue
 from typing import ClassVar
 
 from atom.model_engine.sequence import SequenceStatus
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -335,7 +336,9 @@ class EngineUtilityHandler:
         """
         # Telemetry replies use their own tagged path, never the forward/KV
         # result queues. No wait for a worker response or device completion.
-        if hasattr(self.runner_mgr, "latest_forward_metrics"):
+        if envs.ATOM_ENABLE_METRICS_DEVICE_TIMER and hasattr(
+            self.runner_mgr, "latest_forward_metrics"
+        ):
             self.runner_mgr.call_func("collect_forward_metrics")
         snapshot = self.collect_metrics() if scheduler_metrics else {"enabled": False}
         snapshot["forward_metrics"] = list(

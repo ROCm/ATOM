@@ -13,6 +13,7 @@ class Event:
     def __init__(self):
         self.ready = False
         self.recorded = 0
+        self.queries = 0
         self.duration_ms = 8.0
 
     def record(self):
@@ -20,6 +21,7 @@ class Event:
         self.ready = False
 
     def query(self):
+        self.queries += 1
         return self.ready
 
     def elapsed_time(self, end):
@@ -54,9 +56,15 @@ def test_events_are_polled_without_waiting_and_reused_only_after_completion():
     for event in metrics.pending[1][1:3]:
         event.ready = True
     snapshot = metrics.snapshot()
-    assert len(metrics.pending) == 1
-    assert snapshot["phases"]["prefill"]["sum"] == 0.008
+    assert len(metrics.pending) == 2
+    assert not metrics.free
+    assert snapshot["phases"]["prefill"]["sum"] == 0
     assert snapshot["phases"]["decode"]["sum"] == 0
+    complete_event(metrics)
+    snapshot = metrics.snapshot()
+    assert not metrics.pending
+    assert snapshot["phases"]["prefill"]["sum"] == 0.008
+    assert snapshot["phases"]["decode"]["sum"] == 0.008
     reused = tuple(metrics.free[-1])
     with metrics.measure(batch(prefill=1, decode=1)):
         pass
@@ -68,6 +76,20 @@ def test_events_are_polled_without_waiting_and_reused_only_after_completion():
     assert snapshot["phases"]["decode"]["sum"] == 0.008
     assert snapshot["phases"]["mixed"]["sum"] == 0.008
     assert metrics.snapshot()["phases"] == snapshot["phases"]
+
+
+def test_poll_checks_only_the_unfinished_head_of_a_full_queue():
+    metrics = GPUForwardMetrics(Event)
+    for _ in range(256):
+        with metrics.measure(batch()):
+            pass
+    for index, (_, start, end, _) in enumerate(metrics.pending):
+        start.ready = end.ready = index > 0
+        end.queries = 0
+    metrics.poll()
+    assert [end.queries for _, _, end, _ in metrics.pending] == [1] + [0] * 255
+    assert not metrics.free
+    assert metrics.histograms["decode"].snapshot()["sum"] == 0
 
 
 def test_warmup_dummy_failure_and_decorator_do_not_create_spurious_samples():
@@ -85,12 +107,17 @@ def test_warmup_dummy_failure_and_decorator_do_not_create_spurious_samples():
         return inputs + 1
 
     assert model(SimpleNamespace(), 4, batch()) == 5
+    assert model(SimpleNamespace(gpu_forward_metrics=None), 4, object()) == 5
     assert model(SimpleNamespace(gpu_forward_metrics=metrics), 4, batch()) == 5
     metrics.poll()
     assert len(metrics.pending) == 1
 
 
-def test_device_snapshot_push_never_waits_or_duplicates_downstream_scheduler():
+@pytest.mark.parametrize("enabled", [False, True])
+def test_device_snapshot_push_never_waits_or_duplicates_downstream_scheduler(
+    monkeypatch, enabled
+):
+    monkeypatch.setenv("ATOM_ENABLE_METRICS_DEVICE_TIMER", "1" if enabled else "0")
     calls = []
     manager = SimpleNamespace(
         latest_forward_metrics={0: {"tp_rank": 0}},
@@ -99,7 +126,7 @@ def test_device_snapshot_push_never_waits_or_duplicates_downstream_scheduler():
     output = Queue()
     utility = EngineUtilityHandler(manager, output)
     utility.push_metrics(scheduler_metrics=False)
-    assert calls == [(("collect_forward_metrics",), {})]
+    assert calls == ([(("collect_forward_metrics",), {})] if enabled else [])
     tag, data = output.get_nowait()
     assert tag == "METRICS" and data["enabled"] is False
     assert data["forward_metrics"] == [{"tp_rank": 0}]
@@ -185,7 +212,7 @@ def test_request_sum_waits_for_every_chunk_even_if_last_event_finishes_first():
     complete_event(metrics, 0, 10)
     first = metrics.snapshot()
     assert first["prefill_requests"]["buckets"][-1][1] == 0
-    assert first["phases"]["prefill"]["sum"] == pytest.approx(0.018)
+    assert first["phases"]["prefill"]["sum"] == pytest.approx(0.010)
     complete_event(metrics, 0, 12)
     final = metrics.snapshot()
     assert final["prefill_requests"]["sum"] == pytest.approx(0.030)
@@ -263,19 +290,22 @@ def test_reused_request_id_cannot_be_finished_by_an_old_pending_event():
     with metrics.measure(prefill_batch((7, 1, True))):
         pass
     complete_event(metrics, 1, 20)
-    assert metrics.snapshot()["prefill_requests"]["sum"] == pytest.approx(0.020)
+    assert metrics.snapshot()["prefill_requests"]["sum"] == 0
     complete_event(metrics, 0, 100)
     final = metrics.snapshot()
     assert final["prefill_requests"]["sum"] == pytest.approx(0.020)
     assert final["prefill_requests"]["buckets"][-1][1] == 1
 
 
-def test_scheduler_freezes_chunk_boundaries_and_excludes_later_recomputation():
+def test_scheduler_freezes_chunk_boundaries_and_excludes_later_recomputation(
+    monkeypatch,
+):
     import pickle
 
     from atom.model_engine.scheduler import ScheduledBatch
     from atom.model_engine.sequence import Sequence, SequenceType
 
+    monkeypatch.setenv("ATOM_ENABLE_METRICS_DEVICE_TIMER", "1")
     seq = Sequence(list(range(10)), block_size=4)
     seq.type = SequenceType.PREFILL
     seq.num_cached_tokens = 4  # Cached prefix is not a forward or a zero-time chunk.
@@ -310,6 +340,26 @@ def test_scheduler_freezes_chunk_boundaries_and_excludes_later_recomputation():
         complete_event(metrics)
         metrics.poll()
     assert metrics.snapshot()["prefill_requests"]["sum"] == pytest.approx(0.016)
+
+
+def test_scheduler_does_not_track_gpu_chunks_by_default(monkeypatch):
+    from atom.model_engine.scheduler import ScheduledBatch
+    from atom.model_engine.sequence import Sequence, SequenceType
+
+    monkeypatch.delenv("ATOM_ENABLE_METRICS_DEVICE_TIMER", raising=False)
+    seq = Sequence([1, 2, 3, 4], block_size=4)
+    seq.type = SequenceType.PREFILL
+    scheduled = ScheduledBatch(
+        {seq.id: seq},
+        [4],
+        4,
+        total_tokens_num_prefill=4,
+        total_seqs_num=1,
+        total_seqs_num_prefill=1,
+    )
+    assert scheduled.prefill_gpu_requests == []
+    assert seq.prefill_gpu_chunks == 0
+    assert not seq.prefill_gpu_complete
 
 
 def test_request_gpu_histogram_export_is_per_worker_and_backward_compatible():

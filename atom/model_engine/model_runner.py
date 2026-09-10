@@ -814,11 +814,15 @@ class ModelRunner:
                 )
 
         # Install after startup profiling/warmup/capture, which are not traffic.
-        self.gpu_forward_metrics = GPUForwardMetrics(
-            lambda: torch.cuda.Event(enable_timing=True)
-        )
+        self.gpu_forward_metrics = None
+        if envs.ATOM_ENABLE_METRICS_DEVICE_TIMER:
+            self.gpu_forward_metrics = GPUForwardMetrics(
+                lambda: torch.cuda.Event(enable_timing=True)
+            )
 
     def collect_forward_metrics(self):
+        if self.gpu_forward_metrics is None:
+            return None
         pc = self.config.parallel_config
         return {
             **self.gpu_forward_metrics.snapshot(),
