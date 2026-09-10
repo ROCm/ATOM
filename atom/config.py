@@ -1746,19 +1746,23 @@ class Config:
             self.enable_tbo_decode = False
 
         self.moe_backend = self.moe_backend.strip().lower()
-        if self.moe_backend not in ("standard", "mega"):
+        if self.moe_backend not in ("standard", "mega", "wideep"):
             raise ValueError(
-                "moe_backend must be one of {'standard', 'mega'}, "
+                "moe_backend must be one of {'standard', 'mega', 'wideep'}, "
                 f"got {self.moe_backend!r}"
             )
-        if self.moe_backend == "mega" and not self.enable_expert_parallel:
+        if self.moe_backend in ("mega", "wideep") and not self.enable_expert_parallel:
             raise ValueError(
-                "moe_backend='mega' requires expert parallelism; "
+                f"moe_backend={self.moe_backend!r} requires expert parallelism; "
                 "pass --enable-expert-parallel."
             )
-        if self.moe_backend == "mega" and self.moe_all2all_backend == "rccl":
+        if (
+            self.moe_backend in ("mega", "wideep")
+            and self.moe_all2all_backend == "rccl"
+        ):
             raise ValueError(
-                "moe_backend='mega' owns its MoRI transport and cannot use the "
+                f"moe_backend={self.moe_backend!r} owns its MoRI transport and "
+                "cannot use the "
                 "experimental RCCL prepare/finalize backend"
             )
 

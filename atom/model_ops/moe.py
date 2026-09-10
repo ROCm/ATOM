@@ -1811,11 +1811,65 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
         return views
 
 
+class WideEpMxfp4MoEMethod(Mxfp4MoEMethod):
+    """MXFP4 MoE method backed by AITER's EP16 inter-node operator."""
+
+    def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
+        super().__init__(quant_config, moe)
+        parallel = moe.moe_parallel_config
+        if not parallel.use_ep or parallel.ep_size != 16 or parallel.local_ep_size != 8:
+            raise ValueError("moe_backend='wideep' requires EP16 on two 8-GPU nodes")
+        if not parallel.use_mori_kernels:
+            raise ValueError(
+                "moe_backend='wideep' requires the MORI all-to-all runtime"
+            )
+        if get_gfx() != "gfx950":
+            raise ValueError("moe_backend='wideep' requires gfx950")
+        if not quant_config.is_dynamic:
+            raise ValueError(
+                "moe_backend='wideep' requires dynamic activation quantization"
+            )
+        if get_current_atom_config().eplb_enable:
+            raise ValueError("moe_backend='wideep' does not support EPLB")
+        if moe.expert_layout.mode is not SharedExpertMode.NONE or moe.has_bias:
+            raise ValueError(
+                "moe_backend='wideep' supports routed experts without bias"
+            )
+        self.use_triton = False
+        self.use_triton_decode = False
+
+    def _process_weight_layout_after_loading(self, layer) -> None:
+        from atom.model_ops.fused_moe.wideep_experts import build_wideep_weights
+
+        build_wideep_weights(layer)
+        layer.w13_weight.data = torch.empty(
+            0, dtype=layer.w13_weight.dtype, device=layer.w13_weight.device
+        )
+        layer.w2_weight.data = torch.empty(
+            0, dtype=layer.w2_weight.dtype, device=layer.w2_weight.device
+        )
+
+    def init_prepare_finalize(self, layer: torch.nn.Module):
+        from atom.model_ops.fused_moe.wideep_experts import WideEpFusedExperts
+
+        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        self.fused_experts = WideEpFusedExperts(
+            layer,
+            model_dim=self.hidden_size,
+            inter_dim=self.intermediate_size,
+            experts=self.moe.num_experts,
+            mtpr=self.moe.max_num_tokens,
+        )
+
+
 def _make_mxfp4_moe_method(
     quant_config: LayerQuantConfig, moe: FusedMoEConfig
 ) -> Mxfp4MoEMethod:
-    if get_current_atom_config().moe_backend == "mega":
+    backend = get_current_atom_config().moe_backend
+    if backend == "mega":
         return MegaMxfp4MoEMethod(quant_config, moe)
+    if backend == "wideep":
+        return WideEpMxfp4MoEMethod(quant_config, moe)
     return Mxfp4MoEMethod(quant_config, moe)
 
 
@@ -3108,14 +3162,19 @@ class FusedMoE(torch.nn.Module):
             self._comm_fused_moe.initialize(self)
 
     def _validate_moe_backend(self) -> None:
-        if get_current_atom_config().moe_backend != "mega":
+        backend = get_current_atom_config().moe_backend
+        if backend == "standard":
             return
-        if not isinstance(self.quant_method, MegaMxfp4MoEMethod):
+        expected = MegaMxfp4MoEMethod if backend == "mega" else WideEpMxfp4MoEMethod
+        if not isinstance(self.quant_method, expected):
             raise TypeError(
-                "moe_backend='mega' currently supports only MXFP4/A8W4 MoE, "
+                f"moe_backend={backend!r} currently supports only MXFP4/A8W4 MoE, "
                 f"got {type(self.quant_method).__name__}"
             )
-        if self.expert_layout.mode is SharedExpertMode.LEGACY_AITER:
+        if (
+            backend == "mega"
+            and self.expert_layout.mode is SharedExpertMode.LEGACY_AITER
+        ):
             raise NotImplementedError(
                 "moe_backend='mega' requires the shared expert to be fused into "
                 "the dispatch space; the legacy AITER fusion is unsupported."
