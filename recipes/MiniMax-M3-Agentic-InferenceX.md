@@ -9,7 +9,9 @@ per rank**, against DeepSeek-V4's MLA which compresses ~10–20×. The GPU KV po
 × 128 = **7.66M tokens**, and the agentic traces average ~150K tokens of context (~1,170 blocks
 per in-flight request), so the running set fills the pool near 50 concurrent requests. At ≤24
 there is still headroom, reusable multi-turn prefixes survive in HBM, and a CPU/NVMe offload tier
-would only spend lookups recovering tokens HBM never lost — which is why offload is off here.
+would only spend lookups recovering tokens HBM never lost — which is why offload is off on the
+1–32 ladder. Past that knee — 48c and up — the running set exceeds the pool, so CPU offload with
+the SLRU cache policy earns its keep; see [Concurrency 48 — CPU offload](#concurrency-48--cpu-offload).
 
 One server launch per concurrency point — `--max-num-seqs` is sized off concurrency, so it
 cannot be reused across points. It is set at **2 × concurrency**: a value at or below the offered
@@ -50,7 +52,6 @@ env \
     --attn-prefill-chunk-size 16384 \
     --max-num-seqs $((2 * CONC)) \
     --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}' \
-    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
     --default-chat-template-kwargs '{"thinking_mode": "enabled"}' \
     --enable-prefix-caching \
     --method eagle3 \
@@ -59,6 +60,37 @@ env \
     --spec-decode-acceptance-rate 0.5933 \
   > server_c${CONC}.log 2>&1 &
 ```
+
+## Concurrency 48 — CPU offload
+
+Beyond the ~32c knee the running set no longer fits the HBM pool, so the offload
+tier stops being redundant. Run a 48c point by enabling LMCache CPU offload with
+the SLRU cache policy — full rationale in `MiniMax-M3-Cache-Policies.md`. Keep the
+server command above (`CONC=48`, so `--max-num-seqs` is 96) and add these to its
+`env \` block:
+
+```bash
+  LMCACHE_LOCAL_CPU=True \
+  LMCACHE_MAX_LOCAL_CPU_SIZE=256 \
+  LMCACHE_CHUNK_SIZE=256 \
+  ATOM_PREFIX_CACHE_POLICY=slru \
+  ATOM_PREFIX_CACHE_PROTECTED_RATIO=0.5 \
+  LMCACHE_CACHE_POLICY=ATOM_SLRU \
+  LMCACHE_LOOKUP_SERVER_WORKER_IDS=0,1,2,3 \
+```
+
+and this to its args:
+
+```bash
+    --kv-transfer-config '{"kv_connector":"lmcache_offload","kv_role":"offload"}' \
+```
+
+`LMCACHE_LOOKUP_SERVER_WORKER_IDS=0,1,2,3` is the all-rank lookup scope — one id per
+TP4 rank. Each rank pins its own KV shard and the minimum hit length across ranks
+is the common restorable prefix, so a shard another rank already evicted is never
+trusted. At 48c this took the total prompt cache hit rate from 82.86% (rank-0-only
+lookup) to 95.48%. Only synchronous lookup is supported; enabling
+`LMCACHE_ENABLE_ASYNC_LOADING` is rejected at startup.
 
 ## aiperf
 
