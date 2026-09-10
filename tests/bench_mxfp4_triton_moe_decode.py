@@ -112,6 +112,50 @@ def _make_layer(num_experts, hidden, inter, use_bias, device, seed=0):
     )
 
 
+def _make_router_logits(tokens, experts, topk, args, device):
+    """Gating logits honoring the same balance controls as the FlyDSL UT's
+    ``_make_routing_score`` (op_tests/test_flydsl_grouped_gemm_gfx1250.py):
+
+    * ``--num-expert-activated n`` (highest priority): activate n randomly-chosen
+      experts, round-robin balanced over that active set.
+    * ``--expert-balance``: round-robin balanced over ALL experts -- every expert
+      gets an equal share of the tokens*topk routing slots (best case for the
+      grouped GEMM).
+    * otherwise: random gating (``randn``), the natural unbalanced distribution.
+
+    Exactly ``topk`` experts score high per token, so apply()'s internal top-k
+    selects the intended set (ties among the high scores are the balanced set).
+    """
+    n_act = args.num_expert_activated
+    if n_act > 0:
+        if n_act < topk or n_act > experts or n_act > tokens * topk:
+            raise SystemExit(
+                f"--num-expert-activated={n_act} invalid: must be in "
+                f"[topk={topk}, min(experts={experts}, tokens*topk={tokens * topk})]"
+            )
+        sel = torch.randperm(experts)[:n_act]
+        score = torch.full((tokens, experts), float("-inf"), dtype=torch.float32)
+        slot = torch.arange(tokens * topk) % n_act
+        rows = torch.arange(tokens).repeat_interleave(topk)
+        score[rows, sel[slot]] = 1.0
+    elif args.expert_balance:
+        score = torch.zeros((tokens, experts), dtype=torch.float32)
+        start_col, end_col = 0, topk
+        for token_id in range(tokens):
+            score[token_id, start_col:end_col] = 1.0
+            start_col = end_col % experts
+            end_col = start_col + topk
+    else:
+        score = torch.randn((tokens, experts), dtype=torch.float32)
+    return score.to(device)
+
+
+def _routing_mode(args):
+    if args.num_expert_activated > 0:
+        return f"activated:{args.num_expert_activated}"
+    return "balanced" if args.expert_balance else "random"
+
+
 def _device_us(evt):
     """Self device (GPU) time for a profiler event, in us, across torch versions."""
     for attr in (
@@ -192,8 +236,8 @@ def _run_one(args, tokens):
     )
 
     x = torch.randn(tokens, args.model_dim, dtype=torch.bfloat16, device=device)
-    router_logits = torch.randn(
-        tokens, args.experts, dtype=torch.float32, device=device
+    router_logits = _make_router_logits(
+        tokens, args.experts, args.topk, args, device
     )
 
     def step():
@@ -241,6 +285,23 @@ def main():
     parser.add_argument("--tokens", type=int, nargs="+", default=[512], metavar="N",
                         help="one or more decode token counts; timed once per value")
     parser.add_argument("--no-bias", action="store_true")
+    # Routing balance, mirroring the FlyDSL UT's env controls. Defaults read the
+    # same env vars so the same environment reproduces the same distribution.
+    parser.add_argument(
+        "--expert-balance",
+        action="store_true",
+        default=os.environ.get("AITER_MOE_EXPERT_BALANCE", "False").lower() == "true",
+        help="round-robin balanced routing over all experts (equal load); "
+        "default from AITER_MOE_EXPERT_BALANCE. Off => random gating.",
+    )
+    parser.add_argument(
+        "--num-expert-activated",
+        type=int,
+        default=int(os.environ.get("AITER_MOE_NUM_EXPERT_ACTIVATED", "0")),
+        metavar="N",
+        help="activate only N randomly-chosen experts, balanced over them "
+        "(highest priority); default from AITER_MOE_NUM_EXPERT_ACTIVATED.",
+    )
     # FlyDSL bench defaults (op_tests/test_flydsl_grouped_gemm_gfx1250.py).
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=101)
@@ -267,7 +328,7 @@ def main():
         f"[bench decode] {args.data_format} {args.act} "
         f"experts={args.experts} topk={args.topk} "
         f"model_dim={args.model_dim} inter_dim={args.inter_dim} "
-        f"bias={not args.no_bias}",
+        f"bias={not args.no_bias} routing={_routing_mode(args)}",
         flush=True,
     )
     rows = []
