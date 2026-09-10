@@ -71,6 +71,9 @@ no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only whe
 | **ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM** | bool | 0 (false) | If set to `1`, use AITER Triton FP4 GEMM with non-shuffled weights. Takes precedence over the FP4 preshuffled GEMM path selected by `ATOM_USE_TRITON_GEMM`. |
 | **ATOM_USE_TRITON_MXFP4_BMM** | bool | 0 (false) | If set to `1`, use FP4 BMM in MLA attention module. |
 | **ATOM_USE_FLYDSL_GATHER_KV_B_PROJ** | bool | 1 (true) | Use the FlyDSL fused gather + `kv_b_proj` GEMM for MLA's cached-prefix path. Covers page_size-1 fp8 (e4m3) KV with an fp8 weight on gfx950 — i.e. Kimi-K3 / DeepSeek MLA under `--kv-cache-dtype fp8`. Any other shape is rejected before launch and falls back to the Triton gather, once per process, with a warning. Set `0` to force Triton. |
+| **ATOM_USE_FLYDSL_FP8_PREFILL_ATTN** | bool | 0 (false) | Use FlyDSL FP8 FMHA for MLA prefill on gfx950. Quantizes Q/K/V to E4M3 and folds the layer softmax scale into Q's descale. Requires BF16 output, Q/K head dimension divisible by 64, and V dimension 64–192 divisible by 32. Missing kernels or unsupported layers raise at startup; unsupported per-call features use AITER varlen attention. Added 2026-09-10. |
+| **ATOM_USE_FLYDSL_GATHER_KV_B_PROJ_FP8** | bool | 1 (true) | With FlyDSL gather and FP8 prefill attention enabled, write cached K/V directly as FP8 using separate descales `max(new_token_descale, 1e-6) * 2`. Requires AITER FP8-output gather support; older BF16-only gather builds retain separate quantization. Set `0` for dynamic per-chunk K/V quantization. Added 2026-09-10. |
+| **ATOM_USE_FUSED_MLA_QKV_QUANT** | bool | 1 (true) | Fuse Q/K/V per-tensor quantization, strided V reads, and descale preparation into one or two Triton launches before FP8 prefill attention. Set `0` for separate AITER HIP quantization. Added 2026-09-10. |
 
 ### GLM-5.3
 

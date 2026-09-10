@@ -3,8 +3,9 @@
 
 import logging
 from dataclasses import dataclass
-from functools import cache, lru_cache
+from functools import cache
 from functools import partial as functools_partial
+from inspect import signature
 from typing import ClassVar, Protocol
 
 import torch
@@ -62,6 +63,7 @@ from atom.distributed.pcp_utils import (
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import use_triton_gemm
 from atom.model_ops.triton_fused_mla_ctx_kv import fused_mla_ctx_norm_rope_cache
+from atom.model_ops.triton_fused_qkv_quant import fused_qkv_per_tensor_quant
 from atom.model_ops.utils import get_and_maybe_dequant_weights
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
@@ -471,65 +473,37 @@ if is_rocm_aiter_fp4bmm_enabled():
     from atom.model_ops.utils import quark_post_load_weights
 
 
-# --------------------------------------------------------------------------
-# Optional flydsl backend for `_kv_b_proj_gather` (ATOM_USE_FLYDSL_GATHER_KV_B_PROJ)
-# --------------------------------------------------------------------------
+# Optional kernels are imported independently: older AITER builds can provide
+# the BF16 gather without FP8 FMHA or the FP8-output gather API.
+try:
+    from aiter.ops.flydsl import gather_kv_b_proj_flydsl
+except ImportError:
+    gather_kv_b_proj_flydsl = None
+
+try:
+    from aiter.ops.flydsl import flydsl_flash_attn_fp8_func
+except ImportError:
+    flydsl_flash_attn_fp8_func = None
+
+_FLYDSL_GATHER_FP8_AVAILABLE = gather_kv_b_proj_flydsl is not None and {
+    "k_out_scale",
+    "v_out_scale",
+}.issubset(signature(gather_kv_b_proj_flydsl).parameters)
+
+# The FMHA wrapper uses int32 flattened tensor extents in its C ABI.
+_FLYDSL_FMHA_MAX_FLAT_ELEMS = 2**31
 _flydsl_gather_logged: set[str] = set()
 
 
-@lru_cache(maxsize=1)
-def _load_flydsl_gather_kv_b_proj():
-    """Import the flydsl gather lazily -- it pulls in the flydsl compiler and
-    JIT-builds on first launch, which nothing should pay for while the flag is
-    off. Returns ``None`` when flydsl is unavailable."""
-    try:
-        from aiter.ops.flydsl import gather_kv_b_proj_flydsl
-
-        return gather_kv_b_proj_flydsl
-    except Exception as exc:  # noqa: BLE001 - flydsl may fail to import or JIT
-        logger.warning("[MLA] flydsl gather_kv_b_proj unavailable: %s", exc)
-        return None
-
-
 def _log_flydsl_gather_once(key: str, level: int, msg: str, *args) -> None:
-    if key in _flydsl_gather_logged:
-        return
-    _flydsl_gather_logged.add(key)
-    logger.log(level, msg, *args)
+    if key not in _flydsl_gather_logged:
+        _flydsl_gather_logged.add(key)
+        logger.log(level, msg, *args)
 
 
-# --------------------------------------------------------------------------
-# Optional flydsl fp8 backend for the prefill flash-attention sites
-# (ATOM_USE_FLYDSL_FP8_PREFILL_ATTN)
-# --------------------------------------------------------------------------
-# The wrapper packs the flattened q/k/v extent as an int32 for the C ABI.
-_FLYDSL_FMHA_MAX_FLAT_ELEMS = 2**31
-
-
-@lru_cache(maxsize=1)
-def _load_flydsl_fp8_fmha():
-    """Import the flydsl fp8 FMHA lazily: it drags in the flydsl compiler and
-    JIT-builds on first launch, which nothing should pay for while
-    ATOM_USE_FLYDSL_FP8_PREFILL_ATTN is off. Raises if this build lacks the
-    kernel -- the caller asked for it explicitly, so that is a config error."""
-    from aiter.ops.flydsl import flydsl_flash_attn_fp8_func
-
-    return flydsl_flash_attn_fp8_func
-
-
-@lru_cache(maxsize=1)
-def _load_fused_qkv_quant():
-    from atom.model_ops.triton_fused_qkv_quant import fused_qkv_per_tensor_quant
-
-    return fused_qkv_per_tensor_quant
-
-
-@lru_cache(maxsize=1)
+@cache
 def _is_gfx950() -> bool:
-    try:
-        return torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx950")
-    except Exception:  # noqa: BLE001 - no GPU, or a driver that will not answer
-        return False
+    return torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx950")
 
 
 # MLA Specific Arguments
@@ -623,24 +597,9 @@ def dynamic_per_batched_tensor_quant(
 
 
 _per_tensor_fp8_quant = get_hip_quant(QuantType.per_Tensor)
-# Row count to reshape into before the aiter per-tensor quant; see the U-curve
-# in `quant_fp8_per_tensor`. One workgroup per row, so this is the floor of the
-# curve: one workgroup per CU on gfx950. Measured device us, sweeping only this
-# value, at the shapes K3 prefill quantizes:
-#
-#     rows              64    128    256    512   1024   2048   4096
-#     [16384,16,192] 130.5   72.2   45.0   45.9   50.9   59.9   78.3
-#     [ 4096,16,192]  31.4   23.3   12.2   13.1   23.7   35.1   58.2
-#     [  512,16,192]   8.8    8.8    9.3   11.9   22.3   33.9   57.1
-#
-# Landing ON the target matters as much as the target itself, which is why
-# `_quant_rows` searches for the largest divisor instead of taking a `gcd`
-# against this value. A gcd only ever yields a common factor, so the row count
-# fell out of the token count: at the old target of 2048, a 1001-token chunk
-# (gcd 1024) quantized 2.6x FASTER than a 512-token one (gcd 2048) despite
-# being twice the size, and any odd token count collapses to gcd 64 -- which on
-# a full 16384-token chunk is 130 us against 45. Remainder chunks have
-# arbitrary token counts, so that is a live case, not a hypothetical.
+# HIP quantization launches one workgroup per row. Limit atomic-reduction
+# contention while keeping enough workgroups to fill gfx950; each reshaped
+# row must contain complete 16-element vectors.
 _QUANT_ROWS_TARGET = 256
 
 
@@ -663,61 +622,13 @@ def _quant_rows(m: int) -> int:
 
 
 def quant_fp8_per_tensor(x: torch.Tensor):
-    """Per-tensor dynamic fp8 quant on aiter's kernel, for the flydsl FMHA's q/k/v.
+    """Quantize FMHA activations with AITER HIP and return a shape-[1] descale.
 
-    Same contract as `dynamic_per_batched_tensor_quant` -- returns
-    ``(x_fp8, descale)`` with ``descale == amax / 448`` -- but three device
-    kernels (seed the scale, amax-reduce, quantize) instead of the six separate
-    full-tensor launches the torch expression above decomposes into. That
-    prologue, run three times per FMHA call, measured ~452 ms/rank on a K3 c1
-    prefill trace against the ~198 ms/rank the fp8 FMHA itself saves -- 2.3x the
-    entire win -- which is why the fp8 backend regressed TTFT +20% e2e.
-
-    THE FLATTEN IS NOT COSMETIC -- it is most of the speedup, and calling aiter
-    on the natural [tokens, heads, dim] shape is far SLOWER than the torch path
-    it replaces. `dynamic_per_tensor_quant` derives `rows = numel / size(-1)`
-    and launches one workgroup per row, each closing with an `atomicMaxFloat`
-    on a single global scalar, so cost is driven by row count, not bytes.
-    Measured on one [16384,16,192] bf16 tensor (50.3M elements), varying only
-    the view handed in:
-
-        rows 262,144 (the natural shape)   3050 us   <- 19x slower than torch
-        rows  16,384                        215 us
-        rows   3,072                         67 us
-        rows     768                         47 us
-        rows       1 (fully flat)          7,197 us   <- no parallelism left
-
-    A U-curve: too many rows serializes on the atomic, too few leaves the GPU
-    idle. Reshaping is free and exact -- per-tensor amax does not depend on
-    layout, and on a contiguous input the reshaped result is bit-identical
-    (verified, values and descale both) -- so this targets the flat of the
-    curve. The row count divides numel/16 so each row has a multiple of 16
-    elements: the HIP kernel uses vector loads/stores whose partial rows can
-    read adjacent storage and corrupt the scale (e.g. [5,16,192] at 1024x15).
-
-    Only for the FMHA's activations. The load-time weight quant keeps the torch
-    version: it runs once, gains nothing, and its consumers want the 0-dim
-    scalar that one returns rather than the shape-[1] tensor this does.
-
-    Behaviour differences from the torch path, each probed on device rather
-    than assumed, since two of the three hazards predicted from the source were
-    not real:
-      - NOT bit-identical. aiter reduces amax in fp32 where torch reduces in the
-        input's own dtype, and the quantize pass multiplies by an approximate
-        reciprocal (`__builtin_amdgcn_rcpf`) where torch divides. On bf16
-        [4096,16,192] the descales differ 0.2% and the worst element differs by
-        one fp8 ulp at the top bin.
-      - all-zero input is SAFE despite there being no equivalent of torch's
-        `clamp(min=1e-10)`: it returns descale 0.0 with every element saturated
-        to -448, so `y * descale` is exactly 0 -- self-consistent, not NaN.
-      - empty input is SAFE; it returns an empty result rather than faulting.
-      - non-contiguous input is CORRUPTING, silently: the descale is still
-        right (amax does not depend on layout) but the kernel reads the storage
-        linearly and writes contiguous, so the values come back permuted. Hence
-        the guard below. `.contiguous()` is a no-op on an already-contiguous
-        tensor, which is what every current caller passes.
-
-    `quant_dtype` is passed explicitly because aiter's default is int8.
+    The per-tensor amax is shape-independent. Reshape contiguous input into
+    at most 256 rows to reduce atomic contention, with 16-element-aligned rows
+    for the HIP vector loads. Strided inputs are materialized before dispatch;
+    partial vectors use the torch reference. Explicitly request FP8 because
+    AITER's default output dtype is int8.
     """
     if not x.is_contiguous():
         x = x.contiguous()
@@ -841,7 +752,10 @@ class MLAAttention(nn.Module):
         # Backend for the cached-prefix gather in `_kv_b_proj_gather`. Read once
         # here rather than per call: the gather runs once per full-attention
         # layer per prefill chunk.
-        self.use_flydsl_gather_kv_b_proj = bool(envs.ATOM_USE_FLYDSL_GATHER_KV_B_PROJ)
+        self.use_flydsl_gather_kv_b_proj = (
+            envs.ATOM_USE_FLYDSL_GATHER_KV_B_PROJ
+            and gather_kv_b_proj_flydsl is not None
+        )
         # Backend for the prefill flash-attention sites. `_fmha_d` is the head dim
         # flash-attention actually sees, which is NEITHER `self.head_dim`
         # (kv_lora_rank + qk_rope_head_dim, 576) NOR always `self.qk_head_dim`
@@ -868,6 +782,11 @@ class MLAAttention(nn.Module):
             and self.v_head_dim % 32 == 0
         )
         if envs.ATOM_USE_FLYDSL_FP8_PREFILL_ATTN:
+            if flydsl_flash_attn_fp8_func is None:
+                raise RuntimeError(
+                    "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN=1 requires an AITER build "
+                    "with flydsl_flash_attn_fp8_func"
+                )
             if not self.use_flydsl_fp8_prefill_attn:
                 raise RuntimeError(
                     "[MLA] ATOM_USE_FLYDSL_FP8_PREFILL_ATTN=1 but layer "
@@ -1197,36 +1116,23 @@ class MLAAttention(nn.Module):
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
         ) = None,
     ):
-        """Prefill flash-attention for every MLA site, over one of two backends.
+        """Dispatch MLA prefill to FP8 FlyDSL or AITER varlen attention.
 
-        Runs the flydsl gfx950 fp8 FMHA when the layer is eligible
-        (``ATOM_USE_FLYDSL_FP8_PREFILL_ATTN``), else ``flash_attn_varlen_func``.
-        That fallback is a dispatch, not one kernel: it screens a flydsl bf16
-        path (which our bf16/no-descale args always fail), then Triton if
-        ``ENABLE_CK=0``, then ``FlashAttnVarlenFunc``, which itself prefers the
-        gfx950 OPUS ``gqa_d192_v128`` bf16 varlen kernel -- on by default and
-        matching MLA's D=192/Dv=128 exactly -- over v3/CK. So on this box the
-        baseline is OPUS; ``AITER_DISABLE_FMHA_OPUS=1`` drops it to v3/CK.
+        FlyDSL uses bottom-right causal masking and returns natural-log FP32
+        LSE in [heads, total_q] layout. Unsupported per-call features use AITER
+        varlen attention, which selects BF16 OPUS on gfx950 for D=192/Dv=128.
+        Kernel failures propagate to the caller.
 
-        flydsl is semantically equivalent at these shapes: both are BOTTOM-RIGHT
-        causal (measured against explicit bottom-right and top-left torch
-        references that differ by max_abs 3.199 -- both land on bottom-right to
-        ~1e-3), and flydsl's LSE is the same [H, total_q] fp32 contiguous
-        NATURAL-log tensor the fallback returns, agreeing to 1.3e-3 abs. The
-        difference is fp8: q/k/v are quantized here to per-tensor e4m3, which
-        costs mean_abs ~5.5e-4 against an output rms of ~0.013. gsm8k over the
-        pair: 0.9636 both, 30 flips split 15/15.
-
-        ``q_fp8`` lets the chunk loop hand in an already-quantized
-        ``(q8, q_descale)`` so the amax reduction over Q runs once per layer-step
-        instead of once per chunk. ``kv_fp8`` supplies ``(k8, v8, k_descale,
-        v_descale)`` from the fused gather, skipping K/V quantization too. These
-        outputs may alias the BF16 workspaces; only their shapes remain usable.
+        ``q_fp8`` reuses ``(q8, q_descale)`` across cached chunks. ``kv_fp8``
+        supplies ``(k8, v8, k_descale, v_descale)`` from FP8 gather and skips
+        K/V quantization. These outputs can alias the BF16 workspaces, so a
+        call with ``kv_fp8`` must not fall back and read those BF16 views.
         """
         if self._flydsl_fmha_callable(q, k, v, dropout_p):
-            fn = _load_flydsl_fp8_fmha()
+            if flydsl_flash_attn_fp8_func is None:
+                raise RuntimeError("AITER flydsl_flash_attn_fp8_func is unavailable")
             if q_fp8 is None and kv_fp8 is None and envs.ATOM_USE_FUSED_MLA_QKV_QUANT:
-                q8, k8, v8, qs, ks, vs, _, _ = _load_fused_qkv_quant()(
+                q8, k8, v8, qs, ks, vs, _, _ = fused_qkv_per_tensor_quant(
                     q, k, v, q_scale_factor=self._fmha_scale_fixup
                 )
                 q_fp8 = (q8, qs)
@@ -1241,16 +1147,9 @@ class MLAAttention(nn.Module):
                 v8, v_descale = quant_fp8_per_tensor(v)
             else:
                 k8, v8, k_descale, v_descale = kv_fp8
-            # A varlen entry with seqlen_kv == 0 used to come back all NaN where
-            # aiter writes exact 0.0, and merge_attn_states then spread the NaN
-            # across the layer output. Empty per-seq chunks are the norm, not an
-            # edge case: the chunk-meta builder emits `max(seq_hi - seq_lo, 0)`
-            # per seq, so any multi-request batch with unequal cached lengths
-            # has them. Fixed in the kernel instead of repaired here -- an
-            # lse == -inf mask can only run when return_lse is set, so it left
-            # the causal sites unprotected. See the unconditional
-            # floor_masked_max in flash_attn_fp8_gfx950._merge_tile_max.
-            return fn(
+            # Empty per-sequence cached chunks require the FMHA kernel's
+            # masked-row handling: zero output and -inf LSE for the merge.
+            return flydsl_flash_attn_fp8_func(
                 q8,
                 k8,
                 v8,
@@ -1768,68 +1667,68 @@ class MLAAttention(nn.Module):
         weight_scale = getattr(self.kv_b_proj, "weight_scale", None)
         preshuffled = getattr(weight, "is_shuffled", False)
 
-        if self.use_flydsl_gather_kv_b_proj:
-            flydsl_gather_kv_b_proj = _load_flydsl_gather_kv_b_proj()
-            if flydsl_gather_kv_b_proj is None:
-                self.use_flydsl_gather_kv_b_proj = False
-            else:
-                fp8_outputs = kv_out_scales is not None and all(
+        if self.use_flydsl_gather_kv_b_proj and gather_kv_b_proj_flydsl is not None:
+            fp8_outputs = (
+                _FLYDSL_GATHER_FP8_AVAILABLE
+                and kv_out_scales is not None
+                and all(
                     t.dtype == torch.bfloat16 and t.is_contiguous()
                     for t in (k_out, v_out)
                 )
-                k_gather, v_gather = k_out, v_out
-                out_kwargs = {}
+            )
+            k_gather, v_gather = k_out, v_out
+            out_kwargs = {}
+            if fp8_outputs:
+                k_gather, v_gather = (
+                    t.view(torch.float8_e4m3fn).view(-1)[: t.numel()].view(t.shape)
+                    for t in (k_out, v_out)
+                )
+                out_kwargs = {
+                    "k_out_scale": kv_out_scales[0],
+                    "v_out_scale": kv_out_scales[1],
+                }
+            try:
+                gather_kv_b_proj_flydsl(
+                    kv_buffer,
+                    self._k_scale,
+                    kv_indptr,
+                    kv_indices,
+                    cu_seqlens_k,
+                    gather_weight,
+                    weight_scale,
+                    k_gather,
+                    v_gather,
+                    weight_preshuffle=preshuffled,
+                    **out_kwargs,
+                )
+            except ValueError as exc:
+                # fallback to triton path if rejected by flydsl
+                self.use_flydsl_gather_kv_b_proj = False
+                _log_flydsl_gather_once(
+                    "fallback",
+                    logging.WARNING,
+                    "[MLA] ATOM_USE_FLYDSL_GATHER_KV_B_PROJ=1 but the flydsl "
+                    "gather rejected this call (%s); falling back to Triton.",
+                    exc,
+                )
+            else:
+                _log_flydsl_gather_once(
+                    "used",
+                    logging.INFO,
+                    "[MLA] gather_kv_b_proj: using the flydsl backend "
+                    "(kv=%s weight=%s preshuffle=%s)",
+                    tuple(kv_buffer.shape),
+                    tuple(gather_weight.shape),
+                    preshuffled,
+                )
                 if fp8_outputs:
-                    k_gather, v_gather = (
-                        t.view(torch.float8_e4m3fn).view(-1)[: t.numel()].view(t.shape)
-                        for t in (k_out, v_out)
-                    )
-                    out_kwargs = {
-                        "k_out_scale": kv_out_scales[0],
-                        "v_out_scale": kv_out_scales[1],
-                    }
-                try:
-                    flydsl_gather_kv_b_proj(
-                        kv_buffer,
-                        self._k_scale,
-                        kv_indptr,
-                        kv_indices,
-                        cu_seqlens_k,
-                        gather_weight,
-                        weight_scale,
-                        k_gather,
-                        v_gather,
-                        weight_preshuffle=preshuffled,
-                        **out_kwargs,
-                    )
-                except ValueError as exc:
-                    # fallback to triton path if rejected by flydsl
-                    self.use_flydsl_gather_kv_b_proj = False
                     _log_flydsl_gather_once(
-                        "fallback",
-                        logging.WARNING,
-                        "[MLA] ATOM_USE_FLYDSL_GATHER_KV_B_PROJ=1 but the flydsl "
-                        "gather rejected this call (%s); falling back to Triton.",
-                        exc,
-                    )
-                else:
-                    _log_flydsl_gather_once(
-                        "used",
+                        "fp8_output",
                         logging.INFO,
-                        "[MLA] gather_kv_b_proj: using the flydsl backend "
-                        "(kv=%s weight=%s preshuffle=%s)",
-                        tuple(kv_buffer.shape),
-                        tuple(gather_weight.shape),
-                        preshuffled,
+                        "[MLA] gather_kv_b_proj: fused FP8 K/V output; cached-chunk quantization skipped",
                     )
-                    if fp8_outputs:
-                        _log_flydsl_gather_once(
-                            "fp8_output",
-                            logging.INFO,
-                            "[MLA] gather_kv_b_proj: fused FP8 K/V output; cached-chunk quantization skipped",
-                        )
-                        return k_gather, v_gather, *kv_out_scales
-                    return None
+                    return k_gather, v_gather, *kv_out_scales
+                return None
 
         gather_kv_b_proj(
             kv_buffer,
@@ -1915,9 +1814,10 @@ class MLAAttention(nn.Module):
         gather_fp8 = (
             self.use_flydsl_gather_kv_b_proj
             and envs.ATOM_USE_FLYDSL_GATHER_KV_B_PROJ_FP8
+            and _FLYDSL_GATHER_FP8_AVAILABLE
         )
         if fp8_eligible and envs.ATOM_USE_FUSED_MLA_QKV_QUANT:
-            q8, k8, v8, qs, ks, vs, gather_ks, gather_vs = _load_fused_qkv_quant()(
+            q8, k8, v8, qs, ks, vs, gather_ks, gather_vs = fused_qkv_per_tensor_quant(
                 prefill_q, k_new, v_new, q_scale_factor=self._fmha_scale_fixup
             )
             q_fp8 = (q8, qs)

@@ -51,7 +51,7 @@ def cpu_quantizer():
 
     with (
         mock.patch.object(mla, "quant_fp8_per_tensor", quant),
-        mock.patch.object(mla, "_load_fused_qkv_quant", lambda: fused),
+        mock.patch.object(mla, "fused_qkv_per_tensor_quant", fused),
     ):
         yield quant
 
@@ -222,7 +222,7 @@ def test_softmax_scale_is_never_passed_to_flydsl():
     layer = _layer(scale=_K3_SCALE)
     q, k, v = _qkv()
     fly = mock.Mock(return_value=torch.zeros(8, 4, 128))
-    with mock.patch.object(mla, "_load_flydsl_fp8_fmha", lambda: fly):
+    with mock.patch.object(mla, "flydsl_flash_attn_fp8_func", fly):
         layer._flash_attn_prefill(q, k, v, **_call_kwargs())
     fly.assert_called_once()
     assert "softmax_scale" not in fly.call_args.kwargs
@@ -237,7 +237,7 @@ def test_descales_are_one_dimensional():
     layer = _layer(scale=_K3_SCALE)
     q, k, v = _qkv()
     fly = mock.Mock(return_value=torch.zeros(8, 4, 128))
-    with mock.patch.object(mla, "_load_flydsl_fp8_fmha", lambda: fly):
+    with mock.patch.object(mla, "flydsl_flash_attn_fp8_func", fly):
         layer._flash_attn_prefill(q, k, v, **_call_kwargs())
     for name in ("q_descale", "k_descale", "v_descale"):
         got = fly.call_args.kwargs[name]
@@ -256,7 +256,7 @@ def test_kernel_exception_propagates():
     fly = mock.Mock(side_effect=RuntimeError("JIT boom"))
     ck = mock.Mock(return_value=torch.zeros(8, 4, 128))
     with (
-        mock.patch.object(mla, "_load_flydsl_fp8_fmha", lambda: fly),
+        mock.patch.object(mla, "flydsl_flash_attn_fp8_func", fly),
         mock.patch.object(mla, "flash_attn_varlen_func", ck),
         pytest.raises(RuntimeError, match="JIT boom"),
     ):
@@ -267,18 +267,15 @@ def test_kernel_exception_propagates():
 
 
 def test_missing_kernel_raises_rather_than_falling_back():
-    """`_load_flydsl_fp8_fmha` no longer returns None for an absent kernel."""
+    """An unavailable explicitly selected FMHA must not use BF16 silently."""
     layer = _layer(scale=_K3_SCALE)
     q, k, v = _qkv()
     ck = mock.Mock(return_value=torch.zeros(8, 4, 128))
 
-    def _boom():
-        raise ImportError("no flydsl_flash_attn_fp8_func in this build")
-
     with (
-        mock.patch.object(mla, "_load_flydsl_fp8_fmha", _boom),
+        mock.patch.object(mla, "flydsl_flash_attn_fp8_func", None),
         mock.patch.object(mla, "flash_attn_varlen_func", ck),
-        pytest.raises(ImportError),
+        pytest.raises(RuntimeError, match="unavailable"),
     ):
         layer._flash_attn_prefill(q, k, v, **_call_kwargs())
     assert ck.call_count == 0
@@ -326,7 +323,7 @@ def test_kernel_result_is_passed_through_untouched(return_lse):
     lse[:, 2:4] = float("-inf")  # the rows a zero-KV entry marks
 
     fly = mock.Mock(return_value=(out, lse) if return_lse else out)
-    with mock.patch.object(mla, "_load_flydsl_fp8_fmha", lambda: fly):
+    with mock.patch.object(mla, "flydsl_flash_attn_fp8_func", fly):
         got = layer._flash_attn_prefill(
             q, k, v, **_call_kwargs(causal=not return_lse, return_lse=return_lse)
         )
@@ -348,7 +345,7 @@ def test_supplied_q_fp8_skips_requantization(cpu_quantizer):
     fly = mock.Mock(return_value=torch.zeros(8, 4, 128))
     quant = mock.Mock(wraps=cpu_quantizer)
     with (
-        mock.patch.object(mla, "_load_flydsl_fp8_fmha", lambda: fly),
+        mock.patch.object(mla, "flydsl_flash_attn_fp8_func", fly),
         mock.patch.object(mla, "quant_fp8_per_tensor", quant),
     ):
         layer._flash_attn_prefill(q, k, v, **_call_kwargs(), q_fp8=q8)
@@ -378,7 +375,7 @@ def test_supplied_kv_fp8_skips_kv_quantization(cpu_quantizer):
     fly = mock.Mock(return_value=torch.empty(8, 4, 128))
     quant = mock.Mock(wraps=cpu_quantizer)
     with (
-        mock.patch.object(mla, "_load_flydsl_fp8_fmha", lambda: fly),
+        mock.patch.object(mla, "flydsl_flash_attn_fp8_func", fly),
         mock.patch.object(mla, "quant_fp8_per_tensor", quant),
     ):
         layer._flash_attn_prefill(q, k, v, kv_fp8=(k8, v8, ks, vs), **_call_kwargs())
@@ -401,13 +398,13 @@ def test_fused_qkv_dispatch_and_scale_fixup(enabled, cpu_quantizer, monkeypatch)
     monkeypatch.setenv("ATOM_USE_FUSED_MLA_QKV_QUANT", str(int(enabled)))
     layer = _layer(scale=1.7 * _K3_SCALE)
     q, k, v = _qkv()
-    fused = mock.Mock(wraps=mla._load_fused_qkv_quant())
+    fused = mock.Mock(wraps=mla.fused_qkv_per_tensor_quant)
     quant = mock.Mock(wraps=cpu_quantizer)
     fly = mock.Mock()
     with (
-        mock.patch.object(mla, "_load_fused_qkv_quant", lambda: fused),
+        mock.patch.object(mla, "fused_qkv_per_tensor_quant", fused),
         mock.patch.object(mla, "quant_fp8_per_tensor", quant),
-        mock.patch.object(mla, "_load_flydsl_fp8_fmha", lambda: fly),
+        mock.patch.object(mla, "flydsl_flash_attn_fp8_func", fly),
     ):
         layer._flash_attn_prefill(q, k, v, **_call_kwargs())
     assert fused.call_count == int(enabled)
@@ -424,9 +421,11 @@ def test_prequantized_qkv_bypasses_all_preparation(cpu_quantizer):
     v8, vs = cpu_quantizer(v)
     fly = mock.Mock()
     with (
-        mock.patch.object(mla, "_load_fused_qkv_quant", side_effect=AssertionError),
+        mock.patch.object(
+            mla, "fused_qkv_per_tensor_quant", side_effect=AssertionError
+        ),
         mock.patch.object(mla, "quant_fp8_per_tensor", side_effect=AssertionError),
-        mock.patch.object(mla, "_load_flydsl_fp8_fmha", lambda: fly),
+        mock.patch.object(mla, "flydsl_flash_attn_fp8_func", fly),
     ):
         layer._flash_attn_prefill(
             q, k, v, q_fp8=(q8, qs), kv_fp8=(k8, v8, ks, vs), **_call_kwargs()

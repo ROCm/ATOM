@@ -30,9 +30,10 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(autouse=True)
-def _reset_once_log():
+def _reset_once_log(monkeypatch):
     """The one-time log latch is module state; keep tests independent."""
     attention_mla._flydsl_gather_logged.clear()
+    monkeypatch.setattr(attention_mla, "_FLYDSL_GATHER_FP8_AVAILABLE", True)
     yield
     attention_mla._flydsl_gather_logged.clear()
 
@@ -45,7 +46,9 @@ def _fake_self(use_flydsl):
             weight_scale=torch.empty(3072, 1, dtype=torch.float32, device="meta"),
         ),
         _k_scale=torch.ones(1, device="meta"),
-        use_flydsl_gather_kv_b_proj=use_flydsl,
+        use_flydsl_gather_kv_b_proj=(
+            use_flydsl and attention_mla.gather_kv_b_proj_flydsl is not None
+        ),
     )
 
 
@@ -69,8 +72,8 @@ def _spies(monkeypatch):
 def test_flag_off_uses_triton(_spies, monkeypatch):
     monkeypatch.setattr(
         attention_mla,
-        "_load_flydsl_gather_kv_b_proj",
-        lambda: pytest.fail("flydsl must not even be imported while the flag is off"),
+        "gather_kv_b_proj_flydsl",
+        lambda *a, **k: pytest.fail("flydsl must not be called while the flag is off"),
     )
     _call(_fake_self(use_flydsl=False))
     assert _spies == ["triton"]
@@ -79,15 +82,15 @@ def test_flag_off_uses_triton(_spies, monkeypatch):
 def test_flag_on_uses_flydsl(_spies, monkeypatch):
     monkeypatch.setattr(
         attention_mla,
-        "_load_flydsl_gather_kv_b_proj",
-        lambda: (lambda *a, **k: _spies.append("flydsl")),
+        "gather_kv_b_proj_flydsl",
+        lambda *a, **k: _spies.append("flydsl"),
     )
     _call(_fake_self(use_flydsl=True))
     assert _spies == ["flydsl"]
 
 
 def test_unavailable_flydsl_falls_back_to_triton(_spies, monkeypatch):
-    monkeypatch.setattr(attention_mla, "_load_flydsl_gather_kv_b_proj", lambda: None)
+    monkeypatch.setattr(attention_mla, "gather_kv_b_proj_flydsl", None)
     obj = _fake_self(use_flydsl=True)
     _call(obj)
     assert _spies == ["triton"]
@@ -99,7 +102,7 @@ def test_rejected_shape_falls_back_and_stops_retrying(_spies, monkeypatch, caplo
         _spies.append("flydsl")
         raise ValueError("[FlyDSL gather_kv_b_proj] page_size 1 only")
 
-    monkeypatch.setattr(attention_mla, "_load_flydsl_gather_kv_b_proj", lambda: _reject)
+    monkeypatch.setattr(attention_mla, "gather_kv_b_proj_flydsl", _reject)
     obj = _fake_self(use_flydsl=True)
     with caplog.at_level("WARNING"):
         _call(obj)
@@ -117,7 +120,7 @@ def test_non_value_error_is_not_swallowed(_spies, monkeypatch):
     def _boom(*a, **k):
         raise RuntimeError("HIP error: illegal memory access")
 
-    monkeypatch.setattr(attention_mla, "_load_flydsl_gather_kv_b_proj", lambda: _boom)
+    monkeypatch.setattr(attention_mla, "gather_kv_b_proj_flydsl", _boom)
     with pytest.raises(RuntimeError, match="illegal memory access"):
         _call(_fake_self(use_flydsl=True))
     assert _spies == []
@@ -150,7 +153,7 @@ def test_fp8_output_alias_and_bf16_fallback(monkeypatch, reject):
         k.fill_(4)
         v.fill_(5)
 
-    monkeypatch.setattr(attention_mla, "_load_flydsl_gather_kv_b_proj", lambda: fly)
+    monkeypatch.setattr(attention_mla, "gather_kv_b_proj_flydsl", fly)
     monkeypatch.setattr(attention_mla, "gather_kv_b_proj", triton)
     unused = torch.empty(0, device="meta")
     result = MLAAttention._kv_b_proj_gather(
@@ -164,3 +167,31 @@ def test_fp8_output_alias_and_bf16_fallback(monkeypatch, reject):
         assert result[0] is seen[0] and result[1] is seen[1]
         assert result[2] is ks and result[3] is vs
         assert (result[0].float() == 2).all() and (result[1].float() == 3).all()
+
+
+def test_bf16_only_gather_retains_dynamic_quantization(monkeypatch):
+    monkeypatch.setattr(attention_mla, "_FLYDSL_GATHER_FP8_AVAILABLE", False)
+    obj = _fake_self(True)
+    k = torch.empty((17, 12, 192), dtype=torch.bfloat16)
+    v = torch.empty((17, 12, 128), dtype=torch.bfloat16)
+
+    def bf16_gather(*args, **kwargs):
+        assert args[7] is k and args[8] is v
+        assert "k_out_scale" not in kwargs and "v_out_scale" not in kwargs
+        k.fill_(4)
+        v.fill_(5)
+
+    monkeypatch.setattr(attention_mla, "gather_kv_b_proj_flydsl", bf16_gather)
+    unused = torch.empty(0, device="meta")
+    result = MLAAttention._kv_b_proj_gather(
+        obj,
+        unused,
+        unused,
+        unused,
+        unused,
+        k,
+        v,
+        kv_out_scales=(torch.ones(1), torch.ones(1)),
+    )
+    assert result is None  # Caller must quantize the BF16 outputs.
+    assert (k == 4).all() and (v == 5).all()
