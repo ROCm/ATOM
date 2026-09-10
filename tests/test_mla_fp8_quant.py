@@ -17,7 +17,10 @@ def test_quant_does_not_read_adjacent_storage(tokens, dim):
     x.fill_(1)
     quantized, scale = quant_fp8_per_tensor(x)
     torch.testing.assert_close(
-        scale, torch.full_like(scale, 1 / torch.finfo(quantized.dtype).max), rtol=1e-6, atol=0
+        scale,
+        torch.full_like(scale, 1 / torch.finfo(quantized.dtype).max),
+        rtol=1e-6,
+        atol=0,
     )
     torch.testing.assert_close(quantized.float() * scale, x.float(), rtol=1e-6, atol=0)
 
