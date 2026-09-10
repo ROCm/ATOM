@@ -78,9 +78,41 @@ class DSparkDraftModel(nn.Module):
     def forward_spec(
         self,
         input_ids: torch.Tensor,  # [B] verified anchor token per request
-        positions: torch.Tensor,  # [B*T] block absolute positions
+        positions: torch.Tensor,  # flavor-defined, see `block_backbone`
         num_draft: "int | None" = None,
     ):
         """One DSpark block: parallel backbone pass + sequential Markov
-        sampling. Returns ``(draft_token_ids [B, T], confidence | None)``."""
+        sampling. Returns ``(draft_token_ids [B, T], confidence | None)``.
+
+        Implement as the composition of the two halves below, so the whole
+        block and the captured block cannot drift apart."""
+        raise NotImplementedError
+
+    def block_backbone(
+        self,
+        input_ids: torch.Tensor,  # [B] verified anchor token per request
+        positions: torch.Tensor,  # flavor-defined, see below
+        num_draft: int,
+    ):
+        """The parallel half: embed the block, run the layers, norm.
+
+        Returns whatever this flavor's ``head_and_sample`` takes -- a hidden
+        tensor, a tuple of them, its own business. Nothing in between looks
+        inside: the proposer captures the backbone as a pass and the head as
+        its epilogue, and hands one's return straight to the other.
+
+        ``positions`` is the one argument the flavors disagree on: K3 takes the
+        block's absolute positions ``[B*T]``, because its caller built the paged
+        slot mapping from those exact numbers; V4 takes the anchor position
+        ``[B]`` and expands inside its compiled region.
+        ``DSparkProposer._block_positions`` is the only place that knows which.
+        """
+        raise NotImplementedError
+
+    def head_and_sample(self, out, anchor_ids: torch.Tensor, num_draft: int):
+        """The sequential half: LM head, then Markov sampling over the block.
+
+        ``out`` is what ``block_backbone`` returned; ``anchor_ids`` is the one
+        argument whose shape says how many requests there are.
+        """
         raise NotImplementedError

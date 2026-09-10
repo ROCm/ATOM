@@ -47,30 +47,26 @@ class DSparkProposer(Drafter):
             self._init_draft_block_buffers()
 
     def _declare_draft_graphs(self):
-        """The block pass.
+        """The block pass, in whichever flavor this drafter is.
 
-        ``block`` is the only pure pass either drafter has: it gathers the
-        rolling window and writes nothing back. The KV write is a separate call
-        (``compute_draft_kv``), which is exactly why the block can be padded
-        at all -- purity is a property of what a pass does, not of DSpark.
+        ``block`` is the only paddable pass either drafter has: the target
+        context it reads was absorbed by ``compute_draft_kv``, and the only KV
+        it writes is its own T draft rows, so a pad row is one whose every
+        effect can be aimed at nowhere -- what V4's ``mask_pad_tail`` and K3's
+        ``_build_paged_block_metadata`` each do with it.
 
-        That KV write is per-token, not per-sequence, and is NOT declared:
-        warming it needs a prefill-shaped synthetic forward context, which the
-        capture builder cannot produce. Declaring it with a stub forward would
-        create a pass that claims to be warmable and is not.
+        That target-KV write is NOT declared: warming it needs a prefill-shaped
+        synthetic context the capture builder cannot produce, and a stub forward
+        would claim a pass is warmable when it is not.
 
-        The separate-draft flavor declares nothing for the same reason: it drafts
-        through ``_propose_with_draft``, and the warmup/forward/epilogue below
-        reach for ``model.window_size`` and ``model.model.head_and_sample``,
-        which its checkpoint does not carry. Declining to pad is not enough --
-        warmup runs before that gate.
+        Both flavors declare the same two-part pass -- backbone, then LM head
+        plus Markov sampler, captured together -- with the same bindings. What
+        differs lives behind ``DSparkDraftModel``'s two halves, not here; the
+        one exception is which positions the backbone gets, and
+        ``_block_positions`` is the only place that knows.
 
-        No ``mtp_k`` floor, unlike eagle's: the block drafts its whole width in
-        ONE pass, so there is no step 1+ to be absent at ``mtp_k == 1``.
+        No ``mtp_k`` floor, unlike eagle's: the whole width drafts in ONE pass.
         """
-        self.block = None
-        if self._with_draft:
-            return ()
         self.block = DraftGraph(
             forward=self._block_backbone,
             epilogue=self._block_head,
@@ -84,18 +80,36 @@ class DSparkProposer(Drafter):
         return (self.block,)
 
     def _block_warmup_inputs(self, running_bs, *, anchor_positions, **_):
-        """A plausible warmup batch: anchors past the window, real ring slots.
+        """A plausible warmup batch, in whichever terms the context is addressed.
 
-        Anchors at position ``window`` leave every window slot valid, which is
-        what a steady-state decode draws. Warming at position 0 would mask all
-        but the last slot and compile a shape serving never asks for.
+        Both flavors want the anchor that leaves the whole block reachable and
+        reach it from opposite ends: on the rolling window position ``window``
+        leaves every slot valid, where 0 would mask all but the last; on the
+        paged pool block 0 is the only page a synthetic batch can be sure this
+        rank owns, so anchors sit at 0 to stay inside it.
+
+        The paged metadata build runs HERE, once per size, because everything
+        host-side about the batch must stay outside a recording. That makes the
+        recording a ``1 + T`` context replayed against thousand-token ones --
+        argued, and asserted, in `_init_block_persistent_buffers`.
         """
         fc = get_forward_context()
         assert not fc.context.is_dummy_run, (
-            "warmup needs a real forward context; a dummy one bakes the "
-            "all-zero rolling window and only shows up as lost acceptance"
+            "warmup needs a real forward context; a dummy one has neither a "
+            "populated rolling window nor any paged state"
         )
-        anchor_positions.fill_(int(self.model.window_size))
+        if not self._with_draft:
+            anchor_positions.fill_(int(self.model.window_size))
+            return
+        anchor_positions.zero_()
+        self._build_paged_block_metadata(
+            fc,
+            fc.attn_metadata,
+            anchor_positions,
+            scheduled_bs=running_bs,
+            # Anchors at 0, so every row's context is exactly the block.
+            max_seqlen_k=1 + self.draft_tokens_per_seq,
+        )
 
     def _block_head(self, out, running_bs, *, anchor_ids, **_):
         """The block's epilogue: LM head, then the sequential Markov sampler.
@@ -114,17 +128,32 @@ class DSparkProposer(Drafter):
         builder, and leaving it out of the warm is exactly how
         `hipModuleLoadData` went 0 -> 4 on the reproducer once.
         """
-        normed, hc_hidden = out
-        return self.model.model.head_and_sample(normed, hc_hidden, anchor_ids)
+        return self.model.head_and_sample(out, anchor_ids, self.draft_tokens_per_seq)
 
     def _block_backbone(self, running_bs, *, anchor_ids, anchor_positions):
         """The block's forward: the parallel backbone over the whole draft width.
 
-        Nothing of the target's metadata is installed. The ring slots the model
-        reads off the forward context are already this length: `prepare_decode`
-        publishes them at the padded batch, which is the batch this runs at.
+        Nothing of the target's metadata is installed. Whatever addressing the
+        model reads off the forward context is already this length, published
+        at the padded batch by `prepare_decode` or `_build_paged_block_metadata`.
         """
-        return self.model.model(anchor_ids, anchor_positions, self.draft_tokens_per_seq)
+        return self.model.block_backbone(
+            anchor_ids,
+            self._block_positions(running_bs, anchor_positions),
+            self.draft_tokens_per_seq,
+        )
+
+    def _block_positions(self, running_bs, anchor_positions):
+        """The ``positions`` this drafter's backbone takes; see
+        `DSparkDraftModel.block_backbone` for why the flavors disagree.
+
+        The paged flavor reads `_blk_positions` rather than the staged anchors
+        they derive from: the slot mapping was built from those exact numbers,
+        so the block's two descriptions of itself stay one tensor.
+        """
+        if not self._with_draft:
+            return anchor_positions
+        return self._blk_positions[:running_bs].view(-1)
 
     def _init_draft_block_buffers(self) -> None:
         """Preallocate the block-pass metadata the separate-draft path rebinds."""
@@ -145,6 +174,9 @@ class DSparkProposer(Drafter):
         self._blk_offsets = torch.arange(1, t + 1, **i64)
         self._blk_last_page_lens = torch.ones(max_bs, **i32)
         self._blk_kv_indptr = torch.zeros(max_bs + 1, **i32)
+        # Holds the pad tail's own first page ids while it borrows block 0 --
+        # see `_build_paged_block_metadata`.
+        self._blk_saved_page0 = torch.zeros(max_bs, **i32)
         # kv_indptr[-1] = sum(ctx_lens) = sum(anchor + 1 + T). An anchor can sit
         # at max_model_len - 1, so each request contributes up to
         # max_model_len + T entries -- pad by max_bs * T so the unchecked
@@ -167,6 +199,9 @@ class DSparkProposer(Drafter):
         place each step."""
         if self._blk_ps_bufs is not None:
             return self._blk_ps_bufs
+        from aiter.dist.parallel_state import get_dp_group
+
+        from atom.model_ops.attention_mla import should_use_persistent_mode
         from atom.model_ops.attentions.aiter_mla import (
             _MLA_META_SUPPORTS_MAX_SPLIT,
             _MLA_SPLIT_BUDGET_AUTO,
@@ -186,6 +221,37 @@ class DSparkProposer(Drafter):
             self._blk_padded_heads = impl.dcp_kernel_num_heads
         else:
             self._blk_padded_heads = impl.padded_num_heads
+        # These buffers ARE the block's answer to "how does a recording made on
+        # a 1 + T context stay right against a 100k one" (see
+        # `_block_warmup_inputs`): the capture bakes their addresses,
+        # `get_mla_metadata_v1` re-plans their contents every step from the real
+        # lengths, and their capacity below is a function of batch, block width
+        # and head count -- never of context length.
+        #
+        # The split-KV fallback has no such re-plan. It decides its split count
+        # HOST-side, from `kv_indices.shape[0]` and the fp8 min-block cap
+        # (aiter/mla.py `get_meta_param`, reached only when the work descriptors
+        # are None), and a capture freezes host decisions by value -- so a
+        # recording made at the warmup context would carry that context's split
+        # plan into every replay. Refuse the configuration rather than record
+        # against it: today it dies as a `KeyError` in that same cap
+        # (`get_block_n_fp8` has no key at this block's gqa x T), which says
+        # nothing about the reason. Read off the draft's own impl so the check
+        # describes the kernel that will actually run, as the head count above.
+        assert should_use_persistent_mode(
+            dp_size=get_dp_group().world_size,
+            dpa_persistent_supported=impl._dpa_persistent_supported,
+            page_size=envs.ATOM_MLA_PAGE_SIZE,
+            dcp_world_size=impl.dcp_world_size,
+            dcp_persistent_supported=impl.dcp_persistent_supported,
+        ), (
+            "the Kimi-K3 draft block records its MLA decode at a 1 + T context, "
+            "which only the persistent (ps=1) kernel makes safe; this "
+            "configuration resolves to the split-KV fallback "
+            f"(ATOM_MLA_PAGE_SIZE={envs.ATOM_MLA_PAGE_SIZE}, "
+            f"dcp_world_size={impl.dcp_world_size}, "
+            f"dcp_persistent_supported={impl.dcp_persistent_supported})"
+        )
         # max_split_per_batch only exists in newer aiter builds; feature-detect
         # it (as aiter_mla does) so old builds don't hit a TypeError. Cache the
         # kwargs so the sizing (info) and fill (get_mla_metadata_v1) calls agree.
@@ -287,9 +353,15 @@ class DSparkProposer(Drafter):
 
     @property
     def draft_tokens_per_seq(self) -> int:
-        """The whole block, in one pass -- capped at the rolling window so the
-        `[window ++ draft]` KV the block attends to stays bounded."""
-        return min(self.mtp_k, int(self.model.window_size))
+        """The whole block, in one pass -- capped at the rolling window, where
+        there is one, so the `[window ++ draft]` KV stays bounded.
+
+        The separate-draft flavor has no window to cap against: its context
+        lives in the paged pool addressed by absolute position, so what bounds
+        `[context ++ draft]` is the request's own length, not a ring.
+        """
+        window = getattr(self.model, "window_size", None)
+        return self.mtp_k if window is None else min(self.mtp_k, int(window))
 
     def _resolve_mtp_k(self) -> int:
         draft_cfg = self.speculative_config.draft_model_hf_config
@@ -308,6 +380,22 @@ class DSparkProposer(Drafter):
         # num_speculative_tokens may be unset when the config supplies the
         # width; default to the full block (a static verify length == block).
         return num_spec or self.dspark_block_size
+
+    def _bound_draft_k_cache(self, forward_context) -> "torch.Tensor | None":
+        """The draft's own paged K cache, or None while the pool is unallocated.
+
+        Whether there is paged state to describe is a property of the POOL, not
+        of ``is_dummy_run``. Two passes carry that flag and only one of them
+        lacks a pool: ``warmup_model()`` runs before ``allocate_kv_cache()``,
+        while ``dummy_execution()``'s DP-alignment step is a dummy whose pool is
+        fully bound. Gating on the flag would let the second one through
+        describing whatever the previous real step left behind.
+        """
+        layer_num = self.model.layers[0].self_attn.mla_attn.layer_num
+        cache_data = forward_context.kv_cache_data or {}
+        entry = cache_data.get(f"layer_{layer_num}")
+        bound = getattr(entry, "k_cache", None) if entry is not None else None
+        return None if bound is None or bound.numel() == 0 else bound
 
     def _resolve_dtype_q(self, forward_context) -> "tuple[torch.dtype, bool]":
         """q_out dtype for the draft's MLA decode, read from its bound cache.
@@ -330,11 +418,8 @@ class DSparkProposer(Drafter):
         # silently read that as float32 rather than the model dtype.
         from_config = dtypes.d_dtypes.get(self.config.kv_cache_dtype) or self.dtype
 
-        layer_num = self.model.layers[0].self_attn.mla_attn.layer_num
-        cache_data = forward_context.kv_cache_data or {}
-        entry = cache_data.get(f"layer_{layer_num}")
-        bound = getattr(entry, "k_cache", None) if entry is not None else None
-        if bound is None or bound.numel() == 0:
+        bound = self._bound_draft_k_cache(forward_context)
+        if bound is None:
             # warmup_model() runs before allocate_kv_cache(), so on that pass
             # there is no pool to read. Answer from the config and return None
             # for `final` so the caller does not cache a warmup-time guess.
@@ -507,7 +592,6 @@ class DSparkProposer(Drafter):
         context = forward_context.context
         attn_metadata = forward_context.attn_metadata
         context.is_draft = True
-        scheduled_bs = context.scheduled_bs
 
         # Drafter-owned aux: our own forward-hook capture buffers, row-aligned to
         # the target hidden states.
@@ -532,7 +616,6 @@ class DSparkProposer(Drafter):
             return self._propose_with_draft(
                 forward_context,
                 attn_metadata,
-                scheduled_bs,
                 anchor_ids,
                 anchor_positions,
             )
@@ -620,118 +703,197 @@ class DSparkProposer(Drafter):
 
     # ---- separate-draft-model path (Kimi-K3) --------------------------------
 
-    def _propose_with_draft(
+    def _build_paged_block_metadata(
         self,
         forward_context,
         attn_metadata,
+        anchor_positions: torch.Tensor,  # [running_bs], already padded
+        *,
         scheduled_bs: int,
-        anchor_ids: torch.Tensor,  # [scheduled_bs]
-        anchor_positions: torch.Tensor,  # [scheduled_bs]
-    ) -> torch.Tensor:
-        """Kimi-K3 DSpark: one non-causal block pass over the paged latent cache.
+        max_seqlen_k: int,
+    ) -> None:
+        """Retarget `attn_metadata` from the target's step to this draft block.
 
-        The target context is already in the draft's latent cache (absorbed by
-        `compute_draft_kv`); this only builds the draft block's own metadata
-        (addressed by slot mapping) and runs the block. Same shape as the V4
-        block pass -- T queries per request against a paged KV cache.
+        Runs OUTSIDE any recording, which is what lets the block be captured:
+        every host-side decision about this batch is made here, and only the
+        ADDRESS of each buffer filled here crosses into the graph -- all
+        preallocated at `max_num_seqs` and only ever sliced -- so a replay reads
+        this step's numbers out of the storage the capture saw.
+
+        How many rows are padding is the caller's to say; the total comes from
+        `anchor_positions`, which is the padded batch itself.
+
+        The `[scheduled_bs, running_bs)` tail is aimed at NOWHERE, but shaped
+        like a WARMUP ROW rather than like an absence -- block 0, a context of
+        exactly the block, slot -1 -- and both halves of that are load-bearing.
+
+        Slot -1 is the cache-store kernel's drop value. Unlike V4's, this block
+        WRITES the KV it attends, and `DraftGraph._stage_one` tail-repeats the
+        last real anchor, so a pad row addressing normally would scribble draft
+        KV into the pages of the request that anchor belongs to.
+
+        The non-empty CONTEXT is why this tail may NOT follow `prepare_decode`,
+        which zeroes both `context_lens` and `kv_last_page_lens`. A pad row
+        still carries T QUERY rows, and queries against zero PAGES is a shape
+        the split-KV stage1 asm kernel cannot run: it derives
+        `full_pages = page_count - (tail_len != 0)`, underflowing to a ~2^32
+        loop bound. `build_for_cudagraph_capture` answers that same arithmetic
+        the same way. The target survives zeroes only because its decode ALWAYS
+        replays a graph recorded on such a batch; a drafted block reaches the
+        kernel eagerly at any `running_bs` the startup sweep did not capture.
         """
-        T = self.mtp_k
+        T = self.draft_tokens_per_seq
         block_size = self.runner.block_size
-        # warmup_model() runs at the end of ModelRunner.__init__, BEFORE
-        # allocate_kv_cache(), so on a dummy run there is no paged state: the
-        # draft's kv_cache is still the empty init tensor and attn_metadata's
-        # slot_mapping / block_tables are unset. Everything that touches paged
-        # state is skipped below; the block forward still runs, because warmup
-        # doubles as the memory-profiling pass and omitting the draft would
-        # leave its activations out of the KV budget.
-        is_dummy = forward_context.context.is_dummy_run
+        running_bs = anchor_positions.shape[0]
 
-        # The DSpark draft block is bidirectional: every one of the T draft
-        # positions attends the whole block, so the MLA decode runs non-causal.
-        # The target rebuilds its own metadata (causal defaults True), so this
-        # never leaks back.
+        # The block is bidirectional -- every draft position attends the whole
+        # block -- so the MLA decode runs non-causal. The target rebuilds its
+        # own metadata (causal defaults True), so this never leaks back.
         attn_metadata.causal = False
 
-        block_positions = self._blk_positions[
-            :scheduled_bs
-        ]  # [scheduled_bs, T] view, stable
+        # Filled for the PADDED batch: the backbone runs the pad rows too, so
+        # they need positions to embed and rotate.
+        block_positions = self._blk_positions[:running_bs]
         torch.add(
-            anchor_positions.view(scheduled_bs, 1),
+            anchor_positions.view(running_bs, 1),
             self._blk_offsets.view(1, T),
             out=block_positions,
         )
 
-        if not is_dummy:
-            block_tables = self.runner.forward_vars["block_tables"].gpu[:scheduled_bs]
-            slots = self._blk_slots[: scheduled_bs * T].view(scheduled_bs, T)  # stable
-            # Each request's KV spans [0, anchor] (context) ++ the T block rows.
-            ctx_lens = self._blk_ctx_lens[:scheduled_bs]  # stable
-            global_lens = anchor_positions + (1 + T)
-            if self.dcp_world_size > 1:
-                # DCP shards KV token-wise round-robin, so one block table entry
-                # covers block_size*dcp_world_size GLOBAL tokens and rank r holds
-                # only the positions p with p % dcp_world_size == r, packed
-                # densely into its page. Rows this rank does not own are written
-                # to -1 (dropped).
-                virtual_block = block_size * self.dcp_world_size
-                page_idx = torch.div(
-                    block_positions, virtual_block, rounding_mode="floor"
+        # q_out dtype for the draft's MLA decode, ahead of the dummy return
+        # below because that pass needs it just as much: MLA allocates q_out
+        # with this and hands it plus the bound k_cache to the fused
+        # rope-concat-and-cache write, whose kernel derives the KV dtype from
+        # the tensor it was given and rejects a mismatched pair. Left unset, the
+        # pass inherits whatever the TARGET's metadata was carrying.
+        dtype_q = self._blk_dtype_q
+        if dtype_q is None:
+            dtype_q, final = self._resolve_dtype_q(forward_context)
+            if final:
+                self._blk_dtype_q = dtype_q
+        attn_metadata.dtype_q = dtype_q
+
+        if self._bound_draft_k_cache(forward_context) is None:
+            # warmup_model() runs before allocate_kv_cache(), so there is no
+            # paged state to describe. The block forward still runs on that
+            # pass -- it doubles as memory profiling, and omitting the draft
+            # would leave its activations out of the KV budget.
+            #
+            # Keyed on the POOL and not on `is_dummy_run`: a replay reads the
+            # buffers filled below at the addresses the capture saw, so a pass
+            # that returns here while the pool IS bound leaves the block
+            # writing its KV through the last real step's slots. See
+            # `_bound_draft_k_cache`.
+            return
+
+        block_tables = self.runner.forward_vars["block_tables"].gpu[:running_bs]
+        slots = self._blk_slots[: running_bs * T].view(running_bs, T)  # stable
+        # Each request's KV spans [0, anchor] (context) ++ the T block rows.
+        ctx_lens = self._blk_ctx_lens[:running_bs]  # stable
+        global_lens = anchor_positions + (1 + T)
+        if self.dcp_world_size > 1:
+            # DCP shards KV token-wise round-robin: one block table entry covers
+            # block_size*dcp_world_size GLOBAL tokens, and rank r holds the
+            # positions p with p % dcp_world_size == r, packed densely into its
+            # page. Rows this rank does not own go to -1 (dropped).
+            virtual_block = block_size * self.dcp_world_size
+            page_idx, in_table = self._block_page_idx(
+                block_positions, virtual_block, block_tables
+            )
+            local_off = torch.div(
+                torch.remainder(block_positions, virtual_block),
+                self.dcp_world_size,
+                rounding_mode="floor",
+            )
+            slots.copy_(
+                torch.where(
+                    in_table
+                    & (
+                        torch.remainder(block_positions, self.dcp_world_size)
+                        == self.dcp_rank
+                    ),
+                    torch.gather(block_tables, 1, page_idx) * block_size + local_off,
+                    -1,
                 )
-                local_off = torch.div(
-                    torch.remainder(block_positions, virtual_block),
+            )
+            # Of L global tokens this rank stores ceil((L - r) / dcp_world_size).
+            ctx_lens.copy_(
+                torch.div(
+                    global_lens + (self.dcp_world_size - 1 - self.dcp_rank),
                     self.dcp_world_size,
                     rounding_mode="floor",
                 )
-                slots.copy_(
-                    torch.where(
-                        torch.remainder(block_positions, self.dcp_world_size)
-                        == self.dcp_rank,
-                        torch.gather(block_tables, 1, page_idx) * block_size
-                        + local_off,
-                        -1,
-                    )
-                )
-                # Of L global tokens this rank stores ceil((L - r) / dcp_world_size).
-                ctx_lens.copy_(
-                    torch.div(
-                        global_lens + (self.dcp_world_size - 1 - self.dcp_rank),
-                        self.dcp_world_size,
-                        rounding_mode="floor",
-                    )
-                )
-            else:
-                # slot = page_id * block_size + offset_in_page, derived on-device
-                # from the block table so there is no host sync.
-                page_idx = torch.div(block_positions, block_size, rounding_mode="floor")
-                slots.copy_(torch.gather(block_tables, 1, page_idx))
-                slots.mul_(block_size)
-                slots.add_(torch.remainder(block_positions, block_size))
-                ctx_lens.copy_(global_lens)
-
-            attn_metadata.slot_mapping = slots.view(-1)
-            attn_metadata.block_tables = block_tables
-            attn_metadata.cu_seqlens_q = self._blk_cu_seqlens_q[: scheduled_bs + 1]
-            attn_metadata.context_lens = ctx_lens
-            attn_metadata.max_seqlen_q = T
-            # Upper bound rather than a .max() host sync: every context_len is
-            # at most the target pass's longest sequence plus the block.
-            attn_metadata.max_seqlen_k = int(attn_metadata.max_seqlen_k) + T
-            kv_indptr = self._blk_kv_indptr[: scheduled_bs + 1]
-            # kv_indptr[0] stays 0 (zero-init, never written). cumsum promotes
-            # integers to int64, so land it through copy_ rather than out=.
-            kv_indptr[1:].copy_(torch.cumsum(ctx_lens, dim=0))
-            # The generator walks block_tables row by row up to this bound, and
-            # under DCP those rows are LOCAL: one entry covers
-            # block_size*dcp_world_size global tokens. max_seqlen_k stays global
-            # (prepare_decode keeps it that way too), so handing it over unscaled
-            # would run the generator dcp_world_size times past each row's valid
-            # entries and emit slots from unmapped pages. Overestimating is fine
-            # -- kv_indptr caps the real per-seq count.
-            index_max_k = (
-                attn_metadata.max_seqlen_k // self.dcp_world_size + 1
-                if self.dcp_world_size > 1
-                else attn_metadata.max_seqlen_k
             )
+        else:
+            # slot = page_id * block_size + offset_in_page, derived on-device
+            # from the block table so there is no host sync.
+            page_idx, in_table = self._block_page_idx(
+                block_positions, block_size, block_tables
+            )
+            slots.copy_(torch.gather(block_tables, 1, page_idx))
+            slots.mul_(block_size)
+            slots.add_(torch.remainder(block_positions, block_size))
+            # Positions the table cannot address are dropped, not clamped --
+            # see `_block_page_idx`.
+            slots.masked_fill_(~in_table, -1)
+            ctx_lens.copy_(global_lens)
+
+        # `kv_indptr` is a cumsum of these, and it must not promise more
+        # indices than the generator writes: `kv_indices_generate_kernel` masks
+        # its store with `block_cols < n_cols` (block_convert.py), so entries
+        # past the block table's width are simply skipped and the decode would
+        # read whatever the previous step left in `_blk_kv_indices`. The bound
+        # is the same in either branch's units -- one entry holds `block_size`
+        # of THIS rank's tokens under DCP too, since a rank packs its
+        # round-robin share of a virtual block densely into one page.
+        ctx_lens.clamp_(max=block_tables.shape[1] * block_size)
+
+        if running_bs > scheduled_bs:
+            # See the docstring for why this tail reads a page rather than
+            # nothing. `_blk_last_page_lens` needs no tail of its own: it is
+            # all ones already, which is what one page holding one token means.
+            slots[scheduled_bs:].fill_(-1)
+            ctx_lens[scheduled_bs:].fill_(self._paged_pad_ctx_len)
+
+        attn_metadata.slot_mapping = slots.view(-1)
+        attn_metadata.block_tables = block_tables
+        attn_metadata.cu_seqlens_q = self._blk_cu_seqlens_q[: running_bs + 1]
+        attn_metadata.context_lens = ctx_lens
+        attn_metadata.max_seqlen_q = T
+        attn_metadata.max_seqlen_k = max_seqlen_k
+        kv_indptr = self._blk_kv_indptr[: running_bs + 1]
+        # kv_indptr[0] stays 0 (zero-init, never written). cumsum promotes
+        # integers to int64, so land it through copy_ rather than out=.
+        kv_indptr[1:].copy_(torch.cumsum(ctx_lens, dim=0))
+        # The generator walks block_tables up to this bound, and under DCP those
+        # rows are LOCAL while max_seqlen_k stays global, so handing it over
+        # unscaled would run dcp_world_size times past each row's valid entries
+        # and emit slots from unmapped pages. Overestimating is fine --
+        # kv_indptr caps the real per-seq count.
+        index_max_k = (
+            max_seqlen_k // self.dcp_world_size + 1
+            if self.dcp_world_size > 1
+            else max_seqlen_k
+        )
+        # The pad tail borrows block 0 for this one call, then gives its own
+        # page ids back. Only the FIRST column, and only it has to be: the
+        # generator stops at each row's `ctx_lens`, so a tail row whose context
+        # fits one page never reads a second (which `_paged_pad_ctx_len` ensures).
+        # These rows belong to the target, which never reads past
+        # `[:scheduled_bs]` -- but a row that is padding now may be real next
+        # step, and would come back blanked if overwritten outright.
+        # The give-back is a `finally` because the borrowed column is another
+        # component's live state: anything raising out of the generator (a
+        # first-seen grid failing to JIT, an allocation) would otherwise leave
+        # those target rows permanently pointing at page 0, and the request that
+        # lands on one next step would read page 0 as its own first page.
+        n_pad = running_bs - scheduled_bs
+        if n_pad:
+            borrowed = block_tables[scheduled_bs:, 0]
+            saved_page0 = self._blk_saved_page0[:n_pad]
+            saved_page0.copy_(borrowed)
+            borrowed.zero_()
+        try:
             kv_indices_generate_triton(
                 block_tables,
                 self._blk_kv_indices,
@@ -739,81 +901,160 @@ class DSparkProposer(Drafter):
                 block_size,
                 index_max_k,
             )
-            attn_metadata.kv_indptr = kv_indptr
-            attn_metadata.kv_indices = self._blk_kv_indices
-            attn_metadata.kv_last_page_lens = self._blk_last_page_lens[:scheduled_bs]
+        finally:
+            if n_pad:
+                block_tables[scheduled_bs:, 0].copy_(saved_page0)
+        attn_metadata.kv_indptr = kv_indptr
+        attn_metadata.kv_indices = self._blk_kv_indices
+        attn_metadata.kv_last_page_lens = self._blk_last_page_lens[:running_bs]
 
-            # Build persistent (ps=1) MLA-decode metadata
-            from atom.model_ops.attentions.aiter_mla import get_mla_metadata_v1
+        # Build persistent (ps=1) MLA-decode metadata
+        from atom.model_ops.attentions.aiter_mla import get_mla_metadata_v1
 
-            dtype_q, _ = self._resolve_dtype_q(forward_context)
-            dtype_kv = dtype_q
-            ps = self._init_block_persistent_buffers(dtype_q, dtype_kv)
-            get_mla_metadata_v1(
-                attn_metadata.cu_seqlens_q,  # seqlens_qo_indptr
-                kv_indptr,  # seqlens_kv_indptr
-                attn_metadata.kv_last_page_lens,  # kv_last_page_lens
-                self._blk_padded_heads,
-                1,  # nhead_kv
-                False,  # is_causal (non-causal block)
-                ps["work_meta_data"],
-                ps["work_info_set"],
-                ps["work_indptr"],
-                ps["reduce_indptr"],
-                ps["reduce_final_map"],
-                ps["reduce_partial_map"],
-                page_size=block_size,
-                kv_granularity=max(block_size, 16),
-                max_seqlen_qo=T,
-                uni_seqlen_qo=T,
-                fast_mode=True,
-                dtype_q=dtype_q,
-                dtype_kv=dtype_kv,
-                **self._blk_split_kwargs,
-            )
-            attn_metadata.work_meta_data = ps["work_meta_data"]
-            attn_metadata.work_indptr = ps["work_indptr"]
-            attn_metadata.work_info_set = ps["work_info_set"]
-            attn_metadata.reduce_indptr = ps["reduce_indptr"]
-            attn_metadata.reduce_final_map = ps["reduce_final_map"]
-            attn_metadata.reduce_partial_map = ps["reduce_partial_map"]
+        dtype_kv = dtype_q
+        ps = self._init_block_persistent_buffers(dtype_q, dtype_kv)
+        get_mla_metadata_v1(
+            attn_metadata.cu_seqlens_q,  # seqlens_qo_indptr
+            kv_indptr,  # seqlens_kv_indptr
+            attn_metadata.kv_last_page_lens,  # kv_last_page_lens
+            self._blk_padded_heads,
+            1,  # nhead_kv
+            False,  # is_causal (non-causal block)
+            ps["work_meta_data"],
+            ps["work_info_set"],
+            ps["work_indptr"],
+            ps["reduce_indptr"],
+            ps["reduce_final_map"],
+            ps["reduce_partial_map"],
+            page_size=block_size,
+            kv_granularity=max(block_size, 16),
+            max_seqlen_qo=T,
+            uni_seqlen_qo=T,
+            fast_mode=True,
+            dtype_q=dtype_q,
+            dtype_kv=dtype_kv,
+            **self._blk_split_kwargs,
+        )
+        attn_metadata.work_meta_data = ps["work_meta_data"]
+        attn_metadata.work_indptr = ps["work_indptr"]
+        attn_metadata.work_info_set = ps["work_info_set"]
+        attn_metadata.reduce_indptr = ps["reduce_indptr"]
+        attn_metadata.reduce_final_map = ps["reduce_final_map"]
+        attn_metadata.reduce_partial_map = ps["reduce_partial_map"]
+
+    @property
+    def _paged_pad_ctx_len(self) -> int:
+        """A pad row's KV length, in this rank's own units.
+
+        The block anchored at position 0 -- the row `_block_warmup_inputs`
+        builds, and so the row every recording was captured on. Under DCP the
+        rank holds its round-robin share of those `1 + T` tokens.
+
+        Both bounds are load-bearing: at least 1, because a zero-page row is
+        the shape this tail exists to avoid; at most one page, because that is
+        what lets the build borrow only the first column of the tail's block
+        table.
+        """
+        block = 1 + self.draft_tokens_per_seq
+        if self.dcp_world_size > 1:
+            block = (
+                block + self.dcp_world_size - 1 - self.dcp_rank
+            ) // self.dcp_world_size
+        return min(max(block, 1), self.runner.block_size)
+
+    @staticmethod
+    def _block_page_idx(
+        block_positions: torch.Tensor,
+        tokens_per_entry: int,
+        block_tables: torch.Tensor,
+    ) -> "tuple[torch.Tensor, torch.Tensor]":
+        """Block-table column per block position, and which columns exist.
+
+        The block drafts T positions PAST the anchor, so a request whose anchor
+        sits in its final page addresses a column the table does not have. The
+        index is clamped to keep the gather in bounds, but the clamp is not an
+        answer: it names the row's LAST column, which this request may never
+        have been given, and the slot derived from it keeps the original
+        position's in-page offset. Writing that would carry this block's KV
+        into whatever request owns the page that column points at.
+
+        So the mask is the real return value. Those rows want the same `-1` the
+        pad tail uses -- their draft tokens sit past the model length and cannot
+        survive verification anyway, so dropping them costs nothing.
+        """
+        page_idx = torch.div(block_positions, tokens_per_entry, rounding_mode="floor")
+        in_table = page_idx < block_tables.shape[1]
+        return page_idx.clamp_(max=block_tables.shape[1] - 1), in_table
+
+    def _propose_with_draft(
+        self,
+        forward_context,
+        attn_metadata,
+        anchor_ids: torch.Tensor,  # [scheduled_bs]
+        anchor_positions: torch.Tensor,  # [scheduled_bs]
+    ) -> torch.Tensor:
+        """Kimi-K3 DSpark: one non-causal block pass over the paged latent cache.
+
+        The target context is already in the draft's latent cache (absorbed by
+        `compute_draft_kv`); this builds the block's own metadata and runs it.
+        Same shape as the V4 block pass -- T queries per request against a paged
+        KV cache -- and now the same machinery: staged into fixed buffers,
+        widened to the agreed batch, and replayed where a recording exists.
+        """
+        T = self.draft_tokens_per_seq
+        context = forward_context.context
+        # The block is sized off anchor_ids. context.scheduled_bs counts only one
+        # half of a mixed prefill+decode step, so it is not that B.
+        scheduled_bs = anchor_ids.shape[0]
+        running_bs = context.running_bs
+        staged = self.block.stage(
+            running_bs,
+            {"anchor_ids": anchor_ids, "anchor_positions": anchor_positions},
+        )
+        # A DP-alignment dummy (`dummy_execution`) arrives with the pool bound
+        # but not one row that owns a page: its sequence is fabricated and its
+        # block table is [0]. It still has to run -- the peers mirror the
+        # collectives this pass carries -- so describe every row as PAD, which
+        # is the shape that already means "aimed at nowhere, writes nothing".
+        # `scheduled_bs` itself keeps counting the real rows: it is what the
+        # caller's ids are sliced back to.
+        described_bs = 0 if context.is_dummy_run else scheduled_bs
+        self._build_paged_block_metadata(
+            forward_context,
+            attn_metadata,
+            staged["anchor_positions"],
+            scheduled_bs=described_bs,
+            # Upper bound rather than a .max() host sync: every context_len is
+            # at most the target pass's longest sequence plus the block.
+            max_seqlen_k=int(attn_metadata.max_seqlen_k) + T,
+        )
 
         # `[bs, T]` against a paged KV cache however the target just ran. Left
         # True, every MLA layer takes its prefill branch, which reads
         # cu_seqlens_k / chunk_meta / _gather_cached_kv_b_proj -- none of which
-        # the retarget above touches, because none of them describe this batch.
+        # the retarget above describes. `pad_for_all_gather` reads it too, to
+        # pick which count to check its rows against, and left True it checks
+        # the scheduled one and asserts as soon as the batch is widened.
         # Not restored: the Context is rebuilt per forward, like `is_draft`.
-        forward_context.context.is_prefill = False
-        # The separate-draft path pads nothing, so both heights are
-        # `scheduled_bs * T` -- this rank's own request count, which the group
-        # can only discover. Nothing rules this path out under DP either:
-        # `--enable-dp-attention` folds TP into the DP size.
+        context.is_prefill = False
         self._publish_draft_shape(
             forward_context,
             scheduled_tokens=scheduled_bs * T,
-            running_tokens=scheduled_bs * T,
-            running_tokens_are_unified=False,
+            running_tokens=running_bs * T,
+            # `running_bs` is `decide`'s reduction and T is config, so every
+            # rank reaches this height on its own, none has to discover it.
+            running_tokens_are_unified=True,
         )
 
-        dtype_q = self._blk_dtype_q
-        if dtype_q is None:
-            dtype_q, final = self._resolve_dtype_q(forward_context)
-            if final:
-                self._blk_dtype_q = dtype_q
-        forward_context.attn_metadata.dtype_q = dtype_q
-
         # ---- 3. Block pass + Markov sampling ---------------------------------
-        with record_function(f"propose_dspark[bs={scheduled_bs} T={T}]"):
-            draft_token_ids, confidence = self.model.forward_spec(
-                anchor_ids,
-                block_positions.view(-1),
-                T,
-            )
+        label = self.block.label(scheduled_bs, running_bs)
+        with record_function(f"propose_dspark[{label} T={T}]"):
+            draft_token_ids, confidence = self.block.run(running_bs, **staged)
 
         if self.verify_scheduler is not None:
             self.verify_scheduler.set_last_ell(
-                self.verify_scheduler.compute_ell(confidence[:, :T])
+                self.verify_scheduler.compute_ell(confidence[:scheduled_bs, :T])
                 if confidence is not None
                 else None
             )
-        return draft_token_ids[:, :T]
+        return draft_token_ids[:scheduled_bs, :T]
