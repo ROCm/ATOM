@@ -13,8 +13,33 @@ name: ATOM Release Package
 # The build runs inside the ATOM release image so the wheel is built against
 # the exact torch/triton stack the image ships (the rust mesh build links
 # against torch's C API via pyo3, and libmesh.so is carried as package data).
+#
+# Versioning follows aiter's scheme so the two packages read alike:
+#
+#   v0.1.7          a release, roughly every two weeks
+#   v0.1.7.post1    a fix on top of one
+#   v0.1.8.dev0     a preview, published as a pre-release
+#
+# and the ROCm line the wheel was built against lands in the PEP 440 local
+# segment, the way torch spells it (2.11.0+rocm10.0.0):
+#
+#   atom-0.1.7+rocm10.0.0-cp312-cp312-linux_x86_64.whl
+#   atom-0.1.7+rocm7.2.4-cp312-cp312-linux_x86_64.whl
+#
+# Both hang off the single v0.1.7 tag: the flavor that runs first creates the
+# Release, the next one uploads into it. pip keeps them apart by filename, and
+# a plain `pip install atom==0.1.7` still resolves, because a local segment
+# never changes which release a version belongs to.
 
 on:
+  # Preview cadence, matched to aiter's release rhythm (a minor roughly every
+  # two weeks). These runs build and validate the wheel and keep it as a
+  # workflow artifact -- they deliberately do not tag or publish a Release, so
+  # the tag history stays a record of deliberate releases rather than a log of
+  # every scheduled build. Formal releases stay manual, as aiter's are.
+  schedule:
+    - cron: '17 4 1,15 * *'   # 1st and 15th, 04:17 UTC
+
   workflow_dispatch:
     inputs:
       commit:
@@ -79,27 +104,6 @@ jobs:
             echo "No ref override, building current commit: $(git rev-parse HEAD)"
           fi
 
-      - name: Generate version
-        id: version
-        run: |
-          set -ex
-          # setuptools_scm derives the version from git tags; the date stamp
-          # variant is for nightly-style builds off main.
-          if [ "${ADD_DATE_STAMP}" = "true" ]; then
-            DATE_STAMP=$(date +%Y%m%d)
-            BASE_VERSION=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo "0.1.0")
-            WHEEL_VERSION="${BASE_VERSION}+${DATE_STAMP}"
-            echo "wheel_version=${WHEEL_VERSION}" >> "$GITHUB_OUTPUT"
-            echo "Building version: ${WHEEL_VERSION}"
-          else
-            WHEEL_VERSION=$(python3 -c "
-            import subprocess
-            describe = subprocess.run(['git', 'describe', '--tags', '--dirty'], capture_output=True, text=True).stdout.strip()
-            print(describe.lstrip('v'))")
-            echo "wheel_version=${WHEEL_VERSION}" >> "$GITHUB_OUTPUT"
-            echo "Building version: ${WHEEL_VERSION}"
-          fi
-
       - name: Run the build container
         run: |
           set -ex
@@ -123,6 +127,77 @@ jobs:
             --name atom_build \
             "${BUILD_IMAGE}" \
             sleep infinity
+
+      - name: Generate version
+        id: version
+        run: |
+          set -ex
+          # Two names come out of this step and they are deliberately different:
+          #
+          #   wheel_version  the PEP 440 version baked into the wheel, carrying
+          #                  a +rocm<ver> local segment so the ROCm 7 and
+          #                  ROCm 10 builds of one commit are distinguishable
+          #                  files (torch does the same: 2.11.0+rocm10.0.0).
+          #   release_tag    the git tag / GitHub Release the wheel is attached
+          #                  to, with the local segment stripped. One tag holds
+          #                  every flavor built from that commit — the release
+          #                  step falls back to uploading into an existing
+          #                  release, so whichever flavor runs second just adds
+          #                  its asset.
+          #
+          # The ROCm version is read from the build container rather than
+          # guessed from the image name, which is why this step runs after the
+          # container is up.
+          ROCM_VER=$(docker exec atom_build bash -c 'cat /opt/rocm/.info/version 2>/dev/null' | tr -d '[:space:]')
+          if [ -z "${ROCM_VER}" ]; then
+            ROCM_VER=$(docker exec atom_build bash -c \
+              'python3 -c "import torch; print(torch.version.hip or \"\")" 2>/dev/null' | tr -d '[:space:]')
+          fi
+          if [ -z "${ROCM_VER}" ]; then
+            echo "ERROR: could not read a ROCm version from ${BUILD_IMAGE}; refusing to build an unlabelled wheel"
+            exit 1
+          fi
+          echo "Build image ROCm version: ${ROCM_VER}"
+
+          DATE_STAMP=""
+          if [ "${ADD_DATE_STAMP}" = "true" ]; then DATE_STAMP=$(date +%Y%m%d); fi
+
+          VERSIONS=$(ROCM_VER="${ROCM_VER}" DATE_STAMP="${DATE_STAMP}" python3 - <<'PYEOF'
+          import os, re, subprocess
+
+          describe = subprocess.run(
+              ["git", "describe", "--tags", "--long", "--dirty"],
+              capture_output=True, text=True).stdout.strip()
+          dirty = describe.endswith("-dirty")
+          if dirty:
+              describe = describe[: -len("-dirty")]
+          # "v0.1.6-rc0-418-g2462800c": the tag itself contains hyphens, so
+          # split from the right -- the last two fields are always <n>-g<sha>.
+          tag, distance, sha = describe.rsplit("-", 2)
+
+          # PEP 440 spells pre-releases without a separator (0.1.6rc0), while
+          # ATOM's tags use one (v0.1.6-rc0). Normalise so pip and setuptools
+          # agree on the ordering; aiter's .devN/.postN tags need no fixing.
+          base = re.sub(
+              r"[-_.]?(rc|c|alpha|a|beta|b|preview|pre)[-_.]?(\d+)",
+              lambda m: {"alpha": "a", "beta": "b", "c": "rc",
+                         "preview": "rc", "pre": "rc"}.get(m.group(1), m.group(1)) + m.group(2),
+              tag.lstrip("v"))
+
+          local = []
+          if int(distance) or dirty:
+              base = f"{base}.post{distance}"
+              local.append(sha)          # already g-prefixed by git describe
+          local.append("rocm" + os.environ["ROCM_VER"])
+          if os.environ.get("DATE_STAMP"):
+              local.append(os.environ["DATE_STAMP"])
+
+          print(f"wheel_version={base}+{'.'.join(local)}")
+          print(f"release_tag=v{base}")
+          PYEOF
+          )
+          echo "${VERSIONS}"
+          echo "${VERSIONS}" >> "$GITHUB_OUTPUT"
 
       - name: Build wheel
         env:
@@ -166,8 +241,10 @@ jobs:
           retention-days: 14
 
       - name: Create GitHub Release and upload wheel
+        if: ${{ github.event_name != 'schedule' }}
         env:
           WHEEL_VERSION: ${{ steps.version.outputs.wheel_version }}
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -ex
@@ -177,7 +254,7 @@ jobs:
           if [ "${{ github.event_name }}" = "push" ]; then
             TAG="${GITHUB_REF_NAME}"
           else
-            TAG="v${WHEEL_VERSION}"
+            TAG="${RELEASE_TAG}"
             if ! git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
               git tag "${TAG}" "$(git rev-parse HEAD)"
               git push origin "refs/tags/${TAG}"
