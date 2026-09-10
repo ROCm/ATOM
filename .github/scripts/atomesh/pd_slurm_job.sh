@@ -12,6 +12,8 @@ CURRENT_USER="$(id -un 2>/dev/null || id -u)"
 RUN_DIR="${LOG_ROOT}/slurm_job-${JOB_ID}"
 
 mkdir -p "${RUN_DIR}"
+# Shared NFS: every Spur rank writes rank-rc-* here for GHA accounting fallback.
+chmod 0777 "${RUN_DIR}" 2>/dev/null || true
 
 EXECUTION_PHASES=(combined)
 if [[ "${BENCHMARK_KIND:-random}" == "aiperf_agentic" \
@@ -32,6 +34,28 @@ execution_phase_port_offset() {
   else
     printf '0\n'
   fi
+}
+
+# Do not wait on D-state RDMA leftovers: kill/rm with a bound so the Slurm
+# task can exit instead of sitting in COMPLETING (same as RDMA smoke).
+bounded_docker_rm() {
+  local container="$1"
+  [[ -n "${container}" ]] || return 0
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 20 docker kill "${container}" >/dev/null 2>&1 || true
+    timeout 20 docker rm -f "${container}" >/dev/null 2>&1 || true
+  else
+    docker kill "${container}" >/dev/null 2>&1 || true
+    docker rm -f "${container}" >/dev/null 2>&1 || true
+  fi
+}
+
+publish_rank_rc() {
+  local rank="$1"
+  local rc="$2"
+  local rc_file="${RUN_DIR}/rank-rc-${rank}"
+  printf '%s\n' "${rc}" > "${rc_file}.tmp" 2>/dev/null || return 0
+  mv "${rc_file}.tmp" "${rc_file}" 2>/dev/null || true
 }
 
 write_env_file() {
@@ -147,7 +171,7 @@ EOF
     nccl_socket_ifname="eth1"
   fi
 
-  docker rm -f "${container}" >/dev/null 2>&1 || true
+  bounded_docker_rm "${container}"
   if [[ "${execution_phase}" != "eval" ]]; then
     docker pull "${DOCKER_IMAGE}"
   fi
@@ -159,7 +183,7 @@ EOF
   fi
 
   docker_args=(
-    run --rm --name "${container}"
+    run --name "${container}"
     --user "$(id -u):$(id -g)"
     --network host --ipc host
     --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband
@@ -256,7 +280,12 @@ EOF
     bash -lc "export PATH=/run_logs/slurm_job-${JOB_ID}/bin:\${PATH}; cd /workspace/ATOM && bash .github/scripts/atomesh/pd_server_atom.sh"
   )
 
+  local docker_rc
+  set +e
   docker "${docker_args[@]}" 2>&1 | tee "${rank_dir}/${container_log}"
+  docker_rc="${PIPESTATUS[0]}"
+  set -e
+  return "${docker_rc}"
 }
 
 run_spur_job() {
@@ -326,10 +355,12 @@ EOF
     fi
     SPUR_CLEANUP_DONE=1
     echo "=== cleanup rank=${SPUR_NODE_RANK_FOR_CLEANUP} rc=${rc} ==="
+    # Publish before cleanup: Spur accounting is unreliable, so the workflow
+    # falls back to these per-rank codes.
+    publish_rank_rc "${SPUR_NODE_RANK_FOR_CLEANUP}" "${rc}"
     for suffix in "" "-benchmark" "-eval"; do
-      docker rm -f \
-        "atomesh-${ATOMESH_CELL_ID}-${JOB_ID}-${SPUR_NODE_RANK_FOR_CLEANUP}${suffix}" \
-        >/dev/null 2>&1 || true
+      bounded_docker_rm \
+        "atomesh-${ATOMESH_CELL_ID}-${JOB_ID}-${SPUR_NODE_RANK_FOR_CLEANUP}${suffix}"
     done
     return "${rc}"
   }
@@ -449,12 +480,20 @@ cleanup() {
   fi
   CLEANUP_DONE=1
   echo "=== cleanup rc=${rc} ==="
+  printf '%s\n' "${rc}" > "${RUN_DIR}/slurm-job.rc.tmp" 2>/dev/null || true
+  mv "${RUN_DIR}/slurm-job.rc.tmp" "${RUN_DIR}/slurm-job.rc" 2>/dev/null || true
   for idx in "${!SELECTED_NODES[@]}"; do
     node="${SELECTED_NODES[$idx]}"
     for suffix in "" "-benchmark" "-eval"; do
       container="atomesh-${ATOMESH_CELL_ID}-${SLURM_JOB_ID}-${idx}${suffix}"
       srun --nodes=1 --ntasks=1 --nodelist="${node}" bash -lc "
-        docker rm -f '${container}' >/dev/null 2>&1 || true
+        if command -v timeout >/dev/null 2>&1; then
+          timeout 20 docker kill '${container}' >/dev/null 2>&1 || true
+          timeout 20 docker rm -f '${container}' >/dev/null 2>&1 || true
+        else
+          docker kill '${container}' >/dev/null 2>&1 || true
+          docker rm -f '${container}' >/dev/null 2>&1 || true
+        fi
       " || true
     done
   done
@@ -495,7 +534,13 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
       container="atomesh-'"${ATOMESH_CELL_ID}"'-'"${SLURM_JOB_ID}"'-${rank}${phase_suffix}"
       rank_dir="'"${RUN_DIR}"'/rank-${rank}"
       mkdir -p "${rank_dir}"
-      docker rm -f "${container}" >/dev/null 2>&1 || true
+      if command -v timeout >/dev/null 2>&1; then
+        timeout 20 docker kill "${container}" >/dev/null 2>&1 || true
+        timeout 20 docker rm -f "${container}" >/dev/null 2>&1 || true
+      else
+        docker kill "${container}" >/dev/null 2>&1 || true
+        docker rm -f "${container}" >/dev/null 2>&1 || true
+      fi
       if [[ "${execution_phase}" != "eval" ]]; then
         docker pull "'"${DOCKER_IMAGE}"'"
       fi
@@ -540,7 +585,8 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
           fi
         fi
       fi
-      docker run --rm --name "${container}" \
+      set +e
+      docker run --name "${container}" \
         --network host --ipc host --privileged \
         --device /dev/kfd --device /dev/dri --device /dev/infiniband \
         --group-add video --cap-add IPC_LOCK --cap-add NET_ADMIN \
@@ -568,6 +614,18 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
         "'"${DOCKER_IMAGE}"'" \
         bash -lc "cd /workspace/ATOM && bash .github/scripts/atomesh/pd_server_atom.sh" \
         2>&1 | tee "${rank_dir}/${container_log}"
+      docker_rc="${PIPESTATUS[0]}"
+      set -e
+      printf "%s\n" "${docker_rc}" > "'"${RUN_DIR}"'/rank-rc-${rank}.tmp" 2>/dev/null || true
+      mv "'"${RUN_DIR}"'/rank-rc-${rank}.tmp" "'"${RUN_DIR}"'/rank-rc-${rank}" 2>/dev/null || true
+      if command -v timeout >/dev/null 2>&1; then
+        timeout 20 docker kill "${container}" >/dev/null 2>&1 || true
+        timeout 20 docker rm -f "${container}" >/dev/null 2>&1 || true
+      else
+        docker kill "${container}" >/dev/null 2>&1 || true
+        docker rm -f "${container}" >/dev/null 2>&1 || true
+      fi
+      exit "${docker_rc}"
     '
 done
 unset ATOMESH_EXECUTION_PHASE ATOMESH_SERVICE_PORT_OFFSET

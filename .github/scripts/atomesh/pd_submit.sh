@@ -112,10 +112,6 @@ crusoe_runner_labels = {
     "atomesh-cicd-crusoe-mi355",
     "atomesh-cicd-mi355-crusoe",
 }
-if slurm_submit_runner in crusoe_runner_labels:
-    default_spur_accounting_addr = "http://crs-m2m-cpu-spur-005.crusoe.amd.com:6819"
-else:
-    default_spur_accounting_addr = "http://134.199.196.72:6819"
 if not spur_controller_addr:
     if slurm_submit_runner in crusoe_runner_labels:
         spur_controller_addr = "http://crs-m2m-cpu-spur-005.crusoe.amd.com:6817"
@@ -275,10 +271,6 @@ exports = {
     "SLURM_TIME_LIMIT": runner.get("time_limit", "06:00:00"),
     "SLURM_LOG_ROOT": runner.get("log_root", "/it-share/ATOMESH_LOG/"),
     "SPUR_CONTROLLER_ADDR": spur_controller_addr,
-    "SPUR_ACCOUNTING_ADDR": runner.get(
-        "spur_accounting_addr",
-        os.environ.get("SPUR_ACCOUNTING_ADDR", default_spur_accounting_addr),
-    ),
 }
 
 # server_args is mapped key by key above, so a key the mapping never read would
@@ -324,6 +316,8 @@ else
   export SLURM_ERROR="${LOG_ROOT}/slurm-%j.err"
 fi
 SLURM_LOG_POLL_INTERVAL="${SLURM_LOG_POLL_INTERVAL:-30}"
+SLURM_ACCOUNTING_TIMEOUT="${SLURM_ACCOUNTING_TIMEOUT:-30}"
+SLURM_ACCOUNTING_POLL_INTERVAL="${SLURM_ACCOUNTING_POLL_INTERVAL:-2}"
 USES_SPUR_CONTROLLER=0
 if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
   USES_SPUR_CONTROLLER=1
@@ -339,9 +333,6 @@ echo "slurm_job_name=${SLURM_JOB_NAME}"
 echo "log_root=${LOG_ROOT}"
 if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
   echo "spur_controller=${SPUR_CONTROLLER_ADDR}"
-fi
-if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
-  echo "spur_accounting=${SPUR_ACCOUNTING_ADDR}"
 fi
 
 mkdir -p "${RESULT_DIR}"
@@ -448,7 +439,7 @@ else
     SBATCH_CMD+=(--partition "${SLURM_PARTITION}")
   fi
   if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
-    SBATCH_CMD+=(-q amd-burst-qos --reservation=atomesh-ci)
+    SBATCH_CMD+=(--qos amd-aifw-dev-qos)
   fi
   SBATCH_CMD+=(
     --nodes "${NUM_NODES}"
@@ -491,7 +482,56 @@ write_slurm_cancel_helper "${JOB_ID}"
 
 set_slurm_job_log_paths "${JOB_ID}"
 monitor_slurm_job "${JOB_ID}"
+
+# Spur leaves the job in COMPLETING while RDMA leftovers are reaped, so give
+# sacct longer than the 30s default and fall back to per-rank / batch status.
+SLURM_ACCOUNTING_TIMEOUT="${SLURM_ACCOUNTING_TIMEOUT:-180}"
 read_slurm_exit_code "${JOB_ID}"
+SLURM_STATUS_DIR="${LOG_ROOT}/slurm_job-${JOB_ID}"
+SLURM_STATUS_FILE="${SLURM_STATUS_DIR}/slurm-job.rc"
+if [[ "${SLURM_STATE}" == "unknown" && -s "${SLURM_STATUS_FILE}" ]]; then
+  batch_rc="$(tr -d '[:space:]' < "${SLURM_STATUS_FILE}")"
+  if [[ "${batch_rc}" =~ ^[0-9]+$ ]]; then
+    SLURM_JOB_RC="${batch_rc}"
+    SLURM_EXIT_CODE="${batch_rc}:0"
+    if [[ "${batch_rc}" -eq 0 ]]; then
+      SLURM_STATE="COMPLETED"
+    else
+      SLURM_STATE="FAILED"
+    fi
+    echo "Using batch script exit status because Slurm accounting is unavailable."
+  else
+    echo "WARNING: invalid batch script exit status: ${batch_rc}" >&2
+  fi
+fi
+if [[ "${SLURM_STATE}" == "unknown" ]]; then
+  ranks_reported=0
+  worst_rank_rc=0
+  shopt -s nullglob
+  for rank_rc_file in "${SLURM_STATUS_DIR}"/rank-rc-*; do
+    [[ -s "${rank_rc_file}" ]] || continue
+    rank_rc="$(tr -d '[:space:]' < "${rank_rc_file}")"
+    [[ "${rank_rc}" =~ ^[0-9]+$ ]] || continue
+    ranks_reported=$((ranks_reported + 1))
+    echo "atomesh rank status: $(basename "${rank_rc_file}")=${rank_rc}"
+    if [[ "${rank_rc}" -gt "${worst_rank_rc}" ]]; then
+      worst_rank_rc="${rank_rc}"
+    fi
+  done
+  shopt -u nullglob
+  if [[ "${ranks_reported}" -ge "${NUM_NODES}" ]]; then
+    SLURM_JOB_RC="${worst_rank_rc}"
+    SLURM_EXIT_CODE="${worst_rank_rc}:0"
+    if [[ "${worst_rank_rc}" -eq 0 ]]; then
+      SLURM_STATE="COMPLETED"
+    else
+      SLURM_STATE="FAILED"
+    fi
+    echo "Using per-rank exit status because Slurm accounting is unavailable."
+  else
+    echo "WARNING: only ${ranks_reported}/${NUM_NODES} ATOMesh ranks reported an exit status" >&2
+  fi
+fi
 SLURM_JOB_ACTIVE=0
 SBATCH_RC="${SLURM_JOB_RC}"
 echo "slurm_state=${SLURM_STATE}"
