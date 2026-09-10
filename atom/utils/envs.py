@@ -48,10 +48,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # request on that immutable cache owner. Existing sessions never spill;
     # child correlation ids are independently load-placed rather than
     # inheriting their parent's owner.
-    "ATOM_DP_SESSION_AFFINITY": lambda: os.getenv(
-        "ATOM_DP_SESSION_AFFINITY", "0"
-    ).lower()
-    in {"1", "true", "yes", "on"},
+    "ATOM_DP_SESSION_AFFINITY": lambda: (
+        os.getenv("ATOM_DP_SESSION_AFFINITY", "0").lower() in {"1", "true", "yes", "on"}
+    ),
     # Prefix for process titles set via set_process_title (shown in ps/top/rocm-smi)
     "ATOM_PROCESS_NAME_PREFIX": lambda: os.getenv("ATOM_PROCESS_NAME_PREFIX", "ATOM"),
     # SGLang's GLM-5.2 and DeepSeek V4 prefill CP paths still force
@@ -76,15 +75,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_USE_TRITON_MLA_SHUFFLE_KV", "0") == "1"
     ),
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
-    "ATOM_USE_TRITON_MOE_DECODE": lambda: os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0")
-    == "1",
+    "ATOM_USE_TRITON_MOE_DECODE": lambda: (
+        os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0") == "1"
+    ),
     # Force DP-attention + EP through the collective fallback even when mori is
     # installed. This is useful for controlled A/B tests and for deployments
     # where the mori shared-memory transport is unavailable or undesirable.
     # The fallback gathers hidden/router rows across DP ranks, computes only
     # the locally owned experts, then reduce-scatters the outputs.
-    "ATOM_DISABLE_MORI_EP": lambda: os.getenv("ATOM_DISABLE_MORI_EP", "0").lower()
-    in {"1", "true", "yes", "on"},
+    "ATOM_DISABLE_MORI_EP": lambda: (
+        os.getenv("ATOM_DISABLE_MORI_EP", "0").lower() in {"1", "true", "yes", "on"}
+    ),
     # Use mori dispatch_combine_v2 (FlyDSL/cco, gfx1250 wave32) instead of the
     # production mori v1 (mori.ops.EpDispatchCombineOp) for the EP+DP MoE
     # all2all. v1 is authored for gfx942/950 and does not run on gfx1250; v2 is
@@ -115,6 +116,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the flydsl a8w8 gather-GEMM. Added 2026-09-09.
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ": lambda: (
         os.getenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "1") == "1"
+    ),
+    # Fuse cached-chunk K/V quantization into the FlyDSL gather epilogue when
+    # both FlyDSL gather and fp8 FMHA are enabled. Descales come from the new
+    # tokens, with 2x range headroom. Set 0 for the dynamic-quantization baseline.
+    "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ_FP8": lambda: (
+        os.getenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ_FP8", "1") == "1"
+    ),
+    # Batch Q/K/V dynamic quantization, strided loads and descale preparation
+    # into one or two launches before FlyDSL FP8 prefill attention.
+    "ATOM_USE_FUSED_MLA_QKV_QUANT": lambda: (
+        os.getenv("ATOM_USE_FUSED_MLA_QKV_QUANT", "1") == "1"
     ),
     # MLA prefill flash-attention: swap aiter's CK varlen kernel for the flydsl
     # gfx950 fp8 FMHA, quantizing q/k/v to per-tensor e4m3 at the call site. The
@@ -404,7 +416,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_UNIFIED_ATTN": lambda: os.getenv("ATOM_USE_UNIFIED_ATTN", "0") == "1",
     # Force Triton attention fallbacks where available. Set to 1 to bypass
     # optional ASM/OPUS fast paths during debugging.
-    "ATOM_FORCE_ATTN_TRITON": lambda: (os.getenv("ATOM_FORCE_ATTN_TRITON", "0") == "1"),
+    "ATOM_FORCE_ATTN_TRITON": lambda: os.getenv("ATOM_FORCE_ATTN_TRITON", "0") == "1",
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
@@ -434,8 +446,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # group so each rank reads [H, V/dp] instead of the full [H, V], exchanging
     # only the packed [N, 2]. Active only for a unified (rectangular) pure-DP
     # draft step; everything else falls back to the replicated local argmax.
-    "ATOM_DP_DRAFT_ARGMAX": lambda: os.getenv("ATOM_DP_DRAFT_ARGMAX", "1").lower()
-    in ("1", "true"),
+    "ATOM_DP_DRAFT_ARGMAX": lambda: (
+        os.getenv("ATOM_DP_DRAFT_ARGMAX", "1").lower() in ("1", "true")
+    ),
     # Row count (running_tokens) above which it falls back: the hidden gather
     # grows with rows, so the shard only pays at small M. ~256 is the V4-Pro
     # crossover.
@@ -462,13 +475,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt-in: MoE shared||routed fork inside a PIECEWISE-captured piece. Capture
     # holds it and GSM8K is unmoved; off until a throughput win is shown. Shared
     # dispatcher, so this moves V2/V3.2/K3 too. See docs.
-    "ATOM_DUAL_STREAM_PIECEWISE": lambda: os.getenv("ATOM_DUAL_STREAM_PIECEWISE", "0")
-    == "1",
+    "ATOM_DUAL_STREAM_PIECEWISE": lambda: (
+        os.getenv("ATOM_DUAL_STREAM_PIECEWISE", "0") == "1"
+    ),
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout.
     "ATOM_MOE_GU_ITLV": lambda: os.getenv("ATOM_MOE_GU_ITLV", "0") == "1",
     # --- MoE all2all (MoRI) wire format ---
-    "ATOM_MORI_FP4_DISPATCH": lambda: (os.getenv("ATOM_MORI_FP4_DISPATCH", "0") == "1"),
+    "ATOM_MORI_FP4_DISPATCH": lambda: os.getenv("ATOM_MORI_FP4_DISPATCH", "0") == "1",
     # Combine-side codec. "none" (the MoRI default) sends bf16 back;
     # "fp8_blockwise" selects EpCombineIntraNodeKernel_*_fp8bwq_*.
     "ATOM_MORI_COMBINE_QUANT": lambda: os.getenv("ATOM_MORI_COMBINE_QUANT", "none"),
@@ -480,9 +494,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Build atomesh when installing ATOM from source.
     "ATOM_MESH_BUILD": lambda: os.getenv("ATOM_MESH_BUILD", "0") == "1",
     # Route the OpenAI-compatible server entrypoint through Atomesh.
-    "USE_ATOMESH_ENTRYPOINTS": lambda: (
-        os.getenv("USE_ATOMESH_ENTRYPOINTS", "0") == "1"
-    ),
+    "USE_ATOMESH_ENTRYPOINTS": lambda: os.getenv("USE_ATOMESH_ENTRYPOINTS", "0") == "1",
     # --- Gradient Control ---
     # Enable gradient tracking on model parameters.  Default "0" (disabled)
     # is correct for inference; set to "1" only for training / fine-tuning.

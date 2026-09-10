@@ -3,6 +3,7 @@
 
 import logging
 from dataclasses import dataclass
+from functools import cache, lru_cache
 from functools import partial as functools_partial
 from typing import ClassVar, Protocol
 
@@ -517,6 +518,13 @@ def _load_flydsl_fp8_fmha():
 
 
 @lru_cache(maxsize=1)
+def _load_fused_qkv_quant():
+    from atom.model_ops.triton_fused_qkv_quant import fused_qkv_per_tensor_quant
+
+    return fused_qkv_per_tensor_quant
+
+
+@lru_cache(maxsize=1)
 def _is_gfx950() -> bool:
     try:
         return torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx950")
@@ -612,6 +620,121 @@ def dynamic_per_batched_tensor_quant(
     scale = DTYPE_MAX / amax
     x_scl_sat = (x * scale).clamp(min=-DTYPE_MAX, max=DTYPE_MAX)
     return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
+
+
+_per_tensor_fp8_quant = get_hip_quant(QuantType.per_Tensor)
+# Row count to reshape into before the aiter per-tensor quant; see the U-curve
+# in `quant_fp8_per_tensor`. One workgroup per row, so this is the floor of the
+# curve: one workgroup per CU on gfx950. Measured device us, sweeping only this
+# value, at the shapes K3 prefill quantizes:
+#
+#     rows              64    128    256    512   1024   2048   4096
+#     [16384,16,192] 130.5   72.2   45.0   45.9   50.9   59.9   78.3
+#     [ 4096,16,192]  31.4   23.3   12.2   13.1   23.7   35.1   58.2
+#     [  512,16,192]   8.8    8.8    9.3   11.9   22.3   33.9   57.1
+#
+# Landing ON the target matters as much as the target itself, which is why
+# `_quant_rows` searches for the largest divisor instead of taking a `gcd`
+# against this value. A gcd only ever yields a common factor, so the row count
+# fell out of the token count: at the old target of 2048, a 1001-token chunk
+# (gcd 1024) quantized 2.6x FASTER than a 512-token one (gcd 2048) despite
+# being twice the size, and any odd token count collapses to gcd 64 -- which on
+# a full 16384-token chunk is 130 us against 45. Remainder chunks have
+# arbitrary token counts, so that is a live case, not a hypothetical.
+_QUANT_ROWS_TARGET = 256
+
+
+@cache
+def _quant_rows(m: int) -> int:
+    """Largest divisor of ``m`` that is <= `_QUANT_ROWS_TARGET`.
+
+    Callers pass ``numel // 16``, so every row of the resulting view holds a
+    whole number of 16-element vectors.
+
+    The descending scan is up to 256 Python iterations, which would be a
+    meaningful fraction of a 45 us kernel if it ran per call -- hence the cache.
+    Distinct shapes are few (chunk sizes and prefill token counts), so this is
+    effectively a startup cost.
+    """
+    for rows in range(min(m, _QUANT_ROWS_TARGET), 0, -1):
+        if m % rows == 0:
+            return rows
+    return 1
+
+
+def quant_fp8_per_tensor(x: torch.Tensor):
+    """Per-tensor dynamic fp8 quant on aiter's kernel, for the flydsl FMHA's q/k/v.
+
+    Same contract as `dynamic_per_batched_tensor_quant` -- returns
+    ``(x_fp8, descale)`` with ``descale == amax / 448`` -- but three device
+    kernels (seed the scale, amax-reduce, quantize) instead of the six separate
+    full-tensor launches the torch expression above decomposes into. That
+    prologue, run three times per FMHA call, measured ~452 ms/rank on a K3 c1
+    prefill trace against the ~198 ms/rank the fp8 FMHA itself saves -- 2.3x the
+    entire win -- which is why the fp8 backend regressed TTFT +20% e2e.
+
+    THE FLATTEN IS NOT COSMETIC -- it is most of the speedup, and calling aiter
+    on the natural [tokens, heads, dim] shape is far SLOWER than the torch path
+    it replaces. `dynamic_per_tensor_quant` derives `rows = numel / size(-1)`
+    and launches one workgroup per row, each closing with an `atomicMaxFloat`
+    on a single global scalar, so cost is driven by row count, not bytes.
+    Measured on one [16384,16,192] bf16 tensor (50.3M elements), varying only
+    the view handed in:
+
+        rows 262,144 (the natural shape)   3050 us   <- 19x slower than torch
+        rows  16,384                        215 us
+        rows   3,072                         67 us
+        rows     768                         47 us
+        rows       1 (fully flat)          7,197 us   <- no parallelism left
+
+    A U-curve: too many rows serializes on the atomic, too few leaves the GPU
+    idle. Reshaping is free and exact -- per-tensor amax does not depend on
+    layout, and on a contiguous input the reshaped result is bit-identical
+    (verified, values and descale both) -- so this targets the flat of the
+    curve. The row count divides numel/16 so each row has a multiple of 16
+    elements: the HIP kernel uses vector loads/stores whose partial rows can
+    read adjacent storage and corrupt the scale (e.g. [5,16,192] at 1024x15).
+
+    Only for the FMHA's activations. The load-time weight quant keeps the torch
+    version: it runs once, gains nothing, and its consumers want the 0-dim
+    scalar that one returns rather than the shape-[1] tensor this does.
+
+    Behaviour differences from the torch path, each probed on device rather
+    than assumed, since two of the three hazards predicted from the source were
+    not real:
+      - NOT bit-identical. aiter reduces amax in fp32 where torch reduces in the
+        input's own dtype, and the quantize pass multiplies by an approximate
+        reciprocal (`__builtin_amdgcn_rcpf`) where torch divides. On bf16
+        [4096,16,192] the descales differ 0.2% and the worst element differs by
+        one fp8 ulp at the top bin.
+      - all-zero input is SAFE despite there being no equivalent of torch's
+        `clamp(min=1e-10)`: it returns descale 0.0 with every element saturated
+        to -448, so `y * descale` is exactly 0 -- self-consistent, not NaN.
+      - empty input is SAFE; it returns an empty result rather than faulting.
+      - non-contiguous input is CORRUPTING, silently: the descale is still
+        right (amax does not depend on layout) but the kernel reads the storage
+        linearly and writes contiguous, so the values come back permuted. Hence
+        the guard below. `.contiguous()` is a no-op on an already-contiguous
+        tensor, which is what every current caller passes.
+
+    `quant_dtype` is passed explicitly because aiter's default is int8.
+    """
+    if not x.is_contiguous():
+        x = x.contiguous()
+    n = x.numel()
+    if n == 0:
+        return torch.empty_like(x, dtype=dtypes.fp8), torch.ones(
+            1, device=x.device, dtype=torch.float32
+        )
+    if n % 16:
+        # FMHA's head dimensions are multiples of 16. Keep the helper safe
+        # for other callers without passing a partial vector to the HIP op.
+        x8, descale = dynamic_per_batched_tensor_quant(x)
+        return x8, descale.reshape(1)
+    # Preserve complete 16-element vectors in every reshaped row.
+    rows = _quant_rows(n // 16)
+    x8, descale = _per_tensor_fp8_quant(x.view(rows, n // rows), quant_dtype=dtypes.fp8)
+    return x8.view(x.shape), descale
 
 
 class MLAAttention(nn.Module):
@@ -1070,6 +1193,9 @@ class MLAAttention(nn.Module):
         causal: bool,
         return_lse: bool = False,
         q_fp8: tuple[torch.Tensor, torch.Tensor] | None = None,
+        kv_fp8: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None,
     ):
         """Prefill flash-attention for every MLA site, over one of two backends.
 
@@ -1093,19 +1219,28 @@ class MLAAttention(nn.Module):
 
         ``q_fp8`` lets the chunk loop hand in an already-quantized
         ``(q8, q_descale)`` so the amax reduction over Q runs once per layer-step
-        instead of once per chunk.
+        instead of once per chunk. ``kv_fp8`` supplies ``(k8, v8, k_descale,
+        v_descale)`` from the fused gather, skipping K/V quantization too. These
+        outputs may alias the BF16 workspaces; only their shapes remain usable.
         """
         if self._flydsl_fmha_callable(q, k, v, dropout_p):
             fn = _load_flydsl_fp8_fmha()
+            if q_fp8 is None and kv_fp8 is None and envs.ATOM_USE_FUSED_MLA_QKV_QUANT:
+                q8, k8, v8, qs, ks, vs, _, _ = _load_fused_qkv_quant()(
+                    q, k, v, q_scale_factor=self._fmha_scale_fixup
+                )
+                q_fp8 = (q8, qs)
+                kv_fp8 = (k8, v8, ks, vs)
             q8, q_descale = q_fp8 or self._quant_fmha_q(q)
-            k8, k_descale = dynamic_per_batched_tensor_quant(k)
-            v8, v_descale = dynamic_per_batched_tensor_quant(v)
             # flydsl wraps every tensor argument as a layout-dynamic memref,
-            # which needs an axis of stride 1; the 0-dim scalar
-            # `dynamic_per_batched_tensor_quant` returns has no axis at all and
-            # is rejected at trace time.
-            k_descale = k_descale.reshape(1)
-            v_descale = v_descale.reshape(1)
+            # which needs an axis of stride 1, so the descale must be shape [1];
+            # `quant_fp8_per_tensor` already returns it that way, where the torch
+            # quantizer returns a 0-dim scalar that is rejected at trace time.
+            if kv_fp8 is None:
+                k8, k_descale = quant_fp8_per_tensor(k)
+                v8, v_descale = quant_fp8_per_tensor(v)
+            else:
+                k8, v8, k_descale, v_descale = kv_fp8
             # A varlen entry with seqlen_kv == 0 used to come back all NaN where
             # aiter writes exact 0.0, and merge_attn_states then spread the NaN
             # across the layer output. Empty per-seq chunks are the norm, not an
@@ -1136,6 +1271,10 @@ class MLAAttention(nn.Module):
                 stream=None,
             )
 
+        if kv_fp8 is not None:
+            raise ValueError(
+                "prequantized K/V require an eligible FlyDSL FP8 FMHA call"
+            )
         return flash_attn_varlen_func(
             q=q,
             k=k,
@@ -1160,12 +1299,12 @@ class MLAAttention(nn.Module):
         the same constant. (Fold into q or k only; v_descale scales O and is
         deliberately excluded from the LSE.)
         """
-        q8, q_descale = dynamic_per_batched_tensor_quant(q)
+        # Already shape [1], as flydsl's layout-dynamic memref wrapper requires
+        # an axis with stride 1; the multiply below preserves that.
+        q8, q_descale = quant_fp8_per_tensor(q)
         if self._fmha_scale_fixup != 1.0:
             q_descale = q_descale * self._fmha_scale_fixup
-        # 1-D, not the 0-dim scalar the quantizer returns: flydsl's
-        # layout-dynamic memref wrapper requires an axis with stride 1.
-        return q8, q_descale.reshape(1)
+        return q8, q_descale
 
     def _restore_query_heads(
         self, output: torch.Tensor, num_heads: int | None = None
@@ -1569,7 +1708,8 @@ class MLAAttention(nn.Module):
         v_out: torch.Tensor,
         shuffle_kv_block_indptr: torch.Tensor | None = None,
         shuffle_kv_block_indices: torch.Tensor | None = None,
-    ) -> None:
+        kv_out_scales: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ):
         weight = self.kv_b_proj.weight
         if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
             # Shuffled KV: read the block_size-shuffled cache with block-granular
@@ -1590,8 +1730,14 @@ class MLAAttention(nn.Module):
                 shuffled_kv_cache=True,
             )
         else:
-            self._kv_b_proj_gather(
-                kv_cache, kv_indptr, kv_indices, cu_seqlens_k, k_out, v_out
+            return self._kv_b_proj_gather(
+                kv_cache,
+                kv_indptr,
+                kv_indices,
+                cu_seqlens_k,
+                k_out,
+                v_out,
+                kv_out_scales=kv_out_scales,
             )
 
     def _kv_b_proj_gather(
@@ -1602,7 +1748,8 @@ class MLAAttention(nn.Module):
         cu_seqlens_k: torch.Tensor,
         k_out: torch.Tensor,
         v_out: torch.Tensor,
-    ) -> None:
+        kv_out_scales: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ):
         """Gather compressed KV rows and decompress them into k/v, in one pass.
 
         One kernel for the whole chain: row gather, KV-cache dequant,
@@ -1610,6 +1757,11 @@ class MLAAttention(nn.Module):
         any ``[rows, block, kv_lora_rank + qk_rope_head_dim]`` compressed-KV
         tensor -- the paged cache for the non-DCP path, the AllGather block for
         DCP -- and ``kv_indices`` selects rows out of it.
+
+        With ``kv_out_scales`` the FlyDSL epilogue writes FP8 into the first
+        half of each contiguous BF16 workspace and returns the FP8 views and
+        descales. On refusal the fallback fills the original BF16 workspaces
+        and returns None, so the caller uses ordinary dynamic quantization.
         """
         weight = self.kv_b_proj.weight
         gather_weight = _maybe_view_mxfp4_weight_for_gather(self.kv_b_proj, weight)
@@ -1621,6 +1773,21 @@ class MLAAttention(nn.Module):
             if flydsl_gather_kv_b_proj is None:
                 self.use_flydsl_gather_kv_b_proj = False
             else:
+                fp8_outputs = kv_out_scales is not None and all(
+                    t.dtype == torch.bfloat16 and t.is_contiguous()
+                    for t in (k_out, v_out)
+                )
+                k_gather, v_gather = k_out, v_out
+                out_kwargs = {}
+                if fp8_outputs:
+                    k_gather, v_gather = (
+                        t.view(torch.float8_e4m3fn).view(-1)[: t.numel()].view(t.shape)
+                        for t in (k_out, v_out)
+                    )
+                    out_kwargs = {
+                        "k_out_scale": kv_out_scales[0],
+                        "v_out_scale": kv_out_scales[1],
+                    }
                 try:
                     flydsl_gather_kv_b_proj(
                         kv_buffer,
@@ -1630,9 +1797,10 @@ class MLAAttention(nn.Module):
                         cu_seqlens_k,
                         gather_weight,
                         weight_scale,
-                        k_out,
-                        v_out,
+                        k_gather,
+                        v_gather,
                         weight_preshuffle=preshuffled,
+                        **out_kwargs,
                     )
                 except ValueError as exc:
                     # fallback to triton path if rejected by flydsl
@@ -1654,7 +1822,14 @@ class MLAAttention(nn.Module):
                         tuple(gather_weight.shape),
                         preshuffled,
                     )
-                    return
+                    if fp8_outputs:
+                        _log_flydsl_gather_once(
+                            "fp8_output",
+                            logging.INFO,
+                            "[MLA] gather_kv_b_proj: fused FP8 K/V output; cached-chunk quantization skipped",
+                        )
+                        return k_gather, v_gather, *kv_out_scales
+                    return None
 
         gather_kv_b_proj(
             kv_buffer,
@@ -1731,13 +1906,41 @@ class MLAAttention(nn.Module):
         # Q is identical across step 1 and every step-2 chunk (`_drop_rope_pad` is
         # idempotent and the values never change), so quantize it once here
         # instead of running an amax reduction over it per chunk.
-        q_fp8 = (
-            self._quant_fmha_q(prefill_q)
-            if self._flydsl_fmha_callable(
-                prefill_q, k_new, v_new, attn_metadata.dropout_p
-            )
-            else None
+        fp8_eligible = self._flydsl_fmha_callable(
+            prefill_q, k_new, v_new, attn_metadata.dropout_p
         )
+        q_fp8 = None
+        new_kv_fp8 = None
+        kv_out_scales = None
+        gather_fp8 = (
+            self.use_flydsl_gather_kv_b_proj
+            and envs.ATOM_USE_FLYDSL_GATHER_KV_B_PROJ_FP8
+        )
+        if fp8_eligible and envs.ATOM_USE_FUSED_MLA_QKV_QUANT:
+            q8, k8, v8, qs, ks, vs, gather_ks, gather_vs = _load_fused_qkv_quant()(
+                prefill_q, k_new, v_new, q_scale_factor=self._fmha_scale_fixup
+            )
+            q_fp8 = (q8, qs)
+            new_kv_fp8 = (k8, v8, ks, vs)
+            if gather_fp8:
+                kv_out_scales = (gather_ks, gather_vs)
+            _log_flydsl_gather_once(
+                "fused_qkv_quant",
+                logging.INFO,
+                "[MLA] fused Q/K/V quantization and scale preparation enabled",
+            )
+        elif fp8_eligible:
+            q_fp8 = self._quant_fmha_q(prefill_q)
+        if q_fp8 is not None and new_kv_fp8 is None and gather_fp8:
+            k8, ks = quant_fp8_per_tensor(k_new)
+            v8, vs = quant_fp8_per_tensor(v_new)
+            new_kv_fp8 = (k8, v8, ks, vs)
+            # Reuse new-token calibration for the cached context. Doubling the
+            # range is an exponent shift, preserving E4M3 relative precision
+            # while giving old-token outliers headroom. This changes the scale
+            # policy from per-chunk amax; the kernel saturates larger outliers.
+            # A zero amax from the HIP quantizer must not produce a zero divisor.
+            kv_out_scales = (ks.clamp_min(1e-6) * 2, vs.clamp_min(1e-6) * 2)
         new_out, new_lse = self._flash_attn_prefill(
             prefill_q,
             k_new,
@@ -1751,6 +1954,7 @@ class MLAAttention(nn.Module):
             causal=True,
             return_lse=True,
             q_fp8=q_fp8,
+            kv_fp8=new_kv_fp8,
         )
 
         # Step 2: chunked cached-prefix attention.
@@ -1762,7 +1966,12 @@ class MLAAttention(nn.Module):
             # reorg -> kv_b_proj. The rest of the merge logic below
             # is identical to the non-DCP path.
             chunked_out, chunked_lse = self._dcp_compute_prefill_context(
-                prefill_q, kv_cache, attn_metadata, chunk_meta, q_fp8=q_fp8
+                prefill_q,
+                kv_cache,
+                attn_metadata,
+                chunk_meta,
+                q_fp8=q_fp8,
+                kv_out_scales=kv_out_scales,
             )
         else:
             k_workspace = chunk_meta.k_workspace
@@ -1773,13 +1982,21 @@ class MLAAttention(nn.Module):
                     continue
                 k_chunk = k_workspace[:n_tok]
                 v_chunk = v_workspace[:n_tok]
-                self._gather_cached_kv_b_proj(
+                chunk_scales = (
+                    kv_out_scales
+                    if self._flydsl_fmha_callable(
+                        prefill_q, k_chunk, v_chunk, attn_metadata.dropout_p
+                    )
+                    else None
+                )
+                kv_fp8 = self._gather_cached_kv_b_proj(
                     kv_cache,
                     chunk_meta.kv_indptr[c],
                     chunk_meta.kv_indices[c],
                     chunk_meta.cu_seqlens_k[c],
                     k_chunk,
                     v_chunk,
+                    kv_out_scales=chunk_scales,
                     shuffle_kv_block_indptr=(
                         chunk_meta.shuffle_kv_block_indptr[c]
                         if chunk_meta.shuffle_kv_block_indptr is not None
@@ -1809,6 +2026,7 @@ class MLAAttention(nn.Module):
                     causal=False,
                     return_lse=True,
                     q_fp8=q_fp8,
+                    kv_fp8=kv_fp8,
                 )
                 if chunked_out is None:
                     chunked_out = suf_out
@@ -1851,6 +2069,7 @@ class MLAAttention(nn.Module):
         attn_metadata: AttentionMetaData,
         chunk_meta,
         q_fp8: tuple[torch.Tensor, torch.Tensor] | None = None,
+        kv_out_scales: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         """DCP chunked cached-prefix context attention.
 
@@ -1897,13 +2116,21 @@ class MLAAttention(nn.Module):
             # 3. reorg + dequant + kv_b_proj + k_pe concat, fused. block_size 1
             #    on the AllGather buffer makes the row map a plain token index.
             k_chunk, v_chunk = self._dcp_context_kv_buffers(chunk_meta, sum_seq_len)
-            self._kv_b_proj_gather(
+            chunk_scales = (
+                kv_out_scales
+                if self._flydsl_fmha_callable(
+                    prefill_q, k_chunk, v_chunk, attn_metadata.dropout_p
+                )
+                else None
+            )
+            kv_fp8 = self._kv_b_proj_gather(
                 ag_kv.unsqueeze(1),
                 chunk_meta.cu_seqlens_k[c],
                 chunk_meta.ag_row_indices[c],
                 chunk_meta.cu_seqlens_k[c],
                 k_chunk,
                 v_chunk,
+                kv_out_scales=chunk_scales,
             )
 
             # 4. flash attention over the (unmasked) context chunk.
@@ -1929,6 +2156,7 @@ class MLAAttention(nn.Module):
                 causal=False,
                 return_lse=True,
                 q_fp8=q_fp8,
+                kv_fp8=kv_fp8,
             )
 
             # 5. LSE-merge across chunks.

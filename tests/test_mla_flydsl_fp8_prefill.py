@@ -3,9 +3,10 @@
 
 """Gate and dispatch logic for the flydsl fp8 prefill FMHA backend.
 
-CPU-only: the flydsl callable and the aiter fallback are both mocked, so what is
-under test is the eligibility predicate, the softmax-scale fold, the descale ABI,
-and the fallback state machine -- not kernel numerics.
+CPU-only: the flydsl callable, the aiter fallback and the aiter q/k/v quantizer
+are all mocked, so what is under test is the eligibility predicate, the
+softmax-scale fold, the descale ABI, and the fallback state machine -- not
+kernel numerics.
 """
 
 import math
@@ -16,6 +17,43 @@ import pytest
 import torch
 
 from atom.model_ops import attention_mla as mla
+
+
+@pytest.fixture(autouse=True)
+def cpu_quantizer():
+    """Stand a torch quantizer in for the aiter one, for every test in the file.
+
+    `quant_fp8_per_tensor` wraps an aiter HIP kernel. Handed a CPU tensor it
+    does not raise -- it ABORTS the process, taking the whole pytest session
+    down with it, so this cannot be left to an ImportError-style guard. The
+    stand-in keeps the only part of the contract these tests lean on:
+    ``(x_fp8, descale)`` with descale a shape-[1] tensor.
+    """
+
+    def quant(x):
+        x8, descale = mla.dynamic_per_batched_tensor_quant(x)
+        return x8, descale.reshape(1)
+
+    def fused(q, k, v, *, q_scale_factor=1.0):
+        q8, qs = quant(q)
+        k8, ks = quant(k)
+        v8, vs = quant(v)
+        return (
+            q8,
+            k8,
+            v8,
+            qs * q_scale_factor,
+            ks,
+            vs,
+            ks.clamp_min(1e-6) * 2,
+            vs.clamp_min(1e-6) * 2,
+        )
+
+    with (
+        mock.patch.object(mla, "quant_fp8_per_tensor", quant),
+        mock.patch.object(mla, "_load_fused_qkv_quant", lambda: fused),
+    ):
+        yield quant
 
 
 def _layer(
@@ -303,15 +341,15 @@ def test_kernel_result_is_passed_through_untouched(return_lse):
 # --------------------------------------------------------------------------
 
 
-def test_supplied_q_fp8_skips_requantization():
+def test_supplied_q_fp8_skips_requantization(cpu_quantizer):
     layer = _layer(scale=_K3_SCALE)
     q, k, v = _qkv()
     q8 = (q.to(torch.float8_e4m3fn), torch.tensor(0.25))
     fly = mock.Mock(return_value=torch.zeros(8, 4, 128))
-    quant = mock.Mock(wraps=mla.dynamic_per_batched_tensor_quant)
+    quant = mock.Mock(wraps=cpu_quantizer)
     with (
         mock.patch.object(mla, "_load_flydsl_fp8_fmha", lambda: fly),
-        mock.patch.object(mla, "dynamic_per_batched_tensor_quant", quant),
+        mock.patch.object(mla, "quant_fp8_per_tensor", quant),
     ):
         layer._flash_attn_prefill(q, k, v, **_call_kwargs(), q_fp8=q8)
     # K and V only -- Q came in pre-quantized.
@@ -330,3 +368,67 @@ def test_fixup_reproduces_the_layers_softmax_scale():
         _, plain = mla.dynamic_per_batched_tensor_quant(q)
         effective = math.sqrt(1.0 / layer._fmha_d) * (descale / plain).item()
         assert effective == pytest.approx(scale, rel=1e-6)
+
+
+def test_supplied_kv_fp8_skips_kv_quantization(cpu_quantizer):
+    layer = _layer(scale=_K3_SCALE)
+    q, k, v = _qkv()
+    k8, ks = cpu_quantizer(k)
+    v8, vs = cpu_quantizer(v)
+    fly = mock.Mock(return_value=torch.empty(8, 4, 128))
+    quant = mock.Mock(wraps=cpu_quantizer)
+    with (
+        mock.patch.object(mla, "_load_flydsl_fp8_fmha", lambda: fly),
+        mock.patch.object(mla, "quant_fp8_per_tensor", quant),
+    ):
+        layer._flash_attn_prefill(q, k, v, kv_fp8=(k8, v8, ks, vs), **_call_kwargs())
+    assert quant.call_count == 1  # Q only
+    assert fly.call_args.args[1] is k8
+    assert fly.call_args.args[2] is v8
+    assert fly.call_args.kwargs["k_descale"] is ks
+    assert fly.call_args.kwargs["v_descale"] is vs
+
+
+def test_prequantized_kv_cannot_fall_back_to_aliased_bf16():
+    layer = _layer(scale=_K3_SCALE, enabled=False)
+    q, k, v = _qkv()
+    with pytest.raises(ValueError, match="prequantized K/V require"):
+        layer._flash_attn_prefill(q, k, v, kv_fp8=(k, v, None, None), **_call_kwargs())
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_fused_qkv_dispatch_and_scale_fixup(enabled, cpu_quantizer, monkeypatch):
+    monkeypatch.setenv("ATOM_USE_FUSED_MLA_QKV_QUANT", str(int(enabled)))
+    layer = _layer(scale=1.7 * _K3_SCALE)
+    q, k, v = _qkv()
+    fused = mock.Mock(wraps=mla._load_fused_qkv_quant())
+    quant = mock.Mock(wraps=cpu_quantizer)
+    fly = mock.Mock()
+    with (
+        mock.patch.object(mla, "_load_fused_qkv_quant", lambda: fused),
+        mock.patch.object(mla, "quant_fp8_per_tensor", quant),
+        mock.patch.object(mla, "_load_flydsl_fp8_fmha", lambda: fly),
+    ):
+        layer._flash_attn_prefill(q, k, v, **_call_kwargs())
+    assert fused.call_count == int(enabled)
+    assert quant.call_count == (0 if enabled else 3)
+    _, qs = cpu_quantizer(q)
+    torch.testing.assert_close(fly.call_args.kwargs["q_descale"], qs * 1.7)
+
+
+def test_prequantized_qkv_bypasses_all_preparation(cpu_quantizer):
+    layer = _layer(scale=_K3_SCALE)
+    q, k, v = _qkv()
+    q8, qs = cpu_quantizer(q)
+    k8, ks = cpu_quantizer(k)
+    v8, vs = cpu_quantizer(v)
+    fly = mock.Mock()
+    with (
+        mock.patch.object(mla, "_load_fused_qkv_quant", side_effect=AssertionError),
+        mock.patch.object(mla, "quant_fp8_per_tensor", side_effect=AssertionError),
+        mock.patch.object(mla, "_load_flydsl_fp8_fmha", lambda: fly),
+    ):
+        layer._flash_attn_prefill(
+            q, k, v, q_fp8=(q8, qs), kv_fp8=(k8, v8, ks, vs), **_call_kwargs()
+        )
+    assert fly.call_args.args == (q8, k8, v8)

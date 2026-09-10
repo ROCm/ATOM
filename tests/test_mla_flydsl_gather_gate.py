@@ -121,3 +121,46 @@ def test_non_value_error_is_not_swallowed(_spies, monkeypatch):
     with pytest.raises(RuntimeError, match="illegal memory access"):
         _call(_fake_self(use_flydsl=True))
     assert _spies == []
+
+
+@pytest.mark.parametrize("reject", [False, True])
+def test_fp8_output_alias_and_bf16_fallback(monkeypatch, reject):
+    obj = _fake_self(True)
+    k = torch.full((17, 12, 192), 9, dtype=torch.bfloat16)
+    v = torch.full((17, 12, 128), 9, dtype=torch.bfloat16)
+    ks, vs = torch.tensor([0.25]), torch.tensor([0.5])
+    seen = []
+
+    def fly(*args, **kwargs):
+        ko, vo = args[7:9]
+        assert ko.dtype == vo.dtype == torch.float8_e4m3fn
+        assert ko.data_ptr() == k.data_ptr()
+        assert vo.data_ptr() == v.data_ptr()
+        assert ko.is_contiguous() and vo.is_contiguous()
+        assert kwargs["k_out_scale"] is ks
+        assert kwargs["v_out_scale"] is vs
+        if reject:
+            raise ValueError("unsupported shape")
+        ko.fill_(2)
+        vo.fill_(3)
+        seen.extend([ko, vo])
+
+    def triton(*args, **kwargs):
+        assert args[7] is k and args[8] is v
+        k.fill_(4)
+        v.fill_(5)
+
+    monkeypatch.setattr(attention_mla, "_load_flydsl_gather_kv_b_proj", lambda: fly)
+    monkeypatch.setattr(attention_mla, "gather_kv_b_proj", triton)
+    unused = torch.empty(0, device="meta")
+    result = MLAAttention._kv_b_proj_gather(
+        obj, unused, unused, unused, unused, k, v, kv_out_scales=(ks, vs)
+    )
+    if reject:
+        assert result is None
+        assert (k == 4).all() and (v == 5).all()
+        assert not obj.use_flydsl_gather_kv_b_proj
+    else:
+        assert result[0] is seen[0] and result[1] is seen[1]
+        assert result[2] is ks and result[3] is vs
+        assert (result[0].float() == 2).all() and (result[1].float() == 3).all()
