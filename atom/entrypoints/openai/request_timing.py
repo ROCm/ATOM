@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import re
 import time
 from collections.abc import Callable
 from contextvars import ContextVar
@@ -17,7 +15,8 @@ def _has_text(fields: Any, keys: tuple[str, ...]) -> bool:
     )
 
 
-def _has_generated_output(payload: Any) -> bool:
+def has_generated_output(payload: Any) -> bool:
+    """Recognize text, reasoning or tool output in an API generation event."""
     if not isinstance(payload, dict) or "error" in payload:
         return False
     choices = payload.get("choices")
@@ -49,93 +48,12 @@ def _has_generated_output(payload: Any) -> bool:
     return False
 
 
-class SSEFrames:
-    """Incrementally frame SSE bytes with amortized linear scanning and copying."""
-
-    _ENDING = re.compile(rb"\n\n|\r\n\r\n")
-
-    def __init__(self, max_frame_bytes: int):
-        self.pending = bytearray()
-        self._start = 0
-        self._search = 0
-        self._limit = max_frame_bytes
-        self.oversized = False
-
-    def append(self, chunk: bytes) -> None:
-        # Compact only after consuming at least half the buffer. Each copied
-        # byte can be charged to consumed bytes, even with a large partial frame.
-        if self._start and self._start >= len(self.pending) // 2:
-            del self.pending[: self._start]
-            self._search -= self._start
-            self._start = 0
-        self.pending.extend(chunk)
-
-    def next_frame(self) -> bytes | None:
-        ending = self._ENDING.search(self.pending, self._search)
-        if ending is None:
-            self._search = max(self._start, len(self.pending) - 3)
-            self.oversized = len(self.pending) - self._start > self._limit
-            return None
-        if ending.start() - self._start > self._limit:
-            self.oversized = True
-            return None
-        frame = bytes(self.pending[self._start : ending.start()])
-        self._start = self._search = ending.end()
-        return frame
-
-    def clear(self) -> None:
-        self.pending.clear()
-        self._start = self._search = 0
-
-
-class FirstOutputSSE:
-    """Inspect SSE until the first generation event, without altering the stream."""
-
-    MAX_PENDING_BYTES = 1024 * 1024
-
-    def __init__(self):
-        self._frames = SSEFrames(self.MAX_PENDING_BYTES)
-        self.done = False
-
-    def _finish(self) -> None:
-        self.done = True
-        self._frames.clear()
-
-    def feed(self, chunk: bytes) -> bool:
-        if self.done:
-            return False
-        self._frames.append(chunk)
-        while (frame := self._frames.next_frame()) is not None:
-            data = b"\n".join(
-                line[5:].lstrip(b" ")
-                for line in frame.splitlines()
-                if line.startswith(b"data:")
-            )
-            if data == b"[DONE]":
-                self._finish()
-                return False
-            try:
-                payload = json.loads(data)
-            except (ValueError, UnicodeDecodeError):
-                continue
-            if isinstance(payload, dict) and (
-                "error" in payload or payload.get("type") == "error"
-            ):
-                self._finish()
-                return False
-            if _has_generated_output(payload):
-                self._finish()
-                return True
-        if self._frames.oversized:
-            self._finish()
-        return False
-
-
 @dataclass
 class RequestTiming:
     started_at: float
     observe: Callable[[float, bool], None]
     recorded: bool = False
+    streaming_response: bool = False
 
     def first_output(self, *, streaming: bool) -> None:
         if not self.recorded:
@@ -148,6 +66,14 @@ _request_timing: ContextVar[RequestTiming | None] = ContextVar(
 )
 
 
+def get_stream_timing() -> RequestTiming | None:
+    """Return timing for a successful SSE response, after response headers."""
+    timing = _request_timing.get()
+    if timing is not None and timing.streaming_response and not timing.recorded:
+        return timing
+    return None
+
+
 def record_nonstream_first_token() -> None:
     """Record an internal token arrival; a buffered response has no SSE event."""
     timing = _request_timing.get()
@@ -156,7 +82,11 @@ def record_nonstream_first_token() -> None:
 
 
 class RequestTimingMiddleware:
-    """Start before preprocessing; keep timing isolated across concurrent requests."""
+    """Start before preprocessing and mark successful SSE responses.
+
+    The client stream wrapper observes generated output; this middleware only
+    owns request lifetime and response eligibility, without inspecting bodies.
+    """
 
     def __init__(self, app, observe_ttft: Callable[[float, bool], None]):
         self.app = app
@@ -174,23 +104,14 @@ class RequestTimingMiddleware:
 
         timing = RequestTiming(time.perf_counter(), self.observe_ttft)
         context_token = _request_timing.set(timing)
-        detector = FirstOutputSSE()
-        streaming = False
 
         async def timed_send(message):
-            nonlocal streaming
             if message["type"] == "http.response.start":
                 headers = dict(message.get("headers", []))
-                streaming = 200 <= message["status"] < 300 and headers.get(
-                    b"content-type", b""
-                ).startswith(b"text/event-stream")
-            elif (
-                message["type"] == "http.response.body"
-                and streaming
-                and not timing.recorded
-            ):
-                if detector.feed(message.get("body", b"")):
-                    timing.first_output(streaming=True)
+                is_sse = headers.get(b"content-type", b"").startswith(
+                    b"text/event-stream"
+                )
+                timing.streaming_response = 200 <= message["status"] < 300 and is_sse
             await send(message)
 
         try:
