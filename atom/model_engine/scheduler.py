@@ -1896,7 +1896,10 @@ class Scheduler:
 
     def _query_connector_prefill_match(self, seq: Sequence, *, skip: bool) -> bool:
         """Ask the connector whether this prefill should park for remote KV."""
-        if skip or self.kv_connector is None:
+        # Temporary: media prompts skip the offload tier too -- LMCache keys on
+        # the raw token ids, same collision as the HBM cache. Only asked here, so
+        # this covers every connector variant.
+        if skip or seq.is_multimodal or self.kv_connector is None:
             return False
         ext_tokens, needs_remote_load = self.kv_connector.get_num_new_matched_tokens(
             seq

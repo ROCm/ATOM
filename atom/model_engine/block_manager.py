@@ -885,14 +885,19 @@ class BlockManager:
         h = -1
         compressed_hit = 0
         block_hashes: list[int] = []
-        for i in range(self._n_hash_blocks(seq) - 1):
-            token_ids = self._hash_block_tokens(seq, i)
-            h = self.compute_hash(token_ids, h)
-            block_id = self.kv.lookup(h)
-            if block_id == -1 or self.kv.block(block_id).token_ids != token_ids:
-                break
-            block_hashes.append(h)
-            compressed_hit += 1
+        # Temporary: a media prompt takes no hit. Its placeholder tokens are the
+        # same token id whatever image they stand for, so the keys collide. Zero
+        # hits is the cold-prompt path, so everything below runs unchanged.
+        # Per-block image keys: branch `whn/mm_prefix_cache`.
+        if not seq.is_multimodal:
+            for i in range(self._n_hash_blocks(seq) - 1):
+                token_ids = self._hash_block_tokens(seq, i)
+                h = self.compute_hash(token_ids, h)
+                block_id = self.kv.lookup(h)
+                if block_id == -1 or self.kv.block(block_id).token_ids != token_ids:
+                    break
+                block_hashes.append(h)
+                compressed_hit += 1
         # Step 2: SWA only needs the trailing window before the boundary to be
         # present (SWA is local). Scan right-to-left within the compressed prefix
         # for the largest boundary whose window is SWA-cached (vLLM
@@ -1602,13 +1607,19 @@ class BlockManager:
         # Watermark for the decode-side continuation, maintained here so every
         # prefill path feeds it without knowing about it.
         seq.num_hashed_tokens = max(seq.num_hashed_tokens, end * hbs)
-        record = self._event_log is not None
+        # Media blocks are hashed but not indexed (see `can_allocate`). Reads
+        # `is_multimodal`, not `multimodal_data` -- the scheduler drops that dict
+        # before this runs. The walk still feeds `h` and `num_hashed_tokens`.
+        publish = not seq.is_multimodal
+        record = self._event_log is not None and publish
         store_run_parent: int | None = h if h != -1 else None
         store_run_hashes: list[int] = []
         store_run_tokens: list[int] = []
         for i in range(start, end):
             token_ids = self._hash_block_tokens(seq, i)
             h = self.compute_hash(token_ids, h)
+            if not publish:
+                continue
             self.kv.publish(seq.block_table[i], h, token_ids)
             if record:
                 store_run_hashes.append(h)
