@@ -10,9 +10,10 @@
 
 """Fused attention-residual operations for Kimi-K3.
 
-The Triton kernel below is one of two implementations reachable through
-``apply_attn_res``; ``ATOM_ATTN_RES_BACKEND`` selects between it and aiter's
-``attn_res_gate`` (see ``_attn_res_impl``).
+``apply_attn_res`` runs aiter's ``attn_res_gate`` (see ``_aiter_attn_res_impl``).
+The Triton kernel below is the same math and is no longer on that path; it is
+kept as the reference implementation the aiter kernel was ported from and
+validated against.
 
 The algorithm is flash-linear-attention's ``fused_attnres``
 (``fla/ops/attnres/fused.py``, MIT; read against fla 0.5.2), which is what the
@@ -40,11 +41,8 @@ from __future__ import annotations
 
 import torch
 
-from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace
-
-_ATTN_RES_BACKEND = envs.ATOM_ATTN_RES_BACKEND
 
 try:
     import triton
@@ -342,11 +340,14 @@ def _aiter_attn_res_impl(
 ):
     """aiter's ``attn_res_gate`` behind ``_apply_attn_res_impl``'s signature.
 
-    Same mix, same fusion arguments, but a separate implementation: the two
-    kernels are not expected to agree bit for bit (the fused FP8 output quant in
-    particular can land a ulp apart), and aiter's own surface is wider than what
-    is forwarded here. Its output pair nests the quant scale inside the first
-    element; unpack it so callers see the flat returns they already handle.
+    What the four custom ops below launch. Same mix and same fusion arguments as
+    the Triton kernel above, but a separate implementation, so the two are not
+    expected to agree bit for bit -- the fused FP8 output quant in particular
+    lands a ulp apart on rounding ties. aiter's own surface is also wider than
+    what is forwarded here (it can fuse the block-banking concat as well); this
+    passes on only the combinations ATOM asks for. Its output pair nests the
+    quant scale inside the first element; unpack it so callers see the flat
+    returns they already handle.
     """
     from aiter.ops.triton.fusions.attn_res import attn_res_gate
 
@@ -367,19 +368,6 @@ def _aiter_attn_res_impl(
     return y, y_scale, prefix_out
 
 
-def _attn_res_impl(*args, **kwargs):
-    """Run whichever kernel ``ATOM_ATTN_RES_BACKEND`` selects.
-
-    The four custom ops below call this rather than ``_apply_attn_res_impl``
-    directly, which puts the choice under the op boundary: the op schemas, their
-    fake impls and every caller stay the same either way, so switching backends
-    swaps the kernel and nothing around it.
-    """
-    if _ATTN_RES_BACKEND == "local":
-        return _apply_attn_res_impl(*args, **kwargs)
-    return _aiter_attn_res_impl(*args, **kwargs)
-
-
 def _apply_attn_res_op(
     prefix_sum: torch.Tensor,
     block_residual: torch.Tensor,
@@ -388,7 +376,7 @@ def _apply_attn_res_op(
     out_norm_weight: torch.Tensor | None = None,
     out_eps: float = 1e-6,
 ) -> torch.Tensor:
-    mixed_output, _ = _attn_res_impl(
+    mixed_output, _ = _aiter_attn_res_impl(
         prefix_sum,
         block_residual,
         score_weight,
@@ -428,7 +416,7 @@ def _apply_attn_res_add_op(
     out_eps: float = 1e-6,
     add_hidden2: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return _attn_res_impl(
+    return _aiter_attn_res_impl(
         prefix_sum,
         block_residual,
         score_weight,
@@ -475,7 +463,7 @@ def _apply_attn_res_quant_op(
     out_eps: float,
     quant_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    y, y_scale, _ = _attn_res_impl(
+    y, y_scale, _ = _aiter_attn_res_impl(
         prefix_sum,
         block_residual,
         score_weight,
@@ -523,7 +511,7 @@ def _apply_attn_res_add_quant_op(
     quant_dtype: torch.dtype,
     add_hidden2: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return _attn_res_impl(
+    return _aiter_attn_res_impl(
         prefix_sum,
         block_residual,
         score_weight,

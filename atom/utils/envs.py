@@ -190,16 +190,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
     ),
-    # Which attn_res kernel Kimi-K3's AttnRes sites run: "aiter" is aiter's
-    # attn_res_gate (the default), "local" is the Triton kernel in
-    # atom/model_ops/kimi_k3/attention_residual.py. Both compute the same mix
-    # over the fusion surface this dispatch path uses, but they are separate
-    # implementations rather than one kernel behind two names -- expect
-    # last-place FP8 differences, and do not read a swap as an A/B of one
-    # variable. Read once at import, so it must be set before the server starts.
-    "ATOM_ATTN_RES_BACKEND": lambda: os.getenv(
-        "ATOM_ATTN_RES_BACKEND", "aiter"
-    ).lower(),
     # DSpark block sampling: replace the Markov head's
     #   bias = W1[x] @ W2.float().t() ; argmax(base_logits + bias)
     # with one fused Triton kernel (atom/model_ops/dspark_markov_sample.py).
