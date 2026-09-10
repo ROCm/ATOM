@@ -263,9 +263,15 @@ def build_cell(
     }
     requires_explicit_candidate_nodes = slurm_submit_runner == "atomesh-cicd-mi350"
 
-    nodes = resolve_nodes(suite_cfg.get("nodes"))
-    if allow_auto_nodes and not requires_explicit_candidate_nodes:
-        nodes = []
+    single_node_override = os.environ.get("ATOMESH_SINGLE_NODE", "").strip()
+    if single_node_pd and single_node_override not in ("", "auto"):
+        nodes = resolve_nodes(single_node_override)
+        if len(nodes) != 1:
+            raise ValueError("ATOMESH_SINGLE_NODE must specify exactly one node")
+    else:
+        nodes = resolve_nodes(suite_cfg.get("nodes"))
+        if allow_auto_nodes and not requires_explicit_candidate_nodes:
+            nodes = []
     if allow_auto_nodes and requires_explicit_candidate_nodes:
         if not nodes:
             raise ValueError(
