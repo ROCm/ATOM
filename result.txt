@@ -1,0 +1,49 @@
+=========================================
+Start Test ISL=1024, OSL=1024, CONC=2048
+=========================================
+[atom 06:52:16] Raised RLIMIT_NOFILE soft limit 1024 -> 65535 (hard=524288)
+You are using a model of type `deepseek_v4` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+[atom 06:52:16] Loaded message encoder from /data/DeepSeek-V4-Pro/encoding/encoding_dsv4.py
+Namespace(backend='vllm', base_url='http://localhost:8000', host='127.0.0.1', port=8000, endpoint='/v1/completions', dataset_name='random', dataset_path=None, max_concurrency=2048, model='/data/DeepSeek-V4-Pro', tokenizer=None, best_of=1, use_beam_search=False, num_prompts=8192, logprobs=None, request_rate=inf, burstiness=1.0, seed=0, trust_remote_code=False, disable_tqdm=False, profile=False, save_result=False, save_detailed=False, metadata=None, result_dir=None, result_filename=None, ignore_eos=True, percentile_metrics='ttft,tpot,itl,e2el', metric_percentiles='99', goodput=None, sonnet_input_len=550, sonnet_output_len=150, sonnet_prefix_len=200, sharegpt_output_len=None, random_input_len=1024, random_output_len=1024, random_range_ratio=1.0, random_prefix_len=0, use_chat_template=False, hf_subset=None, hf_split=None, hf_output_len=None, tokenizer_mode='auto', served_model_name=None, lora_modules=None, num_warmups=1)
+-------------------  Input/Output Length Statistics  -------------------
+ input_lens : min=1024  max=1024  mean=1024.00  avg_token_mismatch=0.00  
+ output_lens: min=1024  max=1024  mean=1024.00 
+------------------------------------------------------------------------ 
+
+Starting initial single prompt test run...
+Warming up with 1 requests...
+  0%|          | 0/1 [00:00<?, ?it/s]100%|██████████| 1/1 [00:22<00:00, 22.78s/it]100%|██████████| 1/1 [00:22<00:00, 22.78s/it]
+Warmup completed.
+Traffic request rate: inf
+Burstiness factor: 1.0 (Poisson process)
+Maximum request concurrency: 2048
+  0%|          | 0/8192 [00:00<?, ?it/s]  0%|          | 1/8192 [01:44<238:05:15, 104.64s/it]  1%|          | 102/8192 [01:44<1:37:16,  1.39it/s]  18%|█▊        | 1501/8192 [01:45<03:54, 28.48it/s]  25%|██▌       | 2048/8192 [01:57<03:35, 28.48it/s] 25%|██▌       | 2049/8192 [03:25<08:50, 11.58it/s] 29%|██▊       | 2353/8192 [03:25<06:35, 14.75it/s] 33%|███▎      | 2685/8192 [03:25<04:40, 19.61it/s] 50%|█████     | 4096/8192 [03:37<03:28, 19.61it/s] 50%|█████     | 4097/8192 [05:00<04:09, 16.43it/s] 50%|█████     | 4099/8192 [05:05<04:20, 15.71it/s] 56%|█████▌    | 4562/8192 [05:05<02:45, 21.97it/s] 71%|███████▏  | 5848/8192 [05:05<00:49, 46.97it/s] 75%|███████▌  | 6144/8192 [05:17<00:43, 46.97it/s] 75%|███████▌  | 6145/8192 [06:37<02:12, 15.50it/s] 75%|███████▌  | 6146/8192 [06:46<02:25, 14.11it/s] 79%|███████▉  | 6487/8192 [06:46<01:29, 19.01it/s]100%|██████████| 8192/8192 [06:46<00:00, 20.13it/s]
+Starting main benchmark run...
+============ Serving Benchmark Result ============
+Successful requests:                     8192      
+Benchmark duration (s):                  406.93    
+Total input tokens:                      8388608   
+Total generated tokens:                  8388608   
+Request throughput (req/s):              20.13     
+Output token throughput (tok/s):         20614.52  
+Total Token throughput (tok/s):          41229.04  
+Concurrency:                             2041.44   
+---------------Time to First Token----------------
+Mean TTFT (ms):                          15605.64  
+Median TTFT (ms):                        15581.88  
+P99 TTFT (ms):                           28014.60  
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          83.87     
+Median TPOT (ms):                        83.81     
+P99 TPOT (ms):                           98.31     
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           83.79     
+Median ITL (ms):                         58.71     
+P99 ITL (ms):                            546.93    
+----------------End-to-end Latency----------------
+Mean E2EL (ms):                          101406.18 
+Median E2EL (ms):                        100658.69 
+P99 E2EL (ms):                           104659.35 
+==================================================
+
+
