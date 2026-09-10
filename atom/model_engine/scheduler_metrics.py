@@ -6,33 +6,15 @@ per-request labels are needed, and a scrape never consumes observations.
 
 from __future__ import annotations
 
-import math
 import time
-from bisect import bisect_left
 from dataclasses import dataclass
-from itertools import accumulate
 
-LATENCY_BUCKETS = (
-    0.001,
-    0.002,
-    0.005,
-    0.01,
-    0.02,
-    0.05,
-    0.1,
-    0.2,
-    0.5,
-    1,
-    2,
-    5,
-    10,
-    20,
-    30,
-    60,
-    120,
-    300,
-    600,
+from atom.utils.histogram import (
+    LATENCY_BUCKETS,
+    CumulativeHistogram,
+    prometheus_buckets,
 )
+
 BATCH_BUCKETS = (1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 512, 1024)
 TOKEN_BUCKETS = (
     0,
@@ -54,25 +36,6 @@ TOKEN_BUCKETS = (
     4194304,
     8388608,
 )
-
-
-class CumulativeHistogram:
-    def __init__(self, bounds):
-        self.bounds = (*bounds, math.inf)
-        self.counts = [0] * len(self.bounds)
-        self.total = 0.0
-
-    def observe(self, value: float) -> None:
-        if not math.isfinite(value) or value < 0:
-            return
-        self.counts[bisect_left(self.bounds, value)] += 1
-        self.total += value
-
-    def snapshot(self) -> dict:
-        return {
-            "buckets": list(zip(self.bounds, accumulate(self.counts))),
-            "sum": self.total,
-        }
 
 
 @dataclass
@@ -174,3 +137,85 @@ class SchedulerMetrics:
             "decode_context_tokens": self.decode_context_tokens.snapshot(),
             "decode_request_context_tokens": self.decode_request_context_tokens.snapshot(),
         }
+
+
+def collect_scheduler_metrics(snapshot):
+    """Export scheduler-owned observations; None describes names without data."""
+    from prometheus_client.core import GaugeMetricFamily, HistogramMetricFamily
+
+    ranks = (snapshot or {}).get("scheduler_metrics", [])
+    labels = ["dp_rank", "engine_role"]
+    for key, name, help_text in (
+        (
+            "queue_time",
+            "atom:request_queue_time_seconds",
+            "Time from engine receipt to first real forward dispatch, including KV loading waits.",
+        ),
+        (
+            "decode_batch_size",
+            "atom:decode_batch_size",
+            "Real decode request rows per forward; excludes dummy work and graph padding.",
+        ),
+        (
+            "pd_kv_transfer",
+            "atom:pd_kv_transfer_seconds",
+            "Decode-side PD KV load wait until all workers complete; includes dispatch, handshake and notification.",
+        ),
+        (
+            "prefill_request_tokens",
+            "atom:prefill_request_tokens",
+            "Prompt tokens remaining at first local prefill dispatch, once per request.",
+        ),
+        (
+            "prefill_batch_tokens",
+            "atom:prefill_batch_tokens",
+            "Real prefill tokens scheduled per forward, excluding cached prefix and padding.",
+        ),
+        (
+            "decode_context_tokens",
+            "atom:decode_context_tokens",
+            "Sum of logical decode sequence lengths per real forward, without padding or TP multiplication.",
+        ),
+        (
+            "decode_request_context_tokens",
+            "atom:decode_request_context_tokens",
+            "Logical context length per real decode request row on each forward; request-forward weighted, without padding or TP multiplication.",
+        ),
+    ):
+        metric = HistogramMetricFamily(name, help_text, labels=labels)
+        for rank in ranks:
+            if key not in rank:
+                continue
+            hist = rank[key]
+            metric.add_metric(
+                [str(rank["dp_rank"]), rank["engine_role"]],
+                buckets=prometheus_buckets(hist),
+                sum_value=hist["sum"],
+            )
+        yield metric
+
+    queues = GaugeMetricFamily(
+        "atom:scheduler_requests",
+        "Requests by scheduler state; waiting excludes KV waits.",
+        labels=[*labels, "state"],
+    )
+    blocks = GaugeMetricFamily(
+        "atom:scheduler_kv_cache_blocks",
+        "KV block pool by state; used + evictable + vacant = total.",
+        labels=[*labels, "state"],
+    )
+    timestamp = GaugeMetricFamily(
+        "atom:scheduler_snapshot_timestamp_seconds",
+        "Unix time of the engine scheduler snapshot.",
+        labels=labels,
+    )
+    for rank in ranks:
+        values = [str(rank["dp_rank"]), rank["engine_role"]]
+        for state in ("running", "waiting", "waiting_kv"):
+            queues.add_metric([*values, state], rank[state])
+        for state, count in rank["kv_blocks"].items():
+            blocks.add_metric([*values, state], count)
+        timestamp.add_metric(values, rank["timestamp"])
+    yield queues
+    yield blocks
+    yield timestamp

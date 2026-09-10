@@ -150,7 +150,7 @@ def test_freezing_twice_is_additive_and_harmless():
 
 
 def test_the_frozen_count_cannot_be_mirrored_so_nothing_scrape_side_reads_it():
-    """`gc.get_freeze_count()` is too slow for a scrape -- `_gc_metrics` has
+    """`gc.get_freeze_count()` is too slow for a scrape -- `GCMetricsCollector.collect` has
     the measurement -- and caching it here, the obvious answer, is wrong: the
     count is not a function of this module's calls, which is what the middle of
     this test shows. Hence no `atom:gc_frozen_objects` gauge to keep in step.

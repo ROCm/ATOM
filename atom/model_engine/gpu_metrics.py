@@ -6,7 +6,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
 
-from atom.model_engine.scheduler_metrics import LATENCY_BUCKETS, CumulativeHistogram
+from atom.utils.histogram import (
+    LATENCY_BUCKETS,
+    CumulativeHistogram,
+    prometheus_buckets,
+)
 
 
 @dataclass
@@ -140,3 +144,77 @@ def record_gpu_forward(func):
             return func(self, input_ids, batch)
 
     return wrapped
+
+
+def collect_gpu_metrics(snapshot):
+    """Export worker snapshots without synchronizing devices or re-observing."""
+    from prometheus_client.core import (
+        CounterMetricFamily,
+        GaugeMetricFamily,
+        HistogramMetricFamily,
+    )
+
+    workers = (snapshot or {}).get("forward_metrics", [])
+    labels = ["dp_rank", "pp_rank", "tp_rank", "engine_role"]
+    duration = HistogramMetricFamily(
+        "atom:gpu_forward_seconds",
+        "Per-worker target forward device-event duration, including stream communication/waits; excludes input preparation, sampling and drafting.",
+        labels=[*labels, "phase"],
+    )
+    request_duration = HistogramMetricFamily(
+        "atom:prefill_request_gpu_forward_seconds",
+        "Per-worker sum of participating batch device durations across a request's initial local prefill chunks; once after all chunks complete, not exclusive request compute time.",
+        labels=labels,
+    )
+    request_tracked = GaugeMetricFamily(
+        "atom:prefill_request_gpu_forward_tracked",
+        "Bounded unfinished request timing accumulators; may include abandoned partial prefills until eviction.",
+        labels=labels,
+    )
+    request_dropped = CounterMetricFamily(
+        "atom:prefill_request_gpu_forward_dropped",
+        "Request timing accumulators discarded because of missing/failed timings, replacement or capacity eviction.",
+        labels=labels,
+    )
+    pending = GaugeMetricFamily(
+        "atom:gpu_forward_pending",
+        "Unfinished device timing samples.",
+        labels=labels,
+    )
+    dropped = CounterMetricFamily(
+        "atom:gpu_forward_dropped",
+        "Device timings skipped because the bounded event queue was full.",
+        labels=labels,
+    )
+    timestamp = GaugeMetricFamily(
+        "atom:gpu_forward_snapshot_timestamp_seconds",
+        "Worker device timing snapshot time.",
+        labels=labels,
+    )
+    for worker in workers:
+        values = [str(worker[k]) for k in labels]
+        for phase, hist in worker["phases"].items():
+            duration.add_metric(
+                [*values, phase],
+                buckets=prometheus_buckets(hist),
+                sum_value=hist["sum"],
+            )
+        if "prefill_requests" in worker:
+            hist = worker["prefill_requests"]
+            request_duration.add_metric(
+                values,
+                buckets=prometheus_buckets(hist),
+                sum_value=hist["sum"],
+            )
+            request_tracked.add_metric(values, worker["prefill_requests_tracked"])
+            request_dropped.add_metric(values, worker["prefill_requests_dropped"])
+        pending.add_metric(values, worker["pending"])
+        dropped.add_metric(values, worker["dropped"])
+        timestamp.add_metric(values, worker["timestamp"])
+    yield duration
+    yield request_duration
+    yield request_tracked
+    yield request_dropped
+    yield pending
+    yield dropped
+    yield timestamp

@@ -118,3 +118,51 @@ class RequestTimingMiddleware:
             await self.app(scope, receive, timed_send)
         finally:
             _request_timing.reset(context_token)
+
+
+class RequestMetrics:
+    """Request latency instruments registered once for an API instance."""
+
+    def __init__(self, registry):
+        from prometheus_client import Histogram
+
+        self._time_to_first_token = Histogram(
+            "atom:time_to_first_token_seconds",
+            "Local API request arrival to first output. Streaming observes the "
+            "first generated SSE payload; non-streaming observes the first "
+            "internal token delivery. One sample per request.",
+            labelnames=("streaming",),
+            buckets=(
+                0.001,
+                0.005,
+                0.010,
+                0.025,
+                0.050,
+                0.100,
+                0.250,
+                0.500,
+                1.0,
+                2.5,
+                5.0,
+                10.0,
+                15.0,
+                30.0,
+                45.0,
+                60.0,
+                90.0,
+                120.0,
+                180.0,
+                240.0,
+            ),
+            registry=registry,
+        )
+
+        # Expose zero-valued children before traffic so Prometheus can establish
+        # a baseline for rate(). Registering labels does not record a sample.
+        for streaming in ("true", "false"):
+            self._time_to_first_token.labels(streaming=streaming)
+
+    def observe_time_to_first_token(self, interval: float, streaming: bool) -> None:
+        self._time_to_first_token.labels(streaming=str(streaming).lower()).observe(
+            interval
+        )

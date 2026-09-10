@@ -281,3 +281,65 @@ JSON 的每个 panel 可增加 `instances: {"host:port": {"series": ..., ...}}`�
 实现入口为 `atom/model_engine/scheduler_metrics.py`、各 engine 的 forward 下发处、
 `engine_utility.py → llm_engine.py → entrypoints/openai/metrics.py`。
 HTML 和 CI 导出位于 `.github/scripts/atomesh/observability/`。
+
+## 指标定义与注册
+
+Python 指标由所属模块定义，API 在 `entrypoints/openai/metrics_setup.py` 中显式组合。
+`AtomMetricsExporter` 只管理快照缓存、registry、渲染及自身刷新健康指标。
+指标名称、HELP、标签和桶边界跟随所属模块，不再集中在 exporter 中。
+
+| 所属模块 | 定义及采集接口 |
+| --- | --- |
+| `entrypoints/openai/request_timing.py` | `RequestMetrics` 定义 TTFT；middleware 和请求计时通过观察回调记录。 |
+| `entrypoints/openai/streaming_dispatch.py` | `StreamMetrics` 定义 ITL 和实时流静默时长；dispatcher 通过观察回调记录 ITL。 |
+| `model_engine/scheduler_metrics.py` | scheduler 采样及 `collect_scheduler_metrics`，包括排队、batch、token 和 KV 状态。 |
+| `model_engine/gpu_metrics.py` | GPU 事件采样及 `collect_gpu_metrics`，包括单次 forward 和请求累计 prefill 时长。 |
+| `model_engine/engine_stats.py` | `collect_engine_metrics`，导出引擎聚合状态、cache 和 MTP 统计。 |
+| `model_engine/dp_metrics.py` | `collect_dp_metrics`，导出相邻 `EngineCoreMgr` 的 DP 路由统计。 |
+| `kv_transfer/offload/metrics.py` | `collect_offload_metrics`，导出 offload connector 的累计统计。 |
+| `utils/gc_utils.py` | `GCMetricsCollector`，读取 API 进程的实时 GC 统计。 |
+
+API 进程内的 Histogram/Gauge 显式传入 `exporter.registry`，由标准
+`prometheus_client.CollectorRegistry` 注册。引擎和 worker 仍然通过现有累计快照传输；
+注册函数用很薄的 adapter 把快照转换为标准 MetricFamily。
+同一次 `exporter.render()` 中所有快照 collector 共用一份快照，后台刷新不会造成
+一份响应混入多个版本。不同 API 实例使用独立 registry。
+GC 和流静默指标依旧在抓取时读取本进程实时状态。
+
+给已有模块增加指标时，在所属的 metrics 类或 `collect_*_metrics` 中添加定义，
+并在事件发生处更新。只有新增整个组件时，才需要在 `metrics_setup.py` 注册一次。
+例如新组件通过快照报告队列长度，可在该组件的 metrics 模块中定义：
+
+```python
+from prometheus_client.core import GaugeMetricFamily
+
+
+def collect_component_metrics(snapshot):
+    metric = GaugeMetricFamily(
+        "atom:component_queue_depth",
+        "Number of items waiting in the component queue.",
+    )
+    # None 是注册时的元数据查询；必须声明所有可能出现的指标族。
+    # 真正抓取时，缺失字段保持无样本，避免把未知状态伪装为零。
+    if snapshot is not None and "component_queue_depth" in snapshot:
+        metric.add_metric([], snapshot["component_queue_depth"])
+    yield metric
+```
+
+生产端将观测值加入已有快照，在 `metrics_setup.py` 的组件列表中加入
+`collect_component_metrics` 即可；exporter 无需修改。
+`collect(None)` 不能做 RPC 或 GPU 同步，并须声明包括可选指标在内的全部名称；
+registry 会检查重名及 `_total`、`_bucket`、`_count`、`_sum` 等生成序列的冲突。
+实际 `collect(snapshot)` 只能读取快照，不得修改共享快照、重新 observe 或清空计数。
+已有指标缺字段时的零值或缺失行为保持原有约定。
+
+ITL 使用 `utils/histogram.py` 中的 `WeightedHistogram` 扩展标准 Histogram，
+复用标签、注册、桶校验和导出，仅补充一次加权更新及进程内更新/抓取锁。
+例如 20 ms 新增 4 个 token，调用 `observe_weighted(0.020, 4)`，对应
+4 个 5 ms 样本：`count += 4`，`sum += 0.020`。
+标准库目前没有公开的加权 observe 接口，内部桶访问集中在这个工具类中；升级
+`prometheus-client` 时运行 `tests/test_histogram.py` 和 streaming metrics 回归。
+引擎侧 `CumulativeHistogram` 继续生成可传输的累计桶，抓取时直接导出。
+
+这里参考 SGLang 的组件 collector 和原生 Prometheus 注册方式。
+ATOM 保留自身快照 IPC，没有引入 SGLang 的文件式 multiprocess 聚合。

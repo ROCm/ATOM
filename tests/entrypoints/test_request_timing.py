@@ -6,7 +6,7 @@ from prometheus_client.parser import text_string_to_metric_families
 from starlette.responses import StreamingResponse
 
 from atom.entrypoints.openai import api_server
-from atom.entrypoints.openai.metrics import AtomMetricsExporter
+from atom.entrypoints.openai.metrics_setup import create_metrics_exporter
 from atom.entrypoints.openai.request_timing import (
     RequestTimingMiddleware,
     record_nonstream_first_token,
@@ -181,7 +181,7 @@ def test_streaming_ttft_includes_preprocessing_skips_role_and_records_once(
     monkeypatch.setattr(
         "atom.entrypoints.openai.request_timing.time.perf_counter", lambda: clock[0]
     )
-    exporter = AtomMetricsExporter()
+    exporter, request_metrics, _ = create_metrics_exporter()
     chunks = [
         _sse({"choices": [{"delta": {"role": "assistant"}}]}),
         _sse({"choices": [{"delta": {"content": "four tokens at once"}}]}),
@@ -196,7 +196,7 @@ def test_streaming_ttft_includes_preprocessing_skips_role_and_records_once(
     sent = asyncio.run(
         _serve_stream(
             source(),
-            exporter.observe_time_to_first_token,
+            request_metrics.observe_time_to_first_token,
             path=path,
             spec_version=spec_version,
         )
