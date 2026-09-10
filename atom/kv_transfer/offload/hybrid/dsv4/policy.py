@@ -309,7 +309,24 @@ def _chained_prefix_hashes(
     token_ids: array.array,
     hash_block_size: int,
 ) -> dict[int, int]:
-    """Return each full-block prefix hash using BlockManager's exact chain."""
+    """Return each full-block prefix hash using BlockManager's exact chain.
+
+    Text-only, and the sidecar index it keys is a closed namespace: every
+    committed hash was produced here and every lookup recomputes it here, so
+    these values never have to agree with the block hashes `BlockManager`
+    publishes.
+
+    What they do share is the weakness of keying on token ids alone. A
+    multimodal prompt's media placeholders are the same token id whatever image
+    they stand for, so two prompts differing only in their images hash
+    identically here and would resume each other's per-request state.
+    `BlockManager` folds each image's content hash into its own chain to close
+    exactly this (`_media_extra_keys`); this path does not.
+
+    Inert today -- DSv4 is text-only, so no sequence reaching here carries
+    media. A media-capable model routed onto this path would need the
+    placeholders folded in first.
+    """
 
     if hash_block_size <= 0:
         raise ValueError("hash_block_size must be positive")

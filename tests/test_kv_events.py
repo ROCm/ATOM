@@ -35,6 +35,7 @@ from atom.distributed.kv_events import (
     make_publisher,
 )
 from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.multimodal import MediaPlaceholder
 
 # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -390,3 +391,62 @@ class TestPublisher:
             assert pub.stats["sent"] == 0
         finally:
             pub.shutdown()
+
+
+# ── media placeholders on the wire ─────────────────────────────────────────
+
+
+class TestBlockStoredCarriesMediaKeys:
+    """The digest depends on the images, so the event stream must say so.
+
+    A consumer that only ever saw token ids would have no way to tell why two
+    runs with identical tokens hash differently.
+    """
+
+    def test_text_only_run_reports_no_extra_keys(self, seq_factory):
+        bm = _bm_with_events()
+        seq = seq_factory(list(range(16)))
+        _admit(bm, seq)
+
+        stored = [e for e in bm.take_events() if isinstance(e, BlockStored)]
+        assert stored
+        assert all(e.extra_keys is None for e in stored)
+
+    def test_media_run_reports_the_keys_per_block(self, seq_factory):
+        bm = _bm_with_events(num_kvcache_blocks=16)
+        tokens = list(range(8)) + [999] * 8 + [100, 101, 102, 103]
+        seq = seq_factory(
+            tokens,
+            media_placeholders=(
+                MediaPlaceholder(
+                    identifier=0xABCD, modality="image", offset=8, length=8
+                ),
+            ),
+        )
+        _admit(bm, seq)
+
+        stored = [e for e in bm.take_events() if isinstance(e, BlockStored)]
+        keys = [k for event in stored for k in (event.extra_keys or [])]
+        # One entry per published block, keyed only where the image reaches:
+        # blocks 0-1 are text, blocks 2-3 hold the image.
+        assert keys[:2] == [None, None]
+        assert keys[2] == ((0xABCD, 0),)
+        assert keys[3] == ((0xABCD, -4),)
+
+    def test_keys_survive_the_msgpack_round_trip(self, seq_factory):
+        bm = _bm_with_events(num_kvcache_blocks=16)
+        seq = seq_factory(
+            list(range(8)) + [999] * 8,
+            media_placeholders=(
+                MediaPlaceholder(
+                    identifier=0xABCD, modality="image", offset=8, length=8
+                ),
+            ),
+        )
+        _admit(bm, seq)
+        stored = next(e for e in bm.take_events() if isinstance(e, BlockStored))
+
+        batch = EventBatch(ts=time.time(), events=[stored], data_parallel_rank=0)
+        enc = msgspec.msgpack.Encoder().encode(batch)
+        dec = msgspec.msgpack.Decoder(EventBatch).decode(enc)
+        assert dec.events[0].extra_keys is not None

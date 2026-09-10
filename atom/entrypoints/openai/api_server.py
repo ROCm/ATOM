@@ -714,43 +714,24 @@ def _collect_multimodal_parts(
     return processor_messages, images
 
 
-def _images_before_text(
-    processor_messages: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Hoist image parts ahead of the text within each message.
-
-    Qwen3.5's template only reliably emits <|image_pad|> when image entries
-    precede the text, matching the native offline multimodal example.
-    """
-    reordered: list[dict[str, Any]] = []
-    for message in processor_messages:
-        content = message["content"]
-        if not isinstance(content, list):
-            reordered.append(message)
-            continue
-        parts = [part for part in content if part["type"] == "image"]
-        texts = [part["text"] for part in content if part["type"] == "text"]
-        if texts:
-            parts.append({"type": "text", "text": "\n".join(texts)})
-        reordered.append({"role": message["role"], "content": parts})
-    return reordered
-
-
 def _prepare_multimodal_inputs(
     messages: list[Any],
     chat_template_kwargs: dict[str, Any],
     tools: Any = None,
-) -> tuple[list[int], dict[str, Any]]:
+) -> tuple[list[int], dict[str, Any], tuple]:
+    """Turn chat messages into prompt tokens, encoder inputs and media ranges.
+
+    The per-architecture work -- the Qwen `processor(text=..., images=...)`
+    convention and the builders registered for processors that deviate from it
+    -- lives in `atom.model_engine.multimodal`, shared with the offline example.
+    """
     mm_processor = _get_multimodal_processor()
     processor_messages, images = _collect_multimodal_parts(messages)
 
     if not images:
         raise ValueError("Multimodal request did not contain any images")
 
-    # Models whose processor deviates from the Qwen convention register their
-    # own builder (e.g. Kimi-K3's messages+medias API and unexpanded
-    # <|media_pad|> placeholders).
-    built = build_multimodal_inputs(
+    input_ids, multimodal_data, placeholders = build_multimodal_inputs(
         _get_engine_config(),
         mm_processor,
         processor_messages,
@@ -758,26 +739,7 @@ def _prepare_multimodal_inputs(
         chat_template_kwargs,
         tools=tools,
     )
-    if built is not None:
-        return built
-
-    template_kwargs = dict(chat_template_kwargs)
-    template_kwargs.pop("tokenize", None)
-    template_kwargs.pop("add_generation_prompt", None)
-    text = mm_processor.apply_chat_template(
-        _images_before_text(processor_messages),
-        tokenize=False,
-        add_generation_prompt=True,
-        **template_kwargs,
-    )
-    if images and "<|image_pad|>" not in text:
-        raise ValueError("Multimodal chat template did not emit image placeholders")
-    inputs = mm_processor(text=[text], images=images, return_tensors="pt")
-    multimodal_data = {
-        "pixel_values": inputs["pixel_values"],
-        "image_grid_thw": inputs["image_grid_thw"],
-    }
-    return inputs["input_ids"][0].tolist(), multimodal_data
+    return input_ids, multimodal_data, tuple(placeholders)
 
 
 # ── Batched stream dispatch ──────────────────────────────────────────────
@@ -982,6 +944,7 @@ async def generate_async_multimodal(
     multimodal_data: dict[str, Any],
     sampling_params: SamplingParams,
     request_id: str,
+    media_placeholders: tuple | None = None,
     data_parallel_rank: int | None = None,
     dp_session_id: str | None = None,
     dp_parent_session_id: str | None = None,
@@ -1015,6 +978,7 @@ async def generate_async_multimodal(
             sampling_params,
             stream_callback=completion_callback,
             multimodal_data=multimodal_data,
+            media_placeholders=media_placeholders,
             data_parallel_rank=data_parallel_rank,
             dp_session_id=dp_session_id,
             dp_parent_session_id=dp_parent_session_id,
@@ -1082,6 +1046,7 @@ async def generate_async_fanout(
     request_id: str,
     kv_transfer_params: dict[str, Any] | None = None,
     multimodal_data: dict[str, Any] | None = None,
+    media_placeholders: tuple | None = None,
     data_parallel_rank: int | None = None,
     dp_session_id: str | None = None,
     dp_parent_session_id: str | None = None,
@@ -1134,6 +1099,7 @@ async def generate_async_fanout(
             stream_callbacks=stream_callbacks,
             kv_transfer_params=kv_transfer_params,
             multimodal_data=multimodal_data,
+            media_placeholders=media_placeholders,
             parent_request_id=request_id,
             data_parallel_rank=data_parallel_rank,
             dp_session_id=dp_session_id,
@@ -1228,6 +1194,7 @@ async def setup_streaming_request(
     request_id: str,
     kv_transfer_params: dict[str, Any] | None = None,
     multimodal_data: dict[str, Any] | None = None,
+    media_placeholders: tuple | None = None,
     data_parallel_rank: int | None = None,
     dp_session_id: str | None = None,
     dp_parent_session_id: str | None = None,
@@ -1263,6 +1230,7 @@ async def setup_streaming_request(
             stream_callback=stream_callback,
             kv_transfer_params=kv_transfer_params,
             multimodal_data=multimodal_data,
+            media_placeholders=media_placeholders,
             data_parallel_rank=data_parallel_rank,
             dp_session_id=dp_session_id,
             dp_parent_session_id=dp_parent_session_id,
@@ -1432,6 +1400,7 @@ async def setup_streaming_request_fanout(
     request_id: str,
     kv_transfer_params: dict[str, Any] | None = None,
     multimodal_data: dict[str, Any] | None = None,
+    media_placeholders: tuple | None = None,
     data_parallel_rank: int | None = None,
     dp_session_id: str | None = None,
     dp_parent_session_id: str | None = None,
@@ -1483,6 +1452,7 @@ async def setup_streaming_request_fanout(
             stream_callbacks=stream_callbacks,
             kv_transfer_params=kv_transfer_params,
             multimodal_data=multimodal_data,
+            media_placeholders=media_placeholders,
             parent_request_id=request_id,
             data_parallel_rank=data_parallel_rank,
             dp_session_id=dp_session_id,
@@ -1674,7 +1644,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             # so concurrent cold-start requests don't race on its lazy init.
             _get_multimodal_processor()
             loop = asyncio.get_running_loop()
-            token_ids, multimodal_data = await loop.run_in_executor(
+            token_ids, multimodal_data, media_placeholders = await loop.run_in_executor(
                 None,
                 _prepare_multimodal_inputs,
                 messages,
@@ -1706,6 +1676,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         if request.stream:
             stream_input = token_ids if is_multimodal else prompt
             stream_multimodal_data = multimodal_data if is_multimodal else None
+            stream_placeholders = media_placeholders if is_multimodal else None
             if effective_n > 1:
                 seq_ids, stream_collector, num_prompt_tokens = (
                     await setup_streaming_request_fanout(
@@ -1713,6 +1684,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                         sampling_params,
                         request_id,
                         multimodal_data=stream_multimodal_data,
+                        media_placeholders=stream_placeholders,
                         kv_transfer_params=request.kv_transfer_params,
                         **dp_routing,
                     )
@@ -1737,6 +1709,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                         sampling_params,
                         request_id,
                         multimodal_data=stream_multimodal_data,
+                        media_placeholders=stream_placeholders,
                         kv_transfer_params=request.kv_transfer_params,
                         **dp_routing,
                     )
@@ -1767,6 +1740,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     sampling_params,
                     request_id,
                     multimodal_data=multimodal_data,
+                    media_placeholders=media_placeholders,
                     kv_transfer_params=request.kv_transfer_params,
                     **dp_routing,
                 ),
@@ -1791,6 +1765,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     multimodal_data,
                     sampling_params,
                     request_id,
+                    media_placeholders=media_placeholders,
                     **dp_routing,
                 ),
                 raw_request,

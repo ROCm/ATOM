@@ -6,6 +6,7 @@ import logging
 from conftest import MockConfig
 
 from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.multimodal import MediaPlaceholder
 
 # ── compute_hash ───────────────────────────────────────────────────────────
 
@@ -29,6 +30,32 @@ class TestComputeHash:
     def test_hash_is_int(self):
         h = BlockManager.compute_hash([1, 2, 3, 4])
         assert isinstance(h, int)
+
+    def test_no_extra_keys_digests_exactly_what_it_always_did(self):
+        # The regression gate for every prefix cached before extra_keys
+        # existed: a block with no media must hash bit-identically to the
+        # two-argument call, or text-only serving loses its whole cache.
+        assert BlockManager.compute_hash([1, 2, 3, 4]) == BlockManager.compute_hash(
+            [1, 2, 3, 4], -1, None
+        )
+        assert BlockManager.compute_hash([1, 2, 3, 4], 7) == BlockManager.compute_hash(
+            [1, 2, 3, 4], 7, None
+        )
+
+    def test_extra_keys_change_hash(self):
+        plain = BlockManager.compute_hash([1, 2, 3, 4], 7)
+        keyed = BlockManager.compute_hash([1, 2, 3, 4], 7, ((123, 0),))
+        assert plain != keyed
+
+    def test_different_media_hash_differently(self):
+        first = BlockManager.compute_hash([1, 2, 3, 4], 7, ((123, 0),))
+        second = BlockManager.compute_hash([1, 2, 3, 4], 7, ((456, 0),))
+        assert first != second
+
+    def test_same_media_at_a_different_alignment_hashes_differently(self):
+        at_start = BlockManager.compute_hash([1, 2, 3, 4], 7, ((123, 0),))
+        shifted = BlockManager.compute_hash([1, 2, 3, 4], 7, ((123, 2),))
+        assert at_start != shifted
 
 
 # ── can_allocate ───────────────────────────────────────────────────────────
@@ -787,9 +814,9 @@ class TestRegisterReceivedPrefix:
         computed_token_groups = []
         compute_hash = bm.compute_hash
 
-        def tracked_compute_hash(token_ids, prefix=-1):
+        def tracked_compute_hash(token_ids, prefix=-1, extra_keys=None):
             computed_token_groups.append(list(token_ids))
-            return compute_hash(token_ids, prefix)
+            return compute_hash(token_ids, prefix, extra_keys)
 
         monkeypatch.setattr(bm, "compute_hash", tracked_compute_hash)
 
@@ -1213,3 +1240,145 @@ class TestJointChunkProbeIsGated:
         # runs and fails -- which is the point: it ran.
         assert bm._joint_chunk_tokens == 0
         assert "LMCache chunk size" in caplog.text
+
+
+# ── media placeholders in the block hash ───────────────────────────────────
+
+
+PLACEHOLDER_TOKEN = 999
+
+
+def _media_tokens() -> list[int]:
+    """28 tokens: 16 of text, one image's 8 placeholders, then 4 more of text.
+
+    With hash_block_size 4 the image covers blocks 4 and 5, so blocks 0-3 are
+    text that no image touches. `can_allocate` walks `_n_hash_blocks - 1`, so
+    the most it can report here is 6.
+    """
+    return list(range(16)) + [PLACEHOLDER_TOKEN] * 8 + [100, 101, 102, 103]
+
+
+def _image(identifier: int, offset: int = 16, length: int = 8) -> MediaPlaceholder:
+    return MediaPlaceholder(
+        identifier=identifier, modality="image", offset=offset, length=length
+    )
+
+
+class TestMediaPlaceholdersInBlockHash:
+    """A prompt's placeholder tokens are the same token id whatever the image.
+
+    Without the image in the block hash, "same text, different image" collides
+    and the second request reads the first one's KV back as its own.
+    """
+
+    def _bm(self, **overrides) -> BlockManager:
+        cfg = MockConfig(
+            num_kvcache_blocks=32,
+            kv_cache_block_size=4,
+            enable_prefix_caching=True,
+            **overrides,
+        )
+        return BlockManager(cfg)
+
+    def _publish(self, bm, seq_factory, images):
+        """Admit a sequence, publish its block hashes, then release it."""
+        tokens = _media_tokens()
+        seq = seq_factory(tokens, media_placeholders=images)
+        bm.allocate(seq, 0)
+        bm.hash_blocks(seq, len(tokens))
+        bm.deallocate(seq)
+        return tokens
+
+    def test_a_different_image_does_not_reuse_the_first_ones_blocks(self, seq_factory):
+        bm = self._bm()
+        tokens = self._publish(bm, seq_factory, (_image(0xAAAA),))
+
+        second = seq_factory(tokens, media_placeholders=(_image(0xBBBB),))
+        # 4, not 6: the text before the image is shared, the image's own two
+        # blocks are not. 6 here would be the bug -- the second request reading
+        # the first image's KV.
+        assert bm.can_allocate(second) == 4
+
+    def test_the_same_image_is_still_fully_reused(self, seq_factory):
+        bm = self._bm()
+        tokens = self._publish(bm, seq_factory, (_image(0xAAAA),))
+
+        again = seq_factory(tokens, media_placeholders=(_image(0xAAAA),))
+        # Multi-turn chat about one image must keep its prefix.
+        assert bm.can_allocate(again) == 6
+
+    def test_a_text_only_prompt_shares_the_prefix_ahead_of_the_image(self, seq_factory):
+        """The whole reason the keys are per-block rather than per-request.
+
+        Blocks before the image carry no keys, so they digest exactly what a
+        text-only prompt digests and the two share. Seeding the chain with the
+        image instead would diverge from block 0 and lose this.
+        """
+        bm = self._bm()
+        self._publish(bm, seq_factory, (_image(0xAAAA),))
+
+        text_only = seq_factory(list(range(16)) + [7, 7, 7, 7])
+        assert bm.can_allocate(text_only) == 4
+
+    def test_images_are_keyed_independently(self, seq_factory):
+        bm = self._bm()
+        images = (_image(0xAAAA, offset=4, length=4), _image(0xBBBB))
+        tokens = self._publish(bm, seq_factory, images)
+
+        # Only the first image changes: block 1 diverges, so nothing past it
+        # can match either.
+        changed_first = seq_factory(
+            tokens,
+            media_placeholders=(_image(0xCCCC, offset=4, length=4), _image(0xBBBB)),
+        )
+        assert bm.can_allocate(changed_first) == 1
+
+        # Only the second changes: everything up to its first block still matches.
+        changed_second = seq_factory(
+            tokens,
+            media_placeholders=(_image(0xAAAA, offset=4, length=4), _image(0xCCCC)),
+        )
+        assert bm.can_allocate(changed_second) == 4
+
+    def test_the_memo_is_rebuilt_for_a_different_hash_block_size(
+        self, seq_factory, monkeypatch
+    ):
+        """A disaggregated request is pickled between engines, memo and all.
+
+        Prefill and decode can run different DCP degrees, so the memo can arrive
+        describing a block size this side does not use. Keyed on the size it was
+        built for, it rebuilds instead of keying blocks on stale ranges.
+        """
+        seq = seq_factory(_media_tokens(), media_placeholders=(_image(0xAAAA),))
+
+        local = self._bm()
+        local.can_allocate(seq)
+        assert seq.media_extra_keys_cache[0] == 4
+        built_for_four = seq.media_extra_keys_cache[1]
+
+        remote = self._bm(decode_context_parallel_size=2)
+        monkeypatch.setattr(
+            remote,
+            "num_pool_blocks",
+            lambda seq_len: (seq_len + remote.hash_block_size - 1)
+            // remote.hash_block_size,
+        )
+        remote.can_allocate(seq)
+        assert seq.media_extra_keys_cache[0] == 8
+        assert seq.media_extra_keys_cache[1] != built_for_four
+
+    def test_keys_follow_the_hash_block_size_under_dcp(self, seq_factory, monkeypatch):
+        """hash_block_size is block_size * dcp, and the ranges must use it."""
+        bm = self._bm(decode_context_parallel_size=2)
+        monkeypatch.setattr(
+            bm,
+            "num_pool_blocks",
+            lambda seq_len: (seq_len + bm.hash_block_size - 1) // bm.hash_block_size,
+        )
+        assert bm.hash_block_size == 8
+        tokens = self._publish(bm, seq_factory, (_image(0xAAAA),))
+
+        # 28 tokens over 8-token blocks: the image spans [16, 24) == block 2
+        # alone, so a different image leaves blocks 0 and 1 shareable.
+        second = seq_factory(tokens, media_placeholders=(_image(0xBBBB),))
+        assert bm.can_allocate(second) == 2

@@ -142,6 +142,7 @@ class Sequence:
         sibling_index: int = 0,
         request_id: str | None = None,
         multimodal_data: dict | None = None,
+        media_placeholders: tuple | None = None,
         mrope_positions: np.ndarray | None = None,
         mrope_position_delta: int = 0,
         data_parallel_rank: int | None = None,
@@ -167,6 +168,24 @@ class Sequence:
         # allocate() / free it in deallocate().
         self.has_per_req_cache = has_per_req_cache
         self.multimodal_data = multimodal_data
+        # Where each media item's placeholder tokens landed, and a content
+        # hash of the image that put them there. The prefix cache reads this
+        # to tell two prompts apart when only their images differ; see
+        # `MediaPlaceholder` and `BlockManager._media_extra_keys`.
+        #
+        # Its own field, deliberately, rather than a key inside
+        # `multimodal_data`: that dict is cleared when the scheduler builds
+        # the first batch, while block hashes are published after the forward
+        # -- placeholders kept there would be gone by publish time and the
+        # blocks would land under text-only hashes admission never looks up.
+        # A tuple because every sibling of an n>1 fanout shares this object.
+        self.media_placeholders = media_placeholders or ()
+        # BlockManager's memo of which block holds which image, as
+        # `(hash_block_size, {block_idx: extra_keys})`. Derived state, so it
+        # is rebuilt whenever the block size it was built for is not the one
+        # asking -- which is what a request handed from a prefill engine to a
+        # decode engine at a different DCP degree looks like.
+        self.media_extra_keys_cache: tuple | None = None
         self.mrope_positions = mrope_positions
         self.mrope_position_delta = mrope_position_delta
         self.num_tokens = len(self.token_ids)

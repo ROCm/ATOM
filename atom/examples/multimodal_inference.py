@@ -81,33 +81,20 @@ def main():
     engine_args = EngineArgs.from_cli_args(args)
     llm = engine_args.create_engine()
 
-    built = build_multimodal_inputs(
+    input_ids, multimodal_data, placeholders = build_multimodal_inputs(
         llm.io_processor.config,
         processor,
         messages,
         images,
         chat_template_kwargs,
     )
-    if built is not None:
-        input_ids, multimodal_data = built
-    else:
-        # Default (Qwen-style) path: the template expands image placeholders
-        # itself, so tokenize the rendered text together with the images.
-        text = processor.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            **chat_template_kwargs,
-        )
-        print(f"Formatted prompt (first 500 chars): {text[:500]}")
-        inputs = processor(text=[text], images=images, return_tensors="pt")
-        input_ids = inputs["input_ids"][0].tolist()
-        multimodal_data = {
-            "pixel_values": inputs["pixel_values"],
-            "image_grid_thw": inputs["image_grid_thw"],
-        }
 
     print(f"Input token count: {len(input_ids)}")
+    for item in placeholders:
+        print(
+            f"  {item.modality} at [{item.offset}, {item.offset + item.length}) "
+            f"id={item.identifier:#034x}"
+        )
     print(f"pixel_values shape: {multimodal_data['pixel_values'].shape}")
     print(f"image_grid_thw: {multimodal_data['image_grid_thw']}")
 
@@ -121,6 +108,7 @@ def main():
         [input_ids],
         sampling_params,
         [multimodal_data],
+        [tuple(placeholders)],
     )
 
     # Print results

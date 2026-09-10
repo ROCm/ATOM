@@ -194,6 +194,7 @@ class LLMEngine:
         sampling_params_list: SamplingParams | list[SamplingParams],
         stream_callback=None,
         multimodal_data_list: list[dict] | None = None,
+        media_placeholders_list: list[tuple] | None = None,
         request_ids: list[str] | None = None,
     ):
         # if sampling params is not list, use it for all prompts
@@ -232,6 +233,17 @@ class LLMEngine:
         else:
             mm_data_iter = itertools.repeat(None)
 
+        # Handle media placeholders (prompt ranges + image content hashes)
+        if media_placeholders_list is not None:
+            if len(prompt_or_tokens_list) != len(media_placeholders_list):
+                raise ValueError(
+                    f"number of elements in prompt_or_tokens_list and media_placeholders_list is different: "
+                    f"{len(prompt_or_tokens_list)=} vs {len(media_placeholders_list)=}"
+                )
+            placeholders_iter = media_placeholders_list
+        else:
+            placeholders_iter = itertools.repeat(None)
+
         # Handle request_ids
         if request_ids is not None:
             if len(request_ids) != len(prompt_or_tokens_list):
@@ -244,11 +256,12 @@ class LLMEngine:
             request_id_iter = itertools.repeat(None)
 
         reqs = []
-        for prompt, sampling_param, callback, mm_data, request_id in zip(
+        for prompt, sampling_param, callback, mm_data, placeholders, request_id in zip(
             prompt_or_tokens_list,
             sampling_params_iter,
             stream_callback_iter,
             mm_data_iter,
+            placeholders_iter,
             request_id_iter,
         ):
             req = self.io_processor.preprocess(
@@ -256,6 +269,7 @@ class LLMEngine:
                 sampling_param,
                 stream_callback=callback,
                 multimodal_data=mm_data,
+                media_placeholders=placeholders,
                 request_id=request_id,
             )
             reqs.append(req)
@@ -295,6 +309,7 @@ class LLMEngine:
         token_ids_list: list[list[int]],
         sampling_params: SamplingParams | list[SamplingParams],
         multimodal_data_list: list[dict],
+        media_placeholders_list: list[tuple] | None = None,
     ) -> list[dict]:
         """Generate completions for multimodal inputs (token IDs + vision data)."""
         self.core_mgr.reset_dp_router()
@@ -302,6 +317,7 @@ class LLMEngine:
             token_ids_list,
             sampling_params,
             multimodal_data_list=multimodal_data_list,
+            media_placeholders_list=media_placeholders_list,
         )
         outputs = {}
         while not self.is_finished() and (
@@ -684,6 +700,7 @@ class InputOutputProcessor:
         stream_callback=None,
         kv_transfer_params=None,
         multimodal_data=None,
+        media_placeholders: tuple | None = None,
         request_id: str | None = None,
         data_parallel_rank: int | None = None,
         dp_session_id: str | None = None,
@@ -708,6 +725,7 @@ class InputOutputProcessor:
             stream_callback=stream_callback,
             kv_transfer_params=kv_transfer_params,
             multimodal_data=multimodal_data,
+            media_placeholders=media_placeholders,
             parent_request_id=request_id,
             data_parallel_rank=data_parallel_rank,
             dp_session_id=dp_session_id,
@@ -723,6 +741,7 @@ class InputOutputProcessor:
         stream_callbacks: list | None = None,
         kv_transfer_params=None,
         multimodal_data=None,
+        media_placeholders: tuple | None = None,
         parent_request_id: str | None = None,
         data_parallel_rank: int | None = None,
         dp_session_id: str | None = None,
@@ -792,6 +811,7 @@ class InputOutputProcessor:
                 has_per_req_cache=self.has_per_req_cache,
                 kv_transfer_params=kv_transfer_params,
                 multimodal_data=multimodal_data,
+                media_placeholders=media_placeholders,
                 mrope_positions=mrope_positions,
                 mrope_position_delta=mrope_position_delta,
                 needs_independent_noise=(n > 1),

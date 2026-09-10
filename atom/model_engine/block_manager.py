@@ -42,6 +42,7 @@ def _make_block_stored(
     parent: int | None,
     block_size: int,
     medium: str = MEDIUM_GPU,
+    extra_keys: list | None = None,
 ) -> BlockStored:
     """Construct a BlockStored event from a coalesced run of new blocks."""
     # A list, not the `array("i")` the publish paths carry: the event is
@@ -57,6 +58,7 @@ def _make_block_stored(
         token_ids=tokens,
         block_size=block_size,
         medium=medium,
+        extra_keys=extra_keys,
     )
 
 
@@ -372,7 +374,12 @@ class BlockManager:
         self.chunks_cut_for_end: int = 0
 
     @classmethod
-    def compute_hash(cls, token_ids: array.array, prefix: int = -1):
+    def compute_hash(
+        cls,
+        token_ids: array.array,
+        prefix: int = -1,
+        extra_keys: tuple | None = None,
+    ):
         h = xxhash.xxh64()
         if prefix != -1:
             h.update(prefix.to_bytes(8, "little"))
@@ -383,7 +390,65 @@ class BlockManager:
         # was -- and keeps a caller who does pass a list from silently
         # computing a different one.
         h.update(np.asarray(token_ids, dtype=np.int64).tobytes())
+        # Appended, and only when there are any, so that a block holding no
+        # media digests exactly the bytes it always did: `extra_keys=None`
+        # has to stay bit-identical to the two-argument call, or every
+        # prefix cached before this existed misses. Keys are plain ints, so
+        # `repr` is a stable encoding of them.
+        if extra_keys is not None:
+            h.update(repr(extra_keys).encode())
         return h.intdigest()
+
+    def _media_extra_keys(self, seq: Sequence, block_idx: int):
+        """Extra hash keys for block `block_idx`, or None when it holds no media.
+
+        A prompt's media placeholder tokens all carry the same token id, so
+        without these two prompts differing only in their images hash
+        identically and the second one silently reuses the first one's KV.
+
+        Each key is `(identifier, offset - block_start)`. The offset is relative
+        to the block, so the same image landing at a different alignment keys
+        differently.
+
+        Only blocks that overlap a media range get keys. Everything before the
+        first image therefore hashes exactly as a text-only prompt does and stays
+        shareable with one; everything after it differs anyway, because the
+        chained parent hash already carries the image. Blocks past the last image
+        -- every decode block among them -- get none.
+        """
+        placeholders = seq.media_placeholders
+        if not placeholders:
+            return None
+
+        hbs = self._hash_block_size()
+        cached = seq.media_extra_keys_cache
+        # Keyed on the block size it was built for, not just cached: a
+        # disaggregated request is pickled from the prefill engine to the decode
+        # engine, and the two can run different DCP degrees -- so the cache can
+        # arrive describing a block size this side does not use. The mooncake
+        # connector guards the same mismatch on the transfer itself.
+        if cached is None or cached[0] != hbs:
+            cached = (hbs, self._build_media_extra_keys(placeholders, hbs))
+            seq.media_extra_keys_cache = cached
+        return cached[1].get(block_idx)
+
+    @staticmethod
+    def _build_media_extra_keys(placeholders, hbs: int) -> dict[int, tuple]:
+        """Map block index -> extra keys for the blocks that hold media.
+
+        Built once per sequence: the prompt is immutable, so which block holds
+        which image is fixed the moment the request arrives. Bounded by the
+        blocks the media actually span, not by the sequence length.
+        """
+        by_block: dict[int, list[tuple[int, int]]] = {}
+        for item in placeholders:
+            first = item.offset // hbs
+            last = (item.offset + item.length - 1) // hbs
+            for block_idx in range(first, last + 1):
+                by_block.setdefault(block_idx, []).append(
+                    (item.identifier, item.offset - block_idx * hbs)
+                )
+        return {idx: tuple(keys) for idx, keys in by_block.items()}
 
     def complete_previous_state_batch(self) -> None:
         """Complete state reads and copies issued by the previous batch."""
@@ -842,7 +907,9 @@ class BlockManager:
         chain = list(block_hashes)
         h = chain[-1] if chain else -1
         for i in range(len(chain), blocks):
-            h = self.compute_hash(self._hash_block_tokens(seq, i), h)
+            h = self.compute_hash(
+                self._hash_block_tokens(seq, i), h, self._media_extra_keys(seq, i)
+            )
             chain.append(h)
         return chain
 
@@ -887,7 +954,7 @@ class BlockManager:
         block_hashes: list[int] = []
         for i in range(self._n_hash_blocks(seq) - 1):
             token_ids = self._hash_block_tokens(seq, i)
-            h = self.compute_hash(token_ids, h)
+            h = self.compute_hash(token_ids, h, self._media_extra_keys(seq, i))
             block_id = self.kv.lookup(h)
             if block_id == -1 or self.kv.block(block_id).token_ids != token_ids:
                 break
@@ -1004,7 +1071,7 @@ class BlockManager:
         hit_hash = -1
         for i in range(claim_blocks):
             token_ids = self._hash_block_tokens(seq, i)
-            h = self.compute_hash(token_ids, h)
+            h = self.compute_hash(token_ids, h, self._media_extra_keys(seq, i))
             block_id = self.kv.lookup(h)
             if block_id == -1:
                 # Evicted between `can_allocate` and here. For the widened joint
@@ -1606,13 +1673,16 @@ class BlockManager:
         store_run_parent: int | None = h if h != -1 else None
         store_run_hashes: list[int] = []
         store_run_tokens: list[int] = []
+        store_run_extra_keys: list = []
         for i in range(start, end):
             token_ids = self._hash_block_tokens(seq, i)
-            h = self.compute_hash(token_ids, h)
+            extra_keys = self._media_extra_keys(seq, i)
+            h = self.compute_hash(token_ids, h, extra_keys)
             self.kv.publish(seq.block_table[i], h, token_ids)
             if record:
                 store_run_hashes.append(h)
                 store_run_tokens.extend(token_ids)
+                store_run_extra_keys.append(extra_keys)
         if record and store_run_hashes:
             self._event_log.append(
                 _make_block_stored(
@@ -1620,6 +1690,11 @@ class BlockManager:
                     store_run_tokens,
                     store_run_parent,
                     self.hash_block_size,
+                    extra_keys=(
+                        store_run_extra_keys
+                        if any(k is not None for k in store_run_extra_keys)
+                        else None
+                    ),
                 )
             )
         pos = base + num_new_tokens
@@ -2355,7 +2430,9 @@ class BlockManager:
             token_ids = self._hash_block_tokens(seq, i)
             block_id = seq.block_table[i]
             block = self.kv.block(block_id)
-            block_hash = self.compute_hash(token_ids, parent_hash)
+            block_hash = self.compute_hash(
+                token_ids, parent_hash, self._media_extra_keys(seq, i)
+            )
             canonical_id = self.kv.lookup(block_hash)
 
             if block.hash not in (-1, block_hash):
@@ -2437,7 +2514,7 @@ class BlockManager:
 
         for i in range(start, num_full):
             token_ids = self._hash_block_tokens(seq, i)
-            h = self.compute_hash(token_ids, h)
+            h = self.compute_hash(token_ids, h, self._media_extra_keys(seq, i))
             block_id = seq.block_table[i]
             block = self.kv.block(block_id)
             indexed_block_id = self.kv.lookup(h)
