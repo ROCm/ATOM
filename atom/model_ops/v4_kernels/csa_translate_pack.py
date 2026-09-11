@@ -66,6 +66,7 @@ def _csa_translate_pack_kernel(
     index_topk: tl.constexpr,
     csa_block_capacity: tl.constexpr,
     ENVELOPE_ROWS: tl.constexpr,  # rows one block occupies across all layers
+    COMPRESS_BIAS: tl.constexpr,  # rows to this layer's compressor owner; 0 = itself
     BLOCK_K: tl.constexpr,
     INLINE_SKIP_FROM_POS: tl.constexpr,  # True → skip = min(pos+1, WINDOW_SIZE) (decode); False → load from buffer (prefill)
     WINDOW_SIZE: tl.constexpr,  # SWA window; only used under INLINE_SKIP_FROM_POS
@@ -134,7 +135,7 @@ def _csa_translate_pack_kernel(
     )
     tl.store(
         kv_indices_csa_ptr + write_base + k_offs,
-        compress_row(phys, slot, ENVELOPE_ROWS),
+        compress_row(phys, slot, ENVELOPE_ROWS, COMPRESS_BIAS),
         mask=in_range,
     )
 
@@ -151,6 +152,7 @@ def csa_translate_pack(
     *,
     envelope_rows: int,
     csa_block_capacity: int,
+    compress_bias: int = 0,
     window_size: int = 0,
     prefix: str = "",
 ) -> None:
@@ -201,10 +203,17 @@ def csa_translate_pack(
                                    the compress stride, from
                                    `UnifiedPoolGeometry.envelope_rows`. Fixed at
                                    CG capture time. Keyword-only.
-      csa_block_capacity:          `block_size // ratio = 256 // 4 = 64`, the
-                                   rows this layer contributes per block
-                                   (constexpr; triton can strength-reduce
-                                   // and %). Keyword-only.
+      csa_block_capacity:          `block_size // ratio` (256 // 4 = 64 for
+                                   V4), the rows this layer contributes per
+                                   block (constexpr; triton can
+                                   strength-reduce // and %). Keyword-only.
+      compress_bias:               rows from this layer's own envelope rows to
+                                   the rows it actually reads, when it does not
+                                   own a compressor -- from
+                                   `UnifiedPoolGeometry.compress_bias`. 0 (the
+                                   default, and every V4 layer) leaves the
+                                   stored row exactly what it was.
+                                   Keyword-only.
       window_size:                 SWA window. When > 0 the kernel computes
                                    per-token skip inline (decode shortcut);
                                    when 0 the per-token buffer is loaded.
@@ -264,6 +273,7 @@ def csa_translate_pack(
         index_topk=index_topk,
         csa_block_capacity=csa_block_capacity,
         ENVELOPE_ROWS=envelope_rows,
+        COMPRESS_BIAS=compress_bias,
         BLOCK_K=BLOCK_K,
         INLINE_SKIP_FROM_POS=inline_skip,
         WINDOW_SIZE=window_size,
@@ -281,6 +291,7 @@ def csa_translate_pack_reference(
     *,
     envelope_rows: int,
     csa_block_capacity: int,
+    compress_bias: int = 0,
     window_size: int = 0,
 ) -> None:
     """Pure-torch reference. Mirrors the kernel — derives per-token valid_k
@@ -314,6 +325,6 @@ def csa_translate_pack_reference(
         blk_idx = (topk // csa_block_capacity).clamp(0, mnbps - 1)
         slot = topk % csa_block_capacity
         phys = block_tables[bid, blk_idx].to(torch.int64)
-        rows = phys * envelope_rows + slot
+        rows = phys * envelope_rows + slot + compress_bias
         for k in range(valid_k):
             kv_indices_csa[base + k] = int(rows[k].item())

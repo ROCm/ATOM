@@ -419,6 +419,11 @@ class DeepseekV4Args:
 
     # Per-layer attention type: 0=Dense, 4=CSA, 128 (or other large m')=HCA
     compress_ratios: tuple[int, ...] = field(default_factory=tuple)
+    # Layers that own a compressor / an indexer K cache. A layer reads the
+    # greatest source at or before itself. Absent (None) is V4: every
+    # compressed layer owns its own.
+    kv_source_layer_ids: tuple[int, ...] | None = None
+    index_source_layer_ids: tuple[int, ...] | None = None
 
     # Indexer (CSA layers only)
     index_n_heads: int = 64
@@ -486,6 +491,8 @@ class DeepseekV4Args:
             o_groups=g("o_groups", 16),
             window_size=g("sliding_window", 128),
             compress_ratios=tuple(g("compress_ratios", (0,))),
+            kv_source_layer_ids=_as_layer_ids(g("kv_source_layer_ids", None)),
+            index_source_layer_ids=_as_layer_ids(g("index_source_layer_ids", None)),
             index_n_heads=g("index_n_heads", 64),
             index_head_dim=g("index_head_dim", 128),
             index_topk=g("index_topk", 1024),
@@ -514,6 +521,11 @@ class DeepseekV4Args:
         )
 
 
+def _as_layer_ids(value) -> tuple[int, ...] | None:
+    """A config's source-layer list as a sorted tuple; nothing stays None."""
+    return tuple(sorted(int(v) for v in value)) if value else None
+
+
 def _v4_index_topk_refreshes(args: DeepseekV4Args, layer_id: int) -> bool:
     index_topk_pattern = args.index_topk_pattern
     if index_topk_pattern is not None:
@@ -534,6 +546,26 @@ def _v4_index_topk_refreshes(args: DeepseekV4Args, layer_id: int) -> bool:
 
 
 def _should_skip_v4_index_topk(args: DeepseekV4Args, layer_id: int) -> bool:
+    """Whether this layer reuses the top-k an earlier layer already wrote.
+
+    Reuse itself is the same either way: a consumer simply does not overwrite
+    `attn_metadata.kv_indices_*`, so the source's contents stand. What differs
+    is who decides. `index_source_layer_ids` states it per layer, which is how
+    V4.1-Flash spells a structural source/reuse map; with no such table the V4
+    heuristic (`index_topk_freq` / `index_topk_pattern`, behind
+    `use_index_cache`) decides, unchanged.
+    """
+    sources = args.index_source_layer_ids
+    if sources:
+        if args.compress_ratios[layer_id] <= 0 or layer_id in sources:
+            return False
+        if not any(source < layer_id for source in sources):
+            raise ValueError(
+                f"layer {layer_id} reuses an index top-k but no source layer "
+                f"precedes it in {list(sources)}"
+            )
+        return True
+
     if not args.use_index_cache:
         return False
     if args.compress_ratios[layer_id] != 4:
@@ -2393,6 +2425,10 @@ class DeepseekV4Attention(nn.Module):
         )
         self.swa_plane_rope = None
         self.swa_window = None
+        # Rows from this layer's own compressed rows to the ones it reads.
+        # Zero unless the builder binds a layer that reuses another's
+        # compressor; see `UnifiedPoolGeometry.compress_bias`.
+        self.compress_bias = 0
         # Classical KV cache (paper §3.6.1) lives entirely in the global
         # `csa_main_kv` / `hca_main_kv` pool (allocated by the V4 attention
         # builder as `[num_blocks, n_layers, k_per_block, head_dim]`).
@@ -3340,12 +3376,13 @@ class DeepseekV4Attention(nn.Module):
             to csa_translate_pack so the kernel can compute per-token
             `valid_k` inline.
         """
-        # csa_block_capacity = block_size // ratio = 256 // 4 = 64.
-        # Derived from constants (not `compressor.kv_cache.size(1)`) because
-        # warmup runs before `build_kv_cache_tensor` binds compressor.kv_cache,
-        # and this method now fires for both decode and prefill (including
-        # warmup batches). Equivalent post-bind: `compressor.kv_cache.size(1)`.
-        csa_block_capacity = _V4_BLOCK_SIZE // 4
+        # csa_block_capacity = block_size // ratio = 256 // 4 = 64 for V4.
+        # Derived from the block size and this layer's own ratio (not
+        # `compressor.kv_cache.size(1)`) because warmup runs before
+        # `build_kv_cache_tensor` binds compressor.kv_cache, and this method
+        # now fires for both decode and prefill (including warmup batches).
+        # Equivalent post-bind: `compressor.kv_cache.size(1)`.
+        csa_block_capacity = _V4_BLOCK_SIZE // self.compress_ratio
 
         if attn_md.state is AttnState.DECODE:
             kv_indptr = attn_md.kv_indptr_csa
@@ -3374,6 +3411,7 @@ class DeepseekV4Attention(nn.Module):
             kv_indices,
             envelope_rows=attn_md.envelope_rows,
             csa_block_capacity=csa_block_capacity,
+            compress_bias=self.compress_bias,
             window_size=window_size,
             prefix=f"{self.layer_name}.csa_translate_pack",
         )

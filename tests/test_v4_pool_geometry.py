@@ -500,9 +500,17 @@ class TestBoundary:
 
 
 class TestRejects:
+    def test_a_ratio_the_block_does_not_divide(self):
+        """7 rows per block is 36.57 rows per layer, so the class has no
+        integer layer stride and every address past the first is off by the
+        remainder. The refusal is by division now rather than by a fixed set
+        of known ratios: which ratios a config names is up to the config."""
+        with pytest.raises(ValueError, match="do not divide a block"):
+            UnifiedPoolGeometry([0, 4, 7], 1, 1, ring_slots=8, block_size=256)
+
     def test_unknown_ratio(self):
         with pytest.raises(ValueError, match="unknown V4 compress ratios"):
-            UnifiedPoolGeometry([0, 4, 7], 1, 1, ring_slots=8, block_size=256)
+            UnifiedPoolGeometry([0, 4, -2], 1, 1, ring_slots=8, block_size=256)
 
     def test_no_layers(self):
         with pytest.raises(ValueError, match="at least one layer"):

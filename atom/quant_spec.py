@@ -57,6 +57,11 @@ class _LazyAiterAttr:
 QuantType = _LazyAiterAttr("aiter", "QuantType")
 d_dtypes = _LazyAiterAttr("aiter.utility.dtypes", "d_dtypes")
 
+# Historical blockscale grid. `_infer_qtype` collapses both ``[1, 128]`` and
+# ``[128, 128]`` to ``per_1x128``, and both allocate a ``(out/128, in/128)``
+# weight scale, so 128 is the grid whenever a checkpoint declares nothing finer.
+DEFAULT_BLOCK_SCALE = 128
+
 # ──────────────────────────────────────────────────────────────────────
 # Typed layer-level spec
 # ──────────────────────────────────────────────────────────────────────
@@ -73,10 +78,39 @@ class LayerQuantConfig:
     quant_dtype: Any = torch.bfloat16  # torch.dtype (use Any for forward compat)
     is_dynamic: bool = True
     quant_method: str | None = None
+    # Raw HF ``weight_block_size`` rows/cols, when the checkpoint declares one.
+    block_n: int | None = None
+    block_k: int | None = None
+    # Raw HF ``scale_fmt``: "ue8m0" means power-of-two scales stored as
+    # ``torch.float8_e8m0fnu``; None / "fp32" means fp32 scales.
+    scale_fmt: str | None = None
 
     @property
     def is_quantized(self) -> bool:
         return self.quant_type != QuantType.No
+
+    @property
+    def block_scale_grid(self) -> tuple[int, int]:
+        """``(block_n, block_k)`` of the 2-D FP8 weight-scale grid.
+
+        A missing block size, or a ``[1, K]`` one, keeps the 128x128 grid the
+        ``per_1x128`` path has always allocated. Only a checkpoint declaring a
+        different square block -- the ``[32, 32]`` of DeepSeek-V4.1-Flash --
+        moves it.
+        """
+        if self.block_n is None or self.block_k is None or self.block_n == 1:
+            return (DEFAULT_BLOCK_SCALE, DEFAULT_BLOCK_SCALE)
+        return (self.block_n, self.block_k)
+
+    @property
+    def has_fine_block_scale(self) -> bool:
+        """Weight-scale grid finer than the legacy 128x128 one."""
+        return self.block_scale_grid != (DEFAULT_BLOCK_SCALE, DEFAULT_BLOCK_SCALE)
+
+    @property
+    def is_ue8m0_block_scale(self) -> bool:
+        """Fine block scales stored as ue8m0 (``torch.float8_e8m0fnu``)."""
+        return self.has_fine_block_scale and self.scale_fmt == "ue8m0"
 
     @classmethod
     def no_quant(cls, dtype: Any = torch.bfloat16) -> LayerQuantConfig:
@@ -225,6 +259,16 @@ def _parse_quant_dtype(dtype_str: str | None) -> Any:
         if result is not None:
             return result
     return torch.bfloat16
+
+
+def _parse_weight_block_size(wbs: Any) -> tuple[int | None, int | None]:
+    """Raw HF ``weight_block_size`` -> ``(block_n, block_k)``, or ``(None, None)``."""
+    if not isinstance(wbs, (list, tuple)) or len(wbs) < 2:
+        return (None, None)
+    try:
+        return (int(wbs[0]), int(wbs[1]))
+    except (TypeError, ValueError):
+        return (None, None)
 
 
 def _parse_is_dynamic(input_tensors: dict | None) -> bool:
@@ -433,11 +477,17 @@ class GenericParser(QuantConfigParser):
             or []
         )
 
+        block_n, block_k = _parse_weight_block_size(weight_block_size)
+        scale_fmt = hf_quant_config.get("scale_fmt") or None
+
         global_spec = LayerQuantConfig(
             quant_type=quant_type,
             quant_dtype=quant_dtype,
             is_dynamic=is_dynamic,
             quant_method=quant_method or None,
+            block_n=block_n,
+            block_k=block_k,
+            scale_fmt=scale_fmt,
         )
 
         return ParsedQuantConfig(global_spec=global_spec, exclude_layers=exclude)
@@ -492,6 +542,9 @@ class GenericParser(QuantConfigParser):
                     return QuantType.per_1x128
                 if (m, n) == (1, 32):
                     return QuantType.per_1x32
+                # Any other 2-D block (DeepSeek-V4.1-Flash ships [32, 32]
+                # ue8m0) also stays on per_1x128: QuantType lives in AITER C++,
+                # so the real grid travels on the spec's block_n / block_k.
                 return QuantType.per_1x128
         # Check explicit fields
         for key in ("quant_type", "quantization_type", "scheme"):

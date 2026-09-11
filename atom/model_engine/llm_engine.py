@@ -674,6 +674,10 @@ class InputOutputProcessor:
                 "kimi_linear",
                 "glm5_next_text",
                 "deepseek_v4",
+                # `deepseek_v41` is the wrapper type; a served config
+                # arrives as its text sub-config, so both are listed.
+                "deepseek_v41",
+                "deepseek_v41_text",
             }
         )
 

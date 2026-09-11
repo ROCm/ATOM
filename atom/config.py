@@ -642,6 +642,11 @@ def glm5_kpool_block_size(index_kpool: int) -> int:
 _CONFIG_REGISTRY: dict[str, str] = {
     "deepseek_v32": "deepseek_v3",
     "deepseek_v4": "deepseek_v3",  # V4 reuses V3 schema; V4-specific fields
+    # V4.1 reuses it too. It cannot be a bare PretrainedConfig like the
+    # other text sub-configs: transformers 5.x standardizes `rope_scaling`
+    # in __post_init__ and a bare config has no `max_position_embeddings`
+    # attribute yet at that point, so from_dict raises.
+    "deepseek_v41_text": "deepseek_v3",
     # (compress_ratios, num_hash_layers, hc_mult, swiglu_limit, ...) flow
     # through as extra config attrs and are read in DeepseekV4Args.from_hf_config.
     "glm_moe_dsa": "deepseek_v3",  # GLM 5.0 MoE, structure similar to DeepSeek v3.2
@@ -663,6 +668,7 @@ _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     "qwen3_5_moe": "text_config",
     "mistral3": "text_config",
     "glm5_next": "text_config",  # GLM-5.3-Flash: text-only hybrid KDA/DSA runtime
+    "deepseek_v41": "text_config",  # DeepSeek-V4.1-Flash: served text-only
 }
 
 # Text sub-config model_types that this image's transformers has no class for.
@@ -730,6 +736,12 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
         original_arch = config_dict.get("architectures", [])
         if original_arch:
             hf_config.architectures = original_arch
+        # A mapped schema keeps only the fields it declares, so model-specific
+        # ones (V4.1's compress_ratios, kv_source_layer_ids, engram_*, ...)
+        # have to be put back. Same fix as the single-config branch below.
+        for field_name, value in text_config_dict.items():
+            if not hasattr(hf_config, field_name):
+                setattr(hf_config, field_name, value)
         # Propagate top-level token IDs if missing in text config
         for field in ("bos_token_id", "eos_token_id", "pad_token_id"):
             if getattr(hf_config, field, None) is None and field in config_dict:
@@ -2064,6 +2076,9 @@ class Config:
         # Use the preserved `architectures` field (re-injected by get_hf_config,
         # line 567) which keeps the original "DeepseekV4ForCausalLM[NextN]" name.
         arches = getattr(self.hf_config, "architectures", None) or []
+        # "DeepseekV41ForCausalLM" contains the "DeepseekV4" substring, so
+        # V4.1 takes this branch too -- which is what it needs: the same
+        # attention backend, the same 256-token block, the same FP4 indexer.
         is_deepseek_v4 = any("DeepseekV4" in str(a) for a in arches)
         if is_deepseek_v4:
             v4_block_size = 256

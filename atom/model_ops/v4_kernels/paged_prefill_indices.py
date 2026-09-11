@@ -107,6 +107,10 @@ def _v4_paged_prefill_indices_kernel(
     HCA_SLOT_ROWS: tl.constexpr,
     HCA_RING_STRIDE: tl.constexpr,
     HCA_RUN_ROWS: tl.constexpr,
+    # V4.1: the coarse class selects with a top-k too, so its buffer is laid
+    # out like the fine one -- compress at the head, SWA prefix at the tail --
+    # and this kernel leaves the head to `csa_translate_pack`.
+    HCA_TOPK: tl.constexpr = False,
 ):
     """One program per token. Writes four per-token segments:
 
@@ -157,7 +161,10 @@ def _v4_paged_prefill_indices_kernel(
     # this reads is inside the ring's last lap. That bound is what lets a ring
     # serve chunked prefill at all — the in-chunk part comes from the extend
     # tensor, never from the pool.
-    swa_base_hca = tl.load(prefix_hca_indptr_ptr + t)
+    if HCA_TOPK:
+        swa_base_hca = tl.load(prefix_hca_indptr_ptr + t + 1) - prefix_swa_count
+    else:
+        swa_base_hca = tl.load(prefix_hca_indptr_ptr + t)
     swa_mask = i < prefix_swa_count
     global_pos = swa_low + i
     swa_slot = tl.load(state_slot_per_seq_ptr + bid)
@@ -222,6 +229,8 @@ def _v4_paged_prefill_indices_kernel(
     hca_dst_base = swa_base_hca + prefix_swa_count
     # block_tables row stride is `bt_stride_bs` int32 elements (== max_num_blocks_per_seq).
     bt_row_base = bid * bt_stride_bs
+    if HCA_TOPK:
+        n_hca = 0
     for j in tl.range(0, n_hca, BLOCK_N):
         k = j + i
         hca_mask = k < n_hca
@@ -257,6 +266,9 @@ def write_v4_paged_prefill_indices(
     geometry: UnifiedPoolGeometry,
     hca_ratio: int = 128,
     hca_rows_per_block: int = 1,
+    csa_class_ratio: int = CSA_RATIO,
+    hca_class_ratio: int = HCA_RATIO,
+    hca_topk: bool = False,
     prefix: str = "",
 ) -> None:
     """One-shot GPU build of the V4 paged-prefill index buffers.
@@ -340,13 +352,13 @@ def write_v4_paged_prefill_indices(
     # have no such exit today; the assert is there so the day one appears it
     # says so instead of raising a bare KeyError out of the geometry.
     served = served_window_params(geometry)
-    assert CSA_RATIO in served and HCA_RATIO in served, (
+    assert csa_class_ratio in served and hca_class_ratio in served, (
         "V4 paged prefill writes the CSA and HCA prefix buffers unconditionally; "
         f"this pool serves only {sorted(served)}"
     )
     has_dense = DENSE_RATIO in served
-    csa = served[CSA_RATIO]
-    hca = served[HCA_RATIO]
+    csa = served[csa_class_ratio]
+    hca = served[hca_class_ratio]
     dense = served.get(DENSE_RATIO, csa)
     BLOCK_N = triton.next_power_of_2(win)
     _v4_paged_prefill_indices_kernel[(T,)](
@@ -371,6 +383,7 @@ def write_v4_paged_prefill_indices(
         hca_ring_start=hca.ring_start,
         HCA_RATIO=hca_ratio,
         HCA_ROWS_PER_BLOCK=hca_rows_per_block,
+        HCA_TOPK=hca_topk,
         ENVELOPE_ROWS=geometry.envelope_rows,
         BLOCK_N=BLOCK_N,
         HAS_DENSE=has_dense,
@@ -401,6 +414,9 @@ def write_v4_paged_prefill_indices_reference(
     geometry: UnifiedPoolGeometry,
     hca_ratio: int = 128,
     hca_rows_per_block: int = 1,
+    csa_class_ratio: int = CSA_RATIO,
+    hca_class_ratio: int = HCA_RATIO,
+    hca_topk: bool = False,
 ) -> None:
     """Pure-Python equivalent of ``write_v4_paged_prefill_indices``.
     Per-token Python loop — slow but readable; used for unit-test bit-exact
@@ -414,8 +430,8 @@ def write_v4_paged_prefill_indices_reference(
         return
     served = served_window_params(geometry)
     dense = served.get(DENSE_RATIO)
-    csa = served[CSA_RATIO]
-    hca = served[HCA_RATIO]
+    csa = served[csa_class_ratio]
+    hca = served[hca_class_ratio]
     bid_cpu = bid_per_token[:T].cpu().tolist()
     pos_cpu = positions[:T].cpu().tolist()
     cs_per_seq_cpu = chunk_start_per_seq.cpu().tolist()
@@ -478,14 +494,20 @@ def write_v4_paged_prefill_indices_reference(
             prefix_csa_indices[csa_end - prefix_swa_count : csa_end] = rows(
                 csa, prefix_csa_indices
             )
-            prefix_hca_indices[sb_hca : sb_hca + prefix_swa_count] = rows(
-                hca, prefix_hca_indices
-            )
+            if hca_topk:
+                hca_end = hca_indptr_cpu[t + 1]
+                prefix_hca_indices[hca_end - prefix_swa_count : hca_end] = rows(
+                    hca, prefix_hca_indices
+                )
+            else:
+                prefix_hca_indices[sb_hca : sb_hca + prefix_swa_count] = rows(
+                    hca, prefix_hca_indices
+                )
 
         # HCA compress: entry k lives in physical block
         # block_tables[bid, k // hca_rows_per_block] at row
         # k % hca_rows_per_block.
-        if n_hca > 0:
+        if n_hca > 0 and not hca_topk:
             ks = torch.arange(n_hca, device=device)
             blk = (ks // hca_rows_per_block).cpu()
             row = (ks % hca_rows_per_block).to(prefix_hca_indices.dtype)

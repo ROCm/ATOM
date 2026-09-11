@@ -1847,8 +1847,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
         # Block sizes for block quantization
         if self.block_quant:
             if self.quant_type == QuantType.per_1x128:
-                self.block_n = 128
-                self.block_k = 128
+                self.block_n, self.block_k = quant_config.block_scale_grid
             elif self.quant_type == QuantType.per_1x32:
                 self.block_n = 1
                 self.block_k = 32
@@ -2255,8 +2254,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         if self.block_quant:
             if self.quant_type == QuantType.per_1x128:
-                block_n = 128
-                block_k = 128
+                block_n, block_k = self.quant_config.block_scale_grid
             elif self.quant_type == QuantType.per_1x32:
                 block_n = 1
                 block_k = 32
@@ -2555,7 +2553,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # per_1x128 + UE8M0 block-scale.
             if self.block_quant:
                 if self.quant_type == QuantType.per_1x128:
-                    block_shape = [128, 128]
+                    block_shape = list(self.quant_config.block_scale_grid)
                 elif self.quant_type == QuantType.per_1x32:
                     block_shape = [1, 32]
                 else:

@@ -100,13 +100,13 @@ from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
     ABSENT_RATIO,
     CSA_RATIO,
     DENSE_RATIO,
-    HCA_RATIO,
     UnifiedPoolGeometry,
     WindowParams,
+    compress_class_ratios,
     merge_abutting,
+    owner_layers,
     require_step_within_full_q,
-    visible_csa,
-    visible_hca,
+    visible_groups,
 )
 from atom.model_ops.attentions.token_layout.batch_ids import build_batch_ids
 from atom.model_ops.v4_kernels import (
@@ -147,11 +147,13 @@ STATE_WINDOW_FIELD = "state_window"
 # Per-compress-class buffer holding, for each decode token, the plane row its
 # own KV goes to. One per class because a class interleaves its layers' windows
 # by its own stride, so the same token lands somewhere different in each.
-_DEST_ROW_BUFFERS = {
-    DENSE_RATIO: "v4_swa_dest_dense",
-    CSA_RATIO: "v4_swa_dest_csa",
-    HCA_RATIO: "v4_swa_dest_hca",
-}
+# Named by slot, not by ratio: which ratio each compressed slot carries comes
+# from the model config (`compress_class_ratios`), so the key is per builder.
+_DEST_ROW_BUFFERS = (
+    "v4_swa_dest_dense",
+    "v4_swa_dest_csa",
+    "v4_swa_dest_hca",
+)
 
 # ---------------------------------------------------------------------------
 # Typed metadata surface for V4. The base AttentionMetaData class is shared
@@ -398,6 +400,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     # Number of micro-batches for Two-Batch Overlap (TBO).
     _NUM_TBO_UBATCHES = 2
 
+    # V4 answers, as class defaults: `__init__` overwrites all of them, and
+    # the transfer/checkpoint tests hand-build a builder without running it.
+    csa_overlap = True
+    v41_reuse = False
+    hca_topk = False
+    kv_owner_layers: tuple[int, ...] = ()
+    layer_id_to_kv_owner_pos: dict[int, int] = {}
+    v41_index_rows_per_block = 0
+
     def __init__(self, model_runner):
         super().__init__(model_runner)
         hf = model_runner.config.hf_config
@@ -405,24 +416,61 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         assert ratios, "deepseek_v4 hf_config must define compress_ratios"
         self.compress_ratios = ratios
         self.num_layers = len(ratios)
+        # The two compressed classes, as this config spells them. V4 pins them
+        # to 4 and 128; V4.1-Flash pools at 2 and at 1. Everything below counts
+        # rows from these rather than from the two constants.
+        self.csa_ratio, self.hca_ratio = compress_class_ratios(ratios)
         # Per-buffer-type layer indexing.
         # Buffers are layer-major: shape [num_layers_of_type, num_slots, *state_shape].
-        self.csa_layers = [i for i, r in enumerate(ratios) if r == 4]
-        self.hca_layers = [i for i, r in enumerate(ratios) if r == 128]
-        self.dense_layers = [i for i, r in enumerate(ratios) if r == 0]
+        self.csa_layers = [i for i, r in enumerate(ratios) if r == self.csa_ratio]
+        self.hca_layers = [i for i, r in enumerate(ratios) if r == self.hca_ratio]
+        self.dense_layers = [i for i, r in enumerate(ratios) if r == DENSE_RATIO]
         self.layer_id_to_csa_pos = {lid: p for p, lid in enumerate(self.csa_layers)}
         self.layer_id_to_hca_pos = {lid: p for p, lid in enumerate(self.hca_layers)}
+        # Which layer's compressor and indexer K each layer reads. Absent from
+        # the config means V4: every compressed layer owns its own.
+        self.kv_owner = owner_layers(ratios, getattr(hf, "kv_source_layer_ids", None))
+        self.index_owner = owner_layers(
+            ratios, getattr(hf, "index_source_layer_ids", None)
+        )
+        for table in (self.kv_owner, self.index_owner):
+            for lid, owner in enumerate(table):
+                assert owner is None or owner <= lid, (
+                    f"layer {lid} reads layer {owner}, which does not precede "
+                    "it; a source has to be written before it is read"
+                )
+        # V4.1 reuse. The config names the layers that own a compressor, and
+        # two things follow that V4 does not have:
+        #   * the index-K cache belongs to those owners rather than to every
+        #     layer of the fine class, and they straddle both compressed
+        #     classes, so it is a plain bf16 pool keyed by owner;
+        #   * both classes select with a top-k, so the coarse class index
+        #     buffer is laid out like the fine one -- compress section at the
+        #     slice head, capped by `index_topk` -- instead of holding every
+        #     committed row.
+        self.v41_reuse = bool(getattr(hf, "kv_source_layer_ids", None))
+        self.kv_owner_layers = sorted({o for o in self.kv_owner if o is not None})
+        self.layer_id_to_kv_owner_pos = {
+            lid: pos for pos, lid in enumerate(self.kv_owner_layers)
+        }
+        self.hca_topk = self.v41_reuse and bool(self.hca_layers)
         # Unique (ratio, is_overlap) pairs needed for compress-plan generation.
-        # CSA ratio=4 has overlap=True; HCA ratio=128 has overlap=False.
+        # The fine class overlaps its compression windows, the coarse one does
+        # not — a property of the slot, not of the ratio it happens to carry.
+        # Overlap is a property of ratio 4, not of the slot: V4 pools the fine
+        # class with overlapping windows, V4.1 pools at 1 and 2 and overlaps
+        # neither.
+        self.csa_overlap = self.csa_ratio == CSA_RATIO
         unique = []
         if self.csa_layers:
-            unique.append((4, True))
+            unique.append((self.csa_ratio, self.csa_overlap))
         if self.hca_layers:
-            unique.append((128, False))
+            unique.append((self.hca_ratio, False))
         self._unique_compress_ratios_overlap = unique
 
         # Geometry from HF config.
-        self.head_dim = getattr(hf, "kv_head_dim", 512)
+        # V4 spells the latent width `kv_head_dim`; V4.1 spells it `head_dim`.
+        self.head_dim = getattr(hf, "kv_head_dim", None) or getattr(hf, "head_dim", 512)
         self.index_head_dim = getattr(hf, "index_head_dim", 128)
         self.window_size = getattr(hf, "sliding_window", 128)
         self.index_topk = getattr(hf, "index_topk", 1024)
@@ -436,18 +484,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._n_main_layers = n_main
         self._mtp_layers_are_swa_only = all(r == 0 for r in ratios[n_main:])
         # `deepgemm_fp8_paged_mqa_logits` decode-path output column count
-        # = max compressed K positions per seq. CSA ratio=4 is the
-        # max-density ratio (1 indexer slot per 4 source tokens).
-        self.max_model_len_idx = model_runner.config.max_model_len // 4
+        # = max compressed K positions per seq. The CSA class is the
+        # max-density one (1 indexer slot per `csa_ratio` source tokens).
+        self.max_model_len_idx = model_runner.config.max_model_len // self.csa_ratio
 
         # Classical KV pool geometry. block_size=256 original tokens means one
         # V4 block compresses to 256/4=64 rows in a CSA layer and 256/128=2 rows
         # in an HCA layer (paper §3.6.1; block_size is a multiple of lcm).
-        self.csa_rows_per_block = self.block_size // 4  # = 64
-        self.hca_rows_per_block = self.block_size // 128  # = 2
+        self.csa_rows_per_block = self.block_size // self.csa_ratio  # 64 for V4
+        self.hca_rows_per_block = self.block_size // self.hca_ratio  # 2 for V4
         self._rows_per_block = {
-            4: self.csa_rows_per_block,
-            128: self.hca_rows_per_block,
+            self.csa_ratio: self.csa_rows_per_block,
+            self.hca_ratio: self.hca_rows_per_block,
         }
 
         self._state_dtype = torch.float32  # fp32 required for softmax-pool
@@ -510,6 +558,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._indexer_fp4 = fp4_indexer_enabled(
             getattr(model_runner.config, "index_cache_dtype", None), warn=True
         )
+        if self.v41_reuse:
+            # V4.1 keys project the main compressor latent, not the hidden
+            # state, so no fused compress kernel writes them and the fp4/fp8
+            # preshuffle layouts have no writer. Plain bf16 rows.
+            self._indexer_fp4 = False
         # What one CSA layer's indexer block holds, and where each region sits
         # in it. Sizing, allocation and the scale view `build_kv_cache_tensor`
         # binds all read these two, so none can place a region differently.
@@ -523,6 +576,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._indexer_regions, self._indexer_block_bytes = indexer_block_regions(
             self._indexer_fields
         )
+        # V4.1: one bf16 row per compressed position, sized for the densest of
+        # the two classes so both owners share one shape.
+        self.v41_index_rows_per_block = max(self._rows_per_block.values())
+        if self.v41_reuse:
+            self._indexer_block_bytes = (
+                self.v41_index_rows_per_block * self.index_head_dim * 2
+            )
         # The alignment that has to hold is the BLOCK stride, not the row:
         # 64 * 132 = 8448 = 16 * 528 already is. Rounding the row up to 16
         # instead pays the 12 B once per row rather than once per block —
@@ -568,9 +628,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # correct next token, confirming no read-from-stale slot collision.
         # See `Adding a further +1 (the old layout) was unnecessary slack` below.
         ring_extra = self.max_spec_steps
-        self.csa_main_state_shape = (2 * 4 + ring_extra, 2 * self.head_dim)
-        self.csa_idx_state_shape = (2 * 4 + ring_extra, 2 * self.index_head_dim)
-        self.hca_main_state_shape = (128 + ring_extra, self.head_dim)
+        csa_coff = 2 if self.csa_overlap else 1
+        csa_pool = csa_coff * self.csa_ratio
+        self.csa_main_state_shape = (csa_pool + ring_extra, csa_coff * self.head_dim)
+        self.csa_idx_state_shape = (
+            csa_pool + ring_extra,
+            csa_coff * self.index_head_dim,
+        )
+        self.hca_main_state_shape = (self.hca_ratio + ring_extra, self.head_dim)
         self.max_decode_tokens = self.max_bs * (1 + self.max_spec_steps)
         # SWA ring-buffer slots per req. Distinct from `window_size`:
         #   * `window_size`  = SWA attention window = topk count per token
@@ -626,7 +691,20 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         # Worst-case HCA per-token committed compress count
         # (= max_model_len // 128 for V4-Pro = 8192 at 1M context).
-        self.max_committed_hca = model_runner.config.max_model_len // 128
+        self.max_committed_hca = model_runner.config.max_model_len // self.hca_ratio
+        # Rows between a layer's own compressed rows and the ones it reads,
+        # per layer. Non-zero only where the config says a layer reuses
+        # another's compressor; see `UnifiedPoolGeometry.compress_bias`. A
+        # layer whose window moved into a state field is not in the row space
+        # at all, so it has no compressed row to bias either.
+        absent = set(self._field_window_layers)
+        self.compress_bias = [0] * self.num_layers
+        for layer_id, owner in enumerate(self.kv_owner):
+            if owner is None or owner == layer_id or layer_id in absent:
+                continue
+            self.compress_bias[layer_id] = self.pool_geometry.compress_bias(
+                layer_id, owner
+            )
 
         # Sparse-attn + per-fwd metadata buffers (CG-A: pre-allocate for fixed
         # GPU pointers, prerequisite for CUDAGraph capture). All H2D copies in
@@ -691,6 +769,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 "state field carrying them is one field, so one dtype"
             )
         return tuple(sorted(found)), widths.pop() if widths else None
+
+    def _index_owner_of(self, layer_id: int) -> int:
+        """The layer whose indexer K cache `layer_id` reads — itself, in V4."""
+        owner = self.index_owner[layer_id]
+        return layer_id if owner is None else owner
 
     def _geometry_ratios(self) -> list[int]:
         """Per-layer ratios as the row space sees them.
@@ -853,12 +936,24 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             f":state={self.csa_main_state_shape},{self.csa_idx_state_shape},"
             f"{self.hca_main_state_shape}"
             f":main={'fp8-2buff' if self._kv_fp8 else 'bf16'}"
-            f":index={'fp4' if self._indexer_fp4 else 'fp8'}"
+            f":index={self._indexer_layout_name()}"
             f":ratios={ratios}"
             f":nocopy={nocopy}"
             ":entry=packed"
         )
         return StateTransfer.copy(layout_id)
+
+    def _indexer_layout_name(self) -> str:
+        """What one indexer block holds, for the checkpoint layout id.
+
+        V4.1's keys project the compressor latent rather than the hidden
+        state, so no fused kernel writes them and they are plain bf16 rows
+        keyed by KV owner -- a different pool from either V4 layout, and a
+        reader must not mistake one for the other.
+        """
+        if self.v41_reuse:
+            return "bf16-owner"
+        return "fp4" if self._indexer_fp4 else "fp8"
 
     def state_entry_views(self, slot: int) -> list[torch.Tensor]:
         """One contiguous slice per plane: a V4 slot is one row per plane."""
@@ -1236,7 +1331,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     )
                 per_layer = pool.stride(0) * pool.element_size()
                 per_block = pool.stride(1) * pool.element_size()
-                for layer in range(len(self.csa_layers)):
+                pool_layers = (
+                    self.kv_owner_layers if self.v41_reuse else self.csa_layers
+                )
+                for layer in range(len(pool_layers)):
                     bases.append(pool.data_ptr() + layer * per_layer)
                     strides.append(per_block)
             self._page_unit_region_cache = (
@@ -1306,7 +1404,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         so it never has to agree with anyone else's row width. Every CSA layer
         holds one declared block (`_indexer_block_bytes`) per V4 block.
         """
-        return len(self.csa_layers) * self._indexer_block_bytes
+        owners = self.kv_owner_layers if self.v41_reuse else self.csa_layers
+        return len(owners) * self._indexer_block_bytes
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
         """Two entry classes: a paged block, and a request's slot.
@@ -1364,6 +1463,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         transfer/offload registration so neither path can omit a pool.
         """
         runner = self.model_runner
+        if self.v41_reuse:
+            return [(runner.v4_csa_idx_kv, "dsv4.v41_indexer")]
         if self._indexer_fp4:
             return [
                 (runner.v4_csa_idx_kv, "dsv4.csa_indexer.fp4_data"),
@@ -1398,6 +1499,21 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         device = runner.device
         num_blocks = self.num_blocks
         n_csa = len(self.csa_layers)
+        if self.v41_reuse:
+            # One slice per KV-owner layer. `[n_owners, NB, rows, D]`, so a
+            # per-owner slice is contiguous and a row is `phys * rows + slot`.
+            return {
+                "v4_csa_idx_kv": torch.zeros(
+                    (
+                        len(self.kv_owner_layers),
+                        num_blocks,
+                        self.v41_index_rows_per_block,
+                        self.index_head_dim,
+                    ),
+                    dtype=torch.bfloat16,
+                    device=device,
+                ),
+            }
         if self._indexer_fp4:
             # FP4: one pool per declared region, each `[n_csa, NB, *shape]`, so
             # a per-CSA slice `pool[pos]` is contiguous in both.
@@ -1652,9 +1768,75 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         from atom.models.deepseek_v4 import Compressor as _V4Compressor
         from atom.models.deepseek_v4 import DeepseekV4Attention as _V4Attention
         from atom.models.deepseek_v4 import Indexer as _V4Indexer
+        from atom.models.deepseek_v41 import Compressor as _V41Compressor
+        from atom.models.deepseek_v41 import DeepseekV41Attention as _V41Attention
+        from atom.models.deepseek_v41 import Indexer as _V41Indexer
 
         runner = self.model_runner
         geo = self.pool_geometry
+
+        if isinstance(module, _V41Attention):
+            # The plane view and the class window, as a V4 attention takes
+            # them, plus the compress geometry the V4.1 paged path addresses
+            # its own rows with.
+            layer_id = module.layer_id
+            module.envelope_rows = geo.envelope_rows
+            ratio = self.compress_ratios[layer_id]
+            module.is_fine_class = ratio == self.csa_ratio
+            module.unified_kv = runner.v4_unified_kv[layer_id]
+            module.swa_plane = module.unified_kv
+            module.swa_window = geo.window_params(ratio if ratio else DENSE_RATIO)
+            module.rows_per_block = self._rows_per_block[ratio] if ratio else 0
+            # `compress_bias` is not usable as the index bias it was built to
+            # be: it is always negative (an owner precedes every layer that
+            # reads it) and both paged prefill kernels -- including aiter's
+            # OPUS, which is not ours to change -- read a negative row as the
+            # -1 sentinel and drop the entry. Rebasing the reuse layer's view
+            # on its owner instead fixes the compressed half and breaks the
+            # window half, which is addressed by one class-wide formula
+            # relative to each layer's own base. So the compressor writes its
+            # latent into the envelope rows of every layer that reads it --
+            # rows the layout already reserves -- and no index moves. See the
+            # note in `DeepseekV41Attention._paged_compress`.
+            module.compress_bias = 0
+            module.mirror_kv = [
+                runner.v4_unified_kv[reader]
+                for reader, owner in enumerate(self.kv_owner)
+                if owner == layer_id and reader != layer_id
+            ]
+            module.kv_fp8 = False
+            module.unified_kv_rope = None
+            module.swa_plane_rope = None
+            return None
+
+        if isinstance(module, _V41Indexer):
+            # The keys a layer scores against are the ones its KV owner
+            # published, so the pool slot is the owner's -- not the index
+            # owner's, which only says whose top-k it reuses.
+            layer_id = int(module.prefix.split(".")[1])
+            owner = self.kv_owner[layer_id]
+            assert (
+                owner is not None
+            ), f"layer {layer_id} is dense and has no indexer to bind"
+            module.kv_cache = runner.v4_csa_idx_kv[self.layer_id_to_kv_owner_pos[owner]]
+            module.rows_per_block = self.v41_index_rows_per_block
+            return None
+
+        if isinstance(module, _V41Compressor):
+            # Only the ring: the compressed rows go into the shared plane
+            # through the owning attention view, which already has the
+            # geometry the write needs.
+            layer_id = int(module.prefix.split(".")[1])
+            ratio = self.compress_ratios[layer_id]
+            if ratio == self.csa_ratio:
+                pos = self.layer_id_to_csa_pos[layer_id]
+                module.paged_kv_state = runner.v4_csa_main_kv_state[pos]
+                module.paged_score_state = runner.v4_csa_main_score_state[pos]
+            else:
+                pos = self.layer_id_to_hca_pos[layer_id]
+                module.paged_kv_state = runner.v4_hca_main_kv_state[pos]
+                module.paged_score_state = runner.v4_hca_main_score_state[pos]
+            return None
 
         if isinstance(module, _V4Attention):
             # A layer that declared its own window KV dtype is carried as a
@@ -1683,6 +1865,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             module.unified_kv = unified
             module.swa_plane = unified
             module.swa_window = geo.window_params(self.compress_ratios[module.layer_id])
+            # Zero unless this layer reads another layer's compressor: the
+            # translate kernel adds it to every compressed row it stores.
+            module.compress_bias = self.compress_bias[module.layer_id]
             module.kv_fp8 = self._kv_fp8
             if self._kv_fp8:
                 # 2buff: the second plane, same rows at the RoPE width. A row
@@ -1707,8 +1892,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # [NB*rows, 1, index_row_bytes] makes the kernel see block_size=1
             # and OOB-index block_table. Matches V3.2's [num_blocks,
             # block_size, head_dim] layout (deepseek_v2.py:1049).
+            # A layer that does not own an indexer K cache is bound to the
+            # pool slot of the one it reads, so its scorer sees the owner's
+            # keys rather than rows nothing ever writes.
             layer_id_from_prefix = int(module.prefix.split(".")[1])
-            pos = self.layer_id_to_csa_pos[layer_id_from_prefix]
+            pos = self.layer_id_to_csa_pos[self._index_owner_of(layer_id_from_prefix)]
             module.kv_cache = runner.v4_csa_idx_kv[pos]
             # Re-assert the authoritative FP4 flag (config + gfx950 fallback) onto
             # the Indexer. Its forward_pre/indexer_score_topk branch on this
@@ -1731,8 +1919,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             ratio = module.compress_ratio
 
             if is_indexer_inner:
-                assert ratio == 4, "Indexer-inner Compressor only on CSA layers"
-                pos = self.layer_id_to_csa_pos[layer_id_from_prefix]
+                assert ratio == self.csa_ratio, "Indexer-inner is CSA-only"
+                pos = self.layer_id_to_csa_pos[
+                    self._index_owner_of(layer_id_from_prefix)
+                ]
                 module.kv_state = runner.v4_csa_idx_kv_state[pos]
                 module.score_state = runner.v4_csa_idx_score_state[pos]
                 # Inner compressor writes target the SAME storage as the
@@ -1780,14 +1970,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 # kv_cache_dtype); it has no separate rope pool.
                 module.quant_mode = "fp4" if self._indexer_fp4 else "per_row_fp8"
                 module.kv_cache_rope = None
-            elif ratio in (CSA_RATIO, HCA_RATIO):
+            elif ratio in (self.csa_ratio, self.hca_ratio):
                 table = (
                     self.layer_id_to_csa_pos
-                    if ratio == CSA_RATIO
+                    if ratio == self.csa_ratio
                     else self.layer_id_to_hca_pos
                 )
                 pos = table[layer_id_from_prefix]
-                if ratio == CSA_RATIO:
+                if ratio == self.csa_ratio:
                     module.kv_state = runner.v4_csa_main_kv_state[pos]
                     module.score_state = runner.v4_csa_main_score_state[pos]
                 else:
@@ -1908,7 +2098,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # checkpoint stream. Derive the block width from the actual view so
         # this remains correct for both the FP8 row layout and FP4 tiles.
         for pool, role_prefix in self._indexer_page_pools():
-            for pos, layer_id in enumerate(self.csa_layers):
+            pool_layers = self.kv_owner_layers if self.v41_reuse else self.csa_layers
+            for pos, layer_id in enumerate(pool_layers):
                 view = pool[pos]
                 if not view.is_contiguous():
                     raise RuntimeError(
@@ -2182,7 +2373,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # subtraction base for prefill `top_k_per_row_prefill`'s GLOBAL output
         # → seq-local conversion (the indexer kernel writes
         # `seq_base + col_in_seq`; we recover col_in_seq by subtracting).
-        visible_end_gpu = visible_csa(positions_gpu[:total_tokens]).to(
+        visible_end_gpu = visible_groups(
+            positions_gpu[:total_tokens], self.csa_ratio
+        ).to(
             torch.int32
         )  # [total_tokens] int32 — causal upper bound, see `v4_pool_geometry`
         cu_ends_gpu = (
@@ -3376,7 +3569,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # attn_metadata so `_attach_v4_indexer_meta` reads it instead of
         # re-running `ctx // 4`. HCA has no twin here: every consumer wants the
         # count a TOKEN may see, which is `(pos+1)//128`.
-        n_committed_csa_per_seq_np = ctx_per_seq_np // 4
+        n_committed_csa_per_seq_np = ctx_per_seq_np // self.csa_ratio
         attn_metadata.n_committed_csa_per_seq_cpu = n_committed_csa_per_seq_np
 
         # ---- Stage all buffers to GPU ----
@@ -3521,6 +3714,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             T_pad=T_pad,
             win=win,
             index_topk=index_topk,
+            csa_ratio=self.csa_ratio,
+            hca_ratio=self.hca_ratio,
+            hca_topk=self.hca_topk,
         )
 
         # Expand block tables per query row so the unchanged aiter paged-MQA
@@ -3587,8 +3783,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             win=win,
             geometry=self.pool_geometry,
             # Same buffer set as batch_id_per_q_token, for the reason above.
-            hca_block_tables=var[f"{buf_prefix_ubatch}block_tables"].gpu,
+            # V4.1 fills the coarse class's compress section per layer
+            # through `csa_translate_pack`, exactly as the fine one, so the
+            # writer is asked for the SWA prefix alone.
+            hca_block_tables=(
+                None if self.hca_topk else var[f"{buf_prefix_ubatch}block_tables"].gpu
+            ),
             hca_rows_per_block=self.hca_rows_per_block,
+            csa_class_ratio=self.csa_ratio,
+            hca_class_ratio=self.hca_ratio,
         )
         attn_metadata.swa_dest_rows = dest_rows
 
@@ -3750,9 +3953,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # uninitialized. Buffer size ↔ kernel-writes then match exactly and no
         # `-1` sentinel pre-fill is needed.
         csa_valid_k_per_token_np = np.minimum(
-            visible_csa(positions_arr), index_topk
+            visible_groups(positions_arr, self.csa_ratio), index_topk
         ).astype(np.int32)
-        n_hca_per_token_np = visible_hca(positions_arr).astype(np.int32)
+        n_hca_per_token_np = visible_groups(positions_arr, self.hca_ratio)
+        if self.hca_topk:
+            n_hca_per_token_np = np.minimum(n_hca_per_token_np, index_topk)
+        n_hca_per_token_np = n_hca_per_token_np.astype(np.int32)
 
         # 4 indptrs on CPU; last element = total (no D2H to size buffers).
         ext_indptr_np = np.zeros(T + 1, dtype=np.int32)
@@ -3842,6 +4048,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             win=win,
             geometry=self.pool_geometry,
             hca_rows_per_block=self.hca_rows_per_block,
+            csa_class_ratio=self.csa_ratio,
+            hca_class_ratio=self.hca_ratio,
+            hca_topk=self.hca_topk,
         )
 
         # ----- skip_prefix_len_csa: per-token SWA prefix length -----
@@ -4297,7 +4506,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # class. The fused SWA write reads these rather than deriving the row,
         # so the window layout stays inside this repo (see
         # `write_v4_paged_decode_indices`).
-        for name in _DEST_ROW_BUFFERS.values():
+        for name in _DEST_ROW_BUFFERS:
             bufs[name] = CpuGpuBuffer(T_dec, **i32)
 
         # Per-token paged-decode index tensors for the fp8 asm decode kernel
@@ -4456,7 +4665,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 bufs[f"{p}v4_block_tables_per_token"] = torch.zeros(
                     T_dec, self.block_table_cols, **i32
                 )
-            for name in _DEST_ROW_BUFFERS.values():
+            for name in _DEST_ROW_BUFFERS:
                 bufs[f"{p}{name}"] = CpuGpuBuffer(T_dec, **i32)
             bufs[f"{p}batch_id_per_q_token"] = CpuGpuBuffer(mnbt, **i32)
             bufs[f"{p}v4_indexer_cu_committed"] = CpuGpuBuffer(bs + 1, **i32)
@@ -4478,12 +4687,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 bufs[f"{p}v4_compress_plan_{ratio}"] = cbuf
                 bufs[f"{p}v4_write_plan_{ratio}"] = wbuf
 
+    @property
+    def _dest_row_names(self) -> dict[int, str]:
+        """Destination-row buffer per compress class, keyed by the class."""
+        dense, csa, hca = _DEST_ROW_BUFFERS
+        return {DENSE_RATIO: dense, self.csa_ratio: csa, self.hca_ratio: hca}
+
     def _dest_row_buffers(self, buf_prefix_ubatch: str = "") -> dict[int, torch.Tensor]:
         """The per-class destination-row buffers for this (ubatch's) forward."""
         var = self.model_runner.forward_vars
         return {
             ratio: var[f"{buf_prefix_ubatch}{name}"].gpu
-            for ratio, name in _DEST_ROW_BUFFERS.items()
+            for ratio, name in self._dest_row_names.items()
         }
 
     def _stage(self, name: str, arr, pad_to: int | None = None) -> torch.Tensor:

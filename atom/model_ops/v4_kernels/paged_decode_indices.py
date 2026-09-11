@@ -280,6 +280,8 @@ def write_v4_paged_decode_indices(
     geometry: UnifiedPoolGeometry,
     hca_block_tables: torch.Tensor | None = None,
     hca_rows_per_block: int = 0,
+    csa_class_ratio: int = CSA_RATIO,
+    hca_class_ratio: int = HCA_RATIO,
     prefix: str = "",
 ) -> None:
     """In-place fill SWA / CSA / HCA window-prefix offsets via a single
@@ -356,6 +358,13 @@ def write_v4_paged_decode_indices(
       win:                 int — SWA window size (typically 128 for V4-Pro).
       geometry:            the pool's `UnifiedPoolGeometry`; supplies one
                                  `WindowParams` per compress class.
+      csa_class_ratio,
+      hca_class_ratio:     int — the compress ratios naming the two compressed
+                                   classes in this pool. They key the geometry,
+                                   which is built from the config's per-layer
+                                   ratios, so a model that pools on other
+                                   strides passes its own; V4's 4 and 128 are
+                                   the default.
     """
     if T == 0:
         return
@@ -393,8 +402,8 @@ def write_v4_paged_decode_indices(
     borrowed = next(iter(served.values()))
     borrowed_dest = next(iter(dest_rows.values()))
     dense = served[DENSE_RATIO] if has_dense else borrowed
-    csa = served[CSA_RATIO] if has_csa else borrowed
-    hca = served[HCA_RATIO] if has_hca else borrowed
+    csa = served[csa_class_ratio] if has_csa else borrowed
+    hca = served[hca_class_ratio] if has_hca else borrowed
     BLOCK_N = triton.next_power_of_2(win)
     _v4_paged_decode_indices_kernel[(T,)](
         state_slot_per_seq,
@@ -409,8 +418,8 @@ def write_v4_paged_decode_indices(
         csa_indices if has_csa else swa_indices,
         hca_indices if has_hca else swa_indices,
         dest_rows[DENSE_RATIO] if has_dense else borrowed_dest,
-        dest_rows[CSA_RATIO] if has_csa else borrowed_dest,
-        dest_rows[HCA_RATIO] if has_hca else borrowed_dest,
+        dest_rows[csa_class_ratio] if has_csa else borrowed_dest,
+        dest_rows[hca_class_ratio] if has_hca else borrowed_dest,
         dense.ring_start,
         csa.ring_start,
         hca.ring_start,
@@ -445,6 +454,8 @@ def write_v4_paged_decode_indices_reference(
     T: int,
     win: int,
     geometry: UnifiedPoolGeometry,
+    csa_class_ratio: int = CSA_RATIO,
+    hca_class_ratio: int = HCA_RATIO,
 ) -> None:
     """Pure-PyTorch reference equivalent of `write_v4_paged_decode_indices`.
     For unit tests and bisect verification. Mirrors the kernel: per-token
@@ -456,8 +467,8 @@ def write_v4_paged_decode_indices_reference(
     params = served_window_params(geometry)
     outputs = {
         DENSE_RATIO: (swa_indices, swa_indptr),
-        CSA_RATIO: (csa_indices, csa_indptr),
-        HCA_RATIO: (hca_indices, hca_indptr),
+        csa_class_ratio: (csa_indices, csa_indptr),
+        hca_class_ratio: (hca_indices, hca_indptr),
     }
     bid = batch_id_per_q_token[:T].long()
     pos_t = positions[:T].long()
@@ -507,6 +518,7 @@ def _v4_decode_indptr_kernel(
     HCA_R: tl.constexpr,
     INDEX_TOPK: tl.constexpr,
     BLOCK: tl.constexpr,
+    HCA_TOPK: tl.constexpr = False,
 ):
     """One program: a running offset per class over `t_pad` tokens, and each
     token's own CSA visibility alongside them.
@@ -544,6 +556,10 @@ def _v4_decode_indptr_kernel(
         n = tl.minimum(pos + 1, WIN)
         n_csa = (pos + 1) // CSA_R
         n_hca = (pos + 1) // HCA_R
+        if HCA_TOPK:
+            # V4.1: the coarse class selects a top-k as well, so its slice
+            # reserves what the indexer can return, not every committed row.
+            n_hca = tl.minimum(n_hca, INDEX_TOPK)
         # Visibility and output capacity are different quantities: the indexer
         # scans every causally visible row, the translated output reserves at
         # most `index_topk` of them.
@@ -586,6 +602,9 @@ def build_v4_paged_decode_indptr(
     T_pad: int,
     win: int,
     index_topk: int,
+    csa_ratio: int = CSA_RATIO,
+    hca_ratio: int = HCA_RATIO,
+    hca_topk: bool = False,
 ) -> None:
     """Fill the three ragged indptr cumsums and the CSA per-token visibility.
 
@@ -642,9 +661,10 @@ def build_v4_paged_decode_indptr(
         csa_n_committed_per_token,
         T_pad,
         WIN=win,
-        CSA_R=CSA_RATIO,
-        HCA_R=HCA_RATIO,
+        CSA_R=csa_ratio,
+        HCA_R=hca_ratio,
         INDEX_TOPK=index_topk,
+        HCA_TOPK=hca_topk,
         BLOCK=1024,
     )
 
@@ -660,6 +680,9 @@ def build_v4_paged_decode_indptr_reference(
     T_pad: int,
     win: int,
     index_topk: int,
+    csa_ratio: int = CSA_RATIO,
+    hca_ratio: int = HCA_RATIO,
+    hca_topk: bool = False,
 ) -> None:
     """Pure-PyTorch equivalent of `build_v4_paged_decode_indptr`, for the
     kernel-vs-reference tests. Same argument contract, including owning the
@@ -669,8 +692,10 @@ def build_v4_paged_decode_indptr_reference(
     live = bid >= 0
     pos = positions[:T_pad].long()
     n = torch.minimum(pos + 1, torch.full_like(pos, win))
-    n_csa = (pos + 1) // CSA_RATIO
-    n_hca = (pos + 1) // HCA_RATIO
+    n_csa = (pos + 1) // csa_ratio
+    n_hca = (pos + 1) // hca_ratio
+    if hca_topk:
+        n_hca = torch.minimum(n_hca, torch.full_like(n_hca, index_topk))
     zero = torch.zeros_like(n)
     counts = {
         "swa": torch.where(live, n, zero),

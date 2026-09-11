@@ -161,6 +161,79 @@ def test_compress_row_matches_the_geometry(geometry):
         assert out[:n].tolist() == want
 
 
+@triton.jit
+def _compress_row_bias_probe(
+    block_ptr,
+    row_ptr,
+    out_ptr,
+    n,
+    ENVELOPE_ROWS: tl.constexpr,
+    BIAS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    i = tl.arange(0, BLOCK)
+    mask = i < n
+    block = tl.load(block_ptr + i, mask=mask, other=0)
+    row = tl.load(row_ptr + i, mask=mask, other=0)
+    tl.store(out_ptr + i, compress_row(block, row, ENVELOPE_ROWS, BIAS), mask=mask)
+
+
+def _run_compress(probe, blocks, rows, **kwargs):
+    n = len(blocks)
+    size = triton.next_power_of_2(n)
+    out = torch.zeros(size, dtype=torch.int64, device=DEV)
+    probe[(1,)](
+        torch.tensor(blocks, dtype=torch.int64, device=DEV),
+        torch.tensor(rows, dtype=torch.int64, device=DEV),
+        out,
+        n,
+        BLOCK=size,
+        **kwargs,
+    )
+    return out[:n].tolist()
+
+
+def test_a_bias_of_zero_is_the_row_the_kernel_computed_before(geometry):
+    """Every V4 layer owns the compressed rows it reads, so the default has
+    to leave the store exactly where it was."""
+    blocks = [b for b in range(geometry.num_blocks) for _ in range(3)]
+    rows = [0, 1, 2] * geometry.num_blocks
+    envelope = geometry.envelope_rows
+    biased = _run_compress(
+        _compress_row_bias_probe, blocks, rows, ENVELOPE_ROWS=envelope, BIAS=0
+    )
+    plain = _run_compress(_compress_row_probe, blocks, rows, ENVELOPE_ROWS=envelope)
+    assert biased == plain
+
+
+def test_a_biased_row_reaches_the_owners_plane_row(geometry):
+    """What the kernel stores for a layer that reads another layer's
+    compressor, read back through its own view base, has to be the plane row
+    the owner's own index reaches. That equality is the whole of the
+    redirection, and it is split across the two sides."""
+    for ratio in (CSA_RATIO, HCA_RATIO):
+        cls = geometry.classes[ratio]
+        owner, layer = cls.layers[0], cls.layers[-1]
+        bias = geometry.compress_bias(layer, owner)
+        blocks, rows, want = [], [], []
+        for block in range(geometry.num_blocks):
+            for row in (0, cls.block_rows // 2, cls.block_rows - 1):
+                blocks.append(block)
+                rows.append(row)
+                owned = geometry.compress_index(owner, block, row)
+                want.append(
+                    geometry.absolute_row(owner, owned) - geometry.layer_base_row(layer)
+                )
+        got = _run_compress(
+            _compress_row_bias_probe,
+            blocks,
+            rows,
+            ENVELOPE_ROWS=geometry.envelope_rows,
+            BIAS=bias,
+        )
+        assert got == want, (ratio, owner, layer, bias)
+
+
 def test_device_rows_never_collide(geometry):
     """The host side proves this by enumeration; repeat it on what the kernels
     compute, since only their agreement makes that proof binding."""

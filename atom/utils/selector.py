@@ -46,7 +46,12 @@ class Family(StrEnum):
 # that -- so these two are named, and everything else is read off the shape.
 _KIMI_MLA_TYPES = ("kimi_linear", "glm5_next_text")
 _GDN_TYPES = ("qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text")
-_V4_TYPES = ("deepseek_v4", "deepseek_v4_mtp")
+_V4_TYPES = (
+    "deepseek_v4",
+    "deepseek_v4_mtp",
+    "deepseek_v41",
+    "deepseek_v41_text",
+)
 
 
 def attn_family(hf_text_config) -> Family:

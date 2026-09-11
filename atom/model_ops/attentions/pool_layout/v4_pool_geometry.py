@@ -64,10 +64,14 @@ addressed by `WindowParams` through `field_window_params`.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
-# Compress ratios, as they appear in the model config's per-layer list.
+# Compress ratios, as they appear in the model config's per-layer list. The
+# two compressed values are V4's; a later config moves them (V4.1-Flash pools
+# at 2 and at 1), so they are the default pair rather than the only one and
+# every count below takes its ratio from the config. See
+# `compress_class_ratios`.
 DENSE_RATIO = 0
 CSA_RATIO = 4
 HCA_RATIO = 128
@@ -84,14 +88,19 @@ HCA_RATIO = 128
 # as a `constexpr` and divide inline; keep the spellings identical.
 
 
+def visible_groups(pos, ratio):
+    """Groups of `ratio` visible to the token at `pos` — int, array or tensor."""
+    return (pos + 1) // ratio
+
+
 def visible_csa(pos):
-    """CSA groups visible to the token at `pos` — int, numpy array or tensor."""
-    return (pos + 1) // CSA_RATIO
+    """CSA groups visible to the token at `pos`, at V4's ratio."""
+    return visible_groups(pos, CSA_RATIO)
 
 
 def visible_hca(pos):
-    """HCA groups visible to the token at `pos` — int, numpy array or tensor."""
-    return (pos + 1) // HCA_RATIO
+    """HCA groups visible to the token at `pos`, at V4's ratio."""
+    return visible_groups(pos, HCA_RATIO)
 
 
 def require_step_within_full_q(longest: int, full_q: int, source: str) -> None:
@@ -124,12 +133,86 @@ def require_step_within_full_q(longest: int, full_q: int, source: str) -> None:
 # already has; it never reaches `classes`, so asking one for its layout raises.
 ABSENT_RATIO = -1
 
-# Envelope order puts the narrow class first so a future one can be appended
-# without moving it. The entry leads with dense, the one class that has no
-# envelope part at all, which is what frees the two orders from having to agree.
-_ENVELOPE_ORDER = (HCA_RATIO, CSA_RATIO)
-_ENTRY_ORDER = (DENSE_RATIO, HCA_RATIO, CSA_RATIO)
-_KNOWN_RATIOS = frozenset(_ENTRY_ORDER) | {ABSENT_RATIO}
+
+def _envelope_order(ratios: Iterable[int]) -> tuple[int, ...]:
+    """Compressed classes, the one with fewest rows per layer first, so a
+    taller one appended later does not move it.
+
+    Descending ratio, not a fixed pair: the ratios come from the model config
+    now, and a set has no order a layout can rest on. V4 comes back as
+    `(HCA_RATIO, CSA_RATIO)`, unchanged.
+    """
+    return tuple(sorted({r for r in ratios if r > 0}, reverse=True))
+
+
+def _entry_order(ratios: Iterable[int]) -> tuple[int, ...]:
+    """Entry order: dense leads, the one class with no envelope part at all,
+    which is what frees the two orders from having to agree."""
+    return (DENSE_RATIO,) + _envelope_order(ratios)
+
+
+def compress_class_ratios(ratios: Iterable[int]) -> tuple[int, int]:
+    """The two compressed slots a config spells, as `(fine, coarse)`.
+
+    V4 names them CSA and HCA and pins them to 4 and 128; a config that pools
+    on other strides keeps the two slots and moves the ratios. Fine is the
+    denser class -- the one whose indexer drives top-k and whose visibility
+    bounds `max_model_len_idx` -- so V4 comes back as `(CSA_RATIO, HCA_RATIO)`
+    and a config naming only one of the two leaves the other where V4 had it.
+    """
+    present = sorted({int(r) for r in ratios if int(r) > 0})
+    if len(present) > 2:
+        raise ValueError(
+            f"a V4 pool has two compressed classes, but {present} names "
+            f"{len(present)}"
+        )
+    if not present:
+        return CSA_RATIO, HCA_RATIO
+    if len(present) == 1:
+        only = present[0]
+        return (CSA_RATIO, only) if only == HCA_RATIO else (only, HCA_RATIO)
+    return present[0], present[1]
+
+
+def owner_layers(
+    ratios: Sequence[int], sources: Iterable[int] | None
+) -> tuple[int | None, ...]:
+    """Per layer, the layer whose compressed KV (or indexer K) it reads.
+
+    `sources` is the config's list of owning layer ids; a layer reads the
+    greatest one at or before itself, so an owner always precedes the layers
+    that read it. No list, or an empty one, is V4: every compressed layer
+    owns what it reads. A layer that keeps no compressed KV maps to `None`
+    either way.
+
+    A layer must share its owner's class. That is what leaves the
+    sliding-window half of its index already correct while only the
+    compressed half is redirected -- see `UnifiedPoolGeometry.compress_bias`.
+    """
+    owned = sorted({int(s) for s in sources}) if sources else None
+    out: list[int | None] = []
+    for layer_id, ratio in enumerate(ratios):
+        if ratio <= DENSE_RATIO:
+            out.append(None)
+            continue
+        if owned is None:
+            out.append(layer_id)
+            continue
+        prior = [s for s in owned if s <= layer_id]
+        if not prior:
+            raise ValueError(
+                f"layer {layer_id} compresses at ratio {ratio} but no source "
+                f"layer precedes it in {owned}"
+            )
+        owner = prior[-1]
+        if ratios[owner] != ratio:
+            raise ValueError(
+                f"layer {layer_id} at ratio {ratio} reads layer {owner} at "
+                f"ratio {ratios[owner]}; a layer and its source must be in "
+                "the same compress class"
+            )
+        out.append(owner)
+    return tuple(out)
 
 
 def merge_abutting(runs: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -361,9 +444,19 @@ class UnifiedPoolGeometry:
         """
         if not ratios:
             raise ValueError("a V4 pool needs at least one layer")
-        unknown = set(ratios) - _KNOWN_RATIOS
+        unknown = sorted({r for r in ratios if r < DENSE_RATIO and r != ABSENT_RATIO})
         if unknown:
-            raise ValueError(f"unknown V4 compress ratios {sorted(unknown)}")
+            raise ValueError(f"unknown V4 compress ratios {unknown}")
+        # A ratio the block size does not divide gives a class a fractional
+        # number of rows per block, so its layer stride stops being an integer
+        # and every address after it is off by the remainder.
+        ragged = sorted({r for r in ratios if r > 0 and block_size % r})
+        if ragged:
+            raise ValueError(
+                f"compress ratios {ragged} do not divide a block of "
+                f"{block_size} tokens, so a block holds no whole number of "
+                "compressed rows"
+            )
         if slot_align_rows < 1:
             raise ValueError(f"slot_align_rows must be positive, got {slot_align_rows}")
         if ring_slots < 1:
@@ -387,17 +480,17 @@ class UnifiedPoolGeometry:
 
         # Both orders are walked before any layout is built, so each class
         # learns its offset in the envelope and in the entry at once.
+        entry_order = _entry_order(ratios)
         envelope_offsets: dict[int, int] = {}
         cursor = 0
-        for ratio in _ENVELOPE_ORDER:
-            if layers_of(ratio):
-                envelope_offsets[ratio] = cursor
-                cursor += len(layers_of(ratio)) * (block_size // ratio)
+        for ratio in _envelope_order(ratios):
+            envelope_offsets[ratio] = cursor
+            cursor += len(layers_of(ratio)) * (block_size // ratio)
         self.envelope_rows = cursor
 
         entry_offsets: dict[int, int] = {}
         cursor = 0
-        for ratio in _ENTRY_ORDER:
+        for ratio in entry_order:
             layers = layers_of(ratio)
             if layers:
                 entry_offsets[ratio] = cursor
@@ -414,7 +507,7 @@ class UnifiedPoolGeometry:
                 envelope_offset=envelope_offsets.get(ratio, 0),
                 entry_offset=entry_offsets[ratio],
             )
-            for ratio in _ENTRY_ORDER
+            for ratio in entry_order
             if layers_of(ratio)
         }
 
@@ -537,6 +630,29 @@ class UnifiedPoolGeometry:
                 f"row {row} outside 0..{cls.block_rows} for ratio {cls.ratio}"
             )
         return block * self.envelope_rows + row
+
+    def compress_bias(self, layer_id: int, owner_id: int) -> int:
+        """Rows to add to `layer_id`'s compress index so it reads `owner_id`'s.
+
+        A layer that owns no compressor still keeps its own envelope rows and
+        its own sliding-window ring, because `layer_base_row` positions both
+        with one number and cannot be pointed at another layer without taking
+        the ring with it. So the redirection is an additive term on the
+        compressed half of the index alone; the two layers share a class, so
+        the window half is already right. The rows the reuse layer no longer
+        writes stay reserved and unread.
+
+        Zero when a layer is its own owner, which is every V4 layer.
+        """
+        cls = self.layer_class(layer_id)
+        if cls.ratio == DENSE_RATIO:
+            raise ValueError(f"layer {layer_id} is dense and keeps no compressed KV")
+        if self.layer_class(owner_id) is not cls:
+            raise ValueError(
+                f"layers {layer_id} and {owner_id} are in different compress "
+                "classes, so one cannot read the other's rows"
+            )
+        return (cls.layer_index(owner_id) - cls.layer_index(layer_id)) * cls.block_rows
 
     def window_index(self, layer_id: int, slot: int, ring_pos: int) -> int:
         """Index of a sliding-window row, relative to the layer's own base."""

@@ -108,11 +108,17 @@ def row_offset(row, row_stride):
 
 
 @triton.jit
-def compress_row(block, row, ENVELOPE_ROWS: tl.constexpr):
+def compress_row(block, row, ENVELOPE_ROWS: tl.constexpr, BIAS: tl.constexpr = 0):
     """Row of a compressed entry, relative to the calling layer's view base.
 
     `block` is a physical block id and `row` its index within the block for
     this layer's class (`0 <= row < block_size // ratio`). No layer term: the
     layer's offset inside the envelope is already in the view base.
+
+    `BIAS` is that layer term back again, for a layer that reads another
+    layer's compressed rows instead of its own -- one class-layer stride per
+    layer between them, from `UnifiedPoolGeometry.compress_bias`. It is a
+    `constexpr` so the default folds away and a layer that owns what it reads
+    compiles to what it compiled to before.
     """
-    return block * ENVELOPE_ROWS + row
+    return block * ENVELOPE_ROWS + row + BIAS
