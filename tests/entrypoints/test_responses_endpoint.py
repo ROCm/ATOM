@@ -106,7 +106,10 @@ class TestNormalizeCodexRequest:
         body, context = normalize_codex_request(raw)
         assert len(body["tools"]) == 2
         assert context.kind("tool_search") == "tool_search"
-        names = {t.get("name") or (t.get("function") or {}).get("name") for t in body["tools"]}
+        names = {
+            t.get("name") or (t.get("function") or {}).get("name")
+            for t in body["tools"]
+        }
         assert names == {"tool_search", "spawn_agent"}
 
 

@@ -2609,9 +2609,7 @@ async def responses_create(raw_request: Request):
                                 "input_tokens": input_tokens,
                                 "output_tokens": output_tokens,
                                 "total_tokens": input_tokens + output_tokens,
-                                "input_tokens_details": {
-                                    "cached_tokens": cache_read
-                                },
+                                "input_tokens_details": {"cached_tokens": cache_read},
                             }
                             for _frame in emitter.finish_frames(
                                 usage=usage,

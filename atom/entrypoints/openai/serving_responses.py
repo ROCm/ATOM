@@ -228,7 +228,9 @@ def _normalize_tools(tools: list, context: CodexToolContext) -> list[dict]:
         elif tool_type == "namespace":
             namespace = tool.get("name") or "namespace"
             for child in tool.get("tools") or []:
-                if not isinstance(child, dict) or not isinstance(child.get("name"), str):
+                if not isinstance(child, dict) or not isinstance(
+                    child.get("name"), str
+                ):
                     continue
                 name = child["name"]
                 context.namespaces[name] = namespace
@@ -264,7 +266,9 @@ def _custom_as_function(tool: dict, namespace: str | None) -> dict:
     if isinstance(fmt, dict) and fmt.get("type") == "grammar":
         syntax = fmt.get("syntax") or "grammar"
         definition = fmt.get("definition") or ""
-        description += f"\nReturn raw input matching this {syntax} grammar:\n{definition}"
+        description += (
+            f"\nReturn raw input matching this {syntax} grammar:\n{definition}"
+        )
     return {
         "type": "function",
         "name": tool.get("name") or "",
@@ -366,7 +370,9 @@ def responses_to_openai_messages(request: ResponsesRequest) -> list[dict]:
         item_type = item.get("type")
         if item_type in (None, "message") and "role" in item:
             messages.append(
-                _role_message(item.get("role") or "user", _content_text(item.get("content")))
+                _role_message(
+                    item.get("role") or "user", _content_text(item.get("content"))
+                )
             )
         elif item_type == "function_call":
             call_id = item.get("call_id") or item.get("id") or ""
@@ -412,7 +418,9 @@ def responses_to_openai_messages(request: ResponsesRequest) -> list[dict]:
             )
         elif "role" in item:
             messages.append(
-                _role_message(item.get("role") or "user", _content_text(item.get("content")))
+                _role_message(
+                    item.get("role") or "user", _content_text(item.get("content"))
+                )
             )
     if not messages:
         raise ValueError("Request must contain at least one message")
@@ -497,7 +505,9 @@ def build_responses_response(
         "store": False,
         "tools": request.tools or [],
         "metadata": request.metadata or {},
-        "tool_choice": request.tool_choice if request.tool_choice is not None else "auto",
+        "tool_choice": (
+            request.tool_choice if request.tool_choice is not None else "auto"
+        ),
     }
     if request.instructions is not None:
         response["instructions"] = request.instructions
@@ -764,11 +774,7 @@ class ResponseStreamEmitter:
         if args:
             state.accumulated_args += args
         frames = self._maybe_add_tool_item(state)
-        if (
-            state.added
-            and self.context.kind(state.name) == "function"
-            and args
-        ):
+        if state.added and self.context.kind(state.name) == "function" and args:
             frames.append(
                 self._event(
                     "response.function_call_arguments.delta",
