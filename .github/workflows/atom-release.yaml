@@ -3,8 +3,10 @@ name: ATOM Release Package
 # Builds the ATOM wheel (pure Python + the rust-built libmesh.so carried as
 # package data) and publishes it as a GitHub Release asset.
 #
-# First wheel release flow for ATOM (the ROCm 7 images only ever shipped an
-# editable install inside the docker image). Modeled on aiter's
+# ATOM has published wheels before -- v0.1.5 and v0.1.6-rc0 carry
+# atom-<version>+rocm7.0/7.1/7.2-py3-none-any.whl -- but by hand rather than
+# from a workflow. This puts that on rails, keeping the name those releases
+# established. Modeled on aiter's
 # aiter-release.yaml, minus everything that does not apply: ATOM has no HIP
 # kernels to compile, no auditwheel repair step, and no S3 staging — the wheel
 # is the package plus the atomesh rust binary's cdylib, built by the same
@@ -123,16 +125,18 @@ jobs:
     # racing them. fail-fast is off because a break in one ROCm line says
     # nothing about the other -- that independence is the point of running
     # both.
+    outputs:
+      release_tag: ${{ steps.version.outputs.release_tag }}
+
     strategy:
       max-parallel: 1
       fail-fast: false
       matrix:
-        flavor: [rocm7, rocm10]
-
-    if: >-
-      ${{ github.event_name != 'workflow_dispatch'
-          || inputs.flavors == 'both'
-          || inputs.flavors == matrix.flavor }}
+        # Narrowing to one line has to happen here rather than in a job-level
+        # `if`: that is evaluated before the matrix exists, so it cannot see
+        # matrix.flavor. Anything that is not a dispatch (a workflow_call with
+        # no flavors, or a tag push) builds the whole set.
+        flavor: ${{ fromJSON(inputs.flavors == 'rocm7' && '["rocm7"]' || inputs.flavors == 'rocm10' && '["rocm10"]' || '["rocm7","rocm10"]') }}
 
     env:
       BUILD_REF: ${{ inputs.commit || github.ref }}
@@ -210,7 +214,14 @@ jobs:
             echo "ERROR: could not read a ROCm version from ${BUILD_IMAGE}; refusing to build an unlabelled wheel"
             exit 1
           fi
-          echo "Build image ROCm version: ${ROCM_VER}"
+          # Published wheels already spell this as major.minor -- v0.1.5 shipped
+          # atom-0.1.5+rocm7.0, +rocm7.1 and +rocm7.2 -- so keep two components
+          # rather than the SDK's full 7.2.4, or the same line would appear
+          # under two different names across releases.
+          ROCM_VER_FULL="${ROCM_VER}"
+          ROCM_VER="$(echo "${ROCM_VER}" | cut -d. -f1,2)"
+          echo "Build image ROCm version: ${ROCM_VER_FULL} (wheel segment: rocm${ROCM_VER})"
+          echo "rocm_ver_full=${ROCM_VER_FULL}" >> "$GITHUB_OUTPUT"
 
           DATE_STAMP=""
           if [ "${ADD_DATE_STAMP}" = "true" ]; then DATE_STAMP=$(date +%Y%m%d); fi
@@ -286,47 +297,33 @@ jobs:
               python3 -c 'import atom.mesh; print(\"atom.mesh import ok\")' || echo 'note: atom.mesh python import not required (cdylib only)'
             "
 
+      - name: Record what this wheel was built against
+        env:
+          ROCM_VER_FULL: ${{ steps.version.outputs.rocm_ver_full }}
+          WHEEL_VERSION: ${{ steps.version.outputs.wheel_version }}
+        run: |
+          set -eu
+          # The version segment keeps two components, the way v0.1.5's wheels
+          # and aiter's spell it -- users pick a line, not a patch. The exact
+          # SDK the wheel was built against still matters for tracking down a
+          # regression, so it is recorded here and carried into the release
+          # notes rather than into the filename.
+          {
+            echo "  - \`$(basename "$(ls dist/atom-*.whl)")\`"
+            echo "    ROCm ${ROCM_VER_FULL}, image ${BUILD_IMAGE}"
+            docker exec "atom_build_${{ matrix.flavor }}" bash -c \
+              'python3 -c "import torch,sys;print(f\"    torch {torch.__version__}\")" 2>/dev/null' || true
+          } > "dist/provenance-${{ matrix.flavor }}.txt"
+          cat "dist/provenance-${{ matrix.flavor }}.txt"
+
       - name: Upload wheel as workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: atom-whl-${{ github.run_id }}-${{ github.run_attempt }}
-          path: dist/*.whl
+          name: atom-whl-${{ matrix.flavor }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/*.whl
+            dist/provenance-*.txt
           retention-days: 14
-
-      - name: Create GitHub Release and upload wheel
-        env:
-          WHEEL_VERSION: ${{ steps.version.outputs.wheel_version }}
-          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -ex
-          # Tag builds release at the pushed tag; manual dispatch releases at
-          # v<wheel_version> (creating the tag if absent) so the release is
-          # always anchored to a tag.
-          if [ "${{ github.event_name }}" = "push" ]; then
-            TAG="${GITHUB_REF_NAME}"
-          else
-            TAG="${RELEASE_TAG}"
-            if ! git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
-              git tag "${TAG}" "$(git rev-parse HEAD)"
-              git push origin "refs/tags/${TAG}"
-            fi
-          fi
-          DRAFT_FLAG=""
-          if [ "${DRAFT}" = "true" ]; then DRAFT_FLAG="--draft"; fi
-          gh release create "${TAG}" \
-            --title "ATOM ${TAG}" \
-            --notes "ATOM ${TAG} wheel build.
-
-          - Commit: $(git rev-parse HEAD)
-          - Build image: ${BUILD_IMAGE}
-          - Wheel: $(basename $(ls dist/atom-*.whl))" \
-            ${DRAFT_FLAG} \
-            --verify-tag \
-            dist/atom-*.whl \
-            || { # release may already exist (re-run); fall back to asset upload
-              gh release upload "${TAG}" dist/atom-*.whl --clobber
-            }
 
       - name: Build summary
         if: always()
@@ -344,3 +341,96 @@ jobs:
         if: always()
         run: |
           docker rm -f "atom_build_${{ matrix.flavor }}" || true
+
+  publish:
+    name: Publish the release once every flavor is in
+    needs: build-and-release
+    if: ${{ always() && needs.build-and-release.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.build-and-release.outputs.release_tag }}
+      FLAVORS: ${{ inputs.flavors || 'both' }}
+      DRAFT: ${{ inputs.draft || false }}
+
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download every flavor's wheel
+        uses: actions/download-artifact@v4
+        with:
+          pattern: atom-whl-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-wheels
+          merge-multiple: true
+
+      - name: Check the set is complete
+        run: |
+          set -euo pipefail
+          # Publishing is deliberately a separate job: a release that carries
+          # only some of its flavors looks finished from the outside, and
+          # whoever pulls the missing one silently gets another line's wheel.
+          # Uploading as each flavor finished would put exactly that
+          # half-release in front of users for as long as the rest takes.
+          case "${FLAVORS}" in
+            both) expected=2; want="rocm7 rocm10" ;;
+            rocm7) expected=1; want="rocm7" ;;
+            rocm10) expected=1; want="rocm10" ;;
+            *) echo "Unexpected flavors value: ${FLAVORS}"; exit 1 ;;
+          esac
+
+          found=$(find release-wheels -type f -name '*.whl' | wc -l | tr -d ' ')
+          find release-wheels -type f -name '*.whl' -printf '%f\n' | sort
+          if [ "${found}" -ne "${expected}" ]; then
+            echo "Expected exactly ${expected} wheel(s) for flavors='${FLAVORS}', found ${found}."
+            exit 1
+          fi
+          for flavor in ${want}; do
+            n=$(find release-wheels -type f -name "*+${flavor}*.whl" | wc -l | tr -d ' ')
+            if [ "${n}" -ne 1 ]; then
+              echo "Expected one ${flavor} wheel, found ${n}."
+              exit 1
+            fi
+          done
+          echo "Wheel set complete: ${found} wheel(s), one per flavor."
+
+      - name: Create the release and upload every wheel at once
+        run: |
+          set -ex
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="${RELEASE_TAG}"
+            if ! git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
+              git tag "${TAG}" "$(git rev-parse HEAD)"
+              git push origin "refs/tags/${TAG}"
+            fi
+          fi
+          DRAFT_FLAG=""
+          if [ "${DRAFT}" = "true" ]; then DRAFT_FLAG="--draft"; fi
+          gh release create "${TAG}" \
+            --title "ATOM ${TAG}" \
+            --notes "ATOM ${TAG} wheel build.
+
+          - Commit: $(git rev-parse HEAD)
+          - Wheels:
+          $(cat release-wheels/provenance-*.txt 2>/dev/null | sed 's/^/        /')" \
+            ${DRAFT_FLAG} \
+            --verify-tag \
+            $(find release-wheels -type f -name '*.whl' | sort) \
+            || gh release upload "${TAG}" $(find release-wheels -type f -name '*.whl' | sort) --clobber
+
+      - name: Release summary
+        if: always()
+        run: |
+          {
+            echo "## ATOM Release"
+            echo "- **Tag**: ${RELEASE_TAG}"
+            echo "- **Wheels**:"
+            find release-wheels -type f -name '*.whl' -printf '  - %f\n' | sort || echo "  - (none)"
+          } >> "$GITHUB_STEP_SUMMARY"
