@@ -880,7 +880,14 @@ class BlockManager:
         # rollback set to.
         if seq.has_per_req_cache and not self.state.has_free(self.state_slots_per_req):
             return -1
-        if not self.enable_prefix_caching:
+        # Temporary: a media prompt is served as if prefix caching were off. Its
+        # placeholder tokens are the same token id whatever image they stand for,
+        # so the keys collide. Folded into this early return rather than guarded
+        # further down, so media also skips the checkpoint bookkeeping below --
+        # those checkpoints could never be hit, and never being indexed they
+        # would never be evicted either. Per-block image keys would lift this:
+        # branch `whn/mm_prefix_cache`.
+        if not self.enable_prefix_caching or seq.is_multimodal:
             if not self._has_page_units(self.num_pool_blocks(len(seq))):
                 return -1
             return 0
@@ -1590,7 +1597,9 @@ class BlockManager:
         `next_forward_tokens` reaches `checkpointers_at`; see there. Left
         unset it reads the prompt's remainder, which is the prefill answer.
         """
-        if not self.enable_prefix_caching:
+        # Media publishes nothing, exactly as prefix caching off does; see
+        # `can_allocate`.
+        if not self.enable_prefix_caching or seq.is_multimodal:
             return
         hbs = self._hash_block_size()
         base = seq.num_cached_tokens if start_tokens is None else start_tokens

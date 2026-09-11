@@ -2064,7 +2064,7 @@ class Scheduler:
         # which is correct for a single-shot prefill (there is no later chunk to
         # resume from anyway). Forks do not arise on a fresh multimodal prompt
         # (`state_fork_src < 0`), so the fork-vetting below is likewise moot.
-        if getattr(seq, "multimodal_data", None) is not None:
+        if seq.is_multimodal:
             return chunk
         target = bm.checkpoint_cut(seq, start, start + chunk)
         if target:

@@ -1855,6 +1855,8 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         self._load_lifecycles[sid] = seq
 
     def get_num_new_matched_tokens(self, seq) -> tuple[int, bool]:
+        if self.skips_offload(seq):
+            return 0, False
         if not self._do_load or self._lookup_client is None:
             return 0, False
         self._begin_load_lifecycle(seq)
@@ -1964,7 +1966,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         # hbm_satisfies_after_alloc case where HBM prefix cache already covers
         # the lookup hit. Only suffix chunks computed by this request should be
         # stored.
-        if self._do_save:
+        if self._do_save and not self.skips_offload(seq):
             entry = self._save_tracker.get(sid)
             if entry is None or entry[0] is not seq:
                 self._save_tracker[sid] = [seq, initial_saved]

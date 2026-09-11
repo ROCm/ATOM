@@ -310,6 +310,26 @@ class OffloadSchedulerMixin(ABC):
     handoff mechanics whose invariants are identical for both layouts.
     """
 
+    @staticmethod
+    def skips_offload(seq) -> bool:
+        """Whether this request must stay out of the offload tier entirely.
+
+        Temporary, and true for media. LMCache derives its keys from the raw
+        token ids we hand `lookup`, and a prompt's media placeholders are the
+        same token id whatever image they stand for -- so a hit returns a
+        different image's KV, and anything stored is reachable by any request
+        carrying the same ids, a text one that passed them in as
+        `prompt_token_ids` included.
+
+        Read by both `get_num_new_matched_tokens` and `update_state_after_alloc`
+        in each layout, rather than by the scheduler that calls them: those two
+        are the generic connector API, and P/D carries its transfer
+        registration and its "park for remote KV" signal through the same
+        calls. Lifting this needs block hashes that name the images:
+        branch `whn/mm_prefix_cache`.
+        """
+        return bool(getattr(seq, "is_multimodal", False))
+
     # Save/load lifecycle contract. Declared abstract so a missing forwarder is
     # a construction-time TypeError, not a silent no-op behind the delegating
     # shell -- the failure mode that let DSV4 ship without abandon_save. The

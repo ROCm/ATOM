@@ -6199,3 +6199,79 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
             assert tier.take_store_reports() == (set(), {op})
         finally:
             tier.shutdown()
+
+
+# ── media prompts stay out of the offload tier ─────────────────────────────
+
+
+class _RecordingLookup:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def lookup(self, token_ids, lookup_id):
+        self.calls.append(lookup_id)
+        return 0
+
+    def clear_lookup_status(self, lookup_id):
+        pass
+
+
+def _dense_sched(lookup):
+    from atom.kv_transfer.offload.dense.connector import DenseOffloadScheduler
+
+    sched = object.__new__(DenseOffloadScheduler)
+    sched._do_load = True
+    sched._do_save = True
+    sched._lookup_client = lookup
+    sched._load_specs = {}
+    sched._reqs_need_recv = {}
+    sched._save_tracker = {}
+    sched._hit_save_floors = {}
+    sched._lookup_results = {}
+    sched._lookup_in_step = []
+    sched._begin_load_lifecycle = lambda seq: None
+    sched._lmcache_hit_save_floor = lambda ls: 0
+    return sched
+
+
+def _offload_seq(media: bool):
+    return SimpleNamespace(
+        id=1,
+        num_prompt_tokens=8,
+        token_ids=list(range(8)),
+        num_cached_tokens=0,
+        is_multimodal=media,
+    )
+
+
+def test_media_never_looks_up_the_offload_tier():
+    """LMCache keys on the raw token ids we hand `lookup`, and media
+    placeholders are the same token id whatever image they stand for -- a hit
+    would return a different image's KV.
+
+    Guarded here and not in the scheduler: `get_num_new_matched_tokens` is the
+    generic connector API, and P/D returns its "park for remote KV" signal
+    through it.
+    """
+    lookup = _RecordingLookup()
+    sched = _dense_sched(lookup)
+
+    assert sched.get_num_new_matched_tokens(_offload_seq(media=True)) == (0, False)
+    assert lookup.calls == []
+
+    # A text prompt still asks.
+    sched.get_num_new_matched_tokens(_offload_seq(media=False))
+    assert lookup.calls == ["1"]
+
+
+def test_media_is_never_tracked_for_save():
+    """Blocking reads alone would leave entries nobody can safely read, and a
+    text request passing the same placeholder ids as `prompt_token_ids` could
+    still reach them."""
+    sched = _dense_sched(_RecordingLookup())
+
+    sched.update_state_after_alloc(_offload_seq(media=True))
+    assert sched._save_tracker == {}
+
+    sched.update_state_after_alloc(_offload_seq(media=False))
+    assert list(sched._save_tracker) == ["1"]

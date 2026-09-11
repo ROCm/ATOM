@@ -1272,3 +1272,107 @@ class TestJointChunkProbeIsGated:
         # runs and fails -- which is the point: it ran.
         assert bm._joint_chunk_tokens == 0
         assert "LMCache chunk size" in caplog.text
+
+
+# ── media prompts opt out of the prefix cache ──────────────────────────────
+
+
+class TestMultimodalSkipsPrefixCache:
+    """Temporary: until the block hash can tell two images apart, a media
+    prompt must neither read the cache nor write to it -- reading hands it
+    another request's image, writing hands its own to somebody else.
+    """
+
+    def _bm(self) -> BlockManager:
+        cfg = MockConfig(
+            num_kvcache_blocks=32, kv_cache_block_size=4, enable_prefix_caching=True
+        )
+        return BlockManager(cfg)
+
+    def _media(self, seq_factory, tokens):
+        return seq_factory(tokens, multimodal_data={"pixel_values": object()})
+
+    def _publish(self, bm, seq, tokens):
+        bm.allocate(seq, 0)
+        bm.hash_blocks(seq, len(tokens))
+        bm.deallocate(seq)
+
+    def test_a_media_request_takes_no_hit(self, seq_factory):
+        bm = self._bm()
+        tokens = list(range(20))
+        self._publish(bm, seq_factory(tokens), tokens)
+
+        # The prefix really is resident: a text request finds it.
+        assert bm.can_allocate(seq_factory(tokens)) == 4
+        # The media request with the same tokens must not.
+        assert bm.can_allocate(self._media(seq_factory, tokens)) == 0
+
+    def test_a_media_request_publishes_nothing(self, seq_factory):
+        bm = self._bm()
+        tokens = list(range(20))
+        self._publish(bm, self._media(seq_factory, tokens), tokens)
+
+        # Nothing it computed may be reachable by anyone else.
+        assert bm.can_allocate(seq_factory(tokens)) == 0
+        assert bm.can_allocate(self._media(seq_factory, tokens)) == 0
+
+    def test_text_requests_are_untouched(self, seq_factory):
+        bm = self._bm()
+        tokens = list(range(20))
+        self._publish(bm, seq_factory(tokens), tokens)
+        assert bm.can_allocate(seq_factory(tokens)) == 4
+
+    def test_the_marker_outlives_the_batch_dropping_multimodal_data(self, seq_factory):
+        """`ScheduledBatch.__init__` clears `multimodal_data` after the first
+        batch, and block hashes are published after the forward -- so the
+        publish path has to read a marker that survives that."""
+        bm = self._bm()
+        tokens = list(range(20))
+        media = self._media(seq_factory, tokens)
+        bm.allocate(media, 0)
+
+        media.multimodal_data = None  # what the scheduler does
+        assert media.is_multimodal
+
+        bm.hash_blocks(media, len(tokens))
+        bm.deallocate(media)
+        assert bm.can_allocate(seq_factory(tokens)) == 0
+
+    def test_decode_steps_stay_quiet(self, seq_factory):
+        """A first cut skipped only `kv.publish`, which left every block
+        unhashed -- so `_chain_parent_hash` took its gap branch and logged an
+        error on every decode step of every media request. Media has to take the
+        same path prefix caching off takes: nothing hashed, nothing published,
+        nothing logged."""
+        errors = []
+
+        class _Catch(logging.Handler):
+            def emit(self, record):
+                if record.levelno >= logging.ERROR:
+                    errors.append(record.getMessage())
+
+        bm = self._bm()
+        tokens = list(range(20))
+        media = self._media(seq_factory, tokens)
+        bm.allocate(media, 0)
+        bm.hash_blocks(media, len(tokens))
+
+        handler = _Catch()
+        logging.getLogger("atom").addHandler(handler)
+        try:
+            for token in range(1000, 1016):
+                media.token_ids.append(token)
+                media.num_tokens += 1
+                bm.may_append(media)
+                bm.hash_decode_blocks(media, media.num_tokens)
+        finally:
+            logging.getLogger("atom").removeHandler(handler)
+
+        assert errors == []
+        assert media.num_hashed_tokens == 0
+
+    def test_no_block_stored_events_for_media(self, seq_factory):
+        bm = self._bm()
+        tokens = list(range(20))
+        self._publish(bm, self._media(seq_factory, tokens), tokens)
+        assert bm.take_events() == []

@@ -167,6 +167,7 @@ class Sequence:
         # allocate() / free it in deallocate().
         self.has_per_req_cache = has_per_req_cache
         self.multimodal_data = multimodal_data
+        self.is_multimodal = multimodal_data is not None
         self.mrope_positions = mrope_positions
         self.mrope_position_delta = mrope_position_delta
         self.num_tokens = len(self.token_ids)
