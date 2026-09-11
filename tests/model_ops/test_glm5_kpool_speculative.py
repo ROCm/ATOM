@@ -4,47 +4,6 @@
 import pytest
 
 
-def _get_query_request_indices():
-    try:
-        from atom.model_ops.glm5_next.speculative import get_query_request_indices
-    except (ImportError, RuntimeError) as error:
-        missing_gpu_runtime = (
-            isinstance(error, ImportError)
-            and error.name is not None
-            and (
-                error.name == "aiter"
-                or error.name.startswith("aiter.")
-                or error.name == "triton"
-            )
-        )
-        missing_device = isinstance(error, RuntimeError) and "rocminfo" in str(error)
-        if not (missing_gpu_runtime or missing_device):
-            raise
-        pytest.skip(f"GLM k-pool runtime unavailable: {error}")
-    return get_query_request_indices
-
-
-def test_get_query_request_indices_maps_ragged_verification_tokens_to_requests():
-    import torch
-
-    get_query_request_indices = _get_query_request_indices()
-    cu = torch.tensor([0, 3, 3, 7, 9], dtype=torch.int32)
-
-    rows = get_query_request_indices(cu, 9)
-
-    # The second request is empty; no token may be assigned to it.
-    assert rows.tolist() == [0, 0, 0, 2, 2, 2, 2, 3, 3]
-
-
-def test_get_query_request_indices_preserves_single_request_positions():
-    import torch
-
-    get_query_request_indices = _get_query_request_indices()
-    cu = torch.tensor([0, 4], dtype=torch.int32)
-
-    assert get_query_request_indices(cu, 4).tolist() == [0, 0, 0, 0]
-
-
 def test_pool_candidates_mix_history_with_fresh_rows():
     import torch
 

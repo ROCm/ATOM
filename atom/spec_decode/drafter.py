@@ -221,12 +221,7 @@ class Drafter(abc.ABC):
         all_gather that goes INTO the recording, so a synthetic context left
         describing the target bakes a collective the pass never runs at.
         """
-        from atom.utils import envs
-
-        # The forced-rejection diagnostic returns sentinel draft ids before any
-        # draft forward.  Its declared graphs are therefore unreachable, and
-        # warming them would try to compile an otherwise-uninitialized wrapper.
-        if envs.ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL or not self.draft_graphs:
+        if not self.draft_graphs:
             return
         runner = self.runner
         capture_sizes = sorted(runner.capture_sizes)  # capture leaves it descending

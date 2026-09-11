@@ -13,6 +13,7 @@ from atom.model_ops.attention_mla import MLAAttention
 from atom.model_ops.glm5_next.geometry import (
     effective_kpool_size,
     pooled_path_enabled,
+    speculative_kpool_history_size,
 )
 from atom.utils import envs
 
@@ -198,14 +199,11 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         return rows
 
     def _kpool_history_size(self) -> int:
-        """Return ring rows needed to survive speculative rejection."""
+        """Return the documented ring bound for speculative rejection."""
         pool = self._kpool_size()
         spec = self.model_runner.config.speculative_config
-        if spec is None:
-            return pool
-        # Two speculative windows plus the incomplete pool survive rejection.
-        window = spec.num_speculative_tokens + 1
-        return 1 << (pool + 2 * window - 1).bit_length()
+        num_speculative_tokens = None if spec is None else spec.num_speculative_tokens
+        return speculative_kpool_history_size(pool, num_speculative_tokens)
 
     def _kpool_tail_bytes(self) -> int:
         """Per-request tail bytes across every indexer-owning layer."""

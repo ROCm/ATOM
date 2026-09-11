@@ -26,6 +26,7 @@ from atom.utils import envs, forward_context
 from atom.utils.custom_register import direct_register_custom_op
 
 from . import kpool
+from .geometry import speculative_verify_enabled
 
 
 def _kpool_request_index(cu_seqlens_q: torch.Tensor, n_tokens: int) -> torch.Tensor:
@@ -141,10 +142,13 @@ def _sparse_attn_indexer_kpool(
         raise NotImplementedError(
             "GLM-5.3 kpool does not support DCP/PCP; use dcp=pcp=1"
         )
-    # Prefer explicit scheduler metadata. The ragged-query condition covers
-    # metadata implementations that do not expose ``num_spec_decodes``.
-    is_speculative_verify = getattr(attn_metadata, "num_spec_decodes", 0) > 0 or (
-        not context.is_prefill and attn_metadata.max_seqlen_q > 1
+    # The explicit scheduler field lives on the nested GDN metadata today. The
+    # ragged-query condition remains a fallback for other metadata builders.
+    gdn_metadata = getattr(attn_metadata, "gdn_metadata", None)
+    is_speculative_verify = speculative_verify_enabled(
+        is_prefill=context.is_prefill,
+        num_spec_decodes=getattr(gdn_metadata, "num_spec_decodes", 0),
+        max_seqlen_q=attn_metadata.max_seqlen_q,
     )
     if is_speculative_verify:
         from .speculative import run_speculative_kpool_indexer
@@ -166,7 +170,6 @@ def _sparse_attn_indexer_kpool(
             topk_tokens,
             topk_out_width,
             get_current_atom_config().kv_cache_block_size,
-            max_model_len,
             scale_fmt,
             stable_topk,
         )

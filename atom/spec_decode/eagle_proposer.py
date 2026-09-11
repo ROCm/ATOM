@@ -559,7 +559,6 @@ class EagleProposer(Drafter):
         )
         if envs.ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL:
             draft_token_ids.fill_(-1)
-            return draft_token_ids
         var = self.runner.forward_vars
         # Eaale3 only support mha currently
         draft_uses_mha = hasattr(self.runner, "draft_kv_builder")

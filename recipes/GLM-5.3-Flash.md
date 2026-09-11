@@ -102,7 +102,11 @@ The serving implementation is split between
 implementation. Its contracts are covered at three levels:
 
 * `tests/model_ops/test_glm5_kpool_geometry.py` runs on CPU and pins the shared
-  producer/metadata output width, including `ATOM_GLM5_KPOOL=0`.
+  producer/metadata output width, speculative dispatch, packed request mapping,
+  and rejection-ring sizing, including `ATOM_GLM5_KPOOL=0`. The speculative
+  ring retains an incomplete pool plus two verification windows, then rounds
+  that correctness floor to a power of two for efficient modulo and stable
+  kernel shapes. With pool size 4 and MTP3, 12 live rows therefore allocate 16.
 * `tests/model_ops/test_glm5_kpool_kernels.py` runs on ROCm and compares the
   production pooling/Hadamard/query-quant kernels directly with their torch
   references. It also asserts that query quantization uses AITER's

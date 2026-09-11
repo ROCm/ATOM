@@ -14,6 +14,10 @@ import triton
 import triton.language as tl
 
 from . import kpool
+from .geometry import (
+    get_query_request_indices,
+    speculative_pool_scratch_width,
+)
 
 
 @triton.jit
@@ -62,19 +66,6 @@ def _update_kpool_history_kernel(
             (destination_slot * 2 + plane) * HISTORY_SIZE + residue
         ) * HEAD_DIM
         tl.store(history + destination_offset + offsets, value)
-
-
-def get_query_request_indices(
-    cu_seqlens_q: torch.Tensor,
-    num_query_tokens: int,
-) -> torch.Tensor:
-    """Map each packed query row to its request index."""
-    # Unlike repeat_interleave, this has no data-dependent output allocation.
-    return torch.bucketize(
-        torch.arange(num_query_tokens, device=cu_seqlens_q.device),
-        cu_seqlens_q[1:],
-        right=True,
-    ).clamp_max(cu_seqlens_q.numel() - 2)
 
 
 def build_speculative_pool_candidates(
@@ -229,7 +220,6 @@ def run_speculative_kpool_indexer(
     topk_tokens: int,
     output_width: int,
     block_size: int,
-    max_model_len: int,
     scale_fmt: str,
     stable_topk: bool,
 ) -> None:
@@ -289,41 +279,44 @@ def run_speculative_kpool_indexer(
     )
     if metadata.max_seqlen_k <= topk_tokens:
         return
-    # A per-token paged scoring path also handles ragged verification. Chunking
-    # bounds scratch memory during long prefills; optimize only after parity.
+    # A per-token paged scoring path also handles ragged verification. Size its
+    # reusable scratch from this batch's live KV span, not the model limit.
     selected = torch.full(
         (num_query_tokens, output_width),
         -1,
         device=keys.device,
         dtype=torch.int32,
     )
-    max_pools = triton.cdiv(max_model_len, pool_size)
+    max_pools = speculative_pool_scratch_width(metadata.max_seqlen_k, pool_size)
+    chunk_size = min(num_query_tokens, 128)
+    logits_scratch = torch.empty(
+        (chunk_size, max_pools),
+        device=keys.device,
+        dtype=torch.float32,
+    )
+    selected_pools_scratch = torch.empty(
+        (chunk_size, topk_tokens // pool_size),
+        device=keys.device,
+        dtype=torch.int32,
+    )
+    query_block_tables = metadata.block_tables[request_indices].contiguous()
     for begin in range(0, num_query_tokens, 128):
         end = min(num_query_tokens, begin + 128)
         count = end - begin
         sequence_lengths = (positions[begin:end] + 1).to(torch.int32)
         pool_lengths = (sequence_lengths // pool_size).contiguous()
-        logits = torch.empty(
-            (count, max_pools),
-            device=keys.device,
-            dtype=torch.float32,
-        )
-        block_tables = metadata.block_tables[request_indices[begin:end]].contiguous()
+        logits = logits_scratch[:count]
+        selected_pools = selected_pools_scratch[:count]
         deepgemm_fp8_paged_mqa_logits(
             queries[begin:end].view(count, 1, num_heads, head_dim),
             pooled_kv_cache.unsqueeze(-2),
             weights[begin:end],
             logits,
             pool_lengths,
-            block_tables,
+            query_block_tables[begin:end],
             max_pools,
             KVBlockSize=pool_rows_per_block,
             Preshuffle=True,
-        )
-        selected_pools = torch.empty(
-            (count, topk_tokens // pool_size),
-            device=keys.device,
-            dtype=torch.int32,
         )
         top_k_per_row_decode(
             logits,
