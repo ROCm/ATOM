@@ -38,7 +38,7 @@ def _resolve_model_path(model: str) -> str:
 
 
 def _load_encoder_from_dir(model_path: str) -> MessageEncoderAdapter | None:
-    """Look for ``<model>/encoding/encoding_*.py`` and load ``encode_messages``.
+    """Look for ``<model>/encoding/encoding*.py`` and load ``encode_messages``.
 
     Returns ``None`` when the directory or matching file is absent (model uses
     the standard Jinja path). Returns ``None`` and warns on ambiguity (multiple
@@ -49,12 +49,14 @@ def _load_encoder_from_dir(model_path: str) -> MessageEncoderAdapter | None:
     if not os.path.isdir(enc_dir):
         return None
 
-    candidates = sorted(glob.glob(os.path.join(enc_dir, "encoding_*.py")))
+    # DeepSeek-V4 ships encoding_dsv4.py; DeepSeek-V4.1-Flash ships
+    # encoding.py, so match both rather than only the suffixed form.
+    candidates = sorted(glob.glob(os.path.join(enc_dir, "encoding*.py")))
     if not candidates:
         return None
     if len(candidates) > 1:
         logger.warning(
-            f"Multiple encoding_*.py found in {enc_dir}, refusing to guess: "
+            f"Multiple encoding*.py found in {enc_dir}, refusing to guess: "
             f"{[os.path.basename(p) for p in candidates]}"
         )
         return None
