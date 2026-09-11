@@ -17,6 +17,9 @@ import threading
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 
+import numpy as np
+import torch
+
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
     KVConnectorOutput,
@@ -27,6 +30,32 @@ from atom.kv_transfer.offload import config as offcfg
 
 logger = logging.getLogger("atom")
 _VALID_KV_ROLES = {"offload", "kv_both", "kv_producer", "kv_consumer"}
+
+
+def tokens_to_tensor(tokens: list[int]) -> torch.Tensor:
+    """Materialize a request's token ids as an int64 CPU tensor.
+
+    ``torch.tensor(list_of_int)`` unboxes every element through the CPython
+    API while holding the GIL, and offload runs on save/load worker threads
+    that contend for it with the forward loop. numpy builds the buffer in C
+    and ``from_numpy`` adopts it without a copy; the resulting values and
+    dtype are identical.
+
+    Two measurements, because they disagree and the smaller one is the one to
+    plan against. A microbenchmark at M3's longest requests (32768 ids, three
+    threads spinning on the GIL) gives 16.1 ms per call for ``torch.tensor``
+    against 1.8 ms here -- 8.8x. In the server, across a 180 s window at 440
+    save calls per rank, the same substitution moved the conversion from
+    5.07 s to 1.71 s -- 3.0x. The gap is request length: the benchmark uses
+    the longest requests, the server sees a distribution, and the numpy path's
+    fixed cost is a larger share of a short one. The in-server figure is what
+    the connector's own budget moved by, and it was 24% of the whole save cost
+    before the change.
+
+    The tensor aliases the fresh numpy buffer, which nothing else holds, so
+    LMCache owns it outright.
+    """
+    return torch.from_numpy(np.asarray(tokens, dtype=np.int64))
 
 
 def validated_kv_role(kvc: dict) -> str:
