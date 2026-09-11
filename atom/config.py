@@ -641,8 +641,6 @@ def glm5_kpool_block_size(index_kpool: int) -> int:
 
 _CONFIG_REGISTRY: dict[str, str] = {
     "deepseek_v32": "deepseek_v3",
-    "deepseek_v41_text": "deepseek_v3",  # V4.1 text half; engram_*/hc_mult ride
-    # through as extra attrs the same way V4's fields do.
     "deepseek_v4": "deepseek_v3",  # V4 reuses V3 schema; V4-specific fields
     # (compress_ratios, num_hash_layers, hc_mult, swiglu_limit, ...) flow
     # through as extra config attrs and are read in DeepseekV4Args.from_hf_config.
@@ -665,44 +663,11 @@ _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     "qwen3_5_moe": "text_config",
     "mistral3": "text_config",
     "glm5_next": "text_config",  # GLM-5.3-Flash: text-only hybrid KDA/DSA runtime
-    "deepseek_v41": "text_config",  # V4.1-Flash: vision tower ignored, text half served
 }
 
 # Text sub-config model_types that this image's transformers has no class for.
 # Loaded as a bare PretrainedConfig; the ATOM model normalizes the aliases it
 # needs at construction time.
-
-
-def _fill_v41_attention_shims(text_config_dict: dict) -> None:
-    """Synthesize the V3-schema attention fields DeepSeek-V4.1 does not carry.
-
-    V4.1 replaced MLA with CSA2, so it describes attention with head_dim /
-    o_lora_rank / o_groups / index_* and simply has no kv_lora_rank,
-    qk_nope_head_dim or v_head_dim. ATOM's KV-cache sizing and attention
-    metadata builder read those names off the config -- not off the model -- so
-    they have to exist before a V4.1 checkpoint can be loaded at all.
-
-    These values only have to be self-consistent enough to size a pool. They are
-    NOT V4.1's real attention geometry, and any model that actually runs CSA2
-    must stop relying on them.
-    """
-    head_dim = int(text_config_dict.get("head_dim", 512))
-    rope_dim = int(text_config_dict.get("qk_rope_head_dim", 64))
-    text_config_dict.setdefault("kv_lora_rank", head_dim)
-    text_config_dict.setdefault("qk_nope_head_dim", max(head_dim - rope_dim, 1))
-    text_config_dict.setdefault("v_head_dim", head_dim)
-    text_config_dict.setdefault("first_k_dense_replace", 0)
-    text_config_dict.setdefault("moe_layer_freq", 1)
-    # CSA2 encodes its per-layer compression as {0, 1, 2}; the V4 pool geometry
-    # only knows V4's {dense 0, CSA 4, HCA 128}, and V4.1's list is also longer
-    # than num_hidden_layers because it covers the CED encoder. Flatten it to a
-    # dense pool of the right length: the pool this sizes is not the one CSA2
-    # will need, and a model that runs CSA2 has to bring its own geometry.
-    num_layers = int(text_config_dict.get("num_hidden_layers", 0))
-    if num_layers:
-        text_config_dict["compress_ratios"] = [0] * num_layers
-
-
 _PLAIN_TEXT_CONFIG_MODEL_TYPES: frozenset[str] = frozenset(
     {"kimi_linear", "glm5_next_text"}
 )
@@ -749,8 +714,6 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
             and "quantization_config" in config_dict
         ):
             text_config_dict["quantization_config"] = config_dict["quantization_config"]
-        if text_config_dict.get("model_type") == "deepseek_v41_text":
-            _fill_v41_attention_shims(text_config_dict)
         text_model_type = text_config_dict.get("model_type", "deepseek_v3")
         if text_model_type in _PLAIN_TEXT_CONFIG_MODEL_TYPES:
             # Transformers does not ship a config class for these in this image
@@ -2101,10 +2064,7 @@ class Config:
         # Use the preserved `architectures` field (re-injected by get_hf_config,
         # line 567) which keeps the original "DeepseekV4ForCausalLM[NextN]" name.
         arches = getattr(self.hf_config, "architectures", None) or []
-        # `DeepseekV4` NOT followed by a digit: V4* (Pro, DSpark, NextN) but NOT
-        # DeepseekV41 (V4.1), which is a distinct architecture and must not take
-        # V4's 256 block-size override.
-        is_deepseek_v4 = any(re.search(r"DeepseekV4(?!\d)", str(a)) for a in arches)
+        is_deepseek_v4 = any("DeepseekV4" in str(a) for a in arches)
         if is_deepseek_v4:
             v4_block_size = 256
             if self.kv_cache_block_size != v4_block_size:

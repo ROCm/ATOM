@@ -3,19 +3,12 @@
 
 from __future__ import annotations
 
-import re
 from enum import StrEnum
 from functools import cache
 from typing import TYPE_CHECKING
 
 from atom.plugin.prepare import is_sglang, is_vllm
 from atom.utils import envs, resolve_obj_by_qualname
-
-# `DeepseekV4` NOT followed by a digit: matches DeepseekV4* (V4-Pro, V4-DSpark,
-# NextN) but NOT DeepseekV41 (V4.1), a distinct architecture that must not be
-# mistaken for the V4 attention family. A bare substring test catches the "V4"
-# inside "V41" and routes V4.1 to the wrong backend.
-_V4_ARCH_RE = re.compile(r"DeepseekV4(?!\d)")
 
 if TYPE_CHECKING:
     # A return annotation only, and its module imports the attention stack --
@@ -74,7 +67,7 @@ def attn_family(hf_text_config) -> Family:
     # (`get_hf_config` preserves it) and is what tells them apart; a draft is
     # stamped `deepseek_v4_mtp` instead and has no architecture of its own.
     arches = getattr(hf_text_config, "architectures", None) or []
-    if any(_V4_ARCH_RE.search(str(arch)) for arch in arches) or model_type in _V4_TYPES:
+    if any("DeepseekV4" in str(arch) for arch in arches) or model_type in _V4_TYPES:
         return Family.V4
     if model_type in _KIMI_MLA_TYPES:
         return Family.KIMI_MLA
