@@ -819,6 +819,23 @@ class ModelRunner:
         construct on the meta device and import weights via IPC instead.
         """
         config = self.config
+        # Reject engram + speculative decoding BEFORE constructing the model,
+        # which memory-maps ~200 GB of host tables: the host prefetch keys on one
+        # sampled token per sequence per step and cannot carry a spec step's
+        # candidates or n-gram context. Detected from the config so we never map
+        # the tables just to raise afterwards.
+        if config.speculative_config is not None:
+            tc = getattr(config.hf_config, "text_config", None) or config.hf_config
+            declares_engram = (
+                tc.get("engram_layer_ids") is not None
+                if isinstance(tc, dict)
+                else getattr(tc, "engram_layer_ids", None) is not None
+            )
+            if declares_engram:
+                raise NotImplementedError(
+                    "engram is not supported with speculative decoding; serve "
+                    "engram models without a speculative_config"
+                )
         self.model = model_class(config)
         fused_shared_expert_load_fn = None
         if hasattr(self.model, "load_fused_expert_weights"):
@@ -850,16 +867,8 @@ class ModelRunner:
         build_engram_host = getattr(self.model, "build_engram_host", None)
         if build_engram_host is None:
             return
-        # Engram does not support speculative decoding: the host prefetch keys on
-        # one sampled token per sequence per step and cannot carry the multiple
-        # candidate tokens (nor the trailing n-gram context) a spec step needs,
-        # and the one-row-per-seq staging cannot represent them -- so rather than
-        # silently stage zeros or hash a rejected token, reject the combination.
-        if getattr(self.config, "speculative_config", None) is not None:
-            raise NotImplementedError(
-                "engram is not supported with speculative decoding; serve engram "
-                "models without a speculative_config"
-            )
+        # engram + speculative decoding is rejected earlier, in
+        # _build_and_load_model, before the host tables are mapped.
         self.engram = build_engram_host(
             device=self.device,
             max_num_tokens=self.config.max_num_batched_tokens,
@@ -1011,6 +1020,10 @@ class ModelRunner:
         if not self.still_running:
             return
         self.still_running = False
+        # Stop the engram prefetch worker (a ThreadPoolExecutor + large-table
+        # thread) so it does not outlive teardown or write into freed state.
+        if getattr(self, "engram", None) is not None:
+            self.engram.shutdown()
         # 0. Join any offload connector's copy threads. Its ThreadPoolExecutors
         #    are non-daemon, so leaving them running wedges interpreter shutdown
         #    or races an in-flight copy against atexit. Must run BEFORE the KV

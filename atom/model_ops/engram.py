@@ -371,6 +371,14 @@ class HostEmbeddingTable:
         self._scale = scale
         self.block_size = 0
         if scale is not None:
+            # gather() does `scale.to(float32)`; that decodes 2**(code-127) only
+            # for a float8 E8M0 dtype. A raw uint8 exponent-code table would be
+            # read as plain magnitudes (~127x off), so fail loud instead.
+            if not scale.is_floating_point():
+                raise ValueError(
+                    f"engram block scale must be a float8 (E8M0) dtype, got "
+                    f"{scale.dtype}"
+                )
             if scale.shape[0] != num_rows:
                 raise ValueError(
                     f"scale has {scale.shape[0]} rows, expected {num_rows}"
@@ -634,10 +642,16 @@ class EngramHost:
 
         # Probe without consuming: a hit still has to be readable by the fill
         # loop below, which is what makes this `contains` and not `take`.
+        # A seq is a miss unless EVERY layer is cached: entries evict per
+        # (seq, layer), so probing only layer_ids[0] would call a half-evicted
+        # seq a hit and then fail in the take loop below.
         missing = [
             i
             for i, seq_id in enumerate(seq_ids)
-            if not self.prefetcher.cache.contains(seq_id, self.layer_ids[0])
+            if any(
+                not self.prefetcher.cache.contains(seq_id, lid)
+                for lid in self.layer_ids
+            )
         ]
         computed: dict[tuple[int, int], torch.Tensor] = {}
         if missing:

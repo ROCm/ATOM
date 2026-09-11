@@ -158,6 +158,13 @@ class EngramOp(nn.Module):
                     f"{(self.hc_mult, self.hidden_size)}"
                 )
         if wkv_scale is not None:
+            # `.float()` decodes 2**(code-127) only for a float8 E8M0 dtype; a
+            # raw uint8 exponent-code table would multiply by ~127 instead. Fail
+            # loud rather than silently mis-scale the projection.
+            if not wkv_scale.is_floating_point():
+                raise ValueError(
+                    f"wkv scale must be a float8 (E8M0) dtype, got {wkv_scale.dtype}"
+                )
             rows, cols = wkv.shape
             if tuple(wkv_scale.shape) != (rows // block, cols // block):
                 raise ValueError(
@@ -259,18 +266,28 @@ class EngramModules(nn.Module):
         with open(os.path.join(model_path, "model.safetensors.index.json")) as fh:
             weight_map = json.load(fh)["weight_map"]
 
+        # A layer's six tensors need not share a shard -- safetensors is free to
+        # split the ~98 GB table off from its scale/projection -- so resolve each
+        # tensor through its own weight_map entry, opening (and keeping) whatever
+        # shards they land in rather than assuming they follow `embed.weight`.
+        shard_handles: dict[str, object] = {}
+
+        def _get(name: str) -> torch.Tensor:
+            shard = weight_map[name]
+            handle = shard_handles.get(shard)
+            if handle is None:
+                handle = safe_open(os.path.join(model_path, shard), framework="pt")
+                shard_handles[shard] = handle
+            return handle.get_tensor(name)
+
         ops: dict[int, EngramOp] = {}
         tables: dict[int, HostEmbeddingTable] = {}
-        handles = []
         for layer_id, num_rows in zip(config.layer_ids, config.num_embeddings):
-            shard = weight_map[_EMBED.format(layer_id)]
-            handle = safe_open(os.path.join(model_path, shard), framework="pt")
-            handles.append(handle)
             tables[layer_id] = HostEmbeddingTable(
-                handle.get_tensor(_EMBED.format(layer_id)),
+                _get(_EMBED.format(layer_id)),
                 num_rows=num_rows,
                 head_dim=config.head_dim,
-                scale=handle.get_tensor(_EMBED_SCALE.format(layer_id)),
+                scale=_get(_EMBED_SCALE.format(layer_id)),
             )
             op = EngramOp(
                 layer_id,
@@ -280,12 +297,14 @@ class EngramModules(nn.Module):
                 norm_eps=norm_eps,
             ).to(dtype)
             op.load_checkpoint_weights(
-                handle.get_tensor(_WKV.format(layer_id)),
-                handle.get_tensor(_K_WEIGHT.format(layer_id)),
-                handle.get_tensor(_Q_WEIGHT.format(layer_id)),
-                wkv_scale=handle.get_tensor(_WKV_SCALE.format(layer_id)),
+                _get(_WKV.format(layer_id)),
+                _get(_K_WEIGHT.format(layer_id)),
+                _get(_Q_WEIGHT.format(layer_id)),
+                wkv_scale=_get(_WKV_SCALE.format(layer_id)),
             )
             ops[layer_id] = op
+
+        handles = list(shard_handles.values())
 
         logger.info(
             "engram: %d modules on layers %s, %d hash heads, tables mapped from %s",
