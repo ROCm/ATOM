@@ -209,6 +209,7 @@ class _ChunkMajorPlan:
         "_grid",
         "_host_events",
         "_host_slots",
+        "_host_views",
         "_nblocks",
         "_num_segments",
         "_output_nbytes",
@@ -248,6 +249,9 @@ class _ChunkMajorPlan:
             torch.empty(nblocks, dtype=torch.int64, pin_memory=True)
             for _ in range(self._NUM_HOST_SLOTS)
         ]
+        # Numpy views over the same pinned storage, built once: ``.numpy()``
+        # allocates a fresh wrapper per call and this is per staging group.
+        self._host_views = [t.numpy() for t in self._host_slots]
         self._host_events = [torch.cuda.Event() for _ in range(self._NUM_HOST_SLOTS)]
         for event in self._host_events:
             event.record()
@@ -266,9 +270,13 @@ class _ChunkMajorPlan:
         slot = self._slot
         self._slot = (slot + 1) % self._NUM_HOST_SLOTS
         self._host_events[slot].synchronize()
-        host = self._host_slots[slot]
-        host.copy_(torch.as_tensor(block_ids, dtype=torch.int64))
-        self._block_ids_d.copy_(host, non_blocking=True)
+        # Assigning the sequence into the pinned buffer's numpy view converts it
+        # in C, straight into the destination. ``torch.as_tensor(list_of_int)``
+        # would unbox every element through the CPython API while holding the
+        # GIL, and then copy the result -- the same cost tokens_to_tensor exists
+        # to avoid, on a path that runs once per staging group.
+        self._host_views[slot][:] = block_ids
+        self._block_ids_d.copy_(self._host_slots[slot], non_blocking=True)
         self._host_events[slot].record()
         return True
 
@@ -307,14 +315,45 @@ class _ChunkMajorPlan:
         )
 
 
-# Plans are keyed by everything _build_meta derives them from except block_ids.
-# Segment data pointers are part of the key, so a reallocated KV cache misses
-# rather than silently packing from freed storage. Only a couple of shapes occur
+# Plans are keyed by the segment geometry and the chunk shape -- everything
+# _build_meta derives them from except block_ids. Only a couple of shapes occur
 # in practice -- a full staging group plus whatever tail a store leaves -- but
 # cap the cache anyway so an unusual traffic pattern cannot grow it without
 # bound.
 _PLAN_CACHE: dict[tuple, _ChunkMajorPlan] = {}
 _MAX_PLANS = 64
+
+
+def _plan_key(segment_tensors, counts) -> tuple | None:
+    """Identify one segment geometry and chunk shape, in constant time.
+
+    Naming every segment costs one ``data_ptr`` and one ``int`` per segment,
+    and at M3's 180 segments that is 360 Python-level conversions on every
+    staging group. It is also pure overhead: the codec builds its segment list
+    once in ``__init__`` and never mutates it. Measured at that geometry, the
+    full key costs 0.019 ms per group with the GIL idle and 0.277 ms with it
+    contended -- which is the state offload actually runs in -- against
+    0.003 ms for this.
+
+    Live tensors have distinct addresses, so the segment count together with
+    the first, middle and last segment pointers names one live segment list.
+    Two lists could only collide by sharing those three tensors and their
+    length while differing in between, which the codec cannot produce: it
+    derives the whole list from a single kv_caches mapping. A reallocated KV
+    cache misses, so a stale plan is never used to pack from freed storage.
+
+    Returns None for an empty segment list, leaving ``_build_meta`` to raise.
+    """
+    n = len(segment_tensors)
+    if n == 0:
+        return None
+    return (
+        n,
+        segment_tensors[0].data_ptr(),
+        segment_tensors[n // 2].data_ptr(),
+        segment_tensors[-1].data_ptr(),
+        counts,
+    )
 
 
 def _get_plan(
@@ -324,12 +363,8 @@ def _get_plan(
     device_buf: torch.Tensor,
 ) -> _ChunkMajorPlan:
     counts = tuple(int(n) for n in chunk_block_counts)
-    key = (
-        tuple(int(t.data_ptr()) for t in segment_tensors),
-        tuple(int(nb) for nb in segment_block_bytes),
-        counts,
-    )
-    plan = _PLAN_CACHE.get(key)
+    key = _plan_key(segment_tensors, counts)
+    plan = _PLAN_CACHE.get(key) if key is not None else None
     if plan is None:
         # block_ids is only length-checked by _build_meta, so a placeholder of
         # the right length is enough to get every other tensor built and every
