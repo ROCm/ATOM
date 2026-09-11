@@ -137,6 +137,8 @@ def pd_label(prefill: Any, decode: Any) -> str:
         return str(prefill) if prefill == decode else f"P{prefill}/D{decode}"
     value = prefill if prefill is not None else decode
     return "--" if value is None else str(value)
+
+
 def divide_by_total_gpu(value: float | None, total_gpu: int | None) -> float | None:
     if value and total_gpu:
         return value / total_gpu
