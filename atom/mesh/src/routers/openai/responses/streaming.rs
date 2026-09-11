@@ -19,11 +19,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use super::{
-    codex::{custom_tool_input, parse_tool_search_arguments, CodexToolContext},
-    context::ResponsesContext,
-    persistence::persist_response_if_needed,
-};
+use super::{context::ResponsesContext, persistence::persist_response_if_needed};
 use crate::protocols::{
     chat::{ChatCompletionRequest, ChatCompletionStreamResponse},
     common::{Usage, UsageInfo},
@@ -39,8 +35,6 @@ use crate::protocols::{
 pub(crate) enum OutputItemType {
     Message,
     FunctionCall,
-    CustomToolCall,
-    ToolSearchCall,
 }
 
 /// Status of an output item
@@ -56,16 +50,6 @@ struct OutputItemState {
     output_index: usize,
     status: ItemStatus,
     item_data: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone)]
-struct ToolCallItemState {
-    output_index: usize,
-    item_id: String,
-    call_id: String,
-    name: String,
-    accumulated_args: String,
-    added: bool,
 }
 
 /// OpenAI-compatible event emitter for /v1/responses streaming
@@ -96,8 +80,8 @@ pub(crate) struct ResponseStreamEventEmitter {
     current_message_output_index: Option<usize>,
     current_item_id: Option<String>,
     original_request: Option<ResponsesRequest>,
-    tool_call_items: Vec<ToolCallItemState>,
-    codex_context: CodexToolContext,
+    // Maps tool_call delta index → (output_index, item_id, name, accumulated_args).
+    tool_call_items: Vec<(usize, String, String, String)>,
 }
 
 impl ResponseStreamEventEmitter {
@@ -121,16 +105,11 @@ impl ResponseStreamEventEmitter {
             current_item_id: None,
             original_request: None,
             tool_call_items: Vec::new(),
-            codex_context: CodexToolContext::default(),
         }
     }
 
     pub fn set_original_request(&mut self, request: ResponsesRequest) {
         self.original_request = Some(request);
-    }
-
-    pub fn set_codex_context(&mut self, context: CodexToolContext) {
-        self.codex_context = context;
     }
 
     fn next_sequence(&mut self) -> u64 {
@@ -313,8 +292,6 @@ impl ResponseStreamEventEmitter {
             }
         }
 
-        self.codex_context.rewrite_response(&mut response_obj);
-
         json!({
             "type": ResponseEvent::COMPLETED,
             "sequence_number": self.next_sequence(),
@@ -362,40 +339,6 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub fn emit_custom_tool_input_delta(
-        &mut self,
-        output_index: usize,
-        item_id: &str,
-        call_id: &str,
-        delta: &str,
-    ) -> serde_json::Value {
-        json!({
-            "type": "response.custom_tool_call_input.delta",
-            "sequence_number": self.next_sequence(),
-            "output_index": output_index,
-            "item_id": item_id,
-            "call_id": call_id,
-            "delta": delta
-        })
-    }
-
-    pub fn emit_custom_tool_input_done(
-        &mut self,
-        output_index: usize,
-        item_id: &str,
-        call_id: &str,
-        input: &str,
-    ) -> serde_json::Value {
-        json!({
-            "type": "response.custom_tool_call_input.done",
-            "sequence_number": self.next_sequence(),
-            "output_index": output_index,
-            "item_id": item_id,
-            "call_id": call_id,
-            "input": input
-        })
-    }
-
     pub fn emit_output_item_added(
         &mut self,
         output_index: usize,
@@ -435,8 +378,6 @@ impl ResponseStreamEventEmitter {
 
         let id_prefix = match &item_type {
             OutputItemType::FunctionCall => "fc",
-            OutputItemType::CustomToolCall => "ctc",
-            OutputItemType::ToolSearchCall => "tsc",
             OutputItemType::Message => "msg",
         };
 
@@ -522,103 +463,51 @@ impl ResponseStreamEventEmitter {
                     let tc_index = delta.index as usize;
 
                     while self.tool_call_items.len() <= tc_index {
-                        self.tool_call_items.push(ToolCallItemState {
-                            output_index: usize::MAX,
-                            item_id: String::new(),
-                            call_id: String::new(),
-                            name: String::new(),
-                            accumulated_args: String::new(),
-                            added: false,
-                        });
+                        let (output_index, item_id) =
+                            self.allocate_output_index(OutputItemType::FunctionCall);
+                        self.tool_call_items.push((
+                            output_index,
+                            item_id,
+                            String::new(),
+                            String::new(),
+                        ));
                     }
 
                     if let Some(function) = &delta.function {
                         if let Some(name) = &function.name {
-                            self.tool_call_items[tc_index].name.push_str(name);
+                            self.tool_call_items[tc_index].2.push_str(name);
                         }
                     }
 
+                    // First delta for the tool call carries its id; emit output_item.added once.
                     if let Some(delta_id) = &delta.id {
-                        self.tool_call_items[tc_index].call_id.push_str(delta_id);
-                    }
-
-                    if !self.tool_call_items[tc_index].added
-                        && !self.tool_call_items[tc_index].call_id.is_empty()
-                        && !self.tool_call_items[tc_index].name.is_empty()
-                    {
-                        let state = self.tool_call_items[tc_index].clone();
-                        let kind = self.codex_context.kind(&state.name).to_string();
-                        let item_type = match kind.as_str() {
-                            "custom" => OutputItemType::CustomToolCall,
-                            "tool_search" => OutputItemType::ToolSearchCall,
-                            _ => OutputItemType::FunctionCall,
-                        };
-                        let (output_index, new_item_id) = self.allocate_output_index(item_type);
-                        self.tool_call_items[tc_index].output_index = output_index;
-                        self.tool_call_items[tc_index].item_id = new_item_id.clone();
-                        let mut item = match kind.as_str() {
-                            "custom" => json!({
-                                "id": new_item_id,
-                                "type": "custom_tool_call",
-                                "call_id": state.call_id,
-                                "name": state.name,
-                                "input": "",
-                                "status": "in_progress"
-                            }),
-                            "tool_search" => json!({
-                                "id": new_item_id,
-                                "type": "tool_search_call",
-                                "call_id": state.call_id,
-                                "execution": "client",
-                                "arguments": {},
-                                "status": "in_progress"
-                            }),
-                            _ => json!({
-                                "id": new_item_id,
-                                "type": "function_call",
-                                "call_id": state.call_id,
-                                "name": state.name,
-                                "arguments": "",
-                                "status": "in_progress"
-                            }),
-                        };
-                        if let Some(namespace) = self.codex_context.namespace(&state.name) {
-                            item["namespace"] = json!(namespace);
-                        }
+                        let output_index = self.tool_call_items[tc_index].0;
+                        let item_id = self.tool_call_items[tc_index].1.clone();
+                        let tc_name = self.tool_call_items[tc_index].2.clone();
+                        let item = json!({
+                            "id": item_id,
+                            "type": "function_call",
+                            "call_id": delta_id,
+                            "name": tc_name,
+                            "arguments": "",
+                            "status": "in_progress"
+                        });
                         let event = self.emit_output_item_added(output_index, &item);
                         self.send_event(&event, tx)?;
-                        self.tool_call_items[tc_index].added = true;
-
-                        // Some providers send argument bytes before the id/name
-                        // delta. Replay those bytes only after output_item.added
-                        // so the Responses event sequence stays valid.
-                        let state = self.tool_call_items[tc_index].clone();
-                        if kind == "function" && !state.accumulated_args.is_empty() {
-                            let event = self.emit_function_call_arguments_delta(
-                                state.output_index,
-                                &state.item_id,
-                                &state.accumulated_args,
-                            );
-                            self.send_event(&event, tx)?;
-                        }
                     }
 
                     if let Some(function) = &delta.function {
                         if let Some(args) = &function.arguments {
                             if !args.is_empty() {
-                                self.tool_call_items[tc_index]
-                                    .accumulated_args
-                                    .push_str(args);
-                                let state = self.tool_call_items[tc_index].clone();
-                                if state.added && self.codex_context.kind(&state.name) == "function"
-                                {
-                                    let event = self.emit_function_call_arguments_delta(
-                                        state.output_index,
-                                        &state.item_id,
-                                        args,
-                                    );
-                                    self.send_event(&event, tx)?;
-                                }
+                                self.tool_call_items[tc_index].3.push_str(args);
+                                let output_index = self.tool_call_items[tc_index].0;
+                                let item_id = self.tool_call_items[tc_index].1.clone();
+                                let event = self.emit_function_call_arguments_delta(
+                                    output_index,
+                                    &item_id,
+                                    args,
+                                );
+                                self.send_event(&event, tx)?;
                             }
                         }
                     }
@@ -628,75 +517,25 @@ impl ResponseStreamEventEmitter {
             if let Some(reason) = &choice.finish_reason {
                 if reason == "tool_calls" {
                     let tool_calls: Vec<_> = self.tool_call_items.clone();
-                    for state in &tool_calls {
-                        if !state.added {
-                            warn!(
-                                call_id = %state.call_id,
-                                name = %state.name,
-                                "Skipping incomplete streamed tool call without id or name"
-                            );
-                            continue;
-                        }
-                        let kind = self.codex_context.kind(&state.name);
-                        let mut item = match kind {
-                            "custom" => {
-                                let input = custom_tool_input(&state.accumulated_args);
-                                if !input.is_empty() {
-                                    let event = self.emit_custom_tool_input_delta(
-                                        state.output_index,
-                                        &state.item_id,
-                                        &state.call_id,
-                                        &input,
-                                    );
-                                    self.send_event(&event, tx)?;
-                                }
-                                let event = self.emit_custom_tool_input_done(
-                                    state.output_index,
-                                    &state.item_id,
-                                    &state.call_id,
-                                    &input,
-                                );
-                                self.send_event(&event, tx)?;
-                                json!({
-                                    "id": state.item_id,
-                                    "type": "custom_tool_call",
-                                    "call_id": state.call_id,
-                                    "name": state.name,
-                                    "input": input,
-                                    "status": "completed"
-                                })
-                            }
-                            "tool_search" => json!({
-                                "id": state.item_id,
-                                "type": "tool_search_call",
-                                "call_id": state.call_id,
-                                "execution": "client",
-                                "arguments": parse_tool_search_arguments(&state.accumulated_args),
-                                "status": "completed"
-                            }),
-                            _ => {
-                                let event = self.emit_function_call_arguments_done(
-                                    state.output_index,
-                                    &state.item_id,
-                                    &state.accumulated_args,
-                                );
-                                self.send_event(&event, tx)?;
-                                json!({
-                                    "id": state.item_id,
-                                    "type": "function_call",
-                                    "call_id": state.call_id,
-                                    "name": state.name,
-                                    "arguments": state.accumulated_args,
-                                    "status": "completed"
-                                })
-                            }
-                        };
-                        if let Some(namespace) = self.codex_context.namespace(&state.name) {
-                            item["namespace"] = json!(namespace);
-                        }
-                        let event = self.emit_output_item_done(state.output_index, &item);
+                    for (output_index, item_id, tc_name, accumulated_args) in &tool_calls {
+                        let event = self.emit_function_call_arguments_done(
+                            *output_index,
+                            item_id,
+                            accumulated_args,
+                        );
                         self.send_event(&event, tx)?;
-                        self.complete_output_item(state.output_index);
+
+                        let item = json!({
+                            "id": item_id,
+                            "type": "function_call",
+                            "call_id": item_id,
+                            "name": tc_name,
+                            "arguments": accumulated_args,
+                            "status": "completed"
+                        });
+                        let event = self.emit_output_item_done(*output_index, &item);
+                        self.send_event(&event, tx)?;
+                        self.complete_output_item(*output_index);
                     }
                 }
 
@@ -778,7 +617,6 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
     original_request: &ResponsesRequest,
-    codex_context: CodexToolContext,
 ) -> Response {
     debug!("Converting chat SSE stream to responses SSE format");
 
@@ -813,7 +651,6 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
             conversation_storage,
             conversation_item_storage,
             tx.clone(),
-            codex_context,
         )
         .await
         {
@@ -840,7 +677,6 @@ async fn process_and_transform_sse_stream(
     conversation_storage: Arc<dyn ConversationStorage>,
     conversation_item_storage: Arc<dyn ConversationItemStorage>,
     tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
-    codex_context: CodexToolContext,
 ) -> Result<(), String> {
     let mut accumulator = StreamingResponseAccumulator::new(&original_request);
 
@@ -849,7 +685,6 @@ async fn process_and_transform_sse_stream(
     let created_at = chrono::Utc::now().timestamp() as u64;
     let mut event_emitter = ResponseStreamEventEmitter::new(response_id, model, created_at);
     event_emitter.set_original_request(original_request.clone());
-    event_emitter.set_codex_context(codex_context);
 
     let event = event_emitter.emit_created();
     event_emitter

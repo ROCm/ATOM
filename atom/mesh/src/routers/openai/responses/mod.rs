@@ -1,6 +1,5 @@
 //! /v1/responses endpoint implementation.
 
-pub(crate) mod codex;
 pub(crate) mod context;
 pub(crate) mod conversation;
 pub(crate) mod conversions;
