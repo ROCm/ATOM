@@ -11,9 +11,9 @@ import torch
 
 from atom.model_ops.engram import (
     EngramConfig,
+    EngramHost,
     EngramPrefetchCache,
     EngramPrefetcher,
-    EngramHost,
     HostEmbeddingTable,
     NgramHashMapping,
     _is_prime,
