@@ -109,6 +109,7 @@ from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
     visible_hca,
 )
 from atom.model_ops.attentions.token_layout.batch_ids import build_batch_ids
+from atom.model_ops.sparse_indexer_fp4 import fp4_prefill_schedule
 from atom.model_ops.v4_kernels import (
     FP4_MQA_BLOCK_K,
     FP4_MQA_PARALLEL_UNIT_NUM,
@@ -2209,17 +2210,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         }
 
         if self._indexer_fp4:
-            # Precompute the FP4 prefill persistent-grid schedule here (instead
-            # of inside flydsl_pa_mqa_logits_fp4_prefill) so the kernel call is
-            # a pure launch. Prefill is eager (dynamic total_tokens), so this is
-            # a per-fwd tensor, not a fixed buffer. Inputs match the score
-            # call: aiter's `row_to_batch` = batch_id_per_q_token, local_starts = 0,
-            # local_ends = visible_end. block_k / parallel_unit_num MUST match
-            # the values passed to the kernel in `_score_topk_prefill_fp4`.
-            from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
-                compute_prefill_schedule,
-            )
-
             # Size the seq-local logits width to this batch's ACTUAL max
             # committed index length (max over seqs of n_committed_csa), NOT the
             # model max (`max_model_len_idx`). Every query row's visible_end is
@@ -2232,35 +2222,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # case. Decode keeps the fixed `max_model_len_idx` (CG needs a
             # static shape); prefill is eager so a per-fwd width is fine.
             fp4_prefill_max_seq_len = max(int(n_committed_per_seq.max()), 1)
-
-            local_starts = torch.zeros_like(visible_end_gpu)
-            # parallel_unit_num is the persistent-grid CTA-count CAP; the
-            # schedule uses as many CTAs as it can up to this P (smaller P ->
-            # larger `safe` chunk-fold -> fewer, more-serial CTAs). It bounds
-            # TWO independent axes:
-            #   - rows: every (row, chunk-split) needs a slot. A prefill fwd has
-            #     one row PER QUERY TOKEN, so P must be >= prefill row count or
-            #     surplus rows are silently dropped (logits stay at the -inf/NaN
-            #     pre-fill -> wrong top-k). This is what `prefill_rows` covers.
-            #   - chunks (context length): the FP4_MQA_PARALLEL_UNIT_NUM floor
-            #     keeps enough CTAs to split a long context across the GPU even
-            #     when rows are few. NOT decode-only: a long-context prefill has
-            #     few rows too, because the logits budget shrinks the Q chunk as
-            #     the row widens. At rows=1024 / W~32768 the floor is worth ~8%.
-            # max() of both axes -> correct rows AND adequate chunk parallelism.
-            prefill_rows = int(visible_end_gpu.shape[0])
-            prefill_parallel_unit_num = max(self._fp4_parallel_unit_num, prefill_rows)
-            _, prefill_cta_info, prefill_n_ctas = compute_prefill_schedule(
-                batch_id_per_q_token.to(torch.int32),
-                local_starts,
+            (
+                meta["fp4_prefill_cta_info"],
+                meta["fp4_prefill_n_ctas"],
+                meta["fp4_prefill_local_starts"],
+            ) = fp4_prefill_schedule(
+                batch_id_per_q_token,
                 visible_end_gpu,
                 self._fp4_block_k,
-                prefill_parallel_unit_num,
+                self._fp4_parallel_unit_num,
                 fp4_prefill_max_seq_len,
             )
-            meta["fp4_prefill_cta_info"] = prefill_cta_info
-            meta["fp4_prefill_n_ctas"] = prefill_n_ctas
-            meta["fp4_prefill_local_starts"] = local_starts
             meta["fp4_prefill_max_seq_len"] = fp4_prefill_max_seq_len
 
         return meta
@@ -4338,8 +4310,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # tensor (not CpuGpuBuffer): no CPU mirror, written by a device kernel.
         # P / block_k MUST match the values the scorer passes.
         if self._indexer_fp4:
-            # P = persistent-grid CTA-count CAP, bounding two axes (see the
-            # prefill build for the full note):
+            # P = persistent-grid CTA-count CAP, bounding two axes:
             #   - rows: a decode fwd has one row per decode token (= bs*next_n),
             #     so P must be >= max_decode_tokens (T_dec) or surplus rows are
             #     silently dropped (logits stay at the -inf pre-fill -> wrong

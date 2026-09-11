@@ -14,6 +14,10 @@ from typing import Any
 
 from aiter.jit.utils.chip_info import get_gfx
 
+from atom.model_ops.sparse_indexer_fp4 import (
+    FP4_MQA_BLOCK_K,
+    FP4_MQA_PARALLEL_UNIT_NUM,
+)
 from atom.model_ops.v4_kernels.compress_plan import (
     CompressPlan,
     make_compress_plans,
@@ -97,25 +101,6 @@ __all__ = [
 
 logger = logging.getLogger("atom")
 
-# FP4 indexer persistent-grid schedule params for the `pa_mqa_logits_fp4_prefill`
-# kernels, which decode and prefill both score through.
-# The attention metadata builder precomputes each path's cta_info with these
-# and the scorer passes the matching block_k, so layout and grid agree. They
-# live here (rather than in either caller) because both the builder and the
-# model-side scorer must use the SAME values.
-#
-# The grid floor is a CTA-count target, not the kernel default: every consumer
-# takes `max(floor, rows)`, so it only adds split-K to grids too small to fill
-# the GPU and is an identity for the wide ones. Splits are numerically inert --
-# each CTA gets a disjoint KV-column range, no cross-CTA partial sums.
-# 512 idled the machine on long contexts, where rows shrink as the logits buffer
-# widens: decode rows=128 W~32768 54.1us -> 51.2us, prefill rows=1024 224.6us ->
-# 206.2us. 4096 is not any shape's optimum (CTA-count quantization makes the
-# ordering shape-specific) but has the smallest worst-case regret of the values
-# tried; re-tune against a real workload mix.
-FP4_MQA_PARALLEL_UNIT_NUM = 4096
-FP4_MQA_BLOCK_K = 256
-
 
 def fp4_indexer_enabled(index_cache_dtype: Any, *, warn: bool = False) -> bool:
     """Is the FP4 CSA indexer active? Single source of truth for the predicate.
@@ -135,8 +120,7 @@ def fp4_indexer_enabled(index_cache_dtype: Any, *, warn: bool = False) -> bool:
 
     Keeping the predicate in one place is what stops the two from drifting —
     a divergence is silent at startup and only surfaces as a graph/eager dtype
-    mismatch. Lives here rather than in either caller for the same reason as
-    `FP4_MQA_*` above.
+    mismatch.
 
     gfx942 keeps the FP8 indexer because its FP4 path is unsupported. Pass
     `warn=True` from the builder only — it runs once, while `Indexer.__init__`

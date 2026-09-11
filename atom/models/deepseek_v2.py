@@ -108,6 +108,14 @@ from atom.model_ops.linear import (
     use_triton_gemm,
 )
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.sparse_indexer_fp4 import (
+    FP4_MQA_BLOCK_K,
+    FP4_MQA_PARALLEL_UNIT_NUM,
+    FP4_QUANT_BLOCK_SIZE,
+    assert_fp4_indexer_supported,
+    fp4_q_scale_shape,
+    sparse_indexer_fp4_enabled,
+)
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE, atom_parameter
 from atom.models.utils import (
@@ -1456,6 +1464,68 @@ def _dcp_gather_indexer_k_prefill(
     return k_fp8, k_scale
 
 
+def _prefill_mqa_logits_fp4(
+    prefill_metadata,
+    chunk: slice,
+    whole_batch: bool,
+    q_fp4: torch.Tensor,
+    q_scale: torch.Tensor,
+    weights: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_scale: torch.Tensor,
+    weights_scale: float,
+    kv_block_size: int,
+) -> torch.Tensor:
+    """One chunk of ragged-prefill FP4 logits, scored out of the paged cache.
+
+    A split chunk rebuilds the schedule rather than slicing the forward's:
+    `cta_info` encodes absolute row ids, so a slice would drop its rows.
+    """
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
+        compute_prefill_schedule,
+        flydsl_pa_mqa_logits_fp4_prefill,
+    )
+
+    rows = prefill_metadata.batch_id_per_q_token[chunk]
+    starts = prefill_metadata.indexer_fp4_local_starts[chunk]
+    ends = prefill_metadata.indexer_fp4_local_ends[chunk]
+    width = prefill_metadata.indexer_fp4_max_seq_len
+    if whole_batch:
+        cta_info = prefill_metadata.indexer_fp4_cta_info
+        n_ctas = prefill_metadata.indexer_fp4_n_ctas
+    else:
+        _, cta_info, n_ctas = compute_prefill_schedule(
+            rows,
+            starts,
+            ends,
+            FP4_MQA_BLOCK_K,
+            max(FP4_MQA_PARALLEL_UNIT_NUM, q_fp4.shape[0]),
+            width,
+        )
+    logits = torch.empty(
+        q_fp4.shape[0], width, dtype=torch.float32, device=q_fp4.device
+    )
+    flydsl_pa_mqa_logits_fp4_prefill(
+        q_fp4,
+        q_scale,
+        kv_cache,
+        kv_scale,
+        prefill_metadata.block_tables,
+        weights,
+        rows,
+        starts,
+        ends,
+        width,
+        weight_scale=weights_scale,
+        block_k=FP4_MQA_BLOCK_K,
+        kv_block_size=kv_block_size,
+        out=logits,
+        cta_info=cta_info,
+        n_ctas=n_ctas,
+    )
+    return logits
+
+
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: str,
@@ -1506,7 +1576,14 @@ def sparse_attn_indexer(
     )
     runner_block_size = get_current_atom_config().kv_cache_block_size
     cp_kv_cache_interleave_size = get_current_atom_config().dcp_config.interleave_size
-    kv_cache = kv_cache.view(-1, runner_block_size, kv_cache.shape[-1])
+    # Which width this indexer's cache is in -- the one thing the arguments
+    # cannot say, and a thing the traced graph piece already committed to.
+    fwd_ctx = get_current_atom_config().compilation_config.static_forward_context
+    indexer_module = fwd_ctx[k_cache_prefix.rsplit(".k_cache", 1)[0]]
+    indexer_fp4 = indexer_module._indexer_fp4
+    q_fp4_scale = None
+    if not indexer_fp4:
+        kv_cache = kv_cache.view(-1, runner_block_size, kv_cache.shape[-1])
     # PCP prefill: `k` (and `positions`) arrive as the full PADDED key set
     # [S_pad] produced by an all-gather of the round-robin shards. The KV-cache
     # write (driven by slot_mapping) and the gathered-KV sizing (total_kv =
@@ -1523,15 +1600,54 @@ def sparse_attn_indexer(
         k = k[:n_real]
         if positions is not None:
             positions = positions[:n_real]
-    if use_qk_rope_cache_fusion:
+    if indexer_fp4:
+        # `weights_out` comes back unscaled in q's dtype: the FP4 mqa-logits
+        # kernels apply the per-group q scale inside the MFMA and take
+        # `weights_scale` as their own fp32 scalar, so either folded in here
+        # would be applied twice. `preshuffle` has no FP4 spelling.
         q_bf16 = q_input
-        q_fp8 = torch.empty_like(q_bf16, dtype=dtypes.fp8)
+        q_quant = torch.empty(
+            (*q_bf16.shape[:-1], head_dim // 2), device=q_bf16.device, dtype=torch.uint8
+        )
+        q_fp4_scale = torch.empty(
+            fp4_q_scale_shape(q_bf16.shape[0], q_bf16.shape[1], head_dim),
+            device=q_bf16.device,
+            dtype=torch.uint8,
+        )
+        weights_mqa = torch.empty_like(weights)
+        indexer_qk_rope_quant_and_cache(
+            q_bf16,
+            q_quant,
+            weights,
+            weights_mqa,
+            k,
+            kv_cache,
+            slot_mapping,
+            k_norm_weight,
+            k_norm_bias,
+            positions,
+            cos_cache,
+            sin_cache,
+            k_norm_eps,
+            FP4_QUANT_BLOCK_SIZE,
+            scale_fmt,
+            weights_scale,
+            is_neox=is_neox_style,
+            q_scale_out=q_fp4_scale,
+            kv_cache_scale=indexer_module.k_cache.kv_cache_scale,
+        )
+        # `sparse_attn_indexer_fake` declares an fp32 return; nothing reads it,
+        # but the eager op must not drift from the trace.
+        weights = weights_mqa.float()
+    elif use_qk_rope_cache_fusion:
+        q_bf16 = q_input
+        q_quant = torch.empty_like(q_bf16, dtype=dtypes.fp8)
         weights_out = torch.empty(
             weights.shape, device=weights.device, dtype=torch.float32
         )
         indexer_qk_rope_quant_and_cache(
             q_bf16,
-            q_fp8,
+            q_quant,
             weights,
             weights_out,
             k,
@@ -1551,7 +1667,7 @@ def sparse_attn_indexer(
         )
         weights = weights_out
     else:
-        q_fp8 = q_input
+        q_quant = q_input
         indexer_k_quant_and_cache(
             k,
             kv_cache,
@@ -1560,6 +1676,8 @@ def sparse_attn_indexer(
             scale_fmt,
             preshuffle=True,
         )
+    if not indexer_fp4:
+        weights_mqa = weights
     if context.is_prefill:
         # Below index_topk the indexer is a no-op: top-k would select every token,
         # so prefill runs dense (attention_mla.use_prefill_mla gates on the same
@@ -1584,7 +1702,10 @@ def sparse_attn_indexer(
                 dtype=torch.long,
                 device=prefill_metadata.block_tables.device,
             )
-        if get_dcp_world_size() > 1:
+        if indexer_fp4:
+            # The paged FP4 scorer reads the cache in place.
+            k_fp8 = k_scale = None
+        elif get_dcp_world_size() > 1:
             k_fp8, k_scale = _dcp_gather_indexer_k_prefill(
                 kv_cache, prefill_metadata, head_dim, k.device
             )
@@ -1603,22 +1724,30 @@ def sparse_attn_indexer(
                 ),
                 preshuffle=True,
             )
-        cu_seqlen_ks = prefill_metadata.cu_seqlen_ks
-        cu_seqlen_ke = prefill_metadata.cu_seqlen_ke
+        # Per-row window bounds, in the column space this scorer emits.
+        if indexer_fp4:
+            cu_seqlen_ks = prefill_metadata.indexer_fp4_local_starts
+            cu_seqlen_ke = prefill_metadata.indexer_fp4_local_ends
+        else:
+            cu_seqlen_ks = prefill_metadata.cu_seqlen_ks
+            cu_seqlen_ke = prefill_metadata.cu_seqlen_ke
         num_tokens = hidden_states.shape[0]
-        q_prefill = q_fp8[num_decode_tokens:num_tokens]
-        weights_prefill = weights[num_decode_tokens:num_tokens]
+        q_prefill = q_quant[num_decode_tokens:num_tokens]
+        weights_prefill = weights_mqa[num_decode_tokens:num_tokens]
         num_rows = q_prefill.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
         topk_indices_prefill = topk_indices[num_decode_tokens:num_tokens, :topk_tokens]
-        # The dense logits buffer is [num_rows, total_kv] fp32. total_kv is the
-        # sum of all co-scheduled prefill contexts and is unbounded by
-        # max_num_batched_tokens, so a burst of long-context requests can push a
-        # single allocation to tens of GiB (#1376). Under chunked prefill
-        # num_rows is already capped by max_num_batched_tokens, so the OOM is
-        # driven by total_kv (the column dim). Chunk along the Q (query-row)
-        # dimension with q_chunk sized so the buffer [q_chunk, total_kv] fp32
-        # stays within the memory budget — q_chunk shrinks as total_kv grows.
+        row_width = (
+            prefill_metadata.indexer_fp4_max_seq_len if indexer_fp4 else total_kv
+        )
+        # The dense logits buffer is [num_rows, row_width] fp32. For FP8 that
+        # width is total_kv, the sum of all co-scheduled prefill contexts, and
+        # is unbounded by max_num_batched_tokens, so a burst of long-context
+        # requests can push a single allocation to tens of GiB (#1376). Under
+        # chunked prefill num_rows is already capped by max_num_batched_tokens,
+        # so the OOM is driven by the column dim. Chunk along the Q (query-row)
+        # dimension with q_chunk sized so the buffer [q_chunk, row_width] fp32
+        # stays within the memory budget — q_chunk shrinks as row_width grows.
         # Each chunk still scores the FULL KV, so every row's top-k is computed
         # completely in one shot: the result is exact with no cross-chunk merge,
         # the kernel's column indices are already global (no remapping), and each
@@ -1628,17 +1757,17 @@ def sparse_attn_indexer(
         budget_bytes = SPARSE_INDEXER_LOGITS_BUDGET_MB * 1024 * 1024
         if (
             budget_bytes > 0
-            and total_kv > 0
-            and budget_bytes // (total_kv * 4) < num_rows
+            and row_width > 0
+            and budget_bytes // (row_width * 4) < num_rows
         ):
-            # 4 bytes per fp32 logit; total_kv * 4 is one query row's footprint.
+            # 4 bytes per fp32 logit; row_width * 4 is one query row's footprint.
             # Round the budget-derived row count DOWN to keep the buffer within
             # budget: a multiple of 128 (aligned to the kernel's row tiling) in
             # the normal regime, avoiding the coarse power-of-2 doubling. When
-            # the budget affords < 128 rows (extreme total_kv), fall back to a
+            # the budget affords < 128 rows (extreme row_width), fall back to a
             # power-of-2 floor so it degrades to 64/32/.../1 instead of
             # collapsing straight to 1.
-            budget_rows = budget_bytes // (total_kv * 4)
+            budget_rows = budget_bytes // (row_width * 4)
             if budget_rows >= 128:
                 chunk_tokens = (budget_rows // 128) * 128
             else:
@@ -1651,14 +1780,29 @@ def sparse_attn_indexer(
             # Per-row window bounds slice 1:1 with this chunk's rows.
             row_starts = cu_seqlen_ks[chunk_start:chunk_end]
             row_ends = cu_seqlen_ke[chunk_start:chunk_end]
-            logits = fp8_mqa_logits(
-                Q=q_prefill[chunk_start:chunk_end],
-                KV=k_fp8,
-                kv_scales=k_scale,
-                weights=weights_prefill[chunk_start:chunk_end],
-                cu_starts=row_starts,
-                cu_ends=row_ends,
-            )
+            if indexer_fp4:
+                chunk = slice(chunk_start, chunk_end)
+                logits = _prefill_mqa_logits_fp4(
+                    prefill_metadata,
+                    chunk,
+                    chunk_tokens == num_rows,
+                    q_prefill[chunk],
+                    q_fp4_scale[num_decode_tokens:num_tokens][chunk],
+                    weights_prefill[chunk],
+                    kv_cache,
+                    indexer_module.k_cache.kv_cache_scale,
+                    weights_scale,
+                    runner_block_size,
+                )
+            else:
+                logits = fp8_mqa_logits(
+                    Q=q_prefill[chunk_start:chunk_end],
+                    KV=k_fp8,
+                    kv_scales=k_scale,
+                    weights=weights_prefill[chunk_start:chunk_end],
+                    cu_starts=row_starts,
+                    cu_ends=row_ends,
+                )
             top_k_per_row_prefill(
                 logits=logits,
                 rowStarts=row_starts,
@@ -1703,21 +1847,23 @@ def sparse_attn_indexer(
                 NUM_TOPK_TOKENS=topk_tokens,
                 PAGE_SIZE=runner_block_size,
                 out=sparse_kv_indices_buffer,
+                seq_local=indexer_fp4,
             )
     else:
         decode_metadata = attn_metadata
-        # kv_cache size requirement [num_block, block_size, n_head, head_dim],
-        # we only have [num_block, block_size, head_dim],
-        kv_cache = kv_cache.unsqueeze(-2)
-        padded_q_fp8_decode_tokens = q_fp8[:num_decode_tokens].reshape(
-            context.scheduled_bs, -1, *q_fp8.shape[1:]
+        if not indexer_fp4:
+            # kv_cache size requirement [num_block, block_size, n_head, head_dim],
+            # we only have [num_block, block_size, head_dim],
+            kv_cache = kv_cache.unsqueeze(-2)
+        padded_q_decode_tokens = q_quant[:num_decode_tokens].reshape(
+            context.scheduled_bs, -1, *q_quant.shape[1:]
         )
         # TODO: move and optimize below logic with triton kernels
-        batch_size = padded_q_fp8_decode_tokens.shape[0]
-        next_n = padded_q_fp8_decode_tokens.shape[1]
+        batch_size = padded_q_decode_tokens.shape[0]
+        next_n = padded_q_decode_tokens.shape[1]
         assert batch_size == context.scheduled_bs
         num_padded_tokens = batch_size * next_n
-        batch_size, next_n, _heads, _ = padded_q_fp8_decode_tokens.shape
+        batch_size, next_n, _heads, _ = padded_q_decode_tokens.shape
         num_rows = batch_size * next_n
         dcp_world_size = get_dcp_world_size()
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
@@ -1730,7 +1876,7 @@ def sparse_attn_indexer(
             # non-DCP path does below has already happened, and we return here.
             dcp_decode_candidate_exchange_fused(
                 attn_metadata,
-                padded_q_fp8_decode_tokens,
+                padded_q_decode_tokens,
                 kv_cache,
                 weights,
                 get_dcp_rank(),
@@ -1750,17 +1896,40 @@ def sparse_attn_indexer(
         logits = torch.empty(
             [num_rows, max_model_len], dtype=torch.float32, device="cuda"
         )
-        deepgemm_fp8_paged_mqa_logits(
-            padded_q_fp8_decode_tokens,
-            kv_cache,
-            weights[:num_padded_tokens],
-            logits,
-            decode_metadata.context_lens,
-            attn_metadata.block_tables,
-            max_model_len,
-            KVBlockSize=runner_block_size,
-            Preshuffle=True,
-        )
+        if indexer_fp4:
+            from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
+
+            flydsl_pa_mqa_logits_fp4(
+                padded_q_decode_tokens,
+                q_fp4_scale[:num_decode_tokens].reshape(
+                    batch_size, next_n, *q_fp4_scale.shape[1:]
+                ),
+                kv_cache,
+                indexer_module.k_cache.kv_cache_scale,
+                attn_metadata.block_tables,
+                weights_mqa[:num_padded_tokens],
+                decode_metadata.context_lens,
+                max_model_len,
+                weight_scale=weights_scale,
+                next_n=next_n,
+                block_k=FP4_MQA_BLOCK_K,
+                kv_block_size=runner_block_size,
+                out=logits,
+                cta_info=decode_metadata.indexer_fp4_cta_info,
+                total_ctas=decode_metadata.indexer_fp4_n_ctas,
+            )
+        else:
+            deepgemm_fp8_paged_mqa_logits(
+                padded_q_decode_tokens,
+                kv_cache,
+                weights[:num_padded_tokens],
+                logits,
+                decode_metadata.context_lens,
+                attn_metadata.block_tables,
+                max_model_len,
+                KVBlockSize=runner_block_size,
+                Preshuffle=True,
+            )
         topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
         top_k_per_row_decode(
             logits,
@@ -2075,6 +2244,9 @@ class Indexer(nn.Module):
         super().__init__()
         self.atom_config = atom_config
         self.config = config
+        self._indexer_fp4 = sparse_indexer_fp4_enabled(
+            atom_config.index_cache_dtype, config
+        )
         # self.indexer_cfg = config.attn_module_list_cfg[0]["attn_index"]
         self.topk_tokens = config.index_topk
         self.n_head = config.index_n_heads  # 64
@@ -2125,6 +2297,11 @@ class Indexer(nn.Module):
         self.k_norm = LayerNorm(self.head_dim, eps=1e-6, dtype=torch.float32)
         self.softmax_scale = self.head_dim**-0.5
         self._weights_scale = self.softmax_scale * self.n_head**-0.5
+        if self._indexer_fp4:
+            assert_fp4_indexer_supported(
+                fused_writer=self.use_qk_rope_cache_fusion,
+                context_parallel=get_dcp_world_size() > 1 or pcp_is_enabled(),
+            )
 
         # TODO (zyongye) change dim to fp8 later to (self.head_dim + 4)
         self.k_cache = DeepseekV32IndexerCache(
