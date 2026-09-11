@@ -838,20 +838,20 @@ class ModelRunner:
             f"[{self.rank_name}] Model load done: {config.model} "
             f"(weights loaded in {load_elapsed:.2f}s)"
         )
-        self._init_engram_runtime()
+        self._init_engram_host()
 
-    def _init_engram_runtime(self) -> None:
+    def _init_engram_host(self) -> None:
         """Attach the engram host path, for models that have engram layers.
 
-        The model owns its tables (it is what loaded them) and hands back a
-        runtime; the runner owns the lifecycle and the two hooks below. Models
+        The model owns its tables (it is what loaded them) and hands back the
+        EngramHost; the runner owns the lifecycle and the two hooks below. Models
         without engram leave this None and pay nothing but the attribute.
         """
         self.engram = None
-        build = getattr(self.model, "build_engram_runtime", None)
-        if build is None:
+        make_host = getattr(self.model, "build_engram_host", None)
+        if make_host is None:
             return
-        self.engram = build(
+        self.engram = make_host(
             device=self.device,
             max_num_tokens=self.config.max_num_batched_tokens,
         )
@@ -919,7 +919,7 @@ class ModelRunner:
                 .numpy()
                 .reshape(-1, 1)
             )
-        self.engram.stage(seq_ids, tokens, verify_token_ids=verify_tokens)
+        self.engram.stage_embeddings(seq_ids, tokens, verify_token_ids=verify_tokens)
         self.engram.wait_for_copy()
 
     def _maybe_warmup(self):

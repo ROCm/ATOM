@@ -13,7 +13,7 @@ from atom.model_ops.engram import (
     EngramConfig,
     EngramPrefetchCache,
     EngramPrefetcher,
-    EngramRuntime,
+    EngramHost,
     HostEmbeddingTable,
     NgramHashMapping,
     _is_prime,
@@ -375,10 +375,10 @@ def test_load_checkpoint_weights_rejects_bad_scale_shape():
         )
 
 
-def make_runtime() -> EngramRuntime:
+def make_runtime() -> EngramHost:
     pf = make_prefetcher()
     cfg = pf._hash_mapping.config
-    return EngramRuntime(
+    return EngramHost(
         pf,
         max_num_tokens=8,
         num_hash_heads=cfg.num_hash_heads,
@@ -392,7 +392,7 @@ def test_runtime_stage_uses_prefetched_rows():
     seq_ids = [31, 32]
     tokens = np.array([[5], [6]], dtype=np.int64)
     rt.prefetch_next(seq_ids, tokens)
-    assert rt.stage(seq_ids, tokens) == 2
+    assert rt.stage_embeddings(seq_ids, tokens) == 2
     for layer_id in rt.layer_ids:
         assert rt.embeddings(layer_id).shape == (2, rt.embed_width)
     rt.shutdown()
@@ -404,11 +404,11 @@ def test_runtime_stage_recomputes_on_prefetch_miss():
     seq_ids = [41]
     tokens = np.array([[9]], dtype=np.int64)
     rt.prefetch_next(seq_ids, tokens)
-    rt.stage(seq_ids, tokens)
+    rt.stage_embeddings(seq_ids, tokens)
     warm = {lid: rt.embeddings(lid).clone() for lid in rt.layer_ids}
 
     cold = make_runtime()
-    cold.stage(seq_ids, tokens)  # nothing prefetched
+    cold.stage_embeddings(seq_ids, tokens)  # nothing prefetched
     for layer_id in cold.layer_ids:
         torch.testing.assert_close(cold.embeddings(layer_id), warm[layer_id])
     rt.shutdown()
@@ -418,7 +418,7 @@ def test_runtime_stage_recomputes_on_prefetch_miss():
 def test_runtime_stage_without_tokens_on_miss_is_an_error():
     rt = make_runtime()
     with pytest.raises(RuntimeError, match="no token ids were supplied"):
-        rt.stage([51], None)
+        rt.stage_embeddings([51], None)
     rt.shutdown()
 
 
@@ -426,7 +426,7 @@ def test_runtime_rejects_more_rows_than_capacity():
     rt = make_runtime()
     ids = list(range(9))
     with pytest.raises(ValueError, match="exceeds staging capacity"):
-        rt.stage(ids, np.zeros((9, 1), dtype=np.int64))
+        rt.stage_embeddings(ids, np.zeros((9, 1), dtype=np.int64))
     rt.shutdown()
 
 

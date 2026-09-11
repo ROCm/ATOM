@@ -1,8 +1,8 @@
 """Device-side Engram op and the module that attaches it to a model.
 
 `EngramOp` is the per-layer device compute; `EngramModules` builds one op per
-engram layer, loads their weights, and hands back the host `EngramRuntime`
-(defined in `engram.py`) that feeds them -- the runner drives that runtime.
+engram layer, loads their weights, and hands back the `EngramHost` (defined in
+`engram.py`) that feeds them -- the runner drives that host each step.
 
 Structure is taken from the checkpoint's own tensors and from the V4.1 tech
 report section 2.4.2, which states two deliberate departures from the original
@@ -37,8 +37,8 @@ from torch import nn
 from atom.model_ops.engram import (
     CompressedTokenizer,
     EngramConfig,
+    EngramHost,
     EngramPrefetcher,
-    EngramRuntime,
     HostEmbeddingTable,
     NgramHashMapping,
 )
@@ -174,7 +174,8 @@ class EngramOp(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Model attachment: build the ops and their host runtime (was engram_module.py).
+# Model attachment: build the ops and the EngramHost that feeds them (was
+# engram_module.py).
 # ---------------------------------------------------------------------------
 
 _EMBED = "layers.{}.engram.embed.weight"
@@ -295,12 +296,12 @@ class EngramModules(nn.Module):
         )
         return cls(config, hash_mapping, ops, tables, handles)
 
-    def build_engram_runtime(
+    def build_engram_host(
         self,
         device: torch.device,
         max_num_tokens: int,
         dtype: torch.dtype | None = None,
-    ) -> EngramRuntime:
+    ) -> EngramHost:
         """The contract ModelRunner looks for by name.
 
         The staging buffers default to the dtype the engram layers actually
@@ -309,7 +310,7 @@ class EngramModules(nn.Module):
         """
         if dtype is None:
             dtype = next(self.ops.parameters()).dtype
-        return EngramRuntime(
+        return EngramHost(
             EngramPrefetcher(self.hash_mapping, self._tables),
             max_num_tokens=max_num_tokens,
             num_hash_heads=self.config.num_hash_heads,

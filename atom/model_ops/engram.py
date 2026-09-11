@@ -481,7 +481,7 @@ class EngramPrefetcher:
         )
         self._inflight: Future | None = None
         # DEBUG (ATOM_ENGRAM_DEBUG_VERIFY): the token each seq was last prefetched
-        # with, so `stage` can compare it against the token it recomputes from.
+        # with, so `stage_embeddings` can compare it against the token it recomputes from.
         self._debug_prefetch_token: dict[int, int] = {}
 
     @property
@@ -532,7 +532,7 @@ class EngramPrefetcher:
         self._pool.shutdown(wait=False, cancel_futures=True)
 
 
-class EngramRuntime:
+class EngramHost:
     """Ties the host prefetch to the device step.
 
     Ordering per step, with nothing added to the critical path:
@@ -540,12 +540,12 @@ class EngramRuntime:
       1. the previous step's sampled ids land on the host (the runner already
          copies them asynchronously and synchronizes before use), and
          `prefetch_next` queues hash + gather for them on the worker;
-      2. `stage` copies whatever the worker produced into a pinned buffer and
+      2. `stage_embeddings` copies whatever the worker produced into a pinned buffer and
          issues the H2D on a side stream, recording an event;
       3. `wait_for_copy` makes the compute stream wait on that event, so the
          engram layers read staged rows rather than racing the copy.
 
-    A sequence whose prefetch has not landed is computed inline in `stage`. The
+    A sequence whose prefetch has not landed is computed inline in `stage_embeddings`. The
     result is identical either way -- the prefetch only decides whether the work
     was already done, never what the answer is.
     """
@@ -578,7 +578,7 @@ class EngramRuntime:
         self.copy_stream = torch.cuda.Stream(device) if device.type == "cuda" else None
         self.copy_done = torch.cuda.Event() if device.type == "cuda" else None
         self._staged_rows = 0
-        # ATOM_ENGRAM_DEBUG_VERIFY cumulative counters (see `stage`).
+        # ATOM_ENGRAM_DEBUG_VERIFY cumulative counters (see `stage_embeddings`).
         self._verify_stages = 0
         self._verify_rows = 0
         self._verify_bad = 0
@@ -588,7 +588,7 @@ class EngramRuntime:
     def layer_ids(self) -> tuple[int, ...]:
         return self.prefetcher.layer_ids
 
-    def stage(
+    def stage_embeddings(
         self,
         seq_ids: list[int],
         token_ids: np.ndarray | None = None,
