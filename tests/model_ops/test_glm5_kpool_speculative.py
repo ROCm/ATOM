@@ -7,16 +7,20 @@ import pytest
 def _get_query_request_indices():
     try:
         from atom.model_ops.glm5_next.speculative import get_query_request_indices
-    except (ModuleNotFoundError, RuntimeError) as error:
-        missing_aiter = (
-            isinstance(error, ModuleNotFoundError)
+    except (ImportError, RuntimeError) as error:
+        missing_gpu_runtime = (
+            isinstance(error, ImportError)
             and error.name is not None
-            and (error.name == "aiter" or error.name.startswith("aiter."))
+            and (
+                error.name == "aiter"
+                or error.name.startswith("aiter.")
+                or error.name == "triton"
+            )
         )
         missing_device = isinstance(error, RuntimeError) and "rocminfo" in str(error)
-        if not (missing_aiter or missing_device):
+        if not (missing_gpu_runtime or missing_device):
             raise
-        pytest.skip("AITER imports require a visible ROCm device")
+        pytest.skip(f"GLM k-pool runtime unavailable: {error}")
     return get_query_request_indices
 
 

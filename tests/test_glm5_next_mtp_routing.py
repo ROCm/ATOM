@@ -10,7 +10,7 @@ from atom.config import SpeculativeConfig, _glm5_next_unsupported_features
 
 def _aiter_unavailable(error):
     missing_aiter = (
-        isinstance(error, ModuleNotFoundError)
+        isinstance(error, ImportError)
         and error.name is not None
         and (error.name == "aiter" or error.name.startswith("aiter."))
     )
@@ -24,20 +24,20 @@ def _mtp_symbols():
             Glm5NextMTP,
             _add_mtp_quant_excludes,
         )
-    except (ModuleNotFoundError, RuntimeError) as error:
+    except (ImportError, RuntimeError) as error:
         if not _aiter_unavailable(error):
             raise
-        pytest.skip("AITER imports require a visible ROCm device")
+        pytest.skip(f"AITER runtime unavailable: {error}")
     return Glm5NextMTP, _add_mtp_quant_excludes
 
 
 def _eagle_proposer():
     try:
         from atom.spec_decode.eagle_proposer import EagleProposer
-    except (ModuleNotFoundError, RuntimeError) as error:
+    except (ImportError, RuntimeError) as error:
         if not _aiter_unavailable(error):
             raise
-        pytest.skip("AITER imports require a visible ROCm device")
+        pytest.skip(f"AITER runtime unavailable: {error}")
     return EagleProposer
 
 
