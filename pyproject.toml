@@ -39,6 +39,7 @@ include-package-data = true
 [tool.setuptools.package-data]
 atom = [
     "mesh/target/release/libmesh.so",
+    "model_ops/fused_moe/configs/*.csv",
 ]
 
 [project.entry-points."vllm.platform_plugins"]

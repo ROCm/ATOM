@@ -42,6 +42,7 @@ the scheduler's token counts for variable-size AllGather/ReduceScatter; other
 topologies use variable-split routed `torch.distributed.all_to_all_single`:
 
 ```bash
+AITER_CONFIG_FMOE="$(python -c 'from atom.model_ops.fused_moe.configs import DSV4_RCCL_FMOE_CONFIG; print(DSV4_RCCL_FMOE_CONFIG)')" \
 AITER_BF16_FP8_MOE_BOUND=0 ATOM_MOE_GU_ITLV=1 AITER_LOG_LEVEL=WARNING \
 python -m atom.entrypoints.openai_server \
   --model deepseek-ai/DeepSeek-V4-Pro \
@@ -49,6 +50,31 @@ python -m atom.entrypoints.openai_server \
   --enable-expert-parallel --enable-dp-attention \
   --all2all-backend rccl
 ```
+
+The bundled AITER table selects measured FlyDSL kernels for the two large
+prefill buckets produced by this DPA8/EP8 RCCL path on MI355X:
+
+| padded tokens | stage 1 | stage 2 |
+|---:|---|---|
+| 32,768 | `flydsl_moe1_afp8_wfp4_bf16_t128x256x256_w2_bnt0_gui_fp8` | `flydsl_moe2_afp8_wfp4_bf16_t64x128x256_atomic` |
+| 131,072 | `flydsl_moe1_afp8_wfp4_bf16_t128x256x256_w2_bnt0_gui_fp8` | `flydsl_moe2_afp8_wfp4_bf16_t64x128x256_atomic` |
+
+Other shapes retain AITER's normal fallback selection. An explicit user value
+for `AITER_CONFIG_FMOE` can be used instead of the bundled table.
+
+On 8xMI355X with C64 AgentX, TP8/EP8, DP attention, RCCL, FP4 experts, FP8 KV,
+FP4 index cache, MTP=3, no KV offload, and real speculative acceptance, the
+one-hour A/B result was:
+
+| metric | default AITER selection | bundled table | change |
+|---|---:|---:|---:|
+| P90 interactivity | 28.769 tok/s/user | 33.401 tok/s/user | +16.10% |
+| active token throughput/chip | 22,884.686 tok/s | 24,233.944 tok/s | +5.90% |
+| TTFT p50 | 9.024 s | 8.679 s | -3.82% |
+| TTFT p90 | 16.510 s | 15.636 s | -5.29% |
+
+The tuning and A/B validation used AITER
+`38c6bb5fcb17243ca70195541a437cf1ac66d7e7`.
 
 The backend consumes the physical expert IDs produced by the existing routing
 and remapping path; it does not change EPLB policy or load accounting.
