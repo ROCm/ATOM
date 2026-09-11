@@ -1257,9 +1257,17 @@ class TestJointChunkProbeIsGated:
         assert bm._joint_chunk_tokens == 0
         assert "LMCache chunk size" not in caplog.text
 
-    def test_a_hosted_tier_still_probes_and_says_so_when_it_cannot_read(self, caplog):
+    def test_a_hosted_tier_still_probes_and_says_so_when_it_cannot_read(
+        self, caplog, monkeypatch
+    ):
         """The warning is worth printing exactly here: the tier is on, so a
         missing chunk size really does disable the joint KV load."""
+        from atom.kv_transfer.offload import config as offcfg
+
+        def unavailable(_config):
+            raise ImportError("LMCache unavailable for this probe")
+
+        monkeypatch.setattr(offcfg, "build_lmcache_config", unavailable)
         with caplog.at_level(logging.WARNING, logger="atom"):
             bm = self._bm(
                 {
@@ -1268,7 +1276,6 @@ class TestJointChunkProbeIsGated:
                     "offload_layout": "kimi_k3",
                 }
             )
-        # lmcache is not installed in the unit-test environment, so the probe
-        # runs and fails -- which is the point: it ran.
+        # Exercise a failed probe even when the test image has LMCache installed.
         assert bm._joint_chunk_tokens == 0
         assert "LMCache chunk size" in caplog.text

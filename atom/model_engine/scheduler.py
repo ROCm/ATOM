@@ -30,7 +30,7 @@ from collections.abc import Iterable
 import numpy as np
 
 from atom.config import Config
-from atom.kv_transfer.disaggregation import KVConnectorOutput
+from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.request import RequestOutput
@@ -160,6 +160,7 @@ class ScheduledBatch:
         is_final_chunk: list[bool] | None = None,
         next_token_ids: list[int] | None = None,
         state_maintenance_ops: StateMaintenanceOps | None = None,
+        is_first_decode_without_local_prefill: list[bool] | None = None,
     ):
         if scheduled_spec_decode_tokens is None:
             scheduled_spec_decode_tokens = {}
@@ -233,9 +234,14 @@ class ScheduledBatch:
             dtype=bool,
         )
 
-        self.is_first_decode_without_local_prefill = [
-            seq.is_first_decode for seq in seqs.values()
-        ]
+        self.is_first_decode_without_local_prefill = (
+            [seq.is_first_decode for seq in seqs.values()]
+            if is_first_decode_without_local_prefill is None
+            else list(is_first_decode_without_local_prefill)
+        )
+        assert len(self.is_first_decode_without_local_prefill) == len(
+            seqs
+        ), "first-decode flags must align with scheduled sequences"
         self.mrope_positions_by_req = {
             seq.id: seq.mrope_positions
             for seq in seqs.values()
@@ -507,8 +513,21 @@ class Scheduler:
         self.last_prompt_latency = 0.0
         self.delay_factor = config.scheduler_delay_factor
 
-        # Speculative decoding
-        self.use_spec = config.speculative_config is not None
+        # Speculative decoding. A P/D producer is excluded for the same reason
+        # `PrefillScheduler` is: it prefills, samples T0 and hands the request
+        # off, so it never proposes. ModelRunner disables deferred output on a
+        # producer (the consumer must consume T0 exactly once, or KDA state
+        # advances twice), and `propose()` only runs on the deferred path.
+        # Leaving speculation on here would still pad every sequence with
+        # `mtp_k` placeholders and size its decode window to `mtp_k + 1`, and
+        # the padding holds `num_tokens` `mtp_k` short of `max_tokens` so the
+        # handoff never fires -- the producer keeps decoding a request whose
+        # drafts do not exist. The drafter itself stays loaded: the producer
+        # still writes the draft's context KV into the shared pool at prefill.
+        is_pd_producer = kv_config_has_producer(
+            getattr(config, "kv_transfer_config", {}) or {}
+        )
+        self.use_spec = config.speculative_config is not None and not is_pd_producer
         self.mtp_k: int = (
             config.speculative_config.num_speculative_tokens if self.use_spec else 0
         )  # type: ignore
@@ -912,6 +931,10 @@ class Scheduler:
         if (
             seq.id not in self.deferred_free_blocks
             or getattr(seq, "_awaiting_aborted_load_cleanup", False)
+            or (
+                self._connector_flag("is_producer")
+                and not getattr(seq, "_kv_send_completed", False)
+            )
             or self._connector_should_defer_free(seq)
         ):
             return
@@ -1978,6 +2001,17 @@ class Scheduler:
                 )[: self.mtp_k]
                 for d in drafts:
                     seq.append_token(int(d))
+                # Pad to the full verify window regardless of what the producer
+                # sent -- normally nothing, since a producer does not
+                # speculate. The first decode slices the trailing `mtp_k + 1`
+                # tokens, so a short seq makes that slice reach back into the
+                # prompt: T0 lands at the end of the window instead of at its
+                # head and the consumer verifies prompt tokens as drafts.
+                # Placeholders are what postprocess leaves on every other
+                # running seq, and the target rejects any the drafter's absence
+                # left it disagreeing with.
+                for _ in range(self.mtp_k - len(drafts)):
+                    seq.append_token(self.eos_token_id)
                 seq.spec_token_ids = np.asarray(drafts, dtype=np.int32)
         logger.debug(
             "[PD-TRANSITION] seq %s: num_tokens=%d, "
@@ -2603,7 +2637,7 @@ class Scheduler:
             # request from at least one intervening model-runner batch, which
             # already discards its deferred partial output. The first output
             # after the request resumes is fresh and must be kept.
-            if seq.id in prev_partial_ids:
+            if is_deferred_out and seq.id in prev_partial_ids:
                 continue
             # Register prefix-cache hashes for blocks the prefill step just
             # finalized. Deferred from BlockManager.allocate() so a hash is
@@ -2707,8 +2741,13 @@ class Scheduler:
                 new_tokens = [injected_t0] + list(new_tokens)
                 seq._injected_t0 = None
 
+            # `draft_token_ids` is None whenever the runner skipped propose(),
+            # which a P/D producer does on every step: it disables deferred
+            # output so the consumer consumes T0 exactly once (KDA state would
+            # otherwise advance twice). The seq is handed off rather than
+            # decoded here, so it keeps its empty spec_token_ids and the
+            # consumer proposes for itself.
             if self.mtp_k > 0 and draft_token_ids is not None:
-                # draft_token_ids is None when the drafter did not run.
                 seq.spec_token_ids = draft_token_ids[idx]
 
             if seq.num_completion_tokens <= 3 and seq.kv_transfer_params:
@@ -3245,14 +3284,16 @@ class Scheduler:
                 # Already reclaimed by `_reconcile_stalled_deferred_saves` after
                 # a stall; a late completion report has nothing left to free.
                 continue
-            self.deferred_free_blocks.pop(seq.id, None)
-            self.block_manager.deallocate(seq)
+            # A final offload save can still be awaiting admission, and hence
+            # invisible to the worker's send/save pairing. Keep its source
+            # until the scheduler has also retired that save generation.
+            seq._kv_send_completed = True
+            self._maybe_release_deferred(seq)
 
-        if not is_producer:
-            for req_id in finished_saving:
-                seq = self._deferred_sequence(req_id)
-                if seq is not None:
-                    self._maybe_release_deferred(seq)
+        for req_id in finished_saving:
+            seq = self._deferred_sequence(req_id)
+            if seq is not None:
+                self._maybe_release_deferred(seq)
         # Early-release requests are never in `deferred_free_blocks` (they were
         # fully torn down, minus their lease, at finish time), so the loops
         # above have nothing to find for them. Drain independently of producer
@@ -3700,6 +3741,13 @@ class DecodeScheduler(Scheduler):
         if seq is not None:
             seq.num_cached_tokens = num_tokens_computed
             seq.append_token(sampled_token_id)
+            seq.is_first_decode = True
+            # Decode schedules a full target verification window.  The remote
+            # prefill producer normally sends only T0, so pad the missing draft
+            # positions exactly as the monolithic P/D handoff does.  Without
+            # this, the trailing mtp_k+1 slice reaches back into prompt tokens.
+            for _ in range(self.mtp_k):
+                seq.append_token(self.eos_token_id)
             seq.first_token_time = time.time()
             self.prefill_done.append(seq)
 
@@ -3744,6 +3792,7 @@ class DecodeScheduler(Scheduler):
         scheduled_seqs: dict[int, Sequence] = {}
         num_scheduled_tokens: list[int] = []
         scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
+        first_decode_flags: list[bool] = []
 
         with self._prefill_lock:
             while self.running and len(scheduled_seqs) < self.max_num_seqs:
@@ -3764,6 +3813,10 @@ class DecodeScheduler(Scheduler):
                     num_new_tokens = self.mtp_k + 1
                     self.block_manager.may_append(seq, num_new_tokens)
                     scheduled_seqs[seq.id] = seq
+                    is_first_decode = bool(seq.is_first_decode)
+                    first_decode_flags.append(is_first_decode)
+                    if is_first_decode:
+                        seq.is_first_decode = False
                     seq.type = SequenceType.DECODE
                     num_scheduled_tokens.append(num_new_tokens)
 
@@ -3799,6 +3852,7 @@ class DecodeScheduler(Scheduler):
                 scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
                 cu_stream_fraction=self.cu_fraction,
                 state_maintenance_ops=self.block_manager.take_state_maintenance_ops(),
+                is_first_decode_without_local_prefill=first_decode_flags,
             ),
             scheduled_seqs,
         )

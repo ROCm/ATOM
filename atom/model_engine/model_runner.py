@@ -41,7 +41,7 @@ from atom.distributed.pp_comm import (
     recv_intermediate_tensors,
 )
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
-from atom.kv_transfer.disaggregation import KVConnectorOutput
+from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
@@ -158,6 +158,11 @@ def max_schedulable_decode_bs(
     return min(max_num_seqs, max_num_batched_tokens // full_q_len)
 
 
+# Re-exported under the old private name: this module is where the predicate
+# used to live and where callers (and tests) still import it from.
+_kv_config_has_producer = kv_config_has_producer
+
+
 class TokenLocations(NamedTuple):
     """How each request in this decode batch gets its anchor token.
 
@@ -186,7 +191,17 @@ class tokenIDProcessor:
         num_spec_tokens: int = 0,
     ):
         """Asynchronously copy the sampled_token_ids tensor to the host."""
-        self.is_deferred_out = getattr(runner.config, "pipeline_parallel_size", 1) == 1
+        kv_cfg = getattr(runner.config, "kv_transfer_config", {}) or {}
+        is_remote_prefill_producer = _kv_config_has_producer(kv_cfg)
+        self.is_pipeline_parallel = (
+            getattr(runner.config, "pipeline_parallel_size", 1) > 1
+        )
+        # P/D hands off prompt-end state plus the first sampled token.
+        # Disable deferred output on the producer so the consumer processes that
+        # token only once, avoiding duplicate state updates (e.g. Kimi-K3 KDA).
+        self.is_deferred_out = (
+            not self.is_pipeline_parallel and not is_remote_prefill_producer
+        )
 
         self.runner = runner
         device = runner.device
@@ -463,7 +478,6 @@ class tokenIDProcessor:
         GPU need to be copied into the corresponding slots into input_ids.
         """
         scheduled_tokens = batch.scheduled_tokens  # tokens per req
-        total_tokens = batch.total_tokens_num
         total_tokens_prefill = batch.total_tokens_num_prefill
         total_tokens_decode = batch.total_tokens_num_decode
         total_reqs_prefill = batch.total_seqs_num_prefill
@@ -490,12 +504,29 @@ class tokenIDProcessor:
             token_ids = scheduled_tokens[
                 total_tokens_prefill : total_tokens_prefill + total_tokens_decode
             ]
-            if self.use_spec:
-                # Reached only under pipeline parallel, which no spec path
-                # supports yet; wants the deferred branch's per-request staging.
+            # No spec path supports pipeline parallel yet; it wants the deferred
+            # branch's per-request staging. Gate on PP itself rather than on
+            # `use_spec`: a P/D producer also reaches this branch, and the flag
+            # is still set there (the runner keeps the drafter loaded to write
+            # the draft's context KV at prefill) even though the scheduler
+            # turned speculation off for it.
+            if self.use_spec and self.is_pipeline_parallel:
                 raise NotImplementedError("pipeline parallel + speculative decode")
 
             self.input_ids.np[:total_tokens_decode] = token_ids
+            # RAGGED needs no overwrite: scheduled_tokens is already the flat
+            # [anchor, drafts...]. The uniform case does, and `scheduled_tokens`
+            # is flat here too -- reshape to one row per request the way the
+            # deferred path below does, rather than indexing it as if it were
+            # already rectangular.
+            if (
+                self.use_spec
+                and batch.num_spec_step > 0
+                and getattr(batch, "dynamic_spec_query_tokens_per_req", None) is None
+            ):
+                self.input_ids.np[:total_tokens_decode].reshape(-1, max_seqlen_q)[
+                    :, 1:
+                ] = batch.scheduled_spec_decode_tokens
             return self.input_ids.copy_to_gpu(total_tokens_decode)
 
         # PD consumer first decode: no prior prefill step initialized
@@ -594,7 +625,11 @@ class tokenIDProcessor:
         if fill_to > total_tokens_decode:
             self.input_ids.gpu[total_tokens_decode:fill_to].zero_()
 
-        input_ids = self.input_ids.gpu[:total_tokens]
+        # Slice by the width this path actually staged. Prefill returned above,
+        # so the decode total is the whole batch; a worker-side speculative q
+        # shrink rewrites it, and reading any other total here would leave the
+        # attention metadata wider than input_ids.
+        input_ids = self.input_ids.gpu[:total_tokens_decode]
         return input_ids
 
     def prepare_draft_ids(
@@ -2473,6 +2508,15 @@ class ModelRunner:
             tbo_on=self.config.enable_tbo,
             local_tbo=self._local_tbo_eligibility(batch),
             max_seqlen_q=(batch.num_spec_step + 1 if shrunk_q is None else shrunk_q),
+            graph_shapes=(
+                None
+                if (
+                    self.enforce_eager
+                    or self._piecewise_cg_active()
+                    or not hasattr(self, "graphs")
+                )
+                else self.graphs.keys()
+            ),
         )
         # Stash the DP-wide prefill OR for the EPLB prefill gate; reused free by
         # on_forward_pass_end when the DP group == the migration (EP) group.

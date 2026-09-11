@@ -237,21 +237,22 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             world_size=world,
             worker_id=rank,
             layout_id=layout_id,
+            max_cache_bytes=int(
+                float(os.environ.get("OFFLOAD_STATE_CPU_SIZE", "32")) * (1 << 30)
+            ),
         )
-        # ONE pool, shared with paged KV. A request writes its KV chunks and its
-        # one state object in the same prefill window, so both enter LMCache's
-        # LRU together and cool at the same rate -- exactly right, since a joint
-        # boundary needs both legs to survive together and a boundary whose KV is
-        # gone is worthless. `LMCACHE_MAX_LOCAL_CPU_SIZE` is the one size to tune.
+        # Share the allocator, but cap state retention separately so old
+        # checkpoints cannot consume nearly the whole paged-KV CPU pool.
         codec.bind_storage_manager(self._engine.storage_manager)
         # No index here: StateOffloadIndex lives in the engine process; both
         # directions report and the engine applies.
         self._state_tier = StateOffloadTier(codec)
         logger.info(
             "kimi_k3 offload: state tier up, entry=%.2f MiB rank=%d, "
-            "sharing the paged-KV CPU pool, layout=%s",
+            "sharing the paged-KV CPU pool, max_state_entries=%d, layout=%s",
             entry_bytes / (1 << 20),
             rank,
+            codec._max_entries,
             layout_id,
         )
 
@@ -613,7 +614,7 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
             getattr(config, "kv_transfer_config", None) or {},
             int(os.environ.get("OFFLOAD_COPY_WORKERS", "1") or 1),
         )
-        self._save_inflight_since: dict[str, float] = {}
+        self._save_inflight_since: dict[object, float] = {}
         self._save_stalled = False
         self._warned_save_stalled = False
         # Channel reports drained by the engine each step. No-tier store
@@ -689,11 +690,13 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         so this needs no hook inside the base class's save loop.
         """
         now = time.monotonic()
-        inflight = set(self._save_inflight)
-        for sid in inflight - set(self._save_inflight_since):
-            self._save_inflight_since[sid] = now
-        for sid in set(self._save_inflight_since) - inflight:
-            del self._save_inflight_since[sid]
+        # A long prefill can emit many consecutive saves for the same request.
+        # Age the exact operation, not the request across completed generations.
+        inflight = set(self._save_inflight.values())
+        for operation in inflight - set(self._save_inflight_since):
+            self._save_inflight_since[operation] = now
+        for operation in set(self._save_inflight_since) - inflight:
+            del self._save_inflight_since[operation]
         if not self._save_inflight_since:
             if self._save_stalled:
                 logger.info("kimi_k3 offload: save path draining again")
