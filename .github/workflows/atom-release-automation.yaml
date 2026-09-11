@@ -189,6 +189,9 @@ jobs:
           } >> "${GITHUB_STEP_SUMMARY}"
 
   build:
+    # The called workflow checks the wheel set is complete before it creates
+    # the release, so there is nothing to verify afterwards here: a release
+    # carrying only some of its flavors can no longer come into being.
     name: Build and publish the wheels
     needs: prepare
     if: ${{ needs.prepare.outputs.should_run == 'true' }}
@@ -197,31 +200,3 @@ jobs:
     with:
       commit: ${{ needs.prepare.outputs.release_tag }}
       flavors: both
-
-  verify:
-    name: Verify the release carries every flavor
-    needs: [prepare, build]
-    if: ${{ needs.prepare.outputs.should_run == 'true' }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check the release assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
-        run: |
-          set -euo pipefail
-          # One tag carries one wheel per ROCm line. A release holding only
-          # half the set is the failure this check exists to catch: it looks
-          # complete from the outside, and whoever pulls the missing flavor
-          # silently gets the other one's version instead.
-          assets="$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name')"
-          echo "${assets}"
-          missing=""
-          for flavor in rocm7 rocm10; do
-            echo "${assets}" | grep -q "+${flavor}" || missing="${missing} ${flavor}"
-          done
-          if [ -n "${missing}" ]; then
-            echo "Release ${RELEASE_TAG} is missing a wheel for:${missing}"
-            exit 1
-          fi
-          echo "Release ${RELEASE_TAG} carries every flavor."

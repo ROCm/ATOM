@@ -127,6 +127,7 @@ jobs:
     # both.
     outputs:
       release_tag: ${{ steps.version.outputs.release_tag }}
+      build_sha: ${{ steps.builtref.outputs.sha }}
 
     strategy:
       max-parallel: 1
@@ -184,6 +185,10 @@ jobs:
             --name "atom_build_${{ matrix.flavor }}" \
             "${BUILD_IMAGE}" \
             sleep infinity
+
+      - name: Record the commit actually built
+        id: builtref
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Generate version
         id: version
@@ -345,7 +350,6 @@ jobs:
   publish:
     name: Publish the release once every flavor is in
     needs: build-and-release
-    if: ${{ always() && needs.build-and-release.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -353,13 +357,17 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       RELEASE_TAG: ${{ needs.build-and-release.outputs.release_tag }}
+      BUILD_SHA: ${{ needs.build-and-release.outputs.build_sha }}
       FLAVORS: ${{ inputs.flavors || 'both' }}
       DRAFT: ${{ inputs.draft || false }}
 
     steps:
-      - name: Checkout ATOM repo
+      - name: Checkout the commit that was built
         uses: actions/checkout@v4
         with:
+          # Not the default ref: a dispatch can name any commit, and the tag
+          # has to land on the one the wheels actually came from.
+          ref: ${{ needs.build-and-release.outputs.build_sha }}
           fetch-depth: 0
 
       - name: Download every flavor's wheel
@@ -407,7 +415,7 @@ jobs:
           else
             TAG="${RELEASE_TAG}"
             if ! git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
-              git tag "${TAG}" "$(git rev-parse HEAD)"
+              git tag "${TAG}" "${BUILD_SHA}"
               git push origin "refs/tags/${TAG}"
             fi
           fi
@@ -417,7 +425,7 @@ jobs:
             --title "ATOM ${TAG}" \
             --notes "ATOM ${TAG} wheel build.
 
-          - Commit: $(git rev-parse HEAD)
+          - Commit: ${BUILD_SHA}
           - Wheels:
           $(cat release-wheels/provenance-*.txt 2>/dev/null | sed 's/^/        /')" \
             ${DRAFT_FLAG} \
