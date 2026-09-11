@@ -962,6 +962,10 @@ class Scheduler:
         if (
             seq.id not in self.deferred_free_blocks
             or getattr(seq, "_awaiting_aborted_load_cleanup", False)
+            or (
+                self._connector_flag("is_producer")
+                and not getattr(seq, "_kv_send_completed", False)
+            )
             or self._connector_should_defer_free(seq)
         ):
             return
@@ -3333,14 +3337,16 @@ class Scheduler:
                 # Already reclaimed by `_reconcile_stalled_deferred_saves` after
                 # a stall; a late completion report has nothing left to free.
                 continue
-            self.deferred_free_blocks.pop(seq.id, None)
-            self.block_manager.deallocate(seq)
+            # A final offload save can still be awaiting admission, and hence
+            # invisible to the worker's send/save pairing. Keep its source
+            # until the scheduler has also retired that save generation.
+            seq._kv_send_completed = True
+            self._maybe_release_deferred(seq)
 
-        if not is_producer:
-            for req_id in finished_saving:
-                seq = self._deferred_sequence(req_id)
-                if seq is not None:
-                    self._maybe_release_deferred(seq)
+        for req_id in finished_saving:
+            seq = self._deferred_sequence(req_id)
+            if seq is not None:
+                self._maybe_release_deferred(seq)
         # Early-release requests are never in `deferred_free_blocks` (they were
         # fully torn down, minus their lease, at finish time), so the loops
         # above have nothing to find for them. Drain independently of producer

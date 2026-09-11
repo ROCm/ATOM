@@ -12,6 +12,8 @@ also sidesteps LMCache's chunk-alignment loss.
 from __future__ import annotations
 
 import logging
+import threading
+from collections import OrderedDict
 from typing import Any
 
 import torch
@@ -41,6 +43,7 @@ class StateByteCodec:
         world_size: int,
         worker_id: int,
         layout_id: str,
+        max_cache_bytes: int | None = None,
     ) -> None:
         self._backend = backend
         self._staged = staged
@@ -55,6 +58,16 @@ class StateByteCodec:
         self._layout_id = layout_id
         self._misfit_reads = 0
         self._storage = None
+        self._max_entries = (
+            None
+            if max_cache_bytes is None
+            else int(max_cache_bytes) // self.entry_bytes
+        )
+        if self._max_entries is not None and self._max_entries < 1:
+            raise ValueError("state CPU budget must fit at least one checkpoint")
+        self._cache_keys: OrderedDict[Any, None] = OrderedDict()
+        self._cache_lock = threading.Lock()
+        self._store_lock = threading.Lock()
         # Never hard-code a size: V4 keeps six compressor fields across
         # n_csa/n_hca layers plus an optional window; GDN keeps
         # 2 * num_gdn_attn_state * (1 + num_spec) slots. Measured at 53.6 MiB
@@ -103,6 +116,29 @@ class StateByteCodec:
         )
 
     def put(self, h: int, unit_ids, on_source_released=None) -> bool:
+        # Bound state independently of KV while retaining the shared allocator.
+        # Only stores serialize; a load holds its MemoryObj reference while
+        # unpacking, so removing its cache entry cannot free live bytes.
+        if self._storage is None:
+            return False
+        if self._max_entries is None:
+            return self._put(h, unit_ids, on_source_released)
+        key = self.key(h)
+        with self._store_lock:
+            with self._cache_lock:
+                if key not in self._cache_keys:
+                    while len(self._cache_keys) >= self._max_entries:
+                        old = next(iter(self._cache_keys))
+                        self._storage.remove(old)
+                        del self._cache_keys[old]
+            ok = self._put(h, unit_ids, on_source_released)
+            if ok:
+                with self._cache_lock:
+                    self._cache_keys.pop(key, None)
+                    self._cache_keys[key] = None
+            return ok
+
+    def _put(self, h: int, unit_ids, on_source_released=None) -> bool:
         """Store one checkpoint image. False when nothing was stored.
 
         Reads PAGE units where `get` writes an Active Slot; safe because the
@@ -194,6 +230,10 @@ class StateByteCodec:
             self._staged.unpack(obj, self._backend.state_entry_views(slot))
         finally:
             obj.ref_count_down()
+        with self._cache_lock:
+            key = self.key(h)
+            if key in self._cache_keys:
+                self._cache_keys.move_to_end(key)
         return True
 
     @staticmethod

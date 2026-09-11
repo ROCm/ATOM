@@ -1262,9 +1262,12 @@ class TestJointChunkProbeIsGated:
     ):
         """The warning is worth printing exactly here: the tier is on, so a
         missing chunk size really does disable the joint KV load."""
-        import sys
+        from atom.kv_transfer.offload import config as offcfg
 
-        monkeypatch.setitem(sys.modules, "lmcache.v1.config", None)
+        def unavailable(_config):
+            raise ImportError("LMCache unavailable for this probe")
+
+        monkeypatch.setattr(offcfg, "build_lmcache_config", unavailable)
         with caplog.at_level(logging.WARNING, logger="atom"):
             bm = self._bm(
                 {
@@ -1273,6 +1276,6 @@ class TestJointChunkProbeIsGated:
                     "offload_layout": "kimi_k3",
                 }
             )
-        # Exercise the missing dependency even in images with LMCache installed.
+        # Exercise a failed probe even when the test image has LMCache installed.
         assert bm._joint_chunk_tokens == 0
         assert "LMCache chunk size" in caplog.text
