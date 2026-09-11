@@ -241,7 +241,6 @@ def _worker(connectors, pp_is_head=True):
     obj._pp_is_head = pp_is_head
     obj._pending_save_ops = {}
     obj._sent = {}
-    obj._saved = {}
     obj._state_tier = None
     return obj
 
@@ -784,24 +783,43 @@ def test_send_is_withheld_until_save_completes():
     assert w._pending_save_ops == {}  # cleared after release
 
 
-def test_save_then_send_also_pairs():
+def test_save_is_reported_before_send():
     moriio = FakeWorkerSub(is_producer=True)
     off = FakeWorkerSub()
     w = _worker([moriio, off])
     w.start_load_kv(MultiConnectorMetadata([ConnectorMetadata(), _save_meta(9)]))
 
-    # Step 1: save completes first, send not yet -> nothing released.
+    # Save progress must reach the scheduler even before send completion.
     off._finished = KVConnectorOutput(finished_saving={9})
     out1 = w.get_finished()
     assert out1.finished_sending == set()
-    assert out1.finished_saving == set()
+    assert out1.finished_saving == {9}
 
     # Step 2: send completes -> both released.
     off._finished = KVConnectorOutput()
     moriio._finished = ({9}, set())
     out2 = w.get_finished()
     assert out2.finished_sending == {9}
-    assert out2.finished_saving == {9}
+    assert out2.finished_saving == set()
+
+
+def test_save_registered_after_send_is_still_reported():
+    producer = FakeWorkerSub(is_producer=True)
+    offload = FakeWorkerSub()
+    w = _worker([producer, offload])
+    producer._finished = KVConnectorOutput(finished_sending={9})
+    assert w.get_finished().finished_sending == {9}
+    producer._finished = KVConnectorOutput()
+    for generation in (1, 2):
+        op = SaveOperationId(9, generation)
+        w.start_load_kv(
+            MultiConnectorMetadata([ConnectorMetadata(), _save_operation_meta(op)])
+        )
+        offload._finished = KVConnectorOutput(finished_saving={op})
+        out = w.get_finished()
+        assert out.finished_saving == {op}
+        assert out.finished_sending == set()
+        assert w._pending_save_ops == {}
 
 
 def test_pairing_matches_save_operation_id():
@@ -825,7 +843,6 @@ def test_pairing_matches_save_operation_id():
     assert out.finished_saving == {op}
     assert w._pending_save_ops == {}
     assert w._sent == {}
-    assert w._saved == {}
 
 
 def test_pairing_waits_for_all_save_operation_ids():
@@ -845,16 +862,15 @@ def test_pairing_waits_for_all_save_operation_ids():
     off._finished = KVConnectorOutput(finished_saving={op0})
     out1 = w.get_finished()
     assert out1.finished_sending == set()
-    assert out1.finished_saving == set()
+    assert out1.finished_saving == {op0}
 
     moriio._finished = (set(), set())
     off._finished = KVConnectorOutput(finished_saving={op1})
     out2 = w.get_finished()
     assert out2.finished_sending == {9}
-    assert out2.finished_saving == {op0, op1}
+    assert out2.finished_saving == {op1}
     assert w._pending_save_ops == {}
     assert w._sent == {}
-    assert w._saved == {}
 
 
 def test_non_head_pp_stage_does_not_pair():

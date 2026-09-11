@@ -863,7 +863,7 @@ def test_build_lmcache_config_validates_extras_and_keeps_gds_disabled(monkeypatc
     assert cfg.local_disk == "/nvme/lmcache"
     assert cfg.max_local_disk_size == 10
     assert cfg.use_gds is False
-    assert cfg.lookup_server_worker_ids == [0]
+    assert cfg.lookup_server_worker_ids == []
 
 
 def test_lmcache_disk_startup_fails_if_backend_was_not_created():
@@ -4175,6 +4175,36 @@ def test_finished_saving_releases_deferred_free_with_string_req_id():
     assert sched.deferred_free_blocks == {}
 
 
+@pytest.mark.parametrize("send_first", [False, True])
+def test_producer_waits_for_send_and_final_save(send_first):
+    class Connector(_OffloadMixinStub):
+        is_producer = True
+        is_offload = True
+        pending = True  # Also represents a final save not yet dispatched.
+
+        def save_finished(self, req_id):
+            self.pending = False
+
+        def should_defer_free(self, seq):
+            return self.pending
+
+    host = Scheduler.__new__(Scheduler)
+    host.kv_connector = Connector()
+    freed = []
+    host.block_manager = SimpleNamespace(deallocate=lambda seq: freed.append(seq.id))
+    seq = SimpleNamespace(id=9)
+    host.deferred_free_blocks = {9: seq}
+    send = KVConnectorOutput(finished_sending={9})
+    save = KVConnectorOutput(finished_saving={"9"})
+    first, last = (send, save) if send_first else (save, send)
+    host._update_from_kv_xfer_finished(first)
+    assert freed == []
+    assert host.deferred_free_blocks == {9: seq}
+    host._update_from_kv_xfer_finished(last)
+    assert freed == [9]
+    assert host.deferred_free_blocks == {}
+
+
 def test_finished_recv_matches_string_req_id():
     sched = Scheduler.__new__(Scheduler)
     sched.finished_recving_kv_req_ids = ["123"]
@@ -4941,7 +4971,7 @@ def test_a_stalled_save_releases_blocks_it_never_handed_out(monkeypatch):
 
     # Age the outstanding save rather than the process clock: `time.monotonic`
     # is the stdlib's, and patching it reaches every other test in the run.
-    s._save_inflight_since["9"] -= 2 * save_stall_seconds()
+    s._save_inflight_since[s._save_inflight["9"]] -= 2 * save_stall_seconds()
     s._refresh_save_stall()
     assert s._save_stalled is True
     # Never handed out -> the blocks may go free. `should_defer_free` is a pure
@@ -5147,6 +5177,46 @@ def test_the_key_survives_a_process_restart(lmcache_key):
     """`hash()` of a str is salted per process, so using it would orphan every
     entry the previous run wrote -- a cache that silently starts cold."""
     assert _codec("L").key(7) == _codec("L").key(7)
+
+
+def test_completed_save_generation_does_not_age_its_successor():
+    s = _k3_scheduler()
+    op = SaveOperationId(9, 1)
+    s._save_inflight = {"9": op}
+    s._refresh_save_stall()
+    s._save_inflight_since[op] -= 1000
+    # No intervening idle metadata build: the same request has a new save.
+    new_op = SaveOperationId(9, 2)
+    s._save_inflight["9"] = new_op
+    s._refresh_save_stall()
+    assert not s._save_stalled
+    assert set(s._save_inflight_since) == {new_op}
+
+
+def test_state_budget_evicts_cold_state_without_removing_kv(lmcache_key, monkeypatch):
+    storage = _FakeStorage()
+    storage.remove = lambda key: storage.objects.pop(key, None)
+    codec = _codec("L", storage)
+    codec._max_entries = 2
+    codec._backend = SimpleNamespace(state_entry_views=lambda slot: [])
+    codec._staged = SimpleNamespace(unpack=lambda obj, views: None)
+    storage.objects["KV"] = object()
+
+    def put(h, units, callback):
+        storage.objects[codec.key(h)] = SimpleNamespace(
+            get_size=lambda: 1024, ref_count_down=lambda: None
+        )
+        return True
+
+    monkeypatch.setattr(codec, "_put", put)
+    assert codec.put(1, [])
+    assert codec.put(2, [])
+    assert codec.get(1, 0)  # Keep the recently loaded checkpoint.
+    assert codec.put(3, [])
+    assert set(storage.objects) == {"KV", codec.key(1), codec.key(3)}
+    assert len(codec._cache_keys) == 2
+    assert codec.put(3, [])  # Re-store does not evict an unrelated state.
+    assert set(storage.objects) == {"KV", codec.key(1), codec.key(3)}
 
 
 def test_a_state_key_cannot_collide_with_a_kv_chunk_key(lmcache_key):
