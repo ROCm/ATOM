@@ -32,6 +32,8 @@ xP="${xP:-1}"
 yD="${yD:-1}"
 PREFILL_TP_SIZE="${PREFILL_TP_SIZE:-8}"
 DECODE_TP_SIZE="${DECODE_TP_SIZE:-8}"
+PREFILL_DCP_SIZE="${PREFILL_DCP_SIZE:-1}"
+DECODE_DCP_SIZE="${DECODE_DCP_SIZE:-1}"
 PREFILL_ENABLE_DP="${PREFILL_ENABLE_DP:-false}"
 DECODE_ENABLE_DP="${DECODE_ENABLE_DP:-false}"
 
@@ -109,6 +111,8 @@ HF_OVERRIDES="${HF_OVERRIDES:-}"
 SPEC_METHOD="${SPEC_METHOD:-}"
 DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-}"
 NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-}"
+SPEC_DECODE_ACCEPTANCE_LENGTH="${SPEC_DECODE_ACCEPTANCE_LENGTH:-}"
+STATE_CHECKPOINT_INTERVAL_TOKENS="${STATE_CHECKPOINT_INTERVAL_TOKENS:-}"
 EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:-}"
 PREFILL_EXTRA_SERVER_ARGS="${PREFILL_EXTRA_SERVER_ARGS:-}"
 DECODE_EXTRA_SERVER_ARGS="${DECODE_EXTRA_SERVER_ARGS:-}"
@@ -180,6 +184,7 @@ AIPERF_VENV="${AIPERF_VENV:-/tmp/atomesh-aiperf-venv}"
 AIPERF_COMMIT="${AIPERF_COMMIT:-b7b16cf851885567988a643282266bce74e34437}"
 AIPERF_SCENARIO="${AIPERF_SCENARIO:-inferencex-agentx-mvp}"
 AIPERF_PUBLIC_DATASET="${AIPERF_PUBLIC_DATASET:-semianalysis_cc_traces_weka_062126_256k}"
+AIPERF_APPLY_CHAT_TEMPLATE="${AIPERF_APPLY_CHAT_TEMPLATE:-false}"
 AIPERF_MAX_CONTEXT_LENGTH="${AIPERF_MAX_CONTEXT_LENGTH:-262144}"
 AIPERF_NUM_DATASET_ENTRIES="${AIPERF_NUM_DATASET_ENTRIES:-393}"
 AIPERF_BENCHMARK_DURATION="${AIPERF_BENCHMARK_DURATION:-1800}"
@@ -320,33 +325,81 @@ else
   done
 fi
 
-prefill_parallel=(-tp "${PREFILL_TP_SIZE}")
+prefill_parallel=(
+  -tp "${PREFILL_TP_SIZE}"
+  --decode-context-parallel-size "${PREFILL_DCP_SIZE}"
+)
 if [[ "${PREFILL_ENABLE_DP}" == "true" ]]; then
   prefill_parallel+=("--enable-dp-attention")
 fi
 
-decode_parallel=(-tp "${DECODE_TP_SIZE}")
+decode_parallel=(
+  -tp "${DECODE_TP_SIZE}"
+  --decode-context-parallel-size "${DECODE_DCP_SIZE}"
+)
 if [[ "${DECODE_ENABLE_DP}" == "true" ]]; then
   decode_parallel+=("--enable-dp-attention")
 fi
 
+# AgentX captures every query-token count the engine can produce, i.e. the dense
+# range [2, graph_max] with graph_max = seqs * (1 + spec_tokens), where seqs
+# defaults to 2 * CONC. Concurrencies whose in-flight window is wider than
+# 2 * CONC pin seqs explicitly via cudagraph_max_num_seqs.
+auto_cudagraph_capture_sizes() {
+  local role="$1"
+  local seqs="$2"
+  local conc spec graph_max
+  spec="${NUM_SPEC_TOKENS:-0}"
+  [[ "${spec}" =~ ^[0-9]+$ ]] || spec=0
+  if [[ ! "${seqs}" =~ ^[0-9]+$ ]]; then
+    conc="$(echo "${BENCH_MAX_CONCURRENCY}" | tr 'x,' '\n' | sort -n | tail -1)"
+    [[ "${conc}" =~ ^[0-9]+$ ]] || conc=1
+    seqs=$(( 2 * conc ))
+  fi
+  graph_max=$(( seqs * (1 + spec) ))
+  if (( graph_max < 2 )); then
+    graph_max=2
+  fi
+  echo "[${role}] cudagraph auto range 2..${graph_max} (seqs=${seqs} spec=${spec})" >&2
+  echo "[$(seq -s, 2 "${graph_max}")]"
+}
+
 build_cudagraph_args() {
-  local value="$1"
+  local role="$1"
   local -n out="$2"
-  case "${value:-}" in
+  local prefix="${role^^}"
+  local sizes_var="${prefix}_CUDAGRAPH"
+  local mode_var="${prefix}_CUDAGRAPH_MODE"
+  local level_var="${prefix}_COMPILATION_LEVEL"
+  local seqs_var="${prefix}_CUDAGRAPH_MAX_NUM_SEQS"
+  local mode="${!mode_var:-}"
+  local level="${!level_var:-}"
+  case "${!sizes_var:-}" in
     ""|none|None|NONE|false|False|FALSE|off|Off|OFF|disabled|Disabled|DISABLED)
       out=()
       ;;
+    auto|Auto|AUTO)
+      out=(
+        --cudagraph-capture-sizes
+        "$(auto_cudagraph_capture_sizes "${role}" "${!seqs_var:-}")"
+      )
+      ;;
     *)
-      out=(--cudagraph-capture-sizes "${value}")
+      out=(--cudagraph-capture-sizes "${!sizes_var}")
       ;;
   esac
+  if [[ -n "${mode}" ]]; then
+    out+=(--cudagraph-mode "${mode}")
+  fi
+  if [[ -n "${level}" ]]; then
+    out+=(--level "${level}")
+  fi
 }
 
 prefill_cudagraph_args=()
 decode_cudagraph_args=()
-build_cudagraph_args "${PREFILL_CUDAGRAPH:-}" prefill_cudagraph_args
-build_cudagraph_args "${DECODE_CUDAGRAPH:-}" decode_cudagraph_args
+build_cudagraph_args prefill prefill_cudagraph_args
+build_cudagraph_args decode decode_cudagraph_args
 
 build_server_cache_env() {
   local role="$1"
@@ -404,7 +457,21 @@ fi
 if [[ -n "${NUM_SPEC_TOKENS}" ]]; then
   server_common+=(--num-speculative-tokens "${NUM_SPEC_TOKENS}")
 fi
-
+spec_decode_acceptance_for_server="${SPEC_DECODE_ACCEPTANCE_LENGTH}"
+if [[ "${ATOMESH_EXECUTION_PHASE}" == "eval" && "${EVAL_TASK}" == "gsm8k" ]]; then
+  spec_decode_acceptance_for_server=""
+  echo "[runtime] omitting spec-decode-acceptance-length for gsm8k eval phase"
+fi
+if [[ -n "${spec_decode_acceptance_for_server}" ]]; then
+  server_common+=(
+    --spec-decode-acceptance-length "${spec_decode_acceptance_for_server}"
+  )
+fi
+if [[ -n "${STATE_CHECKPOINT_INTERVAL_TOKENS}" ]]; then
+  server_common+=(
+    --state-checkpoint-interval-tokens "${STATE_CHECKPOINT_INTERVAL_TOKENS}"
+  )
+fi
 wait_http() {
   local url="$1"
   local name="$2"
@@ -559,7 +626,7 @@ start_prefill() {
   else
     prefill_kv_transfer_config="{\"kv_role\":\"kv_producer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${handshake_port}}"
   fi
-  echo "[prefill] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${PREFILL_CUDAGRAPH:-none}"
+  echo "[prefill] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${prefill_cudagraph_args[*]:-none}"
   local -a prefill_cmd=(
     python3 -m atom.entrypoints.openai_server
     "${server_common[@]}"
@@ -611,7 +678,7 @@ start_decode() {
   else
     decode_kv_transfer_config="{\"kv_role\":\"kv_consumer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${handshake_port}}"
   fi
-  echo "[decode] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${DECODE_CUDAGRAPH:-none}"
+  echo "[decode] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${decode_cudagraph_args[*]:-none}"
   local -a decode_cmd=(
     python3 -m atom.entrypoints.openai_server
     "${server_common[@]}"
@@ -629,6 +696,7 @@ start_decode() {
 
 start_router() {
   echo "[router] prefill=${prefill_args[*]} decode=${decode_args[*]}"
+  local mesh_binary="${ATOMESH_MESH_BINARY:-/app/ATOM/atom/mesh/target/release/atomesh}"
   case "${ATOM_PD_RANK_MAPPING_POLICY}" in
     none|idx2idx) ;;
     *)
@@ -654,7 +722,7 @@ start_router() {
     router_dp_aware_args=(--dp-aware)
   fi
   local -a router_cmd=(
-    /app/ATOM/atom/mesh/target/release/atomesh launch
+    "${mesh_binary}" launch
     --host 0.0.0.0
     --port "${ROUTER_PORT}"
     --pd-disaggregation
@@ -712,6 +780,7 @@ run_benchmark() {
         --ignore-eos \
         --save-result \
         --percentile-metrics='ttft,tpot,itl,e2el' \
+        --metric-percentiles='90,99' \
         --result-dir="${RUN_DIR}/benchmark_results" \
         --result-filename="${result_file}"
     done
@@ -811,12 +880,15 @@ payload = {
     "request_throughput": avg("request_throughput"),
     "mean_ttft_ms": avg("time_to_first_token"),
     "median_ttft_ms": pct("time_to_first_token", "p50"),
+    "p90_ttft_ms": pct("time_to_first_token", "p90"),
     "p99_ttft_ms": pct("time_to_first_token", "p99"),
     "mean_itl_ms": avg("inter_token_latency"),
     "median_itl_ms": pct("inter_token_latency", "p50"),
+    "p90_itl_ms": pct("inter_token_latency", "p90"),
     "p99_itl_ms": pct("inter_token_latency", "p99"),
     "mean_e2el_ms": avg("request_latency"),
     "median_e2el_ms": pct("request_latency", "p50"),
+    "p90_e2el_ms": pct("request_latency", "p90"),
     "p99_e2el_ms": pct("request_latency", "p99"),
     "input_throughput": avg("input_token_throughput"),
     "output_throughput": avg("output_token_throughput"),
@@ -852,6 +924,23 @@ print(f"[aiperf] dashboard json: {dst}")
 PY
 }
 
+write_aiperf_chrome_trace() {
+  local out_dir="$1"
+  local generator="${ATOMESH_SCRIPT_DIR}/../generate_aiperf_traces.py"
+  local jsonl="${out_dir}/profile_export.jsonl"
+  if [[ ! -f "${jsonl}" ]]; then
+    echo "[aiperf] skip chrome trace: ${jsonl} was not produced"
+    return 0
+  fi
+  if [[ ! -f "${generator}" ]]; then
+    echo "[aiperf] skip chrome trace: ${generator} not found"
+    return 0
+  fi
+  echo "[aiperf] converting ${jsonl} to Perfetto/Chrome trace"
+  python3 "${generator}" "${out_dir}" \
+    || echo "[aiperf] WARNING: chrome trace conversion failed for ${out_dir}" >&2
+}
+
 run_aiperf_agentic_benchmark() {
   ensure_aiperf
 
@@ -863,12 +952,18 @@ run_aiperf_agentic_benchmark() {
 
   local safe_model="${MODEL_NAME//\//-}"
   local -a server_metrics_args=(--server-metrics)
+  local -a report_args=(
+    --model "${MODEL_NAME} · ${DISPLAY_TOPOLOGY}"
+    --mesh "127.0.0.1:${PROMETHEUS_PORT}"
+  )
   local idx
   for idx in "${!prefill_ips[@]}"; do
     server_metrics_args+=("http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/metrics")
+    report_args+=(--prefill "${prefill_ips[$idx]}:${prefill_ports[$idx]}")
   done
   for idx in "${!decode_ips[@]}"; do
     server_metrics_args+=("http://${decode_ips[$idx]}:${decode_ports[$idx]}/metrics")
+    report_args+=(--decode "${decode_ips[$idx]}:${decode_ports[$idx]}")
   done
 
   local conc
@@ -881,9 +976,14 @@ run_aiperf_agentic_benchmark() {
     local aiperf_json="${out_dir}/profile_export_aiperf.json"
     local dashboard_json="${RUN_DIR}/benchmark_results/${result_file}"
     local -a unsafe_args=()
+    local -a chat_template_args=()
     if (( AIPERF_BENCHMARK_DURATION < 900 )) \
       || [[ "${AIPERF_UNSAFE_OVERRIDE}" == "1" || "${AIPERF_UNSAFE_OVERRIDE}" == "true" ]]; then
       unsafe_args+=(--unsafe-override)
+    fi
+    if [[ "${AIPERF_APPLY_CHAT_TEMPLATE}" == "1" \
+      || "${AIPERF_APPLY_CHAT_TEMPLATE}" == "true" ]]; then
+      chat_template_args+=(--apply-chat-template)
     fi
 
     echo "[aiperf] ${result_file}"
@@ -894,6 +994,8 @@ run_aiperf_agentic_benchmark() {
     AIPERF_DATASET_CONFIGURATION_TIMEOUT="${AIPERF_DATASET_CONFIGURATION_TIMEOUT}" \
     AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT="${AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT}" \
     AIPERF_UI_REALTIME_METRICS_ENABLED=true \
+      python3 "${ATOMESH_SCRIPT_DIR}/observability/collect_metrics.py" \
+      --output "${out_dir}/metrics" "${report_args[@]}" -- \
       "${AIPERF_VENV}/bin/aiperf" profile \
       "${unsafe_args[@]}" \
       --scenario "${AIPERF_SCENARIO}" \
@@ -916,6 +1018,7 @@ run_aiperf_agentic_benchmark() {
       --no-gpu-telemetry \
       --tokenizer "${MODEL_PATH}" \
       --tokenizer-trust-remote-code \
+      "${chat_template_args[@]}" \
       --max-context-length "${AIPERF_MAX_CONTEXT_LENGTH}" \
       --num-dataset-entries "${AIPERF_NUM_DATASET_ENTRIES}" \
       --slice-duration "${AIPERF_SLICE_DURATION}" \
@@ -929,6 +1032,7 @@ run_aiperf_agentic_benchmark() {
       return 1
     fi
     write_aiperf_dashboard_json "${aiperf_json}" "${dashboard_json}" "${conc}"
+    write_aiperf_chrome_trace "${out_dir}"
   done
 }
 
@@ -1128,10 +1232,10 @@ run_benchmark_and_eval() {
     return
   fi
   if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" \
-    && "${EVAL_TASK}" == "swebench_lite" \
+    && ( "${EVAL_TASK}" == "swebench_lite" || "${EVAL_TASK}" == "gsm8k" ) \
     && ( "${RUN_EVAL}" == "true" || "${RUN_EVAL}" == "1" ) ]]; then
-    # Agentic performance cases require a fresh prefix-cache state. Run their
-    # trace benchmark before the independent SWE-bench workload.
+    # Agentic performance cases require a fresh prefix/state-cache state. Run
+    # their trace benchmark before any independent accuracy workload.
     run_benchmark
     run_eval
   else

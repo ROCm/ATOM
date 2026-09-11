@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from contextlib import nullcontext
 
 import torch
 
@@ -35,9 +36,11 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorSchedulerBase,
 )
 from atom.kv_transfer.disaggregation.types import (
+    ConnectorCompletion,
     LoadOperationId,
     SaveCompletionId,
     SaveOperationId,
+    SaveSourceGroupId,
 )
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
@@ -58,6 +61,9 @@ from atom.kv_transfer.offload.metadata import (
 
 logger = logging.getLogger("atom")
 
+DENSE_PAGE_SOURCE_SAFE_CHANNEL = "dense.page.source_safe"
+DENSE_PAGE_STORE_CHANNEL = "dense.page.store"
+
 
 # =====================================================================
 # Worker side
@@ -75,6 +81,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
     # (GDN: Qwen3-Next, Qwen3.5) and fail fast. A hybrid connector
     # that owns a state tier (kimi_k3) overrides this to True.
     _permit_per_request_state = False
+    _supports_early_block_release = True
 
     def __init__(self, config) -> None:
         self._config = config
@@ -87,6 +94,14 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         self._engine = None
         self._codec: DenseKVByteCodec | None = None
         self._lookup_server = None
+        self._early_release = bool(self._supports_early_block_release)
+
+    def close(self) -> None:
+        super().close()
+        gpu_connector = getattr(getattr(self, "_engine", None), "gpu_connector", None)
+        close = getattr(gpu_connector, "close", None)
+        if callable(close):
+            close()
 
     # -- lifecycle --------------------------------------------------------
     def register_kv_caches(
@@ -117,6 +132,11 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 self.block_size,
                 chunk_size=int(cfg.chunk_size),
                 virtual_block_size=self.virtual_block_size,
+                source_safe_callback=(
+                    self._source_group_safe
+                    if getattr(self, "_early_release", False)
+                    else None
+                ),
             ),
             world=world,
             rank=rank,
@@ -170,6 +190,42 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 self._save_executor.submit(self._guard, "save", self._do_save_req, req)
 
     # -- copy daemon thread ----------------------------------------------
+    def _source_group_safe(self, identity: SaveSourceGroupId) -> None:
+        """Publish one locally source-safe PAGE staging group for TP quorum."""
+
+        with self._lock:
+            self._connector_completions.add(
+                ConnectorCompletion(
+                    DENSE_PAGE_SOURCE_SAFE_CHANNEL,
+                    identity,
+                    True,
+                )
+            )
+
+    def _record_store_terminal(self, req: LMCacheReqMeta, succeeded: bool) -> None:
+        operation = req.save_operation
+        if getattr(self, "_early_release", False) and isinstance(
+            operation, SaveOperationId
+        ):
+            with self._lock:
+                # Keep the legacy terminal channel as well: MultiConnector's
+                # producer send/save pairing consumes this field before
+                # connector-owned completions reach the scheduler.
+                self._done_save.add(operation)
+                self._connector_completions.add(
+                    ConnectorCompletion(
+                        DENSE_PAGE_STORE_CHANNEL,
+                        operation,
+                        succeeded,
+                    )
+                )
+            return
+        with self._lock:
+            self._done_save.add(self._save_completion_id(req))
+
+    def _record_save_failure(self, req) -> None:
+        self._record_store_terminal(req, False)
+
     def _do_load_req(self, req: LMCacheReqMeta) -> None:
         ls = req.load_spec
         assert ls is not None
@@ -258,8 +314,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             toks = toks[: (len(toks) // self.chunk_size) * self.chunk_size]
         skip = (ss.skip_leading_tokens // self.chunk_size) * self.chunk_size
         if skip >= len(toks):
-            with self._lock:
-                self._done_save.add(self._save_completion_id(req))
+            self._record_store_terminal(req, True)
             return
 
         t_total0 = time.perf_counter()
@@ -268,16 +323,22 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
 
         t_store0 = time.perf_counter()
         self._reset_gpu_connector_transfer_stats()
-        self._engine.store(
-            torch.tensor(toks),
-            mask=mask,
-            block_ids=req.block_ids,
-            req_id=str(req.req_id),
+        gpu_connector = self._engine.gpu_connector
+        track_source = getattr(gpu_connector, "track_save_source", None)
+        source_context = (
+            track_source(req.save_operation)
+            if getattr(self, "_early_release", False) and callable(track_source)
+            else nullcontext()
         )
+        with source_context:
+            self._engine.store(
+                torch.tensor(toks),
+                mask=mask,
+                block_ids=req.block_ids,
+                req_id=str(req.req_id),
+            )
         store_ms = (time.perf_counter() - t_store0) * 1000
         transfer_stats = self._last_gpu_connector_transfer_stats()
-        with self._lock:
-            self._done_save.add(self._save_completion_id(req))
         total_ms = (time.perf_counter() - t_total0) * 1000
         if self._profile_enabled():
             logger.info(
@@ -308,6 +369,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 store_ms,
                 total_ms,
             )
+        self._record_store_terminal(req, True)
 
     # get_finished / get_finished_recv_blocks inherited from OffloadWorkerMixin
     # (finished_recving wakes loaded reqs, failed_recving -> recompute,
@@ -324,6 +386,7 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
     # Opt the scheduler into offload-wake (suffix prefill) instead of the P/D
     # decode-jump in Scheduler.schedule(); see Scheduler._is_offload_connector.
     is_offload = True
+    _supports_early_block_release = True
 
     def __init__(self, config) -> None:
         self._init_offload_statistics()
@@ -336,6 +399,9 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             "Dense block size",
             config.kv_cache_block_size,
             minimum=1,
+        )
+        self.virtual_block_size = self.block_size * int(
+            getattr(config, "decode_context_parallel_size", 1) or 1
         )
         self.chunk_size: int | None = None
         self._lookup_client = None
@@ -367,11 +433,26 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         # notification for an older request lifecycle from releasing the
         # current request's deferred blocks.
         self._save_inflight: dict[str, SaveCompletionId] = {}
+        # Early block-release bookkeeping. Operation maps retain the exact
+        # token-index -> block-id relationship frozen at save emission; the
+        # per-request lease set exists only after request teardown transfers a
+        # refcount share from the request to the save. Source-safe and
+        # store-terminal are separate connector completions.
+        self._early_release = bool(self._supports_early_block_release)
+        self._save_operation_blocks: dict[SaveOperationId, dict[int, int]] = {}
+        self._save_operation_safe: dict[SaveOperationId, set[int]] = {}
+        self._save_operation_owner: dict[SaveOperationId, object] = {}
+        self._save_lease_blocks: dict[int, set[int]] = {}
+        self._save_lease_at: dict[int, float] = {}
+        self._save_lease_owner: dict[int, object] = {}
+        self._pending_source_safe_releases: list[frozenset] = []
+        self._source_safe_waiting_for_store: dict[SaveOperationId, set[int]] = {}
         self._save_nonce = 0
         self._load_nonce = 0
         self._load_lifecycles: dict[str, object] = {}
         self._active_load_operations: dict[str, tuple[object, LoadOperationId]] = {}
         self._lookup_in_step: list[str] = []
+        self._lookup_results: dict[str, tuple[object, int]] = {}
         self._handoff_loads: set[str] = set()
         # Unaligned handoff is always on: when the HBM prefix-cache hit is not
         # chunk-aligned, recompute the misaligned head up to the next chunk
@@ -428,8 +509,24 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         self._begin_load_lifecycle(seq)
         num_prompt = seq.num_prompt_tokens
         token_ids = list(seq.token_ids[:num_prompt])
+        sid = str(seq.id)
+        pending = self._lookup_results.get(sid)
+        if pending is not None and pending[0] is not seq:
+            # An older lifecycle still owns this worker-side pin. Its cleanup
+            # must be dispatched before the ID can acquire a new lease.
+            return 0, False
         try:
-            hit = self._lookup_client.lookup(token_ids, lookup_id=str(seq.id))
+            if pending is None:
+                if sid not in self._lookup_in_step:
+                    self._lookup_in_step.append(sid)
+                self._lookup_results[sid] = (seq, 0)
+                hit = self._lookup_client.lookup(token_ids, lookup_id=sid)
+                if hit is None:
+                    self._lookup_results.pop(sid, None)
+                else:
+                    self._lookup_results[sid] = (seq, int(hit))
+            else:
+                hit = pending[1]
         except Exception:
             logger.exception("LMCache offload lookup failed for seq %s", seq.id)
             return 0, False
@@ -463,17 +560,9 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         self._hit_save_floors[sid] = self._chunk_floor(hit)
         need = hit - int(seq.num_cached_tokens)
         if need <= 0:
-            if self._lookup_client is not None:
-                try:
-                    self._lookup_client.clear_lookup_status(sid)
-                except Exception:
-                    logger.debug(
-                        "LMCache offload: lookup status cleanup failed for req=%s",
-                        sid,
-                        exc_info=True,
-                    )
+            self._clear_pending_load(sid)
+            self._hit_save_floors[sid] = self._chunk_floor(hit)
             return 0, False
-        self._lookup_in_step.append(sid)
         self._load_specs[sid] = LoadSpec(
             hbm_cached_tokens=int(seq.num_cached_tokens),
             lmcache_cached_tokens=hit,
@@ -519,9 +608,8 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         self._handoff_loads.discard(sid)
         self._load_save_floors.pop(sid, None)
         self._hit_save_floors.pop(sid, None)
-        self._lookup_in_step = [
-            req_id for req_id in self._lookup_in_step if req_id != sid
-        ]
+        # clear_lookup_status only clears the client's memo; it does not
+        # release worker pins. Keep the ID for the next metadata dispatch.
         if self._lookup_client is not None:
             try:
                 self._lookup_client.clear_lookup_status(sid)
@@ -635,7 +723,11 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                     load_operation=load_operation,
                 )
             )
-        meta.lookup_requests_in_step = list(self._lookup_in_step)
+        meta.lookup_requests_in_step = [
+            sid
+            for sid in self._lookup_in_step
+            if sid in loading_sids or sid not in self._load_specs
+        ]
         # Saves: store fully computed prompt chunks. Under scheduler-side
         # chunked prefill, seq.num_cached_tokens advances after each prefill
         # chunk's forward has completed; use it as the D2H-safe frontier.
@@ -659,7 +751,13 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             if sid in self._save_inflight:
                 continue  # keep at most one save per request in flight
             computed = min(
-                int(getattr(seq, "num_cached_tokens", 0)),
+                int(
+                    getattr(
+                        seq,
+                        "_offload_finished_cached_tokens",
+                        getattr(seq, "num_cached_tokens", 0),
+                    )
+                ),
                 int(seq.num_prompt_tokens),
             )
             is_last_prefill = computed >= int(seq.num_prompt_tokens)
@@ -677,11 +775,14 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             save_operation = SaveOperationId(seq.id, self._save_nonce)
             self._save_nonce += 1
             self._track_save_statistics(save_operation, aligned - saved)
+            block_ids = list(
+                getattr(seq, "_offload_finished_block_ids", seq.block_table)
+            )
             meta.add_request(
                 LMCacheReqMeta(
                     req_id=seq.id,
                     token_ids=list(seq.token_ids[:aligned]),
-                    block_ids=list(seq.block_table),
+                    block_ids=block_ids,
                     save_spec=SaveSpec(skip_leading_tokens=saved, can_save=True),
                     is_last_prefill=is_last_prefill,
                     save_operation=save_operation,
@@ -690,7 +791,22 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             entry[1] = aligned
             self._save_inflight[sid] = save_operation
             self._save_rr_last = sid
+            if getattr(self, "_early_release", False):
+                # Freeze the exact token-index -> block-id mapping before a
+                # finished request clears its block table. The lease itself is
+                # activated only by `activate_block_leases` at teardown.
+                source_block_size = getattr(self, "virtual_block_size", self.block_size)
+                start_block = saved // source_block_size
+                end_block = -(-aligned // source_block_size)  # ceil div
+                self._save_operation_blocks[save_operation] = {
+                    index: block_ids[index]
+                    for index in range(start_block, min(end_block, len(block_ids)))
+                }
+                self._save_operation_safe[save_operation] = set()
+                self._save_operation_owner[save_operation] = seq
         dispatched = set(meta.lookup_requests_in_step)
+        for sid in dispatched:
+            self._lookup_results.pop(sid, None)
         self._lookup_in_step = [
             sid for sid in self._lookup_in_step if sid not in dispatched
         ]
@@ -703,7 +819,134 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         if not self._do_save:
             return False
         sid = str(seq.id)
-        return sid in self._save_inflight or self._has_pending_save(seq)
+        operation_blocks = getattr(self, "_save_operation_blocks", {})
+        operation_safe = getattr(self, "_save_operation_safe", {})
+        operation_owner = getattr(self, "_save_operation_owner", {})
+        unsafe_retired_operation = any(
+            owner is seq
+            and not set(operation_blocks.get(operation, {}).values()).issubset(
+                operation_safe.get(operation, set())
+            )
+            for operation, owner in operation_owner.items()
+        )
+        return (
+            sid in self._save_inflight
+            or self._has_pending_save(seq)
+            or unsafe_retired_operation
+        )
+
+    def protected_block_ids(self, seq) -> frozenset | None:
+        """Exact pending/in-flight source blocks not yet known source-safe.
+
+        None means "this connector cannot narrow the protection" (the layout
+        does not support exact leases, or a load is in flight, since a load also
+        touches HBM blocks this connector does not track per-range) -- the
+        scheduler falls back to deferring the whole request. This includes a
+        final save that has not been emitted yet: request teardown freezes its
+        full block table and computed frontier so the next metadata build can
+        still dispatch that save after unrelated blocks have been released.
+        """
+        if not self._early_release or self._has_active_load(seq):
+            return None
+        sid = str(seq.id)
+        table = list(getattr(seq, "_offload_finished_block_ids", seq.block_table))
+        if not hasattr(seq, "_offload_finished_block_ids"):
+            seq._offload_finished_block_ids = table
+        seq._offload_finished_cached_tokens = min(
+            int(getattr(seq, "num_cached_tokens", 0)), int(seq.num_prompt_tokens)
+        )
+
+        protected: set[int] = set()
+        for operation, blocks in self._save_operation_blocks.items():
+            if self._save_operation_owner.get(operation) is not seq:
+                continue
+            safe = self._save_operation_safe.get(operation, set())
+            protected.update(
+                block_id for block_id in blocks.values() if block_id not in safe
+            )
+
+        entry = self._save_tracker.get(sid)
+        if entry is not None and entry[0] is seq:
+            saved = int(entry[1])
+            aligned = self._save_frontier(seq)
+            if aligned > saved:
+                start_block = saved // self.virtual_block_size
+                end_block = -(-aligned // self.virtual_block_size)
+                protected.update(table[start_block:end_block])
+        return frozenset(protected)
+
+    def activate_block_leases(self, seq, block_ids: frozenset[int]) -> None:
+        """Record the refcount shares transferred at request deallocation."""
+
+        if not self._early_release or not block_ids:
+            return
+        lease_key = id(seq)
+        leased = self._save_lease_blocks.setdefault(lease_key, set())
+        self._save_lease_owner[lease_key] = seq
+        added = set(block_ids) - leased
+        leased.update(added)
+        if added:
+            self._save_lease_at.setdefault(lease_key, time.monotonic())
+            self.total_leased_source_blocks += len(added)
+
+    def take_source_safe_releases(self) -> list[frozenset]:
+        """Drain block-ID sets whose lease became source-safe since the last poll."""
+        out = self._pending_source_safe_releases
+        self._pending_source_safe_releases = []
+        return out
+
+    def reclaim_stale_leases(self, timeout_s: float) -> list[frozenset]:
+        """Force-release leases whose save never reported, past `timeout_s`.
+
+        Twin of the scheduler's `_reconcile_stalled_deferred_saves`, but for
+        leases opened by `deallocate_partial`'s early-release path -- those
+        requests are *not* in `deferred_free_blocks` (they were already fully
+        torn down at finish time), so the existing reconciler never sees them.
+        Same safety argument as `_reconcile_stalled_deferred_saves`: past
+        `save_abandon_timeout_s()`, LMCache has force-unpinned the source
+        either way, so the GPU blocks are safe to return. A lease exists only
+        after its request finished, so reclamation also drops that lifecycle's
+        frozen tracker entry; re-emitting it would read blocks just returned to
+        the pool.
+        """
+        if timeout_s <= 0 or not self._save_lease_at:
+            return []
+        now = time.monotonic()
+        stale_keys = [
+            lease_key
+            for lease_key, at in self._save_lease_at.items()
+            if now - at >= timeout_s
+        ]
+        released: list[frozenset] = []
+        for lease_key in stale_keys:
+            self._save_lease_at.pop(lease_key, None)
+            blocks = self._save_lease_blocks.pop(lease_key, None)
+            owner = self._save_lease_owner.pop(lease_key, None)
+            owned_operations = [
+                op
+                for op, owner in self._save_operation_owner.items()
+                if id(owner) == lease_key
+            ]
+            sid = str(owner.id) if owner is not None else None
+            operation = self._save_inflight.get(sid) if sid is not None else None
+            if operation in owned_operations:
+                self._save_inflight.pop(sid, None)
+                self._cancel_save_statistics(operation)
+            for candidate in [
+                op for op in self._save_operation_blocks if op in owned_operations
+            ]:
+                self._save_operation_blocks.pop(candidate, None)
+                self._save_operation_safe.pop(candidate, None)
+                self._save_operation_owner.pop(candidate, None)
+                self._source_safe_waiting_for_store.pop(candidate, None)
+            if sid is not None:
+                entry = self._save_tracker.get(sid)
+                if entry is not None and entry[0] is owner:
+                    self._save_tracker.pop(sid, None)
+            if blocks:
+                released.append(frozenset(blocks))
+                self.total_abnormal_lease_reclaims += len(blocks)
+        return released
 
     def release_stalled_save(self, seq) -> None:
         """Drop bookkeeping for a stall-escaped save the scheduler is freeing.
@@ -715,17 +958,32 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         """
 
     def has_pending_work(self) -> bool:
-        """True while a load still needs dispatch or a save is unreported.
+        """True while a load/cleanup is dispatchable or a save is unreported.
 
         Feeds ``EngineCore.has_pending_kv_work()``, so it reads only state
         that clears itself: ``_reqs_need_recv`` is emptied by every
         ``build_connector_meta`` and ``_save_inflight`` by ``save_finished``
         (or ``abandon_save`` when the scheduler reclaims a stalled save).
-        Saves that are queued but not yet dispatched are covered there by the
-        scheduler's ``deferred_free_blocks``, which ``should_defer_free``
-        keeps populated for exactly those requests.
+        With early release, a finished request's final not-yet-emitted save is
+        no longer represented by ``deferred_free_blocks``; its frozen tracker
+        entry must therefore keep the engine polling until it is dispatched.
+
+        A pre-allocation lookup belongs to a waiting request. Keep its pin,
+        but do not advertise idle work until allocation or cancellation makes
+        a load or cleanup dispatchable in ``build_connector_meta``.
         """
-        return bool(self._reqs_need_recv) or bool(self._save_inflight)
+        pending_finished_save = getattr(self, "_early_release", False) and any(
+            hasattr(entry[0], "_offload_finished_block_ids")
+            and self._has_pending_save(entry[0])
+            for entry in self._save_tracker.values()
+        )
+        return (
+            bool(self._reqs_need_recv)
+            or bool(self._save_inflight)
+            or bool(getattr(self, "_save_lease_blocks", {}))
+            or pending_finished_save
+            or any(sid not in self._load_specs for sid in self._lookup_in_step)
+        )
 
     def save_finished(self, req_id) -> None:
         sid = str(req_id.req_id if isinstance(req_id, SaveOperationId) else req_id)
@@ -739,7 +997,131 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             # entries should one be restored from older scheduler state.
             return
         self._save_inflight.pop(sid, None)
+        if getattr(self, "_early_release", False):
+            # Store success/failure and lease release travel on the dedicated
+            # connector channel. This legacy terminal exists for deferred-free
+            # and MultiConnector send/save pairing only.
+            self._finish_retired_request(sid)
+            return
         self._finish_save_statistics(req_id)
+        self._release_operation_lease(req_id)
+        self._finish_retired_request(sid)
+
+    def connector_completion(self, completion: ConnectorCompletion) -> bool | None:
+        """Apply TP/PP-quorumed source-safe and store-terminal reports."""
+
+        if completion.channel == DENSE_PAGE_SOURCE_SAFE_CHANNEL:
+            identity = completion.operation_id
+            if not isinstance(identity, SaveSourceGroupId):
+                return False
+            self._source_group_finished(identity)
+            return None
+        if completion.channel != DENSE_PAGE_STORE_CHANNEL:
+            return False
+        operation = completion.operation_id
+        if not isinstance(operation, SaveOperationId):
+            return False
+        self._store_finished(operation, succeeded=completion.succeeded)
+        return True
+
+    def _source_group_finished(self, identity: SaveSourceGroupId) -> None:
+        operation = identity.save_operation
+        block_map = self._save_operation_blocks.get(operation)
+        if block_map is None:
+            return
+        source_blocks: set[int] = set()
+        for start, end in identity.ranges:
+            start_block = start // self.virtual_block_size
+            end_block = -(-end // self.virtual_block_size)
+            source_blocks.update(
+                block_map[index]
+                for index in range(start_block, end_block)
+                if index in block_map
+            )
+        safe = self._save_operation_safe.setdefault(operation, set())
+        newly_safe = source_blocks - safe
+        safe.update(newly_safe)
+        if not newly_safe:
+            return
+        sid = str(operation.req_id)
+        owner = self._save_operation_owner.get(operation)
+        lease_key = id(owner) if owner is not None else None
+        leased = self._save_lease_blocks.get(lease_key)
+        releasable = newly_safe & leased if leased is not None else set()
+        if releasable:
+            leased.difference_update(releasable)
+            self._pending_source_safe_releases.append(frozenset(releasable))
+            self.total_source_safe_released_blocks += len(releasable)
+            if not leased:
+                self._save_lease_blocks.pop(lease_key, None)
+                self._save_lease_at.pop(lease_key, None)
+                self._save_lease_owner.pop(lease_key, None)
+        if self._save_inflight.get(sid) == operation:
+            self._source_safe_waiting_for_store.setdefault(operation, set()).update(
+                newly_safe
+            )
+        elif set(block_map.values()).issubset(safe):
+            self._save_operation_blocks.pop(operation, None)
+            self._save_operation_safe.pop(operation, None)
+            self._save_operation_owner.pop(operation, None)
+
+    def _store_finished(self, operation: SaveOperationId, *, succeeded: bool) -> None:
+        sid = str(operation.req_id)
+        active = self._save_inflight.get(sid)
+        if (
+            active != operation
+            and operation not in self._save_operation_blocks
+            and operation not in self._save_inflight_tokens
+        ):
+            return
+        if active == operation:
+            self._save_inflight.pop(sid, None)
+        self._source_safe_waiting_for_store.pop(operation, None)
+        if succeeded:
+            self._finish_save_statistics(operation)
+            # A returned store is also a source-safety fence, including the
+            # case where LMCache found a chunk already present and never called
+            # the GPU connector for that range.
+            self._release_operation_lease(operation)
+        else:
+            self._cancel_save_statistics(operation)
+            # Do not infer source-safety from a failed store. Any ranges whose
+            # GPU staging callback already reached quorum were released above;
+            # the rest stay leased until the conservative abandon timeout.
+        self._finish_retired_request(sid)
+
+    def _release_operation_lease(self, operation) -> None:
+        if not isinstance(operation, SaveOperationId):
+            return
+        block_map = self._save_operation_blocks.pop(operation, {})
+        self._save_operation_safe.pop(operation, None)
+        owner = self._save_operation_owner.pop(operation, None)
+        lease_key = id(owner) if owner is not None else None
+        leased = self._save_lease_blocks.get(lease_key)
+        releasable = set(block_map.values()) & leased if leased is not None else set()
+        if releasable:
+            leased.difference_update(releasable)
+            self._pending_source_safe_releases.append(frozenset(releasable))
+            self.total_source_safe_released_blocks += len(releasable)
+            if not leased:
+                self._save_lease_blocks.pop(lease_key, None)
+                self._save_lease_at.pop(lease_key, None)
+                self._save_lease_owner.pop(lease_key, None)
+
+    def _finish_retired_request(self, sid: str) -> None:
+        entry = self._save_tracker.get(sid)
+        if entry is None:
+            return
+        seq = entry[0]
+        if hasattr(seq, "_offload_finished_block_ids") and not self._has_pending_save(
+            seq
+        ):
+            self._save_tracker.pop(sid, None)
+
+    def blocks_waiting_for_store(self) -> int:
+        return sum(
+            len(blocks) for blocks in self._source_safe_waiting_for_store.values()
+        )
 
     def abandon_save(self, req_id) -> None:
         """Force-drop a save the scheduler reclaimed after it stalled.
@@ -763,6 +1145,18 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         if operation is not None:
             self._cancel_save_statistics(operation)
         self._save_tracker.pop(sid, None)
+        owner = self._save_operation_owner.pop(operation, None)
+        lease_key = id(owner) if owner is not None else None
+        self._save_lease_at.pop(lease_key, None)
+        blocks = self._save_lease_blocks.pop(lease_key, None)
+        self._save_lease_owner.pop(lease_key, None)
+        if isinstance(operation, SaveOperationId):
+            self._save_operation_blocks.pop(operation, None)
+            self._save_operation_safe.pop(operation, None)
+            self._source_safe_waiting_for_store.pop(operation, None)
+        if blocks:
+            self._pending_source_safe_releases.append(frozenset(blocks))
+            self.total_abnormal_lease_reclaims += len(blocks)
 
     def load_failed(self, req_id) -> bool:
         sid = str(req_id.req_id if isinstance(req_id, LoadOperationId) else req_id)
@@ -822,7 +1216,20 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                 self._cancel_load_statistics(active[1])
             self._load_lifecycles.pop(sid, None)
         entry = self._save_tracker.get(sid)
-        if entry is not None and entry[0] is seq and not self.should_defer_free(seq):
-            self._save_tracker.pop(sid, None)
+        if entry is not None and entry[0] is seq:
+            if self._early_release:
+                # Freeze the final computed frontier before BlockManager
+                # clears it during partial deallocation. Keep the tracker when
+                # a final chunk still needs emission; a later metadata build
+                # uses the frozen block table recorded by
+                # `protected_block_ids`.
+                seq._offload_finished_cached_tokens = min(
+                    int(getattr(seq, "num_cached_tokens", 0)),
+                    int(seq.num_prompt_tokens),
+                )
+                if not self.should_defer_free(seq):
+                    self._save_tracker.pop(sid, None)
+            elif not self.should_defer_free(seq):
+                self._save_tracker.pop(sid, None)
         if hasattr(seq, "_load_operation"):
             delattr(seq, "_load_operation")

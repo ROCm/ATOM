@@ -470,6 +470,16 @@ if is_rocm_aiter_fp4bmm_enabled():
     from atom.model_ops.utils import quark_post_load_weights
 
 
+# Optional flydsl backend for `_kv_b_proj_gather`, gated by
+# ATOM_USE_FLYDSL_GATHER_KV_B_PROJ.
+try:
+    from aiter.ops.flydsl import gather_kv_b_proj_flydsl
+
+    _FLYDSL_GATHER_AVAILABLE = True
+except Exception:  # noqa: BLE001 -- optional kernel; absence is the whole answer
+    _FLYDSL_GATHER_AVAILABLE = False
+
+
 # MLA Specific Arguments
 @dataclass
 class MLAModules:
@@ -661,6 +671,7 @@ class MLAAttention(nn.Module):
         # ==1 falls back to the original interleaved per-token (page_size=1)
         # kernels with an unpadded 576-wide q_out. The triton path never uses seg.
         self.use_seg_mla = (not self.use_triton_mla) and envs.ATOM_MLA_PAGE_SIZE > 1
+        self.use_flydsl_gather_kv_b_proj = bool(envs.ATOM_USE_FLYDSL_GATHER_KV_B_PROJ)
         if self.use_seg_mla:
             if envs.ATOM_MLA_PAGE_SIZE != _MLA_SEG_PAGE_SIZE:
                 raise RuntimeError(
@@ -1376,17 +1387,36 @@ class MLAAttention(nn.Module):
         DCP -- and ``kv_indices`` selects rows out of it.
         """
         weight = self.kv_b_proj.weight
+        gather_weight = _maybe_view_mxfp4_weight_for_gather(self.kv_b_proj, weight)
+        weight_scale = getattr(self.kv_b_proj, "weight_scale", None)
+        preshuffled = getattr(weight, "is_shuffled", False)
+
+        if self.use_flydsl_gather_kv_b_proj and _FLYDSL_GATHER_AVAILABLE:
+            gather_kv_b_proj_flydsl(
+                kv_buffer,
+                self._k_scale,
+                kv_indptr,
+                kv_indices,
+                cu_seqlens_k,
+                gather_weight,
+                weight_scale,
+                k_out,
+                v_out,
+                weight_preshuffle=preshuffled,
+            )
+            return
+
         gather_kv_b_proj(
             kv_buffer,
             self._k_scale,
             kv_indptr,
             kv_indices,
             cu_seqlens_k,
-            _maybe_view_mxfp4_weight_for_gather(self.kv_b_proj, weight),
-            getattr(self.kv_b_proj, "weight_scale", None),
+            gather_weight,
+            weight_scale,
             k_out,
             v_out,
-            weight_preshuffle=getattr(weight, "is_shuffled", False),
+            weight_preshuffle=preshuffled,
         )
 
     def _forward_prefill_cached_chunked(
