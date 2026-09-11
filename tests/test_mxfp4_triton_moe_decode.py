@@ -52,10 +52,15 @@ def _make_method(monkeypatch, *, decode_flag, use_triton=True, use_ep=False):
     [
         (True, True, False, True),
         (False, True, False, False),
-        # The flag narrows ATOM_USE_TRITON_MOE; it cannot turn Triton on, and
-        # it is inert under EP (which has its own weight prep).
+        # The flag narrows ATOM_USE_TRITON_MOE and cannot turn Triton on by
+        # itself, so it stays off with the outer flag unset.
         (True, False, False, False),
-        (True, True, True, False),
+        # Under EP it arms too. `use_triton` here is the ENV
+        # ATOM_USE_TRITON_MOE, not the attribute: with use_ep the env resolves
+        # to use_triton=False / use_triton_ep=True, and use_triton_decode is
+        # `(use_triton or use_triton_ep) and decode_flag`. Expected False while
+        # the flag was TP-only.
+        (True, True, True, True),
     ],
 )
 def test_decode_flag_only_narrows_the_triton_path(

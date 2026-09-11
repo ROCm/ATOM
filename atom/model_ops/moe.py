@@ -1117,10 +1117,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # rests on gfx1250 + GUGU + SiLU + zero pad, which the asserts in
         # _process_weight_layout_after_loading enforce for both.
         #
-        # NOTE the EP wiring is only in the `fused_experts is None` block of
-        # apply() -- the local, no-transport path. The modular-kernel EP path
-        # still consumes the branch-A layout, so setting this under EP with a
-        # transport in play leaves the Triton experts without their weights.
+        # Both EP entry points honour it: the modular-kernel (transport) path
+        # publishes `triton_experts` built from _triton_views_of_flydsl_weights,
+        # and the local no-transport path builds the same views. Neither reads
+        # the branch-A layout under this flag, because the prep never wrote one.
         self.use_triton_decode = (
             self.use_triton or self.use_triton_ep
         ) and envs.ATOM_USE_TRITON_MOE_DECODE
@@ -1141,6 +1141,49 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             f"(ATOM_USE_TRITON_MOE={int(use_triton_moe)}, use_ep={ep_moe}, "
             f"eplb_enable={getattr(get_current_atom_config(), 'eplb_enable', False)})."
         )
+
+        # Triton MoE under EP exists only for gfx95x and gfx125x -- those are the
+        # arches whose branch-A weight prep and gluon experts are wired up. The
+        # arch test that computes `use_triton_moe` above is bypassed whenever
+        # ATOM_USE_TRITON_MOE is set explicitly, so without this a gfx94x EP
+        # deployment reaches the modular kernel's Triton experts carrying weights
+        # that were never prepared for them. Checked after the EPLB block so a
+        # deployment EPLB would have turned off anyway does not trip it.
+        assert not self.use_triton_ep or gfx.startswith(("gfx95", "gfx125")), (
+            "Triton MoE on EP is only supported on gfx95x and gfx125x, got "
+            f"{gfx}. Unset ATOM_USE_TRITON_MOE to run the FlyDSL EP path."
+        )
+
+        # Selecting Triton for the routed experts under EP is a change of
+        # backend, not a tuning knob, and nothing downstream announces it -- so
+        # say so once at construction where it is decided. Warning rather than
+        # info because it diverges from what an EP deployment got before this
+        # path existed.
+        if self.use_triton_ep:
+            logger.warning(
+                "Triton MoE selected for the routed experts under EP (arch=%s); "
+                "this replaces the FlyDSL EP path.",
+                gfx,
+            )
+
+        # Which wrapper the Triton path will use. a4w4 has a third trigger that
+        # only exists at call time -- an already-MXFP4 activation, which is what
+        # a mori fp4 dispatch hands over -- so this reports the two reasons
+        # decided here, not all three. See _fused_experts_silu_gugu.
+        if self.use_triton or self.use_triton_ep:
+            logger.info(
+                "Triton MoE experts: %s (ATOM_USE_TRITON_MOE_A4W4=%d, "
+                "act_quant=%s, ep=%d)",
+                (
+                    "a4w4"
+                    if envs.ATOM_USE_TRITON_MOE_A4W4
+                    or self.act_quant == MoEActivationQuant.FP4
+                    else "a8w4"
+                ),
+                int(envs.ATOM_USE_TRITON_MOE_A4W4),
+                self.act_quant.value,
+                int(self.use_triton_ep),
+            )
 
     def create_weights(
         self,
@@ -1300,7 +1343,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 "ATOM_USE_TRITON_MOE_DECODE=1 shares one weight copy between the "
                 "FlyDSL and Triton kernels, which only matches on gfx1250 + "
                 "ATOM_MOE_GU_ITLV=1 + SiLU (got gfx1250="
-                f"{self.is_gfx1250}, gu_itlv={self.is_guinterleave}, silu={is_silu})."
+                f"{self.is_gfx1250}, gu_itlv={self.is_guinterleave}, silu={is_silu}). "
+                "NOTE the ATOM_MOE_GU_ITLV requirement is INVERTED from earlier "
+                "builds: this flag used to be skipped when GU interleaving was on "
+                "and to run with ATOM_MOE_GU_ITLV=0, which is now the "
+                "unsupported combination. A launch line carrying "
+                "ATOM_MOE_GU_ITLV=0 with ATOM_USE_TRITON_MOE_DECODE=1 needs "
+                "ATOM_MOE_GU_ITLV=1, or drop ATOM_USE_TRITON_MOE_DECODE."
             )
             # FlyDSL trims the create_weights padding via hidden_pad /
             # intermediate_pad; the Triton kernels take no such argument and read

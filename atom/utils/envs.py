@@ -83,7 +83,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # flag, it cannot enable Triton on its own) plus gfx1250 + ATOM_MOE_GU_ITLV=1
     # + SiLU, because it keeps a single copy of the weights in the FlyDSL layout
     # and hands Triton a zero-copy view of it -- which is only valid where the
-    # two preshuffles agree byte-for-byte. TP only; inert under EP.
+    # two preshuffles agree byte-for-byte -- which is what ATOM_MOE_GU_ITLV=1
+    # buys, and why the prep asserts it: only the interleaved layout is shared,
+    # so at ATOM_MOE_GU_ITLV=0 the FlyDSL prep and the Triton view disagree.
+    # tests/test_mxfp4_triton_moe_decode.py runs both real preps and compares.
+    #
+    # Arms under EP as well as TP, at both EP entry points -- the modular-kernel
+    # (transport) path and the local no-transport one build the same views.
     "ATOM_USE_TRITON_MOE_DECODE": lambda: (
         os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0") == "1"
     ),

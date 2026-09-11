@@ -444,6 +444,11 @@ class FusedMoEModularKernel(torch.nn.Module):
         # be prefill-broken (TDM async_gather over mxfp8 activations), so this
         # was decode-only; that is fixed in the aiter gluon kernel, which now
         # loads the x mx-scales via async_copy when X_SCALE_TDM is off.
+        # No arch test here on purpose: `triton_experts` is only ever non-None
+        # when Mxfp4MoEMethod set use_triton_ep, and its constructor asserts that
+        # is gfx95x or gfx125x. Re-deriving the arch in the modular kernel -- which
+        # holds no layer reference -- would be a second copy of that rule to keep
+        # in sync.
         if triton_experts is not None:
             # Same entry point the TP path uses; the flag selects the fused
             # SiLU a8w4/a4w4 experts (a8w4 by default, a4w4 under
