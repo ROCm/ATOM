@@ -6,6 +6,7 @@ plus ATOM extensions (`BlockTransferred`, CPU/DISK/REMOTE medium constants)."""
 
 from __future__ import annotations
 
+import itertools
 import logging
 import queue
 import threading
@@ -134,10 +135,18 @@ class ZmqEventPublisher(EventPublisher):
     batch is dropped — KV events are advisory and a missed eviction is
     cheaper than stalling inference.
 
-    With `topic=""` (default) each message is a single msgpack frame; with a
-    non-empty `topic` the publisher sends two-frame multipart messages
-    (`[topic, payload]`), so consumers must use `recv_multipart()` to read
-    the payload.
+    Every message is a three-frame multipart `[topic, seq, payload]`, the
+    layout vLLM's `ZmqEventPublisher` emits: `topic` is the (possibly empty)
+    subscription key, `seq` is a monotonic uint64 big-endian batch counter,
+    and `payload` is the msgpack-encoded `EventBatch`. Consumers must use
+    `recv_multipart()`. `seq` is assigned at enqueue, so a batch dropped on
+    queue overflow shows up as a gap in the stream instead of vanishing
+    silently. The all-0xFF value is never used as a data seq; vLLM reserves
+    it as the replay terminator.
+
+    With `data_parallel_rank` set, the bound endpoint is moved to that rank
+    (see `offset_endpoint_port`) so co-located DP ranks do not collide on one
+    socket, and subscribers reach rank N at base port + N.
     """
 
     def __init__(
@@ -162,12 +171,16 @@ class ZmqEventPublisher(EventPublisher):
         self._dp_rank = data_parallel_rank
         self._topic_bytes = topic.encode("utf-8")
         self._encoder = encoder or msgspec.msgpack.Encoder()
-        self._queue: queue.Queue[bytes | None] = queue.Queue(maxsize=buffer_steps)
+        # Queue items are (seq, payload); None is the shutdown sentinel.
+        self._queue: queue.Queue[tuple[int, bytes] | None] = queue.Queue(
+            maxsize=buffer_steps
+        )
+        self._seq_gen = itertools.count()
 
         ctx = zmq.Context.instance()
         self._socket = ctx.socket(zmq.PUB)
         self._socket.set_hwm(hwm)
-        self._socket.bind(endpoint)
+        self._socket.bind(offset_endpoint_port(endpoint, data_parallel_rank or 0))
         self._zmq_error_cls = zmq.ZMQError  # captured so _run doesn't re-import
 
         self._drops = 0
@@ -207,10 +220,16 @@ class ZmqEventPublisher(EventPublisher):
                 )
             return
 
+        # Assigned at enqueue rather than at send: a batch dropped on overflow
+        # below still consumes a seq, so subscribers see the loss as a gap.
+        # Modulo keeps the counter in [0, 2**64-2], clear of vLLM's all-0xFF
+        # replay terminator.
+        seq = next(self._seq_gen) % 0xFFFFFFFFFFFFFFFF
+
         # Non-blocking enqueue; drop oldest on overflow.
         while True:
             try:
-                self._queue.put_nowait(payload)
+                self._queue.put_nowait((seq, payload))
                 return
             except queue.Full:
                 try:
@@ -246,11 +265,11 @@ class ZmqEventPublisher(EventPublisher):
             item = self._queue.get()
             if item is None:
                 return
+            seq, payload = item
             try:
-                if self._topic_bytes:
-                    self._socket.send_multipart([self._topic_bytes, item])
-                else:
-                    self._socket.send(item)
+                self._socket.send_multipart(
+                    [self._topic_bytes, seq.to_bytes(8, "big"), payload]
+                )
                 with self._lock:
                     self._sent += 1
             except self._zmq_error_cls:  # pragma: no cover - socket closed
@@ -265,6 +284,22 @@ class ZmqEventPublisher(EventPublisher):
                 "dropped": self._drops,
                 "encode_errors": self._encode_errors,
             }
+
+
+def offset_endpoint_port(endpoint: str, data_parallel_rank: int) -> str:
+    """Return `endpoint` moved to the given data-parallel rank: tcp ports are
+    offset by the rank, other transports (inproc, ipc) get a `_dp<rank>`
+    suffix. Rank 0 returns the endpoint unchanged. Mirrors vLLM's
+    `ZmqEventPublisher.offset_endpoint_port`, so a subscriber that dials
+    base port + rank works against either engine."""
+    if data_parallel_rank <= 0:
+        return endpoint
+    if endpoint.startswith("tcp://"):
+        base, sep, port = endpoint.rpartition(":")
+        if not sep or not port.isdigit():
+            raise ValueError(f"tcp endpoint without a numeric port: {endpoint!r}")
+        return f"{base}:{int(port) + data_parallel_rank}"
+    return f"{endpoint}_dp{data_parallel_rank}"
 
 
 def make_publisher(
