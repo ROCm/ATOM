@@ -46,10 +46,18 @@ on:
         description: 'Commit/tag/ref to build (leave empty to use current commit)'
         required: false
         default: ''
+      flavors:
+        description: 'Which ROCm lines to release'
+        type: choice
+        default: 'both'
+        options:
+          - both
+          - rocm7
+          - rocm10
       build_image:
-        description: 'Docker image to build the wheel in'
-        required: true
-        default: 'rocm/atom-dev:latest'
+        description: 'Override the build image (leave empty to use the flavor default)'
+        required: false
+        default: ''
       add_date_stamp:
         description: 'Add date stamp to version (+yyyymmdd)'
         type: boolean
@@ -78,12 +86,29 @@ concurrency:
 
 jobs:
   build-and-release:
-    name: Build wheel and publish to GitHub Releases
+    name: Build wheel (${{ matrix.flavor }}) and publish to GitHub Releases
     runs-on: ${{ inputs.runner || 'linux-atom-mi35x-1' }}
+
+    # One dispatch releases every line. The flavors are built one at a time so
+    # that the first to finish creates the GitHub Release and the rest upload
+    # into it; they also share a runner, so there is nothing to gain from
+    # racing them. fail-fast is off because a break in one ROCm line says
+    # nothing about the other -- that independence is the point of running
+    # both.
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        flavor: [rocm7, rocm10]
+
+    if: >-
+      ${{ github.event_name != 'workflow_dispatch'
+          || inputs.flavors == 'both'
+          || inputs.flavors == matrix.flavor }}
 
     env:
       BUILD_REF: ${{ inputs.commit || github.ref }}
-      BUILD_IMAGE: ${{ inputs.build_image || 'rocm/atom-dev:latest' }}
+      BUILD_IMAGE: ${{ inputs.build_image || (matrix.flavor == 'rocm10' && 'rocm/atom-dev:latest-rocm10' || 'rocm/atom-dev:latest') }}
       ADD_DATE_STAMP: ${{ inputs.add_date_stamp || false }}
       DRAFT: ${{ inputs.draft || false }}
 
@@ -107,7 +132,7 @@ jobs:
       - name: Run the build container
         run: |
           set -ex
-          echo "Starting container: atom_build"
+          echo "Starting container: atom_build_${{ matrix.flavor }}"
           # The build needs a GPU only if the rust mesh build's torch linkage
           # check touches one; pass devices when the runner has them.
           GPU_FLAGS=""
@@ -124,7 +149,7 @@ jobs:
             --entrypoint="" \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
-            --name atom_build \
+            --name "atom_build_${{ matrix.flavor }}" \
             "${BUILD_IMAGE}" \
             sleep infinity
 
@@ -148,9 +173,9 @@ jobs:
           # The ROCm version is read from the build container rather than
           # guessed from the image name, which is why this step runs after the
           # container is up.
-          ROCM_VER=$(docker exec atom_build bash -c 'cat /opt/rocm/.info/version 2>/dev/null' | tr -d '[:space:]')
+          ROCM_VER=$(docker exec "atom_build_${{ matrix.flavor }}" bash -c 'cat /opt/rocm/.info/version 2>/dev/null' | tr -d '[:space:]')
           if [ -z "${ROCM_VER}" ]; then
-            ROCM_VER=$(docker exec atom_build bash -c \
+            ROCM_VER=$(docker exec "atom_build_${{ matrix.flavor }}" bash -c \
               'python3 -c "import torch; print(torch.version.hip or \"\")" 2>/dev/null' | tr -d '[:space:]')
           fi
           if [ -z "${ROCM_VER}" ]; then
@@ -211,7 +236,7 @@ jobs:
             -e SETUPTOOLS_SCM_PRETEND_VERSION="${WHEEL_VERSION}" \
             -e ATOM_MESH_BUILD=1 \
             -w /workspace \
-            atom_build \
+            "atom_build_${{ matrix.flavor }}" \
             bash -c "python3 -m pip wheel . --no-deps -w dist && ls -lh dist/"
 
       - name: Validate wheel
@@ -225,7 +250,7 @@ jobs:
             || { echo "ERROR: wheel does not carry libmesh.so / _version.py"; exit 1; }
           docker exec \
             -w /workspace \
-            atom_build \
+            "atom_build_${{ matrix.flavor }}" \
             bash -c "
               set -e
               python3 -m pip install --force-reinstall --no-deps dist/atom-*.whl
@@ -291,4 +316,4 @@ jobs:
       - name: Cleanup container
         if: always()
         run: |
-          docker rm -f atom_build || true
+          docker rm -f "atom_build_${{ matrix.flavor }}" || true
