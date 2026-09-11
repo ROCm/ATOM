@@ -20,6 +20,10 @@ name: ATOM Release Package
 #   v0.1.7.post1    a fix on top of one
 #   v0.1.8.dev0     a preview, published as a pre-release
 #
+# The two-week rhythm itself is not enforced here: like aiter, the schedule
+# and its cadence gate live in a separate automation workflow that resolves
+# the next tag and calls this one.
+#
 # and the ROCm line the wheel was built against lands in the PEP 440 local
 # segment, the way torch spells it (2.11.0+rocm10.0.0):
 #
@@ -32,13 +36,37 @@ name: ATOM Release Package
 # never changes which release a version belongs to.
 
 on:
-  # Preview cadence, matched to aiter's release rhythm (a minor roughly every
-  # two weeks). These runs build and validate the wheel and keep it as a
-  # workflow artifact -- they deliberately do not tag or publish a Release, so
-  # the tag history stays a record of deliberate releases rather than a log of
-  # every scheduled build. Formal releases stay manual, as aiter's are.
-  schedule:
-    - cron: '17 4 1,15 * *'   # 1st and 15th, 04:17 UTC
+  # Cadence lives in a separate automation workflow, the way aiter splits
+  # aiter-release.yaml from release-automation.yaml: that one holds the
+  # schedule and the every-two-week gate, resolves the next tag, and calls
+  # this workflow to do the building. Keeping the split means the build can
+  # still be driven by hand for a one-off without going through the cadence.
+  workflow_call:
+    inputs:
+      commit:
+        type: string
+        required: false
+        default: ''
+      flavors:
+        type: string
+        required: false
+        default: 'both'
+      build_image:
+        type: string
+        required: false
+        default: ''
+      add_date_stamp:
+        type: boolean
+        required: false
+        default: false
+      draft:
+        type: boolean
+        required: false
+        default: false
+      runner:
+        type: string
+        required: false
+        default: 'linux-atom-mi35x-1'
 
   workflow_dispatch:
     inputs:
@@ -266,7 +294,6 @@ jobs:
           retention-days: 14
 
       - name: Create GitHub Release and upload wheel
-        if: ${{ github.event_name != 'schedule' }}
         env:
           WHEEL_VERSION: ${{ steps.version.outputs.wheel_version }}
           RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
