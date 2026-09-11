@@ -31,6 +31,7 @@ from atom.kv_transfer.offload.hybrid.dsv4.codec import (
 )
 from atom.kv_transfer.offload.hybrid.dsv4.connector import (
     DSV4_CHECKPOINT_SAVE_CHANNEL,
+    DSV4_PAGE_SAVE_CHANNEL,
     _env_nonnegative_float,
     _env_positive_float,
     _wait_for_publication,
@@ -482,6 +483,10 @@ def _worker(
     connector._done_save = _OrderedSet(order, "done")
     connector._done_sidecar_save = _OrderedSet(order, "sidecar-done")
     connector._failed_sidecar_save = _OrderedSet(order, "sidecar-failed")
+    # Plain sets: the PAGE channel is not part of the terminal ordering these
+    # tests assert on, so it must not be recorded into `order`.
+    connector._done_page_save = set()
+    connector._failed_page_save = set()
     connector._pending_save_ops = {}
     connector._pending_legacy_save_ops = {}
     connector._save_req_locks = {}
@@ -523,6 +528,103 @@ def _worker(
     connector._create_slot_stream = lambda: _FakeTransferStream(order)
     connector._slot_stream_context = lambda stream: nullcontext()
     return connector
+
+
+def _verdicts(connector) -> dict[str, dict]:
+    """Drain get_finished once and split completions by channel.
+
+    `get_finished` clears the underlying sets, so a test that wants both the
+    PAGE and the SLOT verdict has to read them out of the same drain.
+    """
+    out = connector.get_finished()
+    by_channel: dict[str, dict] = {
+        DSV4_PAGE_SAVE_CHANNEL: {},
+        DSV4_CHECKPOINT_SAVE_CHANNEL: {},
+    }
+    for c in out.connector_completions:
+        by_channel.setdefault(c.channel, {})[c.operation_id] = c.succeeded
+    return by_channel
+
+
+def _page_verdict(connector) -> dict:
+    return _verdicts(connector)[DSV4_PAGE_SAVE_CHANNEL]
+
+
+def test_page_verdict_fails_when_the_store_raises():
+    """The executor path must report the PAGE failure, not just log it."""
+    order: list[str] = []
+    connector = _worker(order)
+    connector._engine.store_error = RuntimeError("store exploded")
+    request = _save_request()
+
+    connector._do_save_req(request, None, None)
+
+    assert _page_verdict(connector) == {request.req_id: False}
+
+
+def test_page_verdict_fails_when_coverage_never_becomes_visible():
+    """A visibility timeout must not be reported as a landed PAGE save.
+
+    `store` returning is not proof the PAGEs are queryable. Committing the
+    watermark here would leave exactly the hole this channel exists to prevent.
+    """
+    order: list[str] = []
+    connector = _worker(order)
+    _inject_fake_publication_clock(connector)
+    connector._engine.lookup_hit = 0  # boundary is 8; never satisfied
+    request = _save_request()
+
+    connector._do_save_req(request, None, None)
+
+    seen = _verdicts(connector)
+    assert seen[DSV4_PAGE_SAVE_CHANNEL] == {request.req_id: False}
+    assert seen[DSV4_CHECKPOINT_SAVE_CHANNEL] == {request.req_id: False}
+
+
+def test_page_verdict_survives_a_sidecar_failure_after_coverage_is_visible():
+    """PAGE landed and was confirmed; a later SLOT failure must not revoke it."""
+    order: list[str] = []
+    connector = _worker(order)
+    connector._engine.lookup_hit = 8  # boundary satisfied
+    connector._slot_store.put_result = False  # sidecar put is rejected
+    request = _save_request()
+
+    connector._do_save_req(request, None, None)
+
+    seen = _verdicts(connector)
+    assert seen[DSV4_PAGE_SAVE_CHANNEL] == {request.req_id: True}
+    assert seen[DSV4_CHECKPOINT_SAVE_CHANNEL] == {request.req_id: False}
+
+
+def test_page_verdict_succeeds_for_a_page_only_save():
+    """With no SLOT spec there is no probe, so a clean store is the verdict."""
+    order: list[str] = []
+    connector = _worker(order)
+    request = LMCacheReqMeta(
+        req_id=71,
+        token_ids=list(range(8)),
+        block_ids=[10, 11],
+        save_spec=SaveSpec(skip_leading_tokens=0),
+        slot_save_spec=None,
+    )
+
+    connector._do_save_req(request, None, None)
+
+    assert _page_verdict(connector) == {request.req_id: True}
+
+
+def test_page_verdict_reported_when_executor_submission_is_rejected():
+    """`_finish_rejected_save` is a terminal path and owes a verdict too."""
+    order: list[str] = []
+    connector = _worker(order)
+    request = _save_request()
+
+    connector._save_admission.acquire()
+    connector._begin_save_operation(request.req_id, None)
+
+    connector._finish_rejected_save(request, None, None)
+
+    assert _page_verdict(connector) == {request.req_id: False}
 
 
 def _inject_fake_publication_clock(
