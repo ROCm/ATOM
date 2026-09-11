@@ -1255,7 +1255,7 @@ class Glm5NextMultimodalModel(nn.Module):
         "model.language_model.": "language_model.model.",
         "lm_head.": "language_model.lm_head.",
     }
-    quant_exclude_name_mapping = {
+    quant_exclude_name_mapping: ClassVar[dict[str, str]] = {
         "model.visual.": "visual.",
         "model.": "language_model.model.",
         "lm_head.": "language_model.lm_head.",

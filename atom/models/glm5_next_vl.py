@@ -2,8 +2,8 @@
 """Native GLM-5.3-Flash vision tower for ATOM."""
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 
 class RMSNorm(nn.Module):
