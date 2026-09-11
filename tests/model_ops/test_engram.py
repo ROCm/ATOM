@@ -9,12 +9,15 @@ import numpy as np
 import pytest
 import torch
 
-from atom.model_ops.engram import EngramConfig, NgramHashMapping, _is_prime, _next_prime
-from atom.model_ops.engram_host import (
+from atom.model_ops.engram import (
+    EngramConfig,
     EngramPrefetchCache,
     EngramPrefetcher,
     EngramRuntime,
     HostEmbeddingTable,
+    NgramHashMapping,
+    _is_prime,
+    _next_prime,
 )
 from atom.model_ops.engram_layer import EngramOp
 
@@ -116,7 +119,7 @@ def test_head_vocab_sizes_match_checkpoint():
 def test_head_vocab_sizes_are_globally_distinct():
     cfg = EngramConfig.from_hf(V41_FLASH)
     mapping = NgramHashMapping(cfg, StubTokenizer(cfg.compressed_vocab_size))
-    every = np.concatenate([mapping.head_vocab_sizes[l] for l in cfg.layer_ids])
+    every = np.concatenate([mapping.head_vocab_sizes[lid] for lid in cfg.layer_ids])
     assert len(set(every.tolist())) == every.size
 
 

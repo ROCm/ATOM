@@ -22,7 +22,7 @@ import logging
 import torch
 from torch import nn
 
-from atom.model_ops.engram_module import EngramModules
+from atom.model_ops.engram_layer import EngramModules
 
 logger = logging.getLogger(__name__)
 
