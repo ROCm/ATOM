@@ -40,6 +40,7 @@ DEFAULT_PARAM_LISTS = "1024,1024,128,0.8"
 RESERVED_INPUTS = {
     "agentic",
     "agentic_duration",
+    "agentic_concurrency",
     "extra_args",
     "image",
     "runner",
@@ -165,6 +166,7 @@ def main() -> int:
         model_filter=model_filter,
         cadence=cadence,
         bench_kind_filter=bench_kinds,
+        conc_filter=conc_filter,
     )
     if conc_filter and not configs:
         # The box is free text, so this is usually a typo rather than catalog

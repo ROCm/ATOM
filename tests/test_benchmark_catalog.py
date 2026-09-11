@@ -143,12 +143,16 @@ def test_cells_respect_conc_bands():
     overlap the TP band, which is the only concurrency where the two can be
     compared at all.
     """
+    # Keyed on the resolved server args too, not just (prefix, suffix): the
+    # EPLB MegaMoE pair shares the `-mega` suffix and is split ONLY by band
+    # (c=512 vs c=4096, the latter carrying its own --gpu-memory-utilization).
+    # Keying on the suffix alone drops one of the two bands on the floor.
     bands = {
-        (v["prefix"], v["suffix"]): (v["conc_min"], v["conc_max"])
+        (v["prefix"], v["suffix"], v["args"]): (v["conc_min"], v["conc_max"])
         for v in catalog.load_variants(CATALOG)
     }
     for c in catalog.build_cells(CATALOG):
-        lo, hi = bands[(c["prefix"], c["suffix"])]
+        lo, hi = bands[(c["prefix"], c["suffix"], c["server_args"])]
         assert (
             lo <= c["conc"] <= hi
         ), f"{c['result_filename']} at conc={c['conc']} is outside [{lo}, {hi}]"
