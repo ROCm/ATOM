@@ -19,6 +19,7 @@ import os
 import threading
 import zipfile
 from collections import OrderedDict
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -502,14 +503,27 @@ class EngramPrefetcher:
                 results[(seq_id, layer_id)] = gathered[i]
         return results
 
-    def submit(self, seq_ids: list[int], token_ids: np.ndarray) -> Future:
-        """Queue a prefetch. Cheap and non-blocking; the caller keeps going."""
+    def submit(
+        self,
+        seq_ids: list[int],
+        token_ids: np.ndarray | None = None,
+        *,
+        token_source: Callable[[], np.ndarray] | None = None,
+    ) -> Future:
+        """Queue a prefetch. Cheap and non-blocking; the caller keeps going.
+
+        `token_source`, when given, is called ON THE WORKER to produce the ids --
+        it waits on an async device->host copy off the caller's thread, so the
+        token D2H never blocks the compute thread. Otherwise `token_ids` is used
+        directly.
+        """
 
         def _run() -> None:
-            for key, value in self.compute(seq_ids, token_ids).items():
+            toks = token_source() if token_source is not None else token_ids
+            for key, value in self.compute(seq_ids, toks).items():
                 self.cache.put(key[0], key[1], value)
             for i, sid in enumerate(seq_ids):
-                self._debug_prefetch_token[sid] = int(token_ids[i][-1])
+                self._debug_prefetch_token[sid] = int(toks[i][-1])
 
         self._inflight = self._pool.submit(_run)
         return self._inflight
@@ -575,8 +589,25 @@ class EngramHost:
             )
             for layer_id in prefetcher.layer_ids
         }
-        self.copy_stream = torch.cuda.Stream(device) if device.type == "cuda" else None
-        self.copy_done = torch.cuda.Event() if device.type == "cuda" else None
+        # Streams and events exist only on device; the CPU path (unit tests) runs
+        # everything synchronously and leaves them None. `copy_stream`/`copy_done`
+        # carry the staging H2D; `_token_*` carry the async device->host of the
+        # just-sampled token -- the main thread only launches that copy on the
+        # side stream and records the event, and the worker waits on it before
+        # reading, so the per-step token D2H never blocks the compute thread. The
+        # pinned buffer and event are reused: `stage_embeddings` waits on the
+        # worker before the next step can overwrite them.
+        if device.type == "cuda":
+            self.copy_stream = torch.cuda.Stream(device)
+            self.copy_done = torch.cuda.Event()
+            self._token_d2h_stream = torch.cuda.Stream(device)
+            self._token_event = torch.cuda.Event()
+            self._token_host = torch.empty(
+                max_num_tokens, dtype=torch.int64
+            ).pin_memory()
+        else:
+            self.copy_stream = self.copy_done = None
+            self._token_d2h_stream = self._token_event = self._token_host = None
         self._staged_rows = 0
         # ATOM_ENGRAM_DEBUG_VERIFY cumulative counters (see `stage_embeddings`).
         self._verify_stages = 0
@@ -781,8 +812,36 @@ class EngramHost:
         """Staged rows for one layer, [staged_rows, num_hash_heads * head_dim]."""
         return self.buffers[layer_id].gpu[: self._staged_rows]
 
-    def prefetch_next(self, seq_ids: list[int], token_ids: np.ndarray) -> None:
-        if len(seq_ids):
+    def prefetch_next(self, seq_ids: list[int], tokens) -> None:
+        """Queue the next step's hash + gather for the just-sampled tokens.
+
+        `tokens` is this step's sampled ids ([N] or [N, T]) -- the next step's
+        model input. On device the last id per row is copied to the host
+        ASYNCHRONOUSLY on a side stream, and the worker waits on a CUDA event
+        before reading it, so the main thread never blocks on the D2H. A host
+        array (tests) is submitted directly.
+        """
+        n = len(seq_ids)
+        if not n:
+            return
+        if torch.is_tensor(tokens) and tokens.is_cuda:
+            col = tokens.detach().reshape(n, -1)[:, -1].to(torch.int64)
+            self._token_d2h_stream.wait_stream(torch.cuda.current_stream(self.device))
+            with torch.cuda.stream(self._token_d2h_stream):
+                self._token_host[:n].copy_(col, non_blocking=True)
+            # Keep `col` from being recycled by the allocator until the side
+            # stream's copy has consumed it.
+            col.record_stream(self._token_d2h_stream)
+            self._token_event.record(self._token_d2h_stream)
+            event, host = self._token_event, self._token_host
+
+            def _read() -> np.ndarray:
+                event.synchronize()
+                return np.array(host[:n]).reshape(n, 1)
+
+            self.prefetcher.submit(seq_ids, token_source=_read)
+        else:
+            token_ids = np.asarray(tokens).reshape(n, -1)[:, -1:].astype(np.int64)
             self.prefetcher.submit(seq_ids, token_ids)
 
     def drop_requests(self, seq_ids: list[int]) -> None:

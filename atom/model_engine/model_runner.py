@@ -3155,17 +3155,11 @@ class ModelRunner:
         # one step stale -- the staged embedding then keys on `input_ids[N-1]` while
         # the step processes `input_ids[N]`. `sampled_tokens` reshaped per request
         # takes the last (bonus) token per seq, matching the deferred path's `[-1]`.
-        # The small D2H here is the sync #168 accepted to keep the token current.
+        # `prefetch_next` slices that token and copies it to the host ASYNC on a
+        # side stream (the worker waits on a CUDA event), so keeping the token
+        # current costs this compute thread no D2H sync.
         if getattr(self, "engram", None) is not None and not batch.is_dummy_run:
-            cur_req_ids = list(batch.req_ids)
-            cur_tokens = (
-                sampled_tokens.detach()
-                .reshape(len(cur_req_ids), -1)[:, -1]
-                .to("cpu", dtype=torch.int64)
-                .numpy()
-                .reshape(-1, 1)
-            )
-            self.engram.prefetch_next(cur_req_ids, cur_tokens)
+            self.engram.prefetch_next(list(batch.req_ids), sampled_tokens)
 
         draft_token_ids: np.ndarray | None = None
         if self.tokenID_processor.is_deferred_out:
