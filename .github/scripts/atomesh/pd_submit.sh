@@ -106,22 +106,18 @@ def q(value):
     return shlex.quote(str(shell_value(value)))
 
 slurm_submit_runner = runner.get("slurm_submit_runner", "atomesh-cicd")
+is_crusoe_v2 = slurm_submit_runner == "atomesh-cicd-mi355-crusoe"
 spur_controller_addr = runner.get("spur_controller_addr")
-crusoe_runner_labels = {
-    "atomesh-cicd-crusoe-mi355",
-    "atomesh-cicd-mi355-crusoe",
-}
-if slurm_submit_runner in crusoe_runner_labels:
-    default_spur_accounting_addr = "http://crs-m2m-cpu-spur-005.crusoe.amd.com:6819"
-else:
-    default_spur_accounting_addr = "http://134.199.196.72:6819"
-if not spur_controller_addr:
-    if slurm_submit_runner in crusoe_runner_labels:
-        spur_controller_addr = "http://crs-m2m-cpu-spur-005.crusoe.amd.com:6817"
-    else:
-        spur_controller_addr = os.environ.get(
-            "SPUR_CONTROLLER_ADDR", "http://134.199.196.72:6817"
-        )
+spur_accounting_addr = os.environ.get("SPUR_ACCOUNTING_ADDR", "")
+if is_crusoe_v2:
+    spur_controller_addr = "http://crs-m2m-cpu-spur-v2-001.crusoe.amd.com:6817"
+    spur_accounting_addr = os.environ.get("SPUR_V2_ACCOUNTING_ADDR") or (
+        "http://crs-m2m-cpu-spur-v2-001.crusoe.amd.com:6819"
+    )
+elif not spur_controller_addr:
+    spur_controller_addr = os.environ.get(
+        "SPUR_CONTROLLER_ADDR", "http://134.199.196.72:6817"
+    )
 
 exports = {
     "ATOMESH_CELL_ID": cell["id"],
@@ -255,17 +251,15 @@ exports = {
     "SWEBENCH_MAX_WORKERS": "" if accuracy.get("max_workers") is None else accuracy.get("max_workers"),
     "SWEBENCH_EVAL_TIMEOUT": "" if accuracy.get("instance_timeout") is None else accuracy.get("instance_timeout"),
     "SLURM_SUBMIT_RUNNER": slurm_submit_runner,
-    "SLURM_ACCOUNT": runner.get("slurm_account", "amd-frameworks"),
-    "SLURM_PARTITION": runner.get("slurm_partition", "amd-frameworks"),
+    "SLURM_ACCOUNT": "amd-aifw-dev" if is_crusoe_v2 else runner.get("slurm_account", "amd-frameworks"),
+    "SLURM_PARTITION": "" if is_crusoe_v2 else runner.get("slurm_partition", "amd-frameworks"),
+    "SLURM_QOS": "amd-aifw-dev-qos" if is_crusoe_v2 else "",
     "SLURM_CPUS_PER_TASK": runner.get("cpus_per_task", 114),
     "SLURM_GPUS_PER_NODE": runner.get("gpus_per_node", 8),
     "SLURM_TIME_LIMIT": runner.get("time_limit", "06:00:00"),
     "SLURM_LOG_ROOT": runner.get("log_root", "/it-share/ATOMESH_LOG/"),
     "SPUR_CONTROLLER_ADDR": spur_controller_addr,
-    "SPUR_ACCOUNTING_ADDR": runner.get(
-        "spur_accounting_addr",
-        os.environ.get("SPUR_ACCOUNTING_ADDR", default_spur_accounting_addr),
-    ),
+    "SPUR_ACCOUNTING_ADDR": spur_accounting_addr,
 }
 
 # server_args is mapped key by key above, so a key the mapping never read would
@@ -309,8 +303,10 @@ else
   export SLURM_ERROR="${LOG_ROOT}/slurm-%j.err"
 fi
 SLURM_LOG_POLL_INTERVAL="${SLURM_LOG_POLL_INTERVAL:-30}"
+SLURM_ACCOUNTING_TIMEOUT="${SLURM_ACCOUNTING_TIMEOUT:-180}"
+SLURM_ACCOUNTING_POLL_INTERVAL="${SLURM_ACCOUNTING_POLL_INTERVAL:-2}"
 USES_SPUR_CONTROLLER=0
-if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
+if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
   USES_SPUR_CONTROLLER=1
 fi
 
@@ -319,14 +315,14 @@ echo "cell=${ATOMESH_CELL_ID}"
 echo "model=${MODEL_NAME}"
 echo "topology=${DISPLAY_TOPOLOGY}"
 echo "nodes=${NODE_LIST}"
+echo "slurm_account=${SLURM_ACCOUNT:-default}"
+echo "slurm_partition=${SLURM_PARTITION:-default}"
+echo "slurm_qos=${SLURM_QOS:-default}"
 echo "isl=${ISL_LIST} osl=${OSL} concurrency=${CONC_LIST}"
 echo "slurm_job_name=${SLURM_JOB_NAME}"
 echo "log_root=${LOG_ROOT}"
 if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
   echo "spur_controller=${SPUR_CONTROLLER_ADDR}"
-fi
-if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
-  echo "spur_accounting=${SPUR_ACCOUNTING_ADDR}"
 fi
 
 mkdir -p "${RESULT_DIR}"
@@ -432,8 +428,8 @@ else
   if [[ -n "${SLURM_PARTITION}" ]]; then
     SBATCH_CMD+=(--partition "${SLURM_PARTITION}")
   fi
-  if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
-    SBATCH_CMD+=(-q amd-burst-qos --reservation=atomesh-ci)
+  if [[ -n "${SLURM_QOS}" ]]; then
+    SBATCH_CMD+=(--qos "${SLURM_QOS}")
   fi
   SBATCH_CMD+=(
     --nodes "${NUM_NODES}"
@@ -476,7 +472,10 @@ write_slurm_cancel_helper "${JOB_ID}"
 
 set_slurm_job_log_paths "${JOB_ID}"
 monitor_slurm_job "${JOB_ID}"
+
+# Fall back to published results if accounting has no final state.
 read_slurm_exit_code "${JOB_ID}"
+read_slurm_status_files "${LOG_ROOT}/slurm_job-${JOB_ID}" "${NUM_NODES}"
 SLURM_JOB_ACTIVE=0
 SBATCH_RC="${SLURM_JOB_RC}"
 echo "slurm_state=${SLURM_STATE}"
