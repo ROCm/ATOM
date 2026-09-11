@@ -403,6 +403,10 @@ models:
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c40
           concurrency: [40]
 
+        - <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c56
+          concurrency: [56]
+
         - &glm52_agentic_lmcache_tp4_dpa
           <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c24

@@ -61,8 +61,24 @@ enables `OFFLOAD_PROFILE=1` and `OFFLOAD_MIN_LOAD_TOKENS=0`.
 
 #### Start the PD Deployment
 
-Cold-start the deployment for each concurrency point. The commands below write
-`prefill.log`, `decode.log`, and `mesh.log` in the current directory:
+Cold-start the deployment for each concurrency point. Each script below is
+self-contained and can be run from a separate terminal. They write `prefill.log`,
+`decode.log`, and `mesh.log` in the current directory.
+
+Start prefill and decode first. **Do not start atomesh until both workers are
+ready** — otherwise the router may fail health checks or route traffic to servers
+that are still loading weights. After each worker starts, wait until its endpoint
+responds (model load can take several minutes):
+
+```bash
+curl -sf http://127.0.0.1:8010/v1/models   # prefill ready
+curl -sf http://127.0.0.1:8020/v1/models   # decode ready
+```
+
+If a curl fails, check the corresponding log (`prefill.log` or `decode.log`) and
+retry once the server is up.
+
+##### Start Prefill
 
 ```bash
 export MODEL_PATH=${MODEL_PATH:-amd/GLM-5.2-MXFP4}
@@ -83,26 +99,6 @@ export ATOM_HOST_IP=127.0.0.1
 export LD_LIBRARY_PATH="$(python3 -c \
   'import sysconfig; print(sysconfig.get_path("purelib"))')/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}"
 
-ONLINE_QUANT_CONFIG='{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}'
-PREFILL_KV_CONFIG='{"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"127.0.0.1","handshake_port":6301,"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}'
-DECODE_KV_CONFIG='{"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"127.0.0.1","handshake_port":6301,"protocol":"rdma"}'
-DECODE_CUDAGRAPH='[1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]'
-
-COMMON_ARGS=(
-  --model "${MODEL_PATH}"
-  --host 0.0.0.0
-  --trust-remote-code
-  --kv_cache_dtype fp8
-  --block-size 16
-  --gpu-memory-utilization 0.85
-  --max-num-seqs 512
-  --enable_prefix_caching
-  --online_quant_config "${ONLINE_QUANT_CONFIG}"
-  --level 3
-  --method mtp
-  --num-speculative-tokens 3
-)
-
 env \
   HIP_VISIBLE_DEVICES=0,1,2,3 \
   VLLM_PP_LAYER_PARTITION=20,20,20,18 \
@@ -112,44 +108,81 @@ env \
   OFFLOAD_PROFILE=1 \
   OFFLOAD_MIN_LOAD_TOKENS=0 \
   nohup python3 -m atom.entrypoints.openai_server \
-    "${COMMON_ARGS[@]}" \
+    --model "${MODEL_PATH}" \
+    --host 0.0.0.0 \
+    --trust-remote-code \
+    --kv_cache_dtype fp8 \
+    --block-size 16 \
+    --gpu-memory-utilization 0.85 \
+    --max-num-seqs 512 \
+    --enable_prefix_caching \
+    --online_quant_config \
+      '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}' \
+    --level 3 \
+    --method mtp \
+    --num-speculative-tokens 3 \
     --server-port 8010 \
     --tensor-parallel-size 1 \
     --pipeline-parallel-size 4 \
     --enforce-eager \
     --max-num-batched-tokens 8192 \
-    --kv-transfer-config "${PREFILL_KV_CONFIG}" \
+    --kv-transfer-config \
+      '{"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"127.0.0.1","handshake_port":6301,"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}' \
     >prefill.log 2>&1 &
-PREFILL_PID=$!
+```
+
+##### Start Decode
+
+```bash
+export MODEL_PATH=${MODEL_PATH:-amd/GLM-5.2-MXFP4}
+
+export PYTHONUNBUFFERED=1
+export PYTHONHASHSEED=0
+export AITER_LOG_LEVEL=WARNING
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
+export ATOM_MLA_PAGE_SIZE=1
+export ATOM_ONLINE_QUANT_STREAMING=0
+export ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB=2047
+export ATOM_USE_TRITON_MLA=0
+export MAX_JOBS=16
+export ATOM_HOST_IP=127.0.0.1
+export LD_LIBRARY_PATH="$(python3 -c \
+  'import sysconfig; print(sysconfig.get_path("purelib"))')/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}"
 
 env \
   HIP_VISIBLE_DEVICES=4,5,6,7 \
   nohup python3 -m atom.entrypoints.openai_server \
-    "${COMMON_ARGS[@]}" \
+    --model "${MODEL_PATH}" \
+    --host 0.0.0.0 \
+    --trust-remote-code \
+    --kv_cache_dtype fp8 \
+    --block-size 16 \
+    --gpu-memory-utilization 0.85 \
+    --max-num-seqs 512 \
+    --enable_prefix_caching \
+    --online_quant_config \
+      '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}' \
+    --level 3 \
+    --method mtp \
+    --num-speculative-tokens 3 \
     --server-port 8020 \
     --tensor-parallel-size 4 \
     --decode-context-parallel-size 4 \
     --cudagraph-mode FULL \
-    --cudagraph-capture-sizes "${DECODE_CUDAGRAPH}" \
-    --kv-transfer-config "${DECODE_KV_CONFIG}" \
+    --cudagraph-capture-sizes \
+      '[1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]' \
+    --kv-transfer-config \
+      '{"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"127.0.0.1","handshake_port":6301,"protocol":"rdma"}' \
     >decode.log 2>&1 &
-DECODE_PID=$!
+```
 
-wait_ready() {
-  local name=$1 port=$2 pid=$3 log=$4
-  until curl -sf "http://127.0.0.1:${port}/v1/models" >/dev/null; do
-    kill -0 "${pid}" 2>/dev/null || {
-      echo "${name} failed; see ${log}" >&2
-      tail -100 "${log}" >&2
-      return 1
-    }
-    sleep 10
-  done
-}
+##### Start ATOMesh
 
-wait_ready prefill 8010 "${PREFILL_PID}" prefill.log
-wait_ready decode 8020 "${DECODE_PID}" decode.log
+Run this only after both prefill (`:8010`) and decode (`:8020`) pass the curl checks
+above.
 
+```bash
 nohup atomesh launch \
   --host 0.0.0.0 \
   --port 8000 \
@@ -162,9 +195,6 @@ nohup atomesh launch \
   --disable-circuit-breaker \
   --prometheus-port 29100 \
   >mesh.log 2>&1 &
-MESH_PID=$!
-
-wait_ready mesh 8000 "${MESH_PID}" mesh.log
 ```
 
 ### PD Mixed Deployment (Standalone)
