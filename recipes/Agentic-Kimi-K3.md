@@ -126,6 +126,7 @@ export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_SITUV2_A4W4=1
 export AITER_FLYDSL_STAGE2_FP8=1
 export ATOM_STATE_CHECKPOINT_DEMAND=0
+export ATOM_GDN_SSM_DTYPE="${ATOM_GDN_SSM_DTYPE:-fp16}"
 export PYTHONNOUSERSITE=1
 
 ONLINE_QUANT_CONFIG='{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*"]}'
