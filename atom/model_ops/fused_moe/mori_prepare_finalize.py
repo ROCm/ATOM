@@ -183,8 +183,9 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         is_async: bool = False,
         tbo_mori_ops: list | None = None,
         low_latency: bool = False,
-        dispatch_quantizer: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
-        | None = None,
+        dispatch_quantizer: (
+            Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]] | None
+        ) = None,
         fixed_dispatch_config: tuple[int, int] | None = None,
     ):
         if not MORI_AVAILABLE:
@@ -291,9 +292,9 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         - Optional dispatched expert topk IDs
         - Optional dispatched expert topk weight
         """
-        assert not apply_router_weight_on_input, (
-            "mori does not support apply_router_weight_on_input=True now."
-        )
+        assert (
+            not apply_router_weight_on_input
+        ), "mori does not support apply_router_weight_on_input=True now."
         # EpDispatchCombineOp requires FP32 routing weights and contiguous INT32
         # global expert IDs. Normalize at the shared MORI boundary so every
         # transport, including WideEP, uses the same prepare implementation.
@@ -371,9 +372,9 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
     ) -> mk.ReceiverType:
-        assert not apply_router_weight_on_input, (
-            "mori does not support apply_router_weight_on_input=True now."
-        )
+        assert (
+            not apply_router_weight_on_input
+        ), "mori does not support apply_router_weight_on_input=True now."
 
         scale = None
         if self.use_fp4_dispatch:

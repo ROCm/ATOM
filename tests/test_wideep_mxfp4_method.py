@@ -99,7 +99,7 @@ def test_wideep_reuses_mori_prepare_finalize_around_fused_moe(monkeypatch):
     recv_weights = torch.randn(8, 2, dtype=torch.float32)
     recv_ids = torch.zeros(8, 2, dtype=torch.int32)
     recv_count = torch.tensor([5], dtype=torch.int32)
-    fused_output = torch.full((8, 4), 7, dtype=torch.bfloat16)
+    fused_output = torch.full((3, 4), 7, dtype=torch.bfloat16)
     combined = torch.full((3, 4), 9, dtype=torch.bfloat16)
     calls = {}
 
@@ -128,7 +128,9 @@ def test_wideep_reuses_mori_prepare_finalize_around_fused_moe(monkeypatch):
     monkeypatch.setattr(
         modular_kernel,
         "get_forward_context",
-        lambda: SimpleNamespace(context=None),
+        lambda: SimpleNamespace(
+            context=SimpleNamespace(running_tokens_across_dp=(1, 2))
+        ),
     )
 
     def fake_fused_moe(*args, **kwargs):
@@ -175,9 +177,10 @@ def test_wideep_reuses_mori_prepare_finalize_around_fused_moe(monkeypatch):
     assert dispatch[4:] == (96, 8)
 
     args, kwargs = calls["fused_moe"]
-    assert args[0] is recv_x
-    assert args[3] is recv_weights
-    assert args[4] is recv_ids
+    assert args[0].shape[0] == 3
+    assert torch.equal(args[0], recv_x[:3])
+    assert torch.equal(args[3], recv_weights[:3])
+    assert torch.equal(args[4], recv_ids[:3])
     assert args[5] is expert_mask
     assert kwargs["a1_scale"] is recv_scale
     assert kwargs["num_local_tokens"] is recv_count
