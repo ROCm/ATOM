@@ -226,6 +226,47 @@ def test_minimax_m3_model_type_routes_to_m3():
     assert offcfg.select_offload_layout(config) == "m3"
 
 
+@pytest.mark.parametrize("override", ["dense", "hybrid", "kimi_k3"])
+def test_minimax_m3_rejects_incompatible_layout_override(override):
+    config = _config()
+    config.hf_config.compress_ratios = None
+    config.hf_config.model_type = "minimax_m3"
+    config.kv_transfer_config = {"offload_layout": override}
+
+    with pytest.raises(ValueError, match="MiniMax-M3 requires offload_layout='m3'"):
+        offcfg.select_offload_layout(config)
+
+
+def test_minimax_m3_accepts_explicit_m3_layout():
+    config = _config()
+    config.hf_config.compress_ratios = None
+    config.hf_config.model_type = "minimax_m3"
+    config.kv_transfer_config = {"offload_layout": "m3"}
+
+    assert offcfg.select_offload_layout(config) == "m3"
+
+
+def test_minimax_m3_is_detected_by_nested_text_config_model_type():
+    config = _config()
+    config.hf_config.compress_ratios = None
+    config.hf_config.model_type = "multimodal_wrapper"
+    config.hf_config.text_config = SimpleNamespace(model_type="minimax_m3")
+
+    assert offcfg.select_offload_layout(config) == "m3"
+
+
+def test_minimax_m3_is_detected_by_nested_text_config_architecture():
+    config = _config()
+    config.hf_config.compress_ratios = None
+    config.hf_config.model_type = "multimodal_wrapper"
+    config.hf_config.text_config = SimpleNamespace(
+        model_type="minimax_text_01",
+        architectures=["MiniMaxM3ForCausalLM"],
+    )
+
+    assert offcfg.select_offload_layout(config) == "m3"
+
+
 def test_minimax_m3_is_detected_by_architecture_name():
     # M3 is identified by architecture name, not a model_type family, so the
     # arch-name path must route to "m3" from the architectures list even when

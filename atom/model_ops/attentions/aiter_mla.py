@@ -27,6 +27,15 @@ from atom.distributed.pcp_utils import (
     pcp_pad_len,
     pcp_round_robin_query_indices,
 )
+from atom.kv_transfer.disaggregation.index_staging import (
+    gather_dcp_preshuffled_index_pages,
+    prepare_dcp_index_gather_indices,
+)
+from atom.kv_transfer.disaggregation.pd_producer import (
+    index_staging_pool_size as _index_staging_pool_size,
+)
+from atom.kv_transfer.disaggregation.pd_producer import mooncake_pd_producer_configured
+from atom.kv_transfer.disaggregation.sharded_transfer import DCPShardPlan
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import (
     _MLA_MIN_HEADS,
@@ -1184,6 +1193,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             **indexer,
         )
 
+    def _supports_dcp_index_staging(self) -> bool:
+        """Whether producer index pages can be gathered into DCP consumer pages.
+
+        The gather reconstructs scheduler-block MFMA tiles from token-granular
+        physical pages. Hybrid KDA builders whose index cache is already
+        scheduler-block indexed (and may compress tokens) override this.
+        """
+        return True
+
     def allocate_kv_cache_tensors(self, *, blocks: int, buf) -> dict:
         """Allocate this model's MLA pool inside the runner's paged region.
 
@@ -1262,6 +1280,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
     def get_kv_transfer_tensors(self):
         from atom.kv_transfer.disaggregation.types import (
+            INDEX_CACHE_ROLE,
+            MLA_KV_ROLE,
             KVTransferRegion,
             KVTransferTensors,
         )
@@ -1273,19 +1293,38 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # hybrid caches for fewer layers than the model has, and the consumer
         # indices below are positions in the allocated rows.
         num_layers = self.kv_pool.layers
+        index_tensors: list[torch.Tensor] = []
+        index_head_dim = getattr(runner.config.hf_config, "index_head_dim", None)
 
         # A row of each is one scheduler block, so `stride(0)` is already the
         # bytes a transfer moves per block -- no `block_ratio` after the fact,
         # and no per-field override to keep in step with the pooling ones.
-        block_regions = [
-            KVTransferRegion(
-                base_addr=t.data_ptr(),
-                total_bytes=t.numel() * t.element_size(),
-                unit_bytes=t.stride(0) * t.element_size(),
-                semantic_role=f"mla.{role}",
+        # DCP PD still dispatches on the two collapsed roles (`mla.kv` /
+        # `dsa.index_cache`) rather than the pool's per-layer names.
+        block_regions: list[KVTransferRegion] = []
+        for role, t in self.kv_pool.region_tensors():
+            bpb = t.stride(0) * t.element_size()
+            if role.startswith("index."):
+                block_regions.append(
+                    KVTransferRegion(
+                        base_addr=t.data_ptr(),
+                        total_bytes=t.numel() * t.element_size(),
+                        unit_bytes=bpb,
+                        semantic_role=INDEX_CACHE_ROLE,
+                    )
+                )
+                index_tensors.append(t)
+                continue
+            block_regions.append(
+                KVTransferRegion(
+                    base_addr=t.data_ptr(),
+                    total_bytes=t.numel() * t.element_size(),
+                    unit_bytes=bpb,
+                    semantic_role=(
+                        MLA_KV_ROLE if role.startswith("kv.") else f"mla.{role}"
+                    ),
+                )
             )
-            for role, t in self.kv_pool.region_tensors()
-        ]
 
         block_region_consumer_indices = None
         index_cache_layer_ids = getattr(runner, "index_cache_layer_ids", ())
@@ -1379,10 +1418,82 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 for layer_id in local_index_layer_ids
             ]
 
+        index_staging_region = None
+        index_staging_pool_size = 0
+        index_staging_chunk_pages = 0
+        prepare_sharded_index = None
+        gather_sharded_index = None
+        if (
+            index_tensors
+            and self.dcp_world_size == 1
+            and mooncake_pd_producer_configured(runner.config)
+            and self._supports_dcp_index_staging()
+        ):
+            # A Mooncake P/D producer can receive requests from a DCP
+            # consumer whose index cache is sharded below one MFMA tile. Keep a
+            # small per-send-thread pool that repacks one index layer at a time;
+            # latent MLA pages continue to transfer directly.
+            scheduler_block_size = runner.config.kv_cache_block_size
+            if scheduler_block_size % 16:
+                raise RuntimeError(
+                    "Preshuffled DSA index P/D staging requires "
+                    "kv_cache_block_size divisible by 16, got "
+                    f"{scheduler_block_size}"
+                )
+            index_staging_pool_size = _index_staging_pool_size(runner.config)
+            index_staging_chunk_pages = 256
+            first_index_page = index_tensors[0]
+            page_bytes = first_index_page.stride(0) * first_index_page.element_size()
+            staging = torch.empty(
+                (
+                    index_staging_pool_size,
+                    index_staging_chunk_pages,
+                    page_bytes,
+                ),
+                dtype=torch.uint8,
+                device=first_index_page.device,
+            )
+            index_staging_region = KVTransferRegion(
+                base_addr=staging.data_ptr(),
+                total_bytes=staging.numel() * staging.element_size(),
+                unit_bytes=index_staging_chunk_pages * page_bytes,
+                semantic_role="dsa.index_staging",
+            )
+
+            def prepare_sharded_index(plan: DCPShardPlan):
+                return prepare_dcp_index_gather_indices(plan, first_index_page.device)
+
+            def gather_sharded_index(
+                region_idx,
+                indices,
+                pool_idx,
+            ):
+                index_region_idx = region_idx - num_layers
+                if not 0 <= index_region_idx < len(index_tensors):
+                    raise IndexError(
+                        f"Index region {region_idx} maps to invalid cache row "
+                        f"{index_region_idx}"
+                    )
+                slot = staging[pool_idx]
+                pages = gather_dcp_preshuffled_index_pages(
+                    index_tensors[index_region_idx],
+                    slot,
+                    indices,
+                    index_head_dim,
+                    runner.config.kv_cache_block_size,
+                    1,
+                )
+                return slot.data_ptr(), pages
+
         return KVTransferTensors(
             block_regions=block_regions,
             slot_regions=[],
             block_region_consumer_indices=block_region_consumer_indices,
+            index_staging_region=index_staging_region,
+            index_staging_pool_size=index_staging_pool_size,
+            index_staging_chunk_pages=index_staging_chunk_pages,
+            prepare_sharded_index=prepare_sharded_index,
+            gather_sharded_index=gather_sharded_index,
         )
 
     def _build_dcp_indexer_prefill_meta(self, attn_metadata, bs: int, counts, var):
