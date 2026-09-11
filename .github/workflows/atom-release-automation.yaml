@@ -1,0 +1,227 @@
+name: ATOM Release Automation
+
+# The release cadence, kept apart from the workflow that does the building,
+# the way aiter splits release-automation.yaml from aiter-release.yaml.
+# This one decides *whether* and *what* to release; atom-release.yaml builds
+# whatever it is handed.
+#
+# Cadence: GitHub cron cannot say "every 14 days", so this fires weekly and
+# gates on a fixed 14-day grid anchored at RELEASE_CADENCE_ANCHOR -- the same
+# trick aiter uses. The anchor sits one week off aiter's (2026-08-31) so ATOM
+# releases land in the week *after* an aiter release: ATOM ships aiter inside
+# its image, and a release that cannot pick up the aiter it was meant to carry
+# is not worth much.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'     # Mondays 06:00 UTC; the gate below keeps every other one
+
+  push:
+    tags:
+      - 'v*'
+
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Tag to release. Empty derives the next one from main (v0.1.6 -> v0.1.7).'
+        required: false
+        type: string
+      release_branch:
+        description: 'Release branch. Empty uses release/<base-tag>.'
+        required: false
+        type: string
+      release_ref:
+        description: 'Source ref for a new release branch/tag.'
+        required: false
+        type: string
+        default: main
+      create_missing_refs:
+        description: 'Create the branch/tag when missing. Post releases must already exist.'
+        type: boolean
+        default: true
+      skip_biweekly_gate:
+        description: 'Manual testing only: ignore the every-two-week gate.'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.inputs.release_tag || github.ref_name || 'scheduled' }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Resolve release target
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.resolve.outputs.should_run }}
+      skip_reason: ${{ steps.resolve.outputs.skip_reason }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      release_branch: ${{ steps.resolve.outputs.release_branch }}
+    steps:
+      - name: Generate release app token
+        id: release_app_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.ATOM_CI_APP_ID }}
+          private-key: ${{ secrets.ATOM_CI_APP_PRIVATE_KEY }}
+          owner: ROCm
+          repositories: ATOM
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.release_app_token.outputs.token }}
+          fetch-depth: 0
+
+      - name: Resolve release target
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_RELEASE_TAG: ${{ github.event.inputs.release_tag || '' }}
+          INPUT_RELEASE_BRANCH: ${{ github.event.inputs.release_branch || '' }}
+          INPUT_RELEASE_REF: ${{ github.event.inputs.release_ref || 'main' }}
+          CREATE_MISSING_REFS: ${{ github.event.inputs.create_missing_refs || true }}
+          SKIP_BIWEEKLY_GATE: ${{ github.event.inputs.skip_biweekly_gate || false }}
+          RELEASE_CADENCE_ANCHOR: '2026-09-07'
+        run: |
+          set -euo pipefail
+
+          should_run=true
+          skip_reason=""
+
+          if [ "${EVENT_NAME}" = "schedule" ] && [ "${SKIP_BIWEEKLY_GATE}" != "true" ]; then
+            anchor_seconds="$(date -u -d "${RELEASE_CADENCE_ANCHOR}" +%s)"
+            today_seconds="$(date -u -d "$(date -u +%Y-%m-%d)" +%s)"
+            if [ $(( ((today_seconds - anchor_seconds) / 86400) % 14 )) -ne 0 ]; then
+              should_run=false
+              skip_reason="Off the 14-day cadence anchored at ${RELEASE_CADENCE_ANCHOR}."
+            fi
+          fi
+
+          if [ "${should_run}" != "true" ]; then
+            {
+              echo "should_run=false"
+              echo "skip_reason=${skip_reason}"
+              echo "release_tag="
+              echo "release_branch="
+            } >> "${GITHUB_OUTPUT}"
+            echo "- Skipped: ${skip_reason}" >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          git fetch --force --tags origin
+          git fetch --force origin '+refs/heads/*:refs/remotes/origin/*'
+
+          # Only vX.Y.Z counts as a base for "the next one": pre-release tags
+          # such as v0.1.6-rc0 must not make the automation skip a version.
+          latest_stable_tag="$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)"
+
+          if [ "${EVENT_NAME}" = "push" ]; then
+            release_tag="${REF_NAME}"
+          elif [ -n "${INPUT_RELEASE_TAG}" ]; then
+            release_tag="${INPUT_RELEASE_TAG}"
+          else
+            if [ -z "${latest_stable_tag}" ]; then
+              echo "No vX.Y.Z tag to count from."; exit 1
+            fi
+            IFS=. read -r major minor patch <<< "${latest_stable_tag#v}"
+            release_tag="v${major}.${minor}.$((patch + 1))"
+          fi
+
+          if [[ ! "${release_tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(\.post[0-9]+)?$ ]]; then
+            echo "Invalid release tag: ${release_tag}. Expected vX.Y.Z or vX.Y.Z.postN."
+            exit 1
+          fi
+
+          release_kind=scheduled
+          if [[ "${release_tag}" =~ \.post[0-9]+$ ]]; then release_kind=post; fi
+
+          base_tag="${release_tag%%.post*}"
+          release_branch="${INPUT_RELEASE_BRANCH:-release/${base_tag}}"
+
+          branch_exists=false
+          git show-ref --verify --quiet "refs/remotes/origin/${release_branch}" && branch_exists=true
+          tag_exists=false
+          git rev-parse -q --verify "refs/tags/${release_tag}^{commit}" >/dev/null && tag_exists=true
+
+          # A .postN is a fix on something already released; it must not bring
+          # its own branch or tag into being.
+          if [ "${release_kind}" = "post" ] && { [ "${branch_exists}" != "true" ] || [ "${tag_exists}" != "true" ]; }; then
+            echo "Post release ${release_tag} must already exist on ${release_branch}."
+            exit 1
+          fi
+
+          if [ "${release_kind}" = "scheduled" ] && [ "${EVENT_NAME}" != "push" ] && [ "${CREATE_MISSING_REFS}" = "true" ]; then
+            target_commit="$(git rev-parse "refs/remotes/origin/${INPUT_RELEASE_REF}^{commit}" 2>/dev/null \
+              || git rev-parse "${INPUT_RELEASE_REF}^{commit}")"
+            if [ "${branch_exists}" != "true" ]; then
+              git branch "${release_branch}" "${target_commit}"
+              git push origin "refs/heads/${release_branch}"
+              git fetch --force origin "refs/heads/${release_branch}:refs/remotes/origin/${release_branch}"
+              branch_exists=true
+            fi
+            if [ "${tag_exists}" != "true" ]; then
+              git tag "${release_tag}" "$(git rev-parse "refs/remotes/origin/${release_branch}^{commit}")"
+              git push origin "refs/tags/${release_tag}"
+              tag_exists=true
+            fi
+          fi
+
+          [ "${branch_exists}" = "true" ] || { echo "Missing release branch: ${release_branch}"; exit 1; }
+          [ "${tag_exists}" = "true" ]    || { echo "Missing release tag: ${release_tag}"; exit 1; }
+
+          {
+            echo "should_run=true"
+            echo "skip_reason="
+            echo "release_tag=${release_tag}"
+            echo "release_branch=${release_branch}"
+          } >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "## Release target"
+            echo "- Tag: ${release_tag}"
+            echo "- Branch: ${release_branch}"
+            echo "- Previous stable: ${latest_stable_tag:-none}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  build:
+    name: Build and publish the wheels
+    needs: prepare
+    if: ${{ needs.prepare.outputs.should_run == 'true' }}
+    uses: ./.github/workflows/atom-release.yaml
+    secrets: inherit
+    with:
+      commit: ${{ needs.prepare.outputs.release_tag }}
+      flavors: both
+
+  verify:
+    name: Verify the release carries every flavor
+    needs: [prepare, build]
+    if: ${{ needs.prepare.outputs.should_run == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          # One tag carries one wheel per ROCm line. A release holding only
+          # half the set is the failure this check exists to catch: it looks
+          # complete from the outside, and whoever pulls the missing flavor
+          # silently gets the other one's version instead.
+          assets="$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name')"
+          echo "${assets}"
+          missing=""
+          for flavor in rocm7 rocm10; do
+            echo "${assets}" | grep -q "+${flavor}" || missing="${missing} ${flavor}"
+          done
+          if [ -n "${missing}" ]; then
+            echo "Release ${RELEASE_TAG} is missing a wheel for:${missing}"
+            exit 1
+          fi
+          echo "Release ${RELEASE_TAG} carries every flavor."
