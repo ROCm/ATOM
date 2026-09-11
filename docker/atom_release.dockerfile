@@ -199,8 +199,9 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         && rm -rf /app/mooncake/build /app/mooncake/.git; \
     fi
 
-# Runtime: do not set MOONCAKE_DISABLE_HIP_DMABUF (any non-0 forces ibv_reg_mr).
-ENV MOONCAKE_DISABLE_HIP_DMABUF=0
+# Default to ibv_reg_mr; set MOONCAKE_DISABLE_HIP_DMABUF=0 at runtime to opt in
+# to HIP dma-buf when Mooncake was built with USE_HIP_DMABUF=ON.
+ENV MOONCAKE_DISABLE_HIP_DMABUF=1
 
 # ========== Install Rust toolchain ==========
 ARG RUST_VERSION="1.94.0"
