@@ -165,6 +165,7 @@ def _builder(
             ),
         ),
         block_size=16,
+        aligned_index_dim=(index_head_dim + 4 + 15) // 16 * 16,
         has_mla_indexer=True,
         # The rows are the MLA modules this stage holds, target and shared
         # draft alike, so the fixture supplies a tree rather than a count.
@@ -174,6 +175,7 @@ def _builder(
     )
     builder = object.__new__(AiterMLAMetadataBuilder)
     builder.model_runner = runner
+    builder.dcp_world_size = 1
     builder.invalidate_pool_rows()
     return builder, runner
 

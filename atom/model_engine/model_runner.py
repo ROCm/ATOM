@@ -3136,6 +3136,27 @@ class ModelRunner:
             dspark_ell=dspark_ell,
         )
 
+    def _record_kv_cache_ready(self, batch: ScheduledBatch) -> None:
+        """Publish a GPU event for final prefill chunks to transfer connectors."""
+        if batch.total_seqs_num_prefill <= 0:
+            return
+        if batch.is_final_chunk is None:
+            req_ids = batch.req_ids
+        else:
+            req_ids = [
+                req_id
+                for req_id, is_final in zip(
+                    batch.req_ids, batch.is_final_chunk, strict=True
+                )
+                if is_final
+            ]
+        if not req_ids:
+            return
+        connector = get_kvconnector()
+        callback = getattr(connector, "record_kv_cache_ready", None)
+        if callable(callback):
+            callback(req_ids)
+
     @torch.inference_mode()
     @with_eplb_forward_monitor
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
@@ -3206,6 +3227,7 @@ class ModelRunner:
             reset_forward_context()
             # Mark this slot's GPU work (attention consumed its metadata) done.
             self._record_forward_vars_event()
+            self._record_kv_cache_ready(batch)
             return ScheduledBatchOutput(
                 req_ids=list(batch.req_ids),
                 token_ids=[],
@@ -3227,6 +3249,7 @@ class ModelRunner:
 
         reset_forward_context()
         self._record_forward_vars_event()
+        self._record_kv_cache_ready(batch)
         return fwd_output
 
     @staticmethod
@@ -4555,5 +4578,6 @@ class RapidServeModelRunner(ModelRunner):
             sampled_cpu = sampled.view(-1).tolist()
         # Synchronize so decode's default stream sees all KV writes.
         stream.synchronize()
+        self._record_kv_cache_ready(batch)
         reset_forward_context()
         return sampled_cpu

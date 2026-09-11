@@ -9,12 +9,14 @@ functions and response builders.
 """
 
 import ast
+import asyncio
 import json
 import pathlib
 
 import pytest
 
 from atom.entrypoints.openai import api_server
+from atom.entrypoints.openai.protocol import ChatMessage
 from atom.entrypoints.openai.reasoning import separate_reasoning
 from atom.entrypoints.openai.serving_anthropic import (
     AnthropicMessage,
@@ -84,6 +86,54 @@ class TestAnthropicToOpenAIMessages:
         ]
         result = anthropic_to_openai_messages(msgs)
         assert result[1] == {"role": "assistant", "content": "Hello!"}
+
+    def test_assistant_thinking_is_preserved_for_multi_turn_history(self):
+        msgs = [
+            AnthropicMessage(role="user", content="Solve this carefully."),
+            AnthropicMessage(
+                role="assistant",
+                content=[
+                    {
+                        "type": "thinking",
+                        "thinking": "First inspect the constraints.",
+                        "signature": "opaque-signature",
+                    },
+                    {"type": "text", "text": "The answer is 42."},
+                ],
+            ),
+            AnthropicMessage(role="user", content="Why?"),
+        ]
+
+        result = anthropic_to_openai_messages(msgs)
+
+        assert result[1] == {
+            "role": "assistant",
+            "content": "The answer is 42.",
+            "reasoning_content": "First inspect the constraints.",
+        }
+        assert ChatMessage(**result[1]).to_template_dict() == result[1]
+
+    def test_assistant_thinking_only_is_not_converted_to_empty_history(self):
+        msgs = [
+            AnthropicMessage(
+                role="assistant",
+                content=[
+                    {
+                        "type": "thinking",
+                        "thinking": "Work still in progress.",
+                        "signature": "opaque-signature",
+                    }
+                ],
+            )
+        ]
+
+        result = anthropic_to_openai_messages(msgs)
+
+        assert result[0] == {
+            "role": "assistant",
+            "content": None,
+            "reasoning_content": "Work still in progress.",
+        }
 
     def test_assistant_with_tool_use(self):
         msgs = [
@@ -490,6 +540,23 @@ class TestAnthropicMessagesRequest:
         assert req.stream is True
         assert req.stop_sequences == ["STOP"]
         assert len(req.tools) == 1
+
+    @pytest.mark.parametrize("value", [-5, -1, 0])
+    def test_non_positive_max_tokens_returns_invalid_request(self, value):
+        request = AnthropicMessagesRequest(
+            model="test",
+            messages=[AnthropicMessage(role="user", content="Hi")],
+            max_tokens=value,
+        )
+
+        response = asyncio.run(api_server.anthropic_messages(request, None))
+        body = json.loads(response.body)
+
+        assert response.status_code == 400
+        assert body["error"]["type"] == "invalid_request_error"
+        assert body["error"]["message"] == (
+            f"max_tokens must be at least 1, got {value}"
+        )
 
     def test_attribution_header_stripped(self):
         system = [

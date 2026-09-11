@@ -198,6 +198,37 @@ class TestChatCompletionRequest:
         assert req.max_tokens == 32
         assert req.get_max_tokens() == 32
 
+    @pytest.mark.parametrize("value", [-5, -1, 0])
+    def test_non_positive_max_tokens_rejected(self, value):
+        req = ChatCompletionRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": value,
+            }
+        )
+        with pytest.raises(ValueError, match="max_tokens must be at least 1"):
+            req.get_max_tokens()
+
+    @pytest.mark.parametrize("value", [-5, -1, 0])
+    def test_non_positive_max_completion_tokens_rejected(self, value):
+        req = ChatCompletionRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_completion_tokens": value,
+            }
+        )
+        with pytest.raises(ValueError, match="max_tokens must be at least 1"):
+            req.get_max_tokens()
+
+    def test_max_tokens_of_one_allowed(self):
+        req = ChatCompletionRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 1,
+            }
+        )
+        assert req.get_max_tokens() == 1
+
     def test_n_greater_than_one(self):
         req = ChatCompletionRequest.model_validate(
             {
@@ -264,6 +295,13 @@ class TestCompletionRequest:
         assert req.max_tokens == 8192
         assert req.max_completion_tokens == 16
         assert req.get_max_tokens() == 16
+
+    @pytest.mark.parametrize("field", ["max_tokens", "max_completion_tokens"])
+    @pytest.mark.parametrize("value", [-5, -1, 0])
+    def test_non_positive_max_tokens_rejected(self, field, value):
+        req = CompletionRequest.model_validate({"prompt": "Hello world", field: value})
+        with pytest.raises(ValueError, match="max_tokens must be at least 1"):
+            req.get_max_tokens()
 
     def test_extra_fields_ignored(self):
         req = CompletionRequest.model_validate(

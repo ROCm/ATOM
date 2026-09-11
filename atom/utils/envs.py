@@ -23,6 +23,11 @@ from collections.abc import Callable
 from typing import Any
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Protect reused KV prefixes from one-off prefill scans. Opt-in.
+    "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
+    "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
+        os.getenv("ATOM_PREFIX_CACHE_PROTECTED_RATIO", "0.5")
+    ),
     # --- Data Parallelism ---
     "ATOM_DP_RANK": lambda: int(os.getenv("ATOM_DP_RANK", "0")),
     "ATOM_DP_RANK_LOCAL": lambda: int(os.getenv("ATOM_DP_RANK_LOCAL", "0")),
@@ -106,6 +111,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSED_COMPRESS_USE_FLYDSL": lambda: os.getenv(
         "ATOM_FUSED_COMPRESS_USE_FLYDSL", "auto"
     ).lower(),
+    # gather_kv_b_proj (the MLA cached-prefix expansion): swap the Triton op for
+    # the flydsl a8w8 gather-GEMM. Added 2026-09-09.
+    "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ": lambda: (
+        os.getenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "1") == "1"
+    ),
     # QK-norm-rope-cache-quant fusion for Qwen3 dense and MoE; disabled by default.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"
