@@ -659,8 +659,13 @@ class EngramHost:
                 cpu[row].copy_(value.reshape(-1)[: self.embed_width])
 
         if self.copy_stream is not None:
+            # Capture the compute stream BEFORE entering the copy_stream context:
+            # inside it `current_stream()` would return copy_stream, making the
+            # wait a no-op self-wait that fails to order the H2D after the
+            # previous forward's reads of these buffers.
+            compute_stream = torch.cuda.current_stream(self.device)
             with torch.cuda.stream(self.copy_stream):
-                self.copy_stream.wait_stream(torch.cuda.current_stream(self.device))
+                self.copy_stream.wait_stream(compute_stream)
                 for buffer in self.buffers.values():
                     buffer.copy_to_gpu(num_rows)
                 self.copy_done.record(self.copy_stream)
@@ -682,8 +687,13 @@ class EngramHost:
         for buffer in self.buffers.values():
             buffer.cpu[:num_rows].zero_()
         if self.copy_stream is not None:
+            # Capture the compute stream BEFORE entering the copy_stream context:
+            # inside it `current_stream()` would return copy_stream, making the
+            # wait a no-op self-wait that fails to order the H2D after the
+            # previous forward's reads of these buffers.
+            compute_stream = torch.cuda.current_stream(self.device)
             with torch.cuda.stream(self.copy_stream):
-                self.copy_stream.wait_stream(torch.cuda.current_stream(self.device))
+                self.copy_stream.wait_stream(compute_stream)
                 for buffer in self.buffers.values():
                     buffer.copy_to_gpu(num_rows)
                 self.copy_done.record(self.copy_stream)
