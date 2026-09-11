@@ -175,7 +175,9 @@ class CompressedTokenizer:
     def _build(self) -> tuple[np.ndarray, int]:
         from tokenizers import Regex, normalizers
 
-        sentinel = ""
+        # U+E000: a Private Use Area sentinel that cannot occur in real token
+        # text, used to shield a lone-space token from Strip() (restored below).
+        sentinel = chr(0xE000)
         normalizer = normalizers.Sequence(
             [
                 normalizers.NFKC(),
