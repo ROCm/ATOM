@@ -230,6 +230,10 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         callback = getattr(self._impl, "reclaim_stale_leases", None)
         return callback(timeout_s) if callback is not None else []
 
+    @property
+    def requires_save_retirement(self) -> bool:
+        return bool(getattr(self._impl, "requires_save_retirement", False))
+
     def record_early_release(self, count: int) -> None:
         callback = getattr(self._impl, "record_early_release", None)
         if callback is not None:

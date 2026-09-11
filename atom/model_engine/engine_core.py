@@ -131,6 +131,7 @@ class EngineCore:
             self._post_model_load_hook()
             block_info = self.runner_mgr.call_func("get_num_blocks", wait_out=True)
             num_blocks = block_info["num_kvcache_blocks"]
+            config.kv_cache_block_bytes = int(block_info.get("kv_cache_block_bytes", 0))
             # Sizing happens in the runner subprocess, so nothing it wrote to
             # its own `config` is visible here. Carry the per-class entry table
             # across; BlockManager (built in Scheduler below) and the

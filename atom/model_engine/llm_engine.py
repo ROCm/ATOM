@@ -570,11 +570,26 @@ class LLMEngine:
             "saved_tokens",
             "loads_pending",
             "saves_pending",
+            "save_ops_admitted",
+            "save_tokens_admitted",
+            "save_ops_dropped",
+            "save_tokens_dropped",
+            "save_cancel_requests",
+            "save_ops_unretired",
+            "save_pending_bytes",
+            "source_blocks_reserved",
+            "source_blocks_leased",
         )
         offload_totals = {
             key: sum(int(stats.get(key, 0)) for stats in offload_rank_stats)
             for key in offload_keys
         }
+        # Ages share a wall-clock unit across independent DP schedulers. The
+        # oldest outstanding operation is their maximum, not a sum of ages.
+        offload_totals["save_oldest_age_ms"] = max(
+            (float(stats.get("save_oldest_age_ms", 0)) for stats in offload_rank_stats),
+            default=0.0,
+        )
 
         return {
             "enabled": bool(rank_stats),

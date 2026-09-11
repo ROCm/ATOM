@@ -24,6 +24,7 @@ from atom.kv_transfer.offload._block_gpu_connector import (
     _TransferGroup,
 )
 from atom.kv_transfer.offload.dense.connector import (
+    DENSE_PAGE_RETIRED_CHANNEL,
     DENSE_PAGE_SOURCE_SAFE_CHANNEL,
     DENSE_PAGE_STORE_CHANNEL,
     DenseOffloadConnector,
@@ -75,6 +76,10 @@ def _store_terminal(operation, succeeded=True):
     return ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, operation, succeeded)
 
 
+def _retired(operation):
+    return ConnectorCompletion(DENSE_PAGE_RETIRED_CHANNEL, operation, True)
+
+
 def _finish_and_lease(scheduler, seq):
     scheduler.request_finished(seq)
     protected = scheduler.protected_block_ids(seq)
@@ -103,6 +108,70 @@ class TestBlockPoolLeaseOwnership:
         bm.free_leased_blocks(protected)
         assert bm.kv.num_used == 0
 
+    @pytest.mark.parametrize("first_owner", [0, 1])
+    def test_shared_prefix_lease_refs_retire_per_owner(
+        self, monkeypatch, seq_factory, first_owner
+    ):
+        scheduler = _early_release_scheduler(monkeypatch)
+        bm = BlockManager(
+            MockConfig(
+                num_kvcache_blocks=32,
+                kv_cache_block_size=4,
+                enable_prefix_caching=True,
+            )
+        )
+        tokens = list(range(20))
+        first = seq_factory(tokens)
+        bm.allocate(first)
+        bm.hash_blocks(first, len(tokens))
+        second = seq_factory(tokens)
+        second.offload_joint.claim_tokens = 16
+        bm.allocate(second, 2)
+        shared = frozenset(first.block_table[:4])
+        assert frozenset(second.block_table[:4]) == shared
+        assert all(bm.kv.block(block).ref_count == 2 for block in shared)
+
+        owners = [first, second]
+        for owner in owners:
+            scheduler.update_state_after_alloc(owner)
+            owner.num_cached_tokens = 16
+        operations = {
+            request.req_id: request.save_operation
+            for request in scheduler.build_connector_meta().requests
+        }
+        assert scheduler._save_budget.source_blocks == 8
+        for owner in owners:
+            scheduler.request_finished(owner)
+            protected = scheduler.protected_block_ids(owner)
+            assert protected == shared
+            bm.deallocate_partial(owner, protected)
+            scheduler.activate_block_leases(owner, protected)
+        assert all(bm.kv.block(block).ref_count == 2 for block in shared)
+
+        operation = operations[owners[first_owner].id]
+        scheduler.connector_completion(_source_safe(operation, (0, 16)))
+        released = scheduler.take_source_safe_releases()
+        assert released == [shared]
+        bm.free_leased_blocks(released[0])
+        scheduler.connector_completion(_store_terminal(operation))
+        scheduler.connector_completion(_retired(operation))
+        assert scheduler.take_source_safe_releases() == []
+        assert scheduler._save_budget.source_blocks == 4
+        assert all(bm.kv.block(block).ref_count == 1 for block in shared)
+
+        other = operations[owners[1 - first_owner].id]
+        scheduler.connector_completion(_store_terminal(other, succeeded=False))
+        assert scheduler.take_source_safe_releases() == []
+        scheduler.connector_completion(_retired(other))
+        released = scheduler.take_source_safe_releases()
+        assert released == [shared]
+        bm.free_leased_blocks(released[0])
+        assert all(bm.kv.block(block).ref_count == 0 for block in shared)
+        assert scheduler._save_budget.source_blocks == 0
+        scheduler.connector_completion(_source_safe(operation, (0, 16)))
+        scheduler.connector_completion(_retired(other))
+        assert scheduler.take_source_safe_releases() == []
+
 
 class TestSourceSafeBoundary:
     def test_worker_reports_source_safe_and_store_failure_separately(self):
@@ -122,11 +191,15 @@ class TestSourceSafeBoundary:
         )
         output = worker.get_finished()
 
-        assert output.finished_saving == {operation}
+        assert output.finished_saving == set()
         assert output.connector_completions == {
             ConnectorCompletion(DENSE_PAGE_SOURCE_SAFE_CHANNEL, identity, True),
             ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, operation, False),
         }
+        worker._record_save_retired(operation)
+        output = worker.get_finished()
+        assert output.finished_saving == {operation}
+        assert output.connector_completions == {_retired(operation)}
 
     def test_gpu_connector_reports_only_after_staging_group_fence(self):
         codec = SimpleNamespace(device=torch.device("cpu"), bytes_per_block=4)
@@ -298,9 +371,10 @@ class TestIncrementalLeaseRelease:
         seq = _seq(100, num_prompt_tokens=48, num_blocks=12)
         scheduler.update_state_after_alloc(seq)
 
-        seq.num_cached_tokens = 8
-        op1 = scheduler.build_connector_meta().requests[0].save_operation
+        # Only admitted ranges are protected: admit all eight source blocks
+        # before testing their incremental release, not an unsubmitted tail.
         seq.num_cached_tokens = 32
+        op1 = scheduler.build_connector_meta().requests[0].save_operation
         protected = _finish_and_lease(scheduler, seq)
         assert protected == frozenset(range(8))
 
@@ -308,11 +382,13 @@ class TestIncrementalLeaseRelease:
         assert scheduler.take_source_safe_releases() == [frozenset({0, 1})]
         assert scheduler.protected_block_ids(seq) == frozenset(range(2, 8))
 
-        assert scheduler.connector_completion(_store_terminal(op1)) is True
-        op2 = scheduler.build_connector_meta().requests[0].save_operation
-        assert scheduler.connector_completion(_source_safe(op2, (8, 32))) is None
+        assert scheduler.connector_completion(_source_safe(op1, (8, 32))) is None
         assert scheduler.take_source_safe_releases() == [frozenset(range(2, 8))]
-        scheduler.connector_completion(_store_terminal(op2))
+        assert op1 in scheduler._save_budget.operations
+        assert scheduler.connector_completion(_store_terminal(op1)) is True
+        assert op1 in scheduler._save_budget.operations
+        scheduler.connector_completion(_retired(op1))
+        assert op1 not in scheduler._save_budget.operations
         assert scheduler.protected_block_ids(seq) == frozenset()
 
     def test_final_pending_save_survives_request_block_table_clear(self, monkeypatch):
@@ -373,6 +449,10 @@ class TestStoreOutcomeSeparation:
         assert scheduler.total_save_requests == 0
         assert scheduler.total_saved_tokens == 0
         assert scheduler.blocks_waiting_for_store() == 0
+        assert operation in scheduler._save_budget.operations
+        scheduler.connector_completion(_retired(operation))
+        assert operation not in scheduler._save_budget.operations
+        assert scheduler.total_save_requests == 0
 
     def test_source_safe_blocks_are_observable_while_store_is_pending(
         self, monkeypatch
@@ -388,12 +468,15 @@ class TestStoreOutcomeSeparation:
         assert scheduler.get_statistics()["blocks_waiting_for_store"] == 2
         scheduler.connector_completion(_store_terminal(operation))
         assert scheduler.get_statistics()["blocks_waiting_for_store"] == 0
+        assert scheduler.total_save_requests == 0
+        assert operation in scheduler._save_budget.operations
+        scheduler.connector_completion(_retired(operation))
         assert scheduler.total_save_requests == 1
         assert scheduler.total_saved_tokens == 8
 
 
 class TestNoDoubleFree:
-    def test_timeout_drops_an_unemitted_finished_save_before_freeing(self, monkeypatch):
+    def test_timeout_cancels_a_prepared_final_save_before_freeing(self, monkeypatch):
         scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
         seq = _seq(399, num_prompt_tokens=16, num_blocks=4)
         scheduler.update_state_after_alloc(seq)
@@ -401,11 +484,19 @@ class TestNoDoubleFree:
         _finish_and_lease(scheduler, seq)
         scheduler._save_lease_at[id(seq)] = time.monotonic() - 10
 
-        assert scheduler.reclaim_stale_leases(1) == [frozenset({0, 1})]
+        assert scheduler.reclaim_stale_leases(1) == []
+        assert scheduler.protected_block_ids(seq) == frozenset({0, 1})
+        metadata = scheduler.build_connector_meta()
+        operation = metadata.requests[0].save_operation
+        assert metadata.cancel_save_operations == [operation]
+        scheduler.connector_completion(_store_terminal(operation, succeeded=False))
+        assert scheduler.take_source_safe_releases() == []
+        scheduler.connector_completion(_retired(operation))
+        assert scheduler.take_source_safe_releases() == [frozenset({0, 1})]
         assert str(seq.id) not in scheduler._save_tracker
         assert scheduler.has_pending_work() is False
 
-    def test_late_completions_after_timeout_reclaim_are_noops(self, monkeypatch):
+    def test_late_completions_after_confirmed_cancellation_are_noops(self, monkeypatch):
         scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
         seq = _seq(400, num_prompt_tokens=16, num_blocks=4)
         scheduler.update_state_after_alloc(seq)
@@ -414,11 +505,18 @@ class TestNoDoubleFree:
         _finish_and_lease(scheduler, seq)
         scheduler._save_lease_at[id(seq)] = time.monotonic() - 10
 
-        assert scheduler.reclaim_stale_leases(1) == [frozenset({0, 1})]
+        assert scheduler.reclaim_stale_leases(1) == []
+        assert scheduler.build_connector_meta().cancel_save_operations == [operation]
+        assert scheduler.take_source_safe_releases() == []
+        scheduler.connector_completion(_store_terminal(operation, succeeded=False))
+        assert scheduler.take_source_safe_releases() == []
+        scheduler.connector_completion(_retired(operation))
+        assert scheduler.take_source_safe_releases() == [frozenset({0, 1})]
         scheduler.connector_completion(_source_safe(operation, (0, 8)))
         scheduler.connector_completion(_store_terminal(operation))
+        scheduler.connector_completion(_retired(operation))
         assert scheduler.take_source_safe_releases() == []
-        assert scheduler.total_abnormal_lease_reclaims == 2
+        assert scheduler.total_abnormal_lease_reclaims == 0
         assert scheduler.total_save_requests == 0
 
     def test_duplicate_and_stale_source_completions_do_not_double_release(
@@ -440,7 +538,7 @@ class TestNoDoubleFree:
         assert scheduler.take_source_safe_releases() == [frozenset({0, 1})]
         assert scheduler.take_source_safe_releases() == []
 
-    def test_abandon_then_late_store_completion_does_not_release_twice(
+    def test_abandon_waits_for_safe_retirement_and_does_not_release_twice(
         self, monkeypatch
     ):
         scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
@@ -451,10 +549,15 @@ class TestNoDoubleFree:
         _finish_and_lease(scheduler, seq)
 
         scheduler.abandon_save(str(seq.id))
-        released = scheduler.take_source_safe_releases()
+        assert scheduler.take_source_safe_releases() == []
+        assert scheduler.build_connector_meta().cancel_save_operations == [operation]
         scheduler.connector_completion(_store_terminal(operation))
         assert scheduler.take_source_safe_releases() == []
-        assert released == [frozenset({0, 1})]
+        scheduler.connector_completion(_retired(operation))
+        assert scheduler.take_source_safe_releases() == [frozenset({0, 1})]
+        scheduler.connector_completion(_store_terminal(operation))
+        scheduler.connector_completion(_retired(operation))
+        assert scheduler.take_source_safe_releases() == []
 
     def test_request_id_reuse_cannot_attach_an_old_lease_to_new_blocks(
         self, monkeypatch

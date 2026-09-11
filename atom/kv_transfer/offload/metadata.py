@@ -163,6 +163,7 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
     #: asked to produce.
     WORK_FIELDS = ConnectorMetadata.WORK_FIELDS + (
         "requests",
+        "cancel_save_operations",
         "lookup_requests_in_step",
         "state_loads",
         "state_stores",
@@ -171,6 +172,8 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
     def __init__(self) -> None:
         super().__init__()
         self.requests: list[LMCacheReqMeta] = []
+        # Cancellation is a request, never a source-safety acknowledgement.
+        self.cancel_save_operations: list[SaveOperationId] = []
         # req_ids whose worker-side lookup pin can be released this step.
         self.lookup_requests_in_step: list[str] = []
         # (req_id, state_hash, target_group) for the K3 state tier. A separate

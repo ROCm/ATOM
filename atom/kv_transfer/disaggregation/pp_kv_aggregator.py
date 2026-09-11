@@ -10,11 +10,18 @@ whole request, but only once every stage has reached a terminal state.
 
 from __future__ import annotations
 
+from atom.kv_transfer.disaggregation.aggregator import (
+    _DENSE_PAGE_RETIRED_CHANNEL,
+    _DENSE_PAGE_SOURCE_SAFE_CHANNEL,
+    _RetiredDenseGenerations,
+)
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
     ConnectorCompletionKey,
     KVConnectorOutput,
     ReqId,
+    SaveOperationId,
+    SaveSourceGroupId,
 )
 
 
@@ -52,6 +59,7 @@ class PPKVAggregator:
         # per generation and PP quorum is just stage coverage.
         self._connector: dict[ConnectorCompletionKey, set[int]] = {}
         self._connector_failed: set[ConnectorCompletionKey] = set()
+        self._retired_dense_generations = _RetiredDenseGenerations()
 
     def ingest(self, pp_rank: int, output: KVConnectorOutput) -> KVConnectorOutput:
         for rid in output.finished_loading:
@@ -61,6 +69,8 @@ class PPKVAggregator:
         for rid in output.finished_saving:
             self._saving.setdefault(rid, set()).add(pp_rank)
         for completion in output.connector_completions:
+            if self._is_retired_dense_report(completion):
+                continue
             self._connector.setdefault(completion.key, set()).add(pp_rank)
             if not completion.succeeded:
                 self._connector_failed.add(completion.key)
@@ -107,6 +117,28 @@ class PPKVAggregator:
             self._connector.pop(key, None)
             self._connector_failed.discard(key)
 
+        retired = {
+            completion.operation_id
+            for completion in connector_completions
+            if completion.channel == _DENSE_PAGE_RETIRED_CHANNEL
+            and completion.succeeded
+            and isinstance(completion.operation_id, SaveOperationId)
+        }
+        if retired:
+            for operation in retired:
+                self._retired_dense_generations.add(operation.generation)
+            # A never-started stage cannot emit the other stages' source
+            # groups. Only successful all-stage retirement supersedes their
+            # missing quorums; store outcomes remain independently pending.
+            for key in list(self._connector):
+                if (
+                    key[0] == _DENSE_PAGE_SOURCE_SAFE_CHANNEL
+                    and isinstance(key[1], SaveSourceGroupId)
+                    and key[1].save_operation in retired
+                ):
+                    del self._connector[key]
+                    self._connector_failed.discard(key)
+
         return KVConnectorOutput(
             finished_loading=done_loading,
             failed_loading=failed,
@@ -114,11 +146,28 @@ class PPKVAggregator:
             connector_completions=connector_completions,
         )
 
+    def _is_retired_dense_report(self, completion: ConnectorCompletion) -> bool:
+        identity = completion.operation_id
+        if completion.channel == _DENSE_PAGE_SOURCE_SAFE_CHANNEL and isinstance(
+            identity, SaveSourceGroupId
+        ):
+            operation = identity.save_operation
+        elif completion.channel == _DENSE_PAGE_RETIRED_CHANNEL and isinstance(
+            identity, SaveOperationId
+        ):
+            operation = identity
+        else:
+            # Store outcomes may follow source retirement. Other connector
+            # channels also retain their independent completion semantics.
+            return False
+        return self._retired_dense_generations.contains(operation.generation)
+
     def has_pending(self) -> bool:
         """True while any request is still short of its per-stage quorum.
 
         The head's busy loop keeps polling downstream stages while this holds;
-        the tallies only drain when the missing stages report in.
+        the tallies drain when the missing stages report in or an all-stage
+        safe retirement supersedes incomplete dense source-group reports.
         """
         return bool(
             self._loading or self._saving or self._failed_loading or self._connector
@@ -130,3 +179,4 @@ class PPKVAggregator:
         self._failed_loading.clear()
         self._connector.clear()
         self._connector_failed.clear()
+        self._retired_dense_generations = _RetiredDenseGenerations()

@@ -469,6 +469,23 @@ a requested SLOT boundary is reported failed and is never committed. Standalone
 `ATOM_PD_STAGING_POOL`. Other connectors and composite topologies keep their
 existing staging behavior; this change does not adapt them to LMCache offload.
 
+Dense/M3 PAGE saves also reserve scheduler credits before dispatch: an operation
+credit, its candidate bytes, and every unsafe source block (including blocks of
+live requests). The worker queue enforces the same operation limit and physically
+removes cancelled queued tasks. A full budget drops that range and disables new
+save ranges for that request lifecycle. At request finish, a final tail is dropped
+when an earlier save is still outstanding; unsubmitted ranges never acquire a
+source lease. Loads use their independent executor.
+
+PAGE source safety and store outcome are separate. Per-group TP/PP source-safe
+reports release source credits incrementally. All-rank `dense.page.retired`
+proves no future source reads and releases any remaining source references;
+operation/byte credits remain until both retirement and store outcome arrive.
+Store exceptions fence the staging streams before reporting retirement. A timeout
+only requests cancellation; a running or unfenced operation retains its references.
+Normally returned store calls can have skipped ranges in LMCache, so the existing
+`saved_tokens` metric counts candidate tokens, not actual persisted tokens.
+
 ## When Does a Reload Actually Happen?
 
 A lookup hit does **not** guarantee a reload. After block allocation,
@@ -878,6 +895,11 @@ Connector-specific tuning (env):
 | `OFFLOAD_MIN_LOAD_TOKENS` | 8192 | Don't reload a hit smaller than this; recompute is cheaper. |
 | `OFFLOAD_COPY_WORKERS` | 1 | SAVE daemon threads. LOAD is always a single thread (TTFT-critical). |
 | `OFFLOAD_MAX_PENDING_SAVES` | `max(2, 2 × OFFLOAD_COPY_WORKERS)` | Positive integer bound on total admitted worker saves (running + queued), acquired before SLOT snapshot or executor submission. |
+| `OFFLOAD_SAVE_ADMISSION` | 1 | Dense/M3 PAGE operation, byte, source and worker queue gates. `0` disables these limits for controlled comparisons; safety/retirement and queue-age cancellation remain enabled. |
+| `OFFLOAD_MAX_RESERVED_SOURCE_BLOCKS` | 10% of PAGE pool, rounded down (at least 1) | Positive cap on unsafe source blocks reserved across admitted Dense/M3 saves, including active requests. Shared blocks are conservatively charged per operation. |
+| `OFFLOAD_MAX_PENDING_SAVE_BYTES` | source cap × measured worst-rank PAGE block bytes | Positive candidate-byte cap. Source-safe milestones do not return this credit while the backend is still pending. Explicit byte limits require known block geometry. |
+| `OFFLOAD_MAX_PENDING_SAVE_TOKENS` | source cap × virtual block size when bytes are unknown; 131072 if pool geometry is also unknown | Positive optional token cap; compatibility fallback when byte geometry is unavailable. |
+| `OFFLOAD_SAVE_QUEUE_TIMEOUT_S` | 2 | Age since scheduler admission at which Dense/M3 requests cancellation once. `0` disables age-based requests. Successful physical queue removal retires a queued task; running tasks need their own source fence. This is not a hard execution-time limit. |
 | `OFFLOAD_GPU_STAGING_CHUNKS` | 2 | Chunks per bounded GPU staging buffer. Sizes **each** buffer — load and save own separate ones, so resident HBM ≈ `(1 + OFFLOAD_COPY_WORKERS) × chunks × chunk_bytes`. |
 | `OFFLOAD_GPU_STAGING_MAX_BYTES` | — | Hard cap on staging bytes (clamps the chunk count). |
 | `OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER` | 0 | Free the staging buffer after each transfer (lower idle HBM, higher churn). |
@@ -893,6 +915,9 @@ Connector-specific tuning (env):
 `"committed_sidecar_index_capacity": N` overrides
 `OFFLOAD_COMMITTED_SIDECAR_CAPACITY`. `"max_pending_saves": N` overrides
 `OFFLOAD_MAX_PENDING_SAVES`. All apply only to that connector.
+For Dense/M3, `max_reserved_source_blocks`, `max_pending_save_bytes` and
+`max_pending_save_tokens` in `kv_connector_extra_config` override their respective
+environment limits.
 
 AOS1 follows the engine's location policy exactly. Submission passes
 `store_location` to `StorageManager.batched_put`; discovery searches only

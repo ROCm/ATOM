@@ -703,25 +703,13 @@ _save_abandon_timeout_s: float | None = None
 
 
 def offload_save_abandon_timeout_s() -> float:
-    """Seconds a deferred offload save may sit before the engine reclaims it.
+    """Legacy stall threshold derived from LMCache's pin timeout.
 
-    Blocks are freed on `finished_saving`, so a lost report leaves them deferred
-    forever: `has_pending_kv_work()` never clears and the engine busy-loops with
-    every GPU idle.
-
-    Reclaiming cannot race a live copy. `OffloadWorkerMixin._guard` reports on
-    both the success and the exception path, so a report is lost only when
-    `store()` neither returns nor raises -- it is parked inside LMCache. Then
-    either the parked save is not copying (LMCache force-unpinned its source
-    after `pin_timeout_sec`) or a save queued behind it never reached `store()`.
-    Both cases are safe once that window has passed.
-
-    Derived from LMCache's own `LMCACHE_EC_PIN_TIMEOUT_SEC` rather than a knob of
-    its own, because that ordering IS the safety argument -- two independent env
-    vars could be set the wrong way round with nothing to say so. This lives on
-    the offload connector, not the scheduler: it is LMCache knowledge, and the
-    scheduler now asks the connector for it (`save_abandon_timeout_s`).
-    Non-positive disables reclamation.
+    A queued task may still start after this threshold; CPU pin expiry is not
+    proof that GPU source reads have ended. Dense/M3 uses this only to request
+    cancellation and requires explicit source-safe or retired reports before
+    recycling blocks. Other layouts keep their existing timeout behavior.
+    Non-positive pin timeouts disable this threshold.
     """
     global _save_abandon_timeout_s
     if _save_abandon_timeout_s is not None:

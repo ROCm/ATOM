@@ -923,45 +923,21 @@ class Scheduler:
         self.block_manager.deallocate(seq)
 
     def _save_abandon_timeout_s(self) -> float:
-        """Seconds a deferred save may sit before reclamation, or 0 to disable.
+        """Connector-owned stall threshold, or zero when no connector defines it.
 
-        Sourced from the offload connector (`save_abandon_timeout_s`), not
-        re-derived here: the window is a function of LMCache's own pin timeout,
-        which is the connector's knowledge, and keeping the derivation in one
-        place is what stops the safety ordering (reclaim strictly after LMCache
-        force-unpins) from silently drifting. Returns 0 when no offload connector
-        is attached, which disables reclamation -- there is nothing to reclaim.
+        This threshold is not a GPU source fence. Connectors requiring safe
+        retirement use it to request cancellation and retain unsafe references.
         """
         callback = getattr(self.kv_connector, "save_abandon_timeout_s", None)
         return callback() if callable(callback) else 0.0
 
     def _reconcile_stalled_deferred_saves(self) -> int:
-        """Reclaim blocks whose offload save has stalled past the abandon timeout.
+        """Request cancellation of stalled saves, respecting source ownership.
 
-        `_maybe_release_deferred` cannot do this: the connector still reports the
-        save as pending (`should_defer_free` stays True), which is exactly why
-        the blocks were never released. Once the save has been deferred longer
-        than `_save_abandon_timeout_s()` -- set above LMCache's pin
-        timeout, so upstream has force-unpinned and released the source bytes --
-        the blocks are safe to return to the pool. Without this, a single
-        never-reported save keeps `has_pending_kv_work()` True forever and the
-        engine busy-loops with every GPU idle.
-
-        Mirrors the producer `finished_sending` reclaim (pop + deallocate),
-        deliberately not re-invoking `request_finished`: it was already called
-        when the request finished, before the block free was deferred. It does
-        notify the connector via `abandon_save`, though -- freeing the blocks
-        here is not enough on its own: the connector still holds the save in
-        `_save_inflight` (and, on K3, in the stall latch), so `should_defer_free`
-        would stay True and `has_pending_kv_work()` would never clear without
-        that drop.
-
-        The complement of the K3 connector's stall escape
-        (`kimi_k3.connector.save_stall_seconds()`), not a duplicate of it: that
-        one releases the blocks of a save the backend never took, on a shorter
-        clock, and leaves a save already handed out alone -- precisely the case
-        this reclaims once the report is not coming. Between them every deferred
-        save has a way out.
+        Dense/M3 advertises `requires_save_retirement`: neither exact leases nor
+        whole-request fallback allocations may be freed by elapsed time. Other
+        layouts retain their legacy abandonment behavior here. Request cleanup
+        has already run, so this hook must not create another final save.
         """
         timeout = self._save_abandon_timeout_s()
         if timeout <= 0:
@@ -997,10 +973,15 @@ class Scheduler:
             and now - seq._deferred_save_at >= timeout
         ]
         for seq in stalled:
+            if getattr(self.kv_connector, "requires_save_retirement", False):
+                self._connector_abandon_save(seq)
+                continue
             self.deferred_free_blocks.pop(seq.id, None)
             self._connector_abandon_save(seq)
             self.block_manager.deallocate(seq)
             self._abandoned_saves += 1
+        if getattr(self.kv_connector, "requires_save_retirement", False):
+            return lease_reclaims
         if stalled:
             logger.warning(
                 "Reclaimed %d offload save(s) still deferred after %.0fs with no "

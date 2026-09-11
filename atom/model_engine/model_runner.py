@@ -1633,6 +1633,16 @@ class ModelRunner:
             plan = plan.with_paged_entries(num_kvcache_blocks)
 
         block_bytes = plan.entry_bytes[plan.paged_class]
+        offload_block_bytes = block_bytes
+        if (
+            getattr(config, "kv_transfer_config", None)
+            and torch.distributed.is_initialized()
+        ):
+            byte_size = torch.tensor(
+                [block_bytes], dtype=torch.int64, device=self.device
+            )
+            torch.distributed.all_reduce(byte_size, op=torch.distributed.ReduceOp.MAX)
+            offload_block_bytes = int(byte_size.item())
         # The whole plan travels to the engine process; BlockManager, the
         # sliding-window pool and the attention builder each index it by the
         # class name they declared. Nothing here needs to know those names.
@@ -1755,6 +1765,7 @@ class ModelRunner:
         # the class they declared.
         return {
             "num_kvcache_blocks": num_kvcache_blocks,
+            "kv_cache_block_bytes": offload_block_bytes,
             "pool_entries": dict(plan.entries),
             "pool_entries_per_req": dict(plan.entries_per_req),
             "state_runtime": state_runtime.to_wire(),

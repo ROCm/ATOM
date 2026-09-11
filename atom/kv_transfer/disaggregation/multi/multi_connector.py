@@ -735,6 +735,13 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
                 releases.extend(callback(timeout_s))
         return releases
 
+    @property
+    def requires_save_retirement(self) -> bool:
+        return any(
+            getattr(connector, "requires_save_retirement", False)
+            for connector in self._connectors
+        )
+
     def record_early_release(self, count: int) -> None:
         for connector in self._connectors:
             callback = getattr(connector, "record_early_release", None)

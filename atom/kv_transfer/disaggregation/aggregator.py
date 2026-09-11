@@ -17,6 +17,7 @@ This module provides:
 from __future__ import annotations
 
 import logging
+from bisect import bisect_left, bisect_right
 from collections import deque
 from collections.abc import Callable, Hashable, Iterable
 from typing import Generic, TypeVar
@@ -30,6 +31,7 @@ from atom.kv_transfer.disaggregation.types import (
     ReqId,
     SaveCompletionId,
     SaveOperationId,
+    SaveSourceGroupId,
 )
 
 logger = logging.getLogger("atom")
@@ -37,6 +39,38 @@ logger = logging.getLogger("atom")
 __all__ = ["KVOutputAggregator"]
 
 _KeyT = TypeVar("_KeyT", bound=Hashable)
+
+# Keep this transport module independent of the offload connector import tree.
+_DENSE_PAGE_SOURCE_SAFE_CHANNEL = "dense.page.source_safe"
+_DENSE_PAGE_RETIRED_CHANNEL = "dense.page.retired"
+
+
+class _RetiredDenseGenerations:
+    """Compact terminal generations while preserving out-of-order holes.
+
+    Dense save generations are unique across one scheduler lifetime. A single
+    maximum would wrongly suppress an older operation still running on another
+    rank. Contiguous retired generations instead collapse to one interval.
+    """
+
+    def __init__(self) -> None:
+        self._intervals: list[tuple[int, int]] = []
+
+    def contains(self, generation: int) -> bool:
+        index = bisect_right(self._intervals, (generation, float("inf"))) - 1
+        return index >= 0 and self._intervals[index][1] >= generation
+
+    def add(self, generation: int) -> None:
+        if self.contains(generation):
+            return
+        index = bisect_left(self._intervals, (generation, generation))
+        start = end = generation
+        if index and self._intervals[index - 1][1] + 1 == generation:
+            index -= 1
+            start = self._intervals.pop(index)[0]
+        if index < len(self._intervals) and self._intervals[index][0] == end + 1:
+            end = self._intervals.pop(index)[1]
+        self._intervals.insert(index, (start, end))
 
 
 class _TPCompletionGroup(Generic[_KeyT]):
@@ -97,6 +131,12 @@ class _TPCompletionGroup(Generic[_KeyT]):
         self._reports.clear()
         self._tombstone_order.clear()
         self._tombstones.clear()
+
+    def discard_matching(self, predicate: Callable[[_KeyT], bool]) -> None:
+        """Forget incomplete reports covered by a stronger terminal fence."""
+        for key in list(self._reports):
+            if predicate(key):
+                del self._reports[key]
 
     @property
     def pending_count(self) -> int:
@@ -160,6 +200,7 @@ class KVOutputAggregator:
             terminal_tombstone_limit,
             lambda _key: True,
         )
+        self._retired_dense_generations = _RetiredDenseGenerations()
 
     @property
     def world_size(self) -> int:
@@ -211,6 +252,8 @@ class KVOutputAggregator:
                 succeeded=False,
             )
             for completion in output.connector_completions:
+                if self._is_retired_dense_report(completion):
+                    continue
                 self._connector_completions.report(
                     worker_idx,
                     completion.key,
@@ -222,6 +265,22 @@ class KVOutputAggregator:
         done_saving, _ = self._saving.drain()
         done_loading, failed_loading = self._loading.drain()
         done_connector_keys, failed_connector_keys = self._connector_completions.drain()
+        retired = {
+            key[1]
+            for key in done_connector_keys
+            if key[0] == _DENSE_PAGE_RETIRED_CHANNEL
+            and isinstance(key[1], SaveOperationId)
+        }
+        if retired:
+            for operation in retired:
+                self._retired_dense_generations.add(operation.generation)
+            # A never-started rank cannot emit the other ranks' chunk groups.
+            # All-rank operation retirement supersedes those missing quorums.
+            self._connector_completions.discard_matching(
+                lambda key: key[0] == _DENSE_PAGE_SOURCE_SAFE_CHANNEL
+                and isinstance(key[1], SaveSourceGroupId)
+                and key[1].save_operation in retired
+            )
         connector_completions = {
             ConnectorCompletion(
                 channel=key[0],
@@ -245,6 +304,22 @@ class KVOutputAggregator:
             connector_completions=connector_completions,
         )
 
+    def _is_retired_dense_report(self, completion: ConnectorCompletion) -> bool:
+        identity = completion.operation_id
+        if completion.channel == _DENSE_PAGE_SOURCE_SAFE_CHANNEL and isinstance(
+            identity, SaveSourceGroupId
+        ):
+            operation = identity.save_operation
+        elif completion.channel == _DENSE_PAGE_RETIRED_CHANNEL and isinstance(
+            identity, SaveOperationId
+        ):
+            operation = identity
+        else:
+            # In particular, a store outcome may legitimately follow a source
+            # retirement. Do not discard it or affect any other connector.
+            return False
+        return self._retired_dense_generations.contains(operation.generation)
+
     def reset(self) -> None:
         """Clear all internal tracking state."""
         self._sending.reset()
@@ -252,6 +327,7 @@ class KVOutputAggregator:
         self._saving.reset()
         self._loading.reset()
         self._connector_completions.reset()
+        self._retired_dense_generations = _RetiredDenseGenerations()
 
     @property
     def terminal_tombstone_count(self) -> tuple[int, int]:

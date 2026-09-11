@@ -7,16 +7,20 @@ import pytest
 
 from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
 from atom.kv_transfer.disaggregation.types import (
+    ConnectorCompletion,
     KVConnectorOutput,
     LoadOperationId,
     SaveOperationId,
 )
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload.dense.connector import (
+    DENSE_PAGE_RETIRED_CHANNEL,
+    DENSE_PAGE_STORE_CHANNEL,
     DenseOffloadConnector,
     DenseOffloadScheduler,
 )
 from atom.kv_transfer.offload.metadata import (
+    LMCacheOffloadMetadata,
     LMCacheReqMeta,
     LoadSpec,
     SaveSpec,
@@ -76,6 +80,15 @@ def _engine_scheduler(connector):
     scheduler.failed_recving_kv_req_ids = []
     scheduler.deferred_free_blocks = {}
     return scheduler
+
+
+def _retire_save(scheduler, operation):
+    scheduler.connector_completion(
+        ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, operation, True)
+    )
+    scheduler.connector_completion(
+        ConnectorCompletion(DENSE_PAGE_RETIRED_CHANNEL, operation, True)
+    )
 
 
 @pytest.mark.parametrize(
@@ -251,6 +264,8 @@ def test_dense_build_save_metadata_uses_increasing_exact_generations(monkeypatch
     first_meta = scheduler.build_connector_meta()
     first = first_meta.requests[0].save_operation
     scheduler.save_finished(first)
+    assert scheduler._save_inflight["12"] == first
+    _retire_save(scheduler, first)
     seq.num_cached_tokens = 16
     second_meta = scheduler.build_connector_meta()
     second = second_meta.requests[0].save_operation
@@ -268,16 +283,19 @@ def test_dense_stale_or_raw_save_completion_cannot_clear_exact_lifecycle(
     scheduler.update_state_after_alloc(seq)
     seq.num_cached_tokens = 8
     stale = scheduler.build_connector_meta().requests[0].save_operation
-    scheduler.save_finished(stale)
+    _retire_save(scheduler, stale)
 
     seq.num_cached_tokens = 16
     current = scheduler.build_connector_meta().requests[0].save_operation
     scheduler.save_finished(stale)
     scheduler.save_finished(seq.id)
+    _retire_save(scheduler, stale)
 
     assert scheduler._save_inflight["13"] == current
 
     scheduler.save_finished(current)
+    assert scheduler._save_inflight["13"] == current
+    _retire_save(scheduler, current)
     assert "13" not in scheduler._save_inflight
 
     # A raw completion remains compatible with an explicitly legacy lifecycle.
@@ -304,7 +322,8 @@ def test_dense_worker_exact_save_generations_do_not_form_cross_tp_quorum():
                     gpu_connector=None,
                     store=lambda _tokens, **_kwargs: None,
                 )
-            worker._do_save_req(
+            metadata = LMCacheOffloadMetadata()
+            metadata.add_request(
                 LMCacheReqMeta(
                     req_id=14,
                     token_ids=list(range(8)),
@@ -313,6 +332,8 @@ def test_dense_worker_exact_save_generations_do_not_form_cross_tp_quorum():
                     save_operation=operation,
                 )
             )
+            worker.start_load_kv(metadata)
+            worker.close()
             outputs.append(worker.get_finished())
 
         assert outputs[0].finished_saving == {operations[0]}
