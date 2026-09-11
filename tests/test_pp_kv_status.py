@@ -59,14 +59,13 @@ def _head(pp_size, local_outputs, downstream_messages=()):
     proc.kv_transfer_enabled = True
     proc.pp_size = pp_size
     proc._pp_kv_aggregator = None
-    proc._held_sending = {}
     proc.scheduler = FakeScheduler()
     proc.runner_mgr = FakeRunnerMgr(local_outputs)
     proc.pp_transport = FakePPTransport(downstream_messages)
     return proc
 
 
-def test_send_waits_for_every_pp_stage_save():
+def test_send_is_reported_while_save_waits_for_every_pp_stage():
     proc = _head(
         pp_size=3,
         local_outputs=[
@@ -80,21 +79,16 @@ def test_send_waits_for_every_pp_stage_save():
     )
 
     proc._poll_kv_transfer_progress()
-    assert proc.scheduler.released_sending() == set()  # stage 2 still saving
-    assert proc._held_sending == {"a": ("a", {"a"})}
+    assert proc.scheduler.released_sending() == {"a"}
+    assert proc.scheduler.released_saving() == set()  # stage 2 still saving
 
     proc._poll_kv_transfer_progress()
     assert proc.scheduler.released_sending() == {"a"}
     assert proc.scheduler.released_saving() == {"a"}
-    assert proc._held_sending == {}
 
 
-def test_send_pairs_with_a_save_operation_id():
-    # The offload connector reports a SaveOperationId(req_id, generation) once
-    # it tracks save generations, while mooncake reports a bare request id.
-    # Both have to collapse onto the request before they can be paired; keying
-    # the two sides differently releases every send unheld and lets the head
-    # free blocks a downstream stage is still saving from.
+def test_save_operation_id_waits_for_quorum_independently_of_send():
+    # Send is request-scoped; each save generation still needs PP quorum.
     op = SaveOperationId(9, 2)
     proc = _head(
         pp_size=2,
@@ -109,21 +103,16 @@ def test_send_pairs_with_a_save_operation_id():
     )
 
     proc._poll_kv_transfer_progress()
-    assert proc.scheduler.released_sending() == set()  # stage 1 still saving
-    assert proc._held_sending == {"9": (9, {op})}
+    assert proc.scheduler.released_sending() == {9}
+    assert proc.scheduler.released_saving() == set()  # stage 1 still saving
 
     proc._poll_kv_transfer_progress()
     assert proc.scheduler.released_sending() == {9}
     assert proc.scheduler.released_saving() == {op}
-    assert proc._held_sending == {}
 
 
-def test_send_waits_for_every_save_generation():
-    # A chunked prefill saves once per chunk, so the pairing rank flushes the
-    # send together with every generation it accumulated. The head must hold
-    # the send until each of those generations has reached PP quorum, not just
-    # the first one — the stages lag each other, and a stage still short of
-    # quorum is still reading the blocks the send would free.
+def test_each_save_generation_needs_its_own_quorum():
+    # Completing one save must neither complete nor delay another generation.
     g2, g3 = SaveOperationId(9, 2), SaveOperationId(9, 3)
     proc = _head(
         pp_size=2,
@@ -140,18 +129,16 @@ def test_send_waits_for_every_save_generation():
     )
 
     proc._poll_kv_transfer_progress()
-    assert proc.scheduler.released_sending() == set()
-    assert proc._held_sending == {"9": (9, {g2, g3})}
+    assert proc.scheduler.released_sending() == {9}
+    assert proc.scheduler.released_saving() == set()
 
     proc._poll_kv_transfer_progress()
-    assert proc.scheduler.released_sending() == set()  # generation 3 pending
+    assert proc.scheduler.released_sending() == {9}
     assert proc.scheduler.released_saving() == {g2}
-    assert proc._held_sending == {"9": (9, {g3})}
 
     proc._poll_kv_transfer_progress()
     assert proc.scheduler.released_sending() == {9}
     assert proc.scheduler.released_saving() == {g2, g3}
-    assert proc._held_sending == {}
 
 
 def test_send_without_a_save_is_not_held():
@@ -172,7 +159,6 @@ def test_send_without_a_save_is_not_held():
 
     proc._poll_kv_transfer_progress()
     assert proc.scheduler.released_sending() == {"a", "b"}
-    assert proc._held_sending == {}
 
 
 def test_send_passes_through_before_any_offload_activity():

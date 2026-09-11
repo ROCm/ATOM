@@ -208,9 +208,9 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             operation, SaveOperationId
         ):
             with self._lock:
-                # Keep the legacy terminal channel as well: MultiConnector's
-                # producer send/save pairing consumes this field before
-                # connector-owned completions reach the scheduler.
+                # Report the save terminal independently of the P/D send so
+                # the scheduler can recheck deferred blocks. The dedicated
+                # channel below carries store success/failure and lease cleanup.
                 self._done_save.add(operation)
                 self._connector_completions.add(
                     ConnectorCompletion(
@@ -999,8 +999,8 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         self._save_inflight.pop(sid, None)
         if getattr(self, "_early_release", False):
             # Store success/failure and lease release travel on the dedicated
-            # connector channel. This legacy terminal exists for deferred-free
-            # and MultiConnector send/save pairing only.
+            # connector channel. This terminal clears the matching in-flight
+            # save; process_completions also triggers a scheduler release check.
             self._finish_retired_request(sid)
             return
         self._finish_save_statistics(req_id)

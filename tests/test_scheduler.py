@@ -1743,6 +1743,22 @@ class TestPostprocess:
         scheduler.postprocess(list(scheduler.running), self._output(seq.id, [2]))
         assert scheduler.get_request_counts() == (0, 0)
 
+    @pytest.mark.parametrize("pp_size", [1, 4])
+    def test_producer_retains_blocks_until_send_finishes(self, seq_factory, pp_size):
+        sched = Scheduler(MockConfig(pipeline_parallel_size=pp_size))
+        seq = self._prefill(sched, seq_factory([1, 2, 3, 4]))
+        sched.kv_connector = SimpleNamespace(is_producer=True)
+        sched.postprocess([seq], self._output(seq.id, [2]))
+
+        assert seq._awaiting_kv_send
+        assert seq.block_table
+        assert not sched.is_finished()
+        sched._update_from_kv_xfer_finished(
+            KVConnectorOutput(finished_sending={seq.id})
+        )
+        assert not seq.block_table
+        assert sched.is_finished()
+
 
 # ── get_next_batch_info ────────────────────────────────────────────────────
 
@@ -1995,6 +2011,24 @@ class TestStalledOffloadSaveReclaim:
         assert freed == [1]
         # Notified with the string request id, matching the connector's sid keys.
         assert abandoned == ["1"]
+
+    def test_save_timeout_does_not_release_a_pending_producer_send(self, monkeypatch):
+        import time as _time
+
+        seq = SimpleNamespace(
+            id=1,
+            _deferred_save_at=_time.monotonic() - 500.0,
+            _awaiting_kv_send=True,
+        )
+        s, freed = self._sched(monkeypatch, [seq])
+        assert s._reconcile_stalled_deferred_saves() == 0
+        assert not freed
+        assert seq.id in s.deferred_free_blocks
+
+        seq._awaiting_kv_send = False
+        s._next_save_reconcile_at = 0
+        assert s._reconcile_stalled_deferred_saves() == 1
+        assert freed == [seq.id]
 
     def test_it_self_throttles_so_a_1ms_poll_is_cheap(self, monkeypatch):
         import time as _time

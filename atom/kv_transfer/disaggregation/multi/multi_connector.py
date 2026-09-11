@@ -36,26 +36,23 @@ Merge strategy mirrors vLLM's ``MultiConnector``, adapted to ATOM's
 * ``build_connector_meta`` — returns :class:`MultiConnectorMetadata` carrying one
   sub-metadata per connector, in connector order. The worker de-multiplexes by
   index in ``start_load_kv``.
-* ``get_finished`` — union the completion sets, **but** see the send/save
-  pairing below.
+* ``get_finished`` — union the completion sets without delaying incremental
+  save progress.
 * ``_state_tier`` — the state offload tier, if a sub built one, re-exposed on
   the composite by ``_adopt_state_tier`` at ``register_kv_caches`` time (which
   also refuses a config that lists two offload subs). Mirroring the sub's tier
   on the composite keeps the attribute defined, so a probe for it resolves to
   the real tier instead of raising ``AttributeError``.
 
-Send/save pairing (the one tricky correctness point)
-----------------------------------------------------
-On a producer node the scheduler frees a finished request's blocks as soon as it
-sees ``finished_sending`` (``scheduler.py``: producer path), and it can *also*
-free on ``finished_saving`` when the connector does not defer. If offload is
-still reading those blocks for its save when the moriio send completes (or vice
-versa), the free would corrupt the in-flight transfer. So when a request needs
-**both** a send and one or more saves, ``MultiConnector`` withholds *both*
-completion signals until every known save is done, then emits them together.
-The scheduler's ``finished_sending`` handler frees first; the
-``finished_saving`` handler then finds nothing to free and no-ops. This is the
-analogue of vLLM's ``_extra_async_saves`` refcount.
+Send/save lifetime
+------------------
+Completion reports describe individual operations, not permission to free a
+request. The scheduler owns that decision: a producer waits for its send and
+for ``should_defer_free`` to clear, including computed chunks whose save has
+not yet been dispatched. Holding a chunk's ``finished_saving`` until the send
+finishes prevents the scheduler from issuing the next chunk's save. Forward
+both kinds of progress immediately; TP/PP aggregation still requires every
+worker owning a slice of each save to finish before reporting it.
 """
 
 from __future__ import annotations
@@ -71,9 +68,6 @@ from atom.kv_transfer.disaggregation.base import (
 from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
     KVConnectorOutput,
-    SaveCompletionId,
-    StateStoreOperationId,
-    completion_req_key,
     connector_metadata_has_work,
 )
 
@@ -228,35 +222,11 @@ class MultiConnector(KVConnectorBase):
             getattr(c, "is_producer", False) for c in self._connectors
         )
 
-        pp_rank = getattr(
-            getattr(config, "parallel_config", None),
-            "pipeline_parallel_rank",
-            0,
-        )
-        self._pp_is_head = pp_rank == 0
-
-        # Send/save pairing state, all keyed by str(req_id). See module
-        # docstring. The values below are completion identities, not keys: a
-        # pending save is named by its SaveOperationId, or by the bare req_id
-        # when the metadata carries none -- whichever the worker will report.
-        self._pending_save_ops: dict[str, set[SaveCompletionId]] = {}
-        self._sent: dict[str, Any] = {}
-        self._saved: dict[str, set[SaveCompletionId]] = {}
         # The state tier of whichever sub owns one. Adopted in
         # `register_kv_caches` via `_adopt_state_tier`; set to None here so the
         # attribute exists before the subs register -- a probe for it must
         # resolve, not raise `AttributeError`.
         self._state_tier = None
-
-    @property
-    def _pairs_send_and_save(self) -> bool:
-        """Whether this rank has a send to pair its saves against.
-
-        Only a producer's PP stage 0 does: mooncake reports done_sending on
-        stage 0 alone (via ``_record_release``). Every other rank passes both
-        completions straight through and must keep no pairing state.
-        """
-        return self.is_producer and self._pp_is_head
 
     def register_kv_caches(
         self,
@@ -301,22 +271,6 @@ class MultiConnector(KVConnectorBase):
         for c, m in zip(self._connectors, metas):
             if m is None:
                 continue
-            # Remember what offload is about to save, so get_finished can hold
-            # the send until it finishes.
-            if self._pairs_send_and_save:
-                reqs = getattr(m, "requests", None)
-                if reqs:
-                    for req in reqs:
-                        has_save = (
-                            getattr(req, "save_spec", None) is not None
-                            or getattr(req, "slot_save_spec", None) is not None
-                        )
-                        if not has_save:
-                            continue
-                        operation = getattr(req, "save_operation", None)
-                        self._pending_save_ops.setdefault(
-                            completion_req_key(req.req_id), set()
-                        ).add(operation if operation is not None else req.req_id)
             c.start_load_kv(m)
 
     def record_kv_cache_ready(self, req_ids: list) -> None:
@@ -344,55 +298,15 @@ class MultiConnector(KVConnectorBase):
             save_now.extend(o.finished_saving)
             completions |= o.connector_completions
 
-        out = KVConnectorOutput(
+        return KVConnectorOutput(
+            finished_sending=set(send_now),
+            finished_saving=set(save_now),
             finished_recving=recv,
             failed_recving=failed,
             finished_loading=loaded,
             failed_loading=load_failed,
             connector_completions=completions,
         )
-
-        if not self._pairs_send_and_save:
-            out.finished_sending = set(send_now)
-            out.finished_saving = set(save_now)
-            return out
-
-        # Pair each request's send and save before releasing either.
-        for r in send_now:
-            self._sent[str(r)] = r
-        # State-tier store completions (`StateStoreOperationId`: a
-        # (prefix_hash, generation) pair) have no send counterpart to pair
-        # against. Parking them in `self._saved` leaked for the life of the
-        # process -- their key never enters `self._sent`, so the pop below never
-        # fired. They are terminal on their own: release immediately. Match on
-        # the exact type, not `hasattr(r, "req_id")` -- a bare `ReqId` save
-        # completion (a plain str/int) has no `req_id` attribute either and must
-        # still go through send/save pairing on a producer node.
-        state_saves: set = set()
-        for r in save_now:
-            if isinstance(r, StateStoreOperationId):
-                state_saves.add(r)
-                continue
-            key = completion_req_key(r)
-            self._saved.setdefault(key, set()).add(r)
-            pending_ops = self._pending_save_ops.get(key)
-            if pending_ops is not None:
-                pending_ops.discard(r)
-                if not pending_ops:
-                    self._pending_save_ops.pop(key, None)
-
-        rel_send: set = set()
-        rel_save: set = set()
-        for key, raw in list(self._sent.items()):
-            if self._pending_save_ops.get(key):
-                continue  # hold: save still in flight for this request
-            rel_send.add(raw)
-            del self._sent[key]
-            rel_save.update(self._saved.pop(key, set()))
-
-        out.finished_sending = rel_send
-        out.finished_saving = rel_save | state_saves
-        return out
 
     def get_finished_recv_blocks(self) -> list[int]:
         blocks: list[int] = []
@@ -742,9 +656,8 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
                 callback(count)
 
     def has_pending_work(self) -> bool:
-        # Scheduler-side only: the send/save pairing state lives on the worker
-        # instance, and a pending send is already visible to the engine through
-        # the scheduler's deferred_free_blocks.
+        # A pending send is visible to the engine through the scheduler's
+        # deferred_free_blocks; sub-connectors report their offload work here.
         return any(
             c.has_pending_work()
             for c in self._connectors
