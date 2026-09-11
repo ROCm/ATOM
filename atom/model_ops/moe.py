@@ -1812,7 +1812,7 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
 
 
 class WideEpMxfp4MoEMethod(Mxfp4MoEMethod):
-    """MXFP4 MoE method backed by AITER's EP16 inter-node operator."""
+    """MXFP4 MoE using WideEP dispatch/combine around AITER fused_moe."""
 
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         super().__init__(quant_config, moe)
@@ -1837,28 +1837,47 @@ class WideEpMxfp4MoEMethod(Mxfp4MoEMethod):
             )
         self.use_triton = False
         self.use_triton_decode = False
+        # The validated gfx950 A8W4 kernel consumes GUGU-interleaved w1 and
+        # scales. Keep the normal ATOM/AITER weight preparation, but pin its
+        # layout instead of relying on a launch-time environment variable.
+        self.is_guinterleave = True
 
     def _process_weight_layout_after_loading(self, layer) -> None:
-        from atom.model_ops.fused_moe.wideep_experts import build_wideep_weights
-
-        build_wideep_weights(layer)
-        layer.w13_weight.data = torch.empty(
-            0, dtype=layer.w13_weight.dtype, device=layer.w13_weight.device
-        )
-        layer.w2_weight.data = torch.empty(
-            0, dtype=layer.w2_weight.dtype, device=layer.w2_weight.device
-        )
+        # Use the same shuffled weights that ATOM's normal aiter.fused_moe path
+        # consumes. WideEP changes only prepare/finalize communication.
+        super()._process_weight_layout_after_loading(layer)
 
     def init_prepare_finalize(self, layer: torch.nn.Module):
-        from atom.model_ops.fused_moe.wideep_experts import WideEpFusedExperts
+        from atom.model_ops.fused_moe.wideep_experts import (
+            make_wideep_prepare_finalize,
+        )
 
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
-        self.fused_experts = WideEpFusedExperts(
-            layer,
+        prepare_finalize = make_wideep_prepare_finalize(
             model_dim=self.hidden_size,
-            inter_dim=self.intermediate_size,
             experts=self.moe.num_experts,
+            experts_per_rank=self.moe.num_local_experts,
+            topk=self.moe.experts_per_token,
             mtpr=self.moe.max_num_tokens,
+        )
+        self.topk_indices_dtype = prepare_finalize.topk_indices_dtype()
+
+        # MORI pads inactive arena rows with the global-expert sentinel. Keep
+        # one masked slot for that value, matching TestWideEpMoe's native path.
+        if (
+            layer.expert_mask is not None
+            and layer.expert_mask.numel() == self.moe.num_experts
+        ):
+            layer.expert_mask = torch.cat(
+                (layer.expert_mask, layer.expert_mask.new_zeros(1))
+            )
+
+        # TODO(wideep): split fused_moe when the BF16 stage-1 intermediate for
+        # the static receive bound exceeds one AMDGPU buffer descriptor's 4-GiB
+        # byte range. The communication contract is independent of that guard.
+        self.fused_experts = FusedMoEModularKernel(
+            prepare_finalize,
+            quant_config=self.moe_quant_config,
         )
 
 

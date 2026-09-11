@@ -183,6 +183,9 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         is_async: bool = False,
         tbo_mori_ops: list | None = None,
         low_latency: bool = False,
+        dispatch_quantizer: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
+        | None = None,
+        fixed_dispatch_config: tuple[int, int] | None = None,
     ):
         if not MORI_AVAILABLE:
             raise ImportError(
@@ -198,6 +201,8 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self.quant_dtype = quant_dtype
         self._is_async = is_async
         self._low_latency = low_latency
+        self._dispatch_quantizer = dispatch_quantizer
+        self._fixed_dispatch_config = fixed_dispatch_config
 
     # Derived from the resolved format so there is no second copy to keep in
     # sync with the staging config.
@@ -254,6 +259,9 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         completes -> warmup deadlocks. Capping at multi_processor_count keeps
         big-CU GPUs (MI300X/MI355X, >=128 CU) at 128 with no perf loss.
         """
+        if self._fixed_dispatch_config is not None:
+            return self._fixed_dispatch_config
+
         mp = get_cu_num()
         context = get_forward_context().context
         if context.is_prefill:
@@ -283,11 +291,19 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         - Optional dispatched expert topk IDs
         - Optional dispatched expert topk weight
         """
-        assert (
-            not apply_router_weight_on_input
-        ), "mori does not support apply_router_weight_on_input=True now."
+        assert not apply_router_weight_on_input, (
+            "mori does not support apply_router_weight_on_input=True now."
+        )
+        # EpDispatchCombineOp requires FP32 routing weights and contiguous INT32
+        # global expert IDs. Normalize at the shared MORI boundary so every
+        # transport, including WideEP, uses the same prepare implementation.
+        topk_weights = topk_weights.to(torch.float32).contiguous()
+        topk_ids = topk_ids.to(torch.int32).contiguous()
+
         scale = None
-        if self.use_fp4_dispatch:
+        if self._dispatch_quantizer is not None:
+            a1, scale = self._dispatch_quantizer(a1)
+        elif self.use_fp4_dispatch:
             from aiter import get_hip_quant
 
             quant_func = get_hip_quant(self.quant_type or quant_type)
@@ -331,6 +347,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         apply_router_weight_on_input: bool,
     ) -> torch.Tensor:
         num_token = topk_ids.shape[0]
+        topk_ids = topk_ids.to(torch.int32).contiguous()
 
         block_num, warp_per_block = self._get_dispatch_config(num_token)
 
@@ -354,9 +371,9 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
     ) -> mk.ReceiverType:
-        assert (
-            not apply_router_weight_on_input
-        ), "mori does not support apply_router_weight_on_input=True now."
+        assert not apply_router_weight_on_input, (
+            "mori does not support apply_router_weight_on_input=True now."
+        )
 
         scale = None
         if self.use_fp4_dispatch:

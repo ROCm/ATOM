@@ -1,183 +1,120 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Minimal adapter for AITER's EP16 inter-node MoE operator."""
+"""WideEP transport construction for ATOM's modular fused-MoE path."""
 
 from __future__ import annotations
 
+import os
+from functools import lru_cache
+
 import torch
+from aiter import QuantType, dtypes
 
-_WIDEEP_CACHE: dict[tuple, object] = {}
-
-
-def build_wideep_weights(layer) -> None:
-    """Convert ATOM's raw MXFP4 weights to TestWideEpMoe's layout."""
-    from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
-
-    local_experts = int(layer.w13_weight.shape[0])
-    if local_experts != layer.local_num_experts:
-        raise RuntimeError(
-            "WideEP weight count does not match the local expert layout: "
-            f"weights={local_experts}, local_experts={layer.local_num_experts}"
-        )
-
-    layer._wideep_w1 = shuffle_weight_a16w4(
-        layer.w13_weight.data, 16, True
-    ).contiguous()
-    layer._wideep_w1_scale = shuffle_scale_a16w4(
-        layer.w13_weight_scale.data.flatten(0, 1), local_experts, True
-    ).contiguous()
-    layer._wideep_w2 = shuffle_weight_a16w4(
-        layer.w2_weight.data, 16, False
-    ).contiguous()
-    layer._wideep_w2_scale = shuffle_scale_a16w4(
-        layer.w2_weight_scale.data.flatten(0, 1), local_experts, False
-    ).contiguous()
-    layer._wideep_w1.is_shuffled = True
-    layer._wideep_w2.is_shuffled = True
+from atom.model_ops.fused_moe.mori_prepare_finalize import (
+    MoriDispatchFormat,
+    MoriPrepareAndFinalize,
+)
 
 
-def _get_wideep_op(
+def _quantize_wideep_dispatch(
+    hidden_states: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Use the quantizer validated with AITER's inter-node WideEP path."""
+    from aiter.ops.flydsl.kernels.mega_moe.quant import per_1x32_mx_quant
+
+    return per_1x32_mx_quant(hidden_states, quant_mode="fp8")
+
+
+@lru_cache(maxsize=16)
+def _init_wideep_op(
     *,
     rank: int,
     world_size: int,
     model_dim: int,
-    inter_dim: int,
-    experts: int,
+    experts_per_rank: int,
     topk: int,
     mtpr: int,
-    swiglu_limit: float,
-    layer,
 ):
-    """Share the MORI transport and bind the current layer's weights."""
-    key = (
-        rank,
-        world_size,
-        model_dim,
-        inter_dim,
-        experts,
-        topk,
-        mtpr,
-        swiglu_limit,
+    """Create the dedicated two-node InterNodeV1LL MORI transport."""
+    import mori
+
+    capacity_mtpr = 1 << (mtpr - 1).bit_length()
+    config = mori.ops.EpDispatchCombineConfig(
+        data_type=dtypes.fp8,
+        rank=rank,
+        world_size=world_size,
+        hidden_dim=model_dim,
+        scale_dim=model_dim // 32,
+        scale_type_size=1,
+        max_num_inp_token_per_rank=capacity_mtpr,
+        num_experts_per_rank=experts_per_rank,
+        num_experts_per_token=topk,
+        max_token_type_size=torch.bfloat16.itemsize,
+        kernel_type=mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
+        gpu_per_node=8,
+        num_qp_per_pe=2,
+        rdma_block_num=int(os.environ.get("MORI_EP_RDMA_BLOCK_NUM", "64")),
+        block_num=int(os.environ.get("MORI_EP_BLOCK_NUM", "96")),
+        warp_num_per_block=int(os.environ.get("MORI_EP_WARP_PER_BLOCK", "8")),
     )
-    op = _WIDEEP_CACHE.get(key)
-    if op is None:
-        from aiter.ops.flydsl.test_wide_ep_moe import TestWideEpMoe
-
-        op = TestWideEpMoe(
-            rank=rank,
-            world_size=world_size,
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            experts=experts,
-            topk=topk,
-            quant="a8w4",
-            w1=layer._wideep_w1,
-            w1_scale=layer._wideep_w1_scale,
-            w2=layer._wideep_w2,
-            w2_scale=layer._wideep_w2_scale,
-            max_tok_per_rank=mtpr,
-            gpu_per_node=8,
-            swiglu_limit=swiglu_limit,
-            activation="silu",
-            gate_mode="interleave",
-        )
-        _WIDEEP_CACHE[key] = op
-
-    op.w1 = layer._wideep_w1
-    op.w1_scale = layer._wideep_w1_scale
-    op.w2 = layer._wideep_w2
-    op.w2_scale = layer._wideep_w2_scale
-    return op
+    return mori.ops.EpDispatchCombineOp(config)
 
 
-def run_wideep_moe(
-    layer,
-    hidden_states: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
+def make_wideep_prepare_finalize(
     *,
     model_dim: int,
-    inter_dim: int,
     experts: int,
+    experts_per_rank: int,
+    topk: int,
     mtpr: int,
-) -> torch.Tensor:
-    """Run AITER dispatch, expert GEMMs, and combine as one eager call."""
-    if torch.compiler.is_compiling():
-        raise RuntimeError(
-            "moe_backend='wideep' currently supports eager execution only; "
-            "start ATOM with --enforce-eager --level 0"
-        )
-
+) -> MoriPrepareAndFinalize:
+    """Bind WideEP transport to the shared ATOM prepare/finalize implementation."""
     from aiter.dist.parallel_state import get_ep_group
 
-    # Accessing all2all_manager initializes MORI's symmetric heap.
+    # Accessing all2all_manager initializes MORI's symmetric heap before this
+    # dedicated operator allocates its communication arena.
     manager = get_ep_group().device_communicator.all2all_manager
     rank = int(manager.rank)
     world_size = int(manager.world_size)
     if world_size != 16:
         raise RuntimeError(f"WideEP requires EP16, got EP{world_size}")
-    if int(hidden_states.shape[0]) > mtpr:
-        raise ValueError(
-            f"WideEP tokens={hidden_states.shape[0]} exceed max_num_tokens={mtpr}"
+    if experts != experts_per_rank * world_size:
+        raise RuntimeError(
+            "WideEP requires an evenly sharded expert space: "
+            f"experts={experts}, experts_per_rank={experts_per_rank}, "
+            f"world_size={world_size}"
         )
 
-    op = _get_wideep_op(
+    # The dispatched activation is already FP8. AITER's mixed MoE selector
+    # must therefore stay on its A8W4 path even for decode-sized M.
+    bf16_fp8_bound = os.environ.get("AITER_BF16_FP8_MOE_BOUND")
+    if bf16_fp8_bound not in (None, "0"):
+        raise RuntimeError(
+            "WideEP requires AITER_BF16_FP8_MOE_BOUND=0 because dispatch "
+            "produces prequantized FP8 activations"
+        )
+    os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
+
+    op = _init_wideep_op(
         rank=rank,
         world_size=world_size,
         model_dim=model_dim,
-        inter_dim=inter_dim,
-        experts=experts,
-        topk=int(topk_ids.shape[1]),
+        experts_per_rank=experts_per_rank,
+        topk=topk,
         mtpr=mtpr,
-        swiglu_limit=float(getattr(layer, "swiglu_limit", 0.0)),
-        layer=layer,
     )
-    with torch.inference_mode(False), torch.no_grad():
-        output = op.forward(
-            hidden_states.contiguous(),
-            topk_weights.to(torch.float32).contiguous(),
-            topk_ids.to(torch.int32).contiguous(),
-        )
-    # MORI's result aliases its reusable combine arena.
-    return output.clone()
-
-
-class WideEpFusedExperts:
-    """Adapter for Mxfp4MoEMethod's whole-pipeline experts hook."""
-
-    def __init__(
-        self, layer, *, model_dim: int, inter_dim: int, experts: int, mtpr: int
-    ):
-        self.layer = layer
-        self.model_dim = model_dim
-        self.inter_dim = inter_dim
-        self.experts = experts
-        self.mtpr = mtpr
-
-    def __call__(
-        self,
-        *,
-        hidden_states,
-        topk_weights,
-        topk_ids,
-        activation=None,
-        apply_router_weight_on_input=False,
-        **_ignored,
-    ):
-        from aiter import ActivationType
-
-        if apply_router_weight_on_input:
-            raise NotImplementedError(
-                "WideEP does not support apply_router_weight_on_input=True"
-            )
-        if activation is not None and activation != ActivationType.Silu:
-            raise NotImplementedError("WideEP A8W4 supports SiLU only")
-        return run_wideep_moe(
-            self.layer,
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            model_dim=self.model_dim,
-            inter_dim=self.inter_dim,
-            experts=self.experts,
-            mtpr=self.mtpr,
-        )
+    return MoriPrepareAndFinalize(
+        op,
+        max_tokens_per_rank=mtpr,
+        num_dispatchers=world_size,
+        dispatch_format=MoriDispatchFormat(
+            dtype=dtypes.fp8,
+            quant_type=QuantType.per_1x32,
+            scale_dim=model_dim // 32,
+            scale_type_size=1,
+        ),
+        dispatch_quantizer=_quantize_wideep_dispatch,
+        fixed_dispatch_config=(
+            int(os.environ.get("MORI_EP_BLOCK_NUM", "96")),
+            int(os.environ.get("MORI_EP_WARP_PER_BLOCK", "8")),
+        ),
+    )

@@ -59,6 +59,7 @@ def test_wideep_method_requires_ep16_mori(monkeypatch):
     method = moe_mod.WideEpMxfp4MoEMethod(SimpleNamespace(is_dynamic=True), _moe())
     assert method.use_triton is False
     assert method.use_triton_decode is False
+    assert method.is_guinterleave is True
 
     with pytest.raises(ValueError, match="requires EP16"):
         moe_mod.WideEpMxfp4MoEMethod(
@@ -73,70 +74,157 @@ def test_wideep_method_requires_ep16_mori(monkeypatch):
         )
 
 
-def test_wideep_run_calls_aiter_and_copies_combine_output(monkeypatch):
+def test_wideep_reuses_mori_prepare_finalize_around_fused_moe(monkeypatch):
+    from aiter import ActivationType, QuantType
     from aiter.dist import parallel_state
 
-    from atom.model_ops.fused_moe import wideep_experts
+    from atom.model_ops.fused_moe import (
+        modular_kernel,
+        mori_prepare_finalize,
+        wideep_experts,
+    )
 
     manager = SimpleNamespace(rank=3, world_size=16)
     group = SimpleNamespace(
         device_communicator=SimpleNamespace(all2all_manager=manager)
     )
     monkeypatch.setattr(parallel_state, "get_ep_group", lambda: group)
-    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+    monkeypatch.setattr(mori_prepare_finalize, "MORI_AVAILABLE", True)
+    monkeypatch.delenv("AITER_BF16_FP8_MOE_BOUND", raising=False)
 
-    arena_output = torch.ones((2, 4), dtype=torch.bfloat16)
-    calls = []
+    quantized = torch.zeros(3, 4, dtype=torch.uint8)
+    quant_scale = torch.ones(3, 1, dtype=torch.uint8)
+    recv_x = torch.zeros(8, 4, dtype=torch.uint8)
+    recv_scale = torch.ones(8, 1, dtype=torch.uint8)
+    recv_weights = torch.randn(8, 2, dtype=torch.float32)
+    recv_ids = torch.zeros(8, 2, dtype=torch.int32)
+    recv_count = torch.tensor([5], dtype=torch.int32)
+    fused_output = torch.full((8, 4), 7, dtype=torch.bfloat16)
+    combined = torch.full((3, 4), 9, dtype=torch.bfloat16)
+    calls = {}
+
+    def fake_quantize(hidden_states):
+        calls["quantize"] = hidden_states
+        return quantized, quant_scale
 
     class FakeOp:
-        def forward(self, hidden, weights, ids):
-            calls.append((hidden, weights, ids))
-            return arena_output
+        def dispatch(self, hidden, weights, scale, ids, block_num, warp_num):
+            calls["dispatch"] = (
+                hidden,
+                weights,
+                scale,
+                ids,
+                block_num,
+                warp_num,
+            )
+            return recv_x, recv_weights, recv_scale, recv_ids, recv_count
 
-    captured = {}
+        def combine(self, output, bias, ids, block_num, warp_num):
+            calls["combine"] = (output, bias, ids, block_num, warp_num)
+            return combined, None
 
-    def fake_get(**kwargs):
-        captured.update(kwargs)
-        return FakeOp()
-
-    monkeypatch.setattr(wideep_experts, "_get_wideep_op", fake_get)
-    layer = SimpleNamespace(swiglu_limit=10.0)
-    hidden = torch.randn(2, 4, dtype=torch.bfloat16)
-    weights = torch.randn(2, 2, dtype=torch.bfloat16)
-    ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int64)
-
-    output = wideep_experts.run_wideep_moe(
-        layer,
-        hidden,
-        weights,
-        ids,
-        model_dim=4,
-        inter_dim=8,
-        experts=16,
-        mtpr=32,
+    monkeypatch.setattr(wideep_experts, "_init_wideep_op", lambda **_kwargs: FakeOp())
+    monkeypatch.setattr(wideep_experts, "_quantize_wideep_dispatch", fake_quantize)
+    monkeypatch.setattr(
+        modular_kernel,
+        "get_forward_context",
+        lambda: SimpleNamespace(context=None),
     )
 
-    assert captured["rank"] == 3
-    assert captured["world_size"] == 16
-    assert captured["topk"] == 2
-    assert calls[0][1].dtype == torch.float32
-    assert calls[0][2].dtype == torch.int32
-    assert torch.equal(output, arena_output)
-    assert output.data_ptr() != arena_output.data_ptr()
+    def fake_fused_moe(*args, **kwargs):
+        calls["fused_moe"] = (args, kwargs)
+        return fused_output
+
+    monkeypatch.setattr(modular_kernel, "fused_moe", fake_fused_moe)
+
+    prepare_finalize = wideep_experts.make_wideep_prepare_finalize(
+        model_dim=4,
+        experts=16,
+        experts_per_rank=1,
+        topk=2,
+        mtpr=32,
+    )
+    assert isinstance(prepare_finalize, mori_prepare_finalize.MoriPrepareAndFinalize)
+    kernel = modular_kernel.FusedMoEModularKernel(prepare_finalize, quant_config=None)
+    hidden = torch.randn(3, 4, dtype=torch.bfloat16)
+    topk_weights = torch.randn(3, 2, dtype=torch.bfloat16)
+    topk_ids = torch.zeros(3, 2, dtype=torch.int64)
+    expert_mask = torch.tensor([1] + [0] * 16, dtype=torch.int32)
+
+    result = kernel(
+        hidden,
+        torch.empty(1, 8, 2),
+        torch.empty(1, 4, 4),
+        topk_weights,
+        topk_ids,
+        activation=ActivationType.Silu,
+        quant_type=QuantType.per_1x32,
+        global_num_experts=16,
+        expert_mask=expert_mask,
+        w1_scale=torch.ones(1),
+        w2_scale=torch.ones(1),
+        moe_extra_args={"gate_mode": "interleave", "swiglu_limit": 10.0},
+    )
+
+    assert calls["quantize"] is hidden
+    dispatch = calls["dispatch"]
+    assert dispatch[0] is quantized
+    assert dispatch[1].dtype == torch.float32
+    assert dispatch[2] is quant_scale
+    assert dispatch[3].dtype == torch.int32
+    assert dispatch[4:] == (96, 8)
+
+    args, kwargs = calls["fused_moe"]
+    assert args[0] is recv_x
+    assert args[3] is recv_weights
+    assert args[4] is recv_ids
+    assert args[5] is expert_mask
+    assert kwargs["a1_scale"] is recv_scale
+    assert kwargs["num_local_tokens"] is recv_count
+    assert kwargs["gate_mode"] == "interleave"
+
+    combine = calls["combine"]
+    assert combine[0] is fused_output
+    assert combine[1] is None
+    assert combine[2].dtype == torch.int32
+    assert combine[3:] == (96, 8)
+    assert torch.equal(result, combined)
 
 
-def test_wideep_rejects_torch_compile(monkeypatch):
+def test_wideep_method_installs_modular_kernel_and_sentinel_mask(monkeypatch):
     from atom.model_ops.fused_moe import wideep_experts
+    from atom.model_ops.fused_moe.modular_kernel import FusedMoEModularKernel
 
-    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
-    with pytest.raises(RuntimeError, match="--level 0"):
-        wideep_experts.run_wideep_moe(
-            SimpleNamespace(),
-            torch.empty(1, 4),
-            torch.empty(1, 1),
-            torch.empty(1, 1, dtype=torch.int64),
-            model_dim=4,
-            inter_dim=8,
-            experts=16,
-            mtpr=32,
-        )
+    method = object.__new__(moe_mod.WideEpMxfp4MoEMethod)
+    method.moe = SimpleNamespace(
+        num_experts=16,
+        num_local_experts=1,
+        experts_per_token=2,
+        max_num_tokens=32,
+    )
+    method.hidden_size = 4
+    method.intermediate_size = 8
+    method.topk_indices_dtype = None
+    method.fused_experts = None
+    quant_config = object()
+    method.get_fused_moe_quant_config = lambda _layer: quant_config
+
+    class FakePrepareFinalize:
+        def topk_indices_dtype(self):
+            return torch.int32
+
+    prepare_finalize = FakePrepareFinalize()
+    monkeypatch.setattr(
+        wideep_experts,
+        "make_wideep_prepare_finalize",
+        lambda **_kwargs: prepare_finalize,
+    )
+    layer = SimpleNamespace(expert_mask=torch.ones(16, dtype=torch.int32))
+
+    method.init_prepare_finalize(layer)
+
+    assert method.topk_indices_dtype == torch.int32
+    assert layer.expert_mask.tolist() == [1] * 16 + [0]
+    assert isinstance(method.fused_experts, FusedMoEModularKernel)
+    assert method.fused_experts.prepare_finalize is prepare_finalize
+    assert method.fused_experts.quant_config is quant_config
