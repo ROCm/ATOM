@@ -531,6 +531,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_PREFILL_DELAYER": lambda: (
         os.getenv("ATOM_ENABLE_PREFILL_DELAYER", "1") == "1"
     ),
+    # Build the coalescer on the single-rank (TP/DCP, dp_size=1) path too.
+    # PrefillDelayer always documented a `cpu_group=None` mode for dp_size=1,
+    # but it was only ever constructed in DPEngineCoreProc, so a TP-only server
+    # silently ran uncoalesced. Off by default: this changes prefill batching on
+    # every non-DP deployment, so opt in and measure before flipping it.
+    "ATOM_PREFILL_DELAYER_SINGLE_RANK": lambda: (
+        os.getenv("ATOM_PREFILL_DELAYER_SINGLE_RANK", "0") == "1"
+    ),
     # Fill target: release prefill once accumulated pending tokens reach
     # target_fill * max_num_batched_tokens (averaged across prefillable ranks).
     # In (0, 1]; higher batches harder (fewer, larger prefills) at some TTFT

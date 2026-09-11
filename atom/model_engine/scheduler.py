@@ -722,18 +722,36 @@ class Scheduler:
         so the "queued work" signal counts only tokens this rank could actually
         prefill this step. Counting remote-KV / unschedulable tokens here would
         inflate the cross-rank aggregate and reach the fill target before a real
-        batch has accumulated. The `num_cached_tokens` discount is best-effort:
-        an un-admitted seq has not been probed against the prefix cache yet, so
-        this is an upper bound on new tokens for cache-hit prompts.
+        An un-admitted seq has not been probed against the prefix cache yet, so
+        its `num_cached_tokens` is still 0 and `num_tokens - num_cached_tokens`
+        is the FULL prompt. On a prefix-cache-heavy workload that is not a small
+        error -- it is fatal to the coalescer:
+
+            agentic trace, 09-09: median prompt 79k tokens, 95.8% hit rate.
+            One waiting request alone pushed the raw count past the 16,384-token
+            cap, so `fill` pinned at 1.0 and the delayer fired every time.
+            Measured: hold_rate 1.58% over 29,000 decisions. `TARGET_FILL` had
+            no effect at any value.
+
+        So discount an un-probed seq by the observed hit rate. This is an
+        estimator, not a measurement: the population rate applied to a seq we
+        have not probed. A seq that HAS been probed (`num_cached_tokens > 0`)
+        keeps its exact value. Before any request completes the rate is None and
+        we fall back to the raw count -- the old behaviour, which only ever
+        fires early, never holds too long.
         """
         cap = self.max_num_batched_tokens
         total = 0
+        hit_rate = getattr(self.engine_stats, "recent_cache_hit_rate", None)
+        discount = 1.0 - hit_rate if hit_rate is not None else 1.0
         for seq in self.waiting:
             if self._unschedulable_reason(seq) is not None:
                 continue
             if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
                 continue
             num_new_tokens = seq.num_tokens - seq.num_cached_tokens
+            if seq.num_cached_tokens == 0:
+                num_new_tokens = int(num_new_tokens * discount)
             if (
                 not self.enable_chunked_prefill
                 and num_new_tokens > self.max_num_batched_tokens

@@ -1115,6 +1115,89 @@ class TestWaitingNewTokenCount:
         assert sched._waiting_new_token_count() == 16  # capped, scan short-circuits
 
 
+class TestWaitingNewTokenCountHitRateDiscount:
+    """An un-probed waiting seq must be discounted by the observed hit rate.
+
+    Regression for the 09-09 finding: `num_cached_tokens` is 0 until a seq is
+    admitted and probed, so the raw `num_tokens - num_cached_tokens` is the FULL
+    prompt. On the agentic trace (median prompt 79k, hit rate 95.8%) a single
+    waiting request saturated the coalescer's fill signal at 1.0, so the
+    PrefillDelayer fired on every decision — measured hold_rate 1.58% over
+    29,000 decisions, and `TARGET_FILL` had no effect at any value.
+    """
+
+    @staticmethod
+    def _set_hit_rate(sched, hit_rate):
+        """Drive the real sliding-window counters rather than stubbing the
+        property — `recent_cache_hit_rate` is read-only, and going through the
+        counters keeps the test honest about how the rate is actually derived
+        (`_recent_cached_tokens / _recent_reusable_tokens`)."""
+        st = sched.engine_stats
+        if hit_rate is None:
+            st._recent_reusable_tokens = 0  # empty window → property None
+            st._recent_cached_tokens = 0
+        else:
+            st._recent_reusable_tokens = 1_000_000
+            st._recent_cached_tokens = int(1_000_000 * hit_rate)
+
+    def _sched(self, hit_rate):
+        sched = Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=1000,
+                max_model_len=1024,
+                enable_chunked_prefill=True,
+            )
+        )
+        self._set_hit_rate(sched, hit_rate)
+        return sched
+
+    def test_no_rate_yet_keeps_raw_count(self, seq_factory):
+        # Before any request completes the window is empty. Fall back to the raw
+        # count: firing early is the old behaviour and is always safe.
+        sched = self._sched(None)
+        sched.waiting = deque([seq_factory(list(range(20)))])
+        assert sched._waiting_new_token_count() == 20
+
+    def test_high_hit_rate_discounts_unprobed_seq(self, seq_factory):
+        sched = self._sched(0.95)
+        sched.waiting = deque([seq_factory(list(range(100)))])
+        # 100 raw tokens, 95% of which the cache is expected to serve.
+        assert sched._waiting_new_token_count() == 5
+
+    def test_probed_seq_keeps_exact_value(self, seq_factory):
+        # num_cached_tokens > 0 means the seq HAS been probed; that number is a
+        # measurement, not an estimate, so it must not be discounted again.
+        sched = self._sched(0.95)
+        seq = seq_factory(list(range(100)))
+        seq.num_cached_tokens = 60
+        sched.waiting = deque([seq])
+        assert sched._waiting_new_token_count() == 40
+
+    def test_zero_hit_rate_is_a_no_op(self, seq_factory):
+        sched = self._sched(0.0)
+        sched.waiting = deque([seq_factory(list(range(20)))])
+        assert sched._waiting_new_token_count() == 20
+
+    def test_discount_lets_the_signal_stay_below_cap(self, seq_factory):
+        # The actual bug: without the discount one big prompt pins fill at 1.0.
+        sched = Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=16,
+                max_model_len=1024,
+                enable_chunked_prefill=True,
+            )
+        )
+        self._set_hit_rate(sched, 0.958)
+        sched.waiting = deque([seq_factory(list(range(200)))])
+        n = sched._waiting_new_token_count()
+        assert n < 16, "one 95.8%-cached prompt must not saturate the fill signal"
+        assert n == int(200 * (1 - 0.958))
+
+
 class TestPartialPrefillRemainingTokens:
     """Remaining tokens of mid-chunked-prefill seqs, folded into the coalescer
     pending signal so a small partial tail chunk batches instead of firing
