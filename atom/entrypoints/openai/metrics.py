@@ -367,13 +367,50 @@ class _AtomMetricsCollector:
             ),
             (
                 "atom:lmcache_save_requests",
-                "Number of completed LMCache save operations.",
+                (
+                    "Number of normally completed LMCache store calls; does not "
+                    "prove all candidate tokens were persisted."
+                ),
                 offload.get("save_requests", 0),
             ),
             (
                 "atom:lmcache_saved_tokens",
-                "Number of tokens saved to LMCache.",
+                (
+                    "Number of candidate tokens in normally completed LMCache "
+                    "store calls; not actual persisted tokens."
+                ),
                 offload.get("saved_tokens", 0),
+            ),
+            (
+                "atom:lmcache_save_ops_admitted",
+                "Number of LMCache save operations admitted by the scheduler.",
+                offload.get("save_ops_admitted", 0),
+            ),
+            (
+                "atom:lmcache_save_tokens_admitted",
+                (
+                    "Number of candidate tokens admitted for LMCache save; "
+                    "not actual persisted tokens."
+                ),
+                offload.get("save_tokens_admitted", 0),
+            ),
+            (
+                "atom:lmcache_save_ops_dropped",
+                "Number of LMCache save candidates dropped before submission.",
+                offload.get("save_ops_dropped", 0),
+            ),
+            (
+                "atom:lmcache_save_tokens_dropped",
+                "Number of candidate LMCache save tokens dropped before submission.",
+                offload.get("save_tokens_dropped", 0),
+            ),
+            (
+                "atom:lmcache_save_cancel_requests",
+                (
+                    "Number of LMCache save cancellation requests; does not "
+                    "indicate cancellation completion or source safety."
+                ),
+                offload.get("save_cancel_requests", 0),
             ),
         ):
             metric = CounterMetricFamily(name, documentation)
@@ -388,8 +425,45 @@ class _AtomMetricsCollector:
             ),
             (
                 "atom:lmcache_saves_pending",
-                "Number of LMCache saves currently in flight.",
+                (
+                    "Number of LMCache save operations awaiting terminal completion "
+                    "or cleanup; may include operations whose source is already safe."
+                ),
                 offload.get("saves_pending", 0),
+            ),
+            (
+                "atom:lmcache_save_ops_unretired",
+                "Number of admitted LMCache save operations not yet retired.",
+                offload.get("save_ops_unretired", 0),
+            ),
+            (
+                "atom:lmcache_save_pending_bytes",
+                "Candidate bytes reserved by admitted LMCache saves not yet retired.",
+                offload.get("save_pending_bytes", 0),
+            ),
+            (
+                "atom:lmcache_source_blocks_reserved",
+                (
+                    "Source block reservations for admitted saves not yet source-safe, "
+                    "including active requests; not deduplicated physical blocks."
+                ),
+                offload.get("source_blocks_reserved", 0),
+            ),
+            (
+                "atom:lmcache_source_blocks_leased",
+                (
+                    "Source block lease references retained after requests finish; "
+                    "not deduplicated physical blocks."
+                ),
+                offload.get("source_blocks_leased", 0),
+            ),
+            (
+                "atom:lmcache_save_oldest_age_seconds",
+                (
+                    "Age in seconds of the oldest admitted, unretired LMCache save "
+                    "across scheduler ranks; zero when none is outstanding."
+                ),
+                offload.get("save_oldest_age_ms", 0) / 1000,
             ),
         ):
             metric = GaugeMetricFamily(name, documentation)

@@ -202,8 +202,13 @@ discoverable from the central env reference despite bypassing the registry.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **LMCACHE_EC_PIN_TIMEOUT_SEC** | float | LMCache's own (300) | LMCache's source-pin timeout. ATOM reads it only to derive the engine's save-abandon window (`pin + 30s`), so the two stay ordered — a lost store report is reclaimed only after LMCache would already have force-unpinned its source. Non-positive disables ATOM's reclamation. ATOM sets no default of its own; when unset it assumes LMCache's. |
+| **LMCACHE_EC_PIN_TIMEOUT_SEC** | float | LMCache's own (300) | LMCache's pin timeout, also used to derive ATOM's legacy save-abandon threshold (`pin + 30s`). This timeout does not prove GPU sources are safe: Dense/M3 only requests cancellation and waits for all-rank source safety. Non-positive disables the legacy threshold. |
 | **OFFLOAD_MAX_PENDING_SAVES** | int | **2**, flat, for the engine-side/state-tier reader (`scheduler.py`); `max(2, 2 × OFFLOAD_COPY_WORKERS)` for the KV-leg reader (`_offload_common.py`) | Bound on total in-flight offload transfers (running + queued) held before a SLOT snapshot or executor submission. A KV save and a state store both pin bytes out of the same pool while they run, so the KV leg and the K3 state tier share this one number rather than each carrying its own. Two readers compute it, though: the KV leg's canonical `_offload_common.max_pending_saves` derives the shown default from `OFFLOAD_COPY_WORKERS` and **raises** on an unparseable value, while the scheduler's state-tier reader (`_offload_max_pending_saves`) has a simpler fallback — a flat default of **2** (no `OFFLOAD_COPY_WORKERS` scaling) that **warns and uses 2** on an unparseable value rather than raising. Set the env to an explicit integer to pin both. |
+| **OFFLOAD_SAVE_ADMISSION** | bool | 1 | Dense/M3 PAGE save capacity gates; `0` disables limits while retaining safe cancellation and retirement. |
+| **OFFLOAD_MAX_RESERVED_SOURCE_BLOCKS** | int | 10% of PAGE pool, rounded down, minimum 1 | Unsafe source-block budget, including sources of live requests. |
+| **OFFLOAD_MAX_PENDING_SAVE_BYTES** | int | source cap × measured block bytes | Candidate bytes reserved until store outcome and safe retirement. |
+| **OFFLOAD_MAX_PENDING_SAVE_TOKENS** | int | source cap × virtual block size (131072 with unknown pool), only when byte geometry is absent | Optional token budget / byte-geometry fallback. |
+| **OFFLOAD_SAVE_QUEUE_TIMEOUT_S** | float | 2 | Attempt cancellation once at this age after admission; `0` disables age-based attempts. A running save is never freed merely because it is old. |
 
 ## Profiling & debugging
 

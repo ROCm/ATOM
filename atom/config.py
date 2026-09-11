@@ -1589,6 +1589,9 @@ class Config:
     stop_token_ids: list[int] = field(default_factory=list)
     kv_cache_block_size: int = 16
     num_kvcache_blocks: int = -1
+    # Largest per-rank PAGE entry, communicated by the model runner. Save
+    # admission uses this geometry without importing a model-specific codec.
+    kv_cache_block_bytes: int = 0
     kv_cache_dtype: str = "bf16"
     index_cache_dtype: str | None = None
     enable_prefix_caching: bool = True
