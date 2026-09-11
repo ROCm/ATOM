@@ -1517,6 +1517,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 self.hidden_size,  # N_2,
                 self.intermediate_size,  # K_2,
                 atom_config.tensor_parallel_size,
+                # Selects the consuming kernel, which fixes the scale kwidth.
+                act_quant=self.act_quant,
             )
             del layer.w13_weight
             del layer.w2_weight

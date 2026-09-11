@@ -47,6 +47,34 @@ if envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE:
 from atom.model_ops.moe import MoEActivationQuant
 
 
+def _mx_scale_kwidth(act_quant) -> int:
+    """K-groups per scale tile, which the CONSUMING KERNEL fixes -- not the arch.
+
+    ``SWIZZLE_MX_SCALE`` names the tile but not its width, and the gfx1250
+    kernels disagree on the width for the same "GFX1250_SCALE" label:
+
+        moe_gemm_a8w4  (act FP8)  SCALE_KWIDTH = 4
+        moe_gemm_a4w4  (act FP4)  SCALE_KWIDTH = 4
+        moe_gemm_a16w4 (act BF16) SCALE_KWIDTH = 8
+
+    and the triton kernel hardcodes ``GFX1250_SCALE_KWIDTH = 4`` for the two
+    quantized-activation paths. CDNA4_SCALE (gfx950) is always 8 -- its
+    unswizzle takes no width argument at all.
+
+    Getting this wrong is SILENT: _shuffle_scale_tile_gfx1250 returns
+    ``cols * preshuffle_factor`` either way, so a mismatched width is a
+    different permutation at an identical shape, with nothing to assert on.
+
+    Must stay in step with ``SCALE_KWIDTH`` in the gfx1250 gluon MoE kernels
+    and ``GFX1250_SCALE_KWIDTH`` in the triton one. Branch A of
+    ``_process_weight_layout_after_loading`` states the same rule inline; it
+    only ever feeds a8w4/a4w4, so it can hardcode 4 on gfx1250.
+    """
+    if get_arch() != "gfx1250":
+        return 8
+    return 8 if act_quant == MoEActivationQuant.BF16 else 4
+
+
 def _swizzle_mxfp4(
     w1,
     w1_scale,
@@ -58,11 +86,16 @@ def _swizzle_mxfp4(
     N_2,
     K_2,
     TP=1,
+    *,
+    act_quant,
 ):
     """Weight swizzle for mxfp4 moe, used for aiter triton mxfp4 moe kernels.
 
     The arch -> SWIZZLE_MX_SCALE label decision lives in aiter
-    (``shuffle_scale_moe(..., return_layout=True)``), so this stays arch-agnostic.
+    (``shuffle_scale_moe(..., return_layout=True)``), but the scale WIDTH does
+    not -- it belongs to whichever kernel ``act_quant`` selects, so it is
+    passed explicitly. ``act_quant`` is keyword-only and has no default on
+    purpose: a default would silently pick a width for a caller that forgot.
     """
     assert envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE
 
@@ -72,16 +105,21 @@ def _swizzle_mxfp4(
     w2_triton_layout = w2.transpose(-2, -1)
     w2_scale_triton_layout = w2_scale.transpose(-2, -1)
 
-    if N_1 % 32 == 0 and K_1 % (32 * 8) == 0:
+    # The divisibility bound is the chosen width, not a fixed 8: at kwidth 4
+    # gfx1250 only needs K // 32 divisible by 4, so hardcoding 8 also dropped
+    # shapes that could have been swizzled.
+    scale_kwidth = _mx_scale_kwidth(act_quant)
+
+    if N_1 % 32 == 0 and K_1 % (32 * scale_kwidth) == 0:
         w1_scale_triton_layout, w1_swizzle_layout = shuffle_scale_moe(
-            w1_scale_triton_layout, return_layout=True
+            w1_scale_triton_layout, return_layout=True, scale_kwidth=scale_kwidth
         )
     else:
         w1_swizzle_layout = None
 
-    if N_2 % 32 == 0 and K_2 % (32 * 8) == 0:
+    if N_2 % 32 == 0 and K_2 % (32 * scale_kwidth) == 0:
         w2_scale_triton_layout, w2_swizzle_layout = shuffle_scale_moe(
-            w2_scale_triton_layout, return_layout=True
+            w2_scale_triton_layout, return_layout=True, scale_kwidth=scale_kwidth
         )
     else:
         w2_swizzle_layout = None
