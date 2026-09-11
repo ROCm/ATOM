@@ -30,6 +30,9 @@ def _sse(payload, newline="\n"):
             "type": "content_block_start",
             "content_block": {"type": "tool_use", "name": "search"},
         },
+        {"type": "response.output_text.delta", "delta": "hi"},
+        {"type": "response.custom_tool_call_input.delta", "delta": "patch"},
+        {"type": "response.function_call_arguments.delta", "delta": "{"},
     ],
 )
 def test_first_output_handles_fragmented_events_and_ignores_metadata(payload):

@@ -46,6 +46,14 @@ def _has_generated_output(payload: Any) -> bool:
     if payload.get("type") == "content_block_start":
         block = payload.get("content_block") or {}
         return _has_text(block, ("text", "thinking", "name"))
+    # OpenAI Responses / Codex events carry generation in `delta`.
+    if payload.get("type") in (
+        "response.output_text.delta",
+        "response.custom_tool_call_input.delta",
+        "response.function_call_arguments.delta",
+    ):
+        delta = payload.get("delta")
+        return isinstance(delta, str) and bool(delta)
     return False
 
 
@@ -167,7 +175,12 @@ class RequestTimingMiddleware:
             scope["type"] != "http"
             or scope.get("method") != "POST"
             or scope.get("path")
-            not in {"/v1/chat/completions", "/v1/completions", "/v1/messages"}
+            not in {
+                "/v1/chat/completions",
+                "/v1/completions",
+                "/v1/messages",
+                "/v1/responses",
+            }
         ):
             await self.app(scope, receive, send)
             return
