@@ -4108,7 +4108,10 @@ def test_pending_work_tracks_undispatched_loads_and_unreported_saves():
     assert sched.has_pending_work() is False
 
 
-def test_chunked_prefill_save_uses_computed_frontier_and_serializes_inflight():
+@pytest.mark.parametrize("send_first", [False, True])
+def test_chunked_prefill_save_uses_computed_frontier_and_serializes_inflight(
+    send_first,
+):
     sched = _scheduler()
     seq = SimpleNamespace(
         id=10,
@@ -4133,13 +4136,43 @@ def test_chunked_prefill_save_uses_computed_frontier_and_serializes_inflight():
     meta2 = sched.build_connector_meta()
     assert len(meta2.requests) == 0
 
-    sched.save_finished(meta1.requests[0].save_operation)
+    # The producer finishes with one save in flight and a suffix not yet issued.
+    seq._awaiting_kv_send = True
+    freed = []
+    engine_sched = Scheduler.__new__(Scheduler)
+    engine_sched.deferred_free_blocks = {seq.id: seq}
+    engine_sched.block_manager = SimpleNamespace(deallocate=freed.append)
+    engine_sched.kv_connector = SimpleNamespace(
+        is_producer=True,
+        is_offload=True,
+        process_completions=sched.process_completions,
+        should_defer_free=sched.should_defer_free,
+    )
+    report = engine_sched._update_from_kv_xfer_finished
+    if send_first:
+        report(KVConnectorOutput(finished_sending={seq.id}))
+        assert not freed
+        assert seq._deferred_save_at > 0
+
+    first_save = meta1.requests[0].save_operation
+    report(KVConnectorOutput(finished_saving={first_save}))
+    assert str(seq.id) not in sched._save_inflight
+    assert not freed  # The undispatched suffix still owns the source blocks.
     meta3 = sched.build_connector_meta()
 
     assert len(meta3.requests) == 1
     assert len(meta3.requests[0].token_ids) == 12
     assert meta3.requests[0].save_spec.skip_leading_tokens == 8
     assert meta3.requests[0].is_last_prefill is True
+
+    report(KVConnectorOutput(finished_saving={first_save}))  # Stale generation.
+    assert not freed
+    report(KVConnectorOutput(finished_saving={meta3.requests[0].save_operation}))
+    if not send_first:
+        assert not freed  # All saves finished, but the send still owns blocks.
+        report(KVConnectorOutput(finished_sending={seq.id}))
+    assert freed == [seq]
+    assert not engine_sched.deferred_free_blocks
 
 
 def test_finished_saving_releases_deferred_free_with_string_req_id():
