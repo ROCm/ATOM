@@ -2,8 +2,9 @@
 
 # Decide whether an expensive PR CI workflow should run.
 # Non-PR events keep their existing behavior. For PR events, run when the PR
-# currently has one of CI_GATE_LABELS, or the PR has any historical APPROVED
-# review.
+# currently has one of CI_GATE_LABELS, or GitHub reports that the PR's current
+# aggregate review decision is APPROVED. Dismissed or superseded reviews must
+# not authorize unrelated heavy CI workflows.
 
 set -euo pipefail
 
@@ -167,7 +168,6 @@ fi
 ACTION="$(jq -r '.action // ""' "${EVENT_PATH}")"
 PR_NUMBER="$(jq -r '.pull_request.number // empty' "${EVENT_PATH}")"
 IS_DRAFT="$(jq -r '.pull_request.draft // false' "${EVENT_PATH}")"
-EVENT_LABEL="$(jq -r '.label.name // empty' "${EVENT_PATH}")"
 BASE_REF="$(jq -r '.pull_request.base.ref // ""' "${EVENT_PATH}")"
 
 if [ "${BASE_REF}" != "main" ]; then
@@ -209,17 +209,33 @@ fi
 
 check_relevant_paths
 
-if ! REVIEW_STATES="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/reviews" --jq '.[].state')"; then
-  echo "Failed to query PR review state; skipping heavy CI."
+if ! REVIEW_DECISION="$(
+  gh api graphql \
+    -f owner="${OWNER}" \
+    -f name="${NAME}" \
+    -F number="${PR_NUMBER}" \
+    -f query='query($owner: String!, $name: String!, $number: Int!) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $number) {
+          reviewDecision
+        }
+      }
+    }' \
+    --jq '.data.repository.pullRequest.reviewDecision // ""'
+)"; then
+  echo "Failed to query the current PR review decision; skipping heavy CI."
   emit_decision "false" "review-query-failed"
   exit 0
 fi
 
-APPROVAL_COUNT="$(printf '%s\n' "${REVIEW_STATES}" | awk '$0 == "APPROVED" || $0 == "DISMISSED" { count++ } END { print count + 0 }')"
-CHANGES_REQUESTED_COUNT="$(printf '%s\n' "${REVIEW_STATES}" | awk '$0 == "CHANGES_REQUESTED" { count++ } END { print count + 0 }')"
-
-if [ "${APPROVAL_COUNT}" -gt 0 ]; then
-  emit_decision "true" "approved-history" "" "APPROVED_HISTORY" "${APPROVAL_COUNT}" "${CHANGES_REQUESTED_COUNT}"
-else
-  emit_decision "false" "not-approved" "" "" "${APPROVAL_COUNT}" "${CHANGES_REQUESTED_COUNT}"
-fi
+case "${REVIEW_DECISION}" in
+  APPROVED)
+    emit_decision "true" "current-approval" "" "${REVIEW_DECISION}" "1" "0"
+    ;;
+  CHANGES_REQUESTED)
+    emit_decision "false" "changes-requested" "" "${REVIEW_DECISION}" "0" "1"
+    ;;
+  *)
+    emit_decision "false" "not-approved" "" "${REVIEW_DECISION}" "0" "0"
+    ;;
+esac

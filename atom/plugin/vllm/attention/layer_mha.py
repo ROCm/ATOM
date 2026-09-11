@@ -11,7 +11,9 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from atom.config import get_current_atom_config
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import (
+    PA_ASM_MAX_QUERY_GROUP_SIZE,
     cp_mha_gather_cache,
+    gluon_decode_over_limit,
     run_pa_decode_gluon,
     run_pa_fwd_asm,
 )
@@ -142,7 +144,11 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             if cache_dtype == "fp8"
             else 1.0
         )
-        self.kv_scale = torch.tensor(self.kv_scale_float, dtype=torch.float32)
+        # On device: this is aliased into self.per_tensor_scale and reaches
+        # fused_qk_rope_reshape_and_cache, which dereferences it in the kernel.
+        self.kv_scale = torch.tensor(
+            self.kv_scale_float, dtype=torch.float32, device=self.device
+        )
         self.per_token_quant = True
         self.sinks = sinks
         self.sliding_window = (
@@ -420,8 +426,11 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         # the max_qlen multiplier — mirroring server-mode `paged_attention_triton`.
         _, num_q_heads_total, head_size = q.shape
         _, num_kv_heads, _, _, _ = k_cache.shape
+        # Only reached through _dispatch_decode_backend, which asserts
+        # decode_metadata is present and reads the same field to pick this
+        # function -- so no default, and one read per step rather than two.
         decode_metadata = attn_metadata.decode_metadata
-        max_qlen = decode_metadata.max_query_len if decode_metadata is not None else 1
+        max_qlen = decode_metadata.max_query_len
         assert num_q_heads_total % num_kv_heads == 0
 
         seq_lens = attn_metadata.seq_lens[:num_decodes]
@@ -508,11 +517,11 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         attn_metadata: "AiterMhaMetadataForVllm",
         out: torch.Tensor,
     ):
+        # Same as paged_attention_triton: only reached through the decode
+        # dispatcher, which has already asserted decode_metadata is present.
         decode_metadata = attn_metadata.decode_metadata
-        max_qlen = decode_metadata.max_query_len if decode_metadata is not None else 1
-        qo_indptr = (
-            decode_metadata.query_start_loc if decode_metadata is not None else None
-        )
+        max_qlen = decode_metadata.max_query_len
+        qo_indptr = decode_metadata.query_start_loc
         run_pa_fwd_asm(
             q=q,
             k_cache=k_cache,
@@ -719,16 +728,26 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             suffix_lse=lse,
         )
 
-    def _dispatch_decode_backend(self, num_decodes):
-        # use asm pa for models without setting gluon pa decode bs
+    def _dispatch_decode_backend(self, num_decodes, max_qlen):
+        # No fallback exists here: this bridge has no unified branch, and ASM
+        # tops out lower still, where an unmatched mtp picks a kernel built for
+        # another qlen and computes instead of asserting.
+        if gluon_decode_over_limit(max_qlen, self.num_heads, self.num_kv_heads):
+            raise NotImplementedError(
+                f"query length {max_qlen} is past the gluon decode kernel, and "
+                "this bridge has no fallback that takes it"
+            )
         gluon_pa_decode_bs = _GLUON_PA_DECODE_BS_MAPPING.get(self.model_type, -1)
         if self.use_triton_attn:
             return self.paged_attention_triton
-        else:
-            if ATOM_USE_GLUON_PA_DECODE and num_decodes <= gluon_pa_decode_bs:
-                return self.paged_attention_triton
-            else:
-                return self.paged_attention_asm
+        if ATOM_USE_GLUON_PA_DECODE and num_decodes <= gluon_pa_decode_bs:
+            return self.paged_attention_triton
+        # Past ASM's envelope prefer the wider kernel: ASM would silently fall
+        # back to one built for a different qlen rather than refuse.
+        asm_group = int(max_qlen) * (self.num_heads // self.num_kv_heads)
+        if asm_group > PA_ASM_MAX_QUERY_GROUP_SIZE:
+            return self.paged_attention_triton
+        return self.paged_attention_asm
 
     def forward_impl(
         self,
@@ -915,7 +934,9 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         if num_decodes > 0:
             assert attn_metadata.decode_metadata is not None
 
-            decode_backend_func = self._dispatch_decode_backend(num_decodes)
+            decode_backend_func = self._dispatch_decode_backend(
+                num_decodes, attn_metadata.decode_metadata.max_query_len
+            )
             decode_backend_func(
                 q=query[:num_decode_tokens],
                 k_cache=new_key_cache,
