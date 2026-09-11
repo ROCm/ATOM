@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 
 from atom.config import Config
 from atom.models.deepseek_v2 import DeepseekV3ForCausalLM, GlmMoeDsaForCausalLM
@@ -117,7 +118,7 @@ def _register_custom_attention_to_sglang() -> None:
     def create_atom_backend(runner):
         hf_config = runner.model_config.hf_config
         arches = getattr(hf_config, "architectures", None) or []
-        if any("DeepseekV4" in str(arch) for arch in arches):
+        if any(re.search(r"DeepseekV4(?!\d)", str(arch)) for arch in arches):
             logger.info(
                 "Use ATOMDeepseekV4BackendForSgl for DeepSeek-V4 through SGLang aiter backend choice"
             )
@@ -284,7 +285,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 )
                 or []
             )
-            return any("DeepseekV4" in str(arch) for arch in arches)
+            return any(re.search(r"DeepseekV4(?!\d)", str(arch)) for arch in arches)
         except Exception:
             return False
 

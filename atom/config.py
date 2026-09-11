@@ -2101,7 +2101,10 @@ class Config:
         # Use the preserved `architectures` field (re-injected by get_hf_config,
         # line 567) which keeps the original "DeepseekV4ForCausalLM[NextN]" name.
         arches = getattr(self.hf_config, "architectures", None) or []
-        is_deepseek_v4 = any("DeepseekV4" in str(a) for a in arches)
+        # `DeepseekV4` NOT followed by a digit: V4* (Pro, DSpark, NextN) but NOT
+        # DeepseekV41 (V4.1), which is a distinct architecture and must not take
+        # V4's 256 block-size override.
+        is_deepseek_v4 = any(re.search(r"DeepseekV4(?!\d)", str(a)) for a in arches)
         if is_deepseek_v4:
             v4_block_size = 256
             if self.kv_cache_block_size != v4_block_size:

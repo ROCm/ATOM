@@ -1145,8 +1145,28 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         The modules, counted -- so sizing, allocation and the P/D adopt path
         cannot disagree, and a hybrid's linear layers or a draft's stack are
         simply not in the walk rather than something to subtract.
+
+        Fallback: a model whose decoder layers are stubs carrying no attention
+        module yet (the DeepSeek-V4.1 Engram stub) walks to zero MLA rows, which
+        would size the pool at 0 bytes and divide by zero in `plan_pools`. It
+        still runs through the paged serving path and needs a non-degenerate pool
+        to schedule against, so size it from this PP stage's config layer count.
+        A real MLA model always counts >0 here, so the fallback never fires.
         """
-        return self.row_counts().get(MLA_ROWS, 0)
+        counted = self.row_counts().get(MLA_ROWS, 0)
+        if counted:
+            return counted
+        from aiter.dist.parallel_state import get_pp_group
+        from atom.models.utils import get_pp_indices
+
+        hf_config = self.model_runner.config.hf_config
+        pp_group = get_pp_group()
+        start_layer, end_layer = get_pp_indices(
+            hf_config.num_hidden_layers,
+            pp_group.rank_in_group,
+            pp_group.world_size,
+        )
+        return end_layer - start_layer
 
     def _index_rows_per_block(self) -> int:
         """Indexer rows one scheduler block owns — one per token by default.

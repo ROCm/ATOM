@@ -674,9 +674,11 @@ class InputOutputProcessor:
                 "kimi_linear",
                 "glm5_next_text",
                 "deepseek_v4",
-                # V4.1's text half is served through the V4 attention builder
-                # today, which declares a per-request state sub-pool.
-                "deepseek_v41_text",
+                # NOTE: deepseek_v41_text is intentionally NOT here. V4.1's stub
+                # is served through the MLA builder (attn_family routes it there
+                # via its synthesized kv_lora_rank), which declares no per-request
+                # state sub-pool — so a V4.1 request must not reserve a state slot,
+                # or it waits forever for a slot the MLA pool never holds.
             }
         )
 

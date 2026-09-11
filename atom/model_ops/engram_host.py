@@ -9,6 +9,7 @@ orders of magnitude more bytes than the step needs.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -159,6 +160,9 @@ class EngramPrefetcher:
             max_workers=1, thread_name_prefix="engram-prefetch"
         )
         self._inflight: Future | None = None
+        # DEBUG (ATOM_ENGRAM_DEBUG_VERIFY): the token each seq was last prefetched
+        # with, so `stage` can compare it against the token it recomputes from.
+        self._debug_prefetch_token: dict[int, int] = {}
 
     @property
     def layer_ids(self) -> tuple[int, ...]:
@@ -184,6 +188,8 @@ class EngramPrefetcher:
         def _run() -> None:
             for key, value in self.compute(seq_ids, token_ids).items():
                 self.cache.put(key[0], key[1], value)
+            for i, sid in enumerate(seq_ids):
+                self._debug_prefetch_token[sid] = int(token_ids[i][-1])
 
         self._inflight = self._pool.submit(_run)
         return self._inflight
@@ -252,15 +258,32 @@ class EngramRuntime:
         self.copy_stream = torch.cuda.Stream(device) if device.type == "cuda" else None
         self.copy_done = torch.cuda.Event() if device.type == "cuda" else None
         self._staged_rows = 0
+        # ATOM_ENGRAM_DEBUG_VERIFY cumulative counters (see `stage`).
+        self._verify_stages = 0
+        self._verify_rows = 0
+        self._verify_bad = 0
+        self._verify_done = False
 
     @property
     def layer_ids(self) -> tuple[int, ...]:
         return self.prefetcher.layer_ids
 
-    def stage(self, seq_ids: list[int], token_ids: np.ndarray | None = None) -> int:
+    def stage(
+        self,
+        seq_ids: list[int],
+        token_ids: np.ndarray | None = None,
+        verify_token_ids: np.ndarray | None = None,
+    ) -> int:
         """Fill the staging buffers for `seq_ids`; returns the row count staged.
 
-        `token_ids` is only consulted for sequences the prefetch missed.
+        `token_ids` is only consulted for sequences the prefetch missed -- the
+        caller passes the cheap host-side source (the scheduler's committed
+        anchor), correct for the just-admitted rows that are the only misses.
+
+        `verify_token_ids`, when the debug check is on, is the GROUND-TRUTH token
+        per row (this step's real model input) used to recompute the reference.
+        Keeping it separate is what lets verify catch a bad `token_ids` source:
+        a miss recomputed from the wrong anchor diverges from this reference.
         """
         num_rows = len(seq_ids)
         if num_rows > self.max_num_tokens:
@@ -286,9 +309,28 @@ class EngramRuntime:
             miss_ids = [seq_ids[i] for i in missing]
             computed = self.prefetcher.compute(miss_ids, token_ids[missing])
 
+        # DEBUG (ATOM_ENGRAM_DEBUG_VERIFY): the module's invariant is that the
+        # async-prefetched rows equal a fresh SYNCHRONOUS recompute -- the
+        # prefetch only decides whether the work was already done, never the
+        # answer. Recompute every seq inline now and compare it against what is
+        # about to be staged; for a cache hit that staged value came off the
+        # prefetch queued on the PREVIOUS step, so a match proves the async
+        # hand-off (per-seq token alignment, cache keying, staging) is correct.
+        # `=1` logs mismatches; `=strict` also raises. Off by default; doubles the
+        # host gather when on.
+        verify = os.environ.get("ATOM_ENGRAM_DEBUG_VERIFY")
+        reference = (
+            self.prefetcher.compute(seq_ids, verify_token_ids)
+            if verify and not self._verify_done and verify_token_ids is not None
+            else None
+        )
+        n_checked = n_from_cache = n_bad = n_tok_bad = 0
+        logged = 0
+
         for layer_id in self.layer_ids:
             cpu = self.buffers[layer_id].cpu
             for row, seq_id in enumerate(seq_ids):
+                from_cache = (seq_id, layer_id) not in computed
                 value = computed.get((seq_id, layer_id))
                 if value is None:
                     value = self.prefetcher.cache.take(seq_id, layer_id)
@@ -296,7 +338,86 @@ class EngramRuntime:
                     raise RuntimeError(
                         f"no engram embedding for seq {seq_id} layer {layer_id}"
                     )
+                if reference is not None:
+                    ref = reference[(seq_id, layer_id)]
+                    n_checked += 1
+                    n_from_cache += int(from_cache)
+                    if not torch.equal(value, ref):
+                        n_bad += 1
+                        # The decisive split: did we recompute from a DIFFERENT
+                        # token than the prefetch used (async alignment), or the
+                        # SAME token yet still diverge (gather/table bug)?
+                        ref_tok = int(verify_token_ids[row][-1])
+                        cache_tok = self.prefetcher._debug_prefetch_token.get(seq_id)
+                        tok_match = ref_tok == cache_tok
+                        n_tok_bad += int(not tok_match)
+                        if logged < 8:
+                            logged += 1
+                            d = (value.float() - ref.float()).abs()
+                            logger.error(
+                                "engram VERIFY MISMATCH seq=%d layer=%d "
+                                "from_cache=%s ref_token=%s cache_token=%s "
+                                "token_match=%s max|delta|=%.6g ndiff=%d/%d",
+                                seq_id,
+                                layer_id,
+                                from_cache,
+                                ref_tok,
+                                cache_tok,
+                                tok_match,
+                                float(d.max()),
+                                int((d > 0).sum()),
+                                d.numel(),
+                            )
+                    # Show the actual numbers -- prefetched (computed one step
+                    # ahead) vs the on-the-spot recompute -- for the first row of
+                    # the first few steps, so equality is visible as values.
+                    if (
+                        row == 0
+                        and layer_id == self.layer_ids[0]
+                        and self._verify_stages < 6
+                    ):
+                        pv = [
+                            round(x, 4) for x in value.reshape(-1)[:6].float().tolist()
+                        ]
+                        rv = [
+                            round(x, 4) for x in ref.reshape(-1)[:6].float().tolist()
+                        ]
+                        logger.warning(
+                            "engram VERIFY VALUES step %d seq=%d layer=%d token=%s "
+                            "equal=%s prefetched[:6]=%s recomputed[:6]=%s",
+                            self._verify_stages + 1,
+                            seq_id,
+                            layer_id,
+                            int(verify_token_ids[row][-1]),
+                            torch.equal(value, ref),
+                            pv,
+                            rv,
+                        )
                 cpu[row].copy_(value.reshape(-1)[: self.embed_width])
+
+        if reference is not None:
+            self._verify_stages += 1
+            self._verify_rows += n_checked
+            self._verify_bad += n_bad
+            # One compact line per step over a short window, so the prefill->
+            # decode transient (the first decode step's cache is stale because
+            # prefill's prefetch had no sampled token yet under deferred output)
+            # shows up apart from any steady-state divergence. wrong-token>0 means
+            # the staged token != this step's model input; ==0 with mismatch would
+            # mean the gather itself diverges.
+            logger.warning(
+                "engram VERIFY step %d: %d/%d rows mismatch, %d wrong-token",
+                self._verify_stages,
+                n_bad,
+                n_checked,
+                n_tok_bad,
+            )
+            if self._verify_stages >= 12:
+                self._verify_done = True
+            if n_bad and verify == "strict":
+                raise AssertionError(
+                    f"engram prefetch/inline mismatch on {n_bad} row(s)"
+                )
 
         if self.copy_stream is not None:
             with torch.cuda.stream(self.copy_stream):

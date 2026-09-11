@@ -861,7 +861,7 @@ class ModelRunner:
                 f"{list(self.engram.layer_ids)}"
             )
 
-    def _stage_engram(self, batch: ScheduledBatch) -> None:
+    def _stage_engram(self, batch: ScheduledBatch, input_ids: torch.Tensor) -> None:
         """Move this step's engram rows to the device before the model runs.
 
         Decode is the real path: one row per sequence, keyed on the token the
@@ -869,6 +869,17 @@ class ModelRunner:
         Prefill and dummy passes stage zeros -- engram then contributes exactly
         nothing, which is wrong for a real model and has to be replaced by a
         per-prompt-token gather before this serves anything for accuracy.
+
+        The lookup token is this step's actual model input -- the previous step's
+        sampled token, which `prefetch_next` queued the gather for. On the hot
+        path the cache is keyed by seq id, so a hit needs no token at all; the
+        token is consulted only to recompute a prefetch miss, which is always a
+        just-admitted sequence whose committed anchor sits in the scheduler's
+        host `scheduled_tokens` -- read from there, no device->host copy. (That is
+        the committed anchor, not the `seq.last_token` snapshot, which lags a step
+        under deferred output and would key a miss on the wrong token.) Only the
+        verify path, recomputing a reference for every row, falls back to the
+        `input_ids` D2H for ground truth.
         """
         seq_ids = list(batch.req_ids)
         # A dummy pass runs the engram layers with nothing to look up, and a
@@ -882,10 +893,33 @@ class ModelRunner:
             self.engram.stage_dummy(batch.total_tokens_num)
             self.engram.wait_for_copy()
             return
-        last_tokens = np.array(
-            [[batch.seqs[seq_id].last_token] for seq_id in seq_ids], dtype=np.int64
-        )
-        self.engram.stage(seq_ids, last_tokens)
+        # One token per seq on a pure-decode step (the guard above), aligned with
+        # `req_ids`; the host gather wants a column ([N, 1]) of numpy int64.
+        #
+        # `stage()` consults these tokens ONLY for sequences the prefetch missed,
+        # and a miss is a just-admitted sequence -- for which the scheduler's
+        # host-side `scheduled_tokens` already holds the real anchor (a
+        # carried-over row is a placeholder there, but it is a cache hit and its
+        # token is never read). So the hot path reads the token straight off that
+        # host array with no device->host copy. This is NOT the lagging
+        # `seq.last_token` snapshot: that trails a step under deferred output,
+        # whereas `scheduled_tokens` is this step's committed anchor.
+        tokens = batch.scheduled_tokens[: len(seq_ids)].astype(np.int64).reshape(-1, 1)
+        # Verify recomputes a reference for EVERY row against the ground-truth
+        # model input, so it needs `input_ids` even for carried-over rows; only
+        # there do we pay the D2H (debug-only). Passing it separately lets verify
+        # catch a bad `scheduled_tokens` anchor: a miss recomputed from it would
+        # diverge from this reference.
+        verify_tokens = None
+        if os.environ.get("ATOM_ENGRAM_DEBUG_VERIFY"):
+            verify_tokens = (
+                input_ids[: len(seq_ids)]
+                .detach()
+                .to("cpu", dtype=torch.int64)
+                .numpy()
+                .reshape(-1, 1)
+            )
+        self.engram.stage(seq_ids, tokens, verify_token_ids=verify_tokens)
         self.engram.wait_for_copy()
 
     def _maybe_warmup(self):
@@ -3113,16 +3147,25 @@ class ModelRunner:
         req_ids_out = [k for k in token_id_dict if k != -1]
         token_ids_out = [token_id_dict[k] for k in req_ids_out]
 
-        # These ids were copied to the host by the sampler's async path and are
-        # already synchronized here, so queuing the engram gather costs no extra
-        # synchronization -- it runs on a worker while the next step's GPU work
-        # is being issued. Hooking this into the copy itself (as the #168
-        # prototype did) would force a device sync and give the overlap back.
-        if getattr(self, "engram", None) is not None and req_ids_out:
-            self.engram.prefetch_next(
-                req_ids_out,
-                np.array([[ids[-1]] for ids in token_ids_out], dtype=np.int64),
+        # Prefetch for the token JUST sampled this step -- it is the NEXT step's
+        # model input, and computing its hash + host gather now (on the worker)
+        # overlaps this step's postprocess, so it is done and its embedding H2D'd
+        # by the time engram runs next step (the #168 design). `prepare_sampled_ids`'
+        # output is the DEFERRED (previous batch's) token instead, which prefetches
+        # one step stale -- the staged embedding then keys on `input_ids[N-1]` while
+        # the step processes `input_ids[N]`. `sampled_tokens` reshaped per request
+        # takes the last (bonus) token per seq, matching the deferred path's `[-1]`.
+        # The small D2H here is the sync #168 accepted to keep the token current.
+        if getattr(self, "engram", None) is not None and not batch.is_dummy_run:
+            cur_req_ids = list(batch.req_ids)
+            cur_tokens = (
+                sampled_tokens.detach()
+                .reshape(len(cur_req_ids), -1)[:, -1]
+                .to("cpu", dtype=torch.int64)
+                .numpy()
+                .reshape(-1, 1)
             )
+            self.engram.prefetch_next(cur_req_ids, cur_tokens)
 
         draft_token_ids: np.ndarray | None = None
         if self.tokenID_processor.is_deferred_out:
@@ -3219,7 +3262,7 @@ class ModelRunner:
         ) = self.prepare_model(batch)
         self._mark_staging_h2d_enqueued()
         if getattr(self, "engram", None) is not None:
-            self._stage_engram(batch)
+            self._stage_engram(batch, input_ids)
         logits, hidden_states = self.run_model(input_ids, batch)
 
         pp_group = get_pp_group()
@@ -3670,6 +3713,12 @@ class ModelRunner:
                 ubatch_slices=None,
                 in_hipgraph=True,
             )
+            # Engram stages per forward; re-stage zeros at this capture width or
+            # the engram layer sees the previous stage's row count. Eager here,
+            # before the piecewise capture below.
+            if getattr(self, "engram", None) is not None:
+                self.engram.stage_dummy(num_tokens_dp)
+                self.engram.wait_for_copy()
             # Warmup, then the PIECEWISE forward: dense pieces replay (deduped by
             # num_tokens); attn_ffn op captures its (bs, q_eff, num_tokens_pad) graph.
             self.model(input_ids[:num_tokens_dp], model_positions)
@@ -3912,6 +3961,14 @@ class ModelRunner:
                         if self.use_mrope
                         else positions[:num_tokens]
                     )
+                    # Engram stages per forward; capture buckets run at fewer
+                    # tokens than warmup, so re-stage zeros at this width or the
+                    # engram layer sees the previous stage's row count against
+                    # num_tokens hidden and raises. Eager, before capture — the
+                    # H2D must not bake into the graph.
+                    if getattr(self, "engram", None) is not None:
+                        self.engram.stage_dummy(num_tokens)
+                        self.engram.wait_for_copy()
                     model_output = self.model(input_ids[:num_tokens], model_positions)
                     outputs[:num_tokens] = model_output
                     if self.logits_in_graph:
