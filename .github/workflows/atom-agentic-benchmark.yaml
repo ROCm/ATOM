@@ -1,0 +1,96 @@
+# Agentic trace-replay benchmark: AIPerf's `inferencex-agentx-mvp` scenario
+# against a single-node ATOM server, matching InferenceX's
+# benchmarks/single_node/agentic recipe.
+#
+# Separate from ATOM Benchmark because the cost is an order of magnitude apart:
+# a random ISL/OSL cell is minutes, an agentic cell replays for a full hour.
+# The split is enforced in code, not by convention -- the catalog's
+# `bench_kind` field, filtered via BENCH_KIND_FILTER, so neither workflow can
+# pick up the other's variants.
+name: ATOM Agentic Benchmark
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+on:
+  schedule:
+    # Weekly, Sunday 14:07 Beijing time (06:07 UTC Sunday). Off the hour, and
+    # well into the day: the nightly starts 00:12 Beijing and its 317 cells are
+    # long done by then. Both draw from the same runner pool
+    # (atom-mi355-8gpu.predownload), so the old 01:07 slot had nine agentic
+    # cells holding a machine each for ~1.5h while the nightly was still
+    # queuing. Contending is survivable -- whoever gets a runner uses it -- but
+    # there is no reason to schedule it.
+    - cron: '7 6 * * 0'
+  workflow_dispatch:
+    inputs:
+      benchmark_duration:
+        description: "Replay seconds per cell. 3600 = the official scenario duration. Below 900 forces --unsafe-override and stamps submission_valid=false (smoke test only)."
+        type: string
+        default: "3600"
+      image:
+        description: "Image to use for the benchmark"
+        type: string
+        default: "rocm/atom-dev:latest"
+      runner:
+        description: "Optional runner label override; leave empty to use the catalog default"
+        type: string
+      atom_commit:
+        description: "ATOM commit/branch to check out; empty = this ref"
+        type: string
+
+jobs:
+  # Same catalog and the same expansion the nightly uses, narrowed to the
+  # agentic variants. See .github/benchmark/README.md.
+  build-matrix:
+    name: Build agentic matrix
+    runs-on: ubuntu-latest
+    outputs:
+      configs_json: ${{ steps.build.outputs.configs_json }}
+      has_cells: ${{ steps.build.outputs.has_cells }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.ref }}
+      - id: build
+        env:
+          # `schedule` so the catalog's own scenarios are used rather than a
+          # dispatch param grid -- the agentic concurrency bands live in the
+          # catalog and are not a knob here.
+          EVENT_NAME: schedule
+          INPUTS_JSON: '{}'
+          BENCH_KIND_FILTER: aiperf_agentic
+        run: python3 .github/scripts/build_benchmark_matrix.py
+
+  benchmark:
+    name: ${{ matrix.config.display }} agentic
+    needs: [build-matrix]
+    if: >-
+      !cancelled()
+      && needs.build-matrix.result == 'success'
+      && needs.build-matrix.outputs.has_cells == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        config: ${{ fromJson(needs.build-matrix.outputs.configs_json) }}
+    uses: ./.github/workflows/benchmark-tmpl.yml
+    secrets: inherit
+    with:
+      display: ${{ matrix.config.display }}
+      prefix: ${{ matrix.config.prefix }}
+      suffix: ${{ matrix.config.suffix }}
+      model_path: ${{ matrix.config.model_path }}
+      server_args: ${{ matrix.config.server_args }}
+      bench_args: ${{ matrix.config.bench_args }}
+      bench_kind: ${{ matrix.config.bench_kind }}
+      benchmark_duration: ${{ inputs.benchmark_duration || '3600' }}
+      env_vars: ${{ matrix.config.env_vars }}
+      runner: ${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || matrix.config.runner }}
+      isl: ${{ matrix.config.isl }}
+      osl: ${{ matrix.config.osl }}
+      ratio: ${{ matrix.config.ratio }}
+      ratio_str: ${{ matrix.config.ratio_str }}
+      concurrency: ${{ matrix.config.concurrency }}
+      image: ${{ inputs.image || 'rocm/atom-dev:latest' }}
+      atom_commit: ${{ inputs.atom_commit || '' }}
