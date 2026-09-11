@@ -98,7 +98,7 @@ def test_wideep_reuses_mori_prepare_finalize_around_fused_moe(monkeypatch):
     recv_scale = torch.ones(8, 1, dtype=torch.uint8)
     recv_weights = torch.randn(8, 2, dtype=torch.float32)
     recv_ids = torch.zeros(8, 2, dtype=torch.int32)
-    recv_count = torch.tensor([5], dtype=torch.int32)
+    recv_count = torch.tensor([2], dtype=torch.int32)
     fused_output = torch.full((3, 4), 7, dtype=torch.bfloat16)
     combined = torch.full((3, 4), 9, dtype=torch.bfloat16)
     calls = {}
@@ -182,7 +182,7 @@ def test_wideep_reuses_mori_prepare_finalize_around_fused_moe(monkeypatch):
     assert torch.equal(args[3], recv_weights[:3])
     assert torch.equal(args[4], recv_ids[:3])
     assert args[5] is expert_mask
-    assert kwargs["a1_scale"] is recv_scale
+    assert torch.equal(kwargs["a1_scale"], recv_scale[:3])
     assert kwargs["num_local_tokens"] is recv_count
     assert kwargs["gate_mode"] == "interleave"
 
