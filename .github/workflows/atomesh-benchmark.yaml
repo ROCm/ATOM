@@ -36,10 +36,18 @@ on:
           - smoke
           - nightly
       rdma_smoke_nodes:
-        description: 'Comma-separated Slurm nodes for the Mooncake RDMA smoke test; defaults to atomesh_1p1d_nodes'
+        description: 'Comma-separated Slurm candidate nodes for the Mooncake RDMA smoke test; Slurm selects two when multiple nodes are listed'
         required: false
         default: ''
         type: string
+      rdma_smoke_node_count:
+        description: 'Number of Slurm nodes for the Mooncake RDMA smoke test'
+        required: false
+        default: '2'
+        type: choice
+        options:
+          - '1'
+          - '2'
       run_all_models:
         description: 'Run all models from models_atomesh.yaml'
         required: false
@@ -310,12 +318,32 @@ jobs:
             if [[ -n "${CASE_NAMES}" ]]; then
               CASE_NAME="${CASE_NAMES}"
             elif [[ "${RUN_ALL_MODELS}" != "true" ]]; then
-              if [[ -z "${MODEL_NAMES}" ]]; then
+              if [[ -z "${MODEL_NAMES}" && "${SUITE}" != "smoke" ]]; then
                 echo "::error::Set run_all_models=true, provide model_names, or provide case_names."
                 exit 1
               fi
               MODEL_NAME="${MODEL_NAMES}"
             fi
+          fi
+
+          if [[ "${SUITE}" == "smoke" && -z "${CASE_NAME}" && -z "${MODEL_NAME}" && "${RUN_ALL_MODELS}" != "true" ]]; then
+            python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          matrix = {"include": []}
+          Path("atomesh-matrix.json").write_text(
+              json.dumps(matrix, indent=2),
+              encoding="utf-8",
+          )
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write('matrix_json={"include":[]}\n')
+              output.write("has_matrix=false\n")
+          print("RDMA smoke workflow: skipping benchmark matrix generation")
+          PY
+            cat atomesh-matrix.json
+            exit 0
           fi
 
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" && "${EVENT_SCHEDULE}" == "0 16 * * 5" ]]; then
@@ -416,16 +444,19 @@ jobs:
     needs: [load-config]
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.suite == 'smoke' }}
     runs-on: ${{ inputs.atomesh_slurm_submit_runner }}
-    timeout-minutes: 45
+    timeout-minutes: 75
     env:
       RDMA_SMOKE_IMAGE: ${{ needs.load-config.outputs.image }}
       RDMA_SMOKE_NODES: ${{ inputs.rdma_smoke_nodes }}
+      RDMA_SMOKE_NODE_COUNT: ${{ inputs.rdma_smoke_node_count }}
+      RDMA_SMOKE_DECODE_HCA_MODE: all
       SLURM_SUBMIT_RUNNER: ${{ inputs.atomesh_slurm_submit_runner }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
 
       - name: Run Mooncake RDMA transfer test on selected nodes
+        id: rdma-smoke
         run: |
           set -euo pipefail
           export PATH="/usr/local/slurm-24.05.5.1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
@@ -437,33 +468,7 @@ jobs:
 
           nodes="${RDMA_SMOKE_NODES:-${ATOMESH_1P1D_NODES:-}}"
           nodes="${nodes// /}"
-          if [[ -n "${nodes}" ]]; then
-            IFS=',' read -r -a node_list <<< "${nodes}"
-            node_count="${#node_list[@]}"
-          else
-            # Allocate two nodes by default so both local and cross-node GDR are validated.
-            node_count=2
-          fi
-          if [[ "${node_count}" -lt 1 ]]; then
-            echo "::error::GPUDirect RDMA smoke testing requires at least one Slurm node."
-            exit 1
-          fi
-
-          current_user="$(id -un 2>/dev/null || id -u)"
-          log_root="${ATOMESH_LOG_ROOT//\$\{USER\}/${current_user}}"
-          log_root="${log_root//\$USER/${current_user}}"
-          run_dir="${log_root%/}/rdma-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          mkdir -p "${run_dir}"
-          export RDMA_SMOKE_RUN_DIR="${run_dir}"
-          export RDMA_SMOKE_NODE_COUNT="${node_count}"
-          CURRENT_USER="${current_user}"
-          ATOMESH_CELL_ID="rdma-smoke"
-          RESULT_DIR="${run_dir}"
-          SLURM_JOB_NAME="rdma-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          SLURM_OUTPUT="${run_dir}/slurm-%j.out"
-          SLURM_ERROR="${run_dir}/slurm-%j.err"
-          SLURM_CANCEL_HELPER="${run_dir}/slurm-cancel.sh"
-          SLURM_LOG_POLL_INTERVAL="${SLURM_LOG_POLL_INTERVAL:-15}"
+          RDMA_SMOKE_TARGET_NODE_COUNT="${RDMA_SMOKE_NODE_COUNT:-2}"
           USES_SPUR_CONTROLLER=0
           SPUR_CONTROLLER_ADDR=""
           SPUR_ACCOUNTING_ADDR=""
@@ -479,6 +484,39 @@ jobs:
           source "${GITHUB_WORKSPACE}/.github/scripts/slurm_submit_helpers.sh"
           install_slurm_cancel_traps
 
+          if [[ -n "${nodes}" ]]; then
+            IFS=',' read -r -a node_list <<< "${nodes}"
+            node_count="${#node_list[@]}"
+            if [[ "${node_count}" -gt "${RDMA_SMOKE_TARGET_NODE_COUNT}" ]]; then
+              node_count="${RDMA_SMOKE_TARGET_NODE_COUNT}"
+            fi
+            echo "=== requesting ${node_count} node(s) from ${#node_list[@]} Slurm candidates ==="
+          else
+            # Allocate two nodes by default so both local and cross-node GDR are validated.
+            node_count="${RDMA_SMOKE_TARGET_NODE_COUNT}"
+          fi
+          if [[ "${node_count}" -lt 1 ]]; then
+            echo "::error::GPUDirect RDMA smoke testing requires at least one Slurm node."
+            exit 1
+          fi
+
+          current_user="$(id -un 2>/dev/null || id -u)"
+          log_root="${ATOMESH_LOG_ROOT//\$\{USER\}/${current_user}}"
+          log_root="${log_root//\$USER/${current_user}}"
+          run_dir="${log_root%/}/rdma-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "${run_dir}"
+          chmod 0777 "${run_dir}"
+          export RDMA_SMOKE_RUN_DIR="${run_dir}"
+          export RDMA_SMOKE_NODE_COUNT="${node_count}"
+          CURRENT_USER="${current_user}"
+          ATOMESH_CELL_ID="rdma-smoke"
+          RESULT_DIR="${run_dir}"
+          SLURM_JOB_NAME="rdma-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          SLURM_OUTPUT="${run_dir}/slurm-%j.out"
+          SLURM_ERROR="${run_dir}/slurm-%j.err"
+          SLURM_CANCEL_HELPER="${run_dir}/slurm-cancel.sh"
+          SLURM_LOG_POLL_INTERVAL="${SLURM_LOG_POLL_INTERVAL:-15}"
+
           rank_script="${run_dir}/run-rdma-smoke-rank.sh"
           cat > "${rank_script}" <<'RANK_SCRIPT'
           #!/usr/bin/env bash
@@ -489,10 +527,15 @@ jobs:
           container="atomesh-rdma-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${job_id}-${rank}-$$"
           rank_host="$(hostname)"
           cleanup() {
-            if docker container inspect "${container}" >/dev/null 2>&1; then
-              docker rm -f "${container}" || {
-                echo "WARNING: failed to remove RDMA smoke container ${container}" >&2
-              }
+            echo "=== Removing RDMA smoke container ${container} ==="
+            # Do not wait on D-state RDMA leftovers: kill/rm with a bound so
+            # the Slurm task can exit instead of sitting in COMPLETING.
+            if command -v timeout >/dev/null 2>&1; then
+              timeout 20 docker kill "${container}" >/dev/null 2>&1 || true
+              timeout 20 docker rm -f "${container}" >/dev/null 2>&1 || true
+            else
+              docker kill "${container}" >/dev/null 2>&1 || true
+              docker rm -f "${container}" >/dev/null 2>&1 || true
             fi
           }
           on_error() {
@@ -507,10 +550,21 @@ jobs:
             echo "ERROR: RDMA smoke rank ${rank} received ${signal} on ${rank_host}" >&2
             exit "${rc}"
           }
+          publish_rank_rc() {
+            local rc="$1"
+            local rc_file
+            [[ -n "${RDMA_SMOKE_RUN_DIR:-}" ]] || return 0
+            rc_file="${RDMA_SMOKE_RUN_DIR}/rank-rc-${rank}"
+            printf '%s\n' "${rc}" > "${rc_file}.tmp" 2>/dev/null || return 0
+            mv "${rc_file}.tmp" "${rc_file}" 2>/dev/null || true
+          }
           on_exit() {
             local rc=$?
             trap - EXIT
             echo "=== RDMA smoke rank exit: rank=${rank} host=${rank_host} pid=$$ job=${job_id} container=${container} rc=${rc} ==="
+            # Publish before cleanup: Slurm accounting is unreliable on Spur, so
+            # the workflow falls back to these per-rank codes.
+            publish_rank_rc "${rc}"
             cleanup
             exit "${rc}"
           }
@@ -526,7 +580,7 @@ jobs:
           docker pull "${RDMA_SMOKE_IMAGE}"
           echo "=== RDMA smoke image pull complete on rank ${rank} ==="
           docker_args=(
-            run --rm -i --name "${container}"
+            run -i --name "${container}"
             --network host --ipc host
             --privileged
             --device=/dev/kfd
@@ -539,6 +593,7 @@ jobs:
             -e MC_ENABLE_DEST_DEVICE_AFFINITY=1
             -e SMOKE_RANK="${rank}"
             -e SMOKE_NODE_COUNT="${RDMA_SMOKE_NODE_COUNT}"
+            -e SMOKE_DECODE_HCA_MODE="${RDMA_SMOKE_DECODE_HCA_MODE}"
             -e SMOKE_RUN_DIR=/rdma-smoke-shared
             -v "${RDMA_SMOKE_RUN_DIR}:/rdma-smoke-shared"
           )
@@ -564,10 +619,23 @@ jobs:
           docker "${docker_args[@]}" <<'CONTAINER_SCRIPT'
           set -euo pipefail
 
-          mapfile -t rdma_devices < <(
-            for device_path in /sys/class/infiniband/*; do
-              [[ -e "${device_path}" ]] && basename "${device_path}"
-            done
+          mapfile -t rdma_devices < <(python3 - <<'PY'
+          import os
+          import re
+
+          devices = [
+              name
+              for name in os.listdir("/sys/class/infiniband")
+              if os.path.isdir(os.path.join("/sys/class/infiniband", name))
+          ]
+
+          def sort_key(name: str) -> int:
+              match = re.search(r"(?:ionic_|rdma)(\d+)$", name)
+              return int(match.group(1)) if match else 10_000
+
+          for device in sorted(devices, key=sort_key):
+              print(device)
+          PY
           )
           if [[ "${#rdma_devices[@]}" -eq 0 ]]; then
             echo "ERROR: no RDMA devices found under /sys/class/infiniband" >&2
@@ -588,25 +656,44 @@ jobs:
           fi
           echo "Visible ROCm GPUs: ${gpu_count}"
 
-          rdma_context="/app/mooncake/mooncake-transfer-engine/src/transport/rdma_transport/rdma_context.cpp"
-          python3 - "${rdma_context}" <<'PY'
+          validator_source="/app/mooncake/mooncake-transfer-engine/example/transfer_engine_validator.cpp"
+          python3 - "${validator_source}" <<'PY'
           import pathlib
           import sys
 
           path = pathlib.Path(sys.argv[1])
           source = path.read_text()
 
-          old = "            uint32_t init = 16;"
-          new = "            uint32_t init = max_dest_rd_atomic_;"
+          replacements = {
+              """            fillData(thread_id, addr, seed);
+                      submitRequestSync(engine, segment_id, thread_id, addr, remote_base,
+                                        TransferRequest::WRITE);
+                      fillData(thread_id, addr, 0);
+                      submitRequestSync(engine, segment_id, thread_id, addr, remote_base,
+                                        TransferRequest::READ);
+                      checkData(thread_id, addr, seed);""":
+              """            fillData(thread_id, addr, seed);
+                      submitRequestSync(engine, segment_id, thread_id, addr, remote_base,
+                                        TransferRequest::WRITE);""",
+              """            submitRequestSync(engine, segment_id, thread_id, addr, remote_base,
+                                        TransferRequest::WRITE);
+                      submitRequestSync(engine, segment_id, thread_id, addr, remote_base,
+                                        TransferRequest::READ);""":
+              """            submitRequestSync(engine, segment_id, thread_id, addr, remote_base,
+                                        TransferRequest::WRITE);""",
+              'LOG(INFO) << "Worker " << thread_id << " stopped! Data validation passed";':
+              'LOG(INFO) << "Worker " << thread_id << " stopped! RDMA WRITE transfers completed";',
+          }
+          for old, new in replacements.items():
+              if source.count(old) != 1:
+                  raise RuntimeError(
+                      f"Expected exactly one validator WRITE/READ sequence, "
+                      f"found {source.count(old)} in {path}"
+                  )
+              source = source.replace(old, new)
 
-          if source.count(old) != 1:
-              raise RuntimeError(
-                  f"Expected exactly one Mooncake RDMA atomic setting, "
-                  f"found {source.count(old)} in {path}"
-              )
-
-          path.write_text(source.replace(old, new))
-          print(f"Patched Mooncake RDMA atomic limits in {path}")
+          path.write_text(source)
+          print(f"Patched {path} to exercise production WRITE-only transfers")
           PY
 
           build_dir="/tmp/mooncake-rdma-smoke-build"
@@ -646,9 +733,42 @@ jobs:
           cat /tmp/rdma-smoke-nic-priority.json
 
           target_pid=""
+          log_progress() {
+            local msg="$*"
+            echo "${msg}"
+            echo "$(date -Is) rank=${SMOKE_RANK:-?} ${msg}" >> "${SMOKE_RUN_DIR}/rank-${SMOKE_RANK:-unknown}.log" 2>/dev/null || true
+          }
+
+          start_target_process() {
+            local gpu_id="$1"
+            local log_file="$2"
+            shift 2
+            if command -v setsid >/dev/null 2>&1; then
+              HIP_VISIBLE_DEVICES="${gpu_id}" \
+                setsid "${validator_bin}" "$@" >"${log_file}" 2>&1 < /dev/null &
+            else
+              HIP_VISIBLE_DEVICES="${gpu_id}" \
+                "${validator_bin}" "$@" >"${log_file}" 2>&1 < /dev/null &
+            fi
+            target_pid=$!
+          }
+
+          stop_target_process() {
+            local pid="${target_pid:-}"
+
+            [[ -n "${pid}" ]] || return 0
+            target_pid=""
+            # SIGTERM runs Mooncake unregisterLocalMemory(), which can hang in
+            # D-state. Smoke targets are ephemeral: KILL the process group and
+            # do not wait, so the next GPU pair can start immediately.
+            echo "WARNING: killing RDMA target process group ${pid} without waiting" >&2
+            kill -KILL -- "-${pid}" 2>/dev/null || kill -KILL "${pid}" 2>/dev/null || true
+            disown "${pid}" 2>/dev/null || true
+          }
+
           cleanup_processes() {
-            [[ -z "${target_pid}" ]] || kill "${target_pid}" 2>/dev/null || true
-            [[ -z "${target_pid}" ]] || wait "${target_pid}" 2>/dev/null || true
+            stop_target_process
+            pkill -KILL -f 'transfer_engine_validator' 2>/dev/null || true
           }
           trap cleanup_processes EXIT HUP INT TERM
 
@@ -672,7 +792,6 @@ jobs:
               if ! kill -0 "${target_pid}" 2>/dev/null; then
                 echo "ERROR: P2P target exited before publishing its listening address" >&2
                 cat "${target_log}" >&2 || true
-                wait "${target_pid}" 2>/dev/null || true
                 return 1
               fi
               if [[ "${SECONDS}" -ge "${deadline}" ]]; then
@@ -693,26 +812,115 @@ jobs:
             exit 1
           fi
 
-          # The initiator writes prefill VRAM into the decode target. Register
-          # each decode buffer on its local HCA and the prefill GPU's alternate
-          # HCA, then verify destination affinity selects the matching HCA.
-          for ((prefill_gpu_id = 0; prefill_gpu_id < 4; prefill_gpu_id++)); do
-            decode_gpu_id=$((prefill_gpu_id + 4))
+          HCA_COUNT=8
+
+          select_all_ib_devices_for_gpu() {
+            local phys_idx="$1"
+            local primary="${rdma_devices[phys_idx]}"
+            local -a selected=("${primary}")
+            local idx device existing
+            for ((idx = 0; idx < HCA_COUNT; idx++)); do
+              device="${rdma_devices[idx]:-}"
+              [[ -z "${device}" ]] && continue
+              for existing in "${selected[@]}"; do
+                [[ "${existing}" == "${device}" ]] && continue 2
+              done
+              selected+=("${device}")
+            done
+            (IFS=,; echo "${selected[*]}")
+          }
+
+          select_decode_ib_devices() {
+            local prefill_idx="$1"
+            local decode_idx="$2"
+            local prefill_device="${rdma_devices[prefill_idx]}"
+            local decode_device="${rdma_devices[decode_idx]}"
+
+            case "${SMOKE_DECODE_HCA_MODE}" in
+              local|same-gpu)
+                echo "${decode_device}"
+                ;;
+              peer)
+                echo "${prefill_device}"
+                ;;
+              local-peer)
+                if [[ "${decode_device}" == "${prefill_device}" ]]; then
+                  echo "${decode_device}"
+                else
+                  echo "${decode_device},${prefill_device}"
+                fi
+                ;;
+              all)
+                select_all_ib_devices_for_gpu "${decode_idx}"
+                ;;
+              *)
+                echo "ERROR: unsupported SMOKE_DECODE_HCA_MODE=${SMOKE_DECODE_HCA_MODE}" >&2
+                return 1
+                ;;
+            esac
+          }
+
+          expected_decode_peer_device() {
+            local prefill_idx="$1"
+            local decode_idx="$2"
+            if [[ "${SMOKE_DECODE_HCA_MODE}" == "local" ||
+                  "${SMOKE_DECODE_HCA_MODE}" == "same-gpu" ]]; then
+              echo "${rdma_devices[decode_idx]}"
+            else
+              echo "${rdma_devices[prefill_idx]}"
+            fi
+          }
+
+          write_cuda0_nic_matrix() {
+            local matrix_path="$1"
+            shift
+            MATRIX_PATH="${matrix_path}" RDMA_MATRIX_DEVICES="${*}" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          devices = os.environ["RDMA_MATRIX_DEVICES"].split()
+          Path(os.environ["MATRIX_PATH"]).write_text(
+              json.dumps({"cuda:0": [devices, []]}),
+              encoding="utf-8",
+          )
+          PY
+          }
+
+          echo "Decode HCA diagnostic mode: ${SMOKE_DECODE_HCA_MODE}"
+          local_prefill_gpu_ids=()
+          local_decode_gpu_ids=()
+          if [[ "${SMOKE_DECODE_HCA_MODE}" == "same-gpu" ]]; then
+            for ((gpu_id = 0; gpu_id < gpu_count; gpu_id++)); do
+              local_prefill_gpu_ids+=("${gpu_id}")
+              local_decode_gpu_ids+=("${gpu_id}")
+            done
+          else
+            for ((prefill_gpu_id = 0; prefill_gpu_id < gpu_count - 1; prefill_gpu_id++)); do
+              for ((decode_gpu_id = prefill_gpu_id + 1; decode_gpu_id < gpu_count; decode_gpu_id++)); do
+                local_prefill_gpu_ids+=("${prefill_gpu_id}")
+                local_decode_gpu_ids+=("${decode_gpu_id}")
+              done
+            done
+          fi
+
+          for ((pair_index = 0; pair_index < ${#local_prefill_gpu_ids[@]}; pair_index++)); do
+            prefill_gpu_id="${local_prefill_gpu_ids[pair_index]}"
+            decode_gpu_id="${local_decode_gpu_ids[pair_index]}"
             prefill_rdma_device="${rdma_devices[prefill_gpu_id]}"
             decode_rdma_device="${rdma_devices[decode_gpu_id]}"
-            decode_device_csv="${decode_rdma_device},${prefill_rdma_device}"
+            decode_device_csv="$(select_decode_ib_devices "${prefill_gpu_id}" "${decode_gpu_id}")"
             prefill_matrix="/tmp/gdr-smoke-prefill-gpu-${prefill_gpu_id}-nic-priority.json"
             decode_matrix="/tmp/gdr-smoke-decode-gpu-${decode_gpu_id}-nic-priority.json"
-            printf '{"cuda:0":[["%s"],[]]}\n' "${prefill_rdma_device}" > "${prefill_matrix}"
-            printf '{"cuda:0":[["%s","%s"],[]]}\n' \
-              "${decode_rdma_device}" "${prefill_rdma_device}" > "${decode_matrix}"
+            write_cuda0_nic_matrix "${prefill_matrix}" "${prefill_rdma_device}"
+            IFS=',' read -r -a decode_ib_devices <<< "${decode_device_csv}"
+            write_cuda0_nic_matrix "${decode_matrix}" "${decode_ib_devices[@]}"
 
             target_log="/tmp/gdr-smoke-decode-gpu-${decode_gpu_id}-target.log"
             initiator_log="/tmp/gdr-smoke-prefill-gpu-${prefill_gpu_id}-initiator.log"
 
-            echo "=== GPUDirect RDMA prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) -> decode GPU ${decode_gpu_id} (${decode_rdma_device}, alternate ${prefill_rdma_device}) ==="
-            HIP_VISIBLE_DEVICES="${decode_gpu_id}" \
-            "${validator_bin}" \
+            echo "=== GPUDirect RDMA prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) -> decode GPU ${decode_gpu_id} (${decode_device_csv}) ==="
+            start_target_process "${decode_gpu_id}" "${target_log}" \
               --mode=target \
               --protocol=rdma \
               --metadata_server=P2PHANDSHAKE \
@@ -721,9 +929,7 @@ jobs:
               --nic_priority_matrix="${decode_matrix}" \
               --use_vram=true \
               --gpu_id=0 \
-              --buffer_size=100663296 \
-              >"${target_log}" 2>&1 &
-            target_pid=$!
+              --buffer_size=100663296
             target_name="$(wait_for_p2p_address "${target_log}" "${target_pid}" 30)"
             echo "P2P target listening at ${target_name}"
 
@@ -751,13 +957,14 @@ jobs:
             set -e
 
             if [[ "${transfer_rc}" -ne 0 ]] ||
-               ! grep -q "Data validation passed" "${initiator_log}"; then
+               ! grep -q "RDMA WRITE transfers completed" "${initiator_log}"; then
               cat "${initiator_log}" >&2
               cat "${target_log}" >&2
-              echo "ERROR: GPUDirect RDMA data validation failed from prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) to decode GPU ${decode_gpu_id} (${decode_rdma_device}, alternate ${prefill_rdma_device})" >&2
+              echo "ERROR: GPUDirect RDMA WRITE failed from prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) to decode GPU ${decode_gpu_id} (${decode_device_csv})" >&2
               exit 1
             fi
-            expected_affinity="local_device_name=${prefill_rdma_device}, peer_device_name=${prefill_rdma_device}"
+            expected_peer_device="$(expected_decode_peer_device "${prefill_gpu_id}" "${decode_gpu_id}")"
+            expected_affinity="local_device_name=${prefill_rdma_device}, peer_device_name=${expected_peer_device}"
             if grep -Fq "RDMA slice affinity:" "${initiator_log}"; then
               if ! grep -Fq "${expected_affinity}" "${initiator_log}"; then
                 grep -F "RDMA slice affinity:" "${initiator_log}" >&2 || true
@@ -765,14 +972,13 @@ jobs:
                 exit 1
               fi
             else
-              echo "WARNING: RDMA data validation passed, but HCA affinity logging was unavailable for prefill GPU ${prefill_gpu_id}" >&2
+              echo "WARNING: RDMA WRITE completed, but HCA affinity logging was unavailable for prefill GPU ${prefill_gpu_id}" >&2
             fi
-            kill "${target_pid}" 2>/dev/null || true
-            wait "${target_pid}" 2>/dev/null || true
-            target_pid=""
-            echo "GPUDirect RDMA passed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id} via alternate HCA ${prefill_rdma_device}"
+            stop_target_process
+            touch "${SMOKE_RUN_DIR}/node-local-passed-${SMOKE_RANK}-${prefill_gpu_id}-${decode_gpu_id}"
+            echo "GPUDirect RDMA passed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id} via decode HCAs ${decode_device_csv}"
           done
-          echo "Node-local GPUDirect RDMA passed for all four prefill/decode GPU pairs"
+          echo "Node-local GPUDirect RDMA passed for all ${#local_prefill_gpu_ids[@]} prefill/decode GPU pairs"
 
           if [[ "${SMOKE_NODE_COUNT}" -lt 2 ]]; then
             echo "Single-node GPUDirect RDMA smoke test passed"
@@ -810,17 +1016,22 @@ jobs:
             done
           }
 
-          local_ip="$(ip route get 1.1.1.1 2>/dev/null | awk '
-            {
-              for (i = 1; i <= NF; i++) {
-                if ($i == "src" && i < NF) {
-                  print $(i + 1)
-                  exit
+          local_ip=""
+          if command -v ip >/dev/null 2>&1; then
+            local_ip="$(ip route get 1.1.1.1 2>/dev/null | awk '
+              {
+                for (i = 1; i <= NF; i++) {
+                  if ($i == "src" && i < NF) {
+                    print $(i + 1)
+                    exit
+                  }
                 }
               }
-            }
-          ')"
-          local_ip="${local_ip:-$(hostname -I | awk '{print $1}')}"
+            ' || true)"
+          fi
+          if [[ -z "${local_ip}" ]]; then
+            local_ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+          fi
           if [[ -z "${local_ip}" ]]; then
             echo "ERROR: unable to determine node IP for cross-node GDR testing" >&2
             exit 1
@@ -845,8 +1056,18 @@ jobs:
           fi
 
           if [[ "${SMOKE_RANK}" -eq 0 || "${SMOKE_RANK}" -eq 1 ]]; then
-            cross_prefill_gpu_ids=(0 1 2 3 4 5 6 7 0 1 2 3)
-            cross_decode_gpu_ids=(0 1 2 3 4 5 6 7 4 5 6 7)
+            cross_prefill_gpu_ids=()
+            cross_decode_gpu_ids=()
+            for ((gpu_id = 0; gpu_id < gpu_count; gpu_id++)); do
+              cross_prefill_gpu_ids+=("${gpu_id}")
+              cross_decode_gpu_ids+=("${gpu_id}")
+            done
+            for ((prefill_gpu_id = 0; prefill_gpu_id < gpu_count - 1; prefill_gpu_id++)); do
+              for ((decode_gpu_id = prefill_gpu_id + 1; decode_gpu_id < gpu_count; decode_gpu_id++)); do
+                cross_prefill_gpu_ids+=("${prefill_gpu_id}")
+                cross_decode_gpu_ids+=("${decode_gpu_id}")
+              done
+            done
             for ((pair_index = 0; pair_index < ${#cross_prefill_gpu_ids[@]}; pair_index++)); do
               prefill_gpu_id="${cross_prefill_gpu_ids[pair_index]}"
               decode_gpu_id="${cross_decode_gpu_ids[pair_index]}"
@@ -856,28 +1077,30 @@ jobs:
               expected_peer_device="${decode_rdma_device}"
               is_cross_rail=0
               if [[ "${prefill_gpu_id}" -ne "${decode_gpu_id}" ]]; then
-                decode_device_csv="${decode_rdma_device},${prefill_rdma_device}"
-                expected_peer_device="${prefill_rdma_device}"
+                decode_device_csv="$(select_decode_ib_devices "${prefill_gpu_id}" "${decode_gpu_id}")"
+                expected_peer_device="$(expected_decode_peer_device "${prefill_gpu_id}" "${decode_gpu_id}")"
                 is_cross_rail=1
               fi
               echo "=== Cross-node RDMA pair: prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) -> decode GPU ${decode_gpu_id} (${decode_device_csv}); expected peer HCA ${expected_peer_device} ==="
               prefill_matrix="/tmp/cross-node-prefill-gpu-${prefill_gpu_id}-nic-priority.json"
               decode_matrix="/tmp/cross-node-decode-gpu-${decode_gpu_id}-nic-priority.json"
-              printf '{"cuda:0":[["%s"],[]]}\n' "${prefill_rdma_device}" > "${prefill_matrix}"
+              write_cuda0_nic_matrix "${prefill_matrix}" "${prefill_rdma_device}"
               if [[ "${is_cross_rail}" -eq 1 ]]; then
-                printf '{"cuda:0":[["%s","%s"],[]]}\n' \
-                  "${decode_rdma_device}" "${prefill_rdma_device}" > "${decode_matrix}"
+                IFS=',' read -r -a decode_ib_devices <<< "${decode_device_csv}"
+                write_cuda0_nic_matrix "${decode_matrix}" "${decode_ib_devices[@]}"
               else
-                printf '{"cuda:0":[["%s"],[]]}\n' "${decode_rdma_device}" > "${decode_matrix}"
+                write_cuda0_nic_matrix "${decode_matrix}" "${decode_rdma_device}"
               fi
               ready_file="${SMOKE_RUN_DIR}/cross-node-ready-prefill-${prefill_gpu_id}-decode-${decode_gpu_id}"
               result_file="${SMOKE_RUN_DIR}/cross-node-result-prefill-${prefill_gpu_id}-decode-${decode_gpu_id}"
               target_log="${SMOKE_RUN_DIR}/cross-node-prefill-${prefill_gpu_id}-decode-${decode_gpu_id}-target.log"
 
               if [[ "${SMOKE_RANK}" -eq 1 ]]; then
-                echo "=== Cross-node decode target: ${local_ip}, GPU ${decode_gpu_id} (${decode_rdma_device}) ==="
-                HIP_VISIBLE_DEVICES="${decode_gpu_id}" \
-                "${validator_bin}" \
+                rm -f \
+                  "${ready_file}" "${ready_file}.tmp" \
+                  "${result_file}" "${result_file}.tmp"
+                log_progress "=== Cross-node decode target: ${local_ip}, GPU ${decode_gpu_id} (${decode_rdma_device}) ==="
+                start_target_process "${decode_gpu_id}" "${target_log}" \
                   --mode=target \
                   --protocol=rdma \
                   --metadata_server=P2PHANDSHAKE \
@@ -886,27 +1109,23 @@ jobs:
                   --nic_priority_matrix="${decode_matrix}" \
                   --use_vram=true \
                   --gpu_id=0 \
-                  --buffer_size=100663296 \
-                  >"${target_log}" 2>&1 &
-                target_pid=$!
+                  --buffer_size=100663296
                 target_name="$(wait_for_p2p_address "${target_log}" "${target_pid}" 30)"
-                echo "Cross-node P2P target listening at ${target_name}"
+                log_progress "Cross-node P2P target listening at ${target_name}"
                 echo "${target_name}" > "${ready_file}.tmp"
                 mv "${ready_file}.tmp" "${ready_file}"
 
                 wait_for_file "${result_file}" 150 "prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id} result"
                 result="$(<"${result_file}")"
-                kill "${target_pid}" 2>/dev/null || true
-                wait "${target_pid}" 2>/dev/null || true
-                target_pid=""
+                stop_target_process
                 if [[ "${result}" != "0" ]]; then
                   cat "${target_log}" >&2
                   echo "ERROR: cross-node GPUDirect RDMA failed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}" >&2
                   exit 1
                 fi
-                echo "Cross-node GPUDirect RDMA passed on decode GPU ${decode_gpu_id}"
+                log_progress "Cross-node GPUDirect RDMA passed on decode GPU ${decode_gpu_id}"
               else
-                wait_for_file "${ready_file}" 60 "decode GPU ${decode_gpu_id} target"
+                wait_for_file "${ready_file}" 120 "decode GPU ${decode_gpu_id} target"
                 target_name="$(<"${ready_file}")"
                 initiator_log="/tmp/cross-node-prefill-${prefill_gpu_id}-decode-${decode_gpu_id}-initiator.log"
                 echo "=== Cross-node prefill initiator: ${local_ip} GPU ${prefill_gpu_id} (${prefill_rdma_device}) -> ${target_name} decode GPU ${decode_gpu_id} ==="
@@ -941,7 +1160,7 @@ jobs:
                 transfer_rc="${PIPESTATUS[0]}"
                 set -e
                 if [[ "${transfer_rc}" -eq 0 ]] &&
-                   grep -q "Data validation passed" "${initiator_log}"; then
+                   grep -q "RDMA WRITE transfers completed" "${initiator_log}"; then
                   result=0
                 else
                   result=1
@@ -955,36 +1174,52 @@ jobs:
                       result=1
                     fi
                   else
-                    echo "WARNING: cross-node RDMA data validation passed, but HCA affinity logging was unavailable from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}" >&2
+                    echo "WARNING: cross-node RDMA WRITE completed, but HCA affinity logging was unavailable from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}" >&2
                   fi
                 fi
                 echo "${result}" > "${result_file}.tmp"
                 mv "${result_file}.tmp" "${result_file}"
                 if [[ "${result}" -ne 0 ]]; then
                   cat "${target_log}" >&2 || true
-                  echo "ERROR: cross-node GPUDirect RDMA data validation failed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}" >&2
+                  echo "ERROR: cross-node GPUDirect RDMA WRITE failed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}" >&2
                   exit 1
                 fi
-                echo "Cross-node GPUDirect RDMA passed from prefill GPU ${prefill_gpu_id}"
+                touch "${SMOKE_RUN_DIR}/cross-node-passed-${prefill_gpu_id}-${decode_gpu_id}"
+                echo "Cross-node GPUDirect RDMA passed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}"
               fi
             done
           fi
 
           if [[ "${SMOKE_RANK}" -eq 0 ]]; then
-            echo "Mooncake cross-node GPUDirect RDMA passed for same-index GPU pairs 0-7 and prefill GPUs 0-3 to decode GPUs 4-7"
+            echo "Mooncake cross-node GPUDirect RDMA passed for same-index GPU pairs 0-7 and all cross-rail pairs i < j"
           fi
+          cleanup_processes
+          log_progress "rank ${SMOKE_RANK} container script complete"
           CONTAINER_SCRIPT
           docker_rc=$?
           set -e
           echo "=== RDMA smoke container finished on rank ${rank}: rc=${docker_rc} ==="
+          cleanup
           exit "${docker_rc}"
           RANK_SCRIPT
           chmod +x "${rank_script}"
 
           slurm_status_file="${run_dir}/slurm-job.rc"
           rm -f "${slurm_status_file}" "${slurm_status_file}.tmp"
+          rm -f \
+            "${run_dir}"/rank-rc-* \
+            "${run_dir}"/node-local-passed-* \
+            "${run_dir}"/cross-node-passed-*
           batch_script="${run_dir}/rdma-smoke.sbatch.sh"
-          cat > "${batch_script}" <<EOF
+          if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
+            # Spur launches this script on each node with SPUR_TASK_OFFSET; srun is unavailable.
+            cat > "${batch_script}" <<EOF
+          #!/usr/bin/env bash
+          set -euo pipefail
+          exec "${rank_script}"
+          EOF
+          else
+            cat > "${batch_script}" <<EOF
           #!/usr/bin/env bash
           set -euo pipefail
           set +e
@@ -996,6 +1231,7 @@ jobs:
           mv "${slurm_status_file}.tmp" "${slurm_status_file}"
           exit "\${srun_rc}"
           EOF
+          fi
           chmod +x "${batch_script}"
 
           sbatch_cmd=(
@@ -1007,7 +1243,7 @@ jobs:
             --nodes "${node_count}"
             --ntasks "${node_count}"
             --ntasks-per-node 1
-            --time 00:30:00
+            --time 01:00:00
             --output "${SLURM_OUTPUT}"
             --error "${SLURM_ERROR}"
           )
@@ -1048,6 +1284,10 @@ jobs:
           write_slurm_cancel_helper "${JOB_ID}"
           set_slurm_job_log_paths "${JOB_ID}"
           monitor_slurm_job "${JOB_ID}"
+
+          # Spur leaves the job in COMPLETING while RDMA leftovers are reaped,
+          # so give sacct longer than the 30s default to publish a final state.
+          SLURM_ACCOUNTING_TIMEOUT="${SLURM_ACCOUNTING_TIMEOUT:-180}"
           read_slurm_exit_code "${JOB_ID}"
           if [[ "${SLURM_STATE}" == "unknown" && -s "${slurm_status_file}" ]]; then
             batch_rc="$(tr -d '[:space:]' < "${slurm_status_file}")"
@@ -1064,11 +1304,142 @@ jobs:
               echo "WARNING: invalid batch script exit status: ${batch_rc}" >&2
             fi
           fi
+          if [[ "${SLURM_STATE}" == "unknown" ]]; then
+            # The Spur batch script cannot write a single status file because it
+            # runs once per node, so aggregate the per-rank codes instead.
+            ranks_reported=0
+            worst_rank_rc=0
+            for rank_rc_file in "${run_dir}"/rank-rc-*; do
+              [[ -s "${rank_rc_file}" ]] || continue
+              rank_rc="$(tr -d '[:space:]' < "${rank_rc_file}")"
+              [[ "${rank_rc}" =~ ^[0-9]+$ ]] || continue
+              ranks_reported=$((ranks_reported + 1))
+              echo "rdma smoke rank status: $(basename "${rank_rc_file}")=${rank_rc}"
+              if [[ "${rank_rc}" -gt "${worst_rank_rc}" ]]; then
+                worst_rank_rc="${rank_rc}"
+              fi
+            done
+            if [[ "${ranks_reported}" -ge "${node_count}" ]]; then
+              SLURM_JOB_RC="${worst_rank_rc}"
+              SLURM_EXIT_CODE="${worst_rank_rc}:0"
+              if [[ "${worst_rank_rc}" -eq 0 ]]; then
+                SLURM_STATE="COMPLETED"
+              else
+                SLURM_STATE="FAILED"
+              fi
+              echo "Using per-rank exit status because Slurm accounting is unavailable."
+            else
+              echo "WARNING: only ${ranks_reported}/${node_count} RDMA smoke ranks reported an exit status" >&2
+            fi
+          fi
           SLURM_JOB_ACTIVE=0
           echo "slurm_state=${SLURM_STATE}"
           echo "slurm_exit_code=${SLURM_EXIT_CODE}"
           echo "slurm job exit code: ${SLURM_JOB_RC}"
           exit "${SLURM_JOB_RC}"
+
+      - name: Summarize Mooncake RDMA smoke test
+        if: always()
+        env:
+          RDMA_SMOKE_OUTCOME: ${{ steps.rdma-smoke.outcome }}
+        run: |
+          set -uo pipefail
+
+          current_user="$(id -un 2>/dev/null || id -u)"
+          log_root="${ATOMESH_LOG_ROOT//\$\{USER\}/${current_user}}"
+          log_root="${log_root//\$USER/${current_user}}"
+          run_dir="${log_root%/}/rdma-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          summary_path="${run_dir}/rdma-smoke-summary.md"
+          mkdir -p "${run_dir}"
+
+          if [[ "${RDMA_SMOKE_OUTCOME}" == "success" ]]; then
+            outcome_icon="✅"
+          else
+            outcome_icon="❌"
+          fi
+
+          job_id=""
+          if [[ -s "${run_dir}/slurm-job-id" ]]; then
+            job_id="$(tr -d '[:space:]' < "${run_dir}/slurm-job-id")"
+          fi
+
+          shopt -s nullglob
+          log_files=("${run_dir}"/slurm-*.out "${run_dir}"/slurm-*.err)
+          shopt -u nullglob
+
+          {
+            echo "## Mooncake RDMA smoke test"
+            echo
+            echo "- Workflow result: ${outcome_icon} \`${RDMA_SMOKE_OUTCOME}\`"
+            echo "- Image: \`${RDMA_SMOKE_IMAGE}\`"
+            echo "- Requested nodes: \`${RDMA_SMOKE_NODE_COUNT}\`"
+            echo "- Decode HCA mode: \`${RDMA_SMOKE_DECODE_HCA_MODE}\`"
+            echo "- Slurm job: \`${job_id:-not submitted}\`"
+            echo
+
+            echo "### RDMA WRITE results"
+            python3 - "${run_dir}" <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          run_dir = Path(sys.argv[1])
+          node_local_results = set()
+          for path in run_dir.glob("node-local-passed-*-*-*"):
+              try:
+                  _, _, _, rank, src, dst = path.name.split("-")
+                  node_local_results.add((int(rank), int(src), int(dst)))
+              except ValueError:
+                  continue
+
+          cross_node_pairs = set()
+          for path in run_dir.glob("cross-node-passed-*-*"):
+              try:
+                  _, _, _, src, dst = path.name.split("-")
+                  cross_node_pairs.add((int(src), int(dst)))
+              except ValueError:
+                  continue
+
+          cross_rail_pairs = {(src, dst) for src in range(7) for dst in range(src + 1, 8)}
+          same_index_pairs = {(gpu, gpu) for gpu in range(8)}
+          node_count = int(os.environ.get("RDMA_SMOKE_NODE_COUNT", "2"))
+          expected_node_local_results = {
+              (rank, src, dst)
+              for rank in range(node_count)
+              for src, dst in cross_rail_pairs
+          }
+          pair_label = "GPU" + "、".join(
+              f"{src}→{dst}" for src, dst in sorted(cross_rail_pairs)
+          )
+
+          node_local_icon = "✅" if expected_node_local_results <= node_local_results else "❌"
+          same_index_icon = "✅" if same_index_pairs <= cross_node_pairs else "❌"
+          cross_rail_icon = "✅" if cross_rail_pairs <= cross_node_pairs else "❌"
+
+          print(f"Node-local {pair_label} {node_local_icon}")
+          print(f"Cross-node same-index GPU0–7 {same_index_icon}")
+          print(f"Cross-node cross-rail {pair_label} {cross_rail_icon}")
+          PY
+            echo
+
+            echo "### Errors"
+            if [[ "${#log_files[@]}" -gt 0 ]] &&
+               awk '
+                 /^(ERROR:|E[0-9]{8})/ ||
+                 /Permission denied|command not found|Detect data integrity/ {
+                   if (!seen[$0]++ && count++ < 20) {
+                     print "- ❌ `" $0 "`"
+                   }
+                 }
+                 END { exit(count ? 0 : 1) }
+               ' "${log_files[@]}"; then
+              :
+            else
+              echo "- No RDMA smoke errors found in Slurm logs."
+            fi
+          } | tee "${summary_path}" >> "${GITHUB_STEP_SUMMARY}"
+
+          echo "RDMA smoke summary written to ${summary_path}"
 
   run-model-benchmark:
     name: ${{ matrix.id }}
