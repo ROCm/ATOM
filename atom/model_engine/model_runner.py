@@ -850,6 +850,16 @@ class ModelRunner:
         build_engram_host = getattr(self.model, "build_engram_host", None)
         if build_engram_host is None:
             return
+        # Engram does not support speculative decoding: the host prefetch keys on
+        # one sampled token per sequence per step and cannot carry the multiple
+        # candidate tokens (nor the trailing n-gram context) a spec step needs,
+        # and the one-row-per-seq staging cannot represent them -- so rather than
+        # silently stage zeros or hash a rejected token, reject the combination.
+        if getattr(self.config, "speculative_config", None) is not None:
+            raise NotImplementedError(
+                "engram is not supported with speculative decoding; serve engram "
+                "models without a speculative_config"
+            )
         self.engram = build_engram_host(
             device=self.device,
             max_num_tokens=self.config.max_num_batched_tokens,

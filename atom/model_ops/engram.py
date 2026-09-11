@@ -576,12 +576,15 @@ class EngramHost:
         self.max_num_tokens = max_num_tokens
         self.embed_width = num_hash_heads * head_dim
         self.device = device
+        # pin_memory only on device: a CPU-only build (the unit tests) has no
+        # pinned allocator and would raise on construction.
         self.buffers = {
             layer_id: CpuGpuBuffer(
                 max_num_tokens,
                 self.embed_width,
                 dtype=dtype,
                 device=device,
+                pin_memory=device.type == "cuda",
                 with_numpy=False,
             )
             for layer_id in prefetcher.layer_ids
