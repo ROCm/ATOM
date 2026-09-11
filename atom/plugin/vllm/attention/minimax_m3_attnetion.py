@@ -16,6 +16,9 @@ import aiter
 import torch
 from aiter import dtypes
 from torch import nn
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
 from atom.config import get_current_atom_config
 from atom.model_ops.minimax_m3.sparse_attn import (
@@ -31,8 +34,6 @@ from atom.plugin.vllm.attention.layer_common import (
     _register_vllm_static_forward_context,
 )
 from atom.utils import mark_spliting_op
-from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
 _MINIMAX_M3_TOPK_CACHE_STATE: dict = {}
 
@@ -41,28 +42,35 @@ def minimax_m3_sparse_attention_fake(
     qkv: torch.Tensor,
     positions: torch.Tensor,
     layer_name: str,
-    output_hidden_size: int,
-) -> torch.Tensor:
-    del positions, layer_name
-    return qkv.new_empty((qkv.shape[0], output_hidden_size))
+    output: torch.Tensor,
+) -> None:
+    del qkv, positions, layer_name, output
 
 
 @mark_spliting_op(
     is_custom=True,
     gen_fake=minimax_m3_sparse_attention_fake,
-    mutates_args=[],
+    mutates_args=["output"],
 )
 def minimax_m3_sparse_attention(
     qkv: torch.Tensor,
     positions: torch.Tensor,
     layer_name: str,
-    output_hidden_size: int,
-) -> torch.Tensor:
+    output: torch.Tensor,
+) -> None:
+    """Write this layer's sparse attention into ``output``.
+
+    The caller owns ``output`` rather than this op returning a fresh tensor,
+    because :func:`eager_break_during_capture` -- which the layer's
+    ``_sparse_attn_run`` carries -- replays the Python kernel on every
+    breakable-cudagraph replay. A tensor allocated inside would land at a new
+    address each replay while the captured segments that consume it still read
+    the address recorded at capture time.
+    """
     from vllm.forward_context import get_forward_context
 
     layer = get_forward_context().no_compile_layers[layer_name]
-    output = qkv.new_empty((qkv.shape[0], output_hidden_size))
-    return layer._forward_with_output(qkv, positions, output)
+    layer._sparse_attn_run(qkv, positions, output)
 
 
 class MiniMaxM3SparseIndexerCache(nn.Module, AttentionLayerBase):
@@ -75,8 +83,8 @@ class MiniMaxM3SparseIndexerCache(nn.Module, AttentionLayerBase):
         head_dim: int,
         kv_cache_dtype: str,
     ) -> None:
-        from vllm.v1.attention.backend import AttentionType
         from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+        from vllm.v1.attention.backend import AttentionType
 
         super().__init__()
         atom_config = get_current_atom_config()
@@ -339,6 +347,42 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             self.k_scale = self.kv_scale[0]
             self.v_scale = self.kv_scale[1]
         return self.k_scale, self.v_scale
+
+    def get_kv_transfer_scales(
+        self, kv_cache: "torch.Tensor | None" = None
+    ) -> tuple["torch.Tensor | None", "torch.Tensor | None"]:
+        """The fp8 scales a KV transfer must carry alongside this layer's bytes.
+
+        The sparse cache stores fp8 mantissas whose scale is per token AND per
+        head -- `(num_blocks, num_kv_heads, block_size)`, one fp32 per element
+        of the paged cache. Move the mantissas without them and a restored
+        block is dequantised against whatever the block's previous occupant
+        left behind: fluent-looking garbage, no error anywhere. So any tier
+        that moves this layer's KV has to move these too, and it can only know
+        that by asking -- vLLM's `kv_caches` registration carries the KV
+        tensors alone, and these live on the layer.
+
+        Named after the native path's `get_kv_transfer_tensors`, which reports
+        the same regions off `runner.kv_scale`.
+
+        `kv_cache` overrides the layer's own tensor, for callers that hold it
+        before the layer does -- a connector registering at engine start runs
+        before the first forward, and the scales are allocated lazily. Passing
+        the tensor vLLM registered is also what keeps the allocation stable:
+        `_ensure_fp8_scales` reallocates on a shape or device change, which
+        would strand a pointer a tier had already registered.
+
+        Returns `(None, None)` when the cache is not fp8 -- nothing to carry.
+        """
+        cache = self.kv_cache if kv_cache is None else kv_cache
+        if self.kv_cache_dtype != "fp8":
+            return None, None
+        if cache is None or cache.numel() == 0:
+            raise RuntimeError(
+                f"{self.layer_name}: cannot size the fp8 KV scales before the "
+                "KV cache is allocated"
+            )
+        return self._ensure_fp8_scales(cache)
 
     def _page16_shuffle_cache_for_sparse_kernel(
         self,
@@ -709,6 +753,39 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
         )
         return output
 
+    @eager_break_during_capture
+    def _sparse_attn_run(
+        self,
+        qkv: torch.Tensor,
+        positions: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        """Run sparse attention outside the breakable cudagraph segments.
+
+        M3 reaches vLLM with ``VLLM_USE_BREAKABLE_CUDAGRAPH`` on (vLLM
+        auto-enables it for this architecture), so there is no FX splitting:
+        one stream capture drives the whole forward and only the ops carrying
+        this decorator end a segment. Without it the 57 sparse layers are
+        captured wholesale, and everything this path reads per step -- the
+        prefill/decode token counts, ``block_table``, ``seq_lens``, the topk
+        indices -- is frozen at whatever the capture batch happened to hold.
+
+        The damage is silent and needs a cache hit to show: a cold prompt
+        prefills more tokens than the largest captured size and runs eagerly,
+        so it is correct; reuse a prefix and the short remainder lands inside a
+        captured size, replays another batch's metadata, and answers fluently
+        from the wrong KV. Any M3 run with prefix caching on is exposed.
+
+        Decode is untouched: full decode graphs dispatch with
+        ``cudagraph_runtime_mode == FULL``, which the decorator passes through,
+        and that path builds its metadata through the backend's cudagraph-safe
+        persistent buffers.
+
+        Mirrors what vLLM's own MiniMax-M3 does for its sparse attention, and
+        ATOM's Kimi-K3 plugin for the KDA mixer.
+        """
+        self._forward_with_output(qkv, positions, output)
+
     def forward(
         self,
         query: torch.Tensor,
@@ -724,12 +801,14 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             raise ValueError("MiniMax-M3 sparse vLLM attention requires packed qkv.")
         if positions is None:
             raise ValueError("positions is required for MiniMax-M3 sparse attention.")
-        return torch.ops.aiter.minimax_m3_sparse_attention(
+        output = qkv.new_empty((qkv.shape[0], self.q_size))
+        torch.ops.aiter.minimax_m3_sparse_attention(
             qkv,
             positions,
             self.layer_name,
-            self.q_size,
+            output,
         )
+        return output
 
 
 class MiniMaxM3DenseAttentionForVllm(nn.Module, AttentionLayerBase):
