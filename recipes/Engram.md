@@ -113,12 +113,3 @@ The `text_config` must carry the `engram_*` block `EngramConfig.from_hf` reads:
 The checkpoint carries six tensors per engram layer (see `EngramOp`):
 `embed.weight`/`embed.scale` (the ~98 GB fp8 table, stays on host),
 `wkv.weight`/`wkv.scale`, `k_weight`, `q_weight`.
-
-## Verifying correctness
-
-Set `ATOM_ENGRAM_DEBUG_VERIFY=1` (or `=strict` to raise) when serving. For the
-first decode steps it recomputes each staged embedding synchronously from the
-ground-truth model input and compares it to the async-prefetched rows, logging
-`engram VERIFY step N: X/Y rows mismatch, Z wrong-token`. `0/Y, 0 wrong-token`
-means the async hand-off (token alignment, cache keying, staging) is correct. It
-is off by default and self-disables after a short window.

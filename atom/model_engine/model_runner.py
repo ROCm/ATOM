@@ -860,7 +860,7 @@ class ModelRunner:
                 f"{list(self.engram.layer_ids)}"
             )
 
-    def _stage_engram(self, batch: ScheduledBatch, input_ids: torch.Tensor) -> None:
+    def _stage_engram(self, batch: ScheduledBatch) -> None:
         """Stage this step's engram embeddings to the device before the forward.
 
         Decode stages the real rows the prefetch gathered; dummy and prefill
@@ -874,19 +874,9 @@ class ModelRunner:
             return
         # `tokens` is read only to recompute a prefetch miss (a just-admitted
         # row), whose anchor is already in the host `scheduled_tokens` -- so the
-        # hot path needs no D2H. Verify alone pays the `input_ids` D2H, passed
-        # separately so it can catch a bad anchor.
+        # hot path needs no D2H.
         tokens = batch.scheduled_tokens[: len(seq_ids)].astype(np.int64).reshape(-1, 1)
-        verify_tokens = None
-        if os.environ.get("ATOM_ENGRAM_DEBUG_VERIFY"):
-            verify_tokens = (
-                input_ids[: len(seq_ids)]
-                .detach()
-                .to("cpu", dtype=torch.int64)
-                .numpy()
-                .reshape(-1, 1)
-            )
-        self.engram.stage_embeddings(seq_ids, tokens, verify_token_ids=verify_tokens)
+        self.engram.stage_embeddings(seq_ids, tokens)
         self.engram.wait_for_embeddings()
 
     def _maybe_warmup(self):
@@ -3216,7 +3206,7 @@ class ModelRunner:
         ) = self.prepare_model(batch)
         self._mark_staging_h2d_enqueued()
         if getattr(self, "engram", None) is not None:
-            self._stage_engram(batch, input_ids)
+            self._stage_engram(batch)
         logits, hidden_states = self.run_model(input_ids, batch)
 
         pp_group = get_pp_group()
