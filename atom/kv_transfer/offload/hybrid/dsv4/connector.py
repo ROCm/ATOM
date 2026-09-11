@@ -57,6 +57,7 @@ from atom.kv_transfer.offload._offload_common import (
     build_offload_engine,
     max_pending_saves,
     pp_aware_rank_and_world,
+    tokens_to_tensor,
     validated_kv_role,
 )
 from atom.kv_transfer.offload.hybrid.dsv4.codec import (
@@ -1192,7 +1193,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         t_retrieve0 = time.perf_counter()
         self._reset_gpu_connector_transfer_stats()
         ret_mask = self._engine.retrieve(
-            torch.tensor(toks),
+            tokens_to_tensor(toks),
             mask=mask,
             block_ids=req.block_ids,
             req_id=str(req.req_id),
@@ -1585,7 +1586,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 t_store0 = time.perf_counter()
                 self._reset_gpu_connector_transfer_stats()
                 self._engine.store(
-                    torch.tensor(toks),
+                    tokens_to_tensor(toks),
                     mask=mask,
                     block_ids=req.block_ids,
                     req_id=str(req.req_id),
