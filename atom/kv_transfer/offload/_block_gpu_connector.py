@@ -38,6 +38,109 @@ from atom.kv_transfer.offload.atom_lmcache_staging import (
 logger = logging.getLogger("atom")
 
 
+# Diagnostic only. When off, ``_run_staged_pipeline`` issues exactly the calls
+# it always did and ``last_transfer_stats`` reports nothing, so the shipping
+# path carries none of this. When on, it decomposes a staged transfer into GPU
+# busy time per stage, the wall-clock span the GPU spent on the transfer, and
+# the host time spent issuing it -- the three numbers that separate "the GPU is
+# genuinely busy", "the GPU is stalled between stages", and "the host never got
+# around to issuing the work".
+_TRANSFER_PROFILE = _env_flag("OFFLOAD_TRANSFER_PROFILE")
+
+# Experimental. The staging pipeline owns one buffer, so group n+1's pack
+# already waits on the free event group n's copy records and the two streams
+# never overlap on the GPU -- measured offline, span == pack + copy to within
+# 1%. What the second stream does still cost is a cross-stream event handoff
+# per group, and in-server that handoff is where the time goes: 2.28 ms of GPU
+# work inside a 16.86 ms span. Running both legs on one stream makes the
+# handoff a no-op of in-order execution and gives up an overlap that does not
+# exist. Correctness is unaffected -- one stream is strictly more ordered than
+# two, and the terminal synchronize is unchanged.
+_SINGLE_STREAM = _env_flag("OFFLOAD_SINGLE_STREAM")
+
+
+class _TransferProfile:
+    """Per-thread transfer accounting spanning one LMCache store/retrieve.
+
+    LMCache calls ``reset_transfer_stats`` before ``store()`` and reads the
+    totals after, and a store issues several ``batched_from_gpu`` calls, so the
+    fields accumulate across calls rather than describing the last one. Save
+    workers run concurrently on the same connector, which is why this lives in
+    the same thread-local as the transfer streams it measures.
+    """
+
+    __slots__ = (
+        "calls",
+        "chunks",
+        "copy_ms",
+        "from_gpu_ms",
+        "gpu_span_ms",
+        "groups",
+        "issue_copy_ms",
+        "issue_pack_ms",
+        "max_chunk_bytes",
+        "max_group_bytes",
+        "pack_ms",
+        "prepare_ms",
+        "total_bytes",
+        "wall_ms",
+    )
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.calls = 0
+        self.groups = 0
+        self.chunks = 0
+        self.total_bytes = 0
+        self.max_chunk_bytes = 0
+        self.max_group_bytes = 0
+        self.pack_ms = 0.0
+        self.copy_ms = 0.0
+        self.gpu_span_ms = 0.0
+        self.prepare_ms = 0.0
+        self.from_gpu_ms = 0.0
+        self.issue_pack_ms = 0.0
+        self.issue_copy_ms = 0.0
+        self.wall_ms = 0.0
+
+
+class _TimedStage:
+    """Wraps one pipeline leg with CUDA events and host issue timing.
+
+    The event pair brackets ``run`` alone on that leg's own stream, so it
+    measures the stage's GPU busy time and excludes the cross-stream waits the
+    pipeline inserts around it -- the difference between the two is exactly the
+    stall being hunted. ``elapsed_time`` is deliberately not queried here: it
+    would block, and the caller can read every event for free once
+    ``run_staged_pipeline`` has synchronized.
+    """
+
+    __slots__ = ("_stage", "events", "issue_ms")
+
+    def __init__(self, stage: _PipelineStage) -> None:
+        self._stage = stage
+        self.events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        self.issue_ms = 0.0
+
+    def as_stage(self) -> _PipelineStage:
+        return _PipelineStage(self._stage.stream, self._run)
+
+    def _run(self, group: Any, buf: torch.Tensor) -> None:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        t0 = time.perf_counter()
+        start.record(self._stage.stream)
+        self._stage.run(group, buf)
+        end.record(self._stage.stream)
+        self.issue_ms += (time.perf_counter() - t0) * 1000.0
+        self.events.append((start, end))
+
+    def busy_ms(self) -> float:
+        return sum(start.elapsed_time(end) for start, end in self.events)
+
+
 class BlockByteCodec(Protocol):
     """Block-byte staging contract shared by dense and PAGE codecs."""
 
@@ -291,6 +394,54 @@ class BlockGPUConnector:
             )
             states[key] = state
         return state
+
+    def _profile_state(self) -> _TransferProfile:
+        profile = getattr(self._tls, "profile", None)
+        if profile is None:
+            profile = _TransferProfile()
+            self._tls.profile = profile
+        return profile
+
+    def reset_transfer_stats(self) -> None:
+        """Start a new accounting window. Called before each LMCache store."""
+        if _TRANSFER_PROFILE:
+            self._profile_state().reset()
+
+    def last_transfer_stats(self) -> dict[str, int | float]:
+        """Totals since the last reset, in the shape the offload profiler logs.
+
+        ``sync_ms`` is host time inside the pipeline that was not spent issuing
+        work -- the terminal stream synchronize plus per-group bookkeeping --
+        so ``pack_ms + copy_ms`` against ``gpu_span_ms`` separates GPU busy from
+        GPU stalled, and ``gpu_span_ms`` against ``transfer_ms`` separates the
+        GPU from the host.
+        """
+        if not _TRANSFER_PROFILE:
+            return {}
+        acc = self._profile_state()
+        issue_ms = acc.issue_pack_ms + acc.issue_copy_ms
+        seconds = acc.wall_ms / 1000.0
+        return {
+            "calls": acc.calls,
+            "groups": acc.groups,
+            "chunks": acc.chunks,
+            "total_bytes": acc.total_bytes,
+            "max_chunk_bytes": acc.max_chunk_bytes,
+            "max_group_bytes": acc.max_group_bytes,
+            "gpu_staging_chunk_bytes": self._gpu_staging_chunk_bytes,
+            "gpu_staging_buffer_chunks": self._staging_buffer_chunks,
+            "gpu_staging_buffer_bytes": self._gpu_staging_buffer_bytes,
+            "pack_ms": acc.pack_ms,
+            "copy_ms": acc.copy_ms,
+            "gpu_span_ms": acc.gpu_span_ms,
+            "prepare_ms": acc.prepare_ms,
+            "from_gpu_ms": acc.from_gpu_ms,
+            "issue_pack_ms": acc.issue_pack_ms,
+            "issue_copy_ms": acc.issue_copy_ms,
+            "sync_ms": max(0.0, acc.wall_ms - issue_ms),
+            "transfer_ms": acc.wall_ms,
+            "effective_gbps": (acc.total_bytes / seconds / 1e9 if seconds > 0 else 0.0),
+        }
 
     def _ensure_staging_buffer(
         self,
@@ -620,17 +771,55 @@ class BlockGPUConnector:
             self._quarantine_staging_buffer(staging_buffer)
             return False
 
+        kwargs = {
+            "ensure_buffer": self._ensure_staging_buffer,
+            "group_nbytes": lambda group: group.nbytes,
+            "release_buffer": self._release_staging_buffer_if_requested,
+            "recover_buffer": recover,
+            "stage_b_enqueued": stage_b_enqueued,
+        }
+        if not (_TRANSFER_PROFILE and self._use_cuda()):
+            run_staged_pipeline(
+                state, groups, stage_a=stage_a, stage_b=stage_b, **kwargs
+            )
+            return
+
+        timed_a = _TimedStage(stage_a)
+        timed_b = _TimedStage(stage_b)
+        started = time.perf_counter()
         run_staged_pipeline(
             state,
             groups,
-            stage_a=stage_a,
-            stage_b=stage_b,
-            ensure_buffer=self._ensure_staging_buffer,
-            group_nbytes=lambda group: group.nbytes,
-            release_buffer=self._release_staging_buffer_if_requested,
-            recover_buffer=recover,
-            stage_b_enqueued=stage_b_enqueued,
+            stage_a=timed_a.as_stage(),
+            stage_b=timed_b.as_stage(),
+            **kwargs,
         )
+        wall_ms = (time.perf_counter() - started) * 1000.0
+        # Every event has completed by now and none of these reads can block:
+        # run_staged_pipeline synchronized stage_b's stream, and each stage_a
+        # end event precedes the ready event that same stream waited on. A
+        # failed pipeline raises above this point and is simply not counted --
+        # the totals describe transfers that ran, which is what a bandwidth
+        # attribution needs.
+        acc = self._profile_state()
+        acc.calls += 1
+        acc.groups += len(groups)
+        acc.wall_ms += wall_ms
+        for group in groups:
+            acc.chunks += len(group.chunks)
+            acc.total_bytes += group.nbytes
+            acc.max_group_bytes = max(acc.max_group_bytes, group.nbytes)
+            for chunk in group.chunks:
+                acc.max_chunk_bytes = max(acc.max_chunk_bytes, chunk.nbytes)
+        acc.pack_ms += timed_a.busy_ms()
+        acc.copy_ms += timed_b.busy_ms()
+        acc.issue_pack_ms += timed_a.issue_ms
+        acc.issue_copy_ms += timed_b.issue_ms
+        if timed_a.events and timed_b.events:
+            # First work issued to last work retired, across both streams.
+            # Device timestamps share one clock, so this is meaningful even
+            # though the two events sit on different streams.
+            acc.gpu_span_ms += timed_a.events[0][0].elapsed_time(timed_b.events[-1][1])
 
     def from_gpu(self, memory_obj: Any, start: int, end: int, **kwargs) -> None:
         self.batched_from_gpu([memory_obj], [start], [end], **kwargs)
@@ -646,6 +835,7 @@ class BlockGPUConnector:
         **kwargs,
     ) -> None:
         """Pack ATOM KV blocks tail-to-head into LMCache MemoryObjs."""
+        t0 = time.perf_counter() if _TRANSFER_PROFILE else 0.0
         prepared = self._prepare_transfer(
             memory_objs,
             starts,
@@ -653,9 +843,12 @@ class BlockGPUConnector:
             tail_to_head=True,
             **kwargs,
         )
+        if _TRANSFER_PROFILE:
+            self._profile_state().prepare_ms += (time.perf_counter() - t0) * 1000.0
         if prepared is None:
             return
         state, groups = prepared
+        copy_stream = state.pack_stream if _SINGLE_STREAM else state.copy_stream
         self._run_staged_pipeline(
             state,
             groups,
@@ -666,11 +859,13 @@ class BlockGPUConnector:
                 ),
             ),
             stage_b=_PipelineStage(
-                state.copy_stream,
+                copy_stream,
                 lambda group, buf: self._slice_to_memory_objs(group, buf),
             ),
             stage_b_enqueued=self._queue_source_safe_group,
         )
+        if _TRANSFER_PROFILE:
+            self._profile_state().from_gpu_ms += (time.perf_counter() - t0) * 1000.0
 
     def batched_to_gpu(
         self,
@@ -684,11 +879,12 @@ class BlockGPUConnector:
         if prepared is None:
             return
         state, groups = prepared
+        copy_stream = state.pack_stream if _SINGLE_STREAM else state.copy_stream
         self._run_staged_pipeline(
             state,
             groups,
             stage_a=_PipelineStage(
-                state.copy_stream,
+                copy_stream,
                 lambda group, buf: self._memory_objs_to_slice(group, buf),
             ),
             stage_b=_PipelineStage(
