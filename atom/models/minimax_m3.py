@@ -13,6 +13,7 @@ from aiter.dist.parallel_state import (
 )
 from aiter.rotary_embedding import get_rope
 from atom.config import Config, QuantizationConfig
+from atom.distributed.indexer_cp import indexer_cp_enabled
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -443,7 +444,18 @@ class MiniMaxM3SparseAttention(nn.Module):
                 f"{SPARSE_BLOCK_SIZE}, got {sparse_block_size}."
             )
         self.total_idx_heads = sparse_cfg["sparse_num_index_heads"]
-        self.num_idx_heads = self.num_kv_heads
+        # Indexer-only CP projects EVERY index head on every rank and shards the
+        # context instead, so the width is the full head count rather than this
+        # rank's kv-head share. `index_q_size` and the fused-qkv split in
+        # `forward` are both derived from this, so they follow with no edit --
+        # and they must: `aiter.fused_qknorm_idxrqknorm` finds index_q by offset
+        # inside `qkv`, so the wide tensor has to reach it intact.
+        #
+        # This is an __init__-time value, not a traced branch: `forward` closes
+        # over the resulting int exactly as it already does for TP2 vs TP4.
+        self.num_idx_heads = (
+            self.total_idx_heads if indexer_cp_enabled() else self.num_kv_heads
+        )
         self.idx_head_dim = sparse_cfg["sparse_index_dim"]
         self.index_q_size = self.num_idx_heads * self.idx_head_dim
         self.topk_blocks = sparse_cfg["sparse_topk_blocks"]

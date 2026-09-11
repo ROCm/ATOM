@@ -1522,10 +1522,17 @@ class DCPConfig:
     enable_query_replication: bool = True
     enable_project_before_merge: bool = True
     comm_backend: str = "a2a"
+    # Context-parallelize the MiniMax-M3 lightning indexer INSTEAD of the KV
+    # cache: every rank scores all index heads over 1/P of the blocks, then an
+    # all-to-all routes each head's candidates to the rank that owns it. Sparse
+    # attention, KV geometry and MoE stay TP. Requires
+    # decode_context_parallel_size == 1 -- see indexer_cp_unsupported_reason.
+    indexer_dcp_only: bool = False
 
     def __post_init__(self):
         self.interleave_size = int(self.interleave_size)
         assert self.interleave_size >= 1, "dcp.interleave_size must be >= 1"
+        self.indexer_dcp_only = bool(self.indexer_dcp_only)
         self.enable_query_replication = bool(self.enable_query_replication)
         self.enable_project_before_merge = bool(self.enable_project_before_merge)
         self.comm_backend = str(self.comm_backend)
@@ -1569,6 +1576,66 @@ def qrep_unsupported_reason(
     if mxfp4_bmm:
         # fp4 (mxfp4) absorbed BMM has a different scale structure.
         return "fp4 (mxfp4) BMM weights"
+    return None
+
+
+def indexer_cp_unsupported_reason(
+    arches,
+    tp_size: int,
+    num_kv_heads: int,
+    sparse_block_size: int,
+    dcp_size: int,
+    enable_tbo: bool,
+) -> str | None:
+    """Why MiniMax-M3 indexer-only context parallelism cannot run here, or None.
+
+    Pure and module-level for the same reason as ``qrep_unsupported_reason``:
+    the alternative is a real model directory and an HF config.
+
+    Note the DCP relationship is EXCLUSIVE, not a prerequisite. This shards the
+    indexer's block scoring; real DCP shards the KV cache itself (BlockManager
+    scales the prefix-cache hash granularity by dcp_world_size), and M3 has no
+    DCP-aware attention path at all. The two cannot both own the context axis.
+    """
+    if not any("MiniMaxM3" in str(a) for a in arches):
+        return "not a MiniMax-M3 model"
+    if dcp_size > 1:
+        return (
+            "decode_context_parallel_size > 1 (KV-cache DCP owns the context "
+            "axis; indexer_dcp_only replaces it, it does not extend it)"
+        )
+    if tp_size != num_kv_heads:
+        # Below TP4 a rank holds >1 kv head, which the candidate merge and the
+        # gluon decode kernel both reject (they assume per-rank num_kv_heads
+        # == 1). Above it the group is a strided subset of TP -- not wired yet.
+        return (
+            f"tensor_parallel_size ({tp_size}) != num_key_value_heads "
+            f"({num_kv_heads}); v1 supports only the square case"
+        )
+    if sparse_block_size != 128:
+        return f"sparse_block_size {sparse_block_size} != 128"
+    # Speculative decoding is deliberately NOT rejected. The whole chain takes
+    # max_query_len as a runtime argument and validates against it --
+    # indexer_context_scores, local_candidate_keys, merge_candidate_keys. This
+    # was verified out of tree over query_len {1, 4}, asserting torch.equal
+    # against minimax_m3_index_topk_decode for every head at every context
+    # length; qlen == 4 is exactly EAGLE3 with 3 draft tokens. NOTE that no test
+    # in this repo currently pins it -- the equality suite is not carried here.
+    #
+    # It is also the configuration this feature most wants. The score kernel
+    # sizes its MMA tile as max(16, next_power_of_2(heads * max_query_len))
+    # (indexer_context_parallel.py), so heads and draft tokens fill ONE
+    # dimension together against a hardware floor of 16:
+    #     TP,  no spec   1 x 1 =  1  ->  6% of the tile
+    #     CP,  no spec   4 x 1 =  4  -> 25%
+    #     TP + spec3     1 x 4 =  4  -> 25%
+    #     CP + spec3     4 x 4 = 16  -> 100%
+    # Rejecting spec here left every measurable arm at 25% or below and made the
+    # feature look marginal.
+    if enable_tbo:
+        # Two ubatch threads issuing all-to-alls on one group with no ordering
+        # discipline deadlock.
+        return "TBO (two-batch overlap)"
     return None
 
 
@@ -2154,6 +2221,41 @@ class Config:
                         f"{index_topk} for the comparison, or drop the "
                         "override."
                     )
+
+        # MiniMax-M3 indexer-only context parallelism. Off by default: it trades
+        # a fixed per-layer all-to-all for a large long-context score win, so it
+        # is a loss below roughly batch*context ~ 1M tokens. Warn and fall back
+        # rather than raise -- this is a performance flag, never correctness.
+        # Ops override wins over the config field, in both directions.
+        if envs.ATOM_M3_INDEXER_CP is not None:
+            self.dcp_config.indexer_dcp_only = envs.ATOM_M3_INDEXER_CP == "1"
+        if self.dcp_config.indexer_dcp_only:
+            text_cfg = getattr(self.hf_config, "text_config", self.hf_config)
+            sparse_cfg = getattr(text_cfg, "sparse_attention_config", None) or {}
+            indexer_cp_off = indexer_cp_unsupported_reason(
+                arches,
+                self.tensor_parallel_size,
+                getattr(text_cfg, "num_key_value_heads", 0),
+                sparse_cfg.get("sparse_block_size", 0),
+                self.decode_context_parallel_size,
+                self.enable_tbo or self.enable_tbo_decode,
+            )
+            if indexer_cp_off is not None:
+                logger.warning(
+                    "dcp_config.indexer_dcp_only disabled: %s.", indexer_cp_off
+                )
+                self.dcp_config.indexer_dcp_only = False
+            else:
+                # Announce the ON case too. The "Engine kwargs" dump is emitted
+                # before this runs (arg_utils.py), so it prints the pre-override
+                # value -- reading it as the live setting is how an A/B ends up
+                # comparing a config against itself.
+                logger.info(
+                    "dcp_config.indexer_dcp_only enabled: MiniMax-M3 indexer "
+                    "scores all %d index heads over 1/%d of the blocks.",
+                    getattr(text_cfg, "num_key_value_heads", 0),
+                    self.tensor_parallel_size,
+                )
 
         # Keep ``None`` intact until the model architecture is known so an
         # omitted index-cache option remains distinguishable from an explicit

@@ -223,6 +223,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_GLM5_DISABLE_FUSED_MHC": lambda: (
         os.getenv("ATOM_GLM5_DISABLE_FUSED_MHC", "0") == "1"
     ),
+    # MiniMax-M3 indexer-only context parallelism, as an ops override for
+    # dcp_config.indexer_dcp_only. Selection is bit-identical to the TP path, so
+    # this is an exact A/B: it trades a per-layer all-to-all for full MMA
+    # occupancy in the block scorer, winning above ~1M batch*context tokens and
+    # losing below. Unset leaves the config field alone.
+    "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
     # Kimi-K3 DSpark draft: fuse the per-layer context-row KV write
     # (K3DSparkMLAAttention.write_context_kv) into one Triton kernel --
     # RMSNorm(kv_c) + rope(k_pe) + concat + paged-cache store, versus today's
