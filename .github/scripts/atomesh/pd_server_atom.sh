@@ -251,8 +251,36 @@ apply_prefixed_env() {
   while IFS='=' read -r name raw; do
     [[ "${name}" == "${prefix}"* ]] || continue
     value="${raw//\$\{ROLE_IP\}/${role_ip}}"
+    value="${value//\$\{HANDSHAKE_PORT\}/${HANDSHAKE_PORT}}"
     export "${name#${prefix}}=${value}"
   done < <(env)
+}
+
+# Names the last apply_role_env() exported for a role.
+ROLE_ENV_NAMES=()
+
+# Both servers are launched from this one shell, so a variable exported for one
+# role stays in the environment the next role inherits. Only names the two roles
+# both define get overwritten; a prefill-only name reaches decode unchanged --
+# VLLM_PP_LAYER_PARTITION from a pp4 prefill aborts a pp1 decode's model build
+# with "len(partitions)=4 does not match pp_size=1". Drop the previous role's
+# names before applying this one's.
+apply_role_env() {
+  local prefix="$1"
+  local role_ip="$2"
+  local name
+  for name in ${ROLE_ENV_NAMES[@]+"${ROLE_ENV_NAMES[@]}"}; do
+    unset "${name}"
+  done
+  ROLE_ENV_NAMES=()
+  while IFS='=' read -r name _; do
+    [[ "${name}" == "${prefix}"* ]] || continue
+    ROLE_ENV_NAMES+=("${name#${prefix}}")
+  done < <(env)
+  # A name the common block also sets was just unset with the previous role's,
+  # so put the common value back before the role overrides it.
+  apply_prefixed_env "ATOMESH_ENV_" "${role_ip}"
+  apply_prefixed_env "${prefix}" "${role_ip}"
 }
 
 host_ip="$(echo "${IPADDRS}" | tr ',' '\n' | sed -n "$((NODE_RANK + 1))p")"
@@ -570,12 +598,38 @@ terminate_process_group() {
   wait "${pid}" 2>/dev/null || true
 }
 
+# LMCache's NVMe tier lives on a host bind mount, so unlike the container's own
+# /tmp it survives `docker run --rm`. Every concurrency runs as its own job, and
+# a tier left behind would both serve the previous job's KV and hold its
+# LMCACHE_MAX_LOCAL_DISK_SIZE of disk per rank. Start empty, leave nothing.
+lmcache_disk_dir=""
+
+reset_lmcache_disk() {
+  local dir="${LMCACHE_LOCAL_DISK:-}"
+  [[ -n "${dir}" && "${dir}" != "/" ]] || return 0
+  # Several prefill workers can share this shell, so only the first one empties
+  # the tier; a later one would delete a running worker's cache underneath it.
+  [[ "${lmcache_disk_dir}" != "${dir}" ]] || return 0
+  lmcache_disk_dir="${dir}"
+  rm -rf -- "${dir}"
+  mkdir -p -- "${dir}"
+  echo "[lmcache] NVMe tier ${dir} reset (${LMCACHE_MAX_LOCAL_DISK_SIZE:-0}GiB per rank)"
+}
+
+purge_lmcache_disk() {
+  [[ -n "${lmcache_disk_dir}" ]] || return 0
+  rm -rf -- "${lmcache_disk_dir}"
+  echo "[lmcache] NVMe tier ${lmcache_disk_dir} removed"
+  lmcache_disk_dir=""
+}
+
 cleanup_processes() {
   local rc=$?
   local pid
   for pid in "$@"; do
     terminate_process_group "${pid}"
   done
+  purge_lmcache_disk
   return "${rc}"
 }
 
@@ -610,7 +664,8 @@ start_prefill() {
   local handshake_port="${3:-${HANDSHAKE_PORT}}"
   local dp_master_port="${4:-${PREFILL_DP_MASTER_PORT}}"
   local dp_base_port="${5:-${PREFILL_DP_BASE_PORT}}"
-  apply_prefixed_env "ATOMESH_PREFILL_ENV_" "${host_ip}"
+  apply_role_env "ATOMESH_PREFILL_ENV_" "${host_ip}"
+  reset_lmcache_disk
   local -a prefill_cache_env=()
   build_server_cache_env "prefill" "${server_port}" prefill_cache_env
   local -a prefill_dp_env=()
@@ -647,7 +702,7 @@ start_decode() {
   local handshake_port="${3:-${HANDSHAKE_PORT}}"
   local dp_master_port="${4:-${DECODE_DP_MASTER_PORT}}"
   local dp_base_port="${5:-${DECODE_DP_BASE_PORT}}"
-  apply_prefixed_env "ATOMESH_DECODE_ENV_" "${host_ip}"
+  apply_role_env "ATOMESH_DECODE_ENV_" "${host_ip}"
   local max_conc
   max_conc="$(echo "${BENCH_MAX_CONCURRENCY}" | tr 'x,' '\n' | sort -n | tail -1)"
   local decode_max_num_seqs="${MAX_NUM_SEQS}"
