@@ -1133,6 +1133,29 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.use_triton = False
             self.use_triton_decode = False
             self.use_triton_ep = False
+
+        # Triton MoE under EP exists only for gfx95x and gfx125x -- those are the
+        # arches whose branch-A weight prep and gluon experts are wired up. The
+        # arch test that computes `use_triton_moe` above is bypassed whenever
+        # ATOM_USE_TRITON_MOE is set explicitly, so a fleet-wide
+        # ATOM_USE_TRITON_MOE=1 would otherwise reach the modular kernel's Triton
+        # experts on gfx94x over weights that were never prepared for them.
+        #
+        # Declined rather than asserted, so one env setting can span mixed
+        # arches. Sits with the EPLB force-off and BEFORE the A4W4 assert below
+        # on purpose: that assert has to see the final value, or a4w4 would be
+        # accepted here and then silently dropped on an arch that cannot serve
+        # it. `use_triton` needs no reset -- it is already False under EP.
+        if self.use_triton_ep and not gfx.startswith(("gfx95", "gfx125")):
+            logger.warning(
+                "ATOM_USE_TRITON_MOE=1 asks for Triton MoE, but the EP path is "
+                "supported only on gfx95x and gfx125x (arch=%s). Falling back to "
+                "the FlyDSL EP path for the routed experts.",
+                gfx,
+            )
+            self.use_triton_ep = False
+            self.use_triton_decode = False
+
         assert not (
             envs.ATOM_USE_TRITON_MOE_A4W4
             and not (self.use_triton or self.use_triton_ep)
@@ -1140,18 +1163,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             "ATOM_USE_TRITON_MOE_A4W4=1 requires a Triton MoE path, but it is off "
             f"(ATOM_USE_TRITON_MOE={int(use_triton_moe)}, use_ep={ep_moe}, "
             f"eplb_enable={getattr(get_current_atom_config(), 'eplb_enable', False)})."
-        )
-
-        # Triton MoE under EP exists only for gfx95x and gfx125x -- those are the
-        # arches whose branch-A weight prep and gluon experts are wired up. The
-        # arch test that computes `use_triton_moe` above is bypassed whenever
-        # ATOM_USE_TRITON_MOE is set explicitly, so without this a gfx94x EP
-        # deployment reaches the modular kernel's Triton experts carrying weights
-        # that were never prepared for them. Checked after the EPLB block so a
-        # deployment EPLB would have turned off anyway does not trip it.
-        assert not self.use_triton_ep or gfx.startswith(("gfx95", "gfx125")), (
-            "Triton MoE on EP is only supported on gfx95x and gfx125x, got "
-            f"{gfx}. Unset ATOM_USE_TRITON_MOE to run the FlyDSL EP path."
         )
 
         # Selecting Triton for the routed experts under EP is a change of

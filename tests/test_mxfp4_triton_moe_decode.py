@@ -26,15 +26,23 @@ gfx1250_only = pytest.mark.skipif(
 )
 
 
-def _make_method(monkeypatch, *, decode_flag, use_triton=True, use_ep=False):
+def _make_method(
+    monkeypatch,
+    *,
+    decode_flag,
+    use_triton=True,
+    use_ep=False,
+    gfx="gfx1250",
+    a4w4=False,
+):
     monkeypatch.setattr(
         moe_mod, "get_current_atom_config", lambda: SimpleNamespace(eplb_enable=False)
     )
-    monkeypatch.setattr(moe_mod, "get_gfx", lambda: "gfx1250")
+    monkeypatch.setattr(moe_mod, "get_gfx", lambda: gfx)
     monkeypatch.setattr(moe_mod.envs, "is_set", lambda _name: True)
     monkeypatch.setattr(moe_mod.envs, "ATOM_USE_TRITON_MOE", use_triton)
     monkeypatch.setattr(moe_mod.envs, "ATOM_USE_TRITON_MOE_DECODE", decode_flag)
-    monkeypatch.setattr(moe_mod.envs, "ATOM_USE_TRITON_MOE_A4W4", False)
+    monkeypatch.setattr(moe_mod.envs, "ATOM_USE_TRITON_MOE_A4W4", a4w4)
     monkeypatch.setattr(moe_mod.envs, "ATOM_MOE_GU_ITLV", True)
 
     quant_config = SimpleNamespace(
@@ -70,6 +78,51 @@ def test_decode_flag_only_narrows_the_triton_path(
         monkeypatch, decode_flag=decode_flag, use_triton=use_triton, use_ep=use_ep
     )
     assert method.use_triton_decode is expected
+
+
+@pytest.mark.parametrize(
+    ("gfx", "expected_ep"),
+    [
+        ("gfx1250", True),
+        ("gfx950", True),
+        # gfx94x has a Triton TP path but no EP one: no branch-A weight prep and
+        # no gluon experts. ATOM_USE_TRITON_MOE=1 skips the arch test that
+        # computes use_triton_moe, so the restriction has to be re-applied.
+        ("gfx942", False),
+    ],
+)
+def test_ep_triton_is_declined_on_unsupported_arch(monkeypatch, gfx, expected_ep):
+    """ATOM_USE_TRITON_MOE=1 under EP is honoured only on gfx95x / gfx125x.
+
+    Declined, not asserted, so one env setting can span a mixed-arch fleet --
+    and use_triton_decode has to come down with it, since it was derived from
+    use_triton_ep before the restriction is applied.
+    """
+    method = _make_method(
+        monkeypatch, decode_flag=True, use_triton=True, use_ep=True, gfx=gfx
+    )
+    assert method.use_triton_ep is expected_ep
+    assert method.use_triton_decode is expected_ep
+    # TP is never what EP falls back to; the routed experts go to FlyDSL.
+    assert method.use_triton is False
+
+
+def test_a4w4_still_refuses_when_ep_triton_is_declined(monkeypatch):
+    """The arch restriction runs BEFORE the A4W4 assert, on purpose.
+
+    ATOM_USE_TRITON_MOE_A4W4 only chooses which Triton wrapper runs. If the
+    restriction were applied after the assert, a4w4 would be accepted here and
+    then silently dropped on an arch with no Triton EP path at all.
+    """
+    with pytest.raises(AssertionError, match="ATOM_USE_TRITON_MOE_A4W4"):
+        _make_method(
+            monkeypatch,
+            decode_flag=False,
+            use_triton=True,
+            use_ep=True,
+            gfx="gfx942",
+            a4w4=True,
+        )
 
 
 def test_mega_backend_keeps_decode_triton_off(monkeypatch):
