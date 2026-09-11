@@ -430,7 +430,9 @@ class _Qwen35CacheViewBinding:
     kv_cache_data: dict[str, KVCacheTensor]
 
 
-def bind_qwen35_cache_views(forward_batch: Any) -> dict[str, KVCacheTensor]:
+def bind_qwen35_cache_views(
+    forward_batch: Any, *, token_pool: Any | None = None
+) -> dict[str, KVCacheTensor]:
     """Bind SGLang storage as ATOM-compatible K/V cache views.
 
     The K view is vectorized as ``[block, head, dim/x, page, x]`` for both
@@ -440,7 +442,8 @@ def bind_qwen35_cache_views(forward_batch: Any) -> dict[str, KVCacheTensor]:
     token pool.
     """
 
-    token_pool, _ = _mha_pools(forward_batch)
+    if token_pool is None:
+        token_pool, _ = _mha_pools(forward_batch)
     page_size = int(getattr(token_pool, "page_size", 1))
     kv_cache_data: dict[str, KVCacheTensor] = {}
 
@@ -515,7 +518,7 @@ def _block_tables(
     max_blocks = max(1, (max_seq_len + page_size - 1) // page_size)
     token_table = req_pool.req_to_token[
         forward_batch.req_pool_indices[:batch_size], : max_blocks * page_size
-    ].clone()
+    ]
     if extend_lens is not None:
         extend_lens = extend_lens[:batch_size].to(
             device=token_table.device, dtype=torch.long
@@ -535,7 +538,7 @@ def _block_tables(
             source_indices = query_offsets.unsqueeze(1) + relative_positions
             source_indices = source_indices.clamp(
                 min=0, max=int(out_cache_loc.numel()) - 1
-            ).to(torch.long)
+            )
             source_slots = out_cache_loc.gather(0, source_indices.reshape(-1)).view_as(
                 source_indices
             )
@@ -561,11 +564,7 @@ def _frontier_slot_mapping(
         .squeeze(1)
     )
     physical_slots = block_ids * page_size + torch.remainder(logical_slots, page_size)
-    return torch.where(
-        context_lens > 0,
-        physical_slots,
-        torch.full_like(physical_slots, -1),
-    )
+    return torch.where(context_lens > 0, physical_slots, -1)
 
 
 def build_qwen35_attention_metadata(
@@ -803,7 +802,7 @@ def install_qwen35_cache_views(
     ):
         kv_cache_data = cached.kv_cache_data
     else:
-        kv_cache_data = bind_qwen35_cache_views(forward_batch)
+        kv_cache_data = bind_qwen35_cache_views(forward_batch, token_pool=token_pool)
         kv_cache_data.update(
             SGLangGDNForwardContext._build_kv_cache_tensors(
                 forward_batch, linear_backend

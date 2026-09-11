@@ -13,12 +13,14 @@ A DSV4 boundary is reusable only when both PAGE and SLOT restore successfully.
 Missing, incompatible, or corrupt sidecar data fails closed to recomputation.
 
 The public configuration remains `kv_connector: "lmcache_offload"`. The thin
-top-level shell resolves one of three layouts: `kimi_k3` when
-`hf_config.model_type == "kimi_linear"` (dense paged MLA KV plus a KDA
-per-request state tier), `hybrid` when `hf_config.compress_ratios` is present
-(DSV4 PAGE+SLOT), and `dense` otherwise. `kv_transfer_config.offload_layout` can
-override that choice without giving scheduler and worker different connector
-names.
+top-level shell resolves one of four layouts: `m3` for MiniMax-M3 PAGE regions
+(including its NSA index cache), `kimi_k3` when the text config has
+`model_type == "kimi_linear"` (dense paged MLA KV plus a KDA per-request state
+tier), `hybrid` when `hf_config.compress_ratios` is present (DSV4 PAGE+SLOT),
+and `dense` otherwise. `kv_transfer_config.offload_layout` can override
+compatible choices without giving scheduler and worker different connector
+names. MiniMax-M3 cannot be overridden away from `m3`, because the other codecs
+do not preserve its NSA index cache.
 
 GDN/linear-attention models (`qwen3_next`, `qwen3_5_*`; e.g. Qwen3-Next,
 Qwen3.5) are the one family the resolver does **not** map to a layout: they carry
@@ -412,6 +414,16 @@ The GPU connector uses a **bounded** staging buffer
 one group copies host↔staging, the next packs/unpacks on a separate CUDA stream,
 handed off via ready/free events. Transfers larger than the buffer are split into
 groups, so HBM staging cost is capped regardless of prefix length.
+
+SAVE chunk staging is scheduled strictly tail-to-head by token range. For B1–B8
+with two-block LMCache chunks, GPU source reads and source-safe notifications are
+B7–B8, B5–B6, B3–B4, B1–B2. Each assembled transfer record keeps its original
+MemoryObj, token range, and block-ID slice together, so reversing scheduling
+cannot cross-wire payloads. LOAD remains head-to-tail. LMCache's current
+`CacheEngine.store` API retains the cache-key list internally and exposes only
+MemoryObjs/ranges to the GPU connector; therefore ATOM cannot safely reorder the
+later `StorageManager.batched_put` batch. Backend submission remains one opaque
+batch in LMCache's original key/object order, after tail-to-head GPU staging.
 
 **`OFFLOAD_GPU_STAGING_CHUNKS` sizes *each* staging buffer, and there is more than
 one.** The buffer is thread-local (`threading.local`), and load and save run on

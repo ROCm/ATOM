@@ -51,10 +51,12 @@ _HF_PAGE_FIELDS = (
     "qk_rope_head_dim",
     "compress_ratios",
     "indexer_dtype",
+    "indexer_types",
 )
 _HF_INTEGER_GEOMETRY_FIELDS = frozenset(_HF_PAGE_FIELDS) - {
     "compress_ratios",
     "indexer_dtype",
+    "indexer_types",
 }
 # GDN/linear model types carrying a per-request recurrent state but NOT in the
 # `kimi_linear` family `kimi_k3` owns. Same set as `attn_family` resolves to
@@ -107,15 +109,12 @@ def _is_minimax_m3(hf_config) -> bool:
     (config-only selection, matching select_offload_layout's contract).
     """
 
-    if hf_config is None:
-        return False
-    architectures = getattr(hf_config, "architectures", None) or ()
-    for arch in architectures:
-        name = str(arch).lower()
-        if "minimaxm3" in name or "minimax_m3" in name:
-            return True
-    model_type = str(getattr(hf_config, "model_type", "") or "").lower()
-    return "minimax_m3" in model_type or "minimaxm3" in model_type
+    # Keep model normalization, attention selection, and offload layout
+    # selection on one predicate, including wrapper configs whose identifying
+    # fields live under ``text_config``.
+    from atom.config import _is_minimax_m3_config
+
+    return hf_config is not None and _is_minimax_m3_config(hf_config)
 
 
 def select_offload_layout(config) -> str:
@@ -143,6 +142,17 @@ def select_offload_layout(config) -> str:
         raise ValueError(
             f"lmcache_offload: unknown offload_layout={override!r}; "
             f"expected one of {sorted(_OFFLOAD_LAYOUT_ALIASES)}"
+        )
+    # M3's PAGE layout is the only codec that carries its NSA index cache.
+    # Unlike a dense/hybrid namespace preference, changing this model family
+    # to another layout loses required state and can silently corrupt a
+    # restored prefix.
+    if natural == "m3" and mapped != "m3":
+        raise ValueError(
+            f"lmcache_offload: MiniMax-M3 requires offload_layout='m3'; "
+            f"offload_layout={override!r} resolves to {mapped!r}, whose codec "
+            "does not preserve the NSA index cache. Drop the override or set "
+            "it to 'm3'."
         )
     # An override may pick between compatible layouts, but it may not strip a
     # state-owning model down to a layout with no tier for its per-request state

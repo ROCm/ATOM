@@ -676,8 +676,9 @@ def test_qwen35_cache_install_reuses_pool_stable_views(monkeypatch):
         lambda _batch: (token_pools[0], SimpleNamespace()),
     )
 
-    def bind_mha(_batch):
-        bind_calls.append(token_pools[0])
+    def bind_mha(_batch, *, token_pool):
+        assert token_pool is token_pools[0]
+        bind_calls.append(token_pool)
         return {"layer_0": object()}
 
     monkeypatch.setattr(bridge, "bind_qwen35_cache_views", bind_mha)

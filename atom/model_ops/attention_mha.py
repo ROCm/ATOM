@@ -85,17 +85,8 @@ class PagedAttentionImpl(nn.Module):
         self.kv_scale = torch.tensor(
             self.kv_scale_float, dtype=torch.float32, device=self.device
         )
-        # Pre-allocated fp8 dequant scale for the pa_decode_bf16_asm path. Built
-        # here (outside CUDAGraph capture) and reused so the kernel wrapper never
-        # allocates a tensor mid-capture.
-        self._pa_decode_bf16_asm_scale = torch.full(
-            (1,), self.kv_scale_float, dtype=torch.float32, device=self.device
-        )
-        # Pure-prefill FP8 FMHA quantizes the live Q/K/V tensors directly, so
-        # its per-tensor descale is identity and independent of KV-cache scales.
-        self._fp8_prefill_attn_scale = torch.ones(
-            (1,), dtype=torch.float32, device=self.device
-        )
+        # Reuse the KV scale as a 1-D view, created outside CUDA Graph capture.
+        self._pa_decode_bf16_asm_scale = self.kv_scale.view(1)
         self.per_token_quant = True
         self.sinks = sinks
         self.sliding_window = sliding_window if sliding_window is not None else -1
@@ -815,7 +806,8 @@ class PagedAttentionImpl(nn.Module):
             )
         if self._can_use_fp8_prefill_attention(q, k, v, fwd_ctx):
             output_dtype = q.dtype
-            scale = self._fp8_prefill_attn_scale
+            # On gfx950, kv_scale is 1.0; FMHA requires a 1-D per-tensor scale.
+            scale = self.kv_scale.view(1)
             # Use aiter's FMHA v3 varlen dispatcher (ROCm/aiter#4657) instead of
             # flash_attn_varlen_fp8_pertensor_func, which hardcodes return_lse=False
             # and can divert to Triton when ENABLE_CK=0.

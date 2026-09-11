@@ -73,10 +73,7 @@ def reconstruct_linear_metadata(
 
     if mode.is_decode_or_idle():
         # Give each real decode request one token and every padded row zero tokens.
-        query_start_loc = torch.empty(batch_size + 1, dtype=torch.int32, device=device)
-        query_start_loc[: real_batch_size + 1] = torch.arange(
-            real_batch_size + 1, dtype=torch.int32, device=device
-        )
+        query_start_loc = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
         query_start_loc[real_batch_size + 1 :] = real_batch_size
     elif mode.is_extend():
         # Build variable-length query offsets using only real extend requests.
