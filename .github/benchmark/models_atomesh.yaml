@@ -468,6 +468,7 @@ models:
         # AgentX enables comm-group reuse only on C56/C64.
         AITER_REUSE_IDENTICAL_COMM_GROUPS: "0"
         ATOM_MLA_MAX_SPLIT_PER_BATCH: "256"
+        ATOM_GDN_SSM_DTYPE: "fp16"
         ATOM_STATE_CHECKPOINT_DEMAND: "0"
         # AgentX band default: ReplaySSM off on CONC 1/2/4, on for the mid band
         # (CONC 8-16), off again from CONC 32. Cases that declare their own env
