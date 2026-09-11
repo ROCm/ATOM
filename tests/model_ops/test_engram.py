@@ -269,7 +269,7 @@ def test_prefetch_result_equals_inline_compute():
     seq_ids = [11, 12]
     ids = np.array([[3, 4, 5], [6, 7, 8]], dtype=np.int64)
     expected = pf.compute(seq_ids, ids)
-    assert pf.submit(seq_ids, ids).result(timeout=30) is None
+    assert pf.submit_compute(seq_ids, ids).result(timeout=30) is None
     assert pf.wait(timeout=30)
     for (seq_id, layer_id), value in expected.items():
         torch.testing.assert_close(pf.cache.take(seq_id, layer_id), value)
@@ -278,7 +278,7 @@ def test_prefetch_result_equals_inline_compute():
 
 def test_prefetch_drop_requests_clears_cache():
     pf = make_prefetcher()
-    pf.submit([21], np.array([[1, 2, 3]], dtype=np.int64)).result(timeout=30)
+    pf.submit_compute([21], np.array([[1, 2, 3]], dtype=np.int64)).result(timeout=30)
     pf.drop_requests([21])
     assert len(pf.cache) == 0
     pf.shutdown()

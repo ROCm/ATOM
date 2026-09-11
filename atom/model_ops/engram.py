@@ -503,7 +503,7 @@ class EngramPrefetcher:
                 results[(seq_id, layer_id)] = gathered[i]
         return results
 
-    def submit(
+    def submit_compute(
         self,
         seq_ids: list[int],
         token_ids: np.ndarray | None = None,
@@ -556,7 +556,7 @@ class EngramHost:
          `prefetch_next` queues hash + gather for them on the worker;
       2. `stage_embeddings` copies whatever the worker produced into a pinned buffer and
          issues the H2D on a side stream, recording an event;
-      3. `wait_for_copy` makes the compute stream wait on that event, so the
+      3. `wait_for_embeddings` makes the compute stream wait on that event, so the
          engram layers read staged rows rather than racing the copy.
 
     A sequence whose prefetch has not landed is computed inline in `stage_embeddings`. The
@@ -803,7 +803,7 @@ class EngramHost:
         self._staged_rows = num_rows
         return num_rows
 
-    def wait_for_copy(self) -> None:
+    def wait_for_embeddings(self) -> None:
         """Order the compute stream behind the staging H2D."""
         if self.copy_done is not None:
             torch.cuda.current_stream(self.device).wait_event(self.copy_done)
@@ -839,10 +839,10 @@ class EngramHost:
                 event.synchronize()
                 return np.array(host[:n]).reshape(n, 1)
 
-            self.prefetcher.submit(seq_ids, token_source=_read)
+            self.prefetcher.submit_compute(seq_ids, token_source=_read)
         else:
             token_ids = np.asarray(tokens).reshape(n, -1)[:, -1:].astype(np.int64)
-            self.prefetcher.submit(seq_ids, token_ids)
+            self.prefetcher.submit_compute(seq_ids, token_ids)
 
     def drop_requests(self, seq_ids: list[int]) -> None:
         self.prefetcher.drop_requests(seq_ids)
