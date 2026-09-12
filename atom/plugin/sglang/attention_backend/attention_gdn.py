@@ -567,6 +567,7 @@ class SGLangGDNForwardContext:
 
         metadata = SGLangForwardBatchMetadata.build(forward_batch_or_metadata)
         if metadata is None or metadata.forward_batch is None:
+            logger.warning("SGLang GDN forward context: metadata/forward_batch missing")
             return None
 
         forward_batch = metadata.forward_batch
@@ -582,10 +583,41 @@ class SGLangGDNForwardContext:
         linear_backend = cls._linear_attn_backend(attn_backend)
         gdn_metadata = cls._build_gdn_metadata(forward_batch, linear_backend)
         if gdn_metadata is None and not forward_batch.forward_mode.is_target_verify():
+            fm = getattr(linear_backend, "forward_metadata", None)
+            pool = resolve_mamba_req_pool(forward_batch, linear_backend)
+            logger.warning(
+                "SGLang GDN forward context: gdn_metadata build failed "
+                "(mode=%s linear_backend=%s forward_metadata=%s "
+                "mamba_pool=%s mamba_map=%s)",
+                getattr(forward_batch.forward_mode, "name", forward_batch.forward_mode),
+                type(linear_backend).__name__,
+                None
+                if fm is None
+                else (
+                    hasattr(fm, "query_start_loc"),
+                    hasattr(fm, "mamba_cache_indices"),
+                ),
+                None if pool is None else type(pool).__name__,
+                None if pool is None else getattr(pool, "mamba_map", None),
+            )
             return None
 
         kv_cache_data = cls._build_kv_cache_tensors(forward_batch, linear_backend)
         if not kv_cache_data:
+            pool = resolve_mamba_req_pool(forward_batch, linear_backend)
+            logger.warning(
+                "SGLang GDN forward context: empty kv_cache_data "
+                "(linear_backend=%s mamba_pool=%s attrs=%s)",
+                type(linear_backend).__name__,
+                None if pool is None else type(pool).__name__,
+                None
+                if pool is None
+                else sorted(
+                    a
+                    for a in dir(pool)
+                    if "mamba" in a.lower() or a in ("size", "mamba_map")
+                )[:40],
+            )
             return None
 
         context, num_tokens = cls._build_context(forward_batch)
