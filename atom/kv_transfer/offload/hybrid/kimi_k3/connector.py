@@ -98,6 +98,7 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
     # through it, so the dense codec must SKIP the state tensor rather than
     # reject it. The base rejects it (silent-wrong-output guard); we opt in here.
     _permit_per_request_state = True
+    _supports_early_block_release = False
 
     def __init__(self, config) -> None:
         super().__init__(config)
@@ -594,6 +595,8 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
     state tier -- so routing can select it with `isinstance` rather than probing
     for a method the delegating shell defines on every layout (see
     `StateOffloadFace` and the shell's `has_state_tier`)."""
+
+    _supports_early_block_release = False
 
     def __init__(self, config) -> None:
         super().__init__(config)

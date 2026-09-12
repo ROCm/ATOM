@@ -50,6 +50,8 @@ if is_sglang():
         {
             "DeepseekV4ForCausalLM": DeepseekV4ForCausalLM,
             "Qwen3NextForCausalLM": Qwen3NextForCausalLM,
+            "Qwen3_5ForCausalLM": Qwen3_5ForCausalLM,
+            "Qwen3_5MoeForCausalLM": Qwen3_5MoeForCausalLM,
             "Qwen3_5ForConditionalGeneration": Qwen3_5ForCausalLM,
             "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoeForCausalLM,
             # ROCm/ATOM#1078: route Kimi-K2.x through ATOM's quant-aware model

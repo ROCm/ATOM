@@ -18,6 +18,7 @@ from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 
 from atom.kv_transfer.disaggregation.types import (
+    ConnectorCompletion,
     KVConnectorOutput,
     LoadCompletionId,
     SaveCompletionId,
@@ -136,6 +137,7 @@ class OffloadWorkerMixin:
         self._done_save: set[SaveCompletionId] = set()
         self._done_load: set[LoadCompletionId] = set()
         self._failed_load: set[LoadCompletionId] = set()
+        self._connector_completions: set[ConnectorCompletion] = set()
 
     def close(self) -> None:
         """Join the save/load executors at worker teardown.
@@ -233,19 +235,26 @@ class OffloadWorkerMixin:
                 with self._lock:
                     self._failed_load.add(self._load_completion_id(req))
             else:
-                # A failed save just loses this offload opportunity; still report
-                # finished_saving so the scheduler releases any deferred free.
-                with self._lock:
-                    self._done_save.add(self._save_completion_id(req))
+                # Layouts with a richer success/failure protocol override this
+                # hook.  Legacy layouts still report a terminal save so a
+                # whole-request deferred free cannot leak.
+                self._record_save_failure(req)
+
+    def _record_save_failure(self, req) -> None:
+        with self._lock:
+            self._done_save.add(self._save_completion_id(req))
 
     def get_finished(self) -> KVConnectorOutput:
         with self._lock:
             dl, fl, ds = self._drain_common_completions_locked()
+            completions = set(self._connector_completions)
+            self._connector_completions.clear()
         return KVConnectorOutput(
             finished_sending=set(),
             finished_loading=dl,
             failed_loading=fl,
             finished_saving=ds,
+            connector_completions=completions,
         )
 
     def _drain_common_completions_locked(
@@ -330,6 +339,12 @@ class OffloadSchedulerMixin(ABC):
         self.total_saved_tokens = 0
         self._load_inflight_tokens: dict[object, int] = {}
         self._save_inflight_tokens: dict[object, int] = {}
+        # Early block-release observability. Populated by layouts that support
+        # exact source-block leases; unsupported layouts leave these at 0.
+        self.total_early_released_blocks = 0  # freed at request-finish, not save-gated
+        self.total_leased_source_blocks = 0  # ever protected by a save lease
+        self.total_source_safe_released_blocks = 0  # freed once their save reported
+        self.total_abnormal_lease_reclaims = 0  # freed by stall timeout, no report
 
     def process_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
         """Apply offload-specific completions and expose plain request IDs."""
@@ -347,14 +362,19 @@ class OffloadSchedulerMixin(ABC):
         terminal_saves = set()
         callback = getattr(self, "connector_completion", None)
         for completion in output.connector_completions:
-            if callback is None or callback(completion) is False:
+            handled = callback(completion) if callback is not None else False
+            if handled is False:
                 logger.warning(
                     "Ignoring unhandled offload completion channel %s",
                     completion.channel,
                 )
                 continue
-            value = completion.operation_id
-            terminal_saves.add(value.req_id if hasattr(value, "req_id") else value)
+            # ``True`` means this connector-owned event is also a terminal save
+            # for scheduler deferred-free purposes. ``None`` is a handled
+            # non-terminal milestone such as PAGE source-safety.
+            if handled is True:
+                value = completion.operation_id
+                terminal_saves.add(value.req_id if hasattr(value, "req_id") else value)
         for value in output.finished_saving:
             self.save_finished(value)
             terminal_saves.add(value.req_id if hasattr(value, "req_id") else value)
@@ -393,6 +413,16 @@ class OffloadSchedulerMixin(ABC):
         self.total_save_requests += 1
         self.total_saved_tokens += tokens
 
+    def record_early_release(self, n: int) -> None:
+        """Count blocks `deallocate_partial` freed immediately at request-finish.
+
+        Called by the scheduler right after it frees the non-protected part of
+        a finished request's `block_table` under early block release, so
+        `get_statistics()`'s `early_released_blocks` reflects blocks a save
+        never needed to hold, not just the ones a lease later returns.
+        """
+        self.total_early_released_blocks += max(0, int(n))
+
     def _cancel_save_statistics(self, operation) -> None:
         """Forget a save retired without a terminal (scheduler abandon).
 
@@ -407,7 +437,7 @@ class OffloadSchedulerMixin(ABC):
     def get_statistics(self) -> dict[str, int]:
         """Return cumulative counters and exact-operation queue depths."""
 
-        return {
+        statistics = {
             "load_requests": self.total_load_requests,
             "loaded_tokens": self.total_loaded_tokens,
             "load_failures": self.total_load_failures,
@@ -416,6 +446,20 @@ class OffloadSchedulerMixin(ABC):
             "loads_pending": len(self._load_inflight_tokens),
             "saves_pending": len(self._save_inflight_tokens),
         }
+        if hasattr(self, "total_early_released_blocks"):
+            statistics.update(
+                early_released_blocks=self.total_early_released_blocks,
+                leased_source_blocks=self.total_leased_source_blocks,
+                source_safe_released_blocks=self.total_source_safe_released_blocks,
+                blocks_waiting_for_store=self.blocks_waiting_for_store(),
+                abnormal_lease_reclaims=self.total_abnormal_lease_reclaims,
+            )
+        return statistics
+
+    def blocks_waiting_for_store(self) -> int:
+        """PAGE blocks source-safe but not yet store-terminal, if supported."""
+
+        return 0
 
     def save_abandon_timeout_s(self) -> float:
         """Seconds a deferred save may sit before the engine reclaims it.
@@ -597,7 +641,13 @@ class OffloadSchedulerMixin(ABC):
 
     def _save_frontier(self, seq) -> int:
         computed = min(
-            int(getattr(seq, "num_cached_tokens", 0)),
+            int(
+                getattr(
+                    seq,
+                    "_offload_finished_cached_tokens",
+                    getattr(seq, "num_cached_tokens", 0),
+                )
+            ),
             int(getattr(seq, "num_prompt_tokens", 0)),
         )
         return self._chunk_floor(computed)

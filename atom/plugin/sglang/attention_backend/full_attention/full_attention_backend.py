@@ -239,6 +239,17 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 forward_batch.seq_lens_cpu,
                 forward_batch.out_cache_loc,
             )
+            if (
+                forward_batch.forward_mode.is_decode_or_idle()
+                and (num_padding := int(getattr(forward_batch, "num_padding", 0))) > 0
+            ):
+                # Decode CUDA graphs pad batches to a captured bucket. SGLang
+                # fills those rows with seq_len=1 and req_pool_index=0, but ATOM
+                # uses kv_lens to derive the KV write slot inside the graph.
+                # Mark padded rows as empty so their slot_mapping becomes -1
+                # instead of overwriting request-pool row 0.
+                real_bs = forward_batch.batch_size - num_padding
+                self.forward_metadata.kv_lens[real_bs:].zero_()
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         """ATOM's full-attention metadata is prepared outside the captured graph."""
@@ -1885,7 +1896,10 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
-        use_native_dense_mha = self._should_use_native_dense_mha(layer)
+        use_native_dense_mha = (
+            envs.ATOM_AITER_FP8_PREFILL_ATTN
+            and self._should_use_native_dense_mha(layer)
+        )
 
         if k is not None:
             assert v is not None

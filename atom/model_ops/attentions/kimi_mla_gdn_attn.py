@@ -95,10 +95,11 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         own reasons, so the two agree meanwhile.
 
         Dtype-safe by construction, which a checkpoint cut from `h` would not
-        be here — `_state_dtypes` gives kimi_linear an fp32 v side. An image is
-        copied slot to slot with no kernel output in between, so that fp32 side
-        round-trips exactly. Both dtypes are named in the layout id, so a build
-        that changed either cannot read another's images.
+        be here — `_state_dtypes` gives kimi_linear a v side of its own dtype
+        (`ATOM_GDN_SSM_DTYPE`). An image is copied slot to slot with no kernel
+        output in between, so it round-trips exactly whatever that dtype is.
+        Both dtypes are named in the layout id, so a build that changed either
+        cannot read another's images.
         """
         if not self._uses_paged_checkpoints():
             return StateTransfer.fork(1)
@@ -429,7 +430,8 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
 
 
 class KimiAiterMLAGDNMetadataBuilder(_KimiMLAGDNCommon, AiterMLAMetadataBuilder):
-    pass
+    def _supports_dcp_index_staging(self) -> bool:
+        return False
 
 
 class KimiTritonMLAGDNMetadataBuilder(_KimiMLAGDNCommon, TritonMLAMetadataBuilder):

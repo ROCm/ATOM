@@ -149,6 +149,8 @@ def test_producer_advertises_remote_pp_size():
     sched.pp_size = 4
     sched.tp_size = 1
     sched.hash_block_size = 64
+    sched.block_size = 64
+    sched.dcp_size = 1
     sched.dp_rank = 0
     sched.engine_id = "eng"
     sched.host_ip = "10.0.0.1"
@@ -167,13 +169,17 @@ def test_producer_advertises_remote_pp_size():
     mc.MooncakeConnectorScheduler.request_finished(sched, seq)
     assert seq.kv_transfer_params_output["remote_pp_size"] == 4
     assert seq.kv_transfer_params_output["hash_block_size"] == 64
+    assert seq.kv_transfer_params_output["block_size"] == 64
+    assert seq.kv_transfer_params_output["dcp_size"] == 1
     assert seq.kv_transfer_params_output["remote_block_ids"] == [1, 2, 3]
 
 
-def _mooncake_consumer_scheduler(mc, hash_block_size=64):
+def _mooncake_consumer_scheduler(mc, block_size=64, dcp_size=1):
     sched = object.__new__(mc.MooncakeConnectorScheduler)
     sched.is_producer = False
-    sched.hash_block_size = hash_block_size
+    sched.block_size = block_size
+    sched.dcp_size = dcp_size
+    sched.hash_block_size = block_size * dcp_size
     sched.request_id_to_transfer_id = {}
     sched.transfer_id_to_request_id = {}
     sched._reqs_need_recv = {}
@@ -195,7 +201,7 @@ def _remote_prefill_seq(remote_hash_block_size):
     )
 
 
-def test_matching_hash_block_size_enables_incremental_transfer():
+def test_matching_block_size_enables_incremental_transfer():
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
@@ -205,10 +211,57 @@ def test_matching_hash_block_size_enables_incremental_transfer():
     sched.update_state_after_alloc(seq)
 
     assert seq.kv_transfer_params["num_computed_blocks"] == 2
+    assert seq.kv_transfer_params["src_block_skip_factor"] == 1
+
+
+def test_dcp_consumer_stays_incremental_against_a_non_dcp_producer():
+    # CPP prefill (dcp=1, 16-token blocks) -> DCP decode (dcp=4). The consumer
+    # addresses 64-token virtual blocks, so the two sides' hash_block_size
+    # differ by exactly dcp_size; the block slicing applies that factor itself.
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    sched = _mooncake_consumer_scheduler(mc, block_size=16, dcp_size=4)
+    seq = _remote_prefill_seq(remote_hash_block_size=16)
+
+    sched.update_state_after_alloc(seq)
+
+    assert seq.kv_transfer_params["num_computed_blocks"] == 2
+    assert seq.kv_transfer_params["src_block_skip_factor"] == 4
+
+
+def test_symmetric_dcp_keeps_incremental_transfer():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    sched = _mooncake_consumer_scheduler(mc, block_size=16, dcp_size=4)
+    seq = _remote_prefill_seq(remote_hash_block_size=64)
+    seq.kv_transfer_params["block_size"] = 16
+    seq.kv_transfer_params["dcp_size"] = 4
+
+    sched.update_state_after_alloc(seq)
+
+    assert seq.kv_transfer_params["num_computed_blocks"] == 2
+    assert seq.kv_transfer_params["src_block_skip_factor"] == 1
+
+
+def test_mismatched_producer_block_size_disables_incremental_transfer():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    sched = _mooncake_consumer_scheduler(mc, block_size=16, dcp_size=4)
+    seq = _remote_prefill_seq(remote_hash_block_size=16)
+    seq.kv_transfer_params["block_size"] = 8
+    seq.kv_transfer_params["dcp_size"] = 2
+
+    sched.update_state_after_alloc(seq)
+
+    assert seq.kv_transfer_params["num_computed_blocks"] == 0
+    assert seq.kv_transfer_params["src_block_skip_factor"] == 1
 
 
 @pytest.mark.parametrize("remote_hash_block_size", [32, None])
-def test_mismatched_or_missing_hash_block_size_forces_full_transfer(
+def test_mismatched_or_missing_block_size_forces_full_transfer(
     remote_hash_block_size, caplog
 ):
     mc = pytest.importorskip(
@@ -221,6 +274,7 @@ def test_mismatched_or_missing_hash_block_size_forces_full_transfer(
         sched.update_state_after_alloc(seq)
 
     assert seq.kv_transfer_params["num_computed_blocks"] == 0
+    assert seq.kv_transfer_params["src_block_skip_factor"] == 1
     assert "falling back to full transfer" in caplog.text
 
 
@@ -665,3 +719,177 @@ def test_pp_downstream_skips_forward_for_request_less_batch():
     ]
     assert forwards == []
     stage.pp_transport.send_tokens.assert_not_called()
+
+
+def test_dcp_block_descriptors_are_streamed_in_bounded_batches():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    from atom.kv_transfer.disaggregation.types import MLA_KV_ROLE
+
+    connector = object.__new__(mc.MooncakeConnector)
+    connector.dcp_size = 1
+    connector.block_size = 64
+    connector.kv_caches_base_addr = [1_000_000, 2_000_000]
+    bytes_per_block = connector.block_size * 576
+    connector._per_block_bytes_list = [bytes_per_block, bytes_per_block]
+    connector._block_region_roles = [MLA_KV_ROLE, MLA_KV_ROLE]
+    connector._block_region_consumer_indices = None
+    connector._consumer_region_map = lambda *_args, **_kwargs: [0, 1]
+
+    batch_sizes = []
+    transferred_bytes = 0
+
+    def record_batch(_target, src_addrs, dst_addrs, sizes, _req_id, _label):
+        nonlocal transferred_bytes
+        assert len(src_addrs) == len(dst_addrs) == len(sizes)
+        assert len(src_addrs) <= connector._MAX_RDMA_ENTRIES_PER_BATCH
+        batch_sizes.append(len(src_addrs))
+        transferred_bytes += sum(sizes)
+        return True
+
+    connector._rdma_write_with_retry = record_batch
+    dst_block_ids = list(range(100, 140))
+    src_block_ids = list(range(len(dst_block_ids) * 8))
+    request_data = {
+        "consumer_base_addrs": [3_000_000, 4_000_000],
+        "consumer_num_layers": 2,
+        "consumer_region_roles": [MLA_KV_ROLE, MLA_KV_ROLE],
+        "consumer_block_bpb": [bytes_per_block, bytes_per_block],
+        "consumer_dcp_size": 8,
+        "consumer_dcp_rank": 0,
+        "consumer_dcp_interleave": 1,
+    }
+
+    assert mc.MooncakeConnector._execute_block_transfer(
+        connector,
+        request_data,
+        "consumer:1234",
+        src_block_ids,
+        dst_block_ids,
+        "req-1",
+    )
+    descriptors_per_region = len(dst_block_ids) * connector.block_size
+    assert batch_sizes == [4096, 1024]
+    assert sum(batch_sizes) == 2 * descriptors_per_region
+    assert transferred_bytes == 2 * descriptors_per_region * 576
+
+
+def test_dcp_index_staging_waits_for_request_ready_event():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    from atom.kv_transfer.disaggregation.types import INDEX_CACHE_ROLE, MLA_KV_ROLE
+
+    connector = object.__new__(mc.MooncakeConnector)
+    connector.dcp_size = 1
+    connector.block_size = 16
+    connector.kv_caches_base_addr = [1_000_000, 2_000_000]
+    mla_block_bytes = connector.block_size * 576
+    index_block_bytes = connector.block_size * 144
+    connector._per_block_bytes_list = [mla_block_bytes, index_block_bytes]
+    connector._block_region_roles = [MLA_KV_ROLE, INDEX_CACHE_ROLE]
+    connector._block_region_consumer_indices = None
+    connector._consumer_region_map = lambda *_args, **_kwargs: [0, 1]
+    connector._index_staging_chunk_pages = 256
+    gather_indices = object()
+    connector._prepare_sharded_index = MagicMock(return_value=gather_indices)
+    connector._gather_sharded_index = MagicMock()
+    connector._index_staging_stream = MagicMock()
+    connector._execute_staged_index_layer_chunk = MagicMock(return_value=True)
+    connector._rdma_write_with_retry = MagicMock(return_value=True)
+    ready_event = object()
+    request_data = {
+        "consumer_base_addrs": [3_000_000, 4_000_000],
+        "consumer_num_layers": 2,
+        "consumer_region_roles": [MLA_KV_ROLE, INDEX_CACHE_ROLE],
+        "consumer_block_bpb": [mla_block_bytes, index_block_bytes],
+        "consumer_dcp_size": 2,
+        "consumer_dcp_rank": 0,
+        "consumer_dcp_interleave": 1,
+    }
+
+    assert mc.MooncakeConnector._execute_block_transfer(
+        connector,
+        request_data,
+        "consumer:1234",
+        [0, 1],
+        [10],
+        "req-1",
+        ready_event,
+    )
+    connector._index_staging_stream.wait_event.assert_called_once_with(ready_event)
+    connector._execute_staged_index_layer_chunk.assert_called_once_with(
+        "consumer:1234",
+        1,
+        4_000_000,
+        index_block_bytes,
+        [10],
+        "req-1",
+        gather_indices,
+    )
+
+
+def test_dcp_index_staging_rejects_missing_request_ready_event():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    from atom.kv_transfer.disaggregation.types import INDEX_CACHE_ROLE, MLA_KV_ROLE
+
+    connector = object.__new__(mc.MooncakeConnector)
+    connector.dcp_size = 1
+    connector.block_size = 16
+    connector.kv_caches_base_addr = [1_000_000, 2_000_000]
+    connector._per_block_bytes_list = [16 * 576, 16 * 144]
+    connector._block_region_roles = [MLA_KV_ROLE, INDEX_CACHE_ROLE]
+    connector._block_region_consumer_indices = None
+    connector._consumer_region_map = lambda *_args, **_kwargs: [0, 1]
+    connector._index_staging_chunk_pages = 256
+    connector._prepare_sharded_index = MagicMock(return_value=object())
+    connector._gather_sharded_index = MagicMock()
+    connector._index_staging_stream = MagicMock()
+    connector._rdma_write_with_retry = MagicMock(return_value=True)
+    request_data = {
+        "consumer_base_addrs": [3_000_000, 4_000_000],
+        "consumer_num_layers": 2,
+        "consumer_region_roles": [MLA_KV_ROLE, INDEX_CACHE_ROLE],
+        "consumer_block_bpb": [16 * 576, 16 * 144],
+        "consumer_dcp_size": 2,
+        "consumer_dcp_rank": 0,
+        "consumer_dcp_interleave": 1,
+    }
+
+    with pytest.raises(RuntimeError, match="ready event"):
+        mc.MooncakeConnector._execute_block_transfer(
+            connector,
+            request_data,
+            "consumer:1234",
+            [0, 1],
+            [10],
+            "req-1",
+        )
+
+
+def test_mooncake_records_one_ready_event_for_a_prefill_batch(monkeypatch):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    connector = object.__new__(mc.MooncakeConnector)
+    connector.is_producer = True
+    connector._index_staging_stream = object()
+    connector._cuda_device = 3
+    connector._kv_cache_ready_events = {}
+    connector._completed_prefills_lock = threading.Lock()
+    ready_event = MagicMock()
+    producer_stream = object()
+    monkeypatch.setattr(mc.torch.cuda, "Event", MagicMock(return_value=ready_event))
+    monkeypatch.setattr(
+        mc.torch.cuda,
+        "current_stream",
+        MagicMock(return_value=producer_stream),
+    )
+
+    connector.record_kv_cache_ready([11, 12])
+
+    ready_event.record.assert_called_once_with(producer_stream)
+    assert connector._kv_cache_ready_events == {11: ready_event, 12: ready_event}

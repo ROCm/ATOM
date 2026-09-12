@@ -498,6 +498,12 @@ class Context:
     # stood for "dp-attention is off", and readers needing the strong claim --
     # `_can_use_dp_sharded_head` above all -- silently got the weak one.
     running_tokens_are_unified: bool = True
+    # `running_tokens` for every rank, unreduced; this rank's entry IS
+    # `running_tokens`. Consumers reduce it, because they want different
+    # reductions: padding each rank up to the group is a MAX, an all2all's
+    # receive width holds what every rank sent and is a SUM. None where no DP
+    # reduction produced one, which is where the two coincide.
+    running_tokens_across_dp: tuple[int, ...] | None = None
     # The step's whole shape decision. Set by `prepare_model` via
     # `ForwardMode.decide`; None only on a capture context, which declares its
     # shape rather than reading one.
@@ -529,6 +535,7 @@ class Context:
         running_tokens: int = 0,
         is_draft: bool = False,
         running_tokens_are_unified: bool = True,
+        running_tokens_across_dp: tuple[int, ...] | None = None,
         forward_mode: ForwardMode | None = None,
         input_ids: torch.Tensor | None = None,
         ubatch_token_offset: int = 0,
@@ -543,6 +550,7 @@ class Context:
         self.running_tokens = running_tokens
         self.is_draft = is_draft
         self.running_tokens_are_unified = running_tokens_are_unified
+        self.running_tokens_across_dp = running_tokens_across_dp
         self.forward_mode = forward_mode
         self.input_ids = input_ids
         self.ubatch_token_offset = ubatch_token_offset
@@ -770,6 +778,10 @@ class ForwardContext:
     # per-ubatch all_reduce. Shape: tuple of length N == len(ubatch_slices).
     # None when DP is off or when TBO is not active this step.
     ub_max_tokens_across_dp: tuple | None = None
+    # The same counts UNREDUCED: per ubatch, every rank's. The MAX above is one
+    # reduction of it and an all2all's receive width wants the SUM, so consumers
+    # take their own. Same None conditions as the MAX.
+    ub_tokens_across_dp: tuple | None = None
 
     # Cached current_stream() captured at set_forward_context() time, so
     # downstream code (V4 attention / MoE / metadata builder) doesn't have
@@ -894,6 +906,7 @@ def set_forward_context(
     ubatch_slices: list[Any] | None = None,
     in_hipgraph: bool = False,
     ub_max_tokens_across_dp: tuple | None = None,
+    ub_tokens_across_dp: tuple | None = None,
 ) -> None:
     global _forward_context
     dp_metadata: DPMetadata | None = None
@@ -905,6 +918,14 @@ def set_forward_context(
             num_tokens_across_dp,
         )
 
+    # Mirrored here rather than at each caller: the two going out of step is how
+    # an all2all comes to bound its receive buffer by one rank's count. Assigned
+    # unconditionally, because the capture loop reuses one Context across
+    # buckets and a set-only write would leave the last table behind.
+    context.running_tokens_across_dp = (
+        None if num_tokens_across_dp is None else tuple(num_tokens_across_dp.tolist())
+    )
+
     _forward_context = ForwardContext(
         attn_metadata=attn_metadata,
         no_compile_layers=atom_config.compilation_config.static_forward_context,
@@ -914,6 +935,7 @@ def set_forward_context(
         spec_decode_metadata=spec_decode_metadata,
         ubatch_slices=ubatch_slices,
         ub_max_tokens_across_dp=ub_max_tokens_across_dp,
+        ub_tokens_across_dp=ub_tokens_across_dp,
         main_stream=(torch.cuda.current_stream() if _CUDA_AVAILABLE else None),
         in_hipgraph=in_hipgraph,
     )  # _forward_context.attn_metadata = attn_metadata

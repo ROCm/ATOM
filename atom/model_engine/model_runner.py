@@ -2333,6 +2333,7 @@ class ModelRunner:
         num_tokens_across_dp = None if sync is None else sync.num_tokens_across_dp
         tbo_collective_active = forward_mode.tbo_collective_active
         ub_max_tokens_across_dp = None if sync is None else sync.ub_max_tokens_across_dp
+        ub_tokens_across_dp = None if sync is None else sync.ub_tokens_across_dp
         running_tokens_are_unified = forward_mode.running_tokens_are_unified
 
         if not tbo_collective_active:
@@ -2402,6 +2403,7 @@ class ModelRunner:
             spec_decode_metadata=spec_decode_metadata,
             ubatch_slices=ubatch_slices,
             ub_max_tokens_across_dp=ub_max_tokens_across_dp,
+            ub_tokens_across_dp=ub_tokens_across_dp,
         )
 
     def prepare_sample(
@@ -3137,6 +3139,27 @@ class ModelRunner:
             dspark_ell=dspark_ell,
         )
 
+    def _record_kv_cache_ready(self, batch: ScheduledBatch) -> None:
+        """Publish a GPU event for final prefill chunks to transfer connectors."""
+        if batch.total_seqs_num_prefill <= 0:
+            return
+        if batch.is_final_chunk is None:
+            req_ids = batch.req_ids
+        else:
+            req_ids = [
+                req_id
+                for req_id, is_final in zip(
+                    batch.req_ids, batch.is_final_chunk, strict=True
+                )
+                if is_final
+            ]
+        if not req_ids:
+            return
+        connector = get_kvconnector()
+        callback = getattr(connector, "record_kv_cache_ready", None)
+        if callable(callback):
+            callback(req_ids)
+
     @torch.inference_mode()
     @with_eplb_forward_monitor
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
@@ -3207,6 +3230,7 @@ class ModelRunner:
             reset_forward_context()
             # Mark this slot's GPU work (attention consumed its metadata) done.
             self._record_forward_vars_event()
+            self._record_kv_cache_ready(batch)
             return ScheduledBatchOutput(
                 req_ids=list(batch.req_ids),
                 token_ids=[],
@@ -3228,6 +3252,7 @@ class ModelRunner:
 
         reset_forward_context()
         self._record_forward_vars_event()
+        self._record_kv_cache_ready(batch)
         return fwd_output
 
     @staticmethod
@@ -3814,11 +3839,24 @@ class ModelRunner:
                         )
                     # Create ubatch slices for TBO capture (need > 2 requests)
                     ubatch_slices = None
+                    ub_tokens_across_dp = None
                     if is_tbo and self.config.enable_tbo_decode and bs > 2:
                         ubatch_slices = maybe_create_ubatch_slices(
                             num_reqs=bs,
                             num_tokens=num_tokens,
                         )
+                        # The rebuild above's symmetry, one level down: every
+                        # rank splits this bucket the same way, so a ubatch's
+                        # per-rank counts are its own repeated. Stated, because
+                        # a capture context declares its shape where a real step
+                        # reduces one, and no consumer can tell an absent
+                        # reduction from a uniform answer.
+                        if ubatch_slices and num_tokens_across_dp is not None:
+                            dp = len(num_tokens_across_dp)
+                            ub_tokens_across_dp = tuple(
+                                (s.token_slice.stop - s.token_slice.start,) * dp
+                                for s in ubatch_slices
+                            )
 
                     set_forward_context(
                         attn_metadata=attn_metadata,
@@ -3827,6 +3865,7 @@ class ModelRunner:
                         num_tokens=num_tokens,
                         num_tokens_across_dp=num_tokens_across_dp,
                         ubatch_slices=ubatch_slices,
+                        ub_tokens_across_dp=ub_tokens_across_dp,
                         in_hipgraph=True,
                     )
 
@@ -4542,5 +4581,6 @@ class RapidServeModelRunner(ModelRunner):
             sampled_cpu = sampled.view(-1).tolist()
         # Synchronize so decode's default stream sees all KV writes.
         stream.synchronize()
+        self._record_kv_cache_ready(batch)
         reset_forward_context()
         return sampled_cpu

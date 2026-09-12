@@ -108,6 +108,33 @@ def _prepare_qwen35_config(atom_config: Any, model_arch: str) -> None:
     apply_prepare_model_adaptations(atom_config, model_arch)
 
 
+def _qwen35_construction_context():
+    from atom.plugin.sglang.models.qwen3_5_attention import (
+        qwen35_native_attention_construction,
+    )
+
+    return qwen35_native_attention_construction()
+
+
+def _build_qwen35_forward_metadata(
+    atom_config: Any, forward_batch: Any, positions: Any
+):
+    del atom_config
+    from atom.plugin.sglang.models.qwen3_5_attention import (
+        build_qwen35_forward_metadata,
+    )
+
+    return build_qwen35_forward_metadata(forward_batch, positions)
+
+
+def _bind_qwen35_cache_views(model: Any, runtime: Any) -> None:
+    from atom.plugin.sglang.models.qwen3_5_attention import (
+        install_qwen35_cache_views,
+    )
+
+    install_qwen35_cache_views(runtime.forward_batch, cache_owner=model)
+
+
 def _prepare_minimax_m2_config(atom_config: Any, model_arch: str) -> None:
     quant_config = getattr(atom_config, "quant_config", None)
     if quant_config is None:
@@ -453,6 +480,20 @@ MODEL_ADAPTER_SPECS = {
     "Qwen3NextForCausalLM": SGLangModelAdapterSpec(
         wrapper_binds_gdn_context=True,
     ),
+    "Qwen3_5ForCausalLM": SGLangModelAdapterSpec(
+        prepare_config=_prepare_qwen35_config,
+        uses_context_only_forward=True,
+        construction_context=_qwen35_construction_context,
+        bind_cache_views=_bind_qwen35_cache_views,
+        build_forward_metadata=_build_qwen35_forward_metadata,
+    ),
+    "Qwen3_5MoeForCausalLM": SGLangModelAdapterSpec(
+        prepare_config=_prepare_qwen35_config,
+        uses_context_only_forward=True,
+        construction_context=_qwen35_construction_context,
+        bind_cache_views=_bind_qwen35_cache_views,
+        build_forward_metadata=_build_qwen35_forward_metadata,
+    ),
     "Qwen3_5ForConditionalGeneration": SGLangModelAdapterSpec(
         prepare_config=_prepare_qwen35_config,
     ),
@@ -506,6 +547,8 @@ MODEL_ARCH_SPECS = {
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
         "Qwen3NextForCausalLM",
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5MoeForCausalLM",
         "MiniMaxM2ForCausalLM",
         "MiniMaxM3SparseForCausalLM",
         "MiniMaxM3SparseForConditionalGeneration",
