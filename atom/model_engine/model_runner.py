@@ -116,6 +116,9 @@ support_model_arch_dict = {
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2.GlmMoeDsaForCausalLM",
     "Glm4MoeForCausalLM": "atom.models.glm4_moe.Glm4MoeForCausalLM",
     "Qwen3NextForCausalLM": "atom.models.qwen3_next.Qwen3NextForCausalLM",
+    "Qwen4ExpForConditionalGeneration": (
+        "atom.models.qwen3_8_flash_next.Qwen3_8FlashNextForConditionalGeneration"
+    ),
     "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MultimodalModel",
     "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeMultimodalModel",
     "Qwen3_5MoeForCausalLM": "atom.models.qwen3_5.Qwen3_5MoeForCausalLM",

@@ -27,6 +27,9 @@ _MULTIMODAL_ARCH_TO_MODEL: dict[str, str] = {
     "Qwen3_5MoeForConditionalGeneration": (
         "atom.models.qwen3_5.Qwen3_5MoeMultimodalModel"
     ),
+    "Qwen4ExpForConditionalGeneration": (
+        "atom.models.qwen3_8_flash_next.Qwen3_8FlashNextForConditionalGeneration"
+    ),
 }
 
 _MULTIMODAL_ARCH_TO_INPUT_BUILDER: dict[str, str] = {

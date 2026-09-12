@@ -466,7 +466,7 @@ class RMSNormGated(nn.Module):
     This is a native PyTorch implementation that supports:
     - Standard RMS normalization
     - Group RMS normalization
-    - Optional gating with SiLU activation
+    - Optional gating with a SiLU or sigmoid activation
     - Fused FP8 group quantization (when quant_config is provided)
     """
 
@@ -479,6 +479,7 @@ class RMSNormGated(nn.Module):
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
         quant_config=None,
+        activation: str = "silu",
     ):
         """Initialize RMSNormGated.
 
@@ -489,12 +490,18 @@ class RMSNormGated(nn.Module):
                         having group_size elements.
                         group_size=None is equivalent to group_size=hidden_size
                         (i.e. there's only 1 group).
-            norm_before_gate: If True and z is provided: out = norm(x) * silu(z)
-                              If False and z is provided: out = norm(x * silu(z))
+            norm_before_gate: If True and z is provided: out = norm(x) * act(z)
+                              If False and z is provided: out = norm(x * act(z))
             dtype: Data type for parameters
             quant_config: Quantization config (enables FP8 fusion if configured)
+            activation: Gate activation, "silu" (default) or "sigmoid". Models
+                        declare it as `output_gate_type`; Qwen3.8-Flash-Next uses
+                        sigmoid where Qwen3-Next uses SiLU.
         """
         super().__init__()
+        if activation not in ("silu", "sigmoid"):
+            raise ValueError(f"unsupported gate activation {activation!r}")
+        self.activation = activation
         self.eps = eps
         self.weight = atom_parameter(torch.empty(hidden_size))
         self.register_parameter("bias", None)
@@ -549,12 +556,13 @@ class RMSNormGated(nn.Module):
             - None: No scale
 
         If z is not None:
-            - norm_before_gate=True: out = norm(x) * silu(z)
-            - norm_before_gate=False: out = norm(x * silu(z))
+            - norm_before_gate=True: out = norm(x) * act(z)
+            - norm_before_gate=False: out = norm(x * act(z))
         """
+        gate = silu if self.activation == "silu" else torch.sigmoid
         # Apply gating before normalization if needed
         if z is not None and not self.norm_before_gate:
-            x = x * silu(z)
+            x = x * gate(z)
 
         # RMS Normalization
         if self.group_size is None:
@@ -573,7 +581,7 @@ class RMSNormGated(nn.Module):
 
         # Apply gating after normalization if needed
         if z is not None and self.norm_before_gate:
-            out = out * silu(z)
+            out = out * gate(z)
 
         # Flatten to match fused kernel output: [num_tokens, num_heads, head_dim] -> [num_tokens, num_heads*head_dim]
         if len(out.shape) == 3:
@@ -606,6 +614,8 @@ class RMSNormGated(nn.Module):
             self.group_size is not None
             or not self.norm_before_gate
             or head_dim != self.group_size_quant
+            # The fused kernel's gate is SiLU only.
+            or self.activation != "silu"
         ):
             # Grouped norm not supported by kernel, fallback
             return self.forward_native(x, z)

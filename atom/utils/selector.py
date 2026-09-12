@@ -24,8 +24,12 @@ class Family(StrEnum):
     satisfies two: DeepSeek-V4 also carries a latent rank, and so do both
     hybrids. An enum and not a string, so a name that does not exist raises
     instead of falling through to MHA.
+
+    Qwen3.8-Flash-Next is a GDN hybrid whose *full-attention* layers are QSA,
+    so it must win over Family.GDN.
     """
 
+    QWEN3_8_FLASH_NEXT = "qwen3_8_flash_next"
     V4 = "v4"
     KIMI_MLA = "kimi_mla"
     MLA = "mla"
@@ -45,6 +49,7 @@ class Family(StrEnum):
 # What makes a hybrid one is which of its layers are linear, and no field says
 # that -- so these two are named, and everything else is read off the shape.
 _KIMI_MLA_TYPES = ("kimi_linear", "glm5_next_text")
+_FLASH_NEXT_TYPES = ("qwen4_exp_text", "qwen4_exp")
 _GDN_TYPES = ("qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text")
 _V4_TYPES = ("deepseek_v4", "deepseek_v4_mtp")
 
@@ -73,6 +78,8 @@ def attn_family(hf_text_config) -> Family:
         return Family.KIMI_MLA
     if getattr(hf_text_config, "kv_lora_rank", None) is not None:
         return Family.MLA
+    if model_type in _FLASH_NEXT_TYPES:
+        return Family.QWEN3_8_FLASH_NEXT
     if model_type in _GDN_TYPES:
         return Family.GDN
     return Family.MHA
@@ -111,6 +118,8 @@ def _cached_get_attn_backend(
 
 
 def get_attn_backend_cls(family: Family, use_sglang: bool, use_vllm: bool) -> str:
+    if family is Family.QWEN3_8_FLASH_NEXT:
+        return "atom.model_ops.attentions.qwen3_8_flash_next_attn.Qwen3_8FlashNextBackend"
     if family is Family.V4:
         return "atom.model_ops.attentions.deepseek_v4_attn.DeepseekV4Backend"
     if family is Family.KIMI_MLA:

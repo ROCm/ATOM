@@ -274,6 +274,12 @@ class ScheduledBatch:
             dtype=np.int32,
         )
 
+        # Qwen3.8-Flash-Next's PLE hashes n-grams that reach back across a chunk
+        # boundary, so it needs the tokens immediately BEFORE each scheduled
+        # chunk -- which `scheduled_tokens` by definition does not carry. A
+        # list of references, so this costs nothing for models that ignore it.
+        self.seq_token_ids = [seq.token_ids for seq in seqs.values()]
+
         # Each sequence's window, staged into one array rather than assigned
         # per sequence: a numpy slice-assign costs ~245ns of dispatch whatever
         # its length, and at decode a window is a single token. `extend`

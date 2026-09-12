@@ -268,6 +268,7 @@ lm_eval --model local-completions \
 - [DeepSeek-R1](recipes/DeepSeek-R1.md) — FP8/MXFP4 with MTP speculative decoding on 8 GPUs
 - [Qwen3-235B-A22B](recipes/Qwen3-235b.md) — TP8 + EP with FP8 KV cache
 - [Qwen3-Next](recipes/Qwen3-Next.md) — Hybrid GDN + MoE architecture
+- [Qwen3.8-Flash-Next](recipes/Qwen3.8-Flash-Next.md) — Hybrid GDN + sparse attention (QSA) + n-gram memory, multimodal, TP2+EP or 1 GPU
 - [Kimi-K2-Thinking](recipes/Kimi-K2-Thinking.md) — MXFP4 MoE on 4 GPUs
 - [GLM-5](recipes/GLM-5.md) — FP8 MoE with MLA on 8 GPUs
 - [GPT-OSS-120B](recipes/GPT-OSS.md) — Single GPU or DP+EP on 2 GPUs

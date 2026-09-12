@@ -663,13 +663,14 @@ _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     "qwen3_5_moe": "text_config",
     "mistral3": "text_config",
     "glm5_next": "text_config",  # GLM-5.3-Flash: text-only hybrid KDA/DSA runtime
+    "qwen4_exp": "text_config",  # Qwen3.8-Flash-Next / Qwen4Exp
 }
 
 # Text sub-config model_types that this image's transformers has no class for.
 # Loaded as a bare PretrainedConfig; the ATOM model normalizes the aliases it
 # needs at construction time.
 _PLAIN_TEXT_CONFIG_MODEL_TYPES: frozenset[str] = frozenset(
-    {"kimi_linear", "glm5_next_text"}
+    {"kimi_linear", "glm5_next_text", "qwen4_exp_text"}
 )
 
 # multimodal models fully supported by plugin mode
