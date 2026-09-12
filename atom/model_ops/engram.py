@@ -626,18 +626,28 @@ class EngramHost:
         self,
         seq_ids: list[int],
         token_ids: np.ndarray | None = None,
+        padded_rows: int | None = None,
     ) -> int:
         """Fill the staging buffers for `seq_ids`; returns the row count staged.
 
         `token_ids` is only consulted for sequences the prefetch missed -- the
         caller passes the cheap host-side source (the scheduler's committed
         anchor), correct for the just-admitted rows that are the only misses.
+
+        `padded_rows`, when the forward runs a padded rectangle taller than the
+        scheduled rows (a CUDAGraph decode bucket), is that running height. The
+        tail past `len(seq_ids)` is zeroed and staged too, so the engram layers
+        read a matching height (and a defined zero contribution) rather than
+        raising on shape or consuming a stale tail.
         """
         num_rows = len(seq_ids)
         if num_rows > self.max_num_tokens:
             raise ValueError(
                 f"{num_rows} rows exceeds staging capacity {self.max_num_tokens}"
             )
+        staged_rows = (
+            num_rows if padded_rows is None else min(padded_rows, self.max_num_tokens)
+        )
         self.prefetcher.wait(timeout=None)
 
         # Probe without consuming: a hit still has to be readable by the fill
@@ -674,6 +684,10 @@ class EngramHost:
                         f"no engram embedding for seq {seq_id} layer {layer_id}"
                     )
                 cpu[row].copy_(value.reshape(-1)[: self.embed_width])
+            # Zero the padded tail so the graph/eager forward reads a fresh zero
+            # contribution there rather than the previous step's rows.
+            if staged_rows > num_rows:
+                cpu[num_rows:staged_rows].zero_()
 
         if self.copy_stream is not None:
             # Capture the compute stream BEFORE entering the copy_stream context:
@@ -684,13 +698,13 @@ class EngramHost:
             with torch.cuda.stream(self.copy_stream):
                 self.copy_stream.wait_stream(compute_stream)
                 for buffer in self.buffers.values():
-                    buffer.copy_to_gpu(num_rows)
+                    buffer.copy_to_gpu(staged_rows)
                 self.copy_done.record(self.copy_stream)
         else:
             for buffer in self.buffers.values():
-                buffer.copy_to_gpu(num_rows)
-        self._staged_rows = num_rows
-        return num_rows
+                buffer.copy_to_gpu(staged_rows)
+        self._staged_rows = staged_rows
+        return staged_rows
 
     def stage_dummy(self, num_rows: int) -> int:
         """Stage zeros for a warmup or capture pass.

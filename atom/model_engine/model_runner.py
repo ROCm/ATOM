@@ -895,7 +895,18 @@ class ModelRunner:
         # row), whose anchor is already in the host `scheduled_tokens` -- so the
         # hot path needs no D2H.
         tokens = batch.scheduled_tokens[: len(seq_ids)].astype(np.int64).reshape(-1, 1)
-        self.engram.stage_embeddings(seq_ids, tokens)
+        # A CUDAGraph decode replays a fixed bucket >= the scheduled rows, so the
+        # forward is that tall; stage to the same padded height (zero tail) so the
+        # engram layers do not raise on shape or read a stale tail. Mirrors the
+        # `fill_to` padding in prepare_input_ids (pure decode -> one token/seq).
+        padded_rows = len(seq_ids)
+        if not self.enforce_eager:
+            gbs = next(
+                (g for g in reversed(self.capture_sizes) if g >= padded_rows), None
+            )
+            if gbs is not None:
+                padded_rows = max(padded_rows, int(gbs))
+        self.engram.stage_embeddings(seq_ids, tokens, padded_rows=padded_rows)
         self.engram.wait_for_embeddings()
 
     def _maybe_warmup(self):
