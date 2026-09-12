@@ -132,10 +132,7 @@ export AITER_SITUV2_A4W4=1
 export AITER_FLYDSL_STAGE2_FP8=1
 export ATOM_STATE_CHECKPOINT_DEMAND=0
 export ATOM_GDN_SSM_DTYPE="${ATOM_GDN_SSM_DTYPE:-fp16}"
-# Pinned rather than left to the default. This is 1 today
-# (atom/utils/envs.py), and the numbers below were measured with it at 1, but
-# the default may flip to 0 later -- set it explicitly so the recipe keeps
-# reproducing what was measured.
+# Set explicitly to 1 for reproducibility; this is also the current default.
 export ATOM_USE_FLYDSL_GATHER_KV_B_PROJ=1
 export PYTHONNOUSERSITE=1
 
