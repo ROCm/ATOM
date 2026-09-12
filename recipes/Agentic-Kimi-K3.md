@@ -141,119 +141,51 @@ export PYTHONNOUSERSITE=1
 
 ONLINE_QUANT_CONFIG='{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*"]}'
 
+# Defaults shared by every band. The case below overrides only what actually
+# differs per concurrency, so a value that is uniform across the sweep is
+# written once here instead of twelve times.
+DCP=8
+MAX_NUM_SEQS=32
+MAX_NUM_BATCHED_TOKENS=8192
+GPU_MEMORY_UTILIZATION=0.90
+ENABLE_LMCACHE=1
+LMCACHE_MAX_LOCAL_CPU_SIZE=128
+ATOM_ENABLE_REPLAYSSM=0
+NUM_SPECULATIVE_TOKENS=0
+SPEC_DECODE_ACCEPTANCE_LENGTH=""
+
 case "${CONC}" in
   1|2|4)
+    # Interactive: no DCP, no LMCache, the wide DSpark draft.
     DCP=1
-    MAX_NUM_SEQS=32
-    MAX_NUM_BATCHED_TOKENS=8192
-    GPU_MEMORY_UTILIZATION=0.90
     ENABLE_LMCACHE=0
-    ATOM_ENABLE_REPLAYSSM=0
     NUM_SPECULATIVE_TOKENS=7
     SPEC_DECODE_ACCEPTANCE_LENGTH=3.84
     ;;
-  8)
-    DCP=8
-    MAX_NUM_SEQS=32
-    MAX_NUM_BATCHED_TOKENS=8192
-    GPU_MEMORY_UTILIZATION=0.90
-    ENABLE_LMCACHE=1
-    LMCACHE_MAX_LOCAL_CPU_SIZE=128
+  8|12|14|16)
+    # Mid: DCP=8 + LMCache 128 GiB + the narrow DSpark draft.
     ATOM_ENABLE_REPLAYSSM=1
     NUM_SPECULATIVE_TOKENS=3
     SPEC_DECODE_ACCEPTANCE_LENGTH=3.00
+    # C12 is the one band whose in-flight window is not the default 32.
+    if [[ "${CONC}" == "12" ]]; then
+      MAX_NUM_SEQS=24
+    fi
+    # C14 runs the C16 server verbatim, including the pinned CUDA-graph width.
+    # Only the client concurrency is 14. Deriving graph_max from 2*CONC here
+    # would give 28 and the server fails during CUDA-graph warmup.
+    if [[ "${CONC}" == "14" ]]; then
+      CUDAGRAPH_MAX_NUM_SEQS=32
+    fi
     ;;
-  12)
-    DCP=8
-    MAX_NUM_SEQS=24
-    MAX_NUM_BATCHED_TOKENS=8192
-    GPU_MEMORY_UTILIZATION=0.90
-    ENABLE_LMCACHE=1
-    LMCACHE_MAX_LOCAL_CPU_SIZE=128
-    ATOM_ENABLE_REPLAYSSM=1
-    NUM_SPECULATIVE_TOKENS=3
-    SPEC_DECODE_ACCEPTANCE_LENGTH=3.00
-    ;;
-  14)
-    # Mid-tier: the C16 server recipe verbatim, including the pinned CUDA-graph
-    # width. Only the client concurrency is 14. Deriving graph_max from 2*CONC
-    # here would give 28 and the server fails during CUDA-graph warmup.
-    DCP=8
-    MAX_NUM_SEQS=32
-    MAX_NUM_BATCHED_TOKENS=8192
-    GPU_MEMORY_UTILIZATION=0.90
-    ENABLE_LMCACHE=1
-    LMCACHE_MAX_LOCAL_CPU_SIZE=128
-    ATOM_ENABLE_REPLAYSSM=1
-    NUM_SPECULATIVE_TOKENS=3
-    SPEC_DECODE_ACCEPTANCE_LENGTH=3.00
-    CUDAGRAPH_MAX_NUM_SEQS=32
-    ;;
-  16)
-    DCP=8
-    MAX_NUM_SEQS=32
-    MAX_NUM_BATCHED_TOKENS=8192
-    GPU_MEMORY_UTILIZATION=0.90
-    ENABLE_LMCACHE=1
-    LMCACHE_MAX_LOCAL_CPU_SIZE=128
-    ATOM_ENABLE_REPLAYSSM=1
-    NUM_SPECULATIVE_TOKENS=3
-    SPEC_DECODE_ACCEPTANCE_LENGTH=3.00
-    ;;
-  32)
-    DCP=8
-    MAX_NUM_SEQS=64
-    MAX_NUM_BATCHED_TOKENS=8192
-    GPU_MEMORY_UTILIZATION=0.90
-    ENABLE_LMCACHE=1
-    LMCACHE_MAX_LOCAL_CPU_SIZE=128
-    ATOM_ENABLE_REPLAYSSM=0
-    NUM_SPECULATIVE_TOKENS=0
-    SPEC_DECODE_ACCEPTANCE_LENGTH=""
-    ;;
-  40)
-    DCP=8
-    MAX_NUM_SEQS=80
-    MAX_NUM_BATCHED_TOKENS=8192
-    GPU_MEMORY_UTILIZATION=0.90
-    ENABLE_LMCACHE=1
-    LMCACHE_MAX_LOCAL_CPU_SIZE=128
-    ATOM_ENABLE_REPLAYSSM=0
-    NUM_SPECULATIVE_TOKENS=0
-    SPEC_DECODE_ACCEPTANCE_LENGTH=""
-    ;;
-  48)
-    DCP=8
-    MAX_NUM_SEQS=96
-    MAX_NUM_BATCHED_TOKENS=8192
-    GPU_MEMORY_UTILIZATION=0.90
-    ENABLE_LMCACHE=1
-    LMCACHE_MAX_LOCAL_CPU_SIZE=128
-    ATOM_ENABLE_REPLAYSSM=0
-    NUM_SPECULATIVE_TOKENS=0
-    SPEC_DECODE_ACCEPTANCE_LENGTH=""
-    ;;
-  56)
-    DCP=8
-    MAX_NUM_SEQS=112
-    MAX_NUM_BATCHED_TOKENS=8192
-    GPU_MEMORY_UTILIZATION=0.90
-    ENABLE_LMCACHE=1
-    LMCACHE_MAX_LOCAL_CPU_SIZE=192
-    ATOM_ENABLE_REPLAYSSM=0
-    NUM_SPECULATIVE_TOKENS=0
-    SPEC_DECODE_ACCEPTANCE_LENGTH=""
-    ;;
-  64)
-    DCP=8
-    MAX_NUM_SEQS=128
-    MAX_NUM_BATCHED_TOKENS=8192
-    GPU_MEMORY_UTILIZATION=0.90
-    ENABLE_LMCACHE=1
-    LMCACHE_MAX_LOCAL_CPU_SIZE=192
-    ATOM_ENABLE_REPLAYSSM=0
-    NUM_SPECULATIVE_TOKENS=0
-    SPEC_DECODE_ACCEPTANCE_LENGTH=""
+  32|40|48|56|64)
+    # Throughput: no spec, and max-num-seqs tracks 2*CONC so the in-flight
+    # window can keep up with the client.
+    MAX_NUM_SEQS=$((2 * CONC))
+    # The two largest bands need a bigger CPU tier to stay off the HBM cliff.
+    if [[ "${CONC}" -ge 56 ]]; then
+      LMCACHE_MAX_LOCAL_CPU_SIZE=192
+    fi
     ;;
   *)
     echo "Unsupported CONC=${CONC}; AgentX Kimi-K3 covers 1,2,4,8,12,14,16,32,40,48,56,64." >&2
