@@ -144,6 +144,7 @@ on:
           - mia1-p02-g47,mia1-p02-g42
           - mia1-p02-g47,mia1-p02-g44
           - mia1-p01-g36,mia1-p01-g43
+          - mia1-p01-g43,mia1-p01-g36
       atomesh_2p1d_nodes:
         description: 'TW 2P1D nodes; Crusoe v2 selects from its configured candidate pool'
         required: false
