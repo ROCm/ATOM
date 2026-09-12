@@ -27,6 +27,7 @@ ATOM_DEEPSEEK_V4_BLOCK_SIZE = 128
 ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT = 256
 
 logger = logging.getLogger(__name__)
+_V4_SLOT_ALLOCATORS_BY_PROXY_PTR = {}
 
 # aiter's V4 native 2buff fp8 prefill (op4) / decode (op5) kernels exist only on
 # gfx950 / gfx1250. Mirror native's guard (deepseek_v4_attn.py): a request for an
@@ -902,6 +903,7 @@ def bind_deepseek_v4_proxy_cache_views(
     # the bridge cannot read from common_attn_metadata.
     if not hasattr(model, "_atom_v4_slot_allocator"):
         model._atom_v4_slot_allocator = _V4StateSlotAllocator(num_slots)
+    _V4_SLOT_ALLOCATORS_BY_PROXY_PTR[ptr] = model._atom_v4_slot_allocator
     window_size = int(model.args.window_size)
     win_with_spec = _v4_win_with_spec(vllm_config, window_size)
     # Single fp8 authority for the whole bind (must agree with the _proxy_page_bytes
@@ -1273,6 +1275,26 @@ class _V4StateSlotAllocator:
             last_seen[slot] = step
         return np.asarray(slots, dtype=np.int32), reset
 
+    def reserve(self, req_key, slot: int) -> None:
+        """Bind a scheduler-selected slot before an async state restore."""
+        slot = int(slot)
+        if not 0 <= slot < self.num_slots:
+            raise ValueError(f"V4 state slot {slot} is outside [0, {self.num_slots})")
+        current = self._key_to_slot.get(req_key)
+        if current == slot:
+            return
+        if current is not None:
+            self._slot_to_key[current] = None
+            if current not in self._free:
+                self._free.append(current)
+        old = self._slot_to_key[slot]
+        if old is not None and old != req_key:
+            self._key_to_slot.pop(old, None)
+        self._key_to_slot[req_key] = slot
+        self._slot_to_key[slot] = req_key
+        if slot in self._free:
+            self._free.remove(slot)
+
     def _acquire(self, active: set) -> int:
         if self._free:
             return self._free.pop()
@@ -1293,6 +1315,18 @@ class _V4StateSlotAllocator:
             self._key_to_slot.pop(old, None)
         self._slot_to_key[victim] = None
         return victim
+
+
+def reserve_deepseek_v4_state_slot(
+    proxy_data_ptr: int, req_id: str, slot: int
+) -> None:
+    """Prevent metadata construction from clearing a restored request slot."""
+    allocator = _V4_SLOT_ALLOCATORS_BY_PROXY_PTR.get(int(proxy_data_ptr))
+    if allocator is None:
+        raise RuntimeError(
+            f"DeepSeek-V4 state-slot allocator is not bound for proxy {proxy_data_ptr}"
+        )
+    allocator.reserve(str(req_id), int(slot))
 
 
 def build_atom_v4_attention_metadata(
