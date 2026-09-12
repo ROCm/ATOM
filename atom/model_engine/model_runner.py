@@ -888,24 +888,38 @@ class ModelRunner:
     def _stage_engram(self, batch: ScheduledBatch) -> None:
         """Stage this step's engram embeddings to the device before the forward.
 
-        Decode stages the real rows the prefetch gathered; dummy and prefill
-        passes stage zeros (prefill's per-prompt gather is not implemented, so
-        engram contributes nothing there yet).
+        Decode stages the rows the prefetch gathered; prefill gathers every
+        prompt position's n-gram (carrying the tokens preceding a chunk); a dummy
+        warmup/capture pass stages zeros.
         """
         seq_ids = list(batch.req_ids)
-        if batch.is_dummy_run or not seq_ids or batch.total_tokens_num != len(seq_ids):
-            # Prefill (many tokens per seq) still stages zeros -- the per-prompt
-            # gather is not wired -- but seed each sequence's n-gram window with
-            # its prompt tail so the FIRST decode tokens hash with real context
-            # instead of padding. `scheduled_tokens` is laid out per sequence;
-            # seed_context keeps only the trailing max_ngram_size-1 it needs.
-            if not batch.is_dummy_run and seq_ids:
-                offsets = np.concatenate(([0], np.cumsum(batch.num_scheduled_tokens)))
-                for i, seq_id in enumerate(seq_ids):
-                    self.engram.seed_context(
-                        seq_id, batch.scheduled_tokens[offsets[i] : offsets[i + 1]]
-                    )
+        if batch.is_dummy_run or not seq_ids:
             self.engram.stage_dummy(batch.total_tokens_num)
+            self.engram.wait_for_embeddings()
+            return
+        if batch.total_tokens_num_prefill > 0:
+            # Prefill (possibly chunked). Each request's chunk is a consecutive
+            # slice of the flat scheduled_tokens; prefill_context supplies the
+            # max_ngram_size-1 tokens preceding the chunk so its leading positions
+            # hash with real context instead of padding. stage_prefill seeds the
+            # decode window on the final chunk. Prefill and decode are never mixed
+            # in one batch, so the whole batch is prefill rows here.
+            assert (
+                batch.total_tokens_num_decode == 0
+            ), "engram does not support mixed prefill+decode batches"
+            offsets = np.concatenate(([0], np.cumsum(batch.num_scheduled_tokens)))
+            chunk_tokens = [
+                batch.scheduled_tokens[offsets[i] : offsets[i + 1]].astype(np.int64)
+                for i in range(len(seq_ids))
+            ]
+            context = batch.prefill_context or [[]] * len(seq_ids)
+            context_tails = [np.asarray(c, dtype=np.int64) for c in context]
+            final_mask = (
+                list(batch.is_final_chunk) if batch.is_final_chunk is not None else None
+            )
+            self.engram.stage_prefill(
+                seq_ids, chunk_tokens, context_tails, final_mask=final_mask
+            )
             self.engram.wait_for_embeddings()
             return
         # `tokens` is a fallback for recomputing a prefetch miss, and is read

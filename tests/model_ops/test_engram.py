@@ -294,6 +294,76 @@ def test_wait_without_submit_is_a_noop():
     pf.shutdown()
 
 
+def test_compute_prefill_matches_per_position_compute():
+    """Each prefill position's embedding equals the decode-window compute for
+    the same n-gram (context prepended, leading outputs discarded)."""
+    pf = make_prefetcher()
+    ctx = [3, 4]  # max_ngram_size-1 = 2 preceding tokens
+    chunk = [5, 6, 7]
+    pre = pf.compute_prefill([np.array(ctx)], [np.array(chunk)])
+    windows = [[3, 4, 5], [4, 5, 6], [5, 6, 7]]  # window ending at each chunk pos
+    for pos, window in enumerate(windows):
+        exp = pf.compute([0], np.array([window], dtype=np.int64))
+        for layer_id in pf.layer_ids:
+            torch.testing.assert_close(
+                pre[layer_id][0][pos], exp[(0, layer_id)].reshape(-1)
+            )
+    pf.shutdown()
+
+
+def test_compute_prefill_chunked_equals_unchunked():
+    """Splitting a prompt into chunks with the n-1 context carried across the
+    boundary reproduces hashing the whole prompt at once."""
+    pf = make_prefetcher()
+    prompt = [1, 2, 3, 4, 5, 6]
+    whole = pf.compute_prefill([np.array([], dtype=np.int64)], [np.array(prompt)])
+    part1 = pf.compute_prefill([np.array([], dtype=np.int64)], [np.array([1, 2, 3])])
+    # chunk 2 starts at position 3; its 2 preceding tokens are [2, 3].
+    part2 = pf.compute_prefill([np.array([2, 3])], [np.array([4, 5, 6])])
+    for layer_id in pf.layer_ids:
+        stitched = torch.cat([part1[layer_id][0], part2[layer_id][0]], dim=0)
+        torch.testing.assert_close(stitched, whole[layer_id][0])
+    pf.shutdown()
+
+
+def test_compute_prefill_first_chunk_left_pads():
+    """A first chunk (empty context) left-pads, so position 0 is a 1-gram."""
+    pf = make_prefetcher()
+    pre = pf.compute_prefill([np.array([], dtype=np.int64)], [np.array([9, 8])])
+    exp0 = pf.compute([0], np.array([[9]], dtype=np.int64))
+    for layer_id in pf.layer_ids:
+        torch.testing.assert_close(pre[layer_id][0][0], exp0[(0, layer_id)].reshape(-1))
+    pf.shutdown()
+
+
+def test_stage_prefill_lays_out_rows_and_seeds_window():
+    rt = make_runtime()
+    seq_ids = [71, 72]
+    chunks = [np.array([1, 2, 3]), np.array([4, 5])]
+    ctxs = [np.array([], dtype=np.int64), np.array([6, 7])]  # 72 is a continuation
+    pre = rt.prefetcher.compute_prefill(ctxs, chunks)
+
+    total = rt.stage_prefill(seq_ids, chunks, ctxs, final_mask=[True, True])
+    assert total == 5
+    for layer_id in rt.layer_ids:
+        emb = rt.embeddings(layer_id)
+        assert emb.shape == (5, rt.embed_width)
+        torch.testing.assert_close(emb[0:3], pre[layer_id][0][:, : rt.embed_width])
+        torch.testing.assert_close(emb[3:5], pre[layer_id][1][:, : rt.embed_width])
+
+    # Final chunk seeds the decode window with the prompt's trailing n-1 tokens.
+    assert list(rt.prefetcher._window[71]) == [2, 3]
+    assert list(rt.prefetcher._window[72]) == [4, 5]
+    rt.shutdown()
+
+
+def test_stage_prefill_rejects_more_rows_than_capacity():
+    rt = make_runtime()  # max_num_tokens=8
+    with pytest.raises(ValueError, match="exceed staging capacity"):
+        rt.stage_prefill([81], [np.arange(9)], [np.array([], dtype=np.int64)])
+    rt.shutdown()
+
+
 # --- device-side modules and the staging runtime ---
 
 

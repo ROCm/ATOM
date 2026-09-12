@@ -541,6 +541,10 @@ class EngramPrefetcher:
     def layer_ids(self) -> tuple[int, ...]:
         return self._hash_mapping.config.layer_ids
 
+    @property
+    def ngram(self) -> int:
+        return self._ngram
+
     def seed_context(self, seq_id: int, context_tokens) -> None:
         """Seed a sequence's window with its prompt's trailing tokens, before its
         first decode token is advanced in, so the first decode hashes with real
@@ -627,6 +631,38 @@ class EngramPrefetcher:
             for i, seq_id in enumerate(seq_ids):
                 results[(seq_id, layer_id)] = gathered[i][-1]
         return results
+
+    def compute_prefill(
+        self,
+        context_tails: list[np.ndarray],
+        chunk_tokens: list[np.ndarray],
+    ) -> dict[int, list[torch.Tensor]]:
+        """Per-position engram gather for prefill chunks.
+
+        For request i, `chunk_tokens[i]` is this chunk's token ids and
+        `context_tails[i]` the up-to-(max_ngram_size-1) prompt tokens immediately
+        before it (empty for a first chunk). Prepending the context lets every
+        chunk position hash its real causal n-gram; the leading context outputs
+        are discarded. Unlike `compute`, which keeps only the last position, this
+        keeps all `chunk_len` positions. Returns, per layer, one
+        `[chunk_len, embed_width]` tensor per request in input order.
+        """
+        out: dict[int, list[torch.Tensor]] = {lid: [] for lid in self.layer_ids}
+        for ctx, chunk in zip(context_tails, chunk_tokens):
+            ctx = np.asarray(ctx, dtype=np.int64).reshape(-1)
+            chunk = np.asarray(chunk, dtype=np.int64).reshape(-1)
+            ids = np.concatenate([ctx, chunk]) if ctx.size else chunk
+            skip = int(ctx.size)
+            compressed = self._hash_mapping.tokenizer(ids)
+            for layer_id in self.layer_ids:
+                hashes = self._hash_mapping.hash_layer(
+                    compressed, layer_id, compress=False
+                )
+                rows = self._hash_mapping.to_row_indices(hashes, layer_id)
+                gathered = self._tables[layer_id].gather(rows)
+                chunk_rows = gathered[0, skip:]
+                out[layer_id].append(chunk_rows.reshape(chunk_rows.shape[0], -1))
+        return out
 
     def submit_compute(
         self,
@@ -821,6 +857,12 @@ class EngramHost:
             if staged_rows > num_rows:
                 cpu[num_rows:staged_rows].zero_()
 
+        self._issue_h2d(staged_rows)
+        return staged_rows
+
+    def _issue_h2d(self, rows: int) -> None:
+        """Copy `rows` staged rows of every layer buffer to the device and record
+        the completion event `wait_for_embeddings` orders against."""
         if self.copy_stream is not None:
             # Capture the compute stream BEFORE entering the copy_stream context:
             # inside it `current_stream()` would return copy_stream, making the
@@ -830,13 +872,58 @@ class EngramHost:
             with torch.cuda.stream(self.copy_stream):
                 self.copy_stream.wait_stream(compute_stream)
                 for buffer in self.buffers.values():
-                    buffer.copy_to_gpu(staged_rows)
+                    buffer.copy_to_gpu(rows)
                 self.copy_done.record(self.copy_stream)
         else:
             for buffer in self.buffers.values():
-                buffer.copy_to_gpu(staged_rows)
-        self._staged_rows = staged_rows
-        return staged_rows
+                buffer.copy_to_gpu(rows)
+        self._staged_rows = rows
+
+    def stage_prefill(
+        self,
+        seq_ids: list[int],
+        chunk_tokens: list[np.ndarray],
+        context_tails: list[np.ndarray],
+        final_mask: list[bool] | None = None,
+    ) -> int:
+        """Gather and stage per-position engram rows for a prefill batch.
+
+        Each request contributes `len(chunk_tokens[i])` consecutive rows, laid
+        out in `seq_ids` order to match the prefill forward's flattened token
+        order. `context_tails[i]` supplies the tokens immediately preceding the
+        chunk so its leading n-grams hash with real context instead of padding.
+        Synchronous: prefill has no prior step to overlap a prefetch with.
+
+        On a request's final chunk the decode window is seeded from the prompt
+        tail, so the first decode token continues the same n-gram context.
+        """
+        lengths = [int(np.asarray(c).reshape(-1).size) for c in chunk_tokens]
+        total = sum(lengths)
+        if total > self.max_num_tokens:
+            raise ValueError(
+                f"{total} prefill rows exceed staging capacity {self.max_num_tokens}"
+            )
+        computed = self.prefetcher.compute_prefill(context_tails, chunk_tokens)
+        offsets = np.concatenate(([0], np.cumsum(lengths)))
+        for layer_id in self.layer_ids:
+            cpu = self.buffers[layer_id].cpu
+            for i, rows in enumerate(computed[layer_id]):
+                base = int(offsets[i])
+                cpu[base : base + lengths[i]].copy_(rows[:, : self.embed_width])
+        if final_mask is not None:
+            need = self.prefetcher.ngram - 1
+            for i, seq_id in enumerate(seq_ids):
+                if not final_mask[i] or need <= 0:
+                    continue
+                chunk = np.asarray(chunk_tokens[i]).reshape(-1)
+                if chunk.size >= need:
+                    tail = chunk[-need:]
+                else:
+                    ctx = np.asarray(context_tails[i]).reshape(-1)
+                    tail = np.concatenate([ctx, chunk])[-need:]
+                self.seed_context(seq_id, tail)
+        self._issue_h2d(total)
+        return total
 
     def stage_dummy(self, num_rows: int) -> int:
         """Stage zeros for a warmup or capture pass.
@@ -849,21 +936,7 @@ class EngramHost:
         num_rows = min(int(num_rows), self.max_num_tokens)
         for buffer in self.buffers.values():
             buffer.cpu[:num_rows].zero_()
-        if self.copy_stream is not None:
-            # Capture the compute stream BEFORE entering the copy_stream context:
-            # inside it `current_stream()` would return copy_stream, making the
-            # wait a no-op self-wait that fails to order the H2D after the
-            # previous forward's reads of these buffers.
-            compute_stream = torch.cuda.current_stream(self.device)
-            with torch.cuda.stream(self.copy_stream):
-                self.copy_stream.wait_stream(compute_stream)
-                for buffer in self.buffers.values():
-                    buffer.copy_to_gpu(num_rows)
-                self.copy_done.record(self.copy_stream)
-        else:
-            for buffer in self.buffers.values():
-                buffer.copy_to_gpu(num_rows)
-        self._staged_rows = num_rows
+        self._issue_h2d(num_rows)
         return num_rows
 
     def wait_for_embeddings(self) -> None:
