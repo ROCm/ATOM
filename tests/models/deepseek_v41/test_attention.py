@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: MIT
 """CSA2 operator/ownership differential tests against pinned upstream methods."""
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
@@ -78,22 +76,23 @@ def test_compressor_all_chunk_boundaries_against_official_decode(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("chunks", [(6,), (3, 1, 1, 1), (1, 3, 2), (2, 1, 3)])
 def test_full_reuse_reindex_attention_prefill_and_decode(
-    reference, single_rank, small_config, chunks
+    reference, single_rank, small_config, chunks, attention_contract
 ):
     from atom.model_ops.attentions.deepseek_v41_state import EagerAttentionCache
     from atom.models.deepseek_v41.attention import Attention
     from atom.models.deepseek_v41.config import build_attention_topology
 
+    captured, check_attention = attention_contract
     torch.manual_seed(196)
     config = small_config
     config.index_topk = 16
     topology = build_attention_topology(config)
     args = reference.ModelArgs(
         dim=64,
-        n_heads=4,
-        head_dim=64,
+        n_heads=config.num_attention_heads,
+        head_dim=config.head_dim,
         q_lora_rank=32,
-        o_groups=4,
+        o_groups=config.o_groups,
         o_lora_rank=32,
         window_size=4,
         index_n_heads=32,
@@ -152,12 +151,15 @@ def test_full_reuse_reindex_attention_prefill_and_decode(
             for spec, target, values, output in zip(
                 topology, targets, hidden, expected
             ):
-                actual = target(
-                    values[:, position : position + length].cuda(),
-                    cache,
-                    step,
-                    global_rope if spec.ratio else window_rope,
-                ).cpu()
+                with check_attention(
+                    [captured[spec.layer_id][:, position : position + length]]
+                ):
+                    actual = target(
+                        values[:, position : position + length].cuda(),
+                        cache,
+                        step,
+                        global_rope if spec.ratio else window_rope,
+                    ).cpu()
                 torch.testing.assert_close(
                     actual,
                     output[:, position : position + length],
@@ -170,25 +172,3 @@ def test_full_reuse_reindex_attention_prefill_and_decode(
         assert set(step.indices) == {1, 3, 4}
         assert set(step.candidates) == {3}
         assert cache.position == 6
-
-
-def test_short_decode_and_chunks_keep_window_slots():
-    from atom.model_ops.attentions.deepseek_v41_state import EagerAttentionCache
-
-    config = SimpleNamespace(max_position_embeddings=512)
-    cache = EagerAttentionCache(config, (), 1, 512, "cpu")
-    position = 0
-    for length in (5, 3, 1, 120, 1, 130):
-        values = torch.arange(position, position + length).reshape(1, length, 1)
-        step = cache.begin_step(position, length, 1)
-        stored, indices = cache.append_window(0, values, 128, step)
-        selected = stored[0, indices[0].clamp_min(0), 0].masked_fill(indices[0] < 0, -1)
-        for offset, row in enumerate(selected.tolist()):
-            last = position + offset
-            visible = list(range(max(0, last - 127), last + 1))
-            padding = [-1] * (len(row) - len(visible))
-            expected = visible + padding if position == 0 else padding + visible
-            assert row == expected
-        assert indices.shape[-1] == (5 if position == 0 else 128)
-        cache.finish_step(step)
-        position += length

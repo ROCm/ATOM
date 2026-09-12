@@ -14,7 +14,10 @@ from atom.model_ops.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from atom.model_ops.sparse_attn_v4 import sparse_attn_triton
+from atom.model_ops.v4_kernels import (
+    sparse_attn_v4_paged_decode,
+    sparse_attn_v4_paged_prefill,
+)
 
 from .config import AttentionMode, IndexTieBreak
 from .layers import native_quant_config, reduce_output
@@ -74,7 +77,6 @@ class Attention(nn.Module):
     def __init__(self, config, spec):
         super().__init__()
         self.spec = spec
-        self.window_size = config.sliding_window
         self.head_dim, self.o_rank = config.head_dim, config.o_lora_rank
         tp_size = get_tp_group().world_size
         self.heads, self.groups = (
@@ -134,9 +136,6 @@ class Attention(nn.Module):
         kv = quantize_fp8(
             rope(self.kv_norm(self.wkv(hidden)), positions), dequantize=True
         )
-        window, indices = cache.append_window(
-            self.spec.layer_id, kv, self.window_size, step
-        )
         if self.spec.ratio:
             owner = self.spec.kv_owner
             count = (step.position + step.length) // self.spec.ratio
@@ -175,13 +174,36 @@ class Attention(nn.Module):
                 step.indices[self.spec.layer_id] = selected
                 if candidates_out is not None:
                     step.candidates[self.spec.layer_id] = candidates_out
-            selected = step.indices[self.spec.topk_owner]
-            shifted = torch.where(selected >= 0, selected + window.shape[1], -1)
-            indices = torch.cat((indices, shifted), dim=-1)
-            window = torch.cat((window, cache.main[owner][:, :count]), dim=1)
-        output = sparse_attn_triton(
-            query, window, self.attn_sink, indices, self.head_dim**-0.5, block_k=64
+        prefix, prefix_indptr, extend, extend_indptr = cache.attention_indices(
+            self.spec, step
         )
+        flat_query = query.flatten(0, 1)
+        if step.length == 1:
+            cache.write_window(self.spec.layer_id, kv, step)
+            output = sparse_attn_v4_paged_decode(
+                flat_query,
+                cache.pool,
+                prefix,
+                prefix_indptr,
+                self.attn_sink,
+                self.head_dim**-0.5,
+            )
+        else:
+            output = sparse_attn_v4_paged_prefill(
+                flat_query,
+                cache.pool,
+                prefix,
+                prefix_indptr,
+                kv.flatten(0, 1),
+                extend,
+                extend_indptr,
+                self.attn_sink,
+                self.head_dim**-0.5,
+                out=flat_query,
+            )
+            # Preserve the prior ring until every query has consumed its prefix.
+            cache.write_window(self.spec.layer_id, kv, step)
+        output = output.view_as(query)
         output = (
             rope(output, positions, inverse=True)
             .unflatten(-2, (self.groups, -1))

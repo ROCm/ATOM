@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: MIT
-"""Bounded eager CSA2 cache ownership; paged request lifecycle is a separate layer."""
+"""Eager CSA2 cache ownership and inputs for the unmodified V4 attention kernels."""
 
 from dataclasses import dataclass, field
 
 import torch
 
+from atom.model_ops.attentions.pool_layout.v4_pool_geometry import WindowParams
 from atom.model_ops.deepseek_v41.compressor import CompressorTail
+from atom.model_ops.deepseek_v41.paged_indices import build_sparse_indices
+from atom.model_ops.v4_kernels.state_writes import swa_write
 from atom.models.deepseek_v41.config import AttentionMode
 
 
@@ -13,15 +16,17 @@ from atom.models.deepseek_v41.config import AttentionMode
 class AttentionStep:
     position: int
     length: int
+    positions: torch.Tensor
+    cu_seqlens_q: torch.Tensor
     indices: dict[int, torch.Tensor] = field(default_factory=dict)
     candidates: dict[int, torch.Tensor] = field(default_factory=dict)
 
 
 class EagerAttentionCache:
-    """One fixed batch of equal-position sequences, with one allocation per owner.
+    """Fixed-batch storage with private SWA rings and one global region per owner.
 
-    This is the offline correctness baseline. It deliberately has no global
-    module state and cannot be shared between independent requests or branches.
+    The pool uses V4's row-addressed BF16 ABI. It is allocated for one offline
+    request batch; scheduler paging and request migration are separate work.
     """
 
     def __init__(self, config, topology, batch_size, max_length, device):
@@ -29,20 +34,33 @@ class EagerAttentionCache:
             raise ValueError("Invalid eager CSA2 cache capacity")
         self.batch_size, self.max_length = batch_size, max_length
         self.position = 0
-        self.window = {}
         self.tails: dict[int, CompressorTail | None] = {}
-        self.main = {}
-        self.index = {}
+        self.main, self.index, self.main_offsets = {}, {}, {}
+        rows = len(topology) * config.sliding_window
+        for spec in topology:
+            if spec.mode == AttentionMode.FULL:
+                self.main_offsets[spec.layer_id] = rows
+                rows += max_length // spec.ratio
+        self.pool = torch.empty(
+            batch_size * rows, config.head_dim, dtype=torch.bfloat16, device=device
+        )
+        view = self.pool.view(batch_size, rows, config.head_dim)
+        self.slots = torch.arange(batch_size, dtype=torch.int32, device=device)
+        self.window = {
+            spec.layer_id: WindowParams(
+                ring_start=i * config.sliding_window,
+                slot_rows=rows,
+                ring_slots=config.sliding_window,
+                ring_stride=config.sliding_window,
+                run_rows=config.sliding_window,
+            )
+            for i, spec in enumerate(topology)
+        }
         for spec in topology:
             if spec.mode == AttentionMode.FULL:
                 count = max_length // spec.ratio
-                self.main[spec.layer_id] = torch.empty(
-                    batch_size,
-                    count,
-                    config.head_dim,
-                    dtype=torch.bfloat16,
-                    device=device,
-                )
+                start = self.main_offsets[spec.layer_id]
+                self.main[spec.layer_id] = view[:, start : start + count]
                 self.index[spec.layer_id] = torch.empty(
                     batch_size,
                     count,
@@ -58,31 +76,39 @@ class EagerAttentionCache:
             )
         if position + length > self.max_length:
             raise ValueError("Eager cache capacity exceeded")
-        return AttentionStep(position, length)
+        positions = torch.arange(
+            position, position + length, dtype=torch.int32, device=self.pool.device
+        ).repeat(batch_size)
+        cu_seqlens = (
+            torch.arange(batch_size + 1, dtype=torch.int32, device=self.pool.device)
+            * length
+        )
+        return AttentionStep(position, length, positions, cu_seqlens)
 
     def finish_step(self, step):
         if step.position != self.position:
             raise ValueError("Attention step does not match the cache position")
         self.position += step.length
 
-    def append_window(self, layer_id, kv, window_size, step):
-        previous = self.window.get(layer_id)
-        if step.position and previous is None:
-            raise ValueError("Missing sliding-window state")
-        combined = kv if previous is None else torch.cat((previous, kv), dim=1)
-        past = 0 if previous is None else previous.shape[1]
-        end = past + torch.arange(step.length, device=kv.device)
-        start = end - window_size + 1
-        if step.position == 0:
-            count = min(window_size, combined.shape[1])
-            start = start.clamp_min(0)
-        else:
-            # Reference decode retains the leading empty ring slots. Compacting
-            # them changes the 64-row BF16 probability-rounding boundaries.
-            count = window_size
-        indices = start[:, None] + torch.arange(count, device=kv.device)
-        indices = indices.masked_fill(
-            (indices < 0) | (indices > end[:, None]), -1
-        ).int()
-        self.window[layer_id] = combined[:, -window_size:].clone()
-        return combined, indices[None].expand(kv.shape[0], -1, -1).contiguous()
+    def write_window(self, layer_id, kv, step):
+        window = self.window[layer_id]
+        swa_write(
+            kv.flatten(0, 1),
+            step.positions,
+            step.cu_seqlens_q,
+            self.slots,
+            self.pool,
+            window,
+            min(step.length, window.ring_slots),
+        )
+
+    def attention_indices(self, spec, step):
+        return build_sparse_indices(
+            step.indices[spec.topk_owner] if spec.ratio else None,
+            position=step.position,
+            length=step.length,
+            batch_size=self.batch_size,
+            window=self.window[spec.layer_id],
+            global_start=self.main_offsets[spec.kv_owner] if spec.ratio else 0,
+            device=self.pool.device,
+        )

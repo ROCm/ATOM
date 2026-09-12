@@ -1,40 +1,104 @@
 # SPDX-License-Identifier: MIT
-"""BF16 sparse attention rounding and sink contracts, independent of model wiring."""
+"""Unmodified V4 BF16 kernels with V4.1's dimensions and sparse inputs."""
 
 import pytest
 import torch
 
+from atom.model_ops.attentions.deepseek_v41_state import EagerAttentionCache
+from atom.model_ops.v4_kernels import (
+    sparse_attn_v4_paged_decode,
+    sparse_attn_v4_paged_prefill,
+)
+from atom.models.deepseek_v41.config import build_attention_topology
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-def test_v4_bf16_attention_counts_sink_once_for_two_representations():
-    from atom.model_ops.sparse_attn_v4 import sparse_attn
-
-    q = torch.zeros(1, 1, 8, 512, dtype=torch.bfloat16, device="cuda")
-    kv = torch.full((1, 2, 512), 6.0, dtype=torch.bfloat16, device="cuda")
-    # Two representations of the same logical position remain separate entries.
-    indices = torch.tensor([[[0, 1, -1]]], dtype=torch.int32, device="cuda")
-    output = sparse_attn(q, kv, torch.zeros(8, device="cuda"), indices, 512**-0.5)
-    torch.testing.assert_close(output, torch.full_like(output, 4.0), rtol=0, atol=0)
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="ROCm GPU required"
+)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-def test_sparse_bf16_uses_reference_online_softmax_tiles():
-    from atom.model_ops.sparse_attn_v4 import sparse_attn, sparse_attn_triton
+@pytest.mark.parametrize("length", [1, 2])
+def test_v4_bf16_counts_sink_once_for_swa_and_global(small_config, length):
+    config = small_config
+    config.head_dim = 512
+    spec = build_attention_topology(config)[3]
+    cache = EagerAttentionCache(config, (spec,), 2, 32, "cuda")
+    cache.main[spec.layer_id].fill_(6)
+    step = cache.begin_step(0, length, 2)
+    step.indices[spec.topk_owner] = torch.zeros(
+        2, length, 1, device="cuda", dtype=torch.int32
+    )
+    q = torch.zeros(2 * length, 8, 512, dtype=torch.bfloat16, device="cuda")
+    kv = torch.full((2, length, 512), 6.0, dtype=torch.bfloat16, device="cuda")
+    sink = torch.zeros(8, device="cuda")
+    prefix, pptr, extend, eptr = cache.attention_indices(spec, step)
+    if length == 1:
+        cache.write_window(spec.layer_id, kv, step)
+        output = sparse_attn_v4_paged_decode(
+            q, cache.pool, prefix, pptr, sink, 512**-0.5
+        )
+    else:
+        output = sparse_attn_v4_paged_prefill(
+            q, cache.pool, prefix, pptr, kv.flatten(0, 1), extend, eptr, sink, 512**-0.5
+        )
+    expected = torch.tensor(
+        [4.0] if length == 1 else [4.0, 4.5], device="cuda", dtype=torch.bfloat16
+    )
+    expected = expected.repeat(2)[:, None, None].expand_as(output)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
+
+@pytest.mark.parametrize("length", [1, 3])
+@pytest.mark.parametrize("count", [192, 640])
+def test_v4_bf16_sparse_attention_matches_independent_oracle(length, count):
     from .oracle_kernels import sparse_attn as oracle
 
     torch.manual_seed(512)
-    for count in (192, 640):
-        q = torch.randn(1, 1, 16, 512, device="cuda", dtype=torch.bfloat16)
-        kv = torch.randn(1, count, 512, device="cuda", dtype=torch.bfloat16)
-        sink = torch.randn(16, device="cuda", dtype=torch.float32)
-        indices = torch.arange(count, device="cuda", dtype=torch.int32).view(1, 1, -1)
-        expected = oracle(q, kv, sink, indices, 512**-0.5)
-        actual = sparse_attn_triton(q, kv, sink, indices, 512**-0.5, block_k=64)
-        torch.testing.assert_close(actual, expected, rtol=1 / 128, atol=2**-12)
-        assert (
-            actual.float() - expected.float()
-        ).norm() / expected.float().norm() < 1e-4
-        # Existing V4 callers retain the previous default tile size.
-        legacy = sparse_attn_triton(q, kv, sink, indices, 512**-0.5, block_k=16)
-        assert torch.equal(sparse_attn(q, kv, sink, indices, 512**-0.5), legacy)
+    batch, heads, dim = 2, 8, 512
+    q = torch.randn(batch, length, heads, dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(batch, count, dim, device="cuda", dtype=torch.bfloat16)
+    sink = torch.randn(heads, device="cuda", dtype=torch.float32)
+    selected = (
+        torch.arange(count, device="cuda", dtype=torch.int32)
+        .view(1, 1, -1)
+        .expand(batch, length, -1)
+        .contiguous()
+    )
+    expected = oracle(q, kv, sink, selected, dim**-0.5)
+    bids = torch.arange(batch, device="cuda", dtype=torch.int32).repeat_interleave(
+        length
+    )
+    prefix_count = count if length == 1 else count // 2
+    prefix = (
+        bids[:, None] * count
+        + torch.arange(prefix_count, device="cuda", dtype=torch.int32)
+    ).flatten()
+    pptr = (
+        torch.arange(batch * length + 1, device="cuda", dtype=torch.int32)
+        * prefix_count
+    )
+    if length == 1:
+        actual = sparse_attn_v4_paged_decode(
+            q.flatten(0, 1), kv.flatten(0, 1), prefix, pptr, sink, dim**-0.5
+        )
+    else:
+        extend = (
+            bids[:, None] * count
+            + torch.arange(prefix_count, count, device="cuda", dtype=torch.int32)
+        ).flatten()
+        eptr = torch.arange(batch * length + 1, device="cuda", dtype=torch.int32) * (
+            count - prefix_count
+        )
+        actual = sparse_attn_v4_paged_prefill(
+            q.flatten(0, 1),
+            kv.flatten(0, 1),
+            prefix,
+            pptr,
+            kv.flatten(0, 1),
+            extend,
+            eptr,
+            sink,
+            dim**-0.5,
+        )
+    actual = actual.view_as(q)
+    torch.testing.assert_close(actual, expected, rtol=1 / 64, atol=2**-10)
+    assert (actual.float() - expected.float()).norm() / expected.float().norm() < 3e-3

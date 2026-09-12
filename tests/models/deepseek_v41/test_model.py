@@ -9,10 +9,11 @@ import torch
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 def test_text_backbone_native_weights_and_single_pass_mhc(
-    reference, single_rank, small_config
+    reference, single_rank, small_config, attention_contract
 ):
     from atom.models.deepseek_v41.model import DeepseekV41ForCausalLM
 
+    captured, check_attention = attention_contract
     config = small_config
     config.vocab_size = 128
     config.n_routed_experts, config.num_experts_per_tok = 8, 2
@@ -34,10 +35,10 @@ def test_text_backbone_native_weights_and_single_pass_mhc(
     args = reference.ModelArgs(
         dim=64,
         vocab_size=128,
-        n_heads=4,
-        head_dim=64,
+        n_heads=config.num_attention_heads,
+        head_dim=config.head_dim,
         q_lora_rank=32,
-        o_groups=4,
+        o_groups=config.o_groups,
         o_lora_rank=32,
         window_size=4,
         index_n_heads=32,
@@ -102,8 +103,10 @@ def test_text_backbone_native_weights_and_single_pass_mhc(
         cache = target.new_cache(1)
         for position, length in ((0, 3), (3, 1), (4, 1), (5, 1)):
             chunk = tokens[:, position : position + length]
+            captured.clear()
             expected = source(chunk, position)[1]
-            actual = target(chunk.cuda(), cache).cpu()
+            with check_attention(captured):
+                actual = target(chunk.cuda(), cache).cpu()
             torch.testing.assert_close(
                 actual,
                 expected,

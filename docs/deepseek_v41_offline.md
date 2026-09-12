@@ -46,8 +46,15 @@ an offline run. The model captures the selected policy at construction time.
 The four global cache owners are layers 2, 8, 14 and 20. Reuse layers share
 their owner's values and top-k; Reindex layers score only the supplied compact
 candidate blocks. All attention caches contain BF16 values after the original
-FP8/FP4 quantization and dequantization steps. The V4 BF16 sparse kernel uses
-64-entry tiles here to preserve reference probability-rounding boundaries.
+FP8/FP4 quantization and dequantization steps. Attention calls the existing V4
+BF16 paged prefill/decode entry points with
+unchanged dispatch and kernels. The earlier fixed-64 tile override was removed.
+The cache owns a fixed BF16 row pool: one SWA ring per layer and one global
+region per owner. Prefill reads the prior ring and current chunk separately;
+decode writes its current row before reading the pool. Both use V4's existing
+ring writer. No forward step concatenates the complete global KV history.
+`atom/model_ops/deepseek_v41/paged_indices.py` prepares the caller's CSR indices;
+it contains no attention computation.
 
 Weights retain native FP8 32x32 or FP4 1x32 storage. The correctness GEMM converts
 register tiles for BF16 MFMA, retaining FP8 activation quantization. Routed
@@ -66,11 +73,35 @@ ATOM_DSV41_REFERENCE=/mnt/DeepSeek-V4.1-Flash \
   python -m pytest -q tests/models/deepseek_v41
 ```
 
-Module tests compare with independent PyTorch contracts and pinned upstream
-methods. Attention covers Full/Reuse/Reindex, causal visibility, ratio-2 groups
-across chunk boundaries, short-window padding and the single sink contribution.
+Operator tests compare with independent PyTorch contracts and pinned upstream
+methods. Attention integration fixtures retain the real 512-dimensional heads
+and eight local heads. Cache tests cover Full/Reuse/Reindex ownership, causal
+visibility, ring wraparound, separate requests and batch rows, and ratio-2
+boundaries. The actual V4 BF16 prefill/decode tests cover a single sink across
+SWA/global representations and 192/640 selected entries.
 
-Full-weight integration was checked separately:
+Quantized graph tests first compare each real backend's output with the upstream
+attention output (relative L2 <= 0.003), then supply the upstream output to the
+remaining projections. This controls accepted BF16 rounding before discontinuous
+FP8 quantization and isolates model composition. These tests do not establish
+end-to-end numerical parity. The production model has no such substitution.
+
+An isolated run of the official TileLang HIP attention also checked the
+unmodified V4 kernels at 5/192/640 entries. The maximum observed relative L2 was
+0.002461 for decode and 0.001203 for prefill across those cases.
+
+The current paged V4 path completed an independent TP8 full-weight comparison
+using one loaded block at a time, without aligning GEMMs, attention, norms or
+collective implementations. All 40 layers ran for five fixtures and 20 calls;
+peak allocated HBM was 6.46 GiB per rank. Across 248 scored next-token positions,
+top-1 agreement was 238/248, target mean NLL 1.329078 and reference mean NLL
+1.333321. Per-call logits relative L2 ranged from 0.103 to 0.604. These results
+leave the full-model numerical/quality gate open; aggregate NLL is not sufficient
+to close it. Streaming is an external diagnostic, not a model execution feature.
+
+Earlier full-weight results below describe assembly commit `446d5a03a`, before
+the switch from the generic helper to paged V4 attention. They are historical
+evidence, not acceptance of the current backend:
 
 - Five fixtures (English, Chinese, code, Unicode and a 200-token window-boundary
   sequence) cover 20 prefill/decode calls. Every layer residual and final logit
@@ -86,10 +117,17 @@ Full-weight integration was checked separately:
   Both strict and flexible exact-match scores were 4/4. This is a smoke test;
   it does not establish a model-quality score or replace paired evaluation.
 
-The short real-weight probe isolated a one-element BF16 attention difference
-and FP32 collective reduction differences that accumulate through quantized
-layers. These explain the controlled fixture drift; thresholds have not been
-relaxed. Long contexts that exercise top-512 pruning and the complete serving
-state lifecycle still need their own acceptance checks.
+The earlier short real-weight probe isolated a one-element BF16 attention
+difference and FP32 collective reduction differences that accumulate through
+quantized layers. With paged attention, the reference and production kernels
+also differ in KV tile and region accumulation order. Full-model numerical and
+quality acceptance remains open. Long contexts that exercise top-512 pruning
+and the complete serving state lifecycle still need their own acceptance checks.
 
-No throughput or latency claim is made for this eager baseline.
+A GPU graph microbenchmark on MI355X measured decode attention plus the former
+full-history KV concatenation, with H=8, D=512 and 640 selected entries. At 8192
+history rows, median latency changed from 157.8 to 7.8 microseconds for batch 1,
+and from 245.7 to 9.3 microseconds for batch 16, over three measurements. The
+baseline is the helper from `446d5a03a`; the new case reads the existing pool.
+Index preparation, ring writes, projections, MoE and serving are excluded.
+These measurements are not end-to-end latency or throughput results.
