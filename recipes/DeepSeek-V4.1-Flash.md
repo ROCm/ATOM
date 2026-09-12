@@ -13,7 +13,7 @@ Engram builds on ROCm/ATOM PR #2185.
 | P00 | Pinned checkpoint, numerical oracle and input fixtures | Complete: 48 shards, 96085 tensors, 7 checks passed |
 | P01 | Nested configuration, CSA2 topology and format schema | Complete |
 | P02 | Native FP8/FP4 weights and kernel interfaces | Complete |
-| P03 | Single-Pass mHC, MoE semantics and complete Engram | Pending |
+| P03 | Single-Pass mHC, MoE arithmetic and Engram math/history | Complete |
 | P04 | Full-layer exact text inference | Pending |
 | P05 | Paging, batching and request-state lifecycle | Pending |
 | P06 | Chat, tools and reasoning-effort protocol | Pending |
@@ -58,4 +58,23 @@ it does not establish full-model speed or claim tuned GEMM performance.
 Engram libraries and their tests are imported from PR #2185 at
 `236953870b1d5a2352c647875d43239eebe5e208`. Native FP8 CPU table gathers now index
 raw bytes before converting selected rows, supporting the container's PyTorch
-2.9. Runner hooks and full V4.1 Engram mathematics/history follow in P03/P05.
+2.9. P03 separates tokenizer/hash (`model_ops/engram.py`), native table lookup
+(`model_ops/engram_lookup.py`), projection/gating (`model_ops/engram_layer.py`),
+and prefetch/staging (`model_engine/engram_runtime.py`). Engram returns the full
+updated residual with FP32 gate arithmetic and accepts a native A8 projection.
+Its incoming Single-Pass mHC pre-mix is retained at the model boundary.
+
+Prefetch and fallback consume immutable snapshots containing the request
+generation, position, raw tokens, compressed history and image mask. Every token
+in a ragged chunk is staged, and cancellation invalidates pending results. The
+runner still needs P05 integration for committed history, sampled-token D2H,
+request lifecycle, prefix state and speculation; these library helpers do not
+provide a runnable server. Staging can wait for the prior H2D before reusing its
+pinned source; overlap and buffer residency have not been benchmarked.
+
+`model_ops/deepseek_v41/mhc.py` implements the incoming-pre-mix Single-Pass
+contract. `moe.py` owns FP32 sqrtsoftplus routing, text/VL selection biases and
+weighted asymmetric-clamp SwiGLU before BF16/A8 rounding. Native routed W4A8
+uses an explicit activation dtype in the existing linear interface. MoE
+dispatch/communication integration remains P04 work; these are arithmetic
+contracts, not a claim that the existing fused MoE has equivalent precision.

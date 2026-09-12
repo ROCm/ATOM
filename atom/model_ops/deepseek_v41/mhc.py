@@ -1,0 +1,97 @@
+# SPDX-License-Identifier: MIT
+"""Single-Pass mHC math; incoming pre-mix belongs to the previous sublayer."""
+
+from dataclasses import dataclass
+
+import torch
+import torch.nn.functional as F
+
+from atom.model_ops.sparse_attn_v4 import hc_split_sinkhorn
+
+
+@dataclass(frozen=True)
+class SinglePassHCState:
+    residual: torch.Tensor
+    pre_mix: torch.Tensor
+
+    @classmethod
+    def from_embeddings(cls, hidden: torch.Tensor, hc_mult: int):
+        residual = (
+            hidden.unsqueeze(-2)
+            .expand(*hidden.shape[:-1], hc_mult, hidden.shape[-1])
+            .contiguous()
+        )
+        pre_mix = torch.zeros(
+            (*hidden.shape[:-1], hc_mult), dtype=torch.float32, device=hidden.device
+        )
+        pre_mix[..., 0] = 1
+        return cls(residual, pre_mix)
+
+    def collapse(self):
+        return (
+            (self.residual.float() * self.pre_mix.unsqueeze(-1))
+            .sum(-2)
+            .to(self.residual.dtype)
+        )
+
+
+def predict_mixes(
+    residual,
+    hc_fn,
+    hc_scale,
+    hc_base,
+    *,
+    norm_eps=1e-20,
+    sinkhorn_eps=1e-6,
+    sinkhorn_iters=20,
+):
+    """Predict next pre-mix and current post/comb, preserving FP32 hc_fn."""
+    if (
+        hc_fn.dtype != torch.float32
+        or hc_scale.dtype != torch.float32
+        or hc_base.dtype != torch.float32
+    ):
+        raise ValueError("mHC coefficients must retain their FP32 checkpoint dtype")
+    flat = residual.flatten(-2).float()
+    norm = torch.rsqrt(flat.square().mean(-1, keepdim=True) + norm_eps)
+    mixes = F.linear(flat, hc_fn) * norm
+    return hc_split_sinkhorn(
+        mixes, hc_scale, hc_base, residual.shape[-2], sinkhorn_iters, sinkhorn_eps
+    )
+
+
+def expand_residual(sublayer_output, residual, post_mix, combination):
+    """combination[..., input_stream, output_stream], with FP32 accumulation."""
+    mixed = (combination.unsqueeze(-1) * residual.float().unsqueeze(-2)).sum(-3)
+    return (mixed + post_mix.unsqueeze(-1) * sublayer_output.float().unsqueeze(-2)).to(
+        sublayer_output.dtype
+    )
+
+
+def apply_sublayer(
+    state,
+    sublayer,
+    hc_fn,
+    hc_scale,
+    hc_base,
+    *,
+    norm_eps=1e-20,
+    sinkhorn_eps=1e-6,
+    sinkhorn_iters=20,
+):
+    """Run one attention/FFN callable; its pre-mix is used by the next callable.
+
+    The callable owns its input RMSNorm and operation. Engram updates residual
+    before this boundary and must retain the incoming state's pre_mix.
+    """
+    pre, post, comb = predict_mixes(
+        state.residual,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        norm_eps=norm_eps,
+        sinkhorn_eps=sinkhorn_eps,
+        sinkhorn_iters=sinkhorn_iters,
+    )
+    output = sublayer(state.collapse())
+    return SinglePassHCState(expand_residual(output, state.residual, post, comb), pre)

@@ -75,6 +75,8 @@ class LayerQuantConfig:
     quant_method: str | None = None
     # Source weight blocks, distinct from the activation grouping in QuantType.
     weight_block_size: tuple[int, int] | None = None
+    # An explicit activation contract, e.g. native W4A8 rather than W4A4.
+    activation_dtype: Any = None
 
     @property
     def is_quantized(self) -> bool:

@@ -9,17 +9,20 @@ import numpy as np
 import pytest
 import torch
 
-from atom.model_ops.engram import (
-    EngramConfig,
+from atom.model_engine.engram_runtime import (
     EngramHost,
     EngramPrefetchCache,
     EngramPrefetcher,
-    HostEmbeddingTable,
+    EngramRequest,
+)
+from atom.model_ops.engram import (
+    EngramConfig,
     NgramHashMapping,
     _is_prime,
     _next_prime,
 )
 from atom.model_ops.engram_layer import EngramOp
+from atom.model_ops.engram_lookup import HostEmbeddingTable
 
 # The engram block of deepseek-ai/DeepSeek-V4.1-Flash config.json -> text_config.
 V41_FLASH = {
@@ -223,30 +226,44 @@ def test_host_table_rejects_wrong_shape():
         HostEmbeddingTable(torch.zeros(8, 5), num_rows=8, head_dim=4)
 
 
+def request(
+    seq_id,
+    tokens=(3,),
+    *,
+    position=0,
+    generation=0,
+    history=(-1, -1),
+    token_mask=None,
+):
+    return EngramRequest(
+        seq_id, generation, position, tuple(tokens), tuple(history), token_mask
+    )
+
+
 def test_cache_evicts_least_recently_used():
     cache = EngramPrefetchCache(capacity=2)
-    cache.put(1, 0, torch.zeros(1))
-    cache.put(2, 0, torch.zeros(1))
-    cache.put(3, 0, torch.zeros(1))
-    assert cache.take(1, 0) is None
-    assert cache.take(3, 0) is not None
+    cache.put(request(1), 0, torch.zeros(1))
+    cache.put(request(2), 0, torch.zeros(1))
+    cache.put(request(3), 0, torch.zeros(1))
+    assert cache.take(request(1), 0) is None
+    assert cache.take(request(3), 0) is not None
 
 
 def test_cache_take_is_destructive():
     cache = EngramPrefetchCache()
-    cache.put(4, 1, torch.zeros(1))
-    assert cache.take(4, 1) is not None
-    assert cache.take(4, 1) is None
+    cache.put(request(4), 1, torch.zeros(1))
+    assert cache.take(request(4), 1) is not None
+    assert cache.take(request(4), 1) is None
 
 
 def test_cache_drop_forgets_every_layer_of_a_request():
     cache = EngramPrefetchCache()
-    cache.put(5, 0, torch.zeros(1))
-    cache.put(5, 2, torch.zeros(1))
-    cache.put(6, 0, torch.zeros(1))
+    cache.put(request(5), 0, torch.zeros(1))
+    cache.put(request(5), 2, torch.zeros(1))
+    cache.put(request(6), 0, torch.zeros(1))
     cache.drop(5)
-    assert cache.take(5, 0) is None and cache.take(5, 2) is None
-    assert cache.take(6, 0) is not None
+    assert cache.take(request(5), 0) is None and cache.take(request(5), 2) is None
+    assert cache.take(request(6), 0) is not None
 
 
 def make_prefetcher() -> EngramPrefetcher:
@@ -268,8 +285,9 @@ def test_prefetch_result_equals_inline_compute():
     pf = make_prefetcher()
     seq_ids = [11, 12]
     ids = np.array([[3, 4, 5], [6, 7, 8]], dtype=np.int64)
-    expected = pf.compute(seq_ids, ids)
-    assert pf.submit_compute(seq_ids, ids).result(timeout=30) is None
+    requests = [request(seq, tokens) for seq, tokens in zip(seq_ids, ids)]
+    expected = pf.compute(requests)
+    assert pf.submit_compute(requests).result(timeout=30) is None
     assert pf.wait(timeout=30)
     for (seq_id, layer_id), value in expected.items():
         torch.testing.assert_close(pf.cache.take(seq_id, layer_id), value)
@@ -278,7 +296,7 @@ def test_prefetch_result_equals_inline_compute():
 
 def test_prefetch_drop_requests_clears_cache():
     pf = make_prefetcher()
-    pf.submit_compute([21], np.array([[1, 2, 3]], dtype=np.int64)).result(timeout=30)
+    pf.submit_compute([request(21, (1, 2, 3))]).result(timeout=30)
     pf.drop_requests([21])
     assert len(pf.cache) == 0
     pf.shutdown()
@@ -384,6 +402,7 @@ def make_runtime() -> EngramHost:
         num_hash_heads=cfg.num_hash_heads,
         head_dim=8,
         device=torch.device("cpu"),
+        dtype=torch.float32,
     )
 
 
@@ -391,8 +410,9 @@ def test_runtime_stage_uses_prefetched_rows():
     rt = make_runtime()
     seq_ids = [31, 32]
     tokens = np.array([[5], [6]], dtype=np.int64)
-    rt.prefetch_next(seq_ids, tokens)
-    assert rt.stage_embeddings(seq_ids, tokens) == 2
+    requests = [request(seq, ids) for seq, ids in zip(seq_ids, tokens)]
+    rt.prefetch(requests).result(timeout=30)
+    assert rt.stage_embeddings(requests) == 2
     for layer_id in rt.layer_ids:
         assert rt.embeddings(layer_id).shape == (2, rt.embed_width)
     rt.shutdown()
@@ -403,30 +423,29 @@ def test_runtime_stage_recomputes_on_prefetch_miss():
     rt = make_runtime()
     seq_ids = [41]
     tokens = np.array([[9]], dtype=np.int64)
-    rt.prefetch_next(seq_ids, tokens)
-    rt.stage_embeddings(seq_ids, tokens)
+    requests = [request(seq, ids) for seq, ids in zip(seq_ids, tokens)]
+    rt.prefetch(requests).result(timeout=30)
+    rt.stage_embeddings(requests)
     warm = {lid: rt.embeddings(lid).clone() for lid in rt.layer_ids}
 
     cold = make_runtime()
-    cold.stage_embeddings(seq_ids, tokens)  # nothing prefetched
+    cold.stage_embeddings(requests)  # nothing prefetched
     for layer_id in cold.layer_ids:
         torch.testing.assert_close(cold.embeddings(layer_id), warm[layer_id])
     rt.shutdown()
     cold.shutdown()
 
 
-def test_runtime_stage_without_tokens_on_miss_is_an_error():
-    rt = make_runtime()
-    with pytest.raises(RuntimeError, match="no token ids were supplied"):
-        rt.stage_embeddings([51], None)
-    rt.shutdown()
+def test_runtime_rejects_empty_lookup_snapshot():
+    with pytest.raises(ValueError, match="needs tokens"):
+        request(51, ())
 
 
 def test_runtime_rejects_more_rows_than_capacity():
     rt = make_runtime()
     ids = list(range(9))
     with pytest.raises(ValueError, match="exceeds staging capacity"):
-        rt.stage_embeddings(ids, np.zeros((9, 1), dtype=np.int64))
+        rt.stage_embeddings([request(seq) for seq in ids])
     rt.shutdown()
 
 
@@ -452,3 +471,85 @@ def test_host_table_rejects_mismatched_scale():
         HostEmbeddingTable(torch.ones(4, 8), 4, 8, scale=torch.ones(3, 2))
     with pytest.raises(ValueError, match="not divisible"):
         HostEmbeddingTable(torch.ones(4, 8), 4, 8, scale=torch.ones(4, 3))
+
+
+def test_ragged_prefill_stages_all_history_aware_rows_and_padding():
+    rt = make_runtime()
+    requests = [
+        request(71, (5, 6, 7), position=3, history=(3, 4)),
+        request(72, (9, 10), position=4, history=(-1, 8), token_mask=(False, True)),
+    ]
+    rt.prefetch(requests).result(timeout=30)
+    assert rt.stage_embeddings(requests, padded_rows=8) == 8
+    mapping = rt.prefetcher._hash_mapping
+    for layer in rt.layer_ids:
+        # Compute hashes over the whole prefix independently of snapshot history.
+        expected = []
+        for req in requests:
+            ids = np.array([req.history + req.token_ids])
+            mask = np.array(
+                [
+                    [True] * len(req.history)
+                    + list(req.token_mask or (True,) * len(req.token_ids))
+                ]
+            )
+            hashes = mapping.hash_layer(ids, layer, compress=False, token_mask=mask)[
+                :, len(req.history) :
+            ]
+            rows = mapping.to_row_indices(hashes, layer)
+            expected.append(
+                rt.prefetcher._tables[layer].gather(rows).reshape(-1, rt.embed_width)
+            )
+        torch.testing.assert_close(rt.embeddings(layer)[:5], torch.cat(expected))
+        assert torch.count_nonzero(rt.embeddings(layer)[5:]) == 0
+    rt.shutdown()
+
+
+def test_cache_identity_covers_history_position_generation_and_tentative_tokens():
+    from dataclasses import replace
+
+    cache = EngramPrefetchCache()
+    original = request(7)
+    for changed in (
+        replace(original, history=(1, 2, 3)),
+        replace(original, position=1),
+        replace(original, generation=1),
+        replace(original, token_ids=(4,)),
+        replace(original, token_mask=(False,)),
+    ):
+        cache.put(original, 1, torch.ones(1))
+        assert cache.take(changed, 1) is None
+        assert cache.take(original, 1) is not None
+
+
+def test_drop_during_prefetch_cannot_repopulate_recycled_request(monkeypatch):
+    import threading
+
+    pf = make_prefetcher()
+    entered, release = threading.Event(), threading.Event()
+    compute = pf.compute
+
+    def delayed(requests):
+        entered.set()
+        assert release.wait(30)
+        return compute(requests)
+
+    monkeypatch.setattr(pf, "compute", delayed)
+    future = pf.submit_compute([request(7)])
+    try:
+        assert entered.wait(30)
+        pf.drop_requests([7])
+        release.set()
+        future.result(timeout=30)
+        assert len(pf.cache) == 0
+    finally:
+        release.set()
+        pf.shutdown()
+
+
+def test_staging_rejects_padding_that_truncates_or_exceeds_capacity():
+    rt = make_runtime()
+    for padded in (2, 9):
+        with pytest.raises(ValueError, match="staging capacity"):
+            rt.stage_embeddings([request(7, (1, 2, 3))], padded_rows=padded)
+    rt.shutdown()

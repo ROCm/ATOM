@@ -1,14 +1,8 @@
-"""Engram: n-gram hash -> multi-head embedding lookup, computed on the host.
+# SPDX-License-Identifier: MIT
+"""Engram configuration, tokenizer compression and n-gram hashing.
 
-DeepSeek's Engram (https://github.com/deepseek-ai/Engram) augments a few decoder
-layers with a lookup into very large n-gram embedding tables. The tables cannot
-live in HBM -- DeepSeek-V4.1-Flash carries two of them, 384,006,168 and
-384,016,682 rows of 256 fp8 values, ~101.5 GB each -- so the lookup runs on the
-host and its result is staged into a pinned buffer and copied to the device on a
-side stream, overlapped with the previous step's GPU work.
-
-The hashing here reproduces the reference implementation (engram_demo_v1.py)
-exactly; anything else silently indexes the wrong rows of a trained table.
+Derived from ROCm/ATOM PR #2185. Table residency and asynchronous staging live
+in engram_lookup and model_engine.engram_runtime, respectively.
 """
 
 from __future__ import annotations
@@ -16,16 +10,11 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
-import threading
 import zipfile
-from collections import OrderedDict
-from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import torch
 
 logger = logging.getLogger(__name__)
 
@@ -283,508 +272,120 @@ class NgramHashMapping:
                 )
         return sizes
 
-    def hash_layer(
-        self, input_ids: np.ndarray, layer_id: int, compress: bool = True
-    ) -> np.ndarray:
-        """Hash ids for one layer, shape [B, T, num_hash_heads].
+    def compress_tokens(self, input_ids, token_mask=None):
+        tokens = self.tokenizer(input_ids)
+        if tokens.ndim == 1:
+            tokens = tokens[None, :]
+        if tokens.ndim != 2:
+            raise ValueError("Engram token IDs must have shape [batch, tokens]")
+        if token_mask is not None:
+            mask = np.asarray(token_mask, dtype=bool)
+            if mask.shape != tokens.shape:
+                raise ValueError("Engram token mask must match token IDs")
+            tokens = np.where(mask, tokens, -1)
+        if np.any(tokens < -1):
+            raise ValueError("Only DEAD=-1 is a valid negative compressed token")
+        return tokens
 
-        Only the requested layer is computed. The reference hashes every layer
-        and discards the rest, which doubles the work for a two-layer model.
+    def hash_layer(
+        self, input_ids, layer_id, compress=True, *, history=None, token_mask=None
+    ):
+        """Hash each query with up to three prior compressed IDs/DEAD markers.
+
+        History is compressed already. DEAD stops the entire lookback, including
+        for an image query itself; every blocked position contributes pad_id.
+        This computes the requested layer only and never mutates request state.
         """
         x = (
-            self.tokenizer(input_ids)
+            self.compress_tokens(input_ids, token_mask)
             if compress
             else np.asarray(input_ids, dtype=np.int64)
         )
         if x.ndim == 1:
             x = x[None, :]
-        _, seq_len = x.shape
-
+        if not compress and token_mask is not None:
+            mask = np.asarray(token_mask, dtype=bool)
+            if mask.shape != x.shape:
+                raise ValueError("Engram token mask must match token IDs")
+            x = np.where(mask, x, -1)
+        if x.ndim != 2 or np.any(x < -1):
+            raise ValueError("Expected compressed [batch, tokens] IDs or DEAD=-1")
+        width = self.config.max_ngram_size - 1
+        if history is None:
+            history = np.full((x.shape[0], width), -1, dtype=np.int64)
+        history = np.asarray(history, dtype=np.int64)
+        if history.shape != (x.shape[0], width) or np.any(history < -1):
+            raise ValueError(f"Engram history must have shape [batch, {width}]")
+        combined = np.concatenate((history, x), axis=1)
+        positions = width + np.arange(x.shape[1])
+        blocked = np.zeros_like(x, dtype=bool)
+        rolling = np.zeros_like(x)
+        pieces = []
         multipliers = self.layer_multipliers[layer_id]
-        head_sizes = self.head_vocab_sizes[layer_id]
+        for shift in range(self.config.max_ngram_size):
+            source = combined[:, positions - shift]
+            blocked |= source == -1
+            token = np.where(blocked, self.pad_id, source)
+            rolling ^= token * multipliers[shift]
+            if shift:
+                begin = (shift - 1) * self.config.n_heads
+                sizes = self.head_vocab_sizes[layer_id][
+                    begin : begin + self.config.n_heads
+                ]
+                pieces.append(rolling[..., None] % sizes)
+        return np.concatenate(pieces, axis=-1)
 
-        # shifted[k] is the token k positions back, left-padded with pad_id.
-        shifted = [x]
-        for k in range(1, self.config.max_ngram_size):
-            shifted.append(
-                np.pad(
-                    x, ((0, 0), (k, 0)), mode="constant", constant_values=self.pad_id
-                )[:, :seq_len]
-            )
-
-        out = np.empty(
-            (x.shape[0], seq_len, self.config.num_hash_heads), dtype=np.int64
-        )
-        head = 0
-        for order_idx, n in enumerate(self.config.ngram_orders):
-            mix = shifted[0] * multipliers[0]
-            for k in range(1, n):
-                mix = np.bitwise_xor(mix, shifted[k] * multipliers[k])
-            base = order_idx * self.config.n_heads
-            for j in range(self.config.n_heads):
-                out[:, :, head] = mix % int(head_sizes[base + j])
-                head += 1
-        return out
-
-    def hash_all_layers(self, input_ids: np.ndarray) -> dict[int, np.ndarray]:
-        compressed = self.tokenizer(input_ids)
+    def hash_all_layers(self, input_ids, *, history=None, token_mask=None):
+        compressed = self.compress_tokens(input_ids, token_mask)
         return {
-            layer_id: self.hash_layer(compressed, layer_id, compress=False)
+            layer_id: self.hash_layer(
+                compressed, layer_id, compress=False, history=history
+            )
             for layer_id in self.config.layer_ids
         }
+
+    def advance_history(self, history, compressed_tokens, accepted_lengths=None):
+        """Return the last compressed IDs after each accepted prefix only.
+
+        Used by lifecycle code; tentative/rejected tokens never mutate history.
+        No full-sequence token cache is required by the hash algorithm.
+        """
+        tokens = np.asarray(compressed_tokens, dtype=np.int64)
+        if tokens.ndim != 2:
+            raise ValueError("Expected [batch, tokens] compressed IDs")
+        batch, count = tokens.shape
+        width = self.config.max_ngram_size - 1
+        if history is None:
+            history = np.full((batch, width), -1, dtype=np.int64)
+        history = np.asarray(history, dtype=np.int64)
+        if history.shape != (batch, width):
+            raise ValueError(f"Engram history must have shape [batch, {width}]")
+        lengths = (
+            np.full(batch, count)
+            if accepted_lengths is None
+            else np.asarray(accepted_lengths)
+        )
+        if (
+            lengths.shape != (batch,)
+            or not np.issubdtype(lengths.dtype, np.integer)
+            or np.any(lengths < 0)
+            or np.any(lengths > count)
+        ):
+            raise ValueError(
+                "Accepted lengths must describe prefixes of this token batch"
+            )
+        combined = np.concatenate((history, tokens), axis=1)
+        return (
+            np.stack(
+                [
+                    combined[row, length : length + width]
+                    for row, length in enumerate(lengths)
+                ]
+            )
+            if batch
+            else history.copy()
+        )
 
     def to_row_indices(self, hash_ids: np.ndarray, layer_id: int) -> np.ndarray:
         """Fold per-head hashes into absolute row indices of the layer's table."""
         return hash_ids + self.head_offsets[layer_id][None, None, :]
-
-
-# ---------------------------------------------------------------------------
-# Host-resident tables and the prefetch that hides them (was engram_host.py).
-# ---------------------------------------------------------------------------
-
-
-class HostEmbeddingTable:
-    """One engram layer's table, memory-mapped and gathered row-wise.
-
-    The reference keeps the table as a float32 numpy array, which for this model
-    would be 393 GB per layer -- 786 GB of host RAM for the pair, before any
-    staging buffer. Rows are kept in their stored dtype and converted only after
-    the gather, so the resident cost is the page cache the OS chooses to keep.
-    """
-
-    def __init__(
-        self,
-        tensor: torch.Tensor,
-        num_rows: int,
-        head_dim: int,
-        scale: torch.Tensor | None = None,
-    ):
-        if tensor.shape[0] != num_rows:
-            raise ValueError(f"table has {tensor.shape[0]} rows, expected {num_rows}")
-        if tensor.shape[1] != head_dim:
-            raise ValueError(
-                f"table row is {tensor.shape[1]} wide, expected {head_dim}"
-            )
-        self._tensor = tensor
-        self.num_rows = num_rows
-        self.head_dim = head_dim
-        self._scale = scale
-        self.block_size = 0
-        if scale is not None:
-            # gather() does `scale.to(float32)`; that decodes 2**(code-127) only
-            # for a float8 E8M0 dtype. A raw uint8 exponent-code table would be
-            # read as plain magnitudes (~127x off), so fail loud instead.
-            if not scale.is_floating_point():
-                raise ValueError(
-                    f"engram block scale must be a float8 (E8M0) dtype, got "
-                    f"{scale.dtype}"
-                )
-            if scale.shape[0] != num_rows:
-                raise ValueError(
-                    f"scale has {scale.shape[0]} rows, expected {num_rows}"
-                )
-            if head_dim % scale.shape[1]:
-                raise ValueError(
-                    f"head_dim {head_dim} is not divisible by {scale.shape[1]} "
-                    f"scale blocks"
-                )
-            self.block_size = head_dim // scale.shape[1]
-
-    @property
-    def dtype(self) -> torch.dtype:
-        return self._tensor.dtype
-
-    def gather(
-        self, row_indices: np.ndarray, out_dtype: torch.dtype = torch.float32
-    ) -> torch.Tensor:
-        """Gather rows named by `row_indices` ([...] ints) -> [..., head_dim].
-
-        Out-of-range indices are a bug in the hash layout rather than something
-        to clamp away quietly: a clamp turns a wrong table into plausible
-        numbers, which is far harder to notice than an exception.
-        """
-        flat = np.ascontiguousarray(row_indices.reshape(-1))
-        if flat.size and (flat.min() < 0 or flat.max() >= self.num_rows):
-            raise IndexError(
-                f"engram row index out of range: [{flat.min()}, {flat.max()}] "
-                f"not within [0, {self.num_rows})"
-            )
-        index = torch.from_numpy(flat)
-        # One fancy-index over the whole batch, not a row at a time: measured on
-        # the real table that is ~0.9 us/row against ~8 us/row for a Python loop.
-        # PyTorch 2.9 has no CPU advanced-index kernel for float8. Gather the
-        # stored bytes first, then reinterpret only the selected rows.
-        rows = self._gather_rows(self._tensor, index).to(out_dtype)
-        if self._scale is not None:
-            # Block-quantized: each scale covers `block_size` consecutive values
-            # of a row. Skipping this does not fail, it returns values two orders
-            # of magnitude off, so it is not optional.
-            scale = self._gather_rows(self._scale, index).to(out_dtype)
-            rows = (
-                rows.reshape(-1, scale.shape[1], self.block_size) * scale.unsqueeze(-1)
-            ).reshape(-1, self.head_dim)
-        return rows.reshape(*row_indices.shape, self.head_dim)
-
-    @staticmethod
-    def _gather_rows(tensor: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
-        if tensor.element_size() == 1:
-            return tensor.view(torch.uint8)[index].view(tensor.dtype)
-        return tensor[index]
-
-
-class EngramPrefetchCache:
-    """Bounded per-request store of prefetched embeddings.
-
-    The reference uses an unbounded module-level dict keyed by sequence id and
-    never removes anything, so a long-running server accumulates one entry per
-    request served. This is an LRU with an explicit `drop` for finished
-    requests, and it is the only shared state between the worker and the runner.
-    """
-
-    def __init__(self, capacity: int = 4096):
-        self._capacity = capacity
-        self._lock = threading.Lock()
-        self._store: OrderedDict[tuple[int, int], torch.Tensor] = OrderedDict()
-
-    def put(self, seq_id: int, layer_id: int, value: torch.Tensor) -> None:
-        with self._lock:
-            key = (seq_id, layer_id)
-            self._store[key] = value
-            self._store.move_to_end(key)
-            while len(self._store) > self._capacity:
-                self._store.popitem(last=False)
-
-    def take(self, seq_id: int, layer_id: int) -> torch.Tensor | None:
-        with self._lock:
-            return self._store.pop((seq_id, layer_id), None)
-
-    def contains(self, seq_id: int, layer_id: int) -> bool:
-        """Non-destructive probe. `take` consumes, so miss detection needs this."""
-        with self._lock:
-            return (seq_id, layer_id) in self._store
-
-    def drop(self, seq_id: int) -> None:
-        """Forget everything for a finished request."""
-        with self._lock:
-            for key in [k for k in self._store if k[0] == seq_id]:
-                del self._store[key]
-
-    def __len__(self) -> int:
-        with self._lock:
-            return len(self._store)
-
-
-class EngramPrefetcher:
-    """Runs hash + host gather for the next step while the GPU works on this one.
-
-    One worker thread, not a thread per step: the work is numpy and torch gather
-    which release the GIL, and an unbounded thread-per-step (as in the reference)
-    both races with its own consumer and contends with the runner for the GIL.
-
-    `submit` returns a Future so the consumer can wait for a specific step rather
-    than hoping the daemon finished. When the result is not ready in time the
-    caller computes it inline -- correctness never depends on the race.
-    """
-
-    def __init__(
-        self,
-        hash_mapping,
-        tables: dict[int, HostEmbeddingTable],
-        cache_capacity: int = 4096,
-    ):
-        self._hash_mapping = hash_mapping
-        self._tables = tables
-        self.cache = EngramPrefetchCache(cache_capacity)
-        self._pool = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="engram-prefetch"
-        )
-        self._inflight: Future | None = None
-
-    @property
-    def layer_ids(self) -> tuple[int, ...]:
-        return self._hash_mapping.config.layer_ids
-
-    def compute(
-        self, seq_ids: list[int], token_ids: np.ndarray
-    ) -> dict[tuple[int, int], torch.Tensor]:
-        """Hash `token_ids` ([B, T]) and gather, for every engram layer."""
-        results: dict[tuple[int, int], torch.Tensor] = {}
-        compressed = self._hash_mapping.tokenizer(token_ids)
-        for layer_id in self.layer_ids:
-            hashes = self._hash_mapping.hash_layer(compressed, layer_id, compress=False)
-            rows = self._hash_mapping.to_row_indices(hashes, layer_id)
-            gathered = self._tables[layer_id].gather(rows)
-            for i, seq_id in enumerate(seq_ids):
-                results[(seq_id, layer_id)] = gathered[i]
-        return results
-
-    def submit_compute(
-        self,
-        seq_ids: list[int],
-        token_ids: np.ndarray | None = None,
-        *,
-        token_source: Callable[[], np.ndarray] | None = None,
-    ) -> Future:
-        """Queue a prefetch. Cheap and non-blocking; the caller keeps going.
-
-        `token_source`, when given, is called ON THE WORKER to produce the ids --
-        it waits on an async device->host copy off the caller's thread, so the
-        token D2H never blocks the compute thread. Otherwise `token_ids` is used
-        directly.
-        """
-
-        def _run() -> None:
-            toks = token_source() if token_source is not None else token_ids
-            for key, value in self.compute(seq_ids, toks).items():
-                self.cache.put(key[0], key[1], value)
-
-        self._inflight = self._pool.submit(_run)
-        return self._inflight
-
-    def wait(self, timeout: float | None = None) -> bool:
-        """Block until the queued prefetch lands. True if it did."""
-        if self._inflight is None:
-            return True
-        try:
-            self._inflight.result(timeout=timeout)
-            return True
-        except TimeoutError:
-            return False
-
-    def drop_requests(self, seq_ids: list[int]) -> None:
-        for seq_id in seq_ids:
-            self.cache.drop(seq_id)
-
-    def shutdown(self) -> None:
-        self._pool.shutdown(wait=False, cancel_futures=True)
-
-
-class EngramHost:
-    """Ties the host prefetch to the device step.
-
-    Ordering per step, with nothing added to the critical path:
-
-      1. the previous step's sampled ids land on the host (the runner already
-         copies them asynchronously and synchronizes before use), and
-         `prefetch_next` queues hash + gather for them on the worker;
-      2. `stage_embeddings` copies whatever the worker produced into a pinned buffer and
-         issues the H2D on a side stream, recording an event;
-      3. `wait_for_embeddings` makes the compute stream wait on that event, so the
-         engram layers read staged rows rather than racing the copy.
-
-    A sequence whose prefetch has not landed is computed inline in `stage_embeddings`. The
-    result is identical either way -- the prefetch only decides whether the work
-    was already done, never what the answer is.
-    """
-
-    def __init__(
-        self,
-        prefetcher: EngramPrefetcher,
-        max_num_tokens: int,
-        num_hash_heads: int,
-        head_dim: int,
-        device: torch.device,
-        dtype: torch.dtype = torch.float32,
-    ):
-        from atom.utils import CpuGpuBuffer
-
-        self.prefetcher = prefetcher
-        self.max_num_tokens = max_num_tokens
-        self.embed_width = num_hash_heads * head_dim
-        self.device = device
-        # pin_memory only on device: a CPU-only build (the unit tests) has no
-        # pinned allocator and would raise on construction.
-        self.buffers = {
-            layer_id: CpuGpuBuffer(
-                max_num_tokens,
-                self.embed_width,
-                dtype=dtype,
-                device=device,
-                pin_memory=device.type == "cuda",
-                with_numpy=False,
-            )
-            for layer_id in prefetcher.layer_ids
-        }
-        # Streams and events exist only on device; the CPU path (unit tests) runs
-        # everything synchronously and leaves them None. `copy_stream`/`copy_done`
-        # carry the staging H2D; `_token_*` carry the async device->host of the
-        # just-sampled token -- the main thread only launches that copy on the
-        # side stream and records the event, and the worker waits on it before
-        # reading, so the per-step token D2H never blocks the compute thread. The
-        # pinned buffer and event are reused: `stage_embeddings` waits on the
-        # worker before the next step can overwrite them.
-        if device.type == "cuda":
-            self.copy_stream = torch.cuda.Stream(device)
-            self.copy_done = torch.cuda.Event()
-            self._token_d2h_stream = torch.cuda.Stream(device)
-            self._token_event = torch.cuda.Event()
-            self._token_host = torch.empty(
-                max_num_tokens, dtype=torch.int64
-            ).pin_memory()
-        else:
-            self.copy_stream = self.copy_done = None
-            self._token_d2h_stream = self._token_event = self._token_host = None
-        self._staged_rows = 0
-
-    @property
-    def layer_ids(self) -> tuple[int, ...]:
-        return self.prefetcher.layer_ids
-
-    def stage_embeddings(
-        self,
-        seq_ids: list[int],
-        token_ids: np.ndarray | None = None,
-        padded_rows: int | None = None,
-    ) -> int:
-        """Fill the staging buffers for `seq_ids`; returns the row count staged.
-
-        `token_ids` is only consulted for sequences the prefetch missed -- the
-        caller passes the cheap host-side source (the scheduler's committed
-        anchor), correct for the just-admitted rows that are the only misses.
-
-        `padded_rows`, when the forward runs a padded rectangle taller than the
-        scheduled rows (a CUDAGraph decode bucket), is that running height. The
-        tail past `len(seq_ids)` is zeroed and staged too, so the engram layers
-        read a matching height (and a defined zero contribution) rather than
-        raising on shape or consuming a stale tail.
-        """
-        num_rows = len(seq_ids)
-        if num_rows > self.max_num_tokens:
-            raise ValueError(
-                f"{num_rows} rows exceeds staging capacity {self.max_num_tokens}"
-            )
-        staged_rows = (
-            num_rows if padded_rows is None else min(padded_rows, self.max_num_tokens)
-        )
-        self.prefetcher.wait(timeout=None)
-
-        # Probe without consuming: a hit still has to be readable by the fill
-        # loop below, which is what makes this `contains` and not `take`.
-        # A seq is a miss unless EVERY layer is cached: entries evict per
-        # (seq, layer), so probing only layer_ids[0] would call a half-evicted
-        # seq a hit and then fail in the take loop below.
-        missing = [
-            i
-            for i, seq_id in enumerate(seq_ids)
-            if any(
-                not self.prefetcher.cache.contains(seq_id, lid)
-                for lid in self.layer_ids
-            )
-        ]
-        computed: dict[tuple[int, int], torch.Tensor] = {}
-        if missing:
-            if token_ids is None:
-                raise RuntimeError(
-                    f"engram prefetch missed {len(missing)} sequences and no token "
-                    f"ids were supplied to recompute them"
-                )
-            miss_ids = [seq_ids[i] for i in missing]
-            computed = self.prefetcher.compute(miss_ids, token_ids[missing])
-
-        for layer_id in self.layer_ids:
-            cpu = self.buffers[layer_id].cpu
-            for row, seq_id in enumerate(seq_ids):
-                value = computed.get((seq_id, layer_id))
-                if value is None:
-                    value = self.prefetcher.cache.take(seq_id, layer_id)
-                if value is None:
-                    raise RuntimeError(
-                        f"no engram embedding for seq {seq_id} layer {layer_id}"
-                    )
-                cpu[row].copy_(value.reshape(-1)[: self.embed_width])
-            # Zero the padded tail so the graph/eager forward reads a fresh zero
-            # contribution there rather than the previous step's rows.
-            if staged_rows > num_rows:
-                cpu[num_rows:staged_rows].zero_()
-
-        if self.copy_stream is not None:
-            # Capture the compute stream BEFORE entering the copy_stream context:
-            # inside it `current_stream()` would return copy_stream, making the
-            # wait a no-op self-wait that fails to order the H2D after the
-            # previous forward's reads of these buffers.
-            compute_stream = torch.cuda.current_stream(self.device)
-            with torch.cuda.stream(self.copy_stream):
-                self.copy_stream.wait_stream(compute_stream)
-                for buffer in self.buffers.values():
-                    buffer.copy_to_gpu(staged_rows)
-                self.copy_done.record(self.copy_stream)
-        else:
-            for buffer in self.buffers.values():
-                buffer.copy_to_gpu(staged_rows)
-        self._staged_rows = staged_rows
-        return staged_rows
-
-    def stage_dummy(self, num_rows: int) -> int:
-        """Stage zeros for a warmup or capture pass.
-
-        A dummy forward has no real sequences to look up, but it still runs the
-        engram layers, so the buffers have to be the right size and the H2D has
-        to happen -- warmup exists to touch exactly this path. Zeros keep the
-        shapes honest without inventing token ids.
-        """
-        num_rows = min(int(num_rows), self.max_num_tokens)
-        for buffer in self.buffers.values():
-            buffer.cpu[:num_rows].zero_()
-        if self.copy_stream is not None:
-            # Capture the compute stream BEFORE entering the copy_stream context:
-            # inside it `current_stream()` would return copy_stream, making the
-            # wait a no-op self-wait that fails to order the H2D after the
-            # previous forward's reads of these buffers.
-            compute_stream = torch.cuda.current_stream(self.device)
-            with torch.cuda.stream(self.copy_stream):
-                self.copy_stream.wait_stream(compute_stream)
-                for buffer in self.buffers.values():
-                    buffer.copy_to_gpu(num_rows)
-                self.copy_done.record(self.copy_stream)
-        else:
-            for buffer in self.buffers.values():
-                buffer.copy_to_gpu(num_rows)
-        self._staged_rows = num_rows
-        return num_rows
-
-    def wait_for_embeddings(self) -> None:
-        """Order the compute stream behind the staging H2D."""
-        if self.copy_done is not None:
-            torch.cuda.current_stream(self.device).wait_event(self.copy_done)
-
-    def embeddings(self, layer_id: int) -> torch.Tensor:
-        """Staged rows for one layer, [staged_rows, num_hash_heads * head_dim]."""
-        return self.buffers[layer_id].gpu[: self._staged_rows]
-
-    def prefetch_next(self, seq_ids: list[int], tokens) -> None:
-        """Queue the next step's hash + gather for the just-sampled tokens.
-
-        `tokens` is this step's sampled ids ([N] or [N, T]) -- the next step's
-        model input. On device the last id per row is copied to the host
-        ASYNCHRONOUSLY on a side stream, and the worker waits on a CUDA event
-        before reading it, so the main thread never blocks on the D2H. A host
-        array (tests) is submitted directly.
-        """
-        n = len(seq_ids)
-        if not n:
-            return
-        if torch.is_tensor(tokens) and tokens.is_cuda:
-            col = tokens.detach().reshape(n, -1)[:, -1].to(torch.int64)
-            self._token_d2h_stream.wait_stream(torch.cuda.current_stream(self.device))
-            with torch.cuda.stream(self._token_d2h_stream):
-                self._token_host[:n].copy_(col, non_blocking=True)
-            # Keep `col` from being recycled by the allocator until the side
-            # stream's copy has consumed it.
-            col.record_stream(self._token_d2h_stream)
-            self._token_event.record(self._token_d2h_stream)
-            event, host = self._token_event, self._token_host
-
-            def _read() -> np.ndarray:
-                event.synchronize()
-                return np.array(host[:n]).reshape(n, 1)
-
-            self.prefetcher.submit_compute(seq_ids, token_source=_read)
-        else:
-            token_ids = np.asarray(tokens).reshape(n, -1)[:, -1:].astype(np.int64)
-            self.prefetcher.submit_compute(seq_ids, token_ids)
-
-    def drop_requests(self, seq_ids: list[int]) -> None:
-        self.prefetcher.drop_requests(seq_ids)
-
-    def shutdown(self) -> None:
-        self.prefetcher.shutdown()

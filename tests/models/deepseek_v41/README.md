@@ -27,3 +27,12 @@ skip. The checkpoint check validates all 48 headers, the complete 96085-tensor
 index, contiguous offsets, exact file sizes, readable final pages, and available
 download revision metadata. It does not checksum the 475 GiB tensor payload.
 Use `lm_eval` for model accuracy once the ATOM model is executable.
+
+
+P03 compares Single-Pass mHC, router, weighted SwiGLU, and Engram residual math
+with the pinned upstream methods. Tests cover native GPU W4A8 experts and FP8
+Engram projection, actual layer-1 table rows/projection weights, and official
+tokenizer hashes across chunks, image boundaries and accepted prefix lengths.
+Prefetch and fallback row IDs both match that official history oracle. Request
+snapshot identity, ragged staging, padding, and cancellation are covered in
+`tests/model_ops/test_engram.py`. This remains module-level validation.

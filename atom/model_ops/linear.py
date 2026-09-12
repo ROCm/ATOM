@@ -519,11 +519,17 @@ class LinearBase(nn.Module):
             self.register_parameter("bias", None)
         self.quant_type = quant_type
         self.params_dtype = params_dtype
-        self.native_fp8_group_rows = None
-        if (
+        self.native_a8_group_rows = None
+        native_fp8 = (
             params_dtype == torch.float8_e4m3fn
             and layer_quant_config.weight_block_size in ((1, 32), (32, 32))
-        ):
+        )
+        native_w4a8 = (
+            params_dtype == torch.float4_e2m1fn_x2
+            and layer_quant_config.activation_dtype == torch.float8_e4m3fn
+            and layer_quant_config.weight_block_size == (1, 32)
+        )
+        if native_fp8 or native_w4a8:
             if (
                 quant_type != QuantType.per_1x32
                 or self.source_quant_dtype is not None
@@ -531,15 +537,14 @@ class LinearBase(nn.Module):
                 or getattr(quant_config, "online_quant", False)
             ):
                 raise ValueError(
-                    "Native group32 FP8 requires dynamic A8 and native weights"
+                    "Native group32 A8 requires dynamic activations and native weights"
                 )
-            self.native_fp8_group_rows = layer_quant_config.weight_block_size[0]
+            self.native_a8_group_rows = layer_quant_config.weight_block_size[0]
             if self.input_size % 32 or any(
-                size % self.native_fp8_group_rows
-                for size in self.output_partition_sizes
+                size % self.native_a8_group_rows for size in self.output_partition_sizes
             ):
                 raise ValueError(
-                    "TP partitions must align with the native FP8 source blocks"
+                    "TP partitions must align with the native source blocks"
                 )
 
         if quant_type != QuantType.No and self.source_quant_dtype is None:
@@ -586,7 +591,7 @@ class LinearBase(nn.Module):
             elif quant_type == QuantType.per_1x32:
                 self.weight_scale = atom_parameter(
                     torch.empty(
-                        self.output_size // (self.native_fp8_group_rows or 1),
+                        self.output_size // (self.native_a8_group_rows or 1),
                         (self.input_size + 31) // 32,
                         dtype=dtypes.fp8_e8m0,
                         device=param_device,
@@ -609,8 +614,8 @@ class LinearBase(nn.Module):
     @property
     def weight_scale_row_group(self) -> int:
         """Number of weight rows represented by one row of source scales."""
-        if self.native_fp8_group_rows is not None:
-            return self.native_fp8_group_rows
+        if self.native_a8_group_rows is not None:
+            return self.native_a8_group_rows
         return 128 if self.quant_type == QuantType.per_1x128 else 1
 
     @staticmethod
@@ -824,7 +829,7 @@ class LinearBase(nn.Module):
 
     def process_weights_after_loading(self):
         # The native group32 kernel consumes checkpoint bytes and compact scales.
-        if self.native_fp8_group_rows is not None:
+        if self.native_a8_group_rows is not None:
             return
         if self.weight.numel() == 0:
             return
@@ -1002,7 +1007,7 @@ class LinearBase(nn.Module):
             "Linear out= requested but this quant path does not support it "
             f"(quant_type={self.quant_type})."
         )
-        if self.native_fp8_group_rows is not None:
+        if self.native_a8_group_rows is not None:
             from atom.model_ops.blockscale import native_quant_linear
 
             y = native_quant_linear(
@@ -1010,7 +1015,7 @@ class LinearBase(nn.Module):
                 self.weight,
                 self.weight_scale,
                 x_scale=x_scale,
-                weight_group_rows=self.native_fp8_group_rows,
+                weight_group_rows=self.native_a8_group_rows,
                 dtype=otype,
             )
             if self.bias is not None:
@@ -1263,8 +1268,7 @@ class ColumnParallelLinear(LinearBase):
                     requires_grad=False,
                 )
             elif (
-                self.quant_type == QuantType.per_Token
-                or self.native_fp8_group_rows == 1
+                self.quant_type == QuantType.per_Token or self.native_a8_group_rows == 1
             ):
                 view.weight_scale = nn.Parameter(
                     ws.data.narrow(0, start, length), requires_grad=False
