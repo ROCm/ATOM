@@ -24,8 +24,8 @@ Related guides: [`Kimi-K3.md`](Kimi-K3.md) (generic serving / GSM8K),
 | Band | CONC | Serving defaults |
 |---|---|---|
 | Interactive | 1, 2, 4 | TP8, **DCP=1**, DSpark **7**, synthetic AL **3.84**, GPU prefix cache only (no LMCache). CUDA-graph capture grows with `2 * CONC * 8`. |
-| Mid | 8, 12, 16 | TP8, **DCP=8**, DSpark **3**, synthetic AL **3.00**, LMCache **128 GiB**. C8/C12 use `max-num-batched-tokens 4096`; C16 uses 8192. |
-| Throughput | 32, 40, 56, 64 | TP8, **DCP=8**, **no spec**, LMCache on. C32/C40 use 128 GiB; C56/C64 use **192 GiB** and a larger `max-num-seqs` so the in-flight window can track `2 * CONC`. |
+| Mid | 8, 12, 14, 16 | TP8, **DCP=8**, DSpark **3**, synthetic AL **3.00**, LMCache **128 GiB**, `max-num-batched-tokens 8192`. |
+| Throughput | 32, 40, 48, 56, 64 | TP8, **DCP=8**, **no spec**, LMCache on. C32–C48 use 128 GiB; C56/C64 use **192 GiB** and a larger `max-num-seqs` so the in-flight window can track `2 * CONC`. |
 
 The AgentX **client** is the same at every concurrency. Only `--concurrency`
 changes.
@@ -53,22 +53,27 @@ changes.
 
 | CONC | DCP | spec | AL | LMCache | ReplaySSM | `max-num-seqs` | batched tokens | GPU util | `graph_max` |
 |---:|---:|---:|---:|---|---:|---:|---:|---:|---:|
-| 1 | 1 | 7 | 3.84 | off | 0 | 32 | 8192 | 0.88 | 16 |
-| 2 | 1 | 7 | 3.84 | off | 0 | 32 | 8192 | 0.88 | 32 |
-| 4 | 1 | 7 | 3.84 | off | 0 | 32 | 8192 | 0.88 | 64 |
-| 8 | 8 | 3 | 3.00 | 128 GiB | 1 | 32 | 4096 | 0.88 | 64 |
-| 12 | 8 | 3 | 3.00 | 128 GiB | 1 | 24 | 4096 | 0.88 | 96 |
-| 14 | 8 | 3 | 3.00 | 128 GiB | 1 | 32 | 8192 | 0.86 | 128 |
-| 16 | 8 | 3 | 3.00 | 128 GiB | 1 | 32 | 8192 | 0.86 | 128 |
-| 32 | 8 | 0 | — | 128 GiB | 0 | 64 | 8192 | 0.86 | 64 |
-| 40 | 8 | 0 | — | 128 GiB | 0 | 80 | 8192 | 0.86 | 80 |
-| 56 | 8 | 0 | — | **192 GiB** | 0 | **112** | 8192 | 0.86 | 112 |
-| 64 | 8 | 0 | — | **192 GiB** | 0 | **128** | 8192 | 0.86 | 128 |
+| 1 | 1 | 7 | 3.84 | off | 0 | 32 | 8192 | 0.90 | 16 |
+| 2 | 1 | 7 | 3.84 | off | 0 | 32 | 8192 | 0.90 | 32 |
+| 4 | 1 | 7 | 3.84 | off | 0 | 32 | 8192 | 0.90 | 64 |
+| 8 | 8 | 3 | 3.00 | 128 GiB | 1 | 32 | 8192 | 0.90 | 64 |
+| 12 | 8 | 3 | 3.00 | 128 GiB | 1 | 24 | 8192 | 0.90 | 96 |
+| 14 | 8 | 3 | 3.00 | 128 GiB | 1 | 32 | 8192 | 0.90 | 128 |
+| 16 | 8 | 3 | 3.00 | 128 GiB | 1 | 32 | 8192 | 0.90 | 128 |
+| 32 | 8 | 0 | — | 128 GiB | 0 | 64 | 8192 | 0.90 | 64 |
+| 40 | 8 | 0 | — | 128 GiB | 0 | 80 | 8192 | 0.90 | 80 |
+| 48 | 8 | 0 | — | 128 GiB | 0 | 96 | 8192 | 0.90 | 96 |
+| 56 | 8 | 0 | — | **192 GiB** | 0 | **112** | 8192 | 0.90 | 112 |
+| 64 | 8 | 0 | — | **192 GiB** | 0 | **128** | 8192 | 0.90 | 128 |
 
-C8–C40 use 128 GiB LMCache; C56/C64 use **192 GiB**.
-`AITER_REUSE_IDENTICAL_COMM_GROUPS=1` only on C56/C64; every other CONC leaves
-it off. LMCache CPU size is `LMCACHE_MAX_LOCAL_CPU_SIZE`; chunk size is 1024
-tokens.
+C8–C48 use 128 GiB LMCache; C56/C64 use **192 GiB**. LMCache CPU size is
+`LMCACHE_MAX_LOCAL_CPU_SIZE`; chunk size is 1024 tokens.
+
+`AITER_REUSE_IDENTICAL_COMM_GROUPS=1` on **every DCP=8 band** (C8…C64), and `0`
+on the DCP=1 bands (C1/C2/C4). Enabling it at C32/C40/C48 is what a 12-point
+MI355X sweep measured as a gain; on C1 a separate A/B measured it *costing*
+3.3–3.9% ITL, which is why the DCP=1 bands leave it off. The C8–C16 bands are
+still under A/B and may move; C56/C64 are unchanged from the original table.
 
 ## 0. Container prerequisites
 
@@ -127,6 +132,11 @@ export AITER_SITUV2_A4W4=1
 export AITER_FLYDSL_STAGE2_FP8=1
 export ATOM_STATE_CHECKPOINT_DEMAND=0
 export ATOM_GDN_SSM_DTYPE="${ATOM_GDN_SSM_DTYPE:-fp16}"
+# Pinned rather than left to the default. This is 1 today
+# (atom/utils/envs.py), and the numbers below were measured with it at 1, but
+# the default may flip to 0 later -- set it explicitly so the recipe keeps
+# reproducing what was measured.
+export ATOM_USE_FLYDSL_GATHER_KV_B_PROJ=1
 export PYTHONNOUSERSITE=1
 
 ONLINE_QUANT_CONFIG='{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*"]}'
@@ -136,7 +146,7 @@ case "${CONC}" in
     DCP=1
     MAX_NUM_SEQS=32
     MAX_NUM_BATCHED_TOKENS=8192
-    GPU_MEMORY_UTILIZATION=0.88
+    GPU_MEMORY_UTILIZATION=0.90
     ENABLE_LMCACHE=0
     ATOM_ENABLE_REPLAYSSM=0
     NUM_SPECULATIVE_TOKENS=7
@@ -145,8 +155,8 @@ case "${CONC}" in
   8)
     DCP=8
     MAX_NUM_SEQS=32
-    MAX_NUM_BATCHED_TOKENS=4096
-    GPU_MEMORY_UTILIZATION=0.88
+    MAX_NUM_BATCHED_TOKENS=8192
+    GPU_MEMORY_UTILIZATION=0.90
     ENABLE_LMCACHE=1
     LMCACHE_MAX_LOCAL_CPU_SIZE=128
     ATOM_ENABLE_REPLAYSSM=1
@@ -156,8 +166,8 @@ case "${CONC}" in
   12)
     DCP=8
     MAX_NUM_SEQS=24
-    MAX_NUM_BATCHED_TOKENS=4096
-    GPU_MEMORY_UTILIZATION=0.88
+    MAX_NUM_BATCHED_TOKENS=8192
+    GPU_MEMORY_UTILIZATION=0.90
     ENABLE_LMCACHE=1
     LMCACHE_MAX_LOCAL_CPU_SIZE=128
     ATOM_ENABLE_REPLAYSSM=1
@@ -171,7 +181,7 @@ case "${CONC}" in
     DCP=8
     MAX_NUM_SEQS=32
     MAX_NUM_BATCHED_TOKENS=8192
-    GPU_MEMORY_UTILIZATION=0.86
+    GPU_MEMORY_UTILIZATION=0.90
     ENABLE_LMCACHE=1
     LMCACHE_MAX_LOCAL_CPU_SIZE=128
     ATOM_ENABLE_REPLAYSSM=1
@@ -183,7 +193,7 @@ case "${CONC}" in
     DCP=8
     MAX_NUM_SEQS=32
     MAX_NUM_BATCHED_TOKENS=8192
-    GPU_MEMORY_UTILIZATION=0.86
+    GPU_MEMORY_UTILIZATION=0.90
     ENABLE_LMCACHE=1
     LMCACHE_MAX_LOCAL_CPU_SIZE=128
     ATOM_ENABLE_REPLAYSSM=1
@@ -194,7 +204,7 @@ case "${CONC}" in
     DCP=8
     MAX_NUM_SEQS=64
     MAX_NUM_BATCHED_TOKENS=8192
-    GPU_MEMORY_UTILIZATION=0.86
+    GPU_MEMORY_UTILIZATION=0.90
     ENABLE_LMCACHE=1
     LMCACHE_MAX_LOCAL_CPU_SIZE=128
     ATOM_ENABLE_REPLAYSSM=0
@@ -205,7 +215,18 @@ case "${CONC}" in
     DCP=8
     MAX_NUM_SEQS=80
     MAX_NUM_BATCHED_TOKENS=8192
-    GPU_MEMORY_UTILIZATION=0.86
+    GPU_MEMORY_UTILIZATION=0.90
+    ENABLE_LMCACHE=1
+    LMCACHE_MAX_LOCAL_CPU_SIZE=128
+    ATOM_ENABLE_REPLAYSSM=0
+    NUM_SPECULATIVE_TOKENS=0
+    SPEC_DECODE_ACCEPTANCE_LENGTH=""
+    ;;
+  48)
+    DCP=8
+    MAX_NUM_SEQS=96
+    MAX_NUM_BATCHED_TOKENS=8192
+    GPU_MEMORY_UTILIZATION=0.90
     ENABLE_LMCACHE=1
     LMCACHE_MAX_LOCAL_CPU_SIZE=128
     ATOM_ENABLE_REPLAYSSM=0
@@ -216,11 +237,10 @@ case "${CONC}" in
     DCP=8
     MAX_NUM_SEQS=112
     MAX_NUM_BATCHED_TOKENS=8192
-    GPU_MEMORY_UTILIZATION=0.86
+    GPU_MEMORY_UTILIZATION=0.90
     ENABLE_LMCACHE=1
     LMCACHE_MAX_LOCAL_CPU_SIZE=192
     ATOM_ENABLE_REPLAYSSM=0
-    AITER_REUSE_IDENTICAL_COMM_GROUPS=1
     NUM_SPECULATIVE_TOKENS=0
     SPEC_DECODE_ACCEPTANCE_LENGTH=""
     ;;
@@ -228,20 +248,24 @@ case "${CONC}" in
     DCP=8
     MAX_NUM_SEQS=128
     MAX_NUM_BATCHED_TOKENS=8192
-    GPU_MEMORY_UTILIZATION=0.86
+    GPU_MEMORY_UTILIZATION=0.90
     ENABLE_LMCACHE=1
     LMCACHE_MAX_LOCAL_CPU_SIZE=192
     ATOM_ENABLE_REPLAYSSM=0
-    AITER_REUSE_IDENTICAL_COMM_GROUPS=1
     NUM_SPECULATIVE_TOKENS=0
     SPEC_DECODE_ACCEPTANCE_LENGTH=""
     ;;
   *)
-    echo "Unsupported CONC=${CONC}; AgentX Kimi-K3 covers 1,2,4,8,12,14,16,32,40,56,64." >&2
+    echo "Unsupported CONC=${CONC}; AgentX Kimi-K3 covers 1,2,4,8,12,14,16,32,40,48,56,64." >&2
     exit 2
     ;;
 esac
 
+# Reuse tracks DCP, not CONC: on at every DCP=8 band, off on DCP=1. Stated as a
+# rule rather than repeated in nine branches so the two cannot drift apart.
+if [[ "${TP}" == "8" && "${DCP}" == "8" ]]; then
+  AITER_REUSE_IDENTICAL_COMM_GROUPS="${AITER_REUSE_IDENTICAL_COMM_GROUPS:-1}"
+fi
 AITER_REUSE_IDENTICAL_COMM_GROUPS="${AITER_REUSE_IDENTICAL_COMM_GROUPS:-0}"
 export AITER_REUSE_IDENTICAL_COMM_GROUPS
 export ATOM_ENABLE_REPLAYSSM
