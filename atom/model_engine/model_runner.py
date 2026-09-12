@@ -812,6 +812,17 @@ class ModelRunner:
                     self.drafter.model, fullgraph=True, backend="eager"
                 )
 
+    @staticmethod
+    def _config_declares_engram(config) -> bool:
+        """Whether the model config declares engram layers, read without mapping
+        the ~200 GB host tables (detection must precede model construction)."""
+        tc = getattr(config.hf_config, "text_config", None) or config.hf_config
+        return (
+            tc.get("engram_layer_ids") is not None
+            if isinstance(tc, dict)
+            else getattr(tc, "engram_layer_ids", None) is not None
+        )
+
     def _build_and_load_model(self, model_class):
         """Construct the model and load its weights from disk.
 
@@ -824,18 +835,13 @@ class ModelRunner:
         # sampled token per sequence per step and cannot carry a spec step's
         # candidates or n-gram context. Detected from the config so we never map
         # the tables just to raise afterwards.
-        if config.speculative_config is not None:
-            tc = getattr(config.hf_config, "text_config", None) or config.hf_config
-            declares_engram = (
-                tc.get("engram_layer_ids") is not None
-                if isinstance(tc, dict)
-                else getattr(tc, "engram_layer_ids", None) is not None
+        if config.speculative_config is not None and self._config_declares_engram(
+            config
+        ):
+            raise NotImplementedError(
+                "engram is not supported with speculative decoding; serve "
+                "engram models without a speculative_config"
             )
-            if declares_engram:
-                raise NotImplementedError(
-                    "engram is not supported with speculative decoding; serve "
-                    "engram models without a speculative_config"
-                )
         self.model = model_class(config)
         fused_shared_expert_load_fn = None
         if hasattr(self.model, "load_fused_expert_weights"):
@@ -888,12 +894,26 @@ class ModelRunner:
         """
         seq_ids = list(batch.req_ids)
         if batch.is_dummy_run or not seq_ids or batch.total_tokens_num != len(seq_ids):
+            # Prefill (many tokens per seq) still stages zeros -- the per-prompt
+            # gather is not wired -- but seed each sequence's n-gram window with
+            # its prompt tail so the FIRST decode tokens hash with real context
+            # instead of padding. `scheduled_tokens` is laid out per sequence;
+            # seed_context keeps only the trailing max_ngram_size-1 it needs.
+            if not batch.is_dummy_run and seq_ids:
+                offsets = np.concatenate(([0], np.cumsum(batch.num_scheduled_tokens)))
+                for i, seq_id in enumerate(seq_ids):
+                    self.engram.seed_context(
+                        seq_id, batch.scheduled_tokens[offsets[i] : offsets[i + 1]]
+                    )
             self.engram.stage_dummy(batch.total_tokens_num)
             self.engram.wait_for_embeddings()
             return
-        # `tokens` is read only to recompute a prefetch miss (a just-admitted
-        # row), whose anchor is already in the host `scheduled_tokens` -- so the
-        # hot path needs no D2H.
+        # `tokens` is a fallback for recomputing a prefetch miss, and is read
+        # only for a missed row that also has no rolling window -- a cold /
+        # just-admitted row, for which `scheduled_tokens` holds the real committed
+        # anchor. A carried-over row recomputes from its window (advanced by the
+        # prior prefetch_next), so the placeholder `scheduled_tokens` writes for
+        # it is never read. The hot path needs no D2H either way.
         tokens = batch.scheduled_tokens[: len(seq_ids)].astype(np.int64).reshape(-1, 1)
         # A CUDAGraph decode replays a fixed bucket >= the scheduled rows, so the
         # forward is that tall; stage to the same padded height (zero tail) so the
@@ -4183,6 +4203,16 @@ class RapidServeModelRunner(ModelRunner):
     """
 
     def __init__(self, rank, config):
+        # Engram staging lives only on the base ModelRunner.forward path. This
+        # runner's prefill_forward/forward overrides call run_model directly and
+        # the decode process skips _init_engram_host, so an engram model would
+        # silently run without its trained contribution in both processes.
+        # Reject it up front rather than serve wrong output.
+        if self._config_declares_engram(config):
+            raise NotImplementedError(
+                "engram is not supported with prefill/decode disaggregation "
+                "(rapidserve); serve engram models without disaggregation"
+            )
         if not config.disagg_is_decode:
             self.forward = self.prefill_forward
         super().__init__(rank, config)

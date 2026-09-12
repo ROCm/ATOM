@@ -267,9 +267,13 @@ def make_prefetcher() -> EngramPrefetcher:
 def test_prefetch_result_equals_inline_compute():
     pf = make_prefetcher()
     seq_ids = [11, 12]
-    ids = np.array([[3, 4, 5], [6, 7, 8]], dtype=np.int64)
-    expected = pf.compute(seq_ids, ids)
-    assert pf.submit_compute(seq_ids, ids).result(timeout=30) is None
+    # Seed each sequence's n-gram context, then prefetch its current token; the
+    # async result must equal an inline compute over the same window (last col).
+    pf.seed_context(11, [3, 4])
+    pf.seed_context(12, [6, 7])
+    current = np.array([[5], [8]], dtype=np.int64)
+    expected = pf.compute(seq_ids, np.array([[3, 4, 5], [6, 7, 8]], dtype=np.int64))
+    assert pf.submit_compute(seq_ids, current).result(timeout=30) is None
     assert pf.wait(timeout=30)
     for (seq_id, layer_id), value in expected.items():
         torch.testing.assert_close(pf.cache.take(seq_id, layer_id), value)
@@ -413,6 +417,24 @@ def test_runtime_stage_recomputes_on_prefetch_miss():
         torch.testing.assert_close(cold.embeddings(layer_id), warm[layer_id])
     rt.shutdown()
     cold.shutdown()
+
+
+def test_runtime_carried_over_miss_recomputes_from_window_not_placeholder():
+    """A carried-over request that misses recomputes from its rolling window,
+    ignoring the placeholder anchor the scheduler writes for it."""
+    rt = make_runtime()
+    seq_ids = [61]
+    rt.seed_context(61, [2, 3])
+    rt.prefetch_next(seq_ids, np.array([[4]], dtype=np.int64))
+    rt.stage_embeddings(seq_ids, np.array([[4]], dtype=np.int64))
+    warm = {lid: rt.embeddings(lid).clone() for lid in rt.layer_ids}
+
+    # The stage above consumed the cached rows, so this stage misses. The window
+    # is intact and ends at token 4; a wrong placeholder anchor must be ignored.
+    rt.stage_embeddings(seq_ids, np.array([[999]], dtype=np.int64))
+    for layer_id in rt.layer_ids:
+        torch.testing.assert_close(rt.embeddings(layer_id), warm[layer_id])
+    rt.shutdown()
 
 
 def test_runtime_stage_without_tokens_on_miss_is_an_error():

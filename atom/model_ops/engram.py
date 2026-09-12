@@ -18,7 +18,7 @@ import logging
 import os
 import threading
 import zipfile
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -137,12 +137,20 @@ class CompressedTokenizer:
         return self.num_new_token
 
     def _cache_key(self) -> str:
+        # `_build` keys the compressed table on the full id->token mapping, so
+        # the cache key must cover all of it: hashing only the vocab length and
+        # the first 1024 token strings lets two tokenizers that share a prefix
+        # but assign different ids reuse each other's table (a silently wrong
+        # lookup). Hash every (token, id) pair instead.
         vocab = self._tokenizer.get_vocab()
         h = hashlib.sha256()
         h.update(str(self._CACHE_VERSION).encode())
         h.update(str(len(vocab)).encode())
-        for tok in sorted(vocab)[:1024]:
+        for tok, tid in sorted(vocab.items()):
             h.update(tok.encode("utf-8", "replace"))
+            h.update(b"\x00")
+            h.update(str(tid).encode())
+            h.update(b"\x00")
         return h.hexdigest()[:16]
 
     def _load_or_build(self, cache_dir: str | None) -> tuple[np.ndarray, int]:
@@ -343,6 +351,19 @@ class NgramHashMapping:
 # ---------------------------------------------------------------------------
 
 
+def decode_block_scale(scale: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Decode an E8M0 block scale to `out_dtype`.
+
+    A native `float8_e8m0fnu` byte decodes directly under `.to()`. When the torch
+    build has no such dtype ATOM exposes the same bytes as raw `torch.uint8`
+    (see deepseek_v4's block-scale loader); those are biased exponents, so the
+    value is `2 ** (code - 127)` rather than the magnitude `.to()` would read.
+    """
+    if scale.dtype == torch.uint8:
+        return torch.exp2(scale.to(torch.float32) - 127.0).to(out_dtype)
+    return scale.to(out_dtype)
+
+
 class HostEmbeddingTable:
     """One engram layer's table, memory-mapped and gathered row-wise.
 
@@ -371,14 +392,6 @@ class HostEmbeddingTable:
         self._scale = scale
         self.block_size = 0
         if scale is not None:
-            # gather() does `scale.to(float32)`; that decodes 2**(code-127) only
-            # for a float8 E8M0 dtype. A raw uint8 exponent-code table would be
-            # read as plain magnitudes (~127x off), so fail loud instead.
-            if not scale.is_floating_point():
-                raise ValueError(
-                    f"engram block scale must be a float8 (E8M0) dtype, got "
-                    f"{scale.dtype}"
-                )
             if scale.shape[0] != num_rows:
                 raise ValueError(
                     f"scale has {scale.shape[0]} rows, expected {num_rows}"
@@ -417,7 +430,7 @@ class HostEmbeddingTable:
             # Block-quantized: each scale covers `block_size` consecutive values
             # of a row. Skipping this does not fail, it returns values two orders
             # of magnitude off, so it is not optional.
-            scale = self._scale[index].to(out_dtype)
+            scale = decode_block_scale(self._scale[index], out_dtype)
             rows = (
                 rows.reshape(-1, scale.shape[1], self.block_size) * scale.unsqueeze(-1)
             ).reshape(-1, self.head_dim)
@@ -437,14 +450,29 @@ class EngramPrefetchCache:
         self._capacity = capacity
         self._lock = threading.Lock()
         self._store: OrderedDict[tuple[int, int], torch.Tensor] = OrderedDict()
+        # Seq ids dropped while a prefetch for them may still be in flight. `put`
+        # skips them under the same lock as `drop`, so a worker that finishes its
+        # gather after the request was dropped cannot resurrect a stale entry.
+        # Bounded like the store: a drop-mark only needs to outlive one in-flight
+        # prefetch, so evicting the oldest past capacity is safe.
+        self._dropped: OrderedDict[int, None] = OrderedDict()
 
     def put(self, seq_id: int, layer_id: int, value: torch.Tensor) -> None:
         with self._lock:
+            if seq_id in self._dropped:
+                return
             key = (seq_id, layer_id)
             self._store[key] = value
             self._store.move_to_end(key)
             while len(self._store) > self._capacity:
                 self._store.popitem(last=False)
+
+    def admit(self, seq_ids: list[int]) -> None:
+        """Clear drop-marks for sequences that are being prefetched again, so a
+        reused seq id is not permanently blocked from the store."""
+        with self._lock:
+            for seq_id in seq_ids:
+                self._dropped.pop(seq_id, None)
 
     def take(self, seq_id: int, layer_id: int) -> torch.Tensor | None:
         with self._lock:
@@ -456,10 +484,15 @@ class EngramPrefetchCache:
             return (seq_id, layer_id) in self._store
 
     def drop(self, seq_id: int) -> None:
-        """Forget everything for a finished request."""
+        """Forget everything for a finished request and mark it dropped so an
+        in-flight prefetch cannot put it back."""
         with self._lock:
             for key in [k for k in self._store if k[0] == seq_id]:
                 del self._store[key]
+            self._dropped[seq_id] = None
+            self._dropped.move_to_end(seq_id)
+            while len(self._dropped) > self._capacity:
+                self._dropped.popitem(last=False)
 
     def __len__(self) -> int:
         with self._lock:
@@ -491,15 +524,100 @@ class EngramPrefetcher:
             max_workers=1, thread_name_prefix="engram-prefetch"
         )
         self._inflight: Future | None = None
+        # Per-sequence rolling n-gram context: the last `max_ngram_size` raw
+        # token ids ending at the current position. Engram hashes causal
+        # 2..max_ngram_size grams, so a token must carry its predecessors or the
+        # hash pads them and indexes the wrong rows.
+        self._ngram = hash_mapping.config.max_ngram_size
+        self._pad_id = hash_mapping.config.pad_token_id
+        # Bounded like the cache: finished sequences are dropped by drop_requests
+        # when the runner wires it, but the bound keeps the dict from growing
+        # unboundedly if a drop is ever missed.
+        self._window_capacity = cache_capacity
+        self._window: OrderedDict[int, deque] = OrderedDict()
+        self._window_lock = threading.Lock()
 
     @property
     def layer_ids(self) -> tuple[int, ...]:
         return self._hash_mapping.config.layer_ids
 
+    def seed_context(self, seq_id: int, context_tokens) -> None:
+        """Seed a sequence's window with its prompt's trailing tokens, before its
+        first decode token is advanced in, so the first decode hashes with real
+        context rather than padding."""
+        tail = list(context_tokens)[-(self._ngram - 1) :] if self._ngram > 1 else []
+        with self._window_lock:
+            self._window[seq_id] = deque(tail, maxlen=self._ngram)
+            self._window.move_to_end(seq_id)
+            self._evict_windows()
+
+    def advance(self, seq_ids: list[int], current_tokens: np.ndarray) -> np.ndarray:
+        """Append each sequence's current token to its window and return the
+        `[B, max_ngram_size]` left-padded windows to hash (last column = current).
+        """
+        cur = np.asarray(current_tokens).reshape(len(seq_ids), -1)
+        out = np.full((len(seq_ids), self._ngram), self._pad_id, dtype=np.int64)
+        with self._window_lock:
+            for i, seq_id in enumerate(seq_ids):
+                w = self._window.setdefault(seq_id, deque(maxlen=self._ngram))
+                w.append(int(cur[i, -1]))
+                self._window.move_to_end(seq_id)
+                out[i, self._ngram - len(w) :] = list(w)
+            self._evict_windows()
+        return out
+
+    def windows_for_recompute(
+        self, seq_ids: list[int], fallback_tokens: np.ndarray | None
+    ) -> np.ndarray:
+        """Render `[B, max_ngram_size]` windows to recompute a prefetch miss.
+
+        A sequence that reached a decode step was already advanced to its current
+        token by the previous step's `prefetch_next`, so its window is rendered
+        AS-IS -- advancing again would append the token twice and hash the wrong
+        n-gram. Only a sequence with no window (never prefetched: a cold or
+        just-admitted row) is advanced from empty using `fallback_tokens`, whose
+        anchor is correct for exactly that case. This is why a carried-over
+        request never depends on the caller's token, which for it is a
+        placeholder.
+        """
+        cur = (
+            None
+            if fallback_tokens is None
+            else np.asarray(fallback_tokens).reshape(len(seq_ids), -1)
+        )
+        out = np.full((len(seq_ids), self._ngram), self._pad_id, dtype=np.int64)
+        with self._window_lock:
+            for i, seq_id in enumerate(seq_ids):
+                w = self._window.get(seq_id)
+                if not w:
+                    if cur is None:
+                        raise RuntimeError(
+                            f"engram prefetch missed seq {seq_id} with no window "
+                            f"and no token ids were supplied to recompute it"
+                        )
+                    w = self._window.setdefault(seq_id, deque(maxlen=self._ngram))
+                    w.append(int(cur[i, -1]))
+                self._window.move_to_end(seq_id)
+                out[i, self._ngram - len(w) :] = list(w)
+            self._evict_windows()
+        return out
+
+    def _evict_windows(self) -> None:
+        """Drop least-recently-used windows past the capacity (caller holds the
+        lock). A safety net for a missed drop_requests, not the primary path."""
+        while len(self._window) > self._window_capacity:
+            self._window.popitem(last=False)
+
     def compute(
         self, seq_ids: list[int], token_ids: np.ndarray
     ) -> dict[tuple[int, int], torch.Tensor]:
-        """Hash `token_ids` ([B, T]) and gather, for every engram layer."""
+        """Hash `token_ids` ([B, T]) and gather, for every engram layer.
+
+        `token_ids` is a per-sequence n-gram window; the embedding wanted is the
+        one for the CURRENT token, i.e. the hash ending at the LAST column. Taking
+        the last position is what makes `[a, b, x]` (x in context) differ from a
+        bare `[x]`, which would pad the missing history and index the wrong rows.
+        """
         results: dict[tuple[int, int], torch.Tensor] = {}
         compressed = self._hash_mapping.tokenizer(token_ids)
         for layer_id in self.layer_ids:
@@ -507,7 +625,7 @@ class EngramPrefetcher:
             rows = self._hash_mapping.to_row_indices(hashes, layer_id)
             gathered = self._tables[layer_id].gather(rows)
             for i, seq_id in enumerate(seq_ids):
-                results[(seq_id, layer_id)] = gathered[i]
+                results[(seq_id, layer_id)] = gathered[i][-1]
         return results
 
     def submit_compute(
@@ -527,7 +645,11 @@ class EngramPrefetcher:
 
         def _run() -> None:
             toks = token_source() if token_source is not None else token_ids
-            for key, value in self.compute(seq_ids, toks).items():
+            # These seqs are being prefetched now, so clear any stale drop-mark
+            # (a reused seq id) before the results land.
+            self.cache.admit(seq_ids)
+            windows = self.advance(seq_ids, toks)
+            for key, value in self.compute(seq_ids, windows).items():
                 self.cache.put(key[0], key[1], value)
 
         self._inflight = self._pool.submit(_run)
@@ -546,9 +668,16 @@ class EngramPrefetcher:
     def drop_requests(self, seq_ids: list[int]) -> None:
         for seq_id in seq_ids:
             self.cache.drop(seq_id)
+        with self._window_lock:
+            for seq_id in seq_ids:
+                self._window.pop(seq_id, None)
 
     def shutdown(self) -> None:
-        self._pool.shutdown(wait=False, cancel_futures=True)
+        # Cancel queued prefetches but join the one in flight: the worker holds
+        # references to the host tables, so letting it outlive shutdown can block
+        # interpreter exit or leave it gathering against tables the runner is
+        # tearing down. A gather is bounded work, so the join is short.
+        self._pool.shutdown(wait=True, cancel_futures=True)
 
 
 class EngramHost:
@@ -630,9 +759,10 @@ class EngramHost:
     ) -> int:
         """Fill the staging buffers for `seq_ids`; returns the row count staged.
 
-        `token_ids` is only consulted for sequences the prefetch missed -- the
-        caller passes the cheap host-side source (the scheduler's committed
-        anchor), correct for the just-admitted rows that are the only misses.
+        `token_ids` is only consulted for a missed sequence that also has no
+        rolling window (a cold or just-admitted row), where the scheduler's
+        committed anchor is correct. A carried-over request recomputes from its
+        window instead, so a placeholder anchor for it is never read.
 
         `padded_rows`, when the forward runs a padded rectangle taller than the
         scheduled rows (a CUDAGraph decode bucket), is that running height. The
@@ -665,13 +795,15 @@ class EngramHost:
         ]
         computed: dict[tuple[int, int], torch.Tensor] = {}
         if missing:
-            if token_ids is None:
-                raise RuntimeError(
-                    f"engram prefetch missed {len(missing)} sequences and no token "
-                    f"ids were supplied to recompute them"
-                )
             miss_ids = [seq_ids[i] for i in missing]
-            computed = self.prefetcher.compute(miss_ids, token_ids[missing])
+            # Recompute from each seq's existing rolling window (already advanced
+            # to its current token by the prior prefetch_next), falling back to
+            # `token_ids` only for a seq with no window -- see
+            # `windows_for_recompute`. This is why the caller's token being a
+            # placeholder for carried-over requests does not corrupt the result.
+            miss_tokens = None if token_ids is None else token_ids[missing]
+            miss_windows = self.prefetcher.windows_for_recompute(miss_ids, miss_tokens)
+            computed = self.prefetcher.compute(miss_ids, miss_windows)
 
         for layer_id in self.layer_ids:
             cpu = self.buffers[layer_id].cpu
@@ -774,6 +906,10 @@ class EngramHost:
         else:
             token_ids = np.asarray(tokens).reshape(n, -1)[:, -1:].astype(np.int64)
             self.prefetcher.submit_compute(seq_ids, token_ids)
+
+    def seed_context(self, seq_id: int, context_tokens) -> None:
+        """Seed a sequence's n-gram window from its prompt's trailing tokens."""
+        self.prefetcher.seed_context(seq_id, context_tokens)
 
     def drop_requests(self, seq_ids: list[int]) -> None:
         self.prefetcher.drop_requests(seq_ids)

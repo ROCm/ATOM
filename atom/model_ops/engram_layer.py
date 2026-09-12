@@ -41,6 +41,7 @@ from atom.model_ops.engram import (
     EngramPrefetcher,
     HostEmbeddingTable,
     NgramHashMapping,
+    decode_block_scale,
 )
 
 logger = logging.getLogger(__name__)
@@ -158,22 +159,17 @@ class EngramOp(nn.Module):
                     f"{(self.hc_mult, self.hidden_size)}"
                 )
         if wkv_scale is not None:
-            # `.float()` decodes 2**(code-127) only for a float8 E8M0 dtype; a
-            # raw uint8 exponent-code table would multiply by ~127 instead. Fail
-            # loud rather than silently mis-scale the projection.
-            if not wkv_scale.is_floating_point():
-                raise ValueError(
-                    f"wkv scale must be a float8 (E8M0) dtype, got {wkv_scale.dtype}"
-                )
             rows, cols = wkv.shape
             if tuple(wkv_scale.shape) != (rows // block, cols // block):
                 raise ValueError(
                     f"wkv scale is {tuple(wkv_scale.shape)}, expected "
                     f"{(rows // block, cols // block)} for {block}x{block} blocks"
                 )
+            # Decode E8M0 (native float8 or raw uint8 exponent bytes) before use.
+            ws = decode_block_scale(wkv_scale, torch.float32)
             wkv = (
                 wkv.float().reshape(rows // block, block, cols // block, block)
-                * wkv_scale.float().reshape(rows // block, 1, cols // block, 1)
+                * ws.reshape(rows // block, 1, cols // block, 1)
             ).reshape(rows, cols)
         self.wkv.weight.copy_(wkv.to(self.wkv.weight.dtype))
         self.k_weight.copy_(k_weight.to(self.k_weight.dtype))
