@@ -102,7 +102,7 @@ class TestEnvsDefaults:
         assert _get_envs().ATOM_ENABLE_GDN_DECODE_LOSSY_FAST is False
 
     def test_use_flydsl_gather_kv_b_proj_default(self):
-        assert _get_envs().ATOM_USE_FLYDSL_GATHER_KV_B_PROJ is True
+        assert _get_envs().ATOM_USE_FLYDSL_GATHER_KV_B_PROJ is False
 
     def test_unknown_attr_raises(self):
         with pytest.raises(AttributeError):
