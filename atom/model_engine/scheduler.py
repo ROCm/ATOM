@@ -2376,12 +2376,31 @@ class Scheduler:
         # Strip placeholder + rejected draft tokens added by postprocess.
         # Real token count = seq.num_tokens - mtp_k - num_rejected
         # (same formula as postprocess line: num_tokens = seq.num_tokens - self.mtp_k - num_rejected)
+        #
+        # Deferred output appends its placeholder on every decode step, not
+        # only under speculation: `is_deferred_out` is `pipeline_parallel_size
+        # == 1`, so a plain TP-only engine takes that path for every running
+        # sequence. The placeholder is `eos_token_id`, and postprocess
+        # overwrites it in place one step later -- a step this sequence will
+        # never reach, because it is being preempted now. Left in place it
+        # stops being a placeholder: the recompute prefills a context ending in
+        # `<|endoftext|>` and the model duly starts a new document, and the
+        # same token is handed back to the caller as generated output. With
+        # `ignore_eos=False` the request just stops there, which reads as a
+        # coherent answer that ends before it answers anything.
         if self.spec_decode_local and self.mtp_k > 0:
             strip = self.mtp_k + seq.num_rejected
-            if strip > 0:
-                del seq.token_ids[-strip:]
-                del seq.output_tokens[-strip:]
-                seq.num_tokens -= strip
+        else:
+            strip = seq.num_placeholder_tokens
+        if strip > 0:
+            del seq.token_ids[-strip:]
+            del seq.output_tokens[-strip:]
+            seq.num_tokens -= strip
+            # Each placeholder pushed a 0.0 alongside it (postprocess patches
+            # that in place too), so they go together or the two lists stop
+            # describing the same tokens.
+            if seq.return_logprobs and len(seq.logprobs) >= strip:
+                del seq.logprobs[-strip:]
         seq.num_rejected = 0
         seq.num_bonus_tokens = 0
         seq.num_placeholder_tokens = 0
