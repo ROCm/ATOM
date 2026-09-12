@@ -70,6 +70,7 @@ from .protocol import (
     CompletionRequest,
     ModelCard,
     ModelList,
+    validate_max_tokens,
 )
 from .reasoning import (
     ReasoningChannel,
@@ -110,6 +111,17 @@ from .serving_completion import (
     stream_completion_response,
     stream_completion_response_fanout,
 )
+from .serving_responses import (
+    DEFAULT_MAX_OUTPUT_TOKENS,
+    ResponsesRequest,
+    ResponseStreamEmitter,
+    build_responses_response,
+    normalize_codex_request,
+    responses_to_openai_messages,
+    responses_tools_to_openai,
+    unsupported_responses_parameter,
+)
+from .serving_responses import stream_failure_frames as responses_stream_failure_frames
 from .sse import event_frame
 from .streaming_dispatch import (
     SYNTHETIC_TOKEN_TEXT,
@@ -2056,6 +2068,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
     # streaming it arrives after the client was told the request succeeded.
     try:
         validate_tool_list(anthropic_to_openai_tools(request.tools))
+        validate_max_tokens(request.max_tokens)
     except ValueError as exc:
         return JSONResponse(
             status_code=400,
@@ -2387,6 +2400,290 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         )
 
 
+@app.post("/v1/responses")
+async def responses_create(raw_request: Request):
+    """Handle OpenAI Responses API requests, including Codex tool shapes.
+
+    Codex sends custom tools, namespace groups, and client-side tool search.
+    Those are normalized to function tools, run through the same engine path
+    as ``/v1/messages``, then restored to the Responses / Codex wire format.
+    """
+    try:
+        body = await raw_request.json()
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": "Request body must be valid JSON",
+                    "type": "invalid_request_error",
+                    "code": 400,
+                }
+            },
+        )
+    if not isinstance(body, dict):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": "Responses request must be a JSON object",
+                    "type": "invalid_request_error",
+                    "code": 400,
+                }
+            },
+        )
+
+    unsupported = unsupported_responses_parameter(body)
+    if unsupported:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": unsupported,
+                    "type": "invalid_request_error",
+                    "code": "unsupported_parameter",
+                }
+            },
+        )
+
+    try:
+        body, codex_context = normalize_codex_request(body)
+        request = ResponsesRequest.model_validate(body)
+        openai_tools = responses_tools_to_openai(request.tools)
+        validate_tool_list(openai_tools)
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": str(exc),
+                    "type": "invalid_request_error",
+                    "code": 400,
+                }
+            },
+        )
+
+    try:
+        openai_messages = responses_to_openai_messages(request)
+        from .protocol import ChatMessage
+
+        messages = [ChatMessage(**m) for m in openai_messages]
+
+        merged_kwargs = dict(default_chat_template_kwargs)
+        if isinstance(request.tool_choice, str):
+            merged_kwargs["tool_choice"] = request.tool_choice
+        elif forbids_tool_calls(request.tool_choice):
+            merged_kwargs["tool_choice"] = "none"
+        if isinstance(request.reasoning, dict):
+            effort = request.reasoning.get("effort")
+            if effort is not None:
+                merged_kwargs["thinking_effort"] = effort
+
+        prompt = apply_chat_template(
+            tokenizer,
+            custom_message_encoder,
+            [msg.to_template_dict() for msg in messages],
+            tools=openai_tools,
+            **merged_kwargs,
+        )
+
+        generation_config = engine.config.generation_config
+        model_temperature = getattr(generation_config, "temperature", None)
+        model_top_p = getattr(generation_config, "top_p", None)
+        model_top_k = getattr(generation_config, "top_k", None)
+        if model_temperature is None:
+            model_temperature = DEFAULT_TEMPERATURE
+        if model_top_p is None:
+            model_top_p = DEFAULT_TOP_P
+        if model_top_k is None:
+            model_top_k = DEFAULT_TOP_K
+
+        max_tokens = (
+            request.max_output_tokens
+            if request.max_output_tokens is not None
+            else DEFAULT_MAX_OUTPUT_TOKENS
+        )
+        sampling_params = _build_sampling_params(
+            temperature=(
+                request.temperature
+                if request.temperature is not None
+                else model_temperature
+            ),
+            max_tokens=max_tokens,
+            stop_strings=request.stop,
+            ignore_eos=False,
+            top_k=(request.top_k if request.top_k is not None else model_top_k),
+            top_p=(request.top_p if request.top_p is not None else model_top_p),
+        )
+
+        request_id = f"resp_{uuid.uuid4().hex[:24]}"
+        input_tokens = len(tokenizer.encode(prompt))
+
+        max_ctx = 30720
+        for obj in (
+            getattr(engine, "config", None),
+            getattr(engine, "model_config", None),
+            getattr(engine, "scheduler", None),
+            engine,
+        ):
+            value = getattr(obj, "max_model_len", None) if obj is not None else None
+            if value:
+                max_ctx = int(value)
+                break
+        headroom = min(max_tokens, max(1024, max_ctx // 8))
+        max_input = max_ctx - headroom
+        if input_tokens > max_input:
+            logger.warning(
+                f"Prompt too long ({input_tokens} > {max_input}), truncating"
+            )
+            token_ids = tokenizer.encode(prompt)[:max_input]
+            prompt = tokenizer.decode(token_ids, skip_special_tokens=False)
+            input_tokens = max_input
+
+        created_at = int(time.time())
+        if request.stream:
+            seq_id, stream_collector, _num_prompt_tokens = (
+                await setup_streaming_request(prompt, sampling_params, request_id)
+            )
+
+            async def generate_responses_stream():
+                reasoning_filter = reasoning_channel(
+                    prompt_starts_in_reasoning(prompt),
+                    template_kwargs=merged_kwargs,
+                ).stream()
+                tool_parser = ToolCallStreamParser(
+                    parser_cls=tool_call_parser_cls,
+                    suppress_calls=forbids_tool_calls(request.tool_choice),
+                )
+                tool_parser.tools = openai_tools
+                emitter = ResponseStreamEmitter(
+                    request_id,
+                    model_name,
+                    context=codex_context,
+                    request=request,
+                    created_at=created_at,
+                )
+                has_tool_calls = False
+                output_tokens = 0
+                opened = False
+                aborted = True
+                try:
+                    while True:
+                        chunk_data = await stream_collector.get()
+                        if not opened:
+                            for _frame in emitter.opening_frames():
+                                yield _frame
+                            opened = True
+                        new_text = chunk_data["text"]
+                        output_tokens += len(chunk_data.get("token_ids", []))
+                        finished = chunk_data.get("finished", False)
+
+                        segments = reasoning_filter.process(new_text)
+                        if finished:
+                            segments.extend(reasoning_filter.flush())
+
+                        for field, text in segments:
+                            if not text:
+                                continue
+                            if field == "reasoning_content":
+                                for _frame in emitter.frames_for_events(
+                                    [("reasoning", text)]
+                                ):
+                                    yield _frame
+                            else:
+                                events = tool_parser.process(text)
+                                has_tool_calls = has_tool_calls or (
+                                    completes_a_tool_call(events)
+                                )
+                                for _frame in emitter.frames_for_events(events):
+                                    yield _frame
+
+                        if finished:
+                            events = tool_parser.flush()
+                            has_tool_calls = has_tool_calls or (
+                                completes_a_tool_call(events)
+                            )
+                            for _frame in emitter.frames_for_events(events):
+                                yield _frame
+                            aborted = False
+                            cache_read = chunk_data.get("num_cached_tokens", 0)
+                            usage = {
+                                "input_tokens": input_tokens,
+                                "output_tokens": output_tokens,
+                                "total_tokens": input_tokens + output_tokens,
+                                "input_tokens_details": {"cached_tokens": cache_read},
+                            }
+                            for _frame in emitter.finish_frames(
+                                usage=usage,
+                                has_tool_calls=has_tool_calls,
+                            ):
+                                yield _frame
+                            break
+                except Exception as exc:
+                    logger.exception("Error streaming responses")
+                    for _frame in responses_stream_failure_frames(
+                        exc, emitter, opened=opened
+                    ):
+                        yield _frame
+                finally:
+                    cleanup_stream(seq_id, aborted=aborted)
+                    cleanup_request(request_id)
+
+            return StreamingResponse(
+                _client_stream(generate_responses_stream(), request_id),
+                media_type="text/event-stream",
+                headers={"x-request-id": request_id},
+            )
+
+        final_output = await _run_nonstream_with_disconnect(
+            generate_async(prompt, sampling_params, request_id),
+            raw_request,
+            request_id,
+        )
+        if final_output is None:
+            raise RuntimeError("No output generated")
+
+        raw_text = final_output["text"]
+        events = read_whole_blocks(
+            reasoning_channel(
+                prompt_starts_in_reasoning(prompt),
+                template_kwargs=merged_kwargs,
+            ),
+            tool_call_parser_cls,
+            raw_text,
+            openai_tools,
+            suppress_calls=forbids_tool_calls(request.tool_choice),
+        )
+        output_tokens = len(tokenizer.encode(raw_text))
+        cache_read_input_tokens = final_output.get("num_cached_tokens", 0)
+        return build_responses_response(
+            request_id=request_id,
+            model=model_name,
+            events=events,
+            context=codex_context,
+            request=request,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_input_tokens=cache_read_input_tokens,
+            created_at=created_at,
+        )
+
+    except _ClientDisconnected:
+        return JSONResponse(status_code=499, content={"detail": "client disconnected"})
+    except Exception as e:
+        logger.exception("Error in responses_create")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": {
+                    "message": str(e),
+                    "type": "internal_server_error",
+                    "code": 500,
+                }
+            },
+        )
+
+
 @app.get("/v1/models")
 async def list_models():
     """List available models."""
@@ -2468,7 +2765,7 @@ def _resolve_kv_transfer_role(kv_cfg: dict) -> tuple[str | None, int]:
         return kv_role, handshake_port
 
     # MultiConnector wraps the real transfer connector. Surface the producer
-    # role so atomesh can recognize multi[mooncake-producer + offload] as a
+    # role so a P/D proxy can recognize multi[mooncake-producer + offload] as a
     # prefill node.
     fallback_role = None
     fallback_port = handshake_port
