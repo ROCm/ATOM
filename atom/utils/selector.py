@@ -26,6 +26,7 @@ class Family(StrEnum):
     instead of falling through to MHA.
     """
 
+    CSA2 = "csa2"
     V4 = "v4"
     KIMI_MLA = "kimi_mla"
     MLA = "mla"
@@ -47,6 +48,7 @@ class Family(StrEnum):
 _KIMI_MLA_TYPES = ("kimi_linear", "glm5_next_text")
 _GDN_TYPES = ("qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text")
 _V4_TYPES = ("deepseek_v4", "deepseek_v4_mtp")
+_V41_TYPES = ("deepseek_v41", "deepseek_v41_text", "deepseek_v41_dspark")
 
 
 def attn_family(hf_text_config) -> Family:
@@ -67,6 +69,10 @@ def attn_family(hf_text_config) -> Family:
     # (`get_hf_config` preserves it) and is what tells them apart; a draft is
     # stamped `deepseek_v4_mtp` instead and has no architecture of its own.
     arches = getattr(hf_text_config, "architectures", None) or []
+    if model_type in _V41_TYPES or any(
+        arch in ("DeepseekV41ForCausalLM", "DeepseekV41DSparkModel") for arch in arches
+    ):
+        return Family.CSA2
     if any("DeepseekV4" in str(arch) for arch in arches) or model_type in _V4_TYPES:
         return Family.V4
     if model_type in _KIMI_MLA_TYPES:
@@ -111,6 +117,8 @@ def _cached_get_attn_backend(
 
 
 def get_attn_backend_cls(family: Family, use_sglang: bool, use_vllm: bool) -> str:
+    if family is Family.CSA2:
+        raise NotImplementedError("DeepSeek-V4.1 CSA2 runtime is not enabled yet")
     if family is Family.V4:
         return "atom.model_ops.attentions.deepseek_v4_attn.DeepseekV4Backend"
     if family is Family.KIMI_MLA:

@@ -11,7 +11,7 @@ Engram builds on ROCm/ATOM PR #2185.
 | Stage | Deliverable | Status |
 |---|---|---|
 | P00 | Pinned checkpoint, numerical oracle and input fixtures | Complete: 48 shards, 96085 tensors, 7 checks passed |
-| P01 | Nested configuration, CSA2 topology and format schema | Pending |
+| P01 | Nested configuration, CSA2 topology and format schema | Complete |
 | P02 | Native FP8/FP4 weights and kernel interfaces | Pending |
 | P03 | Single-Pass mHC, MoE semantics and complete Engram | Pending |
 | P04 | Full-layer exact text inference | Pending |
@@ -37,3 +37,7 @@ use `lm_eval`; no model accuracy or performance result is claimed yet.
 The first attention implementation reuses V4 BF16 sparse-attention kernels.
 V4.1 cache values retain their reference quantize/dequantize semantics before
 BF16 storage; native packed attention remains a later performance stage.
+
+P01 registers the configuration and attention family. Model/backend execution
+registration follows P04/P05 when those implementations are usable; selecting
+CSA2 currently fails explicitly rather than invoking the incompatible V4 backend.
