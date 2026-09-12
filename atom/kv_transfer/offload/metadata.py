@@ -92,6 +92,11 @@ class LoadSpec:
     lmcache_cached_tokens: int
     # Set True by update_state_after_alloc once blocks are reserved for the load.
     can_load: bool = False
+    # Optional transport boundary. A full-prompt LMCache hit still exposes only
+    # ``prompt_tokens - 1`` cached tokens to the scheduler (the final token must
+    # be recomputed), but chunk-oriented transports need to retrieve the whole
+    # final chunk. ``None`` keeps the legacy boundary above.
+    transfer_end_tokens: int | None = None
 
 
 @dataclass
