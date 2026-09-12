@@ -519,6 +519,28 @@ class LinearBase(nn.Module):
             self.register_parameter("bias", None)
         self.quant_type = quant_type
         self.params_dtype = params_dtype
+        self.native_fp8_group_rows = None
+        if (
+            params_dtype == torch.float8_e4m3fn
+            and layer_quant_config.weight_block_size in ((1, 32), (32, 32))
+        ):
+            if (
+                quant_type != QuantType.per_1x32
+                or self.source_quant_dtype is not None
+                or not layer_quant_config.is_dynamic
+                or getattr(quant_config, "online_quant", False)
+            ):
+                raise ValueError(
+                    "Native group32 FP8 requires dynamic A8 and native weights"
+                )
+            self.native_fp8_group_rows = layer_quant_config.weight_block_size[0]
+            if self.input_size % 32 or any(
+                size % self.native_fp8_group_rows
+                for size in self.output_partition_sizes
+            ):
+                raise ValueError(
+                    "TP partitions must align with the native FP8 source blocks"
+                )
 
         if quant_type != QuantType.No and self.source_quant_dtype is None:
             if quant_type == QuantType.per_Tensor:
@@ -564,7 +586,7 @@ class LinearBase(nn.Module):
             elif quant_type == QuantType.per_1x32:
                 self.weight_scale = atom_parameter(
                     torch.empty(
-                        self.output_size,
+                        self.output_size // (self.native_fp8_group_rows or 1),
                         (self.input_size + 31) // 32,
                         dtype=dtypes.fp8_e8m0,
                         device=param_device,
@@ -583,6 +605,13 @@ class LinearBase(nn.Module):
         self.need_normalize_e4m3fn_to_e4m3fnuz = params_dtype == torch.float8_e4m3fnuz
         self.quant_func = get_hip_quant(self.quant_type)
         self.is_output_padded = False
+
+    @property
+    def weight_scale_row_group(self) -> int:
+        """Number of weight rows represented by one row of source scales."""
+        if self.native_fp8_group_rows is not None:
+            return self.native_fp8_group_rows
+        return 128 if self.quant_type == QuantType.per_1x128 else 1
 
     @staticmethod
     def weight_loader_process(
@@ -794,6 +823,9 @@ class LinearBase(nn.Module):
         }
 
     def process_weights_after_loading(self):
+        # The native group32 kernel consumes checkpoint bytes and compact scales.
+        if self.native_fp8_group_rows is not None:
+            return
         if self.weight.numel() == 0:
             return
         # Re-quantize before process_weights if online quantization is enabled
@@ -970,7 +1002,20 @@ class LinearBase(nn.Module):
             "Linear out= requested but this quant path does not support it "
             f"(quant_type={self.quant_type})."
         )
-        if self.quant_type.value == QuantType.No.value:
+        if self.native_fp8_group_rows is not None:
+            from atom.model_ops.blockscale import native_quant_linear
+
+            y = native_quant_linear(
+                x,
+                self.weight,
+                self.weight_scale,
+                x_scale=x_scale,
+                weight_group_rows=self.native_fp8_group_rows,
+                dtype=otype,
+            )
+            if self.bias is not None:
+                y += self.bias
+        elif self.quant_type.value == QuantType.No.value:
             y = tgemm.mm(
                 x,
                 self.weight,
@@ -1207,19 +1252,20 @@ class ColumnParallelLinear(LinearBase):
 
         ws = getattr(self, "weight_scale", None)
         if ws is not None and ws.data.dim() == 2 and ws.data.shape[0] > 1:
-            if self.quant_type == QuantType.per_1x128:
-                # Scale is [(N+127)//128, (K+127)//128] and is NOT shuffled, so it
-                # slices on the same boundary scaled by 128 -- the same arithmetic
-                # the TP weight_loader already uses for this quant type.
-                assert start % 128 == 0 and length % 128 == 0, (
-                    "per_1x128 row view must be 128-aligned; got "
+            if self.weight_scale_row_group > 1:
+                group = self.weight_scale_row_group
+                assert start % group == 0 and length % group == 0, (
+                    f"blockscale row view must be {group}-aligned; got "
                     f"start={start} length={length}"
                 )
                 view.weight_scale = nn.Parameter(
-                    ws.data.narrow(0, start // 128, length // 128),
+                    ws.data.narrow(0, start // group, length // group),
                     requires_grad=False,
                 )
-            elif self.quant_type == QuantType.per_Token:
+            elif (
+                self.quant_type == QuantType.per_Token
+                or self.native_fp8_group_rows == 1
+            ):
                 view.weight_scale = nn.Parameter(
                     ws.data.narrow(0, start, length), requires_grad=False
                 )
@@ -1303,11 +1349,10 @@ class MergedColumnParallelLinear(LinearBase):
                 if param is getattr(self, "weight_scale", None) or param is getattr(
                     self, "input_scale", None
                 ):
-                    if self.quant_type not in (
-                        QuantType.per_1x32,
-                        QuantType.per_Token,
-                    ):
+                    if self.quant_type == QuantType.per_Tensor:
                         shard_size //= 128
+                    else:
+                        shard_size //= self.weight_scale_row_group
                 shard = loaded_weight.narrow(self.tp_dim, current_offset, shard_size)
                 self.weight_loader(param, shard, shard_id)
                 current_offset += shard_size
@@ -1332,8 +1377,8 @@ class MergedColumnParallelLinear(LinearBase):
             current_offset = 0
             for shard_id, output_size in enumerate(self.output_sizes):
                 shard_size = output_size
-                if is_scale_param and self.quant_type == QuantType.per_1x128:
-                    shard_size //= 128
+                if is_scale_param and self.weight_scale_row_group > 1:
+                    shard_size //= self.weight_scale_row_group
 
                 shard = loaded_weight.narrow(self.tp_dim, current_offset, shard_size)
                 self.weight_loader(param, shard, shard_id)
@@ -1346,9 +1391,10 @@ class MergedColumnParallelLinear(LinearBase):
         if param is getattr(self, "weight_scale", None) or param is getattr(
             self, "input_scale", None
         ):
-            if self.quant_type == QuantType.per_1x128:
-                shard_offset = (shard_offset + 127) // 128
-                shard_size = (shard_size + 127) // 128
+            if self.weight_scale_row_group > 1:
+                group = self.weight_scale_row_group
+                shard_offset = (shard_offset + group - 1) // group
+                shard_size = (shard_size + group - 1) // group
             elif self.quant_type == QuantType.per_Tensor:
                 param_data = param_data.narrow(self.tp_dim, loaded_shard_id, 1)
                 if (
@@ -1542,9 +1588,10 @@ class QKVZBAParallelLinear(ColumnParallelLinear):
             shard_offset = q_size + k_size + v_size + z_size + b_size
 
         if is_scale:
-            if self.quant_type == QuantType.per_1x128:
-                shard_offset = (shard_offset + 127) // 128
-                shard_size = (shard_size + 127) // 128
+            if self.weight_scale_row_group > 1:
+                group = self.weight_scale_row_group
+                shard_offset = (shard_offset + group - 1) // group
+                shard_size = (shard_size + group - 1) // group
             elif self.quant_type == QuantType.per_Tensor:
                 loaded_weight = loaded_weight.view(1, 1).repeat(self.tp_size, 1)
                 shard_offset = ["qkvz", "ba", "qkv", "z", "b", "a"].index(
@@ -1831,9 +1878,7 @@ class QKVGParallelLinear(ColumnParallelLinear):
                 )
                 return
 
-            scale_factor = (
-                128 if (is_scale and self.quant_type == QuantType.per_1x128) else 1
-            )
+            scale_factor = self.weight_scale_row_group if is_scale else 1
             half = q_size // scale_factor
             start_idx = shard_rank * shard_size // scale_factor
             loaded_weight = loaded_weight.narrow(
@@ -1856,9 +1901,9 @@ class QKVGParallelLinear(ColumnParallelLinear):
         else:
             # K or V: straightforward load
             if is_scale:
-                if self.quant_type == QuantType.per_1x128:
-                    shard_offset //= 128
-                    shard_size //= 128
+                if self.weight_scale_row_group > 1:
+                    shard_offset //= self.weight_scale_row_group
+                    shard_size //= self.weight_scale_row_group
                 elif self.quant_type == QuantType.per_Tensor:
                     loaded_weight = loaded_weight.view(1, 1).repeat(self.tp_size, 1)
                     # [Gate, Q, K, V] -> K=2, V=3
@@ -1940,9 +1985,10 @@ class QKVParallelLinear(ColumnParallelLinear):
         if param is getattr(self, "weight_scale", None) or param is getattr(
             self, "input_scale", None
         ):
-            if self.quant_type == QuantType.per_1x128:
-                shard_offset = (shard_offset + 127) // 128
-                shard_size = (shard_size + 127) // 128
+            if self.weight_scale_row_group > 1:
+                group = self.weight_scale_row_group
+                shard_offset = (shard_offset + group - 1) // group
+                shard_size = (shard_size + group - 1) // group
             elif self.quant_type == QuantType.per_Tensor:
                 loaded_weight = loaded_weight.view(1, 1).repeat(self.tp_size, 1)
                 shard_offset = ["q", "k", "v"].index(loaded_shard_id)
@@ -2049,9 +2095,10 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
         if param is getattr(self, "weight_scale", None) or param is getattr(
             self, "input_scale", None
         ):
-            if self.quant_type == QuantType.per_1x128:
-                shard_offset = (shard_offset + 127) // 128
-                shard_size = (shard_size + 127) // 128
+            if self.weight_scale_row_group > 1:
+                group = self.weight_scale_row_group
+                shard_offset = (shard_offset + group - 1) // group
+                shard_size = (shard_size + group - 1) // group
             elif self.quant_type == QuantType.per_Tensor:
                 loaded_weight = loaded_weight.view(1, 1).repeat(self.tp_size, 1)
                 shard_offset = ["q", "k", "v", "index_q", "index_k"].index(
@@ -2161,11 +2208,12 @@ class MergedReplicatedLinear(ReplicatedLinear):
         if param is getattr(self, "weight_scale", None) or param is getattr(
             self, "input_scale", None
         ):
-            if self.quant_type == QuantType.per_1x128:
+            if self.weight_scale_row_group > 1:
+                group = self.weight_scale_row_group
                 shard_offset = (
-                    sum(self.output_sizes[:loaded_shard_id]) + 128 - 1
-                ) // 128
-                shard_size = (self.output_sizes[loaded_shard_id] + 128 - 1) // 128
+                    sum(self.output_sizes[:loaded_shard_id]) + group - 1
+                ) // group
+                shard_size = (self.output_sizes[loaded_shard_id] + group - 1) // group
             elif self.quant_type == QuantType.per_Tensor:
                 shard_offset = loaded_shard_id
                 shard_size = 1
