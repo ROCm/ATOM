@@ -520,39 +520,79 @@ ARG LMCACHE_WHEEL_URL=https://github.com/LMCache/LMCache/releases/download/v0.5.
 ARG LMCACHE_WHEEL_SHA256=06cda2fef1c2cf3926ffa59c4ba13b6029c6e40d3fba6db2bc2e7350a29c280f
 # Docker builds do not expose a GPU, so LMCache's torch.cuda.is_available()
 # backend predicate is overridden only in the validation process below.
-RUN echo "========== [ATOM] Install LMCache ROCm torch 2.10 wheel ==========" && \
-    curl -fL "${LMCACHE_WHEEL_URL}" -o "/tmp/${LMCACHE_WHEEL_NAME}" && \
-    echo "${LMCACHE_WHEEL_SHA256}  /tmp/${LMCACHE_WHEEL_NAME}" | sha256sum -c - && \
-    "${VENV_PYTHON}" -m pip install \
-        prometheus_client==0.25.0 aiofile==3.11.1 aiofiles caio==0.9.25 \
-        blake3 redis sortedcontainers pyzmq cupy-rocm-7-0 \
-        cachetools cryptography numba openai py-cpuinfo \
-        opentelemetry-api==1.40.0 opentelemetry-sdk==1.40.0 \
-        opentelemetry-exporter-otlp==1.40.0 \
-        opentelemetry-exporter-prometheus==0.61b0 && \
-    "${VENV_PYTHON}" -m pip install --no-deps "/tmp/${LMCACHE_WHEEL_NAME}" && \
-    rm -f "/tmp/${LMCACHE_WHEEL_NAME}" && \
-    "${VENV_PYTHON}" -c "import torch; torch.cuda.is_available = lambda: True; import lmcache, lmcache.cuda_ops, lmcache.lmcache_native; \
-from lmcache.v1.cache_engine import LMCacheEngineBuilder; \
-from lmcache.v1.memory_management import MemoryFormat; \
-from lmcache.v1.lookup_client.factory import LookupClientFactory; \
-from lmcache.v1.config import LMCacheEngineConfig; \
-from lmcache.v1.metadata import LMCacheMetadata; \
-from lmcache.integration.atom import AtomMPSchedulerAdapter, AtomMPTransferSpec, AtomMPWorkerAdapter; \
-from lmcache.utils import EngineType; \
-from lmcache.v1.multiprocess.futures import DeviceMessagingFuture; \
-from lmcache.v1.multiprocess.group_view import EngineGroupInfo; \
-assert 'rocm' in torch.__version__, torch.__version__; \
-assert lmcache.__version__.startswith('0.5.5rc3+rocm7.2.4.torch2.10'), lmcache.__version__; \
-assert lmcache.cuda_ops.__file__.endswith('.so'), lmcache.cuda_ops.__file__; \
-assert lmcache.lmcache_native.__file__.endswith('.so'), lmcache.lmcache_native.__file__; \
-assert hasattr(lmcache.cuda_ops, 'execute_object_group_transfer'), 'cuda_ops extension is incomplete'; \
-assert EngineType.ATOM.value == 'atom'; \
-assert DeviceMessagingFuture.__module__ == 'lmcache.v1.multiprocess.futures'; \
-assert AtomMPTransferSpec.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
-assert AtomMPSchedulerAdapter.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
-assert AtomMPWorkerAdapter.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
-print('OK: lmcache', lmcache.__version__, 'HIP cuda_ops; torch', torch.__version__)"
+# Two install paths, because the published wheel targets one ABI: its filename
+# pins rocm7.2.4 / torch 2.10, which is what the apt base image ships but not
+# the pip SDK's (torch 2.11 on ROCm 10.0, 2.13 on the 10.1 nightly), and the
+# validation below asserts that exact version string. LMCache publishes no
+# ROCm 10 wheel today -- every rocm asset on their releases, up to v0.5.5rc7,
+# is built for ROCm 7.2 -- so the ROCm 10 line keeps building the HIP c_ops
+# from source, which is how the images validated on gfx950 were built. ROCM_HOME
+# is set only by the rocm10-base stage and inherited through the image, so it
+# tells the two apart. Collapse this back to one path once a matching wheel
+# exists.
+ARG LMCACHE_TAG=v0.4.5
+RUN if [ -z "${ROCM_HOME}" ]; then \
+      echo "========== [ATOM] Install LMCache ROCm torch 2.10 wheel ==========" && \
+          curl -fL "${LMCACHE_WHEEL_URL}" -o "/tmp/${LMCACHE_WHEEL_NAME}" && \
+          echo "${LMCACHE_WHEEL_SHA256}  /tmp/${LMCACHE_WHEEL_NAME}" | sha256sum -c - && \
+          "${VENV_PYTHON}" -m pip install \
+              prometheus_client==0.25.0 aiofile==3.11.1 aiofiles caio==0.9.25 \
+              blake3 redis sortedcontainers pyzmq cupy-rocm-7-0 \
+              cachetools cryptography numba openai py-cpuinfo \
+              opentelemetry-api==1.40.0 opentelemetry-sdk==1.40.0 \
+              opentelemetry-exporter-otlp==1.40.0 \
+              opentelemetry-exporter-prometheus==0.61b0 && \
+          "${VENV_PYTHON}" -m pip install --no-deps "/tmp/${LMCACHE_WHEEL_NAME}" && \
+          rm -f "/tmp/${LMCACHE_WHEEL_NAME}" && \
+          "${VENV_PYTHON}" -c "import torch; torch.cuda.is_available = lambda: True; import lmcache, lmcache.cuda_ops, lmcache.lmcache_native; \
+      from lmcache.v1.cache_engine import LMCacheEngineBuilder; \
+      from lmcache.v1.memory_management import MemoryFormat; \
+      from lmcache.v1.lookup_client.factory import LookupClientFactory; \
+      from lmcache.v1.config import LMCacheEngineConfig; \
+      from lmcache.v1.metadata import LMCacheMetadata; \
+      from lmcache.integration.atom import AtomMPSchedulerAdapter, AtomMPTransferSpec, AtomMPWorkerAdapter; \
+      from lmcache.utils import EngineType; \
+      from lmcache.v1.multiprocess.futures import DeviceMessagingFuture; \
+      from lmcache.v1.multiprocess.group_view import EngineGroupInfo; \
+      assert 'rocm' in torch.__version__, torch.__version__; \
+      assert lmcache.__version__.startswith('0.5.5rc3+rocm7.2.4.torch2.10'), lmcache.__version__; \
+      assert lmcache.cuda_ops.__file__.endswith('.so'), lmcache.cuda_ops.__file__; \
+      assert lmcache.lmcache_native.__file__.endswith('.so'), lmcache.lmcache_native.__file__; \
+      assert hasattr(lmcache.cuda_ops, 'execute_object_group_transfer'), 'cuda_ops extension is incomplete'; \
+      assert EngineType.ATOM.value == 'atom'; \
+      assert DeviceMessagingFuture.__module__ == 'lmcache.v1.multiprocess.futures'; \
+      assert AtomMPTransferSpec.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
+      assert AtomMPSchedulerAdapter.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
+      assert AtomMPWorkerAdapter.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
+      print('OK: lmcache', lmcache.__version__, 'HIP cuda_ops; torch', torch.__version__)" ; \
+    else \
+      echo "========== [ATOM] LMCache HIP c_ops (${LMCACHE_TAG}, arch=${PYTORCH_ROCM_ARCH}) ==========" && \
+          git clone https://github.com/LMCache/LMCache.git /opt/LMCache && \
+          cd /opt/LMCache && git checkout ${LMCACHE_TAG} && \
+          "${VENV_PYTHON}" -m pip install -r requirements/build.txt && \
+          CXX=hipcc BUILD_WITH_HIP=1 \
+            "${VENV_PYTHON}" -m pip install -e . --no-build-isolation --no-deps && \
+          "${VENV_PYTHON}" -m pip install \
+              --extra-index-url "${ROCM_INDEX_URL}" \
+              -r requirements/common.txt \
+              cupy-rocm-7-0 && \
+          # common.txt pins prometheus_client<=0.24.1, downgrading ATOM's required
+          # >=0.25; restore ATOM's pin (lmcache only uses it for optional metrics).
+          "${VENV_PYTHON}" -m pip install "prometheus_client==0.25.0" && \
+          "${VENV_PYTHON}" -c "import glob, torch; \
+      c_ops_paths = glob.glob('/opt/LMCache/lmcache/c_ops*.so'); \
+      assert c_ops_paths, 'LMCache HIP c_ops extension was not built'; \
+      torch.cuda.is_available = lambda: True; \
+      import lmcache, lmcache.c_ops; \
+      from lmcache.v1.cache_engine import LMCacheEngineBuilder; \
+      from lmcache.v1.memory_management import MemoryFormat; \
+      from lmcache.v1.lookup_client.factory import LookupClientFactory; \
+      from lmcache.v1.config import LMCacheEngineConfig; \
+      from lmcache.v1.metadata import LMCacheMetadata; \
+      assert 'rocm' in torch.__version__, torch.__version__; \
+      assert lmcache.c_ops.__file__.endswith('.so'), 'c_ops fell back to python backend!'; \
+      print('OK: lmcache', lmcache.__version__, 'HIP c_ops; torch', torch.__version__)" ; \
+    fi
 
 # ========== SemiAnalysis aiperf agentic benchmark tool ==========
 # The SemiAnalysis fork, which is what carries the SA agentic datasets
