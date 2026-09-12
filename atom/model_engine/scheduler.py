@@ -1581,16 +1581,24 @@ class Scheduler:
                 self._publish_state_stores()
                 connector_meta_output = self.kv_connector.build_connector_meta()
 
-            # Freeze, per seq, whether this chunk finishes the prompt. Uses the
-            # pre-advance offsets so it is correct whether or not schedule-time
-            # advancement runs below.
+            # Freeze, per seq, whether this chunk is the last one this prefill
+            # owes. Uses the pre-advance offsets so it is correct whether or not
+            # schedule-time advancement runs below.
+            #
+            # Measured against `num_tokens`, for the same reason
+            # `next_token_ids` below is: a seq re-admitted after `preempt`
+            # re-forwards the tokens it had already generated, so its prefill
+            # runs past the prompt boundary. Ending it at `num_prompt_tokens`
+            # would call a middle chunk final and leave the rest of the context
+            # with no KV -- the sequence would then decode against blocks still
+            # holding the text of whichever request owned them last, and carry
+            # on writing that request's answer. Equal to `num_prompt_tokens` on
+            # a first admission, which is every seq that was never preempted.
             is_final_chunk = [
                 (num_cached_tokens_list[i] + int(num_scheduled_tokens[i]))
-                >= seq.num_prompt_tokens
+                >= seq.num_tokens
                 for i, seq in enumerate(scheduled_seqs.values())
             ]
-            # Bound on num_tokens (not num_prompt_tokens): preempted seqs
-            # re-forward generated tokens past the prompt boundary.
             next_token_ids = None
             if self.drafter_needs_next_token:
                 next_token_ids = []
@@ -2570,13 +2578,19 @@ class Scheduler:
                 # multiple steps (hash_blocks clips to fully-filled blocks).
                 self.block_manager.hash_blocks(seq, chunk)
                 seq.num_cached_tokens += chunk
-                # Prefill is partial until the whole PROMPT's KV is computed.
-                # Compare against num_prompt_tokens, not num_tokens: once a
-                # completion token is appended (this step's sampled token, or an
-                # externally-appended EOS), num_tokens > num_prompt_tokens and
-                # comparing against it would wrongly keep a finished prefill
-                # flagged partial — which makes the EOS/finish loop below skip it.
-                now_partial = seq.num_cached_tokens < seq.num_prompt_tokens
+                # Ask the scheduler what it decided rather than re-deriving it
+                # from lengths here. It froze `is_final_chunk` at pre-advance
+                # offsets, against the whole admitted length -- which for a
+                # preempted seq runs past the prompt. By the time this runs
+                # `num_tokens` may already have grown by this step's sampled
+                # token, so no comparison against it is safe either. The length
+                # fallback is for callers that hand a batch without the field;
+                # the scheduler always sets it.
+                final = getattr(batch, "is_final_chunk", None)
+                if final is not None:
+                    now_partial = not final[i]
+                else:
+                    now_partial = seq.num_cached_tokens < seq.num_prompt_tokens
                 if now_partial != seq.is_partial_prefill:
                     self._partial_prefill_count += 1 if now_partial else -1
                     seq.is_partial_prefill = now_partial
