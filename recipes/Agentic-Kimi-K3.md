@@ -69,11 +69,8 @@ changes.
 C8–C48 use 128 GiB LMCache; C56/C64 use **192 GiB**. LMCache CPU size is
 `LMCACHE_MAX_LOCAL_CPU_SIZE`; chunk size is 1024 tokens.
 
-`AITER_REUSE_IDENTICAL_COMM_GROUPS=1` on **every DCP=8 band** (C8…C64), and `0`
-on the DCP=1 bands (C1/C2/C4). Enabling it at C32/C40/C48 is what a 12-point
-MI355X sweep measured as a gain; on C1 a separate A/B measured it *costing*
-3.3–3.9% ITL, which is why the DCP=1 bands leave it off. The C8–C16 bands are
-still under A/B and may move; C56/C64 are unchanged from the original table.
+`AITER_REUSE_IDENTICAL_COMM_GROUPS=1` on **C56/C64**, and `0` on every other
+band (C1…C48).
 
 ## 0. Container prerequisites
 
@@ -190,9 +187,9 @@ case "${CONC}" in
     ;;
 esac
 
-# Reuse tracks DCP, not CONC: on at every DCP=8 band, off on DCP=1. Stated as a
-# rule rather than repeated in nine branches so the two cannot drift apart.
-if [[ "${TP}" == "8" && "${DCP}" == "8" ]]; then
+# Stated as a rule rather than repeated in nine branches so the two cannot
+# drift apart.
+if [[ "${CONC}" -ge 56 ]]; then
   AITER_REUSE_IDENTICAL_COMM_GROUPS="${AITER_REUSE_IDENTICAL_COMM_GROUPS:-1}"
 fi
 AITER_REUSE_IDENTICAL_COMM_GROUPS="${AITER_REUSE_IDENTICAL_COMM_GROUPS:-0}"
