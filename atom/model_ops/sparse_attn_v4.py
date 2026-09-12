@@ -14,7 +14,6 @@ kernel's accumulation precision. They are correct but not performant.
 """
 
 import os
-from typing import Tuple
 
 import torch
 import triton
@@ -132,13 +131,22 @@ def _sparse_attn_triton_kernel(
     )
 
 
-def _sparse_attn_triton(
+def sparse_attn_triton(
     q: torch.Tensor,
     kv: torch.Tensor,
     attn_sink: torch.Tensor,
     topk_idxs: torch.Tensor,
     softmax_scale: float,
+    *,
+    block_k: int | None = None,
 ) -> torch.Tensor:
+    """Online softmax with an optional fixed KV tile for rounding parity.
+
+    BF16 probabilities are rounded per tile. Models that prescribe a tile
+    size must retain it even when another size would select the same keys.
+    """
+    if block_k is not None and block_k not in (16, 32, 64):
+        raise ValueError("Sparse attention block_k must be 16, 32 or 64")
     if not q.is_cuda:
         raise RuntimeError("Triton sparse_attn requires CUDA/HIP tensors")
     if q.dtype not in (torch.bfloat16, torch.float16):
@@ -160,7 +168,8 @@ def _sparse_attn_triton(
     # back to FMA.
     block_h = 16
     block_d = triton.next_power_of_2(D)
-    block_k = 16 if D >= 256 else 32
+    if block_k is None:
+        block_k = 16 if D >= 256 else 32
     _sparse_attn_triton_kernel[(B * M, triton.cdiv(H, block_h))](
         q,
         kv,
@@ -312,7 +321,7 @@ def _sparse_attn_ragged_triton(
     out = torch.empty_like(q)
     topk_idxs = topk_idxs.to(torch.int32)
 
-    # See _sparse_attn_triton: BLOCK_H must be >= 16 for AMD MFMA lowering.
+    # See sparse_attn_triton: BLOCK_H must be >= 16 for AMD MFMA lowering.
     block_h = 16
     block_d = triton.next_power_of_2(D)
     block_k = 16 if D >= 256 else 32
@@ -416,7 +425,7 @@ def _sparse_attn_torch(
           (sum_exp = exp(sink - (-inf)) = 0; division below uses safe eps).
     """
     B, M, H, D = q.shape
-    _, N, D_kv = kv.shape
+    _, _, D_kv = kv.shape
     K = topk_idxs.shape[-1]
     assert kv.shape[0] == B, f"batch mismatch: q={B} vs kv={kv.shape[0]}"
     assert D_kv == D, f"head_dim mismatch: q={D} vs kv={D_kv}"
@@ -491,7 +500,7 @@ def sparse_attn(
     implementation remains the default when the env var is unset.
     """
     if os.environ.get("ATOM_USE_TRITON_ATTN", "1") == "1":
-        return _sparse_attn_triton(q, kv, attn_sink, topk_idxs, softmax_scale)
+        return sparse_attn_triton(q, kv, attn_sink, topk_idxs, softmax_scale)
     return _sparse_attn_torch(q, kv, attn_sink, topk_idxs, softmax_scale)
 
 
@@ -507,7 +516,7 @@ def hc_split_sinkhorn(
     hc_mult: int = 4,
     sinkhorn_iters: int = 20,
     eps: float = 1e-6,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Split + project mHC mixing parameters.
 
     Reference: /data/DeepSeek-V4-Pro/inference/kernel.py:371-440
