@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
 from atom.model_engine.sequence import new_token_ids
+from atom.utils import itl_diagnostics as itl_diag
 
 logger = logging.getLogger("atom")
 
@@ -131,6 +132,11 @@ class StreamOutputCollector:
         self.request_id = request_id
         self._pending: dict[Any, dict] = {}
         self._ready = Event()
+        if itl_diag.enabled():
+            self._diag_puts = 0
+            self._diag_gets = 0
+            self._diag_tokens_in = 0
+            self._diag_tokens_out = 0
 
     def put_nowait(self, payload: dict | tuple[int, dict]) -> None:
         """Accept one prepared chunk. Called on the event loop, never off it."""
@@ -146,6 +152,20 @@ class StreamOutputCollector:
             self._pending[tag] = chunk
         else:
             merge_chunk(waiting, chunk)
+        if itl_diag.enabled():
+            self._diag_puts += 1
+            self._diag_tokens_in += len(chunk.get("token_ids") or ())
+            itl_diag.emit(
+                "frontend.collector_put",
+                api_id=self.request_id,
+                tag=tag,
+                ordinal=self._diag_puts,
+                tokens_in=self._diag_tokens_in,
+                merged=waiting is not None,
+                pending_tokens=len(self._pending[tag].get("token_ids") or ()),
+                text_chars=len(chunk.get("text") or ""),
+                finished=bool(chunk.get("finished")),
+            )
         self._ready.set()
 
     async def get(self) -> dict | tuple[int, dict]:
@@ -156,6 +176,19 @@ class StreamOutputCollector:
         del self._pending[tag]
         if not self._pending:
             self._ready.clear()
+        if itl_diag.enabled():
+            self._diag_gets += 1
+            self._diag_tokens_out += len(chunk.get("token_ids") or ())
+            itl_diag.emit(
+                "frontend.collector_get",
+                api_id=self.request_id,
+                tag=tag,
+                ordinal=self._diag_gets,
+                tokens_out=self._diag_tokens_out,
+                token_count=len(chunk.get("token_ids") or ()),
+                text_chars=len(chunk.get("text") or ""),
+                finished=bool(chunk.get("finished")),
+            )
         return chunk if tag is None else (tag, chunk)
 
 
@@ -273,6 +306,14 @@ class StreamBatchDispatcher:
         if buf is None:
             buf = self._thread_local.buf = []
         buf.append(_BufferedChunk(loop, collector, state, chunk, tag))
+        if itl_diag.enabled():
+            itl_diag.emit(
+                "frontend.dispatch_enqueue",
+                api_id=getattr(collector, "request_id", None),
+                tag=tag,
+                token_count=len(chunk.get("token_ids") or ()),
+                finished=bool(chunk.get("finished")),
+            )
 
     def flush(self) -> None:
         """Detokenize buffered chunks and schedule one delivery per event loop."""
@@ -284,18 +325,43 @@ class StreamBatchDispatcher:
 
         by_loop: dict[AbstractEventLoop, list[tuple[Any, Any]]] = {}
         for item in buf:
-            item.chunk["text"] = item.state.update(
-                item.chunk.get("token_ids") or [],
-                bool(item.chunk.get("finished")),
-            )
+            if itl_diag.enabled():
+                with itl_diag.span(
+                    "frontend.detokenize",
+                    api_id=getattr(item.collector, "request_id", None),
+                    tag=item.tag,
+                    token_count=len(item.chunk.get("token_ids") or ()),
+                ):
+                    item.chunk["text"] = item.state.update(
+                        item.chunk.get("token_ids") or [],
+                        bool(item.chunk.get("finished")),
+                    )
+            else:
+                item.chunk["text"] = item.state.update(
+                    item.chunk.get("token_ids") or [],
+                    bool(item.chunk.get("finished")),
+                )
             payload = item.chunk if item.tag is None else (item.tag, item.chunk)
             by_loop.setdefault(item.loop, []).append((item.collector, payload))
 
         for loop, items in by_loop.items():
-            loop.call_soon_threadsafe(self._deliver, items)
+            if itl_diag.enabled():
+                delivery_id = f"{threading.get_ident()}:{time.monotonic_ns()}"
+                itl_diag.emit(
+                    "frontend.loop_submit",
+                    delivery_id=delivery_id,
+                    api_ids=tuple(
+                        getattr(collector, "request_id", None) for collector, _ in items
+                    ),
+                )
+                loop.call_soon_threadsafe(self._deliver, items, delivery_id)
+            else:
+                loop.call_soon_threadsafe(self._deliver, items)
 
     @staticmethod
-    def _deliver(items: list[tuple[Any, Any]]) -> None:
+    def _deliver(
+        items: list[tuple[Any, Any]], diag_delivery_id: str | None = None
+    ) -> None:
         """Run on the target event loop and hand a whole step to its collectors.
 
         A step is delivered in one callback, never split across loop iterations.
@@ -306,5 +372,9 @@ class StreamBatchDispatcher:
         wrong order, and an end-of-stream that lands before a straggler is
         overwritten by it, hanging that client for good.
         """
+        if itl_diag.enabled():
+            itl_diag.emit(
+                "frontend.loop_arrive", delivery_id=diag_delivery_id, count=len(items)
+            )
         for collector, payload in items:
             collector.put_nowait(payload)

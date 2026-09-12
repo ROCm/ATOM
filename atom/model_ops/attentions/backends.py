@@ -107,6 +107,11 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
     def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
         raise NotImplementedError
 
+    def prepare_mixed(self, batch: ScheduledBatch, running_bs: int):
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support mixed batches"
+        )
+
     @abstractmethod
     def build(
         self,
@@ -396,6 +401,18 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         self.model_runner.forward_vars.update(attn_metadata)
         self.has_sliding_window = hasattr(hf_config, "sliding_window")
 
+    def _get_mixed_prefill_bank(self) -> dict:
+        """Separate pinned sources and device destinations for the P partition."""
+        if not hasattr(self, "_mixed_prefill_bank"):
+            bank = {}
+            for name, value in self.model_runner.forward_vars.items():
+                if isinstance(value, (CpuGpuBuffer, torch.Tensor)):
+                    bank[name] = value.clone()
+                else:
+                    bank[name] = value
+            self._mixed_prefill_bank = bank
+        return self._mixed_prefill_bank
+
     def prepare_block_tables(self, batch: ScheduledBatch, limit: int | None = None):
         """Marshal the batch's block tables into `forward_vars["block_tables"]`.
 
@@ -667,6 +684,8 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             self.execute_paged_state_copies(
                 state_ops.checkpoint_stores, state_ops.checkpoint_restores
             )
+        if getattr(batch, "is_mixed", False):
+            return self.prepare_mixed(batch, running_bs)
         is_prefill = batch.total_tokens_num_prefill > 0
         if is_prefill:
             return self.prepare_prefill(batch, running_bs)

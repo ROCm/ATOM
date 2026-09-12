@@ -469,6 +469,13 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         )
         return attn_metadata, positions
 
+    def prepare_mixed(self, batch: ScheduledBatch, running_bs: int):
+        attn_metadata, positions = super().prepare_mixed(batch, running_bs)
+        attn_metadata.kda_metadata = self.prepare_gdn_metadata(
+            batch, attn_metadata, is_prefill=True, prepare_block_tables=False
+        )
+        return attn_metadata, positions
+
     def prepare_decode(
         self,
         batch: ScheduledBatch,

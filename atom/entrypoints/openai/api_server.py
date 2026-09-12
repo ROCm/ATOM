@@ -42,6 +42,7 @@ from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.multimodal import build_multimodal_inputs
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import new_token_ids
+from atom.utils import itl_diagnostics as itl_diag
 from atom.utils.arg_parser import FlexibleArgumentParser
 from atom.utils.gc_utils import (
     freeze_gc_heap,
@@ -482,17 +483,64 @@ async def _client_stream(
     """
     it = gen.__aiter__()
     delivered = False
-    while True:
-        # The first wait is the queue, not silence: every generator awaits the
-        # collector before its opening frame.
-        with FrameWait(request_id, armed=delivered):
-            try:
-                chunk = await it.__anext__()
-            except StopAsyncIteration:
-                return
-        delivered = True
-        _log_sse(chunk, request_id)
-        yield chunk
+    diag = itl_diag.enabled()
+    ordinal = 0
+    try:
+        while True:
+            # The first wait is the queue, not silence: every generator awaits the
+            # collector before its opening frame.
+            if diag:
+                itl_diag.emit("http.generator_wait.begin", api_id=request_id)
+            with FrameWait(request_id, armed=delivered):
+                try:
+                    chunk = await it.__anext__()
+                except StopAsyncIteration:
+                    if diag:
+                        itl_diag.emit(
+                            "http.generator_wait.end", api_id=request_id, terminal=True
+                        )
+                    return
+                except BaseException:
+                    if diag:
+                        itl_diag.emit(
+                            "http.generator_wait.end",
+                            api_id=request_id,
+                            terminal=True,
+                            status="error",
+                        )
+                    raise
+            if diag:
+                itl_diag.emit(
+                    "http.generator_wait.end", api_id=request_id, terminal=False
+                )
+            delivered = True
+            _log_sse(chunk, request_id)
+            if diag:
+                ordinal += 1
+                itl_diag.emit(
+                    "http.yield",
+                    api_id=request_id,
+                    ordinal=ordinal,
+                    byte_count=len(chunk.encode("utf-8")),
+                    sse_frames=int(chunk.startswith("data:")) + chunk.count("\ndata:"),
+                )
+            yield chunk
+            if diag:
+                itl_diag.emit("http.resume", api_id=request_id, ordinal=ordinal)
+    except BaseException as exc:
+        if diag:
+            itl_diag.emit(
+                "http.stream_error",
+                critical=True,
+                api_id=request_id,
+                error_type=type(exc).__name__,
+            )
+        raise
+    finally:
+        if diag:
+            itl_diag.emit(
+                "http.stream_closed", critical=True, api_id=request_id, yields=ordinal
+            )
 
 
 # ============================================================================
@@ -1268,6 +1316,15 @@ async def setup_streaming_request(
             dp_parent_session_id=dp_parent_session_id,
         )
         _seq_id_to_request_id[seq.id] = request_id
+        if itl_diag.enabled():
+            itl_diag.emit(
+                "http.sequence_map",
+                critical=True,
+                api_id=request_id,
+                seq_id=seq.id,
+                tag=None,
+                prompt_tokens=seq.num_prompt_tokens,
+            )
         return seq
 
     seq = None
@@ -1307,6 +1364,14 @@ def cleanup_stream(seq_id: int, aborted: bool = False) -> None:
     no-op that just floods the control path (one broadcast per engine core, per
     request).
     """
+    if itl_diag.enabled():
+        itl_diag.emit(
+            "http.sequence_cleanup",
+            critical=True,
+            api_id=_seq_id_to_request_id.get(seq_id),
+            seq_id=seq_id,
+            aborted=aborted,
+        )
     _seq_id_to_request_id.pop(seq_id, None)
     if aborted:
         try:
@@ -1327,6 +1392,14 @@ def cleanup_request(request_id: str) -> None:
     """
     _stream_loops.pop(request_id, None)
     _request_start_times.pop(request_id, None)
+    if itl_diag.enabled():
+        itl_diag.emit(
+            "http.request_cleanup",
+            critical=True,
+            api_id=request_id,
+            active_streams=len(_stream_loops),
+            active_sequences=len(_seq_id_to_request_id),
+        )
 
 
 class _ClientDisconnected(Exception):
@@ -1488,8 +1561,17 @@ async def setup_streaming_request_fanout(
             dp_session_id=dp_session_id,
             dp_parent_session_id=dp_parent_session_id,
         )
-        for seq in seqs:
+        for tag, seq in enumerate(seqs):
             _seq_id_to_request_id[seq.id] = request_id
+            if itl_diag.enabled():
+                itl_diag.emit(
+                    "http.sequence_map",
+                    critical=True,
+                    api_id=request_id,
+                    seq_id=seq.id,
+                    tag=tag,
+                    prompt_tokens=seq.num_prompt_tokens,
+                )
         return seqs
 
     seqs = []
@@ -1532,6 +1614,13 @@ async def _refresh_metrics_once() -> None:
         logger.warning("Failed to refresh Prometheus metrics", exc_info=True)
     else:
         _metrics_exporter.update(snapshot)
+        if itl_diag.enabled():
+            itl_diag.emit(
+                "http.active_streams",
+                active_streams=len(_stream_loops),
+                active_sequences=len(_seq_id_to_request_id),
+                callbacks=len(getattr(engine.core_mgr, "_seq_id_to_callback", {})),
+            )
 
 
 async def _metrics_refresh_loop() -> None:
@@ -1565,6 +1654,7 @@ async def lifespan(app: FastAPI):
         logger.info("Server shutting down, releasing resources...")
         if engine is not None:
             engine.close()
+        itl_diag.close()
 
 
 app = FastAPI(title="ATOM OpenAI API Server", lifespan=lifespan)
@@ -1657,6 +1747,15 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         )
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
+        if itl_diag.enabled():
+            itl_diag.emit(
+                "http.request_map",
+                critical=True,
+                api_id=request_id,
+                client_id=raw_request.headers.get("x-request-id"),
+                endpoint="chat_completions",
+                stream=bool(request.stream),
+            )
         dp_session_id, dp_parent_session_id = _get_dp_session_affinity_ids(raw_request)
         dp_routing = {
             "data_parallel_rank": request.data_parallel_rank,
@@ -1889,6 +1988,15 @@ async def completions(request: CompletionRequest, raw_request: Request):
         )
 
         request_id = f"cmpl-{uuid.uuid4().hex}"
+        if itl_diag.enabled():
+            itl_diag.emit(
+                "http.request_map",
+                critical=True,
+                api_id=request_id,
+                client_id=raw_request.headers.get("x-request-id"),
+                endpoint="completions",
+                stream=bool(request.stream),
+            )
         dp_session_id, dp_parent_session_id = _get_dp_session_affinity_ids(raw_request)
         dp_routing = {
             "data_parallel_rank": request.data_parallel_rank,
@@ -2073,6 +2181,15 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         )
 
         request_id = uuid.uuid4().hex[:24]
+        if itl_diag.enabled():
+            itl_diag.emit(
+                "http.request_map",
+                critical=True,
+                api_id=request_id,
+                client_id=raw_request.headers.get("x-request-id"),
+                endpoint="anthropic_messages",
+                stream=bool(request.stream),
+            )
         input_tokens = len(tokenizer.encode(prompt))
 
         max_ctx = None

@@ -1181,6 +1181,9 @@ class MLAAttention(nn.Module):
         else:
             n_heads_out = self.qrep_num_heads if self.qrep_enabled else self.num_heads
             q = self.q_proj(x, x_scale).view(-1, n_heads_out, self.qk_head_dim)
+        return self._projected_q_to_latent(q, group)
+
+    def _projected_q_to_latent(self, q, group=False):
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         # Convert from (B, N, P) to (N, B, P)
@@ -2475,6 +2478,101 @@ class MLAAttention(nn.Module):
         _, k_pe = self.rotary_emb(positions, torch.empty_like(k_pe), k_pe)
         self._pcp_write_full_kv(kv_cache, kv_c, k_pe, slot_mapping)
 
+    def _forward_mixed(
+        self, q, k_nope, k_rope, positions, q_scale, kv_cache, context, metadata
+    ):
+        assert not self.is_sparse_mla
+        n_p = context.num_prefill_tokens
+        p_meta = metadata.prefill_attn_metadata
+        d_meta = metadata.decode_attn_metadata
+        proj = self._local_q_proj() if self.qrep_enabled else self.q_proj
+        projected = proj(q, x_scale=q_scale).view(-1, self.num_heads, self.qk_head_dim)
+        p_q = projected[:n_p]
+        p_k = k_nope[:n_p]
+        p_rope = k_rope[:n_p]
+        self.rotary_emb(positions[:n_p], p_q[..., self.qk_nope_head_dim :], p_rope)
+        if self.use_seg_mla:
+            concat_and_cache_mla_seg(
+                p_k,
+                p_rope.squeeze(1),
+                self._seg_kv_cache_view(kv_cache),
+                p_meta.slot_mapping.flatten(),
+                kv_cache_dtype=self.kv_cache_dtype,
+                scale=self._k_scale,
+            )
+        else:
+            concat_and_cache_mla(
+                p_k,
+                p_rope.squeeze(1),
+                kv_cache,
+                p_meta.slot_mapping.flatten(),
+                kv_cache_dtype=self.kv_cache_dtype,
+                scale=self._k_scale,
+            )
+        if p_meta.has_cached:
+            chunk_meta = getattr(p_meta, "mla_chunk_meta", None)
+            if chunk_meta is not None:
+                p_out = self._forward_prefill_cached_chunked(
+                    p_q, p_k, p_rope, kv_cache, p_meta, chunk_meta
+                )
+            else:
+                p_out = self._forward_prefill_cached_single_pass(p_q, kv_cache, p_meta)
+        else:
+            p_out = self._forward_prefill_mha(p_q, p_k, p_rope, kv_cache, p_meta)
+
+        d_nope, d_rope = self._projected_q_to_latent(projected[n_p:])
+        width = (
+            _MLA_Q_OUT_PADDED_DIM
+            if self.use_seg_mla
+            else self.kv_lora_rank + self.qk_rope_head_dim
+        )
+        d_q = torch.empty(
+            (d_nope.shape[0], self.num_heads, width),
+            dtype=d_meta.dtype_q,
+            device=d_nope.device,
+        )
+        if self.use_seg_mla and self.dcp_world_size <= 1:
+            fused_qk_rope_concat_and_cache_mla_seg(
+                d_nope,
+                d_rope,
+                k_nope[n_p:],
+                k_rope[n_p:],
+                self._seg_kv_cache_view(kv_cache),
+                d_q,
+                d_meta.slot_mapping,
+                self._k_scale,
+                self._q_scale,
+                positions[n_p:],
+                self.rotary_emb.cos_cache,
+                self.rotary_emb.sin_cache,
+                is_neox=self.rotary_emb.is_neox_style,
+            )
+        else:
+            fused_qk_rope_concat_and_cache_mla(
+                d_nope,
+                d_rope,
+                k_nope[n_p:],
+                k_rope[n_p:],
+                kv_cache.view(
+                    kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
+                ),
+                d_q,
+                d_meta.slot_mapping,
+                self._k_scale,
+                self._q_scale,
+                positions[n_p:],
+                self.rotary_emb.cos_cache,
+                self.rotary_emb.sin_cache,
+                is_neox=self.rotary_emb.is_neox_style,
+                is_nope_first=True,
+                compute_all_q_rope=self.dcp_world_size > 1,
+            )
+        if self.dcp_world_size > 1:
+            d_out = self._dcp_decode(d_q, kv_cache, d_meta, False)
+        else:
+            d_out = self._forward_decode(d_q, kv_cache, d_meta)
+        return torch.cat((p_out, d_out))
+
     def forward_impl(
         self,
         q: torch.Tensor,
@@ -2501,6 +2599,11 @@ class MLAAttention(nn.Module):
             return output
         kv_cache_data = forward_context.kv_cache_data
         kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
+
+        if context.is_mixed:
+            return self._forward_mixed(
+                q, k_nope, k_rope, positions, q_scale, kv_cache, context, attn_metadata
+            )
 
         if context.is_prefill and not use_prefill_mla:
             # QREP: q_proj emits the whole DCP-group head set, but prefill needs

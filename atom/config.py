@@ -1590,6 +1590,7 @@ class Config:
     index_cache_dtype: str | None = None
     enable_prefix_caching: bool = True
     enable_chunked_prefill: bool = True
+    enable_mixed_prefill_decode: bool = False
     enable_log_stats: bool = True
     # Seconds between engine-status lines. Validated > 0 by EngineStats.
     throughput_log_interval: float = 10.0
@@ -1678,6 +1679,32 @@ class Config:
     # coordination between prefill and decode. When False (default),
     # use plain separate streams with no CU masking.
     disagg_constrained: bool = False
+
+    def validate_mixed_prefill_decode(self) -> None:
+        if not self.enable_mixed_prefill_decode:
+            return
+        if (
+            self.hf_config.architectures != ["KimiK3ForConditionalGeneration"]
+            or self.plugin_config is not None
+            or self.parallel_config.data_parallel_size != 1
+            or self.pipeline_parallel_size != 1
+            or self.prefill_context_parallel_size != 1
+            or self.speculative_config is not None
+            or not self.enable_chunked_prefill
+            or self.enable_tbo
+            or self.enable_tbo_decode
+            or self.enable_rapidserve
+        ):
+            raise ValueError(
+                "Mixed prefill/decode requires native K3, DP1/PP1/PCP1, "
+                "chunked prefill, no spec/TBO/RapidServe."
+            )
+        if envs.ATOM_DIAG_DP1_PREFILL_DELAYER:
+            raise ValueError(
+                "Mixed prefill/decode is incompatible with DP1 PrefillDelayer"
+            )
+        if envs.ATOM_USE_TRITON_MLA:
+            raise ValueError("Mixed prefill/decode requires the AITER MLA backend")
 
     @property
     def tp_world_size(self) -> int:
@@ -1873,6 +1900,7 @@ class Config:
         # Multimodal config (full config with vision_config) for vision encoder init
         self.multimodal_config = getattr(self.hf_config, "_multimodal_config", None)
         _normalize_moe_config_fields(self.hf_config, self.model)
+        self.validate_mixed_prefill_decode()
         # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.
         # Synthesize when missing or None so GPT-OSS YaRN (rope_type in rope_scaling) is preserved.
         if getattr(self.hf_config, "rope_parameters", None) is None:

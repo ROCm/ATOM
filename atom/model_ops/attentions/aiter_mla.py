@@ -3,6 +3,7 @@
 
 import inspect
 import logging
+from copy import copy
 from dataclasses import dataclass
 
 import numpy as np
@@ -1611,6 +1612,83 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # Attached last, once all metadata is finalized. No-op unless TBO is on.
         self._attach_tbo_prefill_cpu_lens(attn_metadata, bs)
         return attn_metadata, positions
+
+    @staticmethod
+    def _mixed_partition(batch: ScheduledBatch, prefill: bool):
+        """One half of a mixed batch, for an MLA sub-builder to read as a batch.
+
+        Only the fields indexed by batch position are re-based. The per-req
+        state lists are deliberately not among them: they are built from the
+        seqs holding a claimed slot, so they are aligned with each other and
+        not with `req_ids`, and `n_p` is not a boundary in them. KDA owns
+        state and builds over the whole batch, where that alignment holds.
+        """
+        part = copy(batch)
+        n_p = batch.total_seqs_num_prefill
+        rows = slice(0, n_p) if prefill else slice(n_p, batch.total_seqs_num)
+        for name in (
+            "req_ids",
+            "context_lens",
+            "num_cached_tokens",
+            "num_scheduled_tokens",
+            "block_tables",
+            "last_block_num_tokens",
+            "is_first_decode_without_local_prefill",
+            "is_final_chunk",
+        ):
+            value = getattr(batch, name, None)
+            if value is not None:
+                setattr(part, name, value[rows])
+        n = n_p if prefill else batch.total_seqs_num_decode
+        tokens = (
+            batch.total_tokens_num_prefill if prefill else batch.total_tokens_num_decode
+        )
+        part.total_seqs_num = n
+        part.total_seqs_num_prefill = n if prefill else 0
+        part.total_seqs_num_decode = 0 if prefill else n
+        part.total_tokens_num = tokens
+        part.total_tokens_num_prefill = tokens if prefill else 0
+        part.total_tokens_num_decode = 0 if prefill else tokens
+        part.is_mixed = False
+        return part
+
+    def prepare_mixed(self, batch: ScheduledBatch, running_bs: int):
+        assert not self.is_sparse and batch.num_spec_step == 0
+        assert running_bs >= batch.total_seqs_num
+        # The runner's graph ladder may round its width; mixed is unpadded.
+        n_p = batch.total_seqs_num_prefill
+        n_d = batch.total_seqs_num_decode
+        assert n_p > 0 and n_d > 0 and batch.total_tokens_num_decode == n_d
+        p_batch = self._mixed_partition(batch, True)
+        d_batch = self._mixed_partition(batch, False)
+        main_var = self.model_runner.forward_vars
+        self.model_runner.forward_vars = self._get_mixed_prefill_bank()
+        try:
+            # Bypass hybrid overrides: KDA must be built once for the whole batch.
+            p_meta, p_positions = AiterMLAMetadataBuilder.prepare_prefill(
+                self, p_batch, n_p
+            )
+        finally:
+            self.model_runner.forward_vars = main_var
+        main_var["cu_seqlens_q"].np[: n_d + 1] = np.arange(n_d + 1, dtype=np.int32)
+        main_var["kv_indptr"].np[0] = 0
+        d_meta, d_positions = AiterMLAMetadataBuilder.prepare_decode(
+            self, d_batch, n_d, n_d, 1
+        )
+        cu = np.zeros(batch.total_seqs_num + 1, dtype=np.int32)
+        np.cumsum(batch.num_scheduled_tokens, out=cu[1:])
+        # A new tensor identity per step is required by AITER's chunk-index cache.
+        cu_gpu = torch.from_numpy(cu).to(self.device, non_blocking=True)
+        metadata = AttentionMetaData(
+            cu_seqlens_q=cu_gpu,
+            slot_mapping=torch.cat((p_meta.slot_mapping, d_meta.slot_mapping)),
+            prefill_attn_metadata=p_meta,
+            decode_attn_metadata=d_meta,
+            max_seqlen_q=max(p_meta.max_seqlen_q, 1),
+            max_seqlen_k=max(p_meta.max_seqlen_k, d_meta.max_seqlen_k),
+        )
+        metadata.dtype_q = self.dtype_q
+        return metadata, torch.cat((p_positions, d_positions))
 
     def _build_mla_chunk_meta(
         self, batch: ScheduledBatch, bs: int

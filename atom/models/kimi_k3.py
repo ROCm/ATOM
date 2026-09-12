@@ -156,6 +156,15 @@ _RMS_FUSABLE_QUANT_TYPES = (
     QuantType.per_Token,
 )
 
+# Decode rows in a mixed batch are one token each. Running them through the
+# ragged chunk kernel alongside the prefill rows costs ~4x what handing them to
+# the fused decode kernel does, but splitting pays a second launch per layer, so
+# it only pays off once there are enough rows to amortise. Measured crossover on
+# MI355 at TP8 is ~18 rows against a prefill chunk that fills the 8192-token
+# budget, and higher for shorter chunks; below it the single ragged launch wins
+# by ~5 ms per step across the 69 KDA layers.
+MIXED_KDA_SPLIT_MIN_DECODES = 20
+
 
 def _effective_layer_quant(
     quant_config: QuantizationConfig | None, prefix: str
@@ -1283,24 +1292,68 @@ class KimiKDAAttention(nn.Module):
             # replacing the gather + separate zero-write.
             from atom.model_ops.kimi_k3 import gather_kda_initial_state
 
-            initial = gather_kda_initial_state(
-                ssm_state, state_indices_in, kda_metadata.has_initial_state
-            )
-            kda_out, last_state = self._run_kda(
-                q,
-                k,
-                v,
-                gate,
-                beta,
-                initial,
-                query_start_loc,
-                True,
-            )
-            # last_state already has ssm_state's dtype (fla preserves the
-            # initial_state dtype; the gathered initial is allocated as such),
-            # so no .to() cast is needed.
-            ssm_state[state_indices] = last_state
-            out.copy_(kda_out.squeeze(0))
+            num_decodes = kda_metadata.num_decodes
+            if num_decodes >= MIXED_KDA_SPLIT_MIN_DECODES:
+                num_prefills = kda_metadata.num_prefills
+                npt = kda_metadata.num_prefill_tokens
+                initial = gather_kda_initial_state(
+                    ssm_state,
+                    state_indices_in[:num_prefills],
+                    kda_metadata.has_initial_state[:num_prefills],
+                )
+                kda_out, last_state = self._run_kda(
+                    q[:, :npt],
+                    k[:, :npt],
+                    v[:, :npt],
+                    gate[:, :npt],
+                    beta[:, :npt],
+                    initial,
+                    query_start_loc[: num_prefills + 1],
+                    True,
+                )
+                ssm_state[state_indices[:num_prefills]] = last_state
+                out[:npt].copy_(kda_out.squeeze(0))
+                # Byte-for-byte the call a pure-decode step makes, so a request's
+                # decode rows stay on one kernel across the pure<->mixed boundary
+                # instead of changing reduction mid-sequence.
+                fused_sigmoid_gating_delta_rule_update(
+                    A_log=self.A_log,
+                    a=gate[:, npt:],
+                    b=beta[:, npt:],
+                    dt_bias=self.dt_bias,
+                    q=q[:, npt:],
+                    k=k[:, npt:],
+                    v=v[:, npt:],
+                    o=out[npt:],
+                    initial_state=ssm_state,
+                    inplace_final_state=True,
+                    cu_seqlens=kda_metadata.mixed_decode_query_start_loc,
+                    ssm_state_indices=state_indices[
+                        num_prefills : num_prefills + num_decodes
+                    ],
+                    use_qk_l2norm_in_kernel=True,
+                    is_kda=True,
+                    lower_bound=self._kda_gate_lower_bound,
+                )
+            else:
+                initial = gather_kda_initial_state(
+                    ssm_state, state_indices_in, kda_metadata.has_initial_state
+                )
+                kda_out, last_state = self._run_kda(
+                    q,
+                    k,
+                    v,
+                    gate,
+                    beta,
+                    initial,
+                    query_start_loc,
+                    True,
+                )
+                # last_state already has ssm_state's dtype (fla preserves the
+                # initial_state dtype; the gathered initial is allocated as such),
+                # so no .to() cast is needed.
+                ssm_state[state_indices] = last_state
+                out.copy_(kda_out.squeeze(0))
         elif kda_metadata.num_decodes > 0:
             # Slice the per-token cache-slot indices once (used for both the
             # conv update and the fused recurrence below).

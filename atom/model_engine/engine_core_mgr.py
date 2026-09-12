@@ -15,7 +15,6 @@ from threading import Lock, Thread
 
 import zmq
 import zmq.asyncio
-
 from atom.config import Config
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.request import RequestOutput
@@ -26,6 +25,7 @@ from atom.utils import (
     get_open_zmq_ipc_path,
     make_zmq_socket,
 )
+from atom.utils import itl_diagnostics as itl_diag
 
 logger = logging.getLogger("atom")
 
@@ -176,6 +176,7 @@ class CoreManager:
         Routing state sizes to the global count -- a short array would
         IndexError the moment the balancer picked a remote rank.
         """
+        itl_diag.configure(getattr(config, "torch_profiler_dir", None), "frontend")
         self.label = label
         self._closed = False  # Track whether already closed
         self.local_engine_count = local_engine_count
@@ -593,6 +594,19 @@ class CoreManager:
                         break
                     elif request_type == EngineCoreRequestType.STREAM:
                         stream_outputs = data  # List of (seq_id, RequestOutput) tuples
+                        diag = itl_diag.enabled()
+                        if diag:
+                            itl_diag.emit(
+                                "frontend.stream_receive",
+                                dp_rank=dp_rank,
+                                seq_ids=tuple(sid for sid, _ in stream_outputs),
+                                token_counts=tuple(
+                                    len(out.output_tokens) for _, out in stream_outputs
+                                ),
+                                finished=tuple(
+                                    out.finished for _, out in stream_outputs
+                                ),
+                            )
                         logger.debug(
                             f"{self.label}: Received STREAM message with {len(stream_outputs)} outputs"
                         )
@@ -619,7 +633,13 @@ class CoreManager:
                                 )
                             if callback is not None:
                                 try:
-                                    callback(request_output)
+                                    if diag:
+                                        with itl_diag.span(
+                                            "frontend.callback", seq_id=seq_id
+                                        ):
+                                            callback(request_output)
+                                    else:
+                                        callback(request_output)
                                     if dbg:
                                         logger.debug(
                                             f"{self.label}: Successfully called callback for seq_id={seq_id}"
@@ -629,6 +649,14 @@ class CoreManager:
                                         f"Error calling stream_callback for sequence {seq_id}: {e}",
                                         exc_info=True,
                                     )
+                            if diag:
+                                itl_diag.emit(
+                                    "frontend.callback_result",
+                                    critical=request_output.finished,
+                                    seq_id=seq_id,
+                                    callback_found=callback is not None,
+                                    finished=request_output.finished,
+                                )
                             if request_output.finished:
                                 self._seq_id_to_callback.pop(seq_id, None)
                                 self._release_seq_load(seq_id)
@@ -644,7 +672,13 @@ class CoreManager:
                         # cycle. No-op when no streaming request is in flight.
                         if self._flush_stream_batch_fn is not None:
                             try:
-                                self._flush_stream_batch_fn()
+                                if itl_diag.enabled():
+                                    with itl_diag.span(
+                                        "frontend.flush", dp_rank=dp_rank
+                                    ):
+                                        self._flush_stream_batch_fn()
+                                else:
+                                    self._flush_stream_batch_fn()
                             except Exception as e:
                                 logger.warning(
                                     f"{self.label}: flush_stream_batch failed: {e}",
@@ -679,7 +713,13 @@ class CoreManager:
                             # without this flush the chunk never reaches the
                             # request's collector and the client still hangs.
                             try:
-                                self._flush_stream_batch_fn()
+                                if itl_diag.enabled():
+                                    with itl_diag.span(
+                                        "frontend.flush", dp_rank=dp_rank
+                                    ):
+                                        self._flush_stream_batch_fn()
+                                else:
+                                    self._flush_stream_batch_fn()
                             except Exception as e:
                                 logger.warning(
                                     f"{self.label}: flush_stream_batch failed: {e}",

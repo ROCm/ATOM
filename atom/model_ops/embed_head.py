@@ -246,7 +246,16 @@ class ParallelLMHead(VocabParallelEmbedding):
             context = forward_context.context
             attn_metadata = forward_context.attn_metadata
             # context = get_context()
-            if context.is_prefill and not context.is_draft:
+            if context.is_mixed and not context.is_draft:
+                p_last = attn_metadata.prefill_attn_metadata.cu_seqlens_q[1:] - 1
+                d_rows = torch.arange(
+                    context.num_prefill_tokens,
+                    context.scheduled_tokens,
+                    device=x.device,
+                    dtype=p_last.dtype,
+                )
+                x = x[torch.cat((p_last, d_rows))].contiguous()
+            elif context.is_prefill and not context.is_draft:
                 last_indices = attn_metadata.cu_seqlens_q[1:] - 1
                 x = x[last_indices].contiguous()
             if self._can_use_dp_sharded_head(context):

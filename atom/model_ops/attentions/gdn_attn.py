@@ -66,6 +66,12 @@ class GDNAttentionMetadata:
     non_spec_query_start_loc: torch.Tensor | None = (
         None  # shape: [batch - num_spec_decodes + 1,]
     )
+    # Zero-based cu_seqlens over a mixed batch's decode rows alone, which under
+    # the [P | D] ordering are [num_prefills, num_prefills + num_decodes) and are
+    # one token each. The fused decode kernel requires a cu starting at 0, so the
+    # absolute tail of `non_spec_query_start_loc` cannot be handed to it
+    # directly. Built once per step; None unless the batch is mixed.
+    mixed_decode_query_start_loc: torch.Tensor | None = None
 
     spec_state_indices_tensor: torch.Tensor | None = None  # shape: [batch, num_spec]
     non_spec_state_indices_tensor: torch.Tensor | None = (
@@ -1107,9 +1113,15 @@ class GDNStateMixin:
         # scheduled, for a draft pass that follows. Decode's padding is older
         # than that and everything below is written for it.
         query_start_loc = attn_metadata.cu_seqlens_q
+        mixed = num_prefills > 0 and num_decodes > 0
+        if mixed:
+            assert not self.use_spec_decode and is_prefill
         if is_prefill:
-            query_start_loc = query_start_loc[: num_prefills + 1]
+            query_start_loc = query_start_loc[
+                : (num_reqs if mixed else num_prefills) + 1
+            ]
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
+        mixed_decode_query_start_loc = None
         if not self.use_spec_decode or is_prefill:
             self.prepare_state_indices(batch, with_spec=False)
             spec_token_indx = None
@@ -1173,12 +1185,26 @@ class GDNStateMixin:
             # from whatever the recycled state group still held. The backend
             # leaves `num_cached_tokens` None when no row has any, which is the
             # same all-False answer.
-            cached = attn_metadata.num_cached_tokens
-            has_initial_state = (
-                cached[:num_prefills] > 0
-                if cached is not None
-                else torch.zeros(num_prefills, dtype=torch.bool, device=self.device)
-            )
+            if mixed:
+                # Decode has live state even while its host cached cursor lags.
+                initial = np.asarray(
+                    [n > 0 for n in batch.num_cached_tokens[:num_prefills]]
+                    + [True] * num_decodes,
+                    dtype=np.bool_,
+                )
+                has_initial_state = torch.from_numpy(initial).to(
+                    self.device, non_blocking=True
+                )
+                mixed_decode_query_start_loc = torch.arange(
+                    num_decodes + 1, dtype=torch.int32, device=self.device
+                )
+            else:
+                cached = attn_metadata.num_cached_tokens
+                has_initial_state = (
+                    cached[:num_prefills] > 0
+                    if cached is not None
+                    else torch.zeros(num_prefills, dtype=torch.bool, device=self.device)
+                )
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
                 compute_causal_conv1d_metadata(non_spec_query_start_loc)
             )
@@ -1196,6 +1222,7 @@ class GDNStateMixin:
             has_initial_state=has_initial_state,
             spec_query_start_loc=spec_query_start_loc,
             non_spec_query_start_loc=non_spec_query_start_loc,
+            mixed_decode_query_start_loc=mixed_decode_query_start_loc,
             spec_state_indices_tensor=spec_state_indices_tensor,
             non_spec_state_indices_tensor=non_spec_state_indices_tensor,
             non_spec_state_indices_in_tensor=non_spec_state_indices_in_tensor,

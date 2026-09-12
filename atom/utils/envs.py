@@ -256,6 +256,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT", "1") == "1"
     ),
     # --- Profiling & Logging ---
+    # Temporary CPU-only ITL metadata diagnostics; requires a profiler directory.
+    "ATOM_DIAG_ITL": lambda: os.getenv("ATOM_DIAG_ITL", "0") == "1",
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     # Move the startup heap (model, compiled graph, tokenizer, KV block pool)
     # into CPython's permanent generation once warmup is done, so collections
@@ -498,6 +500,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # They are configured via --dspark-config (JSON dict) and carried in
     # config.dspark (see atom/config.py DSparkConfig). See
     # recipes/DSpark.md.
+    # Diagnostic opt-in for ordinary DP1; does not enable other engine paths.
+    "ATOM_DIAG_DP1_PREFILL_DELAYER": lambda: (
+        os.getenv("ATOM_DIAG_DP1_PREFILL_DELAYER", "0") == "1"
+    ),
     # --- PrefillDelayer (cross-DP prefill alignment) ---
     # Master switch; default on. Set "0" to disable construction.
     # The delayer is a prefill COALESCER: it holds back prefill admission under

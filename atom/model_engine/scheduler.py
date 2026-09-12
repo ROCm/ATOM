@@ -46,6 +46,7 @@ from atom.model_engine.state_runtime import (
     StateRuntime,
 )
 from atom.utils import envs
+from atom.utils import itl_diagnostics as itl_diag
 
 logger = logging.getLogger("atom")
 
@@ -160,7 +161,9 @@ class ScheduledBatch:
         is_final_chunk: list[bool] | None = None,
         next_token_ids: list[int] | None = None,
         state_maintenance_ops: StateMaintenanceOps | None = None,
+        diag_step_id: str | None = None,
     ):
+        self.diag_step_id = diag_step_id
         if scheduled_spec_decode_tokens is None:
             scheduled_spec_decode_tokens = {}
         self.remote_kv_block_ids = remote_kv_block_ids or []
@@ -346,6 +349,7 @@ class ScheduledBatch:
         self.total_seqs_num = total_seqs_num
         self.total_seqs_num_prefill = total_seqs_num_prefill
         self.total_seqs_num_decode = total_seqs_num_decode
+        self.is_mixed = total_seqs_num_prefill > 0 and total_seqs_num_decode > 0
 
         self.connector_meta_output = connector_meta_output
         self.finished_recving_kv_req_ids: list[int] = []
@@ -544,6 +548,9 @@ class Scheduler:
         self._detailed_annotation_enabled = envs.ATOM_ENABLE_DETAILED_ANNOTATION
 
         self.enable_chunked_prefill = config.enable_chunked_prefill
+        self.enable_mixed_prefill_decode = getattr(
+            config, "enable_mixed_prefill_decode", False
+        )
         # Running seqs currently mid-prefill; counter lets schedule() skip the
         # running-queue scan on pure-decode steps.
         self._partial_prefill_count: int = 0
@@ -623,6 +630,8 @@ class Scheduler:
         self.prefill_delayer: PrefillDelayer | None = None
 
     def set_prefill_delayer(self, delayer) -> None:
+        if self.enable_mixed_prefill_decode and delayer is not None:
+            raise ValueError("Mixed prefill/decode cannot use PrefillDelayer")
         self.prefill_delayer = delayer
 
     def _can_admit_head_prefill(self) -> bool:
@@ -1011,6 +1020,17 @@ class Scheduler:
         # whole prompt), so for them the batched-token budget is a hard cap even
         # when chunked prefill is on.
         is_multimodal = getattr(seq, "multimodal_data", None) is not None
+        if is_multimodal and self.enable_mixed_prefill_decode:
+            # Mixed batching serves the text path only. A multimodal prompt is
+            # taken whole and its vision embeddings are scattered over every
+            # row of the forward, which in a mixed batch includes the decode
+            # rows. Rejected rather than deferred: the condition is the
+            # config's, so waiting for a decode-free step could never clear it.
+            return (
+                "multimodal prompts are not supported while mixed "
+                "prefill/decode is enabled. Restart without "
+                "--enable-mixed-prefill-decode to serve images."
+            )
         if (
             not self.enable_chunked_prefill or is_multimodal
         ) and num_tokens > self.max_num_batched_tokens:
@@ -1110,9 +1130,28 @@ class Scheduler:
         as long as it fires, and nothing would fail — the log would just go
         quiet, which is indistinguishable from an idle engine.
         """
+        if itl_diag.enabled():
+            self._itl_observe_state("before_schedule")
         result = self._schedule()
         self._record_throughput(num_prompt_tokens=_prompt_tokens_of(result))
+        if itl_diag.enabled():
+            self._itl_observe_state("after_schedule")
         return result
+
+    def _itl_observe_state(self, boundary):
+        # Queue/status observations are not a prediction of decode eligibility.
+        state = {
+            name: [
+                (seq.id, seq.status.name, seq.type.name, seq.is_partial_prefill)
+                for seq in getattr(self, name, ())
+            ]
+            for name in ("running", "waiting")
+        }
+        state["pp_inflight"] = sorted(self._pp_inflight_token_block)
+        state["deferred_free"] = list(self.deferred_free_blocks)
+        if state != getattr(self, "_itl_last_state", None):
+            self._itl_last_state = state
+            itl_diag.emit("scheduler.state", boundary=boundary, **state)
 
     def _schedule(self) -> tuple[ScheduledBatch, dict[int, Sequence]] | None:
         """Select the next batch of sequences for a forward pass.
@@ -1163,6 +1202,14 @@ class Scheduler:
         if not self.running and not self.waiting:
             return None
 
+        decode_selection = None
+        if self.enable_mixed_prefill_decode:
+            decode_selection = self._select_decode()
+        decode_seqs = decode_selection[0] if decode_selection else {}
+        decode_tokens = sum(decode_selection[1]) if decode_selection else 0
+        prefill_seq_budget = self.max_num_seqs - len(decode_seqs)
+        prefill_token_budget = self.max_num_batched_tokens - decode_tokens
+
         # ---- Phase 1: resume partial prefills from running ----
         # Gated by `delayer_allows` so cross-DP alignment still holds when one
         # rank is mid-chunked-prefill: a delayer veto skips both Phase 1 and
@@ -1171,14 +1218,14 @@ class Scheduler:
         # using the counter maintained by postprocess / preempt / finished-removal.
         if delayer_allows and self._partial_prefill_count > 0:
             for seq in self.running:
-                if num_seqs_prefill >= self.max_num_seqs:
+                if num_seqs_prefill >= prefill_seq_budget:
                     break
                 if not seq.is_partial_prefill:
                     continue
                 remaining = seq.num_tokens - seq.num_cached_tokens
                 if 0 < self.long_prefill_token_threshold < remaining:
                     remaining = self.long_prefill_token_threshold
-                budget_remaining = self.max_num_batched_tokens - num_batched_tokens
+                budget_remaining = prefill_token_budget - num_batched_tokens
                 chunk = self._chunked_prefill_size(
                     remaining, budget_remaining, num_batched_tokens
                 )
@@ -1199,8 +1246,8 @@ class Scheduler:
             delayer_allows
             and (self.delay_factor <= 0 or self._passed_delay(time.time()))
             and self.waiting
-            and num_seqs_prefill < self.max_num_seqs
-            and num_batched_tokens < self.max_num_batched_tokens
+            and num_seqs_prefill < prefill_seq_budget
+            and num_batched_tokens < prefill_token_budget
         ):
             seq = self.waiting.popleft()
 
@@ -1261,7 +1308,7 @@ class Scheduler:
                 # Blocks already held from the pre-park allocate; only re-check
                 # the batch budget. No re-match / re-allocate / re-park.
                 num_new_tokens = seq.num_prompt_tokens - seq.num_cached_tokens
-                budget_remaining = self.max_num_batched_tokens - num_batched_tokens
+                budget_remaining = prefill_token_budget - num_batched_tokens
                 chunk = self._prefill_chunk_for_budget(
                     num_new_tokens, budget_remaining, num_batched_tokens
                 )
@@ -1335,7 +1382,7 @@ class Scheduler:
                 and 0 < self.long_prefill_token_threshold < num_new_tokens
             ):
                 num_new_tokens = self.long_prefill_token_threshold
-            budget_remaining = self.max_num_batched_tokens - num_batched_tokens
+            budget_remaining = prefill_token_budget - num_batched_tokens
             chunk = self._prefill_chunk_for_budget(
                 num_new_tokens, budget_remaining, num_batched_tokens
             )
@@ -1523,14 +1570,21 @@ class Scheduler:
             num_cached_tokens_list = [
                 seq.num_cached_tokens for seq in scheduled_seqs.values()
             ]
+            # A mixed batch is identified by both counts being non-zero, so the
+            # decode rows merged in below have to appear here or the shape of
+            # the forward is not recoverable from the log.
+            mixed_note = (
+                f" + {len(decode_seqs)} decode ({decode_tokens} tokens)"
+                if decode_seqs
+                else ""
+            )
             logger.info(
                 f"Scheduled prefill batch: {num_seqs_prefill} reqs, "
                 f"{total_tokens_num_prefill} new tokens "
                 f"(done: {num_cached_tokens_list}, new: {num_scheduled_tokens}), "
-                f"req_ids: {tuple(scheduled_seqs.keys())}"
+                f"req_ids: {tuple(scheduled_seqs.keys())}{mixed_note}"
             )
             self.prev_prompt = True
-            # lip: TODO for prefill/decode mixed batch
 
             connector_meta_output = None
             if self.kv_connector is not None:
@@ -1570,17 +1624,34 @@ class Scheduler:
                     seq, start, start + int(num_scheduled_tokens[i])
                 )
 
+            if decode_seqs:
+                scheduled_seqs.update(decode_seqs)
+                num_scheduled_tokens.extend(decode_selection[1])
+                num_cached_tokens_list.extend(
+                    seq.num_cached_tokens for seq in decode_seqs.values()
+                )
+                is_final_chunk.extend([True] * len(decode_seqs))
+
             prefill_batch = ScheduledBatch(
                 seqs=scheduled_seqs,
                 num_scheduled_tokens=num_scheduled_tokens,
-                total_tokens_num=total_tokens_num_prefill,
+                total_tokens_num=total_tokens_num_prefill + decode_tokens,
+                total_tokens_num_decode=decode_tokens,
+                total_seqs_num_decode=len(decode_seqs),
                 total_tokens_num_prefill=total_tokens_num_prefill,
-                total_seqs_num=num_seqs_prefill,
+                total_seqs_num=num_seqs_prefill + len(decode_seqs),
                 total_seqs_num_prefill=num_seqs_prefill,
                 connector_meta_output=connector_meta_output,
                 num_cached_tokens=num_cached_tokens_list,
                 is_final_chunk=is_final_chunk,
                 next_token_ids=next_token_ids,
+                # Carried for the same reason the decode-only batch carries
+                # them: a first decode's blocks are the decode selection's to
+                # report, and which batch it merged into does not change that.
+                remote_kv_block_ids=(
+                    sorted(decode_selection[3]) if decode_seqs else []
+                ),
+                remote_kv_seq_blocks=decode_selection[4] if decode_seqs else None,
                 state_maintenance_ops=self.block_manager.take_state_maintenance_ops(),
             )
             self._consume_state_forks(scheduled_seqs)
@@ -1594,7 +1665,54 @@ class Scheduler:
 
             return (prefill_batch, scheduled_seqs)
 
-        # --- Decode scheduling ---
+        if decode_selection is None:
+            decode_selection = self._select_decode()
+        (
+            scheduled_seqs,
+            num_scheduled_tokens,
+            scheduled_spec_decode_tokens,
+            remote_kv_blocks,
+            remote_kv_seq_blocks,
+        ) = decode_selection
+        num_seqs_decode = len(scheduled_seqs)
+        total_tokens_num_decode = sum(num_scheduled_tokens)
+
+        connector_meta_output = None
+        if self.kv_connector is not None:
+            self._publish_state_loads()
+            self._publish_state_stores()
+            connector_meta_output = self.kv_connector.build_connector_meta()
+
+        decode_batch = ScheduledBatch(
+            seqs=scheduled_seqs,
+            num_scheduled_tokens=num_scheduled_tokens,
+            total_tokens_num=total_tokens_num_decode,
+            total_tokens_num_decode=total_tokens_num_decode,
+            total_seqs_num=num_seqs_prefill + num_seqs_decode,
+            total_seqs_num_prefill=num_seqs_prefill,
+            total_seqs_num_decode=num_seqs_decode,
+            connector_meta_output=connector_meta_output,
+            num_spec_step=self.mtp_k if self.spec_decode_local else 0,
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            remote_kv_block_ids=sorted(remote_kv_blocks) if remote_kv_blocks else [],
+            remote_kv_seq_blocks=remote_kv_seq_blocks,
+            # An empty batch cannot execute queued maintenance.
+            # For spills that is not merely wasted work: a drained spill is
+            # released only once its copy reaches a forward, so draining into a
+            # batch that is never forwarded strands every slot it drained.
+            state_maintenance_ops=(
+                self.block_manager.take_state_maintenance_ops()
+                if scheduled_seqs
+                else None
+            ),
+        )
+        self._consume_state_forks(scheduled_seqs)
+        return (decode_batch, scheduled_seqs)
+
+    def _select_decode(self):
+        scheduled_seqs = {}
+        num_scheduled_tokens = []
+        scheduled_spec_decode_tokens = {}
         num_seqs_decode = 0
         num_decode_tokens = 0
         # anchor + drafts if verifying locally, anchor alone otherwise.
@@ -1667,8 +1785,6 @@ class Scheduler:
                 num_scheduled_tokens.append(num_new_tokens)
                 seq.is_first_decode = False
 
-        total_tokens_num_decode = sum(num_scheduled_tokens)
-
         if scheduled_seqs:
             self.running.extendleft(reversed(scheduled_seqs.values()))
         if skipped_partial_prefills:
@@ -1693,37 +1809,13 @@ class Scheduler:
         if skipped_pp_inflight:
             self.running.extend(skipped_pp_inflight)
 
-        connector_meta_output = None
-        if self.kv_connector is not None:
-            self._publish_state_loads()
-            self._publish_state_stores()
-            connector_meta_output = self.kv_connector.build_connector_meta()
-
-        decode_batch = ScheduledBatch(
-            seqs=scheduled_seqs,
-            num_scheduled_tokens=num_scheduled_tokens,
-            total_tokens_num=total_tokens_num_decode,
-            total_tokens_num_decode=total_tokens_num_decode,
-            total_seqs_num=num_seqs_prefill + num_seqs_decode,
-            total_seqs_num_prefill=num_seqs_prefill,
-            total_seqs_num_decode=num_seqs_decode,
-            connector_meta_output=connector_meta_output,
-            num_spec_step=self.mtp_k if self.spec_decode_local else 0,
-            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
-            remote_kv_block_ids=sorted(remote_kv_blocks) if remote_kv_blocks else [],
-            remote_kv_seq_blocks=remote_kv_seq_blocks,
-            # An empty batch cannot execute queued maintenance.
-            # For spills that is not merely wasted work: a drained spill is
-            # released only once its copy reaches a forward, so draining into a
-            # batch that is never forwarded strands every slot it drained.
-            state_maintenance_ops=(
-                self.block_manager.take_state_maintenance_ops()
-                if scheduled_seqs
-                else None
-            ),
+        return (
+            scheduled_seqs,
+            num_scheduled_tokens,
+            scheduled_spec_decode_tokens,
+            remote_kv_blocks,
+            remote_kv_seq_blocks,
         )
-        self._consume_state_forks(scheduled_seqs)
-        return (decode_batch, scheduled_seqs)
 
     @staticmethod
     def _consume_state_forks(scheduled_seqs: dict[int, Sequence]) -> None:
@@ -2382,7 +2474,11 @@ class Scheduler:
         if batch.total_seqs_num_decode > 0:
             yield from batch.req_ids
         elif final is not None:
-            for i, req_id in enumerate(batch.req_ids):
+            for i, req_id in enumerate(
+                batch.req_ids[
+                    : getattr(batch, "total_seqs_num_prefill", len(batch.req_ids))
+                ]
+            ):
                 if final[i]:
                     yield req_id
 
@@ -2420,7 +2516,11 @@ class Scheduler:
         if batch.is_final_chunk is None:
             return
         seq_by_id = self._batch_seq_lookup(seqs)
-        for i, req_id in enumerate(batch.req_ids):
+        for i, req_id in enumerate(
+            batch.req_ids[
+                : getattr(batch, "total_seqs_num_prefill", len(batch.req_ids))
+            ]
+        ):
             seq = seq_by_id.get(req_id)
             if seq is None or not seq.block_table:
                 logger.warning(
@@ -2475,7 +2575,11 @@ class Scheduler:
             # See _batch_seq_lookup: seq may have left running.
             seq_by_id = self._batch_seq_lookup(seqs)
             final = batch.is_final_chunk
-            for i, req_id in enumerate(batch.req_ids):
+            for i, req_id in enumerate(
+                batch.req_ids[
+                    : getattr(batch, "total_seqs_num_prefill", len(batch.req_ids))
+                ]
+            ):
                 seq = seq_by_id.get(req_id)
                 if seq is None or final is None or not seq.block_table:
                     continue
@@ -2486,7 +2590,11 @@ class Scheduler:
                 if not is_final:
                     pp_middle_chunk_ids.add(req_id)
         elif batch is not None:
-            for i, req_id in enumerate(batch.req_ids):
+            for i, req_id in enumerate(
+                batch.req_ids[
+                    : getattr(batch, "total_seqs_num_prefill", len(batch.req_ids))
+                ]
+            ):
                 seq = running_by_id.get(req_id)
                 if seq is None or seq.type != SequenceType.PREFILL:
                     continue

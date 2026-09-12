@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 import pickle
 import queue
 import threading
@@ -10,7 +11,6 @@ from contextlib import ExitStack
 
 import torch
 import zmq
-
 from atom.config import Config, ParallelConfig
 from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
@@ -31,6 +31,9 @@ from atom.utils import (
     init_exit_handler,
     make_zmq_socket,
     set_process_title,
+)
+from atom.utils import (
+    itl_diagnostics as itl_diag,
 )
 from atom.utils.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,
@@ -67,6 +70,11 @@ class EngineCore:
     _process_name = "EngineCore"
 
     def __init__(self, config: Config, input_address: str, output_address: str):
+        itl_diag.configure(config.torch_profiler_dir, "engine")
+        if itl_diag.enabled():
+            self._itl_engine_id = f"{os.getpid()}-{time.monotonic_ns()}"
+            self._itl_step_counter = 0
+            self._itl_stream_counter = 0
         self.label = "Engine Core"
         self.input_queue = queue.Queue[Sequence]()
         self.output_queue = queue.Queue[list[Sequence]]()
@@ -171,6 +179,7 @@ class EngineCore:
                 config,
                 state_runtime=self.state_runtime,
             )
+            self._init_dp1_prefill_delayer(config)
 
         self.kv_transfer_enabled = bool(config.kv_transfer_config)
         self._next_idle_kv_drain = 0.0
@@ -191,6 +200,41 @@ class EngineCore:
 
         self._send_ready_signal()
         logger.info(f"{self.label}: EngineCore fully initialized and ready")
+
+    def _init_dp1_prefill_delayer(self, config: Config):
+        if (
+            not envs.ATOM_DIAG_DP1_PREFILL_DELAYER
+            or not envs.ATOM_ENABLE_PREFILL_DELAYER
+            or type(self) is not EngineCore
+            or config.parallel_config.data_parallel_size != 1
+            or config.pipeline_parallel_size != 1
+            or config.enable_rapidserve
+            or config.disagg_is_decode
+        ):
+            return
+
+        from atom.model_engine.prefill_delayer import PrefillDelayer
+
+        self.scheduler.set_prefill_delayer(
+            PrefillDelayer(
+                dp_size=1,
+                cpu_group=None,
+                max_num_batched_tokens=config.max_num_batched_tokens,
+                target_fill=envs.ATOM_PREFILL_DELAYER_TARGET_FILL,
+                ttft_max_ticks=envs.ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS,
+                partial_max_ticks=envs.ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS,
+                stall_ticks=envs.ATOM_PREFILL_DELAYER_STALL_TICKS,
+                kv_high_watermark=envs.ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK,
+                token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
+                max_queue_ms=envs.ATOM_PREFILL_DELAYER_MAX_QUEUE_MS,
+                prefill_decode_interval=envs.ATOM_PREFILL_DECODE_INTERVAL,
+            )
+        )
+        logger.info(
+            "[DEBUG-dp1-fairness] local PrefillDelayer interval=%d kv_high=%s",
+            envs.ATOM_PREFILL_DECODE_INTERVAL,
+            envs.ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK,
+        )
 
     def _freeze_after_startup(self):
         """Freeze this process and its ModelRunner workers.
@@ -303,6 +347,8 @@ class EngineCore:
         logger.debug(f"{self.label}: send SHUTDOWN request")
         self.output_queue.put_nowait([get_exit_sequence()])
         self.output_thread.join(timeout=0.5)
+        if itl_diag.enabled():
+            itl_diag.close()
 
     @staticmethod
     def run_engine(config: Config, input_address: str, output_address: str):
@@ -353,6 +399,17 @@ class EngineCore:
                     break
                 if self._is_idle_rl_weights_offloaded():
                     continue
+                if itl_diag.enabled() and now >= getattr(self, "_itl_next_drain", 0.0):
+                    self._itl_next_drain = now + 1.0
+                    itl_diag.emit(
+                        "engine.drain_state",
+                        pending_kv=self.has_pending_kv_work(),
+                        running=len(self.scheduler.running),
+                        waiting=len(self.scheduler.waiting),
+                        deferred_free=len(self.scheduler.deferred_free_blocks),
+                        input_queue=self.input_queue.qsize(),
+                        output_queue=self.output_queue.qsize(),
+                    )
                 if not self.scheduler.is_finished():
                     self._process_engine_step()
                 elif self.has_pending_kv_work():
@@ -380,7 +437,11 @@ class EngineCore:
                 logger.exception("KV event publish in engine-step finally failed")
 
     def _process_engine_step_inner(self):
-        result = self.scheduler.schedule()
+        if itl_diag.enabled():
+            with itl_diag.span("engine.schedule"):
+                result = self.scheduler.schedule()
+        else:
+            result = self.scheduler.schedule()
 
         # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
         # the scheduler) through the same finished-seq path as normal seqs.
@@ -400,22 +461,72 @@ class EngineCore:
             self._advance_idle_kv_transfer()
             return False
 
+        if itl_diag.enabled():
+            self._itl_step_counter += 1
+            if scheduled_batch.req_ids and not scheduled_batch.is_dummy_run:
+                scheduled_batch.diag_step_id = (
+                    f"{self._itl_engine_id}:{self._itl_step_counter}"
+                )
+            itl_diag.emit(
+                "engine.dispatch",
+                critical=True,
+                step_id=scheduled_batch.diag_step_id,
+                synthetic=scheduled_batch.is_dummy_run,
+                req_ids=list(scheduled_batch.req_ids),
+                scheduled_lengths=[
+                    int(n) for n in scheduled_batch.num_scheduled_tokens
+                ],
+                cached_lengths=list(scheduled_batch.num_cached_tokens),
+                context_lengths=[int(n) for n in scheduled_batch.context_lens],
+                final_chunks=(
+                    list(scheduled_batch.is_final_chunk)
+                    if scheduled_batch.is_final_chunk is not None
+                    else None
+                ),
+                prefill_count=scheduled_batch.total_seqs_num_prefill,
+                decode_count=scheduled_batch.total_seqs_num_decode,
+            )
+
         # Dispatch KV connector metadata to workers (triggers async KV load)
         if (
             self.kv_transfer_enabled
             and scheduled_batch.connector_meta_output is not None
         ):
-            self.runner_mgr.call_func(
-                "process_kvconnector_output", scheduled_batch.connector_meta_output
-            )
+            if itl_diag.enabled():
+                with itl_diag.span(
+                    "engine.kv_dispatch", step_id=scheduled_batch.diag_step_id
+                ):
+                    self.runner_mgr.call_func(
+                        "process_kvconnector_output",
+                        scheduled_batch.connector_meta_output,
+                    )
+            else:
+                self.runner_mgr.call_func(
+                    "process_kvconnector_output", scheduled_batch.connector_meta_output
+                )
 
         # Run the model forward pass if there are actual sequences
         has_seqs = len(scheduled_batch.req_ids) > 0
         if has_seqs:
             self.scheduler.compute_detailed_aggregates(scheduled_batch, seqs)
-            fwd_out = self.runner_mgr.call_func(
-                "forward", scheduled_batch, wait_out=True
-            )
+            if itl_diag.enabled():
+                with itl_diag.span(
+                    "engine.forward", step_id=scheduled_batch.diag_step_id
+                ):
+                    fwd_out = self.runner_mgr.call_func(
+                        "forward", scheduled_batch, wait_out=True
+                    )
+                itl_diag.emit(
+                    "engine.forward_output",
+                    step_id=scheduled_batch.diag_step_id,
+                    req_ids=list(fwd_out.req_ids),
+                    output_counts=[len(tokens) for tokens in fwd_out.token_ids],
+                    deferred=fwd_out.is_deferred_out,
+                )
+            else:
+                fwd_out = self.runner_mgr.call_func(
+                    "forward", scheduled_batch, wait_out=True
+                )
             if (
                 self.scheduler.prefill_delayer is not None
                 and scheduled_batch.total_seqs_num_prefill > 0
@@ -426,7 +537,11 @@ class EngineCore:
                 self.scheduler.prefill_delayer.notify_prefill_executed()
 
         # Aggregate KV transfer status from all workers (only when PD disaggregation is active)
-        self._poll_kv_transfer_progress()
+        if itl_diag.enabled():
+            with itl_diag.span("engine.kv_poll", step_id=scheduled_batch.diag_step_id):
+                self._poll_kv_transfer_progress()
+        else:
+            self._poll_kv_transfer_progress()
 
         if not has_seqs:
             logger.debug("%s: Empty scheduled batch, skipping postprocess", self.label)
@@ -434,19 +549,45 @@ class EngineCore:
 
         seqs = seqs.values()
         # Pass stream_output_queue to postprocess for streaming callbacks
-        finished_seqs = self.scheduler.postprocess(
-            seqs,
-            fwd_out,
-            stream_output_queue=self.stream_output_queue,
-            batch=scheduled_batch,
-        )
+        if itl_diag.enabled():
+            with itl_diag.span(
+                "engine.postprocess", step_id=scheduled_batch.diag_step_id
+            ):
+                finished_seqs = self.scheduler.postprocess(
+                    seqs,
+                    fwd_out,
+                    stream_output_queue=self.stream_output_queue,
+                    batch=scheduled_batch,
+                )
+        else:
+            finished_seqs = self.scheduler.postprocess(
+                seqs,
+                fwd_out,
+                stream_output_queue=self.stream_output_queue,
+                batch=scheduled_batch,
+            )
 
         # Send stream outputs to main process via output_queue
         try:
             while not self.stream_output_queue.empty():
                 stream_outputs = self.stream_output_queue.get_nowait()
                 # Send stream outputs as intermediate results
-                self.output_queue.put_nowait(("STREAM", stream_outputs))
+                if itl_diag.enabled():
+                    self._itl_stream_counter += 1
+                    with itl_diag.span(
+                        "engine.stream_enqueue",
+                        critical=True,
+                        step_id=scheduled_batch.diag_step_id,
+                        emission_ordinal=self._itl_stream_counter,
+                        req_ids=[req_id for req_id, _ in stream_outputs],
+                        output_counts=[
+                            len(out.output_tokens) for _, out in stream_outputs
+                        ],
+                        finished=[out.finished for _, out in stream_outputs],
+                    ):
+                        self.output_queue.put_nowait(("STREAM", stream_outputs))
+                else:
+                    self.output_queue.put_nowait(("STREAM", stream_outputs))
         except queue.Empty:
             pass
 

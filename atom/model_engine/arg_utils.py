@@ -60,6 +60,7 @@ class EngineArgs:
     state_checkpoint_interval_tokens: int = 8192
     state_checkpoint_demand: bool = True
     enable_chunked_prefill: bool = True
+    enable_mixed_prefill_decode: bool = False
     enable_log_stats: bool = True
     throughput_log_interval: float = 10.0
     cache_hit_rate_window: int = 1000
@@ -442,6 +443,12 @@ class EngineArgs:
                 "the time, against 85.2% for an anchor, so the rung's write "
                 "traffic may cost more in evictions than its reuse is worth."
             ),
+        )
+        parser.add_argument(
+            "--enable-mixed-prefill-decode",
+            action="store_true",
+            default=False,
+            help="Enable native K3 mixed prefill/decode (text, DP1/PP1/PCP1, no spec).",
         )
         parser.add_argument(
             "--enable_chunked_prefill",

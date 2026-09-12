@@ -502,6 +502,9 @@ class Context:
     # `ForwardMode.decide`; None only on a capture context, which declares its
     # shape rather than reading one.
     forward_mode: ForwardMode | None = None
+    is_mixed: bool = False
+    num_prefill_tokens: int = 0
+    num_prefill_seqs: int = 0
     # Optional flat token ids for the current forward. Read by callbacks
     # invoked inside Dynamo-opaque custom ops (e.g. V4 MoE hash routing)
     # that need the token ids but cannot receive them as a function arg
@@ -535,6 +538,9 @@ class Context:
         ubatch_token_offset: int = 0,
         draft_anchor_overrides: torch.Tensor | None = None,
         draft_ragged_lens: torch.Tensor | None = None,
+        is_mixed: bool = False,
+        num_prefill_tokens: int = 0,
+        num_prefill_seqs: int = 0,
     ):
         self.positions = positions
         self.is_prefill = is_prefill
@@ -550,6 +556,9 @@ class Context:
         self.ubatch_token_offset = ubatch_token_offset
         self.draft_anchor_overrides = draft_anchor_overrides
         self.draft_ragged_lens = draft_ragged_lens
+        self.is_mixed = is_mixed
+        self.num_prefill_tokens = num_prefill_tokens
+        self.num_prefill_seqs = num_prefill_seqs
 
 
 @dataclass
@@ -604,6 +613,9 @@ class AttentionMetaData:
     reduce_final_map: torch.Tensor | None = None
     reduce_partial_map: torch.Tensor | None = None
 
+    prefill_attn_metadata: "AttentionMetaData | None" = None
+    decode_attn_metadata: "AttentionMetaData | None" = None
+
     # for prefix cache
     has_cached: bool = False
     total_kv: int | None = None
@@ -646,7 +658,11 @@ class AttentionMetaData:
         kpool_total_pools: int | None = None,
         num_cached_tokens: torch.Tensor | None = None,
         seq_starts: torch.Tensor | None = None,
+        prefill_attn_metadata: "AttentionMetaData | None" = None,
+        decode_attn_metadata: "AttentionMetaData | None" = None,
     ):
+        self.prefill_attn_metadata = prefill_attn_metadata
+        self.decode_attn_metadata = decode_attn_metadata
         self.has_cached = has_cached
         self.total_kv = total_kv
         self.kpool_total_pools = kpool_total_pools

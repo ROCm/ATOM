@@ -7,6 +7,7 @@ import inspect
 import logging
 import math
 import os
+import sys
 import time
 from contextlib import contextmanager, nullcontext
 from functools import partial
@@ -25,8 +26,6 @@ from aiter.dist.parallel_state import (
     graph_capture,
 )
 from aiter.dist.utils import get_distributed_init_method
-from torch.profiler import record_function
-
 from atom.config import Config, CUDAGraphMode, set_current_atom_config
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
@@ -82,6 +81,9 @@ from atom.utils import (
     resolve_obj_by_qualname,
     worker_process_name,
 )
+from atom.utils import (
+    itl_diagnostics as itl_diag,
+)
 from atom.utils.cuda_graph import BatchDescriptor
 from atom.utils.forward_context import (
     Context,
@@ -101,6 +103,7 @@ from atom.utils.tbo import (
     local_tbo_precompute,
     maybe_create_ubatch_slices,
 )
+from torch.profiler import record_function
 
 logger = logging.getLogger("atom")
 
@@ -234,11 +237,31 @@ class tokenIDProcessor:
         cpu_tensor_handle.append((cpu_tensor, copy_done))
         self.logprobs_cpu.append(cpu_logprobs)
 
+    def _itl_output_fields(self, batch):
+        owner = self.prev_batch if self.is_deferred_out else batch
+        return {
+            "step_id": getattr(batch, "diag_step_id", None),
+            "output_step_id": getattr(owner, "diag_step_id", None),
+            "synthetic": bool(getattr(batch, "is_dummy_run", False)),
+            "output_synthetic": bool(getattr(owner, "is_dummy_run", False)),
+        }
+
+    def _itl_wait(self, event, kind):
+        with itl_diag.span(
+            "runner.output_wait",
+            kind=kind,
+            **self._itl_output_fields(getattr(self, "_diag_current_batch", None)),
+        ):
+            event.synchronize()
+
     def recv_async_output(self, cpu_tensor_handle) -> torch.Tensor:
         if not cpu_tensor_handle:
             return torch.empty(0, dtype=torch.int32, device="cpu")
         cpu_tensor, event = cpu_tensor_handle.pop(0)
-        event.synchronize()
+        if itl_diag.enabled():
+            self._itl_wait(event, "sampled")
+        else:
+            event.synchronize()
         return cpu_tensor
 
     def recv_logprobs(self) -> list[float] | None:
@@ -273,7 +296,10 @@ class tokenIDProcessor:
         if not self.draft_token_ids_cpu:
             return np.array([], dtype=np.int32)
         token_ids, event = self.draft_token_ids_cpu.pop(0)
-        event.synchronize()
+        if itl_diag.enabled():
+            self._itl_wait(event, "draft")
+        else:
+            event.synchronize()
         return token_ids.numpy()
 
     def send_mtp_status_to_cpu_async(
@@ -308,10 +334,15 @@ class tokenIDProcessor:
         cpu_num_rejected, cpu_num_bonus, copy_done = self.pending_mtp_status_copies.pop(
             0
         )
-        copy_done.synchronize()
+        if itl_diag.enabled():
+            self._itl_wait(copy_done, "mtp_status")
+        else:
+            copy_done.synchronize()
         return cpu_num_rejected.numpy(), cpu_num_bonus.numpy()
 
     def clean(self):
+        if itl_diag.enabled():
+            self._diag_current_batch = None
         self.token_ids_cpu: list[torch.Tensor] = []
         self.logprobs_cpu: list[torch.Tensor | None] = []
 
@@ -365,24 +396,54 @@ class tokenIDProcessor:
                 processed = self._batch_process_token_ids(token_ids)
             else:
                 processed = [(tid,) for tid in token_ids]
-            ret = dict(zip(req_ids, processed))
+            final = batch.is_final_chunk if getattr(batch, "is_mixed", False) else None
+            ret = {
+                req_id: tokens
+                for i, (req_id, tokens) in enumerate(zip(req_ids, processed))
+                if final is None or final[i]
+            }
+            if itl_diag.enabled() and getattr(self.runner, "_itl_rank", None) == 0:
+                itl_diag.emit(
+                    "runner.sampled_output",
+                    **self._itl_output_fields(batch),
+                    req_ids=list(ret),
+                    output_counts=[len(tokens) for tokens in ret.values()],
+                    deferred=False,
+                )
             ret[-1] = 0  # is_deferred_out flag
             logprobs_map = None
             if sampled_logprobs is not None:
                 logprobs = sampled_logprobs.tolist()
                 logprobs_map = {
-                    seq_id: logprob for seq_id, logprob in zip(req_ids, logprobs)
+                    seq_id: logprob
+                    for seq_id, logprob in zip(req_ids, logprobs)
+                    if seq_id in ret
                 }
             return ret, logprobs_map
 
-        token_ids = self.recv_async_output(self.token_ids_cpu)
-        logprobs = self.recv_logprobs()
-        self.send_to_cpu_async(
-            sampled_token_ids,
-            self.token_ids_cpu,
-            sync_event,
-            gpu_logprobs=sampled_logprobs,
-        )
+        if itl_diag.enabled():
+            self._diag_current_batch = batch
+        if itl_diag.enabled() and getattr(self.runner, "_itl_rank", None) == 0:
+            fields = self._itl_output_fields(batch)
+            with itl_diag.span("runner.deferred_receive", **fields):
+                token_ids = self.recv_async_output(self.token_ids_cpu)
+                logprobs = self.recv_logprobs()
+            with itl_diag.span("runner.deferred_send", **fields):
+                self.send_to_cpu_async(
+                    sampled_token_ids,
+                    self.token_ids_cpu,
+                    sync_event,
+                    gpu_logprobs=sampled_logprobs,
+                )
+        else:
+            token_ids = self.recv_async_output(self.token_ids_cpu)
+            logprobs = self.recv_logprobs()
+            self.send_to_cpu_async(
+                sampled_token_ids,
+                self.token_ids_cpu,
+                sync_event,
+                gpu_logprobs=sampled_logprobs,
+            )
         token_id_dict = {}
         logprobs_map = None
         self.prev_req_ids = None
@@ -395,17 +456,31 @@ class tokenIDProcessor:
                 processed = self._batch_process_token_ids(token_ids_list)
             else:
                 processed = [(tid,) for tid in token_ids_list]
-            token_id_dict = dict(zip(self.prev_req_ids, processed))
+            final = self.prev_batch.is_final_chunk
+            token_id_dict = {
+                req_id: tokens
+                for i, (req_id, tokens) in enumerate(zip(self.prev_req_ids, processed))
+                if final is None or final[i]
+            }
             if logprobs is not None:
                 logprobs_map = {
                     seq_id: logprob
                     for seq_id, logprob in zip(self.prev_req_ids, logprobs)
+                    if seq_id in token_id_dict
                 }
         else:
             # first time, no previous tokens
             token_ids = {}
             logprobs_map = None
 
+        if itl_diag.enabled() and getattr(self.runner, "_itl_rank", None) == 0:
+            itl_diag.emit(
+                "runner.sampled_output",
+                **self._itl_output_fields(batch),
+                req_ids=list(token_id_dict),
+                output_counts=[len(tokens) for tokens in token_id_dict.values()],
+                deferred=True,
+            )
         self.prev_batch = batch
         self.prev_token_ids = sampled_token_ids
         token_id_dict[-1] = 1
@@ -414,7 +489,6 @@ class tokenIDProcessor:
     def get_token_locations(self, batch: ScheduledBatch) -> TokenLocations:
         prev_req_ids = self.prev_batch.req_ids
         cur_req_ids = batch.req_ids
-        num_prev = len(prev_req_ids)
         num_cur = len(cur_req_ids)
 
         # A fabricated batch carries nothing over -- and the DP-sync dummy
@@ -425,7 +499,12 @@ class tokenIDProcessor:
             none = np.empty(0, dtype=np.intp)
             return TokenLocations(none, none, np.arange(num_cur, dtype=np.intp))
 
-        prev_id_to_idx = dict(zip(prev_req_ids, range(num_prev)))
+        final = getattr(self.prev_batch, "is_final_chunk", None)
+        prev_id_to_idx = {
+            req_id: i
+            for i, req_id in enumerate(prev_req_ids)
+            if final is None or final[i]
+        }
 
         deferred_curr = np.empty(num_cur, dtype=np.intp)
         deferred_prev = np.empty(num_cur, dtype=np.intp)
@@ -487,7 +566,33 @@ class tokenIDProcessor:
         if batch.produces_output():
             self.prev_rejected_num, self.prev_bonus_num = self.recv_mtp_status_async()
 
-        # TODO: remove this when we support mixed prefill and decode in one batch
+        if getattr(batch, "is_mixed", False):
+            assert (
+                not self.use_spec
+            ), "Mixed prefill/decode does not support speculation"
+            self.input_ids.np[total_tokens_prefill:total_tokens] = scheduled_tokens[
+                total_tokens_prefill:total_tokens
+            ]
+            self.input_ids.copy_to_gpu(total_tokens)
+            if self.is_deferred_out and self.prev_batch is not None:
+                locs = self.get_token_locations(batch)
+                mask = locs.deferred_curr >= total_reqs_prefill
+                bs = batch.total_seqs_num_decode
+                self.decode_cu.np[: bs + 1] = np.arange(bs + 1) + total_tokens_prefill
+                self.decode_src.np[:bs].fill(NEW_SEQUENCE)
+                self.decode_src.np[locs.deferred_curr[mask] - total_reqs_prefill] = (
+                    locs.deferred_prev[mask]
+                )
+                fill_deferred_decode_ids(
+                    self.input_ids.gpu,
+                    self.decode_cu.copy_to_gpu(bs + 1),
+                    self.decode_src.copy_to_gpu(bs),
+                    self.prev_token_ids,
+                    None,
+                    max_tokens_per_seq=1,
+                )
+            return self.input_ids.gpu[:total_tokens]
+
         if total_reqs_prefill > 0:
             return self.input_ids.gpu[:total_tokens_prefill]
 
@@ -636,6 +741,16 @@ class ModelRunner:
 
     def __init__(self, rank: int, config: Config):
         self.config = config
+        itl_diag.configure(config.torch_profiler_dir, "worker", rank=rank)
+        if itl_diag.enabled():
+            pc = config.parallel_config
+            self._itl_rank = (
+                (pc.data_parallel_rank or 0) * config.pipeline_parallel_size
+                + pc.pipeline_parallel_rank
+            ) * config.tp_world_size * config.prefill_context_parallel_size + rank
+            itl_diag.emit(
+                "runner.identity", global_rank=self._itl_rank, local_rank=rank
+            )
         self.mark_trace = getattr(config, "mark_trace", False)
         from atom.utils.graph_marker import set_graph_marker_enabled
 
@@ -1059,6 +1174,8 @@ class ModelRunner:
         if not self.still_running:
             return
         self.still_running = False
+        if itl_diag.enabled():
+            itl_diag.close()
         # 0. Join any offload connector's copy threads. Its ThreadPoolExecutors
         #    are non-daemon, so leaving them running wedges interpreter shutdown
         #    or races an in-flight copy against atexit. Must run BEFORE the KV
@@ -1466,7 +1583,16 @@ class ModelRunner:
         does nothing.
         """
         if self._stage_h2d_done is not None:
-            self._stage_h2d_done.synchronize()
+            if itl_diag.enabled():
+                with itl_diag.span(
+                    "runner.staging_wait",
+                    step_id=getattr(
+                        getattr(self, "_diag_current_batch", None), "diag_step_id", None
+                    ),
+                ):
+                    self._stage_h2d_done.synchronize()
+            else:
+                self._stage_h2d_done.synchronize()
 
     def _mark_staging_h2d_enqueued(self):
         """Close the window the gate above waits on.
@@ -2507,6 +2633,9 @@ class ModelRunner:
             running_tokens=running_tokens,
             running_tokens_are_unified=running_tokens_are_unified,
             forward_mode=forward_mode,
+            is_mixed=getattr(batch, "is_mixed", False),
+            num_prefill_tokens=batch.total_tokens_num_prefill,
+            num_prefill_seqs=batch.total_seqs_num_prefill,
         )
 
         spec_decode_metadata = None
@@ -2921,6 +3050,10 @@ class ModelRunner:
             detailed_suffix=self._detailed_label_suffix(batch),
         )
 
+        if itl_diag.enabled() and self.profiler is not None:
+            step_id = getattr(batch, "diag_step_id", None)
+            label += f" itl_step={step_id if step_id is not None else 'unjoined'}"
+
         # PCP+TBO prefill: per-group round-robin stripe before UBatchWrapper (see
         # _apply_pcp_balanced_stripe). _pcp_tbo_balanced also gates the per-group
         # output restore further below.
@@ -3297,18 +3430,52 @@ class ModelRunner:
         # buffers. Excluding them here leaves no event between a dummy and the
         # following real forward, allowing that real forward's CPU writes to
         # race the dummy's still-pending H2D copies.
-        self._advance_forward_vars()
-        self._gate_staging_reuse()
-        (
-            input_ids,
-            temperatures,
-            top_ks,
-            top_ps,
-            all_greedy,
-            needs_independent_noise,
-        ) = self.prepare_model(batch)
+        if itl_diag.enabled():
+            self._diag_current_batch = batch
+            self.tokenID_processor._diag_current_batch = batch
+            itl_diag.emit(
+                "runner.forward",
+                step_id=getattr(batch, "diag_step_id", None),
+                synthetic=batch.is_dummy_run,
+            )
+        diag_detail = itl_diag.enabled() and getattr(self, "_itl_rank", None) == 0
+        if diag_detail:
+            fields = {
+                "step_id": getattr(batch, "diag_step_id", None),
+                "synthetic": batch.is_dummy_run,
+            }
+            phase = itl_diag.span("runner.staging", **fields)
+            phase.__enter__()
+        try:
+            self._advance_forward_vars()
+            self._gate_staging_reuse()
+        finally:
+            if diag_detail:
+                phase.__exit__(*sys.exc_info())
+        if diag_detail:
+            phase = itl_diag.span("runner.prepare", **fields)
+            phase.__enter__()
+        try:
+            (
+                input_ids,
+                temperatures,
+                top_ks,
+                top_ps,
+                all_greedy,
+                needs_independent_noise,
+            ) = self.prepare_model(batch)
+        finally:
+            if diag_detail:
+                phase.__exit__(*sys.exc_info())
         self._mark_staging_h2d_enqueued()
-        logits, hidden_states = self.run_model(input_ids, batch)
+        if diag_detail:
+            phase = itl_diag.span("runner.model", **fields)
+            phase.__enter__()
+        try:
+            logits, hidden_states = self.run_model(input_ids, batch)
+        finally:
+            if diag_detail:
+                phase.__exit__(*sys.exc_info())
 
         pp_group = get_pp_group()
         pp_non_last = pp_group.world_size > 1 and not pp_group.is_last_rank
@@ -3364,16 +3531,29 @@ class ModelRunner:
                 draft_token_ids=None,
             )
 
-        fwd_output = self.postprocess(
-            batch,
-            logits,
-            temperatures,
-            top_ks,
-            top_ps,
-            all_greedy,
-            hidden_states,
-            needs_independent_noise=needs_independent_noise,
-        )
+        if itl_diag.enabled() and getattr(self, "_itl_rank", None) == 0:
+            with itl_diag.span("runner.postprocess", **fields):
+                fwd_output = self.postprocess(
+                    batch,
+                    logits,
+                    temperatures,
+                    top_ks,
+                    top_ps,
+                    all_greedy,
+                    hidden_states,
+                    needs_independent_noise=needs_independent_noise,
+                )
+        else:
+            fwd_output = self.postprocess(
+                batch,
+                logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                all_greedy,
+                hidden_states,
+                needs_independent_noise=needs_independent_noise,
+            )
 
         reset_forward_context()
         self._record_forward_vars_event()
