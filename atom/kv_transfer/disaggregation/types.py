@@ -45,6 +45,31 @@ SaveCompletionId = ReqId | SaveOperationId
 
 
 @dataclass(frozen=True)
+class SaveSourceGroupId:
+    """Exact source-safe identity for one batched PAGE staging group.
+
+    ``ranges`` are the absolute token ranges copied from scheduler-owned GPU
+    blocks into independent LMCache MemoryObjs by one ``batched_from_gpu``
+    call.  The enclosing :class:`SaveOperationId` prevents a late callback for
+    an older request lifecycle from releasing a newer lifecycle's blocks.
+    """
+
+    save_operation: SaveOperationId
+    ranges: tuple[tuple[int, int], ...]
+
+    def __post_init__(self) -> None:
+        if not self.ranges:
+            raise ValueError("save source group must contain at least one range")
+        for start, end in self.ranges:
+            if start < 0 or end <= start:
+                raise ValueError(f"invalid save source range: {start}:{end}")
+
+    @property
+    def req_id(self) -> ReqId:
+        return self.save_operation.req_id
+
+
+@dataclass(frozen=True)
 class LoadOperationId:
     """Exact identity of one scheduler-issued PAGE/SLOT load generation."""
 
@@ -81,7 +106,11 @@ class StateStoreOperationId:
 
 
 ConnectorCompletionId = (
-    ReqId | SaveOperationId | LoadOperationId | StateStoreOperationId
+    ReqId
+    | SaveOperationId
+    | SaveSourceGroupId
+    | LoadOperationId
+    | StateStoreOperationId
 )
 ConnectorCompletionKey = tuple[str, ConnectorCompletionId]
 
@@ -121,6 +150,17 @@ class ConnectorCompletion:
         return self.channel, self.operation_id
 
 
+# Region roles used for producer-to-DCP-consumer relayout. The consumer stores
+# both MLA and DSA index caches interleave-sharded; producer MLA bytes are
+# token-contiguous, while producer preshuffled DSA index bytes require staging.
+MLA_KV_ROLE = "mla.kv"
+INDEX_CACHE_ROLE = "dsa.index_cache"
+# Producer gather callbacks need one staging slot per concurrent send worker.
+# Mooncake and attention-pool allocation share this fallback so their defaults
+# cannot drift independently.
+DEFAULT_SHARDED_STAGING_WORKERS = 16
+
+
 @dataclass
 class KVTransferRegion:
     """One RDMA-registerable tensor region."""
@@ -155,12 +195,22 @@ class KVTransferTensors:
     plane count explicit so registration can reject a missing plane.
     ``staging_region`` plus ``gather_slot``/``scatter_slot`` cover only the
     compressor-state PD staging pool and are invalid as sidecar SLOT sources.
+    ``index_staging_region`` plus ``prepare_sharded_index`` and
+    ``gather_sharded_index`` cover producer-side repacking of preshuffled index
+    pages before DCP-sharded RDMA. The prepared indices are shared across index
+    layers.
+
+    ``tp_replication_factor`` describes byte-identical PAGE replicas, not the
+    number of physical consumers. A value equal to tensor parallel size lets a
+    remote cache store one copy while every TP worker still retrieves into its
+    own local GPU cache. The declaration applies to every ``block_region``;
+    mixed replicated/sharded layouts must leave it at ``1`` until the transfer
+    protocol can describe replication per region group.
     """
 
-    # Block-indexed PAGE regions, indexed forward by physical block id.
+    # Block-indexed PAGE regions, indexed forward by block id.
     block_regions: list[KVTransferRegion]
     slot_regions: list[KVTransferRegion]
-    num_blocks: int
     num_slots: int = 0
     # Optional producer-local -> consumer-global mapping for non-uniform block
     # region layouts. Uniform per-layer groups leave this unset and use the
@@ -176,6 +226,15 @@ class KVTransferTensors:
     scatter_slot: Callable[[int, int], None] | None = None
     # Appended for positional compatibility with existing generic descriptors.
     expected_full_slot_region_count: int | None = None
+    # Zero-copy, physical-order views paired with block regions.
+    # Each view is [num_units, physical_slots_per_unit, opaque_width]; it may
+    # retain its native dtype, and one dim-0 unit must cover exactly the paired
+    # region's unit_bytes. The last two dimensions describe copy geometry, not
+    # a semantic token/head layout.
+    block_tensor_views: list[Any] = field(default_factory=list)
+    # Number of TP workers whose complete PAGE layout is byte-identical.
+    # ``1`` means no cross-rank deduplication is safe.
+    tp_replication_factor: int = 1
     # The attention metadata builder, published by `ModelRunner` after the tier
     # is built inside `register_kv_caches` -- the one place builder and connector
     # are both in scope. The kimi_k3 state tier reads its `state_runtime.
@@ -185,6 +244,46 @@ class KVTransferTensors:
     # loose runtime attribute so the field the connector reads is part of the
     # contract, not an undocumented assignment two layers away.
     state_backend: object | None = None
+    # Producer-side DSA index-page staging. The callback fills one pool slot
+    # with compact destination pages and returns (base_addr, page_count).
+    index_staging_region: KVTransferRegion | None = None
+    index_staging_pool_size: int = 0
+    index_staging_chunk_pages: int = 0
+    gather_sharded_index: Callable[..., tuple[int, int]] | None = None
+    # Appended after the original staging fields for positional compatibility.
+    prepare_sharded_index: Callable[..., Any] | None = None
+    # Scheduler blocks the PAGE regions are addressed in. `init=False` because
+    # a backend cannot answer it: `req.block_ids` is the scheduler's id space,
+    # and a backend counts in its own page -- a different unit even where it is
+    # the same number. Set through `set_block_count`.
+    num_blocks: int = field(init=False, default=0)
+
+    def set_block_count(self, num_blocks: int) -> None:
+        """Fix the block id space, and check every region is in it.
+
+        Called once the last contributor's regions are in the list; a draft
+        appends its own after construction, so this cannot be a `__post_init__`.
+
+        A region that does not divide into exactly `num_blocks` units was
+        registered in some other unit. Both ends would still agree on
+        `base + id * unit_bytes` and disagree on the stride, so the wrong bytes
+        move and nothing reports it.
+        """
+        for i, region in enumerate(self.block_regions):
+            name = region.semantic_role or i
+            if not region.unit_bytes or region.total_bytes % region.unit_bytes:
+                raise ValueError(
+                    f"PAGE region {name} does not divide into whole blocks: "
+                    f"{region.total_bytes} B in units of {region.unit_bytes} B"
+                )
+            held = region.total_bytes // region.unit_bytes
+            if held != num_blocks:
+                raise ValueError(
+                    f"PAGE region {name} holds {held} blocks but the scheduler "
+                    f"addresses {num_blocks}; it is registered in some unit "
+                    "other than the scheduler's block"
+                )
+        self.num_blocks = num_blocks
 
 
 @dataclass
@@ -270,6 +369,10 @@ class ReqMeta:
     # PD incremental: blocks already in decode's prefix cache; both sides
     # skip block_ids[:num_computed_blocks]. 0 = full transfer.
     num_computed_blocks: int = 0
+    # How many producer blocks correspond to one destination block. 1 when
+    # producer and consumer share a DCP world, consumer dcp_size when the
+    # producer is unsharded.
+    src_block_skip_factor: int = 1
     # The request's SWA ring slot, as a one-element list so it zips with the
     # region loop like block ids do. Empty for backends with no SWA state.
     local_swa_block_ids: list[int] = field(default_factory=list)
@@ -361,6 +464,7 @@ class ConnectorMetadata:
             transfer_id=kv_transfer_params.get("transfer_id", 0),
             local_slot_index=kv_transfer_params.get("local_slot_index", -1),
             num_computed_blocks=kv_transfer_params.get("num_computed_blocks", 0),
+            src_block_skip_factor=kv_transfer_params.get("src_block_skip_factor", 1),
         )
 
     def add_new_req_to_save(

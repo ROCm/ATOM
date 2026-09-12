@@ -470,6 +470,16 @@ if is_rocm_aiter_fp4bmm_enabled():
     from atom.model_ops.utils import quark_post_load_weights
 
 
+# Optional flydsl backend for `_kv_b_proj_gather`, gated by
+# ATOM_USE_FLYDSL_GATHER_KV_B_PROJ.
+try:
+    from aiter.ops.flydsl import gather_kv_b_proj_flydsl
+
+    _FLYDSL_GATHER_AVAILABLE = True
+except Exception:  # noqa: BLE001 -- optional kernel; absence is the whole answer
+    _FLYDSL_GATHER_AVAILABLE = False
+
+
 # MLA Specific Arguments
 @dataclass
 class MLAModules:
@@ -661,6 +671,7 @@ class MLAAttention(nn.Module):
         # ==1 falls back to the original interleaved per-token (page_size=1)
         # kernels with an unpadded 576-wide q_out. The triton path never uses seg.
         self.use_seg_mla = (not self.use_triton_mla) and envs.ATOM_MLA_PAGE_SIZE > 1
+        self.use_flydsl_gather_kv_b_proj = bool(envs.ATOM_USE_FLYDSL_GATHER_KV_B_PROJ)
         if self.use_seg_mla:
             if envs.ATOM_MLA_PAGE_SIZE != _MLA_SEG_PAGE_SIZE:
                 raise RuntimeError(
@@ -1376,17 +1387,36 @@ class MLAAttention(nn.Module):
         DCP -- and ``kv_indices`` selects rows out of it.
         """
         weight = self.kv_b_proj.weight
+        gather_weight = _maybe_view_mxfp4_weight_for_gather(self.kv_b_proj, weight)
+        weight_scale = getattr(self.kv_b_proj, "weight_scale", None)
+        preshuffled = getattr(weight, "is_shuffled", False)
+
+        if self.use_flydsl_gather_kv_b_proj and _FLYDSL_GATHER_AVAILABLE:
+            gather_kv_b_proj_flydsl(
+                kv_buffer,
+                self._k_scale,
+                kv_indptr,
+                kv_indices,
+                cu_seqlens_k,
+                gather_weight,
+                weight_scale,
+                k_out,
+                v_out,
+                weight_preshuffle=preshuffled,
+            )
+            return
+
         gather_kv_b_proj(
             kv_buffer,
             self._k_scale,
             kv_indptr,
             kv_indices,
             cu_seqlens_k,
-            _maybe_view_mxfp4_weight_for_gather(self.kv_b_proj, weight),
-            getattr(self.kv_b_proj, "weight_scale", None),
+            gather_weight,
+            weight_scale,
             k_out,
             v_out,
-            weight_preshuffle=getattr(weight, "is_shuffled", False),
+            weight_preshuffle=preshuffled,
         )
 
     def _forward_prefill_cached_chunked(
@@ -2951,7 +2981,7 @@ def triton_convert_req_index_to_global_index(
 def _convert_req_index_to_global_index_dsa_prefill_kernel(
     dsa_qo_indptr,  # int32 [num_tokens + 1]
     dsa_kv_indptr,  # int32 [num_tokens + 1]
-    token_to_seq_idxs,  # int32 [num_tokens]
+    batch_id_per_q_token,  # int32 [num_tokens]
     topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS]
     block_table,  # int32 [num_req, max_num_blocks_per_req]
     cu_seqlens_q,  # int32 [num_tokens + 1]
@@ -2974,7 +3004,7 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
 
     col_id = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    req_id = tl.load(token_to_seq_idxs + token_id)  # int32
+    req_id = tl.load(batch_id_per_q_token + token_id)  # int32
     valid_req = (req_id >= 0) & (req_id < NUM_REQ)
 
     kv_start = tl.load(dsa_kv_indptr + token_id)
@@ -3030,7 +3060,7 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
 def triton_convert_req_index_to_global_index_dsa_prefill(
     dsa_qo_indptr: torch.Tensor,  # int32 [num_tokens + 1]
     dsa_kv_indptr: torch.Tensor,  # int32 [num_tokens + 1]
-    token_to_seq_idxs: torch.Tensor,  # int32 [num_tokens]
+    batch_id_per_q_token: torch.Tensor,  # int32 [num_tokens]
     topk_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS]
     block_table: torch.Tensor,  # int32 [num_req, max_num_blocks_per_req]
     cu_seqlens_q: torch.Tensor,  # int32 [num_tokens + 1]
@@ -3050,12 +3080,12 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
     num_tokens = min(
         dsa_qo_indptr.shape[0] - 1,
         dsa_kv_indptr.shape[0] - 1,
-        token_to_seq_idxs.shape[0],
+        batch_id_per_q_token.shape[0],
         topk_indices.shape[0],
     )
     dsa_qo_indptr = dsa_qo_indptr[: num_tokens + 1]
     dsa_kv_indptr = dsa_kv_indptr[: num_tokens + 1]
-    token_to_seq_idxs = token_to_seq_idxs[:num_tokens]
+    batch_id_per_q_token = batch_id_per_q_token[:num_tokens]
     topk_indices = topk_indices[:num_tokens]
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
 
@@ -3078,7 +3108,7 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
     _convert_req_index_to_global_index_dsa_prefill_kernel[grid](
         dsa_qo_indptr,
         dsa_kv_indptr,
-        token_to_seq_idxs,
+        batch_id_per_q_token,
         topk_indices,
         block_table,
         cu_seqlens_q,
@@ -3102,7 +3132,7 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
 @triton.jit
 def _gather_kv_indices_sparse_kernel(
     sparse_kv_indptr,
-    token_to_seq_idxs,
+    batch_id_per_q_token,
     topk_indices,
     kv_indices,
     kv_indptr,
@@ -3116,7 +3146,13 @@ def _gather_kv_indices_sparse_kernel(
     tile_id = tl.program_id(1)
     col_id = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    req_id = tl.load(token_to_seq_idxs + token_id)
+    # `-1` marks a CUDAGraph pad token (see token_layout/batch_ids.py). Its row
+    # must be inert, and both halves of that matter: the `kv_indptr` loads would
+    # read one entry BEFORE the buffer, and the gather below would index
+    # `block_table` at row -1 for any pad row whose topk slot still holds a
+    # stale non-negative id.
+    req_id = tl.load(batch_id_per_q_token + token_id)
+    valid_req = req_id >= 0
 
     out_start = tl.load(sparse_kv_indptr + token_id)
     out_end = tl.load(sparse_kv_indptr + token_id + 1)
@@ -3124,12 +3160,12 @@ def _gather_kv_indices_sparse_kernel(
 
     pos = tl.load(topk_indices + token_id * ti_stride0 + col_id * ti_stride1)
 
-    kv_base = tl.load(kv_indptr + req_id)
-    kv_end = tl.load(kv_indptr + req_id + 1)
+    kv_base = tl.load(kv_indptr + req_id, mask=valid_req, other=0)
+    kv_end = tl.load(kv_indptr + req_id + 1, mask=valid_req, other=0)
     req_kv_len = kv_end - kv_base
 
     store_mask = (col_id < kv_len) & (col_id < NUM_TOPK_TOKENS)
-    valid_mask = store_mask & (pos >= 0) & (pos < req_kv_len)
+    valid_mask = store_mask & valid_req & (pos >= 0) & (pos < req_kv_len)
 
     out_val = tl.load(
         kv_indices + kv_base + pos,
@@ -3146,7 +3182,7 @@ def _gather_kv_indices_sparse_kernel(
 
 def triton_gather_kv_indices_sparse(
     sparse_kv_indptr: torch.Tensor,
-    token_to_seq_idxs: torch.Tensor,
+    batch_id_per_q_token: torch.Tensor,
     topk_indices: torch.Tensor,
     kv_indices: torch.Tensor,
     kv_indptr: torch.Tensor,
@@ -3162,12 +3198,12 @@ def triton_gather_kv_indices_sparse(
     # per-token inputs aligned to the actual valid intersection before launch;
     # otherwise the kernel may read past topk_indices.
     num_tokens = min(
-        token_to_seq_idxs.shape[0],
+        batch_id_per_q_token.shape[0],
         topk_indices.shape[0],
         sparse_kv_indptr.shape[0] - 1,
     )
     sparse_kv_indptr = sparse_kv_indptr[: num_tokens + 1]
-    token_to_seq_idxs = token_to_seq_idxs[:num_tokens]
+    batch_id_per_q_token = batch_id_per_q_token[:num_tokens]
     topk_indices = topk_indices[:num_tokens]
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
 
@@ -3184,7 +3220,7 @@ def triton_gather_kv_indices_sparse(
 
     _gather_kv_indices_sparse_kernel[grid](
         sparse_kv_indptr,
-        token_to_seq_idxs,
+        batch_id_per_q_token,
         topk_indices,
         kv_indices,
         kv_indptr,

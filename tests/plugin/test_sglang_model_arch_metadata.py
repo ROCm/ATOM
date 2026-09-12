@@ -11,6 +11,7 @@ from atom.plugin.sglang.runtime.model_arch import resolve_model_arch_spec
         ("KimiK3ForConditionalGeneration", "_build_kimi_k3_forward_metadata"),
         ("GlmMoeDsaForCausalLM", "_build_glm52_dsa_forward_metadata"),
         ("DeepseekV4ForCausalLM", "_build_deepseek_v4_forward_metadata"),
+        ("DeepseekV4ForCausalLMNextN", "_build_deepseek_v4_forward_metadata"),
         (
             "MiniMaxM3SparseForCausalLM",
             "_build_minimax_m3_forward_metadata",
@@ -84,6 +85,11 @@ def test_resolve_model_arch_spec_supports_glm_model_type_fallback():
             "DeepseekV4ForCausalLM",
             "_build_deepseek_v4_forward_metadata",
         ),
+        (
+            "deepseek_v4_mtp",
+            "DeepseekV4ForCausalLM",
+            "_build_deepseek_v4_forward_metadata",
+        ),
     ),
 )
 def test_resolve_model_arch_spec_supports_family_version_architectures(
@@ -131,6 +137,22 @@ def test_resolve_model_arch_spec_uses_nested_text_model_type():
     )
 
     assert resolved_arch == "Qwen3_5MoeForConditionalGeneration"
+
+
+def test_resolve_dsv4_nextn_keeps_v4_metadata_when_model_type_is_v3():
+    resolved_arch, model_spec = resolve_model_arch_spec(
+        SimpleNamespace(
+            architectures=["DeepseekV4ForCausalLMNextN"],
+            model_type="deepseek_v3",
+        )
+    )
+
+    assert resolved_arch == "DeepseekV4ForCausalLMNextN"
+    assert model_spec.build_forward_metadata is not None
+    assert (
+        model_spec.build_forward_metadata.__name__
+        == "_build_deepseek_v4_forward_metadata"
+    )
 
 
 def test_resolve_model_arch_spec_does_not_treat_plain_llama_as_eagle3():

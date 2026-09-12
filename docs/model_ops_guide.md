@@ -146,11 +146,24 @@ The MHA `Attention` class handles standard models (Llama, Qwen3, Mixtral, etc.).
 | Phase | Condition | Method | AITER Kernel |
 |---|---|---|---|
 | Prefill | Always | `prefill_attention` | `aiter.flash_attn_varlen_func` |
+| Decode | `ATOM_USE_UNIFIED_ATTN` and `block_size == 256` | `paged_attention_persistent_asm` | `aiter.pa_persistent_fwd` |
+| Decode | past a paged kernel's envelope, or `ATOM_USE_UNIFIED_ATTN` / `use_flash_layout` | `paged_attention_unified` | `aiter.ops.triton.unified_attention` |
 | Decode | `use_triton_attn=True` | `paged_attention_triton` | `torch.ops.aiter.pa_decode_gluon` |
-| Decode | `block_size == 1024` | `paged_attention_persistent_asm` | `aiter.pa_persistent_fwd` |
 | Decode | Default | `paged_attention_asm` | `aiter.pa_fwd_asm` |
 
 The `use_triton_attn` flag is set when `sliding_window != -1` or `head_dim != 128`.
+
+Both paged kernels stop short of unified, at different points, and drafting
+multiplies the query group into both limits (`base_attention.py`):
+
+| Kernel | Envelope | Past it |
+|---|---|---|
+| gluon | `query_length <= 4` and `next_pow2(qlen) * max(16 // next_pow2(qlen), next_pow2(ratio)) <= 64`, where `ratio = q_heads / kv_heads` | no layout arm; Triton fails to compile |
+| `pa_fwd_asm` | `qlen x q_heads/kv_heads <= 16` | `get_heuristic_kernel` silently re-runs with `mtp=1` |
+
+`_dispatch_decode` is the single place that answers this; the runners do not
+re-decide. Unified carries one descale for the whole tensor, so a per-token
+quantized layer routed there raises rather than returning wrong numbers.
 
 ### Multi-head latent attention (`attention_mla.py`)
 
@@ -533,12 +546,12 @@ positions are ragged, and the one-token decode slot mapping comes from
 | `pool_layout/sub_pool_spec.py` | `SubPoolSpec`, `page_pool`, `state_pool`, `plan_pools` — sub-pool sizing as arithmetic over a byte budget |
 | `pool_layout/v4_pool_geometry.py` | `UnifiedPoolGeometry`, `WindowParams`, the compress ratios — where a DeepSeek-V4 row lives, and which rows a step may see |
 | `pool_layout/page_unit_geometry.py` | `PageUnitGeometryMixin` — where a K3 checkpoint image's bytes land in the MLA paged pool |
-| `pool_layout/state_arena.py` | `StateArena`, `StateField`, `plan_regions` — one request's per-layer state as a contiguous byte run |
+| `pool_layout/entry_arena.py` | `EntryField`, `entry_bytes_for`, `plan_regions`, `EntryMajorArena` — what one entry of a cache class holds, and where those bytes are put |
 | `pool_layout/paged_state_copy.py` | `plan_segmented_copy`, `launch_copy_descriptor` — scattering that byte run across PAGE units and back |
 | `token_layout/prefill.py` | `prefill_positions` — where a ragged prefill chunk's tokens sit in their own sequences |
 | `token_layout/decode.py` | `decode_positions` — the same for the rectangular speculative decode step |
 | `token_layout/slots.py` | `slot_mapping` — which KV slot a token is written to, one gather for both sides |
-| `token_layout/batch_ids.py` | `batch_id_per_token` — the token → sequence map both sides build and every kernel resolves per-sequence data through |
+| `token_layout/batch_ids.py` | `build_batch_ids` — builds the token → sequence map every kernel resolves per-sequence data through. Query lengths in gives `batch_id_per_q_token`, context lengths in gives `batch_id_per_k_token`; the two axes are not interchangeable |
 
 ### `atom/model_ops/fused_moe/`
 

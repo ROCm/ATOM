@@ -94,21 +94,37 @@ Streaming responses use the SSE (Server-Sent Events) protocol with
 
 #### Delivery under load
 
-The API server is a single Python process, so at high concurrency the fixed
-per-chunk cost of delivering tokens (detokenize, coroutine wakeup, JSON encode,
-socket write) can cap throughput before the GPU does. Two things keep that cost
-down:
+The API server is a single Python process, so at high concurrency detokenization
+and per-chunk delivery work (coroutine wakeup, JSON encoding, socket writes) can
+cap throughput before the GPU does. Two things reduce that work:
 
-- **Backlog merging.** Each request's chunks land in a `StreamOutputCollector`
-  (`atom/entrypoints/openai/streaming_dispatch.py`), which holds at most one
-  chunk per stream: anything arriving behind an unread one merges into it.
-  Nothing is held back waiting for more, so a consumer that keeps up sees
-  exactly one chunk per engine step.
+- **Merge before detokenization.** Engine output threads hand raw token deltas
+  to `StreamOutputCollector` (`atom/entrypoints/openai/streaming_dispatch.py`).
+  It keeps one pending chunk per stream or fan-out tag, merging unread token
+  IDs and metadata. The consumer decodes the accumulated delta in `get()`, so
+  backlog merging saves repeated detokenization as well as delivery work.
+  There is no timer or minimum batch size; a consumer that keeps up can read
+  each delta as it arrives.
 - **msgspec frame encoding** (`atom/entrypoints/openai/sse.py`), roughly 5.8x
   cheaper per frame than `json.dumps`.
 
-**A token *can* be delivered later than the engine produced it, by a bounded
-amount.** Two stages downstream of the collector read the text for markers —
+Detokenizer state is shared by reference but mutated only on the event loop;
+queued or unread chunks keep it alive after the engine callback is removed.
+A decode exception is logged with the request and fan-out tag. That chunk is
+returned with empty text while retaining token counts and terminal metadata,
+so a failed decode does not terminate sibling streams. Buffered tokens can be
+recovered by a later successful update; text from a failing terminal update
+cannot be guaranteed.
+
+Decoding is synchronous on the event loop. A large accumulated delta can delay
+other requests, and one pending chunk does not bound its token count or memory.
+There is no guarantee of unchanged TTFT or ITL. The serving benchmark measures
+intervals between SSE events carrying choices, which may contain multiple
+merged tokens or empty text; these intervals are not GPU token-generation
+latencies.
+
+**Marker lookahead bounds buffered bytes, not wall-clock delivery latency.**
+Two stages downstream of the collector read the text for markers —
 the reasoning channel's delimiters
 (`atom/entrypoints/openai/reasoning.py`) and the opening tags of whichever
 tool-call format this model uses (`atom/entrypoints/openai/tool_parser/`) —
@@ -116,10 +132,11 @@ and neither may hand out a byte that could turn out to be the first character
 of one. Both ask the same
 question through `MarkerScanner`
 (`atom/entrypoints/openai/marker_scanner.py`): release everything except the
-longest *suffix* of the buffer that is a prefix of some marker. The wait is
-therefore bounded by the longest marker a format declares, a few dozen bytes,
-and is usually zero — a chunk whose tail cannot begin a marker is released
-whole.
+longest *suffix* of the buffer that is a prefix of some marker. The retained
+suffix is therefore bounded by the longest marker a format declares, a few
+dozen bytes, and is usually empty — a chunk whose tail cannot begin a marker
+is released whole. Event-loop scheduling and socket backpressure can still
+add delivery delay.
 
 This is worth stating because it used to be unbounded. The rule was "hold
 everything once a marker's first character appears *anywhere* in the buffer",

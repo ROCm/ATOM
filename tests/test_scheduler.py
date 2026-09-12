@@ -945,6 +945,7 @@ class TestSchedule:
 
         assert failed.offload_load_failed is True
         assert failed in sched.running
+        assert failed.block_table == [0]
         assert sched._num_parked_remote_kv == 0
 
     def test_a_resumed_offload_prefill_reports_the_hit_the_load_gave_it(

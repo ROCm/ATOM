@@ -32,6 +32,7 @@ _OFFLOAD_LAYOUT_ALIASES = {
     "hybrid": "hybrid",
     "dense": "dense",
     "kimi_k3": "kimi_k3",
+    "m3": "m3",
     # Compatibility with the names used while the layout split was developed.
     "terminal_unit": "hybrid",
     "page_slot": "hybrid",
@@ -50,23 +51,28 @@ _HF_PAGE_FIELDS = (
     "qk_rope_head_dim",
     "compress_ratios",
     "indexer_dtype",
+    "indexer_types",
 )
 _HF_INTEGER_GEOMETRY_FIELDS = frozenset(_HF_PAGE_FIELDS) - {
     "compress_ratios",
     "indexer_dtype",
+    "indexer_types",
 }
 # GDN/linear model types carrying a per-request recurrent state but NOT in the
-# `kimi_linear` family `kimi_k3` owns. Same set as `ModelRunner.is_qwen_next()`,
-# but note the attribute skew: the guard below reads `hf_config.model_type`
-# while `is_qwen_next` reads `hf_text_config.model_type`. On the native path
-# they agree only because `get_hf_config` flattens the text type up; `is_vllm()`
-# drops `qwen3_5`/`qwen3_5_moe` from that flatten, so if offload is ever wired
-# into plugin mode this guard must switch to the text config to stay in sync.
+# `kimi_linear` family `kimi_k3` owns. Same set as `attn_family` resolves to
+# `Family.GDN`, but note the attribute skew: the guard below reads
+# `hf_config.model_type` while `attn_family` reads the text config. On the
+# native path they agree only because `get_hf_config` flattens the text type
+# up; `is_vllm()` drops `qwen3_5`/`qwen3_5_moe` from that flatten, so if
+# offload is ever wired into plugin mode this guard must switch to the text
+# config to stay in sync.
 # Unreachable today -- no plugin caller passes a `kv_transfer_config`.
-# MiniMax-M2/M3 are absent by design: M3 is sparse *paged* attention
+# MiniMax-M3 is not here either: it is sparse *paged* attention
 # (`MiniMaxM3SparseForCausalLM` -> `SparseMHAPagedAttentionImpl`), no recurrent
-# state, so the dense offload path handles it as ordinary paged KV -- it is NOT
-# a GDN/linear model despite some sibling comments once listing it as one.
+# state, so it is NOT a GDN/linear model. It does get its own PAGE-only `m3`
+# layout (see `_is_minimax_m3` and offload/hybrid/m3/): its NSA index_cache is
+# delivered only through transfer_tensors.block_regions, so the dense codec --
+# which builds from per-layer KVCacheTensor K/V -- would silently drop it.
 _GDN_LINEAR_MODEL_TYPES = frozenset(
     {"qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text"}
 )
@@ -95,6 +101,22 @@ def _strict_integer(name: str, value: object, *, minimum: int = 0) -> int:
     return normalized
 
 
+def _is_minimax_m3(hf_config) -> bool:
+    """MiniMax-M3: PAGE-only NSA sparse attention, no SLOT/compression.
+
+    Detected by architecture / model_type name so the offload layout
+    resolves identically in the scheduler and worker processes
+    (config-only selection, matching select_offload_layout's contract).
+    """
+
+    # Keep model normalization, attention selection, and offload layout
+    # selection on one predicate, including wrapper configs whose identifying
+    # fields live under ``text_config``.
+    from atom.config import _is_minimax_m3_config
+
+    return hf_config is not None and _is_minimax_m3_config(hf_config)
+
+
 def select_offload_layout(config) -> str:
     """Resolve the config-only dense/hybrid layout selection.
 
@@ -121,6 +143,17 @@ def select_offload_layout(config) -> str:
             f"lmcache_offload: unknown offload_layout={override!r}; "
             f"expected one of {sorted(_OFFLOAD_LAYOUT_ALIASES)}"
         )
+    # M3's PAGE layout is the only codec that carries its NSA index cache.
+    # Unlike a dense/hybrid namespace preference, changing this model family
+    # to another layout loses required state and can silently corrupt a
+    # restored prefix.
+    if natural == "m3" and mapped != "m3":
+        raise ValueError(
+            f"lmcache_offload: MiniMax-M3 requires offload_layout='m3'; "
+            f"offload_layout={override!r} resolves to {mapped!r}, whose codec "
+            "does not preserve the NSA index cache. Drop the override or set "
+            "it to 'm3'."
+        )
     # An override may pick between compatible layouts, but it may not strip a
     # state-owning model down to a layout with no tier for its per-request state
     # -- the same silent-wrong-output the GDN refusal pre-empts, reached by a
@@ -146,9 +179,17 @@ def _layout_from_model(config) -> str:
     hf_config = getattr(config, "hf_config", None)
     if hf_config is None:
         return "dense"
+    # MiniMax-M3 (NSA sparse *paged* attention, no recurrent state) gets a
+    # PAGE-only layout whose codec is sourced from transfer_tensors.block_regions
+    # -- the NSA index_cache rides there, never as a KVCacheTensor the dense codec
+    # inspects, so `dense` would offload K/V and silently drop the index cache,
+    # corrupting restored prefixes. Checked before the text-config family probe
+    # below because M3 is identified by architecture name, not model_type family.
+    if _is_minimax_m3(hf_config):
+        return "m3"
     # Resolve the family off the *text* config, exactly as the model-side
-    # predicates this mirrors do (`ModelRunner.is_qwen_next`/`is_kimi_linear`
-    # read `self.hf_text_config`). Two names in `_GDN_LINEAR_MODEL_TYPES` --
+    # predicate this mirrors does (`attn_family(hf_text_config)`, which the
+    # backend selector runs). Two names in `_GDN_LINEAR_MODEL_TYPES` --
     # `qwen3_5_text`, `qwen3_5_moe_text` -- are literally text-config model
     # types, so the bare wrapper `model_type` would be the multimodal wrapper's
     # and neither the `kimi_linear` nor the GDN branch would fire: Qwen3.5 would
@@ -261,11 +302,10 @@ def build_page_namespace(
         "schema": "atom-page-namespace",
         "layout_version": layout_version,
         "model": base_model_name,
-        "page_mode": (
-            "dsv4-page-regions"
-            if select_offload_layout(config) == "hybrid"
-            else "dense-opaque-block"
-        ),
+        "page_mode": {
+            "hybrid": "dsv4-page-regions",
+            "m3": "m3-page-regions",
+        }.get(select_offload_layout(config), "dense-opaque-block"),
         "kv_cache_dtype": str(getattr(config, "kv_cache_dtype", "auto")),
         "index_cache_dtype": str(getattr(config, "index_cache_dtype", "auto")),
         "block_size": _strict_integer(
@@ -326,23 +366,36 @@ def build_lmcache_config(
 
     Raises:
         ValueError: If the local-disk path, capacity, or CPU staging capacity
-            is incomplete.
+            is incomplete, or asynchronous loading is requested.
     """
     from lmcache.v1.config import LMCacheEngineConfig
 
     cfg = LMCacheEngineConfig.from_env()
+    # Preserve the legacy rank-0 default; explicit overrides can opt into
+    # all-rank lookup ([]) so every shard gets matching touches and pins.
+    if getattr(cfg, "lookup_server_worker_ids", None) is None:
+        cfg.lookup_server_worker_ids = [0]
     apply_extra_overrides(cfg, kv_transfer_config)
+    # Async lookup has a separate polling/cancellation contract. This
+    # connector currently implements only synchronous lookup; do not let an
+    # unsupported mode issue duplicate lookups or release late-arriving pins.
+    if getattr(cfg, "enable_async_loading", False):
+        raise ValueError(
+            "ATOM LMCache offload does not support enable_async_loading=True; "
+            "set LMCACHE_ENABLE_ASYNC_LOADING=false and remove any conflicting "
+            "lmcache.enable_async_loading override."
+        )
+    if str(getattr(cfg, "cache_policy", "")).strip().upper() == "ATOM_SLRU":
+        from atom.kv_transfer.offload.cache_policy import register_slru_policy
+
+        cfg.cache_policy = "ATOM_SLRU"
+        register_slru_policy()
     # cufile GDS has no NVMe-GDS hardware here and hangs on init; force off.
     if getattr(cfg, "use_gds", False):
         cfg.use_gds = False
-    # TP>1 fix: only rank 0 serves/answers the ZMQ lookup. Without this the
-    # client queries all ranks and takes min() over results; we observed rank!=0
-    # engine.lookup returning 0 even though that rank stored the chunk
-    # (contains()=True) -> min(0, hit)=0 -> the scheduler never sees the hit and
-    # always recomputes. Our connector saves on ALL ranks in lockstep, so rank 0
-    # is authoritative for "is it offloaded?"; each rank still loads its own KV
-    # shard, and _do_load is all-or-nothing (re-prefills if a shard is missing).
-    cfg.lookup_server_worker_ids = [0]
+    # Legacy rank-0 lookup avoids cold-rank false negatives. Under capacity
+    # pressure it cannot guarantee residency or pins on other shards; callers
+    # may explicitly request all ranks, whose minimum is the loadable prefix.
     validate_lmcache_storage_config(cfg)
     return cfg
 
@@ -377,7 +430,7 @@ def lmcache_replica_world_size(config) -> int:
 
     Worker ids index this replica-local grid rather than the global one.
     LMCache selects its lookup servers by worker id
-    (``cfg.lookup_server_worker_ids``, pinned to ``[0]`` above), so global
+    (``cfg.lookup_server_worker_ids``, defaulting to ``[0]``), so global
     numbering would leave every replica except the first without a server.
     Replica-local ids are also the right cache-key component: id ``i`` means
     "shard i of the model", which holds the same bytes in every replica, so

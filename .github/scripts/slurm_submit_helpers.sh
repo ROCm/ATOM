@@ -333,42 +333,62 @@ monitor_slurm_job() {
 
 read_slurm_exit_code() {
   local job_id="$1"
-  local sacct_line exit_status exit_signal
-  local attempt state
+  local sacct_line exit_status exit_signal deadline
+  local state=""
 
   SLURM_STATE="unknown"
   SLURM_EXIT_CODE="unknown"
-  SLURM_JOB_RC=1
+  SLURM_JOB_RC=2
+
+  SLURM_ACCOUNTING_TIMEOUT="${SLURM_ACCOUNTING_TIMEOUT:-30}"
+  SLURM_ACCOUNTING_POLL_INTERVAL="${SLURM_ACCOUNTING_POLL_INTERVAL:-2}"
 
   if ! command -v sacct >/dev/null 2>&1; then
     echo "WARNING: sacct not found; unable to read Slurm job exit code" >&2
     return 0
   fi
 
-  for ((attempt = 1; attempt <= ${SLURM_SACCT_MAX_ATTEMPTS:-12}; attempt++)); do
+  deadline=$(( $(date +%s) + SLURM_ACCOUNTING_TIMEOUT ))
+  while true; do
     if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
-      sacct_line="$(sacct --accounting "${SPUR_ACCOUNTING_ADDR}" --brief --noheader 2>/dev/null | awk -v job_id="${job_id}" '$1 == job_id { print $2 "|" $3; exit }' || true)"
+      if [[ -n "${SLURM_ACCOUNT:-}" ]]; then
+        sacct_line="$(sacct --account "${SLURM_ACCOUNT}" --brief --noheader 2>/dev/null | awk -v job_id="${job_id}" '$1 == job_id { print $2 "|" $3; exit }' || true)"
+      elif [[ -n "${SPUR_ACCOUNTING_ADDR:-}" ]]; then
+        sacct_line="$(sacct --accounting "${SPUR_ACCOUNTING_ADDR}" --brief --noheader 2>/dev/null | awk -v job_id="${job_id}" '$1 == job_id { print $2 "|" $3; exit }' || true)"
+      else
+        sacct_line="$(sacct -j "${job_id}" -X -n -P -o State,ExitCode 2>/dev/null | awk -F'|' 'NF { print; exit }' || true)"
+      fi
     else
       sacct_line="$(sacct -j "${job_id}" -X -n -P -o State,ExitCode 2>/dev/null | awk -F'|' 'NF { print; exit }' || true)"
     fi
     if [[ -n "${sacct_line}" ]]; then
       state="${sacct_line%%|*}"
+      state="${state%%+*}"
       case "${state}" in
         COMPLETE|COMPLETED|FAILED|CANCELLED|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL|PREEMPTED|BOOT_FAIL|DEADLINE)
           break
           ;;
       esac
     fi
-    if [[ "${attempt}" -lt "${SLURM_SACCT_MAX_ATTEMPTS:-12}" ]]; then
-      sleep "${SLURM_SACCT_RETRY_INTERVAL:-5}"
+
+    if [[ "$(date +%s)" -ge "${deadline}" ]]; then
+      if [[ -z "${sacct_line}" ]]; then
+        echo "ERROR: unable to read final Slurm state for job ${job_id} after ${SLURM_ACCOUNTING_TIMEOUT}s" >&2
+        return 0
+      fi
+      # COMPLETING (and similar) is not a final state on Spur; let callers
+      # fall back to rank-rc / batch-script status instead of treating 0:0 as fail.
+      echo "WARNING: Slurm job ${job_id} still in ${state:-unknown} after ${SLURM_ACCOUNTING_TIMEOUT}s; treating accounting as unavailable" >&2
+      SLURM_STATE="unknown"
+      SLURM_EXIT_CODE="unknown"
+      SLURM_JOB_RC=2
+      return 0
     fi
+    sleep "${SLURM_ACCOUNTING_POLL_INTERVAL}"
   done
-  if [[ -z "${sacct_line}" ]]; then
-    echo "WARNING: no Slurm accounting record found for job ${job_id}" >&2
-    return 0
-  fi
 
   SLURM_STATE="${sacct_line%%|*}"
+  SLURM_STATE="${SLURM_STATE%%+*}"
   SLURM_EXIT_CODE="${sacct_line##*|}"
   exit_status="${SLURM_EXIT_CODE%%:*}"
   exit_signal="${SLURM_EXIT_CODE##*:}"
@@ -383,5 +403,54 @@ read_slurm_exit_code() {
 
   if [[ "${SLURM_STATE}" != COMPLETE && "${SLURM_STATE}" != COMPLETED && "${SLURM_JOB_RC}" -eq 0 ]]; then
     SLURM_JOB_RC=1
+  fi
+}
+
+# Spur runs its batch script once per node. When accounting is unavailable,
+# accept a batch result or a complete set of atomically published rank results.
+read_slurm_status_files() {
+  local status_dir="$1"
+  local num_ranks="$2"
+  local rc_file rc rank
+  local ranks_reported=0 worst_rank_rc=0
+
+  [[ "${SLURM_STATE}" == "unknown" ]] || return 0
+
+  rc_file="${status_dir}/slurm-job.rc"
+  if [[ -s "${rc_file}" ]]; then
+    rc="$(tr -d '[:space:]' < "${rc_file}")"
+    if [[ "${rc}" =~ ^(0|[1-9][0-9]{0,2})$ && "${rc}" -le 255 ]]; then
+      worst_rank_rc="${rc}"
+      echo "Using batch script exit status because Slurm accounting is unavailable."
+    else
+      echo "WARNING: invalid batch script exit status: ${rc}" >&2
+      return 0
+    fi
+  else
+    # Read each expected rank exactly once; ignore .tmp and unrelated files.
+    for ((rank = 0; rank < num_ranks; rank++)); do
+      rc_file="${status_dir}/rank-rc-${rank}"
+      [[ -s "${rc_file}" ]] || continue
+      rc="$(tr -d '[:space:]' < "${rc_file}")"
+      [[ "${rc}" =~ ^(0|[1-9][0-9]{0,2})$ && "${rc}" -le 255 ]] || continue
+      ranks_reported=$((ranks_reported + 1))
+      echo "Slurm rank status: rank-${rank}=${rc}"
+      if [[ "${rc}" -gt "${worst_rank_rc}" ]]; then
+        worst_rank_rc="${rc}"
+      fi
+    done
+    if [[ "${ranks_reported}" -ne "${num_ranks}" || "${num_ranks}" -le 0 ]]; then
+      echo "WARNING: only ${ranks_reported}/${num_ranks} ranks reported an exit status" >&2
+      return 0
+    fi
+    echo "Using per-rank exit status because Slurm accounting is unavailable."
+  fi
+
+  SLURM_JOB_RC="${worst_rank_rc}"
+  SLURM_EXIT_CODE="${worst_rank_rc}:0"
+  if [[ "${worst_rank_rc}" -eq 0 ]]; then
+    SLURM_STATE="COMPLETED"
+  else
+    SLURM_STATE="FAILED"
   fi
 }

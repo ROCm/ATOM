@@ -239,6 +239,65 @@ class TestAllocateDeallocate:
         assert block_manager.can_allocate(probe) >= 0
 
 
+class TestDeallocatePartial:
+    """`deallocate_partial` backs offload early block release (see
+    `atom.kv_transfer.offload.dense.connector.DenseOffloadScheduler.
+    protected_block_ids`): everything a pending save does not read frees now;
+    the rest is left allocated (an implicit lease) until `free_leased_blocks`.
+    """
+
+    def test_frees_everything_outside_the_protected_set(self, seq_factory):
+        cfg = MockConfig(num_kvcache_blocks=32, kv_cache_block_size=4)
+        bm = BlockManager(cfg)
+        seq = seq_factory(list(range(48)))  # 12 blocks of 4 tokens
+        bm.allocate(seq)
+        assert len(seq.block_table) == 12
+        protected = frozenset(seq.block_table[:8])  # B1..B8
+
+        bm.deallocate_partial(seq, protected)
+
+        assert len(seq.block_table) == 0
+        assert seq.num_cached_tokens == 0
+        # Protected blocks are still allocated (ref_count untouched) --
+        # nothing else can claim them until `free_leased_blocks`.
+        assert bm.kv.num_used == 8
+        for block_id in protected:
+            assert bm.kv.block(block_id).ref_count >= 1
+
+    def test_free_leased_blocks_returns_the_rest_to_the_pool(self, seq_factory):
+        cfg = MockConfig(num_kvcache_blocks=32, kv_cache_block_size=4)
+        bm = BlockManager(cfg)
+        seq = seq_factory(list(range(48)))
+        bm.allocate(seq)
+        protected = frozenset(seq.block_table[:8])
+        bm.deallocate_partial(seq, protected)
+        assert bm.kv.num_used == 8
+
+        bm.free_leased_blocks(protected)
+
+        assert bm.kv.num_used == 0
+
+    def test_incremental_release_of_two_chunk_sized_leases(self, seq_factory):
+        """B1-B2 become source-safe first; B3-B8 stay leased until later."""
+        cfg = MockConfig(num_kvcache_blocks=32, kv_cache_block_size=4)
+        bm = BlockManager(cfg)
+        seq = seq_factory(list(range(48)))
+        bm.allocate(seq)
+        table = list(seq.block_table)
+        chunk_1_2 = frozenset(table[0:2])
+        chunk_3_8 = frozenset(table[2:8])
+        bm.deallocate_partial(seq, chunk_1_2 | chunk_3_8)
+        assert bm.kv.num_used == 8
+
+        bm.free_leased_blocks(chunk_1_2)
+        assert bm.kv.num_used == 6
+        for block_id in chunk_3_8:
+            assert bm.kv.block(block_id).ref_count >= 1
+
+        bm.free_leased_blocks(chunk_3_8)
+        assert bm.kv.num_used == 0
+
+
 # ── Prefix caching ────────────────────────────────────────────────────────
 
 

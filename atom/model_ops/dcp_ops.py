@@ -21,8 +21,16 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.distributed.dcp_layout import (  # noqa: F401
+    dcp_global_pos,
+    dcp_local_index,
+    dcp_owner_rank,
+)
 from atom.distributed.dcp_utils import get_dcp_group, get_dcp_world_size
 from atom.utils.forward_context import get_published_dcp_local_context_lens
+
+# Token-ownership arithmetic lives in ``dcp_layout`` so P/D relayout can share
+# it without importing Triton. Re-exported here for existing attention callers.
 
 _AG_CUSTOM_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
@@ -776,42 +784,6 @@ def get_dcp_local_window_lens(
     )
 
 
-def dcp_owner_rank(pos, dcp_size, cp_kv_cache_interleave_size=1):
-    """Which DCP rank owns global token ``pos`` under interleaved KV storage.
-
-    Interleaving groups tokens into chunks of ``cp_kv_cache_interleave_size`` (= S); chunk
-    ``c = pos // S`` is stored on rank ``c % dcp_size``. For S == 1 this reduces
-    to the round-robin ``pos % dcp_size``.
-
-    Works elementwise on Python ints, numpy arrays and torch tensors (only ``//``
-    and ``%`` are used). Consistent with vLLM's slot kernel
-    (``block_table.py`` ``is_local``) because ``block_size * W`` is a multiple of
-    ``S * W`` when ``block_size % S == 0``, so computing on the global position
-    equals computing on the virtual-block offset.
-    """
-    return (pos // cp_kv_cache_interleave_size) % dcp_size
-
-
-def dcp_local_index(pos, dcp_size, cp_kv_cache_interleave_size=1):
-    """Local KV-sequence index of global token ``pos`` on its owning rank.
-
-    Each ``S * W`` super-block contributes ``S`` tokens to a rank, so the local
-    index is ``(pos // (S*W)) * S + (pos % S)``. For S == 1 this reduces to the
-    round-robin ``pos // dcp_size``.
-
-    To map to a physical slot (given ``block_size % S == 0``):
-        block_table_index = pos // (block_size * dcp_size)   # == local_index // block_size
-        slot_offset       = local_index % block_size
-        slot              = block_table[block_table_index] * block_size + slot_offset
-
-    Elementwise over Python ints / numpy / torch.
-    """
-    sw = cp_kv_cache_interleave_size * dcp_size
-    return (pos // sw) * cp_kv_cache_interleave_size + (
-        pos % cp_kv_cache_interleave_size
-    )
-
-
 def dcp_prefill_slot_mapping(
     block_tables,
     cached_lens,
@@ -849,23 +821,6 @@ def dcp_prefill_slot_mapping(
                 block_table[pos // virtual_block_size] * block_size + local_offset
             )
     return slot_mapping
-
-
-def dcp_global_pos(local_index, dcp_rank, dcp_size, cp_kv_cache_interleave_size=1):
-    """Inverse of ``dcp_local_index``: global token position of local KV index
-    ``local_index`` held on ``dcp_rank``.
-
-    Local index j on rank r sits in local S-group ``j // S`` at offset ``j % S``;
-    that group is global chunk ``(j//S)*W + r``, so the global position is
-    ``((j//S)*W + r) * S + (j % S)``. For S == 1 this reduces to the round-robin
-    ``j*W + r``. Used to reconstruct globally-unique ids for exchanged sparse
-    top-k candidates (the id must be a total order over global positions).
-
-    Elementwise over Python ints / numpy / torch.
-    """
-    return (
-        (local_index // cp_kv_cache_interleave_size) * dcp_size + dcp_rank
-    ) * cp_kv_cache_interleave_size + (local_index % cp_kv_cache_interleave_size)
 
 
 def dcp_local_context_lens(
@@ -1072,7 +1027,7 @@ def dcp_decode_candidate_exchange_fused(
 @triton.jit
 def _count_owned_dcp_prefill_kernel(
     dsa_kv_indptr,  # int32 [num_tokens + 1] -- GLOBAL per-token candidate counts
-    token_to_seq_idxs,  # int32 [num_tokens]
+    batch_id_per_q_token,  # int32 [num_tokens]
     topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- FLAT KV indices
     cu_seqlens_k,  # int32 [num_req + 1] -- per-seq base of the flat KV axis
     out_counts,  # int32 [num_tokens]
@@ -1095,8 +1050,12 @@ def _count_owned_dcp_prefill_kernel(
     is what the round-robin owner is derived from -- is `indice - cu_seqlens_k[req]`.
     """
     token_id = tl.program_id(0)
-    req_id = tl.load(token_to_seq_idxs + token_id)
-    base = tl.load(cu_seqlens_k + req_id)
+    # `-1` marks a CUDAGraph pad token (see token_layout/batch_ids.py): its row
+    # owns nothing. `valid_req` must gate the SAME way in pass 2 below, or the
+    # counts this pass writes stop describing what that pass writes.
+    req_id = tl.load(batch_id_per_q_token + token_id)
+    valid_req = req_id >= 0
+    base = tl.load(cu_seqlens_k + req_id, mask=valid_req, other=0)
 
     count = 0
     for tile_start in range(0, NUM_TOPK_TOKENS, BLOCK_N):
@@ -1109,7 +1068,10 @@ def _count_owned_dcp_prefill_kernel(
         )
         pos = indice - base  # position within the sequence
         owned = (
-            col_valid & (indice >= 0) & (((pos // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
+            col_valid
+            & valid_req
+            & (indice >= 0)
+            & (((pos // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
         )
         count += tl.sum(owned.to(tl.int32))
 
@@ -1121,7 +1083,7 @@ def _count_owned_dcp_prefill_kernel(
 def _compact_filter_dcp_prefill_kernel(
     dsa_kv_indptr,  # int32 [num_tokens + 1] -- GLOBAL per-token candidate counts
     out_kv_indptr,  # int32 [num_tokens + 1] -- COMPACTED offsets (cumsum of pass 1)
-    token_to_seq_idxs,  # int32 [num_tokens]
+    batch_id_per_q_token,  # int32 [num_tokens]
     topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- FLAT KV indices
     cu_seqlens_k,  # int32 [num_req + 1]
     block_table,  # int32 [num_req, max_num_blocks_per_req] -- logical(global) blocks
@@ -1151,8 +1113,10 @@ def _compact_filter_dcp_prefill_kernel(
     deterministic.
     """
     token_id = tl.program_id(0)
-    req_id = tl.load(token_to_seq_idxs + token_id)
-    base = tl.load(cu_seqlens_k + req_id)
+    # Pad-token guard, in lockstep with pass 1 (see the note there).
+    req_id = tl.load(batch_id_per_q_token + token_id)
+    valid_req = req_id >= 0
+    base = tl.load(cu_seqlens_k + req_id, mask=valid_req, other=0)
     out_kv_start = tl.load(out_kv_indptr + token_id)
 
     vbs = PAGE_SIZE * DCP_WORLD
@@ -1171,7 +1135,10 @@ def _compact_filter_dcp_prefill_kernel(
         )
         pos = indice - base
         idx_valid = (
-            col_valid & (indice >= 0) & (((pos // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
+            col_valid
+            & valid_req
+            & (indice >= 0)
+            & (((pos // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
         )
 
         block_id = pos // vbs
@@ -1202,7 +1169,7 @@ def _compact_filter_dcp_prefill_kernel(
 
 def triton_filter_and_convert_dcp_index_prefill(
     dsa_kv_indptr: torch.Tensor,  # int32 [num_tokens + 1] GLOBAL counts
-    token_to_seq_idxs: torch.Tensor,  # int32 [num_tokens]
+    batch_id_per_q_token: torch.Tensor,  # int32 [num_tokens]
     topk_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS] FLAT indices
     cu_seqlens_k: torch.Tensor,  # int32 [num_req + 1]
     block_table: torch.Tensor,  # int32 [num_req, max_num_blocks_per_req] logical
@@ -1237,7 +1204,7 @@ def triton_filter_and_convert_dcp_index_prefill(
     num_tokens = dsa_kv_indptr.shape[0] - 1
 
     dsa_kv_indptr_c = dsa_kv_indptr.contiguous()
-    token_to_seq_idxs_c = token_to_seq_idxs.contiguous()
+    batch_id_per_q_token_c = batch_id_per_q_token.contiguous()
     topk_indices_c = topk_indices.contiguous()
     cu_seqlens_k_c = cu_seqlens_k.contiguous()
     block_table_c = block_table.contiguous()
@@ -1250,7 +1217,7 @@ def triton_filter_and_convert_dcp_index_prefill(
     metadata_counts = out_kv_indptr[1 : num_tokens + 1]
     _count_owned_dcp_prefill_kernel[grid](
         dsa_kv_indptr_c,
-        token_to_seq_idxs_c,
+        batch_id_per_q_token_c,
         topk_indices_c,
         cu_seqlens_k_c,
         counts,
@@ -1278,7 +1245,7 @@ def triton_filter_and_convert_dcp_index_prefill(
     _compact_filter_dcp_prefill_kernel[grid](
         dsa_kv_indptr_c,
         out_kv_indptr,
-        token_to_seq_idxs_c,
+        batch_id_per_q_token_c,
         topk_indices_c,
         cu_seqlens_k_c,
         block_table_c,

@@ -307,7 +307,7 @@ def swa_write_reference(
 def _swa_scatter_rows_kernel(
     kv_ptr,  # [T, head_dim]
     dest_row_ptr,  # [T] int32 — plane row for this token
-    batch_id_per_token_ptr,  # [T] int — -1 on CG-pad tokens
+    batch_id_per_q_token_ptr,  # [T] int — -1 on CG-pad tokens
     pool_ptr,  # [rows, head_dim] this layer's plane view
     pool_row_stride,
     pool_rows,  # rows in that view; nothing may be written past it
@@ -316,7 +316,7 @@ def _swa_scatter_rows_kernel(
 ):
     t = tl.program_id(0)
     dst_row = tl.load(dest_row_ptr + t)
-    bid = tl.load(batch_id_per_token_ptr + t)
+    bid = tl.load(batch_id_per_q_token_ptr + t)
     # Upper bound as well as lower: `dest_rows` comes from another kernel fed
     # by the same staging, so it is no more trustworthy than the row
     # `swa_write` derives inline.
@@ -335,7 +335,7 @@ def _swa_scatter_rows_kernel(
 def swa_scatter_rows(
     kv: torch.Tensor,
     dest_rows: torch.Tensor,
-    batch_id_per_token: torch.Tensor,
+    batch_id_per_q_token: torch.Tensor,
     pool: torch.Tensor,
     *,
     k_packed: torch.Tensor | None = None,
@@ -354,7 +354,7 @@ def swa_scatter_rows(
     Args:
         kv:        [T, head_dim] — bf16 path.
         dest_rows: [>=T] int32 — plane row per token.
-        batch_id_per_token: [>=T] int — `-1` on CG-pad tokens, which are
+        batch_id_per_q_token: [>=T] int — `-1` on CG-pad tokens, which are
                    skipped. The same gate the fused writes apply, so a padded
                    replay writes nothing whichever backend ran.
         pool:      [rows, head_dim] this layer's NoPE plane view.
@@ -364,20 +364,20 @@ def swa_scatter_rows(
         assert k_packed is not None and k_rope is not None
         flat = (t.reshape(t.shape[0], -1) for t in (k_packed, k_rope))
         nope, rope = flat
-        swa_scatter_rows(nope, dest_rows, batch_id_per_token, pool)
-        swa_scatter_rows(rope, dest_rows, batch_id_per_token, pool_rope)
+        swa_scatter_rows(nope, dest_rows, batch_id_per_q_token, pool)
+        swa_scatter_rows(rope, dest_rows, batch_id_per_q_token, pool_rope)
         return
     assert kv.dim() == 2 and pool.dim() == 2
     assert kv.shape[1] == pool.shape[1]
     T = kv.shape[0]
     if T == 0:
         return
-    assert dest_rows.shape[0] >= T and batch_id_per_token.shape[0] >= T
+    assert dest_rows.shape[0] >= T and batch_id_per_q_token.shape[0] >= T
     head_dim = kv.shape[1]
     _swa_scatter_rows_kernel[(T,)](
         kv.contiguous(),
         dest_rows,
-        batch_id_per_token,
+        batch_id_per_q_token,
         pool,
         pool.stride(0),
         pool.shape[0],
@@ -389,12 +389,12 @@ def swa_scatter_rows(
 def swa_scatter_rows_reference(
     kv: torch.Tensor,
     dest_rows: torch.Tensor,
-    batch_id_per_token: torch.Tensor,
+    batch_id_per_q_token: torch.Tensor,
     pool: torch.Tensor,
 ) -> None:
     """Pure-torch equivalent of :func:`swa_scatter_rows` (bf16 path)."""
     T = kv.shape[0]
-    live = (dest_rows[:T] >= 0) & (batch_id_per_token[:T] >= 0)
+    live = (dest_rows[:T] >= 0) & (batch_id_per_q_token[:T] >= 0)
     pool[dest_rows[:T][live].long()] = kv[live]
 
 

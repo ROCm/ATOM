@@ -42,7 +42,7 @@ Checkpoint layout (DeepSeek-V4-Pro-DSpark):
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from torch import nn
@@ -239,25 +239,41 @@ def _linear_out(output):
     return output[0] if isinstance(output, tuple) else output
 
 
+def _ckpt_index_path(model_path: str) -> str:
+    """Locate the shard index of a checkpoint named by directory or hub repo.
+
+    ``--model`` accepts either, and the hub form is not hypothetical: CI passes
+    the bare repo id on any runner without a local model mirror mounted. Only
+    the index is wanted here, so fetch that one file, never the shards.
+    """
+    import os
+
+    if os.path.isdir(model_path):
+        return os.path.join(model_path, "model.safetensors.index.json")
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(model_path, "model.safetensors.index.json")
+
+
 def _count_dspark_stages(model_path, default: int = 0) -> int:
     """Count distinct ``mtp.{i}.*`` stages in the checkpoint index.
 
     DSpark stores its backbone as ``mtp.0 .. mtp.{N-1}`` in the V4 checkpoint
     (N=3 for V4-Pro-DSpark). We must build exactly N stages or the last stage's
     Markov/confidence-head weights get dropped at load. The HF config's
-    ``num_nextn_predict_layers`` is unrelated (it is 1, a serial-MTP field).
+    ``num_nextn_predict_layers`` is unrelated (it is 1, a serial-MTP field),
+    and neither is ``dspark_target_layer_ids``, whose length counts the target
+    hidden states stage 0 concatenates, not the stages downstream of it.
     """
     import json
-    import os
     import re
 
     if not model_path:
         return default
-    idx_path = os.path.join(model_path, "model.safetensors.index.json")
     try:
-        with open(idx_path) as f:
+        with open(_ckpt_index_path(model_path)) as f:
             weight_map = json.load(f)["weight_map"]
-    except Exception:
+    except Exception:  # noqa: BLE001 -- a probe: any unreadable index means "no"
         return default
     stages = set()
     for name in weight_map:
@@ -408,7 +424,7 @@ def _dspark_block_sparse_attention_torch(
     Kept as a kernel-free, inspectable reference. The production path
     (``_dspark_block_sparse_attention``) dispatches to the fused flash kernel.
     """
-    B, T, H, D = q.shape
+    B, T, H, _ = q.shape
     W = kv.shape[1] - T
     # Scores: [B, H, T, W+T]  (broadcast single KV head over H query heads).
     scores = torch.einsum("bthd,bsd->bhts", q.float(), kv.float()) * scale
@@ -514,7 +530,7 @@ try:
     )
 
     _ATOM_V4_AVAILABLE = True
-except Exception:  # pragma: no cover - exercised only in the stubbed test sandbox
+except Exception:  # noqa: BLE001  # pragma: no cover - stubbed test sandbox only
     _ATOM_V4_AVAILABLE = False
     Block = object  # type: ignore
 
@@ -848,7 +864,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
             swa_nope_scale_buff=a.swa_plane if use_fp8 else None,
             swa_rope_buff=a.swa_plane_rope if use_fp8 else None,
             swa_dest_rows=draft_rows if use_fp8 else None,
-            batch_id_per_token=batch_ids if use_fp8 else None,
+            batch_id_per_q_token=batch_ids if use_fp8 else None,
             prefix=f"{a.layer_name}.dspark_qk_norm_rope",
         )
 
@@ -997,11 +1013,11 @@ class DeepseekV4DSpark(DSparkDraftModel):
         from atom.model_loader.loader import WeightsMapper
 
         weights_mapper = WeightsMapper(orig_to_new_prefix={"mtp.": "model.mtp."})
-    weights_mapping = {
+    weights_mapping: ClassVar[dict[str, str]] = {
         ".gate.bias": ".gate.e_score_correction_bias",
         ".scale": ".weight_scale_inv",
     }
-    packed_modules_mapping = {
+    packed_modules_mapping: ClassVar[dict[str, tuple[str, int]]] = {
         "attn.wq_a": ("attn.wqkv_a", 0),
         "attn.wkv": ("attn.wqkv_a", 1),
         "compressor.wkv": ("compressor.wkv_gate", 0),
@@ -1056,7 +1072,9 @@ class DeepseekV4DSpark(DSparkDraftModel):
         )
         if self.num_stages <= 0:
             raise ValueError(
-                "Could not determine DSpark stage count from the checkpoint; "
+                "Could not determine DSpark stage count from the checkpoint at "
+                f"{getattr(config, 'model', None)!r} (no readable "
+                "model.safetensors.index.json holding mtp.{i}.* weights); "
                 "set dspark_num_layers in the config."
             )
 
@@ -1159,9 +1177,32 @@ class DeepseekV4DSpark(DSparkDraftModel):
                 f"the compiled graph at CompilationLevel >= DYNAMO_ONCE."
             )
 
+        return self.head_and_sample(
+            self.block_backbone(input_ids, positions, T), input_ids, T
+        )
+
+    def block_backbone(
+        self,
+        input_ids: torch.Tensor,  # [B]  anchor token per request (x0)
+        positions: torch.Tensor,  # [B]  anchor position per request
+        num_draft: int,
+    ):
+        """The parallel half: the compiled backbone over the whole draft width.
+
+        Returns the inner's ``(normed, hc_hidden)`` pair untouched -- the mHC
+        hidden is the pre-norm reduction the confidence head needs. Positions
+        are the ANCHOR's; expanding them across the block happens inside the
+        compiled region.
+        """
         # __call__, not .forward -- the decorator's compiled dispatch lives there.
-        normed, hc_hidden = self.model(input_ids, positions, T)
-        return self.model.head_and_sample(normed, hc_hidden, input_ids)
+        return self.model(input_ids, positions, num_draft)
+
+    def head_and_sample(self, out, anchor_ids: torch.Tensor, num_draft: int):
+        """The sequential half: LM head, then the Markov sampler. ``num_draft``
+        is taken for the shared surface and unused -- the width is carried by
+        ``hc_hidden``'s middle dimension."""
+        normed, hc_hidden = out
+        return self.model.head_and_sample(normed, hc_hidden, anchor_ids)
 
 
 @support_torch_compile

@@ -1,7 +1,6 @@
 import logging
 import math
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
@@ -38,9 +37,7 @@ _MLA_MAX_SPLIT_PER_BATCH = 16
 
 def get_aiter_kv_cache_dtype(config) -> torch.dtype:
     kv_cache_dtype = config.cache_config.cache_dtype
-    if kv_cache_dtype == "auto":
-        kv_cache_dtype = "bf16"
-    elif kv_cache_dtype == "bfloat16":
+    if kv_cache_dtype == "auto" or kv_cache_dtype == "bfloat16":
         kv_cache_dtype = "bf16"
     elif kv_cache_dtype == "float16":
         kv_cache_dtype = "fp16"
@@ -59,7 +56,7 @@ class AiterChunkSlidingWindowMetadata:
     swa_seqlens: torch.Tensor
     swa_cu_seqlens: torch.Tensor
     swa_seq_starts: torch.Tensor
-    swa_token_to_batch: torch.Tensor
+    swa_batch_id_per_k_token: torch.Tensor
     swa_max_seqlens: int
     swa_total_tokens: int
     swa_workspace: torch.Tensor
@@ -70,13 +67,13 @@ class AiterChunkContextMetadata:
     workspace: torch.Tensor
     cu_seq_lens_chunk: torch.Tensor
     chunk_starts: torch.Tensor
-    token_to_batch: torch.Tensor
+    batch_id_per_k_token: torch.Tensor
     seq_tot: list[int]
     max_seq_lens: list[int]
     seq_lens: torch.Tensor
     num_chunks: int
     total_token_per_batch: list[int]
-    swa_metadata: Optional[AiterChunkSlidingWindowMetadata] = None
+    swa_metadata: AiterChunkSlidingWindowMetadata | None = None
 
 
 @dataclass
@@ -115,9 +112,9 @@ class AiterMhaMetadataForVllm:
     num_extend_tokens: int
     dropout_p: float = 0.0
 
-    decode_metadata: Optional[AiterMhaPhaseMetadata] = None
-    prefill_metadata: Optional[AiterMhaPhaseMetadata] = None
-    extend_metadata: Optional[AiterChunkPrefillMetadata] = None
+    decode_metadata: AiterMhaPhaseMetadata | None = None
+    prefill_metadata: AiterMhaPhaseMetadata | None = None
+    extend_metadata: AiterChunkPrefillMetadata | None = None
 
     use_cascade: bool = False
     common_prefix_len: int = 0
@@ -190,7 +187,7 @@ class AiterMlaPrefillMetadataForVllm:
         max_seq_lens: list[int]
         seq_lens: torch.Tensor
         workspace: torch.Tensor
-        token_to_seq: torch.Tensor
+        batch_id_per_k_token: torch.Tensor
         chunk_total_token: list[int]
         prefill_tokens_with_context: int | None = None
 
@@ -201,9 +198,9 @@ class AiterMlaPrefillMetadataForVllm:
         cu_seq_lens_lst: list[list[int]] | None = None
         chunk_size: int | None = None
         # Per-chunk local token->seq map for gather_and_maybe_dequant_cache under
-        # fp8 DCP (mirrors token_to_seq but over the padded local per-rank
+        # fp8 DCP (mirrors batch_id_per_k_token but over the padded local per-rank
         # chunk layout). [num_chunks, max_local_toks].
-        padded_local_token_to_seq: torch.Tensor | None = None
+        padded_local_batch_id_per_k_token: torch.Tensor | None = None
 
     block_table: torch.Tensor
     query_start_loc: torch.Tensor
@@ -259,7 +256,7 @@ class AiterMlaSparseIndexerPrefillChunkMetadataForVllm:
     cu_seqlen_ks: torch.Tensor
     cu_seqlen_ke: torch.Tensor
     cu_seq_lens: torch.Tensor
-    token_to_seq: torch.Tensor
+    batch_id_per_k_token: torch.Tensor
     total_seq_lens: int
     token_start: int
     token_end: int
@@ -399,7 +396,7 @@ class AiterMlaSparseMetadataForVllm:
     slot_mapping: torch.Tensor
 
     block_table: torch.Tensor
-    req_id_per_token: torch.Tensor
+    batch_id_per_q_token: torch.Tensor
 
     qo_indptr: torch.Tensor
     paged_kv_last_page_len: torch.Tensor
@@ -473,8 +470,9 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
         del model_runner
         super().__init__(kv_cache_spec, layer_names, config, device)
         logger.info("init MinimaxM3SparseAttentionMetadataBuilder")
-        from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE
         from vllm.config import VllmConfig
+
+        from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE
 
         assert isinstance(config, VllmConfig)
         self.vllm_config = config
@@ -818,14 +816,14 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
                     dtype=cu_seq_lens.dtype,
                     out=cu_seq_lens[1:],
                 )
-                token_to_seq = torch.arange(
+                batch_id_per_k_token = torch.arange(
                     0,
                     num_extends,
                     dtype=torch.int32,
                     device=seq_lens_extend.device,
                 )
-                token_to_seq = torch.repeat_interleave(
-                    token_to_seq, swa_seqlen_for_extend
+                batch_id_per_k_token = torch.repeat_interleave(
+                    batch_id_per_k_token, swa_seqlen_for_extend
                 )
                 fetched_shape = cu_seq_lens[-1].item()
                 swa_workspace = torch.empty(
@@ -844,7 +842,9 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
                     ),
                     swa_cu_seqlens=cu_seq_lens.to(self.device, non_blocking=True),
                     swa_seq_starts=seq_starts.to(self.device, non_blocking=True),
-                    swa_token_to_batch=token_to_seq.to(self.device, non_blocking=True),
+                    swa_batch_id_per_k_token=batch_id_per_k_token.to(
+                        self.device, non_blocking=True
+                    ),
                     swa_max_seqlens=max_seqlen_k,
                     swa_total_tokens=total_tokens,
                     swa_workspace=swa_workspace,
@@ -878,7 +878,7 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
             max_cum_tokens = cu_seq_lens_cpu[:, -1].max().item()
 
             # Build token->batch mapping robustly, even with zero-length batches.
-            token_to_batch_tensor = torch.zeros(
+            batch_id_per_k_token_tensor = torch.zeros(
                 (num_chunks, max_cum_tokens), dtype=torch.int32, pin_memory=True
             )
             batch_ids = torch.arange(num_extends, dtype=torch.int32)
@@ -886,10 +886,12 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
                 total_tokens = cu_seq_lens_cpu[chunk_idx, -1].item()
                 if total_tokens == 0:
                     continue
-                token_to_batch = torch.repeat_interleave(
+                batch_id_per_k_token = torch.repeat_interleave(
                     batch_ids, chunk_seq_lens[chunk_idx].to(torch.int64)
                 )
-                token_to_batch_tensor[chunk_idx, :total_tokens] = token_to_batch
+                batch_id_per_k_token_tensor[chunk_idx, :total_tokens] = (
+                    batch_id_per_k_token
+                )
 
             chunk_context_metadata = AiterChunkContextMetadata(
                 workspace=self.extend_workspace,
@@ -898,7 +900,9 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
                 seq_tot=chunk_seq_lens.sum(dim=1).tolist(),
                 max_seq_lens=chunk_seq_lens.max(dim=1).values.tolist(),
                 seq_lens=chunk_seq_lens,
-                token_to_batch=token_to_batch_tensor.to(self.device, non_blocking=True),
+                batch_id_per_k_token=batch_id_per_k_token_tensor.to(
+                    self.device, non_blocking=True
+                ),
                 num_chunks=num_chunks,
                 total_token_per_batch=cu_seq_lens_cpu[:, -1].tolist(),
                 swa_metadata=swa_metadata,
@@ -1537,13 +1541,14 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         fast_build: bool = False,
     ):
 
-        from vllm.v1.attention.backends.utils import split_decodes_and_prefills
         from vllm.model_executor.layers.attention.mla_attention import (
             QueryLenSupport,
         )
-
         from vllm.utils.math_utils import cdiv, round_down
-        from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
+        from vllm.v1.attention.backends.utils import (
+            get_dcp_local_seq_lens,
+            split_decodes_and_prefills,
+        )
 
         num_reqs = common_attn_metadata.num_reqs
         num_tokens = common_attn_metadata.num_actual_tokens
@@ -1687,16 +1692,16 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                 chunk_total_token = cu_seq_lens_cpu[:, -1]
 
                 max_token_num_over_chunk = chunk_total_token.max().item()
-                token_to_seq_tensor_cpu = torch.zeros(
+                batch_id_per_k_token_cpu = torch.zeros(
                     [num_chunks, max_token_num_over_chunk], dtype=torch.int32
                 )
                 range_idx = torch.arange(num_prefills, dtype=torch.int32)
                 for i in range(num_chunks):
-                    chunk_token_to_seq_tensor = torch.repeat_interleave(
+                    chunk_batch_id_per_k_token = torch.repeat_interleave(
                         range_idx, chunk_seq_lens[i]
                     )
-                    chunk_len = chunk_token_to_seq_tensor.shape[0]
-                    token_to_seq_tensor_cpu[i, :chunk_len] = chunk_token_to_seq_tensor
+                    chunk_len = chunk_batch_id_per_k_token.shape[0]
+                    batch_id_per_k_token_cpu[i, :chunk_len] = chunk_batch_id_per_k_token
 
                 if self.dcp_world_size > 1:
                     local_context_lens_allranks = get_dcp_local_seq_lens(
@@ -1756,19 +1761,21 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                     )
 
                     # Local token->seq map for gather_and_maybe_dequant_cache
-                    # (fp8 DCP): mirrors token_to_seq but over the padded local
+                    # (fp8 DCP): mirrors batch_id_per_k_token but over the padded local
                     # per-rank chunk layout. Length per chunk == seq_tot[i].
                     max_local_toks = int(
                         padded_local_chunk_seq_lens.sum(dim=1).max().item()
                     )
-                    padded_local_token_to_seq_cpu = torch.zeros(
+                    padded_local_batch_id_per_k_token_cpu = torch.zeros(
                         [num_chunks, max_local_toks], dtype=torch.int32
                     )
                     for _c in range(num_chunks):
-                        _t2s = torch.repeat_interleave(
+                        _bid = torch.repeat_interleave(
                             range_idx, padded_local_chunk_seq_lens[_c]
                         )
-                        padded_local_token_to_seq_cpu[_c, : _t2s.shape[0]] = _t2s
+                        padded_local_batch_id_per_k_token_cpu[_c, : _bid.shape[0]] = (
+                            _bid
+                        )
 
                 chunked_context_metadata_cls = (
                     AiterMlaPrefillMetadataForVllm.AiterMlaChunkedContextMetadataForVllm
@@ -1785,7 +1792,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                         seq_tot=padded_local_chunk_seq_lens.sum(dim=1).tolist(),
                         max_seq_lens=chunk_seq_lens.max(dim=1).values.tolist(),
                         seq_lens=chunk_seq_lens,
-                        token_to_seq=token_to_seq_tensor_cpu.to(
+                        batch_id_per_k_token=batch_id_per_k_token_cpu.to(
                             device, non_blocking=True
                         ),
                         chunk_total_token=chunk_total_token.tolist(),
@@ -1797,7 +1804,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                         ),
                         cu_seq_lens_lst=cu_seq_lens_cpu.tolist(),
                         chunk_size=padded_local_max_context_chunk_across_ranks,
-                        padded_local_token_to_seq=padded_local_token_to_seq_cpu.to(
+                        padded_local_batch_id_per_k_token=padded_local_batch_id_per_k_token_cpu.to(
                             device, non_blocking=True
                         ),
                         prefill_tokens_with_context=prefill_tokens_with_context,
@@ -1809,7 +1816,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                         seq_tot=chunk_seq_lens.sum(dim=1).tolist(),
                         max_seq_lens=chunk_seq_lens.max(dim=1).values.tolist(),
                         seq_lens=chunk_seq_lens,
-                        token_to_seq=token_to_seq_tensor_cpu.to(
+                        batch_id_per_k_token=batch_id_per_k_token_cpu.to(
                             device, non_blocking=True
                         ),
                         chunk_total_token=chunk_total_token,
@@ -1936,7 +1943,7 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         # zeros (not empty) so the shrink-tail fast path in build() can assume
         # entries past the current extent are already 0 without a full-buffer
         # fill_(0) every step.
-        self.req_id_per_token_buffer = torch.zeros(
+        self.batch_id_per_q_token_buffer = torch.zeros(
             (max_num_batched_tokens,),
             dtype=torch.int32,
             device=device,
@@ -2017,11 +2024,7 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         vllm_sfc = getattr(config.compilation_config, "static_forward_context", {})
 
         def _resolve_indexer(layer_name):
-            attention_prefix = (
-                layer_name[: -len(".attn")]
-                if layer_name.endswith(".attn")
-                else layer_name
-            )
+            attention_prefix = layer_name.removesuffix(".attn")
             indexer_cache = vllm_sfc.get(f"{attention_prefix}.indexer.k_cache")
             owner_atom_config = getattr(indexer_cache, "atom_config", None)
             sfc = (
@@ -2078,24 +2081,24 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         common_attn_metadata,
         fast_build=False,
         *,
-        _req_id_per_token=None,
+        _batch_id_per_q_token=None,
         _drafting=False,
     ):
         num_tokens = common_attn_metadata.num_actual_tokens
-        if _req_id_per_token is not None:
-            # Draft path (see build_for_drafting): req_id_per_token was already
+        if _batch_id_per_q_token is not None:
+            # Draft path (see build_for_drafting): batch_id_per_q_token was already
             # produced on-GPU, so the copy_ below is device-to-device and the
             # per-step pageable H2D sync is avoided.
-            req_id_per_token = _req_id_per_token
+            batch_id_per_q_token = _batch_id_per_q_token
         else:
             starts = common_attn_metadata.query_start_loc_cpu.to(torch.int32)
             seg_lengths = torch.diff(starts)
-            req_id_per_token = torch.repeat_interleave(
+            batch_id_per_q_token = torch.repeat_interleave(
                 torch.arange(seg_lengths.shape[0], dtype=torch.int32), seg_lengths
             )
         # Shrink-tail-only zeroing instead of three full-buffer fill_(0) every
         # step (the buffers are persistent across decode steps and zeros-init):
-        #   - req_id_per_token_buffer / paged_kv_indices: the kernel only reads
+        #   - batch_id_per_q_token_buffer / paged_kv_indices: the kernel only reads
         #     the ranges defined by paged_kv_indptr / num_tokens, so entries
         #     past the new extent are never read; we only need to re-zero the
         #     tail left over from a previous, larger batch.
@@ -2103,20 +2106,20 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         #     below, which starts at index 1) and indices >= 1 are fully
         #     rewritten by the cumsum + scalar broadcast, so its fill_(0) is
         #     redundant and dropped entirely.
-        new_req_extent = int(req_id_per_token.shape[0])
+        new_req_extent = int(batch_id_per_q_token.shape[0])
         new_indices_extent = num_tokens * self.topk_tokens
         if self._prev_req_extent > new_req_extent:
-            self.req_id_per_token_buffer[new_req_extent : self._prev_req_extent].fill_(
-                0
-            )
+            self.batch_id_per_q_token_buffer[
+                new_req_extent : self._prev_req_extent
+            ].fill_(0)
         if self._prev_indices_extent > new_indices_extent:
             self.paged_kv_indices[new_indices_extent : self._prev_indices_extent].fill_(
                 0
             )
         self._prev_req_extent = new_req_extent
         self._prev_indices_extent = new_indices_extent
-        self.req_id_per_token_buffer[:new_req_extent].copy_(
-            req_id_per_token, non_blocking=True
+        self.batch_id_per_q_token_buffer[:new_req_extent].copy_(
+            batch_id_per_q_token, non_blocking=True
         )
 
         query_lens = (
@@ -2144,7 +2147,7 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         )
         self.paged_kv_indptr[num_tokens + 1 :].fill_(self.paged_kv_indptr[num_tokens])
 
-        req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
+        batch_id_per_q_token = self.batch_id_per_q_token_buffer[:num_tokens]
         qo_indptr = self.qo_indptr[: num_tokens + 1]
         paged_kv_last_page_len = self.paged_kv_last_page_len[:num_tokens]
         paged_kv_indices = self.paged_kv_indices[: num_tokens * self.topk_tokens]
@@ -2230,7 +2233,7 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
             query_start_loc=common_attn_metadata.query_start_loc,
             slot_mapping=common_attn_metadata.slot_mapping,
             block_table=common_attn_metadata.block_table_tensor,
-            req_id_per_token=req_id_per_token,
+            batch_id_per_q_token=batch_id_per_q_token,
             block_size=self.kv_cache_spec.block_size,
             attn_out_dtype=self.model_dtype,
             topk_tokens=self.topk_tokens,
@@ -2253,13 +2256,13 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
 
         vLLM's EagleProposer rebuilds attention metadata for every MTP draft
         step. The inherited build_for_drafting just calls build(), which
-        constructs ``req_id_per_token`` on the host and copies it into a GPU
+        constructs ``batch_id_per_q_token`` on the host and copies it into a GPU
         buffer -- a pageable, synchronous H2D copy that stalls the draft
         model's kernel dispatch right at the target->draft boundary (this is
         the H2D sync visible between the main and draft models in the trace).
 
         During MTP/EAGLE drafting every request contributes exactly one decode
-        token, so ``req_id_per_token`` is simply ``arange(num_reqs)`` and can be
+        token, so ``batch_id_per_q_token`` is simply ``arange(num_reqs)`` and can be
         built on-GPU (device-to-device copy, no sync). We also pass
         ``_drafting=True`` so build() skips the decode-only work-split
         fingerprint (whose ``seq_lens.cpu()`` fallback would be another sync and
@@ -2276,14 +2279,14 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
                 common_attn_metadata=common_attn_metadata,
                 fast_build=True,
             )
-        req_id_per_token = torch.arange(
+        batch_id_per_q_token = torch.arange(
             num_tokens, dtype=torch.int32, device=self.device
         )
         return self.build(
             common_prefix_len=0,
             common_attn_metadata=common_attn_metadata,
             fast_build=True,
-            _req_id_per_token=req_id_per_token,
+            _batch_id_per_q_token=batch_id_per_q_token,
             _drafting=True,
         )
 
@@ -2407,7 +2410,7 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
         token_end = query_start_loc_cpu[reqs_end].item()
         total_seq_lens = seq_lens_cpu[reqs_start:reqs_end].sum()
         seq_idx = torch.arange(0, reqs_end - reqs_start, dtype=torch.int32)
-        token_to_seq = torch.repeat_interleave(
+        batch_id_per_k_token = torch.repeat_interleave(
             seq_idx, seq_lens_cpu[reqs_start:reqs_end]
         ).to(self.device)
         assert total_seq_lens <= self.max_prefill_buffer_size
@@ -2425,7 +2428,7 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
             cu_seqlen_ks=cu_seqlen_ks,
             cu_seqlen_ke=cu_seqlen_ke,
             cu_seq_lens=cu_seq_lens,
-            token_to_seq=token_to_seq,
+            batch_id_per_k_token=batch_id_per_k_token,
             total_seq_lens=total_seq_lens,
             block_table=block_table[reqs_start:reqs_end],
             token_start=token_start,
@@ -2439,14 +2442,14 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
         common_attn_metadata=None,
         fast_build: bool = False,
     ) -> AiterMlaSparseIndexerMetadataForVllm:
-        from vllm.v1.attention.backends.utils import (
-            split_decodes_and_prefills,
-            split_prefill_chunks,
-        )
         from vllm.platforms import current_platform
         from vllm.utils.deep_gemm import (
             get_paged_mqa_logits_metadata,
             is_deep_gemm_supported,
+        )
+        from vllm.v1.attention.backends.utils import (
+            split_decodes_and_prefills,
+            split_prefill_chunks,
         )
 
         num_reqs = common_attn_metadata.num_reqs

@@ -22,7 +22,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from functools import lru_cache
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 if TYPE_CHECKING:
     from atom.model_ops.attentions.deepseek_v4_attn import AttentionMetaData_DSV4
@@ -94,9 +94,6 @@ from atom.model_ops.moe import FusedMoE
 from atom.model_ops.quant_v4 import act_quant_inplace
 from atom.model_ops.sparse_attn_v4 import (
     hc_split_sinkhorn,
-)
-from atom.model_ops.topK import (
-    is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
 )
 from atom.model_ops.triton_hash_topk import hash_topk_triton
 from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
@@ -588,7 +585,7 @@ def _wo_a_is_bf16_on_disk(model_path):
         with open(idx_path) as f:
             idx = json.load(f)
         wmap = idx.get("weight_map", {})
-    except Exception:
+    except Exception:  # noqa: BLE001 -- a probe: any unreadable index means "no"
         return False
     probe = "layers.0.attn.wo_a.weight"
     if probe not in wmap:
@@ -608,12 +605,14 @@ def _wo_a_is_bf16_on_disk(model_path):
                 return True  # BF16 weight; no scale needed regardless of index
             if not scale_present_in_idx:
                 return False
-            if "layers.0.attn.wo_a.scale" not in h.keys():
+            # `.keys()` is not redundant: safetensors' handle has no
+            # `__contains__`, so `not in h` would raise. noqa: SIM118
+            if "layers.0.attn.wo_a.scale" not in h.keys():  # noqa: SIM118
                 # Index lies. wo_a still FP8 but no scale → loader will fail
                 # anyway; safer to fall back to no_spec, although this case is
                 # unexpected.
                 return True
-    except Exception:
+    except Exception:  # noqa: BLE001 -- a probe: any unreadable shard means "no"
         return False
     return False
 
@@ -2021,7 +2020,13 @@ class Indexer(nn.Module):
 
         device = q_fp4.device
         total_tokens = q_fp4.size(0)
-        row_to_batch = indexer_meta["batch_id_per_token_gpu"].to(torch.int32)
+        # Off the metadata, not the dict: `indexer_meta` IS
+        # `attn_metadata.indexer_meta`, so the tensor is already reachable and
+        # copying it in gave the decode branch -- which builds its own dict --
+        # a second place to forget.
+        batch_id_per_q_token = get_forward_context().attn_metadata.batch_id_per_q_token[
+            :total_tokens
+        ]
         local_ends = indexer_meta["visible_end_gpu"]  # [total_tokens] int32
         local_starts = indexer_meta["fp4_prefill_local_starts"]
         # Full-batch schedule precomputed once (outside the fwd) in the metadata
@@ -2061,7 +2066,7 @@ class Indexer(nn.Module):
                 # dropped (their logits stay -inf -> wrong top-k); the shared CTA
                 # floor keeps a small chunk spread across the GPU.
                 _, cta_info, n_ctas = compute_prefill_schedule(
-                    row_to_batch[chunk_start:chunk_end],
+                    batch_id_per_q_token[chunk_start:chunk_end],
                     rs,
                     re,
                     FP4_MQA_BLOCK_K,
@@ -2082,7 +2087,7 @@ class Indexer(nn.Module):
                 self.kv_scale,
                 block_tables,
                 weights[chunk_start:chunk_end],
-                row_to_batch[chunk_start:chunk_end],
+                batch_id_per_q_token[chunk_start:chunk_end],
                 rs,
                 re,
                 max_seq_len,
@@ -2120,7 +2125,7 @@ class Indexer(nn.Module):
         A sequence forwards its own number of query tokens, so `total_tokens` is
         their sum and a `[bs, next_n]` view does not exist. None is needed: the
         decode tokens are already laid out per-seq ascending, so row `r` IS token
-        `r` and `batch_id_per_token` is the row-to-sequence map the ragged-prefill
+        `r` and `batch_id_per_q_token` is the row-to-sequence map the ragged-prefill
         kernel wants — no scatter, no second layout.
 
         Per-row MTP tail-causal window: row n of seq b scores compressed KV
@@ -2156,7 +2161,10 @@ class Indexer(nn.Module):
         # so the full padded q_fp4 is scored single-shot: pad rows are skipped by
         # the kernel (empty window → 0 CTAs → no paged KV read) and their top-k is
         # -1 (ignored downstream by csa_translate_pack). No strip / pad-back.
-        row_to_batch = indexer_meta["fp4_row_to_batch"]
+        # Off the metadata, not the dict -- see `_score_topk_prefill_fp4`.
+        batch_id_per_q_token = get_forward_context().attn_metadata.batch_id_per_q_token[
+            : q_fp4.size(0)
+        ]
         local_starts = indexer_meta["fp4_local_starts"]
         local_ends = indexer_meta["fp4_local_ends"]
         cta_info = indexer_meta["fp4_cta_info"]
@@ -2188,7 +2196,7 @@ class Indexer(nn.Module):
             self.kv_scale,
             block_tables,
             weights,
-            row_to_batch,
+            batch_id_per_q_token,
             local_starts,
             local_ends,
             max_seq_len,
@@ -2963,7 +2971,7 @@ class DeepseekV4Attention(nn.Module):
 
         Split out of the attention body so it can run one graph piece earlier, in
         the compiled dense piece, via the opaque `v4_qk_norm_rope` op -- its grid is
-        `q.shape[0]`, `batch_id_per_token` is `[T]` and only gates the store, and
+        `q.shape[0]`, `batch_id_per_q_token` is `[T]` and only gates the store, and
         `swa_dest_rows` is a whole buffer, so a num_tokens-keyed piece holds it.
 
         Running AHEAD of the compressor is safe: nothing here reads what the
@@ -3022,7 +3030,7 @@ class DeepseekV4Attention(nn.Module):
             quant_q=False,
             quant_k=False,
             fp8_2buff=self.kv_fp8,
-            batch_id_per_token=attn_md.batch_id_per_token if is_decode else None,
+            batch_id_per_q_token=attn_md.batch_id_per_q_token if is_decode else None,
             # Where each token's own KV row goes, built once per forward for
             # this layer's compress class. The fused write takes the row rather
             # than the slot because a window row is no longer `slot * cs +
@@ -3313,7 +3321,7 @@ class DeepseekV4Attention(nn.Module):
         Per doc §6.4:
           block_idx_in_seq = topk_local // csa_block_capacity
           slot_in_block    = topk_local %  csa_block_capacity
-          physical_block   = block_tables[batch_id_per_token[t], block_idx_in_seq]
+          physical_block   = block_tables[batch_id_per_q_token[t], block_idx_in_seq]
           row              = physical_block * envelope_rows + slot_in_block
 
         Fully fused into one triton kernel — no [T, index_topk] intermediates,
@@ -3361,7 +3369,7 @@ class DeepseekV4Attention(nn.Module):
             attn_md.block_tables,
             positions,
             kv_indptr,
-            attn_md.batch_id_per_token,
+            attn_md.batch_id_per_q_token,
             skip_buf,
             kv_indices,
             envelope_rows=attn_md.envelope_rows,
@@ -3515,18 +3523,9 @@ class MoE(nn.Module):
             # attribute mutation across the compile boundary, so stashing on
             # `self.foo` from inside forward is a no-op at runtime.
         assert args.n_shared_experts == 1
-        self._fuse_shared_into_routed = (
-            is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
-                qc,
-                shared_expert_prefix=f"{prefix}.shared_experts",
-                routed_expert_prefix=f"{prefix}.experts",
-            )
-        )
         moe_cfg = SimpleNamespace(
             routed_scaling_factor=self.routed_scaling_factor,
-            n_shared_experts=(
-                args.n_shared_experts if self._fuse_shared_into_routed else 0
-            ),
+            n_shared_experts=args.n_shared_experts,
         )
         self.experts = FusedMoE(
             num_experts=self.n_routed_experts,
@@ -3546,8 +3545,10 @@ class MoE(nn.Module):
             # inter=3072/TP8=384 is a 128-multiple; pad to 128 (not the 256
             # default) to avoid padding the MoE intermediate up to 512.
             pad_align=128,
+            enable_comm_fused=True,
         )
         self.experts.swiglu_limit = args.swiglu_limit
+        self._fuse_shared_into_routed = self.experts.num_fused_shared_experts > 0
 
         if not self._fuse_shared_into_routed:
             # self.experts.num_fused_shared_experts = 0
@@ -3577,13 +3578,15 @@ class MoE(nn.Module):
             and self.alt_stream is not None
             and envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
         )
+        # Keep comm-fused token-bucket dispatch dynamic under torch.compile.
+        self._use_comm_fused_dispatch = self.experts._comm_fused_moe is not None
         # Register self in static_forward_context so the custom op dispatcher
         # can look us up by `layer_name` (= self.prefix). Needed by
         # maybe_dual_stream_forward (dual-stream) AND moe_pcp_merge_forward
         # — the latter requires registration regardless of
         # dual-stream, so register whenever either consumer is active.
         _pcp_merge_on = get_pcp_world_size() > 1 and bool(envs.ATOM_PCP_MOE_MERGE)
-        if self._use_dual_stream or _pcp_merge_on:
+        if self._use_dual_stream or self._use_comm_fused_dispatch or _pcp_merge_on:
             get_current_atom_config().compilation_config.static_forward_context[
                 prefix
             ] = self
@@ -3657,8 +3660,12 @@ class MoE(nn.Module):
         return topk_weights, topk_ids
 
     def routed_expert_forward(
-        self, x: torch.Tensor  # [num_tokens, dim]
-    ) -> torch.Tensor:  # [num_tokens, dim]
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]
+        shared_partial: torch.Tensor | None = None,
+        before_stage2=None,
+        stage2_stream: torch.cuda.Stream | None = None,
+    ) -> tuple[torch.Tensor, bool]:
         """Gate + FusedMoE routed-expert pass.
 
         For hash layers the gate's `tid2eid` lookup needs `input_ids`;
@@ -3667,7 +3674,13 @@ class MoE(nn.Module):
         `_hash_topk` (FusedMoE's custom_routing_function) reads it there.
         """
         router_logits = self.gate(x)  # [num_tokens, n_routed_experts]
-        return self.experts(hidden_states=x, router_logits=router_logits)
+        return self.experts.forward_maybe_comm_fused(
+            x,
+            router_logits,
+            shared_partial,
+            before_stage2=before_stage2,
+            stage2_stream=stage2_stream,
+        )
 
     @staticmethod
     def _gather_ids_for_dp(ids: torch.Tensor, ctx) -> torch.Tensor:
@@ -3725,9 +3738,13 @@ class MoE(nn.Module):
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Sequential: shared_experts → routed_experts → combine."""
         shared = self.shared_experts(x) if self.shared_experts is not None else None
-        routed = self.routed_expert_forward(x)
+        routed, is_complete = self.routed_expert_forward(x, shared_partial=shared)
+        if is_complete:
+            return routed
         return self.combine_outputs(
-            routed, shared, prefix=f"{self.prefix}.combine_outputs"
+            routed,
+            shared,
+            prefix=f"{self.prefix}.combine_outputs",
         )
 
     def dual_stream_moe_forward(
@@ -3738,12 +3755,26 @@ class MoE(nn.Module):
         independent; main stream waits on alt_stream's completion before
         combining.
         """
-        current_stream = get_forward_context().main_stream
-        self.alt_stream.wait_stream(current_stream)
-        routed = self.routed_expert_forward(x)
+        routed_stream = torch.cuda.current_stream(x.device)
+        self.alt_stream.wait_stream(routed_stream)
+
+        def produce_shared():
+            with torch.cuda.stream(self.alt_stream):
+                shared = self.shared_experts.forward(x)
+            routed_stream.wait_stream(self.alt_stream)
+            shared.record_stream(routed_stream)
+            return shared
+
+        routed, is_complete = self.routed_expert_forward(
+            x,
+            before_stage2=produce_shared,
+            stage2_stream=routed_stream,
+        )
+        if is_complete:
+            return routed
         with torch.cuda.stream(self.alt_stream):
             shared = self.shared_experts.forward(x)
-        current_stream.wait_stream(self.alt_stream)
+        routed_stream.wait_stream(self.alt_stream)
         return self.combine_outputs(
             routed, shared, prefix=f"{self.prefix}.combine_outputs"
         )
@@ -3758,11 +3789,8 @@ class MoE(nn.Module):
         assert (
             x.dim() == 2 and x.shape[-1] == self.dim
         ), f"MoE expects 2D [num_tokens, {self.dim}], got {tuple(x.shape)}"
-        if self._use_dual_stream:
-            # Shared custom op (also used by V2). Dispatcher reads
-            # `_use_dual_stream` + per-call num_tokens vs threshold to pick
-            # dual vs single. Custom op = Dynamo barrier so stream context
-            # inside `dual_stream_moe_forward` is opaque to torch.compile.
+        if self._use_dual_stream or self._use_comm_fused_dispatch:
+            # Keep stream and comm-fused dispatch opaque to torch.compile.
             return torch.ops.aiter.maybe_dual_stream_forward(x, self.prefix)
         return self.single_stream_moe_forward(x)
 
@@ -3844,7 +3872,7 @@ class Block(nn.Module):
             getattr(aiter, "mhc_fused_post_pre", None) if _dim_ok else None
         )
         self.enable_fused_hc = (
-            hasattr(aiter, "mhc_fused_post_pre") and not self.layer_id == 0
+            hasattr(aiter, "mhc_fused_post_pre") and self.layer_id != 0
         )
 
     # mHC `hc_post_mult_value`: V4 uses `2.0 * sigmoid(post)` for the post gate.
@@ -4400,11 +4428,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             "hc_head_": "model.hc_head_",
         }
     )
-    weights_mapping = {
+    weights_mapping: ClassVar[dict[str, str]] = {
         ".gate.bias": ".gate.e_score_correction_bias",
         ".scale": ".weight_scale_inv",
     }
-    packed_modules_mapping = {
+    packed_modules_mapping: ClassVar[dict[str, tuple[str, int]]] = {
         "attn.wq_a": ("attn.wqkv_a", 0),
         "attn.wkv": ("attn.wqkv_a", 1),
         "compressor.wkv": ("compressor.wkv_gate", 0),
@@ -4685,7 +4713,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # → `experts.w13_` (param_name_part), keeping the `weight` / `scale` suffix.
         try:
             expert_mapping = self.get_expert_mapping()
-        except Exception:
+        except Exception:  # noqa: BLE001 -- optional; a model without one loads fine
             expert_mapping = []
         # Build longest-first index for unambiguous matching (shared with std loader).
         expert_index: dict[str, tuple[str, int, str]] = {}

@@ -494,7 +494,7 @@
   {
     "model_name": "MI308 DeepSeek-V4-Flash",
     "model_path": "sgl-project/DeepSeek-V4-Flash-FP8",
-    "extraArgs": "--trust-remote-code --tensor-parallel-size 8 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.9 --swa-full-tokens-ratio 0.1 --max-running-requests 256 --page-size 256 --disable-radix-cache --disable-shared-experts-fusion --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4",
+    "extraArgs": "--trust-remote-code --tensor-parallel-size 8 --kv-cache-dtype bfloat16 --mem-fraction-static 0.9 --swa-full-tokens-ratio 0.1 --max-running-requests 256 --page-size 256 --disable-radix-cache --disable-shared-experts-fusion --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4",
     "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1\nSGLANG_DEFAULT_THINKING=1\nSGLANG_DSV4_REASONING_EFFORT=max\nSGLANG_USE_AITER=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nTORCHINDUCTOR_COMPILE_THREADS=128",
     "runner": "atom-mi308-8gpu-plugins-accuracy",
     "test_level": "nightly",
@@ -503,6 +503,6 @@
     "accuracy_threshold": 0.94,
     "accuracy_baseline": null,
     "accuracy_baseline_model": "sgl-project/DeepSeek-V4-Flash-FP8",
-    "_baseline_note": "MI308 SGLang DeepSeek-V4-Flash coverage uses the FP8 checkpoint to avoid the MXFP4 MoE loading path on gfx942; refresh baseline after nightly measurements land."
+    "_baseline_note": "MI308 SGLang DeepSeek-V4-Flash uses the FP8 weight checkpoint with a BF16 KV cache because AITER DSV4 FP8 KV decode kernels are unavailable on gfx942; refresh baseline after nightly measurements land."
   }
 ]

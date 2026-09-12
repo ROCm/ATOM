@@ -225,6 +225,35 @@ def test_static_decode_preserves_topk_ids_for_aiter_expert_mask():
     assert torch.equal(dispatch_weights, topk_weights.repeat(2, 1))
 
 
+def test_static_decode_appends_aiter_ep_sentinel_column():
+    backend = _make_backend()
+    hidden = torch.tensor([[1.0, 2.0]])
+    topk_ids = torch.tensor([[0, 2]], dtype=torch.int32)
+    topk_weights = torch.tensor([[0.6, 0.4]])
+    # FusedMoE appends one -1 entry to expert_map when AITER expects the
+    # always-masked EP sentinel.  Its index is the real dispatch-space size.
+    expert_map = torch.tensor([0, 1, -1, -1, -1], dtype=torch.int32)
+
+    _, _, _, dispatch_ids, dispatch_weights = backend.prepare(
+        hidden,
+        topk_weights,
+        topk_ids,
+        num_experts=4,
+        expert_map=expert_map,
+        apply_router_weight_on_input=False,
+        quant_config=None,
+    )
+
+    assert torch.equal(
+        dispatch_ids,
+        torch.tensor([[0, 2, 4], [0, 2, 4]], dtype=torch.int32),
+    )
+    assert torch.equal(
+        dispatch_weights,
+        torch.tensor([[0.6, 0.4, 0.0], [0.6, 0.4, 0.0]]),
+    )
+
+
 def test_gathered_rows_round_robin_replicated_shared_expert_owners():
     backend = _make_backend(
         num_local_experts=3,

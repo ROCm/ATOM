@@ -70,6 +70,7 @@ no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only whe
 | **ATOM_USE_TRITON_GEMM** | bool | 0 (false) | If set to `1`, use AITER Triton FP4 weight preshuffled GEMM. Otherwise use AITER ASM FP4 weight preshuffled GEMM. |
 | **ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM** | bool | 0 (false) | If set to `1`, use AITER Triton FP4 GEMM with non-shuffled weights. Takes precedence over the FP4 preshuffled GEMM path selected by `ATOM_USE_TRITON_GEMM`. |
 | **ATOM_USE_TRITON_MXFP4_BMM** | bool | 0 (false) | If set to `1`, use FP4 BMM in MLA attention module. |
+| **ATOM_USE_FLYDSL_GATHER_KV_B_PROJ** | bool | 1 (true) | Use the FlyDSL fused gather + `kv_b_proj` GEMM for MLA's cached-prefix path. Covers page_size-1 fp8 (e4m3) KV with an fp8 weight on gfx950 — i.e. Kimi-K3 / DeepSeek MLA under `--kv-cache-dtype fp8`. Any other shape is rejected before launch and falls back to the Triton gather, once per process, with a warning. Set `0` to force Triton. |
 
 ### GLM-5.3
 
@@ -150,7 +151,7 @@ reachable shape one set rather than two lists that drift. The switch below decid
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **ATOM_DRAFT_CUDAGRAPH** | bool | 1 (true) | Capture each declared draft pass into a per-`capture_sizes` CUDAGraph as it is warmed, so a draft pass replays instead of relaunching every kernel. `0` keeps the warmup (and therefore the JIT saving) but drafts eagerly. Only passes that declare a graph are captured — the separate-draft Kimi-K3 path declares none, so this is inert there. EPLB no longer declines the padding: the target pads on every cudagraph decode step and its rows reach the same expert-load recorder, so declining on the draft protected nothing. A DP-sync dummy DOES replay, in lockstep with the ranks holding work — `is_dummy_run` is per-rank, so gating on it splits one DP group across two collectives. Measured on V4-Flash-DSpark tp1: GSM8K 0.9527 / acceptance 65.25% captured against 0.9497 / 65.21% eager, i.e. indistinguishable; on tp4 with the LM head inside the capture, draft kernel launches went 30 → 0 per pass and draft wall time 915.8 → 118.9 µs. Read per pass at warmup time, so set it before the server starts. Grep a trace for a trailing ` graph` in a `propose_*` label to confirm which passes replayed. |
+| **ATOM_DRAFT_CUDAGRAPH** | bool | 1 (true) | Capture each declared draft pass into a per-`capture_sizes` CUDAGraph as it is warmed, so a draft pass replays instead of relaunching every kernel. `0` keeps the warmup (and therefore the JIT saving) but drafts eagerly. Only passes that declare a graph are captured; every drafter ATOM ships declares at least one, including the separate-draft Kimi-K3 path, whose block pass builds its paged metadata at warmup so nothing host-side is left inside the recording. EPLB no longer declines the padding: the target pads on every cudagraph decode step and its rows reach the same expert-load recorder, so declining on the draft protected nothing. A DP-sync dummy DOES replay, in lockstep with the ranks holding work — `is_dummy_run` is per-rank, so gating on it splits one DP group across two collectives. Measured on V4-Flash-DSpark tp1: GSM8K 0.9527 / acceptance 65.25% captured against 0.9497 / 65.21% eager, i.e. indistinguishable; on tp4 with the LM head inside the capture, draft kernel launches went 30 → 0 per pass and draft wall time 915.8 → 118.9 µs. Read per pass at warmup time, so set it before the server starts. Grep a trace for a trailing ` graph` in a `propose_*` label to confirm which passes replayed. |
 
 ### DSpark drafting
 
@@ -193,12 +194,10 @@ flag below. Details in the state-checkpoint section of the
 
 ### LMCache offload tier
 
-Two knobs that govern the LMCache CPU/NVMe offload connector are read directly
-via `os.environ` rather than through `atom.utils.envs`, because ATOM does not
-own either default: one belongs to the LMCache library, the other to the
-offload connector itself (defined in
-`atom/kv_transfer/offload/_offload_common.py` and documented in full in
-`atom/kv_transfer/offload/README.md`). They are listed here so they are
+The LMCache source-pin timeout and ATOM's pending-save bound are read directly
+via `os.environ` rather than through `atom.utils.envs`. Their behavior is
+defined in `atom/kv_transfer/offload/_offload_common.py` and documented in full
+in `atom/kv_transfer/offload/README.md`; they are also listed here so they are
 discoverable from the central env reference despite bypassing the registry.
 
 | Variable | Type | Default | Description |
@@ -228,7 +227,50 @@ objects once startup was done. See `atom/utils/gc_utils.py`.
 |----------|------|---------|-------------|
 | **ATOM_GC_FREEZE** | bool | 1 (true) | Move the startup heap into CPython's permanent generation once warmup is done, so collections stop scanning it. Applied in every process that outlives startup — the API server, the atomesh frontend, every EngineCore and every ModelRunner worker; undone on engine shutdown so an in-process teardown does not leak. Set `0` to keep the pre-freeze behaviour. |
 | **ATOM_GC_DEBUG** | bool | 0 (false) | Log every collection: generation, duration, objects reclaimed, objects tracked. Costly — counting the tracked set on every pass added ~90s of startup on a V4-Flash tp1 — but the only way to see these pauses, since a stall in the EngineCore idles the workers with no event in their torch trace. |
-| **ATOM_GC_THRESHOLD** | csv int | "" (= CPython default 700,10,10) | `t0,t1,t2` for `gc.set_threshold()`. Thresholds are per-interpreter, so each process reads it independently. A fallback for `ATOM_GC_FREEZE=0`: this spaces collections out, freezing removes what one costs. |
+| **ATOM_GC_THRESHOLD** | csv int | "" (= CPython default 700,10,10) | `t0,t1,t2` for `gc.set_threshold()`. Thresholds are per-interpreter, so each process reads it independently; anything that is not three integers is logged and ignored, applying nothing. Raising these does not make a pass cheaper, it makes passes rarer — the same total scan lands in fewer, longer stop-the-world pauses, which is a trade against tail latency and not measured here. It is also **not uniform across processes**: at concurrency 4096 the API server's collector ran 13,956 times in twenty minutes over a set that grew to 688,646 objects and reclaimed **zero**, while each ModelRunner worker reclaimed thousands per pass, where spacing collections out defers real work. Read `atom:gc_collected_total` for the process you mean to tune before setting this — and note that only the API server exports it, so a worker has to be read with `ATOM_GC_DEBUG=1`. |
+
+Raising a process's thresholds is free only while its collector keeps finding
+nothing to free, which is a property of that one process, so it is exported
+rather than assumed. All three are wired into the API server only; the engine
+and worker processes serve no `/metrics`, so `ATOM_GC_DEBUG=1` is what reads
+them there.
+
+- **`atom:gc_collected_total`** (`/metrics`, per generation — `prometheus_client`
+  appends the `_total`) is the invariant as a series. Flat after startup is the
+  expected shape; a rising line means the process has started building reference
+  cycles, and spacing its collections out would defer real work into a growing
+  heap. `atom:gc_collections_total`, `atom:gc_uncollectable_total` and
+  `atom:gc_threshold` sit beside it for context. All are O(1) reads taken at
+  scrape time, which is a bound and not a preference: `/metrics` renders on the
+  loop that delivers every stream. The frozen count is deliberately **not**
+  here — `gc.get_freeze_count()` walks the permanent generation (11.9 ms at
+  430k frozen, the cost freezing exists to remove) for a number that changes
+  twice in a process's life. The startup log has it, and so does the census.
+- **`reclaim_watch`** logs one warning — once, not per check — if that line
+  ever rises, because a counter nobody looks at is not a safeguard. It sees
+  only what a collection reclaimed, so cyclic garbage that reaches gen-2 before
+  it dies is invisible to it where gen-2 passes are rare; the gen-2 size in
+  `/debug/gc_census` is what shows that.
+- **`GET /debug/gc_census`** breaks the scanned set down by type and by owning
+  library. Unlike the metrics it walks every tracked object (~1s at a million),
+  so it is asked for, never scraped, and it runs in a worker thread rather than
+  on the loop that delivers the streams. It reports counts only: naming what a
+  container *holds* would mean serialising the keys of parsed request bodies
+  into an unauthenticated response. `top` and `types_per_owner` bound the two
+  breakdowns.
+
+## Incremental detokenizer
+
+Streaming decodes each delta from two `tokenizer.decode` calls that share a
+window start, so subtracting one from the other isolates the new text without
+emitting a half-formed UTF-8 character. These two settings govern the shortcut
+that removes one of those calls. Nothing here is related to the KV prefix
+cache, which is what "cache" means everywhere else in this repository.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_DETOKENIZER_DELTA_REUSE** | auto \| on \| off | auto | Whether the incremental detokenizer may reuse the delta it last emitted in place of one of its two `tokenizer.decode` calls per update. The two decodes share a window start so that subtracting one from the other isolates the new text; the first one only ever yields a length, and its span is what the previous call already emitted. Measured on DeepSeek-V4-Pro: **1.74x** at one token per update, **1.40x** at sixty-four. Holds only where decoding a token span does not depend on where the window started — true for the byte-level BPE tokenizers measured (DeepSeek, Qwen3.5, GLM-5.2), not for a SentencePiece-style decoder that adds or strips a leading space by position. `auto` therefore verifies it at startup (~15 ms) instead of assuming it from a class name, and leaves it off on any failure. Case-insensitive; an unrecognised value is logged and leaves reuse off, since off is what someone spelling this setting is reaching for. Unrelated to the KV prefix cache. |
+| **ATOM_DETOKENIZER_AUDIT_EVERY** | int | 1000 | How often a reused delta is checked against a real decode once reuse is on. A mismatch answers that call from the decode, then turns reuse off for the process and logs once. Only audited calls are checked, so at the default up to 999 deltas can ship between a tokenizer starting to disagree and the audit that notices it; `1` checks every update, which is what the startup probe runs at. An unusable value — 0, negative, or not a number — is logged and the default used; this is not how reuse is turned off, `ATOM_DETOKENIZER_DELTA_REUSE=off` is. |
 
 ### Debug dump (`atom.utils.debug_helper`)
 

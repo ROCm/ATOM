@@ -8,7 +8,8 @@ both the scheduler and worker from configuration alone:
 
 * ``dense`` stores ordinary token-indexed KV chunks;
 * ``hybrid`` stores DSV4 compressed PAGE chunks plus complete SLOT sidecars;
-* ``kimi_k3`` stores dense MLA KV plus a KDA per-request state tier.
+* ``kimi_k3`` stores dense MLA KV plus a KDA per-request state tier;
+* ``m3`` stores MiniMax-M3 PAGE-only KV including the NSA index cache.
 
 Keeping selection config-only is important because the scheduler process does
 not have access to the worker's transfer tensors.
@@ -51,6 +52,13 @@ def _build_worker(config):
 
         return KimiK3OffloadConnector(config)
 
+    if variant == "m3":
+        from atom.kv_transfer.offload.hybrid.m3.connector import (
+            M3OffloadConnector,
+        )
+
+        return M3OffloadConnector(config)
+
     from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
 
     return DenseOffloadConnector(config)
@@ -72,6 +80,13 @@ def _build_scheduler(config):
         )
 
         return KimiK3OffloadScheduler(config)
+
+    if variant == "m3":
+        from atom.kv_transfer.offload.hybrid.m3.connector import (
+            M3OffloadScheduler,
+        )
+
+        return M3OffloadScheduler(config)
 
     from atom.kv_transfer.offload.dense.connector import DenseOffloadScheduler
 
@@ -114,6 +129,17 @@ class LMCacheOffloadConnector(KVConnectorBase):
 
     def get_finished_recv_blocks(self):
         return self._impl.get_finished_recv_blocks()
+
+    def record_kv_cache_ready(self, req_ids) -> None:
+        """Pass the prefill-ready event on to an impl that wants one.
+
+        Guarded rather than a plain forward because no offload impl needs it
+        now: the event exists only for the Mooncake producer's DSA index
+        staging stream.
+        """
+        callback = getattr(self._impl, "record_kv_cache_ready", None)
+        if callable(callback):
+            callback(req_ids)
 
     def close(self) -> None:
         """Join the impl's save/load executors at worker teardown.
@@ -186,6 +212,32 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
 
     def should_defer_free(self, seq) -> bool:
         return self._impl.should_defer_free(seq)
+
+    def protected_block_ids(self, seq):
+        callback = getattr(self._impl, "protected_block_ids", None)
+        return callback(seq) if callback is not None else None
+
+    def activate_block_leases(self, seq, block_ids) -> None:
+        callback = getattr(self._impl, "activate_block_leases", None)
+        if callback is not None:
+            callback(seq, block_ids)
+
+    def take_source_safe_releases(self):
+        callback = getattr(self._impl, "take_source_safe_releases", None)
+        return callback() if callback is not None else []
+
+    def reclaim_stale_leases(self, timeout_s: float):
+        callback = getattr(self._impl, "reclaim_stale_leases", None)
+        return callback(timeout_s) if callback is not None else []
+
+    def record_early_release(self, count: int) -> None:
+        callback = getattr(self._impl, "record_early_release", None)
+        if callback is not None:
+            callback(count)
+
+    def connector_completion(self, completion):
+        callback = getattr(self._impl, "connector_completion", None)
+        return callback(completion) if callback is not None else False
 
     def release_stalled_save(self, seq) -> None:
         # Plain forward, not getattr-guarded: OffloadSchedulerMixin declares the
