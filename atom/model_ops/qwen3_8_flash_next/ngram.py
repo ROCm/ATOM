@@ -21,6 +21,7 @@ import torch
 from torch import nn
 
 from atom.model_ops.embed_head import VocabParallelEmbedding
+from atom.model_ops.utils import atom_parameter
 
 _MASK64 = (1 << 64) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -149,6 +150,14 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
             self.table_rows + self.split_ngram_parts - 1
         ) // self.split_ngram_parts
         self.ngram_embedding.weight.weight_loader = self._embedding_shard_loader
+        # FP8 checkpoint: one per-tensor scale for the whole n-gram table.
+        # Shards load as float8→bf16 without this factor (~2e-4); skipping it
+        # leaves PLE embeddings ~5000x too large and garbage logits above it.
+        weight_scale = atom_parameter(
+            torch.ones(1, dtype=torch.bfloat16),
+        )
+        weight_scale.weight_loader = self._weight_scale_loader
+        self.ngram_embedding.register_parameter("weight_scale", weight_scale)
 
         self.register_buffer(
             "positions_buffer",
@@ -208,6 +217,61 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         source = loaded_weight.narrow(0, overlap_start - checkpoint_start, rows)
         target = param.data.narrow(0, overlap_start - tp_start, rows)
         target.copy_(source.to(device=target.device, dtype=target.dtype))
+
+    @staticmethod
+    def _weight_scale_loader(
+        param: nn.Parameter, loaded_weight: torch.Tensor
+    ) -> None:
+        """Load the single FP8 per-tensor scale for the n-gram table."""
+        scale = loaded_weight.detach().to(device=param.device, dtype=param.dtype)
+        if scale.numel() != 1:
+            raise ValueError(
+                "Qwen3.8-Flash-Next PLE ngram weight_scale must be a scalar, "
+                f"got shape {tuple(scale.shape)}"
+            )
+        param.data.copy_(scale.reshape_as(param.data))
+        # Temporary smoke diagnostic — remove after SGLang FP8 greedy passes.
+        try:
+            import logging
+
+            logging.getLogger("atom").warning(
+                "PLE ngram weight_scale LOADED value=%s dtype=%s",
+                float(param.data.item()),
+                param.data.dtype,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def process_weights_after_loading(self) -> None:
+        """Fold the FP8 per-tensor scale into the already-cast bf16 table."""
+        scale = self.ngram_embedding.weight_scale
+        weight = self.ngram_embedding.weight
+        # Temporary smoke diagnostic — remove after SGLang FP8 greedy passes.
+        try:
+            import logging
+
+            logging.getLogger("atom").warning(
+                "PLE ngram process_weights_after_loading: scale_before=%s "
+                "weight_abs_mean_before=%s shape=%s",
+                float(scale.data.float().mean().item()),
+                float(weight.data.float().abs().mean().item()),
+                tuple(weight.data.shape),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        weight.data.mul_(scale.data.to(device=weight.device, dtype=weight.dtype))
+        scale.data.fill_(1.0)
+        try:
+            import logging
+
+            logging.getLogger("atom").warning(
+                "PLE ngram process_weights_after_loading: scale_after=%s "
+                "weight_abs_mean_after=%s",
+                float(scale.data.float().mean().item()),
+                float(weight.data.float().abs().mean().item()),
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     @staticmethod
     def _shift_precompute(
@@ -342,4 +406,10 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         # for an N-element index whatever its shape, so a 2D index would come
         # back already flattened on one path and 3D on the other.
         rows = self.ngram_embedding(ngram_ids.reshape(-1))
+        # FP8 per-tensor scale: either folded in process_weights_after_loading
+        # (scale becomes 1) or still pending; multiply either way.
+        scale = self.ngram_embedding.weight_scale.to(
+            device=rows.device, dtype=rows.dtype
+        )
+        rows = rows * scale
         return rows.reshape(ngram_ids.shape[0], self.embedding_dim)

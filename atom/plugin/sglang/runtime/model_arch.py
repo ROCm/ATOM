@@ -23,6 +23,8 @@ MODEL_TYPE_ADAPTER_ARCHES = {
     "qwen3_5_text": "Qwen3_5ForConditionalGeneration",
     "qwen3_5_moe": "Qwen3_5MoeForConditionalGeneration",
     "qwen3_5_moe_text": "Qwen3_5MoeForConditionalGeneration",
+    "qwen4_exp": "Qwen4ExpForConditionalGeneration",
+    "qwen4_exp_text": "Qwen4ExpForConditionalGeneration",
 }
 
 
@@ -106,6 +108,14 @@ def _prepare_qwen35_config(atom_config: Any, model_arch: str) -> None:
     from atom.plugin.sglang.models.qwen3_5 import apply_prepare_model_adaptations
 
     apply_prepare_model_adaptations(atom_config, model_arch)
+
+
+def _prepare_flash_config(atom_config: Any, model_arch: str) -> None:
+    from atom.plugin.sglang.models.qwen3_8_flash_next import (
+        apply_prepare_flash_adaptations,
+    )
+
+    apply_prepare_flash_adaptations(atom_config, model_arch)
 
 
 def _qwen35_construction_context():
@@ -499,6 +509,10 @@ MODEL_ADAPTER_SPECS = {
     ),
     "Qwen3_5MoeForConditionalGeneration": SGLangModelAdapterSpec(
         prepare_config=_prepare_qwen35_config,
+    ),
+    "Qwen4ExpForConditionalGeneration": SGLangModelAdapterSpec(
+        prepare_config=_prepare_flash_config,
+        wrapper_binds_gdn_context=True,
     ),
     "MiniMaxM2ForCausalLM": SGLangModelAdapterSpec(
         uses_context_only_forward=True,

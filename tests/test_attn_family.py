@@ -126,6 +126,11 @@ class TestThePriorityBetweenFamilies:
     def test_the_gdn_hybrids(self, model_type):
         assert attn_family(cfg(model_type=model_type)) == GDN
 
+    @pytest.mark.parametrize("model_type", ["qwen4_exp_text", "qwen4_exp"])
+    def test_flash_next_wins_over_gdn(self, model_type):
+        """Qwen3.8-Flash-Next is a GDN hybrid whose full-attn layers are QSA."""
+        assert attn_family(cfg(model_type=model_type)) == Family.QWEN3_8_FLASH_NEXT
+
 
 class TestWhatRidesAnMlaPool:
 

@@ -37,7 +37,7 @@ from atom.model_engine.scheduler import ScheduledBatch
 from atom.utils import CpuGpuBuffer
 
 from .gdn_attn import GDNAttentionBackend, GDNAttentionMetadataBuilder
-from .sub_pool_spec import SubPoolSpec, page_pool, state_pool
+from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool, state_pool
 
 # The PLE short-conv window is per-request state with exactly the GDN
 # recurrent state's lifetime and multiplicity, so it shares its index space.
@@ -139,7 +139,15 @@ class Qwen3_8FlashNextMetadataBuilder(GDNAttentionMetadataBuilder):
 
     @property
     def _qsa_layers(self) -> int:
-        return self.model_runner.num_full_attn
+        runner = self.model_runner
+        n = getattr(runner, "num_full_attn", None)
+        if n is not None:
+            return int(n)
+        layers = getattr(runner, "full_attention_layers", None)
+        if layers:
+            return len(layers)
+        types = getattr(runner.config.hf_config, "layer_types", None) or []
+        return sum(1 for t in types if t == "full_attention")
 
     @property
     def _index_head_dim(self) -> int:
@@ -204,58 +212,59 @@ class Qwen3_8FlashNextMetadataBuilder(GDNAttentionMetadataBuilder):
             specs.append(ple_spec)
         return specs
 
-    def allocate_kv_cache_tensors(
-        self, num_kv_heads: int, num_draft_layers: int
-    ) -> dict:
-        if num_draft_layers:
-            raise NotImplementedError("Qwen3.8-Flash-Next has no speculative draft path yet")
+    def paged_pool_bytes(self, blocks: int) -> int:
+        # Price QSA pages, not Aiter's shuffled MHA layout.
+        return self._page_bytes() * blocks
+
+    def allocate_kv_cache_tensors(self, *, blocks: int, buf) -> dict:
         runner = self.model_runner
+        self.num_blocks = blocks
         head_dim = int(runner.config.hf_config.head_dim)
-        blocks = runner.num_physical_kvcache_blocks
+        num_kv_heads = runner._get_num_kv_heads()
         block = self.block_size
-        return {
-            "kv_cache": torch.zeros(
-                2,
-                self._qsa_layers,
-                blocks,
-                block,
-                num_kv_heads,
-                head_dim,
-                dtype=dtypes.bf16,
-                device="cuda",
+        qsa = self._qsa_layers
+        offset = 0
+
+        def take(shape, dtype):
+            nonlocal offset
+            n = 1
+            for dim in shape:
+                n *= int(dim)
+            nbytes = n * dtype.itemsize
+            if buf is None or buf.numel() == 0:
+                tensor = torch.zeros(shape, dtype=dtype, device="cuda")
+            else:
+                tensor = buf[offset : offset + nbytes].view(dtype).view(*shape)
+            offset += nbytes
+            return tensor
+
+        # Do not return `kv_cache`: the runner overwrites that name with the
+        # raw uint8 paged buffer after this hook.
+        out = {
+            "qsa_kv_cache": take(
+                (2, qsa, blocks, block, num_kv_heads, head_dim), dtypes.bf16
             ),
-            "qsa_raw_key_cache": torch.zeros(
-                self._qsa_layers,
-                blocks,
-                block,
-                1,
-                self._index_head_dim,
-                dtype=dtypes.bf16,
-                device="cuda",
+            "qsa_raw_key_cache": take(
+                (qsa, blocks, block, 1, self._index_head_dim), dtypes.bf16
             ),
-            "qsa_compressed_key_cache": torch.zeros(
-                self._qsa_layers,
-                blocks,
-                block // self._compress_ratio,
-                1,
-                self._index_head_dim,
-                dtype=dtypes.bf16,
-                device="cuda",
-            ),
-            "qsa_rope_position_cache": (
-                torch.zeros(
-                    self._qsa_layers,
+            "qsa_compressed_key_cache": take(
+                (
+                    qsa,
                     blocks,
-                    block,
+                    block // self._compress_ratio,
                     1,
-                    3,
-                    dtype=torch.int64,
-                    device="cuda",
-                )
-                if self.cache_rope_positions
-                else None
+                    self._index_head_dim,
+                ),
+                dtypes.bf16,
             ),
         }
+        if self.cache_rope_positions:
+            out["qsa_rope_position_cache"] = take(
+                (qsa, blocks, block, 1, 3), torch.int64
+            )
+        else:
+            out["qsa_rope_position_cache"] = None
+        return out
 
     def allocate_per_req_cache(self, entries: dict[str, int]) -> dict[str, object]:
         caches = super().allocate_per_req_cache(entries)
@@ -286,27 +295,31 @@ class Qwen3_8FlashNextMetadataBuilder(GDNAttentionMetadataBuilder):
         if destinations:
             torch._foreach_copy_(destinations, sources)
 
-    def build_kv_cache_tensor(self, layer_id: int, module):
+    def build_kv_cache_tensor(self, module):
         """Bind the three caches a QSA layer owns; defer everything else."""
         if not getattr(module, "is_qsa_attention", False):
-            return super().build_kv_cache_tensor(layer_id, module)
+            return super().build_kv_cache_tensor(module)
 
         from atom.config import KVCacheTensor
 
         runner = self.model_runner
-        qsa_idx = layer_id // runner.full_attention_interval
+        hf = runner.config.hf_config
+        interval = getattr(runner, "full_attention_interval", None) or getattr(
+            hf, "full_attention_interval", 4
+        )
+        qsa_idx = int(module.layer_num) // int(interval)
         position_cache = getattr(runner, "qsa_rope_position_cache", None)
         module.bind_caches(
-            runner.kv_cache[0, qsa_idx],
-            runner.kv_cache[1, qsa_idx],
+            runner.qsa_kv_cache[0, qsa_idx],
+            runner.qsa_kv_cache[1, qsa_idx],
             runner.qsa_raw_key_cache[qsa_idx],
             runner.qsa_compressed_key_cache[qsa_idx],
             None if position_cache is None else position_cache[qsa_idx],
         )
         return KVCacheTensor(
-            layer_num=layer_id,
-            k_cache=runner.kv_cache[0, qsa_idx],
-            v_cache=runner.kv_cache[1, qsa_idx],
+            layer_num=module.layer_num,
+            k_cache=runner.qsa_kv_cache[0, qsa_idx],
+            v_cache=runner.qsa_kv_cache[1, qsa_idx],
             k_scale=None,
             v_scale=None,
         )
@@ -443,8 +456,8 @@ class Qwen3_8FlashNextMetadataBuilder(GDNAttentionMetadataBuilder):
             max_query_len=max_query_len,
         )
 
-    def prepare_prefill(self, batch: ScheduledBatch):
-        attn_metadata, positions = super().prepare_prefill(batch)
+    def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
+        attn_metadata, positions = super().prepare_prefill(batch, running_bs)
         num_reqs = batch.total_seqs_num_prefill
         num_tokens = batch.total_tokens_num_prefill
         # QSA reads the compressed cache through the block table on every
@@ -475,10 +488,19 @@ class Qwen3_8FlashNextMetadataBuilder(GDNAttentionMetadataBuilder):
         )
         return attn_metadata, positions
 
-    def prepare_decode(self, batch: ScheduledBatch, bs: int):
-        attn_metadata, positions = super().prepare_decode(batch, bs)
+    def prepare_decode(
+        self,
+        batch: ScheduledBatch,
+        running_bs: int,
+        running_tokens: int,
+        max_seqlen_q: int,
+    ):
+        attn_metadata, positions = super().prepare_decode(
+            batch, running_bs, running_tokens, max_seqlen_q
+        )
         scheduled_bs = batch.total_seqs_num_decode
         query_len = attn_metadata.max_seqlen_q
+        bs = running_bs
         num_tokens = bs * query_len
         per_req = np.full(bs, query_len, dtype=np.int64)
         attn_metadata.qsa_metadata = self._build_qsa_metadata(
