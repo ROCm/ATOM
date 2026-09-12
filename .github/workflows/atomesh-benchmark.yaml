@@ -108,7 +108,6 @@ on:
           - atomesh-cicd
           - atomesh-cicd-mi350
           - atomesh-cicd-mi355-crusoe
-          - amd-sglang
       atomesh_slurm_account:
         description: 'TW Slurm account: amd-frameworks[42/44/47], amd-tw[36/43]; Crusoe v2 uses amd-aifw-dev'
         required: false
@@ -128,6 +127,7 @@ on:
           - auto
           - amd-frameworks
           - amd-tw
+          - amd-sglang
       atomesh_log_root:
         description: 'Root directory for ATOMesh Slurm logs'
         required: false
