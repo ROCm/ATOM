@@ -63,7 +63,7 @@ class Expert(nn.Module):
         self.w1, self.w2, self.w3 = w1, w2, w3
         self.swiglu_limit = swiglu_limit
 
-    def forward(self, hidden, routing_weights=None):
+    def forward(self, hidden, routing_weights=None, *, output_dtype=None):
         activation = weighted_swiglu(
             self.w1(hidden),
             self.w3(hidden),
@@ -71,4 +71,6 @@ class Expert(nn.Module):
             limit=self.swiglu_limit,
             dtype=hidden.dtype,
         )
+        if output_dtype is not None:
+            return self.w2(activation, otype=output_dtype)
         return self.w2(activation)
