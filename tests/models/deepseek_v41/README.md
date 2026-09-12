@@ -28,7 +28,6 @@ index, contiguous offsets, exact file sizes, readable final pages, and available
 download revision metadata. It does not checksum the 475 GiB tensor payload.
 Use `lm_eval` for model accuracy once the ATOM model is executable.
 
-
 P03 compares Single-Pass mHC, router, weighted SwiGLU, and Engram residual math
 with the pinned upstream methods. Tests cover native GPU W4A8 experts and FP8
 Engram projection, actual layer-1 table rows/projection weights, and official
@@ -36,3 +35,13 @@ tokenizer hashes across chunks, image boundaries and accepted prefix lengths.
 Prefetch and fallback row IDs both match that official history oracle. Request
 snapshot identity, ragged staging, padding, and cancellation are covered in
 `tests/model_ops/test_engram.py`. This remains module-level validation.
+
+P04 index selection tests live in `test_indexer.py`. They cover compact candidate
+blocks, candidate-only Reindex, causal visibility, short/empty prefixes, and both
+`small_position` and `large_position` score-tie policies on CPU and ROCm.
+Selection is stable across key tile boundaries; higher scores always win, the
+newest visible block is retained, and returned position IDs remain ascending.
+The pinned upstream top-k does not define a deterministic position tie rule, so
+exact ties use explicit position-based expectations in addition to dense
+reference checks on untied scores. Full-model P04 numerical validation remains
+in progress; indexer checks alone do not establish model accuracy or throughput.

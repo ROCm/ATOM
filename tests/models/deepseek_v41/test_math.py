@@ -20,17 +20,6 @@ from atom.model_ops.deepseek_v41.moe import Expert, Router, weighted_swiglu
 from atom.model_ops.engram import CompressedTokenizer, EngramConfig, NgramHashMapping
 from atom.model_ops.engram_layer import EngramOp
 
-from .reference import load_reference
-
-
-@pytest.fixture
-def reference():
-    directory = os.environ.get("ATOM_DSV41_REFERENCE")
-    if not directory:
-        pytest.skip("Set ATOM_DSV41_REFERENCE for pinned model methods")
-    with load_reference(directory) as module:
-        yield module
-
 
 @contextmanager
 def bf16_default():

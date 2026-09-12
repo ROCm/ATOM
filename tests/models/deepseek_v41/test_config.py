@@ -124,3 +124,19 @@ def test_v41_never_falls_through_to_v4_backend(raw_config):
     assert attn_family(by_arch) == Family.CSA2
     with pytest.raises(NotImplementedError, match="CSA2"):
         get_attn_backend_cls(Family.CSA2, False, False)
+
+
+@pytest.mark.parametrize("policy", ["small_position", "large_position"])
+def test_index_tie_break_configuration_and_serialization(raw_config, policy):
+    raw_config["text_config"]["index_topk_tie_break"] = policy
+    config = normalize_hf_config(raw_config)
+    assert config.index_topk_tie_break == policy
+    assert config.to_dict()["index_topk_tie_break"] == policy
+    assert config._multimodal_config.text_config.index_topk_tie_break == policy
+
+
+def test_index_tie_break_default_and_rejection(raw_config):
+    assert normalize_hf_config(raw_config).index_topk_tie_break == "small_position"
+    raw_config["text_config"]["index_topk_tie_break"] = "random"
+    with pytest.raises(ValueError, match="index_topk_tie_break"):
+        normalize_hf_config(raw_config)

@@ -14,7 +14,7 @@ Engram builds on ROCm/ATOM PR #2185.
 | P01 | Nested configuration, CSA2 topology and format schema | Complete |
 | P02 | Native FP8/FP4 weights and kernel interfaces | Complete |
 | P03 | Single-Pass mHC, MoE arithmetic and Engram math/history | Complete |
-| P04 | Full-layer exact text inference | Pending |
+| P04 | Full-layer exact text inference | In progress: tiled index selection and configurable ties validated |
 | P05 | Paging, batching and request-state lifecycle | Pending |
 | P06 | Chat, tools and reasoning-effort protocol | Pending |
 | P07 | Vision and image requests | Pending |
@@ -78,3 +78,16 @@ weighted asymmetric-clamp SwiGLU before BF16/A8 rounding. Native routed W4A8
 uses an explicit activation dtype in the existing linear interface. MoE
 dispatch/communication integration remains P04 work; these are arithmetic
 contracts, not a claim that the existing fused MoE has equivalent precision.
+
+The CSA2 `text_config.index_topk_tie_break` option controls equal-score selection:
+`small_position` (default) prefers earlier positions; `large_position` prefers
+later positions. It applies to index top-k, candidate-block ties and Reindex.
+The newest visible candidate block remains mandatory in both modes. Selected
+indices are returned in ascending position order for attention, regardless of
+selection priority. Set the option in the checkpoint text configuration:
+
+```json
+{"text_config": {"index_topk_tie_break": "large_position"}}
+```
+
+This is a field override, not a replacement for the rest of `config.json`.

@@ -8,6 +8,11 @@ from enum import Enum
 from transformers import PretrainedConfig
 
 
+class IndexTieBreak(str, Enum):
+    SMALL_POSITION = "small_position"
+    LARGE_POSITION = "large_position"
+
+
 class AttentionMode(str, Enum):
     WINDOW = "window"
     FULL = "full"
@@ -132,6 +137,15 @@ class DeepseekV41TextConfig(PretrainedConfig):
     """The published text schema, with root token IDs and quantization preserved."""
 
     model_type = "deepseek_v41_text"
+
+    def __init__(self, index_topk_tie_break="small_position", **kwargs):
+        super().__init__(**kwargs)
+        try:
+            self.index_topk_tie_break = IndexTieBreak(index_topk_tie_break).value
+        except ValueError as error:
+            raise ValueError(
+                "index_topk_tie_break must be small_position or large_position"
+            ) from error
 
     def validate_parallelism(self, tensor_parallel_size, expert_parallel_size=1):
         if tensor_parallel_size <= 0 or expert_parallel_size <= 0:
