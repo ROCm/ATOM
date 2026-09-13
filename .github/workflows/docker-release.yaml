@@ -208,14 +208,11 @@ jobs:
           echo ""
           echo "========== Comparing output with golden outputs =========="
           # Ignore whitespace and EOL differences in the diff
-          diff -u -B -w --strip-trailing-cr atom_release_output.txt .github/workflows/golden_outputs.txt || true
-          DIFF_EXIT_CODE=$?
-          
-          if [ $DIFF_EXIT_CODE -ne 0 ]; then
+          if diff -u -B -w --strip-trailing-cr atom_release_output.txt .github/workflows/golden_outputs.txt; then
+            echo "Output matches golden outputs."
+          else
             echo "Output does not match golden outputs."
             exit 1
-          else
-            echo "Output matches golden outputs."
           fi
 
       - name: Re-login to Docker Hub before push
