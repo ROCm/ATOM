@@ -111,6 +111,7 @@ support_model_arch_dict = {
     "MixtralForCausalLM": "atom.models.mixtral.MixtralForCausalLM",
     "DeepseekV3ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
     "DeepseekV32ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
+    "DeepseekV41ForCausalLM": "atom.models.deepseek_v41.runtime.DeepseekV41RuntimeModel",
     "DeepseekV4ForCausalLM": "atom.models.deepseek_v4.DeepseekV4ForCausalLM",
     "GptOssForCausalLM": "atom.models.gpt_oss.GptOssForCausalLM",
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2.GlmMoeDsaForCausalLM",
@@ -670,6 +671,7 @@ class ModelRunner:
             self.profiler_dir = os.path.join(config.torch_profiler_dir, rank_name)
             os.makedirs(self.profiler_dir, exist_ok=True)
 
+        self.attn_backend = get_attn_backend(self.attn_family)
         self._setup_device_and_distributed(rank, config)
 
         self.capture_sizes = [0]  # for eager fallback
@@ -688,7 +690,6 @@ class ModelRunner:
         default_dtype = self.config.torch_dtype
         torch.set_default_dtype(default_dtype)
         torch.set_default_device(self.device)
-        self.attn_backend = get_attn_backend(self.attn_family)
         use_spec = bool(self.config.speculative_config) and get_pp_group().is_last_rank
         self.num_spec_tokens = (
             self.config.speculative_config.num_speculative_tokens if use_spec else 0
@@ -911,7 +912,12 @@ class ModelRunner:
         else:
             # The group spans the devices that exist; apply_simulated_tp then
             # makes it *report* the logical width so layers shard that many ways.
-            init_dist_env(
+            initialize = init_dist_env
+            if not self.attn_backend.use_custom_all_reduce:
+                from atom.distributed.rccl import init_rccl_dist_env
+
+                initialize = init_rccl_dist_env
+            initialize(
                 config.tp_world_size,
                 rankID=rank,
                 backend="nccl",
@@ -969,6 +975,9 @@ class ModelRunner:
         close = getattr(connector, "close", None) if connector is not None else None
         if callable(close):
             close()
+        builder = getattr(self, "attn_metadata_builder", None)
+        if builder is not None:
+            builder.close()
         # 1. Destroy distributed env (NCCL + CustomAllreduce + process groups)
         #    Must happen while ops module is still alive for CustomAllreduce cleanup.
         destroy_dist_env()
@@ -2346,6 +2355,7 @@ class ModelRunner:
             running_tokens=running_tokens,
             max_seqlen_q=forward_mode.max_seqlen_q,
         )
+        self.attn_metadata_builder.prepare_model_inputs(input_ids, attn_metadata)
         context = Context(
             positions=positions,
             is_prefill=is_prefill,

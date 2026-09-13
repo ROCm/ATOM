@@ -2581,6 +2581,15 @@ class Scheduler:
             num_placeholder += 1
 
         for seq in self.running:
+            # Cancellation does not require sampled output. Middle prefill
+            # chunks and the first deferred step may have none; waiting for
+            # one keeps an aborted request alive without advancing its tokens.
+            if seq.status == SequenceStatus.ABORTED:
+                self._mark_finished(
+                    seq, "aborted", seq.num_tokens - seq.num_placeholder_tokens
+                )
+                finished_seqs.append(seq)
+                continue
             # Update the running status
             idx = fwd_output.get_idx(seq.id)
             if idx is None:
@@ -2723,11 +2732,6 @@ class Scheduler:
                 )
             num_tokens = seq.num_tokens - num_placeholder_width - num_rejected
             leave_reason = None
-            # Client disconnected -> finish now via the normal stop path (frees
-            # KV blocks, emits a finished RequestOutput). A natural stop below
-            # may still overwrite the reason; either way the seq terminates.
-            if seq.status == SequenceStatus.ABORTED:
-                leave_reason = "aborted"
             # MTP edge case: `rejection_sampler` does NOT inspect EOS — it
             # only compares draft vs target_argmax for acceptance. So when
             # the verified token is EOS the kernel still emits 1+ accepted
@@ -2876,14 +2880,7 @@ class Scheduler:
                 # logger.info(
                 #     f"Sequence {seq.id} finished with reason: {leave_reason}, {seq.token_ids[-8:]=}"
                 # )
-                seq.num_tokens = num_tokens
-                seq.leave_reason = leave_reason
-                seq.status = SequenceStatus.FINISHED
-                self.total_finished_requests += 1
-                self.total_prompt_tokens += int(seq.num_prompt_tokens)
-                self.total_generation_tokens += max(
-                    0, int(num_tokens) - int(seq.num_prompt_tokens)
-                )
+                self._mark_finished(seq, leave_reason, num_tokens)
                 finished_seqs.append(seq)
 
         if stream_output_queue is not None and stream_outputs:
@@ -2963,6 +2960,16 @@ class Scheduler:
             num_generation_tokens=num_new_generation_tokens
         )
         return finished_seqs
+
+    def _mark_finished(self, seq, reason, num_tokens):
+        seq.num_tokens = num_tokens
+        seq.leave_reason = reason
+        seq.status = SequenceStatus.FINISHED
+        self.total_finished_requests += 1
+        self.total_prompt_tokens += int(seq.num_prompt_tokens)
+        self.total_generation_tokens += max(
+            0, int(num_tokens) - int(seq.num_prompt_tokens)
+        )
 
     def compute_detailed_aggregates(
         self,

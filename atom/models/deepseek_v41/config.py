@@ -255,3 +255,46 @@ def normalize_hf_config(raw: dict) -> DeepseekV41TextConfig:
     root_data["vision_config"] = DeepseekV41VisionConfig(**vision)
     config._multimodal_config = DeepseekV41Config(**root_data)
     return config
+
+
+def validate_runtime_config(config):
+    """Gate unimplemented execution modes before weights or pools are loaded."""
+    unsupported = []
+    for name, enabled in (
+        ("CUDAGraph (set enforce_eager=True)", not config.enforce_eager),
+        ("torch.compile", config.compilation_config.level != 0),
+        ("speculative decoding", config.speculative_config is not None),
+        ("pipeline parallel", config.pipeline_parallel_size != 1),
+        (
+            "context parallel",
+            config.prefill_context_parallel_size != 1
+            or config.decode_context_parallel_size != 1,
+        ),
+        (
+            "data parallel",
+            config.parallel_config.data_parallel_size != 1
+            or config.enable_dp_attention,
+        ),
+        ("TBO", config.enable_tbo or config.enable_tbo_decode),
+        ("KV transfer", bool(config.kv_transfer_config) or config.enable_rapidserve),
+        ("plugin mode", config.plugin_config is not None),
+        ("online quantization", config.online_quant_config is not None),
+        ("EPLB", config.eplb_enable),
+        (
+            "packed KV/index cache",
+            config.kv_cache_dtype != "bf16" or config.index_cache_dtype != "bf16",
+        ),
+    ):
+        if enabled:
+            unsupported.append(name)
+    if unsupported:
+        raise ValueError(
+            "DeepSeek-V4.1 eager runtime does not support " + ", ".join(unsupported)
+        )
+    if config.kv_cache_block_size % 2:
+        raise ValueError("DeepSeek-V4.1 PAGE token count must be even")
+    if config.tensor_parallel_size > 1 and not config.enable_expert_parallel:
+        raise ValueError(
+            "DeepSeek-V4.1 uses whole-expert EP; set enable_expert_parallel=True"
+        )
+    IndexTieBreak(config.hf_config.index_topk_tie_break)

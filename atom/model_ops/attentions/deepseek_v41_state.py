@@ -21,6 +21,10 @@ class AttentionStep:
     indices: dict[int, torch.Tensor] = field(default_factory=dict)
     candidates: dict[int, torch.Tensor] = field(default_factory=dict)
 
+    @property
+    def decode(self):
+        return self.length == 1
+
 
 class EagerAttentionCache:
     """Fixed-batch storage with private SWA rings and one global region per owner.
@@ -68,6 +72,26 @@ class EagerAttentionCache:
                     dtype=torch.bfloat16,
                     device=device,
                 )
+
+    def rope_positions(self, step):
+        return step.positions[: step.length]
+
+    def requests(self, step):
+        yield self, step, slice(None)
+
+    def read_tail(self, owner, position):
+        return self.tails.get(owner)
+
+    def write_tail(self, owner, tail):
+        self.tails[owner] = tail
+
+    def write_global(self, owner, begin, main, index):
+        end = begin + main.shape[1]
+        self.main[owner][:, begin:end] = main
+        self.index[owner][:, begin:end] = index
+
+    def index_keys(self, owner, count):
+        return self.index[owner][:, :count]
 
     def begin_step(self, position, length, batch_size):
         if position != self.position or batch_size != self.batch_size or length < 1:

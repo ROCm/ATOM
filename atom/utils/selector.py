@@ -118,7 +118,11 @@ def _cached_get_attn_backend(
 
 def get_attn_backend_cls(family: Family, use_sglang: bool, use_vllm: bool) -> str:
     if family is Family.CSA2:
-        raise NotImplementedError("DeepSeek-V4.1 CSA2 runtime is not enabled yet")
+        if use_sglang or use_vllm:
+            raise NotImplementedError(
+                "DeepSeek-V4.1 CSA2 currently supports native ATOM only"
+            )
+        return "atom.model_ops.attentions.deepseek_v41.backend.DeepseekV41Backend"
     if family is Family.V4:
         return "atom.model_ops.attentions.deepseek_v4_attn.DeepseekV4Backend"
     if family is Family.KIMI_MLA:

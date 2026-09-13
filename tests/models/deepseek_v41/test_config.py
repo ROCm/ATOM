@@ -122,8 +122,11 @@ def test_v41_never_falls_through_to_v4_backend(raw_config):
     by_arch = deepcopy(config)
     by_arch.model_type = "deepseek_v3"
     assert attn_family(by_arch) == Family.CSA2
-    with pytest.raises(NotImplementedError, match="CSA2"):
-        get_attn_backend_cls(Family.CSA2, False, False)
+    assert get_attn_backend_cls(Family.CSA2, False, False) == (
+        "atom.model_ops.attentions.deepseek_v41.backend.DeepseekV41Backend"
+    )
+    with pytest.raises(NotImplementedError, match="native ATOM"):
+        get_attn_backend_cls(Family.CSA2, True, False)
 
 
 @pytest.mark.parametrize("policy", ["small_position", "large_position"])

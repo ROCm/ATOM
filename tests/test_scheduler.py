@@ -2182,3 +2182,42 @@ class TestTheTierSplitPartitionsServedReuse:
         with caplog.at_level(logging.INFO, logger="atom"):
             s._log_pools()
         assert not any("[Cache Tiers]" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("partial", [True, False])
+def test_cancel_without_sampled_output_releases_state_and_pages(partial):
+    from atom.model_engine.kv_block import STATE_SLOT_CLASS
+
+    config = MockConfig(
+        max_num_seqs=2,
+        max_model_len=64,
+        max_num_batched_tokens=4,
+        kv_cache_block_size=4,
+        num_kvcache_blocks=32,
+        pool_entries={STATE_SLOT_CLASS: 2},
+    )
+    scheduler = Scheduler(config)
+    seq = Sequence(list(range(1, 13 if partial else 5)), 4, has_per_req_cache=True)
+    scheduler.add(seq)
+    batch, seqs = scheduler.schedule()
+    empty = ScheduledBatchOutput(
+        req_ids=[],
+        token_ids=[],
+        num_rejected=None,
+        num_bonus=None,
+        draft_token_ids=None,
+        is_deferred_out=True,
+    )
+    scheduler.postprocess(list(seqs.values()), empty, batch=batch)
+    assert seq.is_partial_prefill == partial
+    assert seq.state_slot >= 0 and seq.block_table
+    seq.status = SequenceStatus.ABORTED
+    # A completed middle chunk or deferred first decode carries no sampled
+    # token for this request. It must still drive the normal finish/free path.
+    finished = scheduler.postprocess([], empty)
+    assert finished == [seq]
+    assert seq.leave_reason == "aborted" and seq.status == SequenceStatus.FINISHED
+    assert seq.state_slot == -1 and not seq.block_table
+    assert scheduler._partial_prefill_count == 0
+    assert not scheduler.running
+    assert scheduler.total_finished_requests == 1

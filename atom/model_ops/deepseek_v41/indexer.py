@@ -26,6 +26,20 @@ def _ordered_indices(scores, indices):
     return torch.where(ordered == sentinel, -1, ordered).int()
 
 
+class TensorIndexKeys:
+    """Contiguous key access with the same tile/gather contract as paged keys."""
+
+    def __init__(self, keys):
+        self.keys, self.shape = keys, keys.shape
+
+    def tile(self, start, end):
+        return self.keys[:, start:end]
+
+    def gather(self, ids):
+        batches = torch.arange(self.shape[0], device=ids.device).view(-1, 1, 1)
+        return self.keys[batches, ids]
+
+
 def select_indices(
     q,
     weights,
@@ -49,6 +63,8 @@ def select_indices(
     Candidate block ties follow the same policy, while the newest block is pinned.
     candidate_blocks contains ascending IDs from the candidate source.
     """
+    if isinstance(keys, torch.Tensor):
+        keys = TensorIndexKeys(keys)
     prefer_large = IndexTieBreak(tie_break) == IndexTieBreak.LARGE_POSITION
     batch, queries, _, _ = q.shape
     width = keys.shape[1]
@@ -92,11 +108,10 @@ def select_indices(
                     .view(1, 1, -1)
                     .expand(batch, q1 - q0, -1)
                 )
-                dots = torch.einsum("bqhd,bkd->bqhk", query, keys[:, k0:k1])
+                dots = torch.einsum("bqhd,bkd->bqhk", query, keys.tile(k0, k1))
             else:
                 ids = positions[..., k0:k1]
-                batch_ids = torch.arange(batch, device=q.device).view(-1, 1, 1)
-                selected_keys = keys[batch_ids, ids.clamp(0, width - 1)]
+                selected_keys = keys.gather(ids.clamp(0, width - 1))
                 dots = torch.einsum("bqhd,bqkd->bqhk", query, selected_keys)
             scores = (dots.relu_() * head_weights.unsqueeze(-1)).sum(dim=2)
             scores = scores.masked_fill(

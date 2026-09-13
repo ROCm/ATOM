@@ -125,25 +125,15 @@ class Attention(nn.Module):
             else None
         )
 
-    def forward(self, hidden, cache, step, rope):
-        positions = torch.arange(
-            step.position, step.position + step.length, device=hidden.device
-        )
-        qr = self.q_norm(self.wq_a(hidden))
-        query = rope(
-            self.wq_b(qr).unflatten(-1, (self.heads, self.head_dim)), positions
-        )
-        kv = quantize_fp8(
-            rope(self.kv_norm(self.wkv(hidden)), positions), dequantize=True
-        )
+    def _update_global(self, hidden, qr, cache, step, rope):
         if self.spec.ratio:
             owner = self.spec.kv_owner
             count = (step.position + step.length) // self.spec.ratio
             if self.compressor is not None:
                 latent, tail = self.compressor(
-                    hidden, step.position, cache.tails.get(owner)
+                    hidden, step.position, cache.read_tail(owner, step.position)
                 )
-                cache.tails[owner] = tail
+                cache.write_tail(owner, tail)
                 if latent is not None:
                     begin = step.position // self.spec.ratio
                     end = begin + latent.shape[1]
@@ -151,15 +141,14 @@ class Attention(nn.Module):
                         torch.arange(begin, end, device=hidden.device) * self.spec.ratio
                     )
                     # Derive index keys before the main latent is rotated in place.
-                    cache.index[owner][:, begin:end] = self.indexer.project_keys(
-                        latent, rope, latent_positions
-                    )
-                    cache.main[owner][:, begin:end] = quantize_fp4(
+                    index = self.indexer.project_keys(latent, rope, latent_positions)
+                    main = quantize_fp4(
                         rope(latent, latent_positions),
                         group_size=16,
                         scale_dtype=torch.float8_e4m3fn,
                         dequantize=True,
                     )
+                    cache.write_global(owner, begin, main, index)
             if self.indexer is not None:
                 candidate_owner = self.spec.candidate_owner
                 candidates = (
@@ -169,16 +158,30 @@ class Attention(nn.Module):
                     else None
                 )
                 selected, candidates_out = self.indexer(
-                    hidden, qr, cache.index[owner][:, :count], rope, step, candidates
+                    hidden, qr, cache.index_keys(owner, count), rope, step, candidates
                 )
                 step.indices[self.spec.layer_id] = selected
                 if candidates_out is not None:
                     step.candidates[self.spec.layer_id] = candidates_out
+
+    def forward(self, hidden, cache, step, rope):
+        positions = cache.rope_positions(step)
+        qr = self.q_norm(self.wq_a(hidden))
+        query = rope(
+            self.wq_b(qr).unflatten(-1, (self.heads, self.head_dim)), positions
+        )
+        kv = quantize_fp8(
+            rope(self.kv_norm(self.wkv(hidden)), positions), dequantize=True
+        )
+        for request_cache, request_step, rows in cache.requests(step):
+            self._update_global(
+                hidden[:, rows], qr[:, rows], request_cache, request_step, rope
+            )
         prefix, prefix_indptr, extend, extend_indptr = cache.attention_indices(
             self.spec, step
         )
         flat_query = query.flatten(0, 1)
-        if step.length == 1:
+        if step.decode:
             cache.write_window(self.spec.layer_id, kv, step)
             output = sparse_attn_v4_paged_decode(
                 flat_query,

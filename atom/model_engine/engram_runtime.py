@@ -297,3 +297,89 @@ class EngramHost:
         if self._copy_pending:
             self.copy_done.synchronize()
         self.prefetcher.shutdown()
+
+
+class EngramInputPreparer:
+    """Prepare finalized runtime tokens using the cache's restored history.
+
+    No request-history dictionary: the returned history commits with the model
+    state, and generic STATE checkpoints carry it across migration and reuse.
+    """
+
+    def __init__(self, mapping, host, resources=None):
+        self.mapping, self.host, self.resources = mapping, host, resources
+
+    @classmethod
+    def from_checkpoint(cls, directory, config, max_tokens, device):
+        from contextlib import ExitStack
+
+        from transformers import AutoTokenizer
+
+        from atom.model_loader.deepseek_v41 import engram_tables
+        from atom.model_ops.engram import (
+            CompressedTokenizer,
+            EngramConfig,
+            NgramHashMapping,
+        )
+
+        resources = ExitStack()
+        try:
+            tables = resources.enter_context(engram_tables(directory, config))
+            tokenizer = AutoTokenizer.from_pretrained(directory, local_files_only=True)
+            engram_config = EngramConfig.from_hf(config.to_dict())
+            mapping = NgramHashMapping(
+                engram_config,
+                CompressedTokenizer(
+                    tokenizer, expected_size=engram_config.compressed_vocab_size
+                ),
+            )
+            host = EngramHost(
+                EngramPrefetcher(mapping, tables),
+                max_tokens,
+                engram_config.num_hash_heads,
+                engram_config.head_dim,
+                device,
+            )
+            resources.callback(host.shutdown)
+            return cls(mapping, host, resources)
+        except BaseException:
+            resources.close()
+            raise
+
+    def prepare(self, spans, token_ids, histories, *, dummy=False):
+        if dummy:
+            self.host.stage_dummy(token_ids.numel())
+            next_histories = histories
+        else:
+            # These are the final GPU IDs, including deferred decode tokens.
+            # One D2H per batch is the eager host-lookup contract; a subsequent
+            # HBM provider can replace it without changing the model or scheduler.
+            ids = token_ids.detach().cpu().numpy()
+            requests, next_histories = [], []
+            for span, history in zip(spans, histories):
+                tokens = ids[span.token_slice]
+                requests.append(
+                    EngramRequest(
+                        span.request_id, 0, span.position, tuple(tokens), tuple(history)
+                    )
+                )
+                compressed = self.mapping.compress_tokens(tokens[None, :])
+                next_histories.append(
+                    self.mapping.advance_history(history[None, :], compressed)[0]
+                )
+            self.host.stage_embeddings(requests, padded_rows=token_ids.numel())
+            next_histories = np.asarray(next_histories, dtype=np.int64).reshape(
+                histories.shape
+            )
+        self.host.wait_for_embeddings()
+        return {
+            layer: self.host.embeddings(layer).unsqueeze(0)
+            for layer in self.host.layer_ids
+        }, next_histories
+
+    def close(self):
+        if self.resources is not None:
+            self.resources.close()
+            self.resources = None
+        else:
+            self.host.shutdown()

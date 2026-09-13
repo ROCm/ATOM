@@ -2068,7 +2068,10 @@ class Config:
         # Use the preserved `architectures` field (re-injected by get_hf_config,
         # line 567) which keeps the original "DeepseekV4ForCausalLM[NextN]" name.
         arches = getattr(self.hf_config, "architectures", None) or []
-        is_deepseek_v4 = any("DeepseekV4" in str(a) for a in arches)
+        is_deepseek_v4 = any(
+            str(a).startswith(("DeepseekV4For", "DeepseekV4MTP", "DeepseekV4DSpark"))
+            for a in arches
+        )
         if is_deepseek_v4:
             v4_block_size = 256
             if self.kv_cache_block_size != v4_block_size:
@@ -2149,6 +2152,11 @@ class Config:
                 self.index_cache_dtype = "fp8"
         elif self.index_cache_dtype is None:
             self.index_cache_dtype = self.kv_cache_dtype
+
+        if self.hf_config.model_type == "deepseek_v41_text":
+            from atom.models.deepseek_v41.config import validate_runtime_config
+
+            validate_runtime_config(self)
 
     def compute_hash(self) -> str:
         """

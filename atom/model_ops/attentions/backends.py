@@ -75,6 +75,7 @@ class AttentionBackend(ABC):
     # For some attention backends, we allocate an output tensor before
     # calling the custom op. When piecewise cudagraph is enabled, this
     # makes sure the output tensor is allocated inside the cudagraph.
+    use_custom_all_reduce: ClassVar[bool] = True
     accept_output_buffer: bool = False
 
     #: Whether a *draft* of this flavor caches into a pool of its own. False
@@ -148,6 +149,13 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         max_seqlen_q: int,
     ):
         raise NotImplementedError
+
+    def prepare_model_inputs(self, input_ids, metadata):
+        """Prepare model inputs after state maintenance and final token staging."""
+
+    def close(self):
+        """Release backend-owned host workers and mapped resources."""
+        self.release_kv_pools()
 
     def prepare_mtp_decode(
         self,

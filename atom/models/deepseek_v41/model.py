@@ -122,10 +122,10 @@ class Block(nn.Module):
 
 
 class DeepseekV41ForCausalLM(nn.Module):
-    """Offline eager text model; TP and whole-expert EP share the same rank group.
+    """Text backbone and offline interface; TP and EP share the same rank group.
 
-    The ModelRunner registry is intentionally gated until paged state/batching
-    integration. The caller supplies prepared Engram values and a private cache.
+    RuntimeModel adapts this math to ModelRunner using prepared Engram values
+    and a paged cache. The offline caller supplies its own private cache.
     """
 
     def __init__(self, config, *, max_length):
@@ -171,6 +171,22 @@ class DeepseekV41ForCausalLM(nn.Module):
             if module is not self and hasattr(module, "process_weights_after_loading"):
                 module.process_weights_after_loading()
 
+    def forward_hidden(self, token_ids, cache, step, engram_embeddings=None):
+        # ATOM's sharded embedding consumes flat tokens; restore this offline
+        # interface's batch/sequence dimensions before entering model math.
+        hidden = self.embed(token_ids.flatten()).view(
+            *token_ids.shape, self.config.hidden_size
+        )
+        state = SinglePassHCState.from_embeddings(hidden, self.config.hc_mult)
+        engram_embeddings = {} if engram_embeddings is None else engram_embeddings
+        for spec, layer in zip(self.topology, self.layers):
+            rope = self.global_rope if spec.ratio else self.window_rope
+            state = layer(
+                state, cache, step, rope, engram_embeddings.get(spec.layer_id)
+            )
+        hidden = state.collapse()
+        return hidden
+
     @torch.inference_mode()
     def forward(
         self,
@@ -189,19 +205,7 @@ class DeepseekV41ForCausalLM(nn.Module):
         ):
             raise ValueError("logits_start requires a valid full-logits suffix")
         step = cache.begin_step(cache.position, token_ids.shape[1], token_ids.shape[0])
-        # ATOM's sharded embedding consumes flat tokens; restore this offline
-        # interface's batch/sequence dimensions before entering model math.
-        hidden = self.embed(token_ids.flatten()).view(
-            *token_ids.shape, self.config.hidden_size
-        )
-        state = SinglePassHCState.from_embeddings(hidden, self.config.hc_mult)
-        engram_embeddings = {} if engram_embeddings is None else engram_embeddings
-        for spec, layer in zip(self.topology, self.layers):
-            rope = self.global_rope if spec.ratio else self.window_rope
-            state = layer(
-                state, cache, step, rope, engram_embeddings.get(spec.layer_id)
-            )
-        hidden = state.collapse()
+        hidden = self.forward_hidden(token_ids, cache, step, engram_embeddings)
         hidden = hidden[:, logits_start:] if full_logits else hidden[:, -1]
         logits = self.head(self.norm(hidden))
         cache.finish_step(step)

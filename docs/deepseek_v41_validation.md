@@ -1,8 +1,10 @@
 # DeepSeek-V4.1 text baseline validation
 
-P04 remains open. The independent TP4 NLL and fixed-corpus repeatability checks
-pass, but task quality and non-near-tie token agreement do not yet satisfy every
-original criterion. P05 runtime registration has not started.
+P04 was accepted by the user on 2026-09-13 as the baseline for P05. The
+independent TP4 NLL and repeatability checks pass; the task-quality and
+non-near-tie differences below remain accepted limitations, not passes of the
+original thresholds. P05 paged runtime and lifecycle integration is complete; see
+`docs/deepseek_v41_runtime.md` for its separate acceptance results.
 
 V4 GPU inverse RoPE is integrated in `ce26bb149` at the user's explicit direction;
 `f9f8d419f` preserves empty-batch behavior without changing nonempty arithmetic.
@@ -291,10 +293,10 @@ warm weights/storage, after other model jobs exited. They are not end-to-end
 serving speedups. The FP64-accumulation correctness GEMM's measured cost ratio
 against the earlier candidate is 0.937-1.102 over 15 real-weight cases; small
 apparent improvements are not claimed as speedups. Eager intermediate RMSNorm
-still has material launch cost. Runtime latency, throughput and memory remain
-unmeasured until the P05 serving lifecycle exists.
+still has material launch cost. P05 now provides a serving lifecycle and verifies pool byte accounting.
+End-to-end throughput and latency optimization remain separate work.
 
-## Long-context coverage and remaining P04 work
+## Long-context coverage and accepted P04 limitations
 
 The full-model 2,049-token case crosses top-512 selection for ratio-1 and
 ratio-2 owners. Separate indexer tests cover 32,771 keys with 32 heads of
@@ -310,9 +312,10 @@ budget; pinned TileLang HIP probes measured at most 0.002461 for decode and
 substituting a checked reference output; independent checkpoint/task runs
 make no such substitution.
 
-P04 still requires resolution of the original task/token quality gaps and any
-new kernel's complete regression. Historical cross-run likelihood outliers
-also remain unexplained: request replays and rank-cache audits narrow them,
-but fixed-corpus repeatability is not a proof of arbitrary request-sequence
-repeatability. P05 remains gated and will own paged request state, scheduler
-lifecycle and serving integration after P04 acceptance is resolved.
+The original task/token differences above were explicitly accepted for the
+P04 baseline; they were not resolved by relaxing the historical report fields.
+Any subsequent kernel substitution still requires its own complete regression.
+Historical cross-run likelihood outliers remain unexplained: request replays
+and rank-cache audits narrow them, but fixed-corpus repeatability does not prove
+arbitrary request-sequence repeatability. P05 validates paging and request
+lifecycle against this accepted arithmetic without substituting new kernels.
