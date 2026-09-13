@@ -187,6 +187,31 @@ then propagates through the model. Shape, positions and NoPE preservation are
 correct; disabling FMA does not restore general equality. These diagnoses
 explain contributors, not every remaining task or token mismatch.
 
+## High-margin token diagnosis
+
+A follow-up traces two unchanged GSM8K corpus inputs through all 40 layers.
+All four ranks exactly reproduce the saved target/reference NLL sums.
+Normal execution matches 323/334 prefill top-1 positions. Supplying identical
+reference inputs at each attention/FFN boundary in a diagnostic replay gives
+334/334 matches and removes expert-set differences. This localizes accumulated
+input-error propagation; the replay is not an independent quality result.
+
+For `gsm8k/test/27`, position 34 has identical queries and causal index rows on
+all ranks, but one earlier KV value differs. The unchanged V4 attention gives
+bitwise-identical output at that position when given the same reference Q/K.
+The discrepancy therefore precedes inverse RoPE. WKV projection first differs
+in four BF16 values, with identical input activation bytes/scales. Independent
+FP64 GEMM rounds to the ATOM result for all 69,120 outputs, and exact rational
+sums confirm that all four differing ATOM values are nearer the exact result.
+One reference FP32 dot lands on a BF16 midpoint where the exact dot is below
+it by `2**-30`; the subsequent KV normalization/A8 boundary changes the cache
+value. No shared V4 kernel modification follows from this finding.
+
+This explains one high-margin case without changing the frozen reference or
+waiving the remaining task/token criteria. See `high_margin_propagation.md`,
+`first_attention_high_margin.md` and the model-free
+`probe_wkv_high_margin_exact.py` in the evidence directory.
+
 ## Collective reliability
 
 The production offline entry point and evaluators select RCCL through
@@ -236,7 +261,7 @@ retained overwritten views is invalidated.
 | Final RMSNorm | Reused; prior complete task regression preserves every metric |
 | Index-key RMSNorm | Integrated in `ff95c8e4c`; all task document metrics preserved; 8.22-12.16x warm operator speedup |
 | Compressor RMSNorm | Full Chinese loses one normalized answer; causal replay isolates compressor; restored eager |
-| Query RMSNorm | Not integrated; NLL passes, 28 top-1 changes; smaller tasks complete, full Chinese pending |
+| Query RMSNorm | Not adopted; full Chinese falls to 471/651 raw and 422/651 normalized |
 | KV RMSNorm | NLL passes but code loses one answer (35/60 to 34/60); not adopted |
 | Attention-input / FFN-input RMSNorm | NLL increases +0.0122933 / +0.0107104; not adopted |
 | V4 small-token grouped wo_a | Task regressions and no warm operator improvement; not adopted |
@@ -248,8 +273,18 @@ Query-norm diagnostics use the accepted index-key integration and pinned AITER.
 NLL is 0.6043518102, or +0.0084045782 versus the mathematical reference.
 ARC and HellaSwag preserve all document metrics. Code remains 35/60 with one
 gain and one loss. GSM8K five-shot improves from 12/16 to 15/16, with three
-gains and no losses. The complete 651-document Chinese regression is still
-required before adoption; aggregate gains elsewhere do not replace it.
+gains and no losses. The completed Chinese regression covers all 651 documents
+and 2,604 option responses. Raw accuracy falls from 475/651 to 471/651 (six
+gains, ten losses); normalized accuracy falls from 425/651 to 422/651 (six gains,
+nine losses). The substitution is not adopted. Both shards used identical
+source/cache identities, and the final source audit found no changes during
+execution. Query normalization remains eager.
+
+Reconstructing token decisions from the saved paired numerical reports finds
+14 resolved mathematical-reference disagreements, 12 new disagreements and
+two changed predictions that still disagree. Total disagreement becomes
+255 rather than 257. This diagnostic does not close the non-near-tie criterion;
+mathematical margins for the newly introduced disagreements were not saved.
 
 Inverse and norm speedups are isolated GPU-graph operator measurements with
 warm weights/storage, after other model jobs exited. They are not end-to-end
