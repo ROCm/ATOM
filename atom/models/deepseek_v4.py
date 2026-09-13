@@ -3801,6 +3801,7 @@ class HCState:
     post_mix: torch.Tensor | None = None
     comb_mix: torch.Tensor | None = None
     x_prev: torch.Tensor | None = None
+    res_preshuffle: bool = False
 
 
 class Block(nn.Module):
@@ -3848,7 +3849,8 @@ class Block(nn.Module):
         self.hc_eps = args.hc_eps
         mix_hc = (2 + hc_mult) * hc_mult
         hc_dim = hc_mult * args.dim
-        # All HC params stored in fp32 (matches reference's `set_dtype(torch.float32)`).
+        # Load HC params in FP32. BF16 mode replaces fn storage after loading;
+        # base and scale remain FP32.
         self.hc_attn_fn = atom_parameter(
             torch.empty(mix_hc, hc_dim, dtype=torch.float32)
         )
@@ -3871,12 +3873,33 @@ class Block(nn.Module):
         self._mhc_fused_post_pre = (
             getattr(aiter, "mhc_fused_post_pre", None) if _dim_ok else None
         )
+        self.enable_hc_fn_pack_bf16 = (
+            envs.ATOM_MHC_USE_BF16
+            and self._mhc_pre is not None
+            and hasattr(aiter, "mhc_shuffle_fn")
+        )
         self.enable_fused_hc = (
-            hasattr(aiter, "mhc_fused_post_pre") and self.layer_id != 0
+            self._mhc_fused_post_pre is not None and self.layer_id != 0
         )
 
     # mHC `hc_post_mult_value`: V4 uses `2.0 * sigmoid(post)` for the post gate.
     HC_POST_MULT = 2.0
+
+    def process_weights_after_loading(self):
+        """Pack constant mHC fn weights into AITER's BF16 hi/lo block layout.
+
+        AITER selects the block size for the runtime GPU architecture. Pack once
+        after loading, then use w_preshuffle_bf16=1 without shuffling residuals.
+        No-op unless enable_hc_fn_pack_bf16.
+        """
+        if not self.enable_hc_fn_pack_bf16:
+            return
+        for name in ("hc_attn_fn", "hc_ffn_fn"):
+            fn = getattr(self, name)
+            if fn.dtype == torch.int32:
+                continue
+            # Replace storage on the existing Parameter: retain no FP32 copy.
+            fn.data = aiter.mhc_shuffle_fn(fn.data.contiguous().float())
 
     def hc_pre(
         self,
@@ -3886,6 +3909,7 @@ class Block(nn.Module):
         hc_base: torch.Tensor,  # [mix_hc] fp32
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 1e-6,
+        res_preshuffle: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reduce mHC residual `[num_tokens, hc, dim]` to sub-layer input `[num_tokens, dim]`.
 
@@ -3902,6 +3926,11 @@ class Block(nn.Module):
         if self._mhc_pre is not None:
             # aiter mhc_pre wants [M, hc, dim] and returns
             # (post [M, hc, 1], comb [M, hc, hc], y [M, dim]).
+            # mhc_pre restores the ordinary residual layout when the runtime
+            # fuse policy says this input is shuffled.
+            pack_kw = {"w_preshuffle_bf16": 1} if self.enable_hc_fn_pack_bf16 else {}
+            if res_preshuffle:
+                pack_kw["res_preshuffle"] = True
             post, comb, y = self._mhc_pre(
                 residual,
                 hc_fn,
@@ -3914,6 +3943,7 @@ class Block(nn.Module):
                 int(self.hc_sinkhorn_iters),
                 norm_weight,
                 norm_eps,
+                **pack_kw,
             )
             return y, post.squeeze(-1), comb
 
@@ -3943,6 +3973,7 @@ class Block(nn.Module):
         residual: torch.Tensor,  # [num_tokens, hc, dim]  pre-layer residual
         post: torch.Tensor,  # [num_tokens, hc]       from hc_pre
         comb: torch.Tensor,  # [num_tokens, hc, hc]   from hc_pre
+        res_preshuffle: bool = False,
     ) -> torch.Tensor:  # [num_tokens, hc, dim]  new residual
         """Expand sub-layer output `[num_tokens, dim]` back to mHC residual
         `[num_tokens, hc, dim]`.
@@ -3958,7 +3989,14 @@ class Block(nn.Module):
             # `out` inherits residual.dtype = x.dtype (residual stream is BF16
             # end-to-end in Block.forward), so no cast needed on the kernel path.
             out = torch.empty_like(residual)
-            self._mhc_post(out, x, residual, post.unsqueeze(-1), comb)
+            self._mhc_post(
+                out,
+                x,
+                residual,
+                post.unsqueeze(-1),
+                comb,
+                res_preshuffle=res_preshuffle,
+            )
             return out
 
         # Torch fallback. fp32 (post, comb) × BF16 (x, residual) promotes to
@@ -3982,8 +4020,13 @@ class Block(nn.Module):
         hc_base: torch.Tensor,
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 1e-6,
+        res_preshuffle: bool = False,
         prefix: str = "",
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # BF16 weight packing is independent of the residual layout.
+        pack_kw = {"res_preshuffle": res_preshuffle}
+        if self.enable_hc_fn_pack_bf16:
+            pack_kw["w_preshuffle_bf16"] = True
         return self._mhc_fused_post_pre(
             x,
             residual,
@@ -3999,6 +4042,7 @@ class Block(nn.Module):
             int(self.hc_sinkhorn_iters),
             norm_weight,
             norm_eps,
+            **pack_kw,
         )
 
     @mark_trace
@@ -4013,6 +4057,7 @@ class Block(nn.Module):
         hc_base: torch.Tensor,
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 1e-6,
+        res_preshuffle: bool = False,
         prefix: str = "",
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if x is not None:
@@ -4020,7 +4065,13 @@ class Block(nn.Module):
         else:
             res = residual
         x, post, comb = self.hc_pre(
-            res, hc_fn, hc_scale, hc_base, norm_weight, norm_eps
+            res,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            norm_weight,
+            norm_eps,
+            res_preshuffle=res_preshuffle,
         )
         return x, post, comb, res
 
@@ -4037,7 +4088,7 @@ class Block(nn.Module):
         post = hc_state.post_mix
         comb = hc_state.comb_mix
         x = hc_state.x_prev
-        if self.enable_fused_hc and x is not None:
+        if (self.enable_fused_hc or hc_state.res_preshuffle) and x is not None:
             post, comb, x, res = self.mhc_fused_post_pre(
                 x,
                 residual,
@@ -4048,8 +4099,11 @@ class Block(nn.Module):
                 hc_base,
                 norm_weight,
                 norm_eps,
+                res_preshuffle=hc_state.res_preshuffle,
                 prefix=f"{self.prefix}.mhc_fused_post_pre",
             )
+            # Match hc_pre's [tokens, hc] state for subsequent post/pre calls.
+            post = post.squeeze(-1)
         else:
             x, post, comb, res = self.mhc_post_pre(
                 x,
@@ -4061,9 +4115,16 @@ class Block(nn.Module):
                 hc_base,
                 norm_weight,
                 norm_eps,
+                res_preshuffle=hc_state.res_preshuffle,
                 prefix=f"{self.prefix}.mhc_post_pre",
             )
-        return HCState(residual=res, post_mix=post, comb_mix=comb, x_prev=x)
+        return HCState(
+            residual=res,
+            post_mix=post,
+            comb_mix=comb,
+            x_prev=x,
+            res_preshuffle=hc_state.res_preshuffle,
+        )
 
     def forward(
         self,
@@ -4150,7 +4211,14 @@ class ParallelHead(ParallelLMHead):
         via Sigmoid-gated weighted sum (vs Block.hc_pre's Sinkhorn variant).
         """
         _, _, y = aiter.mhc_pre(
-            x, hc_fn, hc_scale, hc_base, self.norm_eps, self.hc_eps, sinkhorn_repeat=0
+            x,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            self.norm_eps,
+            self.hc_eps,
+            sinkhorn_repeat=0,
+            **({"w_preshuffle_bf16": 1} if hc_fn.dtype == torch.int32 else {}),
         )
         return y
 
@@ -4310,6 +4378,10 @@ class DeepseekV4Model(nn.Module):
         self.norm_eps = args.norm_eps
         self.hc_eps = args.hc_eps
         self.hc_mult = args.hc_mult
+        self._mhc_arch = get_gfx()
+        self.enable_res_preshuffle = aiter.mhc_res_shuffle_enabled(
+            1, self._mhc_arch
+        )
 
         # VocabParallelEmbedding shards along vocab dim. At TP=1 weight shape
         # equals nn.Embedding's [vocab_size, dim] so dummy state_dicts load
@@ -4354,6 +4426,19 @@ class DeepseekV4Model(nn.Module):
         self.hc_head_base = atom_parameter(torch.empty(hc_mult, dtype=torch.float32))
         self.hc_head_scale = atom_parameter(torch.empty(1, dtype=torch.float32))
 
+    def process_weights_after_loading(self):
+        """Pack the head's constant fn using AITER's architecture-specific layout."""
+        if (
+            not envs.ATOM_MHC_USE_BF16
+            or not hasattr(aiter, "mhc_shuffle_fn")
+            or self.hc_head_fn.dtype == torch.int32
+        ):
+            return
+        # Replace storage instead of keeping a second packed Parameter.
+        self.hc_head_fn.data = aiter.mhc_shuffle_fn(
+            self.hc_head_fn.data.contiguous().float()
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,  # [num_tokens] int  flat ragged-batch token ids
@@ -4361,10 +4446,10 @@ class DeepseekV4Model(nn.Module):
     ) -> torch.Tensor:  # [num_tokens, hc, dim]  pre-hc_head residual stream
         """Forward over `num_tokens` flat ragged-batch tokens.
 
-        Returns the mHC residual stack `[num_tokens, hc, dim]` BEFORE hc_head
-        reduction — `hc_head + RMSNorm + LM head` are all deferred to
-        `compute_logits`. Returning the hc-shaped residual lets the (future)
-        MTP draft consume it without re-expanding from a dim-reduced state.
+        Returns the mHC residual stack `[num_tokens, hc, dim]` before hc_head
+        reduction. The final layer unshuffles and uses standalone hc_post;
+        `hc_head + RMSNorm + LM head` remain in `compute_logits`, and MTP keeps
+        the same three-dimensional residual contract.
         """
         assert input_ids.dim() == 1, f"input_ids must be 1D, got {input_ids.shape}"
         # PCP note: under PCP, `input_ids`/`positions` arrive already round-robin-
@@ -4374,16 +4459,31 @@ class DeepseekV4Model(nn.Module):
         # the K/V all-gather inside attention reconstructs full KV per layer,
         # and the final all-gather + un-pad happens back in the caller.
         h = self.embed(input_ids)  # [num_tokens, dim]
-        # Expand to hc_mult copies for Hyper-Connections: [num_tokens, hc, dim]
-        h = h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
-        hc_state = HCState(residual=h, post_mix=None, comb_mix=None, x_prev=None)
+        res_preshuffle = self.enable_res_preshuffle and (
+            self.layers[0]._mhc_fused_post_pre is not None
+        )
+        # Aiter writes either the ordinary repeated residual or the shuffled
+        # gfx1250 layout directly, without materializing repeat + shuffle.
+        h = aiter.mhc_res_repeat(h, self.hc_mult, res_preshuffle)
+        hc_state = HCState(
+            residual=h,
+            post_mix=None,
+            comb_mix=None,
+            x_prev=None,
+            res_preshuffle=res_preshuffle,
+        )
 
         for layer in self.layers:
             hc_state = layer(hc_state, positions)
-        h = self.layers[-1].hc_post(
-            hc_state.x_prev, hc_state.residual, hc_state.post_mix, hc_state.comb_mix
+
+        last_layer = self.layers[-1]
+        return last_layer.hc_post(
+            hc_state.x_prev,
+            hc_state.residual,
+            hc_state.post_mix,
+            hc_state.comb_mix,
+            res_preshuffle=hc_state.res_preshuffle,
         )
-        return h
 
 
 class DeepseekV4ForCausalLM(nn.Module):
@@ -4609,11 +4709,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         self,
         hidden_states: torch.Tensor,  # [num_tokens, hc, dim]  pre-hc_head residual
     ) -> torch.Tensor:  # [bs, vocab]
-        # mHC reduce + final RMSNorm + LM head are all here so `model.forward`
-        # can return the un-reduced [N, hc, dim] residual stream — the future
-        # MTP draft consumes it directly without re-expanding from a dim-reduced
-        # state. CG output buffer is sized [N, hc, dim] in ModelRunner via the
-        # `extra_output_dims = (hc_mult,)` hook on this class.
+        # Reduce the final unshuffled residual, normalize, then project logits.
         x = self.model.head.hc_head(
             hidden_states,
             self.model.hc_head_fn,

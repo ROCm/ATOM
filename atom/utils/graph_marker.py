@@ -1,14 +1,9 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc.
 #
-# A tiny, graph-friendly marker op for debugging/graph inspection.
-# It is an identity at runtime, but it shows up in FX/graph dumps.
-
-# from __future__ import annotations
+# A graph marker for profiling compiled code without copying activations.
 
 import torch
-
-from aiter.jit.utils.torch_guard import torch_compile_guard
 
 _GRAPH_MARKER_ENABLED: bool = False
 
@@ -23,26 +18,27 @@ def is_graph_marker_enabled() -> bool:
     return _GRAPH_MARKER_ENABLED
 
 
-def _graph_marker_impl(x: torch.Tensor) -> torch.Tensor:
-    # Runtime behavior: identity.
-    # Keep this side-effect free to avoid graph breaks.
-    return x
+@torch.library.custom_op("aiter::graph_marker", mutates_args=("x",))
+def _graph_marker(x: torch.Tensor, name: str) -> None:
+    # An in-place barrier keeps the marker ordered with operations on x and
+    # prevents dead-code elimination. It does not actually change any data.
+    # Return nothing: returning x from a custom op would introduce an output
+    # alias that functionalization cannot represent with this schema.
+    pass
 
 
-def _graph_marker_fake(x: torch.Tensor, name: str) -> torch.Tensor:
-    # FakeTensor / meta behavior: identity with preserved shape/stride/dtype.
-    return x
+@_graph_marker.register_fake
+def _graph_marker_fake(x: torch.Tensor, name: str) -> None:
+    pass
 
 
-@torch_compile_guard(gen_fake=_graph_marker_fake)
 def graph_marker(x: torch.Tensor, name: str) -> torch.Tensor:
-    """Insert a no-op marker node into the compiled/traced graph.
+    """Mark a tensor's position in the graph, preserving its identity and layout.
 
-    The marker `name` is embedded as a constant in the graph dump so you can
-    grep it in `computation_graph.py` / generated wrapper files.
+    The compiler sees an in-place barrier with no aliased output. Returning the
+    original tensor here keeps its existing views and lets Inductor reuse its
+    storage, instead of cloning an opaque custom op's returned alias.
     """
-    # When disabled, return early so the marker does not even appear in the
-    # traced/compiled graph.
-    if not _GRAPH_MARKER_ENABLED:
-        return x
-    return _graph_marker_impl(x)
+    if _GRAPH_MARKER_ENABLED:
+        _graph_marker(x, name)
+    return x
