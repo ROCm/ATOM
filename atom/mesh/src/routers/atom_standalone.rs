@@ -24,11 +24,10 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use crate::{
     protocols::{
         chat::ChatCompletionRequest,
-        completion::CompletionRequest,
         generate::GenerateRequest,
         responses::{ResponsesGetParams, ResponsesRequest},
     },
-    routers::RouterTrait,
+    routers::{completion_request::CompletionRequest, RouterTrait},
 };
 
 type RouterResult<T> = Result<T, Response>;
@@ -453,7 +452,7 @@ impl RouterTrait for AtomStandaloneRouter {
         body: &CompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        if body.stream {
+        if body.is_stream() {
             return self.run_completion_stream(body);
         }
 

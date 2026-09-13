@@ -795,8 +795,8 @@ mod h_completion_adapter {
     use http::StatusCode;
     use serde_json::{json, Value};
 
-    use crate::protocols::common::StringOrArray;
-    use crate::protocols::completion::CompletionRequest;
+    use crate::protocols::common::{InputIds, StringOrArray};
+    use crate::routers::completion_request::CompletionRequest;
     use crate::routers::grpc::completion_adapter::{
         completion_to_generate, wrap_generate_response_as_completion,
         wrap_streaming_generate_as_completion,
@@ -839,6 +839,47 @@ mod h_completion_adapter {
         let err = completion_to_generate(&req).unwrap_err();
         assert!(err.contains("Batched prompts"), "error: {err}");
         assert!(err.contains("2 items"), "error: {err}");
+    }
+
+    #[test]
+    fn test_token_id_prompt_maps_to_input_ids() {
+        let req: CompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "prompt": [1, 2, 3]
+        }))
+        .unwrap();
+        let gen = completion_to_generate(&req).unwrap();
+        assert!(gen.text.is_none(), "token-id prompt must not set text");
+        match gen.input_ids.as_ref().expect("input_ids must be set") {
+            InputIds::Single(ids) => {
+                let ids: Vec<i64> = ids.iter().map(|&x| x as i64).collect();
+                assert_eq!(ids, vec![1, 2, 3]);
+            }
+            other => panic!("expected InputIds::Single, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_string_array_still_parses_as_text() {
+        let req: CompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "prompt": ["hello"]
+        }))
+        .unwrap();
+        let gen = completion_to_generate(&req).unwrap();
+        assert_eq!(gen.text.as_deref(), Some("hello"));
+        assert!(gen.input_ids.is_none());
+    }
+
+    #[test]
+    fn test_batched_token_ids_rejected_on_grpc() {
+        let req: CompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "prompt": [[1, 2], [3, 4]]
+        }))
+        .unwrap();
+        let err = completion_to_generate(&req).unwrap_err();
+        assert!(err.contains("Batched token-id prompts"), "error: {err}");
     }
 
     #[test]

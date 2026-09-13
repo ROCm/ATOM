@@ -3,8 +3,9 @@
 //! Converts between OpenAI `/v1/completions` protocol and SGLang's native
 //! generate protocol so the existing generate pipeline can be reused.
 //!
-//! Supports both streaming and non-streaming requests. Batched prompts,
-//! echo, suffix, best_of, and logit_bias return a clear 4xx error.
+//! Supports both streaming and non-streaming requests. A single token-id prompt
+//! is forwarded as `input_ids`; batched prompts, echo, suffix, best_of, and
+//! logit_bias return a clear 4xx error.
 
 use axum::{body::Body, response::Response};
 use bytes::Bytes;
@@ -17,12 +18,15 @@ use uuid::Uuid;
 
 use crate::{
     protocols::{
-        common::{StringOrArray, Usage},
-        completion::{CompletionChoice, CompletionRequest, CompletionResponse},
+        common::{InputIds, Usage},
+        completion::{CompletionChoice, CompletionResponse},
         generate::{GenerateFinishReason, GenerateRequest, GenerateResponse},
         sampling_params::SamplingParams,
     },
-    routers::comm::error,
+    routers::{
+        comm::error,
+        completion_request::{CompletionPrompt, CompletionRequest},
+    },
 };
 
 /// Build a synthetic SGLang `GenerateRequest` from an OpenAI `CompletionRequest`.
@@ -30,74 +34,87 @@ use crate::{
 /// Returns `Err(message)` for unsupported features so the caller can emit
 /// `400 Bad Request` with the same message.
 pub(crate) fn completion_to_generate(c: &CompletionRequest) -> Result<GenerateRequest, String> {
-    if c.echo {
+    let inner = &c.inner;
+    if inner.echo {
         return Err("`echo` is not supported on the gRPC /v1/completions path".into());
     }
-    if c.suffix.is_some() {
+    if inner.suffix.is_some() {
         return Err("`suffix` is not supported on the gRPC /v1/completions path".into());
     }
-    if c.best_of.map(|n| n > 1).unwrap_or(false) {
+    if inner.best_of.map(|n| n > 1).unwrap_or(false) {
         return Err("`best_of > 1` is not supported on the gRPC /v1/completions path".into());
     }
-    if c.logit_bias.is_some() {
+    if inner.logit_bias.is_some() {
         return Err("`logit_bias` is not supported on the gRPC /v1/completions path".into());
     }
 
-    let text = match &c.prompt {
-        StringOrArray::String(s) => s.clone(),
-        StringOrArray::Array(arr) => {
+    let (text, input_ids) = match &c.prompt {
+        CompletionPrompt::String(s) => (Some(s.clone()), None),
+        CompletionPrompt::Texts(arr) => {
             if arr.len() != 1 {
                 return Err(format!(
                     "Batched prompts (got {} items) are not supported on the gRPC /v1/completions path; send one prompt per request",
                     arr.len()
                 ));
             }
-            arr[0].clone()
+            (Some(arr[0].clone()), None)
+        }
+        CompletionPrompt::Tokens(ids) => {
+            // Round-trip through serde to avoid depending on InputIds' integer width.
+            let value = serde_json::to_value(ids)
+                .and_then(serde_json::from_value::<InputIds>)
+                .map_err(|e| format!("failed to build input_ids from token-id prompt: {e}"))?;
+            (None, Some(value))
+        }
+        CompletionPrompt::TokenBatches(_) => {
+            return Err(
+                "Batched token-id prompts are not supported on the gRPC /v1/completions path; send one prompt per request".into(),
+            );
         }
     };
 
     let sampling_params = SamplingParams {
-        temperature: c.temperature,
-        max_new_tokens: c.max_tokens,
-        top_p: c.top_p,
-        top_k: c.top_k,
-        frequency_penalty: c.frequency_penalty,
-        presence_penalty: c.presence_penalty,
+        temperature: inner.temperature,
+        max_new_tokens: inner.max_tokens,
+        top_p: inner.top_p,
+        top_k: inner.top_k,
+        frequency_penalty: inner.frequency_penalty,
+        presence_penalty: inner.presence_penalty,
         repetition_penalty: None,
-        stop: c.stop.clone(),
-        ignore_eos: Some(c.ignore_eos),
-        skip_special_tokens: Some(c.skip_special_tokens),
-        json_schema: c.json_schema.clone(),
-        regex: c.regex.clone(),
-        ebnf: c.ebnf.clone(),
-        min_p: c.min_p,
+        stop: inner.stop.clone(),
+        ignore_eos: Some(inner.ignore_eos),
+        skip_special_tokens: Some(inner.skip_special_tokens),
+        json_schema: inner.json_schema.clone(),
+        regex: inner.regex.clone(),
+        ebnf: inner.ebnf.clone(),
+        min_p: inner.min_p,
         min_new_tokens: None,
-        stop_token_ids: c.stop_token_ids.clone(),
-        no_stop_trim: Some(c.no_stop_trim),
-        n: c.n,
-        sampling_seed: c.sampling_seed.or_else(|| c.seed.map(|s| s as u64)),
+        stop_token_ids: inner.stop_token_ids.clone(),
+        no_stop_trim: Some(inner.no_stop_trim),
+        n: inner.n,
+        sampling_seed: inner.sampling_seed.or_else(|| inner.seed.map(|s| s as u64)),
     };
 
     Ok(GenerateRequest {
-        text: Some(text),
-        model: Some(c.model.clone()),
-        input_ids: None,
+        text,
+        model: Some(inner.model.clone()),
+        input_ids,
         input_embeds: None,
         image_data: None,
         video_data: None,
         audio_data: None,
         sampling_params: Some(sampling_params),
-        return_logprob: Some(c.logprobs.is_some()),
+        return_logprob: Some(inner.logprobs.is_some()),
         logprob_start_len: None,
-        top_logprobs_num: c.logprobs.map(|n| n as i32),
+        top_logprobs_num: inner.logprobs.map(|n| n as i32),
         token_ids_logprob: None,
         return_text_in_logprobs: false,
-        stream: c.stream,
+        stream: inner.stream,
         log_metrics: true,
-        return_hidden_states: c.return_hidden_states,
+        return_hidden_states: inner.return_hidden_states,
         modalities: None,
-        session_params: c.session_params.clone(),
-        lora_path: c.lora_path.clone(),
+        session_params: inner.session_params.clone(),
+        lora_path: inner.lora_path.clone(),
         lora_id: None,
         custom_logit_processor: None,
         bootstrap_host: None,
