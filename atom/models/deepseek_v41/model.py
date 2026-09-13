@@ -8,10 +8,11 @@ from torch import nn
 
 from atom.model_ops.attentions.deepseek_v41_state import EagerAttentionCache
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState, apply_sublayer
+from atom.model_ops.deepseek_v41.normalization import RMSNorm
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 from atom.model_ops.embed_head import VocabParallelEmbedding
 from atom.model_ops.engram_layer import EngramOp
-from atom.model_ops.layernorm import RMSNorm
+from atom.model_ops.layernorm import RMSNorm as FusedRMSNorm
 from atom.model_ops.linear import ReplicatedLinear
 
 from .attention import Attention
@@ -137,7 +138,9 @@ class DeepseekV41ForCausalLM(nn.Module):
         self.topology = build_attention_topology(config)[: config.num_hidden_layers]
         self.embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(Block(config, spec) for spec in self.topology)
-        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        # Final normalization feeds the FP32 logits projection, with no further
+        # activation quantization. Reuse V4's fused RMSNorm at this boundary.
+        self.norm = FusedRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.head = LogitsHead(config.hidden_size, config.vocab_size)
         self.window_rope = RotaryEmbedding(
             config.qk_rope_head_dim, max_length, base=config.rope_theta

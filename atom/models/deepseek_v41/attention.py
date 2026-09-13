@@ -8,7 +8,7 @@ from torch import nn
 from atom.model_ops.blockscale import quantize_fp4, quantize_fp8
 from atom.model_ops.deepseek_v41.compressor import Compressor
 from atom.model_ops.deepseek_v41.indexer import select_indices
-from atom.model_ops.layernorm import RMSNorm
+from atom.model_ops.deepseek_v41.normalization import FusedRMSNorm, RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -46,7 +46,7 @@ class Indexer(nn.Module):
             self.wk = nn.Linear(
                 config.head_dim, self.head_dim, bias=False, dtype=torch.bfloat16
             )
-            self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
+            self.k_norm = FusedRMSNorm(self.head_dim, config.rms_norm_eps)
 
     def project_keys(self, latent, rope, positions):
         key = self.k_norm(self.wk(latent))
