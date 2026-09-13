@@ -307,6 +307,8 @@ class MiMoV2MTP(nn.Module):
         self,
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
+        *,
+        out: torch.Tensor,
     ) -> torch.Tensor:
         """Greedy draft token ids via distributed argmax — each rank reduces its
         own vocab shard and only [N, 2] is all-gathered, instead of the full
@@ -315,7 +317,7 @@ class MiMoV2MTP(nn.Module):
         prefill last-token slice (is_draft is set for the whole propose loop),
         so both see the same rows.
         """
-        return self.lm_head.compute_argmax_token(hidden_states)
+        return self.lm_head.compute_argmax_token(hidden_states, out=out)
 
     _MTP_PATTERN = re.compile(r"model\.mtp\.layers\.(\d+)\.")
     _PREDICTOR_KEYS: ClassVar[set[str]] = {

@@ -280,7 +280,7 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
         *,
-        out: torch.Tensor | None = None,
+        out: torch.Tensor,
     ) -> torch.Tensor:
         """Greedy draft token ids via distributed argmax over the TP-sharded vocab —
         avoids all-gathering the full [N, vocab] logits every draft step.
@@ -424,7 +424,7 @@ class DeepSeekMTP(nn.Module):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
         *,
-        out: torch.Tensor | None = None,
+        out: torch.Tensor,
     ) -> torch.Tensor:
         """Distributed greedy argmax for the MTP draft rollout (GLM-5.2).
 

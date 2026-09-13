@@ -382,11 +382,13 @@ class Eagle3DeepseekMLAModel(nn.Module):
             hidden_states = self.norm(hidden_states)
         return self.lm_head(hidden_states)
 
-    def compute_draft_ids(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def compute_draft_ids(
+        self, hidden_states: torch.Tensor, *, out: torch.Tensor
+    ) -> torch.Tensor:
         """Greedy draft token ids via distributed argmax — avoids all-gathering
         the full [N, vocab] logits every draft step. Token-identical to
         compute_logits(...).argmax(-1); norm handling mirrors compute_logits.
         """
         if not self.norm_output:
             hidden_states = self.norm(hidden_states)
-        return self.lm_head.compute_argmax_token(hidden_states)
+        return self.lm_head.compute_argmax_token(hidden_states, out=out)

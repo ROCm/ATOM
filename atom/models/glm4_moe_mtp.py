@@ -168,11 +168,13 @@ class Glm4MoeMultiTokenPredictor(nn.Module):
         self,
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
+        *,
+        out: torch.Tensor,
     ) -> torch.Tensor:
         # Same bare-LM-head input as compute_logits, but reduced per vocab shard
         # so only [N, 2] crosses TP instead of the full [N, vocab].
         head = self._mtp_layer(spec_step_idx).shared_head.head
-        return head.compute_argmax_token(hidden_states)
+        return head.compute_argmax_token(hidden_states, out=out)
 
 
 @support_torch_compile
@@ -229,6 +231,8 @@ class Glm4MoeMTP(nn.Module):
         self,
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
+        *,
+        out: torch.Tensor,
     ) -> torch.Tensor:
         """Greedy draft token ids via distributed argmax — only [N, 2] is
         all-gathered instead of the full [N, vocab] logits. Token-identical to
@@ -241,7 +245,7 @@ class Glm4MoeMTP(nn.Module):
         this class. The plugin calls it unconditionally, though, so the method
         has to exist.
         """
-        return self.model.compute_draft_ids(hidden_states, spec_step_idx)
+        return self.model.compute_draft_ids(hidden_states, spec_step_idx, out=out)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales

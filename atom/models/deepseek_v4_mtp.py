@@ -201,11 +201,13 @@ class DeepseekV4MTPModel(nn.Module):
         self,
         hidden_states: torch.Tensor,  # [num_tokens, hc, dim]  pre-hc_head residual
         spec_step_idx: int = 0,
-    ) -> torch.Tensor:  # [num_tokens] int64
+        *,
+        out: torch.Tensor,  # [num_tokens] int32
+    ) -> torch.Tensor:
         """Same reduce + norm as compute_logits, but the argmax runs per vocab
         shard so only [N, 2] crosses TP instead of the full [N, vocab]."""
         blk, x = self._head_input(hidden_states, spec_step_idx)
-        return blk.head.compute_argmax_token(x)
+        return blk.head.compute_argmax_token(x, out=out)
 
 
 class DeepseekV4MTP(nn.Module):
@@ -319,13 +321,15 @@ class DeepseekV4MTP(nn.Module):
         self,
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
+        *,
+        out: torch.Tensor,
     ) -> torch.Tensor:
         """Greedy draft token ids via distributed argmax — only [N, 2] crosses
         TP instead of the full [N, vocab]. Token-identical to
         compute_logits(...).argmax(-1): the draft path never hits the LM head's
         prefill last-token slice (is_draft is set for the whole propose loop),
         so both see the same rows."""
-        return self.model.compute_draft_ids(hidden_states, spec_step_idx)
+        return self.model.compute_draft_ids(hidden_states, spec_step_idx, out=out)
 
     def share_with_target(self, target_base: nn.Module, loaded: set[str]) -> None:
         """Bind embed/head on each MTPBlock to the already-loaded target's
