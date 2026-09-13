@@ -1,4 +1,8 @@
-"""Prometheus exposition for the standalone ATOM OpenAI server."""
+"""Snapshot cache and explicit Prometheus registration for the OpenAI server.
+
+Existing metric definitions remain here. The API composition module registers
+request timing instruments and the new scheduler/worker snapshot collectors.
+"""
 
 from __future__ import annotations
 
@@ -6,71 +10,53 @@ import copy
 import gc
 import threading
 import time
-from bisect import bisect_left
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from contextvars import ContextVar
 from typing import Any
 
-from prometheus_client import CollectorRegistry, Histogram, generate_latest
-from prometheus_client.core import (
-    CounterMetricFamily,
-    GaugeMetricFamily,
-    HistogramMetricFamily,
-)
+from prometheus_client import CollectorRegistry, generate_latest
+from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, Metric
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 
 from .streaming_dispatch import longest_silence_seconds
 
+Snapshot = dict[str, Any]
+SnapshotState = tuple[Snapshot, int, float]
 
-class _WeightedHistogram:
-    """Aggregate equal observations with one bucket lookup and one lock.
 
-    Own the counters and expose them through Prometheus' public collector API.
-    A scrape snapshots bucket counts and the sum under the same lock.
-    """
+class _SnapshotCollector:
+    def __init__(
+        self, exporter, collect: Callable[[Snapshot | None], Iterable[Metric]]
+    ):
+        self._exporter = exporter
+        self._collect = collect
 
-    def __init__(self, name, documentation, *, buckets, registry):
-        self._name = name
-        self._documentation = documentation
-        self._bounds = (*buckets, float("inf"))
-        self._counts = [0] * len(self._bounds)
-        self._sum = 0.0
-        self._created = time.time()
-        self._lock = threading.Lock()
-        registry.register(self)
-
-    def observe_weighted(self, total: float, weight: int) -> None:
-        """Record ``weight`` equal samples whose sum is ``total``."""
-        if weight <= 0:
-            return
-        index = bisect_left(self._bounds, total / weight)
-        with self._lock:
-            self._counts[index] += weight
-            self._sum += total
+    def describe(self):
+        # None requests all family names, including optional snapshot fields.
+        # Registration must never depend on available runtime data or do RPCs.
+        return self._collect(None)
 
     def collect(self):
-        with self._lock:
-            counts, total = self._counts.copy(), self._sum
-        cumulative = 0
-        buckets = []
-        for bound, count in zip(self._bounds, counts):
-            cumulative += count
-            buckets.append(
-                ("+Inf" if bound == float("inf") else str(bound), cumulative)
-            )
-        yield HistogramMetricFamily(
-            self._name, self._documentation, buckets=buckets, sum_value=total
-        )
-        yield GaugeMetricFamily(
-            self._name + "_created", self._documentation, value=self._created
-        )
+        return self._collect(self._exporter.read()[0])
 
 
 class _AtomMetricsCollector:
     def __init__(self, exporter: AtomMetricsExporter):
         self._exporter = exporter
 
+    def describe(self):
+        # Reserve all original families, including data-dependent label sets,
+        # without reading the runtime snapshot or live process state.
+        return self._collect(None)
+
     def collect(self) -> Iterable[GaugeMetricFamily | CounterMetricFamily]:
-        snapshot, refresh_errors, last_refresh = self._exporter.read()
+        return self._collect(self._exporter.read())
+
+    def _collect(
+        self, state: SnapshotState | None
+    ) -> Iterable[GaugeMetricFamily | CounterMetricFamily]:
+        describe = state is None
+        snapshot, refresh_errors, last_refresh = ({}, 0, 0.0) if describe else state
         available = bool(snapshot.get("enabled", False))
 
         metric = GaugeMetricFamily(
@@ -104,7 +90,7 @@ class _AtomMetricsCollector:
             "chunk. Zero when none is waiting. Non-zero and growing is a "
             "response that has stopped delivering while the client waits.",
         )
-        metric.add_metric([], longest_silence_seconds())
+        metric.add_metric([], 0.0 if describe else longest_silence_seconds())
         yield metric
 
         gauges = (
@@ -438,10 +424,12 @@ class _AtomMetricsCollector:
             distribution.add_metric([str(accepted)], float(steps))
         yield distribution
 
-        yield from _gc_metrics()
+        yield from _gc_metrics(describe=describe)
 
 
-def _gc_metrics() -> Iterable[GaugeMetricFamily | CounterMetricFamily]:
+def _gc_metrics(
+    *, describe: bool = False
+) -> Iterable[GaugeMetricFamily | CounterMetricFamily]:
     """This process's own collector -- the frontend's, not the engine's, since
     each interpreter keeps its own counters.
 
@@ -459,7 +447,7 @@ def _gc_metrics() -> Iterable[GaugeMetricFamily | CounterMetricFamily]:
     that changes twice in a process's life. It and the tracked-set size both
     live in `/debug/gc_census` now, which is asked for rather than scraped.
     """
-    stats = gc.get_stats()
+    stats = [] if describe else gc.get_stats()
     for name, key, doc in (
         (
             "atom:gc_collections",
@@ -491,7 +479,7 @@ def _gc_metrics() -> Iterable[GaugeMetricFamily | CounterMetricFamily]:
         "Collection threshold in effect in this process, per generation.",
         labels=["generation"],
     )
-    for generation, value in enumerate(gc.get_threshold()):
+    for generation, value in enumerate(() if describe else gc.get_threshold()):
         threshold.add_metric([str(generation)], float(value))
     yield threshold
 
@@ -503,90 +491,25 @@ class AtomMetricsExporter:
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._snapshot: dict[str, Any] = {}
+        self._snapshot: Snapshot = {}
         self._refresh_errors = 0
         self._last_refresh = 0.0
-        self._registry = CollectorRegistry(auto_describe=False)
-        self._registry.register(_AtomMetricsCollector(self))
-        self._inter_token_latency = _WeightedHistogram(
-            "atom:inter_token_latency_seconds",
-            "Frontend-observed streaming output interval divided by new token "
-            "count, weighted by that count. Excludes the first output batch.",
-            buckets=(
-                0.002,
-                0.004,
-                0.006,
-                0.008,
-                0.010,
-                0.015,
-                0.020,
-                0.025,
-                0.030,
-                0.035,
-                0.040,
-                0.060,
-                0.080,
-                0.100,
-                0.200,
-                0.400,
-                0.600,
-                0.800,
-                1.000,
-                2.000,
-                4.000,
-                6.000,
-                8.000,
-            ),
-            registry=self._registry,
+        self._render_snapshot: ContextVar[SnapshotState | None] = ContextVar(
+            "metrics_render_snapshot", default=None
         )
-        self._time_to_first_token = Histogram(
-            "atom:time_to_first_token_seconds",
-            "Local API request arrival to first output. Streaming observes the "
-            "first generated SSE payload; non-streaming observes the first "
-            "internal token delivery. One sample per request.",
-            labelnames=("streaming",),
-            buckets=(
-                0.001,
-                0.005,
-                0.010,
-                0.025,
-                0.050,
-                0.100,
-                0.250,
-                0.500,
-                1.0,
-                2.5,
-                5.0,
-                10.0,
-                15.0,
-                30.0,
-                45.0,
-                60.0,
-                90.0,
-                120.0,
-                180.0,
-                240.0,
-            ),
-            registry=self._registry,
-        )
+        self.registry = CollectorRegistry(auto_describe=False)
+        self.registry.register(_AtomMetricsCollector(self))
 
-        # Expose zero-valued children before traffic so Prometheus can establish
-        # a baseline for rate(). Registering labels does not record a sample.
-        for streaming in ("true", "false"):
-            self._time_to_first_token.labels(streaming=streaming)
+    def register_snapshot_collector(
+        self, collect: Callable[[Snapshot | None], Iterable[Metric]]
+    ) -> None:
+        """Register a component's pure snapshot-to-families function once.
 
-    def observe_time_to_first_token(self, interval: float, streaming: bool) -> None:
-        self._time_to_first_token.labels(streaming=str(streaming).lower()).observe(
-            interval
-        )
-
-    def observe_inter_token_latency(self, interval: float, num_new_tokens: int) -> None:
-        """Record token-weighted intervals in one aggregation update.
-
-        These cumulative observations are independent of the engine snapshot;
-        neither refreshing that snapshot nor scraping resets the histogram.
+        collect(None) must describe every possible family, without runtime I/O.
+        collect(snapshot) exports existing cumulative values; it must not mutate
+        the snapshot or re-observe values. The registry rejects name collisions.
         """
-        self._inter_token_latency.observe_weighted(interval, num_new_tokens)
+        self.registry.register(_SnapshotCollector(self, collect))
 
     def update(self, snapshot: dict[str, Any]) -> None:
         with self._lock:
@@ -598,6 +521,9 @@ class AtomMetricsExporter:
             self._refresh_errors += 1
 
     def read(self) -> tuple[dict[str, Any], int, float]:
+        pinned = self._render_snapshot.get()
+        if pinned is not None:
+            return pinned
         with self._lock:
             return (
                 copy.deepcopy(self._snapshot),
@@ -606,4 +532,10 @@ class AtomMetricsExporter:
             )
 
     def render(self) -> bytes:
-        return generate_latest(self._registry)
+        # All component collectors see the same revision, even if refresh runs
+        # concurrently. Context-local state isolates concurrent/nested scrapes.
+        token = self._render_snapshot.set(self.read())
+        try:
+            return generate_latest(self.registry)
+        finally:
+            self._render_snapshot.reset(token)

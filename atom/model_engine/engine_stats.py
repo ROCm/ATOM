@@ -786,3 +786,18 @@ class EngineStats:
         self._throughput_last_log_time = now
         self.num_prompt_tokens = 0
         self.num_generation_tokens = 0
+
+
+def collect_engine_metrics(snapshot):
+    """Export supplemental prefix reuse for the dashboard's cache breakdown."""
+    from prometheus_client.core import CounterMetricFamily
+
+    describe = snapshot is None
+    cache = (snapshot or {}).get("cache", {})
+    if describe or "offload_tokens" in cache:
+        metric = CounterMetricFamily(
+            "atom:prefix_cache_offload_tokens",
+            "Prompt tokens reused from LMCache beyond the admitted GPU prefix; shares prefix-cache input accounting, not transfer volume.",
+        )
+        metric.add_metric([], float(cache.get("offload_tokens", 0)))
+        yield metric

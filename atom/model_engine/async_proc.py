@@ -241,6 +241,10 @@ class AsyncIOProc:
                 if need_barrier and self.all_ranks_barrier is not None:
                     self.all_ranks_barrier.wait()
                 if out is not None:
+                    if func_name == "collect_forward_metrics":
+                        if self.kv_queue is not None:
+                            self.kv_queue.put_nowait(("FORWARD_METRICS", out))
+                        continue
                     if (
                         self.io_addrs[1] is not None
                         and func_name not in self._KV_FUNC_NAMES
@@ -299,6 +303,7 @@ class AsyncIOProcManager:
 
         # KV output aggregation infrastructure
         self.kv_output_aggregator: KVOutputAggregator | None = None
+        self.latest_forward_metrics: dict[int, dict] = {}
         self.kv_output_addrs = [get_open_zmq_ipc_path() for _ in range(proc_num)]
         self.kv_outputs_queues: list[queue.Queue] = [
             queue.Queue() for _ in range(proc_num)
@@ -417,10 +422,16 @@ class AsyncIOProcManager:
                     continue
                 obj = output_socket.recv(copy=False)
                 obj = pickle.loads(obj)
-                self.kv_outputs_queues[worker_id].put_nowait(obj)
+                self._receive_worker_output(worker_id, obj)
         finally:
             output_socket.close(linger=0)
             logger.debug(f"{self.label}: kv output thread {worker_id} exit")
+
+    def _receive_worker_output(self, worker_id, obj):
+        if isinstance(obj, tuple) and len(obj) == 2 and obj[0] == "FORWARD_METRICS":
+            self.latest_forward_metrics[worker_id] = obj[1]
+        else:
+            self.kv_outputs_queues[worker_id].put_nowait(obj)
 
     def call_func(self, func_name: str, *args, wait_out: bool = False):
         """Standard RPC call for non-KV operations."""

@@ -486,10 +486,9 @@ class LLMEngine:
         a local dict lookup: no round trip, no deadline, and nothing that can
         fail just because the engine is busy.
         """
+        latest_metrics = self.core_mgr.latest_metrics.copy()
         rank_stats = [
-            stats
-            for stats in self.core_mgr.latest_metrics.values()
-            if stats.get("enabled", False)
+            stats for stats in latest_metrics.values() if stats.get("enabled", False)
         ]
 
         def summed(key: str) -> int:
@@ -554,6 +553,12 @@ class LLMEngine:
             key: sum(int(stats.get(key, 0)) for stats in cache_rank_stats)
             for key in cache_keys
         }
+        # Keep the admitted supplemental reuse population aligned with the HBM
+        # and input counters. Missing older snapshots are not a zero tier hit.
+        if all("offload_tokens" in stats for stats in cache_rank_stats):
+            cache_totals["offload_tokens"] = sum(
+                int(stats["offload_tokens"]) for stats in cache_rank_stats
+            )
         # NOTE: `full`, while `get_cache_statistics` divides by `reusable`, so
         # this endpoint reads lower for the same engine — `full` counts the
         # trailing block no cache is offered, and that fixed size weighs more
@@ -591,6 +596,32 @@ class LLMEngine:
             "kv_blocks_total": kv_total,
             "kv_blocks_indexed": summed("kv_blocks_indexed"),
             "kv_cache_usage_ratio": kv_used / kv_total if kv_total else 0.0,
+            "forward_metrics": [
+                {**worker, "engine_role": stats.get("role") or "default"}
+                for stats in latest_metrics.values()
+                for worker in stats.get("forward_metrics", [])
+            ],
+            # Keep cumulative observations per scheduler: exposing each rank
+            # preserves reset detection and avoids counting a PP batch twice.
+            "scheduler_metrics": [
+                {
+                    "dp_rank": rank,
+                    "engine_role": stats.get("role") or "default",
+                    **stats["scheduler_metrics"],
+                    "kv_blocks": (
+                        {
+                            "used": stats["kv_blocks_used"],
+                            "evictable": stats["kv_blocks_evictable"],
+                            "vacant": stats["kv_blocks_vacant"],
+                            "total": stats["kv_blocks_total"],
+                        }
+                        if "kv_blocks_total" in stats
+                        else {}
+                    ),
+                }
+                for rank, stats in latest_metrics.items()
+                if stats.get("enabled") and "scheduler_metrics" in stats
+            ],
             "mtp": {
                 "enabled": bool(mtp_rank_stats),
                 "total_draft_tokens": mtp_draft,

@@ -6,7 +6,7 @@ from prometheus_client import CollectorRegistry, Histogram, generate_latest
 from prometheus_client.parser import text_string_to_metric_families
 
 from atom.entrypoints.openai import streaming_dispatch
-from atom.entrypoints.openai.metrics import AtomMetricsExporter
+from atom.entrypoints.openai.metrics_setup import create_metrics_exporter
 from atom.entrypoints.openai.streaming_dispatch import (
     IncrementalStreamDetokenizer,
     StreamBatchDispatcher,
@@ -84,16 +84,16 @@ def _itl_samples(exporter):
 
 
 def test_weighted_itl_matches_histogram_buckets_and_handles_large_batches():
-    exporter = AtomMetricsExporter()
+    exporter, _, stream_metrics = create_metrics_exporter()
     registry = CollectorRegistry()
     reference = Histogram(
         "atom:inter_token_latency_seconds",
         "reference",
-        buckets=exporter._inter_token_latency._bounds,
+        buckets=streaming_dispatch.INTER_TOKEN_LATENCY_BUCKETS,
         registry=registry,
     )
     for interval, tokens in ((0.0, 3), (0.008, 4), (0.09, 3), (32.0, 2)):
-        exporter.observe_inter_token_latency(interval, tokens)
+        stream_metrics.observe_inter_token_latency(interval, tokens)
         for _ in range(tokens):
             reference.observe(interval / tokens)
     expected = {
@@ -103,8 +103,8 @@ def test_weighted_itl_matches_histogram_buckets_and_handles_large_batches():
         if not s.name.endswith("_created")
     }
     assert _itl_samples(exporter) == pytest.approx(expected)
-    exporter.observe_inter_token_latency(5000.0, 10_000_000)
-    exporter.observe_inter_token_latency(1.0, 0)
+    stream_metrics.observe_inter_token_latency(5000.0, 10_000_000)
+    stream_metrics.observe_inter_token_latency(1.0, 0)
     samples = _itl_samples(exporter)
     prefix = "atom:inter_token_latency_seconds"
     assert samples[(prefix + "_count", None)] == 10_000_012
@@ -115,11 +115,11 @@ def test_weighted_itl_matches_histogram_buckets_and_handles_large_batches():
 def test_itl_preserves_token_weighted_intervals_when_stream_chunks_coalesce(
     monkeypatch,
 ):
-    exporter = AtomMetricsExporter()
+    exporter, _, stream_metrics = create_metrics_exporter()
     tokenizer = _CountingTokenizer()
     dispatcher = StreamBatchDispatcher(
         tokenizer,
-        observe_inter_token_latency=exporter.observe_inter_token_latency,
+        observe_inter_token_latency=stream_metrics.observe_inter_token_latency,
     )
     state = dispatcher.new_state()
     collector = StreamOutputCollector("itl")
@@ -166,10 +166,10 @@ def test_itl_preserves_token_weighted_intervals_when_stream_chunks_coalesce(
 def test_itl_keeps_independent_clocks_for_interleaved_fanout_choices(
     monkeypatch, collector_type
 ):
-    exporter = AtomMetricsExporter()
+    exporter, _, stream_metrics = create_metrics_exporter()
     dispatcher = StreamBatchDispatcher(
         _Utf8ByteTokenizer(),
-        observe_inter_token_latency=exporter.observe_inter_token_latency,
+        observe_inter_token_latency=stream_metrics.observe_inter_token_latency,
     )
     states = [dispatcher.new_state(), dispatcher.new_state()]
     loop = _ImmediateLoop()
@@ -197,7 +197,7 @@ def test_itl_keeps_independent_clocks_for_interleaved_fanout_choices(
 
 
 def test_itl_includes_frontend_queueing_but_excludes_observation_work(monkeypatch):
-    exporter = AtomMetricsExporter()
+    exporter, _, stream_metrics = create_metrics_exporter()
     clock = [0.0]
     monkeypatch.setattr(
         "atom.entrypoints.openai.streaming_dispatch.time.perf_counter",
@@ -205,7 +205,7 @@ def test_itl_includes_frontend_queueing_but_excludes_observation_work(monkeypatc
     )
 
     def observe(interval, tokens):
-        exporter.observe_inter_token_latency(interval, tokens)
+        stream_metrics.observe_inter_token_latency(interval, tokens)
         clock[0] += 0.125
 
     dispatcher = StreamBatchDispatcher(

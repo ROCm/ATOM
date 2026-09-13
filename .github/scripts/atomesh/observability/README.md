@@ -1,23 +1,88 @@
-# Agentic PD latency reports
+# Agentic PD inference reports
 
 Agentic PD benchmarks (`benchmark.kind: aiperf_agentic`) automatically collect
 metrics and generate an offline HTML report for each concurrency setting. No
 additional workflow input or long-running monitoring server is required.
+
+GPU event timing is disabled by default in ATOM. Agentic CI sets
+`ATOM_ENABLE_METRICS_DEVICE_TIMER=1` on the prefill and decode services so their
+GPU panels have data. Set `env.common.ATOM_ENABLE_METRICS_DEVICE_TIMER: "0"` in the job
+configuration to disable it; GPU panels then have no samples. Other metrics
+remain available. Event polling stops at the first unfinished event and reuses
+completed pairs, with at most 256 pending pairs per worker and no GPU synchronization.
 
 Each matrix job uploads its own `atomesh-latency-<matrix-id>-<attempt>` artifact.
 The job summary contains **Download HTML reports and data**. Download and extract
 that artifact, then open a `report.html` file. GitHub Actions summaries cannot
 execute the report's JavaScript; the report runs locally without a server.
 
-The report shows two charts per row:
+The report defaults to an eight-panel Overview with Prefill/Decode TTFT, queue
+time, total cache reuse, and GPU forward latency. Use Latency, Workload, Cache & KV, or
+All metrics to inspect the full set. Desktop charts use two columns:
 
 - Mesh overall TTFT: ingress to first generated streaming output.
 - Decode ITL: output intervals normalized and weighted by new token count.
 - Prefill local TTFT: request arrival to first internal token delivery.
 - Decode local TTFT: request arrival to first generated streaming output.
+- Prefill and Decode request queues: running, waiting, and external KV waits.
+- Prefill and Decode queue time: engine receipt to first forward dispatch,
+  including input queue residence, scheduling, and KV loading waits.
+- Actual decode batch size: real decode request rows in each forward.
+- PD KV transfer wait: Decode-side remote load wait until all workers finish.
+- Prefill and Decode KV block utilization: used, evictable cached, and vacant.
+- Prefill and Decode cache reuse: Total reuse, LMCache and GPU curves shown
+  together, each divided by input tokens. The panel also shows estimated
+  Reused / Input and LMCache / GPU tokens in the same window.
+- Uncached prompt tokens per request and actual prefill tokens per forward.
+- Prefill batch context tokens: sum of the prefill rows' logical context lengths
+  through the current chunk, including cached and previously computed prefixes.
+- Prefill request context tokens: one sample per prefill row on every real forward.
+  For an 80K cached prefix plus a 4K chunk, context is 84K while actual prefill work
+  is 4K. Later chunks contribute new samples; future prompt chunks, decode rows,
+  and graph padding are excluded. These CPU scheduler metrics are available even
+  when GPU event timing is disabled.
+- Decode batch context tokens: sum of logical sequence lengths per real batch.
+- Decode request context tokens: one context-length sample per real request row
+  on every decode forward. Requests participating in more forwards contribute
+  more samples; this is not one observation per request lifetime.
+- Prefill and Decode GPU forward: per-worker device-event duration, including
+  stream communication/waits; PP samples cover each local stage, not the full pipeline.
 
 Mean, P50, P90, P95, and P99 can be toggled globally or per chart. The report also
 supports hiding charts, time-range selection, a data table, and CSV export.
+All / Prefill / Decode buttons filter both charts and metric selection buttons;
+CSV exports follow that selection. In All view, shared metrics align Prefill on
+the left and Decode on the right, followed by the remaining metrics. Individual
+chart and series selections are retained when switching roles. Small screens
+stack charts in the same order.
+The global Statistics controls contain only Mean, P50, P90, P95, and P99.
+Queue and KV state controls stay inside their own panels. Units are milliseconds,
+requests, tokens, or percent as indicated on each chart and in the CSV.
+The existing KV utilization panels also display summed Used / Total block
+counts for the latest point in the selected range, or the hovered point.
+Their data tables and CSV include the raw counts with unit `blocks`.
+
+Independent Prefill/Decode instance selectors use host:port addresses, including
+multiple services on one machine. The default pools all instances. Selecting an
+instance updates charts, counts, tables and CSV (`instance` column); missing data
+stays missing. Configured unavailable targets remain selectable. Mesh TTFT stays
+global. Instance percentiles are computed from grouped histogram buckets; global
+percentiles and ratios pool raw observations/counts rather than averaging
+instance quantiles or percentages. Archived JSON without an instance breakdown
+still renders its aggregate data.
+Cache contributions share the full-input denominator and admission accounting.
+The LMCache numerator is `atom:prefix_cache_offload_tokens_total`, which counts
+supplemental admitted reuse beyond the GPU prefix, rather than physical transfer
+volume or backend lookup success. Disabled LMCache reports zero contribution;
+missing tier telemetry remains unknown, including incomplete instance coverage.
+Pure PD consumers record their own pre-existing prefix once on first-decode
+admission after successful KV receive. Received KV and the producer's inherited
+API cache-hit value are excluded. Cache hits do not measure PD transfer savings:
+the transfer backend may still require a full transfer for its topology/state.
+Use each panel's legend to toggle the three curves independently. Tables and CSV
+include the tier quantities and selected percentage curves.
+See [metric definitions](../../../../docs/metrics_guide.md) for the full metric
+reference and how to add a new metric.
 
 ## Collection lifecycle
 
@@ -46,14 +111,30 @@ user, setup installs Rust 1.94.0 into that cache; `ATOMESH_MESH_RUST_TOOLCHAIN`
 can select another fallback version. These settings pass through the existing
 CI environment handling and are independent of metrics collection.
 
-The TSDB uses temporary node-local storage. Scraping runs every five seconds;
-each plotted point summarizes the preceding 60 seconds. Each invocation uses a
+The TSDB uses temporary node-local storage. Scraping and engine/API snapshots run
+every second (subject to engine progress). Histogram observations accumulate at
+each event, including events between scrapes. Plots use five-second steps;
+histogram points summarize the preceding 60 seconds, while queues and KV panels
+show sampled state. Brief queue peaks between snapshots may be missed.
+Each invocation uses a
 fresh TSDB and counter baselines, so previous benchmark traffic is excluded.
 Collection covers the complete AIPerf invocation, including its warmup and drain.
 API TTFT exposes zero-valued `streaming=true` and `streaming=false` series at
 startup, so the collector can scrape a baseline before the first request.
 Percentiles are histogram estimates; Prefill and Decode percentiles cannot be
 added to obtain Mesh percentiles.
+
+The Latency view also includes **Prefill request GPU forward**. Each worker sums
+the batch forward durations in which a request participates across its initial
+local prefill chunks, then records one sample after all those timings complete.
+Three chunks taking 10, 12 and 8 ms yield one 30 ms request sample. Shared or
+mixed batches contribute their full duration to each participating prefill
+request; this is not exclusive per-request compute time. Inter-chunk queue/KV
+waits are excluded. Missing chunk timings invalidate the entire request sample.
+PP samples cover each local stage, and worker distributions are pooled rather
+than summing rank times. The rolling window selects completed timing samples,
+which may include chunks executed before the window. Instance filters, the five
+statistics, tables and CSV work as for the existing per-forward panel.
 
 After the command finishes, the wrapper waits for a successful scrape from each
 target with a scrape timestamp after the benchmark end, then waits until the
@@ -104,5 +185,17 @@ python .github/scripts/atomesh/observability/export_report.py \
 Python callers can use `collect_report(...)` to fetch data without writing files,
 `write_report(data, output)` to render data, or `generate_report(...)` as a
 convenience API that does both. The JSON interface uses
-Unix timestamps in seconds, latency values in milliseconds, and `null` for
-missing points. See `report-data.example.json` for a small synthetic example.
+Unix timestamps in seconds, values in the panel's `unit` (default `ms` for older
+reports), and `null` for missing points. Gauge panels set `kind` to `queues` or
+`blocks` and use state names as series keys. See `report-data.example.json` for
+a small synthetic latency example.
+KV panels additionally carry `block_counts.used` and `block_counts.total`
+time series; older JSON without these fields displays unavailable counts as a dash.
+Cache panels use `kind: "cache"`, `cache_breakdown: true`, percentage series
+`reuse/gpu/lmcache`, and `cache_counts.reused/prompt/gpu/lmcache` (rolling
+`increase()` estimates, in tokens). Archived cache panels without the breakdown
+flag retain their original GPU-only `hit` and `cache_counts.cached/prompt` meaning.
+Each panel can also supply `instances: {"host:port": {"series": ..., ...}}` with
+the same series/count fields. `meta.instances` lists configured role/instance
+pairs, including unavailable services. Optional `category` and `overview` fields
+control the focus filters.

@@ -6,6 +6,7 @@ import queue
 from typing import ClassVar
 
 from atom.model_engine.sequence import SequenceStatus
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -321,7 +322,7 @@ class EngineUtilityHandler:
             ("UTILITY_RESPONSE", {"cmd": "get_cache_statistics", "result": result})
         )
 
-    def push_metrics(self) -> None:
+    def push_metrics(self, *, scheduler_metrics: bool = True) -> None:
         """Publish this rank's metrics snapshot on the output socket.
 
         Pushed on the engine's own clock rather than answered on demand. The
@@ -333,7 +334,18 @@ class EngineUtilityHandler:
         caller to mistake for its own. Pushing removes the deadline, and with it
         the last off-loop writer on the control socket.
         """
-        self.output_queue.put_nowait(("METRICS", self.collect_metrics()))
+        # Telemetry replies use their own tagged path, never the forward/KV
+        # result queues. No wait for a worker response or device completion.
+        if envs.ATOM_ENABLE_METRICS_DEVICE_TIMER and hasattr(
+            self.runner_mgr, "latest_forward_metrics"
+        ):
+            self.runner_mgr.call_func("collect_forward_metrics")
+        snapshot = self.collect_metrics() if scheduler_metrics else {"enabled": False}
+        snapshot["forward_metrics"] = list(
+            getattr(self.runner_mgr, "latest_forward_metrics", {}).copy().values()
+        )
+        snapshot["role"] = getattr(self.scheduler, "_METRICS_ROLE", "")
+        self.output_queue.put_nowait(("METRICS", snapshot))
 
     def collect_metrics(self) -> dict:
         """One rank's scheduler, KV, MTP, and cache metrics."""
@@ -396,11 +408,30 @@ class EngineUtilityHandler:
                 "offload": offload,
             }
             if kv_pool is not None:
+                reusable = kv_pool.num_reusable_free
                 result |= {
                     "kv_blocks_used": kv_pool.num_used,
                     "kv_blocks_free": kv_pool.num_free,
                     "kv_blocks_total": kv_pool.num_blocks,
                     "kv_blocks_indexed": kv_pool.num_indexed,
+                    "kv_blocks_evictable": reusable,
+                    "kv_blocks_vacant": kv_pool.num_free - reusable,
+                }
+
+            metrics = getattr(self.scheduler, "metrics", None)
+            if metrics is not None:
+                parked = sum(
+                    seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+                    for seq in self.scheduler.waiting
+                )
+                # Shared-cache disaggregation has a separate prefill queue,
+                # whereas connector-based PD parks requests in `waiting`.
+                external = parked + len(getattr(self.scheduler, "prefill_waiting", ()))
+                result["scheduler_metrics"] = {
+                    **metrics.snapshot(),
+                    "running": running,
+                    "waiting": max(0, waiting - external),
+                    "waiting_kv": external,
                 }
 
         return result

@@ -18,6 +18,7 @@ from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
+from atom.model_engine.scheduler_metrics import SchedulerMetrics
 from atom.model_engine.sequence import (
     Sequence,
     SequenceStatus,
@@ -47,7 +48,7 @@ logger = logging.getLogger("atom")
 # How often each EngineCore publishes its metrics snapshot. Kept at the API
 # server's scrape interval: the exporter reads a cache, so this bounds how
 # stale a Prometheus sample can be.
-METRICS_PUSH_INTERVAL_S = 5.0
+METRICS_PUSH_INTERVAL_S = 1.0
 
 # Pace of the idle KV drain. The busy loops never block, so an unpaced drain
 # would fire one worker RPC round per spin; 1ms matches the PP head's existing
@@ -413,6 +414,7 @@ class EngineCore:
         has_seqs = len(scheduled_batch.req_ids) > 0
         if has_seqs:
             self.scheduler.compute_detailed_aggregates(scheduled_batch, seqs)
+            self.scheduler.metrics.record_forward(scheduled_batch, seqs)
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )
@@ -613,6 +615,7 @@ class EngineCore:
                 for sock, _ in poller.poll():
                     # (RequestType, RequestData)
                     obj = sock.recv(copy=False)
+                    received_at = time.perf_counter()
                     try:
                         request_type, reqs = pickle.loads(obj)
                     except Exception:
@@ -628,6 +631,8 @@ class EngineCore:
                         )
                         continue
                     if request_type == EngineCoreRequestType.ADD:
+                        for req in reqs:
+                            SchedulerMetrics.enqueue(req, received_at=received_at)
                         req_ids = [req.id for req in reqs]
                         logger.debug(
                             f"{self.label}: input get {request_type} {req_ids}"
@@ -1059,6 +1064,7 @@ class PrefillEngineCore(EngineCore):
             return False
 
         # Run on the dedicated prefill stream; returns sampled token IDs (one per seq).
+        self.scheduler.metrics.record_forward(scheduled_batch, seqs)
         t0 = time.perf_counter()
         sampled_token_ids = self.runner_mgr.call_func(
             "prefill_forward", scheduled_batch, wait_out=True
@@ -1331,6 +1337,7 @@ class DecodeEngineCore(EngineCore):
         scheduled_batch, seqs = result
         if scheduled_batch is None:
             return False
+        self.scheduler.metrics.record_forward(scheduled_batch, seqs)
         t0 = time.perf_counter()
         fwd_out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
         iter_ms = (time.perf_counter() - t0) * 1000
