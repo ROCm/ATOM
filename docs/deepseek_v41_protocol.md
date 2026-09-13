@@ -1,7 +1,7 @@
 # DeepSeek-V4.1 chat, tools and reasoning
 
 P06 enables the native V4.1 text protocol on the Python OpenAI-compatible
-entrypoints. ATOM loads the checkpoint's standalone encoding/encoding.py when
+entrypoints and the Rust mesh tool parser. ATOM loads the checkpoint's standalone encoding/encoding.py when
 config.json declares model_type="deepseek_v41". Keep that directory alongside
 the tokenizer and weights. An ambiguous encoder directory is rejected by the
 existing discovery policy.
@@ -54,6 +54,13 @@ It is detected once from the rendered tools prompt, and can be selected
 explicitly with --tool-call-parser dsml_v41. The original dsml selection keeps
 V4's tag spelling.
 
+The Rust mesh registry also exposes dsml_v41. Specific DeepSeek-V4.1 model
+mappings precede the V4 family mapping. Both dialects share DsmlParser's
+streaming state machine; only markers differ. Typed JSON parameters wait for
+their closing parameter tag, and partial string values preserve whitespace.
+Python and Rust consume the same fixtures for qualified names, nested JSON,
+null/boolean values, Unicode, multiple calls and arbitrary valid UTF-8 splits.
+
 ```xml
 <｜DSML｜ calls>
 <｜DSML｜ invoke name="math::add">
@@ -83,6 +90,10 @@ decoding in this phase.
 ## Validation
 
 On ljin_dev with the local pinned checkpoint:
+
+- Rust mesh tool-parser regression: 107 passed, including the existing V4
+  parser and V4.1 shared fixtures at every UTF-8 boundary and character stream.
+  The same fixture file passes the Python streaming/complete parser checks.
 
 - 2,282 entrypoint tests passed; 56 skipped and 3 expected failures. The skips
   are 21 opt-in HTTP server integration tests and 35 inapplicable combinations
