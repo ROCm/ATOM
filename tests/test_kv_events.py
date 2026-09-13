@@ -10,7 +10,8 @@ Covers:
   * `take_events()` drain semantics
   * `clear_cache()` emits AllBlocksCleared
   * `record_remote_store()` emits BlockStored(medium=REMOTE)
-  * ZmqEventPublisher PUB→SUB round-trip
+  * ZmqEventPublisher PUB→SUB round-trip, `[topic, seq, payload]` framing,
+    per-DP-rank endpoint offset
   * NullEventPublisher is a no-op
 """
 
@@ -33,6 +34,7 @@ from atom.distributed.kv_events import (
     NullEventPublisher,
     ZmqEventPublisher,
     make_publisher,
+    offset_endpoint_port,
 )
 from atom.model_engine.block_manager import BlockManager
 
@@ -339,20 +341,67 @@ class TestPublisher:
         try:
             sub.setsockopt(zmq.SUBSCRIBE, b"")
             sub.connect(endpoint)
-            decoder = msgspec.msgpack.Decoder(EventBatch)
-            payload: bytes | None = None
-            for _ in range(10):
-                pub.publish([BlockRemoved(block_hashes=[7])])
-                if sub.poll(timeout=200):
-                    payload = sub.recv()
-                    break
-            assert payload is not None, "SUB did not receive any batch"
-            batch = decoder.decode(payload)
+            topic, seq_bytes, payload = _first_frames(
+                pub, sub, BlockRemoved(block_hashes=[7])
+            )
+            assert topic == b""
+            assert len(seq_bytes) == 8
+            batch = msgspec.msgpack.Decoder(EventBatch).decode(payload)
             assert len(batch.events) == 1
             assert isinstance(batch.events[0], BlockRemoved)
         finally:
             sub.close(linger=0)
             pub.shutdown()
+
+    def test_wire_frames_are_topic_seq_payload(self):
+        # vLLM layout: [topic, uint64 big-endian seq, msgpack EventBatch], with
+        # seq advancing by one per published batch.
+        zmq = pytest.importorskip("zmq")
+        endpoint = "inproc://test-kv-events-frames"
+        topic = b"kv@10.0.0.1@model"
+        pub = ZmqEventPublisher(
+            endpoint=endpoint, topic=topic.decode(), buffer_steps=16
+        )
+        ctx = zmq.Context.instance()
+        sub = ctx.socket(zmq.SUB)
+        try:
+            sub.setsockopt(zmq.SUBSCRIBE, b"kv@")
+            sub.connect(endpoint)
+            decoder = msgspec.msgpack.Decoder(EventBatch)
+            first = _first_frames(pub, sub, BlockRemoved(block_hashes=[0]))
+            assert first[0] == topic
+            first_seq = int.from_bytes(first[1], "big")
+            for expected in range(first_seq + 1, first_seq + 4):
+                pub.publish([BlockRemoved(block_hashes=[expected])])
+                assert sub.poll(timeout=2000), f"batch {expected} not received"
+                frames = sub.recv_multipart()
+                assert len(frames) == 3
+                assert frames[0] == topic
+                assert len(frames[1]) == 8
+                assert int.from_bytes(frames[1], "big") == expected
+                batch = decoder.decode(frames[2])
+                assert batch.events[0].block_hashes == [expected]
+        finally:
+            sub.close(linger=0)
+            pub.shutdown()
+
+    def test_dropped_batches_consume_seq(self):
+        # Stopped sender + buffer_steps=1: publishes 0 and 1 are dropped on
+        # overflow, and the surviving queued batch carries seq 2.
+        pytest.importorskip("zmq")
+        pub = ZmqEventPublisher(
+            endpoint="inproc://test-kv-events-seq-gap", buffer_steps=1
+        )
+        pub._queue.put_nowait(None)
+        pub._sender.join(timeout=2.0)
+        try:
+            for i in range(3):
+                pub.publish([BlockRemoved(block_hashes=[i])])
+            seq, _ = pub._queue.get_nowait()
+            assert seq == 2
+            assert pub.stats["dropped"] == 2
+        finally:
+            pub._socket.close(linger=0)
 
     def test_publish_drops_oldest_on_overflow(self):
         # buffer_steps=1 + stopped sender => every publish past the first must
@@ -390,3 +439,56 @@ class TestPublisher:
             assert pub.stats["sent"] == 0
         finally:
             pub.shutdown()
+
+
+# ── Endpoint offset ────────────────────────────────────────────────────────
+
+
+class TestOffsetEndpointPort:
+    @pytest.mark.parametrize(
+        ("endpoint", "rank", "expected"),
+        [
+            ("tcp://*:5557", 0, "tcp://*:5557"),
+            ("tcp://*:5557", 3, "tcp://*:5560"),
+            ("tcp://0.0.0.0:5557", 1, "tcp://0.0.0.0:5558"),
+            ("tcp://[::1]:5557", 2, "tcp://[::1]:5559"),
+            ("inproc://kv", 2, "inproc://kv_dp2"),
+            ("ipc:///tmp/kv.sock", 1, "ipc:///tmp/kv.sock_dp1"),
+        ],
+    )
+    def test_offsets(self, endpoint, rank, expected):
+        assert offset_endpoint_port(endpoint, rank) == expected
+
+    def test_tcp_without_numeric_port_rejected(self):
+        with pytest.raises(ValueError):
+            offset_endpoint_port("tcp://host", 1)
+
+    def test_publisher_binds_rank_offset_endpoint(self):
+        # Two ranks on one base endpoint bind distinct sockets, and the rank-1
+        # stream is reachable at the offset address.
+        zmq = pytest.importorskip("zmq")
+        base = "inproc://test-kv-events-dp"
+        rank0 = ZmqEventPublisher(endpoint=base, buffer_steps=4, data_parallel_rank=0)
+        rank1 = ZmqEventPublisher(endpoint=base, buffer_steps=4, data_parallel_rank=1)
+        ctx = zmq.Context.instance()
+        sub = ctx.socket(zmq.SUB)
+        try:
+            sub.setsockopt(zmq.SUBSCRIBE, b"")
+            sub.connect(offset_endpoint_port(base, 1))
+            _, _, payload = _first_frames(rank1, sub, BlockRemoved(block_hashes=[1]))
+            batch = msgspec.msgpack.Decoder(EventBatch).decode(payload)
+            assert batch.data_parallel_rank == 1
+        finally:
+            sub.close(linger=0)
+            rank0.shutdown()
+            rank1.shutdown()
+
+
+def _first_frames(pub: ZmqEventPublisher, sub, event) -> list[bytes]:
+    """Publish `event` until the SUB (a slow joiner) sees a batch; return its
+    frames."""
+    for _ in range(20):
+        pub.publish([event])
+        if sub.poll(timeout=200):
+            return sub.recv_multipart()
+    raise AssertionError("SUB did not receive any batch")
