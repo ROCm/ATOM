@@ -8,8 +8,8 @@ This entry point is for development and numerical comparison.
 ## Run
 
 Use a ROCm environment with ATOM and AITER installed and the native checkpoint
-available locally. The tested setup uses MI355X and TP8; a shorter full-model
-probe also ran under TP4.
+available locally. The latest complete independent numerical comparison uses
+MI355X and TP4. TP8 also has parameter-layout and collective regression coverage.
 
 ```bash
 torchrun --standalone --nproc_per_node=8 \
@@ -21,6 +21,8 @@ torchrun --standalone --nproc_per_node=8 \
 
 The example accepts one raw text prefix. It owns the parallel group, prepares
 Engram rows through the host provider, and maintains a private eager cache.
+It selects RCCL collectives through AITER's initialization API because the
+current custom collective path fails repeated-input checks for this workload.
 Chat/tool encoding, vision, serving batches, paging, graph execution and
 speculative decoding are separate milestones.
 
@@ -47,8 +49,7 @@ The four global cache owners are layers 2, 8, 14 and 20. Reuse layers share
 their owner's values and top-k; Reindex layers score only the supplied compact
 candidate blocks. All attention caches contain BF16 values after the original
 FP8/FP4 quantization and dequantization steps. Attention calls the existing V4
-BF16 paged prefill/decode entry points with
-unchanged dispatch and kernels. The earlier fixed-64 tile override was removed.
+BF16 paged prefill/decode entry points with unchanged dispatch and kernels.
 The cache owns a fixed BF16 row pool: one SWA ring per layer and one global
 region per owner. Prefill reads the prior ring and current chunk separately;
 decode writes its current row before reading the pool. Both use V4's existing
@@ -57,8 +58,12 @@ ring writer. No forward step concatenates the complete global KV history.
 it contains no attention computation.
 
 Weights retain native FP8 32x32 or FP4 1x32 storage. The correctness GEMM converts
-register tiles for BF16 MFMA, retaining FP8 activation quantization. Routed
-experts use whole-expert partitioning; the shared expert uses TP with FP32
+register tiles for BF16 MFMA and keeps scaled block sums in FP64 until output
+conversion, retaining FP8 activation quantization. V4.1 RMSNorm uses the
+published FP32 evaluation order at the intermediate quantization boundaries.
+Index-key normalization uses a small V4/AITER leaf after complete task
+regression; final normalization also uses V4/AITER. Routed experts use
+whole-expert partitioning; the shared expert uses TP with FP32
 partials and rounds after reduction. The eager dispatch still synchronizes
 expert counts to the CPU. Packed caches, native FP8 MFMA, fused dispatch and
 performance tuning remain pending.
@@ -90,44 +95,12 @@ An isolated run of the official TileLang HIP attention also checked the
 unmodified V4 kernels at 5/192/640 entries. The maximum observed relative L2 was
 0.002461 for decode and 0.001203 for prefill across those cases.
 
-The current paged V4 path completed an independent TP8 full-weight comparison
-using one loaded block at a time, without aligning GEMMs, attention, norms or
-collective implementations. All 40 layers ran for five fixtures and 20 calls;
-peak allocated HBM was 6.46 GiB per rank. Across 248 scored next-token positions,
-top-1 agreement was 238/248, target mean NLL 1.329078 and reference mean NLL
-1.333321. Per-call logits relative L2 ranged from 0.103 to 0.604. These results
-leave the full-model numerical/quality gate open; aggregate NLL is not sufficient
-to close it. Streaming is an external diagnostic, not a model execution feature.
+The independent resident-model comparison and paired lm-eval results are
+recorded in [deepseek_v41_validation.md](deepseek_v41_validation.md), together
+with reproducible commands and the remaining quality gate. These runs execute
+all 40 layers with real checkpoint weights, Engram and all QAT operations.
 
-Earlier full-weight results below describe assembly commit `446d5a03a`, before
-the switch from the generic helper to paged V4 attention. They are historical
-evidence, not acceptance of the current backend:
-
-- Five fixtures (English, Chinese, code, Unicode and a 200-token window-boundary
-  sequence) cover 20 prefill/decode calls. Every layer residual and final logit
-  matches exactly when both model graphs use the same GEMM, attention, norm,
-  shared-expert K partition and collective reduction order. This validates model
-  composition and state flow; it is not an independent kernel or quality gate.
-- With the original independent PyTorch GEMM/attention oracle, the same corpus
-  has 248 scored next-token positions: target mean NLL 1.284154, reference
-  mean NLL 1.333241, top-1 agreement 235/248. At reference margins
-  above 0.1, agreement is 235/246. Cross-backend numerical
-  acceptance remains open despite the lower aggregate target NLL.
-- A temporary lm_eval adapter ran GSM8K, five-shot, greedy, on four examples.
-  Both strict and flexible exact-match scores were 4/4. This is a smoke test;
-  it does not establish a model-quality score or replace paired evaluation.
-
-The earlier short real-weight probe isolated a one-element BF16 attention
-difference and FP32 collective reduction differences that accumulate through
-quantized layers. With paged attention, the reference and production kernels
-also differ in KV tile and region accumulation order. Full-model numerical and
-quality acceptance remains open. Long contexts that exercise top-512 pruning
-and the complete serving state lifecycle still need their own acceptance checks.
-
-A GPU graph microbenchmark on MI355X measured decode attention plus the former
-full-history KV concatenation, with H=8, D=512 and 640 selected entries. At 8192
-history rows, median latency changed from 157.8 to 7.8 microseconds for batch 1,
-and from 245.7 to 9.3 microseconds for batch 16, over three measurements. The
-baseline is the helper from `446d5a03a`; the new case reads the existing pool.
-Index preparation, ring writes, projections, MoE and serving are excluded.
-These measurements are not end-to-end latency or throughput results.
+The numerical corpus includes a 2,049-token case crossing top-512 selection;
+separate indexer tests exercise 32,771 keys and actual candidate-block pruning.
+This is not a full-model 32K or 1M-context validation. The serving request
+lifecycle belongs to P05.
