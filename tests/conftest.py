@@ -70,6 +70,8 @@ class MockConfig:
             "eos_token_id": 2,
             "stop_token_ids": [],
             "scheduler_delay_factor": 0.0,
+            "scheduling_policy": "fcfs",
+            "sjf_max_skip_steps": 64,
             "speculative_config": None,
             # Scheduler.__init__ reads config.hf_config.architectures for V4
             # SWA-warmup detection; a non-V4 stub keeps that path inert.

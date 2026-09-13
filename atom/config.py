@@ -1572,6 +1572,17 @@ class Config:
     # `BlockManager._record_checkpoint_demand` for the placement.
     state_checkpoint_demand: bool = True
     scheduler_delay_factor: float = 0.0
+    # Order in which waiting requests are admitted to prefill.
+    #   "fcfs"  arrival order (the historical behaviour)
+    #   "sjf"   shortest-job-first: fewest uncached prompt tokens first, which
+    #           lowers p90 TTFT at the cost of the longest requests' TTFT.
+    # See Scheduler._reorder_waiting_shortest_first.
+    scheduling_policy: str = "fcfs"
+    # Under "sjf", a waiting request skipped this many scheduling steps is
+    # promoted to the front regardless of length, bounding the starvation the
+    # policy would otherwise allow. 0 removes the bound (pure shortest-job-
+    # first). Ignored under "fcfs".
+    sjf_max_skip_steps: int = 64
     max_num_seqs: int = 512
     max_model_len: int | None = None
     gpu_memory_utilization: float = 0.9

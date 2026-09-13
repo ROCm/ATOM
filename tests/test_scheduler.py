@@ -1337,6 +1337,175 @@ class TestLongPrefillTokenThreshold:
         assert list(batch2.num_scheduled_tokens) == [8]
 
 
+# ── shortest-job-first prefill ordering ───────────────────────────────────
+
+
+class TestSJFScheduling:
+    """`scheduling_policy="sjf"` orders waiting prefills by remaining work.
+
+    Every scheduler here uses max_num_seqs=1 so exactly one prefill is issued
+    per step and the batch contents read as an ordering assertion.
+    """
+
+    @staticmethod
+    def _sched(**overrides):
+        cfg = {
+            "num_kvcache_blocks": 400,
+            "kv_cache_block_size": 4,
+            "max_num_seqs": 1,
+            "max_num_batched_tokens": 1000,
+            "max_model_len": 1024,
+            "scheduling_policy": "sjf",
+        }
+        cfg.update(overrides)
+        return Scheduler(MockConfig(**cfg))
+
+    def test_short_request_preempts_queue_position_of_earlier_long_request(
+        self, seq_factory
+    ):
+        """The whole point: a 10-token prompt that arrived second prefills
+        first, so its TTFT is not held hostage by a 100-token prompt."""
+        sched = self._sched()
+        long_seq = seq_factory(list(range(100)))
+        short_seq = seq_factory(list(range(200, 210)))
+        sched.add(long_seq)
+        sched.add(short_seq)
+
+        _, scheduled = sched.schedule()
+
+        assert list(scheduled) == [short_seq.id]
+
+    def test_fcfs_is_the_default_and_keeps_arrival_order(self, seq_factory):
+        """The policy is opt-in; unset config must schedule the long prompt
+        first, exactly as before this feature existed."""
+        sched = self._sched(scheduling_policy="fcfs")
+        long_seq = seq_factory(list(range(100)))
+        short_seq = seq_factory(list(range(200, 210)))
+        sched.add(long_seq)
+        sched.add(short_seq)
+
+        _, scheduled = sched.schedule()
+
+        assert list(scheduled) == [long_seq.id]
+
+    def test_equal_length_requests_keep_arrival_order(self, seq_factory):
+        """The sort is stable, so SJF never reshuffles same-cost requests."""
+        sched = self._sched()
+        first = seq_factory(list(range(10)))
+        second = seq_factory(list(range(100, 110)))
+        sched.add(first)
+        sched.add(second)
+
+        _, scheduled = sched.schedule()
+
+        assert list(scheduled) == [first.id]
+
+    def test_long_request_is_promoted_once_skipped_too_many_times(self, seq_factory):
+        """SJF alone starves the longest prompt under a stream of short ones.
+        After `sjf_max_skip_steps` passes it jumps the queue unconditionally,
+        which is what bounds its worst-case TTFT.
+
+        Budget (not max_num_seqs) throttles this to one prefill per step, so
+        `running` filling up never confounds the ordering.
+        """
+        sched = self._sched(
+            max_num_seqs=8,
+            max_num_batched_tokens=10,
+            sjf_max_skip_steps=2,
+        )
+        long_seq = seq_factory(list(range(100)))
+        sched.add(long_seq)
+
+        order = []
+        for i in range(3):
+            sched.add(seq_factory(list(range(200 + 20 * i, 210 + 20 * i))))
+            _, scheduled = sched.schedule()
+            order.append(list(scheduled))
+
+        # Steps 1 and 2 serve the short arrivals; on step 3 the long request
+        # has been skipped twice and takes the slot.
+        assert order[2] == [long_seq.id]
+        assert long_seq.id not in order[0] + order[1]
+
+    def test_a_step_that_schedules_no_prefill_does_not_age_the_queue(self, seq_factory):
+        """A KV-starved step passes over nobody — every request is equally
+        stuck. Counting it as a skip would let a stall promote the whole queue
+        to the front tier at once, collapsing SJF back into FCFS.
+        """
+        # 25 blocks of 4 tokens: a 100-token prompt is admissible but consumes
+        # the entire pool, so the next arrival cannot allocate at all.
+        sched = self._sched(
+            num_kvcache_blocks=25, max_model_len=128, sjf_max_skip_steps=1
+        )
+        hog = seq_factory(list(range(100)))
+        sched.add(hog)
+        _, scheduled = sched.schedule()
+        assert list(scheduled) == [hog.id], "setup: the hog must take the pool"
+
+        stalled = seq_factory(list(range(200, 300)))
+        sched.add(stalled)
+        _, scheduled = sched.schedule()
+
+        assert scheduled == {}, "setup: no prefill may be scheduled this step"
+        assert stalled.num_skipped_steps == 0
+
+    def test_zero_max_skip_steps_disables_the_starvation_bound(self, seq_factory):
+        """`sjf_max_skip_steps=0` is pure shortest-job-first: no promotion, so
+        a long prompt yields to short arrivals indefinitely. Documented as a
+        deliberate setting rather than a degenerate one -- it is the sharpest
+        p90 win available and the least fair.
+        """
+        sched = self._sched(
+            max_num_seqs=8, max_num_batched_tokens=10, sjf_max_skip_steps=0
+        )
+        long_seq = seq_factory(list(range(100)))
+        sched.add(long_seq)
+
+        served = []
+        for i in range(4):
+            sched.add(seq_factory(list(range(200 + 20 * i, 210 + 20 * i))))
+            _, scheduled = sched.schedule()
+            served.extend(scheduled)
+
+        assert long_seq.id not in served
+
+    def test_preempted_request_is_retried_before_shorter_newcomers(self, seq_factory):
+        """`preempt` puts its victim at the head on purpose -- it has already
+        burned a forward pass and its KV was just thrown away. Sorting it back
+        behind every shorter arrival would re-preempt it indefinitely, so a
+        preempted request joins the front tier.
+        """
+        sched = self._sched(max_num_seqs=8, max_num_batched_tokens=10)
+        victim = seq_factory(list(range(100)))
+        sched.add(victim)
+        _, scheduled = sched.schedule()
+        assert list(scheduled) == [victim.id], "setup: victim must run first"
+
+        sched.running.remove(victim)
+        sched.preempt(victim)
+        sched.add(seq_factory(list(range(200, 210))))
+
+        _, scheduled = sched.schedule()
+
+        assert list(scheduled) == [victim.id]
+
+    def test_preemption_flag_clears_once_the_victim_runs_again(self, seq_factory):
+        """The front tier is a one-shot retry, not a permanent promotion --
+        otherwise any request that was ever preempted outranks SJF forever.
+        """
+        sched = self._sched(max_num_seqs=8, max_num_batched_tokens=10)
+        victim = seq_factory(list(range(100)))
+        sched.add(victim)
+        sched.schedule()
+        sched.running.remove(victim)
+        sched.preempt(victim)
+        assert victim.is_preempted is True
+
+        sched.schedule()
+
+        assert victim.is_preempted is False
+
+
 # ── prefix caching ────────────────────────────────────────────────────────
 
 
@@ -2182,3 +2351,19 @@ class TestTheTierSplitPartitionsServedReuse:
         with caplog.at_level(logging.INFO, logger="atom"):
             s._log_pools()
         assert not any("[Cache Tiers]" in r.getMessage() for r in caplog.records)
+
+
+class TestSchedulingPolicyValidation:
+    """An unrecognised policy must fail loudly. Both schedulers compare the
+    string to "sjf", so a typo would otherwise degrade to FCFS in silence --
+    the operator sets a flag, sees no error, and gets none of the behaviour."""
+
+    def test_unknown_policy_is_rejected(self):
+        with pytest.raises(ValueError, match="scheduling_policy"):
+            Scheduler(MockConfig(scheduling_policy="SJF"))
+
+    def test_prefill_scheduler_rejects_unknown_policy(self):
+        from atom.model_engine.scheduler import PrefillScheduler
+
+        with pytest.raises(ValueError, match="scheduling_policy"):
+            PrefillScheduler(MockConfig(scheduling_policy="shortest"))

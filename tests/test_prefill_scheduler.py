@@ -219,3 +219,62 @@ def test_schedule_records_prompt_throughput(seq_factory):
     assert sched.engine_stats.num_prompt_tokens == 4
     # Prefill produces no sampled tokens.
     assert sched.engine_stats.num_generation_tokens == 0
+
+
+# ── shortest-job-first ordering ───────────────────────────────────────────
+
+
+def _sjf_scheduler(**overrides):
+    from atom.model_engine.scheduler import PrefillScheduler
+
+    cfg = {"scheduling_policy": "sjf", "max_num_seqs": 1}
+    cfg.update(overrides)
+    return PrefillScheduler(MockConfig(**cfg))
+
+
+def test_sjf_runs_the_shorter_ready_prefill_first(seq_factory):
+    """Disaggregated prefill is where ordering pays twice: the short request
+    finishes sooner AND its decode reaches the decode node's batch sooner,
+    instead of waiting out a long prompt's prefill."""
+    sched = _sjf_scheduler()
+    long_seq = seq_factory(list(range(40)))
+    short_seq = seq_factory(list(range(200, 204)))
+    sched.extend([long_seq, short_seq])
+    long_seq.block_table = [0]
+    short_seq.block_table = [1]
+
+    _, seqs = sched.schedule()
+
+    assert list(seqs) == [short_seq.id]
+
+
+def test_fcfs_remains_the_default_for_prefill_scheduler(seq_factory):
+    sched = _sjf_scheduler(scheduling_policy="fcfs")
+    long_seq = seq_factory(list(range(40)))
+    short_seq = seq_factory(list(range(200, 204)))
+    sched.extend([long_seq, short_seq])
+    long_seq.block_table = [0]
+    short_seq.block_table = [1]
+
+    _, seqs = sched.schedule()
+
+    assert list(seqs) == [long_seq.id]
+
+
+def test_sjf_promotes_a_repeatedly_skipped_prefill(seq_factory):
+    """Same starvation bound as the colocated scheduler."""
+    sched = _sjf_scheduler(sjf_max_skip_steps=2)
+    long_seq = seq_factory(list(range(40)))
+    long_seq.block_table = [0]
+    sched.add(long_seq)
+
+    order = []
+    for i in range(3):
+        short = seq_factory(list(range(200 + 10 * i, 204 + 10 * i)))
+        short.block_table = [i + 1]
+        sched.add(short)
+        _, seqs = sched.schedule()
+        order.append(list(seqs))
+
+    assert order[2] == [long_seq.id]
+    assert long_seq.id not in order[0] + order[1]

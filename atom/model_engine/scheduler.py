@@ -122,6 +122,57 @@ def _optimal_cu_fraction(
         return 0.5
 
 
+SCHEDULING_POLICIES = ("fcfs", "sjf")
+
+
+def validate_scheduling_policy(policy: str) -> str:
+    """Refuse a policy name no scheduler implements.
+
+    Both schedulers select behaviour with `policy == "sjf"`, so an unknown
+    value would otherwise mean FCFS with no diagnostic -- the operator sets the
+    flag, sees the engine start, and gets none of the ordering.
+    """
+    if policy not in SCHEDULING_POLICIES:
+        raise ValueError(
+            f"scheduling_policy must be one of {SCHEDULING_POLICIES}, got {policy!r}"
+        )
+    return policy
+
+
+def shortest_first_key(
+    seq: Sequence, max_skip_steps: int, block_manager: BlockManager | None = None
+) -> tuple[int, int]:
+    """Waiting-queue sort key for `scheduling_policy="sjf"`.
+
+    Two tiers. The front tier holds requests that must not be reordered by
+    length -- a preemption victim, which has already spent a forward pass and
+    had its KV thrown away, and any request skipped `max_skip_steps` times,
+    which is the bound on how long SJF may starve a long prompt. Everything
+    else is ranked by remaining prefill work.
+
+    "Remaining" means after prefix reuse. A fresh waiter owns no blocks and
+    carries `num_cached_tokens == 0`, so `block_manager` is asked what the cache
+    can actually serve it. A waiter that already owns blocks -- an offload resume
+    or a parked partial prefill, and every request in the disaggregated
+    `PrefillScheduler`'s ready set -- instead uses its own computed-token count:
+    that KV is real whether or not it is reachable through the prefix index, so
+    probing would under-report it. Pass `block_manager=None` to skip the probe.
+
+    Both tiers sort stably, so equal-cost requests keep arrival order and the
+    policy degrades to FCFS on a uniform workload.
+
+    Shared by `Scheduler` and `PrefillScheduler`, which are separate classes
+    with separate waiting queues but the same ordering rule.
+    """
+    if seq.is_preempted or 0 < max_skip_steps <= seq.num_skipped_steps:
+        return (0, 0)
+    if block_manager is not None and not seq.block_table:
+        cached = block_manager.prefix_cached_tokens(seq)
+    else:
+        cached = seq.num_cached_tokens
+    return (1, seq.num_tokens - cached)
+
+
 class ScheduledBatch:
     """Immutable snapshot of sequences selected for a single forward pass.
 
@@ -540,6 +591,8 @@ class Scheduler:
         self._detailed_annotation_enabled = envs.ATOM_ENABLE_DETAILED_ANNOTATION
 
         self.enable_chunked_prefill = config.enable_chunked_prefill
+        self.scheduling_policy = validate_scheduling_policy(config.scheduling_policy)
+        self.sjf_max_skip_steps = config.sjf_max_skip_steps
         # Running seqs currently mid-prefill; counter lets schedule() skip the
         # running-queue scan on pure-decode steps.
         self._partial_prefill_count: int = 0
@@ -1174,6 +1227,10 @@ class Scheduler:
         num_scheduled_tokens: list[int] = []
         scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
 
+        # Ordering first, then the two passes that move specific requests to
+        # the front for correctness — their invariants must survive the sort,
+        # so they run after it, not before.
+        self._reorder_waiting_shortest_first()
         self._promote_ready_remote_kv_requests()
         self._park_ready_offload_partial_prefills()
 
@@ -1515,6 +1572,8 @@ class Scheduler:
                 len(skipped_waiting_requests),
             )
             self.waiting.extend(skipped_waiting_requests)
+
+        self._age_waiting_requests(num_seqs_prefill)
 
         if self._num_parked_remote_kv > 0 and self._schedule_tick % 1000 == 0:
             logger.info(
@@ -2163,6 +2222,9 @@ class Scheduler:
         num_batched_tokens += chunk
         seq.status = SequenceStatus.RUNNING
         seq.type = SequenceType.PREFILL
+        # Admitted: both front-tier claims are spent.
+        seq.is_preempted = False
+        seq.num_skipped_steps = 0
         self.running.append(seq)
         scheduled_seqs[seq.id] = seq
         num_scheduled_tokens.append(chunk)
@@ -2395,6 +2457,9 @@ class Scheduler:
         # surrendered blocks (the mutator half of `should_defer_free`'s escape).
         self._connector_release_stalled_save(seq)
         self.block_manager.deallocate(seq)
+        # `appendleft` alone no longer guarantees the head: under "sjf" the
+        # next step re-sorts the queue. The flag is what survives that.
+        seq.is_preempted = True
         self.waiting.appendleft(seq)
         return True
 
@@ -3107,6 +3172,50 @@ class Scheduler:
                 )
         return True
 
+    def _reorder_waiting_shortest_first(self) -> None:
+        """Order the waiting queue by remaining prefill work, cheapest first.
+
+        The cost of a request is its uncached token count -- what prefill
+        actually still has to compute, after prefix reuse. A fresh waiter has
+        `num_cached_tokens == 0` until it runs a chunk, so the key would read a
+        cache-hot 20k prompt as 20k of work; `prefix_cached_tokens` probes the
+        live cache read-only instead, under the same SWA/state-checkpoint gate
+        admission uses, so an unresumable prefix is not counted as free.
+
+        Hits are re-probed every sort rather than memoised: an admission earlier
+        in the same pass can evict the blocks a later waiter matched.
+
+        The probe costs one chained-hash walk per fresh waiter per scheduling
+        pass. That is charged to `sjf` alone -- the early return below is what
+        keeps FCFS off this path entirely.
+
+        The sort is stable, so requests of equal cost keep arrival order and
+        the policy degrades to FCFS on a uniform workload.
+        """
+        if self.scheduling_policy != "sjf" or len(self.waiting) < 2:
+            return
+        bm = self.block_manager
+        self.waiting = deque(
+            sorted(
+                self.waiting,
+                key=lambda seq: shortest_first_key(seq, self.sjf_max_skip_steps, bm),
+            )
+        )
+
+    def _age_waiting_requests(self, num_seqs_prefill: int) -> None:
+        """Charge a skip to everything still waiting after an admitting step.
+
+        Gated on a prefill having actually been scheduled: on a step where the
+        engine admitted nobody -- KV exhausted, budget gone, delayer holding --
+        no request was passed over in favour of another, and counting it would
+        let a stall age the whole queue into the front tier at once, which is
+        just FCFS with extra steps.
+        """
+        if self.scheduling_policy != "sjf" or not num_seqs_prefill:
+            return
+        for seq in self.waiting:
+            seq.num_skipped_steps += 1
+
     def _promote_ready_remote_kv_requests(self) -> None:
         """Move completed remote-KV waiters ahead of fresh admissions.
 
@@ -3403,6 +3512,8 @@ class PrefillScheduler:
         self.block_manager = None  # blocks managed by decode process
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        self.scheduling_policy = validate_scheduling_policy(config.scheduling_policy)
+        self.sjf_max_skip_steps = config.sjf_max_skip_steps
         # spec decode not used on prefill side
         self.use_spec = False
         self.spec_decode_local = False
@@ -3490,6 +3601,10 @@ class PrefillScheduler:
         with self._pending_lock:
             # Collect ready sequences (have received BlockAssignment from decode)
             ready = [s for s in self.waiting if s.block_table]
+            if self.scheduling_policy == "sjf" and len(ready) > 1:
+                ready.sort(
+                    key=lambda seq: shortest_first_key(seq, self.sjf_max_skip_steps)
+                )
 
             for seq in ready:
                 if num_seqs >= self.max_num_seqs:
@@ -3505,6 +3620,13 @@ class PrefillScheduler:
                 num_scheduled_tokens.append(num_new_tokens)
                 num_batched_tokens += num_new_tokens
                 num_seqs += 1
+
+            # Only the ready set can be "passed over" -- a sequence still
+            # awaiting its BlockAssignment was never a candidate this step.
+            if self.scheduling_policy == "sjf" and num_seqs:
+                for seq in ready:
+                    if seq.id not in scheduled_seqs:
+                        seq.num_skipped_steps += 1
 
         if not scheduled_seqs:
             return None, {}
