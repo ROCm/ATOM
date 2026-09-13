@@ -114,7 +114,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gather_kv_b_proj (the MLA cached-prefix expansion): swap the Triton op for
     # the flydsl a8w8 gather-GEMM. Added 2026-09-09.
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ": lambda: (
-        os.getenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "1") == "1"
+        os.getenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "0") == "1"
     ),
     # QK-norm-rope-cache-quant fusion for Qwen3 dense and MoE; disabled by default.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
