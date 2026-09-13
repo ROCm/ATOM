@@ -116,6 +116,24 @@ def test_text_backbone_native_weights_and_single_pass_mhc(
             )
         assert cache.position == 6
 
+        # Projection cropping must preserve all-token execution and cache state.
+        # Use the actual V4 attention path for both forwards.
+        full_cache, suffix_cache = target.new_cache(1), target.new_cache(1)
+        full_cache.pool.fill_(torch.nan)
+        for values in full_cache.index.values():
+            values.fill_(torch.nan)
+        full = target(tokens.cuda(), full_cache, full_logits=True)
+        suffix = target(tokens.cuda(), suffix_cache, full_logits=True, logits_start=3)
+        torch.testing.assert_close(suffix, full[:, 3:], rtol=1e-5, atol=1e-6)
+        assert full_cache.position == suffix_cache.position == 6
+        next_token = torch.tensor([[13]], device="cuda")
+        torch.testing.assert_close(
+            target(next_token, suffix_cache),
+            target(next_token, full_cache),
+            rtol=0,
+            atol=0,
+        )
+
 
 @pytest.mark.parametrize("rank", [0, 7])
 def test_full_checkpoint_runtime_parameter_layout(single_rank, reference, rank):

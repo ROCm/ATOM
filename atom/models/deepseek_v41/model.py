@@ -172,9 +172,22 @@ class DeepseekV41ForCausalLM(nn.Module):
                 module.process_weights_after_loading()
 
     @torch.inference_mode()
-    def forward(self, token_ids, cache, engram_embeddings=None, *, full_logits=False):
+    def forward(
+        self,
+        token_ids,
+        cache,
+        engram_embeddings=None,
+        *,
+        full_logits=False,
+        logits_start=0,
+    ):
+        """Execute every input token; optionally project only a logit suffix."""
         if token_ids.ndim != 2:
             raise ValueError("Offline token IDs must have shape [batch, tokens]")
+        if not 0 <= logits_start < token_ids.shape[1] or (
+            logits_start and not full_logits
+        ):
+            raise ValueError("logits_start requires a valid full-logits suffix")
         step = cache.begin_step(cache.position, token_ids.shape[1], token_ids.shape[0])
         # ATOM's sharded embedding consumes flat tokens; restore this offline
         # interface's batch/sequence dimensions before entering model math.
@@ -189,8 +202,7 @@ class DeepseekV41ForCausalLM(nn.Module):
                 state, cache, step, rope, engram_embeddings.get(spec.layer_id)
             )
         hidden = state.collapse()
-        if not full_logits:
-            hidden = hidden[:, -1]
+        hidden = hidden[:, logits_start:] if full_logits else hidden[:, -1]
         logits = self.head(self.norm(hidden))
         cache.finish_step(step)
         return logits
