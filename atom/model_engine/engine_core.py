@@ -172,6 +172,43 @@ class EngineCore:
                 state_runtime=self.state_runtime,
             )
 
+        # Prefill coalescer on the single-rank (TP-only) path. PrefillDelayer
+        # documents a `cpu_group=None` mode for dp_size=1, but construction only
+        # ever lived in DPEngineCoreProc, so a TP/DCP server ran uncoalesced:
+        # measured median prefill fill 12.8% of the 16384-token budget, 1 request
+        # per batch. Prefill cannot share a forward with decode, so each of those
+        # forwards stalls every decoding request. Opt-in until measured.
+        if (
+            self.scheduler is not None
+            and envs.ATOM_ENABLE_PREFILL_DELAYER
+            and envs.ATOM_PREFILL_DELAYER_SINGLE_RANK
+            and config.parallel_config.data_parallel_size == 1
+        ):
+            from atom.model_engine.prefill_delayer import PrefillDelayer
+
+            self.scheduler.set_prefill_delayer(
+                PrefillDelayer(
+                    dp_size=1,
+                    cpu_group=None,
+                    max_num_batched_tokens=config.max_num_batched_tokens,
+                    target_fill=envs.ATOM_PREFILL_DELAYER_TARGET_FILL,
+                    ttft_max_ticks=envs.ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS,
+                    partial_max_ticks=envs.ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS,
+                    stall_ticks=envs.ATOM_PREFILL_DELAYER_STALL_TICKS,
+                    kv_high_watermark=envs.ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK,
+                    token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
+                    max_queue_ms=envs.ATOM_PREFILL_DELAYER_MAX_QUEUE_MS,
+                    prefill_decode_interval=envs.ATOM_PREFILL_DECODE_INTERVAL,
+                )
+            )
+            logger.info(
+                "%s: PrefillDelayer ENABLED (single-rank, target_fill=%.2f, "
+                "budget=%d tokens)",
+                self.label,
+                envs.ATOM_PREFILL_DELAYER_TARGET_FILL,
+                config.max_num_batched_tokens,
+            )
+
         self.kv_transfer_enabled = bool(config.kv_transfer_config)
         self._next_idle_kv_drain = 0.0
         if self.kv_transfer_enabled:
