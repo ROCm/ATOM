@@ -122,11 +122,19 @@ record exactly reproduces the previously frozen P05 NLL.
 | Original independent allowance | +0.01 (not met) |
 | Top-1 agreement with P05 | 96.600411% |
 
-Task-level ARC/code/GSM8K/Chinese accuracy has not been revalidated for this
-kernel substitution. P04 task results remain historical results for the eager
-backend. Runtime parity separately holds the selected MoE backend fixed and
-checks that paging and graph execution add no error relative to uncaptured
-execution with a private BF16 cache.
+The AITER backend also completed a matched GSM8K generation regression:
+5-shot, greedy, 256 maximum generated tokens, the same 16 documents and seeds
+as the accepted eager run. Strict and flexible exact match are both 12/16
+(75%), equal to eager's aggregate score, with one gain and one loss. The paired
+report verifies document, prompt and target hashes. This is a 16-item regression,
+not the full 1,319-question GSM8K test set. The reproducible wrapper, launcher,
+responses and paired report are retained in the phase evidence archive.
+
+ARC, code and Chinese task accuracy have not been revalidated for this kernel
+substitution. Their P04 results remain historical results for eager experts.
+Runtime parity separately holds the selected MoE backend fixed and checks that
+paging and graph execution add no error relative to uncaptured execution with
+a private BF16 cache.
 
 The final production adapter reproduces every field of all 148 numerical
 records from the accepted candidate. The final TP4 runtime test has zero
