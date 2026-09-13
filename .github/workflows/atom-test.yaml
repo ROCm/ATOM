@@ -41,7 +41,7 @@ on:
 concurrency:
   # Keep scheduled main runs from blocking push-triggered validation.
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.pull_request.number && 'pr' || github.event_name }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && (github.event_name != 'pull_request_review' || github.event.review.state == 'approved') }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   ATOM_BASE_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.atom_base_image || 'rocm/atom-dev:latest' }}
