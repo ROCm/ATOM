@@ -167,6 +167,14 @@ class Sequence:
         # allocate() / free it in deallocate().
         self.has_per_req_cache = has_per_req_cache
         self.multimodal_data = multimodal_data
+        # Immutable content identity survives payload release and preemption.
+        self.cache_seed = -1
+        if multimodal_data is not None:
+            from atom.model_engine.multimodal import multimodal_cache_seed
+
+            self.cache_seed = multimodal_data.get("cache_seed")
+            if self.cache_seed is None:
+                self.cache_seed = multimodal_cache_seed(multimodal_data)
         self.mrope_positions = mrope_positions
         self.mrope_position_delta = mrope_position_delta
         self.num_tokens = len(self.token_ids)

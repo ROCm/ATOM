@@ -10,10 +10,10 @@ from atom.config import CUDAGraphMode
 from atom.utils.forward_context import get_forward_context
 
 from .execution import DenseGraphExecutor
-from .model import DeepseekV41ForCausalLM
+from .multimodal import DeepseekV41MultimodalModel
 
 
-class DeepseekV41RuntimeModel(DeepseekV41ForCausalLM):
+class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
     checkpoint_loader = "atom.model_loader.deepseek_v41.load_checkpoint"
 
     def __init__(self, config):
@@ -21,7 +21,7 @@ class DeepseekV41RuntimeModel(DeepseekV41ForCausalLM):
         self.dense_graphs = None if config.enforce_eager else DenseGraphExecutor()
 
     @torch.inference_mode()
-    def forward(self, input_ids, positions):
+    def forward(self, input_ids, positions, inputs_embeds=None):
         context = get_forward_context()
         metadata = context.attn_metadata
         execution = None
@@ -42,6 +42,12 @@ class DeepseekV41RuntimeModel(DeepseekV41ForCausalLM):
                 step,
                 metadata.engram_embeddings,
                 execution=execution,
+                inputs_embeds=(
+                    None
+                    if inputs_embeds is None
+                    else inputs_embeds[: step.length].unsqueeze(0)
+                ),
+                image_mask=metadata.image_mask,
             ).squeeze(0)
             metadata.cache.finish_step(step, metadata.next_histories)
         else:

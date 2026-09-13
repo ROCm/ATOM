@@ -25,6 +25,7 @@ def load_checkpoint(model, directory, config, load_dummy=None):
         schema = checkpoint_schema(config)
         manifest = build_weight_manifest(
             schema,
+            scopes=getattr(model, "checkpoint_scopes", ("backbone",)),
             tp_rank=group.rank_in_group,
             tp_size=group.world_size,
             ep_rank=group.rank_in_group,

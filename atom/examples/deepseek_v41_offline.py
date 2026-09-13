@@ -34,7 +34,9 @@ from atom.models.deepseek_v41.weights import (
 
 
 @contextmanager
-def load_offline_model(directory, max_length, *, index_topk_tie_break=None):
+def load_offline_model(
+    directory, max_length, *, index_topk_tie_break=None, vision=False
+):
     """Keep mapped Engram tables alive for the entire offline model lifetime."""
     config = get_hf_config(directory)
     if index_topk_tie_break is not None:
@@ -47,6 +49,7 @@ def load_offline_model(directory, max_length, *, index_topk_tie_break=None):
     schema = checkpoint_schema(config)
     manifest = build_weight_manifest(
         schema,
+        scopes=("backbone", "vision") if vision else ("backbone",),
         tp_rank=group.rank_in_group,
         tp_size=group.world_size,
         ep_rank=group.rank_in_group,
@@ -56,7 +59,14 @@ def load_offline_model(directory, max_length, *, index_topk_tie_break=None):
     torch.set_default_dtype(torch.bfloat16)
     try:
         with torch.device("cuda"):
-            model = DeepseekV41ForCausalLM(config, max_length=max_length)
+            model_cls = DeepseekV41ForCausalLM
+            if vision:
+                from atom.models.deepseek_v41.multimodal import (
+                    DeepseekV41MultimodalModel,
+                )
+
+                model_cls = DeepseekV41MultimodalModel
+            model = model_cls(config, max_length=max_length)
     finally:
         torch.set_default_dtype(previous)
     with CheckpointReader(directory, schema) as reader:
@@ -83,15 +93,29 @@ def load_offline_model(directory, max_length, *, index_topk_tie_break=None):
             host.shutdown()
 
 
-def prepare_engram(token_ids, position, history, mapping, host):
+def prepare_engram(token_ids, position, history, mapping, host, *, token_mask=None):
     tokens = np.asarray(token_ids, dtype=np.int64).reshape(1, -1)
-    request = EngramRequest(0, 0, position, tuple(tokens[0]), tuple(history[0]))
+    mask = (
+        None
+        if token_mask is None
+        else np.asarray(token_mask, dtype=np.bool_).reshape(1, -1)
+    )
+    request = EngramRequest(
+        0,
+        0,
+        position,
+        tuple(tokens[0]),
+        tuple(history[0]),
+        None if mask is None else tuple(mask[0]),
+    )
     host.stage_embeddings([request])
     host.wait_for_embeddings()
     embeddings = {
         layer: host.embeddings(layer).unsqueeze(0) for layer in host.layer_ids
     }
-    next_history = mapping.advance_history(history, mapping.compress_tokens(tokens))
+    next_history = mapping.advance_history(
+        history, mapping.compress_tokens(tokens, mask)
+    )
     return embeddings, next_history
 
 

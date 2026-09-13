@@ -37,7 +37,9 @@ class DenseGraphExecutor:
         length = args[0].shape[1]
         if length > bucket:
             raise ValueError("Dense graph input exceeds its declared token bucket")
-        key = (function, bucket)
+        # Optional masks are part of the graph's input contract. A text-only
+        # capture cannot stand in for an image-token step with a live mask.
+        key = (function, bucket, tuple(x is None for x in args))
         entry = self.entries.get(key)
         if entry is None:
             if not capture:

@@ -226,12 +226,24 @@ class DeepseekV41ForCausalLM(nn.Module):
                 module.process_weights_after_loading()
 
     def forward_hidden(
-        self, token_ids, cache, step, engram_embeddings=None, *, execution=None
+        self,
+        token_ids,
+        cache,
+        step,
+        engram_embeddings=None,
+        *,
+        execution=None,
+        inputs_embeds=None,
+        image_mask=None,
     ):
         # ATOM's sharded embedding consumes flat tokens; restore this offline
         # interface's batch/sequence dimensions before entering model math.
-        hidden = self.embed(token_ids.flatten()).view(
-            *token_ids.shape, self.config.hidden_size
+        hidden = (
+            self.embed(token_ids.flatten()).view(
+                *token_ids.shape, self.config.hidden_size
+            )
+            if inputs_embeds is None
+            else inputs_embeds
         )
         state = SinglePassHCState.from_embeddings(hidden, self.config.hc_mult)
         engram_embeddings = {} if engram_embeddings is None else engram_embeddings
@@ -243,6 +255,7 @@ class DeepseekV41ForCausalLM(nn.Module):
                 step,
                 rope,
                 engram_embeddings.get(spec.layer_id),
+                image_mask=image_mask,
                 execution=execution,
             )
         hidden = state.collapse()
@@ -257,6 +270,8 @@ class DeepseekV41ForCausalLM(nn.Module):
         *,
         full_logits=False,
         logits_start=0,
+        inputs_embeds=None,
+        image_mask=None,
     ):
         """Execute every input token; optionally project only a logit suffix."""
         if token_ids.ndim != 2:
@@ -266,7 +281,14 @@ class DeepseekV41ForCausalLM(nn.Module):
         ):
             raise ValueError("logits_start requires a valid full-logits suffix")
         step = cache.begin_step(cache.position, token_ids.shape[1], token_ids.shape[0])
-        hidden = self.forward_hidden(token_ids, cache, step, engram_embeddings)
+        hidden = self.forward_hidden(
+            token_ids,
+            cache,
+            step,
+            engram_embeddings,
+            inputs_embeds=inputs_embeds,
+            image_mask=image_mask,
+        )
         hidden = hidden[:, logits_start:] if full_logits else hidden[:, -1]
         logits = self.head(self.norm(hidden))
         cache.finish_step(step)

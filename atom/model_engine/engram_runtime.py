@@ -346,7 +346,7 @@ class EngramInputPreparer:
             resources.close()
             raise
 
-    def prepare(self, spans, token_ids, histories, *, dummy=False):
+    def prepare(self, spans, token_ids, histories, *, dummy=False, token_mask=None):
         if dummy:
             self.host.stage_dummy(token_ids.numel())
             next_histories = histories
@@ -358,12 +358,20 @@ class EngramInputPreparer:
             requests, next_histories = [], []
             for span, history in zip(spans, histories):
                 tokens = ids[span.token_slice]
+                mask = None if token_mask is None else token_mask[span.token_slice]
                 requests.append(
                     EngramRequest(
-                        span.request_id, 0, span.position, tuple(tokens), tuple(history)
+                        span.request_id,
+                        0,
+                        span.position,
+                        tuple(tokens),
+                        tuple(history),
+                        token_mask=None if mask is None else tuple(mask),
                     )
                 )
-                compressed = self.mapping.compress_tokens(tokens[None, :])
+                compressed = self.mapping.compress_tokens(
+                    tokens[None, :], None if mask is None else mask[None, :]
+                )
                 next_histories.append(
                     self.mapping.advance_history(history[None, :], compressed)[0]
                 )

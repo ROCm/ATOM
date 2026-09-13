@@ -40,7 +40,10 @@ if TYPE_CHECKING:
 from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
-from atom.model_engine.multimodal import build_multimodal_inputs
+from atom.model_engine.multimodal import (
+    build_multimodal_inputs,
+    get_native_multimodal_processor,
+)
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import new_token_ids
 from atom.utils import envs
@@ -692,7 +695,13 @@ def _get_multimodal_processor():
     global processor
     if processor is None:
         logger.info(f"Loading multimodal processor from {model_name}...")
-        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        processor = get_native_multimodal_processor(
+            _get_engine_config(), tokenizer, custom_message_encoder
+        )
+        if processor is None:
+            processor = AutoProcessor.from_pretrained(
+                model_name, trust_remote_code=True
+            )
     return processor
 
 
@@ -708,9 +717,10 @@ def _collect_multimodal_parts(
     images: list[Image.Image] = []
 
     for message in messages:
-        content = getattr(message, "content", None)
+        record = message.to_template_dict(preserve_content=True)
+        content = record.get("content")
         if isinstance(content, str) or content is None:
-            processor_messages.append({"role": message.role, "content": content or ""})
+            processor_messages.append({**record, "content": content or ""})
             continue
 
         parts: list[dict[str, Any]] = []
@@ -739,7 +749,7 @@ def _collect_multimodal_parts(
                 image = _load_image_from_url(url)
                 images.append(image)
                 parts.append({"type": "image", "image": image})
-        processor_messages.append({"role": message.role, "content": parts})
+        processor_messages.append({**record, "content": parts})
 
     return processor_messages, images
 

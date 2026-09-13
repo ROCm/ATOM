@@ -21,7 +21,7 @@ from .reference import load_reference
 
 
 @contextmanager
-def checkpoint_reference(directory, config, max_length):
+def checkpoint_reference(directory, config, max_length, *, vision=False):
     """Load upstream text math with independent PyTorch quant/GEMM/attention.
 
     Engram table gathers are supplied by the caller (their hash and table
@@ -39,8 +39,20 @@ def checkpoint_reference(directory, config, max_length):
         dspark_block_size=0,
         engram_layer_ids=(),
         engram_num_embeddings=(),
-        vision_n_layers=0,
+        vision_n_layers=raw.get("vision_n_layers", 0) if vision else 0,
     )
+    if vision:
+        vision_config = config._multimodal_config.vision_config
+        for native, hf in {
+            "vision_n_layers": "num_hidden_layers",
+            "vision_dim": "hidden_size",
+            "vision_n_heads": "num_attention_heads",
+            "vision_inter_dim": "intermediate_size",
+            "vision_patch_size": "patch_size",
+            "vision_rope_theta": "rope_theta",
+            "vision_downsample_ratio": "downsample_ratio",
+        }.items():
+            raw[native] = getattr(vision_config, hf)
     with load_reference(directory) as reference, reference.set_dtype(torch.bfloat16):
         with torch.device("cuda"):
             source = reference.Transformer(reference.ModelArgs(**raw))
@@ -87,6 +99,7 @@ def checkpoint_reference(directory, config, max_length):
             source_schema[name] = spec
         manifest = build_weight_manifest(
             source_schema,
+            scopes=("backbone", "vision") if vision else ("backbone",),
             tp_rank=group.rank_in_group,
             tp_size=group.world_size,
             ep_rank=group.rank_in_group,
@@ -117,21 +130,34 @@ def checkpoint_reference(directory, config, max_length):
             raise ValueError(f"Unloaded reference parameters: {set(params) - loaded}")
 
         @torch.inference_mode()
-        def forward(tokens, position, embeddings, *, full_logits=False, logits_start=0):
+        def forward(
+            tokens,
+            position,
+            embeddings,
+            *,
+            full_logits=False,
+            logits_start=0,
+            images=None,
+            token_types=None,
+        ):
             # generate.py also installs this default device; upstream index
             # masks otherwise default to CPU.
             with torch.device(tokens.device):
-                hidden = (
-                    source.embed(tokens).unsqueeze(2).repeat(1, 1, config.hc_mult, 1)
-                )
+                hidden = source.embed(tokens)
+                if images is not None:
+                    source.merge_image_embeddings(images, hidden)
+                image_mask = None if token_types is None else token_types >= 0
+                hidden = hidden.unsqueeze(2).repeat(1, 1, config.hc_mult, 1)
                 mix = reference.make_identity_pre_mix(hidden, config.hc_mult)
                 for layer_id, layer in enumerate(source.layers):
                     if layer.engram is not None:
                         rows = embeddings[layer_id].unflatten(
                             -1, (-1, config.engram_head_dim)
                         )
-                        hidden = layer.engram(hidden, rows)
-                    hidden, mix = layer(hidden, position, mix, None)
+                        hidden = layer.engram(
+                            hidden, rows, None if image_mask is None else ~image_mask
+                        )
+                    hidden, mix = layer(hidden, position, mix, image_mask)
                 hidden = (
                     (mix.unsqueeze(-1) * hidden.float()).sum(dim=2).to(hidden.dtype)
                 )
@@ -143,7 +169,7 @@ def checkpoint_reference(directory, config, max_length):
 
 
 @contextmanager
-def reference_resources(directory, max_length):
+def reference_resources(directory, max_length, *, vision=False):
     """Reference model and bounded host Engram staging without a target model."""
     from transformers import AutoTokenizer
 
@@ -164,7 +190,7 @@ def reference_resources(directory, max_length):
     )
     with (
         CheckpointReader(directory, checkpoint_schema(config)) as reader,
-        checkpoint_reference(directory, config, max_length) as reference,
+        checkpoint_reference(directory, config, max_length, vision=vision) as reference,
     ):
         host = EngramHost(
             EngramPrefetcher(mapping, reader.engram_tables(config)),

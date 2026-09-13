@@ -25,7 +25,7 @@ from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
 
 
-def run_case(runner, prompts, output_tokens):
+def run_case(runner, prompts, output_tokens, *, multimodal_data=None):
     scheduler = Scheduler(runner.config, state_runtime=runner.state_runtime)
     sequences = [
         Sequence(
@@ -35,8 +35,9 @@ def run_case(runner, prompts, output_tokens):
                 temperature=0, max_tokens=output_tokens, ignore_eos=True
             ),
             has_per_req_cache=True,
+            multimodal_data=None if multimodal_data is None else multimodal_data[i],
         )
-        for tokens in prompts
+        for i, tokens in enumerate(prompts)
     ]
     for seq in sequences:
         scheduler.add(seq)

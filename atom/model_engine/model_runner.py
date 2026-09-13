@@ -2814,21 +2814,36 @@ class ModelRunner:
                     and hasattr(batch, "multimodal_data")
                     and batch.multimodal_data
                 ):
-                    mm_data_values = list(batch.multimodal_data.values())
-                    pixel_values = torch.cat(
-                        [mm_data["pixel_values"] for mm_data in mm_data_values], dim=0
-                    ).to(device=self.device, dtype=self.config.torch_dtype)
-                    grid_thw = torch.cat(
-                        [mm_data["image_grid_thw"] for mm_data in mm_data_values],
-                        dim=0,
-                    ).to(device=self.device)
-                    vision_embeds = self.model.get_vision_embeddings(
-                        pixel_values, grid_thw
-                    )
-                    text_embeds = self.model.embed_input_ids(input_ids)
-                    inputs_embeds = self.model.merge_multimodal_embeddings(
-                        input_ids, text_embeds, vision_embeds
-                    )
+                    if all(
+                        "embedding_spans" in data
+                        for data in batch.multimodal_data.values()
+                    ):
+                        from atom.model_engine.multimodal import embed_multimodal_batch
+
+                        inputs_embeds = embed_multimodal_batch(
+                            self.model,
+                            input_ids,
+                            batch,
+                            self.device,
+                            self.config.torch_dtype,
+                        )
+                    else:
+                        mm_data_values = list(batch.multimodal_data.values())
+                        pixel_values = torch.cat(
+                            [mm_data["pixel_values"] for mm_data in mm_data_values],
+                            dim=0,
+                        ).to(device=self.device, dtype=self.config.torch_dtype)
+                        grid_thw = torch.cat(
+                            [mm_data["image_grid_thw"] for mm_data in mm_data_values],
+                            dim=0,
+                        ).to(device=self.device)
+                        vision_embeds = self.model.get_vision_embeddings(
+                            pixel_values, grid_thw
+                        )
+                        text_embeds = self.model.embed_input_ids(input_ids)
+                        inputs_embeds = self.model.merge_multimodal_embeddings(
+                            input_ids, text_embeds, vision_embeds
+                        )
 
                 pp_group = get_pp_group()
                 pp_enabled = pp_group.world_size > 1

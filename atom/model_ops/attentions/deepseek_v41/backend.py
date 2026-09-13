@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 
 from atom.model_engine.engram_runtime import EngramInputPreparer
@@ -164,6 +165,18 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         )
         metadata.cache, metadata.step = cache, step
         metadata.dummy = batch.is_dummy_run
+        token_mask = np.ones(offset, dtype=np.bool_)
+        for span in spans:
+            data = getattr(batch, "multimodal_data", {}).get(span.request_id)
+            if data is not None and "token_types" in data:
+                types = data["token_types"][span.position : span.end]
+                token_mask[span.offset : span.offset + len(types)] = types == -1
+        metadata.token_mask = token_mask
+        metadata.image_mask = (
+            torch.from_numpy(~token_mask).to(self.device).unsqueeze(0)
+            if not token_mask.all()
+            else None
+        )
         return metadata, positions.gpu[:running_tokens]
 
     def prepare_prefill(self, batch, running_bs):
@@ -178,7 +191,11 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         tokens = input_ids[: step.length]
         if self.engram is not None:
             embeddings, histories = self.engram.prepare(
-                step.requests, tokens, histories, dummy=metadata.dummy
+                step.requests,
+                tokens,
+                histories,
+                dummy=metadata.dummy,
+                token_mask=metadata.token_mask,
             )
         else:
             width = (

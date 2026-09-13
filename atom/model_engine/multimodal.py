@@ -14,6 +14,7 @@ Two model-specific hooks live here:
   deviate register a builder below.
 """
 
+import hashlib
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -30,10 +31,89 @@ _MULTIMODAL_ARCH_TO_MODEL: dict[str, str] = {
 }
 
 _MULTIMODAL_ARCH_TO_INPUT_BUILDER: dict[str, str] = {
+    "DeepseekV41ForCausalLM": "atom.models.deepseek_v41.image_processing.build_inputs",
     "KimiK3ForConditionalGeneration": (
         "atom.model_engine.multimodal.build_kimi_k3_inputs"
     ),
 }
+
+
+_MULTIMODAL_PROCESSORS = {
+    "DeepseekV41ForCausalLM": "atom.models.deepseek_v41.image_processing.DeepseekV41ImageProcessor",
+}
+
+
+def get_native_multimodal_processor(atom_config, tokenizer, encoder):
+    architectures = getattr(atom_config.hf_config, "architectures", None) or []
+    factory = _MULTIMODAL_PROCESSORS.get(architectures[0]) if architectures else None
+    return (
+        None
+        if factory is None
+        else resolve_obj_by_qualname(factory)(atom_config, tokenizer, encoder)
+    )
+
+
+def multimodal_cache_seed(data):
+    """Hash processed media once; token-only prefix identity is insufficient.
+
+    Include layout as well as values: an identical patch buffer arranged into
+    different image grids need not produce the same language embeddings.
+    """
+    digest = hashlib.blake2b(digest_size=8, person=b"ATOM-media-v1")
+    for name in ("pixel_values", "image_grid_thw", "token_types"):
+        value = data.get(name)
+        if value is None:
+            continue
+        if hasattr(value, "detach"):
+            import torch
+
+            value = value.detach().cpu().contiguous()
+            digest.update(str((value.dtype, tuple(value.shape))).encode())
+            digest.update(value.view(torch.uint8).numpy().tobytes())
+        else:
+            value = np.ascontiguousarray(value)
+            digest.update(str((value.dtype, value.shape)).encode())
+            digest.update(value.tobytes())
+    digest.update(repr(data.get("embedding_spans", ())).encode())
+    return int.from_bytes(digest.digest(), "little")
+
+
+def embedding_indices(spans, position, length):
+    """Paired query/embedding indices for intersections with an input slice."""
+    query, source, offset = [], [], 0
+    for start, count in spans:
+        first, end = max(start, position), min(start + count, position + length)
+        if first < end:
+            query.extend(range(first - position, end - position))
+            source.extend(range(offset + first - start, offset + end - start))
+        offset += count
+    return query, source
+
+
+def embed_multimodal_batch(model, input_ids, batch, device, dtype):
+    """Scatter explicit request spans, including prefill after a prefix hit."""
+    import torch
+
+    hidden = model.embed_input_ids(input_ids)
+    offset = 0
+    for request_id, length, end in zip(
+        batch.req_ids, batch.num_scheduled_tokens, batch.context_lens
+    ):
+        data = batch.multimodal_data.get(request_id)
+        if data is not None:
+            query, source = embedding_indices(
+                data["embedding_spans"], int(end) - int(length), int(length)
+            )
+            if query:
+                values = model.get_vision_embeddings(
+                    data["pixel_values"].to(device=device, dtype=dtype),
+                    data["image_grid_thw"],
+                )
+                query = torch.tensor(query, device=device) + offset
+                source = torch.tensor(source, device=device)
+                hidden[query] = values[source]
+        offset += int(length)
+    return hidden
 
 
 def get_mrope_input_positions(
