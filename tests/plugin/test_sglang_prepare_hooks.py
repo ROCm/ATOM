@@ -64,17 +64,21 @@ def _reset_framework_state():
 
 
 @pytest.mark.parametrize(
-    "model_arch",
+    ("model_arch", "register_atom_attention"),
     (
-        "Qwen3_5ForConditionalGeneration",
-        "Qwen3_5MoeForConditionalGeneration",
-        "Qwen3NextForCausalLM",
-        "DeepseekV3ForCausalLM",
-        "GlmMoeDsaForCausalLM",
-        "Qwen3MoeForCausalLM",
+        ("Qwen3_5ForConditionalGeneration", False),
+        ("Qwen3_5MoeForConditionalGeneration", False),
+        ("Qwen3NextForCausalLM", False),
+        ("Qwen3_5ForCausalLM", True),
+        ("Qwen3_5MoeForCausalLM", True),
+        ("DeepseekV3ForCausalLM", True),
+        ("GlmMoeDsaForCausalLM", True),
+        ("Qwen3MoeForCausalLM", True),
     ),
 )
-def test_prepare_model_register_ops_gate(model_arch: str):
+def test_prepare_model_register_ops_gate(
+    model_arch: str, register_atom_attention: bool
+):
     fake_atom_config = _Obj(plugin_config=_Obj(is_plugin_mode=True))
     fake_register, _fake_model, fake_model_cls = _make_fake_register_module(model_arch)
     fake_config_mod = MagicMock()
@@ -89,6 +93,8 @@ def test_prepare_model_register_ops_gate(model_arch: str):
         fake_qwen35_mod.apply_prepare_model_adaptations
         if model_arch
         in {
+            "Qwen3_5ForCausalLM",
+            "Qwen3_5MoeForCausalLM",
             "Qwen3_5ForConditionalGeneration",
             "Qwen3_5MoeForConditionalGeneration",
         }
@@ -103,17 +109,26 @@ def test_prepare_model_register_ops_gate(model_arch: str):
             "atom.plugin.config": fake_config_mod,
             "atom.plugin.sglang.runtime": fake_runtime_mod,
             "atom.plugin.sglang.models.qwen3_5": fake_qwen35_mod,
-            "atom.plugin.sglang.graph_capture_patch": MagicMock(
+            "atom.plugin.sglang.dflash_lm_head_bridge": _module(
+                "atom.plugin.sglang.dflash_lm_head_bridge",
+                install_dflash_lm_head_patch=MagicMock(),
+            ),
+            "atom.plugin.sglang.patches.graph_capture_patch": MagicMock(
                 apply_graph_capture_patch=MagicMock()
             ),
         },
     ):
         sglang_prepare.prepare_model(config=_Obj(architectures=[model_arch]))
 
-    fake_register.register_ops_to_sglang.assert_called_once_with(
-        atom_config=fake_atom_config
-    )
+    if register_atom_attention:
+        fake_register.register_ops_to_sglang.assert_called_once_with(
+            atom_config=fake_atom_config
+        )
+    else:
+        fake_register.register_ops_to_sglang.assert_not_called()
     if model_arch in {
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5MoeForCausalLM",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
     }:
@@ -154,7 +169,11 @@ def test_prepare_model_uses_canonical_family_architecture():
             "atom.plugin.register": fake_register,
             "atom.plugin.config": fake_config_mod,
             "atom.plugin.sglang.runtime": fake_runtime_mod,
-            "atom.plugin.sglang.graph_capture_patch": MagicMock(
+            "atom.plugin.sglang.dflash_lm_head_bridge": _module(
+                "atom.plugin.sglang.dflash_lm_head_bridge",
+                install_dflash_lm_head_patch=MagicMock(),
+            ),
+            "atom.plugin.sglang.patches.graph_capture_patch": MagicMock(
                 apply_graph_capture_patch=MagicMock()
             ),
         },
@@ -163,4 +182,5 @@ def test_prepare_model_uses_canonical_family_architecture():
 
     fake_runtime_mod.resolve_model_arch_spec.assert_called_once_with(config)
     prepare_config.assert_called_once_with(fake_atom_config, canonical_arch)
+    fake_register.register_ops_to_sglang.assert_not_called()
     fake_model_cls.assert_called_once()
