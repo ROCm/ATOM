@@ -25,7 +25,7 @@ Related guides: [`Kimi-K3.md`](Kimi-K3.md) (generic serving / GSM8K),
 |---|---|---|
 | Interactive | 1, 2, 4 | TP8, **DCP=1**, DSpark **7**, synthetic AL **3.84**, GPU prefix cache only (no LMCache). CUDA-graph capture grows with `2 * CONC * 8`. |
 | Mid | 8, 12, 14, 16 | TP8, **DCP=8**, DSpark **3**, synthetic AL **3.00**, LMCache **128 GiB**, `max-num-batched-tokens 8192`. |
-| Throughput | 32, 40, 48, 56, 64, 72 | TP8, **DCP=8**, **no spec**, LMCache on. C32–C48 use 128 GiB; C56–C72 use **192 GiB** and a larger `max-num-seqs` so the in-flight window can track `2 * CONC`. |
+| Throughput | 32, 40, 48, 56, 64, 72, 80 | TP8, **DCP=8**, **no spec**, LMCache on. C32–C48 use 128 GiB; C56–C80 use **192 GiB** and a larger `max-num-seqs` so the in-flight window can track `2 * CONC`. |
 
 The AgentX **client** is the same at every concurrency. Only `--concurrency`
 changes.
@@ -66,12 +66,13 @@ changes.
 | 56 | 8 | 0 | — | **192 GiB** | 0 | **112** | 8192 | 0.90 | 112 |
 | 64 | 8 | 0 | — | **192 GiB** | 0 | **128** | 8192 | 0.90 | 128 |
 | 72 | 8 | 0 | — | **192 GiB** | 0 | **144** | 8192 | 0.90 | 144 |
+| 80 | 8 | 0 | — | **192 GiB** | 0 | **160** | 8192 | 0.90 | 160 |
 
-C8–C48 use 128 GiB LMCache; C56–C72 use **192 GiB**. LMCache CPU size is
+C8–C48 use 128 GiB LMCache; C56–C80 use **192 GiB**. LMCache CPU size is
 `LMCACHE_MAX_LOCAL_CPU_SIZE`; chunk size is 1024 tokens.
 
-`AITER_REUSE_IDENTICAL_COMM_GROUPS=1` on **C56/C64/C72**, and `0` on every other
-band (C1…C48).
+`AITER_REUSE_IDENTICAL_COMM_GROUPS=1` on **C56/C64/C72/C80**, and `0` on every
+other band (C1…C48).
 
 ## 0. Container prerequisites
 
@@ -167,17 +168,17 @@ case "${CONC}" in
       MAX_NUM_SEQS=24
     fi
     ;;
-  32|40|48|56|64|72)
+  32|40|48|56|64|72|80)
     # Throughput: no spec, and max-num-seqs tracks 2*CONC so the in-flight
     # window can keep up with the client.
     MAX_NUM_SEQS=$((2 * CONC))
-    # The three largest bands need a bigger CPU tier to stay off the HBM cliff.
+    # The four largest bands need a bigger CPU tier to stay off the HBM cliff.
     if [[ "${CONC}" -ge 56 ]]; then
       LMCACHE_MAX_LOCAL_CPU_SIZE=192
     fi
     ;;
   *)
-    echo "Unsupported CONC=${CONC}; AgentX Kimi-K3 covers 1,2,4,8,12,14,16,32,40,48,56,64,72." >&2
+    echo "Unsupported CONC=${CONC}; AgentX Kimi-K3 covers 1,2,4,8,12,14,16,32,40,48,56,64,72,80." >&2
     exit 2
     ;;
 esac
