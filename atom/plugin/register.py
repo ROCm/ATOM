@@ -75,6 +75,7 @@ def _register_custom_attention_to_sglang() -> None:
     name to inject ATOMAttnBackendForSgl without modifying sglang source.
     """
     import sglang.srt.layers.attention.aiter_backend as sglang_aiter_backend
+    import sglang.srt.layers.attention.dsa_backend as sglang_dsa_backend
     from sglang.srt.layers.attention.attention_registry import (
         register_attention_backend,
     )
@@ -87,7 +88,6 @@ def _register_custom_attention_to_sglang() -> None:
     )
     from atom.plugin.sglang.attention_backend.glm52_dsa_backend import (
         ATOMGLM52DSABackendForSgl,
-        install_upstream_glm52_graph_metadata_adapter,
     )
     from atom.plugin.sglang.attention_backend.kimi_k3_backend import (
         ATOMKimiK3BackendForSgl,
@@ -138,6 +138,13 @@ def _register_custom_attention_to_sglang() -> None:
         )
         return ATOMDeepseekV4BackendForSgl(runner)
 
+    @register_attention_backend("dsa")
+    def create_atom_dsa_backend(runner):
+        hf_config = runner.model_config.hf_config
+        if is_glm52_dsa_config(hf_config):
+            return create_glm52_backend(runner)
+        return sglang_dsa_backend.DeepseekSparseAttnBackend(runner)
+
     @register_attention_backend("nsa")
     def create_atom_nsa_backend(runner):
         hf_config = runner.model_config.hf_config
@@ -146,8 +153,6 @@ def _register_custom_attention_to_sglang() -> None:
         from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
 
         return NativeSparseAttnBackend(runner)
-
-    install_upstream_glm52_graph_metadata_adapter()
 
 
 def _patch_sglang_dsv4_draft_backends() -> None:
