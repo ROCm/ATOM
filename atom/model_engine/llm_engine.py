@@ -591,6 +591,10 @@ class LLMEngine:
             "kv_blocks_total": kv_total,
             "kv_blocks_indexed": summed("kv_blocks_indexed"),
             "kv_cache_usage_ratio": kv_used / kv_total if kv_total else 0.0,
+            # KV-owning ranks share the block size; prefill-only ranks omit it.
+            "block_size": next(
+                (int(s["block_size"]) for s in rank_stats if "block_size" in s), 0
+            ),
             "mtp": {
                 "enabled": bool(mtp_rank_stats),
                 "total_draft_tokens": mtp_draft,
