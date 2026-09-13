@@ -51,6 +51,8 @@ class EngineArgs:
     enable_prefix_caching: bool = True
     port: int = 8006
     kv_cache_dtype: str = "bf16"
+    persistent_decoder: str = "off"
+    persistent_decoder_checkpoint: str | None = None
     index_cache_dtype: str | None = None
     block_size: int = 16
     max_model_len: int | None = None
@@ -219,6 +221,21 @@ class EngineArgs:
             type=str,
             default="bf16",
             help="KV cache type. Default is 'bf16'.",
+        )
+        persistent = parser.add_argument_group("GPT-OSS persistent decoder")
+        persistent.add_argument(
+            "--persistent-decoder",
+            choices=["off", "auto", "required"],
+            default="off",
+            help="Enable AITER's gfx950 GPT-OSS persistent decoder.",
+        )
+        persistent.add_argument(
+            "--persistent-decoder-checkpoint",
+            default=None,
+            help=(
+                "Local directory containing the compiled persistent checkpoint. "
+                "Required only when persistent decoding is enabled."
+            ),
         )
         parser.add_argument(
             "--index-cache-dtype",
