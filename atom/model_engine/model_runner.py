@@ -892,10 +892,8 @@ class ModelRunner:
         prompt position's n-gram (carrying the tokens preceding a chunk); a dummy
         warmup/capture pass stages zeros.
         """
-        # Drop the engram cache + n-gram window for requests that finished or were
-        # preempted since the last batch, before staging (so a reused id that is
-        # re-seeded below is dropped first, then freshly seeded). No-op for ids
-        # engram never saw.
+        # Drop finished/preempted requests before staging, so a reused id is
+        # dropped first and then re-seeded below.
         if getattr(batch, "engram_dropped", None):
             self.engram.drop_requests(batch.engram_dropped)
         seq_ids = list(batch.req_ids)
@@ -904,12 +902,9 @@ class ModelRunner:
             self.engram.wait_for_embeddings()
             return
         if batch.total_tokens_num_prefill > 0:
-            # Prefill (possibly chunked). Each request's chunk is a consecutive
-            # slice of the flat scheduled_tokens; prefill_context supplies the
-            # max_ngram_size-1 tokens preceding the chunk so its leading positions
-            # hash with real context instead of padding. stage_prefill seeds the
-            # decode window on the final chunk. Prefill and decode are never mixed
-            # in one batch, so the whole batch is prefill rows here.
+            # Prefill (possibly chunked): each request's chunk is a slice of
+            # scheduled_tokens; prefill_context carries the max_ngram_size-1 tokens
+            # before the chunk so its leading positions hash with real context.
             assert (
                 batch.total_tokens_num_decode == 0
             ), "engram does not support mixed prefill+decode batches"
@@ -928,17 +923,13 @@ class ModelRunner:
             )
             self.engram.wait_for_embeddings()
             return
-        # `tokens` is a fallback for recomputing a prefetch miss, and is read
-        # only for a missed row that also has no rolling window -- a cold /
-        # just-admitted row, for which `scheduled_tokens` holds the real committed
-        # anchor. A carried-over row recomputes from its window (advanced by the
-        # prior prefetch_next), so the placeholder `scheduled_tokens` writes for
-        # it is never read. The hot path needs no D2H either way.
+        # `tokens` recomputes a prefetch miss only for a missed row with no
+        # window (a cold/just-admitted row, where scheduled_tokens is its real
+        # anchor); a carried-over row uses its window, so its placeholder is never
+        # read.
         tokens = batch.scheduled_tokens[: len(seq_ids)].astype(np.int64).reshape(-1, 1)
-        # A CUDAGraph decode replays a fixed bucket >= the scheduled rows, so the
-        # forward is that tall; stage to the same padded height (zero tail) so the
-        # engram layers do not raise on shape or read a stale tail. Mirrors the
-        # `fill_to` padding in prepare_input_ids (pure decode -> one token/seq).
+        # Stage to the CUDAGraph decode bucket height (zero tail) so the engram
+        # layers match the padded forward's row count (mirrors prepare_input_ids).
         padded_rows = len(seq_ids)
         if not self.enforce_eager:
             gbs = next(
@@ -1071,8 +1062,7 @@ class ModelRunner:
         if not self.still_running:
             return
         self.still_running = False
-        # Stop the engram prefetch worker (a ThreadPoolExecutor + large-table
-        # thread) so it does not outlive teardown or write into freed state.
+        # Stop the engram prefetch worker so it does not outlive teardown.
         if getattr(self, "engram", None) is not None:
             self.engram.shutdown()
         # 0. Join any offload connector's copy threads. Its ThreadPoolExecutors
