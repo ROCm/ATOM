@@ -22,31 +22,95 @@ LOG_FILE="/app/logs_claude/atom_server.log"
 export AITER_LOG_LEVEL="${AITER_LOG_LEVEL:-INFO}"
 export KINETO_CONFIG="/home/ljin1/dk/libkineto.conf"
 
+# === Which cards this run owns ===
+# HIP_VISIBLE_DEVICES numbering is not rocm-smi's (measured here: HIP 0 is
+# GPU[3]) and the map does not survive a reboot, so resolve it through the PCI
+# bus now. Unset means the whole box, which is all this script used to assume.
+OWNED_GPUS=""
+if [ -n "${HIP_VISIBLE_DEVICES:-}" ]; then
+    OWNED_GPUS="$(python - <<'PY' || true
+import re, subprocess, torch
+
+mine = {
+    f"{torch.cuda.get_device_properties(i).pci_bus_id:02X}"
+    for i in range(torch.cuda.device_count())
+}
+smi = subprocess.run(["rocm-smi", "--showbus"], capture_output=True, text=True).stdout
+print(" ".join(
+    idx for idx, bus in re.findall(r"GPU\[(\d+)\].*?PCI Bus: \w+:(\w\w):", smi)
+    if bus.upper() in mine
+))
+PY
+)"
+    [ -n "$OWNED_GPUS" ] || {
+        echo "ERROR: cannot map HIP_VISIBLE_DEVICES=$HIP_VISIBLE_DEVICES to rocm-smi indices"
+        exit 1
+    }
+    echo "Owned GPUs: rocm-smi [$OWNED_GPUS] <- HIP_VISIBLE_DEVICES=$HIP_VISIBLE_DEVICES"
+fi
+
+# How many OWNED cards hold memory. Empty OWNED_GPUS counts every card.
+owned_in_use() {
+    rocm-smi --showmemuse 2>/dev/null | awk -v owned="$OWNED_GPUS" '
+        /VRAM%/ {
+            idx = $0; sub(/^GPU\[/, "", idx); sub(/\].*/, "", idx)
+            if (owned != "" && index(" " owned " ", " " idx " ") == 0) next
+            if ($NF + 0 > 0) n++
+        }
+        END { print n + 0 }'
+}
+
+# Ownership is decidable only on the server process: its EngineCore child
+# clears HIP_VISIBLE_DEVICES. Empty means this run claims the whole box.
+owns_our_cards() {
+    [ -n "${HIP_VISIBLE_DEVICES:-}" ] || return 0
+    [ "$(tr '\0' '\n' <"/proc/$1/environ" 2>/dev/null |
+        sed -n 's/^HIP_VISIBLE_DEVICES=//p')" = "$HIP_VISIBLE_DEVICES" ]
+}
+
+# Children are reached through the tree, not by name: the worker calls itself
+# ATOM::EngineCore and matches none of the patterns a pkill would use. An
+# EngineCore already orphaned by a dead server is unreachable either way -- it
+# carries neither the card set nor a parent -- and shows up as owned_in_use.
+kill_tree() {
+    local child
+    for child in $(pgrep -P "$1" 2>/dev/null); do
+        kill_tree "$child"
+    done
+    kill -9 "$1" 2>/dev/null || true
+}
+
 # === Pre-flight: ensure GPU is clean ===
 echo "Pre-flight: cleaning up processes and GPU memory..."
 
-# 1. Kill atom server processes
-pkill -f 'atom.entrypoints' 2>/dev/null || true
-sleep 2
-
-# 2. Kill orphaned multiprocessing spawn/tracker (these hold GPU memory after server dies)
-pkill -9 -f 'multiprocessing.spawn' 2>/dev/null || true
-pkill -9 -f 'multiprocessing.resource_tracker' 2>/dev/null || true
+# 1. Kill this run's servers and everything under them. A bare `pkill -f` hits
+#    every ATOM process on the box, which on a shared one is someone else's.
+for pid in $(pgrep -f 'atom\.entrypoints' 2>/dev/null || true); do
+    if owns_our_cards "$pid"; then
+        echo "  killing server $pid and its children"
+        kill_tree "$pid"
+    fi
+done
 sleep 3
 
 # 3. Verify GPU memory is actually free
 MAX_WAIT=30
 for i in $(seq 1 $MAX_WAIT); do
-    USED_GPUS=$(rocm-smi --showmemuse 2>/dev/null | grep "VRAM%" | awk '{print $NF}' | awk '$1 > 0' | wc -l)
+    USED_GPUS=$(owned_in_use)
     if [ "$USED_GPUS" -eq 0 ]; then
         echo "GPU memory clear after ${i}s"
         break
     fi
     if [ "$i" -eq "$MAX_WAIT" ]; then
-        echo "WARNING: GPU memory still in use after ${MAX_WAIT}s. Dumping GPU process info:"
+        echo "WARNING: owned GPU memory still in use after ${MAX_WAIT}s:"
         rocm-smi --showpidgpus 2>&1 | grep "PID.*is using" | grep -v "0 DRM" || true
-        echo "Attempting force kill of GPU-holding processes..."
-        rocm-smi --showpidgpus 2>&1 | grep -oP 'PID \K\d+' | while read pid; do
+        # Only what we can BOTH attribute and reach. The pids rocm-smi prints
+        # are the host's and mean something else in this container, so the
+        # blanket `kill -9` this used to do could hit an unrelated local pid --
+        # and on a shared box that memory may not be ours to reclaim at all.
+        # Our own leftovers are the ones we can name.
+        for pid in $(pgrep -f 'atom\.entrypoints|multiprocessing\.spawn' || true); do
+            echo "  force-killing our own leftover pid $pid"
             kill -9 "$pid" 2>/dev/null || true
         done
         sleep 5
@@ -103,7 +167,7 @@ echo "Server started in background (PID: $SERVER_PID)"
 echo "Waiting for server to be ready..."
 for i in $(seq 1 120); do
     if curl -sf "http://localhost:${PORT}/v1/models" > /dev/null 2>&1; then
-        VRAM_COUNT=$(rocm-smi --showmemuse 2>/dev/null | grep "VRAM%" | awk '{print $NF}' | awk '$1 > 0' | wc -l)
+        VRAM_COUNT=$(owned_in_use)
         if [ "$VRAM_COUNT" -gt 0 ]; then
             echo "Server is ready! (PID: $SERVER_PID, GPU VRAM loaded)"
             exit 0
