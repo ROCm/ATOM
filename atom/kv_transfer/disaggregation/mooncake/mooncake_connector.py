@@ -4,8 +4,8 @@
 """
 Worker-side and scheduler-side KV cache connectors for disaggregated P/D.
 
-Uses Mooncake TransferEngine for TCP- or RDMA-based push (WRITE) transfers of
-KV cache data from producer (prefill) to consumer (decode) nodes.
+Uses Mooncake TransferEngine for HIP-, TCP-, or RDMA-based push (WRITE)
+transfers of KV cache data from producer (prefill) to consumer (decode).
 """
 
 from __future__ import annotations
@@ -83,6 +83,9 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 MOONCAKE_DEFAULT_PROTOCOL = "rdma"
+# An empty filter enables HCA auto-discovery even for protocol="hip" in
+# Mooncake's Python API. Exclude every HCA to avoid RDMA GPU registration.
+MOONCAKE_HIP_ONLY_DEVICE_FILTER = "__atom_hip_only_no_hca__"
 PREFILL_LOOKUP_TIMEOUT = 60
 PREFILL_LOOKUP_POLL_INTERVAL = 0.01
 
@@ -125,7 +128,7 @@ def _auto_select_ib_device(phys_idx: int) -> str:
 def _select_ib_device(
     protocol: str, configured_device: str, phys_idx: int | None
 ) -> str:
-    """Resolve the Mooncake device filter without enabling RDMA for TCP.
+    """Resolve the Mooncake device filter without enabling RDMA for TCP/HIP.
 
     Mooncake's TCP transport requires an empty device list. Passing a usable
     HCA alongside ``protocol=tcp`` allows the transfer engine to activate RDMA
@@ -133,13 +136,20 @@ def _select_ib_device(
     choice. RDMA-family transports retain the existing configured/automatic
     device selection.
     """
-    if protocol.strip().lower() == "tcp":
+    if protocol.strip().lower() in {"tcp", "hip"}:
         return ""
     if configured_device:
         return configured_device
     if phys_idx is None:
         raise ValueError("physical GPU index is required for RDMA device selection")
     return _auto_select_ib_device(phys_idx)
+
+
+def _engine_device_filter(protocol: str, ib_device: str) -> str:
+    """Exclude RDMA HCAs from HIP-only engine initialization."""
+    if protocol.strip().lower() == "hip":
+        return MOONCAKE_HIP_ONLY_DEVICE_FILTER
+    return ib_device
 
 
 def _configure_mooncake_transport(protocol: str) -> None:
@@ -151,6 +161,9 @@ def _configure_mooncake_transport(protocol: str) -> None:
     """
     if protocol.strip().lower() == "tcp":
         os.environ["MC_FORCE_TCP"] = "true"
+    elif protocol.strip().lower() == "hip":
+        os.environ.pop("MC_FORCE_TCP", None)
+        os.environ.pop("MC_DISABLE_HIP", None)
 
 
 # ZMQ side-channel message types
@@ -512,11 +525,12 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
 
 
 class MooncakeConnector(KVConnectorBase):
-    """Worker-side KV cache connector using Mooncake push-mode RDMA.
+    """Worker-side KV cache connector using Mooncake push-mode transfers.
 
     Mooncake uses a push/WRITE model: the prefill (producer) node writes
     KV cache data directly into the decode (consumer) node's registered
-    GPU memory via ``batch_transfer_sync_write``.
+    GPU memory via ``batch_transfer_sync_write``. HIP mode uses same-host
+    GPU IPC/xGMI; RDMA mode uses a registered NIC memory region.
     """
 
     def __init__(self, config: Config) -> None:
@@ -551,7 +565,11 @@ class MooncakeConnector(KVConnectorBase):
         # Networking config
         self.http_port = kv_transfer_config.get("http_port", 8000)
         self.request_address = f"{self.local_ip}:{self.http_port}"
-        self.protocol = kv_transfer_config.get("protocol", MOONCAKE_DEFAULT_PROTOCOL)
+        self.protocol = (
+            kv_transfer_config.get("protocol", MOONCAKE_DEFAULT_PROTOCOL)
+            .strip()
+            .lower()
+        )
 
         # Side channel port (ZMQ) — deterministic from config for proxy relay
         self.base_handshake_port = kv_transfer_config.get("handshake_port", 6301)
@@ -571,9 +589,8 @@ class MooncakeConnector(KVConnectorBase):
                 "Install the mooncake package to use push-mode transfers."
             )
 
-        # Determine which RDMA device this TP rank should use. TCP is
-        # intentionally initialized with an empty device filter so Mooncake
-        # cannot activate an available HCA as an alternate path.
+        # TCP and HIP do not select a rank-local HCA. HIP additionally needs
+        # a nonempty filter at engine initialization to disable HCA discovery.
         # AMD GPU nodes pair GPU N with NIC N, but the HCA name is cluster
         # dependent: Spur MI350 exposes ionic_N while older setups used rdmaN.
         # Registering GPU memory with a non-local RDMA NIC fails with
@@ -584,7 +601,7 @@ class MooncakeConnector(KVConnectorBase):
             "ib_device", ""
         ) or os.environ.get("ATOM_MOONCAKE_IB_DEVICE", "")
         phys_idx: int | None = None
-        if self.protocol.strip().lower() != "tcp" and not configured_ib_device:
+        if self.protocol not in {"tcp", "hip"} and not configured_ib_device:
             visible_idx = torch.cuda.current_device()
             visible_env = os.environ.get("HIP_VISIBLE_DEVICES") or os.environ.get(
                 "CUDA_VISIBLE_DEVICES"
@@ -595,8 +612,14 @@ class MooncakeConnector(KVConnectorBase):
             else:
                 phys_idx = visible_idx
         ib_device = _select_ib_device(self.protocol, configured_ib_device, phys_idx)
+        engine_device_filter = _engine_device_filter(self.protocol, ib_device)
         if self.protocol.strip().lower() == "tcp":
             logger.info("Mooncake TCP selected; RDMA device selection is disabled")
+        elif self.protocol == "hip":
+            logger.info(
+                "Mooncake HIP-only selected: same-host GPU IPC/xGMI; "
+                "RDMA HCAs are excluded from GPU memory registration"
+            )
         elif not configured_ib_device:
             logger.info(
                 "Auto-selecting RDMA device %s for physical GPU %d "
@@ -627,22 +650,22 @@ class MooncakeConnector(KVConnectorBase):
             self.local_ip,
             "P2PHANDSHAKE",
             self.protocol,
-            ib_device,
+            engine_device_filter,
         )
         if ret != 0:
             raise RuntimeError(
                 f"Mooncake TransferEngine.initialize() failed (ret={ret}) "
                 f"on ip={self.local_ip}, protocol={self.protocol}, "
-                f"ib_device={ib_device}"
+                f"ib_device={engine_device_filter}"
             )
         self.rpc_port = self.transfer_engine.get_rpc_port()
         self.engine_id = f"{self.local_ip}:{self.rpc_port}"
         logger.info(
             "Mooncake TransferEngine initialized: ip=%s, protocol=%s, "
-            "ib_device=%s, rpc_port=%d",
+            "device_filter=%s, rpc_port=%d",
             self.local_ip,
             self.protocol,
-            ib_device,
+            engine_device_filter,
             self.rpc_port,
         )
 
@@ -905,7 +928,7 @@ class MooncakeConnector(KVConnectorBase):
                 offset += chunk
 
         logger.info(
-            "Registering %d RDMA chunks (%d block regions, %d slot regions, "
+            "Registering %d Mooncake chunks (%d block regions, %d slot regions, "
             "max_chunk=%.2f GiB)",
             len(reg_ptrs),
             len(tt.block_regions),
@@ -1751,7 +1774,7 @@ class MooncakeConnector(KVConnectorBase):
             return False
         if debug_block_transfer and block_descriptor_count:
             logger.debug(
-                "[PRODUCER] block RDMA write: req=%s, regions=%d, "
+                "[PRODUCER] block Mooncake write: req=%s, regions=%d, "
                 "source_blocks=%d, descriptors=%d, total_bytes=%d",
                 req_id,
                 num_regions - len(staged_regions),
@@ -1835,7 +1858,7 @@ class MooncakeConnector(KVConnectorBase):
             )
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
-                    "[PRODUCER] staged index RDMA write: req=%s, region=%d, "
+                    "[PRODUCER] staged index Mooncake write: req=%s, region=%d, "
                     "pages=%d, descriptors=%d, total_bytes=%d",
                     req_id,
                     region_idx,
@@ -1926,7 +1949,7 @@ class MooncakeConnector(KVConnectorBase):
                 block_sizes.append(src_region.unit_bytes)
 
         logger.debug(
-            "[PRODUCER] block RDMA: req=%s, %d regions × %d blocks, " "total_bytes=%d",
+            "[PRODUCER] block Mooncake: req=%s, %d regions × %d blocks, total_bytes=%d",
             req_id,
             len(self._block_regions),
             len(src_block_ids),
@@ -1980,7 +2003,7 @@ class MooncakeConnector(KVConnectorBase):
             slot_sizes.append(self._staging_slot_bytes)
 
         logger.debug(
-            "[PRODUCER] slot RDMA: req=%s, %d entries, "
+            "[PRODUCER] slot Mooncake: req=%s, %d entries, "
             "src_slot=%d → dst_slot=%d, total_bytes=%d",
             req_id,
             len(slot_src),
