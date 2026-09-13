@@ -21,7 +21,7 @@ Do NOT use this skill for:
 ## Critical pre-flight
 
 1. **Stop the existing server cleanly** — the profiler argument has to be on the launch command line. `start_atom_server.sh` auto-kills the prior atom workers, so just relaunching with the new args is enough.
-2. **Pick a SHORT workload** — a trace from a long run is unreadable and OOMs the profiler exporter. Default to `CONC * 1` requests (one prompt per concurrent slot). Never use the production `PROMPT_MULTIPLIER=10` default for a profiling run.
+2. **Pick a SHORT workload** — a trace from a long run is unreadable and OOMs the profiler exporter. Default to `CONC * 1` requests (one prompt per concurrent slot). Never use the production `PROMPT_MULTIPLIER=10` default for a profiling run. When the workload itself has to be long (a sweep, a soak, anything you cannot shorten), bound the recording instead with `--profiler-max-iters N` on the server launch: the profiler stops itself and exports after N engine steps, and the bench keeps running. `--profiler-delay-iters N` skips the ramp-up first.
 3. **`ATOM_PROFILER_MORE` belongs on the server, not the benchmark client.** The profiler runs inside the model-runner worker processes; an env on the bench client does nothing.
 4. **Trace dir must be empty** for a clean per-rank layout. `start_atom_server.sh` does NOT clear it — `rm -rf $TRACE_DIR` before relaunch if you're iterating.
 
@@ -46,6 +46,7 @@ Pull these out of the user's request; everything except `MODEL` has a sensible d
 | `CONC` | Concurrency the bench keeps in flight | `64` or `128` |
 | `PROMPT_MULTIPLIER` | Total prompts = `CONC * this` | **`1` for trace runs** (override the script default of 10) |
 | `ATOM_PROFILER_MORE` | `1` = shapes + stack + memory (large traces, OOM risk); `0` = kernel-name only | **`0`** unless asked |
+| `--profiler-max-iters` | Server flag: stop recording after N engine steps regardless of how long the bench runs | `200`, or omit and rely on a short bench |
 | `TRACE_DIR` | Where the kineto `.pt.trace.json.gz` lands | `/app/logs_claude/traces/<run-name>` |
 | `EXTRA_ARGS` | Forwarded to the openai server (MTP, kv-cache, etc.) | See [[atom-patterns]] |
 

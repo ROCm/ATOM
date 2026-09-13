@@ -73,6 +73,8 @@ class EngineArgs:
     enable_expert_parallel: bool = False
     fake_eplb: bool = False
     torch_profiler_dir: str | None = None
+    profiler_delay_iters: int = 0
+    profiler_max_iters: int = 0
     enable_dp_attention: bool = False
     dp_load_balance: str = DP_LB_DEFAULT
     enable_tbo: str | None = None
@@ -288,6 +290,21 @@ class EngineArgs:
             type=str,
             default=None,
             help="Directory to save torch profiler traces",
+        )
+        parser.add_argument(
+            "--profiler-delay-iters",
+            type=int,
+            default=0,
+            help="Engine steps to skip after /start_profile before the "
+            "profiler starts recording. 0 records immediately.",
+        )
+        parser.add_argument(
+            "--profiler-max-iters",
+            type=int,
+            default=0,
+            help="Stop the profiler and write the trace after this many "
+            "recorded engine steps, without waiting for /stop_profile. "
+            "0 records until /stop_profile.",
         )
         parser.add_argument(
             "--enable-dp-attention",

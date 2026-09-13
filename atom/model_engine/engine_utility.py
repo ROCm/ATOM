@@ -29,6 +29,12 @@ class EngineUtilityHandler:
         Label used in log messages (default ``"Engine Core"``).
     scheduler : Scheduler, optional
         The scheduler instance, needed by MTP statistics handlers.
+    profiler_delay_iters : int, optional
+        Engine steps to skip after ``start_profile`` before the profiler
+        records (default 0, record immediately).
+    profiler_max_iters : int, optional
+        Recorded steps after which the profiler stops itself (default 0, run
+        until ``stop_profile``).
     """
 
     # Utility command name  ->  handler method name
@@ -49,12 +55,23 @@ class EngineUtilityHandler:
     }
 
     def __init__(
-        self, runner_mgr, output_queue, label: str = "Engine Core", scheduler=None
+        self,
+        runner_mgr,
+        output_queue,
+        label: str = "Engine Core",
+        scheduler=None,
+        profiler_delay_iters: int = 0,
+        profiler_max_iters: int = 0,
     ):
         self.runner_mgr = runner_mgr
         self.output_queue = output_queue
         self.label = label
         self.scheduler = scheduler
+        self.profiler_delay_iters = profiler_delay_iters
+        self.profiler_max_iters = profiler_max_iters
+        self._profiler_pending = 0
+        self._profiler_recorded = 0
+        self._profiler_active = False
 
     def process_queue(self, utility_queue, engine):
         """Drain *utility_queue* and execute each command.
@@ -248,26 +265,74 @@ class EngineUtilityHandler:
     # Profiler
     # ------------------------------------------------------------------
 
-    def _handle_start_profile(self, args: dict):
-        result = self.runner_mgr.call_func("start_profiler", wait_out=True)
+    def _start_profiler_now(self):
+        # start_profiler returns a bare True per rank, which the caller has no
+        # use for: every branch here answers with a dict the endpoint can
+        # inspect for "error" and "message".
+        self.runner_mgr.call_func("start_profiler", wait_out=True)
         # Flip the scheduler flag so per-iteration detailed aggregates
         # (compute_detailed_aggregates) are emitted while profiling is active.
         if self.scheduler is not None:
             self.scheduler.profile_active = True
+        self._profiler_active = True
+        self._profiler_recorded = 0
         logger.info(f"{self.label}: profiler started")
+        return {"message": "Profiling started"}
+
+    def _stop_profiler_now(self):
+        logger.info(f"{self.label}: stopping profiler...")
+        result = self.runner_mgr.call_func("stop_profiler", wait_out=True)
+        if self.scheduler is not None:
+            self.scheduler.profile_active = False
+        self._profiler_active = False
+        self._profiler_pending = 0
+        logger.info(f"{self.label}: profiler stopped, result={result}")
+        return result
+
+    def _handle_start_profile(self, args: dict):
+        if self._profiler_active or self._profiler_pending:
+            # Starting twice without an intervening stop would leave one trace
+            # spanning both runs while the window counts from the second call.
+            result = {
+                "error": "Profiling is already in progress. Call /stop_profile first."
+            }
+            logger.warning(f"{self.label}: {result['error']}")
+        elif self.profiler_delay_iters:
+            self._profiler_pending = self.profiler_delay_iters
+            result = {
+                "armed_after_iters": self.profiler_delay_iters,
+                "message": (
+                    f"Profiling armed. Recording starts after "
+                    f"{self.profiler_delay_iters} engine steps."
+                ),
+            }
+            logger.info(f"{self.label}: {result['message']}")
+        else:
+            result = self._start_profiler_now()
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "start_profile", "result": result})
         )
 
     def _handle_stop_profile(self, args: dict):
-        logger.info(f"{self.label}: stopping profiler...")
-        result = self.runner_mgr.call_func("stop_profiler", wait_out=True)
-        if self.scheduler is not None:
-            self.scheduler.profile_active = False
-        logger.info(f"{self.label}: profiler stopped, result={result}")
+        result = self._stop_profiler_now()
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "stop_profile", "result": result})
         )
+
+    def profiler_step(self):
+        """Advance the profiler window once per completed forward.
+
+        Called after the forward RPC returns, so the trace export that closing
+        a window triggers runs between engine steps rather than inside one.
+        """
+        if self._profiler_pending:
+            self._profiler_pending -= 1
+            if self._profiler_pending == 0:
+                self._start_profiler_now()
+        elif self._profiler_active and self.profiler_max_iters:
+            self._profiler_recorded += 1
+            if self._profiler_recorded >= self.profiler_max_iters:
+                self._stop_profiler_now()
 
     # ------------------------------------------------------------------
     # MTP statistics
