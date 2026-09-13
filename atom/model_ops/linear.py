@@ -1258,6 +1258,8 @@ class MergedColumnParallelLinear(LinearBase):
         quant_config: Optional[QuantizationConfig] = None,
         source_quant_dtype: torch.dtype = None,
         prefix: str = "",
+        override_tp_size: int | None = None,
+        override_tp_rank: int | None = None,
         **kwargs,
     ):
         self.output_sizes = output_sizes
@@ -1269,6 +1271,8 @@ class MergedColumnParallelLinear(LinearBase):
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
             prefix=prefix,
+            override_tp_size=override_tp_size,
+            override_tp_rank=override_tp_rank,
         )
 
     def weight_loader(
@@ -2085,8 +2089,12 @@ class RowParallelLinear(LinearBase):
         reduce_results: bool = True,
         source_quant_dtype: torch.dtype = None,
         prefix: str = "",
+        override_tp_size: int | None = None,
+        override_tp_rank: int | None = None,
         **kwargs,
     ):
+        # Overwritten by super() when an override is given; both sizing and
+        # weight_loader read self.tp_rank/tp_size, so they stay same-sourced.
         self.tp_rank = get_tp_group().rank_in_group
         super().__init__(
             input_size,
@@ -2097,6 +2105,8 @@ class RowParallelLinear(LinearBase):
             reduce_results=reduce_results,
             source_quant_dtype=source_quant_dtype,
             prefix=prefix,
+            override_tp_size=override_tp_size,
+            override_tp_rank=override_tp_rank,
         )
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
