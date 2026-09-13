@@ -1294,15 +1294,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # indices below are positions in the allocated rows.
         num_layers = self.kv_pool.layers
         index_tensors: list[torch.Tensor] = []
-        index_head_dim = getattr(runner.config.hf_config, "index_head_dim", None)
 
         # A row of each is one scheduler block, so `stride(0)` is already the
         # bytes a transfer moves per block -- no `block_ratio` after the fact,
         # and no per-field override to keep in step with the pooling ones.
         # DCP PD still dispatches on the two collapsed roles (`mla.kv` /
         # `dsa.index_cache`) rather than the pool's per-layer names.
+        region_tensors = self.kv_pool.region_tensors()
         block_regions: list[KVTransferRegion] = []
-        for role, t in self.kv_pool.region_tensors():
+        for role, t in region_tensors:
             bpb = t.stride(0) * t.element_size()
             if role.startswith("index."):
                 block_regions.append(
@@ -1325,6 +1325,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     ),
                 )
             )
+        block_tensor_views = [t for _, t in region_tensors]
 
         block_region_consumer_indices = None
         index_cache_layer_ids = getattr(runner, "index_cache_layer_ids", ())
@@ -1425,7 +1426,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         gather_sharded_index = None
         if (
             index_tensors
-            and self.dcp_world_size == 1
+            and getattr(self, "dcp_world_size", None) == 1
             and mooncake_pd_producer_configured(runner.config)
             and self._supports_dcp_index_staging()
         ):
@@ -1443,6 +1444,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             index_staging_pool_size = _index_staging_pool_size(runner.config)
             index_staging_chunk_pages = 256
             first_index_page = index_tensors[0]
+            index_head_dim = getattr(runner.config.hf_config, "index_head_dim", None)
             page_bytes = first_index_page.stride(0) * first_index_page.element_size()
             staging = torch.empty(
                 (
@@ -1488,12 +1490,22 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         return KVTransferTensors(
             block_regions=block_regions,
             slot_regions=[],
+            block_tensor_views=block_tensor_views,
             block_region_consumer_indices=block_region_consumer_indices,
             index_staging_region=index_staging_region,
             index_staging_pool_size=index_staging_pool_size,
             index_staging_chunk_pages=index_staging_chunk_pages,
             prepare_sharded_index=prepare_sharded_index,
             gather_sharded_index=gather_sharded_index,
+            # MLA's latent projection is replicated across TP. Sparse MLA's
+            # index-key projection/cache is replicated as well; only the query
+            # heads and absorbed KV-B/output projections are TP-sharded.
+            # Consequently every PAGE byte published above is identical on
+            # every TP worker (DCP/PCP are separate axes and are rejected by
+            # the current LMCache MP connector).
+            tp_replication_factor=int(
+                getattr(runner.config, "tensor_parallel_size", 1) or 1
+            ),
         )
 
     def _build_dcp_indexer_prefill_meta(self, attn_metadata, bs: int, counts, var):

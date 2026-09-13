@@ -70,6 +70,7 @@ no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only whe
 | **ATOM_USE_TRITON_GEMM** | bool | 0 (false) | If set to `1`, use AITER Triton FP4 weight preshuffled GEMM. Otherwise use AITER ASM FP4 weight preshuffled GEMM. |
 | **ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM** | bool | 0 (false) | If set to `1`, use AITER Triton FP4 GEMM with non-shuffled weights. Takes precedence over the FP4 preshuffled GEMM path selected by `ATOM_USE_TRITON_GEMM`. |
 | **ATOM_USE_TRITON_MXFP4_BMM** | bool | 0 (false) | If set to `1`, use FP4 BMM in MLA attention module. |
+| **ATOM_USE_FLYDSL_GATHER_KV_B_PROJ** | bool | 1 (true) | Use the FlyDSL fused gather + `kv_b_proj` GEMM for MLA's cached-prefix path. Covers page_size-1 fp8 (e4m3) KV with an fp8 weight on gfx950 — i.e. Kimi-K3 / DeepSeek MLA under `--kv-cache-dtype fp8`. Any other shape is rejected before launch and falls back to the Triton gather, once per process, with a warning. Set `0` to force Triton. |
 
 ### GLM-5.3
 

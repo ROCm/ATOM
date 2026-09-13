@@ -173,6 +173,33 @@ def test_speculative_config_mtp_not_misrouted_to_dspark():
     assert hf.architectures == ["DeepseekV4MTPModel"]
 
 
+def test_the_stage_count_still_comes_off_a_checkpoint_directory(tmp_path):
+    import json
+
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {f"mtp.{i}.attn.wo.weight": "s" for i in (0, 1, 2)}})
+    )
+    from atom.models.deepseek_v4_dspark import _count_dspark_stages
+
+    assert _count_dspark_stages(str(tmp_path), default=0) == 3
+
+
+def test_an_unreachable_checkpoint_falls_back_instead_of_raising(tmp_path, monkeypatch):
+    """The probe stays a probe: nothing on disk, nothing cached, no exception."""
+    from huggingface_hub import constants
+
+    from atom.models.deepseek_v4_dspark import _count_dspark_stages
+
+    # Patched on the module, not in the environment: the env var is read once
+    # at import, so setting it here would leave the probe reading whatever real
+    # cache this machine has and reaching the hub for what it misses.
+    monkeypatch.setattr(constants, "HF_HUB_CACHE", str(tmp_path))
+    monkeypatch.setattr(constants, "HF_HUB_OFFLINE", True)
+
+    assert _count_dspark_stages("atom-test/nothing-cached-here", default=7) == 7
+    assert _count_dspark_stages(None, default=7) == 7
+
+
 def test_block_sparse_attention_is_bidirectional_within_block():
     # The block is decoded in one parallel pass, so every draft query position
     # sees every draft KV column, including ones after itself.
