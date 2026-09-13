@@ -479,6 +479,16 @@ try:
 except Exception:  # noqa: BLE001 -- optional kernel; absence is the whole answer
     _FLYDSL_GATHER_AVAILABLE = False
 
+_flydsl_gather_logged: set[str] = set()
+
+
+def _log_flydsl_gather_once(key: str, level: int, msg: str, *args) -> None:
+    """Log one line per outcome; this gather runs once per layer and chunk."""
+    if key in _flydsl_gather_logged:
+        return
+    _flydsl_gather_logged.add(key)
+    logger.log(level, msg, *args)
+
 
 # MLA Specific Arguments
 @dataclass
@@ -1391,20 +1401,37 @@ class MLAAttention(nn.Module):
         weight_scale = getattr(self.kv_b_proj, "weight_scale", None)
         preshuffled = getattr(weight, "is_shuffled", False)
 
-        if self.use_flydsl_gather_kv_b_proj and _FLYDSL_GATHER_AVAILABLE:
-            gather_kv_b_proj_flydsl(
-                kv_buffer,
-                self._k_scale,
-                kv_indptr,
-                kv_indices,
-                cu_seqlens_k,
-                gather_weight,
-                weight_scale,
-                k_out,
-                v_out,
-                weight_preshuffle=preshuffled,
-            )
-            return
+        if self.use_flydsl_gather_kv_b_proj:
+            if not _FLYDSL_GATHER_AVAILABLE:
+                self.use_flydsl_gather_kv_b_proj = False
+            else:
+                try:
+                    gather_kv_b_proj_flydsl(
+                        kv_buffer,
+                        self._k_scale,
+                        kv_indptr,
+                        kv_indices,
+                        cu_seqlens_k,
+                        gather_weight,
+                        weight_scale,
+                        k_out,
+                        v_out,
+                        weight_preshuffle=preshuffled,
+                    )
+                except ValueError as exc:
+                    # FlyDSL validates its supported shape and dtype family
+                    # before launch, so Triton can safely serve this call.
+                    # Shapes are stable per layer; do not retry every chunk.
+                    self.use_flydsl_gather_kv_b_proj = False
+                    _log_flydsl_gather_once(
+                        "fallback",
+                        logging.WARNING,
+                        "[MLA] FlyDSL gather_kv_b_proj rejected this call (%s); "
+                        "falling back to Triton.",
+                        exc,
+                    )
+                else:
+                    return
 
         gather_kv_b_proj(
             kv_buffer,

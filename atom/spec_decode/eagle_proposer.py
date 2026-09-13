@@ -139,9 +139,13 @@ class EagleProposer(Drafter):
             return ()
         draft_hf = self.speculative_config.draft_model_hf_config
         # DeepSeek-V4 carries the mHC residual, so its hidden is [N, hc, dim]
-        # rather than [N, dim]. `hc_mult` is absent on every architecture that
-        # does not, which is exactly the two-dimensional case.
-        hc = getattr(draft_hf, "hc_mult", None)
+        # rather than [N, dim]. GLM inherits hc_mult from its backbone, but
+        # its NextN block carries an ordinary two-dimensional residual.
+        hc = (
+            None
+            if draft_hf.architectures[0] == "Glm5NextMTPModel"
+            else getattr(draft_hf, "hc_mult", None)
+        )
         inputs = {
             # The same int32 the token buffer step 0 reads: the loop rebinds
             # `input_ids` from that buffer to this one, and `stage` asserts the
@@ -157,11 +161,14 @@ class EagleProposer(Drafter):
                 dtype=self.dtype,
             ),
         }
-        # Keep this capability at the non-compiled call site. DeepSeekMTPModel
-        # has the two-dimensional hidden-state and shared-head contracts needed
-        # to feed its fixed graph inputs directly; other draft architectures
+        # Keep this capability at the non-compiled call site. These MTP models
+        # have the two-dimensional hidden-state and shared-head contracts needed
+        # to feed their fixed graph inputs directly; other draft architectures
         # remain on the owned-output path.
-        self._reuse_step_buffers = draft_hf.architectures[0] == "DeepSeekMTPModel"
+        self._reuse_step_buffers = draft_hf.architectures[0] in {
+            "DeepSeekMTPModel",
+            "Glm5NextMTPModel",
+        }
         self.step = DraftGraph(
             forward=self._step_forward,
             epilogue=self._step_head,

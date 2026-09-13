@@ -66,6 +66,23 @@ class SharedHead(nn.Module):
 
 
 class DeepSeekMultiTokenPredictorLayer(nn.Module):
+    @staticmethod
+    def build_mtp_block(
+        atom_config: Config,
+        prefix: str,
+        layer_idx: int,
+        alt_stream: torch.cuda.Stream | None,
+    ) -> nn.Module:
+        return DeepseekV2DecoderLayer(
+            prefix=prefix,
+            config=atom_config.hf_config,
+            cache_config=atom_config.kv_cache_dtype,
+            quant_config=atom_config.quant_config,
+            layer_num=layer_idx,
+            is_mtp_block=True,
+            alt_stream=alt_stream,
+        )
+
     def __init__(
         self,
         atom_config: Config,
@@ -92,16 +109,11 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
             config=config, prefix=prefix, quant_config=atom_config.quant_config
         )
 
-        quant_config = atom_config.quant_config
-
-        self.mtp_block = DeepseekV2DecoderLayer(
-            prefix=prefix,
-            config=self.config,
-            cache_config=atom_config.kv_cache_dtype,
-            quant_config=quant_config,
-            layer_num=layer_idx,
-            is_mtp_block=True,
-            alt_stream=alt_stream,
+        self.mtp_block = self.build_mtp_block(
+            atom_config,
+            prefix,
+            layer_idx,
+            alt_stream,
         )
 
     def forward(
@@ -169,6 +181,9 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         *,
         atom_config: Config,
         prefix: str = "",
+        layer_cls: type[DeepSeekMultiTokenPredictorLayer] = (
+            DeepSeekMultiTokenPredictorLayer
+        ),
     ):
         super().__init__()
         config = atom_config.hf_config
@@ -183,7 +198,7 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         # to map the exact layer index from weights
         self.layers = torch.nn.ModuleDict(
             {
-                str(idx): DeepSeekMultiTokenPredictorLayer(
+                str(idx): layer_cls(
                     atom_config,
                     f"{prefix}.layers.{idx}",
                     layer_idx=idx,
@@ -334,6 +349,10 @@ class DeepSeekMultiTokenPredictor(nn.Module):
 
 @support_torch_compile
 class DeepSeekMTP(nn.Module):
+    predictor_layer_cls = DeepSeekMultiTokenPredictorLayer
+    packed_modules_mapping_override: dict[str, tuple[str, int]] | None = None
+    supports_indexer_projection_fusion = True
+
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
         self.config = atom_config.hf_config
@@ -352,7 +371,11 @@ class DeepSeekMTP(nn.Module):
         ):
             atom_config.quant_config.apply_default_exclude_layers(["*.eh_proj"])
 
-        if hasattr(self.config, "q_lora_rank") and self.config.q_lora_rank is not None:
+        if self.packed_modules_mapping_override is not None:
+            self.packed_modules_mapping = dict(self.packed_modules_mapping_override)
+        elif (
+            hasattr(self.config, "q_lora_rank") and self.config.q_lora_rank is not None
+        ):
             self.packed_modules_mapping = {
                 "q_a_proj": ("fused_qkv_a_proj", 0),
                 "kv_a_proj_with_mqa": ("fused_qkv_a_proj", 1),
@@ -366,7 +389,9 @@ class DeepSeekMTP(nn.Module):
             }
 
         model_prefix = maybe_prefix(prefix, "model")
-        if hasattr(self.config, "index_topk"):
+        if self.supports_indexer_projection_fusion and hasattr(
+            self.config, "index_topk"
+        ):
             indexer_prefixes = [
                 f"{model_prefix}.layers.{idx}.self_attn.indexer"
                 for idx in range(
@@ -390,6 +415,7 @@ class DeepSeekMTP(nn.Module):
         self.model = DeepSeekMultiTokenPredictor(
             atom_config=atom_config,
             prefix=model_prefix,
+            layer_cls=self.predictor_layer_cls,
         )
 
     def remap_mtp_weight_name(self, name: str) -> str | None:
