@@ -1,0 +1,444 @@
+name: ATOM Release Package
+
+# Builds the ATOM wheel (pure Python + the rust-built libmesh.so carried as
+# package data) and publishes it as a GitHub Release asset.
+#
+# ATOM has published wheels before -- v0.1.5 and v0.1.6-rc0 carry
+# atom-<version>+rocm7.0/7.1/7.2-py3-none-any.whl -- but by hand rather than
+# from a workflow. This puts that on rails, keeping the name those releases
+# established. Modeled on aiter's
+# aiter-release.yaml, minus everything that does not apply: ATOM has no HIP
+# kernels to compile, no auditwheel repair step, and no S3 staging — the wheel
+# is the package plus the atomesh rust binary's cdylib, built by the same
+# ATOM_MESH_BUILD=1 hook the docker image uses.
+#
+# The build runs inside the ATOM release image so the wheel is built against
+# the exact torch/triton stack the image ships (the rust mesh build links
+# against torch's C API via pyo3, and libmesh.so is carried as package data).
+#
+# Versioning follows aiter's scheme so the two packages read alike:
+#
+#   v0.1.7          a release, roughly every two weeks
+#   v0.1.7.post1    a fix on top of one
+#   v0.1.8.dev0     a preview, published as a pre-release
+#
+# The two-week rhythm itself is not enforced here: like aiter, the schedule
+# and its cadence gate live in a separate automation workflow that resolves
+# the next tag and calls this one.
+#
+# and the ROCm line the wheel was built against lands in the PEP 440 local
+# segment, the way torch spells it (2.11.0+rocm10.0.0):
+#
+#   atom-0.1.7+rocm10.0.0-cp312-cp312-linux_x86_64.whl
+#   atom-0.1.7+rocm7.2.4-cp312-cp312-linux_x86_64.whl
+#
+# Both hang off the single v0.1.7 tag: the flavor that runs first creates the
+# Release, the next one uploads into it. pip keeps them apart by filename, and
+# a plain `pip install atom==0.1.7` still resolves, because a local segment
+# never changes which release a version belongs to.
+
+on:
+  # Cadence lives in a separate automation workflow, the way aiter splits
+  # aiter-release.yaml from release-automation.yaml: that one holds the
+  # schedule and the every-two-week gate, resolves the next tag, and calls
+  # this workflow to do the building. Keeping the split means the build can
+  # still be driven by hand for a one-off without going through the cadence.
+  workflow_call:
+    inputs:
+      commit:
+        type: string
+        required: false
+        default: ''
+      flavors:
+        type: string
+        required: false
+        default: 'both'
+      build_image:
+        type: string
+        required: false
+        default: ''
+      add_date_stamp:
+        type: boolean
+        required: false
+        default: false
+      draft:
+        type: boolean
+        required: false
+        default: false
+      runner:
+        type: string
+        required: false
+        default: 'linux-atom-mi35x-1'
+
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: 'Commit/tag/ref to build (leave empty to use current commit)'
+        required: false
+        default: ''
+      flavors:
+        description: 'Which ROCm lines to release'
+        type: choice
+        default: 'both'
+        options:
+          - both
+          - rocm7
+          - rocm10
+      build_image:
+        description: 'Override the build image (leave empty to use the flavor default)'
+        required: false
+        default: ''
+      add_date_stamp:
+        description: 'Add date stamp to version (+yyyymmdd)'
+        type: boolean
+        default: false
+      draft:
+        description: 'Create the GitHub Release as a draft'
+        type: boolean
+        default: false
+      runner:
+        description: 'Runner label to use'
+        type: choice
+        default: 'linux-atom-mi35x-1'
+        options:
+          - linux-atom-mi35x-1
+          - build-only-atom
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write  # create the GitHub Release and upload assets
+
+concurrency:
+  group: atom-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    name: Build wheel (${{ matrix.flavor }}) and publish to GitHub Releases
+    runs-on: ${{ inputs.runner || 'linux-atom-mi35x-1' }}
+
+    # One dispatch releases every line. The flavors are built one at a time so
+    # that the first to finish creates the GitHub Release and the rest upload
+    # into it; they also share a runner, so there is nothing to gain from
+    # racing them. fail-fast is off because a break in one ROCm line says
+    # nothing about the other -- that independence is the point of running
+    # both.
+    outputs:
+      release_tag: ${{ steps.version.outputs.release_tag }}
+      build_sha: ${{ steps.builtref.outputs.sha }}
+
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        # Narrowing to one line has to happen here rather than in a job-level
+        # `if`: that is evaluated before the matrix exists, so it cannot see
+        # matrix.flavor. Anything that is not a dispatch (a workflow_call with
+        # no flavors, or a tag push) builds the whole set.
+        flavor: ${{ fromJSON(inputs.flavors == 'rocm7' && '["rocm7"]' || inputs.flavors == 'rocm10' && '["rocm10"]' || '["rocm7","rocm10"]') }}
+
+    env:
+      BUILD_REF: ${{ inputs.commit || github.ref }}
+      BUILD_IMAGE: ${{ inputs.build_image || (matrix.flavor == 'rocm10' && 'rocm/atom-dev:latest-rocm10' || 'rocm/atom-dev:latest') }}
+      ADD_DATE_STAMP: ${{ inputs.add_date_stamp || false }}
+      DRAFT: ${{ inputs.draft || false }}
+
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history + tags for setuptools_scm versioning
+
+      - name: Checkout to user-specified ref (if provided)
+        run: |
+          set -ex
+          if [ -n "${BUILD_REF}" ] && [ "${BUILD_REF}" != "${{ github.ref }}" ]; then
+            echo "Checking out to ref: ${BUILD_REF}"
+            git fetch --all --tags
+            git checkout "${BUILD_REF}"
+          else
+            echo "No ref override, building current commit: $(git rev-parse HEAD)"
+          fi
+
+      - name: Run the build container
+        run: |
+          set -ex
+          echo "Starting container: atom_build_${{ matrix.flavor }}"
+          # The build needs a GPU only if the rust mesh build's torch linkage
+          # check touches one; pass devices when the runner has them.
+          GPU_FLAGS=""
+          if [ -e /dev/kfd ]; then
+            GPU_FLAGS="--device=/dev/kfd --device=/dev/dri --group-add video"
+            echo "GPU devices detected; passing ${GPU_FLAGS} to build container"
+          else
+            echo "No /dev/kfd on runner; starting build container without GPU access"
+          fi
+          docker run -dt \
+            --shm-size=16G \
+            --network=host \
+            ${GPU_FLAGS} \
+            --entrypoint="" \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            --name "atom_build_${{ matrix.flavor }}" \
+            "${BUILD_IMAGE}" \
+            sleep infinity
+
+      - name: Record the commit actually built
+        id: builtref
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Generate version
+        id: version
+        run: |
+          set -ex
+          # Two names come out of this step and they are deliberately different:
+          #
+          #   wheel_version  the PEP 440 version baked into the wheel, carrying
+          #                  a +rocm<ver> local segment so the ROCm 7 and
+          #                  ROCm 10 builds of one commit are distinguishable
+          #                  files (torch does the same: 2.11.0+rocm10.0.0).
+          #   release_tag    the git tag / GitHub Release the wheel is attached
+          #                  to, with the local segment stripped. One tag holds
+          #                  every flavor built from that commit — the release
+          #                  step falls back to uploading into an existing
+          #                  release, so whichever flavor runs second just adds
+          #                  its asset.
+          #
+          # The ROCm version is read from the build container rather than
+          # guessed from the image name, which is why this step runs after the
+          # container is up.
+          ROCM_VER=$(docker exec "atom_build_${{ matrix.flavor }}" bash -c 'cat /opt/rocm/.info/version 2>/dev/null' | tr -d '[:space:]')
+          if [ -z "${ROCM_VER}" ]; then
+            ROCM_VER=$(docker exec "atom_build_${{ matrix.flavor }}" bash -c \
+              'python3 -c "import torch; print(torch.version.hip or \"\")" 2>/dev/null' | tr -d '[:space:]')
+          fi
+          if [ -z "${ROCM_VER}" ]; then
+            echo "ERROR: could not read a ROCm version from ${BUILD_IMAGE}; refusing to build an unlabelled wheel"
+            exit 1
+          fi
+          # Published wheels already spell this as major.minor -- v0.1.5 shipped
+          # atom-0.1.5+rocm7.0, +rocm7.1 and +rocm7.2 -- so keep two components
+          # rather than the SDK's full 7.2.4, or the same line would appear
+          # under two different names across releases.
+          ROCM_VER_FULL="${ROCM_VER}"
+          ROCM_VER="$(echo "${ROCM_VER}" | cut -d. -f1,2)"
+          echo "Build image ROCm version: ${ROCM_VER_FULL} (wheel segment: rocm${ROCM_VER})"
+          echo "rocm_ver_full=${ROCM_VER_FULL}" >> "$GITHUB_OUTPUT"
+
+          DATE_STAMP=""
+          if [ "${ADD_DATE_STAMP}" = "true" ]; then DATE_STAMP=$(date +%Y%m%d); fi
+
+          VERSIONS=$(ROCM_VER="${ROCM_VER}" DATE_STAMP="${DATE_STAMP}" python3 - <<'PYEOF'
+          import os, re, subprocess
+
+          describe = subprocess.run(
+              ["git", "describe", "--tags", "--long", "--dirty"],
+              capture_output=True, text=True).stdout.strip()
+          dirty = describe.endswith("-dirty")
+          if dirty:
+              describe = describe[: -len("-dirty")]
+          # "v0.1.6-rc0-418-g2462800c": the tag itself contains hyphens, so
+          # split from the right -- the last two fields are always <n>-g<sha>.
+          tag, distance, sha = describe.rsplit("-", 2)
+
+          # PEP 440 spells pre-releases without a separator (0.1.6rc0), while
+          # ATOM's tags use one (v0.1.6-rc0). Normalise so pip and setuptools
+          # agree on the ordering; aiter's .devN/.postN tags need no fixing.
+          base = re.sub(
+              r"[-_.]?(rc|c|alpha|a|beta|b|preview|pre)[-_.]?(\d+)",
+              lambda m: {"alpha": "a", "beta": "b", "c": "rc",
+                         "preview": "rc", "pre": "rc"}.get(m.group(1), m.group(1)) + m.group(2),
+              tag.lstrip("v"))
+
+          local = []
+          if int(distance) or dirty:
+              base = f"{base}.post{distance}"
+              local.append(sha)          # already g-prefixed by git describe
+          local.append("rocm" + os.environ["ROCM_VER"])
+          if os.environ.get("DATE_STAMP"):
+              local.append(os.environ["DATE_STAMP"])
+
+          print(f"wheel_version={base}+{'.'.join(local)}")
+          print(f"release_tag=v{base}")
+          PYEOF
+          )
+          echo "${VERSIONS}"
+          echo "${VERSIONS}" >> "$GITHUB_OUTPUT"
+
+      - name: Build wheel
+        env:
+          WHEEL_VERSION: ${{ steps.version.outputs.wheel_version }}
+        run: |
+          set -ex
+          # ATOM_MESH_BUILD=1 is the same hook the docker image uses: builds
+          # the rust mesh crate and places libmesh.so under atom/mesh/target/
+          # for package-data pickup (pyproject [tool.setuptools.package-data]).
+          docker exec \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION="${WHEEL_VERSION}" \
+            -e ATOM_MESH_BUILD=1 \
+            -w /workspace \
+            "atom_build_${{ matrix.flavor }}" \
+            bash -c "python3 -m pip wheel . --no-deps -w dist && ls -lh dist/"
+
+      - name: Validate wheel
+        run: |
+          set -ex
+          # The wheel must carry the mesh cdylib and must install + import
+          # cleanly in the same image it was built in.
+          WHEEL=$(ls dist/atom-*.whl)
+          echo "Wheel: ${WHEEL}"
+          python3 -m zipfile -l "${WHEEL}" | grep -E 'libmesh\.so|atom/_version\.py' \
+            || { echo "ERROR: wheel does not carry libmesh.so / _version.py"; exit 1; }
+          docker exec \
+            -w /workspace \
+            "atom_build_${{ matrix.flavor }}" \
+            bash -c "
+              set -e
+              python3 -m pip install --force-reinstall --no-deps dist/atom-*.whl
+              cd /tmp && python3 -c 'import atom; print(\"atom import ok:\", atom.__file__, atom.__version__)'
+              python3 -c 'import atom.mesh; print(\"atom.mesh import ok\")' || echo 'note: atom.mesh python import not required (cdylib only)'
+            "
+
+      - name: Record what this wheel was built against
+        env:
+          ROCM_VER_FULL: ${{ steps.version.outputs.rocm_ver_full }}
+          WHEEL_VERSION: ${{ steps.version.outputs.wheel_version }}
+        run: |
+          set -eu
+          # The version segment keeps two components, the way v0.1.5's wheels
+          # and aiter's spell it -- users pick a line, not a patch. The exact
+          # SDK the wheel was built against still matters for tracking down a
+          # regression, so it is recorded here and carried into the release
+          # notes rather than into the filename.
+          {
+            echo "  - \`$(basename "$(ls dist/atom-*.whl)")\`"
+            echo "    ROCm ${ROCM_VER_FULL}, image ${BUILD_IMAGE}"
+            docker exec "atom_build_${{ matrix.flavor }}" bash -c \
+              'python3 -c "import torch,sys;print(f\"    torch {torch.__version__}\")" 2>/dev/null' || true
+          } > "dist/provenance-${{ matrix.flavor }}.txt"
+          cat "dist/provenance-${{ matrix.flavor }}.txt"
+
+      - name: Upload wheel as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: atom-whl-${{ matrix.flavor }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/*.whl
+            dist/provenance-*.txt
+          retention-days: 14
+
+      - name: Build summary
+        if: always()
+        run: |
+          {
+            echo "## ATOM Wheel Build"
+            echo "- **Version**: ${{ steps.version.outputs.wheel_version }}"
+            echo "- **Commit**: $(git rev-parse HEAD)"
+            echo "- **Build image**: ${BUILD_IMAGE}"
+            echo "- **Wheel**:"
+            ls -lh dist/*.whl 2>/dev/null | awk '{print "- " $9 " (" $5 ")"}' || echo "- (build failed)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker rm -f "atom_build_${{ matrix.flavor }}" || true
+
+  publish:
+    name: Publish the release once every flavor is in
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.build-and-release.outputs.release_tag }}
+      BUILD_SHA: ${{ needs.build-and-release.outputs.build_sha }}
+      FLAVORS: ${{ inputs.flavors || 'both' }}
+      DRAFT: ${{ inputs.draft || false }}
+
+    steps:
+      - name: Checkout the commit that was built
+        uses: actions/checkout@v4
+        with:
+          # Not the default ref: a dispatch can name any commit, and the tag
+          # has to land on the one the wheels actually came from.
+          ref: ${{ needs.build-and-release.outputs.build_sha }}
+          fetch-depth: 0
+
+      - name: Download every flavor's wheel
+        uses: actions/download-artifact@v4
+        with:
+          pattern: atom-whl-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-wheels
+          merge-multiple: true
+
+      - name: Check the set is complete
+        run: |
+          set -euo pipefail
+          # Publishing is deliberately a separate job: a release that carries
+          # only some of its flavors looks finished from the outside, and
+          # whoever pulls the missing one silently gets another line's wheel.
+          # Uploading as each flavor finished would put exactly that
+          # half-release in front of users for as long as the rest takes.
+          case "${FLAVORS}" in
+            both) expected=2; want="rocm7 rocm10" ;;
+            rocm7) expected=1; want="rocm7" ;;
+            rocm10) expected=1; want="rocm10" ;;
+            *) echo "Unexpected flavors value: ${FLAVORS}"; exit 1 ;;
+          esac
+
+          found=$(find release-wheels -type f -name '*.whl' | wc -l | tr -d ' ')
+          find release-wheels -type f -name '*.whl' -printf '%f\n' | sort
+          if [ "${found}" -ne "${expected}" ]; then
+            echo "Expected exactly ${expected} wheel(s) for flavors='${FLAVORS}', found ${found}."
+            exit 1
+          fi
+          for flavor in ${want}; do
+            n=$(find release-wheels -type f -name "*+${flavor}*.whl" | wc -l | tr -d ' ')
+            if [ "${n}" -ne 1 ]; then
+              echo "Expected one ${flavor} wheel, found ${n}."
+              exit 1
+            fi
+          done
+          echo "Wheel set complete: ${found} wheel(s), one per flavor."
+
+      - name: Create the release and upload every wheel at once
+        run: |
+          set -ex
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="${RELEASE_TAG}"
+            if ! git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
+              git tag "${TAG}" "${BUILD_SHA}"
+              git push origin "refs/tags/${TAG}"
+            fi
+          fi
+          DRAFT_FLAG=""
+          if [ "${DRAFT}" = "true" ]; then DRAFT_FLAG="--draft"; fi
+          gh release create "${TAG}" \
+            --title "ATOM ${TAG}" \
+            --notes "ATOM ${TAG} wheel build.
+
+          - Commit: ${BUILD_SHA}
+          - Wheels:
+          $(cat release-wheels/provenance-*.txt 2>/dev/null | sed 's/^/        /')" \
+            ${DRAFT_FLAG} \
+            --verify-tag \
+            $(find release-wheels -type f -name '*.whl' | sort) \
+            || gh release upload "${TAG}" $(find release-wheels -type f -name '*.whl' | sort) --clobber
+
+      - name: Release summary
+        if: always()
+        run: |
+          {
+            echo "## ATOM Release"
+            echo "- **Tag**: ${RELEASE_TAG}"
+            echo "- **Wheels**:"
+            find release-wheels -type f -name '*.whl' -printf '  - %f\n' | sort || echo "  - (none)"
+          } >> "$GITHUB_STEP_SUMMARY"
