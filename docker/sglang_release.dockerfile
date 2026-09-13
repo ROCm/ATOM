@@ -36,6 +36,17 @@ RUN echo "========== [SGLANG-ATOM 1/6] Clone SGLang ==========" && \
     echo "sglang ref:" && \
     git rev-parse HEAD
 
+# The sglang kernel is PER-ARCH: setup_rocm.py bakes an arch-specific FP8 type
+# into the build (gfx942 -> FNUZ, gfx950 -> E4M3, via -DHIP_FP8_TYPE_*), and each
+# install overwrites the previous one's .so, so one image cannot carry kernels
+# for multiple archs (sglang upstream ships per-arch images for the same
+# reason). SGLANG_KERNEL_ARCH selects the arch explicitly; empty = detect the
+# build GPU, and if no GPU is visible (docker build containers see no /dev/kfd)
+# fall back to SGLANG_KERNEL_ARCH rather than silently picking the last entry
+# of GPU_ARCH — the old last-arch fallback shipped images whose kernel died
+# with "invalid device function" on every other arch (hit on gfx942/308:
+# kvcache.cuh:316 during cuda graph capture).
+ARG SGLANG_KERNEL_ARCH="gfx942"
 RUN echo "========== [SGLANG-ATOM 2/6] Build sglang kernel ==========" && \
     "${VENV_PYTHON}" -m pip uninstall -y sgl-kernel sglang-kernel sglang || true && \
     "${VENV_PYTHON}" -m pip install --upgrade pip setuptools wheel && \
@@ -44,9 +55,9 @@ RUN echo "========== [SGLANG-ATOM 2/6] Build sglang kernel ==========" && \
       FINAL_AMDGPU_TARGET="${DETECTED_AMDGPU_TARGET}"; \
       echo "Detected AMDGPU_TARGET=${FINAL_AMDGPU_TARGET} from build GPU"; \
     else \
-      FINAL_AMDGPU_TARGET="$(printf '%s' "${GPU_ARCH}" | awk -F';' '{print $NF}' | xargs)"; \
+      FINAL_AMDGPU_TARGET="${SGLANG_KERNEL_ARCH}"; \
       test -n "${FINAL_AMDGPU_TARGET}"; \
-      echo "GPU not detectable during build; fallback AMDGPU_TARGET=${FINAL_AMDGPU_TARGET} from GPU_ARCH=${GPU_ARCH}"; \
+      echo "GPU not detectable during build; using SGLANG_KERNEL_ARCH=${FINAL_AMDGPU_TARGET} (the sglang kernel is per-arch: gfx942 and gfx950 need separate images; override with --build-arg SGLANG_KERNEL_ARCH=<arch>)"; \
     fi && \
     cd /app/sglang/python/sglang/kernels/aot && \
     AMDGPU_TARGET="${FINAL_AMDGPU_TARGET}" "${VENV_PYTHON}" setup_rocm.py install && \
