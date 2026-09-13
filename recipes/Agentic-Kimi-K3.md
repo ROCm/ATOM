@@ -25,7 +25,7 @@ Related guides: [`Kimi-K3.md`](Kimi-K3.md) (generic serving / GSM8K),
 |---|---|---|
 | Interactive | 1, 2, 4 | TP8, **DCP=1**, DSpark **7**, synthetic AL **3.84**, GPU prefix cache only (no LMCache). CUDA-graph capture grows with `2 * CONC * 8`. |
 | Mid | 8, 12, 14, 16 | TP8, **DCP=8**, DSpark **3**, synthetic AL **3.00**, LMCache **128 GiB**, `max-num-batched-tokens 8192`. |
-| Throughput | 32, 40, 48, 56, 64 | TP8, **DCP=8**, **no spec**, LMCache on. C32–C48 use 128 GiB; C56/C64 use **192 GiB** and a larger `max-num-seqs` so the in-flight window can track `2 * CONC`. |
+| Throughput | 32, 40, 48, 56, 64, 72, 80 | TP8, **DCP=8**, **no spec**, LMCache on. C32–C48 use 128 GiB; C56–C80 use **192 GiB** and a larger `max-num-seqs` so the in-flight window can track `2 * CONC`. |
 
 The AgentX **client** is the same at every concurrency. Only `--concurrency`
 changes.
@@ -58,19 +58,21 @@ changes.
 | 4 | 1 | 7 | 3.84 | off | 0 | 32 | 8192 | 0.90 | 64 |
 | 8 | 8 | 3 | 3.00 | 128 GiB | 1 | 32 | 8192 | 0.90 | 64 |
 | 12 | 8 | 3 | 3.00 | 128 GiB | 1 | 24 | 8192 | 0.90 | 96 |
-| 14 | 8 | 3 | 3.00 | 128 GiB | 1 | 32 | 8192 | 0.90 | 128 |
+| 14 | 8 | 3 | 3.00 | 128 GiB | 1 | 32 | 8192 | 0.90 | 112 |
 | 16 | 8 | 3 | 3.00 | 128 GiB | 1 | 32 | 8192 | 0.90 | 128 |
 | 32 | 8 | 0 | — | 128 GiB | 0 | 64 | 8192 | 0.90 | 64 |
 | 40 | 8 | 0 | — | 128 GiB | 0 | 80 | 8192 | 0.90 | 80 |
 | 48 | 8 | 0 | — | 128 GiB | 0 | 96 | 8192 | 0.90 | 96 |
 | 56 | 8 | 0 | — | **192 GiB** | 0 | **112** | 8192 | 0.90 | 112 |
 | 64 | 8 | 0 | — | **192 GiB** | 0 | **128** | 8192 | 0.90 | 128 |
+| 72 | 8 | 0 | — | **192 GiB** | 0 | **144** | 8192 | 0.90 | 144 |
+| 80 | 8 | 0 | — | **192 GiB** | 0 | **160** | 8192 | 0.90 | 160 |
 
-C8–C48 use 128 GiB LMCache; C56/C64 use **192 GiB**. LMCache CPU size is
+C8–C48 use 128 GiB LMCache; C56–C80 use **192 GiB**. LMCache CPU size is
 `LMCACHE_MAX_LOCAL_CPU_SIZE`; chunk size is 1024 tokens.
 
-`AITER_REUSE_IDENTICAL_COMM_GROUPS=1` on **C56/C64**, and `0` on every other
-band (C1…C48).
+`AITER_REUSE_IDENTICAL_COMM_GROUPS=1` on **C56/C64/C72/C80**, and `0` on every
+other band (C1…C48).
 
 ## 0. Container prerequisites
 
@@ -165,24 +167,18 @@ case "${CONC}" in
     if [[ "${CONC}" == "12" ]]; then
       MAX_NUM_SEQS=24
     fi
-    # C14 runs the C16 server verbatim, including the pinned CUDA-graph width.
-    # Only the client concurrency is 14. Deriving graph_max from 2*CONC here
-    # would give 28 and the server fails during CUDA-graph warmup.
-    if [[ "${CONC}" == "14" ]]; then
-      CUDAGRAPH_MAX_NUM_SEQS=32
-    fi
     ;;
-  32|40|48|56|64)
+  32|40|48|56|64|72|80)
     # Throughput: no spec, and max-num-seqs tracks 2*CONC so the in-flight
     # window can keep up with the client.
     MAX_NUM_SEQS=$((2 * CONC))
-    # The two largest bands need a bigger CPU tier to stay off the HBM cliff.
+    # The four largest bands need a bigger CPU tier to stay off the HBM cliff.
     if [[ "${CONC}" -ge 56 ]]; then
       LMCACHE_MAX_LOCAL_CPU_SIZE=192
     fi
     ;;
   *)
-    echo "Unsupported CONC=${CONC}; AgentX Kimi-K3 covers 1,2,4,8,12,14,16,32,40,48,56,64." >&2
+    echo "Unsupported CONC=${CONC}; AgentX Kimi-K3 covers 1,2,4,8,12,14,16,32,40,48,56,64,72,80." >&2
     exit 2
     ;;
 esac
