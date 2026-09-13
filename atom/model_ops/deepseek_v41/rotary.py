@@ -64,6 +64,8 @@ class RotaryEmbedding(nn.Module):
         return x
 
     def _inverse_cuda(self, x, positions):
+        if x.numel() == 0:
+            return x
         # Contiguous model outputs use a view. Copy back only for strided callers
         # so the public rotation remains in place for batched chunk views.
         values = x.contiguous()

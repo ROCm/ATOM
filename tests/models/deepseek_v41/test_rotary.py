@@ -12,6 +12,9 @@ from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 @pytest.mark.parametrize(
     "batch,length,heads,head_dim,strided",
     [
+        (1, 0, 16, 512, False),
+        (2, 0, None, 128, False),
+        (0, 5, 8, 512, False),
         (1, 1, 16, 512, False),
         (2, 5, 8, 512, True),
         (2, 5, None, 128, True),
