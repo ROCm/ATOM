@@ -13,7 +13,10 @@ MODEL_PATH="${1:-/data/DeepSeek-R1-0528}"
 TP_SIZE="${2:-8}"
 PORT="${3:-8000}"
 shift 3 2>/dev/null || true
-EXTRA_ARGS="$*"
+# An array, not "$*": a value carrying spaces -- an --online_quant_config
+# JSON, a chat-template kwargs blob -- reaches argv only if it is never
+# re-split. Flattening it here fed argparse the first word and nothing else.
+EXTRA_ARGS=("$@")
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-256}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.9}"
@@ -141,7 +144,7 @@ echo " Port:           $PORT"
 echo " KV Cache dtype: $KV_CACHE_DTYPE"
 echo " Max num seqs:   $MAX_NUM_SEQS"
 echo " GPU mem util:   $GPU_MEM_UTIL"
-echo " Extra args:     ${EXTRA_ARGS:-none}"
+echo " Extra args:     ${EXTRA_ARGS[*]:-none}"
 echo " Date:           $(date)"
 echo "----------------------------------------"
 echo " Inherited env vars (ATOM_*, V4_*, AITER_*, HSA_*, AMD_*, HIP_*):"
@@ -157,7 +160,7 @@ python -m atom.entrypoints.openai_server \
     --max-num-seqs "$MAX_NUM_SEQS" \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
     --server-port "$PORT" \
-    $EXTRA_ARGS \
+    "${EXTRA_ARGS[@]}" \
     >> "$LOG_FILE" 2>&1 &
 
 SERVER_PID=$!
