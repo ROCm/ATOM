@@ -27,7 +27,8 @@ def test_kimi_k3_plugin_registries_are_synchronized():
         == "atom.plugin.vllm.models.kimi_k3:KimiK3ForCausalLMVllm"
     )
     assert (
-        _ATOM_MODEL_CLASSES[arch] == "atom.plugin.vllm.models.kimi_k3:KimiK3ForCausalLM"
+        _ATOM_MODEL_CLASSES[arch]
+        == "atom.plugin.vllm.models.kimi_k3:KimiK3ForConditionalGeneration_"
     )
 
 
@@ -105,6 +106,96 @@ def test_kimi_k3_temporal_state_uses_fp32():
         conv_dtype, temporal_dtype = _get_k3_state_dtype(vllm_config)
         assert conv_dtype == torch.bfloat16
         assert temporal_dtype == torch.float32
+        """)
+
+
+def test_kimi_k3_outer_is_multimodal_and_hybrid():
+    _run_without_test_stubs("""
+        from vllm.model_executor.models.interfaces import IsHybrid
+
+        from atom.plugin.vllm.model_wrapper import ATOMForConditionalGeneration
+        from atom.plugin.vllm.models.kimi_k3 import KimiK3ForCausalLMVllm
+
+        mro = KimiK3ForCausalLMVllm.__mro__
+        # Multimodal via ATOMForConditionalGeneration; hybrid state retained.
+        assert ATOMForConditionalGeneration in mro
+        assert IsHybrid in mro
+
+        # Image placeholder matches the checkpoint token.
+        assert (
+            KimiK3ForCausalLMVllm.get_placeholder_str("image", 0)
+            == "<|kimi_image_placeholder|>"
+        )
+
+        # Hybrid mamba-state entry points survive the base-class change.
+        for name in (
+            "get_mamba_state_dtype_from_config",
+            "get_mamba_state_shape_from_config",
+            "get_mamba_state_copy_func",
+        ):
+            assert hasattr(KimiK3ForCausalLMVllm, name)
+        """)
+
+
+def test_kimi_k3_is_plugin_supported_multimodal():
+    from atom.config import (
+        _MULTIMODAL_MODEL_TYPES,
+        _PLUGIN_SUPPORTED_MULTIMODAL_MODELS,
+    )
+
+    # kimi_k3 must be a known multimodal type AND opted into plugin-mode
+    # pass-through, so get_hf_config keeps vision_config instead of stripping
+    # to text_config.
+    assert "kimi_k3" in _MULTIMODAL_MODEL_TYPES
+    assert "kimi_k3" in _PLUGIN_SUPPORTED_MULTIMODAL_MODELS
+
+
+def test_kimi_k3_inner_conditional_generation_class():
+    _run_without_test_stubs("""
+        from vllm.models.kimi_k3 import (
+            KimiK3ForConditionalGeneration as vLLMKimiK3,
+        )
+        from atom.plugin.vllm.models.kimi_k3 import (
+            KimiK3ForCausalLM,
+            KimiK3ForConditionalGeneration_,
+        )
+
+        # Inner class subclasses the upstream multimodal model so it inherits
+        # embed_multimodal / media parsing / vision-tower forward.
+        assert issubclass(KimiK3ForConditionalGeneration_, vLLMKimiK3)
+
+        # ATOM plugin loading + expert routing entry points exist.
+        assert hasattr(KimiK3ForConditionalGeneration_, "load_weights")
+        assert hasattr(KimiK3ForConditionalGeneration_, "get_expert_mapping")
+
+        # Weight mapper collapses the double language_model nesting and renames
+        # the projector layers.
+        mapper = KimiK3ForConditionalGeneration_.hf_to_atom_mapper
+        assert mapper.orig_to_new_prefix["language_model."] == (
+            "language_model.language_model."
+        )
+        assert mapper.orig_to_new_prefix["mm_projector.proj.0"] == (
+            "mm_projector.linear_1"
+        )
+        assert mapper.orig_to_new_prefix["mm_projector.proj.2"] == (
+            "mm_projector.linear_2"
+        )
+
+        # Language-model wrapper exposes embed_input_ids for vLLM multimodal
+        # discovery.
+        assert hasattr(KimiK3ForCausalLM, "embed_input_ids")
+
+        # Quant-remap attributes must be present (ATOMModelBase reads them off
+        # the inner class); missing them silently corrupts a quantized ckpt.
+        packed = KimiK3ForConditionalGeneration_.packed_modules_mapping
+        assert packed, "packed_modules_mapping must be non-empty"
+
+        excl = KimiK3ForConditionalGeneration_.quant_exclude_name_mapping
+        assert excl, "quant_exclude_name_mapping must be non-empty"
+        # Values carry the doubled language_model. prefix for the extra nesting
+        # (inner.language_model = ATOM KimiK3ForCausalLM -> KimiLinearForCausalLM).
+        for value in excl.values():
+            assert value.startswith("language_model.language_model."), value
         """)
 
 
