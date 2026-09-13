@@ -892,6 +892,12 @@ class ModelRunner:
         prompt position's n-gram (carrying the tokens preceding a chunk); a dummy
         warmup/capture pass stages zeros.
         """
+        # Drop the engram cache + n-gram window for requests that finished or were
+        # preempted since the last batch, before staging (so a reused id that is
+        # re-seeded below is dropped first, then freshly seeded). No-op for ids
+        # engram never saw.
+        if getattr(batch, "engram_dropped", None):
+            self.engram.drop_requests(batch.engram_dropped)
         seq_ids = list(batch.req_ids)
         if batch.is_dummy_run or not seq_ids:
             self.engram.stage_dummy(batch.total_tokens_num)

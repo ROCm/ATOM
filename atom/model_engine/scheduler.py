@@ -161,6 +161,7 @@ class ScheduledBatch:
         next_token_ids: list[int] | None = None,
         state_maintenance_ops: StateMaintenanceOps | None = None,
         engram_ngram: int | None = None,
+        engram_dropped: list[int] | None = None,
     ):
         if scheduled_spec_decode_tokens is None:
             scheduled_spec_decode_tokens = {}
@@ -297,6 +298,12 @@ class ScheduledBatch:
                 )
                 for i, seq in enumerate(seqs.values())
             ]
+
+        # Engram host state for requests that finished or were preempted since
+        # the last batch; the runner drops their cache + n-gram window so a
+        # finished request does not linger in the LRU and a reused id cannot hit
+        # a stale entry. None (no cost) for non-engram models.
+        self.engram_dropped = engram_dropped
 
         # Each sequence's window, staged into one array rather than assigned
         # per sequence: a numpy slice-assign costs ~245ns of dispatch whatever
@@ -526,6 +533,10 @@ class Scheduler:
             )
         else:
             self._engram_ngram = None
+        # Seq ids that finished or were preempted, awaiting an engram host drop on
+        # the next batch (see ScheduledBatch.engram_dropped). Stays empty for
+        # non-engram models.
+        self._engram_drop_pending: list[int] = []
 
         # Admit-rejected seqs (those `_unschedulable_reason` flags). Drained
         # by `take_rejected` each EngineCore step; routed through the same
@@ -1668,6 +1679,7 @@ class Scheduler:
                 next_token_ids=next_token_ids,
                 state_maintenance_ops=self.block_manager.take_state_maintenance_ops(),
                 engram_ngram=self._engram_ngram,
+                engram_dropped=self._drain_engram_dropped(),
             )
             self._consume_state_forks(scheduled_seqs)
 
@@ -1807,6 +1819,7 @@ class Scheduler:
                 if scheduled_seqs
                 else None
             ),
+            engram_dropped=self._drain_engram_dropped(),
         )
         self._consume_state_forks(scheduled_seqs)
         return (decode_batch, scheduled_seqs)
@@ -2411,10 +2424,23 @@ class Scheduler:
             self.running.insert(index, candidate)
         return False
 
+    def _drain_engram_dropped(self) -> list[int] | None:
+        """Hand the pending finished/preempted seq ids to the batch being built
+        and clear them, so each is dropped from the engram host exactly once."""
+        if not self._engram_drop_pending:
+            return None
+        dropped = self._engram_drop_pending
+        self._engram_drop_pending = []
+        return dropped
+
     def preempt(self, seq: Sequence) -> bool:
         if not self._is_preemptable(seq):
             return False
         self.total_preemptions += 1
+        # A preempted seq re-runs prefill on resume (re-seeding its window), so
+        # its engram state can be dropped now rather than lingering in the LRU.
+        if self._engram_ngram is not None:
+            self._engram_drop_pending.append(seq.id)
         seq.status = SequenceStatus.WAITING
         # Strip placeholder + rejected draft tokens added by postprocess.
         # Real token count = seq.num_tokens - mtp_k - num_rejected
@@ -3005,6 +3031,10 @@ class Scheduler:
         self.engine_stats.update_throughput(
             num_generation_tokens=num_new_generation_tokens
         )
+        # Finished requests leave the engram host's cache and n-gram window to be
+        # dropped on the next batch (a no-op for any that never used engram).
+        if self._engram_ngram is not None and finished_seqs:
+            self._engram_drop_pending.extend(seq.id for seq in finished_seqs)
         return finished_seqs
 
     def compute_detailed_aggregates(

@@ -507,6 +507,20 @@ def test_runtime_carried_over_miss_recomputes_from_window_not_placeholder():
     rt.shutdown()
 
 
+def test_runtime_drop_requests_clears_cache_and_window():
+    rt = make_runtime()
+    rt.seed_context(91, [2, 3])
+    rt.prefetch_next([91], np.array([[4]], dtype=np.int64))
+    rt.prefetcher.wait(timeout=30)
+    assert 91 in rt.prefetcher._window
+    assert rt.prefetcher.cache.contains(91, rt.layer_ids[0])
+
+    rt.drop_requests([91])
+    assert 91 not in rt.prefetcher._window
+    assert not rt.prefetcher.cache.contains(91, rt.layer_ids[0])
+    rt.shutdown()
+
+
 def test_runtime_stage_without_tokens_on_miss_is_an_error():
     rt = make_runtime()
     with pytest.raises(RuntimeError, match="no token ids were supplied"):

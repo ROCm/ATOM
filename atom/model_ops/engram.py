@@ -749,8 +749,9 @@ class EngramHost:
         self.max_num_tokens = max_num_tokens
         self.embed_width = num_hash_heads * head_dim
         self.device = device
-        # pin_memory only on device: a CPU-only build (the unit tests) has no
-        # pinned allocator and would raise on construction.
+        # One device buffer per layer, whose address never moves so a captured
+        # decode CUDAGraph keeps reading it. pin_memory only on device: a CPU
+        # build (the unit tests) has no pinned allocator and would raise.
         self.buffers = {
             layer_id: CpuGpuBuffer(
                 max_num_tokens,
@@ -762,17 +763,34 @@ class EngramHost:
             )
             for layer_id in prefetcher.layer_ids
         }
+        # A ring of pinned host buffers feeding each device buffer. The host fills
+        # the next step into a DIFFERENT slot than the one the previous step's H2D
+        # is still reading, so a fill never races an in-flight copy; the device
+        # target stays single (graph-safe). Slot 0 reuses the CpuGpuBuffer's own
+        # pinned tensor; the extra slot is a second pinned buffer.
+        self._n_slots = 2 if device.type == "cuda" else 1
+        self._slot = 0
+        self._host_slots = {
+            layer_id: [self.buffers[layer_id].cpu]
+            + [
+                torch.zeros(
+                    max_num_tokens, self.embed_width, dtype=dtype, pin_memory=True
+                )
+                for _ in range(self._n_slots - 1)
+            ]
+            for layer_id in prefetcher.layer_ids
+        }
         # Streams and events exist only on device; the CPU path (unit tests) runs
-        # everything synchronously and leaves them None. `copy_stream`/`copy_done`
-        # carry the staging H2D; `_token_*` carry the async device->host of the
-        # just-sampled token -- the main thread only launches that copy on the
-        # side stream and records the event, and the worker waits on it before
-        # reading, so the per-step token D2H never blocks the compute thread. The
-        # pinned buffer and event are reused: `stage_embeddings` waits on the
-        # worker before the next step can overwrite them.
+        # everything synchronously and leaves them None. `copy_stream` + a per-slot
+        # `copy_done` carry the staging H2D; `_token_*` carry the async
+        # device->host of the just-sampled token -- the main thread only launches
+        # that copy on the side stream and records the event, and the worker waits
+        # on it before reading, so the per-step token D2H never blocks compute.
         if device.type == "cuda":
             self.copy_stream = torch.cuda.Stream(device)
-            self.copy_done = torch.cuda.Event()
+            self.copy_done = [torch.cuda.Event() for _ in range(self._n_slots)]
+            for event in self.copy_done:
+                event.record(self.copy_stream)  # so the first reuse can wait it
             self._token_d2h_stream = torch.cuda.Stream(device)
             self._token_event = torch.cuda.Event()
             self._token_host = torch.empty(
@@ -782,6 +800,16 @@ class EngramHost:
             self.copy_stream = self.copy_done = None
             self._token_d2h_stream = self._token_event = self._token_host = None
         self._staged_rows = 0
+
+    def _next_slot(self) -> None:
+        """Rotate to the next host staging slot and wait for its previous H2D to
+        drain before the host refills it. With a 2-slot ring this wait is on the
+        copy from two steps back -- normally already complete -- so the next
+        step's fill still overlaps the last step's transfer."""
+        if self.copy_done is None:
+            return
+        self._slot = (self._slot + 1) % self._n_slots
+        self.copy_done[self._slot].synchronize()
 
     @property
     def layer_ids(self) -> tuple[int, ...]:
@@ -841,8 +869,9 @@ class EngramHost:
             miss_windows = self.prefetcher.windows_for_recompute(miss_ids, miss_tokens)
             computed = self.prefetcher.compute(miss_ids, miss_windows)
 
+        self._next_slot()
         for layer_id in self.layer_ids:
-            cpu = self.buffers[layer_id].cpu
+            cpu = self._host_slots[layer_id][self._slot]
             for row, seq_id in enumerate(seq_ids):
                 value = computed.get((seq_id, layer_id))
                 if value is None:
@@ -861,8 +890,9 @@ class EngramHost:
         return staged_rows
 
     def _issue_h2d(self, rows: int) -> None:
-        """Copy `rows` staged rows of every layer buffer to the device and record
-        the completion event `wait_for_embeddings` orders against."""
+        """Copy `rows` staged rows from the current host slot to every layer's
+        device buffer and record the slot's completion event, which
+        `wait_for_embeddings` and the slot's next reuse order against."""
         if self.copy_stream is not None:
             # Capture the compute stream BEFORE entering the copy_stream context:
             # inside it `current_stream()` would return copy_stream, making the
@@ -871,12 +901,15 @@ class EngramHost:
             compute_stream = torch.cuda.current_stream(self.device)
             with torch.cuda.stream(self.copy_stream):
                 self.copy_stream.wait_stream(compute_stream)
-                for buffer in self.buffers.values():
-                    buffer.copy_to_gpu(rows)
-                self.copy_done.record(self.copy_stream)
+                for layer_id, buffer in self.buffers.items():
+                    buffer.gpu[:rows].copy_(
+                        self._host_slots[layer_id][self._slot][:rows],
+                        non_blocking=True,
+                    )
+                self.copy_done[self._slot].record(self.copy_stream)
         else:
-            for buffer in self.buffers.values():
-                buffer.copy_to_gpu(rows)
+            for layer_id, buffer in self.buffers.items():
+                buffer.gpu[:rows].copy_(self._host_slots[layer_id][self._slot][:rows])
         self._staged_rows = rows
 
     def stage_prefill(
@@ -905,8 +938,9 @@ class EngramHost:
             )
         computed = self.prefetcher.compute_prefill(context_tails, chunk_tokens)
         offsets = np.concatenate(([0], np.cumsum(lengths)))
+        self._next_slot()
         for layer_id in self.layer_ids:
-            cpu = self.buffers[layer_id].cpu
+            cpu = self._host_slots[layer_id][self._slot]
             for i, rows in enumerate(computed[layer_id]):
                 base = int(offsets[i])
                 cpu[base : base + lengths[i]].copy_(rows[:, : self.embed_width])
@@ -934,18 +968,24 @@ class EngramHost:
         shapes honest without inventing token ids.
         """
         num_rows = min(int(num_rows), self.max_num_tokens)
-        for buffer in self.buffers.values():
-            buffer.cpu[:num_rows].zero_()
+        self._next_slot()
+        for layer_id in self.layer_ids:
+            self._host_slots[layer_id][self._slot][:num_rows].zero_()
         self._issue_h2d(num_rows)
         return num_rows
 
     def wait_for_embeddings(self) -> None:
-        """Order the compute stream behind the staging H2D."""
+        """Order the compute stream behind the current slot's staging H2D."""
         if self.copy_done is not None:
-            torch.cuda.current_stream(self.device).wait_event(self.copy_done)
+            torch.cuda.current_stream(self.device).wait_event(
+                self.copy_done[self._slot]
+            )
 
     def embeddings(self, layer_id: int) -> torch.Tensor:
-        """Staged rows for one layer, [staged_rows, num_hash_heads * head_dim]."""
+        """Staged rows for one layer, [staged_rows, num_hash_heads * head_dim].
+
+        The device buffer is fixed per layer (the host ring rotates, not this),
+        so a captured decode CUDAGraph reads a stable address."""
         return self.buffers[layer_id].gpu[: self._staged_rows]
 
     def prefetch_next(self, seq_ids: list[int], tokens) -> None:
