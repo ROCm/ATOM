@@ -98,9 +98,10 @@ def native_quant_linear(
 ):
     """FP8 32x32/1x32 or W4A8 1x32 GEMM; inputs and weights stay native.
 
-    Weight scales remain compact and apply to group32 partials in FP32. The
-    correctness path uses BF16 MFMA on register tiles; it retains A8 QAT and
-    native weight storage. Decode splits K with FP32 partial sums.
+    Weight scales remain compact. BF16 MFMA produces group32 dot products;
+    FP64 block accumulation and split-K reduction preserve small contributions
+    until the requested output conversion. A8 QAT and native weight storage
+    are retained without materializing a dequantized weight matrix.
     """
     if x.ndim < 2 or weight.ndim != 2 or dtype not in (torch.bfloat16, torch.float32):
         raise ValueError(
@@ -154,7 +155,7 @@ def native_quant_linear(
     partial = (
         output
         if splits == 1
-        else torch.empty((splits, m, n), device=x.device, dtype=torch.float32)
+        else torch.empty((splits, m, n), device=x.device, dtype=torch.float64)
     )
     bm, bn = (16 if m <= 16 else 32), 64
     blockscale_gemm_kernel[(triton.cdiv(m, bm), triton.cdiv(n, bn), splits)](

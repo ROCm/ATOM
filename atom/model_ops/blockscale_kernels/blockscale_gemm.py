@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
 """Group32 FP8 dot products with compact FP8 or packed FP4 weight storage.
 
-Apply scales to FP32 partials per group. The first correctness path converts
-each tile's FP8/FP4 values in registers and uses BF16 MFMA. Native gfx950 FP8
-MFMA introduces extra reduction error in cancellation probes; enabling it needs
-a separately measured error budget. We never materialize a BF16 weight copy.
+Compute group32 dot products with BF16 MFMA, then retain scaled block sums in
+FP64 until the output conversion. Quantized projections can cancel across blocks
+with very different scales; losing a small term before A8 QAT amplifies the
+error through the model. Inputs and weights remain in their native storage;
+only register accumulators and the bounded split-K scratch use FP64.
 """
 
 import triton
@@ -33,7 +34,7 @@ def blockscale_gemm_kernel(
     row = tl.program_id(0) * BM + tl.arange(0, BM)
     col = tl.program_id(1) * BN + tl.arange(0, BN)
     split = tl.program_id(2)
-    acc = tl.zeros((BM, BN), tl.float32)
+    acc = tl.zeros((BM, BN), tl.float64)
     for base in range(split * PART_K, tl.minimum((split + 1) * PART_K, K), BK):
         offsets = base + tl.arange(0, BK)
         a = tl.load(
@@ -67,9 +68,14 @@ def blockscale_gemm_kernel(
         b_code = tl.load(
             BS + (col // B_GROUP_N) * (K // 32) + base // 32, col < N, other=127
         ).to(tl.uint32)
-        a_scale = (a_code << 23).to(tl.float32, bitcast=True)
-        b_scale = (b_code << 23).to(tl.float32, bitcast=True)
+        # E8M0 exponent zero is 2**-127, not IEEE FP32 zero. Form the
+        # product directly as a normal FP64 power of two, including code zero.
+        exponent = a_code[:, None] + b_code[None, :] + (1023 - 2 * 127)
+        scale = (exponent.to(tl.uint64) << 52).to(tl.float64, bitcast=True)
+        scale = tl.where(
+            (a_code[:, None] == 255) | (b_code[None, :] == 255), float("nan"), scale
+        )
         partial = tl.dot(a.to(tl.bfloat16), b.to(tl.bfloat16))
-        acc += partial * (a_scale[:, None] * b_scale[None, :])
+        acc += partial.to(tl.float64) * scale
     out = C + split * M * N + row[:, None] * N + col[None, :]
     tl.store(out, acc, (row[:, None] < M) & (col[None, :] < N))
