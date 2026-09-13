@@ -60,16 +60,37 @@ owned_in_use() {
         END { print n + 0 }'
 }
 
+# Ownership is decidable only on the server process: its EngineCore child
+# clears HIP_VISIBLE_DEVICES. Empty means this run claims the whole box.
+owns_our_cards() {
+    [ -n "${HIP_VISIBLE_DEVICES:-}" ] || return 0
+    [ "$(tr '\0' '\n' <"/proc/$1/environ" 2>/dev/null |
+        sed -n 's/^HIP_VISIBLE_DEVICES=//p')" = "$HIP_VISIBLE_DEVICES" ]
+}
+
+# Children are reached through the tree, not by name: the worker calls itself
+# ATOM::EngineCore and matches none of the patterns a pkill would use. An
+# EngineCore already orphaned by a dead server is unreachable either way -- it
+# carries neither the card set nor a parent -- and shows up as owned_in_use.
+kill_tree() {
+    local child
+    for child in $(pgrep -P "$1" 2>/dev/null); do
+        kill_tree "$child"
+    done
+    kill -9 "$1" 2>/dev/null || true
+}
+
 # === Pre-flight: ensure GPU is clean ===
 echo "Pre-flight: cleaning up processes and GPU memory..."
 
-# 1. Kill atom server processes
-pkill -f 'atom.entrypoints' 2>/dev/null || true
-sleep 2
-
-# 2. Kill orphaned multiprocessing spawn/tracker (these hold GPU memory after server dies)
-pkill -9 -f 'multiprocessing.spawn' 2>/dev/null || true
-pkill -9 -f 'multiprocessing.resource_tracker' 2>/dev/null || true
+# 1. Kill this run's servers and everything under them. A bare `pkill -f` hits
+#    every ATOM process on the box, which on a shared one is someone else's.
+for pid in $(pgrep -f 'atom\.entrypoints' 2>/dev/null || true); do
+    if owns_our_cards "$pid"; then
+        echo "  killing server $pid and its children"
+        kill_tree "$pid"
+    fi
+done
 sleep 3
 
 # 3. Verify GPU memory is actually free
