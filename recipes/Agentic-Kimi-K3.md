@@ -58,7 +58,7 @@ changes.
 | 4 | 1 | 7 | 3.84 | off | 0 | 32 | 8192 | 0.90 | 64 |
 | 8 | 8 | 3 | 3.00 | 128 GiB | 1 | 32 | 8192 | 0.90 | 64 |
 | 12 | 8 | 3 | 3.00 | 128 GiB | 1 | 24 | 8192 | 0.90 | 96 |
-| 14 | 8 | 3 | 3.00 | 128 GiB | 1 | 32 | 8192 | 0.90 | 128 |
+| 14 | 8 | 3 | 3.00 | 128 GiB | 1 | 32 | 8192 | 0.90 | 112 |
 | 16 | 8 | 3 | 3.00 | 128 GiB | 1 | 32 | 8192 | 0.90 | 128 |
 | 32 | 8 | 0 | — | 128 GiB | 0 | 64 | 8192 | 0.90 | 64 |
 | 40 | 8 | 0 | — | 128 GiB | 0 | 80 | 8192 | 0.90 | 80 |
@@ -165,12 +165,6 @@ case "${CONC}" in
     # C12 is the one band whose in-flight window is not the default 32.
     if [[ "${CONC}" == "12" ]]; then
       MAX_NUM_SEQS=24
-    fi
-    # C14 runs the C16 server verbatim, including the pinned CUDA-graph width.
-    # Only the client concurrency is 14. Deriving graph_max from 2*CONC here
-    # would give 28 and the server fails during CUDA-graph warmup.
-    if [[ "${CONC}" == "14" ]]; then
-      CUDAGRAPH_MAX_NUM_SEQS=32
     fi
     ;;
   32|40|48|56|64|72)
