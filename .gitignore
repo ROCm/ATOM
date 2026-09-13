@@ -63,3 +63,8 @@ online_quant_info_*.json
 # so it lands in `git status` on every local run and gets committed by accident.
 # That has happened before (#1662 removed one), hence the rule rather than care.
 unit-report.xml
+
+# Local A/A pairing runs (perf_check_half.sh output, judged in place)
+perf-pair/
+aa-*.json
+aa-*.log
