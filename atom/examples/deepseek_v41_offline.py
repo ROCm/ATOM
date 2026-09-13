@@ -17,6 +17,7 @@ from aiter.dist.parallel_state import (
     get_tp_group,
     init_distributed_environment,
     initialize_model_parallel,
+    set_custom_all_reduce,
 )
 from transformers import AutoTokenizer
 
@@ -98,6 +99,10 @@ def initialize_parallel():
     rank, local_rank = int(os.environ["RANK"]), int(os.environ["LOCAL_RANK"])
     size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(local_rank)
+    # The eager V4.1 baseline mixes BF16 embedding and FP32 output reductions.
+    # The current AITER custom path is not repeatable for this workload; select
+    # its supported RCCL fallback before constructing any parallel groups.
+    set_custom_all_reduce(False)
     init_distributed_environment(
         world_size=size,
         rank=rank,
