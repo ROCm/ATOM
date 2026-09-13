@@ -235,6 +235,37 @@ class RcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             owner_bases[:, None] + shared_offsets[None, :]
         )
 
+    @staticmethod
+    def _append_aiter_ep_sentinel(
+        result: mk.PrepareResultType,
+        sentinel_expert_id: int | None,
+    ) -> mk.PrepareResultType:
+        """Append AITER's always-masked EP routing column when required.
+
+        AITER's EP tuning lookup assumes that the final top-k column is a fake
+        expert and subtracts it when building the tuned-kernel key.  FusedMoE
+        exposes that fake expert as the trailing ``-1`` entry in ``expert_map``.
+        RCCL transports only real routing columns, so add the fake column after
+        communication; otherwise a real top-k of 6 is looked up as top-k 5.
+        """
+        if sentinel_expert_id is None:
+            return result
+
+        dispatch_a1, dispatch_scale, metadata, dispatch_ids, dispatch_weights = result
+        if dispatch_ids is None or dispatch_weights is None:
+            raise RuntimeError("RCCL prepare did not return routing tensors")
+        sentinel_ids = dispatch_ids.new_full(
+            (dispatch_ids.shape[0], 1), sentinel_expert_id
+        )
+        sentinel_weights = dispatch_weights.new_zeros((dispatch_weights.shape[0], 1))
+        return (
+            dispatch_a1,
+            dispatch_scale,
+            metadata,
+            torch.cat((dispatch_ids, sentinel_ids), dim=1),
+            torch.cat((dispatch_weights, sentinel_weights), dim=1),
+        )
+
     def _prepare_static_decode(
         self,
         a1: torch.Tensor,
@@ -335,7 +366,15 @@ class RcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         quant_config: FusedMoEQuantConfig,
         quant_type: QuantType = QuantType.No,
     ) -> mk.PrepareResultType:
-        del expert_map, quant_config, quant_type
+        del quant_config, quant_type
+        # AITER's EP kernel-selection ABI reserves one trailing, masked expert
+        # ID and subtracts that column from its top-k tuning key.  FusedMoE
+        # advertises the sentinel by extending expert_map by exactly one slot.
+        sentinel_expert_id = (
+            num_experts
+            if expert_map is not None and expert_map.numel() == num_experts + 1
+            else None
+        )
         if apply_router_weight_on_input:
             raise NotImplementedError(
                 "RCCL routed MoE does not support apply_router_weight_on_input"
@@ -350,15 +389,21 @@ class RcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             )
 
         if self._use_static_decode_path():
-            return self._prepare_static_decode(a1, topk_weights, topk_ids)
+            return self._append_aiter_ep_sentinel(
+                self._prepare_static_decode(a1, topk_weights, topk_ids),
+                sentinel_expert_id,
+            )
 
         variable_sizes = self._variable_gather_sizes(a1)
         if variable_sizes is not None:
-            return self._prepare_variable_gather(
-                a1,
-                topk_weights,
-                topk_ids.to(torch.int32),
-                variable_sizes,
+            return self._append_aiter_ep_sentinel(
+                self._prepare_variable_gather(
+                    a1,
+                    topk_weights,
+                    topk_ids.to(torch.int32),
+                    variable_sizes,
+                ),
+                sentinel_expert_id,
             )
 
         self._reject_graph_capture(a1)
@@ -418,15 +463,18 @@ class RcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # num_local_tokens makes some AITER A8W4/EP kernels take the arena path
         # and can corrupt memory when M is already the exact row count. Let
         # fused_moe derive M directly from dispatch_ids instead.
-        return (
-            dispatch_a1,
-            None,
-            mk.ExpertTokensMetadata(
-                expert_num_tokens=None,
-                expert_num_tokens_cpu=None,
+        return self._append_aiter_ep_sentinel(
+            (
+                dispatch_a1,
+                None,
+                mk.ExpertTokensMetadata(
+                    expert_num_tokens=None,
+                    expert_num_tokens_cpu=None,
+                ),
+                dispatch_ids,
+                dispatch_weights,
             ),
-            dispatch_ids,
-            dispatch_weights,
+            sentinel_expert_id,
         )
 
     def finalize(
