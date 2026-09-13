@@ -6,6 +6,8 @@ import math
 import torch
 from torch import nn
 
+from atom.model_ops.v4_kernels.inverse_rope import inverse_rope_inplace
+
 
 class RotaryEmbedding(nn.Module):
     def __init__(
@@ -49,6 +51,8 @@ class RotaryEmbedding(nn.Module):
 
     def forward(self, x, positions, *, inverse=False):
         """Rotate the final RoPE dimensions in place, preserving the NoPE prefix."""
+        if inverse and x.is_cuda:
+            return self._inverse_cuda(x, positions)
         freqs = self.frequencies[positions]
         dim = freqs.shape[-1] * 2
         tail = x[..., -dim:]
@@ -57,4 +61,23 @@ class RotaryEmbedding(nn.Module):
             freqs = freqs.conj()
         shape = [1, positions.numel()] + [1] * (pairs.ndim - 3) + [dim // 2]
         tail.copy_(torch.view_as_real(pairs * freqs.view(shape)).flatten(-2))
+        return x
+
+    def _inverse_cuda(self, x, positions):
+        # Contiguous model outputs use a view. Copy back only for strided callers
+        # so the public rotation remains in place for batched chunk views.
+        values = x.contiguous()
+        batch, length = x.shape[:2]
+        flat_positions = (
+            positions.repeat(batch) if batch > 1 else positions.contiguous()
+        )
+        inverse_rope_inplace(
+            values.view(batch * length, -1, x.shape[-1]),
+            self.frequencies.real[:, None, None, :],
+            self.frequencies.imag[:, None, None, :],
+            flat_positions,
+            self.frequencies.shape[-1] * 2,
+        )
+        if values is not x:
+            x.copy_(values)
         return x
