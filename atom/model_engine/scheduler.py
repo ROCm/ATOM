@@ -529,7 +529,7 @@ class Scheduler:
             self._engram_ngram = int(
                 tc["engram_max_ngram_size"]
                 if isinstance(tc, dict)
-                else getattr(tc, "engram_max_ngram_size")
+                else tc.engram_max_ngram_size
             )
         else:
             self._engram_ngram = None
