@@ -1747,7 +1747,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             prompt = apply_chat_template(
                 tokenizer,
                 custom_message_encoder,
-                [msg.to_template_dict() for msg in messages],
+                messages,
                 tools=request.tools,
                 **merged_kwargs,
             )
@@ -2105,7 +2105,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         prompt = apply_chat_template(
             tokenizer,
             custom_message_encoder,
-            [msg.to_template_dict() for msg in messages],
+            messages,
             tools=anthropic_to_openai_tools(request.tools),
             **merged_kwargs,
         )
@@ -2389,6 +2389,14 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
     except _ClientDisconnected:
         # Client hung up; seq already aborted + popped. Nothing to return.
         return JSONResponse(status_code=499, content={"detail": "client disconnected"})
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": str(exc)},
+            },
+        )
     except Exception as e:
         logger.exception("Error in anthropic_messages")
         return JSONResponse(
@@ -2482,7 +2490,7 @@ async def responses_create(raw_request: Request):
         prompt = apply_chat_template(
             tokenizer,
             custom_message_encoder,
-            [msg.to_template_dict() for msg in messages],
+            messages,
             tools=openai_tools,
             **merged_kwargs,
         )
@@ -2670,6 +2678,8 @@ async def responses_create(raw_request: Request):
 
     except _ClientDisconnected:
         return JSONResponse(status_code=499, content={"detail": "client disconnected"})
+    except ValueError as exc:
+        return await value_error_handler(raw_request, exc)
     except Exception as e:
         logger.exception("Error in responses_create")
         return JSONResponse(

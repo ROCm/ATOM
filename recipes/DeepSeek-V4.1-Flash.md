@@ -2,8 +2,8 @@
 
 The native text backbone and paged ModelRunner/Scheduler lifecycle are usable
 on the user-accepted P04 arithmetic baseline. The original V4 BF16 attention
-and inverse RoPE kernels are reused. Chat/tool protocol integration, vision and
-speculative decoding remain separate milestones.
+and inverse RoPE kernels are reused. Chat/tool/reasoning protocol integration is
+complete; vision and speculative decoding remain separate milestones.
 
 The reference revision is `dba1be0a40aa45a94ad051997016db3960a90277`.
 Real-checkpoint acceptance uses `ljin_dev`, four MI355X GPUs, TP4 and whole-expert
@@ -18,7 +18,7 @@ EP, with weights at `/mnt/DeepSeek-V4.1-Flash`. AITER is pinned to
 | P03 | Single-Pass mHC, MoE arithmetic and Engram math/history | Complete |
 | P04 | Full-layer text baseline | Accepted; reference differences documented |
 | P05 | Paging, batching and request-state lifecycle | Complete |
-| P06 | Chat, tools and reasoning-effort protocol | Pending |
+| P06 | Chat, tools and reasoning-effort protocol | Complete |
 | P07 | Vision and image requests | Pending |
 | P08 | Multimodal chunking and embedding lifetime | Pending |
 | P09 | Packed cache, AITER W4A8 experts and PIECEWISE graphs | Complete; MoE precision tradeoff accepted |
@@ -38,8 +38,9 @@ have separate implementations.
 See the [offline guide](../docs/deepseek_v41_offline.md) for a raw-text example,
 the [runtime guide](../docs/deepseek_v41_runtime.md) for paged execution and
 supported configuration, and [reference validation](../docs/deepseek_v41_validation.md)
-for the accepted numerical differences. The runtime validates unsupported
-combinations before loading weights.
+for the accepted numerical differences. The [protocol guide](../docs/deepseek_v41_protocol.md)
+covers numeric reasoning effort, tool calls and multi-turn history. The runtime
+validates unsupported combinations before loading weights.
 
 For a bounded real-checkpoint TP4 regression in the development container:
 

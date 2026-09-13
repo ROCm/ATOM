@@ -119,6 +119,6 @@ chunk. `expert_backend="eager"` remains the default and preserves P05 arithmetic
 See [the P09 report](deepseek_v41_performance.md) for cache formats, graph
 ownership, comparison commands and measured limits. FULL graphs, torch.compile,
 speculative decoding, PP/CP/DP, TBO, KV transfer, plugin execution and EPLB remain
-rejected before loading. Vision and the V4.1 chat/tool protocol belong to later
-milestones. Host Engram lookup still reads final GPU IDs on the CPU; HBM lookup
-and further fusion belong to P11.
+rejected before loading. The [V4.1 chat/tool protocol](deepseek_v41_protocol.md)
+is enabled by P06; vision remains a separate milestone. Host Engram lookup still
+reads final GPU IDs on the CPU; HBM lookup and further fusion belong to P11.
