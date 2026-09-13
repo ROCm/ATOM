@@ -4379,9 +4379,9 @@ class DeepseekV4Model(nn.Module):
         self.hc_eps = args.hc_eps
         self.hc_mult = args.hc_mult
         self._mhc_arch = get_gfx()
-        self.enable_res_preshuffle = aiter.mhc_res_shuffle_enabled(
-            1, self._mhc_arch
-        )
+        self.enable_res_preshuffle = hasattr(
+            aiter, "mhc_res_shuffle_enabled"
+        ) and aiter.mhc_res_shuffle_enabled(1, self._mhc_arch)
 
         # VocabParallelEmbedding shards along vocab dim. At TP=1 weight shape
         # equals nn.Embedding's [vocab_size, dim] so dummy state_dicts load
