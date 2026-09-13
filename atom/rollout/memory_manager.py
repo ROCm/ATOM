@@ -24,13 +24,57 @@ _POOL_VIEW_ATTRS = (
 )
 
 
+# Both of these take the runner rather than being methods on the mixin below,
+# because its methods are called unbound on stand-ins that provide only the
+# attributes they touch -- `tests/test_rollout_memory_manager.py` hands
+# `_release_kv_cache` a `SimpleNamespace`.
+def sleep_keeps_memory_resident(runner) -> bool:
+    """Whether sleep should leave *runner*'s weights and KV pool allocated.
+
+    Keeping them costs the whole footprint the caller went to sleep to
+    reclaim, so it is opt-in (`Config.sleep_keeps_memory_resident`) rather
+    than the default for every non-eager deployment. What it buys is that
+    nothing a decode graph captured moves, so nothing has to be recaptured --
+    recapture is what faults under
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments.
+
+    Both reads go through `getattr`, and `enforce_eager` defaults to True,
+    i.e. to releasing: a host that defines neither gets the behaviour every
+    caller had before this option existed.
+    """
+    if getattr(runner, "enforce_eager", True):
+        return False
+    return bool(
+        getattr(getattr(runner, "config", None), "sleep_keeps_memory_resident", False)
+    )
+
+
+def release_cudagraphs(runner) -> None:
+    """Drop *runner*'s captured decode graphs and mark them for recapture.
+
+    A graph replays the addresses it captured: every weight, and the base of
+    the KV pool. Whichever of the two a release frees, the graphs that
+    captured it can no longer be replayed, so both release paths come through
+    here. Releasing the KV pool alone -- what `AsyncLLMEngine.sleep(level=1)`
+    does, and the default level -- used to leave the graphs in place to be
+    replayed against a pool that had since been freed and reallocated.
+    """
+    if getattr(runner, "enforce_eager", True) or not getattr(runner, "graphs", None):
+        return
+    runner._graphs_backup_keys = list(runner.graphs.keys())
+    runner.graphs.clear()
+    runner.graph_pool = None
+    logger.info(f"{runner.label}: CUDA graphs released for sleep")
+
+
 class MemoryManagerMixin:
     """Mixin providing GPU memory lifecycle management for ModelRunner.
 
     Host class must provide:
       - self.model (nn.Module)
       - self.device (torch.device)
-      - self.config (Config) — with num_kvcache_blocks
+      - self.config (Config) — with num_kvcache_blocks and
+        sleep_keeps_memory_resident
       - self.kv_cache — KV cache tensor
       - self.enforce_eager (bool)
       - self.label (str)
@@ -100,13 +144,15 @@ class MemoryManagerMixin:
     def _release_weights(self) -> None:
         if not hasattr(self, "model") or self.model is None:
             return
+        if sleep_keeps_memory_resident(self):
+            logger.info(
+                f"{self.label}: sleep keeps the weights and the CUDA graphs "
+                f"resident (Config.sleep_keeps_memory_resident)"
+            )
+            return
         # Release CUDA graphs first — they hold references to weight memory
         # and prevent freeing GPU memory.
-        if not self.enforce_eager and hasattr(self, "graphs") and self.graphs:
-            self._graphs_backup_keys = list(self.graphs.keys())
-            self.graphs.clear()
-            self.graph_pool = None
-            logger.info(f"{self.label}: CUDA graphs released for sleep")
+        release_cudagraphs(self)
         # Discard GPU weight data but keep shape/dtype metadata so that
         # weight sync (SHM or IPC) can do param.data.copy_() later.
         # The weights are always overwritten after resume, so offloading
@@ -122,6 +168,12 @@ class MemoryManagerMixin:
 
     def _resume_weights(self) -> None:
         if not hasattr(self, "model") or self.model is None:
+            return
+        if sleep_keeps_memory_resident(self) and not getattr(
+            self, "_weights_discarded", False
+        ):
+            # Nothing was released, so there is nothing to restore -- and the
+            # point of the option is that no parameter moves.
             return
         if getattr(self, "_weights_discarded", False):
             # Weights were discarded — allocate empty GPU tensors with the
@@ -144,6 +196,15 @@ class MemoryManagerMixin:
     def _release_kv_cache(self) -> None:
         if not hasattr(self, "kv_cache") or self.kv_cache is None:
             return
+        if sleep_keeps_memory_resident(self):
+            logger.info(
+                f"{self.label}: sleep keeps the KV pool resident "
+                f"(Config.sleep_keeps_memory_resident); clear_kv_cache() still "
+                f"zeroes it"
+            )
+            return
+        # The graphs captured the base of the pool this is about to free.
+        release_cudagraphs(self)
         self._kv_cache_num_blocks = self.config.num_kvcache_blocks
 
         # Clear per-module KV cache views that share the underlying storage.
@@ -197,6 +258,14 @@ class MemoryManagerMixin:
         return models
 
     def _resume_kv_cache(self) -> None:
+        # The matching half of the release guard: the pool was never freed, so
+        # there is nothing to re-allocate and rebind.
+        if (
+            sleep_keeps_memory_resident(self)
+            and getattr(self, "kv_cache", None) is not None
+        ):
+            return
+
         if (
             not hasattr(self, "_kv_cache_num_blocks")
             or self._kv_cache_num_blocks is None
@@ -228,8 +297,11 @@ class MemoryManagerMixin:
 
         We only recapture when **both** weights and KV cache are on GPU
         (i.e., the model is fully ready for inference).
+
+        Nothing to do under `sleep_keeps_memory_resident`: nothing was
+        released, so `_graphs_backup_keys` is absent and this returns below.
         """
-        if self.enforce_eager:
+        if getattr(self, "enforce_eager", True):
             return
         if not hasattr(self, "_graphs_backup_keys") or not self._graphs_backup_keys:
             return

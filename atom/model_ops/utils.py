@@ -154,7 +154,16 @@ def shuffle_weights(*tensors: torch.nn.Parameter, layout: tuple[int, int] = (16,
 
         weight = tensor.data
         if weight.dim() == 2:
-            tensor.data = shuffle_weight(weight, layout=layout)
+            shuffled = shuffle_weight(weight, layout=layout)
+            # Write through the existing storage, the way the 3D branch below
+            # already does, so that an online weight update does not move an
+            # address a captured CUDA graph holds. Rebind only when shuffling
+            # changes the shape or dtype, which no captured graph can survive
+            # anyway.
+            if shuffled.shape == weight.shape and shuffled.dtype == weight.dtype:
+                weight.copy_(shuffled)
+            else:
+                tensor.data = shuffled
         elif weight.dim() == 3:
             # Split fully on dim0 and shuffle each 2D slice independently.
             for i in range(weight.shape[0]):
@@ -166,6 +175,34 @@ def shuffle_weights(*tensors: torch.nn.Parameter, layout: tuple[int, int] = (16,
             )
 
         tensor.is_shuffled = True
+
+
+def shuffle_expert_slices(
+    tensor: torch.nn.Parameter,
+    expert_ids: list[int],
+    layout: tuple[int, int] = (16, 16),
+) -> None:
+    """Re-apply the expert layout to selected slices of a 3D expert buffer.
+
+    ``shuffle_weights`` covers the whole buffer, which is what an initial load
+    wants. An online weight update rewrites some experts and must leave the
+    rest alone: shuffling an already-shuffled slice does not undo the first
+    shuffle, it produces a third layout.
+
+    Per slice and in place, so the buffer keeps the address a captured CUDA
+    graph holds. Equivalent to what the load did, because
+    ``shuffle_weights``'s own 3D branch shuffles each slice independently.
+    """
+    if not isinstance(tensor, torch.nn.Parameter):
+        raise TypeError(f"Expected torch.nn.Parameter, but got {type(tensor)}")
+    weight = tensor.data
+    if weight.dim() != 3:
+        raise ValueError(
+            f"Expected a 3D expert buffer to shuffle per expert, got {weight.dim()}D"
+        )
+    for expert_id in expert_ids:
+        weight[expert_id].copy_(shuffle_weight(weight[expert_id], layout=layout))
+    tensor.is_shuffled = True
 
 
 def all_close_1d(x: torch.Tensor) -> bool:

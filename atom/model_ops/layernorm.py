@@ -60,7 +60,11 @@ def rmsnorm2d_fwd_(
 ) -> torch.Tensor:
     ori_shape = x.shape
     x = x.reshape(-1, dim)
-    return rmsnorm2d_fwd(x, weight, eps).view(ori_shape)
+    if envs.ATOM_USE_MODEL_SENSITIVE_RMSNORM:
+        out = rmsnorm2d_fwd(x, weight, eps, use_model_sensitive_rmsnorm=1)
+    else:
+        out = rmsnorm2d_fwd(x, weight, eps)
+    return out.view(ori_shape)
 
 
 @torch_compile_guard()
@@ -71,7 +75,18 @@ def rmsnorm2d_fwd_with_add_(
     x = x.reshape(-1, dim)
     out = torch.empty_like(x)
     residual_out = torch.empty_like(x)
-    rmsnorm2d_fwd_with_add(out, x, residual, residual_out, weight, eps)
+    if envs.ATOM_USE_MODEL_SENSITIVE_RMSNORM:
+        rmsnorm2d_fwd_with_add(
+            out,
+            x,
+            residual,
+            residual_out,
+            weight,
+            eps,
+            use_model_sensitive_rmsnorm=1,
+        )
+    else:
+        rmsnorm2d_fwd_with_add(out, x, residual, residual_out, weight, eps)
     return out.view(ori_shape), residual_out.view(ori_shape)
 
 
