@@ -7,7 +7,11 @@ from aiter.dist.parallel_state import get_tp_group
 from torch import nn
 
 from atom.model_ops.attentions.deepseek_v41_state import EagerAttentionCache
-from atom.model_ops.deepseek_v41.mhc import SinglePassHCState, apply_sublayer
+from atom.model_ops.deepseek_v41.mhc import (
+    SinglePassHCState,
+    expand_residual,
+    predict_mixes,
+)
 from atom.model_ops.deepseek_v41.normalization import RMSNorm
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 from atom.model_ops.embed_head import VocabParallelEmbedding
@@ -91,33 +95,83 @@ class Block(nn.Module):
                 projection=projection,
             )
 
-    def forward(self, state, cache, step, rope, embeddings=None, image_mask=None):
+    def prepare_attention(self, residual, pre_mix, embeddings, image_mask):
         if self.engram is not None:
             if embeddings is None:
                 raise ValueError("Engram rows must be prepared before model execution")
-            state = SinglePassHCState(
-                self.engram(
-                    state.residual,
-                    embeddings,
-                    None if image_mask is None else ~image_mask,
-                ),
-                state.pre_mix,
+            residual = self.engram(
+                residual,
+                embeddings,
+                None if image_mask is None else ~image_mask,
             )
-        state = apply_sublayer(
-            state,
-            lambda hidden: self.attn(self.attn_norm(hidden), cache, step, rope),
+        state = SinglePassHCState(residual, pre_mix)
+        pre, post, comb = predict_mixes(
+            residual,
             self.hc_attn_fn,
             self.hc_attn_scale,
             self.hc_attn_base,
             **self.hc_options,
         )
-        return apply_sublayer(
-            state,
-            lambda hidden: self.ffn(self.ffn_norm(hidden), image_mask),
+        return self.attn_norm(state.collapse()), residual, pre, post, comb
+
+    def prepare_ffn(self, output, residual, pre, post, comb):
+        residual = expand_residual(output, residual, post, comb)
+        state = SinglePassHCState(residual, pre)
+        pre, post, comb = predict_mixes(
+            residual,
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
             **self.hc_options,
+        )
+        return self.ffn_norm(state.collapse()), residual, pre, post, comb
+
+    def decode_ffn(self, hidden, image_mask):
+        return (self.ffn(hidden, image_mask),)
+
+    def finish_ffn(self, output, residual, pre, post, comb):
+        return expand_residual(output, residual, post, comb), pre
+
+    def forward(
+        self,
+        state,
+        cache,
+        step,
+        rope,
+        embeddings=None,
+        image_mask=None,
+        *,
+        execution=None,
+    ):
+        # Execution policy may capture pure tensor stages. Attention, request
+        # state and expert dispatch keep their own execution/lifetime contracts.
+        run = (
+            (lambda function, *args: function(*args))
+            if execution is None
+            else execution
+        )
+        hidden, residual, pre, post, comb = run(
+            self.prepare_attention,
+            state.residual,
+            state.pre_mix,
+            embeddings,
+            image_mask,
+        )
+        output = self.attn(hidden, cache, step, rope)
+        hidden, residual, pre, post, comb = run(
+            self.prepare_ffn,
+            output,
+            residual,
+            pre,
+            post,
+            comb,
+        )
+        if step.decode and self.ffn.can_capture(hidden.shape[0] * hidden.shape[1]):
+            (output,) = run(self.decode_ffn, hidden, image_mask)
+        else:
+            output = self.ffn(hidden, image_mask)
+        return SinglePassHCState(
+            *run(self.finish_ffn, output, residual, pre, post, comb)
         )
 
 
@@ -171,7 +225,9 @@ class DeepseekV41ForCausalLM(nn.Module):
             if module is not self and hasattr(module, "process_weights_after_loading"):
                 module.process_weights_after_loading()
 
-    def forward_hidden(self, token_ids, cache, step, engram_embeddings=None):
+    def forward_hidden(
+        self, token_ids, cache, step, engram_embeddings=None, *, execution=None
+    ):
         # ATOM's sharded embedding consumes flat tokens; restore this offline
         # interface's batch/sequence dimensions before entering model math.
         hidden = self.embed(token_ids.flatten()).view(
@@ -182,7 +238,12 @@ class DeepseekV41ForCausalLM(nn.Module):
         for spec, layer in zip(self.topology, self.layers):
             rope = self.global_rope if spec.ratio else self.window_rope
             state = layer(
-                state, cache, step, rope, engram_embeddings.get(spec.layer_id)
+                state,
+                cache,
+                step,
+                rope,
+                engram_embeddings.get(spec.layer_id),
+                execution=execution,
             )
         hidden = state.collapse()
         return hidden

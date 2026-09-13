@@ -4,6 +4,11 @@
 import torch
 import torch.nn.functional as F
 
+from atom.model_ops.attentions.deepseek_v41.packed_rows import (
+    gather_index_rows,
+    pack_rows,
+    write_packed_window,
+)
 from atom.model_ops.attentions.deepseek_v41_state import AttentionStep
 from atom.model_ops.attentions.pool_layout.entry_arena import EntryMajorArena
 from atom.model_ops.deepseek_v41.compressor import CompressorTail
@@ -16,11 +21,14 @@ from .metadata import BatchStep
 class PagedIndexKeys:
     """Read only a scoring tile or the selected candidate rows."""
 
-    def __init__(self, pages, block_table, count):
+    def __init__(self, pages, block_table, count, packed_dim=None):
         self.pages, self.block_table = pages, block_table
-        self.shape = (1, count, pages.shape[-1])
+        self.packed_dim = packed_dim
+        self.shape = (1, count, packed_dim or pages.shape[-1])
 
     def _read(self, ids):
+        if self.packed_dim is not None:
+            return gather_index_rows(self.pages, self.block_table, ids, self.packed_dim)
         rows = self.pages.shape[1]
         blocks = self.block_table[ids // rows].long()
         return self.pages[blocks, ids % rows]
@@ -36,6 +44,7 @@ class PagedIndexKeys:
 class RequestCache:
     def __init__(self, cache, span, blocks):
         self.cache, self.span, self.blocks = cache, span, blocks
+        self.packed = cache.geometry.packed
 
     def read_tail(self, owner, position):
         if position % 2 == 0 or owner not in self.cache.tail_indices:
@@ -63,6 +72,8 @@ class RequestCache:
 
     def write_global(self, owner, begin, main, index):
         for kind, value in (("main", main), ("index", index)):
+            if self.packed:
+                value = pack_rows(*value)
             pages = self.cache.pages.view(f"{kind}_{owner}")[0]
             rows = pages.shape[1]
             ids = torch.arange(begin, begin + value.shape[1], device=value.device)
@@ -70,7 +81,10 @@ class RequestCache:
 
     def index_keys(self, owner, count):
         return PagedIndexKeys(
-            self.cache.pages.view(f"index_{owner}")[0], self.blocks, count
+            self.cache.pages.view(f"index_{owner}")[0],
+            self.blocks,
+            count,
+            self.cache.geometry.index_dim if self.packed else None,
         )
 
 
@@ -79,6 +93,7 @@ class PagedAttentionCache:
         if pages < 1 or slots < 1:
             raise ValueError("A paged cache needs positive PAGE and STATE capacities")
         self.geometry, self.num_pages, self.num_slots = geometry, pages, slots
+        self.packed = geometry.packed
         size = pages * geometry.page_bytes + slots * geometry.state_bytes
         self.backing = torch.zeros(size, dtype=torch.uint8, device=device)
         boundary = pages * geometry.page_bytes
@@ -100,7 +115,11 @@ class PagedAttentionCache:
         self.page_bytes = self.backing[:boundary].view(pages, geometry.page_bytes)
         self.cursor = self.state.view("cursor")[0]
         self.cursor[:, 1:].fill_(-1)
-        self.pool = self.backing.view(torch.bfloat16).view(-1, geometry.head_dim)
+        self.pool = (
+            self.backing.view(-1, 1)
+            if geometry.packed
+            else self.backing.view(torch.bfloat16).view(-1, geometry.head_dim)
+        )
         self.tail_indices = {owner: i for i, owner in enumerate(geometry.tail_owners)}
 
     def begin_step(self, requests):
@@ -198,6 +217,11 @@ class PagedAttentionCache:
     def write_window(self, layer, kv, step):
         if step.length:
             window = self.geometry.window(layer, self.num_pages)
+            if self.packed:
+                write_packed_window(
+                    *kv, self.backing, step, window, self.geometry.head_dim
+                )
+                return
             swa_write(
                 kv.flatten(0, 1),
                 step.positions,

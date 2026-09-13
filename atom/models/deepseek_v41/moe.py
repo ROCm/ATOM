@@ -13,6 +13,7 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 
+from .config import ExpertBackend
 from .layers import native_quant_config, reduce_output
 
 
@@ -20,6 +21,8 @@ class MoE(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.group = get_tp_group()
+        self.backend = ExpertBackend(getattr(config, "expert_backend", "eager"))
+        self.aiter_experts = None
         self.num_experts = config.n_routed_experts
         self.gate = Router(
             config.hidden_size,
@@ -50,14 +53,34 @@ class MoE(nn.Module):
             swiglu_limit=config.swiglu_limit,
         )
 
+    def process_weights_after_loading(self):
+        if self.backend == ExpertBackend.AITER:
+            from atom.model_ops.deepseek_v41.moe_aiter import AiterExperts
+
+            self.aiter_experts = AiterExperts(self.experts, self.num_experts)
+
+    def can_capture(self, tokens):
+        return (
+            self.backend == ExpertBackend.AITER
+            and self.aiter_experts is not None
+            and tokens <= self.aiter_experts.max_tokens
+        )
+
     def forward(self, hidden, image_mask=None):
         flat = hidden.reshape(-1, hidden.shape[-1])
         weights, indices = self.gate(
             flat, None if image_mask is None else image_mask.flatten()
         )
-        output = execute_experts(
-            flat, weights, indices, self.experts, self.num_experts, self.group
-        )
+        if self.backend == ExpertBackend.AITER:
+            if self.aiter_experts is None:
+                raise RuntimeError("AITER expert views must be finalized after loading")
+            output = self.aiter_experts(flat, weights, indices)
+            if self.group.world_size > 1:
+                output = self.group.all_reduce(output, ca_fp8_quant=False)
+        else:
+            output = execute_experts(
+                flat, weights, indices, self.experts, self.num_experts, self.group
+            )
         # Upstream rounds the complete shared FFN output once. Its TP
         # partials must remain FP32 until after the reduction.
         shared = reduce_output(

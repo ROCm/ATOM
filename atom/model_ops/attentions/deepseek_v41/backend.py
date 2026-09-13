@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 """ATOM scheduling adapter for the eager CSA2 paged runtime."""
 
+from types import SimpleNamespace
+
 import torch
 
 from atom.model_engine.engram_runtime import EngramInputPreparer
@@ -10,7 +12,7 @@ from atom.model_ops.attentions.backends import AttentionBackend, CommonAttention
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import page_pool, state_pool
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 from atom.models.deepseek_v41.config import AttentionMode, build_attention_topology
-from atom.utils.forward_context import AttentionMetaData, AttnState
+from atom.utils.forward_context import AttentionMetaData, AttnState, Context
 
 from .cache import PagedAttentionCache
 from .checkpoints import StateCopies
@@ -49,6 +51,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             self.config.head_dim,
             self.config.index_head_dim,
             self.config.engram_max_ngram_size - 1,
+            packed=model_runner.config.kv_cache_dtype == "fp4",
         )
         self.cache = self.copies = self.engram = None
         self.dummy_weights = bool(model_runner.config.load_dummy)
@@ -193,6 +196,27 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         metadata.next_histories = histories
 
     def build_for_cudagraph_capture(self, bs):
-        raise NotImplementedError(
-            "CSA2 graph execution is a later milestone; use enforce_eager"
+        # Only pure dense stages are captured. All attention warmup uses a
+        # private PAGE/STATE allocation and can never alter live requests.
+        batch = SimpleNamespace(
+            is_dummy_run=True,
+            req_ids=tuple(range(bs)),
+            num_scheduled_tokens=(1,) * bs,
+            context_lens=(1,) * bs,
+            state_slots_committed=(),
+            total_seqs_num=bs,
+            total_tokens_num=bs,
+        )
+        metadata, positions = self._prepare(batch, bs, bs)
+        self.prepare_model_inputs(
+            self.model_runner.forward_vars["input_ids"].gpu[:bs], metadata
+        )
+        return metadata, Context(
+            positions=positions,
+            is_prefill=False,
+            is_dummy_run=True,
+            scheduled_bs=bs,
+            scheduled_tokens=bs,
+            running_bs=bs,
+            running_tokens=bs,
         )

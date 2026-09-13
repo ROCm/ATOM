@@ -27,6 +27,8 @@ class AttentionStep:
 
 
 class EagerAttentionCache:
+    packed = False
+
     """Fixed-batch storage with private SWA rings and one global region per owner.
 
     The pool uses V4's row-addressed BF16 ABI. It is allocated for one offline

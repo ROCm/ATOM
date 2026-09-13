@@ -28,11 +28,14 @@ from atom.models.deepseek_v41.config import build_attention_topology
 from tests.attentions.deepseek_v41.helpers import geometry
 
 
+@pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_checkpoint_fork_rollback_relocation_and_slot_reuse(small_config, device):
+def test_checkpoint_fork_rollback_relocation_and_slot_reuse(
+    small_config, device, packed
+):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("ROCm GPU required")
-    geo = geometry(small_config, block=2)
+    geo = replace(geometry(small_config, block=2), packed=packed)
     cache = PagedAttentionCache(geo, 40, 4, device)
     assert cache.backing.numel() == 40 * geo.page_bytes + 4 * geo.state_bytes
     spec = PagedStateCheckpointSpec(

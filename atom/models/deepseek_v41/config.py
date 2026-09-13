@@ -133,13 +133,21 @@ def build_attention_topology(config) -> tuple[LayerAttentionSpec, ...]:
     return tuple(result)
 
 
+class ExpertBackend(str, Enum):
+    EAGER = "eager"
+    AITER = "aiter"
+
+
 class DeepseekV41TextConfig(PretrainedConfig):
     """The published text schema, with root token IDs and quantization preserved."""
 
     model_type = "deepseek_v41_text"
 
-    def __init__(self, index_topk_tie_break="small_position", **kwargs):
+    def __init__(
+        self, index_topk_tie_break="small_position", expert_backend="eager", **kwargs
+    ):
         super().__init__(**kwargs)
+        self.expert_backend = ExpertBackend(expert_backend).value
         try:
             self.index_topk_tie_break = IndexTieBreak(index_topk_tie_break).value
         except ValueError as error:
@@ -259,9 +267,15 @@ def normalize_hf_config(raw: dict) -> DeepseekV41TextConfig:
 
 def validate_runtime_config(config):
     """Gate unimplemented execution modes before weights or pools are loaded."""
+    from atom.config import CUDAGraphMode
+
     unsupported = []
+    graph_mode = getattr(config.compilation_config, "cudagraph_mode", None)
     for name, enabled in (
-        ("CUDAGraph (set enforce_eager=True)", not config.enforce_eager),
+        (
+            "CUDAGraph mode (use PIECEWISE or enforce_eager=True)",
+            not config.enforce_eager and graph_mode != CUDAGraphMode.PIECEWISE,
+        ),
         ("torch.compile", config.compilation_config.level != 0),
         ("speculative decoding", config.speculative_config is not None),
         ("pipeline parallel", config.pipeline_parallel_size != 1),
@@ -281,15 +295,16 @@ def validate_runtime_config(config):
         ("online quantization", config.online_quant_config is not None),
         ("EPLB", config.eplb_enable),
         (
-            "packed KV/index cache",
-            config.kv_cache_dtype != "bf16" or config.index_cache_dtype != "bf16",
+            "KV/index cache layout (use bf16/bf16 or fp4/fp4)",
+            (config.kv_cache_dtype, config.index_cache_dtype)
+            not in (("bf16", "bf16"), ("fp4", "fp4")),
         ),
     ):
         if enabled:
             unsupported.append(name)
     if unsupported:
         raise ValueError(
-            "DeepSeek-V4.1 eager runtime does not support " + ", ".join(unsupported)
+            "DeepSeek-V4.1 runtime does not support " + ", ".join(unsupported)
         )
     if config.kv_cache_block_size % 2:
         raise ValueError("DeepSeek-V4.1 PAGE token count must be even")

@@ -1,4 +1,4 @@
-# DeepSeek-V4.1 native paged runtime (P05)
+# DeepSeek-V4.1 native paged runtime
 
 P05 is complete on the user-accepted P04 arithmetic baseline. This enables
 native ATOM text execution through ModelRunner and Scheduler with chunked
@@ -33,9 +33,10 @@ all queries have consumed their causal prefixes, including chunks wider than
 the ring. Index reads gather a tile or candidate positions, never a full copy
 of the historical main KV.
 
-With the production geometry and block size 16, one PAGE costs 51,200 bytes and
-one STATE entry costs 5,256,192 bytes. The complete image occupies 103 PAGE
-units. Allocation and checkpoints use these same declarations. Positions and
+With BF16 production geometry and block size 16, one PAGE costs 51,200 bytes
+and one STATE entry costs 5,256,192 bytes. The complete image occupies 103 PAGE
+units. The optional packed layout uses 15,104 bytes per PAGE and 2,715,904 bytes
+per STATE (180 smaller PAGE units). Allocation and checkpoints use these same declarations. Positions and
 Engram history advance after the model forward; checkpoints carry every state
 field and padding byte. Images are versioned by geometry and index tie policy.
 
@@ -44,7 +45,7 @@ Without a matching image, the generic scheduler replays from a recoverable
 boundary. Checkpoint relocation/fork and restored tentative suffixes cannot
 retain stale compressor tails, window rows or Engram history.
 
-## Acceptance
+## P05 acceptance
 
 Validation used `ljin_dev`, GPUs 0–3, TP4 with whole-expert EP, and native weights
 at `/mnt/DeepSeek-V4.1-Flash`. AITER was pinned to
@@ -94,15 +95,30 @@ memory budget. Reports and logs are retained in
 
 ## Current execution scope
 
-Use `enforce_eager=True`, `enable_expert_parallel=True` for TP greater than one,
-BF16 KV/index storage, and an even cache block size. The native architecture is
-`DeepseekV41ForCausalLM`; `small_position` and `large_position` remain configurable
-through `index_topk_tie_break` in the HF text config/overrides.
+Use whole-expert EP (`enable_expert_parallel=True`) for TP greater than one and
+an even cache block size. The architecture is `DeepseekV41ForCausalLM`.
+`small_position` and `large_position` remain configurable through
+`index_topk_tie_break` in the HF text config/overrides.
 
-Packed cache, graph capture, speculative decoding, PP/CP/DP, TBO, KV transfer,
-plugin execution and EPLB are rejected before loading. Vision and the V4.1
-chat/tool protocol belong to later milestones. Host Engram lookup still reads
-final GPU IDs on the CPU; request-specific compression/index selection remains
-eager. HBM lookup, fused kernels and end-to-end throughput/latency optimization
-remain later work, including P09. P05 establishes their tested state/lifecycle
-contract without claiming those optimizations are complete.
+Two cache combinations are supported: BF16 KV/index storage, or
+`kv_cache_dtype="fp4", index_cache_dtype="fp4"`. In the latter, main and index
+rows use their distinct FP4 formats, while SWA uses FP8. The offline numerical
+interface retains BF16 QAT storage. Both use the original V4 BF16 attention
+kernels and inverse RoPE; the V4 files have no P09 modifications.
+
+`enforce_eager=True` remains the baseline. Optional graph execution requires
+`enforce_eager=False` and `CompilationConfig(level=0,
+cudagraph_mode=CUDAGraphMode.PIECEWISE)`. Only pure tensor stages are recorded;
+request metadata, compression, indexing and host Engram preparation remain
+outside capture. Set the HF override `expert_backend="aiter"` to use existing
+AITER A8W4 GEMMs for prefill and decode, with the user-accepted numerical change
+recorded in the P09 report. This also allows the decode FFN and its RCCL
+reductions to be captured. Expert intermediates are bounded to 512 tokens per
+chunk. `expert_backend="eager"` remains the default and preserves P05 arithmetic.
+
+See [the P09 report](deepseek_v41_performance.md) for cache formats, graph
+ownership, comparison commands and measured limits. FULL graphs, torch.compile,
+speculative decoding, PP/CP/DP, TBO, KV transfer, plugin execution and EPLB remain
+rejected before loading. Vision and the V4.1 chat/tool protocol belong to later
+milestones. Host Engram lookup still reads final GPU IDs on the CPU; HBM lookup
+and further fusion belong to P11.

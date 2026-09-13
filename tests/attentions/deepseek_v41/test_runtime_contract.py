@@ -113,8 +113,26 @@ def test_empty_rank_padding_has_no_cache_writes(monkeypatch):
     model = DeepseekV41RuntimeModel.__new__(DeepseekV41RuntimeModel)
     torch.nn.Module.__init__(model)
     model.config = SimpleNamespace(hidden_size=64)
+    model.dense_graphs = None
     model.embed = torch.nn.Embedding(16, 64)
     # No layers are constructed: any attempted execution of padded rows fails.
     output = model(torch.zeros(8, dtype=torch.int32), torch.zeros(8, dtype=torch.int32))
     assert output.shape == (8, 64) and output.count_nonzero() == 0
     torch.testing.assert_close(cache.backing, before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("cache_dtype", ["bf16", "fp4"])
+@pytest.mark.parametrize("graph", [False, True])
+def test_supported_cache_and_piecewise_graph_modes(cache_dtype, graph):
+    from atom.config import CUDAGraphMode
+
+    validate_runtime_config(
+        runtime_config(
+            kv_cache_dtype=cache_dtype,
+            index_cache_dtype=cache_dtype,
+            enforce_eager=not graph,
+            compilation_config=SimpleNamespace(
+                level=0, cudagraph_mode=CUDAGraphMode.PIECEWISE
+            ),
+        )
+    )

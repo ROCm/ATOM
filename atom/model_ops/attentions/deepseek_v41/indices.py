@@ -33,6 +33,8 @@ def _indices(
     SLOT_ROWS: tl.constexpr,
     RING_STRIDE: tl.constexpr,
     RUN_ROWS: tl.constexpr,
+    PACKED: tl.constexpr,
+    MAIN_ROW_BYTES: tl.constexpr,
 ):
     t = tl.program_id(0)
     batch = tl.load(batches + t)
@@ -50,19 +52,29 @@ def _indices(
             tables + batch * table_stride + ids // ROWS_PER_PAGE, valid, other=0
         )
         rank = tl.cumsum(valid.to(tl.int32)) - 1
-        tl.store(
-            prefix + pbegin + rank,
-            pages * PAGE_ROWS + global_offset + ids % ROWS_PER_PAGE,
-            valid,
-        )
+        if PACKED:
+            address = (
+                pages.to(tl.int64) * PAGE_ROWS
+                + global_offset
+                + (ids % ROWS_PER_PAGE) * MAIN_ROW_BYTES
+            )
+            row = address << 1
+        else:
+            row = pages * PAGE_ROWS + global_offset + ids % ROWS_PER_PAGE
+        tl.store(prefix + pbegin + rank, row, valid)
     slot = tl.load(slots + batch)
-    tl.store(
-        prefix + pend - window_count + i,
-        window_row(
-            slot, first + i, ring_start, RING_SLOTS, SLOT_ROWS, RING_STRIDE, RUN_ROWS
-        ),
-        i < window_count,
+    row = window_row(
+        slot.to(tl.int64) if PACKED else slot,
+        first + i,
+        ring_start,
+        RING_SLOTS,
+        SLOT_ROWS,
+        RING_STRIDE,
+        RUN_ROWS,
     )
+    if PACKED:
+        row = (row << 1) | 1
+    tl.store(prefix + pend - window_count + i, row, i < window_count)
     if not DECODE:
         count = tl.minimum(t - start + 1, RING_SLOTS)
         begin = tl.load(eptr + t)
@@ -81,7 +93,7 @@ def build_indices(selected, step, geometry, window, owner, ratio):
     pptr = _indptr(counts)
     prefix = torch.empty(
         step.length * (topk + window.ring_slots),
-        dtype=torch.int32,
+        dtype=torch.int64 if geometry.packed else torch.int32,
         device=positions.device,
     )
     extend_counts = (
@@ -110,7 +122,10 @@ def build_indices(selected, step, geometry, window, owner, ratio):
             window.ring_start,
             DECODE=step.decode,
             ROWS_PER_PAGE=geometry.block_size // (ratio or 1),
-            PAGE_ROWS=geometry.page_bytes // geometry.row_bytes,
+            PAGE_ROWS=geometry.page_bytes
+            // (1 if geometry.packed else geometry.row_bytes),
+            PACKED=geometry.packed,
+            MAIN_ROW_BYTES=geometry.main_row_bytes,
             TOPK=topk,
             BLOCK=triton.next_power_of_2(max(topk, window.ring_slots)),
             **window_constexprs(window),

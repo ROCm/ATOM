@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Real TP4 ModelRunner/P04 parity and scheduler lifecycle acceptance.
+"""Real TP4 paged/private-cache parity and scheduler lifecycle acceptance.
 
 Run with torchrun --nproc_per_node=4 -m tests.attentions.deepseek_v41.validate_runtime.
 One full model instance per rank; PAGE allocation is capped for this test.
@@ -17,7 +17,7 @@ import torch
 from aiter.dist.parallel_state import get_tp_group
 from transformers import AutoTokenizer
 
-from atom.config import Config
+from atom.config import CompilationConfig, Config, CUDAGraphMode
 from atom.examples.deepseek_v41_offline import prepare_engram
 from atom.model_engine.model_runner import ModelRunner
 from atom.model_engine.scheduler import ScheduledBatch, Scheduler
@@ -30,6 +30,12 @@ from atom.model_engine.sequence import (
 from atom.models.deepseek_v41.model import DeepseekV41ForCausalLM
 from atom.sampling_params import SamplingParams
 from atom.utils.forward_context import reset_forward_context
+
+
+def reference_forward(model, *args, **kwargs):
+    # Hold model arithmetic fixed: quality against P05 is a separate comparison.
+    # This oracle uses an uncaptured forward and a private BF16 cache.
+    return DeepseekV41ForCausalLM.forward(model, *args, **kwargs)
 
 
 def compare_private_cache(runner, tokenizer):
@@ -99,7 +105,7 @@ def compare_private_cache(runner, tokenizer):
             values, history = prepare_engram(
                 tokens[at : at + length], at, history, prepare.mapping, prepare.host
             )
-            expected = DeepseekV41ForCausalLM.forward(
+            expected = reference_forward(
                 runner.model,
                 torch.tensor([tokens[at : at + length]], device=runner.device),
                 private,
@@ -140,7 +146,7 @@ def offline_completion(runner, tokens, count):
         values, history = prepare_engram(
             tokens, cache.position, history, prepare.mapping, prepare.host
         )
-        logits = DeepseekV41ForCausalLM.forward(
+        logits = reference_forward(
             runner.model, torch.tensor([tokens], device=runner.device), cache, values
         )
         token = int(logits.argmax(-1).item())
@@ -257,6 +263,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="/mnt/DeepSeek-V4.1-Flash")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--cache-dtype", choices=("bf16", "fp4"), default="bf16")
+    parser.add_argument("--graph", action="store_true")
+    parser.add_argument("--expert-backend", choices=("eager", "aiter"), default="eager")
     args = parser.parse_args()
     rank, size = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     port = int(os.environ["MASTER_PORT"])
@@ -264,7 +273,13 @@ def main():
         model=args.model,
         tensor_parallel_size=size,
         enable_expert_parallel=True,
-        enforce_eager=True,
+        enforce_eager=not args.graph,
+        compilation_config=CompilationConfig(
+            cudagraph_mode=CUDAGraphMode.PIECEWISE if args.graph else None,
+            cudagraph_capture_sizes=[1, 2, 4],
+        ),
+        kv_cache_dtype=args.cache_dtype,
+        index_cache_dtype=args.cache_dtype,
         max_num_batched_tokens=256,
         max_model_len=1024,
         max_num_seqs=4,
@@ -273,6 +288,7 @@ def main():
         enable_log_stats=False,
         port=port,
     )
+    config.hf_config.expert_backend = args.expert_backend
     config.parallel_config.data_parallel_base_port = port
     start = time.perf_counter()
     runner = ModelRunner(rank, config)
@@ -281,14 +297,36 @@ def main():
         runner.pool_plan = runner.pool_plan.with_paged_entries(1024)
         config.pool_entries = dict(runner.pool_plan.entries)
         runner.allocate_kv_cache(1024)
+        if args.graph:
+            before = runner.attn_metadata_builder.cache.backing.clone()
+            runner.capture_cudagraph()
+            torch.testing.assert_close(
+                runner.attn_metadata_builder.cache.backing, before, rtol=0, atol=0
+            )
+            del before
         # Verify the initialization policy that numerical acceptance requires.
         assert getattr(get_tp_group(), "ca_comm", None) is None
         tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
         parity = compare_private_cache(runner, tokenizer)
         events = scheduler_cases(runner, tokenizer)
+        graphs = runner.model.dense_graphs
+        if args.graph:
+            assert (
+                len(graphs.entries)
+                == (4 if args.expert_backend == "aiter" else 3)
+                * config.hf_config.num_hidden_layers
+                * 3
+            )
+            assert graphs.replays > len(graphs.entries)
         report = {
+            "graph": args.graph,
+            "expert_backend": args.expert_backend,
+            "reference": "uncaptured execution, private BF16 cache, same MoE backend",
+            "dense_graphs": 0 if graphs is None else len(graphs.entries),
+            "dense_graph_replays": 0 if graphs is None else graphs.replays,
             "passed": True,
             "tp": size,
+            "cache_dtype": args.cache_dtype,
             "parity": parity,
             "scheduler": events,
             "elapsed_seconds": time.perf_counter() - start,

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 """Accepted model math over paged/relocated state versus private P04 caches."""
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 import torch
@@ -21,9 +23,10 @@ from tests.attentions.deepseek_v41.helpers import geometry
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("tie", ["small_position", "large_position"])
 def test_attention_math_and_odd_tail_survive_exact_checkpoint(
-    small_config, single_rank, tie
+    small_config, single_rank, tie, packed
 ):
     torch.manual_seed(711)
     config = small_config
@@ -50,7 +53,7 @@ def test_attention_math_and_odd_tail_survive_exact_checkpoint(
                 parameter.data.copy_(value)
             if layer.compressor is not None:
                 layer.compressor.process_weights_after_loading()
-    geo = geometry(config)
+    geo = replace(geometry(config), packed=packed)
     paged = PagedAttentionCache(geo, 40, 3, "cuda")
     private = EagerAttentionCache(config, topology, 1, 32, "cuda")
     spec = PagedStateCheckpointSpec(

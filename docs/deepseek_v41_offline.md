@@ -1,9 +1,9 @@
 # DeepSeek-V4.1 offline text development baseline
 
 The eager text backbone executes all 40 layers, including Engram and the
-checkpoint's FP8/FP4 quantization steps. ModelRunner registration remains gated:
-the paged request lifecycle and model-quality acceptance are still in progress.
-This entry point is for development and numerical comparison.
+checkpoint's FP8/FP4 quantization steps. The paged ModelRunner integration is
+described in [the runtime guide](deepseek_v41_runtime.md). This offline entry
+point remains the development and numerical comparison baseline.
 
 ## Run
 
@@ -23,8 +23,9 @@ The example accepts one raw text prefix. It owns the parallel group, prepares
 Engram rows through the host provider, and maintains a private eager cache.
 It selects RCCL collectives through AITER's initialization API because the
 current custom collective path fails repeated-input checks for this workload.
-Chat/tool encoding, vision, serving batches, paging, graph execution and
-speculative decoding are separate milestones.
+This entry point uses a private eager cache. Paged batches and optional graph
+execution are available through ModelRunner; chat/tool encoding, vision and
+speculative decoding remain separate milestones.
 
 ## Equal-score index selection
 
@@ -65,8 +66,9 @@ Index-key normalization uses a small V4/AITER leaf after complete task
 regression; final normalization also uses V4/AITER. Routed experts use
 whole-expert partitioning; the shared expert uses TP with FP32
 partials and rounds after reduction. The eager dispatch still synchronizes
-expert counts to the CPU. Packed caches, native FP8 MFMA, fused dispatch and
-performance tuning remain pending.
+expert counts to the CPU. The ModelRunner path adds optional packed caches and
+AITER A8W4 expert dispatch with a user-accepted precision change. Dense native
+FP8 MFMA remains disabled. See the [P09 report](deepseek_v41_performance.md).
 
 ## Validation and open gates
 
@@ -103,4 +105,4 @@ all 40 layers with real checkpoint weights, Engram and all QAT operations.
 The numerical corpus includes a 2,049-token case crossing top-512 selection;
 separate indexer tests exercise 32,771 keys and actual candidate-block pruning.
 This is not a full-model 32K or 1M-context validation. The serving request
-lifecycle belongs to P05.
+lifecycle is covered by the completed P05 validation.

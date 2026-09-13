@@ -5,6 +5,10 @@ import torch
 from aiter.dist.parallel_state import get_tp_group
 from torch import nn
 
+from atom.model_ops.attentions.deepseek_v41.packed_attention import (
+    packed_decode,
+    packed_prefill,
+)
 from atom.model_ops.blockscale import quantize_fp4, quantize_fp8
 from atom.model_ops.deepseek_v41.compressor import Compressor
 from atom.model_ops.deepseek_v41.indexer import select_indices
@@ -48,9 +52,9 @@ class Indexer(nn.Module):
             )
             self.k_norm = FusedRMSNorm(self.head_dim, config.rms_norm_eps)
 
-    def project_keys(self, latent, rope, positions):
+    def project_keys(self, latent, rope, positions, *, packed=False):
         key = self.k_norm(self.wk(latent))
-        return quantize_fp4(rope(key, positions), dequantize=True)
+        return quantize_fp4(rope(key, positions), dequantize=not packed)
 
     def forward(self, hidden, qr, keys, rope, step, candidates=None):
         positions = torch.arange(
@@ -141,12 +145,14 @@ class Attention(nn.Module):
                         torch.arange(begin, end, device=hidden.device) * self.spec.ratio
                     )
                     # Derive index keys before the main latent is rotated in place.
-                    index = self.indexer.project_keys(latent, rope, latent_positions)
+                    index = self.indexer.project_keys(
+                        latent, rope, latent_positions, packed=cache.packed
+                    )
                     main = quantize_fp4(
                         rope(latent, latent_positions),
                         group_size=16,
                         scale_dtype=torch.float8_e4m3fn,
-                        dequantize=True,
+                        dequantize=not cache.packed,
                     )
                     cache.write_global(owner, begin, main, index)
             if self.indexer is not None:
@@ -170,9 +176,15 @@ class Attention(nn.Module):
         query = rope(
             self.wq_b(qr).unflatten(-1, (self.heads, self.head_dim)), positions
         )
-        kv = quantize_fp8(
-            rope(self.kv_norm(self.wkv(hidden)), positions), dequantize=True
+        raw_kv = rope(self.kv_norm(self.wkv(hidden)), positions)
+        # Decode consumes only the stored window; do not materialize an unused
+        # BF16 copy when the persistent cache is packed.
+        kv = (
+            None
+            if cache.packed and step.decode
+            else quantize_fp8(raw_kv, dequantize=True)
         )
+        window_kv = quantize_fp8(raw_kv) if cache.packed else kv
         for request_cache, request_step, rows in cache.requests(step):
             self._update_global(
                 hidden[:, rows], qr[:, rows], request_cache, request_step, rope
@@ -182,8 +194,9 @@ class Attention(nn.Module):
         )
         flat_query = query.flatten(0, 1)
         if step.decode:
-            cache.write_window(self.spec.layer_id, kv, step)
-            output = sparse_attn_v4_paged_decode(
+            cache.write_window(self.spec.layer_id, window_kv, step)
+            decode = packed_decode if cache.packed else sparse_attn_v4_paged_decode
+            output = decode(
                 flat_query,
                 cache.pool,
                 prefix,
@@ -192,7 +205,8 @@ class Attention(nn.Module):
                 self.head_dim**-0.5,
             )
         else:
-            output = sparse_attn_v4_paged_prefill(
+            prefill = packed_prefill if cache.packed else sparse_attn_v4_paged_prefill
+            output = prefill(
                 flat_query,
                 cache.pool,
                 prefix,
@@ -205,7 +219,7 @@ class Attention(nn.Module):
                 out=flat_query,
             )
             # Preserve the prior ring until every query has consumed its prefix.
-            cache.write_window(self.spec.layer_id, kv, step)
+            cache.write_window(self.spec.layer_id, window_kv, step)
         output = output.view_as(query)
         output = (
             rope(output, positions, inverse=True)

@@ -3727,7 +3727,8 @@ class ModelRunner:
         # uncaptured shapes.
         self._piecewise_captured_tokens = set()
 
-        self.forward_vars["kv_indptr"].gpu.zero_()
+        if "kv_indptr" in self.forward_vars:
+            self.forward_vars["kv_indptr"].gpu.zero_()
         # Present exactly when the model has an indexer -- the builder makes it
         # under the same answer -- so the buffer's own existence is the test.
         if "sparse_kv_indptr" in self.forward_vars:
