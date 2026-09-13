@@ -8,7 +8,6 @@ import torch
 from aiter import fused_qk_norm_rope_cache_quant_shuffle
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
-from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 from aiter.ops.triton.unified_attention import unified_attention
 from torch import nn
 
@@ -16,6 +15,7 @@ from atom.config import get_current_atom_config
 from atom.model_ops.base_attention import (
     PA_ASM_MAX_QUERY_GROUP_SIZE,
     cp_mha_gather_cache,
+    dense_decode_splits,
     gluon_decode_over_limit,
     run_pa_decode_gluon,
     run_pa_fwd_asm,
@@ -558,9 +558,10 @@ class PagedAttentionImpl(nn.Module):
         )
         assert num_q_heads_total % num_kv_heads == 0
 
-        max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
+        max_context_partition_num = dense_decode_splits(num_seqs, num_kv_heads)
 
         context_partition_size = 256
+        # Left after the split so a sliding-window layer still overrides both.
         if self.sliding_window > 0:
             max_context_partition_num = 1
             context_partition_size = 128

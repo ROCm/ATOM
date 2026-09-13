@@ -24,16 +24,28 @@ import pytest
 pytest.importorskip("triton", reason="base_attention defines @triton.jit kernels")
 pytest.importorskip("aiter", reason="base_attention imports the AITER runtime")
 
+from aiter.ops.triton.gluon import pa_decode_gluon
+
 from atom.model_ops.base_attention import (
     PA_ASM_MAX_QUERY_GROUP_SIZE,
+    PA_DENSE_SPLIT_MAX,
+    PA_DENSE_SPLIT_TARGET_WG,
     PA_GLUON_MAX_QUERY_GROUP_SIZE,
     PA_GLUON_MAX_QUERY_LEN,
+    dense_decode_splits,
     gluon_decode_over_limit,
 )
 
 # aiter pa_decode_gluon.py:134-168 -- the arms `register_bases` is defined for,
 # plus a separate path below 16. There is no 128 arm and no else.
 AITER_GLUON_GROUP_ARMS = (16, 32, 64)
+
+# aiter pa_ps.py:69 -- the C++ PS reduce is built for 1..64 partitions. Past it
+# the launcher falls to flydsl, whose module-level wrapper takes no `stream`
+# argument, and the TypeError that raises is not caught by the `except
+# ImportError` that would otherwise reach the Triton kernel. So there is no
+# fallback: decode aborts.
+AITER_PS_REDUCE_MAX_PARTITIONS = 64
 
 
 class TestGluonEnvelope:
@@ -105,6 +117,20 @@ class TestEnvelopeConstants:
     def test_gluon_group_limit_is_the_last_layout_arm(self):
         assert PA_GLUON_MAX_QUERY_GROUP_SIZE == max(AITER_GLUON_GROUP_ARMS)
 
+    def test_the_split_ceiling_stays_inside_what_the_ps_reduce_was_built_for(self):
+        """The bound the rule is written against, not the one it declares.
+
+        Every other test here reads its limit off PA_DENSE_SPLIT_MAX, so raising
+        that constant past what aiter serves leaves them all green while decode
+        aborts. This is the one that goes red.
+        """
+        assert PA_DENSE_SPLIT_MAX <= AITER_PS_REDUCE_MAX_PARTITIONS
+
+    def test_the_split_constants_are_positive(self):
+        """`1 << (x.bit_length() - 1)` raises on 0, and both are tuning knobs."""
+        assert PA_DENSE_SPLIT_TARGET_WG >= 1
+        assert PA_DENSE_SPLIT_MAX >= 1
+
     def test_every_reachable_group_has_an_arm(self):
         """Anything reported as safe must land on an arm, not between two."""
         for qlen in range(1, PA_GLUON_MAX_QUERY_LEN + 1):
@@ -124,6 +150,80 @@ class TestEnvelopeConstants:
         asm_pa.cu:113-116 carries `# mtp * gqa <= 16` as a source comment.
         """
         assert PA_ASM_MAX_QUERY_GROUP_SIZE < PA_GLUON_MAX_QUERY_GROUP_SIZE
+
+
+class TestDenseDecodeSplits:
+    """How finely the dense decode splits the KV, and what bounds it.
+
+    Integer arithmetic, no device. `dense_decode_splits` imports the aiter
+    heuristic inside its body, so monkeypatching the module attribute reaches it
+    -- which is what lets the cases aiter cannot produce today be tested at all.
+    """
+
+    def test_batch_one_asks_for_the_ceiling(self):
+        """Reverting to the bare heuristic returns 8 and turns this red."""
+        assert dense_decode_splits(1, 1) == PA_DENSE_SPLIT_MAX
+
+    def test_a_full_grid_is_left_to_the_heuristic(self, monkeypatch):
+        """Past TARGET_WG the added term is 1, so the heuristic must win outright.
+
+        Red if max() becomes min(), or if TARGET_WG grows past the grid.
+        """
+        monkeypatch.setattr(
+            pa_decode_gluon, "get_recommended_splits", lambda seqs, heads: 3
+        )
+        assert dense_decode_splits(128, 4) == 3
+
+    def test_never_below_the_heuristic(self, monkeypatch):
+        """Guards the direction: this is what makes the change unable to regress."""
+        monkeypatch.setattr(
+            pa_decode_gluon, "get_recommended_splits", lambda seqs, heads: 8
+        )
+        for num_seqs in (1, 2, 4, 8, 16, 64, 256):
+            assert dense_decode_splits(num_seqs, 1) >= 8
+
+    @pytest.mark.parametrize("num_seqs", range(1, 40))
+    def test_only_ever_asks_for_a_power_of_two_above_the_heuristic(
+        self, num_seqs, monkeypatch
+    ):
+        """Every split count past the heuristic's own range is a power of two.
+
+        The C++ PS reduce compiles one variant per distinct count, so a
+        continuous cdiv would add ~11 of them, each a first-use hipcc on the
+        request path under eager decode. Red if the rounding is dropped: n=5
+        would ask for 26.
+        """
+        monkeypatch.setattr(
+            pa_decode_gluon, "get_recommended_splits", lambda seqs, heads: 1
+        )
+        s = dense_decode_splits(num_seqs, 1)
+        assert s & (s - 1) == 0, f"n={num_seqs} asked for {s}"
+
+    def test_stays_inside_the_ps_reduce_contract(self, monkeypatch):
+        """The C++ PS reduce is built for 1..64 and there is no usable fallback.
+
+        Past it `launch_pa_decode_ps_reduce_flydsl` is called with a `stream`
+        kwarg its module-level signature does not take, and the resulting
+        TypeError is not caught by the `except ImportError` that would otherwise
+        reach the Triton kernel. So the ceiling has to clamp the result, not just
+        the term this function adds -- red if it moves back inside the max().
+        """
+        monkeypatch.setattr(
+            pa_decode_gluon, "get_recommended_splits", lambda seqs, heads: 128
+        )
+        assert 1 <= dense_decode_splits(1, 1) <= PA_DENSE_SPLIT_MAX
+
+    def test_kv_heads_count_toward_the_grid(self, monkeypatch):
+        """The grid is (num_seqs, num_kv_heads, splits), so both dims fill it.
+
+        Red if num_kv_heads is dropped from the product: 4 x 4 would then be read
+        as 4 and ask for TARGET_WG // 4 instead of // 16.
+        """
+        monkeypatch.setattr(
+            pa_decode_gluon, "get_recommended_splits", lambda seqs, heads: 1
+        )
+        assert dense_decode_splits(4, 4) == dense_decode_splits(16, 1)
+        assert dense_decode_splits(4, 4) == PA_DENSE_SPLIT_TARGET_WG // 16
 
 
 class _Layer:
