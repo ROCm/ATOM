@@ -71,7 +71,6 @@ class FakeSchedSub:
             self.saved = []
             self.load_failed_ids = []
             self.pending = False
-            self.state_loads = []
             self.state_stores = []
             self.state_reports = (set(), set())
             self.state_source_releases = set()
@@ -132,10 +131,6 @@ class FakeSchedSub:
     def has_pending_work(self):
         return self.pending
 
-    def enqueue_state_loads(self, loads):
-        self.state_loads.extend(loads)
-        return True
-
     def enqueue_state_stores(self, stores):
         self.state_stores.extend(stores)
         return True
@@ -159,7 +154,6 @@ class FakeSchedSub:
             "cancel_pending_load",
             "process_completions",
             "has_pending_work",
-            "enqueue_state_loads",
             "enqueue_state_stores",
             "take_state_reports",
             "take_state_source_releases",
@@ -572,30 +566,6 @@ def test_producer_offload_load_completion_uses_loading_state():
     assert out.failed_loading == {"f1"}
 
 
-def test_state_loads_go_to_the_sub_that_can_carry_them():
-    """The scheduler calls `enqueue_state_loads` on whatever connector it
-    holds. Under `multi` that is this object, and a load it swallowed would
-    leave its request parked against a transfer nobody was asked to make.
-    """
-    plain = FakeSchedSub()
-    off = FakeSchedSub(is_offload=True, offload_methods=True)
-    loads = [(1, 111, 0), (2, 222, 3)]
-
-    assert _sched([plain, off]).enqueue_state_loads(loads) is True
-
-    assert off.state_loads == loads
-    assert not hasattr(plain, "enqueue_state_loads")
-
-
-def test_no_sub_to_carry_a_state_load_is_reported_not_swallowed():
-    """Every one of these belongs to a parked request that only a report can
-    wake, and the scheduler's `hasattr` guard cannot catch this case because
-    this method always exists on the composite. So it has to say no."""
-    plain = FakeSchedSub()
-    accepted = _sched([plain, FakeSchedSub()]).enqueue_state_loads([(1, 111, 0)])
-    assert accepted is False
-
-
 def test_state_stores_and_reports_forward_to_the_owning_sub():
     """The store leg is symmetric to the load leg, but only the load forwarder
     existed. The engine calls `enqueue_state_stores`, `take_state_reports` and
@@ -645,15 +615,12 @@ def test_state_calls_route_by_tier_ownership_not_method_presence():
     sched = _sched([dense, k3])
 
     assert sched.enqueue_state_stores([(111, (1, 2, 3))]) is True
-    assert sched.enqueue_state_loads([(1, 111, 0)]) is True
     assert sched.take_state_reports() == ({7}, {9})
     assert sched.take_state_source_releases() == {7, 9}
 
     # The tier-carrying sub got everything; the dense shell got nothing.
     assert k3.state_stores == [(111, (1, 2, 3))]
-    assert k3.state_loads == [(1, 111, 0)]
     assert dense.state_stores == []
-    assert dense.state_loads == []
 
 
 def test_state_stores_default_when_no_sub_implements():
@@ -666,38 +633,18 @@ def test_state_stores_default_when_no_sub_implements():
     assert sched.take_state_source_releases() == set()
 
 
-def test_the_composite_exposes_the_sub_connectors_state_tier():
-    """The K3 store/load path reads `_state_tier` off whatever
-    connector the forward context holds. Under `multi` that is this object, so
-    without the re-export nothing is ever submitted and every slot leaks."""
-    tier = object()
-    off = FakeWorkerSub()
-    off._state_tier = tier
-    w = _worker([FakeWorkerSub(), off])
-
-    w.register_kv_caches({}, transfer_tensors=None, num_blocks=1)
-
-    assert w._state_tier is tier
-
-
-def test_no_sub_with_a_tier_leaves_the_composite_tier_none():
-    w = _worker([FakeWorkerSub(), FakeWorkerSub()])
-    w.register_kv_caches({}, transfer_tensors=None, num_blocks=1)
-    assert w._state_tier is None
-
-
 def test_a_state_only_step_under_multi_is_not_dropped():
-    """A step whose only work is a state load must reach the worker.
+    """A step whose only work is a state store must reach the worker.
 
-    `state_loads` carries no `LMCacheReqMeta`, so a wrapper that answers from
+    `state_stores` carries no `LMCacheReqMeta`, so a wrapper that answers from
     its own (always empty) fields reports no work, the engine drops the
-    snapshot, and the request parked on that load is woken by nothing.
+    snapshot, and the PAGE units that store pinned are never released.
     """
     from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
     from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
 
     sub = LMCacheOffloadMetadata()
-    sub.state_loads = [("req-1", 12345, 7)]
+    sub.state_stores = [("op-1", (1, 2, 3))]
 
     assert connector_metadata_has_work(sub)
     assert connector_metadata_has_work(MultiConnectorMetadata(metas=[sub]))

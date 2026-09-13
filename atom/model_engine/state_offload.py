@@ -13,38 +13,74 @@ lifetime.
 
 import logging
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass, replace
+from time import monotonic
 
 logger = logging.getLogger("atom")
+
+
+@dataclass
+class _OutstandingLoad:
+    """One dispatched state load that has not reached a terminal state."""
+
+    prefix_hash: int
+    slot: int
+    at: float
+    # Set when the request is torn down while its load is still in flight. The
+    # slot then belongs to this index rather than to the sequence, because the
+    # worker may still be scattering into it.
+    orphaned: bool = False
 
 
 class StateOffloadIndex:
     """What is believed to be in LMCache, and what is being fetched back.
 
+    The sole engine-side owner of a state load's lifecycle, which is what lets
+    it state its own invariant::
+
+        dispatched == settled + outstanding
+
+    Spreading those three facts over several owners is what makes a load-path
+    defect unstatable and therefore untestable, so `check_invariant` is a method
+    here rather than a property of the system nobody can name.
+
     `hashes` answers the membership half of the tier's vote. It is deliberately
     optimistic: LMCache's own LRU can drop bytes at any time, so a hash here
     means "was stored once", never "is still there". The false positive costs
-    one lookup and a park/unpark, and is handled by the `failed_loading` path
-    (`fail_load` -> `forget`).
+    one lookup and a park/unpark, and is handled by the load-failure path
+    (`fail_load(missing=True)` -> `forget`).
     """
 
-    def __init__(self, *, can_store: bool = True, can_load: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        can_store: bool = True,
+        can_load: bool = True,
+        release_slot: Callable[[int], None] | None = None,
+    ) -> None:
         # The two legs are separately granted. A `kv_producer` role saves and
         # never loads, a `kv_consumer` loads and never saves, and offering a
         # load the worker will not serve parks the request that took it.
         self.can_store = bool(can_store)
         self.can_load = bool(can_load)
+        # The only capability this index needs from the allocator: hand a state
+        # slot back when an orphaned load settles. Optional so a test double or
+        # a store-only deployment can build the index without a pool; an
+        # orphaned load then simply has no slot to return.
+        self._release_slot = release_slot
         # The optimistic membership index (see the class docstring). It only
-        # grows on `note_stored` and shrinks on `forget` (a failed load), so a
-        # long-lived server that stored many distinct prefixes would grow it
+        # grows on `note_stored` and shrinks on `forget` (a real load miss), so
+        # a long-lived server that stored many distinct prefixes would grow it
         # without bound. Cap it: `hashes` stays a plain set -- membership stays
         # O(1) and every caller/test keeps `in` / `len` / `== set()` /
         # `discard` -- and `_hash_lru` records insertion order beside it purely
         # so the oldest hash can be dropped on overflow. The two move in
-        # lockstep (every add and every forget touches both), so `_hash_lru`
-        # never diverges in length from `hashes`. Dropping the oldest hash is
-        # safe for the same reason the index is optimistic: a false "not stored"
-        # only costs one recompute, never wrong output.
+        # lockstep (every add and every forget touches both), which
+        # `check_invariant` asserts, because a divergence turns the cap into
+        # either a leak or a false-positive generator. Dropping the oldest hash
+        # is safe for the same reason the index is optimistic: a false "not
+        # stored" only costs one recompute, never wrong output.
         self.hashes: set[int] = set()
         self._hash_lru: OrderedDict[int, None] = OrderedDict()
         # ~1M hashes -> a few tens of MB. Well above any working set that a
@@ -52,21 +88,24 @@ class StateOffloadIndex:
         # without evicting live entries in normal operation.
         self._hash_cap = 1 << 20
         self.hashes_evicted = 0
-        # req_id -> hash, for loads offered and not yet settled. Keyed by
-        # request because that is what comes back, on the same
-        # `finished_loading`/`failed_loading` channel a KV load uses.
-        self.pending_loads: dict = {}
-        self.loads_attempted = 0
+        # req_id -> _OutstandingLoad, for loads dispatched and not yet settled.
+        # Keyed by request because that is what comes back: the fused load
+        # reports on the same `finished_loading`/`failed_loading` channel its KV
+        # leg does, in exactly one completion per dispatch.
+        self._outstanding: dict = {}
+        self.dispatched = 0
+        self.settled = 0
         self.loads_completed = 0
         self.loads_failed = 0
-        # Store-side counters. Until this commit the only store-side signal was
-        # `indexed` growing, which is why a shell that refused every store
-        # (`enqueue_state_stores` never forwarded) looked identical to a tier
-        # with nothing to do -- 94 refusals produced one warning line and no
-        # number anywhere. `stores_refused` is the probe that would have said
-        # so on the first pass, and it is deliberately apart from
-        # `stores_failed`: refused means nobody tried, failed means the worker
-        # tried and could not.
+        self.loads_abandoned = 0
+        self.orphan_load_slots_reclaimed = 0
+        # Non-zero means `audit_invariant` caught the accounting drifting.
+        self.invariant_violations = 0
+        self._warned_invariant = False
+        # `stores_refused` is deliberately apart from `stores_failed`: refused
+        # means nobody tried, failed means the worker tried and could not. A
+        # shell that forwards no store at all is otherwise indistinguishable
+        # from a tier with nothing to do.
         self.stores_attempted = 0
         self.stores_completed = 0
         self.stores_failed = 0
@@ -77,6 +116,64 @@ class StateOffloadIndex:
         # than indexed. Any non-zero value means the reclaim window is firing
         # on live transfers and is set too low.
         self.stores_untrusted = 0
+
+    # ------------------------------ invariant ------------------------------ #
+    @property
+    def outstanding(self) -> int:
+        """Loads dispatched and not yet settled."""
+        return len(self._outstanding)
+
+    @property
+    def pending_loads(self) -> dict:
+        """req_id -> prefix hash for every load still in flight."""
+        return {req_id: p.prefix_hash for req_id, p in self._outstanding.items()}
+
+    def check_invariant(self) -> None:
+        """Assert this object's whole contract. Cheap enough for tests and for
+        the periodic stats path.
+
+        Two properties: every dispatched load reaches exactly one terminal
+        state, and `hashes` never diverges from `_hash_lru`.
+        """
+        if self.dispatched != self.settled + self.outstanding:
+            raise AssertionError(
+                "state offload index: dispatched != settled + outstanding "
+                f"({self.dispatched} != {self.settled} + {self.outstanding})"
+            )
+        if len(self.hashes) != len(self._hash_lru):
+            raise AssertionError(
+                "state offload index: hashes and _hash_lru diverged "
+                f"({len(self.hashes)} != {len(self._hash_lru)})"
+            )
+
+    def audit_invariant(self) -> bool:
+        """Check the invariant on the serving path. Reports, never raises.
+
+        `check_invariant` raises because a test that cannot fail proves nothing.
+        Production wants the opposite: a bookkeeping fault must not take the
+        engine down, but it must not be silent either -- a violation means some
+        request is parked on a report that will never come, or a slot has
+        leaked, and without this the first symptom is a hang nobody can explain.
+
+        So the fault surfaces twice: one loud log line naming the numbers, and
+        `state_offload_invariant_violations` in `checkpoint_funnel`, which
+        `stats()` reaches through the coordinator's `checkpoint_fates`.
+        An assertion nothing ever runs is not an assertion.
+        """
+        try:
+            self.check_invariant()
+        except AssertionError as exc:
+            self.invariant_violations += 1
+            if not self._warned_invariant:
+                self._warned_invariant = True
+                logger.error(
+                    "%s. This is an accounting fault, not a cache miss: a "
+                    "request is parked on a report that cannot come, or a "
+                    "state slot has leaked. Serving continues.",
+                    exc,
+                )
+            return False
+        return True
 
     # ------------------------------- stores -------------------------------- #
     def note_stored(self, h: int) -> None:
@@ -98,7 +195,8 @@ class StateOffloadIndex:
             self.hashes_evicted += 1
 
     def forget(self, h: int) -> None:
-        """Drop a hash whose load failed, so the next request does not retry."""
+        """Drop a hash whose load missed, so the next request does not retry."""
+        h = int(h)
         self.hashes.discard(h)
         self._hash_lru.pop(h, None)
 
@@ -109,42 +207,60 @@ class StateOffloadIndex:
         The membership+capability half of `request_load`'s guard (minus its
         per-request in-flight check), factored out so the admission-path voters
         -- `PageUnitCheckpointCoordinator._reachable` and
-        `BlockManager._tier_can_serve` -- test exactly what `request_load` will
-        accept and cannot drift from it. Mirroring only `h in hashes` there,
-        without `can_load`, made a `kv_producer` (can_load=False, but `hashes`
-        populated from its own stores) vote a tier hit it would then refuse: the
-        right-to-left resumable scan stopped at the tier rung, skipped a
-        still-resident HBM rung, and `request_load` returned False -- the
-        boundary disowned and the HBM checkpoint forfeited to a full recompute.
+        `BlockManager._attach_state_slots` -- test exactly what `request_load`
+        will accept and cannot drift from it. Mirroring only `h in hashes`
+        there, without `can_load`, made a `kv_producer` (can_load=False, but
+        `hashes` populated from its own stores) vote a tier hit it would then
+        refuse: the right-to-left resumable scan stopped at the tier rung,
+        skipped a still-resident HBM rung, and `request_load` returned False --
+        the boundary disowned and the HBM checkpoint forfeited to a full
+        recompute.
         """
-        return self.can_load and h in self.hashes
+        return self.can_load and int(h) in self.hashes
 
     # -------------------------------- loads -------------------------------- #
-    def request_load(self, req_id, h: int) -> bool:
-        """Offer to fetch `h` back for `req_id`. False if this tier cannot.
+    def request_load(self, req_id, h: int, slot: int = -1) -> bool:
+        """Offer to fetch `h` back into `slot` for `req_id`. False if refused.
 
         The guard between believing and delivering: a load is resolved only by
         a worker report, so offering one for a hash never stored would park the
-        request against bytes no `get` can produce.
+        request against bytes no `get` can produce. Refusing is always safe --
+        the caller disowns the boundary and recomputes.
         """
         if not self.could_serve(h):
             # A store-only role (can_load False) or a hash never stored. Voting
             # for either parks the request against a report that never comes;
             # refuse so the boundary is disowned and recomputed.
             return False
-        if req_id in self.pending_loads:
+        if req_id in self._outstanding:
             # One request, one outstanding load: reports are keyed by request
-            # id, so the first completion would unpark while the second is
-            # still writing. No in-tree path reaches this today, and the
-            # refusal costs only a disown.
+            # id, so the first completion would settle the second load's slot,
+            # and an orphaned first entry would be overwritten and lost to
+            # `reclaim`, which iterates this dict. The refusal costs a disown.
             logger.warning(
                 "state offload: request %s already has a load in flight; "
                 "refusing a second one and letting the boundary be disowned.",
                 req_id,
             )
             return False
-        self.pending_loads[req_id] = int(h)
-        self.loads_attempted += 1
+        self._outstanding[req_id] = _OutstandingLoad(
+            prefix_hash=int(h), slot=int(slot), at=monotonic()
+        )
+        self.dispatched += 1
+        return True
+
+    def orphan(self, req_id) -> bool:
+        """The request is being torn down while its load is still in flight.
+
+        The slot passes to this index: the worker may still be scattering into
+        it, so it cannot go back on the free list until the report lands.
+        Returns False when nothing was in flight -- the ordinary case, and it
+        means the caller keeps the slot.
+        """
+        pending = self._outstanding.get(req_id)
+        if pending is None:
+            return False
+        pending.orphaned = True
         return True
 
     def complete_load(self, req_id) -> None:
@@ -153,39 +269,106 @@ class StateOffloadIndex:
         The hash stays indexed: a load reads LMCache, it does not consume it,
         and the next request over the same prefix must still find it.
         """
-        if self.pending_loads.pop(req_id, None) is not None:
-            self.loads_completed += 1
+        pending = self._settle(req_id)
+        if pending is None:
+            return
+        self.loads_completed += 1
 
-    def fail_load(self, req_id) -> None:
-        """No bytes came back. Retract the claim as well as counting it.
+    def fail_load(self, req_id, *, missing: bool = False) -> None:
+        """No usable load came back.
 
-        A miss is the only evidence that LMCache's LRU dropped what this index
-        advertises, so it has to be what un-advertises it. Leaving the hash makes
-        every later request over that prefix park, miss and recompute.
+        `missing` is what separates the two failures the fused load can report.
+        The verdict on `failed_loading` covers BOTH legs, so it may mean the KV
+        chunk was dropped while the state bytes are present and untouched;
+        retracting the hash on that would permanently deny state that is still
+        there. Only `missing=True` -- set from the worker's own state-`get`
+        verdict -- is evidence LMCache's LRU dropped what this index advertises,
+        so only it un-advertises the hash.
         """
-        h = self.pending_loads.pop(req_id, None)
-        if h is None:
+        pending = self._settle(req_id)
+        if pending is None:
             return
         self.loads_failed += 1
-        self.forget(h)
+        if missing:
+            self.forget(pending.prefix_hash)
 
     def abandon_load(self, req_id) -> None:
-        """The request went away before its bytes did. Neither outcome.
+        """The request went away, or nothing could carry the load. Neither
+        outcome.
 
-        Not `fail_load`: an abort says nothing about the bytes, and forgetting
-        a loadable hash sends the next request back to a full recompute.
+        Terminal like the other two, but not a miss: an abandon says nothing
+        about the bytes, and forgetting a loadable hash sends the next request
+        over that prefix back to a full recompute.
         """
-        self.pending_loads.pop(req_id, None)
+        pending = self._settle(req_id)
+        if pending is None:
+            return
+        self.loads_abandoned += 1
+
+    def _settle(self, req_id):
+        """The one terminal transition, shared by all three outcomes.
+
+        Returns the entry, or None when this id had no load in flight -- which
+        is the common case, because every KV completion is offered here and only
+        a hybrid's carries a state leg.
+        """
+        pending = self._outstanding.pop(req_id, None)
+        if pending is None:
+            return None
+        self.settled += 1
+        if pending.orphaned and self._release_slot is not None:
+            self._release_slot(pending.slot)
+        return pending
+
+    def reclaim(self, timeout_s: float) -> int:
+        """Free orphaned slots whose report never came, after `timeout_s`.
+
+        Fusing the two legs removed the desync between them; it did not remove
+        the possibility that a worker dies or a completion is dropped. Without
+        this, one leak per lost report drains the state pool until the admission
+        gate refuses every hybrid request, with no error and no warning.
+
+        Only *orphaned* entries are reclaimed. A live request's slot must never
+        be yanked out from under a worker that may still be writing into it; a
+        live request whose report is lost shows up as `outstanding` climbing,
+        which is what `check_invariant` is for. `timeout_s <= 0` disables
+        reclamation, matching the store-pin reconciler, and must not be tighter
+        than that window or this becomes the hazard it exists to prevent.
+        """
+        if timeout_s <= 0 or not self._outstanding:
+            return 0
+        deadline = monotonic() - timeout_s
+        stale = [
+            req_id
+            for req_id, pending in self._outstanding.items()
+            if pending.orphaned and pending.at <= deadline
+        ]
+        for req_id in stale:
+            self._settle(req_id)
+            self.orphan_load_slots_reclaimed += 1
+        if stale:
+            logger.warning(
+                "state offload: reclaimed %d orphaned load slot(s) whose "
+                "report never arrived after %.1fs",
+                len(stale),
+                timeout_s,
+            )
+        return len(stale)
 
     def stats(self) -> dict[str, int]:
         """Counters for the periodic `state checkpoints:` line.
 
-        Read the load counters together: `failed / attempted` is this index's
-        false-positive rate, and `attempted - completed - failed` is what is in
-        flight or was abandoned by an aborted request. Read the store counters
-        the same way, and read `stores_completed` against `checkpoints_kept`:
-        the gap is how much of what HBM keeps the CPU tier never received.
+        Read the load counters together: `loads_failed / dispatched` is this
+        index's false-positive rate, and `dispatched - settled` is what is still
+        in flight. Read the store counters the same way, and read
+        `stores_completed` against `checkpoints_kept`: the gap is how much of
+        what HBM keeps the CPU tier never received.
+
+        Audits the invariant on the way past. This is the periodic path the
+        funnel already pulls, so it costs two integer comparisons per metrics
+        read and it is the only place the check runs in a live engine.
         """
+        self.audit_invariant()
         return {
             # Store leg. `attempted - completed - failed` is in flight;
             # `refused` is a wiring fault, not backpressure -- any non-zero
@@ -196,9 +379,14 @@ class StateOffloadIndex:
             "stores_refused": self.stores_refused,
             "stores_untrusted": self.stores_untrusted,
             # Load leg.
-            "loads_attempted": self.loads_attempted,
+            "loads_attempted": self.dispatched,
+            "loads_settled": self.settled,
+            "loads_outstanding": self.outstanding,
             "loads_completed": self.loads_completed,
             "loads_failed": self.loads_failed,
+            "loads_abandoned": self.loads_abandoned,
+            "orphan_load_slots_reclaimed": self.orphan_load_slots_reclaimed,
+            "invariant_violations": self.invariant_violations,
             "indexed": len(self.hashes),
             # Non-zero means the index hit its `_hash_cap` and is dropping the
             # coldest hashes. Harmless (a dropped hash just misses one reuse),
@@ -226,11 +414,9 @@ class StateTierCapability:
     Derived from configuration, not from the connector's public name. The name
     only says which connector class is constructed; whether that class builds a
     `StateOffloadTier` depends on the layout it resolves, the pipeline depth,
-    and the role it was given. The engine used to install a `StateOffloadIndex`
-    for any `lmcache_offload`, so a K3 run under PP>1 -- or any `dense`/`hybrid`
-    run -- got an index against a worker that would never build the tier. That
-    mismatch is what left stores emitted with nowhere to go, and it is the
-    common root of the tier-none fallback paths.
+    and the role it was given. An index installed for a worker that never
+    builds the tier emits stores with nowhere to go, which is the common root
+    of the tier-none fallback paths.
 
     `reason` is filled in whenever the tier is off, so the log names which check
     refused it rather than leaving the operator to guess.

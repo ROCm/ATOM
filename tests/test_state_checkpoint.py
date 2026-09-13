@@ -1399,15 +1399,16 @@ class TestPagedCopyCheckpoint:
             self.hashes = set(hashes)
             self.pending_loads = {}
             self.requested = []
+            self.orphan_load_slots_reclaimed = 0
 
         def could_serve(self, h):
             return h in self.hashes
 
-        def request_load(self, req_id, h):
+        def request_load(self, req_id, h, slot=-1):
             if h not in self.hashes:
                 return False
             self.pending_loads[req_id] = h
-            self.requested.append((req_id, h))
+            self.requested.append((req_id, h, slot))
             return True
 
     def _with_tier(self, bm, *hashes):
@@ -1434,11 +1435,12 @@ class TestPagedCopyCheckpoint:
 
         assert second.offload_joint.load_hash == h
         assert second.state_slot >= 0, "the H2D writes this slot directly"
-        assert index.requested == [(second.id, h)]
+        assert index.requested == [(second.id, h, second.state_slot)]
         # No restore queued: there is nothing in HBM to gather from, and the
-        # bytes land in the slot rather than in PAGE units.
+        # bytes land in the slot rather than in PAGE units. The load itself
+        # travels on the request's own KV load metadata, so nothing is queued
+        # here for a separate dispatch.
         assert bm.take_state_maintenance_ops().checkpoint_restores == ()
-        assert bm.take_state_loads() == [(second.id, h, second.state_slot)]
 
     def test_hbm_is_preferred_over_the_tier(self):
         """Both tiers are keyed by the same hash, so the gate does not say which
@@ -3568,17 +3570,18 @@ class TestPagedAllocateAimsTheStateLegAtTheJointBoundary:
             self.hashes = set(hashes)
             self.pending_loads = {}
             self.requested = []
+            self.orphan_load_slots_reclaimed = 0
             self.can_store = True
             self.can_load = True
 
         def could_serve(self, h):
             return self.can_load and h in self.hashes
 
-        def request_load(self, req_id, h):
+        def request_load(self, req_id, h, slot=-1):
             if h not in self.hashes:
                 return False
             self.pending_loads[req_id] = h
-            self.requested.append((req_id, h))
+            self.requested.append((req_id, h, slot))
             return True
 
     def _bm(self, *tier_hashes):
@@ -3604,7 +3607,7 @@ class TestPagedAllocateAimsTheStateLegAtTheJointBoundary:
         bm.allocate(seq, 0)
 
         assert index.requested == [
-            (seq.id, 4242)
+            (seq.id, 4242, seq.state_slot)
         ], "the state leg must be aimed at the joint boundary"
         assert seq.offload_joint.boundary_hash == 4242, "the boundary still stands"
 

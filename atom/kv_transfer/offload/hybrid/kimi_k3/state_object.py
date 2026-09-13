@@ -140,12 +140,15 @@ class StateByteCodec:
         # That means on ANY exception below -- from `pack`, from
         # `on_source_released`, or from a pre-adoption raise inside
         # `batched_put` -- the reference was never downed and we still own it, so
-        # we down it exactly once. The earlier `handed_off = True` set *before*
-        # the call did the opposite: it suppressed the down on a pre-adoption
-        # `batched_put` raise, stranding the allocation at ref_count=1 (LMCache
-        # reports "garbage collected with ref_count=1, pin_count=0" much later)
-        # and shrinking the CPU pool one entry per failure. `get` guards its own
-        # reference with `finally` for the same reason.
+        # we down it exactly once, unconditionally.
+        #
+        # Do not reintroduce an "already handed off" flag set before the call to
+        # skip that down: there is no adopted-then-raised window for it to
+        # protect, and it would suppress the down on a pre-adoption raise,
+        # stranding the allocation at ref_count=1 (LMCache reports "garbage
+        # collected with ref_count=1, pin_count=0" much later) and shrinking the
+        # CPU pool one entry per failure. `get` guards its own reference with
+        # `finally` for the same reason.
         try:
             self._staged.pack(self._backend.page_unit_views(unit_ids), obj)
             # Source first: `pack` has synchronized the stream that reads the
