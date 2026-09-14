@@ -1,6 +1,7 @@
 {
   "default_scenarios": [
     {
+      "cadence": "weekly",
       "isl": 1024,
       "osl": 1024,
       "concurrency": [4, 8, 16, 32, 64, 128, 256, 512],

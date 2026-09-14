@@ -147,23 +147,25 @@ def install_dflash_lm_head_patch() -> None:
             return torch.empty((0,), dtype=torch.long, device=hidden_states.device)
 
         weight_dtype = lm_head.weight.dtype
-        out_tokens = torch.empty(
-            (num_tokens,), dtype=torch.long, device=hidden_states.device
-        )
+        # Each chunk's slice IS the head's output, so the per-chunk copy this
+        # loop used to make is gone; SGLang's caller wants int64, widened once.
+        ids = torch.empty((num_tokens,), dtype=torch.int32, device=hidden_states.device)
         step = max(int(chunk_size), 1)
         for start in range(0, num_tokens, step):
             end = min(num_tokens, start + step)
             hs = hidden_states[start:end]
             if hs.dtype != weight_dtype:
                 hs = hs.to(weight_dtype)
-            token_ids = compute_argmax_token(hs)
-            if token_ids.shape != (end - start,):
+            dst = ids[start:end]
+            answered = compute_argmax_token(hs, out=dst)
+            # The head is duck-typed; a shape check would no longer catch one
+            # that ignores `out`, which leaves this chunk unwritten.
+            if answered.data_ptr() != dst.data_ptr():
                 raise ValueError(
-                    "ATOM lm_head.compute_argmax_token returned an invalid shape: "
-                    f"expected {(end - start,)}, got {tuple(token_ids.shape)}."
+                    "ATOM lm_head.compute_argmax_token did not answer into the "
+                    "storage it was given."
                 )
-            out_tokens[start:end].copy_(token_ids.to(torch.long))
-        return out_tokens
+        return ids.to(torch.long)
 
     patched.__name__ = original.__name__
     patched.__qualname__ = original.__qualname__

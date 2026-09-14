@@ -2733,6 +2733,7 @@ class FusedMoE(torch.nn.Module):
         config: PretrainedConfig | None = None,
         shared_expert_prefix: str | None = None,
         pad_align: int | None = None,
+        enable_comm_fused: bool = False,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -2760,10 +2761,28 @@ class FusedMoE(torch.nn.Module):
         self.moe_parallel_config = FusedMoEParallelConfig.make(
             tp_size, dp_size, atom_config
         )
+        self._comm_fused_moe = None
+        if enable_comm_fused:
+            from atom.model_ops.fused_moe.comm_fused_moe import (
+                create_comm_fused_moe_backend,
+            )
+
+            self._comm_fused_moe = create_comm_fused_moe_backend(
+                layer_quant_config=layer_quant_config,
+                online_quant=quant_config is not None and quant_config.online_quant,
+                parallel_config=self.moe_parallel_config,
+                model_dim=hidden_size,
+                inter_dim=intermediate_size // self.tp_size,
+                experts=num_experts,
+                topk=top_k,
+                activation=activation,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
         if shared_expert_prefix is None and prefix.endswith(".experts"):
             shared_expert_prefix = prefix[: -len(".experts")] + ".shared_experts"
         fuse_shared_experts = (
-            is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+            self._comm_fused_moe is None
+            and is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
                 quant_config,
                 shared_expert_prefix=shared_expert_prefix,
                 routed_expert_prefix=prefix,
@@ -3085,6 +3104,8 @@ class FusedMoE(torch.nn.Module):
     def process_weights_after_loading(self):
         self._online_quant()
         self._validate_moe_backend()
+        if self._comm_fused_moe is not None:
+            self._comm_fused_moe.initialize(self)
 
     def _validate_moe_backend(self) -> None:
         if get_current_atom_config().moe_backend != "mega":
@@ -4319,6 +4340,33 @@ class FusedMoE(torch.nn.Module):
         return torch.ops.aiter.moe_forward(
             hidden_states, router_logits, self.layer_name
         )
+
+    def forward_maybe_comm_fused(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        shared_partial: torch.Tensor | None,
+        before_stage2: Callable[[], torch.Tensor] | None = None,
+        stage2_stream: torch.cuda.Stream | None = None,
+    ) -> tuple[torch.Tensor, bool]:
+        """Return ``(output, complete)`` after fused or ordinary dispatch.
+
+        A complete output already contains the shared expert and TP reduction.
+        """
+        backend = self._comm_fused_moe
+        if backend is not None and backend.supports(hidden_states.shape[0]):
+            return (
+                backend.forward(
+                    self,
+                    hidden_states,
+                    router_logits,
+                    shared_partial,
+                    before_stage2=before_stage2,
+                    stage2_stream=stage2_stream,
+                ),
+                True,
+            )
+        return self(hidden_states, router_logits), False
 
     def forward_impl_graph(
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor

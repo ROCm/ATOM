@@ -40,6 +40,30 @@ class Attention:
         return AttentionForAtom(*args, **kwargs)
 
 
+# Envelopes of the two paged decode kernels wrapped below. Both are multiplied
+# by drafting: MiniMax-M3 sits exactly on the gluon group one today (16 x 4 draft
+# positions), a gqa=8 model reaches the gluon length one first, and ASM tops out
+# lower than either -- past its limit get_heuristic_kernel silently re-runs with
+# mtp=1, a kernel built for another query length.
+PA_GLUON_MAX_QUERY_LEN = 4
+PA_GLUON_MAX_QUERY_GROUP_SIZE = 64
+PA_ASM_MAX_QUERY_GROUP_SIZE = 16
+
+
+def gluon_decode_over_limit(max_qlen: int, num_heads: int, num_kv_heads: int) -> bool:
+    """Whether decode is past what the gluon kernel takes.
+
+    pow2, not the raw product: that is what the kernel indexes its layout table
+    with, and it rounds a small group up to fill 16.
+    """
+    max_qlen = max(1, int(max_qlen))
+    qlen_p2 = 1 << (max_qlen - 1).bit_length()
+    group_p2 = qlen_p2 * max(
+        16 // qlen_p2, 1 << (num_heads // num_kv_heads - 1).bit_length()
+    )
+    return max_qlen > PA_GLUON_MAX_QUERY_LEN or group_p2 > PA_GLUON_MAX_QUERY_GROUP_SIZE
+
+
 def run_pa_fwd_asm(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -53,8 +77,13 @@ def run_pa_fwd_asm(
     qo_indptr: torch.Tensor | None = None,
     max_qlen: int = 1,
     high_precision: int = 0,
+    kernel_name: str | None = None,
 ):
-    """Run the AITER paged-attention ASM kernel with explicit metadata."""
+    """Run the AITER paged-attention ASM kernel with explicit metadata.
+
+    ``kernel_name`` bypasses aiter's kernel heuristic; a name absent from
+    pa_asm.csv aborts the process rather than raising.
+    """
 
     import aiter
 
@@ -71,6 +100,7 @@ def run_pa_fwd_asm(
         out_=out,
         qo_indptr=qo_indptr,
         high_precision=high_precision,
+        kernelName=kernel_name,
     )
 
 

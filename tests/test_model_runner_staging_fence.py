@@ -101,6 +101,22 @@ def test_dummy_forward_participates_in_staging_lifetime():
     )
 
 
+def test_prefill_ready_events_are_recorded_after_model_submission():
+    method = _method("forward")
+    helper = _method("_record_kv_cache_ready")
+    run_model = _attribute_calls(method, "run_model")
+    ready_events = _attribute_calls(method, "_record_kv_cache_ready")
+    helper_source = ast.unparse(helper)
+
+    assert len(run_model) == 1
+    assert len(ready_events) == 2
+    assert all(run_model[0].lineno < event.lineno for event in ready_events)
+    assert "batch.total_seqs_num_prefill <= 0" in helper_source
+    assert "batch.is_final_chunk" in helper_source
+    assert "if is_final" in helper_source
+    assert "record_kv_cache_ready" in helper_source
+
+
 def test_late_draft_uploads_are_staged_by_prepare_model():
     """Draft setup must not start a new pinned H2D after the staging event."""
     prepare_model = _method("prepare_model")

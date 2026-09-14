@@ -1,16 +1,29 @@
 import asyncio
+import logging
 
 import pytest
+from prometheus_client import CollectorRegistry, Histogram, generate_latest
+from prometheus_client.parser import text_string_to_metric_families
 
+from atom.entrypoints.openai import streaming_dispatch
+from atom.entrypoints.openai.metrics import AtomMetricsExporter
 from atom.entrypoints.openai.streaming_dispatch import (
     IncrementalStreamDetokenizer,
     StreamBatchDispatcher,
     StreamOutputCollector,
+    enable_delta_reuse,
     merge_chunk,
 )
 
 
 class _Utf8ByteTokenizer:
+    # One token per byte, so the delta-reuse probe's sampled-vocabulary
+    # streams reach every id this double can produce.
+    vocab_size = 256
+
+    def encode(self, text, add_special_tokens=False):
+        return list(text.encode())
+
     def decode(self, token_ids, skip_special_tokens=True):
         # `bytes(x)` of an `array("i")` copies its buffer -- four bytes per id
         # -- where from a list it takes the values. A real tokenizer reads ids,
@@ -58,6 +71,176 @@ def _resolve(coro):
         return stop.value
     coro.close()
     raise AssertionError("coroutine suspended when it should have had a value ready")
+
+
+def _itl_samples(exporter):
+    return {
+        (sample.name, sample.labels.get("le")): sample.value
+        for family in text_string_to_metric_families(exporter.render().decode())
+        for sample in family.samples
+        if sample.name.startswith("atom:inter_token_latency_seconds_")
+        and not sample.name.endswith("_created")
+    }
+
+
+def test_weighted_itl_matches_histogram_buckets_and_handles_large_batches():
+    exporter = AtomMetricsExporter()
+    registry = CollectorRegistry()
+    reference = Histogram(
+        "atom:inter_token_latency_seconds",
+        "reference",
+        buckets=exporter._inter_token_latency._bounds,
+        registry=registry,
+    )
+    for interval, tokens in ((0.0, 3), (0.008, 4), (0.09, 3), (32.0, 2)):
+        exporter.observe_inter_token_latency(interval, tokens)
+        for _ in range(tokens):
+            reference.observe(interval / tokens)
+    expected = {
+        (s.name, s.labels.get("le")): s.value
+        for f in text_string_to_metric_families(generate_latest(registry).decode())
+        for s in f.samples
+        if not s.name.endswith("_created")
+    }
+    assert _itl_samples(exporter) == pytest.approx(expected)
+    exporter.observe_inter_token_latency(5000.0, 10_000_000)
+    exporter.observe_inter_token_latency(1.0, 0)
+    samples = _itl_samples(exporter)
+    prefix = "atom:inter_token_latency_seconds"
+    assert samples[(prefix + "_count", None)] == 10_000_012
+    assert samples[(prefix + "_bucket", "0.002")] == 10_000_007
+    assert samples[(prefix + "_sum", None)] == pytest.approx(5032.098)
+
+
+def test_itl_preserves_token_weighted_intervals_when_stream_chunks_coalesce(
+    monkeypatch,
+):
+    exporter = AtomMetricsExporter()
+    tokenizer = _CountingTokenizer()
+    dispatcher = StreamBatchDispatcher(
+        tokenizer,
+        observe_inter_token_latency=exporter.observe_inter_token_latency,
+    )
+    state = dispatcher.new_state()
+    collector = StreamOutputCollector("itl")
+    loop = _ImmediateLoop()
+    timestamps = iter((1.0, 1.125, 1.125, 1.375, 1.375))
+    monkeypatch.setattr(
+        "atom.entrypoints.openai.streaming_dispatch.time.perf_counter",
+        lambda: next(timestamps),
+    )
+    # Four speculative tokens after 125 ms contribute four 31.25 ms
+    # observations; the next token contributes one 250 ms observation.
+    # An empty terminal output must not contribute another sample.
+    for tokens in ([65], [66, 67, 68, 69], [70], []):
+        dispatcher.enqueue(
+            loop=loop,
+            collector=collector,
+            state=state,
+            chunk={"token_ids": tokens, "finished": not tokens},
+        )
+        dispatcher.flush()
+
+    # ITL still samples each delivered batch while decoding waits for a read.
+    assert tokenizer.calls == 0
+    samples = _itl_samples(exporter)
+    assert _resolve(collector.get())["text"] == "ABCDEF"
+    assert tokenizer.calls == 2
+    assert _itl_samples(exporter) == samples
+    prefix = "atom:inter_token_latency_seconds"
+    assert samples[(prefix + "_count", None)] == 5
+    assert samples[(prefix + "_sum", None)] == pytest.approx(0.375)
+    assert samples[(prefix + "_bucket", "0.03")] == 0
+    assert samples[(prefix + "_bucket", "0.035")] == 4
+    assert samples[(prefix + "_bucket", "+Inf")] == 5
+
+    # The 5-second runtime snapshot and repeated scrapes must neither reset
+    # these streaming samples nor count them again.
+    exporter.update({"enabled": True})
+    exporter.update({"enabled": True, "requests_running": 0})
+    assert _itl_samples(exporter) == samples
+    assert _itl_samples(exporter) == samples
+
+
+@pytest.mark.parametrize("collector_type", [asyncio.Queue, StreamOutputCollector])
+def test_itl_keeps_independent_clocks_for_interleaved_fanout_choices(
+    monkeypatch, collector_type
+):
+    exporter = AtomMetricsExporter()
+    dispatcher = StreamBatchDispatcher(
+        _Utf8ByteTokenizer(),
+        observe_inter_token_latency=exporter.observe_inter_token_latency,
+    )
+    states = [dispatcher.new_state(), dispatcher.new_state()]
+    loop = _ImmediateLoop()
+    queue = collector_type()
+    timestamps = iter((1.0, 2.0, 2.5, 2.5, 3.0, 3.0))
+    monkeypatch.setattr(
+        "atom.entrypoints.openai.streaming_dispatch.time.perf_counter",
+        lambda: next(timestamps),
+    )
+    for tag, token in ((0, 65), (1, 66), (1, 67), (0, 68)):
+        dispatcher.enqueue(
+            loop=loop,
+            collector=queue,
+            state=states[tag],
+            chunk={"token_ids": [token], "finished": False},
+            tag=tag,
+        )
+    dispatcher.flush()
+    samples = _itl_samples(exporter)
+    prefix = "atom:inter_token_latency_seconds"
+    assert samples[(prefix + "_count", None)] == 2
+    assert samples[(prefix + "_sum", None)] == pytest.approx(2.5)
+    assert samples[(prefix + "_bucket", "0.6")] == 1
+    assert samples[(prefix + "_bucket", "2.0")] == 2
+
+
+def test_itl_includes_frontend_queueing_but_excludes_observation_work(monkeypatch):
+    exporter = AtomMetricsExporter()
+    clock = [0.0]
+    monkeypatch.setattr(
+        "atom.entrypoints.openai.streaming_dispatch.time.perf_counter",
+        lambda: clock[0],
+    )
+
+    def observe(interval, tokens):
+        exporter.observe_inter_token_latency(interval, tokens)
+        clock[0] += 0.125
+
+    dispatcher = StreamBatchDispatcher(
+        _Utf8ByteTokenizer(), observe_inter_token_latency=observe
+    )
+    loop = _RecordingLoop()
+    collector = StreamOutputCollector("frontend-itl")
+    state = dispatcher.new_state()
+    prefix = "atom:inter_token_latency_seconds"
+
+    for arrival, delivery, tokens in (
+        (1.0, 2.0, [65, 66, 67, 68]),  # Entire first batch is excluded.
+        (3.0, 4.5, [69, 70, 71, 72]),  # 2.5 seconds / 4 new tokens.
+        (5.0, 5.5, []),  # Empty output does not advance the last-token clock.
+        (6.0, 6.625, [73]),  # 2 seconds since observation ended at 4.625.
+    ):
+        before = _itl_samples(exporter)
+        clock[0] = arrival
+        dispatcher.enqueue(
+            loop=loop,
+            collector=collector,
+            state=state,
+            chunk={"token_ids": tokens, "finished": tokens == [73]},
+        )
+        dispatcher.flush()
+        assert _itl_samples(exporter) == before
+        clock[0] = delivery
+        loop.run()
+
+    samples = _itl_samples(exporter)
+    assert samples[(prefix + "_count", None)] == 5
+    assert samples[(prefix + "_sum", None)] == pytest.approx(4.5)
+    assert samples[(prefix + "_bucket", "0.6")] == 0
+    assert samples[(prefix + "_bucket", "0.8")] == 4
+    assert _resolve(collector.get())["text"] == "ABCDEFGHI"
 
 
 def test_incremental_detokenizer_holds_incomplete_utf8():
@@ -442,6 +625,7 @@ def test_dispatcher_keeps_no_per_stream_state():
     assert vars(dispatcher).keys() == {
         "tokenizer",
         "synthetic_text",
+        "_observe_inter_token_latency",
         "_thread_local",
     }
     for collector in collectors:
@@ -454,7 +638,9 @@ def test_each_stream_gets_its_own_detokenizer():
     first, second = dispatcher.new_state(), dispatcher.new_state()
 
     assert first is not second
-    assert not first.tokens and not second.tokens
+    assert first.detokenizer is not second.detokenizer
+    assert first.timing is not second.timing
+    assert not first.detokenizer.tokens and not second.detokenizer.tokens
 
 
 class _CountingTokenizer(_Utf8ByteTokenizer):
@@ -639,7 +825,7 @@ def test_decode_failure_keeps_tokens_for_a_later_update(fail_on, caplog):
     assert failed == {"token_ids": [ord("B")], "text": "", "finished": False}
     recovered = send(ord("C"), finished=True)
     assert recovered == {"token_ids": [ord("C")], "text": "BC", "finished": True}
-    assert list(state.tokens) == list(b"ABC")
+    assert list(state.detokenizer.tokens) == list(b"ABC")
     assert "Error detokenizing stream recoverable (tag=None)" in caplog.text
     assert "injected decode failure" in caplog.text
 
@@ -685,3 +871,201 @@ def test_failed_terminal_decode_preserves_metadata_and_fanout(fail_on, caplog):
     assert not collector._ready.is_set()
     assert "Error detokenizing stream fanout-error (tag=0)" in caplog.text
     assert "injected decode failure" in caplog.text
+
+
+class _PositionSensitiveTokenizer(_Utf8ByteTokenizer):
+    """A tokenizer whose span text depends on where the window starts.
+
+    What SentencePiece does with a leading space, in miniature. No such
+    tokenizer is installed here, so the probe's ability to reject one has to be
+    modelled or it is only ever exercised on tokenizers that pass.
+    """
+
+    def decode(self, token_ids, skip_special_tokens=True):
+        text = super().decode(token_ids, skip_special_tokens)
+        return text.lstrip(" ") if text.startswith(" ") else text
+
+
+@pytest.fixture(autouse=True)
+def _leave_delta_reuse_as_found():
+    """Process-wide state; a test that left it on would change how every later
+    test decodes."""
+    from dataclasses import replace as _replace
+
+    before = _replace(streaming_dispatch._DELTA_REUSE)
+    yield
+    for f, v in vars(before).items():
+        setattr(streaming_dispatch._DELTA_REUSE, f, v)
+
+
+def test_reuse_is_off_until_a_tokenizer_has_been_checked():
+    """Default-off, so a path that forgets to probe is slow rather than wrong."""
+    assert streaming_dispatch._DeltaReuse().enabled is False
+
+
+def test_a_well_behaved_tokenizer_is_accepted_and_skips_a_decode():
+    tokenizer = _CountingTokenizer()
+    assert enable_delta_reuse(tokenizer, "auto", audit_every=10**9) is True
+
+    tokenizer.calls = 0
+    state = IncrementalStreamDetokenizer(tokenizer)
+    text = "".join(state.update([b], b == ord("!")) for b in b"hello world!")
+
+    assert text == "hello world!"
+    # 12 tokens: without reuse each update decodes twice. The first update
+    # is audited (calls starts at zero), so one extra.
+    assert tokenizer.calls == 13
+
+
+def test_a_position_sensitive_tokenizer_is_rejected():
+    """The control the installed tokenizers cannot provide: the probe has to
+    say no to something, or "it passed" carries no information."""
+    assert enable_delta_reuse(_PositionSensitiveTokenizer(), "auto") is False
+    assert streaming_dispatch._DELTA_REUSE.enabled is False
+
+
+def test_output_is_identical_with_and_without_reuse():
+    """The property that matters. Same streams, same merge depths, both paths."""
+    tokenizer = _Utf8ByteTokenizer()
+    payload = ("你好 🎉 world ゆ\t x  " * 3).encode()
+    ids = list(payload)
+
+    def run(chunk):
+        state = IncrementalStreamDetokenizer(tokenizer)
+        return "".join(
+            state.update(ids[i : i + chunk], i + chunk >= len(ids))
+            for i in range(0, len(ids), chunk)
+        )
+
+    for chunk in (1, 2, 3, 7, 64):
+        enable_delta_reuse(tokenizer, "off")
+        plain = run(chunk)
+        enable_delta_reuse(tokenizer, "on")
+        assert run(chunk) == plain == payload.decode(), f"chunk {chunk}"
+
+
+def test_an_audit_mismatch_corrects_the_output_and_turns_reuse_off():
+    """A wrong delta must not reach the client. The audit that catches it also
+    has the decoded value in hand, so this call is answered correctly and only
+    later calls lose the shortcut."""
+    tokenizer = _Utf8ByteTokenizer()
+    enable_delta_reuse(tokenizer, "on", audit_every=1)
+    state = IncrementalStreamDetokenizer(tokenizer)
+    state.update(list(b"ab"), False)
+    state.last_delta = "wrong"
+
+    delta = state.update(list(b"cd"), True)
+
+    assert delta == "cd"
+    assert streaming_dispatch._DELTA_REUSE.enabled is False
+    assert streaming_dispatch._DELTA_REUSE.mismatches == 1
+
+
+def test_disabling_reaches_streams_already_in_flight():
+    """The flag is read per call, not captured per stream: four thousand
+    streams are open when a mismatch is found, and they must all stop trusting
+    reuse, not just the next one to arrive."""
+    tokenizer = _Utf8ByteTokenizer()
+    enable_delta_reuse(tokenizer, "on", audit_every=10**9)
+    inflight = IncrementalStreamDetokenizer(tokenizer)
+    inflight.update(list(b"xy"), False)
+
+    streaming_dispatch._DELTA_REUSE.enabled = False
+    counting = _CountingTokenizer()
+    inflight.tokenizer = counting
+    counting.calls = 0
+    inflight.update(list(b"z"), True)
+
+    assert counting.calls == 2, "still trusting the delta after reuse was off"
+
+
+def test_an_empty_update_does_not_disturb_the_stream():
+    """`update()` documents this as legal, and delta reuse is why it now
+    matters: an empty call that touched `last_delta` would leave it naming a
+    span it does not describe, and every later delta would be cut at the wrong
+    length. Nothing would raise."""
+    tokenizer = _Utf8ByteTokenizer()
+    enable_delta_reuse(tokenizer, "on", audit_every=10**9)
+    state = IncrementalStreamDetokenizer(tokenizer)
+
+    assert state.update(list(b"ab"), False) == "ab"
+    carried = state.last_delta
+    assert state.update([], False) == ""
+    assert state.last_delta == carried
+    assert state.update(list(b"cd"), True) == "cd"
+
+
+@pytest.mark.parametrize("spelling", ["off", "OFF", "Off", " off ", "  OfF"])
+def test_the_kill_switch_is_not_case_sensitive(spelling):
+    """Whoever sets this has just read the mismatch ERROR. A spelling that
+    silently means `auto` hands them back the behaviour they were disabling,
+    and `_Utf8ByteTokenizer` passes the probe, so `auto` here means on."""
+    assert enable_delta_reuse(_Utf8ByteTokenizer(), spelling) is False
+    assert streaming_dispatch._DELTA_REUSE.enabled is False
+
+
+@pytest.mark.parametrize("spelling", ["0", "false", "no", "disabled", "", "atuo"])
+def test_an_unreadable_mode_leaves_reuse_off(spelling, caplog):
+    """`auto` is the wrong fallback for a value nobody can parse: every
+    plausible misspelling here is someone reaching for off, and the tokenizer
+    that would then be trusted was never the thing in doubt."""
+    with caplog.at_level(logging.WARNING):
+        assert enable_delta_reuse(_Utf8ByteTokenizer(), spelling) is False
+    assert "unknown delta reuse mode" in caplog.text
+
+
+@pytest.mark.parametrize("spelling", ["on", "ON", " On "])
+def test_the_mode_still_pins_reuse_on(spelling):
+    """The negative control for the two above: normalising must not have made
+    every value mean off."""
+    assert enable_delta_reuse(_Utf8ByteTokenizer(), spelling) is True
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("", streaming_dispatch.DEFAULT_AUDIT_EVERY),
+        (None, streaming_dispatch.DEFAULT_AUDIT_EVERY),
+        ("abc", streaming_dispatch.DEFAULT_AUDIT_EVERY),
+        ("1_000ms", streaming_dispatch.DEFAULT_AUDIT_EVERY),
+        ("0", streaming_dispatch.DEFAULT_AUDIT_EVERY),
+        ("-5", streaming_dispatch.DEFAULT_AUDIT_EVERY),
+        ("7", 7),
+        (250, 250),
+    ],
+)
+def test_an_unusable_audit_interval_falls_back_instead_of_raising(value, expected):
+    """This is read as an argument at a callsite that has already loaded the
+    weights onto eight GPUs, so a typo in an optional tuning knob must not be
+    what ends the process -- and `0`, which reads like "never audit", would
+    divide by zero."""
+    assert enable_delta_reuse(_Utf8ByteTokenizer(), "on", value) is True
+    assert streaming_dispatch._DELTA_REUSE.audit_every == expected
+
+
+@pytest.mark.parametrize("value", ["abc", "1_000ms", "", "0", "-5"])
+def test_the_audit_interval_env_survives_a_typo(value, monkeypatch):
+    """The raise this guards against is in `envs`, one frame above
+    `enable_delta_reuse`, where its own try/except cannot reach it. Its sibling
+    `ATOM_GC_THRESHOLD` is text for the same reason."""
+    from atom.utils import envs
+
+    monkeypatch.setenv("ATOM_DETOKENIZER_AUDIT_EVERY", value)
+
+    assert enable_delta_reuse(
+        _Utf8ByteTokenizer(), "on", envs.ATOM_DETOKENIZER_AUDIT_EVERY
+    )
+
+
+@pytest.mark.parametrize(
+    ("raw", "normalized"), [("OFF", "off"), (" Auto ", "auto"), ("On", "on")]
+)
+def test_the_mode_env_is_normalized_where_it_is_read(raw, normalized, monkeypatch):
+    """Normalising in both places would be redundant; normalising in neither is
+    what shipped. `envs` owns it, and `enable_delta_reuse` keeps its own guard
+    because it is also called directly."""
+    from atom.utils import envs
+
+    monkeypatch.setenv("ATOM_DETOKENIZER_DELTA_REUSE", raw)
+
+    assert envs.ATOM_DETOKENIZER_DELTA_REUSE == normalized

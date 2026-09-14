@@ -21,8 +21,16 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.distributed.dcp_layout import (  # noqa: F401
+    dcp_global_pos,
+    dcp_local_index,
+    dcp_owner_rank,
+)
 from atom.distributed.dcp_utils import get_dcp_group, get_dcp_world_size
 from atom.utils.forward_context import get_published_dcp_local_context_lens
+
+# Token-ownership arithmetic lives in ``dcp_layout`` so P/D relayout can share
+# it without importing Triton. Re-exported here for existing attention callers.
 
 _AG_CUSTOM_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
@@ -776,42 +784,6 @@ def get_dcp_local_window_lens(
     )
 
 
-def dcp_owner_rank(pos, dcp_size, cp_kv_cache_interleave_size=1):
-    """Which DCP rank owns global token ``pos`` under interleaved KV storage.
-
-    Interleaving groups tokens into chunks of ``cp_kv_cache_interleave_size`` (= S); chunk
-    ``c = pos // S`` is stored on rank ``c % dcp_size``. For S == 1 this reduces
-    to the round-robin ``pos % dcp_size``.
-
-    Works elementwise on Python ints, numpy arrays and torch tensors (only ``//``
-    and ``%`` are used). Consistent with vLLM's slot kernel
-    (``block_table.py`` ``is_local``) because ``block_size * W`` is a multiple of
-    ``S * W`` when ``block_size % S == 0``, so computing on the global position
-    equals computing on the virtual-block offset.
-    """
-    return (pos // cp_kv_cache_interleave_size) % dcp_size
-
-
-def dcp_local_index(pos, dcp_size, cp_kv_cache_interleave_size=1):
-    """Local KV-sequence index of global token ``pos`` on its owning rank.
-
-    Each ``S * W`` super-block contributes ``S`` tokens to a rank, so the local
-    index is ``(pos // (S*W)) * S + (pos % S)``. For S == 1 this reduces to the
-    round-robin ``pos // dcp_size``.
-
-    To map to a physical slot (given ``block_size % S == 0``):
-        block_table_index = pos // (block_size * dcp_size)   # == local_index // block_size
-        slot_offset       = local_index % block_size
-        slot              = block_table[block_table_index] * block_size + slot_offset
-
-    Elementwise over Python ints / numpy / torch.
-    """
-    sw = cp_kv_cache_interleave_size * dcp_size
-    return (pos // sw) * cp_kv_cache_interleave_size + (
-        pos % cp_kv_cache_interleave_size
-    )
-
-
 def dcp_prefill_slot_mapping(
     block_tables,
     cached_lens,
@@ -849,23 +821,6 @@ def dcp_prefill_slot_mapping(
                 block_table[pos // virtual_block_size] * block_size + local_offset
             )
     return slot_mapping
-
-
-def dcp_global_pos(local_index, dcp_rank, dcp_size, cp_kv_cache_interleave_size=1):
-    """Inverse of ``dcp_local_index``: global token position of local KV index
-    ``local_index`` held on ``dcp_rank``.
-
-    Local index j on rank r sits in local S-group ``j // S`` at offset ``j % S``;
-    that group is global chunk ``(j//S)*W + r``, so the global position is
-    ``((j//S)*W + r) * S + (j % S)``. For S == 1 this reduces to the round-robin
-    ``j*W + r``. Used to reconstruct globally-unique ids for exchanged sparse
-    top-k candidates (the id must be a total order over global positions).
-
-    Elementwise over Python ints / numpy / torch.
-    """
-    return (
-        (local_index // cp_kv_cache_interleave_size) * dcp_size + dcp_rank
-    ) * cp_kv_cache_interleave_size + (local_index % cp_kv_cache_interleave_size)
 
 
 def dcp_local_context_lens(

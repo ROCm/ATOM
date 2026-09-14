@@ -146,11 +146,24 @@ The MHA `Attention` class handles standard models (Llama, Qwen3, Mixtral, etc.).
 | Phase | Condition | Method | AITER Kernel |
 |---|---|---|---|
 | Prefill | Always | `prefill_attention` | `aiter.flash_attn_varlen_func` |
+| Decode | `ATOM_USE_UNIFIED_ATTN` and `block_size == 256` | `paged_attention_persistent_asm` | `aiter.pa_persistent_fwd` |
+| Decode | past a paged kernel's envelope, or `ATOM_USE_UNIFIED_ATTN` / `use_flash_layout` | `paged_attention_unified` | `aiter.ops.triton.unified_attention` |
 | Decode | `use_triton_attn=True` | `paged_attention_triton` | `torch.ops.aiter.pa_decode_gluon` |
-| Decode | `block_size == 1024` | `paged_attention_persistent_asm` | `aiter.pa_persistent_fwd` |
 | Decode | Default | `paged_attention_asm` | `aiter.pa_fwd_asm` |
 
 The `use_triton_attn` flag is set when `sliding_window != -1` or `head_dim != 128`.
+
+Both paged kernels stop short of unified, at different points, and drafting
+multiplies the query group into both limits (`base_attention.py`):
+
+| Kernel | Envelope | Past it |
+|---|---|---|
+| gluon | `query_length <= 4` and `next_pow2(qlen) * max(16 // next_pow2(qlen), next_pow2(ratio)) <= 64`, where `ratio = q_heads / kv_heads` | no layout arm; Triton fails to compile |
+| `pa_fwd_asm` | `qlen x q_heads/kv_heads <= 16` | `get_heuristic_kernel` silently re-runs with `mtp=1` |
+
+`_dispatch_decode` is the single place that answers this; the runners do not
+re-decide. Unified carries one descale for the whole tensor, so a per-token
+quantized layer routed there raises rather than returning wrong numbers.
 
 ### Multi-head latent attention (`attention_mla.py`)
 

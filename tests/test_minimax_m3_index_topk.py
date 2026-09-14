@@ -22,7 +22,7 @@ import torch
 pytest.importorskip("triton", reason="index_topk defines @triton.jit kernels")
 
 from atom.model_ops.minimax_m3.index_topk import (
-    DECODE_SCORE_MAX_CHUNKS,
+    DECODE_SCORE_MIN_BLOCKS,
     DECODE_SCORE_TARGET_GRID,
     PREFILL_TOPK_MAX_BLOCK_SIZE_K,
     PREFILL_TOPK_MIN_BLOCK_SIZE_K,
@@ -77,10 +77,22 @@ class TestDecodeScoreChunks:
         # block and that none of them is empty by construction.
         n = _decode_score_chunks(batch, max_block)
         assert 1 <= n <= max_block
-        assert n <= DECODE_SCORE_MAX_CHUNKS
+        # Two bounds, one per end of the batch range.
+        assert n <= max(1, -(-max_block // DECODE_SCORE_MIN_BLOCKS))
+        assert batch * n <= max(DECODE_SCORE_TARGET_GRID, batch)
         chunk_blocks = -(-max_block // n)
         assert chunk_blocks * n >= max_block
         assert chunk_blocks * (n - 1) < max_block
+
+    def test_the_ceiling_binds_at_high_batch(self):
+        """The floor alone would return the same count at every batch.
+
+        Asserted against a literal rather than DECODE_SCORE_TARGET_GRID: a bound
+        read from the constant moves with it, so raising the constant back out
+        of range would satisfy the assertion instead of failing it.
+        """
+        assert _decode_score_chunks(8, 8192) > _decode_score_chunks(128, 8192)
+        assert _decode_score_chunks(128, 8192) * 128 <= 16384
 
     @pytest.mark.parametrize("batch", [1, 64])
     def test_an_empty_bound_still_gives_a_grid(self, batch):
@@ -91,19 +103,31 @@ class TestDecodeScoreChunks:
         assert _decode_score_chunks(batch, 0) == 1
 
     def test_shrinks_with_batch(self):
-        # The cap exists so a large batch does not multiply into a pointless
-        # grid; monotonicity is what makes that statement true.
+        # A larger batch must not buy more chunks per request: the grid is
+        # (request, chunk), so that would multiply into a pointless grid.
         prev = _decode_score_chunks(1, 4096)
         for batch in (2, 4, 16, 64, 256, 4096):
             cur = _decode_score_chunks(batch, 4096)
             assert cur <= prev
             prev = cur
 
-    def test_grid_stays_near_the_target(self):
-        # (request, chunk) is the grid, so batch * chunks is what it sizes.
-        for batch in (1, 8, 50, 64):
-            grid = batch * _decode_score_chunks(batch, 4096)
-            assert grid <= DECODE_SCORE_TARGET_GRID * 2
+    @pytest.mark.parametrize("max_block", [3, 5, 64, 800, 2464, 8192, 65534])
+    @pytest.mark.parametrize("batch", [1, 8, 64])
+    def test_a_chunk_walks_at_least_min_blocks(self, batch, max_block):
+        """The floor is the whole point of the split rule: a chunk down to one
+        block pays the query-tile load, which sits outside the block loop, for
+        a single block of work. Deleting the clamp must turn this red."""
+        n = _decode_score_chunks(batch, max_block)
+        assert -(-max_block // n) >= DECODE_SCORE_MIN_BLOCKS
+
+    @pytest.mark.parametrize("max_block,want_chunks", [(1, 1), (2, 1), (4, 2)])
+    def test_the_floor_is_a_target_not_a_guarantee(self, max_block, want_chunks):
+        """Right above MIN_BLOCKS the floor cannot hand out a second full
+        chunk: max_block=4 splits into 2 chunks of 2, under the floor. Nothing
+        is wrong with that -- 2 blocks still amortize the query tile -- but the
+        floor is a target, so `test_a_chunk_walks_at_least_min_blocks` skips
+        this range rather than asserting something untrue about it."""
+        assert _decode_score_chunks(1, max_block) == want_chunks
 
 
 class TestPackableBound:

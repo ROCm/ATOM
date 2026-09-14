@@ -7,7 +7,9 @@ concurrency list; see ``catalog.build_cell_configs``) to ``$GITHUB_OUTPUT`` as
 ``configs_json`` plus a ``has_cells`` flag.
 
 Behaviour by event:
-- ``schedule``      -> all models, catalog ``default_scenarios`` (nightly grid).
+- ``schedule``      -> all models, catalog ``default_scenarios`` filtered by
+  ``CADENCE`` (the workflow derives it from which cron fired: the nightly grid,
+  or the weekly one).
 - ``workflow_dispatch`` -> only models whose checkbox is ticked, workload from
   the ``param_lists`` input. Also validates that the dispatch model checkboxes
   stay in sync with the catalog prefixes (fails fast on drift).
@@ -65,6 +67,12 @@ def main() -> int:
     event = os.environ.get("EVENT_NAME", "")
     inputs = json.loads(os.environ.get("INPUTS_JSON") or "{}")
 
+    # Which slice of `default_scenarios` this run wants. Set by the workflow off
+    # the cron that fired; unset means no filter. Only the schedule path reads
+    # it -- a dispatch always carries `param_lists`, which replaces the catalog
+    # scenarios outright.
+    cadence = os.environ.get("CADENCE") or None
+
     if event == "schedule":
         model_filter = None
         param_lists = None
@@ -84,16 +92,31 @@ def main() -> int:
         param_lists = inputs.get("param_lists") or DEFAULT_PARAM_LISTS
 
     configs = build_cell_configs(
-        CATALOG, param_lists=param_lists, model_filter=model_filter
+        CATALOG,
+        param_lists=param_lists,
+        model_filter=model_filter,
+        cadence=cadence,
     )
+    if event == "schedule" and not configs:
+        # A cron that resolves to nothing means the catalog and the workflow's
+        # cadence labels disagree. Fail loudly: `has_cells=false` would skip the
+        # whole run in silence and read as a healthy no-op.
+        print(
+            f"ERROR: no cells for cadence {cadence!r}; the cron in "
+            f"atom-benchmark.yaml and the scenario `cadence` tags in {CATALOG} "
+            "are out of sync.",
+            file=sys.stderr,
+        )
+        return 1
     _emit(configs)
 
     n_cells = sum(len(json.loads(c["concurrency"])) for c in configs)
     n_models = len({c["prefix"] for c in configs})
     n_total = len(load_variants(CATALOG))
     print(
-        f"Event={event}: {n_cells} cells across {n_models} models "
-        f"-> {len(configs)} matrix configs ({n_total} variants in catalog)",
+        f"Event={event} cadence={cadence or 'all'}: {n_cells} cells across "
+        f"{n_models} models -> {len(configs)} matrix configs "
+        f"({n_total} variants in catalog)",
         file=sys.stderr,
     )
     return 0

@@ -853,6 +853,33 @@ class Scheduler:
         callback = getattr(self.kv_connector, "should_defer_free", None)
         return bool(callable(callback) and callback(seq))
 
+    def _connector_protected_block_ids(self, seq: Sequence) -> frozenset | None:
+        """Exact block IDs a pending save still reads, or None if unsupported.
+
+        None means the connector cannot narrow the protection (feature off, no
+        offload connector, or this predicate not implemented, e.g. DSV4/K3) --
+        the caller must fall back to deferring the whole request. See
+        `DenseOffloadScheduler.protected_block_ids`.
+        """
+        callback = getattr(self.kv_connector, "protected_block_ids", None)
+        if not callable(callback):
+            return None
+        return callback(seq)
+
+    def _drain_source_safe_releases(self) -> None:
+        """Free block IDs the offload connector reports as newly source-safe.
+
+        Polled after every `finished_saving` batch and by the stall
+        reconciler. No-op for a connector without early block release (the
+        method is simply absent).
+        """
+        take = getattr(self.kv_connector, "take_source_safe_releases", None)
+        if not callable(take):
+            return
+        for block_ids in take():
+            if block_ids:
+                self.block_manager.free_leased_blocks(block_ids)
+
     def _connector_release_stalled_save(self, seq: Sequence) -> None:
         """Let the connector drop a stall-escaped save this free surrenders.
 
@@ -937,12 +964,32 @@ class Scheduler:
         save has a way out.
         """
         timeout = self._save_abandon_timeout_s()
-        if timeout <= 0 or not self.deferred_free_blocks:
+        if timeout <= 0:
             return 0
         now = time.monotonic()
         if now < self._next_save_reconcile_at:
             return 0
         self._next_save_reconcile_at = now + _SAVE_RECONCILE_INTERVAL_S
+        # Early-release leases (see `deallocate_partial`) live entirely on the
+        # connector, keyed by save generation rather than by seq -- reclaim
+        # those first since they are independent of `deferred_free_blocks`
+        # below (an early-released request is never parked there).
+        reclaim_leases = getattr(self.kv_connector, "reclaim_stale_leases", None)
+        lease_reclaims = 0
+        if callable(reclaim_leases):
+            for block_ids in reclaim_leases(timeout):
+                if block_ids:
+                    self.block_manager.free_leased_blocks(block_ids)
+                    lease_reclaims += len(block_ids)
+        if lease_reclaims:
+            logger.warning(
+                "Reclaimed %d offload save-lease block(s) whose save never "
+                "reported after %.0fs.",
+                lease_reclaims,
+                timeout,
+            )
+        if not self.deferred_free_blocks:
+            return lease_reclaims
         stalled = [
             seq
             for seq in list(self.deferred_free_blocks.values())
@@ -964,7 +1011,7 @@ class Scheduler:
                 timeout,
                 self._abandoned_saves,
             )
-        return len(stalled)
+        return len(stalled) + lease_reclaims
 
     def _unschedulable_reason(self, seq: Sequence) -> str | None:
         """Return a human-readable reason if `seq` is permanently unschedulable.
@@ -1803,6 +1850,13 @@ class Scheduler:
         seq.status = SequenceStatus.FINISHED
         seq.leave_reason = "aborted"
         self._rejected.append(seq)
+        if not has_inflight_load and self._connector_flag("is_offload"):
+            # A lookup can pin CPU KV before HBM allocation succeeds. No load
+            # is in flight yet, but the connector still owns cleanup work.
+            # Already-dispatched loads retain the completion-driven path below.
+            self.kv_connector.cancel_pending_load(seq)
+            self.deferred_free_blocks[seq.id] = seq
+            self._maybe_release_deferred(seq)
         if not has_inflight_load or not self._connector_flag("is_offload"):
             self._uncount_inflight_load(seq)
             return
@@ -2860,14 +2914,45 @@ class Scheduler:
                     )
                     self.deferred_free_blocks[seq.id] = seq
                 elif self._connector_should_defer_free(seq):
-                    logger.debug(
-                        "Deferring block free for seq %s until KV save completes.",
-                        seq.id,
-                    )
-                    # Stamp when the save was deferred so the reconciler can
-                    # reclaim it if the completion report never arrives.
-                    seq._deferred_save_at = time.monotonic()
-                    self.deferred_free_blocks[seq.id] = seq
+                    protected = self._connector_protected_block_ids(seq)
+                    if protected is not None:
+                        # Early block release: only the save's exact source
+                        # blocks stay pinned; everything else in this
+                        # finished request's block_table -- decode blocks, an
+                        # unaligned prompt tail, already-saved ranges -- frees
+                        # now instead of waiting behind `deferred_free_blocks`.
+                        before = len(seq.block_table)
+                        self.block_manager.deallocate_partial(seq, protected)
+                        activate = getattr(
+                            self.kv_connector, "activate_block_leases", None
+                        )
+                        if callable(activate):
+                            activate(seq, protected)
+                        released = before - len(protected)
+                        record = getattr(
+                            self.kv_connector, "record_early_release", None
+                        )
+                        if callable(record):
+                            record(released)
+                        logger.debug(
+                            "Early-released %d/%d block(s) for seq %s; %d "
+                            "still leased to an in-flight save.",
+                            released,
+                            before,
+                            seq.id,
+                            len(protected),
+                        )
+                    else:
+                        logger.debug(
+                            "Deferring block free for seq %s until KV save "
+                            "completes.",
+                            seq.id,
+                        )
+                        # Stamp when the save was deferred so the reconciler
+                        # can reclaim it if the completion report never
+                        # arrives.
+                        seq._deferred_save_at = time.monotonic()
+                        self.deferred_free_blocks[seq.id] = seq
                 else:
                     self.block_manager.deallocate(seq)
             else:
@@ -3168,6 +3253,12 @@ class Scheduler:
                 seq = self._deferred_sequence(req_id)
                 if seq is not None:
                     self._maybe_release_deferred(seq)
+        # Early-release requests are never in `deferred_free_blocks` (they were
+        # fully torn down, minus their lease, at finish time), so the loops
+        # above have nothing to find for them. Drain independently of producer
+        # mode because a MultiConnector may contain both a producer and an
+        # offload leg.
+        self._drain_source_safe_releases()
 
         # The state-offload store reports, not keyed by request: by the time a
         # store lands its owner is long gone and only the hash remains. They
