@@ -418,6 +418,11 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             assert (
                 not self.is_producer
             ), "Only the decode (consumer) side handles do_remote_prefill"
+            # Preserve the producer's final, possibly checkpoint-moved source
+            # slot before replacing local_slot_index with the consumer's slot.
+            params["remote_slot_index"] = params.get(
+                "remote_slot_index", params.get("local_slot_index", -1)
+            )
             self._reqs_need_recv[seq.id] = (seq, list(seq.block_table), slot_index)
             params["do_remote_prefill"] = False
             params["local_slot_index"] = slot_index
@@ -448,12 +453,13 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             params["src_block_skip_factor"] = src_block_skip_factor
             logger.debug(
                 "[SCHEDULER-CONSUMER] Queued req %s for remote KV recv "
-                "(%d blocks, %d locally cached, slot=%d), transfer_id=%s, "
-                "remote_host=%s, remote_handshake_port=%s",
+                "(%d blocks, %d locally cached, dst_slot=%d, src_slot=%d), "
+                "transfer_id=%s, remote_host=%s, remote_handshake_port=%s",
                 seq.id,
                 len(seq.block_table),
                 num_computed_blocks,
                 slot_index,
+                params["remote_slot_index"],
                 params.get("transfer_id"),
                 params.get("remote_host"),
                 params.get("remote_handshake_port"),
@@ -476,6 +482,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         draft_token_ids = (
             [int(x) for x in drafts] if drafts is not None and len(drafts) else []
         )
+        final_state_slot = getattr(seq, "state_slot", -1)
         seq.kv_transfer_params_output = {
             "do_remote_prefill": True,
             "do_remote_decode": False,
@@ -496,9 +503,17 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             "transfer_id": seq.id,
             "first_token_id": first_token_id,
             "draft_token_ids": draft_token_ids,
-            "local_slot_index": getattr(seq, "state_slot", -1),
+            "local_slot_index": final_state_slot,
+            # Keep source and destination namespaces separate on the consumer:
+            # its allocation overwrites local_slot_index with the destination.
+            "remote_slot_index": final_state_slot,
             "prefix_cache_hit_tokens": getattr(seq, "prefix_cache_hit_tokens", 0),
         }
+        logger.debug(
+            "[PD-STATE-SLOT] producer-finished transfer_id=%s final_src_slot=%d",
+            seq.id,
+            final_state_slot,
+        )
 
         if not self.is_producer:
             transfer_id = self.request_id_to_transfer_id.pop(seq.id, None)
@@ -714,7 +729,14 @@ class MooncakeConnector(KVConnectorBase):
         self._release_targets: dict[ReqId, tuple[str, int, int]] = {}
         self._release_count: dict[TransferId, int] = {}
         self._released_transfers: set[TransferId] = set()
-        self._notification_port = get_open_port()
+        # Filled in by the listener thread once it has actually bound. Picking a
+        # free port here and binding it later leaves a window in which any of
+        # the other ranks starting up on this node can take it, and the loser
+        # used to die silently -- leaving producers with nowhere to report
+        # write-done, so every request on this rank hung until it was aborted.
+        self._notification_port: int | None = None
+        self._listener_bound = threading.Event()
+        self._listener_error: BaseException | None = None
 
         # --- Completion tracking ---
         self.done_sending: set[str] = set()
@@ -981,6 +1003,11 @@ class MooncakeConnector(KVConnectorBase):
                 name="mooncake-notify-listener",
             )
             self._notification_listener_thread.start()
+        # Fail registration instead of coming up healthy behind a dead listener.
+        # An unreachable side channel does not surface as an error anywhere: the
+        # peer simply never hears back, and every request hangs until the client
+        # gives up.
+        self._await_listener()
 
     # -----------------------------------------------------------------
     # KVConnectorBase: start_load_kv
@@ -1101,7 +1128,7 @@ class MooncakeConnector(KVConnectorBase):
                 "num_computed_blocks": off,
                 "src_block_skip_factor": src_block_skip_factor,
                 "notify_host": self.local_ip,
-                "notify_port": self._notification_port,
+                "notify_port": self.notification_port,
                 "consumer_tp_size": self.tp_size,
                 "write_nonce": write_nonce,
                 # DCP relayout: which shard of each block this rank owns.
@@ -1123,6 +1150,11 @@ class MooncakeConnector(KVConnectorBase):
                 request_body.update(
                     {
                         "has_slot_regions": True,
+                        # Recurrent state is slot-indexed, and prefix
+                        # checkpointing may move the producer request after its
+                        # initial allocation.
+                        "src_slot_index": meta.remote_slot_index,
+                        "src_swa_block_ids": meta.remote_swa_block_ids,
                         "dst_slot_index": meta.local_slot_index,
                         "consumer_block_base_addrs": [
                             b for b, _ in self._block_regions
@@ -1267,41 +1299,79 @@ class MooncakeConnector(KVConnectorBase):
     # Producer: write listener (ZMQ ROUTER)
     # -----------------------------------------------------------------
 
+    @property
+    def notification_port(self) -> int:
+        """Port the consumer's notification listener owns.
+
+        Only meaningful after ``_await_listener`` has returned; reading it
+        earlier is a bug, not a value to guess at.
+        """
+        port = self._notification_port
+        if port is None:
+            raise RuntimeError("Mooncake notification listener is not bound yet")
+        return port
+
+    def _publish_listener_state(self, exc: BaseException | None = None) -> None:
+        """Hand this listener's bind outcome to whoever is waiting on it."""
+        if exc is not None:
+            self._listener_error = exc
+            logger.exception("Mooncake side-channel listener died")
+        self._listener_bound.set()
+
+    def _await_listener(self, timeout: float = 60.0) -> None:
+        """Block until the side-channel listener owns its socket, else raise."""
+        role = "write" if self.is_producer else "notification"
+        if not self._listener_bound.wait(timeout):
+            raise RuntimeError(
+                f"Mooncake {role} listener did not bind within {timeout}s"
+            )
+        if self._listener_error is not None:
+            raise RuntimeError(
+                f"Mooncake {role} listener failed to bind"
+            ) from self._listener_error
+
     def _write_listener(self) -> None:
         """Accept write requests from consumers and dispatch RDMA writes."""
+        # Unlike the consumer's notification port this one is derived from
+        # handshake_port, so consumers can address it without a handshake; it
+        # cannot be delegated to the kernel.
         path = make_zmq_path("tcp", "*", self._side_channel_port)
-        logger.info("Mooncake write listener bound to %s", path)
+        try:
+            with zmq_socket_ctx(path, zmq.ROUTER, bind=True) as sock:
+                logger.info("Mooncake write listener bound to %s", path)
+                self._publish_listener_state()
+                while True:
+                    parts = sock.recv_multipart()
+                    identity, msg_type = parts[0], parts[1]
 
-        with zmq_socket_ctx(path, zmq.ROUTER, bind=True) as sock:
-            while True:
-                parts = sock.recv_multipart()
-                identity, msg_type = parts[0], parts[1]
+                    if msg_type == MSG_GET_META:
+                        encoded = self._encoder.encode(self._local_metadata)
+                        sock.send_multipart([identity, b"", encoded])
+                        logger.debug("Sent metadata to peer")
 
-                if msg_type == MSG_GET_META:
-                    encoded = self._encoder.encode(self._local_metadata)
-                    sock.send_multipart([identity, b"", encoded])
-                    logger.debug("Sent metadata to peer")
+                    elif msg_type == MSG_WRITE_REQUEST:
+                        request_data = msgpack.loads(parts[2])
+                        logger.debug(
+                            "[PRODUCER] Received write_request for req %s "
+                            "(transfer_id=%s, consumer=%s:%s)",
+                            request_data["request_id"],
+                            request_data.get("transfer_id"),
+                            request_data.get("consumer_host"),
+                            request_data.get("consumer_rpc_port"),
+                        )
+                        self._send_executor.submit(self._execute_transfer, request_data)
 
-                elif msg_type == MSG_WRITE_REQUEST:
-                    request_data = msgpack.loads(parts[2])
-                    logger.debug(
-                        "[PRODUCER] Received write_request for req %s "
-                        "(transfer_id=%s, consumer=%s:%s)",
-                        request_data["request_id"],
-                        request_data.get("transfer_id"),
-                        request_data.get("consumer_host"),
-                        request_data.get("consumer_rpc_port"),
-                    )
-                    self._send_executor.submit(self._execute_transfer, request_data)
+                    elif msg_type == MSG_RELEASE:
+                        data = msgpack.loads(parts[2])
+                        self._record_release(
+                            data["transfer_id"], data.get("consumer_tp_size", 1)
+                        )
 
-                elif msg_type == MSG_RELEASE:
-                    data = msgpack.loads(parts[2])
-                    self._record_release(
-                        data["transfer_id"], data.get("consumer_tp_size", 1)
-                    )
-
-                else:
-                    logger.error("Unknown message type: %s", msg_type)
+                    else:
+                        logger.error("Unknown message type: %s", msg_type)
+        except BaseException as exc:
+            self._publish_listener_state(exc)
+            raise
 
     def _record_release(self, transfer_id: TransferId, consumer_tp_size: int) -> None:
         """Count a consumer-rank release; free the shared page after all ranks.
@@ -1362,6 +1432,18 @@ class MooncakeConnector(KVConnectorBase):
             )
 
             request_src_block_ids = request_data.get("src_block_ids")
+            final_src_slot = -1
+            if has_slot_data:
+                try:
+                    final_src_slot = int(request_data["src_slot_index"])
+                except (KeyError, TypeError, ValueError):
+                    pass
+                if final_src_slot < 0:
+                    raise RuntimeError(
+                        "stateful Mooncake transfer is missing the producer's "
+                        f"final source slot (req_id={req_id}, "
+                        f"transfer_id={transfer_id})"
+                    )
             if self.pp_size == 1:
                 # TP-TP: authoritative block_ids come from the local prefill
                 # cache (populated by the scheduler). Wait for it.
@@ -1396,11 +1478,7 @@ class MooncakeConnector(KVConnectorBase):
                     cached = self._completed_prefills.get(transfer_id)
                 prefill_data = {
                     "block_ids": request_src_block_ids,
-                    "slot_index": (
-                        cached["slot_index"]
-                        if cached
-                        else request_data.get("src_slot_index", -1)
-                    ),
+                    "slot_index": (cached["slot_index"] if cached else final_src_slot),
                 }
 
             src_block_ids = prefill_data["block_ids"]
@@ -1431,10 +1509,30 @@ class MooncakeConnector(KVConnectorBase):
                 )
                 self._notify_transfer_result(request_data, success=False)
                 return
-            if has_slot_data and consumer_dcp_size > 1:
+            if (
+                has_slot_data
+                and consumer_dcp_size > 1
+                and self.dcp_size != consumer_dcp_size
+            ):
                 raise RuntimeError(
-                    "P/D slot-region transfer does not support a DCP consumer "
-                    f"(consumer_dcp_size={consumer_dcp_size})"
+                    "P/D slot-region transfer does not support asymmetric DCP "
+                    f"(producer_dcp={self.dcp_size}, consumer_dcp={consumer_dcp_size})"
+                )
+            if has_slot_data:
+                initial_src_slot = int(prefill_data.get("slot_index", -1))
+                prefill_data = dict(prefill_data)
+                prefill_data["slot_index"] = final_src_slot
+                prefill_data["swa_block_ids"] = request_data.get(
+                    "src_swa_block_ids", prefill_data.get("swa_block_ids", [])
+                )
+                logger.debug(
+                    "[PD-STATE-SLOT] transfer req_id=%s transfer_id=%s "
+                    "initial_src_slot=%d final_src_slot=%d dst_slot=%d",
+                    req_id,
+                    transfer_id,
+                    initial_src_slot,
+                    final_src_slot,
+                    int(request_data.get("dst_slot_index", -1)),
                 )
             target = f"{consumer_host}:{consumer_rpc_port}"
 
@@ -1940,6 +2038,17 @@ class MooncakeConnector(KVConnectorBase):
             return False
 
         # ---- Phase 2: Slot transfer ----
+        # Registered slot regions but no slot means no per-request state moves
+        # and the resuming side decodes from a zeroed recurrent state -- 69 of
+        # 93 layers on Kimi-K3, still fluent, so the skip below would report
+        # success. Same shape as the SWA guard above.
+        if self._slot_regions and (src_slot < 0 or dst_slot < 0):
+            raise RuntimeError(
+                f"backend registered {len(self._slot_regions)} state slot "
+                f"regions but the transfer carries no state slot "
+                f"(src={src_slot}, dst={dst_slot}); the resuming request would "
+                "decode from a zeroed recurrent state"
+            )
         if src_slot < 0 or dst_slot < 0:
             logger.debug(
                 "[PRODUCER] slot transfer skipped (src_slot=%d, dst_slot=%d)",
@@ -1952,7 +2061,7 @@ class MooncakeConnector(KVConnectorBase):
         slot_dst: list[int] = []
         slot_sizes: list[int] = []
 
-        # Phase 2a: SWA slot regions (direct, no staging)
+        # Phase 2a: slot-indexed state, written direct (no staging)
         slot_cmap = self._consumer_region_map(
             len(self._slot_regions), len(consumer_slot_addrs)
         )
@@ -2150,25 +2259,36 @@ class MooncakeConnector(KVConnectorBase):
 
     def _notification_listener(self) -> None:
         """Receive write-done notifications from producers."""
-        path = make_zmq_path("tcp", "*", self._notification_port)
-        logger.info("Mooncake notification listener bound to %s", path)
+        try:
+            # Port 0: let the kernel hand out the port to the socket we keep,
+            # so there is no interval between choosing it and owning it. The
+            # port only has to be known before the first start_load_kv puts it
+            # in the handshake, which _await_listener guarantees.
+            path = make_zmq_path("tcp", "*", 0)
+            with zmq_socket_ctx(path, zmq.ROUTER, bind=True) as sock:
+                endpoint = sock.getsockopt(zmq.LAST_ENDPOINT).decode()
+                self._notification_port = int(endpoint.rsplit(":", 1)[1])
+                logger.info("Mooncake notification listener bound to %s", endpoint)
+                self._publish_listener_state()
 
-        with zmq_socket_ctx(path, zmq.ROUTER, bind=True) as sock:
-            while True:
-                parts = sock.recv_multipart()
-                msg_type = parts[1]
+                while True:
+                    parts = sock.recv_multipart()
+                    msg_type = parts[1]
 
-                if msg_type == MSG_WRITE_DONE:
-                    data = msgpack.loads(parts[2])
-                    self._record_write_done(
-                        data["request_id"],
-                        data.get("pp_rank", 0),
-                        data.get("tp_rank", 0),
-                        data.get("write_nonce", 0),
-                        success=data.get("success", True),
-                    )
-                else:
-                    logger.error("Unknown notification type: %s", msg_type)
+                    if msg_type == MSG_WRITE_DONE:
+                        data = msgpack.loads(parts[2])
+                        self._record_write_done(
+                            data["request_id"],
+                            data.get("pp_rank", 0),
+                            data.get("tp_rank", 0),
+                            data.get("write_nonce", 0),
+                            success=data.get("success", True),
+                        )
+                    else:
+                        logger.error("Unknown notification type: %s", msg_type)
+        except BaseException as exc:
+            self._publish_listener_state(exc)
+            raise
 
     def _send_release(self, req_id: str) -> None:
         """Tell stage-0 this request's KV is fully received from every stage.

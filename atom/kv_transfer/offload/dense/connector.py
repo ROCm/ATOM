@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 import time
 from contextlib import nullcontext
+from functools import partial
 
 import torch
 
@@ -176,11 +177,25 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         for lookup_id in metadata.lookup_requests_in_step:
             if str(lookup_id) not in loading_lookup_ids:
                 self._lookup_unpin(lookup_id)
+        save_ready_event = None
+        if self._do_save and any(
+            req.save_spec is not None for req in metadata.requests
+        ):
+            # Middle prefill chunks return before their GPU writes complete.
+            # The save packer uses another stream: fence the RPC stream here,
+            # before dispatching its reader, rather than relying on CPU return.
+            save_ready_event = torch.cuda.Event()
+            save_ready_event.record(torch.cuda.current_stream())
         for req in metadata.requests:
             if req.load_spec is not None and self._do_load:
                 self._load_executor.submit(self._guard, "load", self._do_load_req, req)
             if req.save_spec is not None and self._do_save:
-                self._save_executor.submit(self._guard, "save", self._do_save_req, req)
+                self._save_executor.submit(
+                    self._guard,
+                    "save",
+                    partial(self._do_save_req, producer_event=save_ready_event),
+                    req,
+                )
 
     # -- copy daemon thread ----------------------------------------------
     def _source_group_safe(self, identity: SaveSourceGroupId) -> None:
@@ -299,7 +314,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 total_ms,
             )
 
-    def _do_save_req(self, req: LMCacheReqMeta) -> None:
+    def _do_save_req(self, req: LMCacheReqMeta, *, producer_event=None) -> None:
         ss = req.save_spec
         assert ss is not None
         toks = req.token_ids
@@ -315,6 +330,8 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         mask[:skip] = False
 
         t_store0 = time.perf_counter()
+        if producer_event is not None:
+            producer_event.synchronize()
         self._reset_gpu_connector_transfer_stats()
         gpu_connector = self._engine.gpu_connector
         track_source = getattr(gpu_connector, "track_save_source", None)

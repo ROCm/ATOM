@@ -371,10 +371,11 @@ def build_lmcache_config(
     from lmcache.v1.config import LMCacheEngineConfig
 
     cfg = LMCacheEngineConfig.from_env()
-    # Preserve the legacy rank-0 default; explicit overrides can opt into
-    # all-rank lookup ([]) so every shard gets matching touches and pins.
+    # Every shard needs the lookup's pins and LRU touches. Rank-0-only lookup
+    # can advertise a prefix already evicted on another rank. LMCache uses
+    # [] for all workers and takes the minimum hit length across responses.
     if getattr(cfg, "lookup_server_worker_ids", None) is None:
-        cfg.lookup_server_worker_ids = [0]
+        cfg.lookup_server_worker_ids = []
     apply_extra_overrides(cfg, kv_transfer_config)
     # Async lookup has a separate polling/cancellation contract. This
     # connector currently implements only synchronous lookup; do not let an
@@ -430,8 +431,8 @@ def lmcache_replica_world_size(config) -> int:
 
     Worker ids index this replica-local grid rather than the global one.
     LMCache selects its lookup servers by worker id
-    (``cfg.lookup_server_worker_ids``, defaulting to ``[0]``), so global
-    numbering would leave every replica except the first without a server.
+    (``cfg.lookup_server_worker_ids``, defaulting to all workers), so explicit
+    subsets must also use replica-local numbering.
     Replica-local ids are also the right cache-key component: id ``i`` means
     "shard i of the model", which holds the same bytes in every replica, so
     replicas sharing a disk/remote backend share entries instead of
