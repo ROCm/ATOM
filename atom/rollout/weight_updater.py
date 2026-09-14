@@ -465,6 +465,31 @@ class WeightUpdaterMixin:
 
         return True
 
+    def _await_readers_of(self, param: torch.nn.Parameter) -> None:
+        """Let work still reading this weight finish before it is overwritten.
+
+        A weight update rewrites the parameter buffer in place, and the FP8
+        path does it twice: once for the quantized bytes, again for the
+        kernel's shuffled layout. In place is deliberate -- rebinding
+        ``tensor.data`` moves the address out from under a captured decode
+        graph, which then replays against the old buffer and returns nothing
+        but punctuation. Keeping the address is what costs us: the write lands
+        in a buffer that is still live.
+
+        An update follows generation immediately, so the last decode replays of
+        the step that just ended can still be in flight. Overlap one with the
+        shuffle and the graph reads a half-permuted weight; generation carries
+        on and every sequence past that point is token soup, with nothing
+        raised anywhere.
+
+        Waiting once per update at the entry points is not enough -- measured
+        over seven weight syncs it still lost five of them. The wait has to sit
+        with the write.
+        """
+        device = getattr(param, "device", None)
+        if getattr(device, "type", None) == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(device)
+
     @staticmethod
     def _is_fp8_param(module: torch.nn.Module, param: torch.nn.Parameter) -> bool:
         return (
@@ -512,6 +537,8 @@ class WeightUpdaterMixin:
         from aiter import QuantType as _QT
 
         quant_type = getattr(module, "quant_type", None)
+
+        self._await_readers_of(param)
 
         if quant_type is not None and quant_type.value == _QT.per_1x128.value:
             # Must match the load-time online_quantize_weight layout: a true
@@ -564,6 +591,10 @@ class WeightUpdaterMixin:
         to ensure the weight layout matches what ATOM's GEMM kernels expect.
         """
         weight_scale = getattr(module, "weight_scale", None)
+
+        # Reached from the direct-copy call sites too, which write the
+        # parameter in place just above without passing through the requantize.
+        self._await_readers_of(param)
 
         if (
             getattr(module, "need_normalize_e4m3fn_to_e4m3fnuz", False)
