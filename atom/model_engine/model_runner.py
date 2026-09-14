@@ -813,7 +813,9 @@ class ModelRunner:
                     self.drafter.model, fullgraph=True, backend="eager"
                 )
 
-        # Install after startup profiling/warmup/capture, which are not traffic.
+        # Install after initialization warmup, which is not request traffic.
+        # Graph capture runs later via RPC and bypasses run_model, so its
+        # timing decorator does not run during capture.
         self.gpu_forward_metrics = None
         if envs.ATOM_ENABLE_METRICS_DEVICE_TIMER:
             self.gpu_forward_metrics = GPUForwardMetrics(
