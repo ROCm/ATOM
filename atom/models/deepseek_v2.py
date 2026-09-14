@@ -1464,6 +1464,42 @@ def _dcp_gather_indexer_k_prefill(
     return k_fp8, k_scale
 
 
+def _dcp_stage_indexer_fp4_prefill(
+    kv_cache: torch.Tensor,
+    kv_cache_scale: torch.Tensor,
+    prefill_metadata,
+    total_kv: int,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Stage the whole key set's FP4 index planes into pages of this rank's own.
+
+    Same three steps as `_dcp_gather_indexer_k_prefill` -- read the local shard,
+    all-gather it, de-interleave back to global order -- on the two E2M1/e8m0
+    planes instead of the one FP8 one. It ends in a paged buffer rather than a
+    flat one because every FP4 mqa-logits kernel is paged; over an identity
+    block table, column j of the scores is then flat KV index j, the space
+    `cu_seqlen_ks/ke` and the DCP prefill filter already speak.
+    """
+    slots = prefill_metadata.dcp_indexer_fp4_local_slots
+    page, row = slots // block_size, slots % block_size
+    data = kv_cache[page, :, :, row, :]
+    scale = kv_cache_scale[page, :, :, row]
+
+    dcp_group = get_dcp_group()
+    gather_index = prefill_metadata.dcp_indexer_gather_index
+    data = dcp_group.all_gather(data, dim=0).index_select(0, gather_index)
+    scale = dcp_group.all_gather(scale, dim=0).index_select(0, gather_index)
+
+    token = torch.arange(total_kv, device=data.device)
+    page, row = token // block_size, token % block_size
+    pages = -(-total_kv // block_size)
+    staged = kv_cache.new_zeros(pages, *kv_cache.shape[1:])
+    staged[page, :, :, row, :] = data
+    staged_scale = kv_cache_scale.new_zeros(pages, *kv_cache_scale.shape[1:])
+    staged_scale[page, :, :, row] = scale
+    return staged, staged_scale
+
+
 def _prefill_mqa_logits_fp4(
     prefill_metadata,
     chunk: slice,
@@ -1475,6 +1511,7 @@ def _prefill_mqa_logits_fp4(
     kv_scale: torch.Tensor,
     weights_scale: float,
     kv_block_size: int,
+    block_tables: torch.Tensor,
 ) -> torch.Tensor:
     """One chunk of ragged-prefill FP4 logits, scored out of the paged cache.
 
@@ -1510,7 +1547,7 @@ def _prefill_mqa_logits_fp4(
         q_scale,
         kv_cache,
         kv_scale,
-        prefill_metadata.block_tables,
+        block_tables,
         weights,
         rows,
         starts,
@@ -1649,7 +1686,7 @@ def sparse_attn_indexer(
         # cannot simply be allocated fp32; converting it instead would put a copy
         # kernel in all 21 captured layers. Nothing reads the return under FP4 --
         # the one reader is PCP-guarded and `assert_fp4_indexer_supported` refuses
-        # context parallel -- so only dtype and shape bind here.
+        # PCP -- so only dtype and shape bind here.
         weights = torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
     elif use_qk_rope_cache_fusion:
         q_bf16 = q_input
@@ -1715,8 +1752,21 @@ def sparse_attn_indexer(
                 device=prefill_metadata.block_tables.device,
             )
         if indexer_fp4:
-            # The paged FP4 scorer reads the cache in place.
+            # The paged FP4 scorer reads the cache in place -- except under DCP,
+            # where in place is only this rank's 1/W of the sequence.
             k_fp8 = k_scale = None
+            fp4_kv_cache = kv_cache
+            fp4_kv_scale = indexer_module.k_cache.kv_cache_scale
+            fp4_block_tables = prefill_metadata.block_tables
+            if get_dcp_world_size() > 1:
+                fp4_kv_cache, fp4_kv_scale = _dcp_stage_indexer_fp4_prefill(
+                    kv_cache,
+                    fp4_kv_scale,
+                    prefill_metadata,
+                    total_kv,
+                    runner_block_size,
+                )
+                fp4_block_tables = prefill_metadata.dcp_indexer_fp4_block_tables
         elif get_dcp_world_size() > 1:
             k_fp8, k_scale = _dcp_gather_indexer_k_prefill(
                 kv_cache, prefill_metadata, head_dim, k.device
@@ -1801,10 +1851,11 @@ def sparse_attn_indexer(
                     q_prefill[chunk],
                     q_fp4_scale[num_decode_tokens:num_tokens][chunk],
                     weights_prefill[chunk],
-                    kv_cache,
-                    indexer_module.k_cache.kv_cache_scale,
+                    fp4_kv_cache,
+                    fp4_kv_scale,
                     weights_scale,
                     runner_block_size,
+                    fp4_block_tables,
                 )
             else:
                 logits = fp8_mqa_logits(
@@ -1890,7 +1941,7 @@ def sparse_attn_indexer(
                 attn_metadata,
                 padded_q_decode_tokens,
                 kv_cache,
-                weights,
+                weights_mqa,
                 get_dcp_rank(),
                 num_decode_tokens,
                 topk_tokens,
@@ -1901,6 +1952,11 @@ def sparse_attn_indexer(
                 out_kv_indices=sparse_kv_indices_buffer,
                 out_kv_indptr=dcp_sparse_kv_indptr_buffer,
                 owned_counts=dcp_owned_counts_buffer,
+                q_scale=q_fp4_scale,
+                kv_scale=(
+                    indexer_module.k_cache.kv_cache_scale if indexer_fp4 else None
+                ),
+                weights_scale=weights_scale,
             )
             return weights
         # Non-DCP: this rank holds the whole plane, so its top-k is already the
@@ -2312,7 +2368,7 @@ class Indexer(nn.Module):
         if self._indexer_fp4:
             assert_fp4_indexer_supported(
                 fused_writer=self.use_qk_rope_cache_fusion,
-                context_parallel=get_dcp_world_size() > 1 or pcp_is_enabled(),
+                prefill_context_parallel=pcp_is_enabled(),
             )
 
         # TODO (zyongye) change dim to fp8 later to (self.head_dim + 4)

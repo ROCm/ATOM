@@ -476,6 +476,10 @@ class EagleProposer(Drafter):
             # itself; the verify step's has the right row count, wrong rows.
             attn_metadata.dcp_token_block_tables = attn_metadata.block_tables
         attn_metadata.context_lens = var["context_lens"].gpu[:running_bs]
+        # The draft's rows are its own, and a replay addresses whatever row
+        # count the schedule buffer holds -- see the publisher for why this is
+        # unguarded.
+        builder._publish_indexer_fp4_decode_schedule(attn_metadata, running_bs, 1)
         if "sparse_kv_indptr" in var:
             attn_metadata.sparse_kv_indptr = var["sparse_kv_indptr"].gpu[
                 : running_bs + 1

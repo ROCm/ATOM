@@ -101,7 +101,9 @@ def sparse_indexer_fp4_enabled(
     return False
 
 
-def assert_fp4_indexer_supported(*, fused_writer: bool, context_parallel: bool) -> None:
+def assert_fp4_indexer_supported(
+    *, fused_writer: bool, prefill_context_parallel: bool
+) -> None:
     """Reject the FP4 requests this build cannot serve.
 
     Both are knobs the user set, not geometry we can read off the config, so
@@ -118,11 +120,11 @@ def assert_fp4_indexer_supported(*, fused_writer: bool, context_parallel: bool) 
             "head_dim // 2, so a NoPE indexer has no FP4 route at all. Pass "
             "--index-cache-dtype fp8."
         )
-    if context_parallel:
+    if prefill_context_parallel:
         raise ValueError(
-            "The FP4 sparse indexer does not support DCP or PCP, which score "
-            "through the FP8-only candidate exchange. Pass "
-            "--index-cache-dtype fp8."
+            "The FP4 sparse indexer does not support PCP, whose candidate "
+            "exchange is the one reader of the fp32 `weights` the FP4 writer "
+            "does not produce. Pass --index-cache-dtype fp8."
         )
 
 
@@ -163,12 +165,15 @@ def fp4_prefill_schedule(
     block_k: int,
     parallel_floor: int,
     max_seq_len: int,
+    local_starts: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, int, torch.Tensor]:
     """Schedule one ragged-prefill forward, and the `local_starts` it scores from.
 
-    `local_ends` is each row's seq-local causal upper bound in the column space
-    the paged FP4 scorer emits -- DeepSeek-V4's `visible_end`, MLA's
-    `cu_seqlen_ke - cu_seqlen_ks` -- not an offset into one concatenated plane.
+    `local_ends` is each row's causal upper bound in the column space the paged
+    FP4 scorer emits -- DeepSeek-V4's `visible_end`, MLA's `cu_seqlen_ke -
+    cu_seqlen_ks`. Rows start at column 0 there, so `local_starts` defaults to
+    zeros; pass it when the columns are one concatenated plane instead, as they
+    are under DCP, where the scorer reads a gathered copy of every sequence.
 
     `parallel_floor` is raised to the row count: prefill has one row per query
     token and every (row, chunk-split) needs a slot. `max_seq_len` has to be the
@@ -178,7 +183,8 @@ def fp4_prefill_schedule(
         compute_prefill_schedule,
     )
 
-    local_starts = torch.zeros_like(local_ends)
+    if local_starts is None:
+        local_starts = torch.zeros_like(local_ends)
     _, cta_info, n_ctas = compute_prefill_schedule(
         row_to_batch.to(torch.int32),
         local_starts,

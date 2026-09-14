@@ -23,6 +23,7 @@ from atom.model_ops.sparse_indexer_fp4 import (
     FP4_QUANT_BLOCK_SIZE,
     assert_fp4_indexer_supported,
     fp4_decode_parallel_units,
+    fp4_decode_schedule,
     fp4_prefill_schedule,
     fp4_q_scale_shape,
     sparse_indexer_fp4_enabled,
@@ -88,13 +89,13 @@ def test_predicate_falls_back_and_names_what_blocked_it(
 
 
 def test_unsupported_fp4_requests_name_the_knob_that_blocked_them():
-    assert_fp4_indexer_supported(fused_writer=True, context_parallel=False)
+    assert_fp4_indexer_supported(fused_writer=True, prefill_context_parallel=False)
     with pytest.raises(ValueError, match="fused QK/RoPE/cache"):
-        assert_fp4_indexer_supported(fused_writer=False, context_parallel=False)
+        assert_fp4_indexer_supported(fused_writer=False, prefill_context_parallel=False)
     # PCP's candidate exchange is the only reader of the indexer op's return, so
     # the FP4 path may leave that tensor unwritten only while this refusal holds.
-    with pytest.raises(ValueError, match="DCP or PCP"):
-        assert_fp4_indexer_supported(fused_writer=True, context_parallel=True)
+    with pytest.raises(ValueError, match="does not support PCP"):
+        assert_fp4_indexer_supported(fused_writer=True, prefill_context_parallel=True)
 
 
 def test_decode_parallel_units_are_a_multiple_of_next_n_covering_the_batch():
@@ -331,6 +332,105 @@ def test_decode_scores_the_cache_the_fused_writer_wrote(
     _assert_agrees(logits, want, visible, topk=512)
 
 
+def test_dcp_decode_scores_each_query_token_over_its_own_local_window(on_gfx950):
+    """The geometry `dcp_decode_candidate_exchange_fused` hands the scorer: one
+    row per query token over this rank's shard, so the windows are ragged and
+    the schedule is built at next_n=1 whatever the speculation width."""
+    from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
+
+    torch.manual_seed(2)
+    batch, next_n, width = 3, 4, 1024
+    rows = batch * next_n
+    table, num_blocks, token, _, slots = _paged_layout(batch, width)
+    *_, kv_cache, kv_scale = _fused_fp4(slots, token, num_blocks)
+    q_fp4, q_scale, weights_out, *_ = _fused_fp4(
+        torch.arange(rows, dtype=torch.int64, device="cuda"),
+        torch.full((rows,), width - 1, dtype=torch.int64, device="cuda"),
+        num_blocks,
+        weight_gain=0.1,
+    )
+
+    # Ragged on purpose: a draft position's extra token lands on ONE rank, so
+    # the local lengths of a request's next_n rows do not all advance together.
+    local_ctx = torch.tensor(
+        [width - (r % 7) * 37 for r in range(rows)], dtype=torch.int32, device="cuda"
+    )
+    units = fp4_decode_parallel_units(batch, next_n)
+    cta_info = torch.zeros(units, 4, dtype=torch.int32, device="cuda")
+    fp4_decode_schedule(local_ctx, FP4_MQA_BLOCK_K, units, width, 1, cta_info)
+
+    logits = torch.empty(rows, width, dtype=torch.float32, device="cuda")
+    flydsl_pa_mqa_logits_fp4(
+        q_fp4.reshape(rows, 1, HEADS, HEAD_DIM // 2),
+        q_scale.reshape(rows, 1, *q_scale.shape[1:]),
+        kv_cache,
+        kv_scale,
+        table.repeat_interleave(next_n, dim=0),
+        weights_out,
+        local_ctx,
+        width,
+        weight_scale=WEIGHTS_SCALE,
+        next_n=1,
+        block_k=FP4_MQA_BLOCK_K,
+        kv_block_size=_BLOCK,
+        out=logits,
+        cta_info=cta_info,
+        total_ctas=units,
+    )
+
+    want = _oracle(
+        q_fp4,
+        q_scale,
+        kv_cache,
+        kv_scale,
+        table,
+        width,
+        weights_out,
+        lambda keys: keys.repeat_interleave(next_n, dim=0),
+    )
+    _assert_agrees(logits, want, local_ctx, topk=512)
+
+
+def test_staged_page_table_is_bounded_by_the_block_table_width():
+    """`pages` counts the whole co-scheduled prefill batch while the staged
+    table is one sequence wide, so the two can cross -- and a short table would
+    silently address page 0 for the tail columns rather than fault."""
+    import numpy as np
+
+    aiter_mla = pytest.importorskip(
+        "atom.model_ops.attentions.aiter_mla",
+        reason="the MLA builder imports triton at module scope",
+    )
+
+    build = aiter_mla.AiterMLAMetadataBuilder._build_dcp_indexer_fp4_prefill_meta
+    block, bs, cols = 64, 2, 6
+    builder = SimpleNamespace(
+        model_runner=SimpleNamespace(block_size=block), device=torch.device("cpu")
+    )
+    lpad = np.full(bs, block, dtype=np.int64)
+    cu_pad = np.concatenate([[0], np.cumsum(lpad)]).astype(np.int64)
+    var = {"block_tables": SimpleNamespace(np=np.zeros((bs, 8), dtype=np.int32))}
+    meta = SimpleNamespace(block_tables=torch.zeros(bs, cols, dtype=torch.int32))
+
+    # Short of the bound: identity over `pages`, and the tail the scorer never
+    # reads stays zero rather than aliasing a real page.
+    build(builder, meta, bs, lpad, cu_pad, 4 * block, var)
+    staged = meta.dcp_indexer_fp4_block_tables
+    assert staged.shape == (bs, cols)
+    assert torch.equal(staged[:, :4], torch.arange(4, dtype=torch.int32).expand(bs, 4))
+    assert not staged[:, 4:].any()
+
+    # Exactly at it: the width is the last addressable page, not one past.
+    build(builder, meta, bs, lpad, cu_pad, cols * block, var)
+    assert torch.equal(
+        meta.dcp_indexer_fp4_block_tables,
+        torch.arange(cols, dtype=torch.int32).expand(bs, cols),
+    )
+
+    with pytest.raises(ValueError, match="only 6 columns wide"):
+        build(builder, meta, bs, lpad, cu_pad, cols * block + 1, var)
+
+
 @pytest.mark.parametrize("whole_batch", [True, False])
 def test_prefill_scores_the_same_cache_seq_locally(on_gfx950, whole_batch):
     from atom.models.deepseek_v2 import _prefill_mqa_logits_fp4
@@ -371,6 +471,7 @@ def test_prefill_scores_the_same_cache_seq_locally(on_gfx950, whole_batch):
         kv_scale,
         WEIGHTS_SCALE,
         _BLOCK,
+        table,
     )
 
     want = _oracle(

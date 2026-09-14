@@ -1618,6 +1618,48 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.dcp_indexer_gather_index = torch.from_numpy(
             src.astype(np.int32)
         ).to(dev, non_blocking=True)
+        if self._indexer_fp4:
+            self._build_dcp_indexer_fp4_prefill_meta(
+                attn_metadata, bs, lpad, cu_pad, total_kv, var
+            )
+
+    def _build_dcp_indexer_fp4_prefill_meta(
+        self, attn_metadata, bs: int, lpad, cu_pad, total_kv: int, var
+    ):
+        """Publish the local slot list and identity page table FP4 staging reads.
+
+        The slot formula must track `cp_gather_indexer_k_quant_cache`, the FP8
+        plane's gather, which the FP4 planes have no equivalent of. Its padded
+        indices stay inside the sequence's own blocks, so the staging read
+        cannot leave the allocation.
+        """
+        block = self.model_runner.block_size
+        dev = self.device
+        seq_of = np.repeat(np.arange(bs, dtype=np.int64), lpad)
+        j = np.arange(int(cu_pad[bs]), dtype=np.int64) - np.repeat(cu_pad[:bs], lpad)
+        table = var["block_tables"].np[:bs].astype(np.int64)
+        slots = table[seq_of, j // block] * block + (j % block)
+        attn_metadata.dcp_indexer_fp4_local_slots = torch.from_numpy(
+            slots.astype(np.int32)
+        ).to(dev, non_blocking=True)
+
+        # Fixed width, not `pages`: the scorer specializes on this table's
+        # stride, so a per-batch width recompiles it and breaks the capture.
+        # `block_tables` is ceil(max_model_len / block) columns, so it covers a
+        # batch-sized `pages` only while the co-scheduled prefill context fits
+        # one sequence's allowance -- a real constraint, hence the raise.
+        pages = -(-total_kv // block)
+        cols = attn_metadata.block_tables.shape[1]
+        if pages > cols:
+            raise ValueError(
+                f"FP4 sparse DCP prefill staged {total_kv} keys ({pages} pages of "
+                f"{block}) but block_tables is only {cols} columns wide. The "
+                f"co-scheduled prefill context exceeds one sequence's block "
+                f"allowance; lower max_num_seqs or max_num_batched_tokens."
+            )
+        staged_tables = torch.zeros(bs, cols, dtype=torch.int32, device=dev)
+        staged_tables[:, :pages] = torch.arange(pages, dtype=torch.int32, device=dev)
+        attn_metadata.dcp_indexer_fp4_block_tables = staged_tables
 
     def _sparse_selected_counts(self, seq_lens):
         """How many KV entries the indexer actually selects for each row.
@@ -1724,7 +1766,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.sparse_kv_indptr = var["sparse_kv_indptr"].copy_to_gpu(
                 scheduled_tokens + 1
             )
-            self._publish_indexer_fp4_prefill_schedule(attn_metadata, sparse_counts)
+            self._publish_indexer_fp4_prefill_schedule(
+                attn_metadata, sparse_counts, int(full_seq_lens.sum())
+            )
             if self.dcp_world_size > 1:
                 self._build_dcp_indexer_prefill_meta(attn_metadata, bs, counts, var)
             get_mla_metadata_v1(
@@ -2198,35 +2242,69 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self, attn_metadata: AttentionMetaData, bs: int, next_n: int, ubatch: int = 0
     ) -> None:
         """Refresh the FP4 decode CTA schedule; the captured kernel replays off
-        it, and every indexer layer of a step shares the one answer."""
+        it, and every indexer layer of a step shares the one answer.
+
+        A replay reads the buffer's CONTENTS, so every decode forward has to
+        call this -- including the MTP draft's, whose rows are its own. The
+        lengths come from the published buffer rather than the metadata's view
+        of it, because a draft following a prefill carries prefill metadata.
+        """
         if not self._indexer_fp4:
             return
         parallel_units = fp4_decode_parallel_units(bs, next_n)
         cta_info = self._indexer_fp4_cta_info[ubatch][:parallel_units]
+        if self.dcp_world_size > 1:
+            # DCP scores this rank's shard. Its rows are query tokens carrying
+            # their own local window, so next_n is already flattened out of the
+            # row axis and the width is the sharded one -- `parallel_units`
+            # stays the non-DCP count, which keeps the captured grid identical.
+            from atom.model_ops.dcp_ops import dcp_local_logits_width
+
+            context_lens = self.model_runner.forward_vars["dcp_local_context_lens"].gpu[
+                : bs * next_n
+            ]
+            schedule_next_n = 1
+            width = dcp_local_logits_width(
+                self.model_runner.config.max_model_len, self.dcp_world_size
+            )
+        else:
+            context_lens = attn_metadata.context_lens[:bs]
+            schedule_next_n = next_n
+            width = self.model_runner.config.max_model_len
         fp4_decode_schedule(
-            attn_metadata.context_lens[:bs],
+            context_lens,
             FP4_MQA_BLOCK_K,
             parallel_units,
-            self.model_runner.config.max_model_len,
-            next_n,
+            width,
+            schedule_next_n,
             cta_info,
         )
         attn_metadata.indexer_fp4_cta_info = cta_info
         attn_metadata.indexer_fp4_n_ctas = parallel_units
 
     def _publish_indexer_fp4_prefill_schedule(
-        self, attn_metadata: AttentionMetaData, local_ends_np: np.ndarray
+        self, attn_metadata: AttentionMetaData, local_ends_np: np.ndarray, total_kv: int
     ) -> None:
         """Build the FP4 ragged-prefill schedule and the width it scores in.
 
         The width comes off `sparse_counts`, which the host already holds, so
         right-sizing the logits buffer to this batch rather than max_model_len
         costs no device sync.
+
+        Under DCP the scorer reads a staged copy of every sequence's keys rather
+        than the in-place shard, so its columns are the flat concatenated ones
+        the FP8 path ranks in and the width is the whole key set.
         """
         if not self._indexer_fp4:
             return
-        local_ends = attn_metadata.cu_seqlen_ke - attn_metadata.cu_seqlen_ks
-        max_seq_len = max(int(local_ends_np.max(initial=0)), 1)
+        if self.dcp_world_size > 1:
+            local_starts = attn_metadata.cu_seqlen_ks
+            local_ends = attn_metadata.cu_seqlen_ke
+            max_seq_len = max(int(total_kv), 1)
+        else:
+            local_starts = None
+            local_ends = attn_metadata.cu_seqlen_ke - attn_metadata.cu_seqlen_ks
+            max_seq_len = max(int(local_ends_np.max(initial=0)), 1)
         (
             attn_metadata.indexer_fp4_cta_info,
             attn_metadata.indexer_fp4_n_ctas,
@@ -2237,6 +2315,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             FP4_MQA_BLOCK_K,
             FP4_MQA_PARALLEL_UNIT_NUM,
             max_seq_len,
+            local_starts,
         )
         attn_metadata.indexer_fp4_local_ends = local_ends
         attn_metadata.indexer_fp4_max_seq_len = max_seq_len
