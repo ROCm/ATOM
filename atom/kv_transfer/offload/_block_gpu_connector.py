@@ -115,6 +115,19 @@ class _TimedStage:
     stall being hunted. ``elapsed_time`` is deliberately not queried here: it
     would block, and the caller can read every event for free once
     ``run_staged_pipeline`` has synchronized.
+
+    Read ``pack_ms`` and ``copy_ms``; do not build an argument on
+    ``issue_*_ms`` or ``gpu_span_ms`` while a model is co-resident. Both
+    ``record`` calls sit inside the region ``issue_ms`` times, and
+    ``Event.record`` releases the GIL, so under contention it costs about one
+    interpreter switch interval -- the same order as the number it is
+    reporting. Measured on gfx950 against two non-yielding spinners: the two
+    records alone cost 20.4 ms where the launch they bracket costs 5.2 ms, and
+    0.005 ms with the GIL idle. Pre-allocating the events does not help
+    (15.3 ms); the object allocation is free and the record is the cost. The
+    stage busy times survive this because they are GPU timestamps taken when
+    the packet executes, but the host issue time and the span it inflates are
+    the instrument as much as the code under it.
     """
 
     __slots__ = ("_stage", "events", "issue_ms")
