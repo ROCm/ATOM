@@ -138,6 +138,13 @@ class OffloadWorkerMixin:
         self._done_load: set[LoadCompletionId] = set()
         self._failed_load: set[LoadCompletionId] = set()
         self._connector_completions: set[ConnectorCompletion] = set()
+        # GPU blocks a failed load left unfilled, and the copy jobs still
+        # running per request. Both exist for the vLLM plugin path: vLLM needs
+        # the block ids to truncate `num_computed_tokens` at the first block a
+        # load could not supply, and needs a fence it can hold a preemption
+        # against. See `take_load_error_blocks` / `wait_for_requests`.
+        self._failed_load_blocks: set[int] = set()
+        self._inflight_jobs: dict[str, set] = {}
 
     def close(self) -> None:
         """Join the save/load executors at worker teardown.
@@ -154,6 +161,87 @@ class OffloadWorkerMixin:
             executor = getattr(self, name, None)
             if executor is not None:
                 executor.shutdown(wait=True)
+
+    # -- in-flight job tracking (preemption fence) -----------------------
+    def _track_job(self, req_id, future) -> None:
+        """Remember one submitted copy job so a preemption can wait on it.
+
+        vLLM frees a preempted request's blocks inside `schedule()` and may hand
+        them to another request in the same step. A save still reading them then
+        persists the new occupant's bytes under the old request's key -- a
+        poisoned cache entry, not a lost one. `wait_for_requests` is the fence,
+        and it needs the futures the submit sites otherwise discard.
+        """
+
+        sid = str(req_id)
+        with self._lock:
+            self._inflight_jobs.setdefault(sid, set()).add(future)
+        # Runs inline when the job already finished; `_lock` is released above,
+        # so the callback can retake it.
+        future.add_done_callback(lambda done, sid=sid: self._untrack_job(sid, done))
+
+    def _untrack_job(self, sid: str, future) -> None:
+        with self._lock:
+            pending = self._inflight_jobs.get(sid)
+            if pending is None:
+                return
+            pending.discard(future)
+            if not pending:
+                del self._inflight_jobs[sid]
+
+    def wait_for_requests(self, req_ids) -> None:
+        """Block until every copy job for `req_ids` has stopped touching HBM.
+
+        Called from the preemption fence, which runs before the forward that
+        would overwrite the freed blocks. `_guard` already swallows job
+        exceptions, so `result()` is only ever a join.
+        """
+
+        jobs: set = set()
+        with self._lock:
+            for req_id in req_ids or ():
+                jobs |= self._inflight_jobs.get(str(req_id), set())
+        for job in jobs:
+            try:
+                job.result()
+            except Exception:  # pragma: no cover - `_guard` swallows job errors
+                logger.exception("offload: in-flight job raised while fencing")
+
+    def take_load_error_blocks(self) -> set[int]:
+        """Drain the GPU blocks that failed loads left holding no valid KV."""
+
+        with self._lock:
+            blocks = set(self._failed_load_blocks)
+            self._failed_load_blocks.clear()
+        return blocks
+
+    def _record_load_error_blocks(self, req) -> None:
+        """Record the block range a failed load was supposed to fill.
+
+        The caller must hold `self._lock`. The range is the one the load owned:
+        `[hbm_cached_tokens, lmcache_cached_tokens)`. Everything below the HBM
+        frontier is already valid, so reporting it would make vLLM discard a
+        prefix that is fine -- and those lower blocks may be shared with another
+        request, whose computed count would then be truncated too.
+
+        The token-to-block grid is the VIRTUAL block size, the same one
+        `BlockGPUConnector` maps chunks with: under DCP one scheduler block id
+        covers one virtual global block while the codec moves a rank-local
+        physical page, so the physical size would index the wrong entries.
+        """
+
+        load_spec = getattr(req, "load_spec", None)
+        block_ids = list(getattr(req, "block_ids", ()) or ())
+        block_size = int(
+            getattr(self, "virtual_block_size", None)
+            or getattr(self, "block_size", 0)
+            or 0
+        )
+        if load_spec is None or not block_ids or block_size <= 0:
+            return
+        start = max(0, int(load_spec.hbm_cached_tokens)) // block_size
+        end = -(-max(0, int(load_spec.lmcache_cached_tokens)) // block_size)
+        self._failed_load_blocks.update(block_ids[start:end])
 
     @staticmethod
     def _load_completion_id(req) -> LoadCompletionId:
@@ -234,6 +322,7 @@ class OffloadWorkerMixin:
                 self._on_load_fail(rid)
                 with self._lock:
                     self._failed_load.add(self._load_completion_id(req))
+                    self._record_load_error_blocks(req)
             else:
                 # Layouts with a richer success/failure protocol override this
                 # hook.  Legacy layouts still report a terminal save so a
