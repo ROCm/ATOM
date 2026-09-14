@@ -173,6 +173,11 @@ class OffloadWorkerMixin:
         )
         if n_load <= 0:
             raise ValueError("offload load worker count must be positive")
+        # Kept alongside the pools so callers that want to report the widths --
+        # the startup banner does -- need not reach into ThreadPoolExecutor's
+        # private `_max_workers`.
+        self.save_workers = n_save
+        self.load_workers = n_load
         self._save_executor = ThreadPoolExecutor(
             max_workers=n_save, thread_name_prefix=f"{thread_name_prefix}-save"
         )
