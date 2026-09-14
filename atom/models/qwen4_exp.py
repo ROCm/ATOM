@@ -97,7 +97,10 @@ def _apply_flash_ple(layer, hidden_states, input_ids):
     return hidden_states + contrib
 
 
-_apply_flash_ple_breakable = eager_on_graph(True)(_apply_flash_ple)
+if os.environ.get("ATOM_FLASH_PLE_EAGER", "") == "1":
+    _apply_flash_ple_breakable = eager_on_graph(True)(_apply_flash_ple)
+else:
+    _apply_flash_ple_breakable = _apply_flash_ple
 
 
 

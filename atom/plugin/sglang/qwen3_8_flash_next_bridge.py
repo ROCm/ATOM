@@ -24,6 +24,7 @@ from typing import Any
 import torch
 
 from atom.plugin.sglang.attention_backend.backend_resolver import (
+    real_batch_size,
     resolve_attn_backend,
     resolve_mamba_req_pool,
 )
@@ -413,24 +414,41 @@ def _req_to_token_pool(forward_batch: Any) -> Any:
 
 def _seq_lens(forward_batch: Any, device: torch.device) -> torch.Tensor:
     seq = getattr(forward_batch, "seq_lens", None)
+    bs = int(getattr(forward_batch, "batch_size", 0) or 0)
     if torch.is_tensor(seq):
-        return seq.to(device=device, dtype=torch.int32)
-    return torch.ones(
-        (int(forward_batch.batch_size),), dtype=torch.int32, device=device
-    )
+        seq = seq.to(device=device, dtype=torch.int32)[:bs]
+    else:
+        seq = torch.ones((bs,), dtype=torch.int32, device=device)
+    live_bs = real_batch_size(forward_batch)
+    if live_bs < seq.shape[0]:
+        # CUDA-graph pad rows keep seq_len_fill_value (usually 1) and a
+        # finished request's page table. Zero them so QSA does not score
+        # or write freed pages.
+        seq = seq.clone()
+        seq[live_bs:] = 0
+    return seq
 
 
 def _query_start_loc(forward_batch: Any, num_tokens: int, device: torch.device) -> torch.Tensor:
     mode = forward_batch.forward_mode
     bs = int(forward_batch.batch_size)
+    live_bs = real_batch_size(forward_batch)
     if mode.is_decode_or_idle():
-        return torch.arange(0, bs + 1, dtype=torch.int32, device=device)
+        loc = torch.arange(0, bs + 1, dtype=torch.int32, device=device)
+        loc[live_bs + 1 :] = live_bs
+        return loc
     if mode.is_extend():
         loc = torch.empty((bs + 1,), dtype=torch.int32, device=device)
-        loc[:bs] = forward_batch.extend_start_loc.to(dtype=torch.int32)
-        loc[bs] = (
-            forward_batch.extend_start_loc[-1] + forward_batch.extend_seq_lens[-1]
-        ).to(dtype=torch.int32)
+        if live_bs:
+            loc[:live_bs] = forward_batch.extend_start_loc[:live_bs].to(
+                dtype=torch.int32
+            )
+            loc[live_bs:] = (
+                forward_batch.extend_start_loc[live_bs - 1]
+                + forward_batch.extend_seq_lens[live_bs - 1]
+            ).to(dtype=torch.int32)
+        else:
+            loc.fill_(0)
         return loc
     return torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
 
@@ -505,6 +523,7 @@ def build_qsa_metadata(
             f"indexer_compress_ratio ({compress_ratio})"
         )
 
+    live_bs = real_batch_size(forward_batch)
     seq_lens = _seq_lens(forward_batch, device)[:bs]
     hf = _hf_text_config(atom_config)
     indexer_budget = int(getattr(hf, "indexer_budget", 2048) or 2048)
@@ -529,6 +548,11 @@ def build_qsa_metadata(
         else int(seq_lens.max().item())
     )
     req_pool_indices = forward_batch.req_pool_indices[:bs]
+    if live_bs < bs:
+        # Pad rows keep the just-finished request's pool index after 4→3
+        # (or any bucket pad). Do not gather that row's pages.
+        req_pool_indices = req_pool_indices.clone()
+        req_pool_indices[live_bs:] = 0
     # Native QSA requires page_table width * compressed_rows >= indexer_budget
     # groups even on short warmup sequences. SGLang's current-seq table is too
     # narrow (one 64-token page => 16 compressed slots vs 512 top-k).
@@ -574,6 +598,17 @@ def build_qsa_metadata(
             slot_mapping,
             torch.full_like(slot_mapping, _NO_WRITE),
         )
+    if live_bs < bs:
+        # Decode is one token per row. Drop pad-token cache writes even if
+        # leftover out_cache_loc still holds a freed page id.
+        pad_tokens = min(num_tokens, bs)
+        if pad_tokens > live_bs:
+            slot_mapping = slot_mapping.clone()
+            slot_mapping[live_bs:pad_tokens] = _NO_WRITE
+            logical = logical.clone()
+            logical[live_bs:pad_tokens] = _NO_WRITE
+            block_tables = block_tables.clone()
+            block_tables[live_bs:].zero_()
 
     compressed = _compressed_slot_mapping(
         block_tables=block_tables,
@@ -608,6 +643,35 @@ def build_qsa_metadata(
     )
 
 
+def _ple_state_pool_slots(forward_batch: Any, idx: torch.Tensor | None) -> int:
+    """Native allocates PLE conv state for the whole per-req pool, not max_bs.
+
+    Decode CUDA graphs bake ``conv_state``'s address. Growing after capture
+    frees that storage; undersizing it makes a recycled mamba slot OOB on the
+    next eager prefill (the conc=4 wave-2 HSA).
+    """
+    slots = max(int(_DECODE_GRAPH.max_bs), 16)
+    backend = resolve_attn_backend(forward_batch)
+    pool = resolve_mamba_req_pool(forward_batch, backend)
+    if pool is not None:
+        mapping = getattr(pool, "req_index_to_mamba_index_mapping", None)
+        if torch.is_tensor(mapping) and mapping.numel():
+            slots = max(slots, int(mapping.numel()))
+        for key in ("size", "max_num_reqs", "mamba_size"):
+            val = getattr(pool, key, None)
+            if val:
+                slots = max(slots, int(val))
+    req_pool = _req_to_token_pool(forward_batch)
+    if req_pool is not None:
+        for key in ("size", "max_num_reqs"):
+            val = getattr(req_pool, key, None)
+            if val:
+                slots = max(slots, int(val))
+    if torch.is_tensor(idx) and idx.numel() and not _is_capturing():
+        slots = max(slots, int(idx.clamp(min=0).max().item()) + 1)
+    return slots
+
+
 def _ensure_ple_conv_state(model: Any, atom_config: Any, num_slots: int) -> torch.Tensor:
     hf = _hf_text_config(atom_config)
     state_len = (int(getattr(hf, "ple_conv_kernel_size", 4)) - 1) * int(
@@ -621,6 +685,14 @@ def _ensure_ple_conv_state(model: Any, atom_config: Any, num_slots: int) -> torc
         and existing.shape[1] == channels
         and existing.shape[2] == state_len
     ):
+        return existing
+    # Never replace a live graph-captured conv_state. Clamp callers instead.
+    if existing is not None and _DECODE_GRAPH.active:
+        logger.warning(
+            "PLE conv_state already captured at %s slots; refusing grow to %s",
+            int(existing.shape[0]),
+            num_slots,
+        )
         return existing
     device = next(model.parameters()).device
     dtype = getattr(atom_config, "torch_dtype", None) or torch.bfloat16
@@ -671,24 +743,36 @@ def build_ple_metadata(
                 if 0 <= src < ids.numel():
                     context[req, offset] = ids[src].to(torch.int64)
 
+    live_bs = real_batch_size(forward_batch)
     idx = idx[:bs].to(device=device, dtype=torch.int32)
     idx_in = getattr(gdn_metadata, "non_spec_state_indices_in_tensor", None)
     if idx_in is None:
         idx_in = idx
     else:
         idx_in = idx_in[:bs].to(device=device, dtype=torch.int32)
+    if live_bs < bs:
+        idx = idx.clone()
+        idx[live_bs:] = -1
+        if idx_in.data_ptr() == idx.data_ptr():
+            idx_in = idx
+        else:
+            idx_in = idx_in.clone()
+            idx_in[live_bs:] = -1
 
-    if _is_capturing() or _DECODE_GRAPH.active:
-        existing = getattr(model, "_atom_ple_conv_state", None)
-        num_slots = max(bs, int(existing.shape[0]) if existing is not None else 16)
-    else:
-        num_slots = int(idx.max().item()) + 1 if idx.numel() else 1
+    num_slots = _ple_state_pool_slots(forward_batch, idx)
     conv_state = _ensure_ple_conv_state(model, atom_config, num_slots)
+    last_slot = max(int(conv_state.shape[0]) - 1, 0)
+    if last_slot >= 0:
+        idx = torch.where(idx < 0, idx, idx.clamp(max=last_slot))
+        idx_in = torch.where(idx_in < 0, idx_in, idx_in.clamp(max=last_slot))
     prefix = getattr(forward_batch, "extend_prefix_lens", None)
     if is_prefill and torch.is_tensor(prefix):
         has_initial = prefix[:bs] > 0
     else:
         has_initial = torch.ones((bs,), dtype=torch.bool, device=device)
+    if live_bs < bs:
+        has_initial = has_initial.clone()
+        has_initial[live_bs:] = False
 
     max_query_len = (
         1
