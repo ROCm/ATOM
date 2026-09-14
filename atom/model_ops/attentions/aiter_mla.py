@@ -1644,19 +1644,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         ).to(dev, non_blocking=True)
 
         # Fixed width, not `pages`: the scorer specializes on this table's
-        # stride, so a per-batch width recompiles it and breaks the capture.
-        # `block_tables` is ceil(max_model_len / block) columns, so it covers a
-        # batch-sized `pages` only while the co-scheduled prefill context fits
-        # one sequence's allowance -- a real constraint, hence the raise.
+        # stride, so a per-batch width recompiles it. Sized at a whole batch's
+        # summed context rather than `block_tables`' one-sequence allowance --
+        # co-scheduled prefills run past that allowance whenever prefix caching
+        # keeps their cached tokens off `max_num_batched_tokens`, which is a
+        # legal schedule, and this table is the only thing that would have
+        # bounded it. Buys one scorer variant against the non-DCP width.
         pages = -(-total_kv // block)
-        cols = attn_metadata.block_tables.shape[1]
-        if pages > cols:
-            raise ValueError(
-                f"FP4 sparse DCP prefill staged {total_kv} keys ({pages} pages of "
-                f"{block}) but block_tables is only {cols} columns wide. The "
-                f"co-scheduled prefill context exceeds one sequence's block "
-                f"allowance; lower max_num_seqs or max_num_batched_tokens."
-            )
+        cols = self.max_bs * self.block_table_cols
         staged_tables = torch.zeros(bs, cols, dtype=torch.int32, device=dev)
         staged_tables[:, :pages] = torch.arange(pages, dtype=torch.int32, device=dev)
         attn_metadata.dcp_indexer_fp4_block_tables = staged_tables
@@ -2253,16 +2248,33 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             return
         parallel_units = fp4_decode_parallel_units(bs, next_n)
         cta_info = self._indexer_fp4_cta_info[ubatch][:parallel_units]
+        # `[:n]` past the end truncates rather than raising, while
+        # `indexer_fp4_n_ctas` still hands the kernel `n`. The rows past the end
+        # would then go unscheduled, and the logits buffer they should have
+        # written is `torch.empty` -- aiter only sentinels it when it builds the
+        # schedule itself, which it never does here.
+        assert cta_info.shape[0] == parallel_units
         if self.dcp_world_size > 1:
             # DCP scores this rank's shard. Its rows are query tokens carrying
             # their own local window, so next_n is already flattened out of the
             # row axis and the width is the sharded one -- `parallel_units`
             # stays the non-DCP count, which keeps the captured grid identical.
             from atom.model_ops.dcp_ops import dcp_local_logits_width
+            from atom.utils.forward_context import (
+                get_published_dcp_local_context_lens,
+            )
 
-            context_lens = self.model_runner.forward_vars["dcp_local_context_lens"].gpu[
-                : bs * next_n
-            ]
+            # A TBO ubatch owns rows from its own offset, not the batch's first
+            # `bs`, and it already publishes that slice on its metadata -- the
+            # same tensor the scorer reads. The global buffer stays the fallback
+            # so callers that publish nothing keep the prefix they had.
+            context_lens = get_published_dcp_local_context_lens(
+                attn_metadata, bs * next_n
+            )
+            if context_lens is None:
+                context_lens = self.model_runner.forward_vars[
+                    "dcp_local_context_lens"
+                ].gpu[: bs * next_n]
             schedule_next_n = 1
             width = dcp_local_logits_width(
                 self.model_runner.config.max_model_len, self.dcp_world_size

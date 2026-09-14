@@ -4,12 +4,14 @@ component cross-check against the bytes the production writer emits.
 `indexer_qk_rope_quant_and_cache` in FP4 mode is the only writer of the packed
 E2M1 Q/K and their e8m0 planes, and `flydsl_pa_mqa_logits_fp4[_prefill]` the
 only readers, so what is worth checking is that the two agree on a real DSA
-indexer's shapes (H=32, D=128, kv_block=64, block_k=256) -- decode at both
-next_n GLM-5.2 runs, prefill down both schedule paths. The reference dequantizes
+indexer's shapes (H=32, D=128, kv_block=64, block_k=256) -- decode at a
+speculation width and at the DCP path's one row per query token, prefill down
+both schedule paths. The reference dequantizes
 exactly what the writer produced, so a disagreement is a layout bug, not
 rounding. The FP8 default has to come out of all of it untouched.
 """
 
+import importlib
 from types import SimpleNamespace
 
 import pytest
@@ -37,6 +39,20 @@ HEADS, HEAD_DIM, _BLOCK = 32, 128, FP4_KV_BLOCK_SIZE
 WEIGHTS_SCALE = HEAD_DIM**-0.5 * HEADS**-0.5
 _E2M1_MAG = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
 _E2M1 = torch.cat([_E2M1_MAG, -_E2M1_MAG])
+
+
+def _import_or_skip(name: str, reason: str | None = None):
+    """Import `name`, skipping the test where this box cannot.
+
+    Not `pytest.importorskip`: it warns on a plain `ImportError` rather than a
+    missing module -- which CI escalates, and pytest 9.1 will too -- and on a
+    CPU runner that is exactly how these fail, `aiter` importing but carrying no
+    `QuantType`.
+    """
+    try:
+        return importlib.import_module(name)
+    except ImportError as exc:
+        pytest.skip(reason or f"{name} is unavailable here: {exc}")
 
 
 def _pool(**overrides):
@@ -75,6 +91,7 @@ def test_predicate_is_structural_and_never_probes_the_chip_for_fp8(monkeypatch):
         ({"index_topk": 0}, "gfx950", "no sparse indexer"),
         ({"index_head_dim": 64}, "gfx950", "index_head_dim is 64"),
         ({"index_n_heads": 24}, "gfx950", "index_n_heads is 24"),
+        ({"index_kpool": 2}, "gfx950", "index_kpool is 2"),
         ({}, "gfx942", "gfx942"),
     ],
 )
@@ -90,13 +107,28 @@ def test_predicate_falls_back_and_names_what_blocked_it(
 
 
 def test_unsupported_fp4_requests_name_the_knob_that_blocked_them():
-    assert_fp4_indexer_supported(fused_writer=True, prefill_context_parallel=False)
+    def check(**overrides):
+        assert_fp4_indexer_supported(
+            **{
+                "fused_writer": True,
+                "prefill_context_parallel": False,
+                "prefill_ubatching": False,
+                **overrides,
+            }
+        )
+
+    check()
     with pytest.raises(ValueError, match="fused QK/RoPE/cache"):
-        assert_fp4_indexer_supported(fused_writer=False, prefill_context_parallel=False)
+        check(fused_writer=False)
     # PCP's candidate exchange is the only reader of the indexer op's return, so
     # the FP4 path may leave that tensor unwritten only while this refusal holds.
     with pytest.raises(ValueError, match="does not support PCP"):
-        assert_fp4_indexer_supported(fused_writer=True, prefill_context_parallel=True)
+        check(prefill_context_parallel=True)
+    # Decode micro-batching is supported; only the prefill split is not, because
+    # it rebuilds metadata from declared fields and the schedule rides on
+    # undeclared ones. A blanket TBO refusal would take the decode path with it.
+    with pytest.raises(ValueError, match="prefill micro-batching"):
+        check(prefill_ubatching=True)
 
 
 def test_every_backend_answers_the_draft_s_fp4_schedule_publish():
@@ -105,10 +137,10 @@ def test_every_backend_answers_the_draft_s_fp4_schedule_publish():
     answer it anyway: EAGLE3 on Llama-3, MTP on Qwen3-Next and on DeepSeek-V4
     (whose builder is a `CommonAttentionBuilder` sibling, not an MLA subclass)
     all reach that line with FP4 nowhere in the picture."""
-    backends = pytest.importorskip("atom.model_ops.attentions.backends")
+    backends = _import_or_skip("atom.model_ops.attentions.backends")
     base = backends.CommonAttentionBuilder._publish_indexer_fp4_decode_schedule
 
-    mla = pytest.importorskip("atom.model_ops.attentions.aiter_mla")
+    mla = _import_or_skip("atom.model_ops.attentions.aiter_mla")
     assert mla.AiterMLAMetadataBuilder._publish_indexer_fp4_decode_schedule is not base
 
     for module, name in (
@@ -120,7 +152,7 @@ def test_every_backend_answers_the_draft_s_fp4_schedule_publish():
         ("atom.model_ops.attentions.gdn_attn", "GDNAttentionMetadataBuilder"),
         ("atom.model_ops.attentions.triton_mha", "TritonMHAMetadataBuilder"),
     ):
-        builder = getattr(pytest.importorskip(module), name)
+        builder = getattr(_import_or_skip(module), name)
         assert builder._publish_indexer_fp4_decode_schedule is base, name
 
     # Inert, not merely present: the draft reuses the target's metadata object,
@@ -130,13 +162,47 @@ def test_every_backend_answers_the_draft_s_fp4_schedule_publish():
     assert not vars(metadata)
 
 
-def test_decode_parallel_units_are_a_multiple_of_next_n_covering_the_batch():
-    for next_n in (1, 2, 3, 4, 8):
-        for max_bs in (1, 16, 512, 8192):
+def test_the_builder_compares_the_indexer_s_fp4_verdict_instead_of_setting_it():
+    """The builder and `Indexer.__init__` answer the same predicate from the
+    same two inputs, and the Indexer has already built `k_cache` from its answer
+    by the time the builder reaches it. Assigning over it cannot fix a
+    divergence -- the object is already built -- it only hides one, to surface
+    later as a graph/eager dtype mismatch. Read off the source because reaching
+    that line needs an allocated pool and a loaded model."""
+    import ast
+    import pathlib
+
+    root = pathlib.Path(sparse_indexer_fp4.__file__).parent
+    tree = ast.parse((root / "attentions" / "aiter_mla.py").read_text(encoding="utf-8"))
+    overwrites = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Attribute)
+        and target.attr == "_indexer_fp4"
+        and isinstance(target.value, ast.Attribute)
+        and target.value.attr == "indexer"
+    ]
+    assert not overwrites, f"builder overwrites the Indexer's verdict at {overwrites}"
+
+
+def test_decode_parallel_units_cover_the_batch_at_every_speculation_width():
+    """Everything the one captured buffer rests on: a slot per sequence per
+    step, the varctx floor, and `f(n) >= f(1)` -- the buffer is sized at
+    `max_seqlen_qo` and the draft then asks at 1. That last one is the weakest
+    true statement, not the obvious one: `f` is NOT monotonic in `next_n`."""
+    for max_bs in (1, 7, 16, 64, 128, 300, 512, 8192):
+        floor = fp4_decode_parallel_units(max_bs, 1)
+        for next_n in range(1, 17):
             units = fp4_decode_parallel_units(max_bs, next_n)
             assert units % next_n == 0
             assert units // next_n >= max_bs
             assert units >= sparse_indexer_fp4.FP4_MQA_VARCTX_PARALLEL_UNIT_NUM
+            assert units >= floor
+
+    # The counterexample the docstring names, so it cannot rot back.
+    assert fp4_decode_parallel_units(1, 3) > fp4_decode_parallel_units(1, 4)
 
 
 def test_q_scale_shape_pads_the_m_tile_axis_to_one_dword():
@@ -260,6 +326,25 @@ def _fused_fp4(slots, positions, num_blocks, weight_gain=1.0):
     return q_fp4, q_scale, weights_out, kv_cache, kv_scale
 
 
+def _written_cache_and_queries(batch, next_n, ctx_len, seed):
+    """A paged cache plus `batch * next_n` query rows, both from the writer.
+
+    The query rows get real slots of their own, which is what a decode step
+    passes and what makes the writer compute Q at all.
+    """
+    torch.manual_seed(seed)
+    rows = batch * next_n
+    table, num_blocks, token, _, slots = _paged_layout(batch, ctx_len)
+    *_, kv_cache, kv_scale = _fused_fp4(slots, token, num_blocks)
+    q_fp4, q_scale, weights_out, *_ = _fused_fp4(
+        torch.arange(rows, dtype=torch.int64, device="cuda"),
+        torch.full((rows,), ctx_len - 1, dtype=torch.int64, device="cuda"),
+        num_blocks,
+        weight_gain=0.1,
+    )
+    return table, kv_cache, kv_scale, q_fp4, q_scale, weights_out, rows
+
+
 def _oracle(q_fp4, q_scale, kv_cache, kv_scale, table, ctx_len, weights, rows_of):
     """The scorer's math in fp32 over the cache as written: per-head ReLU(q.k),
     weighted and summed. `rows_of` maps the per-sequence keys onto query rows."""
@@ -302,29 +387,19 @@ def _assert_agrees(got, want, visible, topk):
     assert overlap > 0.99, overlap
 
 
-@pytest.mark.parametrize(("batch", "next_n", "ctx_len"), [(3, 1, 1024), (2, 4, 768)])
-def test_decode_scores_the_cache_the_fused_writer_wrote(
-    on_gfx950, batch, next_n, ctx_len
-):
+def test_decode_scores_the_cache_the_fused_writer_wrote(on_gfx950):
+    """The rectangular kernel at a speculation width: one row per (seq, step),
+    each seeing one token less than the step after it. `next_n=1` is the DCP
+    test's shape, so what this one holds down is the `next_n > 1` reshape."""
     from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
     from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
         compute_varctx_schedule,
     )
 
-    torch.manual_seed(0)
-    table, num_blocks, token, _, slots = _paged_layout(batch, ctx_len)
-    *_, kv_cache, kv_scale = _fused_fp4(slots, token, num_blocks)
-
-    # The query rows get their own throwaway cache, so their slots are real --
-    # which is what a decode step passes, and what makes the writer compute Q.
-    rows = batch * next_n
-    q_fp4, q_scale, weights_out, *_ = _fused_fp4(
-        torch.arange(rows, dtype=torch.int64, device="cuda"),
-        torch.full((rows,), ctx_len - 1, dtype=torch.int64, device="cuda"),
-        num_blocks,
-        weight_gain=0.1,
+    batch, next_n, ctx_len = 2, 4, 768
+    table, kv_cache, kv_scale, q_fp4, q_scale, weights_out, rows = (
+        _written_cache_and_queries(batch, next_n, ctx_len, seed=0)
     )
-
     ctx_lens = torch.full((batch,), ctx_len, dtype=torch.int32, device="cuda")
     _, cta_info, n_ctas = compute_varctx_schedule(
         ctx_lens, FP4_MQA_BLOCK_K, None, ctx_len, next_n=next_n
@@ -370,16 +445,9 @@ def test_dcp_decode_scores_each_query_token_over_its_own_local_window(on_gfx950)
     the schedule is built at next_n=1 whatever the speculation width."""
     from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
 
-    torch.manual_seed(2)
     batch, next_n, width = 3, 4, 1024
-    rows = batch * next_n
-    table, num_blocks, token, _, slots = _paged_layout(batch, width)
-    *_, kv_cache, kv_scale = _fused_fp4(slots, token, num_blocks)
-    q_fp4, q_scale, weights_out, *_ = _fused_fp4(
-        torch.arange(rows, dtype=torch.int64, device="cuda"),
-        torch.full((rows,), width - 1, dtype=torch.int64, device="cuda"),
-        num_blocks,
-        weight_gain=0.1,
+    table, kv_cache, kv_scale, q_fp4, q_scale, weights_out, rows = (
+        _written_cache_and_queries(batch, next_n, width, seed=2)
     )
 
     # Ragged on purpose: a draft position's extra token lands on ONE rank, so
@@ -433,7 +501,7 @@ def test_dcp_prefill_staging_keeps_every_key_with_its_own_exponent(monkeypatch):
     end-to-end accuracy run can pass with this broken; the random planes here
     remove that cover.
     """
-    dsv2 = pytest.importorskip("atom.models.deepseek_v2")
+    dsv2 = _import_or_skip("atom.models.deepseek_v2")
 
     torch.manual_seed(0)
     block, world, src_pages = _BLOCK, 2, 4
@@ -480,44 +548,45 @@ def test_dcp_prefill_staging_keeps_every_key_with_its_own_exponent(monkeypatch):
     )
 
 
-def test_staged_page_table_is_bounded_by_the_block_table_width():
-    """`pages` counts the whole co-scheduled prefill batch while the staged
-    table is one sequence wide, so the two can cross -- and a short table would
-    silently address page 0 for the tail columns rather than fault."""
+def test_staged_page_table_spans_a_whole_batch_not_one_sequence():
+    """`pages` counts the summed co-scheduled prefill context, and prefix
+    caching lets that run past any one sequence's block allowance --
+    `max_num_batched_tokens` bounds only the uncached tokens. Sized at that
+    allowance the table would turn a legal schedule into a mid-serving raise,
+    so it spans a full batch; the tail the scorer never reads stays zero rather
+    than aliasing a real page."""
     import numpy as np
 
-    aiter_mla = pytest.importorskip(
+    aiter_mla = _import_or_skip(
         "atom.model_ops.attentions.aiter_mla",
         reason="the MLA builder imports triton at module scope",
     )
 
     build = aiter_mla.AiterMLAMetadataBuilder._build_dcp_indexer_fp4_prefill_meta
-    block, bs, cols = 64, 2, 6
+    block, bs, per_seq = 64, 2, 6
     builder = SimpleNamespace(
-        model_runner=SimpleNamespace(block_size=block), device=torch.device("cpu")
+        model_runner=SimpleNamespace(block_size=block),
+        device=torch.device("cpu"),
+        max_bs=4,
+        block_table_cols=per_seq,
     )
+    cols = builder.max_bs * per_seq
     lpad = np.full(bs, block, dtype=np.int64)
     cu_pad = np.concatenate([[0], np.cumsum(lpad)]).astype(np.int64)
     var = {"block_tables": SimpleNamespace(np=np.zeros((bs, 8), dtype=np.int32))}
-    meta = SimpleNamespace(block_tables=torch.zeros(bs, cols, dtype=torch.int32))
+    meta = SimpleNamespace()
 
-    # Short of the bound: identity over `pages`, and the tail the scorer never
-    # reads stays zero rather than aliasing a real page.
-    build(builder, meta, bs, lpad, cu_pad, 4 * block, var)
-    staged = meta.dcp_indexer_fp4_block_tables
-    assert staged.shape == (bs, cols)
-    assert torch.equal(staged[:, :4], torch.arange(4, dtype=torch.int32).expand(bs, 4))
-    assert not staged[:, 4:].any()
+    def staged_for(total_kv):
+        build(builder, meta, bs, lpad, cu_pad, total_kv, var)
+        return meta.dcp_indexer_fp4_block_tables
 
-    # Exactly at it: the width is the last addressable page, not one past.
-    build(builder, meta, bs, lpad, cu_pad, cols * block, var)
-    assert torch.equal(
-        meta.dcp_indexer_fp4_block_tables,
-        torch.arange(cols, dtype=torch.int32).expand(bs, cols),
-    )
-
-    with pytest.raises(ValueError, match="only 6 columns wide"):
-        build(builder, meta, bs, lpad, cu_pad, cols * block + 1, var)
+    for pages in (4, per_seq + 1, cols):
+        staged = staged_for(pages * block)
+        # Past `per_seq` is the case a one-sequence width used to raise on.
+        assert staged.shape == (bs, cols), pages
+        want = torch.arange(pages, dtype=torch.int32).expand(bs, pages)
+        assert torch.equal(staged[:, :pages], want), pages
+        assert not staged[:, pages:].any(), pages
 
 
 @pytest.mark.parametrize("whole_batch", [True, False])

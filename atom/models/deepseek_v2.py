@@ -1688,10 +1688,10 @@ def sparse_attn_indexer(
         # Only this op's fp32 *return* is synthesised. The kernel's `weights_out`
         # must stay `q.dtype` under FP4 (`aiter/ops/cache.py`), so `weights_mqa`
         # cannot simply be allocated fp32; converting it instead would put a copy
-        # kernel in all 21 captured layers. Nothing reads the return under FP4 --
-        # the one reader is PCP-guarded and `assert_fp4_indexer_supported` refuses
-        # PCP -- so only dtype and shape bind here.
-        weights = torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
+        # kernel in all 21 captured layers. Zeroed rather than empty: what makes
+        # it unread is a refusal three files away in `Indexer.__init__`, while
+        # `sparse_attn_indexer_fake` promises torch.compile a real tensor.
+        weights = torch.zeros(weights.shape, device=weights.device, dtype=torch.float32)
     elif use_qk_rope_cache_fusion:
         q_bf16 = q_input
         q_quant = torch.empty_like(q_bf16, dtype=dtypes.fp8)
@@ -2373,6 +2373,7 @@ class Indexer(nn.Module):
             assert_fp4_indexer_supported(
                 fused_writer=self.use_qk_rope_cache_fusion,
                 prefill_context_parallel=pcp_is_enabled(),
+                prefill_ubatching=get_current_atom_config().enable_tbo,
             )
 
         # TODO (zyongye) change dim to fp8 later to (self.head_dim + 4)

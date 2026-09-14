@@ -92,6 +92,11 @@ def sparse_indexer_fp4_enabled(
         why = f"index_head_dim is {head_dim}, not {_K_TILE}"
     elif not n_heads or n_heads % _MFMA_M:
         why = f"index_n_heads is {n_heads}, not a multiple of {_MFMA_M}"
+    elif (getattr(config, "index_kpool", 1) or 1) != 1:
+        # A pooled indexer scores through `sparse_attn_indexer_kpool`, which has
+        # no FP4 arm, and keeps `block_size // index_kpool` rows per block --
+        # so it would also hand the scorer a block size the cache never used.
+        why = f"index_kpool is {config.index_kpool}, and pooling has no FP4 scorer"
     elif (gfx := _gfx()) != "gfx950":
         why = f"{gfx} does not have the FP4 mqa-logits kernels"
     else:
@@ -102,7 +107,7 @@ def sparse_indexer_fp4_enabled(
 
 
 def assert_fp4_indexer_supported(
-    *, fused_writer: bool, prefill_context_parallel: bool
+    *, fused_writer: bool, prefill_context_parallel: bool, prefill_ubatching: bool
 ) -> None:
     """Reject the FP4 requests this build cannot serve.
 
@@ -126,14 +131,26 @@ def assert_fp4_indexer_supported(
             "exchange is the one reader of the fp32 `weights` the FP4 writer "
             "does not produce. Pass --index-cache-dtype fp8."
         )
+    if prefill_ubatching:
+        raise ValueError(
+            "The FP4 sparse indexer does not support prefill micro-batching. "
+            "`split_attn_metadata` rebuilds the metadata from its declared "
+            "fields, and the FP4 schedule rides on undeclared ones whose row "
+            "ids a ubatch rebases. Decode micro-batching (--enable-tbo-decode) "
+            "is supported. Pass --index-cache-dtype fp8."
+        )
 
 
 def fp4_decode_parallel_units(max_bs: int, next_n: int) -> int:
     """CTAs the varctx schedule is built for -- the grid a CUDAGraph captures.
 
     `compute_varctx_schedule` needs a multiple of `next_n` leaving at least one
-    slot per sequence, so the floor rounds up to both. Monotonic in `next_n`,
-    which is what lets one buffer serve every speculation width.
+    slot per sequence, so the floor rounds up to both. Not monotonic in `next_n`
+    -- at 512 units `f(3)` is 513 against `f(4)`'s 512. What lets one buffer
+    serve every width is the weaker `f(next_n) >= f(1)`, which holds because
+    both arms of the max scale with `next_n`: the buffer is sized at
+    `max_seqlen_qo` and the draft, the only caller asking for a different width,
+    asks for 1.
     """
     return next_n * max(-(-FP4_MQA_VARCTX_PARALLEL_UNIT_NUM // next_n), max_bs)
 
