@@ -50,12 +50,12 @@ python3 -m atom.entrypoints.openai_server \
   --model $MODEL_PATH --served-model-name deepseek-ai/DeepSeek-V4-Pro \
   --host 0.0.0.0 --server-port $PORT \
   --tensor-parallel-size 8 \
-  --kv-cache-dtype fp8 --index-cache-dtype fp8 \
-  --enable-prefix-caching --block-size 16 \
+  --kv-cache-dtype fp8 \
+  --enable-prefix-caching \
   --max-num-seqs $(( CONC * 2 )) \
   --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
   --state-checkpoint-interval-tokens 8192 \
-  --level 3 --cudagraph-mode FULL \
+  --level 3 \
   --method mtp --num-speculative-tokens 3 \
   --spec-decode-acceptance-length 2.49 \
   --kv-transfer-config "$KV_TRANSFER"
@@ -104,12 +104,12 @@ python3 -m atom.entrypoints.openai_server \
   --host 0.0.0.0 --server-port $PORT \
   --tensor-parallel-size 8 \
   --enable-dp-attention --enable-tbo \
-  --kv-cache-dtype fp8 --index-cache-dtype fp8 \
-  --enable-prefix-caching --block-size 16 \
+  --kv-cache-dtype fp8 \
+  --enable-prefix-caching \
   --max-num-seqs $(( CONC * 2 )) \
   --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
   --state-checkpoint-interval-tokens 8192 \
-  --level 3 --cudagraph-mode FULL \
+  --level 3 \
   --method mtp --num-speculative-tokens 3 \
   --spec-decode-acceptance-length 2.49 \
   --kv-transfer-config "$KV_TRANSFER"
@@ -212,12 +212,12 @@ python3 -m atom.entrypoints.openai_server \
   --host 0.0.0.0 --server-port 8010 \
   --tensor-parallel-size 8 \
   --enable-dp-attention --enable-tbo \
-  --kv-cache-dtype fp8 --index-cache-dtype fp8 \
-  --enable-prefix-caching --block-size 16 \
+  --kv-cache-dtype fp8 \
+  --enable-prefix-caching \
   --max-num-seqs 512 \
   --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
   --state-checkpoint-interval-tokens 8192 \
-  --level 3 --cudagraph-mode FULL \
+  --level 3 \
   --method mtp --num-speculative-tokens 3 \
   --spec-decode-acceptance-length 2.49 \
   --kv-transfer-config '{"kv_connector":"multi","connectors":[{"kv_role":"kv_producer","kv_connector":"mooncake","proxy_ip":"10.0.0.1","handshake_port":6301,"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload","offload_layout":"hybrid","max_pending_saves":8,"slot_sidecar_staging_slots":4,"lmcache.local_cpu":true,"lmcache.max_local_cpu_size":128,"lmcache.local_disk":null,"lmcache.max_local_disk_size":0,"lmcache.remote_url":null,"lmcache.chunk_size":256,"lmcache.cache_policy":"LRU","lmcache.lookup_server_worker_ids":[],"lmcache.store_location":"LocalCPUBackend","lmcache.retrieve_locations":["LocalCPUBackend"]}]}'
@@ -237,12 +237,12 @@ python3 -m atom.entrypoints.openai_server \
   --host 0.0.0.0 --server-port 8020 \
   --tensor-parallel-size 8 \
   --enable-dp-attention \
-  --kv-cache-dtype fp8 --index-cache-dtype fp8 \
-  --enable-prefix-caching --block-size 16 \
+  --kv-cache-dtype fp8 \
+  --enable-prefix-caching \
   --max-num-seqs 512 \
   --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
   --state-checkpoint-interval-tokens 8192 \
-  --level 3 --cudagraph-mode FULL \
+  --level 3 \
   --method mtp --num-speculative-tokens 3 \
   --spec-decode-acceptance-length 2.49 \
   --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"10.0.0.2","handshake_port":6301,"protocol":"rdma"}'
@@ -440,6 +440,18 @@ xPyD. Two traps:
   sidecars saved across the two nodes, **zero** restored. Set
   `--prefill-policy prefix_hash` (or `cache_aware`) before running more than one
   prefill node.
+
+## Three flags deliberately not passed
+
+Everything else in the commands is pinned on purpose, including values that
+happen to match ATOM's current defaults. These three are left out because
+passing them is either a no-op or actively misleading:
+
+| flag | why it is gone |
+|---|---|
+| `--block-size 16` | **Ignored on V4.** `config.py` overrides `kv_cache_block_size` to 256 unconditionally: V4 needs a multiple of `lcm(4, 128)`, and 2×lcm gives the 64 CSA entries per block that the FP4 paged-MQA-logits indexer kernels require. Passing 16 changes nothing and suggests V4 blocks are 16 tokens. |
+| `--index-cache-dtype fp8` | Forced anyway. `config.py` sets `fp8` whenever `kv_transfer_config` is set, which is every PD launch — Mooncake's producer-consumer staging has no layout for FP4's separate indexer scale pool. This is why PD cannot use the single-node recipe's `fp4`. |
+| `--cudagraph-mode FULL` | Already the default, and unlike the pinned flags above it was never varied in any run here. |
 
 ## If the servers OOM at startup
 
