@@ -70,6 +70,7 @@ no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only whe
 | **ATOM_USE_TRITON_GEMM** | bool | 0 (false) | If set to `1`, use AITER Triton FP4 weight preshuffled GEMM. Otherwise use AITER ASM FP4 weight preshuffled GEMM. |
 | **ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM** | bool | 0 (false) | If set to `1`, use AITER Triton FP4 GEMM with non-shuffled weights. Takes precedence over the FP4 preshuffled GEMM path selected by `ATOM_USE_TRITON_GEMM`. |
 | **ATOM_USE_TRITON_MXFP4_BMM** | bool | 0 (false) | If set to `1`, use FP4 BMM in MLA attention module. |
+| **ATOM_USE_FLYDSL_GATHER_KV_B_PROJ** | bool | 1 (true) | Use the FlyDSL fused gather + `kv_b_proj` GEMM for MLA's cached-prefix path. Covers page_size-1 fp8 (e4m3) KV with an fp8 weight on gfx950 — i.e. Kimi-K3 / DeepSeek MLA under `--kv-cache-dtype fp8`. Any other shape is rejected before launch and falls back to the Triton gather, once per process, with a warning. Set `0` to force Triton. |
 
 ### GLM-5.3
 
@@ -150,7 +151,7 @@ reachable shape one set rather than two lists that drift. The switch below decid
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **ATOM_DRAFT_CUDAGRAPH** | bool | 1 (true) | Capture each declared draft pass into a per-`capture_sizes` CUDAGraph as it is warmed, so a draft pass replays instead of relaunching every kernel. `0` keeps the warmup (and therefore the JIT saving) but drafts eagerly. Only passes that declare a graph are captured — the separate-draft Kimi-K3 path declares none, so this is inert there. EPLB no longer declines the padding: the target pads on every cudagraph decode step and its rows reach the same expert-load recorder, so declining on the draft protected nothing. A DP-sync dummy DOES replay, in lockstep with the ranks holding work — `is_dummy_run` is per-rank, so gating on it splits one DP group across two collectives. Measured on V4-Flash-DSpark tp1: GSM8K 0.9527 / acceptance 65.25% captured against 0.9497 / 65.21% eager, i.e. indistinguishable; on tp4 with the LM head inside the capture, draft kernel launches went 30 → 0 per pass and draft wall time 915.8 → 118.9 µs. Read per pass at warmup time, so set it before the server starts. Grep a trace for a trailing ` graph` in a `propose_*` label to confirm which passes replayed. |
+| **ATOM_DRAFT_CUDAGRAPH** | bool | 1 (true) | Capture each declared draft pass into a per-`capture_sizes` CUDAGraph as it is warmed, so a draft pass replays instead of relaunching every kernel. `0` keeps the warmup (and therefore the JIT saving) but drafts eagerly. Only passes that declare a graph are captured; every drafter ATOM ships declares at least one, including the separate-draft Kimi-K3 path, whose block pass builds its paged metadata at warmup so nothing host-side is left inside the recording. EPLB no longer declines the padding: the target pads on every cudagraph decode step and its rows reach the same expert-load recorder, so declining on the draft protected nothing. A DP-sync dummy DOES replay, in lockstep with the ranks holding work — `is_dummy_run` is per-rank, so gating on it splits one DP group across two collectives. Measured on V4-Flash-DSpark tp1: GSM8K 0.9527 / acceptance 65.25% captured against 0.9497 / 65.21% eager, i.e. indistinguishable; on tp4 with the LM head inside the capture, draft kernel launches went 30 → 0 per pass and draft wall time 915.8 → 118.9 µs. Read per pass at warmup time, so set it before the server starts. Grep a trace for a trailing ` graph` in a `propose_*` label to confirm which passes replayed. |
 
 ### DSpark drafting
 
@@ -193,12 +194,10 @@ flag below. Details in the state-checkpoint section of the
 
 ### LMCache offload tier
 
-Two knobs that govern the LMCache CPU/NVMe offload connector are read directly
-via `os.environ` rather than through `atom.utils.envs`, because ATOM does not
-own either default: one belongs to the LMCache library, the other to the
-offload connector itself (defined in
-`atom/kv_transfer/offload/_offload_common.py` and documented in full in
-`atom/kv_transfer/offload/README.md`). They are listed here so they are
+The LMCache source-pin timeout and ATOM's pending-save bound are read directly
+via `os.environ` rather than through `atom.utils.envs`. Their behavior is
+defined in `atom/kv_transfer/offload/_offload_common.py` and documented in full
+in `atom/kv_transfer/offload/README.md`; they are also listed here so they are
 discoverable from the central env reference despite bypassing the registry.
 
 | Variable | Type | Default | Description |

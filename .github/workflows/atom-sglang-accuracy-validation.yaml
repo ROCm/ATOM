@@ -28,6 +28,7 @@ on:
           - Kimi-K3 TP8
           - MiniMax-M3-MXFP4 TP4
           - MiniMax-M3-MXFP8 EAGLE3 TP4 MTP3
+          - Qwen3.8-2.4T-A95B-Quark-MXFP4 TP8
           - Qwen3.5-35B-A3B-FP8 TP2
           - Qwen3.5-35B-A3B TP2
           - Qwen3.5-397B-A17B-FP8 TP4
@@ -279,6 +280,21 @@ jobs:
                   "accuracy_test_threshold": 0.93,
                   "mtp_accept_threshold": 0.35,
                   "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nSGLANG_USE_AITER=1\nSGLANG_AITER_FP8_PREFILL_ATTN=0\nATOM_FORCE_ATTN_TRITON=1\nSGLANG_ENABLE_TORCH_COMPILE=1\nTORCHINDUCTOR_COMPILE_THREADS=128\nATOM_SGLANG_EAGLE3_TP_VERIFY_BROADCAST=1",
+                  "runner": "atom-plugin-acc-validation-runner-sgl",
+              },
+              {
+                  "toggle_env": "RUN_QWEN38_2_4T_A95B_QUARK_MXFP4_TP8",
+                  "model_name": "Qwen3.8-2.4T-A95B-Quark-MXFP4 TP8",
+                  "model_path": "amd/Qwen3.8-2.4T-A95B-Quark-MXFP4",
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 8 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.9 --max-running-requests 256 --context-length 32768 --disable-radix-cache --page-size 16 --reasoning-parser qwen3 --enable-torch-compile --torch-compile-max-bs 64 --cuda-graph-backend-prefill tc_piecewise --cuda-graph-max-bs-prefill 16384 --cuda-graph-bs-prefill 8192 16384 --cuda-graph-tc-compiler inductor",
+                  "lm_eval_num_fewshot": 5,
+                  "lm_eval_num_concurrent": 64,
+                  "lm_eval_use_chat_completions": "1",
+                  "lm_eval_extra_model_args": "max_retries=3,timeout=1200,max_gen_toks=8192,tokenized_requests=False,trust_remote_code=True",
+                  "lm_eval_batch_size": 1,
+                  "lm_eval_gen_kwargs": "do_sample=True,temperature=1.0,top_p=0.95,top_k=20,min_tokens=1,reasoning_effort=low",
+                  "accuracy_test_threshold": 0.97,
+                  "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_PLUGINS=atom_sglang\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models\nSGLANG_USE_AITER=1\nAITER_LOG_LEVEL=WARNING\nATOM_AITER_FP8_PREFILL_ATTN=1\nATOM_SGLANG_PREFILL_COMPILE_ONLY=1\nTORCHINDUCTOR_COMPILE_THREADS=128\nSGLANG_MAMBA_SSM_DTYPE=bfloat16",
                   "runner": "atom-plugin-acc-validation-runner-sgl",
               },
               {

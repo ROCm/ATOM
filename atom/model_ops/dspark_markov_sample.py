@@ -37,6 +37,10 @@ lowest index attaining the tile max is taken, and the cross-tile reduce takes
 the lowest index among tiles attaining the global max -- tiles being ordered by
 vocab id, that is the global lowest index.
 
+A row that is entirely NaN attains no maximum, and stage 2 answers 0 for it
+rather than the sentinel it carries. Reachable: the warmup forward drafts
+before ``allocate_kv_cache``, reading an fp8 KV pool where ``0x7F`` is NaN.
+
 CUDA-graph safety. Both launches have host-int grids derived from static
 shapes, no host sync and no ``.item()``; the ``prev_ids`` dependence is a
 data-dependent *address* inside the W1 gather the caller already does, never a
@@ -156,7 +160,12 @@ def _dspark_markov_argmax_stage2(
     )
     best = tl.max(vals, axis=0)
     cand = tl.where((vals == best) & tile_mask, idxs, vocab_size)
-    tl.store(out_ptr + row, tl.min(cand, axis=0).to(tl.int64))
+    winner = tl.min(cand, axis=0)
+    # NaN never equals itself, so no lane passes its `== max` test and every
+    # candidate keeps the out-of-range sentinel. Answer 0, as `torch.argmax`
+    # does, so a caller gathering `W1[x]` cannot read past the table.
+    winner = tl.where(winner == vocab_size, 0, winner)
+    tl.store(out_ptr + row, winner.to(tl.int64))
 
 
 def _dspark_markov_argmax_fake(

@@ -531,7 +531,7 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
     Both transports get the same grid shrink. The dispatch arena is padded to a
     huge static token_num (ws * max_num_inp_token_per_rank) while the received
     tokens occupy only the first ``total_recv`` rows, so it is capped at the
-    static ``sum(running_tokens_across_dp)*topk`` bound (the V1/base policy):
+    static ``sum(running_tokens_across_dp)`` bound (same as the base policy):
     the grid-bound aiter kernels (route-ksplit preshuffle, gather-reduce) then
     launch a grid sized to what the group actually sent instead of the full
     arena, and the single-block route/psum kernels shrink too.
@@ -539,18 +539,19 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
     ``recv_token_bound`` because it never sees them.
     """
 
-    def _recv_bound(self, topk_ids: torch.Tensor, arena_rows: int) -> int | None:
+    def _recv_bound(self, arena_rows: int) -> int | None:
         """Recv-row bound for this step, or None when it does not shrink.
 
         Correctness / capture-safety:
           * The counts are python ints, fixed per captured graph, so the bound is
             static across capture/replay and no GPU->CPU sync is needed (unlike
             reading the device ``total_recv``).
-          * The group holds ``sum(running_tokens_across_dp)`` rows, each routed
-            to ``topk`` experts; worst case every route lands on this rank, so
-            ``total_recv <= that_sum * topk``. The bound therefore never drops a
-            valid row, and the aiter kernels' device-side ``num_valid_routes``
-            guard still skips the exact within-buffer tail [total_recv, bound).
+          * mori dispatch deduplicates per destination rank, so each source
+            rank contributes at most its own token count -- never that times
+            topk. ``total_recv <= sum(running_tokens_across_dp)``; the bound
+            therefore never drops a valid row, and the aiter kernels'
+            device-side ``num_valid_routes`` guard still skips the exact
+            within-buffer tail [total_recv, bound).
             Why the sum and not ``running_tokens * dp``: see the base method.
         """
         context = get_forward_context().context
@@ -561,7 +562,7 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
             "an all2all MoE needs the group's per-rank counts to bound what its "
             "dispatch delivered; this step reached it with none reduced"
         )
-        bound = sum(across_dp) * topk_ids.shape[1]
+        bound = sum(across_dp)
         return bound if bound < arena_rows else None
 
     def _maybe_trim_dispatch_output(
@@ -573,7 +574,7 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         topk_ids: torch.Tensor,
         expert_tokens_meta,
     ):
-        bound = self._recv_bound(topk_ids, dispatch_a1.shape[0])
+        bound = self._recv_bound(dispatch_a1.shape[0])
         if bound is not None:
             dispatch_a1 = dispatch_a1[:bound]
             dispatch_ids = dispatch_ids[:bound]
@@ -615,7 +616,6 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
             a1_scale=kwargs.get("a1_scale"),
             a2_scale=kwargs.get("a2_scale"),
             recv_token_bound=self._recv_bound(
-                topk_ids,
                 self.prepare_finalize.num_dispatchers() * mega.max_tokens_per_rank,
             ),
         )

@@ -51,10 +51,12 @@ _HF_PAGE_FIELDS = (
     "qk_rope_head_dim",
     "compress_ratios",
     "indexer_dtype",
+    "indexer_types",
 )
 _HF_INTEGER_GEOMETRY_FIELDS = frozenset(_HF_PAGE_FIELDS) - {
     "compress_ratios",
     "indexer_dtype",
+    "indexer_types",
 }
 # GDN/linear model types carrying a per-request recurrent state but NOT in the
 # `kimi_linear` family `kimi_k3` owns. Same set as `attn_family` resolves to
@@ -107,15 +109,12 @@ def _is_minimax_m3(hf_config) -> bool:
     (config-only selection, matching select_offload_layout's contract).
     """
 
-    if hf_config is None:
-        return False
-    architectures = getattr(hf_config, "architectures", None) or ()
-    for arch in architectures:
-        name = str(arch).lower()
-        if "minimaxm3" in name or "minimax_m3" in name:
-            return True
-    model_type = str(getattr(hf_config, "model_type", "") or "").lower()
-    return "minimax_m3" in model_type or "minimaxm3" in model_type
+    # Keep model normalization, attention selection, and offload layout
+    # selection on one predicate, including wrapper configs whose identifying
+    # fields live under ``text_config``.
+    from atom.config import _is_minimax_m3_config
+
+    return hf_config is not None and _is_minimax_m3_config(hf_config)
 
 
 def select_offload_layout(config) -> str:
@@ -143,6 +142,17 @@ def select_offload_layout(config) -> str:
         raise ValueError(
             f"lmcache_offload: unknown offload_layout={override!r}; "
             f"expected one of {sorted(_OFFLOAD_LAYOUT_ALIASES)}"
+        )
+    # M3's PAGE layout is the only codec that carries its NSA index cache.
+    # Unlike a dense/hybrid namespace preference, changing this model family
+    # to another layout loses required state and can silently corrupt a
+    # restored prefix.
+    if natural == "m3" and mapped != "m3":
+        raise ValueError(
+            f"lmcache_offload: MiniMax-M3 requires offload_layout='m3'; "
+            f"offload_layout={override!r} resolves to {mapped!r}, whose codec "
+            "does not preserve the NSA index cache. Drop the override or set "
+            "it to 'm3'."
         )
     # An override may pick between compatible layouts, but it may not strip a
     # state-owning model down to a layout with no tier for its per-request state
@@ -356,23 +366,36 @@ def build_lmcache_config(
 
     Raises:
         ValueError: If the local-disk path, capacity, or CPU staging capacity
-            is incomplete.
+            is incomplete, or asynchronous loading is requested.
     """
     from lmcache.v1.config import LMCacheEngineConfig
 
     cfg = LMCacheEngineConfig.from_env()
+    # Preserve the legacy rank-0 default; explicit overrides can opt into
+    # all-rank lookup ([]) so every shard gets matching touches and pins.
+    if getattr(cfg, "lookup_server_worker_ids", None) is None:
+        cfg.lookup_server_worker_ids = [0]
     apply_extra_overrides(cfg, kv_transfer_config)
+    # Async lookup has a separate polling/cancellation contract. This
+    # connector currently implements only synchronous lookup; do not let an
+    # unsupported mode issue duplicate lookups or release late-arriving pins.
+    if getattr(cfg, "enable_async_loading", False):
+        raise ValueError(
+            "ATOM LMCache offload does not support enable_async_loading=True; "
+            "set LMCACHE_ENABLE_ASYNC_LOADING=false and remove any conflicting "
+            "lmcache.enable_async_loading override."
+        )
+    if str(getattr(cfg, "cache_policy", "")).strip().upper() == "ATOM_SLRU":
+        from atom.kv_transfer.offload.cache_policy import register_slru_policy
+
+        cfg.cache_policy = "ATOM_SLRU"
+        register_slru_policy()
     # cufile GDS has no NVMe-GDS hardware here and hangs on init; force off.
     if getattr(cfg, "use_gds", False):
         cfg.use_gds = False
-    # TP>1 fix: only rank 0 serves/answers the ZMQ lookup. Without this the
-    # client queries all ranks and takes min() over results; we observed rank!=0
-    # engine.lookup returning 0 even though that rank stored the chunk
-    # (contains()=True) -> min(0, hit)=0 -> the scheduler never sees the hit and
-    # always recomputes. Our connector saves on ALL ranks in lockstep, so rank 0
-    # is authoritative for "is it offloaded?"; each rank still loads its own KV
-    # shard, and _do_load is all-or-nothing (re-prefills if a shard is missing).
-    cfg.lookup_server_worker_ids = [0]
+    # Legacy rank-0 lookup avoids cold-rank false negatives. Under capacity
+    # pressure it cannot guarantee residency or pins on other shards; callers
+    # may explicitly request all ranks, whose minimum is the loadable prefix.
     validate_lmcache_storage_config(cfg)
     return cfg
 
@@ -407,7 +430,7 @@ def lmcache_replica_world_size(config) -> int:
 
     Worker ids index this replica-local grid rather than the global one.
     LMCache selects its lookup servers by worker id
-    (``cfg.lookup_server_worker_ids``, pinned to ``[0]`` above), so global
+    (``cfg.lookup_server_worker_ids``, defaulting to ``[0]``), so global
     numbering would leave every replica except the first without a server.
     Replica-local ids are also the right cache-key component: id ``i`` means
     "shard i of the model", which holds the same bytes in every replica, so

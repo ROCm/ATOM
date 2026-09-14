@@ -120,8 +120,13 @@ def run_pa_fwd_asm(
     qo_indptr: torch.Tensor | None = None,
     max_qlen: int = 1,
     high_precision: int = 0,
+    kernel_name: str | None = None,
 ):
-    """Run the AITER paged-attention ASM kernel with explicit metadata."""
+    """Run the AITER paged-attention ASM kernel with explicit metadata.
+
+    ``kernel_name`` bypasses aiter's kernel heuristic; a name absent from
+    pa_asm.csv aborts the process rather than raising.
+    """
 
     import aiter
 
@@ -138,6 +143,7 @@ def run_pa_fwd_asm(
         out_=out,
         qo_indptr=qo_indptr,
         high_precision=high_precision,
+        kernelName=kernel_name,
     )
 
 
