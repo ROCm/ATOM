@@ -303,7 +303,8 @@ def _emit_sparse_block_table_kernel(
     """The fused selector's emission, reading the selection from HBM instead.
 
     Same compaction -- it calls the same helper -- so the two paths cannot
-    drift. It costs 26us a call against the ~4us the fusion charges, which is
+    drift. Its cost splits: 2.5-4.7us of device time, and ~14us of python
+    launch that a captured replay does not pay at all. Only the first half is
     why `_AITER_MIN_WIDTH_WITH_EMIT` asks for a wider row than the bare
     selection does.
     """
@@ -786,6 +787,14 @@ def _launch_select(
                 NUM_KV_HEADS=num_idx_heads,
                 DECODE_MAX_Q=decode_max_q,
                 pages_per_block=PAGES_PER_SPARSE_BLOCK,
+                # The compaction alone is a `topk x pages_per_block` tile --
+                # 16x8 here -- so a wave is already more lanes than it has
+                # work, and the helper's cumsum stops crossing warps. The
+                # fused kernel reaches the same number from the other side
+                # (`PREFILL_TOPK_NUM_WARPS`); `DECODE_TOPK_NUM_WARPS` is 8 for
+                # the scoring this one does not do. Measured prefill device
+                # time 8.03us -> 4.66us, decode 2.63 -> 2.50, same bytes out.
+                num_warps=1,
             )
         return
 
