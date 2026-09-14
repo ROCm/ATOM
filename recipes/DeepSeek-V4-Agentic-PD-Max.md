@@ -116,6 +116,10 @@ python3 -m atom.entrypoints.openai_server \
 `--enable-tbo` (two-batch overlap) goes on the **prefill node only**. The decode
 node runs DP attention without it, and at `--gpu-memory-utilization 0.70`.
 
+`ATOM_DP_SESSION_AFFINITY=1` is the load-bearing one of those four. It keeps a
+trajectory on one rank, which is what the agentic scenario's prefix reuse
+depends on; without it this band loses most of its cache hit.
+
 `$KV_TRANSFER` is the same plain Mooncake pair as band A.
 
 ## Band C — DP attention with CPU offload (concurrency 256 and up)
@@ -273,34 +277,6 @@ aiperf profile --scenario inferencex-agentx-mvp \
 
 Host memory: `lmcache.max_local_cpu_size` is per worker, so the prefill node
 needs 8 × 128 GiB = 1024 GiB free before the server starts.
-
-## What changes between the bands
-
-Everything not listed is identical across all three.
-
-| | A (TP) | B (DP) | C (DP + offload) |
-|---|---|---|---|
-| `--enable-dp-attention` | absent | **present** | present |
-| `--enable-tbo` (prefill only) | absent | **present** | present |
-| `--gpu-memory-utilization` (prefill) | 0.65 | **0.75** | 0.75 |
-| `--max-num-seqs` | `2 × CONC` | `2 × CONC` | `2 × CONC` |
-| `ATOM_NUMA_BIND` | unset | **1** | 1 |
-| `GPU_MAX_HW_QUEUES` | unset | **5** | 5 |
-| `ATOM_DP_SESSION_AFFINITY` | unset | **1** | 1 |
-| `ATOM_DP_LB_REQ_EQUIV` | unset | **512** | 512 |
-| `OFFLOAD_*` (prefill only) | unset | unset | **set, 3 vars** |
-| prefill `kv-transfer-config` | mooncake | mooncake | **multi: mooncake + offload** |
-| router | `--policy random` | `--dp-aware --policy dp_sticky --atom-pd-rank-mapping-policy idx2idx` | same as B |
-
-Two of these carry more weight than the rest.
-
-`ATOM_DP_SESSION_AFFINITY=1` keeps a trajectory on one rank, which is what the
-agentic scenario's prefix reuse depends on. Without it bands B and C lose most
-of their cache hit.
-
-**B → C is purely additive.** The server flags do not change; only the prefill
-node gains the offload tier. So moving between them is a config swap on one
-node, not a redeploy.
 
 ## The offload settings that matter
 
