@@ -663,6 +663,7 @@ _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     "qwen3_5_moe": "text_config",
     "mistral3": "text_config",
     "glm5_next": "text_config",  # GLM-5.3-Flash: text-only hybrid KDA/DSA runtime
+    "qwen4_exp": "text_config",
 }
 
 # Text sub-config model_types that this image's transformers has no class for.
