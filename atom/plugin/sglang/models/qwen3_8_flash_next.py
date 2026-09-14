@@ -3,7 +3,7 @@
 
 """SGLang EntryClass for Qwen3.8-Flash-Next / Qwen4Exp (eager text).
 
-Native compute: atom.models.qwen3_8_flash_next (PR #2048).
+Native compute: atom.models.qwen4_exp (PR #2048).
 Metadata: ForwardBatch → QSA + PLE bridge. GDN uses the existing SGLang GDN
 context (#2067 path). Do not hang this architecture on Qwen3_5* EntryClass.
 """
@@ -38,8 +38,8 @@ from atom.plugin.sglang.runtime import (
 )
 
 try:
-    from atom.models.qwen3_8_flash_next import (
-        Qwen3_8FlashNextForConditionalGeneration as _NativeFlash,
+    from atom.models.qwen4_exp import (
+        Qwen4ExpForConditionalGeneration as _NativeFlash,
     )
 except ImportError as exc:  # pragma: no cover - until Native #2048 is on the tree
     _NativeFlash = None
@@ -52,7 +52,7 @@ def _require_native() -> type[nn.Module]:
     if _NativeFlash is None:
         raise ImportError(
             "Qwen3.8-Flash-Next SGLang plugin needs Native "
-            "atom.models.qwen3_8_flash_next from ATOM PR #2048 "
+            "atom.models.qwen4_exp from ATOM PR #2048 "
             f"(import failed: {_NATIVE_IMPORT_ERROR})"
         ) from _NATIVE_IMPORT_ERROR
     return _NativeFlash
@@ -107,7 +107,7 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         if not isinstance(atom_lm, native_cls):
             logger_name = type(atom_lm).__name__
             raise TypeError(
-                "Flash plugin expected Native Qwen3_8FlashNextForConditionalGeneration, "
+                "Flash plugin expected Native Qwen4ExpForConditionalGeneration, "
                 f"got {logger_name}. Do not route Qwen4Exp through Qwen3_5*."
             )
 

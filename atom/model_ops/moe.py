@@ -1533,7 +1533,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 if global_num_experts > 0:
                     n_expts_tot = global_num_experts
 
-                output = torch.empty_like(x)
+                try:
+                    from atom.model_ops.qwen3_8_flash_next import (
+                        flash_decode_graph_workspace as _fws,
+                    )
+                    if _fws.fits_moe(x.shape[0], 1, 1, x.dtype):
+                        output = _fws.moe_out(x.shape[0], x.shape[-1], x.dtype)
+                    else:
+                        output = torch.empty_like(x)
+                except Exception:  # noqa: BLE001
+                    output = torch.empty_like(x)
                 _moe_result = triton_kernel_fused_experts(
                     output,
                     x,

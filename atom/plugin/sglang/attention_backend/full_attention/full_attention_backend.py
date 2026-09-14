@@ -251,6 +251,30 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 real_bs = forward_batch.batch_size - num_padding
                 self.forward_metadata.kv_lens[real_bs:].zero_()
 
+        # Qwen3.8-Flash-Next QSA page tables are consumed inside the captured
+        # decode graph. Refresh the persistent bridge buffers here so replay
+        # does not keep capture-time (short) page tables.
+        try:
+            from atom.plugin.sglang.qwen3_8_flash_next_bridge import (
+                prepare_flash_decode_graph_metadata,
+            )
+
+            prepare_flash_decode_graph_metadata(
+                forward_batch, in_capture
+            )
+        except Exception as exc:  # noqa: BLE001 - optional until Flash bridge is loaded
+            logger = getattr(self, "logger", None)
+            if logger is None:
+                import logging
+
+                logger = logging.getLogger(__name__)
+            logger.warning(
+                "prepare_flash_decode_graph_metadata failed (in_capture=%s): %s",
+                in_capture,
+                exc,
+                exc_info=True,
+            )
+
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         """ATOM's full-attention metadata is prepared outside the captured graph."""
         return

@@ -33,6 +33,7 @@ raw index keys so pooling can read them back.
 """
 
 from types import SimpleNamespace
+import os
 
 import aiter
 import torch
@@ -345,7 +346,11 @@ class Qwen4ExpAttention(nn.Module):
         gate, q, k, v = qkv.split(
             [self.q_size, self.q_size, self.kv_size, self.kv_size], -1
         )
-        # Normalization and cache writes accept packed token strides without copies.
+        from atom.model_ops.qwen4_exp import flash_decode_graph_workspace as _fws
+        q = _fws.as_contiguous(q, kind="q")
+        k = _fws.as_contiguous(k, kind="k")
+        v = _fws.as_contiguous(v, kind="v")
+        gate = _fws.as_contiguous(gate, kind="gate")
         q, k = self.qk_norm(q, k)
         query, key = qsa_apply_mrope(
             self.rotary_emb,
@@ -359,6 +364,8 @@ class Qwen4ExpAttention(nn.Module):
             attn_out = self._profile_attention(
                 query, key, value, hidden_states, positions
             )
+        elif os.environ.get("ATOM_FLASH_GRAPH_SKIP_QSA", "") == "1":
+            attn_out = torch.zeros_like(query)
         else:
             aiter.reshape_and_cache_flash(
                 key,

@@ -61,11 +61,18 @@ def _masked_embedding_launcher(
     weight: torch.Tensor,
     vocab_start_idx: int,
     vocab_end_idx: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     N = x.numel()
     D = weight.shape[1]
     BLOCK_D = 1024
-    out = torch.empty(N, D, dtype=weight.dtype, device=weight.device)
+    if out is None:
+        out = torch.empty(N, D, dtype=weight.dtype, device=weight.device)
+    elif out.shape != (N, D) or out.dtype != weight.dtype:
+        raise ValueError(
+            f"masked_embedding out expected {(N, D)} {weight.dtype}, "
+            f"got {tuple(out.shape)} {out.dtype}"
+        )
     grid = (N, triton.cdiv(D, BLOCK_D))
     _masked_embedding_kernel[grid](
         x,

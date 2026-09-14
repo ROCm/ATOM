@@ -730,7 +730,20 @@ class GemmaRMSNorm(nn.Module):
         ori_shape = x.shape
         x_2d = x.view(-1, ori_shape[-1])
 
-        out = torch.empty_like(x_2d)
+        out = None
+        try:
+            from atom.model_ops.qwen3_8_flash_next import (
+                flash_decode_graph_workspace as _fws,
+            )
+
+            if residual is None and _fws.fits_head_norm(
+                x_2d.shape[0], x_2d.shape[1], x_2d.dtype
+            ):
+                out = _fws.head_norm_out(x_2d.shape[0], x_2d.shape[1], x_2d.dtype)
+        except Exception:  # noqa: BLE001
+            out = None
+        if out is None:
+            out = torch.empty_like(x_2d)
         if residual is not None:
             residual_2d = residual.view(-1, ori_shape[-1])
             res_out = torch.empty_like(x_2d)

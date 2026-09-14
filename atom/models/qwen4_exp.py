@@ -9,6 +9,7 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from torch import nn
+import os
 
 from atom.config import Config
 from atom.model_ops.base_attention import LinearAttention
@@ -39,6 +40,65 @@ from atom.models.utils import (
 )
 from atom.quant_spec import LayerQuantConfig
 from atom.utils.forward_context import get_forward_context
+try:
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        eager_on_graph,
+    )
+except Exception:  # pragma: no cover - Native / no SGLang
+
+    def eager_on_graph(enable, capture_stub=None):  # type: ignore[misc]
+        del enable, capture_stub
+
+        def decorator(inner):
+            return inner
+
+        return decorator
+
+# `split_ngram_parts` in the checkpoint config: the n-gram table ships as
+# this many row slices.
+_NGRAM_TABLE_SHARDS = 128
+
+
+def _flash_ple_metadata():
+    ctx = get_forward_context()
+    md = getattr(ctx, "attn_metadata", None)
+    if md is None:
+        ple = None
+    elif isinstance(md, dict):
+        ple = md.get("ple_metadata")
+    else:
+        ple = getattr(md, "ple_metadata", None)
+    if ple is not None:
+        return ple
+    try:
+        from atom.plugin.sglang.qwen3_8_flash_next_bridge import _DECODE_GRAPH
+
+        return getattr(_DECODE_GRAPH, "last_ple", None)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _apply_flash_ple(layer, hidden_states, input_ids):
+    """PLE as a SGLang breakable-CUDA-graph eager island (decode first knife).
+
+    Full decode CUDAGraph cannot host PLE: n-gram gather / FP8 GEMM / TP
+    all-reduce allocate in the caching allocator and HSA after a long eager
+    prefill. Native #2048 has no graph-safe PLE kernel. Keep PLE eager
+    between graph segments; capture QSA / GDN / MoE / HC.
+    """
+    ple_metadata = _flash_ple_metadata()
+    if ple_metadata is None:
+        return hidden_states
+    contrib = layer.ple.forward_with_state(
+        hidden_states,
+        input_ids,
+        ple_metadata,
+    )
+    return hidden_states + contrib
+
+
+_apply_flash_ple_breakable = eager_on_graph(True)(_apply_flash_ple)
+
 
 
 class _Qwen4ExpQuantizationConfig:
@@ -492,36 +552,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         input_ids: torch.Tensor | None,
     ) -> torch.Tensor:
         if self.ple is not None:
-            ple_metadata = get_forward_context().attn_metadata.ple_metadata
-            # `None` only on the warmup/profiling forwards that run before the
-            # state pool exists; a served token always has metadata.
-            if ple_metadata is not None:
-                hidden_states = hidden_states + self.ple.forward_with_state(
-                    hidden_states,
-                    input_ids,
-                    ple_metadata,
-                )
-            else:
-                # Profile the real embedding, projections and convolution.
-                # The production pool is not allocated yet: one synthetic
-                # request provides the activation/workspace peak to budget.
-                starts = torch.tensor(
-                    [0, hidden_states.shape[0]],
-                    device=hidden_states.device,
-                    dtype=torch.int32,
-                )
-                context = torch.full(
-                    (1, self.ple.short_conv_dilation - 1),
-                    self.ple.ple_embedding.eos_token_id,
-                    device=hidden_states.device,
-                    dtype=torch.int64,
-                )
-                hidden_states = hidden_states + self.ple(
-                    hidden_states,
-                    input_ids,
-                    starts,
-                    context,
-                )
+            hidden_states = _apply_flash_ple_breakable(self, hidden_states, input_ids)
 
         mixed, residual = self.attn_hyper_connection.mix(hidden_states)
         if self.layer_type == "linear_attention":

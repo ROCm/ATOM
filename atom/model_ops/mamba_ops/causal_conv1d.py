@@ -1304,9 +1304,19 @@ def causal_conv1d_update(
 
     # adopt the strategy in vLLM that overwrite on 'x' directly, rather than creating a new tensor 'o'
     num_tokens = x.shape[0]
-    query = torch.empty([num_tokens, k_dim_size, 1], dtype=x.dtype, device=x.device)
-    key = torch.empty([num_tokens, k_dim_size, 1], dtype=x.dtype, device=x.device)
-    value = torch.empty([num_tokens, v_dim_size, 1], dtype=x.dtype, device=x.device)
+    pinned = None
+    try:
+        from atom.model_ops.qwen3_8_flash_next import flash_decode_graph_workspace as _fws
+
+        pinned = _fws.gdn_conv_qkv(num_tokens, k_dim_size, v_dim_size, x.dtype)
+    except Exception:
+        pinned = None
+    if pinned is not None:
+        query, key, value = pinned
+    else:
+        query = torch.empty([num_tokens, k_dim_size, 1], dtype=x.dtype, device=x.device)
+        key = torch.empty([num_tokens, k_dim_size, 1], dtype=x.dtype, device=x.device)
+        value = torch.empty([num_tokens, v_dim_size, 1], dtype=x.dtype, device=x.device)
 
     stride_q_seq, stride_q_dim, stride_q_token = query.stride()
     stride_k_seq, stride_k_dim, stride_k_token = key.stride()

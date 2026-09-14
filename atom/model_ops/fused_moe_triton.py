@@ -208,11 +208,24 @@ def triton_kernel_fused_experts(
     half_N = N // 2
 
     if intermediate_cache is None:
-        intermediate_cache = torch.empty(
-            (M * topk, half_N),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
+        try:
+            from atom.model_ops.qwen3_8_flash_next import (
+                flash_decode_graph_workspace as _fws,
+            )
+            if _fws.fits_moe(M, topk, half_N, hidden_states.dtype):
+                intermediate_cache = _fws.moe_inter(M, topk, half_N, hidden_states.dtype)
+            else:
+                intermediate_cache = torch.empty(
+                    (M * topk, half_N),
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
+        except Exception:  # noqa: BLE001
+            intermediate_cache = torch.empty(
+                (M * topk, half_N),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
 
     # Add batch_dim to output buffer because matmul_ogs expects 3D output
     intermediate_cache = _resize_cache(intermediate_cache, (M * topk, half_N))

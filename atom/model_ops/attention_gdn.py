@@ -81,8 +81,18 @@ def fused_gdn_gating(
     batch, num_heads = a.shape
     seq_len = 1
     grid = (batch, seq_len, triton.cdiv(num_heads, 8))
-    g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
-    beta_output = torch.empty(1, batch, num_heads, dtype=b.dtype, device=b.device)
+    pinned = None
+    try:
+        from atom.model_ops.qwen3_8_flash_next import flash_decode_graph_workspace as _fws
+
+        pinned = _fws.gdn_gate_out(batch, num_heads, b.dtype)
+    except Exception:
+        pinned = None
+    if pinned is not None:
+        g, beta_output = pinned
+    else:
+        g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
+        beta_output = torch.empty(1, batch, num_heads, dtype=b.dtype, device=b.device)
     fused_gdn_gating_kernel[grid](
         g,
         beta_output,
@@ -153,7 +163,12 @@ class GatedDeltaNet(nn.Module):
             (query, key),
         )
         value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
-        return query.contiguous(), key.contiguous(), value.contiguous()
+        from atom.model_ops.qwen3_8_flash_next import flash_decode_graph_workspace as _fws
+
+        query = _fws.pin_gdn_qkv(query, kind="q")
+        key = _fws.pin_gdn_qkv(key, kind="k")
+        value = _fws.pin_gdn_qkv(value, kind="v")
+        return query, key, value
 
     def forward(
         self,
