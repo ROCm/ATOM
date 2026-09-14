@@ -98,6 +98,37 @@ def test_unsupported_fp4_requests_name_the_knob_that_blocked_them():
         assert_fp4_indexer_supported(fused_writer=True, prefill_context_parallel=True)
 
 
+def test_every_backend_answers_the_draft_s_fp4_schedule_publish():
+    """`EagleProposer` refreshes this on whatever builder the target uses, and
+    only the MLA one has an FP4 indexer to refresh. Every other backend has to
+    answer it anyway: EAGLE3 on Llama-3, MTP on Qwen3-Next and on DeepSeek-V4
+    (whose builder is a `CommonAttentionBuilder` sibling, not an MLA subclass)
+    all reach that line with FP4 nowhere in the picture."""
+    backends = pytest.importorskip("atom.model_ops.attentions.backends")
+    base = backends.CommonAttentionBuilder._publish_indexer_fp4_decode_schedule
+
+    mla = pytest.importorskip("atom.model_ops.attentions.aiter_mla")
+    assert mla.AiterMLAMetadataBuilder._publish_indexer_fp4_decode_schedule is not base
+
+    for module, name in (
+        ("atom.model_ops.attentions.aiter_attention", "AiterAttentionMetadataBuilder"),
+        (
+            "atom.model_ops.attentions.deepseek_v4_attn",
+            "DeepseekV4AttentionMetadataBuilder",
+        ),
+        ("atom.model_ops.attentions.gdn_attn", "GDNAttentionMetadataBuilder"),
+        ("atom.model_ops.attentions.triton_mha", "TritonMHAMetadataBuilder"),
+    ):
+        builder = getattr(pytest.importorskip(module), name)
+        assert builder._publish_indexer_fp4_decode_schedule is base, name
+
+    # Inert, not merely present: the draft reuses the target's metadata object,
+    # so anything written here would reach the verify step.
+    metadata = SimpleNamespace()
+    base(object(), metadata, 4, 1)
+    assert not vars(metadata)
+
+
 def test_decode_parallel_units_are_a_multiple_of_next_n_covering_the_batch():
     for next_n in (1, 2, 3, 4, 8):
         for max_bs in (1, 16, 512, 8192):
