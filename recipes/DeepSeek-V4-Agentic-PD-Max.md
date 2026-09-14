@@ -108,7 +108,7 @@ python3 -m atom.entrypoints.openai_server \
   --kv-cache-dtype fp8 --index-cache-dtype fp8 \
   --enable-prefix-caching --block-size 16 \
   --gpu-memory-utilization 0.75 \
-  --max-num-seqs 256 \
+  --max-num-seqs $(( CONC * 2 )) \
   --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
   --state-checkpoint-interval-tokens 8192 \
   --level 3 --cudagraph-mode FULL \
@@ -158,6 +158,111 @@ atomesh launch --host 0.0.0.0 --port 8000 --pd-disaggregation \
   --request-timeout-secs 1800
 ```
 
+## Complete example — concurrency 256, both nodes
+
+The config the *Measured* tuned row was produced with, written out in full so it
+can be copied without resolving any of the `$VAR` above. Substitute only the two
+IPs and `$MODEL_PATH`.
+
+### Prefill node
+
+```bash
+export AITER_BF16_FP8_MOE_BOUND=0
+export ATOM_MOE_GU_ITLV=1
+export ATOM_HOST_IP=10.0.0.1                    # this node
+export ATOM_DISABLE_MMAP=true
+export MC_GID_INDEX=1
+export NCCL_IB_DISABLE=1
+export LD_PRELOAD=/path/to/rdma_compat/libhip_dmabuf_mr.so
+
+export ATOM_NUMA_BIND=1
+export GPU_MAX_HW_QUEUES=5
+export ATOM_DP_SESSION_AFFINITY=1
+export ATOM_DP_LB_REQ_EQUIV=512
+export ATOM_DP_MASTER_PORT=29510
+export ATOM_DP_BASE_PORT=29610
+
+export ATOM_PREFIX_CACHE_POLICY=lru
+export ATOM_PREFIX_CACHE_PROTECTED_RATIO=0.5
+
+export OFFLOAD_COPY_WORKERS=1
+export OFFLOAD_MIN_LOAD_TOKENS=8192
+export OFFLOAD_SLOT_STAGING_SLOTS=4
+
+python3 -m atom.entrypoints.openai_server \
+  --model $MODEL_PATH --served-model-name deepseek-ai/DeepSeek-V4-Pro \
+  --host 0.0.0.0 --server-port 8010 \
+  --tensor-parallel-size 8 \
+  --enable-dp-attention --enable-tbo \
+  --kv-cache-dtype fp8 --index-cache-dtype fp8 \
+  --enable-prefix-caching --block-size 16 \
+  --gpu-memory-utilization 0.75 \
+  --max-num-seqs 512 \
+  --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
+  --state-checkpoint-interval-tokens 8192 \
+  --level 3 --cudagraph-mode FULL \
+  --method mtp --num-speculative-tokens 3 \
+  --spec-decode-acceptance-length 2.49 \
+  --kv-transfer-config '{"kv_connector":"multi","connectors":[{"kv_role":"kv_producer","kv_connector":"mooncake","proxy_ip":"10.0.0.1","handshake_port":6301,"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload","offload_layout":"hybrid","max_pending_saves":8,"slot_sidecar_staging_slots":4,"lmcache.local_cpu":true,"lmcache.max_local_cpu_size":128,"lmcache.local_disk":null,"lmcache.max_local_disk_size":0,"lmcache.remote_url":null,"lmcache.chunk_size":256,"lmcache.cache_policy":"LRU","lmcache.lookup_server_worker_ids":[],"lmcache.store_location":"LocalCPUBackend","lmcache.retrieve_locations":["LocalCPUBackend"]}]}'
+```
+
+### Decode node
+
+No offload tier, no `--enable-tbo`, memory fraction 0.70.
+
+```bash
+# same exports as above, except:
+export ATOM_HOST_IP=10.0.0.2                    # this node
+# and drop the three OFFLOAD_* lines entirely
+
+python3 -m atom.entrypoints.openai_server \
+  --model $MODEL_PATH --served-model-name deepseek-ai/DeepSeek-V4-Pro \
+  --host 0.0.0.0 --server-port 8020 \
+  --tensor-parallel-size 8 \
+  --enable-dp-attention \
+  --kv-cache-dtype fp8 --index-cache-dtype fp8 \
+  --enable-prefix-caching --block-size 16 \
+  --gpu-memory-utilization 0.70 \
+  --max-num-seqs 512 \
+  --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
+  --state-checkpoint-interval-tokens 8192 \
+  --level 3 --cudagraph-mode FULL \
+  --method mtp --num-speculative-tokens 3 \
+  --spec-decode-acceptance-length 2.49 \
+  --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"10.0.0.2","handshake_port":6301,"protocol":"rdma"}'
+```
+
+### Router, then client
+
+```bash
+atomesh launch --host 0.0.0.0 --port 8000 --pd-disaggregation \
+  --prefill http://10.0.0.1:8010 --decode http://10.0.0.2:8020 \
+  --dp-aware --policy dp_sticky \
+  --atom-pd-rank-mapping-policy idx2idx \
+  --backend atom --model-path $MODEL_PATH \
+  --disable-circuit-breaker --prometheus-port 29100 \
+  --request-timeout-secs 1800
+
+aiperf profile --scenario inferencex-agentx-mvp \
+  --url http://localhost:8000 --endpoint /v1/chat/completions \
+  --endpoint-type chat --streaming \
+  --model deepseek-ai/DeepSeek-V4-Pro \
+  --tokenizer $MODEL_PATH --tokenizer-trust-remote-code \
+  --concurrency 256 --benchmark-duration 3600 \
+  --stats-interval 30 --random-seed 42 \
+  --failed-request-threshold 0.10 \
+  --trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75 \
+  --warmup-requests-per-lane 10 \
+  --trace-idle-gap-cap-seconds 300 \
+  --agentic-warmup-grace-period 1800 \
+  --use-server-token-count --no-gpu-telemetry \
+  --num-dataset-entries 393 --slice-duration 1.0 \
+  --public-dataset semianalysis_cc_traces_weka_062126
+```
+
+Host memory: `lmcache.max_local_cpu_size` is per worker, so the prefill node
+needs 8 × 128 GiB = 1024 GiB free before the server starts.
+
 ## What changes between TP and DPA
 
 Everything else in the two commands is identical. This is the whole delta:
@@ -166,7 +271,7 @@ Everything else in the two commands is identical. This is the whole delta:
 |---|---|---|
 | `--enable-dp-attention` | absent | **present** |
 | `--enable-tbo` | absent | **present** (prefill only) |
-| `--max-num-seqs` | `2 × CONC` | **256** |
+| `--max-num-seqs` | `2 × CONC` | `2 × CONC` |
 | `--gpu-memory-utilization` (prefill) | 0.65 | **0.75** |
 | `ATOM_NUMA_BIND` | unset | **1** |
 | `GPU_MAX_HW_QUEUES` | unset | **5** |
@@ -218,21 +323,22 @@ which reads downstream as SLOT publication timing out forever. If
 `page_visibility_timeout` appears in the prefill log at all, stop and check the
 build before tuning this knob upward.
 
-### What both of them actually bought
-
-Beyond the failure counts, raising the two together unblocked the prefill queue:
+### What they bought, at c=256
 
 | | defaults (1 / 2) | tuned (4 / 8) |
 |---|---|---|
-| SLOT sidecar failure rate | 26.0% | **1.5%** |
+| tok/s/chip | 21,599 | **30,686** (+42%) |
+| TTFT p90 | 192.8 s | **36.0 s** (−81%) |
+| cache hit | 91.0% | **94.6%** |
+| sidecar failure rate | 26.0% | **1.5%** |
 | save rejections | 6,758 | **160** |
 | prefill `requests_waiting` | 146.5 | **27.3** |
-| decode `requests_running` | 68.4 | **158.1** |
-| warmup wall clock | ~3,400 s | **~2,280 s** |
 
-The prefill queue is the point. At the defaults, 57% of a 256-request
-concurrency sat waiting to start; the offload save path was contending with
-prefill rather than serving it.
+The prefill queue is the mechanism. At the defaults, 57% of a 256-request
+concurrency sat waiting to start, because the offload save path was contending
+with prefill rather than serving it. Output-per-user drops from 56.2 to 35.1
+tok/s over the same move — this trades interactivity for throughput rather than
+being free.
 
 ## Client
 
@@ -293,20 +399,29 @@ prefix-cache reads rather than compute. `x` is AIPerf's
 | 16 | TP | — | 4,442 | 123.1 | 11.8 ms | 2.0 s | 96.6% |
 | 64 | DPA | — | 15,137 | 69.1 | 19.4 ms | 7.8 s | 96.1% |
 | **128** | DPA | — | **21,652** | 57.5 | 29.6 ms | 15.0 s | 94.7% |
-| 256 | DPA | 1024 GiB | 21,599 | 56.2 | 31.0 ms | 192.8 s | 91.0% |
+| 256 | DPA | defaults | 21,599 | 56.2 | 31.0 ms | 192.8 s | 91.0% |
+| **256** | **DPA** | **tuned** | **30,686** | 35.1 | 34.3 ms | **36.0 s** | **94.6%** |
 
-Every row above ran with the offload **defaults** (`max_pending_saves=2`,
-`slot_sidecar_staging_slots=1`), which is why c=256 gains nothing over c=128 and
-carries a 193 s TTFT. With the tuned values in this recipe the c=256 row changes
-substantially; re-measure before quoting it.
+The last row is the configuration this recipe documents; the one above it is the
+same run with `max_pending_saves=2` and `slot_sidecar_staging_slots=1`. Every
+other row also used those defaults, so the 64 and 128 cells have headroom that
+has not been re-measured.
 
-Read three things carefully. **c=128 is the knee at default settings** — c=256
-doubles the concurrency for no throughput and 13× the TTFT. **Cache hit falls
-with concurrency** (96.8% → 91.0%), and every lost point is prefill compute the
-offload tier failed to save. And a 1P2D variant measured at c=256 — 24 chips,
-15,774 tok/s/chip, x=75.3, ITL p90 18.9 ms — shows that adding *decode* capacity
-buys 34% interactivity and gives up 27% per-chip throughput, because decode was
-never the constraint.
+Three caveats on that pair. The tuned run sampled a longer trace
+(`isl` p50 84,176 against 71,141), and `tok/s/chip` counts input tokens, so
+perhaps a fifth of the +42% is the workload rather than the settings — the TTFT
+and cache-hit moves are not affected by this. Output-per-user falls 56.2 → 35.1,
+so this buys throughput with interactivity rather than for free. And both c=256
+rows ran with `--max-num-seqs 256`, which is 1× the concurrency rather than the
+2× this recipe specifies: the engine was capped at exactly the offered load with
+no headroom, so both cells understate what c=256 can do.
+
+Two more things to read. **c=128 is the knee at default settings** — c=256
+doubles the concurrency for no throughput and 13× the TTFT, and it is the tuned
+settings that break that ceiling rather than the concurrency. And a 1P2D variant
+measured at c=256 — 24 chips, 15,774 tok/s/chip, x=75.3, ITL p90 18.9 ms — shows
+that adding *decode* capacity buys 34% interactivity and gives up 27% per-chip
+throughput, because decode was never the constraint.
 
 ## Extending past 1P1D
 
