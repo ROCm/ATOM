@@ -3988,6 +3988,7 @@ class Block(nn.Module):
         if self._mhc_post is not None:
             # `out` inherits residual.dtype = x.dtype (residual stream is BF16
             # end-to-end in Block.forward), so no cast needed on the kernel path.
+            post_kw = {"res_preshuffle": True} if res_preshuffle else {}
             out = torch.empty_like(residual)
             self._mhc_post(
                 out,
@@ -3995,7 +3996,7 @@ class Block(nn.Module):
                 residual,
                 post.unsqueeze(-1),
                 comb,
-                res_preshuffle=res_preshuffle,
+                **post_kw,
             )
             return out
 
@@ -4024,9 +4025,11 @@ class Block(nn.Module):
         prefix: str = "",
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # BF16 weight packing is independent of the residual layout.
-        pack_kw = {"res_preshuffle": res_preshuffle}
+        pack_kw = {}
         if self.enable_hc_fn_pack_bf16:
             pack_kw["w_preshuffle_bf16"] = True
+        if res_preshuffle:
+            pack_kw["res_preshuffle"] = True
         return self._mhc_fused_post_pre(
             x,
             residual,
@@ -4459,6 +4462,8 @@ class DeepseekV4Model(nn.Module):
         # the K/V all-gather inside attention reconstructs full KV per layer,
         # and the final all-gather + un-pad happens back in the caller.
         h = self.embed(input_ids)  # [num_tokens, dim]
+        # Keep this static: concrete-M gating is handled inside AITER custom ops.
+        # Checking h.size(0) here would specialize the compiled graph to warmup M.
         res_preshuffle = self.enable_res_preshuffle and (
             self.layers[0]._mhc_fused_post_pre is not None
         )
