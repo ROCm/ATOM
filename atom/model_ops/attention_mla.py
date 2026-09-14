@@ -473,7 +473,10 @@ if is_rocm_aiter_fp4bmm_enabled():
 # Optional flydsl backend for `_kv_b_proj_gather`, gated by
 # ATOM_USE_FLYDSL_GATHER_KV_B_PROJ.
 try:
-    from aiter.ops.flydsl import gather_kv_b_proj_flydsl
+    from aiter.ops.flydsl import (
+        gather_kv_b_proj_flydsl,
+        gather_kv_b_proj_flydsl_supported,
+    )
 
     _FLYDSL_GATHER_AVAILABLE = True
 except Exception:  # noqa: BLE001 -- optional kernel; absence is the whole answer
@@ -672,6 +675,9 @@ class MLAAttention(nn.Module):
         # kernels with an unpadded 576-wide q_out. The triton path never uses seg.
         self.use_seg_mla = (not self.use_triton_mla) and envs.ATOM_MLA_PAGE_SIZE > 1
         self.use_flydsl_gather_kv_b_proj = bool(envs.ATOM_USE_FLYDSL_GATHER_KV_B_PROJ)
+        # Resolved on the first gather, when the weights and cache exist; see
+        # `_kv_b_proj_gather`. None = not asked yet.
+        self._flydsl_gather_ok: bool | None = None
         if self.use_seg_mla:
             if envs.ATOM_MLA_PAGE_SIZE != _MLA_SEG_PAGE_SIZE:
                 raise RuntimeError(
@@ -1391,20 +1397,32 @@ class MLAAttention(nn.Module):
         weight_scale = getattr(self.kv_b_proj, "weight_scale", None)
         preshuffled = getattr(weight, "is_shuffled", False)
 
+        # `_FLYDSL_GATHER_AVAILABLE` says the import worked, which is a different
+        # question from whether that backend serves THESE tensors: it is gfx950,
+        # page_size 1, fp8 cache and fp8 weight only. A bf16 cache (GLM-5.2), an
+        # unquantized weight (Kimi-K3) or an MXFP4 one make it raise, and that
+        # used to take the engine down rather than reach the Triton op below,
+        # which covers all of them. Every term is fixed by the weights and the
+        # cache, so ask once and keep the answer.
         if self.use_flydsl_gather_kv_b_proj and _FLYDSL_GATHER_AVAILABLE:
-            gather_kv_b_proj_flydsl(
-                kv_buffer,
-                self._k_scale,
-                kv_indptr,
-                kv_indices,
-                cu_seqlens_k,
-                gather_weight,
-                weight_scale,
-                k_out,
-                v_out,
-                weight_preshuffle=preshuffled,
-            )
-            return
+            if self._flydsl_gather_ok is None:
+                self._flydsl_gather_ok = gather_kv_b_proj_flydsl_supported(
+                    kv_buffer, gather_weight, weight_scale, k_out, v_out
+                )
+            if self._flydsl_gather_ok:
+                gather_kv_b_proj_flydsl(
+                    kv_buffer,
+                    self._k_scale,
+                    kv_indptr,
+                    kv_indices,
+                    cu_seqlens_k,
+                    gather_weight,
+                    weight_scale,
+                    k_out,
+                    v_out,
+                    weight_preshuffle=preshuffled,
+                )
+                return
 
         gather_kv_b_proj(
             kv_buffer,

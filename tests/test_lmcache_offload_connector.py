@@ -60,6 +60,7 @@ from atom.kv_transfer.offload.hybrid.dsv4 import policy as connector_module
 from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
 from atom.kv_transfer.offload.hybrid.dsv4.connector import (
     DSV4_CHECKPOINT_SAVE_CHANNEL,
+    DSV4_PAGE_SAVE_CHANNEL,
 )
 from atom.kv_transfer.offload.hybrid.dsv4.connector import (
     DSV4OffloadConnector as LMCacheOffloadConnector,
@@ -159,6 +160,7 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched._load_lifecycles = {}
     sched._active_load_operations = {}
     sched._save_inflight = {}
+    sched._save_watermark_rollback = {}
     sched._lookup_in_step = []
     sched._handoff_loads = set()
     sched.hash_block_size = 4
@@ -2555,6 +2557,149 @@ def test_save_callbacks_clear_only_matching_operation_generation():
     assert sched.should_defer_free(seq) is False
 
 
+def _page_completion(operation, *, succeeded: bool) -> ConnectorCompletion:
+    return ConnectorCompletion(DSV4_PAGE_SAVE_CHANNEL, operation, succeeded)
+
+
+def test_failed_page_save_rolls_the_watermark_back_and_re_emits():
+    """A PAGE save that never lands must not leave its range skipped forever.
+
+    The watermark is advanced where the save is *emitted*, so a save dropped on
+    admission takes a range of the prefix with it: every later incremental save
+    skips it, the PAGE boundary can never become visible, and SLOT publication
+    times out for the rest of the sequence's life. The scheduler only learns
+    this from the PAGE channel -- `finished_saving` reports the drop and the
+    success identically.
+    """
+    sched = _scheduler()
+    seq = SimpleNamespace(
+        id=730,
+        token_ids=list(range(16)),
+        block_table=[1, 2, 3, 4],
+        num_prompt_tokens=16,
+        num_cached_tokens=8,
+        has_per_req_cache=False,
+    )
+    sched._save_tracker["730"] = [seq, 0]
+
+    first = sched.build_connector_meta().requests[0]
+    assert first.save_spec.skip_leading_tokens == 0
+    assert sched._save_tracker["730"][1] == 8
+
+    # The worker dropped it (max_pending_saves). Nothing was persisted.
+    assert (
+        sched.connector_completion(
+            _page_completion(first.save_operation, succeeded=False)
+        )
+        is True
+    )
+    assert sched._save_tracker["730"][1] == 0
+    # Failure must not be counted as saved bytes.
+    assert sched.total_saved_tokens == 0
+
+    # `save_finished` still arrives, and clears the operation so the next step
+    # is free to re-emit the range the drop left behind.
+    sched.save_finished(first.save_operation)
+    assert sched._save_inflight == {}
+    assert sched.total_saved_tokens == 0
+
+    retry = sched.build_connector_meta().requests[0]
+    assert retry.save_operation != first.save_operation
+    assert retry.save_spec.skip_leading_tokens == 0
+    assert retry.token_ids == list(range(8))
+
+    # This one lands: the advance stands and the record is retired.
+    assert (
+        sched.connector_completion(
+            _page_completion(retry.save_operation, succeeded=True)
+        )
+        is True
+    )
+    assert sched._save_tracker["730"][1] == 8
+    assert sched._save_watermark_rollback == {}
+
+    sched.save_finished(retry.save_operation)
+    assert sched.total_saved_tokens == 8
+
+    seq.num_cached_tokens = 16
+    tail = sched.build_connector_meta().requests[0]
+    assert tail.save_spec.skip_leading_tokens == 8
+
+
+def test_page_watermark_records_do_not_outlive_their_request():
+    """Records are keyed by operation, so they must be dropped with the request."""
+    sched = _scheduler()
+    seq = SimpleNamespace(
+        id=731,
+        token_ids=list(range(16)),
+        block_table=[1, 2, 3, 4],
+        num_prompt_tokens=16,
+        num_cached_tokens=8,
+        has_per_req_cache=False,
+    )
+    sched._save_tracker["731"] = [seq, 0]
+    sched.build_connector_meta()
+    assert sched._save_watermark_rollback["731"]
+
+    sched.abandon_save(seq.id)
+    assert sched._save_watermark_rollback == {}
+
+    sched._save_tracker["731"] = [seq, 0]
+    sched.build_connector_meta()
+    assert sched._save_watermark_rollback["731"]
+
+    sched._save_inflight.clear()
+    sched.request_finished(seq)
+    assert sched._save_watermark_rollback == {}
+
+
+def test_worker_reports_a_page_verdict_on_every_terminal_path():
+    """A missing report strands the operation in the TP aggregator forever."""
+    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn._lock = threading.Lock()
+    conn._done_save = set()
+    conn._done_page_save = set()
+    conn._failed_page_save = set()
+    conn._done_sidecar_save = set()
+    conn._failed_sidecar_save = set()
+    conn._pending_save_ops = {}
+    conn._pending_legacy_save_ops = {}
+    conn._max_pending_saves = 4
+
+    operation = SaveOperationId(732, 0)
+    req = SimpleNamespace(
+        req_id=732,
+        token_ids=list(range(8)),
+        block_ids=[1, 2],
+        save_spec=SimpleNamespace(skip_leading_tokens=0, can_save=True),
+        slot_save_spec=None,
+        save_operation=operation,
+    )
+
+    conn._finish_unadmitted_save(req)
+
+    assert conn._failed_page_save == {operation}
+    assert conn._done_page_save == set()
+    # It is still reported as terminal on the plain saving path, so the
+    # scheduler's inflight bookkeeping still clears.
+    assert conn._done_save == {operation}
+
+    # A SLOT-only save moved no watermark and must not claim a PAGE verdict.
+    conn._failed_page_save.clear()
+    conn._done_save.clear()
+    slot_only = SimpleNamespace(
+        req_id=733,
+        token_ids=list(range(8)),
+        block_ids=[1, 2],
+        save_spec=None,
+        slot_save_spec=SimpleNamespace(boundary_tokens=8, boundary_block_hash=7),
+        save_operation=SaveOperationId(733, 0),
+    )
+    conn._finish_unadmitted_save(slot_only)
+    assert conn._failed_page_save == set()
+    assert conn._done_page_save == set()
+
+
 def test_raw_callbacks_cannot_retire_exact_active_operations():
     page_sched = _scheduler()
     page_seq = SimpleNamespace(
@@ -3740,6 +3885,8 @@ def test_worker_completes_noop_load_when_hbm_satisfies():
     conn._done_load = set()
     conn._failed_load = set()
     conn._done_save = set()
+    conn._done_page_save = set()
+    conn._failed_page_save = set()
     conn._engine = SimpleNamespace(unpinned=[])
     conn._engine.lookup_unpin = lambda lookup_id: conn._engine.unpinned.append(
         lookup_id
@@ -3765,6 +3912,8 @@ def test_worker_load_terminal_paths_report_exact_operation_once():
     conn._done_load = set()
     conn._failed_load = set()
     conn._done_save = set()
+    conn._done_page_save = set()
+    conn._failed_page_save = set()
     conn._done_sidecar_save = set()
     conn._failed_sidecar_save = set()
     conn._pending_save_ops = {}
@@ -3837,6 +3986,8 @@ def test_worker_reports_unaligned_hbm_load_as_failed_without_exception():
     conn._done_load = set()
     conn._failed_load = set()
     conn._done_save = set()
+    conn._done_page_save = set()
+    conn._failed_page_save = set()
     conn.chunk_size = 4
     conn._engine = SimpleNamespace(unpinned=[])
     conn._engine.lookup_unpin = lambda lookup_id: conn._engine.unpinned.append(
@@ -3873,6 +4024,8 @@ def test_worker_save_uses_lmcache_engine_store():
     conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
     conn._lock = threading.Lock()
     conn._done_save = set()
+    conn._done_page_save = set()
+    conn._failed_page_save = set()
     conn._pending_save_ops = {}
     conn._pending_legacy_save_ops = {}
     conn._save_req_locks = {}
@@ -3918,6 +4071,8 @@ def test_worker_save_waits_for_forward_event_before_store():
     conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
     conn._lock = threading.Lock()
     conn._done_save = set()
+    conn._done_page_save = set()
+    conn._failed_page_save = set()
     conn._pending_save_ops = {}
     conn._pending_legacy_save_ops = {}
     conn._save_req_locks = {}
@@ -3962,6 +4117,8 @@ def test_worker_load_uses_lmcache_engine_retrieve_and_marks_done():
     conn._done_load = set()
     conn._failed_load = set()
     conn._done_save = set()
+    conn._done_page_save = set()
+    conn._failed_page_save = set()
     conn.chunk_size = 4
     conn._engine = _Engine()
 
@@ -4005,6 +4162,8 @@ def test_worker_load_partial_retrieve_marks_failed():
     conn._done_load = set()
     conn._failed_load = set()
     conn._done_save = set()
+    conn._done_page_save = set()
+    conn._failed_page_save = set()
     conn.chunk_size = 4
     conn._engine = _Engine()
 
@@ -4027,6 +4186,8 @@ def test_load_exception_is_reported_as_failed_recving():
     conn._lock = threading.Lock()
     conn._done_load = set()
     conn._done_save = set()
+    conn._done_page_save = set()
+    conn._failed_page_save = set()
     conn._failed_load = set()
     req = SimpleNamespace(req_id=42)
 
