@@ -14,6 +14,7 @@ from atom.distributed.pcp_utils import (
     pcp_pad_len,
     pcp_round_robin_split,
 )
+from atom.model_ops.embed_head import empty_token_ids
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
 from atom.spec_decode.draft_kv import draft_kv_builder
 from atom.spec_decode.drafter import Drafter
@@ -142,11 +143,10 @@ class EagleProposer(Drafter):
         # does not, which is exactly the two-dimensional case.
         hc = getattr(draft_hf, "hc_mult", None)
         inputs = {
-            # int64, not the int32 of the token buffer step 0 reads: a mid-step's
-            # ids come from `compute_draft_ids`, which is an argmax. The loop
-            # rebinds `input_ids` from one to the other, so the two halves
-            # genuinely differ.
-            "input_ids": StagedInput(dtype=torch.int64),
+            # The same int32 the token buffer step 0 reads: the loop rebinds
+            # `input_ids` from that buffer to this one, and `stage` asserts the
+            # two agree.
+            "input_ids": StagedInput(dtype=torch.int32),
             "positions": StagedInput(dtype=torch.int64),
             "hidden_states": StagedInput(
                 shape=(
@@ -186,7 +186,7 @@ class EagleProposer(Drafter):
             input_ids=input_ids, positions=positions, hidden_states=hidden_states
         )
 
-    def _step_head(self, out, running_bs, *, input_ids, hidden_states, **_):
+    def _step_head(self, fwd_out, running_bs, *, input_ids, hidden_states, **_):
         """The mid-step's draft ids, recorded with the backbone that made them.
 
         Both come back because the next mid-step reads the hidden states and
@@ -195,10 +195,13 @@ class EagleProposer(Drafter):
         is the caller's, on the way out.
         """
         if self._reuse_step_buffers:
-            hidden_states.copy_(out[:running_bs])
+            hidden_states.copy_(fwd_out[:running_bs])
             self.model.compute_draft_ids(hidden_states, out=input_ids)
             return hidden_states, input_ids
-        return out, self.model.compute_draft_ids(out)
+        # No fixed storage on this flavor, so the ids land in the graph's own
+        # pool -- where `argmax`'s result landed before.
+        ids = empty_token_ids(fwd_out)
+        return fwd_out, self.model.compute_draft_ids(fwd_out, out=ids)
 
     def _build_draft_model(self, model_class) -> nn.Module:
         draft_model_hf_config = self.speculative_config.draft_model_hf_config
@@ -544,9 +547,12 @@ class EagleProposer(Drafter):
         else:
             hidden_states = target_hidden_states
 
+        # Step-major while the loop fills it: `draft_token_ids[i]` is then a
+        # contiguous row, and the id-consuming Triton kernels (masked embedding,
+        # the fp8 MTP prologue) index at unit stride. Transposed on the way out.
         draft_token_ids = torch.empty(
-            scheduled_bs,
             self.mtp_k,
+            scheduled_bs,
             dtype=next_token_ids.dtype,
             device=next_token_ids.device,
         )
@@ -668,55 +674,26 @@ class EagleProposer(Drafter):
                         if self._reuse_step_buffers
                         else None
                     )
-                    sample_hidden_states = (
-                        torch.index_select(
-                            ret_hidden_states,
-                            0,
-                            last_token_indices,
-                            out=hidden_out,
-                        )
-                        if hidden_out is not None
-                        else torch.index_select(
-                            ret_hidden_states, 0, last_token_indices
-                        )
+                    # out=None is index_select's own default: it allocates.
+                    sample_hidden_states = torch.index_select(
+                        ret_hidden_states, 0, last_token_indices, out=hidden_out
                     )
                 else:
                     sample_hidden_states = ret_hidden_states[:scheduled_bs]
-                # Only step 0 and a flavor with no declared pass land here; a
-                # recorded mid-step produced its ids inside the graph.
-                # Every draft model EagleProposer can build implements this --
-                # the DSpark archs in support_draft_model_arch_dict do not, but
-                # they are DSparkProposer's and never reach this loop. All of
-                # them reduce per vocab shard and all-gather only [N, 2] rather
-                # than the full [N, vocab] logits, which is token-identical to
-                # compute_logits().argmax(-1) here because is_draft suppresses
-                # the LM head's prefill last-token slice. How the ids are
-                # produced stays the model's business, not this loop's.
-                ids_out = (
-                    self.step.buffer("input_ids", scheduled_bs)
-                    if self._reuse_step_buffers
-                    and graphed_ids is None
-                    and i + 1 < self.mtp_k
-                    else None
-                )
+                # This step's row is owned storage -- the assembled matrix's
+                # async D2H reads it while later replays run.
+                exported = draft_token_ids[i]
                 if graphed_ids is not None:
                     next_input_ids = graphed_ids[:scheduled_bs]
-                    # The fixed ids feed the next replay, but exported draft ids
-                    # need owned storage that a later replay cannot overwrite
-                    # while their assembled matrix is copied to the host.
-                    new_draft_ids = (
-                        next_input_ids.clone()
-                        if self._reuse_step_buffers
-                        else next_input_ids
-                    )
+                    exported.copy_(next_input_ids)
                 else:
-                    new_draft_ids = (
-                        self.model.compute_draft_ids(sample_hidden_states, out=ids_out)
-                        if ids_out is not None
-                        else self.model.compute_draft_ids(sample_hidden_states)
+                    # Every draft model EagleProposer can build implements this
+                    # (DSpark's do not, but they never reach here), and it is
+                    # token-identical to compute_logits().argmax(-1) because
+                    # is_draft suppresses the LM head's prefill last-token slice.
+                    next_input_ids = self.model.compute_draft_ids(
+                        sample_hidden_states, out=exported
                     )
-                    next_input_ids = new_draft_ids
-                draft_token_ids[:, i] = new_draft_ids
 
                 if i < self.mtp_k - 1:
                     do_attn_metadata_update = (
@@ -820,5 +797,5 @@ class EagleProposer(Drafter):
                     hidden_states = sample_hidden_states
 
         # self.runner.debug(f"final {draft_token_ids=}")
-        # [batch_size, mtp_k]
-        return draft_token_ids
+        # [batch_size, mtp_k], contiguous: every consumer indexes by sequence.
+        return draft_token_ids.t().contiguous()
