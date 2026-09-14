@@ -53,29 +53,28 @@ def test_events_are_polled_without_waiting_and_reused_only_after_completion():
         pass
     assert len(metrics.pending) == 2
     # A different stream may complete the second pair before the first.
-    for event in metrics.pending[1][1:3]:
+    for event in metrics.pending[1][:2]:
         event.ready = True
     snapshot = metrics.snapshot()
     assert len(metrics.pending) == 2
     assert not metrics.free
-    assert snapshot["phases"]["prefill"]["sum"] == 0
-    assert snapshot["phases"]["decode"]["sum"] == 0
+    assert snapshot["steps"]["sum"] == 0
     complete_event(metrics)
     snapshot = metrics.snapshot()
     assert not metrics.pending
-    assert snapshot["phases"]["prefill"]["sum"] == 0.008
-    assert snapshot["phases"]["decode"]["sum"] == 0.008
+    assert snapshot["steps"]["sum"] == 0.016
+    assert snapshot["steps"]["buckets"][-1][1] == 2
     reused = tuple(metrics.free[-1])
     with metrics.measure(batch(prefill=1, decode=1)):
         pass
-    assert tuple(metrics.pending[-1][1:3]) == reused
-    for _, start, end, _ in metrics.pending:
+    assert tuple(metrics.pending[-1][:2]) == reused
+    for start, end, _ in metrics.pending:
         start.ready = end.ready = True
     snapshot = metrics.snapshot()
     assert len(metrics.pending) == 0
-    assert snapshot["phases"]["decode"]["sum"] == 0.008
-    assert snapshot["phases"]["mixed"]["sum"] == 0.008
-    assert metrics.snapshot()["phases"] == snapshot["phases"]
+    assert snapshot["steps"]["sum"] == 0.024
+    assert snapshot["steps"]["buckets"][-1][1] == 3
+    assert metrics.snapshot()["steps"] == snapshot["steps"]
 
 
 def test_poll_checks_only_the_unfinished_head_of_a_full_queue():
@@ -83,13 +82,13 @@ def test_poll_checks_only_the_unfinished_head_of_a_full_queue():
     for _ in range(256):
         with metrics.measure(batch()):
             pass
-    for index, (_, start, end, _) in enumerate(metrics.pending):
+    for index, (start, end, _) in enumerate(metrics.pending):
         start.ready = end.ready = index > 0
         end.queries = 0
     metrics.poll()
-    assert [end.queries for _, _, end, _ in metrics.pending] == [1] + [0] * 255
+    assert [end.queries for _, end, _ in metrics.pending] == [1] + [0] * 255
     assert not metrics.free
-    assert metrics.histograms["decode"].snapshot()["sum"] == 0
+    assert metrics.steps.snapshot()["sum"] == 0
 
 
 def test_warmup_dummy_failure_and_decorator_do_not_create_spurious_samples():
@@ -111,6 +110,47 @@ def test_warmup_dummy_failure_and_decorator_do_not_create_spurious_samples():
     assert model(SimpleNamespace(gpu_forward_metrics=metrics), 4, batch()) == 5
     metrics.poll()
     assert len(metrics.pending) == 1
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
+def test_failed_forwards_recycle_events_and_successful_retry_is_measured(error_type):
+    created = []
+
+    def event_factory():
+        event = Event()
+        created.append(event)
+        return event
+
+    metrics = GPUForwardMetrics(event_factory)
+    empty = metrics.snapshot()
+    for req_id in range(16):
+        error = error_type("forward failed")
+        with (
+            pytest.raises(error_type) as caught,
+            metrics.measure(prefill_batch((req_id, 1, True))),
+        ):
+            raise error
+        assert caught.value is error
+        assert len(created) == 2
+        assert metrics.free == [tuple(created)]
+        assert not metrics.pending and not metrics.requests
+        assert metrics.snapshot() == empty
+
+    start, end = created
+    assert (start.recorded, end.recorded) == (16, 0)
+    with metrics.measure(prefill_batch((16, 1, True))):
+        pass
+    assert len(created) == 2
+    assert (start.recorded, end.recorded) == (17, 1)
+    assert not metrics.free
+    assert metrics.snapshot() == empty  # The successful forward is not ready yet.
+    complete_event(metrics, milliseconds=12)
+    snapshot = metrics.snapshot()
+    for histogram in (snapshot["steps"], snapshot["prefill_requests"]):
+        assert histogram["buckets"][-1][1] == 1
+        assert histogram["sum"] == pytest.approx(0.012)
+    assert metrics.free == [(start, end)]
+    assert not metrics.pending and not metrics.requests
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -184,8 +224,8 @@ def test_device_events_measure_graph_replay_on_a_nondefault_stream():
     stream.synchronize()
     snapshot = metrics.snapshot()
     assert len(metrics.pending) == 0
-    assert snapshot["phases"]["decode"]["buckets"][-1][1] == 1
-    assert snapshot["phases"]["decode"]["sum"] > 0
+    assert snapshot["steps"]["buckets"][-1][1] == 1
+    assert snapshot["steps"]["sum"] > 0
     assert output[0, 0].item() == 64
 
 
@@ -198,9 +238,74 @@ def prefill_batch(*chunks, decode=0):
 
 
 def complete_event(metrics, index=0, milliseconds=8):
-    _, start, end, _ = metrics.pending[index]
+    start, end, _ = metrics.pending[index]
     start.duration_ms = milliseconds
     start.ready = end.ready = True
+
+
+def test_step_buckets_match_the_pooled_forward_modes():
+    from collections import defaultdict
+
+    from prometheus_client import CollectorRegistry, Histogram
+    from prometheus_client.parser import text_string_to_metric_families
+
+    from atom.entrypoints.openai.metrics_setup import create_metrics_exporter
+    from atom.utils.histogram import LATENCY_BUCKETS
+
+    registry = CollectorRegistry()
+    reference = Histogram(
+        "reference",
+        "Previously separate forward modes.",
+        ["phase"],
+        buckets=LATENCY_BUCKETS,
+        registry=registry,
+    )
+    metrics = GPUForwardMetrics(Event)
+    for phase, prefill, decode, milliseconds in (
+        ("prefill", 1, 0, 0.5),
+        ("decode", 0, 1, 8),
+        ("mixed", 1, 1, 12),
+        ("prefill", 1, 0, 800_000),
+    ):
+        with metrics.measure(batch(prefill=prefill, decode=decode)):
+            pass
+        complete_event(metrics, milliseconds=milliseconds)
+        metrics.poll()
+        reference.labels(phase).observe(milliseconds / 1000)
+
+    expected = defaultdict(float)
+    for family in registry.collect():
+        for sample in family.samples:
+            suffix = sample.name.removeprefix("reference")
+            if suffix != "_created":
+                bound = sample.labels.get("le")
+                expected[
+                    (suffix, None if bound is None else float(bound))
+                ] += sample.value
+
+    exporter, _, _ = create_metrics_exporter()
+    exporter.update(
+        {
+            "forward_metrics": [
+                dict(
+                    metrics.snapshot(),
+                    dp_rank=0,
+                    pp_rank=0,
+                    tp_rank=0,
+                    engine_role="default",
+                )
+            ]
+        }
+    )
+    actual = {}
+    for family in text_string_to_metric_families(exporter.render().decode()):
+        for sample in family.samples:
+            if sample.name.startswith("atom:gpu_forward_seconds_"):
+                assert "phase" not in sample.labels
+                suffix = sample.name.removeprefix("atom:gpu_forward_seconds")
+                bound = sample.labels.get("le")
+                actual[(suffix, None if bound is None else float(bound))] = sample.value
+    assert actual == pytest.approx(dict(expected))
 
 
 def test_request_sum_waits_for_every_chunk_even_if_last_event_finishes_first():
@@ -212,12 +317,12 @@ def test_request_sum_waits_for_every_chunk_even_if_last_event_finishes_first():
     complete_event(metrics, 0, 10)
     first = metrics.snapshot()
     assert first["prefill_requests"]["buckets"][-1][1] == 0
-    assert first["phases"]["prefill"]["sum"] == pytest.approx(0.010)
+    assert first["steps"]["sum"] == pytest.approx(0.010)
     complete_event(metrics, 0, 12)
     final = metrics.snapshot()
     assert final["prefill_requests"]["sum"] == pytest.approx(0.030)
     assert final["prefill_requests"]["buckets"][-1][1] == 1
-    assert final["phases"]["prefill"]["buckets"][-1][1] == 3
+    assert final["steps"]["buckets"][-1][1] == 3
     assert not metrics.requests
     for _ in range(2):
         assert metrics.snapshot()["prefill_requests"] == final["prefill_requests"]
@@ -232,7 +337,7 @@ def test_shared_mixed_batch_time_counts_in_full_for_each_prefill_request():
     first = metrics.snapshot()
     assert first["prefill_requests"]["sum"] == pytest.approx(0.010)
     assert first["prefill_requests"]["buckets"][-1][1] == 1
-    assert first["phases"]["mixed"]["buckets"][-1][1] == 1
+    assert first["steps"]["buckets"][-1][1] == 1
     with metrics.measure(prefill_batch((2, 2, True))):
         pass
     complete_event(metrics, milliseconds=5)
@@ -362,7 +467,7 @@ def test_scheduler_does_not_track_gpu_chunks_by_default(monkeypatch):
     assert not seq.prefill_gpu_complete
 
 
-def test_request_gpu_histogram_export_is_per_worker_and_backward_compatible():
+def test_gpu_histogram_export_keeps_all_workers_and_optional_request_data():
     from prometheus_client.parser import text_string_to_metric_families
 
     from atom.entrypoints.openai.metrics_setup import create_metrics_exporter

@@ -191,7 +191,7 @@ def test_prefill_context_panels_use_token_histograms_and_instance_filters(deploy
 def test_request_gpu_time_uses_completed_request_histograms_and_instance_filters():
     panels = {p["id"]: p for p in report.panels_for("pd")}
     request = panels["prefill_request_gpu_forward"]
-    assert request["title"] == "Prefill request GPU forward"
+    assert request["title"] == "Prefill GPU per-request"
     assert request["category"] == "latency" and request["unit"] == "ms"
     assert not request["overview"]
     assert sum(p["overview"] for p in panels.values()) == 8

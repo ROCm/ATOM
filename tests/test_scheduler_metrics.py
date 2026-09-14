@@ -663,7 +663,7 @@ def test_worker_snapshots_include_all_pp_tp_workers_without_duplicate_queues():
     from atom.model_engine.gpu_metrics import GPUForwardMetrics
 
     worker = GPUForwardMetrics(lambda: None).snapshot()
-    worker["phases"]["prefill"] = {
+    worker["steps"] = {
         "buckets": [(0.1, 1), (float("inf"), 1)],
         "sum": 0.08,
     }
@@ -695,7 +695,7 @@ def test_worker_snapshots_include_all_pp_tp_workers_without_duplicate_queues():
     counts = {
         labels: v
         for (name, labels), v in samples(exporter).items()
-        if name == "atom:gpu_forward_seconds_count" and ("phase", "prefill") in labels
+        if name == "atom:gpu_forward_seconds_count"
     }
     assert len(counts) == 4 and set(counts.values()) == {1}
     before, after = samples(exporter), samples(exporter)

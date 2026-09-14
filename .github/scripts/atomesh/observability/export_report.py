@@ -193,11 +193,11 @@ def panels_for(deployment: str) -> list[dict]:
                 {
                     **common,
                     "id": f"{role}_gpu_forward",
-                    "title": f"{role.title()} GPU forward",
+                    "title": f"{role.title()} GPU per-step",
                     "label": f"{role.upper()} · GPU WORKERS",
                     "unit": "ms",
                     "metric": "atom:gpu_forward_seconds",
-                    "detail": "Per-worker target forward · includes GPU stream communication/waits · excludes input prep, sampling and drafting",
+                    "detail": "One observation per worker forward step · includes GPU stream communication/waits · excludes input prep, sampling and drafting",
                 },
             ]
         )
@@ -206,7 +206,7 @@ def panels_for(deployment: str) -> list[dict]:
         {
             "id": f"{role}_request_gpu_forward",
             "role": role,
-            "title": "Prefill request GPU forward",
+            "title": "Prefill GPU per-request",
             "label": f"{role.upper()} · GPU WORKERS",
             "detail": "Sum of participating batch times across initial prefill chunks · once per completed request per worker · shared batch time, not exclusive compute",
             "metric": "atom:prefill_request_gpu_forward_seconds",

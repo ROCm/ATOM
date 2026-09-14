@@ -28,10 +28,7 @@ class GPUForwardMetrics:
         self.max_pending = max_pending
         self.pending = deque()
         self.free = []
-        self.histograms = {
-            phase: CumulativeHistogram(LATENCY_BUCKETS)
-            for phase in ("prefill", "decode", "mixed")
-        }
+        self.steps = CumulativeHistogram(LATENCY_BUCKETS)
         self.prefill_requests = CumulativeHistogram(LATENCY_BUCKETS)
         self.max_requests = max_requests
         self.requests = OrderedDict()
@@ -68,12 +65,12 @@ class GPUForwardMetrics:
         # Stop at the first unfinished event instead of scanning the backlog.
         # Other streams may finish sooner; their samples wait for the head.
         while self.pending:
-            phase, start, end, requests = self.pending[0]
+            start, end, requests = self.pending[0]
             if not end.query():
                 break
             self.pending.popleft()
             seconds = start.elapsed_time(end) / 1000
-            self.histograms[phase].observe(seconds)
+            self.steps.observe(seconds)
             for state in requests:
                 state.pending -= 1
                 if not state.valid:
@@ -97,9 +94,6 @@ class GPUForwardMetrics:
                 self._discard_request(state.req_id)
             yield
             return
-        p = batch.total_seqs_num_prefill > 0
-        d = batch.total_seqs_num_decode > 0
-        phase = "mixed" if p and d else "prefill" if p else "decode"
         start, end = (
             self.free.pop()
             if self.free
@@ -112,13 +106,16 @@ class GPUForwardMetrics:
         except BaseException:
             for state in requests:
                 self._discard_request(state.req_id)
+            # No pending sample owns this pair; record() replaces its state
+            # when the next forward reuses it.
+            self.free.append((start, end))
             raise
-        self.pending.append((phase, start, end, requests))
+        self.pending.append((start, end, requests))
 
     def snapshot(self):
         self.poll()
         return {
-            "phases": {k: h.snapshot() for k, h in self.histograms.items()},
+            "steps": self.steps.snapshot(),
             "prefill_requests": self.prefill_requests.snapshot(),
         }
 
@@ -143,8 +140,8 @@ def collect_gpu_metrics(snapshot):
     labels = ["dp_rank", "pp_rank", "tp_rank", "engine_role"]
     duration = HistogramMetricFamily(
         "atom:gpu_forward_seconds",
-        "Per-worker target forward device-event duration, including stream communication/waits; excludes input preparation, sampling and drafting.",
-        labels=[*labels, "phase"],
+        "Per-worker target forward step device-event duration, including stream communication/waits; excludes input preparation, sampling and drafting.",
+        labels=labels,
     )
     request_duration = HistogramMetricFamily(
         "atom:prefill_request_gpu_forward_seconds",
@@ -153,12 +150,12 @@ def collect_gpu_metrics(snapshot):
     )
     for worker in workers:
         values = [str(worker[k]) for k in labels]
-        for phase, hist in worker["phases"].items():
-            duration.add_metric(
-                [*values, phase],
-                buckets=prometheus_buckets(hist),
-                sum_value=hist["sum"],
-            )
+        hist = worker["steps"]
+        duration.add_metric(
+            values,
+            buckets=prometheus_buckets(hist),
+            sum_value=hist["sum"],
+        )
         if "prefill_requests" in worker:
             hist = worker["prefill_requests"]
             request_duration.add_metric(
