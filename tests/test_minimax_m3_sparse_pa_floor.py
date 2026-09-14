@@ -23,8 +23,8 @@ pytest.importorskip("triton", reason="sparse_attn defines @triton.jit kernels")
 pytest.importorskip("aiter", reason="the floor reads aiter's own split ladder")
 
 import torch
-
 from aiter.ops.triton.gluon import pa_decode_gluon
+
 from atom.model_ops.minimax_m3 import sparse_attn
 
 
@@ -92,9 +92,6 @@ def test_real_device_agrees_with_aiter(monkeypatch):
         pytest.skip("needs a device to read multi_processor_count")
     sparse_attn._gluon_one_pass_max_rows.cache_clear()
     cus = torch.cuda.get_device_properties(0).multi_processor_count
-    expected = max(
-        1,
-        cus * pa_decode_gluon.get_occupancy()
-        // pa_decode_gluon.get_recommended_splits(1, 1),
-    )
+    budget = cus * pa_decode_gluon.get_occupancy()
+    expected = max(1, budget // pa_decode_gluon.get_recommended_splits(1, 1))
     assert sparse_attn._gluon_one_pass_max_rows(0) == expected
