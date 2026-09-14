@@ -101,7 +101,6 @@ class BlockPool:
         self._cached: OrderedDict[int, None] = OrderedDict()
         self._free: set[int] = set(range(num_blocks))
         self._used: set[int] = set()
-        self._num_reusable_free = 0
         # Raw PAGE units reserved by multi-unit objects such as state checkpoints.
         self._raw_unit_owner: dict[int, tuple[Hashable, int]] = {}
         # Reusable content this pool destroyed, split by what destroyed it.
@@ -150,10 +149,9 @@ class BlockPool:
         vacant blocks remain this is slack, and once they are gone every
         allocation spends one of these. `num_free - num_reusable_free` is the
         vacant count, which is the number that actually has to reach zero
-        before `blocks_evicted` can start moving. Maintained as ownership and
-        hashes change so scheduler metrics never scan the free list.
+        before `blocks_evicted` can start moving.
         """
-        return self._num_reusable_free
+        return len(self._cached) + len(self._protected)
 
     def eviction_stats(self) -> dict[str, int]:
         """Content this pool destroyed, and the headroom it has left.
@@ -180,10 +178,7 @@ class BlockPool:
     def publish(self, block_id: int, h: int, token_ids: array.array) -> None:
         """Index `block_id` under the content hash of the tokens it now holds."""
         block = self.blocks[block_id]
-        was_cached = block.hash != -1
         block.update(h, token_ids)
-        if block_id in self._free:
-            self._num_reusable_free += int(h != -1) - int(was_cached)
         self._hash_to_block_id[h] = block_id
 
     def clear_index(self) -> None:
@@ -203,7 +198,6 @@ class BlockPool:
         self._cached.clear()
         self._protected.clear()
         self._reused.clear()
-        self._num_reusable_free = 0
         self._vacant = sorted(self._free)
         heapify(self._vacant)
 
@@ -224,8 +218,6 @@ class BlockPool:
             dropped = True
             if self._on_evict is not None:
                 self._on_evict(block.hash)
-        if block_id in self._free and block.hash != -1:
-            self._num_reusable_free -= 1
         block.hash = -1
         block.token_ids = array.array("i")
         return dropped
@@ -250,13 +242,11 @@ class BlockPool:
             block_id, _ = self._cached.popitem(last=False)
             if block_id in self._free and self.blocks[block_id].hash != -1:
                 self._free.discard(block_id)
-                self._num_reusable_free -= 1
                 return block_id
         while self._protected:
             block_id, _ = self._protected.popitem(last=False)
             if block_id in self._free and self.blocks[block_id].hash != -1:
                 self._free.discard(block_id)
-                self._num_reusable_free -= 1
                 return block_id
         return -1
 
@@ -274,9 +264,7 @@ class BlockPool:
         the end — see the class doc. The vacant half is ordered by id, where a
         leftover entry is only a wasted pop.
         """
-        if block_id in self._free:
-            self._num_reusable_free -= int(self.blocks[block_id].hash != -1)
-            self._free.remove(block_id)
+        self._free.discard(block_id)
         self._cached.pop(block_id, None)
         self._protected.pop(block_id, None)
 
@@ -322,7 +310,6 @@ class BlockPool:
         self._used.remove(block_id)
         self._free.add(block_id)
         if block.hash != -1:
-            self._num_reusable_free += 1
             if block_id in self._reused:
                 self._protected[block_id] = None
                 self._trim_protected()
