@@ -12,23 +12,23 @@ which is what the workload needs at high concurrency.
 - Scenario: `inferencex-agentx-mvp`, dataset `semianalysis_cc_traces_weka_062126`
 - Router: `atomesh`, PD mode, `idx2idx` rank mapping
 
-Two variants, split at concurrency 64:
+Three bands, contiguous:
 
-| variant | concurrency | CPU offload |
-|---|---|---|
-| TP | 1 – 48 | not needed |
-| DP attention | 64 and up | required from 256 |
+| band | concurrency | attention | CPU offload |
+|---|---|---|---|
+| **A** | 1 – 48 | TP | no |
+| **B** | 64 – 128 | DP | no |
+| **C** | 256 and up | DP | **yes, 1024 GiB** |
 
-The bands are contiguous. They differ by two flags, four environment variables,
-and two sizing values — listed under *What changes between TP and DPA* below.
+A → B is two flags, four environment variables and a memory fraction. B → C adds
+only the offload tier on the prefill node — the server flags do not change.
 
-The PD sweep in *Measured* covers TP at 1–16 and DPA at 64–256; the 17–48 part
-of the TP band follows the single-node recipe, where TP at c=48 is measured and
-sits just under DP at c=64 (20,308 against 21,888 tok/s/chip). If you are
-running between 16 and 48 here, that crossover is inherited rather than
-re-measured on two nodes.
+The PD sweep in *Measured* covers band A at 1–16 and bands B and C at 64–256.
+The 17–48 part of band A follows the single-node recipe, where TP at c=48 is
+measured and sits just under DP at c=64 (20,308 against 21,888 tok/s/chip); that
+crossover is inherited rather than re-measured on two nodes.
 
-## Server — TP (concurrency 1 – 48)
+## Band A — TP, no offload (concurrency 1 – 48)
 
 ```bash
 export AITER_BF16_FP8_MOE_BOUND=0
@@ -81,24 +81,20 @@ atomesh launch --host 0.0.0.0 --port 8000 --pd-disaggregation \
   --request-timeout-secs 1800
 ```
 
-## Server — DP attention (concurrency 64 and up)
+## Band B — DP attention, no offload (concurrency 64 – 128)
 
-Everything above, plus four environment variables, two flags, and different
-sizing. On the **prefill** node add the CPU offload tier as well.
+Band A plus four environment variables, two flags, and a higher memory fraction.
+No offload tier: at these concurrencies the HBM prefix cache carries the reuse on
+its own (measured hit 96.1% at c=64, 94.7% at c=128).
 
 ```bash
-# ...the TP exports above, plus:
+# ...the band A exports above, plus:
 export ATOM_NUMA_BIND=1
 export GPU_MAX_HW_QUEUES=5
 export ATOM_DP_SESSION_AFFINITY=1
 export ATOM_DP_LB_REQ_EQUIV=512
 export ATOM_DP_MASTER_PORT=29510
 export ATOM_DP_BASE_PORT=29610
-
-# CPU offload — prefill node only. See "The offload settings that matter".
-export OFFLOAD_COPY_WORKERS=1
-export OFFLOAD_MIN_LOAD_TOKENS=8192
-export OFFLOAD_SLOT_STAGING_SLOTS=4
 
 python3 -m atom.entrypoints.openai_server \
   --model $MODEL_PATH --served-model-name deepseek-ai/DeepSeek-V4-Pro \
@@ -120,8 +116,23 @@ python3 -m atom.entrypoints.openai_server \
 `--enable-tbo` (two-batch overlap) goes on the **prefill node only**. The decode
 node runs DP attention without it, and at `--gpu-memory-utilization 0.70`.
 
-Prefill `$KV_TRANSFER` for this band wraps Mooncake and the offload tier in a
-`multi` connector:
+`$KV_TRANSFER` is the same plain Mooncake pair as band A.
+
+## Band C — DP attention with CPU offload (concurrency 256 and up)
+
+Identical server flags to band B. The only change is on the **prefill** node:
+three more environment variables, and a `multi` connector that puts the offload
+tier alongside Mooncake.
+
+```bash
+# ...all band B exports, plus (prefill node only):
+export OFFLOAD_COPY_WORKERS=1
+export OFFLOAD_MIN_LOAD_TOKENS=8192
+export OFFLOAD_SLOT_STAGING_SLOTS=4
+```
+
+Prefill `$KV_TRANSFER` wraps Mooncake and the offload tier in a `multi`
+connector:
 
 ```jsonc
 {"kv_connector": "multi", "connectors": [
@@ -146,7 +157,7 @@ tier.
 host memory. Refuse to start unless `psutil.virtual_memory().available` clears
 `8 × size + 256` GiB.
 
-Router for this band:
+Router for bands B and C (same line for both):
 
 ```bash
 atomesh launch --host 0.0.0.0 --port 8000 --pd-disaggregation \
@@ -263,25 +274,33 @@ aiperf profile --scenario inferencex-agentx-mvp \
 Host memory: `lmcache.max_local_cpu_size` is per worker, so the prefill node
 needs 8 × 128 GiB = 1024 GiB free before the server starts.
 
-## What changes between TP and DPA
+## What changes between the bands
 
-Everything else in the two commands is identical. This is the whole delta:
+Everything not listed is identical across all three.
 
-| | TP | DPA |
-|---|---|---|
-| `--enable-dp-attention` | absent | **present** |
-| `--enable-tbo` | absent | **present** (prefill only) |
-| `--max-num-seqs` | `2 × CONC` | `2 × CONC` |
-| `--gpu-memory-utilization` (prefill) | 0.65 | **0.75** |
-| `ATOM_NUMA_BIND` | unset | **1** |
-| `GPU_MAX_HW_QUEUES` | unset | **5** |
-| `ATOM_DP_SESSION_AFFINITY` | unset | **1** |
-| `ATOM_DP_LB_REQ_EQUIV` | unset | **512** |
-| router | `--policy random` | `--dp-aware --policy dp_sticky --atom-pd-rank-mapping-policy idx2idx` |
+| | A (TP) | B (DP) | C (DP + offload) |
+|---|---|---|---|
+| `--enable-dp-attention` | absent | **present** | present |
+| `--enable-tbo` (prefill only) | absent | **present** | present |
+| `--gpu-memory-utilization` (prefill) | 0.65 | **0.75** | 0.75 |
+| `--max-num-seqs` | `2 × CONC` | `2 × CONC` | `2 × CONC` |
+| `ATOM_NUMA_BIND` | unset | **1** | 1 |
+| `GPU_MAX_HW_QUEUES` | unset | **5** | 5 |
+| `ATOM_DP_SESSION_AFFINITY` | unset | **1** | 1 |
+| `ATOM_DP_LB_REQ_EQUIV` | unset | **512** | 512 |
+| `OFFLOAD_*` (prefill only) | unset | unset | **set, 3 vars** |
+| prefill `kv-transfer-config` | mooncake | mooncake | **multi: mooncake + offload** |
+| router | `--policy random` | `--dp-aware --policy dp_sticky --atom-pd-rank-mapping-policy idx2idx` | same as B |
 
-`ATOM_DP_SESSION_AFFINITY=1` is what makes the DP router keep a trajectory on
-one rank, which is what the agentic scenario's prefix reuse depends on. Without
-it the DP band loses most of its cache hit.
+Two of these carry more weight than the rest.
+
+`ATOM_DP_SESSION_AFFINITY=1` keeps a trajectory on one rank, which is what the
+agentic scenario's prefix reuse depends on. Without it bands B and C lose most
+of their cache hit.
+
+**B → C is purely additive.** The server flags do not change; only the prefill
+node gains the offload tier. So moving between them is a config swap on one
+node, not a redeploy.
 
 ## The offload settings that matter
 
@@ -391,21 +410,22 @@ deliberately excludes a PAGE-only hit or an HBM prefix-cache hit.
 prefix-cache reads rather than compute. `x` is AIPerf's
 `Output Token Throughput Per User` at p90.
 
-| conc | mode | offload | tok/s/chip | x (tok/s/user) | ITL p90 | TTFT p90 | cache hit |
-|---|---|---|---|---|---|---|---|
-| 1 | TP | — | 737 | 149.3 | 7.5 ms | 1.9 s | 96.8% |
-| 2 | TP | — | 789 | 145.8 | 7.7 ms | 1.6 s | 95.6% |
-| 8 | TP | — | 2,512 | 138.9 | 9.2 ms | 1.6 s | 97.1% |
-| 16 | TP | — | 4,442 | 123.1 | 11.8 ms | 2.0 s | 96.6% |
-| 64 | DPA | — | 15,137 | 69.1 | 19.4 ms | 7.8 s | 96.1% |
-| **128** | DPA | — | **21,652** | 57.5 | 29.6 ms | 15.0 s | 94.7% |
-| 256 | DPA | defaults | 21,599 | 56.2 | 31.0 ms | 192.8 s | 91.0% |
-| **256** | **DPA** | **tuned** | **30,686** | 35.1 | 34.3 ms | **36.0 s** | **94.6%** |
+| band | conc | tok/s/chip | x (tok/s/user) | ITL p90 | TTFT p90 | cache hit |
+|---|---|---|---|---|---|---|
+| A | 1 | 737 | 149.3 | 7.5 ms | 1.9 s | 96.8% |
+| A | 2 | 789 | 145.8 | 7.7 ms | 1.6 s | 95.6% |
+| A | 8 | 2,512 | 138.9 | 9.2 ms | 1.6 s | 97.1% |
+| A | 16 | 4,442 | 123.1 | 11.8 ms | 2.0 s | 96.6% |
+| B | 64 | 15,137 | 69.1 | 19.4 ms | 7.8 s | 96.1% |
+| **B** | **128** | **21,652** | 57.5 | 29.6 ms | 15.0 s | 94.7% |
+| C† | 256 | 21,599 | 56.2 | 31.0 ms | 192.8 s | 91.0% |
+| **C** | **256** | **30,686** | 35.1 | 34.3 ms | **36.0 s** | **94.6%** |
 
-The last row is the configuration this recipe documents; the one above it is the
-same run with `max_pending_saves=2` and `slot_sidecar_staging_slots=1`. Every
-other row also used those defaults, so the 64 and 128 cells have headroom that
-has not been re-measured.
+† offload defaults (`max_pending_saves=2`, `slot_sidecar_staging_slots=1`) rather
+than the values in this recipe. Kept as the before/after pair.
+
+The last row is the configuration this recipe documents. Band B rows carry no
+offload tier at all, so the settings section below does not apply to them.
 
 Three caveats on that pair. The tuned run sampled a longer trace
 (`isl` p50 84,176 against 71,141), and `tok/s/chip` counts input tokens, so
