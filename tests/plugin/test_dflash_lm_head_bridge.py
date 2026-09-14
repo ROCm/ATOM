@@ -51,10 +51,10 @@ class _AtomHead:
         self._full_weight = full_weight
         self.calls = 0
 
-    def compute_argmax_token(self, x: torch.Tensor) -> torch.Tensor:
+    def compute_argmax_token(self, x: torch.Tensor, *, out: torch.Tensor):
         # Emulate the all-gathered global reduction ATOM performs across ranks.
         self.calls += 1
-        return torch.argmax(torch.matmul(x, self._full_weight.T), dim=-1).to(torch.long)
+        return out.copy_(torch.argmax(torch.matmul(x, self._full_weight.T), dim=-1))
 
 
 class _PlainHead:
@@ -178,18 +178,18 @@ def test_patch_handles_empty_input(dflash_module):
     assert out.dtype == torch.long
 
 
-def test_patch_rejects_bad_shape_from_head(dflash_module):
-    """A head returning the wrong shape must fail loudly, not silently corrupt
-    the draft block."""
+def test_patch_rejects_a_head_that_ignores_the_output_storage(dflash_module):
+    """A head answering somewhere other than ``out`` must fail loudly, not hand
+    the draft block a buffer nobody wrote."""
     weight, hidden = _inputs(seed=11)
 
     class _BadHead(_AtomHead):
-        def compute_argmax_token(self, x):
-            return torch.zeros(x.shape[0] + 1, dtype=torch.long)
+        def compute_argmax_token(self, x, *, out):
+            return torch.zeros(x.shape[0], dtype=torch.int32)
 
     install_dflash_lm_head_patch()
     worker = dflash_module.DFlashWorkerV2()
-    with pytest.raises(ValueError, match="invalid shape"):
+    with pytest.raises(ValueError, match="did not answer into"):
         worker._greedy_sample_from_vocab_parallel_head(
             hidden_states=hidden, lm_head=_BadHead(weight, tp_rank=0)
         )
