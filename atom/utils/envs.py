@@ -173,7 +173,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # max_num_batched_tokens, so a fixed row count would not adapt to total_kv
     # (see GLM-5.2 OOM #1376) — a memory budget does. Each chunk still scores
     # the full KV, so every row's top-k is exact (no cross-chunk merge). Set to
-    # 0 to disable chunking (always single-shot).
+    # 0 to disable this soft budget; chunking still enforces aiter's hard 2 GiB
+    # buffer-descriptor cap, above which the kernel fails to compile and aborts
+    # the process (see atom/model_ops/sparse_indexer_chunk.py).
     "ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB": lambda: int(
         os.getenv("ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB", "2048")
     ),
