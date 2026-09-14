@@ -803,17 +803,20 @@ def get_generation_config(model: str) -> GenerationConfig:
 
 
 def _is_minimax_m3_config(hf_config: PretrainedConfig) -> bool:
-    architectures = getattr(hf_config, "architectures", None) or ()
-    if any("MiniMaxM3" in arch for arch in architectures):
-        return True
     text_config = getattr(hf_config, "text_config", None)
-    return any(
-        "minimax_m3" in str(model_type).lower()
-        for model_type in (
-            getattr(hf_config, "model_type", ""),
-            getattr(text_config, "model_type", ""),
-        )
-    )
+    for candidate in (hf_config, text_config):
+        if candidate is None:
+            continue
+        architectures = getattr(candidate, "architectures", None) or ()
+        if any(
+            "minimax_m3" in str(arch).lower() or "minimaxm3" in str(arch).lower()
+            for arch in architectures
+        ):
+            return True
+        model_type = str(getattr(candidate, "model_type", "") or "").lower()
+        if "minimax_m3" in model_type or "minimaxm3" in model_type:
+            return True
+    return False
 
 
 def _normalize_minimax_m3_text_config(hf_config: PretrainedConfig) -> None:

@@ -355,7 +355,7 @@ def test_dense_mla_decode_pads_small_head_count():
         """)
 
 
-def test_dense_mla_decode_pads_gathered_dcp_heads():
+def test_dense_mla_decode_keeps_supported_persistent_gathered_head_width():
     _run_without_test_stubs("""
         from types import SimpleNamespace
 
@@ -414,9 +414,11 @@ def test_dense_mla_decode_pads_gathered_dcp_heads():
             torch.zeros(1, 8, dtype=torch.bfloat16),
             SimpleNamespace(decode=decode),
         )
-        assert attention.dcp_kernel_num_heads == 128
-        assert attention.dcp_head_pad == 32
-        assert seen["num_heads"] == 128
+        # A persistent DCP decode takes the gathered width as-is: aiter folds
+        # the round-robin metadata onto the 16-head kernel, so 96 needs no pad.
+        assert attention.dcp_kernel_num_heads == 96
+        assert attention.dcp_head_pad == 0
+        assert seen["num_heads"] == 96
         assert output.shape == (1, 96, 8)
         assert lse.shape == (1, 96)
         """)
@@ -496,6 +498,79 @@ def test_dcp_local_slots_keep_only_this_ranks_round_robin_share():
     # Every global position is stored by exactly one rank.
     for p in range(16):
         assert sum(per_rank[r][p] != -1 for r in range(cp_size)) == 1
+
+
+def test_dcp_local_slots_use_virtual_block_for_null_checks():
+    import torch
+
+    from atom.plugin.vllm.dspark_dcp_patch import _dcp_local_slots
+
+    positions = torch.tensor([4], dtype=torch.int64)
+    token_req = torch.zeros(1, dtype=torch.int64)
+
+    # Under DCP2, position 4 is still in virtual block-table entry 0. Looking
+    # it up with the unsharded position // block_size would use entry 1 instead.
+    live = _dcp_local_slots(
+        positions.clone(),
+        torch.tensor([[7, 0]], dtype=torch.int32),
+        token_req,
+        block_size=4,
+        cp_size=2,
+        cp_rank=0,
+        cp_interleave=1,
+        pad_slot_id=-1,
+    )
+    null = _dcp_local_slots(
+        positions.clone(),
+        torch.tensor([[0, 7]], dtype=torch.int32),
+        token_req,
+        block_size=4,
+        cp_size=2,
+        cp_rank=0,
+        cp_interleave=1,
+        pad_slot_id=-1,
+    )
+
+    assert live.tolist() == [30]
+    assert null.tolist() == [-1]
+
+
+def test_dcp_local_slots_drop_explicitly_invalid_context_rows():
+    import torch
+
+    from atom.plugin.vllm.dspark_dcp_patch import _dcp_local_slots
+
+    slots = _dcp_local_slots(
+        positions=torch.tensor([0, 2], dtype=torch.int64),
+        block_table=torch.tensor([[7]], dtype=torch.int32),
+        token_req=torch.zeros(2, dtype=torch.int64),
+        block_size=4,
+        cp_size=2,
+        cp_rank=0,
+        cp_interleave=1,
+        pad_slot_id=-1,
+        valid_mask=torch.tensor([True, False]),
+    )
+
+    assert slots.tolist() == [28, -1]
+
+
+def test_dcp_context_validity_drops_each_requests_rejected_suffix():
+    import torch
+
+    from atom.plugin.vllm.dspark_dcp_patch import (
+        _context_request_ids_and_valid_mask,
+    )
+
+    request_ids, valid = _context_request_ids_and_valid_mask(
+        query_start_loc=torch.tensor([0, 3, 5], dtype=torch.int32),
+        num_rejected=torch.tensor([1, 2], dtype=torch.int32),
+        num_reqs=2,
+        num_context_tokens=5,
+    )
+
+    assert request_ids.tolist() == [0, 0, 0, 1, 1]
+    assert valid.tolist() == [True, True, False, False, False]
 
 
 def test_atom_patch_hides_dcp_from_speculative_config_validation():

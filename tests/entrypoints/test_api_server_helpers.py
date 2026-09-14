@@ -17,6 +17,8 @@ import ast
 import asyncio
 import inspect
 import sys
+import textwrap
+import threading
 import types
 from types import SimpleNamespace
 
@@ -118,6 +120,28 @@ pytestmark = pytest.mark.skipif(
     api_server is None,
     reason=f"api_server import unavailable: {_import_error!r}",
 )
+
+
+def _run_bounded(coro, timeout=5.0):
+    """Drive a coroutine that must end by cancellation, and fail if it does not.
+
+    Bare `asyncio.run` on a `while True` turns "the guard swallowed the
+    cancellation" into a suite that hangs and a CI job that reports a timeout
+    with no failing assertion. That is the same defect these tests exist to
+    pin, so the bound is not optional here.
+    """
+    try:
+        asyncio.run(asyncio.wait_for(coro, timeout))
+    except asyncio.CancelledError:
+        return
+    except TimeoutError:
+        pytest.fail(f"still running after {timeout}s; a guard swallowed the cancel")
+    pytest.fail("returned on its own; this must run until cancelled")
+
+
+def _boom(*_args, **_kwargs):
+    """A step that fails. Named so the loop's warning names something real."""
+    raise RuntimeError("boom")
 
 
 class TestCoerceN:
@@ -400,3 +424,276 @@ class TestARequestIsNotSerialisedForALogNobodyKeeps:
             "_log_request_event is being handed a model_dump() built before "
             f"the guard can decline it: {eager}. Use _log_request_model."
         )
+
+
+class TestPeriodicOutlivesItsStep:
+    """`_periodic` is the one implementation of "a background task must not die
+    silently", which is the invariant a second copy is how you lose.
+
+    Nothing awaits these tasks until shutdown, so an escaping exception leaves
+    only asyncio's "never retrieved": `/metrics` answers from the last
+    snapshot, `metrics_snapshot_available` still reads 1, and the dashboard
+    looks alive while every engine-derived series is frozen.
+    """
+
+    @staticmethod
+    def _drive(step, rounds=4):
+        """Run the real loop until `step` has been called `rounds` times.
+
+        `CancelledError` is the stop signal rather than a timer, and the
+        interval is zero, so this waits on nothing -- and it doubles as the
+        check that shutdown still works, since a guard wide enough to swallow
+        it would hang here instead of returning.
+        """
+        calls = []
+
+        async def counted():
+            calls.append(1)
+            if len(calls) >= rounds:
+                raise asyncio.CancelledError
+            await step()
+
+        counted.__name__ = getattr(step, "__name__", "step")
+        _run_bounded(api_server._periodic(0, counted))
+        return len(calls)
+
+    def test_a_raising_step_does_not_end_the_loop(self):
+        """A logging handler raising while it formats a warning is enough, and
+        so is `MemoryError` under exactly the load this exists to watch."""
+
+        async def boom():
+            raise RuntimeError("handler raised while formatting")
+
+        assert self._drive(boom) == 4
+
+    def test_no_handler_here_is_wide_enough_to_swallow_cancellation(self):
+        """Shutdown cancels these tasks and awaits them in the lifespan's
+        `finally`, so a handler that caught the cancellation would hang the
+        process rather than fail anything.
+
+        Read from the source, because there is nothing to exercise:
+        `CancelledError` is a BaseException, so `except Exception` cannot see
+        it and a runtime check passes against any guard correct today. What can
+        change is someone widening the clause, and that is a fact about text.
+        """
+        tree = ast.parse(textwrap.dedent(inspect.getsource(api_server._periodic)))
+        caught = [
+            ast.unparse(handler.type) if handler.type else "bare except"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Try)
+            for handler in node.handlers
+        ]
+
+        assert caught == [
+            "Exception"
+        ], f"a handler here would swallow CancelledError and hang shutdown: {caught}"
+
+
+class TestTheStepsOwnTheirOwnFailures:
+    """One counter, one meaning. `metrics_refresh_errors` says the exported
+    series are stale, so only the refresh may raise it -- riding both jobs on
+    one loop is what conflated them, and they are two tasks now."""
+
+    def test_a_failed_refresh_is_counted_and_not_only_logged(self, monkeypatch):
+        """A log line is not a signal; nobody greps the frontend log to find
+        out why a Grafana panel went flat."""
+        errors = []
+        monkeypatch.setattr(
+            api_server, "engine", SimpleNamespace(get_metrics_statistics=_boom)
+        )
+        monkeypatch.setattr(
+            api_server._metrics_exporter,
+            "record_refresh_error",
+            lambda: errors.append(1),
+        )
+
+        asyncio.run(api_server._refresh_metrics_once())
+
+        assert errors == [1]
+
+    def test_publishing_is_inside_the_guard_the_read_is(self, monkeypatch):
+        """`update()` used to sit in an `else:` outside it, so a malformed
+        snapshot -- the likely case when the engine is unhealthy -- escaped to
+        the loop uncounted."""
+        errors = []
+        monkeypatch.setattr(
+            api_server, "engine", SimpleNamespace(get_metrics_statistics=dict)
+        )
+        monkeypatch.setattr(api_server._metrics_exporter, "update", _boom)
+        monkeypatch.setattr(
+            api_server._metrics_exporter,
+            "record_refresh_error",
+            lambda: errors.append(1),
+        )
+
+        asyncio.run(api_server._refresh_metrics_once())
+
+        assert errors == [1]
+
+    def test_a_failing_gc_watch_does_not_claim_the_snapshot_went_stale(
+        self, monkeypatch
+    ):
+        """The two answer to different readers. A gc watch says nothing about
+        the exported snapshot, so counting its failure there pages whoever owns
+        that alert for the one event the counter cannot name."""
+        errors = []
+        monkeypatch.setattr(api_server, "reclaim_watch", _boom)
+        monkeypatch.setattr(
+            api_server._metrics_exporter,
+            "record_refresh_error",
+            lambda: errors.append(1),
+        )
+
+        with pytest.raises(RuntimeError):
+            asyncio.run(api_server._reclaim_watch_once())
+
+        assert errors == [], "a gc failure incremented the stale-snapshot counter"
+
+    def test_the_refresh_step_does_only_the_refresh(self, monkeypatch):
+        """The boundary itself. Asserting the counter from `_reclaim_watch_once`
+        cannot see the watch being called from inside the refresh, which is the
+        arrangement that conflated them -- so this asks the refresh directly."""
+        watched = []
+        monkeypatch.setattr(
+            api_server, "engine", SimpleNamespace(get_metrics_statistics=dict)
+        )
+        monkeypatch.setattr(api_server._metrics_exporter, "update", lambda _s: None)
+        monkeypatch.setattr(
+            api_server, "reclaim_watch", lambda ctx: watched.append(ctx)
+        )
+
+        asyncio.run(api_server._refresh_metrics_once())
+
+        assert watched == [], "the refresh is running the gc watch again"
+
+
+class TestLifespanOwnsTheBackgroundTasks:
+    """Nothing else starts or stops them, and until now nothing checked that it
+    does -- the tasks above are only reachable through here."""
+
+    @staticmethod
+    def _run(monkeypatch):
+        started = []
+        for name in ("tune_gc", "maybe_attach_gc_debug_callback", "freeze_gc_heap"):
+            monkeypatch.setattr(api_server, name, lambda *a, **k: 0)
+        monkeypatch.setattr(api_server, "arm_reclaim_watch", lambda: None)
+        monkeypatch.setattr(api_server, "engine", None)
+        # Long enough that neither step runs: this is about the tasks existing
+        # and being cancelled, not about what they do.
+        monkeypatch.setattr(api_server, "_METRICS_REFRESH_INTERVAL_SECONDS", 3600)
+        monkeypatch.setattr(api_server, "_GC_WATCH_INTERVAL_SECONDS", 3600)
+
+        async def drive():
+            async with api_server.lifespan(api_server.app):
+                started.extend(api_server._background_tasks)
+                assert not any(t.done() for t in started)
+            raise asyncio.CancelledError  # the loops above only end that way
+
+        _run_bounded(drive())
+        return started
+
+    def test_both_jobs_get_a_task_of_their_own(self, monkeypatch):
+        """Two cadences and two failure meanings, so two tasks. Riding one loop
+        is what conflated the error counter."""
+        tasks = self._run(monkeypatch)
+
+        assert [t.get_name() for t in tasks] == [
+            "_refresh_metrics_once",
+            "_reclaim_watch_once",
+        ]
+
+    def test_shutdown_leaves_nothing_running(self, monkeypatch):
+        """An uncancelled task keeps a reference to the whole app alive and
+        goes on scraping an engine that is closing."""
+        tasks = self._run(monkeypatch)
+
+        assert all(t.cancelled() for t in tasks)
+        assert api_server._background_tasks == []
+
+
+class TestTheCensusEndpointKeepsTheLoopFree:
+    """`/debug/gc_census` walks every tracked object -- seconds at a serving
+    heap -- on the one loop that delivers every open SSE stream."""
+
+    def test_the_walk_does_not_run_on_the_event_loop(self, monkeypatch):
+        """Inline, a single unauthenticated GET stalls token delivery for every
+        stream in flight, on a server whose product is inter-token latency.
+
+        The thread identity is the assertion, not the presence of the call: a
+        later refactor that awaits the walk directly would keep the executor
+        import and lose the property.
+        """
+        seen = {}
+
+        def fake_census(top, types_per_owner):
+            seen["walk_thread"] = threading.current_thread()
+            seen["args"] = (top, types_per_owner)
+            return {"by_type": []}
+
+        monkeypatch.setattr(api_server, "gc_census", fake_census)
+
+        async def call():
+            seen["loop_thread"] = threading.current_thread()
+            return await api_server.get_gc_census(top=7, types_per_owner=3)
+
+        assert asyncio.run(call()) == {"by_type": []}
+        assert (
+            seen["walk_thread"] is not seen["loop_thread"]
+        ), "the census ran on the event loop"
+        # Named, not merely "some other thread": the default pool would satisfy
+        # that too, and the default pool is the one this must not borrow.
+        assert seen["walk_thread"].name.startswith("gc-census"), seen[
+            "walk_thread"
+        ].name
+        assert seen["args"] == (7, 3), "the query parameters did not reach the walk"
+
+    def test_the_census_thread_is_not_a_thread_that_serves_requests(self):
+        """`run_in_executor(None, ...)` takes the loop's default pool, which is
+        where every request's prompt preprocessing runs. Handing a seconds-long
+        heap walk to those threads moves the stall from the loop into admission
+        rather than out of the way, and this endpoint has no authentication and
+        no rate limit, so a curl loop is enough to fill them.
+        """
+
+        async def call():
+            loop = asyncio.get_running_loop()
+            census = await loop.run_in_executor(
+                api_server._gc_census_executor, threading.current_thread
+            )
+            default = await loop.run_in_executor(None, threading.current_thread)
+            return census, default
+
+        census_thread, default_thread = asyncio.run(call())
+
+        assert census_thread is not default_thread
+        assert census_thread.name.startswith("gc-census")
+
+    def test_concurrent_walks_do_not_each_pin_a_snapshot(self):
+        """One worker is the single-flight. Each walk holds a full gen-2
+        snapshot alive for its duration, so N concurrent GETs must be N walks
+        in sequence rather than N snapshots at once -- and a lock on top of
+        `max_workers=1` would add nothing, which is why there is not one.
+
+        A barrier rather than a clock: with two workers the pair meets and the
+        wait returns, with one it can only ever time out. Both outcomes are
+        decided by the pool, not by how fast this machine is.
+        """
+        barrier = threading.Barrier(2)
+
+        def met() -> bool:
+            try:
+                barrier.wait(timeout=0.15)
+            except threading.BrokenBarrierError:
+                return False
+            return True
+
+        async def call():
+            loop = asyncio.get_running_loop()
+            return await asyncio.gather(
+                *[
+                    loop.run_in_executor(api_server._gc_census_executor, met)
+                    for _ in range(2)
+                ]
+            )
+
+        assert asyncio.run(call()) == [False, False], "two walks ran at once"
