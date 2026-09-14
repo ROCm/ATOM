@@ -12,23 +12,25 @@ which is what the workload needs at high concurrency.
 - Scenario: `inferencex-agentx-mvp`, dataset `semianalysis_cc_traces_weka_062126`
 - Router: `atomesh`, PD mode, `idx2idx` rank mapping
 
-Three bands, contiguous:
+Pick the section by the concurrency you are running:
 
-| band | concurrency | attention | CPU offload |
-|---|---|---|---|
-| **A** | 1 – 48 | TP | no |
-| **B** | 64 – 128 | DP | no |
-| **C** | 256 and up | DP | **yes, 1024 GiB** |
+| concurrency | section |
+|---|---|
+| 1 – 32 | [TP](#tp--concurrency-1--32) |
+| 64 – 128 | [DP attention](#dp-attention--concurrency-64--128) |
+| 256 and up | [DP attention with CPU offload](#dp-attention-with-cpu-offload--concurrency-256-and-up) |
 
-A → B is two flags, four environment variables and a memory fraction. B → C adds
-only the offload tier on the prefill node — the server flags do not change.
+Each section is complete on its own — server commands for both nodes, the router
+line, and the client. Nothing carries over between them except the model path
+and the two node IPs.
 
-The PD sweep in *Measured* covers band A at 1–16 and bands B and C at 64–256.
-The 17–48 part of band A follows the single-node recipe, where TP at c=48 is
-measured and sits just under DP at c=64 (20,308 against 21,888 tok/s/chip); that
-crossover is inherited rather than re-measured on two nodes.
+One note before you start: **below about 32 concurrency, a single node without PD
+gives roughly twice this per-chip throughput** (1,484 against 737 tok/s/chip at
+c=1). PD earns its keep from 64 up, where it buys 2.6–3.6× the per-user output
+rate. Use the TP section if your deployment is already PD-disaggregated, not as
+a reason to split two nodes for low concurrency.
 
-## Band A — TP, no offload (concurrency 1 – 48)
+## TP — concurrency 1 – 32
 
 ```bash
 export AITER_BF16_FP8_MOE_BOUND=0
@@ -70,7 +72,7 @@ on prefill and 0.70 on decode. `$KV_TRANSFER` is the plain Mooncake pair:
  "proxy_ip": "<DECODE_IP>", "handshake_port": 6301, "protocol": "rdma"}
 ```
 
-Router for this band drops the DP flags:
+Router for this section — note it drops the DP flags:
 
 ```bash
 atomesh launch --host 0.0.0.0 --port 8000 --pd-disaggregation \
@@ -81,14 +83,14 @@ atomesh launch --host 0.0.0.0 --port 8000 --pd-disaggregation \
   --request-timeout-secs 1800
 ```
 
-## Band B — DP attention, no offload (concurrency 64 – 128)
+## DP attention — concurrency 64 – 128
 
-Band A plus four environment variables, two flags, and a higher memory fraction.
-No offload tier: at these concurrencies the HBM prefix cache carries the reuse on
-its own (measured hit 96.1% at c=64, 94.7% at c=128).
+Everything in the TP section, plus four environment variables, two flags, and a
+higher memory fraction. No offload tier: at these concurrencies the HBM prefix
+cache carries the reuse on its own (measured hit 96.1% at c=64, 94.7% at c=128).
 
 ```bash
-# ...the band A exports above, plus:
+# ...the TP exports above, plus:
 export ATOM_NUMA_BIND=1
 export GPU_MAX_HW_QUEUES=5
 export ATOM_DP_SESSION_AFFINITY=1
@@ -118,18 +120,18 @@ node runs DP attention without it, and at `--gpu-memory-utilization 0.70`.
 
 `ATOM_DP_SESSION_AFFINITY=1` is the load-bearing one of those four. It keeps a
 trajectory on one rank, which is what the agentic scenario's prefix reuse
-depends on; without it this band loses most of its cache hit.
+depends on; without it the DP path loses most of its cache hit.
 
-`$KV_TRANSFER` is the same plain Mooncake pair as band A.
+`$KV_TRANSFER` is the same plain Mooncake pair as the TP section.
 
-## Band C — DP attention with CPU offload (concurrency 256 and up)
+## DP attention with CPU offload — concurrency 256 and up
 
-Identical server flags to band B. The only change is on the **prefill** node:
-three more environment variables, and a `multi` connector that puts the offload
-tier alongside Mooncake.
+Identical server flags to the DP section above. The only change is on the
+**prefill** node: three more environment variables, and a `multi` connector that
+puts the offload tier alongside Mooncake.
 
 ```bash
-# ...all band B exports, plus (prefill node only):
+# ...all the DP exports above, plus (prefill node only):
 export OFFLOAD_COPY_WORKERS=1
 export OFFLOAD_MIN_LOAD_TOKENS=8192
 export OFFLOAD_SLOT_STAGING_SLOTS=4
@@ -161,7 +163,7 @@ tier.
 host memory. Refuse to start unless `psutil.virtual_memory().available` clears
 `8 × size + 256` GiB.
 
-Router for bands B and C (same line for both):
+Router for both DP sections (same line for either):
 
 ```bash
 atomesh launch --host 0.0.0.0 --port 8000 --pd-disaggregation \
@@ -401,8 +403,8 @@ The two c=256 rows are the same run with and without the offload settings in
 this recipe: `defaults` is `max_pending_saves=2` and
 `slot_sidecar_staging_slots=1`, `tuned` is 8 and 4.
 
-The c=64 and c=128 rows carry no offload tier at all, so the settings section
-above does not apply to them.
+The c=64 and c=128 rows carry no offload tier at all, so the offload settings
+section does not apply to them.
 
 Three caveats on that pair. The tuned run sampled a longer trace
 (`isl` p50 84,176 against 71,141), and `tok/s/chip` counts input tokens, so
