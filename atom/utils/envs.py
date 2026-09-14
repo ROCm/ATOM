@@ -136,6 +136,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ": lambda: (
         os.getenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "1") == "1"
     ),
+    # Fuse cached-chunk K/V quantization into the FlyDSL gather epilogue when
+    # both FlyDSL gather and fp8 FMHA are enabled. Descales come from the new
+    # tokens, with 2x range headroom. Set 0 for dynamic quantization.
+    # Requires AITER FP8-output gather support. Added 2026-09-10.
+    "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ_FP8": lambda: (
+        os.getenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ_FP8", "1") == "1"
+    ),
+    # Batch Q/K/V dynamic quantization, strided loads and descale preparation
+    # into one or two launches before FlyDSL FP8 prefill attention.
+    # Added 2026-09-10.
+    "ATOM_USE_FUSED_MLA_QKV_QUANT": lambda: (
+        os.getenv("ATOM_USE_FUSED_MLA_QKV_QUANT", "1") == "1"
+    ),
+    # Use FlyDSL gfx950 FP8 FMHA for eligible MLA prefill calls. Quantizes
+    # Q/K/V to E4M3 and passes the layer softmax scale directly to AITER.
+    # Unavailable kernels or unsupported calls use AITER varlen attention.
+    # Disabled by default. Added 2026-09-10.
+    "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN": lambda: (
+        os.getenv("ATOM_USE_FLYDSL_FP8_PREFILL_ATTN", "0") == "1"
+    ),
     # QK-norm-rope-cache-quant fusion for Qwen3 dense and MoE; disabled by default.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"

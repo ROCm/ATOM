@@ -3,7 +3,9 @@
 
 import logging
 from dataclasses import dataclass
+from functools import cache
 from functools import partial as functools_partial
+from inspect import signature
 from typing import ClassVar, Protocol
 
 import torch
@@ -34,6 +36,7 @@ except ImportError:
     concat_and_cache_mla_seg = None
     fused_qk_rope_concat_and_cache_mla_seg = None
 from aiter.dist.parallel_state import get_dp_group, get_tensor_model_parallel_rank
+from aiter.jit.core import get_gfx
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.attention.mla import (
     mla_decode_fwd as triton_shuffle_mla_decode_fwd,
@@ -61,6 +64,7 @@ from atom.distributed.pcp_utils import (
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import use_triton_gemm
 from atom.model_ops.triton_fused_mla_ctx_kv import fused_mla_ctx_norm_rope_cache
+from atom.model_ops.triton_fused_qkv_quant import fused_qkv_per_tensor_quant
 from atom.model_ops.utils import get_and_maybe_dequant_weights
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
@@ -482,6 +486,23 @@ try:
 except Exception:  # noqa: BLE001 -- optional kernel; absence is the whole answer
     _FLYDSL_GATHER_AVAILABLE = False
 
+# Optional FP8 prefill backend, gated by ATOM_USE_FLYDSL_FP8_PREFILL_ATTN.
+try:
+    from aiter.ops.flydsl import flydsl_flash_attn_fp8_func
+
+    _FLYDSL_FP8_MHA_AVAILABLE = True
+except Exception:  # noqa: BLE001 -- optional kernel; absence is the whole answer
+    _FLYDSL_FP8_MHA_AVAILABLE = False
+
+# Import success and support for FP8 output are separate capabilities.
+_FLYDSL_GATHER_FP8_AVAILABLE = _FLYDSL_GATHER_AVAILABLE and {
+    "k_out_scale",
+    "v_out_scale",
+}.issubset(signature(gather_kv_b_proj_flydsl).parameters)
+
+# The FMHA wrapper uses int32 flattened tensor extents in its C ABI.
+_FLYDSL_FMHA_MAX_FLAT_ELEMS = 2**31
+
 
 # MLA Specific Arguments
 @dataclass
@@ -571,6 +592,49 @@ def dynamic_per_batched_tensor_quant(
     scale = DTYPE_MAX / amax
     x_scl_sat = (x * scale).clamp(min=-DTYPE_MAX, max=DTYPE_MAX)
     return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
+
+
+_per_tensor_fp8_quant = get_hip_quant(QuantType.per_Tensor)
+# HIP quantization launches one workgroup per row. Limit atomic-reduction
+# contention while keeping enough workgroups to fill gfx950; each reshaped
+# row must contain complete 16-element vectors.
+_QUANT_ROWS_TARGET = 256
+
+
+@cache
+def _quant_rows(m: int) -> int:
+    """Choose up to 256 rows containing whole 16-element vectors."""
+    for rows in range(min(m, _QUANT_ROWS_TARGET), 0, -1):
+        if m % rows == 0:
+            return rows
+    return 1
+
+
+def quant_fp8_per_tensor(x: torch.Tensor):
+    """Quantize FMHA activations with AITER HIP and return a shape-[1] descale.
+
+    The per-tensor amax is shape-independent. Reshape contiguous input into
+    at most 256 rows to reduce atomic contention, with 16-element-aligned rows
+    for the HIP vector loads. Strided inputs are materialized before dispatch;
+    partial vectors use the torch reference. Explicitly request FP8 because
+    AITER's default output dtype is int8.
+    """
+    if not x.is_contiguous():
+        x = x.contiguous()
+    n = x.numel()
+    if n == 0:
+        return torch.empty_like(x, dtype=dtypes.fp8), torch.ones(
+            1, device=x.device, dtype=torch.float32
+        )
+    if n % 16:
+        # FMHA's head dimensions are multiples of 16. Keep the helper safe
+        # for other callers without passing a partial vector to the HIP op.
+        x8, descale = dynamic_per_batched_tensor_quant(x)
+        return x8, descale.reshape(1)
+    # Preserve complete 16-element vectors in every reshaped row.
+    rows = _quant_rows(n // 16)
+    x8, descale = _per_tensor_fp8_quant(x.view(rows, n // rows), quant_dtype=dtypes.fp8)
+    return x8.view(x.shape), descale
 
 
 class MLAAttention(nn.Module):
@@ -678,6 +742,11 @@ class MLAAttention(nn.Module):
         # Resolved on the first gather, when the weights and cache exist; see
         # `_kv_b_proj_gather`. None = not asked yet.
         self._flydsl_gather_ok: bool | None = None
+        self.use_flydsl_fp8_prefill_attn = bool(envs.ATOM_USE_FLYDSL_FP8_PREFILL_ATTN)
+        # FMHA sees the head dimension after dropping any zero RoPE padding.
+        self._fmha_d = (
+            self.qk_nope_head_dim if self.rope_is_zero_pad else self.qk_head_dim
+        )
         if self.use_seg_mla:
             if envs.ATOM_MLA_PAGE_SIZE != _MLA_SEG_PAGE_SIZE:
                 raise RuntimeError(
@@ -946,6 +1015,111 @@ class MLAAttention(nn.Module):
             return tensors if len(tensors) > 1 else tensors[0]
         out = tuple(t[..., : self.qk_nope_head_dim] for t in tensors)
         return out if len(out) > 1 else out[0]
+
+    def _flydsl_fmha_callable(self, q, k, v, dropout_p) -> bool:
+        """Per-call shape/feature check. Cheap Python compares, no device sync."""
+        return (
+            self.use_flydsl_fp8_prefill_attn
+            and _FLYDSL_FP8_MHA_AVAILABLE
+            and get_gfx() == "gfx950"
+            and self.dtype == torch.bfloat16
+            and self._fmha_d % 64 == 0
+            and 64 <= self.v_head_dim <= 192
+            and self.v_head_dim % 32 == 0
+            and dropout_p == 0.0  # the kernel has no dropout
+            and q.dim() == 3
+            and k.dim() == 3
+            and v.dim() == 3
+            # Require the head dimension after dropping any zero RoPE padding.
+            and q.shape[-1] == self._fmha_d
+            and k.shape[-1] == self._fmha_d
+            and v.shape[-1] == self.v_head_dim
+            and k.shape[1] == q.shape[1]  # MLA is Hkv == H, GQA group 1
+            and v.shape[:-1] == k.shape[:-1]
+            and max(q.numel(), k.numel(), v.numel()) < _FLYDSL_FMHA_MAX_FLAT_ELEMS
+        )
+
+    def _flash_attn_prefill(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        min_seqlen_q: int,
+        dropout_p: float,
+        causal: bool,
+        return_lse: bool = False,
+        q_fp8: tuple[torch.Tensor, torch.Tensor] | None = None,
+        kv_fp8: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None,
+    ):
+        """Dispatch MLA prefill to FP8 FlyDSL or AITER varlen attention.
+
+        FlyDSL uses bottom-right causal masking and returns natural-log FP32
+        LSE in [heads, total_q] layout. Unsupported per-call features use AITER
+        varlen attention, which selects BF16 OPUS on gfx950 for D=192/Dv=128.
+        Kernel failures propagate to the caller.
+
+        ``q_fp8`` reuses ``(q8, q_descale)`` across cached chunks. ``kv_fp8``
+        supplies ``(k8, v8, k_descale, v_descale)`` from FP8 gather and skips
+        K/V quantization. These outputs can alias the BF16 workspaces, so a
+        call with ``kv_fp8`` must not fall back and read those BF16 views.
+        """
+        if self._flydsl_fmha_callable(q, k, v, dropout_p):
+            if q_fp8 is None and kv_fp8 is None and envs.ATOM_USE_FUSED_MLA_QKV_QUANT:
+                q8, k8, v8, qs, ks, vs, _, _ = fused_qkv_per_tensor_quant(q, k, v)
+                q_fp8 = (q8, qs)
+                kv_fp8 = (k8, v8, ks, vs)
+            q8, q_descale = q_fp8 or quant_fp8_per_tensor(q)
+            if kv_fp8 is None:
+                k8, k_descale = quant_fp8_per_tensor(k)
+                v8, v_descale = quant_fp8_per_tensor(v)
+            else:
+                k8, v8, k_descale, v_descale = kv_fp8
+            # Empty per-sequence cached chunks require the FMHA kernel's
+            # masked-row handling: zero output and -inf LSE for the merge.
+            return flydsl_flash_attn_fp8_func(
+                q8,
+                k8,
+                v8,
+                softmax_scale=self.scale,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_kv=max_seqlen_k,
+                cross_seqlen=True,
+                causal=causal,
+                return_lse=return_lse,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                # Use the current stream for copies and launch, including graph capture.
+                stream=None,
+            )
+
+        if kv_fp8 is not None:
+            raise ValueError(
+                "prequantized K/V require an eligible FlyDSL FP8 FMHA call"
+            )
+        return flash_attn_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            min_seqlen_q=min_seqlen_q,
+            dropout_p=dropout_p,
+            softmax_scale=self.scale,
+            causal=causal,
+            return_lse=return_lse,
+        )
 
     def _restore_query_heads(
         self, output: torch.Tensor, num_heads: int | None = None
@@ -1325,17 +1499,16 @@ class MLAAttention(nn.Module):
             getattr(attn_metadata, "shuffle_kv_block_indices", None),
         )
         prefill_q, k_full = self._drop_rope_pad(prefill_q, k_full)
-        output = flash_attn_varlen_func(
-            q=prefill_q,
-            k=k_full,
-            v=v_full,
+        output = self._flash_attn_prefill(
+            prefill_q,
+            k_full,
+            v_full,
             cu_seqlens_q=attn_metadata.cu_seqlens_q,
             cu_seqlens_k=attn_metadata.cu_seqlens_k,
             max_seqlen_q=attn_metadata.max_seqlen_q,
             max_seqlen_k=attn_metadata.max_seqlen_k,
             min_seqlen_q=attn_metadata.min_seqlen_q,
             dropout_p=attn_metadata.dropout_p,
-            softmax_scale=self.scale,
             causal=True,
         )
         return self.o_proj(output.flatten(start_dim=-2))
@@ -1350,7 +1523,8 @@ class MLAAttention(nn.Module):
         v_out: torch.Tensor,
         shuffle_kv_block_indptr: torch.Tensor | None = None,
         shuffle_kv_block_indices: torch.Tensor | None = None,
-    ) -> None:
+        kv_out_scales: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ):
         weight = self.kv_b_proj.weight
         if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
             # Shuffled KV: read the block_size-shuffled cache with block-granular
@@ -1371,8 +1545,14 @@ class MLAAttention(nn.Module):
                 shuffled_kv_cache=True,
             )
         else:
-            self._kv_b_proj_gather(
-                kv_cache, kv_indptr, kv_indices, cu_seqlens_k, k_out, v_out
+            return self._kv_b_proj_gather(
+                kv_cache,
+                kv_indptr,
+                kv_indices,
+                cu_seqlens_k,
+                k_out,
+                v_out,
+                kv_out_scales=kv_out_scales,
             )
 
     def _kv_b_proj_gather(
@@ -1383,7 +1563,8 @@ class MLAAttention(nn.Module):
         cu_seqlens_k: torch.Tensor,
         k_out: torch.Tensor,
         v_out: torch.Tensor,
-    ) -> None:
+        kv_out_scales: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ):
         """Gather compressed KV rows and decompress them into k/v, in one pass.
 
         One kernel for the whole chain: row gather, KV-cache dequant,
@@ -1391,6 +1572,10 @@ class MLAAttention(nn.Module):
         any ``[rows, block, kv_lora_rank + qk_rope_head_dim]`` compressed-KV
         tensor -- the paged cache for the non-DCP path, the AllGather block for
         DCP -- and ``kv_indices`` selects rows out of it.
+
+        With ``kv_out_scales`` the FlyDSL epilogue writes FP8 into the first
+        half of each contiguous BF16 workspace and returns the FP8 views and
+        descales. BF16 output returns None so the caller quantizes separately.
         """
         weight = self.kv_b_proj.weight
         gather_weight = _maybe_view_mxfp4_weight_for_gather(self.kv_b_proj, weight)
@@ -1410,6 +1595,25 @@ class MLAAttention(nn.Module):
                     kv_buffer, gather_weight, weight_scale, k_out, v_out
                 )
             if self._flydsl_gather_ok:
+                fp8_outputs = (
+                    _FLYDSL_GATHER_FP8_AVAILABLE
+                    and kv_out_scales is not None
+                    and all(
+                        t.dtype == torch.bfloat16 and t.is_contiguous()
+                        for t in (k_out, v_out)
+                    )
+                )
+                k_gather, v_gather = k_out, v_out
+                out_kwargs = {}
+                if fp8_outputs:
+                    k_gather, v_gather = (
+                        t.view(torch.float8_e4m3fn).view(-1)[: t.numel()].view(t.shape)
+                        for t in (k_out, v_out)
+                    )
+                    out_kwargs = {
+                        "k_out_scale": kv_out_scales[0],
+                        "v_out_scale": kv_out_scales[1],
+                    }
                 gather_kv_b_proj_flydsl(
                     kv_buffer,
                     self._k_scale,
@@ -1418,11 +1622,14 @@ class MLAAttention(nn.Module):
                     cu_seqlens_k,
                     gather_weight,
                     weight_scale,
-                    k_out,
-                    v_out,
+                    k_gather,
+                    v_gather,
                     weight_preshuffle=preshuffled,
+                    **out_kwargs,
                 )
-                return
+                if fp8_outputs:
+                    return k_gather, v_gather, *kv_out_scales
+                return None
 
         gather_kv_b_proj(
             kv_buffer,
@@ -1496,19 +1703,54 @@ class MLAAttention(nn.Module):
             (k_nope_new, k_rope_new.expand((*k_nope_new.shape[:-1], -1))), dim=-1
         )
         prefill_q, k_new = self._drop_rope_pad(prefill_q, k_new)
-        new_out, new_lse = flash_attn_varlen_func(
-            q=prefill_q,
-            k=k_new,
-            v=v_new,
+        # Q is identical across step 1 and every step-2 chunk (`_drop_rope_pad` is
+        # idempotent and the values never change), so quantize it once here
+        # instead of running an amax reduction over it per chunk.
+        fp8_eligible = self._flydsl_fmha_callable(
+            prefill_q, k_new, v_new, attn_metadata.dropout_p
+        )
+        q_fp8 = None
+        new_kv_fp8 = None
+        kv_out_scales = None
+        gather_fp8 = (
+            self.use_flydsl_gather_kv_b_proj
+            and envs.ATOM_USE_FLYDSL_GATHER_KV_B_PROJ_FP8
+            and _FLYDSL_GATHER_FP8_AVAILABLE
+        )
+        if fp8_eligible and envs.ATOM_USE_FUSED_MLA_QKV_QUANT:
+            q8, k8, v8, qs, ks, vs, gather_ks, gather_vs = fused_qkv_per_tensor_quant(
+                prefill_q, k_new, v_new
+            )
+            q_fp8 = (q8, qs)
+            new_kv_fp8 = (k8, v8, ks, vs)
+            if gather_fp8:
+                kv_out_scales = (gather_ks, gather_vs)
+        elif fp8_eligible:
+            q_fp8 = quant_fp8_per_tensor(prefill_q)
+        if q_fp8 is not None and new_kv_fp8 is None and gather_fp8:
+            k8, ks = quant_fp8_per_tensor(k_new)
+            v8, vs = quant_fp8_per_tensor(v_new)
+            new_kv_fp8 = (k8, v8, ks, vs)
+            # Reuse new-token calibration for the cached context. Doubling the
+            # range is an exponent shift, preserving E4M3 relative precision
+            # while giving old-token outliers headroom. This changes the scale
+            # policy from per-chunk amax; the kernel saturates larger outliers.
+            # A zero amax from the HIP quantizer must not produce a zero divisor.
+            kv_out_scales = (ks.clamp_min(1e-6) * 2, vs.clamp_min(1e-6) * 2)
+        new_out, new_lse = self._flash_attn_prefill(
+            prefill_q,
+            k_new,
+            v_new,
             cu_seqlens_q=attn_metadata.cu_seqlens_q,
             cu_seqlens_k=attn_metadata.cu_seqlens_q,
             max_seqlen_q=attn_metadata.max_seqlen_q,
             max_seqlen_k=attn_metadata.max_seqlen_q,
             min_seqlen_q=attn_metadata.min_seqlen_q,
             dropout_p=attn_metadata.dropout_p,
-            softmax_scale=self.scale,
             causal=True,
             return_lse=True,
+            q_fp8=q_fp8,
+            kv_fp8=new_kv_fp8,
         )
 
         # Step 2: chunked cached-prefix attention.
@@ -1520,7 +1762,12 @@ class MLAAttention(nn.Module):
             # reorg -> kv_b_proj. The rest of the merge logic below
             # is identical to the non-DCP path.
             chunked_out, chunked_lse = self._dcp_compute_prefill_context(
-                prefill_q, kv_cache, attn_metadata, chunk_meta
+                prefill_q,
+                kv_cache,
+                attn_metadata,
+                chunk_meta,
+                q_fp8=q_fp8,
+                kv_out_scales=kv_out_scales,
             )
         else:
             k_workspace = chunk_meta.k_workspace
@@ -1531,13 +1778,21 @@ class MLAAttention(nn.Module):
                     continue
                 k_chunk = k_workspace[:n_tok]
                 v_chunk = v_workspace[:n_tok]
-                self._gather_cached_kv_b_proj(
+                chunk_scales = (
+                    kv_out_scales
+                    if self._flydsl_fmha_callable(
+                        prefill_q, k_chunk, v_chunk, attn_metadata.dropout_p
+                    )
+                    else None
+                )
+                kv_fp8 = self._gather_cached_kv_b_proj(
                     kv_cache,
                     chunk_meta.kv_indptr[c],
                     chunk_meta.kv_indices[c],
                     chunk_meta.cu_seqlens_k[c],
                     k_chunk,
                     v_chunk,
+                    kv_out_scales=chunk_scales,
                     shuffle_kv_block_indptr=(
                         chunk_meta.shuffle_kv_block_indptr[c]
                         if chunk_meta.shuffle_kv_block_indptr is not None
@@ -1550,10 +1805,10 @@ class MLAAttention(nn.Module):
                     ),
                 )
                 prefill_q, k_chunk = self._drop_rope_pad(prefill_q, k_chunk)
-                suf_out, suf_lse = flash_attn_varlen_func(
-                    q=prefill_q,
-                    k=k_chunk,
-                    v=v_chunk,
+                suf_out, suf_lse = self._flash_attn_prefill(
+                    prefill_q,
+                    k_chunk,
+                    v_chunk,
                     # As many q-cums as k-cums -- varlen takes its batch from
                     # the q side, and the chunk's were built unpadded.
                     cu_seqlens_q=attn_metadata.cu_seqlens_q[
@@ -1564,9 +1819,10 @@ class MLAAttention(nn.Module):
                     max_seqlen_k=chunk_meta.max_seqlen_k[c],
                     min_seqlen_q=attn_metadata.min_seqlen_q,
                     dropout_p=attn_metadata.dropout_p,
-                    softmax_scale=self.scale,
                     causal=False,
                     return_lse=True,
+                    q_fp8=q_fp8,
+                    kv_fp8=kv_fp8,
                 )
                 if chunked_out is None:
                     chunked_out = suf_out
@@ -1608,6 +1864,8 @@ class MLAAttention(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetaData,
         chunk_meta,
+        q_fp8: tuple[torch.Tensor, torch.Tensor] | None = None,
+        kv_out_scales: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         """DCP chunked cached-prefix context attention.
 
@@ -1654,13 +1912,21 @@ class MLAAttention(nn.Module):
             # 3. reorg + dequant + kv_b_proj + k_pe concat, fused. block_size 1
             #    on the AllGather buffer makes the row map a plain token index.
             k_chunk, v_chunk = self._dcp_context_kv_buffers(chunk_meta, sum_seq_len)
-            self._kv_b_proj_gather(
+            chunk_scales = (
+                kv_out_scales
+                if self._flydsl_fmha_callable(
+                    prefill_q, k_chunk, v_chunk, attn_metadata.dropout_p
+                )
+                else None
+            )
+            kv_fp8 = self._kv_b_proj_gather(
                 ag_kv.unsqueeze(1),
                 chunk_meta.cu_seqlens_k[c],
                 chunk_meta.ag_row_indices[c],
                 chunk_meta.cu_seqlens_k[c],
                 k_chunk,
                 v_chunk,
+                kv_out_scales=chunk_scales,
             )
 
             # 4. flash attention over the (unmasked) context chunk.
@@ -1671,10 +1937,10 @@ class MLAAttention(nn.Module):
             # `self.qk_head_dim`, and both are the WIDENED 320 for a NoPE
             # model, which CK's 256 head-dim cap refuses.
             prefill_q, k_chunk = self._drop_rope_pad(prefill_q, k_chunk)
-            ctx_out, ctx_lse = flash_attn_varlen_func(
-                q=prefill_q,
-                k=k_chunk,
-                v=v_chunk,
+            ctx_out, ctx_lse = self._flash_attn_prefill(
+                prefill_q,
+                k_chunk,
+                v_chunk,
                 cu_seqlens_q=attn_metadata.cu_seqlens_q[
                     : chunk_meta.cu_seqlens_k[c].shape[0]
                 ],
@@ -1683,9 +1949,10 @@ class MLAAttention(nn.Module):
                 max_seqlen_k=chunk_meta.max_seqlen_k[c],
                 min_seqlen_q=attn_metadata.min_seqlen_q,
                 dropout_p=attn_metadata.dropout_p,
-                softmax_scale=self.scale,
                 causal=False,
                 return_lse=True,
+                q_fp8=q_fp8,
+                kv_fp8=kv_fp8,
             )
 
             # 5. LSE-merge across chunks.
@@ -1827,17 +2094,16 @@ class MLAAttention(nn.Module):
             k = torch.cat((k_nope, k_rope.expand((*k_nope.shape[:-1], -1))), dim=-1)
 
         q, k = self._drop_rope_pad(q, k)
-        output = flash_attn_varlen_func(
-            q=q,
-            k=k,
-            v=v,
+        output = self._flash_attn_prefill(
+            q,
+            k,
+            v,
             cu_seqlens_q=attn_metadata.cu_seqlens_q,
             cu_seqlens_k=attn_metadata.cu_seqlens_k,
             max_seqlen_q=attn_metadata.max_seqlen_q,
             max_seqlen_k=attn_metadata.max_seqlen_k,
             min_seqlen_q=attn_metadata.min_seqlen_q,
             dropout_p=attn_metadata.dropout_p,
-            softmax_scale=self.scale,
             causal=True,
         )
 
