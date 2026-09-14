@@ -24,6 +24,7 @@ from atom.model_ops.sparse_indexer_fp4 import (
     assert_fp4_indexer_supported,
     fp4_decode_parallel_units,
     fp4_decode_schedule,
+    fp4_index_scale_rows,
     fp4_prefill_schedule,
     fp4_q_scale_shape,
     sparse_indexer_fp4_enabled,
@@ -268,7 +269,7 @@ def _oracle(q_fp4, q_scale, kv_cache, kv_scale, table, ctx_len, weights, rows_of
     pos = (token % _BLOCK).expand(batch, ctx_len).unsqueeze(-1)
     group = torch.arange(4, device=kv_cache.device)
     packed = kv_cache[phys, 0, group, pos].reshape(batch, ctx_len, HEAD_DIM // 2)
-    keys = _dequant(packed, kv_scale[phys, 0, group, (pos % 16) * 4 + pos // 16])
+    keys = _dequant(packed, kv_scale[phys, 0, group, fp4_index_scale_rows(pos, _BLOCK)])
     # `[T, k_tiles, 4, 16, qs_pad]` -> the dense `[T, H, D // 32]` a reader sees.
     dense = (
         q_scale[..., : HEADS // 16]
@@ -420,6 +421,63 @@ def test_dcp_decode_scores_each_query_token_over_its_own_local_window(on_gfx950)
         lambda keys: keys.repeat_interleave(next_n, dim=0),
     )
     _assert_agrees(logits, want, local_ctx, topk=512)
+
+
+def test_dcp_prefill_staging_keeps_every_key_with_its_own_exponent(monkeypatch):
+    """Staging moves two planes whose row axes disagree -- the packed one flat,
+    the e8m0 one transposed -- so it cannot address them with a single index.
+
+    Every index stays in bounds either way, so the failure is silent: keys come
+    back wearing another row's exponent. Real exponents are nearly uniform
+    inside a block because `k_norm` precedes the quantizer, which is why an
+    end-to-end accuracy run can pass with this broken; the random planes here
+    remove that cover.
+    """
+    dsv2 = pytest.importorskip("atom.models.deepseek_v2")
+
+    torch.manual_seed(0)
+    block, world, src_pages = _BLOCK, 2, 4
+    local = 64
+    total_kv = world * local
+    shape = {"dtype": torch.uint8, "device": "cpu"}
+    data_src = torch.randint(0, 256, (src_pages, 1, 4, block, 16), **shape)
+    scale_src = torch.randint(0, 256, (src_pages, 1, 4, block), **shape)
+
+    # This rank's slots, spread over pages and rows so no source row equals the
+    # destination row it lands on; the gather then reorders them again.
+    slots = torch.randperm(src_pages * block)[:local].to(torch.int32)
+    gather_index = torch.randperm(total_kv).to(torch.int32)
+    monkeypatch.setattr(
+        dsv2,
+        "get_dcp_group",
+        lambda: SimpleNamespace(
+            all_gather=lambda t, dim: t.repeat(world, *([1] * (t.dim() - 1)))
+        ),
+    )
+
+    staged, staged_scale = dsv2._dcp_stage_indexer_fp4_prefill(
+        data_src,
+        scale_src,
+        SimpleNamespace(
+            dcp_indexer_fp4_local_slots=slots,
+            dcp_indexer_gather_index=gather_index,
+        ),
+        total_kv,
+        block,
+    )
+
+    src = slots[gather_index.long() % local].long()
+    got_rows = torch.arange(total_kv)
+    q_dst = fp4_index_scale_rows(got_rows % block, block)
+    q_src = fp4_index_scale_rows(src % block, block)
+    assert torch.equal(
+        staged[got_rows // block, 0, :, got_rows % block, :],
+        data_src[src // block, 0, :, src % block, :],
+    )
+    assert torch.equal(
+        staged_scale[got_rows // block, 0, :, q_dst],
+        scale_src[src // block, 0, :, q_src],
+    )
 
 
 def test_staged_page_table_is_bounded_by_the_block_table_width():

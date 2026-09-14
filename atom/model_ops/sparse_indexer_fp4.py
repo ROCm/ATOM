@@ -148,6 +148,29 @@ def fp4_q_scale_shape(tokens: int, heads: int, head_dim: int) -> tuple:
     return (tokens, head_dim // _K_TILE, 4, _MFMA_M, -(-m_tiles // 4) * 4)
 
 
+def fp4_index_scale_rows(rows: torch.Tensor, block_size: int) -> torch.Tensor:
+    """Where logical block rows `rows` sit on the e8m0 plane's row axis.
+
+    `indexer_qk_rope_quant_and_cache` stores that axis as an `_MFMA_M`-wide
+    transpose of the packed plane's, which is flat. Everything else addresses
+    both planes by the same logical row, so any reader that moves the two
+    together has to bend exactly here or it mixes exponents across a block --
+    silently, since every index stays in bounds.
+
+    `block_size` is the caller's own page size, taken rather than assumed: the
+    lane count is a property of the plane the kernel wrote, and a caller paging
+    the cache differently would otherwise get a wrong mapping that is still
+    in-bounds. `fp4_index_block_shapes` is what holds the two equal.
+    """
+    if block_size != FP4_KV_BLOCK_SIZE:
+        raise ValueError(
+            f"the FP4 e8m0 row swizzle describes {FP4_KV_BLOCK_SIZE}-row blocks, "
+            f"got {block_size}"
+        )
+    lanes = FP4_KV_BLOCK_SIZE // _MFMA_M
+    return (rows % _MFMA_M) * lanes + rows // _MFMA_M
+
+
 def fp4_index_block_shapes(rows: int, head_dim: int) -> tuple[tuple, tuple]:
     """One block's packed-E2M1 and e8m0 shapes, for one indexer layer."""
     if rows != FP4_KV_BLOCK_SIZE:
