@@ -655,7 +655,21 @@ def _block_ids(blocks) -> list[int]:
         and blocks
         and isinstance(blocks[0], (list, tuple))
     ):
-        return [int(b) for group in blocks for b in group]
+        # One group is the supported shape and unwraps to its ids. More than one
+        # means vLLM is paging this request against several independent block
+        # tables; concatenating them yields a list whose positions no longer map
+        # to token offsets, and the codec would happily copy bytes into the
+        # wrong blocks with nothing logged. ``build_kv_cache_tensors`` rejects
+        # the same condition from the tensor side at registration; this is the
+        # per-request half, for a model that only splits groups later.
+        if len(blocks) > 1:
+            raise ValueError(
+                "ATOM offload connector: vLLM allocated blocks in "
+                f"{len(blocks)} KV cache groups "
+                f"(sizes={[len(g) for g in blocks]}); the byte codec addresses "
+                "KV with a single block table and cannot flatten them."
+            )
+        return [int(b) for b in blocks[0]]
     return [int(b) for b in (blocks or [])]
 
 
