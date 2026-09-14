@@ -22,6 +22,7 @@ _ATOM_ENV_VARS = [
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT",
     "ATOM_TORCH_PROFILER_DIR",
     "ATOM_ENABLE_METRICS_DEVICE_TIMER",
+    "ATOM_METRICS_UPDATE_INTERVAL_S",
     "ATOM_PROFILER_MORE",
     "ATOM_PROFILER_TIMEOUT",
     "ATOM_LOG_MORE",
@@ -80,6 +81,9 @@ class TestEnvsDefaults:
 
     def test_metrics_device_timer_default_disabled(self):
         assert _get_envs().ATOM_ENABLE_METRICS_DEVICE_TIMER is False
+
+    def test_metrics_update_interval_default(self):
+        assert _get_envs().ATOM_METRICS_UPDATE_INTERVAL_S == 1.0
 
     def test_profiler_more_default(self):
         assert _get_envs().ATOM_PROFILER_MORE is False
@@ -141,6 +145,17 @@ class TestEnvsOverrides:
     def test_metrics_device_timer_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_ENABLE_METRICS_DEVICE_TIMER", "1")
         assert _get_envs().ATOM_ENABLE_METRICS_DEVICE_TIMER is True
+
+    @pytest.mark.parametrize("value", ["0.25", "5"])
+    def test_metrics_update_interval_override(self, monkeypatch, value):
+        monkeypatch.setenv("ATOM_METRICS_UPDATE_INTERVAL_S", value)
+        assert _get_envs().ATOM_METRICS_UPDATE_INTERVAL_S == float(value)
+
+    @pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "-inf", "", "bad"])
+    def test_metrics_update_interval_rejects_invalid_values(self, monkeypatch, value):
+        monkeypatch.setenv("ATOM_METRICS_UPDATE_INTERVAL_S", value)
+        with pytest.raises(ValueError, match="ATOM_METRICS_UPDATE_INTERVAL_S"):
+            _ = _get_envs().ATOM_METRICS_UPDATE_INTERVAL_S
 
     def test_profiler_timeout_override(self, monkeypatch):
         monkeypatch.setenv("ATOM_PROFILER_TIMEOUT", "900")

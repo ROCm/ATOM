@@ -381,7 +381,6 @@ _ANTHROPIC_PING_FRAME = event_frame("ping", {"type": "ping"})
 _ANTHROPIC_PING_INTERVAL_SECONDS = 5.0
 _metrics_exporter, _request_metrics, _stream_metrics = create_metrics_exporter()
 _background_tasks: list[asyncio.Task] = []
-_METRICS_REFRESH_INTERVAL_SECONDS = 1.0
 # The watch compares two `gc.get_stats()` reads against something that moves on
 # the scale of minutes, so it has no reason to ride the metrics cadence.
 _GC_WATCH_INTERVAL_SECONDS = 60.0
@@ -1588,6 +1587,7 @@ async def _periodic(interval: float, step: Callable[[], Awaitable[None]]) -> Non
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown."""
+    metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
     logger.info("Server started successfully and ready to accept requests")
     tune_gc()
     maybe_attach_gc_debug_callback("api_server")
@@ -1600,7 +1600,7 @@ async def lifespan(app: FastAPI):
     _background_tasks[:] = [
         asyncio.create_task(_periodic(interval, step), name=step.__name__)
         for interval, step in (
-            (_METRICS_REFRESH_INTERVAL_SECONDS, _refresh_metrics_once),
+            (metrics_interval, _refresh_metrics_once),
             (_GC_WATCH_INTERVAL_SECONDS, _reclaim_watch_once),
         )
     ]

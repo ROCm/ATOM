@@ -39,6 +39,57 @@ def samples(exporter):
     }
 
 
+@pytest.mark.parametrize("kind", ["ordinary", "dp", "pp_head", "pp_downstream"])
+@pytest.mark.parametrize("configured", [None, "0.25"])
+def test_engine_push_loops_use_shared_interval(monkeypatch, kind, configured):
+    from aiter_stub import stubbed_aiter
+
+    with stubbed_aiter():
+        from atom.model_engine import engine_core, pp_engine_core
+
+    if configured is None:
+        monkeypatch.delenv("ATOM_METRICS_UPDATE_INTERVAL_S", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_METRICS_UPDATE_INTERVAL_S", configured)
+    interval = float(configured or 1)
+    now = [0.0]
+    ticks = iter([0, interval / 2, interval, 2 * interval])
+    pushed = []
+    timer = SimpleNamespace(monotonic=lambda: now[0], sleep=lambda _: None)
+    monkeypatch.setattr(engine_core, "time", timer)
+    monkeypatch.setattr(pp_engine_core, "time", timer)
+    proc = SimpleNamespace(
+        label="test",
+        utility_queue=None,
+        kv_transfer_enabled=False,
+        _is_rl_weights_offloaded=True,
+        _is_idle_rl_weights_offloaded=lambda: True,
+        _drain_kv_work_at_exit=lambda: None,
+        pull_and_process_input_queue=lambda: now[0] >= 2 * interval,
+        _sync_dp_state=lambda unfinished, shutdown, offloaded: (False, shutdown, True),
+        runner_mgr=SimpleNamespace(call_func=lambda *args, **kwargs: None),
+        scheduler=SimpleNamespace(
+            heartbeat_throughput=lambda _: None,
+            is_finished=lambda: True,
+            publish_kv_events=lambda: None,
+            shutdown_kv_events=lambda: None,
+        ),
+        utility_handler=SimpleNamespace(
+            process_queue=lambda *args: now.__setitem__(0, next(ticks)),
+            push_metrics=lambda **kwargs: pushed.append((now[0], kwargs)),
+        ),
+    )
+    loops = {
+        "ordinary": engine_core.EngineCore.busy_loop,
+        "dp": engine_core.DPEngineCoreProc.busy_loop,
+        "pp_head": pp_engine_core.PPEngineCoreProc._head_busy_loop,
+        "pp_downstream": pp_engine_core.PPEngineCoreProc._downstream_busy_loop,
+    }
+    loops[kind](proc)
+    options = {"scheduler_metrics": False} if kind == "pp_downstream" else {}
+    assert pushed == [(tick, options) for tick in (0, interval, 2 * interval)]
+
+
 def test_queue_includes_kv_wait_and_counts_first_forward_once(clock):
     metrics = SchedulerMetrics()
     seq = SimpleNamespace(id=7, kv_transfer_params={"do_remote_prefill": True})

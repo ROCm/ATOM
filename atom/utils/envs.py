@@ -18,9 +18,21 @@ Third-party / dependency env vars (NCCL, torch, HuggingFace, AITER, FLA) are
 documented at the bottom of this file but NOT managed here.
 """
 
+import math
 import os
 from collections.abc import Callable
 from typing import Any
+
+
+def _positive_float_env(name: str, default: str) -> float:
+    try:
+        value = float(os.getenv(name, default))
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a finite positive number") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a finite positive number")
+    return value
+
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
@@ -278,6 +290,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT", "1") == "1"
     ),
     # --- Profiling & Logging ---
+    "ATOM_METRICS_UPDATE_INTERVAL_S": lambda: _positive_float_env(
+        "ATOM_METRICS_UPDATE_INTERVAL_S", "1.0"
+    ),
     "ATOM_ENABLE_METRICS_DEVICE_TIMER": lambda: os.getenv(
         "ATOM_ENABLE_METRICS_DEVICE_TIMER", "0"
     )

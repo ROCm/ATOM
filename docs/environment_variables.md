@@ -209,6 +209,7 @@ discoverable from the central env reference despite bypassing the registry.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
+| **ATOM_METRICS_UPDATE_INTERVAL_S** | float | 1.0 | Shared interval in seconds for ordinary/DP/PP engine metrics pushes and API snapshot refresh. Must be finite and positive; read when each loop starts, so set it before starting every service process. Prometheus scraping is configured independently. Does not cache rendered `/metrics` responses or change when histogram observations are recorded. |
 | **ATOM_ENABLE_METRICS_DEVICE_TIMER** | bool | 0 (false) | Set to `1` before starting the service to collect GPU forward duration and cumulative request prefill GPU time. Uses CUDA/HIP events, a reusable pool capped at 256 pending pairs, and FIFO polling that stops at the first incomplete event. Adds event recording and query overhead; disabled services emit no GPU timing samples. Agentic dashboard CI explicitly enables it. |
 | **ATOM_TORCH_PROFILER_DIR** | str | — | When set, enables PyTorch profiler and writes traces to this directory. Create subdirectories per rank (e.g., `rank_0`, `dp0_tp0`). |
 | **ATOM_PROFILER_MORE** | bool | 0 (false) | When `ATOM_TORCH_PROFILER_DIR` is set and this is `1`, enables detailed profiling: `record_shapes`, `with_stack`, and `profile_memory`. Applies to both the run-phase profiler and the CUDA-graph capture profiler. |

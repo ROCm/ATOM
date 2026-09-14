@@ -45,11 +45,6 @@ from atom.utils.gc_utils import (
 
 logger = logging.getLogger("atom")
 
-# How often each EngineCore publishes its metrics snapshot. Kept at the API
-# server's scrape interval: the exporter reads a cache, so this bounds how
-# stale a Prometheus sample can be.
-METRICS_PUSH_INTERVAL_S = 1.0
-
 # Pace of the idle KV drain. The busy loops never block, so an unpaced drain
 # would fire one worker RPC round per spin; 1ms matches the PP head's existing
 # idle token-poll timeout and is far below any transfer latency.
@@ -340,13 +335,14 @@ class EngineCore:
 
     def busy_loop(self):
         shutdown = False
+        metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
         next_metrics_push = 0.0
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
                 now = time.monotonic()
                 if now >= next_metrics_push:
-                    next_metrics_push = now + METRICS_PUSH_INTERVAL_S
+                    next_metrics_push = now + metrics_interval
                     self.utility_handler.push_metrics()
                 self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()
@@ -765,13 +761,14 @@ class DPEngineCoreProc(EngineCore):
 
     def busy_loop(self):
         shutdown = False
+        metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
         next_metrics_push = 0.0
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
                 now = time.monotonic()
                 if now >= next_metrics_push:
-                    next_metrics_push = now + METRICS_PUSH_INTERVAL_S
+                    next_metrics_push = now + metrics_interval
                     self.utility_handler.push_metrics()
                 self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()

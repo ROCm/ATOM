@@ -16,8 +16,9 @@ from atom.kv_transfer.disaggregation.types import (
     completion_req_key,
     connector_metadata_has_work,
 )
-from atom.model_engine.engine_core import METRICS_PUSH_INTERVAL_S, EngineCore
+from atom.model_engine.engine_core import EngineCore
 from atom.model_engine.scheduler import ScheduledBatch
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -64,13 +65,14 @@ class PPEngineCoreProc(EngineCore):
 
     def _head_busy_loop(self):
         shutdown = False
+        metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
         next_metrics_push = 0.0
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
                 now = time.monotonic()
                 if now >= next_metrics_push:
-                    next_metrics_push = now + METRICS_PUSH_INTERVAL_S
+                    next_metrics_push = now + metrics_interval
                     self.utility_handler.push_metrics()
                 self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()
@@ -383,13 +385,14 @@ class PPEngineCoreProc(EngineCore):
 
     def _downstream_busy_loop(self):
         shutdown = False
+        metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
         next_metrics_push = 0.0
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
                 now = time.monotonic()
                 if now >= next_metrics_push:
-                    next_metrics_push = now + METRICS_PUSH_INTERVAL_S
+                    next_metrics_push = now + metrics_interval
                     self.utility_handler.push_metrics(scheduler_metrics=False)
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 if shutdown:

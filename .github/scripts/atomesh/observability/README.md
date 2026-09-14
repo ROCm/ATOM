@@ -111,11 +111,21 @@ user, setup installs Rust 1.94.0 into that cache; `ATOMESH_MESH_RUST_TOOLCHAIN`
 can select another fallback version. These settings pass through the existing
 CI environment handling and are independent of metrics collection.
 
-The TSDB uses temporary node-local storage. Scraping and engine/API snapshots run
-every second (subject to engine progress). Histogram observations accumulate at
-each event, including events between scrapes. Plots use five-second steps;
-histogram points summarize the preceding 60 seconds, while queues and KV panels
-show sampled state. Brief queue peaks between snapshots may be missed.
+The TSDB uses temporary node-local storage. Scraping and engine/API snapshots
+default to every second (subject to engine progress). Set
+`ATOM_METRICS_UPDATE_INTERVAL_S` before starting all service processes to change
+the shared internal update interval; it must be finite and positive. Configure
+the collector separately with `--scrape-interval-seconds`, placed before the
+`--` introducing the benchmark command. It accepts seconds at millisecond
+precision, with a minimum of `0.001`; for example, `0.5` produces `500ms` scrapes.
+The scrape timeout is the smaller of the interval and one second. Startup,
+baseline and final-scrape waits grow as needed for longer intervals.
+
+Histogram observations accumulate at each event, including events between
+scrapes. Plots use five-second steps; histogram points summarize the preceding
+`max(60, 4 × scrape interval)` seconds, while queues and KV panels show sampled
+state. Brief queue peaks between snapshots may be missed. These settings do not
+add a periodic text cache to `/metrics`; responses are still rendered on demand.
 Each invocation uses a
 fresh TSDB and counter baselines, so previous benchmark traffic is excluded.
 Collection covers the complete AIPerf invocation, including its warmup and drain.

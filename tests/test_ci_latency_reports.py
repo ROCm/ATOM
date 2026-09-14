@@ -2,11 +2,13 @@ import argparse
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from prometheus_client import (
@@ -42,6 +44,7 @@ def test_targets_preserve_distinct_hosts_ports_and_roles(collector):
         "127.0.0.1:30100",
     )
     api, mesh = config["scrape_configs"]
+    assert config["global"] == {"scrape_interval": "1s", "scrape_timeout": "1s"}
     assert api["static_configs"][0] == {
         "targets": ["10.0.0.1:8010", "10.0.0.1:8011"],
         "labels": {"observer": "api", "role": "prefill"},
@@ -50,6 +53,136 @@ def test_targets_preserve_distinct_hosts_ports_and_roles(collector):
     assert mesh["static_configs"][0]["targets"] == ["127.0.0.1:30100"]
     with pytest.raises(ValueError):
         collector.scrape_config(["user:secret@host:8010"], ["host:8020"], "host:29100")
+
+
+@pytest.mark.parametrize(
+    "interval,duration,timeout",
+    [
+        (0.001, "1ms", "1ms"),
+        (0.5, "500ms", "500ms"),
+        (1.25, "1250ms", "1s"),
+        (5, "5s", "1s"),
+    ],
+)
+def test_scrape_interval_and_timeout(collector, interval, duration, timeout):
+    config = collector.scrape_config(
+        ["host:8010"], ["host:8020"], "host:29100", interval
+    )
+    assert config["global"] == {"scrape_interval": duration, "scrape_timeout": timeout}
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "0.0001", "1e100", "bad"])
+def test_scrape_interval_rejects_invalid_values(collector, value):
+    with pytest.raises(argparse.ArgumentTypeError):
+        collector.scrape_interval_seconds(value)
+
+
+@pytest.mark.parametrize(
+    "option,expected", [([], 1.0), (["--scrape-interval-seconds", "0.5"], 0.5)]
+)
+def test_scrape_interval_cli(collector, monkeypatch, option, expected):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "collect_metrics.py",
+            "--output",
+            "unused",
+            "--model",
+            "test",
+            "--prefill",
+            "host:8010",
+            "--decode",
+            "host:8020",
+            "--mesh",
+            "host:29100",
+            *option,
+            "--",
+            "benchmark",
+        ],
+    )
+    received = []
+    monkeypatch.setattr(collector, "run", lambda args: received.append(args))
+    collector.main()
+    assert received[0].scrape_interval_seconds == expected
+    assert received[0].command == ["benchmark"]
+
+
+@pytest.mark.parametrize(
+    "interval,baseline,ready_timeout,final_timeout,window,cancel",
+    [
+        (0.5, 6, 45, 30, 60, False),
+        (1.0, 6, 45, 30, 60, False),
+        (30, 60, 65, 70, 120, False),
+        (30, 0.5, 65, 70, 120, True),
+    ],
+)
+def test_collector_interval_waits_and_report_window(
+    collector,
+    monkeypatch,
+    tmp_path,
+    interval,
+    baseline,
+    ready_timeout,
+    final_timeout,
+    window,
+    cancel,
+):
+    clock = [0.0]
+    handlers = {}
+
+    def sleep(seconds):
+        clock[0] += seconds
+        if cancel:
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+
+    monkeypatch.setattr(collector.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(collector.time, "sleep", sleep)
+    monkeypatch.setattr(
+        collector.signal, "signal", lambda sig, fn: handlers.update({sig: fn})
+    )
+    monkeypatch.setattr(collector, "ensure_prometheus", lambda _: "prometheus")
+    process = Mock(returncode=0)
+    process.poll.return_value = 0
+    popen = Mock(return_value=process)
+    monkeypatch.setattr(collector.subprocess, "Popen", popen)
+    ready = Mock(return_value="http://127.0.0.1:9090")
+    final = Mock(return_value=collector.time.time())
+    monkeypatch.setattr(collector, "wait_for_prometheus", ready)
+    monkeypatch.setattr(collector, "wait_for_final_scrape", final)
+    monkeypatch.setattr(collector, "get_json", lambda _: {"data": {"result": []}})
+    report_windows = []
+
+    def collect_report(_url, start, end, **kwargs):
+        report_windows.append(kwargs["window"])
+        return collector.empty_report(start, end, "test", [], window=kwargs["window"])
+
+    monkeypatch.setattr(collector.export_report, "collect_report", collect_report)
+    args = argparse.Namespace(
+        output=tmp_path / "report",
+        model="test",
+        prefill=["host:8010"],
+        decode=["host:8020"],
+        mesh="host:29100",
+        command=["benchmark"],
+        scrape_interval_seconds=interval,
+    )
+    assert collector.run(args) == (128 + signal.SIGTERM if cancel else 0)
+    assert clock[0] == baseline
+    assert ready.call_args.kwargs["timeout"] == ready_timeout
+    assert final.call_args.kwargs["timeout"] == final_timeout
+    assert report_windows == [window]
+    assert popen.call_count == (1 if cancel else 2)
+    data = json.loads((args.output / "report-data.json").read_text())
+    assert data["meta"]["window"] == window
+    assert any(f"preceding {window} seconds" in note for note in data["meta"]["notes"])
+
+
+def test_collector_startup_wait_is_interruptible(collector, tmp_path):
+    with pytest.raises(RuntimeError, match="interrupted during startup"):
+        collector.wait_for_prometheus(
+            Mock(), tmp_path / "unused.log", 3, timeout=3600, interrupted=lambda: True
+        )
 
 
 @pytest.mark.parametrize("exit_code", [0, 17])
@@ -67,6 +200,7 @@ def test_collector_setup_failure_preserves_benchmark_exit_and_diagnostic_report(
         prefill=["127.0.0.1:8010"],
         decode=["127.0.0.1:8020"],
         mesh="127.0.0.1:29100",
+        scrape_interval_seconds=1.0,
         command=[
             sys.executable,
             "-c",
@@ -137,6 +271,7 @@ def test_publication_failure_preserves_benchmark_exit(
         prefill=["127.0.0.1:8010"],
         decode=["127.0.0.1:8020"],
         mesh="127.0.0.1:29100",
+        scrape_interval_seconds=1.0,
         command=[sys.executable, "-c", f"raise SystemExit({exit_code})"],
     )
     assert collector.run(args) == exit_code
@@ -529,6 +664,8 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
                 other_target,
                 "--mesh",
                 target,
+                "--scrape-interval-seconds",
+                "0.5",
                 "--",
                 sys.executable,
                 str(benchmark),
@@ -544,6 +681,11 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
             check=False,
         )
         assert completed.returncode == 7, completed.stdout + completed.stderr
+        config = json.loads((output / "prometheus.yml").read_text())
+        assert config["global"] == {
+            "scrape_interval": "500ms",
+            "scrape_timeout": "500ms",
+        }
         status = json.loads((output / "status.json").read_text())
         assert status["status"] == "partial" and status["errors"] == []
         data = json.loads((output / "report-data.json").read_text())

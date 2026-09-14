@@ -46,7 +46,7 @@ must remain bounded. Engine snapshots retain their existing refresh interval.
                            ▲                            │        Engine     ┤
                            │                            │                   │
              exporter.update(snapshot) ◄────────────────┴─── METRICS push ──┘
-                    (1 Hz refresh loop)                      (engine clock)
+                    (configured refresh loop)                (engine clock)
 ```
 
 There are exactly **two ways** a number gets exported, and which one you need is
@@ -70,8 +70,17 @@ into `MetricFamily` objects at render time.
 Used by `collect_scheduler_metrics`, `collect_gpu_metrics`,
 `collect_engine_metrics`, and the legacy `_AtomMetricsCollector`.
 
-The snapshot is refreshed by `_refresh_metrics_once()` in `api_server.py` once
-per second (`_METRICS_REFRESH_INTERVAL_SECONDS = 1.0`), independently of scrapes.
+Engine pushes (including DP and both PP stage roles) and API snapshot refresh
+share `ATOM_METRICS_UPDATE_INTERVAL_S`, defaulting to one second. Set this finite,
+positive value before starting the service; each loop reads it once at startup.
+The loops run independently and are subject to engine progress. Prometheus
+scraping has its own interval; the CI collector accepts
+`--scrape-interval-seconds` (default `1`, minimum `0.001`, millisecond precision).
+For example, `ATOM_METRICS_UPDATE_INTERVAL_S=0.5` updates internal snapshots twice
+per second while the collector can continue scraping once per second.
+
+Snapshot refresh is independent of on-demand text rendering and does not impose
+a periodic cache on API TTFT/ITL observations.
 `render()` pins one snapshot revision in a `ContextVar` for the whole response,
 so every snapshot collector in a single scrape sees the same revision even if
 the refresh loop fires concurrently. Published snapshots are private and never
