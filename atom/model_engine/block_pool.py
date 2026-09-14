@@ -58,6 +58,11 @@ class BlockPool:
     freed again, which is the LRU order inverted for exactly the blocks being
     reused most. Removing it costs O(1) here and O(n) from a deque, on a path
     that runs once per hit block.
+
+    Optional ``slru`` puts blocks claimed for reuse into a bounded protected
+    queue on release. New content remains probationary until claimed, so a
+    stream of one-off prefixes cannot evict the whole hot set. Vacant blocks
+    still go first; referenced blocks are never candidates in either policy.
     """
 
     def __init__(
@@ -65,7 +70,18 @@ class BlockPool:
         num_blocks: int,
         on_evict: Callable[[int], None] | None = None,
         max_blocks: int | None = None,
+        cache_policy: str = "lru",
+        protected_ratio: float = 0.5,
     ):
+        cache_policy = cache_policy.strip().lower()
+        if cache_policy not in {"lru", "slru"}:
+            raise ValueError(f"unknown prefix cache policy: {cache_policy!r}")
+        if not 0 < protected_ratio < 1:
+            raise ValueError("protected_ratio must be between 0 and 1")
+        self.cache_policy = cache_policy
+        self.protected_ratio = protected_ratio
+        self._protected: OrderedDict[int, None] = OrderedDict()
+        self._reused: set[int] = set()
         # `max_blocks` is how far `extend` may go, and so how many Block
         # objects exist. It is the pool's share of a fixed plane rather than
         # its current size; a pool with a pinned boundary passes neither and
@@ -180,6 +196,8 @@ class BlockPool:
         # only ever decided from its hash — so the split has to be redrawn
         # here rather than left to drift.
         self._cached.clear()
+        self._protected.clear()
+        self._reused.clear()
         self._vacant = sorted(self._free)
         heapify(self._vacant)
 
@@ -192,6 +210,8 @@ class BlockPool:
         callers that count evictions must not count those.
         """
         block = self.blocks[block_id]
+        self._protected.pop(block_id, None)
+        self._reused.discard(block_id)
         dropped = False
         if block.hash != -1 and self._hash_to_block_id.get(block.hash) == block_id:
             del self._hash_to_block_id[block.hash]
@@ -223,6 +243,11 @@ class BlockPool:
             if block_id in self._free and self.blocks[block_id].hash != -1:
                 self._free.discard(block_id)
                 return block_id
+        while self._protected:
+            block_id, _ = self._protected.popitem(last=False)
+            if block_id in self._free and self.blocks[block_id].hash != -1:
+                self._free.discard(block_id)
+                return block_id
         return -1
 
     def pop(self) -> int:
@@ -241,6 +266,7 @@ class BlockPool:
         """
         self._free.discard(block_id)
         self._cached.pop(block_id, None)
+        self._protected.pop(block_id, None)
 
     def allocate(self, block_id: int) -> Block:
         """Take `block_id` for fresh content, evicting whatever it held."""
@@ -261,6 +287,8 @@ class BlockPool:
         every other request that could still hit it.
         """
         block = self.blocks[block_id]
+        if self.cache_policy == "slru" and block.hash != -1:
+            self._reused.add(block_id)
         if block_id in self._used:
             block.ref_count += 1
         else:
@@ -282,7 +310,11 @@ class BlockPool:
         self._used.remove(block_id)
         self._free.add(block_id)
         if block.hash != -1:
-            self._cached[block_id] = None
+            if block_id in self._reused:
+                self._protected[block_id] = None
+                self._trim_protected()
+            else:
+                self._cached[block_id] = None
             return
         heappush(self._vacant, block_id)
         # Stale entries are skipped, not removed, so the heap can outgrow the
@@ -291,6 +323,14 @@ class BlockPool:
         if len(self._vacant) > 2 * self.num_blocks + 2:
             self._vacant = [b for b in self._free if self.blocks[b].hash == -1]
             heapify(self._vacant)
+
+    def _trim_protected(self) -> None:
+        # Bound protection so new prefixes can compete for cache space.
+        limit = int(self.num_blocks * self.protected_ratio)
+        while len(self._protected) > limit:
+            block_id, _ = self._protected.popitem(last=False)
+            self._reused.discard(block_id)
+            self._cached[block_id] = None
 
     def reserve_units(self, count: int, owner: Hashable) -> list[int] | None:
         """Reserve arbitrary PAGE-sized units for raw storage."""
@@ -369,6 +409,7 @@ class BlockPool:
                 return None
             self._adopt(destination, top)
         self.num_blocks -= 1
+        self._trim_protected()
         return BlockRetirement(top, destination)
 
     def _adopt(self, destination: int, source: int) -> None:
@@ -385,6 +426,9 @@ class BlockPool:
         if self._unindex(destination):
             self.blocks_retired += 1
         src, dst = self.blocks[source], self.blocks[destination]
+        if source in self._reused:
+            self._reused.discard(source)
+            self._reused.add(destination)
         dst.ref_count, dst.hash, dst.token_ids = src.ref_count, src.hash, src.token_ids
         if src.hash != -1 and self._hash_to_block_id.get(src.hash) == source:
             self._hash_to_block_id[src.hash] = destination

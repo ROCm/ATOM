@@ -64,9 +64,13 @@ class TritonMLAMetadataBuilder(AiterMLAMetadataBuilder):
         self.model_runner.forward_vars.update(triton_mla_buffers)
 
     def set_mla_persistent_worker_buffers(
-        self, bs, max_q_len, only_update=False, num_reject_tokens=None
+        self, bs, max_q_len, only_update=False, num_reject_tokens=None, **kwargs
     ):
-        # Triton MLA does not use aiter persistent worker buffers
+        # Triton MLA does not use aiter persistent worker buffers.
+        # `**kwargs` absorbs arguments the aiter caller grows over time (e.g.
+        # `is_cp_round_robin`); this override returns nothing, so ignoring them
+        # is correct, and pinning the exact signature only breaks the Triton
+        # path whenever the aiter side adds a keyword.
         return {}
 
     def _cut_decode_buffers(

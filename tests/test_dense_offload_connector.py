@@ -22,6 +22,7 @@ from atom.kv_transfer.offload.metadata import (
     SaveSpec,
 )
 from atom.model_engine.scheduler import Scheduler
+from atom.model_engine.sequence import SequenceStatus
 
 
 def _config(role="offload"):
@@ -423,3 +424,185 @@ def test_dense_lookup_unpin_passes_one_string_id():
     finally:
         worker._save_executor.shutdown(wait=True)
         worker._load_executor.shutdown(wait=True)
+
+
+@pytest.mark.parametrize("outcome", ["hbm_hit", "small_hit", "cancel", "miss", "error"])
+def test_unused_lookup_releases_worker_pin(monkeypatch, outcome):
+    scheduler = _scheduler(monkeypatch, "kv_consumer")
+    worker = DenseOffloadConnector(_config("kv_consumer"))
+    pins = set()
+    calls = []
+
+    def lookup(_tokens, lookup_id):
+        pins.add(lookup_id)
+        calls.append(lookup_id)
+        if outcome == "error":
+            raise RuntimeError("lookup transport failed after a worker pinned")
+        return 0 if outcome == "miss" else 16
+
+    scheduler._lookup_client = SimpleNamespace(
+        lookup=lookup, clear_lookup_status=lambda _sid: None
+    )
+    worker._engine = SimpleNamespace(lookup_unpin=pins.discard)
+    seq = _load_seq(52, num_prompt_tokens=24)
+    if outcome == "hbm_hit":
+        seq.num_cached_tokens = 16
+    try:
+        scheduler.get_num_new_matched_tokens(seq)
+        if outcome == "cancel":
+            scheduler.cancel_pending_load(seq)
+        elif outcome == "small_hit":
+            scheduler.update_state_after_alloc(seq)
+        else:
+            # Repeated scheduler probes must not acquire another pin lease.
+            scheduler.get_num_new_matched_tokens(seq)
+        assert calls == ["52"]
+        assert scheduler.has_pending_work()
+        metadata = scheduler.build_connector_meta()
+        assert metadata.lookup_requests_in_step == ["52"]
+        worker.start_load_kv(metadata)
+        assert pins == set()
+        assert not scheduler.has_pending_work()
+    finally:
+        worker.close()
+
+
+def test_pending_load_keeps_pin_until_cancelled(monkeypatch):
+    scheduler = _scheduler(monkeypatch, "kv_consumer")
+    scheduler._lookup_client = SimpleNamespace(
+        lookup=lambda *_args, **_kwargs: 16,
+        clear_lookup_status=lambda _sid: None,
+    )
+    seq = _load_seq(53, num_prompt_tokens=24)
+    assert scheduler.get_num_new_matched_tokens(seq) == (16, True)
+    # A pre-allocation lookup is owned by the waiting request, not dispatchable
+    # idle work. It must retain its pin without keeping the idle drain alive.
+    assert not scheduler.has_pending_work()
+    assert scheduler.build_connector_meta().lookup_requests_in_step == []
+    scheduler.cancel_pending_load(seq)
+    assert scheduler.has_pending_work()
+    assert scheduler.build_connector_meta().lookup_requests_in_step == ["53"]
+    assert scheduler.build_connector_meta().lookup_requests_in_step == []
+
+
+def test_scheduler_abort_before_allocation_releases_lookup_pin(
+    monkeypatch, scheduler, seq_factory
+):
+    connector = _scheduler(monkeypatch, "kv_consumer")
+    worker = DenseOffloadConnector(_config("kv_consumer"))
+    pins = set()
+    calls = []
+
+    def lookup(_tokens, lookup_id):
+        calls.append(lookup_id)
+        pins.add(lookup_id)
+        return 16
+
+    connector._lookup_client = SimpleNamespace(
+        lookup=lookup, clear_lookup_status=lambda _sid: None
+    )
+    worker._engine = SimpleNamespace(lookup_unpin=pins.discard)
+    scheduler.kv_connector = connector
+    seq = seq_factory(list(range(24)))
+    scheduler.add(seq)
+    allocation_attempts = []
+
+    def cannot_allocate(value):
+        allocation_attempts.append(value.id)
+        return -1
+
+    monkeypatch.setattr(scheduler.block_manager, "can_allocate", cannot_allocate)
+    sid = str(seq.id)
+    try:
+        scheduler.schedule()
+        assert list(scheduler.waiting) == [seq]
+        assert calls == [sid]
+        assert allocation_attempts == [seq.id]
+        assert pins == {sid}
+        assert sid in connector._load_specs
+        assert not getattr(seq, "_counted_as_inflight_load", False)
+        assert connector.build_connector_meta().lookup_requests_in_step == []
+
+        seq.status = SequenceStatus.ABORTED
+        batch, scheduled = scheduler.schedule()
+        assert seq.status == SequenceStatus.FINISHED
+        assert scheduler._num_parked_remote_kv == 0
+        assert sid not in connector._load_specs
+        assert sid not in connector._load_lifecycles
+        assert scheduler.deferred_free_blocks == {}
+        assert scheduled == {}
+        # schedule() already dispatched cleanup into this empty batch.
+        meta = batch.connector_meta_output
+        assert meta.requests == []
+        assert meta.lookup_requests_in_step == [sid]
+        worker.start_load_kv(meta)
+        assert pins == set()
+        assert connector._lookup_results == {}
+        assert not connector.has_pending_work()
+        assert connector.build_connector_meta().lookup_requests_in_step == []
+    finally:
+        worker.close()
+
+
+def test_lookup_id_reuse_does_not_consume_an_old_pin(monkeypatch):
+    scheduler = _scheduler(monkeypatch, "kv_consumer")
+    calls = []
+    scheduler._lookup_client = SimpleNamespace(
+        lookup=lambda _tokens, lookup_id: calls.append(lookup_id) or 16,
+        clear_lookup_status=lambda _sid: None,
+    )
+    old = _load_seq(54, num_prompt_tokens=24)
+    new = _load_seq(54, num_prompt_tokens=32)
+    scheduler.get_num_new_matched_tokens(old)
+    scheduler.cancel_pending_load(old)
+    assert scheduler.get_num_new_matched_tokens(new) == (0, False)
+    assert calls == ["54"]
+    assert scheduler.build_connector_meta().lookup_requests_in_step == ["54"]
+    assert scheduler.get_num_new_matched_tokens(new) == (16, True)
+    assert calls == ["54", "54"]
+
+
+def test_hbm_catches_up_after_a_pending_cpu_lookup(monkeypatch):
+    scheduler = _scheduler(monkeypatch, "kv_consumer")
+    scheduler._lookup_client = SimpleNamespace(
+        lookup=lambda *_args, **_kwargs: 16,
+        clear_lookup_status=lambda _sid: None,
+    )
+    seq = _load_seq(55, num_prompt_tokens=24)
+    assert scheduler.get_num_new_matched_tokens(seq) == (16, True)
+    seq.num_cached_tokens = 16
+    assert scheduler.get_num_new_matched_tokens(seq) == (0, False)
+    metadata = scheduler.build_connector_meta()
+    assert metadata.lookup_requests_in_step == ["55"]
+    assert metadata.requests == []
+
+
+def test_cpu_pin_is_retained_until_retrieve_finishes(monkeypatch):
+    scheduler = _scheduler(monkeypatch, "kv_consumer")
+    scheduler._min_load_tokens = 0
+    scheduler._lookup_client = SimpleNamespace(
+        lookup=lambda *_args, **_kwargs: 16,
+        clear_lookup_status=lambda _sid: None,
+    )
+    seq = _load_seq(56, num_prompt_tokens=24)
+    scheduler.get_num_new_matched_tokens(seq)
+    scheduler.update_state_after_alloc(seq)
+    metadata = scheduler.build_connector_meta()
+    pins = {"56"}
+
+    def retrieve(_tokens, *, mask, **_kwargs):
+        assert pins == {"56"}
+        return mask.clone()
+
+    worker = DenseOffloadConnector(_config("kv_consumer"))
+    worker.chunk_size = 8
+    worker._engine = SimpleNamespace(retrieve=retrieve, lookup_unpin=pins.discard)
+    try:
+        worker.start_load_kv(metadata)
+        worker.close()
+        assert pins == set()
+        assert worker.get_finished().finished_loading == {
+            metadata.requests[0].load_operation
+        }
+    finally:
+        worker.close()

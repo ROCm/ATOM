@@ -3,16 +3,66 @@
 from __future__ import annotations
 
 import copy
+import gc
 import threading
 import time
+from bisect import bisect_left
 from collections.abc import Iterable
 from typing import Any
 
-from prometheus_client import CollectorRegistry, generate_latest
-from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
+from prometheus_client import CollectorRegistry, Histogram, generate_latest
+from prometheus_client.core import (
+    CounterMetricFamily,
+    GaugeMetricFamily,
+    HistogramMetricFamily,
+)
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 
 from .streaming_dispatch import longest_silence_seconds
+
+
+class _WeightedHistogram:
+    """Aggregate equal observations with one bucket lookup and one lock.
+
+    Own the counters and expose them through Prometheus' public collector API.
+    A scrape snapshots bucket counts and the sum under the same lock.
+    """
+
+    def __init__(self, name, documentation, *, buckets, registry):
+        self._name = name
+        self._documentation = documentation
+        self._bounds = (*buckets, float("inf"))
+        self._counts = [0] * len(self._bounds)
+        self._sum = 0.0
+        self._created = time.time()
+        self._lock = threading.Lock()
+        registry.register(self)
+
+    def observe_weighted(self, total: float, weight: int) -> None:
+        """Record ``weight`` equal samples whose sum is ``total``."""
+        if weight <= 0:
+            return
+        index = bisect_left(self._bounds, total / weight)
+        with self._lock:
+            self._counts[index] += weight
+            self._sum += total
+
+    def collect(self):
+        with self._lock:
+            counts, total = self._counts.copy(), self._sum
+        cumulative = 0
+        buckets = []
+        for bound, count in zip(self._bounds, counts):
+            cumulative += count
+            buckets.append(
+                ("+Inf" if bound == float("inf") else str(bound), cumulative)
+            )
+        yield HistogramMetricFamily(
+            self._name, self._documentation, buckets=buckets, sum_value=total
+        )
+        yield GaugeMetricFamily(
+            self._name + "_created", self._documentation, value=self._created
+        )
 
 
 class _AtomMetricsCollector:
@@ -388,6 +438,63 @@ class _AtomMetricsCollector:
             distribution.add_metric([str(accepted)], float(steps))
         yield distribution
 
+        yield from _gc_metrics()
+
+
+def _gc_metrics() -> Iterable[GaugeMetricFamily | CounterMetricFamily]:
+    """This process's own collector -- the frontend's, not the engine's, since
+    each interpreter keeps its own counters.
+
+    `atom:gc_collected_total` is the one to watch, and why the rest are here:
+    it is what decides whether spacing this process's collections out with
+    `ATOM_GC_THRESHOLD` would cost nothing or would defer real work. Flat after
+    startup means the collector is finding nothing; a rising line means the
+    process builds reference cycles and raising thresholds has a price.
+
+    O(1) per source is a bound, not a preference: rendering runs inline on the
+    loop that delivers every stream, so a scrape pauses all of them. It cost a
+    metric. `atom:gc_frozen_objects` came from `gc.get_freeze_count()`, which
+    walks the permanent generation -- 11.9 ms at 430k frozen against 0.5 us for
+    `gc.get_stats()`, i.e. the cost freezing exists to remove -- for a number
+    that changes twice in a process's life. It and the tracked-set size both
+    live in `/debug/gc_census` now, which is asked for rather than scraped.
+    """
+    stats = gc.get_stats()
+    for name, key, doc in (
+        (
+            "atom:gc_collections",
+            "collections",
+            "Collections run by this process's collector, per generation.",
+        ),
+        (
+            "atom:gc_collected",
+            "collected",
+            (
+                "Objects reclaimed by this process's collector, per generation. "
+                "Expected flat after startup; growth means raising this "
+                "process's ATOM_GC_THRESHOLD would defer real work."
+            ),
+        ),
+        (
+            "atom:gc_uncollectable",
+            "uncollectable",
+            "Objects found unreclaimable by this process's collector.",
+        ),
+    ):
+        metric = CounterMetricFamily(name, doc, labels=["generation"])
+        for generation, per_gen in enumerate(stats):
+            metric.add_metric([str(generation)], float(per_gen.get(key, 0)))
+        yield metric
+
+    threshold = GaugeMetricFamily(
+        "atom:gc_threshold",
+        "Collection threshold in effect in this process, per generation.",
+        labels=["generation"],
+    )
+    for generation, value in enumerate(gc.get_threshold()):
+        threshold.add_metric([str(generation)], float(value))
+    yield threshold
+
 
 class AtomMetricsExporter:
     """Own a cached runtime snapshot and render it without engine RPCs."""
@@ -401,6 +508,85 @@ class AtomMetricsExporter:
         self._last_refresh = 0.0
         self._registry = CollectorRegistry(auto_describe=False)
         self._registry.register(_AtomMetricsCollector(self))
+        self._inter_token_latency = _WeightedHistogram(
+            "atom:inter_token_latency_seconds",
+            "Frontend-observed streaming output interval divided by new token "
+            "count, weighted by that count. Excludes the first output batch.",
+            buckets=(
+                0.002,
+                0.004,
+                0.006,
+                0.008,
+                0.010,
+                0.015,
+                0.020,
+                0.025,
+                0.030,
+                0.035,
+                0.040,
+                0.060,
+                0.080,
+                0.100,
+                0.200,
+                0.400,
+                0.600,
+                0.800,
+                1.000,
+                2.000,
+                4.000,
+                6.000,
+                8.000,
+            ),
+            registry=self._registry,
+        )
+        self._time_to_first_token = Histogram(
+            "atom:time_to_first_token_seconds",
+            "Local API request arrival to first output. Streaming observes the "
+            "first generated SSE payload; non-streaming observes the first "
+            "internal token delivery. One sample per request.",
+            labelnames=("streaming",),
+            buckets=(
+                0.001,
+                0.005,
+                0.010,
+                0.025,
+                0.050,
+                0.100,
+                0.250,
+                0.500,
+                1.0,
+                2.5,
+                5.0,
+                10.0,
+                15.0,
+                30.0,
+                45.0,
+                60.0,
+                90.0,
+                120.0,
+                180.0,
+                240.0,
+            ),
+            registry=self._registry,
+        )
+
+        # Expose zero-valued children before traffic so Prometheus can establish
+        # a baseline for rate(). Registering labels does not record a sample.
+        for streaming in ("true", "false"):
+            self._time_to_first_token.labels(streaming=streaming)
+
+    def observe_time_to_first_token(self, interval: float, streaming: bool) -> None:
+        self._time_to_first_token.labels(streaming=str(streaming).lower()).observe(
+            interval
+        )
+
+    def observe_inter_token_latency(self, interval: float, num_new_tokens: int) -> None:
+        """Record token-weighted intervals in one aggregation update.
+
+        These cumulative observations are independent of the engine snapshot;
+        neither refreshing that snapshot nor scraping resets the histogram.
+        """
+        self._inter_token_latency.observe_weighted(interval, num_new_tokens)
 
     def update(self, snapshot: dict[str, Any]) -> None:
         with self._lock:

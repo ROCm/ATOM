@@ -144,7 +144,7 @@ def _install_draft_extend_fused_swa_patch() -> None:
             kwargs.update(
                 fp8_2buff=kv_fp8,
                 swa_cache_size=cache_size,
-                batch_id_per_token=attn_md.batch_id_per_token,
+                batch_id_per_q_token=attn_md.batch_id_per_q_token,
                 swa_cu_seqlens_q=attn_md.cu_seqlens_q,
                 swa_write_per_batch=min(int(attn_md.max_seqlen_q), cache_size),
             )
@@ -286,7 +286,7 @@ def patch_deepseek_v4_attention_for_sglang(attn: nn.Module) -> None:
                 _draft_extend_fused_swa_ctx.reset(token)
 
         if attn_md is not None and attn_md.state is not AttnState.DECODE:
-            batch_id_per_token = getattr(attn_md, "batch_id_per_token", None)
+            batch_id_per_q_token = getattr(attn_md, "batch_id_per_q_token", None)
             is_verify_graph = bool(
                 getattr(attn_md, "use_decode_indexer_for_verify_graph", False)
             )
@@ -307,8 +307,8 @@ def patch_deepseek_v4_attention_for_sglang(attn: nn.Module) -> None:
                 num_real = int(getattr(attn_md, "max_seqlen_q", 1)) * num_reqs
             else:
                 num_real = (
-                    int(batch_id_per_token.shape[0])
-                    if torch.is_tensor(batch_id_per_token)
+                    int(batch_id_per_q_token.shape[0])
+                    if torch.is_tensor(batch_id_per_q_token)
                     else x.shape[0]
                 )
             if 0 <= num_real < x.shape[0]:
@@ -321,11 +321,13 @@ def patch_deepseek_v4_attention_for_sglang(attn: nn.Module) -> None:
                     elif value is not None:
                         try:
                             setattr(sliced_md, name, value[:n])
-                        except Exception:
+                        # Not every field is sliceable; leaving it whole is the
+                        # fallback, so anything raised here means "not this one".
+                        except Exception:  # noqa: BLE001, S110
                             pass
 
                 for name in (
-                    "batch_id_per_token",
+                    "batch_id_per_q_token",
                     "skip_prefix_len_csa",
                 ):
                     slice_attr(name, num_real)
@@ -340,7 +342,7 @@ def patch_deepseek_v4_attention_for_sglang(attn: nn.Module) -> None:
                 if isinstance(indexer_meta, dict):
                     indexer_meta = dict(indexer_meta)
                     for key in (
-                        "batch_id_per_token_gpu",
+                        "batch_id_per_q_token",
                         "seq_base_per_token_gpu",
                         "cu_starts_gpu",
                         "cu_ends_gpu",

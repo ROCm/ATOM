@@ -1230,6 +1230,16 @@ class CoreManager:
 
     def _mark_seq_prefill_complete(self, seq_id) -> None:
         """Release only a sequence's prefill-token charge, once."""
+        # Every decode token reaches this path. The prefill charge may be zero
+        # at admission, or already released by the first output. Avoid taking
+        # the router lock for a no-op; re-read under the lock before changing
+        # counters because abort/finish may release the charge concurrently.
+        entry = self._seq_load.get(seq_id)
+        if entry is None:
+            return
+        _, _, tok_cost = entry
+        if tok_cost == 0:
+            return
         with self._lb_lock:
             entry = self._seq_load.get(seq_id)
             if entry is None:

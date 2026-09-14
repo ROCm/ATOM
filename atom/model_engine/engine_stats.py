@@ -53,6 +53,7 @@ class EngineStats:
         "_cache_interval_compressed_tokens",
         "_cache_interval_evicted_base",
         "_cache_interval_full_tokens",
+        "_cache_interval_offload_tokens",
         "_cache_interval_requests",
         "_cache_interval_reusable_tokens",
         "_cache_interval_wanted_tokens",
@@ -81,6 +82,7 @@ class EngineStats:
         "total_compressed_tokens",
         "total_draft_tokens",
         "total_full_tokens",
+        "total_offload_tokens",
         "total_requests",
         "total_reusable_tokens",
         "total_wanted_tokens",
@@ -141,6 +143,10 @@ class EngineStats:
         # the length mix even when both pools behave identically, which is
         # exactly the confound that makes two runs incomparable.
         self.total_reusable_tokens: int = 0
+        # Reuse the lmcache CPU offload tier served. Sits above the HBM walk
+        # rather than inside the `cached <= ... <= reusable` chain (see
+        # `update_cache`); shares only the `reusable` denominator with it.
+        self.total_offload_tokens: int = 0
         # Pre-gate compressed-prefix hit tokens, and the boundary between the
         # two pools: everything below it is the paged pool's doing, everything
         # between it and `cached` is the state gates'. `reusable - compressed`
@@ -159,6 +165,7 @@ class EngineStats:
         self._cache_interval_compressed_tokens: int = 0
         self._cache_interval_wanted_tokens: int = 0
         self._cache_interval_reusable_tokens: int = 0
+        self._cache_interval_offload_tokens: int = 0
         # Sliding window behind `recent_cache_hit_rate`, the figure the
         # engine-status line reports. Mirrors vLLM's PrefixCachingMetrics: the
         # last N requests, aggregated incrementally so `observe` stays O(1).
@@ -280,10 +287,11 @@ class EngineStats:
         num_compressed_tokens: int,
         num_wanted_tokens: int,
         num_reusable_tokens: int,
+        num_offload_tokens: int = 0,
     ) -> None:
         """Record cache stats for one prefill sequence.
 
-        All five are required because the reported rates are differences
+        The first five are required because the reported rates are differences
         between them: `cached <= wanted <= compressed <= reusable <= full`. A
         defaulted argument would silently report a negative rate rather than a
         missing one.
@@ -293,6 +301,11 @@ class EngineStats:
         has no stable hash, so it is never a reuse candidate). Recomputing it
         here would mean duplicating that rule in a second place and letting the
         two drift.
+
+        `num_offload_tokens` is the exception, and defaults because it is not
+        part of that chain: it is reuse the CPU tier served, which sits above
+        the HBM walk rather than inside it. Counting it in `cached` is what
+        would break the nesting -- see `_schedule_prefill_seq`.
         """
         if not self.cache_enabled:
             return
@@ -341,6 +354,18 @@ class EngineStats:
         self._cache_interval_reusable_tokens += num_reusable_tokens
         self._cache_interval_compressed_tokens += num_compressed_tokens
         self._cache_interval_wanted_tokens += num_wanted_tokens
+        # `num_offload_tokens` is outside the `cached <= ... <= reusable` chain,
+        # so the ordering clamp above never bounded it -- but the rates pair it
+        # with `cached` against the same `reusable` denominator (`cache_hit_rate`
+        # and `lmcache_hit_rate` are meant to partition served reuse), and the
+        # documented invariant is `cached + offload <= reusable`. A CPU-tier
+        # resume can report more offload reuse than the HBM walk left room for;
+        # clamp so the combined rate cannot exceed 100%.
+        num_offload_tokens = max(
+            0, min(num_offload_tokens, num_reusable_tokens - num_cached_tokens)
+        )
+        self.total_offload_tokens += num_offload_tokens
+        self._cache_interval_offload_tokens += num_offload_tokens
 
         # Slide the recent-requests window. One call is one request here, so
         # the deque length is the request count directly. Denominated in
@@ -423,6 +448,27 @@ class EngineStats:
         )
 
     @property
+    def lmcache_hit_rate(self) -> float:
+        """Reuse the lmcache CPU offload tier served, as a share of all reuse.
+
+        Disjoint from the HBM walk on purpose: `total_offload_tokens` counts
+        reuse claimed *above* what the walk could offer (see `update_cache`), so
+        it is exactly the reuse that becomes recompute the moment the tier is
+        switched off -- the whole case for the tier on a given workload, in one
+        number.
+
+        **Pairs with `cache_hit_rate`, not with `paged_hit_rate`.** Both of
+        those read as "the HBM number" and only `cache_hit_rate` is a served
+        quantity: `paged_hit_rate`'s numerator is `compressed`, how far the
+        prefix walk reached *before* the state gates cut it. `cached + offload
+        <= reusable` by construction (the clamp in `update_cache` enforces it),
+        so `cache_hit_rate` and this partition the served reuse; `compressed +
+        offload` does not and can
+        exceed the denominator.
+        """
+        return self._rate(self.total_offload_tokens, self.total_reusable_tokens)
+
+    @property
     def recent_cache_hit_rate(self) -> float | None:
         """`cache_hit_rate` over the last `cache_hit_rate_window` requests.
 
@@ -457,6 +503,9 @@ class EngineStats:
             # not a hit-rate denominator -- see `total_reusable_tokens`.
             "reusable_tokens": self.total_reusable_tokens,
             "full_tokens": self.total_full_tokens,
+            # Reuse from the CPU tier. Separate on purpose: it shares no
+            # denominator with the HBM series above.
+            "offload_tokens": self.total_offload_tokens,
         }
 
     def _reset_cache_interval(self) -> None:
@@ -466,6 +515,7 @@ class EngineStats:
         self._cache_interval_compressed_tokens = 0
         self._cache_interval_wanted_tokens = 0
         self._cache_interval_reusable_tokens = 0
+        self._cache_interval_offload_tokens = 0
 
     @staticmethod
     def _rate(num: int, den: int) -> float:
@@ -515,6 +565,12 @@ class EngineStats:
                 f"(total {occ['evicted_total']})"
             )
         self._log_pools()
+        if self.total_offload_tokens:
+            logger.info(
+                "[Cache Stats offload] CPU-tier tokens: "
+                f"interval={self._cache_interval_offload_tokens} "
+                f"total={self.total_offload_tokens}"
+            )
         if self._pool_pressure is not None:
             self._log_pressure(self._pool_pressure())
 
@@ -557,6 +613,32 @@ class EngineStats:
             f"combined: {self.cache_hit_rate:.2%}, "
             f"binding: {worse}"
         )
+        # A second split, orthogonal to paged/state above: of all reuse, how much
+        # came from HBM (paged pool) vs from the lmcache CPU offload tier. The
+        # offload count sits above the HBM walk (see `update_cache`), so it is
+        # exactly the reuse that reverts to recompute when the tier is switched
+        # off -- i.e. the value of running lmcache on this workload, in one
+        # number. Logged only when a tier is attached; the no-connector baseline
+        # has total_offload_tokens==0 and its tier split is trivially HBM=all,
+        # lmcache=0.
+        #
+        # The HBM half is `cache_hit_rate` (`cached`), NOT `paged_hit_rate`
+        # (`compressed`). Both read as "the HBM number" and only one of them is
+        # a *served* quantity: `compressed` is how far the prefix walk reached
+        # before the state gates cut it, so it is reach, not reuse anybody got.
+        # `cached + offload <= reusable` by construction (clamped in
+        # `update_cache`), so these two do partition, and `combined` is exactly
+        # the end-to-end rate.
+        if self.total_offload_tokens:
+            served = self.total_cached_tokens + self.total_offload_tokens
+            logger.info(
+                "[Cache Tiers] "
+                f"HBM-served (KV prefix resident): {self.cache_hit_rate:.2%} "
+                f"({self.total_cached_tokens}/{self.total_reusable_tokens}), "
+                f"lmcache-served (CPU tier): {self.lmcache_hit_rate:.2%} "
+                f"({self.total_offload_tokens}/{self.total_reusable_tokens}), "
+                f"combined: {self._rate(served, self.total_reusable_tokens):.2%}"
+            )
 
     @staticmethod
     def _log_pressure(p: dict[str, int]) -> None:

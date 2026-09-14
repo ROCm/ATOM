@@ -21,8 +21,16 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.distributed.dcp_layout import (  # noqa: F401
+    dcp_global_pos,
+    dcp_local_index,
+    dcp_owner_rank,
+)
 from atom.distributed.dcp_utils import get_dcp_group, get_dcp_world_size
 from atom.utils.forward_context import get_published_dcp_local_context_lens
+
+# Token-ownership arithmetic lives in ``dcp_layout`` so P/D relayout can share
+# it without importing Triton. Re-exported here for existing attention callers.
 
 _AG_CUSTOM_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
@@ -600,6 +608,56 @@ def dcp_gather_compressed_kv(
     return gathered.reshape(slot_ids.shape[0], -1)
 
 
+def dcp_reorg_row_indices(
+    padded_local_chunk_seq_lens: np.ndarray,
+    real_local_chunk_lens: np.ndarray,
+) -> np.ndarray:
+    """The reorg of an AllGathered compressed-KV chunk, as a row map.
+
+    Same reordering ``reorg_kvcache`` performs by slicing and concatenating,
+    expressed as ``dst_row -> src_row`` so a kernel can apply it in one gather.
+    ``reorg_kvcache`` walks the (seq, rank) segments in Python on every layer;
+    this walks them once per step in the metadata builder, and the gather then
+    rides along with the ``kv_b_proj`` decompress instead of costing two
+    ``cat``s of its own.
+
+    Args:
+        padded_local_chunk_seq_lens: [bs] per-seq padded local chunk length.
+            Uniform across ranks, so it also gives each rank's AllGather block
+            size (``toks = sum``) and each seq's offset inside a block.
+        real_local_chunk_lens: [bs, dcp] per-(seq, rank) REAL local chunk
+            length. Where it falls short of the padded length is exactly the
+            padding this map drops.
+
+    Returns:
+        int32 [``real_local_chunk_lens.sum()``] rows into the
+        ``[toks * dcp, d]`` AllGather buffer, per-seq contiguous and rank-major
+        within a seq -- the layout ``cu_seqlens_k`` describes.
+    """
+    padded = np.asarray(padded_local_chunk_seq_lens, dtype=np.int64).reshape(-1)
+    lens = np.asarray(real_local_chunk_lens, dtype=np.int64)
+    bs, dcp = lens.shape
+    assert padded.shape[0] == bs, (padded.shape, lens.shape)
+
+    toks = int(padded.sum())
+    seq_base = np.zeros(bs, dtype=np.int64)
+    np.cumsum(padded[:-1], out=seq_base[1:])
+    # Rank r's block starts at r * toks, and seq i sits at the same offset
+    # inside every block because the padded length is rank-invariant.
+    starts = (
+        seq_base[:, None] + np.arange(dcp, dtype=np.int64)[None, :] * toks
+    ).reshape(-1)
+
+    lens = lens.reshape(-1)  # (seq, rank) row-major == reorg's walk order
+    seg_base = np.zeros(lens.shape[0], dtype=np.int64)
+    np.cumsum(lens[:-1], out=seg_base[1:])
+    # Row `seg_base[s] + j` of the output is row `starts[s] + j` of the input,
+    # so a single arange carries the per-segment offset j.
+    total = int(lens.sum())
+    rows = np.repeat(starts - seg_base, lens) + np.arange(total, dtype=np.int64)
+    return rows.astype(np.int32)
+
+
 def reorg_kvcache(
     allgatered_kv_c_normed: torch.Tensor,
     allgatered_k_pe: torch.Tensor,
@@ -704,57 +762,65 @@ def get_dcp_local_seq_lens(seq_lens, dcp_size, dcp_rank, cp_kv_cache_interleave_
     return base + remainder
 
 
-def dcp_owner_rank(pos, dcp_size, cp_kv_cache_interleave_size=1):
-    """Which DCP rank owns global token ``pos`` under interleaved KV storage.
+def get_dcp_local_window_lens(
+    seq_lens, max_seqlen_q, dcp_size, dcp_rank, cp_kv_cache_interleave_size=1
+):
+    """Per-DCP-rank local KV length of each query token's causal window.
 
-    Interleaving groups tokens into chunks of ``cp_kv_cache_interleave_size`` (= S); chunk
-    ``c = pos // S`` is stored on rank ``c % dcp_size``. For S == 1 this reduces
-    to the round-robin ``pos % dcp_size``.
-
-    Works elementwise on Python ints, numpy arrays and torch tensors (only ``//``
-    and ``%`` are used). Consistent with vLLM's slot kernel
-    (``block_table.py`` ``is_local``) because ``block_size * W`` is a multiple of
-    ``S * W`` when ``block_size % S == 0``, so computing on the global position
-    equals computing on the virtual-block offset.
+    Draft position ``j`` attends to global positions ``[0, seq_len -
+    max_seqlen_q + j]``; that extra position belongs to a single rank, so the
+    ranks' local lengths do not all advance with j. Returns a flat
+    ``[len(seq_lens) * max_seqlen_q]`` array in (sequence, draft position)
+    order. ``max_seqlen_q == 1`` reproduces ``get_dcp_local_seq_lens``.
     """
-    return (pos // cp_kv_cache_interleave_size) % dcp_size
-
-
-def dcp_local_index(pos, dcp_size, cp_kv_cache_interleave_size=1):
-    """Local KV-sequence index of global token ``pos`` on its owning rank.
-
-    Each ``S * W`` super-block contributes ``S`` tokens to a rank, so the local
-    index is ``(pos // (S*W)) * S + (pos % S)``. For S == 1 this reduces to the
-    round-robin ``pos // dcp_size``.
-
-    To map to a physical slot (given ``block_size % S == 0``):
-        block_table_index = pos // (block_size * dcp_size)   # == local_index // block_size
-        slot_offset       = local_index % block_size
-        slot              = block_table[block_table_index] * block_size + slot_offset
-
-    Elementwise over Python ints / numpy / torch.
-    """
-    sw = cp_kv_cache_interleave_size * dcp_size
-    return (pos // sw) * cp_kv_cache_interleave_size + (
-        pos % cp_kv_cache_interleave_size
+    windows = seq_lens[:, None] - max_seqlen_q + 1 + np.arange(max_seqlen_q)
+    return get_dcp_local_seq_lens(
+        # Row 0 is the committed token count, which a scheduled decode row
+        # always has at least one of; the clip is for callers that do not.
+        windows.clip(min=0).ravel(),
+        dcp_size,
+        dcp_rank,
+        cp_kv_cache_interleave_size,
     )
 
 
-def dcp_global_pos(local_index, dcp_rank, dcp_size, cp_kv_cache_interleave_size=1):
-    """Inverse of ``dcp_local_index``: global token position of local KV index
-    ``local_index`` held on ``dcp_rank``.
+def dcp_prefill_slot_mapping(
+    block_tables,
+    cached_lens,
+    context_lens,
+    block_size,
+    dcp_size,
+    dcp_rank,
+    cp_kv_cache_interleave_size=1,
+):
+    """Per-token KV slots for a prefill step, ``-1`` where another rank owns it.
 
-    Local index j on rank r sits in local S-group ``j // S`` at offset ``j % S``;
-    that group is global chunk ``(j//S)*W + r``, so the global position is
-    ``((j//S)*W + r) * S + (j % S)``. For S == 1 this reduces to the round-robin
-    ``j*W + r``. Used to reconstruct globally-unique ids for exchanged sparse
-    top-k candidates (the id must be a total order over global positions).
+    ``block_tables`` is one ragged per-sequence row per sequence, and the two
+    length arrays bound each sequence's span; the result is the flattened token
+    axis in sequence order. The body is the slot formula ``dcp_local_index``
+    documents above, applied per token -- kept here rather than in the
+    attention builder so the rank filter and the addressing it depends on stay
+    in one file, and so the builder needs to know nothing about interleaving.
 
-    Elementwise over Python ints / numpy / torch.
+    A loop, not array arithmetic: this axis is a per-rank filter, and no
+    configuration in this tree runs ``dcp_size > 1`` to check a vectorized
+    rewrite against.
     """
-    return (
-        (local_index // cp_kv_cache_interleave_size) * dcp_size + dcp_rank
-    ) * cp_kv_cache_interleave_size + (local_index % cp_kv_cache_interleave_size)
+    virtual_block_size = block_size * dcp_size
+    slot_mapping = []
+    rows = zip(block_tables, cached_lens, context_lens)
+    for block_table, cached_seqlen, seqlen in rows:
+        for pos in range(cached_seqlen, seqlen):
+            if dcp_owner_rank(pos, dcp_size, cp_kv_cache_interleave_size) != dcp_rank:
+                slot_mapping.append(-1)
+                continue
+            local_offset = (
+                dcp_local_index(pos, dcp_size, cp_kv_cache_interleave_size) % block_size
+            )
+            slot_mapping.append(
+                block_table[pos // virtual_block_size] * block_size + local_offset
+            )
+    return slot_mapping
 
 
 def dcp_local_context_lens(
@@ -764,7 +830,7 @@ def dcp_local_context_lens(
     cp_kv_cache_interleave_size: int,
     num_rows: int,
 ) -> torch.Tensor:
-    """This rank's per-request LOCAL KV length under interleave-S sharding.
+    """This rank's LOCAL KV length for each of ``num_rows`` query tokens.
 
     Matches get_dcp_local_seq_lens / prepare_decode's slot split: each full S*W
     super-block gives every rank S tokens, and the tail remainder is handed out
@@ -781,6 +847,13 @@ def dcp_local_context_lens(
     if local_ctx is not None:
         return local_ctx
     g_ctx = attn_metadata.context_lens
+    if g_ctx.shape[0] != num_rows:
+        # This fallback only sees per-request lengths; per-draft windows
+        # have to come from the published buffer.
+        raise ValueError(
+            f"no published DCP local context lengths, and context_lens holds "
+            f"{g_ctx.shape[0]} rows for {num_rows} query tokens"
+        )
     S = cp_kv_cache_interleave_size
     W = dcp_world_size
     full_chunks = g_ctx // (S * W)
@@ -852,11 +925,17 @@ def dcp_decode_candidate_exchange_fused(
     # scheduled -- NOT padded_q_fp8_decode_tokens.shape, which is the padded
     # capture width. Sizing off the padded array walks rows nothing scheduled
     # and hands attention a width it did not ask for (upstream 0b4f1ddba).
-    next_n = padded_q_fp8_decode_tokens.shape[1]
-    assert attn_metadata.max_seqlen_q == 1, (
-        "DCP + DeepSeek-V3.2 sparse indexer (DSA) currently supports "
-        "qlen=1 decode only (MTP verify not yet supported)."
+    #
+    # Rows are query tokens, so the (batch, next_n) query is flattened here and
+    # next_n never reaches aiter: its window formula `seqLens[row // next_n] -
+    # next_n + row % next_n + 1` advances every rank's LOCAL length once per
+    # draft position, but that extra position belongs to one rank. At next_n ==
+    # 1 it degenerates to `seqLens[row]` and local_ctx carries the real windows.
+    q_rows = padded_q_fp8_decode_tokens.reshape(
+        num_decode_tokens, 1, *padded_q_fp8_decode_tokens.shape[2:]
     )
+    # One block-table row per query token; both aiter ops address it by row.
+    block_tables = attn_metadata.dcp_token_block_tables[:num_decode_tokens]
 
     local_ctx = dcp_local_context_lens(
         attn_metadata,
@@ -870,12 +949,12 @@ def dcp_decode_candidate_exchange_fused(
         [num_decode_tokens, l_max], dtype=torch.float32, device="cuda"
     )
     deepgemm_fp8_paged_mqa_logits(
-        padded_q_fp8_decode_tokens,
+        q_rows,
         kv_cache,
         weights[:num_decode_tokens],
         local_logits,
         local_ctx,
-        attn_metadata.block_tables,
+        block_tables,
         l_max,
         KVBlockSize=runner_block_size,
         Preshuffle=True,
@@ -898,7 +977,7 @@ def dcp_decode_candidate_exchange_fused(
     )
     top_k_per_row_decode(
         local_logits,
-        next_n,
+        1,  # next_n: one row per query token, windows come from local_ctx
         local_ctx,
         local_idx,
         num_decode_tokens,
@@ -923,7 +1002,7 @@ def dcp_decode_candidate_exchange_fused(
     flydsl_dcp_topk_merge(
         gathered_sc.view(torch.float32),
         local_idx,
-        attn_metadata.block_tables[:num_decode_tokens],
+        block_tables,
         out_kv_indices,
         out_kv_indptr,
         owned_counts,
@@ -948,7 +1027,7 @@ def dcp_decode_candidate_exchange_fused(
 @triton.jit
 def _count_owned_dcp_prefill_kernel(
     dsa_kv_indptr,  # int32 [num_tokens + 1] -- GLOBAL per-token candidate counts
-    token_to_seq_idxs,  # int32 [num_tokens]
+    batch_id_per_q_token,  # int32 [num_tokens]
     topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- FLAT KV indices
     cu_seqlens_k,  # int32 [num_req + 1] -- per-seq base of the flat KV axis
     out_counts,  # int32 [num_tokens]
@@ -971,8 +1050,12 @@ def _count_owned_dcp_prefill_kernel(
     is what the round-robin owner is derived from -- is `indice - cu_seqlens_k[req]`.
     """
     token_id = tl.program_id(0)
-    req_id = tl.load(token_to_seq_idxs + token_id)
-    base = tl.load(cu_seqlens_k + req_id)
+    # `-1` marks a CUDAGraph pad token (see token_layout/batch_ids.py): its row
+    # owns nothing. `valid_req` must gate the SAME way in pass 2 below, or the
+    # counts this pass writes stop describing what that pass writes.
+    req_id = tl.load(batch_id_per_q_token + token_id)
+    valid_req = req_id >= 0
+    base = tl.load(cu_seqlens_k + req_id, mask=valid_req, other=0)
 
     count = 0
     for tile_start in range(0, NUM_TOPK_TOKENS, BLOCK_N):
@@ -985,7 +1068,10 @@ def _count_owned_dcp_prefill_kernel(
         )
         pos = indice - base  # position within the sequence
         owned = (
-            col_valid & (indice >= 0) & (((pos // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
+            col_valid
+            & valid_req
+            & (indice >= 0)
+            & (((pos // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
         )
         count += tl.sum(owned.to(tl.int32))
 
@@ -997,7 +1083,7 @@ def _count_owned_dcp_prefill_kernel(
 def _compact_filter_dcp_prefill_kernel(
     dsa_kv_indptr,  # int32 [num_tokens + 1] -- GLOBAL per-token candidate counts
     out_kv_indptr,  # int32 [num_tokens + 1] -- COMPACTED offsets (cumsum of pass 1)
-    token_to_seq_idxs,  # int32 [num_tokens]
+    batch_id_per_q_token,  # int32 [num_tokens]
     topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- FLAT KV indices
     cu_seqlens_k,  # int32 [num_req + 1]
     block_table,  # int32 [num_req, max_num_blocks_per_req] -- logical(global) blocks
@@ -1027,8 +1113,10 @@ def _compact_filter_dcp_prefill_kernel(
     deterministic.
     """
     token_id = tl.program_id(0)
-    req_id = tl.load(token_to_seq_idxs + token_id)
-    base = tl.load(cu_seqlens_k + req_id)
+    # Pad-token guard, in lockstep with pass 1 (see the note there).
+    req_id = tl.load(batch_id_per_q_token + token_id)
+    valid_req = req_id >= 0
+    base = tl.load(cu_seqlens_k + req_id, mask=valid_req, other=0)
     out_kv_start = tl.load(out_kv_indptr + token_id)
 
     vbs = PAGE_SIZE * DCP_WORLD
@@ -1047,7 +1135,10 @@ def _compact_filter_dcp_prefill_kernel(
         )
         pos = indice - base
         idx_valid = (
-            col_valid & (indice >= 0) & (((pos // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
+            col_valid
+            & valid_req
+            & (indice >= 0)
+            & (((pos // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
         )
 
         block_id = pos // vbs
@@ -1078,7 +1169,7 @@ def _compact_filter_dcp_prefill_kernel(
 
 def triton_filter_and_convert_dcp_index_prefill(
     dsa_kv_indptr: torch.Tensor,  # int32 [num_tokens + 1] GLOBAL counts
-    token_to_seq_idxs: torch.Tensor,  # int32 [num_tokens]
+    batch_id_per_q_token: torch.Tensor,  # int32 [num_tokens]
     topk_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS] FLAT indices
     cu_seqlens_k: torch.Tensor,  # int32 [num_req + 1]
     block_table: torch.Tensor,  # int32 [num_req, max_num_blocks_per_req] logical
@@ -1113,7 +1204,7 @@ def triton_filter_and_convert_dcp_index_prefill(
     num_tokens = dsa_kv_indptr.shape[0] - 1
 
     dsa_kv_indptr_c = dsa_kv_indptr.contiguous()
-    token_to_seq_idxs_c = token_to_seq_idxs.contiguous()
+    batch_id_per_q_token_c = batch_id_per_q_token.contiguous()
     topk_indices_c = topk_indices.contiguous()
     cu_seqlens_k_c = cu_seqlens_k.contiguous()
     block_table_c = block_table.contiguous()
@@ -1126,7 +1217,7 @@ def triton_filter_and_convert_dcp_index_prefill(
     metadata_counts = out_kv_indptr[1 : num_tokens + 1]
     _count_owned_dcp_prefill_kernel[grid](
         dsa_kv_indptr_c,
-        token_to_seq_idxs_c,
+        batch_id_per_q_token_c,
         topk_indices_c,
         cu_seqlens_k_c,
         counts,
@@ -1154,7 +1245,7 @@ def triton_filter_and_convert_dcp_index_prefill(
     _compact_filter_dcp_prefill_kernel[grid](
         dsa_kv_indptr_c,
         out_kv_indptr,
-        token_to_seq_idxs_c,
+        batch_id_per_q_token_c,
         topk_indices_c,
         cu_seqlens_k_c,
         block_table_c,

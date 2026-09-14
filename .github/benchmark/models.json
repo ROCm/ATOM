@@ -1,6 +1,7 @@
 {
   "default_scenarios": [
     {
+      "cadence": "weekly",
       "isl": 1024,
       "osl": 1024,
       "concurrency": [4, 8, 16, 32, 64, 128, 256, 512],
@@ -138,7 +139,7 @@
       "path": "zai-org/GLM-5.2-FP8",
       "prefix": "glm-5-2-fp8",
       "runner": "atom-mi355-8gpu.predownload",
-      "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1",
+      "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1\nATOM_USE_FLYDSL_GATHER_KV_B_PROJ=0",
       "config": {
         "tp": 4,
         "kv_cache_dtype": "fp8",
@@ -161,7 +162,7 @@
       "path": "amd/GLM-5.2-MXFP4",
       "prefix": "glm-5-2-mxfp4",
       "runner": "atom-mi355-8gpu.predownload",
-      "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1",
+      "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1\nATOM_USE_FLYDSL_GATHER_KV_B_PROJ=0",
       "config": {
         "tp": 4,
         "kv_cache_dtype": "fp8",

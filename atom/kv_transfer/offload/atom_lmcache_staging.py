@@ -13,6 +13,35 @@ from typing import Any
 import torch
 
 
+def memory_object_as_uint8(memory_obj: Any, nbytes: int) -> torch.Tensor:
+    """The leading `nbytes` of a LMCache MemoryObj as a flat uint8 view.
+
+    Shared by every ATOM offload connector (dense block, K3 staging, state
+    tier): each transfers raw bytes, so all validate the MemoryObj the same
+    way. Kept here -- the connectors' common aiter-free dependency -- so the
+    check lives once instead of byte-identically in each.
+    """
+    tensor = getattr(memory_obj, "tensor", None)
+    if tensor is None and hasattr(memory_obj, "get_tensor"):
+        tensor = memory_obj.get_tensor(0)
+    if tensor is None:
+        raise RuntimeError("ATOM LMCache connector: invalid MemoryObj tensor")
+    if tensor.dtype != torch.uint8:
+        raise TypeError(
+            "ATOM LMCache connector: MemoryObj tensor must be uint8, "
+            f"got {tensor.dtype}"
+        )
+    if not tensor.is_contiguous():
+        raise RuntimeError("ATOM LMCache connector: MemoryObj tensor not contiguous")
+    flat = tensor.reshape(-1)
+    if int(flat.numel()) < int(nbytes):
+        raise ValueError(
+            "ATOM LMCache connector: MemoryObj tensor is too small "
+            f"for {nbytes} bytes; got {int(flat.numel())}"
+        )
+    return flat[: int(nbytes)]
+
+
 class _NullCtx:
     def __enter__(self):
         return None
@@ -33,7 +62,11 @@ class _StagingBuffer:
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
-    return os.environ.get(name, default).lower() not in ("0", "false", "no", "off")
+    # Stripped, and empty reads as off: `VAR=` is how a shell script clears a
+    # flag inline, and a bare membership test reads the empty string as ON --
+    # the opposite of what the operator wrote. `VAR="off "` did the same.
+    raw = os.environ.get(name, default).strip().lower()
+    return bool(raw) and raw not in ("0", "false", "no", "off")
 
 
 def _env_int(name: str, default: int, *, min_value: int = 1) -> int:
@@ -103,6 +136,7 @@ def run_staged_pipeline(
     recover_buffer: (
         Callable[[_StagingBuffer, _PipelineStage, _PipelineStage], bool] | None
     ) = None,
+    stage_b_enqueued: Callable[[Any, Any], None] | None = None,
 ) -> None:
     """Drive a two-stream staging pipeline with explicit recovery ownership.
 
@@ -132,6 +166,8 @@ def run_staged_pipeline(
                 stage_b.run(group, device_buf)
             staging_buffer.free_event.record(stage_b.stream)
             staging_buffer.free_event_valid = True
+            if stage_b_enqueued is not None:
+                stage_b_enqueued(group, stage_b.stream)
         stage_b.stream.synchronize()
     except Exception:
         buffer_safe_to_release = bool(

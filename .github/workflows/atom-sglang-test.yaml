@@ -29,9 +29,6 @@ env:
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
   NIGHTLY_PLUGIN_IMAGE_TAG: rocm/atom-dev:sglang-latest
-  PLUGIN_CI_SLURM_ACCOUNT: amd-aifw-dev
-  PLUGIN_CI_SLURM_PARTITION: amd-spur
-  PLUGIN_CI_LOG_ROOT: /home/junyyang/ATOM_PLUGIN_RUNNER/LOG/
 
 jobs:
   ci-gate:
@@ -138,7 +135,7 @@ jobs:
               SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
             lm_eval_num_fewshot: 5
             accuracy_test_threshold: 0.93
-            runner: atom-mi355-8gpu-vllm-sgl-ci
+            runner: spur-runner-mi355x-8gpu
           - model_name: "DeepSeek-R1-FP4-V2 TP8 MTP3"
             model_path: "amd/DeepSeek-R1-0528-MXFP4-v2"
             extra_args: "--trust-remote-code --tensor-parallel-size 8 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85 --page-size 1 --disable-radix-cache --speculative-draft-model-path SGLang/DeepSeek-R1-NextN --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --max-running-requests 256 --cuda-graph-bs 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 101 102 103 104 105 106 107 108 109 110 111 112 113 114 115 116 117 118 119 120 121 122 123 124 125 126 127 128 160 192 224 256"
@@ -152,7 +149,7 @@ jobs:
               SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
               TORCHINDUCTOR_COMPILE_THREADS=128
             accuracy_test_threshold: 0.93
-            runner: atom-mi355-8gpu-vllm-sgl-ci
+            runner: spur-runner-mi355x-8gpu
           - model_name: "MiniMax-M3-MXFP4 TP4"
             model_path: "amd/MiniMax-M3-MXFP4"
             extra_args: "--trust-remote-code --tensor-parallel-size 4 --attention-backend aiter --page-size 128 --mem-fraction-static 0.8 --max-running-requests 128 --disable-radix-cache"
@@ -168,7 +165,7 @@ jobs:
             lm_eval_use_chat_completions: "1"
             lm_eval_extra_model_args: "max_gen_toks=16384"
             accuracy_test_threshold: 0.93
-            runner: atom-mi355-8gpu-vllm-sgl-ci
+            runner: spur-runner-mi355x-8gpu
           - model_name: "Qwen3.5-35B-A3B-FP8 TP2"
             model_path: "Qwen/Qwen3.5-35B-A3B-FP8"
             extra_args: "--tensor-parallel-size 2 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache"
@@ -177,7 +174,7 @@ jobs:
               SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
               ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0
             accuracy_test_threshold: 0.76
-            runner: atom-mi355-8gpu-vllm-sgl-ci
+            runner: spur-runner-mi355x-8gpu
           - model_name: "DeepSeek-V4-Flash TP8"
             model_path: "deepseek-ai/DeepSeek-V4-Flash"
             extra_args: "--trust-remote-code --tensor-parallel-size 8 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.9 --swa-full-tokens-ratio 0.1 --max-running-requests 256 --page-size 256 --disable-radix-cache --disable-shared-experts-fusion --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4"
@@ -193,7 +190,7 @@ jobs:
             lm_eval_num_fewshot: 5
             lm_eval_num_concurrent: 8
             accuracy_test_threshold: 0.94
-            runner: atom-mi355-8gpu-vllm-sgl-ci
+            runner: spur-runner-mi355x-8gpu
           - model_name: "DeepSeek-V4-Pro MTP3 TP8"
             model_path: "deepseek-ai/DeepSeek-V4-Pro"
             extra_args: "--trust-remote-code --tensor-parallel-size 8 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.9 --swa-full-tokens-ratio 0.1 --max-running-requests 256 --page-size 256 --disable-radix-cache --disable-shared-experts-fusion --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4 --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4"
@@ -213,11 +210,10 @@ jobs:
             lm_eval_num_fewshot: 5
             lm_eval_num_concurrent: 8
             accuracy_test_threshold: 0.94
-            runner: atom-mi355-8gpu-vllm-sgl-ci
+            runner: spur-runner-mi355x-8gpu
     env:
       AITER_ARTIFACT_ID: ${{ needs.download_aiter_wheel.outputs.aiter_artifact_id }}
       CONTAINER_NAME: plugin_ci_sglang_${{ github.run_id }}_${{ strategy.job-index }}
-      PLUGIN_CI_SLURM_NODES: crsuse2-m2m-v2-002,crsuse2-m2m-v2-027,crsuse2-m2m-v2-030,crsuse2-m2m-v2-031,crsuse2-m2m-v2-032,crsuse2-m2m-v2-044,crsuse2-m2m-v2-050
       RESULT_DIR: plugin-ci-results
     steps:
       - name: Checkout ATOM repo
@@ -229,13 +225,12 @@ jobs:
           name: aiter-whl
           path: aiter-whl
 
-      - name: Build SGLang Slurm cell
+      - name: Build SGLang cell
         id: cell
         env:
           MATRIX_JSON: ${{ toJson(matrix) }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PLUGIN_CI_SLURM_SUBMIT_RUNNER: ${{ matrix.runner }}
           SKIP_DOCKER_LOGIN: ${{ github.event.pull_request.head.repo.fork && '1' || '0' }}
         run: |
           set -euo pipefail
@@ -244,19 +239,27 @@ jobs:
             --matrix-json "${MATRIX_JSON}" \
             --github-output
 
-      - name: Submit SGLang accuracy job to Slurm
+      - name: Run SGLang accuracy job
         env:
-          CELL_JSON: ${{ steps.cell.outputs.cell_json }}
+          MATRIX_MODEL_NAME: ${{ matrix.model_name }}
+          MATRIX_MODEL_PATH: ${{ matrix.model_path }}
+          MATRIX_EXTRA_ARGS: ${{ matrix.extra_args }}
+          MATRIX_ENV_VARS: ${{ matrix.env_vars }}
+          MATRIX_LM_EVAL_NUM_FEWSHOT: ${{ matrix.lm_eval_num_fewshot }}
+          MATRIX_LM_EVAL_NUM_CONCURRENT: ${{ matrix.lm_eval_num_concurrent }}
+          MATRIX_LM_EVAL_USE_CHAT_COMPLETIONS: ${{ matrix.lm_eval_use_chat_completions }}
+          MATRIX_LM_EVAL_EXTRA_MODEL_ARGS: ${{ matrix.lm_eval_extra_model_args }}
+          MATRIX_ACCURACY_TEST_THRESHOLD: ${{ matrix.accuracy_test_threshold }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SKIP_DOCKER_LOGIN: ${{ github.event.pull_request.head.repo.fork && '1' || '0' }}
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
           HF_TOKEN: ${{ secrets.AMD_HF_TOKEN }}
         run: |
           set -euo pipefail
-          chmod +x .github/scripts/plugin_ci/*.sh
-          bash .github/scripts/plugin_ci/submit.sh \
-            --plugin sglang \
-            --cell-json "${CELL_JSON}" \
-            --result-dir "${RESULT_DIR}"
+          chmod +x .github/scripts/plugin_ci/run_sglang_ci.sh
+          bash .github/scripts/plugin_ci/run_sglang_ci.sh
 
       - name: Add SGLang result to job summary
         if: always()
@@ -270,12 +273,9 @@ jobs:
 
           cell = json.loads(os.environ.get("CELL_JSON") or "{}")
           result_root = Path(os.environ["RESULT_DIR"])
-          job_ids = list(result_root.glob("*.slurm-job-id"))
           outputs = list(result_root.rglob("atom_sglang_accuracy_output.txt"))
           with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
               summary.write(f"## {cell.get('id', 'SGLang plugin CI')}\n\n")
-              if job_ids:
-                  summary.write(f"Slurm job: `{job_ids[0].read_text(encoding='utf-8').strip()}`\n\n")
               if outputs:
                   text = outputs[0].read_text(encoding="utf-8", errors="replace")
                   lines = text.splitlines()
@@ -292,7 +292,7 @@ jobs:
                       summary.write("\n".join(table) + "\n")
           PY
 
-      - name: Upload SGLang Slurm artifacts
+      - name: Upload SGLang artifacts
         if: always()
         uses: actions/upload-artifact@v7
         with:

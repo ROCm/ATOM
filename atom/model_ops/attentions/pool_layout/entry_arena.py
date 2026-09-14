@@ -1,29 +1,37 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""One request's attention state as few byte ranges as the layout allows.
+"""What one entry of a cache class holds, and where those bytes are put.
 
-A stateful attention type keeps several tensors per request — DeepSeek-V4's
-compressor keeps a `kv_state`/`score_state` pair for each of its three
-compressor flavors, GDN keeps a recurrent k and v. The natural way to write
-that down is one tensor per family, layer outermost and the request slot
-inside: `[layers, entries, ...]`. Every kernel then binds one layer's slice
-and indexes it by slot.
+An entry is one unit of an index space — `sub_pool_spec` sizes both pools in
+these terms, so it is a block of paged KV in the PAGE pool and one request's
+attention state in the STATE pool. Either way it holds several tensor
+families: DeepSeek-V4's compressor keeps a `kv_state`/`score_state` pair for
+each of its three flavors, GDN keeps a recurrent k and v, an MHA block keeps
+k, v and their dequantization scales. Each family is an `EntryField`, whose
+`shape` is what ONE (layer, entry) pair of it holds.
 
-That layout spreads a single request's state across as many disjoint
-allocations as there are families, which is fine as long as nothing ever
-needs the state *as a whole*. Three things do:
+There is one align-place-advance walk over a field list — `field_extents` —
+and the entry's own size, an arena's field offsets and a checkpoint image's
+ranges are three answers to that same walk, so all three come from it and
+cannot drift.
+
+An arena is that declaration materialized. `EntryMajorArena` puts the entry
+axis outermost, so entry `i` starts at `i * slot_stride` and is a contiguous
+slice. That is what a per-request state wants. Its natural declaration — one
+tensor per family, layer outermost and the request slot inside, `[layers,
+entries, ...]` — spreads one request across as many disjoint allocations as
+there are families, which is fine until something needs the state *as a
+whole*. Three things do:
 
   - saving it as a prefix-cache checkpoint, which wants one `copy_` per range;
   - relocating it when the pool boundary moves, which needs an entry to be
     the unit of movement;
   - shipping it over RDMA, which wants one registered range per entry.
 
-`StateArena` keeps the same per-layer views the kernels already take, but
-backs them with one allocation laid out entry-major: entry `i` starts at
-`i * slot_stride`, and inside it each field is laid out layer-major. So a
-per-layer view is the same shape as before with a larger slot stride, and an
-entry is a contiguous slice.
+So the arena keeps the same per-layer views the kernels already take, backed
+by one allocation: a per-layer view is the same shape as before with a larger
+slot stride, and `entry(i)` is a contiguous slice.
 
 The stride is the entry's own size when the arena owns its buffer. It is not
 when the arena lives at the front of a slot in a shared plane — there the
@@ -33,11 +41,22 @@ really the caller's and nothing outside it is ever written.
 
 A row space with planes of differing width cannot hold one entry contiguously
 at all: a field is one strided tensor, so it lands in one plane or the other.
-`plan_field_planes` decides which, `SplitStateArena` hides the split from
+`plan_field_planes` decides which, `SplitEntryMajorArena` hides the split from
 consumers asking for a field by name, and what stays contiguous is a *slot* —
 which is the range a PD transfer registers, and the range a checkpoint's own
 is carved out of by `checkpoint_ranges_for`, since an image holds only the
-fields a resumer reads (`StateField.in_checkpoint`).
+fields a resumer reads (`EntryField.in_checkpoint`).
+
+The entry axis is not always the one that goes outermost, which is why the
+declaration and the materializer are separate things in one module: a paged
+KV pool whose blocks are still laid out layer-major reads the same field list
+through a sibling arena. What picks between the two is where the entry axis
+sits, not which pool the entries are drawn from. They share a file because
+they are one topic — neither arena means anything without the field list it
+reads, and the two differ only in that axis. Not because they have to: a
+member of this package may import a sibling member, which
+`tests/test_layout_packages.py` allows precisely so that a declaration and
+the arithmetic over it are placed by topic rather than by import rule.
 
 Backends stay in charge of what the fields are; this module only owns the
 arithmetic. The layout is deliberately the one DeepSeek-V4's PD staging path
@@ -75,9 +94,9 @@ def plan_regions(sizes: list[int]) -> tuple[list[int], int]:
     and concatenate rather than slicing one flat result positionally. An
     empty list plans to `([], 0)`, so an absent group needs no special case.
 
-    Lives beside the arena because `_ALIGN` does: whoever carves the arena out
-    of a shared allocation has to place every other region on the boundary the
-    arena's own fields assume.
+    Lives beside the field extents because `_ALIGN` does: whoever carves an
+    arena out of a shared allocation has to place every other region on the
+    boundary that arena's own fields assume.
     """
     offsets: list[int] = []
     offset = 0
@@ -88,9 +107,32 @@ def plan_regions(sizes: list[int]) -> tuple[list[int], int]:
     return offsets, _align_up(offset)
 
 
+def carve(buf: torch.Tensor | None, sizes: list[int]) -> list[torch.Tensor | None]:
+    """`buf` cut into one region per size, placed by `plan_regions`.
+
+    The one place a region's start is decided, so every consumer of a shared
+    allocation — the runner's paged pool, a pool's field groups, a builder's
+    several pools — places them the same way and none has to be told the
+    offsets. `None` in, `None`s out: a pool that owns its memory carves
+    nothing and lets each arena allocate.
+    """
+    offsets, total = plan_regions(sizes)
+    if buf is None:
+        return [None] * len(sizes)
+    # Slicing past the end truncates rather than raising, so a short buffer
+    # comes back as a short last region and surfaces as an arena complaining
+    # about bytes the caller never chose.
+    if buf.numel() < total:
+        raise ValueError(
+            f"a buffer of {buf.numel()} B cannot hold {len(sizes)} regions "
+            f"needing {total} B"
+        )
+    return [buf[start : start + size] for start, size in zip(offsets, sizes)]
+
+
 def plan_field_planes(
-    fields: list[StateField], plane_row_bytes: list[int]
-) -> tuple[list[list[StateField]], int]:
+    fields: list[EntryField], plane_row_bytes: list[int]
+) -> tuple[list[list[EntryField]], int]:
     """Split fields across the planes of one row space, in the fewest rows.
 
     Every plane materializes the same rows at its own width, so a slot that
@@ -118,9 +160,9 @@ def plan_field_planes(
             f"{len(fields)} fields over {num_planes} planes"
         )
 
-    best: tuple[list[list[StateField]], int] | None = None
+    best: tuple[list[list[EntryField]], int] | None = None
     for code in range(assignments):
-        groups: list[list[StateField]] = [[] for _ in plane_row_bytes]
+        groups: list[list[EntryField]] = [[] for _ in plane_row_bytes]
         rest = code
         for field in fields:
             groups[rest % num_planes].append(field)
@@ -135,45 +177,8 @@ def plan_field_planes(
     return best
 
 
-class SplitStateArena:
-    """One request's state, spread over the planes of a row space.
-
-    A row space materializes the same rows at several widths, and a field is
-    one strided tensor so it cannot straddle two of them — see
-    `plan_field_planes`. Consumers still want to ask for a field by name
-    without knowing which plane it landed in, which is all this is.
-
-    There is deliberately no whole-entry accessor. When the state shares a slot
-    with that request's windows, the range worth copying is the slot, and the
-    caller who knows the geometry takes it from the plane directly.
-    """
-
-    def __init__(self, arenas: list[StateArena]):
-        if not arenas:
-            raise ValueError("a split arena needs at least one plane")
-        self.arenas = list(arenas)
-        self._by_field: dict[str, StateArena] = {}
-        for arena in self.arenas:
-            for field in arena.fields:
-                if field.name in self._by_field:
-                    raise ValueError(f"field {field.name!r} is in two planes")
-                self._by_field[field.name] = arena
-
-    @property
-    def entry_bytes(self) -> int:
-        """Bytes one request's state takes, summed over the planes."""
-        return sum(a.entry_bytes for a in self.arenas)
-
-    def view(self, name: str) -> torch.Tensor:
-        return self._by_field[name].view(name)
-
-    def field_offset(self, name: str) -> int:
-        """Bytes into the plane's slot where field `name` begins."""
-        return self._by_field[name].field_offset(name)
-
-
 @dataclass(frozen=True)
-class StateField:
+class EntryField:
     """One tensor family inside an entry.
 
     `shape` is what ONE (layer, entry) pair holds — the same trailing shape
@@ -225,8 +230,8 @@ class StateField:
 
 
 def field_extents(
-    fields: list[StateField],
-) -> Iterator[tuple[StateField, int, int]]:
+    fields: list[EntryField],
+) -> Iterator[tuple[EntryField, int, int]]:
     """Each field with the `[start, end)` bytes it occupies in an entry.
 
     The one place the align-place-advance walk is written. An arena's field
@@ -240,7 +245,7 @@ def field_extents(
         offset += field.bytes_per_entry
 
 
-def entry_bytes_for(fields: list[StateField]) -> int:
+def entry_bytes_for(fields: list[EntryField]) -> int:
     """Bytes one entry costs, including inter-field alignment.
 
     Sizing calls this before any GPU allocation exists, so it is a free
@@ -253,7 +258,7 @@ def entry_bytes_for(fields: list[StateField]) -> int:
     return _align_up(end)
 
 
-def checkpoint_ranges_for(fields: list[StateField]) -> list[tuple[int, int]]:
+def checkpoint_ranges_for(fields: list[EntryField]) -> list[tuple[int, int]]:
     """`(offset, num_bytes)` of an entry a checkpoint image holds.
 
     Consecutive carried fields merge into one range, so the ordinary
@@ -278,8 +283,45 @@ def checkpoint_ranges_for(fields: list[StateField]) -> list[tuple[int, int]]:
     return ranges
 
 
-class StateArena:
-    """`entries` fixed-size state entries, one stride apart.
+class SplitEntryMajorArena:
+    """One request's state, spread over the planes of a row space.
+
+    A row space materializes the same rows at several widths, and a field is
+    one strided tensor so it cannot straddle two of them — see
+    `plan_field_planes`. Consumers still want to ask for a field by name
+    without knowing which plane it landed in, which is all this is.
+
+    There is deliberately no whole-entry accessor. When the state shares a slot
+    with that request's windows, the range worth copying is the slot, and the
+    caller who knows the geometry takes it from the plane directly.
+    """
+
+    def __init__(self, arenas: list[EntryMajorArena]):
+        if not arenas:
+            raise ValueError("a split arena needs at least one plane")
+        self.arenas = list(arenas)
+        self._by_field: dict[str, EntryMajorArena] = {}
+        for arena in self.arenas:
+            for field in arena.fields:
+                if field.name in self._by_field:
+                    raise ValueError(f"field {field.name!r} is in two planes")
+                self._by_field[field.name] = arena
+
+    @property
+    def entry_bytes(self) -> int:
+        """Bytes one request's state takes, summed over the planes."""
+        return sum(a.entry_bytes for a in self.arenas)
+
+    def view(self, name: str) -> torch.Tensor:
+        return self._by_field[name].view(name)
+
+    def field_offset(self, name: str) -> int:
+        """Bytes into the plane's slot where field `name` begins."""
+        return self._by_field[name].field_offset(name)
+
+
+class EntryMajorArena:
+    """`entries` fixed-size entries, one stride apart.
 
     Exposes the per-layer views kernels expect (`view(name)` →
     `[layers, entries, *shape]`) and the whole-entry byte range that
@@ -293,15 +335,18 @@ class StateArena:
 
     def __init__(
         self,
-        fields: list[StateField],
+        fields: list[EntryField],
         entries: int,
         device,
         buf: torch.Tensor | None = None,
         slot_stride: int | None = None,
         live_entries: int | None = None,
     ):
-        if not fields:
-            raise ValueError("a state arena needs at least one field")
+        # No fields is legal here and not in `LayerMajorArena`, because "empty"
+        # differs: a layer-major group is a region a model may not want, and
+        # `carve_layer_major` drops it to None; a plane is addressed by index,
+        # still costs its rows, and `plan_field_planes` empties one whenever
+        # the fields fit in fewer.
         names = [f.name for f in fields]
         if len(set(names)) != len(names):
             raise ValueError(f"duplicate field names: {names}")
@@ -413,3 +458,127 @@ class StateArena:
     def field_offset(self, name: str) -> int:
         """Byte offset of a field from the start of an entry."""
         return self._offsets[name]
+
+
+def carve_layer_major(
+    groups: list[list[EntryField]],
+    entries: int,
+    device,
+    buf: torch.Tensor | None = None,
+) -> list[LayerMajorArena | None]:
+    """One layer-major arena per field group, packed into one allocation.
+
+    A paged pool is several groups that are laid out apart but bought together
+    -- an MHA block's cache, its scales and an indexer's keys. `plan_regions`
+    places them, so each starts on the boundary its own field views retype
+    from, and an empty group gets `None` instead of an arena over nothing.
+
+    Every group's `entry_bytes_for` is aligned already, so packing adds no
+    padding and the regions come to exactly what a caller summing the same
+    groups was charged. `buf` is None for a pool that owns its memory.
+    """
+    sizes = [entry_bytes_for(group) * entries for group in groups]
+    return [
+        LayerMajorArena(group, entries, device, buf=region) if group else None
+        for group, region in zip(groups, carve(buf, sizes))
+    ]
+
+
+class LayerMajorArena:
+    """The same fields with the layer axis outermost instead of the entry axis.
+
+    A field's whole region comes first with the layer axis inside it, so field
+    `f` begins at `field_extents`' offset for it *times* `entries` — the same
+    walk, scaled by the axis that moved outside.
+
+    This is the shape a paged KV pool already has: `[layers, blocks, ...]` per
+    tensor, one layer's slice contiguous, which several attention kernels
+    assume. The cost is that an *entry* is not contiguous — one block's k, v
+    and scales sit `entries` apart — so there is no `entry(i)` here and nothing
+    can copy or register a block as a unit. That absence is why this is not
+    `EntryMajorArena`, and it is the deletion condition: turn the pool
+    block-major and that class serves both, `entry(i)` included.
+
+    Unlike `EntryMajorArena` it fills only the allocation it owns; a `buf`
+    handed in may already hold KV, and an IPC-imported one does. Handing one in
+    also checks the declaration against it: too few bytes, or padding the
+    allocation does not have, is refused rather than addressed past.
+    """
+
+    def __init__(
+        self,
+        fields: list[EntryField],
+        entries: int,
+        device,
+        buf: torch.Tensor | None = None,
+    ):
+        if not fields:
+            raise ValueError("a layer-major arena needs at least one field")
+        names = [f.name for f in fields]
+        if len(set(names)) != len(names):
+            raise ValueError(f"duplicate field names: {names}")
+
+        self.fields = list(fields)
+        self.entries = entries
+        self.entry_bytes = entry_bytes_for(fields)
+        self._align = max([_ALIGN] + [f.align for f in self.fields])
+        self._offsets = {f.name: start for f, start, _ in field_extents(self.fields)}
+        self._by_name = {f.name: f for f in self.fields}
+
+        want = self.entry_bytes * entries
+        if buf is None:
+            self.buf = torch.zeros(want, dtype=torch.uint8, device=device)
+            for field in self.fields:
+                self.view(field.name).fill_(field.fill)
+        else:
+            if buf.dtype is not torch.uint8 or buf.numel() < want:
+                raise ValueError(
+                    f"buf must hold at least {want} uint8 elements, got "
+                    f"{buf.numel()} {buf.dtype}"
+                )
+            if not buf.is_contiguous():
+                raise ValueError("buf must be contiguous")
+            if buf.storage_offset() % self._align:
+                raise ValueError(
+                    f"buf must start on a {self._align}B boundary, got storage "
+                    f"offset {buf.storage_offset()}: field views retype the "
+                    "buffer, which needs the offset to divide every itemsize"
+                )
+            # Refused and not applied: the buffer may be an imported pool
+            # already holding the peer's KV, which the arena cannot tell from a
+            # fresh one. Refused and not dropped either -- a `-inf` score plane
+            # arriving as 0.0 turns "never selected" into "always".
+            unfillable = [f.name for f in self.fields if f.fill]
+            if unfillable:
+                raise ValueError(
+                    f"fields {unfillable} declare a non-zero fill, which an "
+                    "arena over a caller's buffer cannot apply; give the "
+                    "caller the fill before declaring one"
+                )
+            self.buf = buf
+
+    @property
+    def total_bytes(self) -> int:
+        """Bytes the whole arena spans."""
+        return self.entry_bytes * self.entries
+
+    def view(self, name: str) -> torch.Tensor:
+        """`[layers, entries, *shape]` — the same signature `EntryMajorArena`
+        gives, and contiguous per layer, which is what the paged path binds."""
+        field = self._by_name[name]
+        itemsize = field.dtype.itemsize
+        # `as_strided`'s storage_offset is ABSOLUTE, so `typed`'s own offset has
+        # to be added -- omit it and a carved arena addresses from the front of
+        # the host allocation and writes through whatever precedes it.
+        typed = self.buf.view(field.dtype)
+        inner: tuple[int, ...] = ()
+        acc = 1
+        for dim in reversed(field.shape):
+            inner = (acc,) + inner
+            acc *= dim
+        return typed.as_strided(
+            (field.layers, self.entries) + field.shape,
+            (self.entries * field.per_layer_numel, field.per_layer_numel) + inner,
+            typed.storage_offset()
+            + self._offsets[field.name] * self.entries // itemsize,
+        )

@@ -88,8 +88,8 @@ def test_select_experts_keeps_shared_out_of_router_and_eplb(monkeypatch):
         moe_module, "is_rocm_aiter_fuse_routed_scaling_factor", lambda: True
     )
     # Pins the ordering router -> EPLB -> shared, not the kernel arithmetic.
-    layer.to_dispatch_space = lambda weights, ids: (
-        FusedMoE.to_dispatch_space(layer, weights, ids)
+    layer.to_dispatch_space = lambda weights, ids: FusedMoE.to_dispatch_space(
+        layer, weights, ids
     )
 
     weights, ids = FusedMoEMethodBase.select_experts_with_record(
@@ -145,7 +145,9 @@ def test_eplb_appends_unscaled_shared_weight(monkeypatch):
     assert captured["scale"] == 2.0
 
 
-def _parallel_config(*, dp_size: int, use_ep: bool) -> FusedMoEParallelConfig:
+def _parallel_config(
+    *, dp_size: int, use_ep: bool, backend: str = "auto"
+) -> FusedMoEParallelConfig:
     return FusedMoEParallelConfig(
         tp_size=8,
         dp_size=dp_size,
@@ -155,31 +157,45 @@ def _parallel_config(*, dp_size: int, use_ep: bool) -> FusedMoEParallelConfig:
         ep_rank=0,
         use_ep=use_ep,
         local_ep_size=8,
+        requested_all2all_backend=backend,
     )
 
 
 @pytest.mark.parametrize(
-    "dp_size, use_ep, has_mori, expected",
+    "dp_size, use_ep, has_mori, disable_mori, backend, expected_backend",
     [
         # EP without DP still runs the legacy AITER fusion: no all2all backend,
         # so there is no dispatch space to fold the shared expert into.
-        (1, True, True, False),
-        (8, True, True, True),
-        (8, False, True, False),
-        (8, True, False, False),
+        (1, True, True, False, "auto", None),
+        (8, True, True, False, "auto", "mori"),
+        (8, False, True, False, "auto", None),
+        (8, True, False, False, "auto", None),
+        (8, True, True, True, "auto", None),
+        # The native backend is explicit and does not depend on MoRI import or
+        # ATOM_DISABLE_MORI_EP, whose scope remains MoRI only.
+        (8, True, False, True, "rccl", "rccl"),
+        (8, True, True, False, "none", None),
     ],
 )
 def test_ep_alone_does_not_imply_all2all(
-    monkeypatch, dp_size, use_ep, has_mori, expected
+    monkeypatch,
+    dp_size,
+    use_ep,
+    has_mori,
+    disable_mori,
+    backend,
+    expected_backend,
 ):
     monkeypatch.setattr(moe_module, "_has_module", lambda name: has_mori)
+    monkeypatch.setattr(moe_module.envs, "ATOM_DISABLE_MORI_EP", disable_mori)
 
-    config = _parallel_config(dp_size=dp_size, use_ep=use_ep)
+    config = _parallel_config(dp_size=dp_size, use_ep=use_ep, backend=backend)
 
-    assert config.use_all2all_kernels is expected
+    assert config.selected_all2all_backend == expected_backend
+    assert config.use_all2all_kernels is (expected_backend is not None)
 
 
-def _atom_config(*, eplb: bool) -> SimpleNamespace:
+def _atom_config(*, eplb: bool, backend: str = "auto") -> SimpleNamespace:
     """The four fields this gate reads, over the real Config's defaults.
 
     Hand-built, this went red the day `is_rocm_aiter_fusion_shared_expert_
@@ -193,6 +209,7 @@ def _atom_config(*, eplb: bool) -> SimpleNamespace:
         parallel_config=SimpleNamespace(data_parallel_size=8),
         moe_ep_flatten_tp_across_dp=False,
         eplb_enable=eplb,
+        moe_all2all_backend=backend,
         # The branch under test is the MoRI + DP-attention one -- "only MoRI
         # needs the switch", says the code -- so the scenario has to say so.
         # Left at Config's default of False, the early return is unreachable
@@ -212,6 +229,7 @@ def _atom_config(*, eplb: bool) -> SimpleNamespace:
 )
 def test_eplb_overrides_the_local_replica_switch(monkeypatch, eplb, switch, expected):
     monkeypatch.setattr(topK_module.envs, "ATOM_FUSE_SHARED_EXPERT", switch)
+    monkeypatch.setattr(topK_module.envs, "ATOM_DISABLE_MORI_EP", False)
     # Stated, not inherited: the gate asks whether MoRI is importable, so
     # without this the truth table below holds only on a box that has it.
     monkeypatch.setattr(topK_module, "_has_module", lambda name: True)
@@ -224,3 +242,16 @@ def test_eplb_overrides_the_local_replica_switch(monkeypatch, eplb, switch, expe
     enabled = is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(None)
 
     assert enabled is expected
+
+
+def test_rccl_backend_does_not_take_mori_shared_expert_gate(monkeypatch):
+    monkeypatch.setattr(topK_module.envs, "ATOM_FUSE_SHARED_EXPERT", False)
+    monkeypatch.setattr(topK_module.envs, "ATOM_DISABLE_MORI_EP", False)
+    monkeypatch.setattr(topK_module, "_has_module", lambda name: True)
+    monkeypatch.setattr(
+        topK_module,
+        "get_current_atom_config",
+        lambda: _atom_config(eplb=False, backend="rccl"),
+    )
+
+    assert is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(None)

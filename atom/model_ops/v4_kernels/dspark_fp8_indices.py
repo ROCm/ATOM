@@ -40,7 +40,7 @@ import torch
 import triton
 import triton.language as tl
 
-from atom.model_ops.attentions.v4_pool_geometry import WindowParams
+from atom.model_ops.attentions.pool_layout.v4_pool_geometry import WindowParams
 from atom.model_ops.v4_kernels.pool_index import window_constexprs, window_row
 
 

@@ -546,7 +546,7 @@ def _resolve_sglang_pools(forward_batch):
     return runtime.token_to_kv_pool, runtime.req_to_token_pool
 
 
-def _build_sparse_req_id_per_token_for_sglang(
+def _build_sparse_batch_id_per_q_token_for_sglang(
     forward_batch,
     device: torch.device,
     num_tokens: int | None = None,
@@ -563,12 +563,14 @@ def _build_sparse_req_id_per_token_for_sglang(
     query_lens = getattr(forward_batch, "extend_seq_lens", None)
     if query_lens is None:
         query_lens = forward_batch.seq_lens
-    req_id_per_token = torch.repeat_interleave(req_ids, query_lens[:bs].to(torch.int32))
+    batch_id_per_q_token = torch.repeat_interleave(
+        req_ids, query_lens[:bs].to(torch.int32)
+    )
     if num_tokens is not None:
-        req_id_per_token = _maybe_apply_pcp_dense_query_split(
-            req_id_per_token, int(num_tokens)
+        batch_id_per_q_token = _maybe_apply_pcp_dense_query_split(
+            batch_id_per_q_token, int(num_tokens)
         )
-    return req_id_per_token
+    return batch_id_per_q_token
 
 
 def _supports_sparse_mla_fast_metadata(
@@ -595,7 +597,7 @@ def _supports_sparse_mla_fast_metadata(
 class SparseMLAKernelMetadata:
     allocator_page_size: int
     topk_tokens: int
-    req_id_per_token: torch.Tensor
+    batch_id_per_q_token: torch.Tensor
     block_table: torch.Tensor
     qo_indptr: torch.Tensor
     kv_indptr: torch.Tensor
@@ -620,7 +622,7 @@ class SparseMLAGraphBuffers:
     q: torch.Tensor
     output: torch.Tensor
     seq_len: torch.Tensor
-    req_id_per_token: torch.Tensor
+    batch_id_per_q_token: torch.Tensor
     block_table: torch.Tensor
     qo_indptr: torch.Tensor
     kv_indptr: torch.Tensor
@@ -840,7 +842,7 @@ def _allocate_sparse_mla_graph_buffers(
             device=q.device,
         ),
         seq_len=torch.empty(num_tokens, dtype=torch.int32, device=q.device),
-        req_id_per_token=torch.repeat_interleave(
+        batch_id_per_q_token=torch.repeat_interleave(
             torch.arange(batch_size, dtype=torch.int32, device=q.device),
             tokens_per_req,
         ),
@@ -985,7 +987,7 @@ def _prepare_sparse_mla_graph_metadata(
     buffers.kv_indptr[0].zero_()
     torch.cumsum(buffers.seq_len, dim=0, out=buffers.kv_indptr[1:])
     triton_convert_req_index_to_global_index(
-        buffers.req_id_per_token,
+        buffers.batch_id_per_q_token,
         buffers.block_table,
         topk_indices.to(dtype=torch.int32),
         buffers.kv_indptr,
@@ -1019,7 +1021,7 @@ def _prepare_sparse_mla_graph_metadata(
     return SparseMLAKernelMetadata(
         allocator_page_size=buffers.allocator_page_size,
         topk_tokens=buffers.topk_tokens,
-        req_id_per_token=buffers.req_id_per_token,
+        batch_id_per_q_token=buffers.batch_id_per_q_token,
         block_table=buffers.block_table,
         qo_indptr=buffers.qo_indptr,
         kv_indptr=buffers.kv_indptr,
@@ -1048,7 +1050,7 @@ def _prepare_sparse_mla_kernel_metadata(
     topk_tokens = int(topk_indices.shape[1])
     token_to_kv_pool, _ = _resolve_sglang_pools(forward_batch)
     allocator_page_size = int(getattr(token_to_kv_pool, "page_size", 1))
-    req_id_per_token = _build_sparse_req_id_per_token_for_sglang(
+    batch_id_per_q_token = _build_sparse_batch_id_per_q_token_for_sglang(
         forward_batch, q.device, num_tokens=num_tokens
     )
     block_table = _build_sglang_block_table(forward_batch, allocator_page_size).to(
@@ -1063,7 +1065,7 @@ def _prepare_sparse_mla_kernel_metadata(
         (num_tokens * topk_tokens,), dtype=torch.int32, device=q.device
     )
     triton_convert_req_index_to_global_index(
-        req_id_per_token,
+        batch_id_per_q_token,
         block_table,
         topk_indices.to(dtype=torch.int32),
         kv_indptr,
@@ -1087,7 +1089,7 @@ def _prepare_sparse_mla_kernel_metadata(
     metadata = SparseMLAKernelMetadata(
         allocator_page_size=allocator_page_size,
         topk_tokens=topk_tokens,
-        req_id_per_token=req_id_per_token,
+        batch_id_per_q_token=batch_id_per_q_token,
         block_table=block_table,
         qo_indptr=qo_indptr,
         kv_indptr=kv_indptr,

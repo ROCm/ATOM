@@ -17,6 +17,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from atom.model_ops.v4_kernels.compress_plan import (
     CompressPlan,
     make_compress_plans,
+    plan_context_lens,
 )
 from atom.model_ops.v4_kernels.csa_translate_pack import (
     csa_translate_pack,
@@ -76,6 +77,7 @@ __all__ = [
     "hca_compress_paged_offsets",
     "inverse_rope_inplace",
     "make_compress_plans",
+    "plan_context_lens",
     "qk_norm_rope_maybe_quant",
     "qk_norm_rope_maybe_quant_fp8_2buff",
     "qk_norm_rope_maybe_quant_reference",
@@ -95,13 +97,23 @@ __all__ = [
 
 logger = logging.getLogger("atom")
 
-# FP4 indexer persistent-grid schedule params, shared by the decode
-# (`pa_mqa_logits_fp4`) and prefill (`pa_mqa_logits_fp4_prefill`) kernels.
+# FP4 indexer persistent-grid schedule params for the `pa_mqa_logits_fp4_prefill`
+# kernels, which decode and prefill both score through.
 # The attention metadata builder precomputes each path's cta_info with these
 # and the scorer passes the matching block_k, so layout and grid agree. They
 # live here (rather than in either caller) because both the builder and the
-# model-side scorer must use the SAME values. Mirrors the kernel defaults.
-FP4_MQA_PARALLEL_UNIT_NUM = 512
+# model-side scorer must use the SAME values.
+#
+# The grid floor is a CTA-count target, not the kernel default: every consumer
+# takes `max(floor, rows)`, so it only adds split-K to grids too small to fill
+# the GPU and is an identity for the wide ones. Splits are numerically inert --
+# each CTA gets a disjoint KV-column range, no cross-CTA partial sums.
+# 512 idled the machine on long contexts, where rows shrink as the logits buffer
+# widens: decode rows=128 W~32768 54.1us -> 51.2us, prefill rows=1024 224.6us ->
+# 206.2us. 4096 is not any shape's optimum (CTA-count quantization makes the
+# ordering shape-specific) but has the smallest worst-case regret of the values
+# tried; re-tune against a real workload mix.
+FP4_MQA_PARALLEL_UNIT_NUM = 4096
 FP4_MQA_BLOCK_K = 256
 
 
