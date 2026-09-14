@@ -24,7 +24,7 @@ from atom.model_ops.qwen4_exp.hyperconnection import (
     Qwen4ExpHyperConnection,
 )
 from atom.model_ops.qwen4_exp.ops.gated import sigmoid_mul, sigmoid_rmsnorm
-from atom.model_ops.qwen4_exp.ple import Qwen4ExpPLELayer
+from atom.model_ops.qwen4_exp.ple_layer import Qwen4ExpPLELayer
 from atom.model_ops.qwen4_exp.qsa_attention import (
     Qwen4ExpAttention,
 )
