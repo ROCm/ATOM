@@ -386,22 +386,23 @@ deliberately excludes a PAGE-only hit or an HBM prefix-cache hit.
 prefix-cache reads rather than compute. `x` is AIPerf's
 `Output Token Throughput Per User` at p90.
 
-| band | conc | tok/s/chip | x (tok/s/user) | ITL p90 | TTFT p90 | cache hit |
-|---|---|---|---|---|---|---|
-| A | 1 | 737 | 149.3 | 7.5 ms | 1.9 s | 96.8% |
-| A | 2 | 789 | 145.8 | 7.7 ms | 1.6 s | 95.6% |
-| A | 8 | 2,512 | 138.9 | 9.2 ms | 1.6 s | 97.1% |
-| A | 16 | 4,442 | 123.1 | 11.8 ms | 2.0 s | 96.6% |
-| B | 64 | 15,137 | 69.1 | 19.4 ms | 7.8 s | 96.1% |
-| **B** | **128** | **21,652** | 57.5 | 29.6 ms | 15.0 s | 94.7% |
-| C† | 256 | 21,599 | 56.2 | 31.0 ms | 192.8 s | 91.0% |
-| **C** | **256** | **30,686** | 35.1 | 34.3 ms | **36.0 s** | **94.6%** |
+| conc | mode | offload | tok/s/chip | x (tok/s/user) | ITL p90 | TTFT p90 | cache hit |
+|---|---|---|---|---|---|---|---|
+| 1 | TP | — | 737 | 149.3 | 7.5 ms | 1.9 s | 96.8% |
+| 2 | TP | — | 789 | 145.8 | 7.7 ms | 1.6 s | 95.6% |
+| 8 | TP | — | 2,512 | 138.9 | 9.2 ms | 1.6 s | 97.1% |
+| 16 | TP | — | 4,442 | 123.1 | 11.8 ms | 2.0 s | 96.6% |
+| 64 | DP | — | 15,137 | 69.1 | 19.4 ms | 7.8 s | 96.1% |
+| 128 | DP | — | 21,652 | 57.5 | 29.6 ms | 15.0 s | 94.7% |
+| 256 | DP | defaults | 21,599 | 56.2 | 31.0 ms | 192.8 s | 91.0% |
+| 256 | DP | **tuned** | **30,686** | 35.1 | 34.3 ms | **36.0 s** | **94.6%** |
 
-† offload defaults (`max_pending_saves=2`, `slot_sidecar_staging_slots=1`) rather
-than the values in this recipe. Kept as the before/after pair.
+The two c=256 rows are the same run with and without the offload settings in
+this recipe: `defaults` is `max_pending_saves=2` and
+`slot_sidecar_staging_slots=1`, `tuned` is 8 and 4.
 
-The last row is the configuration this recipe documents. Band B rows carry no
-offload tier at all, so the settings section below does not apply to them.
+The c=64 and c=128 rows carry no offload tier at all, so the settings section
+above does not apply to them.
 
 Three caveats on that pair. The tuned run sampled a longer trace
 (`isl` p50 84,176 against 71,141), and `tok/s/chip` counts input tokens, so
