@@ -8,6 +8,8 @@ which is what the workload needs at high concurrency.
 
 - Hardware: MI355X ×8 per node, **two nodes**, prefill/decode disaggregated (1P1D)
 - Model: `deepseek-ai/DeepSeek-V4-Pro`, FP4 weights, FP8 KV, FP8 index cache
+  (FP8 is forced under PD — the single-node recipe's FP4 indexer has no
+  Mooncake staging layout, and `atom/config.py` rewrites it)
 - Transport: Mooncake RDMA, GID index 1, HIP DMA-BUF compatibility preload
 - Scenario: `inferencex-agentx-mvp`, dataset `semianalysis_cc_traces_weka_062126`
 - Router: `atomesh`, PD mode, `idx2idx` rank mapping
@@ -50,7 +52,6 @@ python3 -m atom.entrypoints.openai_server \
   --tensor-parallel-size 8 \
   --kv-cache-dtype fp8 --index-cache-dtype fp8 \
   --enable-prefix-caching --block-size 16 \
-  --gpu-memory-utilization 0.65 \
   --max-num-seqs $(( CONC * 2 )) \
   --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
   --state-checkpoint-interval-tokens 8192 \
@@ -60,8 +61,8 @@ python3 -m atom.entrypoints.openai_server \
   --kv-transfer-config "$KV_TRANSFER"
 ```
 
-`$PORT` is 8010 on prefill, 8020 on decode. `--gpu-memory-utilization` is 0.65
-on prefill and 0.70 on decode. `$KV_TRANSFER` is the plain Mooncake pair:
+`$PORT` is 8010 on prefill, 8020 on decode. `$KV_TRANSFER` is the plain
+Mooncake pair:
 
 ```jsonc
 // prefill
@@ -105,7 +106,6 @@ python3 -m atom.entrypoints.openai_server \
   --enable-dp-attention --enable-tbo \
   --kv-cache-dtype fp8 --index-cache-dtype fp8 \
   --enable-prefix-caching --block-size 16 \
-  --gpu-memory-utilization 0.75 \
   --max-num-seqs $(( CONC * 2 )) \
   --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
   --state-checkpoint-interval-tokens 8192 \
@@ -116,7 +116,7 @@ python3 -m atom.entrypoints.openai_server \
 ```
 
 `--enable-tbo` (two-batch overlap) goes on the **prefill node only**. The decode
-node runs DP attention without it, and at `--gpu-memory-utilization 0.70`.
+node runs DP attention without it.
 
 `ATOM_DP_SESSION_AFFINITY=1` is the load-bearing one of those four. It keeps a
 trajectory on one rank, which is what the agentic scenario's prefix reuse
@@ -181,6 +181,7 @@ The config the *Measured* tuned row was produced with, written out in full so it
 can be copied without resolving any of the `$VAR` above. Substitute only the two
 IPs and `$MODEL_PATH`.
 
+
 ### Prefill node
 
 ```bash
@@ -213,7 +214,6 @@ python3 -m atom.entrypoints.openai_server \
   --enable-dp-attention --enable-tbo \
   --kv-cache-dtype fp8 --index-cache-dtype fp8 \
   --enable-prefix-caching --block-size 16 \
-  --gpu-memory-utilization 0.75 \
   --max-num-seqs 512 \
   --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
   --state-checkpoint-interval-tokens 8192 \
@@ -239,7 +239,6 @@ python3 -m atom.entrypoints.openai_server \
   --enable-dp-attention \
   --kv-cache-dtype fp8 --index-cache-dtype fp8 \
   --enable-prefix-caching --block-size 16 \
-  --gpu-memory-utilization 0.70 \
   --max-num-seqs 512 \
   --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
   --state-checkpoint-interval-tokens 8192 \
@@ -388,6 +387,10 @@ deliberately excludes a PAGE-only hit or an HBM prefix-cache hit.
 prefix-cache reads rather than compute. `x` is AIPerf's
 `Output Token Throughput Per User` at p90.
 
+Taken at `--gpu-memory-utilization` 0.75 prefill / 0.70 decode, which the
+commands above no longer set — see [If the servers OOM at
+startup](#if-the-servers-oom-at-startup).
+
 | conc | mode | offload | tok/s/chip | x (tok/s/user) | ITL p90 | TTFT p90 | cache hit |
 |---|---|---|---|---|---|---|---|
 | 1 | TP | — | 737 | 149.3 | 7.5 ms | 1.9 s | 96.8% |
@@ -437,6 +440,23 @@ xPyD. Two traps:
   sidecars saved across the two nodes, **zero** restored. Set
   `--prefill-policy prefix_hash` (or `cache_aware`) before running more than one
   prefill node.
+
+## If the servers OOM at startup
+
+The commands above do not pass `--gpu-memory-utilization`; ATOM defaults it to
+0.9, same as the single-node recipe. PD does not need a lower value.
+
+The Crusoe MI355X cluster these numbers came from does: ROCm's dmabuf RDMA
+memory registration is incomplete there, which is also why the commands preload
+`rdma_compat/libhip_dmabuf_mr.so`. At 0.9 the KV pool allocates and Mooncake
+registers it, then the first barrier in `allocate_kv_cache` cannot get 32 MiB —
+with ~43 GiB per chip still nominally free at 0.85, so it is not a budget
+overrun. Cluster IT's guidance is `≤ 0.65`; 0.75 prefill / 0.70 decode completed
+a 3,600 s run for us, while 0.80 started, passed smoke, and then died mid-run in
+MoE stage-2. Starting is not evidence a value is safe.
+
+This is a property of that cluster, not of PD or DeepSeek-V4. Elsewhere, leave
+the flag off.
 
 ## Related
 
