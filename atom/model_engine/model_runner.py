@@ -131,7 +131,7 @@ support_model_arch_dict = {
     "MiniMaxM3SparseForCausalLM": "atom.models.minimax_m3.MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration": "atom.models.minimax_m3.MiniMaxM3SparseForConditionalGeneration",
     "Glm5NextForConditionalGeneration": (
-        "atom.models.glm5_next.Glm5NextForConditionalGeneration"
+        "atom.models.glm5_next.Glm5NextMultimodalModel"
     ),
 }
 # seed = 34567
