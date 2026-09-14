@@ -214,7 +214,7 @@ python3 -m atom.entrypoints.openai_server \
   --enable-dp-attention --enable-tbo \
   --kv-cache-dtype fp8 \
   --enable-prefix-caching \
-  --max-num-seqs 512 \
+  --max-num-seqs $(( CONC * 2 )) \
   --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
   --state-checkpoint-interval-tokens 8192 \
   --level 3 \
@@ -239,7 +239,7 @@ python3 -m atom.entrypoints.openai_server \
   --enable-dp-attention \
   --kv-cache-dtype fp8 \
   --enable-prefix-caching \
-  --max-num-seqs 512 \
+  --max-num-seqs $(( CONC * 2 )) \
   --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
   --state-checkpoint-interval-tokens 8192 \
   --level 3 \
