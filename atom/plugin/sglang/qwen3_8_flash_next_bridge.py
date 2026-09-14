@@ -678,7 +678,7 @@ def build_ple_metadata(
     else:
         idx_in = idx_in[:bs].to(device=device, dtype=torch.int32)
 
-    if _is_capturing():
+    if _is_capturing() or _DECODE_GRAPH.active:
         existing = getattr(model, "_atom_ple_conv_state", None)
         num_slots = max(bs, int(existing.shape[0]) if existing is not None else 16)
     else:
@@ -1109,8 +1109,10 @@ def prepare_flash_decode_graph_metadata(
     # PLE must refresh *after* HybridLinearAttnBackend runs the GDN/linear
     # child (full-attn out_graph runs first). See refresh_flash_decode_graph_ple
     # installed from register.py. Capture-time PLE still comes from model.forward.
-    ple_ok = False
-    if qsa is not None:
+    # Replay must not .item() / INFO-log: each D2H sync is a full device drain
+    # and Native ATOM decode (TPOT ~26ms) has none of this.
+    debug_qsa = in_capture or logger.isEnabledFor(logging.DEBUG)
+    if qsa is not None and debug_qsa:
         try:
             bt = qsa.block_tables
             nonzero_pages = int((bt > 0).sum().item()) if torch.is_tensor(bt) else -1
@@ -1126,59 +1128,16 @@ def prepare_flash_decode_graph_metadata(
             )
         except Exception:  # noqa: BLE001
             nonzero_pages, seq_max, slot0 = -1, -1, -1
-        log_fn = logger.info if in_capture or seq_max >= 512 else logger.debug
-        log_fn(
+        logger.info(
             "Flash decode graph QSA %s: seq_max=%s pages_nonzero=%s "
-            "page_width=%s slot0=%s ple_ok=%s max_seq_len=%s",
+            "page_width=%s slot0=%s max_seq_len=%s",
             "capture" if in_capture else "replay",
             seq_max,
             nonzero_pages,
             int(qsa.block_tables.shape[1]) if torch.is_tensor(qsa.block_tables) else -1,
             slot0,
-            ple_ok,
             qsa.max_seq_len,
         )
-        if (not in_capture) and seq_max >= 512 and torch.is_tensor(getattr(qsa, "block_tables", None)):
-            bt = qsa.block_tables
-            page_max = int(bt.max().item()) if bt.numel() else -1
-            n_pages = -1
-            try:
-                pool = getattr(forward_batch, "token_to_kv_pool", None)
-                if pool is None:
-                    backend = resolve_attn_backend(forward_batch)
-                    pool = getattr(backend, "token_to_kv_pool", None)
-                for attr in ("page_num", "num_pages", "size"):
-                    val = getattr(pool, attr, None) if pool is not None else None
-                    if val:
-                        n_pages = int(val)
-                        if attr == "size":
-                            bs_ = _block_size(forward_batch, atom_config)
-                            n_pages = max((n_pages + max(bs_, 1) - 1) // max(bs_, 1), 1)
-                        break
-            except Exception:
-                n_pages = -1
-            page_oob = bool(n_pages > 0 and page_max >= n_pages)
-            slot_max = -1
-            sm = getattr(qsa, "slot_mapping", None)
-            if torch.is_tensor(sm) and sm.numel():
-                valid = sm[sm >= 0]
-                if valid.numel():
-                    slot_max = int(valid.max().item())
-            logger.info(
-                "Flash decode graph QSA page-check: page_max=%s n_pages=%s "
-                "oob=%s slot_max=%s slot0=%s",
-                page_max,
-                n_pages,
-                page_oob,
-                slot_max,
-                slot0,
-            )
-            if page_oob:
-                logger.error(
-                    "Flash QSA page id OOB on graph replay: page_max=%s >= n_pages=%s",
-                    page_max,
-                    n_pages,
-                )
     if in_capture:
         logger.info(
             "Flash decode CUDA-graph QSA buffers ready: "
@@ -1268,16 +1227,13 @@ def refresh_flash_decode_graph_ple(
             ),
         )
         bs = int(getattr(forward_batch, "batch_size", 0) or 0)
-        # Capture must not D2H-sync (.item()). Decode positions are seq_len-1.
-        seq_hint = -1
-        if (not in_capture) and torch.is_tensor(positions) and positions.numel():
-            seq_hint = _host_int(positions, -1)
-        log_fn = logger.info if in_capture or seq_hint >= 512 else logger.debug
-        log_fn(
-            "Flash decode graph PLE refresh ok (in_capture=%s): bs=%s",
-            in_capture,
-            bs,
-        )
+        # Do not .item() positions on replay — that D2H-syncs every decode token.
+        if in_capture or logger.isEnabledFor(logging.DEBUG):
+            logger.info(
+                "Flash decode graph PLE refresh ok (in_capture=%s): bs=%s",
+                in_capture,
+                bs,
+            )
         return True
     except Exception as exc:  # noqa: BLE001
         logger.warning(

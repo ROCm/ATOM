@@ -41,8 +41,12 @@ def apply_flash_decode_graph_replay_sync_patch() -> None:
                 def wrapped(self, *args, **kwargs):
                     result = orig(self, *args, **kwargs)
                     try:
+                        import os
+
                         import torch
 
+                        if os.environ.get("ATOM_FLASH_GRAPH_REPLAY_SYNC", "") != "1":
+                            return result
                         seq = -1
                         fb = args[0] if args else kwargs.get("forward_batch")
                         if fb is not None:
