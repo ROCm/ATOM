@@ -434,7 +434,16 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         Capping is the correct semantics, not just a guard: KV for tokens past
         the block table is not in any block this connector knows about, so
         offering it up was never right. The remainder is saved on a later step,
-        once the allocation catches up.
+        once the allocation catches up -- which is why the block table has to be
+        grown here as well. vLLM calls ``update_state_after_alloc`` exactly once
+        per admission and hands it only the blocks allocated by then, so a
+        prompt longer than one prefill budget leaves a permanently short table:
+        the cap then pins the frontier at the first chunk forever, the save loop
+        sees ``aligned == saved`` on every later step, and everything past the
+        first chunk is never offloaded at all. Measured on GLM-5.2 with a
+        16,384-token budget: 20k-token prompts stored exactly 16,384 tokens and
+        nothing else, so half of every long prefix was invisible to the external
+        tier while every metric reported success.
 
         Only long prompts reach this: a chat-sized prompt is allocated in one
         go, so the two quantities never separate and every gsm8k-scale test
@@ -445,6 +454,12 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         """
         preempted = self._handle_preempted(scheduler_output)
         block_size = int(self._config.kv_cache_block_size)
+        for req_id, new_blocks, replaces in _scheduled_block_growth(scheduler_output):
+            seq = self._seqs.get(req_id)
+            if seq is None:
+                continue
+            grown = _block_ids(new_blocks)
+            seq.set_block_table(grown if replaces else seq.block_table + grown)
         for req_id, num_tokens in _scheduled_frontiers(scheduler_output):
             seq = self._seqs.get(req_id)
             if seq is not None:
@@ -736,6 +751,25 @@ def _block_ids(blocks) -> list[int]:
             )
         return [int(b) for b in blocks[0]]
     return [int(b) for b in (blocks or [])]
+
+
+def _scheduled_block_growth(scheduler_output):
+    """Yield ``(request_id, new_block_ids, replaces)`` for this step.
+
+    ``update_state_after_alloc`` fires once, when a request leaves the waiting
+    queue, and carries only the blocks allocated by then. Every block allocated
+    after that -- each further chunk of a chunked prefill, and each block decode
+    appends -- is announced only here. A request in ``resumed_req_ids`` is one
+    vLLM re-admitted after preemption: its ids REPLACE the old table rather than
+    extending it, because the blocks it held went back to the pool.
+    """
+    cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
+    req_ids = getattr(cached, "req_ids", None) or []
+    new_blocks = getattr(cached, "new_block_ids", None) or []
+    resumed = getattr(cached, "resumed_req_ids", None) or ()
+    for req_id, blocks in zip(req_ids, new_blocks):
+        if blocks is not None:
+            yield req_id, blocks, req_id in resumed
 
 
 def _scheduled_frontiers(scheduler_output):
