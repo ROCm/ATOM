@@ -19,6 +19,10 @@ from atom.kv_transfer.disaggregation.types import (
 from atom.kv_transfer.offload.hybrid.dsv4.connector import (
     DSV4_CHECKPOINT_SAVE_CHANNEL,
 )
+from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
+    STATE_INDEX_CHANNEL,
+    STATE_LOAD_VERDICT_TAG,
+)
 
 _TEST_COMPLETION_CHANNEL = "test.connector.completion"
 
@@ -576,3 +580,67 @@ class TestKVConnectorOutput:
         assert "recving" in r
         assert "connector_completions" in r
         assert DSV4_CHECKPOINT_SAVE_CHANNEL in r
+
+
+class TestStateLoadVerdictsSurviveRepeatedMisses:
+    """The aggregator tombstones every connector-completion key it takes quorum
+    on, and drops a report whose key is already tombstoned. A verdict key that
+    was the bare prefix hash was therefore reportable exactly once per process:
+    a hash re-stored after its first miss could never be retracted again, and
+    the engine's index kept advertising bytes LMCache no longer held -- every
+    later request over that prefix paying a park, a failed load and a recompute
+    until the tombstone ring evicted the key. Keying by request as well as hash
+    makes each load its own key, and the request id is identical on every rank
+    so the quorum is unchanged.
+    """
+
+    @staticmethod
+    def _verdict(req_id):
+        return _completion(
+            STATE_INDEX_CHANNEL,
+            (STATE_LOAD_VERDICT_TAG, 4242, req_id),
+            succeeded=False,
+        )
+
+    def test_the_same_hash_can_be_retracted_by_two_different_requests(self):
+        agg = KVOutputAggregator(world_size=2)
+
+        first = self._verdict("req-a")
+        assert agg.aggregate(
+            [
+                KVConnectorOutput(connector_completions={first}),
+                KVConnectorOutput(connector_completions={first}),
+            ]
+        ).connector_completions == {first}
+
+        # Same hash, a later request. Under the old bare-hash key this second
+        # quorum was silently dropped.
+        second = self._verdict("req-b")
+        assert agg.aggregate(
+            [
+                KVConnectorOutput(connector_completions={second}),
+                KVConnectorOutput(connector_completions={second}),
+            ]
+        ).connector_completions == {second}
+
+    def test_one_request_is_still_reported_once(self):
+        """Uniqueness comes from the request, so a duplicate report of the same
+        load is still collapsed -- the tombstone keeps doing its job."""
+        agg = KVOutputAggregator(world_size=2)
+        verdict = self._verdict("req-a")
+        for _ in range(2):
+            agg.aggregate(
+                [
+                    KVConnectorOutput(connector_completions={verdict}),
+                    KVConnectorOutput(connector_completions={verdict}),
+                ]
+            )
+        assert (
+            agg.aggregate(
+                [
+                    KVConnectorOutput(connector_completions={verdict}),
+                    KVConnectorOutput(connector_completions={verdict}),
+                ]
+            ).connector_completions
+            == set()
+        )

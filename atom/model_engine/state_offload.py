@@ -140,10 +140,17 @@ class StateOffloadIndex:
                 "state offload index: dispatched != settled + outstanding "
                 f"({self.dispatched} != {self.settled} + {self.outstanding})"
             )
-        if len(self.hashes) != len(self._hash_lru):
+        # Key sets, not cardinalities: the two are written together on every
+        # path, so an equal-but-different pair can only come from a bug that
+        # added one hash and dropped another in the same step -- exactly the
+        # divergence this check exists to catch, and the one a length compare
+        # is blind to.
+        if set(self.hashes) != set(self._hash_lru):
+            only_index = sorted(set(self.hashes) - set(self._hash_lru))[:8]
+            only_lru = sorted(set(self._hash_lru) - set(self.hashes))[:8]
             raise AssertionError(
                 "state offload index: hashes and _hash_lru diverged "
-                f"({len(self.hashes)} != {len(self._hash_lru)})"
+                f"(index-only={only_index}, lru-only={only_lru})"
             )
 
     def audit_invariant(self) -> bool:

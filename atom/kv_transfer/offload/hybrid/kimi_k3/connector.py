@@ -330,7 +330,7 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
                 req.req_id,
             )
             return False
-        return tier.load_state(spec.boundary_hash, spec.destination_slot)
+        return tier.load_state(spec.boundary_hash, spec.destination_slot, req.req_id)
 
     def _start_state_stores(self, metadata) -> None:
         """Hand this step's ready checkpoints to the tier's executor.
@@ -415,10 +415,19 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         # that would permanently deny state that is still there. Successes ride
         # the same channel because the TP quorum acts only on a key every rank
         # reported.
-        for h, ok in self._state_tier.take_hash_verdicts().items():
+        # The key carries the request as well as the hash. The aggregator
+        # tombstones every connector-completion key it takes quorum on, and
+        # drops a report whose key is already tombstoned, so a bare hash is
+        # reportable exactly once per process: a hash re-stored after its first
+        # miss could never be retracted again and the index would keep
+        # advertising bytes LMCache no longer holds. The request id is the same
+        # on every rank, so the quorum is unchanged.
+        for (h, rid), ok in self._state_tier.take_hash_verdicts().items():
             out.connector_completions.add(
                 ConnectorCompletion(
-                    STATE_INDEX_CHANNEL, (STATE_LOAD_VERDICT_TAG, int(h)), bool(ok)
+                    STATE_INDEX_CHANNEL,
+                    (STATE_LOAD_VERDICT_TAG, int(h), rid),
+                    bool(ok),
                 )
             )
         return out
@@ -718,10 +727,19 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         return max(hbm, min(joint, lmc)) if joint else max(hbm, lmc)
 
     # -- connector-owned channels -----------------------------------------
-    def connector_completion(self, completion) -> bool:
+    def connector_completion(self, completion) -> bool | None:
+        # Return-value contract (`_offload_common.process_completions`):
+        # `False` = not this connector's channel, `True` = handled AND a
+        # terminal save for the scheduler's deferred-free, `None` = handled
+        # non-terminal milestone. Every channel below is a state-tier milestone
+        # whose operation id is a hash or a store id, never a request id, so
+        # every one of them returns `None`. Returning `True` fed those ids into
+        # `KVConnectorOutput.finished_saving`, where the scheduler looked each
+        # up as a request id and silently found nothing -- harmless by luck
+        # (request ids are strings), but a lie about what had finished saving.
         if completion.channel == STATE_SOURCE_CHANNEL:
             self._state_source_released.add(completion.operation_id)
-            return True
+            return None
         if completion.channel == STATE_INDEX_CHANNEL:
             op = completion.operation_id
             if isinstance(op, tuple) and op and op[0] == STATE_LOAD_VERDICT_TAG:
@@ -730,14 +748,14 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
                 # -- the fused load report says nothing about which leg failed.
                 if not completion.succeeded:
                     self._state_load_missed.add(int(op[1]))
-                return True
+                return None
             target = (
                 self._state_indexed
                 if completion.succeeded
                 else self._state_index_failed
             )
             target.add(op)
-            return True
+            return None
         # Channels this connector does not own. `DenseOffloadConnector` and the
         # rest of the MRO define no `connector_completion`, so `super().` would
         # raise AttributeError; `False` is the caller's contract for "unhandled"
