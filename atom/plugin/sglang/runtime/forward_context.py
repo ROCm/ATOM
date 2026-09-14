@@ -527,6 +527,7 @@ def _build_minimax_m3_metadata(
         build_atom_minimax_m3_attention_metadata_from_sglang,
         is_minimax_m3_config,
         maybe_get_minimax_m3_pools_from_sglang_batch,
+        minimax_m3_num_idx_heads,
     )
 
     if not is_minimax_m3_config(hf_config):
@@ -544,6 +545,7 @@ def _build_minimax_m3_metadata(
         token_to_kv_pool=token_to_kv_pool,
         req_to_token_pool=req_to_token_pool,
         max_model_len=int(atom_config.max_model_len),
+        num_idx_heads=minimax_m3_num_idx_heads(hf_config),
     )
 
 

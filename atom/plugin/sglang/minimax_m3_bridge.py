@@ -41,6 +41,22 @@ def _m3_index_dim(config: Any) -> int:
     return int(index_dim)
 
 
+def minimax_m3_num_idx_heads(config: Any) -> int:
+    """TP-local index heads -- the selector has one row per (index head, token).
+
+    M3 ties the index head count to the KV head count, so this is the KV heads
+    this rank holds.
+    """
+    heads = int(getattr(_text_config(config), "num_key_value_heads", 1))
+    try:
+        from sglang.srt.layers.dp_attention import get_attention_tp_size
+
+        tp_size = max(1, int(get_attention_tp_size()))
+    except Exception:
+        tp_size = 1
+    return max(1, heads // tp_size)
+
+
 def _dtype_size(dtype: torch.dtype) -> int:
     return torch.empty((), dtype=dtype).element_size()
 
@@ -488,6 +504,7 @@ def build_atom_minimax_m3_attention_metadata_from_sglang(
     token_to_kv_pool,
     req_to_token_pool,
     max_model_len: int,
+    num_idx_heads: int,
 ):
     from atom.utils.forward_context import AttentionMetaData
 
@@ -534,6 +551,7 @@ def build_atom_minimax_m3_attention_metadata_from_sglang(
             slot_mapping=slot_mapping,
             max_seq_len=max_seq_len,
             max_query_len=tokens_per_req,
+            num_idx_heads=num_idx_heads,
         )
         cu_q = torch.arange(
             0,
@@ -583,6 +601,7 @@ def build_atom_minimax_m3_attention_metadata_from_sglang(
             max_seq_len=max_seq_len,
             num_prefills=bs,
             num_prefill_tokens=total_tokens,
+            num_idx_heads=num_idx_heads,
         )
         sparse_md.prefill.qo_indptr = torch.arange(
             total_tokens + 1,
@@ -634,6 +653,7 @@ def build_atom_minimax_m3_attention_metadata_from_sglang(
         slot_mapping=slot_mapping,
         max_seq_len=max_seq_len,
         max_query_len=tokens_per_req,
+        num_idx_heads=num_idx_heads,
     )
     cu_q = torch.arange(
         0,

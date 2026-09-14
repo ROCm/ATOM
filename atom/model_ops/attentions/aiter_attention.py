@@ -279,6 +279,21 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                     **i32_kwargs,
                 )
             )
+        # MiniMax-M3's index selector reads one row per (index head, query
+        # token); `num_head_k` is that head count, the same TP-local division
+        # the sparse layers construct with.
+        self._num_idx_heads = num_head_k if self._has_sparse_attention else 0
+        if self._has_sparse_attention:
+            # Decode only, and persistent because `make_sparse_decode_metadata`
+            # refills it every step outside the graph while the captured
+            # selector reads the pointer baked in at capture. Prefill is not
+            # captured and allocates its own.
+            self.model_runner.forward_vars[
+                "sparse_attention_n_valid_column_per_row"
+            ] = torch.empty(
+                num_head_k * self.max_bs * max_qlen,
+                **i32_kwargs,
+            )
         self._pa_decode_bf16_asm_enabled = (
             use_pa_decode_bf16_asm() and model_runner.block_size == 256
         )
@@ -379,6 +394,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 )
             )
             var[f"{p}cu_seqlens_q"].copy_to_gpu()
+
+            if self._has_sparse_attention:
+                # Per ubatch like everything else here: both ubatches' sparse
+                # metadata are alive at once, so one shared row-bound buffer
+                # would have the second overwrite the first.
+                var[f"{p}sparse_attention_n_valid_column_per_row"] = torch.empty(
+                    self._num_idx_heads * ub_max_bs * max_seqlen_qo, **i32_kwargs
+                )
 
             # PA work buffers per ubatch (GPU only)
             var[f"{p}work_meta_data"] = torch.empty(
@@ -692,6 +715,18 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             v_scale=module.v_scale,
         )
 
+    def _n_valid_column_per_row_buffer(self, prefix: str = "") -> torch.Tensor:
+        """The decode buffer `make_sparse_decode_metadata` refills each step.
+
+        `prefix` selects the ubatch's, on the same `ub<i>_` convention as every
+        other decode buffer here. Prefill passes no buffer at all: it is not
+        captured, so a per-forward allocation is safe there and the two prefill
+        ubatches then cannot collide.
+        """
+        return self.model_runner.forward_vars[
+            f"{prefix}sparse_attention_n_valid_column_per_row"
+        ]
+
     def _get_sparse_attention_block_tables(
         self,
         block_tables: torch.Tensor,
@@ -829,6 +864,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 # argument: on the `only_update` path that carries the verify
                 # forward's width.
                 max_query_len=1,
+                num_idx_heads=self._num_idx_heads,
+                n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
             )
         return workinfos
 
@@ -875,6 +912,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_seq_len=attn_metadata.max_seqlen_k,
                 num_prefills=bs,
                 num_prefill_tokens=batch.total_tokens_num_prefill,
+                num_idx_heads=self._num_idx_heads,
             )
         if self._tbo_token_split:
             self._stash_tbo_token_split_prefill_state(batch)
@@ -959,6 +997,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_seq_len=ub_max_seq_len,
                 num_prefills=ub_num_reqs,
                 num_prefill_tokens=ub_num_tokens,
+                num_idx_heads=self._num_idx_heads,
             )
             ub_attn.sparse_attention_metadata = sparse_md
         return ub_attn
@@ -1135,6 +1174,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 slot_mapping=attn_metadata.slot_mapping,
                 max_seq_len=int(max_seqlen_k),
                 max_query_len=int(max_seqlen_q),
+                num_idx_heads=self._num_idx_heads,
+                n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
             )
         mrope_positions = self._build_mrope_decode_positions(
             batch, context_lens, max_seqlen_q
@@ -1326,6 +1367,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 block_table=sparse_block_tables,
                 slot_mapping=attn.slot_mapping,
                 max_seq_len=attn.max_seqlen_k,
+                num_idx_heads=self._num_idx_heads,
+                n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(p),
             )
         return attn
 
@@ -1370,6 +1413,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 slot_mapping=attn_metadata.slot_mapping,
                 max_seq_len=attn_metadata.max_seqlen_k,
                 max_query_len=max_q_len,
+                num_idx_heads=self._num_idx_heads,
+                n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
             )
 
         positions = var["positions"].copy_to_gpu(scheduled_tokens)

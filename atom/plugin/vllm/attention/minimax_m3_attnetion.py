@@ -474,7 +474,10 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
         main_metadata,
         index_metadata,
     ):
-        from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk_decode
+        from atom.model_ops.minimax_m3.index_topk import (
+            minimax_m3_index_topk_decode,
+            n_valid_column_per_row_for_forward,
+        )
 
         num_decode_tokens = main_metadata.num_decode_tokens
         decode_md = main_metadata.decode
@@ -503,6 +506,20 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             self.scale,
             emit_sparse_block_table=True,
             max_query_len=max_query_len,
+            # Dense rows, so both index arrays collapse to seq_lens. A batch
+            # whose decode tokens are not `max_query_len` per request makes this
+            # the wrong row count, and the selector declines on the shape rather
+            # than reading past it -- the Triton one then runs.
+            n_valid_column_per_row=n_valid_column_per_row_for_forward(
+                main_metadata,
+                "decode",
+                index_decode_md.seq_lens,
+                index_decode_md.seq_lens,
+                batch=index_decode_md.seq_lens.shape[0],
+                total_q=index_decode_md.seq_lens.shape[0] * max_query_len,
+                num_idx_heads=self.num_idx_heads,
+                decode_max_q=max_query_len,
+            ),
         )
         self._store_cached_topk(key, topk_idx)
         return topk_idx
@@ -515,7 +532,10 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
         main_metadata,
         index_metadata,
     ):
-        from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk
+        from atom.model_ops.minimax_m3.index_topk import (
+            minimax_m3_index_topk,
+            n_valid_column_per_row_for_forward,
+        )
 
         prefill_md = main_metadata.prefill
         index_prefill_md = (
@@ -540,6 +560,18 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             self.num_kv_heads,
             self.scale,
             emit_sparse_block_table=True,
+            # Ragged rows: query starts, and the keys already behind each
+            # request.
+            n_valid_column_per_row=n_valid_column_per_row_for_forward(
+                main_metadata,
+                "prefill",
+                index_prefill_md.cu_seqlens_q,
+                index_prefill_md.context_lens,
+                batch=index_prefill_md.cu_seqlens_q.shape[0] - 1,
+                total_q=stop - start,
+                num_idx_heads=self.num_idx_heads,
+                decode_max_q=0,
+            ),
         )
         self._store_cached_topk(key, topk_idx)
         return topk_idx
