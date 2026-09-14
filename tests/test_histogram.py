@@ -1,8 +1,5 @@
 """Weighted observations preserve the standard histogram's public behavior."""
 
-from concurrent.futures import ThreadPoolExecutor
-from threading import Event
-
 import pytest
 from prometheus_client import CollectorRegistry, Histogram, generate_latest
 from prometheus_client.parser import text_string_to_metric_families
@@ -44,39 +41,3 @@ def test_weighted_and_ordinary_observations_share_standard_labels_and_buckets():
         weighted.observe_weighted(0.02, 4)
     with pytest.raises(ValueError, match="Duplicated timeseries"):
         WeightedHistogram(**kwargs, registry=weighted_registry)
-
-
-def test_scrape_cannot_see_half_a_weighted_observation(monkeypatch):
-    registry = CollectorRegistry()
-    histogram = WeightedHistogram(
-        "test_latency", "Latency", buckets=(0.005,), registry=registry
-    )
-    sum_updated, resume, scraping = Event(), Event(), Event()
-    original_inc = histogram._sum.inc
-
-    def pause_after_sum(amount):
-        original_inc(amount)
-        sum_updated.set()
-        assert resume.wait(5), "scrape did not start"
-
-    monkeypatch.setattr(histogram._sum, "inc", pause_after_sum)
-
-    def scrape():
-        scraping.set()
-        return samples(registry)
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        observation = pool.submit(histogram.observe_weighted, 0.020, 4)
-        try:
-            assert sum_updated.wait(5), "observation did not start"
-            exposition = pool.submit(scrape)
-            assert scraping.wait(5), "scrape did not start"
-            assert not exposition.done()
-        finally:
-            resume.set()
-        observation.result(timeout=5)
-        result = exposition.result(timeout=5)
-    assert result[("test_latency_count", ())] == 4
-    assert result[("test_latency_sum", ())] == pytest.approx(0.020)
-    assert result[("test_latency_bucket", (("le", "0.005"),))] == 4
-    assert result[("test_latency_bucket", (("le", "+Inf"),))] == 4

@@ -29,11 +29,11 @@ LATENCY_BUCKETS = (
 
 
 class WeightedHistogram(Histogram):
-    """Standard Prometheus histogram with an atomic weighted observation.
+    """Standard Prometheus histogram with a weighted observation.
 
     prometheus_client has no public weighted observe API. Keep its private
     bucket access here; reuse its validation, labels, registration and export.
-    The lock makes updates and scrapes consistent within this process.
+    The lock serializes weighted writers; collection uses the parent's semantics.
     """
 
     def _metric_init(self):
@@ -49,12 +49,3 @@ class WeightedHistogram(Histogram):
         with self._observation_lock:
             self._sum.inc(total)
             self._buckets[index].inc(weight)
-
-    def observe(self, amount: float, exemplar=None) -> None:
-        self._raise_if_not_observable()
-        with self._observation_lock:
-            super().observe(amount, exemplar)
-
-    def _child_samples(self):
-        with self._observation_lock:
-            return super()._child_samples()
