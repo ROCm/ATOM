@@ -184,7 +184,6 @@ models:
       common:
         AITER_QUICK_REDUCE_QUANTIZATION: INT4
         AITER_USE_FLYDSL_MOE_SORTING: "1"
-        ATOM_USE_FLYDSL_GATHER_KV_B_PROJ: "0"
       prefill: {}
       decode: {}
     service:
