@@ -101,6 +101,9 @@ For each AIPerf invocation, `collect_metrics.py` starts its own Prometheus proce
 on a dynamically assigned loopback port, scraping all resolved Prefill/Decode
 addresses and Mesh's configured metrics port. Addresses and ports come from the
 same arrays used to launch the services, including multiple hosts and workers.
+For multi-node DP, include every node's `--server-port` as a target (repeat
+`--prefill` / `--decode`); native histogram storage is local to each node.
+The coordinator's endpoint does not include remote histogram observations.
 
 Prometheus 3.5.0 is downloaded and verified against its release checksums when
 no executable is already available. `ATOMESH_PROMETHEUS_BIN` can point to an

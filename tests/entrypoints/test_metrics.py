@@ -18,7 +18,6 @@ from threading import Event
 
 import pytest
 from prometheus_client import REGISTRY, CollectorRegistry, Gauge, generate_latest
-from prometheus_client.core import GaugeMetricFamily
 from prometheus_client.parser import text_string_to_metric_families
 
 from atom.entrypoints.openai.metrics import AtomMetricsExporter, _gc_metrics
@@ -99,30 +98,15 @@ def _samples(exposition):
     }
 
 
-def test_new_component_registers_without_exporter_changes_and_reads_cached_data():
+def test_state_snapshots_are_private_and_scrapes_do_not_mutate_them():
     exporter = AtomMetricsExporter()
-    seen = []
-
-    def collect(snapshot):
-        seen.append(snapshot)
-        yield GaugeMetricFamily(
-            "test:component_depth",
-            "Component queue depth.",
-            value=(snapshot or {}).get("component", {}).get("depth", 0),
-        )
-
-    exporter.register_snapshot_collector(collect)
-    assert seen == [None]  # Name discovery needs no runtime snapshot.
-    source = {"enabled": True, "component": {"depth": 3}}
+    source = {"enabled": True, "requests_running": 3}
     exporter.update(source)
-    source["component"]["depth"] = 99
+    source["requests_running"] = 99
     snapshot, _, _ = exporter.read()
-    snapshot["component"]["depth"] = 88
+    snapshot["requests_running"] = 88
     for _ in range(2):
-        assert _samples(exporter.render())[("test:component_depth", ())] == 3
-    assert exporter.read()[0]["component"]["depth"] == 3
-    with pytest.raises(ValueError, match="Duplicated timeseries"):
-        exporter.register_snapshot_collector(collect)
+        assert _samples(exporter.render())[("atom:requests_running", ())] == 3
 
 
 @pytest.mark.parametrize(
@@ -136,9 +120,6 @@ def test_new_component_registers_without_exporter_changes_and_reads_cached_data(
         "atom:lmcache_loaded_tokens_total",
         "atom:gc_collections_total",
         "atom:gc_threshold",
-        "atom:request_queue_time_seconds_bucket",
-        "atom:request_queue_time_seconds_count",
-        "atom:request_queue_time_seconds_sum",
         "atom:prefix_cache_offload_tokens_total",  # Absent on legacy snapshots.
         "atom:time_to_first_token_seconds_count",
         "atom:inter_token_latency_seconds_sum",
@@ -151,10 +132,6 @@ def test_registration_reserves_optional_families_and_generated_series(name):
     )
     with pytest.raises(ValueError, match="Duplicated timeseries"):
         Gauge(name, "Conflicting instrument", registry=exporter.registry)
-    with pytest.raises(ValueError, match="Duplicated timeseries"):
-        exporter.register_snapshot_collector(
-            lambda snapshot: [GaugeMetricFamily(name, "Conflicting component")]
-        )
 
 
 def test_registration_never_reads_snapshots_or_live_process_metrics(monkeypatch):
@@ -196,70 +173,6 @@ def test_components_do_not_pollute_default_registry_or_other_api_instances():
     assert default_names() == before
 
 
-def test_concurrent_scrapes_pin_one_snapshot_each_while_refresh_continues():
-    exporter = AtomMetricsExporter()
-    entered, resume = Event(), Event()
-
-    def first(snapshot):
-        if snapshot is not None and snapshot["revision"] == 1:
-            entered.set()
-            assert resume.wait(5), "second scrape did not complete"
-        yield GaugeMetricFamily(
-            "test:first_revision",
-            "First component's revision.",
-            value=(snapshot or {}).get("revision", 0),
-        )
-
-    def second(snapshot):
-        yield GaugeMetricFamily(
-            "test:second_revision",
-            "Second component's revision.",
-            value=(snapshot or {}).get("revision", 0),
-        )
-
-    exporter.register_snapshot_collector(first)
-    exporter.register_snapshot_collector(second)
-    exporter.update({"enabled": True, "revision": 1})
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        old_scrape = pool.submit(exporter.render)
-        try:
-            assert entered.wait(5), "first scrape did not start"
-            exporter.update({"enabled": False, "revision": 2})
-            exporter.record_refresh_error()
-            fresh = _samples(pool.submit(exporter.render).result(timeout=5))
-        finally:
-            resume.set()
-        old = _samples(old_scrape.result(timeout=5))
-    for name in ("test:first_revision", "test:second_revision"):
-        assert old[(name, ())] == 1
-        assert fresh[(name, ())] == 2
-    assert old[("atom:metrics_snapshot_available", ())] == 1
-    assert fresh[("atom:metrics_snapshot_available", ())] == 0
-    assert old[("atom:metrics_refresh_errors_total", ())] == 0
-    assert fresh[("atom:metrics_refresh_errors_total", ())] == 1
-
-
-def test_failed_scrape_releases_its_snapshot_context():
-    exporter = AtomMetricsExporter()
-
-    def collect(snapshot):
-        if snapshot and snapshot["fail"]:
-            exporter.update({"fail": False, "revision": 2})
-            raise RuntimeError("collector failed")
-        yield GaugeMetricFamily(
-            "test:revision",
-            "Snapshot revision.",
-            value=(snapshot or {}).get("revision", 0),
-        )
-
-    exporter.register_snapshot_collector(collect)
-    exporter.update({"fail": True, "revision": 1})
-    with pytest.raises(RuntimeError, match="collector failed"):
-        exporter.render()
-    assert exporter.read()[0] == {"fail": False, "revision": 2}
-    assert _samples(exporter.render())[("test:revision", ())] == 2
-
-
 def test_async_scrapes_keep_live_state_on_loop_and_do_not_cache_responses(monkeypatch):
     exporter, requests, streams = create_metrics_exporter()
     owner = threading.get_ident()
@@ -278,7 +191,9 @@ def test_async_scrapes_keep_live_state_on_loop_and_do_not_cache_responses(monkey
     monkeypatch.setattr(
         "atom.entrypoints.openai.metrics.longest_silence_seconds", live_silence
     )
-    exporter.register_snapshot_collector(thread_probe)
+    exporter.registry.register(
+        type("Probe", (), {"collect": lambda _: thread_probe(exporter.read()[0])})()
+    )
     exporter.update({"enabled": True, "requests_running": 3})
     requests.observe_time_to_first_token(0.5, True)
     streams.observe_inter_token_latency(0.020, 4)

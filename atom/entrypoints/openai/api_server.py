@@ -12,6 +12,11 @@ Usage:
     python -m atom.entrypoints.openai_server --model <model> [options]
 """
 
+if __name__ == "__main__":
+    from atom.entrypoints.metrics import initialize_metrics
+
+    initialize_metrics()
+
 import asyncio
 import base64
 import binascii
@@ -2937,6 +2942,23 @@ def main():
 
     logger.info(f"Initializing engine with model {args.model}...")
     engine_args = EngineArgs.from_cli_args(args)
+    # Remote DP nodes block inside engine startup and never run the API loop.
+    # Expose their local mmap metrics on the same configured HTTP port.
+    dp_rank = (
+        envs.ATOM_DP_RANK
+        if envs.is_set("ATOM_DP_RANK")
+        else engine_args.data_parallel_rank
+    )
+    if dp_rank > 0:
+        from atom.entrypoints.metrics import start_metrics_server
+
+        server, _ = start_metrics_server(args.host, args.server_port)
+        try:
+            engine_args.create_engine(tokenizer=tokenizer)
+        finally:
+            server.shutdown()
+            server.server_close()
+        return
     _template_source = chat_template_source(tokenizer, custom_message_encoder)
     reasoning_dialect, _dialect_stated = resolve_dialect(
         _template_source,

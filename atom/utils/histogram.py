@@ -1,9 +1,7 @@
 """Histogram primitives shared by metrics owners."""
 
-import math
 import threading
 from bisect import bisect_left
-from itertools import accumulate
 
 from prometheus_client import Histogram
 
@@ -28,25 +26,6 @@ LATENCY_BUCKETS = (
     300,
     600,
 )
-
-
-class CumulativeHistogram:
-    def __init__(self, bounds):
-        self.bounds = (*bounds, math.inf)
-        self.counts = [0] * len(self.bounds)
-        self.total = 0.0
-
-    def observe(self, value: float) -> None:
-        if not math.isfinite(value) or value < 0:
-            return
-        self.counts[bisect_left(self.bounds, value)] += 1
-        self.total += value
-
-    def snapshot(self) -> dict:
-        return {
-            "buckets": list(zip(self.bounds, accumulate(self.counts))),
-            "sum": self.total,
-        }
 
 
 class WeightedHistogram(Histogram):
@@ -79,11 +58,3 @@ class WeightedHistogram(Histogram):
     def _child_samples(self):
         with self._observation_lock:
             return super()._child_samples()
-
-
-def prometheus_buckets(snapshot):
-    """Translate cumulative snapshot bounds to Prometheus bucket labels."""
-    return [
-        ("+Inf" if bound == math.inf else str(bound), count)
-        for bound, count in snapshot["buckets"]
-    ]

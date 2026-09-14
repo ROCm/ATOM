@@ -1,8 +1,8 @@
 """Compose component-owned metrics for one API process."""
 
-from atom.model_engine.engine_stats import collect_engine_metrics
-from atom.model_engine.gpu_metrics import collect_gpu_metrics
-from atom.model_engine.scheduler_metrics import collect_scheduler_metrics
+import os
+
+from prometheus_client import multiprocess, values
 
 from .metrics import AtomMetricsExporter
 from .request_timing import RequestMetrics
@@ -13,12 +13,15 @@ def create_metrics_exporter() -> (
     tuple[AtomMetricsExporter, RequestMetrics, StreamMetrics]
 ):
     exporter = AtomMetricsExporter()
-    for collect in (
-        collect_scheduler_metrics,
-        collect_gpu_metrics,
-        collect_engine_metrics,
-    ):
-        exporter.register_snapshot_collector(collect)
-    request_metrics = RequestMetrics(exporter.registry)
-    stream_metrics = StreamMetrics(exporter.registry)
+    registry = exporter.registry
+    if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+        if not values.ValueClass._multiprocess:
+            raise RuntimeError(
+                "Set PROMETHEUS_MULTIPROC_DIR before importing prometheus_client"
+            )
+        multiprocess.MultiProcessCollector(registry)
+        # Register only the multiprocess collector, not its instruments too.
+        registry = None
+    request_metrics = RequestMetrics(registry)
+    stream_metrics = StreamMetrics(registry)
     return exporter, request_metrics, stream_metrics

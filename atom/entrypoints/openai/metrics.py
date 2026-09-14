@@ -1,7 +1,7 @@
 """Snapshot cache and explicit Prometheus registration for the OpenAI server.
 
-Existing metric definitions remain here. The API composition module registers
-request timing instruments and the new scheduler/worker snapshot collectors.
+Legacy state metrics use engine snapshots. Event observations are exported by
+the native Prometheus client, using multiprocess storage in server launches.
 """
 
 from __future__ import annotations
@@ -11,34 +11,18 @@ import copy
 import gc
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from contextvars import ContextVar
 from typing import Any
 
 from prometheus_client import CollectorRegistry, generate_latest
-from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, Metric
+from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 
 from .streaming_dispatch import longest_silence_seconds
 
 Snapshot = dict[str, Any]
 SnapshotState = tuple[Snapshot, int, float]
-
-
-class _SnapshotCollector:
-    def __init__(
-        self, exporter, collect: Callable[[Snapshot | None], Iterable[Metric]]
-    ):
-        self._exporter = exporter
-        self._collect = collect
-
-    def describe(self):
-        # None requests all family names, including optional snapshot fields.
-        # Registration must never depend on available runtime data or do RPCs.
-        return self._collect(None)
-
-    def collect(self):
-        return self._collect(self._exporter.read()[0])
 
 
 class _AtomMetricsCollector:
@@ -425,6 +409,43 @@ class _AtomMetricsCollector:
             distribution.add_metric([str(accepted)], float(steps))
         yield distribution
 
+        ranks = snapshot.get("scheduler_metrics", [])
+        for name, help_text, key, states in (
+            (
+                "atom:scheduler_requests",
+                "Requests by scheduler state; waiting excludes KV waits.",
+                None,
+                ("running", "waiting", "waiting_kv"),
+            ),
+            (
+                "atom:scheduler_kv_cache_blocks",
+                "KV block pool by state; used + evictable + vacant = total.",
+                "kv_blocks",
+                ("used", "evictable", "vacant", "total"),
+            ),
+        ):
+            metric = GaugeMetricFamily(
+                name, help_text, labels=["dp_rank", "engine_role", "state"]
+            )
+            for rank in ranks:
+                values = rank if key is None else rank.get(key, {})
+                for queue_state in states:
+                    if queue_state in values:
+                        metric.add_metric(
+                            [str(rank["dp_rank"]), rank["engine_role"], queue_state],
+                            values[queue_state],
+                        )
+            yield metric
+
+        cache = snapshot.get("cache", {})
+        if describe or "offload_tokens" in cache:
+            metric = CounterMetricFamily(
+                "atom:prefix_cache_offload_tokens",
+                "Prompt tokens reused from LMCache beyond the admitted GPU prefix; shares prefix-cache input accounting, not transfer volume.",
+            )
+            metric.add_metric([], float(cache.get("offload_tokens", 0)))
+            yield metric
+
         yield from _gc_metrics(describe=describe)
 
 
@@ -495,9 +516,6 @@ class AtomMetricsExporter:
         self._snapshot: Snapshot = {}
         self._refresh_errors = 0
         self._last_refresh = 0.0
-        self._render_snapshot: ContextVar[SnapshotState | None] = ContextVar(
-            "metrics_render_snapshot", default=None
-        )
         self._render_silence: ContextVar[float | None] = ContextVar(
             "metrics_render_silence", default=None
         )
@@ -506,17 +524,6 @@ class AtomMetricsExporter:
         self._render_task: asyncio.Task[bytes] | None = None
         self.registry = CollectorRegistry(auto_describe=False)
         self.registry.register(_AtomMetricsCollector(self))
-
-    def register_snapshot_collector(
-        self, collect: Callable[[Snapshot | None], Iterable[Metric]]
-    ) -> None:
-        """Register a component's pure snapshot-to-families function once.
-
-        collect(None) must describe every possible family, without runtime I/O.
-        collect(snapshot) exports existing cumulative values; it must not mutate
-        the snapshot or re-observe values. The registry rejects name collisions.
-        """
-        self.registry.register(_SnapshotCollector(self, collect))
 
     def update(self, snapshot: dict[str, Any]) -> None:
         snapshot = copy.deepcopy(snapshot)
@@ -530,15 +537,12 @@ class AtomMetricsExporter:
             self._refresh_errors += 1
 
     def read(self) -> tuple[dict[str, Any], int, float]:
-        pinned = self._render_snapshot.get()
-        if pinned is not None:
-            return pinned
         with self._lock:
             snapshot = self._snapshot
             refresh_errors = self._refresh_errors
             last_refresh = self._last_refresh
         # A renderer must not hold up the API loop's next update while copying
-        # the per-rank histograms. The captured snapshot is immutable here.
+        # the engine state. The captured snapshot is immutable here.
         return copy.deepcopy(snapshot), refresh_errors, last_refresh
 
     def stream_silence(self) -> float:
@@ -546,15 +550,11 @@ class AtomMetricsExporter:
         return longest_silence_seconds() if captured is None else captured
 
     def render(self, *, stream_silence: float | None = None) -> bytes:
-        # All component collectors see the same revision, even if refresh runs
-        # concurrently. Context-local state isolates concurrent/nested scrapes.
-        token = self._render_snapshot.set(self.read())
         silence_token = self._render_silence.set(stream_silence)
         try:
             return generate_latest(self.registry)
         finally:
             self._render_silence.reset(silence_token)
-            self._render_snapshot.reset(token)
 
     async def render_async(self) -> bytes:
         """Render on demand off the API loop, coalescing concurrent scrapes."""

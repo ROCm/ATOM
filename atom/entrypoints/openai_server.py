@@ -7,6 +7,11 @@ Usage:
     python -m atom.entrypoints.openai_server --model <model> [options]
 """
 
+if __name__ == "__main__":
+    from atom.entrypoints.metrics import initialize_metrics
+
+    initialize_metrics()
+
 from atom.utils import envs, set_ulimit
 
 if envs.USE_ATOMESH_ENTRYPOINTS:

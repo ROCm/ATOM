@@ -334,18 +334,12 @@ class EngineUtilityHandler:
         caller to mistake for its own. Pushing removes the deadline, and with it
         the last off-loop writer on the control socket.
         """
-        # Telemetry replies use their own tagged path, never the forward/KV
-        # result queues. No wait for a worker response or device completion.
-        if envs.ATOM_ENABLE_METRICS_DEVICE_TIMER and hasattr(
-            self.runner_mgr, "latest_forward_metrics"
-        ):
-            self.runner_mgr.call_func("collect_forward_metrics")
-        snapshot = self.collect_metrics() if scheduler_metrics else {"enabled": False}
-        snapshot["forward_metrics"] = list(
-            getattr(self.runner_mgr, "latest_forward_metrics", {}).copy().values()
-        )
-        snapshot["role"] = getattr(self.scheduler, "_METRICS_ROLE", "")
-        self.output_queue.put_nowait(("METRICS", snapshot))
+        # Poll ready device events even after the final forward. Workers write
+        # native metrics directly; this RPC has no response payload.
+        if envs.ATOM_ENABLE_METRICS_DEVICE_TIMER and self.runner_mgr is not None:
+            self.runner_mgr.call_func("poll_forward_metrics")
+        if scheduler_metrics:
+            self.output_queue.put_nowait(("METRICS", self.collect_metrics()))
 
     def collect_metrics(self) -> dict:
         """One rank's scheduler, KV, MTP, and cache metrics."""
@@ -428,7 +422,6 @@ class EngineUtilityHandler:
                 # whereas connector-based PD parks requests in `waiting`.
                 external = parked + len(getattr(self.scheduler, "prefill_waiting", ()))
                 result["scheduler_metrics"] = {
-                    **metrics.snapshot(),
                     "running": running,
                     "waiting": max(0, waiting - external),
                     "waiting_kv": external,

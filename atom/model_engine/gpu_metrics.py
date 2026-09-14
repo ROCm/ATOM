@@ -1,15 +1,17 @@
 """Nonblocking, bounded device-event timing for real target-model forwards."""
 
+import logging
+import math
 from collections import OrderedDict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
 
-from atom.utils.histogram import (
-    LATENCY_BUCKETS,
-    CumulativeHistogram,
-    prometheus_buckets,
-)
+from prometheus_client import Histogram
+
+from atom.utils.histogram import LATENCY_BUCKETS
+
+logger = logging.getLogger("atom")
 
 
 @dataclass
@@ -23,13 +25,42 @@ class _RequestTiming:
 
 
 class GPUForwardMetrics:
-    def __init__(self, event_factory, max_pending=256, max_requests=4096):
+    def __init__(
+        self,
+        event_factory,
+        max_pending=256,
+        max_requests=4096,
+        *,
+        dp_rank=0,
+        pp_rank=0,
+        tp_rank=0,
+        engine_role="default",
+        registry=None,
+    ):
         self.event_factory = event_factory
         self.max_pending = max_pending
         self.pending = deque()
         self.free = []
-        self.steps = CumulativeHistogram(LATENCY_BUCKETS)
-        self.prefill_requests = CumulativeHistogram(LATENCY_BUCKETS)
+        labels = {
+            "dp_rank": str(dp_rank),
+            "pp_rank": str(pp_rank),
+            "tp_rank": str(tp_rank),
+            "engine_role": engine_role,
+        }
+        self.steps = Histogram(
+            "atom:gpu_forward_seconds",
+            "Per-worker target forward step device-event duration, including stream communication/waits; excludes input preparation, sampling and drafting.",
+            labels,
+            buckets=LATENCY_BUCKETS,
+            registry=registry,
+        ).labels(**labels)
+        self.prefill_requests = Histogram(
+            "atom:prefill_request_gpu_forward_seconds",
+            "Per-worker sum of participating batch device durations across a request's initial local prefill chunks; once after all chunks complete, not exclusive request compute time.",
+            labels,
+            buckets=LATENCY_BUCKETS,
+            registry=registry,
+        ).labels(**labels)
         self.max_requests = max_requests
         self.requests = OrderedDict()
 
@@ -70,6 +101,16 @@ class GPUForwardMetrics:
                 break
             self.pending.popleft()
             seconds = start.elapsed_time(end) / 1000
+            if not math.isfinite(seconds) or seconds < 0:
+                logger.warning(
+                    "Invalid GPU forward duration %r; discarding %d request timings",
+                    seconds,
+                    len(requests),
+                )
+                for state in requests:
+                    self._discard_request(state.req_id)
+                self.free.append((start, end))
+                continue
             self.steps.observe(seconds)
             for state in requests:
                 state.pending -= 1
@@ -112,13 +153,6 @@ class GPUForwardMetrics:
             raise
         self.pending.append((start, end, requests))
 
-    def snapshot(self):
-        self.poll()
-        return {
-            "steps": self.steps.snapshot(),
-            "prefill_requests": self.prefill_requests.snapshot(),
-        }
-
 
 def record_gpu_forward(func):
     @wraps(func)
@@ -130,38 +164,3 @@ def record_gpu_forward(func):
             return func(self, input_ids, batch)
 
     return wrapped
-
-
-def collect_gpu_metrics(snapshot):
-    """Export worker snapshots without synchronizing devices or re-observing."""
-    from prometheus_client.core import HistogramMetricFamily
-
-    workers = (snapshot or {}).get("forward_metrics", [])
-    labels = ["dp_rank", "pp_rank", "tp_rank", "engine_role"]
-    duration = HistogramMetricFamily(
-        "atom:gpu_forward_seconds",
-        "Per-worker target forward step device-event duration, including stream communication/waits; excludes input preparation, sampling and drafting.",
-        labels=labels,
-    )
-    request_duration = HistogramMetricFamily(
-        "atom:prefill_request_gpu_forward_seconds",
-        "Per-worker sum of participating batch device durations across a request's initial local prefill chunks; once after all chunks complete, not exclusive request compute time.",
-        labels=labels,
-    )
-    for worker in workers:
-        values = [str(worker[k]) for k in labels]
-        hist = worker["steps"]
-        duration.add_metric(
-            values,
-            buckets=prometheus_buckets(hist),
-            sum_value=hist["sum"],
-        )
-        if "prefill_requests" in worker:
-            hist = worker["prefill_requests"]
-            request_duration.add_metric(
-                values,
-                buckets=prometheus_buckets(hist),
-                sum_value=hist["sum"],
-            )
-    yield duration
-    yield request_duration

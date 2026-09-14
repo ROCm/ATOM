@@ -819,19 +819,20 @@ class ModelRunner:
         self.gpu_forward_metrics = None
         if envs.ATOM_ENABLE_METRICS_DEVICE_TIMER:
             self.gpu_forward_metrics = GPUForwardMetrics(
-                lambda: torch.cuda.Event(enable_timing=True)
+                lambda: torch.cuda.Event(enable_timing=True),
+                dp_rank=config.parallel_config.data_parallel_rank,
+                pp_rank=config.parallel_config.pipeline_parallel_rank,
+                tp_rank=self.rank,
+                engine_role=(
+                    ("decode" if config.disagg_is_decode else "prefill")
+                    if config.enable_rapidserve
+                    else "default"
+                ),
             )
 
-    def collect_forward_metrics(self):
-        if self.gpu_forward_metrics is None:
-            return None
-        pc = self.config.parallel_config
-        return {
-            **self.gpu_forward_metrics.snapshot(),
-            "dp_rank": pc.data_parallel_rank,
-            "pp_rank": pc.pipeline_parallel_rank,
-            "tp_rank": self.rank,
-        }
+    def poll_forward_metrics(self):
+        if self.gpu_forward_metrics is not None:
+            self.gpu_forward_metrics.poll()
 
     def _build_and_load_model(self, model_class):
         """Construct the model and load its weights from disk.

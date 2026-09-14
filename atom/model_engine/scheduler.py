@@ -512,7 +512,13 @@ class Scheduler:
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.config = config
-        self.metrics = SchedulerMetrics()
+        pc = getattr(config, "parallel_config", None)
+        self.metrics = SchedulerMetrics(
+            getattr(pc, "data_parallel_rank", 0)
+            * getattr(config, "pipeline_parallel_size", 1)
+            + getattr(pc, "pipeline_parallel_rank", 0),
+            self._METRICS_ROLE or "default",
+        )
 
         # Admit-rejected seqs (those `_unschedulable_reason` flags). Drained
         # by `take_rejected` each EngineCore step; routed through the same
@@ -3454,7 +3460,13 @@ class PrefillScheduler:
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.block_manager = None  # blocks managed by decode process
-        self.metrics = SchedulerMetrics()
+        pc = getattr(config, "parallel_config", None)
+        self.metrics = SchedulerMetrics(
+            getattr(pc, "data_parallel_rank", 0)
+            * getattr(config, "pipeline_parallel_size", 1)
+            + getattr(pc, "pipeline_parallel_rank", 0),
+            self._METRICS_ROLE or "default",
+        )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         # spec decode not used on prefill side

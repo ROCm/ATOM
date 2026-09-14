@@ -596,13 +596,6 @@ class LLMEngine:
             "kv_blocks_total": kv_total,
             "kv_blocks_indexed": summed("kv_blocks_indexed"),
             "kv_cache_usage_ratio": kv_used / kv_total if kv_total else 0.0,
-            "forward_metrics": [
-                {**worker, "engine_role": stats.get("role") or "default"}
-                for stats in latest_metrics.values()
-                for worker in stats.get("forward_metrics", [])
-            ],
-            # Keep cumulative observations per scheduler: exposing each rank
-            # preserves reset detection and avoids counting a PP batch twice.
             "scheduler_metrics": [
                 {
                     "dp_rank": rank,

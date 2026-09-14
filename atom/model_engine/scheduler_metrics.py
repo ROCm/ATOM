@@ -1,4 +1,4 @@
-"""Cumulative scheduler observations, transported by the existing metrics snapshot.
+"""Scheduler-owned Prometheus observations.
 
 Only the scheduler owner updates these counters. No GPU synchronization or
 per-request labels are needed, and a scrape never consumes observations.
@@ -9,11 +9,9 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-from atom.utils.histogram import (
-    LATENCY_BUCKETS,
-    CumulativeHistogram,
-    prometheus_buckets,
-)
+from prometheus_client import Histogram
+
+from atom.utils.histogram import LATENCY_BUCKETS
 
 BATCH_BUCKETS = (1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 512, 1024)
 TOKEN_BUCKETS = (
@@ -50,16 +48,71 @@ class RequestQueueTiming:
 
 
 class SchedulerMetrics:
-    def __init__(self):
-        self.queue_time = CumulativeHistogram(LATENCY_BUCKETS)
-        self.decode_batch_size = CumulativeHistogram(BATCH_BUCKETS)
-        self.pd_transfer = CumulativeHistogram(LATENCY_BUCKETS)
-        self.prefill_request_tokens = CumulativeHistogram(TOKEN_BUCKETS)
-        self.prefill_batch_tokens = CumulativeHistogram(TOKEN_BUCKETS)
-        self.prefill_context_tokens = CumulativeHistogram(BATCH_CONTEXT_BUCKETS)
-        self.prefill_request_context_tokens = CumulativeHistogram(TOKEN_BUCKETS)
-        self.decode_context_tokens = CumulativeHistogram(BATCH_CONTEXT_BUCKETS)
-        self.decode_request_context_tokens = CumulativeHistogram(TOKEN_BUCKETS)
+    def __init__(self, dp_rank=0, engine_role="default", *, registry=None):
+        labels = {"dp_rank": str(dp_rank), "engine_role": engine_role}
+        self.queue_time = Histogram(
+            "atom:request_queue_time_seconds",
+            "Time from engine receipt to first real forward dispatch, including KV loading waits.",
+            labels,
+            buckets=LATENCY_BUCKETS,
+            registry=registry,
+        ).labels(**labels)
+        self.decode_batch_size = Histogram(
+            "atom:decode_batch_size",
+            "Real decode request rows per forward; excludes dummy work and graph padding.",
+            labels,
+            buckets=BATCH_BUCKETS,
+            registry=registry,
+        ).labels(**labels)
+        self.pd_transfer = Histogram(
+            "atom:pd_kv_transfer_seconds",
+            "Decode-side PD KV load wait until all workers complete; includes dispatch, handshake and notification.",
+            labels,
+            buckets=LATENCY_BUCKETS,
+            registry=registry,
+        ).labels(**labels)
+        self.prefill_request_tokens = Histogram(
+            "atom:prefill_request_tokens",
+            "Prompt tokens remaining at first local prefill dispatch, once per request.",
+            labels,
+            buckets=TOKEN_BUCKETS,
+            registry=registry,
+        ).labels(**labels)
+        self.prefill_batch_tokens = Histogram(
+            "atom:prefill_batch_tokens",
+            "Real prefill tokens scheduled per forward, excluding cached prefix and padding.",
+            labels,
+            buckets=TOKEN_BUCKETS,
+            registry=registry,
+        ).labels(**labels)
+        self.prefill_context_tokens = Histogram(
+            "atom:prefill_context_tokens",
+            "Sum of logical prefill context lengths at the current chunk end per real forward, including cached prefixes and excluding decode rows and padding.",
+            labels,
+            buckets=BATCH_CONTEXT_BUCKETS,
+            registry=registry,
+        ).labels(**labels)
+        self.prefill_request_context_tokens = Histogram(
+            "atom:prefill_request_context_tokens",
+            "Logical context length per real prefill request row on each forward, including cached prefixes through the current chunk; request-forward weighted, without padding or TP multiplication.",
+            labels,
+            buckets=TOKEN_BUCKETS,
+            registry=registry,
+        ).labels(**labels)
+        self.decode_context_tokens = Histogram(
+            "atom:decode_context_tokens",
+            "Sum of logical decode sequence lengths per real forward, without padding or TP multiplication.",
+            labels,
+            buckets=BATCH_CONTEXT_BUCKETS,
+            registry=registry,
+        ).labels(**labels)
+        self.decode_request_context_tokens = Histogram(
+            "atom:decode_request_context_tokens",
+            "Logical context length per real decode request row on each forward; request-forward weighted, without padding or TP multiplication.",
+            labels,
+            buckets=TOKEN_BUCKETS,
+            registry=registry,
+        ).labels(**labels)
         # Only in-flight external loads are retained; removed on every terminal
         # path, including abort and fallback. Sequence timing dies with the seq.
         self._loads: dict[str, tuple[object, float]] = {}
@@ -139,101 +192,3 @@ class SchedulerMetrics:
                     timing.prefill_observed = True
             if context_lens is not None:
                 self.prefill_context_tokens.observe(total_context)
-
-    def snapshot(self) -> dict:
-        return {
-            "queue_time": self.queue_time.snapshot(),
-            "decode_batch_size": self.decode_batch_size.snapshot(),
-            "pd_kv_transfer": self.pd_transfer.snapshot(),
-            "prefill_request_tokens": self.prefill_request_tokens.snapshot(),
-            "prefill_batch_tokens": self.prefill_batch_tokens.snapshot(),
-            "prefill_context_tokens": self.prefill_context_tokens.snapshot(),
-            "prefill_request_context_tokens": self.prefill_request_context_tokens.snapshot(),
-            "decode_context_tokens": self.decode_context_tokens.snapshot(),
-            "decode_request_context_tokens": self.decode_request_context_tokens.snapshot(),
-        }
-
-
-def collect_scheduler_metrics(snapshot):
-    """Export scheduler-owned observations; None describes names without data."""
-    from prometheus_client.core import GaugeMetricFamily, HistogramMetricFamily
-
-    ranks = (snapshot or {}).get("scheduler_metrics", [])
-    labels = ["dp_rank", "engine_role"]
-    for key, name, help_text in (
-        (
-            "queue_time",
-            "atom:request_queue_time_seconds",
-            "Time from engine receipt to first real forward dispatch, including KV loading waits.",
-        ),
-        (
-            "decode_batch_size",
-            "atom:decode_batch_size",
-            "Real decode request rows per forward; excludes dummy work and graph padding.",
-        ),
-        (
-            "pd_kv_transfer",
-            "atom:pd_kv_transfer_seconds",
-            "Decode-side PD KV load wait until all workers complete; includes dispatch, handshake and notification.",
-        ),
-        (
-            "prefill_request_tokens",
-            "atom:prefill_request_tokens",
-            "Prompt tokens remaining at first local prefill dispatch, once per request.",
-        ),
-        (
-            "prefill_batch_tokens",
-            "atom:prefill_batch_tokens",
-            "Real prefill tokens scheduled per forward, excluding cached prefix and padding.",
-        ),
-        (
-            "prefill_context_tokens",
-            "atom:prefill_context_tokens",
-            "Sum of logical prefill context lengths at the current chunk end per real forward, including cached prefixes and excluding decode rows and padding.",
-        ),
-        (
-            "prefill_request_context_tokens",
-            "atom:prefill_request_context_tokens",
-            "Logical context length per real prefill request row on each forward, including cached prefixes through the current chunk; request-forward weighted, without padding or TP multiplication.",
-        ),
-        (
-            "decode_context_tokens",
-            "atom:decode_context_tokens",
-            "Sum of logical decode sequence lengths per real forward, without padding or TP multiplication.",
-        ),
-        (
-            "decode_request_context_tokens",
-            "atom:decode_request_context_tokens",
-            "Logical context length per real decode request row on each forward; request-forward weighted, without padding or TP multiplication.",
-        ),
-    ):
-        metric = HistogramMetricFamily(name, help_text, labels=labels)
-        for rank in ranks:
-            if key not in rank:
-                continue
-            hist = rank[key]
-            metric.add_metric(
-                [str(rank["dp_rank"]), rank["engine_role"]],
-                buckets=prometheus_buckets(hist),
-                sum_value=hist["sum"],
-            )
-        yield metric
-
-    queues = GaugeMetricFamily(
-        "atom:scheduler_requests",
-        "Requests by scheduler state; waiting excludes KV waits.",
-        labels=[*labels, "state"],
-    )
-    blocks = GaugeMetricFamily(
-        "atom:scheduler_kv_cache_blocks",
-        "KV block pool by state; used + evictable + vacant = total.",
-        labels=[*labels, "state"],
-    )
-    for rank in ranks:
-        values = [str(rank["dp_rank"]), rank["engine_role"]]
-        for state in ("running", "waiting", "waiting_kv"):
-            queues.add_metric([*values, state], rank[state])
-        for state, count in rank["kv_blocks"].items():
-            blocks.add_metric([*values, state], count)
-    yield queues
-    yield blocks

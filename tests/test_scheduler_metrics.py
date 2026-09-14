@@ -6,7 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 from conftest import MockConfig
+from metrics_helpers import histogram_values_by_name
 from prometheus_client.parser import text_string_to_metric_families
+from prometheus_client.utils import floatToGoString
 
 from atom.entrypoints.openai.metrics_setup import create_metrics_exporter
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
@@ -103,7 +105,7 @@ def test_queue_includes_kv_wait_and_counts_first_forward_once(clock):
     clock[0] += 3
     metrics.record_forward(batch(seqs, decode=1), seqs)
     metrics.record_forward(batch(seqs, decode=1), seqs)
-    snap = metrics.snapshot()
+    snap = histogram_values_by_name(metrics)
     assert snap["queue_time"]["sum"] == 10
     assert snap["queue_time"]["buckets"][-1][1] == 1
     assert snap["pd_kv_transfer"]["sum"] == 5
@@ -156,7 +158,7 @@ def test_engine_receipt_includes_time_buffered_before_scheduler_admission(
     scheduler.metrics.record_forward(
         batch({received.id: received}), {received.id: received}
     )
-    assert scheduler.metrics.snapshot()["queue_time"]["sum"] == 7
+    assert histogram_values_by_name(scheduler.metrics)["queue_time"]["sum"] == 7
 
 
 @pytest.mark.parametrize(
@@ -170,9 +172,12 @@ def test_transfer_ignores_failed_and_offload_loads(clock, is_pd, succeeded, expe
     clock[0] += 0.25
     metrics.finish_kv_wait(seq.id, succeeded=succeeded)
     metrics.finish_kv_wait(seq.id, succeeded=succeeded)
-    assert metrics.snapshot()["pd_kv_transfer"]["buckets"][-1][1] == expected
+    assert (
+        histogram_values_by_name(metrics)["pd_kv_transfer"]["buckets"][-1][1]
+        == expected
+    )
     metrics.record_forward(batch({seq.id: seq}), {seq.id: seq})
-    assert metrics.snapshot()["queue_time"]["sum"] == 0.25
+    assert histogram_values_by_name(metrics)["queue_time"]["sum"] == 0.25
     assert not metrics._loads
 
 
@@ -183,14 +188,14 @@ def test_batch_counts_request_rows_and_ignores_dummy_prefill_and_empty(clock):
         metrics.enqueue(seq)
     metrics.record_forward(batch(seqs, decode=5, dummy=True), seqs)
     metrics.record_forward(batch({}, decode=0), {})
-    assert metrics.snapshot()["queue_time"]["buckets"][-1][1] == 0
+    assert histogram_values_by_name(metrics)["queue_time"]["buckets"][-1][1] == 0
     metrics.record_forward(batch(seqs, decode=0), seqs)
     mixed = batch(seqs, decode=3)
     mixed.total_tokens_num_decode = 12  # MTP tokens do not multiply batch size
     metrics.record_forward(mixed, seqs)
-    hist = metrics.snapshot()["decode_batch_size"]
+    hist = histogram_values_by_name(metrics)["decode_batch_size"]
     assert hist["sum"] == 3 and hist["buckets"][-1][1] == 1
-    assert metrics.snapshot()["queue_time"]["buckets"][-1][1] == 5
+    assert histogram_values_by_name(metrics)["queue_time"]["buckets"][-1][1] == 5
 
 
 def test_scheduler_abort_releases_pending_metric_state(clock):
@@ -205,7 +210,10 @@ def test_scheduler_abort_releases_pending_metric_state(clock):
         KVConnectorOutput(finished_recving={seq.id})
     )
     assert not scheduler.metrics._loads
-    assert scheduler.metrics.snapshot()["pd_kv_transfer"]["buckets"][-1][1] == 0
+    assert (
+        histogram_values_by_name(scheduler.metrics)["pd_kv_transfer"]["buckets"][-1][1]
+        == 0
+    )
     assert scheduler.engine_stats.total_requests == 0
 
 
@@ -223,7 +231,7 @@ def test_scheduler_success_closes_timer_at_completion_before_next_schedule(clock
     clock[0] += 2
     scheduler._uncount_inflight_load(seq)
     scheduler.metrics.record_forward(batch({seq.id: seq}, decode=1), {seq.id: seq})
-    snap = scheduler.metrics.snapshot()
+    snap = histogram_values_by_name(scheduler.metrics)
     assert snap["pd_kv_transfer"]["sum"] == 0.5
     assert snap["queue_time"]["sum"] == 2.5
 
@@ -248,63 +256,6 @@ def test_pool_partition_and_waiting_queue_exclusion():
     assert snapshot["scheduler_metrics"]["waiting"] == 0
     assert snapshot["scheduler_metrics"]["waiting_kv"] == 1
     pool.free(used.block_id)
-
-
-def test_histograms_preserve_rank_counts_and_do_not_reobserve_snapshots(clock):
-    metrics = SchedulerMetrics()
-    metrics.decode_batch_size.observe(3)
-    ranks = [
-        dict(
-            metrics.snapshot(),
-            dp_rank=rank,
-            engine_role="default",
-            running=3,
-            waiting=0,
-            waiting_kv=0,
-            kv_blocks={"used": 2, "evictable": 3, "vacant": 5, "total": 10},
-        )
-        for rank in (0, 1)
-    ]
-    exporter, _, _ = create_metrics_exporter()
-    exporter.update({"enabled": True, "scheduler_metrics": ranks})
-    before = samples(exporter)
-    exporter.update({"enabled": True, "scheduler_metrics": ranks})
-    after = samples(exporter)
-    for rank in (0, 1):
-        labels = (("dp_rank", str(rank)), ("engine_role", "default"))
-        key = ("atom:decode_batch_size_count", labels)
-        assert before[key] == after[key] == 1
-        assert after[("atom:decode_batch_size_sum", labels)] == 3
-    metrics.decode_batch_size.observe(7)
-    assert ranks[0]["decode_batch_size"]["buckets"][-1][1] == 1
-
-
-def test_engine_snapshots_reach_exporter_with_distinct_dp_ranks():
-    from aiter_stub import stubbed_aiter
-
-    with stubbed_aiter():
-        from atom.model_engine.llm_engine import LLMEngine
-
-    rank_snapshots = {}
-    for rank, size in ((0, 3), (1, 7)):
-        scheduler = Scheduler(MockConfig())
-        scheduler.metrics.decode_batch_size.observe(size)
-        rank_snapshots[rank] = EngineUtilityHandler(
-            None, Queue(), scheduler=scheduler
-        ).collect_metrics()
-    engine = SimpleNamespace(
-        core_mgr=SimpleNamespace(
-            latest_metrics=rank_snapshots,
-            get_dp_router_statistics=dict,
-        )
-    )
-    exporter, _, _ = create_metrics_exporter()
-    exporter.update(LLMEngine.get_metrics_statistics(engine))
-    data = samples(exporter)
-    for rank, size in ((0, 3), (1, 7)):
-        labels = (("dp_rank", str(rank)), ("engine_role", "default"))
-        assert data[("atom:decode_batch_size_count", labels)] == 1
-        assert data[("atom:decode_batch_size_sum", labels)] == size
 
 
 def test_cache_tiers_preserve_admitted_reuse_through_snapshots():
@@ -476,8 +427,8 @@ def test_pp_head_records_once_when_dispatching_a_real_forward(clock):
     proc._pp_head_step()
     proc._pp_head_step()  # full pipeline: collect only; no second submission
     assert dispatched == ["forward", "flush_pp_send"]
-    assert metrics.snapshot()["decode_batch_size"]["buckets"][-1][1] == 1
-    assert metrics.snapshot()["queue_time"]["buckets"][-1][1] == 1
+    assert histogram_values_by_name(metrics)["decode_batch_size"]["buckets"][-1][1] == 1
+    assert histogram_values_by_name(metrics)["queue_time"]["buckets"][-1][1] == 1
 
 
 def test_workload_uses_dispatch_snapshot_and_observes_prompt_once(clock):
@@ -501,7 +452,7 @@ def test_workload_uses_dispatch_snapshot_and_observes_prompt_once(clock):
     mixed.total_tokens_num_prefill = 976
     mixed.context_lens = [2001, 10000]
     metrics.record_forward(mixed, seqs)
-    snapshot = metrics.snapshot()
+    snapshot = histogram_values_by_name(metrics)
     assert snapshot["prefill_request_tokens"]["sum"] == 2000
     assert snapshot["prefill_request_tokens"]["buckets"][-1][1] == 1
     assert snapshot["prefill_batch_tokens"]["sum"] == 2000
@@ -514,7 +465,7 @@ def test_workload_uses_dispatch_snapshot_and_observes_prompt_once(clock):
     assert snapshot["decode_context_tokens"]["buckets"][-1][1] == 2
     mixed.is_dummy_run = True
     metrics.record_forward(mixed, seqs)
-    assert metrics.snapshot() == snapshot
+    assert histogram_values_by_name(metrics) == snapshot
 
 
 def test_prefill_context_uses_chunk_end_and_excludes_decode_and_padding(monkeypatch):
@@ -547,7 +498,7 @@ def test_prefill_context_uses_chunk_end_and_excludes_decode_and_padding(monkeypa
     first.num_cached_tokens = 7
     second.num_cached_tokens = 12
     metrics.record_forward(scheduled, seqs)
-    initial = metrics.snapshot()
+    initial = histogram_values_by_name(metrics)
     assert initial["prefill_context_tokens"]["sum"] == 19  # 7 + 12
     assert initial["prefill_context_tokens"]["buckets"][-1][1] == 1
     assert initial["prefill_request_context_tokens"]["sum"] == 19
@@ -564,37 +515,14 @@ def test_prefill_context_uses_chunk_end_and_excludes_decode_and_padding(monkeypa
         total_seqs_num_prefill=1,
     )
     metrics.record_forward(tail, seqs)
-    final = metrics.snapshot()
+    final = histogram_values_by_name(metrics)
     assert final["prefill_context_tokens"]["sum"] == 31  # 19 + 12
     assert final["prefill_context_tokens"]["buckets"][-1][1] == 2
     assert final["prefill_request_context_tokens"]["sum"] == 31
     assert final["prefill_request_context_tokens"]["buckets"][-1][1] == 3
     tail.is_dummy_run = True
     metrics.record_forward(tail, seqs)
-    assert metrics.snapshot() == final
-
-    rank = dict(
-        final,
-        dp_rank=2,
-        engine_role="prefill",
-        running=1,
-        waiting=0,
-        waiting_kv=0,
-        kv_blocks={},
-    )
-    exporter, _, _ = create_metrics_exporter()
-    labels = (("dp_rank", "2"), ("engine_role", "prefill"))
-    for _ in range(2):
-        exporter.update({"enabled": True, "scheduler_metrics": [rank]})
-        values = samples(exporter)
-        assert values[("atom:prefill_context_tokens_count", labels)] == 2
-        assert values[("atom:prefill_request_context_tokens_count", labels)] == 3
-        assert values[("atom:prefill_request_context_tokens_sum", labels)] == 31
-    # Older workers must remain missing, not produce synthetic zero samples.
-    for key in ("prefill_context_tokens", "prefill_request_context_tokens"):
-        del rank[key]
-    exporter.update({"enabled": True, "scheduler_metrics": [rank]})
-    assert ("atom:prefill_context_tokens_count", labels) not in samples(exporter)
+    assert histogram_values_by_name(metrics) == final
 
 
 def test_decode_request_context_histogram_counts_each_real_row_on_each_forward():
@@ -610,7 +538,7 @@ def test_decode_request_context_histogram_counts_each_real_row_on_each_forward()
         context_lens=[1000, 9000, 300, 999999],
     )
     metrics.record_forward(mixed, seqs)
-    first = metrics.snapshot()
+    first = histogram_values_by_name(metrics)
     assert first["decode_context_tokens"]["sum"] == 10000
     assert first["decode_context_tokens"]["buckets"][-1][1] == 1
     assert first["decode_request_context_tokens"]["sum"] == 10000
@@ -624,33 +552,14 @@ def test_decode_request_context_histogram_counts_each_real_row_on_each_forward()
     mixed.total_seqs_num_prefill = 0
     mixed.context_lens = [1001]
     metrics.record_forward(mixed, seqs)
-    second = metrics.snapshot()
+    second = histogram_values_by_name(metrics)
     assert second["decode_context_tokens"]["sum"] == 11001
     assert second["decode_context_tokens"]["buckets"][-1][1] == 2
     assert second["decode_request_context_tokens"]["sum"] == 11001
     assert second["decode_request_context_tokens"]["buckets"][-1][1] == 3
     mixed.is_dummy_run = True
     metrics.record_forward(mixed, seqs)
-    assert metrics.snapshot() == second
-
-    # Repeated exposition must not re-observe any request or forward.
-    rank = dict(
-        second,
-        dp_rank=0,
-        engine_role="decode",
-        running=1,
-        waiting=0,
-        waiting_kv=0,
-        kv_blocks={},
-    )
-    exporter, _, _ = create_metrics_exporter()
-    for _ in range(2):
-        exporter.update({"enabled": True, "scheduler_metrics": [rank]})
-        values = samples(exporter)
-        labels = (("dp_rank", "0"), ("engine_role", "decode"))
-        assert values[("atom:decode_request_context_tokens_count", labels)] == 3
-        assert values[("atom:decode_request_context_tokens_sum", labels)] == 11001
-        assert values[("atom:decode_context_tokens_count", labels)] == 2
+    assert histogram_values_by_name(metrics) == second
 
 
 @pytest.mark.parametrize("phase", ["prefill", "decode"])
@@ -660,7 +569,8 @@ def test_decode_request_context_histogram_counts_each_real_row_on_each_forward()
 def test_large_batch_contexts_have_finite_buckets_through_exposition(
     phase, rows, context
 ):
-    metrics = SchedulerMetrics()
+    exporter, _, _ = create_metrics_exporter()
+    metrics = SchedulerMetrics(engine_role=phase, registry=exporter.registry)
     seqs = {i: SimpleNamespace(id=i) for i in range(rows)}
     scheduled = SimpleNamespace(
         req_ids=list(seqs),
@@ -671,7 +581,7 @@ def test_large_batch_contexts_have_finite_buckets_through_exposition(
         context_lens=[context] * rows,
     )
     metrics.record_forward(scheduled, seqs)
-    snapshot = metrics.snapshot()
+    snapshot = histogram_values_by_name(metrics)
     total = rows * context
     histogram = snapshot[f"{phase}_context_tokens"]
     assert histogram["sum"] == total
@@ -682,75 +592,9 @@ def test_large_batch_contexts_have_finite_buckets_through_exposition(
     request_histogram = snapshot[f"{phase}_request_context_tokens"]
     assert request_histogram["buckets"][-2] == (8388608, rows)
 
-    exporter, _, _ = create_metrics_exporter()
-    exporter.update(
-        {
-            "scheduler_metrics": [
-                dict(
-                    snapshot,
-                    dp_rank=0,
-                    engine_role=phase,
-                    running=rows,
-                    waiting=0,
-                    waiting_kv=0,
-                    kv_blocks={},
-                )
-            ]
-        }
-    )
     values = samples(exporter)
     labels = (("dp_rank", "0"), ("engine_role", phase))
-    bucket_labels = (*labels, ("le", str(total)))
+    bucket_labels = (*labels, ("le", floatToGoString(total)))
     assert values[(f"atom:{phase}_context_tokens_bucket", bucket_labels)] == 1
     assert values[(f"atom:{phase}_context_tokens_sum", labels)] == total
     assert values[(f"atom:{phase}_context_tokens_count", labels)] == 1
-
-
-def test_worker_snapshots_include_all_pp_tp_workers_without_duplicate_queues():
-    from aiter_stub import stubbed_aiter
-
-    with stubbed_aiter():
-        from atom.model_engine.llm_engine import LLMEngine
-    from atom.model_engine.gpu_metrics import GPUForwardMetrics
-
-    worker = GPUForwardMetrics(lambda: None).snapshot()
-    worker["steps"] = {
-        "buckets": [(0.1, 1), (float("inf"), 1)],
-        "sum": 0.08,
-    }
-    snapshots = {
-        0: {
-            "enabled": True,
-            "requests_running": 2,
-            "forward_metrics": [
-                {**worker, "dp_rank": 0, "pp_rank": 0, "tp_rank": tp} for tp in (0, 1)
-            ],
-        },
-        1: {
-            "enabled": False,
-            "forward_metrics": [
-                {**worker, "dp_rank": 0, "pp_rank": 1, "tp_rank": tp} for tp in (0, 1)
-            ],
-        },
-    }
-    engine = SimpleNamespace(
-        core_mgr=SimpleNamespace(
-            latest_metrics=snapshots, get_dp_router_statistics=dict
-        )
-    )
-    result = LLMEngine.get_metrics_statistics(engine)
-    assert result["requests_running"] == 2
-    assert len(result["forward_metrics"]) == 4
-    exporter, _, _ = create_metrics_exporter()
-    exporter.update(result)
-    counts = {
-        labels: v
-        for (name, labels), v in samples(exporter).items()
-        if name == "atom:gpu_forward_seconds_count"
-    }
-    assert len(counts) == 4 and set(counts.values()) == {1}
-    before, after = samples(exporter), samples(exporter)
-    for key, value in before.items():
-        # GC counters are live process state, independent of worker snapshots.
-        if not key[0].startswith("atom:gc_"):
-            assert after[key] == value

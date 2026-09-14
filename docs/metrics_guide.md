@@ -29,68 +29,46 @@ observes current API instruments without waiting for a periodic text refresh.
 The rendering thread still shares CPU and the GIL with the API loop; collectors
 must remain bounded. Engine snapshots retain their existing refresh interval.
 
-```
-                       API process                      │  Engine process(es)
-                                                        │
-  RequestTimingMiddleware ─┐                            │
-  StreamBatchDispatcher  ──┤ direct instrument          │
-                           ▼                            │
-                    exporter.registry ◄─────────┐       │
-                           ▲                    │       │
-                           │                    │       │
-  GET /metrics ─► render_async() ─► render()       │     │
-                  API loop         thread         │     │
-                           │                    │       │
-                           ▼            _SnapshotCollector       Scheduler ─┐
-                    pinned snapshot ────────────┘       │        GPU events─┤
-                           ▲                            │        Engine     ┤
-                           │                            │                   │
-             exporter.update(snapshot) ◄────────────────┴─── METRICS push ──┘
-                    (configured refresh loop)                (engine clock)
-```
+### Native instruments and node-local export
 
-There are exactly **two ways** a number gets exported, and which one you need is
-decided by *which process observes the event*.
+API, scheduler and GPU timing owners use `prometheus_client` instruments.
+Server entrypoints initialize `PROMETHEUS_MULTIPROC_DIR` before importing the
+client or spawning workers. Children inherit this node-local directory;
+`MultiProcessCollector` reads their mmap files at scrape time. Histogram buckets,
+counts and sums are maintained by the client, without histogram snapshots,
+worker telemetry replies or API-side bucket conversion.
 
-### Path A — direct instrument (observed in the API process)
+Each service launch gets a fresh temporary directory, removed when its parent
+exits normally after its children. If the launcher supplies a directory, it
+must create/clean it before startup and remove it after all processes exit.
+Do not share one directory between service instances or across nodes. A hard
+kill can leave the automatic directory behind, but the next launch uses a new
+one. The client's Histogram/Counter files retain cumulative values after a
+worker exits; `mark_process_dead()` only removes live-mode Gauge files.
+Multiprocess exposition omits `_created` and exemplars, and uses the client's
+canonical numeric `le` labels (for example `1.0`). API TTFT/ITL use the
+same native storage; instruments are not also registered in the scrape registry.
 
-The owning module defines a normal `prometheus_client` instrument against
-`exporter.registry` and observes it inline at the event. Cumulative state lives
-in the instrument itself; a scrape neither resets nor advances it.
+On a non-coordinator DP node, the launcher exposes native metrics on its own
+`--host` / `--server-port` while its engines run. Scrape every node, including
+the coordinator, as a separate target. Preserve `instance`, `dp_rank`,
+`pp_rank`, `tp_rank` and `engine_role` as applicable; aggregate rates with PromQL
+before computing histogram quantiles. A coordinator exports only its **local**
+native instruments, so scraping it alone misses remote histograms. The CI
+collector accepts repeated `--prefill` / `--decode` target addresses.
 
-Used by `RequestMetrics` (TTFT) and `StreamMetrics` (ITL).
+This replaces custom histogram transport with the standard client while
+keeping one endpoint per node rather than one per internal worker. Existing
+engine, cache, queue and offload state metrics still use their pre-existing
+snapshots and exporter. Their refresh and idle GPU-event polling use
+`ATOM_METRICS_UPDATE_INTERVAL_S` (default 1 second). GPU polling only observes
+completed events; it returns no metrics payload and never synchronizes a GPU.
+Native histogram observations do not wait for a snapshot refresh.
 
-### Path B — snapshot collector (observed in an engine/worker process)
-
-The engine cannot share a Prometheus registry with the API process, so the
-producer accumulates into a plain `CumulativeHistogram`/counter, ships it inside
-the existing `METRICS` snapshot, and a thin pure function converts that snapshot
-into `MetricFamily` objects at render time.
-
-Used by `collect_scheduler_metrics`, `collect_gpu_metrics`,
-`collect_engine_metrics`, and the legacy `_AtomMetricsCollector`.
-
-Engine pushes (including DP and both PP stage roles) and API snapshot refresh
-share `ATOM_METRICS_UPDATE_INTERVAL_S`, defaulting to one second. Set this finite,
-positive value before starting the service; each loop reads it once at startup.
-The loops run independently and are subject to engine progress. Prometheus
-scraping has its own interval; the CI collector accepts
-`--scrape-interval-seconds` (default `1`, minimum `0.001`, millisecond precision).
-For example, `ATOM_METRICS_UPDATE_INTERVAL_S=0.5` updates internal snapshots twice
-per second while the collector can continue scraping once per second.
-
-Snapshot refresh is independent of on-demand text rendering and does not impose
-a periodic cache on API TTFT/ITL observations.
-`render()` pins one snapshot revision in a `ContextVar` for the whole response,
-so every snapshot collector in a single scrape sees the same revision even if
-the refresh loop fires concurrently. Published snapshots are private and never
-mutated; copying and rendering happen outside the publication lock. API
-instruments retain their own synchronization and are sampled during collection.
-
-**Histogram events are never lost to the snapshot interval** — the producer
-observes at the event; the snapshot only transports accumulated buckets.
-Gauges are the exception: they are sampled state, so a queue spike that opens and
-closes between two snapshots is invisible.
+The API endpoint retains on-demand thread rendering. Multiprocess storage does
+not itself move collection/encoding into another process. Prometheus scraping
+has its own interval; the CI collector accepts `--scrape-interval-seconds`
+(default `1`, minimum `0.001`, millisecond precision).
 
 ---
 
@@ -102,7 +80,7 @@ Histograms expose `_bucket`, `_count` and `_sum`.
 
 ### API request and stream latency
 
-Observed in the API process (Path A), plus one live-read gauge.
+Observed in the API process, plus one live-read gauge.
 
 | Metric | Type / unit | Definition |
 | --- | --- | --- |
@@ -112,7 +90,7 @@ Observed in the API process (Path A), plus one live-read gauge.
 
 ### Scheduler
 
-Observed in each scheduler; transported per DP rank (Path B). All carry
+Observed in each scheduler; exported per DP rank. All carry
 `dp_rank` and `engine_role`.
 
 | Metric | Type / unit | Definition |
@@ -137,7 +115,7 @@ snapshot collection does not scan the free block pool.
 
 ### GPU forward timing
 
-Device-event histograms, one entry per worker (Path B). Labels: `dp_rank`,
+Device-event histograms, one entry per worker. Labels: `dp_rank`,
 `pp_rank`, `tp_rank`, `engine_role`.
 
 **Opt-in.** Set `ATOM_ENABLE_METRICS_DEVICE_TIMER=1` before starting the service;
@@ -244,137 +222,45 @@ interpreter keeps its own counters.
 
 ## Adding a new metric
 
-**Define the metric where it is observed, not in a central file.** Pick the path
-by which process sees the event.
-
-### Path A — the API process observes it
-
-Define the instrument in a class owned by the module that observes it, taking
-the registry as a constructor argument:
+Define a standard instrument in the component that observes the event. Bind
+rank/role labels once at initialization and call `observe()`, `inc()` or `set()`
+where the value becomes known. Do not add a metrics RPC or a snapshot converter.
 
 ```python
-# atom/entrypoints/openai/streaming_dispatch.py
-
-class StreamMetrics:
-    """Delivery metrics owned by the API stream dispatcher."""
-
-    def __init__(self, registry):
-        from prometheus_client import Histogram
-
-        self._chunk_bytes = Histogram(
-            "atom:stream_chunk_bytes",
-            "Bytes per delivered SSE chunk.",
-            buckets=(64, 256, 1024, 4096, 16384),
-            registry=registry,
-        )
-
-    def observe_chunk_bytes(self, size: int) -> None:
-        self._chunk_bytes.observe(size)
-```
-
-Then construct it in `metrics_setup.py` and pass the handle to the component.
-
-If you need labels that must exist before the first request — so a
-`rate()` baseline can be established — register the zero-valued children up
-front, as `RequestMetrics` does:
-
-```python
-for streaming in ("true", "false"):
-    self._time_to_first_token.labels(streaming=streaming)
-```
-
-Registering a label child does not record a sample.
-
-### Path B — an engine or worker process observes it
-
-Three pieces:
-
-**1. Accumulate at the event**, in the owning component, using
-`atom/utils/histogram.py`:
-
-```python
-# atom/model_engine/<component>_metrics.py
-from atom.utils.histogram import LATENCY_BUCKETS, CumulativeHistogram, prometheus_buckets
-
+from prometheus_client import Histogram
 
 class ComponentMetrics:
-    def __init__(self):
-        self.dispatch_time = CumulativeHistogram(LATENCY_BUCKETS)
-
-    def snapshot(self) -> dict:
-        return {"dispatch_time": self.dispatch_time.snapshot()}
+    def __init__(self, dp_rank, registry=None):
+        self.dispatch_time = Histogram(
+            "atom:dispatch_seconds",
+            "Time waiting for dispatch.",
+            ["dp_rank"],
+            buckets=(0.001, 0.01, 0.1, 1.0),
+            registry=registry,
+        ).labels(dp_rank=str(dp_rank))
 ```
 
-**2. Put it in the snapshot.** The producer merges its `snapshot()` into the
-existing `METRICS` push (`EngineUtilityHandler.collect_metrics` /
-`push_metrics`), and `LLMEngine.get_metrics_statistics()` shapes the per-rank
-list the API side reads. No new IPC channel.
+`registry=None` uses native multiprocess storage in server processes without
+registering a second collector. Unit tests can pass an isolated
+`CollectorRegistry`. Embedders must set `PROMETHEUS_MULTIPROC_DIR` **before**
+importing `prometheus_client` and before spawning any contributing processes.
 
-**3. Convert snapshot → families** with a pure function:
+Create zero-valued label children at startup when a `rate()` baseline is
+needed; creating a child does not observe a sample. Keep labels bounded and
+never include request IDs. For new Gauges, choose `multiprocess_mode` explicitly
+according to ownership/aggregation semantics; live modes also require the
+process supervisor to call `mark_process_dead(pid)` after that process exits.
+Validate device-derived values at the measurement boundary with diagnostic
+context, rather than silently discarding them in a generic histogram.
 
-```python
-from prometheus_client.core import GaugeMetricFamily
-
-
-def collect_component_metrics(snapshot):
-    metric = GaugeMetricFamily(
-        "atom:component_queue_depth",
-        "Number of items waiting in the component queue.",
-    )
-    # `None` is the registration-time metadata query: declare every family that
-    # can ever appear. On a real scrape a missing field stays sample-less, so an
-    # unknown state is never dressed up as a zero.
-    if snapshot is not None and "component_queue_depth" in snapshot:
-        metric.add_metric([], snapshot["component_queue_depth"])
-    yield metric
-```
-
-Register it once, in `atom/entrypoints/openai/metrics_setup.py`:
-
-```python
-for collect in (
-    collect_scheduler_metrics,
-    collect_gpu_metrics,
-    collect_engine_metrics,
-    collect_component_metrics,   # <-- new component
-):
-    exporter.register_snapshot_collector(collect)
-```
-
-`AtomMetricsExporter` itself does not change.
-
-### Rules the collector contract imposes
-
-- `collect(None)` is called at **registration** time. It must declare every
-  family name that can ever appear, including optional ones, and must not do
-  RPCs, I/O or GPU synchronization. The registry uses these names to reject
-  collisions — including generated series such as `_total`, `_bucket`, `_count`
-  and `_sum`.
-- Collectors run in a rendering thread. Read only their snapshot or synchronized
-  instruments; capture event-loop-owned state on the API loop before dispatch.
-- `collect(snapshot)` may only **read**. It must not mutate the shared snapshot,
-  re-observe a value, or reset a counter.
-- Keep the existing zero-vs-missing convention: a field absent from an older
-  snapshot must not render as `0` for a metric where 0 is a meaningful value.
-- Adding a metric to an **existing** component means editing that component's
-  metrics class and its `collect_*` function. Only a genuinely new component
-  needs a line in `metrics_setup.py`.
-
-### Where things live
-
-| Module | Defines |
+| Module | Responsibility |
 | --- | --- |
-| `entrypoints/openai/metrics_setup.py` | Composition root: registers collectors, builds the API instrument classes. |
-| `entrypoints/openai/metrics.py` | `AtomMetricsExporter` (snapshot cache, registry, render), plus the legacy `_AtomMetricsCollector` and `_gc_metrics` for engine, DP, offload, GC, stream-silence and refresh-health metrics. |
-| `entrypoints/openai/request_timing.py` | `RequestMetrics` (TTFT) and the middleware that marks eligible responses. |
-| `entrypoints/openai/streaming_dispatch.py` | `StreamMetrics` (ITL) and `longest_silence_seconds()`. |
-| `model_engine/scheduler_metrics.py` | `SchedulerMetrics` sampling and `collect_scheduler_metrics`. |
-| `model_engine/gpu_metrics.py` | `GPUForwardMetrics` device-event sampling and `collect_gpu_metrics`. |
-| `model_engine/engine_stats.py` | `collect_engine_metrics` (supplemental prefix reuse). |
-| `model_engine/engine_utility.py`, `llm_engine.py` | Snapshot production and per-rank aggregation. |
-| `utils/histogram.py` | `LATENCY_BUCKETS`, `CumulativeHistogram`, `WeightedHistogram`, `prometheus_buckets`. |
-| `.github/scripts/atomesh/observability/` | CI collection, HTML report and export. |
-
-Pre-existing engine, DP, offload and GC metrics still live centrally in
-`metrics.py`. That is deliberate scope containment, not the pattern to copy —
-**new** metrics belong in their owning component.
+| `entrypoints/metrics.py` | Node-local directory lifetime and worker-node HTTP endpoint. |
+| `entrypoints/openai/metrics_setup.py` | Native collector and API instrument composition. |
+| `entrypoints/openai/metrics.py` | Existing state metrics, snapshot cache and async rendering. |
+| `entrypoints/openai/request_timing.py` | Request TTFT observations. |
+| `entrypoints/openai/streaming_dispatch.py` | Token-weighted ITL and stream silence. |
+| `model_engine/scheduler_metrics.py` | Scheduler observations using standard Histograms. |
+| `model_engine/gpu_metrics.py` | Bounded device-event lifecycle and standard Histograms. |
+| `utils/histogram.py` | Shared latency bounds and the weighted ITL extension. |
+| `.github/scripts/atomesh/observability/` | Prometheus collection and HTML reporting. |
