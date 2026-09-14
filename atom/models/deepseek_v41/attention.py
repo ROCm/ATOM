@@ -13,6 +13,7 @@ from atom.model_ops.blockscale import quantize_fp4, quantize_fp8
 from atom.model_ops.deepseek_v41.compressor import Compressor
 from atom.model_ops.deepseek_v41.indexer import select_indices
 from atom.model_ops.deepseek_v41.normalization import FusedRMSNorm, RMSNorm
+from atom.model_ops.deepseek_v41.projections import grouped_output_projection
 from atom.model_ops.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -227,5 +228,5 @@ class Attention(nn.Module):
             .flatten(-2)
         )
         grouped_weight = self.wo_a.weight.view(self.groups, self.o_rank, -1)
-        output = torch.einsum("bsgd,grd->bsgr", output, grouped_weight)
+        output = grouped_output_projection(output, grouped_weight)
         return reduce_output(self.wo_b(output.flatten(-2)))

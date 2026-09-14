@@ -379,6 +379,15 @@ class EngineCore:
             except Exception:
                 logger.exception("KV event publish in engine-step finally failed")
 
+    def _release_multimodal_requests(self, sequences):
+        request_ids = [
+            seq.id for seq in sequences if getattr(seq, "cache_seed", -1) != -1
+        ]
+        if request_ids:
+            # Ordered after the completed forward on every worker, including
+            # final/aborted requests when there will be no subsequent batch.
+            self.runner_mgr.call_func("release_multimodal_requests", request_ids)
+
     def _process_engine_step_inner(self):
         result = self.scheduler.schedule()
 
@@ -388,6 +397,7 @@ class EngineCore:
         # the rejected seq will never produce.
         rejected = self.scheduler.take_rejected()
         if rejected:
+            self._release_multimodal_requests(rejected)
             self.output_queue.put_nowait(rejected)
 
         if result is None:
@@ -451,6 +461,7 @@ class EngineCore:
             pass
 
         if finished_seqs:
+            self._release_multimodal_requests(finished_seqs)
             self.output_queue.put_nowait(finished_seqs)
 
         return True

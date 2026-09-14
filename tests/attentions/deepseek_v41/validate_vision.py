@@ -100,7 +100,12 @@ def main():
             ids, data = processor.prepare(
                 [{"role": "user", "content": parts}], images, {"thinking_mode": "chat"}
             )
+            encoded_before = runner.vision_embeddings.encodes
             result = run_case(runner, [ids], 48, multimodal_data=[data])
+            assert runner.vision_embeddings.encodes - encoded_before == len(images)
+            assert not runner.vision_embeddings.entries
+            assert not runner.vision_embeddings.leases
+            result["vision_encodes"] = runner.vision_embeddings.encodes - encoded_before
             hashes = [None] * size
             torch.distributed.all_gather_object(hashes, result["output_sha256"])
             assert len(set(hashes)) == 1

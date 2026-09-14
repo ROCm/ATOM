@@ -78,6 +78,17 @@ def multimodal_cache_seed(data):
     return int.from_bytes(digest.digest(), "little")
 
 
+def prefill_media_payload(data, cache_seed, *, cache_ready):
+    """Keep span metadata; send media tensors only until the worker owns a lease."""
+    omitted = {"token_types"}
+    if cache_ready:
+        omitted.update(("pixel_values", "image_grid_thw"))
+    return {
+        **{key: value for key, value in data.items() if key not in omitted},
+        "cache_seed": cache_seed,
+    }
+
+
 def embedding_indices(spans, position, length):
     """Paired query/embedding indices for intersections with an input slice."""
     query, source, offset = [], [], 0
@@ -88,32 +99,6 @@ def embedding_indices(spans, position, length):
             source.extend(range(offset + first - start, offset + end - start))
         offset += count
     return query, source
-
-
-def embed_multimodal_batch(model, input_ids, batch, device, dtype):
-    """Scatter explicit request spans, including prefill after a prefix hit."""
-    import torch
-
-    hidden = model.embed_input_ids(input_ids)
-    offset = 0
-    for request_id, length, end in zip(
-        batch.req_ids, batch.num_scheduled_tokens, batch.context_lens
-    ):
-        data = batch.multimodal_data.get(request_id)
-        if data is not None:
-            query, source = embedding_indices(
-                data["embedding_spans"], int(end) - int(length), int(length)
-            )
-            if query:
-                values = model.get_vision_embeddings(
-                    data["pixel_values"].to(device=device, dtype=dtype),
-                    data["image_grid_thw"],
-                )
-                query = torch.tensor(query, device=device) + offset
-                source = torch.tensor(source, device=device)
-                hidden[query] = values[source]
-        offset += int(length)
-    return hidden
 
 
 def get_mrope_input_positions(

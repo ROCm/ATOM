@@ -167,6 +167,7 @@ class Sequence:
         # allocate() / free it in deallocate().
         self.has_per_req_cache = has_per_req_cache
         self.multimodal_data = multimodal_data
+        self.multimodal_cache_ready = False
         # Immutable content identity survives payload release and preemption.
         self.cache_seed = -1
         if multimodal_data is not None:

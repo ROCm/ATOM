@@ -53,7 +53,10 @@ def run_case(runner, prompts, output_tokens, *, multimodal_data=None):
         batch, seqs = item
         counts = {seq.id: seq.num_completion_tokens for seq in sequences}
         output = runner.forward(batch)
-        scheduler.postprocess(list(seqs.values()), output, batch=batch)
+        finished = scheduler.postprocess(list(seqs.values()), output, batch=batch)
+        runner.release_multimodal_requests(
+            [seq.id for seq in finished if seq.cache_seed != -1]
+        )
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start
         for seq in sequences:

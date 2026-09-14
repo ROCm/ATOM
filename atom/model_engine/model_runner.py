@@ -622,6 +622,9 @@ class ModelRunner:
 
     def __init__(self, rank: int, config: Config):
         self.config = config
+        from atom.model_engine.multimodal_runtime import VisionEmbeddingCache
+
+        self.vision_embeddings = VisionEmbeddingCache()
         self.mark_trace = getattr(config, "mark_trace", False)
         from atom.utils.graph_marker import set_graph_marker_enabled
 
@@ -962,10 +965,14 @@ class ModelRunner:
 
         return cu_num_tokens, arange
 
+    def release_multimodal_requests(self, request_ids):
+        self.vision_embeddings.release(request_ids)
+
     def exit(self):
         if not self.still_running:
             return
         self.still_running = False
+        self.vision_embeddings.clear()
         # 0. Join any offload connector's copy threads. Its ThreadPoolExecutors
         #    are non-daemon, so leaving them running wedges interpreter shutdown
         #    or races an in-flight copy against atexit. Must run BEFORE the KV
@@ -2797,15 +2804,7 @@ class ModelRunner:
             # prefill, or decode forced eager (enforce_eager / DP peer
             # prefill / bs above the largest captured graph).
             with record_function(label):
-                # Handle multimodal prefill: compute vision embeddings and merge.
-                #
-                # This assumes `input_ids` spans the whole prompt: the encoder
-                # runs over every image and the result is scattered onto all
-                # placeholder positions found in the batch. The scheduler
-                # therefore refuses to chunk a multimodal prefill.
-                # TODO: support chunked multimodal prefill — cache the encoder
-                # output per request and scatter only the slice belonging to
-                # this chunk, keyed by its token offset into the prompt.
+                # The multimodal runtime owns request leases and span scatter.
                 inputs_embeds = None
                 if (
                     is_prefill
@@ -2818,10 +2817,13 @@ class ModelRunner:
                         "embedding_spans" in data
                         for data in batch.multimodal_data.values()
                     ):
-                        from atom.model_engine.multimodal import embed_multimodal_batch
+                        from atom.model_engine.multimodal_runtime import (
+                            embed_multimodal_batch,
+                        )
 
                         inputs_embeds = embed_multimodal_batch(
                             self.model,
+                            self.vision_embeddings,
                             input_ids,
                             batch,
                             self.device,

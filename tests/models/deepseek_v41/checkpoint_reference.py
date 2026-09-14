@@ -130,6 +130,14 @@ def checkpoint_reference(directory, config, max_length, *, vision=False):
             raise ValueError(f"Unloaded reference parameters: {set(params) - loaded}")
 
         @torch.inference_mode()
+        def embed_inputs(tokens, images=None):
+            hidden = source.embed(tokens)
+            if images is not None:
+                with torch.device(tokens.device):
+                    source.merge_image_embeddings(images, hidden)
+            return hidden
+
+        @torch.inference_mode()
         def forward(
             tokens,
             position,
@@ -139,13 +147,16 @@ def checkpoint_reference(directory, config, max_length, *, vision=False):
             logits_start=0,
             images=None,
             token_types=None,
+            inputs_embeds=None,
         ):
             # generate.py also installs this default device; upstream index
             # masks otherwise default to CPU.
             with torch.device(tokens.device):
-                hidden = source.embed(tokens)
-                if images is not None:
-                    source.merge_image_embeddings(images, hidden)
+                hidden = (
+                    embed_inputs(tokens, images)
+                    if inputs_embeds is None
+                    else inputs_embeds
+                )
                 image_mask = None if token_types is None else token_types >= 0
                 hidden = hidden.unsqueeze(2).repeat(1, 1, config.hc_mult, 1)
                 mix = reference.make_identity_pre_mix(hidden, config.hc_mult)
@@ -165,6 +176,7 @@ def checkpoint_reference(directory, config, max_length, *, vision=False):
                     source.norm(hidden[:, logits_start:]), full_logits=full_logits
                 )
 
+        forward.embed_inputs = embed_inputs
         yield forward
 
 

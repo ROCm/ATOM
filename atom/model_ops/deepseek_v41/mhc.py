@@ -4,8 +4,8 @@
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 
+from atom.model_ops.deepseek_v41.projections import hc_projection
 from atom.model_ops.sparse_attn_v4 import hc_split_sinkhorn
 
 
@@ -54,7 +54,7 @@ def predict_mixes(
         raise ValueError("mHC coefficients must retain their FP32 checkpoint dtype")
     flat = residual.flatten(-2).float()
     norm = torch.rsqrt(flat.square().mean(-1, keepdim=True) + norm_eps)
-    mixes = F.linear(flat, hc_fn) * norm
+    mixes = hc_projection(flat, hc_fn) * norm
     return hc_split_sinkhorn(
         mixes, hc_scale, hc_base, residual.shape[-2], sinkhorn_iters, sinkhorn_eps
     )

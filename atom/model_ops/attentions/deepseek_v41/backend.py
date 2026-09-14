@@ -168,9 +168,17 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         token_mask = np.ones(offset, dtype=np.bool_)
         for span in spans:
             data = getattr(batch, "multimodal_data", {}).get(span.request_id)
-            if data is not None and "token_types" in data:
-                types = data["token_types"][span.position : span.end]
-                token_mask[span.offset : span.offset + len(types)] = types == -1
+            if data is not None:
+                for start, count in data.get("embedding_spans", ()):
+                    first, end = max(start, span.position), min(start + count, span.end)
+                    if first < end:
+                        token_mask[
+                            span.offset
+                            + first
+                            - span.position : span.offset
+                            + end
+                            - span.position
+                        ] = False
         metadata.token_mask = token_mask
         metadata.image_mask = (
             torch.from_numpy(~token_mask).to(self.device).unsqueeze(0)

@@ -33,6 +33,7 @@ from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.engine_stats import EngineStats
+from atom.model_engine.multimodal import prefill_media_payload
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import (
     Sequence,
@@ -364,12 +365,19 @@ class ScheduledBatch:
         # Key into ModelRunner's stream pool for CU-masked disagg streams.
         # None means full-CU fallback (no mask).
         self.cu_stream_fraction = cu_stream_fraction
-        # Collect multimodal data from prefill sequences
+        # Explicit spans support arbitrary chunks. Retain the CPU payload on
+        # the request for retry, and omit pixels after workers acknowledge it.
         self.multimodal_data = {}
         for seq in seqs.values():
-            if getattr(seq, "multimodal_data", None) is not None:
-                self.multimodal_data[seq.id] = seq.multimodal_data
-                # Clear after first use to avoid re-sending on decode steps
+            data = getattr(seq, "multimodal_data", None)
+            if data is None or seq.type != SequenceType.PREFILL:
+                continue
+            if "embedding_spans" in data:
+                self.multimodal_data[seq.id] = prefill_media_payload(
+                    data, seq.cache_seed, cache_ready=seq.multimodal_cache_ready
+                )
+            else:
+                self.multimodal_data[seq.id] = data
                 seq.multimodal_data = None
         self.external_request_ids = [seq.external_request_id for seq in seqs.values()]
 
@@ -1013,6 +1021,11 @@ class Scheduler:
             )
         return len(stalled) + lease_reclaims
 
+    @staticmethod
+    def _requires_atomic_prefill(seq):
+        data = getattr(seq, "multimodal_data", None)
+        return data is not None and "embedding_spans" not in data
+
     def _unschedulable_reason(self, seq: Sequence) -> str | None:
         """Return a human-readable reason if `seq` is permanently unschedulable.
 
@@ -1050,10 +1063,8 @@ class Scheduler:
                 f"input tokens={num_tokens} > max_model_len={self.max_model_len}. "
                 f"Increase --max-model-len or shorten the prompt."
             )
-        # Multimodal prefills are never chunked (the vision embeddings cover the
-        # whole prompt), so for them the batched-token budget is a hard cap even
-        # when chunked prefill is on.
-        is_multimodal = getattr(seq, "multimodal_data", None) is not None
+        # Only processors with explicit spans and request leases can chunk.
+        is_multimodal = self._requires_atomic_prefill(seq)
         if (
             not self.enable_chunked_prefill or is_multimodal
         ) and num_tokens > self.max_num_batched_tokens:
@@ -1277,6 +1288,7 @@ class Scheduler:
             if unschedulable is not None:
                 seq.status = SequenceStatus.FINISHED
                 seq.leave_reason = f"unschedulable: {unschedulable}"
+                seq.multimodal_data = None
                 self._rejected.append(seq)
                 continue
 
@@ -1356,22 +1368,7 @@ class Scheduler:
             num_new_tokens = (
                 seq.num_tokens - num_cached_blocks * self.block_manager.hash_block_size
             )
-            # Vision embeddings are computed for the whole prompt in one shot
-            # and scattered onto the placeholder positions of the tokens in the
-            # batch, so a multimodal prefill must not be split: a partial chunk
-            # would either miss the placeholders entirely or land them at the
-            # wrong offsets. Take the prompt whole or wait for a step with
-            # enough budget.
-            #
-            # TODO: support chunked multimodal prefill. Needs the vision
-            # embeddings computed once and cached per request, then sliced by
-            # the chunk's token offset at scatter time (see the merge site in
-            # ModelRunner.run_model). Today the scheduler also clears
-            # `seq.multimodal_data` after the first batch, so later chunks would
-            # silently embed raw `<|media_pad|>` tokens into the KV cache. Until
-            # that lands, `max_num_batched_tokens` caps multimodal prompt length
-            # even with chunked prefill enabled.
-            atomic_prefill = getattr(seq, "multimodal_data", None) is not None
+            atomic_prefill = self._requires_atomic_prefill(seq)
             if (
                 not atomic_prefill
                 and self.enable_chunked_prefill
@@ -1849,6 +1846,7 @@ class Scheduler:
         has_inflight_load = bool(getattr(seq, "_counted_as_inflight_load", False))
         seq.status = SequenceStatus.FINISHED
         seq.leave_reason = "aborted"
+        seq.multimodal_data = None
         self._rejected.append(seq)
         if not has_inflight_load and self._connector_flag("is_offload"):
             # A lookup can pin CPU KV before HBM allocation succeeds. No load
@@ -2052,19 +2050,7 @@ class Scheduler:
         than one checkpoint interval.
         """
         bm = self.block_manager
-        # A multimodal prompt is prefilled whole -- chunked multimodal prefill is
-        # unsupported (see the `atomic_prefill` guard in `_schedule_prefills`), so
-        # it is either admitted entire or requeued entire. Landing it on a state
-        # checkpoint rung shortens it deterministically, and the post-alloc atomic
-        # re-assert then requeues it whole; the very next pass produces the same
-        # shortened chunk and requeues again -- a livelock with idle GPUs and
-        # head-of-line blocking. Skip the rung cut here: the checkpoint machinery
-        # keeps a checkpoint only where a forward ends exactly on a rung, so a
-        # whole prompt that ends off-grid simply keeps no mid-prompt checkpoint,
-        # which is correct for a single-shot prefill (there is no later chunk to
-        # resume from anyway). Forks do not arise on a fresh multimodal prompt
-        # (`state_fork_src < 0`), so the fork-vetting below is likewise moot.
-        if getattr(seq, "multimodal_data", None) is not None:
+        if self._requires_atomic_prefill(seq):
             return chunk
         target = bm.checkpoint_cut(seq, start, start + chunk)
         if target:
@@ -2510,6 +2496,11 @@ class Scheduler:
         # live seq.is_partial_prefill while this batch was in flight).
         pp_middle_chunk_ids: set[int] = set()
         running_by_id = {seq.id: seq for seq in self.running} if batch else {}
+        if batch is not None:
+            for request_id, data in getattr(batch, "multimodal_data", {}).items():
+                seq = running_by_id.get(request_id)
+                if seq is not None and "embedding_spans" in data:
+                    seq.multimodal_cache_ready = True
         num_prefill = int(getattr(batch, "total_seqs_num_prefill", 0))
         if self._connector_flag("is_offload") and num_prefill:
             for req_id in batch.req_ids[:num_prefill]:
@@ -2964,6 +2955,7 @@ class Scheduler:
     def _mark_finished(self, seq, reason, num_tokens):
         seq.num_tokens = num_tokens
         seq.leave_reason = reason
+        seq.multimodal_data = None
         seq.status = SequenceStatus.FINISHED
         self.total_finished_requests += 1
         self.total_prompt_tokens += int(seq.num_prompt_tokens)
