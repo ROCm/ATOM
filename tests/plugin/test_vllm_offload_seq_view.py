@@ -76,3 +76,32 @@ def test_drop_forgets_the_request():
     reg.get_or_create(_request("r1"))
     reg.drop("r1")
     assert reg.get("r1") is None and len(reg) == 0
+
+
+def test_preemption_forgets_placement_but_not_what_was_stored():
+    """vLLM reuses the same Request object, so the view has to be reset in place.
+
+    Preemption hands the blocks to somebody else without telling the connector,
+    and the save loop sizes its next store from exactly these two fields -- a
+    stale block table plus a stale frontier is another request's KV stored under
+    this request's token ids.
+    """
+    reg = SeqViewRegistry()
+    req = _request()
+    view = reg.get_or_create(req)
+    view.set_block_table([7, 8, 9])
+    view.set_num_cached_tokens(384)
+    view.offload_loaded_tokens = 256
+    view.offload_handoff_boundary_tokens = 256
+    view.prefix_hashes_published = True
+
+    view.reset_for_preemption()
+
+    assert view.block_table == []
+    assert view.num_cached_tokens == 0
+    assert view.offload_loaded_tokens == 0
+    assert view.offload_handoff_boundary_tokens == 0
+    assert view.prefix_hashes_published is False
+    # Same view: the request keeps its identity, so ATOM's scheduler must not
+    # see this as a recycled request id.
+    assert reg.get_or_create(req) is view

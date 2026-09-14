@@ -77,7 +77,10 @@ class _HFConfigView:
         return getattr(self._outer, name)
 
     def __repr__(self) -> str:
-        return f"_HFConfigView(inner={type(self._inner).__name__}, outer={type(self._outer).__name__})"
+        return (
+            f"_HFConfigView(inner={type(self._inner).__name__}, "
+            f"outer={type(self._outer).__name__})"
+        )
 
 
 class OffloadConfigShim:

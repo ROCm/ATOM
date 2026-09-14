@@ -72,6 +72,29 @@ class SeqView:
     def set_block_table(self, block_ids: list[int]) -> None:
         self.block_table = list(block_ids)
 
+    def reset_for_preemption(self) -> None:
+        """Forget everything placement-dependent; vLLM took the blocks back.
+
+        A preempted request keeps its identity -- vLLM re-schedules the same
+        ``Request`` object, so the registry hands back this same view -- but its
+        blocks have gone back to the pool and its computed prefix with them.
+        Every field reset here either names a block or counts tokens resident in
+        one, and offload reads all of them to size its next save; left alone,
+        the next step offers up another request's KV under this request's token
+        ids.
+
+        Deliberately NOT reset: anything recording what is already persisted.
+        LMCache keys chunks by token content rather than by placement, so a
+        chunk stored before the preemption is still a hit afterwards and must
+        not be stored twice.
+        """
+        self._num_cached_tokens = 0
+        self.block_table = []
+        self.offload_loaded_tokens = 0
+        self.offload_handoff_boundary_tokens = 0
+        self.prefix_hashes_published = False
+        self._load_operation = None
+
     def __repr__(self) -> str:
         return (
             f"SeqView(id={self.id!r}, prompt={self.num_prompt_tokens}, "
