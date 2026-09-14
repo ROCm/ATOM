@@ -231,7 +231,10 @@ EOF
     -v /data:/data
   )
   if [[ -d /shared_nfs ]]; then
-    docker_args+=(-v /shared_nfs:/shared_nfs:ro)
+    docker_args+=(-v /shared_nfs:/shared_nfs)
+  fi
+  if [[ -d /share_nfs/models ]]; then
+    docker_args+=(-v /share_nfs/models:/share_nfs/models)
   fi
 
   if [[ "${rank}" -eq 0 \

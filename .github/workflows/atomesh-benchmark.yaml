@@ -467,6 +467,9 @@ jobs:
           current_user="$(id -un 2>/dev/null || id -u)"
           log_root="${ATOMESH_LOG_ROOT//\$\{USER\}/${current_user}}"
           log_root="${log_root//\$USER/${current_user}}"
+          if [[ "$(hostname -s)" == "pit2-vm-amd-xl-02" ]]; then
+            log_root="/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG"
+          fi
           run_dir="${log_root%/}/rdma-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           mkdir -p "${run_dir}"
           chmod 0777 "${run_dir}"
@@ -1185,9 +1188,42 @@ jobs:
             fi
           done
 
-      - name: Print benchmark config
+      - name: Resolve machine-specific benchmark paths
+        id: machine-paths
         env:
           CELL_JSON: ${{ toJson(matrix) }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import socket
+          from pathlib import Path
+
+          cell = json.loads(os.environ["CELL_JSON"])
+          # The matrix is expanded on ubuntu-latest, before the submit machine is known.
+          if socket.gethostname().split(".", 1)[0] == "pit2-vm-amd-xl-02":
+              old_model_root = os.environ["ATOMESH_MODEL_ROOT"].rstrip("/")
+
+              def remap_model_paths(value):
+                  if isinstance(value, dict):
+                      return {key: remap_model_paths(item) for key, item in value.items()}
+                  if isinstance(value, list):
+                      return [remap_model_paths(item) for item in value]
+                  if isinstance(value, str) and (value == old_model_root or value.startswith(old_model_root + "/")):
+                      return "/share_nfs/models" + value[len(old_model_root):]
+                  return value
+
+              cell = remap_model_paths(cell)
+              cell["runner"]["log_root"] = "/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG"
+
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write(f"cell_json={json.dumps(cell, separators=(',', ':'))}\n")
+          PY
+
+      - name: Print benchmark config
+        env:
+          CELL_JSON: ${{ steps.machine-paths.outputs.cell_json }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -1245,7 +1281,7 @@ jobs:
           # existing release profile for both benchmark and eval services.
           ATOMESH_BUILD_MESH: ${{ matrix.benchmark.kind == 'aiperf_agentic' && 'true' || 'false' }}
           ATOMESH_MESH_BUILD_PROFILE: release
-          CELL_JSON: ${{ toJson(matrix) }}
+          CELL_JSON: ${{ steps.machine-paths.outputs.cell_json }}
           RESULT_DIR: atomesh-results
           SLURM_SUBMIT_RUNNER: ${{ matrix.runner.slurm_submit_runner }}
         run: |
