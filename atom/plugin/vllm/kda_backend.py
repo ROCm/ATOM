@@ -57,8 +57,28 @@ class AtomKimiK3KDAMetadataBuilder(KimiK3KDAMetadataBuilder):
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
             fast_build=fast_build,
         )
+        self._stage_packed_decode_query_start_loc(common_attn_metadata, metadata)
         self._adapt_full_graph_decode_metadata(common_attn_metadata, metadata)
         return metadata
+
+    def _stage_packed_decode_query_start_loc(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        metadata: KimiK3KDAMetadata,
+    ) -> None:
+        if metadata.num_decodes <= 0 or metadata.non_spec_query_start_loc is not None:
+            return
+
+        batch_size = int(common_attn_metadata.num_reqs)
+        query_start_loc_buf = self.non_spec_query_start_loc[: batch_size + 1]
+        torch.arange(
+            metadata.num_decodes + 1,
+            dtype=torch.int32,
+            device=query_start_loc_buf.device,
+            out=query_start_loc_buf[: metadata.num_decodes + 1],
+        )
+        query_start_loc_buf[metadata.num_decodes + 1 :].fill_(metadata.num_decodes)
+        metadata.non_spec_query_start_loc = query_start_loc_buf
 
     def _adapt_full_graph_decode_metadata(
         self,
@@ -81,8 +101,6 @@ class AtomKimiK3KDAMetadataBuilder(KimiK3KDAMetadataBuilder):
         query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
         real_decode_mask_cpu = query_lens_cpu > 0
         real_num_decodes = int(real_decode_mask_cpu.sum().item())
-        if real_num_decodes == metadata.num_decodes:
-            return
 
         batch_size = int(common_attn_metadata.num_reqs)
         if batch_size > self.decode_cudagraph_max_bs:
