@@ -545,7 +545,9 @@ def _build_minimax_m3_metadata(
         token_to_kv_pool=token_to_kv_pool,
         req_to_token_pool=req_to_token_pool,
         max_model_len=int(atom_config.max_model_len),
-        num_idx_heads=minimax_m3_num_idx_heads(hf_config),
+        num_idx_heads=minimax_m3_num_idx_heads(
+            hf_config, atom_config.tensor_parallel_size
+        ),
     )
 
 

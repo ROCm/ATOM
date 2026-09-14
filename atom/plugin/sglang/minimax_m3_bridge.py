@@ -41,20 +41,30 @@ def _m3_index_dim(config: Any) -> int:
     return int(index_dim)
 
 
-def minimax_m3_num_idx_heads(config: Any) -> int:
+def minimax_m3_num_idx_heads(config: Any, tp_size: int) -> int:
     """TP-local index heads -- the selector has one row per (index head, token).
 
     M3 ties the index head count to the KV head count, so this is the KV heads
-    this rank holds.
+    this rank holds. An sglang carrying the dp-attention split answers the
+    world size exactly, since attention's differs from the model's there;
+    without that module the caller's is the answer.
+
+    `tp_size` is the caller's rather than a literal 1, because a wrong count
+    here is not an error anywhere downstream: the row bounds come out the wrong
+    length, aiter's predicate declines them, and the Triton selector serves at
+    full correctness -- so nothing would ever report the fast path was lost.
     """
     heads = int(getattr(_text_config(config), "num_key_value_heads", 1))
     try:
         from sglang.srt.layers.dp_attention import get_attention_tp_size
-
-        tp_size = max(1, int(get_attention_tp_size()))
-    except Exception:
-        tp_size = 1
-    return max(1, heads // tp_size)
+    except ImportError:  # an sglang without the dp-attention split
+        pass
+    else:
+        # Only the import is guarded. This runs inside a forward, where the
+        # attention group is up -- unlike `_local_kv_heads`, which answers the
+        # same question while the memory pools are still being sized.
+        tp_size = get_attention_tp_size()
+    return max(1, heads // max(1, int(tp_size)))
 
 
 def _dtype_size(dtype: torch.dtype) -> int:
