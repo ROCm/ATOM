@@ -75,6 +75,7 @@ from atom.kv_transfer.offload.hybrid.dsv4.policy import (
 from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
     STATE_INDEX_CHANNEL,
     STATE_LOAD_VERDICT_TAG,
+    STATE_SOURCE_CHANNEL,
     KimiK3OffloadConnector,
     KimiK3OffloadScheduler,
     save_stall_seconds,
@@ -5642,8 +5643,14 @@ def test_the_two_state_channels_are_routed_and_drained():
         (STATE_INDEX_CHANNEL, 111, True),
         (STATE_INDEX_CHANNEL, 222, False),
     ):
-        assert s.connector_completion(
-            SimpleNamespace(channel=channel, operation_id=op, succeeded=ok)
+        # `None`, not `True`: handled, but a store-index milestone is not a
+        # terminal save, and its id is a hash -- feeding it to the scheduler's
+        # `finished_saving` would name a request that does not exist.
+        assert (
+            s.connector_completion(
+                SimpleNamespace(channel=channel, operation_id=op, succeeded=ok)
+            )
+            is None
         )
 
     indexed, failed = s.take_state_reports()
@@ -6310,7 +6317,7 @@ class _FakeTier:
         self.ok = ok
         self.calls: list = []
 
-    def load_state(self, h, slot) -> bool:
+    def load_state(self, h, slot, req_id="r") -> bool:
         self.calls.append((h, slot))
         if isinstance(self.ok, Exception):
             raise self.ok
@@ -6414,10 +6421,10 @@ def test_only_a_state_get_miss_is_advertised_to_the_engine():
         assert (
             s.connector_completion(
                 ConnectorCompletion(
-                    STATE_INDEX_CHANNEL, (STATE_LOAD_VERDICT_TAG, h), ok
+                    STATE_INDEX_CHANNEL, (STATE_LOAD_VERDICT_TAG, h, "req-a"), ok
                 )
             )
-            is True
+            is None
         )
     assert s.take_missed_state_hashes() == {222}
     assert s.take_missed_state_hashes() == set()
@@ -6600,13 +6607,46 @@ class TestStateStoreCompletionsCarryAGeneration:
             ConnectorCompletion(STATE_INDEX_CHANNEL, second, True)
         }
 
+    def test_no_state_milestone_is_reported_as_a_terminal_save(self):
+        """`process_completions` reads the callback's return value as a
+        three-state contract: `False` = not mine, `True` = handled AND a
+        terminal save, `None` = handled non-terminal milestone. Every state-tier
+        channel carries a hash or a store id, never a request id, so every one
+        of them is `None`. Returning `True` put those ids into
+        `finished_saving`, where the scheduler looked each up as a request and
+        found nothing -- silent only because request ids happen to be strings.
+        """
+        s = _k3_scheduler()
+        s._state_source_released = set()
+        out = KVConnectorOutput(
+            connector_completions={
+                ConnectorCompletion(
+                    STATE_INDEX_CHANNEL, (STATE_LOAD_VERDICT_TAG, 4242, "r1"), False
+                ),
+                ConnectorCompletion(
+                    STATE_INDEX_CHANNEL, StateStoreOperationId(4242, 7), True
+                ),
+                ConnectorCompletion(
+                    STATE_SOURCE_CHANNEL, StateStoreOperationId(4242, 7), True
+                ),
+            }
+        )
+        result = s.process_completions(out)
+
+        assert result.finished_saving == set()
+        # ...yet every one of them was handled, not warned past as unowned.
+        assert s.take_missed_state_hashes() == {4242}
+        assert s.take_state_reports()[0] == {StateStoreOperationId(4242, 7)}
+        assert s.take_state_source_releases() == {StateStoreOperationId(4242, 7)}
+
     def test_the_scheduler_half_keeps_the_operation_whole(self):
         """`connector_completion` used to narrow the id to `int`, which would
         undo the generation on the way to `settle_state_store`."""
         s = _k3_scheduler()
         op = StateStoreOperationId(4242, 7)
-        assert s.connector_completion(
-            ConnectorCompletion(STATE_INDEX_CHANNEL, op, True)
+        assert (
+            s.connector_completion(ConnectorCompletion(STATE_INDEX_CHANNEL, op, True))
+            is None
         )
         indexed, failed = s.take_state_reports()
         assert indexed == {op}
@@ -6655,9 +6695,9 @@ class TestStateLoadsNeverQueueBehindStores:
         try:
             for gen in range(4):
                 tier.submit_store(StateStoreOperationId(gen, gen + 1), (0,))
-            assert tier.load_state(77, 0) is True
+            assert tier.load_state(77, 0, "r0") is True
             assert codec.loaded.is_set(), "the load waited behind the store backlog"
-            assert tier.take_hash_verdicts() == {77: True}
+            assert tier.take_hash_verdicts() == {(77, "r0"): True}
         finally:
             codec.gate.set()
             tier.shutdown()
@@ -6673,8 +6713,8 @@ class TestStateLoadsNeverQueueBehindStores:
 
         tier = self._tier(_Missing())
         try:
-            assert tier.load_state(77, 0) is False
-            assert tier.take_hash_verdicts() == {77: False}
+            assert tier.load_state(77, 0, "r0") is False
+            assert tier.take_hash_verdicts() == {(77, "r0"): False}
             assert tier.take_hash_verdicts() == {}
         finally:
             tier.shutdown()
