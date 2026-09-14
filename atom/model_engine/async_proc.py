@@ -27,7 +27,7 @@ import zmq
 import zmq.asyncio
 from aiter.dist.shm_broadcast import MessageQueue
 
-from atom.kv_transfer.disaggregation import KVOutputAggregator
+from atom.kv_transfer.disaggregation import KVConnectorOutput, KVOutputAggregator
 from atom.utils import (
     get_mp_context,
     get_open_zmq_ipc_path,
@@ -303,6 +303,7 @@ class AsyncIOProcManager:
         self.kv_outputs_queues: list[queue.Queue] = [
             queue.Queue() for _ in range(proc_num)
         ]
+        self._pending_kv_outputs: list[KVConnectorOutput] | None = None
         self.kv_output_threads: list[threading.Thread] = []
 
         for i in range(proc_num):
@@ -437,7 +438,9 @@ class AsyncIOProcManager:
         """RPC call with KV output aggregation across all workers.
 
         Broadcasts the function call to all workers, collects their
-        KV outputs, and returns the aggregated result.
+        KV outputs, and returns the aggregated result. After a timeout,
+        the next call resumes collecting the outstanding replies instead
+        of broadcasting another call.
 
         Args:
             func_name: Method name to invoke on each worker's runner.
@@ -450,14 +453,18 @@ class AsyncIOProcManager:
             self.kv_output_aggregator = KVOutputAggregator(world_size=self.proc_num)
 
         logger.debug(f"{self.label}: call_func_with_aggregation {func_name} {args}")
-        msg = (func_name, *args)
-        self.rpc_broadcast_mq.enqueue(msg)
+        worker_outputs = self._pending_kv_outputs
+        if worker_outputs is None:
+            msg = (func_name, *args)
+            self.rpc_broadcast_mq.enqueue(msg)
+            worker_outputs = self._pending_kv_outputs = []
 
-        # Collect KV outputs from all workers
-        worker_outputs = []
-        for i, output_queue in enumerate(self.kv_outputs_queues):
+        # Worker reports drain completion state, so a timeout cannot discard
+        # earlier replies. Keep the collected prefix in rank order and resume
+        # at the missing rank before issuing another poll to any worker.
+        for i in range(len(worker_outputs), len(self.kv_outputs_queues)):
             try:
-                output = output_queue.get(timeout=timeout)
+                output = self.kv_outputs_queues[i].get(timeout=timeout)
                 worker_outputs.append(output)
             except queue.Empty:
                 logger.error(
@@ -466,9 +473,11 @@ class AsyncIOProcManager:
                 return None
 
         if not worker_outputs:
+            self._pending_kv_outputs = None
             return None
 
         kv_output = self.kv_output_aggregator.aggregate(worker_outputs=worker_outputs)
+        self._pending_kv_outputs = None
         logger.debug(f"Aggregated KV output: {kv_output}")
         return kv_output
 
