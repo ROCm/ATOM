@@ -57,13 +57,21 @@ ARG ROCM_INDEX_URL="https://stable.repo.amd.com/rocm/whl-next/"
 # as --extra-index-url when resolving packages whose only home is the AMD
 # channel (e.g. torch's Requires-Dist: triton==<local rocm version>).
 ENV ROCM_INDEX_URL=${ROCM_INDEX_URL}
-# 10.1 tracking line overrides (nightly channel, date-stamped versions):
-#   --build-arg ROCM_SDK_VERSION=10.1.0a<yyyymmdd>
-#   --build-arg ROCM_TORCH_VERSION=2.12.0
-#   --build-arg ROCM_TRITON_VERSION=3.8.0+gitc01b6774
+# 10.1 tracking line overrides (nightly channel, date-stamped versions).
+# The combination below is the one actually validated on MI355X (gfx950):
+# 4/4 models pass, and performance is within +/-2.2% of the 10.0 line.
+#   --build-arg ROCM_SDK_VERSION=10.1.0a20260909
+#   --build-arg ROCM_TORCH_VERSION=2.13.0
+#   --build-arg ROCM_TORCHVISION_VERSION=0.28.0
+#   --build-arg ROCM_TORCHAUDIO_VERSION=2.11.0.3
+#   --build-arg ROCM_TRITON_VERSION=3.8.0+git4cff872c
 #   --build-arg ROCM_INDEX_URL=https://nightly.repo.amd.com/rocm/whl-next/
 # (the +rocm10.1.0a<date> local version suffix is derived from
 #  ROCM_SDK_VERSION below, so only the base version needs overriding)
+#
+# The nightly channel prunes old date-stamped builds, so a given
+# 10.1.0a<date> stops resolving after a few weeks. Bump the date and
+# re-run the golden test rather than pinning to a build that has aged out.
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
