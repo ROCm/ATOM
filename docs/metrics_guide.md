@@ -21,6 +21,14 @@ engine side: the metric definitions and the registration interfaces.
 that path issues an engine RPC, synchronizes a device, or consumes an
 observation — a scrape is a read of already-materialized state.
 
+The API captures the live stream-silence gauge on its event loop, then awaits
+on-demand rendering in a background thread. Concurrent scrapes share the one
+in-flight render; cancellation of an HTTP request does not cancel that work.
+Shutdown drains it. Completed responses are not cached, so a later scrape
+observes current API instruments without waiting for a periodic text refresh.
+The rendering thread still shares CPU and the GIL with the API loop; collectors
+must remain bounded. Engine snapshots retain their existing refresh interval.
+
 ```
                        API process                      │  Engine process(es)
                                                         │
@@ -30,7 +38,8 @@ observation — a scrape is a read of already-materialized state.
                     exporter.registry ◄─────────┐       │
                            ▲                    │       │
                            │                    │       │
-  GET /metrics ─► exporter.render()             │       │
+  GET /metrics ─► render_async() ─► render()       │     │
+                  API loop         thread         │     │
                            │                    │       │
                            ▼            _SnapshotCollector       Scheduler ─┐
                     pinned snapshot ────────────┘       │        GPU events─┤
@@ -64,8 +73,10 @@ Used by `collect_scheduler_metrics`, `collect_gpu_metrics`,
 The snapshot is refreshed by `_refresh_metrics_once()` in `api_server.py` once
 per second (`_METRICS_REFRESH_INTERVAL_SECONDS = 1.0`), independently of scrapes.
 `render()` pins one snapshot revision in a `ContextVar` for the whole response,
-so every collector in a single scrape sees the same revision even if the refresh
-loop fires concurrently.
+so every snapshot collector in a single scrape sees the same revision even if
+the refresh loop fires concurrently. Published snapshots are private and never
+mutated; copying and rendering happen outside the publication lock. API
+instruments retain their own synchronization and are sampled during collection.
 
 **Histogram events are never lost to the snapshot interval** — the producer
 observes at the event; the snapshot only transports accumulated buckets.
@@ -207,8 +218,9 @@ interpreter keeps its own counters.
 > `gc.get_freeze_count()` and the tracked-set size are deliberately **not**
 > exported: the former walks the permanent generation (11.9 ms at 430k frozen
 > objects, against 0.5 µs for `gc.get_stats()`) for a number that changes twice
-> in a process's life, and rendering runs inline on the loop that delivers every
-> stream. Both live in `/debug/gc_census`, which is asked for rather than scraped.
+> in a process's life. Even in a rendering thread, that work competes with SSE
+> delivery for CPU and the GIL. Both live in `/debug/gc_census`, which is asked
+> for rather than scraped.
 
 ---
 
@@ -320,6 +332,8 @@ for collect in (
   RPCs, I/O or GPU synchronization. The registry uses these names to reject
   collisions — including generated series such as `_total`, `_bucket`, `_count`
   and `_sum`.
+- Collectors run in a rendering thread. Read only their snapshot or synchronized
+  instruments; capture event-loop-owned state on the API loop before dispatch.
 - `collect(snapshot)` may only **read**. It must not mutate the shared snapshot,
   re-observe a value, or reset a counter.
 - Keep the existing zero-vs-missing convention: a field absent from an older

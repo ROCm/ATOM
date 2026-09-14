@@ -1614,6 +1614,7 @@ async def lifespan(app: FastAPI):
         # shutdown the thing that cannot be stopped.
         await asyncio.gather(*_background_tasks, return_exceptions=True)
         _background_tasks.clear()
+        await _metrics_exporter.wait_for_render()
         logger.info("Server shutting down, releasing resources...")
         if engine is not None:
             engine.close()
@@ -2693,7 +2694,7 @@ async def health():
 async def metrics():
     """Expose cached standalone-engine metrics in Prometheus text format."""
     return Response(
-        content=_metrics_exporter.render(),
+        content=await _metrics_exporter.render_async(),
         headers={"Content-Type": _metrics_exporter.content_type},
     )
 

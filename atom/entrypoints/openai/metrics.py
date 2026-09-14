@@ -6,6 +6,7 @@ request timing instruments and the new scheduler/worker snapshot collectors.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import gc
 import threading
@@ -90,7 +91,7 @@ class _AtomMetricsCollector:
             "chunk. Zero when none is waiting. Non-zero and growing is a "
             "response that has stopped delivering while the client waits.",
         )
-        metric.add_metric([], 0.0 if describe else longest_silence_seconds())
+        metric.add_metric([], 0.0 if describe else self._exporter.stream_silence())
         yield metric
 
         gauges = (
@@ -439,10 +440,10 @@ def _gc_metrics(
     startup means the collector is finding nothing; a rising line means the
     process builds reference cycles and raising thresholds has a price.
 
-    O(1) per source is a bound, not a preference: rendering runs inline on the
-    loop that delivers every stream, so a scrape pauses all of them. It cost a
-    metric. `atom:gc_frozen_objects` came from `gc.get_freeze_count()`, which
-    walks the permanent generation -- 11.9 ms at 430k frozen against 0.5 us for
+    Keep each source O(1): rendering runs in a thread but still competes with
+    SSE delivery for CPU and the GIL. `atom:gc_frozen_objects` came from
+    `gc.get_freeze_count()`, which walks the permanent generation -- 11.9 ms
+    at 430k frozen against 0.5 us for
     `gc.get_stats()`, i.e. the cost freezing exists to remove -- for a number
     that changes twice in a process's life. It and the tracked-set size both
     live in `/debug/gc_census` now, which is asked for rather than scraped.
@@ -497,6 +498,12 @@ class AtomMetricsExporter:
         self._render_snapshot: ContextVar[SnapshotState | None] = ContextVar(
             "metrics_render_snapshot", default=None
         )
+        self._render_silence: ContextVar[float | None] = ContextVar(
+            "metrics_render_silence", default=None
+        )
+        # Owned by the API event loop. Share only in-flight work, never a
+        # completed response: the next scrape must observe fresh API metrics.
+        self._render_task: asyncio.Task[bytes] | None = None
         self.registry = CollectorRegistry(auto_describe=False)
         self.registry.register(_AtomMetricsCollector(self))
 
@@ -512,8 +519,10 @@ class AtomMetricsExporter:
         self.registry.register(_SnapshotCollector(self, collect))
 
     def update(self, snapshot: dict[str, Any]) -> None:
+        snapshot = copy.deepcopy(snapshot)
         with self._lock:
-            self._snapshot = copy.deepcopy(snapshot)
+            # Published snapshots are replaced, never mutated or exposed.
+            self._snapshot = snapshot
             self._last_refresh = time.time()
 
     def record_refresh_error(self) -> None:
@@ -525,17 +534,55 @@ class AtomMetricsExporter:
         if pinned is not None:
             return pinned
         with self._lock:
-            return (
-                copy.deepcopy(self._snapshot),
-                self._refresh_errors,
-                self._last_refresh,
-            )
+            snapshot = self._snapshot
+            refresh_errors = self._refresh_errors
+            last_refresh = self._last_refresh
+        # A renderer must not hold up the API loop's next update while copying
+        # the per-rank histograms. The captured snapshot is immutable here.
+        return copy.deepcopy(snapshot), refresh_errors, last_refresh
 
-    def render(self) -> bytes:
+    def stream_silence(self) -> float:
+        captured = self._render_silence.get()
+        return longest_silence_seconds() if captured is None else captured
+
+    def render(self, *, stream_silence: float | None = None) -> bytes:
         # All component collectors see the same revision, even if refresh runs
         # concurrently. Context-local state isolates concurrent/nested scrapes.
         token = self._render_snapshot.set(self.read())
+        silence_token = self._render_silence.set(stream_silence)
         try:
             return generate_latest(self.registry)
         finally:
+            self._render_silence.reset(silence_token)
             self._render_snapshot.reset(token)
+
+    async def render_async(self) -> bytes:
+        """Render on demand off the API loop, coalescing concurrent scrapes."""
+        task = self._render_task
+        if task is None or task.done():
+            # _WAITING_SINCE belongs to the SSE event loop. Read it before
+            # handing serialization to a thread; registry instruments have
+            # their own synchronization and are collected in that thread.
+            silence = longest_silence_seconds()
+            task = asyncio.create_task(
+                asyncio.to_thread(self.render, stream_silence=silence),
+                name="metrics_render",
+            )
+            self._render_task = task
+            task.add_done_callback(self._render_finished)
+        # Cancelling an HTTP waiter cannot stop the thread. Keep tracking its
+        # task so another scrape shares it instead of starting more work.
+        return await asyncio.shield(task)
+
+    def _render_finished(self, task: asyncio.Task[bytes]) -> None:
+        if self._render_task is task:
+            self._render_task = None
+        if not task.cancelled():
+            task.exception()  # Retrieve failures even if every client left.
+
+    async def wait_for_render(self) -> None:
+        """Drain in-flight rendering during API shutdown without blocking it."""
+        if self._render_task is not None:
+            await asyncio.gather(
+                asyncio.shield(self._render_task), return_exceptions=True
+            )

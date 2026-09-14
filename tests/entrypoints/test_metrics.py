@@ -3,15 +3,16 @@
 
 """What `/metrics` may cost, which here is a correctness property.
 
-Rendering runs inline on the loop that delivers every open SSE stream, so a
-metric whose source walks the heap turns the scrape interval into a periodic
-inter-token latency spike. These pin the bound, not any value: a slow source is
-invisible until someone profiles a scrape.
+Rendering runs in a thread, but still shares CPU and the GIL with SSE delivery.
+Collectors must stay bounded, and their event-loop state must be captured
+before rendering. Concurrent or cancelled scrapes must not multiply the work.
 """
 
 from __future__ import annotations
 
+import asyncio
 import gc
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 
@@ -257,3 +258,187 @@ def test_failed_scrape_releases_its_snapshot_context():
         exporter.render()
     assert exporter.read()[0] == {"fail": False, "revision": 2}
     assert _samples(exporter.render())[("test:revision", ())] == 2
+
+
+def test_async_scrapes_keep_live_state_on_loop_and_do_not_cache_responses(monkeypatch):
+    exporter, requests, streams = create_metrics_exporter()
+    owner = threading.get_ident()
+    silence = 1.25
+    render_threads = []
+
+    def live_silence():
+        assert threading.get_ident() == owner
+        return silence
+
+    def thread_probe(snapshot):
+        if snapshot is not None:
+            render_threads.append(threading.get_ident())
+        return []
+
+    monkeypatch.setattr(
+        "atom.entrypoints.openai.metrics.longest_silence_seconds", live_silence
+    )
+    exporter.register_snapshot_collector(thread_probe)
+    exporter.update({"enabled": True, "requests_running": 3})
+    requests.observe_time_to_first_token(0.5, True)
+    streams.observe_inter_token_latency(0.020, 4)
+
+    def stable(exposition):
+        return {
+            key: value
+            for key, value in _samples(exposition).items()
+            if not key[0].startswith("atom:gc_")
+        }
+
+    expected = stable(exporter.render())
+    render_threads.clear()
+
+    async def run():
+        nonlocal silence
+        assert stable(await exporter.render_async()) == expected
+        # No sleep or refresh tick: the next GET must see new API samples.
+        requests.observe_time_to_first_token(0.25, True)
+        streams.observe_inter_token_latency(0.010, 2)
+        silence = 0.0
+        result = _samples(await exporter.render_async())
+        assert result[("atom:stream_longest_silence_seconds", ())] == 0
+        assert result[("atom:inter_token_latency_seconds_count", ())] == 6
+        assert (
+            result[("atom:time_to_first_token_seconds_count", (("streaming", "true"),))]
+            == 2
+        )
+        await exporter.wait_for_render()
+
+    asyncio.run(run())
+    assert len(render_threads) == 2
+    assert all(worker != owner for worker in render_threads)
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_cancelled_scrapes_share_one_render_and_shutdown_drains_it(monkeypatch, fail):
+    exporter = AtomMetricsExporter()
+    entered, resume = Event(), Event()
+    calls = []
+    original = exporter.render
+
+    def blocked_render(**kwargs):
+        calls.append(1)
+        entered.set()
+        assert resume.wait(5), "API loop did not resume while rendering"
+        if fail:
+            raise RuntimeError("render failed")
+        return original(**kwargs)
+
+    monkeypatch.setattr(exporter, "render", blocked_render)
+
+    async def run():
+        first = asyncio.create_task(exporter.render_async())
+        try:
+            # Yield the actual event loop while the worker is blocked.
+            async def wait_for_worker():
+                while not entered.is_set():
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(wait_for_worker(), 3)
+            peers = [asyncio.create_task(exporter.render_async()) for _ in range(8)]
+            await asyncio.sleep(0)
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            # Even when all current HTTP waiters disconnect, a later one must
+            # join the running thread rather than launch a second render.
+            for peer in peers:
+                peer.cancel()
+            await asyncio.gather(*peers, return_exceptions=True)
+            remaining = asyncio.create_task(exporter.render_async())
+            drain = asyncio.create_task(exporter.wait_for_render())
+            await asyncio.sleep(0)
+            assert not drain.done()
+            assert calls == [1]
+        finally:
+            resume.set()
+        if fail:
+            with pytest.raises(RuntimeError, match="render failed"):
+                await remaining
+        else:
+            assert b"atom:metrics_snapshot_available" in await remaining
+        await drain
+        monkeypatch.setattr(exporter, "render", original)
+        assert b"atom:metrics_snapshot_available" in await exporter.render_async()
+
+    asyncio.run(run())
+
+
+def test_failed_render_after_all_clients_disconnect_is_retrieved(monkeypatch):
+    exporter = AtomMetricsExporter()
+    entered, resume = Event(), Event()
+
+    def failed_render(**kwargs):
+        entered.set()
+        assert resume.wait(5)
+        raise RuntimeError("client already gone")
+
+    monkeypatch.setattr(exporter, "render", failed_render)
+
+    async def run():
+        failures = []
+        asyncio.get_running_loop().set_exception_handler(
+            lambda loop, context: failures.append(context)
+        )
+        waiter = asyncio.create_task(exporter.render_async())
+        try:
+
+            async def wait_for_worker():
+                while not entered.is_set():
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(wait_for_worker(), 3)
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+        finally:
+            resume.set()
+
+        async def wait_for_release():
+            while exporter._render_task is not None:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_release(), 3)
+        gc.collect()
+        assert failures == []
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("operation", ["read", "update"])
+def test_snapshot_copy_does_not_hold_publication_lock(monkeypatch, operation):
+    import copy
+
+    exporter = AtomMetricsExporter()
+    exporter.update({"revision": 1})
+    entered, resume = Event(), Event()
+    original = copy.deepcopy
+
+    def blocked_copy(value):
+        entered.set()
+        assert resume.wait(5), "snapshot copy held the publication lock"
+        return original(value)
+
+    monkeypatch.setattr("atom.entrypoints.openai.metrics.copy.deepcopy", blocked_copy)
+    with ThreadPoolExecutor(2) as pool:
+        operation_future = pool.submit(
+            exporter.read
+            if operation == "read"
+            else lambda: exporter.update({"revision": 2})
+        )
+        try:
+            assert entered.wait(3)
+            # Both update and error recording acquire the publication lock.
+            pool.submit(exporter.record_refresh_error).result(timeout=2)
+        finally:
+            resume.set()
+        result = operation_future.result(timeout=3)
+    monkeypatch.setattr("atom.entrypoints.openai.metrics.copy.deepcopy", original)
+    if operation == "read":
+        assert result == ({"revision": 1}, 0, exporter.read()[2])
+    assert exporter.read()[1] == 1

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 
 import pytest
 from prometheus_client.parser import text_string_to_metric_families
@@ -12,6 +13,50 @@ from atom.entrypoints.openai.request_timing import (
     record_nonstream_first_token,
 )
 from atom.entrypoints.openai.streaming_dispatch import longest_silence_seconds
+
+
+def test_metrics_endpoint_allows_sse_delivery_while_rendering(monkeypatch):
+    exporter, _, _ = create_metrics_exporter()
+    entered, resume = threading.Event(), threading.Event()
+    owner = threading.get_ident()
+    original = exporter.render
+
+    def blocked_render(**kwargs):
+        assert threading.get_ident() != owner
+        entered.set()
+        assert resume.wait(5), "metrics rendering blocked SSE delivery"
+        return original(**kwargs)
+
+    monkeypatch.setattr(exporter, "render", blocked_render)
+    monkeypatch.setattr(api_server, "_metrics_exporter", exporter)
+
+    async def run():
+        scrape = asyncio.create_task(api_server.metrics())
+        try:
+
+            async def wait_for_worker():
+                while not entered.is_set():
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(wait_for_worker(), 3)
+
+            async def source():
+                yield _sse({"choices": [{"delta": {"content": "hello"}}]})
+                await asyncio.sleep(0)
+                yield "data: [DONE]\n\n"
+
+            frames = [
+                chunk async for chunk in api_server._client_stream(source(), "req")
+            ]
+            assert frames and not scrape.done()
+        finally:
+            resume.set()
+        response = await scrape
+        assert response.status_code == 200
+        assert response.headers["content-type"] == exporter.content_type
+        assert b"atom:stream_longest_silence_seconds" in response.body
+
+    asyncio.run(run())
 
 
 def _sse(payload, newline="\n"):
