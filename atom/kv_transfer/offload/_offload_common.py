@@ -479,6 +479,10 @@ class OffloadSchedulerMixin(ABC):
         self.total_saved_tokens = 0
         self._load_inflight_tokens: dict[object, int] = {}
         self._save_inflight_tokens: dict[object, int] = {}
+        # req_id -> the sequence whose external-tier load failed. One
+        # external-tier attempt per request; see `_repeat_load_suppressed`.
+        self._load_failed_seqs: dict[str, object] = {}
+        self.total_suppressed_load_retries = 0
         # Early block-release observability. Populated by layouts that support
         # exact source-block leases; unsupported layouts leave these at 0.
         self.total_early_released_blocks = 0  # freed at request-finish, not save-gated
@@ -633,6 +637,59 @@ class OffloadSchedulerMixin(ABC):
     def _chunk_floor(self, tokens: int) -> int:
         chunk = int(self.chunk_size or 256)
         return (max(0, int(tokens)) // chunk) * chunk
+
+    def _loadable_hit(self, hit: int, num_prompt: int) -> int:
+        """Turn a lookup hit into a length the external tier can actually serve.
+
+        Two steps, in this order:
+
+        * A hit covering the whole prompt leaves nothing to compute, so step
+          back one token.
+        * Floor to a chunk. `retrieve` resolves the tier at chunk granularity,
+          so a `hit` that is not a chunk multiple names tokens the tier does
+          not hold and the load's `ret_mask[hbm:lmc].all()` check can never
+          pass. The decrement above is exactly how that happens in practice:
+          a prompt whose length is a multiple of the chunk size lands on a
+          boundary and stepping back one token walks off it -- which is why the
+          floor must come second. Flooring costs at most one chunk of
+          re-prefill and makes the spec satisfiable; without it such a request
+          can never load, only fail.
+        """
+
+        hit = int(hit)
+        if hit == int(num_prompt):
+            hit -= 1
+        return self._chunk_floor(hit)
+
+    def _repeat_load_suppressed(self, seq, sid: str) -> bool:
+        """True once this request has spent its one external-tier attempt.
+
+        Asking again repeats the same lookup against the same tier state, which
+        is how a single failure becomes a permanent one: `load_failed` clears
+        the pending load and the lookup memo, so the next scheduler pass hits,
+        parks the request in WAITING_FOR_REMOTE_KVS again, and fails again --
+        forever, holding the request's KV blocks and its concurrency slot the
+        whole time. Prefilling normally instead is exactly what would have
+        happened with no external tier at all.
+        """
+
+        if self._load_failed_seqs.get(sid) is seq:
+            self.total_suppressed_load_retries += 1
+            return True
+        return False
+
+    def _record_failed_load_attempt(self, sid: str) -> None:
+        """Spend the attempt against the sequence that actually suffered it."""
+
+        failed_seq = self._load_lifecycles.get(sid)
+        if failed_seq is not None:
+            self._load_failed_seqs[sid] = failed_seq
+
+    def _release_failed_load_attempt(self, sid: str, seq) -> None:
+        """Drop the mark when its sequence is done with the request ID."""
+
+        if self._load_failed_seqs.get(sid) is seq:
+            self._load_failed_seqs.pop(sid, None)
 
     def _lmcache_hit_save_floor(self, load_spec) -> int:
         if load_spec is None:

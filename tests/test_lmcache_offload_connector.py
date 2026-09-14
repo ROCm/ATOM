@@ -174,6 +174,8 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched._sidecar_hash_cache = {}
     sched._load_inflight_tokens = {}
     sched._save_inflight_tokens = {}
+    sched._load_failed_seqs = {}
+    sched.total_suppressed_load_retries = 0
     sched.total_load_requests = 0
     sched.total_loaded_tokens = 0
     sched.total_load_failures = 0
@@ -3657,7 +3659,14 @@ def test_sidecar_chunk_cut_preserves_earlier_load_handoff_cap():
     assert sched.adjust_prefill_chunk_after_alloc(seq, 16_000) == 4096
 
 
-def test_full_prompt_hit_is_clamped_before_load_spec():
+def test_full_prompt_hit_is_clamped_and_floored_before_load_spec():
+    # A full-prompt hit is decremented so something is left to compute, and
+    # then floored back onto a chunk boundary. Both steps are load-bearing:
+    # LMCache resolves at chunk granularity, so the bare decrement (7 here,
+    # 32767 on GLM-5.2 with chunk 64) names tokens the tier does not hold and
+    # the load can only ever fail -- which parks the request in
+    # WAITING_FOR_REMOTE_KVS and, since a failed load used to leave no record,
+    # forever. chunk_size is 4, so 8 -> 7 -> 4.
     sched = _scheduler()
     sched._lookup_client = _LookupClient(hit=8)
     seq = SimpleNamespace(
@@ -3669,9 +3678,35 @@ def test_full_prompt_hit_is_clamped_before_load_spec():
 
     need, should_park = sched.get_num_new_matched_tokens(seq)
 
-    assert need == 7
+    assert need == 4
     assert should_park is True
-    assert sched._load_specs[str(seq.id)].lmcache_cached_tokens == 7
+    assert sched._load_specs[str(seq.id)].lmcache_cached_tokens == 4
+
+
+def test_dsv4_failed_load_is_not_retried_for_the_same_request():
+    # Same one-attempt rule as the dense layout: without it, `load_failed`
+    # clears the pending load and the lookup memo, so the next scheduler pass
+    # hits, parks, and fails again -- holding the request's KV blocks and its
+    # concurrency slot for the life of the benchmark.
+    sched = _scheduler()
+    sched._lookup_client = _LookupClient(hit=6)
+    seq = SimpleNamespace(
+        id=125,
+        num_prompt_tokens=8,
+        token_ids=list(range(8)),
+        num_cached_tokens=0,
+        has_per_req_cache=False,
+    )
+
+    assert sched.get_num_new_matched_tokens(seq) == (4, True)
+    assert sched.load_failed("125") is True
+    assert sched._load_failed_seqs == {"125": seq}
+
+    assert sched.get_num_new_matched_tokens(seq) == (0, False)
+    assert sched.total_suppressed_load_retries == 1
+
+    sched.request_finished(seq)
+    assert sched._load_failed_seqs == {}
 
 
 def test_lookup_miss_is_forwarded_for_worker_unpin():

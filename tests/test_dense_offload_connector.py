@@ -740,3 +740,109 @@ def test_dense_worker_rejects_non_positive_pool_width(monkeypatch, var):
     monkeypatch.setenv(var, "0")
     with pytest.raises(ValueError, match="worker count must be positive"):
         DenseOffloadConnector(_config())
+
+
+class _StubLookupClient:
+    """Lookup client that always reports the same hit length."""
+
+    def __init__(self, hit):
+        self.hit = hit
+        self.calls = 0
+        self.cleared = []
+
+    def lookup(self, token_ids, lookup_id):
+        self.calls += 1
+        return self.hit
+
+    def clear_lookup_status(self, lookup_id):
+        self.cleared.append(lookup_id)
+
+
+def _lookup_scheduler(monkeypatch, hit, *, role="offload"):
+    sched = _scheduler(monkeypatch, role)
+    sched._lookup_client = _StubLookupClient(hit)
+    sched._min_load_tokens = 0  # these prompts are far below the 8192 default
+    return sched
+
+
+def _dispatch_and_fail_load(sched, seq):
+    """Run the alloc + metadata step, then fail the load it dispatched.
+
+    The metadata build is what releases the lookup memo, so a later pass is a
+    fresh lookup rather than the "older lifecycle still owns the pin" deferral.
+    """
+
+    sched.update_state_after_alloc(seq)
+    meta = sched.build_connector_meta()
+    (load,) = [req for req in meta.requests if req.load_spec is not None]
+    assert sched.load_failed(load.load_operation) is True
+
+
+def test_dense_full_prompt_hit_is_floored_to_a_loadable_chunk(monkeypatch):
+    # A hit covering the whole prompt is decremented so something is left to
+    # compute. With a prompt length that is an exact multiple of the chunk
+    # size, that decrement lands off the chunk boundary -- and LMCache resolves
+    # at chunk granularity, so the resulting spec asks for tokens the tier can
+    # never return and the load fails every time. The floor is what keeps the
+    # spec satisfiable. Scaled-down mirror of the production shape observed on
+    # GLM-5.2 (chunk 64, prompt 32768: 32767 requested, 32704 available).
+    sched = _lookup_scheduler(monkeypatch, hit=16)
+    assert sched.chunk_size == 8
+    seq = _load_seq(940, num_prompt_tokens=16)
+
+    assert sched.get_num_new_matched_tokens(seq) == (8, True)
+    assert sched._load_specs["940"].lmcache_cached_tokens == 8
+
+
+def test_dense_partial_hit_off_a_chunk_boundary_is_floored(monkeypatch):
+    # The same arithmetic with no decrement involved: any unaligned hit names
+    # tokens the tier does not hold at chunk granularity.
+    sched = _lookup_scheduler(monkeypatch, hit=13)
+    seq = _load_seq(941, num_prompt_tokens=24)
+
+    assert sched.get_num_new_matched_tokens(seq) == (8, True)
+    assert sched._load_specs["941"].lmcache_cached_tokens == 8
+
+
+def test_dense_failed_load_is_not_retried_for_the_same_request(monkeypatch):
+    # `load_failed` clears the pending load and the lookup memo, so without a
+    # record of the attempt the next scheduler pass looks up, hits, parks the
+    # request in WAITING_FOR_REMOTE_KVS and fails again -- forever, holding its
+    # KV blocks and concurrency slot. One attempt per request; after that the
+    # request prefills normally.
+    sched = _lookup_scheduler(monkeypatch, hit=16)
+    seq = _load_seq(942, num_prompt_tokens=24)
+
+    assert sched.get_num_new_matched_tokens(seq) == (16, True)
+    _dispatch_and_fail_load(sched, seq)
+
+    assert sched.get_num_new_matched_tokens(seq) == (0, False)
+    assert sched.total_suppressed_load_retries == 1
+    assert sched._load_specs == {}
+    assert sched._lookup_client.calls == 1
+
+
+def test_dense_new_sequence_reusing_request_id_gets_a_fresh_attempt(monkeypatch):
+    # The mark is against the sequence, not the ID: a request ID leased to a
+    # new sequence has spent nothing.
+    sched = _lookup_scheduler(monkeypatch, hit=16)
+    seq = _load_seq(943, num_prompt_tokens=24)
+
+    assert sched.get_num_new_matched_tokens(seq) == (16, True)
+    _dispatch_and_fail_load(sched, seq)
+
+    reused = _load_seq(943, num_prompt_tokens=24)
+    assert sched.get_num_new_matched_tokens(reused) == (16, True)
+    assert sched.total_suppressed_load_retries == 0
+
+
+def test_dense_request_finished_releases_the_failed_load_mark(monkeypatch):
+    sched = _lookup_scheduler(monkeypatch, hit=16)
+    seq = _load_seq(944, num_prompt_tokens=24)
+
+    assert sched.get_num_new_matched_tokens(seq) == (16, True)
+    _dispatch_and_fail_load(sched, seq)
+    assert sched._load_failed_seqs == {"944": seq}
+
+    sched.request_finished(seq)
+    assert sched._load_failed_seqs == {}
