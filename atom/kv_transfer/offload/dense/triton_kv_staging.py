@@ -10,6 +10,15 @@ import triton
 import triton.language as tl
 
 _BLOCK_BYTES = 1024
+# 1024 bytes over two wavefronts is 8 bytes per lane. The tile used to be
+# launched with eight warps, which the rectangular grid hid -- most programs
+# had nothing to move, so what the ones that did cost per lane barely showed.
+# Sized by the work, the shape is the whole cost: a sweep of tile x warps over
+# the measured M3 geometry peaks flat along 8 bytes per lane (643/634/632 GB/s
+# at 512x1, 1024x2, 2048x4) and falls off either side of it -- 448 GB/s at the
+# eight warps this used to run, 45 GB/s at 8192x1. Two warps keeps the tile
+# where every other part of this file already assumes it.
+_NUM_WARPS = 2
 
 
 @triton.jit
@@ -22,11 +31,14 @@ def _pack_chunk_major_kernel(
     chunk_block_offsets,
     chunk_output_bases,
     block_ids,
+    tile_job,
+    tile_pos,
     NUM_SEGMENTS: tl.constexpr,
     BLOCK_BYTES: tl.constexpr,
 ):
-    job = tl.program_id(0)
-    tile = tl.program_id(1)
+    pid = tl.program_id(0)
+    job = tl.load(tile_job + pid)
+    tile = tl.load(tile_pos + pid)
     chunk_id = job // NUM_SEGMENTS
     seg_id = job - chunk_id * NUM_SEGMENTS
 
@@ -69,11 +81,14 @@ def _unpack_chunk_major_kernel(
     chunk_block_offsets,
     chunk_output_bases,
     block_ids,
+    tile_job,
+    tile_pos,
     NUM_SEGMENTS: tl.constexpr,
     BLOCK_BYTES: tl.constexpr,
 ):
-    job = tl.program_id(0)
-    tile = tl.program_id(1)
+    pid = tl.program_id(0)
+    job = tl.load(tile_job + pid)
+    tile = tl.load(tile_pos + pid)
     chunk_id = job // NUM_SEGMENTS
     seg_id = job - chunk_id * NUM_SEGMENTS
 
@@ -154,32 +169,73 @@ def _build_meta(
     chunk_output_bases: list[int] = []
     block_offset = 0
     byte_offset = 0
-    max_tile_nbytes = 0
-    max_seg_bytes = max(int(nb) for nb in segment_block_bytes)
-    for nblocks in chunk_block_counts:
-        nblocks = int(nblocks)
+    counts = [int(n) for n in chunk_block_counts]
+    for nblocks in counts:
         if nblocks < 0:
             raise ValueError("chunk block count must be non-negative")
         chunk_block_offsets.append(block_offset)
         chunk_output_bases.append(byte_offset)
         block_offset += nblocks
         byte_offset += nblocks * bytes_per_block
-        max_tile_nbytes = max(max_tile_nbytes, nblocks * max_seg_bytes)
 
     if len(block_ids) != block_offset:
         raise ValueError("block_ids length does not match chunk block counts")
     if int(device_buf.numel()) < byte_offset:
         raise ValueError("device_buf is smaller than chunk-major staging output")
 
+    tile_job, tile_pos = _tile_table(counts, segment_block_bytes, device)
+
     return (
         _device_i64(segment_ptr_values, device),
         _device_i64([int(x) for x in segment_block_bytes], device),
         _device_i64(segment_prefix_values, device),
-        _device_i64([int(x) for x in chunk_block_counts], device),
+        _device_i64(counts, device),
         _device_i64(chunk_block_offsets, device),
         _device_i64(chunk_output_bases, device),
         _device_i64([int(x) for x in block_ids], device),
-        torch.tensor([int(byte_offset), int(max_tile_nbytes)], dtype=torch.int64),
+        tile_job,
+        tile_pos,
+        torch.tensor([int(byte_offset)], dtype=torch.int64),
+    )
+
+
+def _tile_table(
+    counts: list[int],
+    segment_block_bytes,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One grid entry per tile that has bytes to move, and nothing else.
+
+    The grid used to be rectangular: ``(chunk * segment, tiles)``, where the
+    tile count came from the largest segment. Segments are not the same size --
+    M3 stages 16 KiB of K and of V per block next to 512-byte MXFP8 scales and
+    one much larger cache -- so every small segment was launched with the tile
+    count of the biggest one and masked off almost all of it. On the measured
+    geometry that is 1,847,024 programs to move 23 MiB, about 12 payload bytes
+    each, and it costs what it sounds like: 15.8 GB/s against 276.6 GB/s for
+    the same bytes in segments of one size.
+
+    So size the grid by the work instead. Each job's tile count is its own,
+    the table maps a flat program id back to (job, tile within job), and the
+    result depends on the total bytes rather than on the widest segment. The
+    table is a function of the geometry alone, so it is built once per plan and
+    cached with it; it costs two int32 entries per tile, tens of KiB here.
+    """
+    nseg = len(segment_block_bytes)
+    job_nbytes = torch.as_tensor(counts, dtype=torch.int64).repeat_interleave(
+        nseg
+    ) * torch.as_tensor(
+        [int(nb) for nb in segment_block_bytes], dtype=torch.int64
+    ).repeat(
+        len(counts)
+    )
+    tiles = (job_nbytes + _BLOCK_BYTES - 1) // _BLOCK_BYTES
+    jobs = torch.repeat_interleave(torch.arange(tiles.numel()), tiles)
+    starts = torch.cumsum(tiles, 0) - tiles
+    pos = torch.arange(int(tiles.sum())) - torch.repeat_interleave(starts, tiles)
+    return (
+        jobs.to(device=device, dtype=torch.int32),
+        pos.to(device=device, dtype=torch.int32),
     )
 
 
@@ -217,6 +273,8 @@ class _ChunkMajorPlan:
         "_segment_prefix",
         "_segment_ptrs",
         "_slot",
+        "_tile_job",
+        "_tile_pos",
     )
 
     # Host staging slots for block_ids. One would race: the pinned buffer is
@@ -236,15 +294,14 @@ class _ChunkMajorPlan:
             self._chunk_block_offsets,
             self._chunk_output_bases,
             self._block_ids_d,
+            self._tile_job,
+            self._tile_pos,
             sizes,
         ) = meta
         self._num_segments = num_segments
         self._nblocks = nblocks
         self._output_nbytes = int(sizes[0].item())
-        self._grid = (
-            int(self._chunk_block_counts.numel()) * num_segments,
-            triton.cdiv(int(sizes[1].item()), _BLOCK_BYTES),
-        )
+        self._grid = (int(self._tile_job.numel()),)
         self._host_slots = [
             torch.empty(nblocks, dtype=torch.int64, pin_memory=True)
             for _ in range(self._NUM_HOST_SLOTS)
@@ -292,9 +349,11 @@ class _ChunkMajorPlan:
             self._chunk_block_offsets,
             self._chunk_output_bases,
             self._block_ids_d,
+            self._tile_job,
+            self._tile_pos,
             NUM_SEGMENTS=self._num_segments,
             BLOCK_BYTES=_BLOCK_BYTES,
-            num_warps=8,
+            num_warps=_NUM_WARPS,
         )
 
     def unpack(self, block_ids, device_buf: torch.Tensor) -> None:
@@ -309,9 +368,11 @@ class _ChunkMajorPlan:
             self._chunk_block_offsets,
             self._chunk_output_bases,
             self._block_ids_d,
+            self._tile_job,
+            self._tile_pos,
             NUM_SEGMENTS=self._num_segments,
             BLOCK_BYTES=_BLOCK_BYTES,
-            num_warps=8,
+            num_warps=_NUM_WARPS,
         )
 
 
