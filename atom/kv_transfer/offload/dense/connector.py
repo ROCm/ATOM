@@ -162,8 +162,8 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             gpu_connector.release_gpu_staging_after_transfer,
             self._do_save,
             self._do_load,
-            self._save_executor._max_workers,
-            self._load_executor._max_workers,
+            self.save_workers,
+            self.load_workers,
         )
 
     # -- per-step (RPC thread): only enqueue, never copy ------------------

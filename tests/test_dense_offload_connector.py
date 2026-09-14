@@ -718,6 +718,7 @@ def test_dense_worker_pool_widths_follow_env(monkeypatch):
 
     worker = DenseOffloadConnector(_config())
     try:
+        assert (worker.save_workers, worker.load_workers) == (1, 1)
         assert worker._save_executor._max_workers == 1
         assert worker._load_executor._max_workers == 1
     finally:
@@ -727,6 +728,7 @@ def test_dense_worker_pool_widths_follow_env(monkeypatch):
     monkeypatch.setenv("OFFLOAD_LOAD_WORKERS", "3")
     worker = DenseOffloadConnector(_config())
     try:
+        assert (worker.save_workers, worker.load_workers) == (4, 3)
         assert worker._save_executor._max_workers == 4
         assert worker._load_executor._max_workers == 3
     finally:

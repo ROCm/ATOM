@@ -378,6 +378,10 @@ def _dense_registration_connector() -> DenseOffloadConnector:
     connector._engine = None
     connector._codec = None
     connector._lookup_server = None
+    # `register_kv_caches` logs the pool widths, which a real worker sets in
+    # `__init__`; this connector is built through `__new__`.
+    connector.save_workers = 1
+    connector.load_workers = 1
     return connector
 
 
@@ -1111,6 +1115,88 @@ def test_staged_pipeline_allocates_on_first_consumer_stream(
         ("run", "a", first_stream_name),
     ]
     assert ("run", "b", second_stream_name) in trace
+
+
+@pytest.mark.parametrize("shared_stream", [True, False])
+def test_staged_pipeline_skips_the_handshake_on_a_shared_stream(shared_stream):
+    """One stream orders the stages itself, so it must issue no event calls.
+
+    Not a cosmetic saving: every one of those calls enters the GPU runtime and
+    releases the GIL, and it is charged once per staging group.
+    """
+    from atom.kv_transfer.offload.atom_lmcache_staging import (
+        _PipelineStage,
+        run_staged_pipeline,
+    )
+
+    calls = []
+
+    class _FakeStream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_event(self, event):
+            calls.append(("wait", event.name))
+
+        def synchronize(self):
+            pass
+
+    class _FakeEvent:
+        def __init__(self, name):
+            self.name = name
+
+        def record(self, stream):
+            calls.append(("record", self.name))
+
+    class _FakeState:
+        def __init__(self):
+            self.staging_buffer = SimpleNamespace(
+                tensor=None,
+                ready_event=_FakeEvent("ready"),
+                free_event=_FakeEvent("free"),
+                free_event_valid=False,
+            )
+
+        def stream_ctx(self, stream):
+            return nullcontext()
+
+    state = _FakeState()
+    pack = _FakeStream("pack")
+    copy = pack if shared_stream else _FakeStream("copy")
+    ran = []
+
+    # Three groups: the free-event wait only appears from the second onwards,
+    # so a single group would not distinguish the two modes.
+    run_staged_pipeline(
+        state,
+        [SimpleNamespace(nbytes=8) for _ in range(3)],
+        stage_a=_PipelineStage(pack, lambda group, buf: ran.append("a")),
+        stage_b=_PipelineStage(copy, lambda group, buf: ran.append("b")),
+        ensure_buffer=lambda _buffer, _nbytes: object(),
+        group_nbytes=lambda group: group.nbytes,
+    )
+
+    assert ran == ["a", "b"] * 3
+    if shared_stream:
+        assert calls == []
+        # A recorded-event flag that outlived its event would gate a later
+        # transfer on something that was never recorded.
+        assert state.staging_buffer.free_event_valid is False
+    else:
+        assert calls == [
+            ("record", "ready"),
+            ("wait", "ready"),
+            ("record", "free"),
+            ("wait", "free"),
+            ("record", "ready"),
+            ("wait", "ready"),
+            ("record", "free"),
+            ("wait", "free"),
+            ("record", "ready"),
+            ("wait", "ready"),
+            ("record", "free"),
+        ]
+        assert state.staging_buffer.free_event_valid is True
 
 
 def _exception_pipeline(monkeypatch, direction: str, *, failed_stream: str | None):
