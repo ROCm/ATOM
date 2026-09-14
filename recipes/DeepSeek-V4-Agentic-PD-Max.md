@@ -16,13 +16,19 @@ Two variants, split at concurrency 64:
 
 | variant | concurrency | CPU offload |
 |---|---|---|
-| TP | 1 – 16 | not needed |
+| TP | 1 – 48 | not needed |
 | DP attention | 64 and up | required from 256 |
 
 The bands are contiguous. They differ by two flags, four environment variables,
 and two sizing values — listed under *What changes between TP and DPA* below.
 
-## Server — TP (concurrency 1 – 16)
+The PD sweep in *Measured* covers TP at 1–16 and DPA at 64–256; the 17–48 part
+of the TP band follows the single-node recipe, where TP at c=48 is measured and
+sits just under DP at c=64 (20,308 against 21,888 tok/s/chip). If you are
+running between 16 and 48 here, that crossover is inherited rather than
+re-measured on two nodes.
+
+## Server — TP (concurrency 1 – 48)
 
 ```bash
 export AITER_BF16_FP8_MOE_BOUND=0
