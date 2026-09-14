@@ -10,7 +10,7 @@ which is what the workload needs at high concurrency.
 - Model: `deepseek-ai/DeepSeek-V4-Pro`, FP4 weights, FP8 KV, FP8 index cache
   (FP8 is forced under PD — the single-node recipe's FP4 indexer has no
   Mooncake staging layout, and `atom/config.py` rewrites it)
-- Transport: Mooncake RDMA, GID index 1, HIP DMA-BUF compatibility preload
+- Transport: Mooncake RDMA, GID index 1
 - Scenario: `inferencex-agentx-mvp`, dataset `semianalysis_cc_traces_weka_062126`
 - Router: `atomesh`, PD mode, `idx2idx` rank mapping
 
@@ -41,7 +41,6 @@ export ATOM_HOST_IP=<PREFILL_IP>          # <DECODE_IP> on the decode node
 export MC_GID_INDEX=1
 export NCCL_IB_DISABLE=1
 export ATOM_DISABLE_MMAP=true
-export LD_PRELOAD=<path>/rdma_compat/libhip_dmabuf_mr.so
 
 export ATOM_PREFIX_CACHE_POLICY=lru
 export ATOM_PREFIX_CACHE_PROTECTED_RATIO=0.5
@@ -191,7 +190,6 @@ export ATOM_HOST_IP=10.0.0.1                    # this node
 export ATOM_DISABLE_MMAP=true
 export MC_GID_INDEX=1
 export NCCL_IB_DISABLE=1
-export LD_PRELOAD=/path/to/rdma_compat/libhip_dmabuf_mr.so
 
 export ATOM_NUMA_BIND=1
 export GPU_MAX_HW_QUEUES=5
@@ -455,20 +453,30 @@ passing them is either a no-op or actively misleading:
 
 ## If the servers OOM at startup
 
-The commands above do not pass `--gpu-memory-utilization`; ATOM defaults it to
-0.9, same as the single-node recipe. PD does not need a lower value.
+It should not happen where RDMA memory registration works — the commands above
+are then the whole configuration, and `--gpu-memory-utilization` is left at
+ATOM's 0.9 default, the same value the single-node recipe uses. PD does not need
+a lower one.
 
-The Crusoe MI355X cluster these numbers came from does: ROCm's dmabuf RDMA
-memory registration is incomplete there, which is also why the commands preload
-`rdma_compat/libhip_dmabuf_mr.so`. At 0.9 the KV pool allocates and Mooncake
-registers it, then the first barrier in `allocate_kv_cache` cannot get 32 MiB —
-with ~43 GiB per chip still nominally free at 0.85, so it is not a budget
-overrun. Cluster IT's guidance is `≤ 0.65`; 0.75 prefill / 0.70 decode completed
-a 3,600 s run for us, while 0.80 started, passed smoke, and then died mid-run in
-MoE stage-2. Starting is not evidence a value is safe.
+The Crusoe MI355X cluster these numbers came from is not such a place: ROCm's
+GPU memory registration fails there, and the runs behind this file needed two
+things that are deliberately not in the commands.
 
-This is a property of that cluster, not of PD or DeepSeek-V4. Elsewhere, leave
-the flag off.
+**An `LD_PRELOAD` shim** intercepting `ibv_reg_mr_iova2`. The native path
+returns `EFAULT`/`EINVAL` on GPU memory, so the shim exports a dma-buf fd with
+`hipMemGetHandleForAddressRange` and registers through `ibv_reg_dmabuf_mr`
+instead. Where the native path works it succeeds first and the fallback never
+runs, which is why the shim is not part of the recipe. It is what prints
+`[hip-dmabuf-mr] registered GPU range ...`.
+
+**A lower memory fraction.** At 0.9 the KV pool allocates and Mooncake registers
+it, and then the first barrier in `allocate_kv_cache` cannot get 32 MiB — with
+~43 GiB per chip still nominally free at 0.85, so this is not a budget overrun.
+Cluster IT's guidance is `≤ 0.65`. For us 0.75 prefill / 0.70 decode completed a
+3,600 s run, while 0.80 started, passed smoke, and then died mid-run in MoE
+stage-2: starting is not evidence a value is safe.
+
+Both are properties of that cluster, not of PD or DeepSeek-V4.
 
 ## Related
 
