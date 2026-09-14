@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Qwen-local gated tails: HyperConnection, sigmoid RMSNorm, and output gates.
+"""Qwen-local gated operators: HyperConnection, sigmoid RMSNorm, and output gates.
 
 Each of the 97 hyper-connections runs a `mix` and (bar the final mixer) a
 `combine`, and the parts of them that are not a GEMM are all cheap elementwise

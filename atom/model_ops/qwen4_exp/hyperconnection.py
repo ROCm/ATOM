@@ -23,7 +23,7 @@ import torch
 from torch import nn
 
 from atom.model_ops.linear import ReplicatedLinear
-from atom.model_ops.qwen4_exp.gated_ops import (
+from atom.model_ops.qwen4_exp.ops.gated import (
     combine_inject,
     mix_gated_mean,
     scaled_silu,

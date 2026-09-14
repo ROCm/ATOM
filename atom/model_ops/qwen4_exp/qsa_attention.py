@@ -45,8 +45,8 @@ from atom.model_ops.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from atom.model_ops.qwen4_exp.gated_ops import sigmoid_mul
-from atom.model_ops.qwen4_exp.qsa_ops import (
+from atom.model_ops.qwen4_exp.ops.gated import sigmoid_mul
+from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_apply_mrope,
     qsa_compress_groups,
     qsa_select_paged_tokens,

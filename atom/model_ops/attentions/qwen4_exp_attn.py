@@ -30,7 +30,7 @@ import torch
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_ops.qwen4_exp.qsa_ops import qsa_compressed_slots
+from atom.model_ops.qwen4_exp.ops.qsa import qsa_compressed_slots
 from atom.utils import CpuGpuBuffer
 
 from .gdn_attn import GDNAttentionBackend, GDNAttentionMetadataBuilder

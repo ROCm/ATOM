@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""QSA cache preparation, index selection and sparse paged GQA.
+"""QSA operators for cache preparation, index selection and sparse paged GQA.
 
 Cache writes skip negative slots. Only complete groups are pooled and scored;
 selection expands those groups and appends each query's incomplete causal tail.
