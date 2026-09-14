@@ -7,6 +7,7 @@ import aiter
 import torch
 from aiter import fused_qk_norm_rope_cache_quant_shuffle
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.mha import _flash_attn_varlen_forward
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
 from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 from aiter.ops.triton.unified_attention import unified_attention
@@ -71,6 +72,7 @@ class PagedAttentionImpl(nn.Module):
         self.alibi_slopes = alibi_slopes
         self.k_cache = self.v_cache = torch.tensor([])
         self.kv_cache_dtype = kv_cache_dtype
+        self.logits_soft_cap = logits_soft_cap
         self.max_model_len = 0
         self.k_scale = self.v_scale = None
         self.device = "cuda:" + str(torch.cuda.current_device())
@@ -83,12 +85,8 @@ class PagedAttentionImpl(nn.Module):
         self.kv_scale = torch.tensor(
             self.kv_scale_float, dtype=torch.float32, device=self.device
         )
-        # Pre-allocated fp8 dequant scale for the pa_decode_bf16_asm path. Built
-        # here (outside CUDAGraph capture) and reused so the kernel wrapper never
-        # allocates a tensor mid-capture.
-        self._pa_decode_bf16_asm_scale = torch.full(
-            (1,), self.kv_scale_float, dtype=torch.float32, device=self.device
-        )
+        # Reuse the KV scale as a 1-D view, created outside CUDA Graph capture.
+        self._pa_decode_bf16_asm_scale = self.kv_scale.view(1)
         self.per_token_quant = True
         self.sinks = sinks
         self.sliding_window = sliding_window if sliding_window is not None else -1
@@ -109,6 +107,20 @@ class PagedAttentionImpl(nn.Module):
             and self.sinks.dtype != torch.float32
         ):
             self.sinks.data = self.sinks.data.to(torch.float32).contiguous()
+
+    def _use_asm_cache_layout(
+        self,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        *,
+        use_triton_attn: bool,
+    ) -> bool:
+        """Select the native ATOM cache layout.
+
+        Native builders provide a pre-shuffled 5-D cache. A 4-D cache is only
+        used by the Triton path and must retain its standard layout.
+        """
+        return v_cache.dim() == 5 or not use_triton_attn
 
     def _can_attempt_prefill_sink_asm(self, fwd_ctx: ForwardContext) -> bool:
         if not fwd_ctx.context.is_prefill:
@@ -353,9 +365,9 @@ class PagedAttentionImpl(nn.Module):
             self._cache_format = "NHD"
         else:
             # for asm paged attention
-            asm_layout = True
-            if use_triton_attn and v_cache.dim() != 5:
-                asm_layout = False
+            asm_layout = self._use_asm_cache_layout(
+                k_cache, v_cache, use_triton_attn=use_triton_attn
+            )
             if self.rotary_emb is not None:
                 assert position is not None
                 q, k = self.rotary_emb(position, q, k)
@@ -751,6 +763,28 @@ class PagedAttentionImpl(nn.Module):
 
             return output.view(batch_size * max_seqlen_q, self.num_heads, self.head_dim)
 
+    def _can_use_fp8_prefill_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        fwd_ctx: ForwardContext,
+    ) -> bool:
+        attn_metadata = fwd_ctx.attn_metadata
+        return (
+            envs.ATOM_AITER_FP8_PREFILL_ATTN
+            and get_gfx() == "gfx950"
+            and self.head_dim == 256
+            and self.kv_cache_dtype.startswith("fp8")
+            and not attn_metadata.has_cached
+            and self.sliding_window == -1
+            and self.sinks is None
+            and (self.logits_soft_cap is None or self.logits_soft_cap == 0.0)
+            and getattr(attn_metadata, "dropout_p", 0.0) == 0.0
+            and q.shape[0] == k.shape[0] == v.shape[0]
+            and q.shape[-1] == k.shape[-1] == v.shape[-1] == 256
+        )
+
     @mark_trace(prefix="prefill_attention", torch_compile=False)
     def prefill_attention(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
@@ -770,6 +804,41 @@ class PagedAttentionImpl(nn.Module):
                     q, k, v, k_cache, v_cache, k_scale, v_scale, attn_metadata
                 )
             )
+        if self._can_use_fp8_prefill_attention(q, k, v, fwd_ctx):
+            output_dtype = q.dtype
+            # On gfx950, kv_scale is 1.0; FMHA requires a 1-D per-tensor scale.
+            scale = self.kv_scale.view(1)
+            # Use aiter's FMHA v3 varlen dispatcher (ROCm/aiter#4657) instead of
+            # flash_attn_varlen_fp8_pertensor_func, which hardcodes return_lse=False
+            # and can divert to Triton when ENABLE_CK=0.
+            o, _, _, _ = _flash_attn_varlen_forward(
+                q.contiguous().to(aiter.dtypes.fp8),
+                k.contiguous().to(aiter.dtypes.fp8),
+                v.contiguous().to(aiter.dtypes.fp8),
+                attn_metadata.cu_seqlens_q,
+                attn_metadata.cu_seqlens_k,
+                None,
+                None,
+                attn_metadata.max_seqlen_q,
+                attn_metadata.max_seqlen_k,
+                attn_metadata.min_seqlen_q,
+                0.0,
+                self.scale,
+                causal=True,
+                logits_soft_cap=0.0,
+                window_size_left=-1,
+                window_size_right=-1,
+                sink_size=0,
+                bias=None,
+                alibi_slopes=None,
+                q_descale=scale,
+                k_descale=scale,
+                v_descale=scale,
+                return_lse=False,
+                return_softmax=False,
+            )
+            return o if o.dtype == output_dtype else o.to(output_dtype)
+
         sliding_window = (
             (self.sliding_window, 0, 0) if self.sliding_window > 0 else (-1, -1, 0)
         )
