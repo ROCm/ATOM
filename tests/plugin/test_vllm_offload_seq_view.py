@@ -105,3 +105,50 @@ def test_preemption_forgets_placement_but_not_what_was_stored():
     # Same view: the request keeps its identity, so ATOM's scheduler must not
     # see this as a recycled request id.
     assert reg.get_or_create(req) is view
+
+
+def test_view_accepts_the_frozen_placement_the_chunked_scheduler_writes():
+    """`__slots__` makes "the scheduler sets an attribute on the seq" a contract.
+
+    ATOM's `ChunkedOffloadSchedulerBase` freezes a finishing request's placement
+    onto the seq object so a final save can still be dispatched after vLLM has
+    taken the blocks back. ATOM's own `Sequence` has a `__dict__` and absorbs
+    that silently; a slotted view raises `AttributeError` instead -- out of
+    `request_finished`, which runs on every completed request.
+
+    Calling the real unbound method is the point: a fake scheduler would still
+    pass if the base class grew another such attribute tomorrow.
+    """
+    from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
+
+    reg = SeqViewRegistry()
+    view = reg.get_or_create(_request("r1", prompt=(1, 2, 3, 4)))
+    view.set_block_table([5, 6])
+    view.set_num_cached_tokens(4)
+
+    scheduler = SimpleNamespace(
+        _load_lifecycles={},
+        _active_load_operations={},
+        _save_tracker={"r1": [view, 0]},
+        _early_release=True,
+        should_defer_free=lambda seq: False,
+    )
+
+    ChunkedOffloadSchedulerBase.request_finished(scheduler, view)
+
+    assert view._offload_finished_cached_tokens == 4
+    # Popped, because nothing was still deferring the free.
+    assert "r1" not in scheduler._save_tracker
+
+
+def test_preemption_forgets_the_frozen_placement_too():
+    """Frozen placement is placement; a preempted request's is equally stale."""
+    reg = SeqViewRegistry()
+    view = reg.get_or_create(_request())
+    view._offload_finished_block_ids = [7, 8, 9]
+    view._offload_finished_cached_tokens = 384
+
+    view.reset_for_preemption()
+
+    assert not hasattr(view, "_offload_finished_block_ids")
+    assert not hasattr(view, "_offload_finished_cached_tokens")

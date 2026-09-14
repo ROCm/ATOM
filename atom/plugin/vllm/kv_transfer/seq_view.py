@@ -22,6 +22,13 @@ class SeqView:
     __slots__ = (
         "_load_operation",
         "_num_cached_tokens",
+        # Written by the chunked scheduler's early-block-release path, which
+        # freezes a finished request's placement so a final save can still be
+        # dispatched after vLLM has handed the blocks back. Deliberately left
+        # unset in ``__init__``: that path tests for them with ``hasattr``, and
+        # an unset slot is absent the same way a missing attribute is.
+        "_offload_finished_block_ids",
+        "_offload_finished_cached_tokens",
         "_request",
         "block_table",
         "offload_handoff_boundary_tokens",
@@ -94,6 +101,14 @@ class SeqView:
         self.offload_handoff_boundary_tokens = 0
         self.prefix_hashes_published = False
         self._load_operation = None
+        # Frozen placement from a previous finish is placement too, and a
+        # preempted request's is as stale as the live block table.
+        for frozen in (
+            "_offload_finished_block_ids",
+            "_offload_finished_cached_tokens",
+        ):
+            if hasattr(self, frozen):
+                delattr(self, frozen)
 
     def __repr__(self) -> str:
         return (
