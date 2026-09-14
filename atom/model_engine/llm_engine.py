@@ -674,6 +674,7 @@ class InputOutputProcessor:
                 "kimi_linear",
                 "glm5_next_text",
                 "deepseek_v4",
+                "qwen4_exp_text",
             }
         )
 
