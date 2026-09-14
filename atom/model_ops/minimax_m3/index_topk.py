@@ -157,6 +157,11 @@ def _emit_sparse_block_table_row(
 # as a tensor, so serving aiter means writing it down -- once per forward, the
 # way `deepseek_v4_attn.csa_n_committed_per_token` does for the sibling indexer.
 # ---------------------------------------------------------------------------
+# Query rows one bounds program owns. Also the grid's second dimension, so the
+# two have to be the same number.
+_N_VALID_BLOCK_Q = 128
+
+
 @triton.jit
 def _n_valid_column_per_row_kernel(
     out_ptr,  # [num_idx_heads * total_q] int32
@@ -183,14 +188,20 @@ def _n_valid_column_per_row_kernel(
         block_num = tl.load(row_starts + pid_b + 1) - seq_start
         prefix_len = tl.load(row_prefix + pid_b)
 
-    for off in tl.range(0, block_num, BLOCK_Q):
-        q = off + tl.arange(0, BLOCK_Q)
-        live = q < block_num
-        # ceil(causal_len / block_size) for causal_len = prefix_len + q + 1;
-        # the selector spells the same thing as its `valid_blocks`.
-        n_valid = (prefix_len + q + block_size) // block_size
-        for h in tl.static_range(NUM_IDX_HEADS):
-            tl.store(out_ptr + h * total_q + seq_start + q, n_valid, mask=live)
+    # The query axis is the grid's second dimension, not a loop: one request
+    # can be the whole batch, and folding its tiles into one program would
+    # serve a long prefill from a single compute unit. Ragged requests make
+    # the bound per-request, so the short ones exit here.
+    off = tl.program_id(1) * BLOCK_Q
+    if off >= block_num:
+        return
+    q = off + tl.arange(0, BLOCK_Q)
+    live = q < block_num
+    # ceil(causal_len / block_size) for causal_len = prefix_len + q + 1;
+    # the selector spells the same thing as its `valid_blocks`.
+    n_valid = (prefix_len + q + block_size) // block_size
+    for h in tl.static_range(NUM_IDX_HEADS):
+        tl.store(out_ptr + h * total_q + seq_start + q, n_valid, mask=live)
 
 
 def build_n_valid_column_per_row(
@@ -217,12 +228,19 @@ def build_n_valid_column_per_row(
     rows = num_idx_heads * total_q
     if batch <= 0 or rows <= 0:
         return None
+    # Slicing a buffer shorter than `rows` yields a shorter tensor without
+    # complaining, while the kernel still writes `rows` of them off the raw
+    # pointer -- the one failure here that is silent.
+    assert (
+        out is None or out.numel() >= rows
+    ), f"n_valid_column_per_row needs {rows} rows, buffer holds {out.numel()}"
     out = (
         torch.empty(rows, dtype=torch.int32, device=row_starts.device)
         if out is None
         else out[:rows]
     )
-    _n_valid_column_per_row_kernel[(batch,)](
+    q_tiles = triton.cdiv(decode_max_q or total_q, _N_VALID_BLOCK_Q)
+    _n_valid_column_per_row_kernel[(batch, q_tiles)](
         out,
         row_starts,
         row_prefix,
@@ -230,7 +248,7 @@ def build_n_valid_column_per_row(
         block_size=SPARSE_BLOCK_SIZE,
         NUM_IDX_HEADS=num_idx_heads,
         DECODE_MAX_Q=decode_max_q,
-        BLOCK_Q=128,
+        BLOCK_Q=_N_VALID_BLOCK_Q,
     )
     return out
 
