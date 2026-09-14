@@ -9,16 +9,33 @@ A chunk of ``x`` tokens after a cached prefix of ``L`` tokens is modeled as
 
 Startup dummy forwards fit ``b``; a two-size runtime prefill sweep fits
 ``a``, ``gamma`` and ``c``. The accepted model then selects equal-latency chunks.
+
+``DynamicChunkingWorker`` at the bottom of this module is the worker half of the
+feature: it drives the startup sweep, times real prefills and hands the fitted
+model back, so ``ModelRunner`` only forwards its two RPCs and brackets the model
+call.
 """
 
 from __future__ import annotations
 
+import logging
 import math
+import time
 from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
+import torch
+
+from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
+
+if TYPE_CHECKING:
+    from atom.model_engine.model_runner import ModelRunner
+    from atom.model_engine.scheduler import ScheduledBatch
+
+logger = logging.getLogger("atom")
 
 # Maximum share of chunk latency spent rebuilding the cached prefix.
 MAX_PREFIX_OVERHEAD_FRACTION = 0.2
@@ -28,6 +45,15 @@ MIN_PROFILE_SAMPLES = 8
 # Span of the startup profiling sweep: it runs from the token budget down to
 # this fraction of it.
 PROFILE_SWEEP_RATIO = 8
+
+# Sizes visited by the startup sweep before alignment collapses duplicates.
+PROFILE_SWEEP_POINTS = 24
+
+# Maximum asynchronous timing samples in flight.
+MAX_PENDING_CHUNK_SAMPLES = 8
+
+# Discard one request's kernel and allocator warmup timings.
+DISCARD_FIRST_CHUNK_REQUESTS = 1
 
 # Minimum sample diversity required for an identifiable runtime fit.
 MIN_CALIBRATION_PREFIXES = 3
@@ -64,8 +90,38 @@ def has_sole_prefill(sources: int, recent_sources: Iterable[int] = ()) -> bool:
     return max((sources, *recent_sources)) <= 1
 
 
-def _scaled_lstsq(design: np.ndarray, target: np.ndarray) -> np.ndarray:
-    """Least squares with per-column scaling, returning unscaled coefficients.
+def _attention_area(prefix_len: Any, chunk_size: Any) -> Any:
+    """Attention work of a chunk: its own tokens plus the prefix it re-reads.
+
+    Scalars or arrays; the fit and the model it produces both measure a chunk
+    through this one expression.
+    """
+    return 2.0 * prefix_len * chunk_size + chunk_size * chunk_size
+
+
+def _design_matrix(
+    chunks: np.ndarray,
+    prefixes: np.ndarray,
+    *,
+    with_prefix: bool,
+    with_constant: bool,
+) -> np.ndarray:
+    """Latency-model columns, in coefficient order ``(a, gamma, c)``.
+
+    Built here rather than at each call site because the fit and the gates that
+    judge its uncertainty have to describe the same model: a column present in
+    one and not the other silently changes the degrees of freedom.
+    """
+    columns = [_attention_area(prefixes, chunks)]
+    if with_prefix:
+        columns.append(prefixes)
+    if with_constant:
+        columns.append(np.ones_like(chunks))
+    return np.column_stack(columns)
+
+
+def _scale_columns(design: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Normalize each column to unit maximum, with the scales applied.
 
     The columns span many orders of magnitude - attention area is O(1e10) next to
     a constant column of ones - and an unscaled solve reports rank deficiency on
@@ -74,8 +130,14 @@ def _scaled_lstsq(design: np.ndarray, target: np.ndarray) -> np.ndarray:
     scales = np.max(np.abs(design), axis=0)
     if not np.all(np.isfinite(scales)) or np.any(scales <= 0.0):
         raise ValueError("Dynamic chunking latency samples have a degenerate column")
+    return design / scales, scales
+
+
+def _scaled_lstsq(design: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """Least squares on scaled columns, returning unscaled coefficients."""
+    scaled, scales = _scale_columns(design)
     try:
-        solution, _, rank, _ = np.linalg.lstsq(design / scales, target, rcond=None)
+        solution, _, rank, _ = np.linalg.lstsq(scaled, target, rcond=None)
     except np.linalg.LinAlgError as exc:
         raise ValueError("Failed to fit dynamic chunking latency model") from exc
     if rank < design.shape[1]:
@@ -121,6 +183,16 @@ def fit_chunk_overhead(
             "overhead"
         )
     return linear, max(constant, 0.0)
+
+
+class _LatencyTerms(NamedTuple):
+    """Fitted ``(a, gamma, c)`` and which columns produced them."""
+
+    quadratic: float
+    prefix: float
+    constant: float
+    with_prefix: bool
+    free_constant: bool
 
 
 @dataclass
@@ -188,11 +260,11 @@ class ChunkLatencyCalibrator:
         return self._failed_fits >= MAX_CALIBRATION_FIT_FAILURES
 
     def _is_due(self) -> bool:
-        if len(self._timings) < MIN_CALIBRATION_SHAPES:
+        if self.num_shapes < MIN_CALIBRATION_SHAPES:
             return False
-        if len({prefix for _, prefix in self._timings}) < MIN_CALIBRATION_PREFIXES:
+        if self.num_prefixes < MIN_CALIBRATION_PREFIXES:
             return False
-        if len({chunk for chunk, _ in self._timings}) < MIN_CALIBRATION_CHUNK_SIZES:
+        if self.num_chunk_sizes < MIN_CALIBRATION_CHUNK_SIZES:
             return False
         # A fit is attempted once per timing the last attempt did not see, so a
         # failure costs one retry per new measurement rather than one per poll.
@@ -217,7 +289,7 @@ class ChunkLatencyCalibrator:
 
     def _fit_terms(
         self, chunks: np.ndarray, prefixes: np.ndarray, latencies: np.ndarray
-    ) -> tuple[float, float, float]:
+    ) -> _LatencyTerms:
         """Solve for ``(a, gamma, c)``, keeping only ``b`` from startup profiling.
 
         A dummy forward does the same per-token arithmetic serving does, so ``b``
@@ -227,61 +299,43 @@ class ChunkLatencyCalibrator:
         on. ``MIN_CALIBRATION_CHUNK_SIZES`` is what makes fitting it instead
         possible, so this runs on sweep samples by construction.
         """
-        areas = 2.0 * prefixes * chunks + chunks * chunks
         overhead = latencies - self.linear_coeff * chunks
-        ones = np.ones_like(chunks)
 
-        def solve(free_constant: bool, with_prefix: bool) -> tuple[float, float, float]:
-            columns = [areas]
-            if with_prefix:
-                columns.append(prefixes)
-            target = overhead
-            if free_constant:
-                columns.append(ones)
-            else:
-                target = overhead - self.constant_coeff
-            values = [
-                float(value)
-                for value in _scaled_lstsq(np.column_stack(columns), target)
-            ]
-            return (
-                values[0],
-                values[1] if with_prefix else 0.0,
-                values[-1] if free_constant else self.constant_coeff,
+        def solve(free_constant: bool, with_prefix: bool) -> _LatencyTerms:
+            design = _design_matrix(
+                chunks, prefixes, with_prefix=with_prefix, with_constant=free_constant
+            )
+            target = overhead if free_constant else overhead - self.constant_coeff
+            values = [float(value) for value in _scaled_lstsq(design, target)]
+            return _LatencyTerms(
+                quadratic=values[0],
+                prefix=values[1] if with_prefix else 0.0,
+                constant=values[-1] if free_constant else self.constant_coeff,
+                with_prefix=with_prefix,
+                free_constant=free_constant,
             )
 
-        free_constant = True
-        quadratic, prefix, constant = solve(free_constant, True)
-        if constant < 0.0:
+        terms = solve(True, True)
+        if terms.constant < 0.0:
             # A forward that costs less than nothing to launch is not physical,
             # and a negative constant drags the terms fitted beside it.
-            free_constant = False
-            quadratic, prefix, constant = solve(free_constant, True)
-        if prefix < 0.0:
+            terms = solve(False, True)
+        if terms.prefix < 0.0:
             # Refit rather than clamp: dropping the prefix column leaves the
             # whole prefix cost in the area term, where a clamp would have left
             # `a` carrying a negative partner's bias instead.
-            quadratic, prefix, constant = solve(free_constant, False)
-        return quadratic, prefix, constant
+            terms = solve(terms.free_constant, False)
+        return terms
 
     def _validate_fit_quality(
-        self,
-        *,
-        chunks: np.ndarray,
-        prefixes: np.ndarray,
-        latencies: np.ndarray,
-        modeled: np.ndarray,
-        with_prefix: bool,
+        self, *, design: np.ndarray, error: np.ndarray, mean_latency: float
     ) -> None:
-        """Reject identifiable but noise-sensitive fits."""
-        areas = 2.0 * prefixes * chunks + chunks * chunks
-        columns = [areas]
-        if with_prefix:
-            columns.append(prefixes)
-        columns.append(np.ones_like(chunks))
-        design = np.column_stack(columns)
-        scales = np.max(np.abs(design), axis=0)
-        scaled = design / scales
+        """Reject identifiable but noise-sensitive fits.
+
+        ``design`` must be the matrix the accepted fit was solved on, so that the
+        uncertainty below is the uncertainty of the model being installed.
+        """
+        scaled, _ = _scale_columns(design)
 
         condition = float(np.linalg.cond(scaled))
         if not math.isfinite(condition) or condition > MAX_CALIBRATION_DESIGN_CONDITION:
@@ -292,19 +346,17 @@ class ChunkLatencyCalibrator:
                 "sizes do not separate the latency terms"
             )
 
-        degrees_of_freedom = len(latencies) - design.shape[1]
+        degrees_of_freedom = design.shape[0] - design.shape[1]
         if degrees_of_freedom <= 0:
             raise ValueError(
                 "Dynamic chunking calibration has too few samples to estimate "
                 "fit uncertainty"
             )
-        error = modeled - latencies
         residual_variance = float(error @ error) / degrees_of_freedom
         covariance = residual_variance * np.linalg.inv(scaled.T @ scaled)
         prediction_variance = np.einsum("ij,jk,ik->i", scaled, covariance, scaled)
         max_stderr = float(np.sqrt(np.maximum(prediction_variance, 0.0)).max())
-        mean = float(np.mean(latencies))
-        uncertainty = max_stderr / mean
+        uncertainty = max_stderr / mean_latency
         if uncertainty > MAX_CALIBRATION_PREDICTION_STDERR_FRACTION:
             raise ValueError(
                 "Dynamic chunking calibration prediction uncertainty is "
@@ -322,20 +374,23 @@ class ChunkLatencyCalibrator:
             dtype=np.float64,
         )
 
-        quadratic, prefix, constant = self._fit_terms(chunks, prefixes, latencies)
-        areas = 2.0 * prefixes * chunks + chunks * chunks
-        attention_span = quadratic * float(np.ptp(areas))
+        terms = self._fit_terms(chunks, prefixes, latencies)
+        attention_span = terms.quadratic * float(
+            np.ptp(_attention_area(prefixes, chunks))
+        )
         roundoff = (
             64.0 * np.finfo(np.float64).eps * max(float(np.max(np.abs(latencies))), 1.0)
         )
         if attention_span <= roundoff:
             raise ValueError(
                 "Dynamic chunking calibration measured no attention growth "
-                f"(a={quadratic:.3e}): chunk cost does not rise with attention "
-                "area, so equal-latency chunking has nothing to equalize"
+                f"(a={terms.quadratic:.3e}): chunk cost does not rise with "
+                "attention area, so equal-latency chunking has nothing to equalize"
             )
 
-        predictor = ChunkSizePredictor(quadratic, self.linear_coeff, constant, prefix)
+        predictor = ChunkSizePredictor(
+            terms.quadratic, self.linear_coeff, terms.constant, terms.prefix
+        )
         modeled = np.asarray(
             [
                 predictor.predicted_latency(int(prefix_len), int(chunk))
@@ -354,11 +409,14 @@ class ChunkLatencyCalibrator:
                 "not described by the chunk latency model"
             )
         self._validate_fit_quality(
-            chunks=chunks,
-            prefixes=prefixes,
-            latencies=latencies,
-            modeled=modeled,
-            with_prefix=predictor.prefix_coeff > 0.0,
+            design=_design_matrix(
+                chunks,
+                prefixes,
+                with_prefix=terms.with_prefix,
+                with_constant=terms.free_constant,
+            ),
+            error=error,
+            mean_latency=mean,
         )
         return predictor
 
@@ -400,8 +458,7 @@ class ChunkSizePredictor:
     def chunk_latency(self, history_len: int, chunk_size: int) -> float:
         """Modeled attention-area runtime of ``chunk_size`` tokens after a prefix."""
         return (
-            self.quadratic_coeff
-            * (2.0 * history_len * chunk_size + chunk_size * chunk_size)
+            self.quadratic_coeff * _attention_area(history_len, chunk_size)
             + self.linear_coeff * chunk_size
         )
 
@@ -494,3 +551,282 @@ class ChunkSizePredictor:
         )
         aligned = constrained - constrained % alignment
         return aligned if aligned >= alignment else None
+
+
+def profile_chunk_grid(alignment: int, max_chunk: int) -> list[int]:
+    """Return aligned startup profiling sizes spanning the sweep ratio."""
+
+    def align(value: int) -> int:
+        return max(alignment, int(value) // alignment * alignment)
+
+    chunk_floor = max(alignment, max_chunk // PROFILE_SWEEP_RATIO)
+    return list(
+        dict.fromkeys(
+            align(chunk)
+            for chunk in np.linspace(
+                max_chunk, chunk_floor, num=PROFILE_SWEEP_POINTS, dtype=np.int64
+            )
+        )
+    )
+
+
+class ChunkTimingSample(NamedTuple):
+    """One prefill forward being timed by a pair of CUDA events."""
+
+    start: torch.cuda.Event
+    end: torch.cuda.Event
+    prefix_len: int
+    chunk_size: int
+
+
+class DynamicChunkingWorker:
+    """Worker-side driver for the chunk latency model.
+
+    Holds everything a ``ModelRunner`` does for dynamic chunking: the startup
+    dummy sweep that fits the attention-free terms, the CUDA events that time
+    real prefills, and the fit the engine polls for. The runner owns one of
+    these unconditionally and it stays inert unless the feature is on.
+    """
+
+    def __init__(self, runner: ModelRunner) -> None:
+        self._runner = runner
+        self._calibrator: ChunkLatencyCalibrator | None = None
+        self._pending: deque[ChunkTimingSample] = deque()
+        self._free_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        self._samples_seen = 0
+        self._last_prefix = -1
+        self._requests_seen = 0
+        self._rng = np.random.default_rng(0)
+
+    def profile(self) -> dict | None:
+        """Fit attention-free chunk overhead from startup dummy forwards.
+
+        All workers run the sweep in lockstep; only the PP head's TP rank 0 keeps
+        the result and calibrates attention terms from real prefills.
+        """
+        runner = self._runner
+        config = runner.config
+        if not config.enable_dynamic_chunking or config.pipeline_parallel_size <= 1:
+            return None
+
+        alignment = max(runner.block_size, 64)
+        max_chunk = min(
+            config.max_num_batched_tokens,
+            config.max_model_len,
+            config.num_kvcache_blocks * runner.block_size,
+        )
+        max_chunk -= max_chunk % alignment
+        chunk_grid = profile_chunk_grid(alignment, max_chunk)
+        if len(chunk_grid) < MIN_PROFILE_SAMPLES:
+            # Report it like a failed fit rather than raising: too little room to
+            # profile is a reason to serve with fixed chunking, not to fail startup.
+            reason = (
+                f"Dynamic chunking needs at least {MIN_PROFILE_SAMPLES} aligned "
+                f"profiling lengths, got {len(chunk_grid)} from "
+                f"max_chunk={max_chunk}, alignment={alignment}"
+            )
+            logger.warning("%s: %s", runner.label, reason)
+            return {"error": reason} if runner.rank == 0 else None
+
+        logger.info(
+            "%s: profiling dynamic chunking chunk overhead at %d sizes (max chunk=%d)",
+            runner.label,
+            len(chunk_grid),
+            max_chunk,
+        )
+        latencies_ms = self._sweep(chunk_grid)
+
+        try:
+            linear, constant = fit_chunk_overhead(chunk_grid, latencies_ms)
+        except ValueError as exc:
+            logger.warning(
+                "%s: dynamic chunking chunk overhead fit failed: %s", runner.label, exc
+            )
+            return {"error": str(exc)} if runner.rank == 0 else None
+
+        # Only the scheduling PP head collects runtime samples.
+        pp_rank = config.parallel_config.pipeline_parallel_rank
+        samples_here = pp_rank == 0
+        logger.info(
+            "%s: dynamic chunking chunk overhead b=%.3e c=%.3e on PP stage %d; "
+            "attention terms %s",
+            runner.label,
+            linear,
+            constant,
+            pp_rank,
+            (
+                "will be calibrated from this stage's real prefills"
+                if samples_here
+                else "come from the head stage"
+            ),
+        )
+        if runner.rank != 0:
+            # Other TP ranks ran duplicate shapes.
+            return None
+        if samples_here:
+            self._calibrator = ChunkLatencyCalibrator(linear, constant)
+        return {"linear_coeff": linear, "constant_coeff": constant}
+
+    def _sweep(self, chunk_grid: list[int]) -> list[float]:
+        """Time one dummy prefill per grid size, warmup excluded."""
+        runner = self._runner
+
+        def run(chunk_size: int) -> None:
+            runner.forward(self._dummy_batch(chunk_size))
+            runner.flush_pp_send()
+
+        # Absorbs first-shape compilation and lazy communicator costs.
+        run(chunk_grid[0])
+        torch.cuda.synchronize(runner.device)
+
+        latencies_ms: list[float] = []
+        for chunk_size in chunk_grid:
+            # Best of two limits straggler bias.
+            best_ms = math.inf
+            for _ in range(2):
+                torch.cuda.synchronize(runner.device)
+                start = time.perf_counter()
+                run(chunk_size)
+                torch.cuda.synchronize(runner.device)
+                best_ms = min(best_ms, (time.perf_counter() - start) * 1000.0)
+            latencies_ms.append(best_ms)
+        return latencies_ms
+
+    def _dummy_batch(self, chunk_size: int) -> ScheduledBatch:
+        # Imported here because `scheduler` imports this module at load time.
+        from atom.model_engine.scheduler import ScheduledBatch
+
+        runner = self._runner
+        block_size = runner.block_size
+        # Random tokens avoid an unrealistic single-expert MoE profile.
+        tokens = self._rng.integers(
+            0, int(runner.config.hf_config.vocab_size), size=chunk_size, dtype=np.int64
+        ).tolist()
+        seq = Sequence(tokens, block_size=block_size, id=-2)
+        seq.status = SequenceStatus.RUNNING
+        seq.type = SequenceType.PREFILL
+        seq.block_table = list(range(math.ceil(chunk_size / block_size)))
+        return ScheduledBatch(
+            seqs={seq.id: seq},
+            num_scheduled_tokens=[chunk_size],
+            total_tokens_num=chunk_size,
+            total_tokens_num_prefill=chunk_size,
+            total_seqs_num=1,
+            total_seqs_num_prefill=1,
+            is_dummy_run=True,
+            num_cached_tokens=[0],
+            is_final_chunk=[False],
+        )
+
+    def take_fit(self) -> dict | None:
+        """Return newly calibrated coefficients, or ``None`` if none are ready.
+
+        TP rank 0 always returns a dict so the polling RPC receives a response.
+        """
+        runner = self._runner
+        if runner.rank != 0:
+            return None
+        calibrator = self._calibrator
+        if calibrator is None:
+            return {"coefficients": None}
+        self._drain()
+        try:
+            predictor = calibrator.maybe_fit()
+        except ValueError as exc:
+            logger.warning("%s: dynamic chunking calibration: %s", runner.label, exc)
+            if not calibrator.gave_up:
+                return {"coefficients": None}
+            logger.warning(
+                "%s: giving up on dynamic chunking calibration after %d rejected "
+                "fits over %d shapes; chunking stays fixed",
+                runner.label,
+                MAX_CALIBRATION_FIT_FAILURES,
+                calibrator.num_shapes,
+            )
+            # Stop timing prefills: more of the same samples cannot pass the gates.
+            self._calibrator = None
+            return {"coefficients": None, "gave_up": True}
+        if predictor is None:
+            logger.info(
+                "%s: dynamic chunking still calibrating: %d timed prefills, "
+                "%d shapes, %d distinct prefixes, %d chunk sizes",
+                runner.label,
+                self._samples_seen,
+                calibrator.num_shapes,
+                calibrator.num_prefixes,
+                calibrator.num_chunk_sizes,
+            )
+            return {"coefficients": None}
+        logger.info(
+            "%s: dynamic chunking calibrated from %d real prefill shapes over "
+            "%d chunk sizes: a=%.3e b=%.3e c=%.3e gamma=%.3e",
+            runner.label,
+            calibrator.num_shapes,
+            calibrator.num_chunk_sizes,
+            predictor.quadratic_coeff,
+            predictor.linear_coeff,
+            predictor.constant_coeff,
+            predictor.prefix_coeff,
+        )
+        # Freeze the accepted fit and stop timing.
+        self._calibrator = None
+        return {
+            "coefficients": (
+                predictor.quadratic_coeff,
+                predictor.linear_coeff,
+                predictor.constant_coeff,
+                predictor.prefix_coeff,
+            ),
+            "num_shapes": calibrator.num_shapes,
+        }
+
+    def start_sample(self, batch: ScheduledBatch | None) -> ChunkTimingSample | None:
+        """Start timing ``batch`` if it is a single-request prefill worth a sample.
+
+        Records the start event, so the caller must pair a non-``None`` return
+        with ``finish_sample`` around the model call and nothing else.
+        """
+        if self._calibrator is None or batch is None or batch.is_dummy_run:
+            return None
+        if batch.total_seqs_num != 1 or batch.total_seqs_num_prefill != 1:
+            return None
+        if len(self._pending) >= MAX_PENDING_CHUNK_SAMPLES:
+            return None
+        if self._free_events:
+            start, end = self._free_events.pop()
+        else:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        return ChunkTimingSample(
+            start,
+            end,
+            int(batch.num_cached_tokens[0]),
+            int(batch.num_scheduled_tokens[0]),
+        )
+
+    def finish_sample(self, sample: ChunkTimingSample | None) -> None:
+        if sample is None:
+            return
+        sample.end.record()
+        self._pending.append(sample)
+        self._drain()
+
+    def _drain(self) -> None:
+        """Pass completed event timings to the calibrator without synchronizing."""
+        if self._calibrator is None:
+            return
+        pending = self._pending
+        while pending and pending[0].end.query():
+            sample = pending.popleft()
+            prefix = sample.prefix_len
+            self._samples_seen += 1
+            # A non-growing prefix starts a new request, including cache hits.
+            if self._last_prefix < 0 or prefix <= self._last_prefix:
+                self._requests_seen += 1
+            self._last_prefix = prefix
+            if self._requests_seen > DISCARD_FIRST_CHUNK_REQUESTS:
+                self._calibrator.add(
+                    prefix, sample.chunk_size, sample.start.elapsed_time(sample.end)
+                )
+            self._free_events.append((sample.start, sample.end))
