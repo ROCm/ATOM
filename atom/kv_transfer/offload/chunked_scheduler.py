@@ -623,8 +623,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             return
         self._save_inflight.pop(sid, None)
         if getattr(self, "_early_release", False):
-            # The dedicated connector completion reports store success/failure.
-            # This legacy terminal remains for MultiConnector save pairing.
+            # Store success/failure and lease release travel on the dedicated
+            # connector channel. This terminal clears the matching in-flight
+            # save; process_completions also triggers a scheduler release check.
             self._finish_retired_request(sid)
             return
         self._finish_save_statistics(req_id)
