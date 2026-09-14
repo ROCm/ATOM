@@ -25,6 +25,14 @@ ARG GPU_ARCH
 ENV GPU_ARCH_LIST=$GPU_ARCH
 ENV PYTORCH_ROCM_ARCH=$GPU_ARCH
 
+# Use the legacy HSA IPC mode. The new mode keeps GPU memory pinned after
+# hipFree when a rank dies, so a crashed vLLM/LMCache worker leaves its VRAM
+# behind and the server crash-loops on "not enough free GPU memory".
+# Set in the base stage so every downstream image (atom, vllm-atom, sglang-atom)
+# inherits it. See https://github.com/ROCm/rocm-libraries/issues/6266 and the
+# same setting in vllm's own docker/Dockerfile.rocm.
+ENV HSA_ENABLE_IPC_MODE_LEGACY=1
+
 # AITER's prebuilt and runtime-JIT modules must use the same pybind ABI.
 RUN pip install --upgrade pip "pybind11==3.0.4" && \
     apt-get update && \
