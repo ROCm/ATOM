@@ -5,7 +5,7 @@ This recipe runs the SemiAnalysis/Weka AgentX replay workload against GLM-5.2-MX
 - `amd/GLM-5.2-MXFP4`
 - TP4
 - FP8 KV cache
-- MTP with four speculative tokens
+- MTP, with the draft depth chosen per concurrency point (5 / 4 / 3)
 - forced acceptance length fixed to the current benchmark target
 - native GPU prefix caching plus a 512 GiB/rank LMCache CPU tier
 - the SemiAnalysis Weka AgentX workload
@@ -24,8 +24,8 @@ For PD-disaggregated serving, see [`mesh/Agentic-GLM-5.2.md`](mesh/Agentic-GLM-5
 | KV cache | FP8 |
 | Prefix cache | Enabled |
 | CPU offload | LMCache, 512 GiB per TP rank (2 TiB total), 256-token chunks |
-| Speculative decoding | Native MTP, 4 draft tokens |
-| Forced acceptance length | `3.33` tokens/forward |
+| Speculative decoding | Native MTP, draft depth per concurrency (see below) |
+| Forced acceptance length | Golden AL for that depth (see below) |
 | Profiling duration | 3,600 seconds |
 | Warmup | 10 additional one-token requests per lane |
 | AIPerf | `0.12.0` (`agentx-v1.0.4`) |
@@ -34,13 +34,26 @@ For PD-disaggregated serving, see [`mesh/Agentic-GLM-5.2.md`](mesh/Agentic-GLM-5
 
 Start a fresh server for each concurrency point.
 
-Use TP + MTP for small concurrency (`C2`–`C10`), and TP + DCP for large
-concurrency (`C16` and above).
+Use TP + MTP for small concurrency (`C2`-`C10`), and TP + DCP + MTP for large
+concurrency (`C16` and above). Both modes run speculative decoding; the draft
+depth is chosen per concurrency point.
+
+| Concurrency | Parallelism | `--num-speculative-tokens` | `--spec-decode-acceptance-length` |
+|---|---|---:|---:|
+| C2, C4, C8 | TP4 | 5 | `3.61` |
+| C10 | TP4 | 4 | `3.33` |
+| C16, C24, C32, C40 | TP4 + DCP4 | 4 | `3.33` |
+| C48 | TP4 + DCP4 | 3 | `2.99` |
+
+Acceptance lengths are the golden values from
+[`golden_al_distribution/glm5.2_mtp.yaml`](https://github.com/SemiAnalysisAI/InferenceX/blob/main/golden_al_distribution/glm5.2_mtp.yaml)
+(`glm-5.2-fp8`, `thinking_on`).
 
 ### GLM-5.2 MXFP4 with TP + MTP (small concurrency)
 
-For small-concurrency runs, TP4 + MTP4 uses four speculative tokens and the
-current benchmark's forced acceptance length of `3.33`.
+For small-concurrency runs, `C2`-`C8` use five speculative tokens and `C10` uses
+four; the case block resolves both the draft depth and its golden AL from
+`CONC`.
 
 ```bash
 export MODEL_PATH=${MODEL_PATH:-models/GLM-5.2-MXFP4}
@@ -67,14 +80,15 @@ export OFFLOAD_MIN_LOAD_TOKENS=8192
 export TP=${TP:-4}
 export CONC=${CONC:-8}
 
+# MTP_K and MTP_AL move together: the AL is the golden value for that depth.
 case "${CONC}" in
-  1)  CUDAGRAPH_CAPTURE_SIZES='[1,2]' ;;
-  2)  CUDAGRAPH_CAPTURE_SIZES='[1,2,4]' ;;
-  4)  CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8]' ;;
-  8)  CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8,12,16]' ;;
-  10) CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8,12,16,20]' ;;
-  12) CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8,12,16,20,24]' ;;
-  16) CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8,12,16,20,24,28,32]' ;;
+  1)  CUDAGRAPH_CAPTURE_SIZES='[1,2]';                       MTP_K=5; MTP_AL=3.61 ;;
+  2)  CUDAGRAPH_CAPTURE_SIZES='[1,2,4]';                     MTP_K=5; MTP_AL=3.61 ;;
+  4)  CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8]';                   MTP_K=5; MTP_AL=3.61 ;;
+  8)  CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8,12,16]';             MTP_K=5; MTP_AL=3.61 ;;
+  10) CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8,12,16,20]';          MTP_K=4; MTP_AL=3.33 ;;
+  12) CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8,12,16,20,24]';       MTP_K=4; MTP_AL=3.33 ;;
+  16) CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8,12,16,20,24,28,32]'; MTP_K=4; MTP_AL=3.33 ;;
   *)
     echo "Unsupported CONC=${CONC}" >&2
     exit 2
@@ -94,11 +108,11 @@ python -m atom.entrypoints.openai_server \
   --tensor-parallel-size "${TP}" \
   --max-num-seqs "$((CONC * 2))" \
   --cudagraph-capture-sizes "${CUDAGRAPH_CAPTURE_SIZES}" \
-  --num-speculative-tokens 4 \
+  --num-speculative-tokens "${MTP_K}" \
   --method mtp \
-  --spec-decode-acceptance-length 3.33 \
+  --spec-decode-acceptance-length "${MTP_AL}" \
   --max-num-batched-tokens 16384 \
-  2>&1 | tee "server-glm52-mtp4-c${CONC}.log"
+  2>&1 | tee "server-glm52-mtp${MTP_K}-c${CONC}.log"
 ```
 
 #### Forced Acceptance Semantics
@@ -128,8 +142,12 @@ Also remove the `--kv-transfer-config` argument from the server command.
 ### GLM-5.2 MXFP4 with TP + DCP (large concurrency)
 
 For large-concurrency runs, TP4 + DCP4 reuses the same four GPUs to shard the
-decode KV cache and increase the available decode batch capacity; speculative
-decoding is disabled.
+decode KV cache and increase the available decode batch capacity. Speculative
+decoding stays on: `C16`-`C40` use four draft tokens and `C48` uses three.
+
+> **Note:** with MTP on the DCP path the engine disables DCP query replication,
+> and the KV pool is ~3.7% smaller because the draft layer carries its own KV.
+> Both are expected; compare MTP and non-MTP runs at the same concurrency.
 
 ```bash
 export MODEL_PATH=${MODEL_PATH:-models/GLM-5.2-MXFP4}
@@ -163,6 +181,13 @@ if (( CONC < 16 )); then
   echo "DCP mode expects large CONC (>=16); got CONC=${CONC}" >&2
   exit 2
 fi
+
+# Draft depth by concurrency; AL is the golden value for that depth.
+if (( CONC >= 48 )); then
+  MTP_K=3; MTP_AL=2.99
+else
+  MTP_K=4; MTP_AL=3.33
+fi
 CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8'
 for ((size=12; size <= CONC * 2; size += 4)); do
   CUDAGRAPH_CAPTURE_SIZES+=",${size}"
@@ -183,8 +208,11 @@ python -m atom.entrypoints.openai_server \
   --decode-context-parallel-size "${DCP}" \
   --max-num-seqs "$((CONC * 2))" \
   --cudagraph-capture-sizes "${CUDAGRAPH_CAPTURE_SIZES}" \
+  --num-speculative-tokens "${MTP_K}" \
+  --method mtp \
+  --spec-decode-acceptance-length "${MTP_AL}" \
   --max-num-batched-tokens 16384 \
-  2>&1 | tee "server-glm52-dcp${DCP}-tp${TP}-c${CONC}.log"
+  2>&1 | tee "server-glm52-dcp${DCP}-tp${TP}-mtp${MTP_K}-c${CONC}.log"
 ```
 
 ## 2. Run the AgentX Profile
