@@ -33,6 +33,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorWorkerMetadata,
 )
 
+from atom.kv_transfer.disaggregation.types import ConnectorCompletion
 from atom.plugin.vllm.kv_transfer.kv_cache_layout import build_kv_cache_tensors
 from atom.plugin.vllm.kv_transfer.offload_config import build_offload_config
 from atom.plugin.vllm.kv_transfer.seq_view import SeqViewRegistry
@@ -80,11 +81,20 @@ class AtomOffloadWorkerMetadata(KVConnectorWorkerMetadata):
     written its shard: acting on the first report would drop
     ``should_defer_free`` while a slower rank is still reading the blocks.
     ``aggregate`` sums the ranks of one step; the scheduler half sums the steps.
+
+    ``completions`` carries ATOM's connector-owned completion channels, which
+    are a third thing vLLM has no slot for. They are what releases the save's
+    block lease, and without them ``should_defer_free`` never goes false: the
+    per-operation owner and source-safe maps only ever grow, every finished
+    request keeps its blocks, and the pool deadlocks on capacity with nothing
+    running. The events are forwarded verbatim rather than interpreted --
+    channel semantics belong to the layout, not to this adapter.
     """
 
-    def __init__(self, saved=None, load_failed=None) -> None:
+    def __init__(self, saved=None, load_failed=None, completions=None) -> None:
         self.saved: dict[str, int] = dict(saved or {})
         self.load_failed: dict[str, int] = dict(load_failed or {})
+        self.completions: list[ConnectorCompletion] = list(completions or ())
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
@@ -93,12 +103,13 @@ class AtomOffloadWorkerMetadata(KVConnectorWorkerMetadata):
             mine = getattr(self, field)
             for req_id, count in (getattr(other, field, None) or {}).items():
                 mine[req_id] = mine.get(req_id, 0) + int(count)
+        self.completions.extend(getattr(other, "completions", None) or ())
         return self
 
     def __repr__(self) -> str:
         return (
             f"AtomOffloadWorkerMetadata(saved={self.saved}, "
-            f"load_failed={self.load_failed})"
+            f"load_failed={self.load_failed}, completions={self.completions})"
         )
 
 
@@ -127,6 +138,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         self._pending_release_ids: list[str] = []
         self._worker_saved: dict[str, int] = {}
         self._worker_load_failed: dict[str, int] = {}
+        self._worker_completions: list[ConnectorCompletion] = []
 
         # Scheduler half: requests whose free vLLM is holding for us, split by
         # what they are still waiting for -- the save to land, or the worker to
@@ -137,6 +149,8 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         # metadata rather than as one of vLLM's two id sets.
         self._save_reports: dict[str, int] = {}
         self._load_failure_reports: dict[str, int] = {}
+        # channel/operation key -> [ranks reported, succeeded on all of them].
+        self._completion_reports: dict[tuple, list] = {}
         self._world_size = max(
             1, int(getattr(vllm_config.parallel_config, "world_size", 1) or 1)
         )
@@ -306,6 +320,10 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         for completion in out.finished_saving:
             req_id = _req_id_of(completion)
             self._worker_saved[req_id] = self._worker_saved.get(req_id, 0) + 1
+        # ATOM's connector-owned channels. `finished_saving` above is the
+        # legacy terminal that clears `_save_inflight`; these are what release
+        # the save's block lease, and dropping them deadlocks the pool.
+        self._worker_completions.extend(out.connector_completions)
 
         finished_sending = set(self._pending_release_ids)
         self._pending_release_ids.clear()
@@ -332,11 +350,16 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         none: the aggregator folds only non-``None`` metadata, and a step with
         no offload activity should not pickle an empty object per rank.
         """
-        if not (self._worker_saved or self._worker_load_failed):
+        if not (
+            self._worker_saved or self._worker_load_failed or self._worker_completions
+        ):
             return None
-        meta = AtomOffloadWorkerMetadata(self._worker_saved, self._worker_load_failed)
+        meta = AtomOffloadWorkerMetadata(
+            self._worker_saved, self._worker_load_failed, self._worker_completions
+        )
         self._worker_saved = {}
         self._worker_load_failed = {}
+        self._worker_completions = []
         return meta
 
     def shutdown(self) -> None:
@@ -601,6 +624,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         """
         if meta is None:
             return
+        self._apply_completions(getattr(meta, "completions", None) or ())
         for req_id, count in (getattr(meta, "load_failed", None) or {}).items():
             rid = str(req_id)
             self._load_failure_reports[rid] = self._load_failure_reports.get(
@@ -617,6 +641,47 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
                 self._save_reports.pop(rid, None)
             if quorums:
                 self._scheduler.save_finished_by_request(rid)
+
+    def _apply_completions(self, completions) -> None:
+        """Hand ATOM's connector-owned completions on, once every rank agrees.
+
+        These are the events `should_defer_free` waits for. The dense layout
+        emits two channels per save -- the staged source ranges becoming safe to
+        overwrite, and the store landing -- and the second is what pops the
+        operation's block lease. Drop them and `_save_operation_owner` only
+        grows: every finished request defers forever, each pinning its blocks
+        and its SeqView, until the pool has no free block left and the engine
+        sits at zero running requests with one waiting on capacity.
+
+        Quorum is by count, as for `saved`: the worker's completion set is
+        drained on each `get_finished`, so a rank reports one event once.
+        Failure is dominant -- a store that failed on any rank did not persist
+        that range, and `_store_finished` keeps the lease so the range is not
+        advertised as source-safe.
+
+        The return value is deliberately ignored. ATOM's native worker treats a
+        ``True`` here as ALSO a terminal save; on this path the same save
+        already travels the legacy `finished_saving` channel (the dense
+        connector emits both), and completing it twice would let a delayed
+        report clear a newer save generation.
+        """
+        for completion in completions:
+            key = completion.key
+            report = self._completion_reports.get(key)
+            if report is None:
+                report = self._completion_reports[key] = [0, True]
+            report[0] += 1
+            report[1] = report[1] and bool(completion.succeeded)
+            if report[0] < self._world_size:
+                continue
+            del self._completion_reports[key]
+            handled = self._scheduler.connector_completion(
+                ConnectorCompletion(key[0], key[1], report[1])
+            )
+            if handled is False:
+                logger.warning(
+                    "ATOM LMCache offload: unhandled completion channel %s", key[0]
+                )
 
     def request_finished(self, request, block_ids) -> tuple[bool, dict | None]:
         req_id = request.request_id
