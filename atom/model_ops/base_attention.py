@@ -9,8 +9,10 @@ import triton
 import triton.language as tl
 from torch import nn
 
-from atom.config import get_current_atom_config
+from atom.config import CUDAGraphMode, get_current_atom_config
 from atom.utils import mark_spliting_op
+from atom.utils.cuda_graph import StableOutputs
+from atom.utils.forward_context import get_forward_context
 from atom.utils.selector import Family, get_attn_backend
 
 from .attention_mla import MLAModules, _mla_output_width
@@ -370,6 +372,22 @@ def fake_(
     return output
 
 
+def _deliver_attention_output(layer, output: torch.Tensor) -> torch.Tensor:
+    """Keep eager split-op outputs at the address the next graph captured."""
+    forward_context = get_forward_context()
+    if forward_context.cudagraph_runtime_mode != CUDAGraphMode.PIECEWISE:
+        return output
+
+    # The attention body runs outside the dense graphs and may allocate a fresh
+    # result on every call. Each layer/bucket needs its own persistent storage:
+    # replaying the next dense piece reads its captured pointer, not this call's
+    # newly allocated result. Allocate here, outside the dense graph's pool.
+    outputs = getattr(layer, "_piecewise_outputs", None)
+    if outputs is None:
+        outputs = layer._piecewise_outputs = StableOutputs()
+    return outputs.deliver(forward_context.batch_descriptor, output)
+
+
 # Dynamo will not try to inspect any of the internal operations for prefill or decode
 # This way, although attention operation is complicated,
 # we can still capture the model's computation graph as a full-graph
@@ -387,7 +405,7 @@ def unified_attention_with_output_base(
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
     if use_mla:
-        return self.impl.forward(
+        output = self.impl.forward(
             query=q,
             k_nope=k,
             k_rope=v,
@@ -395,7 +413,7 @@ def unified_attention_with_output_base(
             q_scale=q_scale,
         )
     else:
-        return self.impl.forward(
+        output = self.impl.forward(
             query=q,
             key=k,
             value=v,
@@ -403,6 +421,7 @@ def unified_attention_with_output_base(
             q_scale=q_scale,
             qkv=qkv,
         )
+    return _deliver_attention_output(self, output)
 
 
 def linear_attention_with_output_base_fake(
