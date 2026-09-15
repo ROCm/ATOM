@@ -27,6 +27,20 @@ import torch
 import triton
 import triton.language as tl
 
+try:
+    # aiter's chunk-narrowing per-row selector: same forced-block pins and tie
+    # direction as the Triton one below, same selection on every shape tried.
+    # It narrows in one pass where Triton folds tl.topk over
+    # ceil(max_block / BLOCK_SIZE_K) tiles, so it pulls ahead as the row widens
+    # -- 7us against 36us at a 1M context. `_aiter_selector_wins` says where.
+    from aiter.ops.flydsl.topk_per_row_small_k import (
+        topk_per_row_small_k,
+        topk_per_row_small_k_supported,
+    )
+except ImportError:  # pragma: no cover - aiter is optional at import time
+    topk_per_row_small_k = None
+    topk_per_row_small_k_supported = None
+
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
 # Query rows one prefill score program owns.
@@ -135,6 +149,203 @@ def _emit_sparse_block_table_row(
         bt_has_tail, bt_ctx, tl.minimum(bt_n_valid * block_size, causal_len)
     )
     tl.store(sctx_ptr, bt_ctx)
+
+
+# ---------------------------------------------------------------------------
+# Per-row valid column count, and the standalone emission that pairs with it.
+# The fused selector keeps a row's causal bound in registers; aiter's takes it
+# as a tensor, so serving aiter means writing it down -- once per forward, the
+# way `deepseek_v4_attn.csa_n_committed_per_token` does for the sibling indexer.
+# ---------------------------------------------------------------------------
+# Query rows one bounds program owns. Also the grid's second dimension, so the
+# two have to be the same number.
+_N_VALID_BLOCK_Q = 128
+
+
+@triton.jit
+def _n_valid_column_per_row_kernel(
+    out_ptr,  # [num_idx_heads * total_q] int32
+    row_starts,
+    row_prefix,
+    total_q,
+    block_size: tl.constexpr,
+    NUM_IDX_HEADS: tl.constexpr,
+    DECODE_MAX_Q: tl.constexpr,  # 0 = prefill; else query rows per request
+    BLOCK_Q: tl.constexpr,
+):
+    """Live column count per selector row; preamble mirrors the selector's.
+
+    Stores the head axis itself rather than leaving the caller an
+    `expand().contiguous()`, which would move the same numbers through HBM twice.
+    """
+    pid_b = tl.program_id(0)
+    if DECODE_MAX_Q > 0:
+        seq_start = pid_b * DECODE_MAX_Q
+        block_num = DECODE_MAX_Q
+        prefix_len = tl.load(row_prefix + pid_b) - DECODE_MAX_Q
+    else:
+        seq_start = tl.load(row_starts + pid_b)
+        block_num = tl.load(row_starts + pid_b + 1) - seq_start
+        prefix_len = tl.load(row_prefix + pid_b)
+
+    # The query axis is the grid's second dimension, not a loop: one request
+    # can be the whole batch, and folding its tiles into one program would
+    # serve a long prefill from a single compute unit. Ragged requests make
+    # the bound per-request, so the short ones exit here.
+    off = tl.program_id(1) * BLOCK_Q
+    if off >= block_num:
+        return
+    q = off + tl.arange(0, BLOCK_Q)
+    live = q < block_num
+    # ceil(causal_len / block_size) for causal_len = prefix_len + q + 1;
+    # the selector spells the same thing as its `valid_blocks`.
+    n_valid = (prefix_len + q + block_size) // block_size
+    for h in tl.static_range(NUM_IDX_HEADS):
+        tl.store(out_ptr + h * total_q + seq_start + q, n_valid, mask=live)
+
+
+def build_n_valid_column_per_row(
+    row_starts,
+    row_prefix,
+    *,
+    batch,
+    total_q,
+    num_idx_heads,
+    decode_max_q,
+    out=None,
+):
+    """``[num_idx_heads * total_q]`` int32: live columns of each selector row.
+
+    A row is one (index head, query token) pair, head-major to match
+    ``score.view(rows, max_block)``; the count is
+    ``ceil(causal_len / SPARSE_BLOCK_SIZE)``, which depends on the token alone,
+    so the head axis repeats. None when the batch is empty.
+
+    ``out`` is a persistent buffer to fill, sliced here: a captured decode
+    replays against the pointer baked in at capture, so a fresh allocation each
+    step would be read at its stale address.
+    """
+    rows = num_idx_heads * total_q
+    if batch <= 0 or rows <= 0:
+        return None
+    # Slicing a buffer shorter than `rows` yields a shorter tensor without
+    # complaining, while the kernel still writes `rows` of them off the raw
+    # pointer -- the one failure here that is silent.
+    assert (
+        out is None or out.numel() >= rows
+    ), f"n_valid_column_per_row needs {rows} rows, buffer holds {out.numel()}"
+    out = (
+        torch.empty(rows, dtype=torch.int32, device=row_starts.device)
+        if out is None
+        else out[:rows]
+    )
+    q_tiles = triton.cdiv(decode_max_q or total_q, _N_VALID_BLOCK_Q)
+    _n_valid_column_per_row_kernel[(batch, q_tiles)](
+        out,
+        row_starts,
+        row_prefix,
+        total_q,
+        block_size=SPARSE_BLOCK_SIZE,
+        NUM_IDX_HEADS=num_idx_heads,
+        DECODE_MAX_Q=decode_max_q,
+        BLOCK_Q=_N_VALID_BLOCK_Q,
+    )
+    return out
+
+
+def n_valid_column_per_row_for_forward(owner, phase, row_starts, row_prefix, **kw):
+    """:func:`build_n_valid_column_per_row`, hoisted to once per forward.
+
+    For the vLLM and SGLang plugins, whose metadata is framework code with no
+    field to publish into. Native ATOM reads
+    `MiniMaxM3SparseMetadata.n_valid_column_per_row` instead.
+
+    `owner` MUST live exactly one forward -- the framework's per-step metadata
+    or batch. That is the whole licence for caching with no content key: both
+    frameworks refill persistent length buffers in place, so a cache keyed on
+    shapes or pointers would serve the previous step's bounds. `phase` splits
+    decode from prefill, which a hybrid batch runs both of over different rows.
+    """
+    cache = getattr(owner, "_n_valid_column_per_row", None)
+    if cache is None:
+        cache = {}
+        try:
+            owner._n_valid_column_per_row = cache
+        except AttributeError:
+            pass  # slotted metadata: correct, just rebuilt per layer
+    if phase not in cache:
+        cache[phase] = build_n_valid_column_per_row(row_starts, row_prefix, **kw)
+    return cache[phase]
+
+
+@triton.heuristics({"BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["topk"])})
+@triton.jit
+def _emit_sparse_block_table_kernel(
+    ti_ptr,  # [num_heads, total_q, topk] the selection to compact
+    row_starts,
+    row_prefix,
+    topk,
+    stride_ti_h,
+    stride_ti_n,
+    stride_ti_t,
+    block_table_ptr,
+    sparse_bt_ptr,
+    sparse_ctx_ptr,
+    stride_bt_b,
+    stride_sbt_n,
+    sample_interval,
+    block_size,
+    NUM_KV_HEADS: tl.constexpr,
+    DECODE_MAX_Q: tl.constexpr,
+    pages_per_block: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+):
+    """The fused selector's emission, reading the selection from HBM instead.
+
+    Same compaction -- it calls the same helper -- so the two paths cannot
+    drift. Its cost splits: 2.5-4.7us of device time, and ~14us of python
+    launch that a captured replay does not pay at all. Only the first half is
+    why `_AITER_MIN_WIDTH_WITH_EMIT` asks for a wider row than the bare
+    selection does.
+    """
+    pid_q = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    pid_h = tl.program_id(2)
+    if DECODE_MAX_Q > 0:
+        seq_start = pid_b * DECODE_MAX_Q
+        block_num = DECODE_MAX_Q
+        prefix_len = tl.load(row_prefix + pid_b) - DECODE_MAX_Q
+    else:
+        seq_start = tl.load(row_starts + pid_b)
+        block_num = tl.load(row_starts + pid_b + 1) - seq_start
+        prefix_len = tl.load(row_prefix + pid_b)
+    if pid_q >= block_num:
+        return
+
+    off_t = tl.arange(0, BLOCK_SIZE_T)
+    topk_idx = tl.load(
+        ti_ptr
+        + (seq_start + pid_q) * stride_ti_n
+        + pid_h * stride_ti_h
+        + off_t * stride_ti_t,
+        mask=off_t < topk,
+        other=-1,
+    ).to(tl.int32)
+
+    emit_row = (seq_start + pid_q) * NUM_KV_HEADS + pid_h
+    _emit_sparse_block_table_row(
+        topk_idx,
+        block_table_ptr + pid_b * stride_bt_b,
+        sparse_bt_ptr + emit_row * stride_sbt_n,
+        sparse_ctx_ptr + emit_row,
+        prefix_len + pid_q * sample_interval + 1,
+        topk,
+        pid_h,
+        block_size,
+        pages_per_block,
+        NUM_KV_HEADS,
+        BLOCK_SIZE_T,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -463,6 +674,64 @@ def _alloc_emit(total_q, num_idx_heads, topk, block_table, emit, device):
     return (sparse_bt, sparse_ctx), args
 
 
+# Row widths (in 128-blocks) from which aiter's selector is the cheaper way to
+# serve the call; under them the fused Triton kernel is, being one launch that
+# also emits. Device us, MI355X, topk=16, rows 1..512, rocprofv3-attributed
+# (`/app/logs_claude/m3_emit_gate_device*.log`), as triton/aiter:
+#
+#     width        64     512    1024    2048    8192
+#     emit=True   0.6x    0.7x    1.0x    1.4x    3.7x
+#     emit=False  0.8x    ~1.0x   1.25x   2.0x    4.8x
+#
+# Width decides, not rows: at fixed width the ratio moves <0.2x across 1..512
+# rows. Emission raises the bar because it costs a second kernel there, 26us
+# against the ~4us the fusion charges for the same work.
+_AITER_MIN_WIDTH = 1024
+_AITER_MIN_WIDTH_WITH_EMIT = 2048
+
+
+def _aiter_selector_wins(width, emit):
+    return width >= (_AITER_MIN_WIDTH_WITH_EMIT if emit else _AITER_MIN_WIDTH)
+
+
+# aiter's support predicate answers from shape, dtype and arch alone, but costs
+# 11.4us of Python to ask -- against 7-10us of device time for the selection
+# itself, on a path that runs once per sparse layer. Memoized on what it reads.
+_AITER_SERVES: dict[tuple, bool] = {}
+
+
+def _select_with_aiter(
+    score, topk_idx, n_valid_column_per_row, topk, init_blocks, local_blocks
+):
+    """Run the selection through aiter, or return False if it cannot serve.
+
+    Declines rather than raises: k past the wave width, or a survivor buffer
+    past the LDS budget, are shapes the Triton selector still handles. `score`
+    and `topk_idx` are contiguous, so the flattening is a view.
+    """
+    if topk_per_row_small_k is None:
+        return False
+    heads, total_q, max_block = score.shape
+    rows = heads * total_q
+    flat_score = score.view(rows, max_block)
+    flat_idx = topk_idx.view(rows, topk)
+    # The bounds length is in the key, not assumed equal to `rows`: a caller
+    # whose decode tokens are not `max_query_len` per request hands a shorter
+    # one, and that has to keep declining rather than hit a cached yes.
+    key = (rows, max_block, topk, n_valid_column_per_row.shape[0], score.device)
+    served = _AITER_SERVES.get(key)
+    if served is None:
+        served = _AITER_SERVES[key] = topk_per_row_small_k_supported(
+            flat_score, n_valid_column_per_row, flat_idx, topk
+        )
+    if not served:
+        return False
+    topk_per_row_small_k(
+        flat_score, n_valid_column_per_row, flat_idx, topk, init_blocks, local_blocks
+    )
+    return True
+
+
 def _launch_select(
     score,
     topk_idx,
@@ -480,6 +749,7 @@ def _launch_select(
     block_size_k,
     num_warps,
     emit,
+    n_valid_column_per_row=None,
 ):
     """The one selection pass, launched the same way by both phases.
 
@@ -489,6 +759,45 @@ def _launch_select(
     collapse to seq_lens and the tile and warp count have to be constants.
     """
     sbt, sctx, bt_stride0, sbt_stride0 = emit_args
+    # Bounds published and the row wide enough to pay for aiter; the selection
+    # runs inside the check, which returns False on a shape aiter declines.
+    # Without bounds the Triton kernel serves, holding the bound in registers --
+    # deriving a private copy here is the per-layer rebuild that
+    # `MiniMaxM3SparseMetadata.n_valid_column_per_row` exists to avoid.
+    take_aiter = n_valid_column_per_row is not None and _aiter_selector_wins(
+        score.shape[2], emit
+    )
+    if take_aiter and _select_with_aiter(
+        score, topk_idx, n_valid_column_per_row, topk, init_blocks, local_blocks
+    ):
+        if emit:
+            _emit_sparse_block_table_kernel[(rows_per_req, batch, num_idx_heads)](
+                topk_idx,
+                row_starts,
+                row_prefix,
+                topk,
+                *topk_idx.stride(),
+                block_table,
+                sbt,
+                sctx,
+                bt_stride0,
+                sbt_stride0,
+                1,  # sample_interval (block_size_q)
+                SPARSE_BLOCK_SIZE,
+                NUM_KV_HEADS=num_idx_heads,
+                DECODE_MAX_Q=decode_max_q,
+                pages_per_block=PAGES_PER_SPARSE_BLOCK,
+                # The compaction alone is a `topk x pages_per_block` tile --
+                # 16x8 here -- so a wave is already more lanes than it has
+                # work, and the helper's cumsum stops crossing warps. The
+                # fused kernel reaches the same number from the other side
+                # (`PREFILL_TOPK_NUM_WARPS`); `DECODE_TOPK_NUM_WARPS` is 8 for
+                # the scoring this one does not do. Measured prefill device
+                # time 8.03us -> 4.66us, decode 2.63 -> 2.50, same bytes out.
+                num_warps=1,
+            )
+        return
+
     _topk_index_packed_kernel[(rows_per_req, batch, num_idx_heads)](
         score,
         topk_idx,
@@ -764,6 +1073,7 @@ def minimax_m3_index_topk(
     num_kv_heads: int,
     sm_scale: float,
     emit_sparse_block_table: bool = False,
+    n_valid_column_per_row: torch.Tensor | None = None,
 ):
     """Index block-score + top-k selection. block_size_q == 1 (per-token).
 
@@ -776,6 +1086,13 @@ def minimax_m3_index_topk(
     compaction and returns ``(topk_idx, sparse_bt [total_q, topk*8], sparse_ctx
     [total_q])`` ready for the ASM prefill kernel -- saving a separate build
     launch + topk_idx HBM round-trip.
+
+    ``n_valid_column_per_row`` is the batch's
+    ``MiniMaxM3SparseMetadata.n_valid_column_per_row``, built once per forward by
+    the attention metadata and handed to every sparse layer. It makes the aiter
+    selector eligible -- the row width decides whether it is actually cheaper
+    (`_aiter_selector_wins`); omitted, the Triton one runs, which derives the
+    same bound in registers.
     """
     total_q, num_idx_heads, head_dim = idx_q.shape
     assert (
@@ -849,6 +1166,7 @@ def minimax_m3_index_topk(
         block_size_k=_prefill_topk_block_size_k(max_block),
         num_warps=PREFILL_TOPK_NUM_WARPS,
         emit=emit_sparse_block_table,
+        n_valid_column_per_row=n_valid_column_per_row,
     )
     return (topk_idx, *emit_out) if emit_out else topk_idx
 
@@ -867,6 +1185,7 @@ def minimax_m3_index_topk_decode(
     sm_scale: float,
     emit_sparse_block_table: bool = False,
     max_query_len: int = 1,  # query tokens per request (num_spec+1); 1 == plain decode
+    n_valid_column_per_row: torch.Tensor | None = None,
 ):
     """Decode index block-score + top-k, both split-K (cudagraph-safe).
 
@@ -880,6 +1199,13 @@ def minimax_m3_index_topk_decode(
     SHUFFLE block-table compaction and returns ``(topk_idx, sparse_bt [total_q,
     topk*8], sparse_ctx [total_q])`` ready for the ASM/gluon decode kernel --
     saving a separate build launch + topk_idx HBM round-trip.
+
+    ``n_valid_column_per_row`` is the batch's
+    ``MiniMaxM3SparseMetadata.n_valid_column_per_row``, built once per forward by
+    the attention metadata and handed to every sparse layer. It makes the aiter
+    selector eligible -- the row width decides whether it is actually cheaper
+    (`_aiter_selector_wins`); omitted, the Triton one runs, which derives the
+    same bound in registers.
     """
     total_q, num_idx_heads, head_dim = idx_q.shape
     assert (
@@ -946,5 +1272,6 @@ def minimax_m3_index_topk_decode(
         block_size_k=DECODE_TOPK_BLOCK_SIZE_K,
         num_warps=DECODE_TOPK_NUM_WARPS,
         emit=emit_sparse_block_table,
+        n_valid_column_per_row=n_valid_column_per_row,
     )
     return (topk_idx, *emit_out) if emit_out else topk_idx
