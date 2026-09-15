@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: MIT
 import pytest
 import torch
+
+if not torch.version.hip or not torch.cuda.is_available():
+    pytest.skip("requires a ROCm GPU", allow_module_level=True)
+
 from aiter.ops.quant import per_tensor_quant_hip
 from aiter.test_common import checkAllclose
 
 from atom.model_ops.triton_fused_qkv_quant import fused_qkv_per_tensor_quant
-
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not torch.version.hip, reason="requires a ROCm GPU"
-)
 
 
 @pytest.mark.parametrize("tokens", [0, 1, 3, 5, 88, 512, 1001, 8192])
