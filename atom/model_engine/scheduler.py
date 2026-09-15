@@ -1283,8 +1283,7 @@ class Scheduler:
             running_decode_batch = max(
                 0, len(self.running) - self._partial_prefill_count
             )
-            protects_decode = getattr(self.prefill_delayer, "protects_decode", None)
-            if protects_decode is not None and protects_decode(running_decode_batch):
+            if self.prefill_delayer.protects_decode(running_decode_batch):
                 prefillable = bool(self.waiting) or self._partial_prefill_count > 0
                 pending_tokens = 0
             elif self._local_prefill_coalescing:
