@@ -2,6 +2,7 @@
 import pytest
 import torch
 from aiter.ops.quant import per_tensor_quant_hip
+from aiter.test_common import checkAllclose
 
 from atom.model_ops.triton_fused_qkv_quant import fused_qkv_per_tensor_quant
 
@@ -28,18 +29,51 @@ def test_strided_qkv_matches_hip(tokens, dtype):
                 x.contiguous().view(-1, 4096 if x.numel() % 4096 == 0 else 128),
                 quant_dtype=torch.float8_e4m3fn,
             )
-            torch.testing.assert_close(
-                out[i].float(), ref.view(x.shape).float(), rtol=0, atol=0
+            assert (
+                checkAllclose(
+                    out[i].float(),
+                    ref.view(x.shape).float(),
+                    rtol=0,
+                    atol=0,
+                    tol_err_ratio=0,
+                    msg="quantized output",
+                )
+                == 0
             )
-            torch.testing.assert_close(out[3 + i], scale, rtol=0, atol=0)
+            assert (
+                checkAllclose(
+                    out[3 + i],
+                    scale,
+                    rtol=0,
+                    atol=0,
+                    tol_err_ratio=0,
+                    msg="descale",
+                )
+                == 0
+            )
         else:
-            torch.testing.assert_close(
-                out[3 + i],
-                torch.full_like(out[3 + i], 1e-6),
+            assert (
+                checkAllclose(
+                    out[3 + i],
+                    torch.full_like(out[3 + i], 1e-6),
+                    rtol=0,
+                    atol=0,
+                    tol_err_ratio=0,
+                    msg="empty descale",
+                )
+                == 0
             )
     for i in (1, 2):
-        torch.testing.assert_close(
-            out[5 + i], out[3 + i].clamp_min(1e-6) * 2, rtol=0, atol=0
+        assert (
+            checkAllclose(
+                out[5 + i],
+                out[3 + i].clamp_min(1e-6) * 2,
+                rtol=0,
+                atol=0,
+                tol_err_ratio=0,
+                msg="gather descale",
+            )
+            == 0
         )
 
 
@@ -51,7 +85,17 @@ def test_no_padding_reads_and_zero_input(tokens):
     k = torch.zeros((tokens + 1, 4, 13), device="cuda", dtype=q.dtype)
     v = k.transpose(0, 1)
     out = fused_qkv_per_tensor_quant(q, k, v)
-    torch.testing.assert_close(out[0].float() * out[3], q.float(), rtol=1e-6, atol=0)
+    assert (
+        checkAllclose(
+            out[0].float() * out[3],
+            q.float(),
+            rtol=1e-6,
+            atol=0,
+            tol_err_ratio=0,
+            msg="strided input",
+        )
+        == 0
+    )
     for i in (1, 2):
         assert torch.count_nonzero(out[i].float()).item() == 0
         assert out[3 + i].item() == pytest.approx(1e-6)
@@ -72,6 +116,14 @@ def test_graph_replay_updates_scales_and_outputs():
         graph.replay()
         for i, x in enumerate((q, q, v)):
             scale = out[3 + i]
-            torch.testing.assert_close(
-                out[i].float() * scale, x.float(), rtol=1e-6, atol=0
+            assert (
+                checkAllclose(
+                    out[i].float() * scale,
+                    x.float(),
+                    rtol=1e-6,
+                    atol=0,
+                    tol_err_ratio=0,
+                    msg="graph replay",
+                )
+                == 0
             )

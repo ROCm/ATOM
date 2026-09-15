@@ -80,9 +80,7 @@ def _quant_tensor(
         amax = tl.max(tl.abs(x), 0)
     else:
         amax = tl.max(tl.load(Partial + tl.arange(0, PARTS)), 0)
-    # Match AITER for nonzero inputs. A zero descale gives FMHA NaNs when it
-    # scales masked -inf logits by zero. Use a positive scale for zero tensors;
-    # 1e-6 also preserves the cached-gather clamp/headroom policy exactly.
+    # Match AITER for nonzero inputs; positive zero-input descales avoid FMHA NaNs.
     raw_descale = amax * (1.0 / 448.0)
     descale = tl.where(raw_descale > 0, raw_descale, 1e-6)
     inv = tl.inline_asm_elementwise(
@@ -171,17 +169,10 @@ def _fused_qkv_quant(
 def fused_qkv_per_tensor_quant(q, k, v):
     """Quantize 3-D Q/K/V to E4M3 with independent per-tensor FP32 descales.
 
-    Returns ``(q8, k8, v8, qs, ks, vs, gather_ks, gather_vs)``. Outputs are
-    contiguous and scales have shape [1].
-    Gather descales are ``max(ks/vs, 1e-6) * 2`` for cached-KV range headroom.
-
-    Reads strided tensors directly, including V sliced from a K/V projection.
-    Uses one launch for small tensors, otherwise two: partial amax reduction,
-    then quantization with final reduction and scale preparation. No atomics,
-    initialized workspace, contiguous copies, or host synchronization.
-    All-zero/empty tensors use descale 1e-6, so
-    FMHA can safely scale masked logits. Their FP8 values are zero and the
-    cached-gather descales retain the existing 2e-6 floor.
+    Returns ``(q8, k8, v8, qs, ks, vs, gather_ks, gather_vs)`` with contiguous
+    outputs and shape-[1] scales. Gather descales are ``max(ks/vs, 1e-6) * 2``.
+    Reads strided inputs in one launch for small tensors, otherwise two.
+    Zero/empty inputs use descale 1e-6 and gather descale 2e-6.
     """
     tensors = (q, k, v)
     if any(x.ndim != 3 or x.shape[1] == 0 or x.shape[2] == 0 for x in tensors):

@@ -1071,7 +1071,7 @@ class MLAAttention(nn.Module):
         call with ``kv_fp8`` must not fall back and read those BF16 views.
         """
         if self._flydsl_fmha_callable(q, k, v, dropout_p):
-            if q_fp8 is None and kv_fp8 is None and envs.ATOM_USE_FUSED_MLA_QKV_QUANT:
+            if q_fp8 is None and kv_fp8 is None:
                 q8, k8, v8, qs, ks, vs, _, _ = fused_qkv_per_tensor_quant(q, k, v)
                 q_fp8 = (q8, qs)
                 kv_fp8 = (k8, v8, ks, vs)
@@ -1703,40 +1703,20 @@ class MLAAttention(nn.Module):
             (k_nope_new, k_rope_new.expand((*k_nope_new.shape[:-1], -1))), dim=-1
         )
         prefill_q, k_new = self._drop_rope_pad(prefill_q, k_new)
-        # Q is identical across step 1 and every step-2 chunk (`_drop_rope_pad` is
-        # idempotent and the values never change), so quantize it once here
-        # instead of running an amax reduction over it per chunk.
+        # Quantize Q once and reuse it across the new tokens and cached chunks.
         fp8_eligible = self._flydsl_fmha_callable(
             prefill_q, k_new, v_new, attn_metadata.dropout_p
         )
         q_fp8 = None
         new_kv_fp8 = None
         kv_out_scales = None
-        gather_fp8 = (
-            self.use_flydsl_gather_kv_b_proj
-            and envs.ATOM_USE_FLYDSL_GATHER_KV_B_PROJ_FP8
-            and _FLYDSL_GATHER_FP8_AVAILABLE
-        )
-        if fp8_eligible and envs.ATOM_USE_FUSED_MLA_QKV_QUANT:
+        if fp8_eligible:
             q8, k8, v8, qs, ks, vs, gather_ks, gather_vs = fused_qkv_per_tensor_quant(
                 prefill_q, k_new, v_new
             )
             q_fp8 = (q8, qs)
             new_kv_fp8 = (k8, v8, ks, vs)
-            if gather_fp8:
-                kv_out_scales = (gather_ks, gather_vs)
-        elif fp8_eligible:
-            q_fp8 = quant_fp8_per_tensor(prefill_q)
-        if q_fp8 is not None and new_kv_fp8 is None and gather_fp8:
-            k8, ks = quant_fp8_per_tensor(k_new)
-            v8, vs = quant_fp8_per_tensor(v_new)
-            new_kv_fp8 = (k8, v8, ks, vs)
-            # Reuse new-token calibration for the cached context. Doubling the
-            # range is an exponent shift, preserving E4M3 relative precision
-            # while giving old-token outliers headroom. This changes the scale
-            # policy from per-chunk amax; the kernel saturates larger outliers.
-            # A zero amax from the HIP quantizer must not produce a zero divisor.
-            kv_out_scales = (ks.clamp_min(1e-6) * 2, vs.clamp_min(1e-6) * 2)
+            kv_out_scales = (gather_ks, gather_vs)
         new_out, new_lse = self._flash_attn_prefill(
             prefill_q,
             k_new,
