@@ -1,6 +1,72 @@
 ARG SGLANG_BASE_IMAGE="rocm/atom-dev:latest"
 ARG GPU_ARCH="gfx942;gfx950"
 
+# Build TileLang in an isolated stage. The ATOM runtime intentionally carries a
+# custom RCCL package, which leaves the rocm-hip meta-package unsatisfied from
+# apt's perspective. Repairing apt is safe here and cannot replace runtime RCCL.
+FROM ${SGLANG_BASE_IMAGE} AS build_tilelang
+ARG VENV_PYTHON="/opt/venv/bin/python"
+ARG TILELANG_REPO="https://github.com/tile-ai/tilelang.git"
+ARG TILELANG_COMMIT="a55a82302bf7f3c5af635b5c9146f728185cc900"
+ARG TILELANG_BUILD_JOBS=32
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && \
+    apt-get --fix-broken install -y && \
+    apt-get install -y --no-install-recommends \
+      curl gnupg libgtest-dev libgmock-dev libgflags-dev libsqlite3-dev \
+      libtinfo-dev zlib1g-dev libedit-dev libxml2-dev && \
+    rm -rf /var/lib/apt/lists/* && \
+    cmake -S /usr/src/googletest -B /tmp/build-gtest \
+      -DBUILD_GTEST=ON -DBUILD_GMOCK=ON -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build /tmp/build-gtest -j"${TILELANG_BUILD_JOBS}" && \
+    cp -v /tmp/build-gtest/lib/*.a /usr/lib/x86_64-linux-gnu/ && \
+    rm -rf /tmp/build-gtest
+
+RUN LLVM_CONFIG="" && \
+    for candidate in \
+      /opt/rocm/llvm/bin/llvm-config \
+      /opt/rocm/llvm-*/bin/llvm-config \
+      /opt/rocm-*/llvm*/bin/llvm-config; do \
+      if [ -x "${candidate}" ]; then LLVM_CONFIG="${candidate}"; break; fi; \
+    done && \
+    if [ -z "${LLVM_CONFIG}" ]; then \
+      install -d -m 0755 /etc/apt/keyrings && \
+      curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+        | gpg --dearmor -o /etc/apt/keyrings/llvm.gpg && \
+      echo "deb [signed-by=/etc/apt/keyrings/llvm.gpg] http://apt.llvm.org/noble/ llvm-toolchain-noble-18 main" \
+        > /etc/apt/sources.list.d/llvm.list && \
+      apt-get update && \
+      apt-get install -y --no-install-recommends llvm-18 && \
+      rm -rf /var/lib/apt/lists/*; \
+    fi && \
+    if [ -z "${LLVM_CONFIG}" ]; then LLVM_CONFIG="$(command -v llvm-config-18)"; fi && \
+    test -x "${LLVM_CONFIG}"
+
+RUN \
+    "${VENV_PYTHON}" -m pip install --upgrade \
+      "setuptools>=77.0.3,<80" wheel "cmake==4.3.4" ninja scikit-build-core \
+      "cython>=0.29.36,<3.0" \
+      "apache-tvm-ffi @ git+https://github.com/apache/tvm-ffi.git@37d0485b2058885bf4e7a486f7d7b2174a8ac1ce" \
+      "z3-solver==4.15.4.0"
+
+RUN LLVM_CONFIG="" && \
+    for candidate in \
+      /opt/rocm/llvm/bin/llvm-config \
+      /opt/rocm/llvm-*/bin/llvm-config \
+      /opt/rocm-*/llvm*/bin/llvm-config; do \
+      if [ -x "${candidate}" ]; then LLVM_CONFIG="${candidate}"; break; fi; \
+    done && \
+    if [ -z "${LLVM_CONFIG}" ]; then LLVM_CONFIG="$(command -v llvm-config-18)"; fi && \
+    test -x "${LLVM_CONFIG}" && \
+    git clone --recursive "${TILELANG_REPO}" /opt/tilelang && \
+    cd /opt/tilelang && \
+    git checkout --detach "${TILELANG_COMMIT}" && \
+    git submodule update --init --recursive && \
+    CMAKE_BUILD_PARALLEL_LEVEL="${TILELANG_BUILD_JOBS}" \
+    CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=ON -DROCM_PATH=/opt/rocm -DLLVM_CONFIG=${LLVM_CONFIG} -DSKBUILD_SABI_VERSION=" \
+      "${VENV_PYTHON}" -m pip wheel . --wheel-dir /tmp/tilelang-wheel \
+        --no-build-isolation --no-deps
+
 # SGLang image extends an ATOM base image and layers on an sglang checkout.
 FROM ${SGLANG_BASE_IMAGE} AS atom_sglang
 
@@ -54,6 +120,7 @@ RUN echo "========== [SGLANG-ATOM 2/6] Build sglang kernel ==========" && \
 
 RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" && \
     cd /app/sglang/python && \
+    "${VENV_PYTHON}" -m pip install --no-cache-dir /opt/rocm/share/amd_smi && \
     rm -f pyproject.toml && \
     cp pyproject_other.toml pyproject.toml && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir --no-deps -e . && \
@@ -88,6 +155,22 @@ RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" &
     rm -f /tmp/sglang-runtime-common.txt && \
     "${VENV_PYTHON}" -m pip show sglang torch triton transformers IPython orjson pybase64 petit-kernel wave-lang xgrammar outlines apache-tvm-ffi || true
 
+COPY --from=build_tilelang /tmp/tilelang-wheel /tmp/tilelang-wheel
+RUN echo "========== [SGLANG-ATOM 3.25/6] Install ROCm TileLang ==========" && \
+    "${VENV_PYTHON}" -m pip install --no-cache-dir --no-deps \
+      /tmp/tilelang-wheel/*.whl && \
+    rm -rf /tmp/tilelang-wheel && \
+    "${VENV_PYTHON}" -c "import tilelang; print(tilelang.__version__)"
+
+ARG FHT_REPO="https://github.com/jeffdaily/fast-hadamard-transform.git"
+ARG FHT_BRANCH="rocm"
+ARG FHT_COMMIT="46efb7d776d38638fc39f3c803eaee3dd7016bd1"
+RUN echo "========== [SGLANG-ATOM 3.5/6] Build ROCm fast-hadamard-transform ==========" && \
+    git clone --branch "${FHT_BRANCH}" "${FHT_REPO}" /app/fast-hadamard-transform && \
+    cd /app/fast-hadamard-transform && \
+    git checkout --detach "${FHT_COMMIT}" && \
+    "${VENV_PYTHON}" setup.py install
+
 # Keep SGLang aligned with the Triton that the ATOM base image ships.  SGLang
 # runtime installs can perturb Triton; restore the base package before final
 # validation so ATOM, AITER, triton_kernels, and SGLang run with one coherent
@@ -108,7 +191,7 @@ RUN echo "========== [SGLANG-ATOM 4/6] Restore base image Triton ==========" && 
 
 RUN echo "========== [SGLANG-ATOM 5/6] Validate vision/audio wheels ==========" && \
     "${VENV_PYTHON}" -m sglang.launch_server --help >/dev/null && \
-    "${VENV_PYTHON}" -c "import os, torch, torchvision, torchaudio, sglang, triton, transformers; from torchvision.io import decode_jpeg; assert torch.version.hip is not None, 'Torch is not ROCm build (torch.version.hip is None).'; print(f'torch: {torch.__version__}'); print(f'triton: {triton.__version__}'); print(f'transformers: {transformers.__version__}'); print(f'torchvision: {torchvision.__version__}'); print(f'torchaudio: {torchaudio.__version__}'); print(f'decode_jpeg: {decode_jpeg.__name__}'); print(f'sglang imported from: {sglang.__file__}'); print(f'PYTHONPATH={os.environ.get(\"PYTHONPATH\", \"\")}')" && \
+    "${VENV_PYTHON}" -c "import amdsmi, fast_hadamard_transform, os, tilelang, torch, torchvision, torchaudio, sglang, triton, transformers; from torchvision.io import decode_jpeg; assert torch.version.hip is not None, 'Torch is not ROCm build (torch.version.hip is None).'; print(f'torch: {torch.__version__}'); print(f'triton: {triton.__version__}'); print(f'transformers: {transformers.__version__}'); print(f'torchvision: {torchvision.__version__}'); print(f'torchaudio: {torchaudio.__version__}'); print(f'decode_jpeg: {decode_jpeg.__name__}'); print(f'sglang imported from: {sglang.__file__}'); print(f'PYTHONPATH={os.environ.get(\"PYTHONPATH\", \"\")}')" && \
     echo "Validated sglang launch_server entrypoint"
 
 RUN echo "========== [SGLANG-ATOM 5.5/6] Pin smg-grpc-servicer ==========" && \
