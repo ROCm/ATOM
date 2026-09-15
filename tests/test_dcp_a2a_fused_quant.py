@@ -18,13 +18,19 @@ if not torch.cuda.is_available():
 
 triton = pytest.importorskip("triton")
 
+from aiter import dtypes as _aiter_dtypes
+
 from atom.model_ops.dcp_ops import (
+    _AITER_AMAX_EPS,
     _dcp_a2a_unpack_combine_kernel,
     _dcp_a2a_unpack_combine_quant_kernel,
     _lse_pack_slots,
 )
 
-FP8 = torch.float8_e4m3fnuz if torch.version.hip else torch.float8_e4m3fn
+# The dtype the production call site passes: _dcp_fused_quant_dtype returns
+# aiter's dtypes.fp8, which is e4m3fn on MI355X. Hard-coding e4m3fnuz here
+# tested a format this path never sees.
+FP8 = _aiter_dtypes.fp8
 
 
 def _make_recv(n, b, h, d, dtype, pack, empty_rows=(), seed=0):
@@ -88,6 +94,7 @@ def _run_fused(recv, b, h, d, n, pack):
         LSE_PACK=pack,
         N_ROUNDED=triton.next_power_of_2(n),
         FP8_MAX=float(torch.finfo(FP8).max),
+        AMAX_EPS=_AITER_AMAX_EPS,
     )
     return out, scale
 
@@ -161,8 +168,13 @@ def test_scale_differs_from_the_bf16_path_only_by_bf16_rounding():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_empty_rows_do_not_poison_the_scale():
-    """A row every rank reports empty must come back all-zero with scale 1.0,
-    not NaN -- NaN in the scale would silently destroy the whole o_proj row."""
+    """A row every rank reports empty must dequantize to zero, not to NaN.
+
+    aiter floors the row max too but lets the clamp run, so its degenerate row
+    is `-FP8_MAX` paired with a zero scale and only cancels on the multiply.
+    Here the row is zero on its own, which holds whatever downstream does with
+    the scale. It is the one place the two quantizers deliberately differ.
+    """
     b, h, d, n, dtype = 16, 4, 256, 4, torch.bfloat16
     pack = _lse_pack_slots(dtype)
     empty = (0, 7, 15)
@@ -174,8 +186,39 @@ def test_empty_rows_do_not_poison_the_scale():
     deq = got_q.float().reshape(b, h * d) * got_s
     assert torch.isfinite(deq).all()
     for row in empty:
-        assert got_s[row].item() == 1.0
+        assert got_s[row].item() > 0.0, "a zero scale is not a valid dequant"
+        assert got_q.float().reshape(b, h * d)[row].abs().max().item() == 0.0
         assert deq[row].abs().max().item() == 0.0
+
+
+def test_quant_matches_aiter_bit_for_bit():
+    """The fused quant must BE aiter's per-token quant, not merely close to it.
+
+    o_proj cannot tell which kernel produced its input, so a 1 ulp difference in
+    the scale is not a rounding detail -- it moves elements to an adjacent FP8
+    code. Spelling the scale as a divide costs ~0.1% of codes and a different
+    scale on over half the rows, and a tolerance test does not see any of it.
+
+    One rank makes the combine exact: global_lse == lse, so factor == 1.0 and
+    the fp32 accumulator holds the bf16 input unchanged. That removes the
+    intentional bf16-round-trip difference and leaves only the quantizer.
+    """
+    from aiter import QuantType, get_hip_quant
+
+    n, b, h, d = 1, 64, 4, 256
+    pack = _lse_pack_slots(torch.bfloat16)
+    recv = _make_recv(n, b, h, d, torch.bfloat16, pack, seed=3)
+    recv[..., d:] = 0.0  # lse == 0 on the single rank
+
+    got_q, got_s = _run_fused(recv, b, h, d, n, pack)
+    want_q, want_s = get_hip_quant(QuantType.per_Token)(
+        recv[0, ..., :d].reshape(b, h * d).contiguous(), quant_dtype=FP8
+    )
+
+    assert torch.equal(got_s.reshape(-1), want_s.reshape(-1))
+    assert torch.equal(
+        got_q.view(torch.uint8).reshape(b, -1), want_q.view(torch.uint8).reshape(b, -1)
+    )
 
 
 def test_non_power_of_two_group():
@@ -216,6 +259,7 @@ def test_non_power_of_two_group():
         LSE_PACK=pack,
         N_ROUNDED=triton.next_power_of_2(n),
         FP8_MAX=float(torch.finfo(FP8).max),
+        AMAX_EPS=_AITER_AMAX_EPS,
     )
     deq = out.float().reshape(b, -1) * scale
     got = deq.reshape(b, h, d)

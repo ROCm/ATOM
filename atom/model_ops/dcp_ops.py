@@ -29,6 +29,11 @@ from atom.distributed.dcp_layout import (  # noqa: F401
 from atom.distributed.dcp_utils import get_dcp_group, get_dcp_world_size
 from atom.utils.forward_context import get_published_dcp_local_context_lens
 
+# The floor aiter's per-token quantizer puts under the row max, so an all-zero
+# row gets a tiny scale instead of a zero one. Reproduced here rather than
+# imported because aiter does not export it.
+_AITER_AMAX_EPS = 1e-10
+
 # Token-ownership arithmetic lives in ``dcp_layout`` so P/D relayout can share
 # it without importing Triton. Re-exported here for existing attention callers.
 
@@ -531,6 +536,7 @@ def _dcp_a2a_unpack_combine_quant_kernel(
     LSE_PACK: tl.constexpr,
     N_ROUNDED: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    AMAX_EPS: tl.constexpr,
 ):
     """Combine + per-token FP8 quant in one launch. ONE PROGRAM PER TOKEN.
 
@@ -602,14 +608,22 @@ def _dcp_a2a_unpack_combine_quant_kernel(
 
     # Per-token scale: reduce over BOTH remaining axes, which is exactly the row
     # o_proj will see once [H, D] is flattened to one activation row.
-    row_max = tl.max(tl.abs(acc))
-    scale = row_max / FP8_MAX
-    # An all-empty row gives row_max == 0; a zero scale would make the divide
-    # produce NaN and would also be an invalid dequant multiplier downstream.
-    scale = tl.where(scale > 0.0, scale, 1.0)
+    # This has to reproduce aiter's per-token quantizer bit for bit: the two are
+    # interchangeable for the same activation, and o_proj cannot tell which one
+    # produced its input. Three details carry that, none of them cosmetic:
+    #
+    #   * `* (1 / FP8_MAX)`, not `/ FP8_MAX`. Triton's fdiv on ROCm is 1 ulp off
+    #     IEEE here, which moves ~0.1% of elements to an adjacent FP8 code
+    #     (measured: 4869 of 4.2M, and 54% of rows get a different scale).
+    #     `atom/model_ops/kimi_k3/quant.py` carries the same note.
+    #   * one reciprocal, then a multiply per element -- not a divide per element.
+    #   * the row max floored at 1e-10, which is what gives an all-zero row
+    #     aiter's tiny scale rather than a zero or a one.
+    row_max = tl.maximum(tl.max(tl.abs(acc)), AMAX_EPS)
+    scale = row_max * (1.0 / FP8_MAX)
     tl.store(out_scale_ptr + b, scale)
 
-    q = acc / scale
+    q = acc * (1.0 / scale)
     q = tl.minimum(tl.maximum(q, -FP8_MAX), FP8_MAX)
     tl.store(
         out_ptr + b * out_stride_b + h[:, None] * out_stride_h + d[None, :],
@@ -720,6 +734,7 @@ def cp_lse_a2a(
             LSE_PACK=pack,
             N_ROUNDED=triton.next_power_of_2(n_ranks),
             FP8_MAX=float(torch.finfo(quant_dtype).max),
+            AMAX_EPS=_AITER_AMAX_EPS,
         )
         return out, out_scale
 
