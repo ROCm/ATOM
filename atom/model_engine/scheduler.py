@@ -1412,32 +1412,25 @@ class Scheduler:
             )
 
             if needs_remote_load:
-                oj = seq.offload_joint
-                if oj.load_hash != -1 and not oj.boundary_tokens:
-                    # Two transfers but one report: the first completion would
-                    # unpark the request while the other is still writing.
-                    #
-                    # Fusing the legs makes them one report only when ONE
-                    # connector owns both. Under `kv_connector: multi` the KV
-                    # leg can be owned by a different sub (a PD connector wins
-                    # `get_num_new_matched_tokens` ahead of the offload sub),
-                    # and `_update_waiting_for_remote_kv` unparks on that sub's
-                    # `finished_recving` alone -- with the state H2D still
-                    # scattering into `seq.state_slot`. Dropping the state load
-                    # degrades to a recompute, which is correct output at
-                    # baseline speed; the alternative is silent wrong output.
-                    logger.warning(
-                        "seq %s has both a remote KV load and a state load "
-                        "pending, with no joint boundary; dropping the state "
-                        "load.",
-                        seq.id,
-                    )
-                    if not self.block_manager.cancel_state_load(seq):
-                        # Disown could not be backed: requeue for a clean
-                        # recompute instead of parking a load into shared blocks.
-                        self.block_manager.deallocate(seq)
-                        self.waiting.appendleft(seq)
-                        break
+                # NOT guarded here on `load_hash != -1 and not boundary_tokens`.
+                # The merge base was, and restoring that guard was wrong twice
+                # over: it calls `BlockManager.cancel_state_load`, which this
+                # branch deleted, and its predicate is exactly the fused
+                # STATE-ONLY shape -- at the merge base that shape returned
+                # `False` from `_decide_load_after_alloc` and never reached
+                # here, while the fused path returns True, so the guard would
+                # drop every state-only load, which is the capability this
+                # branch exists to add.
+                #
+                # What the guard was actually for -- two transfers reporting
+                # once -- cannot happen while ONE connector owns both legs: a
+                # state-only load moves no KV (`_load_kv_bytes` is a no-op
+                # success) and reports once. It can happen under
+                # `kv_connector: multi`, where a PD sub wins the KV leg and
+                # `_update_waiting_for_remote_kv` unparks on that sub's report
+                # alone. That is a pre-existing scheduler-wide gap -- the unpark
+                # takes no state-leg predicate at the merge base either -- and
+                # is tracked separately rather than patched K3-shaped here.
                 self._park_for_remote_load(seq, skipped_waiting_requests)
                 continue
 
