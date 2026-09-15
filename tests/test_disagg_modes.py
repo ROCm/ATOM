@@ -144,8 +144,28 @@ def test_metrics_work_on_the_prefill_scheduler():
     # those keys rather than reporting a pool of size zero. The aggregator
     # sums with `.get(key, 0)`, so the decode rank's real figures still land.
     assert not [k for k in metrics if k.startswith("kv_blocks")]
+    assert "block_size" not in metrics
 
     handler.push_metrics()  # must not raise from inside the busy loop
+
+
+@pytest.mark.parametrize("scheduler_kind", ["aggregated", "decode"])
+def test_kv_owning_scheduler_reports_cache_geometry(scheduler_kind):
+    import queue
+
+    from atom.model_engine.engine_utility import EngineUtilityHandler
+    from atom.model_engine.scheduler import DecodeScheduler, Scheduler
+
+    cfg = MockConfig()
+    sched = (
+        Scheduler(cfg)
+        if scheduler_kind == "aggregated"
+        else DecodeScheduler(cfg, disagg_cu_shm_name="")
+    )
+    handler = EngineUtilityHandler(None, queue.Queue(), scheduler=sched)
+    metrics = handler.collect_metrics()
+    assert metrics["block_size"] == cfg.kv_cache_block_size
+    assert metrics["kv_blocks_total"] == cfg.num_kvcache_blocks
 
 
 def test_idle_heartbeat_is_available_on_every_scheduler(caplog):
@@ -322,3 +342,33 @@ def test_prefill_only_window_still_reports_its_queues():
     metrics = _aggregate(_snapshot("prefill", running=6, waiting=2))
     assert metrics["requests_running"] == 6
     assert metrics["requests_waiting"] == 2
+
+
+@pytest.mark.parametrize("prefill_first", [True, False])
+def test_cache_geometry_comes_from_decode_regardless_of_snapshot_order(prefill_first):
+    prefill = _snapshot("prefill", running=6, waiting=2)
+    decode = _snapshot(
+        "decode", running=3, waiting=6, block_size=16, kv_blocks_total=80
+    )
+    snapshots = (prefill, decode) if prefill_first else (decode, prefill)
+    metrics = _aggregate(*snapshots)
+    assert metrics["block_size"] == 16
+    assert metrics["kv_blocks_total"] == 80
+
+
+def test_cache_block_size_is_not_summed_across_dp_ranks():
+    metrics = _aggregate(
+        _snapshot("", running=0, waiting=0, block_size=16, kv_blocks_total=80),
+        _snapshot("", running=0, waiting=0, block_size=16, kv_blocks_total=120),
+    )
+    assert metrics["block_size"] == 16
+    assert metrics["kv_blocks_total"] == 200
+
+
+@pytest.mark.parametrize(
+    "snapshots", [(), (_snapshot("prefill", running=0, waiting=0),)]
+)
+def test_cache_geometry_defaults_before_a_kv_owning_rank_reports(snapshots):
+    metrics = _aggregate(*snapshots)
+    assert metrics["block_size"] == 0
+    assert metrics["kv_blocks_total"] == 0
