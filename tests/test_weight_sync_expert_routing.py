@@ -177,6 +177,88 @@ def test_a_named_expert_buffer_is_refused_under_expert_parallelism():
 # ── a sync that fails part way through ────────────────────────────────────
 
 
+def _pending_two_buffers(updater, experts, *, second_is_half_written):
+    """Buffer A complete, buffer B missing a shard so finalize raises on it."""
+    pending = updater._pending_expert_relayout
+    pending[(experts, "w13_weight")] = {e: {"w1", "w3"} for e in range(EXPERTS)}
+    pending[(experts, "w2_weight")] = {
+        e: (set() if second_is_half_written else {"w2"}) for e in range(EXPERTS)
+    }
+    return pending
+
+
+@needs_aiter
+def test_a_shuffled_buffer_is_not_carried_into_the_next_sync(monkeypatch):
+    """`pending.clear()` sat after the loop, so the raise skipped it and left
+    the entry for the buffer the loop had already shuffled. The next
+    successful sync shuffled it a second time -- a third layout, silent, with
+    `updated=N` logged as success."""
+    import atom.model_ops.utils as utils_mod
+
+    model, experts = _moe_model()
+    updater = _updater(model)
+    shuffled = []
+    monkeypatch.setattr(
+        utils_mod,
+        "shuffle_expert_slices",
+        lambda buffer, ids, **k: shuffled.append(tuple(ids)),
+        raising=True,
+    )
+    pending = _pending_two_buffers(updater, experts, second_is_half_written=True)
+
+    with pytest.raises(RuntimeError, match="half new and"):
+        updater._finalize_expert_weight_sync()
+
+    assert shuffled == [(0, 1)], "buffer A was shuffled before the raise"
+    assert (experts, "w13_weight") not in pending, "A would be shuffled twice"
+
+    # A later sync completes B and must not touch A again.
+    pending[(experts, "w2_weight")] = {e: {"w2"} for e in range(EXPERTS)}
+    updater._finalize_expert_weight_sync()
+
+    assert shuffled == [(0, 1), (0, 1)], "exactly one shuffle per buffer"
+    assert not pending
+
+
+@needs_aiter
+def test_a_buffer_the_loop_never_reached_survives(monkeypatch):
+    """The other direction: an entry the loop did not get to still describes a
+    row-major buffer, so dropping it would leave the kernel reading row-major
+    bytes through the permutation with nothing left to say so."""
+    import atom.model_ops.utils as utils_mod
+
+    model, experts = _moe_model()
+    updater = _updater(model)
+    monkeypatch.setattr(
+        utils_mod,
+        "shuffle_expert_slices",
+        lambda buffer, ids, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+        raising=True,
+    )
+    pending = _pending_two_buffers(updater, experts, second_is_half_written=False)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        updater._finalize_expert_weight_sync()
+
+    assert list(pending) == [(experts, "w13_weight"), (experts, "w2_weight")]
+
+
+@needs_aiter
+def test_a_clean_sync_still_empties_the_pending_set(monkeypatch):
+    import atom.model_ops.utils as utils_mod
+
+    model, experts = _moe_model()
+    updater = _updater(model)
+    monkeypatch.setattr(
+        utils_mod, "shuffle_expert_slices", lambda *a, **k: None, raising=True
+    )
+    pending = _pending_two_buffers(updater, experts, second_is_half_written=False)
+
+    updater._finalize_expert_weight_sync()
+
+    assert not pending
+
+
 def test_finalize_is_a_no_op_with_nothing_pending():
     """And does not import aiter to find that out, which is why the rest of
     this file's expert-routing tests run on a CPU box."""

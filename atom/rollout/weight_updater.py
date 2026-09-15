@@ -467,25 +467,54 @@ class WeightUpdaterMixin:
         from atom.model_ops.utils import shuffle_expert_slices
 
         experts = 0
-        for (module, param_name), arrived in pending.items():
-            required = _EXPERT_BUFFER_SHARDS[param_name]
-            for expert_id, shards in sorted(arrived.items()):
-                missing = sorted(required - shards)
-                if missing:
-                    raise RuntimeError(
-                        f"{self.label}: expert {expert_id} of {param_name} was "
-                        f"rewritten without {missing}. Its slice is half new and "
-                        f"half old, and re-establishing the layout over that "
-                        f"would mix two layouts. Send every shard of an expert "
-                        f"in the same weight update."
-                    )
-            shuffle_expert_slices(getattr(module, param_name), sorted(arrived))
-            experts += len(arrived)
+        relaid_out = []
+        try:
+            for (module, param_name), arrived in pending.items():
+                required = _EXPERT_BUFFER_SHARDS[param_name]
+                for expert_id, shards in sorted(arrived.items()):
+                    missing = sorted(required - shards)
+                    if missing:
+                        raise RuntimeError(
+                            f"{self.label}: expert {expert_id} of {param_name} was "
+                            f"rewritten without {missing}. Its slice is half new and "
+                            f"half old, and re-establishing the layout over that "
+                            f"would mix two layouts. Send every shard of an expert "
+                            f"in the same weight update."
+                        )
+                buffer = getattr(module, param_name)
+                # The relayout is the second in-place write this sync makes to
+                # these slices, and the one the graph is most likely to catch
+                # mid-flight: a half-permuted expert reads as plausible garbage.
+                self._await_readers_of(buffer)
+                shuffle_expert_slices(buffer, sorted(arrived))
+                relaid_out.append((module, param_name))
+                experts += len(arrived)
+        finally:
+            # Drop what was relaid out, and only that. This loop raises -- on
+            # a half-rewritten expert above, or out of
+            # `_check_expert_sync_supported` mid-sync, or because a bucketed
+            # SHM/IPC sync aborted before `is_last` -- and whatever it had
+            # already shuffled must not be carried into the next sync: per this
+            # function's own docstring, shuffling an already-shuffled slice
+            # does not undo the first shuffle, it produces a third layout.
+            #
+            # An entry it never reached is the opposite case and has to
+            # survive: that buffer is row-major right now, and a later sync
+            # re-establishing its layout is the only thing that fixes it.
+            for key in relaid_out:
+                del pending[key]
+            if pending:
+                logger.error(
+                    f"{self.label}: expert layout NOT re-established for "
+                    f"{len(pending)} fused buffer(s) "
+                    f"{sorted(param_name for _, param_name in pending)}; they "
+                    f"hold row-major bytes the kernel reads through the expert "
+                    f"permutation until a later sync finishes the job"
+                )
         logger.info(
             f"{self.label}: expert layout re-established for {experts} expert "
-            f"slices across {len(pending)} fused buffers"
+            f"slices across {len(relaid_out)} fused buffers"
         )
-        pending.clear()
 
     def _try_shard_weight(
         self,

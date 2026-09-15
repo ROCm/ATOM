@@ -247,6 +247,41 @@ def test_fused_expert_tensor_waits_before_each_half(monkeypatch):
     assert torch.equal(seen[0][1], old), "the first half wrote before its fence"
 
 
+@needs_aiter
+def test_expert_relayout_waits_first(monkeypatch):
+    """The relayout is the second in-place write to these slices, and the one
+    a graph is most likely to catch half-done: a half-permuted expert reads as
+    plausible garbage rather than as an error."""
+    import atom.rollout.weight_updater as wu
+
+    model, param, _ = _moe_model()
+    updater = _updater(model)
+    seen = _record_fences(monkeypatch)
+    order = []
+    monkeypatch.setattr(
+        wu.WeightUpdaterMixin,
+        "_await_readers_of",
+        lambda self, p: (order.append("wait"), seen.append((p, p.data.clone())))[0],
+        raising=True,
+    )
+    import atom.model_ops.utils as utils_mod
+
+    monkeypatch.setattr(
+        utils_mod,
+        "shuffle_expert_slices",
+        lambda *a, **k: order.append("shuffle"),
+        raising=True,
+    )
+    updater._pending_expert_relayout[(model.mlp.experts, "w13_weight")] = {
+        0: {"w1", "w3"}
+    }
+
+    updater._finalize_expert_weight_sync()
+
+    assert order == ["wait", "shuffle"]
+    assert [p for p, _ in seen] == [param]
+
+
 # ── the FP8 post-process ──────────────────────────────────────────────────
 
 
