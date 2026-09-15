@@ -659,15 +659,19 @@ def cp_lse_a2a(
             UNQUANTIZED and the caller must quantize as before; that is the
             single-rank shortcut below, not an error.
     """
+    # Checked before the single-rank shortcut, not after: that path returns
+    # early, so an assertion below it would let the one caller combination this
+    # function cannot serve slip through with the LSE silently dropped.
+    assert (
+        quant_dtype is None or not return_lse
+    ), "cp_lse_a2a: the fused-quant combine does not emit LSE"
+
     n_ranks = cp_group.world_size
     if n_ranks == 1:
         if quant_dtype is not None:
             # Nothing to combine, so there is no kernel to fold the quant into.
             return cp_attn_out, None
         return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
-    assert (
-        quant_dtype is None or not return_lse
-    ), "cp_lse_a2a: the fused-quant combine does not emit LSE"
 
     b, h_total, head_dim = cp_attn_out.shape
     assert h_total % n_ranks == 0, (

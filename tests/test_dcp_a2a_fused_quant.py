@@ -5,6 +5,8 @@ No distributed setup: both kernels are driven directly off a synthetic `recv`
 buffer, which is the only thing the all-to-all produces.
 """
 
+import types
+
 import pytest
 import torch
 
@@ -219,6 +221,24 @@ def test_quant_matches_aiter_bit_for_bit():
     assert torch.equal(
         got_q.view(torch.uint8).reshape(b, -1), want_q.view(torch.uint8).reshape(b, -1)
     )
+
+
+def test_lse_and_fused_quant_is_rejected_at_any_group_size():
+    """The combination the fused combine cannot serve must be rejected, and the
+    single-rank shortcut must not be a way around that.
+
+    The shortcut returns before the body runs, so an assertion placed after it
+    would let a single-rank caller through with the LSE silently dropped -- the
+    one shape of bug this check exists to prevent.
+    """
+    from atom.model_ops.dcp_ops import cp_lse_a2a
+
+    o = torch.zeros(2, 4, 8, device="cuda")
+    lse = torch.zeros(2, 4, device="cuda")
+    for world_size in (1, 4):
+        group = types.SimpleNamespace(world_size=world_size, device_group=None)
+        with pytest.raises(AssertionError, match="does not emit LSE"):
+            cp_lse_a2a(o, lse, group, return_lse=True, quant_dtype=FP8)
 
 
 def test_non_power_of_two_group():
