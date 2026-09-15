@@ -571,9 +571,6 @@ class Scheduler:
 
         kv_events_cfg = getattr(config, "kv_events_config", None)
         parallel_cfg = getattr(config, "parallel_config", None)
-        self._local_prefill_coalescing = (
-            getattr(parallel_cfg, "data_parallel_size", 1) == 1
-        )
         dp_rank = (
             getattr(parallel_cfg, "data_parallel_rank", None)
             if parallel_cfg is not None
@@ -619,9 +616,13 @@ class Scheduler:
         from atom.model_engine.prefill_delayer import PrefillDelayer
 
         self.prefill_delayer: PrefillDelayer | None = None
+        self._local_prefill_coalescing = False
 
     def set_prefill_delayer(self, delayer) -> None:
         self.prefill_delayer = delayer
+        self._local_prefill_coalescing = (
+            delayer is not None and delayer.dp_size == 1 and delayer.cpu_group is None
+        )
 
     def _wait_for_inflight_prefix(self, seq: Sequence, cached_tokens: int) -> bool:
         """Avoid recomputing a prefix an admitted prefill will checkpoint."""
@@ -640,7 +641,10 @@ class Scheduler:
                 or producer.multimodal_data is not None
             ):
                 continue
-            if seq.token_ids[:anchor] == producer.token_ids[:anchor]:
+            if np.array_equal(
+                np.frombuffer(seq.token_ids, dtype=np.int32, count=anchor),
+                np.frombuffer(producer.token_ids, dtype=np.int32, count=anchor),
+            ):
                 return True
         return False
 
@@ -1422,12 +1426,8 @@ class Scheduler:
             num_new_tokens = (
                 seq.num_tokens - num_cached_blocks * self.block_manager.hash_block_size
             )
-            if (
-                self._local_prefill_coalescing
-                and self.prefill_delayer is not None
-                and self._wait_for_inflight_prefix(
-                    seq, num_cached_blocks * self.block_manager.hash_block_size
-                )
+            if self._local_prefill_coalescing and self._wait_for_inflight_prefix(
+                seq, num_cached_blocks * self.block_manager.hash_block_size
             ):
                 # Wait without holding blocks; re-probe after producer progress.
                 skipped_waiting_requests.append(seq)
