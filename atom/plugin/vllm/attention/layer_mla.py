@@ -318,7 +318,14 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         # ATOM only needs the manager for the builder's chunked-prefill KV
         # gather; its own decode paths do not call the manager.
         if dcp_size > 1 and getattr(self, "dcp_manager", None) is None:
-            from vllm.v1.attention.ops.dcp_utils import MLADCPManager
+            # vLLM 0.29 folded `v1/attention/ops/dcp_utils.py` into
+            # `v1/attention/ops/dcp.py`; the class is otherwise unchanged.
+            # The builder asserts `isinstance(..., MLADCPManager)`, so the
+            # manager has to come from whichever module vLLM itself uses.
+            try:
+                from vllm.v1.attention.ops.dcp import MLADCPManager
+            except ImportError:  # vLLM <= 0.28
+                from vllm.v1.attention.ops.dcp_utils import MLADCPManager
 
             self.dcp_manager = MLADCPManager(
                 vllm_config=vllm_config,

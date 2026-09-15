@@ -141,16 +141,12 @@ def apply_vllm_v4_profile_cache_patch() -> None:
         return
 
     @functools.wraps(original)
-    def wrapped_initialize_kv_cache(
-        self,
-        kv_cache_config,
-        is_profiling: bool = False,
-    ):
-        result = original(
-            self,
-            kv_cache_config,
-            is_profiling=is_profiling,
-        )
+    def wrapped_initialize_kv_cache(self, kv_cache_config, *args, **kwargs):
+        # vLLM keeps adding keyword-only knobs to this method (0.29 added
+        # `kv_cache_allocation_context`), so forward everything untouched and
+        # only read back the flag this patch cares about.
+        result = original(self, kv_cache_config, *args, **kwargs)
+        is_profiling = kwargs.get("is_profiling", args[0] if args else False)
         _mark_v4_proxy_cache_mode(
             self.compilation_config.static_forward_context,
             is_profiling,
