@@ -34,6 +34,16 @@ SPARSE_BLOCK_SIZE = 128
 ASM_PAGE_SIZE = 16
 PAGES_PER_SPARSE_BLOCK = SPARSE_BLOCK_SIZE // ASM_PAGE_SIZE  # 8
 
+# Stride (in physical 16-pages) between two consecutive logical 128-blocks when
+# K and V share one block. ATOM's native engine allocates separate K and V caches
+# whose blocks are back to back, so there the stride is just
+# PAGES_PER_SPARSE_BLOCK. Under the vLLM 0.29 plugin, K and V are two head slots
+# of one page: a block's rows are [K page | V page], so the V plane is the K
+# plane shifted half a block and consecutive blocks land 16 physical pages apart
+# while each still fills only 8. See
+# `MiniMaxM3SparseAttention._page16_shuffle_cache_for_sparse_kernel`.
+BLOCK_PAGE_STRIDE = 2 * PAGES_PER_SPARSE_BLOCK  # 16
+
 
 @dataclass
 class MiniMaxM3SparsePrefillMetadata:
@@ -1064,6 +1074,7 @@ def _build_sparse_block_table_kernel(
     max_topk,
     sm_block_size: tl.constexpr,  # logical sparse block size (128)
     pages_per_block: tl.constexpr,  # 16-pages per sparse block (8)
+    block_page_stride: tl.constexpr,  # 16-pages between logical blocks (8 or 16)
     asm_page_size: tl.constexpr,  # physical page size (16)
     stride_tn,
     stride_tk,
@@ -1094,9 +1105,12 @@ def _build_sparse_block_table_kernel(
     slot = tl.where(is_full, earlier_full, n_full)  # tail -> slot n_full
 
     # logical 128-page id of each selected block -> 8 physical 16-pages:
-    #   physical = logical_id * pages_per_block + j   (matches block_convert)
+    #   physical = logical_id * block_page_stride + j
+    # block_page_stride == pages_per_block for back-to-back blocks; it is twice
+    # that when K and V share a block (the planes are the same buffer half a
+    # block apart), so consecutive blocks sit 16 pages apart, each filling 8.
     logical_page = tl.load(bt_row + blk, mask=valid, other=0).to(tl.int32)
-    base_phys = logical_page * pages_per_block  # [BLOCK_SIZE_T]
+    base_phys = logical_page * block_page_stride  # [BLOCK_SIZE_T]
     dst_base = slot * pages_per_block  # [BLOCK_SIZE_T]
 
     # Write EVERY destination slot so the output buffer can be torch.empty (no
@@ -1124,13 +1138,15 @@ def minimax_m3_build_sparse_block_table(
     topk_idx: torch.Tensor,  # [1, batch, topk] int32 (num_kv_heads == 1)
     block_table: torch.Tensor,  # [batch, max_blocks] int32, logical 128-granularity
     seq_lens: torch.Tensor,  # [batch] int32
+    block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compact per-request selected 128-blocks into a dense 16-page block_table +
     context_lens for `pa_fwd_asm`.
 
     Each selected logical 128-block expands to its 8 physical 16-pages
-    (``logical_id * 8 + j``, matching ``block_convert``). The partial tail block
-    is packed last so pa_fwd_asm's tail mask (context_lens % 16) lands on it.
+    (``logical_id * block_page_stride + j``; pass ``BLOCK_PAGE_STRIDE`` for a
+    cache whose K and V share a block). The partial tail block is packed last so
+    pa_fwd_asm's tail mask (context_lens % 16) lands on it.
 
     Returns (sparse_bt [batch, topk*8] int32, sparse_ctx_lens [batch] int32).
     The compacted width is fixed (topk*8), so the grid is shape-constant
@@ -1154,6 +1170,7 @@ def minimax_m3_build_sparse_block_table(
         topk,
         SPARSE_BLOCK_SIZE,
         PAGES_PER_SPARSE_BLOCK,
+        block_page_stride,
         ASM_PAGE_SIZE,
         topk_idx.stride(1),
         topk_idx.stride(2),
@@ -1185,6 +1202,7 @@ def _build_sparse_block_table_prefill_kernel(
     max_topk,
     sm_block_size: tl.constexpr,  # logical sparse block size (128)
     pages_per_block: tl.constexpr,  # 16-pages per sparse block (8)
+    block_page_stride: tl.constexpr,  # 16-pages between logical blocks (8 or 16)
     stride_tn,
     stride_tk,
     stride_bt_b,
@@ -1216,7 +1234,7 @@ def _build_sparse_block_table_prefill_kernel(
     slot = tl.where(is_full, earlier_full, n_full)  # tail -> slot n_full
 
     logical_page = tl.load(bt_row + blk, mask=valid, other=0).to(tl.int32)
-    base_phys = logical_page * pages_per_block
+    base_phys = logical_page * block_page_stride
     dst_base = slot * pages_per_block
 
     # Write EVERY destination slot so the output buffer can be torch.empty (no
@@ -1242,6 +1260,7 @@ def minimax_m3_build_sparse_block_table_prefill(
     block_table: torch.Tensor,  # [batch, max_blocks] int32, logical 128-granularity
     query_req_id: torch.Tensor,  # [total_q] int32, precomputed in prepare_prefill
     query_abs_pos: torch.Tensor,  # [total_q] int32, precomputed in prepare_prefill
+    block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-query-token compacted 16-page block_table + causal context_lens.
 
@@ -1273,6 +1292,7 @@ def minimax_m3_build_sparse_block_table_prefill(
         topk,
         SPARSE_BLOCK_SIZE,
         PAGES_PER_SPARSE_BLOCK,
+        block_page_stride,
         topk_idx.stride(1),
         topk_idx.stride(2),
         block_table.stride(0),
@@ -1301,6 +1321,7 @@ def minimax_m3_sparse_attn_decode_asm(
     v_scale: torch.Tensor | None = None,
     sparse_bt: torch.Tensor | None = None,  # prebuilt (fused topk) -> skip build
     sparse_ctx: torch.Tensor | None = None,
+    block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
 ) -> None:
     """Block-sparse decode attention over the page-16 SHUFFLE KV cache.
 
@@ -1321,7 +1342,7 @@ def minimax_m3_sparse_attn_decode_asm(
             "kv-head-encoded sparse_bt/sparse_ctx from the fused topk emit."
         )
         sparse_bt, sparse_ctx = minimax_m3_build_sparse_block_table(
-            topk_idx, block_table, seq_lens
+            topk_idx, block_table, seq_lens, block_page_stride=block_page_stride
         )
 
     _sparse_pa_per_row(
@@ -1466,6 +1487,7 @@ def minimax_m3_sparse_attn_prefill_asm(
     prefix_lens: torch.Tensor | None = None,  # [batch] int32, for the fallback
     sparse_bt: torch.Tensor | None = None,  # prebuilt (fused topk) -> skip build
     sparse_ctx: torch.Tensor | None = None,
+    block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
 ) -> None:
     """Block-sparse PREFILL via AITER ASM pa_fwd_asm, per-token-as-decode.
 
@@ -1503,7 +1525,11 @@ def minimax_m3_sparse_attn_prefill_asm(
                 prefix_lens[query_req_id] + (pos - cu_seqlens_q[query_req_id])
             ).to(torch.int32)
         sparse_bt, sparse_ctx = minimax_m3_build_sparse_block_table_prefill(
-            topk_idx, block_table, query_req_id, query_abs_pos
+            topk_idx,
+            block_table,
+            query_req_id,
+            query_abs_pos,
+            block_page_stride=block_page_stride,
         )
 
     _sparse_pa_per_row(

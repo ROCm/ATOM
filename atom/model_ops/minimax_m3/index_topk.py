@@ -99,6 +99,7 @@ def _emit_sparse_block_table_row(
     pid_h,
     block_size: tl.constexpr,
     pages_per_block: tl.constexpr,  # 16-pages per sparse block (8)
+    block_page_stride: tl.constexpr,  # 16-pages between logical blocks (16)
     NUM_KV_HEADS: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
 ):
@@ -121,7 +122,9 @@ def _emit_sparse_block_table_row(
     bt_slot = tl.where(bt_is_full, bt_earlier_full, bt_n_full)  # tail -> n_full
 
     bt_logical_page = tl.load(bt_row + bt_blk, mask=bt_valid, other=0).to(tl.int32)
-    bt_base_phys = bt_logical_page * pages_per_block * NUM_KV_HEADS + pid_h
+    # block_page_stride (16) > pages_per_block (8): consecutive logical blocks sit
+    # 16 physical pages apart because the K and V planes overlap half a block.
+    bt_base_phys = bt_logical_page * block_page_stride * NUM_KV_HEADS + pid_h
     bt_dst_base = bt_slot * pages_per_block
 
     # Write valid slots -> their pages, then the unused tail -> 0 (an in-bounds
@@ -749,6 +752,7 @@ def _launch_select(
     block_size_k,
     num_warps,
     emit,
+    block_page_stride,
     n_valid_column_per_row=None,
 ):
     """The one selection pass, launched the same way by both phases.
@@ -819,6 +823,7 @@ def _launch_select(
         DECODE_MAX_Q=decode_max_q,
         BLOCK_SIZE_K=block_size_k,
         pages_per_block=PAGES_PER_SPARSE_BLOCK,
+        block_page_stride=block_page_stride,
         EMIT_SPARSE_BT=emit,
         num_warps=num_warps,
     )
@@ -866,6 +871,7 @@ def _topk_index_packed_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
     pages_per_block: tl.constexpr,  # 16-pages per sparse block (8)
+    block_page_stride: tl.constexpr,  # 16-pages between logical blocks (16)
     EMIT_SPARSE_BT: tl.constexpr,  # fuse compaction (per-kv-head row + encoded page)
 ):
     tl.static_assert(BLOCK_SIZE_K >= BLOCK_SIZE_T)
@@ -940,6 +946,7 @@ def _topk_index_packed_kernel(
             pid_h,
             block_size,
             pages_per_block,
+            block_page_stride,
             NUM_KV_HEADS,
             BLOCK_SIZE_T,
         )
@@ -1073,6 +1080,7 @@ def minimax_m3_index_topk(
     num_kv_heads: int,
     sm_scale: float,
     emit_sparse_block_table: bool = False,
+    block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
     n_valid_column_per_row: torch.Tensor | None = None,
 ):
     """Index block-score + top-k selection. block_size_q == 1 (per-token).
@@ -1087,6 +1095,12 @@ def minimax_m3_index_topk(
     [total_q])`` ready for the ASM prefill kernel -- saving a separate build
     launch + topk_idx HBM round-trip.
 
+    ``block_page_stride`` is the distance in physical 16-pages between two
+    consecutive logical 128-blocks in the KV cache. It equals
+    ``PAGES_PER_SPARSE_BLOCK`` for a cache whose blocks are back to back (ATOM's
+    native engine), and twice that under vLLM 0.29's plugin path, where K and V
+    share one block as two head slots so the K/V planes overlap half a block
+    (see ``sparse_attn.BLOCK_PAGE_STRIDE``).
     ``n_valid_column_per_row`` is the batch's
     ``MiniMaxM3SparseMetadata.n_valid_column_per_row``, built once per forward by
     the attention metadata and handed to every sparse layer. It makes the aiter
@@ -1166,6 +1180,7 @@ def minimax_m3_index_topk(
         block_size_k=_prefill_topk_block_size_k(max_block),
         num_warps=PREFILL_TOPK_NUM_WARPS,
         emit=emit_sparse_block_table,
+        block_page_stride=block_page_stride,
         n_valid_column_per_row=n_valid_column_per_row,
     )
     return (topk_idx, *emit_out) if emit_out else topk_idx
@@ -1185,6 +1200,7 @@ def minimax_m3_index_topk_decode(
     sm_scale: float,
     emit_sparse_block_table: bool = False,
     max_query_len: int = 1,  # query tokens per request (num_spec+1); 1 == plain decode
+    block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
     n_valid_column_per_row: torch.Tensor | None = None,
 ):
     """Decode index block-score + top-k, both split-K (cudagraph-safe).
@@ -1200,6 +1216,12 @@ def minimax_m3_index_topk_decode(
     topk*8], sparse_ctx [total_q])`` ready for the ASM/gluon decode kernel --
     saving a separate build launch + topk_idx HBM round-trip.
 
+    ``block_page_stride`` is the distance in physical 16-pages between two
+    consecutive logical 128-blocks in the KV cache. It equals
+    ``PAGES_PER_SPARSE_BLOCK`` for a cache whose blocks are back to back (ATOM's
+    native engine), and twice that under vLLM 0.29's plugin path, where K and V
+    share one block as two head slots so the K/V planes overlap half a block
+    (see ``sparse_attn.BLOCK_PAGE_STRIDE``).
     ``n_valid_column_per_row`` is the batch's
     ``MiniMaxM3SparseMetadata.n_valid_column_per_row``, built once per forward by
     the attention metadata and handed to every sparse layer. It makes the aiter
@@ -1277,6 +1299,7 @@ def minimax_m3_index_topk_decode(
         block_size_k=DECODE_TOPK_BLOCK_SIZE_K,
         num_warps=DECODE_TOPK_NUM_WARPS,
         emit=emit_sparse_block_table,
+        block_page_stride=block_page_stride,
         n_valid_column_per_row=n_valid_column_per_row,
     )
     return (topk_idx, *emit_out) if emit_out else topk_idx

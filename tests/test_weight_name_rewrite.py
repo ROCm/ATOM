@@ -31,19 +31,48 @@ def rewriter(**kwargs) -> CheckpointNameRewriter:
 
 
 class WeightsMapperCompatibilityTest(unittest.TestCase):
-    def test_mapper_is_already_unstacked(self):
+    def test_rename_mapper_keeps_renames(self):
         mapper = WeightsMapper(
             orig_to_new_prefix={"model.language_model.": "language_model.model."}
         )
 
-        unstacked_mapper = mapper.get_unstacked_mapper()
+        rename_mapper = mapper.get_rename_mapper()
 
-        self.assertIs(unstacked_mapper, mapper)
         self.assertEqual(
-            unstacked_mapper.apply_list(
+            rename_mapper.apply_list(
                 ["model.language_model.layers.0.self_attn.q_proj"]
             ),
             ["language_model.model.layers.0.self_attn.q_proj"],
+        )
+
+    def test_rename_mapper_drops_ignore_rules(self):
+        """A `None` entry means "skip this weight", which a name-only consumer
+        such as a quantization ignore list must not act on: dropping the name
+        would leave the module quantized instead of excluded."""
+        mapper = WeightsMapper(
+            orig_to_new_substr={".rotary_emb.inv_freq": None},
+            orig_to_new_prefix={"model.": "", "visual.": None},
+            orig_to_new_suffix={".kv_scale": None, ".weight_scale": ".scale"},
+        )
+
+        rename_mapper = mapper.get_rename_mapper()
+
+        self.assertEqual(rename_mapper.orig_to_new_substr, {})
+        self.assertEqual(rename_mapper.orig_to_new_prefix, {"model.": ""})
+        self.assertEqual(rename_mapper.orig_to_new_suffix, {".weight_scale": ".scale"})
+        self.assertEqual(
+            rename_mapper.apply_list(
+                [
+                    "model.layers.0.self_attn.kv_scale",
+                    "model.layers.0.mlp.gate.weight_scale",
+                    "visual.blocks.0.mlp.weight",
+                ]
+            ),
+            [
+                "layers.0.self_attn.kv_scale",
+                "layers.0.mlp.gate.scale",
+                "visual.blocks.0.mlp.weight",
+            ],
         )
 
 

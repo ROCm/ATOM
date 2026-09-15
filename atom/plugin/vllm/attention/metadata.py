@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 from dataclasses import dataclass
 
 import torch
@@ -447,6 +448,11 @@ class MinimaxM3SparseMetadata:
     max_query_len: int
     prefill: MinimaxM3SparsePrefillMetadata | None = None
     decode: MinimaxM3SparseDecodeMetadata | None = None
+    # ``slot_mapping`` rebased onto the half-page numbering the fused KV writer
+    # uses now that K and V share a block; see
+    # ``MinimaxM3SparseAttentionMetadataBuilder._rebase_slots_to_half_pages``.
+    # The index cache keeps the untouched ``slot_mapping``.
+    half_page_slot_mapping: torch.Tensor | None = None
 
 
 def _uniform_decode_query_len(
@@ -519,7 +525,38 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
         self.prefill_qo_indptr = torch.arange(
             max_num_batched_tokens + 1, dtype=torch.int32, device=device
         )
+        # vLLM 0.29 stores K and V as two head slots of one page, so the fused
+        # KV-insert sees 2 * num_blocks half-pages
+        # (MiniMaxM3SparseAttention._page16_shuffle_cache_for_sparse_kernel) and
+        # every build has to re-index the slot mapping into that space. The
+        # destination must be persistent: uniform-batch cudagraphs bake the
+        # captured pointer into the replayed kernels.
+        self._paged_slot_mapping = torch.empty(
+            max_num_batched_tokens, dtype=torch.int64, device=device
+        )
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+
+    def _rebase_slots_to_half_pages(self, slot_mapping: torch.Tensor) -> torch.Tensor:
+        """Map token slots onto the K/V half-page space of the 0.29 cache.
+
+        Logical block ``b`` starts at half-page ``2 * b``, so a slot gains one
+        block per block it is already past. ``PAD_SLOT_ID`` (-1) stays negative
+        and is passed through untouched.
+
+        The result is published as ``half_page_slot_mapping`` rather than
+        replacing ``slot_mapping``, because this builder also serves the key-only
+        index cache, whose single head slot leaves its own numbering unchanged.
+        The block table is likewise left alone: the sparse block-table emitters
+        apply the stride themselves (``BLOCK_PAGE_STRIDE``).
+        """
+        out = self._paged_slot_mapping[: slot_mapping.shape[0]]
+        torch.div(
+            slot_mapping.clamp(min=0),
+            self.block_size,
+            rounding_mode="floor",
+            out=out,
+        )
+        return out.mul_(self.block_size).add_(slot_mapping)
 
     def build(
         self,
@@ -634,6 +671,9 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
             seq_lens=seq_lens,
             max_seq_len=common_attn_metadata.max_seq_len,
             slot_mapping=common_attn_metadata.slot_mapping,
+            half_page_slot_mapping=self._rebase_slots_to_half_pages(
+                common_attn_metadata.slot_mapping
+            ),
             num_actual_tokens=num_tokens,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
@@ -672,6 +712,9 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
             seq_lens=seq_lens,
             max_seq_len=common_attn_metadata.max_seq_len,
             slot_mapping=common_attn_metadata.slot_mapping,
+            half_page_slot_mapping=self._rebase_slots_to_half_pages(
+                common_attn_metadata.slot_mapping
+            ),
             num_actual_tokens=num_tokens,
             num_decodes=num_reqs,
             num_decode_tokens=num_tokens,
@@ -729,11 +772,13 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
         self.block_ratio = 1
 
         sliding_window_sizes: set[tuple[int, int] | None] = set()
+        self._mha_layers: list = []
         layers = get_layers_from_vllm_config(config, AttentionLayerBase, layer_names)
         for layer in layers.values():
             from atom.plugin.vllm.attention.layer import AttentionForVllmMHA
 
             assert isinstance(layer, AttentionForVllmMHA)
+            self._mha_layers.append(layer)
             sliding_window = layer.sliding_window
             if sliding_window is None or sliding_window == -1:
                 sliding_window_sizes.add(None)
@@ -776,7 +821,110 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
         max_num_batched_tokens = config.scheduler_config.max_num_batched_tokens
         i64_kwargs = {"dtype": torch.int64, "device": device}
         self.positions = CpuGpuBuffer(max_num_batched_tokens, **i64_kwargs)
+
+        # ATOM splits vLLM 0.29's [B, 2, N, C] page into two K/V planes that each
+        # see 2 * B half-pages (AttentionForVllmMHA._split_kv_cache), so every
+        # build re-indexes the block table and slot mapping into that space.
+        # The destinations must be persistent: full/uniform-batch cudagraphs bake
+        # the captured pointers into the replayed kernels.
+        self._kernel_page_size: int | None = None
+        self.max_num_reqs = config.scheduler_config.max_num_seqs
+        self._paged_block_table: torch.Tensor | None = None
+        self._paged_slot_mapping = torch.empty(max_num_batched_tokens, **i64_kwargs)
+
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+
+    def _kernel_page_tokens(self) -> int:
+        """Tokens per physical KV page, which is what the block table indexes.
+
+        vLLM may split a manager block into smaller kernel blocks, so this is
+        the bound cache's token dim rather than ``kv_cache_spec.block_size``.
+        Before the caches are bound (profile runs) attention never executes, so
+        the manager block size is a good enough stand-in.
+        """
+        if self._kernel_page_size is None:
+            kv_cache = self._mha_layers[0].kv_cache
+            if kv_cache.ndim != 4:
+                return self.block_size
+            self._kernel_page_size = kv_cache.shape[2]
+        return self._kernel_page_size
+
+    def _pack_kv_pages(self, common_attn_metadata):
+        """Re-index the block table and slot mapping for ATOM's K/V page planes.
+
+        Block ``b`` lives at half-page ``2 * b`` in both planes, so a page id
+        doubles and a slot gains one page per page it is already past.
+        ``PAD_SLOT_ID`` (-1) stays negative and is passed through untouched.
+        """
+        page_tokens = self._kernel_page_tokens()
+
+        src_block_table = common_attn_metadata.block_table_tensor
+        num_reqs, num_cols = src_block_table.shape
+        if (
+            self._paged_block_table is None
+            or self._paged_block_table.shape[1] != num_cols
+            or self._paged_block_table.shape[0] < num_reqs
+        ):
+            self._paged_block_table = torch.empty(
+                (max(self.max_num_reqs, num_reqs), num_cols),
+                dtype=src_block_table.dtype,
+                device=src_block_table.device,
+            )
+        block_table = self._paged_block_table[:num_reqs]
+        torch.mul(src_block_table, 2, out=block_table)
+
+        src_slot_mapping = common_attn_metadata.slot_mapping
+        slot_mapping = self._paged_slot_mapping[: src_slot_mapping.shape[0]]
+        torch.div(
+            src_slot_mapping.clamp(min=0),
+            page_tokens,
+            rounding_mode="floor",
+            out=slot_mapping,
+        )
+        slot_mapping.mul_(page_tokens).add_(src_slot_mapping)
+        if os.environ.get("ATOM_DEBUG_KV_BOUNDS") == "1":
+            self._debug_pack(
+                src_block_table,
+                block_table,
+                src_slot_mapping,
+                slot_mapping,
+                page_tokens,
+            )
+        return block_table, slot_mapping
+
+    def _debug_pack(
+        self, src_bt, bt, src_sm, sm, page_tokens
+    ):  # pragma: no cover - debug
+        """Report the doubled-page re-index once per padding/real slot regime.
+
+        Skipped during cudagraph capture: the `.item()` reads below are
+        device->host syncs, which HIP rejects on a capturing stream.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            return
+        smax = int(src_sm.max().item()) if src_sm.numel() else -1
+        tag = "pad" if smax < 0 else "real"
+        seen = getattr(self, "_pack_debug_seen", None)
+        if seen is None:
+            seen = set()
+            self._pack_debug_seen = seen
+        if tag in seen:
+            return
+        seen.add(tag)
+        print(
+            f"[ATOM-PACK/{tag}] page_tokens={page_tokens} "
+            f"src_slot[{int(src_sm.min().item())},{smax}] n={src_sm.numel()} "
+            f"dst_slot[{int(sm.min().item())},{int(sm.max().item())}] "
+            f"src_bt[{int(src_bt.min().item())},{int(src_bt.max().item())}] "
+            f"dst_bt[{int(bt.min().item())},{int(bt.max().item())}] "
+            f"bt_shape={tuple(src_bt.shape)} "
+            f"src_sm_dtype={src_sm.dtype} dst_sm_dtype={sm.dtype} "
+            f"src_bt_dtype={src_bt.dtype}",
+            flush=True,
+        )
+        if tag == "real":
+            print(f"[ATOM-PACK/real] src_slot[:32]={src_sm[:32].tolist()}", flush=True)
+            print(f"[ATOM-PACK/real] dst_slot[:32]={sm[:32].tolist()}", flush=True)
 
     def build(
         self,
@@ -1016,6 +1164,7 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
         use_cascade = False
 
         num_actual_tokens = common_attn_metadata.num_actual_tokens
+        block_table, slot_mapping = self._pack_kv_pages(common_attn_metadata)
 
         attn_metadata = AiterMhaMetadataForVllm(
             num_actual_tokens=num_actual_tokens,
@@ -1024,8 +1173,8 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
             query_start_loc=common_attn_metadata.query_start_loc,
             max_seq_len=common_attn_metadata.max_seq_len,
             seq_lens=common_attn_metadata.seq_lens,
-            block_table=common_attn_metadata.block_table_tensor,
-            slot_mapping=common_attn_metadata.slot_mapping,
+            block_table=block_table,
+            slot_mapping=slot_mapping,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,
@@ -1079,6 +1228,7 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
             max_seq_len=common_attn_metadata.max_seq_len,
             query_start_loc=common_attn_metadata.query_start_loc,
         )
+        block_table, slot_mapping = self._pack_kv_pages(common_attn_metadata)
         return AiterMhaMetadataForVllm(
             num_actual_tokens=num_tokens,
             num_actual_kv_tokens=0,
@@ -1086,8 +1236,8 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
             query_start_loc=common_attn_metadata.query_start_loc,
             max_seq_len=common_attn_metadata.max_seq_len,
             seq_lens=common_attn_metadata.seq_lens,
-            block_table=common_attn_metadata.block_table_tensor,
-            slot_mapping=common_attn_metadata.slot_mapping,
+            block_table=block_table,
+            slot_mapping=slot_mapping,
             num_decodes=num_reqs,
             num_decode_tokens=num_tokens,
             num_prefills=0,
