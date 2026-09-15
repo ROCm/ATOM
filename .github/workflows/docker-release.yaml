@@ -13,6 +13,17 @@ on:
           - rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0
           - rocm/pytorch:latest
           - rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.10.0
+      build_mode:
+        description: "Native image build mode. Auto uses a source overlay only when the change is safe; scheduled releases always build the full stack."
+        type: choice
+        default: "auto"
+        options:
+          - auto
+          - incremental
+          - full
+      incremental_base_image:
+        description: "Published native image to use for a safe incremental source overlay"
+        default: "rocm/atom-dev:latest"
       atom_repo:
         description: "ATOM repo"
         default: "https://github.com/ROCm/ATOM.git"
@@ -106,6 +117,8 @@ jobs:
 
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Load vLLM version
         run: cat atom/plugin/vllm/vllm-version.env >> "$GITHUB_ENV"
@@ -129,15 +142,105 @@ jobs:
             echo "sglang=${{ inputs.only_release_sglang == true || (inputs.only_release_oot != true && (github.event_name == 'schedule' || inputs.build_sglang_image == true)) }}"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Resolve source revisions and image digests
+        id: build-meta
+        env:
+          REQUESTED_ATOM_REPO: ${{ inputs.atom_repo || env.ATOM_REPO }}
+          REQUESTED_ATOM_COMMIT: ${{ inputs.atom_commit || env.ATOM_COMMIT }}
+          REQUESTED_AITER_REPO: ${{ inputs.aiter_repo || env.AITER_REPO }}
+          REQUESTED_AITER_COMMIT: ${{ inputs.aiter_commit || env.AITER_COMMIT }}
+          REQUESTED_RCCL_REPO: ${{ inputs.rccl_repo || env.RCCL_REPO }}
+          REQUESTED_RCCL_COMMIT: ${{ inputs.rccl_branch || env.RCCL_BRANCH }}
+          REQUESTED_FOUNDATION_IMAGE: ${{ matrix.base_image }}
+          REQUESTED_INCREMENTAL_BASE: ${{ inputs.incremental_base_image || 'rocm/atom-dev:latest' }}
+          REQUESTED_BUILD_MODE: ${{ inputs.build_mode || 'full' }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          resolve_ref() {
+            local repository="$1"
+            local ref="$2"
+            local checkout
+            checkout="$(mktemp -d)"
+            git -C "${checkout}" init -q
+            git -C "${checkout}" fetch -q --no-tags --depth=1 "${repository}" "${ref}"
+            git -C "${checkout}" rev-parse FETCH_HEAD
+            rm -rf "${checkout}"
+          }
+
+          pin_image() {
+            local image="$1"
+            local digest
+            if [[ "${image}" == *@sha256:* ]]; then
+              printf '%s\n' "${image}"
+              return
+            fi
+            digest="$(docker buildx imagetools inspect "${image}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+            test -n "${digest}"
+            printf '%s@%s\n' "${image}" "${digest}"
+          }
+
+          if [[ "${REQUESTED_ATOM_REPO}" == "${ATOM_REPO}" && "${REQUESTED_ATOM_COMMIT}" == "HEAD" ]]; then
+            ATOM_REVISION="${GITHUB_SHA}"
+          else
+            ATOM_REVISION="$(resolve_ref "${REQUESTED_ATOM_REPO}" "${REQUESTED_ATOM_COMMIT}")"
+          fi
+          AITER_REVISION="$(resolve_ref "${REQUESTED_AITER_REPO}" "${REQUESTED_AITER_COMMIT}")"
+          RCCL_REVISION="$(resolve_ref "${REQUESTED_RCCL_REPO}" "${REQUESTED_RCCL_COMMIT}")"
+          FOUNDATION_IMAGE="$(pin_image "${REQUESTED_FOUNDATION_IMAGE}")"
+          INCREMENTAL_BASE_IMAGE="${REQUESTED_INCREMENTAL_BASE}"
+
+          if [[ "${EVENT_NAME}" == "schedule" || "${REQUESTED_BUILD_MODE}" == "full" ]]; then
+            echo '{}' > "${RUNNER_TEMP}/atom-base-labels.json"
+          else
+            INCREMENTAL_BASE_IMAGE="$(pin_image "${REQUESTED_INCREMENTAL_BASE}")"
+            if ! docker buildx imagetools inspect "${INCREMENTAL_BASE_IMAGE}" \
+              --format '{{json .Image.Config.Labels}}' > "${RUNNER_TEMP}/atom-base-labels.json"; then
+              echo '{}' > "${RUNNER_TEMP}/atom-base-labels.json"
+            fi
+            if ! jq -e 'type == "object"' "${RUNNER_TEMP}/atom-base-labels.json" >/dev/null; then
+              echo '{}' > "${RUNNER_TEMP}/atom-base-labels.json"
+            fi
+          fi
+
+          {
+            echo "atom_revision=${ATOM_REVISION}"
+            echo "aiter_revision=${AITER_REVISION}"
+            echo "rccl_revision=${RCCL_REVISION}"
+            echo "foundation_image=${FOUNDATION_IMAGE}"
+            echo "incremental_base_image=${INCREMENTAL_BASE_IMAGE}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Select native image build mode
+        id: build-mode
+        run: |
+          python .github/scripts/select_docker_build_mode.py \
+            --requested-mode "${{ inputs.build_mode || 'full' }}" \
+            --event-name "${{ github.event_name }}" \
+            --base-labels "${RUNNER_TEMP}/atom-base-labels.json" \
+            --repo-root "${GITHUB_WORKSPACE}" \
+            --atom-repo "${{ inputs.atom_repo || env.ATOM_REPO }}" \
+            --atom-commit "${{ steps.build-meta.outputs.atom_revision }}" \
+            --foundation-image "${{ steps.build-meta.outputs.foundation_image }}" \
+            --aiter-repo "${{ inputs.aiter_repo || env.AITER_REPO }}" \
+            --aiter-commit "${{ steps.build-meta.outputs.aiter_revision }}" \
+            --rccl-repo "${{ inputs.rccl_repo || env.RCCL_REPO }}" \
+            --rccl-commit "${{ steps.build-meta.outputs.rccl_revision }}"
+
       - name: Echo environment variables
         run: |
           echo "ATOM_REPO: ${{ inputs.atom_repo || env.ATOM_REPO }}"
           echo "ATOM_BRANCH: ${{ github.ref_name }}"
-          echo "ATOM_COMMIT: ${{ inputs.atom_commit || env.ATOM_COMMIT }}"
+          echo "ATOM_COMMIT: ${{ steps.build-meta.outputs.atom_revision }}"
           echo "AITER_REPO: ${{ inputs.aiter_repo || env.AITER_REPO }}"
-          echo "AITER_COMMIT: ${{ inputs.aiter_commit || env.AITER_COMMIT }}"
+          echo "AITER_COMMIT: ${{ steps.build-meta.outputs.aiter_revision }}"
           echo "RCCL_REPO: ${{ inputs.rccl_repo || env.RCCL_REPO }}"
-          echo "RCCL_BRANCH: ${{ inputs.rccl_branch || env.RCCL_BRANCH }}"
+          echo "RCCL_COMMIT: ${{ steps.build-meta.outputs.rccl_revision }}"
+          echo "FOUNDATION_IMAGE: ${{ steps.build-meta.outputs.foundation_image }}"
+          echo "BUILD_MODE: ${{ steps.build-mode.outputs.mode }}"
+          echo "BUILD_MODE_REASON: ${{ steps.build-mode.outputs.reason }}"
+          echo "INCREMENTAL_BASE_IMAGE: ${{ steps.build-meta.outputs.incremental_base_image }}"
           echo "OOT_TAG_SUFFIX: ${{ inputs.oot_tag_suffix || '' }}"
           echo "SGLANG_TAG_SUFFIX: ${{ inputs.sglang_tag_suffix || '' }}"
           echo "CUSTOM_TAG: ${{ inputs.custom_tag || '' }}"
@@ -149,24 +252,27 @@ jobs:
       - name: Build Docker image
         timeout-minutes: 180
         run: |
-          ATOM_COMMIT="${{ inputs.atom_commit || env.ATOM_COMMIT }}"
-          if [ "${ATOM_COMMIT}" = "HEAD" ]; then
-            ATOM_CHECKOUT="${{ github.ref_name }}"
+          set -euo pipefail
+          if [[ "${{ steps.build-mode.outputs.mode }}" == "incremental" ]]; then
+            echo "Building source overlay from ${{ steps.build-meta.outputs.incremental_base_image }}"
+            DOCKER_BUILDKIT=1 docker build --pull --network=host -t atom_release:ci \
+              --build-arg BASE_IMAGE="${{ steps.build-meta.outputs.incremental_base_image }}" \
+              --build-arg ATOM_REPO="${{ inputs.atom_repo || env.ATOM_REPO }}" \
+              --build-arg ATOM_COMMIT="${{ steps.build-meta.outputs.atom_revision }}" \
+              -f docker/atom_incremental.dockerfile .
           else
-            ATOM_CHECKOUT="${ATOM_COMMIT}"
+            echo "Building the full native image stack"
+            DOCKER_BUILDKIT=1 docker build --pull --network=host -t atom_release:ci \
+              --build-arg BASE_IMAGE="${{ steps.build-meta.outputs.foundation_image }}" \
+              --build-arg GPU_ARCH="${{ env.GPU_ARCH }}" \
+              --build-arg ATOM_REPO="${{ inputs.atom_repo || env.ATOM_REPO }}" \
+              --build-arg ATOM_COMMIT="${{ steps.build-meta.outputs.atom_revision }}" \
+              --build-arg AITER_REPO="${{ inputs.aiter_repo || env.AITER_REPO }}" \
+              --build-arg AITER_COMMIT="${{ steps.build-meta.outputs.aiter_revision }}" \
+              --build-arg RCCL_REPO="${{ inputs.rccl_repo || env.RCCL_REPO }}" \
+              --build-arg RCCL_BRANCH="${{ steps.build-meta.outputs.rccl_revision }}" \
+              -f docker/atom_release.dockerfile .
           fi
-          echo "ATOM checkout ref: ${ATOM_CHECKOUT} (branch: ${{ github.ref_name }})"
-          DOCKER_BUILDKIT=1 docker build --pull --network=host -t atom_release:ci \
-          --build-arg BASE_IMAGE="${{ matrix.base_image }}" \
-          --build-arg GPU_ARCH="${{ env.GPU_ARCH }}" \
-          --build-arg ATOM_REPO="${{ inputs.atom_repo || env.ATOM_REPO }}" \
-          --build-arg ATOM_COMMIT="${ATOM_CHECKOUT}" \
-          --build-arg AITER_REPO="${{ inputs.aiter_repo || env.AITER_REPO }}" \
-          --build-arg AITER_COMMIT="${{ inputs.aiter_commit || env.AITER_COMMIT }}" \
-          --build-arg RCCL_REPO="${{ inputs.rccl_repo || env.RCCL_REPO }}" \
-          --build-arg RCCL_BRANCH="${{ inputs.rccl_branch || env.RCCL_BRANCH }}" \
-          --build-arg CACHEBUST=$(date +%s) \
-          -f docker/atom_release.dockerfile .
           docker inspect atom_release:ci
 
       - name: Test Docker image

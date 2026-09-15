@@ -106,8 +106,23 @@ RUN echo "========== [Parallel] Building Aiter ==========" && \
 # Stage 3: Final merge — collect all build artifacts + install MORI/ATOM
 # --------------------------------------------------------------------
 FROM base AS atom_image
+ARG BASE_IMAGE
 ARG ATOM_REPO="https://github.com/ROCm/ATOM.git"
 ARG ATOM_COMMIT="HEAD"
+ARG AITER_REPO="https://github.com/ROCm/aiter.git"
+ARG AITER_COMMIT="HEAD"
+ARG RCCL_REPO="https://github.com/ROCm/rccl.git"
+ARG RCCL_BRANCH="29e1567b95e28823b0beb1a988adc587bfab5b4f"
+
+LABEL org.opencontainers.image.source="${ATOM_REPO}" \
+      org.opencontainers.image.revision="${ATOM_COMMIT}" \
+      org.opencontainers.image.base.name="${BASE_IMAGE}" \
+      io.rocm.atom.foundation-image="${BASE_IMAGE}" \
+      io.rocm.atom.aiter.source="${AITER_REPO}" \
+      io.rocm.atom.aiter.revision="${AITER_COMMIT}" \
+      io.rocm.atom.rccl.source="${RCCL_REPO}" \
+      io.rocm.atom.rccl.revision="${RCCL_BRANCH}" \
+      io.rocm.atom.build-mode="full"
 
 # pip packages (lm-eval is lightweight, install directly)
 RUN pip install lm-eval[api]
@@ -221,12 +236,13 @@ RUN pip install rocm-trace-lite && \
     rtl --version || true
 
 # ATOM: Python package install (editable) with the atomesh build hook enabled.
-# CACHEBUST invalidates only this layer so parallel stages stay cached
-ARG CACHEBUST=1
 RUN git clone $ATOM_REPO /app/ATOM && \
     cd /app/ATOM && \
     git checkout $ATOM_COMMIT && \
-    ATOM_MESH_BUILD=1 python -m pip install -e .
+    { [ "$ATOM_COMMIT" = "HEAD" ] || test "$(git rev-parse HEAD)" = "$ATOM_COMMIT"; } && \
+    ATOM_MESH_BUILD=1 python -m pip install -e . && \
+    mkdir -p /etc/atom-build-info && \
+    git rev-parse HEAD > /etc/atom-build-info/commit
 RUN pip show atom || true
 
 RUN pip install --no-cache-dir msgpack msgspec quart
