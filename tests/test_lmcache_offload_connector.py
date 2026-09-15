@@ -4605,11 +4605,19 @@ class TestTheProducerFenceIsRecordedSafely:
     """
 
     class _Executor:
+        """Records submits and hands back a future stub, because `_track_job`
+        registers a done-callback on whatever `submit` returns."""
+
+        class _Future:
+            def add_done_callback(self, fn) -> None:
+                pass
+
         def __init__(self) -> None:
             self.calls = []
 
-        def submit(self, *args) -> None:
+        def submit(self, *args):
             self.calls.append(args)
+            return self._Future()
 
     @staticmethod
     def _conn(do_save=True):
@@ -4618,6 +4626,11 @@ class TestTheProducerFenceIsRecordedSafely:
         conn._do_save = do_save
         conn._engine = SimpleNamespace(lookup_unpin=lambda _i: None)
         conn._save_executor = TestTheProducerFenceIsRecordedSafely._Executor()
+        # `_track_job` wraps every submit and takes these; the fence records
+        # ahead of it, so both have to be present for the ordering to be tested
+        # at all.
+        conn._lock = threading.Lock()
+        conn._inflight_jobs = {}
         return conn
 
     @staticmethod
@@ -5788,7 +5801,6 @@ def _k3_scheduler() -> KimiK3OffloadScheduler:
     s._save_rr_last = None
     s._pending_state_stores = []
     s._state_load_seqs = {}
-    s._load_cancelled = set()
     s._state_load_missed = set()
     s._save_inflight_since = {}
     s._save_stalled = False
@@ -6967,6 +6979,45 @@ def test_the_state_leg_is_attached_to_the_requests_own_metadata(monkeypatch):
         destination_slot=4,
         chunk_tokens=256,
     )
+
+
+def test_a_losing_sub_does_not_rearm_the_state_leg_after_a_cancel(monkeypatch):
+    """Under `kv_connector: multi` the composite cancels every sub that did not
+    win `get_num_new_matched_tokens`. The cancel clears `_load_specs` and
+    `_reqs_need_recv`; it cannot reach `seq.offload_joint`, which the engine
+    owns and which is what the state arm reads. So the losing sub re-armed
+    anyway -- and the `_load_specs` guard could not stop it, because the cancel
+    is precisely what emptied `_load_specs`. That put a second writer into the
+    winning sub's block table.
+
+    The base half is stubbed: what is under test is this override's own gate.
+    """
+    s = _k3_scheduler()
+    s._do_load = True
+    s._load_specs = {}
+    s._reqs_need_recv = {}
+    monkeypatch.setattr(
+        DenseOffloadScheduler, "update_state_after_alloc", lambda self, seq: None
+    )
+
+    def _seq(cancelled):
+        return SimpleNamespace(
+            id="r1",
+            state_slot=4,
+            num_cached_tokens=0,
+            offload_joint=OffloadJointRecord(load_hash=99, boundary_tokens=512),
+            offload_load_cancelled=cancelled,
+        )
+
+    s.update_state_after_alloc(_seq(True))
+    assert "r1" not in s._state_load_seqs
+    assert s._load_specs.get("r1") is None
+    assert "r1" not in s._reqs_need_recv
+
+    # ...and the gate is the cancellation, not the arm being broken outright.
+    s.update_state_after_alloc(_seq(False))
+    assert "r1" in s._state_load_seqs
+    assert s._load_specs["r1"].can_load is True
 
 
 def test_a_save_only_request_never_carries_a_state_leg(monkeypatch):
