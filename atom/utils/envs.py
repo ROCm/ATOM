@@ -23,6 +23,11 @@ from collections.abc import Callable
 from typing import Any
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Protect reused KV prefixes from one-off prefill scans. Opt-in.
+    "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
+    "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
+        os.getenv("ATOM_PREFIX_CACHE_PROTECTED_RATIO", "0.5")
+    ),
     # --- Data Parallelism ---
     "ATOM_DP_RANK": lambda: int(os.getenv("ATOM_DP_RANK", "0")),
     "ATOM_DP_RANK_LOCAL": lambda: int(os.getenv("ATOM_DP_RANK_LOCAL", "0")),
@@ -54,6 +59,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ATOM remaps the SGLang world into internal TP x PCP groups.
     # 0 means unset.
     "ATOM_SGLANG_PCP_SIZE": lambda: int(os.getenv("ATOM_SGLANG_PCP_SIZE", "0") or "0"),
+    # Keep SGLang's tc_piecewise/Inductor compilation path for prefill, but
+    # bypass its per-bucket CUDA Graph capture, static-buffer staging, and token
+    # padding. This is an experimental ATOM SGLang-plugin-only mode.
+    "ATOM_SGLANG_PREFILL_COMPILE_ONLY": lambda: (
+        os.getenv("ATOM_SGLANG_PREFILL_COMPILE_ONLY", "0") == "1"
+    ),
+    # Broadcast EAGLE3 verification predictions and acceptance decisions from
+    # TP rank 0 so every tensor-parallel rank advances with identical results.
+    # SGLang lacks this broadcast path; the ATOM plugin adds it to match native
+    # ATOM's tensor-parallel verification semantics.
+    # Disabled by default because native SGLang normally keeps ranks in sync.
+    "ATOM_SGLANG_EAGLE3_TP_VERIFY_BROADCAST": lambda: (
+        os.getenv("ATOM_SGLANG_EAGLE3_TP_VERIFY_BROADCAST", "0") == "1"
+    ),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
     "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (
@@ -124,6 +143,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gather, i.e. the untouched upstream baseline.
     "ATOM_MORI_V2_FUSED": lambda: os.getenv("ATOM_MORI_V2_FUSED", "0") == "1",
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
+    # Match SGLang's gfx950 pure-prefill fast path: cast Q/K/V to FP8 and use
+    # AITER's head-dim-256 per-tensor FMHA kernel. Set to 0 for the BF16
+    # flash_attn_varlen_func fallback.
+    "ATOM_AITER_FP8_PREFILL_ATTN": lambda: (
+        os.getenv("ATOM_AITER_FP8_PREFILL_ATTN", "1") == "1"
+    ),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
     # flydsl drop-in for V4-Pro Compressor (Main BF16 + Indexer FP8) paths.
@@ -134,6 +159,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSED_COMPRESS_USE_FLYDSL": lambda: os.getenv(
         "ATOM_FUSED_COMPRESS_USE_FLYDSL", "auto"
     ).lower(),
+    # gather_kv_b_proj (the MLA cached-prefix expansion): swap the Triton op for
+    # the flydsl a8w8 gather-GEMM. Added 2026-09-09.
+    "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ": lambda: (
+        os.getenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "1") == "1"
+    ),
     # QK-norm-rope-cache-quant fusion for Qwen3 dense and MoE; disabled by default.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"

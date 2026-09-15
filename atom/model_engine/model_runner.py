@@ -116,6 +116,9 @@ support_model_arch_dict = {
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2.GlmMoeDsaForCausalLM",
     "Glm4MoeForCausalLM": "atom.models.glm4_moe.Glm4MoeForCausalLM",
     "Qwen3NextForCausalLM": "atom.models.qwen3_next.Qwen3NextForCausalLM",
+    "Qwen4ExpForConditionalGeneration": (
+        "atom.models.qwen4_exp.Qwen4ExpForConditionalGeneration"
+    ),
     "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MultimodalModel",
     "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeMultimodalModel",
     "Qwen3_5MoeForCausalLM": "atom.models.qwen3_5.Qwen3_5MoeForCausalLM",
@@ -3136,6 +3139,27 @@ class ModelRunner:
             dspark_ell=dspark_ell,
         )
 
+    def _record_kv_cache_ready(self, batch: ScheduledBatch) -> None:
+        """Publish a GPU event for final prefill chunks to transfer connectors."""
+        if batch.total_seqs_num_prefill <= 0:
+            return
+        if batch.is_final_chunk is None:
+            req_ids = batch.req_ids
+        else:
+            req_ids = [
+                req_id
+                for req_id, is_final in zip(
+                    batch.req_ids, batch.is_final_chunk, strict=True
+                )
+                if is_final
+            ]
+        if not req_ids:
+            return
+        connector = get_kvconnector()
+        callback = getattr(connector, "record_kv_cache_ready", None)
+        if callable(callback):
+            callback(req_ids)
+
     @torch.inference_mode()
     @with_eplb_forward_monitor
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
@@ -3206,6 +3230,7 @@ class ModelRunner:
             reset_forward_context()
             # Mark this slot's GPU work (attention consumed its metadata) done.
             self._record_forward_vars_event()
+            self._record_kv_cache_ready(batch)
             return ScheduledBatchOutput(
                 req_ids=list(batch.req_ids),
                 token_ids=[],
@@ -3227,6 +3252,7 @@ class ModelRunner:
 
         reset_forward_context()
         self._record_forward_vars_event()
+        self._record_kv_cache_ready(batch)
         return fwd_output
 
     @staticmethod
@@ -3618,6 +3644,7 @@ class ModelRunner:
             fc.batch_descriptor = None
             self._piecewise_captured_tokens.add(num_tokens_dp)
 
+    @torch.inference_mode()
     def capture_cudagraph(self):
         _piecewise = self._piecewise_cg_active()
         # AF_PIECEWISE: also capture the attn core (ragged combos below)
@@ -4555,5 +4582,6 @@ class RapidServeModelRunner(ModelRunner):
             sampled_cpu = sampled.view(-1).tolist()
         # Synchronize so decode's default stream sees all KV writes.
         stream.synchronize()
+        self._record_kv_cache_ready(batch)
         reset_forward_context()
         return sampled_cpu

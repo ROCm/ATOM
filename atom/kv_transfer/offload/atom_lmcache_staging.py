@@ -136,6 +136,7 @@ def run_staged_pipeline(
     recover_buffer: (
         Callable[[_StagingBuffer, _PipelineStage, _PipelineStage], bool] | None
     ) = None,
+    stage_b_enqueued: Callable[[Any, Any], None] | None = None,
 ) -> None:
     """Drive a two-stream staging pipeline with explicit recovery ownership.
 
@@ -165,6 +166,8 @@ def run_staged_pipeline(
                 stage_b.run(group, device_buf)
             staging_buffer.free_event.record(stage_b.stream)
             staging_buffer.free_event_valid = True
+            if stage_b_enqueued is not None:
+                stage_b_enqueued(group, stage_b.stream)
         stage_b.stream.synchronize()
     except Exception:
         buffer_safe_to_release = bool(

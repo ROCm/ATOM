@@ -45,8 +45,10 @@ def _masked_embedding_kernel(
     cols = col_start + tl.arange(0, BLOCK_D)
     col_mask = cols < D
 
+    # int64, not `local_idx`'s own int32: the row address wraps at
+    # vocab * hidden >= 2^31, silently -- `in_range` tests the id, not the address.
     emb = tl.load(
-        weight_ptr + local_idx * stride_w_row + cols,
+        weight_ptr + local_idx.to(tl.int64) * stride_w_row + cols,
         mask=in_range & col_mask,
         other=0.0,
     )
@@ -222,6 +224,15 @@ class ReplicatedEmbedding(nn.Module):
         return replicated_embedding(x, self.weight)
 
 
+def empty_token_ids(hidden: torch.Tensor) -> torch.Tensor:
+    """Storage ``compute_argmax_token`` answers into, for a caller holding none.
+
+    Sized off the row axis, so a V4 draft's ``[N, hc, dim]`` works as well as a
+    plain ``[N, dim]``.
+    """
+    return torch.empty(hidden.shape[0], dtype=torch.int32, device=hidden.device)
+
+
 class ParallelLMHead(VocabParallelEmbedding):
 
     def __init__(
@@ -265,10 +276,18 @@ class ParallelLMHead(VocabParallelEmbedding):
         return logits
 
     def compute_argmax_token(
-        self, x: torch.Tensor, *, out: torch.Tensor | None = None
+        self, x: torch.Tensor, *, out: torch.Tensor
     ) -> torch.Tensor:
-        """Greedy argmax token over the (TP-sharded) vocab — returns ``[N]`` token
-        ids WITHOUT all-gathering the full ``[N, vocab]`` logits.
+        """Greedy argmax token over the (TP-sharded) vocab — fills ``out`` with
+        ``[N]`` token ids WITHOUT all-gathering the full ``[N, vocab]`` logits.
+
+        ``out`` is required: the storage belongs to whoever knows its lifetime,
+        and the draft loop's is a CUDA-graph buffer whose address a capture
+        baked. ``empty_token_ids`` makes one for a caller with none.
+
+        int32, the engine's token dtype everywhere else -- ``argmax``'s int64 is
+        torch's convention, not a consumer's, so the vLLM/SGLang bridges widen
+        at their own boundary.
 
         For greedy speculative drafting only the argmax is needed, so each rank
         reduces its own vocab shard to ``(max_val, global_idx)`` and we all-gather
@@ -285,14 +304,12 @@ class ParallelLMHead(VocabParallelEmbedding):
         itself is still exact over whatever logits it is given; only the GEMM's
         rounding differs.
         """
-        if out is not None:
-            assert out.shape == x.shape[:-1], (
-                f"argmax out has shape {tuple(out.shape)}, expected "
-                f"{tuple(x.shape[:-1])}"
-            )
-            assert (
-                out.dtype == torch.long and out.device == x.device
-            ), "argmax out must be an int64 tensor on the input device"
+        assert (
+            out.shape == x.shape[:-1]
+        ), f"argmax out has shape {tuple(out.shape)}, expected {tuple(x.shape[:-1])}"
+        assert (
+            out.dtype == torch.int32 and out.device == x.device
+        ), "argmax out must be an int32 tensor on the input device"
         # Pure-DP draft: shard the vocab across the DP group instead of a
         # replicated full-vocab GEMM. Skip plugin mode -- its caller decides the
         # collective count per chunk (a mismatch would deadlock DP) -- and skip
@@ -302,11 +319,10 @@ class ParallelLMHead(VocabParallelEmbedding):
             and not is_plugin_mode()
             and self._can_use_dp_sharded_argmax(get_forward_context().context)
         ):
-            return self._dp_sharded_logits(x, "argmax", out)
+            return out.copy_(self._dp_sharded_logits(x, "argmax"))
         logits = tgemm.mm(x, self.weight, self.bias)  # [N, vocab/tp]
         if self.tp_size <= 1:
-            token = logits.argmax(dim=-1)
-            return token if out is None else out.copy_(token)
+            return out.copy_(logits.argmax(dim=-1))
         # Pack (val, idx) as fp32 — idx < 2^24 is exact — and all-gather only the
         # per-rank reductions ([N, 2]) instead of the full logits.
         packed = lm_head_argmax_pack(logits, self.vocab_start_idx)
@@ -318,7 +334,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         gathered = gathered.view(self.tp_size, -1, 2)
         winner = gathered[:, :, 0].argmax(dim=0)  # [N] winning rank (ties -> lowest)
         token = gathered[:, :, 1].gather(0, winner.unsqueeze(0)).squeeze(0)  # [N] fp32
-        return token.to(torch.long) if out is None else out.copy_(token)
+        return out.copy_(token)
 
     # ------------------------------------------------------------------
     # Pure-DP sharded LM head (config ② all-gather / ③ all-to-all).
@@ -364,9 +380,7 @@ class ParallelLMHead(VocabParallelEmbedding):
             return False
         return get_forward_context().dp_metadata is not None
 
-    def _dp_sharded_logits(
-        self, x: torch.Tensor, mode: str, out: torch.Tensor | None = None
-    ) -> torch.Tensor:
+    def _dp_sharded_logits(self, x: torch.Tensor, mode: str) -> torch.Tensor:
         """This rank's own rows out of a DP-vocab-sharded lm_head.
 
         Shared front half: pad x to the DP-agreed ``running_tokens``, all-gather
@@ -375,7 +389,7 @@ class ParallelLMHead(VocabParallelEmbedding):
 
         - ``"argmax"``: reduce each shard to a packed ``(max, global_id)`` and
           all-gather only ``[Σrows, 2]``, then pick the winner -> ``[local_rows]``
-          int64 ids (drafting; ``out``, if given, receives them).
+          ids, still packed as fp32 (drafting; the caller narrows into its own).
         - ``"all2all"`` / ``"allgather"``: exchange full-vocab logits ->
           ``[local_rows, vocab]`` (the decode head).
         """
@@ -414,15 +428,8 @@ class ParallelLMHead(VocabParallelEmbedding):
                 packed, dim=0, use_custom=use_custom
             ).view(dp_size, dp_size * max_rows, 2)
             winner = gathered_packed[:, :, 0].argmax(dim=0)  # [Σrows] winning shard
-            token = (
-                gathered_packed[:, :, 1]
-                .gather(0, winner.unsqueeze(0))
-                .squeeze(0)
-                .to(torch.long)
-            )[
-                start : start + local_rows
-            ]  # keep own rows
-            return token if out is None else out.copy_(token)
+            token = gathered_packed[:, :, 1].gather(0, winner.unsqueeze(0)).squeeze(0)
+            return token[start : start + local_rows]  # keep own rows
 
         if mode == "all2all":
             # Send each destination rank only the rows it owns; receive this
