@@ -357,18 +357,55 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
     def get_attn_backend(self):
         return self.attn_backend
 
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        """Drop 0.29's head slot so every consumer below sees 0.28's page.
+
+        vLLM 0.29 views each layer's cache as `[B, H, N, C]` (RFC #42082) where
+        0.28 handed MLA a three-dimensional page, and upstream's own
+        `MLAAttention.bind_kv_cache` absorbs that by squeezing `H` once at the
+        bind point. ATOM's MLA layer derives from `AttentionLayerBase`, whose
+        default binds the view as-is, so without this override the extra
+        dimension reaches every consumer in this file -- and `ops.py` hands them
+        `layer.kv_cache` verbatim, so the drafter's context-row write sees it
+        too. Two of them assert on the rank (`concat_and_cache_mla_rope_fused`
+        wants `dim() == 3`, `aiter.concat_and_cache_mla` wants
+        `size(2) == kv_lora_rank + pe_dim`) and the chunked-context gathers read
+        `size(1)` as the block size, so normalise once here rather than at each
+        call site.
+        """
+        if kv_cache.dim() == 4 and kv_cache.shape[1] == 1:
+            # [B, H=1, N, C] -> [B, N, C]. Guarded so a 0.28-shaped page, and
+            # any future spec that publishes more than one head slot, is left
+            # for the consumer to interpret.
+            kv_cache = kv_cache.squeeze(1)
+        super().bind_kv_cache(kv_cache)
+
     def write_context_kv_latent(self, kv_cache: torch.Tensor, *args, **kwargs) -> None:
-        """Store context rows, reinterpreting vLLM's fp8 cache as fp8.
+        """Store context rows, as ATOM's own page and reinterpreted as fp8.
 
         vLLM allocates the fp8 cache as uint8 where native ATOM allocates fp8,
         and the Triton store reads its element type off the pointer: handed raw
         bytes it converts each value to an integer instead of writing the fp8 bit
         pattern, and only draft acceptance shows it.
+
+        This is also the one place a vLLM-owned page crosses into `model_ops`,
+        whose kernels are written against `[num_blocks, block_size, entry]`, so
+        keep the rank check local as well. `bind_kv_cache` above already drops
+        0.29's head slot, which is what actually normalises the rank; the guard
+        here is what makes that a stated precondition of the crossing rather
+        than an inherited one, and it costs a `dim()` read on a path that runs
+        once per draft step. It holds only because MLA publishes a single head
+        slot -- do not copy it to a backend whose `customize_spec` publishes K
+        and V as two, which it would interleave.
         """
         if self.kv_cache_dtype.startswith("fp8") and kv_cache.dtype == torch.uint8:
             from vllm.platforms import current_platform
 
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
+        if kv_cache.dim() == 4:
+            kv_cache = kv_cache.view(
+                kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
+            )
         return MLAAttention.write_context_kv_latent(self, kv_cache, *args, **kwargs)
 
     def process_weights_after_loading(
