@@ -29,11 +29,6 @@ from atom.distributed.dcp_layout import (  # noqa: F401
 from atom.distributed.dcp_utils import get_dcp_group, get_dcp_world_size
 from atom.utils.forward_context import get_published_dcp_local_context_lens
 
-# The floor aiter's per-token quantizer puts under the row max, so an all-zero
-# row gets a tiny scale instead of a zero one. Reproduced here rather than
-# imported because aiter does not export it.
-_AITER_AMAX_EPS = 1e-10
-
 # Token-ownership arithmetic lives in ``dcp_layout`` so P/D relayout can share
 # it without importing Triton. Re-exported here for existing attention callers.
 
@@ -348,10 +343,15 @@ def _zero_nonfinite_rows_kernel(
     base = out_ptr + b * out_stride_b + h * out_stride_h
     for off in tl.range(0, HEAD_DIM, BLOCK):
         idx = off + tl.arange(0, BLOCK)
+        keep = idx < HEAD_DIM
+        # BLOCK rounds HEAD_DIM up, so the tail lanes of the last block are out
+        # of range. The store mask already keeps them from writing; folding them
+        # onto 0 keeps the address itself inside the row too, as the two a2a
+        # kernels in this file do for their padding rank lanes.
         tl.store(
-            base + idx,
+            base + tl.where(keep, idx, 0),
             tl.zeros([BLOCK], dtype=out_ptr.dtype.element_ty),
-            mask=idx < HEAD_DIM,
+            mask=keep,
         )
 
 
@@ -359,6 +359,11 @@ def zero_nonfinite_rows(out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
     """In-place `out[~isfinite(lse)] = 0`, one kernel. See the kernel docstring."""
     assert out.dim() == 3 and lse.dim() == 2, (out.shape, lse.shape)
     assert out.shape[:2] == lse.shape, (out.shape, lse.shape)
+    # The kernel indexes the head dim as `base + idx`, i.e. it assumes a unit
+    # stride there. Every caller passes a fresh `torch.empty` or the result of
+    # `.contiguous()`, but a violation would write the wrong memory silently,
+    # so it is checked rather than assumed.
+    assert out.stride(2) == 1, f"head dim must be contiguous, got {out.stride()}"
     b, h, d = out.shape
     if b == 0 or h == 0:
         return out
@@ -541,7 +546,6 @@ def _dcp_a2a_unpack_combine_quant_kernel(
     LSE_PACK: tl.constexpr,
     N_ROUNDED: tl.constexpr,
     FP8_MAX: tl.constexpr,
-    AMAX_EPS: tl.constexpr,
 ):
     """Combine + per-token FP8 quant in one launch. ONE PROGRAM PER TOKEN.
 
@@ -627,14 +631,17 @@ def _dcp_a2a_unpack_combine_quant_kernel(
     #     (measured: 4869 of 4.2M, and 54% of rows get a different scale).
     #     `atom/model_ops/kimi_k3/quant.py` carries the same note.
     #   * one reciprocal, then a multiply per element -- not a divide per element.
-    #   * the row max floored at 1e-10, which is what gives an all-zero row
-    #     aiter's tiny scale rather than a zero or a one.
-    row_max = tl.maximum(tl.max(tl.abs(acc)), AMAX_EPS)
+    #   * an all-zero row keeps scale 0 and takes a zero reciprocal, so the row
+    #     comes out zero instead of NaN. That is what aiter stores at the shapes
+    #     this path produces and what `kimi_k3/quant.py` deliberately mirrors;
+    #     a non-zero floor here would make the two non-interchangeable for a row
+    #     every rank reports empty.
+    row_max = tl.max(tl.abs(acc))
     scale = row_max * (1.0 / FP8_MAX)
+    inv = tl.where(scale > 0.0, 1.0 / scale, 0.0)
     tl.store(out_scale_ptr + b, scale)
 
-    q = acc * (1.0 / scale)
-    q = tl.minimum(tl.maximum(q, -FP8_MAX), FP8_MAX)
+    q = tl.minimum(tl.maximum(acc * inv, -FP8_MAX), FP8_MAX)
     tl.store(
         out_ptr + b * out_stride_b + h[:, None] * out_stride_h + d[None, :],
         q.to(out_ptr.dtype.element_ty),
@@ -748,7 +755,6 @@ def cp_lse_a2a(
             LSE_PACK=pack,
             N_ROUNDED=triton.next_power_of_2(n_ranks),
             FP8_MAX=float(torch.finfo(quant_dtype).max),
-            AMAX_EPS=_AITER_AMAX_EPS,
         )
         return out, out_scale
 

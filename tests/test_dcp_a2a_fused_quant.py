@@ -23,7 +23,6 @@ triton = pytest.importorskip("triton")
 from aiter import dtypes as _aiter_dtypes
 
 from atom.model_ops.dcp_ops import (
-    _AITER_AMAX_EPS,
     _dcp_a2a_unpack_combine_kernel,
     _dcp_a2a_unpack_combine_quant_kernel,
     _lse_pack_slots,
@@ -96,7 +95,6 @@ def _run_fused(recv, b, h, d, n, pack):
         LSE_PACK=pack,
         N_ROUNDED=triton.next_power_of_2(n),
         FP8_MAX=float(torch.finfo(FP8).max),
-        AMAX_EPS=_AITER_AMAX_EPS,
     )
     return out, scale
 
@@ -172,10 +170,11 @@ def test_scale_differs_from_the_bf16_path_only_by_bf16_rounding():
 def test_empty_rows_do_not_poison_the_scale():
     """A row every rank reports empty must dequantize to zero, not to NaN.
 
-    aiter floors the row max too but lets the clamp run, so its degenerate row
-    is `-FP8_MAX` paired with a zero scale and only cancels on the multiply.
-    Here the row is zero on its own, which holds whatever downstream does with
-    the scale. It is the one place the two quantizers deliberately differ.
+    Scale 0 with a zero reciprocal, which is what aiter stores at these shapes
+    and what `kimi_k3/quant.py` mirrors, so the fused and unfused paths stay
+    interchangeable for o_proj. aiter lets its clamp run and leaves `-FP8_MAX`
+    in the quantized row; zeroing it as well is the one deliberate difference,
+    and it is the safer of the two if a consumer ever ignores the scale.
     """
     b, h, d, n, dtype = 16, 4, 256, 4, torch.bfloat16
     pack = _lse_pack_slots(dtype)
@@ -188,7 +187,7 @@ def test_empty_rows_do_not_poison_the_scale():
     deq = got_q.float().reshape(b, h * d) * got_s
     assert torch.isfinite(deq).all()
     for row in empty:
-        assert got_s[row].item() > 0.0, "a zero scale is not a valid dequant"
+        assert got_s[row].item() == 0.0, "aiter stores a zero scale here"
         assert got_q.float().reshape(b, h * d)[row].abs().max().item() == 0.0
         assert deq[row].abs().max().item() == 0.0
 
@@ -279,7 +278,6 @@ def test_non_power_of_two_group():
         LSE_PACK=pack,
         N_ROUNDED=triton.next_power_of_2(n),
         FP8_MAX=float(torch.finfo(FP8).max),
-        AMAX_EPS=_AITER_AMAX_EPS,
     )
     deq = out.float().reshape(b, -1) * scale
     got = deq.reshape(b, h, d)
