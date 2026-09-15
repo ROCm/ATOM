@@ -4136,6 +4136,35 @@ class TestTheProducerFenceIsRecordedSafely:
         # a non-blocking event spins a core for that entire window.
         assert recorded[0].blocking is True
 
+    def test_a_step_with_no_save_records_no_fence(self, monkeypatch):
+        """Gated on the work, not on `self._do_save`. That flag is a role set at
+        construction, true on every step a producer turns, while zero-save steps
+        are the common case -- steady-state decode, a save already in flight, a
+        chunk not yet aligned. Gating on the role issued and dropped an
+        unconsumed event on every one of them."""
+        recorded = []
+
+        class _Event:
+            def __init__(self, blocking=False):
+                pass
+
+            def record(self, stream):
+                recorded.append(self)
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "Event", _Event)
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda: object())
+
+        conn = self._conn()
+        meta = LMCacheOffloadMetadata()
+        meta.add_request(
+            LMCacheReqMeta(req_id="r1", token_ids=[], block_ids=[], save_spec=None)
+        )
+        conn.start_load_kv(meta)
+
+        assert recorded == []
+        assert conn._save_executor.calls == []
+
     def test_a_fence_that_cannot_be_recorded_falls_back_and_does_not_escape(
         self, monkeypatch
     ):
