@@ -28,7 +28,7 @@ _MULTIMODAL_ARCH_TO_MODEL: dict[str, str] = {
 }
 
 _MULTIMODAL_ARCH_TO_INPUT_BUILDER: dict[str, str] = {
-    "KimiK3ForConditionalGeneration": "atom.models.kimi_k3.build_kimi_k3_inputs",
+    "KimiK3ForConditionalGeneration": "atom.models.kimi_k3_vl.build_kimi_k3_inputs",
 }
 
 
@@ -56,7 +56,7 @@ def get_multimodal_input_builder(
         raise ValueError(
             "This model's multimodal processor requires a chat conversation"
         )
-    return _resolve(builder or "atom.models.qwen3_5.build_qwen_vl_inputs")
+    return _resolve(builder or "atom.models.qwen3_5_vl.build_qwen_vl_inputs")
 
 
 def get_mrope_input_positions(
