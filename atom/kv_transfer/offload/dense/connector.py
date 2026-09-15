@@ -179,6 +179,37 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         for lookup_id in metadata.lookup_requests_in_step:
             if str(lookup_id) not in loading_lookup_ids:
                 self._lookup_unpin(lookup_id)
+        # Producer fence, recorded ONCE for the step rather than once per
+        # saving request: every save in this loop records against the same
+        # stream at the same point, so N events carried no more ordering than
+        # one, and both other in-tree fences hoist. Guarded, because
+        # `ModelRunner.process_kvconnector_output` has no handler -- a raise
+        # here escaped and dropped every load AND save dispatched this step.
+        # `blocking=True` because the consumer is a worker thread that
+        # `synchronize()`s it for the whole fenced forward; the default spins a
+        # core for that entire window.
+        producer_event = None
+        if self._do_save and torch.cuda.is_available():
+            try:
+                producer_event = torch.cuda.Event(blocking=True)
+                producer_event.record(torch.cuda.current_stream())
+            except Exception:
+                producer_event = None
+                logger.exception(
+                    "offload: could not record the producer fence; falling back "
+                    "to a full device synchronize for this step's saves."
+                )
+                try:
+                    # Strictly stronger than the event, so dropping to it is
+                    # safe: an unfenced gather reads torn latent that is then
+                    # faithfully reloaded -- silent accuracy corruption, which
+                    # is the whole reason the fence exists.
+                    torch.cuda.synchronize()
+                except Exception:  # noqa: BLE001 -- last resort; see the log
+                    logger.error(
+                        "offload: no producer fence and no device synchronize; "
+                        "this step's saves may gather partially-written KV."
+                    )
         for req in metadata.requests:
             # The futures are tracked, not discarded: `wait_for_requests` fences
             # them when vLLM preempts a request and reuses its blocks.
@@ -202,10 +233,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 # save worker waits it before the gather. Without it the gather
                 # reads torn/partially-written latent that is then faithfully
                 # reloaded -- silent, reload-count-scaling accuracy corruption.
-                if torch.cuda.is_available():
-                    ev = torch.cuda.Event()
-                    ev.record(torch.cuda.current_stream())
-                    req.producer_event = ev
+                req.producer_event = producer_event
                 self._track_job(
                     req.req_id,
                     self._save_executor.submit(
