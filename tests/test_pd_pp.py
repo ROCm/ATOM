@@ -641,6 +641,7 @@ def _fake_head(batch):
         pp_transport=MagicMock(),
         scheduler=MagicMock(),
         _poll_kv_transfer_progress=MagicMock(),
+        _dispatch_idle_offload_work=MagicMock(),
     )
     head.scheduler.schedule.side_effect = [(batch, {}), None]
     head.scheduler.take_rejected.return_value = None
@@ -679,6 +680,11 @@ def test_pp_head_skips_empty_meta_of_request_less_batch():
         head.pp_transport.send_metadata.assert_not_called()
 
 
+def test_pp_head_dispatches_idle_offload_without_a_batch():
+    head = _fake_head(None)
+    head._dispatch_idle_offload_work.assert_called_once()
+
+
 def test_pp_head_forwards_normal_batch_with_meta():
     """A batch with requests keeps the original path: dispatch, send, forward."""
     meta = _FakeMeta(["load-r1"])
@@ -689,6 +695,7 @@ def test_pp_head_forwards_normal_batch_with_meta():
     assert _dispatched_metas(head) == [meta]
     head.pp_transport.send_metadata.assert_called_once_with(batch)
     head.runner_mgr.call_func.assert_any_call("forward", batch, wait_out=True)
+    head._dispatch_idle_offload_work.assert_called_once()  # Next schedule is None.
 
 
 def test_pp_downstream_skips_forward_for_request_less_batch():

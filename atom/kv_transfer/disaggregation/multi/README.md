@@ -131,7 +131,7 @@ on the same tick.
 |                                                                     |
 | [5] recv done -> wake seq      |                                    |
 |         -> start its decode    |                                    |
-|     sent/saved -> free HBM     |                                    |
+|     sent/saved -> check free   |                                    |
 |     finished                   | * request_finished(seq)            |
 |                                                                     |
 |     loop  -->  back to [1]     |                                    |
@@ -187,7 +187,7 @@ real sub-connectors and fans out / merges per hook. Three classes:
 |                                                             |
 | register_kv_caches         | fan-out to ALL subs            |
 | start_load_kv(meta)        | route metas[i] -> subs[i]      |
-| get_finished()             | UNION + send/save gating       |
+| get_finished()             | UNION independent completions  |
 +=============================================================+
             |                                       |
             v                                       v
@@ -210,10 +210,13 @@ de-multiplexes.
 
 ```python
 result = (0, False)
+winner = None
 for c in self._connectors:            # iterate in config order
     toks, needs_load = c.get_num_new_matched_tokens(seq)
-    if result[0] == 0 and toks > 0:   # first sub returning >0 owns the request
+    if winner is None and toks > 0:   # first sub returning >0 owns the load
         result = (toks, needs_load)
+        winner = c
+# The implementation records the winner and cancels other subs' pending loads.
 return result
 ```
 
@@ -228,94 +231,119 @@ return result
   (e.g. a hypothetical `multi=[mooncake-consumer, offload]` on the decode node).
   Then prefer putting cheaper local offload first.
 
-> Caveat: the loop calls `get_num_new_matched_tokens` on every sub (only the
-> first non-zero is returned). For offload this method has side effects (records
-> `_load_specs`, pins LMCache, appends `_lookup_in_step`). Harmless in the
-> producer topology (mooncake no-ops, offload is the winner). If you ever run a
-> node where both could match the same request, the non-winning sub still leaves
-> state; vLLM's MultiConnector avoids this with a `_requests_to_connector` owner
-> map — the current ATOM version does not track an owner.
+The loop calls `get_num_new_matched_tokens` on every sub. Offload lookup has
+side effects: it records `_load_specs`, pins LMCache, and appends
+`_lookup_in_step`. `MultiConnectorScheduler` records the first matching sub in
+`_load_winner` and calls `cancel_pending_load` on the other subs that implement
+it. Load parking and chunk-boundary handoff decisions then follow `_load_owner`,
+so only the selected backend loads the request's KV.
 
 ---
 
-## 4. Block-free correctness: send ∧ save gating
+## 4. Block ownership: independent progress, scheduler release checks
 
-On a producer node, a prefilled request's KV blocks must survive until **both**
-the P/D send **and** the offload save have read them. mooncake send and offload
-save both only *read* the same HBM blocks (no write conflict), but if one
-finishes first and the engine frees the block, the other is left reading freed
-memory.
+On a producer node, a finished request's KV blocks must survive while the P/D
+send or offload still needs them. This includes computed chunks whose save has
+not been dispatched yet. A completion report describes one operation; the
+scheduler decides whether the request's blocks can be released.
 
-### The engine natively frees on a single condition
+### Report each operation as it finishes
 
-```python
-# scheduler.py  _update_from_kv_xfer_finished
-for req_id in finished_sending:          # loop A
-    seq = _pop_deferred(req_id)
-    self.block_manager.deallocate(seq)   # frees as soon as send is done
-
-for req_id in finished_saving:           # loop B
-    save_finished(req_id)
-    seq = deferred_free_blocks.get(req_id)
-    if seq is not None and not should_defer_free(seq):
-        deallocate(seq)                  # save completion can also free
-```
-
-Two independent free triggers — fine for plain mooncake, unsafe for `multi`.
-
-### The gate (in `MultiConnector.get_finished`, engine untouched)
+`MultiConnector.get_finished()` normalizes each sub-connector's output and
+unions its completion sets. It forwards send and save progress independently:
 
 ```python
-# start_load_kv: remember which reqs have an offload save in flight
-for req in m.requests:
-    if req.save_spec is not None:
-        self._pending_save.add(str(req.req_id))
-
-# get_finished (producer branch): release send + save only once BOTH are done
-for r in send_now: self._sent[str(r)]  = r
-for r in save_now: self._saved[str(r)] = r
-for key, raw in list(self._sent.items()):
-    needs_save = key in self._pending_save
-    if needs_save and key not in self._saved:
-        continue                          # hold: save not done -> do not report finished_sending
-    rel_send.add(raw); del self._sent[key]; self._pending_save.discard(key)
-    if key in self._saved:
-        rel_save.add(self._saved.pop(key))
-out.finished_sending = rel_send
-out.finished_saving  = rel_save
+return KVConnectorOutput(
+    finished_sending=set(send_now),
+    finished_saving=set(save_now),
+    finished_recving=recv,
+    failed_recving=failed,
+    finished_loading=loaded,
+    failed_loading=load_failed,
+    connector_completions=completions,
+)
 ```
 
-Both arrival orders are covered: send-first holds `finished_sending`; save-first
-buffers in `_saved` and is only reported paired with the send. When both are
-done they are emitted in the same step.
+Incremental prefill saves need their completion reports before the final P/D
+send: the offload scheduler keeps at most one dense save per request in flight,
+and completion processing clears that operation so the next save can be issued.
+There is no worker-side send/save pairing state. Load completion fields continue
+through the same union.
 
-### Why the separate loops are still safe
+### The scheduler owns the release decision
 
-Because both sets land in the **same** `_update_from_kv_xfer_finished` call, and
-loop A (sending) runs before loop B (saving): loop A pops + frees the block;
-loop B then `get`s `None` and is a no-op. Holds across TP ranks too — each rank
-gates, and `KVOutputAggregator` reaches quorum on both sets in the same cycle.
+When a producer request finishes, `Scheduler` sets `seq._awaiting_kv_send = True`
+and retains the sequence in `deferred_free_blocks`. In
+`_update_from_kv_xfer_finished`, connector completion processing first updates
+offload state and normalizes operation IDs to request IDs. Then:
 
-Unit-tested in both orders (`test_send_is_withheld_until_save_completes`,
-`test_save_then_send_also_pairs`); integration runs show 0 corruption.
+- `finished_sending` clears `_awaiting_kv_send` and calls
+  `_maybe_release_deferred(seq)`.
+- `finished_saving` also calls `_maybe_release_deferred(seq)`, including for
+  producers. This releases a request whose send finished before its final save.
 
-### Code subtleties
+The shared check in `scheduler.py` is:
 
-- **Loop B's `if seq is not None and not should_defer_free(seq)` is dead in the
-  multi-producer P/D path** (loop A already popped the seq), but it is *not*
-  removable: it is the real free path for standalone offload
-  (`is_producer=False`, no send), and `should_defer_free` guards multi-chunk
-  saves still in flight.
-- **`if key in self._saved` is not always true.** It is true on the
-  `needs_save` path, but false for **send-only** requests (a req mooncake sends
-  but offload does not save — e.g. prompt `< chunk_size` so `chunk_floor=0`, or
-  the prefix is already fully in LMCache). Such requests release
-  `finished_sending` immediately and contribute nothing to `finished_saving`.
-- **`del self._sent[key]` needs no extra guard.** For `multi=[offload]` (all
-  non-producer subs), `is_producer=False` so `get_finished` returns early via
-  the pass-through branch and never touches `_sent`. When a producer is present,
-  the loop iterates a `list(...)` snapshot, so deleting during iteration is
-  safe and `key` is guaranteed present.
+```python
+if (
+    seq.id not in self.deferred_free_blocks
+    or getattr(seq, "_awaiting_kv_send", False)
+    or getattr(seq, "_awaiting_aborted_load_cleanup", False)
+    or self._connector_should_defer_free(seq)
+):
+    return
+```
+
+Only after this check does the scheduler call `request_finished`, remove the
+deferred entry, and deallocate its blocks. `MultiConnectorScheduler` combines
+`should_defer_free` across its subs; dense offload includes in-flight saves,
+undispatched save ranges, and source blocks not yet known safe.
+
+| State of a finished producer request | Normal release decision |
+|---|---|
+| Saves complete, send still pending | Retain blocks for the send |
+| Send complete, save still in flight | Retain blocks for offload |
+| Send complete, final suffix save not yet dispatched | Retain blocks for the suffix |
+| Send complete, no connector still needs the blocks | Release blocks |
+
+A request with no offload work can release on send completion. Standalone
+offload has no producer send to wait for and uses the same release check.
+
+### PP quorum and idle suffix saves
+
+`KVOutputAggregator` still aggregates worker results across TP ranks. For PP,
+the head forwards Mooncake's send completion directly to the scheduler because
+it already represents PP-wide send completion. Offload load/save operations
+continue through `PPKVAggregator`: every stage must report a terminal result for
+the same operation. Each save generation has its own quorum. The head keeps no
+additional send/save pairing state.
+
+After the last forward batch, there may still be computed KV to save. When
+`_pp_head_step()` cannot obtain a scheduled batch, it calls
+`_dispatch_idle_offload_work()` to build connector metadata and distribute it to
+all PP stages. Deferred blocks keep the scheduler active until that suffix is
+handled. For example, a 192-token prompt computed in 64-token steps can save
+`[0,64)` and `[64,128)` during prefill, then dispatch `[128,192)` while idle.
+
+For a stalled save, the producer's save-reclamation timer starts after send
+completion if offload still needs the blocks. The reconciler skips any request
+with `_awaiting_kv_send` set; a save timeout cannot reclaim an active send's
+source blocks.
+
+### Regression coverage
+
+`tests/test_multi_connector.py` checks independent send/save reports in either
+order and preserves each save operation ID. `tests/test_pp_kv_status.py` checks
+per-operation PP quorum independently of send completion.
+The chunked-prefill test in `tests/test_lmcache_offload_connector.py` connects
+offload metadata and completion processing to scheduler release checks for both
+completion orders, undispatched suffixes, and stale save generations.
+`tests/test_scheduler.py` checks producer block ownership through postprocess
+and send completion for PP1/PP4, including requests without offload saves.
+`tests/test_pd_pp.py` and `tests/test_kv_drain_liveness.py` cover idle dispatch
+after the last forward and distribution of connector metadata to all stages.
+`tests/test_scheduler.py::TestStalledOffloadSaveReclaim::test_save_timeout_does_not_release_a_pending_producer_send`
+covers the timeout guard.
 
 ### HBM-hit + send + offload at the same time
 
@@ -330,10 +358,12 @@ redundant offload **reload**, it does not affect the send or the save:
 
 ---
 
-## 5. P/D disaggregation runbook (tested)
+## 5. P/D disaggregation runbook (recorded run)
 
-Validated on MI325X, container `yhl_kvoff_009`, `Llama-3.1-8B-Instruct`,
-mooncake `protocol=tcp`.
+The results below were recorded on MI325X, container `yhl_kvoff_009`,
+`Llama-3.1-8B-Instruct`, mooncake `protocol=tcp`. They predate the scheduler-owned
+release checks described in section 4; use that section's regression coverage
+for the current completion-ordering behavior.
 
 ### 5.1 Prerequisites / gotchas
 
@@ -442,12 +472,14 @@ For an offload save, use a prompt >= chunk_size (256 tokens).
   256 GB card with an 8B model — use MiniMax + low util + long context and
   `scripts/offload_ttft_micro.py`). Marker: `LMCache ... Retrieved`.
 
-**block-free safety (send ∧ save gating):**
+**block-free diagnostics:**
 - a clean run shows 0 hard errors:
   ```bash
   grep -acE "Traceback|assert|use.after.free|MEMORY_VIOLATION|Memory access fault" <prefill log>
   # ignore the benign tokenizer warning that contains the word "corrupt"
   ```
+- An error-free log alone does not establish completion-ordering safety; the
+  lifecycle regressions in section 4 check when blocks are retained and freed.
 
 ### 5.7 Cleanup
 
@@ -465,8 +497,8 @@ Do not delete `psm_*` in host-shared `/dev/shm` (would break other containers).
 | MultiConnector as P/D producer | OK — P/D transfer works through multi |
 | producer offload save (via multi) | OK — `Stored 2304`, concurrent with P/D send |
 | HBM-hit second request | OK — send proceeds, reload correctly skipped, no re-store |
-| block free / gating | OK — 0 errors / 0 asserts |
-| unit tests | OK — `tests/test_multi_connector.py` 16/16 |
+| block release diagnostics | Recorded run: 0 errors / 0 asserts |
+| unit tests at the time of the run | `tests/test_multi_connector.py` 16/16; current coverage is listed in section 4 |
 
 > Not separately isolated: the exact "prefix in HBM but not in LMCache" case of
 > HBM-hit + send + a NEW save (mechanism supports it, see §4); a real reload demo
