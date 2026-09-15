@@ -334,7 +334,7 @@ def _zero_nonfinite_rows_kernel(
 
     lse = tl.load(lse_ptr + b * lse_stride_b + h * lse_stride_h)
     # isfinite: NaN fails `lse == lse`, +-inf fails the abs bound.
-    if (lse == lse) and (tl.abs(lse) < float("inf")):
+    if (lse == lse) and (tl.abs(lse) < float("inf")):  # noqa: PLR0124
         return
 
     base = out_ptr + b * out_stride_b + h * out_stride_h
@@ -581,9 +581,8 @@ def _dcp_a2a_unpack_combine_quant_kernel(
     global_lse = tl.log(tl.sum(tl.exp(lse - lse_max), axis=0)) + lse_max
 
     factor = tl.exp(lse - global_lse[None, :])
-    factor = tl.where(
-        (factor != factor) | (~valid[:, None]), 0.0, factor
-    )  # noqa: PLR0124
+    factor_is_nan = factor != factor  # noqa: PLR0124
+    factor = tl.where(factor_is_nan | (~valid[:, None]), 0.0, factor)
 
     # [N, H, D]
     vals = tl.load(hbase[:, :, None] + d[None, None, :]).to(tl.float32)

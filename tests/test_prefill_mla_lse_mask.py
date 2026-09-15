@@ -8,14 +8,26 @@ not finite before handing them to the cross-rank combine. It used to spell that
 
     o = torch.where(torch.isfinite(lse).unsqueeze(-1), o, torch.zeros_like(o))
 
-which allocates and fills a second o-sized buffer and then writes a third. It
-is now `o.masked_fill_(...)`, in place. These tests pin the two properties that
-swap depends on: the result is bit-identical to the old expression, and the
-write really does land in the caller's buffer rather than a copy.
+which torch expands into six launches: four to build the mask, one to fill an
+o-sized buffer with zeros, and one to select between them. It is now a single
+Triton kernel, `zero_nonfinite_rows`, that writes into `o` in place and skips
+the rows whose LSE is finite. These tests pin the two properties that swap
+depends on: the result is bit-identical to the old expression, and the write
+really does land in the caller's buffer rather than a copy.
 """
 
 import pytest
 import torch
+
+# The kernel is Triton and the tests drive it on real tensors; both are absent
+# on the non-GPU CI runner.
+pytest.importorskip("triton")
+
+if not torch.cuda.is_available():
+    pytest.skip(
+        "compares a Triton kernel against its reference; needs a real GPU",
+        allow_module_level=True,
+    )
 
 
 def _old(o, lse):
@@ -33,7 +45,7 @@ def _new(o, lse):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("shape", [(1, 16, 512), (7, 64, 512), (128, 1, 512)])
 def test_matches_the_where_it_replaced(dtype, shape):
-    tokens, heads, dim = shape
+    tokens, heads, _dim = shape
     torch.manual_seed(0)
     o = torch.randn(shape, dtype=dtype, device="cuda")
     lse = torch.randn(tokens, heads, dtype=torch.float32, device="cuda")

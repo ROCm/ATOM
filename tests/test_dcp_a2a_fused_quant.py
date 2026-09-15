@@ -8,9 +8,17 @@ buffer, which is the only thing the all-to-all produces.
 import pytest
 import torch
 
+# Order matters: importing triton without an active GPU driver raises rather
+# than failing the import, so the device check has to come first.
+if not torch.cuda.is_available():
+    pytest.skip(
+        "drives Triton kernels on real tensors; needs a real GPU",
+        allow_module_level=True,
+    )
+
 triton = pytest.importorskip("triton")
 
-from atom.model_ops.dcp_ops import (  # noqa: E402
+from atom.model_ops.dcp_ops import (
     _dcp_a2a_unpack_combine_kernel,
     _dcp_a2a_unpack_combine_quant_kernel,
     _lse_pack_slots,
@@ -176,11 +184,11 @@ def test_empty_rows_do_not_poison_the_scale():
 # numerics bug (o_proj told a tensor is quantized when it is not), which is
 # exactly the kind of thing that never shows up as a crash.
 # --------------------------------------------------------------------------
-import types  # noqa: E402
+import types
 
-from aiter import QuantType, dtypes  # noqa: E402
+from aiter import QuantType, dtypes
 
-from atom.model_ops.attention_mla import MLAAttention  # noqa: E402
+from atom.model_ops.attention_mla import MLAAttention
 
 
 def _stub(**over):
