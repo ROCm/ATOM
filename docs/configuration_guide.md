@@ -37,10 +37,10 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `tensor_parallel_size` | `int` | `1` | Number of tensor-parallel GPUs (1 — 8) |
 | `enforce_eager` | `bool` | `False` | Disable compilation and CUDA graphs; run in eager mode |
 | `parallel_config` | `ParallelConfig` | `ParallelConfig()` | Data-parallel configuration (see Section 4) |
-| `kv_cache_block_size` | `int` | `16` | Block size for paged KV cache; must be a multiple of 16 or exactly 1 |
+| `kv_cache_block_size` | `int` | `16` | Block size for paged KV cache; must be a multiple of 16 or exactly 1. The FP4 sparse indexer requires exactly 64 |
 | `num_kvcache_blocks` | `int` | `-1` | Number of KV cache blocks (`-1` = auto) |
 | `kv_cache_dtype` | `str` | `"bf16"` | KV cache data type (`"bf16"` or `"fp8"`) |
-| `index_cache_dtype` | `str \| None` | `None` | Indexer-cache dtype, resolved after model detection. Native single-node DeepSeek-V4 defaults to `"fp4"` except on gfx942; plugin and KV-transfer integrations retain `"fp8"`. Other models inherit `kv_cache_dtype`. An explicit `"bf16"`, `"fp8"`, or `"fp4"` value is preserved. |
+| `index_cache_dtype` | `str \| None` | `None` | Indexer-cache dtype, resolved after model detection. Native single-node DeepSeek-V4 defaults to `"fp4"` except on gfx942; plugin and KV-transfer integrations retain `"fp8"`. Other models inherit `kv_cache_dtype`. An explicit `"bf16"`, `"fp8"`, or `"fp4"` value is preserved. `"fp4"` is honoured only where the FP4 mqa-logits kernels apply -- gfx950, an indexer head dim of 128, an indexer head count that is a multiple of 16, and `--block-size 64`; anything else logs one warning and scores in FP8. It runs under DCP, and is refused outright under PCP and KV transfer rather than falling back. |
 | `enable_prefix_caching` | `bool` | `False` | Enable prefix caching to reuse KV blocks across requests sharing the same prefix |
 | `enable_log_stats` | `bool` | `True` | Emit the periodic engine-status line (running/waiting reqs, KV usage, prefix-cache hit rate, prompt/generation throughput). Applies to offline `LLM(...)` as well as to the server. Scoped to that line: `[MTP Stats]` and `[Cache Stats]` have their own gates |
 | `throughput_log_interval` | `float` | `10.0` | Seconds between engine-status lines. Must be > 0 |
@@ -364,7 +364,7 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--port` | | `int` | `8006` | Engine internal port |
 | `--kv_cache_dtype` | | `str` | `"bf16"` | KV cache dtype; choices: `bf16`, `fp8` |
 | `--index-cache-dtype`, `--index_cache_dtype` | | `str` | `None` | Indexer-cache dtype; choices: `bf16`, `fp8`, `fp4`. When omitted, uses the architecture- and integration-aware `Config.index_cache_dtype` defaults described above. |
-| `--block-size` | | `int` | `16` | KV cache block size (maps to `kv_cache_block_size`) |
+| `--block-size` | | `int` | `16` | KV cache block size (maps to `kv_cache_block_size`); the FP4 sparse indexer requires exactly 64 |
 | `--max-model-len` | | `int` | `None` | Maximum model context length; defaults to `hf_config.max_position_embeddings` |
 | `--cudagraph-capture-sizes` | | `str` | `"[1,2,4,8,16,32,48,64,128,256]"` | CUDA graph capture sizes as a Python list string |
 | `--level` | | `int` | `3` | Compilation level (0 — 3) |

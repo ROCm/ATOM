@@ -885,7 +885,13 @@ Connector-specific tuning (env):
 | `OFFLOAD_PUBLICATION_TIMEOUT_S` | 5.0 | Finite, nonnegative maximum wait after PAGE or AOS1 submission for session visibility. `0` performs exactly one immediate probe. |
 | `OFFLOAD_PUBLICATION_POLL_INTERVAL_S` | 0.01 | Finite, positive sleep interval between visibility probes; prevents busy-spinning. |
 | `OFFLOAD_COMMITTED_SIDECAR_CAPACITY` | 65536 | Positive integer bound for scheduler-session AOS1 commit discovery. Oldest commits are evicted first. |
-| `OFFLOAD_PROFILE` | 0 | Emit `[OFFLOAD-LOAD-PROF]` / `[OFFLOAD-SAVE-PROF]` per-transfer timing. |
+| `OFFLOAD_PROFILE` | 0 | Emit `[OFFLOAD-SAVE-PROF]` / `[OFFLOAD-LOAD-PROF]` records with transfer counts, fast-path evidence, and outer store/retrieve wall time. |
+
+Pinned-host asynchronous copies and one batched PAGE block-ID upload per
+transfer are the built-in `BlockGPUConnector` fast path; there are no feature
+flags for these two pieces. Both the Dense codec and the DSV4/M3 PAGE codec
+implement the prepared-ID API. A future codec or direction without that API
+still falls back safely to per-group ID preparation and blocking host copies.
 
 `kv_transfer_config` may also override any LMCache field via a
 `"lmcache.<field>": value` extra. The actual connector extra
@@ -1070,9 +1076,11 @@ terminal message distinguishing `SLOT sidecar save published` from
 `SLOT sidecar save failed`, and `SLOT sidecar load restored` from
 `SLOT sidecar load failed`. “Published” means the submitted object became
 visible through LMCache `contains` within the bounded policy; it does not claim
-a durable backend flush. PAGE transfer timing remains opt-in with
-`OFFLOAD_PROFILE=1` via
-`[OFFLOAD-SAVE-PROF]` and `[OFFLOAD-LOAD-PROF]`.
+a durable backend flush. PAGE transfer diagnostics remain opt-in with
+`OFFLOAD_PROFILE=1` via `[OFFLOAD-SAVE-PROF]` and `[OFFLOAD-LOAD-PROF]`.
+These records report payload/group counts, whether batched IDs and asynchronous
+host copies actually ran, and outer store/retrieve wall time. Connector phase
+and GPU-event timings are not collected.
 
 Common diagnostics:
 

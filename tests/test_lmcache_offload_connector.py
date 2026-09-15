@@ -341,9 +341,56 @@ def _install_fake_fused_chunk_major(codec: DenseKVByteCodec) -> None:
                 seg.index_copy_(0, idx, src)
                 offset += count * nbytes
 
+    prepared_groups = []
+    prepared_pack_indices = []
+    prepared_unpack_indices = []
+
+    def _prepare(segments, seg_block_bytes, groups, device):
+        normalized = tuple(
+            (tuple(chunk_block_counts), tuple(flat_block_ids))
+            for chunk_block_counts, flat_block_ids in groups
+        )
+        prepared_groups.append(normalized)
+        return SimpleNamespace(
+            segments=segments,
+            seg_block_bytes=seg_block_bytes,
+            groups=normalized,
+            device=device,
+            group_count=len(normalized),
+            upload_count=int(any(ids for _counts, ids in normalized)),
+        )
+
+    def _pack_prepared(prepared, group_index, device_buf):
+        prepared_pack_indices.append(group_index)
+        counts, ids = prepared.groups[group_index]
+        _pack(
+            prepared.segments,
+            prepared.seg_block_bytes,
+            counts,
+            ids,
+            device_buf,
+        )
+
+    def _unpack_prepared(prepared, group_index, device_buf):
+        prepared_unpack_indices.append(group_index)
+        counts, ids = prepared.groups[group_index]
+        _unpack(
+            device_buf,
+            prepared.segments,
+            prepared.seg_block_bytes,
+            counts,
+            ids,
+        )
+
     codec._fused_kv_staging = SimpleNamespace(
         fused_pack_chunk_major=_pack,
         fused_unpack_chunk_major=_unpack,
+        prepare_chunk_major_groups=_prepare,
+        fused_pack_chunk_major_prepared=_pack_prepared,
+        fused_unpack_chunk_major_prepared=_unpack_prepared,
+        prepared_groups=prepared_groups,
+        prepared_pack_indices=prepared_pack_indices,
+        prepared_unpack_indices=prepared_unpack_indices,
     )
 
 
@@ -1288,7 +1335,9 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
     if not hasattr(torch, "arange"):
         pytest.skip("real torch is unavailable")
 
-    monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "2")
+    # Force two physical pipeline groups so Dense must prepare all groups in
+    # one metadata upload and launch each group by index.
+    monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "1")
     original = {
         "l0": SimpleNamespace(
             k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
@@ -1308,32 +1357,10 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
     codec = DenseKVByteCodec(kv_caches)
     connector = BlockGPUConnector(codec, block_size=4, chunk_size=8)
     _install_fake_fused_chunk_major(codec)
+    fused = codec._fused_kv_staging
     monkeypatch.setattr(connector, "_assert_fused_chunk_major_available", lambda: None)
 
-    pack_groups = []
-    unpack_groups = []
     buffer_requests = []
-
-    monkeypatch.setattr(
-        codec,
-        "gpu_to_chunk_major_device_buffer",
-        lambda device_buf, block_id_groups, stream=None: (
-            pack_groups.append([list(group) for group in block_id_groups]),
-            DenseKVByteCodec.gpu_to_chunk_major_device_buffer(
-                codec, device_buf, block_id_groups, stream=None
-            ),
-        )[-1],
-    )
-    monkeypatch.setattr(
-        codec,
-        "chunk_major_device_buffer_to_gpu",
-        lambda device_buf, block_id_groups, stream=None: (
-            unpack_groups.append([list(group) for group in block_id_groups]),
-            DenseKVByteCodec.chunk_major_device_buffer_to_gpu(
-                codec, device_buf, block_id_groups, stream=None
-            ),
-        )[-1],
-    )
     orig_ensure_staging_buffer = connector._ensure_staging_buffer
 
     def _ensure_staging_buffer(staging_buffer, nbytes):
@@ -1400,9 +1427,10 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
     )
     # Save staging is tail-to-head, but every MemoryObj still receives the
     # bytes for its original exact range.
-    assert pack_groups == [[[3], [1, 2]]]
-    assert all(nbytes <= 4 * codec.bytes_per_block for nbytes, _ in buffer_requests)
-    assert all(capacity == 4 * codec.bytes_per_block for _, capacity in buffer_requests)
+    assert fused.prepared_groups == [(((1,), (3,)), ((2,), (1, 2)))]
+    assert fused.prepared_pack_indices == [0, 1]
+    assert all(nbytes <= 2 * codec.bytes_per_block for nbytes, _ in buffer_requests)
+    assert all(capacity == 2 * codec.bytes_per_block for _, capacity in buffer_requests)
     assert torch.equal(memory_objs[0].tensor, expected0)
     assert torch.equal(memory_objs[1].tensor, expected1)
 
@@ -1416,12 +1444,20 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
     )
 
     # Load/retrieve remains in ordinary head-to-tail order.
-    assert unpack_groups == [[[1, 2], [3]]]
+    assert fused.prepared_groups == [
+        (((1,), (3,)), ((2,), (1, 2))),
+        (((2,), (1, 2)), ((1,), (3,))),
+    ]
+    assert fused.prepared_unpack_indices == [0, 1]
     for bid in [1, 2, 3]:
         assert torch.equal(kv_caches["l0"].k_cache[bid], original["l0"].k_cache[bid])
         assert torch.equal(kv_caches["l0"].v_cache[bid], original["l0"].v_cache[bid])
     assert torch.count_nonzero(kv_caches["l0"].k_cache[0]) == 0
     assert torch.count_nonzero(kv_caches["l0"].v_cache[0]) == 0
+    stats = connector.last_transfer_stats()
+    assert stats["batch_block_ids_enabled"] == 1
+    assert stats["batch_id_groups"] == 2
+    assert stats["batch_id_uploads"] == 1
 
 
 def test_lmcache_connector_requires_fused_chunk_major_staging():
@@ -1655,6 +1691,41 @@ def test_codec_chunk_major_rejects_duplicate_block_ids():
 
     with pytest.raises(ValueError, match="duplicate block ids"):
         codec.gpu_to_chunk_major_device_buffer(device_buf, [[0, 1], [1]])
+
+
+def test_dense_prepared_ids_preserve_per_pipeline_group_validation():
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    kv_caches = {
+        "l0": SimpleNamespace(
+            k_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
+            v_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
+            k_scale=None,
+            v_scale=None,
+        )
+    }
+    codec = DenseKVByteCodec(kv_caches)
+    _install_fake_fused_chunk_major(codec)
+    stream = object()
+
+    # A physical block may recur after the preceding pipeline group has been
+    # fenced/reused, matching the legacy per-group validation contract.
+    owner = codec.prepare_block_id_groups(
+        [[[0, 1]], [[1, 2]]], device=codec.device, stream=stream
+    )
+    assert owner.group_count == 2
+    assert owner.upload_count == 1
+    assert codec._fused_kv_staging.prepared_groups == [(((2,), (0, 1)), ((2,), (1, 2)))]
+
+    # Repetition inside one pipeline group is still rejected before upload.
+    with pytest.raises(ValueError, match="duplicate block ids"):
+        codec.prepare_block_id_groups(
+            [[[0, 1], [1]]], device=codec.device, stream=stream
+        )
+    assert len(codec._fused_kv_staging.prepared_groups) == 1
 
 
 def test_scheduler_alignment_uses_dcp_hash_blocks_and_lmcache_chunks(monkeypatch):
@@ -4395,9 +4466,46 @@ def _install_byte_addressing_fused(codec: DenseKVByteCodec) -> None:
                     )
                     offset += nbytes
 
+    def _prepare(segments, seg_block_bytes, groups, device):
+        normalized = tuple(
+            (tuple(chunk_block_counts), tuple(flat_block_ids))
+            for chunk_block_counts, flat_block_ids in groups
+        )
+        return SimpleNamespace(
+            segments=segments,
+            seg_block_bytes=seg_block_bytes,
+            groups=normalized,
+            device=device,
+            group_count=len(normalized),
+            upload_count=int(any(ids for _counts, ids in normalized)),
+        )
+
+    def _pack_prepared(prepared, group_index, device_buf):
+        counts, ids = prepared.groups[group_index]
+        _pack(
+            prepared.segments,
+            prepared.seg_block_bytes,
+            counts,
+            ids,
+            device_buf,
+        )
+
+    def _unpack_prepared(prepared, group_index, device_buf):
+        counts, ids = prepared.groups[group_index]
+        _unpack(
+            device_buf,
+            prepared.segments,
+            prepared.seg_block_bytes,
+            counts,
+            ids,
+        )
+
     codec._fused_kv_staging = SimpleNamespace(
         fused_pack_chunk_major=_pack,
         fused_unpack_chunk_major=_unpack,
+        prepare_chunk_major_groups=_prepare,
+        fused_pack_chunk_major_prepared=_pack_prepared,
+        fused_unpack_chunk_major_prepared=_unpack_prepared,
     )
 
 

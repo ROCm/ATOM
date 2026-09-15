@@ -95,8 +95,27 @@ def indexer_qk_rope_quant_and_cache(
     weights_scale: float,
     preshuffle: bool = False,
     is_neox: bool = True,
+    q_scale_out: torch.Tensor | None = None,
+    kv_cache_scale: torch.Tensor | None = None,
 ) -> None:
-    """Run the fused indexer cache op with ATOM's DCP query semantics."""
+    """Run the fused indexer cache op with ATOM's DCP query semantics.
+
+    The two scale buffers together switch the op to packed E2M1 + e8m0 outputs,
+    and are forwarded only when given so that an aiter predating them still
+    accepts the FP8 call -- the same version tolerance the seg-variant import
+    above keeps. One without the other would fall back to FP8 and write that
+    layout into FP4-shaped buffers, so it is refused here rather than passed on.
+    """
+    if (q_scale_out is None) != (kv_cache_scale is None):
+        raise ValueError(
+            "FP4 output needs both q_scale_out and kv_cache_scale, got only "
+            + ("q_scale_out" if q_scale_out is not None else "kv_cache_scale")
+        )
+    fp4_out = (
+        {"q_scale_out": q_scale_out, "kv_cache_scale": kv_cache_scale}
+        if q_scale_out is not None
+        else {}
+    )
     _indexer_qk_rope_quant_and_cache(
         q,
         q_out,
@@ -117,6 +136,7 @@ def indexer_qk_rope_quant_and_cache(
         preshuffle=preshuffle,
         is_neox=is_neox,
         compute_all_q_rope=get_dcp_world_size() > 1,
+        **fp4_out,
     )
 
 
@@ -3011,6 +3031,9 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     MAX_NUM_BLOCKS_PER_REQ: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,  # tile width along columns
+    # The FP8 indexer scores one concatenated KV plane, so a request's own
+    # position is `indice - cu_seqlens_q[req]`; the paged FP4 scorer emits it.
+    SEQ_LOCAL: tl.constexpr,
     # strides (in elements)
     ti_stride0: tl.int64,  # topk_indices stride 0
     ti_stride1: tl.constexpr,  # topk_indices stride 1
@@ -3037,7 +3060,7 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     req_kv_end = tl.load(cu_seqlens_q + req_id + 1, mask=valid_req, other=0)
     req_kv_len = req_kv_end - pre_seqlens_q
 
-    seq_token_idx = indice - pre_seqlens_q
+    seq_token_idx = indice if SEQ_LOCAL else indice - pre_seqlens_q
     block_id = seq_token_idx // PAGE_SIZE
     inblock_offset = seq_token_idx % PAGE_SIZE
 
@@ -3087,6 +3110,7 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 1024,  # tile width along columns
     out: torch.Tensor | None = None,
+    seq_local: bool = False,
 ):
 
     assert topk_indices.shape[1] == NUM_TOPK_TOKENS
@@ -3138,6 +3162,7 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
         max_num_blocks_per_req,
         PAGE_SIZE,
         BLOCK_N,
+        seq_local,
         # strides
         ti_stride0,
         ti_stride1,

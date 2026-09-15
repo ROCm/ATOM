@@ -823,6 +823,15 @@ def dcp_prefill_slot_mapping(
     return slot_mapping
 
 
+def dcp_local_logits_width(max_model_len: int, dcp_world_size: int) -> int:
+    """Column count of one DCP rank's local indexer logits plane.
+
+    The FP4 metadata builder bakes this into a CUDAGraph-captured schedule while
+    the scorer allocates the plane, so the two have to read it off one formula.
+    """
+    return -(-max_model_len // dcp_world_size)
+
+
 def dcp_local_context_lens(
     attn_metadata,
     dcp_rank: int,
@@ -900,6 +909,9 @@ def dcp_decode_candidate_exchange_fused(
     out_kv_indices: torch.Tensor,
     out_kv_indptr: torch.Tensor,
     owned_counts: torch.Tensor,
+    q_scale: torch.Tensor | None = None,
+    kv_scale: torch.Tensor | None = None,
+    weights_scale: float = 1.0,
 ) -> None:
     """Score the local shard, exchange scores, emit this rank's owned KV slots.
 
@@ -914,11 +926,17 @@ def dcp_decode_candidate_exchange_fused(
     a gid-ordered tie-break, so when the local boundary (2048th) sits on a score
     tie a tied token may be dropped before the exchange. Exact fp32 score ties
     are rare, so this is a negligible boundary effect, not a systematic loss.
+
+    Only the scoring below is dtype-bound: pass `q_scale`/`kv_scale` to score the
+    shard in FP4 instead of FP8. Everything after it -- the local top-k, the
+    exchange and the merge -- reads fp32 logits and is the same either way.
     """
     # Imported here, not at module scope, so this module stays importable on a
     # machine without aiter (collection of CPU-only tests, doc builds).
     from aiter.ops.topk import flydsl_dcp_topk_merge, top_k_per_row_decode
     from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+
+    from atom.model_ops.sparse_indexer_fp4 import FP4_MQA_BLOCK_K
 
     dcp_world_size = get_dcp_world_size()
     # Size everything off num_decode_tokens, the rows this rank actually
@@ -944,21 +962,45 @@ def dcp_decode_candidate_exchange_fused(
         cp_kv_cache_interleave_size,
         num_decode_tokens,
     )
-    l_max = (max_model_len + dcp_world_size - 1) // dcp_world_size
+    l_max = dcp_local_logits_width(max_model_len, dcp_world_size)
     local_logits = torch.empty(
         [num_decode_tokens, l_max], dtype=torch.float32, device="cuda"
     )
-    deepgemm_fp8_paged_mqa_logits(
-        q_rows,
-        kv_cache,
-        weights[:num_decode_tokens],
-        local_logits,
-        local_ctx,
-        block_tables,
-        l_max,
-        KVBlockSize=runner_block_size,
-        Preshuffle=True,
-    )
+    if q_scale is None:
+        deepgemm_fp8_paged_mqa_logits(
+            q_rows,
+            kv_cache,
+            weights[:num_decode_tokens],
+            local_logits,
+            local_ctx,
+            block_tables,
+            l_max,
+            KVBlockSize=runner_block_size,
+            Preshuffle=True,
+        )
+    else:
+        from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
+
+        # The schedule the metadata builder published is the one this kernel was
+        # captured with, and it is built off `local_ctx` at `l_max` -- the same
+        # two the call below scores in. Neither may be re-derived here.
+        flydsl_pa_mqa_logits_fp4(
+            q_rows,
+            q_scale[:num_decode_tokens].unsqueeze(1),
+            kv_cache,
+            kv_scale,
+            block_tables,
+            weights[:num_decode_tokens],
+            local_ctx,
+            l_max,
+            weight_scale=weights_scale,
+            next_n=1,
+            block_k=FP4_MQA_BLOCK_K,
+            kv_block_size=runner_block_size,
+            out=local_logits,
+            cta_info=attn_metadata.indexer_fp4_cta_info,
+            total_ctas=attn_metadata.indexer_fp4_n_ctas,
+        )
 
     # k_loc is the constant `topk_tokens`, never the live local length: the
     # exchanged size must be static for CUDAGraph. Short contexts therefore ship

@@ -606,3 +606,102 @@ def test_cpu_pin_is_retained_until_retrieve_finishes(monkeypatch):
         }
     finally:
         worker.close()
+
+
+def test_dense_worker_records_the_blocks_a_failed_load_left_unfilled():
+    """The id alone does not truncate anything.
+
+    vLLM caches the whole external prefix unless the failure also names blocks:
+    `_update_requests_with_invalid_blocks` cuts `num_computed_tokens` at the
+    first block reported here. Blocks below the HBM frontier are deliberately
+    excluded -- they hold valid KV and may be shared with another request.
+
+    The grid is the virtual block size (block_size 4 x dcp 2 = 8), matching the
+    one `BlockGPUConnector` maps chunks with; the physical size would index
+    different entries of the very same table.
+    """
+    worker = DenseOffloadConnector(_config("kv_consumer"))
+    request = LMCacheReqMeta(
+        req_id=61,
+        token_ids=list(range(16)),
+        block_ids=[10, 11, 12, 13],
+        load_spec=LoadSpec(
+            hbm_cached_tokens=4,
+            lmcache_cached_tokens=12,
+            can_load=True,
+        ),
+        load_operation=LoadOperationId(req_id=61, generation=1),
+    )
+
+    try:
+        with worker._lock:
+            worker._record_load_error_blocks(request)
+
+        # Tokens [4, 12) on a grid of 8 are entries 0 and 1 of the table.
+        assert worker.take_load_error_blocks() == {10, 11}
+        # Drained, so the next step does not truncate a request all over again.
+        assert worker.take_load_error_blocks() == set()
+    finally:
+        worker._save_executor.shutdown(wait=True)
+        worker._load_executor.shutdown(wait=True)
+
+
+def test_dense_worker_fences_in_flight_jobs_for_a_preempted_request():
+    """Preemption hands the blocks to somebody else in the same step.
+
+    A save still gathering from them stores the new occupant's bytes under the
+    preempted request's key -- a poisoned cache entry, not a lost one. The fence
+    is the only thing standing between the two.
+    """
+    import threading
+
+    worker = DenseOffloadConnector(_config("kv_consumer"))
+    release = threading.Event()
+    finished = []
+
+    def slow_job(_request):
+        release.wait(timeout=5)
+        finished.append(True)
+
+    try:
+        worker._track_job(
+            71,
+            worker._save_executor.submit(
+                worker._guard, "save", slow_job, SimpleNamespace(req_id=71)
+            ),
+        )
+        assert worker._inflight_jobs["71"]
+
+        # Another request's ids are not this request's business.
+        worker.wait_for_requests(["72"])
+        assert finished == []
+
+        release.set()
+        worker.wait_for_requests(["71"])
+
+        assert finished == [True]
+        assert "71" not in worker._inflight_jobs
+    finally:
+        release.set()
+        worker._save_executor.shutdown(wait=True)
+        worker._load_executor.shutdown(wait=True)
+
+
+def test_dense_load_failure_by_request_resolves_the_parked_generation(monkeypatch):
+    """vLLM hands back plain strings; `load_failed` refuses a raw id.
+
+    Routing the failure through `load_finished` instead would pop the floor
+    recording that the [HBM, LMCache) range is NOT persisted, so the recomputed
+    chunks would never be saved.
+    """
+    connector = _scheduler(monkeypatch)
+    seq = _load_seq(81, num_prompt_tokens=16)
+    operation = LoadOperationId(req_id=81, generation=3)
+    connector._save_tracker["81"] = [seq, 16]
+    connector._load_save_floors["81"] = 8
+    connector._active_load_operations["81"] = (seq, operation)
+
+    assert connector.load_failed_by_request("81") is True
+
+    assert connector._save_tracker["81"] == [seq, 8]
+    assert "81" not in connector._active_load_operations

@@ -177,10 +177,22 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             if str(lookup_id) not in loading_lookup_ids:
                 self._lookup_unpin(lookup_id)
         for req in metadata.requests:
+            # The futures are tracked, not discarded: `wait_for_requests` fences
+            # them when vLLM preempts a request and reuses its blocks.
             if req.load_spec is not None and self._do_load:
-                self._load_executor.submit(self._guard, "load", self._do_load_req, req)
+                self._track_job(
+                    req.req_id,
+                    self._load_executor.submit(
+                        self._guard, "load", self._do_load_req, req
+                    ),
+                )
             if req.save_spec is not None and self._do_save:
-                self._save_executor.submit(self._guard, "save", self._do_save_req, req)
+                self._track_job(
+                    req.req_id,
+                    self._save_executor.submit(
+                        self._guard, "save", self._do_save_req, req
+                    ),
+                )
 
     # -- copy daemon thread ----------------------------------------------
     def _source_group_safe(self, identity: SaveSourceGroupId) -> None:
@@ -243,6 +255,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             self._lookup_unpin(req.req_id)
             with self._lock:
                 self._failed_load.add(self._load_completion_id(req))
+                self._record_load_error_blocks(req)
             return
 
         mask = torch.ones(len(toks), dtype=torch.bool)
@@ -265,6 +278,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 self._done_load.add(self._load_completion_id(req))
             else:
                 self._failed_load.add(self._load_completion_id(req))
+                self._record_load_error_blocks(req)
         total_ms = (time.perf_counter() - t_total0) * 1000
         if self._profile_enabled():
             logger.info(

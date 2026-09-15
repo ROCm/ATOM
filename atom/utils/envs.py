@@ -142,6 +142,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # own MEGA_DISPATCH=flydsl|mori), 0 binds mori's v2 op-layer running plain
     # gather, i.e. the untouched upstream baseline.
     "ATOM_MORI_V2_FUSED": lambda: os.getenv("ATOM_MORI_V2_FUSED", "0") == "1",
+    # Reuse a 128-token MegaMoEV2 instance for native DP-unified small decode/
+    # verify/draft forwards on the supported EP8, 48-experts-per-rank layout. Set to 0
+    # to keep the configured max_num_batched_tokens capacity for every graph.
+    "ATOM_MEGA_DECODE_FAST_PATH": lambda: (
+        os.getenv("ATOM_MEGA_DECODE_FAST_PATH", "1") == "1"
+    ),
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # Match SGLang's gfx950 pure-prefill fast path: cast Q/K/V to FP8 and use
     # AITER's head-dim-256 per-tensor FMHA kernel. Set to 0 for the BF16
@@ -449,6 +455,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Force Triton attention fallbacks where available. Set to 1 to bypass
     # optional ASM/OPUS fast paths during debugging.
     "ATOM_FORCE_ATTN_TRITON": lambda: (os.getenv("ATOM_FORCE_ATTN_TRITON", "0") == "1"),
+    # Force the OPUS kernel for DeepSeek-V4 fp8 sparse prefill instead of the
+    # aiter asm kernel (`mla_sparse_prefill_fp8_asm`, the default). Escape hatch
+    # for the asm path; that kernel is gfx1250-only and hard-requires H == 128,
+    # so smaller local head counts fall back to OPUS regardless of this flag.
+    "ATOM_FORCE_V4_PREFILL_OPUS": lambda: (
+        os.getenv("ATOM_FORCE_V4_PREFILL_OPUS", "0") == "1"
+    ),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
