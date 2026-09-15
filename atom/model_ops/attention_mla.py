@@ -1084,11 +1084,17 @@ class MLAAttention(nn.Module):
         # re-imported under a different module identity, breaking `is`/`==`.
         if qt is None or getattr(qt, "value", None) != QuantType.per_Token.value:
             return None
-        if getattr(op, "params_dtype", None) != dtypes.fp8:
+        # Same set the sibling predicate in attention_residual.py accepts, and
+        # the layer's own spelling is what comes back: `dtypes.fp8` is e4m3fn
+        # here but e4m3fnuz on MI300, so matching one identity would skip the
+        # fusion for the other, and returning the constant rather than what the
+        # layer holds would quantize to the wrong FP8 format.
+        params_dtype = getattr(op, "params_dtype", None)
+        if params_dtype not in (dtypes.fp8, torch.float8_e4m3fn):
             return None
         if getattr(op, "input_scale", None) is not None:
             return None
-        return dtypes.fp8
+        return params_dtype
 
     @mark_trace(prefix="dcp_project_merge_out", torch_compile=False)
     def _dcp_project_merge_out(
