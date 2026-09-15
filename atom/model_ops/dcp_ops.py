@@ -461,9 +461,14 @@ def _dcp_a2a_unpack_combine_kernel(
 
     n = tl.arange(0, N_ROUNDED)
     valid = n < N_RANKS
+    # The padding lanes are masked at every load, which is the documented Triton
+    # contract. They are also folded onto lane 0 here so no pointer is ever
+    # FORMED outside `recv` -- belt and braces, asked for in review, and free:
+    # the select folds into the address arithmetic.
+    n_safe = tl.where(valid, n, 0)
     base = (
         recv_ptr
-        + n.to(tl.int64) * recv_stride_n
+        + n_safe.to(tl.int64) * recv_stride_n
         + b * recv_stride_b
         + h * recv_stride_h
     )
@@ -560,11 +565,16 @@ def _dcp_a2a_unpack_combine_quant_kernel(
     h = tl.arange(0, H_LOCAL)
     d = tl.arange(0, HEAD_DIM)
     valid = n < N_RANKS
+    # The padding lanes are masked at every load, which is the documented Triton
+    # contract. They are also folded onto lane 0 here so no pointer is ever
+    # FORMED outside `recv` -- belt and braces, asked for in review, and free:
+    # the select folds into the address arithmetic.
+    n_safe = tl.where(valid, n, 0)
 
     # [N, H] base of each (shard, head) record for this token.
     hbase = (
         recv_ptr
-        + n[:, None].to(tl.int64) * recv_stride_n
+        + n_safe[:, None].to(tl.int64) * recv_stride_n
         + b * recv_stride_b
         + h[None, :].to(tl.int64) * recv_stride_h
     )
