@@ -4,11 +4,16 @@ GLM-5.2 (`GlmMoeDsaForCausalLM`) cannot use LMCache's own GPU connector. This
 recipe uses `AtomLMCacheOffloadConnector`, which drives ATOM's `DenseKVByteCodec`
 from vLLM's KV-connector API and leaves LMCache as a pure byte store.
 
-**Read *Measured* before turning this on.** The connector is correct — a
-two-pass check restores 99.84% of a flooded-out prefix and recovers every marker
-— but on GLM-5.2 at the bandwidths measured here it costs throughput at both
-working points tested (-12.31% and -48.41% over 600 s). It is a tool for
-workloads with a small, hot prefix set, not a default.
+On a 64-prefix rotation this is worth **+50.4%** throughput against the same
+workload with the tier off, and it gives back what it stored — a two-pass check
+restores 99.84% of a flooded-out prefix and recovers every marker.
+
+That number is recent. The first working version of this connector *lost* 48.41%
+at this same working point, and the recipe said so. It was not bandwidth-bound,
+as that analysis concluded; it was livelocked. *Measured* keeps both numbers,
+because the wrong one was arrived at carefully and is the more useful of the two
+to read. The 16-prefix working point has **not** been re-measured since the fix,
+so take no number for it from this recipe.
 
 For the generic plugin + `LMCacheConnectorV1` path (works on dense models), see
 [LMCache KV Cache Offload](LMCache-KV-Cache-Offload.md). That path does **not**
@@ -177,103 +182,96 @@ gfx950 x8 (this connector on GPUs 0-3), TP=4, `amd/GLM-5.2-MXFP4`,
 `--cache-bust first-turn-suffix`, 600 s measurement window with a 60 s grace
 period, `--use-server-token-count`. Each pair uses one seed for both arms.
 
-Two working points, differing only in how many distinct prefixes circulate:
+The 64-prefix point is the one to read: both arms complete with zero errors and
+the tier has real work to do. (At 16 prefixes the off arm already serves 75.97%
+of its prompt tokens from HBM, so the external tier has little left to carry;
+that point brackets the behaviour rather than describing a configuration to
+ship.)
 
-| metric | 16 prefixes, off | 16 prefixes, on | 64 prefixes, off | 64 prefixes, on |
-|---|---|---|---|---|
-| seed | 904117 | 904117 | 517293 | 517293 |
-| requests ok / error | 472 / 0 | 419 / 47 | 303 / 0 | 168 / 0 |
-| total throughput tok/s | 25,864 | 22,679 (**-12.31%**) | 16,420 | 8,471 (**-48.41%**) |
-| TTFT avg ms | 1,832 | 2,020 | 4,494 | 16,569 |
-| ITL avg ms | 16.54 | 18.43 | 22.83 | 16.92 |
-| prompt tokens read from cache | 75.97% | 83.84% | 14.94% | 58.64% |
+| metric | 64 prefixes, off | 64 prefixes, on |
+|---|---|---|
+| seed | 441907 | 441907 |
+| requests ok / error | 312 / 0 | 464 / 0 |
+| output throughput tok/s | 261.64 | **393.50 (+50.4%)** |
+| total throughput tok/s | 17,007 | **25,578 (+50.4%)** |
+| TTFT avg ms | 4,086 | 1,406 |
+| TTFT p50 ms | 4,232 | 672 |
+| ITL avg ms | 22.62 | 17.58 |
 
-The 47 errors in the 16-prefix on arm are the `kv_load_failure_policy` default
-biting (see Gotchas); they are gone at 64 prefixes once the policy is `recompute`
-and the CPU tier is sized for the whole run. **Both arms of the 64-prefix pair
-completed with zero errors**, so that pair is the one to read. The 16-prefix on
-arm also *under-reports its own cost*: aiperf excludes failed requests from
-throughput, but the server still prefilled all 47 of them.
+Where the prompt tokens came from (`vllm:prompt_tokens_by_source_total`, delta
+over the window):
 
-Where the prompt tokens came from, 64-prefix on arm
-(`vllm:prompt_tokens_by_source_total`, delta over the window):
+| source | off | on |
+|---|---|---|
+| `external_kv_transfer` | 0 | 9,708,800 (63.9%) |
+| `local_cache_hit` | 2,192,960 (21.4%) | 3,112,704 (20.5%) |
+| `local_compute` | 8,030,918 (78.6%) | 2,383,238 (15.7%) |
 
-```
-external_kv_transfer  2,598,720   47.2%      <- this connector
-local_cache_hit         629,632   11.4%      <- HBM prefix cache
-local_compute         2,276,824   41.4%      <- re-prefilled
-```
+The last row is the mechanism in one line: recomputed prompt tokens fall from
+8.03M to 2.38M, a 3.4x cut in prefill work, and prefill is what this workload is
+short of.
 
-So the tier is genuinely carrying the load — and throughput still halves.
+### The -48.41% run, and why its analysis was wrong
 
-### Why it loses here
+The first measurement of this working point (seed 517293) read 16,420 -> 8,471
+tok/s, **-48.41%**. The recipe then attributed it to the link: 825 s of transfer
+summed across ranks inside a 600 s wall clock, a slow tail with 12.9 s retrieve
+calls, an amortised 116.6 us/token against 71.0 us to recompute = 1.64x, and the
+conclusion that a prefix had to be read back ~14 times to break even.
 
-The offload path, not the GPU, is the saturated resource. From the on arm's
-`Retrieved`/`Stored` lines (summed over the 4 ranks, then divided by 4):
+Every one of those numbers was measured correctly. The inference from them was
+wrong, because the transfer volume they were computed from was itself the
+symptom.
 
-| | per rank | call time | bandwidth | per token |
-|---|---|---|---|---|
-| retrieve | 7,079,168 tok | 424.4 s | 0.796 GB/s | 60.0 us |
-| store | 2,666,752 tok | 400.8 s | 0.317 GB/s | 150.3 us |
+A lookup hit covering the whole prompt is decremented by one so the request has
+something left to compute. LMCache resolves at chunk granularity, so when the
+prompt length is an exact multiple of the chunk size that decrement walks off a
+chunk boundary and names tokens the tier does not hold — the load can never
+satisfy its own `ret_mask` check. And a failed load left no record, so the next
+scheduler pass looked up, hit, parked the request in `WAITING_FOR_REMOTE_KVS`,
+and failed again, forever, holding its KV blocks and its concurrency slot.
 
-Those 825 s of transfer sit inside a 600 s wall clock. The link is not
-uniformly slow — half the retrieve calls run at 3.891 GB/s or better — but the
-slow tail eats the time: p10 is 0.228 GB/s, p90 is 6.36 s per call and the worst
-is 12.9 s, which is exactly where the 16.5 s TTFT comes from. Retrieve and store
-are contending for the same host path (401 s/rank of store overlaps the 424 s of
-retrieve), so aggregate bandwidth lands at a fifth of a typical call.
+One request in that run was retried **137 times at ~1.45 GiB per attempt**; a
+second run reached 528. That is where the 825 s of transfer and the 12.9 s tail
+came from — not from a saturated link. Six of eight workers dead-ended one at a
+time, the last at t=563 s, costing 26.88% of the run's slot-seconds against a
+26.93% throughput drop. Both defects are fixed; `total_suppressed_load_retries`
+counts the suppressed retries so the failure mode is visible if it returns.
 
-Compare against simply re-prefilling. The off arm computed 8,445,197 prompt
-tokens in 600 s = **14,075 tok/s, i.e. 71.0 us per token**. With a 2.65x reuse
-factor (7.08M retrieved against 2.67M stored), the amortised cost of a token
-served from the tier is
+**The lesson worth keeping:** a cost model built on measured volume is only as
+good as the assumption that the volume was necessary. Before fitting a
+break-even against transfer bytes, check that the bytes were work.
 
-```
-60.0 us (retrieve)  +  150.3 us / 2.65 (store)  =  116.6 us  =  1.64x recompute
-```
+### Where the remaining cost is
 
-which is the whole result: on GLM-5.2 it is cheaper to recompute the prefix than
-to move it. The observed drop is larger still (1.94x) — the rest is the
-connector's own bookkeeping: per-step lookups and the scheduling deferral while
-an async load is outstanding.
+With the livelock gone the path is host-bound, not link-bound. A 2.91 MiB chunk
+takes ~2.1 ms to store or retrieve while the raw link moves it in ~0.06 ms, so
+~97% of the time is host-side — and it is the same in both directions and on
+LMCache 0.4.5 and 0.5.5rc4, which is why upgrading LMCache does not move it
+(measured: 0.5.5rc4 is 5.72% *slower* end to end).
 
-Note what this is *not*. GLM-5.2's KV is already compressed — 576 B per token
-per MLA layer, against ~2 KiB for an 8-head GQA layer at fp8 — so the tier is
-moving less per layer than it would on a dense model. The volume is only large
-because there are 99 of them (78 MLA + 21 indexer = 46.6 KiB/token/rank,
-**1.27 GiB per rank** for a 28,672-token prefix). What makes it lose is the
-other side of the ratio: sparse MLA prefill is *fast*. Recomputing a token costs
-71.0 us and moving one costs 60.0 us — the two are within 20% of each other, so
-there is no headroom for the store traffic to hide in. A model whose prefill is
-several times more expensive per KV byte leaves that headroom; this one does
-not.
+py-spy on a live unprofiled server put 46% of the save thread and 56% of the
+load thread inside one call: the staging ring's wait on the slot it is about to
+reuse. That wait blocks because a blocking runtime call drops the GIL to sleep
+and then waits out a switch interval to get it back — ~22 ms (save) / ~35 ms
+(load) per blocking wrap, against 0.158 ms of GPU work per group. Deepening the
+ring is the fix, and it is nearly free (a slot is `nblocks*8` pinned bytes):
 
-### What would have to change
+| host staging slots | output tok/s | TTFT p50 ms | ITL ms |
+|---|---|---|---|
+| 4 | 353.77 | 1,425.71 | 18.87 |
+| 32 | 383.15 | 742.31 | 18.00 |
+| 128 | 393.50 | 672.32 | 17.58 |
 
-Break-even needs the amortised transfer cost below 71 us/token, so either
+Monotone on all three against a 1.23% cross-sweep spread, so 128 is where the
+marginal gain stopped being worth another arm rather than a measured optimum.
+Set `OFFLOAD_STAGING_PROBE=1` to time each runtime call in the staging path
+separately; it perturbs what it measures, so read it for shape, not for level.
 
-- **more reuse** — solving `60.0 + 150.3/r < 71.0` gives **r > 13.7**: at the
-  measured bandwidths a prefix must be read back about fourteen times before the
-  tier pays for storing it. A small set of very hot prefixes (system prompts,
-  few-shot blocks) is the shape that works; the 64-way rotation measured here,
-  at r = 2.65, is nowhere near it;
-- **more bandwidth** — the median call already does 3.891 GB/s, so the deficit
-  is contention rather than the link. Halving the store traffic, or giving
-  retrieve its own stream, moves the aggregate more than faster memory would;
-- **fewer bytes** — there is little left here. The KV is already the MLA latent
-  at fp8; dropping the 21 indexer layers and recomputing them saves 5.8% of the
-  volume, which does not move r = 13.7. Bytes are not the lever on this model.
-
-The honest summary: the connector is correct and the tier does carry the load
-(47.2% of prompt tokens at 64 prefixes), but on GLM-5.2 at these bandwidths it
-costs more than it saves. Ship it behind a flag and turn it on for workloads
-with a small, hot prefix set — not as a default.
-
-Do not read the 16-prefix row as "a smaller loss". It is a different failure: at
-16 prefixes the off arm already served 75.97% of its prompt tokens from HBM, so
-the external tier had almost nothing left to do and its 12.31% is close to pure
-overhead. Neither working point is a configuration to ship; they bracket the
-behaviour.
+Two things are *not* the lever on this model. Bytes: GLM-5.2's KV is already the
+MLA latent at fp8 — 576 B per token per MLA layer against ~2 KiB for an 8-head
+GQA layer — and dropping the 21 indexer layers saves 5.8% of the volume.
+LMCache's version: see above.
 
 ### Correctness: two-pass restore check
 
