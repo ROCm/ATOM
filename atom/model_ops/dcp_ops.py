@@ -303,6 +303,68 @@ def _lse_pack_slots(dtype: torch.dtype) -> int:
 
 
 @triton.jit
+def _zero_nonfinite_rows_kernel(
+    out_ptr,  # [B, H, D]   attention output, written in place
+    lse_ptr,  # [B, H]      fp32 per-head LSE
+    out_stride_b,
+    out_stride_h,
+    lse_stride_b,
+    lse_stride_h,
+    HEAD_DIM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Zero the (token, head) rows whose LSE is not finite. One program per row.
+
+    Replaces five launches with one. The Python it stands in for --
+
+        o = torch.where(torch.isfinite(lse).unsqueeze(-1), o, 0.0)
+
+    -- costs four kernels just to build the mask, because torch decomposes
+    isfinite into abs/ne/eq/mul, and a fifth to apply it. The mask is [B, H],
+    a few KB; at ~5.5 us per launch that chain is pure launch overhead.
+
+    The bigger win is the early return. A non-finite LSE means the row saw no
+    valid KV, which is an edge case -- nearly every row is finite. `where`
+    cannot know that: it reads and rewrites all of `o` regardless. Here a
+    finite row exits before touching `o` at all, so the common case costs one
+    scalar load per row instead of a full read-modify-write of [B, H, D].
+    """
+    b = tl.program_id(axis=0).to(tl.int64)
+    h = tl.program_id(axis=1).to(tl.int64)
+
+    lse = tl.load(lse_ptr + b * lse_stride_b + h * lse_stride_h)
+    # isfinite: NaN fails `lse == lse`, +-inf fails the abs bound.
+    if (lse == lse) and (tl.abs(lse) < float("inf")):
+        return
+
+    base = out_ptr + b * out_stride_b + h * out_stride_h
+    for off in tl.range(0, HEAD_DIM, BLOCK):
+        idx = off + tl.arange(0, BLOCK)
+        tl.store(base + idx, tl.zeros([BLOCK], dtype=out_ptr.dtype.element_ty),
+                 mask=idx < HEAD_DIM)
+
+
+def zero_nonfinite_rows(out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
+    """In-place `out[~isfinite(lse)] = 0`, one kernel. See the kernel docstring."""
+    assert out.dim() == 3 and lse.dim() == 2, (out.shape, lse.shape)
+    assert out.shape[:2] == lse.shape, (out.shape, lse.shape)
+    b, h, d = out.shape
+    if b == 0 or h == 0:
+        return out
+    _zero_nonfinite_rows_kernel[(b, h)](
+        out,
+        lse,
+        out.stride(0),
+        out.stride(1),
+        lse.stride(0),
+        lse.stride(1),
+        HEAD_DIM=d,
+        BLOCK=min(1024, triton.next_power_of_2(d)),
+    )
+    return out
+
+
+@triton.jit
 def _dcp_a2a_pack_kernel(
     out_ptr,  # [B, H, D]      this rank's partial attention output
     lse_ptr,  # [B, H]         fp32

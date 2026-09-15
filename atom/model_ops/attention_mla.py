@@ -2068,9 +2068,22 @@ class MLAAttention(nn.Module):
                 "(empty KV cache?)"
             )
             if self.is_sparse_mla and self.dcp_world_size > 1:
-                o = torch.where(
-                    torch.isfinite(final_lse).unsqueeze(-1), o, torch.zeros_like(o)
-                )
+                # One kernel for what torch spelled in five.
+                #
+                # `torch.where(torch.isfinite(lse).unsqueeze(-1), o, 0.0)` costs
+                # four launches to build the mask -- torch decomposes isfinite
+                # into abs/ne/eq/mul -- plus one to apply it. The mask is a few
+                # KB, so those four are pure launch overhead: 5.5 us each,
+                # 22.3 us per layer, measured.
+                #
+                # The fifth is the expensive one and the reason for the kernel:
+                # `where` reads and rewrites every byte of `o` even though a
+                # non-finite LSE is an edge case and nearly every row survives
+                # untouched. The Triton version returns before touching `o` for
+                # a finite row.
+                from atom.model_ops.dcp_ops import zero_nonfinite_rows
+
+                zero_nonfinite_rows(o, final_lse)
             # These feed a cross-rank combine, not the bmm, so the head slice
             # has to be materialised rather than left as a view.
             return o.contiguous(), final_lse.contiguous()
