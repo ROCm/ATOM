@@ -51,6 +51,9 @@ def _copy_checkpoints_kernel(
     CHUNK: tl.constexpr,
     BLOCK: tl.constexpr,
     NBLK_SSM: tl.constexpr,  # blocks covering HKV; the grid split point
+    K: tl.constexpr,
+    V: tl.constexpr,
+    STATE_VK: tl.constexpr = False,
 ):
     i_t = tl.program_id(0)
     i_blk = tl.program_id(1)
@@ -68,13 +71,16 @@ def _copy_checkpoints_kernel(
         # runtime slot, which the chunk kernel just wrote.
         idx = i_blk * BLOCK + tl.arange(0, BLOCK)
         mask = idx < HKV
+        dst_idx = idx
+        if STATE_VK:
+            dst_idx = idx // (K * V) * (K * V) + (idx % V) * K + (idx % (K * V)) // V
         # Both branches cast to the pool's dtype: `h` is bf16 (the chunk
         # kernel allocates it with `k.new_empty`) while the pool is fp32, so
         # the two loads have different types and Triton requires them to
         # agree before the store.
         if tl.load(is_end + i_t) != 0:
             src_slot = tl.load(runtime_slots + i_t).to(tl.int64)
-            sv = tl.load(ssm_dst + src_slot * HKV + idx, mask=mask, other=0.0).to(
+            sv = tl.load(ssm_dst + src_slot * HKV + dst_idx, mask=mask, other=0.0).to(
                 ssm_dst.dtype.element_ty
             )
         else:
@@ -82,7 +88,7 @@ def _copy_checkpoints_kernel(
             sv = tl.load(h + src * HKV + idx, mask=mask, other=0.0).to(
                 ssm_dst.dtype.element_ty
             )
-        tl.store(ssm_dst + slot * HKV + idx, sv, mask=mask)
+        tl.store(ssm_dst + slot * HKV + dst_idx, sv, mask=mask)
     else:
         # ── conv window: the STATE_LEN tokens ending at the target, ────────
         # transposed into the pool's [D, STATE_LEN] layout.
@@ -165,4 +171,7 @@ def write_state_checkpoints(
         CHUNK=chunk_size,
         BLOCK=BLOCK,
         NBLK_SSM=nblk_ssm,
+        K=ssm_state.shape[-2],
+        V=ssm_state.shape[-1],
+        STATE_VK=ssm_state.stride(-2) == 1,
     )
