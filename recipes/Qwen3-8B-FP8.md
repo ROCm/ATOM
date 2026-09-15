@@ -1,9 +1,12 @@
 # Qwen3-8B-FP8 (block-128) on RX 9070 XT (gfx1201) via ROCm/ATOM
 
 Verified path on RX 9070 XT (gfx1201). Attention and GEMM run through
-Triton; same backend setup and the **build-aiter-for-gfx1201** prerequisite
+Triton; same backend setup and the **build-aiter-for-the-arch** prerequisite
 ([ROCm/aiter#3846](https://github.com/ROCm/aiter/issues/3846)) as the
-[Ministral-3-8B recipe](./Ministral-3-8B.md).
+[Ministral-3-8B recipe](./Ministral-3-8B.md) — build aiter with
+`GPU_ARCHS=gfx1201` (Navi 48) or `GPU_ARCHS=gfx1200` (Navi 44: RX 9060 /
+RX 9060 XT). Both RDNA4 chips share this Triton path; the numbers below are
+from gfx1201.
 
 ## Model
 
@@ -34,7 +37,7 @@ export ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION=0
 `ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT=1` and
 `ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT=1` to fuse
 normalization/activation with FP8 quantization. Requires HIP
-`rmsnorm_quant` to JIT-compile on gfx1201 — test before enabling.
+`rmsnorm_quant` to JIT-compile on gfx1200 / gfx1201 — test before enabling.
 
 ## Required CLI flags
 
