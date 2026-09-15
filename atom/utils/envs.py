@@ -89,9 +89,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MLA_SHUFFLE_KV": lambda: (
         os.getenv("ATOM_USE_TRITON_MLA_SHUFFLE_KV", "0") == "1"
     ),
+    # Run the routed experts with the aiter Triton/gluon MoE kernels instead of
+    # FlyDSL fused_moe, on prefill and decode alike. For SiLU models on gfx1250
+    # this selects the a8w4 GUGU (gate/up-interleaved) kernel -- the default --
+    # which fuses SiLU into GEMM1's write-back and the MXFP8 requant into its
+    # epilogue. SwiGLU models (GPT-OSS) and CDNA archs keep the general
+    # moe_gemm_a16w4 / a4w4 / a8w4 path. Defaults to on for gfx94x, and for
+    # gfx95x when ATOM_USE_TRITON_GEMM is set.
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
-    "ATOM_USE_TRITON_MOE_DECODE": lambda: os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0")
-    == "1",
+    # Split the routed experts by phase: FlyDSL fused_moe on prefill, the Triton
+    # /gluon GUGU kernel on decode. Needs ATOM_USE_TRITON_MOE=1 (it narrows that
+    # flag, it cannot enable Triton on its own) plus gfx1250 + ATOM_MOE_GU_ITLV=1
+    # + SiLU, because it keeps a single copy of the weights in the FlyDSL layout
+    # and hands Triton a zero-copy view of it -- which is only valid where the
+    # two preshuffles agree byte-for-byte -- which is what ATOM_MOE_GU_ITLV=1
+    # buys, and why the prep asserts it: only the interleaved layout is shared,
+    # so at ATOM_MOE_GU_ITLV=0 the FlyDSL prep and the Triton view disagree.
+    # tests/test_mxfp4_triton_moe_decode.py runs both real preps and compares.
+    #
+    # Arms under EP as well as TP, at both EP entry points -- the modular-kernel
+    # (transport) path and the local no-transport one build the same views.
+    "ATOM_USE_TRITON_MOE_DECODE": lambda: (
+        os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0") == "1"
+    ),
+    # Select the a4w4 Triton wrapper instead of the a8w4 default, on both the TP
+    # and EP paths. Only chooses *which* wrapper runs -- it cannot enable the
+    # Triton path on its own, and asserts if set without ATOM_USE_TRITON_MOE.
+    # The weights are identical (both are w4); only the activation quant
+    # differs, so no extra weight prep or memory is involved.
+    "ATOM_USE_TRITON_MOE_A4W4": lambda: (
+        os.getenv("ATOM_USE_TRITON_MOE_A4W4", "0") == "1"
+    ),
     # Force DP-attention + EP through the collective fallback even when mori is
     # installed. This is useful for controlled A/B tests and for deployments
     # where the mori shared-memory transport is unavailable or undesirable.
@@ -114,6 +142,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # own MEGA_DISPATCH=flydsl|mori), 0 binds mori's v2 op-layer running plain
     # gather, i.e. the untouched upstream baseline.
     "ATOM_MORI_V2_FUSED": lambda: os.getenv("ATOM_MORI_V2_FUSED", "0") == "1",
+    # Reuse a 128-token MegaMoEV2 instance for native DP-unified small decode/
+    # verify/draft forwards on the supported EP8, 48-experts-per-rank layout. Set to 0
+    # to keep the configured max_num_batched_tokens capacity for every graph.
+    "ATOM_MEGA_DECODE_FAST_PATH": lambda: (
+        os.getenv("ATOM_MEGA_DECODE_FAST_PATH", "1") == "1"
+    ),
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # Match SGLang's gfx950 pure-prefill fast path: cast Q/K/V to FP8 and use
     # AITER's head-dim-256 per-tensor FMHA kernel. Set to 0 for the BF16
@@ -415,6 +449,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Force Triton attention fallbacks where available. Set to 1 to bypass
     # optional ASM/OPUS fast paths during debugging.
     "ATOM_FORCE_ATTN_TRITON": lambda: (os.getenv("ATOM_FORCE_ATTN_TRITON", "0") == "1"),
+    # Force the OPUS kernel for DeepSeek-V4 fp8 sparse prefill instead of the
+    # aiter asm kernel (`mla_sparse_prefill_fp8_asm`, the default). Escape hatch
+    # for the asm path; that kernel is gfx1250-only and hard-requires H == 128,
+    # so smaller local head counts fall back to OPUS regardless of this flag.
+    "ATOM_FORCE_V4_PREFILL_OPUS": lambda: (
+        os.getenv("ATOM_FORCE_V4_PREFILL_OPUS", "0") == "1"
+    ),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"

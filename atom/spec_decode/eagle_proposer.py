@@ -479,6 +479,11 @@ class EagleProposer(Drafter):
             # itself; the verify step's has the right row count, wrong rows.
             attn_metadata.dcp_token_block_tables = attn_metadata.block_tables
         attn_metadata.context_lens = var["context_lens"].gpu[:running_bs]
+        # Unguarded because the base builder answers it: this runs for every
+        # target a draft can have, and only the MLA one has an FP4 indexer. The
+        # draft's rows are its own, and a replay addresses whatever row count
+        # the schedule buffer holds.
+        builder._publish_indexer_fp4_decode_schedule(attn_metadata, running_bs, 1)
         if "sparse_kv_indptr" in var:
             attn_metadata.sparse_kv_indptr = var["sparse_kv_indptr"].gpu[
                 : running_bs + 1
@@ -757,6 +762,15 @@ class EagleProposer(Drafter):
                     )
                     for k, v in workinfos.items():
                         attn_metadata.__dict__[k] = v
+                    # Every step, and only after `prepare_mtp_decode`: that call
+                    # is what refreshes the DCP local lengths the schedule is
+                    # built from, and a replay reads the buffer's contents. The
+                    # publish in `_enter_decode_metadata` runs before the
+                    # refresh, and steps 1+ reached their forward with step 0's.
+                    builder = self.runner.attn_metadata_builder
+                    builder._publish_indexer_fp4_decode_schedule(
+                        attn_metadata, running_bs, 1
+                    )
                     if has_flat_kv and "slot_mapping" not in workinfos:
                         # MLA/MHA path: slot derived from flat kv_indices. Both,
                         # and the slot_mapping written below, are the ones
@@ -766,7 +780,6 @@ class EagleProposer(Drafter):
                         raw_slots = attn_metadata.kv_indices[
                             attn_metadata.kv_indptr[1 : running_bs + 1] - 1
                         ]
-                        builder = self.runner.attn_metadata_builder
                         if getattr(builder, "dcp_world_size", 1) > 1:
                             # DCP interleave-S: only rank ((ctx-1)//S) % W owns this
                             # draft token; other ranks' kv_indptr didn't grow, so

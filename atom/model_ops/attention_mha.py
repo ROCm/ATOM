@@ -1473,6 +1473,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 self.num_kv_heads,
                 self.scale,
                 emit_sparse_block_table=True,
+                n_valid_column_per_row=sparse_metadata.n_valid_column_per_row,
             )
             self._store_cached_topk(
                 sparse_metadata, topk_key, (topk_idx, sparse_bt, sparse_ctx)
@@ -1550,6 +1551,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 self.scale,
                 emit_sparse_block_table=True,
                 max_query_len=max_query_len,
+                n_valid_column_per_row=sparse_metadata.n_valid_column_per_row,
             )
             self._store_cached_topk(
                 sparse_metadata, topk_key, (topk_idx, sparse_bt, sparse_ctx)

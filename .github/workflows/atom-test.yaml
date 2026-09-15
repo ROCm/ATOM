@@ -318,7 +318,7 @@ jobs:
           if [ -n "$containers" ]; then
             docker kill $containers || true
           fi
-          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true 
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true
 
       - name: Show Docker containers
         if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
@@ -709,7 +709,7 @@ jobs:
           echo "========== Cleaning up workspace =========="
           runner_label="${{ matrix.runner }}"
           if [[ "${runner_label}" == "linux-atom-do-mi350x-8" ]]; then
-            docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true
+            docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true
           fi
           docker stop "$CONTAINER_NAME" || true
           docker rm "$CONTAINER_NAME" || true
