@@ -46,6 +46,7 @@ from atom.kv_transfer.disaggregation.types import (
     SaveOperationId,
     StateStoreOperationId,
 )
+from atom.kv_transfer.offload import _block_gpu_connector
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
@@ -1631,14 +1632,10 @@ def test_lmcache_connector_respects_staging_buffer_chunks_env(monkeypatch):
     assert connector._thread_state().staging_buffer.tensor is None
 
 
-def test_lmcache_connector_default_staging_buffer_chunks_is_two(monkeypatch):
+def _tiny_staging_codec():
+    """A codec with one block per LMCache chunk and a very small chunk."""
     import torch
 
-    if not hasattr(torch, "arange"):
-        pytest.skip("real torch is unavailable")
-
-    monkeypatch.delenv("OFFLOAD_GPU_STAGING_CHUNKS", raising=False)
-    monkeypatch.delenv("OFFLOAD_GPU_STAGING_MAX_BYTES", raising=False)
     kv_caches = {
         "l0": SimpleNamespace(
             k_cache=torch.arange(2 * 2, dtype=torch.uint8).reshape(2, 2),
@@ -1647,11 +1644,85 @@ def test_lmcache_connector_default_staging_buffer_chunks_is_two(monkeypatch):
             v_scale=None,
         )
     }
-    codec = DenseKVByteCodec(kv_caches)
+    return DenseKVByteCodec(kv_caches)
+
+
+def _clear_staging_env(monkeypatch):
+    monkeypatch.delenv("OFFLOAD_GPU_STAGING_CHUNKS", raising=False)
+    monkeypatch.delenv("OFFLOAD_GPU_STAGING_MAX_BYTES", raising=False)
+
+
+def test_default_staging_buffer_is_sized_in_bytes_not_chunks(monkeypatch):
+    """The default buys a fixed number of bytes, whatever a chunk happens to be.
+
+    This is the whole point of the byte-denominated default: two KV geometries
+    with different bytes-per-chunk must end up with the same buffer size, not
+    the same chunk count.
+    """
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    _clear_staging_env(monkeypatch)
+    codec = _tiny_staging_codec()
+    chunk_bytes = codec.bytes_per_block  # block_size == chunk_size below
+    monkeypatch.setattr(
+        _block_gpu_connector, "_DEFAULT_GPU_STAGING_BYTES", 4 * chunk_bytes
+    )
+
+    connector = BlockGPUConnector(codec, block_size=4, chunk_size=4)
+
+    assert connector.gpu_staging_chunk_bytes == chunk_bytes
+    assert connector.gpu_staging_buffer_chunks == 4
+    assert connector.gpu_staging_buffer_bytes == 4 * chunk_bytes
+
+
+def test_default_staging_buffer_never_drops_below_two_chunks(monkeypatch):
+    """A geometry whose single chunk already exceeds the target keeps two.
+
+    The byte target raises the floor for small-chunk models; it must not cut
+    large-chunk models down to a single chunk, which would be worse than the
+    chunk-denominated default they have today.
+    """
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    _clear_staging_env(monkeypatch)
+    codec = _tiny_staging_codec()
+    monkeypatch.setattr(
+        _block_gpu_connector, "_DEFAULT_GPU_STAGING_BYTES", codec.bytes_per_block // 2
+    )
+
     connector = BlockGPUConnector(codec, block_size=4, chunk_size=4)
 
     assert connector.gpu_staging_buffer_chunks == 2
-    assert connector.gpu_staging_buffer_bytes == 2 * connector.gpu_staging_chunk_bytes
+
+
+def test_default_staging_buffer_chunk_count_is_capped(monkeypatch):
+    """A tiny chunk must not turn the byte target into an unbounded count.
+
+    The buffer is allocated at its full size, so the chunk count is what bounds
+    per-group work; without a cap a geometry with a very small chunk would ask
+    for millions of them.
+    """
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    _clear_staging_env(monkeypatch)
+    codec = _tiny_staging_codec()
+    monkeypatch.setattr(_block_gpu_connector, "_DEFAULT_GPU_STAGING_BYTES", 1 << 30)
+
+    connector = BlockGPUConnector(codec, block_size=4, chunk_size=4)
+
+    assert (
+        connector.gpu_staging_buffer_chunks
+        == _block_gpu_connector._MAX_DEFAULT_GPU_STAGING_CHUNKS
+    )
 
 
 def test_codec_chunk_major_device_buffer_layout():
