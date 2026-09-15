@@ -139,6 +139,108 @@ Per-position acceptance:     0.89 - 0.95, 0.72 - 0.84
 Avg draft acceptance rate:   86.1%, 86.1%  (whole run, each of the two)
 ```
 
+## LMCache KV offload (byte codec)
+
+Kimi-K3 offloads KV through `AtomLMCacheOffloadConnector`, the same connector
+MiniMax-M3 and GLM-5.2 use, plus a second leg for the KDA recurrent state. See
+[MiniMax-M3 — LMCache KV offload](MiniMax-M3-LMCache-Byte-Offload.md) for the
+LMCache build steps and the tier-sizing arithmetic; everything there applies
+here unchanged. What follows is only what K3 adds.
+
+### Why K3 needs more than the M3 path
+
+K3 is hybrid, so vLLM builds **two** KV cache groups: MLA full attention and KDA
+recurrent state. A restored MLA prefix is correct only if the KDA state at the
+**same token boundary** is restored with it — half a restore is not a crash and
+not a log line, it is wrong output.
+
+The two groups therefore move by two different mechanisms:
+
+| group | moved by | addressed by |
+|---|---|---|
+| MLA | `DenseKVByteCodec`, whole blocks per chunk | the request's block table, positionally |
+| KDA | `StateByteCodec`, one opaque page per boundary | vLLM's explicit boundary hand-off |
+
+The KDA group cannot be read positionally at all. In `--mamba-cache-mode align`
+a mamba block table is not append-only — a superseded state block is freed and
+nulled, and speculative blocks relocate in place — so indexing it by
+`token // block_size` can land on a null, freed, or live speculative block and
+persist those bytes under a valid prefix hash. The only safe source is vLLM's
+explicit hand-off — `SchedulerOutput.partial_tail_offloads` on the pinned 0.28
+(`KVCacheManager.take_partial_tail_offloads`), the same
+`{req_id: [(group_id, block_id, boundary_tokens)]}` payload under
+`kv_connector_block_state.boundary_state_offloads` on 0.29 — which names the
+exact block holding a committed boundary state. The connector reads whichever
+spelling the running vLLM provides.
+
+Correctness of the pair is enforced on **lookup**, not on save: the reported
+external hit is capped at the largest chunk boundary whose KDA state the index
+still claims. A KDA state that was never stored, or that LMCache evicted,
+shortens the prefix instead of corrupting it.
+
+### Launch
+
+Add to the DSpark launch above (prefix caching and `--mamba-cache-mode align`
+are already there and are both **mandatory** for offload):
+
+```bash
+export PYTHONHASHSEED=0              # mandatory, see Gotchas in the M3 recipe
+export LMCACHE_LOCAL_CPU=True
+export LMCACHE_MAX_LOCAL_CPU_SIZE=20 # GiB **per TP rank** -- TP8 x 20 = 160 GiB pinned
+export LMCACHE_CHUNK_SIZE=128        # must equal --block-size
+export OFFLOAD_MIN_LOAD_TOKENS=256   # default 8192 disables the tier for chat-sized prompts
+
+vllm serve "${MODEL}" \
+    ... the DSpark flags above ... \
+    --kv-transfer-config '{"kv_connector":"AtomLMCacheOffloadConnector","kv_connector_module_path":"atom.plugin.vllm.kv_transfer.connector","kv_role":"kv_both","kv_load_failure_policy":"recompute"}'
+```
+
+Three settings are K3-specific and each one is a hard failure if wrong:
+
+- **`--mamba-cache-mode align` is mandatory**, not just useful for DSpark. Any
+  other mode keeps the recurrent state where this connector has no hand-off for
+  it, so a boundary block id would be a guess. The connector refuses to start
+  rather than guess.
+- **`"kv_load_failure_policy":"recompute"`** must be set. vLLM's default is
+  `fail`, which turns an offload-tier miss into a user-visible 500. The KDA leg
+  reports a load error deliberately whenever a recurrent state does not come
+  back — that is the mechanism that keeps a half-restored prefix from being
+  served — so under the default policy an ordinary eviction fails the request.
+- **`LMCACHE_CHUNK_SIZE` must be a multiple of the mamba block size.** Only
+  chunk-aligned boundaries are stored and only chunk-aligned boundaries are
+  probed on lookup, so a chunk that ends between two boundaries can never
+  produce a usable pair. The connector validates this at construction and names
+  both numbers if it does not hold.
+
+Hybrid models also require vLLM's hybrid memory allocator, which vLLM
+auto-disables for a connector that does not declare `SupportsHMA` — so without
+that declaration K3 plus `--kv-transfer-config` does not mis-save, it does not
+boot. The connector declares it; the check below confirms HMA stayed on.
+
+### Verify it is actually on
+
+On top of the four checks in the M3 recipe:
+
+```bash
+# the recurrent leg found its group (one line per worker AND the EngineCore)
+grep "ATOM LMCache offload: recurrent state leg on group" server.log
+
+# HMA must NOT have been turned off -- this line means the connector was not
+# recognised as SupportsHMA and the recurrent leg is not running
+grep "Turning off hybrid kv cache manager" server.log   # expect no match
+```
+
+### Status
+
+The implementation and its unit coverage are in tree
+(`tests/test_vllm_kda_state_offload.py`). End-to-end validation on hardware —
+boot, two-pass accuracy against the 0.9507 / 0.9500 baseline above, and hit
+rate — has **not** been run yet; the numbers in this section are requirements,
+not measurements. When it is run, use the two-pass method: a single SAVE-only
+pass measures nothing, so salt the prefixes to defeat the GPU prefix cache, size
+the HBM pool below the working set to force read-back, and take the noise floor
+from the OFF arm's own two-pass delta.
+
 ## Current scope
 
 - Text and image inputs are supported through the Kimi-K3 multimodal processor,
@@ -147,3 +249,7 @@ Avg draft acceptance rate:   86.1%, 86.1%  (whole run, each of the two)
 - Asynchronous scheduling is supported. Prefix caching is off by default and
   needs `--mamba-cache-mode align` to be turned on, as the DSpark launch does.
 - DSpark speculative decoding is supported; see above.
+- LMCache KV offload is supported with prefix caching and
+  `--mamba-cache-mode align`; see above. It needs the hybrid memory allocator
+  left on (the connector declares `SupportsHMA`) and the boundary-state
+  hand-off, both of which the pinned vLLM 0.28 provides.
