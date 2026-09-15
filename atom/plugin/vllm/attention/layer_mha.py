@@ -792,6 +792,13 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
                 chunked_output = tmp_output
                 chunked_lse = tmp_lse
 
+        if chunked_output is None:
+            # num_chunks == 0: no request in this segment has any KV preceding
+            # its queries, so the causal pass over the new tokens is already the
+            # whole answer and there is no prefix to merge.
+            output.copy_(out)
+            return
+
         merge_attn_states(
             output=output,
             prefix_output=chunked_output,

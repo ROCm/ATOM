@@ -1046,6 +1046,12 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
             max_context_chunk = _CP_TOKENS_PER_ITER_ROCM // num_extends
             from vllm.utils.math_utils import cdiv
 
+            # Every extend row can start at token 0, leaving no preceding KV to
+            # chunk over. vLLM 0.29's cudagraph memory profiling walks straight
+            # into that: InputBatch.make_dummy hands out seq_len == query_len,
+            # and when num_tokens does not divide num_reqs the query lengths
+            # disagree, so the widening above moves the whole (dummy) decode
+            # segment here. num_chunks is then legitimately 0.
             num_chunks = cdiv(computed_kv_lens.max().item(), max_context_chunk)
 
             chunk_starts = (
@@ -1066,7 +1072,11 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
             torch.cumsum(
                 chunk_seq_lens, dim=1, out=cu_seq_lens_cpu[:, 1:], dtype=torch.int32
             )
-            max_cum_tokens = cu_seq_lens_cpu[:, -1].max().item()
+            # cu_seq_lens_cpu is [0, num_extends + 1] when num_chunks == 0, and
+            # torch.max() with no dim rejects an empty input.
+            max_cum_tokens = (
+                cu_seq_lens_cpu[:, -1].max().item() if num_chunks > 0 else 0
+            )
 
             # Build token->batch mapping robustly, even with zero-length batches.
             batch_id_per_k_token_tensor = torch.zeros(
