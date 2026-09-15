@@ -311,12 +311,31 @@ class OffloadWorkerMixin:
         raw = os.environ.get("OFFLOAD_PROFILE", "0").strip().lower()
         return bool(raw) and raw not in {"0", "false", "no", "off"}
 
+    # The GPU connector's counts describe its last `batched_*` call, but one
+    # store or retrieve issues several, so a log line built from them under-
+    # reports the operation. With `OFFLOAD_TRANSFER_PROFILE=1` the connector
+    # also accumulates `window_*` totals since the reset this class issues just
+    # before the operation -- exactly the span a caller here means by "the
+    # transfer I just did". Folding them in here keeps the profile timings and
+    # the counts they are divided by on the same span.
+    _TRANSFER_WINDOW_TOTALS = (
+        "chunks",
+        "groups",
+        "max_chunk_bytes",
+        "max_group_bytes",
+        "total_bytes",
+    )
+
     def _last_gpu_connector_transfer_stats(self) -> dict[str, int | float]:
         gpu_connector = getattr(getattr(self, "_engine", None), "gpu_connector", None)
         if gpu_connector is None or not hasattr(gpu_connector, "last_transfer_stats"):
             return {}
         try:
-            return dict(gpu_connector.last_transfer_stats())
+            stats = dict(gpu_connector.last_transfer_stats())
+            for key in self._TRANSFER_WINDOW_TOTALS:
+                if f"window_{key}" in stats:
+                    stats[key] = stats[f"window_{key}"]
+            return stats
         except Exception:  # optional instrumentation hook
             logger.debug(
                 "LMCache offload: transfer stats collection failed",
