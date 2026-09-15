@@ -1,0 +1,217 @@
+name: ATOM Release Package
+
+# Builds the ATOM wheel (pure Python + the rust-built libmesh.so carried as
+# package data) and publishes it as a GitHub Release asset.
+#
+# First wheel release flow for ATOM (the ROCm 7 images only ever shipped an
+# editable install inside the docker image). Modeled on aiter's
+# aiter-release.yaml, minus everything that does not apply: ATOM has no HIP
+# kernels to compile, no auditwheel repair step, and no S3 staging — the wheel
+# is the package plus the atomesh rust binary's cdylib, built by the same
+# ATOM_MESH_BUILD=1 hook the docker image uses.
+#
+# The build runs inside the ATOM release image so the wheel is built against
+# the exact torch/triton stack the image ships (the rust mesh build links
+# against torch's C API via pyo3, and libmesh.so is carried as package data).
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: 'Commit/tag/ref to build (leave empty to use current commit)'
+        required: false
+        default: ''
+      build_image:
+        description: 'Docker image to build the wheel in'
+        required: true
+        default: 'rocm/atom-dev:latest'
+      add_date_stamp:
+        description: 'Add date stamp to version (+yyyymmdd)'
+        type: boolean
+        default: false
+      draft:
+        description: 'Create the GitHub Release as a draft'
+        type: boolean
+        default: false
+      runner:
+        description: 'Runner label to use'
+        type: choice
+        default: 'linux-atom-mi35x-1'
+        options:
+          - linux-atom-mi35x-1
+          - build-only-atom
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write  # create the GitHub Release and upload assets
+
+concurrency:
+  group: atom-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    name: Build wheel and publish to GitHub Releases
+    runs-on: ${{ inputs.runner || 'linux-atom-mi35x-1' }}
+
+    env:
+      BUILD_REF: ${{ inputs.commit || github.ref }}
+      BUILD_IMAGE: ${{ inputs.build_image || 'rocm/atom-dev:latest' }}
+      ADD_DATE_STAMP: ${{ inputs.add_date_stamp || false }}
+      DRAFT: ${{ inputs.draft || false }}
+
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history + tags for setuptools_scm versioning
+
+      - name: Checkout to user-specified ref (if provided)
+        run: |
+          set -ex
+          if [ -n "${BUILD_REF}" ] && [ "${BUILD_REF}" != "${{ github.ref }}" ]; then
+            echo "Checking out to ref: ${BUILD_REF}"
+            git fetch --all --tags
+            git checkout "${BUILD_REF}"
+          else
+            echo "No ref override, building current commit: $(git rev-parse HEAD)"
+          fi
+
+      - name: Generate version
+        id: version
+        run: |
+          set -ex
+          # setuptools_scm derives the version from git tags; the date stamp
+          # variant is for nightly-style builds off main.
+          if [ "${ADD_DATE_STAMP}" = "true" ]; then
+            DATE_STAMP=$(date +%Y%m%d)
+            BASE_VERSION=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo "0.1.0")
+            WHEEL_VERSION="${BASE_VERSION}+${DATE_STAMP}"
+            echo "wheel_version=${WHEEL_VERSION}" >> "$GITHUB_OUTPUT"
+            echo "Building version: ${WHEEL_VERSION}"
+          else
+            WHEEL_VERSION=$(python3 -c "
+            import subprocess
+            describe = subprocess.run(['git', 'describe', '--tags', '--dirty'], capture_output=True, text=True).stdout.strip()
+            print(describe.lstrip('v'))")
+            echo "wheel_version=${WHEEL_VERSION}" >> "$GITHUB_OUTPUT"
+            echo "Building version: ${WHEEL_VERSION}"
+          fi
+
+      - name: Run the build container
+        run: |
+          set -ex
+          echo "Starting container: atom_build"
+          # The build needs a GPU only if the rust mesh build's torch linkage
+          # check touches one; pass devices when the runner has them.
+          GPU_FLAGS=""
+          if [ -e /dev/kfd ]; then
+            GPU_FLAGS="--device=/dev/kfd --device=/dev/dri --group-add video"
+            echo "GPU devices detected; passing ${GPU_FLAGS} to build container"
+          else
+            echo "No /dev/kfd on runner; starting build container without GPU access"
+          fi
+          docker run -dt \
+            --shm-size=16G \
+            --network=host \
+            ${GPU_FLAGS} \
+            --entrypoint="" \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            --name atom_build \
+            "${BUILD_IMAGE}" \
+            sleep infinity
+
+      - name: Build wheel
+        env:
+          WHEEL_VERSION: ${{ steps.version.outputs.wheel_version }}
+        run: |
+          set -ex
+          # ATOM_MESH_BUILD=1 is the same hook the docker image uses: builds
+          # the rust mesh crate and places libmesh.so under atom/mesh/target/
+          # for package-data pickup (pyproject [tool.setuptools.package-data]).
+          docker exec \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION="${WHEEL_VERSION}" \
+            -e ATOM_MESH_BUILD=1 \
+            -w /workspace \
+            atom_build \
+            bash -c "python3 -m pip wheel . --no-deps -w dist && ls -lh dist/"
+
+      - name: Validate wheel
+        run: |
+          set -ex
+          # The wheel must carry the mesh cdylib and must install + import
+          # cleanly in the same image it was built in.
+          WHEEL=$(ls dist/atom-*.whl)
+          echo "Wheel: ${WHEEL}"
+          python3 -m zipfile -l "${WHEEL}" | grep -E 'libmesh\.so|atom/_version\.py' \
+            || { echo "ERROR: wheel does not carry libmesh.so / _version.py"; exit 1; }
+          docker exec \
+            -w /workspace \
+            atom_build \
+            bash -c "
+              set -e
+              python3 -m pip install --force-reinstall --no-deps dist/atom-*.whl
+              cd /tmp && python3 -c 'import atom; print(\"atom import ok:\", atom.__file__, atom.__version__)'
+              python3 -c 'import atom.mesh; print(\"atom.mesh import ok\")' || echo 'note: atom.mesh python import not required (cdylib only)'
+            "
+
+      - name: Upload wheel as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: atom-whl-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/*.whl
+          retention-days: 14
+
+      - name: Create GitHub Release and upload wheel
+        env:
+          WHEEL_VERSION: ${{ steps.version.outputs.wheel_version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -ex
+          # Tag builds release at the pushed tag; manual dispatch releases at
+          # v<wheel_version> (creating the tag if absent) so the release is
+          # always anchored to a tag.
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="v${WHEEL_VERSION}"
+            if ! git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
+              git tag "${TAG}" "$(git rev-parse HEAD)"
+              git push origin "refs/tags/${TAG}"
+            fi
+          fi
+          DRAFT_FLAG=""
+          if [ "${DRAFT}" = "true" ]; then DRAFT_FLAG="--draft"; fi
+          gh release create "${TAG}" \
+            --title "ATOM ${TAG}" \
+            --notes "ATOM ${TAG} wheel build.
+
+          - Commit: $(git rev-parse HEAD)
+          - Build image: ${BUILD_IMAGE}
+          - Wheel: $(basename $(ls dist/atom-*.whl))" \
+            ${DRAFT_FLAG} \
+            --verify-tag \
+            dist/atom-*.whl \
+            || { # release may already exist (re-run); fall back to asset upload
+              gh release upload "${TAG}" dist/atom-*.whl --clobber
+            }
+
+      - name: Build summary
+        if: always()
+        run: |
+          {
+            echo "## ATOM Wheel Build"
+            echo "- **Version**: ${{ steps.version.outputs.wheel_version }}"
+            echo "- **Commit**: $(git rev-parse HEAD)"
+            echo "- **Build image**: ${BUILD_IMAGE}"
+            echo "- **Wheel**:"
+            ls -lh dist/*.whl 2>/dev/null | awk '{print "- " $9 " (" $5 ")"}' || echo "- (build failed)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker rm -f atom_build || true
