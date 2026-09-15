@@ -1,6 +1,5 @@
 import logging
 import math
-import os
 from dataclasses import dataclass
 
 import torch
@@ -882,49 +881,7 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
             out=slot_mapping,
         )
         slot_mapping.mul_(page_tokens).add_(src_slot_mapping)
-        if os.environ.get("ATOM_DEBUG_KV_BOUNDS") == "1":
-            self._debug_pack(
-                src_block_table,
-                block_table,
-                src_slot_mapping,
-                slot_mapping,
-                page_tokens,
-            )
         return block_table, slot_mapping
-
-    def _debug_pack(
-        self, src_bt, bt, src_sm, sm, page_tokens
-    ):  # pragma: no cover - debug
-        """Report the doubled-page re-index once per padding/real slot regime.
-
-        Skipped during cudagraph capture: the `.item()` reads below are
-        device->host syncs, which HIP rejects on a capturing stream.
-        """
-        if torch.cuda.is_current_stream_capturing():
-            return
-        smax = int(src_sm.max().item()) if src_sm.numel() else -1
-        tag = "pad" if smax < 0 else "real"
-        seen = getattr(self, "_pack_debug_seen", None)
-        if seen is None:
-            seen = set()
-            self._pack_debug_seen = seen
-        if tag in seen:
-            return
-        seen.add(tag)
-        print(
-            f"[ATOM-PACK/{tag}] page_tokens={page_tokens} "
-            f"src_slot[{int(src_sm.min().item())},{smax}] n={src_sm.numel()} "
-            f"dst_slot[{int(sm.min().item())},{int(sm.max().item())}] "
-            f"src_bt[{int(src_bt.min().item())},{int(src_bt.max().item())}] "
-            f"dst_bt[{int(bt.min().item())},{int(bt.max().item())}] "
-            f"bt_shape={tuple(src_bt.shape)} "
-            f"src_sm_dtype={src_sm.dtype} dst_sm_dtype={sm.dtype} "
-            f"src_bt_dtype={src_bt.dtype}",
-            flush=True,
-        )
-        if tag == "real":
-            print(f"[ATOM-PACK/real] src_slot[:32]={src_sm[:32].tolist()}", flush=True)
-            print(f"[ATOM-PACK/real] dst_slot[:32]={sm[:32].tolist()}", flush=True)
 
     def build(
         self,
