@@ -12,16 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""An FP8 weight is not overwritten before its readers are done.
+"""A weight is not overwritten before its readers are done.
 
 The update writes the parameter buffer in place so a captured decode graph
 keeps reading a valid address, and the price is writing into a buffer that may
 still be in use. What matters is that the wait sits with the write: waiting
 once per update instead still lost five of seven weight syncs in a DAPO smoke.
 
-So assert the ordering, not the wait. Both in-place writers -- the requantize
-and the layout post-process -- must wait first, and the wait must name the
-parameter's own device, because a colocated replica is not always on device 0.
+Which is why there is no test here for "the wait happened". The failure that
+shipped was a wait that happened and did nothing -- `_post_process_fp8_weight`
+carried the only fence on the FP8 direct-copy path and ran one line *after*
+`param.data.copy_` -- so every test below asserts the buffer still held its old
+bytes when the fence fired, and covers each write path separately, because four
+of the six had no fence at all.
 """
 
 from types import SimpleNamespace
@@ -32,87 +35,259 @@ from torch import nn
 
 from atom.rollout.weight_updater import WeightUpdaterMixin
 
+# `atom.model_ops.linear` and `atom.model_ops.utils` import aiter, which
+# resolves the chip architecture through rocminfo. Everything that does not
+# reach them runs on a CPU box, which is what CI is.
+needs_aiter = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="the quant_type dispatch imports aiter, which reads the chip "
+    "architecture out of rocminfo",
+)
 
-def _updater():
+HIDDEN = 8
+INTERMEDIATE = 4
+EXPERTS = 2
+
+
+def _updater(model=None, world_size=1):
     class _Updater(WeightUpdaterMixin):
         device = torch.device("cpu")
         label = "test"
         rank = 0
-        world_size = 1
 
-    return _Updater()
+        def clear_kv_cache(self):
+            pass
 
-
-def _fp8_module(quant_type=None):
-    """A module shaped like the FP8 linear the update path recognises."""
-    param = nn.Parameter(torch.zeros(4, 4, dtype=torch.float32), requires_grad=False)
-
-    class _Module(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = param
-            self.weight_scale = nn.Parameter(torch.ones(1), requires_grad=False)
-            self.quant_type = quant_type
-
-    return _Module(), param
+    updater = _Updater()
+    updater.world_size = world_size
+    updater.model = model if model is not None else nn.Module()
+    return updater
 
 
-def test_post_process_waits_before_rewriting_the_layout(monkeypatch):
-    """`_post_process_fp8_weight` is the one every call site reaches."""
-    events = []
-    updater = _updater()
-    module, param = _fp8_module()
+def _record_fences(monkeypatch):
+    """Capture each fenced buffer's contents at the moment its fence fired.
 
+    A fence that runs after its write sees the new bytes; one that runs before
+    sees the old ones. That difference is the bug, so it is what gets asserted.
+    """
     import atom.rollout.weight_updater as wu
 
+    seen = []
     monkeypatch.setattr(
         wu.WeightUpdaterMixin,
         "_await_readers_of",
-        lambda self, p: events.append("wait"),
+        lambda self, param: seen.append((param, param.data.clone())),
         raising=True,
     )
-    # quant_type None returns before any shuffle, which is enough: the wait is
-    # supposed to happen before the function decides anything.
-    updater._post_process_fp8_weight(module, param)
-
-    assert events == ["wait"]
+    return seen
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="the quant_type dispatch imports aiter, which reads the chip arch "
-    "out of rocminfo",
-)
+def _linear_model(shape=(4, 4), dtype=torch.bfloat16, weight_loader=None):
+    """One parameter, named the way a checkpoint names it."""
+    layer = nn.Module()
+    layer.weight = nn.Parameter(torch.zeros(shape, dtype=dtype), requires_grad=False)
+    if weight_loader is not None:
+        layer.weight_loader = weight_loader
+    model = nn.Module()
+    model.layer = layer
+    return model, layer.weight
+
+
+def _assert_fenced_before_write(seen, param, old, new):
+    """The one fence named this parameter, saw the old bytes, and the new bytes
+    landed after it."""
+    assert [p for p, _ in seen] == [param], "expected exactly one fence, on this param"
+    assert torch.equal(seen[0][1], old), "the fence ran after the write it fences"
+    assert torch.equal(param.data, new), "the write did not land"
+
+
+# ── update_weights: every branch of the dispatch ───────────────────────────
+
+
+def test_bf16_direct_copy_waits_first(monkeypatch):
+    """`param.data.copy_(tensor)` for a plain shape-match had no fence at all,
+    on all three of the named-tensor, SHM and IPC entry points."""
+    model, param = _linear_model()
+    updater = _updater(model)
+    seen = _record_fences(monkeypatch)
+    old = param.data.clone()
+    new = torch.full((4, 4), 7.0, dtype=torch.bfloat16)
+
+    assert updater.update_weights([("layer.weight", new)]) == 1
+
+    _assert_fenced_before_write(seen, param, old, new)
+
+
+def test_weight_loader_fallback_waits_first(monkeypatch):
+    """A module's own loader narrows and copies into the buffer it is handed,
+    so its write is as in-place as ours."""
+    written = []
+
+    def weight_loader(param, tensor):
+        written.append(tensor.shape)
+        param.data.copy_(tensor[: param.shape[0]])
+
+    model, param = _linear_model(weight_loader=weight_loader)
+    updater = _updater(model)
+    seen = _record_fences(monkeypatch)
+    old = param.data.clone()
+    # Not a shape match, so the dispatch falls through to the loader.
+    incoming = torch.full((6, 4), 3.0, dtype=torch.bfloat16)
+
+    assert updater.update_weights([("layer.weight", incoming)]) == 1
+
+    assert written == [torch.Size([6, 4])]
+    _assert_fenced_before_write(
+        seen, param, old, torch.full((4, 4), 3.0, dtype=torch.bfloat16)
+    )
+
+
+def test_tp_sharded_copy_waits_first(monkeypatch):
+    """`_try_shard_weight` is the last branch and wrote unfenced."""
+    model, param = _linear_model()
+    updater = _updater(model, world_size=2)
+    seen = _record_fences(monkeypatch)
+    old = param.data.clone()
+    # Twice the rows, so rank 0 takes the first half.
+    incoming = torch.cat(
+        [
+            torch.full((4, 4), 5.0, dtype=torch.bfloat16),
+            torch.full((4, 4), 9.0, dtype=torch.bfloat16),
+        ]
+    )
+
+    assert updater.update_weights([("layer.weight", incoming)]) == 1
+
+    _assert_fenced_before_write(
+        seen, param, old, torch.full((4, 4), 5.0, dtype=torch.bfloat16)
+    )
+
+
+# ── the MoE expert path, which carried no fence anywhere ───────────────────
+
+
+def _moe_model(dtype=torch.bfloat16, fused_leaves=False):
+    """A layer holding the fused expert buffers, plus a recording loader.
+
+    `FusedMoE`'s real loader needs a device; what is under test here is the
+    fence in front of whatever loader is reached, so a stub that writes the
+    slice it is given is the right stand-in.
+    """
+    written = []
+
+    def weight_loader(param, tensor, weight_name=None, shard_id=None, expert_id=0):
+        written.append((shard_id, expert_id))
+        lo = 0 if shard_id == "w1" else INTERMEDIATE
+        rows = slice(lo, lo + INTERMEDIATE)
+        if tensor.dim() == 3:
+            # A fused tensor covers every expert; the loader is handed one
+            # half of the intermediate dim at a time, (E, I, H).
+            param.data[:, rows].copy_(tensor)
+        else:
+            param.data[expert_id, rows].copy_(tensor)
+
+    experts = nn.Module()
+    experts.w13_weight = nn.Parameter(
+        torch.zeros(EXPERTS, 2 * INTERMEDIATE, HIDDEN, dtype=dtype),
+        requires_grad=False,
+    )
+    experts.weight_loader = weight_loader
+    experts.expert_map = None
+    experts.num_redundant_experts = 0
+    mlp = nn.Module()
+    mlp.experts = experts
+    model = nn.Module()
+    model.mlp = mlp
+    if not fused_leaves:
+        model.get_expert_mapping = lambda: [
+            ("experts.w13_weight", "experts.0.gate_proj.weight", 0, "w1"),
+        ]
+    return model, experts.w13_weight, written
+
+
+def test_per_expert_weight_waits_first(monkeypatch):
+    """`_check_expert_sync_supported` requires an unquantized MoE, so the
+    experts never reach `_post_process_fp8_weight` -- the helper that used to
+    carry the only wait. The headline feature of the PR could not be fenced."""
+    model, param, written = _moe_model()
+    updater = _updater(model)
+    seen = _record_fences(monkeypatch)
+    old = param.data.clone()
+
+    result = updater._apply_expert_weight(
+        "mlp.experts.0.gate_proj.weight",
+        torch.full((INTERMEDIATE, HIDDEN), 2.0, dtype=torch.bfloat16),
+        updater._get_param_to_module_mapping(),
+    )
+
+    assert result == "updated"
+    assert written == [("w1", 0)]
+    assert [p for p, _ in seen] == [param]
+    assert torch.equal(seen[0][1], old), "the fence ran after the loader wrote"
+    assert param.data[0, :INTERMEDIATE].eq(2.0).all()
+
+
+def test_fused_expert_tensor_waits_before_each_half(monkeypatch):
+    """One (E, 2I, H) tensor drives the loader once per half, and both halves
+    write the same live buffer."""
+    model, param, written = _moe_model(fused_leaves=True)
+    updater = _updater(model)
+    seen = _record_fences(monkeypatch)
+    old = param.data.clone()
+
+    result = updater._apply_fused_expert_weight(
+        "mlp.experts.gate_up_proj",
+        torch.full((EXPERTS, 2 * INTERMEDIATE, HIDDEN), 4.0, dtype=torch.bfloat16),
+        updater._get_param_to_module_mapping(),
+    )
+
+    assert result == "updated"
+    assert [shard for shard, _ in written] == ["w1", "w3"]
+    assert [p for p, _ in seen] == [param, param]
+    assert torch.equal(seen[0][1], old), "the first half wrote before its fence"
+
+
+# ── the FP8 post-process ──────────────────────────────────────────────────
+
+
+@needs_aiter
 def test_requantize_waits_before_the_first_write(monkeypatch):
-    events = []
-    updater = _updater()
-    module, param = _fp8_module()
+    from aiter import QuantType
 
+    order = []
     import atom.rollout.weight_updater as wu
 
     monkeypatch.setattr(
         wu.WeightUpdaterMixin,
         "_await_readers_of",
-        lambda self, p: events.append("wait"),
+        lambda self, p: order.append("wait"),
         raising=True,
     )
     monkeypatch.setattr(
         wu.WeightUpdaterMixin,
         "_post_process_fp8_weight",
-        lambda self, m, p: events.append("post"),
+        lambda self, m, p: order.append("post"),
         raising=True,
     )
+    param = nn.Parameter(
+        torch.zeros(4, 4, dtype=torch.float8_e4m3fnuz), requires_grad=False
+    )
+    module = SimpleNamespace(
+        weight_scale=nn.Parameter(torch.ones(4, 1), requires_grad=False),
+        quant_type=QuantType.per_Token,
+    )
 
-    def _copy_(self, other, *a, **k):
-        events.append("write")
-        return self
+    _updater()._requantize_fp8_weight(
+        module, "weight", param, torch.ones(4, 4, dtype=torch.float32)
+    )
 
-    monkeypatch.setattr(torch.Tensor, "copy_", _copy_, raising=True)
+    assert order == ["wait", "post"], "the requantize must fence before it writes"
 
-    updater._requantize_fp8_weight(module, "weight", param, torch.zeros(4, 4))
 
-    assert events and events[0] == "wait"
-    assert "write" not in events[: events.index("wait")]
+# ── the e4m3fnuz conversion is not a repeatable transform ─────────────────
+
+
+# ── the wait itself ───────────────────────────────────────────────────────
 
 
 def test_the_wait_is_a_no_op_off_device():

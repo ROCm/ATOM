@@ -166,7 +166,7 @@ class WeightUpdaterMixin:
             return "accumulated"
 
         tensor_gpu = tensor.to(device=self.device)
-        weight_loader(param, tensor_gpu, shard_id)
+        self._load_into_param(param, weight_loader, tensor_gpu, shard_id)
         return "updated"
 
     def _apply_unmatched_weight(
@@ -259,8 +259,9 @@ class WeightUpdaterMixin:
             self._check_expert_sync_supported(
                 name, atom_name, param_name, module, param, tensor
             )
-            weight_loader(
+            self._load_into_param(
                 param,
+                weight_loader,
                 tensor.to(device=self.device),
                 weight_name=name,
                 shard_id=shard_id,
@@ -284,8 +285,12 @@ class WeightUpdaterMixin:
         One (E, 2I, H) ``...experts.gate_up_proj`` covers every expert and both
         halves of w13, so it is driven through ``weight_loader`` once per half:
         a 3D ``loaded_weight`` puts the loader on its full-load path, where the
-        expert dimension is written whole and the intermediate dimension is
-        still narrowed by TP rank.
+        expert dimension is written whole.
+
+        Rank-local halves only. ``FusedMoE._load_w13`` and ``_load_w2`` narrow
+        the *destination* under ``load_full``; they skip the branch that slices
+        the source by ``tp_rank``, so under TP the incoming halves have to be
+        this rank's shard already, not the global intermediate dimension.
 
         Returns 'updated' or 'skipped'.
         """
@@ -318,8 +323,9 @@ class WeightUpdaterMixin:
         # loader's copy handles a strided source, and materialising these
         # would double the largest tensor in the sync.
         for shard_id, chunk in zip(shard_ids, gpu.chunk(len(shard_ids), dim=1)):
-            weight_loader(
+            self._load_into_param(
                 param,
+                weight_loader,
                 chunk,
                 # _copy_expert_shard dispatches on the name containing
                 # "weight"; the fused leaf names do not, so hand it the
@@ -333,6 +339,60 @@ class WeightUpdaterMixin:
         for expert_id in range(param.shape[0]):
             arrived.setdefault(expert_id, set()).update(shard_ids)
         return "updated"
+
+    def _apply_named_expert_buffer(
+        self,
+        name: str,
+        param_name: str,
+        module: torch.nn.Module,
+        param: torch.nn.Parameter,
+        tensor: torch.Tensor,
+    ) -> None:
+        """Write a whole fused expert buffer sent under ATOM's own name.
+
+        Checks support, writes through the fence, and registers every expert
+        slice for the relayout -- the same three obligations as the per-expert
+        route, reached by a different name.
+
+        ``w13_weight`` and ``w2_weight`` are real parameters of the FusedMoE,
+        so a trainer that mirrors ATOM's state dict rather than the
+        checkpoint's resolves in ``_get_param_to_module_mapping`` and never
+        reaches ``_apply_expert_weight``. Without this function such a tensor
+        took the plain dispatch: a row-major ``copy_`` into a buffer the kernel
+        reads through aiter's 16x16 expert permutation, with
+        ``_pending_expert_relayout`` left empty so
+        ``_finalize_expert_weight_sync`` returned at ``if not pending``,
+        ``updated`` counting it as a success, and ``_check_expert_sync_supported``
+        never running to refuse a quantized or expert-parallel MoE.
+
+        Rank-local buffers only. A TP rollout's parameter is its own shard, so
+        a full global buffer is refused below rather than written at the wrong
+        width; ``FusedMoE``'s full-load path does not slice the source by
+        ``tp_rank`` either.
+        """
+        self._check_expert_sync_supported(name, name, param_name, module, param, tensor)
+        if param.dim() != 3:
+            raise NotImplementedError(
+                f"{self.label}: {name} carries an expert-buffer name but is "
+                f"{param.dim()}D, not the (experts, out, in) buffer the expert "
+                f"relayout works on."
+            )
+        if tensor.shape != param.shape:
+            raise NotImplementedError(
+                f"{self.label}: {name} resolves to the fused expert buffer "
+                f"{tuple(param.shape)} but arrived as {tuple(tensor.shape)}. "
+                f"Re-establishing the layout works on whole expert slices, so "
+                f"a partial write cannot be relaid out. Send this rank's "
+                f"buffer whole -- under TP{self.world_size} that is its own "
+                f"shard, not the global tensor -- or one tensor per expert."
+            )
+        self._copy_into_param(param, tensor.to(device=self.device, dtype=param.dtype))
+        # One tensor covers every expert, so every slice of the buffer is new.
+        arrived = self._pending_expert_relayout.setdefault((module, param_name), {})
+        for expert_id in range(param.shape[0]):
+            arrived.setdefault(expert_id, set()).update(
+                _EXPERT_BUFFER_SHARDS[param_name]
+            )
 
     def _check_expert_sync_supported(
         self,
@@ -461,7 +521,7 @@ class WeightUpdaterMixin:
 
         tensor = tensor.to(device=self.device, dtype=param.dtype)
         sharded_tensor = tensor.narrow(shard_dim, start_idx, shard_size)
-        param.data.copy_(sharded_tensor)
+        self._copy_into_param(param, sharded_tensor)
 
         return True
 
@@ -484,11 +544,42 @@ class WeightUpdaterMixin:
 
         Waiting once per update at the entry points is not enough -- measured
         over seven weight syncs it still lost five of them. The wait has to sit
-        with the write.
+        with the write, which is why every writer goes through
+        ``_copy_into_param`` or ``_load_into_param`` rather than calling this.
         """
         device = getattr(param, "device", None)
         if getattr(device, "type", None) == "cuda" and torch.cuda.is_available():
             torch.cuda.synchronize(device)
+
+    def _copy_into_param(self, param: torch.nn.Parameter, tensor: torch.Tensor) -> None:
+        """Overwrite a live parameter's buffer, after its readers are done.
+
+        The wait and the write belong together. Kept apart, the FP8 path ended
+        up fencing the second of its two writes and not the first, and the
+        bf16, TP-sharded, loader-fallback and expert paths fenced none of
+        theirs -- two of six writes covered, which is indistinguishable from
+        uncovered given the failure is probabilistic per sync.
+        """
+        self._await_readers_of(param)
+        param.data.copy_(tensor)
+
+    def _load_into_param(
+        self,
+        param: torch.nn.Parameter,
+        weight_loader,
+        tensor: torch.Tensor,
+        *args,
+        **kwargs,
+    ) -> None:
+        """Same contract for the writes a module's own ``weight_loader`` makes.
+
+        A loader narrows and copies into whatever buffer it is handed, so its
+        write is as in-place as ours. This is the only fence the MoE expert
+        path can have: ``_check_expert_sync_supported`` requires an unquantized
+        MoE, so the experts never reach ``_post_process_fp8_weight``.
+        """
+        self._await_readers_of(param)
+        weight_loader(param, tensor, *args, **kwargs)
 
     @staticmethod
     def _is_fp8_param(module: torch.nn.Module, param: torch.nn.Parameter) -> bool:
@@ -538,8 +629,6 @@ class WeightUpdaterMixin:
 
         quant_type = getattr(module, "quant_type", None)
 
-        self._await_readers_of(param)
-
         if quant_type is not None and quant_type.value == _QT.per_1x128.value:
             # Must match the load-time online_quantize_weight layout: a true
             # 128x128 block scale of shape (N//128, K//128). The previous code
@@ -553,19 +642,22 @@ class WeightUpdaterMixin:
             q_weight, scale = quantize_weight_to_fp8_128x128_blockscale(
                 tensor_gpu, fp8_dtype
             )
-            param.data.copy_(q_weight)
+            # The scale writes ride on the weight's fence: `_await_readers_of`
+            # synchronizes the device, so the reader that held the weight held
+            # its scale too and both are done by the time this returns.
+            self._copy_into_param(param, q_weight)
             weight_scale.data.copy_(scale.to(weight_scale.dtype))
 
         elif quant_type is not None and quant_type.value == _QT.per_Tensor.value:
             amax = tensor_gpu.abs().max()
             scale = (amax / fp8_max).clamp(min=1e-12)
-            param.data.copy_((tensor_gpu / scale).to(fp8_dtype))
+            self._copy_into_param(param, (tensor_gpu / scale).to(fp8_dtype))
             weight_scale.data.fill_(scale.item())
 
         elif quant_type is not None and quant_type.value == _QT.per_Token.value:
             row_amax = tensor_gpu.abs().amax(dim=-1, keepdim=True)
             scale = (row_amax / fp8_max).clamp(min=1e-12)
-            param.data.copy_((tensor_gpu / scale).to(fp8_dtype))
+            self._copy_into_param(param, (tensor_gpu / scale).to(fp8_dtype))
             weight_scale.data.copy_(scale.to(weight_scale.dtype))
 
         else:
@@ -624,6 +716,11 @@ class WeightUpdaterMixin:
         # loader deliberately leaves row-major; shuffling it here would be the
         # divergence rather than the fix.
         if needs_shuffle and param.dim() == 2:
+            # `shuffle_weights` permutes through the existing storage, so this
+            # is the second in-place write to a weight the caller has just
+            # overwritten -- and the one the PR measured a decode graph
+            # catching half-done, five syncs out of seven.
+            self._await_readers_of(param)
             shuffle_weights(param)
 
     def update_weights(
@@ -670,24 +767,27 @@ class WeightUpdaterMixin:
             module, param_name, param = param_to_module[name]
             weight_loader = getattr(module, "weight_loader", None)
 
-            if self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
+            if param_name in _EXPERT_BUFFER_SHARDS:
+                self._apply_named_expert_buffer(name, param_name, module, param, tensor)
+                updated += 1
+            elif self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
                 self._requantize_fp8_weight(module, param_name, param, tensor)
                 updated += 1
             elif self._is_fp8_param(module, param) and tensor.dtype == param.dtype:
                 tensor = tensor.to(device=self.device)
-                param.data.copy_(tensor)
+                self._copy_into_param(param, tensor)
                 self._post_process_fp8_weight(module, param)
                 updated += 1
             elif tensor.shape == param.shape:
                 tensor = tensor.to(device=self.device, dtype=param.dtype)
-                param.data.copy_(tensor)
+                self._copy_into_param(param, tensor)
                 updated += 1
             elif weight_loader is not None and callable(weight_loader):
                 try:
                     tensor = tensor.to(device=self.device)
-                    weight_loader(param, tensor)
+                    self._load_into_param(param, weight_loader, tensor)
                     updated += 1
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001 - a loader raises anything
                     logger.warning(
                         f"{self.label}: weight_loader failed for {name}: {e}"
                     )
@@ -791,24 +891,29 @@ class WeightUpdaterMixin:
                 module, param_name, param = param_to_module[name]
                 weight_loader = getattr(module, "weight_loader", None)
 
-                if self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
+                if param_name in _EXPERT_BUFFER_SHARDS:
+                    self._apply_named_expert_buffer(
+                        name, param_name, module, param, tensor
+                    )
+                    updated += 1
+                elif self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
                     self._requantize_fp8_weight(module, param_name, param, tensor)
                     updated += 1
                 elif self._is_fp8_param(module, param) and tensor.dtype == param.dtype:
                     tensor = tensor.to(device=self.device)
-                    param.data.copy_(tensor)
+                    self._copy_into_param(param, tensor)
                     self._post_process_fp8_weight(module, param)
                     updated += 1
                 elif tensor.shape == param.shape:
                     tensor = tensor.to(device=self.device, dtype=param.dtype)
-                    param.data.copy_(tensor)
+                    self._copy_into_param(param, tensor)
                     updated += 1
                 elif weight_loader is not None and callable(weight_loader):
                     try:
                         tensor = tensor.to(device=self.device)
-                        weight_loader(param, tensor)
+                        self._load_into_param(param, weight_loader, tensor)
                         updated += 1
-                    except Exception as e:
+                    except Exception as e:  # noqa: BLE001 - a loader raises anything
                         logger.warning(
                             f"{self.label}: weight_loader failed for {name}: {e}"
                         )
@@ -949,23 +1054,26 @@ class WeightUpdaterMixin:
             module, param_name, param = param_to_module[name]
             weight_loader = getattr(module, "weight_loader", None)
 
-            if self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
+            if param_name in _EXPERT_BUFFER_SHARDS:
+                self._apply_named_expert_buffer(name, param_name, module, param, tensor)
+                updated += 1
+            elif self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
                 self._requantize_fp8_weight(module, param_name, param, tensor)
                 updated += 1
             elif self._is_fp8_param(module, param) and tensor.dtype == param.dtype:
-                param.data.copy_(tensor)
+                self._copy_into_param(param, tensor)
                 self._post_process_fp8_weight(module, param)
                 updated += 1
             elif tensor.shape == param.shape:
                 if tensor.dtype != param.dtype:
                     tensor = tensor.to(dtype=param.dtype)
-                param.data.copy_(tensor)
+                self._copy_into_param(param, tensor)
                 updated += 1
             elif weight_loader is not None and callable(weight_loader):
                 try:
-                    weight_loader(param, tensor)
+                    self._load_into_param(param, weight_loader, tensor)
                     updated += 1
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001 - a loader raises anything
                     logger.warning(
                         f"{self.label}: weight_loader failed for {name}: {e}"
                     )
