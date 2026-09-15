@@ -4467,9 +4467,14 @@ class DeepseekV4Model(nn.Module):
         res_preshuffle = self.enable_res_preshuffle and (
             self.layers[0]._mhc_fused_post_pre is not None
         )
-        # Aiter writes either the ordinary repeated residual or the shuffled
-        # gfx1250 layout directly, without materializing repeat + shuffle.
-        h = aiter.mhc_res_repeat(h, self.hc_mult, res_preshuffle)
+        if hasattr(aiter, "mhc_res_repeat"):
+            # Aiter writes either the ordinary repeated residual or the shuffled
+            # gfx1250 layout directly, without materializing repeat + shuffle.
+            h = aiter.mhc_res_repeat(h, self.hc_mult, res_preshuffle)
+        else:
+            # Older AITER versions only support the ordinary residual layout.
+            h = h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+            res_preshuffle = False
         hc_state = HCState(
             residual=h,
             post_mix=None,
