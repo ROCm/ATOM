@@ -1713,32 +1713,19 @@ def test_connector_init_rejects_nonfinite_config_before_starting_executors(
         LMCacheOffloadConnector(config)
 
 
-@pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "1.5", "bad"])
-def test_max_pending_saves_rejects_invalid_connector_extra(value):
+@pytest.mark.parametrize("value", ["", "0", "-1", "1.5", "true", "false", "bad"])
+def test_max_pending_saves_rejects_invalid_env(monkeypatch, value):
+    monkeypatch.setenv("OFFLOAD_MAX_PENDING_SAVES", value)
     with pytest.raises(ValueError, match="max pending saves"):
-        connector_module.max_pending_saves(
-            {
-                "kv_connector_extra_config": {
-                    "max_pending_saves": value,
-                }
-            },
-            2,
-        )
+        connector_module.max_pending_saves(2)
 
 
-def test_max_pending_saves_precedence_and_worker_default(monkeypatch):
+def test_max_pending_saves_env_and_worker_default(monkeypatch):
     monkeypatch.setenv("OFFLOAD_MAX_PENDING_SAVES", "7")
-    assert connector_module.max_pending_saves({}, 3) == 7
-    assert (
-        connector_module.max_pending_saves(
-            {"kv_connector_extra_config": {"max_pending_saves": 5}},
-            3,
-        )
-        == 5
-    )
+    assert connector_module.max_pending_saves(3) == 7
     monkeypatch.delenv("OFFLOAD_MAX_PENDING_SAVES")
-    assert connector_module.max_pending_saves({}, 3) == 6
-    assert connector_module.max_pending_saves({}, 1) == 2
+    assert connector_module.max_pending_saves(3) == 6
+    assert connector_module.max_pending_saves(1) == 2
 
 
 def test_wait_for_publication_times_out_with_bounded_positive_sleeps():

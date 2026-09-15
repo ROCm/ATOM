@@ -566,16 +566,15 @@ class OffloadSchedulerMixin(ABC):
     def max_pending_saves(self) -> int | None:
         """Running-plus-queued save bound this connector enforces, else None.
 
-        The public read of the per-connector `_max_pending_saves` that
-        `max_pending_saves(kvc, save_workers)` computes from
-        `kv_connector_extra_config` and `OFFLOAD_COPY_WORKERS`. The state leg
+        The public read of the connector's `_max_pending_saves`, computed from
+        the process-wide `OFFLOAD_MAX_PENDING_SAVES` setting (or the default
+        derived from `OFFLOAD_COPY_WORKERS`). The state leg
         (`Scheduler._state_store_pending_cap`) shares this exact number with the
-        KV leg's `_may_emit_save` so both legs pin the same slice of the pool,
-        and honours a per-connector `"max_pending_saves"` override the env reader
-        never sees. None when the connector does not bound its save queue
-        (`_may_emit_save` always True, as on dense) -- the scheduler then falls
-        back to the env reader. Exposed so the scheduler never reaches through
-        the delegating shell's `_impl` for it.
+        KV leg's `_may_emit_save` so both legs pin the same slice of the pool.
+        None when the connector does not bound its save queue (`_may_emit_save`
+        always True, as on dense) -- the scheduler then falls back to the env
+        reader. Exposed so the scheduler never reaches through the delegating
+        shell's `_impl` for it.
         """
         return getattr(self, "_max_pending_saves", None)
 
@@ -755,24 +754,17 @@ class OffloadSchedulerMixin(ABC):
         return active is not None and active[0] is seq
 
 
-def max_pending_saves(kvc, save_workers: int) -> int:
-    """Return the maximum running-plus-queued worker save operations."""
+def max_pending_saves(save_workers: int) -> int:
+    """Return the process-wide running-plus-queued worker save bound."""
 
-    extra = (kvc or {}).get("kv_connector_extra_config", kvc or {}) or {}
-    configured = extra.get("max_pending_saves")
-    if configured is None:
-        configured = os.environ.get(
-            "OFFLOAD_MAX_PENDING_SAVES",
-            str(max(2, 2 * save_workers)),
-        )
-        try:
-            capacity = int(configured)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("max pending saves must be a positive integer") from exc
-    else:
-        if isinstance(configured, bool) or not isinstance(configured, int):
-            raise ValueError("max pending saves must be a positive integer")
-        capacity = configured
+    configured = os.environ.get(
+        "OFFLOAD_MAX_PENDING_SAVES",
+        str(max(2, 2 * save_workers)),
+    )
+    try:
+        capacity = int(configured)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("max pending saves must be a positive integer") from exc
     if capacity <= 0:
         raise ValueError("max pending saves must be a positive integer")
     return capacity
