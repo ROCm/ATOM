@@ -451,17 +451,31 @@ def weight_is_stored_preshuffled(
     Says nothing about rank. Only 2D weights are shuffled -- Qwen3-Next's GDN
     conv1d expands its weight to 3D and must stay row-major -- so the caller
     that holds the tensor checks that.
+
+    Compared by ``.value``, like every comparison in this file that runs after
+    the load (``_is_quantized``, ``_is_blockscale``, ``forward``) and like the
+    whole of ``weight_updater``. ``QuantType`` is a pybind enum out of the
+    compiled ``aiter.jit.module_aiter_core``, so a module whose ``quant_type``
+    came from a differently-identified aiter import -- a plugin process, a
+    re-import, ``atom.quant_spec``'s lazy proxy -- does not compare equal to
+    these members under ``==``. Every branch would then fall through to
+    ``return False``: the sync writes the FP8 weight and never re-shuffles it,
+    and the preshuffle GEMM reads a row-major weight. Silent, and only after
+    the first weight update. The load side reached here from ``==`` and the
+    sync side from ``.value``; unifying on ``==`` would have taken the sync
+    side backwards.
     """
-    if quant_type == QuantType.per_Token:
+    quant_value = quant_type.value
+    if quant_value == QuantType.per_Token.value:
         # The triton a8w8 per_Token GEMM consumes the unshuffled (N, K)
         # weight; only the AITER bpreshuffle fallback needs the shuffle.
         return params_dtype == dtypes.fp8 and not (
             use_triton_gemm() and gemm_a8w8_triton is not None
         )
-    if quant_type == QuantType.per_1x32:
+    if quant_value == QuantType.per_1x32.value:
         is_fp4_blockscale = params_dtype == dtypes.fp4x2
         return not is_fp4_blockscale or not use_fp4_non_shuffle_triton_gemm()
-    if quant_type == QuantType.per_1x128:
+    if quant_value == QuantType.per_1x128.value:
         return envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE or needs_preshuffled_weight
     return False
 
