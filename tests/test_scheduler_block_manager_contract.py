@@ -11,7 +11,11 @@ def test_every_block_manager_method_the_scheduler_calls_exists():
     reach because `test_scheduler.py` does not import in this environment.
     Static check instead: cheap, and it does not need the scheduler to run.
     """
-    src = pathlib.Path("atom/model_engine/scheduler.py").read_text()
+    # Anchored on this file, not on the CWD: nothing in the tree pins pytest's
+    # rootdir, so a relative path made the test silently vacuous from any other
+    # directory.
+    root = pathlib.Path(__file__).resolve().parents[1]
+    src = (root / "atom" / "model_engine" / "scheduler.py").read_text()
     called = set()
     for node in ast.walk(ast.parse(src)):
         if not isinstance(node, ast.Call):

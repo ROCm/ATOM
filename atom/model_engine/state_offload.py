@@ -102,7 +102,6 @@ class StateOffloadIndex:
         # Non-zero means `audit_invariant` caught the accounting drifting.
         self.invariant_violations = 0
         self._warned_invariant = False
-        self._audit_calls = 0
         # `stores_refused` is deliberately apart from `stores_failed`: refused
         # means nobody tried, failed means the worker tried and could not. A
         # shell that forwards no store at all is otherwise indistinguishable
@@ -147,23 +146,31 @@ class StateOffloadIndex:
         Two properties: every dispatched load reaches exactly one terminal
         state, and `hashes` never diverges from `_hash_lru`.
 
-        `deep=False` runs only the first. The second is a key-set compare over
-        up to `_hash_cap` entries -- fine for a test, tens of milliseconds on
-        the serving path, which is why `audit_invariant` decimates it. Tests
-        keep the default so they check the whole contract every time.
+        `deep=False` runs the counter identity and an O(1) cardinality compare;
+        `deep=True` adds the exact key-set compare, which is O(n) against
+        `_hash_cap` and so never runs on the serving path. Tests keep the
+        default, so they check the whole contract every time.
         """
         if self.dispatched != self.settled + self.outstanding:
             raise AssertionError(
                 "state offload index: dispatched != settled + outstanding "
                 f"({self.dispatched} != {self.settled} + {self.outstanding})"
             )
+        # O(1), so it runs on the serving path too. Blind to an equal-but-
+        # different pair, which is why the exact compare below exists -- but it
+        # catches every divergence the current writers can actually produce,
+        # since all of them add or drop on one side at a time.
+        if len(self.hashes) != len(self._hash_lru):
+            raise AssertionError(
+                "state offload index: hashes and _hash_lru diverged "
+                f"({len(self.hashes)} != {len(self._hash_lru)})"
+            )
         if not deep:
             return
-        # Key sets, not cardinalities: the two are written together on every
-        # path, so an equal-but-different pair can only come from a bug that
-        # added one hash and dropped another in the same step -- exactly the
-        # divergence this check exists to catch, and the one a length compare
-        # is blind to.
+        # Key sets, not cardinalities: an equal-but-different pair can only come
+        # from a bug that added one hash and dropped another in the same step --
+        # the one divergence the length compare above is blind to. O(n) against
+        # `_hash_cap`, so tests only.
         if set(self.hashes) != set(self._hash_lru):
             only_index = sorted(set(self.hashes) - set(self._hash_lru))[:8]
             only_lru = sorted(set(self._hash_lru) - set(self.hashes))[:8]
@@ -186,21 +193,24 @@ class StateOffloadIndex:
         `stats()` reaches through the coordinator's `checkpoint_fates`.
         An assertion nothing ever runs is not an assertion.
         """
-        self._audit_calls += 1
-        # The key-set compare is the expensive arm. The reasoning at
-        # `check_invariant` for why a length compare cannot replace it still
-        # holds -- but `stats()` is the periodic metrics path AND every client
-        # cache-stats call, `_hash_cap` is 1 << 20, and `set(a) != set(b)` at
-        # that size is tens of milliseconds on the engine loop thread: a stall
-        # that grows with uptime and shows up in no GPU trace. So the cheap arm
-        # (the counter identity, which is what actually catches a parked
-        # request or a leaked slot) runs every time, and the set compare is
-        # decimated. Divergence is a bug, not a race: it does not heal, so
-        # catching it one in `_AUDIT_KEYSET_EVERY` reads loses nothing but the
-        # latency of the report.
-        deep = self._audit_calls % _AUDIT_KEYSET_EVERY == 0
+        # `deep=False`: both arms here are O(1). `stats()` is the periodic
+        # metrics path AND every client cache-stats call, and it runs inline on
+        # the engine loop thread, so nothing on it may be O(n) against a
+        # `_hash_cap` of 1 << 20 -- the key-set compare measures tens to
+        # hundreds of milliseconds there, a stall that grows with uptime and
+        # appears in no GPU trace. Decimating it only converts a constant cost
+        # into a periodic spike, which is worse for tail latency, not better.
+        #
+        # What production keeps is the counter identity (which is what actually
+        # catches a parked request or a leaked slot) plus the cardinality
+        # compare. The exact key-set compare stays on `deep=True`, which the
+        # tests use, so the stronger property is still asserted -- just not on
+        # the serving thread. The gap is narrow and stated at `check_invariant`:
+        # equal cardinalities over different key sets needs a writer that adds
+        # one hash and drops another in the same step, and no current writer
+        # does that.
         try:
-            self.check_invariant(deep=deep)
+            self.check_invariant(deep=False)
         except AssertionError as exc:
             self.invariant_violations += 1
             if not self._warned_invariant:
@@ -413,10 +423,10 @@ class StateOffloadIndex:
         what HBM keeps the CPU tier never received.
 
         Audits the invariant on the way past -- the only place the check runs
-        in a live engine. The counter identity costs two integer comparisons
-        per metrics read; the key-set compare is decimated behind
-        `_AUDIT_KEYSET_EVERY` because at `_hash_cap` it is tens of
-        milliseconds on the engine loop thread.
+        in a live engine. Every arm it runs is O(1): the counter identity and
+        the cardinality compare. The exact key-set compare is `deep=True` only,
+        because at `_hash_cap` it is tens to hundreds of milliseconds on the
+        engine loop thread.
         """
         self.audit_invariant()
         return {
@@ -652,8 +662,4 @@ def state_tier_chunk_tokens(config) -> int:
 
 #: The connector backends whose worker half can build a `StateOffloadTier`.
 #: `multi` qualifies when it lists exactly one.
-#: How often `audit_invariant` runs the expensive key-set arm. One in this many
-#: metrics reads; the cheap counter arm runs on every one.
-_AUDIT_KEYSET_EVERY = 256
-
 _STATE_TIER_BACKENDS = frozenset({"lmcache_offload"})
