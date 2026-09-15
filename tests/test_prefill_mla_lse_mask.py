@@ -19,15 +19,16 @@ really does land in the caller's buffer rather than a copy.
 import pytest
 import torch
 
-# The kernel is Triton and the tests drive it on real tensors; both are absent
-# on the non-GPU CI runner.
-pytest.importorskip("triton")
-
+# Order matters: importing triton without an active GPU driver raises rather
+# than failing the import, and importorskip only catches the latter. Same guard
+# order as tests/test_dcp_a2a_fused_quant.py.
 if not torch.cuda.is_available():
     pytest.skip(
         "compares a Triton kernel against its reference; needs a real GPU",
         allow_module_level=True,
     )
+
+pytest.importorskip("triton")
 
 
 def _old(o, lse):
