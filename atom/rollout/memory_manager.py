@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 
 import torch
 
@@ -59,12 +60,56 @@ def release_cudagraphs(runner) -> None:
     does, and the default level -- used to leave the graphs in place to be
     replayed against a pool that had since been freed and reallocated.
     """
-    if getattr(runner, "enforce_eager", True) or not getattr(runner, "graphs", None):
+    if getattr(runner, "enforce_eager", True):
+        return
+    # Under TBO the replayable handle is in `runner.graphs` like any other, but
+    # `UBatchWrapper` keeps a parallel entry per shape holding the graph, its
+    # per-ubatch contexts and the output tensor it captured. Left behind, that
+    # entry pins the graph's private memory pool -- the footprint the caller
+    # went to sleep to reclaim -- until a recapture happens to overwrite the
+    # same key. `ModelRunner.exit()` has always cleared both stores; a release
+    # for sleep has to clear the same two.
+    tbo_graphs = getattr(getattr(runner, "model", None), "tbo_graphs", None)
+    if tbo_graphs:
+        tbo_graphs.clear()
+        logger.info(f"{runner.label}: TBO CUDA graphs released for sleep")
+    if not getattr(runner, "graphs", None):
         return
     runner._graphs_backup_keys = list(runner.graphs.keys())
     runner.graphs.clear()
     runner.graph_pool = None
+    # `graph_logits` holds the logits tensor each capture produced, allocated
+    # from the graph's own pool. Same shape of leak as `tbo_graphs` above: the
+    # replay is already stopped by clearing `graphs`, but a live reference to
+    # that tensor keeps the pool `empty_cache()` is about to be asked to
+    # reclaim. Recapture refills it per key.
+    graph_logits = getattr(runner, "graph_logits", None)
+    if graph_logits:
+        graph_logits.clear()
     logger.info(f"{runner.label}: CUDA graphs released for sleep")
+    _warn_if_recapture_will_fault(runner)
+
+
+def _warn_if_recapture_will_fault(runner) -> None:
+    """Say so before the fault, not after.
+
+    `expandable_segments` is what makes a recapture fault, and
+    `sleep_keeps_memory_resident` is the way out -- but it is opt-in, so the
+    default configuration walks into it. The failure handler in
+    `_recapture_cudagraphs_if_needed` only gets to speak once the recapture has
+    already gone wrong, and by then it has pinned the runner to eager.
+    """
+    if "expandable_segments" not in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""):
+        return
+    if getattr(getattr(runner, "config", None), "sleep_keeps_memory_resident", False):
+        return
+    logger.warning(
+        f"{runner.label}: released CUDA graphs for sleep with "
+        f"PYTORCH_CUDA_ALLOC_CONF=expandable_segments set. Recapture on wake "
+        f"is what faults under expandable segments; set "
+        f"Config.sleep_keeps_memory_resident=True to keep the weights and the "
+        f"KV pool -- and so the graphs -- valid across sleep instead."
+    )
 
 
 class MemoryManagerMixin:
@@ -324,3 +369,19 @@ class MemoryManagerMixin:
             if hasattr(self, "_graphs_backup_keys"):
                 del self._graphs_backup_keys
             logger.warning(f"{self.label}: Falling back to enforce_eager=True")
+            # `sleep_keeps_memory_resident` reads `enforce_eager` first and
+            # answers False for an eager runner, which is right -- there are no
+            # graphs left to keep valid -- but it means an operator who set the
+            # option now silently gets the release-and-restore behaviour it was
+            # set to avoid. Say which of the two states we are in, because from
+            # here the option's log lines never appear again.
+            if getattr(
+                getattr(self, "config", None), "sleep_keeps_memory_resident", False
+            ):
+                logger.warning(
+                    f"{self.label}: Config.sleep_keeps_memory_resident is set "
+                    f"but now inert: with no captured graphs there is nothing "
+                    f"to keep valid, so sleep releases and restores the "
+                    f"weights and the KV pool as it would without the option. "
+                    f"Restart to recapture."
+                )

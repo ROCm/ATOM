@@ -249,3 +249,166 @@ def test_a_host_without_the_config_field_releases():
     runner.config = SimpleNamespace(num_kvcache_blocks=7)
 
     assert sleep_keeps_memory_resident(runner) is False
+
+
+# ── the TBO graph store ───────────────────────────────────────────────────
+
+
+def _with_tbo(runner, graphs=(("bs", "q"),)):
+    """`UBatchWrapper` keeps a second store beside `runner.graphs`, holding each
+    graph, its per-ubatch contexts and the output tensor it captured.
+
+    Hung on the real model rather than a stand-in, because the release path
+    walks it for parameters and KV views on the way past.
+    """
+    runner.model.tbo_graphs = {key: object() for key in graphs}
+    return runner.model.tbo_graphs
+
+
+@pytest.mark.parametrize("tags", [None, ["kv_cache"]])
+def test_a_release_clears_the_tbo_graphs_too(tags):
+    """`ModelRunner.exit()` clears both stores; a release for sleep has to
+    clear the same two. Left behind, the entry pins the graph's private memory
+    pool -- the footprint the caller went to sleep to reclaim."""
+    runner = _Runner(enforce_eager=False, keep_resident=False)
+    tbo_graphs = _with_tbo(runner)
+
+    runner.release_memory(**({} if tags is None else {"tags": tags}))
+
+    assert tbo_graphs == {}
+    assert runner.graphs == {}
+
+
+def test_the_tbo_store_is_cleared_even_with_no_plain_graphs():
+    """The early return used to be `not runner.graphs`, which skipped the TBO
+    store along with it."""
+    runner = _Runner(enforce_eager=False, keep_resident=False, with_graphs=False)
+    tbo_graphs = _with_tbo(runner)
+
+    memory_manager.release_cudagraphs(runner)
+
+    assert tbo_graphs == {}
+
+
+def test_a_resident_sleep_keeps_the_tbo_graphs():
+    runner = _Runner(enforce_eager=False, keep_resident=True)
+    tbo_graphs = _with_tbo(runner)
+
+    runner.release_memory()
+
+    assert tbo_graphs.keys() == {("bs", "q")}
+
+
+def test_a_release_clears_the_captured_logits_too():
+    """`graph_logits` holds the logits tensor each capture produced, allocated
+    from the graph's own pool. Clearing `graphs` stops the replay but leaves
+    that reference, so the pool `empty_cache()` is about to reclaim stays
+    pinned -- the same leak shape as the TBO store."""
+    runner = _Runner(enforce_eager=False, keep_resident=False)
+    runner.graph_logits = {(1, 1): torch.zeros(4)}
+
+    runner.release_memory(tags=["kv_cache"])
+
+    assert runner.graph_logits == {}
+
+
+def test_a_resident_sleep_keeps_the_captured_logits():
+    runner = _Runner(enforce_eager=False, keep_resident=True)
+    runner.graph_logits = {(1, 1): torch.zeros(4)}
+
+    runner.release_memory()
+
+    assert runner.graph_logits.keys() == {(1, 1)}
+
+
+def test_a_host_without_graph_logits_still_releases():
+    """`graph_logits` only exists once `capture_cudagraph` has run, and the
+    mixin's methods are called on stand-ins that provide what they touch."""
+    runner = _Runner(enforce_eager=False, keep_resident=False)
+    assert not hasattr(runner, "graph_logits")
+
+    runner.release_memory(tags=["kv_cache"])
+
+    assert runner.graphs == {}
+
+
+def test_eager_has_no_tbo_graphs_to_clear():
+    runner = _Runner(enforce_eager=True, keep_resident=False, with_graphs=False)
+    tbo_graphs = _with_tbo(runner)
+
+    memory_manager.release_cudagraphs(runner)
+
+    assert tbo_graphs.keys() == {("bs", "q")}
+
+
+# ── saying so before the fault ────────────────────────────────────────────
+
+
+def test_releasing_under_expandable_segments_names_the_way_out(monkeypatch, caplog):
+    """Recapture on wake is what faults under expandable segments, and the
+    handler that knows it only speaks after the fact -- by which point it has
+    pinned the runner to eager. The release site knows both facts."""
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    runner = _Runner(enforce_eager=False, keep_resident=False)
+
+    with caplog.at_level("WARNING", logger="atom"):
+        runner.release_memory(tags=["kv_cache"])
+
+    assert "sleep_keeps_memory_resident" in caplog.text
+    assert "expandable_segments" in caplog.text
+
+
+def test_no_warning_when_the_allocator_is_not_configured_that_way(monkeypatch, caplog):
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    runner = _Runner(enforce_eager=False, keep_resident=False)
+
+    with caplog.at_level("WARNING", logger="atom"):
+        runner.release_memory(tags=["kv_cache"])
+
+    assert "expandable_segments" not in caplog.text
+
+
+def test_no_warning_when_the_operator_already_took_the_way_out(monkeypatch, caplog):
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    runner = _Runner(enforce_eager=False, keep_resident=True)
+
+    with caplog.at_level("WARNING", logger="atom"):
+        runner.release_memory(tags=["kv_cache"])
+
+    assert "expandable_segments" not in caplog.text
+
+
+def test_a_failed_recapture_says_the_option_is_now_inert(caplog):
+    """`sleep_keeps_memory_resident()` reads `enforce_eager` first and answers
+    False for an eager runner, which is right -- nothing left to keep valid --
+    but it means the option the operator set stops taking effect, and from here
+    its log lines never appear again."""
+    runner = _Runner(enforce_eager=False, keep_resident=True)
+    runner.graphs = {1: object()}
+    runner._graphs_backup_keys = [1]
+    _report_weights_on_device(runner)
+
+    def _boom():
+        raise RuntimeError("recapture faulted")
+
+    runner.capture_cudagraph = _boom
+
+    with caplog.at_level("WARNING", logger="atom"):
+        runner._recapture_cudagraphs_if_needed()
+
+    assert runner.enforce_eager is True
+    assert sleep_keeps_memory_resident(runner) is False
+    assert "now inert" in caplog.text
+
+
+def test_a_failed_recapture_is_quiet_about_an_option_nobody_set(caplog):
+    runner = _Runner(enforce_eager=False, keep_resident=False)
+    runner._graphs_backup_keys = [1]
+    _report_weights_on_device(runner)
+    runner.capture_cudagraph = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+
+    with caplog.at_level("WARNING", logger="atom"):
+        runner._recapture_cudagraphs_if_needed()
+
+    assert runner.enforce_eager is True
+    assert "now inert" not in caplog.text
