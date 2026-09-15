@@ -311,29 +311,28 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         leg, so one dispatch produces exactly one report whatever happens.
         """
         try:
-            ok = self._load_kv_bytes(req)
             if req.state_load_spec is not None:
-                if ok:
-                    ok = self._load_state_bytes(req)
-                else:
-                    # The KV leg's verdict is RANK-LOCAL (`ret_mask.all()` over
-                    # this rank's own LMCache instance and its own LRU), so one
-                    # rank short-circuiting here while the others run the state
-                    # leg leaves the verdict key at `world_size - 1` reports.
-                    # `_TPCompletionGroup.drain` skips an incomplete key with a
-                    # bare `continue` -- no TTL, no eviction, and `reset` is
-                    # never called on the serving path -- so that key sits there
-                    # for the process lifetime: one leaked `_reports` entry, and
-                    # a hash the index can never retract, parking every later
-                    # request over that prefix on a `get` that must miss.
-                    #
-                    # Report neutrally rather than skipping. Only a miss is
-                    # evidence LMCache dropped the bytes, and this rank has no
-                    # such evidence -- it never asked. The quorum is
-                    # failure-dominant, so a real miss on any rank still
-                    # retracts; a key no rank missed stays advertised, which is
-                    # correct.
-                    self._note_state_leg_unrun(req)
+                # Armed BEFORE the KV leg, so every exit below is covered by
+                # construction -- the short-circuit, a raise out of either leg,
+                # and the normal path alike.
+                #
+                # The KV leg's verdict is RANK-LOCAL (`ret_mask.all()` over this
+                # rank's own LMCache instance and its own LRU), so a rank that
+                # skips the state leg while the others run it leaves the verdict
+                # key at `world_size - 1` reports. `_TPCompletionGroup.drain`
+                # skips an incomplete key with a bare `continue` -- no TTL, no
+                # eviction, and `reset` is never called on the serving path --
+                # so that key is immortal, and the hash it would have retracted
+                # is never retracted.
+                #
+                # Neutral rather than absent. Only a miss is evidence LMCache
+                # dropped the bytes, and a rank that never asked holds none. The
+                # merge in `note_load_unrun` is failure-dominant, so when the
+                # leg DOES run below, its real verdict overwrites this one.
+                self._note_state_leg_unrun(req)
+            ok = self._load_kv_bytes(req)
+            if ok and req.state_load_spec is not None:
+                ok = self._load_state_bytes(req)
         except Exception:
             logger.warning(
                 "kimi_k3 offload: load failed for req=%s", req.req_id, exc_info=True
@@ -367,23 +366,36 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
                 req.req_id,
             )
             return False
-        # The validation `StateLoadSpec`'s docstring promises. Both numbers
-        # travel with the spec so the two sides cannot derive the boundary
-        # independently and disagree; unchecked, they were merely two fields
-        # nobody read, and the hazard the docstring names -- a boundary off the
-        # chunk grid, hence a state image that is the history of a different
-        # prefix than the KV leg completed -- stayed exactly as unguarded as
-        # before, while the comment told the next reader it was covered.
-        # Refused, not clamped: there is no safe reinterpretation of a boundary
-        # the engine and the worker disagree about.
-        chunk = int(spec.chunk_tokens)
-        if chunk <= 0 or int(spec.boundary_tokens) % chunk != 0:
+        # The validation `StateLoadSpec`'s docstring promises -- but on the
+        # property that actually holds. An earlier version of this check
+        # demanded `boundary_tokens % chunk_tokens == 0`, which is simply false:
+        # `boundary_tokens` is a HASH-BLOCK position (`tokens = candidate * hbs`
+        # in `_joint_kv_boundary`, and every rung is a multiple of
+        # `hash_block_size` by construction), while the chunk-ceiling of it is a
+        # different field, `kv_tokens`. With the defaults -- hash_block_size 16,
+        # LMCACHE_CHUNK_SIZE 256 -- fifteen of every sixteen legal boundaries
+        # would have been refused, turning this feature off for most of its own
+        # traffic.
+        #
+        # What the two owners must agree on is COVERAGE: the state image is the
+        # compressed history of `[0, boundary_tokens)`, so the KV leg must have
+        # completed at least that far, or the forward resumes on a history it
+        # does not hold -- silent wrong output. Both engine paths establish it
+        # (`joint_state_and_kv` sets `lmcache_cached_tokens = kv_tokens >=
+        # boundary`; `state_only_load` sets it to `hbm`, and its branch
+        # condition is `boundary <= hbm`), and nothing on the worker re-checks
+        # it. Refused, not clamped: there is no safe reinterpretation of a
+        # boundary the two sides disagree about.
+        ls = req.load_spec
+        covered = int(getattr(ls, "lmcache_cached_tokens", 0)) if ls else 0
+        if int(spec.boundary_tokens) > covered:
             logger.error(
-                "kimi_k3 offload: req=%s state boundary %d is not on the %d-token "
-                "chunk grid; refusing the state leg so the request recomputes.",
+                "kimi_k3 offload: req=%s state boundary %d is past the %d tokens "
+                "the KV leg covers; refusing the state leg so the request "
+                "recomputes.",
                 req.req_id,
                 spec.boundary_tokens,
-                chunk,
+                covered,
             )
             return False
         # `seq.state_slot` returns -1 once `state_slots` is empty, and

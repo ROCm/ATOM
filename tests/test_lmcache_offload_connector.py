@@ -10,6 +10,7 @@ import time
 import types
 from collections import deque
 from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -6071,12 +6072,19 @@ def test_a_single_stage_still_builds_the_tier_path(monkeypatch, caplog):
 
 def _k3_load_req(req_id: str, *, state: bool = True, generation: int = 0):
     """A load request shaped like `build_connector_meta`'s: it always attaches a
-    `load_operation`, which is the identity the one completion reports under."""
+    `load_operation`, which is the identity the one completion reports under.
+
+    `lmcache_cached_tokens` covers `boundary_tokens`, as both engine paths
+    guarantee: `joint_state_and_kv` sets it to `kv_tokens`, the chunk-ceiling of
+    the boundary, and `state_only_load` sets it to `hbm` under a branch whose
+    condition is `boundary <= hbm`. It was 0 against a 256-token boundary, a
+    shape the engine cannot produce.
+    """
     return LMCacheReqMeta(
         req_id=req_id,
         token_ids=[],
         block_ids=[],
-        load_spec=LoadSpec(0, 0, can_load=True),
+        load_spec=LoadSpec(0, 256, can_load=True),
         load_operation=LoadOperationId(req_id, generation),
         state_load_spec=(
             StateLoadSpec(
@@ -6097,12 +6105,21 @@ class _FakeTier:
     def __init__(self, ok=True) -> None:
         self.ok = ok
         self.calls: list = []
+        # Separate from `calls`: a neutral report is NOT the leg running. The
+        # fake lacked this method entirely, so `_note_state_leg_unrun` raised
+        # AttributeError into `_do_load_req`'s `except`, which set `ok = False`
+        # on a path where it was already False -- the branch was unpinned and
+        # every assertion still passed.
+        self.neutral: list = []
 
     def load_state(self, h, slot, req_id="r") -> bool:
         self.calls.append((h, slot))
         if isinstance(self.ok, Exception):
             raise self.ok
         return self.ok
+
+    def note_load_unrun(self, h, req_id) -> None:
+        self.neutral.append((h, req_id))
 
 
 class TestOneDispatchEmitsOneCompletion:
@@ -6122,7 +6139,7 @@ class TestOneDispatchEmitsOneCompletion:
         assert failed == set()
         assert tier.calls == [(99, 3)]
 
-    def test_a_failed_kv_leg_never_runs_the_state_leg(self, monkeypatch):
+    def test_a_failed_kv_leg_never_runs_the_state_leg(self, monkeypatch, caplog):
         """State at the boundary is the history of exactly the prefix the KV leg
         was asked to complete, so restoring it over KV that never arrived would
         resume on a history the request does not hold."""
@@ -6131,9 +6148,55 @@ class TestOneDispatchEmitsOneCompletion:
         monkeypatch.setattr(
             KimiK3OffloadConnector, "_load_kv_bytes", lambda s, r: False
         )
-        done, failed = self._run(worker, _k3_load_req("r1"))
+        with caplog.at_level(logging.WARNING):
+            done, failed = self._run(worker, _k3_load_req("r1"))
         assert done == set()
         assert failed == {LoadOperationId("r1", 0)}
+        assert tier.calls == [], "the state leg ran over KV that never arrived"
+        # ...and this rank still reported on the verdict key, or the TP quorum
+        # for it would never be reached and the hash could never be retracted.
+        assert tier.neutral == [(99, "r1")]
+        # Nothing was swallowed on the way: a raise into `_do_load_req`'s
+        # `except` would land here and would otherwise be invisible, because it
+        # only sets `ok = False` on a path where it is already False.
+        assert not [r for r in caplog.records if "load failed" in r.message]
+
+    def test_a_boundary_the_kv_leg_does_not_cover_is_refused(self, monkeypatch):
+        """The state image is the compressed history of `[0, boundary_tokens)`,
+        so restoring it when the KV leg completed less than that resumes the
+        forward on a history it does not hold -- silent wrong output. Both
+        engine paths establish the coverage and nothing on the worker re-checked
+        it.
+
+        Note what is NOT checked: chunk alignment. `boundary_tokens` is a
+        hash-block position (`tokens = candidate * hbs`), never a chunk
+        multiple; demanding `% chunk_tokens == 0` refused fifteen of every
+        sixteen legal boundaries under the defaults.
+        """
+        tier = _FakeTier(True)
+        worker = _k3_worker(tier=tier)
+        monkeypatch.setattr(KimiK3OffloadConnector, "_load_kv_bytes", lambda s, r: True)
+
+        # Legal: a hash-block boundary that is NOT chunk-aligned, covered by the
+        # KV leg. This must load.
+        req = _k3_load_req("ok")
+        # 17 * 16 -- a legal hash-block position that is NOT chunk-aligned.
+        req.state_load_spec = replace(req.state_load_spec, boundary_tokens=272)
+        req.load_spec = LoadSpec(0, 512, can_load=True)
+        done, failed = self._run(worker, req)
+        assert done == {LoadOperationId("ok", 0)}
+        assert tier.calls == [(99, 3)]
+
+        # Illegal: the boundary is past what the KV leg covers. A fresh worker,
+        # because `_run` reads the accumulated done/failed sets.
+        tier = _FakeTier(True)
+        worker = _k3_worker(tier=tier)
+        bad = _k3_load_req("bad")
+        bad.state_load_spec = replace(bad.state_load_spec, boundary_tokens=1024)
+        bad.load_spec = LoadSpec(0, 512, can_load=True)
+        done, failed = self._run(worker, bad)
+        assert done == set()
+        assert failed == {LoadOperationId("bad", 0)}
         assert tier.calls == []
 
     def test_a_failed_state_leg_fails_the_whole_load(self, monkeypatch):

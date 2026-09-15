@@ -3194,7 +3194,7 @@ class Scheduler:
                 req_id,
             )
             if offload is not None:
-                offload.fail_load(req_id, missing=offload.hash_of(req_id) in missed)
+                offload.fail_load(req_id)
             if self._finish_aborted_load_cleanup(req_id):
                 continue
             self.failed_recving_kv_req_ids.append(req_id)
