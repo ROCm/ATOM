@@ -179,17 +179,33 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         for lookup_id in metadata.lookup_requests_in_step:
             if str(lookup_id) not in loading_lookup_ids:
                 self._lookup_unpin(lookup_id)
-        # Producer fence, recorded ONCE for the step rather than once per
-        # saving request: every save in this loop records against the same
-        # stream at the same point, so N events carried no more ordering than
-        # one, and both other in-tree fences hoist. Guarded, because
-        # `ModelRunner.process_kvconnector_output` has no handler -- a raise
-        # here escaped and dropped every load AND save dispatched this step.
-        # `blocking=True` because the consumer is a worker thread that
-        # `synchronize()`s it for the whole fenced forward; the default spins a
-        # core for that entire window.
+        # Producer fence for this step's KV saves. The save gathers KV pages on
+        # a private `pack_stream` with no ordering against the forward's compute
+        # stream, so without this the gather reads torn latent that is then
+        # faithfully reloaded -- silent, reload-count-scaling accuracy
+        # corruption.
+        #
+        # ONE event for the step, not one per saving request: every save in the
+        # loop below records against the same stream at the same point, so N
+        # events carried no more ordering than one. Gated on whether this step
+        # actually dispatches a save, NOT on `self._do_save` -- that is a role
+        # flag fixed at construction, true on every step a producer turns, while
+        # zero-save steps are the common case (steady-state decode, a save
+        # already in flight, a chunk not yet aligned). Gating on the role
+        # recorded and dropped an unconsumed event every one of those steps.
+        # `hybrid/dsv4/connector.py` reaches the same shape lazily, from inside
+        # its loop.
+        #
+        # Guarded, because `ModelRunner.process_kvconnector_output` has no
+        # handler -- a raise here escaped and dropped every load AND save
+        # dispatched this step. `blocking=True` because the consumer is a worker
+        # thread that `synchronize()`s it for the whole fenced forward; the
+        # default spins a core for that entire window.
         producer_event = None
-        if self._do_save and torch.cuda.is_available():
+        saving = self._do_save and any(
+            req.save_spec is not None for req in metadata.requests
+        )
+        if saving and torch.cuda.is_available():
             try:
                 producer_event = torch.cuda.Event(blocking=True)
                 producer_event.record(torch.cuda.current_stream())
