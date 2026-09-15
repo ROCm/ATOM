@@ -4055,6 +4055,98 @@ def test_worker_unpins_only_lookups_without_an_emitted_load():
     assert len(conn._load_executor.calls) == 1
 
 
+class TestTheProducerFenceIsRecordedSafely:
+    """The fence orders the save's private `pack_stream` gather against the
+    forward that wrote the KV. Without it the gather reads torn latent that is
+    then faithfully reloaded -- silent, reload-count-scaling corruption -- so
+    these pin the three properties the mechanism needs.
+    """
+
+    class _Executor:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def submit(self, *args) -> None:
+            self.calls.append(args)
+
+    @staticmethod
+    def _conn(do_save=True):
+        conn = DenseOffloadConnector.__new__(DenseOffloadConnector)
+        conn._do_load = False
+        conn._do_save = do_save
+        conn._engine = SimpleNamespace(lookup_unpin=lambda _i: None)
+        conn._save_executor = TestTheProducerFenceIsRecordedSafely._Executor()
+        return conn
+
+    @staticmethod
+    def _meta(n):
+        metadata = LMCacheOffloadMetadata()
+        for i in range(n):
+            metadata.add_request(
+                LMCacheReqMeta(
+                    req_id=f"s{i}",
+                    token_ids=list(range(8)),
+                    block_ids=[1, 2],
+                    save_spec=SimpleNamespace(skip_leading_tokens=0),
+                )
+            )
+        return metadata
+
+    def test_one_event_serves_every_save_in_the_step(self, monkeypatch):
+        """Recorded once per step, not once per saving request: every save in
+        the loop records against the same stream at the same point, so N events
+        carried no more ordering than one."""
+        recorded = []
+
+        class _Event:
+            def __init__(self, blocking=False):
+                self.blocking = blocking
+
+            def record(self, stream):
+                recorded.append(self)
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "Event", _Event)
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda: object())
+
+        conn = self._conn()
+        meta = self._meta(3)
+        conn.start_load_kv(meta)
+
+        assert len(recorded) == 1, "one fence per step, not one per request"
+        # ...and every save carries it, so none gathers unfenced.
+        events = {req.producer_event for req in meta.requests}
+        assert events == {recorded[0]}
+        assert len(conn._save_executor.calls) == 3
+        # `synchronize()` runs on a worker thread for the whole fenced forward;
+        # a non-blocking event spins a core for that entire window.
+        assert recorded[0].blocking is True
+
+    def test_a_fence_that_cannot_be_recorded_falls_back_and_does_not_escape(
+        self, monkeypatch
+    ):
+        """`ModelRunner.process_kvconnector_output` has no handler, so a raise
+        here dropped every load AND save dispatched that step. The fallback is
+        a full device synchronize -- strictly stronger than the event, so
+        degrading to it cannot produce the corruption the fence prevents."""
+        synced = []
+
+        def _boom(*_a, **_kw):
+            raise RuntimeError("no CUDA context")
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "Event", _boom)
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda: synced.append(True))
+
+        conn = self._conn()
+        meta = self._meta(2)
+        conn.start_load_kv(meta)  # must not raise
+
+        assert synced == [True], "no fence and no fallback ordering"
+        assert len(conn._save_executor.calls) == 2, "the step's saves were dropped"
+        assert all(req.producer_event is None for req in meta.requests)
+
+
 def test_worker_reports_unaligned_hbm_load_as_failed_without_exception():
     conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
     conn._lock = threading.Lock()
