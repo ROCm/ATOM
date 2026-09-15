@@ -1622,6 +1622,11 @@ class Config:
     # Requests in the sliding window behind the status line's prefix-cache hit
     # rate. Validated > 0 by EngineStats.
     cache_hit_rate_window: int = 1000
+    # Mix prefill chunks and decode seqs into the same forward pass (Phase 2
+    # of chunked prefill). Default off until the attention backends grow
+    # split-dispatch support — when off, scheduler emits prefill-only or
+    # decode-only batches as before.
+    enable_mixed_prefill_decode: bool = False
     port: int = 8006
     torch_profiler_dir: str | None = field(
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR
@@ -2171,6 +2176,92 @@ class Config:
                 self.index_cache_dtype = "fp8"
         elif self.index_cache_dtype is None:
             self.index_cache_dtype = self.kv_cache_dtype
+
+        self._validate_mixed_prefill_decode()
+
+    def _validate_mixed_prefill_decode(self) -> None:
+        """Refuse `--enable-mixed-prefill-decode` on configs that cannot run it.
+
+        One table, checked at launch. The alternative -- and what this replaces
+        -- was a refusal scattered across five files, fired only once a mixed
+        batch had actually been built, so a user learned the combination was
+        unsupported some way into serving rather than at startup. Most of those
+        were `assert`s, which `python -O` strips: the combinations then did not
+        refuse at all, they ran with whichever wrong numerics the assert stood
+        in front of.
+
+        Each entry is a condition this config declares, not one a batch
+        discovers. That is the whole reason they can be checked here: they come
+        off the HF config and the CLI, both settled before a model loads.
+
+        The runtime sites are kept as backstops, because two of the conditions
+        are only NEARLY expressible here -- `MLAAttention.is_sparse_mla` also
+        takes `mla_modules.is_sparse`, which this cannot see, and the fp4x2
+        activation-scale layout additionally depends on `use_triton_gemm()`.
+        A backstop that never fires is the intended outcome; one that fires
+        means this table has a gap worth closing rather than a check worth
+        deleting.
+        """
+        if not self.enable_mixed_prefill_decode:
+            return
+
+        from atom.utils import get_hf_text_config
+        from atom.utils.selector import Family, attn_family, has_mla_indexer
+
+        # `hf_config` is set earlier in `__post_init__`; the text sub-config is
+        # derived, not stored (multimodal configs nest it). ModelRunner keeps
+        # its own `hf_text_config` attribute -- that one is NOT on Config, and
+        # reading it here is what made this validator raise AttributeError on
+        # every launch that enabled the flag.
+        hf = get_hf_text_config(self.hf_config)
+        family = attn_family(hf)
+        # A WHITELIST of families, not `not is_mla`. `Family.is_mla` is
+        # `self in (MLA, KIMI_MLA)` -- it deliberately excludes V4, which is
+        # its own, more specific family despite also carrying a latent rank.
+        # Testing `not is_mla` therefore refused DeepSeek-V4, the model this
+        # feature was built for and is validated on, and (because
+        # `has_mla_indexer` is itself gated on `is_mla`) made the sparse check
+        # below dead for V4 at the same time. Both were caught by a server
+        # refusing to start, not by a test.
+        _MIXED_FAMILIES = (Family.V4, Family.MLA)
+        # (is this config affected, what it is, why it cannot run mixed)
+        refusals = [
+            (
+                self.speculative_config is not None,
+                "speculative decoding (MTP / DSpark / EAGLE)",
+                (
+                    "the mixed split has no shape for a draft's 1+K rows; the "
+                    "decode-token reserve is written against mtp_k but the "
+                    "decode loop only spends spec_width, so the two disagree"
+                ),
+            ),
+            (
+                family not in _MIXED_FAMILIES,
+                f"the {family} attention family",
+                (
+                    "only the two builders that implement `prepare_mixed` can "
+                    "form one -- `AiterMLA` (dense MLA) and the V4 builder; "
+                    "every other lands on the base class's NotImplementedError"
+                ),
+            ),
+            (
+                has_mla_indexer(hf),
+                "sparse MLA (the V3.2 indexer)",
+                (
+                    "the indexer's top-k selection is built for the whole "
+                    "batch and the prefill-MLA path it enables has no "
+                    "per-segment form"
+                ),
+            ),
+        ]
+        blocked = [(what, why) for cond, what, why in refusals if cond]
+        if not blocked:
+            return
+        raise ValueError(
+            "--enable-mixed-prefill-decode is not supported with "
+            + "; ".join(f"{what} ({why})" for what, why in blocked)
+            + ". Drop the flag, or the feature it conflicts with."
+        )
 
     def compute_hash(self) -> str:
         """

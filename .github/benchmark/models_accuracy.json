@@ -509,5 +509,18 @@
     "accuracy_baseline": 0.9765,
     "accuracy_baseline_model": "zai-org/GLM-5.3",
     "_baseline_note": "Server args are the GLM-5.2-MXFP4 entry verbatim: the two checkpoints have byte-identical quantization_config, the same 1319-entry exclude list and the same 408 GB footprint, differing only in weights and a new moe_router_dtype key. Measured 2026-09-02, all 1319, chat 5-shot, temperature 0: flexible-extract=0.9765, strict-match=0.9773 -- level with the FP8 source (0.9719/0.9727), so MXFP4 costs nothing detectable here. Chat runs of this model have spanned 0.9719-0.9773 across five measurements, so 0.96 keeps ~1.6pp of headroom below the worst. The HF card ships this checkpoint with no evaluation at all. MUST run chat, not the default raw-completions client: GLM-5.3's template ends '<|assistant|><think>' and the server reports 'This chat template has no switch for reasoning', so few-shot completions suppress the reasoning the model is trained to do and score ~0.91 -- measured 0.9136 (MXFP4) and 0.9234 (FP8) over all 1319, which would fail this threshold on a healthy checkpoint. Chat 5-shot is also far steadier: two runs of identical code disagree on 13 of 1319 questions in chat versus 108 in 3-shot completions."
+  },
+  {
+    "model_name": "DeepSeek-V4-Pro TBO+DPA+mixed conc1000",
+    "model_path": "deepseek-ai/DeepSeek-V4-Pro",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --enable-dp-attention --enable-tbo --enable-mixed-prefill-decode --max-num-batched-tokens 16384 --trust-remote-code --gpu-memory-utilization 0.85 --no-enable_prefix_caching --max-model-len 9472",
+    "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1\nATOM_TBO_MIXED=1\nATOM_PROBE_TBO_MIXED=1",
+    "client_command": "lm_eval --model local-completions --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/completions,num_concurrent=1000,max_retries=3,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot 3 --output_path ${OUTPUT_PATH}",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.93,
+    "accuracy_baseline": 0.95,
+    "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
+    "_baseline_note": "Same as 'TBO+DPA conc1000' plus --enable-mixed-prefill-decode and ATOM_TBO_MIXED=1, so a delta against that sibling isolates TBO splitting a mixed batch. Local 1319-sample GSM8K 3-shot, 3 runs = 0.9560/0.9507/0.9560 (2026-08-24, branch fpz/mixed_mla_dispatch_v4). Baseline/threshold deliberately identical to the sibling: the two cases must move together, and this one drifting alone is the signal. WEAK GUARD -- gsm8k produced only 5-6 build:mixed_ubatch per rank, so this case would still pass if the mixed split stopped firing entirely; ATOM_PROBE_TBO_MIXED=1 puts the tally in the server log so a human can check. Coverage is 10-30x higher under long-input load (57/rank at ISL 8192 conc 512), which is where a perf case would belong."
   }
 ]

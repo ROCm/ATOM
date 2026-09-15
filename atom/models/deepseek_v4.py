@@ -14,6 +14,7 @@ weight loading, tensor parallelism, AITER kernels, KV cache integration, MTP
 spec decode, torch.compile, server) land in PR2-PR6.
 """
 
+import contextlib
 import json
 import logging
 import math
@@ -2235,6 +2236,93 @@ class Indexer(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+# Read once: the call site is per-segment per-layer (122 reads/step).
+_PROBE_MIXED_NORM = envs.ATOM_PROBE_MIXED_NORM
+
+_NULL_SPAN = contextlib.nullcontext()
+
+# `torch.autograd._profiler_enabled` is private but is the only cheap way to ask.
+# If a future torch drops it, fall back to always building the span: slower, but
+# profiling keeps working, which is the failure direction that does not lie.
+_profiler_enabled = getattr(torch.autograd, "_profiler_enabled", None) or (lambda: True)
+
+
+@contextlib.contextmanager
+def _segment_forward_context(fc, ctx, seg_md, *, is_prefill: bool, input_ids):
+    """Present ONE half of a mixed batch to the downstream code as a whole batch.
+
+    The segment tail (`_qk_norm_rope`, `_attn_compress`, `_sparse_attention`)
+    reads its batch off the forward context rather than off its arguments, so
+    running it per half means swapping what the context says and swapping it
+    back. Named and scoped rather than inlined because the swap is otherwise
+    invisible: anything reached from inside here sees a FABRICATED batch, with
+    no signature or type to say so, and the only warning would be a comment.
+
+    Restoring is this block's own job, not its caller's. It used to be the
+    caller's, which meant a segment that returned normally still left the
+    context pointing at its own sub-metadata until the enclosing `finally` ran.
+    """
+    saved_md = fc.attn_metadata
+    saved_is_prefill = ctx.is_prefill
+    saved_input_ids = ctx.input_ids
+    fc.attn_metadata = seg_md
+    ctx.is_prefill = is_prefill
+    if input_ids is not None:
+        # Keep ctx.input_ids segment-consistent for anything downstream reads
+        # off it (e.g. the hash-MoE `_hash_topk`).
+        ctx.input_ids = input_ids
+    try:
+        yield
+    finally:
+        fc.attn_metadata = saved_md
+        ctx.is_prefill = saved_is_prefill
+        ctx.input_ids = saved_input_ids
+
+
+def _assert_segment_state(seg_md, *, is_prefill: bool) -> None:
+    """Both tail ops branch on `seg_md.state`, never on `ctx.is_prefill`.
+
+    A decode sub-metadata that does not carry DECODE gets
+    swa_dest_rows=None / batch_id_per_token=None, and every decode row's SWA
+    store is silently skipped -- no error, just wrong attention. Checked
+    because a 13-point GSM8K drop with faults=0 is exactly that shape.
+    """
+    if is_prefill:
+        assert (
+            seg_md.state is not AttnState.DECODE
+        ), f"prefill segment carries state={seg_md.state}"
+    else:
+        assert seg_md.state is AttnState.DECODE, (
+            f"decode segment carries state={seg_md.state}, so its SWA "
+            "window write is silently skipped"
+        )
+
+
+def _mixed_span(tag: str):
+    """A profiler span that is ~free when nothing is profiling.
+
+    `record_function` constructs and enters a real object whether or not a
+    profiler is attached: measured 4.354 us per enter/exit on this box against
+    0.129 us for the gated form. `_attn_mixed` opens three per layer, so at 61
+    layers that is 183 per mixed step -- 0.797 ms of pure host time on every
+    mixed step, forever, for instrumentation that is off by default.
+
+    Kept rather than deleted because the per-segment split is the measurement
+    the mixed path is actually tuned against; it just should not be billed to
+    runs that never look at it.
+
+    The runtime check genuinely fires: `_attn_mixed`'s only caller is
+    `forward_impl`, reached through `v4_attention_with_output`, which is
+    registered `@mark_spliting_op(is_custom=True)` and is therefore opaque to
+    Dynamo. A plain-Python predicate placed in a TRACED region instead would be
+    evaluated once against the warmup batch and baked out -- the same way the
+    `is_mixed` assert in `_forward_piecewise_attention` is.
+    """
+    if _profiler_enabled():
+        return torch.profiler.record_function(tag)
+    return _NULL_SPAN
+
+
 class DeepseekV4Attention(nn.Module):
     """Hybrid attention: MQA + grouped output LoRA + sliding window + attn_sink.
 
@@ -2631,6 +2719,25 @@ class DeepseekV4Attention(nn.Module):
     ) -> torch.Tensor:
         """Narrow split order: pre/proj+norm -> compressor -> paged core -> post."""
 
+        # Mixed batches are handled only on the FULL path (`forward_impl`),
+        # which is where they run today -- a mixed batch is never captured, so
+        # it never reaches a narrow split. Reaching here with the merged
+        # carrier would run `v4_attn_compress` against `compress_plans=None`.
+        #
+        # There USED to be an `assert not ...is_mixed` here, and it never once
+        # ran. This function is traced: it sits under `@support_torch_compile`
+        # on `DeepseekV4Model`, and `is_mixed` is a plain Python attribute of a
+        # non-tensor object, so Dynamo evaluated it once at trace time against
+        # the warmup batch (never mixed) and baked the result out. Every replay
+        # skipped it. The note 20 lines above -- "Resolve to a plain bool:
+        # Dynamo folds it" -- says exactly why.
+        #
+        # Removed rather than repaired: a check that cannot fire is worse than
+        # none, because it reads like cover. The live equivalent is
+        # `forward_impl`'s `is_mixed` read, which works because
+        # `v4_attention_with_output` is an opaque custom op; the config-time
+        # refusal is `Config._validate_mixed_prefill_decode`.
+
         (
             _q,
             _kv_pre,
@@ -2872,34 +2979,168 @@ class DeepseekV4Attention(nn.Module):
         # Metadata + compressor launch (must precede projections for overlap).
         ratio = self.compress_ratio
         attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
-        plan_for_layer = attn_md.compress_plans[ratio] if ratio else None
-        self.maybe_compressors_async(
-            x,
-            plan_for_layer,
-            attn_md.state_slot_in,
-            attn_md.state_slot_out,
-            attn_md.block_tables,
-        )
+        # A mixed batch has no whole-batch compressor plan: its merged metadata
+        # carries compress_plans=None and each half's plans live on its own
+        # sub-metadata. Skip the launch here and let the per-segment loop fire it
+        # with the right plans. Non-mixed behaviour is unchanged.
+        is_mixed = getattr(attn_md, "is_mixed", False)
+        if not is_mixed:
+            plan_for_layer = attn_md.compress_plans[ratio] if ratio else None
+            self.maybe_compressors_async(
+                x,
+                plan_for_layer,
+                attn_md.state_slot_in,
+                attn_md.state_slot_out,
+                attn_md.block_tables,
+            )
 
         # FULL order: compressor launch overlaps projections, then inline
         # QK-norm/RoPE, compressor join, paged core, and output projection.
         q, kv_pre, qr, qr_scale, hidden, *_ = self._attn_pre(
             x, positions, run_indexer_proj=False
         )
-        qkn = self._qk_norm_rope(q, kv_pre, positions)
-        self._attn_compress(
-            piecewise=False,
-            x=hidden,
-            compressor_already_launched=True,
-        )
-        o = self._sparse_attention(
-            qkn,
-            positions,
-            x=hidden,
-            qr=qr,
-            qr_scale=qr_scale,
-        )
+        if is_mixed:
+            o = self._attn_mixed(attn_md, q, kv_pre, qr, qr_scale, hidden, positions)
+        else:
+            qkn = self._qk_norm_rope(q, kv_pre, positions)
+            self._attn_compress(
+                piecewise=False,
+                x=hidden,
+                compressor_already_launched=True,
+            )
+            o = self._sparse_attention(
+                qkn,
+                positions,
+                x=hidden,
+                qr=qr,
+                qr_scale=qr_scale,
+            )
         return self._attn_post(o, positions)
+
+    def _probe_segment_norm(self, half: str, n: int, qkn, res: torch.Tensor) -> None:
+        """Per-segment output magnitude, under `ATOM_PROBE_MIXED_NORM`.
+
+        A segment that is wrong usually shows it here -- zeros, NaN, or a norm
+        an order off the other half -- and that says WHICH half to read.
+        """
+        logger.warning(
+            "[probe] %s %s n=%d qkn_q=%.3e out=%.3e finite=%s",
+            self.layer_name,
+            half,
+            n,
+            float((qkn.q_sa if qkn.q_sa is not None else qkn.q_packed).float().norm()),
+            float(res.float().norm()),
+            bool(torch.isfinite(res).all()),
+        )
+
+    def _attn_mixed(
+        self,
+        attn_md: "AttentionMetaData_DSV4",
+        q: torch.Tensor,
+        kv_pre: torch.Tensor,
+        qr: torch.Tensor,
+        qr_scale: torch.Tensor | None,
+        hidden: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the segment-dependent attention tail once per half of a mixed batch.
+
+        The batch is `[prefill | decode]`. `_attn_pre` already ran once on the
+        whole thing -- every tensor here is num_tokens-major and simply sliced.
+        What cannot be shared is everything that reads `attn_metadata`:
+
+          maybe_compressors_async  each half has its own compress_plans
+          _attn_compress           batch-shaped; the join for the launch above
+          _sparse_attention        prefill and decode run different paged kernels
+
+        `_qk_norm_rope` is in the loop only because its fused decode SWA write
+        keys off `attn_md.state`; the math itself is identical for both halves
+        ("used for both decode and prefill"). Its store is already gated per
+        token by `batch_id_per_token` (batch_id < 0 skips), so it could be
+        hoisted to a single whole-batch call -- that needs `prepare_mixed` to
+        build the gate and is left to a follow-up so this port stays a port.
+
+        Each segment re-enters with its own complete sub-metadata (is_mixed
+        False), so there is no recursion.
+        """
+        fc = get_forward_context()
+        ctx = fc.context
+        n_p = attn_md.num_prefill_tokens
+        n_d = hidden.size(0) - n_p
+        # `n_d` is derived from the tensor, but the metadata handed to the decode
+        # segment describes a row count of its own. Under TBO those are two
+        # independent splits -- the ubatch boundary is a token midpoint, and
+        # `decode_attn_metadata` is carried over from the parent whole. If they
+        # disagree the decode segment indexes an N-row plan into an M-row tensor,
+        # which is an out-of-bounds read, not an exception. Check it here, where
+        # the numbers are still readable, rather than letting a HIP illegal
+        # access surface three kernels later in an unrelated GEMM.
+        _declared_d = getattr(attn_md, "num_decode_tokens", None)
+        assert _declared_d is None or _declared_d == n_d, (
+            f"mixed segment sizes disagree: tensor has {hidden.size(0)} rows "
+            f"({n_p} prefill + {n_d} decode) but metadata declares "
+            f"{_declared_d} decode tokens"
+        )
+        # Only `input_ids` is still read here -- each segment slices it. The
+        # metadata/is_prefill swap and its restore belong to
+        # `_segment_forward_context`, per segment.
+        saved_input_ids = ctx.input_ids
+
+        # One combined output; each half writes its own rows. `_sparse_attention`
+        # has no `out=`, so this is a slice-copy rather than the zero-copy slot
+        # the pre-refactor core allowed -- still far cheaper than the per-layer
+        # `torch.cat` it replaced (11.95 ms/step over 61 layers).
+        out = torch.empty(
+            (n_p + n_d, self.n_local_heads * self.head_dim),
+            dtype=hidden.dtype,
+            device=hidden.device,
+        )
+
+        def _seg(lo: int, hi: int, seg_md, is_prefill: bool) -> None:
+            _assert_segment_state(seg_md, is_prefill=is_prefill)
+            sl = slice(lo, hi)
+            tag = "prefill" if is_prefill else "decode"
+            with (
+                _segment_forward_context(
+                    fc,
+                    ctx,
+                    seg_md,
+                    is_prefill=is_prefill,
+                    input_ids=None if saved_input_ids is None else saved_input_ids[sl],
+                ),
+                _mixed_span(f"mixed_seg[{tag}] n={hi - lo}"),
+            ):
+                qkn = self._qk_norm_rope(q[sl], kv_pre[sl], positions[sl])
+                # `compressor_already_launched=False` so ONE call decides both
+                # halves of the compressor: it launches via
+                # `maybe_compressors_async` and joins on that call's OWN return
+                # value. Launching here and passing True instead splits the
+                # decision -- the True branch recomputes the condition as
+                # `_use_async_compress and fc.in_hipgraph and not tbo_active()`,
+                # which can disagree with what the launch actually did and skip
+                # the stream join, letting the attention read compressor output
+                # that is not written yet. This is how the pre-refactor core
+                # drove it per segment, for the same reason.
+                self._attn_compress(
+                    piecewise=False,
+                    x=hidden[sl],
+                    compressor_already_launched=False,
+                )
+                _res = self._sparse_attention(
+                    qkn,
+                    positions[sl],
+                    x=hidden[sl],
+                    qr=qr[sl],
+                    qr_scale=None if qr_scale is None else qr_scale[sl],
+                )
+                out[sl] = _res
+                if _PROBE_MIXED_NORM:
+                    self._probe_segment_norm(tag, hi - lo, qkn, _res)
+
+        with _mixed_span(f"mixed[n_p={n_p} n_d={n_d}]"):
+            _seg(0, n_p, attn_md.prefill_attn_metadata, True)
+            _seg(n_p, n_p + n_d, attn_md.decode_attn_metadata, False)
+        return out
 
     # Nothing is copied per step. Every input comes from the dense piece
     # immediately upstream, whose graph writes it to the same address on every

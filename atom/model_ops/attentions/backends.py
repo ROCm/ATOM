@@ -4,6 +4,7 @@
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, Optional, TypeVar
 
 if TYPE_CHECKING:
@@ -490,6 +491,92 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         the target's metadata, so a write here would reach the verify step.
         """
 
+    def _get_mixed_prefill_bank(self) -> dict:
+        """Private mirror of `forward_vars` for the prefill half of a mixed batch.
+
+        A mixed batch is built as ``[prefill | decode]`` by running the
+        unmodified `prepare_prefill` then `prepare_decode`, both of which stage
+        through the SAME named `forward_vars` buffers. Sharing those buffers
+        forced per-field GPU `.clone()`s (so decode's staging couldn't overwrite
+        the prefill segment's GPU tensors) and, on the V4 builder's much larger
+        metadata surface, a full `torch.cuda.current_stream().synchronize()` (so
+        decode's host-side pinned-buffer writes didn't race the prefill
+        segment's in-flight H2D DMA → the large-ISL OOB fixed in `ab55dfb6`).
+
+        Instead we run the prefill half against this private bank: a same-shape
+        clone of every `CpuGpuBuffer` in `forward_vars`. The decode half runs
+        against the real bank, so the two halves never share a pinned CPU source
+        or a GPU destination — both the clones and the stream sync become
+        unnecessary. Non-buffer entries (e.g. the scalar `mtp_k`) are shared by
+        reference; the prefill path never stages into them.
+
+        Built lazily on first use (after all setup-time
+        `forward_vars.update(...)` has run) and only when mixed batching is
+        active, so single-mode runs pay no memory cost. Reused across mixed
+        steps exactly as the real bank is reused every step.
+        """
+        bank = getattr(self, "_mixed_prefill_bank", None)
+        if bank is not None:
+            return bank
+        bank = {}
+        for name, val in self.model_runner.forward_vars.items():
+            if isinstance(val, CpuGpuBuffer):
+                # `clone()`, not a hand-rolled copy: it already allocates the
+                # same shape/dtype/device and copies both sides, so the initial
+                # contents of buffers the prefill path reads but never fully
+                # rewrites (e.g. `seq_starts` == zeros) carry over either way.
+                #
+                # What the hand-rolled version dropped was `pin_memory`. That is
+                # not cosmetic here: this bank exists so the prefill half's H2D
+                # cannot race the decode half's pinned writes, and an unpinned
+                # source makes `copy_(non_blocking=True)` synchronous -- so the
+                # asynchrony the design is stated in terms of quietly did not
+                # hold. `clone()` carries it (`pin_memory=self.cpu.is_pinned()`),
+                # and its docstring already describes this exact use.
+                bank[name] = val.clone()
+            else:
+                bank[name] = val
+        self._mixed_prefill_bank = bank
+        return bank
+
+    @contextmanager
+    def mixed_prefill_bank_active(self):
+        """Point `forward_vars` at the private prefill bank for the duration.
+
+        Wraps the swap together with the one thing the swap alone gets wrong,
+        because they are not separable and a caller that did only the first half
+        shipped: `cu_seqlens_q` is PUBLISHED upstream
+        (`publish_cu_seqlens_q`), not staged by the prefill path, so unlike
+        every other buffer in the bank it is something prefill READS rather
+        than fills in. The bank is built lazily once and never rebuilt, so its
+        copy otherwise freezes at whatever the real buffer held on the first
+        mixed step.
+
+        That was invisible until main's `2ce5f68f` turned `prepare_prefill`
+        from deriving these indices into cross-checking them against the
+        published buffer. From then on the second mixed step reads a stale
+        clone and trips "published cu_seqlens_q ends at N, not the M tokens
+        scheduled for prefill" -- which reads like a row-ordering bug and is
+        not one. Under `python -O` the assert is stripped and the step builds
+        prefill metadata from the stale spans instead.
+
+        Synced rather than shared by reference: the decode half overwrites the
+        real buffer with decode-local spans afterwards, and sharing would make
+        this correct only for as long as prefill keeps running first.
+        """
+        main_var = self.model_runner.forward_vars
+        bank = self._get_mixed_prefill_bank()
+        live_cu = main_var["cu_seqlens_q"]
+        bank["cu_seqlens_q"].cpu.copy_(live_cu.cpu)
+        bank["cu_seqlens_q"].gpu.copy_(live_cu.gpu)
+        self.model_runner.forward_vars = bank
+        try:
+            yield bank
+        finally:
+            # Restore even on error so a failed mixed build can't leave the
+            # runner pointed at the mirror bank.
+            self.model_runner.forward_vars = main_var
+
     def prepare_block_tables(self, batch: ScheduledBatch):
         """Marshal the batch's block tables into `forward_vars["block_tables"]`.
 
@@ -567,7 +654,13 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
     def publish_cu_seqlens_q(
         self, batch: ScheduledBatch, forward_mode: ForwardMode
     ) -> None:
-        """Publish this step's `cu_seqlens_q`. The only writer.
+        """Publish this step's `cu_seqlens_q`. The only writer for an
+        ordinary step.
+
+        A mixed build has a second: `prepare_mixed` overwrites the leading
+        `n_decode_seqs + 1` entries with decode-local spans, host AND device,
+        after this has run and before `prepare_decode` reads them. Anything
+        added here that a mixed batch must also see has to be mirrored there.
 
         Lives here because this class declares the buffer and defines its
         layout, but is CALLED from `prepare_model` before `prepare_input_ids`,
@@ -878,11 +971,23 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             self.execute_paged_state_copies(
                 state_ops.checkpoint_stores, state_ops.checkpoint_restores
             )
+
+        # Mixed dispatch comes AFTER state maintenance: it returns early, and a
+        # mixed batch needs the same relocations / checkpoint copies as any other.
+        if getattr(batch, "is_mixed", False):
+            return self.prepare_mixed(batch, running_bs)
         is_prefill = batch.total_tokens_num_prefill > 0
         if is_prefill:
             return self.prepare_prefill(batch, running_bs)
         else:
             return self.prepare_decode(batch, running_bs, running_tokens, max_seqlen_q)
+
+    def prepare_mixed(self, batch: ScheduledBatch, bs: int):
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support mixed prefill+decode "
+            "batches yet. Only the dense-MLA backend (AiterMLAMetadataBuilder) "
+            "implements split dispatch. Disable --enable-mixed-prefill-decode."
+        )
 
 
 class AttentionImpl(nn.Module):
