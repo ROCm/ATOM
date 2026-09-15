@@ -443,12 +443,105 @@ def _dcp_a2a_unpack_combine_kernel(
     )
 
 
+@triton.jit
+def _dcp_a2a_unpack_combine_quant_kernel(
+    recv_ptr,  # [N, B, H_LOCAL, D + LSE_PACK]  N = source rank (KV shard)
+    out_ptr,  # [B, H_LOCAL, D] fp8
+    out_scale_ptr,  # [B, 1] fp32, one scale per TOKEN
+    recv_stride_n,
+    recv_stride_b,
+    recv_stride_h,
+    out_stride_b,
+    out_stride_h,
+    N_RANKS,
+    HEAD_DIM: tl.constexpr,
+    H_LOCAL: tl.constexpr,
+    LSE_PACK: tl.constexpr,
+    N_ROUNDED: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    """Combine + per-token FP8 quant in one launch. ONE PROGRAM PER TOKEN.
+
+    Why the grid changes from (B, H_LOCAL) to (B,): a per-token scale is the max
+    over the WHOLE row, i.e. across every local head, so the head axis can no
+    longer be split across programs -- a program that sees one head cannot know
+    the row max. Folding the quant in therefore costs occupancy (B*H_LOCAL ->
+    B programs) and buys the removal of a whole kernel launch. Which side wins
+    is a measurement, not a deduction, hence the env switch on the caller.
+
+    The math is bit-for-bit the unfused combine; only the store differs.
+    """
+    b = tl.program_id(axis=0).to(tl.int64)
+
+    n = tl.arange(0, N_ROUNDED)
+    h = tl.arange(0, H_LOCAL)
+    d = tl.arange(0, HEAD_DIM)
+    valid = n < N_RANKS
+
+    # [N, H] base of each (shard, head) record for this token.
+    hbase = (
+        recv_ptr
+        + n[:, None].to(tl.int64) * recv_stride_n
+        + b * recv_stride_b
+        + h[None, :].to(tl.int64) * recv_stride_h
+    )
+
+    if LSE_PACK == 1:
+        lse = tl.load(hbase + HEAD_DIM, mask=valid[:, None], other=float("-inf"))
+        lse = lse.to(tl.float32)
+    else:
+        hi = tl.load(hbase + HEAD_DIM, mask=valid[:, None], other=0).to(
+            tl.uint16, bitcast=True
+        )
+        lo = tl.load(hbase + HEAD_DIM + 1, mask=valid[:, None], other=0).to(
+            tl.uint16, bitcast=True
+        )
+        bits = (hi.to(tl.uint32) << 16) | lo.to(tl.uint32)
+        lse = bits.to(tl.float32, bitcast=True)
+        lse = tl.where(valid[:, None], lse, float("-inf"))
+
+    # Same non-finite handling as the unfused kernel: a rank that owns no KV for
+    # this row reports lse=-inf and o=NaN, and NaN*0 is still NaN, so the NaN has
+    # to be killed before the multiply, not after.
+    lse_is_nan = lse != lse  # noqa: PLR0124
+    lse = tl.where(lse_is_nan | (lse == float("inf")), float("-inf"), lse)
+
+    lse_max = tl.max(lse, axis=0)
+    lse_max = tl.where(lse_max == float("-inf"), 0.0, lse_max)
+    global_lse = tl.log(tl.sum(tl.exp(lse - lse_max), axis=0)) + lse_max
+
+    factor = tl.exp(lse - global_lse[None, :])
+    factor = tl.where((factor != factor) | (~valid[:, None]), 0.0, factor)  # noqa: PLR0124
+
+    # [N, H, D]
+    vals = tl.load(hbase[:, :, None] + d[None, None, :]).to(tl.float32)
+    vals = tl.where(factor[:, :, None] == 0.0, 0.0, vals)
+    acc = tl.sum(vals * factor[:, :, None], axis=0)  # [H, D]
+
+    # Per-token scale: reduce over BOTH remaining axes, which is exactly the row
+    # o_proj will see once [H, D] is flattened to one activation row.
+    row_max = tl.max(tl.abs(acc))
+    scale = row_max / FP8_MAX
+    # An all-empty row gives row_max == 0; a zero scale would make the divide
+    # produce NaN and would also be an invalid dequant multiplier downstream.
+    scale = tl.where(scale > 0.0, scale, 1.0)
+    tl.store(out_scale_ptr + b, scale)
+
+    q = acc / scale
+    q = tl.minimum(tl.maximum(q, -FP8_MAX), FP8_MAX)
+    tl.store(
+        out_ptr + b * out_stride_b + h[:, None] * out_stride_h + d[None, :],
+        q.to(out_ptr.dtype.element_ty),
+    )
+
+
 def cp_lse_a2a(
     cp_attn_out,
     cp_attn_lse,
     cp_group,
     return_lse: bool = False,
     owned_counts=None,
+    quant_dtype=None,
 ):
     """A2A backend: pack -> one all-to-all -> local LSE combine.
 
@@ -462,10 +555,23 @@ def cp_lse_a2a(
         return_lse: also return the merged ``[B, H_local]`` global LSE.
         owned_counts: optional true rank-local sparse-KV count per row. Empty
             rows are masked inside the existing A2A pack kernel.
+        quant_dtype: when given (per-token FP8), the combine also quantizes and
+            the call returns ``(out_fp8, scale)`` instead of ``out``. This
+            deletes the standalone per-token quant launch that o_proj would
+            otherwise need -- see ``_dcp_a2a_unpack_combine_quant_kernel``.
+            ``scale is None`` in the return means the output came back
+            UNQUANTIZED and the caller must quantize as before; that is the
+            single-rank shortcut below, not an error.
     """
     n_ranks = cp_group.world_size
     if n_ranks == 1:
+        if quant_dtype is not None:
+            # Nothing to combine, so there is no kernel to fold the quant into.
+            return cp_attn_out, None
         return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
+    assert quant_dtype is None or not return_lse, (
+        "cp_lse_a2a: the fused-quant combine does not emit LSE"
+    )
 
     b, h_total, head_dim = cp_attn_out.shape
     assert h_total % n_ranks == 0, (
@@ -513,6 +619,28 @@ def cp_lse_a2a(
     recv = torch.empty_like(send)
     torch.distributed.all_to_all_single(recv, send, group=cp_group.device_group)
 
+    if quant_dtype is not None:
+        out = torch.empty((b, h_local, head_dim), dtype=quant_dtype, device=dev)
+        # [b, 1] is the layout gemm_a8w8 / tgemm.mm expect for a per-token scale.
+        out_scale = torch.empty((b, 1), dtype=torch.float32, device=dev)
+        _dcp_a2a_unpack_combine_quant_kernel[(b,)](
+            recv,
+            out,
+            out_scale,
+            recv.stride(0),
+            recv.stride(1),
+            recv.stride(2),
+            out.stride(0),
+            out.stride(1),
+            n_ranks,
+            HEAD_DIM=head_dim,
+            H_LOCAL=h_local,
+            LSE_PACK=pack,
+            N_ROUNDED=triton.next_power_of_2(n_ranks),
+            FP8_MAX=float(torch.finfo(quant_dtype).max),
+        )
+        return out, out_scale
+
     out = torch.empty((b, h_local, head_dim), dtype=dtype, device=dev)
     out_lse = (
         torch.empty((b, h_local), dtype=torch.float32, device=dev)
@@ -553,6 +681,7 @@ def dcp_lse_merge(
     backend="a2a",
     ctx=None,
     owned_counts=None,
+    quant_dtype=None,
 ):
     """Reconstruct the global softmax from the per-rank partials.
 
@@ -576,7 +705,11 @@ def dcp_lse_merge(
             cp_attn_lse,
             cp_group,
             owned_counts=owned_counts,
+            quant_dtype=quant_dtype,
         )
+    assert quant_dtype is None, (
+        "dcp_lse_merge: fused-quant combine is only implemented for backend=a2a"
+    )
     if owned_counts is not None:
         # AG+RS has no existing kernel before its LSE AllGather. The default
         # A2A path above fuses this mask and remains launch-free.
