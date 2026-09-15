@@ -745,6 +745,12 @@ class InputOutputProcessor:
           deltas to independent queues (one per choice index). Falls back to
           the scalar ``stream_callback`` for every sibling.
         """
+        request_validator = getattr(self.config.hf_config, "validate_request", None)
+        if request_validator is not None:
+            request_validator(
+                num_draft_tokens=self.num_speculative_tokens,
+                multimodal_data=multimodal_data,
+            )
         n = max(1, int(getattr(sampling_params, "n", 1)))
 
         tokens = (

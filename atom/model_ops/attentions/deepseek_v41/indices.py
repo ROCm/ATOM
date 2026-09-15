@@ -30,6 +30,7 @@ def _indices(
     TOPK: tl.constexpr,
     BLOCK: tl.constexpr,
     RING_SLOTS: tl.constexpr,
+    WINDOW: tl.constexpr,
     SLOT_ROWS: tl.constexpr,
     RING_STRIDE: tl.constexpr,
     RUN_ROWS: tl.constexpr,
@@ -40,7 +41,7 @@ def _indices(
     batch = tl.load(batches + t)
     start = tl.load(cu + batch)
     pos = tl.load(positions + t)
-    first = tl.maximum(0, pos - RING_SLOTS + 1)
+    first = tl.maximum(0, pos - WINDOW + 1)
     history_end = pos + 1 if DECODE else tl.load(positions + start)
     window_count = tl.maximum(0, history_end - first)
     pbegin, pend = tl.load(pptr + t), tl.load(pptr + t + 1)
@@ -76,14 +77,14 @@ def _indices(
         row = (row << 1) | 1
     tl.store(prefix + pend - window_count + i, row, i < window_count)
     if not DECODE:
-        count = tl.minimum(t - start + 1, RING_SLOTS)
+        count = tl.minimum(t - start + 1, WINDOW)
         begin = tl.load(eptr + t)
         tl.store(extend + begin + i, t - count + 1 + i, i < count)
 
 
 def build_indices(selected, step, geometry, window, owner, ratio):
     positions = step.positions
-    first = (positions - window.ring_slots + 1).clamp_min(0)
+    first = (positions - geometry.window_size + 1).clamp_min(0)
     starts = step.cu_seqlens_q[:-1][step.batch_ids.long()]
     history_end = positions + 1 if step.decode else positions[starts.long()]
     counts = (history_end - first).clamp_min(0)
@@ -92,16 +93,16 @@ def build_indices(selected, step, geometry, window, owner, ratio):
         counts = counts + (selected >= 0).sum(-1, dtype=torch.int32).flatten()
     pptr = _indptr(counts)
     prefix = torch.empty(
-        step.length * (topk + window.ring_slots),
+        step.length * (topk + geometry.window_size),
         dtype=torch.int64 if geometry.packed else torch.int32,
         device=positions.device,
     )
     extend_counts = (
         torch.arange(step.length, device=positions.device) - starts + 1
-    ).clamp_max(window.ring_slots)
+    ).clamp_max(geometry.window_size)
     eptr = pptr if step.decode else _indptr(extend_counts)
     extend = torch.empty(
-        0 if step.decode else step.length * min(step.max_length, window.ring_slots),
+        0 if step.decode else step.length * min(step.max_length, geometry.window_size),
         dtype=torch.int32,
         device=positions.device,
     )
@@ -127,7 +128,8 @@ def build_indices(selected, step, geometry, window, owner, ratio):
             PACKED=geometry.packed,
             MAIN_ROW_BYTES=geometry.main_row_bytes,
             TOPK=topk,
-            BLOCK=triton.next_power_of_2(max(topk, window.ring_slots)),
+            BLOCK=triton.next_power_of_2(max(topk, geometry.window_size)),
+            WINDOW=geometry.window_size,
             **window_constexprs(window),
         )
     return prefix, pptr, extend, eptr

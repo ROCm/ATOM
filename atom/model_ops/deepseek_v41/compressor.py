@@ -36,16 +36,22 @@ class Compressor(nn.Module):
             self.pool_weight = self.wkv.weight.float()
             self.gate_weight = self.wgate.weight.float()
 
-    def forward(self, x, start_position, tail=None):
+    def project(self, x):
+        """Expose per-token projections for accepted-prefix tail storage."""
         if self.ratio == 1:
-            return self.norm(self.wkv(x)), None
+            return self.wkv(x), None
         if self.pool_weight is None or self.gate_weight is None:
             raise RuntimeError("Compressor weights must be processed after loading")
         values = F.linear(x.float(), self.pool_weight)
         scores = F.linear(x.float(), self.gate_weight)
+        return values, scores
+
+    def pool(self, values, scores, start_position, tail=None, *, dtype):
+        if self.ratio == 1:
+            return self.norm(values), None
         remainder = start_position % self.ratio
         if remainder:
-            expected = (x.shape[0], remainder, values.shape[-1])
+            expected = (values.shape[0], remainder, values.shape[-1])
             if (
                 tail is None
                 or tail.values.shape != expected
@@ -69,4 +75,7 @@ class Compressor(nn.Module):
         grouped_values = values[:, :cutoff].unflatten(1, (-1, self.ratio))
         grouped_scores = scores[:, :cutoff].unflatten(1, (-1, self.ratio))
         latent = (grouped_values * grouped_scores.softmax(dim=2)).sum(dim=2)
-        return self.norm(latent.to(x.dtype)), next_tail
+        return self.norm(latent.to(dtype)), next_tail
+
+    def forward(self, x, start_position, tail=None):
+        return self.pool(*self.project(x), start_position, tail, dtype=x.dtype)

@@ -299,6 +299,13 @@ class EngramHost:
         self.prefetcher.shutdown()
 
 
+@dataclass(frozen=True)
+class EngramInputs:
+    embeddings: dict[int, torch.Tensor]
+    histories: np.ndarray
+    compressed_rows: tuple[np.ndarray, ...]
+
+
 class EngramInputPreparer:
     """Prepare finalized runtime tokens using the cache's restored history.
 
@@ -347,6 +354,7 @@ class EngramInputPreparer:
             raise
 
     def prepare(self, spans, token_ids, histories, *, dummy=False, token_mask=None):
+        compressed_rows = []
         if dummy:
             self.host.stage_dummy(token_ids.numel())
             next_histories = histories
@@ -372,6 +380,7 @@ class EngramInputPreparer:
                 compressed = self.mapping.compress_tokens(
                     tokens[None, :], None if mask is None else mask[None, :]
                 )
+                compressed_rows.append(compressed[0])
                 next_histories.append(
                     self.mapping.advance_history(history[None, :], compressed)[0]
                 )
@@ -380,10 +389,14 @@ class EngramInputPreparer:
                 histories.shape
             )
         self.host.wait_for_embeddings()
-        return {
-            layer: self.host.embeddings(layer).unsqueeze(0)
-            for layer in self.host.layer_ids
-        }, next_histories
+        return EngramInputs(
+            {
+                layer: self.host.embeddings(layer).unsqueeze(0)
+                for layer in self.host.layer_ids
+            },
+            next_histories,
+            tuple(compressed_rows),
+        )
 
     def close(self):
         if self.resources is not None:

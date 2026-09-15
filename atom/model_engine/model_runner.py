@@ -3025,13 +3025,24 @@ class ModelRunner:
 
             bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
             target_logits = torch.index_select(logits, 0, target_logits_indices)
+            target_token_ids = None
+            if not all_greedy:
+                target_token_ids = self.sampler.sample_verification_tokens(
+                    target_logits,
+                    spec_decode_metadata.cu_num_draft_tokens,
+                    temperatures,
+                    top_ks,
+                    top_ps,
+                )
+                if target_token_ids.numel() and get_tp_group().world_size > 1:
+                    target_token_ids = get_tp_group().broadcast(target_token_ids, src=0)
             bonus_token_ids = self.sampler(
                 logits=bonus_logits,
                 temperatures=temperatures,
                 top_ks=top_ks,
                 top_ps=top_ps,
                 all_greedy=all_greedy,
-                needs_independent_noise=needs_independent_noise,
+                needs_independent_noise=needs_independent_noise or not all_greedy,
             )
             # Validate shapes match expectations
             if target_logits.shape[0] != len(spec_decode_metadata.draft_token_ids):
@@ -3046,7 +3057,18 @@ class ModelRunner:
                 spec_decode_metadata,
                 target_logits,
                 bonus_token_ids,
+                target_token_ids=target_token_ids,
             )
+            # DIAGNOSTIC175: force every draft to be rejected. Drafts are still
+            # proposed, still written to the window and the compressed rows, and
+            # still rolled back -- only the accepted prefix is pinned to the
+            # anchor. Divergence from baseline under this clamp cannot come from
+            # an accepted draft token, so it isolates what survives the rollback.
+            # Revert before any acceptance run: grep -rn DIAGNOSTIC175 atom/
+            if os.environ.get("ATOM_DSPARK_FORCE_REJECT") == "1" and torch.is_tensor(
+                num_bonus_tokens
+            ):
+                num_bonus_tokens = torch.zeros_like(num_bonus_tokens)
             # PCP ranks decode redundantly and are consistent only while their
             # kernels agree bit-for-bit -- they don't (hidden differs by ~1 bf16
             # ULP, flipping ~24% of the near-tie verify argmaxes). Accept counts
@@ -3377,6 +3399,9 @@ class ModelRunner:
         # complement, and is a zero buffer on a step that scored no drafts.
         last_token_indices = self.drafter.prepare_inputs(
             batch.total_seqs_num, anchor_in_seq=num_bonus_tokens
+        )
+        self.attn_metadata_builder.commit_speculative_state(
+            forward_context.attn_metadata, last_token_indices
         )
 
         draft_token = self.drafter.propose(
@@ -4064,6 +4089,8 @@ class ModelRunner:
         verify_scheduler = getattr(drafter, "verify_scheduler", None)
         if verify_scheduler is None:
             return
+        if verify_scheduler.calibration_profile is not None:
+            return  # Explicit offline measurements must not be overwritten.
         if not getattr(self, "graphs", None):
             return
         if self.config.dspark.disable_sps_calib:

@@ -9,6 +9,7 @@ from collections import deque
 from pathlib import Path
 
 import torch
+from atom.models.deepseek_v41.image_processing import DeepseekV41ImageProcessor
 from PIL import Image
 from transformers import AutoTokenizer
 
@@ -17,7 +18,6 @@ from atom.entrypoints.openai.chat_encoders import load_custom_message_encoder
 from atom.model_engine.model_runner import ModelRunner
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus
-from atom.models.deepseek_v41.image_processing import DeepseekV41ImageProcessor
 from atom.sampling_params import SamplingParams
 
 
@@ -53,7 +53,6 @@ def main():
         port=port,
     )
     config.parallel_config.data_parallel_base_port = port
-    config.hf_config.expert_backend = "eager"
     runner = ModelRunner(rank, config)
     report = {
         "completed": False,

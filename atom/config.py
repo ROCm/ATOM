@@ -1292,6 +1292,10 @@ class SpeculativeConfig:
         # config fields. Route it to the DSpark draft model and skip the MTP
         # n_predict=1 rewrite (DSpark uses dspark_block_size, not n_predict).
         if getattr(hf_config, "dspark_block_size", None):
+            if hf_config.model_type in ("deepseek_v41", "deepseek_v41_text"):
+                hf_config.model_type = "deepseek_v41_dspark"
+                hf_config.architectures = ["DeepseekV41DSparkModel"]
+                return
             hf_config.model_type = "deepseek_v4_dspark"
             hf_config.architectures = ["DeepseekV4DSparkModel"]
             logger.info(
@@ -1397,8 +1401,10 @@ class DSparkConfig:
         buckets to capture for the ragged path (e.g. "1,3,6" or "8").
       - q_buckets: CUDA-graph query-length buckets for the (older) batch-uniform
         q-bucket verify path (independent of the ragged path).
-      - disable_sps_calib: skip SPS calibration (replays captured graphs at
-        warmup); fall back to the synthetic SPS stub.
+      - disable_sps_calib: skip automatic SPS calibration (replays captured
+        graphs at warmup). Without an explicit profile, use the synthetic stub.
+      - calibration_profile: JSON file containing model/runtime-bound SPS and
+        STS measurements. Takes precedence over automatic calibration.
     """
 
     confidence_schedule: bool = False
@@ -1406,6 +1412,18 @@ class DSparkConfig:
     ragged_graph_sizes: str = ""
     q_buckets: str = ""
     disable_sps_calib: bool = False
+    # Explicit offline measurements; compatibility is checked before use.
+    calibration_profile: str | None = None
+
+    def __post_init__(self):
+        if self.calibration_profile is not None and (
+            not isinstance(self.calibration_profile, str)
+            or not self.calibration_profile
+            or not self.confidence_schedule
+        ):
+            raise ValueError(
+                "DSpark calibration_profile requires a path and confidence_schedule=True"
+            )
 
     @classmethod
     def from_dict(cls, cfg: dict | None) -> "DSparkConfig":

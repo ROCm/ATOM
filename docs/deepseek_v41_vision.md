@@ -13,9 +13,9 @@ IDs cannot share KV. Vision weights belong to a multimodal subclass and an
 explicit checkpoint scope; offline text loading still excludes vision by default.
 
 P07's accepted image path used atomic prefills bounded by max_num_batched_tokens.
-The P08 working implementation adds chunking and request-owned embedding lifetime,
-including preemption. Its runtime contracts have passed, but its small-chunk
-quality gate remains open; see the development validation below.
+P08 adds chunking and request-owned embedding lifetime, including preemption.
+Its runtime contracts passed and the user accepted the recorded small-chunk
+quality difference; see the validation and exact scores below.
 
 ## Validation
 
@@ -32,15 +32,15 @@ quality gate remains open; see the development validation below.
 - The same interleaved fixture under the independently loaded official full
   vision/text reference returned A is green, B is blue.
 
-## Separate AITER observation
+## Separate expert-backend observation
 
-The optional P09 AITER MoE passed the single and adjacent-image smoke fixtures,
-but answered the interleaved green/blue fixture with A: Green. B: White.
-The accepted eager model and the official reference both answered correctly.
-This is a recorded visual regression of the optional expert backend, not a P07
-pass and not a new numerical tolerance. Default expert_backend remains eager.
-Do not infer full visual quality acceptance from these smoke fixtures or the
-previous text-only acceptance of P09's numerical loss.
+The optional P09 AITER MoE adapter passed the single and adjacent-image smoke
+fixtures, but answered the interleaved green/blue fixture with A: Green. B:
+White, where the eager model and the official reference both answered
+correctly. Both of those expert paths have since been replaced by V4's
+`FusedMoE`, so this stands only as the reason the fixtures exist: an expert
+path can pass the single-image cases and still fail the interleaved one. The
+vision results below were taken on the eager loop and have not been re-measured.
 
 Logs, commands, fixed inputs and the paired diagnostic are archived under
 /app/logs_claude/atom_dsv41_flash_impl_20260912/p07_vision/ in ljin_dev.

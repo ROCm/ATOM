@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from atom.model_ops.attentions.deepseek_v41.packed_rows import (
     gather_index_rows,
+    gather_prefix_rows,
     pack_rows,
     write_packed_window,
 )
@@ -16,6 +17,7 @@ from atom.model_ops.v4_kernels.state_writes import swa_write
 
 from .indices import build_indices
 from .metadata import BatchStep
+from .speculative import TentativeState
 
 
 class PagedIndexKeys:
@@ -56,8 +58,11 @@ class RequestCache:
             self.cache.state.view("tail_scores")[index, slot].unsqueeze(0),
         )
 
-    def write_tail(self, owner, tail):
+    def write_tail(self, owner, tail, *, rows=None):
         if owner not in self.cache.tail_indices:
+            return
+        if self.cache.pending is not None:
+            self.cache.pending.stage_tail(owner, self.span, rows)
             return
         index = self.cache.tail_indices[owner]
         for name, value in (
@@ -121,9 +126,28 @@ class PagedAttentionCache:
             else self.backing.view(torch.bfloat16).view(-1, geometry.head_dim)
         )
         self.tail_indices = {owner: i for i, owner in enumerate(geometry.tail_owners)}
+        self.pending = None
 
-    def begin_step(self, requests):
+    def require_committed(self):
+        if self.pending is not None:
+            raise RuntimeError(
+                "Commit the accepted prefix before reusing or checkpointing state"
+            )
+
+    def begin_step(self, requests, *, tentative=False):
+        self.require_committed()
         requests = tuple(requests)
+        if tentative and (
+            self.geometry.speculative_tokens == 0
+            or not requests
+            or any(
+                span.position == 0 or span.length > self.geometry.speculative_tokens + 1
+                for span in requests
+            )
+        ):
+            raise ValueError(
+                "Tentative verification needs a prefix and sufficient window slack"
+            )
         offset = 0
         seen = set()
         for span in requests:
@@ -179,10 +203,20 @@ class PagedAttentionCache:
             )
             for i, span in enumerate(requests)
         )
-        return BatchStep(requests, positions, cu, slots, batches, tables, local_steps)
+        return BatchStep(
+            requests,
+            positions,
+            cu,
+            slots,
+            batches,
+            tables,
+            local_steps,
+            tentative=tentative,
+        )
 
     def prepare_state(self, step):
         """Read restored cursors once; reset recycled slots before any layer writes."""
+        self.require_committed()
         cursors = self.cursor[step.slots.long()].cpu().numpy()
         for i, span in enumerate(step.requests):
             if span.position == 0:
@@ -194,9 +228,16 @@ class PagedAttentionCache:
                     f"Request {span.request_id} needs state at {span.position}, "
                     f"found {cursors[i, 0]}; replay from a recoverable boundary"
                 )
+        if step.tentative:
+            self.pending = TentativeState(self, step)
         return cursors[:, 1:]
 
     def finish_step(self, step, histories):
+        if step.tentative:
+            if self.pending is None or self.pending.step is not step:
+                raise RuntimeError("Tentative step was not prepared")
+            self.pending.finish()
+            return
         if not step.requests:
             return
         cursor = torch.as_tensor(histories, dtype=torch.int64, device=self.pool.device)
@@ -205,8 +246,36 @@ class PagedAttentionCache:
         )
         self.cursor[step.slots.long()] = torch.cat((ends[:, None], cursor), dim=1)
 
+    def commit_tentative(self, accepted_lengths):
+        if self.pending is None:
+            raise RuntimeError("No tentative state to commit")
+        self.pending.commit(accepted_lengths)
+        self.pending = None
+
     def rope_positions(self, step):
         return step.positions
+
+    def read_window(self, layer, slots):
+        """Materialize only these requests' bounded context for block drafting."""
+        self.require_committed()
+        if not self.packed:
+            return self.state.view("window")[layer, slots.long()]
+        window = self.geometry.window(layer, self.num_pages)
+        addresses = (
+            window.ring_start
+            + slots.long()[:, None] * window.slot_rows
+            + torch.arange(window.ring_slots, device=slots.device) * window.run_rows
+        )
+        tagged = ((addresses << 1) | 1).flatten()
+        ptr = torch.tensor([0, tagged.numel()], dtype=torch.int32, device=slots.device)
+        output = torch.empty(
+            tagged.numel(),
+            self.geometry.head_dim,
+            dtype=torch.bfloat16,
+            device=slots.device,
+        )
+        gather_prefix_rows(self.backing, tagged, ptr, output, 0, 1)
+        return output.view(slots.numel(), window.ring_slots, self.geometry.head_dim)
 
     def requests(self, step):
         for i, (span, local_step) in enumerate(zip(step.requests, step.request_steps)):

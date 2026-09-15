@@ -35,6 +35,7 @@ def run_case(runner, prompts, output_tokens, *, multimodal_data=None):
                 temperature=0, max_tokens=output_tokens, ignore_eos=True
             ),
             has_per_req_cache=True,
+            num_draft_tokens=runner.num_spec_tokens,
             multimodal_data=None if multimodal_data is None else multimodal_data[i],
         )
         for i, tokens in enumerate(prompts)
@@ -51,7 +52,7 @@ def run_case(runner, prompts, output_tokens, *, multimodal_data=None):
         if item is None:
             raise RuntimeError("Scheduler stalled with unfinished requests")
         batch, seqs = item
-        counts = {seq.id: seq.num_completion_tokens for seq in sequences}
+        counts = {seq.id: seq.num_finalized_tokens for seq in sequences}
         output = runner.forward(batch)
         finished = scheduler.postprocess(list(seqs.values()), output, batch=batch)
         runner.release_multimodal_requests(
@@ -60,12 +61,14 @@ def run_case(runner, prompts, output_tokens, *, multimodal_data=None):
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start
         for seq in sequences:
-            if seq.num_completion_tokens > counts[seq.id]:
+            # Reserved placeholders are not output arrivals. Under deferred
+            # speculation they can grow by six before even the anchor is known.
+            if seq.num_finalized_tokens > counts[seq.id]:
                 arrivals[seq.id].append(elapsed)
         steps += 1
     elapsed = time.perf_counter() - start
     scheduler.block_manager.complete_previous_state_batch()
-    outputs = [list(seq.token_ids)[seq.num_prompt_tokens :] for seq in sequences]
+    outputs = [list(seq.completion_token_ids) for seq in sequences]
     if any(len(tokens) != output_tokens for tokens in outputs):
         raise AssertionError("Generation ended before the requested token count")
     first = [arrivals[seq.id][0] for seq in sequences]
@@ -93,7 +96,6 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--label", required=True)
     parser.add_argument("--cache-dtype", choices=("bf16", "fp4"), default="bf16")
-    parser.add_argument("--expert-backend", choices=("eager", "aiter"), default="eager")
     parser.add_argument("--graph", action="store_true")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--output-tokens", type=int, default=32)
@@ -127,7 +129,6 @@ def main():
         enable_log_stats=False,
         port=port,
     )
-    config.hf_config.expert_backend = args.expert_backend
     config.parallel_config.data_parallel_base_port = port
     runner = ModelRunner(rank, config)
     try:
@@ -144,7 +145,6 @@ def main():
         report = {
             "label": args.label,
             "cache_dtype": args.cache_dtype,
-            "expert_backend": args.expert_backend,
             "graph": args.graph,
             "tp": size,
             "output_tokens": args.output_tokens,

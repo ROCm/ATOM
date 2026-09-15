@@ -3,7 +3,9 @@
 The native text backbone and paged ModelRunner/Scheduler lifecycle are usable
 on the user-accepted P04 arithmetic baseline. The original V4 BF16 attention
 and inverse RoPE kernels are reused. Chat/tool/reasoning protocol integration is
-complete; vision and speculative decoding remain separate milestones.
+complete, and native image requests support chunked prefill and request-owned
+embedding lifetime. See the [DSpark guide](../docs/deepseek_v41_dspark.md) for speculative execution
+and its open zero-shot raw quality limitation.
 
 The reference revision is `dba1be0a40aa45a94ad051997016db3960a90277`.
 Real-checkpoint acceptance uses `ljin_dev`, four MI355X GPUs, TP4 and whole-expert
@@ -19,10 +21,10 @@ EP, with weights at `/mnt/DeepSeek-V4.1-Flash`. AITER is pinned to
 | P04 | Full-layer text baseline | Accepted; reference differences documented |
 | P05 | Paging, batching and request-state lifecycle | Complete |
 | P06 | Chat, tools and reasoning-effort protocol | Complete |
-| P07 | Vision and image requests | Pending |
-| P08 | Multimodal chunking and embedding lifetime | Pending |
+| P07 | Vision and image requests | Complete |
+| P08 | Multimodal chunking and embedding lifetime | Complete; small-chunk quality tradeoff accepted |
 | P09 | Packed cache, AITER W4A8 experts and PIECEWISE graphs | Complete; MoE precision tradeoff accepted |
-| P10 | V4.1 DSpark and accepted-prefix state commit | Pending |
+| P10 | V4.1 DSpark and accepted-prefix state commit | Implemented and tested; zero-shot raw quality decision pending |
 | P11 | Candidate-only indexing, Engram residency and fusion | Pending |
 | P12 | Optional CED decoder replay | Pending |
 | P13 | Optional encoder replay and persistent global cache | Pending |

@@ -406,36 +406,3 @@ class CheckpointReader:
                 scale=tensors[1],
             )
         return tables
-
-    @torch.no_grad()
-    def load_parameters(self, model, manifest):
-        """Load an unfused model layout and reject unconsumed runtime parameters."""
-        from atom.model_ops.blockscale import dequantize_fp8_weight
-
-        entries = {entry.source.name: entry for entry in manifest}
-        parameters = dict(model.named_parameters())
-        loaded = set()
-        for entry in manifest:
-            if entry.action != "load":
-                continue
-            if entry.target not in parameters:
-                raise ValueError(f"Runtime parameter missing: {entry.target}")
-            value = self.read(entry)
-            if entry.source.dequantize:
-                scale = entries[entry.source.name.removesuffix(".weight") + ".scale"]
-                value = dequantize_fp8_weight(value, self.read(scale))
-            param = parameters[entry.target]
-            if tuple(param.shape) != tuple(value.shape) or param.dtype != value.dtype:
-                raise ValueError(
-                    f"Runtime shape/dtype mismatch for {entry.target}: {param.shape}/{param.dtype}, source {value.shape}/{value.dtype}"
-                )
-            if value.dtype == torch.float4_e2m1fn_x2:
-                param.view(torch.uint8).copy_(value.view(torch.uint8))
-            else:
-                param.copy_(value)
-            loaded.add(entry.target)
-        if parameters.keys() - loaded:
-            raise ValueError(
-                f"Unloaded runtime parameters: {sorted(parameters.keys() - loaded)[:8]}"
-            )
-        return loaded

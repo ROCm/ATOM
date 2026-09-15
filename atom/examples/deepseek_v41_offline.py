@@ -14,29 +14,23 @@ import torch
 from aiter.dist.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
-    get_tp_group,
     init_distributed_environment,
     initialize_model_parallel,
     set_custom_all_reduce,
 )
+from atom.model_engine.engram_runtime import EngramHost, EngramPrefetcher, EngramRequest
+from atom.model_loader.deepseek_v41 import engram_tables
+from atom.model_ops.engram import CompressedTokenizer, EngramConfig, NgramHashMapping
+from atom.models.deepseek_v41.config import IndexTieBreak
+from atom.models.deepseek_v41.multimodal import DeepseekV41MultimodalModel
 from transformers import AutoTokenizer
 
 from atom.config import get_hf_config
-from atom.model_engine.engram_runtime import EngramHost, EngramPrefetcher, EngramRequest
-from atom.model_ops.engram import CompressedTokenizer, EngramConfig, NgramHashMapping
-from atom.models.deepseek_v41.config import IndexTieBreak
-from atom.models.deepseek_v41.model import DeepseekV41ForCausalLM
-from atom.models.deepseek_v41.weights import (
-    CheckpointReader,
-    build_weight_manifest,
-    checkpoint_schema,
-)
+from atom.model_loader.loader import load_model
 
 
 @contextmanager
-def load_offline_model(
-    directory, max_length, *, index_topk_tie_break=None, vision=False
-):
+def load_offline_model(directory, max_length, *, index_topk_tie_break=None):
     """Keep mapped Engram tables alive for the entire offline model lifetime."""
     config = get_hf_config(directory)
     if index_topk_tie_break is not None:
@@ -45,33 +39,19 @@ def load_offline_model(
             config.index_topk_tie_break
         )
     tokenizer = AutoTokenizer.from_pretrained(directory, local_files_only=True)
-    group = get_tp_group()
-    schema = checkpoint_schema(config)
-    manifest = build_weight_manifest(
-        schema,
-        scopes=("backbone", "vision") if vision else ("backbone",),
-        tp_rank=group.rank_in_group,
-        tp_size=group.world_size,
-        ep_rank=group.rank_in_group,
-        ep_size=group.world_size,
-    )
     previous = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)
     try:
         with torch.device("cuda"):
-            model_cls = DeepseekV41ForCausalLM
-            if vision:
-                from atom.models.deepseek_v41.multimodal import (
-                    DeepseekV41MultimodalModel,
-                )
-
-                model_cls = DeepseekV41MultimodalModel
-            model = model_cls(config, max_length=max_length)
+            # The multimodal class unconditionally, as serving builds it: it is
+            # the one that owns the vision tensors, and a text-only backbone
+            # would leave them with no parameter to land in -- reported as
+            # unroutable, or worse, skipped quietly.
+            model = DeepseekV41MultimodalModel(config, max_length=max_length)
     finally:
         torch.set_default_dtype(previous)
-    with CheckpointReader(directory, schema) as reader:
-        reader.load_parameters(model, manifest)
-        model.process_weights_after_loading()
+    load_model(model, directory, config)
+    with engram_tables(directory, config) as tables:
         engram_config = EngramConfig.from_hf(config.to_dict())
         mapping = NgramHashMapping(
             engram_config,
@@ -79,7 +59,7 @@ def load_offline_model(
                 tokenizer, expected_size=engram_config.compressed_vocab_size
             ),
         )
-        prefetcher = EngramPrefetcher(mapping, reader.engram_tables(config))
+        prefetcher = EngramPrefetcher(mapping, tables)
         host = EngramHost(
             prefetcher,
             max_length,

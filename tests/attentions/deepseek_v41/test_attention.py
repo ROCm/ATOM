@@ -6,12 +6,6 @@ from dataclasses import replace
 import numpy as np
 import pytest
 import torch
-
-from atom.model_engine.page_unit_checkpoint import (
-    CheckpointRestoreOp,
-    CheckpointStoreOp,
-    PagedStateCheckpointSpec,
-)
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 from atom.model_ops.attentions.deepseek_v41.checkpoints import StateCopies
 from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
@@ -20,6 +14,12 @@ from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 from atom.models.deepseek_v41.attention import Attention
 from atom.models.deepseek_v41.config import build_attention_topology
 from tests.attentions.deepseek_v41.helpers import geometry
+
+from atom.model_engine.page_unit_checkpoint import (
+    CheckpointRestoreOp,
+    CheckpointStoreOp,
+    PagedStateCheckpointSpec,
+)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
@@ -51,8 +51,12 @@ def test_attention_math_and_odd_tail_survive_exact_checkpoint(
                 else:
                     value = (torch.randn(parameter.shape) * 0.1).to(parameter.dtype)
                 parameter.data.copy_(value)
-            if layer.compressor is not None:
-                layer.compressor.process_weights_after_loading()
+            # Parent first, as the model's own traversal does: the layer's hook
+            # dequantizes wo_a and cancels the FP8 post-load steps that would
+            # otherwise shuffle a matrix `torch.einsum` then reads.
+            for module in layer.modules():
+                if hasattr(module, "process_weights_after_loading"):
+                    module.process_weights_after_loading()
     geo = replace(geometry(config), packed=packed)
     paged = PagedAttentionCache(geo, 40, 3, "cuda")
     private = EagerAttentionCache(config, topology, 1, 32, "cuda")

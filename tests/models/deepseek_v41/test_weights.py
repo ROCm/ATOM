@@ -6,15 +6,15 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from safetensors.torch import save_file
-
-from atom.config import get_hf_config
 from atom.models.deepseek_v41.weights import (
     CheckpointReader,
     WeightSpec,
     build_weight_manifest,
     checkpoint_schema,
 )
+from safetensors.torch import save_file
+
+from atom.config import get_hf_config
 
 from .reference import FIXTURES
 
@@ -73,7 +73,7 @@ def _checkpoint(tmp_path, tensors):
     )
 
 
-def test_split_shard_loading_native_bytes_and_wo_a(tmp_path):
+def test_split_shard_reads_native_bytes_unconverted(tmp_path):
     torch.manual_seed(57)
     weights = {
         "linear.weight": torch.randn(64, 64).to(torch.float8_e4m3fn),
@@ -102,43 +102,21 @@ def test_split_shard_loading_native_bytes_and_wo_a(tmp_path):
             dequantize=name.startswith("wo_a"),
         )
     _checkpoint(tmp_path, weights)
-    manifest = build_weight_manifest(specs, tp_rank=1, tp_size=2)
-    model = torch.nn.Module()
-    for name, dtype, width in (
-        ("linear", torch.float8_e4m3fn, 64),
-        ("wo_a", torch.bfloat16, 64),
-        ("expert", torch.float4_e2m1fn_x2, 32),
-    ):
-        module = torch.nn.Module()
-        module.weight = torch.nn.Parameter(
-            torch.empty(32, width, dtype=dtype), requires_grad=False
-        )
-        if name != "wo_a":
-            module.weight_scale = torch.nn.Parameter(
-                torch.empty(
-                    32 if name == "expert" else 1, 2, dtype=torch.float8_e8m0fnu
-                ),
-                requires_grad=False,
-            )
-        model.add_module(name, module)
+    manifest = {
+        entry.source.name: entry
+        for entry in build_weight_manifest(specs, tp_rank=1, tp_size=2)
+    }
+    # Compared through uint8: the point is that a shard reaches the caller as
+    # the checkpoint's own bytes, packed FP4 and e8m0 scales included, with no
+    # dtype conversion on the way -- `copy_` between mismatched dtypes zeros
+    # silently, so a conversion here would not announce itself later.
     with CheckpointReader(tmp_path, specs) as reader:
-        loaded = reader.load_parameters(model, manifest)
-        assert loaded == set(dict(model.named_parameters()))
-        assert torch.equal(
-            model.linear.weight.view(torch.uint8),
-            weights["linear.weight"][32:].view(torch.uint8),
-        )
-        assert torch.equal(
-            model.expert.weight.view(torch.uint8),
-            weights["expert.weight"][32:].view(torch.uint8),
-        )
-        expected = weights["wo_a.weight"][32:].float() * weights["wo_a.scale"][
-            1:
-        ].float().repeat_interleave(32, 0).repeat_interleave(32, 1)
-        assert torch.equal(model.wo_a.weight, expected.bfloat16())
-        model.register_parameter("unmapped", torch.nn.Parameter(torch.zeros(1)))
-        with pytest.raises(ValueError, match="Unloaded runtime"):
-            reader.load_parameters(model, manifest)
+        for name in ("linear.weight", "wo_a.weight", "expert.weight", "wo_a.scale"):
+            rows = 1 if name.endswith(".scale") else 32
+            assert torch.equal(
+                reader.read(manifest[name]).view(torch.uint8),
+                weights[name][rows:].view(torch.uint8),
+            ), name
     corrupted = {**specs, "absent.weight": WeightSpec("absent.weight", (1,), "BF16")}
     with pytest.raises(ValueError, match="Checkpoint schema mismatch"):
         CheckpointReader(tmp_path, corrupted)

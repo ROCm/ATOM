@@ -4,6 +4,7 @@
 from dataclasses import dataclass
 
 import torch
+from aiter import mhc_post
 
 from atom.model_ops.deepseek_v41.projections import hc_projection
 from atom.model_ops.sparse_attn_v4 import hc_split_sinkhorn
@@ -61,7 +62,28 @@ def predict_mixes(
 
 
 def expand_residual(sublayer_output, residual, post_mix, combination):
-    """combination[..., input_stream, output_stream], with FP32 accumulation."""
+    """combination[..., input_stream, output_stream], with FP32 accumulation.
+
+    The torch body materializes a [tokens, hc, hc, dim] product before reducing
+    it. `aiter.mhc_post` is the same expression as one ROCm op, and it is the
+    one V4 and vLLM's ROCm V4.1 both call here. The shape test is the kernel's
+    own coverage, which it traps on rather than reports; vLLM gates it the same
+    way. It is also what keeps the small-hidden reference tests, which demand
+    bit-exactness against the pinned model, on the body below.
+    """
+    hc_mult, hidden = residual.shape[-2], residual.shape[-1]
+    if hidden % 256 == 0 and hc_mult == 4:
+        flat = residual.view(-1, hc_mult, hidden)
+        rows = flat.shape[0]
+        out = torch.empty_like(flat)
+        mhc_post(
+            out,
+            sublayer_output.view(rows, hidden),
+            flat,
+            post_mix.view(rows, hc_mult, 1),
+            combination.view(rows, hc_mult, hc_mult),
+        )
+        return out.view_as(residual)
     mixed = (combination.unsqueeze(-1) * residual.float().unsqueeze(-2)).sum(-3)
     return (mixed + post_mix.unsqueeze(-1) * sublayer_output.float().unsqueeze(-2)).to(
         sublayer_output.dtype

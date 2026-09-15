@@ -3,8 +3,46 @@
 
 import torch
 import torch.nn.functional as F
+from aiter.ops.topk import top_k_per_row_prefill
 
 from atom.models.deepseek_v41.config import IndexTieBreak
+
+
+def _fused_topk_into(output, q, weights, keys, visible_lengths, width, count):
+    """Score every key at once and let one kernel bound, select and order.
+
+    Equivalent to the tiled merge below, not an approximation of it: `rowEnds`
+    is the per-query visibility bound `visible_lengths` expresses, and
+    `stable=True` emits ascending with smallest-index tie-breaking, which is
+    `IndexTieBreak.SMALL_POSITION` followed by `_ordered_indices`. That leaves
+    the tiled path owning only the cases this cannot express -- candidate
+    blocks, candidate production, and the large-position tie-break.
+    """
+    dots = torch.einsum("bqhd,bkd->bqhk", q, keys.tile(0, width))
+    scores = (dots.relu_() * weights.unsqueeze(-1)).sum(dim=2).float()
+    batch, queries = scores.shape[0], scores.shape[1]
+    rows = batch * queries
+    flat = scores.reshape(rows, width).contiguous()
+    ends = (
+        visible_lengths.clamp(0, width)
+        .to(torch.int32)
+        .expand(batch, queries)
+        .reshape(rows)
+        .contiguous()
+    )
+    picked = output.view(rows, count)
+    top_k_per_row_prefill(
+        flat,
+        torch.zeros_like(ends),
+        ends,
+        picked,
+        None,
+        rows,
+        flat.stride(0),
+        flat.stride(1),
+        count,
+        True,
+    )
 
 
 def _merge_topk(best_scores, best_ids, scores, ids, k):
@@ -81,6 +119,9 @@ def select_indices(
         else None
     )
     if width == 0:
+        return output, candidates
+    if candidate_blocks is None and not make_candidates and not prefer_large:
+        _fused_topk_into(output, q, weights, keys, visible_lengths, width, count)
         return output, candidates
     for q0 in range(0, queries, query_tile):
         q1 = min(q0 + query_tile, queries)

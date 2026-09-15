@@ -19,8 +19,11 @@ class V41PoolGeometry:
     index_dim: int
     history_size: int = 3
     packed: bool = False
+    speculative_tokens: int = 0
 
     def __post_init__(self):
+        if self.speculative_tokens < 0:
+            raise ValueError("Speculative window slack cannot be negative")
         if (
             min(
                 self.layers,
@@ -72,6 +75,12 @@ class V41PoolGeometry:
         return self.head_dim + self.head_dim // 32 if self.packed else self.row_bytes
 
     @property
+    def ring_slots(self):
+        # Verification includes one guaranteed input plus speculative tokens.
+        # Slack retains the window behind every possible accepted prefix.
+        return self.window_size + self.speculative_tokens
+
+    @property
     def tail_owners(self):
         return tuple(owner for owner, ratio in self.owners if ratio == 2)
 
@@ -99,7 +108,7 @@ class V41PoolGeometry:
                 "window",
                 self.layers,
                 (
-                    self.window_size,
+                    self.ring_slots,
                     self.window_row_bytes if self.packed else self.head_dim,
                 ),
                 torch.uint8 if self.packed else torch.bfloat16,
@@ -149,25 +158,28 @@ class V41PoolGeometry:
         if self.packed:
             return WindowParams(
                 ring_start=pages * self.page_bytes
-                + layer * self.window_size * self.window_row_bytes,
+                + layer * self.ring_slots * self.window_row_bytes,
                 slot_rows=self.state_bytes,
-                ring_slots=self.window_size,
+                ring_slots=self.ring_slots,
                 ring_stride=1,
                 run_rows=self.window_row_bytes,
             )
         return WindowParams(
             ring_start=pages * self.page_bytes // self.row_bytes
-            + layer * self.window_size,
+            + layer * self.ring_slots,
             slot_rows=self.state_bytes // self.row_bytes,
-            ring_slots=self.window_size,
-            ring_stride=self.window_size,
-            run_rows=self.window_size,
+            ring_slots=self.ring_slots,
+            ring_stride=self.ring_slots,
+            run_rows=self.ring_slots,
         )
 
     @property
     def layout_id(self):
-        return (
+        identity = (
             f"dsv41-{'packed' if self.packed else 'bf16'}-state-v1:layers={self.layers}:owners={self.owners}"
             f":block={self.block_size}:window={self.window_size}"
             f":dims={self.head_dim},{self.index_dim}:history={self.history_size}"
+        )
+        return identity + (
+            f":spec={self.speculative_tokens}" if self.speculative_tokens else ""
         )

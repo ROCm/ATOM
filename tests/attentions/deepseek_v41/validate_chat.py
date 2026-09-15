@@ -108,12 +108,10 @@ def main():
         enable_log_stats=False,
         port=port,
     )
-    config.hf_config.expert_backend = "aiter"
     config.parallel_config.data_parallel_base_port = port
     runner = ModelRunner(rank, config)
     report = {
         "tp": size,
-        "expert_backend": "aiter",
         "cache_dtype": "fp4",
         "graph": "PIECEWISE",
         "transport": "ModelRunner/Scheduler",

@@ -36,6 +36,7 @@ class StateCopies:
         self.pending = False
 
     def entry(self, slot):
+        self.cache.require_committed()
         if not 0 <= slot < self.cache.num_slots:
             raise IndexError(f"STATE slot {slot} is out of range")
         return self.cache.state_bytes[slot]

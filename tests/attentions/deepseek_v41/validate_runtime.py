@@ -15,10 +15,11 @@ from pathlib import Path
 import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
+from atom.examples.deepseek_v41_offline import prepare_engram
+from atom.models.deepseek_v41.model import DeepseekV41ForCausalLM
 from transformers import AutoTokenizer
 
 from atom.config import CompilationConfig, Config, CUDAGraphMode
-from atom.examples.deepseek_v41_offline import prepare_engram
 from atom.model_engine.model_runner import ModelRunner
 from atom.model_engine.scheduler import ScheduledBatch, Scheduler
 from atom.model_engine.sequence import (
@@ -27,7 +28,6 @@ from atom.model_engine.sequence import (
     SequenceType,
     new_block_table,
 )
-from atom.models.deepseek_v41.model import DeepseekV41ForCausalLM
 from atom.sampling_params import SamplingParams
 from atom.utils.forward_context import reset_forward_context
 
@@ -265,7 +265,6 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--cache-dtype", choices=("bf16", "fp4"), default="bf16")
     parser.add_argument("--graph", action="store_true")
-    parser.add_argument("--expert-backend", choices=("eager", "aiter"), default="eager")
     args = parser.parse_args()
     rank, size = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     port = int(os.environ["MASTER_PORT"])
@@ -288,7 +287,6 @@ def main():
         enable_log_stats=False,
         port=port,
     )
-    config.hf_config.expert_backend = args.expert_backend
     config.parallel_config.data_parallel_base_port = port
     start = time.perf_counter()
     runner = ModelRunner(rank, config)
@@ -311,17 +309,11 @@ def main():
         events = scheduler_cases(runner, tokenizer)
         graphs = runner.model.dense_graphs
         if args.graph:
-            assert (
-                len(graphs.entries)
-                == (4 if args.expert_backend == "aiter" else 3)
-                * config.hf_config.num_hidden_layers
-                * 3
-            )
+            assert len(graphs.entries) == 3 * config.hf_config.num_hidden_layers * 3
             assert graphs.replays > len(graphs.entries)
         report = {
             "graph": args.graph,
-            "expert_backend": args.expert_backend,
-            "reference": "uncaptured execution, private BF16 cache, same MoE backend",
+            "reference": "uncaptured execution, private BF16 cache",
             "dense_graphs": 0 if graphs is None else len(graphs.entries),
             "dense_graph_replays": 0 if graphs is None else graphs.replays,
             "passed": True,

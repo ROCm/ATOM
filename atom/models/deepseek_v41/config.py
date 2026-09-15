@@ -133,21 +133,13 @@ def build_attention_topology(config) -> tuple[LayerAttentionSpec, ...]:
     return tuple(result)
 
 
-class ExpertBackend(str, Enum):
-    EAGER = "eager"
-    AITER = "aiter"
-
-
 class DeepseekV41TextConfig(PretrainedConfig):
     """The published text schema, with root token IDs and quantization preserved."""
 
     model_type = "deepseek_v41_text"
 
-    def __init__(
-        self, index_topk_tie_break="small_position", expert_backend="eager", **kwargs
-    ):
+    def __init__(self, index_topk_tie_break="small_position", **kwargs):
         super().__init__(**kwargs)
-        self.expert_backend = ExpertBackend(expert_backend).value
         try:
             self.index_topk_tie_break = IndexTieBreak(index_topk_tie_break).value
         except ValueError as error:
@@ -168,6 +160,12 @@ class DeepseekV41TextConfig(PretrainedConfig):
         if self.moe_intermediate_size % tensor_parallel_size:
             raise ValueError(
                 "moe_intermediate_size must be divisible by tensor parallel size"
+            )
+
+    def validate_request(self, *, num_draft_tokens, multimodal_data):
+        if num_draft_tokens and multimodal_data:
+            raise ValueError(
+                "DeepSeek-V4.1 DSpark currently supports text requests only"
             )
 
 
@@ -265,6 +263,36 @@ def normalize_hf_config(raw: dict) -> DeepseekV41TextConfig:
     return config
 
 
+def validate_speculative_config(config):
+    """Supported DSpark deployment; model math and shared scheduling stay separate."""
+    speculative = config.speculative_config
+    if speculative is None:
+        return
+    if speculative.method != "dspark" or speculative.num_speculative_tokens != 5:
+        raise ValueError("DeepSeek-V4.1 requires native DSpark with five draft tokens")
+    if speculative.model is not None:
+        from pathlib import Path
+
+        if Path(speculative.model).resolve() != Path(config.model).resolve():
+            raise ValueError("DeepSeek-V4.1 DSpark must use the target checkpoint")
+    if config.tensor_parallel_size != 4:
+        raise ValueError("DeepSeek-V4.1 DSpark is validated on TP4")
+    if (config.kv_cache_dtype, config.index_cache_dtype) != ("bf16", "bf16"):
+        raise ValueError("DeepSeek-V4.1 DSpark requires BF16 KV and index caches")
+    from atom.utils import envs
+
+    if envs.ATOM_ENABLE_RELAXED_MTP:
+        raise ValueError("DeepSeek-V4.1 DSpark requires strict target verification")
+    if speculative.synthetic_acceptance_rates is not None:
+        raise ValueError("DeepSeek-V4.1 DSpark requires real target verification")
+    if config.dspark.confidence_schedule and (
+        not config.dspark.ragged or not config.dspark.calibration_profile
+    ):
+        raise ValueError(
+            "DeepSeek-V4.1 dynamic DSpark requires ragged verification and a calibration_profile"
+        )
+
+
 def validate_runtime_config(config):
     """Gate unimplemented execution modes before weights or pools are loaded."""
     from atom.config import CUDAGraphMode
@@ -277,7 +305,6 @@ def validate_runtime_config(config):
             not config.enforce_eager and graph_mode != CUDAGraphMode.PIECEWISE,
         ),
         ("torch.compile", config.compilation_config.level != 0),
-        ("speculative decoding", config.speculative_config is not None),
         ("pipeline parallel", config.pipeline_parallel_size != 1),
         (
             "context parallel",
@@ -313,3 +340,4 @@ def validate_runtime_config(config):
             "DeepSeek-V4.1 uses whole-expert EP; set enable_expert_parallel=True"
         )
     IndexTieBreak(config.hf_config.index_topk_tie_break)
+    validate_speculative_config(config)

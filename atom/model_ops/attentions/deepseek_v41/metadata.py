@@ -36,6 +36,7 @@ class BatchStep:
     block_tables: torch.Tensor
     request_steps: tuple[AttentionStep, ...]
     selected: dict[int, torch.Tensor] = field(default_factory=dict)
+    tentative: bool = False
 
     @property
     def length(self):
@@ -43,7 +44,9 @@ class BatchStep:
 
     @property
     def decode(self):
-        return all(request.length == 1 for request in self.requests)
+        # Verification has ring slack for the entire tentative block. All rows
+        # can use the same causal paged-decode kernel as autoregressive decode.
+        return self.tentative or all(request.length == 1 for request in self.requests)
 
     @property
     def max_length(self):

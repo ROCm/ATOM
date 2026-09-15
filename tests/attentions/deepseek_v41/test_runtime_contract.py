@@ -8,7 +8,6 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 from atom.models.deepseek_v41.config import normalize_hf_config, validate_runtime_config
@@ -71,7 +70,7 @@ def runtime_config(**overrides):
     [
         {"enforce_eager": False},
         {"compilation_config": SimpleNamespace(level=3)},
-        {"speculative_config": object()},
+        {"speculative_config": SimpleNamespace(method="mtp", num_speculative_tokens=5)},
         {"pipeline_parallel_size": 2},
         {"prefill_context_parallel_size": 2},
         {"decode_context_parallel_size": 2},
@@ -136,3 +135,33 @@ def test_supported_cache_and_piecewise_graph_modes(cache_dtype, graph):
             ),
         )
     )
+
+
+@pytest.mark.parametrize("graph", [False, True])
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_native_dspark_passes_production_admission(graph, dynamic):
+    from atom.config import CUDAGraphMode, DSparkConfig
+
+    value = runtime_config(
+        model="/model",
+        enforce_eager=not graph,
+        compilation_config=SimpleNamespace(
+            level=0, cudagraph_mode=CUDAGraphMode.PIECEWISE
+        ),
+        hf_config=SimpleNamespace(index_topk_tie_break="small_position"),
+        speculative_config=SimpleNamespace(
+            method="dspark",
+            num_speculative_tokens=5,
+            model="/model",
+            synthetic_acceptance_rates=None,
+        ),
+        dspark=DSparkConfig(
+            confidence_schedule=dynamic,
+            ragged=dynamic,
+            calibration_profile="profile.json" if dynamic else None,
+        ),
+    )
+    validate_runtime_config(value)
+    value.kv_cache_dtype = value.index_cache_dtype = "fp4"
+    with pytest.raises(ValueError, match="BF16"):
+        validate_runtime_config(value)

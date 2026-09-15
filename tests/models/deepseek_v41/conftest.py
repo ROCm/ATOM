@@ -21,11 +21,15 @@ def reference():
 
 @pytest.fixture
 def single_rank(monkeypatch):
+    from atom.models.deepseek_v41 import attention, layers, model
+
     from atom.model_ops import embed_head, layernorm, linear
-    from atom.models.deepseek_v41 import attention, layers, model, moe
+    from atom.model_ops import moe as fused_moe
 
     group = SimpleNamespace(rank_in_group=0, world_size=1)
-    for module in (linear, attention, layers, model, moe, embed_head):
+    # `fused_moe`, not the V4.1 `moe` module: the routed experts are V4's
+    # `FusedMoE`, which reads the group where it lives.
+    for module in (linear, attention, layers, model, fused_moe, embed_head):
         monkeypatch.setattr(module, "get_tp_group", lambda: group)
     monkeypatch.setattr(
         layernorm, "get_tensor_model_parallel_world_size", lambda: group.world_size
@@ -72,7 +76,6 @@ def attention_contract(monkeypatch, reference):
     composition. This is not an end-to-end numerical acceptance test.
     """
     import torch
-
     from atom.models.deepseek_v41 import attention
 
     captured = []

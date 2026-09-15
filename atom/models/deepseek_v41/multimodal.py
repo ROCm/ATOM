@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Vision weight ownership and image-to-language embedding projection."""
 
+
 import torch
 from torch import nn
 
@@ -9,8 +10,6 @@ from .vision import Aligner, ViT
 
 
 class DeepseekV41MultimodalModel(DeepseekV41ForCausalLM):
-    checkpoint_scopes = ("backbone", "vision")
-
     def __init__(self, config, *, max_length):
         super().__init__(config, max_length=max_length)
         vision_config = config._multimodal_config.vision_config

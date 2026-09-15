@@ -2,23 +2,29 @@
 """CSA2 model projections; cache storage and sparse kernels have separate owners."""
 
 import torch
+from aiter import QuantType
 from aiter.dist.parallel_state import get_tp_group
-from torch import nn
-
 from atom.model_ops.attentions.deepseek_v41.packed_attention import (
     packed_decode,
     packed_prefill,
 )
-from atom.model_ops.blockscale import quantize_fp4, quantize_fp8
-from atom.model_ops.deepseek_v41.compressor import Compressor
+from atom.model_ops.blockscale import (
+    dequantize_fp8_weight,
+    quantize_fp4,
+    quantize_fp8,
+)
+from atom.model_ops.deepseek_v41.compressor import Compressor, CompressorTail
 from atom.model_ops.deepseek_v41.indexer import select_indices
 from atom.model_ops.deepseek_v41.normalization import FusedRMSNorm, RMSNorm
 from atom.model_ops.deepseek_v41.projections import grouped_output_projection
+from torch import nn
+
 from atom.model_ops.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
+from atom.model_ops.utils import atom_parameter
 from atom.model_ops.v4_kernels import (
     sparse_attn_v4_paged_decode,
     sparse_attn_v4_paged_prefill,
@@ -88,9 +94,7 @@ class Attention(nn.Module):
             config.num_attention_heads // tp_size,
             config.o_groups // tp_size,
         )
-        self.attn_sink = nn.Parameter(
-            torch.empty(self.heads, dtype=torch.float32), requires_grad=False
-        )
+        self.attn_sink = atom_parameter(torch.empty(self.heads, dtype=torch.float32))
         self.wq_a = ReplicatedLinear(
             config.hidden_size, config.q_lora_rank, quant_config=native_quant_config()
         )
@@ -104,12 +108,15 @@ class Attention(nn.Module):
             config.hidden_size, self.head_dim, quant_config=native_quant_config()
         )
         self.kv_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
-        # wo_a is used as grouped BF16 weights, not a dense linear forward.
-        self.wo_a = nn.Linear(
+        # wo_a: grouped LoRA. FP8 + e8m0 block scale on disk, BF16 in the
+        # grouped einsum. Allocated as a quantized ColumnParallelLinear so both
+        # tensors load through the standard FP8 path, then dequantized in
+        # `process_weights_after_loading` -- V4's arrangement, unchanged.
+        self.wo_a = ColumnParallelLinear(
             config.num_attention_heads * self.head_dim // config.o_groups,
-            self.groups * self.o_rank,
+            config.o_groups * self.o_rank,
             bias=False,
-            dtype=torch.bfloat16,
+            quant_config=native_quant_config(),
         )
         self.wo_b = RowParallelLinear(
             config.o_groups * self.o_rank,
@@ -135,10 +142,15 @@ class Attention(nn.Module):
             owner = self.spec.kv_owner
             count = (step.position + step.length) // self.spec.ratio
             if self.compressor is not None:
-                latent, tail = self.compressor(
-                    hidden, step.position, cache.read_tail(owner, step.position)
+                values, scores = self.compressor.project(hidden)
+                latent, tail = self.compressor.pool(
+                    values,
+                    scores,
+                    step.position,
+                    cache.read_tail(owner, step.position),
+                    dtype=hidden.dtype,
                 )
-                cache.write_tail(owner, tail)
+                cache.write_tail(owner, tail, rows=CompressorTail(values, scores))
                 if latent is not None:
                     begin = step.position // self.spec.ratio
                     end = begin + latent.shape[1]
@@ -170,6 +182,44 @@ class Attention(nn.Module):
                 step.indices[self.spec.layer_id] = selected
                 if candidates_out is not None:
                     step.candidates[self.spec.layer_id] = candidates_out
+
+    def process_weights_after_loading(self) -> None:
+        """Dequantize wo_a to BF16 for the grouped LoRA einsum.
+
+        Copied from V4, minus its gfx950/gfx1250 mxscale branches: this einsum
+        path wants BF16. Idempotent -- a checkpoint that already ships wo_a as
+        BF16 lands here with nothing to do. Suppressing `quant_type` afterwards
+        is what stops `LinearBase.process_weights_after_loading` from applying
+        the FP8 CK 16x16 shuffle to a matrix `torch.einsum` then reads, which
+        would permute rows inside each block. Load order is parent first, so
+        this runs before that hook.
+        """
+        weight = self.wo_a.weight
+        if weight.dtype == torch.bfloat16:
+            return
+        scale = getattr(self.wo_a, "weight_scale", None)
+        if (
+            weight.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+            or scale is None
+        ):
+            return
+        # The scale stays in its native e8m0: this helper exists for exactly
+        # this weight and reads the grid in that encoding.
+        self.wo_a.weight = atom_parameter(
+            dequantize_fp8_weight(weight.data, scale.data)
+        )
+        try:
+            delattr(self.wo_a, "weight_scale")
+        except AttributeError:
+            pass
+        # The weight is BF16 now and its scale is gone, so both remaining FP8
+        # post-load steps have to be cancelled, not just the shuffle: the other
+        # one re-encodes an FP8 weight and its scale from e4m3fn to e4m3fnuz for
+        # the AMD parts that use that encoding. It is already off on e4m3fn
+        # hardware; clearing it is what makes this correct on the parts where
+        # `LinearBase` turned it on.
+        self.wo_a.quant_type = QuantType.No
+        self.wo_a.need_normalize_e4m3fn_to_e4m3fnuz = False
 
     def forward(self, hidden, cache, step, rope):
         positions = cache.rope_positions(step)

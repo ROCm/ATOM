@@ -119,6 +119,8 @@ class RejectionSampler(nn.Module):
         target_logits: torch.Tensor,
         # [batch_size, 1]
         bonus_token_ids: torch.Tensor,
+        *,
+        target_token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Ensure target_logits is contiguous. For greedy sampling, we can use
         # logits directly (argmax is the same for logits and probs), but we
@@ -143,6 +145,7 @@ class RejectionSampler(nn.Module):
             bonus_token_ids,
             synthetic_acceptance_rates=self.synthetic_acceptance_rates,
             synthetic_step=self._synthetic_step,
+            target_token_ids=target_token_ids,
         )
         if self.synthetic_acceptance_rates is not None:
             self._synthetic_step += 1
@@ -168,6 +171,7 @@ def rejection_sample(
     synthetic_acceptance_rates: tuple[float, ...] | None = None,
     # Per-step seed for the (rank-consistent) synthetic RNG; ignored otherwise.
     synthetic_step: int = 0,
+    target_token_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert draft_token_ids.ndim == 1
     assert draft_probs is None or draft_probs.ndim == 2
@@ -183,6 +187,10 @@ def rejection_sample(
     assert target_probs.is_contiguous()
     assert bonus_token_ids.is_contiguous()
     assert target_probs.shape == (num_tokens, vocab_size)
+    if target_token_ids is not None:
+        if target_token_ids.shape != draft_token_ids.shape:
+            raise ValueError("Sampled target IDs must cover every verification row")
+        target_token_ids = target_token_ids.contiguous()
 
     # Create output buffer. Each kernel program writes positions
     # [0 .. num_draft_tokens] for its request and fills the unwritten tail
@@ -232,9 +240,14 @@ def rejection_sample(
             num_spec_steps,
             num_warps=1,
         )
-    elif RELAXED_TOP_N <= 1:
-        # Strict greedy path: draft must exactly match target argmax
-        target_argmax = target_probs.argmax(dim=-1)
+    elif target_token_ids is not None or RELAXED_TOP_N <= 1:
+        # Match the actual target draw for stochastic requests; greedy requests
+        # keep the existing argmax path. The prefix kernel needs only token IDs.
+        target_argmax = (
+            target_probs.argmax(dim=-1)
+            if target_token_ids is None
+            else target_token_ids
+        )
         rejection_greedy_sample_kernel[(batch_size,)](
             output_token_ids,
             num_bonus_tokens,

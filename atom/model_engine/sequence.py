@@ -152,6 +152,10 @@ class Sequence:
         # every defaulting Sequence would be a mutable default in all but name.
         if sampling_params is None:
             sampling_params = SamplingParams()
+        if num_draft_tokens and sampling_params.logprobs:
+            raise ValueError(
+                "Token logprobs are not supported with speculative decoding"
+            )
         self.block_size = block_size
         self.id = id or next(Sequence.counter)
         self.external_request_id = request_id
@@ -180,6 +184,9 @@ class Sequence:
         self.mrope_position_delta = mrope_position_delta
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
+        # Host-known prefix, excluding deferred outputs and draft placeholders.
+        # Preemption can replay only these IDs; pending GPU results are resampled.
+        self.num_finalized_tokens = len(token_ids)
         self.num_rejected = 0
         self.num_cached_tokens = 0
         # Tokens whose blocks are registered in the prefix cache: through the

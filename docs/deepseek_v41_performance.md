@@ -62,32 +62,19 @@ it is not an end-to-end speedup claim or a long-context bandwidth measurement.
 
 ## Shared MoE kernels and graph ownership
 
-`model_ops/deepseek_v41/moe_aiter.py` adapts the existing AITER
-`fused_routing_from_topk` and `moe_gemm_a8w4` entry points. P09 adds no MoE device
-kernel. At loading time it assembles native FP4/E8M0 arenas and rebinds the
-original expert parameters to views of the same storage. Weights are not
-permanently duplicated or expanded to BF16. Remote experts sort into a final
-sentinel bin that is excluded from the local GEMM schedule. Up/gate share one
-GEMM, followed by one down GEMM; up to 512 tokens are processed per chunk to
-bound intermediates and the existing sorter's 4,096-route limit.
+`models/deepseek_v41/moe.py` is V4's `MoE`, subclassed only to flatten the
+offline caller's batch dimension and to declare `bias_vl`. There is no second
+expert backend and no HF option selecting one: the two models' routed experts
+are the same layer, quantized the same way (W4A8 group-32 MXFP4, whole-expert
+ownership, routing weight applied to the activation before quantization), so
+`FusedMoE` owns routing, the GEMM schedule and the expert-parallel exchange.
 
-The adapter keeps the V4.1 boundaries: BF16 gate/up results, FP32 asymmetric
-clamp and weighted SwiGLU, BF16 rounding before group32 A8 quantization, and
-ascending expert-ID accumulation of BF16 down results into FP32. Router math,
-shared expert TP partials and RCCL remain in their existing model owners.
-
-The HF option `expert_backend="aiter"` selects these kernels for both prefill
-and decode. `expert_backend="eager"` retains the accepted P05 arithmetic and
-remains the default. This is independent of packed cache storage. V4's default
-FP4-activation path and its gfx1250 preshuffled decode wrapper are not suitable
-configurations for this checkpoint on MI355X; the existing raw-layout A8W4
-GEMMs run on gfx950 without modifying AITER or the V4 model.
-
-The earlier P09 custom routed GEMM has been removed. Its exact-arithmetic
-prototype and measurements are retained as historical diagnostics only.
-The first EP-sort probe exposed a compile error in the pinned AITER EP wrapper;
-production uses the existing top-k sorter instead, with per-call metadata and
-no shared persistent routing scratch.
+The earlier P09 experiments -- a custom routed GEMM, then an adapter over
+AITER's `fused_routing_from_topk` / `moe_gemm_a8w4` behind an
+`expert_backend` switch -- have both been removed, along with the eager expert
+loop they were alternatives to. Their measurements survive only as historical
+diagnostics; the numbers below that compare expert backends describe code that
+no longer exists.
 
 `models/deepseek_v41/execution.py` owns stable inputs, outputs and a distinct
 CUDA graph allocation pool per block stage and token bucket. Startup capture
@@ -96,8 +83,9 @@ modified by warmup. Replay copies current inputs, clears padding and returns
 only live rows; an uncaptured bucket falls back to normal execution.
 
 Captured stages are attention preparation, FFN preparation and residual
-completion. With AITER experts, decode FFN and its collectives are also
-captured. Attention/cache/index/compressor work, request positions, Engram CPU
+completion, plus the decode FFN and its collectives -- `FusedMoE` is capturable
+at every shape, so the eager expert loop's capture exclusion is gone.
+Attention/cache/index/compressor work, request positions, Engram CPU
 lookup and committed history stay outside these graphs. FULL graphs and
 `torch.compile` remain unsupported.
 
@@ -147,9 +135,8 @@ These are comparisons against the same AITER backend, not equality with P05.
 The targeted regression passes 953 tests. Forty-seven parameter combinations
 in `test_sub_pool_spec.py` are intentionally skipped because each budget is
 covered by either its success test or its failure test. No V4.1 model/reference
-test is skipped. AITER expert tests include empty/all-remote routes, native
-weight view preservation, 512-token chunk boundaries and refreshed routes
-under graph replay.
+test is skipped. The expert-adapter tests were removed with the adapter; the
+routed experts are now covered by V4's own `FusedMoE` tests.
 
 The dense native FP8 candidate remains disabled: it changed BF16 outputs and
 had no consistent measured speedup (about 0.97–1.04x). Dense projections still
@@ -181,8 +168,9 @@ For an independent P05 baseline, invoke this same script by absolute path with
 `PYTHONPATH` pointing to an isolated checkout of the accepted P05 commit, using
 `--cache-dtype bf16` and omitting the graph/grouped flags.
 
-Measured TP4 medians (milliseconds), using packed cache, AITER experts and
-PIECEWISE graphs:
+Measured TP4 medians (milliseconds), using packed cache and PIECEWISE graphs.
+Taken on the removed AITER expert adapter, so they date the P09 comparison, not
+the current `FusedMoE` path:
 
 | Batch / prompt tokens | P05 TTFT | P09 TTFT | P05 TPOT | P09 TPOT | Decode speed ratio |
 |---|---:|---:|---:|---:|---:|

@@ -1,89 +1,40 @@
 # SPDX-License-Identifier: MIT
-"""V4.1 expert ownership and projection composition, with explicit W4A8 routing."""
+"""V4.1 routed experts: V4's MoE, unchanged.
+
+The two models share this layer. Routing is `sqrtsoftplus` with a
+selection-only per-expert bias, renormalized top-k and a `routed_scaling_factor`;
+the experts are W4A8 group-32 MXFP4 with clamped SwiGLU and whole-expert
+ownership; and the routing weight lands on the activation before quantization,
+which `FusedMoE` spells `apply_router_weight_on_input`. `DeepseekV4Args`
+reads all of it off the V4.1 config by its HF names, so V4's `MoE` constructs
+directly. vLLM's ROCm V4.1 reuses the V4 MoE the same way.
+
+`bias_vl` is the one V4.1-only tensor: a second routing bias for image sentinel
+tokens. It is declared so the checkpoint loads and left unread, matching the
+text-only admission.
+"""
 
 import torch
-from aiter.dist.parallel_state import get_tp_group
 from torch import nn
 
-from atom.model_ops.deepseek_v41.moe import Expert, Router
-from atom.model_ops.deepseek_v41.moe_eager import execute_experts
-from atom.model_ops.linear import (
-    ColumnParallelLinear,
-    ReplicatedLinear,
-    RowParallelLinear,
-)
-
-from .config import ExpertBackend
-from .layers import native_quant_config, reduce_output
+from atom.models.deepseek_v4 import DeepseekV4Args, make_v4_quant_config
+from atom.models.deepseek_v4 import MoE as V4MoE
 
 
-class MoE(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.group = get_tp_group()
-        self.backend = ExpertBackend(getattr(config, "expert_backend", "eager"))
-        self.aiter_experts = None
-        self.num_experts = config.n_routed_experts
-        self.gate = Router(
-            config.hidden_size,
-            self.num_experts,
-            config.num_experts_per_tok,
-            route_scale=config.routed_scaling_factor,
-        )
-        local_count = self.num_experts // self.group.world_size
-        begin = self.group.rank_in_group * local_count
-        self.experts = nn.ModuleDict(
-            {
-                str(expert_id): self._expert(config, routed=True)
-                for expert_id in range(begin, begin + local_count)
-            }
-        )
-        self.shared_experts = self._expert(config, routed=False)
-
-    @staticmethod
-    def _expert(config, *, routed):
-        quant = native_quant_config(fp4=routed)
-        up_type = ReplicatedLinear if routed else ColumnParallelLinear
-        down_type = ReplicatedLinear if routed else RowParallelLinear
-        dim, inter = config.hidden_size, config.moe_intermediate_size
-        return Expert(
-            up_type(dim, inter, quant_config=quant),
-            down_type(inter, dim, quant_config=quant, reduce_results=False),
-            up_type(dim, inter, quant_config=quant),
-            swiglu_limit=config.swiglu_limit,
-        )
-
-    def process_weights_after_loading(self):
-        if self.backend == ExpertBackend.AITER:
-            from atom.model_ops.deepseek_v41.moe_aiter import AiterExperts
-
-            self.aiter_experts = AiterExperts(self.experts, self.num_experts)
-
-    def can_capture(self, tokens):
-        return (
-            self.backend == ExpertBackend.AITER
-            and self.aiter_experts is not None
-            and tokens <= self.aiter_experts.max_tokens
+class MoE(V4MoE):
+    def __init__(self, config, layer_id: int, prefix: str = ""):
+        args = DeepseekV4Args.from_hf_config(config)
+        args.quant_config = make_v4_quant_config(config)
+        super().__init__(layer_id, args, prefix=prefix)
+        self.gate.bias_vl = nn.Parameter(
+            torch.empty(args.n_routed_experts, dtype=torch.float32),
+            requires_grad=False,
         )
 
     def forward(self, hidden, image_mask=None):
-        flat = hidden.reshape(-1, hidden.shape[-1])
-        weights, indices = self.gate(
-            flat, None if image_mask is None else image_mask.flatten()
-        )
-        if self.backend == ExpertBackend.AITER:
-            if self.aiter_experts is None:
-                raise RuntimeError("AITER expert views must be finalized after loading")
-            output = self.aiter_experts(flat, weights, indices)
-            if self.group.world_size > 1:
-                output = self.group.all_reduce(output, ca_fp8_quant=False)
-        else:
-            output = execute_experts(
-                flat, weights, indices, self.experts, self.num_experts, self.group
+        if image_mask is not None:
+            raise NotImplementedError(
+                "V4.1 image-sentinel routing is not part of the text-only admission"
             )
-        # Upstream rounds the complete shared FFN output once. Its TP
-        # partials must remain FP32 until after the reduction.
-        shared = reduce_output(
-            self.shared_experts(flat, output_dtype=torch.float32)
-        ).to(hidden.dtype)
-        return (output + shared).to(hidden.dtype).view_as(hidden)
+        flat = hidden.reshape(-1, hidden.shape[-1])
+        return super().forward(flat).view_as(hidden)

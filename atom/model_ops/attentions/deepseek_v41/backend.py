@@ -5,14 +5,17 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
-
 from atom.model_engine.engram_runtime import EngramInputPreparer
+from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+from atom.models.deepseek_v41.config import AttentionMode, build_attention_topology
+from tests.models.deepseek_v41.cache_visibility_snapshot import (  # DIAGNOSTIC179
+    CacheVisibilitySnapshot,
+)
+
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attentions.backends import AttentionBackend, CommonAttentionBuilder
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import page_pool, state_pool
-from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
-from atom.models.deepseek_v41.config import AttentionMode, build_attention_topology
 from atom.utils.forward_context import AttentionMetaData, AttnState, Context
 
 from .cache import PagedAttentionCache
@@ -40,8 +43,10 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         topology = build_attention_topology(self.config)[
             : self.config.num_hidden_layers
         ]
+        speculative = model_runner.config.speculative_config
+        num_drafts = 0 if speculative is None else speculative.num_speculative_tokens
         self.geometry = V41PoolGeometry(
-            len(topology),
+            len(topology) + (self.config.num_nextn_predict_layers if num_drafts else 0),
             tuple(
                 (spec.layer_id, spec.ratio)
                 for spec in topology
@@ -53,8 +58,14 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             self.config.index_head_dim,
             self.config.engram_max_ngram_size - 1,
             packed=model_runner.config.kv_cache_dtype == "fp4",
+            speculative_tokens=num_drafts,
         )
         self.cache = self.copies = self.engram = None
+        # DIAGNOSTIC179: see the snapshot module. Returns None unless
+        # ATOM_DSPARK_CACHE_SNAPSHOT is set, so production builds nothing.
+        self._cache_snapshot = CacheVisibilitySnapshot.from_env(
+            torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        )
         self.dummy_weights = bool(model_runner.config.load_dummy)
         if not self.dummy_weights and self.config.engram_layer_ids:
             self.engram = EngramInputPreparer.from_checkpoint(
@@ -114,7 +125,15 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             self.engram = None
         self.release_kv_pools()
 
-    def _prepare(self, batch, running_bs, running_tokens):
+    def _prepare(
+        self,
+        batch,
+        running_bs,
+        running_tokens,
+        *,
+        tentative=False,
+        start_positions=None,
+    ):
         spans, offset, next_page = [], 0, 0
         slots = batch.state_slots_committed
         if not batch.is_dummy_run and len(slots) != batch.total_seqs_num:
@@ -134,7 +153,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 next_page += count
                 slot = len(spans)
             else:
-                position = end - length
+                position = (
+                    end - length if start_positions is None else int(start_positions[i])
+                )
                 blocks = tuple(batch.block_tables[i])
                 slot = slots[i]
             spans.append(
@@ -152,7 +173,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         )
         if cache is None:
             raise RuntimeError("CSA2 cache must be allocated before serving")
-        step = cache.begin_step(spans)
+        step = cache.begin_step(
+            spans, tentative=tentative and not batch.is_dummy_run and bool(spans)
+        )
         positions = self.model_runner.forward_vars["positions"]
         positions.gpu[:offset].copy_(step.positions)
         positions.gpu[offset:running_tokens].zero_()
@@ -191,20 +214,44 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         return self._prepare(batch, running_bs, batch.total_tokens_num)
 
     def prepare_decode(self, batch, running_bs, running_tokens, max_seqlen_q):
-        return self._prepare(batch, running_bs, running_tokens)
+        starts = None
+        if self.geometry.speculative_tokens and not batch.is_dummy_run:
+            # The scheduler reserves a full draft span, including placeholders
+            # from the previous step. Ragged verification takes its head.
+            starts = np.asarray(batch.context_lens) - (batch.num_spec_step + 1)
+            rejected = self.model_runner.tokenID_processor.num_rejected
+            if rejected is not None:
+                starts = starts - rejected
+        return self._prepare(
+            batch,
+            running_bs,
+            running_tokens,
+            tentative=bool(self.geometry.speculative_tokens),
+            start_positions=starts,
+        )
 
     def prepare_model_inputs(self, input_ids, metadata):
         step, cache = metadata.step, metadata.cache
+        # DIAGNOSTIC179: the cache still holds only committed state here, so this
+        # is the one point a DSpark run and a baseline run can be compared.
+        # Off unless ATOM_DSPARK_CACHE_SNAPSHOT is set. Revert before any
+        # acceptance run: grep -rn DIAGNOSTIC179 atom/
+        if self._cache_snapshot is not None and not metadata.dummy:
+            self._cache_snapshot.capture(cache, step, step.block_tables)
         histories = cache.prepare_state(step)
         tokens = input_ids[: step.length]
         if self.engram is not None:
-            embeddings, histories = self.engram.prepare(
+            prepared = self.engram.prepare(
                 step.requests,
                 tokens,
                 histories,
                 dummy=metadata.dummy,
                 token_mask=metadata.token_mask,
             )
+            embeddings, histories = prepared.embeddings, prepared.histories
+            if cache.pending is not None:
+                for span, compressed in zip(step.requests, prepared.compressed_rows):
+                    cache.pending.stage_history(span, compressed)
         else:
             width = (
                 (self.config.engram_max_ngram_size - 1)
@@ -217,31 +264,46 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 )
                 for layer in self.config.engram_layer_ids
             }
+            if cache.pending is not None:
+                for span in step.requests:
+                    cache.pending.stage_history(span, [-1] * span.length)
         metadata.engram_embeddings = embeddings
         metadata.next_histories = histories
 
-    def build_for_cudagraph_capture(self, bs):
+    def commit_speculative_state(self, metadata, last_token_indices):
+        if metadata.cache.pending is not None:
+            counts = last_token_indices - metadata.step.cu_seqlens_q[:-1] + 1
+            metadata.cache.commit_tentative(counts)
+
+    def build_for_cudagraph_capture(self, bs, max_q_len=1):
         # Only pure dense stages are captured. All attention warmup uses a
         # private PAGE/STATE allocation and can never alter live requests.
+        if bs < 1 or max_q_len < 1 or bs * max_q_len > self.max_num_batched_tokens:
+            raise ValueError("CSA2 capture shape exceeds the token buffer")
+        tokens = bs * max_q_len
         batch = SimpleNamespace(
             is_dummy_run=True,
             req_ids=tuple(range(bs)),
-            num_scheduled_tokens=(1,) * bs,
-            context_lens=(1,) * bs,
+            num_scheduled_tokens=(max_q_len,) * bs,
+            context_lens=(max_q_len,) * bs,
             state_slots_committed=(),
             total_seqs_num=bs,
-            total_tokens_num=bs,
+            total_tokens_num=tokens,
         )
-        metadata, positions = self._prepare(batch, bs, bs)
+        cu = self.model_runner.forward_vars["cu_seqlens_q"].gpu
+        cu[: bs + 1].copy_(
+            torch.arange(bs + 1, device=self.device, dtype=cu.dtype) * max_q_len
+        )
+        metadata, positions = self._prepare(batch, bs, tokens)
         self.prepare_model_inputs(
-            self.model_runner.forward_vars["input_ids"].gpu[:bs], metadata
+            self.model_runner.forward_vars["input_ids"].gpu[:tokens], metadata
         )
         return metadata, Context(
             positions=positions,
             is_prefill=False,
             is_dummy_run=True,
             scheduled_bs=bs,
-            scheduled_tokens=bs,
+            scheduled_tokens=tokens,
             running_bs=bs,
-            running_tokens=bs,
+            running_tokens=tokens,
         )

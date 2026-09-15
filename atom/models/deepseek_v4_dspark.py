@@ -1125,6 +1125,11 @@ class DeepseekV4DSpark(DSparkDraftModel):
         for layer in self.model.layers:
             layer.reset_kv_cache(max_num_seqs, device, dtype)
 
+    def prepare_block(self, metadata_builder, num_draft, scheduled_bs, running_bs):
+        self.model.index_buffers(
+            num_draft, int(self.window_size), metadata_builder.row_ids.device
+        ).mask_pad_tail(metadata_builder.row_ids, scheduled_bs, running_bs)
+
     # ---- drafting entry points (called by the proposer) --------------------
 
     def project_context(self, aux_concat: torch.Tensor) -> torch.Tensor:

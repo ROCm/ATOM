@@ -1,23 +1,28 @@
 # SPDX-License-Identifier: MIT
 """Full-layer eager text backbone. Checkpoint I/O and request preparation live outside."""
 
+from typing import ClassVar
+
 import torch
 import torch.nn.functional as F
 from aiter.dist.parallel_state import get_tp_group
-from torch import nn
-
 from atom.model_ops.attentions.deepseek_v41_state import EagerAttentionCache
 from atom.model_ops.deepseek_v41.mhc import (
     SinglePassHCState,
     expand_residual,
-    predict_mixes,
 )
+from atom.model_ops.deepseek_v41.mhc_pre_delayed import pre_delayed
 from atom.model_ops.deepseek_v41.normalization import RMSNorm
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
-from atom.model_ops.embed_head import VocabParallelEmbedding
 from atom.model_ops.engram_layer import EngramOp
+from torch import nn
+
+from atom.model_loader.weight_names import WeightsMapper
+from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm as FusedRMSNorm
 from atom.model_ops.linear import ReplicatedLinear
+from atom.model_ops.moe import FusedMoE
+from atom.models.deepseek_v4 import DeepseekV4ForCausalLM
 
 from .attention import Attention
 from .config import build_attention_topology
@@ -25,16 +30,19 @@ from .layers import native_quant_config
 from .moe import MoE
 
 
-class LogitsHead(nn.Module):
+class LogitsHead(ParallelLMHead):
+    """Vocab-parallel head, projecting in FP32.
+
+    Inherits from `ParallelLMHead` for the same reason V4's `ParallelHead` does:
+    the vocab-axis sharding and its `weight_loader` come with it. Hand-rolling
+    the parameter leaves the loader with no way to shard it -- the flat
+    rank-major slice holds the right values but is one-dimensional, so it cannot
+    be copied into a `[vocab/tp, hidden]` destination.
+    """
+
     def __init__(self, hidden_size, vocab_size):
-        super().__init__()
+        super().__init__(vocab_size, hidden_size, bias=False)
         self.group = get_tp_group()
-        self.weight = nn.Parameter(
-            torch.empty(
-                vocab_size // self.group.world_size, hidden_size, dtype=torch.bfloat16
-            ),
-            requires_grad=False,
-        )
         self.register_buffer("fp32_weight", None, persistent=False)
 
     def process_weights_after_loading(self):
@@ -52,16 +60,24 @@ class LogitsHead(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config, spec):
+    attention_cls = Attention
+
+    def __init__(self, config, spec, prefix: str = ""):
         super().__init__()
-        self.attn = Attention(config, spec)
-        self.ffn = MoE(config)
+        self.attn = self.attention_cls(config, spec)
+        # FusedMoE names its parameters from this prefix, so it has to match the
+        # checkpoint layout `weights.py` declares: `layers.N` / `mtp.N`.
+        self.ffn = MoE(config, spec.layer_id, prefix=f"{prefix}.ffn")
         self.attn_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.ffn_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        # `post_mult` is the 2.0 in the post gate's `2 * sigmoid(...)`, which
+        # the AITER stages take as a parameter where the torch body has it
+        # written in.
         self.hc_options = {
-            "norm_eps": config.rms_norm_eps,
-            "sinkhorn_eps": config.hc_eps,
+            "rms_eps": config.rms_norm_eps,
+            "hc_eps": config.hc_eps,
             "sinkhorn_iters": config.hc_sinkhorn_iters,
+            "post_mult": 2.0,
         }
         hc = config.hc_mult
         for sublayer in ("attn", "ffn"):
@@ -104,27 +120,32 @@ class Block(nn.Module):
                 embeddings,
                 None if image_mask is None else ~image_mask,
             )
-        state = SinglePassHCState(residual, pre_mix)
-        pre, post, comb = predict_mixes(
+        residual, hidden, pre, post, comb = pre_delayed(
             residual,
+            pre_mix,
             self.hc_attn_fn,
             self.hc_attn_scale,
             self.hc_attn_base,
             **self.hc_options,
         )
-        return self.attn_norm(state.collapse()), residual, pre, post, comb
+        return self.attn_norm(hidden), residual, pre, post, comb
 
     def prepare_ffn(self, output, residual, pre, post, comb):
-        residual = expand_residual(output, residual, post, comb)
-        state = SinglePassHCState(residual, pre)
-        pre, post, comb = predict_mixes(
+        # The attention post folds into this pre, which is the shape the seam
+        # has: AITER computes the new residual and projects it in one kernel,
+        # and drops back to the two when its own heuristic says to.
+        residual, hidden, pre, post, comb = pre_delayed(
             residual,
+            pre,
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
             **self.hc_options,
+            sublayer_output=output,
+            post_mix=post,
+            combination=comb,
         )
-        return self.ffn_norm(state.collapse()), residual, pre, post, comb
+        return self.ffn_norm(hidden), residual, pre, post, comb
 
     def decode_ffn(self, hidden, image_mask):
         return (self.ffn(hidden, image_mask),)
@@ -166,7 +187,7 @@ class Block(nn.Module):
             post,
             comb,
         )
-        if step.decode and self.ffn.can_capture(hidden.shape[0] * hidden.shape[1]):
+        if step.decode:
             (output,) = run(self.decode_ffn, hidden, image_mask)
         else:
             output = self.ffn(hidden, image_mask)
@@ -182,6 +203,26 @@ class DeepseekV41ForCausalLM(nn.Module):
     and a paged cache. The offline caller supplies its own private cache.
     """
 
+    # Disk-name -> param-name rules for `atom.model_loader.loader.load_model`.
+    # V4's two tables carry over as they are; V4.1 needs one rename V4's
+    # substring dict cannot express safely, and one tensor class that is not a
+    # parameter at all:
+    # - `.gate.bias` must be suffix-anchored. V4.1 ships a second routing bias
+    #   `.gate.bias_vl` for image sentinel tokens, and a substring rule renames
+    #   it to a parameter that does not exist.
+    # - Engram embedding tables are host-owned mmap resources loaded by
+    #   `model_loader.deepseek_v41.engram_tables`; mapping them to None drops
+    #   them here instead of reporting them as unroutable.
+    weights_mapper = WeightsMapper(
+        orig_to_new_substr={".engram.embed.": None},
+        orig_to_new_suffix={".gate.bias": ".gate.e_score_correction_bias"},
+    )
+    weights_mapping: ClassVar[dict[str, str]] = {".scale": ".weight_scale_inv"}
+    packed_modules_mapping: ClassVar[dict[str, tuple[str, int]]] = {
+        "shared_experts.w1": ("shared_experts.gate_up_proj", 0),
+        "shared_experts.w3": ("shared_experts.gate_up_proj", 1),
+    }
+
     def __init__(self, config, *, max_length):
         super().__init__()
         group = get_tp_group()
@@ -191,7 +232,10 @@ class DeepseekV41ForCausalLM(nn.Module):
         self.config, self.max_length = config, max_length
         self.topology = build_attention_topology(config)[: config.num_hidden_layers]
         self.embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList(Block(config, spec) for spec in self.topology)
+        self.layers = nn.ModuleList(
+            Block(config, spec, prefix=f"layers.{spec.layer_id}")
+            for spec in self.topology
+        )
         # Final normalization feeds the FP32 logits projection, with no further
         # activation quantization. Reuse V4's fused RMSNorm at this boundary.
         self.norm = FusedRMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -219,11 +263,42 @@ class DeepseekV41ForCausalLM(nn.Module):
             self.embed.weight.device,
         )
 
-    @torch.no_grad()
-    def process_weights_after_loading(self):
-        for module in self.modules():
-            if module is not self and hasattr(module, "process_weights_after_loading"):
-                module.process_weights_after_loading()
+    @property
+    def model(self):
+        """V4 keeps its backbone under `self.model`; here the class is it.
+
+        The only indirection the borrowed V4 attributes reach through, which
+        is what lets them be used verbatim rather than copied. A property, not
+        a submodule, so parameter traversal does not recurse.
+        """
+        return self
+
+    load_weights = DeepseekV4ForCausalLM.load_weights
+
+    # Whether the shared expert went into the routed buffer is a per-layer
+    # fact, so V4 reads it off a built layer rather than off a global flag.
+    # That reaches the layers through `self.model`, so it applies here as is.
+    disable_fused_shared_loading = DeepseekV4ForCausalLM.disable_fused_shared_loading
+
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        """(param_name, weight_name, expert_id, shard_id) for FusedMoE.
+
+        V4.1 names its routed experts as V4 does, `ffn.experts.{e}.w{1,2,3}`.
+        The count is the one thing to get right: a fused shared expert takes a
+        slot of its own at `n_routed_experts`, and a mapping that is one short
+        leaves it uninitialized while one that is too long mis-loads every
+        expert. Both this and the rename above answer that from the same
+        property, so the mapping cannot disagree with the names it is given.
+        """
+        shared = (
+            0 if self.disable_fused_shared_loading else self.config.n_shared_experts
+        )
+        return FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="w1",
+            ckpt_down_proj_name="w2",
+            ckpt_up_proj_name="w3",
+            num_experts=self.config.n_routed_experts + shared,
+        )
 
     def forward_hidden(
         self,

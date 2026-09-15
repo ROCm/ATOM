@@ -14,7 +14,12 @@ from .multimodal import DeepseekV41MultimodalModel
 
 
 class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
-    checkpoint_loader = "atom.model_loader.deepseek_v41.load_checkpoint"
+    # No `checkpoint_loader`: V4.1 loads through the shared path, the way V4
+    # does, so the renames, the packed projections and the expert mapping are
+    # declared once as tables on `DeepseekV41ForCausalLM` and inherited here
+    # rather than restated per model. Engram's mmap tables still come from
+    # `model_loader.deepseek_v41.engram_tables`, which `engram_runtime` imports
+    # directly and does not route through here.
 
     def __init__(self, config):
         super().__init__(config.hf_config, max_length=config.max_model_len)

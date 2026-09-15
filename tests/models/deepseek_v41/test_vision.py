@@ -9,12 +9,6 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from PIL import Image
-from transformers import AutoTokenizer
-
-from atom.config import get_hf_config
-from atom.entrypoints.openai.chat_encoders import load_custom_message_encoder
-from atom.model_engine.multimodal import embedding_indices, multimodal_cache_seed
 from atom.models.deepseek_v41.image_processing import (
     DeepseekV41ImageProcessor,
     image_token_types,
@@ -27,6 +21,12 @@ from atom.models.deepseek_v41.weights import (
     build_weight_manifest,
     checkpoint_schema,
 )
+from PIL import Image
+from transformers import AutoTokenizer
+
+from atom.config import get_hf_config
+from atom.entrypoints.openai.chat_encoders import load_custom_message_encoder
+from atom.model_engine.multimodal import embedding_indices, multimodal_cache_seed
 
 from .reference import FIXTURES
 
@@ -145,11 +145,18 @@ def test_real_vision_checkpoint_matches_reference(reference):
             )
         expected_vision = official.ViT(args).to(torch.bfloat16)
         expected_aligner = official.Aligner(args).to(torch.bfloat16)
+    # Copied here rather than through `load_model`, which would want the whole
+    # checkpoint and a model to put it in. The vision scope is unquantized,
+    # untiled BF16 whose schema names are the module names, so reading the
+    # slice and copying it is the entire operation; the set comparison is what
+    # keeps that from silently covering less than the stub declares.
     schema = checkpoint_schema(config)
+    manifest = build_weight_manifest(schema, scopes=("vision",))
+    parameters = dict(target.named_parameters())
+    assert parameters.keys() == {entry.target for entry in manifest}
     with CheckpointReader(os.environ["ATOM_DSV41_REFERENCE"], schema) as reader:
-        reader.load_parameters(
-            target, build_weight_manifest(schema, scopes=("vision",))
-        )
+        for entry in manifest:
+            parameters[entry.target].data.copy_(reader.read(entry))
     expected_vision.load_state_dict(target.vision.state_dict())
     expected_aligner.load_state_dict(target.aligner.state_dict())
     images = [Image.new("RGB", (315, 224), "red"), Image.new("RGB", (111, 333), "blue")]

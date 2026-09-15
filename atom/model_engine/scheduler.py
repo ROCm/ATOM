@@ -2359,11 +2359,10 @@ class Scheduler:
             return False
         self.total_preemptions += 1
         seq.status = SequenceStatus.WAITING
-        # Strip placeholder + rejected draft tokens added by postprocess.
-        # Real token count = seq.num_tokens - mtp_k - num_rejected
-        # (same formula as postprocess line: num_tokens = seq.num_tokens - self.mtp_k - num_rejected)
+        # Only replay host-finalized IDs. The newest deferred anchor is still
+        # a placeholder here, even when no draft was rejected.
         if self.spec_decode_local and self.mtp_k > 0:
-            strip = self.mtp_k + seq.num_rejected
+            strip = seq.num_tokens - seq.num_finalized_tokens
             if strip > 0:
                 del seq.token_ids[-strip:]
                 del seq.output_tokens[-strip:]
@@ -2502,6 +2501,7 @@ class Scheduler:
                 if seq is not None and "embedding_spans" in data:
                     seq.multimodal_cache_ready = True
         num_prefill = int(getattr(batch, "total_seqs_num_prefill", 0))
+        prefill_ids = set(batch.req_ids[:num_prefill]) if num_prefill else set()
         if self._connector_flag("is_offload") and num_prefill:
             for req_id in batch.req_ids[:num_prefill]:
                 seq = running_by_id.get(req_id)
@@ -2584,6 +2584,11 @@ class Scheduler:
             # Update the running status
             idx = fwd_output.get_idx(seq.id)
             if idx is None:
+                continue
+            # An immediate preempt/resume can retain the same request ID in
+            # the runner's deferred output. That result belongs to execution
+            # before this prefill and must not advance the replayed request.
+            if is_deferred_out and seq.id in prefill_ids:
                 continue
             # Partial prefill: KV written but prefill not complete — discard
             # the sampled token. Prefix hashes are also deferred since
@@ -2810,6 +2815,7 @@ class Scheduler:
             # Record TTFT from the finalized retained length, after rejected
             # speculative tokens and cap/stop overflow have been removed. A
             # terminal response with no completion tokens must keep TTFT zero.
+            seq.num_finalized_tokens = num_tokens
             if num_tokens - seq.num_prompt_tokens >= 1 and seq.first_token_time == 0.0:
                 seq.first_token_time = time.time()
 

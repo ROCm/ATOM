@@ -84,7 +84,7 @@ class EagerAttentionCache:
     def read_tail(self, owner, position):
         return self.tails.get(owner)
 
-    def write_tail(self, owner, tail):
+    def write_tail(self, owner, tail, *, rows=None):
         self.tails[owner] = tail
 
     def write_global(self, owner, begin, main, index):

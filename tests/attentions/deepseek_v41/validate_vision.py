@@ -7,13 +7,13 @@ import os
 from pathlib import Path
 
 import torch
+from atom.models.deepseek_v41.image_processing import DeepseekV41ImageProcessor
 from PIL import Image
 from transformers import AutoTokenizer
 
 from atom.config import CompilationConfig, Config, CUDAGraphMode
 from atom.entrypoints.openai.chat_encoders import load_custom_message_encoder
 from atom.model_engine.model_runner import ModelRunner
-from atom.models.deepseek_v41.image_processing import DeepseekV41ImageProcessor
 
 from .benchmark_runtime import run_case
 
@@ -23,7 +23,6 @@ def main():
     parser.add_argument("--model", default="/mnt/DeepSeek-V4.1-Flash")
     parser.add_argument("--output", required=True)
     parser.add_argument("--chunk-size", type=int, default=1024)
-    parser.add_argument("--expert-backend", choices=("eager", "aiter"), default="eager")
     args = parser.parse_args()
     rank, size = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     port = int(os.environ["MASTER_PORT"])
@@ -45,7 +44,6 @@ def main():
         enable_log_stats=False,
         port=port,
     )
-    config.hf_config.expert_backend = args.expert_backend
     config.parallel_config.data_parallel_base_port = port
     tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
     processor = DeepseekV41ImageProcessor(
@@ -55,7 +53,6 @@ def main():
     report = {
         "tp": size,
         "chunk_size": args.chunk_size,
-        "expert_backend": args.expert_backend,
         "cases": [],
     }
     try:

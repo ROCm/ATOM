@@ -6,10 +6,10 @@ non-near-tie differences below remain accepted limitations, not passes of the
 original thresholds. P05 paged runtime and lifecycle integration is complete; see
 `docs/deepseek_v41_runtime.md` for its separate acceptance results.
 
-The numerical and task results below describe `expert_backend="eager"`. The
-optional P09 AITER MoE backend has a separately measured, user-accepted precision
-change; see [the P09 report](deepseek_v41_performance.md). It does not inherit
-these task scores.
+The numerical and task results below were taken on the eager expert loop, which
+has since been replaced by V4's `FusedMoE`; see
+[the P09 report](deepseek_v41_performance.md). The current expert path does not
+inherit these task scores.
 
 V4 GPU inverse RoPE is integrated in `ce26bb149` at the user's explicit direction;
 `f9f8d419f` preserves empty-batch behavior without changing nonempty arithmetic.

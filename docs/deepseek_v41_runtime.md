@@ -110,15 +110,19 @@ kernels and inverse RoPE; the V4 files have no P09 modifications.
 `enforce_eager=False` and `CompilationConfig(level=0,
 cudagraph_mode=CUDAGraphMode.PIECEWISE)`. Only pure tensor stages are recorded;
 request metadata, compression, indexing and host Engram preparation remain
-outside capture. Set the HF override `expert_backend="aiter"` to use existing
-AITER A8W4 GEMMs for prefill and decode, with the user-accepted numerical change
-recorded in the P09 report. This also allows the decode FFN and its RCCL
-reductions to be captured. Expert intermediates are bounded to 512 tokens per
-chunk. `expert_backend="eager"` remains the default and preserves P05 arithmetic.
+outside capture. The decode FFN and its RCCL reductions are captured with the
+rest: the routed experts are V4's `FusedMoE`, which is capturable at every
+shape, so there is no expert backend to select and no capture exclusion.
 
 See [the P09 report](deepseek_v41_performance.md) for cache formats, graph
-ownership, comparison commands and measured limits. FULL graphs, torch.compile,
-speculative decoding, PP/CP/DP, TBO, KV transfer, plugin execution and EPLB remain
-rejected before loading. The [V4.1 chat/tool protocol](deepseek_v41_protocol.md)
-is enabled by P06; vision remains a separate milestone. Host Engram lookup still
-reads final GPU IDs on the CPU; HBM lookup and further fusion belong to P11.
+ownership, comparison commands and measured limits. Native five-token DSpark
+supports TP4 text requests with BF16 caches; target PIECEWISE graphs are
+optional. Its draft windows, accepted-prefix state, calibration and validated
+scope are documented in [the DSpark guide](deepseek_v41_dspark.md).
+Packed speculative caches and multimodal speculation are rejected. FULL graphs, torch.compile, PP/CP/DP, TBO, KV transfer,
+plugin execution and EPLB also remain rejected before loading.
+
+The [V4.1 chat/tool protocol](deepseek_v41_protocol.md) is enabled by P06.
+[Vision and multimodal chunking](deepseek_v41_vision.md) are enabled independently
+of speculation. Host Engram lookup still reads final GPU IDs on the CPU; HBM
+lookup and further fusion belong to P11.
