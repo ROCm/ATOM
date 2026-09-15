@@ -121,7 +121,9 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
 
         The tier's store/load threads copy PAGE units out of the KV pool. Draining
         first lets an in-flight transfer finish against a pool that is still
-        mapped; `shutdown` then joins the tier's own executors. Only after that
+        mapped; `shutdown` then joins the tier's store executor -- the only one
+        it still owns, since the load leg now runs inline on the KV load task.
+        Only after that
         does the base close its save/load pools. Guarded because the tier is
         `None` until `register_kv_caches` builds it (and stays `None` under PP or
         on a non-owning layout).
