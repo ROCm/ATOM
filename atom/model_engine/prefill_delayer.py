@@ -250,6 +250,21 @@ class PrefillDelayer:
             return 1
         return value
 
+    def protects_decode(self, running_decode_batch: int) -> bool:
+        """Whether the local decision can skip cache probes during protection."""
+        return (
+            self.cpu_group is None
+            and not self._first
+            and running_decode_batch > 0
+            and (
+                self._decode_interval_remaining > 0
+                or (
+                    self._prefill_executed_since_last_decision
+                    and self.prefill_decode_interval > 0
+                )
+            )
+        )
+
     def should_allow_prefill(
         self,
         prefillable: bool,
