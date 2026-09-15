@@ -41,12 +41,22 @@ from atom.plugin.prepare import _set_framework_backbone
 
 logger = logging.getLogger("atom")
 
+# vLLM 0.29 resolves the MTP draft of DSA-family targets (``deepseek_v32``,
+# ``glm_moe_dsa``, i.e. DeepSeek-V3.2 and GLM-5.x) to "DeepseekV32MTPModel";
+# 0.28 called the very same draft block "DeepSeekMTPModel". Both names map onto
+# ATOM's ``atom.models.deepseek_mtp:DeepSeekMTP``.
+_DEEPSEEK_MTP_ARCHES: set[str] = {
+    "DeepSeekMTPModel",
+    "DeepseekV32MTPModel",
+}
 _MTP_MASK_INPUT_ARCH: set[str] = {
     "DeepSeekMTPModel",
+    "DeepseekV32MTPModel",
     "Glm4MoeMTPModel",
 }
 _MTP_DRAFT_MODEL_ARCHES: set[str] = {
     "DeepSeekMTPModel",
+    "DeepseekV32MTPModel",
     "DeepSeekV4MTPModel",
     "DeepseekV4MTPModel",
     "Qwen3NextMTP",
@@ -148,6 +158,7 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "Glm4MoeForCausalLM": "atom.models.glm4_moe:Glm4MoeForCausalLM",
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2:GlmMoeDsaForCausalLM",
     "DeepSeekMTPModel": "atom.models.deepseek_mtp:DeepSeekMTP",
+    "DeepseekV32MTPModel": "atom.models.deepseek_mtp:DeepSeekMTP",
     "DeepSeekV4MTPModel": "atom.plugin.vllm.models.deepseek_v4_mtp:DeepseekV4MTP",
     "Glm4MoeMTPModel": "atom.models.glm4_moe_mtp:Glm4MoeMTP",
     "Qwen3NextForCausalLM": "atom.plugin.vllm.models.qwen3_next:Qwen3NextForCausalLM",
@@ -1009,7 +1020,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                     self._mtp_target_hidden_states = hidden_states
         else:
             if (
-                self.model_arch in {"Qwen3NextMTP", "DeepSeekMTPModel"}
+                self.model_arch in {"Qwen3NextMTP", *_DEEPSEEK_MTP_ARCHES}
                 and "spec_step_idx" not in model_kwargs
             ):
                 model_kwargs["spec_step_idx"] = (
@@ -1025,7 +1036,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         if not self.pp_group.is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
-        if self.model_arch == "DeepSeekMTPModel":
+        if self.model_arch in _DEEPSEEK_MTP_ARCHES:
             # vLLM's DeepSeek-MTP contract wants (sample_hidden, recycle_hidden).
             # DeepSeekMultiTokenPredictorLayer.forward already returns the
             # post-final-norm hidden, and compute_logits no longer re-norms, so
