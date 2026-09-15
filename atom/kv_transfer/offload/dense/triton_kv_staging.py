@@ -5,14 +5,32 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
 
 _BLOCK_BYTES = 1024
+
+# Warps per program.  A program moves BLOCK_BYTES of uint8, so this is really a
+# choice of bytes per lane: two warps puts 8 on a lane at BLOCK_BYTES=1024.
+# Packing the geometry the dense offload worker logs (296 segments, 23.0 MiB)
+# runs at 943 GB/s on two warps, 782 on four and 586 on eight; one warp drops
+# back to 720.  Nothing in these kernels reduces across lanes, so the warp count
+# moves throughput only.
+_NUM_WARPS = 2
+
+# A tile table is a pure function of (chunk block counts, segment sizes), and
+# both repeat across transfers, so the tables are memoised rather than rebuilt
+# per launch: building one for the geometry above costs more than the kernel it
+# feeds, a hit costs about a tenth of it.  Bounded because the entries are
+# device tensors -- sixteen of that geometry is a few MiB.
+_TILE_TABLE_CACHE_SIZE = 16
+_TILE_TABLE_CACHE: OrderedDict[tuple, tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
 
 
 @dataclass(frozen=True)
@@ -23,7 +41,8 @@ class _PreparedGroupMeta:
     block_ids: slice
     chunk_count: int
     total_bytes: int
-    max_tile_nbytes: int
+    tile_job: torch.Tensor
+    tile_pos: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -54,11 +73,14 @@ def _pack_chunk_major_kernel(
     chunk_block_offsets,
     chunk_output_bases,
     block_ids,
+    tile_job,
+    tile_pos,
     NUM_SEGMENTS: tl.constexpr,
     BLOCK_BYTES: tl.constexpr,
 ):
-    job = tl.program_id(0)
-    tile = tl.program_id(1)
+    pid = tl.program_id(0)
+    job = tl.load(tile_job + pid)
+    tile = tl.load(tile_pos + pid)
     chunk_id = job // NUM_SEGMENTS
     seg_id = job - chunk_id * NUM_SEGMENTS
 
@@ -101,11 +123,14 @@ def _unpack_chunk_major_kernel(
     chunk_block_offsets,
     chunk_output_bases,
     block_ids,
+    tile_job,
+    tile_pos,
     NUM_SEGMENTS: tl.constexpr,
     BLOCK_BYTES: tl.constexpr,
 ):
-    job = tl.program_id(0)
-    tile = tl.program_id(1)
+    pid = tl.program_id(0)
+    job = tl.load(tile_job + pid)
+    tile = tl.load(tile_pos + pid)
     chunk_id = job // NUM_SEGMENTS
     seg_id = job - chunk_id * NUM_SEGMENTS
 
@@ -140,6 +165,51 @@ def _unpack_chunk_major_kernel(
 
 def _device_i64(values: list[int], device: torch.device) -> torch.Tensor:
     return torch.tensor(values, dtype=torch.int64, device=device)
+
+
+def _tile_table(
+    chunk_block_counts: list[int],
+    segment_block_bytes: list[int],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map each flat program id to the (job, tile within job) it moves.
+
+    A job is one (chunk, segment) pair and owns ``count * segment_bytes`` bytes,
+    so jobs do not all want the same number of tiles.  The rectangular grid this
+    replaces gave every job the widest job's tile count and masked the surplus
+    off, which priced a launch by ``max(segment_block_bytes)`` rather than by the
+    bytes being staged -- segments registered alongside their scales are two
+    orders of magnitude apart, so most of that grid moved nothing.
+
+    Memoised on (counts, geometry, device); see ``_TILE_TABLE_CACHE_SIZE``.  A
+    miss costs one H2D upload -- both columns travel as one ``2 x tiles`` tensor
+    whose rows are contiguous -- so a new geometry adds one upload to the plan's
+    one, and a repeat adds none.  Both sequences must already be normalized to
+    ``int``: a hit is on the lookup path of every transfer, and coercing a
+    few hundred segment sizes on the way in costs more than the kernel saves.
+    """
+
+    key = (tuple(chunk_block_counts), tuple(segment_block_bytes), device)
+    cached = _TILE_TABLE_CACHE.get(key)
+    if cached is not None:
+        _TILE_TABLE_CACHE.move_to_end(key)
+        return cached
+
+    counts = np.asarray(key[0], dtype=np.int64)
+    seg_bytes = np.asarray(key[1], dtype=np.int64)
+    # Jobs in (chunk, segment) order, each wanting ceil(count * seg_bytes / tile).
+    tiles = -(-np.outer(counts, seg_bytes).ravel() // _BLOCK_BYTES)
+    starts = np.cumsum(tiles) - tiles
+    total = int(tiles.sum())
+    job_of_tile = np.repeat(np.arange(tiles.size, dtype=np.int64), tiles)
+    pos_in_job = np.arange(total, dtype=np.int64) - np.repeat(starts, tiles)
+    columns = torch.from_numpy(np.concatenate((job_of_tile, pos_in_job)))
+    columns = columns.to(device=device).view(2, total)
+    table = (columns[0], columns[1])
+    _TILE_TABLE_CACHE[key] = table
+    while len(_TILE_TABLE_CACHE) > _TILE_TABLE_CACHE_SIZE:
+        _TILE_TABLE_CACHE.popitem(last=False)
+    return table
 
 
 def _segment_meta_values(
@@ -183,14 +253,12 @@ def _group_meta_values(
     block_ids: Sequence[int],
     *,
     bytes_per_block: int,
-    max_segment_block_bytes: int,
-) -> tuple[list[int], list[int], list[int], list[int], int, int]:
+) -> tuple[list[int], list[int], list[int], list[int], int]:
     normalized_counts: list[int] = []
     chunk_block_offsets: list[int] = []
     chunk_output_bases: list[int] = []
     block_offset = 0
     byte_offset = 0
-    max_tile_nbytes = 0
     for count in chunk_block_counts:
         count = int(count)
         if count < 0:
@@ -200,7 +268,6 @@ def _group_meta_values(
         chunk_output_bases.append(byte_offset)
         block_offset += count
         byte_offset += count * bytes_per_block
-        max_tile_nbytes = max(max_tile_nbytes, count * max_segment_block_bytes)
     normalized_ids = [int(block_id) for block_id in block_ids]
     if len(normalized_ids) != block_offset:
         raise ValueError("block_ids length does not match chunk block counts")
@@ -210,7 +277,6 @@ def _group_meta_values(
         chunk_output_bases,
         normalized_ids,
         byte_offset,
-        max_tile_nbytes,
     )
 
 
@@ -239,7 +305,6 @@ def prepare_chunk_major_groups(
     segment_prefix_bytes = slice(2 * num_segments, 3 * num_segments)
     prepared_groups: list[_PreparedGroupMeta] = []
     has_block_ids = False
-    max_segment_block_bytes = max(normalized_block_bytes)
     for chunk_block_counts, block_ids in groups:
         (
             counts,
@@ -247,13 +312,12 @@ def prepare_chunk_major_groups(
             output_bases,
             normalized_ids,
             total_bytes,
-            max_tile_nbytes,
         ) = _group_meta_values(
             chunk_block_counts,
             block_ids,
             bytes_per_block=bytes_per_block,
-            max_segment_block_bytes=max_segment_block_bytes,
         )
+        tile_job, tile_pos = _tile_table(counts, normalized_block_bytes, device)
 
         count_start = len(values)
         values.extend(counts)
@@ -272,7 +336,8 @@ def prepare_chunk_major_groups(
                 block_ids=slice(ids_start, len(values)),
                 chunk_count=len(counts),
                 total_bytes=total_bytes,
-                max_tile_nbytes=max_tile_nbytes,
+                tile_job=tile_job,
+                tile_pos=tile_pos,
             )
         )
 
@@ -327,36 +392,39 @@ def _build_meta(
         segment_prefix_values.append(bytes_per_block)
         bytes_per_block += nb
 
+    normalized_block_bytes = [int(nb) for nb in segment_block_bytes]
+    normalized_counts: list[int] = []
     chunk_block_offsets: list[int] = []
     chunk_output_bases: list[int] = []
     block_offset = 0
     byte_offset = 0
-    max_tile_nbytes = 0
-    max_seg_bytes = max(int(nb) for nb in segment_block_bytes)
     for nblocks in chunk_block_counts:
         nblocks = int(nblocks)
         if nblocks < 0:
             raise ValueError("chunk block count must be non-negative")
+        normalized_counts.append(nblocks)
         chunk_block_offsets.append(block_offset)
         chunk_output_bases.append(byte_offset)
         block_offset += nblocks
         byte_offset += nblocks * bytes_per_block
-        max_tile_nbytes = max(max_tile_nbytes, nblocks * max_seg_bytes)
 
     if len(block_ids) != block_offset:
         raise ValueError("block_ids length does not match chunk block counts")
     if int(device_buf.numel()) < byte_offset:
         raise ValueError("device_buf is smaller than chunk-major staging output")
 
+    tile_job, tile_pos = _tile_table(normalized_counts, normalized_block_bytes, device)
     return (
         _device_i64(segment_ptr_values, device),
-        _device_i64([int(x) for x in segment_block_bytes], device),
+        _device_i64(normalized_block_bytes, device),
         _device_i64(segment_prefix_values, device),
-        _device_i64([int(x) for x in chunk_block_counts], device),
+        _device_i64(normalized_counts, device),
         _device_i64(chunk_block_offsets, device),
         _device_i64(chunk_output_bases, device),
         _device_i64([int(x) for x in block_ids], device),
-        torch.tensor([int(byte_offset), int(max_tile_nbytes)], dtype=torch.int64),
+        tile_job,
+        tile_pos,
+        int(byte_offset),
     )
 
 
@@ -393,7 +461,8 @@ def _prepared_launch_meta(
         metadata[group.chunk_offsets],
         metadata[group.output_bases],
         metadata[group.block_ids],
-        group,
+        group.tile_job,
+        group.tile_pos,
     )
 
 
@@ -413,12 +482,10 @@ def fused_pack_chunk_major_prepared(
         chunk_block_offsets,
         chunk_output_bases,
         block_ids,
-        group,
+        tile_job,
+        tile_pos,
     ) = launch
-    grid = (
-        group.chunk_count * prepared.num_segments,
-        triton.cdiv(group.max_tile_nbytes, _BLOCK_BYTES),
-    )
+    grid = (tile_job.numel(),)
     _pack_chunk_major_kernel[grid](
         device_buf,
         segment_ptrs,
@@ -428,9 +495,11 @@ def fused_pack_chunk_major_prepared(
         chunk_block_offsets,
         chunk_output_bases,
         block_ids,
+        tile_job,
+        tile_pos,
         NUM_SEGMENTS=prepared.num_segments,
         BLOCK_BYTES=_BLOCK_BYTES,
-        num_warps=8,
+        num_warps=_NUM_WARPS,
     )
 
 
@@ -450,12 +519,10 @@ def fused_unpack_chunk_major_prepared(
         chunk_block_offsets,
         chunk_output_bases,
         block_ids,
-        group,
+        tile_job,
+        tile_pos,
     ) = launch
-    grid = (
-        group.chunk_count * prepared.num_segments,
-        triton.cdiv(group.max_tile_nbytes, _BLOCK_BYTES),
-    )
+    grid = (tile_job.numel(),)
     _unpack_chunk_major_kernel[grid](
         device_buf,
         segment_ptrs,
@@ -465,9 +532,11 @@ def fused_unpack_chunk_major_prepared(
         chunk_block_offsets,
         chunk_output_bases,
         block_ids,
+        tile_job,
+        tile_pos,
         NUM_SEGMENTS=prepared.num_segments,
         BLOCK_BYTES=_BLOCK_BYTES,
-        num_warps=8,
+        num_warps=_NUM_WARPS,
     )
 
 
@@ -486,7 +555,9 @@ def fused_pack_chunk_major(
         chunk_block_offsets,
         chunk_output_bases,
         block_ids_t,
-        sizes,
+        tile_job,
+        tile_pos,
+        total_bytes,
     ) = _build_meta(
         segment_tensors,
         segment_block_bytes,
@@ -494,12 +565,9 @@ def fused_pack_chunk_major(
         block_ids,
         device_buf,
     )
-    if int(sizes[0].item()) == 0:
+    if total_bytes == 0:
         return
-    grid = (
-        len(chunk_block_counts) * len(segment_tensors),
-        triton.cdiv(int(sizes[1].item()), _BLOCK_BYTES),
-    )
+    grid = (tile_job.numel(),)
     _pack_chunk_major_kernel[grid](
         device_buf,
         segment_ptrs,
@@ -509,9 +577,11 @@ def fused_pack_chunk_major(
         chunk_block_offsets,
         chunk_output_bases,
         block_ids_t,
+        tile_job,
+        tile_pos,
         NUM_SEGMENTS=len(segment_tensors),
         BLOCK_BYTES=_BLOCK_BYTES,
-        num_warps=8,
+        num_warps=_NUM_WARPS,
     )
 
 
@@ -530,7 +600,9 @@ def fused_unpack_chunk_major(
         chunk_block_offsets,
         chunk_output_bases,
         block_ids_t,
-        sizes,
+        tile_job,
+        tile_pos,
+        total_bytes,
     ) = _build_meta(
         segment_tensors,
         segment_block_bytes,
@@ -538,12 +610,9 @@ def fused_unpack_chunk_major(
         block_ids,
         device_buf,
     )
-    if int(sizes[0].item()) == 0:
+    if total_bytes == 0:
         return
-    grid = (
-        len(chunk_block_counts) * len(segment_tensors),
-        triton.cdiv(int(sizes[1].item()), _BLOCK_BYTES),
-    )
+    grid = (tile_job.numel(),)
     _unpack_chunk_major_kernel[grid](
         device_buf,
         segment_ptrs,
@@ -553,7 +622,9 @@ def fused_unpack_chunk_major(
         chunk_block_offsets,
         chunk_output_bases,
         block_ids_t,
+        tile_job,
+        tile_pos,
         NUM_SEGMENTS=len(segment_tensors),
         BLOCK_BYTES=_BLOCK_BYTES,
-        num_warps=8,
+        num_warps=_NUM_WARPS,
     )

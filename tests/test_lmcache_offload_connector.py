@@ -4550,6 +4550,47 @@ def test_codec_mla_token_major_block_accounting():
         )
 
 
+def test_codec_reports_segment_geometry_in_staging_order():
+    """The pack grid is priced by this list, so it has to be readable.
+
+    The rectangular grid took its tile count from the widest segment, which
+    made max_segment_bytes -- not bytes_per_block -- the number that set the
+    kernel's cost. It was not logged, so a benchmark reconstructed it from the
+    model config, guessed one segment 30x too wide, and measured a speedup for
+    a geometry the server never ran.
+    """
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    num_blocks = 4
+    kv_caches = {
+        "l0": SimpleNamespace(
+            k_cache=torch.zeros(num_blocks, 8, dtype=torch.uint8),
+            v_cache=torch.zeros(num_blocks, 8, dtype=torch.uint8),
+            k_scale=torch.zeros(num_blocks, 1, dtype=torch.uint8),
+            v_scale=torch.zeros(num_blocks, 1, dtype=torch.uint8),
+        ),
+        "l1": SimpleNamespace(
+            k_cache=torch.zeros(num_blocks, 32, dtype=torch.uint8),
+            v_cache=None,
+            k_scale=None,
+            v_scale=None,
+        ),
+    }
+    codec = DenseKVByteCodec(kv_caches, num_blocks=num_blocks)
+
+    # Staging order, one entry per movable tensor, None-valued slots skipped.
+    assert codec.segment_block_bytes == [8, 8, 1, 1, 32]
+    assert sum(codec.segment_block_bytes) == codec.bytes_per_block
+    assert max(codec.segment_block_bytes) == 32
+
+    # A copy: reading the geometry must not let a caller reshape it.
+    codec.segment_block_bytes.append(999)
+    assert codec.segment_block_bytes == [8, 8, 1, 1, 32]
+
+
 def test_codec_mla_round_trip_byte_identical():
     import torch
 

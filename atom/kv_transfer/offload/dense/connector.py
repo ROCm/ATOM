@@ -147,14 +147,27 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             logger.warning("LMCache offload: lookup server not started: %s", e)
 
         gpu_connector = self._engine.gpu_connector
+        # The staging kernels are priced by the segment list, not by the block
+        # size: the pack grid used to take its tile count from the widest
+        # segment, so max_segment_bytes set the cost of every segment. Twice
+        # now a benchmark has reconstructed this geometry from the model config
+        # instead of reading it and got it wrong -- once 30x too wide (which
+        # reported a 41x speedup for a change worth under 2x), once 2x too wide
+        # because kv-split registers K and V as separate segments. Log what the
+        # codec actually holds so the next person measures the real thing.
+        seg_bytes = self._codec.segment_block_bytes
         logger.info(
             "LMCache offload worker rank=%d: bytes_per_block=%d chunk=%d "
+            "segments=%d max_segment_bytes=%d min_segment_bytes=%d "
             "gpu_staging_chunk_bytes=%d gpu_staging_buffer_chunks=%d "
             "gpu_staging_buffer_bytes=%d release_gpu_staging=%s "
             "save=%s load=%s",
             rank,
             self._codec.bytes_per_block,
             self.chunk_size,
+            len(seg_bytes),
+            max(seg_bytes),
+            min(seg_bytes),
             gpu_connector.gpu_staging_chunk_bytes,
             gpu_connector.gpu_staging_buffer_chunks,
             gpu_connector.gpu_staging_buffer_bytes,
