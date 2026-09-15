@@ -318,7 +318,14 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         # ATOM only needs the manager for the builder's chunked-prefill KV
         # gather; its own decode paths do not call the manager.
         if dcp_size > 1 and getattr(self, "dcp_manager", None) is None:
-            from vllm.v1.attention.ops.dcp_utils import MLADCPManager
+            # vLLM 0.29 folded `v1/attention/ops/dcp_utils.py` into
+            # `v1/attention/ops/dcp.py`; the class is otherwise unchanged.
+            # The builder asserts `isinstance(..., MLADCPManager)`, so the
+            # manager has to come from whichever module vLLM itself uses.
+            try:
+                from vllm.v1.attention.ops.dcp import MLADCPManager
+            except ImportError:  # vLLM <= 0.28
+                from vllm.v1.attention.ops.dcp_utils import MLADCPManager
 
             self.dcp_manager = MLADCPManager(
                 vllm_config=vllm_config,
@@ -350,18 +357,98 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
     def get_attn_backend(self):
         return self.attn_backend
 
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        """Drop 0.29's head slot so every consumer below sees 0.28's page.
+
+        vLLM 0.29 views each layer's cache as `[B, H, N, C]` (RFC #42082) where
+        0.28 handed MLA a three-dimensional page, and upstream absorbs that by
+        squeezing `H` once at the bind point -- in `MLAAttention.bind_kv_cache`
+        and, word for word, in its own K3 MLA layer. Three dimensions is
+        upstream's standing contract for an MLA layer, so restoring it here is
+        parity, not a detour. ATOM's MLA layer derives from
+        `AttentionLayerBase`, whose default binds the view as-is, so without
+        this override the extra dimension reaches every consumer in this file --
+        and `ops.py` hands them `layer.kv_cache` verbatim, so the drafter's
+        context-row write sees it too. Two of them assert on the shape
+        (`concat_and_cache_mla_rope_fused` checks `size(2)` and then
+        `dim() == 3`, `aiter.concat_and_cache_mla` checks `size(2)` alone) and
+        the chunked-context gathers read `size(1)` as the block size, so
+        normalise once here rather than at each call site.
+        """
+        if kv_cache.dim() == 4 and kv_cache.shape[1] == 1:
+            # [B, H=1, N, C] -> [B, N, C]. The guard is not defensive padding
+            # and is not there merely to pass a 0.28-shaped page through: both
+            # upstream copies squeeze unconditionally, which on a three-
+            # dimensional `[B, N, C]` page with `N == 1` -- exactly MLA's kernel
+            # block size -- would eat the block dimension and destroy the page.
+            # Upstream never sees such a page under 0.29; this layer can. Do not
+            # drop the guard to match upstream. It also leaves a future spec
+            # that publishes more than one head slot for the consumer to
+            # interpret.
+            kv_cache = kv_cache.squeeze(1)
+        super().bind_kv_cache(kv_cache)
+
+    def _as_atom_page(self, kv_cache: torch.Tensor) -> torch.Tensor:
+        """Present a vLLM page as ATOM's `[num_blocks, block_size, entry]`.
+
+        Every kernel this file hands a page to is written against the
+        three-dimensional page vLLM produced through 0.28; `aiter` asserts
+        `size(2) == kv_lora_rank + pe_dim` and
+        `ops.concat_and_cache_mla_rope_fused` asserts `dim() == 3` outright.
+        0.29 views each layer's cache as `[B, H, N, C]` (RFC #42082), so the
+        head slot has to go before the crossing. `bind_kv_cache` above already
+        drops it, which is what actually normalises the rank; this is the same
+        rule restated at the four points where a page crosses out of this file,
+        so each crossing states its own precondition rather than inheriting one.
+
+        A single head slot is what makes the fold a reinterpretation. A spec
+        that published K and V as two slots would fold into twice as many block
+        rows, head-major for a `[B, H, N, C]` layout -- the second slot's rows
+        would read as block indices past the end of the first, addressing
+        garbage rather than failing. Such a page is passed through
+        four-dimensional instead, so the kernels' own rank assertions fire.
+
+        Before `de5ce82a1` these four sites folded unconditionally, and that is
+        why the sparse cells stayed green without the bind-point squeeze: for
+        `H == 1` an unconditional fold is accidentally correct. It is not
+        evidence that the rule was ever checked.
+
+        Merging four sites into one means choosing an admission set, and the
+        strictest of the four is the one to keep. `dim() != 4 or shape[1] == 1`
+        -- the union -- agrees with this on every page the system can produce,
+        but it also folds pages that are malformed rather than merely
+        differently shaped: a rank-2 page, a rank-5 page, and a rank-3 page with
+        the wrong entry width all become something that satisfies the kernels'
+        own checks instead of tripping them. `[B, N, 2C]` is the sharp one --
+        it would arrive as `[B, 2N, C]`, the same silent head-major
+        concatenation this guard exists to prevent, one axis over. The
+        condition below is word for word the one `bind_kv_cache` uses, which is
+        the point: one rule, stated at both kinds of crossing.
+        """
+        if kv_cache.dim() == 4 and kv_cache.shape[1] == 1:
+            kv_cache = kv_cache.view(
+                kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
+            )
+        return kv_cache
+
     def write_context_kv_latent(self, kv_cache: torch.Tensor, *args, **kwargs) -> None:
-        """Store context rows, reinterpreting vLLM's fp8 cache as fp8.
+        """Store context rows, as ATOM's own page and reinterpreted as fp8.
 
         vLLM allocates the fp8 cache as uint8 where native ATOM allocates fp8,
         and the Triton store reads its element type off the pointer: handed raw
         bytes it converts each value to an integer instead of writing the fp8 bit
         pattern, and only draft acceptance shows it.
+
+        This is also one of four places a vLLM-owned page crosses out of this
+        file into a kernel written against `[num_blocks, block_size, entry]`,
+        so it goes through `_as_atom_page` like the other three rather than
+        relying on `bind_kv_cache` having normalised the rank already.
         """
         if self.kv_cache_dtype.startswith("fp8") and kv_cache.dtype == torch.uint8:
             from vllm.platforms import current_platform
 
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
+        kv_cache = self._as_atom_page(kv_cache)
         return MLAAttention.write_context_kv_latent(self, kv_cache, *args, **kwargs)
 
     def process_weights_after_loading(
@@ -1096,7 +1183,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                     aiter.concat_and_cache_mla(
                         k_c_normed,
                         k_pe.squeeze(1),
-                        kv_cache,
+                        self._as_atom_page(kv_cache),
                         attn_metadata.slot_mapping.flatten(),
                         kv_cache_dtype=self.kv_cache_dtype,
                         scale=self._k_scale,
@@ -1189,11 +1276,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                     decode_q_pe,
                     k_c_normed,
                     k_pe.squeeze(1),
-                    kv_cache.view(
-                        kv_cache.shape[0],
-                        -1,
-                        self.kv_lora_rank + self.qk_rope_head_dim,
-                    ),
+                    self._as_atom_page(kv_cache),
                     decode_q[:, : self.num_heads] if fused_q_head_pad else decode_q,
                     attn_metadata.slot_mapping,
                     self._k_scale,
@@ -1441,9 +1524,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 q_pe,
                 k_c_normed,
                 k_pe.squeeze(1),
-                kv_cache.view(
-                    kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
-                ),
+                self._as_atom_page(kv_cache),
                 q_out,
                 sparse_meta.slot_mapping,
                 self._k_scale,
