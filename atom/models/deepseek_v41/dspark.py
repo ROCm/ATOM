@@ -5,17 +5,18 @@ from copy import copy
 
 import torch
 import torch.nn.functional as F
+from torch import nn
+
 from atom.model_ops.blockscale import quantize_fp8
 from atom.model_ops.deepseek_v41.dspark import draft_attention, draft_step, rotate_rows
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.deepseek_v41.normalization import RMSNorm
 from atom.model_ops.deepseek_v41.projections import grouped_output_projection
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
-from torch import nn
-
 from atom.model_ops.embed_head import VocabParallelEmbedding
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
+from atom.models.deepseek_v4 import make_v4_quant_config
 from atom.models.dspark_draft import DSparkDraftModel
 
 from .attention import Attention
@@ -81,8 +82,8 @@ class ConfidenceHead(nn.Module):
 class DraftBlock(Block):
     attention_cls = DraftAttention
 
-    def __init__(self, config, spec, stage, prefix: str = ""):
-        super().__init__(config, spec, prefix=prefix)
+    def __init__(self, config, spec, stage, prefix: str = "", *, moe_quant_config):
+        super().__init__(config, spec, prefix=prefix, moe_quant_config=moe_quant_config)
         if stage == 0:
             self.main_proj = ReplicatedLinear(
                 config.hidden_size * len(config.dspark_target_layer_ids),
@@ -107,8 +108,8 @@ class DeepseekV41DSpark(DSparkDraftModel):
     packed_modules_mapping = DeepseekV41ForCausalLM.packed_modules_mapping
     disable_fused_shared_loading = DeepseekV41ForCausalLM.disable_fused_shared_loading
     # The block gathers from request-owned windows through live Python
-    # metadata, and eager expert dispatch synchronizes route counts. Only
-    # target tensor stages are capturable until draft inputs are staged too.
+    # metadata. Target tensor stages are capturable; the draft still needs
+    # stable staged inputs before whole-block graph capture can be enabled.
     supports_block_graph = False
 
     def __init__(self, config, *, max_length=None):
@@ -124,12 +125,21 @@ class DeepseekV41DSpark(DSparkDraftModel):
         draft = copy(args)
         draft.n_routed_experts = args.dspark_n_routed_experts
         draft.num_experts_per_tok = args.dspark_num_experts_per_tok
+        self.moe_quant_config = make_v4_quant_config(
+            draft, online_quant_config=getattr(config, "online_quant_config", None)
+        )
         topology = build_attention_topology(args)[args.num_hidden_layers :]
         self.mtp = nn.ModuleList(
             # The stage index, not the topology's layer id: this prefix names
             # the module's own parameters, and `nn.ModuleList` numbers them
             # from zero -- which is also how the checkpoint numbers them.
-            DraftBlock(draft, spec, i, prefix=f"mtp.{i}")
+            DraftBlock(
+                draft,
+                spec,
+                i,
+                prefix=f"mtp.{i}",
+                moe_quant_config=self.moe_quant_config,
+            )
             for i, spec in enumerate(topology)
         )
         capacity = max_length or getattr(

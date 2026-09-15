@@ -6,6 +6,9 @@ from typing import ClassVar
 import torch
 import torch.nn.functional as F
 from aiter.dist.parallel_state import get_tp_group
+from torch import nn
+
+from atom.model_loader.weight_names import WeightsMapper
 from atom.model_ops.attentions.deepseek_v41_state import EagerAttentionCache
 from atom.model_ops.deepseek_v41.mhc import (
     SinglePassHCState,
@@ -14,15 +17,12 @@ from atom.model_ops.deepseek_v41.mhc import (
 from atom.model_ops.deepseek_v41.mhc_pre_delayed import pre_delayed
 from atom.model_ops.deepseek_v41.normalization import RMSNorm
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
-from atom.model_ops.engram_layer import EngramOp
-from torch import nn
-
-from atom.model_loader.weight_names import WeightsMapper
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+from atom.model_ops.engram_layer import EngramOp
 from atom.model_ops.layernorm import RMSNorm as FusedRMSNorm
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
-from atom.models.deepseek_v4 import DeepseekV4ForCausalLM
+from atom.models.deepseek_v4 import DeepseekV4ForCausalLM, make_v4_quant_config
 
 from .attention import Attention
 from .config import build_attention_topology
@@ -62,12 +62,14 @@ class LogitsHead(ParallelLMHead):
 class Block(nn.Module):
     attention_cls = Attention
 
-    def __init__(self, config, spec, prefix: str = ""):
+    def __init__(self, config, spec, prefix: str = "", *, moe_quant_config):
         super().__init__()
         self.attn = self.attention_cls(config, spec)
         # FusedMoE names its parameters from this prefix, so it has to match the
-        # checkpoint layout `weights.py` declares: `layers.N` / `mtp.N`.
-        self.ffn = MoE(config, spec.layer_id, prefix=f"{prefix}.ffn")
+        # module layout used by the shared loader: `layers.N` / `mtp.N`.
+        self.ffn = MoE(
+            config, spec.layer_id, prefix=f"{prefix}.ffn", quant_config=moe_quant_config
+        )
         self.attn_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.ffn_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         # `post_mult` is the 2.0 in the post gate's `2 * sigmoid(...)`, which
@@ -223,7 +225,7 @@ class DeepseekV41ForCausalLM(nn.Module):
         "shared_experts.w3": ("shared_experts.gate_up_proj", 1),
     }
 
-    def __init__(self, config, *, max_length):
+    def __init__(self, config, *, max_length, online_quant_config=None):
         super().__init__()
         group = get_tp_group()
         config.validate_parallelism(group.world_size, group.world_size)
@@ -232,8 +234,18 @@ class DeepseekV41ForCausalLM(nn.Module):
         self.config, self.max_length = config, max_length
         self.topology = build_attention_topology(config)[: config.num_hidden_layers]
         self.embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+        # One shared configuration owns all expert source/online quantization
+        # rules. Native attention and Engram projections own their A8 layouts.
+        self.moe_quant_config = make_v4_quant_config(
+            config, online_quant_config=online_quant_config
+        )
         self.layers = nn.ModuleList(
-            Block(config, spec, prefix=f"layers.{spec.layer_id}")
+            Block(
+                config,
+                spec,
+                prefix=f"layers.{spec.layer_id}",
+                moe_quant_config=self.moe_quant_config,
+            )
             for spec in self.topology
         )
         # Final normalization feeds the FP32 logits projection, with no further

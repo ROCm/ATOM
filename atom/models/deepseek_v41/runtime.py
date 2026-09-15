@@ -22,7 +22,11 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
     # directly and does not route through here.
 
     def __init__(self, config):
-        super().__init__(config.hf_config, max_length=config.max_model_len)
+        super().__init__(
+            config.hf_config,
+            max_length=config.max_model_len,
+            online_quant_config=config.online_quant_config,
+        )
         self.dense_graphs = None if config.enforce_eager else DenseGraphExecutor()
 
     @torch.inference_mode()

@@ -17,14 +17,14 @@ text-only admission.
 import torch
 from torch import nn
 
-from atom.models.deepseek_v4 import DeepseekV4Args, make_v4_quant_config
+from atom.models.deepseek_v4 import DeepseekV4Args
 from atom.models.deepseek_v4 import MoE as V4MoE
 
 
 class MoE(V4MoE):
-    def __init__(self, config, layer_id: int, prefix: str = ""):
+    def __init__(self, config, layer_id: int, prefix: str = "", *, quant_config):
         args = DeepseekV4Args.from_hf_config(config)
-        args.quant_config = make_v4_quant_config(config)
+        args.quant_config = quant_config
         super().__init__(layer_id, args, prefix=prefix)
         self.gate.bias_vl = nn.Parameter(
             torch.empty(args.n_routed_experts, dtype=torch.float32),

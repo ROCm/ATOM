@@ -12,7 +12,8 @@ caches, and text requests. Target execution can be eager or use PIECEWISE
 graphs; the draft currently runs eagerly. Packed speculative caches, multimodal
 speculation, synthetic acceptance and relaxed MTP acceptance are not admitted. Speculative output token logprobs are
 also rejected because the current output protocol cannot return them correctly.
-Non-speculative vision, packed cache and AITER expert support are independent.
+Non-speculative vision and packed cache support are independent. Both target
+and draft MoE reuse V4 FusedMoE.
 
 Fixed-length verification is the default when DSpark is explicitly selected:
 
@@ -39,7 +40,7 @@ config = Config(
 For target graphs, set `enforce_eager=False` and
 `compilation_config=CompilationConfig(level=0,
 cudagraph_mode=CUDAGraphMode.PIECEWISE)`. Whole-draft capture is explicitly
-disabled: its request-window reads and host expert dispatch need live metadata.
+disabled: its request-window reads still need live request metadata.
 It must not silently capture warmup slots or reuse another request's window.
 
 ## State and sampling contracts
@@ -73,9 +74,9 @@ standard task metrics. The numerical budget allows mean NLL to increase by at
 most 0.01 nats/token and task accuracy to decrease by at most one percentage
 point. Paired confidence intervals and systematic shifts are reviewed separately;
 a point estimate within tolerance does not prove statistical noninferiority.
-Integer state, accepted-prefix and output ownership contracts remain exact. The current eager-expert path showed bitwise stability
-under identical repeated batch compositions; that does not rule out numerical
-variation from atomic kernels in other MoE implementations.
+Integer state, accepted-prefix and output ownership contracts remain exact.
+The current FusedMoE and AITER mHC paths require fresh quality and performance
+validation; earlier eager-expert measurements do not establish their behavior.
 
 Model math lives in `models/deepseek_v41/dspark.py` and
 `model_ops/deepseek_v41/dspark.py`. Tentative state belongs to the V4.1 cache
@@ -119,6 +120,10 @@ python -m tests.models.deepseek_v41.build_dspark_profile \
   --confidence /path/to/sts_candidate.json \
   --output /path/to/profile.json
 ```
+
+The calibration results below were collected before the FusedMoE/AITER mHC
+replacement; regenerate the profile for the current runtime before using dynamic
+verification.
 
 Profiles validate the config/index-file hashes, model type, TP size, cache types,
 expert backend, graph setting, GPU name and Torch/HIP versions. They also validate

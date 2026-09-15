@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 """Vision weight ownership and image-to-language embedding projection."""
 
-
 import torch
 from torch import nn
 
@@ -10,8 +9,10 @@ from .vision import Aligner, ViT
 
 
 class DeepseekV41MultimodalModel(DeepseekV41ForCausalLM):
-    def __init__(self, config, *, max_length):
-        super().__init__(config, max_length=max_length)
+    def __init__(self, config, *, max_length, online_quant_config=None):
+        super().__init__(
+            config, max_length=max_length, online_quant_config=online_quant_config
+        )
         vision_config = config._multimodal_config.vision_config
         self.vision = ViT(vision_config)
         self.aligner = Aligner(vision_config, config.hidden_size)
