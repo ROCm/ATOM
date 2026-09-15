@@ -27,6 +27,8 @@ ATOM (AiTer Optimized Model) uses a prefill-first scheduler with paged KV cache 
 | `kv_cache_block_size` | 16 | Tokens per KV cache block (must be multiple of 16, or 1) |
 | `enable_prefix_caching` | `False` | Enable hash-based prefix block sharing |
 | `scheduler_delay_factor` | 0.0 | Delay factor for batching prompt requests (0 = no delay) |
+| `scheduling_policy` | `"fcfs"` | Waiting-queue order: `"fcfs"` or `"sjf"` (see below) |
+| `sjf_max_skip_steps` | 64 | Starvation bound for `"sjf"` (0 = unbounded) |
 | `gpu_memory_utilization` | 0.9 | Fraction of GPU memory for KV cache |
 
 ## Scheduling algorithm
@@ -81,6 +83,63 @@ The scheduler maintains two deques — `waiting` (pending prefill) and `running`
 4. If the sequence has speculative draft tokens (`seq.spec_token_ids`), record them in `scheduled_spec_decode_tokens`.
 5. Call `block_manager.may_append(seq, num_new_tokens)` where `num_new_tokens = mtp_k + 1`.
 6. Re-insert all scheduled sequences back into `running` (preserving order).
+
+### Waiting-queue order (`scheduling_policy`)
+
+The waiting queue is a FIFO deque. Under the default `"fcfs"` it is left
+alone, and requests prefill in arrival order — so one long prompt at the head
+adds its whole prefill time to the TTFT of every short request behind it.
+
+`--scheduling-policy sjf` sorts the queue at the top of `_schedule` by
+remaining prefill work, cheapest first
+(`Scheduler._reorder_waiting_shortest_first`). Short requests answer sooner
+and the longest prompts answer later — the p90 TTFT improves, the p99 gets
+worse. Under disaggregated prefill the same ordering runs in
+`PrefillScheduler._schedule`, so short requests also reach the decode node's
+batch without waiting out a long prompt's prefill.
+
+Two tiers keep the sort honest (`shortest_first_key`):
+
+- **Front tier** — preemption victims (which already spent a forward pass and
+  had their KV freed, so re-sorting them by length would re-preempt them
+  forever) and any request skipped past `sjf_max_skip_steps`. This is the
+  starvation bound; `0` removes it, giving pure SJF.
+- **Everything else** — ranked by the tokens prefill still has to compute
+  *after prefix reuse*, stably, so equal-cost requests keep arrival order.
+
+A skip is only charged on a step that actually admitted a prefill. On a
+KV-starved or delayer-held step nobody was passed over, and counting it would
+age the whole queue into the front tier at once — FCFS with extra steps.
+
+**How the cost is measured.** `num_cached_tokens` is advanced by `postprocess`,
+so a request that has not yet run a prefill chunk carries 0 — using it alone
+would rank a cache-hot 20k prompt as 20k of work and let a cold 500-token
+request cut in front. Instead the key splits on whether the waiter owns blocks:
+
+- **Fresh waiter** (`not seq.block_table`) — `BlockManager.prefix_cached_tokens`
+  probes the live cache. It shares `_match_prefix` with `can_allocate`, so it
+  applies the same joint SWA / state-checkpoint gate and never counts a prefix
+  no cache could resume from. The probe is read-only: no allocation, no
+  refcount, no `checkpoint_demand_pos`, no funnel counters.
+- **Waiter that already owns blocks** — an offload resume, a parked partial
+  prefill, or anything in the disaggregated `PrefillScheduler`'s ready set uses
+  its own `num_cached_tokens`. That KV is real whether or not it is reachable
+  through the prefix index, so probing would under-report it.
+
+Hits are re-probed on every sort rather than memoised, because an admission
+earlier in the same pass can evict blocks a later waiter matched. Admission
+probes again for the same reason — the sort's answer is a ranking input, never
+an admission decision.
+
+**Cost, and who pays it.** One chained-hash walk per fresh waiter per
+scheduling pass, on top of the walk admission already does. That is charged to
+`sjf` alone: `_reorder_waiting_shortest_first` returns before touching the
+block manager under any other policy, so FCFS walks the prefix exactly once per
+`can_allocate`, as it always has.
+
+The sort runs *before* `_promote_ready_remote_kv_requests` and
+`_park_ready_offload_partial_prefills`, so those passes' front-of-queue
+invariants still hold — SJF only orders what they leave alone.
 
 ### Delay factor
 

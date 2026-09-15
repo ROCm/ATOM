@@ -64,6 +64,8 @@ class EngineArgs:
     throughput_log_interval: float = 10.0
     cache_hit_rate_window: int = 1000
     scheduler_delay_factor: float = 0.0
+    scheduling_policy: str = "fcfs"
+    sjf_max_skip_steps: int = 64
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
     cudagraph_capture_sizes: str = "[1,2,4,8,16,32,48,64,128,256]"
@@ -397,6 +399,32 @@ class EngineArgs:
                 "size at this many tokens. 0 disables the cap (request is only "
                 "bounded by max_num_batched_tokens). Useful to interleave long "
                 "prefills with decode for lower ITL."
+            ),
+        )
+        parser.add_argument(
+            "--scheduling-policy",
+            type=str,
+            default="fcfs",
+            choices=["fcfs", "sjf"],
+            help=(
+                "Order in which waiting requests are admitted to prefill. "
+                "'fcfs' is arrival order. 'sjf' is shortest-job-first: the "
+                "request with the fewest remaining prefill tokens goes first, "
+                "which lowers p90 TTFT and raises TTFT for the longest "
+                "prompts. Under disaggregated prefill it also hands short "
+                "requests to the decode node's batch sooner."
+            ),
+        )
+        parser.add_argument(
+            "--sjf-max-skip-steps",
+            type=int,
+            default=64,
+            help=(
+                "Starvation bound for --scheduling-policy sjf: a request "
+                "passed over this many scheduling steps is admitted next "
+                "regardless of length. 0 removes the bound entirely (pure "
+                "shortest-job-first, in which a long prompt can be starved "
+                "indefinitely). Ignored under 'fcfs'."
             ),
         )
         parser.add_argument(

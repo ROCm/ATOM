@@ -243,6 +243,17 @@ class Sequence:
         # garbage sampled tokens from intermediate chunks and to skip the
         # scheduler's Phase 1 scan when no partials exist.
         self.is_partial_prefill = False
+        # Scheduling steps that admitted some other request's prefill while
+        # this one sat in the waiting queue. Only maintained under
+        # `scheduling_policy="sjf"`, where crossing `sjf_max_skip_steps` moves
+        # the request to the front regardless of length -- the bound on how
+        # long shortest-job-first may starve a long prompt.
+        self.num_skipped_steps = 0
+        # Set by `Scheduler.preempt`, cleared the moment the request is
+        # admitted again. Keeps a preemption victim at the head of the waiting
+        # queue under "sjf", which would otherwise sort it behind every
+        # shorter arrival and re-preempt it forever.
+        self.is_preempted = False
         # `new_block_table` is main's: an array("i") rather than a list,
         # because every forward marshals these into the int32 buffer.
         self.block_table = new_block_table()
