@@ -12,13 +12,14 @@ use axum::{
 
 use crate::protocols::{
     chat::ChatCompletionRequest,
-    completion::CompletionRequest,
     generate::GenerateRequest,
     responses::{ResponsesGetParams, ResponsesRequest},
 };
+use crate::routers::completion_request::CompletionRequest;
 
 pub mod atom_standalone;
 pub mod comm;
+pub mod completion_request;
 pub mod factory;
 pub mod grpc;
 pub mod http_pd_router;

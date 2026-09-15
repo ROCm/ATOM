@@ -44,8 +44,7 @@ use crate::{
     policies::PolicyRegistry,
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
-        common::{InputIds, StringOrArray},
-        completion::CompletionRequest,
+        common::InputIds,
         generate::GenerateRequest,
     },
     routers::{
@@ -54,6 +53,7 @@ use crate::{
             metrics_utils::{error_type_from_status, route_to_endpoint},
             placement_response::placement_err_to_response,
         },
+        completion_request::{CompletionPrompt, CompletionRequest},
         RouterTrait,
     },
 };
@@ -469,12 +469,11 @@ impl PDRouter {
     }
 
     fn get_completion_batch_size(req: &CompletionRequest) -> Option<usize> {
-        if let StringOrArray::Array(arr) = &req.prompt {
-            if !arr.is_empty() {
-                return Some(arr.len());
-            }
+        match &req.prompt {
+            CompletionPrompt::Texts(arr) if !arr.is_empty() => Some(arr.len()),
+            CompletionPrompt::TokenBatches(arr) if !arr.is_empty() => Some(arr.len()),
+            _ => None,
         }
-        None
     }
 
     /// Dispatch a request based on backend type. SGLang uses dual-dispatch+bootstrap;
@@ -2103,13 +2102,14 @@ impl RouterTrait for PDRouter {
         body: &CompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let is_stream = body.stream;
-        let return_logprob = body.logprobs.is_some();
+        let is_stream = body.is_stream();
+        let return_logprob = body.inner.logprobs.is_some();
 
         let request_text = if self.policies_need_request_text() {
             match &body.prompt {
-                StringOrArray::String(s) => Some(s.clone()),
-                StringOrArray::Array(v) => v.first().map(|s| s.to_string()),
+                CompletionPrompt::String(s) => Some(s.clone()),
+                CompletionPrompt::Texts(v) => v.first().map(|s| s.to_string()),
+                CompletionPrompt::Tokens(_) | CompletionPrompt::TokenBatches(_) => None,
             }
         } else {
             None

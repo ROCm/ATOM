@@ -20,12 +20,12 @@ use crate::{
     observability::metrics::{metrics_labels, MeshMetrics},
     protocols::{
         chat::ChatCompletionRequest,
-        completion::CompletionRequest,
         generate::GenerateRequest,
         responses::{ResponsesGetParams, ResponsesRequest},
     },
     routers::{
         comm::error,
+        completion_request::CompletionRequest,
         openai::responses::{
             context::ResponsesContext,
             handlers as responses_handlers,
@@ -231,7 +231,7 @@ impl RouterTrait for GrpcRouter {
             Err(msg) => return error::bad_request("completion_unsupported_field", msg),
         };
 
-        let is_stream = body.stream;
+        let is_stream = body.is_stream();
         debug!(
             "Routing /v1/completions via synthetic generate (stream={}) for model: {}",
             is_stream,
@@ -243,9 +243,9 @@ impl RouterTrait for GrpcRouter {
             .await;
 
         if is_stream {
-            wrap_streaming_generate_as_completion(upstream, body.model.clone()).await
+            wrap_streaming_generate_as_completion(upstream, body.inner.model.clone()).await
         } else {
-            wrap_generate_response_as_completion(upstream, body.model.clone()).await
+            wrap_generate_response_as_completion(upstream, body.inner.model.clone()).await
         }
     }
 
