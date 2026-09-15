@@ -59,8 +59,9 @@ ARG ROCM_INDEX_URL="https://stable.repo.amd.com/rocm/whl-next/"
 ENV ROCM_INDEX_URL=${ROCM_INDEX_URL}
 # 10.1 tracking line overrides (nightly channel, date-stamped versions):
 #   --build-arg ROCM_SDK_VERSION=10.1.0a<yyyymmdd>
-#   --build-arg ROCM_TORCH_VERSION=2.12.0
-#   --build-arg ROCM_TRITON_VERSION=3.8.0+gitc01b6774
+#   --build-arg ROCM_TORCH_VERSION=2.13.0
+#   --build-arg ROCM_TORCHVISION_VERSION=0.28.0
+#   --build-arg ROCM_TRITON_VERSION=          (empty: let torch's pin decide)
 #   --build-arg ROCM_INDEX_URL=https://nightly.repo.amd.com/rocm/whl-next/
 # (the +rocm10.1.0a<date> local version suffix is derived from
 #  ROCM_SDK_VERSION below, so only the base version needs overriding)

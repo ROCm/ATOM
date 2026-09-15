@@ -211,8 +211,14 @@ jobs:
               # commit drifts independently of torch — any explicit pick can
               # fight torch's pin and die with ResolutionImpossible. Empty
               # means the dockerfile lets torch's dependency decide.
+              # torch/torchvision are the pair QA validated on the 10.1 line.
+              # torchvision must be passed explicitly: the dockerfile default
+              # (0.26.0) belongs to the 10.0 stable line and does not exist on
+              # the 10.1 nightly channel at all, so leaving it out pins
+              # torchvision==0.26.0+rocm10.1.0a<date> and the build dies in pip.
               EXTRA_BUILD_ARGS="--build-arg ROCM_SDK_VERSION=${NIGHTLY_SDK_VERSION} \
-                --build-arg ROCM_TORCH_VERSION=2.12.0 \
+                --build-arg ROCM_TORCH_VERSION=2.13.0 \
+                --build-arg ROCM_TORCHVISION_VERSION=0.28.0 \
                 --build-arg ROCM_TORCHAUDIO_VERSION=${NIGHTLY_TORCHAUDIO_VERSION} \
                 --build-arg ROCM_TRITON_VERSION= \
                 --build-arg ROCM_INDEX_URL=https://nightly.repo.amd.com/rocm/whl-next/"
