@@ -174,6 +174,8 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched._sidecar_hash_cache = {}
     sched._load_inflight_tokens = {}
     sched._save_inflight_tokens = {}
+    sched._load_failed_seqs = {}
+    sched.total_suppressed_load_retries = 0
     sched.total_load_requests = 0
     sched.total_loaded_tokens = 0
     sched.total_load_failures = 0
@@ -378,6 +380,10 @@ def _dense_registration_connector() -> DenseOffloadConnector:
     connector._engine = None
     connector._codec = None
     connector._lookup_server = None
+    # `register_kv_caches` logs the pool widths, which a real worker sets in
+    # `__init__`; this connector is built through `__new__`.
+    connector.save_workers = 1
+    connector.load_workers = 1
     return connector
 
 
@@ -1111,6 +1117,88 @@ def test_staged_pipeline_allocates_on_first_consumer_stream(
         ("run", "a", first_stream_name),
     ]
     assert ("run", "b", second_stream_name) in trace
+
+
+@pytest.mark.parametrize("shared_stream", [True, False])
+def test_staged_pipeline_skips_the_handshake_on_a_shared_stream(shared_stream):
+    """One stream orders the stages itself, so it must issue no event calls.
+
+    Not a cosmetic saving: every one of those calls enters the GPU runtime and
+    releases the GIL, and it is charged once per staging group.
+    """
+    from atom.kv_transfer.offload.atom_lmcache_staging import (
+        _PipelineStage,
+        run_staged_pipeline,
+    )
+
+    calls = []
+
+    class _FakeStream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_event(self, event):
+            calls.append(("wait", event.name))
+
+        def synchronize(self):
+            pass
+
+    class _FakeEvent:
+        def __init__(self, name):
+            self.name = name
+
+        def record(self, stream):
+            calls.append(("record", self.name))
+
+    class _FakeState:
+        def __init__(self):
+            self.staging_buffer = SimpleNamespace(
+                tensor=None,
+                ready_event=_FakeEvent("ready"),
+                free_event=_FakeEvent("free"),
+                free_event_valid=False,
+            )
+
+        def stream_ctx(self, stream):
+            return nullcontext()
+
+    state = _FakeState()
+    pack = _FakeStream("pack")
+    copy = pack if shared_stream else _FakeStream("copy")
+    ran = []
+
+    # Three groups: the free-event wait only appears from the second onwards,
+    # so a single group would not distinguish the two modes.
+    run_staged_pipeline(
+        state,
+        [SimpleNamespace(nbytes=8) for _ in range(3)],
+        stage_a=_PipelineStage(pack, lambda group, buf: ran.append("a")),
+        stage_b=_PipelineStage(copy, lambda group, buf: ran.append("b")),
+        ensure_buffer=lambda _buffer, _nbytes: object(),
+        group_nbytes=lambda group: group.nbytes,
+    )
+
+    assert ran == ["a", "b"] * 3
+    if shared_stream:
+        assert calls == []
+        # A recorded-event flag that outlived its event would gate a later
+        # transfer on something that was never recorded.
+        assert state.staging_buffer.free_event_valid is False
+    else:
+        assert calls == [
+            ("record", "ready"),
+            ("wait", "ready"),
+            ("record", "free"),
+            ("wait", "free"),
+            ("record", "ready"),
+            ("wait", "ready"),
+            ("record", "free"),
+            ("wait", "free"),
+            ("record", "ready"),
+            ("wait", "ready"),
+            ("record", "free"),
+        ]
+        assert state.staging_buffer.free_event_valid is True
 
 
 def _exception_pipeline(monkeypatch, direction: str, *, failed_stream: str | None):
@@ -3571,7 +3659,14 @@ def test_sidecar_chunk_cut_preserves_earlier_load_handoff_cap():
     assert sched.adjust_prefill_chunk_after_alloc(seq, 16_000) == 4096
 
 
-def test_full_prompt_hit_is_clamped_before_load_spec():
+def test_full_prompt_hit_is_clamped_and_floored_before_load_spec():
+    # A full-prompt hit is decremented so something is left to compute, and
+    # then floored back onto a chunk boundary. Both steps are load-bearing:
+    # LMCache resolves at chunk granularity, so the bare decrement (7 here,
+    # 32767 on GLM-5.2 with chunk 64) names tokens the tier does not hold and
+    # the load can only ever fail -- which parks the request in
+    # WAITING_FOR_REMOTE_KVS and, since a failed load used to leave no record,
+    # forever. chunk_size is 4, so 8 -> 7 -> 4.
     sched = _scheduler()
     sched._lookup_client = _LookupClient(hit=8)
     seq = SimpleNamespace(
@@ -3583,9 +3678,35 @@ def test_full_prompt_hit_is_clamped_before_load_spec():
 
     need, should_park = sched.get_num_new_matched_tokens(seq)
 
-    assert need == 7
+    assert need == 4
     assert should_park is True
-    assert sched._load_specs[str(seq.id)].lmcache_cached_tokens == 7
+    assert sched._load_specs[str(seq.id)].lmcache_cached_tokens == 4
+
+
+def test_dsv4_failed_load_is_not_retried_for_the_same_request():
+    # Same one-attempt rule as the dense layout: without it, `load_failed`
+    # clears the pending load and the lookup memo, so the next scheduler pass
+    # hits, parks, and fails again -- holding the request's KV blocks and its
+    # concurrency slot for the life of the benchmark.
+    sched = _scheduler()
+    sched._lookup_client = _LookupClient(hit=6)
+    seq = SimpleNamespace(
+        id=125,
+        num_prompt_tokens=8,
+        token_ids=list(range(8)),
+        num_cached_tokens=0,
+        has_per_req_cache=False,
+    )
+
+    assert sched.get_num_new_matched_tokens(seq) == (4, True)
+    assert sched.load_failed("125") is True
+    assert sched._load_failed_seqs == {"125": seq}
+
+    assert sched.get_num_new_matched_tokens(seq) == (0, False)
+    assert sched.total_suppressed_load_retries == 1
+
+    sched.request_finished(seq)
+    assert sched._load_failed_seqs == {}
 
 
 def test_lookup_miss_is_forwarded_for_worker_unpin():

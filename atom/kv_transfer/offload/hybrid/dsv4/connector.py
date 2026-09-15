@@ -57,6 +57,7 @@ from atom.kv_transfer.offload._offload_common import (
     build_offload_engine,
     max_pending_saves,
     pp_aware_rank_and_world,
+    tokens_to_tensor,
     validated_kv_role,
 )
 from atom.kv_transfer.offload.hybrid.dsv4.codec import (
@@ -1192,7 +1193,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         t_retrieve0 = time.perf_counter()
         self._reset_gpu_connector_transfer_stats()
         ret_mask = self._engine.retrieve(
-            torch.tensor(toks),
+            tokens_to_tensor(toks),
             mask=mask,
             block_ids=req.block_ids,
             req_id=str(req.req_id),
@@ -1585,7 +1586,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 t_store0 = time.perf_counter()
                 self._reset_gpu_connector_transfer_stats()
                 self._engine.store(
-                    torch.tensor(toks),
+                    tokens_to_tensor(toks),
                     mask=mask,
                     block_ids=req.block_ids,
                     req_id=str(req.req_id),
@@ -1956,15 +1957,18 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             self._active_slot_loads.pop(sid, None)
             self._active_load_operations.pop(sid, None)
             self._handoff_loads.discard(sid)
+            self._load_failed_seqs.pop(sid, None)
         self._load_lifecycles[sid] = seq
 
     def get_num_new_matched_tokens(self, seq) -> tuple[int, bool]:
         if not self._do_load or self._lookup_client is None:
             return 0, False
         self._begin_load_lifecycle(seq)
+        sid = str(seq.id)
+        if self._repeat_load_suppressed(seq, sid):
+            return 0, False
         num_prompt = seq.num_prompt_tokens
         token_ids = list(seq.token_ids[:num_prompt])
-        sid = str(seq.id)
         if sid not in self._lookup_in_step:
             self._lookup_in_step.append(sid)
         try:
@@ -1997,10 +2001,8 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         if not hit:
             self._clear_lookup_retry_state(sid)
             return 0, False
-        hit = int(hit)
-        if hit == num_prompt:  # full-prompt hit → recompute last token
-            hit -= 1
-        self._hit_save_floors[sid] = self._chunk_floor(hit)
+        hit = self._loadable_hit(hit, num_prompt)
+        self._hit_save_floors[sid] = hit
         if bool(getattr(seq, "has_per_req_cache", False)):
             boundary_hashes, _ = self._sidecar_hash_data(seq)
             boundary = (hit // self.resume_alignment) * self.resume_alignment
@@ -2675,6 +2677,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             # [HBM, LMC) chunks be saved again instead of permanently treating
             # them as already persisted.
             entry[1] = self._chunk_floor(floor)
+        self._record_failed_load_attempt(sid)
         self._clear_pending_load(sid)
         return True
 
@@ -2694,6 +2697,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
 
     def request_finished(self, seq) -> None:
         sid = str(seq.id)
+        self._release_failed_load_attempt(sid, seq)
         if self._load_lifecycles.get(sid) is seq:
             self._clear_pending_load(sid)
             self._active_slot_loads.pop(sid, None)

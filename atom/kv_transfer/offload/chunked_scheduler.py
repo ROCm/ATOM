@@ -150,15 +150,18 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if previous is not None and previous is not seq:
             self._clear_pending_load(sid)
             self._active_load_operations.pop(sid, None)
+            self._load_failed_seqs.pop(sid, None)
         self._load_lifecycles[sid] = seq
 
     def get_num_new_matched_tokens(self, seq) -> tuple[int, bool]:
         if not self._do_load or self._lookup_client is None:
             return 0, False
         self._begin_load_lifecycle(seq)
+        sid = str(seq.id)
+        if self._repeat_load_suppressed(seq, sid):
+            return 0, False
         num_prompt = seq.num_prompt_tokens
         token_ids = list(seq.token_ids[:num_prompt])
-        sid = str(seq.id)
         pending = self._lookup_results.get(sid)
         if pending is not None and pending[0] is not seq:
             # An older lifecycle still owns this worker-side pin. Its cleanup
@@ -202,10 +205,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             )
         if not hit:
             return 0, False
-        hit = int(hit)
-        if hit == num_prompt:  # full-prompt hit → recompute last token
-            hit -= 1
-        self._hit_save_floors[sid] = self._chunk_floor(hit)
+        hit = self._loadable_hit(hit, num_prompt)
+        self._hit_save_floors[sid] = hit
         need = hit - int(seq.num_cached_tokens)
         if need <= 0:
             self._clear_pending_load(sid)
@@ -631,6 +632,48 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._release_operation_lease(req_id)
         self._finish_retired_request(sid)
 
+    def save_finished_by_request(self, req_id) -> None:
+        """Complete a save when only the plain request id is available.
+
+        `save_finished` refuses a raw id once the lifecycle has an exact
+        `SaveOperationId`, so a delayed report cannot complete a newer
+        lifecycle. A vLLM-plugin scheduler cannot satisfy that: vLLM's
+        `KVConnectorOutput` carries request ids as plain strings, so the exact
+        identity never survives the trip back from the worker.
+
+        Resolving the parked identity here keeps the guard meaningful instead of
+        weakening `save_finished` -- and without it the entry never clears, so
+        `_save_inflight` grows for the life of the process and
+        `has_pending_work()` never goes quiet.
+        """
+        sid = str(req_id)
+        active = self._save_inflight.get(sid)
+        self.save_finished(active if active is not None else sid)
+
+    def load_finished_by_request(self, req_id) -> bool:
+        """`load_finished` for a caller that has only the plain request id.
+
+        Same reason as `save_finished_by_request`.
+        """
+        sid = str(req_id)
+        entry = self._active_load_operations.get(sid)
+        return self.load_finished(entry[1] if entry is not None else sid)
+
+    def load_failed_by_request(self, req_id) -> bool:
+        """`load_failed` for a caller that has only the plain request id.
+
+        Same reason as `save_finished_by_request`: vLLM's `KVConnectorOutput`
+        carries request ids as plain strings, so the exact `LoadOperationId`
+        never survives the trip back from the worker half. Routing a failure
+        through `load_finished` instead would pop `_load_save_floors`, which is
+        the record that the `[HBM, LMCache)` range is NOT persisted -- the
+        recomputed chunks would then never be saved.
+        """
+
+        sid = str(req_id)
+        entry = self._active_load_operations.get(sid)
+        return self.load_failed(entry[1] if entry is not None else sid)
+
     def connector_completion(self, completion: ConnectorCompletion) -> bool | None:
         """Apply TP/PP-quorumed source-safe and store-terminal reports."""
 
@@ -782,6 +825,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             # [HBM, LMC) chunks be saved again instead of permanently treating
             # them as already persisted.
             entry[1] = self._chunk_floor(floor)
+        self._record_failed_load_attempt(sid)
         self._clear_pending_load(sid)
         return True
 
@@ -820,6 +864,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 self._active_load_operations.pop(sid, None)
                 self._cancel_load_statistics(active[1])
             self._load_lifecycles.pop(sid, None)
+        self._release_failed_load_attempt(sid, seq)
         entry = self._save_tracker.get(sid)
         if entry is not None and entry[0] is seq:
             if self._early_release:

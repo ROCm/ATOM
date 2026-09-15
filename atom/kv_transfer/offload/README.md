@@ -434,7 +434,7 @@ staging HBM is therefore:
 ```
 staging_chunk_bytes = (LMCACHE_CHUNK_SIZE / block_size) * bytes_per_block
 per_buffer_bytes    = OFFLOAD_GPU_STAGING_CHUNKS * staging_chunk_bytes
-resident_HBM        ≈ (1 load + OFFLOAD_COPY_WORKERS save) * per_buffer_bytes
+resident_HBM        ≈ (OFFLOAD_LOAD_WORKERS load + OFFLOAD_COPY_WORKERS save) * per_buffer_bytes
 ```
 
 For the chunk2 run that is `2 * 16.76 MiB ≈ 33.5 MiB` per buffer × (1 load + 1
@@ -876,9 +876,10 @@ Connector-specific tuning (env):
 | Env | Default | Purpose |
 |-----|:-------:|---------|
 | `OFFLOAD_MIN_LOAD_TOKENS` | 8192 | Don't reload a hit smaller than this; recompute is cheaper. |
-| `OFFLOAD_COPY_WORKERS` | 1 | SAVE daemon threads. LOAD is always a single thread (TTFT-critical). |
+| `OFFLOAD_COPY_WORKERS` | 1 | SAVE daemon threads. |
+| `OFFLOAD_LOAD_WORKERS` | 1 | LOAD daemon threads. One is enough until the CPU tier serves real traffic; past that, requests park inside `retrieve` and the scheduler admits fewer of them. Each thread costs one more `gpu_staging_buffer_bytes` per rank. |
 | `OFFLOAD_MAX_PENDING_SAVES` | `max(2, 2 × OFFLOAD_COPY_WORKERS)` | Positive integer bound on total admitted worker saves (running + queued), acquired before SLOT snapshot or executor submission. |
-| `OFFLOAD_GPU_STAGING_CHUNKS` | 2 | Chunks per bounded GPU staging buffer. Sizes **each** buffer — load and save own separate ones, so resident HBM ≈ `(1 + OFFLOAD_COPY_WORKERS) × chunks × chunk_bytes`. |
+| `OFFLOAD_GPU_STAGING_CHUNKS` | 2 | Chunks per bounded GPU staging buffer. Sizes **each** buffer — load and save own separate ones, so resident HBM ≈ `(OFFLOAD_LOAD_WORKERS + OFFLOAD_COPY_WORKERS) × chunks × chunk_bytes`. |
 | `OFFLOAD_GPU_STAGING_MAX_BYTES` | — | Hard cap on staging bytes (clamps the chunk count). |
 | `OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER` | 0 | Free the staging buffer after each transfer (lower idle HBM, higher churn). |
 | `OFFLOAD_SLOT_STAGING_SLOTS` | 1 | DSV4 only: number of persistent full-SLOT GPU staging rows. Must be at least 1; HBM cost is this value × `slot_bytes`. |

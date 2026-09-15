@@ -17,6 +17,9 @@ import threading
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 
+import numpy as np
+import torch
+
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
     KVConnectorOutput,
@@ -27,6 +30,32 @@ from atom.kv_transfer.offload import config as offcfg
 
 logger = logging.getLogger("atom")
 _VALID_KV_ROLES = {"offload", "kv_both", "kv_producer", "kv_consumer"}
+
+
+def tokens_to_tensor(tokens: list[int]) -> torch.Tensor:
+    """Materialize a request's token ids as an int64 CPU tensor.
+
+    ``torch.tensor(list_of_int)`` unboxes every element through the CPython
+    API while holding the GIL, and offload runs on save/load worker threads
+    that contend for it with the forward loop. numpy builds the buffer in C
+    and ``from_numpy`` adopts it without a copy; the resulting values and
+    dtype are identical.
+
+    Two measurements, because they disagree and the smaller one is the one to
+    plan against. A microbenchmark at M3's longest requests (32768 ids, three
+    threads spinning on the GIL) gives 16.1 ms per call for ``torch.tensor``
+    against 1.8 ms here -- 8.8x. In the server, across a 180 s window at 440
+    save calls per rank, the same substitution moved the conversion from
+    5.07 s to 1.71 s -- 3.0x. The gap is request length: the benchmark uses
+    the longest requests, the server sees a distribution, and the numpy path's
+    fixed cost is a larger share of a short one. The in-server figure is what
+    the connector's own budget moved by, and it was 24% of the whole save cost
+    before the change.
+
+    The tensor aliases the fresh numpy buffer, which nothing else holds, so
+    LMCache owns it outright.
+    """
+    return torch.from_numpy(np.asarray(tokens, dtype=np.int64))
 
 
 def validated_kv_role(kvc: dict) -> str:
@@ -112,6 +141,7 @@ class OffloadWorkerMixin:
         config,
         *,
         save_workers: int | None = None,
+        load_workers: int | None = None,
         thread_name_prefix: str = "offload",
     ) -> None:
         kvc = getattr(config, "kv_transfer_config", {}) or {}
@@ -119,7 +149,8 @@ class OffloadWorkerMixin:
         self._do_save = self.kv_role in ("offload", "kv_both", "kv_producer")
         self._do_load = self.kv_role in ("offload", "kv_both", "kv_consumer")
         # Separate executors so a load (on the TTFT critical path) never queues
-        # behind fire-and-forget saves. OFFLOAD_COPY_WORKERS tunes the save pool.
+        # behind fire-and-forget saves. OFFLOAD_COPY_WORKERS tunes the save pool,
+        # OFFLOAD_LOAD_WORKERS the load pool.
         n_save = (
             int(os.environ.get("OFFLOAD_COPY_WORKERS", "1"))
             if save_workers is None
@@ -127,17 +158,44 @@ class OffloadWorkerMixin:
         )
         if n_save <= 0:
             raise ValueError("offload save worker count must be positive")
+        # A single load thread saturates once the HBM pool is small enough for
+        # the CPU tier to serve real traffic: measured 143s of `retrieve` inside
+        # a 163s window (88% duty cycle) on the radix workload at 7900 blocks,
+        # which turned a +57.8pp hit-rate win into a 4% throughput loss. The
+        # byte-copy path keeps its staging buffers and CUDA streams in
+        # thread-local state (`_BlockGpuConnector._thread_state`), so extra load
+        # threads are independent; each costs one more
+        # `gpu_staging_buffer_bytes` allocation per rank.
+        n_load = (
+            int(os.environ.get("OFFLOAD_LOAD_WORKERS", "1"))
+            if load_workers is None
+            else int(load_workers)
+        )
+        if n_load <= 0:
+            raise ValueError("offload load worker count must be positive")
+        # Kept alongside the pools so callers that want to report the widths --
+        # the startup banner does -- need not reach into ThreadPoolExecutor's
+        # private `_max_workers`.
+        self.save_workers = n_save
+        self.load_workers = n_load
         self._save_executor = ThreadPoolExecutor(
             max_workers=n_save, thread_name_prefix=f"{thread_name_prefix}-save"
         )
         self._load_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix=f"{thread_name_prefix}-load"
+            max_workers=n_load, thread_name_prefix=f"{thread_name_prefix}-load"
         )
         self._lock = threading.Lock()
         self._done_save: set[SaveCompletionId] = set()
         self._done_load: set[LoadCompletionId] = set()
         self._failed_load: set[LoadCompletionId] = set()
         self._connector_completions: set[ConnectorCompletion] = set()
+        # GPU blocks a failed load left unfilled, and the copy jobs still
+        # running per request. Both exist for the vLLM plugin path: vLLM needs
+        # the block ids to truncate `num_computed_tokens` at the first block a
+        # load could not supply, and needs a fence it can hold a preemption
+        # against. See `take_load_error_blocks` / `wait_for_requests`.
+        self._failed_load_blocks: set[int] = set()
+        self._inflight_jobs: dict[str, set] = {}
 
     def close(self) -> None:
         """Join the save/load executors at worker teardown.
@@ -154,6 +212,87 @@ class OffloadWorkerMixin:
             executor = getattr(self, name, None)
             if executor is not None:
                 executor.shutdown(wait=True)
+
+    # -- in-flight job tracking (preemption fence) -----------------------
+    def _track_job(self, req_id, future) -> None:
+        """Remember one submitted copy job so a preemption can wait on it.
+
+        vLLM frees a preempted request's blocks inside `schedule()` and may hand
+        them to another request in the same step. A save still reading them then
+        persists the new occupant's bytes under the old request's key -- a
+        poisoned cache entry, not a lost one. `wait_for_requests` is the fence,
+        and it needs the futures the submit sites otherwise discard.
+        """
+
+        sid = str(req_id)
+        with self._lock:
+            self._inflight_jobs.setdefault(sid, set()).add(future)
+        # Runs inline when the job already finished; `_lock` is released above,
+        # so the callback can retake it.
+        future.add_done_callback(lambda done, sid=sid: self._untrack_job(sid, done))
+
+    def _untrack_job(self, sid: str, future) -> None:
+        with self._lock:
+            pending = self._inflight_jobs.get(sid)
+            if pending is None:
+                return
+            pending.discard(future)
+            if not pending:
+                del self._inflight_jobs[sid]
+
+    def wait_for_requests(self, req_ids) -> None:
+        """Block until every copy job for `req_ids` has stopped touching HBM.
+
+        Called from the preemption fence, which runs before the forward that
+        would overwrite the freed blocks. `_guard` already swallows job
+        exceptions, so `result()` is only ever a join.
+        """
+
+        jobs: set = set()
+        with self._lock:
+            for req_id in req_ids or ():
+                jobs |= self._inflight_jobs.get(str(req_id), set())
+        for job in jobs:
+            try:
+                job.result()
+            except Exception:  # pragma: no cover - `_guard` swallows job errors
+                logger.exception("offload: in-flight job raised while fencing")
+
+    def take_load_error_blocks(self) -> set[int]:
+        """Drain the GPU blocks that failed loads left holding no valid KV."""
+
+        with self._lock:
+            blocks = set(self._failed_load_blocks)
+            self._failed_load_blocks.clear()
+        return blocks
+
+    def _record_load_error_blocks(self, req) -> None:
+        """Record the block range a failed load was supposed to fill.
+
+        The caller must hold `self._lock`. The range is the one the load owned:
+        `[hbm_cached_tokens, lmcache_cached_tokens)`. Everything below the HBM
+        frontier is already valid, so reporting it would make vLLM discard a
+        prefix that is fine -- and those lower blocks may be shared with another
+        request, whose computed count would then be truncated too.
+
+        The token-to-block grid is the VIRTUAL block size, the same one
+        `BlockGPUConnector` maps chunks with: under DCP one scheduler block id
+        covers one virtual global block while the codec moves a rank-local
+        physical page, so the physical size would index the wrong entries.
+        """
+
+        load_spec = getattr(req, "load_spec", None)
+        block_ids = list(getattr(req, "block_ids", ()) or ())
+        block_size = int(
+            getattr(self, "virtual_block_size", None)
+            or getattr(self, "block_size", 0)
+            or 0
+        )
+        if load_spec is None or not block_ids or block_size <= 0:
+            return
+        start = max(0, int(load_spec.hbm_cached_tokens)) // block_size
+        end = -(-max(0, int(load_spec.lmcache_cached_tokens)) // block_size)
+        self._failed_load_blocks.update(block_ids[start:end])
 
     @staticmethod
     def _load_completion_id(req) -> LoadCompletionId:
@@ -234,6 +373,7 @@ class OffloadWorkerMixin:
                 self._on_load_fail(rid)
                 with self._lock:
                     self._failed_load.add(self._load_completion_id(req))
+                    self._record_load_error_blocks(req)
             else:
                 # Layouts with a richer success/failure protocol override this
                 # hook.  Legacy layouts still report a terminal save so a
@@ -339,6 +479,10 @@ class OffloadSchedulerMixin(ABC):
         self.total_saved_tokens = 0
         self._load_inflight_tokens: dict[object, int] = {}
         self._save_inflight_tokens: dict[object, int] = {}
+        # req_id -> the sequence whose external-tier load failed. One
+        # external-tier attempt per request; see `_repeat_load_suppressed`.
+        self._load_failed_seqs: dict[str, object] = {}
+        self.total_suppressed_load_retries = 0
         # Early block-release observability. Populated by layouts that support
         # exact source-block leases; unsupported layouts leave these at 0.
         self.total_early_released_blocks = 0  # freed at request-finish, not save-gated
@@ -493,6 +637,59 @@ class OffloadSchedulerMixin(ABC):
     def _chunk_floor(self, tokens: int) -> int:
         chunk = int(self.chunk_size or 256)
         return (max(0, int(tokens)) // chunk) * chunk
+
+    def _loadable_hit(self, hit: int, num_prompt: int) -> int:
+        """Turn a lookup hit into a length the external tier can actually serve.
+
+        Two steps, in this order:
+
+        * A hit covering the whole prompt leaves nothing to compute, so step
+          back one token.
+        * Floor to a chunk. `retrieve` resolves the tier at chunk granularity,
+          so a `hit` that is not a chunk multiple names tokens the tier does
+          not hold and the load's `ret_mask[hbm:lmc].all()` check can never
+          pass. The decrement above is exactly how that happens in practice:
+          a prompt whose length is a multiple of the chunk size lands on a
+          boundary and stepping back one token walks off it -- which is why the
+          floor must come second. Flooring costs at most one chunk of
+          re-prefill and makes the spec satisfiable; without it such a request
+          can never load, only fail.
+        """
+
+        hit = int(hit)
+        if hit == int(num_prompt):
+            hit -= 1
+        return self._chunk_floor(hit)
+
+    def _repeat_load_suppressed(self, seq, sid: str) -> bool:
+        """True once this request has spent its one external-tier attempt.
+
+        Asking again repeats the same lookup against the same tier state, which
+        is how a single failure becomes a permanent one: `load_failed` clears
+        the pending load and the lookup memo, so the next scheduler pass hits,
+        parks the request in WAITING_FOR_REMOTE_KVS again, and fails again --
+        forever, holding the request's KV blocks and its concurrency slot the
+        whole time. Prefilling normally instead is exactly what would have
+        happened with no external tier at all.
+        """
+
+        if self._load_failed_seqs.get(sid) is seq:
+            self.total_suppressed_load_retries += 1
+            return True
+        return False
+
+    def _record_failed_load_attempt(self, sid: str) -> None:
+        """Spend the attempt against the sequence that actually suffered it."""
+
+        failed_seq = self._load_lifecycles.get(sid)
+        if failed_seq is not None:
+            self._load_failed_seqs[sid] = failed_seq
+
+    def _release_failed_load_attempt(self, sid: str, seq) -> None:
+        """Drop the mark when its sequence is done with the request ID."""
+
+        if self._load_failed_seqs.get(sid) is seq:
+            self._load_failed_seqs.pop(sid, None)
 
     def _lmcache_hit_save_floor(self, load_spec) -> int:
         if load_spec is None:

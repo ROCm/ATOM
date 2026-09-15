@@ -108,6 +108,7 @@ from atom.model_ops.linear import (
     use_triton_gemm,
 )
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE, atom_parameter
 from atom.models.utils import (
@@ -1622,30 +1623,12 @@ def sparse_attn_indexer(
         # Each chunk still scores the FULL KV, so every row's top-k is computed
         # completely in one shot: the result is exact with no cross-chunk merge,
         # the kernel's column indices are already global (no remapping), and each
-        # chunk writes straight into its output row slice (no copy). When the
-        # budget is disabled (0) or a single chunk fits, the loop runs exactly
-        # once and matches the original single-shot behavior.
-        budget_bytes = SPARSE_INDEXER_LOGITS_BUDGET_MB * 1024 * 1024
-        if (
-            budget_bytes > 0
-            and total_kv > 0
-            and budget_bytes // (total_kv * 4) < num_rows
-        ):
-            # 4 bytes per fp32 logit; total_kv * 4 is one query row's footprint.
-            # Round the budget-derived row count DOWN to keep the buffer within
-            # budget: a multiple of 128 (aligned to the kernel's row tiling) in
-            # the normal regime, avoiding the coarse power-of-2 doubling. When
-            # the budget affords < 128 rows (extreme total_kv), fall back to a
-            # power-of-2 floor so it degrades to 64/32/.../1 instead of
-            # collapsing straight to 1.
-            budget_rows = budget_bytes // (total_kv * 4)
-            if budget_rows >= 128:
-                chunk_tokens = (budget_rows // 128) * 128
-            else:
-                chunk_tokens = 1 << (max(1, budget_rows).bit_length() - 1)
-        else:
-            # Budget disabled, or a single chunk already fits all rows.
-            chunk_tokens = num_rows
+        # chunk writes straight into its output row slice (no copy). When a
+        # single chunk fits, the loop runs exactly once and matches the original
+        # single-shot behavior.
+        chunk_tokens = sparse_indexer_row_chunk(
+            num_rows, total_kv, SPARSE_INDEXER_LOGITS_BUDGET_MB
+        )
         for chunk_start in range(0, num_rows, chunk_tokens):
             chunk_end = min(chunk_start + chunk_tokens, num_rows)
             # Per-row window bounds slice 1:1 with this chunk's rows.
