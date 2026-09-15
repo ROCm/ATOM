@@ -23,6 +23,9 @@ from collections.abc import Callable
 from typing import Any
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Directory for the engram compressed-vocab cache (.npz). Empty = default
+    # ~/.cache/atom/engram. Read by CompressedTokenizer._load_or_build.
+    "ATOM_ENGRAM_CACHE_DIR": lambda: os.getenv("ATOM_ENGRAM_CACHE_DIR", ""),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
     "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
