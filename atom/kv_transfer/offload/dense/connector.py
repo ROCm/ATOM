@@ -269,17 +269,34 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         if self._profile_enabled():
             logger.info(
                 "[OFFLOAD-LOAD-PROF] rank=%s req=%s hbm=%d lmc=%d "
-                "retrieved=%d status=%s retrieve_ms=%.2f total_ms=%.2f "
-                "transfer=%s",
+                "retrieved=%d status=%s chunks=%d groups=%d "
+                "max_chunk_bytes=%d max_group_bytes=%d "
+                "gpu_staging_chunk_bytes=%d gpu_staging_buffer_chunks=%d "
+                "gpu_staging_buffer_bytes=%d total_bytes=%d "
+                "pack_ms=%.2f copy_ms=%.2f sync_ms=%.2f "
+                "transfer_ms=%.2f effective_gbps=%.2f "
+                "retrieve_ms=%.2f total_ms=%.2f",
                 getattr(self, "_rank", "?"),
                 req.req_id,
                 hbm,
                 lmc,
                 int(ret_mask.sum().item()),
                 "ok" if loaded else "miss",
+                int(transfer_stats.get("chunks", 0)),
+                int(transfer_stats.get("groups", 0)),
+                int(transfer_stats.get("max_chunk_bytes", 0)),
+                int(transfer_stats.get("max_group_bytes", 0)),
+                int(transfer_stats.get("gpu_staging_chunk_bytes", 0)),
+                int(transfer_stats.get("gpu_staging_buffer_chunks", 0)),
+                int(transfer_stats.get("gpu_staging_buffer_bytes", 0)),
+                int(transfer_stats.get("total_bytes", 0)),
+                float(transfer_stats.get("pack_ms", 0.0)),
+                float(transfer_stats.get("copy_ms", 0.0)),
+                float(transfer_stats.get("sync_ms", 0.0)),
+                float(transfer_stats.get("transfer_ms", 0.0)),
+                float(transfer_stats.get("effective_gbps", 0.0)),
                 retrieve_ms,
                 total_ms,
-                self._transfer_stats_summary(transfer_stats),
             )
 
     def _do_save_req(self, req: LMCacheReqMeta) -> None:
@@ -319,14 +336,31 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         if self._profile_enabled():
             logger.info(
                 "[OFFLOAD-SAVE-PROF] rank=%s req=%s toks=%d skip=%d "
-                "store_ms=%.2f total_ms=%.2f transfer=%s",
+                "chunks=%d groups=%d max_chunk_bytes=%d max_group_bytes=%d "
+                "gpu_staging_chunk_bytes=%d "
+                "gpu_staging_buffer_chunks=%d gpu_staging_buffer_bytes=%d "
+                "total_bytes=%d pack_ms=%.2f copy_ms=%.2f sync_ms=%.2f "
+                "transfer_ms=%.2f effective_gbps=%.2f "
+                "store_ms=%.2f total_ms=%.2f",
                 getattr(self, "_rank", "?"),
                 req.req_id,
                 len(toks),
                 skip,
+                int(transfer_stats.get("chunks", 0)),
+                int(transfer_stats.get("groups", 0)),
+                int(transfer_stats.get("max_chunk_bytes", 0)),
+                int(transfer_stats.get("max_group_bytes", 0)),
+                int(transfer_stats.get("gpu_staging_chunk_bytes", 0)),
+                int(transfer_stats.get("gpu_staging_buffer_chunks", 0)),
+                int(transfer_stats.get("gpu_staging_buffer_bytes", 0)),
+                int(transfer_stats.get("total_bytes", 0)),
+                float(transfer_stats.get("pack_ms", 0.0)),
+                float(transfer_stats.get("copy_ms", 0.0)),
+                float(transfer_stats.get("sync_ms", 0.0)),
+                float(transfer_stats.get("transfer_ms", 0.0)),
+                float(transfer_stats.get("effective_gbps", 0.0)),
                 store_ms,
                 total_ms,
-                self._transfer_stats_summary(transfer_stats),
             )
         self._record_store_terminal(req, True)
 
