@@ -1890,6 +1890,135 @@ class TestPostprocess:
 # ── chunked-prefill finality ───────────────────────────────────────────────
 
 
+class TestChunkedPrefillFinality:
+    """A prefill ends at the admitted length, not at the prompt boundary.
+
+    A sequence re-admitted after `preempt` has to recompute prompt *plus*
+    every token it had already generated, so `num_cached_tokens >=
+    num_prompt_tokens` is the normal state of one of its middle chunks. Ending
+    the prefill there leaves the rest of the context with no KV, and the
+    sequence then decodes against blocks still holding whatever the previous
+    owner wrote into them.
+    """
+
+    PROMPT = tuple(range(10, 18))  # 8 tokens
+    GENERATED = tuple(range(100, 112))  # 12 more to recompute -> 20 admitted
+
+    def _sched(self, max_num_batched_tokens=16):
+        return Scheduler(
+            MockConfig(
+                num_kvcache_blocks=64,
+                kv_cache_block_size=4,
+                max_model_len=256,
+                max_num_batched_tokens=max_num_batched_tokens,
+                max_num_seqs=4,
+            )
+        )
+
+    def _readmitted(self, sched, seq_factory):
+        """A sequence as `preempt` leaves it: back in `waiting`, owing a
+        prefill over prompt + everything it had generated."""
+        seq = seq_factory(self.PROMPT)
+        for token in self.GENERATED:
+            seq.append_token(token)
+        assert seq.num_tokens > seq.num_prompt_tokens
+        sched.add(seq)
+        return seq
+
+    @staticmethod
+    def _output(seq_id, tokens):
+        return ScheduledBatchOutput(
+            req_ids=[seq_id],
+            token_ids=[tuple(tokens)],
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
+        )
+
+    def _batch(self, seq, chunk, cached, is_final):
+        return ScheduledBatch(
+            seqs={seq.id: seq},
+            num_scheduled_tokens=[chunk],
+            total_tokens_num=chunk,
+            total_tokens_num_prefill=chunk,
+            total_seqs_num=1,
+            total_seqs_num_prefill=1,
+            num_cached_tokens=[cached],
+            is_final_chunk=is_final,
+        )
+
+    def test_schedule_measures_finality_against_the_admitted_length(self, seq_factory):
+        """The 337-token recompute split into 256 + 81 was declared complete
+        after the first chunk, because `256 >= 128` held against the prompt."""
+        sched = self._sched()
+        seq = self._readmitted(sched, seq_factory)
+
+        batch, _ = sched.schedule()
+        first = int(batch.num_scheduled_tokens[0])
+
+        assert first < seq.num_tokens
+        assert first >= seq.num_prompt_tokens, "the interesting case: past the prompt"
+        assert batch.is_final_chunk == [False]
+        # A batch of middle chunks yields no token for the head to consume.
+        assert batch.produces_output() is False
+
+        sched.postprocess(list(sched.running), self._output(seq.id, [99]), batch=batch)
+        batch2, _ = sched.schedule()
+
+        assert int(batch2.num_scheduled_tokens[0]) == seq.num_tokens - first
+        assert batch2.is_final_chunk == [True]
+
+    def test_postprocess_takes_finality_from_the_batch(self, seq_factory):
+        """`num_cached_tokens < num_prompt_tokens` is not a usable predicate
+        here: it calls this middle chunk final, and by the time postprocess
+        runs `num_tokens` may have grown by the sampled token, so neither
+        length is a valid bound."""
+        sched = self._sched()
+        seq = self._readmitted(sched, seq_factory)
+        chunk = 16
+        batch, _ = sched.schedule()
+        assert int(batch.num_scheduled_tokens[0]) == chunk
+
+        sched.postprocess(list(sched.running), self._output(seq.id, [99]), batch=batch)
+
+        assert seq.num_cached_tokens == chunk
+        assert seq.num_cached_tokens >= seq.num_prompt_tokens  # the length trap
+        assert seq.is_partial_prefill is True
+        assert sched._partial_prefill_count == 1
+        # A middle chunk's sampled token is not real output.
+        assert 99 not in list(seq.token_ids)
+
+    def test_postprocess_clears_partial_on_the_final_chunk(self, seq_factory):
+        sched = self._sched()
+        seq = self._readmitted(sched, seq_factory)
+        sched.schedule()  # first chunk: 16 of the 20 admitted tokens
+        seq.num_cached_tokens = 16
+        seq.is_partial_prefill = True
+        sched._partial_prefill_count = 1
+        batch = self._batch(seq, chunk=4, cached=16, is_final=[True])
+
+        sched.postprocess(list(sched.running), self._output(seq.id, [99]), batch=batch)
+
+        assert seq.num_cached_tokens == 20
+        assert seq.is_partial_prefill is False
+        assert sched._partial_prefill_count == 0
+
+    def test_postprocess_falls_back_to_lengths_without_the_field(self, seq_factory):
+        """The fallback is for callers that hand a batch without the field; the
+        scheduler itself always sets it."""
+        sched = self._sched()
+        seq = self._readmitted(sched, seq_factory)
+        sched.schedule()
+        seq.num_cached_tokens = 0
+        batch = self._batch(seq, chunk=4, cached=0, is_final=None)
+        assert batch.is_final_chunk is None
+
+        sched.postprocess(list(sched.running), self._output(seq.id, [99]), batch=batch)
+
+        # 4 < 8 prompt tokens, so the length comparison still says partial.
+        assert seq.is_partial_prefill is True
+
+
 # ── offload-resume admission ───────────────────────────────────────────────
 
 
