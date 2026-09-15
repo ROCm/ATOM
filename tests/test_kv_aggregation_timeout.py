@@ -3,7 +3,7 @@
 """KV RPC timeouts must preserve destructive worker completion reports."""
 
 import queue
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 from aiter_stub import stubbed_aiter
@@ -31,7 +31,7 @@ def _manager(world_size=2):
     manager.rpc_broadcast_mq = Mock()
     manager.kv_output_aggregator = None
     manager.kv_outputs_queues = [queue.Queue() for _ in range(world_size)]
-    manager._pending_kv_outputs = None
+    manager._pending_kv_aggregation = None
     return manager
 
 
@@ -50,7 +50,7 @@ def _report(operation, *channels, succeeded=True):
 
 
 def _poll(manager):
-    # Real queues with a zero timeout make delayed replies deterministic.
+    # Non-blocking collection; timeout=0 also suppresses HOL logging.
     return manager.call_func_with_aggregation(_POLL, timeout=0)
 
 
@@ -81,14 +81,16 @@ def test_timeout_keeps_consumed_reports_until_all_workers_reply(
         == _report(operation, _STORE, _RETIRED).connector_completions
     )
     assert manager.kv_output_aggregator.pending_count == (0, 0)
-    manager.rpc_broadcast_mq.enqueue.assert_called_once_with((_POLL,))
+    assert manager._pending_kv_aggregation is not None
+    assert manager.rpc_broadcast_mq.enqueue.call_count == 2
 
-    # Completing the old batch permits one new poll. Already-consumed
-    # completions must not appear again when the next replies are empty.
+    # The next aggregation was already armed before the completed result was
+    # returned. Already-consumed completions must not appear in that batch.
     for output_queue in manager.kv_outputs_queues:
         output_queue.put(KVConnectorOutput())
     assert _poll(manager).is_empty()
-    assert manager.rpc_broadcast_mq.enqueue.call_count == 2
+    assert manager._pending_kv_aggregation is not None
+    assert manager.rpc_broadcast_mq.enqueue.call_count == 3
     assert all(output_queue.empty() for output_queue in manager.kv_outputs_queues)
 
 
@@ -98,6 +100,11 @@ def test_timeout_before_first_reply_does_not_repeat_broadcast():
     manager.kv_outputs_queues[1].put(_report(operation, _STORE, _RETIRED))
 
     assert _poll(manager) is None
+    # Rank 1 can be consumed while rank 0 is still missing.
+    assert manager.kv_outputs_queues[1].empty()
+    assert manager._pending_kv_aggregation is not None
+    assert manager._pending_kv_aggregation.worker_outputs[1] is not None
+    assert manager._pending_kv_aggregation.missing_worker_ranks() == [0]
     assert _poll(manager) is None
     manager.rpc_broadcast_mq.enqueue.assert_called_once_with((_POLL,))
 
@@ -107,7 +114,8 @@ def test_timeout_before_first_reply_does_not_repeat_broadcast():
     assert result is not None
     assert result.finished_saving == {operation}
     assert len(result.connector_completions) == 2
-    manager.rpc_broadcast_mq.enqueue.assert_called_once_with((_POLL,))
+    assert manager._pending_kv_aggregation is not None
+    assert manager.rpc_broadcast_mq.enqueue.call_count == 2
 
 
 @pytest.mark.parametrize("first_channel", [_STORE, _RETIRED])
@@ -134,7 +142,7 @@ def test_timeout_preserves_separate_store_and_retired_quorums(
         expected = _report(operation, channel, succeeded=store_succeeded)
         assert result.connector_completions == expected.connector_completions
         assert result.finished_saving == expected.finished_saving
-        assert manager.rpc_broadcast_mq.enqueue.call_count == poll_count
+        assert manager.rpc_broadcast_mq.enqueue.call_count == poll_count + 1
         results.append(result)
 
     assert set().union(*(result.connector_completions for result in results)) == (
@@ -157,7 +165,7 @@ def test_resumed_batches_keep_worker_identity_and_reply_order():
     manager.kv_outputs_queues[1].put(_report(operations[1], _STORE, _RETIRED))
     first = _poll(manager)
     assert first is not None and first.is_empty()
-    manager.rpc_broadcast_mq.enqueue.assert_called_once_with((_POLL,))
+    assert manager.rpc_broadcast_mq.enqueue.call_count == 2
 
     # The opposite ranks now report the missing generations. This second
     # batch must consume exactly one reply from each original rank.
@@ -174,5 +182,51 @@ def test_resumed_batches_keep_worker_identity_and_reply_order():
             for operation in operations
         )
     )
-    assert manager.rpc_broadcast_mq.enqueue.call_count == 2
+    assert manager.rpc_broadcast_mq.enqueue.call_count == 3
     assert manager.kv_output_aggregator.pending_count == (0, 0)
+    assert manager._pending_kv_aggregation is not None
+
+
+def test_later_ranks_are_consumed_while_an_earlier_rank_is_missing():
+    manager = _manager(world_size=8)
+    operation = SaveOperationId(0, 0)
+    for rank in (3, 7, 1):
+        manager.kv_outputs_queues[rank].put(_report(operation, _STORE, _RETIRED))
+
+    assert _poll(manager) is None
+    pending = manager._pending_kv_aggregation
+    assert pending is not None
+    assert pending.missing_worker_ranks() == [0, 2, 4, 5, 6]
+    for rank in (1, 3, 7):
+        assert pending.worker_outputs[rank] is not None
+        assert manager.kv_outputs_queues[rank].empty()
+    manager.rpc_broadcast_mq.enqueue.assert_called_once_with((_POLL,))
+
+    for rank in pending.missing_worker_ranks():
+        manager.kv_outputs_queues[rank].put(_report(operation, _STORE, _RETIRED))
+    result = _poll(manager)
+    assert result is not None
+    assert result.finished_saving == {operation}
+    assert manager._pending_kv_aggregation is not None
+    assert manager.rpc_broadcast_mq.enqueue.call_count == 2
+
+
+def test_completed_aggregation_arms_the_next_batch_before_returning():
+    manager = _manager(world_size=2)
+    operation = SaveOperationId(0, 0)
+
+    assert _poll(manager) is None
+    manager.rpc_broadcast_mq.enqueue.assert_called_once_with((_POLL,))
+    first_pending = manager._pending_kv_aggregation
+
+    for output_queue in manager.kv_outputs_queues:
+        output_queue.put(_report(operation, _STORE, _RETIRED))
+    result = _poll(manager)
+
+    assert result is not None
+    assert result.finished_saving == {operation}
+    manager.rpc_broadcast_mq.enqueue.assert_has_calls([call((_POLL,)), call((_POLL,))])
+    assert manager.rpc_broadcast_mq.enqueue.call_count == 2
+    assert manager._pending_kv_aggregation is not None
+    assert manager._pending_kv_aggregation is not first_pending
+    assert manager._pending_kv_aggregation.worker_outputs == [None, None]
