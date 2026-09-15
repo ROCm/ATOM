@@ -365,6 +365,10 @@ class FusedMoEConfig:
     def use_rccl_kernels(self):
         return self.moe_parallel_config.use_rccl_kernels
 
+    @property
+    def low_latency(self):
+        return self.moe_parallel_config.low_latency
+
 
 def moe_kernel_token_capacity(
     atom_config,

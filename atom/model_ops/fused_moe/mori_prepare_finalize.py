@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Any
 
 import torch
@@ -24,96 +22,8 @@ except ImportError:
     mori = None  # type: ignore
     MORI_AVAILABLE = False
 
-logger = logging.getLogger("atom")
-
 
 _NUM_TBO_UBATCHES = 2
-
-
-def select_mori_kernel_params(
-    *, low_latency: bool, internode: bool
-) -> tuple[str, int, int, int]:
-    """Pick the MoRI kernel and its launch geometry.
-
-    Returns ``(kernel_name, warp_num_per_block, block_num, rdma_block_num)``.
-    The name is resolved against ``mori.ops.EpDispatchCombineKernelType`` by the
-    caller so this stays importable (and testable) without mori installed.
-
-    `internode` must come from a real topology probe. It used to be inferred
-    from ``world_size <= 8``, which is a GPUs-per-node assumption rather than a
-    measurement: 2 nodes x 4 GPUs reads as intra-node and selects kernels that
-    assume P2P mappings across a boundary that has none.
-    """
-    if low_latency:
-        return ("AsyncLL", 8, 64, 32)
-    if internode:
-        return ("InterNodeV1", 16, 32, 16)
-    return ("IntraNode", 16, 80, 0)
-
-
-@lru_cache(maxsize=8)
-def init_mori_op(
-    rank: int,
-    world_size: int,
-    hidden_dim: int,
-    scale_dim: int,
-    max_num_inp_token_per_rank: int,
-    num_local_experts: int,
-    num_experts_per_token: int,
-    gpu_per_node: int,
-    data_type_itemsize: int,
-    max_token_type_size: int,
-    low_latency: bool = False,
-    internode: bool = False,
-    instance_id: int = 0,
-    scale_type_size: int = torch.float32.itemsize,
-    quant_type: str = "none",
-) -> Any:
-    """
-    Create a mori op instance.
-      - low_latency=True  → AsyncLL (dispatch_send/recv, combine_send/recv)
-      - internode=True    → InterNodeV1 (RDMA across nodes)
-      - otherwise         → IntraNode
-    """
-    import mori
-
-    data_type = torch.float8_e4m3fnuz
-    for dt in [torch.float8_e4m3fnuz, torch.float8_e4m3fn, torch.bfloat16]:
-        if dt.itemsize == data_type_itemsize:
-            data_type = dt
-            break
-
-    kernel_name, warp_num_per_block, block_num, rdma_block_num = (
-        select_mori_kernel_params(low_latency=low_latency, internode=internode)
-    )
-    kernel_type = getattr(mori.ops.EpDispatchCombineKernelType, kernel_name)
-
-    mori_config = mori.ops.EpDispatchCombineConfig(
-        rank=rank,
-        world_size=world_size,
-        data_type=data_type,
-        hidden_dim=hidden_dim,
-        scale_dim=scale_dim,
-        scale_type_size=scale_type_size,
-        quant_type=quant_type,
-        max_token_type_size=max_token_type_size,
-        max_num_inp_token_per_rank=max_num_inp_token_per_rank,
-        num_experts_per_rank=num_local_experts,
-        num_experts_per_token=num_experts_per_token,
-        warp_num_per_block=warp_num_per_block,
-        block_num=block_num,
-        kernel_type=kernel_type,
-        gpu_per_node=gpu_per_node,
-        rdma_block_num=rdma_block_num,
-        **({"num_qp_per_pe": 2} if low_latency else {}),
-    )
-    mori_op = mori.ops.EpDispatchCombineOp(mori_config)
-    logger.info(
-        f"[MORI] Created {kernel_type} mori_op instance_id={instance_id}: "
-        f"{rank=} {world_size=} {hidden_dim=} {num_local_experts=} "
-        f"{num_experts_per_token=}"
-    )
-    return mori_op
 
 
 _FP8_DTYPES = (
@@ -173,6 +83,15 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     Prepare/Finalize using MoRI kernels.
     """
 
+    @staticmethod
+    def uses_split_send_recv(kernel_name: str) -> bool:
+        """Which async protocol a MoRI kernel implements.
+
+        Only AsyncLL has the split send/recv API; mori raises on
+        ``dispatch_recv``/``combine_recv`` for every other kernel type.
+        """
+        return kernel_name == "AsyncLL"
+
     def __init__(
         self,
         mori_op: Any,
@@ -182,7 +101,6 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         quant_dtype: torch.dtype = None,
         is_async: bool = False,
         tbo_mori_ops: list | None = None,
-        low_latency: bool = False,
     ):
         if not MORI_AVAILABLE:
             raise ImportError(
@@ -191,13 +109,14 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             )
         super().__init__()
         self._sync_mori_op = mori_op
-        self._tbo_mori_ops = tbo_mori_ops  # per-ubatch ops for TBO (IntraNode)
+        self._tbo_mori_ops = tbo_mori_ops  # per-ubatch ops for TBO
         self.num_dispatchers_ = num_dispatchers
         self.max_tokens_per_rank = max_tokens_per_rank
         self.dispatch_format = dispatch_format
         self.quant_dtype = quant_dtype
         self._is_async = is_async
-        self._low_latency = low_latency
+        # Which async protocol the op we were given actually implements.
+        self._low_latency = self.uses_split_send_recv(mori_op.config.kernel_type.name)
 
     # Derived from the resolved format so there is no second copy to keep in
     # sync with the staging config.
@@ -243,6 +162,12 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         atom-vllm has no stable prefill/decode flag at this call site and
         instead selects by a token-count threshold; it overrides this method
         via a plugin patch, so keep this body frontend-agnostic.
+
+        Pass these by keyword. MoRI takes (block_num, rdma_block_num,
+        warp_per_block); six positional arguments put warp_per_block into
+        rdma_block_num and left the real one at -1, so on the inter-node
+        kernels the RDMA block count silently became 16 (prefill) or 4
+        (decode) instead of the value their config asks for.
 
         block_num is capped at the device CU count: mori's IntraNode
         dispatch/combine use a hand-rolled grid-wide barrier
@@ -307,7 +232,12 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             dispatch_ids,
             dispatch_recv_token_num,
         ) = self._sync_mori_op.dispatch(
-            a1, topk_weights, scale, topk_ids, block_num, warp_per_block
+            a1,
+            topk_weights,
+            scale,
+            topk_ids,
+            block_num=block_num,
+            warp_per_block=warp_per_block,
         )
 
         expert_tokens_meta = mk.ExpertTokensMetadata(
@@ -338,13 +268,16 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             fused_expert_output,
             None,
             topk_ids,
-            block_num,
-            warp_per_block,
+            block_num=block_num,
+            warp_per_block=warp_per_block,
         )[0]
         return result[:num_token]
 
-    # 1. IntraNode (default TBO): dispatch()/combine() on comm_stream
-    # 2. AsyncLL (--low-latency): dispatch_send/recv, combine_send/recv (CU-free)
+    # 1. comm-stream (IntraNode / InterNodeV1 / InterNodeV1LL): dispatch() and
+    #    combine() on comm_stream. `_low_latency` must be False for these --
+    #    mori only exposes the split send/recv API on AsyncLL.
+    # 2. AsyncLL (--low-latency, intra-node): dispatch_send/recv,
+    #    combine_send/recv (CU-free)
     def prepare_async(
         self,
         a1: torch.Tensor,
@@ -462,7 +395,12 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             dispatch_ids,
             dispatch_recv_token_num,
         ) = mori_op.dispatch(
-            a1, topk_weights, scale, topk_ids, block_num, warp_per_block
+            a1,
+            topk_weights,
+            scale,
+            topk_ids,
+            block_num=block_num,
+            warp_per_block=warp_per_block,
         )
 
         tbo_switch_to_compute_sync()
@@ -547,8 +485,8 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             fused_expert_output,
             None,
             topk_ids,
-            block_num,
-            warp_per_block,
+            block_num=block_num,
+            warp_per_block=warp_per_block,
         )[0]
 
         tbo_switch_to_compute_sync()
