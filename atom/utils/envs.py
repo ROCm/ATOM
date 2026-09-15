@@ -609,6 +609,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # After a prefill forward, protect this many scheduler passes for decode
     # before allowing another prefill. Mirrors SGLang's
     # --prefill-decode-interval; 0 disables the hard interval.
+    # A nonzero interval also enables local coalescing on TP without PP.
     "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
         os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
     ),

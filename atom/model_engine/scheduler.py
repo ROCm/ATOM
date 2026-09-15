@@ -571,6 +571,9 @@ class Scheduler:
 
         kv_events_cfg = getattr(config, "kv_events_config", None)
         parallel_cfg = getattr(config, "parallel_config", None)
+        self._local_prefill_coalescing = (
+            getattr(parallel_cfg, "data_parallel_size", 1) == 1
+        )
         dp_rank = (
             getattr(parallel_cfg, "data_parallel_rank", None)
             if parallel_cfg is not None
@@ -612,14 +615,69 @@ class Scheduler:
                 endpoint="",
             )
 
-        # Cross-DP prefill alignment. Set by DPEngineCoreProc after
-        # dp_group is available. See `prefill_delayer.py` for rationale.
+        # Set by EngineCore for cross-DP alignment or opt-in TP decode protection.
         from atom.model_engine.prefill_delayer import PrefillDelayer
 
         self.prefill_delayer: PrefillDelayer | None = None
 
     def set_prefill_delayer(self, delayer) -> None:
         self.prefill_delayer = delayer
+
+    def _wait_for_inflight_prefix(self, seq: Sequence, cached_tokens: int) -> bool:
+        """Avoid recomputing a prefix an admitted prefill will checkpoint."""
+        if (
+            not self.block_manager.enable_prefix_caching
+            or seq.multimodal_data is not None
+        ):
+            return False
+        for producer in self.running:
+            anchor = producer.checkpoint_end_pos
+            if (
+                producer.status != SequenceStatus.RUNNING
+                or producer.num_cached_tokens >= producer.num_prompt_tokens
+                or anchor - cached_tokens < self.max_num_batched_tokens
+                or anchor >= seq.num_prompt_tokens
+                or producer.multimodal_data is not None
+            ):
+                continue
+            if seq.token_ids[:anchor] == producer.token_ids[:anchor]:
+                return True
+        return False
+
+    def _local_prefill_pending_work(self) -> tuple[bool, int]:
+        """Estimate work after HBM reuse, with bounded queue probes."""
+        budget = self.max_num_batched_tokens
+        pending = self._partial_prefill_remaining_tokens()
+        prefillable = pending > 0
+        if pending >= budget or len(self.running) >= self.max_num_seqs:
+            return prefillable, min(pending, budget)
+        for i, seq in enumerate(self.waiting):
+            if i >= 4:
+                break
+            if (
+                seq.status
+                in (
+                    SequenceStatus.ABORTED,
+                    SequenceStatus.WAITING_FOR_REMOTE_KVS,
+                )
+                or self._unschedulable_reason(seq) is not None
+            ):
+                continue
+            if self._is_offload_prefill_resume(seq):
+                cached = seq.num_cached_tokens
+            else:
+                cached_blocks = self.block_manager.can_allocate(seq, record=False)
+                if cached_blocks < 0:
+                    continue
+                cached = cached_blocks * self.block_manager.hash_block_size
+            remaining = seq.num_tokens - cached
+            if not self.enable_chunked_prefill and remaining > budget:
+                continue
+            prefillable = True
+            pending += max(0, remaining)
+            if pending >= budget:
+                return True, budget
+        return prefillable, pending
 
     def _can_admit_head_prefill(self) -> bool:
         """Match SGL's `local_prefillable=True` semantics: report True iff
@@ -1182,20 +1240,29 @@ class Scheduler:
         if self.prefill_delayer is not None:
             # pending = fresh waiting new-tokens + resumable partials' remaining,
             # capped at the batch budget: the coalescer's accumulation signal.
-            pending_tokens = min(
-                self._waiting_new_token_count()
-                + self._partial_prefill_remaining_tokens(),
-                self.max_num_batched_tokens,
+            running_decode_batch = max(
+                0, len(self.running) - self._partial_prefill_count
             )
+            protects_decode = getattr(self.prefill_delayer, "protects_decode", None)
+            if protects_decode is not None and protects_decode(running_decode_batch):
+                prefillable = bool(self.waiting) or self._partial_prefill_count > 0
+                pending_tokens = 0
+            elif self._local_prefill_coalescing:
+                prefillable, pending_tokens = self._local_prefill_pending_work()
+            else:
+                prefillable = self._can_admit_head_prefill()
+                pending_tokens = min(
+                    self._waiting_new_token_count()
+                    + self._partial_prefill_remaining_tokens(),
+                    self.max_num_batched_tokens,
+                )
             delayer_allows = self.prefill_delayer.should_allow_prefill(
-                prefillable=self._can_admit_head_prefill(),
+                prefillable=prefillable,
                 pending_tokens=pending_tokens,
                 # decode-only: self.running also holds mid-chunked-prefill seqs,
                 # which are NOT decode load — counting them would defeat the
                 # coalescer's "no decode → fire" fast path.
-                running_decode_batch=max(
-                    0, len(self.running) - self._partial_prefill_count
-                ),
+                running_decode_batch=running_decode_batch,
                 kv_usage=self._kv_usage(),
                 has_partial=self._partial_prefill_count > 0,
                 oldest_waiting_age_ms=self._oldest_waiting_prefill_age_ms(),
@@ -1356,6 +1423,16 @@ class Scheduler:
             num_new_tokens = (
                 seq.num_tokens - num_cached_blocks * self.block_manager.hash_block_size
             )
+            if (
+                self._local_prefill_coalescing
+                and self.prefill_delayer is not None
+                and self._wait_for_inflight_prefix(
+                    seq, num_cached_blocks * self.block_manager.hash_block_size
+                )
+            ):
+                # Wait without holding blocks; re-probe after producer progress.
+                skipped_waiting_requests.append(seq)
+                continue
             # Vision embeddings are computed for the whole prompt in one shot
             # and scattered onto the placeholder positions of the tokens in the
             # batch, so a multimodal prefill must not be split: a partial chunk
