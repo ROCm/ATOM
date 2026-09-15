@@ -550,7 +550,14 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             and not self.is_dspark_draft_model
         ):
             self._enable_eagle3_target_interface()
-        if self.is_mtp:
+        if self.is_mtp and model_arch in _DEEPSEEK_V4_ARCHES:
+            # Only DeepSeek-V4 targets can answer this: the pre-hc_head
+            # residual is produced by the V4 forward branch alone. vLLM's
+            # runner tests for the attribute and then subscripts the result
+            # without a None check, so exposing it on any other MTP target
+            # crashes profile_run:
+            #     spec_hidden_states = pre_hc_hidden_states[: ...]
+            #     TypeError: 'NoneType' object is not subscriptable
             self.get_mtp_target_hidden_states = self._get_mtp_target_hidden_states
         if self.is_mtp or self.is_eagle3:
             # Mirror nested attributes required by vLLM speculative decoding.
@@ -784,9 +791,10 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         otherwise feed the post-logits hidden shape expected by older MTP
         models.
 
-        Exposed under its public name only on MTP targets (see `__init__`):
-        vLLM decides whether to override the drafter's input by testing for the
-        attribute alone, so any speculator carrying it would be fed this.
+        Exposed under its public name only on DeepSeek-V4 MTP targets (see
+        `__init__`): vLLM decides whether to override the drafter's input by
+        testing for the attribute alone and then subscripts what it gets back,
+        so a target that cannot produce the residual must not carry it.
         """
         # Prefer the persistent in-graph residual buffer on the native V4 model.
         # It is refreshed by a captured `copy_` every forward (including FULL
