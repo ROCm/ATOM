@@ -218,6 +218,14 @@ jobs:
                 --build-arg ROCM_INDEX_URL=https://nightly.repo.amd.com/rocm/whl-next/"
               ;;
           esac
+          # The shared base pins Triton to the ROCm 7.2 build (3.7.0) and a
+          # later stage asserts that exact version. The ROCm 10 flavors must
+          # keep the SDK's own Triton 3.8.0 -- AITER is built against it
+          # (AITER_USE_SYSTEM_TRITON=1) -- so pass an empty pin, which the
+          # dockerfile treats as "leave the base image's Triton alone".
+          if [ "${BASE_IMAGE}" = "rocm10-base" ]; then
+            EXTRA_BUILD_ARGS="${EXTRA_BUILD_ARGS} --build-arg TRITON_PIN_VERSION="
+          fi
           echo "BASE_IMAGE: ${BASE_IMAGE}"
           DOCKER_BUILDKIT=1 docker build --pull --network=host -t atom_release:ci \
           --build-arg BASE_IMAGE="${BASE_IMAGE}" \

@@ -212,6 +212,14 @@ ENV PYTORCH_ROCM_ARCH=$GPU_ARCH
 # report torch 2.11+ in some combinations).
 ENV ATOM_BASE_IMAGE=${BASE_IMAGE}
 
+# Use the legacy HSA IPC mode. The new mode keeps GPU memory pinned after
+# hipFree when a rank dies, so a crashed vLLM/LMCache worker leaves its VRAM
+# behind and the server crash-loops on "not enough free GPU memory".
+# Set in the base stage so every downstream image (atom, vllm-atom, sglang-atom)
+# inherits it. See https://github.com/ROCm/rocm-libraries/issues/6266 and the
+# same setting in vllm's own docker/Dockerfile.rocm.
+ENV HSA_ENABLE_IPC_MODE_LEGACY=1
+
 # AITER's prebuilt and runtime-JIT modules must use the same pybind ABI.
 RUN pip install --upgrade pip "pybind11==3.0.4" && \
     apt-get update && \
@@ -260,6 +268,22 @@ RUN if [ "${ATOM_BASE_IMAGE}" = "rocm10-base" ]; then \
             echo "ERROR: NVIDIA CUDA runtime packages leaked into the ROCm 10 image"; \
             exit 1; \
         fi; \
+    fi
+
+# Pin Triton to the perf-good ROCm build. The base rocm/pytorch image ships a
+# newer Triton (3.8.0) that regressed benchmark throughput; install the
+# AMD-published 3.7.0 wheel plus its matching triton_kernels from AMD's index,
+# here in the shared base so every downstream stage (the aiter build included)
+# links the same Triton. Empty TRITON_PIN_VERSION keeps the base image's Triton.
+ARG TRITON_INDEX_URL="https://pypi.amd.com/triton/release/rocm-7.2.0/simple/"
+ARG TRITON_PIN_VERSION="3.7.0+amd.rocm7.2.0.git89002410"
+ARG TRITON_KERNELS_PIN_VERSION="1.0.0+amd.rocm7.2.0.git89002410"
+RUN if [ -n "${TRITON_PIN_VERSION}" ]; then \
+        echo "========== [base] Pin Triton ${TRITON_PIN_VERSION} (index ${TRITON_INDEX_URL}) =========="; \
+        pip install --index-url "${TRITON_INDEX_URL}" --force-reinstall --no-deps \
+            "triton==${TRITON_PIN_VERSION}" \
+            "triton_kernels==${TRITON_KERNELS_PIN_VERSION}" && \
+        python -c "import importlib.metadata as m; print('triton pinned ->', m.version('triton'))"; \
     fi
 
 # --------------------------------------------------------------------
@@ -683,6 +707,22 @@ print('final stack: torch', torch.__version__, '| triton', version('triton'), \
         # (see the rocm10-base amdsmi step); numa_utils degrades gracefully.
         python -c "import mori, atom; \
 print('component imports ok: mori, atom (aiter needs a GPU: runtime-only; amdsmi optional)')"; \
+    fi
+
+# Guarantee the perf-good Triton survived every install above: re-pin if
+# something pulled a different one, then assert the exact version or fail the
+# build -- the image must never silently ship the base image's newer Triton.
+ARG TRITON_INDEX_URL="https://pypi.amd.com/triton/release/rocm-7.2.0/simple/"
+ARG TRITON_PIN_VERSION="3.7.0+amd.rocm7.2.0.git89002410"
+ARG TRITON_KERNELS_PIN_VERSION="1.0.0+amd.rocm7.2.0.git89002410"
+RUN if [ -n "${TRITON_PIN_VERSION}" ]; then \
+        cur="$("${VENV_PYTHON}" -c 'import importlib.metadata as m; print(m.version("triton"))' 2>/dev/null || echo none)"; \
+        if [ "${cur}" != "${TRITON_PIN_VERSION}" ]; then \
+            echo "[atom_image] Triton drifted to ${cur}; re-pinning ${TRITON_PIN_VERSION}"; \
+            "${VENV_PYTHON}" -m pip install --index-url "${TRITON_INDEX_URL}" --force-reinstall --no-deps \
+                "triton==${TRITON_PIN_VERSION}" "triton_kernels==${TRITON_KERNELS_PIN_VERSION}"; \
+        fi; \
+        "${VENV_PYTHON}" -c "import importlib.metadata as m; v=m.version('triton'); assert v == '${TRITON_PIN_VERSION}', 'Triton dist is '+v+', expected ${TRITON_PIN_VERSION}'; print('[atom_image] final triton', v)"; \
     fi
 
 CMD ["/bin/bash"]
