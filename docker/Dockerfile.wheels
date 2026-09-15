@@ -1,0 +1,120 @@
+# ATOM Docker — Multi-stage wheel builder
+#
+# Builds/downloads all wheels needed for Dockerfile.clean:
+#   torch, torchvision, torchaudio  (PyTorch ROCm nightly)
+#   triton                          (PyPI wheel)
+#   triton_kernels                  (ROCm/triton source, pure Python)
+#   flydsl                          (pre-built nightly wheel)
+#   mori                            (MORI source)
+#   amd_aiter                       (ENABLE_CK=0, Triton-only)
+#
+# Build:
+#   docker build -f docker/Dockerfile.wheels -t atom:wheels .
+#
+# Extract wheels to host:
+#   docker run --rm atom:wheels tar cf - /wheels | tar xf - -C ./dist --strip-components=1
+#
+# Or pipe directly into Dockerfile.clean (multi-stage):
+#   DOCKER_BUILDKIT=1 docker build \
+#     --build-context wheels=docker-image://atom:wheels \
+#     -f docker/Dockerfile.clean -t atom:clean .
+
+ARG BASE_IMAGE="rocm/dev-ubuntu-24.04:7.2-complete"
+FROM ${BASE_IMAGE}
+
+ARG GPU_ARCH="gfx942;gfx950"
+ARG AITER_REPO="https://github.com/ROCm/aiter.git"
+ARG AITER_BRANCH="main"
+ARG FLYDSL_WHL_URL="https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950/flydsl-0.0.1.dev0%2Bc0d3534-cp312-cp312-manylinux_2_38_x86_64.whl"
+ARG MORI_REPO="https://github.com/ROCm/mori.git"
+ARG MORI_COMMIT="b0dce4beebeb1f26c784eee17d5fd9785ee9447f"
+ARG MAX_JOBS=""
+ARG PREBUILD_TRITON=1
+
+ENV GPU_ARCH_LIST=${GPU_ARCH}
+ENV PYTORCH_ROCM_ARCH=${GPU_ARCH}
+ENV DEBIAN_FRONTEND=noninteractive
+# Disable Triton async copy for stable behavior on ROCm
+ENV TRITON_HIP_USE_ASYNC_COPY=0
+
+# ── 1. System packages + build tools ────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git cmake ninja-build wget \
+        python3-pip python3-dev python3-venv \
+        ibverbs-utils libpci-dev locales \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --break-system-packages --ignore-installed \
+        pip setuptools wheel build
+
+RUN mkdir -p /wheels
+
+# ── 2. Pull PyTorch ROCm nightly wheels ────────────────────────────
+RUN pip3 download --no-deps --dest /wheels \
+        torch torchvision torchaudio \
+        --index-url https://download.pytorch.org/whl/nightly/rocm7.2
+
+# ── 3. Download Triton wheel + build triton_kernels ──────────────
+RUN pip3 download --no-deps --dest /wheels triton==3.6.0 \
+    && ls -lh /wheels/triton-*.whl
+
+# triton_kernels is pure Python, only available in ROCm/triton fork
+RUN git clone --depth=1 --branch release/internal/3.5.x \
+        --filter=blob:none --sparse \
+        https://github.com/ROCm/triton.git /build/triton \
+    && cd /build/triton \
+    && git sparse-checkout set python/triton_kernels \
+    && pip3 wheel --no-deps -w /wheels python/triton_kernels/ \
+    && ls -lh /wheels/triton_kernels-*.whl
+
+# ── 4. Download pre-built FlyDSL wheel ───────────────────────────
+RUN wget -q -P /wheels/ "${FLYDSL_WHL_URL}" \
+    && ls -lh /wheels/flydsl-*.whl
+
+# ── 5. Install torch + triton (needed for AITER/MORI builds) ──────
+RUN pip3 install --break-system-packages --no-deps \
+        /wheels/torch-*.whl /wheels/triton-*.whl \
+    && pip3 install --break-system-packages \
+        filelock typing-extensions sympy networkx jinja2 fsspec numpy
+
+# ── 6. Build MORI wheel ───────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        openmpi-bin libopenmpi-dev cython3 libdw1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Patch PyTorch's Caffe2Config.cmake: the ROCm nightly wheel's config
+# hard-errors when CUDA toolkit is not found, even though we only need ROCm.
+# Convert the fatal error to a warning so MORI (and other torch-cmake users)
+# can build against the ROCm PyTorch wheel without CUDA installed.
+RUN CAFFE2_CFG=$(python3 -c "import torch, pathlib; print(pathlib.Path(torch.__file__).parent / 'share/cmake/Caffe2/Caffe2Config.cmake')") \
+    && sed -i 's/message(FATAL_ERROR "Your installed Caffe2 version uses CUDA/message(WARNING "Skipped: Your installed Caffe2 version uses CUDA/' "$CAFFE2_CFG"
+
+RUN git clone ${MORI_REPO} /build/mori \
+    && cd /build/mori \
+    && git checkout ${MORI_COMMIT} \
+    && grep -iv '^torch\|^triton' requirements-build.txt \
+        | pip3 install --break-system-packages -r /dev/stdin \
+    && git submodule update --init --recursive \
+    && pip3 wheel --no-build-isolation --no-deps -w /wheels . \
+    && ls -lh /wheels/mori-*.whl
+
+# ── 7. Build AITER wheel (ENABLE_CK=0, Triton-only) ──────────────
+RUN git clone --depth=1 --branch ${AITER_BRANCH} ${AITER_REPO} /build/aiter
+
+RUN cd /build/aiter \
+    && pip3 install --break-system-packages -r requirements.txt \
+    && export ENABLE_CK=0 PREBUILD_TRITON=${PREBUILD_TRITON} \
+              PREBUILD_TRITON_ARCHS="gfx942,gfx950" \
+              MAX_JOBS=${MAX_JOBS} GPU_ARCHS=${GPU_ARCH_LIST} \
+    && pip3 install --break-system-packages --no-build-isolation -e . \
+    && python3 -c "import aiter; print('editable install OK')" \
+    && echo "install" > aiter/install_mode \
+    && python3 setup.py bdist_wheel \
+    && cp dist/amd_aiter-*.whl /wheels/ \
+    && ls -lh /wheels/amd_aiter-*.whl
+
+# ── 8. Summary ────────────────────────────────────────────────────
+RUN echo "=== Wheel inventory ===" && ls -lhS /wheels/*.whl && echo "=== Done ==="
+
+WORKDIR /wheels
+CMD ["ls", "-lhS", "/wheels/"]
