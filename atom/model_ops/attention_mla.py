@@ -36,7 +36,6 @@ except ImportError:
     concat_and_cache_mla_seg = None
     fused_qk_rope_concat_and_cache_mla_seg = None
 from aiter.dist.parallel_state import get_dp_group, get_tensor_model_parallel_rank
-from aiter.jit.core import get_gfx
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.attention.mla import (
     mla_decode_fwd as triton_shuffle_mla_decode_fwd,
@@ -500,9 +499,6 @@ _FLYDSL_GATHER_FP8_AVAILABLE = _FLYDSL_GATHER_AVAILABLE and {
     "v_out_scale",
 }.issubset(signature(gather_kv_b_proj_flydsl).parameters)
 
-# The FMHA wrapper uses int32 flattened tensor extents in its C ABI.
-_FLYDSL_FMHA_MAX_FLAT_ELEMS = 2**31
-
 
 # MLA Specific Arguments
 @dataclass
@@ -651,6 +647,12 @@ class MLAAttention(nn.Module):
         **kwargs,
     ) -> None:
         super().__init__()
+        self.use_flydsl_fp8_prefill_attn = bool(envs.ATOM_USE_FLYDSL_FP8_PREFILL_ATTN)
+        if self.use_flydsl_fp8_prefill_attn and not _FLYDSL_FP8_MHA_AVAILABLE:
+            raise ImportError(
+                "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN=1 requires "
+                "aiter.ops.flydsl.flydsl_flash_attn_fp8_func"
+            )
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.scale = float(scale)
@@ -742,11 +744,6 @@ class MLAAttention(nn.Module):
         # Resolved on the first gather, when the weights and cache exist; see
         # `_kv_b_proj_gather`. None = not asked yet.
         self._flydsl_gather_ok: bool | None = None
-        self.use_flydsl_fp8_prefill_attn = bool(envs.ATOM_USE_FLYDSL_FP8_PREFILL_ATTN)
-        # FMHA sees the head dimension after dropping any zero RoPE padding.
-        self._fmha_d = (
-            self.qk_nope_head_dim if self.rope_is_zero_pad else self.qk_head_dim
-        )
         if self.use_seg_mla:
             if envs.ATOM_MLA_PAGE_SIZE != _MLA_SEG_PAGE_SIZE:
                 raise RuntimeError(
@@ -1016,29 +1013,6 @@ class MLAAttention(nn.Module):
         out = tuple(t[..., : self.qk_nope_head_dim] for t in tensors)
         return out if len(out) > 1 else out[0]
 
-    def _flydsl_fmha_callable(self, q, k, v, dropout_p) -> bool:
-        """Per-call shape/feature check. Cheap Python compares, no device sync."""
-        return (
-            self.use_flydsl_fp8_prefill_attn
-            and _FLYDSL_FP8_MHA_AVAILABLE
-            and get_gfx() == "gfx950"
-            and self.dtype == torch.bfloat16
-            and self._fmha_d % 64 == 0
-            and 64 <= self.v_head_dim <= 192
-            and self.v_head_dim % 32 == 0
-            and dropout_p == 0.0  # the kernel has no dropout
-            and q.dim() == 3
-            and k.dim() == 3
-            and v.dim() == 3
-            # Require the head dimension after dropping any zero RoPE padding.
-            and q.shape[-1] == self._fmha_d
-            and k.shape[-1] == self._fmha_d
-            and v.shape[-1] == self.v_head_dim
-            and k.shape[1] == q.shape[1]  # MLA is Hkv == H, GQA group 1
-            and v.shape[:-1] == k.shape[:-1]
-            and max(q.numel(), k.numel(), v.numel()) < _FLYDSL_FMHA_MAX_FLAT_ELEMS
-        )
-
     def _flash_attn_prefill(
         self,
         q: torch.Tensor,
@@ -1061,16 +1035,17 @@ class MLAAttention(nn.Module):
         """Dispatch MLA prefill to FP8 FlyDSL or AITER varlen attention.
 
         FlyDSL uses bottom-right causal masking and returns natural-log FP32
-        LSE in [heads, total_q] layout. Unsupported per-call features use AITER
-        varlen attention, which selects BF16 OPUS on gfx950 for D=192/Dv=128.
-        Kernel failures propagate to the caller.
+        LSE in [heads, total_q] layout. When enabled, invalid inputs and kernel
+        failures propagate to the caller. Otherwise use AITER varlen attention.
 
         ``q_fp8`` reuses ``(q8, q_descale)`` across cached chunks. ``kv_fp8``
         supplies ``(k8, v8, k_descale, v_descale)`` from FP8 gather and skips
-        K/V quantization. These outputs can alias the BF16 workspaces, so a
-        call with ``kv_fp8`` must not fall back and read those BF16 views.
+        K/V quantization. These outputs can alias the BF16 workspaces.
         """
-        if self._flydsl_fmha_callable(q, k, v, dropout_p):
+        if self.use_flydsl_fp8_prefill_attn:
+            # The direct AITER FP8 API has no dropout argument.
+            if dropout_p != 0.0:
+                raise ValueError("FlyDSL FP8 prefill attention requires dropout_p=0")
             if q_fp8 is None and kv_fp8 is None:
                 q8, k8, v8, qs, ks, vs, _, _ = fused_qkv_per_tensor_quant(q, k, v)
                 q_fp8 = (q8, qs)
@@ -1103,9 +1078,7 @@ class MLAAttention(nn.Module):
             )
 
         if kv_fp8 is not None:
-            raise ValueError(
-                "prequantized K/V require an eligible FlyDSL FP8 FMHA call"
-            )
+            raise ValueError("FP8 K/V require ATOM_USE_FLYDSL_FP8_PREFILL_ATTN=1")
         return flash_attn_varlen_func(
             q=q,
             k=k,
@@ -1704,13 +1677,10 @@ class MLAAttention(nn.Module):
         )
         prefill_q, k_new = self._drop_rope_pad(prefill_q, k_new)
         # Quantize Q once and reuse it across the new tokens and cached chunks.
-        fp8_eligible = self._flydsl_fmha_callable(
-            prefill_q, k_new, v_new, attn_metadata.dropout_p
-        )
         q_fp8 = None
         new_kv_fp8 = None
         kv_out_scales = None
-        if fp8_eligible:
+        if self.use_flydsl_fp8_prefill_attn:
             q8, k8, v8, qs, ks, vs, gather_ks, gather_vs = fused_qkv_per_tensor_quant(
                 prefill_q, k_new, v_new
             )
@@ -1758,13 +1728,6 @@ class MLAAttention(nn.Module):
                     continue
                 k_chunk = k_workspace[:n_tok]
                 v_chunk = v_workspace[:n_tok]
-                chunk_scales = (
-                    kv_out_scales
-                    if self._flydsl_fmha_callable(
-                        prefill_q, k_chunk, v_chunk, attn_metadata.dropout_p
-                    )
-                    else None
-                )
                 kv_fp8 = self._gather_cached_kv_b_proj(
                     kv_cache,
                     chunk_meta.kv_indptr[c],
@@ -1772,7 +1735,7 @@ class MLAAttention(nn.Module):
                     chunk_meta.cu_seqlens_k[c],
                     k_chunk,
                     v_chunk,
-                    kv_out_scales=chunk_scales,
+                    kv_out_scales=kv_out_scales,
                     shuffle_kv_block_indptr=(
                         chunk_meta.shuffle_kv_block_indptr[c]
                         if chunk_meta.shuffle_kv_block_indptr is not None
@@ -1892,13 +1855,6 @@ class MLAAttention(nn.Module):
             # 3. reorg + dequant + kv_b_proj + k_pe concat, fused. block_size 1
             #    on the AllGather buffer makes the row map a plain token index.
             k_chunk, v_chunk = self._dcp_context_kv_buffers(chunk_meta, sum_seq_len)
-            chunk_scales = (
-                kv_out_scales
-                if self._flydsl_fmha_callable(
-                    prefill_q, k_chunk, v_chunk, attn_metadata.dropout_p
-                )
-                else None
-            )
             kv_fp8 = self._kv_b_proj_gather(
                 ag_kv.unsqueeze(1),
                 chunk_meta.cu_seqlens_k[c],
@@ -1906,7 +1862,7 @@ class MLAAttention(nn.Module):
                 chunk_meta.cu_seqlens_k[c],
                 k_chunk,
                 v_chunk,
-                kv_out_scales=chunk_scales,
+                kv_out_scales=kv_out_scales,
             )
 
             # 4. flash attention over the (unmasked) context chunk.
