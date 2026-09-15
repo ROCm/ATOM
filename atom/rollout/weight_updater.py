@@ -684,19 +684,43 @@ class WeightUpdaterMixin:
         """
         weight_scale = getattr(module, "weight_scale", None)
 
-        # Reached from the direct-copy call sites too, which write the
-        # parameter in place just above without passing through the requantize.
-        self._await_readers_of(param)
-
+        # `need_normalize_e4m3fn_to_e4m3fnuz` is a static property of the
+        # layer -- `params_dtype == torch.float8_e4m3fnuz`, set once in
+        # `create_weights` -- not a to-do list, and nothing clears it after the
+        # load-time conversion. Re-running that conversion on an
+        # already-converted parameter is not idempotent in either buffer:
+        #
+        #   * `weight_scale` is rebuilt as `scale * 2.0`, so it doubles again
+        #     on every sync (3.0 -> 6.0 -> 12.0, measured) and the dequantized
+        #     weight comes out 2**N too large after N syncs. It is also a fresh
+        #     allocation, which moves the scale's address out from under a
+        #     captured decode graph -- the same hazard the `shuffle_weights`
+        #     fix removed, on the buffer nobody checked.
+        #   * the weight needs no conversion at all: `_requantize_fp8_weight`
+        #     quantizes into `param.dtype` against `finfo(e4m3fnuz).max`, and
+        #     the direct-copy path is handed bytes already in `param.dtype`, so
+        #     both arrive in the target convention.
+        #
+        # Gate on the dtype, so this stays right for a load path that does
+        # leave an e4m3fn parameter behind rather than just never firing.
         if (
             getattr(module, "need_normalize_e4m3fn_to_e4m3fnuz", False)
             and weight_scale is not None
+            and param.dtype == torch.float8_e4m3fn
         ):
             from atom.model_ops.utils import normalize_e4m3fn_to_e4m3fnuz
 
-            param.data, weight_scale.data, _ = normalize_e4m3fn_to_e4m3fnuz(
+            # Writes the NaN-byte fixup straight into the weight's storage.
+            self._await_readers_of(param)
+            normalized, normalized_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                 param.data, weight_scale.data
             )
+            # The weight's bytes are fixed through an int8 view of the same
+            # storage, so `normalized` is the original buffer at the original
+            # address with a reinterpreted dtype -- the rebind a captured graph
+            # cannot see. The scale is a new tensor, so it goes back in place.
+            param.data = normalized
+            weight_scale.data.copy_(normalized_scale.to(weight_scale.dtype))
 
         quant_type = getattr(module, "quant_type", None)
         if quant_type is None:

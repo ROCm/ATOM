@@ -250,6 +250,52 @@ def test_fused_expert_tensor_waits_before_each_half(monkeypatch):
 # ── the FP8 post-process ──────────────────────────────────────────────────
 
 
+def test_post_process_does_not_wait_when_it_writes_nothing(monkeypatch):
+    """The fence belongs to the write, so a call that decides not to write
+    must not fence either -- otherwise the cost is paid per parameter for a
+    guarantee nothing needed."""
+    seen = _record_fences(monkeypatch)
+    param = nn.Parameter(torch.zeros(4, 4, dtype=torch.bfloat16), requires_grad=False)
+    module = SimpleNamespace(weight_scale=None, quant_type=None)
+
+    _updater()._post_process_fp8_weight(module, param)
+
+    assert seen == []
+
+
+@needs_aiter
+def test_post_process_waits_before_the_shuffle(monkeypatch):
+    from aiter import QuantType, dtypes
+
+    import atom.model_ops.utils as utils_mod
+
+    order = []
+    monkeypatch.setenv("ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE", "1")
+    monkeypatch.setattr(
+        utils_mod, "shuffle_weights", lambda *a, **k: order.append("shuffle")
+    )
+    import atom.rollout.weight_updater as wu
+
+    monkeypatch.setattr(
+        wu.WeightUpdaterMixin,
+        "_await_readers_of",
+        lambda self, p: order.append("wait"),
+        raising=True,
+    )
+    param = nn.Parameter(torch.zeros(32, 64, dtype=torch.uint8), requires_grad=False)
+    module = SimpleNamespace(
+        weight_scale=None,
+        quant_type=QuantType.per_1x128,
+        params_dtype=dtypes.fp8,
+        needs_preshuffled_weight=False,
+        need_normalize_e4m3fn_to_e4m3fnuz=False,
+    )
+
+    _updater()._post_process_fp8_weight(module, param)
+
+    assert order == ["wait", "shuffle"]
+
+
 @needs_aiter
 def test_requantize_waits_before_the_first_write(monkeypatch):
     from aiter import QuantType
@@ -285,6 +331,65 @@ def test_requantize_waits_before_the_first_write(monkeypatch):
 
 
 # ── the e4m3fnuz conversion is not a repeatable transform ─────────────────
+
+
+def test_an_already_converted_weight_is_not_converted_again():
+    """`need_normalize_e4m3fn_to_e4m3fnuz` is a static property of the layer --
+    `params_dtype == torch.float8_e4m3fnuz`, set once in `create_weights` --
+    and nothing clears it after the load. Re-running the conversion per sync
+    rebuilds `weight_scale` as `scale * 2.0`, so it doubles again every time
+    (3.0 -> 6.0 -> 12.0) and the dequantized weight comes out 2**N too large
+    after N syncs. The fresh allocation also moves the scale's address out from
+    under a captured decode graph.
+    """
+    param = nn.Parameter(
+        torch.zeros(4, 4, dtype=torch.float8_e4m3fnuz), requires_grad=False
+    )
+    weight_scale = nn.Parameter(torch.full((4, 1), 3.0), requires_grad=False)
+    module = SimpleNamespace(
+        weight_scale=weight_scale,
+        quant_type=None,
+        need_normalize_e4m3fn_to_e4m3fnuz=True,
+    )
+    scale_ptr = weight_scale.data_ptr()
+    param_ptr = param.data_ptr()
+
+    for _ in range(3):
+        _updater()._post_process_fp8_weight(module, param)
+
+    assert weight_scale.data.flatten()[0].item() == 3.0
+    assert weight_scale.data_ptr() == scale_ptr, "the scale's address moved"
+    assert param.data_ptr() == param_ptr, "the weight's address moved"
+    assert param.dtype == torch.float8_e4m3fnuz
+
+
+@needs_aiter
+def test_converting_an_e4m3fn_weight_keeps_both_addresses():
+    """When the conversion does have work to do, it writes the scale in place.
+
+    The weight's own rebind stays: `normalize_e4m3fn_to_e4m3fnuz` fixes its
+    bytes through an int8 view of the same storage and hands back that storage
+    with a reinterpreted dtype, so the address a captured graph holds does not
+    move. The scale is a new tensor, and that one does.
+    """
+    param = nn.Parameter(
+        torch.zeros(4, 4, dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    weight_scale = nn.Parameter(torch.full((4, 1), 3.0), requires_grad=False)
+    module = SimpleNamespace(
+        weight_scale=weight_scale,
+        quant_type=None,
+        need_normalize_e4m3fn_to_e4m3fnuz=True,
+    )
+    scale_ptr = weight_scale.data_ptr()
+    param_ptr = param.data_ptr()
+
+    _updater()._post_process_fp8_weight(module, param)
+
+    assert weight_scale.data.flatten()[0].item() == 6.0, "converted exactly once"
+    assert weight_scale.data_ptr() == scale_ptr
+    assert param.data_ptr() == param_ptr
+    assert param.dtype == torch.float8_e4m3fnuz
 
 
 # ── the wait itself ───────────────────────────────────────────────────────
