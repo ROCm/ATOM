@@ -57,8 +57,11 @@ STATE_SOURCE_CHANNEL = "k3_state_source"
 #: `STATE_INDEX_CHANNEL`. Both are statements about one hash's membership in the
 #: engine's index, so they share the channel rather than adding a third; the tag
 #: is what keeps `connector_completion` from settling a store pin against a
-#: load's verdict. `("state_load", hash)` is a plain hashable tuple, which is
-#: what `ConnectorCompletion.operation_id` and the TP aggregator's key require.
+#: load's verdict. The key is `("state_load", hash, req_id)` -- a plain hashable
+#: tuple, which is what `ConnectorCompletion.operation_id` and the TP
+#: aggregator's key require. The request id is part of the key because the
+#: aggregator tombstones every connector-completion key it takes quorum on; see
+#: `take_hash_verdicts`.
 STATE_LOAD_VERDICT_TAG = "state_load"
 
 #: The connector's standalone stall clock, used only when reclamation is
@@ -307,14 +310,46 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         """
         try:
             ok = self._load_kv_bytes(req)
-            if ok and req.state_load_spec is not None:
-                ok = self._load_state_bytes(req)
+            if req.state_load_spec is not None:
+                if ok:
+                    ok = self._load_state_bytes(req)
+                else:
+                    # The KV leg's verdict is RANK-LOCAL (`ret_mask.all()` over
+                    # this rank's own LMCache instance and its own LRU), so one
+                    # rank short-circuiting here while the others run the state
+                    # leg leaves the verdict key at `world_size - 1` reports.
+                    # `_TPCompletionGroup.drain` skips an incomplete key with a
+                    # bare `continue` -- no TTL, no eviction, and `reset` is
+                    # never called on the serving path -- so that key sits there
+                    # for the process lifetime: one leaked `_reports` entry, and
+                    # a hash the index can never retract, parking every later
+                    # request over that prefix on a `get` that must miss.
+                    #
+                    # Report neutrally rather than skipping. Only a miss is
+                    # evidence LMCache dropped the bytes, and this rank has no
+                    # such evidence -- it never asked. The quorum is
+                    # failure-dominant, so a real miss on any rank still
+                    # retracts; a key no rank missed stays advertised, which is
+                    # correct.
+                    self._note_state_leg_unrun(req)
         except Exception:
             logger.warning(
                 "kimi_k3 offload: load failed for req=%s", req.req_id, exc_info=True
             )
             ok = False
         self._finish_load(req, ok)
+
+    def _note_state_leg_unrun(self, req: LMCacheReqMeta) -> None:
+        """Keep this rank in the quorum for a state leg it never ran.
+
+        See `_do_load_req`. Silent when there is no tier: the tier IS the
+        verdict ledger, and with none built this rank reports on no key at all,
+        so there is no partial quorum to complete.
+        """
+        tier = self._state_tier
+        if tier is None:
+            return
+        tier.note_load_unrun(req.state_load_spec.boundary_hash, req.req_id)
 
     def _load_state_bytes(self, req: LMCacheReqMeta) -> bool:
         """Restore this request's recurrent state into the slot it was given."""
@@ -330,7 +365,39 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
                 req.req_id,
             )
             return False
-        return tier.load_state(spec.boundary_hash, spec.destination_slot, req.req_id)
+        # The validation `StateLoadSpec`'s docstring promises. Both numbers
+        # travel with the spec so the two sides cannot derive the boundary
+        # independently and disagree; unchecked, they were merely two fields
+        # nobody read, and the hazard the docstring names -- a boundary off the
+        # chunk grid, hence a state image that is the history of a different
+        # prefix than the KV leg completed -- stayed exactly as unguarded as
+        # before, while the comment told the next reader it was covered.
+        # Refused, not clamped: there is no safe reinterpretation of a boundary
+        # the engine and the worker disagree about.
+        chunk = int(spec.chunk_tokens)
+        if chunk <= 0 or int(spec.boundary_tokens) % chunk != 0:
+            logger.error(
+                "kimi_k3 offload: req=%s state boundary %d is not on the %d-token "
+                "chunk grid; refusing the state leg so the request recomputes.",
+                req.req_id,
+                spec.boundary_tokens,
+                chunk,
+            )
+            return False
+        # `seq.state_slot` returns -1 once `state_slots` is empty, and
+        # `codec.get(h, -1)` would negative-index into the state pool. The
+        # snapshot is taken at metadata-build time and only incidentally
+        # covered downstream; check it where the value is used.
+        slot = int(spec.destination_slot)
+        if slot < 0:
+            logger.error(
+                "kimi_k3 offload: req=%s has no state slot (%d); refusing the "
+                "state leg so the request recomputes.",
+                req.req_id,
+                slot,
+            )
+            return False
+        return tier.load_state(spec.boundary_hash, slot, req.req_id)
 
     def _start_state_stores(self, metadata) -> None:
         """Hand this step's ready checkpoints to the tier's executor.
@@ -498,6 +565,14 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         if joint is None or int(getattr(joint, "load_hash", -1)) == -1:
             return
         sid = str(seq.id)
+        if sid in self._load_cancelled:
+            # This sub lost `get_num_new_matched_tokens` and the composite
+            # withdrew its load. The state arm reads `seq.offload_joint`, which
+            # the engine owns and the cancel does not reach, so without this the
+            # leg re-arms anyway -- and the `_load_specs` guard below cannot
+            # stop it, because the cancel is exactly what emptied `_load_specs`.
+            # Re-arming puts a second writer into the winner's block table.
+            return
         self._state_load_seqs[sid] = seq
         if self._load_specs.get(sid) is not None:
             return

@@ -84,6 +84,12 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
 
         # req_id -> LoadSpec (pending load decided at match time)
         self._load_specs: dict[str, LoadSpec] = {}
+        # Sids whose armed load was withdrawn (`cancel_pending_load`). Under
+        # `kv_connector: multi` the composite cancels every sub that did NOT win
+        # `get_num_new_matched_tokens`, and a losing sub must not re-arm from a
+        # source the cancel does not reach. Cleared at `request_finished`, which
+        # is the only point the sid can be reused.
+        self._load_cancelled: set[str] = set()
         # req_id -> Sequence (queued to recv this step)
         self._reqs_need_recv: dict[str, object] = {}
         # req_id -> HBM chunk frontier for an emitted load. If the load fails,
@@ -846,6 +852,10 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         sid = str(seq.id)
         if self._load_lifecycles.get(sid) is not seq:
             return
+        # Marked here and not in `_clear_pending_load`: `request_finished`
+        # calls that too, and a sid marked there would stay marked for the rest
+        # of the request's life.
+        self._load_cancelled.add(sid)
         self._clear_pending_load(sid)
         active = self._active_load_operations.get(sid)
         if active is not None and active[0] is seq:
@@ -865,6 +875,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 self._cancel_load_statistics(active[1])
             self._load_lifecycles.pop(sid, None)
         self._release_failed_load_attempt(sid, seq)
+        self._load_cancelled.discard(sid)
         entry = self._save_tracker.get(sid)
         if entry is not None and entry[0] is seq:
             if self._early_release:

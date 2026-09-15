@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+import time
 import types
 from collections import deque
 from contextlib import nullcontext
@@ -5356,6 +5357,7 @@ def _k3_scheduler() -> KimiK3OffloadScheduler:
     s._save_rr_last = None
     s._pending_state_stores = []
     s._state_load_seqs = {}
+    s._load_cancelled = set()
     s._state_load_missed = set()
     s._save_inflight_since = {}
     s._save_stalled = False
@@ -6276,16 +6278,37 @@ def test_pipeline_parallelism_is_refused_loudly_not_warned_about(monkeypatch):
         c._build_state_tier(SimpleNamespace(state_backend=None))
 
 
-def test_a_single_stage_still_builds_the_tier_path(monkeypatch):
+def test_a_single_stage_still_builds_the_tier_path(monkeypatch, caplog):
     """The refusal must key on PP, not on being called at all: pp_size 1 has to
-    fall through to the ordinary backend checks."""
+    fall through to the ordinary backend checks.
+
+    Asserts the function REACHED the backend check, not merely that the tier is
+    off afterwards: the previous version set `_state_tier = None` and then
+    asserted it was None, so replacing the whole body with `return` kept it
+    green -- it proved nothing about the pp gate falling through. The pp>1 arm
+    is asserted alongside it so the two are pinned by one test.
+    """
     c = KimiK3OffloadConnector.__new__(KimiK3OffloadConnector)
     c._config = SimpleNamespace(pipeline_parallel_size=1)
     c._state_tier = None
     # No backend published -> the tier declines quietly, which is the normal
-    # non-K3-backend path and must NOT raise.
-    c._build_state_tier(SimpleNamespace(state_backend=None))
+    # non-K3-backend path and must NOT raise...
+    with caplog.at_level(logging.WARNING):
+        c._build_state_tier(SimpleNamespace(state_backend=None))
     assert c._state_tier is None
+    # ...but it must have got far enough to SAY so. A body replaced by `return`
+    # leaves this empty.
+    assert any(
+        "tier off" in r.message or "backend" in r.message.lower()
+        for r in caplog.records
+    ), f"pp_size=1 never reached the backend check; logged {caplog.records}"
+
+    # The other arm of the same gate: pp>1 is the one fatal refusal.
+    c2 = KimiK3OffloadConnector.__new__(KimiK3OffloadConnector)
+    c2._config = SimpleNamespace(pipeline_parallel_size=2)
+    c2._state_tier = None
+    with pytest.raises(ValueError, match="pipeline"):
+        c2._build_state_tier(SimpleNamespace(state_backend=None))
 
 
 def _k3_load_req(req_id: str, *, state: bool = True, generation: int = 0):
@@ -6671,8 +6694,10 @@ class TestStateLoadsNeverQueueBehindStores:
         def __init__(self):
             self.gate = threading.Event()
             self.loaded = threading.Event()
+            self.entered = threading.Event()
 
         def put(self, h, unit_ids, on_source_released=None):
+            self.entered.set()
             self.gate.wait(timeout=5)
             if on_source_released is not None:
                 on_source_released()
@@ -6695,11 +6720,65 @@ class TestStateLoadsNeverQueueBehindStores:
         try:
             for gen in range(4):
                 tier.submit_store(StateStoreOperationId(gen, gen + 1), (0,))
+            # Wait for the store lane to actually be occupied, so "still stuck"
+            # is a fact about this run rather than a hope about scheduling.
+            deadline = time.monotonic() + 5
+            while not codec.entered.is_set() and time.monotonic() < deadline:
+                time.sleep(0.005)
+            assert codec.entered.is_set(), "no store ever entered the codec"
+
             assert tier.load_state(77, 0, "r0") is True
-            assert codec.loaded.is_set(), "the load waited behind the store backlog"
+            # The property the name claims: the load returned while every store
+            # is STILL blocked. Asserting `codec.loaded.is_set()` proved only
+            # that the synchronous call this line just made had run.
+            assert not codec.gate.is_set()
+            assert tier.take_store_reports() == (set(), set()), (
+                "a store completed, so this no longer tests a load overtaking "
+                "a stuck store backlog"
+            )
             assert tier.take_hash_verdicts() == {(77, "r0"): True}
         finally:
             codec.gate.set()
+            tier.shutdown()
+
+    def test_a_rank_whose_kv_leg_failed_still_reports_on_the_verdict_key(self):
+        """The KV leg's verdict is rank-local (`ret_mask.all()` over this rank's
+        own LMCache LRU), so one rank short-circuiting before the state leg left
+        the verdict key one report short of quorum -- and `drain` skips an
+        incomplete key with a bare `continue`, with no TTL and no eviction, so
+        it sat there for the process lifetime: a leaked `_reports` entry and a
+        hash the index could never retract.
+
+        Neutral, not a miss: this rank never asked, so it holds no evidence that
+        LMCache dropped the bytes. The quorum is failure-dominant, so a real
+        miss on any other rank still retracts.
+        """
+        c = KimiK3OffloadConnector.__new__(KimiK3OffloadConnector)
+        c._state_tier = self._tier(self._BlockingCodec.__new__(self._BlockingCodec))
+        try:
+            req = SimpleNamespace(
+                req_id="r7",
+                state_load_spec=SimpleNamespace(boundary_hash=99),
+            )
+            c._note_state_leg_unrun(req)
+            assert c._state_tier.take_hash_verdicts() == {(99, "r7"): True}
+        finally:
+            c._state_tier.shutdown()
+
+    def test_a_neutral_report_cannot_overwrite_a_real_miss(self):
+        """Same failure-dominant merge as `load_state`: within one drain window
+        a rank that missed stays missed."""
+
+        class _Missing:
+            def get(self, h, slot):
+                return False
+
+        tier = self._tier(_Missing())
+        try:
+            assert tier.load_state(99, 0, "r7") is False
+            tier.note_load_unrun(99, "r7")
+            assert tier.take_hash_verdicts() == {(99, "r7"): False}
+        finally:
             tier.shutdown()
 
     def test_a_missed_load_is_reported_as_a_verdict_not_raised(self):
