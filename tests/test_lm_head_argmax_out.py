@@ -15,7 +15,26 @@ def _tp1_head(logits: torch.Tensor, monkeypatch) -> embed_head.ParallelLMHead:
     head.weight = torch.nn.Parameter(torch.empty(1), requires_grad=False)
     head.bias = None
     monkeypatch.setattr(embed_head.tgemm, "mm", lambda *_args, **_kwargs: logits)
+    monkeypatch.setattr(embed_head, "topk_select", _torch_topk_select)
     return head
+
+
+def _torch_topk_select(input, topk, *, tie=None, output_idx=None, **_kwargs):
+    """`aiter.topk_select` over torch, for a runner with no GPU.
+
+    Stubbed for the same reason `tgemm.mm` above is: the selection is aiter's
+    and has its own tests on a machine that can run it. What is ATOM's, and what
+    these tests are for, is that the caller's buffer is the one handed down and
+    the one handed back -- a contract a stub can hold and a GPU is not needed to
+    check. `tie="low"` is asserted rather than honoured, since `torch.argmax`
+    already breaks ties that way.
+    """
+    assert tie == "low", f"the head must ask for the lowest-index tie, not {tie!r}"
+    idx = torch.topk(input, topk, dim=-1, sorted=True).indices.to(torch.int32)
+    if output_idx is None:
+        return None, idx
+    output_idx.copy_(idx)
+    return None, output_idx
 
 
 def test_argmax_can_write_directly_to_caller_storage(monkeypatch):
