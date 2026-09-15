@@ -207,6 +207,24 @@ class OffloadWorkerMixin:
             )
             return {}
 
+    @staticmethod
+    def _transfer_stats_summary(stats: dict[str, int | float]) -> str:
+        """Compact one-line evidence for OFFLOAD-*-PROF logs."""
+        if not stats:
+            return "{}"
+        keys = (
+            "stats_available",
+            "transfer_succeeded",
+            "chunks",
+            "groups",
+            "total_bytes",
+            "async_host_copy_chunks",
+            "blocking_host_copy_chunks",
+            "batch_id_groups",
+            "batch_id_uploads",
+        )
+        return "{" + ", ".join(f"{key}={stats.get(key, -1)}" for key in keys) + "}"
+
     def _reset_gpu_connector_transfer_stats(self) -> None:
         gpu_connector = getattr(getattr(self, "_engine", None), "gpu_connector", None)
         if gpu_connector is None or not hasattr(gpu_connector, "reset_transfer_stats"):

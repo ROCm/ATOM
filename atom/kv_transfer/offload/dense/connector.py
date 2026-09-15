@@ -269,38 +269,17 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         if self._profile_enabled():
             logger.info(
                 "[OFFLOAD-LOAD-PROF] rank=%s req=%s hbm=%d lmc=%d "
-                "retrieved=%d status=%s transfer_stats=%d transfer_success=%d "
-                "chunks=%d groups=%d "
-                "max_chunk_bytes=%d max_group_bytes=%d "
-                "gpu_staging_chunk_bytes=%d gpu_staging_buffer_chunks=%d "
-                "gpu_staging_buffer_bytes=%d total_bytes=%d "
-                "async_host_copy=%d async_chunks=%d blocking_chunks=%d "
-                "batch_block_ids=%d batch_id_groups=%d batch_id_uploads=%d "
-                "retrieve_ms=%.2f total_ms=%.2f",
+                "retrieved=%d status=%s retrieve_ms=%.2f total_ms=%.2f "
+                "transfer=%s",
                 getattr(self, "_rank", "?"),
                 req.req_id,
                 hbm,
                 lmc,
                 int(ret_mask.sum().item()),
                 "ok" if loaded else "miss",
-                int(transfer_stats.get("stats_available", 0)),
-                int(transfer_stats.get("transfer_succeeded", -1)),
-                int(transfer_stats.get("chunks", -1)),
-                int(transfer_stats.get("groups", -1)),
-                int(transfer_stats.get("max_chunk_bytes", -1)),
-                int(transfer_stats.get("max_group_bytes", -1)),
-                int(transfer_stats.get("gpu_staging_chunk_bytes", -1)),
-                int(transfer_stats.get("gpu_staging_buffer_chunks", -1)),
-                int(transfer_stats.get("gpu_staging_buffer_bytes", -1)),
-                int(transfer_stats.get("total_bytes", -1)),
-                int(transfer_stats.get("async_host_copy_enabled", 0)),
-                int(transfer_stats.get("async_host_copy_chunks", -1)),
-                int(transfer_stats.get("blocking_host_copy_chunks", -1)),
-                int(transfer_stats.get("batch_block_ids_enabled", 0)),
-                int(transfer_stats.get("batch_id_groups", -1)),
-                int(transfer_stats.get("batch_id_uploads", -1)),
                 retrieve_ms,
                 total_ms,
+                self._transfer_stats_summary(transfer_stats),
             )
 
     def _do_save_req(self, req: LMCacheReqMeta) -> None:
@@ -340,36 +319,14 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         if self._profile_enabled():
             logger.info(
                 "[OFFLOAD-SAVE-PROF] rank=%s req=%s toks=%d skip=%d "
-                "transfer_stats=%d transfer_success=%d chunks=%d groups=%d "
-                "max_chunk_bytes=%d max_group_bytes=%d "
-                "gpu_staging_chunk_bytes=%d "
-                "gpu_staging_buffer_chunks=%d gpu_staging_buffer_bytes=%d "
-                "total_bytes=%d async_host_copy=%d async_chunks=%d "
-                "blocking_chunks=%d batch_block_ids=%d batch_id_groups=%d "
-                "batch_id_uploads=%d "
-                "store_ms=%.2f total_ms=%.2f",
+                "store_ms=%.2f total_ms=%.2f transfer=%s",
                 getattr(self, "_rank", "?"),
                 req.req_id,
                 len(toks),
                 skip,
-                int(transfer_stats.get("stats_available", 0)),
-                int(transfer_stats.get("transfer_succeeded", -1)),
-                int(transfer_stats.get("chunks", -1)),
-                int(transfer_stats.get("groups", -1)),
-                int(transfer_stats.get("max_chunk_bytes", -1)),
-                int(transfer_stats.get("max_group_bytes", -1)),
-                int(transfer_stats.get("gpu_staging_chunk_bytes", -1)),
-                int(transfer_stats.get("gpu_staging_buffer_chunks", -1)),
-                int(transfer_stats.get("gpu_staging_buffer_bytes", -1)),
-                int(transfer_stats.get("total_bytes", -1)),
-                int(transfer_stats.get("async_host_copy_enabled", 0)),
-                int(transfer_stats.get("async_host_copy_chunks", -1)),
-                int(transfer_stats.get("blocking_host_copy_chunks", -1)),
-                int(transfer_stats.get("batch_block_ids_enabled", 0)),
-                int(transfer_stats.get("batch_id_groups", -1)),
-                int(transfer_stats.get("batch_id_uploads", -1)),
                 store_ms,
                 total_ms,
+                self._transfer_stats_summary(transfer_stats),
             )
         self._record_store_terminal(req, True)
 
