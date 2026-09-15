@@ -234,6 +234,7 @@ class _FlashDecodeGraphBuffers:
         *,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
+        ngram_state: torch.Tensor,
         state_indices_in: torch.Tensor,
         state_indices_out: torch.Tensor,
         has_initial_state: torch.Tensor,
@@ -280,6 +281,7 @@ class _FlashDecodeGraphBuffers:
         self.last_ple = Qwen3_8FlashNextPLEMetadata(
             query_start_loc=self.query_start_loc[: bs + 1],
             ngram_context=self.ngram_context[:bs, : self.ngram_context_len],
+            ngram_state=ngram_state,
             state_indices_in=self.state_indices_in[:bs],
             state_indices_out=self.state_indices_out[:bs],
             has_initial_state=self.has_initial_state[:bs],
@@ -348,6 +350,7 @@ class Qwen3_8FlashNextQSAMetadata:
 class Qwen3_8FlashNextPLEMetadata:
     query_start_loc: torch.Tensor
     ngram_context: torch.Tensor
+    ngram_state: torch.Tensor
     state_indices_in: torch.Tensor
     state_indices_out: torch.Tensor
     has_initial_state: torch.Tensor
@@ -703,6 +706,33 @@ def _ensure_ple_conv_state(model: Any, atom_config: Any, num_slots: int) -> torc
     return state
 
 
+
+def _ensure_ple_ngram_state(model: Any, atom_config: Any, num_slots: int) -> torch.Tensor:
+    hf = _hf_text_config(atom_config)
+    width = max(int(getattr(hf, "ngram_size", 3)) - 1, 1)
+    eos = getattr(hf, "eos_token_id", 0)
+    eos_id = int(eos[0] if isinstance(eos, (list, tuple)) else eos)
+    existing = getattr(model, "_atom_ple_ngram_state", None)
+    if (
+        existing is not None
+        and existing.shape[0] >= num_slots
+        and existing.shape[1] == width
+    ):
+        return existing
+    if existing is not None and _DECODE_GRAPH.active:
+        logger.warning(
+            "PLE ngram_state already captured at %s slots; refusing grow to %s",
+            int(existing.shape[0]),
+            num_slots,
+        )
+        return existing
+    device = next(model.parameters()).device
+    state = torch.full(
+        (max(num_slots, 1), width), eos_id, dtype=torch.int64, device=device
+    )
+    model._atom_ple_ngram_state = state
+    return state
+
 def build_ple_metadata(
     atom_config: Any,
     forward_batch: Any,
@@ -761,6 +791,7 @@ def build_ple_metadata(
 
     num_slots = _ple_state_pool_slots(forward_batch, idx)
     conv_state = _ensure_ple_conv_state(model, atom_config, num_slots)
+    ngram_state = _ensure_ple_ngram_state(model, atom_config, num_slots)
     last_slot = max(int(conv_state.shape[0]) - 1, 0)
     if last_slot >= 0:
         idx = torch.where(idx < 0, idx, idx.clamp(max=last_slot))
@@ -785,6 +816,7 @@ def build_ple_metadata(
         return _DECODE_GRAPH.materialize_ple(
             query_start_loc=query_start_loc,
             ngram_context=context,
+            ngram_state=ngram_state,
             state_indices_in=idx_in,
             state_indices_out=idx,
             has_initial_state=has_initial,
@@ -796,6 +828,7 @@ def build_ple_metadata(
     return Qwen3_8FlashNextPLEMetadata(
         query_start_loc=query_start_loc,
         ngram_context=context,
+        ngram_state=ngram_state,
         state_indices_in=idx_in,
         state_indices_out=idx,
         has_initial_state=has_initial,
