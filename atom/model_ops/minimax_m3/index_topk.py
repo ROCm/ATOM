@@ -301,6 +301,7 @@ def _emit_sparse_block_table_kernel(
     NUM_KV_HEADS: tl.constexpr,
     DECODE_MAX_Q: tl.constexpr,
     pages_per_block: tl.constexpr,
+    block_page_stride: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
 ):
     """The fused selector's emission, reading the selection from HBM instead.
@@ -346,6 +347,7 @@ def _emit_sparse_block_table_kernel(
         pid_h,
         block_size,
         pages_per_block,
+        block_page_stride,
         NUM_KV_HEADS,
         BLOCK_SIZE_T,
     )
@@ -791,6 +793,13 @@ def _launch_select(
                 NUM_KV_HEADS=num_idx_heads,
                 DECODE_MAX_Q=decode_max_q,
                 pages_per_block=PAGES_PER_SPARSE_BLOCK,
+                # Not PAGES_PER_SPARSE_BLOCK: under vLLM 0.29 a logical block
+                # spans two head slots, so the caller's stride is twice the
+                # pages it fills. Hard-coding the two to the same constant
+                # would emit a block table off by half a block per logical
+                # block on this path only -- the fused path below already
+                # takes the caller's value.
+                block_page_stride=block_page_stride,
                 # The compaction alone is a `topk x pages_per_block` tile --
                 # 16x8 here -- so a wave is already more lanes than it has
                 # work, and the helper's cumsum stops crossing warps. The
