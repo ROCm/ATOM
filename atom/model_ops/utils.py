@@ -161,7 +161,18 @@ def shuffle_weights(*tensors: torch.nn.Parameter, layout: tuple[int, int] = (16,
             # changes the shape or dtype, which no captured graph can survive
             # anyway.
             if shuffled.shape == weight.shape and shuffled.dtype == weight.dtype:
-                weight.copy_(shuffled)
+                try:
+                    weight.copy_(shuffled)
+                except NotImplementedError:
+                    # `copy_` is not implemented for every storage dtype on
+                    # every device, where the rebind this replaced was: MXFP4's
+                    # `Float4_e2m1fn_x2` has no CPU copy kernel before torch
+                    # 2.10, and `linear.py`'s online-quant path shuffles
+                    # exactly that dtype. Keep the address where it can be
+                    # kept, and stay portable where it cannot -- a weight being
+                    # shuffled on a device with no copy kernel for it is not
+                    # one a captured decode graph is replaying against.
+                    tensor.data = shuffled
             else:
                 tensor.data = shuffled
         elif weight.dim() == 3:
