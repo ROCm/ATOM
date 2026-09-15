@@ -1109,7 +1109,17 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                     aiter.concat_and_cache_mla(
                         k_c_normed,
                         k_pe.squeeze(1),
-                        kv_cache,
+                        # aiter asserts kv_cache.size(2) == kv_lora_rank +
+                        # pe_dim, i.e. the 3D page vLLM handed out through
+                        # 0.28. Under 0.29's [B, H, N, C] per-layer view the
+                        # page is 4D, so fold [H, N] the way the two
+                        # fused_qk_rope_concat_and_cache_mla call sites
+                        # already do.
+                        kv_cache.view(
+                            kv_cache.shape[0],
+                            -1,
+                            self.kv_lora_rank + self.qk_rope_head_dim,
+                        ),
                         slot_mapping.flatten(),
                         kv_cache_dtype=self.kv_cache_dtype,
                         scale=self._k_scale,
