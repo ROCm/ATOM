@@ -72,14 +72,34 @@ KV_LORA_RANK, QK_ROPE_HEAD_DIM = 6, 2
 ENTRY = KV_LORA_RANK + QK_ROPE_HEAD_DIM
 
 # Every shape a normalisation point can be handed, and the page it must produce.
-# Both points owe the same four answers -- that is what "the same condition"
-# means above, and asserting it here is what keeps them from drifting apart
-# even though one squeezes and the other folds.
+# Both points owe the same answers -- that is what "the same condition" means
+# above, and asserting it here is what keeps them from drifting apart even
+# though one squeezes and the other folds.
 CASES = (
     ((4, 1, 16, ENTRY), (4, 16, ENTRY), "0.29's [B, H=1, N, C]: the head slot goes"),
     ((4, 2, 16, ENTRY), (4, 2, 16, ENTRY), "two head slots: fall through, fail loudly"),
     ((4, 1, ENTRY), (4, 1, ENTRY), "0.28's [B, N=1, C]: N is a block row, not a head"),
     ((4, 16, ENTRY), (4, 16, ENTRY), "0.28's [B, N, C]: already what consumers want"),
+    # Nothing produces these three. They are here because merging four crossings
+    # into one helper is where the admission set gets chosen, and the union of
+    # the four is wider than the strictest of them: `dim() != 4 or shape[1] == 1`
+    # answers the four rows above identically and still folds all three of these
+    # into something that satisfies the kernels' checks instead of tripping them.
+    ((4, ENTRY), (4, ENTRY), "rank-2: not a page at all, must fall through"),
+    (
+        (4, 1, 1, 16, ENTRY),
+        (4, 1, 1, 16, ENTRY),
+        "rank-5: likewise, not this rule's business",
+    ),
+    (
+        (4, 16, 2 * ENTRY),
+        (4, 16, 2 * ENTRY),
+        (
+            "wrong entry width: folding it would make [B, 2N, C] out of "
+            "[B, N, 2C] -- the same silent head-major concatenation, one axis "
+            "over -- instead of tripping aiter's own size(2) check"
+        ),
+    ),
 )
 
 
