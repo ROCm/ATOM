@@ -7,7 +7,7 @@ from functools import cache
 from typing import List, Optional, Tuple, Union
 
 import torch
-from aiter import QuantType, dtypes, per_tensor_quant
+from aiter import QuantType, dtypes, get_hip_quant, per_tensor_quant
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.quant import dynamic_mxfp4_quant
 from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
@@ -43,6 +43,60 @@ def _has_module(module_name: str) -> bool:
 
 
 MXFP4_QUANT_BLOCK_SIZE = 32
+
+
+def dynamic_per_batched_tensor_quant(
+    x: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn
+):
+    DTYPE_MAX = torch.finfo(dtype).max
+    min_val, max_val = x.aminmax()
+    amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-10)
+    scale = DTYPE_MAX / amax
+    x_scl_sat = (x * scale).clamp(min=-DTYPE_MAX, max=DTYPE_MAX)
+    return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
+
+
+_per_tensor_fp8_quant = get_hip_quant(QuantType.per_Tensor)
+# HIP quantization launches one workgroup per row. Limit atomic-reduction
+# contention while keeping enough workgroups to fill gfx950; each reshaped
+# row must contain complete 16-element vectors.
+_QUANT_ROWS_TARGET = 256
+
+
+@cache
+def _quant_rows(m: int) -> int:
+    """Choose up to 256 rows containing whole 16-element vectors."""
+    for rows in range(min(m, _QUANT_ROWS_TARGET), 0, -1):
+        if m % rows == 0:
+            return rows
+    return 1
+
+
+def quant_fp8_per_tensor(x: torch.Tensor):
+    """Quantize FMHA activations with AITER HIP and return a shape-[1] descale.
+
+    The per-tensor amax is shape-independent. Reshape contiguous input into
+    at most 256 rows to reduce atomic contention, with 16-element-aligned rows
+    for the HIP vector loads. Strided inputs are materialized before dispatch;
+    partial vectors use the torch reference. Explicitly request FP8 because
+    AITER's default output dtype is int8.
+    """
+    if not x.is_contiguous():
+        x = x.contiguous()
+    n = x.numel()
+    if n == 0:
+        return torch.empty_like(x, dtype=dtypes.fp8), torch.ones(
+            1, device=x.device, dtype=torch.float32
+        )
+    if n % 16:
+        # FMHA's head dimensions are multiples of 16. Keep the helper safe
+        # for other callers without passing a partial vector to the HIP op.
+        x8, descale = dynamic_per_batched_tensor_quant(x)
+        return x8, descale.reshape(1)
+    # Preserve complete 16-element vectors in every reshaped row.
+    rows = _quant_rows(n // 16)
+    x8, descale = _per_tensor_fp8_quant(x.view(rows, n // rows), quant_dtype=dtypes.fp8)
+    return x8.view(x.shape), descale
 
 
 def per_tensor_dequantize(
