@@ -120,6 +120,7 @@ support_draft_model_arch_dict = {
     "MiMoV2MTPModel": "atom.models.mimo_v2_mtp.MiMoV2MTP",
     "MiMoV2FlashMTPModel": "atom.models.mimo_v2_mtp.MiMoV2MTP",
     "Qwen3_5MTPModel": "atom.models.qwen3_5_mtp.Qwen3_5MTP",
+    "Glm5NextMTPModel": "atom.models.glm5_next_mtp.Glm5NextMTP",
     "Eagle3LlamaModel": "atom.models.eagle3_llama.Eagle3LlamaModel",
     "Eagle3DeepseekMLAModel": "atom.models.eagle3_deepseek_mla.Eagle3DeepseekMLAModel",
     "K3DSparkModel": "atom.models.kimi_k3_dspark.KimiK3DSpark",
