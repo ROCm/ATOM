@@ -23,7 +23,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-pytest.importorskip("vllm")
+try:  # `importorskip` only catches ImportError, and vLLM's platform probe
+    import vllm  # noqa: F401  # raises RuntimeError on a host with no GPU.
+except (ImportError, RuntimeError) as exc:
+    pytest.skip(f"vLLM is not importable here: {exc}", allow_module_level=True)
 
 import aiter
 import vllm.v1.attention.ops.merge_attn_states as merge_mod
