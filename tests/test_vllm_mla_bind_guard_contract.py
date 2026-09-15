@@ -3,27 +3,27 @@
 
 """The MLA page may be normalised only when it carries exactly one head slot.
 
-`AttentionForVllmMLA` normalises vLLM 0.29's `[B, H, N, C]` page down to 0.28's
-`[B, N, C]` in two places, and both spell the same guard,
-`dim() == 4 and shape[1] == 1`:
+`AttentionForVllmMLA` reconciles vLLM 0.29's `[B, H, N, C]` page with the
+three-dimensional `[B, N, C]` page every consumer below it was written against,
+and it does so at two points, on the same condition -- one published head slot:
 
-* `bind_kv_cache` (the bind point) squeezes the head slot, so every consumer
-  below keeps seeing a three-dimensional page, the way upstream's own
-  `MLAAttention.bind_kv_cache` does.
-* `write_context_kv_latent` folds it with `view` before handing the page to
-  `model_ops`, whose kernels are written against `[num_blocks, block_size,
-  entry]`.
+* `bind_kv_cache` (the bind point) squeezes the head slot away, the way
+  upstream's own `MLAAttention.bind_kv_cache` does, so the rank is normalised
+  once for everything downstream.
+* `_as_atom_page` folds it with `view`, and is called at each of the four
+  places a page crosses out of that file into a kernel written against
+  `[num_blocks, block_size, entry]`.
 
-Neither may drop the guard to match upstream's unconditional form: a 0.28-shaped
-`[B, N, C]` page whose `N` is 1 -- MLA's kernel block size -- would lose its
-block dimension, still be a tensor, still bind, and be silently wrong. And the
-two are not equally forgiving about the other half of the guard. Relaxing
-`shape[1] == 1` is harmless at the bind point, because `Tensor.squeeze(dim)`
-does nothing when that dimension is not 1, but at the fold it is not: `view`
-has no such rule, and a two-head-slot page would fold into a page of twice as
-many block rows -- head-major, so the second slot's rows read as block indices
-past the end of the first. That page must fall through four-dimensional and
-fail loudly in `model_ops` instead.
+Neither may drop the condition to match upstream's unconditional form: a
+0.28-shaped `[B, N, C]` page whose `N` is 1 -- MLA's kernel block size -- would
+lose its block dimension, still be a tensor, still bind, and be silently wrong.
+And the two are not equally forgiving about the head-slot half of it. Relaxing
+it at the bind point is inert, because `Tensor.squeeze(dim)` does nothing when
+that dimension is not 1; at the fold it is not, because `view` has no such rule
+and a two-head-slot page folds into twice as many block rows -- head-major, so
+the second slot's rows read as block indices past the end of the first. Such a
+page must cross four-dimensional and trip the kernels' own rank assertions
+instead.
 
 `tests/plugin/test_vllm_mla_bind_kv_cache.py` drives the real bind point and is
 the stronger test, but importing the layer pulls in vLLM, and CI's unit-test job
@@ -45,7 +45,8 @@ normalised page reaches the method's exit. It asserts only that the value flows,
 never how the guard is written.
 
 What it assumes about each method: one `if` that reads the page's rank, holding
-one assignment back to the page, and a last statement that hands the page on.
+one assignment back to the page, and a last statement that returns the page or
+hands it to a call.
 Rewriting past that fails with a message saying to re-derive this test -- these
 overrides are load-bearing enough to be worth a human reading a rewrite of them.
 """
@@ -64,14 +65,16 @@ LAYER = (
     / "atom/plugin/vllm/attention/layer_mla.py"
 )
 CLASS = "AttentionForVllmMLA"
-POINTS = ("bind_kv_cache", "write_context_kv_latent")
+FOLD_POINT = "_as_atom_page"
+POINTS = ("bind_kv_cache", FOLD_POINT)
 
 KV_LORA_RANK, QK_ROPE_HEAD_DIM = 6, 2
 ENTRY = KV_LORA_RANK + QK_ROPE_HEAD_DIM
 
 # Every shape a normalisation point can be handed, and the page it must produce.
-# Both points owe the same answers -- that is what "the two read as one rule"
-# means, and asserting it here is what keeps them from drifting apart.
+# Both points owe the same four answers -- that is what "the same condition"
+# means above, and asserting it here is what keeps them from drifting apart
+# even though one squeezes and the other folds.
 CASES = (
     ((4, 1, 16, ENTRY), (4, 16, ENTRY), "0.29's [B, H=1, N, C]: the head slot goes"),
     ((4, 2, 16, ENTRY), (4, 2, 16, ENTRY), "two head slots: fall through, fail loudly"),
@@ -184,13 +187,54 @@ def test_the_normalised_page_reaches_the_exit(name: str):
     page_name = method.args.args[1].arg
     _rank_guard(method, page_name)  # also asserts the result is assigned back
 
-    handed_on = any(
-        isinstance(node, ast.Call)
-        and any(isinstance(arg, ast.Name) and arg.id == page_name for arg in node.args)
-        for node in ast.walk(method.body[-1])
+    last = method.body[-1]
+    bare = [
+        node
+        for node in ast.walk(last)
+        if isinstance(node, ast.Call)
+        for arg in node.args
+        if isinstance(arg, ast.Name) and arg.id == page_name
+    ]
+    returned = isinstance(last, ast.Return) and isinstance(last.value, ast.Name)
+    assert bare or (returned and last.value.id == page_name), (
+        f"{CLASS}.{name} neither returns `{page_name}` nor hands it to a call "
+        "in its last statement. The normalisation is only worth anything if "
+        "the normalised page is what leaves the method."
     )
-    assert handed_on, (
-        f"{CLASS}.{name} does not hand `{page_name}` itself to a call in its "
-        "last statement. The normalisation is only worth anything if the "
-        "normalised page is what leaves the method."
+
+
+def test_no_page_is_folded_outside_the_one_place_that_guards_it():
+    """The rule is only a rule if every crossing goes through it.
+
+    Four call sites in `layer_mla.py` hand a page to a kernel written against
+    `[num_blocks, block_size, entry]`, and before `de5ce82a1` each folded it
+    inline and unconditionally. That is why the sparse cells stayed green
+    without the bind-point squeeze -- for `H == 1` an unconditional fold is
+    accidentally correct. A fifth site written the old way would reintroduce
+    the silent case without touching anything the tests above look at.
+    """
+    tree = ast.parse(LAYER.read_text(), filename=str(LAYER))
+    inside = {
+        node
+        for fn in ast.walk(tree)
+        if isinstance(fn, ast.FunctionDef) and fn.name == FOLD_POINT
+        for node in ast.walk(fn)
+    }
+    stray = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "view"
+        and len(node.args) == 3
+        and isinstance(node.args[1], ast.UnaryOp)
+        and isinstance(node.args[1].op, ast.USub)
+        and node not in inside
+    ]
+    assert not stray, (
+        f"{LAYER.name} folds a page with `view(..., -1, ...)` outside "
+        f"{CLASS}.{FOLD_POINT} at line(s) {stray}. Every crossing into a "
+        "three-dimensional kernel must go through the one guarded fold, or a "
+        "multi-head-slot page is silently concatenated head-major at that "
+        "site while the guarded ones correctly pass it through."
     )
