@@ -1074,7 +1074,7 @@ class MLAAttention(nn.Module):
         per channel GROUP with a layout choice; all of those keep the standalone
         quant kernel they have today.
         """
-        if not envs.ATOM_DCP_A2A_FUSED_QUANT or not self.pbm_enabled:
+        if not self.pbm_enabled:
             return None
         if self.dcp_comm_backend != "a2a":
             return None

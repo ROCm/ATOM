@@ -485,30 +485,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM": lambda: (
         os.getenv("ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM", "0") == "1"
     ),
-    # --- DCP a2a combine: emit o_proj's per-token FP8 activation directly ---
-    # Deletes the standalone per-token quant launch between the combine and
-    # o_proj (84 launches / 458us per decode step at C48). Costs occupancy --
-    # the grid drops from (tokens, heads) to (tokens,) because a per-token
-    # scale spans every head -- so it is off by default and measured, not
-    # assumed. Also shifts numerics by up to one bf16 step: the fused path
-    # quantizes from the fp32 accumulator instead of a bf16 round trip.
-    # --- Sparse indexer: skip the -inf prefill of the logits buffer ---
-    # aiter's fp8_mqa_logits allocates [rows, kv_aligned] fp32 and, with
-    # clean_logits=True (its default), fills every element with -inf so that
-    # positions outside a row's [cu_start, cu_end) window cannot win the top-k.
-    # Nothing reads those positions: top_k_per_row_prefill takes the same
-    # rowStarts/rowEnds and offsets every access by rowStart, bounded by
-    # rowEnd - rowStart (topk_per_row_kernels.cu).
-    #
-    # Measured at ISL=49152 bs=1 TP4/DCP4: the fill is 9.1 ms of a 1.3 s
-    # prefill (0.70%), 40 launches, and skipping it leaves a 45k-token greedy
-    # generation bit-identical. Default OFF -- set to 1 to restore the fill.
-    "ATOM_SPARSE_INDEXER_CLEAN_LOGITS": lambda: (
-        os.getenv("ATOM_SPARSE_INDEXER_CLEAN_LOGITS", "0") == "1"
-    ),
-    "ATOM_DCP_A2A_FUSED_QUANT": lambda: (
-        os.getenv("ATOM_DCP_A2A_FUSED_QUANT", "0") == "1"
-    ),
     # --- V4 Attention Backend Refactor (PR-A: kill .item(), unlock CUDAGraph) ---
     # `legacy` (default) keeps the per-seq Python dispatch loop with .item()
     # syncs in deepseek_v4.py. `new` routes through V4AttentionBackend with

@@ -164,7 +164,6 @@ import types  # noqa: E402
 from aiter import QuantType, dtypes  # noqa: E402
 
 from atom.model_ops.attention_mla import MLAAttention  # noqa: E402
-from atom.utils import envs  # noqa: E402
 
 
 def _stub(**over):
@@ -181,20 +180,18 @@ def _stub(**over):
 
 
 @pytest.mark.parametrize(
-    "flag,over,expect",
+    "over,expect",
     [
-        (False, {}, None),                                   # switch off
-        (True, {}, "fp8"),                                   # the one good case
-        (True, {"pbm_enabled": False}, None),                # o_proj not fed directly
-        (True, {"dcp_comm_backend": "ag_rs"}, None),         # other backend
-        (True, {"quant_type": QuantType.per_Tensor}, None),  # not per-token
-        (True, {"quant_type": QuantType.per_1x128}, None),   # block scheme
-        (True, {"params_dtype": dtypes.fp4x2}, None),        # not fp8
-        (True, {"input_scale": object()}, None),             # static scale
-        (True, {"o_proj": None}, None),                      # no o_proj at all
+        ({}, "fp8"),                                   # the one good case
+        ({"pbm_enabled": False}, None),                # o_proj not fed directly
+        ({"dcp_comm_backend": "ag_rs"}, None),         # other backend
+        ({"quant_type": QuantType.per_Tensor}, None),  # not per-token
+        ({"quant_type": QuantType.per_1x128}, None),   # block scheme
+        ({"params_dtype": dtypes.fp4x2}, None),        # not fp8
+        ({"input_scale": object()}, None),             # static scale
+        ({"o_proj": None}, None),                      # no o_proj at all
     ],
 )
-def test_fused_quant_gating(monkeypatch, flag, over, expect):
-    monkeypatch.setattr(envs, "ATOM_DCP_A2A_FUSED_QUANT", flag, raising=False)
+def test_fused_quant_gating(over, expect):
     got = MLAAttention._dcp_fused_quant_dtype(_stub(**over))
     assert got == (dtypes.fp8 if expect == "fp8" else None)
