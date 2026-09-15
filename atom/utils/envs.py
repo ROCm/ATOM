@@ -155,6 +155,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_AITER_FP8_PREFILL_ATTN": lambda: (
         os.getenv("ATOM_AITER_FP8_PREFILL_ATTN", "1") == "1"
     ),
+    # Pack mHC fn weights once after loading and use BF16 hi/lo computation.
+    # Set to 0 before model loading to retain FP32 fn and FP32 mHC computation.
+    "ATOM_MHC_USE_BF16": lambda: os.getenv("ATOM_MHC_USE_BF16", "1") == "1",
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
     # flydsl drop-in for V4-Pro Compressor (Main BF16 + Indexer FP8) paths.
