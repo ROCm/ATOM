@@ -598,6 +598,16 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
             seq = self._state_load_seqs.pop(str(req.req_id), None)
             if seq is None:
                 continue
+            if req.load_spec is None:
+                # Save-only request: `start_load_kv` dispatches a load task only
+                # for `load_spec is not None`, so a spec attached here would
+                # never travel and its index entry would never settle. Today the
+                # scheduler has always cleared `load_hash` first on this path
+                # (`_drop_state_load`), so the `h == -1` check below catches it
+                # -- but that makes this loop's correctness depend on a field a
+                # different owner writes. Check the condition that actually
+                # matters, here.
+                continue
             joint = seq.offload_joint
             h = int(joint.load_hash)
             if h == -1:
