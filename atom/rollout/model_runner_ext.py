@@ -41,6 +41,79 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
     # runner.
     DP_DEVICE_MAP_ENV = "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
 
+    def __init__(self, rank: int, config):
+        # 0 -- the default -- means "this checkpoint's vocabulary is not
+        # padded", which is the right answer for almost every model and costs
+        # one comparison per step.
+        self._true_vocab_size = config.true_vocab_size
+        super().__init__(rank, config)
+        self._check_true_vocab_size(config)
+
+    def _check_true_vocab_size(self, config) -> None:
+        """Refuse a value that would mask nothing, rather than mask nothing.
+
+        The number counts the tokenizer's real tokens, so it can be neither
+        negative nor larger than the rows the embedding matrix has. Either way
+        round it silently disables the mask, which is the failure this whole
+        path exists to prevent.
+        """
+        if self._true_vocab_size < 0:
+            raise ValueError(
+                f"Invalid true_vocab_size={self._true_vocab_size}; expected >= 0, "
+                f"where 0 means the vocabulary is not padded."
+            )
+        if not self._true_vocab_size:
+            return
+        # Not every PretrainedConfig subclass carries vocab_size at the top
+        # level; when it is missing there is nothing to check against.
+        padded = getattr(config.hf_config, "vocab_size", 0)
+        if padded and self._true_vocab_size > padded:
+            raise ValueError(
+                f"true_vocab_size={self._true_vocab_size} exceeds the checkpoint's "
+                f"vocab_size={padded}, so it would mask nothing. It counts the "
+                f"tokenizer's real tokens, which cannot be more than the "
+                f"embedding matrix has rows."
+            )
+        logger.info(
+            "Rollout masks the vocabulary tail above %d (checkpoint has %d rows)",
+            self._true_vocab_size,
+            padded,
+        )
+
+    def postprocess(
+        self,
+        batch: ScheduledBatch,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor | None,
+        top_ps: torch.Tensor | None,
+        all_greedy: bool,
+        hidden_states: torch.Tensor,
+        needs_independent_noise: bool = False,
+    ) -> ScheduledBatchOutput:
+        """Mask the padding tail of the vocabulary before sampling.
+
+        A checkpoint whose embedding matrix is padded up to a friendlier width
+        -- Qwen3 rounds 151665 real tokens up to 151936 -- leaves the tail rows
+        holding whatever the padding was initialised to. On that checkpoint
+        they are copies of an existing embedding rather than zero or -inf, so
+        the sampler reaches them and can return an id the tokenizer cannot
+        decode. Training frameworks mask them on their side; a rollout engine
+        that does not disagrees with the trainer over exactly those positions.
+        """
+        if self._true_vocab_size > 0 and logits.shape[-1] > self._true_vocab_size:
+            logits[..., self._true_vocab_size :] = float("-inf")
+        return super().postprocess(
+            batch,
+            logits,
+            temperatures,
+            top_ks,
+            top_ps,
+            all_greedy,
+            hidden_states,
+            needs_independent_noise=needs_independent_noise,
+        )
+
     def _setup_device_and_distributed(self, rank: int, config):
         """Override to set up DP-isolated NCCL worlds.
 
