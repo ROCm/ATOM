@@ -1586,6 +1586,7 @@ def indexer_cp_unsupported_reason(
     sparse_block_size: int,
     dcp_size: int,
     enable_tbo: bool,
+    plugin_mode: bool = False,
 ) -> str | None:
     """Why MiniMax-M3 indexer-only context parallelism cannot run here, or None.
 
@@ -1596,9 +1597,23 @@ def indexer_cp_unsupported_reason(
     indexer's block scoring; real DCP shards the KV cache itself (BlockManager
     scales the prefix-cache hash granularity by dcp_world_size), and M3 has no
     DCP-aware attention path at all. The two cannot both own the context axis.
+
+    ``plugin_mode`` belongs here rather than only in ``indexer_cp_enabled``
+    because this gate is what clears the FLAG. Leaving it set under a bridge
+    left the config claiming CP while the runtime gate silently served TP, so
+    the startup line an A/B is diagnosed from ("indexer_dcp_only enabled") said
+    the opposite of what ran -- and ``compute_hash`` keyed on a value the model
+    never used.
     """
     if not any("MiniMaxM3" in str(a) for a in arches):
         return "not a MiniMax-M3 model"
+    if plugin_mode:
+        # The vLLM/SGLang bridges run ATOM's own linear.py and minimax_m3.py, so
+        # the flag would widen index_q underneath them -- and both reshape it
+        # with a ``view`` on the width they assume, yielding 4x the rows with no
+        # error. ``indexer_cp_enabled`` refuses them at runtime; this clears the
+        # flag so nothing downstream (log line, compile hash) disagrees.
+        return "plugin mode (the vLLM/SGLang bridges keep the TP indexer path)"
     if dcp_size > 1:
         return (
             "decode_context_parallel_size > 1 (KV-cache DCP owns the context "
@@ -1616,22 +1631,21 @@ def indexer_cp_unsupported_reason(
         return f"sparse_block_size {sparse_block_size} != 128"
     # Speculative decoding is deliberately NOT rejected. The whole chain takes
     # max_query_len as a runtime argument and validates against it --
-    # indexer_context_scores, local_candidate_keys, merge_candidate_keys. This
-    # was verified out of tree over query_len {1, 4}, asserting torch.equal
-    # against minimax_m3_index_topk_decode for every head at every context
-    # length; qlen == 4 is exactly EAGLE3 with 3 draft tokens. NOTE that no test
-    # in this repo currently pins it -- the equality suite is not carried here.
+    # indexer_context_scores, local_candidate_keys, merge_candidate_keys --
+    # and ``tests/model_ops/test_indexer_cp_parity.py`` pins torch.equal against
+    # the native kernel at both qlen 1 and qlen 4 (EAGLE3 with 3 draft tokens).
     #
-    # It is also the configuration this feature most wants. The score kernel
-    # sizes its MMA tile as max(16, next_power_of_2(heads * max_query_len))
-    # (indexer_context_parallel.py), so heads and draft tokens fill ONE
-    # dimension together against a hardware floor of 16:
-    #     TP,  no spec   1 x 1 =  1  ->  6% of the tile
-    #     CP,  no spec   4 x 1 =  4  -> 25%
-    #     TP + spec3     1 x 4 =  4  -> 25%
-    #     CP + spec3     4 x 4 = 16  -> 100%
-    # Rejecting spec here left every measurable arm at 25% or below and made the
-    # feature look marginal.
+    # Rejecting it is also a throughput loss, though NOT for the reason an
+    # earlier revision of this comment gave. That version claimed drafting
+    # "fills the MMA tile" (1x1 = 6% -> 4x4 = 100%). Measured on MI355X, both
+    # arms run the score kernel at 5.5-7.5 TB/s against an ~8 TB/s roof: the
+    # kernel is BANDWIDTH-bound, never MMA-starved, and the CP win is the 4x
+    # byte ratio (every rank reads 1/P of the blocks from a REPLICATED one-head
+    # index cache). The tile width does matter, but with the opposite sign --
+    # both kernels size the dot's N as max(16, next_pow2(heads * query_len)), so
+    # TP's N is 16 for every qlen <= 16 (flat: 90.2/92.2/90.8us at q=1/4/8)
+    # while CP's doubles at q=5 (20.3/20.4/24.0us). q=4 is CP's exact fill point
+    # and free; q=8 costs it 17% for nothing. Pair this flag with MTP3.
     if enable_tbo:
         # Two ubatch threads issuing all-to-alls on one group with no ordering
         # discipline deadlock.
@@ -2239,6 +2253,7 @@ class Config:
                 sparse_cfg.get("sparse_block_size", 0),
                 self.decode_context_parallel_size,
                 self.enable_tbo or self.enable_tbo_decode,
+                is_plugin_mode(),
             )
             if indexer_cp_off is not None:
                 logger.warning(
@@ -2310,6 +2325,20 @@ class Config:
         # runtime — the same stale-artifact hazard documented for the vocab-embed
         # flag below.
         factors.append(self.prefill_context_parallel_size)
+        # MiniMax-M3 indexer-only CP changes the FUSED QKV OUTPUT WIDTH: index_q
+        # is this rank's one head under TP and all `sparse_num_index_heads` of
+        # them under CP (minimax_m3.py, linear.py), so the traced graph and the
+        # captured buffer strides differ. Exactly the pcp hazard above -- two
+        # runs of the same model and source otherwise hash identically, so
+        # starting one mode after the other would load the opposite mode's
+        # artifact and trip assert_size_stride at runtime.
+        #
+        # This reads the field AFTER __post_init__, which is the only correct
+        # value: it already folds in the ATOM_M3_INDEXER_CP override AND every
+        # indexer_cp_unsupported_reason fallback (plugin mode, TP != kv heads,
+        # block != 128, DCP, TBO). Two topologies that both fall back therefore
+        # share one artifact, as they should.
+        factors.append(bool(getattr(self.dcp_config, "indexer_dcp_only", False)))
         factors.append(self.enable_dp_attention)
         factors.append(self.index_cache_dtype)
         text_config = getattr(self.hf_config, "text_config", self.hf_config)

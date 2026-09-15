@@ -211,7 +211,16 @@ def local_candidate_keys(
         raise ValueError("scores must be contiguous and lengths int32")
     keys = torch.empty((heads, tokens, topk), dtype=torch.int64, device=scores.device)
     if tokens:
-        width = max(16, triton.next_power_of_2(local))
+        # The tile must be at least as wide as the top-k it selects: the
+        # kernel's FIRST `tl.topk(x[BLOCK_SIZE_K], BLOCK_SIZE_T)` runs before
+        # any `tl.cat`, so BLOCK_SIZE_K < BLOCK_SIZE_T cannot compile. A small
+        # shard reaches that -- e.g. 8 local blocks with topk 32 gives a 16-wide
+        # tile and a 32-wide selection. M3 ships sparse_topk_blocks=16, which
+        # the max(16, ...) floor already covers, so this is unreachable on the
+        # shipped config and costs it exactly nothing; it is here so the
+        # function is correct for the topk its own guard admits (<= 512), rather
+        # than only for the one value production happens to pass.
+        width = max(16, triton.next_power_of_2(local), triton.next_power_of_2(topk))
         width = min(width, 1024)
         _local_topk[(tokens, heads)](
             scores,

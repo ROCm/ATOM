@@ -26,6 +26,7 @@ import torch.distributed as dist
 
 from atom.config import get_current_atom_config
 from atom.plugin.prepare import is_plugin_mode
+from atom.utils import envs
 
 
 def indexer_cp_enabled() -> bool:
@@ -111,16 +112,54 @@ def exchange_candidates(keys: torch.Tensor) -> torch.Tensor:
     Below the crossover that ~10us bubble outweighs sending 4x the bytes.
     """
     group = get_indexer_cp_group()
-    if keys.numel() * keys.element_size() <= _ALLGATHER_MAX_PAYLOAD_BYTES:
-        gathered = _exchange_via_all_gather(keys, group)
-        if gathered is not None:
-            return gathered
+    if _can_all_gather(keys, group):
+        return _exchange_via_all_gather(keys, group)
     received = torch.empty_like(keys)
     dist.all_to_all_single(received, keys, group=group.device_group)
     return received
 
 
-def _exchange_via_all_gather(keys: torch.Tensor, group) -> torch.Tensor | None:
+def _can_all_gather(keys: torch.Tensor, group) -> bool:
+    """Whether this exchange takes the all-gather transport.
+
+    EVERY TERM MUST BE RANK-INVARIANT, and that is this function's whole reason
+    to exist rather than an incidental property. The two transports are
+    different collectives on the same group: if one rank answered True and
+    another False, the first would sit in ``custom_all_gather`` while the second
+    sat in ``all_to_all_single``, and the group would deadlock with no error at
+    all. An earlier version wrapped the collective in ``except (AssertionError,
+    RuntimeError, AttributeError): return None`` and fell back per rank, which
+    is precisely that hazard -- a per-rank exception is not a per-rank
+    recoverable event when the thing that raised is a collective.
+
+    So the decision reads only inputs that are identical on every rank by
+    construction, and nothing here can raise:
+
+    * ``ATOM_USE_CUSTOM_ALL_GATHER`` -- the repo-wide opt-out for aiter's custom
+      gather (``embed_head.py`` passes it as ``use_custom``). It is set
+      process-wide, never per rank. Honouring it is also what makes this
+      transport switchable at all: without it, an operator who disabled the
+      custom gather everywhere else still got it here.
+    * the group's ``ca_comm`` and its ``disabled`` flag -- both fixed when the
+      group was built, from world size and topology, which every rank shares.
+    * ``should_custom_ag`` -- a pure function of payload bytes and contiguity.
+      ``keys`` is [heads, tokens, topk], the same shape on every rank.
+
+    The byte threshold is checked first because it is the performance decision;
+    the rest is availability. When availability says no, the all-to-all is
+    correct at every size -- just with the bubble documented above.
+    """
+    if keys.numel() * keys.element_size() > _ALLGATHER_MAX_PAYLOAD_BYTES:
+        return False
+    if not envs.ATOM_USE_CUSTOM_ALL_GATHER:
+        return False
+    ca_comm = getattr(getattr(group, "device_communicator", None), "ca_comm", None)
+    if ca_comm is None or ca_comm.disabled:
+        return False
+    return bool(ca_comm.should_custom_ag(keys.view(torch.int32)))
+
+
+def _exchange_via_all_gather(keys: torch.Tensor, group) -> torch.Tensor:
     """The same routing as the all-to-all, via aiter's bubble-free all-gather.
 
     Every rank receives every shard's candidates for every head, and then reads
@@ -129,8 +168,9 @@ def _exchange_via_all_gather(keys: torch.Tensor, group) -> torch.Tensor | None:
     ``merge_candidate_keys`` already reads its input through ``SRC_STRIDE``, so
     a strided view costs it nothing.
 
-    Returns None when aiter's custom collective is unavailable (disabled, or no
-    registered buffer for this size), leaving the caller on the all-to-all.
+    Callers must clear ``_can_all_gather`` first. There is deliberately no
+    try/except here: see that function for why a per-rank fallback around a
+    collective deadlocks rather than recovers.
     """
     world, tokens, topk = keys.shape
     # int64 must be viewed as int32 pairs rather than passed through: aiter's
@@ -139,12 +179,7 @@ def _exchange_via_all_gather(keys: torch.Tensor, group) -> torch.Tensor | None:
     # torch.float64" (aiter/utility/dtypes.py:57). The kernel is a pure memcpy
     # parametrized only by sizeof(T), so splitting each key into two int32 lanes
     # is value-preserving.
-    try:
-        gathered = group.custom_all_gather(keys.view(torch.int32))
-    except (AssertionError, RuntimeError, AttributeError):
-        return None
-    if gathered is None:
-        return None
+    gathered = group.custom_all_gather(keys.view(torch.int32))
     # [world(src), world(head), tokens, topk] -- take this rank's head from
     # every source shard.
     return gathered.view(torch.int64).view(world, world, tokens, topk)[
@@ -171,6 +206,12 @@ def warmup_exchange(device) -> None:
     going through the dispatcher would warm aiter and leave RCCL cold -- and
     then a large batch at capture time would hit the all-to-all's lazy setup
     inside the graph, which is exactly the hang this function exists to prevent.
+
+    The all-gather half still goes through ``_can_all_gather``, so a deployment
+    that disabled aiter's custom gather warms only what it will actually run
+    instead of raising here. That predicate is monotonic in payload size, so
+    clearing it for the probe implies clearing it for the larger production
+    payload -- the warmup cannot pass for a transport production then skips.
     """
     if not indexer_cp_enabled():
         return
@@ -179,5 +220,6 @@ def warmup_exchange(device) -> None:
     group = get_indexer_cp_group()
     received = torch.empty_like(probe)
     dist.all_to_all_single(received, probe, group=group.device_group)
-    _exchange_via_all_gather(probe, group)
+    if _can_all_gather(probe, group):
+        _exchange_via_all_gather(probe, group)
     torch.cuda.synchronize()

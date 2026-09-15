@@ -12,28 +12,31 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from aiter.rotary_embedding import get_rope
+from torch import nn
+from transformers import PretrainedConfig
+
 from atom.config import Config, QuantizationConfig
 from atom.distributed.indexer_cp import indexer_cp_enabled
-from atom.model_ops.base_attention import Attention
+from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
+from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import (
     GemmaRMSNorm,
     fused_allreduce_gemma_rms_norm,
     fused_allreduce_gemma_rms_norm_quant,
 )
-from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.linear import (
-    MinimaxM3QKVParallelLinearWithIndexer,
     MergedColumnParallelLinear,
+    MinimaxM3QKVParallelLinearWithIndexer,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
-from atom.model_ops.moe import FusedMoE
 from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
 )
+from atom.model_ops.moe import FusedMoE
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
 from atom.models.utils import (
@@ -44,8 +47,6 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.utils.decorators import support_torch_compile
-from torch import nn
-from transformers import PretrainedConfig
 
 
 def _get_text_config(config: PretrainedConfig) -> PretrainedConfig:
