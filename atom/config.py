@@ -663,6 +663,7 @@ _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     "qwen3_5_moe": "text_config",
     "mistral3": "text_config",
     "glm5_next": "text_config",  # GLM-5.3-Flash: text-only hybrid KDA/DSA runtime
+    "qwen4_exp": "text_config",
 }
 
 # Text sub-config model_types that this image's transformers has no class for.
@@ -1007,8 +1008,30 @@ class ParallelConfig:
             )
 
 
+_SERIAL_MTP_DEFAULT_MAX_SPEC = 8
+_EAGLE3_DEFAULT_MAX_SPEC = 4
+_SEQUENTIAL_DRAFTER_MAX_SPEC_ATTRS = (
+    "max_speculative_tokens",
+    "max_num_speculative_tokens",
+    "max_draft_tokens",
+)
 _DSPARK_DEFAULT_MAX_BLOCK = 16
 _DSPARK_DEFAULT_ROLLING_WINDOW = 128
+
+
+def _resolve_sequential_drafter_max_spec(
+    speculative_config: "SpeculativeConfig",
+) -> int:
+    """Return the supported draft-token horizon for serial MTP/EAGLE drafters."""
+    draft_cfg = speculative_config.draft_model_hf_config
+    for attr in _SEQUENTIAL_DRAFTER_MAX_SPEC_ATTRS:
+        max_spec = getattr(draft_cfg, attr, None)
+        if max_spec is not None:
+            return int(max_spec)
+
+    if speculative_config.method == "eagle3":
+        return _EAGLE3_DEFAULT_MAX_SPEC
+    return _SERIAL_MTP_DEFAULT_MAX_SPEC
 
 
 def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
@@ -2012,8 +2035,11 @@ class Config:
             draft_cfg = self.speculative_config.draft_model_hf_config
             if not is_dspark:
                 # Sequential drafters (MTP / Eagle): one drafted token per
-                # backbone pass, so the horizon is a small fixed depth.
-                max_spec = 4
+                # backbone pass, and the drafter just repeats that pass, so the
+                # horizon is whatever the checkpoint declares -- else 8 for
+                # plain MTP (a headroom cap; recipes run 3-5 today) and the
+                # historic 4 for EAGLE.
+                max_spec = _resolve_sequential_drafter_max_spec(self.speculative_config)
             else:
                 # DSpark is a PARALLEL block drafter: all flavors
                 # (inline V4, standalone K3 / Qwen3 / ...) share this path with

@@ -872,6 +872,7 @@ def minimax_m3_sparse_attention_for_sglang(
     from atom.model_ops.minimax_m3.index_topk import (
         minimax_m3_index_topk,
         minimax_m3_index_topk_decode,
+        n_valid_column_per_row_for_forward,
     )
 
     if metadata.is_decode:
@@ -887,6 +888,20 @@ def minimax_m3_sparse_attention_for_sglang(
             layer.local_blocks,
             layer.num_kv_heads,
             layer.scaling,
+            # Hoisted onto `forward_batch`, not `metadata`: this function
+            # rebuilds `metadata` per sparse layer, so it is the batch that
+            # lives exactly one forward. One row per request here -- this path
+            # takes the `max_query_len=1` default.
+            n_valid_column_per_row=n_valid_column_per_row_for_forward(
+                forward_batch,
+                "decode",
+                metadata.seq_lens,
+                metadata.seq_lens,
+                batch=batch_size,
+                total_q=batch_size,
+                num_idx_heads=layer.num_idx_heads,
+                decode_max_q=1,
+            ),
         )
         minimax_m3_sparse_attn_decode_split_kv(
             q[:batch_size],
@@ -925,6 +940,18 @@ def minimax_m3_sparse_attention_for_sglang(
             layer.local_blocks,
             layer.num_kv_heads,
             layer.scaling,
+            # Ragged rows: query starts, and the keys already behind each
+            # request. Same owner as the decode branch above.
+            n_valid_column_per_row=n_valid_column_per_row_for_forward(
+                forward_batch,
+                "prefill",
+                metadata.cu_seqlens_q,
+                metadata.context_lens,
+                batch=metadata.cu_seqlens_q.shape[0] - 1,
+                total_q=num_tokens,
+                num_idx_heads=layer.num_idx_heads,
+                decode_max_q=0,
+            ),
         )
         minimax_m3_sparse_attn_split_kv(
             q[:num_tokens],
