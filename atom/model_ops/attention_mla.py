@@ -1045,7 +1045,7 @@ class MLAAttention(nn.Module):
             self._qrep_local_src = w
         return self._qrep_local_proj
 
-    def _dcp_merge(self, o, lse, ctx=None, owned_counts=None):
+    def _dcp_merge(self, o, lse, ctx=None, owned_counts=None, quant_dtype=None):
         """Bind this layer's DCP group and backend to ``dcp_ops.dcp_lse_merge``."""
         from atom.model_ops.dcp_ops import dcp_lse_merge
 
@@ -1056,7 +1056,33 @@ class MLAAttention(nn.Module):
             self.dcp_comm_backend,
             ctx=ctx,
             owned_counts=owned_counts,
+            quant_dtype=quant_dtype,
         )
+
+    def _dcp_fused_quant_dtype(self):
+        """o_proj's activation dtype if the combine can emit it, else None.
+
+        The combine can only absorb the quant when o_proj reads its output
+        directly (PBM) and wants exactly a per-token FP8 activation. A static
+        input_scale is not a per-token scale, and the block schemes need a scale
+        per channel GROUP with a layout choice; all of those keep the standalone
+        quant kernel they have today.
+        """
+        if not envs.ATOM_DCP_A2A_FUSED_QUANT or not self.pbm_enabled:
+            return None
+        if self.dcp_comm_backend != "a2a":
+            return None
+        op = getattr(self, "o_proj", None)
+        qt = getattr(op, "quant_type", None)
+        # QuantType is compared by .value throughout ATOM: the enum can be
+        # re-imported under a different module identity, breaking `is`/`==`.
+        if qt is None or getattr(qt, "value", None) != QuantType.per_Token.value:
+            return None
+        if getattr(op, "params_dtype", None) != dtypes.fp8:
+            return None
+        if getattr(op, "input_scale", None) is not None:
+            return None
+        return dtypes.fp8
 
     @mark_trace(prefix="dcp_project_merge_out", torch_compile=False)
     def _dcp_project_merge_out(
@@ -1072,13 +1098,27 @@ class MLAAttention(nn.Module):
             o = self._v_up_proj(
                 o, self.W_V_dcp, self.W_V_dcp_scale, num_heads=o.shape[1]
             )
+        # Only PBM hands the merge output straight to o_proj, so it is the only
+        # path whose activation quant the combine can absorb. The fp32 merge is
+        # a prefill-accuracy path and keeps its bf16 store.
+        fused_quant = None if merge_in_fp32 else self._dcp_fused_quant_dtype()
         if merge_in_fp32:
             dtype = o.dtype
             o = self._dcp_merge(o.float(), lse, ctx=ctx, owned_counts=owned_counts).to(
                 dtype
             )
         else:
-            o = self._dcp_merge(o, lse, ctx=ctx, owned_counts=owned_counts)
+            o = self._dcp_merge(
+                o, lse, ctx=ctx, owned_counts=owned_counts, quant_dtype=fused_quant
+            )
+        if fused_quant is not None:
+            o, o_scale = o
+            if o_scale is not None:
+                return self.o_proj(
+                    o.reshape(-1, self.num_heads * self.v_head_dim), o_scale
+                )
+            # Single-rank DCP: there was no combine to fold into, so the tensor
+            # came back unquantized and o_proj quantizes it as it always has.
         if self.pbm_enabled:
             return self.o_proj(o.reshape(-1, self.num_heads * self.v_head_dim))
         return self._v_up_proj_and_o_proj(o)

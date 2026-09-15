@@ -151,3 +151,50 @@ def test_empty_rows_do_not_poison_the_scale():
     for row in empty:
         assert got_s[row].item() == 1.0
         assert deq[row].abs().max().item() == 0.0
+
+
+# --------------------------------------------------------------------------
+# Gating. Runs without a GPU: the predicate only reads attributes off self, so
+# a stand-in exercises the whole matrix. A wrong answer here is a silent
+# numerics bug (o_proj told a tensor is quantized when it is not), which is
+# exactly the kind of thing that never shows up as a crash.
+# --------------------------------------------------------------------------
+import types  # noqa: E402
+
+from aiter import QuantType, dtypes  # noqa: E402
+
+from atom.model_ops.attention_mla import MLAAttention  # noqa: E402
+from atom.utils import envs  # noqa: E402
+
+
+def _stub(**over):
+    o_proj = types.SimpleNamespace(
+        quant_type=QuantType.per_Token, params_dtype=dtypes.fp8, input_scale=None
+    )
+    for k in ("quant_type", "params_dtype", "input_scale"):
+        if k in over:
+            setattr(o_proj, k, over.pop(k))
+    s = types.SimpleNamespace(pbm_enabled=True, dcp_comm_backend="a2a", o_proj=o_proj)
+    for k, v in over.items():
+        setattr(s, k, v)
+    return s
+
+
+@pytest.mark.parametrize(
+    "flag,over,expect",
+    [
+        (False, {}, None),                                   # switch off
+        (True, {}, "fp8"),                                   # the one good case
+        (True, {"pbm_enabled": False}, None),                # o_proj not fed directly
+        (True, {"dcp_comm_backend": "ag_rs"}, None),         # other backend
+        (True, {"quant_type": QuantType.per_Tensor}, None),  # not per-token
+        (True, {"quant_type": QuantType.per_1x128}, None),   # block scheme
+        (True, {"params_dtype": dtypes.fp4x2}, None),        # not fp8
+        (True, {"input_scale": object()}, None),             # static scale
+        (True, {"o_proj": None}, None),                      # no o_proj at all
+    ],
+)
+def test_fused_quant_gating(monkeypatch, flag, over, expect):
+    monkeypatch.setattr(envs, "ATOM_DCP_A2A_FUSED_QUANT", flag, raising=False)
+    got = MLAAttention._dcp_fused_quant_dtype(_stub(**over))
+    assert got == (dtypes.fp8 if expect == "fp8" else None)
