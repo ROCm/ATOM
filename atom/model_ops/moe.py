@@ -1534,7 +1534,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     n_expts_tot = global_num_experts
 
                 try:
-                    from atom.model_ops.qwen3_8_flash_next import (
+                    from atom.model_ops.qwen4_exp import (
                         flash_decode_graph_workspace as _fws,
                     )
                     if _fws.fits_moe(x.shape[0], 1, 1, x.dtype):

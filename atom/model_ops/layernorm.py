@@ -732,7 +732,7 @@ class GemmaRMSNorm(nn.Module):
 
         out = None
         try:
-            from atom.model_ops.qwen3_8_flash_next import (
+            from atom.model_ops.qwen4_exp import (
                 flash_decode_graph_workspace as _fws,
             )
 

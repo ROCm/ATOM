@@ -209,7 +209,7 @@ def triton_kernel_fused_experts(
 
     if intermediate_cache is None:
         try:
-            from atom.model_ops.qwen3_8_flash_next import (
+            from atom.model_ops.qwen4_exp import (
                 flash_decode_graph_workspace as _fws,
             )
             if _fws.fits_moe(M, topk, half_N, hidden_states.dtype):

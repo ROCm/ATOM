@@ -1306,7 +1306,7 @@ def causal_conv1d_update(
     num_tokens = x.shape[0]
     pinned = None
     try:
-        from atom.model_ops.qwen3_8_flash_next import flash_decode_graph_workspace as _fws
+        from atom.model_ops.qwen4_exp import flash_decode_graph_workspace as _fws
 
         pinned = _fws.gdn_conv_qkv(num_tokens, k_dim_size, v_dim_size, x.dtype)
     except Exception:

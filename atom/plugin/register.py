@@ -45,7 +45,7 @@ if is_sglang():
         Qwen3_5MoeForCausalLM,
     )
     from atom.models.qwen3_next import Qwen3NextForCausalLM
-    from atom.models.qwen3_8_flash_next import Qwen3_8FlashNextForConditionalGeneration
+    from atom.models.qwen4_exp import Qwen4ExpForConditionalGeneration
 
     _ATOM_SUPPORTED_MODELS.update(
         {
@@ -64,7 +64,7 @@ if is_sglang():
             "KimiK25ForConditionalGeneration": KimiK25ForCausalLM,
             "KimiK3ForConditionalGeneration": KimiK3ForCausalLM,
             # Qwen3.8-Flash-Next / Qwen4Exp — not Qwen3.5.
-            "Qwen4ExpForConditionalGeneration": Qwen3_8FlashNextForConditionalGeneration,
+            "Qwen4ExpForConditionalGeneration": Qwen4ExpForConditionalGeneration,
         }
     )
     _ATOM_SUPPORTED_DRAFT_MODELS = {

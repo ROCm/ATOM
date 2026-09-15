@@ -83,7 +83,7 @@ def fused_gdn_gating(
     grid = (batch, seq_len, triton.cdiv(num_heads, 8))
     pinned = None
     try:
-        from atom.model_ops.qwen3_8_flash_next import flash_decode_graph_workspace as _fws
+        from atom.model_ops.qwen4_exp import flash_decode_graph_workspace as _fws
 
         pinned = _fws.gdn_gate_out(batch, num_heads, b.dtype)
     except Exception:
@@ -163,7 +163,7 @@ class GatedDeltaNet(nn.Module):
             (query, key),
         )
         value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
-        from atom.model_ops.qwen3_8_flash_next import flash_decode_graph_workspace as _fws
+        from atom.model_ops.qwen4_exp import flash_decode_graph_workspace as _fws
 
         query = _fws.pin_gdn_qkv(query, kind="q")
         key = _fws.pin_gdn_qkv(key, kind="k")
