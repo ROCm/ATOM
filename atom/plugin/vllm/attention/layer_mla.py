@@ -404,10 +404,16 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         than an inherited one, and it costs a `dim()` read on a path that runs
         once per draft step. It spells out the same head-slot condition as
         `bind_kv_cache`, so the two read as one rule: a single published head
-        slot is what makes the fold a reinterpretation rather than an
-        interleave. A spec that published K and V as two slots would fold them
-        into alternating rows, so let such a page fall through four-dimensional
-        and fail loudly in `model_ops` instead.
+        slot is what makes the fold a reinterpretation rather than a
+        concatenation. A spec that published K and V as two slots would fold
+        into twice as many block rows, head-major for this `[B, H, N, C]`
+        layout -- the second slot's rows read as block indices past the end of
+        the first -- so let such a page fall through four-dimensional and fail
+        loudly in `model_ops` instead. Note the asymmetry with `bind_kv_cache`:
+        there the same condition is belt-and-braces, because `squeeze(dim)` is
+        a no-op when that dimension is not 1, but `view` has no such rule, so
+        here it is the check that stands between a two-slot page and silently
+        wrong addresses.
         """
         if self.kv_cache_dtype.startswith("fp8") and kv_cache.dtype == torch.uint8:
             from vllm.platforms import current_platform
