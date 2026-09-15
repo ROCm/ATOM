@@ -40,7 +40,7 @@ from aiter import silu_and_mul as aiter_silu_and_mul
 from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
-from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.batched_gemm_op_a8w8 import (
     batched_gemm_a8w8_mxscale,
     batched_gemm_a8w8_mxscale_bpreshuffle,
@@ -2344,10 +2344,11 @@ class DeepseekV4Attention(nn.Module):
             prefix=f"{p}.wo_b",
         )
         self.softmax_scale = self.head_dim**-0.5
-        # Cached at construction (non-compiled) so `_attn_post` — now traced into
-        # the graphed dense piece — doesn't graph-break on a runtime get_gfx().
-        self._is_gfx1250 = get_gfx() == "gfx1250"
-        self._is_gfx950 = get_gfx() == "gfx950"
+        # Cache the runtime architecture outside compiled code so _attn_post
+        # can use static flags without tracing GPU detection.
+        arch = get_gfx_runtime()
+        self._is_gfx1250 = arch == "gfx1250"
+        self._is_gfx950 = arch == "gfx950"
         self._is_preshuffle = (
             self._is_gfx1250
         )  # TODO: gfx950 will support preshuffle in the future
