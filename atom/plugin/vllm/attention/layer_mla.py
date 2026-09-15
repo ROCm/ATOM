@@ -361,22 +361,30 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         """Drop 0.29's head slot so every consumer below sees 0.28's page.
 
         vLLM 0.29 views each layer's cache as `[B, H, N, C]` (RFC #42082) where
-        0.28 handed MLA a three-dimensional page, and upstream's own
-        `MLAAttention.bind_kv_cache` absorbs that by squeezing `H` once at the
-        bind point. ATOM's MLA layer derives from `AttentionLayerBase`, whose
-        default binds the view as-is, so without this override the extra
-        dimension reaches every consumer in this file -- and `ops.py` hands them
-        `layer.kv_cache` verbatim, so the drafter's context-row write sees it
-        too. Two of them assert on the rank (`concat_and_cache_mla_rope_fused`
-        wants `dim() == 3`, `aiter.concat_and_cache_mla` wants
-        `size(2) == kv_lora_rank + pe_dim`) and the chunked-context gathers read
-        `size(1)` as the block size, so normalise once here rather than at each
-        call site.
+        0.28 handed MLA a three-dimensional page, and upstream absorbs that by
+        squeezing `H` once at the bind point -- in `MLAAttention.bind_kv_cache`
+        and, word for word, in its own K3 MLA layer. Three dimensions is
+        upstream's standing contract for an MLA layer, so restoring it here is
+        parity, not a detour. ATOM's MLA layer derives from
+        `AttentionLayerBase`, whose default binds the view as-is, so without
+        this override the extra dimension reaches every consumer in this file --
+        and `ops.py` hands them `layer.kv_cache` verbatim, so the drafter's
+        context-row write sees it too. Two of them assert on the shape
+        (`concat_and_cache_mla_rope_fused` checks `size(2)` and then
+        `dim() == 3`, `aiter.concat_and_cache_mla` checks `size(2)` alone) and
+        the chunked-context gathers read `size(1)` as the block size, so
+        normalise once here rather than at each call site.
         """
         if kv_cache.dim() == 4 and kv_cache.shape[1] == 1:
-            # [B, H=1, N, C] -> [B, N, C]. Guarded so a 0.28-shaped page, and
-            # any future spec that publishes more than one head slot, is left
-            # for the consumer to interpret.
+            # [B, H=1, N, C] -> [B, N, C]. The guard is not defensive padding
+            # and is not there merely to pass a 0.28-shaped page through: both
+            # upstream copies squeeze unconditionally, which on a three-
+            # dimensional `[B, N, C]` page with `N == 1` -- exactly MLA's kernel
+            # block size -- would eat the block dimension and destroy the page.
+            # Upstream never sees such a page under 0.29; this layer can. Do not
+            # drop the guard to match upstream. It also leaves a future spec
+            # that publishes more than one head slot for the consumer to
+            # interpret.
             kv_cache = kv_cache.squeeze(1)
         super().bind_kv_cache(kv_cache)
 
