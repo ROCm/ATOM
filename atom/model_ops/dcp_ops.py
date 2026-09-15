@@ -333,8 +333,11 @@ def _zero_nonfinite_rows_kernel(
     h = tl.program_id(axis=1).to(tl.int64)
 
     lse = tl.load(lse_ptr + b * lse_stride_b + h * lse_stride_h)
-    # isfinite: NaN fails `lse == lse`, +-inf fails the abs bound.
-    if (lse == lse) and (tl.abs(lse) < float("inf")):  # noqa: PLR0124
+    # isfinite: NaN fails `lse == lse`, +-inf fails the abs bound. `&` rather
+    # than `and` to match the rest of this file and to keep the predicate a
+    # single elementwise op; `tl.abs` has no side effect, so nothing is lost by
+    # not short-circuiting.
+    if (lse == lse) & (tl.abs(lse) < float("inf")):  # noqa: PLR0124
         return
 
     base = out_ptr + b * out_stride_b + h * out_stride_h
