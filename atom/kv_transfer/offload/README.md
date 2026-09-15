@@ -94,7 +94,7 @@ Four rules carry the module:
 | `hybrid/kimi_k3/connector.py` | Kimi-K3 worker and scheduler: the dense paged-KV path plus one extra leg for the KDA per-request state tier. |
 | `hybrid/kimi_k3/staging.py` | Single-entry bounded GPU staging buffer, D2H/H2D copy stream, and producer event for one flat state entry per transfer. |
 | `hybrid/kimi_k3/state_object.py` | One state checkpoint as a single opaque object keyed by ATOM's own hash, bypassing LMCache's `ChunkedTokenDatabase` (state bytes are not token-sliceable). |
-| `hybrid/kimi_k3/state_tier.py` | Worker-side store/load driver for the state tier on its own executor; reports store/finished/failed hash sets for the engine-side `StateOffloadIndex` to apply. |
+| `hybrid/kimi_k3/state_tier.py` | Worker-side store/load driver for the state tier. Stores run on its own executor; loads run inline on the KV load task, so one dispatch yields one completion. Reports store/verdict hash sets for the engine-side `StateOffloadIndex` to apply. |
 | `atom_lmcache_staging.py` | Per-thread CUDA streams, staging buffer, ready/free events, env helpers. |
 
 The engine-side counterpart of the state tier lives outside this directory:
