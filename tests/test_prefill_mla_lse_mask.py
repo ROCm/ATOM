@@ -44,7 +44,13 @@ def _new(o, lse):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize("shape", [(1, 16, 512), (7, 64, 512), (128, 1, 512)])
+# 513 and 129 are the point of this list, not padding: BLOCK rounds the head dim
+# up to a power of two, so only a non-power-of-two size exercises the masked tail
+# of the last block. Every shape here used to be 512, which never touched it.
+@pytest.mark.parametrize(
+    "shape",
+    [(1, 16, 512), (7, 64, 512), (128, 1, 512), (5, 3, 513), (2, 7, 129), (3, 2, 1025)],
+)
 def test_matches_the_where_it_replaced(dtype, shape):
     tokens, heads, _dim = shape
     torch.manual_seed(0)
