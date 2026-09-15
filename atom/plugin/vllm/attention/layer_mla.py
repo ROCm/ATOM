@@ -412,8 +412,20 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         why the sparse cells stayed green without the bind-point squeeze: for
         `H == 1` an unconditional fold is accidentally correct. It is not
         evidence that the rule was ever checked.
+
+        Merging four sites into one means choosing an admission set, and the
+        strictest of the four is the one to keep. `dim() != 4 or shape[1] == 1`
+        -- the union -- agrees with this on every page the system can produce,
+        but it also folds pages that are malformed rather than merely
+        differently shaped: a rank-2 page, a rank-5 page, and a rank-3 page with
+        the wrong entry width all become something that satisfies the kernels'
+        own checks instead of tripping them. `[B, N, 2C]` is the sharp one --
+        it would arrive as `[B, 2N, C]`, the same silent head-major
+        concatenation this guard exists to prevent, one axis over. The
+        condition below is word for word the one `bind_kv_cache` uses, which is
+        the point: one rule, stated at both kinds of crossing.
         """
-        if kv_cache.dim() != 4 or kv_cache.shape[1] == 1:
+        if kv_cache.dim() == 4 and kv_cache.shape[1] == 1:
             kv_cache = kv_cache.view(
                 kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
             )
