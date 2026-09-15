@@ -2022,6 +2022,129 @@ class TestChunkedPrefillFinality:
 # ── offload-resume admission ───────────────────────────────────────────────
 
 
+class TestOffloadResumeAdmission:
+    """An offload resume is sized by what it owes, not by its prompt.
+
+    A sequence re-admitted after `preempt` has to recompute prompt *plus* the
+    tokens it had already generated, and `_mark_offload_load_ready` sets
+    `num_cached_tokens` to whatever the tier returned, which is not bounded by
+    the prompt. Sized against `num_prompt_tokens` that width is non-positive:
+    `_prefill_chunk_for_budget` answers None and the sequence goes back to the
+    head of `waiting` with the loop broken -- every tick, forever.
+    """
+
+    PROMPT = tuple(range(8))
+    GENERATED = tuple(range(100, 112))  # owes 20 positions in total
+
+    def _sched(self, **overrides):
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=4,
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_model_len=256,
+                **overrides,
+            )
+        )
+        sched.kv_connector = SimpleNamespace(
+            is_offload=True,
+            build_connector_meta=lambda: None,
+            # Reached only by a sequence that is not resuming: nothing on the
+            # tier for it, so nothing to park for and nothing to arm.
+            get_num_new_matched_tokens=lambda seq: (0, False),
+            update_state_after_alloc=lambda seq: None,
+        )
+        return sched
+
+    def _parked(self, sched, seq_factory, cached):
+        """A sequence as the offload connector leaves it: blocks still held
+        from the pre-park allocate, load reported, ready to resume."""
+        seq = seq_factory(self.PROMPT)
+        for token in self.GENERATED:
+            seq.append_token(token)
+        seq.block_table = [0, 1, 2, 3, 4]
+        seq.offload_loaded = True
+        seq.num_cached_tokens = cached
+        sched.waiting.append(seq)
+        return seq
+
+    def test_a_resume_past_the_prompt_boundary_is_admitted(self, seq_factory):
+        sched = self._sched()
+        # The tier came back with the prompt and four of the generated tokens.
+        seq = self._parked(sched, seq_factory, cached=12)
+        assert seq.num_cached_tokens > seq.num_prompt_tokens, "the failing case"
+
+        batch, scheduled = sched.schedule()
+
+        assert batch is not None, "nothing scheduled: the resume was requeued"
+        assert seq.id in scheduled
+        assert int(batch.num_scheduled_tokens[0]) == seq.num_tokens - 12
+        assert not sched.waiting
+
+    def test_a_resume_at_exactly_the_prompt_boundary_is_admitted(self, seq_factory):
+        """The two failure modes differ by one token, and both are reachable
+        with chunked prefill on: a `num_prompt_tokens`-sized width is negative
+        above the boundary, which trips `_assert_positive_prefill_chunk`, and
+        exactly zero on it, which `_prefill_chunk_for_budget` reports as None
+        -- the silent requeue-and-break."""
+        sched = self._sched()
+        seq = self._parked(sched, seq_factory, cached=len(self.PROMPT))
+
+        batch, scheduled = sched.schedule()
+
+        assert batch is not None, "the silent starvation case"
+        assert seq.id in scheduled
+        assert int(batch.num_scheduled_tokens[0]) == len(self.GENERATED)
+
+    def test_a_resume_the_tier_covered_entirely_is_admitted(self, seq_factory):
+        """The tier's lookup runs over the whole prompt and is not bounded
+        below it, unlike the HBM match whose loop stops one hash block short
+        precisely so a prefill always has something to forward. A first
+        admission whose prompt is wholly resident therefore arrives with
+        `num_cached_tokens == num_tokens`, and a width of zero is the silent
+        requeue-and-break again -- this time with nothing left to size."""
+        sched = self._sched()
+        seq = seq_factory(list(self.PROMPT))
+        seq.block_table = [0, 1, 2, 3, 4]
+        seq.offload_loaded = True
+        seq.num_cached_tokens = seq.num_tokens
+        sched.waiting.append(seq)
+
+        batch, scheduled = sched.schedule()
+
+        assert batch is not None, "nothing scheduled: the resume was requeued"
+        assert seq.id in scheduled
+        # One token still has to be forwarded: the first decode samples from
+        # the logits this prefill produces.
+        assert int(batch.num_scheduled_tokens[0]) >= 1
+        assert not sched.waiting
+
+    def test_a_resume_short_of_the_prompt_boundary_still_works(self, seq_factory):
+        """The same arithmetic on a first admission, where the two lengths
+        agree up to the generated tail."""
+        sched = self._sched()
+        seq = self._parked(sched, seq_factory, cached=4)
+
+        batch, scheduled = sched.schedule()
+
+        assert seq.id in scheduled
+        assert int(batch.num_scheduled_tokens[0]) == seq.num_tokens - 4
+
+    def test_it_does_not_starve_the_queue_behind_it(self, seq_factory):
+        """The symptom an operator sees: one resume at the head of `waiting`
+        holds up every request queued behind it, because the admission loop
+        `break`s rather than skipping."""
+        sched = self._sched()
+        self._parked(sched, seq_factory, cached=12)
+        behind = seq_factory([7, 7, 7, 7])
+        sched.add(behind)
+
+        _, scheduled = sched.schedule()
+
+        assert behind.id in scheduled, "starved behind the offload resume"
+
+
 # ── get_next_batch_info ────────────────────────────────────────────────────
 
 

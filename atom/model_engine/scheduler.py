@@ -1303,7 +1303,37 @@ class Scheduler:
             if offload_resume:
                 # Blocks already held from the pre-park allocate; only re-check
                 # the batch budget. No re-match / re-allocate / re-park.
-                num_new_tokens = seq.num_prompt_tokens - seq.num_cached_tokens
+                #
+                # `num_tokens`, like Phase 1 above and the non-offload branch
+                # below. A seq re-admitted after `preempt` owes KV for the
+                # tokens it had already generated, and the offload load can
+                # come back covering some of them -- `_mark_offload_load_ready`
+                # sets `num_cached_tokens` to whatever the tier returned, which
+                # is not bounded by the prompt. Sized against
+                # `num_prompt_tokens` that is a non-positive width:
+                # `_prefill_chunk_for_budget` answers None, the seq goes back
+                # to the head of `waiting`, and the loop breaks -- every tick,
+                # forever, starving everything queued behind it. With chunked
+                # prefill off it is `_assert_positive_prefill_chunk` that fires
+                # instead, in the engine loop.
+                tier_hit = seq.num_cached_tokens
+                num_new_tokens = seq.num_tokens - tier_hit
+                if num_new_tokens <= 0:
+                    # The tier can cover the request whole: its lookup runs
+                    # over the entire prompt and is not bounded below it, where
+                    # `can_allocate`'s HBM match stops one hash block short so
+                    # that a prefill always has something to forward. A wholly
+                    # resident request reaches here with nothing to size, which
+                    # is the same non-positive width by another route.
+                    #
+                    # Hand back the trailing block, the one the HBM match would
+                    # never have offered. Its KV is present, so recomputing it
+                    # costs one block of forward, and the forward has to happen
+                    # regardless: the first decode samples from the logits this
+                    # prefill produces, and there is nowhere else to get them.
+                    hbs = self.block_manager.hash_block_size
+                    seq.num_cached_tokens = max(0, (seq.num_tokens - 1) // hbs * hbs)
+                    num_new_tokens = seq.num_tokens - seq.num_cached_tokens
                 budget_remaining = self.max_num_batched_tokens - num_batched_tokens
                 chunk = self._prefill_chunk_for_budget(
                     num_new_tokens, budget_remaining, num_batched_tokens
@@ -1321,7 +1351,12 @@ class Scheduler:
                 # is what reaches the API as `cached_tokens` -- the tier would
                 # look like it returned nothing. Unconditional, because a seq
                 # re-admitted after `preempt()` keeps the field.
-                seq.prefix_cache_hit_tokens = seq.num_cached_tokens
+                #
+                # The tier's own figure, not the possibly-rolled-back one: what
+                # it returned is what the API should report, and giving the
+                # trailing block back to the forward is this scheduler's
+                # decision rather than a smaller hit.
+                seq.prefix_cache_hit_tokens = tier_hit
                 num_seqs_prefill, num_batched_tokens = self._schedule_prefill_seq(
                     seq,
                     chunk,
