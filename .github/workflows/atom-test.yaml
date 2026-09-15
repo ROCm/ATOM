@@ -274,7 +274,7 @@ jobs:
 
     steps:
       - name: Prune stale Docker data on TW runners
-        if: matrix.runner == 'linux-atom-do-mi350x-8'
+        if: matrix.runner == 'linux-atom-do-mi350x-8.test'
         run: |
           set -euo pipefail
 
@@ -311,7 +311,7 @@ jobs:
           df -h / "${docker_root}" || true
 
       - name: Kill all Docker containers and clean up workspace
-        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8.test'
         run: |
           echo "=== Cleaning up containers on $(hostname) ==="
           containers=$(docker ps -q)
@@ -321,15 +321,15 @@ jobs:
           docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true
 
       - name: Show Docker containers
-        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8.test'
         run: docker ps -a
 
       - name: Show ROCm memory usage
-        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8.test'
         run: rocm-smi --showmemuse
 
       - name: Show ROCm GPU processes
-        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8.test'
         run: rocm-smi --showpidgpus
 
       - name: Checkout ATOM repo
@@ -419,7 +419,7 @@ jobs:
         run: bash .github/scripts/download_aiter_wheel.sh
 
       - name: Set HF token for predownload runner
-        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8.test'
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
 
       - name: Start CI container
@@ -439,7 +439,7 @@ jobs:
           docker exec "$CONTAINER_NAME" df -h /dev/shm
 
       - name: GPU preflight check
-        if: matrix.runner == 'linux-atom-do-mi350x-8'
+        if: matrix.runner == 'linux-atom-do-mi350x-8.test'
         timeout-minutes: 5
         env:
           GPU_PREFLIGHT_ALLOCATION_MB: "8"
@@ -448,8 +448,67 @@ jobs:
       - name: Collect GPU info (inside container)
         id: gpu-info
         env:
-          COLLECT_VERBOSE_GPU_INFO: ${{ matrix.runner == 'linux-atom-do-mi350x-8' && '1' || '0' }}
+          COLLECT_VERBOSE_GPU_INFO: ${{ matrix.runner == 'linux-atom-do-mi350x-8.test' && '1' || '0' }}
         run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" docker "${{ matrix.runner }}"
+
+      - name: Debug PITT GPU communication
+        if: matrix.runner == 'linux-atom-do-mi350x-8.test'
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          MODEL_EXTRA_ARGS: ${{ matrix.extraArgs }}
+        run: |
+          set -euo pipefail
+
+          gpu_count="$(
+            docker exec "$CONTAINER_NAME" python3 -c \
+              'import torch; print(torch.cuda.device_count() if torch.cuda.is_available() else 0)'
+          )"
+          if ! [[ "${gpu_count}" =~ ^[0-9]+$ ]] || [ "${gpu_count}" -lt 1 ]; then
+            echo "::error::No GPU is visible to torch inside ${CONTAINER_NAME}"
+            exit 1
+          fi
+
+          debug_nproc="${gpu_count}"
+          if [[ "${MODEL_EXTRA_ARGS}" =~ (^|[[:space:]])-tp[[:space:]]+([0-9]+) ]]; then
+            debug_nproc="${BASH_REMATCH[2]}"
+          elif [[ "${MODEL_EXTRA_ARGS}" =~ (^|[[:space:]])--tensor-parallel-size[=[:space:]]+([0-9]+) ]]; then
+            debug_nproc="${BASH_REMATCH[2]}"
+          elif [[ "${MODEL_EXTRA_ARGS}" =~ (^|[[:space:]])--tensor_parallel_size[=[:space:]]+([0-9]+) ]]; then
+            debug_nproc="${BASH_REMATCH[2]}"
+          fi
+          if [ "${debug_nproc}" -lt 1 ] || [ "${debug_nproc}" -gt "${gpu_count}" ]; then
+            debug_nproc="${gpu_count}"
+          fi
+
+          echo "PITT GPU communication debug: gpu_count=${gpu_count}, nproc=${debug_nproc}"
+          echo "MODEL_EXTRA_ARGS=${MODEL_EXTRA_ARGS}"
+
+          docker exec \
+            -e GPU_COMM_DEBUG_DEVICE_MIB=16 \
+            -e GPU_COMM_DEBUG_ITERS=3 \
+            -e NCCL_SOCKET_IFNAME=lo \
+            -e NCCL_DEBUG=INFO \
+            -e NCCL_DEBUG_SUBSYS=INIT,COLL \
+            -e RCCL_DEBUG=INFO \
+            -e TORCH_DISTRIBUTED_DEBUG=DETAIL \
+            "$CONTAINER_NAME" bash -lc "
+              set -euo pipefail
+              echo '=== GPU communication debug context ==='
+              hostname
+              id
+              env | grep -E '^(HIP|CUDA|ROCR|NCCL|RCCL|HSA|ATOM|AITER)_' | sort || true
+              ls -l /dev/kfd /dev/dri/renderD* 2>/dev/null || true
+              rocm-smi --showid --showtopo --showpids || true
+
+              echo '=== torch distributed all_reduce smoke test ==='
+              timeout 180s python3 -m torch.distributed.run \
+                --standalone \
+                --nproc-per-node=${debug_nproc} \
+                /workspace/.github/scripts/gpu_comm_debug.py \
+                --device-mib 16 \
+                --iters 3
+            "
 
       - name: Install aiter from wheel
         run: bash .github/scripts/install_aiter_wheel.sh
@@ -478,9 +537,9 @@ jobs:
         timeout-minutes: 150
         run: |
           set -euo pipefail
-          if [ -d "/models" ]; then
+          if [ -n "${MODEL_HOST_ROOT:-}" ] && docker exec "$CONTAINER_NAME" test -d /models; then
             model_dir="/models/${{ matrix.model_path }}"
-            echo "/models directory found, checking cache and lock-protected download for ${model_dir}"
+            echo "Model cache mounted from ${MODEL_HOST_ROOT} to /models, checking cache and lock-protected download for ${model_dir}"
             if ! docker exec \
               -e HF_TOKEN="${HF_TOKEN:-}" \
               -e MODEL_ID="${{ matrix.model_path }}" \
@@ -494,7 +553,7 @@ jobs:
               exit 1
             fi
           else
-            echo "/models directory not found, skipping model download"
+            echo "Model cache directory not mounted, skipping model download"
           fi
         env:
           MODEL_DOWNLOAD_TIMEOUT: "30m"
@@ -513,7 +572,7 @@ jobs:
           echo ""
           echo "========== Running test =========="
 
-          if [ -d "/models" ]; then
+          if [ -n "${MODEL_HOST_ROOT:-}" ] && docker exec "$CONTAINER_NAME" test -d /models; then
             model_path="/models/${{ matrix.model_path }}"
           else
             model_path="${{ matrix.model_path }}"
@@ -554,18 +613,18 @@ jobs:
           else
             echo "Success: Output matches golden outputs."
           fi
-      
+
       - name: Run ATOM accuracy test
         timeout-minutes: 30
         env:
           MODEL_EXTRA_ARGS: ${{ matrix.extraArgs }}
           CLIENT_COMMAND: ${{ matrix.client_command || '' }}
-          ATOM_DEBUG_DEVICE_MAPPING: ${{ matrix.runner == 'linux-atom-do-mi350x-8' && '1' || '0' }}
+          ATOM_DEBUG_DEVICE_MAPPING: ${{ matrix.runner == 'linux-atom-do-mi350x-8.test' && '1' || '0' }}
         run: |
           set -euo pipefail
           echo ""
           echo "========== Launching ATOM server =========="
-          if [ -d "/models" ]; then
+          if [ -n "${MODEL_HOST_ROOT:-}" ] && docker exec "$CONTAINER_NAME" test -d /models; then
             model_path="/models/${{ matrix.model_path }}"
           else
             model_path="${{ matrix.model_path }}"
@@ -689,14 +748,14 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.model_name }}_atom_test_output.txt
+          name: ${{ matrix.runner }}-${{ matrix.model_name }}_atom_test_output.txt
           path: atom_test_output.txt
 
       - name: Upload accuracy results
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: accuracy-${{ matrix.model_name }}
+          name: accuracy-${{ matrix.runner }}-${{ matrix.model_name }}
           path: accuracy_test_results/*.json
           if-no-files-found: ignore
 
@@ -708,7 +767,7 @@ jobs:
           set -x
           echo "========== Cleaning up workspace =========="
           runner_label="${{ matrix.runner }}"
-          if [[ "${runner_label}" == "linux-atom-do-mi350x-8" ]]; then
+          if [[ "${runner_label}" == "linux-atom-do-mi350x-8.test" ]]; then
             docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true
           fi
           docker stop "$CONTAINER_NAME" || true

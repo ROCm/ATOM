@@ -87,13 +87,27 @@ runs:
           DEVICE_FLAG="--device /dev/dri"
         fi
 
+        IMAGE_TAG="${RESOLVED_ATOM_BASE_IMAGE:-$ATOM_BASE_IMAGE}"
+
         MODEL_HOST_ROOT=""
-        for d in /shared_nfs/huggingface_models /models /data/models; do
-          if [ -d "$d" ]; then
-            MODEL_HOST_ROOT="$d"
-            break
+        if [ "${RUNNER_LABEL}" = "linux-atom-do-mi350x-8.test" ]; then
+          for d in /models /share_nfs/models /share_nfs; do
+            if [ -d "$d" ]; then
+              MODEL_HOST_ROOT="$d"
+              break
+            fi
+          done
+          if [ -z "$MODEL_HOST_ROOT" ]; then
+            echo "Warning: PITT runner requested a model cache, but no known PITT cache directory exists on this host."
           fi
-        done
+        else
+          for d in /shared_nfs/huggingface_models /models /data/models; do
+            if [ -d "$d" ]; then
+              MODEL_HOST_ROOT="$d"
+              break
+            fi
+          done
+        fi
 
         MODEL_MOUNT=""
         if [ -n "$MODEL_HOST_ROOT" ]; then
@@ -108,8 +122,10 @@ runs:
         # (e.g. benchmark + regression) don't clobber each other's file.
         ENV_FILE="/tmp/atom_${CONTAINER_NAME}_env.txt"
         printenv MODEL_ENV_VARS | grep -v '^$' > "$ENV_FILE" || true
+        if [ "${RUNNER_LABEL}" = "linux-atom-do-mi350x-8.test" ] && ! grep -q '^NCCL_SOCKET_IFNAME=' "$ENV_FILE"; then
+          echo "NCCL_SOCKET_IFNAME=lo" >> "$ENV_FILE"
+        fi
 
-        IMAGE_TAG="${RESOLVED_ATOM_BASE_IMAGE:-$ATOM_BASE_IMAGE}"
         echo "Starting container with image: $IMAGE_TAG"
         echo "Model-specific environment variables:"
         cat "$ENV_FILE"
@@ -119,7 +135,7 @@ runs:
           PULL_FLAG="--pull ${PULL_POLICY}"
         elif [ -n "${RESOLVED_ATOM_BASE_IMAGE:-}" ]; then
           PULL_FLAG=""
-        elif [ "${RUNNER_LABEL}" = "atom-mi355-8gpu.predownload" ] || [ "${RUNNER_LABEL}" = "linux-atom-do-mi350x-8" ]; then
+        elif [ "${RUNNER_LABEL}" = "atom-mi355-8gpu.predownload" ] || [ "${RUNNER_LABEL}" = "linux-atom-do-mi350x-8.test" ]; then
           PULL_FLAG="--pull always"
         fi
 
