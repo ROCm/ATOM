@@ -102,6 +102,7 @@ class StateOffloadIndex:
         # Non-zero means `audit_invariant` caught the accounting drifting.
         self.invariant_violations = 0
         self._warned_invariant = False
+        self._audit_calls = 0
         # `stores_refused` is deliberately apart from `stores_failed`: refused
         # means nobody tried, failed means the worker tried and could not. A
         # shell that forwards no store at all is otherwise indistinguishable
@@ -125,21 +126,39 @@ class StateOffloadIndex:
 
     @property
     def pending_loads(self) -> dict:
-        """req_id -> prefix hash for every load still in flight."""
+        """req_id -> prefix hash for every load still in flight.
+
+        Rebuilds the dict, so it is for introspection and tests. The serving
+        path wants `hash_of`: the scheduler reads this one key at a time inside
+        its `failed_loading` loop, and rebuilding an N-entry dict per failure
+        made a backend outage quadratic exactly when the engine most needs to
+        drain.
+        """
         return {req_id: p.prefix_hash for req_id, p in self._outstanding.items()}
 
-    def check_invariant(self) -> None:
-        """Assert this object's whole contract. Cheap enough for tests and for
-        the periodic stats path.
+    def hash_of(self, req_id) -> int | None:
+        """The prefix hash of `req_id`'s in-flight load, or None."""
+        pending = self._outstanding.get(req_id)
+        return None if pending is None else pending.prefix_hash
+
+    def check_invariant(self, *, deep: bool = True) -> None:
+        """Assert this object's whole contract.
 
         Two properties: every dispatched load reaches exactly one terminal
         state, and `hashes` never diverges from `_hash_lru`.
+
+        `deep=False` runs only the first. The second is a key-set compare over
+        up to `_hash_cap` entries -- fine for a test, tens of milliseconds on
+        the serving path, which is why `audit_invariant` decimates it. Tests
+        keep the default so they check the whole contract every time.
         """
         if self.dispatched != self.settled + self.outstanding:
             raise AssertionError(
                 "state offload index: dispatched != settled + outstanding "
                 f"({self.dispatched} != {self.settled} + {self.outstanding})"
             )
+        if not deep:
+            return
         # Key sets, not cardinalities: the two are written together on every
         # path, so an equal-but-different pair can only come from a bug that
         # added one hash and dropped another in the same step -- exactly the
@@ -167,8 +186,21 @@ class StateOffloadIndex:
         `stats()` reaches through the coordinator's `checkpoint_fates`.
         An assertion nothing ever runs is not an assertion.
         """
+        self._audit_calls += 1
+        # The key-set compare is the expensive arm. The reasoning at
+        # `check_invariant` for why a length compare cannot replace it still
+        # holds -- but `stats()` is the periodic metrics path AND every client
+        # cache-stats call, `_hash_cap` is 1 << 20, and `set(a) != set(b)` at
+        # that size is tens of milliseconds on the engine loop thread: a stall
+        # that grows with uptime and shows up in no GPU trace. So the cheap arm
+        # (the counter identity, which is what actually catches a parked
+        # request or a leaked slot) runs every time, and the set compare is
+        # decimated. Divergence is a bug, not a race: it does not heal, so
+        # catching it one in `_AUDIT_KEYSET_EVERY` reads loses nothing but the
+        # latency of the report.
+        deep = self._audit_calls % _AUDIT_KEYSET_EVERY == 0
         try:
-            self.check_invariant()
+            self.check_invariant(deep=deep)
         except AssertionError as exc:
             self.invariant_violations += 1
             if not self._warned_invariant:
@@ -268,6 +300,15 @@ class StateOffloadIndex:
         if pending is None:
             return False
         pending.orphaned = True
+        # Restamp. `reclaim` ages an entry from `at`, and `at` was the dispatch
+        # time, so the safety window it enforces was `timeout_s` MINUS the
+        # load's in-flight age -- a load already outstanding longer than
+        # `timeout_s`, which is precisely the hung-worker case reclamation
+        # exists for, became eligible the instant it was orphaned and the next
+        # reconcile tick handed the slot out while the worker was still
+        # scattering into it. The window starts here, where the slot passes to
+        # this index, exactly as the deleted `_orphan_load_slots` stamped it.
+        pending.at = monotonic()
         return True
 
     def complete_load(self, req_id) -> None:
@@ -371,9 +412,11 @@ class StateOffloadIndex:
         `stores_completed` against `checkpoints_kept`: the gap is how much of
         what HBM keeps the CPU tier never received.
 
-        Audits the invariant on the way past. This is the periodic path the
-        funnel already pulls, so it costs two integer comparisons per metrics
-        read and it is the only place the check runs in a live engine.
+        Audits the invariant on the way past -- the only place the check runs
+        in a live engine. The counter identity costs two integer comparisons
+        per metrics read; the key-set compare is decimated behind
+        `_AUDIT_KEYSET_EVERY` because at `_hash_cap` it is tens of
+        milliseconds on the engine loop thread.
         """
         self.audit_invariant()
         return {
@@ -609,4 +652,8 @@ def state_tier_chunk_tokens(config) -> int:
 
 #: The connector backends whose worker half can build a `StateOffloadTier`.
 #: `multi` qualifies when it lists exactly one.
+#: How often `audit_invariant` runs the expensive key-set arm. One in this many
+#: metrics reads; the cheap counter arm runs on every one.
+_AUDIT_KEYSET_EVERY = 256
+
 _STATE_TIER_BACKENDS = frozenset({"lmcache_offload"})

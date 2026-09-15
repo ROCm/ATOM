@@ -137,6 +137,20 @@ class StateOffloadTier:
             self._hash_verdicts[key] = self._hash_verdicts.get(key, True) and ok
         return ok
 
+    def note_load_unrun(self, prefix_hash: int, req_id: str) -> None:
+        """Record a neutral verdict for a state leg this rank never ran.
+
+        The TP quorum acts only on a key EVERY rank reported, and a rank whose
+        KV leg failed short-circuits before the state leg -- so without this the
+        key stalls one report short forever. Neutral, not a miss: only a `get`
+        that came back empty is evidence LMCache dropped the bytes. The same
+        failure-dominant merge as `load_state`, so this can never overwrite a
+        real miss recorded for the same key by a retry in this window.
+        """
+        key = (int(prefix_hash), str(req_id))
+        with self._lock:
+            self._hash_verdicts[key] = self._hash_verdicts.get(key, True) and True
+
     def take_hash_verdicts(self) -> dict[tuple[int, str], bool]:
         """`{(hash, req_id): the `get` produced bytes}` for every load run since
         the last call.

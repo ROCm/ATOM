@@ -1605,8 +1605,32 @@ class Scheduler:
             )
 
             if needs_remote_load:
-                # Both legs of an offload load ride one request and report once,
-                # so parking is one decision here rather than one per leg.
+                oj = seq.offload_joint
+                if oj.load_hash != -1 and not oj.boundary_tokens:
+                    # Two transfers but one report: the first completion would
+                    # unpark the request while the other is still writing.
+                    #
+                    # Fusing the legs makes them one report only when ONE
+                    # connector owns both. Under `kv_connector: multi` the KV
+                    # leg can be owned by a different sub (a PD connector wins
+                    # `get_num_new_matched_tokens` ahead of the offload sub),
+                    # and `_update_waiting_for_remote_kv` unparks on that sub's
+                    # `finished_recving` alone -- with the state H2D still
+                    # scattering into `seq.state_slot`. Dropping the state load
+                    # degrades to a recompute, which is correct output at
+                    # baseline speed; the alternative is silent wrong output.
+                    logger.warning(
+                        "seq %s has both a remote KV load and a state load "
+                        "pending, with no joint boundary; dropping the state "
+                        "load.",
+                        seq.id,
+                    )
+                    if not self.block_manager.cancel_state_load(seq):
+                        # Disown could not be backed: requeue for a clean
+                        # recompute instead of parking a load into shared blocks.
+                        self.block_manager.deallocate(seq)
+                        self.waiting.appendleft(seq)
+                        break
                 self._park_for_remote_load(seq, skipped_waiting_requests)
                 continue
 
@@ -3496,9 +3520,7 @@ class Scheduler:
                 req_id,
             )
             if offload is not None:
-                offload.fail_load(
-                    req_id, missing=offload.pending_loads.get(req_id) in missed
-                )
+                offload.fail_load(req_id, missing=offload.hash_of(req_id) in missed)
             if self._finish_aborted_load_cleanup(req_id):
                 continue
             self.failed_recving_kv_req_ids.append(req_id)
