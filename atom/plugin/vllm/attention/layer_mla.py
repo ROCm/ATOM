@@ -402,15 +402,18 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         0.29's head slot, which is what actually normalises the rank; the guard
         here is what makes that a stated precondition of the crossing rather
         than an inherited one, and it costs a `dim()` read on a path that runs
-        once per draft step. It holds only because MLA publishes a single head
-        slot -- do not copy it to a backend whose `customize_spec` publishes K
-        and V as two, which it would interleave.
+        once per draft step. It spells out the same head-slot condition as
+        `bind_kv_cache`, so the two read as one rule: a single published head
+        slot is what makes the fold a reinterpretation rather than an
+        interleave. A spec that published K and V as two slots would fold them
+        into alternating rows, so let such a page fall through four-dimensional
+        and fail loudly in `model_ops` instead.
         """
         if self.kv_cache_dtype.startswith("fp8") and kv_cache.dtype == torch.uint8:
             from vllm.platforms import current_platform
 
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
-        if kv_cache.dim() == 4:
+        if kv_cache.dim() == 4 and kv_cache.shape[1] == 1:
             kv_cache = kv_cache.view(
                 kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
             )
