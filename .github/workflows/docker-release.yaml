@@ -180,45 +180,59 @@ jobs:
               ;;
             rocm101-nightly)
               # 10.1 tracking line: nightly channel, latest date-stamped
-              # 10.1.0a<date> wheels. The date stamp is resolved at build
-              # time from the channel (pip cannot take a glob), pinned in
-              # the log for reproducibility.
+              # 10.1.0a<date> wheels. Every version is resolved from the
+              # channel at build time (pip cannot take a glob) and echoed for
+              # reproducibility. Nothing here may be hardcoded: the SDK date
+              # moves, and a version that exists today can be pruned tomorrow.
               BASE_IMAGE="rocm10-base"
+              NIGHTLY_INDEX="https://nightly.repo.amd.com/rocm/whl-next"
               NIGHTLY_SDK_VERSION=$(curl -sL --max-time 60 \
-                "https://nightly.repo.amd.com/rocm/whl-next/rocm-sdk-core/" \
+                "${NIGHTLY_INDEX}/rocm-sdk-core/" \
                 | grep -oE 'rocm_sdk_core-10\.1\.0a[0-9]+-py3' \
-                | sed 's/rocm_sdk_core-//; s/-py3//' | sort -V | tail -1)
+                | sed 's/rocm_sdk_core-//; s/-py3//' | sort -uV | tail -1)
               if [ -z "${NIGHTLY_SDK_VERSION}" ]; then
                 echo "ERROR: could not resolve a 10.1.0a<date> version from the nightly channel"
                 exit 1
               fi
               echo "Resolved 10.1 nightly SDK version: ${NIGHTLY_SDK_VERSION}"
-              # torchaudio on the 10.1 nightly channel is 2.11.0.3 (not the
-              # stable channel's 2.11.0); resolve it from the channel like the
-              # SDK version so the date-stamped line never pins a stale number.
-              NIGHTLY_TORCHAUDIO_VERSION=$(curl -sL --max-time 60 \
-                "https://nightly.repo.amd.com/rocm/whl-next/torchaudio/" \
-                | grep -oE 'torchaudio-2\.11[^"<>]*cp312[^"<>]*linux[^"<>]*\.whl' \
-                | grep "rocm${NIGHTLY_SDK_VERSION}" | sed 's/torchaudio-//; s/+rocm.*//' | sort -V | tail -1)
-              if [ -z "${NIGHTLY_TORCHAUDIO_VERSION}" ]; then
-                echo "ERROR: could not resolve a torchaudio version for ${NIGHTLY_SDK_VERSION} from the nightly channel"
-                exit 1
-              fi
-              echo "Resolved 10.1 nightly torchaudio version: ${NIGHTLY_TORCHAUDIO_VERSION}"
+              # Resolve one package's exact version for the SDK above.
+              # The index lists every wheel twice -- the href percent-encodes
+              # the '+' that starts the local version, the link text does not
+              # -- so normalise %2B before stripping the +rocm<sdk> suffix.
+              # Matching only the text form silently keeps the whole filename
+              # and yields a pip spec like "2.11.0.3%2Brocm...whl+rocm...".
+              resolve_nightly() {
+                curl -sL --max-time 60 "${NIGHTLY_INDEX}/$1/" \
+                  | grep -oE "$1-$2[^\"<>]*cp312[^\"<>]*linux[^\"<>]*\.whl" \
+                  | sed 's/%2B/+/g' \
+                  | grep -F "+rocm${NIGHTLY_SDK_VERSION}" \
+                  | sed "s/^$1-//; s/+rocm.*//" \
+                  | sort -uV | tail -1
+              }
+              # torch 2.13 / torchvision 0.28 / torchaudio 2.11 is the stack
+              # validated end to end on the 10.1 line. The channel carries
+              # 2.14 and 2.15.0a0 against the same SDK, so the minor line is
+              # pinned here and only the trailing build is resolved.
+              NIGHTLY_TORCH_VERSION=$(resolve_nightly torch '2\.13\.')
+              NIGHTLY_TORCHVISION_VERSION=$(resolve_nightly torchvision '0\.28\.')
+              NIGHTLY_TORCHAUDIO_VERSION=$(resolve_nightly torchaudio '2\.11\.')
+              for comp in TORCH TORCHVISION TORCHAUDIO; do
+                eval "resolved=\${NIGHTLY_${comp}_VERSION}"
+                if [ -z "${resolved}" ]; then
+                  echo "ERROR: no ${comp} build for rocm${NIGHTLY_SDK_VERSION} on the nightly channel"
+                  exit 1
+                fi
+                echo "Resolved 10.1 nightly ${comp} version: ${resolved}"
+              done
               # ROCM_TRITON_VERSION is deliberately empty: torch's own
               # metadata pins the exact triton it was built against, and the
               # nightly channel carries several triton variants per date whose
-              # commit drifts independently of torch — any explicit pick can
+              # commit drifts independently of torch -- any explicit pick can
               # fight torch's pin and die with ResolutionImpossible. Empty
               # means the dockerfile lets torch's dependency decide.
-              # torch/torchvision are the pair QA validated on the 10.1 line.
-              # torchvision must be passed explicitly: the dockerfile default
-              # (0.26.0) belongs to the 10.0 stable line and does not exist on
-              # the 10.1 nightly channel at all, so leaving it out pins
-              # torchvision==0.26.0+rocm10.1.0a<date> and the build dies in pip.
               EXTRA_BUILD_ARGS="--build-arg ROCM_SDK_VERSION=${NIGHTLY_SDK_VERSION} \
-                --build-arg ROCM_TORCH_VERSION=2.13.0 \
-                --build-arg ROCM_TORCHVISION_VERSION=0.28.0 \
+                --build-arg ROCM_TORCH_VERSION=${NIGHTLY_TORCH_VERSION} \
+                --build-arg ROCM_TORCHVISION_VERSION=${NIGHTLY_TORCHVISION_VERSION} \
                 --build-arg ROCM_TORCHAUDIO_VERSION=${NIGHTLY_TORCHAUDIO_VERSION} \
                 --build-arg ROCM_TRITON_VERSION= \
                 --build-arg ROCM_INDEX_URL=https://nightly.repo.amd.com/rocm/whl-next/"
