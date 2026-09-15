@@ -95,8 +95,27 @@ def indexer_qk_rope_quant_and_cache(
     weights_scale: float,
     preshuffle: bool = False,
     is_neox: bool = True,
+    q_scale_out: torch.Tensor | None = None,
+    kv_cache_scale: torch.Tensor | None = None,
 ) -> None:
-    """Run the fused indexer cache op with ATOM's DCP query semantics."""
+    """Run the fused indexer cache op with ATOM's DCP query semantics.
+
+    The two scale buffers together switch the op to packed E2M1 + e8m0 outputs,
+    and are forwarded only when given so that an aiter predating them still
+    accepts the FP8 call -- the same version tolerance the seg-variant import
+    above keeps. One without the other would fall back to FP8 and write that
+    layout into FP4-shaped buffers, so it is refused here rather than passed on.
+    """
+    if (q_scale_out is None) != (kv_cache_scale is None):
+        raise ValueError(
+            "FP4 output needs both q_scale_out and kv_cache_scale, got only "
+            + ("q_scale_out" if q_scale_out is not None else "kv_cache_scale")
+        )
+    fp4_out = (
+        {"q_scale_out": q_scale_out, "kv_cache_scale": kv_cache_scale}
+        if q_scale_out is not None
+        else {}
+    )
     _indexer_qk_rope_quant_and_cache(
         q,
         q_out,
@@ -117,6 +136,7 @@ def indexer_qk_rope_quant_and_cache(
         preshuffle=preshuffle,
         is_neox=is_neox,
         compute_all_q_rope=get_dcp_world_size() > 1,
+        **fp4_out,
     )
 
 
@@ -473,7 +493,10 @@ if is_rocm_aiter_fp4bmm_enabled():
 # Optional flydsl backend for `_kv_b_proj_gather`, gated by
 # ATOM_USE_FLYDSL_GATHER_KV_B_PROJ.
 try:
-    from aiter.ops.flydsl import gather_kv_b_proj_flydsl
+    from aiter.ops.flydsl import (
+        gather_kv_b_proj_flydsl,
+        gather_kv_b_proj_flydsl_supported,
+    )
 
     _FLYDSL_GATHER_AVAILABLE = True
 except Exception:  # noqa: BLE001 -- optional kernel; absence is the whole answer
@@ -672,6 +695,9 @@ class MLAAttention(nn.Module):
         # kernels with an unpadded 576-wide q_out. The triton path never uses seg.
         self.use_seg_mla = (not self.use_triton_mla) and envs.ATOM_MLA_PAGE_SIZE > 1
         self.use_flydsl_gather_kv_b_proj = bool(envs.ATOM_USE_FLYDSL_GATHER_KV_B_PROJ)
+        # Resolved on the first gather, when the weights and cache exist; see
+        # `_kv_b_proj_gather`. None = not asked yet.
+        self._flydsl_gather_ok: bool | None = None
         if self.use_seg_mla:
             if envs.ATOM_MLA_PAGE_SIZE != _MLA_SEG_PAGE_SIZE:
                 raise RuntimeError(
@@ -1443,20 +1469,32 @@ class MLAAttention(nn.Module):
         weight_scale = getattr(self.kv_b_proj, "weight_scale", None)
         preshuffled = getattr(weight, "is_shuffled", False)
 
+        # `_FLYDSL_GATHER_AVAILABLE` says the import worked, which is a different
+        # question from whether that backend serves THESE tensors: it is gfx950,
+        # page_size 1, fp8 cache and fp8 weight only. A bf16 cache (GLM-5.2), an
+        # unquantized weight (Kimi-K3) or an MXFP4 one make it raise, and that
+        # used to take the engine down rather than reach the Triton op below,
+        # which covers all of them. Every term is fixed by the weights and the
+        # cache, so ask once and keep the answer.
         if self.use_flydsl_gather_kv_b_proj and _FLYDSL_GATHER_AVAILABLE:
-            gather_kv_b_proj_flydsl(
-                kv_buffer,
-                self._k_scale,
-                kv_indptr,
-                kv_indices,
-                cu_seqlens_k,
-                gather_weight,
-                weight_scale,
-                k_out,
-                v_out,
-                weight_preshuffle=preshuffled,
-            )
-            return
+            if self._flydsl_gather_ok is None:
+                self._flydsl_gather_ok = gather_kv_b_proj_flydsl_supported(
+                    kv_buffer, gather_weight, weight_scale, k_out, v_out
+                )
+            if self._flydsl_gather_ok:
+                gather_kv_b_proj_flydsl(
+                    kv_buffer,
+                    self._k_scale,
+                    kv_indptr,
+                    kv_indices,
+                    cu_seqlens_k,
+                    gather_weight,
+                    weight_scale,
+                    k_out,
+                    v_out,
+                    weight_preshuffle=preshuffled,
+                )
+                return
 
         gather_kv_b_proj(
             kv_buffer,
@@ -3060,6 +3098,9 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     MAX_NUM_BLOCKS_PER_REQ: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,  # tile width along columns
+    # The FP8 indexer scores one concatenated KV plane, so a request's own
+    # position is `indice - cu_seqlens_q[req]`; the paged FP4 scorer emits it.
+    SEQ_LOCAL: tl.constexpr,
     # strides (in elements)
     ti_stride0: tl.int64,  # topk_indices stride 0
     ti_stride1: tl.constexpr,  # topk_indices stride 1
@@ -3086,7 +3127,7 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     req_kv_end = tl.load(cu_seqlens_q + req_id + 1, mask=valid_req, other=0)
     req_kv_len = req_kv_end - pre_seqlens_q
 
-    seq_token_idx = indice - pre_seqlens_q
+    seq_token_idx = indice if SEQ_LOCAL else indice - pre_seqlens_q
     block_id = seq_token_idx // PAGE_SIZE
     inblock_offset = seq_token_idx % PAGE_SIZE
 
@@ -3136,6 +3177,7 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 1024,  # tile width along columns
     out: torch.Tensor | None = None,
+    seq_local: bool = False,
 ):
 
     assert topk_indices.shape[1] == NUM_TOPK_TOKENS
@@ -3187,6 +3229,7 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
         max_num_blocks_per_req,
         PAGE_SIZE,
         BLOCK_N,
+        seq_local,
         # strides
         ti_stride0,
         ti_stride1,

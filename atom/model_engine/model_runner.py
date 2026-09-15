@@ -116,6 +116,9 @@ support_model_arch_dict = {
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2.GlmMoeDsaForCausalLM",
     "Glm4MoeForCausalLM": "atom.models.glm4_moe.Glm4MoeForCausalLM",
     "Qwen3NextForCausalLM": "atom.models.qwen3_next.Qwen3NextForCausalLM",
+    "Qwen4ExpForConditionalGeneration": (
+        "atom.models.qwen4_exp.Qwen4ExpForConditionalGeneration"
+    ),
     "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MultimodalModel",
     "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeMultimodalModel",
     "Qwen3_5MoeForCausalLM": "atom.models.qwen3_5.Qwen3_5MoeForCausalLM",
@@ -3641,6 +3644,7 @@ class ModelRunner:
             fc.batch_descriptor = None
             self._piecewise_captured_tokens.add(num_tokens_dp)
 
+    @torch.inference_mode()
     def capture_cudagraph(self):
         _piecewise = self._piecewise_cg_active()
         # AF_PIECEWISE: also capture the attn core (ragged combos below)

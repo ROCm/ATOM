@@ -31,10 +31,31 @@ from __future__ import annotations
 
 import logging
 import operator
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Any
 
 import torch
 
 logger = logging.getLogger("atom")
+
+
+@dataclass(frozen=True)
+class _PreparedDenseBlockIdGroups:
+    """Validated dense groups plus their single-upload Triton metadata."""
+
+    _codec: DenseKVByteCodec
+    _stream: Any
+    _groups: tuple[tuple[tuple[int, ...], ...], ...]
+    _triton_metadata: Any
+
+    @property
+    def group_count(self) -> int:
+        return len(self._groups)
+
+    @property
+    def upload_count(self) -> int:
+        return int(getattr(self._triton_metadata, "upload_count", 0))
 
 
 class DenseKVByteCodec:
@@ -195,7 +216,7 @@ class DenseKVByteCodec:
 
     def _normalize_block_id_groups(
         self,
-        block_id_groups: list[list[int]],
+        block_id_groups: Sequence[Sequence[int]],
         *,
         reject_repeated: bool,
     ) -> tuple[list[list[int]], list[int], list[int]]:
@@ -222,6 +243,27 @@ class DenseKVByteCodec:
                 f"for {nblocks} blocks; need {required} bytes, "
                 f"got {int(device_buf.numel())}"
             )
+
+    def _validate_prepared_owner(
+        self,
+        owner: _PreparedDenseBlockIdGroups,
+        group_index: int,
+        stream: torch.cuda.Stream | None,
+    ) -> tuple[int, tuple[tuple[int, ...], ...]]:
+        if (
+            not isinstance(owner, _PreparedDenseBlockIdGroups)
+            or owner._codec is not self
+        ):
+            raise ValueError("prepared block IDs belong to a different dense codec")
+        if stream is not owner._stream:
+            raise ValueError("prepared block IDs must use their preparation stream")
+        try:
+            index = operator.index(group_index)
+        except TypeError as exc:
+            raise ValueError("prepared group_index must be an integer") from exc
+        if isinstance(group_index, bool) or index < 0 or index >= owner.group_count:
+            raise ValueError("prepared group_index is out of range")
+        return index, owner._groups[index]
 
     # -- public API -------------------------------------------------------
     def gpu_to_chunk_major_device_buffer(
@@ -285,6 +327,109 @@ class DenseKVByteCodec:
                     self._seg_block_bytes,
                     chunk_block_counts,
                     flat_block_ids,
+                )
+
+    def prepare_block_id_groups(
+        self,
+        group_block_ids: Sequence[Sequence[Sequence[int]]],
+        *,
+        device: torch.device | str,
+        stream: torch.cuda.Stream,
+    ) -> _PreparedDenseBlockIdGroups:
+        """Validate every dense staging group and upload its metadata once."""
+
+        normalized_groups = []
+        triton_groups = []
+        for block_id_groups in group_block_ids:
+            groups, flat_block_ids, chunk_block_counts = (
+                self._normalize_block_id_groups(
+                    block_id_groups,
+                    reject_repeated=True,
+                )
+            )
+            normalized_groups.append(tuple(tuple(block_ids) for block_ids in groups))
+            triton_groups.append((tuple(chunk_block_counts), tuple(flat_block_ids)))
+
+        target = torch.device(device)
+        if target.type == "cuda" and target.index is None:
+            target = self.device
+        if target != self.device:
+            raise ValueError("prepared block IDs require the dense codec device")
+        if self._fused_kv_staging is None:
+            raise RuntimeError(
+                "DenseKVByteCodec requires Triton fused chunk-major staging"
+            )
+        if self.device.type == "cuda":
+            if stream is None or torch.device(stream.device) != target:
+                raise ValueError(
+                    "prepared block IDs require an explicit matching stream"
+                )
+            stream_ctx = torch.cuda.stream(stream)
+        else:
+            stream_ctx = _nullctx()
+        prepare = getattr(self._fused_kv_staging, "prepare_chunk_major_groups", None)
+        if prepare is None:
+            raise RuntimeError("dense prepared-ID staging is unavailable")
+        if not callable(prepare):
+            raise TypeError("dense prepared-ID staging entry point is not callable")
+        with self._device_ctx(), stream_ctx:
+            triton_metadata = prepare(
+                self._segments,
+                self._seg_block_bytes,
+                triton_groups,
+                target,
+            )
+        return _PreparedDenseBlockIdGroups(
+            self,
+            stream,
+            tuple(normalized_groups),
+            triton_metadata,
+        )
+
+    def gpu_to_chunk_major_device_buffer_prepared(
+        self,
+        device_buf: torch.Tensor,
+        owner: _PreparedDenseBlockIdGroups,
+        group_index: int,
+        *,
+        stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        index, block_id_groups = self._validate_prepared_owner(
+            owner, group_index, stream
+        )
+        self._validate_device_buf(
+            device_buf, sum(len(block_ids) for block_ids in block_id_groups)
+        )
+        with self._device_ctx():
+            stream_ctx = torch.cuda.stream(stream) if stream is not None else _nullctx()
+            with stream_ctx:
+                self._fused_kv_staging.fused_pack_chunk_major_prepared(
+                    owner._triton_metadata,
+                    index,
+                    device_buf,
+                )
+
+    def chunk_major_device_buffer_to_gpu_prepared(
+        self,
+        device_buf: torch.Tensor,
+        owner: _PreparedDenseBlockIdGroups,
+        group_index: int,
+        *,
+        stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        index, block_id_groups = self._validate_prepared_owner(
+            owner, group_index, stream
+        )
+        self._validate_device_buf(
+            device_buf, sum(len(block_ids) for block_ids in block_id_groups)
+        )
+        with self._device_ctx():
+            stream_ctx = torch.cuda.stream(stream) if stream is not None else _nullctx()
+            with stream_ctx:
+                self._fused_kv_staging.fused_unpack_chunk_major_prepared(
+                    owner._triton_metadata,
+                    index,
+                    device_buf,
                 )
 
 

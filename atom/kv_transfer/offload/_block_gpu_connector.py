@@ -231,6 +231,7 @@ class BlockGPUConnector:
         # intentionally unbounded for connector lifetime: correctness takes
         # priority over reclaiming potentially live GPU storage.
         self._quarantined_staging_tensors: list[torch.Tensor] = []
+        self._quarantined_block_id_owners: list[Any] = []
         self._quarantined_staging_lock = threading.Lock()
         requested_buffer_chunks = _env_int("OFFLOAD_GPU_STAGING_CHUNKS", 2)
         max_staging_bytes = _env_optional_int("OFFLOAD_GPU_STAGING_MAX_BYTES")
@@ -269,6 +270,91 @@ class BlockGPUConnector:
     @property
     def release_gpu_staging_after_transfer(self) -> bool:
         return self._release_gpu_staging_after_transfer
+
+    def _unavailable_transfer_stats(self) -> dict[str, int]:
+        return {
+            "stats_available": 0,
+            "counts_available": 0,
+            "transfer_succeeded": -1,
+            "async_host_copy_enabled": 0,
+            "batch_block_ids_enabled": 0,
+            "chunks": -1,
+            "groups": -1,
+            "max_chunk_bytes": -1,
+            "max_group_bytes": -1,
+            "total_bytes": -1,
+            "completed_bytes": -1,
+            "async_host_copy_chunks": -1,
+            "blocking_host_copy_chunks": -1,
+            "batch_id_groups": -1,
+            "batch_id_uploads": -1,
+            "gpu_staging_chunk_bytes": self.gpu_staging_chunk_bytes,
+            "gpu_staging_buffer_chunks": self.gpu_staging_buffer_chunks,
+            "gpu_staging_buffer_bytes": self.gpu_staging_buffer_bytes,
+        }
+
+    def reset_transfer_stats(self) -> None:
+        """Reset this worker thread's lightweight transfer evidence."""
+        self._tls.last_transfer_stats = self._unavailable_transfer_stats()
+
+    def last_transfer_stats(self) -> dict[str, int]:
+        """Return counts and fast-path evidence for this thread's last transfer.
+
+        This intentionally contains no phase or GPU-event timings.  It exists
+        so serving logs and the hardware probe can distinguish a real zero-byte
+        operation from unavailable instrumentation and verify which path ran.
+        """
+        stats = getattr(self._tls, "last_transfer_stats", None)
+        return dict(stats) if stats is not None else self._unavailable_transfer_stats()
+
+    @contextmanager
+    def _capture_transfer_stats(self) -> Iterator[dict[str, int]]:
+        stats = self._unavailable_transfer_stats()
+        stats.update(
+            stats_available=1,
+            transfer_succeeded=0,
+            async_host_copy_chunks=0,
+            blocking_host_copy_chunks=0,
+            batch_id_groups=0,
+            batch_id_uploads=0,
+        )
+        previous = getattr(self._tls, "active_transfer_stats", None)
+        self._tls.active_transfer_stats = stats
+        try:
+            yield stats
+            stats["transfer_succeeded"] = 1
+            if stats["counts_available"]:
+                stats["completed_bytes"] = stats["total_bytes"]
+        finally:
+            self._tls.last_transfer_stats = stats
+            self._tls.active_transfer_stats = previous
+
+    @staticmethod
+    def _record_transfer_shape(
+        stats: dict[str, int], groups: list[_TransferGroup]
+    ) -> None:
+        stats.update(
+            counts_available=1,
+            chunks=sum(len(group.chunks) for group in groups),
+            groups=len(groups),
+            max_chunk_bytes=max(
+                (chunk.nbytes for group in groups for chunk in group.chunks),
+                default=0,
+            ),
+            max_group_bytes=max((group.nbytes for group in groups), default=0),
+            total_bytes=sum(group.nbytes for group in groups),
+        )
+
+    @staticmethod
+    def _record_empty_transfer(stats: dict[str, int]) -> None:
+        stats.update(
+            counts_available=1,
+            chunks=0,
+            groups=0,
+            max_chunk_bytes=0,
+            max_group_bytes=0,
+            total_bytes=0,
+        )
 
     def close(self) -> None:
         if self._source_safe_poller is not None:
@@ -470,23 +556,132 @@ class BlockGPUConnector:
     def _group_block_ids(group: _TransferGroup) -> list[list[int]]:
         return [chunk.block_ids for chunk in group.chunks]
 
-    @staticmethod
-    def _slice_to_memory_objs(group: _TransferGroup, src_buf: torch.Tensor) -> None:
+    def _prepare_block_id_stage(
+        self,
+        state: _ThreadTransferState,
+        groups: list[_TransferGroup],
+        method_name: str,
+    ) -> tuple[_PipelineStage, Any | None, bool]:
+        """Upload all final group IDs once before the staging loop.
+
+        Codecs without the prepared-ID API keep their existing per-group call.
+        Prepared plans belong to this codec and the pack stream for both
+        directions; the returned owner must survive the pipeline's final or
+        recovery fence.
+        """
+        prepare = getattr(self.codec, "prepare_block_id_groups", None)
+        prepared_call = (
+            getattr(self.codec, f"{method_name}_prepared", None)
+            if callable(prepare)
+            else None
+        )
+        if not callable(prepared_call):
+            return (
+                _PipelineStage(
+                    state.pack_stream,
+                    lambda group, buf: getattr(self.codec, method_name)(
+                        buf, self._group_block_ids(group), stream=state.pack_stream
+                    ),
+                ),
+                None,
+                False,
+            )
+
+        self._assert_fused_chunk_major_available()
+        # Capture indices once: groups contain lists and are not hashable.
+        # D2H groups have already been sorted tail-to-head here.
+        group_indices = {id(group): index for index, group in enumerate(groups)}
+        owner = prepare(
+            [self._group_block_ids(group) for group in groups],
+            device=self.device,
+            stream=state.pack_stream,
+        )
+        stats = getattr(self._tls, "active_transfer_stats", None)
+        if stats is not None:
+            stats["batch_block_ids_enabled"] = 1
+            stats["batch_id_groups"] = int(getattr(owner, "group_count", len(groups)))
+            stats["batch_id_uploads"] = int(
+                getattr(owner, "upload_count", int(bool(groups)))
+            )
+        return (
+            _PipelineStage(
+                state.pack_stream,
+                lambda group, buf: prepared_call(
+                    buf, owner, group_indices[id(group)], stream=state.pack_stream
+                ),
+            ),
+            owner,
+            True,
+        )
+
+    def _non_blocking_memory_copy(
+        self,
+        memory_tensor: torch.Tensor,
+        staging_tensor: torch.Tensor,
+        *,
+        prepared_ids_active: bool,
+    ) -> bool:
+        """Use nonblocking copies on the validated combined fast path.
+
+        MemoryObj.is_pinned is a cache-eviction pin, not a physical memory
+        property. Tensor.is_pinned checks the actual backing allocation,
+        including supported externally allocated registered host memory.
+        Pageable/unrecognized host memory keeps the original blocking copy.
+        MemoryObjs remain owned by the synchronous caller until the existing
+        final stream fence; this never advances their release or put.
+        """
+        if memory_tensor.device.type != "cpu":
+            return True
+        if staging_tensor.device.type != "cuda":
+            return False
+        non_blocking = bool(prepared_ids_active and memory_tensor.is_pinned())
+        stats = getattr(self._tls, "active_transfer_stats", None)
+        if stats is not None:
+            if non_blocking:
+                stats["async_host_copy_enabled"] = 1
+            name = (
+                "async_host_copy_chunks"
+                if non_blocking
+                else "blocking_host_copy_chunks"
+            )
+            stats[name] += 1
+        return non_blocking
+
+    def _slice_to_memory_objs(
+        self,
+        group: _TransferGroup,
+        src_buf: torch.Tensor,
+        *,
+        prepared_ids_active: bool = False,
+    ) -> None:
         offset = 0
         for chunk in group.chunks:
             chunk.tensor.copy_(
                 src_buf[offset : offset + chunk.nbytes],
-                non_blocking=chunk.tensor.device.type != "cpu",
+                non_blocking=self._non_blocking_memory_copy(
+                    chunk.tensor,
+                    src_buf,
+                    prepared_ids_active=prepared_ids_active,
+                ),
             )
             offset += chunk.nbytes
 
-    @staticmethod
-    def _memory_objs_to_slice(group: _TransferGroup, dst_buf: torch.Tensor) -> None:
+    def _memory_objs_to_slice(
+        self,
+        group: _TransferGroup,
+        dst_buf: torch.Tensor,
+        *,
+        prepared_ids_active: bool = False,
+    ) -> None:
         offset = 0
         for chunk in group.chunks:
             dst_buf[offset : offset + chunk.nbytes].copy_(
                 chunk.tensor,
-                non_blocking=chunk.tensor.device.type != "cpu",
+                non_blocking=self._non_blocking_memory_copy(
+                    chunk.tensor,
+                    dst_buf,
+                    prepared_ids_active=prepared_ids_active,
+                ),
             )
             offset += chunk.nbytes
 
@@ -588,6 +783,7 @@ class BlockGPUConnector:
         stage_a: _PipelineStage,
         stage_b: _PipelineStage,
         stage_b_enqueued: Callable[[_TransferGroup, Any], None] | None = None,
+        block_id_owner: Any | None = None,
     ) -> None:
         """Drive an event-synced two-stage staging pipeline.
 
@@ -596,7 +792,8 @@ class BlockGPUConnector:
         later group's reuse of the same buffer. ``stage_b``'s stream produces
         the observable result, so it is the one synchronized at the end. An
         exception fences both streams; an unconfirmed fence permanently
-        quarantines that tensor and forces fresh allocation on the next call.
+        quarantines that tensor and its prepared block IDs, forcing fresh
+        allocation on the next call.
         """
         self._assert_fused_chunk_major_available()
 
@@ -604,6 +801,9 @@ class BlockGPUConnector:
             if self._fence_pipeline_streams(failed_a, failed_b):
                 return True
             self._quarantine_staging_buffer(staging_buffer)
+            if block_id_owner is not None:
+                with self._quarantined_staging_lock:
+                    self._quarantined_block_id_owners.append(block_id_owner)
             return False
 
         run_staged_pipeline(
@@ -632,31 +832,35 @@ class BlockGPUConnector:
         **kwargs,
     ) -> None:
         """Pack ATOM KV blocks tail-to-head into LMCache MemoryObjs."""
-        prepared = self._prepare_transfer(
-            memory_objs,
-            starts,
-            ends,
-            tail_to_head=True,
-            **kwargs,
-        )
-        if prepared is None:
-            return
-        state, groups = prepared
-        self._run_staged_pipeline(
-            state,
-            groups,
-            stage_a=_PipelineStage(
-                state.pack_stream,
-                lambda group, buf: self.codec.gpu_to_chunk_major_device_buffer(
-                    buf, self._group_block_ids(group), stream=state.pack_stream
+        with self._capture_transfer_stats() as stats:
+            prepared = self._prepare_transfer(
+                memory_objs, starts, ends, tail_to_head=True, **kwargs
+            )
+            if prepared is None:
+                self._record_empty_transfer(stats)
+                return
+            state, groups = prepared
+            self._record_transfer_shape(stats, groups)
+            pack_stage, block_id_owner, prepared_ids_active = (
+                self._prepare_block_id_stage(
+                    state, groups, "gpu_to_chunk_major_device_buffer"
+                )
+            )
+            self._run_staged_pipeline(
+                state,
+                groups,
+                stage_a=pack_stage,
+                stage_b=_PipelineStage(
+                    state.copy_stream,
+                    lambda group, buf: self._slice_to_memory_objs(
+                        group,
+                        buf,
+                        prepared_ids_active=prepared_ids_active,
+                    ),
                 ),
-            ),
-            stage_b=_PipelineStage(
-                state.copy_stream,
-                lambda group, buf: self._slice_to_memory_objs(group, buf),
-            ),
-            stage_b_enqueued=self._queue_source_safe_group,
-        )
+                stage_b_enqueued=self._queue_source_safe_group,
+                block_id_owner=block_id_owner,
+            )
 
     def batched_to_gpu(
         self,
@@ -666,21 +870,29 @@ class BlockGPUConnector:
         **kwargs,
     ) -> None:
         """Load LMCache MemoryObjs back into ATOM KV blocks via bounded staging."""
-        prepared = self._prepare_transfer(memory_objs, starts, ends, **kwargs)
-        if prepared is None:
-            return
-        state, groups = prepared
-        self._run_staged_pipeline(
-            state,
-            groups,
-            stage_a=_PipelineStage(
-                state.copy_stream,
-                lambda group, buf: self._memory_objs_to_slice(group, buf),
-            ),
-            stage_b=_PipelineStage(
-                state.pack_stream,
-                lambda group, buf: self.codec.chunk_major_device_buffer_to_gpu(
-                    buf, self._group_block_ids(group), stream=state.pack_stream
+        with self._capture_transfer_stats() as stats:
+            prepared = self._prepare_transfer(memory_objs, starts, ends, **kwargs)
+            if prepared is None:
+                self._record_empty_transfer(stats)
+                return
+            state, groups = prepared
+            self._record_transfer_shape(stats, groups)
+            pack_stage, block_id_owner, prepared_ids_active = (
+                self._prepare_block_id_stage(
+                    state, groups, "chunk_major_device_buffer_to_gpu"
+                )
+            )
+            self._run_staged_pipeline(
+                state,
+                groups,
+                stage_a=_PipelineStage(
+                    state.copy_stream,
+                    lambda group, buf: self._memory_objs_to_slice(
+                        group,
+                        buf,
+                        prepared_ids_active=prepared_ids_active,
+                    ),
                 ),
-            ),
-        )
+                stage_b=pack_stage,
+                block_id_owner=block_id_owner,
+            )

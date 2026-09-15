@@ -21,6 +21,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.model_ops.minimax_m3.index_topk import build_n_valid_column_per_row
+
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
 
@@ -60,6 +62,16 @@ class MiniMaxM3SparseMetadata:
     num_prefills: int
     prefill: MiniMaxM3SparsePrefillMetadata | None = None
     decode: MiniMaxM3SparseDecodeMetadata | None = None
+    n_valid_column_per_row: torch.Tensor | None = None
+    """[num_idx_heads * total_q] int32 GPU -- live columns of each index-selector
+    row, head-major to match `score.view(rows, max_block)`. None on an empty batch.
+
+    Built once here and read by every sparse layer: the bound is
+    `ceil(causal_len / SPARSE_BLOCK_SIZE)`, a function of the query token alone,
+    so a per-layer rebuild would repeat one launch tens of times a step -- what
+    `deepseek_v4_attn.csa_n_committed_per_token` hoists out for the sibling
+    indexer. `index_topk` consumes it and never derives its own.
+    """
 
 
 def make_sparse_prefill_metadata(
@@ -72,6 +84,8 @@ def make_sparse_prefill_metadata(
     max_seq_len: int,
     num_prefills: int,
     num_prefill_tokens: int,
+    num_idx_heads: int,
+    n_valid_column_per_row_out: torch.Tensor | None = None,
 ) -> MiniMaxM3SparseMetadata:
     query_lens = cu_seqlens_q[1 : num_prefills + 1] - cu_seqlens_q[:num_prefills]
     prefix_lens = seq_lens - query_lens
@@ -92,6 +106,16 @@ def make_sparse_prefill_metadata(
         num_prefills=num_prefills,
         prefill=prefill,
         decode=None,
+        # Ragged rows: query starts, and the keys already behind each request.
+        n_valid_column_per_row=build_n_valid_column_per_row(
+            cu_seqlens_q,
+            prefix_lens,
+            batch=num_prefills,
+            total_q=num_prefill_tokens,
+            num_idx_heads=num_idx_heads,
+            decode_max_q=0,
+            out=n_valid_column_per_row_out,
+        ),
     )
 
 
@@ -101,11 +125,14 @@ def make_sparse_decode_metadata(
     block_table: torch.Tensor,
     slot_mapping: torch.Tensor,
     max_seq_len: int,
+    num_idx_heads: int,
     max_query_len: int = 1,
+    n_valid_column_per_row_out: torch.Tensor | None = None,
 ) -> MiniMaxM3SparseMetadata:
     decode = MiniMaxM3SparseDecodeMetadata(
         seq_lens=seq_lens, block_table=block_table, max_query_len=max_query_len
     )
+    batch = seq_lens.shape[0]
     return MiniMaxM3SparseMetadata(
         seq_lens=seq_lens,
         max_seq_len=max_seq_len,
@@ -113,6 +140,17 @@ def make_sparse_decode_metadata(
         num_prefills=0,
         prefill=None,
         decode=decode,
+        # Dense rows: `max_query_len` per request, so both index arrays collapse
+        # to seq_lens and each request's tail token ends at its full length.
+        n_valid_column_per_row=build_n_valid_column_per_row(
+            seq_lens,
+            seq_lens,
+            batch=batch,
+            total_q=batch * max_query_len,
+            num_idx_heads=num_idx_heads,
+            decode_max_q=max_query_len,
+            out=n_valid_column_per_row_out,
+        ),
     )
 
 
@@ -127,18 +165,60 @@ def _is_fp8_kv_cache_tensor(kv_cache: torch.Tensor) -> bool:
 
 @functools.cache
 def _gluon_one_pass_max_rows(device_index: int | None) -> int:
-    """Rows up to which split-KV still covers the GPU one workgroup per CU.
+    """Rows up to which split-KV still covers the GPU, at aiter's occupancy.
 
-    Under it gluon wins (ASM is launch-bound), over it loses (its workgroups
-    stop fitting). Measured on MI355X, 256 CU: gluon 9.4 / 10.4 / 15.0us at
-    1 / 32 / 40 rows against ASM 12.7 / 14.2 / 14.3 -- re-measure before moving
-    it. Splits is non-increasing in rows, so rows=1 asks aiter for its own cap
-    rather than restating it here, where the two could drift apart.
+    Under it gluon wins (ASM is launch-bound), over it loses. Both factors are
+    aiter's: it sizes its split ladder against `multi_processor_count *
+    get_occupancy()`, so the bare CU count would halve this and hand rows
+    33..64 to ASM, which loses there. rows=1 asks for its cap, not a copy.
+
+    256 * 2 // 8 = 64 on MI355X, and the measured crossover is 64..80 there
+    (gluon 11.2us vs ASM 14.7 at 64 rows; 15.9 vs 15.1 at 80). On triton 3.8 it
+    moves to ~36 -- gluon is a Triton JIT and 3.8 compiles it up to 2x slower,
+    while ASM is hand-written and does not move. The image pins 3.7 (#2173);
+    re-measure on both before touching this.
     """
-    from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
+    from aiter.ops.triton.gluon.pa_decode_gluon import (
+        get_occupancy,
+        get_recommended_splits,
+    )
 
     cus = torch.cuda.get_device_properties(device_index).multi_processor_count
-    return max(1, cus // get_recommended_splits(1, 1))
+    return max(1, cus * get_occupancy() // get_recommended_splits(1, 1))
+
+
+# The maskless fp8 kernel returns NaN for gqa=16 when the context needs exactly
+# 16 pages with a partial tail (241..255 tokens); gqa=8 is correct there, and
+# two 8-head queries of one request are the same arithmetic over the same KV.
+# Unconditional: the trigger is a sparse_ctx value, and reading it costs a sync.
+_ASM_NAN_GROUP = 16
+_ASM_SPLIT = 2
+
+# A maskless mtp>0 kernel is unreachable through the heuristic (a null qo_indptr
+# forces mtp=0, a non-null one forces msk=1), so name the row. An unlisted dtype
+# keeps the unsplit path rather than aborting inside aiter.
+_ASM_SPLIT_KERNELS = {
+    torch.bfloat16: "_ZN5aiter40pa_bf16_pertokenFp8_gqa8_1tg_4w_mtp_msk0E",
+    torch.float16: "_ZN5aiter40pa_fp16_pertokenFp8_gqa8_1tg_4w_mtp_msk0E",
+}
+
+
+# Every request contributes two queries, so the indptr is 2 * arange. Allocated
+# once past any batch (1 MiB) and narrowed per call: narrow raises where a slice
+# would hand the kernel a short tensor, and a pool that grew on demand would
+# allocate inside a graph capture.
+_SPLIT_INDPTR_ROWS = 1 << 18
+
+
+@functools.cache
+def _split_indptr(device: torch.device) -> torch.Tensor:
+    return torch.arange(
+        0,
+        (_SPLIT_INDPTR_ROWS + 1) * _ASM_SPLIT,
+        _ASM_SPLIT,
+        dtype=torch.int32,
+        device=device,
+    )
 
 
 def _sparse_pa_ran_on_asm(
@@ -164,13 +244,24 @@ def _sparse_pa_ran_on_asm(
         run_pa_fwd_asm,
     )
 
+    rows, group, head_dim = q.shape
     if (
         k_scale is None
         or not _is_fp8_kv_cache_tensor(k_cache)
-        or q.shape[1] > PA_ASM_MAX_QUERY_GROUP_SIZE
-        or q.shape[0] <= _gluon_one_pass_max_rows(q.device.index)
+        or group > PA_ASM_MAX_QUERY_GROUP_SIZE
+        or rows <= _gluon_one_pass_max_rows(q.device.index)
     ):
         return False
+
+    kernel_name = _ASM_SPLIT_KERNELS.get(q.dtype) if group == _ASM_NAN_GROUP else None
+    qo_indptr, max_qlen = None, 1
+    if kernel_name:
+        # Rows 2b/2b+1 are request b's head halves -- the kernel's own
+        # q[b*qlen + i] layout, so one block-table row still serves both.
+        qo_indptr = _split_indptr(q.device).narrow(0, 0, rows + 1)
+        q = q.view(rows * _ASM_SPLIT, group // _ASM_SPLIT, head_dim)
+        out = out.view(q.shape)
+        max_qlen = _ASM_SPLIT
 
     pages, pbs = k_cache.shape[0], k_scale.shape[-1]
     run_pa_fwd_asm(
@@ -182,7 +273,9 @@ def _sparse_pa_ran_on_asm(
         k_scale=k_scale.view(pages, 1, pbs),
         v_scale=v_scale.view(pages, 1, pbs),
         out=out,
-        max_qlen=1,
+        qo_indptr=qo_indptr,
+        max_qlen=max_qlen,
+        kernel_name=kernel_name,
     )
     return True
 
