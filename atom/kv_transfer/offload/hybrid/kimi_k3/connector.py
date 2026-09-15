@@ -567,7 +567,7 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         if joint is None or int(getattr(joint, "load_hash", -1)) == -1:
             return
         sid = str(seq.id)
-        if sid in self._load_cancelled:
+        if getattr(seq, "offload_load_cancelled", False):
             # This sub lost `get_num_new_matched_tokens` and the composite
             # withdrew its load. The state arm reads `seq.offload_joint`, which
             # the engine owns and the cancel does not reach, so without this the
