@@ -178,9 +178,57 @@ def test_empty_rows_do_not_poison_the_scale():
         assert deq[row].abs().max().item() == 0.0
 
 
+def test_non_power_of_two_group():
+    """A group size N_ROUNDED has to round up, with a poison slab where it lands.
+
+    Both kernels index n over N_ROUNDED, so a 3-rank group has a fourth lane
+    addressing one rank-slab past `recv`. That lane's factor is zero, so an
+    unmasked load cannot change a number -- the only symptom is the access
+    itself, which is invisible from here and shows up in the field as a fault.
+    So this pins what IS observable: that a non-power-of-two group combines
+    correctly, and that nothing from beyond `recv` leaks into the result.
+    """
+    n, b, h, d = 3, 4, 2, 128
+    assert triton.next_power_of_2(n) > n, "meaningless for a power-of-two group"
+    pack = _lse_pack_slots(torch.bfloat16)
+
+    big = torch.empty((n + 1, b, h, d + pack), dtype=torch.bfloat16, device="cuda")
+    big[:n] = _make_recv(n, b, h, d, torch.bfloat16, pack)
+    big[n] = 1e4  # where the padding lane points
+    recv = big[:n]
+
+    ref = _run_unfused(recv, b, h, d, n, pack, torch.bfloat16)
+
+    out = torch.empty((b, h, d), dtype=FP8, device="cuda")
+    scale = torch.empty((b, 1), dtype=torch.float32, device="cuda")
+    _dcp_a2a_unpack_combine_quant_kernel[(b,)](
+        recv,
+        out,
+        scale,
+        recv.stride(0),
+        recv.stride(1),
+        recv.stride(2),
+        out.stride(0),
+        out.stride(1),
+        n,
+        HEAD_DIM=d,
+        H_LOCAL=h,
+        LSE_PACK=pack,
+        N_ROUNDED=triton.next_power_of_2(n),
+        FP8_MAX=float(torch.finfo(FP8).max),
+    )
+    deq = out.float().reshape(b, -1) * scale
+    got = deq.reshape(b, h, d)
+    # fp8 has ~2 decimal digits; compare against the bf16 combine it must track.
+    torch.testing.assert_close(got, ref.float(), rtol=0.1, atol=0.1)
+    assert got.abs().max().item() < 1e3, "a value from beyond `recv` reached the output"
+
+
 # --------------------------------------------------------------------------
-# Gating. Runs without a GPU: the predicate only reads attributes off self, so
-# a stand-in exercises the whole matrix. A wrong answer here is a silent
+# Gating. These need no GPU *device* -- the predicate only reads attributes off
+# self, so a stand-in exercises the whole matrix -- but the imports below pull
+# in aiter and attention_mla's @triton.jit kernels, so they skip with the rest
+# of this module on a runner that has neither. A wrong answer here is a silent
 # numerics bug (o_proj told a tensor is quantized when it is not), which is
 # exactly the kind of thing that never shows up as a crash.
 # --------------------------------------------------------------------------

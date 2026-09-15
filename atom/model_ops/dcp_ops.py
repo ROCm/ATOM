@@ -495,7 +495,11 @@ def _dcp_a2a_unpack_combine_kernel(
     factor = tl.where((factor != factor) | (~valid), 0.0, factor)  # noqa: PLR0124
 
     d = tl.arange(0, HEAD_DIM)
-    vals = tl.load(base[:, None] + d[None, :]).to(tl.float32)
+    # Masked for the same reason as the fused kernel: the padding lanes of a
+    # non-power-of-two group address memory past `recv`.
+    vals = tl.load(base[:, None] + d[None, :], mask=valid[:, None], other=0.0).to(
+        tl.float32
+    )
     # THIS is what stops an empty rank from poisoning the row. aiter returns
     # o=NaN alongside lse=-inf, and NaN * 0 = NaN, so the NaN has to be replaced
     # BEFORE the multiply -- zeroing the weight is not enough.
@@ -584,8 +588,12 @@ def _dcp_a2a_unpack_combine_quant_kernel(
     factor_is_nan = factor != factor  # noqa: PLR0124
     factor = tl.where(factor_is_nan | (~valid[:, None]), 0.0, factor)
 
-    # [N, H, D]
-    vals = tl.load(hbase[:, :, None] + d[None, None, :]).to(tl.float32)
+    # [N, H, D]. Mask the padding lanes: N_ROUNDED rounds up to a power of two,
+    # so for a non-power-of-two group the high lanes address memory past `recv`.
+    # Their factor is already 0, so this changes no result -- it stops the read.
+    vals = tl.load(
+        hbase[:, :, None] + d[None, None, :], mask=valid[:, None, None], other=0.0
+    ).to(tl.float32)
     vals = tl.where(factor[:, :, None] == 0.0, 0.0, vals)
     acc = tl.sum(vals * factor[:, :, None], axis=0)  # [H, D]
 
