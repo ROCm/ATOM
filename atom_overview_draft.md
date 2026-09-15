@@ -45,12 +45,6 @@ ATOM is the vehicle enabling AMD to challenge the NVIDIA B200.
 | **ATOM** | AMD-optimized inference execution and orchestration |
 | Communication (MORI) | Multi-GPU and multi-node communication |
 
-------|------|
-| Frameworks (PyTorch, vLLM, SGLang) | Model definition and serving APIs |
-| Compiler (AITER / MLIR) | Graph‑level optimization and fusion |
-| **ATOM** | AMD‑optimized inference execution engine |
-| Communication (MORI) | Multi‑GPU and multi‑node communication |
-
 ATOM serves as the central performance layer, coordinating compiler decisions, kernel selection, and distributed execution.
 
 ---
