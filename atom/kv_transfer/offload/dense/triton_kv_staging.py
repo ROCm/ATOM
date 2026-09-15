@@ -5,9 +5,80 @@
 
 from __future__ import annotations
 
+import logging
+import os
+import threading
+import time
+
 import torch
 import triton
 import triton.language as tl
+
+logger = logging.getLogger("atom")
+
+
+def _probe_enabled() -> bool:
+    raw = os.environ.get("OFFLOAD_STAGING_PROBE", "0").strip().lower()
+    return bool(raw) and raw not in ("0", "false", "no", "off")
+
+
+# Diagnostic only, and off unless the operator asks for it. py-spy puts ~46% of
+# the save thread and ~56% of the load thread inside the event wait in
+# ``_prepare``. Two mechanisms produce that sample count and they call for
+# opposite fixes: the event is genuinely incomplete (the host outran the GPU by
+# the slot count, so more slots help), or the event completed long ago and the
+# cost is the GIL round trip a blocking runtime call pays to get the
+# interpreter back (so removing the block helps and more slots do nothing).
+# ``query()`` before the wait separates them: it reports completion without
+# blocking, so a high ready fraction next to an expensive wait is the second
+# mechanism and a low one is the first.
+_STAGING_PROBE = _probe_enabled()
+_PROBE_EVERY = 1000
+
+
+class _ProbeAcc:
+    __slots__ = ("copy_ms", "fill_ms", "n", "query_ms", "ready", "record_ms", "sync_ms")
+
+    def __init__(self) -> None:
+        self.n = 0
+        self.ready = 0
+        self.query_ms = 0.0
+        self.sync_ms = 0.0
+        self.fill_ms = 0.0
+        self.copy_ms = 0.0
+        self.record_ms = 0.0
+
+    def reset(self) -> None:
+        self.__init__()
+
+
+_probe_state = threading.local()
+
+
+def _probe_acc() -> _ProbeAcc:
+    acc = getattr(_probe_state, "acc", None)
+    if acc is None:
+        acc = _ProbeAcc()
+        _probe_state.acc = acc
+    return acc
+
+
+def _probe_report(acc: _ProbeAcc) -> None:
+    n = acc.n
+    logger.info(
+        "[STAGING-PROBE] thread=%s n=%d ready=%.2f%% query=%.4f sync=%.4f "
+        "fill=%.4f copy=%.4f record=%.4f (ms/call)",
+        threading.current_thread().name,
+        n,
+        100.0 * acc.ready / n,
+        acc.query_ms / n,
+        acc.sync_ms / n,
+        acc.fill_ms / n,
+        acc.copy_ms / n,
+        acc.record_ms / n,
+    )
+    acc.reset()
+
 
 _BLOCK_BYTES = 1024
 # 1024 bytes over two wavefronts is 8 bytes per lane. The tile used to be
@@ -281,9 +352,38 @@ class _ChunkMajorPlan:
     # handed to an asynchronous H2D, and the next group's host-side write could
     # land while that copy is still in flight. Waiting on the copy instead would
     # drain everything queued ahead of it on the stream -- the previous group's
-    # pack kernel -- so rotate a few slots and only wait on wrap, which in
-    # practice never blocks.
-    _NUM_HOST_SLOTS = 4
+    # pack kernel -- so rotate slots and only wait on wrap.
+    #
+    # Four slots did not get that wait down to never, and the wrap was not
+    # cheap. py-spy on a live unprofiled server put 46% of the save thread and
+    # 56% of the load thread inside this one wait. Probed in-server
+    # (``OFFLOAD_STAGING_PROBE=1``), the event was already complete on 71% of
+    # save groups and 84% of load groups; the rest wrapped into live work, and
+    # a wrap that blocks costs ~22 ms (save) / ~35 ms (load) against 0.158 ms
+    # of GPU work per group.
+    #
+    # The gap is not the transfer. A blocking runtime call drops the GIL to
+    # sleep, the model's threads take it, and this one waits out a switch
+    # interval to get it back. The non-blocking calls on the same path --
+    # ``Event.record``, the H2D itself -- also drop the GIL and cost tens of
+    # microseconds, so the expense is sleeping, not yielding.
+    #
+    # Depth therefore has to cover a burst, not a couple of groups: a host
+    # issuing ~0.1 ms per group against a GPU draining ~0.158 ms cannot stay
+    # ahead for long, but it only has to be ahead once per wrap to pay. Swept
+    # end to end on GLM-5.2 MXFP4 (pool 64, 600 s, one seed, no instrument),
+    # against a 1.23% cross-sweep spread:
+    #
+    #     slots   output tok/s   p50 TTFT   ITL
+    #         4         353.77   1425.71   18.87
+    #        32         383.15    742.31   18.00
+    #       128         393.50    672.32   17.58
+    #
+    # Monotone on all three, so the knee is past 128 rather than at it; 128 is
+    # where the marginal gain stopped being worth another arm, not a measured
+    # optimum. It is cheap to sit here: a slot is nblocks*8 pinned bytes, so a
+    # ring is single-digit KiB per cached plan.
+    _NUM_HOST_SLOTS = 128
 
     def __init__(self, meta, num_segments: int, nblocks: int) -> None:
         (
@@ -326,6 +426,9 @@ class _ChunkMajorPlan:
             return False
         slot = self._slot
         self._slot = (slot + 1) % self._NUM_HOST_SLOTS
+        if _STAGING_PROBE:
+            self._prepare_probed(slot, block_ids)
+            return True
         self._host_events[slot].synchronize()
         # Assigning the sequence into the pinned buffer's numpy view converts it
         # in C, straight into the destination. ``torch.as_tensor(list_of_int)``
@@ -336,6 +439,36 @@ class _ChunkMajorPlan:
         self._block_ids_d.copy_(self._host_slots[slot], non_blocking=True)
         self._host_events[slot].record()
         return True
+
+    def _prepare_probed(self, slot: int, block_ids) -> None:
+        """``_prepare``'s tail, with each runtime call timed separately.
+
+        Same calls in the same order plus a non-blocking ``query()``, so the
+        per-call numbers are comparable to each other; the total is not
+        comparable to an unprobed run.
+        """
+        acc = _probe_acc()
+        event = self._host_events[slot]
+        t0 = time.perf_counter()
+        ready = event.query()
+        t1 = time.perf_counter()
+        event.synchronize()
+        t2 = time.perf_counter()
+        self._host_views[slot][:] = block_ids
+        t3 = time.perf_counter()
+        self._block_ids_d.copy_(self._host_slots[slot], non_blocking=True)
+        t4 = time.perf_counter()
+        event.record()
+        t5 = time.perf_counter()
+        acc.n += 1
+        acc.ready += 1 if ready else 0
+        acc.query_ms += (t1 - t0) * 1000.0
+        acc.sync_ms += (t2 - t1) * 1000.0
+        acc.fill_ms += (t3 - t2) * 1000.0
+        acc.copy_ms += (t4 - t3) * 1000.0
+        acc.record_ms += (t5 - t4) * 1000.0
+        if acc.n >= _PROBE_EVERY:
+            _probe_report(acc)
 
     def pack(self, block_ids, device_buf: torch.Tensor) -> None:
         if not self._prepare(block_ids, device_buf):
