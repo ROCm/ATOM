@@ -90,7 +90,10 @@ def test_all_finite_leaves_every_row_untouched():
 
 def test_all_non_finite_zeroes_everything():
     o = torch.randn(3, 4, 512, device="cuda")
-    assert torch.count_nonzero(_new(o, torch.full((3, 4), float("nan"), device="cuda"))) == 0
+    assert (
+        torch.count_nonzero(_new(o, torch.full((3, 4), float("nan"), device="cuda")))
+        == 0
+    )
 
 
 def test_mask_is_per_head_not_per_token():

@@ -4,6 +4,7 @@ enough, including on the empty-rank rows that carry lse=-inf and o=NaN.
 No distributed setup: both kernels are driven directly off a synthetic `recv`
 buffer, which is the only thing the all-to-all produces.
 """
+
 import pytest
 import torch
 
@@ -24,7 +25,7 @@ def _make_recv(n, b, h, d, dtype, pack, empty_rows=(), seed=0):
     recv = torch.empty((n, b, h, d + pack), dtype=dtype, device="cuda")
     body = torch.randn((n, b, h, d), generator=g).to(dtype).cuda()
     lse = torch.randn((n, b, h), generator=g).cuda().float() * 2.0
-    for row in empty_rows:                     # a rank owning no KV for this row
+    for row in empty_rows:  # a rank owning no KV for this row
         body[:, row] = float("nan")
         lse[:, row] = float("-inf")
     recv[..., :d] = body
@@ -42,12 +43,21 @@ def _make_recv(n, b, h, d, dtype, pack, empty_rows=(), seed=0):
 def _run_unfused(recv, b, h, d, n, pack, dtype):
     out = torch.empty((b, h, d), dtype=dtype, device="cuda")
     _dcp_a2a_unpack_combine_kernel[(b, h)](
-        recv, out, out,
-        recv.stride(0), recv.stride(1), recv.stride(2),
-        out.stride(0), out.stride(1),
-        0, 0, n,
-        HEAD_DIM=d, LSE_PACK=pack,
-        N_ROUNDED=triton.next_power_of_2(n), WRITE_LSE=False,
+        recv,
+        out,
+        out,
+        recv.stride(0),
+        recv.stride(1),
+        recv.stride(2),
+        out.stride(0),
+        out.stride(1),
+        0,
+        0,
+        n,
+        HEAD_DIM=d,
+        LSE_PACK=pack,
+        N_ROUNDED=triton.next_power_of_2(n),
+        WRITE_LSE=False,
     )
     return out
 
@@ -56,11 +66,18 @@ def _run_fused(recv, b, h, d, n, pack):
     out = torch.empty((b, h, d), dtype=FP8, device="cuda")
     scale = torch.empty((b, 1), dtype=torch.float32, device="cuda")
     _dcp_a2a_unpack_combine_quant_kernel[(b,)](
-        recv, out, scale,
-        recv.stride(0), recv.stride(1), recv.stride(2),
-        out.stride(0), out.stride(1),
+        recv,
+        out,
+        scale,
+        recv.stride(0),
+        recv.stride(1),
+        recv.stride(2),
+        out.stride(0),
+        out.stride(1),
         n,
-        HEAD_DIM=d, H_LOCAL=h, LSE_PACK=pack,
+        HEAD_DIM=d,
+        H_LOCAL=h,
+        LSE_PACK=pack,
         N_ROUNDED=triton.next_power_of_2(n),
         FP8_MAX=float(torch.finfo(FP8).max),
     )
@@ -108,7 +125,7 @@ def test_fused_matches_fp32_combine_then_quant(dtype, b, h, d, n):
     # for an integer grid and is simply the wrong model.
     deq = got_q.float().reshape(b, h * d) * got_s
     torch.testing.assert_close(
-        deq, row32, rtol=2.0 ** -4, atol=(got_s * 2.0 ** -9).max().item()
+        deq, row32, rtol=2.0**-4, atol=(got_s * 2.0**-9).max().item()
     )
 
 
@@ -131,7 +148,7 @@ def test_scale_differs_from_the_bf16_path_only_by_bf16_rounding():
     _, got_s = _run_fused(recv, b, h, d, n, pack)
 
     rel = ((got_s - bf16_s).abs() / bf16_s).max().item()
-    assert rel < 2.0 ** -8, f"scale drifted {rel:.5f}, more than one bf16 step"
+    assert rel < 2.0**-8, f"scale drifted {rel:.5f}, more than one bf16 step"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -182,14 +199,14 @@ def _stub(**over):
 @pytest.mark.parametrize(
     "over,expect",
     [
-        ({}, "fp8"),                                   # the one good case
-        ({"pbm_enabled": False}, None),                # o_proj not fed directly
-        ({"dcp_comm_backend": "ag_rs"}, None),         # other backend
+        ({}, "fp8"),  # the one good case
+        ({"pbm_enabled": False}, None),  # o_proj not fed directly
+        ({"dcp_comm_backend": "ag_rs"}, None),  # other backend
         ({"quant_type": QuantType.per_Tensor}, None),  # not per-token
-        ({"quant_type": QuantType.per_1x128}, None),   # block scheme
-        ({"params_dtype": dtypes.fp4x2}, None),        # not fp8
-        ({"input_scale": object()}, None),             # static scale
-        ({"o_proj": None}, None),                      # no o_proj at all
+        ({"quant_type": QuantType.per_1x128}, None),  # block scheme
+        ({"params_dtype": dtypes.fp4x2}, None),  # not fp8
+        ({"input_scale": object()}, None),  # static scale
+        ({"o_proj": None}, None),  # no o_proj at all
     ],
 )
 def test_fused_quant_gating(over, expect):

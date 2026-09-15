@@ -340,8 +340,11 @@ def _zero_nonfinite_rows_kernel(
     base = out_ptr + b * out_stride_b + h * out_stride_h
     for off in tl.range(0, HEAD_DIM, BLOCK):
         idx = off + tl.arange(0, BLOCK)
-        tl.store(base + idx, tl.zeros([BLOCK], dtype=out_ptr.dtype.element_ty),
-                 mask=idx < HEAD_DIM)
+        tl.store(
+            base + idx,
+            tl.zeros([BLOCK], dtype=out_ptr.dtype.element_ty),
+            mask=idx < HEAD_DIM,
+        )
 
 
 def zero_nonfinite_rows(out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
@@ -578,7 +581,9 @@ def _dcp_a2a_unpack_combine_quant_kernel(
     global_lse = tl.log(tl.sum(tl.exp(lse - lse_max), axis=0)) + lse_max
 
     factor = tl.exp(lse - global_lse[None, :])
-    factor = tl.where((factor != factor) | (~valid[:, None]), 0.0, factor)  # noqa: PLR0124
+    factor = tl.where(
+        (factor != factor) | (~valid[:, None]), 0.0, factor
+    )  # noqa: PLR0124
 
     # [N, H, D]
     vals = tl.load(hbase[:, :, None] + d[None, None, :]).to(tl.float32)
@@ -636,9 +641,9 @@ def cp_lse_a2a(
             # Nothing to combine, so there is no kernel to fold the quant into.
             return cp_attn_out, None
         return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
-    assert quant_dtype is None or not return_lse, (
-        "cp_lse_a2a: the fused-quant combine does not emit LSE"
-    )
+    assert (
+        quant_dtype is None or not return_lse
+    ), "cp_lse_a2a: the fused-quant combine does not emit LSE"
 
     b, h_total, head_dim = cp_attn_out.shape
     assert h_total % n_ranks == 0, (
@@ -774,9 +779,9 @@ def dcp_lse_merge(
             owned_counts=owned_counts,
             quant_dtype=quant_dtype,
         )
-    assert quant_dtype is None, (
-        "dcp_lse_merge: fused-quant combine is only implemented for backend=a2a"
-    )
+    assert (
+        quant_dtype is None
+    ), "dcp_lse_merge: fused-quant combine is only implemented for backend=a2a"
     if owned_counts is not None:
         # AG+RS has no existing kernel before its LSE AllGather. The default
         # A2A path above fuses this mask and remains launch-free.
