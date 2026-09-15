@@ -1987,6 +1987,14 @@ class Scheduler:
                 for d in drafts:
                     seq.append_token(int(d))
                 seq.spec_token_ids = np.asarray(drafts, dtype=np.int32)
+                # These trailing slots are the remote's drafts, awaiting
+                # verification by the first local decode -- the same contract
+                # as postprocess's placeholders, so record the same width.
+                # `preempt()` reads it to decide what to strip, and the remote
+                # may have sent fewer than `mtp_k` (or none at all), so the
+                # count has to come from what was actually appended. T0 is
+                # excluded: it is a real generated token.
+                seq.num_placeholder_tokens = len(drafts)
         logger.debug(
             "[PD-TRANSITION] seq %s: num_tokens=%d, "
             "num_prompt=%d, blocks=%d, first_token=%s, "
@@ -2381,9 +2389,8 @@ class Scheduler:
             return False
         self.total_preemptions += 1
         seq.status = SequenceStatus.WAITING
-        # Strip placeholder + rejected draft tokens added by postprocess.
-        # Real token count = seq.num_tokens - mtp_k - num_rejected
-        # (same formula as postprocess line: num_tokens = seq.num_tokens - self.mtp_k - num_rejected)
+        # Strip the placeholder tokens postprocess appended, so the recompute
+        # restarts from real context only.
         #
         # Deferred output appends its placeholder on every decode step, not
         # only under speculation: `is_deferred_out` is `pipeline_parallel_size
@@ -2396,10 +2403,26 @@ class Scheduler:
         # same token is handed back to the caller as generated output. With
         # `ignore_eos=False` the request just stops there, which reads as a
         # coherent answer that ends before it answers anything.
-        if self.spec_decode_local and self.mtp_k > 0:
-            strip = self.mtp_k + seq.num_rejected
-        else:
-            strip = seq.num_placeholder_tokens
+        #
+        # `num_placeholder_tokens` is the only width that describes what is
+        # actually there: postprocess appends `mtp_k + is_deferred_out -
+        # num_rejected` slots and records exactly that count. Re-deriving it
+        # here as `mtp_k + num_rejected` agrees only when deferred output is
+        # off AND nothing was rejected -- on a TP-only MTP engine it leaves one
+        # `eos_token_id` behind (the case above), and with `num_rejected = r`
+        # it deletes `2r - 1` real tokens and their logprobs instead.
+        strip = seq.num_placeholder_tokens
+        # A truncating stop can move `num_tokens` back over the placeholders
+        # (postprocess only rewrites the count, not the arrays), so bound the
+        # deletion by what is present and by the prompt, which is never a
+        # placeholder. Without this, `del token_ids[-strip:]` on an oversized
+        # `strip` clears the whole list and drives `num_completion_tokens`
+        # negative.
+        strip = min(
+            strip,
+            len(seq.output_tokens),
+            max(0, seq.num_tokens - seq.num_prompt_tokens),
+        )
         if strip > 0:
             del seq.token_ids[-strip:]
             del seq.output_tokens[-strip:]
@@ -2926,7 +2949,10 @@ class Scheduler:
             # placeholder for the each decode step
             for seq in seqs:
                 if seq.status == SequenceStatus.RUNNING and not seq.is_partial_prefill:
-                    num = num_placeholder - seq.num_rejected
+                    # Clamped because `preempt()` strips exactly this many:
+                    # `range()` on a negative width appends nothing, so storing
+                    # one unclamped would claim placeholders that are not there.
+                    num = max(0, num_placeholder - seq.num_rejected)
                     for _ in range(num):
                         seq.append_token(self.eos_token_id)
                         if seq.return_logprobs:

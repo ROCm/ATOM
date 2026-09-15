@@ -1620,6 +1620,148 @@ class TestPreempt:
         assert len(seq.block_table) == 0
 
 
+def _spec_config(mtp_k):
+    """Stand-in for SpeculativeConfig, carrying the two members the scheduler
+    reads: the draft width and whether the drafter consumes the target's token
+    stream."""
+    return SimpleNamespace(
+        num_speculative_tokens=mtp_k,
+        use_dspark=lambda: False,
+    )
+
+
+class TestPreemptStripsExactlyThePlaceholders:
+    """`preempt()` and `postprocess()` have to agree on the placeholder width.
+
+    postprocess appends `mtp_k + is_deferred_out - num_rejected` trailing
+    `eos_token_id` slots and records the count on the sequence. preempt has to
+    delete that many and no more. Leave one behind and it stops being a
+    placeholder: the recompute prefills a context ending in `<|endoftext|>`, so
+    the model starts a new document and the placeholder is also handed back as
+    generated output. Delete one too many and a real token goes with it, along
+    with its logprob.
+    """
+
+    def _sched(self, mtp_k):
+        return Scheduler(
+            MockConfig(
+                num_kvcache_blocks=64,
+                kv_cache_block_size=4,
+                max_model_len=256,
+                max_num_batched_tokens=256,
+                speculative_config=_spec_config(mtp_k) if mtp_k else None,
+            )
+        )
+
+    @staticmethod
+    def _deferred_prefill_output():
+        """A deferred-output forward whose sampled token is still in flight: no
+        row for the sequence, so postprocess only appends placeholders."""
+        return ScheduledBatchOutput(
+            req_ids=[],
+            token_ids=[],
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
+            is_deferred_out=True,
+        )
+
+    @pytest.mark.parametrize("mtp_k", [0, 1, 3])
+    def test_no_placeholder_survives_into_the_recompute(self, mtp_k, seq_factory):
+        """`is_deferred_out` is `pipeline_parallel_size == 1`, so a TP-only
+        engine -- the normal MTP deployment -- carries `mtp_k + 1`
+        placeholders. A `mtp_k`-wide strip leaves exactly one EOS."""
+        sched = self._sched(mtp_k)
+        prompt = [5, 6, 7, 8]
+        seq = seq_factory(prompt)
+        sched.add(seq)
+        sched.schedule()
+        sched.postprocess(list(sched.running), self._deferred_prefill_output())
+
+        assert seq.num_placeholder_tokens == mtp_k + 1
+        assert list(seq.token_ids) == prompt + [sched.eos_token_id] * (mtp_k + 1)
+
+        assert sched.preempt(seq) is True
+
+        assert sched.eos_token_id not in list(seq.token_ids)
+        assert list(seq.token_ids) == prompt
+        assert list(seq.output_tokens) == []
+        assert seq.num_tokens == seq.num_prompt_tokens
+        assert seq.num_completion_tokens == 0
+        assert seq.num_placeholder_tokens == 0
+
+    @pytest.mark.parametrize("num_rejected", [0, 1, 2, 3])
+    def test_rejected_drafts_narrow_the_strip(self, num_rejected, seq_factory):
+        """postprocess appends *fewer* placeholders as more drafts are
+        rejected. Re-deriving the width as `mtp_k + num_rejected` moves it the
+        other way, so the strip eats `2 * num_rejected - 1` real tokens."""
+        mtp_k = 3
+        sched = self._sched(mtp_k)
+        prompt = [5, 6, 7, 8]
+        seq = seq_factory(prompt)
+        sched.add(seq)
+        sched.schedule()
+        real = [41, 42, 43]
+        for token in real:
+            seq.append_token(token)
+        # What a verify step leaves behind: this many of the seq's drafts did
+        # not survive, so the placeholder run appends a narrower block.
+        seq.num_rejected = num_rejected
+        sched.postprocess(list(sched.running), self._deferred_prefill_output())
+
+        appended = mtp_k + 1 - num_rejected
+        assert seq.num_placeholder_tokens == appended
+        assert list(seq.token_ids) == prompt + real + [sched.eos_token_id] * appended
+
+        assert sched.preempt(seq) is True
+
+        assert list(seq.token_ids) == prompt + real
+        assert list(seq.output_tokens) == real
+        assert seq.num_tokens == len(prompt) + len(real)
+        assert seq.num_completion_tokens == len(real)
+
+    def test_strip_is_bounded_by_what_is_there(self, seq_factory):
+        """A truncating stop moves `num_tokens` back over the placeholders
+        without shortening the arrays. An unbounded `del token_ids[-strip:]`
+        then clears the whole list and drives the completion count negative."""
+        sched = self._sched(mtp_k=3)
+        prompt = [5, 6, 7, 8]
+        seq = seq_factory(prompt)
+        sched.add(seq)
+        sched.schedule()
+        sched.postprocess(list(sched.running), self._deferred_prefill_output())
+        # Wider than the sequence has to give, in either direction.
+        seq.num_placeholder_tokens = seq.num_tokens + 10
+
+        assert sched.preempt(seq) is True
+
+        assert list(seq.token_ids) == prompt
+        assert seq.num_tokens == seq.num_prompt_tokens
+        assert seq.num_completion_tokens == 0
+
+    def test_transferred_drafts_are_stripped_but_t0_is_kept(self, seq_factory):
+        """The P/D first-decode path appends the remote's T0 -- a real
+        generated token -- followed by its drafts, which are placeholders in
+        the same sense. It records only the draft count, because the remote may
+        have sent fewer than `mtp_k`."""
+        mtp_k = 3
+        sched = self._sched(mtp_k)
+        prompt = [5, 6, 7, 8]
+        seq = seq_factory(prompt)
+        sched.add(seq)
+        sched.schedule()
+        t0, drafts = 77, [101, 102]  # fewer drafts than mtp_k
+        seq.kv_transfer_params = {"first_token_id": t0, "draft_token_ids": drafts}
+        sched._schedule_first_decode_after_remote_kv(seq)
+
+        assert seq.num_placeholder_tokens == len(drafts)
+
+        assert sched.preempt(seq) is True
+
+        assert list(seq.token_ids) == prompt + [t0]
+        assert seq.num_completion_tokens == 1
+
+
 # ── postprocess ────────────────────────────────────────────────────────────
 
 
@@ -1743,6 +1885,12 @@ class TestPostprocess:
         seq = self._prefill(scheduler, seq_factory([1, 2, 3, 4]))
         scheduler.postprocess(list(scheduler.running), self._output(seq.id, [2]))
         assert scheduler.get_request_counts() == (0, 0)
+
+
+# ── chunked-prefill finality ───────────────────────────────────────────────
+
+
+# ── offload-resume admission ───────────────────────────────────────────────
 
 
 # ── get_next_batch_info ────────────────────────────────────────────────────
