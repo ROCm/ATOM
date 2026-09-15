@@ -6597,7 +6597,19 @@ def test_the_state_leg_is_attached_to_the_requests_own_metadata(monkeypatch):
     s._state_load_seqs["r1"] = seq
 
     meta = LMCacheOffloadMetadata()
-    meta.add_request(LMCacheReqMeta(req_id="r1", token_ids=[], block_ids=[]))
+    # Carries a `load_spec`, as every state-carrying request does in production:
+    # even a STATE-ONLY load gets one (`_decide_load_after_alloc` returns True
+    # and writes `ls.hbm_cached_tokens`), because the state leg rides the KV
+    # leg's task. A request without one is save-only, and `start_load_kv`
+    # dispatches no load for it -- asserted below.
+    meta.add_request(
+        LMCacheReqMeta(
+            req_id="r1",
+            token_ids=[],
+            block_ids=[],
+            load_spec=SimpleNamespace(hbm_cached_tokens=512, lmcache_cached_tokens=512),
+        )
+    )
     monkeypatch.setattr(
         DenseOffloadScheduler, "build_connector_meta", lambda self: meta
     )
@@ -6609,6 +6621,30 @@ def test_the_state_leg_is_attached_to_the_requests_own_metadata(monkeypatch):
         destination_slot=4,
         chunk_tokens=256,
     )
+
+
+def test_a_save_only_request_never_carries_a_state_leg(monkeypatch):
+    """`start_load_kv` dispatches a load task only for `load_spec is not None`,
+    so a spec attached to a save-only request would never travel and its index
+    entry would never settle -- an unsettleable park. The scheduler has always
+    cleared `load_hash` first on that path, but relying on that made this loop's
+    correctness depend on a field a different owner writes."""
+    s = _k3_scheduler()
+    s._state_load_seqs["r1"] = SimpleNamespace(
+        id="r1",
+        state_slot=4,
+        offload_joint=OffloadJointRecord(load_hash=99, boundary_tokens=512),
+    )
+
+    meta = LMCacheOffloadMetadata()
+    meta.add_request(
+        LMCacheReqMeta(req_id="r1", token_ids=[], block_ids=[], load_spec=None)
+    )
+    monkeypatch.setattr(
+        DenseOffloadScheduler, "build_connector_meta", lambda self: meta
+    )
+
+    assert s.build_connector_meta().requests[0].state_load_spec is None
     # Drained: a second pass must not re-attach it to a later step's request.
     assert s._state_load_seqs == {}
 

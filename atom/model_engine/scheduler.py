@@ -3341,6 +3341,24 @@ class Scheduler:
         # miss may retract a hash, and it arrives on its own TP-quorumed channel.
         missed = getattr(self.kv_connector, "take_missed_state_hashes", None)
         missed = missed() if missed is not None else set()
+        # Retract on the hash directly, not by matching against THIS step's
+        # `failed_loading`. The worker writes the miss verdict inside
+        # `load_state` and only then calls `_finish_load`, which runs
+        # `_lookup_unpin` -- a real LMCache call, under a different lock --
+        # before recording the failure. `get_finished` drains in the opposite
+        # order (failures first, verdicts last), so a step tick landing in that
+        # window publishes the verdict on step N and the failure on step N+1.
+        # Step N found no matching failure and discarded the miss; step N+1 saw
+        # an empty `missed`. Since verdict_step <= failure_step always, the skew
+        # is one-directional and never self-corrects: `forget` never ran and the
+        # index kept advertising a hash whose bytes LMCache had dropped.
+        #
+        # A miss is evidence about the HASH; `forget` needs no request id. The
+        # `missing=` flag below stays, because `fail_load` uses it to decide
+        # whether the slot is reusable -- that one IS per-request.
+        if offload is not None:
+            for h in missed:
+                offload.forget(int(h))
         for req_id in kv_connector_output.failed_loading or ():
             if metrics := getattr(self, "metrics", None):
                 metrics.finish_kv_wait(req_id, succeeded=False)
