@@ -1658,6 +1658,13 @@ def sparse_attn_indexer(
                 weights=weights_prefill[chunk_start:chunk_end],
                 cu_starts=row_starts,
                 cu_ends=row_ends,
+                # The -inf prefill of this buffer has no reader. It exists so a
+                # position outside a row's window cannot win the top-k, but
+                # `top_k_per_row_prefill` below is handed the same row_starts /
+                # row_ends and offsets every access by rowStart, bounded by
+                # rowEnd - rowStart, so it never looks outside the window.
+                # 449 us per full-index layer at ISL=49152.
+                clean_logits=envs.ATOM_SPARSE_INDEXER_CLEAN_LOGITS,
             )
             top_k_per_row_prefill(
                 logits=logits,

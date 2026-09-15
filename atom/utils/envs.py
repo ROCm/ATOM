@@ -492,6 +492,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # scale spans every head -- so it is off by default and measured, not
     # assumed. Also shifts numerics by up to one bf16 step: the fused path
     # quantizes from the fp32 accumulator instead of a bf16 round trip.
+    # --- Sparse indexer: skip the -inf prefill of the logits buffer ---
+    # aiter's fp8_mqa_logits allocates [rows, kv_aligned] fp32 and, with
+    # clean_logits=True (its default), fills every element with -inf so that
+    # positions outside a row's [cu_start, cu_end) window cannot win the top-k.
+    # Nothing reads those positions: top_k_per_row_prefill takes the same
+    # rowStarts/rowEnds and offsets every access by rowStart, bounded by
+    # rowEnd - rowStart (topk_per_row_kernels.cu).
+    #
+    # Measured at ISL=49152 bs=1 TP4/DCP4: the fill is 9.1 ms of a 1.3 s
+    # prefill (0.70%), 40 launches, and skipping it leaves a 45k-token greedy
+    # generation bit-identical. Default OFF -- set to 1 to restore the fill.
+    "ATOM_SPARSE_INDEXER_CLEAN_LOGITS": lambda: (
+        os.getenv("ATOM_SPARSE_INDEXER_CLEAN_LOGITS", "0") == "1"
+    ),
     "ATOM_DCP_A2A_FUSED_QUANT": lambda: (
         os.getenv("ATOM_DCP_A2A_FUSED_QUANT", "0") == "1"
     ),

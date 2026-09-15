@@ -885,6 +885,12 @@ class MLAAttention(nn.Module):
         """Undo `_pad_sparse_prefill_query_heads` on an output or per-head LSE."""
         if x.shape[1] == num_heads:
             return x
+        # Keep the `.contiguous()`. Returning the strided view instead was
+        # measured and does not help: output stays bit-identical, but
+        # aten::copy_ over the prefill is unchanged (59,717 -> 59,793 us across
+        # 154 -> 152 launches). The copy is not removed, only moved -- the PBM
+        # leg's reshape/bmm materialises it instead. Removing it for real means
+        # teaching that bmm to take a strided input, which is an aiter change.
         return x[:, :num_heads, ...].contiguous()
 
     def _pad_decode_query_heads(self, q: torch.Tensor) -> torch.Tensor:
@@ -2085,7 +2091,9 @@ class MLAAttention(nn.Module):
 
                 zero_nonfinite_rows(o, final_lse)
             # These feed a cross-rank combine, not the bmm, so the head slice
-            # has to be materialised rather than left as a view.
+            # has to be materialised rather than left as a view. (Handing the
+            # view down instead was measured: same tokens, same copy cost --
+            # see `_restore_sparse_prefill_query_heads`.)
             return o.contiguous(), final_lse.contiguous()
 
         return self._v_up_proj_and_o_proj(o)
