@@ -149,6 +149,29 @@ class TestSlotOwnership:
         assert index.outstanding == 1
         index.check_invariant()
 
+    def test_the_reclaim_window_starts_at_orphan_time_not_dispatch_time(self):
+        """`reclaim` ages an entry from `at`. When `at` stayed at dispatch time
+        the guard window was `timeout_s` MINUS the load's in-flight age, so a
+        load already outstanding longer than `timeout_s` -- precisely the
+        hung-worker case reclamation exists for -- became eligible the instant
+        it was orphaned, and the next tick handed the slot out while the worker
+        was still scattering into it.
+        """
+        index = _index(1)
+        index.request_load("gone", 1, slot=6)
+        # Already far older than any window. The worker may still be writing.
+        index._outstanding["gone"].at -= 3600.0
+
+        index.orphan("gone")
+
+        assert index.reclaim(timeout_s=1.0) == 0, (
+            "an orphan is reclaimable one full window after it was ORPHANED, "
+            "however long it had already been in flight"
+        )
+        assert index.released == []
+        assert index.outstanding == 1
+        index.check_invariant()
+
     def test_reclaim_spares_an_orphan_still_inside_its_window(self):
         index = _index(1)
         index.request_load("gone", 1, slot=6)
