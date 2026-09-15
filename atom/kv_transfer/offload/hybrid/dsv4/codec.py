@@ -81,6 +81,26 @@ class DSV4CopyPlan:
     required_buffer_bytes: int
 
 
+@dataclass(frozen=True)
+class _PreparedBlockIdGroups:
+    """Caller-retained PAGE plans and one ID upload for a single pack stream."""
+
+    _codec: DSV4PageSlotCodec
+    _stream: torch.cuda.Stream
+    _plans: tuple[DSV4CopyPlan, ...]
+    _offsets: tuple[int, ...]
+    _device_ids: torch.Tensor | None
+    _region_plan: object | None
+
+    @property
+    def group_count(self) -> int:
+        return len(self._plans)
+
+    @property
+    def upload_count(self) -> int:
+        return int(self._device_ids is not None)
+
+
 class _NullCtx:
     def __enter__(self):
         return None
@@ -581,6 +601,139 @@ class DSV4PageSlotCodec:
     ) -> None:
         flattened = self._flatten_block_ids(block_id_groups)
         self.scatter(device_buf, self.page_plan(flattened), stream=stream)
+
+    def prepare_block_id_groups(
+        self,
+        group_block_ids: Sequence[Sequence[int] | Sequence[Sequence[int]]],
+        *,
+        device: torch.device | str,
+        stream: torch.cuda.Stream,
+    ) -> _PreparedBlockIdGroups:
+        """Validate all PAGE groups, then upload their IDs once before staging.
+
+        The caller must retain the returned owner through the pipeline fence,
+        including recovery, and use the same explicit stream for every launch.
+        The upload is blocking, so a preparation error cannot leave a live
+        metadata copy after this method unwinds. Repeated IDs in distinct
+        groups retain the ordinary per-group validation semantics.
+        """
+
+        plans = tuple(
+            self.page_plan(self._flatten_block_ids(group)) for group in group_block_ids
+        )
+        target = torch.device(device)
+        if target.type == "cuda" and target.index is None:
+            target = self.device
+        if self.device.type != "cuda" or not self._matches_device(target):
+            raise ValueError(
+                "prepared block IDs require the DSV4 codec CUDA/HIP device"
+            )
+        if stream is None or torch.device(stream.device) != target:
+            raise ValueError("prepared block IDs require an explicit matching stream")
+        triton_page_slot = self._triton_page_slot
+        if triton_page_slot is None:
+            raise RuntimeError("DSV4 PAGE/SLOT Triton staging is unavailable")
+
+        ids: list[int] = []
+        offsets = [0]
+        for plan in plans:
+            if plan.sections:
+                ids.extend(plan.sections[0].item_ids)
+            offsets.append(len(ids))
+        device_ids = None
+        region_plan = None
+        if ids:
+            with (
+                torch.cuda.device(self.device)
+                if self.device.index is not None
+                else _NullCtx()
+            ):
+                region_plan = self._region_plan(DSV4PayloadKind.PAGE, stream=stream)
+                with torch.cuda.stream(stream):
+                    device_ids = triton_page_slot._static_device_i64(ids, target)
+        return _PreparedBlockIdGroups(
+            self, stream, plans, tuple(offsets), device_ids, region_plan
+        )
+
+    def _copy_prepared_block_id_group(
+        self,
+        device_buf: torch.Tensor,
+        owner: _PreparedBlockIdGroups,
+        group_index: int,
+        *,
+        gather: bool,
+        stream: torch.cuda.Stream | None,
+    ) -> None:
+        if not isinstance(owner, _PreparedBlockIdGroups) or owner._codec is not self:
+            raise ValueError("prepared block IDs belong to a different codec")
+        if stream is not owner._stream:
+            raise ValueError("prepared block IDs must use their preparation stream")
+        if not self._matches_device(torch.device(stream.device)):
+            raise ValueError("stream device does not match the DSV4 codec device")
+        index = _integer("group_index", group_index)
+        if index >= owner.group_count:
+            raise ValueError("prepared block ID group_index is out of range")
+        plan = owner._plans[index]
+        sections = self._validate_plan(plan)
+        self._validate_buffer(device_buf, plan, name="dst" if gather else "src")
+        if not sections:
+            return
+        ids = owner._device_ids
+        if not isinstance(ids, torch.Tensor) or ids.dtype is not torch.int64:
+            raise TypeError("prepared block IDs must have dtype torch.int64")
+        if not self._matches_device(ids.device):
+            raise ValueError("prepared block IDs are on the wrong device")
+        if (
+            ids.ndim != 1
+            or not ids.is_contiguous()
+            or ids.numel() != owner._offsets[-1]
+        ):
+            raise ValueError("prepared block IDs have an invalid shape or layout")
+        _, item_ids, buffer_offset = sections[0]
+        with (
+            torch.cuda.device(self.device)
+            if self.device.index is not None
+            else _NullCtx()
+        ):
+            copy = (
+                self._triton_page_slot._gather_region_items_unchecked
+                if gather
+                else self._triton_page_slot._scatter_region_items_unchecked
+            )
+            copy(
+                owner._region_plan,
+                item_ids,
+                device_buf,
+                buffer_offset=buffer_offset,
+                stream=stream,
+                prepared_item_ids=ids[
+                    owner._offsets[index] : owner._offsets[index + 1]
+                ],
+            )
+
+    def gpu_to_chunk_major_device_buffer_prepared(
+        self,
+        device_buf: torch.Tensor,
+        owner: _PreparedBlockIdGroups,
+        group_index: int,
+        *,
+        stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        self._copy_prepared_block_id_group(
+            device_buf, owner, group_index, gather=True, stream=stream
+        )
+
+    def chunk_major_device_buffer_to_gpu_prepared(
+        self,
+        device_buf: torch.Tensor,
+        owner: _PreparedBlockIdGroups,
+        group_index: int,
+        *,
+        stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        self._copy_prepared_block_id_group(
+            device_buf, owner, group_index, gather=False, stream=stream
+        )
 
     def gather_slot(
         self,
