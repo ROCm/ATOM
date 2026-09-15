@@ -291,6 +291,12 @@ host_name="$(hostname)"
 
 apply_prefixed_env "ATOMESH_ENV_" "${host_ip}"
 
+# GPU timing is opt-in; agentic reports need it on both service roles.
+if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" ]]; then
+  export ATOMESH_PREFILL_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER="${ATOMESH_PREFILL_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER:-${ATOM_ENABLE_METRICS_DEVICE_TIMER:-1}}"
+  export ATOMESH_DECODE_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER="${ATOMESH_DECODE_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER:-${ATOM_ENABLE_METRICS_DEVICE_TIMER:-1}}"
+fi
+
 IFS=',' read -r -a IP_ARRAY <<< "${IPADDRS}"
 
 prefill_args=()
