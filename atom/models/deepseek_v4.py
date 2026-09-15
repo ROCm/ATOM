@@ -40,7 +40,7 @@ from aiter import silu_and_mul as aiter_silu_and_mul
 from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.batched_gemm_op_a8w8 import (
     batched_gemm_a8w8_mxscale,
     batched_gemm_a8w8_mxscale_bpreshuffle,
@@ -4381,7 +4381,7 @@ class DeepseekV4Model(nn.Module):
         self.norm_eps = args.norm_eps
         self.hc_eps = args.hc_eps
         self.hc_mult = args.hc_mult
-        self._mhc_arch = get_gfx()
+        self._mhc_arch = get_gfx_runtime()
         self.enable_res_preshuffle = hasattr(
             aiter, "mhc_res_shuffle_enabled"
         ) and aiter.mhc_res_shuffle_enabled(1, self._mhc_arch)
