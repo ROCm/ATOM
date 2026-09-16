@@ -20,8 +20,8 @@ import pytest
 from prometheus_client import REGISTRY, CollectorRegistry, Gauge, generate_latest
 from prometheus_client.parser import text_string_to_metric_families
 
-from atom.entrypoints.openai.metrics import AtomMetricsExporter, _gc_metrics
 from atom.entrypoints.openai.metrics_setup import create_metrics_exporter
+from atom.metrics.exporter import AtomMetricsExporter, _gc_metrics
 
 
 def _render() -> str:
@@ -142,7 +142,7 @@ def test_registration_never_reads_snapshots_or_live_process_metrics(monkeypatch)
     monkeypatch.setattr(gc, "get_stats", unexpected_read)
     monkeypatch.setattr(gc, "get_threshold", unexpected_read)
     monkeypatch.setattr(
-        "atom.entrypoints.openai.metrics.longest_silence_seconds", unexpected_read
+        "atom.entrypoints.openai.metrics_setup.longest_silence_seconds", unexpected_read
     )
     exporter, _, _ = create_metrics_exporter()
     with pytest.raises(ValueError, match="Duplicated timeseries"):
@@ -174,7 +174,6 @@ def test_components_do_not_pollute_default_registry_or_other_api_instances():
 
 
 def test_async_scrapes_keep_live_state_on_loop_and_do_not_cache_responses(monkeypatch):
-    exporter, requests, streams = create_metrics_exporter()
     owner = threading.get_ident()
     silence = 1.25
     render_threads = []
@@ -189,8 +188,9 @@ def test_async_scrapes_keep_live_state_on_loop_and_do_not_cache_responses(monkey
         return []
 
     monkeypatch.setattr(
-        "atom.entrypoints.openai.metrics.longest_silence_seconds", live_silence
+        "atom.entrypoints.openai.metrics_setup.longest_silence_seconds", live_silence
     )
+    exporter, requests, streams = create_metrics_exporter()
     exporter.registry.register(
         type("Probe", (), {"collect": lambda _: thread_probe(exporter.read()[0])})()
     )
@@ -339,7 +339,7 @@ def test_snapshot_copy_does_not_hold_publication_lock(monkeypatch, operation):
         assert resume.wait(5), "snapshot copy held the publication lock"
         return original(value)
 
-    monkeypatch.setattr("atom.entrypoints.openai.metrics.copy.deepcopy", blocked_copy)
+    monkeypatch.setattr("atom.metrics.exporter.copy.deepcopy", blocked_copy)
     with ThreadPoolExecutor(2) as pool:
         operation_future = pool.submit(
             exporter.read
@@ -353,7 +353,7 @@ def test_snapshot_copy_does_not_hold_publication_lock(monkeypatch, operation):
         finally:
             resume.set()
         result = operation_future.result(timeout=3)
-    monkeypatch.setattr("atom.entrypoints.openai.metrics.copy.deepcopy", original)
+    monkeypatch.setattr("atom.metrics.exporter.copy.deepcopy", original)
     if operation == "read":
         assert result == ({"revision": 1}, 0, exporter.read()[2])
     assert exporter.read()[1] == 1

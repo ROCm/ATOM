@@ -32,7 +32,7 @@ def _observe(rank):
 
 def _run_node():
     # This runs in a fresh interpreter, as a server launch does.
-    from atom.entrypoints.metrics import initialize_metrics, start_metrics_server
+    from atom.metrics.prometheus import initialize_metrics, start_metrics_server
 
     initialize_metrics()
     from prometheus_client import values
@@ -143,7 +143,7 @@ def test_request_context_survives_workers_and_repeated_metrics_scrapes(
 ):
     from prometheus_client.parser import text_string_to_metric_families
 
-    from atom.entrypoints.metrics import start_metrics_server
+    from atom.metrics.prometheus import start_metrics_server
 
     monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
     root = Path(__file__).resolve().parents[1]

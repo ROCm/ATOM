@@ -8,7 +8,7 @@ Usage:
 """
 
 if __name__ == "__main__":
-    from atom.entrypoints.metrics import initialize_metrics
+    from atom.metrics.prometheus import initialize_metrics
 
     initialize_metrics()
 

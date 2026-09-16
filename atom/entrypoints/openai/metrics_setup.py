@@ -4,15 +4,16 @@ import os
 
 from prometheus_client import multiprocess, values
 
-from .metrics import AtomMetricsExporter
-from .request_timing import RequestMetrics
-from .streaming_dispatch import StreamMetrics
+from atom.metrics.exporter import AtomMetricsExporter
+from atom.metrics.request import RequestMetrics, StreamMetrics
+
+from .streaming_dispatch import longest_silence_seconds
 
 
 def create_metrics_exporter() -> (
     tuple[AtomMetricsExporter, RequestMetrics, StreamMetrics]
 ):
-    exporter = AtomMetricsExporter()
+    exporter = AtomMetricsExporter(stream_silence=longest_silence_seconds)
     registry = exporter.registry
     if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
         if not values.ValueClass._multiprocess:

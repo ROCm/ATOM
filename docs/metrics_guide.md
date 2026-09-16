@@ -274,17 +274,21 @@ process supervisor to call `mark_process_dead(pid)` after that process exits.
 Validate device-derived values at the measurement boundary with diagnostic
 context, rather than silently discarding them in a generic histogram.
 
-The `atom.metrics` package contains scheduler and GPU instruments and shared
-histogram helpers. Schedulers and model runners own the instrument instances
-and trigger observations; entrypoints initialize storage and expose metrics.
+The `atom.metrics` package contains instruments, shared histogram helpers,
+Prometheus storage setup, and export infrastructure. Schedulers and model
+runners own their instrument instances and trigger observations. Entrypoints
+initialize storage before importing the Prometheus client and compose the API
+exporter. The API supplies the live stream-silence callback; the exporter reads
+it on the event loop before rendering in a worker thread.
 
 | Module | Responsibility |
 | --- | --- |
-| `entrypoints/metrics.py` | Node-local directory lifetime and worker-node HTTP endpoint. |
+| `metrics/prometheus.py` | Node-local directory lifetime and worker-node HTTP endpoint. |
 | `entrypoints/openai/metrics_setup.py` | Native collector and API instrument composition. |
-| `entrypoints/openai/metrics.py` | Existing state metrics, snapshot cache and async rendering. |
-| `entrypoints/openai/request_timing.py` | Request TTFT observations. |
-| `entrypoints/openai/streaming_dispatch.py` | Token-weighted ITL and stream silence. |
+| `metrics/exporter.py` | State and GC metrics, snapshot cache and async rendering. |
+| `metrics/request.py` | TTFT and token-weighted ITL instrument definitions and recording interfaces. |
+| `entrypoints/openai/request_timing.py` | Request lifecycle timing and generated-output detection. |
+| `entrypoints/openai/streaming_dispatch.py` | Streaming delivery, observation timing and live stream silence. |
 | `metrics/scheduler.py` | Scheduler observations using standard Histograms. |
 | `metrics/gpu.py` | Bounded device-event lifecycle and standard Histograms. |
 | `metrics/histogram.py` | Shared latency bounds and the weighted ITL extension. |

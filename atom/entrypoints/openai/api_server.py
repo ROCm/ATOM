@@ -13,7 +13,7 @@ Usage:
 """
 
 if __name__ == "__main__":
-    from atom.entrypoints.metrics import initialize_metrics
+    from atom.metrics.prometheus import initialize_metrics
 
     initialize_metrics()
 
@@ -2950,7 +2950,7 @@ def main():
         else engine_args.data_parallel_rank
     )
     if dp_rank > 0:
-        from atom.entrypoints.metrics import start_metrics_server
+        from atom.metrics.prometheus import start_metrics_server
 
         server, _ = start_metrics_server(args.host, args.server_port)
         try:

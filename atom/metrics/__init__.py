@@ -1,1 +1,1 @@
-"""Runtime metrics instruments and shared histogram helpers."""
+"""Metrics instruments, collection and export infrastructure."""

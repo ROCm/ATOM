@@ -14,6 +14,7 @@ from atom.entrypoints.openai.streaming_dispatch import (
     enable_delta_reuse,
     merge_chunk,
 )
+from atom.metrics.request import INTER_TOKEN_LATENCY_BUCKETS
 
 
 class _Utf8ByteTokenizer:
@@ -89,7 +90,7 @@ def test_weighted_itl_matches_histogram_buckets_and_handles_large_batches():
     reference = Histogram(
         "atom:inter_token_latency_seconds",
         "reference",
-        buckets=streaming_dispatch.INTER_TOKEN_LATENCY_BUCKETS,
+        buckets=INTER_TOKEN_LATENCY_BUCKETS,
         registry=registry,
     )
     for interval, tokens in ((0.0, 3), (0.008, 4), (0.09, 3), (32.0, 2)):

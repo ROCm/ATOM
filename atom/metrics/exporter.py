@@ -1,4 +1,4 @@
-"""Snapshot cache and explicit Prometheus registration for the OpenAI server.
+"""Snapshot cache, metric collection and Prometheus rendering.
 
 Legacy state metrics use engine snapshots. Event observations are exported by
 the native Prometheus client, using multiprocess storage in server launches.
@@ -11,15 +11,13 @@ import copy
 import gc
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from contextvars import ContextVar
 from typing import Any
 
 from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
-
-from .streaming_dispatch import longest_silence_seconds
 
 Snapshot = dict[str, Any]
 SnapshotState = tuple[Snapshot, int, float]
@@ -511,7 +509,8 @@ class AtomMetricsExporter:
 
     content_type = CONTENT_TYPE_LATEST
 
-    def __init__(self):
+    def __init__(self, *, stream_silence: Callable[[], float] | None = None):
+        self._stream_silence = stream_silence
         self._lock = threading.Lock()
         self._snapshot: Snapshot = {}
         self._refresh_errors = 0
@@ -547,7 +546,9 @@ class AtomMetricsExporter:
 
     def stream_silence(self) -> float:
         captured = self._render_silence.get()
-        return longest_silence_seconds() if captured is None else captured
+        if captured is not None:
+            return captured
+        return self._stream_silence() if self._stream_silence is not None else 0.0
 
     def render(self, *, stream_silence: float | None = None) -> bytes:
         silence_token = self._render_silence.set(stream_silence)
@@ -560,10 +561,10 @@ class AtomMetricsExporter:
         """Render on demand off the API loop, coalescing concurrent scrapes."""
         task = self._render_task
         if task is None or task.done():
-            # _WAITING_SINCE belongs to the SSE event loop. Read it before
-            # handing serialization to a thread; registry instruments have
-            # their own synchronization and are collected in that thread.
-            silence = longest_silence_seconds()
+            # Read the provider on its owning event loop before handing
+            # serialization to a thread; registry instruments have their own
+            # synchronization and are collected in that thread.
+            silence = self.stream_silence()
             task = asyncio.create_task(
                 asyncio.to_thread(self.render, stream_silence=silence),
                 name="metrics_render",
