@@ -287,12 +287,16 @@ jobs:
           # ATOM_MESH_BUILD=1 is the same hook the docker image uses: builds
           # the rust mesh crate and places libmesh.so under atom/mesh/target/
           # for package-data pickup (pyproject [tool.setuptools.package-data]).
+          # The checkout belongs to the runner's user and the container
+          # builds as root, so git refuses to read /workspace -- "detected
+          # dubious ownership" -- and the build backend's git introspection
+          # dies before a wheel is started. Mark it safe inside the container.
           docker exec \
             -e SETUPTOOLS_SCM_PRETEND_VERSION="${WHEEL_VERSION}" \
             -e ATOM_MESH_BUILD=1 \
             -w /workspace \
             "atom_build_${{ matrix.flavor }}" \
-            bash -c "python3 -m pip wheel . --no-deps -w dist && ls -lh dist/"
+            bash -c "git config --global --add safe.directory /workspace && python3 -m pip wheel . --no-deps -w dist && ls -lh dist/"
 
       - name: Validate wheel
         run: |
