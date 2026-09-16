@@ -156,13 +156,10 @@ def _configure_mooncake_transport(protocol: str) -> None:
 
 # ZMQ side-channel message types
 MSG_WRITE_REQUEST = b"write_request"
-# Layout-versioned variant. FP4 registers the DSv4 indexer as two PAGE
-# regions instead of one, so a producer that predates that layout would map
-# the plan onto the wrong regions. Tagging the request makes such a producer
-# reject it as an unknown message type rather than write mismatched bytes.
-MSG_WRITE_REQUEST_FP4 = b"write_request_fp4"
 MSG_WRITE_DONE = b"write_done"
 MSG_GET_META = b"get_meta"
+# Bootstrap metadata probe. One round trip per producer, cached after.
+_PEER_META_TIMEOUT_MS = 10_000
 # PP-prefill only: consumer tells stage-0 a request's KV is fully received from
 # every stage, so stage-0 may reuse the shared page table (see _record_release).
 MSG_RELEASE = b"release"
@@ -192,6 +189,9 @@ class MooncakeAgentMetadata(
     slot_base_addrs: list[int] | None = None
     slot_bps: list[int] | None = None
     num_slots: int = 0
+    # PAGE region roles. Absent from producers that predate the two-region
+    # FP4 indexer layout, which is what lets a consumer detect them.
+    block_region_roles: list[str | None] | None = None
 
 
 def _ip_for_ib_device(ib_device: str, fallback: str) -> str:
@@ -658,6 +658,9 @@ class MooncakeConnector(KVConnectorBase):
         self._per_block_bytes_list: list[int] = []
         self._block_region_roles: list[str | None] = []
         self._fp4_index_layout: bool = False
+        # Peer PAGE region roles, probed once per producer over MSG_GET_META.
+        self._peer_region_roles_cache: dict[tuple[str, int], list[str | None]] = {}
+        self._peer_region_roles_lock = threading.Lock()
         self.kv_cache_shape: tuple[int, ...] | None = None
         self.block_len: int = config.kv_cache_block_size
         self.num_blocks: int = 0
@@ -956,6 +959,7 @@ class MooncakeConnector(KVConnectorBase):
                 slot_base_addrs=[b for b, _ in self._slot_regions],
                 slot_bps=[bps for _, bps in self._slot_regions],
                 num_slots=tt.num_slots,
+                block_region_roles=self._block_region_roles,
             )
         else:
             self._local_metadata = MooncakeAgentMetadata(
@@ -964,6 +968,7 @@ class MooncakeConnector(KVConnectorBase):
                 kv_caches_base_addr=self.kv_caches_base_addr,
                 num_blocks=tt.num_blocks,
                 block_len=self.block_len,
+                block_region_roles=self._block_region_roles,
             )
 
         logger.info(
@@ -1158,6 +1163,36 @@ class MooncakeConnector(KVConnectorBase):
 
             write_request = msgpack.dumps(request_body)
 
+            if self._fp4_index_layout and not self._peer_can_map_fp4_regions(
+                meta, remote_tp_rank, remote_tp_size, remote_pp_size
+            ):
+                if consumer_staging_pool_idx >= 0:
+                    self._release_staging_slot(consumer_staging_pool_idx)
+                with self._completion_lock:
+                    self.failed_recving.add(req_id)
+                logger.error(
+                    "[CONSUMER] Refusing req %s: the producer at %s:%d does not "
+                    "advertise PAGE region roles, so it cannot map this engine's "
+                    "FP4 indexer data and scale regions",
+                    req_id,
+                    meta.remote_host,
+                    meta.remote_handshake_port,
+                )
+                continue
+
+            # Registered before the first send: a producer failure can be
+            # notified while this loop is still running, and the handler needs
+            # the slot and block records to already be there or it cannot
+            # reclaim them.
+            self._pending_recv.add(req_id)
+            # Only delta blocks need fencing; reused prefix blocks are coherent.
+            self._pending_recv_blocks[req_id] = list(dst_block_ids)
+            if meta.local_slot_index >= 0:
+                self._pending_recv_slots[req_id] = (
+                    meta.local_slot_index,
+                    consumer_staging_pool_idx,
+                )
+
             for stage in range(remote_pp_size):
                 remote_port = meta.remote_handshake_port + _port_offset(
                     meta.remote_dp_rank,
@@ -1178,12 +1213,7 @@ class MooncakeConnector(KVConnectorBase):
                             meta.transfer_id,
                             self.tp_size,
                         )
-                write_msg = (
-                    MSG_WRITE_REQUEST_FP4
-                    if self._fp4_index_layout
-                    else MSG_WRITE_REQUEST
-                )
-                self._send_on_socket(remote_addr, [write_msg, write_request])
+                self._send_on_socket(remote_addr, [MSG_WRITE_REQUEST, write_request])
                 logger.debug(
                     "[CONSUMER] write_request sent for req %s (transfer_id=%s) "
                     "to stage %d/%d at %s, off=%d, dst_block_ids=%s",
@@ -1196,18 +1226,60 @@ class MooncakeConnector(KVConnectorBase):
                     dst_block_ids[:10],
                 )
 
-            self._pending_recv.add(req_id)
-            # Only delta blocks need fencing; reused prefix blocks are coherent.
-            self._pending_recv_blocks[req_id] = list(dst_block_ids)
-            if meta.local_slot_index >= 0:
-                self._pending_recv_slots[req_id] = (
-                    meta.local_slot_index,
-                    consumer_staging_pool_idx,
-                )
-
     # -----------------------------------------------------------------
     # Staging pool management
     # -----------------------------------------------------------------
+
+    def _peer_can_map_fp4_regions(
+        self,
+        meta,
+        remote_tp_rank: int,
+        remote_tp_size: int,
+        remote_pp_size: int,
+    ) -> bool:
+        """Whether a producer advertises PAGE region roles, probed once per peer.
+
+        FP4 registers the DSv4 indexer as two regions (packed data and e8m0
+        scales) where FP8 registers one. A producer that predates that layout
+        does not send ``block_region_roles`` in its bootstrap metadata and has
+        no per-region role check, so it would map this engine's plan onto the
+        wrong regions and write mismatched bytes with nothing reporting it.
+        Probing the bootstrap channel every producer already serves lets the
+        consumer refuse before it creates any pending-receive state.
+        """
+        port = meta.remote_handshake_port + _port_offset(
+            meta.remote_dp_rank,
+            remote_tp_rank,
+            remote_tp_size,
+            0,
+            remote_pp_size,
+            meta.remote_dp_size,
+        )
+        key = (meta.remote_host, port)
+        with self._peer_region_roles_lock:
+            cached = self._peer_region_roles_cache.get(key)
+        if cached is not None:
+            return True
+        addr = make_zmq_path("tcp", meta.remote_host, port)
+        sock = self.zmq_context.socket(zmq.DEALER)
+        try:
+            sock.setsockopt(zmq.LINGER, 0)
+            sock.setsockopt(zmq.RCVTIMEO, _PEER_META_TIMEOUT_MS)
+            sock.connect(addr)
+            sock.send_multipart([MSG_GET_META])
+            roles = self._decoder.decode(sock.recv_multipart()[-1]).block_region_roles
+        except Exception as exc:  # noqa: BLE001 - any failure means "cannot confirm"
+            logger.error("Peer metadata probe to %s failed: %s", addr, exc)
+            return False
+        finally:
+            sock.close()
+        if roles is None:
+            return False
+        # Only a success is cached: a transient probe failure must not pin the
+        # peer as unusable for the rest of the process.
+        with self._peer_region_roles_lock:
+            self._peer_region_roles_cache[key] = roles
+        return True
 
     def _acquire_staging_slot(self) -> int:
         with self._staging_lock:
@@ -1299,7 +1371,7 @@ class MooncakeConnector(KVConnectorBase):
                     sock.send_multipart([identity, b"", encoded])
                     logger.debug("Sent metadata to peer")
 
-                elif msg_type in (MSG_WRITE_REQUEST, MSG_WRITE_REQUEST_FP4):
+                elif msg_type == MSG_WRITE_REQUEST:
                     request_data = msgpack.loads(parts[2])
                     logger.debug(
                         "[PRODUCER] Received write_request for req %s "

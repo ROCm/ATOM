@@ -548,6 +548,39 @@ def test_write_done_nonce_cleaned_up_on_completion():
     assert "r1" not in conn._pending_recv_nonce
 
 
+def test_bootstrap_metadata_omits_region_roles_for_older_producers():
+    """An older producer's metadata must decode with roles absent, not empty.
+
+    FP4 registers the DSv4 indexer as two PAGE regions where FP8 registers one.
+    The consumer refuses such a peer, so the two cases have to stay
+    distinguishable: `None` means "this producer cannot tell us", while `[]`
+    would read as "it told us, and it has no regions".
+    """
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    import msgspec
+
+    enc = msgspec.msgpack.Encoder()
+    dec = msgspec.msgpack.Decoder(mc.MooncakeAgentMetadata)
+
+    # A producer carrying the field round-trips it.
+    roles = ["dsv4.csa_indexer.fp4_data", "dsv4.csa_indexer.fp4_scale", None]
+    new = dec.decode(
+        enc.encode(
+            mc.MooncakeAgentMetadata(
+                engine_id="e", rpc_port=1, block_region_roles=roles
+            )
+        )
+    )
+    assert new.block_region_roles == roles
+
+    # A producer that predates the field omits it; omit_defaults keeps it off
+    # the wire, and the decoder must surface that as None.
+    old = dec.decode(enc.encode(mc.MooncakeAgentMetadata(engine_id="e", rpc_port=1)))
+    assert old.block_region_roles is None
+
+
 def test_failed_write_done_returns_the_staging_row_to_the_pool():
     """A rejected transfer must not leak the staging row it reserved.
 
