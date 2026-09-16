@@ -4,6 +4,7 @@
 import math
 
 import torch
+from aiter import rope_cached_positions_fwd_inplace
 from torch import nn
 
 from atom.model_ops.v4_kernels.inverse_rope import inverse_rope_inplace
@@ -43,16 +44,25 @@ class RotaryEmbedding(nn.Module):
             ).clamp(0, 1)
             frequencies = frequencies / factor * ramp + frequencies * (1 - ramp)
         angles = torch.outer(torch.arange(max_position), frequencies)
+        frequencies = torch.polar(torch.ones_like(angles), angles)
+        # The cached AITER API expects contiguous real caches. Keep FP32 YaRN
+        # frequencies, including for BF16 activations, as on the original path.
         self.register_buffer(
-            "frequencies",
-            torch.polar(torch.ones_like(angles), angles),
-            persistent=False,
+            "cos_cache", frequencies.real.contiguous(), persistent=False
         )
+        self.register_buffer(
+            "sin_cache", frequencies.imag.contiguous(), persistent=False
+        )
+
+    @property
+    def frequencies(self):
+        """Complex view for CPU/reference callers; GPU execution uses the caches."""
+        return torch.complex(self.cos_cache, self.sin_cache)
 
     def forward(self, x, positions, *, inverse=False):
         """Rotate the final RoPE dimensions in place, preserving the NoPE prefix."""
-        if inverse and x.is_cuda:
-            return self._inverse_cuda(x, positions)
+        if x.is_cuda:
+            return self._rotate_cuda(x, positions, inverse=inverse)
         freqs = self.frequencies[positions]
         dim = freqs.shape[-1] * 2
         tail = x[..., -dim:]
@@ -63,7 +73,7 @@ class RotaryEmbedding(nn.Module):
         tail.copy_(torch.view_as_real(pairs * freqs.view(shape)).flatten(-2))
         return x
 
-    def _inverse_cuda(self, x, positions):
+    def _rotate_cuda(self, x, positions, *, inverse):
         if x.numel() == 0:
             return x
         # Contiguous model outputs use a view. Copy back only for strided callers
@@ -73,13 +83,31 @@ class RotaryEmbedding(nn.Module):
         flat_positions = (
             positions.repeat(batch) if batch > 1 else positions.contiguous()
         )
-        inverse_rope_inplace(
-            values.view(batch * length, -1, x.shape[-1]),
-            self.frequencies.real[:, None, None, :],
-            self.frequencies.imag[:, None, None, :],
-            flat_positions,
-            self.frequencies.shape[-1] * 2,
-        )
+        # A length-one strided view is contiguous to PyTorch, but the cached
+        # RoPE ABI still requires a literal unit position stride.
+        if flat_positions.stride(0) != 1:
+            flat_positions = flat_positions.clone(memory_format=torch.contiguous_format)
+        cos = self.cos_cache[:, None, None, :]
+        sin = self.sin_cache[:, None, None, :]
+        dim = self.cos_cache.shape[-1] * 2
+        if inverse:
+            inverse_rope_inplace(
+                values.view(batch * length, -1, x.shape[-1]),
+                cos,
+                sin,
+                flat_positions,
+                dim,
+            )
+        else:
+            rope_cached_positions_fwd_inplace(
+                values[..., -dim:].view(1, batch * length, -1, dim),
+                cos,
+                sin,
+                flat_positions.to(torch.int64).view(1, -1),
+                1,  # GPT-J interleaved pairs, as in V4.
+                reuse_freqs_front_part=True,
+                nope_first=False,
+            )
         if values is not x:
             x.copy_(values)
         return x

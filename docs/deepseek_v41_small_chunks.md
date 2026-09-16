@@ -1,5 +1,11 @@
 # DeepSeek V4.1 small-chunk projections
 
+This report describes the historical padding workaround. The current output
+projection uses V4/AITER BF16 batched GEMM for 2..32 rows and native einsum
+otherwise, without padding to 128 rows. Production mHC uses AITER delayed-pre
+stages; only its test/reference coefficient helper retains padding. See the
+[current performance report](deepseek_v41_performance.md).
+
 On the tested gfx950/TP4 configuration, native wo_a BF16 and mHC FP32 GEMMs
 change reduction order with row count. Downstream quantization can amplify
 those differences. Original chunk63/checkpoint128 has mean NLL 0.637223 versus

@@ -16,8 +16,9 @@ V4 GPU inverse RoPE is integrated in `ce26bb149` at the user's explicit directio
 The existing V4 BF16 attention dispatch and kernels remain unchanged. Final
 normalization uses V4/AITER RMSNorm. Commit `ff95c8e4c` also reuses that kernel
 in index-key normalization after independent numerical and complete task
-regression. Compressor and KV normalization retain their eager definitions
-because their substitutions regressed on task quality.
+regression. Those P04 decisions are historical: text/draft normalization now
+uses the repository `layernorm.RMSNorm` directly. Current operator reuse and
+its separate validation scope are recorded in the [performance report](deepseek_v41_performance.md).
 
 ## Reproduction environment
 
@@ -179,11 +180,11 @@ output dtypes and split/unsplit reductions. E8M0 code 0 is 2**-127 and code
 FP32 zero/infinity. All 64 analytic cases pass. The decoder correction leaves
 28,571 real-checkpoint GEMMs (1,772,408,832 output elements) bitwise unchanged.
 
-Intermediate RMSNorm before quantized projections retains the published FP32
-reduction and affine order. A small `FusedRMSNorm` leaf owns the validated
-index-key reuse, including CPU/empty behavior and strided input
-adaptation; it has no TP initialization or communication-policy dependency.
-Model composition chooses the role, while `normalization.py` owns the math.
+At the time of these P04 measurements, intermediate RMSNorm retained the
+published FP32 reduction order and index-key normalization used a separate
+fused wrapper. That wrapper has since been removed; target, draft, compressor
+and index-key normalization directly use `atom.model_ops.layernorm.RMSNorm`.
+The historical task scores below do not validate this later substitution.
 
 An independent FP64 calibration found that current GEMM accumulation is often
 locally closer to exact arithmetic than the FP32-BLAS reference. Real inverse
@@ -261,7 +262,7 @@ regression. Engram staging views are snapshotted in paired diagnostics, and
 baseline NLL is checked by token hash/position; the older diagnostic that
 retained overwritten views is invalidated.
 
-| Candidate | Current decision / evidence |
+| Candidate | Historical P04 decision / evidence |
 |---|---|
 | V4 BF16 attention | Reused unchanged |
 | V4 inverse RoPE | Integrated; accepted FMA tradeoff; 4.14-7.06x warm operator speedup |

@@ -3,9 +3,9 @@
 
 The two models share this layer. Routing is `sqrtsoftplus` with a
 selection-only per-expert bias, renormalized top-k and a `routed_scaling_factor`;
-the experts are W4A8 group-32 MXFP4 with clamped SwiGLU and whole-expert
-ownership; and the routing weight lands on the activation before quantization,
-which `FusedMoE` spells `apply_router_weight_on_input`. `DeepseekV4Args`
+the experts use the inherited V4 quantization, clamped SwiGLU and whole-expert
+ownership. Activation format, routing-weight placement and kernel dispatch
+are owned by V4/FusedMoE. `DeepseekV4Args`
 reads all of it off the V4.1 config by its HF names, so V4's `MoE` constructs
 directly. vLLM's ROCm V4.1 reuses the V4 MoE the same way.
 

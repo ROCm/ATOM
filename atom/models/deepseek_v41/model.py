@@ -15,11 +15,10 @@ from atom.model_ops.deepseek_v41.mhc import (
     expand_residual,
 )
 from atom.model_ops.deepseek_v41.mhc_pre_delayed import pre_delayed
-from atom.model_ops.deepseek_v41.normalization import RMSNorm
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.engram_layer import EngramOp
-from atom.model_ops.layernorm import RMSNorm as FusedRMSNorm
+from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
 from atom.models.deepseek_v4 import DeepseekV4ForCausalLM, make_v4_quant_config
@@ -250,7 +249,7 @@ class DeepseekV41ForCausalLM(nn.Module):
         )
         # Final normalization feeds the FP32 logits projection, with no further
         # activation quantization. Reuse V4's fused RMSNorm at this boundary.
-        self.norm = FusedRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.head = LogitsHead(config.hidden_size, config.vocab_size)
         self.window_rope = RotaryEmbedding(
             config.qk_rope_head_dim, max_length, base=config.rope_theta

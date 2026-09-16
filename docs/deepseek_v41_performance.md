@@ -6,6 +6,74 @@ representation and execution policy have separate owners. Quality is compared
 with P05 commit `83c85207f71ff717378c2911851b20a84665fa3f`; this does not change
 the separately documented P04 differences from the mathematical reference.
 
+## Current V4 primitive reuse (2026-09-15)
+
+Target and draft now directly use `atom.model_ops.layernorm.RMSNorm` for
+attention/FFN inputs, Q/KV, index keys and compressor output. The separate
+`deepseek_v41/normalization.py` implementation is removed. The model's ordinary
+TP initialization also serves these layers; standalone tests supply the TP
+fixture rather than adding a separate production normalization class.
+
+Forward RoPE uses AITER's `rope_cached_positions_fwd_inplace`, as V4 does.
+The V4.1 adapter owns its batch/position interface, trailing rotary lanes and
+FP32 YaRN cache. It converts forward positions to the cached kernel's int64
+ABI and preserves unit stride even for length-one views. Inverse RoPE continues
+to use the original V4 kernel. The V4 fused Q/K normalization cannot be called
+verbatim: its weightless per-head Q normalization is absent from V4.1.
+
+The grouped output projection calls V4's AITER `batched_gemm_bf16` for 2..32
+rows, emitting token-major output for the following `wo_b`. Single-row native
+GEMM was already as fast in the isolated test and stays native. Larger batches
+use V4's native einsum path. The earlier 128-row output-projection padding is
+removed. Production delayed mHC keeps its existing AITER stages; the old FP32
+coefficient projection helper is only used by reference diagnostics.
+
+A gfx950 operator comparison against `c7a33d834` uses identical inputs, rows
+1/6/24/128, normalization widths 512/1280/5120 and TP4 wo_a geometry
+G=2, N=1024, K=4096. Timings are CUDA graph replays outside the profiler, in
+before/after/after/before order. RoPE timings include an identical input clone
+on both arms and use int64 positions; an int32 caller also pays a cast.
+
+| Operation | Before | After | Observed ratio |
+|---|---:|---:|---:|
+| RMSNorm, tested widths/rows | 18.4–37.9 us | 1.9–2.6 us | 8.2–18.4x |
+| Forward RoPE, tested rows | 10.9–12.9 us | 6.3–8.9 us | 1.4–1.7x |
+| wo_a, 6 rows | 17.69 us | 7.94 us | 2.23x |
+| wo_a, 24 rows | 17.78 us | 11.55 us | 1.54x |
+| wo_a, 1 / 128 rows | 7.21 / 12.68 us | 7.20 / 12.76 us | unchanged path |
+
+A separate operator trace, attributed via HIP launch correlation IDs, confirms
+8→1 normalization kernels, 4→1 rotation kernels, and 2→1 grouped GEMM kernels
+at 24 rows. These counts exclude input-clone memcpy events. This is not an
+end-to-end speedup claim. There were small BF16 rounding differences: maximum
+normalized RMS error was 1.60e-5 for normalization and 2.80e-5 for wo_a; forward
+RoPE was identical on these inputs. Historical eager-path quality scores do
+not transfer to the new intermediate normalization boundaries.
+
+168 targeted tests pass on GPU 3, including FP64/operator reference checks,
+quantization, chunked Full/Reuse/Reindex composition, speculative state,
+ragged positions and graph replay with changing int32/int64 positions. The
+reference composition test's wo_a initialization now follows the current FP8
+allocation / BF16 post-load conversion. It still substitutes an independently
+checked attention result, so it is not a full-model accuracy test.
+
+Evidence is under
+`/app/logs_claude/atom_dsv41_flash_impl_20260912/p10_dspark/`:
+`benchmark_v4_reuse220.py`, `v4_reuse220/{result.json,primitives.trace.json.gz,trace_summary.json}`,
+and `v4_reuse221_gpu3_tests.log`. The diagnostic runner accepts
+`--torch-profiler-dir` and uses ModelRunner's existing profiler lifecycle.
+Profiled measurements are kept separate from throughput comparisons.
+
+A first TP2 non-speculative runtime comparison on GPUs 0/1 uses the same three
+workloads, 32 finalized tokens/request, one warmup and one measured repeat.
+Baseline/current throughput was 11.31/11.05, 10.96/10.17 and 18.63/16.89 tok/s.
+This pair does **not** demonstrate an end-to-end speedup. It motivated widening
+the graph boundaries: Q/KV projections and output LoRA were still outside the
+captured stages. `trace221_current` and `trace222_baseline` contain separate
+16-token traces; their instrumented times are not the throughput comparison.
+`perf221_*` and `v4_reuse221_comparison.json` retain the unprofiled results.
+These TP2 measurements are neither TP4 DSpark acceptance nor task accuracy.
+
 ## Cache format and attention boundary
 
 | Region | Values | Scales | Bytes per row |
@@ -65,9 +133,9 @@ it is not an end-to-end speedup claim or a long-context bandwidth measurement.
 `models/deepseek_v41/moe.py` is V4's `MoE`, subclassed only to flatten the
 offline caller's batch dimension and to declare `bias_vl`. There is no second
 expert backend and no HF option selecting one: the two models' routed experts
-are the same layer, quantized the same way (W4A8 group-32 MXFP4, whole-expert
-ownership, routing weight applied to the activation before quantization), so
-`FusedMoE` owns routing, the GEMM schedule and the expert-parallel exchange.
+are the same layer. V4/FusedMoE owns the activation format, routing-weight
+placement, GEMM schedule and expert-parallel exchange; these are not redefined
+by V4.1. Actual gfx950 dispatch includes FP4-activation expert kernels.
 
 The earlier P09 experiments -- a custom routed GEMM, then an adapter over
 AITER's `fused_routing_from_topk` / `moe_gemm_a8w4` behind an

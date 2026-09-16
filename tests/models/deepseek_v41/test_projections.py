@@ -25,38 +25,44 @@ def test_cpu_projections_preserve_native_arithmetic():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-@pytest.mark.parametrize("batch,tokens", [(1, 2), (3, 1), (2, 31), (1, 63), (4, 16)])
-def test_small_rows_match_shared_prefix_of_native128(batch, tokens):
-    """Real TP4 shapes; unrelated later rows must not affect the prefix."""
+@pytest.mark.parametrize("batch,tokens", [(1, 1), (1, 2), (3, 1), (4, 6), (2, 16)])
+def test_small_rows_match_fp64_grouped_projection(batch, tokens):
+    """V4's small-row GEMM at actual TP4 shapes, including verify batches."""
     torch.manual_seed(314)
-    rows = batch * tokens
-    hidden = torch.randn(1, 128, 2, 4096, device="cuda", dtype=torch.bfloat16)
+    hidden = torch.randn(batch, tokens, 2, 4096, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(2, 1024, 4096, device="cuda", dtype=torch.bfloat16)
-    coefficients = torch.randn(128, 20480, device="cuda")
-    fn = torch.randn(24, 20480, device="cuda")
-    expected = torch.einsum("bsgd,grd->bsgr", hidden, weight)[:, :rows]
-    actual = grouped_output_projection(
-        hidden[:, :rows].view(batch, tokens, 2, 4096), weight
-    )
-    assert torch.equal(actual.flatten(0, 1), expected.flatten(0, 1))
-    expected_mix = F.linear(coefficients, fn)[:rows]
-    actual_mix = hc_projection(coefficients[:rows].view(batch, tokens, -1), fn)
-    assert torch.equal(actual_mix.flatten(0, 1), expected_mix)
+    expected = torch.einsum("bsgd,grd->bsgr", hidden.double(), weight.double())
+    actual = grouped_output_projection(hidden, weight)
+    assert actual.is_contiguous()
+    assert actual.shape == expected.shape
+    assert actual.dtype == hidden.dtype
+    # FP32 dot accumulation followed by one BF16 rounding; cancellation needs
+    # an absolute allowance as well as the one-ULP relative bound.
+    torch.testing.assert_close(actual, expected.bfloat16(), rtol=1 / 128, atol=2**-9)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-@pytest.mark.parametrize("rows", [1, 65, 127, 128, 189])
-def test_other_rows_preserve_native_projection(rows):
+@pytest.mark.parametrize("rows", [33, 63, 64, 65, 127, 128, 189])
+def test_larger_rows_preserve_native_projection(rows):
     torch.manual_seed(27)
     hidden = torch.randn(1, rows, 2, 4096, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(2, 1024, 4096, device="cuda", dtype=torch.bfloat16)
-    coefficients = torch.randn(1, rows, 20480, device="cuda")
-    fn = torch.randn(24, 20480, device="cuda")
     assert torch.equal(
         grouped_output_projection(hidden, weight),
         torch.einsum("bsgd,grd->bsgr", hidden, weight),
     )
-    assert torch.equal(hc_projection(coefficients, fn), F.linear(coefficients, fn))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("rows", [1, 2, 24, 64, 65])
+def test_reference_hc_projection_preserves_row_policy(rows):
+    coefficients = torch.randn(128, 20480, device="cuda")
+    fn = torch.randn(24, 20480, device="cuda")
+    expected = F.linear(coefficients if 1 < rows <= 64 else coefficients[:rows], fn)[
+        :rows
+    ]
+    actual = hc_projection(coefficients[:rows], fn)
+    assert torch.equal(actual, expected)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")

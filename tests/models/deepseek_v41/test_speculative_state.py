@@ -46,7 +46,7 @@ def write_window(cache, layer, step, rows):
 @pytest.mark.parametrize("position", [127, 128, 265])
 @pytest.mark.parametrize("accepted", range(1, 7))
 def test_every_prefix_survives_ring_wrap_and_ragged_request_order(
-    device, packed, position, accepted
+    single_rank, device, packed, position, accepted
 ):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("ROCm GPU required")
@@ -75,6 +75,9 @@ def test_every_prefix_survives_ring_wrap_and_ragged_request_order(
     cache.prepare_state(step)
     torch.manual_seed(733)
     compressor = Compressor(32, 128, 2, 1e-20).to(device)
+    # This test consumes only compressor tails, before normalization. Keep
+    # that state contract CPU-testable; the shared norm has separate GPU tests.
+    compressor.norm = torch.nn.Identity()
     compressor.process_weights_after_loading()
     expected_tails, expected_histories = [], []
     accepted_lengths = (accepted, min(accepted, 3))

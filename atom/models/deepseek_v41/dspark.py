@@ -10,10 +10,10 @@ from torch import nn
 from atom.model_ops.blockscale import quantize_fp8
 from atom.model_ops.deepseek_v41.dspark import draft_attention, draft_step, rotate_rows
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
-from atom.model_ops.deepseek_v41.normalization import RMSNorm
 from atom.model_ops.deepseek_v41.projections import grouped_output_projection
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 from atom.model_ops.embed_head import VocabParallelEmbedding
+from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
 from atom.models.deepseek_v4 import make_v4_quant_config

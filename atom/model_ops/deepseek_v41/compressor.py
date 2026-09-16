@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from atom.model_ops.deepseek_v41.normalization import RMSNorm
+from atom.model_ops.layernorm import RMSNorm
 
 
 @dataclass(frozen=True)

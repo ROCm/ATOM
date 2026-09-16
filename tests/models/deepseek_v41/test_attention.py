@@ -125,7 +125,12 @@ def test_full_reuse_reindex_attention_prefill_and_decode(
                 else:
                     value = (torch.randn(parameter.shape) * 0.1).to(parameter.dtype)
                 parameter.data.copy_(value)
-                source_params[source_name].data.copy_(value)
+                if not name.startswith("wo_a."):
+                    source_params[source_name].data.copy_(value)
+            # The model now allocates the checkpoint FP8 wo_a and dequantizes
+            # it after loading; the official module stores that weight as BF16.
+            target.process_weights_after_loading()
+            source.wo_a.weight.data.copy_(target.wo_a.weight)
             if target.compressor is not None:
                 target.compressor.process_weights_after_loading()
         window_rope = RotaryEmbedding(32, 32, base=args.rope_theta).cuda()

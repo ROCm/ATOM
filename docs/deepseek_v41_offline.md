@@ -60,10 +60,10 @@ it contains no attention computation.
 
 Weights retain native FP8 32x32 or FP4 1x32 storage. The correctness GEMM converts
 register tiles for BF16 MFMA and keeps scaled block sums in FP64 until output
-conversion, retaining FP8 activation quantization. V4.1 RMSNorm uses the
-published FP32 evaluation order at the intermediate quantization boundaries.
-Index-key normalization uses a small V4/AITER leaf after complete task
-regression; final normalization also uses V4/AITER. Routed experts use
+conversion, retaining FP8 activation quantization. Text/draft RMSNorm now directly uses the repository
+`atom.model_ops.layernorm.RMSNorm` at every normalization boundary. The
+V4.1-specific normalization wrapper has been removed. Its CPU oracle tests
+remain test code; production layers require the usual model-parallel setup. Routed experts use
 whole-expert partitioning; the shared expert uses TP with FP32
 partials and rounds after reduction. The eager dispatch still synchronizes
 expert counts to the CPU. The ModelRunner path adds optional packed caches and

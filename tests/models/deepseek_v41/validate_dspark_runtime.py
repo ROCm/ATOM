@@ -11,8 +11,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 import torch
-from atom.models.deepseek_v41.config import validate_runtime_config
-from tests.attentions.deepseek_v41.benchmark_runtime import run_case
 from transformers import AutoTokenizer
 
 from atom.config import (
@@ -23,6 +21,8 @@ from atom.config import (
     SpeculativeConfig,
 )
 from atom.model_engine.model_runner import ModelRunner
+from atom.models.deepseek_v41.config import validate_runtime_config
+from tests.attentions.deepseek_v41.benchmark_runtime import run_case
 
 
 def diagnostic_config(config):
@@ -57,6 +57,11 @@ def main():
         help="Match the frozen lm_eval scheduler and pool capacities",
     )
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument(
+        "--torch-profiler-dir",
+        type=str,
+        help="ModelRunner trace; exclude profiled runs from throughput comparisons",
+    )
     parser.add_argument("--collect-confidence", action="store_true")
     parser.add_argument("--prefill-trace", action="store_true")
     parser.add_argument("--repeats", type=int, default=1)
@@ -150,6 +155,7 @@ def main():
                 ragged=bool(args.calibration_profile),
                 calibration_profile=args.calibration_profile,
             ),
+            torch_profiler_dir=args.torch_profiler_dir,
             kv_cache_dtype=args.cache_dtype,
             index_cache_dtype=args.cache_dtype,
             max_num_batched_tokens=512 if args.quality_config else 256,
@@ -165,6 +171,7 @@ def main():
         "completed": False,
         "baseline": args.baseline,
         "graph": args.graph,
+        "torch_profiler_dir": args.torch_profiler_dir,
         "tp": size,
         "runtime_guard_bypassed_for_diagnostic": not args.baseline
         and not args.production,
@@ -275,6 +282,8 @@ def main():
             raise ValueError("Persistent shadow supports one case and one repetition")
         report["state_bytes"] = runner.attn_metadata_builder.geometry.state_bytes
         report["physical_window"] = runner.attn_metadata_builder.geometry.ring_slots
+        if args.torch_profiler_dir:
+            runner.start_profiler("v41_runtime")
         for case_id, inputs in enumerate(prompts):
             if case_id not in selected_cases:
                 continue
@@ -318,10 +327,14 @@ def main():
                 if rank == 0:
                     print(json.dumps(row), flush=True)
                     args.output.write_text(json.dumps(report, indent=2) + "\n")
+        if args.torch_profiler_dir:
+            report["torch_profiler_traces"] = runner.stop_profiler()
         report["completed"] = True
         if rank == 0:
             args.output.write_text(json.dumps(report, indent=2) + "\n")
     finally:
+        if args.torch_profiler_dir and runner.profiler is not None:
+            runner.stop_profiler()
         runner.exit()
 
 

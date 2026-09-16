@@ -4,6 +4,8 @@
 import torch
 from aiter import QuantType
 from aiter.dist.parallel_state import get_tp_group
+from torch import nn
+
 from atom.model_ops.attentions.deepseek_v41.packed_attention import (
     packed_decode,
     packed_prefill,
@@ -15,10 +17,8 @@ from atom.model_ops.blockscale import (
 )
 from atom.model_ops.deepseek_v41.compressor import Compressor, CompressorTail
 from atom.model_ops.deepseek_v41.indexer import select_indices
-from atom.model_ops.deepseek_v41.normalization import FusedRMSNorm, RMSNorm
 from atom.model_ops.deepseek_v41.projections import grouped_output_projection
-from torch import nn
-
+from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -57,7 +57,7 @@ class Indexer(nn.Module):
             self.wk = nn.Linear(
                 config.head_dim, self.head_dim, bias=False, dtype=torch.bfloat16
             )
-            self.k_norm = FusedRMSNorm(self.head_dim, config.rms_norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
 
     def project_keys(self, latent, rope, positions, *, packed=False):
         key = self.k_norm(self.wk(latent))

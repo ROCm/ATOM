@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""V4 inverse-RoPE integration: positions, batch layout and rounding boundary."""
+"""V4 cached/inverse RoPE: positions, batch layout and rounding boundaries."""
 
 import pytest
 import torch
@@ -9,6 +9,7 @@ from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("yarn", [False, True])
+@pytest.mark.parametrize("inverse", [False, True])
 @pytest.mark.parametrize(
     "batch,length,heads,head_dim,strided",
     [
@@ -22,8 +23,8 @@ from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
         (1, 257, 16, 512, False),
     ],
 )
-def test_inverse_rotation_batch_positions_and_aliasing(
-    yarn, batch, length, heads, head_dim, strided
+def test_rotation_batch_positions_and_aliasing(
+    inverse, yarn, batch, length, heads, head_dim, strided
 ):
     torch.manual_seed(433)
     rope = RotaryEmbedding(
@@ -50,11 +51,12 @@ def test_inverse_rotation_batch_positions_and_aliasing(
     shape = [1, length] + [1] * (hidden.ndim - 3) + [32]
     cos, sin = freqs.real.double().view(shape), freqs.imag.double().view(shape)
     a, b = before[..., -64:].double().unflatten(-1, (32, 2)).unbind(-1)
-    expected = torch.stack((a * cos + b * sin, b * cos - a * sin), -1)
+    sign = -1 if inverse else 1
+    expected = torch.stack((a * cos - sign * b * sin, b * cos + sign * a * sin), -1)
     expected = expected.flatten(-2).to(hidden.dtype)
 
     with torch.inference_mode():
-        result = rope(hidden, positions, inverse=True)
+        result = rope(hidden, positions, inverse=inverse)
     assert result is hidden
     assert torch.equal(result[..., :-64], before[..., :-64])
     if strided:
@@ -74,3 +76,28 @@ def test_inverse_preserves_v4_fma_rounding_at_bf16_midpoint():
     # With these FP32 frequencies, a*cos+b*sin is 3.725e-9 below the
     # BF16 midpoint. V4 FMA rounds down; eager complex multiplication rounds up.
     assert actual[0, 5, 13, 464].item() == 0.0228271484375
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("inverse", [False, True])
+@pytest.mark.parametrize("position_dtype", [torch.int32, torch.int64])
+def test_graph_replay_reads_updated_rope_positions(inverse, position_dtype):
+    rope = RotaryEmbedding(64, 256, base=10000).cuda()
+    x = torch.randn(1, 6, 16, 512, device="cuda", dtype=torch.bfloat16)
+    positions = torch.arange(6, device="cuda", dtype=position_dtype)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            rope(x, positions, inverse=inverse)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = rope(x, positions, inverse=inverse)
+    for offset in (17, 103):
+        positions.copy_(torch.arange(offset, offset + 6, device="cuda"))
+        x.normal_()
+        expected = rope(x.clone(), positions, inverse=inverse)
+        graph.replay()
+        assert result is x
+        assert torch.equal(result, expected)
