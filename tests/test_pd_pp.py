@@ -587,6 +587,7 @@ def test_fp4_capability_cache_is_rebound_when_the_producer_restarts():
 
     conn = _make_connector(
         _peer_region_roles_cache={},
+        _peer_probe_backoff={},
         _peer_region_roles_lock=threading.Lock(),
         _decoder=msgspec.msgpack.Decoder(mc.MooncakeAgentMetadata),
         zmq_context=SimpleNamespace(socket=lambda *_a, **_k: _Sock()),
@@ -613,6 +614,66 @@ def test_fp4_capability_cache_is_rebound_when_the_producer_restarts():
     assert conn._peer_can_map_fp4_regions(meta_for(None), 0, 1, 1)
     assert conn._peer_can_map_fp4_regions(meta_for(None), 0, 1, 1)
     assert len(probes) == 4
+
+
+def test_fp4_probe_backs_off_instead_of_paying_the_timeout_every_request():
+    """A peer that cannot be probed must not cost a timeout per request.
+
+    The probe runs on the engine loop, so an unreachable or not-yet-started
+    producer would otherwise burn the receive timeout for every pending
+    request on every step. Failures are deferred with a doubling delay.
+    """
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    import msgspec
+
+    attempts = []
+
+    class _DeadSock:
+        def setsockopt(self, *a):
+            pass
+
+        def connect(self, addr):
+            attempts.append(addr)
+
+        def send_multipart(self, parts):
+            pass
+
+        def recv_multipart(self):
+            raise TimeoutError("no route to peer")
+
+        def close(self):
+            pass
+
+    conn = _make_connector(
+        _peer_region_roles_cache={},
+        _peer_probe_backoff={},
+        _peer_region_roles_lock=threading.Lock(),
+        _decoder=msgspec.msgpack.Decoder(mc.MooncakeAgentMetadata),
+        zmq_context=SimpleNamespace(socket=lambda *_a, **_k: _DeadSock()),
+    )
+    meta = SimpleNamespace(
+        remote_engine_id="10.0.0.9:5001",
+        remote_host="10.0.0.9",
+        remote_handshake_port=6301,
+        remote_dp_rank=0,
+        remote_dp_size=1,
+    )
+
+    assert not conn._peer_can_map_fp4_regions(meta, 0, 1, 1)
+    assert len(attempts) == 1
+    # Still inside the backoff window: refused without touching the socket.
+    for _ in range(5):
+        assert not conn._peer_can_map_fp4_regions(meta, 0, 1, 1)
+    assert len(attempts) == 1, "a deferred peer must not be probed again yet"
+
+    # The delay doubles, so a peer that stays down is probed ever less often.
+    _deadline, delay = next(iter(conn._peer_probe_backoff.values()))
+    assert delay == mc._PEER_PROBE_BACKOFF_MIN_S
+    conn._defer_peer_probe(next(iter(conn._peer_probe_backoff)), 0.0)
+    _deadline, doubled = next(iter(conn._peer_probe_backoff.values()))
+    assert doubled == delay * 2
 
 
 def test_bootstrap_metadata_omits_region_roles_for_older_producers():

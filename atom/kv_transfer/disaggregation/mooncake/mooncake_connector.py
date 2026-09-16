@@ -158,8 +158,12 @@ def _configure_mooncake_transport(protocol: str) -> None:
 MSG_WRITE_REQUEST = b"write_request"
 MSG_WRITE_DONE = b"write_done"
 MSG_GET_META = b"get_meta"
-# Bootstrap metadata probe. One round trip per producer, cached after.
-_PEER_META_TIMEOUT_MS = 10_000
+# Bootstrap metadata probe. One round trip per producer, cached after. A live
+# peer answers in well under a millisecond, so the timeout only bounds what a
+# dead one costs; repeated failures then back off.
+_PEER_META_TIMEOUT_MS = 2_000
+_PEER_PROBE_BACKOFF_MIN_S = 1.0
+_PEER_PROBE_BACKOFF_MAX_S = 30.0
 # PP-prefill only: consumer tells stage-0 a request's KV is fully received from
 # every stage, so stage-0 may reuse the shared page table (see _record_release).
 MSG_RELEASE = b"release"
@@ -660,6 +664,10 @@ class MooncakeConnector(KVConnectorBase):
         self._fp4_index_layout: bool = False
         # Peer PAGE region roles, probed once per producer over MSG_GET_META.
         self._peer_region_roles_cache: dict[tuple[str, str, int], list[str | None]] = {}
+        # key -> (retry-after monotonic deadline, current delay)
+        self._peer_probe_backoff: dict[
+            tuple[str | None, str, int], tuple[float, float]
+        ] = {}
         self._peer_region_roles_lock = threading.Lock()
         self.kv_cache_shape: tuple[int, ...] | None = None
         self.block_len: int = config.kv_cache_block_size
@@ -1169,6 +1177,12 @@ class MooncakeConnector(KVConnectorBase):
                 if consumer_staging_pool_idx >= 0:
                     self._release_staging_slot(consumer_staging_pool_idx)
                 with self._completion_lock:
+                    # The completion records were written before the probe ran;
+                    # drop them here or a later notification, or a reuse of the
+                    # id, would find state for a request that never started.
+                    self._pending_recv_expected.pop(req_id, None)
+                    self._pending_recv_stages.pop(req_id, None)
+                    self._pending_recv_nonce.pop(req_id, None)
                     self.failed_recving.add(req_id)
                 logger.error(
                     "[CONSUMER] Refusing req %s: the producer at %s:%d does not "
@@ -1262,11 +1276,15 @@ class MooncakeConnector(KVConnectorBase):
         # Without an engine id there is no generation to bind to, so the
         # result is not cached at all and every request re-probes.
         engine_id = getattr(meta, "remote_engine_id", None)
-        key = (engine_id, meta.remote_host, port) if engine_id else None
-        if key is not None:
-            with self._peer_region_roles_lock:
-                if key in self._peer_region_roles_cache:
-                    return True
+        bkey = (engine_id, meta.remote_host, port)
+        key = bkey if engine_id else None
+        now = time.monotonic()
+        with self._peer_region_roles_lock:
+            if key is not None and key in self._peer_region_roles_cache:
+                return True
+            deferred = self._peer_probe_backoff.get(bkey)
+            if deferred is not None and now < deferred[0]:
+                return False
         addr = make_zmq_path("tcp", meta.remote_host, port)
         sock = self.zmq_context.socket(zmq.DEALER)
         try:
@@ -1277,17 +1295,39 @@ class MooncakeConnector(KVConnectorBase):
             roles = self._decoder.decode(sock.recv_multipart()[-1]).block_region_roles
         except Exception as exc:  # noqa: BLE001 - any failure means "cannot confirm"
             logger.error("Peer metadata probe to %s failed: %s", addr, exc)
+            self._defer_peer_probe(bkey, now)
             return False
         finally:
             sock.close()
         if roles is None:
+            # A definite verdict, but the peer may yet be restarted into a
+            # build that does advertise roles, so it re-probes on the same
+            # schedule rather than never or on every request.
+            self._defer_peer_probe(bkey, now)
             return False
         # Only a success is cached: a transient probe failure must not pin the
         # peer as unusable for the rest of the process.
-        if key is not None:
-            with self._peer_region_roles_lock:
+        with self._peer_region_roles_lock:
+            self._peer_probe_backoff.pop(bkey, None)
+            if key is not None:
                 self._peer_region_roles_cache[key] = roles
         return True
+
+    def _defer_peer_probe(self, bkey: tuple, now: float) -> None:
+        """Hold off the next probe of an unusable peer, doubling each time.
+
+        Without this a producer that is down, or simply not up yet, costs one
+        receive timeout per pending request on every engine step, stalling the
+        serving worker far longer than the transfer it is guarding.
+        """
+        with self._peer_region_roles_lock:
+            previous = self._peer_probe_backoff.get(bkey)
+            delay = (
+                min(previous[1] * 2, _PEER_PROBE_BACKOFF_MAX_S)
+                if previous
+                else _PEER_PROBE_BACKOFF_MIN_S
+            )
+            self._peer_probe_backoff[bkey] = (now + delay, delay)
 
     def _acquire_staging_slot(self) -> int:
         with self._staging_lock:
@@ -2429,4 +2469,3 @@ class MooncakeConnector(KVConnectorBase):
         # PP-prefill: signal stage-0 it may now reuse the shared page table.
         self._send_release(req_id)
         return True
-                      
