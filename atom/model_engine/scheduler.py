@@ -2312,19 +2312,17 @@ class Scheduler:
         """The running-plus-queued cap for state-tier stores.
 
         Read off the connector's public `max_pending_saves` -- the canonical
-        `_offload_common.max_pending_saves` value it computed from
-        `kv_connector_extra_config` and `OFFLOAD_COPY_WORKERS`, the exact bound
-        the KV leg's `_may_emit_save` enforces. Sharing that number rather than
-        re-reading the bare `OFFLOAD_MAX_PENDING_SAVES` default of 2 keeps the
-        two legs from pinning different amounts of the same pool, and honours a
-        per-connector `"max_pending_saves"` override the env reader never sees.
-        Falls back to the env reader for a connector (or test double) that never
-        bounded its save queue (`max_pending_saves` is None, as on dense) and,
-        under `kv_connector: multi`, reaches the bound through the state-tier sub
-        -- `MultiConnectorScheduler` bounds nothing of its own, so without the
-        sub probe the composite silently caps the state leg at the env default of
-        2 while the KV leg keeps the sub's real bound. The public accessor means
-        neither read reaches through the delegating shell's `_impl` any more.
+        `_offload_common.max_pending_saves` value it computed from the
+        process-wide `OFFLOAD_MAX_PENDING_SAVES` setting and
+        `OFFLOAD_COPY_WORKERS`, and the exact bound the KV leg's
+        `_may_emit_save` enforces. Falls back to the env reader for a connector
+        (or test double) that never bounded its save queue (`max_pending_saves`
+        is None, as on dense) and, under `kv_connector: multi`, reaches the
+        bound through the state-tier sub -- `MultiConnectorScheduler` bounds
+        nothing of its own, so without the sub probe the composite can silently
+        use a different default from the state-tier implementation. The public
+        accessor means neither read reaches through the delegating shell's
+        `_impl` any more.
         """
         conn = self.kv_connector
         cap = getattr(conn, "max_pending_saves", None)

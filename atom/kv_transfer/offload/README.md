@@ -897,8 +897,9 @@ still falls back safely to per-group ID preparation and blocking host copies.
 `"lmcache.<field>": value` extra. The actual connector extra
 `"slot_sidecar_staging_slots": N` overrides `OFFLOAD_SLOT_STAGING_SLOTS`, and
 `"committed_sidecar_index_capacity": N` overrides
-`OFFLOAD_COMMITTED_SIDECAR_CAPACITY`. `"max_pending_saves": N` overrides
-`OFFLOAD_MAX_PENDING_SAVES`. All apply only to that connector.
+`OFFLOAD_COMMITTED_SIDECAR_CAPACITY`. These apply only to that connector.
+`max_pending_saves` is intentionally process-wide and is configured only with
+`OFFLOAD_MAX_PENDING_SAVES`, so the scheduler and every worker use one bound.
 
 AOS1 follows the engine's location policy exactly. Submission passes
 `store_location` to `StorageManager.batched_put`; discovery searches only
