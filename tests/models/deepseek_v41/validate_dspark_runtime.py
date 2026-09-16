@@ -200,6 +200,16 @@ def main():
         if args.graph:
             runner.capture_cudagraph()
             report["target_graph_tokens"] = sorted(runner._piecewise_captured_tokens)
+            # Stages-per-layer, which is the number a capture built on the wrong
+            # step kind gets wrong: `decode_ffn` is only offered to the
+            # execution policy on a decode step, and a speculative bucket is
+            # only a decode step because the capture asks for one.
+            dense = runner.model.dense_graphs
+            report["dense_graphs_per_layer"] = (
+                0
+                if dense is None
+                else len(dense.entries) / config.hf_config.num_hidden_layers
+            )
             report["draft_graph_sizes"] = (
                 [] if args.baseline else sorted(runner.drafter.block._cuda_graphs)
             )

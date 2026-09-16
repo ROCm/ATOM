@@ -1,18 +1,23 @@
 # SPDX-License-Identifier: MIT
 """PAGE-backed global keys and complete, relocatable CSA2 request state."""
 
+import numpy as np
 import torch
 import torch.nn.functional as F
-
 from atom.model_ops.attentions.deepseek_v41.packed_rows import (
     gather_index_rows,
     gather_prefix_rows,
     pack_rows,
     write_packed_window,
 )
+from atom.model_ops.attentions.pool_layout.v41_pool_geometry import MAIN_FP4
+from atom.model_ops.blockscale import quantize_fp4
+from atom.model_ops.deepseek_v41.compressor import compress_batch
+
 from atom.model_ops.attentions.pool_layout.entry_arena import EntryMajorArena
-from atom.model_ops.deepseek_v41.compressor import CompressorTail
+from atom.model_ops.v4_kernels import make_compress_plans
 from atom.model_ops.v4_kernels.state_writes import swa_write
+from atom.utils import CpuGpuBuffer
 
 from .indices import build_indices
 from .metadata import prepare_batch_step
@@ -46,33 +51,6 @@ class RequestCache:
     def __init__(self, cache, span, blocks):
         self.cache, self.span, self.blocks = cache, span, blocks
         self.packed = cache.geometry.packed
-
-    def read_tail(self, owner, position):
-        if position % 2 == 0 or owner not in self.cache.tail_indices:
-            return None
-        index = self.cache.tail_indices[owner]
-        slot = self.span.slot
-        return CompressorTail(
-            self.cache.state.view("tail_values")[index, slot].unsqueeze(0),
-            self.cache.state.view("tail_scores")[index, slot].unsqueeze(0),
-        )
-
-    def write_tail(self, owner, tail, *, rows=None):
-        if owner not in self.cache.tail_indices:
-            return
-        if self.cache.pending is not None:
-            self.cache.pending.stage_tail(owner, self.span, rows)
-            return
-        index = self.cache.tail_indices[owner]
-        for name, value in (
-            ("tail_values", None if tail is None else tail.values),
-            ("tail_scores", None if tail is None else tail.scores),
-        ):
-            dst = self.cache.state.view(name)[index, self.span.slot]
-            if value is None:
-                dst.zero_()
-            else:
-                dst.copy_(value[0])
 
     def write_global(self, owner, begin, main, index):
         for kind, value in (("main", main), ("index", index)):
@@ -124,7 +102,11 @@ class PagedAttentionCache:
             if geometry.packed
             else self.backing.view(torch.bfloat16).view(-1, geometry.head_dim)
         )
-        self.tail_indices = {owner: i for i, owner in enumerate(geometry.tail_owners)}
+        # Owner -> its row in the compressor rings, which hold the raw
+        # projections a pool window reaching back before this forward needs.
+        self.compress_indices = {
+            owner: i for i, owner in enumerate(geometry.compress_owners)
+        }
         self.pending = None
 
     def require_committed(self):
@@ -142,6 +124,7 @@ class PagedAttentionCache:
         running_bs=None,
         running_tokens=None,
         state_slot_out=None,
+        plans=None,
     ):
         self.require_committed()
         requests = tuple(requests)
@@ -174,7 +157,7 @@ class PagedAttentionCache:
                 raise ValueError("A request cannot alias its own PAGE rows")
             seen.add(span.slot)
             offset += span.length
-        return prepare_batch_step(
+        step = prepare_batch_step(
             requests,
             self.pool.device,
             tentative=tentative,
@@ -182,6 +165,42 @@ class PagedAttentionCache:
             running_bs=running_bs,
             running_tokens=running_tokens,
             state_slot_out=state_slot_out,
+        )
+        step.plans = (
+            self._private_plans(requests, tentative) if plans is None else plans
+        )
+        return step
+
+    def _private_plans(self, requests, tentative):
+        """Plans into freshly allocated buffers, for a caller without any.
+
+        The serving builder owns fixed-address ones and passes them in; this is
+        the isolated path, alongside the private metadata buffers above.
+        """
+        if not requests:
+            return {}
+        lengths = np.asarray([span.length for span in requests], dtype=np.int32)
+        rows = max(int(lengths.sum()) + len(requests), 1)
+        device = self.pool.device
+        buffers = {
+            ratio: {
+                name: CpuGpuBuffer(
+                    rows,
+                    4,
+                    dtype=torch.int32,
+                    device=device,
+                    pin_memory=device.type != "cpu",
+                )
+                for name in ("compress", "write")
+            }
+            for ratio, _ in self.geometry.compress_ratios
+        }
+        return make_compress_plans(
+            lengths,
+            np.asarray([span.end for span in requests], dtype=np.int32),
+            self.geometry.compress_ratios,
+            plan_buffers=buffers,
+            extra_write=self.geometry.speculative_tokens if tentative else 0,
         )
 
     def prepare_state(self, step):
@@ -221,6 +240,51 @@ class PagedAttentionCache:
             raise RuntimeError("No tentative state to commit")
         self.pending.commit(accepted_lengths)
         self.pending = None
+
+    def compress(self, owner, compressor, values, scores, step, rope):
+        # The packed pool interleaves FP4 with its scales, which the kernel's
+        # BF16 scatter cannot write; take the rotated echo and pack it here.
+        scatter = (
+            None
+            if self.packed
+            else (self.pages.view(f"main_{owner}")[0], step.block_tables)
+        )
+        latent, rows, rotated = compress_batch(
+            self, owner, compressor, values, scores, step, rope, scatter=scatter
+        )
+        if rotated is not None:
+            packed = quantize_fp4(rotated, **MAIN_FP4)
+            self._scatter_rows("main", owner, step, rows, packed, compressor.ratio)
+        return latent, rows
+
+    def write_index(self, owner, step, rows, index, ratio):
+        self._scatter_rows("index", owner, step, rows, index, ratio)
+
+    def _scatter_rows(self, kind, owner, step, rows, value, ratio):
+        """One destination per plan row, resolved from that same plan.
+
+        A plan's rows come from several requests at once, so the page comes
+        from the row's own `batch_id` rather than one request's contiguous run.
+        """
+        pages = self.pages.view(f"{kind}_{owner}")[0]
+        per_block = pages.shape[1]
+        batch = step.plans[ratio].compress_plan_gpu[: rows.numel(), 1].long()
+        physical = step.block_tables[batch, rows // per_block].long()
+        pages[physical, rows % per_block] = (
+            pack_rows(*value) if self.packed else value[0]
+        )
+
+    def compress_state(self, owner):
+        """This owner's `(kv_state, score_state)`, each `[slots, ring, dim]`.
+
+        Straight out of the arena, so a relocated request carries its
+        incomplete group with the rest of its state.
+        """
+        index = self.compress_indices[owner]
+        return (
+            self.state.view("compress_kv")[index],
+            self.state.view("compress_score")[index],
+        )
 
     def rope_positions(self, step):
         return step.positions

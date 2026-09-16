@@ -89,6 +89,7 @@ def make_compress_plans(
     running_bs: int | None = None,
     max_q_len: int | None = None,
     decode_capacity_per_ratio: dict[int, int] | None = None,
+    extra_write: int,
 ) -> dict[int, CompressPlan]:
     """Build a CompressPlan per (ratio, overlap) variant.
 
@@ -141,6 +142,21 @@ def make_compress_plans(
                     contiguous-from-base so data pointers stay stable; only
                     `shape[0]` shrinks. Buffers are always sized to the prefill
                     worst case.
+      extra_write: REQUIRED int — positions per seq the write plan keeps BEYOND
+                    `K_pool`, i.e. it retains `K_pool + extra_write`.
+                    `max_spec_steps` on a fwd that can be rolled back (decode /
+                    verify / its CG capture); `0` on prefill, which nothing
+                    rejects. Bounded above by the ring's own slack
+                    (`deepseek_v4_attn.ring_extra`), since the write kernel
+                    stores at `position % STATE_SIZE` unmasked and two positions
+                    a ring apart would race for one row.
+                    Required rather than defaulted, because `K_pool` is the READ
+                    width: a fwd wider than `K_pool` that keeps only its last
+                    `K_pool` positions silently drops its own tokens, and a
+                    rejection then reads back into positions nobody kept. That
+                    is invisible wherever `K_pool >= 1 + max_spec_steps` (V4: 8
+                    and 128), which is exactly why nobody should get it by
+                    default.
 
     Returns:
       dict[ratio] -> CompressPlan. On empty fwd (`extend_lens_cpu.sum() == 0`)
@@ -161,26 +177,25 @@ def make_compress_plans(
 
     def _slices(
         ratio: int,
-        is_overlap: bool,
+        K_pool_size: int,
         n_compress: int,
-        n_write: int,
         full_wcap: int,
     ) -> tuple[int, int]:
         """(compress_slice, write_slice) — the fixed-or-tight kernel-grid lengths
         for this ratio. Three modes:
           * running_bs set (uniform decode CG): both = `running_bs * per_seq_bound`
-            (compress ceil(qlen/ratio); write min(qlen,K_pool)) — content-
-            independent, so capture/replay dispatch identical shapes and the
-            `[n_actual, cap)` region is exactly the `[bs, running_bs)` padding.
+            (compress ceil(qlen/ratio); write qlen, since a bounded fwd keeps
+            every token it computed) — content-independent, so capture/replay
+            dispatch identical shapes and the `[n_actual, cap)` region is
+            exactly the `[bs, running_bs)` padding.
           * decode_capacity_per_ratio set (extend-shaped verify CG): compress =
             explicit cap; write = full buffer (fixed by buffer sizing).
           * neither (eager): compress = n_compress (tight); write = full buffer.
         """
         if running_bs is not None:
-            k_pool = (2 if is_overlap else 1) * ratio
             return (
                 running_bs * ((max_q_len + ratio - 1) // ratio),  # ceil(qlen/ratio)
-                running_bs * min(max_q_len, k_pool),
+                running_bs * min(max_q_len, K_pool_size),
             )
         if decode_capacity_per_ratio is not None:
             return decode_capacity_per_ratio[ratio], full_wcap
@@ -193,7 +208,8 @@ def make_compress_plans(
         for ratio, is_overlap in unique_ratios_overlap:
             cbuf = plan_buffers[ratio]["compress"]
             wbuf = plan_buffers[ratio]["write"]
-            ccap, wcap = _slices(ratio, is_overlap, 0, 0, wbuf.np.shape[0])
+            K = ratio * (2 if is_overlap else 1)
+            ccap, wcap = _slices(ratio, K + extra_write, 0, wbuf.np.shape[0])
             assert ccap <= cbuf.np.shape[0] and wcap <= wbuf.np.shape[0], (
                 f"ratio={ratio} empty-fwd caps (compress={ccap}, write={wcap}) "
                 f"exceed buffers ({cbuf.np.shape[0]}, {wbuf.np.shape[0]}); "
@@ -235,6 +251,10 @@ def make_compress_plans(
 
     for ratio, is_overlap in unique_ratios_overlap:
         K = ratio * (2 if is_overlap else 1)
+        # What the write plan retains. `K_pool` alone is the READ width: a fwd
+        # wider than it would drop its own tokens, and a rejection would then
+        # read back into positions nobody kept.
+        K_pool_size = K + extra_write
         # window_len = K - min(j_in_seq + 1, K)
         # Number of leading K-loop iterations that go to state cache.
         plan_rows[:, 3] = np.maximum(0, K - np.minimum(j_in_seq + 1, K))
@@ -253,14 +273,15 @@ def make_compress_plans(
         np.cumsum(compress_counts, out=cu_compress[1:])
 
         # write: tokens whose absolute position falls in the per-seq
-        # "last STATE_SIZE positions" window. STATE_SIZE = K.
-        # write_start[i] = max(0, context_lens[i] - K) — uniform across overlap/non-overlap;
+        # "last STATE_SIZE positions" window (see `_ring_slots`).
+        # write_start[i] = max(0, context_lens[i] - STATE_SIZE) — uniform across
+        # overlap/non-overlap;
         # the SGLang formula `(seq_len // ratio) * ratio - (ratio if overlap else 0)`
         # is a stricter bound that includes only ratio-aligned writes; the looser
-        # `context_len - K` is what ATOM's update_compressor_states already uses
-        # (state_writes.py:152-154 docstring) and what the fused kernel's
+        # `context_len - STATE_SIZE` is what ATOM's update_compressor_states already
+        # uses (state_writes.py:152-154 docstring) and what the fused kernel's
         # state-cache reader expects.
-        write_starts = np.maximum(0, context_lens_cpu - K).astype(np.int32)
+        write_starts = np.maximum(0, context_lens_cpu - K_pool_size).astype(np.int32)
         write_mask = positions >= write_starts[batch_ids]
         write_plan = plan_rows[write_mask]
 
@@ -271,9 +292,7 @@ def make_compress_plans(
         wbuf = plan_buffers[ratio]["write"]
         full_ccap = cbuf.np.shape[0]
         full_wcap = wbuf.np.shape[0]
-        compress_slice, write_slice = _slices(
-            ratio, is_overlap, n_compress, n_write, full_wcap
-        )
+        compress_slice, write_slice = _slices(ratio, K_pool_size, n_compress, full_wcap)
         assert n_compress <= compress_slice <= full_ccap, (
             f"ratio={ratio} num_compress={n_compress}, slice={compress_slice}, "
             f"buffer={full_ccap}: invariant violated. CG path requires "

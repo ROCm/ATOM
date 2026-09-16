@@ -1,16 +1,14 @@
 # SPDX-License-Identifier: MIT
-"""Every accepted prefix must recover serial tails, history and window rows."""
+"""Every accepted prefix must recover history, window rows and compressor state."""
 
 from types import SimpleNamespace
 
 import pytest
 import torch
-
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 from atom.model_ops.attentions.deepseek_v41.checkpoints import StateCopies
 from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
-from atom.model_ops.deepseek_v41.compressor import Compressor, CompressorTail
 
 
 def encoded_rows(positions, layer, geometry, device):
@@ -73,35 +71,12 @@ def test_every_prefix_survives_ring_wrap_and_ragged_request_order(
     old_cursors = cache.cursor.clone()
     step = cache.begin_step(spans, tentative=True)
     cache.prepare_state(step)
-    torch.manual_seed(733)
-    compressor = Compressor(32, 128, 2, 1e-20).to(device)
-    # This test consumes only compressor tails, before normalization. Keep
-    # that state contract CPU-testable; the shared norm has separate GPU tests.
-    compressor.norm = torch.nn.Identity()
-    compressor.process_weights_after_loading()
-    expected_tails, expected_histories = [], []
+    expected_histories = []
     accepted_lengths = (accepted, min(accepted, 3))
-    for i, (request, local, _) in enumerate(cache.requests(step)):
-        span, count = request.span, accepted_lengths[i]
-        hidden = torch.randn(1, span.length, 32, device=device, dtype=torch.bfloat16)
-        old_tail = None
-        if span.position % 2:
-            old_tail = CompressorTail(
-                torch.randn(1, 1, 128, device=device),
-                torch.randn(1, 1, 128, device=device),
-            )
-            cache.state.view("tail_values")[0, span.slot] = old_tail.values[0]
-            cache.state.view("tail_scores")[0, span.slot] = old_tail.scores[0]
-        _, expected = compressor(hidden[:, :count], span.position, old_tail)
-        expected_tails.append(expected)
-        values, scores = compressor.project(hidden)
-        _, full_tail = compressor.pool(
-            values, scores, span.position, old_tail, dtype=hidden.dtype
-        )
-        request.write_tail(0, full_tail, rows=CompressorTail(values, scores))
+    for i, span in enumerate(spans):
         ids = [7, -1, 19, 20, 21, 22][: span.length]
         cache.pending.stage_history(span, ids)
-        expected_histories.append((history.tolist() + ids[:count])[-3:])
+        expected_histories.append((history.tolist() + ids[: accepted_lengths[i]])[-3:])
     for layer in range(2):
         write_window(
             cache, layer, step, encoded_rows(step.positions, layer, geometry, device)
@@ -119,16 +94,6 @@ def test_every_prefix_survives_ring_wrap_and_ragged_request_order(
     for i, (span, count) in enumerate(zip(spans, accepted_lengths)):
         end = span.position + count
         assert cache.cursor[span.slot].tolist() == [end] + expected_histories[i]
-        tail = expected_tails[i]
-        for name, value in (
-            ("tail_values", None if tail is None else tail.values),
-            ("tail_scores", None if tail is None else tail.scores),
-        ):
-            actual = cache.state.view(name)[0, span.slot]
-            if value is None:
-                assert actual.count_nonzero() == 0
-            else:
-                torch.testing.assert_close(actual, value[0], rtol=1e-5, atol=1e-5)
         positions = torch.arange(max(0, end - geometry.window_size), end, device=device)
         for layer in range(2):
             actual = cache.state.view("window")[
@@ -175,8 +140,6 @@ def test_tentative_state_refuses_missing_prefixes_and_out_of_range_acceptance():
     cache.prepare_state(step)
     with pytest.raises(RuntimeError, match="missing"):
         cache.finish_step(step, None)
-    rows = CompressorTail(torch.zeros(1, 6, 128), torch.zeros(1, 6, 128))
-    cache.pending.stage_tail(0, span, rows)
     cache.pending.stage_history(span, [1, 2, 3, 4, 5, 6])
     cache.finish_step(step, None)
     for length in (0, 7):
@@ -184,6 +147,73 @@ def test_tentative_state_refuses_missing_prefixes_and_out_of_range_acceptance():
             cache.commit_tentative([length])
     cache.commit_tentative([1])
     assert cache.cursor[0, 0] == 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("accepted", [1, 3, 5])
+def test_a_rejected_round_leaves_the_next_one_as_if_it_never_drafted(
+    single_rank, accepted
+):
+    """The claim `compress_ring_slots` makes: slack instead of a rollback.
+
+    Nothing rewinds the compressor after a rejection -- the discarded rows stay
+    in the ring, and the next round is supposed to be unable to see them
+    because they sit past the `K_pool` window it reads. So run the same accepted
+    prefix twice, once behind six drafted tokens and once alone, and require the
+    next round's latent to be the same bits. An arm that only drafted what it
+    kept is the only oracle here: there is no closed form for what the ring
+    should hold.
+    """
+    from atom.model_ops.deepseek_v41.compressor import Compressor
+    from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
+
+    geometry = V41PoolGeometry(1, ((0, 2),), 16, 128, 128, 32, speculative_tokens=5)
+    drafted, position, blocks = 6, 40, tuple(range(8))
+    torch.manual_seed(409)
+    with torch.device("cuda"):
+        compressor = Compressor(64, 128, 2, 1e-6)
+        rope = RotaryEmbedding(64, 4096, base=10000)
+        for parameter in compressor.parameters():
+            parameter.data.normal_(0, 0.05)
+        compressor.process_weights_after_loading()
+        hidden = torch.randn(1, drafted, 64, dtype=torch.bfloat16)
+        following = torch.randn(1, 3, 64, dtype=torch.bfloat16)
+
+    def round_one(length):
+        cache = PagedAttentionCache(geometry, 20, 1, "cuda")
+        cache.cursor[0, 0] = position
+        span = RequestSpan(7, position, 0, length, 0, blocks)
+        step = cache.begin_step((span,), tentative=True)
+        cache.prepare_state(step)
+        cache.compress(
+            0, compressor, *compressor.project(hidden[:, :length]), step, rope
+        )
+        cache.pending.stage_history(span, [-1] * length)
+        cache.finish_step(step, None)
+        cache.commit_tentative([accepted])
+        return cache
+
+    def round_two(cache):
+        span = RequestSpan(7, position + accepted, 0, 3, 0, blocks)
+        step = cache.begin_step((span,))
+        cache.prepare_state(step)
+        latent, positions = cache.compress(
+            0, compressor, *compressor.project(following), step, rope
+        )
+        cache.finish_step(step, [[-1, -1, -1]])
+        return latent, positions
+
+    drafting, honest = round_one(drafted), round_one(accepted)
+    # Armed: the rings really do differ, so the equality below is a statement
+    # about what the next round reads, not about two identical caches.
+    assert not torch.equal(*[c.compress_state(0)[0] for c in (drafting, honest)])
+    expected, expected_positions = round_two(honest)
+    actual, actual_positions = round_two(drafting)
+    # Positive control: an accepted prefix that crosses no boundary would make
+    # both arms `None` and the comparison vacuous.
+    assert expected is not None and expected.shape[1]
+    assert torch.equal(actual_positions, expected_positions)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
@@ -222,6 +252,7 @@ def test_verify_decode_kernel_is_causal_after_writing_the_whole_block(packed):
     from atom.model_ops.attentions.deepseek_v41.packed_attention import packed_decode
     from atom.model_ops.attentions.deepseek_v41.packed_rows import pack_rows
     from atom.model_ops.blockscale import quantize_fp8
+
     from atom.model_ops.v4_kernels import sparse_attn_v4_paged_decode
 
     torch.manual_seed(863)

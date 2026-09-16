@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: MIT
-"""Accepted-prefix selection for CSA2 tails and Engram history.
+"""Accepted-prefix selection for Engram history.
 
-The window has physical slack, so rejecting rows only changes visibility.
-Small state that cannot be reconstructed from KV is staged per input prefix;
-the sampler selects one prefix per request before checkpointing or drafting.
+The window has physical slack, so rejecting rows only changes visibility, and
+the compressor's ring is widened by the same slack -- a rejected round's writes
+land past the window the next round reads, so neither needs a rollback. Engram
+history is the one thing left that cannot be reconstructed from KV: it is
+staged per input prefix and the sampler picks one per request before
+checkpointing or drafting.
 """
 
 import torch
@@ -14,37 +17,15 @@ class TentativeState:
         self.cache, self.step = cache, step
         self.request_indices = {span.slot: i for i, span in enumerate(step.requests)}
         batch, width = len(step.requests), step.max_length
-        options = {"device": cache.pool.device}
-        shape = (len(cache.tail_indices), batch, width, cache.geometry.head_dim)
-        self.values = torch.zeros(shape, dtype=torch.float32, **options)
-        self.scores = torch.zeros_like(self.values)
         self.cursors = torch.empty(
-            batch, width, cache.geometry.history_size + 1, dtype=torch.int64, **options
+            batch,
+            width,
+            cache.geometry.history_size + 1,
+            dtype=torch.int64,
+            device=cache.pool.device,
         )
-        self.tails_written, self.histories_written = set(), set()
+        self.histories_written = set()
         self.finished = False
-
-    def stage_tail(self, owner, span, rows):
-        if rows is None or rows.scores is None:
-            raise ValueError("Tentative compression requires per-token projections")
-        expected = (1, span.length, self.cache.geometry.head_dim)
-        if rows.values.shape != expected or rows.scores.shape != expected:
-            raise ValueError(
-                "Tentative compressor projections do not match the request"
-            )
-        i, owner_index = self.request_indices[span.slot], self.cache.tail_indices[owner]
-        # An odd committed cursor leaves the preceding even-position row as
-        # the incomplete group. Even cursors have no compressor tail.
-        keep = (
-            torch.arange(span.position, span.end, device=rows.values.device) % 2 == 0
-        )[:, None]
-        self.values[owner_index, i, : span.length] = torch.where(
-            keep, rows.values[0], 0
-        )
-        self.scores[owner_index, i, : span.length] = torch.where(
-            keep, rows.scores[0], 0
-        )
-        self.tails_written.add((owner, span.slot))
 
     def stage_history(self, span, compressed_ids):
         ids = torch.as_tensor(
@@ -64,17 +45,8 @@ class TentativeState:
         self.histories_written.add(span.slot)
 
     def finish(self):
-        expected_tails = {
-            (owner, span.slot)
-            for owner in self.cache.tail_indices
-            for span in self.step.requests
-        }
-        if self.tails_written != expected_tails or self.histories_written != set(
-            self.request_indices
-        ):
-            raise RuntimeError(
-                "Tentative state is missing compressor or Engram prefixes"
-            )
+        if self.histories_written != set(self.request_indices):
+            raise RuntimeError("Tentative state is missing an Engram prefix")
         self.finished = True
 
     def commit(self, accepted_lengths):
@@ -96,8 +68,3 @@ class TentativeState:
         batch = torch.arange(lengths.numel(), device=lengths.device)
         slots = self.step.slots.long()
         self.cache.cursor[slots] = self.cursors[batch, lengths - 1]
-        for name, source in (
-            ("tail_values", self.values),
-            ("tail_scores", self.scores),
-        ):
-            self.cache.state.view(name)[:, slots, 0] = source[:, batch, lengths - 1]

@@ -8,6 +8,11 @@ import torch
 from .entry_arena import EntryField, entry_bytes_for, field_extents
 from .v4_pool_geometry import WindowParams
 
+# The packed main pool's FP4 grid. Finer than the index and window planes,
+# which take `quantize_fp4`'s group-32 E8M0 default; a scatter that disagrees
+# with `main_row_bytes` writes rows the readers cannot decode.
+MAIN_FP4 = {"group_size": 16, "scale_dtype": torch.float8_e4m3fn}
+
 
 @dataclass(frozen=True)
 class V41PoolGeometry:
@@ -58,9 +63,9 @@ class V41PoolGeometry:
 
     @property
     def main_row_bytes(self):
-        return (
-            self.head_dim // 2 + self.head_dim // 16 if self.packed else self.row_bytes
-        )
+        if not self.packed:
+            return self.row_bytes
+        return self.head_dim // 2 + self.head_dim // MAIN_FP4["group_size"]
 
     @property
     def index_row_bytes(self):
@@ -81,8 +86,29 @@ class V41PoolGeometry:
         return self.window_size + self.speculative_tokens
 
     @property
-    def tail_owners(self):
-        return tuple(owner for owner, ratio in self.owners if ratio == 2)
+    def compress_owners(self):
+        return tuple(owner for owner, _ in self.owners)
+
+    @property
+    def compress_ratios(self):
+        """`(ratio, overlap)` per distinct ratio: CSA2 never overlaps."""
+        return tuple(sorted({(ratio, False) for _, ratio in self.owners}))
+
+    @property
+    def compress_ring_slots(self):
+        """V4's `STATE_SIZE`: the pool window plus rejected-draft slack.
+
+        One width for every owner rather than one per ratio. The ring only has
+        to be at least `K_pool = ratio` (no overlap in CSA2) and the widest
+        owner sets that; a ratio-1 owner spending one extra row is cheaper than
+        a second field and a second modulus to keep in step with the kernels.
+
+        The slack is why a rejected draft cannot corrupt the next round: round
+        R's discarded writes sit at most `speculative_tokens` ids past R+1's
+        commit head, so they fall outside the `K_pool`-wide window R+1 reads.
+        """
+        widest = max((ratio for _, ratio in self.owners), default=1)
+        return widest + self.speculative_tokens
 
     @property
     def page_fields(self):
@@ -103,36 +129,32 @@ class V41PoolGeometry:
 
     @property
     def state_fields(self):
-        return [
+        window = EntryField(
+            "window",
+            self.layers,
+            (self.ring_slots, self.window_row_bytes if self.packed else self.head_dim),
+            torch.uint8 if self.packed else torch.bfloat16,
+            align=self.alignment,
+        )
+        # The compressor's own ring, V4's `kv_state` / `score_state`: the last
+        # `K_pool` raw projections per owner, so a pool window reaching back
+        # before this forward reads them from here instead of the caller
+        # carrying an incomplete group across the boundary.
+        rings = [
             EntryField(
-                "window",
-                self.layers,
-                (
-                    self.ring_slots,
-                    self.window_row_bytes if self.packed else self.head_dim,
-                ),
-                torch.uint8 if self.packed else torch.bfloat16,
-                align=self.alignment,
-            ),
-            EntryField(
-                "tail_values",
-                len(self.tail_owners),
-                (1, self.head_dim),
+                name,
+                len(self.owners),
+                (self.compress_ring_slots, self.head_dim),
                 torch.float32,
                 align=self.alignment,
-            ),
-            EntryField(
-                "tail_scores",
-                len(self.tail_owners),
-                (1, self.head_dim),
-                torch.float32,
-                align=self.alignment,
-            ),
-            # Position followed by compressed IDs/DEAD, oldest first.
-            EntryField(
-                "cursor", 1, (self.history_size + 1,), torch.int64, align=self.alignment
-            ),
+            )
+            for name in ("compress_kv", "compress_score")
         ]
+        # Position followed by compressed IDs/DEAD, oldest first.
+        cursor = EntryField(
+            "cursor", 1, (self.history_size + 1,), torch.int64, align=self.alignment
+        )
+        return [window, *rings, cursor]
 
     def _aligned_bytes(self, fields):
         return -(-entry_bytes_for(fields) // self.alignment) * self.alignment
@@ -176,7 +198,11 @@ class V41PoolGeometry:
     @property
     def layout_id(self):
         identity = (
-            f"dsv41-{'packed' if self.packed else 'bf16'}-state-v1:layers={self.layers}:owners={self.owners}"
+            # v2: the compressor's incomplete-group tail became a K_pool ring.
+            # Every other term below was already the same in v1, so without the
+            # bump a v1 image would read as compatible and restore into fields
+            # that no longer mean what it holds.
+            f"dsv41-{'packed' if self.packed else 'bf16'}-state-v2:layers={self.layers}:owners={self.owners}"
             f":block={self.block_size}:window={self.window_size}"
             f":dims={self.head_dim},{self.index_dim}:history={self.history_size}"
         )

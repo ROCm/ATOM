@@ -29,7 +29,11 @@ def test_production_geometry_has_only_four_global_owners():
         config.index_head_dim,
     )
     assert geo.owners == ((2, 2), (8, 2), (14, 2), (20, 1))
-    assert geo.tail_owners == (2, 8, 14)
+    # Every owner has a compressor ring, ratio-1 included: the width is the
+    # widest owner's pool window plus speculative slack, so one field serves
+    # both ratios rather than one per ratio.
+    assert geo.compress_owners == (2, 8, 14, 20)
+    assert geo.compress_ring_slots == 2
     assert len(geo.page_fields) == 8
     assert geo.page_bytes == 16 * (3 / 2 + 1) * (512 + 128) * 2
     assert sum(f.bytes_per_entry for f in geo.state_fields) <= geo.state_bytes

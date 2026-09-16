@@ -249,3 +249,38 @@ def test_shared_expert_keeps_tp_partials_fp32(reference, single_rank):
             .cpu()
         )
         assert not torch.equal(early_rounding, expected)
+
+
+def test_capture_and_replay_offer_the_execution_policy_the_same_stages():
+    """A decode step routes the FFN through `run`; a prefill step does not.
+
+    The stage set is what a graph capture records, so a capture built on the
+    wrong step kind records a different set than the replay runs and the
+    difference is silent -- the missing stage just falls back to eager. This
+    pins the routing so `build_for_cudagraph_capture`'s step kind has something
+    to be wrong against.
+    """
+    from atom.models.deepseek_v41.model import Block
+
+    block = Block.__new__(Block)
+    state = SimpleNamespace(residual="residual", pre_mix="pre_mix")
+    five = ("hidden", "residual", "pre", "post", "comb")
+    block.prepare_attention = lambda *args: five
+    block.attn = lambda *args: "attn_out"
+    block.prepare_ffn = lambda *args: five
+    block.decode_ffn = lambda *args: ("decode_out",)
+    block.ffn = lambda *args: "prefill_out"
+    block.finish_ffn = lambda *args: ("residual", "pre_mix")
+
+    def stages_for(decode):
+        seen = []
+
+        def run(function, *args):
+            seen.append(function)
+            return function(*args)
+
+        block.forward(state, None, SimpleNamespace(decode=decode), None, execution=run)
+        return seen
+
+    assert block.decode_ffn in stages_for(decode=True)
+    assert block.decode_ffn not in stages_for(decode=False)

@@ -5,8 +5,13 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
-
 from atom.model_engine.engram_runtime import EngramInputPreparer
+from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+from atom.models.deepseek_v41.config import AttentionMode, build_attention_topology
+from tests.models.deepseek_v41.cache_visibility_snapshot import (  # DIAGNOSTIC179
+    CacheVisibilitySnapshot,
+)
+
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attentions.backends import AttentionBackend, CommonAttentionBuilder
@@ -14,12 +19,8 @@ from atom.model_ops.attentions.deepseek_v4_attn import (
     DeepseekV4AttentionMetadataBuilder,
 )
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import page_pool, state_pool
-from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
-from atom.models.deepseek_v41.config import AttentionMode, build_attention_topology
+from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import AttentionMetaData, AttnState, Context
-from tests.models.deepseek_v41.cache_visibility_snapshot import (  # DIAGNOSTIC179
-    CacheVisibilitySnapshot,
-)
 
 from .cache import PagedAttentionCache
 from .checkpoints import StateCopies
@@ -43,6 +44,10 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
     _populate_state_slot_mappings = (
         DeepseekV4AttentionMetadataBuilder._populate_state_slot_mappings
     )
+    # Borrowed the same way, and for the same reason: it reads
+    # `_unique_compress_ratios_overlap` and the `v4_*_plan_{ratio}` buffers,
+    # which the property and `__init__` below supply under V4's names.
+    _build_compress_plans = DeepseekV4AttentionMetadataBuilder._build_compress_plans
 
     @staticmethod
     def _physical_slots(pool_slots):
@@ -79,6 +84,11 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             packed=model_runner.config.kv_cache_dtype == "fp4",
             speculative_tokens=num_drafts,
         )
+        model_runner.forward_vars.update(
+            self._compress_plan_buffers(
+                self.geometry, self.max_num_batched_tokens, self.max_bs, self.device
+            )
+        )
         self.cache = self.copies = self.engram = None
         # DIAGNOSTIC179: see the snapshot module. Returns None unless
         # ATOM_DSPARK_CACHE_SNAPSHOT is set, so production builds nothing.
@@ -93,6 +103,49 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 self.max_num_batched_tokens,
                 self.device,
             )
+
+    # V4's plan builder asks for the ratio set under this name.
+    _unique_compress_ratios_overlap = property(
+        lambda self: self.geometry.compress_ratios
+    )
+
+    @staticmethod
+    def _compress_plan_buffers(geometry, max_num_batched_tokens, max_bs, device):
+        """Fixed-address plan buffers under V4's names, sized for prefill.
+
+        A forward writes into these and slices the grid down; the pointers
+        never move, which is what lets a captured graph replay another step's
+        plan. Static so a hand-assembled `forward_vars` declares them from here
+        rather than from a second copy of the sizing.
+        """
+        retained = max(geometry.speculative_tokens + 1, 1)
+        buffers = {}
+        for ratio, _ in geometry.compress_ratios:
+            sizes = {
+                # One boundary per `ratio` tokens, plus the partial group each
+                # request can open.
+                f"v4_compress_plan_{ratio}": max_num_batched_tokens // ratio + max_bs,
+                # A bound, not a token count: the plan keeps a request's last
+                # `max(K_pool, 1 + speculative_tokens)` positions.
+                f"v4_write_plan_{ratio}": min(
+                    max_num_batched_tokens, max_bs * max(ratio, retained)
+                ),
+            }
+            for name, rows in sizes.items():
+                buffer = CpuGpuBuffer(
+                    rows,
+                    4,
+                    dtype=torch.int32,
+                    device=device,
+                    pin_memory=device != "cpu",
+                )
+                # Sentinel, so a capture before the first real forward reads
+                # rows the kernels skip rather than zeros -- which would name
+                # request 0 at position 0.
+                buffer.cpu.fill_(-1)
+                buffer.copy_to_gpu()
+                buffers[name] = buffer
+        return buffers
 
     def sub_pool_specs(self):
         return [
@@ -199,13 +252,25 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             len(spans),
             running_bs,
         )
+        verifying = tentative and not batch.is_dummy_run and bool(spans)
+        # One plan per ratio for the whole batch, into the fixed-address
+        # buffers. Tight slices: nothing is captured yet, so the grid may
+        # depend on content; FULL capture means passing running_bs / max_q_len.
+        # `extra_write`: CSA2's K_pool is 1 or 2, narrower than a verify step,
+        # so without the slack the plan drops what a rejection re-exposes.
+        plans = self._build_compress_plans(
+            np.asarray([span.length for span in spans], dtype=np.int32),
+            np.asarray([span.end for span in spans], dtype=np.int32),
+            extra_write=self.geometry.speculative_tokens if verifying else 0,
+        )
         step = cache.begin_step(
             spans,
-            tentative=tentative and not batch.is_dummy_run and bool(spans),
+            tentative=verifying,
             buffers=self.model_runner.forward_vars,
             running_bs=running_bs,
             running_tokens=running_tokens,
             state_slot_out=state_slot_out,
+            plans=plans,
         )
         positions = self.model_runner.forward_vars["positions"]
         cu = self.model_runner.forward_vars["cu_seqlens_q"].gpu[: running_bs + 1]
@@ -316,17 +381,27 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         if bs < 1 or max_q_len < 1 or bs * max_q_len > self.max_num_batched_tokens:
             raise ValueError("CSA2 capture shape exceeds the token buffer")
         tokens = bs * max_q_len
+        # A full window in, not position 0: there the compressor reads no
+        # history and captures a cold branch replay never takes. `tentative` is
+        # what makes a multi-token bucket a decode step -- otherwise the
+        # capture records the prefill FFN while replay runs `decode_ffn` eager.
+        # The bound cache's geometry, since that is the pool being captured.
+        geometry = self.cache.geometry
+        start = geometry.window_size
+        pages = -(-(start + max_q_len) // self.block_size)
         batch = SimpleNamespace(
             is_dummy_run=False,
             req_ids=tuple(range(bs)),
             num_scheduled_tokens=(max_q_len,) * bs,
-            context_lens=(max_q_len,) * bs,
+            context_lens=(start + max_q_len,) * bs,
             state_slots_committed=tuple(range(bs)),
-            block_tables=(tuple(range(-(-max_q_len // self.block_size))),) * bs,
+            block_tables=(tuple(range(pages)),) * bs,
             total_seqs_num=bs,
             total_tokens_num=tokens,
         )
-        metadata, positions = self._prepare(batch, bs, tokens)
+        metadata, positions = self._prepare(
+            batch, bs, tokens, tentative=bool(geometry.speculative_tokens)
+        )
         metadata.dummy = True  # No host Engram lookup for synthetic tokens.
         self.prepare_model_inputs(
             self.model_runner.forward_vars["input_ids"].gpu[:tokens], metadata

@@ -8,12 +8,92 @@ import torch.nn.functional as F
 from torch import nn
 
 from atom.model_ops.layernorm import RMSNorm
+from atom.model_ops.v4_kernels import fused_compress_attn
+from atom.model_ops.v4_kernels.state_writes import update_compressor_states
 
 
 @dataclass(frozen=True)
 class CompressorTail:
     values: torch.Tensor
     scores: torch.Tensor
+
+
+def compress_batch(cache, owner, compressor, values, scores, step, rope, *, scatter):
+    """Every compression boundary in the batch, through V4's fused kernel.
+
+    One driver for both caches: the indexer's top-k is discrete, so two
+    implementations agreeing to a BF16 ulp still select different rows. Each
+    cache supplies only its addressing, as `scatter`.
+
+    `scatter` is the `(pages, block_tables)` the kernel writes the rotated
+    latent into, or `None` for a pool whose layout it cannot write -- the
+    packed one interleaves FP4 with its scales, so the caller gets the rotated
+    value echoed back and packs it itself. Rotating a second time in torch
+    would round differently, and the FP4 grid turns that into level flips.
+
+    Returns `(latent, rows, rotated)`: the post-norm PRE-RoPE latent the index
+    key projects from, its compressed row per boundary, and the echo when
+    asked. All `None` when no request crossed a boundary.
+    """
+    ratio = compressor.ratio
+    plan = step.plans[ratio]
+    kv_state, score_state = cache.compress_state(owner)
+    head_dim = values.shape[-1]
+    pages, block_tables = scatter or (None, None)
+    # Ratio 1 has no gate, and a one-element softmax weighs 1 whatever the
+    # score is, so the gate input only has to be finite.
+    gate = values if scores is None else scores
+    latent = rotated = None
+    if plan.num_compress:
+        # BF16: what the index key's BF16 `wk` consumes.
+        latent = torch.empty(
+            plan.num_compress, head_dim, dtype=torch.bfloat16, device=values.device
+        )
+        rotated = torch.empty_like(latent) if scatter is None else None
+        fused_compress_attn(
+            kv_in=values[0],
+            score_in=gate[0],
+            kv_state=kv_state,
+            score_state=score_state,
+            plan=plan,
+            state_slot_mapping=step.slots,
+            ape=compressor.ape,
+            rms_weight=compressor.norm_weight,
+            rms_eps=compressor.norm.eps,
+            cos_cache=rope.cos_cache,
+            sin_cache=rope.sin_cache,
+            kv_cache=pages,
+            block_tables=block_tables,
+            k_per_block=0 if pages is None else pages.shape[1],
+            overlap=False,
+            ratio=ratio,
+            head_dim=head_dim,
+            rope_head_dim=rope.cos_cache.shape[-1] * 2,
+            quant_mode="none",
+            latent_out=latent,
+            rotated_out=rotated,
+            prefix=f"csa2.compress_{owner}",
+        )
+    # After the boundary kernel, never before: that reads the ring as of the
+    # previous forward, this overwrites it for the next. Unconditional -- a
+    # forward crossing no boundary still owes the ring its projections, or the
+    # round that does cross one reads a position nobody wrote.
+    update_compressor_states(
+        values[0],
+        gate[0],
+        compressor.ape,
+        kv_state,
+        score_state,
+        write_plan=plan.write_plan_gpu,
+        state_slot_mapping=step.slots,
+        ratio=ratio,
+        overlap=False,
+        prefix=f"csa2.compress_state_{owner}",
+    )
+    if latent is None:
+        return None, None, None
+    rows = plan.compress_plan_gpu[: plan.num_compress, 2].long() // ratio
+    return latent.unsqueeze(0), rows, None if rotated is None else rotated.unsqueeze(0)
 
 
 class Compressor(nn.Module):
@@ -24,6 +104,13 @@ class Compressor(nn.Module):
         self.ratio = ratio
         self.wkv = nn.Linear(hidden_size, head_dim, bias=False, dtype=torch.bfloat16)
         self.norm = RMSNorm(head_dim, eps)
+        self.register_buffer("norm_weight", None, persistent=False)
+        # V4 adds a learned position encoding to the gate before the softmax;
+        # CSA2 does not, and the batched kernel takes it as a tensor rather
+        # than a flag. Zeros say the same thing without a second code path.
+        self.register_buffer(
+            "ape", torch.zeros(ratio, head_dim, dtype=torch.float32), persistent=False
+        )
         if ratio > 1:
             self.wgate = nn.Linear(
                 hidden_size, head_dim, bias=False, dtype=torch.bfloat16
@@ -32,6 +119,9 @@ class Compressor(nn.Module):
             self.register_buffer("gate_weight", None, persistent=False)
 
     def process_weights_after_loading(self):
+        # The fused kernel wants fp32 and contiguous; doing it here keeps it
+        # off the per-layer, per-step path.
+        self.norm_weight = self.norm.weight.float().contiguous()
         if self.ratio > 1:
             self.pool_weight = self.wkv.weight.float()
             self.gate_weight = self.wgate.weight.float()

@@ -4,8 +4,6 @@
 import torch
 from aiter import QuantType
 from aiter.dist.parallel_state import get_tp_group
-from torch import nn
-
 from atom.model_ops.attentions.deepseek_v41.packed_attention import (
     packed_decode,
     packed_prefill,
@@ -15,9 +13,11 @@ from atom.model_ops.blockscale import (
     quantize_fp4,
     quantize_fp8,
 )
-from atom.model_ops.deepseek_v41.compressor import Compressor, CompressorTail
+from atom.model_ops.deepseek_v41.compressor import Compressor
 from atom.model_ops.deepseek_v41.indexer import select_indices
 from atom.model_ops.deepseek_v41.projections import grouped_output_projection
+from torch import nn
+
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -60,8 +60,10 @@ class Indexer(nn.Module):
             self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
 
     def project_keys(self, latent, rope, positions, *, packed=False):
-        key = self.k_norm(self.wk(latent))
-        return quantize_fp4(rope(key, positions), dequantize=not packed)
+        # Same rule as the main pool: quantize for the packed layout, store the
+        # BF16 value as computed otherwise.
+        key = rope(self.k_norm(self.wk(latent)), positions)
+        return quantize_fp4(key) if packed else key
 
     def forward(self, hidden, qr, keys, rope, step, candidates=None):
         positions = torch.arange(
@@ -137,37 +139,31 @@ class Attention(nn.Module):
             else None
         )
 
-    def _update_global(self, hidden, qr, cache, step, rope):
+    def _compress_batch(self, hidden, cache, step, rope):
+        """Every compression boundary in the batch, in one call.
+
+        The cache owns where the main latent lands; what comes back is the
+        unrotated latent, which is all the index key needs.
+        """
+        if not self.spec.ratio or self.compressor is None:
+            return
+        owner = self.spec.kv_owner
+        values, scores = self.compressor.project(hidden)
+        latent, rows = cache.compress(
+            owner, self.compressor, values, scores, step, rope
+        )
+        if latent is not None:
+            # The group's first token, which is where the kernel rotated the
+            # main latent. Rotating the key anywhere else picks other rows.
+            index = self.indexer.project_keys(
+                latent, rope, rows * self.spec.ratio, packed=cache.packed
+            )
+            cache.write_index(owner, step, rows, index, self.spec.ratio)
+
+    def _update_indices(self, hidden, qr, cache, step, rope):
         if self.spec.ratio:
             owner = self.spec.kv_owner
             count = (step.position + step.length) // self.spec.ratio
-            if self.compressor is not None:
-                values, scores = self.compressor.project(hidden)
-                latent, tail = self.compressor.pool(
-                    values,
-                    scores,
-                    step.position,
-                    cache.read_tail(owner, step.position),
-                    dtype=hidden.dtype,
-                )
-                cache.write_tail(owner, tail, rows=CompressorTail(values, scores))
-                if latent is not None:
-                    begin = step.position // self.spec.ratio
-                    end = begin + latent.shape[1]
-                    latent_positions = (
-                        torch.arange(begin, end, device=hidden.device) * self.spec.ratio
-                    )
-                    # Derive index keys before the main latent is rotated in place.
-                    index = self.indexer.project_keys(
-                        latent, rope, latent_positions, packed=cache.packed
-                    )
-                    main = quantize_fp4(
-                        rope(latent, latent_positions),
-                        group_size=16,
-                        scale_dtype=torch.float8_e4m3fn,
-                        dequantize=not cache.packed,
-                    )
-                    cache.write_global(owner, begin, main, index)
             if self.indexer is not None:
                 candidate_owner = self.spec.candidate_owner
                 candidates = (
@@ -236,8 +232,12 @@ class Attention(nn.Module):
             else quantize_fp8(raw_kv, dequantize=True)
         )
         window_kv = quantize_fp8(raw_kv) if cache.packed else kv
+        self._compress_batch(hidden, cache, step, rope)
+        # Still per request: the indexer's scoring width is that request's
+        # committed row count, which is the shape P3/P4 replace. The
+        # compression above no longer needs the walk.
         for request_cache, request_step, rows in cache.requests(step):
-            self._update_global(
+            self._update_indices(
                 hidden[:, rows], qr[:, rows], request_cache, request_step, rope
             )
         prefix, prefix_indptr, extend, extend_indptr = cache.attention_indices(

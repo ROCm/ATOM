@@ -58,7 +58,15 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
                 ),
                 image_mask=metadata.image_mask,
             ).squeeze(0)
-            metadata.cache.finish_step(step, metadata.next_histories)
+            # A synthetic batch stages addresses; it does not advance state.
+            # `prepare_model_inputs` already reads `dummy` for the other half of
+            # that rule -- it skips the cursor read a graph capture would
+            # otherwise take from whoever owns these slots.
+            # This branch is host-side and differs between capture and replay,
+            # so it cannot survive into a whole-forward capture: the cursor
+            # write moves out of the model before FULL is enabled.
+            if not metadata.dummy:
+                metadata.cache.finish_step(step, metadata.next_histories)
         else:
             hidden = self.embed.weight.new_empty((0, self.config.hidden_size))
         return F.pad(hidden, (0, 0, 0, input_ids.numel() - step.length))

@@ -2,6 +2,7 @@
 """Accepted model math over paged/relocated state versus private P04 caches."""
 
 from dataclasses import replace
+from functools import partial
 
 import numpy as np
 import pytest
@@ -10,6 +11,8 @@ from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 from atom.model_ops.attentions.deepseek_v41.checkpoints import StateCopies
 from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
 from atom.model_ops.attentions.deepseek_v41_state import EagerAttentionCache
+from atom.model_ops.attentions.pool_layout.v41_pool_geometry import MAIN_FP4
+from atom.model_ops.blockscale import quantize_fp4
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 from atom.models.deepseek_v41.attention import Attention
 from atom.models.deepseek_v41.config import build_attention_topology
@@ -20,6 +23,34 @@ from atom.model_engine.page_unit_checkpoint import (
     CheckpointStoreOp,
     PagedStateCheckpointSpec,
 )
+
+
+def _where(location, text):
+    return f"{location}\n{text}"
+
+
+class QuantizedOracle(EagerAttentionCache):
+    """A private cache that stores on the FP4 grid, as a packed pool does.
+
+    The oracle has to store what the format under test stores. This cache is
+    BF16 and would keep the unrounded value, so a packed paged pool would
+    differ from it by the grid rather than by anything the paged bookkeeping
+    did. Rounding here keeps the comparison bit-exact and leaves the
+    quantization with the storage format instead of putting it in the model.
+    """
+
+    def compress(self, owner, compressor, values, scores, step, rope):
+        latent, rows = super().compress(owner, compressor, values, scores, step, rope)
+        if latent is not None:
+            self.main[owner][:, rows] = quantize_fp4(
+                self.main[owner][:, rows], dequantize=True, **MAIN_FP4
+            )
+        return latent, rows
+
+    def write_index(self, owner, step, rows, index, ratio):
+        super().write_index(
+            owner, step, rows, quantize_fp4(index, dequantize=True), ratio
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
@@ -60,6 +91,8 @@ def test_attention_math_and_odd_tail_survive_exact_checkpoint(
     geo = replace(geometry(config), packed=packed)
     paged = PagedAttentionCache(geo, 40, 3, "cuda")
     private = EagerAttentionCache(config, topology, 1, 32, "cuda")
+    if packed:
+        private = QuantizedOracle(config, topology, 1, 32, "cuda")
     spec = PagedStateCheckpointSpec(
         geo.page_bytes, geo.state_bytes, geo.layout_id, geo.state_bytes
     )
@@ -72,12 +105,21 @@ def test_attention_math_and_odd_tail_survive_exact_checkpoint(
         step = paged.begin_step([span])
         history = paged.prepare_state(step)
         eager_step = private.begin_step(position, length, 1)
-        for layer in layers:
+        for depth, layer in enumerate(layers):
             x = torch.randn(1, length, 64, dtype=torch.bfloat16, device="cuda")
             with torch.inference_mode():
                 expected = layer(x, private, eager_step, rope)
                 actual = layer(x, paged, step, rope)
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            # Name the step and the layer: a bare tensor mismatch here says
+            # only that the paged path drifted somewhere in four steps and
+            # five layers, which is most of the search.
+            where = (
+                f"step {n} (position {position}, length {length}), layer {depth} "
+                f"{topology[depth].mode.value} ratio={topology[depth].ratio}"
+            )
+            torch.testing.assert_close(
+                actual, expected, rtol=0, atol=0, msg=partial(_where, where)
+            )
         paged.finish_step(step, history)
         private.finish_step(eager_step)
         if n == 0:

@@ -6,14 +6,14 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
+from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
+from tests.attentions.deepseek_v41.helpers import metadata_buffers
 from torch import nn
 
 from atom.config import SpeculativeConfig, get_hf_config
-from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
-from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
 from atom.spec_decode.drafter import AuxCaptureSpec
 from atom.spec_decode.dspark_proposer import DSparkProposer
-from tests.attentions.deepseek_v41.helpers import metadata_buffers
 
 from .reference import FIXTURES
 
@@ -49,12 +49,17 @@ def test_capture_builder_uses_full_query_width_and_serving_storage(width):
     builder.geometry = V41PoolGeometry(
         1, ((0, 2),), 16, 128, 128, 32, speculative_tokens=5
     )
-    builder.cache = PagedAttentionCache(builder.geometry, 4, 2, "cpu")
+    # Enough PAGEs to hold a request that already owns a full window: capture
+    # starts each synthetic request behind `window_size`, so the table it
+    # builds spans `ceil((window_size + width) / block_size)` of them.
+    builder.cache = PagedAttentionCache(builder.geometry, 16, 2, "cpu")
     builder.cache.backing.fill_(17)
     before = builder.cache.backing.clone()
     builder.block_size, builder.device = 16, "cpu"
     builder.max_num_batched_tokens = 12
-    builder.model_runner = SimpleNamespace(forward_vars=metadata_buffers(2, 12, 1))
+    builder.model_runner = SimpleNamespace(
+        forward_vars=metadata_buffers(2, 12, 9, geometry=builder.geometry)
+    )
     prepared = []
     builder.prepare_model_inputs = lambda tokens, metadata: prepared.append(
         tokens.numel()
@@ -64,7 +69,11 @@ def test_capture_builder_uses_full_query_width_and_serving_storage(width):
     assert context.running_tokens == context.scheduled_tokens == 2 * width
     assert not context.is_dummy_run and metadata.dummy
     assert metadata.step.length == 2 * width
-    assert metadata.step.positions.tolist() == list(range(width)) * 2
+    # Behind a full window, not at 0: the capture has to record the branch a
+    # replayed step takes, and at position 0 the compressor reads no history.
+    start = builder.geometry.window_size
+    assert metadata.step.positions.tolist() == list(range(start, start + width)) * 2
+    assert metadata.step.decode
     assert metadata.cu_seqlens_q.tolist() == [0, width, 2 * width]
     assert metadata.cache is builder.cache
     assert (
@@ -157,7 +166,7 @@ def test_decode_positions_use_accepted_prefix_and_full_reservation():
     builder.block_size, builder.device = 16, "cpu"
     builder.model_runner = SimpleNamespace(
         tokenID_processor=SimpleNamespace(num_rejected=np.array([0, 4])),
-        forward_vars=metadata_buffers(2, 4, 10),
+        forward_vars=metadata_buffers(2, 4, 10, geometry=builder.geometry),
     )
     batch = SimpleNamespace(
         is_dummy_run=False,
@@ -183,16 +192,16 @@ def test_draft_graph_replay_reads_serving_slots_after_reorder(monkeypatch):
     )
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
     from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+
     from atom.spec_decode.draft_graph import DraftGraph, StagedInput
 
     monkeypatch.setenv("ATOM_DRAFT_CUDAGRAPH", "1")
     builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    builder.geometry = V41PoolGeometry(1, (), 16, 4, 512, 32, speculative_tokens=5)
     builder.model_runner = SimpleNamespace(
-        forward_vars=metadata_buffers(4, 24, 2, "cuda")
+        forward_vars=metadata_buffers(4, 24, 2, "cuda", geometry=builder.geometry)
     )
-    builder.cache = PagedAttentionCache(
-        V41PoolGeometry(1, (), 16, 4, 512, 32, speculative_tokens=5), 8, 4, "cuda"
-    )
+    builder.cache = PagedAttentionCache(builder.geometry, 8, 4, "cuda")
     builder.block_size, builder.device = 16, "cuda"
     builder.max_num_batched_tokens = 24
     builder.prepare_model_inputs = lambda tokens, metadata: None

@@ -40,6 +40,9 @@ class BatchStep:
     block_tables: torch.Tensor
     request_steps: tuple[AttentionStep, ...]
     selected: dict[int, torch.Tensor] = field(default_factory=dict)
+    # ratio -> CompressPlan. One per distinct compression ratio in the model,
+    # built once per forward and read by every owner that shares that ratio.
+    plans: dict[int, object] = field(default_factory=dict)
     tentative: bool = False
 
     @property

@@ -16,8 +16,17 @@ def geometry(config, block=4):
     )
 
 
-def metadata_buffers(batch_size, tokens, blocks, device="cpu"):
+def metadata_buffers(batch_size, tokens, blocks, device="cpu", geometry=None):
+    """The `forward_vars` a hand-assembled builder needs, declared once.
+
+    `geometry` adds the compressor plan buffers for the ratios that geometry
+    owns. Pass the same object the builder gets: the names are keyed by ratio,
+    so a second geometry would declare buffers no forward looks up.
+    """
     import torch
+    from atom.model_ops.attentions.deepseek_v41.backend import (
+        DeepseekV41MetadataBuilder,
+    )
 
     from atom.model_ops.attentions.deepseek_v4_attn import (
         DeepseekV4AttentionMetadataBuilder,
@@ -46,4 +55,13 @@ def metadata_buffers(batch_size, tokens, blocks, device="cpu"):
             read_side=False,
         )
     )
+    if geometry is not None:
+        buffers.update(
+            DeepseekV41MetadataBuilder._compress_plan_buffers(
+                geometry,
+                tokens,
+                batch_size,
+                device,
+            )
+        )
     return buffers

@@ -6,12 +6,6 @@ from dataclasses import replace
 import numpy as np
 import pytest
 import torch
-
-from atom.model_engine.page_unit_checkpoint import (
-    CheckpointRestoreOp,
-    CheckpointStoreOp,
-    PagedStateCheckpointSpec,
-)
 from atom.model_ops.attentions.deepseek_v41.cache import (
     PagedAttentionCache,
     PagedIndexKeys,
@@ -20,12 +14,18 @@ from atom.model_ops.attentions.deepseek_v41.checkpoints import StateCopies
 from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
 from atom.model_ops.attentions.deepseek_v41_state import EagerAttentionCache
 from atom.model_ops.deepseek_v41.indexer import select_indices
+from atom.models.deepseek_v41.config import build_attention_topology
+from tests.attentions.deepseek_v41.helpers import geometry
+
+from atom.model_engine.page_unit_checkpoint import (
+    CheckpointRestoreOp,
+    CheckpointStoreOp,
+    PagedStateCheckpointSpec,
+)
 from atom.model_ops.v4_kernels import (
     sparse_attn_v4_paged_decode,
     sparse_attn_v4_paged_prefill,
 )
-from atom.models.deepseek_v41.config import build_attention_topology
-from tests.attentions.deepseek_v41.helpers import geometry
 
 
 @pytest.mark.parametrize("packed", [False, True])
@@ -73,7 +73,7 @@ def test_checkpoint_fork_rollback_relocation_and_slot_reuse(
     fresh = cache.begin_step([replace(span, request_id=28, position=0)])
     np.testing.assert_array_equal(cache.prepare_state(fresh), [[-1, -1, -1]])
     assert cache.state.view("window")[:, 0].count_nonzero() == 0
-    assert cache.state.view("tail_values")[:, 0].count_nonzero() == 0
+    assert cache.state.view("compress_kv")[:, 0].count_nonzero() == 0
     assert cache.cursor[0, 0] == 0
     with pytest.raises(ValueError, match="recoverable boundary"):
         cache.prepare_state(step)

@@ -333,17 +333,24 @@ def main():
         config.pool_entries = dict(runner.pool_plan.entries)
         runner.allocate_kv_cache(1024)
         if args.graph:
-            # Capture declares `ceil(max_q_len / block_size)` pages and STATE
-            # slots `[0, bs)` as scratch and scribbles on them, as V4 does
+            # Capture starts each synthetic request behind a full window, so it
+            # declares `ceil((window_size + max_q_len) / block_size)` pages and
+            # STATE slots `[0, bs)` as scratch and scribbles on them, as V4 does
             # ("the data is throwaway", deepseek_v4_attn.py) -- safe only
             # because capture precedes admission. What must stay pristine is
-            # every page it never named. No speculation in this config, so
-            # max_q_len is 1 and the scratch is page 0 alone; adding draft
-            # tokens here widens it and this assert is where you find out.
-            cache = runner.attn_metadata_builder.cache
-            before = cache.page_bytes[1:].clone()
+            # every page it never named, so the bound is computed the way the
+            # builder computes it rather than spelled: a wider window, a bigger
+            # block or draft tokens all move it, and this assert is where a
+            # capture that outgrew its scratch is found.
+            builder = runner.attn_metadata_builder
+            cache = builder.cache
+            max_q_len = runner.drafter.mtp_k + 1 if hasattr(runner, "drafter") else 1
+            scratch = -(-(cache.geometry.window_size + max_q_len) // builder.block_size)
+            before = cache.page_bytes[scratch:].clone()
             runner.capture_cudagraph()
-            torch.testing.assert_close(cache.page_bytes[1:], before, rtol=0, atol=0)
+            torch.testing.assert_close(
+                cache.page_bytes[scratch:], before, rtol=0, atol=0
+            )
             del before
         tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
         parity = compare_private_cache(runner, tokenizer)

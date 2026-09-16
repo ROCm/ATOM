@@ -2539,6 +2539,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             plan_context_lens_np,
             running_bs=running_bs,
             max_q_len=max_seqlen_q,
+            extra_write=self.max_spec_steps,
         )
 
         # ---- sync, build attn_metadata, per-fwd meta ----
@@ -2732,6 +2733,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 running_bs=ub_running_bs,
                 max_q_len=max_seqlen_q,
                 buf_prefix_ubatch=p,
+                extra_write=self.max_spec_steps,
             )
 
             attn_metadata = AttentionMetaData_DSV4(
@@ -2844,7 +2846,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             var["context_lens"].np[:scheduled_bs], dtype=np.int32
         )
         attn_metadata.compress_plans = self._build_compress_plans(
-            extend_lens_np, context_lens_np
+            # Prefill: no slack. Nothing rejects a prefill chunk, so the next
+            # fwd only ever reads back `K_pool`, and the chunk is wider than
+            # the ring anyway.
+            extend_lens_np,
+            context_lens_np,
+            extra_write=0,
         )
         # Prefill is eager (no CG), so it runs exactly what it scheduled and
         # omits `running_tokens` to say so. Must still run BEFORE
@@ -3095,6 +3102,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 np.ascontiguousarray(context_lens_np, dtype=np.int32),
                 self._unique_compress_ratios_overlap,
                 plan_buffers=ub_plan_buffers,
+                extra_write=0,  # TBO prefill is eager-only; nothing rejects it.
             )
         else:
             ub_attn.compress_plans = {}
@@ -3277,6 +3285,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 self._unique_compress_ratios_overlap,
                 plan_buffers=plan_bufs,
                 decode_capacity_per_ratio=None,
+                extra_write=self.max_spec_steps,
             )
         else:
             ub.compress_plans = {}
@@ -3872,6 +3881,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         running_bs: int | None = None,
         max_q_len: int | None = None,
         buf_prefix_ubatch: str = "",
+        extra_write: int,
     ):
         """Build per-ratio CompressPlan dict consumed by batched compressor.
 
@@ -3921,6 +3931,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             plan_buffers=plan_buffers,
             running_bs=running_bs,
             max_q_len=max_q_len,
+            extra_write=extra_write,
         )
 
     def _populate_state_slot_mappings(
@@ -4166,6 +4177,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             context_lens_np,
             running_bs=bs,
             max_q_len=max_q_len,
+            extra_write=self.max_spec_steps,
         )
         # Capture: running_bs == scheduled_bs == bs (synthetic batch is full).
         # Must run BEFORE `_attach_v4_indexer_meta` so the indexer-side meta
