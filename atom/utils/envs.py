@@ -684,6 +684,54 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_TBO_PREFILL_MIN_TOKENS": lambda: int(
         os.getenv("ATOM_TBO_PREFILL_MIN_TOKENS", "8192")
     ),
+    # Allow TBO to split a mixed prefill+decode batch. The cut is required to
+    # land inside the prefill region, giving ubatch 0 = pure prefill and
+    # ubatch 1 = [prefill tail | every decode row]; V4 rebuilds both from the
+    # parent's prefill SEGMENT metadata.
+    #
+    # This is a TAIL-LATENCY feature. Throughput is flat. Measured on V4-Pro
+    # dp8+DPA+TBO at ISL 8192 / OSL 1024 / conc 1024, both arms configured from
+    # the CI catalog cell so they differ only by this flag:
+    #
+    #   Total tok/s   52736 -> 52844   (+0.2%)
+    #   Mean TTFT     11280 -> 11685   (+3.6%)
+    #   Mean ITL      171.8 -> 172.7   (+0.6%)
+    #   P99 ITL        3470 ->  1838   (-47%)
+    #   max ITL      103967 ->  5029   (-95%)
+    #
+    # Judge it on the tail and nowhere else: mean and median ITL do not move,
+    # because the win is deleting a rare catastrophic decode stall (a single
+    # 103-second gap), not speeding up the common case. At P99 alone the win
+    # reads half its true size, and the 103 s is invisible entirely.
+    #
+    # An earlier revision of this comment claimed +4.5%/+12.0%/+18.1% output
+    # throughput. Those came from a local A/B whose control arm was missing
+    # --index_cache_dtype fp4, GPU_MAX_HW_QUEUES=5 and ATOM_NUMA_BIND=1, which
+    # cost it ~15% on its own. Do not reintroduce a throughput claim without a
+    # control arm built from the catalog.
+    #
+    # Still off by default: with it off a mixed batch vetoes TBO through
+    # `can_split`, and that is the behaviour every existing baseline was
+    # measured under.
+    "ATOM_TBO_MIXED": lambda: os.getenv("ATOM_TBO_MIXED", "0") == "1",
+    # Log how many mixed batches TBO split vs refused, and why. Diagnostic
+    # only: an accuracy run can pass while the mixed split never fires (the
+    # batches were all prefill-only, or all refused), in which case it has
+    # validated nothing about this path. Costs one dict update per step.
+    "ATOM_PROBE_TBO_MIXED": lambda: os.getenv("ATOM_PROBE_TBO_MIXED", "0") == "1",
+    # Log how each step's token budget was actually split between prefill and
+    # decode. Exists because the decode-first reserve is easy to reason about
+    # wrongly: with no spec decode it is one token per in-flight decode, so at
+    # dp8/conc1024 it is ~128 of 16384 (0.8%) and cannot by itself explain a
+    # TTFT change. Only a per-step tally settles what the budget really did.
+    "ATOM_PROBE_STEP_BUDGET": lambda: os.getenv("ATOM_PROBE_STEP_BUDGET", "0") == "1",
+    # Per-segment output magnitude for a mixed batch's two halves. A segment
+    # that is wrong usually shows it here -- zeros, NaN, or a norm an order off
+    # the other half -- and that says WHICH half to read. Registered rather than
+    # read through a raw `os.environ.get` at the call site: that sits on a
+    # per-segment per-layer path (122 reads/step) and, more to the point, an
+    # unregistered variable is one nobody can discover.
+    "ATOM_PROBE_MIXED_NORM": lambda: os.getenv("ATOM_PROBE_MIXED_NORM", "0") == "1",
     # --- PCP MoE comm mode ---
     # Fold the PCP (prefill-context-parallel) dim into the MoE tp/ep sharding.
     # Only meaningful when prefill_context_parallel_size > 1;

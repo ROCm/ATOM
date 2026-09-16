@@ -593,6 +593,54 @@ def dynamic_per_batched_tensor_quant(
     return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
 
 
+def _split_per_token_q_scale(
+    q_scale: torch.Tensor | None, n_prefill: int, n_tokens: int
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Split the activation scale the way a mixed batch splits `q`.
+
+    `q_scale` is the fused qkv_a projection's output scale
+    (`_fuse_qkv_a_proj_reduce_rmsnorm_quant_*`, deepseek_v2.py): one row per
+    token, positionally aligned with `q`. Handing the whole tensor to a half
+    that only got `q`'s slice makes that half dequantize against the *other*
+    half's scales. Nothing catches it -- the shapes still broadcast, the
+    outputs stay finite, and a prefill-only or decode-only eval never splits a
+    batch at all.
+
+    Three layouts arrive here:
+
+    - ``None`` (the un-fused path leaves it unset) and 0-d scalars
+      (`MLAAttention.one_scale`) are batch-wide. Both halves take them as-is.
+    - The fp8 producer's plain row-major ``[n_tokens, scale_n]`` slices.
+    - The fp4x2 producer's does NOT. It is built with ``shuffle=True``, and
+      aiter's `shuffle_scale` permutes the row axis within 32-row blocks and
+      pads it to a multiple of 256 taken from the *whole* batch's token count,
+      so no row range of it is a valid scale tensor for a sub-batch of its own
+      height. Refused rather than sliced; supporting it means splitting before
+      the quant rather than after, which is not a change this path can make
+      locally -- the unquantized activation is already gone by here.
+
+    Discriminated by dtype, not by shape: the padding is invisible whenever the
+    token count is already a multiple of 256, so a shape check would pass on
+    exactly the batches it needed to reject.
+    """
+    if q_scale is None or q_scale.ndim < 2:
+        return q_scale, q_scale
+    if q_scale.dtype == torch.uint8:
+        raise NotImplementedError(
+            "Mixed prefill+decode batches do not support the shuffled MXFP4 "
+            "activation-scale layout (fp4x2 attention quant): its row axis is "
+            "permuted and padded against the full batch, so neither half can "
+            "slice it. Serve this checkpoint without "
+            "--enable-mixed-prefill-decode."
+        )
+    if q_scale.shape[0] != n_tokens:
+        raise ValueError(
+            f"q_scale has {q_scale.shape[0]} rows for {n_tokens} tokens; the "
+            "positional split below assumes one row per token"
+        )
+    return q_scale[:n_prefill], q_scale[n_prefill:]
+
+
 class MLAAttention(nn.Module):
     def __init__(
         self,
@@ -1207,12 +1255,18 @@ class MLAAttention(nn.Module):
             owned_counts=owned_counts,
         )
 
-    def _v_up_proj(self, x, W_V=None, W_V_scale=None, num_heads=None):
+    def _v_up_proj(self, x, W_V=None, W_V_scale=None, num_heads=None, out=None):
         """V up-projection only: ``[B, N, kv_lora_rank] -> [B, N, v_head_dim]``.
 
         Split out so DCP decode can run it BEFORE the merge (project-before-
         merge). Weight and head count are arguments because that path projects
         the whole group with ``W_V_dcp``; every other caller uses ``self.W_V``.
+
+        ``out``, a ``[tokens, num_heads * v_head_dim]`` buffer, lets the mixed
+        prefill+decode path write the pre-o_proj decode result straight into the
+        combined tensor, so ONE o_proj -- and so one TP all-reduce -- covers both
+        segments instead of one per segment. Passing it changes the return to
+        ``out`` itself, i.e. 2-D; every other caller gets the 3-D view.
         """
         W_V = self.W_V if W_V is None else W_V
         W_V_scale = self.W_V_scale if W_V_scale is None else W_V_scale
@@ -1222,16 +1276,18 @@ class MLAAttention(nn.Module):
         # way the post-ReduceScatter tensor is.
         x = x.reshape(-1, num_heads, self.kv_lora_rank).transpose(0, 1)
         # Multiply (N, B, L) x (N, L, V) -> (N, B, V), Convert from (N, B, V) to (B, N, V)
-        # x = torch.bmm(x, self.W_UV).transpose(0, 1)
-        # Convert from (B, N, L) to (N, B, L)
         if is_rocm_aiter_fp4bmm_enabled():
-            output = torch.empty(
-                x.shape[1],
-                x.shape[0],
-                W_V.shape[1],
-                device=x.device,
-                dtype=torch.bfloat16,
-            )
+            if out is not None:
+                # Kernel writes straight into the caller's combined buffer.
+                output = out.view(x.shape[1], x.shape[0], W_V.shape[1])
+            else:
+                output = torch.empty(
+                    x.shape[1],
+                    x.shape[0],
+                    W_V.shape[1],
+                    device=x.device,
+                    dtype=torch.bfloat16,
+                )
             output = batched_gemm_a16wfp4(
                 x,
                 W_V,
@@ -1241,12 +1297,18 @@ class MLAAttention(nn.Module):
                 prequant=True,
                 y_scale=None,
             )
-            # x = x.transpose(0, 1).flatten(1, 2)
+            if out is not None:
+                return out
             x = output
         else:
             x = _aiter_triton_fp8_bmm(
                 x, W_V, W_V_scale, group_size=128, transpose_bm=True
             )
+        if out is not None:
+            # fp8 path: the bmm allocated its own output, so this is the one
+            # branch that still needs a copy into the caller's buffer.
+            out.copy_(x.reshape(-1, num_heads * self.v_head_dim))
+            return out
         return x.reshape(-1, num_heads, self.v_head_dim)
 
     @mark_trace(prefix="v_up_proj_and_o_proj", torch_compile=False)
@@ -1368,6 +1430,7 @@ class MLAAttention(nn.Module):
         prefill_q: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetaData,
+        apply_o_proj: bool = True,
     ) -> torch.Tensor:
         """Legacy single-pass path: gather the full cached+new context into
         k_full / v_full and run one flash_attn. OOMs on long contexts (peak
@@ -1410,7 +1473,8 @@ class MLAAttention(nn.Module):
             softmax_scale=self.scale,
             causal=True,
         )
-        return self.o_proj(output.flatten(start_dim=-2))
+        output = output.flatten(start_dim=-2)
+        return output if not apply_o_proj else self.o_proj(output)
 
     def _gather_cached_kv_b_proj(
         self,
@@ -1517,6 +1581,7 @@ class MLAAttention(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetaData,
         chunk_meta,
+        apply_o_proj: bool = True,
     ) -> torch.Tensor:
         """Chunked prefill for the has_cached branch.
 
@@ -1672,7 +1737,8 @@ class MLAAttention(nn.Module):
                 suffix_output=new_out,
                 suffix_lse=new_lse,
             )
-        return self.o_proj(output.flatten(start_dim=-2))
+        output = output.flatten(start_dim=-2)
+        return output if not apply_o_proj else self.o_proj(output)
 
     def _dcp_compute_prefill_context(
         self,
@@ -1808,6 +1874,8 @@ class MLAAttention(nn.Module):
         k_rope: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: AttentionMetaData,
+        apply_o_proj: bool = True,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert attn_metadata is not None
 
@@ -1911,9 +1979,17 @@ class MLAAttention(nn.Module):
             dropout_p=attn_metadata.dropout_p,
             softmax_scale=self.scale,
             causal=True,
+            out=(
+                None if out is None else out.view(-1, self.num_heads, self.v_head_dim)
+            ),
         )
 
-        return self.o_proj(output.flatten(start_dim=-2))
+        # When `out` is provided, flash wrote directly into it (mixed path writes
+        # the prefill segment straight into the shared pre-o_proj buffer, no cat).
+        if out is not None:
+            return out
+        output = output.flatten(start_dim=-2)
+        return output if not apply_o_proj else self.o_proj(output)
 
     def _forward_prefill_mla(
         self,
@@ -2233,6 +2309,8 @@ class MLAAttention(nn.Module):
         attn_metadata: AttentionMetaData,
         return_lse: bool = False,
         q_prepadded: bool = False,
+        apply_o_proj: bool = True,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # attn_metadata.causal is True for the target; False only for DSpark's
         # bidirectional draft block (set by the proposer). The asm kernel picks
@@ -2474,7 +2552,11 @@ class MLAAttention(nn.Module):
             # Bound for a cross-rank combine rather than the bmm: materialise.
             return o.contiguous(), final_lse.contiguous()
 
-        return self._v_up_proj_and_o_proj(o)
+        return (
+            self._v_up_proj(o, out=out)
+            if not apply_o_proj
+            else self._v_up_proj_and_o_proj(o)
+        )
 
     def _pcp_write_full_kv(self, kv_cache, k_nope, k_rope, slot_mapping):
         """Write an already-roped full k (kv_lora + rope) into the k-cache.
@@ -2610,6 +2692,180 @@ class MLAAttention(nn.Module):
         _, k_pe = self.rotary_emb(positions, torch.empty_like(k_pe), k_pe)
         self._pcp_write_full_kv(kv_cache, kv_c, k_pe, slot_mapping)
 
+    def _forward_mixed(
+        self,
+        *,
+        q: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_rope: torch.Tensor,
+        positions: torch.Tensor,
+        q_scale: torch.Tensor | None,
+        kv_cache: torch.Tensor,
+        attn_metadata,
+        context,
+        use_prefill_mla: bool,
+    ) -> torch.Tensor:
+        """The mixed prefill+decode arm of `forward_impl`, on its own.
+
+        Extracted because inline it was the fourth arm of an if/elif chain in a
+        430-line function, and the one arm that runs each half of the batch
+        through a DIFFERENT attention path -- the thing most worth reading in
+        isolation was the thing hardest to find.
+
+        Every argument is passed explicitly rather than read off the enclosing
+        scope: this arm splits `q`, `k_nope`, `k_rope`, `positions` and
+        `q_scale` positionally, and the pairing between a tensor and its scale
+        is exactly what went wrong here once already (the scale was not split
+        alongside `q`). A signature makes the set it operates on countable.
+        """
+        # Mixed prefill+decode split dispatch: the first `num_prefill_tokens`
+        # rows are prefill chunks (MHA path), the rest are decode tokens (MLA
+        # latent path). Each half runs its own Q/KV/O projections against its
+        # own nested metadata, then outputs are concatenated (same hidden dim).
+        # `raise`, not `assert`: under `python -O` an assert is stripped
+        # and the branch below runs the dense path against sparse
+        # metadata. Config._validate_mixed_prefill_decode should have refused this combination at launch; reaching here means that table has a gap.
+        if self.is_sparse_mla:
+            raise NotImplementedError(
+                "Mixed prefill+decode batches do not yet support sparse "
+                "MLA (V3.2/V4 indexer). Disable "
+                "--enable-mixed-prefill-decode."
+            )
+        if use_prefill_mla:
+            raise NotImplementedError(
+                "Mixed prefill+decode batches do not support the "
+                "prefill-MLA (sparse) path. Disable "
+                "--enable-mixed-prefill-decode."
+            )
+        n_prefill = context.num_prefill_tokens
+        prefill_meta = attn_metadata.prefill_attn_metadata
+        decode_meta = attn_metadata.decode_attn_metadata
+
+        # `q` is split below, so its per-token scale must be too -- the
+        # two are positionally aligned and only the pair is meaningful.
+        q_scale_p, q_scale_d = _split_per_token_q_scale(q_scale, n_prefill, q.size(0))
+
+        # ---- Prefill half: MHA path ----
+        q_p = q[:n_prefill]
+        k_nope_p = k_nope[:n_prefill]
+        k_rope_p = k_rope[:n_prefill]
+        positions_p = positions[:n_prefill]
+
+        # This half IS a prefill, so the same QREP rule as the pure-prefill
+        # branch applies: take only this rank's heads, or the view below
+        # reads the whole DCP group's head set at the wrong shape.
+        proj_p = self._local_q_proj() if self.qrep_enabled else self.q_proj
+        prefill_q = proj_p(q_p, x_scale=q_scale_p).view(
+            -1, self.num_heads, self.qk_head_dim
+        )
+        prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
+        self.rotary_emb(positions_p, prefill_q_pe, k_rope_p)
+
+        if kv_cache.numel() > 0:
+            concat_and_cache_mla(
+                k_nope_p,
+                k_rope_p.squeeze(1),
+                kv_cache,
+                prefill_meta.slot_mapping.flatten(),
+                kv_cache_dtype=self.kv_cache_dtype,
+                scale=self._k_scale,
+            )
+
+        # Preallocate the combined pre-o_proj output [n_total, num_heads*v_head_dim]
+        # and write each segment straight into its slice (vLLM-style), so a single
+        # o_proj runs over the whole tensor and no torch.cat is needed.
+        attn_out = torch.empty(
+            (q.size(0), self.num_heads * self.v_head_dim),
+            # `self.dtype`, the same source the non-mixed `_forward_decode`
+            # allocates its output from -- NOT `q.dtype`: `q` here is
+            # `hidden_states_or_q_c`, which the fused qkv_a path hands over
+            # already quantized (fp8, or uint8 for fp4x2), and allocating
+            # the pre-o_proj accumulator at that width would be a silent
+            # precision collapse on exactly the checkpoints people serve.
+            dtype=self.dtype,
+            device=q.device,
+        )
+        out_prefill = attn_out[:n_prefill]
+        out_decode = attn_out[n_prefill:]
+
+        if prefill_meta.has_cached:
+            chunk_meta = getattr(prefill_meta, "mla_chunk_meta", None)
+            if chunk_meta is not None:
+                # Cached prefill has no out= path yet; copy its
+                # result into the slice.
+                out_prefill.copy_(
+                    self._forward_prefill_cached_chunked(
+                        prefill_q,
+                        k_nope_p,
+                        k_rope_p,
+                        kv_cache,
+                        prefill_meta,
+                        chunk_meta,
+                        apply_o_proj=False,
+                    )
+                )
+            else:
+                out_prefill.copy_(
+                    self._forward_prefill_cached_single_pass(
+                        prefill_q, kv_cache, prefill_meta, apply_o_proj=False
+                    )
+                )
+        else:
+            self._forward_prefill_mha(
+                prefill_q,
+                k_nope_p,
+                k_rope_p,
+                kv_cache,
+                prefill_meta,
+                apply_o_proj=False,
+                out=out_prefill,
+            )
+
+        # ---- Decode half: MLA latent path ----
+        q_d = q[n_prefill:]
+        k_nope_d = k_nope[n_prefill:]
+        k_rope_d = k_rope[n_prefill:]
+        positions_d = positions[n_prefill:]
+
+        q_nope_d, q_rope_d = self._q_proj_and_k_up_proj(q_d, x_scale=q_scale_d)
+        q_out_d = torch.empty(
+            (
+                q_nope_d.shape[0],
+                self.num_heads,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+            ),
+            dtype=decode_meta.dtype_q,
+            device=q_nope_d.device,
+        )
+        if kv_cache.numel() > 0:
+            fused_qk_rope_concat_and_cache_mla(
+                q_nope_d,
+                q_rope_d,
+                k_nope_d,
+                k_rope_d,
+                kv_cache.view(
+                    kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
+                ),
+                q_out_d,
+                decode_meta.slot_mapping,
+                self._k_scale,
+                self._q_scale,
+                positions_d,
+                self.rotary_emb.cos_cache,
+                self.rotary_emb.sin_cache,
+                is_neox=self.rotary_emb.is_neox_style,
+                is_nope_first=True,
+            )
+
+        self._forward_decode(
+            q_out_d, kv_cache, decode_meta, apply_o_proj=False, out=out_decode
+        )
+
+        # Both segments wrote their pre-o_proj results into slices of attn_out;
+        # a single o_proj (one TP all-reduce) over the combined tensor — no cat,
+        # no extra allocation. Matches vLLM's MLA layout.
+        return self.o_proj(attn_out)
+
     def forward_impl(
         self,
         q: torch.Tensor,
@@ -2637,7 +2893,19 @@ class MLAAttention(nn.Module):
         kv_cache_data = forward_context.kv_cache_data
         kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
 
-        if context.is_prefill and not use_prefill_mla:
+        if context.is_mixed:
+            output = self._forward_mixed(
+                q=q,
+                k_nope=k_nope,
+                k_rope=k_rope,
+                positions=positions,
+                q_scale=q_scale,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+                context=context,
+                use_prefill_mla=use_prefill_mla,
+            )
+        elif context.is_prefill and not use_prefill_mla:
             # QREP: q_proj emits the whole DCP-group head set, but prefill needs
             # only this rank's heads (QREP optimizes decode's AllGather Q, not
             # prefill).
