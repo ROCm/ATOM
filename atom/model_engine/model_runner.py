@@ -815,6 +815,14 @@ class ModelRunner:
                     self.drafter.model, fullgraph=True, backend="eager"
                 )
 
+    @staticmethod
+    def _config_declares_engram(config) -> bool:
+        """Whether the model config declares engram layers, read without mapping
+        the ~200 GB host tables (detection must precede model construction)."""
+        from atom.model_ops.engram import config_declares_engram
+
+        return config_declares_engram(config.hf_config)
+
     def _build_and_load_model(self, model_class):
         """Construct the model and load its weights from disk.
 
@@ -822,6 +830,58 @@ class ModelRunner:
         construct on the meta device and import weights via IPC instead.
         """
         config = self.config
+        # Reject unsupported engram combinations BEFORE constructing the model,
+        # which memory-maps ~200 GB of host tables (detected from the config so we
+        # never map the tables just to raise afterwards):
+        if self._config_declares_engram(config):
+            # Speculative decoding / MTP: the host prefetch keys on one sampled
+            # token per sequence per step and cannot carry a spec step's
+            # candidates or n-gram context.
+            if config.speculative_config is not None:
+                raise NotImplementedError(
+                    "engram is not supported with speculative decoding / MTP; "
+                    "serve engram models without a speculative_config"
+                )
+            # Two-batch overlap / context or pipeline parallel: staging covers the
+            # whole batch and waits on the caller's stream, but these modes run the
+            # model on a sliced/round-robined subset of rows (and, for TBO, on
+            # per-ubatch streams), so the staged rows would not line up with the
+            # local hidden states. Pipeline parallel also returns before
+            # postprocess on non-last ranks, so the prefetch never runs.
+            if config.enable_tbo or config.enable_tbo_decode:
+                raise NotImplementedError(
+                    "engram is not supported with two-batch overlap (TBO); serve "
+                    "engram models without --enable-tbo/--enable-tbo-decode"
+                )
+            if (
+                config.pipeline_parallel_size > 1
+                or config.prefill_context_parallel_size > 1
+                or config.decode_context_parallel_size > 1
+            ):
+                raise NotImplementedError(
+                    "engram is not supported with pipeline or context parallelism; "
+                    "serve engram models with pipeline/context parallel size 1"
+                )
+            # KV-transfer disaggregation: the decode consumer is marked
+            # is_first_decode without a local prefill, so no prefill_context is
+            # populated and the n-gram window is never seeded -- the first decode
+            # would pad every multi-token n-gram instead of using the prompt tail.
+            if config.kv_transfer_config:
+                raise NotImplementedError(
+                    "engram is not supported with KV-transfer disaggregation; the "
+                    "decode consumer runs no local prefill to seed the n-gram context"
+                )
+            # Fail closed BEFORE constructing and loading the model (which maps
+            # ~200 GB of tables and allocates the full weights): if the resolved
+            # model class does not implement build_engram_host, serving it would
+            # silently ignore the engram weights. _init_engram_host re-checks the
+            # built instance as the final gate (and catches a None return).
+            if not hasattr(model_class, "build_engram_host"):
+                raise NotImplementedError(
+                    f"{model_class.__name__} config declares engram layers but the "
+                    "model class does not implement build_engram_host; serving "
+                    "would silently ignore the engram weights"
+                )
         self.model = model_class(config)
         fused_shared_expert_load_fn = None
         if hasattr(self.model, "load_fused_expert_weights"):
@@ -840,6 +900,109 @@ class ModelRunner:
             f"[{self.rank_name}] Model load done: {config.model} "
             f"(weights loaded in {load_elapsed:.2f}s)"
         )
+        self._init_engram_host()
+
+    def _init_engram_host(self) -> None:
+        """Attach the engram host path, for models that have engram layers.
+
+        The model owns its tables (it is what loaded them) and hands back the
+        EngramHost; the runner owns the lifecycle and the two hooks below. Models
+        without engram leave this None and pay nothing but the attribute.
+        """
+        self.engram = None
+        build_engram_host = getattr(self.model, "build_engram_host", None)
+        if build_engram_host is None:
+            # Fail closed rather than silently serve the base model: a config that
+            # declares engram layers but resolves to a model that does not wire
+            # build_engram_host would otherwise ignore the engram weights and
+            # return wrong output while the request still succeeds.
+            if self._config_declares_engram(self.config):
+                raise NotImplementedError(
+                    f"{type(self.model).__name__} config declares engram layers "
+                    "but the model does not implement build_engram_host; serving "
+                    "would silently ignore the engram weights"
+                )
+            return
+        # engram + speculative decoding is rejected earlier, in
+        # _build_and_load_model, before the host tables are mapped.
+        self.engram = build_engram_host(
+            device=self.device,
+            max_num_tokens=self.config.max_num_batched_tokens,
+            max_num_seqs=self.config.max_num_seqs,
+        )
+        if self.engram is None:
+            # build_engram_host may return None; fail closed when the config still
+            # declares engram, so the base model is not served without it.
+            if self._config_declares_engram(self.config):
+                raise NotImplementedError(
+                    f"{type(self.model).__name__} declares engram layers but "
+                    "build_engram_host returned None; serving would silently "
+                    "ignore the engram weights"
+                )
+            return
+        logger.info(
+            f"[{self.rank_name}] engram host path active on layers "
+            f"{list(self.engram.layer_ids)}"
+        )
+
+    def _stage_engram(self, batch: ScheduledBatch) -> None:
+        """Stage this step's engram embeddings to the device before the forward.
+
+        Decode stages the rows the prefetch gathered; prefill gathers every
+        prompt position's n-gram (carrying the tokens preceding a chunk); a dummy
+        warmup/capture pass stages zeros.
+        """
+        # Drop finished/preempted requests before staging, so a reused id is
+        # dropped first and then re-seeded below.
+        if getattr(batch, "engram_dropped", None):
+            self.engram.drop_requests(batch.engram_dropped)
+        seq_ids = list(batch.req_ids)
+        if batch.is_dummy_run or not seq_ids:
+            self.engram.stage_dummy(batch.total_tokens_num)
+            self.engram.wait_for_embeddings()
+            return
+        if batch.total_tokens_num_prefill > 0:
+            # Prefill (possibly chunked): each request's chunk is a slice of
+            # scheduled_tokens; prefill_context carries the max_ngram_size-1 tokens
+            # before the chunk so its leading positions hash with real context.
+            assert (
+                batch.total_tokens_num_decode == 0
+            ), "engram does not support mixed prefill+decode batches"
+            offsets = np.concatenate(([0], np.cumsum(batch.num_scheduled_tokens)))
+            chunk_tokens = [
+                batch.scheduled_tokens[offsets[i] : offsets[i + 1]].astype(np.int64)
+                for i in range(len(seq_ids))
+            ]
+            context = batch.prefill_context or [[]] * len(seq_ids)
+            context_tails = [np.asarray(c, dtype=np.int64) for c in context]
+            final_mask = (
+                list(batch.is_final_chunk) if batch.is_final_chunk is not None else None
+            )
+            self.engram.stage_prefill(
+                seq_ids, chunk_tokens, context_tails, final_mask=final_mask
+            )
+            self.engram.wait_for_embeddings()
+            return
+        # `tokens` recomputes a prefetch miss only for a missed row with no
+        # window (a cold/just-admitted row, where scheduled_tokens is its real
+        # anchor); a carried-over row uses its window, so its placeholder is never
+        # read.
+        tokens = batch.scheduled_tokens[: len(seq_ids)].astype(np.int64).reshape(-1, 1)
+        # Stage to the SETTLED forward's row count so the engram layers match the
+        # padded forward exactly. ForwardMode.decide() owns the dispatch: it pads
+        # to a CUDAGraph bucket (running_tokens) when a graph runs, and runs eager
+        # at the scheduled row count otherwise -- enforce_eager, a batch above the
+        # largest captured bucket, or a DP peer that prefills while this rank
+        # decodes (use_cudagraph=False, running_tokens=scheduled_tokens). Re-
+        # deriving a bucket from capture_sizes would over-pad those eager steps and
+        # make EngramOp reject the hidden/embedding token mismatch, so pad only
+        # when the settled mode actually uses a graph.
+        padded_rows = len(seq_ids)
+        forward_mode = get_forward_context().context.forward_mode
+        if forward_mode is not None and forward_mode.use_cudagraph:
+            padded_rows = max(padded_rows, int(forward_mode.running_tokens))
+        self.engram.stage_embeddings(seq_ids, tokens, padded_rows=padded_rows)
+        self.engram.wait_for_embeddings()
 
     def _maybe_warmup(self):
         """Run model warmup. Override point: the rapidserve decode process
@@ -963,6 +1126,9 @@ class ModelRunner:
         if not self.still_running:
             return
         self.still_running = False
+        # Stop the engram prefetch worker so it does not outlive teardown.
+        if getattr(self, "engram", None) is not None:
+            self.engram.shutdown()
         # 0. Join any offload connector's copy threads. Its ThreadPoolExecutors
         #    are non-daemon, so leaving them running wedges interpreter shutdown
         #    or races an in-flight copy against atexit. Must run BEFORE the KV
@@ -3066,6 +3232,26 @@ class ModelRunner:
         req_ids_out = [k for k in token_id_dict if k != -1]
         token_ids_out = [token_id_dict[k] for k in req_ids_out]
 
+        # Prefetch on the just-sampled token (the NEXT step's input), not the
+        # deferred one, which would prefetch a step stale. `prefetch_next` gathers
+        # its embedding on the worker overlapping postprocess, and copies the
+        # token to the host async, so this thread pays no D2H sync.
+        if getattr(self, "engram", None) is not None and not batch.is_dummy_run:
+            req_ids = list(batch.req_ids)
+            final = batch.is_final_chunk
+            if final is None:
+                # Decode batch: every row's sampled token is its next input.
+                self.engram.prefetch_next(req_ids, sampled_tokens)
+            else:
+                # Prefill batch: a middle chunk's next input is the next prompt
+                # token, not this sampled value, so prefetching it would advance
+                # the window and cache a wrong embedding. Only final chunks go on
+                # to decode; middle rows are re-seeded when their final chunk stages.
+                keep = [i for i, is_final in enumerate(final) if is_final]
+                if keep:
+                    rows = sampled_tokens.reshape(len(req_ids), -1)[keep]
+                    self.engram.prefetch_next([req_ids[i] for i in keep], rows)
+
         draft_token_ids: np.ndarray | None = None
         if self.tokenID_processor.is_deferred_out:
             if hasattr(self, "drafter"):
@@ -3181,6 +3367,8 @@ class ModelRunner:
             needs_independent_noise,
         ) = self.prepare_model(batch)
         self._mark_staging_h2d_enqueued()
+        if getattr(self, "engram", None) is not None:
+            self._stage_engram(batch)
         logits, hidden_states = self.run_model(input_ids, batch)
 
         pp_group = get_pp_group()
@@ -3633,6 +3821,12 @@ class ModelRunner:
                 ubatch_slices=None,
                 in_hipgraph=True,
             )
+            # Engram stages per forward; re-stage zeros at this capture width or
+            # the engram layer sees the previous stage's row count. Eager here,
+            # before the piecewise capture below.
+            if getattr(self, "engram", None) is not None:
+                self.engram.stage_dummy(num_tokens_dp)
+                self.engram.wait_for_embeddings()
             # Warmup, then the PIECEWISE forward: dense pieces replay (deduped by
             # num_tokens); attn_ffn op captures its (bs, q_eff, num_tokens_pad) graph.
             self.model(input_ids[:num_tokens_dp], model_positions)
@@ -3876,6 +4070,14 @@ class ModelRunner:
                         if self.use_mrope
                         else positions[:num_tokens]
                     )
+                    # Engram stages per forward; capture buckets run at fewer
+                    # tokens than warmup, so re-stage zeros at this width or the
+                    # engram layer sees the previous stage's row count against
+                    # num_tokens hidden and raises. Eager, before capture — the
+                    # H2D must not bake into the graph.
+                    if getattr(self, "engram", None) is not None:
+                        self.engram.stage_dummy(num_tokens)
+                        self.engram.wait_for_embeddings()
                     model_output = self.model(input_ids[:num_tokens], model_positions)
                     outputs[:num_tokens] = model_output
                     if self.logits_in_graph:
@@ -4112,6 +4314,16 @@ class RapidServeModelRunner(ModelRunner):
     """
 
     def __init__(self, rank, config):
+        # Engram staging lives only on the base ModelRunner.forward path. This
+        # runner's prefill_forward/forward overrides call run_model directly and
+        # the decode process skips _init_engram_host, so an engram model would
+        # silently run without its trained contribution in both processes.
+        # Reject it up front rather than serve wrong output.
+        if self._config_declares_engram(config):
+            raise NotImplementedError(
+                "engram is not supported with prefill/decode disaggregation "
+                "(rapidserve); serve engram models without disaggregation"
+            )
         if not config.disagg_is_decode:
             self.forward = self.prefill_forward
         super().__init__(rank, config)
