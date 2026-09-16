@@ -88,7 +88,7 @@ on:
 # follows, and the line that used to be stable simply stops being built.
 env:
   LINE_STABLE: rocm7
-  LINE_NEXT: rocm10
+  LINE_NEXT: rocm10.0
 
 jobs:
   # Which lines this run builds. A separate job because `strategy.matrix` is
@@ -228,7 +228,7 @@ jobs:
             rocm7)
               BASE_IMAGE="rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0"
               ;;
-            rocm10)
+            rocm10.0)
               # rocm10-base is a stage inside atom_release.dockerfile, not an
               # image to pull: the ROCm 10 stack is assembled from the AMD
               # stable wheel channel on plain ubuntu:24.04.
@@ -315,6 +315,18 @@ jobs:
             fi
             TAG_SUFFIX="-rocm$(echo "${ROCM_VER}" | cut -d. -f1,2)"
             echo "Line ${FLAVOR} carries ROCm ${ROCM_VER}; tag suffix ${TAG_SUFFIX}"
+            # A line named for a ROCm version has to carry that version. If
+            # someone changes ROCM_SDK_VERSION without renaming the line, the
+            # derived tag would quietly stop matching the name everything else
+            # is written in. Fail instead.
+            case "${FLAVOR}" in
+              rocm[0-9]*.[0-9]*)
+                if [ "${FLAVOR}" != "${TAG_SUFFIX#-}" ]; then
+                  echo "Line is called ${FLAVOR} but the image carries ROCm ${ROCM_VER} (${TAG_SUFFIX#-})."
+                  exit 1
+                fi
+                ;;
+            esac
           fi
           echo "TAG_SUFFIX=${TAG_SUFFIX}" >> "${GITHUB_ENV}"
 
