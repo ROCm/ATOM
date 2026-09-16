@@ -300,6 +300,64 @@ def test_mooncake_tcp_forces_transfer_engine_transport(monkeypatch):
     assert os.environ["MC_FORCE_TCP"] == "true"
 
 
+@pytest.mark.parametrize("device", ["", "ionic_0"])
+def test_mooncake_hip_initializes_without_hca_discovery(monkeypatch, device):
+    from conftest import atom_config_double
+
+    import atom.kv_transfer.disaggregation.mooncake.mooncake_connector as mc
+
+    group = SimpleNamespace(rank_in_group=0, world_size=1)
+    monkeypatch.setattr(mc, "get_tp_group", lambda: group)
+    monkeypatch.setattr(mc, "get_dp_group", lambda: group)
+    monkeypatch.setattr(mc, "get_ip", lambda: "127.0.0.1")
+    monkeypatch.setattr(mc, "_MOONCAKE_AVAILABLE", True)
+    engine = MagicMock()
+    engine.initialize.return_value = 0
+    engine.get_rpc_port.return_value = 12345
+    monkeypatch.setattr(mc, "TransferEngine", lambda: engine, raising=False)
+    monkeypatch.setattr(mc.torch.cuda, "current_device", lambda: 0)
+
+    def unexpected_hca_lookup(*args):
+        pytest.fail("HIP must not discover HCAs or resolve an RDMA-local IP")
+
+    monkeypatch.setattr(mc, "_auto_select_ib_device", unexpected_hca_lookup)
+    monkeypatch.setattr(mc, "_ip_for_ib_device", unexpected_hca_lookup)
+    # UUID visibility must never be parsed as a physical HCA index in HIP mode.
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "GPU-uuid-for-local-device")
+    monkeypatch.setenv("ATOM_MOONCAKE_IB_DEVICE", device)
+    monkeypatch.setenv("MC_FORCE_TCP", "true")
+    monkeypatch.setenv("MC_DISABLE_HIP", "1")
+    config = atom_config_double(
+        parallel_config=SimpleNamespace(pipeline_parallel_rank=0),
+        hf_config=SimpleNamespace(num_hidden_layers=1),
+        dcp_config=SimpleNamespace(interleave_size=1),
+        kv_transfer_config={
+            "kv_connector": "mooncake",
+            "kv_role": "kv_consumer",
+            "protocol": " HIP ",
+            "ib_device": device,
+        },
+    )
+    connector = mc.MooncakeConnector(config)
+    try:
+        engine.initialize.assert_called_once_with(
+            "127.0.0.1", "P2PHANDSHAKE", "hip", mc.MOONCAKE_HIP_ONLY_DEVICE_FILTER
+        )
+        assert connector.protocol == "hip"
+        assert "MC_FORCE_TCP" not in os.environ
+        assert "MC_DISABLE_HIP" not in os.environ
+    finally:
+        connector.zmq_context.term()
+
+
+@pytest.mark.parametrize("protocol", ["rdma", "tcp"])
+def test_mooncake_non_hip_engine_filter_is_unchanged(protocol):
+    import atom.kv_transfer.disaggregation.mooncake.mooncake_connector as mc
+
+    ib_device = "ionic_4" if protocol == "rdma" else ""
+    assert mc._engine_device_filter(protocol, ib_device) == ib_device
+
+
 def test_mooncake_rdma_preserves_explicit_device():
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
