@@ -124,7 +124,8 @@ CI environment handling and are independent of metrics collection.
 The TSDB uses temporary node-local storage. Scraping and engine/API snapshots
 default to every second (subject to engine progress). Set
 `ATOM_METRICS_UPDATE_INTERVAL_S` before starting all service processes to change
-the shared internal update interval; it must be finite and positive. Configure
+the shared internal update interval; invalid values log a warning and fall back
+to 1 second. Valid values must be finite and positive. Configure
 the collector separately with `--scrape-interval-seconds`, placed before the
 `--` introducing the benchmark command. It accepts seconds at millisecond
 precision, with a minimum of `0.001`; for example, `0.5` produces `500ms` scrapes.

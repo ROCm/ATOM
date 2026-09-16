@@ -18,20 +18,30 @@ Third-party / dependency env vars (NCCL, torch, HuggingFace, AITER, FLA) are
 documented at the bottom of this file but NOT managed here.
 """
 
+import logging
 import math
 import os
 from collections.abc import Callable
 from typing import Any
 
+logger = logging.getLogger("atom")
+
 
 def _positive_float_env(name: str, default: str) -> float:
+    raw_value = os.getenv(name, default)
     try:
-        value = float(os.getenv(name, default))
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a finite positive number") from exc
-    if not math.isfinite(value) or value <= 0:
-        raise ValueError(f"{name} must be a finite positive number")
-    return value
+        value = float(raw_value)
+        if math.isfinite(value) and value > 0:
+            return value
+    except ValueError:
+        pass
+    logger.warning(
+        "Invalid %s=%r: expected a finite positive number; using default %s",
+        name,
+        raw_value,
+        default,
+    )
+    return float(default)
 
 
 environment_variables: dict[str, Callable[[], Any]] = {

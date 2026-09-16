@@ -42,8 +42,10 @@ def samples(exporter):
 
 
 @pytest.mark.parametrize("kind", ["ordinary", "dp", "pp_head", "pp_downstream"])
-@pytest.mark.parametrize("configured", [None, "0.25"])
-def test_engine_push_loops_use_shared_interval(monkeypatch, kind, configured):
+@pytest.mark.parametrize(
+    "configured,interval", [(None, 1.0), ("0.25", 0.25), ("0", 1.0), ("bad", 1.0)]
+)
+def test_engine_push_loops_use_shared_interval(monkeypatch, kind, configured, interval):
     from aiter_stub import stubbed_aiter
 
     with stubbed_aiter():
@@ -53,7 +55,6 @@ def test_engine_push_loops_use_shared_interval(monkeypatch, kind, configured):
         monkeypatch.delenv("ATOM_METRICS_UPDATE_INTERVAL_S", raising=False)
     else:
         monkeypatch.setenv("ATOM_METRICS_UPDATE_INTERVAL_S", configured)
-    interval = float(configured or 1)
     now = [0.0]
     ticks = iter([0, interval / 2, interval, 2 * interval])
     pushed = []

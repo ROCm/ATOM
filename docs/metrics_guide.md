@@ -61,8 +61,10 @@ This replaces custom histogram transport with the standard client while
 keeping one endpoint per node rather than one per internal worker. Existing
 engine, cache, queue and offload state metrics still use their pre-existing
 snapshots and exporter. Their refresh and idle GPU-event polling use
-`ATOM_METRICS_UPDATE_INTERVAL_S` (default 1 second). GPU polling only observes
-completed events; it returns no metrics payload and never synchronizes a GPU.
+`ATOM_METRICS_UPDATE_INTERVAL_S` (default 1 second). Invalid values log a warning
+and fall back to 1 second; valid values must be finite and positive. GPU polling
+only observes completed events; it returns no metrics payload and never
+synchronizes a GPU.
 Native histogram observations do not wait for a snapshot refresh.
 
 The API endpoint retains on-demand thread rendering. Multiprocess storage does

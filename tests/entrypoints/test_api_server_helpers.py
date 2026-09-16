@@ -610,7 +610,12 @@ class TestLifespanOwnsTheBackgroundTasks:
         assert all(t.cancelled() for t in tasks)
         assert api_server._background_tasks == []
 
-    def test_metrics_refresh_uses_shared_interval(self, monkeypatch):
+    @pytest.mark.parametrize(
+        "configured,expected", [("0.25", 0.25), ("0", 1.0), ("bad", 1.0)]
+    )
+    def test_metrics_refresh_uses_shared_interval(
+        self, monkeypatch, configured, expected
+    ):
         intervals = {}
         periodic = api_server._periodic
 
@@ -619,8 +624,11 @@ class TestLifespanOwnsTheBackgroundTasks:
             return periodic(interval, step)
 
         monkeypatch.setattr(api_server, "_periodic", capture)
-        self._run(monkeypatch, interval="0.25")
-        assert intervals == {"_refresh_metrics_once": 0.25, "_reclaim_watch_once": 3600}
+        self._run(monkeypatch, interval=configured)
+        assert intervals == {
+            "_refresh_metrics_once": expected,
+            "_reclaim_watch_once": 3600,
+        }
 
 
 class TestTheCensusEndpointKeepsTheLoopFree:
