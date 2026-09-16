@@ -7,6 +7,7 @@ import os
 import torch
 
 from atom.utils.forward_context import set_kv_cache_data
+from atom.utils.graph_holders import release_registered_graphs
 
 logger = logging.getLogger("atom")
 
@@ -51,7 +52,7 @@ def sleep_keeps_memory_resident(runner) -> bool:
 
 
 def release_cudagraphs(runner) -> None:
-    """Drop *runner*'s captured decode graphs and mark them for recapture.
+    """Drop every captured graph *runner* holds, and mark them for recapture.
 
     A graph replays the addresses it captured: every weight, and the base of
     the KV pool. Whichever of the two a release frees, the graphs that
@@ -59,35 +60,118 @@ def release_cudagraphs(runner) -> None:
     here. Releasing the KV pool alone -- what `AsyncLLMEngine.sleep(level=1)`
     does, and the default level -- used to leave the graphs in place to be
     replayed against a pool that had since been freed and reallocated.
+
+    `runner.graphs` holds one of four stores, and not the one the default
+    configuration fills: `--level 3` is PIECEWISE, where the graphs are one per
+    compiled dense piece and that dict stays empty however much was captured.
+    So each store is asked separately and the answers are OR-ed -- "was
+    anything captured" is not a question `runner.graphs` can answer. Gating the
+    whole function on it, which is what this used to do, made the release a
+    no-op on precisely the configuration whose fault it exists to prevent.
     """
     if getattr(runner, "enforce_eager", True):
         return
-    # Under TBO the replayable handle is in `runner.graphs` like any other, but
-    # `UBatchWrapper` keeps a parallel entry per shape holding the graph, its
-    # per-ubatch contexts and the output tensor it captured. Left behind, that
-    # entry pins the graph's private memory pool -- the footprint the caller
-    # went to sleep to reclaim -- until a recapture happens to overwrite the
-    # same key. `ModelRunner.exit()` has always cleared both stores; a release
-    # for sleep has to clear the same two.
-    tbo_graphs = getattr(getattr(runner, "model", None), "tbo_graphs", None)
-    if tbo_graphs:
-        tbo_graphs.clear()
-        logger.info(f"{runner.label}: TBO CUDA graphs released for sleep")
-    if not getattr(runner, "graphs", None):
+    released = _release_tbo_graphs(runner)
+    released |= _release_piecewise_graphs(runner)
+    released |= _release_draft_graphs(runner)
+    released |= _release_manual_graphs(runner)
+    if not released:
         return
-    runner._graphs_backup_keys = list(runner.graphs.keys())
-    runner.graphs.clear()
+    # What `_recapture_cudagraphs_if_needed` gates on. Not `_graphs_backup_keys`:
+    # that list belongs to the manual store and is empty under PIECEWISE, which
+    # is how the recapture came to be skipped there along with the release.
+    runner._graphs_released_for_sleep = True
+    # Every graph that could have been sharing it is gone, so the next capture
+    # makes its own. Under PIECEWISE the handle parked here is the DRAFT pool's
+    # -- `warmup_draft_graphs` publishes it there -- since a piecewise capture
+    # records no whole-forward graph to own one.
     runner.graph_pool = None
+    logger.info(f"{runner.label}: CUDA graphs released for sleep")
+    _warn_if_recapture_will_fault(runner)
+
+
+def _release_tbo_graphs(runner) -> bool:
+    """`UBatchWrapper`'s parallel store, one entry per shape.
+
+    Under TBO the replayable handle is in `runner.graphs` like any other, but
+    the wrapper keeps its own entry holding the graph, its per-ubatch contexts
+    and the output tensor it captured. Left behind, that entry pins the graph's
+    private memory pool -- the footprint the caller went to sleep to reclaim --
+    until a recapture happens to overwrite the same key. `ModelRunner.exit()`
+    has always cleared both stores; a release for sleep has to clear the same
+    two.
+    """
+    tbo_graphs = getattr(getattr(runner, "model", None), "tbo_graphs", None)
+    if not tbo_graphs:
+        return False
+    tbo_graphs.clear()
+    logger.info(f"{runner.label}: TBO CUDA graphs released for sleep")
+    return True
+
+
+def _release_piecewise_graphs(runner) -> bool:
+    """The per-piece store, and the dispatch that would replay out of it.
+
+    A PIECEWISE capture puts nothing in `runner.graphs`: the compiled dense
+    pieces self-capture into their own `CUDAGraphWrapper`s, and the capture loop
+    in `ModelRunner.capture_cudagraph` moves on before the assignment. Those
+    wrappers are reached through the registry they enter rather than by a walk
+    from here -- `atom/utils/graph_holders.py` says why a walk cannot find them.
+    `_piecewise_captured_tokens` is the runner's record of which shapes got a
+    graph, and so its evidence that anything piecewise was captured at all.
+
+    Clearing that record is not bookkeeping. It is what stops the next step
+    dispatching PIECEWISE, which would either replay a graph holding the pool
+    this release is freeing or -- its entry having just been dropped -- record a
+    replacement mid-serve, uncoordinated, and hang on the first collective.
+    """
+    captured_tokens = getattr(runner, "_piecewise_captured_tokens", None)
+    if not captured_tokens:
+        return False
+    captured_tokens.clear()
+    runner._piecewise_sorted_tokens = []
+    dropped = release_registered_graphs()
+    logger.info(f"{runner.label}: {dropped} piecewise CUDA graphs released for sleep")
+    return True
+
+
+def _release_draft_graphs(runner) -> bool:
+    """The drafter's recordings, one per captured batch.
+
+    Walked rather than registered, because this store is reachable from here. A
+    draft pass writes the KV it attends, so its recording holds the base of the
+    pool the way a decode graph does, and `ATOM_DRAFT_CUDAGRAPH` is on by
+    default. Wake recaptures them: `capture_cudagraph` ends in
+    `warmup_draft_graphs` on both the manual and the piecewise path.
+    """
+    drafter = getattr(runner, "drafter", None)
+    released = False
+    for pass_ in getattr(drafter, "draft_graphs", None) or ():
+        released |= bool(pass_.release_graphs())
+    if released:
+        logger.info(f"{runner.label}: draft CUDA graphs released for sleep")
+    return released
+
+
+def _release_manual_graphs(runner) -> bool:
+    """The whole-forward store a FULL capture fills, and the logits with it."""
+    released = False
+    graphs = getattr(runner, "graphs", None)
+    if graphs:
+        runner._graphs_backup_keys = list(graphs.keys())
+        graphs.clear()
+        released = True
     # `graph_logits` holds the logits tensor each capture produced, allocated
-    # from the graph's own pool. Same shape of leak as `tbo_graphs` above: the
+    # from the graph's own pool. Same shape of leak as the TBO store: the
     # replay is already stopped by clearing `graphs`, but a live reference to
     # that tensor keeps the pool `empty_cache()` is about to be asked to
-    # reclaim. Recapture refills it per key.
+    # reclaim. Recapture refills it per key. Asked separately from `graphs`,
+    # because a gate they shared is what skipped it wherever `graphs` was empty.
     graph_logits = getattr(runner, "graph_logits", None)
     if graph_logits:
         graph_logits.clear()
-    logger.info(f"{runner.label}: CUDA graphs released for sleep")
-    _warn_if_recapture_will_fault(runner)
+        released = True
+    return released
 
 
 def _warn_if_recapture_will_fault(runner) -> None:
@@ -344,11 +428,15 @@ class MemoryManagerMixin:
         (i.e., the model is fully ready for inference).
 
         Nothing to do under `sleep_keeps_memory_resident`: nothing was
-        released, so `_graphs_backup_keys` is absent and this returns below.
+        released, so the flag `release_cudagraphs` sets is absent and this
+        returns below. That flag, and not `_graphs_backup_keys`, because the
+        manual store is empty under PIECEWISE whatever was captured -- keying on
+        it left the default configuration releasing nothing and, when the
+        release was fixed, would have left it recapturing nothing.
         """
         if getattr(self, "enforce_eager", True):
             return
-        if not hasattr(self, "_graphs_backup_keys") or not self._graphs_backup_keys:
+        if not getattr(self, "_graphs_released_for_sleep", False):
             return
         # Only recapture if both weights and KV cache are on GPU
         has_weights_on_gpu = any(p.is_cuda for p in self.model.parameters())
@@ -358,7 +446,10 @@ class MemoryManagerMixin:
         logger.info(f"{self.label}: Recapturing CUDA graphs after sleep/wake cycle")
         try:
             self.capture_cudagraph()
-            del self._graphs_backup_keys
+            self._graphs_released_for_sleep = False
+            # Absent when only the piecewise store had anything in it.
+            if hasattr(self, "_graphs_backup_keys"):
+                del self._graphs_backup_keys
             logger.info(f"{self.label}: CUDA graph recapture completed")
         except Exception:
             logger.exception(f"{self.label}: CUDA graph recapture failed")
@@ -366,6 +457,7 @@ class MemoryManagerMixin:
             self.enforce_eager = True
             self.graphs = {}
             self.graph_pool = None
+            self._graphs_released_for_sleep = False
             if hasattr(self, "_graphs_backup_keys"):
                 del self._graphs_backup_keys
             logger.warning(f"{self.label}: Falling back to enforce_eager=True")

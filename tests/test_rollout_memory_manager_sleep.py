@@ -13,6 +13,12 @@ the memory a colocated trainer sleeps the rollout engine to reclaim.
 
 Either release invalidates the graphs, including the KV-only one that
 `sleep(level=1)` performs.
+
+"the graphs" is four stores, not one. `runner.graphs` is the manual
+whole-forward capture; PIECEWISE -- `--level 3`, the default -- fills only the
+per-piece wrappers, TBO keeps a parallel entry per shape, and the drafter holds
+a recording per warmed batch. Each is asked separately below, because a gate
+they shared is what left three of them behind.
 """
 
 from types import SimpleNamespace
@@ -27,6 +33,8 @@ from atom.rollout.memory_manager import (
     MemoryManagerMixin,
     sleep_keeps_memory_resident,
 )
+from atom.spec_decode.draft_graph import DraftGraph, StagedInput
+from atom.utils.graph_holders import register_graph_holder
 
 
 class _Runner(MemoryManagerMixin):
@@ -133,6 +141,18 @@ def test_clear_kv_cache_still_zeroes_the_resident_pool():
 
     assert runner.kv_cache is pool
     assert torch.count_nonzero(pool) == 0
+
+
+def _as_if_released(runner, keys=(1,)):
+    """The state a release leaves, for a test that cannot get there by calling
+    one -- `sleep_keeps_memory_resident` declines to release at all.
+
+    Both halves, because they mean different things: the keys are the manual
+    store's record, and the flag is "anything at all was dropped", which is what
+    the wake keys on.
+    """
+    runner._graphs_backup_keys = list(keys)
+    runner._graphs_released_for_sleep = True
 
 
 def _report_weights_on_device(runner):
@@ -332,6 +352,172 @@ def test_a_host_without_graph_logits_still_releases():
     assert runner.graphs == {}
 
 
+# ── the piecewise store, which is what the default configuration fills ────
+
+
+class _PieceHolder:
+    """Stands in for a `CUDAGraphWrapper`: the graphs of one compiled piece.
+
+    Not the real one: `atom/utils/cuda_graph.py` reaches aiter, which CI has no
+    build of. What the release path depends on is the registration protocol, and
+    the real wrapper's conformance to it is asserted in
+    `tests/test_graph_holders.py`.
+    """
+
+    def __init__(self, graphs=2):
+        self.graphs = graphs
+        register_graph_holder(self)
+
+    def release_graphs(self) -> int:
+        dropped, self.graphs = self.graphs, 0
+        return dropped
+
+
+def _with_piecewise(runner, tokens=(128, 256)):
+    """The state a PIECEWISE capture pass leaves behind.
+
+    `runner.graphs` stays EMPTY -- the capture loop moves on before the
+    assignment, every shape's graph living in the per-piece wrappers instead --
+    and the runner's record of which shapes got one is
+    `_piecewise_captured_tokens`. PIECEWISE is `--level 3`, the default, so this
+    is the ordinary case rather than a corner of one.
+    """
+    runner._piecewise_captured_tokens = set(tokens)
+    runner._piecewise_sorted_tokens = sorted(tokens)
+    return _PieceHolder()
+
+
+@pytest.mark.parametrize("tags", [None, ["kv_cache"]])
+def test_a_release_drops_the_graphs_a_piecewise_capture_made(tags):
+    """A gate on `runner.graphs` made the whole release a no-op here, on the
+    configuration whose fault it exists to prevent."""
+    runner = _Runner(enforce_eager=False, keep_resident=False, with_graphs=False)
+    holder = _with_piecewise(runner)
+
+    runner.release_memory(**({} if tags is None else {"tags": tags}))
+
+    assert holder.graphs == 0
+    assert runner._piecewise_captured_tokens == set()
+    # Not bookkeeping: an uncleared record is what would let the next step
+    # dispatch PIECEWISE and replay into the pool this release just freed.
+    assert runner._piecewise_sorted_tokens == []
+
+
+def test_a_piecewise_only_release_still_arranges_the_recapture():
+    """`_graphs_backup_keys` records the manual store and is never set here, so
+    keying the wake on it skipped the same configuration the release did."""
+    runner = _Runner(enforce_eager=False, keep_resident=False, with_graphs=False)
+    _with_piecewise(runner)
+
+    runner.release_memory(tags=["kv_cache"])
+
+    assert not hasattr(runner, "_graphs_backup_keys")
+    assert runner._graphs_released_for_sleep is True
+
+    _report_weights_on_device(runner)
+    runner.resume_memory(tags=["kv_cache"])
+
+    assert runner.captures == 1
+    assert runner._graphs_released_for_sleep is False
+
+
+def test_a_resident_sleep_keeps_the_piecewise_graphs():
+    runner = _Runner(enforce_eager=False, keep_resident=True, with_graphs=False)
+    holder = _with_piecewise(runner)
+
+    runner.release_memory()
+
+    assert holder.graphs == 2
+    assert runner._piecewise_captured_tokens == {128, 256}
+
+
+def test_the_captured_logits_are_dropped_with_no_manual_graphs_to_gate_on():
+    """The clear sat behind the gate on `runner.graphs`, so under PIECEWISE the
+    leak it was added for survived the release."""
+    runner = _Runner(enforce_eager=False, keep_resident=False, with_graphs=False)
+    runner.graph_logits = {(1, 1): torch.zeros(4)}
+
+    runner.release_memory(tags=["kv_cache"])
+
+    assert runner.graph_logits == {}
+    assert runner._graphs_released_for_sleep is True
+
+
+def test_the_warning_reaches_the_configuration_that_walks_into_the_fault(
+    monkeypatch, caplog
+):
+    """Behind the same gate, and so silent for the same runners."""
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    runner = _Runner(enforce_eager=False, keep_resident=False, with_graphs=False)
+    _with_piecewise(runner)
+
+    with caplog.at_level("WARNING", logger="atom"):
+        runner.release_memory(tags=["kv_cache"])
+
+    assert "sleep_keeps_memory_resident" in caplog.text
+
+
+def test_a_runner_that_captured_nothing_is_told_nothing():
+    """ "Was anything captured" still has to be a gate: a non-eager runner that
+    never got as far as a capture has no recapture to arrange and no fault to
+    warn about."""
+    runner = _Runner(enforce_eager=False, keep_resident=False, with_graphs=False)
+
+    runner.release_memory(tags=["kv_cache"])
+
+    assert not getattr(runner, "_graphs_released_for_sleep", False)
+    assert runner.captures == 0
+
+
+# ── the drafter's recordings ──────────────────────────────────────────────
+
+
+def _with_draft_graphs(runner, batches=(48,)):
+    """A draft pass holding a recording per batch it was warmed at.
+
+    The real `DraftGraph`: it is deliberately importable without a GPU aiter
+    build, so nothing here has to stand in for it.
+    """
+    pass_ = DraftGraph(forward=lambda bs, **staged: None, inputs={"ids": StagedInput()})
+    for bs in batches:
+        pass_._cuda_graphs[bs] = ("graph", "out")
+    runner.drafter = SimpleNamespace(draft_graphs=(pass_,))
+    return pass_
+
+
+def test_a_release_drops_the_draft_recordings_too():
+    """A draft pass WRITES the KV it attends, so its recording holds the base of
+    the pool exactly the way a decode graph does -- and `ATOM_DRAFT_CUDAGRAPH`
+    is on by default."""
+    runner = _Runner(enforce_eager=False, keep_resident=False, with_graphs=False)
+    pass_ = _with_draft_graphs(runner)
+
+    runner.release_memory(tags=["kv_cache"])
+
+    assert not pass_.is_captured(48)
+    assert runner._graphs_released_for_sleep is True
+
+
+def test_a_resident_sleep_keeps_the_draft_recordings():
+    runner = _Runner(enforce_eager=False, keep_resident=True, with_graphs=False)
+    pass_ = _with_draft_graphs(runner)
+
+    runner.release_memory()
+
+    assert pass_.is_captured(48)
+
+
+def test_a_drafter_with_no_recordings_releases_nothing():
+    """`draft_graphs` is empty for a flavor that declares no warmable pass, and
+    absent entirely on a runner without a drafter."""
+    runner = _Runner(enforce_eager=False, keep_resident=False, with_graphs=False)
+    runner.drafter = SimpleNamespace(draft_graphs=())
+
+    runner.release_memory(tags=["kv_cache"])
+
+    assert not getattr(runner, "_graphs_released_for_sleep", False)
+
+
 def test_eager_has_no_tbo_graphs_to_clear():
     runner = _Runner(enforce_eager=True, keep_resident=False, with_graphs=False)
     tbo_graphs = _with_tbo(runner)
@@ -385,7 +571,7 @@ def test_a_failed_recapture_says_the_option_is_now_inert(caplog):
     its log lines never appear again."""
     runner = _Runner(enforce_eager=False, keep_resident=True)
     runner.graphs = {1: object()}
-    runner._graphs_backup_keys = [1]
+    _as_if_released(runner)
     _report_weights_on_device(runner)
 
     def _boom():
@@ -403,7 +589,7 @@ def test_a_failed_recapture_says_the_option_is_now_inert(caplog):
 
 def test_a_failed_recapture_is_quiet_about_an_option_nobody_set(caplog):
     runner = _Runner(enforce_eager=False, keep_resident=False)
-    runner._graphs_backup_keys = [1]
+    _as_if_released(runner)
     _report_weights_on_device(runner)
     runner.capture_cudagraph = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
 
@@ -411,4 +597,7 @@ def test_a_failed_recapture_is_quiet_about_an_option_nobody_set(caplog):
         runner._recapture_cudagraphs_if_needed()
 
     assert runner.enforce_eager is True
+    # Cleared even though it failed: there is nothing left to recapture, and a
+    # wake that kept asking would try again on every cycle.
+    assert runner._graphs_released_for_sleep is False
     assert "now inert" not in caplog.text
