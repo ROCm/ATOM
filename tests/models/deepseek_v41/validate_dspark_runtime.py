@@ -204,7 +204,11 @@ def main():
                 [] if args.baseline else sorted(runner.drafter.block._cuda_graphs)
             )
             assert report["target_graph_tokens"]
-            assert not report["draft_graph_sizes"]
+            if not args.baseline:
+                from atom.utils import envs
+
+                expected = runner.capture_sizes if envs.ATOM_DRAFT_CUDAGRAPH else []
+                assert report["draft_graph_sizes"] == expected
         stats = None
         if args.profile:
             from tests.models.deepseek_v41.dspark_runtime_stats import RuntimeStats

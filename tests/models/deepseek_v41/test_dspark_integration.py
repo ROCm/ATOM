@@ -29,16 +29,16 @@ def test_native_draft_config_preserves_v41_architecture():
     assert config.n_routed_experts == 384
 
 
-def test_v41_draft_declines_capture_of_live_request_metadata():
+def test_v41_draft_uses_shared_block_capture():
     proposer = DSparkProposer.__new__(DSparkProposer)
     proposer.model = DeepseekV41DSpark.__new__(DeepseekV41DSpark)
     nn.Module.__init__(proposer.model)
     (block,) = proposer._declare_draft_graphs()
-    assert not block.capture_supported
+    assert block.capture_supported
 
 
 @pytest.mark.parametrize("width", [1, 6])
-def test_capture_builder_uses_full_query_width_and_private_state(width):
+def test_capture_builder_uses_full_query_width_and_serving_storage(width):
     from atom.model_ops.attentions.deepseek_v41.backend import (
         DeepseekV41MetadataBuilder,
     )
@@ -62,12 +62,15 @@ def test_capture_builder_uses_full_query_width_and_private_state(width):
     metadata, context = builder.build_for_cudagraph_capture(2, width)
     assert prepared == [2 * width]
     assert context.running_tokens == context.scheduled_tokens == 2 * width
-    assert context.is_dummy_run
+    assert not context.is_dummy_run and metadata.dummy
     assert metadata.step.length == 2 * width
     assert metadata.step.positions.tolist() == list(range(width)) * 2
     assert metadata.cu_seqlens_q.tolist() == [0, width, 2 * width]
-    assert metadata.cache is not builder.cache
-    assert metadata.cache.backing.data_ptr() != builder.cache.backing.data_ptr()
+    assert metadata.cache is builder.cache
+    assert (
+        metadata.state_slot_out.data_ptr()
+        == builder.model_runner.forward_vars["v4_meta_state_slot_out"].gpu.data_ptr()
+    )
     assert torch.equal(builder.cache.backing, before)
     with pytest.raises(ValueError, match="capture shape"):
         builder.build_for_cudagraph_capture(3, 6)
@@ -171,3 +174,87 @@ def test_decode_positions_use_accepted_prefix_and_full_reservation():
     assert [span.position for span in metadata.step.requests] == [129, 140]
     assert actual.tolist() == [129, 140, 141, 142]
     assert metadata.step.tentative
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+def test_draft_graph_replay_reads_serving_slots_after_reorder(monkeypatch):
+    from atom.model_ops.attentions.deepseek_v41.backend import (
+        DeepseekV41MetadataBuilder,
+    )
+    from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+    from atom.spec_decode.draft_graph import DraftGraph, StagedInput
+
+    monkeypatch.setenv("ATOM_DRAFT_CUDAGRAPH", "1")
+    builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    builder.model_runner = SimpleNamespace(
+        forward_vars=metadata_buffers(4, 24, 2, "cuda")
+    )
+    builder.cache = PagedAttentionCache(
+        V41PoolGeometry(1, (), 16, 4, 512, 32, speculative_tokens=5), 8, 4, "cuda"
+    )
+    builder.block_size, builder.device = 16, "cuda"
+    builder.max_num_batched_tokens = 24
+    builder.prepare_model_inputs = lambda tokens, metadata: None
+    metadata, context = builder.build_for_cudagraph_capture(4, 6)
+    assert metadata.cache is builder.cache and not context.is_dummy_run
+    assert (
+        metadata.state_slot_out.data_ptr()
+        == builder.model_runner.forward_vars["v4_meta_state_slot_out"].gpu.data_ptr()
+    )
+    live_context = SimpleNamespace(attn_metadata=metadata)
+    monkeypatch.setattr(
+        "atom.utils.forward_context.get_forward_context", lambda: live_context
+    )
+    draft = DeepseekV41DSpark.__new__(DeepseekV41DSpark)
+    nn.Module.__init__(draft)
+    draft.window_size = 4
+    layer = nn.Module()
+    layer.attn = nn.Module()
+    layer.attn.spec = SimpleNamespace(layer_id=0)
+    draft.mtp = nn.ModuleList([layer])
+    # Exercise the real cache reader and metadata contract; model arithmetic is
+    # covered by the checkpoint runtime test, not replaced in that acceptance.
+    draft.draft_hidden = lambda ids, pos, kv, kv_pos, **_: (kv[0], kv_pos, ids + 1)
+    graph = DraftGraph(
+        forward=lambda bs, anchor_ids, anchor_positions: draft.block_backbone(
+            anchor_ids, anchor_positions, 5
+        ),
+        capture_epilogue=True,
+        inputs={
+            "anchor_ids": StagedInput(),
+            "anchor_positions": StagedInput(dtype=torch.int64),
+        },
+    ).bind(SimpleNamespace(max_num_seqs=4), "cuda")
+    window = builder.cache.state.view("window")[0]
+    window.normal_()
+    before = builder.cache.backing.clone()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        graph.warmup(4, stream=stream)
+    torch.cuda.current_stream().wait_stream(stream)
+    for slots, anchors in (
+        ([3, 1, 0], [17, 12, 3]),
+        ([2], [41]),
+        ([0, 3, 1, 2], [5, 7, 13, 19]),
+    ):
+        builder._populate_state_slot_mappings(
+            SimpleNamespace(state_slots_committed=slots), len(slots), 4
+        )
+        ids = torch.arange(len(slots), device="cuda", dtype=torch.int32)
+        pos = torch.tensor(anchors, device="cuda", dtype=torch.int64)
+        staged = graph.stage(4, {"anchor_ids": ids, "anchor_positions": pos})
+        actual, actual_pos, actual_ids = graph.run(4, **staged)
+        expected = window[torch.tensor(slots, device="cuda")]
+        torch.testing.assert_close(actual[: len(slots)], expected, rtol=0, atol=0)
+        physical = torch.arange(builder.cache.geometry.ring_slots, device="cuda")
+        expected_pos = (
+            pos[:, None] - (pos[:, None] - physical) % builder.cache.geometry.ring_slots
+        )
+        torch.testing.assert_close(
+            actual_pos[: len(slots)], expected_pos, rtol=0, atol=0
+        )
+        torch.testing.assert_close(actual_ids[: len(slots)], ids + 1, rtol=0, atol=0)
+        assert torch.equal(builder.cache.backing, before)
+    assert graph.is_captured(4)

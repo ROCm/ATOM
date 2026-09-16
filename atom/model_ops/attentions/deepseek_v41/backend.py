@@ -27,8 +27,6 @@ from .metadata import RequestSpan
 
 
 class DeepseekV41Backend(AttentionBackend):
-    use_custom_all_reduce = False
-
     @staticmethod
     def get_name():
         return "CSA2"
@@ -218,6 +216,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             state=AttnState.DECODE if step.decode else AttnState.PREFILL_PREFIX,
         )
         metadata.cache, metadata.step = cache, step
+        metadata.state_slot_out = state_slot_out
         metadata.dummy = batch.is_dummy_run
         token_mask = np.ones(offset, dtype=np.bool_)
         for span in spans:
@@ -226,11 +225,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 for start, count in data.get("embedding_spans", ()):
                     first, end = max(start, span.position), min(start + count, span.end)
                     if first < end:
-                        token_mask[
-                            span.offset + first - span.position : span.offset
-                            + end
-                            - span.position
-                        ] = False
+                        at = span.offset + first - span.position
+                        token_mask[at : at + end - first] = False
         metadata.token_mask = token_mask
         metadata.image_mask = (
             torch.from_numpy(~token_mask).to(self.device).unsqueeze(0)
@@ -267,7 +263,14 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         # acceptance run: grep -rn DIAGNOSTIC179 atom/
         if self._cache_snapshot is not None and not metadata.dummy:
             self._cache_snapshot.capture(cache, step, step.block_tables)
-        histories = cache.prepare_state(step)
+        # A synthetic batch stages addresses only. The committed cursor belongs
+        # to whoever owns these slots, and the position-0 reset inside
+        # `prepare_state` would zero a serving request's state to build a graph.
+        histories = (
+            np.full((len(step.requests), self.geometry.history_size), -1, np.int64)
+            if metadata.dummy
+            else cache.prepare_state(step)
+        )
         tokens = input_ids[: step.length]
         if self.engram is not None:
             prepared = self.engram.prepare(
@@ -305,28 +308,33 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             metadata.cache.commit_tentative(counts)
 
     def build_for_cudagraph_capture(self, bs, max_q_len=1):
-        # Only pure dense stages are captured. All attention warmup uses a
-        # private PAGE/STATE allocation and can never alter live requests.
+        # Binds the serving allocation, as V4 does: a scratch cache would bake
+        # the wrong window address into the shared draft graph. Runtime dummies
+        # still get the private cache `_prepare` picks for them.
+        if self.cache is None:
+            raise RuntimeError("Allocate the serving cache before graph capture")
         if bs < 1 or max_q_len < 1 or bs * max_q_len > self.max_num_batched_tokens:
             raise ValueError("CSA2 capture shape exceeds the token buffer")
         tokens = bs * max_q_len
         batch = SimpleNamespace(
-            is_dummy_run=True,
+            is_dummy_run=False,
             req_ids=tuple(range(bs)),
             num_scheduled_tokens=(max_q_len,) * bs,
             context_lens=(max_q_len,) * bs,
-            state_slots_committed=(),
+            state_slots_committed=tuple(range(bs)),
+            block_tables=(tuple(range(-(-max_q_len // self.block_size))),) * bs,
             total_seqs_num=bs,
             total_tokens_num=tokens,
         )
         metadata, positions = self._prepare(batch, bs, tokens)
+        metadata.dummy = True  # No host Engram lookup for synthetic tokens.
         self.prepare_model_inputs(
             self.model_runner.forward_vars["input_ids"].gpu[:tokens], metadata
         )
         return metadata, Context(
             positions=positions,
             is_prefill=False,
-            is_dummy_run=True,
+            is_dummy_run=False,
             scheduled_bs=bs,
             scheduled_tokens=tokens,
             running_bs=bs,

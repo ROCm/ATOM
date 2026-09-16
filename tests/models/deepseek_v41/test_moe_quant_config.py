@@ -38,8 +38,8 @@ def test_model_owns_and_forwards_expert_quantization(
         online_quant_config=online,
     )
     for module, names in (
-        (model, ("VocabParallelEmbedding", "LogitsHead", "RMSNorm")),
-        (dspark, ("ReplicatedLinear", "MarkovHead", "ConfidenceHead")),
+        (model, ("VocabParallelEmbedding", "ParallelHead", "RMSNorm")),
+        (dspark, ("ReplicatedLinear", "DSparkMarkovHead", "DSparkConfidenceHead")),
         (multimodal, ("ViT", "Aligner")),
     ):
         for name in names:

@@ -12,17 +12,17 @@ from aiter.dist.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
 )
+
 from atom.examples.deepseek_v41_offline import (
     initialize_parallel,
     load_offline_model,
     prepare_engram,
 )
+from atom.model_loader.loader import load_model
 from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
 from tests.models.deepseek_v41.checkpoint_draft_reference import (
     checkpoint_draft_reference,
 )
-
-from atom.model_loader.loader import load_model
 
 
 def main():
@@ -144,7 +144,9 @@ def main():
                 actual_ids, actual_confidence = draft.head_and_sample(
                     out, anchors, config.dspark_block_size
                 )
-                teacher_logits = draft.head(out[0])
+                teacher_logits = draft.head.get_logits(out[0]).view(
+                    *out[1].shape[:2], -1
+                )
                 for i in range(config.dspark_block_size):
                     bias, _ = draft.mtp[-1].markov_head(expected_ids[:, i])
                     teacher_logits[:, i] += bias

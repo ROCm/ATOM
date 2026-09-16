@@ -140,9 +140,12 @@ class VerifyTrace:
                 values = self.runner.model.forward_hidden(
                     input_ids[gather][None], shadow, local, embeddings
                 )
-                sequential_logits = self.runner.model.head(
-                    self.runner.model.norm(values)
-                )[0]
+                # A row per token, which is what the head returns here: the
+                # replay above already set `is_draft`, and that is the flag
+                # that holds back the prefill last-token slice.
+                sequential_logits = self.runner.model.head.get_logits(
+                    self.runner.model.norm(values).flatten(0, 1)
+                )
                 shadow.finish_step(
                     local,
                     torch.stack(

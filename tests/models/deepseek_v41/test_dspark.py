@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: MIT
-"""Independent draft masks, ragged positions and Markov/confidence math."""
+"""Independent draft masks, ragged positions and the draft heads' checkpoint names."""
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 from atom.model_ops.deepseek_v41.dspark import draft_attention, draft_step, rotate_rows
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
-from atom.models.deepseek_v41.dspark import ConfidenceHead, MarkovHead
+from atom.models.deepseek_v4_dspark import DSparkConfidenceHead, DSparkMarkovHead
+from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
 
 
 def test_block_mask_keeps_all_draft_rows_and_only_the_visible_window():
@@ -75,24 +75,24 @@ def test_draft_attention_against_dense_sink_oracle():
     assert error < 0.004
 
 
-def test_markov_and_confidence_follow_checkpoint_dtype_contract(single_rank):
-    torch.manual_seed(121)
-    markov = MarkovHead(128, 32)
-    confidence = ConfidenceHead(64 + 32)
-    markov.embed.weight.data.copy_(torch.randn_like(markov.embed.weight))
-    markov.head.weight.data.copy_(torch.randn_like(markov.head.weight))
-    confidence.proj.weight.data.copy_(torch.randn_like(confidence.proj.weight))
-    markov.head.process_weights_after_loading()
-    confidence.process_weights_after_loading()
-    ids = torch.tensor([3, 9])
-    bias, embed = markov(ids)
-    expected_embed = markov.embed.weight[ids]
-    assert torch.equal(embed, expected_embed)
-    assert torch.equal(
-        bias, F.linear(expected_embed.float(), markov.head.weight.float())
+def test_draft_head_names_and_width_match_the_v41_checkpoint():
+    """What belongs to V4.1 here is the naming, not the arithmetic.
+
+    The Markov tables ship under this checkpoint's own names while the shared
+    V4 head calls them `markov_w1` / `markov_w2`, so the rename is checked
+    against the destination's real parameters rather than against a copy of
+    itself. The confidence projection consumes the concatenation, which is what
+    makes the checkpoint's row `[1, hidden + rank]` wide. Both heads' math is
+    V4's and is covered by `tests/test_dspark.py`.
+    """
+    hidden, rank, vocab = 64, 32, 128
+    renamed = DeepseekV41DSpark.weights_mapper.apply_list(
+        [f"mtp.2.markov_head.{name}.weight" for name in ("embed", "head")]
     )
-    hidden = torch.randn(2, 64, dtype=torch.bfloat16)
-    expected = F.linear(
-        torch.cat((hidden, embed), dim=-1).float(), confidence.proj.weight.float()
-    ).squeeze(-1)
-    assert torch.equal(confidence(hidden, embed), expected)
+    assert renamed == [
+        "mtp.2.markov_head.markov_w1.weight",
+        "mtp.2.markov_head.markov_w2.weight",
+    ]
+    markov = DSparkMarkovHead(vocab, rank)
+    assert {f"mtp.2.markov_head.{name}" for name in markov.state_dict()} == set(renamed)
+    assert DSparkConfidenceHead(hidden, rank).proj.weight.shape == (1, hidden + rank)

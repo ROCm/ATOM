@@ -4,25 +4,29 @@
 from copy import copy
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
+from atom.model_loader.weight_names import WeightsMapper
 from atom.model_ops.blockscale import quantize_fp8
 from atom.model_ops.deepseek_v41.dspark import draft_attention, draft_step, rotate_rows
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.deepseek_v41.projections import grouped_output_projection
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
-from atom.model_ops.embed_head import VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
 from atom.models.deepseek_v4 import make_v4_quant_config
+from atom.models.deepseek_v4_dspark import (
+    DSparkConfidenceHead,
+    DSparkMarkovHead,
+    _DSparkInner,
+)
 from atom.models.dspark_draft import DSparkDraftModel
 
 from .attention import Attention
 from .config import build_attention_topology
 from .layers import native_quant_config, reduce_output
-from .model import Block, DeepseekV41ForCausalLM, LogitsHead
+from .model import Block, DeepseekV41ForCausalLM
 
 
 class DraftAttention(Attention):
@@ -52,33 +56,6 @@ class DraftAttention(Attention):
         )
 
 
-class MarkovHead(nn.Module):
-    def __init__(self, vocab_size, rank):
-        super().__init__()
-        self.embed = VocabParallelEmbedding(vocab_size, rank)
-        self.head = LogitsHead(rank, vocab_size)
-
-    def forward(self, token_ids):
-        hidden = self.embed(token_ids.flatten()).view(*token_ids.shape, -1)
-        return self.head(hidden), hidden
-
-
-class ConfidenceHead(nn.Module):
-    def __init__(self, width):
-        super().__init__()
-        self.proj = nn.Linear(width, 1, bias=False, dtype=torch.bfloat16)
-        self.register_buffer("fp32_weight", None, persistent=False)
-
-    def process_weights_after_loading(self):
-        self.fp32_weight = self.proj.weight.float()
-
-    def forward(self, hidden, markov_embeddings):
-        if self.fp32_weight is None:
-            raise RuntimeError("Confidence weights must be processed after loading")
-        values = torch.cat((hidden, markov_embeddings), dim=-1).float()
-        return F.linear(values, self.fp32_weight).squeeze(-1)
-
-
 class DraftBlock(Block):
     attention_cls = DraftAttention
 
@@ -93,24 +70,28 @@ class DraftBlock(Block):
             self.main_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         if stage == config.num_nextn_predict_layers - 1:
             self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-            self.markov_head = MarkovHead(config.vocab_size, config.dspark_markov_rank)
-            self.confidence_head = ConfidenceHead(
-                config.hidden_size + config.dspark_markov_rank
+            self.markov_head = DSparkMarkovHead(
+                config.vocab_size, config.dspark_markov_rank
+            )
+            self.confidence_head = DSparkConfidenceHead(
+                config.hidden_size, config.dspark_markov_rank
             )
 
 
 class DeepseekV41DSpark(DSparkDraftModel):
-    # Loads through the shared path like the backbone, off the same checkpoint
-    # and with the same layer types, so the rename rules are the backbone's --
-    # referenced, not restated, so the two cannot drift apart.
-    weights_mapper = DeepseekV41ForCausalLM.weights_mapper
+    # Same checkpoint and the same layer types as the backbone, so its rules are
+    # referenced rather than restated and the two cannot drift apart. The rule
+    # on top is the draft's alone: this checkpoint names the Markov tables after
+    # the modules that once held them, V4's head calls them markov_w1 / w2.
+    weights_mapper = DeepseekV41ForCausalLM.weights_mapper | WeightsMapper(
+        orig_to_new_substr={
+            ".markov_head.embed.": ".markov_head.markov_w1.",
+            ".markov_head.head.": ".markov_head.markov_w2.",
+        }
+    )
     weights_mapping = DeepseekV41ForCausalLM.weights_mapping
     packed_modules_mapping = DeepseekV41ForCausalLM.packed_modules_mapping
     disable_fused_shared_loading = DeepseekV41ForCausalLM.disable_fused_shared_loading
-    # The block gathers from request-owned windows through live Python
-    # metadata. Target tensor stages are capturable; the draft still needs
-    # stable staged inputs before whole-block graph capture can be enabled.
-    supports_block_graph = False
 
     def __init__(self, config, *, max_length=None):
         super().__init__()
@@ -159,10 +140,10 @@ class DeepseekV41DSpark(DSparkDraftModel):
         """Keep the draft's own stages; drop the rest of the checkpoint.
 
         The drafter is loaded from the same file as the target, in a second
-        pass over every tensor in it. Its parameters are named exactly as the
-        checkpoint names them, so the remap is identity -- what this is really
-        for is the `None`, which is how the loader is told a tensor belongs to
-        somebody else rather than that it failed to route.
+        pass over every tensor in it. Stage names survive `weights_mapper`
+        untouched, so the remap is identity -- what this is really for is the
+        `None`, which is how the loader is told a tensor belongs to somebody
+        else rather than that it failed to route.
         """
         return name if name.startswith("mtp.") else None
 
@@ -235,8 +216,10 @@ class DeepseekV41DSpark(DSparkDraftModel):
         from atom.utils.forward_context import get_forward_context
 
         metadata = get_forward_context().attn_metadata
-        cache, step = metadata.cache, metadata.step
-        slots = F.pad(step.slots, (0, input_ids.numel() - step.slots.numel()))
+        cache = metadata.cache
+        # Published at running_bs, the width DraftGraph stages anchors at, so
+        # window addressing holds no captured Python object.
+        slots = metadata.state_slot_out[: input_ids.numel()]
         context = {
             layer.spec.layer_id: cache.read_window(layer.spec.layer_id, slots)
             for layer in self.context_layers
@@ -275,22 +258,15 @@ class DeepseekV41DSpark(DSparkDraftModel):
         for layer in self.mtp:
             state = layer(state, context_kv, step, self.rope)
         hidden = state.collapse()
-        return self.mtp[-1].norm(hidden), hidden
+        # V4's seam: post-norm flat for `get_logits`, pre-norm still [B, T, dim]
+        # because it is the confidence head's h_k and carries the block width.
+        return self.mtp[-1].norm(hidden).flatten(0, 1), hidden
+
+    # Adopted whole from V4. `_DSparkInner` is `@support_torch_compile`, so the
+    # half it shares with this class cannot move into a common base.
+    _head_and_sample = _DSparkInner.head_and_sample
+    forward_head = _DSparkInner.forward_head
 
     def head_and_sample(self, out, anchor_ids, num_draft):
-        normed, hidden = out
-        logits = self.head(normed)
-        if logits.shape[1] != num_draft:
-            raise ValueError("Draft backbone and sampling widths disagree")
-        previous = anchor_ids
-        tokens, embeddings = [], []
-        last = self.mtp[-1]
-        for position in range(num_draft):
-            bias, embedding = last.markov_head(previous)
-            previous = (logits[:, position] + bias).argmax(-1)
-            tokens.append(previous)
-            embeddings.append(embedding)
-        confidence = last.confidence_head(
-            hidden, torch.stack(embeddings, dim=1)
-        ).sigmoid()
-        return torch.stack(tokens, dim=1), confidence
+        # `num_draft` is the shared surface's; the width rides `out[1]`.
+        return self._head_and_sample(*out, anchor_ids)

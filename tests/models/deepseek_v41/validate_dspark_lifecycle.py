@@ -386,7 +386,10 @@ def main():
         if args.graph:
             runner.capture_cudagraph()
             report["target_graph_tokens"] = sorted(runner._piecewise_captured_tokens)
-            assert not runner.drafter.block._cuda_graphs
+            from atom.utils import envs
+
+            expected = runner.capture_sizes if envs.ATOM_DRAFT_CUDAGRAPH else []
+            assert sorted(runner.drafter.block._cuda_graphs) == expected
             replay_start = runner.model.dense_graphs.replays
         tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
         if args.ragged_probe:

@@ -4,7 +4,6 @@
 from typing import ClassVar
 
 import torch
-import torch.nn.functional as F
 from aiter.dist.parallel_state import get_tp_group
 from torch import nn
 
@@ -16,46 +15,21 @@ from atom.model_ops.deepseek_v41.mhc import (
 )
 from atom.model_ops.deepseek_v41.mhc_pre_delayed import pre_delayed
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
-from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+from atom.model_ops.embed_head import VocabParallelEmbedding
 from atom.model_ops.engram_layer import EngramOp
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
-from atom.models.deepseek_v4 import DeepseekV4ForCausalLM, make_v4_quant_config
+from atom.models.deepseek_v4 import (
+    DeepseekV4ForCausalLM,
+    ParallelHead,
+    make_v4_quant_config,
+)
 
 from .attention import Attention
 from .config import build_attention_topology
 from .layers import native_quant_config
 from .moe import MoE
-
-
-class LogitsHead(ParallelLMHead):
-    """Vocab-parallel head, projecting in FP32.
-
-    Inherits from `ParallelLMHead` for the same reason V4's `ParallelHead` does:
-    the vocab-axis sharding and its `weight_loader` come with it. Hand-rolling
-    the parameter leaves the loader with no way to shard it -- the flat
-    rank-major slice holds the right values but is one-dimensional, so it cannot
-    be copied into a `[vocab/tp, hidden]` destination.
-    """
-
-    def __init__(self, hidden_size, vocab_size):
-        super().__init__(vocab_size, hidden_size, bias=False)
-        self.group = get_tp_group()
-        self.register_buffer("fp32_weight", None, persistent=False)
-
-    def process_weights_after_loading(self):
-        self.fp32_weight = self.weight.float()
-
-    def forward(self, hidden):
-        if self.fp32_weight is None:
-            raise RuntimeError("Logits weights must be processed after loading")
-        logits = F.linear(hidden.float(), self.fp32_weight)
-        return (
-            self.group.all_gather(logits, dim=-1)
-            if self.group.world_size > 1
-            else logits
-        )
 
 
 class Block(nn.Module):
@@ -247,10 +221,8 @@ class DeepseekV41ForCausalLM(nn.Module):
             )
             for spec in self.topology
         )
-        # Final normalization feeds the FP32 logits projection, with no further
-        # activation quantization. Reuse V4's fused RMSNorm at this boundary.
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.head = LogitsHead(config.hidden_size, config.vocab_size)
+        self.head = ParallelHead(config.vocab_size, config.hidden_size)
         self.window_rope = RotaryEmbedding(
             config.qk_rope_head_dim, max_length, base=config.rope_theta
         )
@@ -376,6 +348,8 @@ class DeepseekV41ForCausalLM(nn.Module):
             image_mask=image_mask,
         )
         hidden = hidden[:, logits_start:] if full_logits else hidden[:, -1]
-        logits = self.head(self.norm(hidden))
+        logits = self.head.get_logits(self.norm(hidden).flatten(0, -2)).unflatten(
+            0, hidden.shape[:-1]
+        )
         cache.finish_step(step)
         return logits

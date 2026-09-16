@@ -16,23 +16,56 @@ from aiter.dist.parallel_state import (
     destroy_model_parallel,
     init_distributed_environment,
     initialize_model_parallel,
-    set_custom_all_reduce,
 )
+from transformers import AutoTokenizer
+
+from atom.config import Config, use_custom_atom_config
 from atom.model_engine.engram_runtime import EngramHost, EngramPrefetcher, EngramRequest
 from atom.model_loader.deepseek_v41 import engram_tables
+from atom.model_loader.loader import load_model
 from atom.model_ops.engram import CompressedTokenizer, EngramConfig, NgramHashMapping
 from atom.models.deepseek_v41.config import IndexTieBreak
 from atom.models.deepseek_v41.multimodal import DeepseekV41MultimodalModel
-from transformers import AutoTokenizer
+from atom.utils.forward_context import (
+    Context,
+    reset_forward_context,
+    set_forward_context,
+)
 
-from atom.config import get_hf_config
-from atom.model_loader.loader import load_model
+
+@contextmanager
+def offline_forward_context(atom_config):
+    """Ask the shared LM head for a row per token, not per sequence.
+
+    `ParallelLMHead` keeps only the last row of each sequence on a prefill
+    context, and every offline caller has already chosen its own rows.
+    Positions stay empty: offline layers take theirs through `step`.
+    """
+    set_forward_context(
+        None,
+        atom_config,
+        Context(torch.empty(0, dtype=torch.int64), is_prefill=False),
+    )
+    try:
+        yield
+    finally:
+        reset_forward_context()
 
 
 @contextmanager
 def load_offline_model(directory, max_length, *, index_topk_tie_break=None):
     """Keep mapped Engram tables alive for the entire offline model lifetime."""
-    config = get_hf_config(directory)
+    # The serving config, so this path is held to the same admission rules.
+    # Everything here -- eager, whole-expert EP, no paging or speculation --
+    # is inside that envelope rather than beside it.
+    atom_config = Config(
+        model=directory,
+        tensor_parallel_size=torch.distributed.get_world_size(),
+        enable_expert_parallel=True,
+        enforce_eager=True,
+        max_model_len=max_length,
+    )
+    config = atom_config.hf_config
     if index_topk_tie_break is not None:
         config.index_topk_tie_break = IndexTieBreak(index_topk_tie_break).value
         config._multimodal_config.text_config.index_topk_tie_break = (
@@ -41,36 +74,41 @@ def load_offline_model(directory, max_length, *, index_topk_tie_break=None):
     tokenizer = AutoTokenizer.from_pretrained(directory, local_files_only=True)
     previous = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)
-    try:
-        with torch.device("cuda"):
-            # The multimodal class unconditionally, as serving builds it: it is
-            # the one that owns the vision tensors, and a text-only backbone
-            # would leave them with no parameter to land in -- reported as
-            # unroutable, or worse, skipped quietly.
-            model = DeepseekV41MultimodalModel(config, max_length=max_length)
-    finally:
-        torch.set_default_dtype(previous)
-    load_model(model, directory, config)
-    with engram_tables(directory, config) as tables:
-        engram_config = EngramConfig.from_hf(config.to_dict())
-        mapping = NgramHashMapping(
-            engram_config,
-            CompressedTokenizer(
-                tokenizer, expected_size=engram_config.compressed_vocab_size
-            ),
-        )
-        prefetcher = EngramPrefetcher(mapping, tables)
-        host = EngramHost(
-            prefetcher,
-            max_length,
-            engram_config.num_hash_heads,
-            engram_config.head_dim,
-            model.embed.weight.device,
-        )
+    # The shared MoE reads its config off this global, both while the layers are
+    # built and while they run. `ModelRunner` sets it once; with no runner here,
+    # scope it to the model's lifetime.
+    with use_custom_atom_config(atom_config):
         try:
-            yield model, tokenizer, mapping, host
+            with torch.device("cuda"):
+                # The multimodal class unconditionally, as serving builds it:
+                # it is the one that owns the vision tensors, and a text-only
+                # backbone would leave them with no parameter to land in --
+                # reported as unroutable, or worse, skipped quietly.
+                model = DeepseekV41MultimodalModel(config, max_length=max_length)
         finally:
-            host.shutdown()
+            torch.set_default_dtype(previous)
+        load_model(model, directory, config)
+        with engram_tables(directory, config) as tables:
+            engram_config = EngramConfig.from_hf(config.to_dict())
+            mapping = NgramHashMapping(
+                engram_config,
+                CompressedTokenizer(
+                    tokenizer, expected_size=engram_config.compressed_vocab_size
+                ),
+            )
+            prefetcher = EngramPrefetcher(mapping, tables)
+            host = EngramHost(
+                prefetcher,
+                max_length,
+                engram_config.num_hash_heads,
+                engram_config.head_dim,
+                model.embed.weight.device,
+            )
+            try:
+                with offline_forward_context(atom_config):
+                    yield model, tokenizer, mapping, host
+            finally:
+                host.shutdown()
 
 
 def prepare_engram(token_ids, position, history, mapping, host, *, token_mask=None):
@@ -103,10 +141,6 @@ def initialize_parallel():
     rank, local_rank = int(os.environ["RANK"]), int(os.environ["LOCAL_RANK"])
     size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(local_rank)
-    # The eager V4.1 baseline mixes BF16 embedding and FP32 output reductions.
-    # The current AITER custom path is not repeatable for this workload; select
-    # its supported RCCL fallback before constructing any parallel groups.
-    set_custom_all_reduce(False)
     init_distributed_environment(
         world_size=size,
         rank=rank,

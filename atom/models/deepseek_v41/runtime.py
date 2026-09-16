@@ -64,7 +64,4 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         return F.pad(hidden, (0, 0, 0, input_ids.numel() - step.length))
 
     def compute_logits(self, hidden):
-        context = get_forward_context()
-        if context.context.is_prefill:
-            hidden = hidden[context.attn_metadata.cu_seqlens_q[1:].long() - 1]
-        return self.head(self.norm(hidden))
+        return self.head.get_logits(self.norm(hidden))
