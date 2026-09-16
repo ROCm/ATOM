@@ -190,6 +190,109 @@ def test_load_and_sync_shuffle_in_the_same_cases(
     assert _loader_shuffles(monkeypatch, case) == _sync_shuffles(monkeypatch, case)
 
 
+# ── one decision, one comparison ──────────────────────────────────────────
+
+
+class _ForeignMember:
+    """A `QuantType` member as it arrives out of a differently identified aiter
+    import -- a plugin process, a re-import, `atom.quant_spec`'s lazy proxy.
+
+    The value is the same; identity against the member in THIS import is not,
+    which is all a pybind enum's `==` answers on. This is the condition
+    `weight_is_stored_preshuffled` compares by value for, and every layout
+    decision taken beside it has to survive the same condition or the halves of
+    one decision disagree.
+    """
+
+    def __init__(self, member):
+        self.value = member.value
+        self.name = member.name
+
+    def __eq__(self, other):
+        return self is other
+
+    def __hash__(self):
+        return id(self)
+
+
+def _pad_double(quant_type, *, output_size=32, input_size=64):
+    """The attributes `_maybe_pad_a8w8_preshuffle_output` reads.
+
+    `output_size=32` is not tile-aligned (N % 128), so a weight of this shape is
+    one the pad has to act on.
+    """
+    return SimpleNamespace(
+        weight=nn.Parameter(
+            torch.zeros(output_size, input_size, dtype=torch.uint8),
+            requires_grad=False,
+        ),
+        weight_scale=nn.Parameter(torch.ones(output_size, 1), requires_grad=False),
+        bias=None,
+        quant_type=quant_type,
+        params_dtype=dtypes.fp8,
+        prefix="test",
+    )
+
+
+def test_the_pad_half_of_the_decision_answers_like_the_shuffle_half():
+    """Both halves are taken in `process_weights_after_loading`, one asking the
+    helper and one asking itself. Split, they shuffled the weight and left its N
+    unpadded -- a layout the preshuffle GEMM cannot consume."""
+    foreign = _ForeignMember(QuantType.per_Token)
+    module = _pad_double(foreign)
+
+    assert weight_is_stored_preshuffled(foreign, dtypes.fp8) is True
+    assert LinearBase._maybe_pad_a8w8_preshuffle_output(module) is True
+    assert tuple(module.weight.shape) == (128, 64)
+
+
+def test_a_weight_that_cannot_be_padded_still_fails_loudly():
+    """The RuntimeError is why the pad half exists: K is what padding cannot
+    fix. Skipped along with the padding, `shuffle_weights` gets to raise its own
+    `x.shape[-1] % 32 == 0` assertion instead."""
+    module = _pad_double(_ForeignMember(QuantType.per_Token), input_size=60)
+
+    with pytest.raises(RuntimeError, match="K % 32 == 0"):
+        LinearBase._maybe_pad_a8w8_preshuffle_output(module)
+
+
+def test_the_scale_shuffle_answers_on_the_same_terms(monkeypatch):
+    """`per_1x32` shuffles the SCALE at the tail of the same method -- a layout
+    decision like the other two, and behind the same comparison."""
+    shuffled = []
+    monkeypatch.setattr(linear_mod, "shuffle_weights", lambda *a, **k: None)
+    monkeypatch.setattr(
+        linear_mod.fp4_utils,
+        "e8m0_shuffle",
+        lambda scale: shuffled.append(scale) or scale,
+        raising=False,
+    )
+    module = _linear_double(_ForeignMember(QuantType.per_1x32), dtypes.fp8, False)
+
+    LinearBase.process_weights_after_loading(module)
+
+    assert shuffled
+
+
+def test_the_per_tensor_requantize_answers_on_the_same_terms(monkeypatch):
+    """Not a layout decision, but the same comparison in the same method: a
+    multi-partition per_Tensor weight that skips this keeps one scale per
+    partition where the kernel reads a single one."""
+    calls = []
+
+    def _requantize(**kwargs):
+        calls.append(kwargs)
+        return kwargs["weight_scale"], kwargs["weight"]
+
+    monkeypatch.setattr(linear_mod, "requantize_with_max_scale", _requantize)
+    module = _linear_double(_ForeignMember(QuantType.per_Tensor), dtypes.fp8, False)
+    module.output_partition_sizes = [16, 16]
+
+    LinearBase.process_weights_after_loading(module)
+
+    assert [kwargs["logical_widths"] for kwargs in calls] == [[16, 16]]
+
+
 @pytest.mark.parametrize("case", CASES, ids=lambda c: f"{c[0].name}-{c[1]}-{c[2]}")
 def test_neither_side_shuffles_a_3d_weight(monkeypatch, case):
     """Qwen3-Next's GDN conv1d expands its weight to 3D and stays row-major.

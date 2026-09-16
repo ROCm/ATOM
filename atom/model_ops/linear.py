@@ -852,12 +852,24 @@ class LinearBase(nn.Module):
         }
 
     def process_weights_after_loading(self):
+        """Settle the layout this weight is stored in, once.
+
+        Every `quant_type` test below compares by `.value`, like
+        `weight_is_stored_preshuffled` and everything downstream of the load.
+        They have to be the SAME comparison: this function asks that helper
+        whether to shuffle and then asks itself whether to pad, and a `==` on
+        either side answers False for a module whose `quant_type` came from a
+        differently-identified aiter import (see that helper's docstring), so
+        the two halves of one decision came out inconsistent -- the weight
+        shuffled and its N left unpadded, with the RuntimeError that exists to
+        catch exactly that skipped along with the padding.
+        """
         if self.weight.numel() == 0:
             return
         # Re-quantize before process_weights if online quantization is enabled
         if self.quant_config is not None and self.quant_config.online_quant:
             self.online_quantize_weight()
-        if self.quant_type == QuantType.per_Tensor and (
+        if self.quant_type.value == QuantType.per_Tensor.value and (
             len(self.output_partition_sizes) > 1
             or hasattr(self, "_loaded_weight_scale_for_requant")
             or hasattr(self, "_loaded_weight_scale_for_requant_parts")
@@ -896,7 +908,7 @@ class LinearBase(nn.Module):
             )
         if (
             self.source_quant_dtype == torch.bfloat16
-            and self.quant_type == QuantType.per_1x32
+            and self.quant_type.value == QuantType.per_1x32.value
             and self.params_dtype == torch.float4_e2m1fn_x2
         ):
             w_q, w_s = self.quant_func(
@@ -925,14 +937,18 @@ class LinearBase(nn.Module):
                 shuffle_weights(self.weight)
                 # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         # shuffle weight scale once so no reshuffling for every gemm
-        if self.quant_type == QuantType.per_1x32 and (
+        if self.quant_type.value == QuantType.per_1x32.value and (
             self.params_dtype != dtypes.fp4x2 or not use_fp4_non_shuffle_triton_gemm()
         ):
             self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
 
     def _maybe_pad_a8w8_preshuffle_output(self) -> bool:
+        # The other half of the shuffle decision `process_weights_after_loading`
+        # takes, so it answers on the same terms `weight_is_stored_preshuffled`
+        # does -- by value.
         if not (
-            self.quant_type == QuantType.per_Token and self.params_dtype == dtypes.fp8
+            self.quant_type.value == QuantType.per_Token.value
+            and self.params_dtype == dtypes.fp8
         ):
             return False
         if self.weight.dim() != 2:
