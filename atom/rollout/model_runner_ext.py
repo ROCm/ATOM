@@ -9,10 +9,10 @@ from typing import Optional
 
 import numpy as np
 import torch
-
 from aiter import init_dist_env
 from aiter.dist.parallel_state import get_tp_group
 from aiter.dist.utils import get_distributed_init_method
+
 from atom.model_engine.model_runner import ModelRunner
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.rollout.memory_manager import MemoryManagerMixin
