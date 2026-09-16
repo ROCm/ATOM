@@ -450,6 +450,7 @@ class ScheduledBatchOutput:
         is_prev_prefill=False,
         logprobs=None,
         dspark_ell: np.ndarray | None = None,
+        routed_experts: dict[int, np.ndarray] | None = None,
     ):
         self.req_ids = req_ids
         self.token_ids = token_ids
@@ -464,6 +465,9 @@ class ScheduledBatchOutput:
         # (main-process) scheduler so the NEXT step can size each request's
         # verification to ell_r+1. None when DSpark scheduling is off.
         self.dspark_ell = dspark_ell
+        # Per-request MoE routes gathered this step, keyed by req_id.
+        # Each value is int16 [num_forwarded_tokens, num_layers, top_k].
+        self.routed_experts = routed_experts
         # O(1) lookup: req_id -> index (lazy-built on first access)
         self._req_id_to_idx: dict[int, int] | None = None
 
@@ -515,6 +519,15 @@ class Scheduler:
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.config = config
+        if getattr(config, "enable_return_routed_experts", False):
+            from atom.model_ops.fused_moe.routed_experts_capturer import (
+                check_return_routed_experts,
+            )
+
+            check_return_routed_experts(
+                getattr(config, "decode_context_parallel_size", 1),
+                getattr(config, "prefill_context_parallel_size", 1),
+            )
         pc = getattr(config, "parallel_config", None)
         self.metrics = SchedulerMetrics(
             getattr(pc, "data_parallel_rank", 0)
@@ -2649,6 +2662,15 @@ class Scheduler:
         # live seq.is_partial_prefill while this batch was in flight).
         pp_middle_chunk_ids: set[int] = set()
         running_by_id = {seq.id: seq for seq in self.running} if batch else {}
+        routed = getattr(fwd_output, "routed_experts", None)
+        if routed:
+            seq_map = dict(running_by_id)
+            for seq in seqs:
+                seq_map[seq.id] = seq
+            for req_id, arr in routed.items():
+                seq = seq_map.get(req_id)
+                if seq is not None:
+                    seq.routed_experts = arr
         num_prefill = int(getattr(batch, "total_seqs_num_prefill", 0))
         if self._connector_flag("is_offload") and num_prefill:
             for req_id in batch.req_ids[:num_prefill]:
@@ -3021,6 +3043,9 @@ class Scheduler:
                         seq, "kv_transfer_params_output", None
                     ),
                     num_cached_tokens=getattr(seq, "prefix_cache_hit_tokens", 0),
+                    routed_experts=(
+                        seq.routed_experts if leave_reason is not None else None
+                    ),
                 )
 
                 if request_output.kv_transfer_params_output is not None:
@@ -3039,6 +3064,10 @@ class Scheduler:
                 seq.num_tokens = num_tokens
                 seq.leave_reason = leave_reason
                 seq.status = SequenceStatus.FINISHED
+                if seq.routed_experts is not None:
+                    keep = max(int(num_tokens) - 1, 0)
+                    if seq.routed_experts.shape[0] != keep:
+                        seq.routed_experts = seq.routed_experts[:keep]
                 self.total_finished_requests += 1
                 self.total_prompt_tokens += int(seq.num_prompt_tokens)
                 self.total_generation_tokens += max(

@@ -31,6 +31,9 @@ from atom.config import (
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.eplb import eplb_map_and_record_fused
+from atom.model_ops.fused_moe.routed_experts_capturer import (
+    maybe_capture_routed_experts,
+)
 from atom.model_ops.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
     FusedMoEConfig,
@@ -597,6 +600,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
+        maybe_capture_routed_experts(layer, topk_logical)
         if layer.expert_layout.shared_is_routed:
             # EPLB places and records shared experts with routed experts.
             topk_weights, topk_logical = layer.append_shared_logical_column(
@@ -925,6 +929,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
+        maybe_capture_routed_experts(layer, topk_ids)
         if self.fused_experts:
             return self.fused_experts(
                 hidden_states=x,
@@ -2569,6 +2574,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
+        maybe_capture_routed_experts(layer, topk_ids)
 
         # Get activation scales (may be None for dynamic quantization)
         a1_scale = getattr(layer, "w13_input_scale", None)
@@ -3018,6 +3024,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             num_fused_shared_experts=layer.num_fused_shared_experts,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
+        maybe_capture_routed_experts(layer, topk_ids)
         # Match the 1x32 preshuffled layout above; other FP8 quant modes keep
         # the historical separated gate/up layout.
         gate_mode = (

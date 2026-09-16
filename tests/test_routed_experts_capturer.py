@@ -1,0 +1,161 @@
+# SPDX-License-Identifier: MIT
+"""Slot-indexed MoE route capture: scatter, gather, CUDA-graph pad slots."""
+
+from dataclasses import fields
+
+import numpy as np
+import pytest
+
+torch = pytest.importorskip("torch")
+
+from atom.config import Config
+from atom.model_engine.request import RequestOutput
+from atom.model_engine.sequence import Sequence
+from atom.model_ops.fused_moe.routed_experts_capturer import (
+    RoutedExpertsCapturer,
+    check_return_routed_experts,
+    kv_slots_from_block_table,
+    maybe_capture_routed_experts,
+)
+
+
+@pytest.fixture(autouse=True)
+def _reset_capturer():
+    RoutedExpertsCapturer.reset()
+    yield
+    RoutedExpertsCapturer.reset()
+
+
+def _device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def test_config_flag_defaults_off():
+    names = {f.name for f in fields(Config)}
+    assert "enable_return_routed_experts" in names
+    field = next(f for f in fields(Config) if f.name == "enable_return_routed_experts")
+    assert field.default is False
+
+
+def test_dcp_pcp_fail_closed():
+    check_return_routed_experts(1, 1)
+    with pytest.raises(ValueError, match="decode_context_parallel_size"):
+        check_return_routed_experts(2, 1)
+    with pytest.raises(ValueError, match="prefill_context_parallel_size"):
+        check_return_routed_experts(1, 2)
+
+
+def test_flag_off_leaves_field_absent():
+    seq = Sequence([1, 2, 3], 3)
+    assert seq.routed_experts is None
+    ro = RequestOutput(request_id=0, output_tokens=[1], finished=True)
+    assert ro.routed_experts is None
+
+
+def test_interleaved_two_request_scatter_gather():
+    """Two requests share one select_experts-style batch; gather by block table."""
+    device = _device()
+    block_size = 16
+    capturer = RoutedExpertsCapturer.init(
+        num_slots=64, num_layers=3, top_k=2, device=device
+    )
+    # Request A: blocks [0], tokens at slots 0,1 then later 2
+    # Request B: blocks [1], tokens at slots 16,17
+    # Interleaved batch 1: A0, B0, A1, B1
+    slots_b1 = torch.tensor([0, 16, 1, 17], device=device)
+    ids_b1 = torch.tensor(
+        [[10, 11], [20, 21], [12, 13], [22, 23]],
+        dtype=torch.int32,
+        device=device,
+    )
+    capturer.capture(0, ids_b1, slot_mapping=slots_b1)
+    capturer.capture(1, ids_b1 + 100, slot_mapping=slots_b1)
+
+    # Later step: only A token 2, B idle
+    slots_b2 = torch.tensor([2], device=device)
+    ids_b2 = torch.tensor([[14, 15]], dtype=torch.int32, device=device)
+    capturer.capture(0, ids_b2, slot_mapping=slots_b2)
+    capturer.capture(1, ids_b2 + 100, slot_mapping=slots_b2)
+
+    exported = capturer.export_batch(
+        req_ids=[7, 9],
+        block_tables=[[0], [1]],
+        num_tokens_list=[3, 2],
+        block_size=block_size,
+    )
+    a = exported[7]
+    b = exported[9]
+    assert a.shape == (3, 3, 2)
+    assert b.shape == (2, 3, 2)
+    assert a.dtype == np.int16
+    np.testing.assert_array_equal(a[:, 0, :], [[10, 11], [12, 13], [14, 15]])
+    np.testing.assert_array_equal(a[:, 1, :], [[110, 111], [112, 113], [114, 115]])
+    np.testing.assert_array_equal(b[:, 0, :], [[20, 21], [22, 23]])
+
+
+def test_length_contract_prompt_plus_completion_minus_one():
+    device = _device()
+    capturer = RoutedExpertsCapturer.init(
+        num_slots=32, num_layers=1, top_k=1, device=device
+    )
+    prompt_len, completion_len = 4, 2
+    # Routes exist for every forwarded token: all prompt tokens plus every
+    # completion token except the last sampled id (never forwarded).
+    n_routes = prompt_len + completion_len - 1
+    slots = torch.arange(n_routes, device=device)
+    ids = torch.arange(n_routes, device=device, dtype=torch.int32).unsqueeze(-1)
+    capturer.capture(0, ids, slot_mapping=slots)
+    exported = capturer.export_batch(
+        [1], [[0]], [n_routes], block_size=16
+    )[1]
+    assert exported.shape[0] == n_routes
+    assert exported.shape[0] == prompt_len + completion_len - 1
+
+
+def test_graph_dummy_negative_slots_ignored():
+    device = _device()
+    capturer = RoutedExpertsCapturer.init(
+        num_slots=8, num_layers=1, top_k=2, device=device
+    )
+    capturer.buffer[:, 0, :] = -7
+    slots = torch.tensor([-1, -1, 3], device=device)
+    ids = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32, device=device)
+    capturer.capture(0, ids, slot_mapping=slots)
+    # Pad rows must not clobber slot 0.
+    got0 = capturer.buffer[0, 0].tolist()
+    assert got0 == [-7, -7]
+    got3 = capturer.buffer[3, 0].tolist()
+    assert got3 == [5, 6]
+
+
+def test_prefix_hit_reuses_physical_slots():
+    device = _device()
+    capturer = RoutedExpertsCapturer.init(
+        num_slots=32, num_layers=1, top_k=2, device=device
+    )
+    slots = torch.tensor([0, 1, 2], device=device)
+    ids = torch.tensor([[7, 8], [9, 10], [11, 12]], dtype=torch.int32, device=device)
+    capturer.capture(0, ids, slot_mapping=slots)
+    # Request B prefix-hits A's blocks; gather the same physical slots.
+    a = capturer.export_batch([1], [[0]], [3], block_size=16)[1]
+    b = capturer.export_batch([2], [[0]], [3], block_size=16)[2]
+    np.testing.assert_array_equal(a, b)
+    np.testing.assert_array_equal(a[:, 0, :], [[7, 8], [9, 10], [11, 12]])
+
+
+def test_maybe_capture_skips_when_uninitialized():
+    class _Layer:
+        moe_capture_layer_id = 0
+
+    maybe_capture_routed_experts(
+        _Layer(), torch.zeros((2, 2), dtype=torch.int32)
+    )
+    assert RoutedExpertsCapturer.get() is None
+
+
+def test_kv_slots_from_block_table():
+    slots = kv_slots_from_block_table([4, 9], num_tokens=18, block_size=16)
+    assert slots.tolist() == list(range(4 * 16, 4 * 16 + 16)) + [
+        9 * 16,
+        9 * 16 + 1,
+    ]

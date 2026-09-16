@@ -2010,7 +2010,68 @@ class ModelRunner:
             and torch.distributed.get_world_size() > 1
         ):
             torch.distributed.barrier()
+        self._maybe_init_routed_experts_capturer(num_kvcache_blocks)
         return True
+
+    def _maybe_init_routed_experts_capturer(self, num_kvcache_blocks: int) -> None:
+        if not getattr(self.config, "enable_return_routed_experts", False):
+            return
+        import re
+
+        from atom.model_ops.fused_moe.routed_experts_capturer import (
+            RoutedExpertsCapturer,
+        )
+        from atom.model_ops.moe import FusedMoE
+
+        models = [self.model]
+        moes: list = []
+        for model in models:
+            moes.extend(m for m in model.modules() if isinstance(m, FusedMoE))
+        if not moes:
+            return
+        layer_ids: list[int] = []
+        for ordinal, moe in enumerate(moes):
+            prefix = getattr(moe, "prefix", "") or ""
+            match = re.search(r"layers\.(\d+)", prefix)
+            if match:
+                idx = int(match.group(1))
+            elif getattr(moe, "layer_id", None) is not None:
+                idx = int(moe.layer_id)
+            else:
+                idx = ordinal
+            moe.moe_capture_layer_id = idx
+            layer_ids.append(idx)
+        num_slots = int(num_kvcache_blocks) * int(self.block_size)
+        RoutedExpertsCapturer.init(
+            num_slots=num_slots,
+            num_layers=max(layer_ids) + 1,
+            top_k=max(int(m.top_k) for m in moes),
+            device=self.device,
+        )
+
+    def _attach_routed_experts(
+        self, batch: ScheduledBatch, output: ScheduledBatchOutput
+    ) -> None:
+        if not getattr(self.config, "enable_return_routed_experts", False):
+            return
+        if getattr(batch, "is_dummy_run", False) or self.rank != 0:
+            return
+        from atom.model_ops.fused_moe.routed_experts_capturer import (
+            RoutedExpertsCapturer,
+        )
+
+        capturer = RoutedExpertsCapturer.get()
+        if capturer is None:
+            return
+        block_tables = getattr(batch, "block_tables", None)
+        if not block_tables or len(block_tables) != len(batch.req_ids):
+            return
+        output.routed_experts = capturer.export_batch(
+            batch.req_ids,
+            block_tables,
+            batch.context_lens,
+            self.block_size,
+        )
 
     def get_dp_padding(self, num_tokens: int) -> tuple[int, torch.Tensor | None]:
         dp_size = self.config.parallel_config.data_parallel_size
@@ -3151,7 +3212,7 @@ class ModelRunner:
         if verify_scheduler is not None:
             dspark_ell = verify_scheduler.ell_nonblocking()
 
-        return ScheduledBatchOutput(
+        output = ScheduledBatchOutput(
             req_ids=req_ids_out,
             token_ids=token_ids_out,
             draft_token_ids=draft_token_ids,
@@ -3161,6 +3222,8 @@ class ModelRunner:
             logprobs=logprobs_map,
             dspark_ell=dspark_ell,
         )
+        self._attach_routed_experts(batch, output)
+        return output
 
     def _record_kv_cache_ready(self, batch: ScheduledBatch) -> None:
         """Publish a GPU event for final prefill chunks to transfer connectors."""
@@ -3254,13 +3317,15 @@ class ModelRunner:
             # Mark this slot's GPU work (attention consumed its metadata) done.
             self._record_forward_vars_event()
             self._record_kv_cache_ready(batch)
-            return ScheduledBatchOutput(
+            output = ScheduledBatchOutput(
                 req_ids=list(batch.req_ids),
                 token_ids=[],
                 num_rejected=None,
                 num_bonus=None,
                 draft_token_ids=None,
             )
+            self._attach_routed_experts(batch, output)
+            return output
 
         fwd_output = self.postprocess(
             batch,

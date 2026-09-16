@@ -1717,6 +1717,10 @@ class Config:
     kv_cache_dtype: str = "bf16"
     index_cache_dtype: str | None = None
     enable_prefix_caching: bool = True
+    # Return per-request MoE routes from generate() as int16
+    # [seq_len - 1, num_layers, top_k]. Scatter is CUDA-graph-safe (device
+    # write inside fused MoE). Requires DCP=PCP=1; prefix cache stays on.
+    enable_return_routed_experts: bool = False
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
     # Seconds between engine-status lines. Validated > 0 by EngineStats.
@@ -1903,6 +1907,15 @@ class Config:
             self.dcp_config = DCPConfig(**self.dcp_config.__dict__)
         else:
             raise TypeError("dcp_config must be DCPConfig or dict")
+        if self.enable_return_routed_experts and (
+            self.decode_context_parallel_size != 1
+            or self.prefill_context_parallel_size != 1
+        ):
+            raise ValueError(
+                "enable_return_routed_experts requires "
+                "decode_context_parallel_size == 1 and "
+                "prefill_context_parallel_size == 1"
+            )
         # assert os.path.isdir(self.model)
 
         # The forced-acceptance schedule spends its whole budget on the first
