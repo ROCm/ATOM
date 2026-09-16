@@ -130,6 +130,35 @@ class KVConnectorFactory:
         return cls._requires_pd_staging.get(connector, True)
 
     @classmethod
+    def topology_reads_block_regions(cls, config: Any) -> bool:
+        """Does this transport consume the attention backend's PAGE region map?
+
+        Not the same question as `topology_uses_pd_staging`, which answers
+        whether a backend needs compressor-only P/D staging. `lmcache_mp`
+        declares that False and still builds its cache views straight from
+        `KVTransferTensors` -- `_build_cache_views` raises on None -- so a
+        caller that needs to know whether the map is read at all cannot reuse
+        the staging flag as a proxy for it.
+
+        Only `lmcache_offload` on the dense layout ignores it:
+        `DenseOffloadConnector.register_kv_caches` takes `transfer_tensors` and
+        never looks at it, building its codec from the `KVCacheTensor`s. The
+        hybrid, m3 and kimi_k3 layouts source their PAGE bytes from the
+        regions, and every P/D backend addresses the cache through them -- so
+        the layout, not just the connector name, decides.
+        """
+
+        kv_cfg = getattr(config, "kv_transfer_config", None) or {}
+        if not kv_cfg:
+            return False
+        connector = cls.canonical_name(kv_cfg.get("kv_connector", "moriio"))
+        if connector != "lmcache_offload":
+            return True
+        from atom.kv_transfer.offload.config import select_offload_layout
+
+        return select_offload_layout(config) != "dense"
+
+    @classmethod
     def create_connector(
         cls, config: Any, role: str = "worker"
     ) -> KVConnectorBase | KVConnectorSchedulerBase:

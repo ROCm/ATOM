@@ -8,11 +8,17 @@ and a separate e8m0 exponent plane. `KVTransferRegion`'s role vocabulary has a
 single `INDEX_CACHE_ROLE` for the indexer, so a transport that addresses the
 cache through the region map cannot describe the second plane and is refused.
 
-An offload connector does not read the region map at all: `DenseOffloadConnector
+Dense offload does not read the region map at all: `DenseOffloadConnector
 .register_kv_caches` takes `transfer_tensors` and ignores it, building its codec
 from the `KVCacheTensor`s, which carry both planes. Refusing it as well -- which
 a blanket `if config.kv_transfer_config` does -- costs FP4 the offload path for a
 reason that is not about it.
+
+"Offload" is not the line, though: `lmcache_mp` is offload and `_build_cache_views`
+raises on a None `KVTransferTensors`, and the hybrid/m3/kimi_k3 layouts source
+their PAGE bytes from `block_regions`. The line is whether the region map is read,
+which `topology_uses_pd_staging` does not answer -- it is about compressor P/D
+staging, and `lmcache_mp` declares that False. These pin the real predicate.
 
 The gate is exercised as an unbound method on a stub supplying the three
 attributes it reads before deciding, so the predicate under test is the shipped
@@ -33,16 +39,22 @@ AiterMLAMetadataBuilder = pytest.importorskip(
 ).AiterMLAMetadataBuilder
 
 
-def _fp4_builder(kv_transfer_config):
+def _fp4_builder(kv_transfer_config, *, hf_config=None):
     """A stub carrying only what `get_kv_transfer_tensors` reads before the gate.
 
     `kv_pool` is a sentinel rather than a pool: reaching it would mean the gate
     fell through, and every later line needs a real one -- so an attribute error
     past this point is the test failing loudly rather than passing by accident.
+
+    `hf_config` reaches `select_offload_layout`, which decides the offload family
+    and so whether the regions are read. None is the dense layout.
     """
     return SimpleNamespace(
         model_runner=SimpleNamespace(
-            config=SimpleNamespace(kv_transfer_config=kv_transfer_config)
+            config=SimpleNamespace(
+                kv_transfer_config=kv_transfer_config,
+                hf_config=hf_config,
+            )
         ),
         kv_pool=object(),
         _indexer_fp4=True,
@@ -54,13 +66,12 @@ def _fp4_builder(kv_transfer_config):
     [
         pytest.param({"kv_connector": "lmcache_offload"}, id="lmcache_offload"),
         pytest.param({"kv_connector": "LMCacheConnectorV1"}, id="lmcache-v1-alias"),
-        pytest.param({"kv_connector": "lmcache_mp"}, id="lmcache_mp"),
         pytest.param({}, id="no-connector"),
         pytest.param(None, id="unset"),
     ],
 )
-def test_fp4_indexer_serves_offload_connectors(kv_transfer_config):
-    """Offload never reads these regions, so FP4 hands it None instead of raising."""
+def test_fp4_indexer_serves_dense_offload(kv_transfer_config):
+    """Dense offload never reads these regions, so FP4 hands it None, not a raise."""
     builder = _fp4_builder(kv_transfer_config)
 
     assert (
@@ -72,16 +83,47 @@ def test_fp4_indexer_serves_offload_connectors(kv_transfer_config):
     "connector",
     ["mooncake", "moriio", "multi"],
 )
-def test_fp4_indexer_refuses_pd_connectors(connector):
+def test_fp4_indexer_refuses_region_map_transports(connector):
     """A transport that addresses the cache by region still cannot see plane two.
 
-    The message has to name P/D: an operator reading it decides between dropping
-    to FP8 and dropping P/D, and the old wording ("KV transfer ... unsupported")
-    sent someone using only offload to FP8 for nothing.
+    The message has to say which transports it means: an operator reading it
+    decides between dropping to FP8 and dropping the transport, and a bare "KV
+    transfer ... unsupported" sent someone using only dense offload to FP8 for
+    nothing.
     """
     builder = _fp4_builder({"kv_connector": connector})
 
-    with pytest.raises(NotImplementedError, match="P/D KV transfer"):
+    with pytest.raises(NotImplementedError, match="region map"):
+        AiterMLAMetadataBuilder.get_kv_transfer_tensors(builder)
+
+
+def test_fp4_indexer_refuses_lmcache_mp():
+    """Offload that DOES read the regions is still refused.
+
+    `lmcache_mp` registers with `requires_pd_staging=False`, so a gate keyed on
+    that flag lets it through -- and then `_build_cache_views` raises
+    "lmcache_mp requires KVTransferTensors" during cache registration, which is
+    a worse failure than the refusal it skipped.
+    """
+    builder = _fp4_builder({"kv_connector": "lmcache_mp"})
+
+    with pytest.raises(NotImplementedError, match="region map"):
+        AiterMLAMetadataBuilder.get_kv_transfer_tensors(builder)
+
+
+def test_fp4_indexer_refuses_offload_layouts_that_read_regions():
+    """The connector name is not the line; the offload LAYOUT is.
+
+    `lmcache_offload` on a model with `compress_ratios` resolves to the hybrid
+    family, whose codec sources its PAGE bytes from `block_regions`. Same name,
+    opposite answer.
+    """
+    builder = _fp4_builder(
+        {"kv_connector": "lmcache_offload"},
+        hf_config=SimpleNamespace(compress_ratios=[1, 2], architectures=[]),
+    )
+
+    with pytest.raises(NotImplementedError, match="region map"):
         AiterMLAMetadataBuilder.get_kv_transfer_tensors(builder)
 
 
@@ -94,10 +136,12 @@ def test_fp4_gate_reads_the_shared_connector_predicate():
     """
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
-    for connector in ("lmcache_offload", "mooncake", "moriio", "multi"):
+    for connector in ("lmcache_offload", "lmcache_mp", "mooncake", "moriio", "multi"):
         cfg = {"kv_connector": connector}
-        refused = KVConnectorFactory.topology_uses_pd_staging(cfg)
         builder = _fp4_builder(cfg)
+        refused = KVConnectorFactory.topology_reads_block_regions(
+            builder.model_runner.config
+        )
         if refused:
             with pytest.raises(NotImplementedError):
                 AiterMLAMetadataBuilder.get_kv_transfer_tensors(builder)
