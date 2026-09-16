@@ -158,12 +158,6 @@ def _configure_mooncake_transport(protocol: str) -> None:
 MSG_WRITE_REQUEST = b"write_request"
 MSG_WRITE_DONE = b"write_done"
 MSG_GET_META = b"get_meta"
-# Bootstrap metadata probe. One round trip per producer, cached after. A live
-# peer answers in well under a millisecond, so the timeout only bounds what a
-# dead one costs; repeated failures then back off.
-_PEER_META_TIMEOUT_MS = 2_000
-_PEER_PROBE_BACKOFF_MIN_S = 1.0
-_PEER_PROBE_BACKOFF_MAX_S = 30.0
 # PP-prefill only: consumer tells stage-0 a request's KV is fully received from
 # every stage, so stage-0 may reuse the shared page table (see _record_release).
 MSG_RELEASE = b"release"
@@ -193,9 +187,6 @@ class MooncakeAgentMetadata(
     slot_base_addrs: list[int] | None = None
     slot_bps: list[int] | None = None
     num_slots: int = 0
-    # PAGE region roles. Absent from producers that predate the two-region
-    # FP4 indexer layout, which is what lets a consumer detect them.
-    block_region_roles: list[str | None] | None = None
 
 
 def _ip_for_ib_device(ib_device: str, fallback: str) -> str:
@@ -662,13 +653,6 @@ class MooncakeConnector(KVConnectorBase):
         self._per_block_bytes_list: list[int] = []
         self._block_region_roles: list[str | None] = []
         self._fp4_index_layout: bool = False
-        # Peer PAGE region roles, probed once per producer over MSG_GET_META.
-        self._peer_region_roles_cache: dict[tuple[str, str, int], list[str | None]] = {}
-        # key -> (retry-after monotonic deadline, current delay)
-        self._peer_probe_backoff: dict[
-            tuple[str | None, str, int], tuple[float, float]
-        ] = {}
-        self._peer_region_roles_lock = threading.Lock()
         self.kv_cache_shape: tuple[int, ...] | None = None
         self.block_len: int = config.kv_cache_block_size
         self.num_blocks: int = 0
@@ -967,7 +951,6 @@ class MooncakeConnector(KVConnectorBase):
                 slot_base_addrs=[b for b, _ in self._slot_regions],
                 slot_bps=[bps for _, bps in self._slot_regions],
                 num_slots=tt.num_slots,
-                block_region_roles=self._block_region_roles,
             )
         else:
             self._local_metadata = MooncakeAgentMetadata(
@@ -976,7 +959,6 @@ class MooncakeConnector(KVConnectorBase):
                 kv_caches_base_addr=self.kv_caches_base_addr,
                 num_blocks=tt.num_blocks,
                 block_len=self.block_len,
-                block_region_roles=self._block_region_roles,
             )
 
         logger.info(
@@ -1171,29 +1153,6 @@ class MooncakeConnector(KVConnectorBase):
 
             write_request = msgpack.dumps(request_body)
 
-            if self._fp4_index_layout and not self._peer_can_map_fp4_regions(
-                meta, remote_tp_rank, remote_tp_size, remote_pp_size
-            ):
-                if consumer_staging_pool_idx >= 0:
-                    self._release_staging_slot(consumer_staging_pool_idx)
-                with self._completion_lock:
-                    # The completion records were written before the probe ran;
-                    # drop them here or a later notification, or a reuse of the
-                    # id, would find state for a request that never started.
-                    self._pending_recv_expected.pop(req_id, None)
-                    self._pending_recv_stages.pop(req_id, None)
-                    self._pending_recv_nonce.pop(req_id, None)
-                    self.failed_recving.add(req_id)
-                logger.error(
-                    "[CONSUMER] Refusing req %s: the producer at %s:%d does not "
-                    "advertise PAGE region roles, so it cannot map this engine's "
-                    "FP4 indexer data and scale regions",
-                    req_id,
-                    meta.remote_host,
-                    meta.remote_handshake_port,
-                )
-                continue
-
             # Registered before the first send: a producer failure can be
             # notified while this loop is still running, and the handler needs
             # the slot and block records to already be there or it cannot
@@ -1243,97 +1202,6 @@ class MooncakeConnector(KVConnectorBase):
     # -----------------------------------------------------------------
     # Staging pool management
     # -----------------------------------------------------------------
-
-    def _peer_can_map_fp4_regions(
-        self,
-        meta,
-        remote_tp_rank: int,
-        remote_tp_size: int,
-        remote_pp_size: int,
-    ) -> bool:
-        """Whether a producer advertises PAGE region roles, probed once per peer.
-
-        FP4 registers the DSv4 indexer as two regions (packed data and e8m0
-        scales) where FP8 registers one. A producer that predates that layout
-        does not send ``block_region_roles`` in its bootstrap metadata and has
-        no per-region role check, so it would map this engine's plan onto the
-        wrong regions and write mismatched bytes with nothing reporting it.
-        Probing the bootstrap channel every producer already serves lets the
-        consumer refuse before it creates any pending-receive state.
-        """
-        port = meta.remote_handshake_port + _port_offset(
-            meta.remote_dp_rank,
-            remote_tp_rank,
-            remote_tp_size,
-            0,
-            remote_pp_size,
-            meta.remote_dp_size,
-        )
-        # Keyed by the producer's engine generation, not just its address. A
-        # restart reuses host:port but takes a fresh Mooncake RPC port, so a
-        # peer that came back on an older binary misses this cache and is
-        # probed again instead of inheriting the previous process's verdict.
-        # Without an engine id there is no generation to bind to, so the
-        # result is not cached at all and every request re-probes.
-        engine_id = getattr(meta, "remote_engine_id", None)
-        # MooncakeConnectorScheduler emits the literal "None" until a worker
-        # fills in its real id, and that string is truthy: taking it as a
-        # generation would give every restart the same key and hand a
-        # downgraded producer the previous process's verdict.
-        if engine_id == "None":
-            engine_id = None
-        bkey = (engine_id, meta.remote_host, port)
-        key = bkey if engine_id else None
-        now = time.monotonic()
-        with self._peer_region_roles_lock:
-            if key is not None and key in self._peer_region_roles_cache:
-                return True
-            deferred = self._peer_probe_backoff.get(bkey)
-            if deferred is not None and now < deferred[0]:
-                return False
-        addr = make_zmq_path("tcp", meta.remote_host, port)
-        sock = self.zmq_context.socket(zmq.DEALER)
-        try:
-            sock.setsockopt(zmq.LINGER, 0)
-            sock.setsockopt(zmq.RCVTIMEO, _PEER_META_TIMEOUT_MS)
-            sock.connect(addr)
-            sock.send_multipart([MSG_GET_META])
-            roles = self._decoder.decode(sock.recv_multipart()[-1]).block_region_roles
-        except Exception as exc:  # noqa: BLE001 - any failure means "cannot confirm"
-            logger.error("Peer metadata probe to %s failed: %s", addr, exc)
-            self._defer_peer_probe(bkey, now)
-            return False
-        finally:
-            sock.close()
-        if roles is None:
-            # A definite verdict, but the peer may yet be restarted into a
-            # build that does advertise roles, so it re-probes on the same
-            # schedule rather than never or on every request.
-            self._defer_peer_probe(bkey, now)
-            return False
-        # Only a success is cached: a transient probe failure must not pin the
-        # peer as unusable for the rest of the process.
-        with self._peer_region_roles_lock:
-            self._peer_probe_backoff.pop(bkey, None)
-            if key is not None:
-                self._peer_region_roles_cache[key] = roles
-        return True
-
-    def _defer_peer_probe(self, bkey: tuple, now: float) -> None:
-        """Hold off the next probe of an unusable peer, doubling each time.
-
-        Without this a producer that is down, or simply not up yet, costs one
-        receive timeout per pending request on every engine step, stalling the
-        serving worker far longer than the transfer it is guarding.
-        """
-        with self._peer_region_roles_lock:
-            previous = self._peer_probe_backoff.get(bkey)
-            delay = (
-                min(previous[1] * 2, _PEER_PROBE_BACKOFF_MAX_S)
-                if previous
-                else _PEER_PROBE_BACKOFF_MIN_S
-            )
-            self._peer_probe_backoff[bkey] = (now + delay, delay)
 
     def _acquire_staging_slot(self) -> int:
         with self._staging_lock:
@@ -2066,6 +1934,13 @@ class MooncakeConnector(KVConnectorBase):
                 "roles"
             )
         if self._fp4_index_layout and consumer_roles is None:
+            # Both ends of a PD pair run the same source tree, so this is a
+            # deployment error rather than a version to negotiate with: a peer
+            # that predates the two-region indexer layout advertises no roles,
+            # and there is nothing to map its single FP8 region onto. The
+            # reverse pairing -- an older producer, which has no check at all,
+            # receiving FP4 requests -- is not defended here and is simply not
+            # a supported mix.
             raise RuntimeError(
                 f"FP4 index layout requires the consumer to advertise region "
                 f"roles, but req {req_id} carries none; the peer predates the "
