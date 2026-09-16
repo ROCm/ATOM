@@ -399,7 +399,12 @@ jobs:
             exit 1
           fi
           for flavor in ${want}; do
-            n=$(find release-wheels -type f -name "*+${flavor}*.whl" | wc -l | tr -d ' ')
+            # The ROCm line is not always right after the "+": a build off a
+            # commit that is not a tag puts the sha first, so the local segment
+            # reads +g2462800c.rocm7.2 rather than +rocm7.2. Anchor on either
+            # separator instead of the "+" alone, or every dispatch that is not
+            # a release build fails this check with "found 0".
+            n=$(find release-wheels -type f -name "*[+.]${flavor}.*.whl" | wc -l | tr -d ' ')
             if [ "${n}" -ne 1 ]; then
               echo "Expected one ${flavor} wheel, found ${n}."
               exit 1
