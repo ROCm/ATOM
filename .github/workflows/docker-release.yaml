@@ -312,8 +312,15 @@ jobs:
           TORCH_VER=$(read_in_image 'python3 -c "import torch; print(torch.__version__)"')
           PY_VER=$(read_in_image 'python3 -c "import platform; print(platform.python_version())"')
           TRITON_VER=$(read_in_image 'python3 -c "from importlib.metadata import version; print(version(\"triton\"))" 2>/dev/null || true')
-          AITER_VER=$(read_in_image 'python3 -c "from importlib.metadata import version; print(version(\"aiter\"))" 2>/dev/null || true')
+          # amd-aiter, not aiter: that is the distribution name the wheel
+          # declares, and asking for the wrong one silently yields an empty
+          # label rather than an error.
+          AITER_VER=$(read_in_image 'python3 -c "from importlib.metadata import version; print(version(\"amd-aiter\"))" 2>/dev/null || true')
           ATOM_VER=$(read_in_image 'python3 -c "from importlib.metadata import version; print(version(\"atom\"))" 2>/dev/null || true')
+          # The commit is read from the clone inside the image, which is the
+          # commit that was actually built. The build step only has a ref name
+          # (a branch, usually), which is not what "revision" means.
+          ATOM_SHA=$(read_in_image 'git -C /app/ATOM rev-parse HEAD 2>/dev/null || true')
 
           # Two components in the tag, three in the label. The tag is a name
           # people pull by and scripts pin to, and ATOM already spells the
@@ -350,7 +357,7 @@ jobs:
           echo "FROM ${CI_IMAGE}" | DOCKER_BUILDKIT=1 docker build -q \
             --label "org.opencontainers.image.title=ATOM" \
             --label "org.opencontainers.image.version=${ATOM_VER}" \
-            --label "org.opencontainers.image.revision=${ATOM_CHECKOUT_SHA:-}" \
+            --label "org.opencontainers.image.revision=${ATOM_SHA}" \
             --label "org.opencontainers.image.source=https://github.com/ROCm/ATOM" \
             --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --label "com.amd.atom.line=${FLAVOR}" \
