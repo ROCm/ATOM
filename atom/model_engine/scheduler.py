@@ -374,6 +374,9 @@ class ScheduledBatch:
                 seq.multimodal_data = None
         self.external_request_ids = [seq.external_request_id for seq in seqs.values()]
 
+        # Metrics reporting only: per-request prefill chunks for GPU timing.
+        # Device timing is opt-in because recording GPU events adds overhead,
+        # especially for short decode forwards; skip this bookkeeping when off.
         # Freeze request chunk boundaries before schedule-time advancement.
         # Workers receive copies of the batch, not the mutable Sequence objects.
         self.prefill_gpu_requests = []
