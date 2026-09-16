@@ -83,7 +83,7 @@ on:
         options:
           - both
           - rocm7
-          - rocm10
+          - rocm10.0
       build_image:
         description: 'Override the build image (leave empty to use the flavor default)'
         required: false
@@ -142,14 +142,14 @@ jobs:
         # `if`: that is evaluated before the matrix exists, so it cannot see
         # matrix.flavor. Anything that is not a dispatch (a workflow_call with
         # no flavors, or a tag push) builds the whole set.
-        flavor: ${{ fromJSON(inputs.flavors == 'rocm7' && '["rocm7"]' || inputs.flavors == 'rocm10' && '["rocm10"]' || '["rocm7","rocm10"]') }}
+        flavor: ${{ fromJSON(inputs.flavors == 'rocm7' && '["rocm7"]' || inputs.flavors == 'rocm10.0' && '["rocm10.0"]' || '["rocm7","rocm10.0"]') }}
 
     env:
       BUILD_REF: ${{ inputs.commit || github.ref }}
       # latest-rocm10.0, not latest-rocm10: the nightly workflow reads the
       # suffix out of the image it built, so the rolling tag for a line names
       # the ROCm it carries. Bare latest stays the stable line's.
-      BUILD_IMAGE: ${{ inputs.build_image || (matrix.flavor == 'rocm10' && 'rocm/atom-dev:latest-rocm10.0' || 'rocm/atom-dev:latest') }}
+      BUILD_IMAGE: ${{ inputs.build_image || (matrix.flavor == 'rocm10.0' && 'rocm/atom-dev:latest-rocm10.0' || 'rocm/atom-dev:latest') }}
       ADD_DATE_STAMP: ${{ inputs.add_date_stamp || false }}
       DRAFT: ${{ inputs.draft || false }}
 
@@ -414,9 +414,9 @@ jobs:
           # Uploading as each flavor finished would put exactly that
           # half-release in front of users for as long as the rest takes.
           case "${FLAVORS}" in
-            both) expected=2; want="rocm7 rocm10" ;;
+            both) expected=2; want="rocm7 rocm10.0" ;;
             rocm7) expected=1; want="rocm7" ;;
-            rocm10) expected=1; want="rocm10" ;;
+            rocm10.0) expected=1; want="rocm10.0" ;;
             *) echo "Unexpected flavors value: ${FLAVORS}"; exit 1 ;;
           esac
 
@@ -432,7 +432,10 @@ jobs:
             # reads +g2462800c.rocm7.2 rather than +rocm7.2. Anchor on either
             # separator instead of the "+" alone, or every dispatch that is not
             # a release build fails this check with "found 0".
-            n=$(find release-wheels -type f -name "*[+.]${flavor}.*.whl" | wc -l | tr -d ' ')
+            # The flavor can be a whole version segment (rocm10.0, ending at
+            # the "-" before the python tag) or a prefix of one (rocm7, which
+            # the wheel spells rocm7.2), so accept either boundary after it.
+            n=$(find release-wheels -type f -name "*[+.]${flavor}[-.]*.whl" | wc -l | tr -d ' ')
             if [ "${n}" -ne 1 ]; then
               echo "Expected one ${flavor} wheel, found ${n}."
               exit 1

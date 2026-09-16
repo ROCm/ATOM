@@ -132,8 +132,12 @@ jobs:
             add "${LINE_STABLE}"
             add "${LINE_NEXT}"
           else
-            if [ "${{ inputs.build_rocm7 }}" = "true" ]; then add rocm7; fi
-            if [ "${{ inputs.build_rocm10 }}" = "true" ]; then add rocm10; fi
+            # The line names come from LINE_STABLE / LINE_NEXT, never spelled
+            # out here: a toggle selects a line, it does not name one. Writing
+            # them out is how renaming the line to rocm10.0 left this branch
+            # emitting "rocm10", which then resolved to nothing.
+            if [ "${{ inputs.build_rocm7 }}" = "true" ]; then add "${LINE_STABLE}"; fi
+            if [ "${{ inputs.build_rocm10 }}" = "true" ]; then add "${LINE_NEXT}"; fi
           fi
 
           if [ -z "${lines}" ]; then
@@ -291,28 +295,36 @@ jobs:
           -f docker/atom_release.dockerfile .
           docker inspect "${CI_IMAGE}"
 
-      # The tag suffix comes out of the image, not out of the line's nickname.
-      # A nickname says what we called the line ("rocm10"); the image knows
-      # which ROCm it actually carries (10.0.0 vs 10.1.0), and that is what a
-      # puller needs the tag to tell them. It also keeps the spelling the same
-      # as torch's and the SDK's (rocm10.0).
-      - name: Resolve tag suffix
+      # Everything the image knows about itself, read out of the image: the
+      # tag suffix it publishes under, and the labels that record the stack it
+      # was built from. Read rather than assumed -- a nickname says what we
+      # called the line, the image knows what is actually in it.
+      - name: Read the image's versions and stamp them on it
         run: |
           set -euo pipefail
+          read_in_image() { docker run --rm --entrypoint="" "${CI_IMAGE}" bash -lc "$1" | tr -d '[:space:]'; }
+
+          ROCM_VER=$(read_in_image 'cat /opt/rocm/.info/version 2>/dev/null || python3 -c "import torch; print(torch.version.hip or \"\")"')
+          if [ -z "${ROCM_VER}" ]; then
+            echo "ERROR: could not read a ROCm version out of the image; refusing to publish an unlabelled tag"
+            exit 1
+          fi
+          TORCH_VER=$(read_in_image 'python3 -c "import torch; print(torch.__version__)"')
+          PY_VER=$(read_in_image 'python3 -c "import platform; print(platform.python_version())"')
+          TRITON_VER=$(read_in_image 'python3 -c "from importlib.metadata import version; print(version(\"triton\"))" 2>/dev/null || true')
+          AITER_VER=$(read_in_image 'python3 -c "from importlib.metadata import version; print(version(\"aiter\"))" 2>/dev/null || true')
+          ATOM_VER=$(read_in_image 'python3 -c "from importlib.metadata import version; print(version(\"atom\"))" 2>/dev/null || true')
+
+          # Two components in the tag, three in the label. The tag is a name
+          # people pull by and scripts pin to, and ATOM already spells the
+          # line that way -- v0.1.5 shipped wheels as +rocm7.0, +rocm7.1,
+          # +rocm7.2. A patch bump (10.0.0 -> 10.0.1) must not rename a
+          # rolling tag out from under everyone, so the exact version lives in
+          # the label, where precision costs nothing.
           if [ "${FLAVOR}" = "${LINE_STABLE}" ]; then
-            # The stable line owns the unsuffixed tags: latest, nightly_<ts>,
-            # vllm-latest, sglang-latest.
             TAG_SUFFIX=""
             echo "Stable line (${FLAVOR}): publishing unsuffixed tags"
           else
-            ROCM_VER=$(docker run --rm --entrypoint="" "${CI_IMAGE}" \
-              bash -lc 'cat /opt/rocm/.info/version 2>/dev/null \
-                || python3 -c "import torch; print(torch.version.hip or \"\")"' \
-              | tr -d '[:space:]')
-            if [ -z "${ROCM_VER}" ]; then
-              echo "ERROR: could not read a ROCm version out of the image; refusing to publish an unlabelled tag"
-              exit 1
-            fi
             TAG_SUFFIX="-rocm$(echo "${ROCM_VER}" | cut -d. -f1,2)"
             echo "Line ${FLAVOR} carries ROCm ${ROCM_VER}; tag suffix ${TAG_SUFFIX}"
             # A line named for a ROCm version has to carry that version. If
@@ -329,6 +341,27 @@ jobs:
             esac
           fi
           echo "TAG_SUFFIX=${TAG_SUFFIX}" >> "${GITHUB_ENV}"
+
+          # Stamp the stack onto the image. A tag cannot carry this much and
+          # stay pullable, and the only label the image had was ubuntu's
+          # org.opencontainers.image.version=24.04, which names the base OS
+          # while reading like the image's own version. One more layer, which
+          # holds metadata and no files: the image bytes do not change.
+          echo "FROM ${CI_IMAGE}" | DOCKER_BUILDKIT=1 docker build -q \
+            --label "org.opencontainers.image.title=ATOM" \
+            --label "org.opencontainers.image.version=${ATOM_VER}" \
+            --label "org.opencontainers.image.revision=${ATOM_CHECKOUT_SHA:-}" \
+            --label "org.opencontainers.image.source=https://github.com/ROCm/ATOM" \
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --label "com.amd.atom.line=${FLAVOR}" \
+            --label "com.amd.rocm.version=${ROCM_VER}" \
+            --label "com.amd.torch.version=${TORCH_VER}" \
+            --label "com.amd.triton.version=${TRITON_VER}" \
+            --label "com.amd.aiter.version=${AITER_VER}" \
+            --label "com.amd.python.version=${PY_VER}" \
+            -t "${CI_IMAGE}" -
+          echo "Labels on ${CI_IMAGE}:"
+          docker image inspect "${CI_IMAGE}" --format '{{json .Config.Labels}}'
 
       - name: Test Docker image
         if: ${{ success() && steps.gates.outputs.main == 'true' && inputs.skip_tests != true }}
