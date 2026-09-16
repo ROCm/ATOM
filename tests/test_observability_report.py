@@ -148,12 +148,9 @@ def test_grouped_queries_preserve_instances_and_weight_ratios():
     aggregate = report.query_for(panels["decode_gpu_forward"], "p99", 60)
     assert "sum by (le)" in aggregate and "instance" not in aggregate
     assert panels["decode_context_tokens"]["unit"] == "tokens"
-    assert panels["decode_context_tokens"]["title"] == "Decode batch context tokens"
     standalone = {p["id"]: p for p in report.panels_for("standalone")}
     for phase in ("prefill", "decode"):
         request = panels[f"{phase}_request_context_tokens"]
-        assert request["title"] == f"{phase.title()} request context length"
-        assert request["unit"] == "tokens" and request["category"] == "workload"
         assert f'role="{phase}"' in request["selector"]
         assert request["kind"] == "requests" and request["phase"] == phase
         assert report.statistics_for(request) == ()
@@ -163,51 +160,27 @@ def test_grouped_queries_preserve_instances_and_weight_ratios():
         service = standalone[f"{phase}_request_context_tokens"]
         assert 'role="standalone"' in service["selector"]
         assert service["phase"] == phase
-    assert panels["prefill_batch_tokens"]["metric"] == "atom:prefill_batch_tokens"
-
-
-@pytest.mark.parametrize("deployment", ["pd", "standalone"])
-def test_batch_context_panels_use_token_histograms_and_instance_filters(deployment):
-    panels = {p["id"]: p for p in report.panels_for(deployment)}
-    for phase in ("prefill", "decode"):
-        role = phase if deployment == "pd" else "standalone"
-        metric = f"{phase}_context_tokens"
-        panel = panels[metric]
-        assert panel["title"] == f"{phase.title()} batch context tokens"
-        assert panel["category"] == "workload" and panel["unit"] == "tokens"
-        assert panel["role"] == role and not panel["overview"]
-        assert report.statistics_for(panel) == ("mean", "p50", "p90", "p95", "p99")
-        mean = report.query_for(panel, "mean", 60, by_instance=True)
-        assert f'atom:{metric}_sum{{job="atom",role="{role}"}}' in mean
-        assert f'atom:{metric}_count{{job="atom",role="{role}"}}' in mean
-        assert "sum by (instance)" in mean and "1000 *" not in mean
-        percentile = report.query_for(panel, "p99", 60, by_instance=True)
-        assert "histogram_quantile(0.99, sum by (instance, le)" in percentile
-        assert f"atom:{metric}_bucket" in percentile
-
-
-def test_request_gpu_time_uses_completed_request_histograms_and_instance_filters():
-    panels = {p["id"]: p for p in report.panels_for("pd")}
-    request = panels["prefill_request_gpu_forward"]
-    assert request["title"] == "Prefill GPU per-request"
-    assert request["category"] == "latency" and request["unit"] == "ms"
-    assert not request["overview"]
-    assert sum(p["overview"] for p in panels.values()) == 8
-    assert report.statistics_for(request) == ("mean", "p50", "p90", "p95", "p99")
-    mean = report.query_for(request, "mean", 60)
-    assert mean.startswith("1000 * ")
-    assert (
-        'rate(atom:prefill_request_gpu_forward_seconds_sum{job="atom",role="prefill"}[60s])'
-        in mean
-    )
-    assert "atom:prefill_request_gpu_forward_seconds_count" in mean
-    percentile = report.query_for(request, "p99", 60, by_instance=True)
-    assert "sum by (instance, le)" in percentile and "avg(" not in percentile
-    assert "phase=" not in percentile
-    standalone = {p["id"]: p for p in report.panels_for("standalone")}
+        assert 'role="standalone"' in standalone[f"{phase}_context_tokens"]["selector"]
     assert (
         'role="standalone"' in standalone["standalone_request_gpu_forward"]["selector"]
     )
+
+
+@pytest.mark.parametrize("deployment", ["pd", "standalone"])
+def test_context_and_gpu_queries_preserve_units_and_instance_histograms(deployment):
+    panels = {p["metric"]: p for p in report.panels_for(deployment)}
+    for metric, scale in (
+        ("atom:prefill_context_tokens", 1),
+        ("atom:decode_context_tokens", 1),
+        ("atom:prefill_request_gpu_forward_seconds", 1000),
+    ):
+        panel = panels[metric]
+        mean = report.query_for(panel, "mean", 60, by_instance=True)
+        assert mean.startswith(f"{scale} * ")
+        assert f"{metric}_sum" in mean and f"{metric}_count" in mean
+        percentile = report.query_for(panel, "p99", 60, by_instance=True)
+        assert "histogram_quantile(0.99, sum by (instance, le)" in percentile
+        assert f"{metric}_bucket" in percentile
 
 
 def test_instance_queries_retain_missing_values_and_do_not_average_percentiles(

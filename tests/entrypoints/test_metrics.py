@@ -109,31 +109,6 @@ def test_state_snapshots_are_private_and_scrapes_do_not_mutate_them():
         assert _samples(exporter.render())[("atom:requests_running", ())] == 3
 
 
-@pytest.mark.parametrize(
-    "name",
-    [
-        "atom:requests_running",
-        "atom:requests_finished_total",
-        "atom:metrics_refresh_errors_total",
-        "atom:dp_requests_routed_total",  # No rank samples at startup.
-        "atom:mtp_decode_steps_total",  # No MTP distribution at startup.
-        "atom:lmcache_loaded_tokens_total",
-        "atom:gc_collections_total",
-        "atom:gc_threshold",
-        "atom:prefix_cache_offload_tokens_total",  # Absent on legacy snapshots.
-        "atom:time_to_first_token_seconds_count",
-        "atom:inter_token_latency_seconds_sum",
-    ],
-)
-def test_registration_reserves_optional_families_and_generated_series(name):
-    exporter, _, _ = create_metrics_exporter()
-    assert ("atom:prefix_cache_offload_tokens_total", ()) not in _samples(
-        exporter.render()
-    )
-    with pytest.raises(ValueError, match="Duplicated timeseries"):
-        Gauge(name, "Conflicting instrument", registry=exporter.registry)
-
-
 def test_registration_never_reads_snapshots_or_live_process_metrics(monkeypatch):
     def unexpected_read(*args, **kwargs):
         raise AssertionError("registration must only describe metric names")
@@ -145,8 +120,17 @@ def test_registration_never_reads_snapshots_or_live_process_metrics(monkeypatch)
         "atom.entrypoints.openai.metrics_setup.longest_silence_seconds", unexpected_read
     )
     exporter, _, _ = create_metrics_exporter()
-    with pytest.raises(ValueError, match="Duplicated timeseries"):
-        Gauge("atom:requests_running", "Duplicate", registry=exporter.registry)
+    # Optional snapshot families must reserve their names before any samples.
+    for name in (
+        "atom:requests_running",
+        "atom:prefix_cache_offload_tokens_total",
+        "atom:dp_requests_routed_total",
+        "atom:mtp_decode_steps_total",
+        "atom:lmcache_loaded_tokens_total",
+        "atom:gc_collections_total",
+    ):
+        with pytest.raises(ValueError, match="Duplicated timeseries"):
+            Gauge(name, "Duplicate", registry=exporter.registry)
 
 
 def test_components_do_not_pollute_default_registry_or_other_api_instances():

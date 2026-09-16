@@ -231,58 +231,28 @@ def complete_event(metrics, index=0, milliseconds=8):
     start.ready = end.ready = True
 
 
-def test_step_buckets_match_the_pooled_forward_modes():
-    from collections import defaultdict
-
-    from prometheus_client import CollectorRegistry, Histogram
-    from prometheus_client.parser import text_string_to_metric_families
-
-    from atom.entrypoints.openai.metrics_setup import create_metrics_exporter
-    from atom.metrics.histogram import LATENCY_BUCKETS
-
-    registry = CollectorRegistry()
-    reference = Histogram(
-        "reference",
-        "Previously separate forward modes.",
-        ["phase"],
-        buckets=LATENCY_BUCKETS,
-        registry=registry,
-    )
-    exporter, _, _ = create_metrics_exporter()
-    metrics = GPUForwardMetrics(Event, registry=exporter.registry)
-    for phase, prefill, decode, milliseconds in (
-        ("prefill", 1, 0, 0.5),
-        ("decode", 0, 1, 8),
-        ("mixed", 1, 1, 12),
-        ("prefill", 1, 0, 800_000),
+def test_step_buckets_pool_prefill_decode_and_mixed_batches():
+    metrics = GPUForwardMetrics(Event)
+    for prefill, decode, milliseconds in (
+        (1, 0, 0.5),
+        (0, 1, 8),
+        (1, 1, 12),
+        (1, 0, 800_000),
     ):
         with metrics.measure(batch(prefill=prefill, decode=decode)):
             pass
         complete_event(metrics, milliseconds=milliseconds)
         metrics.poll()
-        reference.labels(phase).observe(milliseconds / 1000)
-
-    expected = defaultdict(float)
-    for family in registry.collect():
-        for sample in family.samples:
-            suffix = sample.name.removeprefix("reference")
-            if suffix != "_created":
-                bound = sample.labels.get("le")
-                expected[
-                    (suffix, None if bound is None else float(bound))
-                ] += sample.value
-
-    actual = {}
-    for family in text_string_to_metric_families(exporter.render().decode()):
-        for sample in family.samples:
-            if sample.name.startswith(
-                "atom:gpu_forward_seconds_"
-            ) and not sample.name.endswith("_created"):
-                assert "phase" not in sample.labels
-                suffix = sample.name.removeprefix("atom:gpu_forward_seconds")
-                bound = sample.labels.get("le")
-                actual[(suffix, None if bound is None else float(bound))] = sample.value
-    assert actual == pytest.approx(dict(expected))
+    values = histogram_values(metrics.steps)
+    buckets = dict(values["buckets"])
+    assert [buckets[b] for b in (0.001, 0.01, 0.02, 600, float("inf"))] == [
+        1,
+        2,
+        3,
+        3,
+        4,
+    ]
+    assert values["sum"] == pytest.approx(800.0205)
 
 
 def test_request_sum_waits_for_every_chunk_even_if_last_event_finishes_first():

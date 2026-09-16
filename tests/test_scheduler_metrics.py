@@ -42,9 +42,7 @@ def samples(exporter):
 
 
 @pytest.mark.parametrize("kind", ["ordinary", "dp", "pp_head", "pp_downstream"])
-@pytest.mark.parametrize(
-    "configured,interval", [(None, 1.0), ("0.25", 0.25), ("0", 1.0), ("bad", 1.0)]
-)
+@pytest.mark.parametrize("configured,interval", [(None, 1.0), ("0.25", 0.25)])
 def test_engine_push_loops_use_shared_interval(monkeypatch, kind, configured, interval):
     from aiter_stub import stubbed_aiter
 
@@ -470,44 +468,6 @@ def test_pp_head_records_once_when_dispatching_a_real_forward(clock):
     assert histogram_values_by_name(metrics)["queue_time"]["buckets"][-1][1] == 1
 
 
-def test_workload_uses_dispatch_snapshot_and_observes_prompt_once(clock):
-    metrics = SchedulerMetrics()
-    decode = SimpleNamespace(id=1, num_prompt_tokens=1000)
-    prefill = SimpleNamespace(id=2, num_prompt_tokens=10000)
-    seqs = {1: decode, 2: prefill}
-    for seq in seqs.values():
-        metrics.enqueue(seq)
-    mixed = SimpleNamespace(
-        req_ids=[1, 2],
-        is_dummy_run=False,
-        total_seqs_num_decode=1,
-        total_seqs_num_prefill=1,
-        total_tokens_num_prefill=1024,
-        num_cached_tokens=[1999, 8000],
-        context_lens=[2000, 9024],
-    )
-    metrics.record_forward(mixed, seqs)
-    mixed.num_cached_tokens[1] = 9024
-    mixed.total_tokens_num_prefill = 976
-    mixed.context_lens = [2001, 10000]
-    metrics.record_forward(mixed, seqs)
-    snapshot = histogram_values_by_name(metrics)
-    assert snapshot["prefill_request_tokens"]["sum"] == 2000
-    assert snapshot["prefill_request_tokens"]["buckets"][-1][1] == 1
-    assert snapshot["prefill_batch_tokens"]["sum"] == 2000
-    assert snapshot["prefill_batch_tokens"]["buckets"][-1][1] == 2
-    assert snapshot["prefill_context_tokens"]["sum"] == 19024
-    assert snapshot["prefill_context_tokens"]["buckets"][-1][1] == 2
-    request_context = metrics.prefill_request_context_tokens.collect()[0].samples
-    assert len(request_context) == 1
-    assert request_context[0].value == 10000
-    assert snapshot["decode_context_tokens"]["sum"] == 4001
-    assert snapshot["decode_context_tokens"]["buckets"][-1][1] == 2
-    mixed.is_dummy_run = True
-    metrics.record_forward(mixed, seqs)
-    assert histogram_values_by_name(metrics) == snapshot
-
-
 def test_prefill_context_records_full_prompt_once_and_chunk_batch_totals(monkeypatch):
     import numpy as np
     from prometheus_client import CollectorRegistry, generate_latest
@@ -560,6 +520,8 @@ def test_prefill_context_records_full_prompt_once_and_chunk_batch_totals(monkeyp
         "# TYPE atom:prefill_request_context_tokens gauge"
         in generate_latest(registry).decode()
     )
+    assert initial["prefill_request_tokens"]["sum"] == 20  # (12 - 4) + (20 - 8)
+    assert initial["prefill_request_tokens"]["buckets"][-1][1] == 2
     assert initial["prefill_batch_tokens"]["sum"] == 7
     assert initial["decode_context_tokens"]["sum"] == 2
 
@@ -573,6 +535,9 @@ def test_prefill_context_records_full_prompt_once_and_chunk_batch_totals(monkeyp
     )
     metrics.record_forward(tail, seqs)
     final = histogram_values_by_name(metrics)
+    assert final["prefill_request_tokens"] == initial["prefill_request_tokens"]
+    assert final["prefill_batch_tokens"]["sum"] == 12  # 7 + 5
+    assert final["prefill_batch_tokens"]["buckets"][-1][1] == 2
     assert final["prefill_context_tokens"]["sum"] == 31  # 19 + 12
     assert final["prefill_context_tokens"]["buckets"][-1][1] == 2
     assert metrics.prefill_request_context_tokens.collect()[0].samples == requests

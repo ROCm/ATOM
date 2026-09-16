@@ -6,6 +6,8 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 from urllib.request import urlopen
 
 import pytest
@@ -20,6 +22,27 @@ def _observe(rank):
     scheduler = SchedulerMetrics(rank, "prefill")
     for _ in range(5):
         scheduler.queue_time.observe(0.05 * (rank + 1))
+    with patch("atom.metrics.scheduler.time.perf_counter", return_value=0.0):
+        for phase in ("prefill", "decode"):
+            context_metrics = (
+                scheduler if phase == "prefill" else SchedulerMetrics(rank, phase)
+            )
+            seq = SimpleNamespace(
+                external_request_id=f"request-{rank}", num_prompt_tokens=1000 + rank
+            )
+            context_metrics.enqueue(seq)
+            batch = SimpleNamespace(
+                req_ids=[1],
+                is_dummy_run=False,
+                total_seqs_num_decode=int(phase == "decode"),
+                total_seqs_num_prefill=int(phase == "prefill"),
+                total_tokens_num_prefill=100,
+                num_cached_tokens=[100],
+                context_lens=[200 if phase == "prefill" else 1000 + rank],
+            )
+            context_metrics.record_forward(batch, {1: seq})
+            batch.context_lens = [400 if phase == "prefill" else 2000 + rank]
+            context_metrics.record_forward(batch, {1: seq})
     for pp_rank in (0, 1):
         gpu = GPUForwardMetrics(
             Event, dp_rank=rank, tp_rank=rank, pp_rank=pp_rank, engine_role="prefill"
@@ -55,6 +78,8 @@ def _run_node():
     def samples(text):
         result = {}
         for family in text_string_to_metric_families(text):
+            if family.name.endswith("_request_context_tokens"):
+                assert family.type == "gauge"
             for sample in family.samples:
                 if sample.name.startswith("atom:gc_"):
                     continue
@@ -72,13 +97,13 @@ def _run_node():
     assert first[("atom:inter_token_latency_seconds_count", ())] == 4
     for rank in (0, 1):
         labels = (("dp_rank", str(rank)), ("engine_role", "prefill"))
-        assert first[("atom:request_queue_time_seconds_count", labels)] == 5
+        assert first[("atom:request_queue_time_seconds_count", labels)] == 6
         assert first[("atom:request_queue_time_seconds_sum", labels)] == 0.25 * (
             rank + 1
         )
         assert (
             first[("atom:request_queue_time_seconds_bucket", labels + (("le", "0.1"),))]
-            == 5
+            == 6
         )
         for pp_rank in (0, 1):
             gpu_labels = (*labels, ("pp_rank", str(pp_rank)), ("tp_rank", str(rank)))
@@ -99,6 +124,30 @@ def _run_node():
             remote = samples(response.read().decode())
         assert "atom:metrics_snapshot_available" not in {name for name, _ in remote}
         assert remote == {key: first[key] for key in remote}
+        # Requests and workers are gone; repeated node scrapes retain their
+        # first-dispatch context, including distinct prefill/decode semantics.
+        for phase in ("prefill", "decode"):
+            name = f"atom:{phase}_request_context_tokens"
+            contexts = [
+                (dict(labels), value)
+                for (metric, labels), value in remote.items()
+                if metric == name
+            ]
+            assert len(contexts) == 2
+            assert {
+                (labels["dp_rank"], labels["request_id"], value)
+                for labels, value in contexts
+            } == {("0", "request-0", 1000), ("1", "request-1", 1001)}
+            assert all(
+                labels["engine_role"] == phase
+                and labels["sequence_id"] == "1"
+                and float(labels["started_at"]) > 0
+                for labels, _ in contexts
+            )
+        with urlopen(
+            f"http://127.0.0.1:{server.server_port}/metrics", timeout=5
+        ) as response:
+            assert samples(response.read().decode()) == remote
         assert (
             "atom:request_queue_time_seconds_count",
             (("dp_rank", "1"), ("engine_role", "prefill")),
@@ -135,89 +184,6 @@ def test_spawned_metrics_are_exported_without_snapshots_and_restart_cleanly():
         results.append(node)
     assert results[0]["directory"] != results[1]["directory"]
     assert results[0]["series"] == results[1]["series"]
-
-
-@pytest.mark.parametrize("phase", ["prefill", "decode"])
-def test_request_context_survives_workers_and_repeated_metrics_scrapes(
-    monkeypatch, tmp_path, phase
-):
-    from prometheus_client.parser import text_string_to_metric_families
-
-    from atom.metrics.prometheus import start_metrics_server
-
-    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
-    root = Path(__file__).resolve().parents[1]
-    env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join([str(root), env.get("PYTHONPATH", "")])
-    script = """
-import sys
-from types import SimpleNamespace
-from prometheus_client import values
-from atom.metrics.scheduler import SchedulerMetrics
-
-assert values.ValueClass._multiprocess
-rank = int(sys.argv[1])
-phase = sys.argv[2]
-metrics = SchedulerMetrics(rank, phase)
-seq = SimpleNamespace(external_request_id=f"request-{rank}", num_prompt_tokens=1000 + rank)
-metrics.enqueue(seq)
-seqs = {1: seq}
-batch = SimpleNamespace(
-    req_ids=[1], is_dummy_run=False, total_seqs_num_decode=int(phase == "decode"),
-    total_seqs_num_prefill=int(phase == "prefill"), total_tokens_num_prefill=100,
-    num_cached_tokens=[100], context_lens=[200 if phase == "prefill" else 1000 + rank],
-)
-metrics.record_forward(batch, seqs)
-batch.context_lens = [400 if phase == "prefill" else 2000 + rank]
-metrics.record_forward(batch, seqs)
-seqs.clear()
-del seq
-"""
-    for rank in (0, 1):
-        result = subprocess.run(
-            [sys.executable, "-c", script, str(rank), phase],
-            cwd=root,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-        assert result.returncode == 0, result.stdout + result.stderr
-
-    # Both requests and their workers have gone before the first HTTP scrape.
-    server, thread = start_metrics_server("127.0.0.1", 0)
-    try:
-        scrapes = []
-        for _ in range(2):
-            with urlopen(
-                f"http://127.0.0.1:{server.server_port}/metrics", timeout=5
-            ) as response:
-                families = list(
-                    text_string_to_metric_families(response.read().decode())
-                )
-            family = next(
-                f for f in families if f.name == f"atom:{phase}_request_context_tokens"
-            )
-            assert family.type == "gauge"
-            assert len(family.samples) == 2
-            assert all(s.name == family.name for s in family.samples)
-            assert {
-                (s.labels["dp_rank"], s.labels["request_id"], s.value)
-                for s in family.samples
-            } == {("0", "request-0", 1000), ("1", "request-1", 1001)}
-            assert all(
-                s.labels["engine_role"] == phase
-                and s.labels["sequence_id"] == "1"
-                and float(s.labels["started_at"]) > 0
-                for s in family.samples
-            )
-            scrapes.append(family.samples)
-        assert scrapes[0] == scrapes[1]
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(5)
 
 
 @pytest.mark.parametrize(

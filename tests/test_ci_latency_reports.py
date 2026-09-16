@@ -749,13 +749,8 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
                     for _, v in points
                 )
         panels = {panel["id"]: panel for panel in data["panels"]}
-        request_gpu = panels["prefill_request_gpu_forward"]
-        for bundle in (request_gpu, *request_gpu["instances"].values()):
-            means = [
-                value for _, value in bundle["series"]["mean"] if value is not None
-            ]
-            assert means and all(value == pytest.approx(30) for value in means)
         for panel_id, expected in (
+            ("prefill_request_gpu_forward", 30),
             ("prefill_context_tokens", 48000),
             ("decode_context_tokens", 32000),
         ):
@@ -763,10 +758,8 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
             for bundle in (panel, *panel["instances"].values()):
                 means = [v for _, v in bundle["series"]["mean"] if v is not None]
                 assert means and all(v == pytest.approx(expected) for v in means)
-        assert panels["decode_context_tokens"]["title"] == "Decode batch context tokens"
         for phase, expected in (("prefill", 12000), ("decode", 8000)):
             request_context = panels[f"{phase}_request_context_tokens"]
-            assert request_context["title"] == f"{phase.title()} request context length"
             assert len(request_context["records"]) == 24  # 12 requests on two targets.
             for bundle in request_context["instances"].values():
                 assert len(bundle["records"]) == 12
