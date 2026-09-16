@@ -1976,18 +1976,20 @@ class MooncakeConnector(KVConnectorBase):
         if (
             self._fp4_index_layout
             and self.pp_size == 1
-            and sorted(set(block_cmap)) != list(range(n_consumer))
+            and sorted(block_cmap) != list(range(n_consumer))
         ):
-            # Bounds only prove each producer region lands somewhere valid, not
-            # that every consumer region is written. An FP4 consumer with an
-            # extra trailing data/scale pair would pass the role and width
-            # checks on the common prefix and keep a stale PAGE. Under
+            # Bounds only prove each producer region lands somewhere valid,
+            # not that the map is a permutation. A consumer with an extra
+            # trailing data/scale pair keeps a stale PAGE, and a duplicated
+            # destination silently overwrites one region with another -- which
+            # the role check cannot catch, because semantic_role is optional
+            # and two None-role regions of equal width compare equal. Under
             # pp_size > 1 the map is legitimately partial and
             # _consumer_region_map's group check enforces total coverage.
             raise RuntimeError(
-                f"Region map leaves consumer regions unwritten for req {req_id}: "
-                f"{len(set(block_cmap))} of {n_consumer} regions are covered; "
-                "an FP4 layout must map one-to-one"
+                f"Region map is not one-to-one for req {req_id}: "
+                f"{sorted(block_cmap)} over {n_consumer} consumer regions; "
+                "an FP4 layout must map each region exactly once"
             )
         if self._fp4_index_layout and consumer_roles is None:
             # Both ends of a PD pair run the same source tree, so this is a
