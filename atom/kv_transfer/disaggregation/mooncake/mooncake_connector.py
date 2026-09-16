@@ -660,6 +660,7 @@ class MooncakeConnector(KVConnectorBase):
         self._has_slot_regions: bool = False
         # (base_addr, bytes_per_block) per region
         self._block_regions: list[tuple[int, int]] = []
+        self._block_region_roles: list[str] = []
         self._block_region_consumer_indices: list[int] | None = None
         # Sliding-window regions, keyed by the request's state slot (not by the
         # compressed block_table above). Kept whole rather than as
@@ -1128,6 +1129,7 @@ class MooncakeConnector(KVConnectorBase):
                             b for b, _ in self._block_regions
                         ],
                         "consumer_block_bpb": [bpb for _, bpb in self._block_regions],
+                        "consumer_block_roles": self._block_region_roles,
                         # SWA ring, keyed by state slot. The whole region
                         # travels, not just its base: a reverse-indexed one
                         # needs its extent to place slot 0.
@@ -1896,6 +1898,30 @@ class MooncakeConnector(KVConnectorBase):
             request_data.get("consumer_num_layers"),
             self._block_region_consumer_indices,
         )
+        # FP4 data and e8m0 scales are distinct PAGE regions. Validate before
+        # any RDMA write; older FP8 peers may omit roles, but FP4 peers must
+        # advertise the complete layout, including each layer's scale pool.
+        local_roles = getattr(self, "_block_region_roles", [])
+        remote_roles = request_data.get("consumer_block_roles", [])
+        if any(
+            role and role.startswith("dsv4.csa_indexer.fp4_")
+            for role in [*local_roles, *remote_roles]
+        ) and (
+            len(local_roles) != len(self._block_regions)
+            or len(local_roles) != len(remote_roles)
+            or len(remote_roles) != len(consumer_block_addrs)
+            or len(consumer_block_bpb) != len(consumer_block_addrs)
+            or any(
+                not 0 <= cidx < len(remote_roles)
+                or local_roles[i] != remote_roles[cidx]
+                or self._block_regions[i][1] != consumer_block_bpb[cidx]
+                for i, cidx in enumerate(block_cmap)
+            )
+        ):
+            raise RuntimeError(
+                "FP4 index PAGE layout mismatch: producer and consumer must "
+                "advertise matching data/scale roles and block byte widths"
+            )
         for region_idx, (src_base, bpb) in enumerate(self._block_regions):
             cidx = block_cmap[region_idx]
             dst_base = consumer_block_addrs[cidx]

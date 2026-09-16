@@ -25,8 +25,8 @@ Tips on server configuration:
 - **MoE backend**: V4-Pro routes 6 experts out of 384 with hash-based selection. The default fused MoE path with `AITER_BF16_FP8_MOE_BOUND=0` + `ATOM_MOE_GU_ITLV=1` handles the FP4 e2m1 microscaling weights correctly — measured GSM8K (1319 samples, 3-shot flexible-extract) = 0.9522 on MI355X/gfx950.
 - Use `--kv_cache_dtype fp8` for memory efficiency. On native single-node V4,
   the CSA indexer's compressed K cache defaults to FP4 except on gfx942, where
-  it remains FP8. Plugin and PD-disaggregated paths also retain FP8 until their
-  cache layouts support the separate FP4 scale pool. Use
+  it remains FP8. Plugin paths retain FP8. Native Mooncake PD supports explicit
+  FP4 index selection, including the separate e8m0 scale pool. Use
   `--index-cache-dtype fp8` to force the legacy path, or explicitly select
   `fp4` on a supported native path.
 - Set `AITER_LOG_LEVEL=WARNING` before starting to suppress aiter kernel log noise.
@@ -141,6 +141,23 @@ For V4-Flash-Base's HF `quantization_config = {"quant_method": "fp8", "fmt": "e4
 
 For PD-disaggregated serving (1P+1D, 2P+1D DPA, with/without MTP), see
 [recipes/mesh/DeepSeek-V4.md](mesh/DeepSeek-V4.md).
+
+On gfx950, native Mooncake PD can use FP4 index storage by setting both P and D:
+
+```bash
+--kv-cache-dtype fp8 --index-cache-dtype fp4
+```
+
+The main attention KV precision is independent of the index precision. Packed
+index data and its separate e8m0 scales travel as per-layer PAGE regions;
+SWA and compressor-state transfer is unchanged. This also works with a P-side
+`multi` connector combining Mooncake and LMCache offload.
+
+Both endpoints must run the FP4 PD support code and use matching index layouts.
+The producer checks the consumer's PAGE roles and block widths before writing,
+and rejects missing scales, reordered layers, or FP4/FP8 mismatches. Existing FP8
+peers may omit the new role metadata. Moriio FP4 index PD and V4 transfer with
+pipeline parallelism greater than one remain unsupported.
 
 ### EPLB (Expert Parallel Load Balancing)
 
