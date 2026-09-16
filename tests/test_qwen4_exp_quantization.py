@@ -6,6 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
+pytest.importorskip("triton")
+pytest.importorskip("aiter.ops.enum", exc_type=ImportError)
+
 from aiter import QuantType, dtypes
 
 from atom.config import QuantizationConfig

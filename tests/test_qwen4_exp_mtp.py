@@ -7,6 +7,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+pytest.importorskip("triton")
+pytest.importorskip("aiter.ops.enum", exc_type=ImportError)
+
 from atom.model_ops.qwen4_exp.ops.ple import advance_ngram_state, dilated_causal_conv1d
 from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_draft_decode_metadata,
