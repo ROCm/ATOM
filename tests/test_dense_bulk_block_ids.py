@@ -60,6 +60,10 @@ def staging(monkeypatch):
         uploads.append(tuple(values))
         return _tensor(values, dtype=dtype)
 
+    def upload_array(array):
+        uploads.append(tuple(int(value) for value in array))
+        return _tensor(array.tolist(), dtype=torch.int64)
+
     class Kernel:
         def __init__(self, direction):
             self.direction = direction
@@ -76,6 +80,7 @@ def staging(monkeypatch):
         int64=torch.int64,
         uint8=torch.uint8,
         tensor=upload,
+        from_numpy=upload_array,
     )
     module._pack_chunk_major_kernel = Kernel("pack")
     module._unpack_chunk_major_kernel = Kernel("unpack")
@@ -97,7 +102,10 @@ def test_dense_metadata_is_uploaded_once_and_sliced_per_pipeline_group(staging):
 
     assert prepared.group_count == 2
     assert prepared.upload_count == 1
-    assert staging.uploads == [
+    # Two tile tables (one per group geometry) then the single plan metadata.
+    # Each table is one upload carrying both columns: jobs then tiles-within-job.
+    assert staging.uploads[:2] == [(0, 1, 2, 3, 0, 0, 0, 0), (0, 1, 0, 0)]
+    assert staging.uploads[2:] == [
         (
             segments[0].data_ptr(),
             segments[1].data_ptr(),
@@ -125,9 +133,10 @@ def test_dense_metadata_is_uploaded_once_and_sliced_per_pipeline_group(staging):
     module.fused_pack_chunk_major_prepared(prepared, 0, device_buf)
     module.fused_unpack_chunk_major_prepared(prepared, 1, device_buf)
 
+    # One program per 1024-byte tile actually staged, not jobs x widest job.
     assert [call[:2] for call in staging.launches] == [
-        ("pack", (4, 1)),
-        ("unpack", (2, 1)),
+        ("pack", (4,)),
+        ("unpack", (2,)),
     ]
     pack_args = staging.launches[0][2]
     unpack_args = staging.launches[1][2]
@@ -137,6 +146,10 @@ def test_dense_metadata_is_uploaded_once_and_sliced_per_pipeline_group(staging):
     assert pack_args[7].tolist() == [2, 0, 1]
     assert unpack_args[4].tolist() == [1]
     assert unpack_args[7].tolist() == [1]
+    assert pack_args[8].tolist() == [0, 1, 2, 3]
+    assert pack_args[9].tolist() == [0, 0, 0, 0]
+    assert unpack_args[8].tolist() == [0, 1]
+    assert unpack_args[9].tolist() == [0, 0]
     for _direction, _grid, args, kwargs in staging.launches:
         for metadata_view in args[1:8]:
             assert (
@@ -146,7 +159,7 @@ def test_dense_metadata_is_uploaded_once_and_sliced_per_pipeline_group(staging):
         assert kwargs == {
             "NUM_SEGMENTS": 2,
             "BLOCK_BYTES": 1024,
-            "num_warps": 8,
+            "num_warps": 2,
         }
 
 
@@ -165,3 +178,38 @@ def test_dense_metadata_rejects_invalid_group_shapes_before_upload(
             torch.device("cuda:0"),
         )
     assert not staging.uploads
+
+
+def test_dense_tile_table_sizes_each_job_by_its_own_bytes(staging):
+    module = staging.module
+    # One chunk of four blocks over a wide segment (4 KiB) and a narrow one
+    # (16 B): the wide job wants four tiles, the narrow job one.  A rectangular
+    # grid would have launched both at four.
+    tile_job, tile_pos = module._tile_table((4,), (1024, 4), torch.device("cuda:0"))
+    assert tile_job.tolist() == [0, 0, 0, 0, 1]
+    assert tile_pos.tolist() == [0, 1, 2, 3, 0]
+    assert len(staging.uploads) == 1
+
+    # A repeat is served from the memo, so steady-state transfers upload nothing
+    # for the table.
+    again = module._tile_table((4,), (1024, 4), torch.device("cuda:0"))
+    assert again[0] is tile_job and again[1] is tile_pos
+    assert len(staging.uploads) == 1
+
+
+def test_dense_tile_table_skips_jobs_with_no_bytes(staging):
+    module = staging.module
+    # A zero-block chunk owns no bytes in any segment, so it gets no programs at
+    # all; the rectangular grid launched it and masked every lane off.
+    tile_job, tile_pos = module._tile_table(
+        [0, 3], [1024, 2048], torch.device("cuda:0")
+    )
+    assert tile_job.tolist() == [2, 2, 2, 3, 3, 3, 3, 3, 3]
+    assert tile_pos.tolist() == [0, 1, 2, 0, 1, 2, 3, 4, 5]
+
+
+def test_dense_tile_table_cache_is_bounded(staging):
+    module = staging.module
+    for extra in range(module._TILE_TABLE_CACHE_SIZE + 4):
+        module._tile_table((1,), (1024 * (extra + 1),), torch.device("cuda:0"))
+    assert len(module._TILE_TABLE_CACHE) == module._TILE_TABLE_CACHE_SIZE

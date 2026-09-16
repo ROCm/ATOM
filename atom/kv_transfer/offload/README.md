@@ -756,14 +756,28 @@ The dense fast path used by `DenseKVByteCodec`. Two JIT kernels (`_pack_chunk_ma
 `_unpack_chunk_major_kernel`) move every `(chunk, segment)` tile in **one launch**
 instead of thousands of per-block copies.
 
-- **Grid** — `(num_chunks × num_segments, ceil(max_tile_bytes / 1024))`: one
-  program per `(chunk, segment)` per 1 KiB tile.
+- **Grid** — flat, one program per 1 KiB tile actually staged. A job is one
+  `(chunk, segment)` pair and owns `count × segment_bytes` bytes, so jobs do not
+  all want the same number of tiles; `_tile_table` maps each program id to its
+  `(job, tile-within-job)`. The earlier rectangular
+  `(num_chunks × num_segments, ceil(max_tile_bytes / 1024))` grid gave every job
+  the *widest* job's tile count and masked the surplus off, which priced a launch
+  by `max(segment_block_bytes)` — on the geometry the worker logs (296 segments,
+  16384 B down to 512 B) that is 37,888 programs for 23,968 tiles of real work.
+- **`_tile_table`** — builds that map. It is a pure function of the block counts
+  and the segment sizes, both of which repeat across transfers, so tables are
+  memoised (`_TILE_TABLE_CACHE_SIZE` entries, LRU): building one costs ~9x the
+  kernel it feeds, a hit ~9% of it.
 - **Gather/scatter** — each program resolves `block_ids[block_offset + local_block]`
   to a physical block, then byte-copies through `uint8` pointers. Operating on raw
   bytes side-steps ROCm's fp8 indexed-copy kernels entirely.
 - **`_build_meta`** — precomputes segment base pointers, per-segment prefix bytes,
   and per-chunk block/byte offsets as device int64 tensors, so the kernel does
   pure address arithmetic. Also validates `device_buf` size and `block_ids` length.
+- **`_NUM_WARPS`** — two. A program moves `BLOCK_BYTES` of `uint8`, so the warp
+  count only chooses bytes per lane (8 at 1024 B on two warps); nothing here
+  reduces across lanes. Eight warps, the previous setting, spread the same tile
+  over 512 lanes and ran at 60% of the throughput.
 
 ### `_block_gpu_connector.py` — the LMCache `GPUConnectorInterface`
 

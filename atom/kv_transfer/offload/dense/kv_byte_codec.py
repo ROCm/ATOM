@@ -185,6 +185,17 @@ class DenseKVByteCodec:
                 )
 
     @property
+    def segment_block_bytes(self) -> list[int]:
+        """Per-block bytes of each segment, in staging order.
+
+        The pack grid is priced by this list -- it used to take its tile count
+        from the widest entry -- so the startup log reports its length and
+        extremes. Returned as a copy: callers read the geometry, they do not
+        get to reshape it.
+        """
+        return list(self._seg_block_bytes)
+
+    @property
     def device(self) -> torch.device:
         return self._device
 
