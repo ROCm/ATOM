@@ -239,12 +239,15 @@ jobs:
           DATE_STAMP=""
           if [ "${ADD_DATE_STAMP}" = "true" ]; then DATE_STAMP=$(date +%Y%m%d); fi
 
-          VERSIONS=$(ROCM_VER="${ROCM_VER}" DATE_STAMP="${DATE_STAMP}" python3 - <<'PYEOF'
-          import os, re, subprocess
+          # git describe runs in the shell, not in python: this step runs on
+          # the runner host, whose python is whatever the host image ships,
+          # and subprocess.run(capture_output=...) needs 3.7. The python below
+          # only normalises a string, so it works on any python3.
+          DESCRIBE=$(git describe --tags --long --dirty)
+          VERSIONS=$(ROCM_VER="${ROCM_VER}" DATE_STAMP="${DATE_STAMP}" DESCRIBE="${DESCRIBE}" python3 - <<'PYEOF'
+          import os, re
 
-          describe = subprocess.run(
-              ["git", "describe", "--tags", "--long", "--dirty"],
-              capture_output=True, text=True).stdout.strip()
+          describe = os.environ["DESCRIBE"].strip()
           dirty = describe.endswith("-dirty")
           if dirty:
               describe = describe[: -len("-dirty")]
