@@ -259,7 +259,12 @@ def test_streaming_ttft_includes_preprocessing_skips_role_and_records_once(
     assert _metrics(exporter) == samples
 
 
-def test_nonstream_first_token_is_request_local_and_precedes_response(monkeypatch):
+@pytest.mark.parametrize(
+    "streaming,spec_version", [(False, "2.4"), (True, "2.0"), (True, "2.4")]
+)
+def test_first_token_is_request_local_and_precedes_response(
+    monkeypatch, streaming, spec_version
+):
     clock = [0.0]
     monkeypatch.setattr(
         "atom.entrypoints.openai.request_timing.time.perf_counter", lambda: clock[0]
@@ -286,10 +291,26 @@ def test_nonstream_first_token_is_request_local_and_precedes_response(monkeypatc
             app, lambda value, streaming: observations.append((value, streaming))
         )
         scope = {"type": "http", "method": "POST", "path": "/v1/completions"}
-        first = asyncio.create_task(middleware({**scope, "index": 0}, None, send))
+
+        async def source(index):
+            ready[index].set()
+            await release[index].wait()
+            yield _sse({"choices": [{"text": "ok"}]})
+
+        async def serve(index):
+            if streaming:
+                await _serve_stream(
+                    source(index),
+                    lambda *args: observations.append(args),
+                    spec_version=spec_version,
+                )
+            else:
+                await middleware({**scope, "index": index}, None, send)
+
+        first = asyncio.create_task(serve(0))
         await ready[0].wait()
         clock[0] = 1.0
-        second = asyncio.create_task(middleware({**scope, "index": 1}, None, send))
+        second = asyncio.create_task(serve(1))
         await ready[1].wait()
         clock[0] = 10.0
         release[1].set()
@@ -300,7 +321,7 @@ def test_nonstream_first_token_is_request_local_and_precedes_response(monkeypatc
         record_nonstream_first_token()  # No request context survives either task.
 
     asyncio.run(run())
-    assert observations == [(9.0, False), (20.0, False)]
+    assert observations == [(9.0, streaming), (20.0, streaming)]
 
 
 @pytest.mark.parametrize(
@@ -318,11 +339,10 @@ def test_failed_or_unrelated_responses_produce_no_sample(kwargs):
     )
 
 
-def test_logging_and_ttft_share_parsing_and_keep_all_events(monkeypatch):
+@pytest.mark.parametrize("logging_enabled", [False, True])
+def test_logging_and_ttft_share_parsing(monkeypatch, logging_enabled):
     chunks = [_sse({"choices": [{"text": text}]}) for text in ("first", "later")]
-    chunks.append("data: [DONE]\n\n")
-    parsed = []
-    written = []
+    parsed, written = [], []
     original_loads = json.loads
 
     def loads(data):
@@ -334,71 +354,17 @@ def test_logging_and_ttft_share_parsing_and_keep_all_events(monkeypatch):
         def info(line):
             written.append(original_loads(line))
 
-    monkeypatch.setattr(api_server, "_request_logger", Recorder)
-    monkeypatch.setattr(api_server.json, "loads", loads)
-    assert len(_run_stream(chunks)) == 1
-    assert parsed == [chunk[6:-2] for chunk in chunks[:2]]
-    assert [event["type"] for event in written] == [
-        "stream_chunk",
-        "stream_chunk",
-        "stream_done",
-    ]
-
-
-def test_logging_disabled_stops_parsing_after_first_output(monkeypatch):
-    chunks = [_sse({"choices": [{"text": text}]}) for text in ("first", "later")]
-    parsed = []
-    original_loads = json.loads
-
-    def loads(data):
-        parsed.append(data)
-        return original_loads(data)
-
-    monkeypatch.setattr(api_server, "_request_logger", None)
-    monkeypatch.setattr(api_server.json, "loads", loads)
-    assert len(_run_stream(["".join(chunks), *chunks])) == 1
-    assert parsed == [chunks[0][6:-2]]
-
-
-@pytest.mark.parametrize("spec_version", ["2.0", "2.4"])
-def test_concurrent_streams_keep_their_own_start_time(monkeypatch, spec_version):
-    clock = [0.0]
     monkeypatch.setattr(
-        "atom.entrypoints.openai.request_timing.time.perf_counter", lambda: clock[0]
+        api_server, "_request_logger", Recorder if logging_enabled else None
     )
-    observations = []
-
-    async def run():
-        ready = [asyncio.Event(), asyncio.Event()]
-        release = [asyncio.Event(), asyncio.Event()]
-
-        async def source(index):
-            ready[index].set()
-            await release[index].wait()
-            yield _sse({"choices": [{"text": "ok"}]})
-
-        async def serve(index):
-            await _serve_stream(
-                source(index),
-                lambda *args: observations.append(args),
-                spec_version=spec_version,
-            )
-
-        first = asyncio.create_task(serve(0))
-        await ready[0].wait()
-        clock[0] = 1.0
-        second = asyncio.create_task(serve(1))
-        await ready[1].wait()
-        clock[0] = 10.0
-        release[1].set()
-        await second
-        clock[0] = 20.0
-        release[0].set()
-        await first
-        record_nonstream_first_token()
-
-    asyncio.run(run())
-    assert observations == [(9.0, True), (20.0, True)]
+    monkeypatch.setattr(api_server.json, "loads", loads)
+    # Exercise a coalesced send followed by another send after first output.
+    assert len(_run_stream(["".join(chunks), chunks[1], "data: [DONE]\n\n"])) == 1
+    expected = [chunks[0], chunks[1], chunks[1]] if logging_enabled else chunks[:1]
+    assert parsed == [chunk[6:-2] for chunk in expected]
+    assert [event["type"] for event in written] == (
+        ["stream_chunk"] * 3 + ["stream_done"] if logging_enabled else []
+    )
 
 
 def test_cancel_before_generated_output_does_not_record_ttft():

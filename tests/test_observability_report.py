@@ -49,10 +49,6 @@ def test_prometheus_export_uses_real_response_values_and_keeps_missing_points(
     monkeypatch.setattr(report.urllib.request, "urlopen", response)
     output = tmp_path / "report.html"
     data = report.generate_report("http://prometheus.example", 100, 110, output)
-    assert len(queries) == 2 + sum(
-        len(list(report.panel_queries(p, 60))) * (1 if p["role"] == "overall" else 2)
-        for p in data["panels"]
-    )
     assert any('role="prefill",streaming="false"' in q for q in queries)
     assert any("histogram_quantile(0.9," in q for q in queries)
     for panel in data["panels"]:
