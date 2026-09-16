@@ -3750,8 +3750,9 @@ class DecodeScheduler(Scheduler):
                     break
             self.waiting.popleft()
 
+            # Shared-cache prefill writes into this allocation; there is no
+            # KV transfer to time or retain a separate metrics reference for.
             self.prefill_waiting[seq.id] = seq
-            self.metrics.start_kv_wait(seq)
             newly_allocated.append(seq)
         return newly_allocated
 
@@ -3768,9 +3769,6 @@ class DecodeScheduler(Scheduler):
 
         seq = self.prefill_waiting.pop(seq_id, None)
         if seq is not None:
-            # Shared-cache prefill computes into the same allocation, so this
-            # completion does not represent a network transfer.
-            self.metrics.finish_kv_wait(seq_id, succeeded=False)
             seq.num_cached_tokens = num_tokens_computed
             seq.append_token(sampled_token_id)
             seq.first_token_time = time.time()

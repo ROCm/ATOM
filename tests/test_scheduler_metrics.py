@@ -1,5 +1,7 @@
 """Request lifecycle and snapshot tests for scheduler observability."""
 
+import gc
+import weakref
 from collections import deque
 from queue import Queue
 from types import SimpleNamespace
@@ -13,7 +15,7 @@ from prometheus_client.utils import floatToGoString
 from atom.entrypoints.openai.metrics_setup import create_metrics_exporter
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.model_engine.engine_utility import EngineUtilityHandler
-from atom.model_engine.scheduler import Scheduler
+from atom.model_engine.scheduler import DecodeScheduler, Scheduler
 from atom.model_engine.scheduler_metrics import SchedulerMetrics
 from atom.model_engine.sequence import Sequence, SequenceStatus
 
@@ -216,6 +218,44 @@ def test_scheduler_abort_releases_pending_metric_state(clock):
         == 0
     )
     assert scheduler.engine_stats.total_requests == 0
+
+
+def test_shared_cache_wait_metrics_do_not_retain_sequence():
+    scheduler = DecodeScheduler(MockConfig())
+    seq = Sequence([1, 2, 3, 4], block_size=4)
+    scheduler.add(seq)
+    assert scheduler.allocate_waiting() == [seq]
+    retained = weakref.ref(seq)
+
+    # Release the scheduler's allocation without PrefillDone. Metrics must
+    # not keep the sequence alive after its actual owner has released it.
+    scheduler.prefill_waiting.pop(seq.id)
+    scheduler.block_manager.deallocate(seq)
+    del seq
+    gc.collect()
+    assert retained() is None
+
+
+def test_shared_cache_wait_preserves_queue_metrics(clock):
+    scheduler = DecodeScheduler(MockConfig())
+    seq = Sequence([1, 2, 3, 4], block_size=4)
+    scheduler.add(seq)
+    clock[0] += 2
+    assert scheduler.allocate_waiting() == [seq]
+    handler = EngineUtilityHandler(
+        runner_mgr=None, output_queue=Queue(), label="Decode", scheduler=scheduler
+    )
+    assert handler.collect_metrics()["scheduler_metrics"]["waiting_kv"] == 1
+
+    clock[0] += 3
+    scheduler.on_prefill_done(seq.id, 4, 5)
+    scheduled, seqs = scheduler.schedule()
+    scheduler.metrics.record_forward(scheduled, seqs)
+    snap = histogram_values_by_name(scheduler.metrics)
+    assert snap["queue_time"]["sum"] == 5
+    assert snap["queue_time"]["buckets"][-1][1] == 1
+    assert snap["pd_kv_transfer"]["buckets"][-1][1] == 0
+    assert handler.collect_metrics()["scheduler_metrics"]["waiting_kv"] == 0
 
 
 def test_scheduler_success_closes_timer_at_completion_before_next_schedule(clock):
