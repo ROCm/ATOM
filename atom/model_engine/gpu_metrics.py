@@ -108,7 +108,8 @@ class GPUForwardMetrics:
                     len(requests),
                 )
                 for state in requests:
-                    self._discard_request(state.req_id)
+                    if self.requests.get(state.req_id) is state:
+                        self._discard_request(state.req_id)
                 self.free.append((start, end))
                 continue
             self.steps.observe(seconds)
