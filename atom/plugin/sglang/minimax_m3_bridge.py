@@ -41,6 +41,32 @@ def _m3_index_dim(config: Any) -> int:
     return int(index_dim)
 
 
+def minimax_m3_num_idx_heads(config: Any, tp_size: int) -> int:
+    """TP-local index heads -- the selector has one row per (index head, token).
+
+    M3 ties the index head count to the KV head count, so this is the KV heads
+    this rank holds. An sglang carrying the dp-attention split answers the
+    world size exactly, since attention's differs from the model's there;
+    without that module the caller's is the answer.
+
+    `tp_size` is the caller's rather than a literal 1, because a wrong count
+    here is not an error anywhere downstream: the row bounds come out the wrong
+    length, aiter's predicate declines them, and the Triton selector serves at
+    full correctness -- so nothing would ever report the fast path was lost.
+    """
+    heads = int(getattr(_text_config(config), "num_key_value_heads", 1))
+    try:
+        from sglang.srt.layers.dp_attention import get_attention_tp_size
+    except ImportError:  # an sglang without the dp-attention split
+        pass
+    else:
+        # Only the import is guarded. This runs inside a forward, where the
+        # attention group is up -- unlike `_local_kv_heads`, which answers the
+        # same question while the memory pools are still being sized.
+        tp_size = get_attention_tp_size()
+    return max(1, heads // max(1, int(tp_size)))
+
+
 def _dtype_size(dtype: torch.dtype) -> int:
     return torch.empty((), dtype=dtype).element_size()
 
@@ -488,6 +514,7 @@ def build_atom_minimax_m3_attention_metadata_from_sglang(
     token_to_kv_pool,
     req_to_token_pool,
     max_model_len: int,
+    num_idx_heads: int,
 ):
     from atom.utils.forward_context import AttentionMetaData
 
@@ -534,6 +561,7 @@ def build_atom_minimax_m3_attention_metadata_from_sglang(
             slot_mapping=slot_mapping,
             max_seq_len=max_seq_len,
             max_query_len=tokens_per_req,
+            num_idx_heads=num_idx_heads,
         )
         cu_q = torch.arange(
             0,
@@ -583,6 +611,7 @@ def build_atom_minimax_m3_attention_metadata_from_sglang(
             max_seq_len=max_seq_len,
             num_prefills=bs,
             num_prefill_tokens=total_tokens,
+            num_idx_heads=num_idx_heads,
         )
         sparse_md.prefill.qo_indptr = torch.arange(
             total_tokens + 1,
@@ -634,6 +663,7 @@ def build_atom_minimax_m3_attention_metadata_from_sglang(
         slot_mapping=slot_mapping,
         max_seq_len=max_seq_len,
         max_query_len=tokens_per_req,
+        num_idx_heads=num_idx_heads,
     )
     cu_q = torch.arange(
         0,
@@ -735,10 +765,8 @@ def bind_minimax_m3_sparse_cache_views(model, token_to_kv_pool) -> bool:
             )
             if impl.index_topk_cache_state is None:
                 impl.index_topk_cache_state = {}
-                setattr(
-                    token_to_kv_pool,
-                    "_atom_minimax_m3_topk_cache_state",
-                    impl.index_topk_cache_state,
+                token_to_kv_pool._atom_minimax_m3_topk_cache_state = (
+                    impl.index_topk_cache_state
                 )
         kv_cache_data[f"layer_{layer_id}"] = KVCacheTensor(
             layer_num=layer_id,

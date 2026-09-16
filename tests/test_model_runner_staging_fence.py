@@ -117,6 +117,20 @@ def test_prefill_ready_events_are_recorded_after_model_submission():
     assert "record_kv_cache_ready" in helper_source
 
 
+def test_cudagraph_capture_runs_in_inference_mode():
+    """Capture must match the inference mode used by warmup and serving.
+
+    Some backends lazily allocate persistent output buffers during an earlier
+    inference-mode warmup.  Capturing outside that mode makes a later in-place
+    update of those inference tensors fail, for example in a padded MoE bucket.
+    """
+    method = _method("capture_cudagraph")
+
+    assert "torch.inference_mode()" in {
+        ast.unparse(decorator) for decorator in method.decorator_list
+    }
+
+
 def test_late_draft_uploads_are_staged_by_prepare_model():
     """Draft setup must not start a new pinned H2D after the staging event."""
     prepare_model = _method("prepare_model")

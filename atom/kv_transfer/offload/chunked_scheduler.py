@@ -631,6 +631,48 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._release_operation_lease(req_id)
         self._finish_retired_request(sid)
 
+    def save_finished_by_request(self, req_id) -> None:
+        """Complete a save when only the plain request id is available.
+
+        `save_finished` refuses a raw id once the lifecycle has an exact
+        `SaveOperationId`, so a delayed report cannot complete a newer
+        lifecycle. A vLLM-plugin scheduler cannot satisfy that: vLLM's
+        `KVConnectorOutput` carries request ids as plain strings, so the exact
+        identity never survives the trip back from the worker.
+
+        Resolving the parked identity here keeps the guard meaningful instead of
+        weakening `save_finished` -- and without it the entry never clears, so
+        `_save_inflight` grows for the life of the process and
+        `has_pending_work()` never goes quiet.
+        """
+        sid = str(req_id)
+        active = self._save_inflight.get(sid)
+        self.save_finished(active if active is not None else sid)
+
+    def load_finished_by_request(self, req_id) -> bool:
+        """`load_finished` for a caller that has only the plain request id.
+
+        Same reason as `save_finished_by_request`.
+        """
+        sid = str(req_id)
+        entry = self._active_load_operations.get(sid)
+        return self.load_finished(entry[1] if entry is not None else sid)
+
+    def load_failed_by_request(self, req_id) -> bool:
+        """`load_failed` for a caller that has only the plain request id.
+
+        Same reason as `save_finished_by_request`: vLLM's `KVConnectorOutput`
+        carries request ids as plain strings, so the exact `LoadOperationId`
+        never survives the trip back from the worker half. Routing a failure
+        through `load_finished` instead would pop `_load_save_floors`, which is
+        the record that the `[HBM, LMCache)` range is NOT persisted -- the
+        recomputed chunks would then never be saved.
+        """
+
+        sid = str(req_id)
+        entry = self._active_load_operations.get(sid)
+        return self.load_failed(entry[1] if entry is not None else sid)
+
     def connector_completion(self, completion: ConnectorCompletion) -> bool | None:
         """Apply TP/PP-quorumed source-safe and store-terminal reports."""
 

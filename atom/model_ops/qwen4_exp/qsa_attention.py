@@ -319,6 +319,8 @@ class Qwen4ExpAttention(nn.Module):
             qsa.compressed_slot_mapping,
             self.indexer.compress_ratio,
             position_cache=self.rope_position_cache,
+            # Draft RoPE is one ahead of its logical cache slots.
+            rope_position_offset=int(get_forward_context().context.is_draft),
         )
         normalized = self.indexer.normalize_compressed_keys(pooled, first_positions)
         qsa_store_rows(
@@ -354,12 +356,14 @@ class Qwen4ExpAttention(nn.Module):
             k.view(num_tokens, self.num_kv_heads, self.head_dim),
         )
         value = v.view(num_tokens, self.num_kv_heads, self.head_dim)
-        qsa = get_forward_context().attn_metadata.qsa_metadata
+        forward_context = get_forward_context()
+        qsa = forward_context.attn_metadata.qsa_metadata
         if qsa is None:
             attn_out = self._profile_attention(
                 query, key, value, hidden_states, positions
             )
         else:
+            qsa = qsa.for_tokens(num_tokens)
             aiter.reshape_and_cache_flash(
                 key,
                 value,
@@ -379,6 +383,11 @@ class Qwen4ExpAttention(nn.Module):
                 qsa.block_tables,
                 qsa.token_to_req,
                 softmax_scale=self.scaling,
+                num_decode_requests=(
+                    None
+                    if forward_context.context.is_prefill
+                    else qsa.block_tables.shape[0]
+                ),
             )
 
         gated = sigmoid_mul(attn_out.reshape(num_tokens, -1), gate)

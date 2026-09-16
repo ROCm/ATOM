@@ -342,13 +342,20 @@ def _strip_runtime_graph_markers(lines: list[str]) -> bool:
     """
     Remove runtime overhead of graph markers in generated wrapper code.
 
-    - Replace `x = torch.ops.aiter.graph_marker.default(y, '...')` with `x = y`
+    - Remove standalone, void graph marker calls.
+    - Replace legacy `x = torch.ops.aiter.graph_marker.default(y, '...')` with `x = y`
     - Drop assert_size_stride / assert_alignment lines that specifically refer to
       `torch.ops.aiter.graph_marker.default` (they become redundant).
     """
     out: list[str] = []
     changed = False
     for line in lines:
+        if _parse_graph_marker_call_expr(line.strip()) is not None:
+            # Preserve a valid suite even when a marker is its only statement.
+            indent = line[: len(line) - len(line.lstrip())]
+            out.append(f"{indent}pass  # graph marker\n")
+            changed = True
+            continue
         parsed = _parse_graph_marker_assignment_line(line)
         if parsed is not None:
             out.append(f"{parsed.indent}{parsed.lhs} = {parsed.arg}\n")
