@@ -34,8 +34,11 @@ def test_production_geometry_has_only_four_global_owners():
     # both ratios rather than one per ratio.
     assert geo.compress_owners == (2, 8, 14, 20)
     assert geo.compress_ring_slots == 2
-    assert len(geo.page_fields) == 8
-    assert geo.page_bytes == 16 * (3 / 2 + 1) * (512 + 128) * 2
+    # One field per owner: the index rows are a region of their own, bought
+    # with the page and addressed by the same block id.
+    assert len(geo.page_fields) == 4
+    assert geo.page_bytes == 16 * (3 / 2 + 1) * 512 * 2
+    assert geo.paged_bytes == 16 * (3 / 2 + 1) * (512 + 128) * 2
     assert sum(f.bytes_per_entry for f in geo.state_fields) <= geo.state_bytes
     assert geo.state_fields[0].layers == 40
     assert all(field.in_checkpoint for field in geo.state_fields)
@@ -89,6 +92,11 @@ def runtime_config(**overrides):
         {"eplb_enable": True},
         {"kv_cache_dtype": "fp8"},
         {"index_cache_dtype": "fp4"},
+        # The paged scorer that an FP8 plane implies has one tie policy.
+        {
+            "index_cache_dtype": "fp8",
+            "hf_config": SimpleNamespace(index_topk_tie_break="large_position"),
+        },
         {"kv_cache_block_size": 3},
         {"enable_expert_parallel": False},
     ],

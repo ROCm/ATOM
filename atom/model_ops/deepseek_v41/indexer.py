@@ -57,11 +57,23 @@ def _merge_topk(best_scores, best_ids, scores, ids, k):
     return values, ids.expand_as(scores).gather(-1, selected)
 
 
-def _ordered_indices(scores, indices):
-    valid = torch.isfinite(scores)
+def ascending_with_padding(indices, valid=None):
+    """Sort each row's ids ascending and leave `-1` for the ones it has not.
+
+    The order matters downstream: the sparse attention kernel sums a row's
+    prefix in the order it is handed, so two selections that agree as sets but
+    not as sequences round differently. `valid` defaults to the ids' own
+    sentinel, which is what a kernel that writes `-1` for a short row gives.
+    """
+    if valid is None:
+        valid = indices >= 0
     sentinel = torch.iinfo(torch.int64).max
     ordered = indices.long().masked_fill(~valid, sentinel).sort(dim=-1).values
     return torch.where(ordered == sentinel, -1, ordered).int()
+
+
+def _ordered_indices(scores, indices):
+    return ascending_with_padding(indices, torch.isfinite(scores))
 
 
 class TensorIndexKeys:

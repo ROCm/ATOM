@@ -16,6 +16,9 @@ from torch.distributed import ProcessGroup, ReduceOp
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
 # plugin-related utilities
+from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+    MQA_LOGITS_PRESHUFFLE_ROWS,
+)
 from atom.plugin import is_plugin_mode, is_vllm
 from atom.plugin.config import PluginConfig
 from atom.quant_spec import (
@@ -616,27 +619,17 @@ class QuantizationConfig:
             self.apply_exclude_name_mapping(quant_exclude_name_mapping)
 
 
-# Rows per block that `deepgemm_fp8_paged_mqa_logits` requires to stay in its
-# preshuffled layout, which is the only layout it computes correctly -- with
-# `Preshuffle=False` it disagrees with the flat `fp8_mqa_logits` kernel by ~100%
-# at every block size, and aiter's assert guards only the preshuffle side. Any
-# cache that kernel pages over must therefore hold a multiple of this many rows
-# per block. Sizing constants belong to whoever enforces them, and the block
-# size is set here.
-_MQA_LOGITS_PRESHUFFLE_ROWS = 16
-
-
 def glm5_kpool_block_size(index_kpool: int) -> int:
     """Tokens per KV block that lets GLM-5.3's pooled index cache be exact.
 
     A block of B tokens needs ``B // index_kpool`` index rows, and that count
-    must be a multiple of `_MQA_LOGITS_PRESHUFFLE_ROWS`. The smallest B that
+    must be a multiple of `MQA_LOGITS_PRESHUFFLE_ROWS`. The smallest B that
     satisfies it is the product, and the smallest is what we want: a larger
     block only adds paging waste, while a smaller one forces the cache to be
     padded back up to one row per token -- which is the whole cost being
     removed here.
     """
-    return index_kpool * _MQA_LOGITS_PRESHUFFLE_ROWS
+    return index_kpool * MQA_LOGITS_PRESHUFFLE_ROWS
 
 
 _CONFIG_REGISTRY: dict[str, str] = {
@@ -2172,6 +2165,17 @@ class Config:
             self.index_cache_dtype = self.kv_cache_dtype
 
         if self.hf_config.model_type == "deepseek_v41_text":
+            # CSA2's index plane is paged by the same scorer GLM's is, so a
+            # PAGE again has to hold a whole number of `MQA_LOGITS_PRESHUFFLE_ROWS`
+            # tiles -- and its ratio-2 owners halve the PAGE before that count
+            # is taken, which makes the floor twice the tile. 256 rather than
+            # that floor, and for the reason DeepSeek-V4 takes it: the block
+            # table is `[max_num_seqs, max_model_len / block_size]` int32 held
+            # twice and copied to the device every forward, 8 MB here against
+            # 134 MB at the 16 this field defaults to. What it costs is prefix
+            # reuse shorter than a PAGE, which stops matching at all.
+            self.kv_cache_block_size = 256
+
             from atom.models.deepseek_v41.config import validate_runtime_config
 
             validate_runtime_config(self)

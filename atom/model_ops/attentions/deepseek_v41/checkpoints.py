@@ -15,14 +15,22 @@ class StateCopies:
     def __init__(self, cache, spec, max_batch):
         self.cache, self.spec = cache, spec
         if (spec.page_unit_bytes, spec.slot_bytes, spec.image_bytes) != (
-            cache.geometry.page_bytes,
+            cache.geometry.paged_bytes,
             cache.geometry.state_bytes,
             cache.geometry.state_bytes,
         ):
             raise ValueError("Checkpoint geometry differs from the allocated cache")
+        # A PAGE unit is several regions, not one run: its main page and its
+        # rows in each index plane. The destination stream repeats them per
+        # unit, which is what `write_descriptor` wants one address per.
+        self.regions = cache.unit_regions()
         self.plan = plan_segmented_copy(
             [spec.slot_bytes],
-            [spec.page_unit_bytes] * spec.units_per_checkpoint,
+            [
+                size
+                for _ in range(spec.units_per_checkpoint)
+                for _, size in self.regions
+            ],
             spec.image_bytes,
         )
         self.staging = CpuGpuBuffer(
@@ -75,11 +83,17 @@ class StateCopies:
             for ops, storing in ((stores, True), (restores, False)):
                 for op in ops:
                     slot = self.entry(op.src_slot if storing else op.dst_slot)
-                    for i, unit in enumerate(op.unit_ids):
-                        start = i * self.spec.page_unit_bytes
-                        state = slot[start : start + self.spec.page_unit_bytes]
-                        page = self.cache.page_bytes[unit, : state.numel()]
-                        (page if storing else state).copy_(state if storing else page)
+                    at = 0
+                    for unit in op.unit_ids:
+                        for view in self.cache.unit_views(unit):
+                            take = min(view.numel(), slot.numel() - at)
+                            if take <= 0:
+                                break
+                            state, page = slot[at : at + take], view[:take]
+                            (page if storing else state).copy_(
+                                state if storing else page
+                            )
+                            at += take
             return
         total = (len(stores) + len(restores)) * self.plan.num_spans
         if total > self.staging.np.shape[0]:
@@ -100,7 +114,11 @@ class StateCopies:
             )
             page_bases = np.asarray(
                 [
-                    [self.cache.page_bytes[unit].data_ptr() for unit in op.unit_ids]
+                    [
+                        base + unit * size
+                        for unit in op.unit_ids
+                        for base, size in self.regions
+                    ]
                     for op in ops
                 ],
                 dtype=np.int64,
@@ -121,15 +139,14 @@ class StateCopies:
         if not self.cache.pool.is_cuda:
             return
         slot = self.entry(0)
-        dst = np.asarray(
-            [
-                [
-                    slot.data_ptr() + i * self.spec.page_unit_bytes
-                    for i in range(self.spec.units_per_checkpoint)
-                ]
-            ],
-            dtype=np.int64,
-        )
+        # Into the slot itself, one address per destination segment. Segments
+        # past the image get an address the plan never emits a span for.
+        offsets, at = [], 0
+        for _ in range(self.spec.units_per_checkpoint):
+            for _, size in self.regions:
+                offsets.append(at)
+                at += size
+        dst = np.asarray([[slot.data_ptr() + off for off in offsets]], dtype=np.int64)
         self.plan.write_descriptor(
             self.staging.np[: self.plan.num_spans],
             np.asarray([[slot.data_ptr()]], dtype=np.int64),

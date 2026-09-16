@@ -40,6 +40,11 @@ class BatchStep:
     block_tables: torch.Tensor
     request_steps: tuple[AttentionStep, ...]
     selected: dict[int, torch.Tensor] = field(default_factory=dict)
+    # Layer -> its candidate blocks for the whole batch, and ratio -> the tile
+    # table its owners page over. Both are one answer per forward that several
+    # layers read, which is the only reason they are memoized on the step.
+    candidates: dict[int, torch.Tensor] = field(default_factory=dict)
+    tiles: dict[int, torch.Tensor] = field(default_factory=dict)
     # ratio -> CompressPlan. One per distinct compression ratio in the model,
     # built once per forward and read by every owner that shares that ratio.
     plans: dict[int, object] = field(default_factory=dict)

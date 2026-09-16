@@ -36,12 +36,15 @@ def test_checkpoint_fork_rollback_relocation_and_slot_reuse(
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("ROCm GPU required")
     geo = replace(geometry(small_config, block=2), packed=packed)
-    cache = PagedAttentionCache(geo, 40, 4, device)
-    assert cache.backing.numel() == 40 * geo.page_bytes + 4 * geo.state_bytes
     spec = PagedStateCheckpointSpec(
-        geo.page_bytes, geo.state_bytes, geo.layout_id, geo.state_bytes
+        geo.paged_bytes, geo.state_bytes, geo.layout_id, geo.state_bytes
     )
     assert spec.units_per_checkpoint > 1
+    # Enough PAGEs for the interleaved unit ids below, which is what makes the
+    # image land in units that are not consecutive.
+    pages = max(40, 2 * spec.units_per_checkpoint)
+    cache = PagedAttentionCache(geo, pages, 4, device)
+    assert cache.backing.numel() == geo.paged_extents(pages)[1] + 4 * geo.state_bytes
     copies = StateCopies(cache, spec, 4)
     copies.warmup()
     # Fill ALL bytes, including padding and FP32 compressor tails. The cursor

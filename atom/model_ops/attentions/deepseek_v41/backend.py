@@ -82,6 +82,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             self.config.index_head_dim,
             self.config.engram_max_ngram_size - 1,
             packed=model_runner.config.kv_cache_dtype == "fp4",
+            index_dtype=model_runner.config.index_cache_dtype,
             speculative_tokens=num_drafts,
         )
         model_runner.forward_vars.update(
@@ -149,7 +150,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
 
     def sub_pool_specs(self):
         return [
-            page_pool(self.geometry.page_bytes),
+            page_pool(self.geometry.paged_bytes),
             state_pool(STATE_SLOT_CLASS, self.geometry.state_bytes, entries_per_req=1),
         ]
 

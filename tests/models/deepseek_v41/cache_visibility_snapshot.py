@@ -137,7 +137,11 @@ class CacheVisibilitySnapshot:
         count = position // ratio
         if count <= 0:
             return torch.empty(0)
-        pages = cache.pages.view(f"{kind}_{owner}")[0]
+        pages = (
+            cache.index_planes[owner]
+            if kind == "index"
+            else cache.pages.view(f"main_{owner}")[0]
+        )
         per_page = pages.shape[1]
         ids = torch.arange(count, device=pages.device)
         return pages[blocks[ids // per_page].long(), ids % per_page]

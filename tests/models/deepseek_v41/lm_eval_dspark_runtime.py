@@ -16,7 +16,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 import torch
-from atom.models.deepseek_v41.config import validate_runtime_config
 from lm_eval import simple_evaluate
 from lm_eval.api.model import LM
 from transformers import AutoTokenizer
@@ -37,6 +36,7 @@ from atom.entrypoints.openai.chat_encoders import (
 from atom.model_engine.model_runner import ModelRunner
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence
+from atom.models.deepseek_v41.config import validate_runtime_config
 from atom.sampling_params import SamplingParams
 from atom.utils.forward_context import get_forward_context
 
@@ -374,6 +374,11 @@ def main():
     )
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--fewshot", type=int, default=0)
+    parser.add_argument(
+        "--index-dtype",
+        choices=("bf16", "fp8", "fp4"),
+        help="Index plane format; defaults to the BF16 this driver pins",
+    )
     parser.add_argument("--max-output-tokens", type=int, default=256)
     args = parser.parse_args()
     if args.audit_state and (args.serial_verify_ops or args.tasks != ["gsm8k"]):
@@ -434,12 +439,15 @@ def main():
             ),
             torch_profiler_dir=profile_root,
             kv_cache_dtype="bf16",
-            index_cache_dtype="bf16",
+            index_cache_dtype=args.index_dtype or "bf16",
             max_num_batched_tokens=512,
             max_model_len=4096,
             max_num_seqs=4,
             long_prefill_token_threshold=128,
-            state_checkpoint_interval_tokens=128,
+            # A multiple of every PAGE size CSA2 runs: the scheduler snaps an
+            # interval that is not one to off, which would leave two arms of a
+            # comparison with different checkpointing and nothing saying so.
+            state_checkpoint_interval_tokens=256,
             enable_log_stats=False,
             port=port,
         )

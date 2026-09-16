@@ -2,9 +2,9 @@
 """Replay each verify row from a pre-forward STATE/PAGE snapshot."""
 
 import torch
-
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
+
 from atom.utils.forward_context import get_forward_context
 
 
@@ -270,13 +270,20 @@ def compare_visible_cache(cache, shadow, span, length, target_layers):
     for owner, ratio in geometry.owners:
         ids = torch.arange(end // ratio, device=device)
         blocks = torch.tensor(span.block_ids, device=device)
-        for kind in ("main", "index"):
+        planes = (
+            (
+                "main",
+                cache.pages.view(f"main_{owner}")[0],
+                shadow.pages.view(f"main_{owner}")[0],
+            ),
+            ("index", cache.index_planes[owner], shadow.index_planes[owner]),
+        )
+        for kind, pages, shadow_pages in planes:
             name = f"{kind}_{owner}"
-            pages = cache.pages.view(name)[0]
             rows_per_page = pages.shape[1]
             page_ids, offsets = blocks[ids // rows_per_page], ids % rows_per_page
             actual = pages[page_ids, offsets]
-            expected = shadow.pages.view(name)[0, page_ids, offsets]
+            expected = shadow_pages[page_ids, offsets]
             counts = (actual != expected).sum(-1)
             if counts.any():
                 global_rows.append(

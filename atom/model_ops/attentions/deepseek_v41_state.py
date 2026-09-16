@@ -35,6 +35,12 @@ class AttentionStep:
 
 class EagerAttentionCache:
     packed = False
+    # Whatever grid its rows were rounded to, the tiled scorer is the only one
+    # that can read them: a paged scorer pages, and this cache has no pages.
+    index_dtype = "bf16"
+
+    def scores_paged(self, step):
+        return False
 
     """Fixed-batch storage with private SWA rings and one global region per owner.
 

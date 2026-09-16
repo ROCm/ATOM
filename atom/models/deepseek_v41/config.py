@@ -30,6 +30,20 @@ class LayerAttentionSpec:
     topk_owner: int | None = None
     candidate_owner: int | None = None
 
+    @property
+    def produces_candidates(self):
+        return self.candidate_owner == self.layer_id
+
+    @property
+    def candidate_source(self):
+        """The layer whose blocks bound this one, or None if none do.
+
+        None covers a layer with no candidate owner and the owner itself, so
+        it answers consumption only -- production is the property above, and
+        conflating the two has the first kind emitting blocks nobody asked for.
+        """
+        return None if self.produces_candidates else self.candidate_owner
+
 
 @dataclass(frozen=True)
 class NativeQuantization:
@@ -277,8 +291,11 @@ def validate_speculative_config(config):
             raise ValueError("DeepSeek-V4.1 DSpark must use the target checkpoint")
     if config.tensor_parallel_size != 4:
         raise ValueError("DeepSeek-V4.1 DSpark is validated on TP4")
-    if (config.kv_cache_dtype, config.index_cache_dtype) != ("bf16", "bf16"):
-        raise ValueError("DeepSeek-V4.1 DSpark requires BF16 KV and index caches")
+    if config.kv_cache_dtype != "bf16" or config.index_cache_dtype not in (
+        "bf16",
+        "fp8",
+    ):
+        raise ValueError("DeepSeek-V4.1 DSpark requires a BF16 KV cache")
     from atom.utils import envs
 
     if envs.ATOM_ENABLE_RELAXED_MTP:
@@ -322,9 +339,11 @@ def validate_runtime_config(config):
         ("online quantization", config.online_quant_config is not None),
         ("EPLB", config.eplb_enable),
         (
-            "KV/index cache layout (use bf16/bf16 or fp4/fp4)",
+            # bf16/fp8 is DeepSeek-V4's own pair: an FP8 index plane is the one
+            # a paged scorer reads, and the main pool is independent of it.
+            "KV/index cache layout (use bf16/bf16, bf16/fp8 or fp4/fp4)",
             (config.kv_cache_dtype, config.index_cache_dtype)
-            not in (("bf16", "bf16"), ("fp4", "fp4")),
+            not in (("bf16", "bf16"), ("bf16", "fp8"), ("fp4", "fp4")),
         ),
     ):
         if enabled:
@@ -332,6 +351,18 @@ def validate_runtime_config(config):
     if unsupported:
         raise ValueError(
             "DeepSeek-V4.1 runtime does not support " + ", ".join(unsupported)
+        )
+    # The paged scorer's top-k breaks ties by the smaller row and has no other
+    # mode, so this pair would score every decode step under a policy it does
+    # not implement -- and would only show up where scores tie exactly, which
+    # ReLU makes common rather than rare.
+    if (
+        config.index_cache_dtype == "fp8"
+        and config.hf_config.index_topk_tie_break == IndexTieBreak.LARGE_POSITION
+    ):
+        raise ValueError(
+            "DeepSeek-V4.1 large-position tie-breaking needs the tiled scorer; "
+            "use index_cache_dtype=bf16"
         )
     if config.kv_cache_block_size % 2:
         raise ValueError("DeepSeek-V4.1 PAGE token count must be even")

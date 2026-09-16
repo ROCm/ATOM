@@ -4,6 +4,8 @@
 import torch
 from aiter import QuantType
 from aiter.dist.parallel_state import get_tp_group
+from torch import nn
+
 from atom.model_ops.attentions.deepseek_v41.packed_attention import (
     packed_decode,
     packed_prefill,
@@ -15,9 +17,11 @@ from atom.model_ops.blockscale import (
 )
 from atom.model_ops.deepseek_v41.compressor import Compressor
 from atom.model_ops.deepseek_v41.indexer import select_indices
+from atom.model_ops.deepseek_v41.paged_scoring import (
+    round_query_rows,
+    score_topk_decode,
+)
 from atom.model_ops.deepseek_v41.projections import grouped_output_projection
-from torch import nn
-
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -59,19 +63,34 @@ class Indexer(nn.Module):
             )
             self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
 
-    def project_keys(self, latent, rope, positions, *, packed=False):
-        # Same rule as the main pool: quantize for the packed layout, store the
-        # BF16 value as computed otherwise.
-        key = rope(self.k_norm(self.wk(latent)), positions)
-        return quantize_fp4(key) if packed else key
+    def project_keys(self, latent, rope, positions):
+        """The BF16 index key. Whatever the plane stores it as is the cache's."""
+        return rope(self.k_norm(self.wk(latent)), positions)
 
-    def forward(self, hidden, qr, keys, rope, step, candidates=None):
+    @property
+    def weights_scale(self):
+        return self.head_dim**-0.5 * self.heads**-0.5
+
+    def project_query(self, qr, rope, positions, index_dtype):
+        """The index query, rounded to whatever the plane's scorer will see.
+
+        The QAT follows the stored keys: an FP8 plane is read by a kernel that
+        takes an FP8 query, so a tiled run over the same plane has to round the
+        same way or the two differ in the value and not just the arithmetic.
+        """
+        query = rope(
+            self.wq_b(qr).unflatten(-1, (self.heads, self.head_dim)), positions
+        )
+        if index_dtype == "fp8":
+            return round_query_rows(query)
+        return quantize_fp4(query, dequantize=True)
+
+    def forward(self, hidden, qr, keys, rope, step, candidates, *, index_dtype):
         positions = torch.arange(
             step.position, step.position + step.length, device=hidden.device
         )
-        query = self.wq_b(qr).unflatten(-1, (self.heads, self.head_dim))
-        query = quantize_fp4(rope(query, positions), dequantize=True)
-        weights = self.weights_proj(hidden) * (self.head_dim**-0.5 * self.heads**-0.5)
+        query = self.project_query(qr, rope, positions, index_dtype)
+        weights = self.weights_proj(hidden) * self.weights_scale
         return select_indices(
             query,
             weights,
@@ -79,7 +98,7 @@ class Indexer(nn.Module):
             (positions + 1) // self.spec.ratio,
             topk=self.topk,
             candidate_blocks=candidates,
-            make_candidates=self.spec.layer_id == self.spec.candidate_owner,
+            make_candidates=self.spec.produces_candidates,
             block_size=self.block_size,
             topk_blocks=self.topk_blocks,
             tie_break=self.tie_break,
@@ -155,29 +174,53 @@ class Attention(nn.Module):
         if latent is not None:
             # The group's first token, which is where the kernel rotated the
             # main latent. Rotating the key anywhere else picks other rows.
-            index = self.indexer.project_keys(
-                latent, rope, rows * self.spec.ratio, packed=cache.packed
-            )
+            index = self.indexer.project_keys(latent, rope, rows * self.spec.ratio)
             cache.write_index(owner, step, rows, index, self.spec.ratio)
 
     def _update_indices(self, hidden, qr, cache, step, rope):
-        if self.spec.ratio:
+        if self.spec.ratio and self.indexer is not None:
             owner = self.spec.kv_owner
             count = (step.position + step.length) // self.spec.ratio
-            if self.indexer is not None:
-                candidate_owner = self.spec.candidate_owner
-                candidates = (
-                    step.candidates[candidate_owner]
-                    if candidate_owner is not None
-                    and candidate_owner != self.spec.layer_id
-                    else None
-                )
-                selected, candidates_out = self.indexer(
-                    hidden, qr, cache.index_keys(owner, count), rope, step, candidates
-                )
-                step.indices[self.spec.layer_id] = selected
-                if candidates_out is not None:
-                    step.candidates[self.spec.layer_id] = candidates_out
+            source = self.spec.candidate_source
+            selected, candidates_out = self.indexer(
+                hidden,
+                qr,
+                cache.index_keys(owner, count),
+                rope,
+                step,
+                None if source is None else step.candidates[source],
+                index_dtype=cache.index_dtype,
+            )
+            step.indices[self.spec.layer_id] = selected
+            if candidates_out is not None:
+                step.candidates[self.spec.layer_id] = candidates_out
+
+    def _score_batch(self, hidden, qr, cache, step, rope):
+        """Every query row's top-k at once, out of the paged plane.
+
+        The whole batch rather than a request at a time, which is what the
+        scorer takes and what `build_indices` wants anyway -- the per-request
+        walk only survived here because the tiled path needed one request's
+        key tile.
+        """
+        indexer, spec = self.indexer, self.spec
+        positions = cache.rope_positions(step)
+        source = self.spec.candidate_source
+        selected, chosen = score_topk_decode(
+            indexer.project_query(qr, rope, positions, cache.index_dtype)[0],
+            indexer.weights_proj(hidden)[0],
+            cache.index_units[spec.kv_owner],
+            cache.unit_tiles(step, spec.ratio),
+            ((positions + 1) // spec.ratio).int(),
+            topk=indexer.topk,
+            weights_scale=indexer.weights_scale,
+            candidates=None if source is None else step.candidates[source],
+            block_size=indexer.block_size,
+            candidate_count=indexer.topk_blocks if spec.produces_candidates else 0,
+        )
+        step.selected[spec.layer_id] = selected.unsqueeze(0)
+        if chosen is not None:
+            step.candidates[spec.layer_id] = chosen
 
     def process_weights_after_loading(self) -> None:
         """Dequantize wo_a to BF16 for the grouped LoRA einsum.
@@ -233,13 +276,16 @@ class Attention(nn.Module):
         )
         window_kv = quantize_fp8(raw_kv) if cache.packed else kv
         self._compress_batch(hidden, cache, step, rope)
-        # Still per request: the indexer's scoring width is that request's
-        # committed row count, which is the shape P3/P4 replace. The
-        # compression above no longer needs the walk.
-        for request_cache, request_step, rows in cache.requests(step):
-            self._update_indices(
-                hidden[:, rows], qr[:, rows], request_cache, request_step, rope
-            )
+        if self.indexer is not None and cache.scores_paged(step):
+            self._score_batch(hidden, qr, cache, step, rope)
+        else:
+            # Per request, because the tiled scorer holds one request's key
+            # tile and bounds it by that request's committed row count. The
+            # paged scorer above takes the batch and needs no walk.
+            for request_cache, request_step, rows in cache.requests(step):
+                self._update_indices(
+                    hidden[:, rows], qr[:, rows], request_cache, request_step, rope
+                )
         prefix, prefix_indptr, extend, extend_indptr = cache.attention_indices(
             self.spec, step
         )

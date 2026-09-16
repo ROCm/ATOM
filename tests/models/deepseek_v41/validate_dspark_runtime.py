@@ -78,6 +78,11 @@ def main():
     )
     parser.add_argument("--output-tokens", type=int, default=16)
     parser.add_argument("--cache-dtype", choices=("bf16", "fp4"), default="bf16")
+    parser.add_argument(
+        "--index-dtype",
+        choices=("bf16", "fp8", "fp4"),
+        help="Index plane format; defaults to --cache-dtype, as the engine does",
+    )
     args = parser.parse_args()
     if args.trace_layers is not None and args.trace_layers < 1:
         parser.error("--trace-layers must be positive")
@@ -157,12 +162,15 @@ def main():
             ),
             torch_profiler_dir=args.torch_profiler_dir,
             kv_cache_dtype=args.cache_dtype,
-            index_cache_dtype=args.cache_dtype,
+            index_cache_dtype=args.index_dtype or args.cache_dtype,
             max_num_batched_tokens=512 if args.quality_config else 256,
             max_model_len=4096 if args.quality_config else 512,
             max_num_seqs=4,
             long_prefill_token_threshold=128,
-            state_checkpoint_interval_tokens=128,
+            # A multiple of every PAGE size CSA2 runs: the scheduler snaps an
+            # interval that is not one to off, which would leave two arms of a
+            # comparison with different checkpointing and nothing saying so.
+            state_checkpoint_interval_tokens=256,
             enable_log_stats=False,
             port=port,
         )
@@ -177,6 +185,7 @@ def main():
         and not args.production,
         "calibration_profile": args.calibration_profile,
         "cache_dtype": args.cache_dtype,
+        "index_dtype": args.index_dtype or args.cache_dtype,
         "single_row_padding_diagnostic": args.pad_single_row,
         "ordered_reductions_diagnostic": args.ordered_reductions,
         "fixed_attention_reduction_diagnostic": args.fixed_attention_reduction,

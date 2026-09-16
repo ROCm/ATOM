@@ -96,6 +96,11 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--label", required=True)
     parser.add_argument("--cache-dtype", choices=("bf16", "fp4"), default="bf16")
+    parser.add_argument(
+        "--index-dtype",
+        choices=("bf16", "fp8", "fp4"),
+        help="Index plane format; defaults to --cache-dtype, as the engine does",
+    )
     parser.add_argument("--graph", action="store_true")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--output-tokens", type=int, default=32)
@@ -120,12 +125,15 @@ def main():
             cudagraph_capture_sizes=buckets,
         ),
         kv_cache_dtype=args.cache_dtype,
-        index_cache_dtype=args.cache_dtype,
+        index_cache_dtype=args.index_dtype or args.cache_dtype,
         max_num_batched_tokens=1024,
         max_model_len=max(length for _, length in cases) + args.output_tokens,
         max_num_seqs=max(4, max_batch),
         long_prefill_token_threshold=128,
-        state_checkpoint_interval_tokens=128,
+        # A multiple of every PAGE size CSA2 runs: the scheduler snaps an
+        # interval that is not one to off, which would leave two arms of a
+        # comparison with different checkpointing and nothing saying so.
+        state_checkpoint_interval_tokens=256,
         enable_log_stats=False,
         port=port,
     )
@@ -145,6 +153,7 @@ def main():
         report = {
             "label": args.label,
             "cache_dtype": args.cache_dtype,
+        "index_dtype": args.index_dtype or args.cache_dtype,
             "graph": args.graph,
             "tp": size,
             "output_tokens": args.output_tokens,
