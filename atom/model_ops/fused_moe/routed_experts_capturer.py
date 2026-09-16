@@ -21,7 +21,12 @@ _INSTANCE: RoutedExpertsCapturer | None = None
 
 
 def check_return_routed_experts(
-    dcp_size: int, pcp_size: int, pp_size: int = 1
+    dcp_size: int,
+    pcp_size: int,
+    pp_size: int = 1,
+    *,
+    kv_transfer_config: dict | None = None,
+    enable_rapidserve: bool = False,
 ) -> None:
     """Refuse topologies that cannot assemble a full [seq_len-1] route tensor."""
     if dcp_size != 1 or pcp_size != 1:
@@ -32,6 +37,18 @@ def check_return_routed_experts(
     if pp_size != 1:
         raise ValueError(
             "enable_return_routed_experts requires pipeline_parallel_size == 1"
+        )
+    if kv_transfer_config:
+        raise ValueError(
+            "enable_return_routed_experts does not support KV transfer "
+            "(prefill/decode disaggregation or KV offload); routed-expert "
+            "metadata is not moved with KV blocks"
+        )
+    if enable_rapidserve:
+        raise ValueError(
+            "enable_return_routed_experts does not support RapidServe "
+            "prefill/decode disaggregation; decode skips KV allocation and "
+            "never initializes the process-local capture buffer"
         )
 
 
@@ -88,6 +105,39 @@ def trim_routed_experts(routes: np.ndarray | None, num_tokens: int):
     if routes.shape[0] != keep:
         return routes[:keep]
     return routes
+
+
+def _gather_src_indx(gather_indx) -> torch.Tensor:
+    if torch.is_tensor(gather_indx):
+        return gather_indx
+    src = getattr(gather_indx, "src_indx", None)
+    if torch.is_tensor(src):
+        return src
+    raise TypeError(f"unsupported gather_indx type {type(gather_indx)}")
+
+
+def topk_ids_from_triton_routing(
+    routing_data,
+    gather_indx,
+    num_tokens: int,
+    topk: int,
+) -> torch.Tensor:
+    """Logical expert ids ``[num_tokens, topk]`` consumed by Triton fused experts.
+
+    Packed slots are expert-major. ``gather_indx`` maps packed slot ->
+    ``token * topk + k``. Invert the histogram prefix to recover expert ids.
+    """
+    src = _gather_src_indx(gather_indx).to(dtype=torch.long).view(-1)
+    n = int(num_tokens) * int(topk)
+    src = src[:n]
+    packed = torch.arange(n, device=src.device, dtype=torch.long)
+    offs = routing_data.expt_data.token_offs_raw.to(dtype=torch.long)
+    expert_packed = torch.searchsorted(offs[1:], packed, right=True)
+    tokens = torch.div(src, int(topk), rounding_mode="floor")
+    slots = src % int(topk)
+    ids = expert_packed.new_empty((int(num_tokens), int(topk)))
+    ids[tokens, slots] = expert_packed
+    return ids
 
 
 class RoutedExpertsCapturer:

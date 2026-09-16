@@ -528,6 +528,13 @@ class Scheduler:
                 getattr(config, "decode_context_parallel_size", 1),
                 getattr(config, "prefill_context_parallel_size", 1),
                 getattr(config, "pipeline_parallel_size", 1),
+                kv_transfer_config=getattr(config, "kv_transfer_config", None),
+                enable_rapidserve=bool(
+                    getattr(config, "enable_rapidserve", False)
+                    or getattr(config, "disagg_is_decode", False)
+                    or "RapidServeModelRunner"
+                    in str(getattr(config, "runner_qualname", ""))
+                ),
             )
         pc = getattr(config, "parallel_config", None)
         self.metrics = SchedulerMetrics(

@@ -1995,6 +1995,11 @@ class ModelRunner:
             num_blocks=num_kvcache_blocks,
         )
 
+        # Capture buffer is part of the PAGE budget (per-slot int32 routes).
+        # Allocate it before the expected-vs-actual check so the measurement
+        # includes those bytes rather than warning on a false mismatch.
+        self._maybe_init_routed_experts_capturer(num_kvcache_blocks)
+
         # Cross-validate: compare estimated vs actual KV cache allocation.
         # `actual_kv_bytes` includes BOTH the unified pool tensors (counted by
         # `block_bytes × num_blocks`) AND the per-request cache tensors (state
@@ -2033,7 +2038,6 @@ class ModelRunner:
             and torch.distributed.get_world_size() > 1
         ):
             torch.distributed.barrier()
-        self._maybe_init_routed_experts_capturer(num_kvcache_blocks)
         return True
 
     def _routed_experts_geometry(self) -> tuple[int, int] | None:
@@ -4323,9 +4327,26 @@ class RapidServeModelRunner(ModelRunner):
         safety_margin = int(total_bytes * 0.02)
         return 4 * safety_margin
 
+    def _refuse_routed_experts_capture(self) -> None:
+        if not getattr(self.config, "enable_return_routed_experts", False):
+            return
+        from atom.model_ops.fused_moe.routed_experts_capturer import (
+            check_return_routed_experts,
+        )
+
+        check_return_routed_experts(
+            getattr(self.config, "decode_context_parallel_size", 1),
+            getattr(self.config, "prefill_context_parallel_size", 1),
+            getattr(self.config, "pipeline_parallel_size", 1),
+            kv_transfer_config=getattr(self.config, "kv_transfer_config", None),
+            enable_rapidserve=True,
+        )
+
     def get_num_blocks(self) -> dict[str, object]:
         # Decode in disagg mode owns no GPU memory — kvcache is imported from
-        # prefill.
+        # prefill. That also skips `_maybe_init_routed_experts_capturer`, so
+        # capture cannot be served from this process.
+        self._refuse_routed_experts_capture()
         if self.config.disagg_is_decode:
             transfer = self.attn_metadata_builder.state_transfer()
             if transfer.copies:
@@ -4341,6 +4362,7 @@ class RapidServeModelRunner(ModelRunner):
 
     def allocate_kv_cache(self, num_kvcache_blocks):
         # Decode in disagg mode: kvcache is imported from prefill, not allocated.
+        self._refuse_routed_experts_capture()
         if self.config.disagg_is_decode:
             logger.info("decode skipping kv cache allocation")
             return True

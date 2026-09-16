@@ -18,6 +18,7 @@ from atom.model_ops.fused_moe.routed_experts_capturer import (
     check_return_routed_experts,
     kv_slots_from_block_table,
     maybe_capture_routed_experts,
+    topk_ids_from_triton_routing,
     trim_routed_experts,
 )
 
@@ -48,6 +49,28 @@ def test_dcp_pcp_pp_fail_closed():
         check_return_routed_experts(1, 2)
     with pytest.raises(ValueError, match="pipeline_parallel_size"):
         check_return_routed_experts(1, 1, 2)
+    with pytest.raises(ValueError, match="KV transfer"):
+        check_return_routed_experts(1, 1, 1, kv_transfer_config={"kv_connector": "moriio"})
+    with pytest.raises(ValueError, match="RapidServe"):
+        check_return_routed_experts(1, 1, 1, enable_rapidserve=True)
+    check_return_routed_experts(1, 1, 1, kv_transfer_config={})
+
+
+def test_rapidserve_decode_skip_is_rejected():
+    """Decode skips KV alloc / capturer init; RapidServeModelRunner must refuse."""
+    from pathlib import Path
+
+    src = (
+        Path(__file__).resolve().parents[1]
+        / "atom"
+        / "model_engine"
+        / "model_runner.py"
+    ).read_text()
+    rapid = src.split("class RapidServeModelRunner", 1)[1]
+    assert "def _refuse_routed_experts_capture" in rapid
+    assert rapid.count("self._refuse_routed_experts_capture()") >= 2
+    with pytest.raises(ValueError, match="never initializes"):
+        check_return_routed_experts(1, 1, 1, enable_rapidserve=True)
 
 
 def test_flag_off_leaves_field_absent():
@@ -206,3 +229,18 @@ def test_trim_routed_experts_before_request_output():
         routed_experts=trimmed,
     )
     assert ro.routed_experts.shape[0] == 3
+
+
+def test_triton_routing_ids_match_packed_histogram():
+    """Reconstruct token-major ids from the same gather/hist Triton consumes."""
+
+    class _Expt:
+        token_offs_raw = torch.tensor([0, 0, 1, 1, 3, 5, 6], dtype=torch.int32)
+
+    class _Routing:
+        expt_data = _Expt()
+        expt_hist = torch.tensor([0, 1, 0, 2, 2, 1], dtype=torch.int32)
+
+    gather = torch.tensor([0, 2, 4, 1, 5, 3], dtype=torch.int32)
+    ids = topk_ids_from_triton_routing(_Routing(), gather, num_tokens=3, topk=2)
+    assert ids.tolist() == [[1, 4], [3, 5], [3, 4]]

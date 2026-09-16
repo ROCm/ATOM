@@ -34,6 +34,7 @@ from atom.model_ops.eplb import eplb_map_and_record_fused
 from atom.model_ops.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
     maybe_capture_routed_experts,
+    topk_ids_from_triton_routing,
 )
 from atom.model_ops.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
@@ -1759,24 +1760,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 or e_score_correction_bias is not None
                 or custom_routing_function is not None
             )
-            # Both Triton branches return before the FlyDSL
-            # select_experts_with_record() below. Record logical ids here.
-            if RoutedExpertsCapturer.get() is not None:
-                self.select_experts_with_record(
-                    layer=layer,
-                    hidden_states=x,
-                    router_logits=router_logits,
-                    use_grouped_topk=use_grouped_topk,
-                    top_k=top_k,
-                    renormalize=renormalize,
-                    topk_group=topk_group,
-                    num_expert_group=num_expert_group,
-                    global_num_experts=global_num_experts,
-                    custom_routing_function=custom_routing_function,
-                    scoring_func=scoring_func,
-                    e_score_correction_bias=e_score_correction_bias,
-                    fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
-                )
             if needs_custom_routing or use_triton_gfx1250_silu:
                 # custom routing -- set for deepseek routing n expts act, for grouped topk
                 n_expts_act = top_k
@@ -1803,6 +1786,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 )
                 # Routed-only gate count (no shared-expert widening).
                 n_expts_act = routing_data.n_expts_act
+                if RoutedExpertsCapturer.get() is not None:
+                    maybe_capture_routed_experts(
+                        layer,
+                        topk_ids_from_triton_routing(
+                            routing_data, gather_idx, x.shape[0], n_expts_act
+                        ),
+                    )
 
                 # Convert to triton routing data structures
                 _, n_expts_tot = router_logits.shape
@@ -1857,6 +1847,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             ), "triton kernel does not support fused shared experts func"
 
             # Takes directly from model dtype in config.json
+            from aiter.ops.triton.moe.moe_routing.routing import routing
+
+            routing_data, gather_idx, scatter_idx = routing(
+                router_logits, top_k, sm_first=not renormalize
+            )
+            if RoutedExpertsCapturer.get() is not None:
+                maybe_capture_routed_experts(
+                    layer,
+                    topk_ids_from_triton_routing(
+                        routing_data, gather_idx, x.shape[0], top_k
+                    ),
+                )
             return triton_kernel_moe_forward(
                 x,
                 w13_weight,
@@ -1878,6 +1880,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 global_num_experts=global_num_experts,
                 act_quant=self.act_quant,
+                routing_outputs=(routing_data, gather_idx, scatter_idx),
             )
 
         topk_weights, topk_ids = self.select_experts_with_record(

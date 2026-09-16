@@ -1719,7 +1719,8 @@ class Config:
     enable_prefix_caching: bool = True
     # Return per-request MoE routes from generate() as int16
     # [seq_len - 1, num_layers, top_k]. Scatter is CUDA-graph-safe (device
-    # write inside fused MoE). Requires DCP=PCP=1; prefix cache stays on.
+    # write inside fused MoE). Requires DCP=PCP=PP=1 and no KV transfer /
+    # offload / RapidServe P/D; prefix cache stays on.
     enable_return_routed_experts: bool = False
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
@@ -1907,17 +1908,6 @@ class Config:
             self.dcp_config = DCPConfig(**self.dcp_config.__dict__)
         else:
             raise TypeError("dcp_config must be DCPConfig or dict")
-        if self.enable_return_routed_experts and (
-            self.decode_context_parallel_size != 1
-            or self.prefill_context_parallel_size != 1
-            or self.pipeline_parallel_size != 1
-        ):
-            raise ValueError(
-                "enable_return_routed_experts requires "
-                "decode_context_parallel_size == 1, "
-                "prefill_context_parallel_size == 1, and "
-                "pipeline_parallel_size == 1"
-            )
         # assert os.path.isdir(self.model)
 
         # The forced-acceptance schedule spends its whole budget on the first
@@ -2145,6 +2135,23 @@ class Config:
                 import ast
 
                 self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
+
+        if self.enable_return_routed_experts:
+            from atom.model_ops.fused_moe.routed_experts_capturer import (
+                check_return_routed_experts,
+            )
+
+            check_return_routed_experts(
+                self.decode_context_parallel_size,
+                self.prefill_context_parallel_size,
+                self.pipeline_parallel_size,
+                kv_transfer_config=self.kv_transfer_config,
+                enable_rapidserve=(
+                    self.enable_rapidserve
+                    or self.disagg_is_decode
+                    or "RapidServeModelRunner" in self.runner_qualname
+                ),
+            )
 
         if self.speculative_config is not None:
             num_spec = self.speculative_config.num_speculative_tokens
