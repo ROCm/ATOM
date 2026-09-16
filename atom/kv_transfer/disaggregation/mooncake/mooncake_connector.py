@@ -1276,6 +1276,12 @@ class MooncakeConnector(KVConnectorBase):
         # Without an engine id there is no generation to bind to, so the
         # result is not cached at all and every request re-probes.
         engine_id = getattr(meta, "remote_engine_id", None)
+        # MooncakeConnectorScheduler emits the literal "None" until a worker
+        # fills in its real id, and that string is truthy: taking it as a
+        # generation would give every restart the same key and hand a
+        # downgraded producer the previous process's verdict.
+        if engine_id == "None":
+            engine_id = None
         bkey = (engine_id, meta.remote_host, port)
         key = bkey if engine_id else None
         now = time.monotonic()

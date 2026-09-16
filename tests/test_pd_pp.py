@@ -615,6 +615,13 @@ def test_fp4_capability_cache_is_rebound_when_the_producer_restarts():
     assert conn._peer_can_map_fp4_regions(meta_for(None), 0, 1, 1)
     assert len(probes) == 4
 
+    # The scheduler emits the literal "None" until a worker fills in its real
+    # id. That string is truthy, so it has to be rejected explicitly or every
+    # restart would share one key.
+    assert conn._peer_can_map_fp4_regions(meta_for("None"), 0, 1, 1)
+    assert conn._peer_can_map_fp4_regions(meta_for("None"), 0, 1, 1)
+    assert len(probes) == 6, "the placeholder id must not be taken as a generation"
+
 
 def test_fp4_probe_backs_off_instead_of_paying_the_timeout_every_request():
     """A peer that cannot be probed must not cost a timeout per request.
