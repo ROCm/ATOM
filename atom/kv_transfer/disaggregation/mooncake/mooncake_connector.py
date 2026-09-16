@@ -659,7 +659,7 @@ class MooncakeConnector(KVConnectorBase):
         self._block_region_roles: list[str | None] = []
         self._fp4_index_layout: bool = False
         # Peer PAGE region roles, probed once per producer over MSG_GET_META.
-        self._peer_region_roles_cache: dict[tuple[str, int], list[str | None]] = {}
+        self._peer_region_roles_cache: dict[tuple[str, str, int], list[str | None]] = {}
         self._peer_region_roles_lock = threading.Lock()
         self.kv_cache_shape: tuple[int, ...] | None = None
         self.block_len: int = config.kv_cache_block_size
@@ -1255,11 +1255,18 @@ class MooncakeConnector(KVConnectorBase):
             remote_pp_size,
             meta.remote_dp_size,
         )
-        key = (meta.remote_host, port)
-        with self._peer_region_roles_lock:
-            cached = self._peer_region_roles_cache.get(key)
-        if cached is not None:
-            return True
+        # Keyed by the producer's engine generation, not just its address. A
+        # restart reuses host:port but takes a fresh Mooncake RPC port, so a
+        # peer that came back on an older binary misses this cache and is
+        # probed again instead of inheriting the previous process's verdict.
+        # Without an engine id there is no generation to bind to, so the
+        # result is not cached at all and every request re-probes.
+        engine_id = getattr(meta, "remote_engine_id", None)
+        key = (engine_id, meta.remote_host, port) if engine_id else None
+        if key is not None:
+            with self._peer_region_roles_lock:
+                if key in self._peer_region_roles_cache:
+                    return True
         addr = make_zmq_path("tcp", meta.remote_host, port)
         sock = self.zmq_context.socket(zmq.DEALER)
         try:
@@ -1277,8 +1284,9 @@ class MooncakeConnector(KVConnectorBase):
             return False
         # Only a success is cached: a transient probe failure must not pin the
         # peer as unusable for the rest of the process.
-        with self._peer_region_roles_lock:
-            self._peer_region_roles_cache[key] = roles
+        if key is not None:
+            with self._peer_region_roles_lock:
+                self._peer_region_roles_cache[key] = roles
         return True
 
     def _acquire_staging_slot(self) -> int:
@@ -2421,3 +2429,4 @@ class MooncakeConnector(KVConnectorBase):
         # PP-prefill: signal stage-0 it may now reuse the shared page table.
         self._send_release(req_id)
         return True
+                      

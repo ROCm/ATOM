@@ -548,6 +548,73 @@ def test_write_done_nonce_cleaned_up_on_completion():
     assert "r1" not in conn._pending_recv_nonce
 
 
+def test_fp4_capability_cache_is_rebound_when_the_producer_restarts():
+    """A producer restart must be re-probed, not served from the cache.
+
+    The verdict is cached so the bootstrap probe costs one round trip per
+    peer, but a restart reuses host:port while taking a fresh Mooncake RPC
+    port. Keying on the address alone would let a peer that came back on an
+    older binary inherit the previous process's "can map FP4" verdict, which
+    is exactly the silent mismap the probe exists to prevent.
+    """
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    import msgspec
+
+    payload = msgspec.msgpack.Encoder().encode(
+        mc.MooncakeAgentMetadata(
+            engine_id="e", rpc_port=1, block_region_roles=["dsv4.csa_indexer.fp4_data"]
+        )
+    )
+    probes = []
+
+    class _Sock:
+        def setsockopt(self, *a):
+            pass
+
+        def connect(self, addr):
+            probes.append(addr)
+
+        def send_multipart(self, parts):
+            pass
+
+        def recv_multipart(self):
+            return [b"", payload]
+
+        def close(self):
+            pass
+
+    conn = _make_connector(
+        _peer_region_roles_cache={},
+        _peer_region_roles_lock=threading.Lock(),
+        _decoder=msgspec.msgpack.Decoder(mc.MooncakeAgentMetadata),
+        zmq_context=SimpleNamespace(socket=lambda *_a, **_k: _Sock()),
+    )
+
+    def meta_for(engine_id):
+        return SimpleNamespace(
+            remote_engine_id=engine_id,
+            remote_host="10.0.0.9",
+            remote_handshake_port=6301,
+            remote_dp_rank=0,
+            remote_dp_size=1,
+        )
+
+    assert conn._peer_can_map_fp4_regions(meta_for("10.0.0.9:5001"), 0, 1, 1)
+    assert conn._peer_can_map_fp4_regions(meta_for("10.0.0.9:5001"), 0, 1, 1)
+    assert len(probes) == 1, "same generation must be served from the cache"
+
+    # Same address, new engine generation: probed again.
+    assert conn._peer_can_map_fp4_regions(meta_for("10.0.0.9:5002"), 0, 1, 1)
+    assert len(probes) == 2, "a restarted producer must not reuse the verdict"
+
+    # No engine id to bind to: never cached, always re-probed.
+    assert conn._peer_can_map_fp4_regions(meta_for(None), 0, 1, 1)
+    assert conn._peer_can_map_fp4_regions(meta_for(None), 0, 1, 1)
+    assert len(probes) == 4
+
+
 def test_bootstrap_metadata_omits_region_roles_for_older_producers():
     """An older producer's metadata must decode with roles absent, not empty.
 
