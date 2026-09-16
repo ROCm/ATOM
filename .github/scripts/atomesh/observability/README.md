@@ -42,9 +42,13 @@ All metrics to inspect the full set. Desktop charts use two columns:
   and graph padding are excluded. These CPU scheduler metrics are available even
   when GPU event timing is disabled.
 - Decode batch context tokens: sum of logical sequence lengths per real batch.
-- Decode request context tokens: one context-length sample per real request row
-  on every decode forward. Requests participating in more forwards contribute
-  more samples; this is not one observation per request lifetime.
+- Decode request context length: exact token count at the first real decode
+  dispatch, once per request sequence. Collected through Prometheus `/metrics`
+  as a Gauge with request ID and dispatch-time labels. The scatter plot shows
+  individual requests; hover for identity or use Data table / CSV for all values.
+  Repeated scrapes and later decode steps do not create additional report rows.
+  Samples persist until the service's metrics directory is cleaned, so the number
+  of time series grows with requests.
 - Prefill and Decode GPU forward: per-worker device-event duration, including
   stream communication/waits; PP samples cover each local stage, not the full pipeline.
 

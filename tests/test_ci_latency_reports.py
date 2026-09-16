@@ -6,6 +6,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import Mock
@@ -300,6 +301,19 @@ def test_collection_diagnostics_are_finalized_once_before_rendering(
 
     monkeypatch.setattr(report, "fetch_series", fetch)
     monkeypatch.setattr(report, "fetch_instance_series", lambda *args: {})
+    monkeypatch.setattr(
+        report,
+        "fetch_request_context",
+        lambda *args: [
+            {
+                "timestamp": 105.0,
+                "request_id": "r1",
+                "sequence_id": "1",
+                "instance": "test:8020",
+                "context_tokens": 8000,
+            }
+        ],
+    )
     renders = []
     original = report.write_report
 
@@ -566,11 +580,16 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
             "atom:prefill_context_tokens",
             "atom:prefill_request_context_tokens",
             "atom:decode_context_tokens",
-            "atom:decode_request_context_tokens",
             "atom:gpu_forward_seconds",
             "atom:prefill_request_gpu_forward_seconds",
         )
     ]
+    request_context_gauge = Gauge(
+        "atom:decode_request_context_tokens",
+        "fixture",
+        ["request_id", "sequence_id", "started_at"],
+        registry=registry,
+    )
     cached = Counter("atom:prefix_cache_cached_tokens", "fixture", registry=registry)
     offload = Counter("atom:prefix_cache_offload_tokens", "fixture", registry=registry)
     prompt = Counter("atom:prefix_cache_full_tokens", "fixture", registry=registry)
@@ -580,7 +599,16 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
         blocks.labels(state).set(value)
 
     other_registry = CollectorRegistry()
-    for metric in (ttft, itl, queue_time, batch, transfer, queues, *workload):
+    for metric in (
+        ttft,
+        itl,
+        queue_time,
+        batch,
+        transfer,
+        queues,
+        request_context_gauge,
+        *workload,
+    ):
         other_registry.register(metric)
     other_blocks = Gauge(
         "atom:scheduler_kv_cache_blocks", "fixture", ["state"], registry=other_registry
@@ -608,9 +636,13 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
                 batch.observe(4)
                 transfer.observe(0.02)
                 for hist, value in zip(
-                    workload, (2000, 512, 48000, 12000, 32000, 8000, 0.008, 0.030)
+                    workload, (2000, 512, 48000, 12000, 32000, 0.008, 0.030)
                 ):
                     hist.observe(value)
+                started = str(time.time())
+                request_context_gauge.labels(
+                    "request-" + started, started, started
+                ).set(8000)
                 cached.inc(8)
                 offload.inc(1)
                 prompt.inc(10)
@@ -708,7 +740,7 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
         for panel in data["panels"]:
             if panel["role"] != "overall":
                 assert set(panel["instances"]) == {target, other_target}
-                assert any(
+                assert panel["instances"][target].get("records") or any(
                     v is not None
                     for points in panel["instances"][target]["series"].values()
                     for _, v in points
@@ -729,14 +761,13 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
                 means = [v for _, v in bundle["series"]["mean"] if v is not None]
                 assert means and all(v == pytest.approx(expected) for v in means)
         request_context = panels["decode_request_context_tokens"]
-        assert request_context["title"] == "Decode request context tokens"
+        assert request_context["title"] == "Decode request context length"
         assert panels["decode_context_tokens"]["title"] == "Decode batch context tokens"
-        for bundle in (request_context, *request_context["instances"].values()):
-            assert all(
-                value == pytest.approx(8000)
-                for _, value in bundle["series"]["mean"]
-                if value is not None
-            )
+        assert len(request_context["records"]) == 24  # 12 requests on two targets.
+        for bundle in request_context["instances"].values():
+            assert len(bundle["records"]) == 12
+            assert all(r["context_tokens"] == 8000 for r in bundle["records"])
+            assert len({r["request_id"] for r in bundle["records"]}) == 12
         kv = panels["prefill_kv_blocks"]
         assert {v for _, v in kv["series"]["used"] if v is not None} == {50.0}
         assert {

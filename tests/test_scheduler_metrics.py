@@ -526,41 +526,71 @@ def test_prefill_context_uses_chunk_end_and_excludes_decode_and_padding(monkeypa
     assert histogram_values_by_name(metrics) == final
 
 
-def test_decode_request_context_histogram_counts_each_real_row_on_each_forward():
-    metrics = SchedulerMetrics()
-    seqs = {i: SimpleNamespace(num_tokens=999999) for i in (1, 2, 3)}
+def test_decode_request_context_gauge_records_first_dispatch_once(monkeypatch):
+    from prometheus_client import CollectorRegistry, generate_latest
+
+    registry = CollectorRegistry()
+    metrics = SchedulerMetrics(registry=registry)
+    seqs = {
+        i: SimpleNamespace(num_tokens=999999, external_request_id=f"request-{i}")
+        for i in (1, 2, 3)
+    }
+    for i in (1, 2):
+        metrics.enqueue(seqs[i])
+    monkeypatch.setattr("atom.model_engine.scheduler_metrics.time.time", lambda: 100.25)
     mixed = SimpleNamespace(
         req_ids=[1, 2, 3],
         is_dummy_run=False,
         total_seqs_num_decode=2,
         total_seqs_num_prefill=1,
         total_tokens_num_prefill=50,
-        # Decode rows, then prefill, then a padded entry. Only the first two count.
         context_lens=[1000, 9000, 300, 999999],
     )
     metrics.record_forward(mixed, seqs)
-    first = histogram_values_by_name(metrics)
-    assert first["decode_context_tokens"]["sum"] == 10000
-    assert first["decode_context_tokens"]["buckets"][-1][1] == 1
-    assert first["decode_request_context_tokens"]["sum"] == 10000
-    assert first["decode_request_context_tokens"]["buckets"][-1][1] == 2
-    assert dict(first["decode_request_context_tokens"]["buckets"])[1024] == 1
-    assert dict(first["decode_request_context_tokens"]["buckets"])[16384] == 2
+    first = metrics.decode_request_context_tokens.collect()[0].samples
+    assert [(s.labels["request_id"], s.value) for s in first] == [
+        ("request-1", 1000),
+        ("request-2", 9000),
+    ]
+    assert all(s.labels["started_at"] == "100.25" for s in first)
+    assert (
+        "# TYPE atom:decode_request_context_tokens gauge"
+        in generate_latest(registry).decode()
+    )
 
-    # The shorter request participates again: this is not a lifetime sample.
+    # Exercise the real preemption reset and re-admission paths. Neither should
+    # reset the first-decode marker or replace the recorded context length.
+    seqs[1].is_partial_prefill = False
+    owner = SimpleNamespace(
+        _is_preemptable=lambda seq: True,
+        total_preemptions=0,
+        spec_decode_local=False,
+        _connector_release_stalled_save=lambda seq: None,
+        block_manager=SimpleNamespace(deallocate=lambda seq: None),
+        waiting=deque(),
+    )
+    assert Scheduler.preempt(owner, seqs[1])
+    metrics.enqueue(seqs[1])
     mixed.req_ids = [1]
     mixed.total_seqs_num_decode = 1
     mixed.total_seqs_num_prefill = 0
     mixed.context_lens = [1001]
     metrics.record_forward(mixed, seqs)
-    second = histogram_values_by_name(metrics)
-    assert second["decode_context_tokens"]["sum"] == 11001
-    assert second["decode_context_tokens"]["buckets"][-1][1] == 2
-    assert second["decode_request_context_tokens"]["sum"] == 11001
-    assert second["decode_request_context_tokens"]["buckets"][-1][1] == 3
+    assert metrics.decode_request_context_tokens.collect()[0].samples == first
+    assert histogram_values_by_name(metrics)["decode_context_tokens"]["sum"] == 11001
+
+    # A new request arrives while the first one is still decoding.
+    metrics.enqueue(seqs[3])
+    mixed.req_ids, mixed.total_seqs_num_decode = [1, 3], 2
+    mixed.context_lens = [1002, 300]
     mixed.is_dummy_run = True
     metrics.record_forward(mixed, seqs)
-    assert histogram_values_by_name(metrics) == second
+    assert metrics.decode_request_context_tokens.collect()[0].samples == first
+    mixed.is_dummy_run = False
+    metrics.record_forward(mixed, seqs)
+    final = metrics.decode_request_context_tokens.collect()[0].samples
+    assert len(final) == 3
+    assert final[-1].labels["request_id"] == "request-3" and final[-1].value == 300
 
 
 @pytest.mark.parametrize("phase", ["prefill", "decode"])
@@ -590,8 +620,9 @@ def test_large_batch_contexts_have_finite_buckets_through_exposition(
     # Finite buckets must contain the observations; otherwise Prometheus
     # clips any quantile in +Inf to the highest finite bound.
     assert dict(histogram["buckets"])[total] == 1
-    request_histogram = snapshot[f"{phase}_request_context_tokens"]
-    assert request_histogram["buckets"][-2] == (8388608, rows)
+    if phase == "prefill":
+        request_histogram = snapshot["prefill_request_context_tokens"]
+        assert request_histogram["buckets"][-2] == (8388608, rows)
 
     values = samples(exporter)
     labels = (("dp_rank", "0"), ("engine_role", phase))

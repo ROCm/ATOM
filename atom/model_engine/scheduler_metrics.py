@@ -9,7 +9,8 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-from prometheus_client import Histogram
+import numpy as np
+from prometheus_client import Gauge, Histogram
 
 from atom.utils.histogram import LATENCY_BUCKETS
 
@@ -45,11 +46,13 @@ class RequestQueueTiming:
     observed: bool = False
     is_pd: bool = False
     prefill_observed: bool = False
+    decode_context_observed: bool = False
 
 
 class SchedulerMetrics:
     def __init__(self, dp_rank=0, engine_role="default", *, registry=None):
         labels = {"dp_rank": str(dp_rank), "engine_role": engine_role}
+        self._labels = labels
         self.queue_time = Histogram(
             "atom:request_queue_time_seconds",
             "Time from engine receipt to first real forward dispatch, including KV loading waits.",
@@ -106,13 +109,13 @@ class SchedulerMetrics:
             buckets=BATCH_CONTEXT_BUCKETS,
             registry=registry,
         ).labels(**labels)
-        self.decode_request_context_tokens = Histogram(
+        self.decode_request_context_tokens = Gauge(
             "atom:decode_request_context_tokens",
-            "Logical context length per real decode request row on each forward; request-forward weighted, without padding or TP multiplication.",
-            labels,
-            buckets=TOKEN_BUCKETS,
+            "Logical context length at first real decode dispatch, once per request sequence; retained until metrics storage is cleaned.",
+            [*labels, "request_id", "sequence_id", "started_at"],
+            multiprocess_mode="max",
             registry=registry,
-        ).labels(**labels)
+        )
         # Only in-flight external loads are retained; removed on every terminal
         # path, including abort and fallback. Sequence timing dies with the seq.
         self._loads: dict[str, tuple[object, float]] = {}
@@ -155,23 +158,44 @@ class SchedulerMetrics:
         if batch.is_dummy_run or not batch.req_ids:
             return
         now = time.perf_counter()
-        for req_id in batch.req_ids:
-            timing = getattr(seqs[req_id], "queue_timing", None)
-            if timing is None or timing.observed:
+        context_lens = getattr(batch, "context_lens", None)
+        for i, req_id in enumerate(batch.req_ids):
+            seq = seqs[req_id]
+            timing = getattr(seq, "queue_timing", None)
+            if timing is None:
                 continue
-            self.queue_time.observe(now - timing.received_at)
-            timing.observed = True
+            if not timing.observed:
+                self.queue_time.observe(now - timing.received_at)
+                timing.observed = True
+            if (
+                i < batch.total_seqs_num_decode
+                and context_lens is not None
+                and not timing.decode_context_observed
+            ):
+                # The marker survives preemption. Retain the sample after the
+                # request completes so a scrape can still see short requests.
+                timing.decode_context_observed = True
+                self.decode_request_context_tokens.labels(
+                    **self._labels,
+                    request_id=(
+                        getattr(seq, "external_request_id", None)
+                        or getattr(seq, "parent_request_id", None)
+                        or str(req_id)
+                    ),
+                    sequence_id=str(req_id),
+                    started_at=str(time.time()),
+                ).set(int(context_lens[i]))
         # Count real request rows, not MTP tokens or a padded graph size.
         if batch.total_seqs_num_decode > 0:
             self.decode_batch_size.observe(batch.total_seqs_num_decode)
-            context_lens = getattr(batch, "context_lens", None)
             if context_lens is not None:
-                total_context = 0
-                for length in context_lens[: batch.total_seqs_num_decode]:
-                    tokens = int(length)
-                    self.decode_request_context_tokens.observe(tokens)
-                    total_context += tokens
-                self.decode_context_tokens.observe(total_context)
+                self.decode_context_tokens.observe(
+                    int(
+                        np.sum(
+                            context_lens[: batch.total_seqs_num_decode], dtype=np.int64
+                        )
+                    )
+                )
         if getattr(batch, "total_seqs_num_prefill", 0) > 0:
             self.prefill_batch_tokens.observe(batch.total_tokens_num_prefill)
             context_lens = getattr(batch, "context_lens", None)

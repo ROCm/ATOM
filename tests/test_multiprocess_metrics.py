@@ -135,6 +135,86 @@ def test_spawned_metrics_are_exported_without_snapshots_and_restart_cleanly():
     assert results[0]["series"] == results[1]["series"]
 
 
+def test_decode_request_context_survives_workers_and_repeated_metrics_scrapes(
+    monkeypatch, tmp_path
+):
+    from prometheus_client.parser import text_string_to_metric_families
+
+    from atom.entrypoints.metrics import start_metrics_server
+
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
+    root = Path(__file__).resolve().parents[1]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join([str(root), env.get("PYTHONPATH", "")])
+    script = """
+import sys
+from types import SimpleNamespace
+from prometheus_client import values
+from atom.model_engine.scheduler_metrics import SchedulerMetrics
+
+assert values.ValueClass._multiprocess
+rank = int(sys.argv[1])
+metrics = SchedulerMetrics(rank, "decode")
+seq = SimpleNamespace(external_request_id=f"request-{rank}")
+metrics.enqueue(seq)
+seqs = {1: seq}
+batch = SimpleNamespace(
+    req_ids=[1], is_dummy_run=False, total_seqs_num_decode=1,
+    context_lens=[1000 + rank],
+)
+metrics.record_forward(batch, seqs)
+batch.context_lens = [2000 + rank]
+metrics.record_forward(batch, seqs)
+seqs.clear()
+del seq
+"""
+    for rank in (0, 1):
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(rank)],
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    # Both requests and their workers have gone before the first HTTP scrape.
+    server, thread = start_metrics_server("127.0.0.1", 0)
+    try:
+        scrapes = []
+        for _ in range(2):
+            with urlopen(
+                f"http://127.0.0.1:{server.server_port}/metrics", timeout=5
+            ) as response:
+                families = list(
+                    text_string_to_metric_families(response.read().decode())
+                )
+            family = next(
+                f for f in families if f.name == "atom:decode_request_context_tokens"
+            )
+            assert family.type == "gauge"
+            assert len(family.samples) == 2
+            assert all(s.name == family.name for s in family.samples)
+            assert {
+                (s.labels["dp_rank"], s.labels["request_id"], s.value)
+                for s in family.samples
+            } == {("0", "request-0", 1000), ("1", "request-1", 1001)}
+            assert all(
+                s.labels["engine_role"] == "decode"
+                and s.labels["sequence_id"] == "1"
+                and float(s.labels["started_at"]) > 0
+                for s in family.samples
+            )
+            scrapes.append(family.samples)
+        assert scrapes[0] == scrapes[1]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(5)
+
+
 @pytest.mark.parametrize(
     "module", ["atom.entrypoints.openai_server", "atom.entrypoints.openai.api_server"]
 )

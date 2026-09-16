@@ -49,7 +49,7 @@ def test_prometheus_export_uses_real_response_values_and_keeps_missing_points(
     monkeypatch.setattr(report.urllib.request, "urlopen", response)
     output = tmp_path / "report.html"
     data = report.generate_report("http://prometheus.example", 100, 110, output)
-    assert len(queries) == sum(
+    assert len(queries) == 1 + sum(
         len(list(report.panel_queries(p, 60))) * (1 if p["role"] == "overall" else 2)
         for p in data["panels"]
     )
@@ -150,15 +150,14 @@ def test_grouped_queries_preserve_instances_and_weight_ratios():
     assert panels["decode_context_tokens"]["unit"] == "tokens"
     assert panels["decode_context_tokens"]["title"] == "Decode batch context tokens"
     request = panels["decode_request_context_tokens"]
-    assert request["title"] == "Decode request context tokens"
+    assert request["title"] == "Decode request context length"
     assert request["unit"] == "tokens" and request["category"] == "workload"
     assert 'role="decode"' in request["selector"]
-    assert "sum by (instance, le)" in report.query_for(
-        request, "p99", 60, by_instance=True
-    )
-    assert "rate(atom:decode_request_context_tokens_sum" in report.query_for(
-        request, "mean", 60
-    )
+    assert request["kind"] == "requests"
+    assert report.statistics_for(request) == ()
+    query = report.request_context_query(request, 100, 110)
+    assert "max_over_time(atom:decode_request_context_tokens{" in query
+    assert "request_id, sequence_id, started_at" in query
     standalone = {p["id"]: p for p in report.panels_for("standalone")}
     assert (
         'role="standalone"' in standalone["decode_request_context_tokens"]["selector"]
@@ -325,3 +324,56 @@ def test_cache_reuse_queries_distinguish_missing_tier_from_zero(tmp_path, missin
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_request_context_uses_dispatch_times_and_deduplicates_scrapes(monkeypatch):
+    def vector(request, sequence, started, instance="node:8020"):
+        return {
+            "metric": {
+                "request_id": request,
+                "sequence_id": sequence,
+                "started_at": str(started),
+                "instance": instance,
+            },
+            "values": [[100, "8000"], [105, "8000"], [110, "8000"]],
+        }
+
+    vectors = [
+        vector("reused-id", "1", 101),
+        vector("reused-id", "1", 101),
+        vector("reused-id", "2", 102),
+        vector("other", "1", 101, "other:8020"),
+        vector("old", "3", 99),
+        vector("future", "4", 111),
+    ]
+    monkeypatch.setattr(report, "_fetch_vectors", lambda *args: vectors)
+    records = report.fetch_request_context("http://fixture", "query", 100, 110)
+    assert len(records) == 3
+    assert [r["timestamp"] for r in records] == [101, 101, 102]
+    assert all(r["context_tokens"] == 8000 for r in records)
+    assert len([r for r in records if r["request_id"] == "reused-id"]) == 2
+
+
+def test_request_context_collects_per_instance_and_round_trips(monkeypatch, tmp_path):
+    records = [
+        {
+            "timestamp": 105.123,
+            "request_id": "</script><request>",
+            "sequence_id": "7",
+            "instance": "node:8020",
+            "context_tokens": 12345,
+        }
+    ]
+    monkeypatch.setattr(report, "fetch_request_context", lambda *args: records)
+    monkeypatch.setattr(report, "fetch_series", lambda *args: [[100, 1], [110, 1]])
+    monkeypatch.setattr(report, "fetch_instance_series", lambda *args: {})
+    data = report.generate_report("http://fixture", 100, 110, tmp_path / "report.html")
+    panel = next(p for p in data["panels"] if p.get("kind") == "requests")
+    assert panel["records"] == records
+    assert panel["instances"]["node:8020"]["records"] == records
+    assert panel["series"] == {}
+    assert {"role": "decode", "instance": "node:8020"} in data["meta"]["instances"]
+    assert "</script><request>" not in (tmp_path / "report.html").read_text()
+    panel["records"][0]["context_tokens"] = -1
+    with pytest.raises(ValueError, match="context_tokens"):
+        report.validate_data(data)

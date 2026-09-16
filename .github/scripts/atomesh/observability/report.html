@@ -79,7 +79,7 @@ function countSpec(p){
 function setPanelScope(s){
  s.scope=selectedInstances[s.role]||"";
  const bundle=s.scope?s.base.instances?.[s.scope]:s.base;
- s.p={...s.base,series:bundle?.series||{},block_counts:bundle?.block_counts,cache_counts:bundle?.cache_counts};
+ s.p={...s.base,series:bundle?.series||{},records:bundle?.records||[],block_counts:bundle?.block_counts,cache_counts:bundle?.cache_counts};
  const spec=countSpec(s.p);
  if(spec){
   s.countMaps=Object.fromEntries(spec.keys.map(k=>[k,new Map(s.p[spec.field]?.[k]||[])]));
@@ -87,6 +87,8 @@ function setPanelScope(s){
  }
 }
 function node(tag,cls,text){const el=document.createElement(tag);if(cls)el.className=cls;if(text!==undefined)el.textContent=text;return el;}
+function requestRecords(s){return (s.p.records||[]).filter(r=>r.timestamp>=range[0]&&r.timestamp<=range[1]);}
+function requestTime(t){return new Date(t*1000).toISOString().slice(11,23);}
 function latest(points,t=META.end,lower=-Infinity){let result=null;for(const point of points||[])if(point[0]>=lower&&point[0]<=t&&finite(point[1]))result=point[1];return result;}
 function near(points,t){if(!points?.length)return null;let a=0,b=points.length-1;while(a<b){const m=(a+b)>>1;if(points[m][0]<t)a=m+1;else b=m;}if(a>0&&Math.abs(points[a-1][0]-t)<Math.abs(points[a][0]-t))a--;return Math.abs(points[a][0]-t)<=META.step*1.5?points[a]:null;}
 $("report-title").textContent=META.title||"Agentic inference report";document.title="ATOM · "+$("report-title").textContent;
@@ -95,7 +97,7 @@ $("duration-summary").textContent=fmt(timeSpan/60);$("step-summary").textContent
 $("ttft-summary").textContent=fmt(latest(states.find(s=>["mesh_ttft","api_ttft"].includes(s.p.id))?.p.series.p99));
 $("itl-summary").textContent=fmt(latest(states.find(s=>s.p.id==="decode_itl")?.p.series.p99));
 $("demo-notice").hidden=META.kind!=="demo";$("kind-badge").textContent=META.kind==="demo"?"PREVIEW":"REPORT";$("kind-badge").classList.toggle("demo",META.kind==="demo");
-$("report-note").textContent="Units are shown per chart. Latency and batch distributions summarize the preceding "+META.window+" seconds; queue depths and KV utilization are sampled states. Zoom changes the displayed time range only. Percentiles are estimated from histogram buckets; missing data remains a gap. Prefill, Decode and Mesh measure different boundaries. Do not add their percentiles.";
+$("report-note").textContent="Units are shown per chart. Latency and batch distributions summarize the preceding "+META.window+" seconds; queue depths and KV utilization are sampled states. Zoom changes the displayed time range only. Percentiles are estimated from histogram buckets; missing data remains a gap. Decode request context points are exact first-decode values, one per request; use Data table or CSV for request IDs. Prefill, Decode and Mesh measure different boundaries. Do not add their percentiles.";
 $("errors").textContent=META.notes?.length?"Report notes: "+META.notes.join("；"):"";
 const statButtons={};
 for(const k of GLOBAL_STAT_KEYS){const b=node("button","chip");b.dataset.stat=k;b.append(node("i","dot"),node("span","",LABELS[k]));b.style.setProperty("--series",COLORS[k]);b.onclick=()=>{const on=!states.every(s=>s.visible.has(k)||!(s.p.series[k]||[]).some(v=>finite(v[1])));for(const s of states)if((s.p.series[k]||[]).some(v=>finite(v[1])))on?s.visible.add(k):s.visible.delete(k);refresh();};$("stat-controls").append(b);statButtons[k]=b;}
@@ -140,7 +142,7 @@ function buildPanel(s){
  setPanelScope(s);
  card.append(legend,s.shell,s.table,foot);$("chart-grid").append(card);s.card=card;
  function pointerTime(e){const r=s.canvas.getBoundingClientRect();return range[0]+Math.max(0,Math.min(1,(e.clientX-r.left-49)/(r.width-67)))*(range[1]-range[0]);}
- s.canvas.onpointermove=e=>{hoverTime=pointerTime(e);activePanel=s;for(const st of states)if(isShown(st))draw(st);};
+ s.canvas.onpointermove=e=>{hoverTime=pointerTime(e);s.hoverY=e.clientY-s.canvas.getBoundingClientRect().top;activePanel=s;for(const st of states)if(isShown(st))draw(st);};
  s.canvas.onpointerleave=()=>{if(s.dragStart===undefined){hoverTime=null;activePanel=null;for(const st of states)if(isShown(st))draw(st);}};
  s.canvas.onpointerdown=e=>{s.dragStart=pointerTime(e);s.canvas.setPointerCapture(e.pointerId);};
  s.canvas.onpointerup=e=>{const end=pointerTime(e),start=s.dragStart;delete s.dragStart;if(s.canvas.hasPointerCapture(e.pointerId))s.canvas.releasePointerCapture(e.pointerId);if(start!==undefined&&Math.abs(end-start)>(range[1]-range[0])*.025)setRange(Math.min(start,end),Math.max(start,end));else draw(s);};
@@ -162,7 +164,8 @@ function draw(s){
  const c=s.canvas,r=c.getBoundingClientRect(),w=r.width,h=r.height;if(!w||!h)return;
  const dpr=window.devicePixelRatio||1;c.width=Math.round(w*dpr);c.height=Math.round(h*dpr);const ctx=c.getContext("2d");ctx.scale(dpr,dpr);
  const left=49,right=w-18,top=24,bottom=h-31,pw=right-left,ph=bottom-top;
- const keys=STAT_KEYS.filter(k=>s.visible.has(k)),points=keys.flatMap(k=>(s.p.series[k]||[]).filter(p=>p[0]>=range[0]&&p[0]<=range[1]&&finite(p[1])));
+ const requests=s.p.kind==="requests"?requestRecords(s):null;
+ const keys=STAT_KEYS.filter(k=>s.visible.has(k)),points=requests?requests.map(r=>[r.timestamp,r.context_tokens]):keys.flatMap(k=>(s.p.series[k]||[]).filter(p=>p[0]>=range[0]&&p[0]<=range[1]&&finite(p[1])));
  const max=points.length?points.reduce((peak,p)=>Math.max(peak,p[1]),0):1;const rough=Math.max(max*1.12,0.01)/4;const magnitude=10**Math.floor(Math.log10(rough));const step=s.p.kind==="cache"?25:[1,2,2.5,5,10].map(v=>v*magnitude).find(v=>v>=rough)||rough;const ceiling=step*4;
  const x=t=>left+(t-range[0])/(range[1]-range[0])*pw,y=v=>bottom-v/ceiling*ph;
  ctx.font="10px -apple-system, sans-serif";ctx.textBaseline="middle";ctx.lineWidth=1;
@@ -170,20 +173,42 @@ function draw(s){
  ctx.fillStyle="#a1adc0";ctx.textAlign="left";ctx.font="9px -apple-system,sans-serif";ctx.fillText(s.p.unit,left,top-14);
  const ticks=w<380?3:4;ctx.font="9px -apple-system,sans-serif";for(let i=0;i<=ticks;i++){const t=range[0]+(range[1]-range[0])*i/ticks;ctx.textAlign=i===0?"left":i===ticks?"right":"center";ctx.fillText(utc(t),x(t),bottom+17);}
  ctx.save();ctx.beginPath();ctx.rect(left,top,pw,ph);ctx.clip();
+ s.hoveredRequest=null;
+ if(requests){
+  ctx.fillStyle=COLORS.running;let closest=14*14;
+  for(const record of requests){const px=x(record.timestamp),py=y(record.context_tokens);ctx.beginPath();ctx.arc(px,py,3,0,Math.PI*2);ctx.fill();
+   if(activePanel===s&&hoverTime!==null){const distance=(px-x(hoverTime))**2+(py-s.hoverY)**2;if(distance<closest){closest=distance;s.hoveredRequest=record;}}
+  }
+ }
  for(const k of keys){const list=s.p.series[k]||[];ctx.strokeStyle=COLORS[k];ctx.lineWidth=k==="p99"?2:1.8;ctx.lineJoin="round";ctx.setLineDash(k==="mean"?[4,3]:[]);ctx.beginPath();let begun=false,lastT=null;for(const [t,v] of list){if(!finite(v)){begun=false;lastT=null;continue;}if(lastT!==null&&t-lastT>META.step*1.6)begun=false;if(!begun){ctx.moveTo(x(t),y(v));begun=true;}else ctx.lineTo(x(t),y(v));lastT=t;}ctx.stroke();ctx.setLineDash([]);}
  if(s.dragStart!==undefined&&hoverTime!==null){ctx.fillStyle="#3864e812";ctx.fillRect(x(Math.min(s.dragStart,hoverTime)),top,Math.abs(x(s.dragStart)-x(hoverTime)),ph);}
  if(hoverTime!==null){ctx.strokeStyle="#bbc8dd";ctx.setLineDash([3,3]);ctx.beginPath();ctx.moveTo(x(hoverTime),top);ctx.lineTo(x(hoverTime),bottom);ctx.stroke();ctx.setLineDash([]);for(const k of keys){const p=near(s.p.series[k],hoverTime);if(p&&finite(p[1])){ctx.fillStyle=COLORS[k];ctx.beginPath();ctx.arc(x(p[0]),y(p[1]),3,0,Math.PI*2);ctx.fill();ctx.strokeStyle="white";ctx.lineWidth=1.5;ctx.stroke();}}}
- ctx.restore();s.empty.hidden=points.length>0;s.empty.textContent=!STAT_KEYS.some(k=>(s.p.series[k]||[]).some(p=>finite(p[1])))?"No samples collected for this metric":keys.length?"No data in this time range":"Select a statistic in the legend to show a series";
+ ctx.restore();s.empty.hidden=points.length>0;s.empty.textContent=requests?"No request context records in this time range":!STAT_KEYS.some(k=>(s.p.series[k]||[]).some(p=>finite(p[1])))?"No samples collected for this metric":keys.length?"No data in this time range":"Select a statistic in the legend to show a series";
  updateReading(s);
+ if(requests){
+  const record=s.hoveredRequest;s.tip.hidden=!record;
+  if(record){s.tip.replaceChildren(node("div","tooltip-time",requestTime(record.timestamp)+" UTC"),node("div","",record.request_id),node("strong","",fmtCount(record.context_tokens)+" tokens"),node("div","",record.instance),node("div","","Sequence "+record.sequence_id));s.tip.style.left=Math.min(Math.max(left,x(record.timestamp)+13),w-220)+"px";s.tip.style.top="35px";}
+  return;
+ }
  s.tip.hidden=activePanel!==s||hoverTime===null||!points.length;
  if(!s.tip.hidden){s.tip.replaceChildren(node("div","tooltip-time",utc(hoverTime)+" UTC"));for(const k of keys){const p=near(s.p.series[k],hoverTime),row=node("div","tooltip-row");row.style.setProperty("--series",COLORS[k]);row.append(node("i","dot"),node("span","",LABELS[k]),node("strong","",fmt(p?.[1])+" "+s.p.unit));s.tip.append(row);}s.tip.style.left=Math.min(Math.max(left,x(hoverTime)+13),w-155)+"px";s.tip.style.top="35px";}
 }
 function updateReading(s){
+ if(s.p.kind==="requests"){
+  const records=requestRecords(s),record=view==="chart"&&activePanel===s&&hoverTime!==null?s.hoveredRequest:records.at(-1);
+  s.value.replaceChildren(node("span","",fmtCount(record?.context_tokens)),node("small","","tokens"));s.stat.textContent=fmtCount(records.length)+" requests in range"+(record?" · "+record.request_id:"");return;
+ }
  const key=s.p.cache_breakdown?"reuse":[...STAT_KEYS].reverse().find(k=>s.visible.has(k));const point=key&&hoverTime!==null?near(s.p.series[key],hoverTime):null;const value=s.p.cache_breakdown?(s.p.series.reuse||[]).find(p=>p[0]===selectedCountTime(s))?.[1]:hoverTime!==null?point?.[1]:latest(s.p.series[key],range[1],range[0]);s.value.replaceChildren(node("span","",fmt(value)),node("small","",s.p.unit));s.stat.textContent=key?LABELS[key]+(hoverTime!==null?" · "+utc(hoverTime):" · Latest in range"):"No series selected";
 }
 function renderTable(s){
  updateBlockCounts(s);
  updateReading(s);
+ if(s.p.kind==="requests"){
+  const records=requestRecords(s),table=node("table"),head=node("thead"),hr=node("tr");
+  for(const label of ["First decode · UTC","Request ID","Context · tokens","Instance","Sequence ID"])hr.append(node("th","",label));head.append(hr);table.append(head);
+  const body=node("tbody");for(const record of records){const row=node("tr");for(const value of [requestTime(record.timestamp),record.request_id,fmtCount(record.context_tokens),record.instance,record.sequence_id])row.append(node("td","",value));body.append(row);}table.append(body);s.table.replaceChildren(table);
+  if(!records.length)s.table.append(node("div","nothing","No request context records in this time range"));return;
+ }
  const keys=STAT_KEYS.filter(k=>s.visible.has(k));
  const columns=keys.map(k=>({label:LABELS[k]+" · "+s.p.unit,points:s.p.series[k]||[],format:fmt}));
  const spec=countSpec(s.p);if(spec)spec.keys.forEach((k,i)=>columns.push({label:spec.labels[i]+" · "+spec.unit,points:s.p[spec.field]?.[k]||[],format:fmtCount}));
@@ -208,14 +233,15 @@ function refresh(){
  let column=1;
  for(const s of orderedStates.filter(s=>!pairedStates.has(s)&&isShown(s))){s.card.style.setProperty("--panel-row",row);s.card.style.setProperty("--panel-column",column);if(column===2)row++;column=3-column;}
  for(const k of GLOBAL_STAT_KEYS){const available=states.filter(s=>(s.p.series[k]||[]).some(v=>finite(v[1])));statButtons[k].disabled=!available.length;statButtons[k].setAttribute("aria-pressed",available.length>0&&available.every(s=>s.visible.has(k)));}
- for(const s of states){s.toggle.hidden=!(matchesRole(s)&&matchesCategory(s));s.source.textContent=s.p.label+" · "+(s.role==="overall"?"Global":s.scope||"All instances");s.footLabel.textContent=(s.p.kind&&s.p.kind!=="cache"?"Sampled state":"Window "+META.window+" s")+" · "+(s.scope||"Pooled across instances");s.toggle.setAttribute("aria-pressed",s.enabled);s.card.hidden=!isShown(s);s.shell.hidden=view!=="chart";s.table.hidden=view!=="table";for(const k of Object.keys(s.legends)){s.legends[k].setAttribute("aria-pressed",s.visible.has(k));s.legends[k].disabled=!(s.p.series[k]||[]).some(v=>finite(v[1]));}if(isShown(s)){if(view==="table")renderTable(s);else draw(s);}}
+ for(const s of states){s.toggle.hidden=!(matchesRole(s)&&matchesCategory(s));s.source.textContent=s.p.label+" · "+(s.role==="overall"?"Global":s.scope||"All instances");s.footLabel.textContent=(s.p.kind==="requests"?"First decode · one value per request":s.p.kind&&s.p.kind!=="cache"?"Sampled state":"Window "+META.window+" s")+" · "+(s.scope||"Pooled across instances");s.toggle.setAttribute("aria-pressed",s.enabled);s.card.hidden=!isShown(s);s.shell.hidden=view!=="chart";s.table.hidden=view!=="table";for(const k of Object.keys(s.legends)){s.legends[k].setAttribute("aria-pressed",s.visible.has(k));s.legends[k].disabled=!(s.p.series[k]||[]).some(v=>finite(v[1]));}if(isShown(s)){if(view==="table")renderTable(s);else draw(s);}}
 }
 $("export-csv").onclick=()=>{
- const rows=[["panel","statistic","timestamp_utc","value","unit","instance"]];
+ const rows=[["panel","statistic","timestamp_utc","value","unit","instance","request_id","sequence_id"]];
  for(const s of orderedStates.filter(isShown)){
+  if(s.p.kind==="requests"){for(const r of requestRecords(s))rows.push([s.p.title,"Context length",new Date(r.timestamp*1000).toISOString(),r.context_tokens,"tokens",r.instance,r.request_id,r.sequence_id]);continue;}
   const columns=STAT_KEYS.filter(k=>s.visible.has(k)).map(k=>({label:LABELS[k],unit:s.p.unit,points:s.p.series[k]||[]}));
   const spec=countSpec(s.p);if(spec)spec.keys.forEach((k,i)=>columns.push({label:spec.labels[i],unit:spec.unit,points:s.p[spec.field]?.[k]||[]}));
-  for(const c of columns)for(const [t,v] of c.points)if(t>=range[0]&&t<=range[1])rows.push([s.p.title,c.label,new Date(t*1000).toISOString(),finite(v)?v:"",c.unit,s.scope||"all"]);
+  for(const c of columns)for(const [t,v] of c.points)if(t>=range[0]&&t<=range[1])rows.push([s.p.title,c.label,new Date(t*1000).toISOString(),finite(v)?v:"",c.unit,s.scope||"all","",""]);
  }
  const quote=v=>'"'+String(v).replaceAll('"','""')+'"';
  const blob=new Blob(["\ufeff"+rows.map(r=>r.map(quote).join(",")).join("\r\n")],{type:"text/csv;charset=utf-8"});

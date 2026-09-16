@@ -256,7 +256,8 @@ def finalize_report(data: dict, status: dict, notes: list[str]) -> None:
     missing = [
         p["id"]
         for p in data["panels"]
-        if not any(
+        if not p.get("records")
+        and not any(
             any(v is not None for _, v in points) for points in p["series"].values()
         )
     ]

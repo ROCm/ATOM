@@ -105,15 +105,30 @@ Observed in each scheduler; exported per DP rank. All carry
 | `atom:prefill_context_tokens` | Histogram, tokens | Sum of the prefill rows' logical context lengths through the current chunk, including cached prefixes. One sample per real forward. |
 | `atom:prefill_request_context_tokens` | Histogram, tokens | Same quantity per prefill request row. Request-forward weighted; no padding, no TP multiplication. |
 | `atom:decode_context_tokens` | Histogram, tokens | Sum of the decode rows' logical sequence lengths per real forward. |
-| `atom:decode_request_context_tokens` | Histogram, tokens | Logical context length per decode request row on each forward. Request-forward weighted. |
+| `atom:decode_request_context_tokens` | Gauge, tokens | Exact logical context length at the first real decode dispatch. One sample per request sequence, preserved across preemption. Additional labels: `request_id`, `sequence_id`, `started_at` (Unix seconds). |
 | `atom:scheduler_requests` | Gauge, requests | Requests by scheduler state. Label `state`: `running`, `waiting` (excludes KV waits), `waiting_kv` (external KV load or shared-cache prefill wait). |
 | `atom:scheduler_kv_cache_blocks` | Gauge, blocks | KV block pool by state. Label `state`: `used`, `evictable`, `vacant`, `total`, where `used + evictable + vacant = total`. |
 
 Batch context histograms use fixed buckets through 8,589,934,592 tokens
 (1024 rows of 8,388,608 tokens). Per-request context buckets end at 8,388,608.
 This keeps long-context batch totals in finite buckets when computing
-percentiles. KV block partition counts are maintained as blocks change state;
-snapshot collection does not scan the free block pool.
+percentiles. Decode request contexts are exact gauges, not bucket estimates.
+KV block partition counts are maintained as blocks change state; snapshot
+collection does not scan the free block pool.
+
+The decode request context gauge replaces the former histogram of the same
+name; its `_bucket`, `_count`, and `_sum` series are no longer emitted. Reports
+show exact request points, a table, and CSV rows instead of P50/P99 curves. The
+`started_at` label records the first decode dispatch time, not the scrape time.
+Repeated scrapes produce one report row; requests from previous runs are excluded.
+A request that finishes during prefill without a decode dispatch has no sample.
+For `n > 1`, each generated sequence has its own `sequence_id` and sample.
+
+This is intentionally a per-request metric: series count grows with requests.
+Samples remain after request completion so even short requests can be scraped.
+Native multiprocess files retain them until the service's metrics directory is
+cleaned; there is no automatic per-request expiry. Use a fresh service/metrics
+directory between long benchmark runs when this accumulated cardinality matters.
 
 ### GPU forward timing
 

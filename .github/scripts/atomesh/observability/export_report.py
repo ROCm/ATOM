@@ -283,10 +283,12 @@ def panels_for(deployment: str) -> list[dict]:
         {
             "id": "decode_request_context_tokens",
             "role": role,
-            "title": "Decode request context tokens",
+            "title": "Decode request context length",
             "label": f"{role.upper()} · WORKLOAD",
-            "detail": "Logical context per request on every decode forward · request-forward weighted · no padding",
+            "detail": "One exact value per request at its first real decode dispatch · hover for request ID · no repeated samples after preemption",
+            "kind": "requests",
             "metric": "atom:decode_request_context_tokens",
+            "records": [],
             "selector": f'job="atom",role="{role}"',
             "unit": "tokens",
             "scale": 1,
@@ -319,6 +321,8 @@ def panels_for(deployment: str) -> list[dict]:
 
 
 def statistics_for(panel: dict):
+    if panel.get("kind") == "requests":
+        return ()
     if panel.get("kind") == "cache":
         return ("reuse", "lmcache", "gpu") if panel.get("cache_breakdown") else ("hit",)
     if panel.get("kind") == "queues":
@@ -451,6 +455,68 @@ def panel_queries(panel, window, *, by_instance=False):
             )
 
 
+def validate_request_context(record):
+    if not isinstance(record, dict):
+        raise TypeError("Request context must be an object")
+    for key in ("request_id", "sequence_id"):
+        if not isinstance(record.get(key), str) or not record[key]:
+            raise ValueError(f"Request context requires {key}")
+    if type(record.get("context_tokens")) is not int or record["context_tokens"] < 0:
+        raise ValueError("Request context requires nonnegative integer context_tokens")
+    t = record.get("timestamp")
+    if type(t) not in (int, float) or not math.isfinite(t):
+        raise ValueError("Request context requires a finite timestamp")
+
+
+def request_context_query(panel, start, end):
+    # Include every scrape in the run, even if a short-lived server disappeared
+    # between report points. started_at labels identify actual dispatch times.
+    window_ms = max(1, math.ceil((end - start) * 1000))
+    return (
+        "max by (instance, request_id, sequence_id, started_at) ("
+        f'max_over_time({panel["metric"]}{{{panel["selector"]}}}[{window_ms}ms]))'
+    )
+
+
+def fetch_request_context(url, query, start, end):
+    records = {}
+    for vector in _fetch_vectors(url, query, start, end, end - start):
+        labels = vector.get("metric", {})
+        if not all(
+            labels.get(k)
+            for k in ("instance", "request_id", "sequence_id", "started_at")
+        ):
+            continue
+        timestamp = float(labels["started_at"])
+        if not start <= timestamp <= end:
+            continue
+        values = [v for _, v in _points(vector) if v is not None]
+        if not values:
+            continue
+        value = values[-1]
+        if not value.is_integer() or value < 0:
+            raise ValueError("Request context must be a nonnegative integer")
+        record = {
+            "timestamp": timestamp,
+            "request_id": labels["request_id"],
+            "sequence_id": labels["sequence_id"],
+            "instance": labels["instance"],
+            "context_tokens": int(value),
+        }
+        validate_request_context(record)
+        key = (
+            record["instance"],
+            record["request_id"],
+            record["sequence_id"],
+            timestamp,
+        )
+        records[key] = record
+    return sorted(
+        records.values(),
+        key=lambda r: (r["timestamp"], r["instance"], r["sequence_id"]),
+    )
+
+
 def collect(args, *, diagnostics: list[str] | None = None) -> dict:
     panels = panels_for(args.deployment)
     errors = [] if diagnostics is None else diagnostics
@@ -460,6 +526,20 @@ def collect(args, *, diagnostics: list[str] | None = None) -> dict:
         pending = {}
         for panel in panels:
             panel["series"], panel["queries"], panel["instances"] = {}, {}, {}
+            if panel.get("kind") == "requests":
+                query = request_context_query(panel, args.start, args.end)
+                panel["queries"]["requests"] = query
+                aggregate_total += 1
+                pending[
+                    pool.submit(
+                        fetch_request_context,
+                        args.prometheus_url,
+                        query,
+                        args.start,
+                        args.end,
+                    )
+                ] = (panel, "records", "context", False)
+                continue
             for grouped in (False, True):
                 if grouped and panel["role"] == "overall":
                     continue
@@ -485,6 +565,14 @@ def collect(args, *, diagnostics: list[str] | None = None) -> dict:
             panel, field, statistic, grouped = pending[future]
             try:
                 result = future.result()
+                if field == "records":
+                    panel["records"] = result
+                    for record in result:
+                        scoped = panel["instances"].setdefault(
+                            record["instance"], {"series": {}, "records": []}
+                        )
+                        scoped["records"].append(record)
+                    continue
                 if grouped:
                     for instance, points in result.items():
                         scoped = panel["instances"].setdefault(instance, {"series": {}})
@@ -639,6 +727,21 @@ def demo_data() -> dict:
                         )
                     }
                 panel["instances"][instance] = scoped
+        if panel.get("kind") == "requests":
+            panel["records"] = []
+            for index, (instance, scoped) in enumerate(panel["instances"].items()):
+                scoped["records"] = [
+                    {
+                        "timestamp": start + 10 + i * 9 + index * 0.25,
+                        "request_id": f"demo-{index}-{i:03d}",
+                        "sequence_id": str(i),
+                        "context_tokens": rng.choice([1024, 8192, 32768, 65536]) + i,
+                        "instance": instance,
+                    }
+                    for i in range(60)
+                ]
+                panel["records"].extend(scoped["records"])
+            panel["records"].sort(key=lambda r: r["timestamp"])
     return {
         "meta": {
             "title": "Agentic inference report",
@@ -710,6 +813,23 @@ def validate_data(data: dict) -> None:
                 bundle.get("series"), dict
             ):
                 raise TypeError("Each panel or instance requires a series object")
+            if panel.get("kind") == "requests":
+                records = bundle.get("records", [])
+                if not isinstance(records, list):
+                    raise ValueError("Request context records must be an array")
+                previous = -math.inf
+                for record in records:
+                    validate_request_context(record)
+                    if (
+                        not isinstance(record.get("instance"), str)
+                        or not record["instance"]
+                    ):
+                        raise ValueError("Request context requires an instance")
+                    if record["timestamp"] < previous:
+                        raise ValueError(
+                            "Request context records must be sorted by timestamp"
+                        )
+                    previous = record["timestamp"]
             fields = [
                 ("series", STATISTICS.keys() | GAUGE_SERIES),
                 ("block_counts", {"used", "total"}),
