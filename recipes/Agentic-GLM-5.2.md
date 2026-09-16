@@ -288,8 +288,6 @@ python -m atom.entrypoints.openai_server \
   --method mtp \
   --spec-decode-acceptance-length "${MTP_AL}" \
   --max-num-batched-tokens 16384 \
-  --index_cache_dtype fp4 \
-  --block-size 64 \
   2>&1 | tee "server-glm52-mtp${MTP_K}-c${CONC}.log"
 ```
 
@@ -381,8 +379,6 @@ python -m atom.entrypoints.openai_server \
   --method mtp \
   --spec-decode-acceptance-length "${MTP_AL}" \
   --max-num-batched-tokens 16384 \
-  --index_cache_dtype fp4 \
-  --block-size 64 \
   2>&1 | tee "server-glm52-dcp${DCP}-tp${TP}-mtp${MTP_K}-c${CONC}.log"
 ```
 
