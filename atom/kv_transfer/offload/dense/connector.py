@@ -331,9 +331,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         mask = torch.ones(len(toks), dtype=torch.bool)
         mask[:skip] = False
 
-        t_tok0 = time.perf_counter()
         tok_tensor = tokens_to_tensor(toks)
-        tok_ms = (time.perf_counter() - t_tok0) * 1000
         t_store0 = time.perf_counter()
         self._reset_gpu_connector_transfer_stats()
         gpu_connector = self._engine.gpu_connector
@@ -361,9 +359,6 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 "gpu_staging_buffer_chunks=%d gpu_staging_buffer_bytes=%d "
                 "total_bytes=%d pack_ms=%.2f copy_ms=%.2f sync_ms=%.2f "
                 "transfer_ms=%.2f effective_gbps=%.2f "
-                "gpu_span_ms=%.2f issue_pack_ms=%.2f issue_copy_ms=%.2f "
-                "prepare_ms=%.2f from_gpu_ms=%.2f tok_ms=%.2f "
-                "xfer_calls=%d "
                 "store_ms=%.2f total_ms=%.2f",
                 getattr(self, "_rank", "?"),
                 req.req_id,
@@ -382,13 +377,6 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 float(transfer_stats.get("sync_ms", 0.0)),
                 float(transfer_stats.get("transfer_ms", 0.0)),
                 float(transfer_stats.get("effective_gbps", 0.0)),
-                float(transfer_stats.get("gpu_span_ms", 0.0)),
-                float(transfer_stats.get("issue_pack_ms", 0.0)),
-                float(transfer_stats.get("issue_copy_ms", 0.0)),
-                float(transfer_stats.get("prepare_ms", 0.0)),
-                float(transfer_stats.get("from_gpu_ms", 0.0)),
-                tok_ms,
-                int(transfer_stats.get("calls", 0)),
                 store_ms,
                 total_ms,
             )
