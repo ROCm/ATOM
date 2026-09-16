@@ -195,6 +195,12 @@ jobs:
     name: Build and publish the wheels
     needs: prepare
     if: ${{ needs.prepare.outputs.should_run == 'true' }}
+    # A called workflow gets the permissions the caller grants it: its own
+    # `permissions: contents: write` cannot raise what this file's top-level
+    # `contents: read` hands down. Without this the build would run and the
+    # publish job would then fail to push the tag or create the release.
+    permissions:
+      contents: write
     uses: ./.github/workflows/atom-release.yaml
     secrets: inherit
     with:
