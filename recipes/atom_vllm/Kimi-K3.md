@@ -1,9 +1,9 @@
 # Kimi-K3 with ATOM vLLM Plugin Backend
 
-This recipe serves the text-only Kimi-K3 backbone
-(`KimiK3ForConditionalGeneration`) through the ATOM vLLM out-of-tree plugin.
-Kimi-K3 combines KDA recurrent-attention layers, MLA full-attention layers, and
-an MXFP4 latent MoE.
+This recipe serves multimodal Kimi-K3 (`KimiK3ForConditionalGeneration`)
+through the ATOM vLLM out-of-tree plugin. Kimi-K3 combines a MoonViT3d vision
+tower with KDA recurrent-attention layers, MLA full-attention layers, and an
+MXFP4 latent MoE.
 
 The validated configuration requires eight MI355 (gfx950) GPUs with TP8.
 
@@ -32,7 +32,6 @@ vllm serve "${MODEL}" \
     --port 8000 \
     --tensor-parallel-size 8 \
     --trust-remote-code \
-    --language-model-only \
     --kv-cache-dtype fp8 \
     --max-model-len 16384 \
     --max-num-seqs 64 \
@@ -142,7 +141,8 @@ Avg draft acceptance rate:   86.1%, 86.1%  (whole run, each of the two)
 
 ## Current scope
 
-- Text generation only; the vision tower and multimodal projector are skipped.
+- Text and image inputs are supported through the Kimi-K3 multimodal processor,
+  vision tower, and projector.
 - TP8 on MI355/gfx950 is the validated deployment.
 - Asynchronous scheduling is supported. Prefix caching is off by default and
   needs `--mamba-cache-mode align` to be turned on, as the DSpark launch does.

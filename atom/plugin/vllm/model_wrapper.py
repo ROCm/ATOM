@@ -507,7 +507,16 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                 else:
                     self.model = model_cls(self.atom_config)
         else:
-            self.model = model_cls(self.atom_config)
+            if model_arch == "KimiK3ForConditionalGeneration":
+                # Kimi-K3's inner class inherits vLLM SupportsQuant. Passing
+                # VllmConfig lets that protocol apply its quant mapper and
+                # packed-module mappings before the vision modules are built.
+                self.model = model_cls(
+                    self.atom_config,
+                    vllm_config=vllm_config,
+                )
+            else:
+                self.model = model_cls(self.atom_config)
 
         num_patched_post_load_hooks = _patch_required_act_dtype_post_load_hooks(
             self.model,

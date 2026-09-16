@@ -54,7 +54,7 @@ class AsyncLLMEngine(LLMEngine):
 
         logger.info("AsyncLLMEngine sleep: completed")
 
-    def wake_up(self, tags: list[str] | None = None):
+    def wake_up(self, tags: list[str] = None):
         """Restore GPU resources.
 
         Args:
