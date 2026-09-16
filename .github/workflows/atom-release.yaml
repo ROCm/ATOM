@@ -146,7 +146,10 @@ jobs:
 
     env:
       BUILD_REF: ${{ inputs.commit || github.ref }}
-      BUILD_IMAGE: ${{ inputs.build_image || (matrix.flavor == 'rocm10' && 'rocm/atom-dev:latest-rocm10' || 'rocm/atom-dev:latest') }}
+      # latest-rocm10.0, not latest-rocm10: the nightly workflow reads the
+      # suffix out of the image it built, so the rolling tag for a line names
+      # the ROCm it carries. Bare latest stays the stable line's.
+      BUILD_IMAGE: ${{ inputs.build_image || (matrix.flavor == 'rocm10' && 'rocm/atom-dev:latest-rocm10.0' || 'rocm/atom-dev:latest') }}
       ADD_DATE_STAMP: ${{ inputs.add_date_stamp || false }}
       DRAFT: ${{ inputs.draft || false }}
 
@@ -385,6 +388,20 @@ jobs:
       - name: Check the set is complete
         run: |
           set -euo pipefail
+          # release_tag comes off a matrix job, so what lands here is whichever
+          # flavor finished last. Every flavor derives it from the same commit
+          # with the local segment stripped, so they agree by construction --
+          # but nothing enforces that, and an empty value would otherwise
+          # create a release named "v". Check rather than trust.
+          if [ -z "${RELEASE_TAG}" ]; then
+            echo "No release tag came back from the build jobs."
+            exit 1
+          fi
+          case "${RELEASE_TAG}" in
+            v[0-9]*) ;;
+            *) echo "Unexpected release tag '${RELEASE_TAG}'; expected vX.Y.Z."; exit 1 ;;
+          esac
+          echo "Release tag: ${RELEASE_TAG}"
           # Publishing is deliberately a separate job: a release that carries
           # only some of its flavors looks finished from the outside, and
           # whoever pulls the missing one silently gets another line's wheel.
