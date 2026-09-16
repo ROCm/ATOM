@@ -354,12 +354,14 @@ class Qwen4ExpAttention(nn.Module):
             k.view(num_tokens, self.num_kv_heads, self.head_dim),
         )
         value = v.view(num_tokens, self.num_kv_heads, self.head_dim)
-        qsa = get_forward_context().attn_metadata.qsa_metadata
+        forward_context = get_forward_context()
+        qsa = forward_context.attn_metadata.qsa_metadata
         if qsa is None:
             attn_out = self._profile_attention(
                 query, key, value, hidden_states, positions
             )
         else:
+            qsa = qsa.for_tokens(num_tokens)
             aiter.reshape_and_cache_flash(
                 key,
                 value,
@@ -379,6 +381,11 @@ class Qwen4ExpAttention(nn.Module):
                 qsa.block_tables,
                 qsa.token_to_req,
                 softmax_scale=self.scaling,
+                num_decode_requests=(
+                    None
+                    if forward_context.context.is_prefill
+                    else qsa.block_tables.shape[0]
+                ),
             )
 
         gated = sigmoid_mul(attn_out.reshape(num_tokens, -1), gate)

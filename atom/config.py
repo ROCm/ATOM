@@ -1158,6 +1158,7 @@ class SpeculativeConfig:
         "qwen3_5_moe": "qwen3_5_mtp",
         "qwen3_5_text": "qwen3_5_mtp",
         "qwen3_5_moe_text": "qwen3_5_mtp",
+        "qwen4_exp_text": "qwen4_exp_mtp",
         "mimo_v2": "mimo_v2_mtp",
         "mimo_v2_flash": "mimo_v2_mtp",
     }
@@ -1168,6 +1169,7 @@ class SpeculativeConfig:
         "deepseek_v4_mtp": ("num_nextn_predict_layers", "DeepseekV4MTPModel"),
         "qwen3_next_mtp": ("num_nextn_predict_layers", "Qwen3NextMTPModel"),
         "qwen3_5_mtp": ("mtp_num_hidden_layers", "Qwen3_5MTPModel"),
+        "qwen4_exp_mtp": ("mtp_num_hidden_layers", "Qwen4ExpMTPModel"),
     }
 
     def use_dspark(self) -> bool:
