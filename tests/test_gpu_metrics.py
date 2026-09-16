@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import pytest
 from metrics_helpers import histogram_values, histogram_values_by_name
 
+from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
 from atom.model_engine.engine_utility import EngineUtilityHandler
-from atom.model_engine.gpu_metrics import GPUForwardMetrics, record_gpu_forward
 
 
 class Event:
@@ -238,7 +238,7 @@ def test_step_buckets_match_the_pooled_forward_modes():
     from prometheus_client.parser import text_string_to_metric_families
 
     from atom.entrypoints.openai.metrics_setup import create_metrics_exporter
-    from atom.utils.histogram import LATENCY_BUCKETS
+    from atom.metrics.histogram import LATENCY_BUCKETS
 
     registry = CollectorRegistry()
     reference = Histogram(

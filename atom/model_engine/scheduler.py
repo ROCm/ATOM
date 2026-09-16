@@ -31,10 +31,10 @@ import numpy as np
 
 from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput
+from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.request import RequestOutput
-from atom.model_engine.scheduler_metrics import SchedulerMetrics
 from atom.model_engine.sequence import (
     Sequence,
     SequenceStatus,

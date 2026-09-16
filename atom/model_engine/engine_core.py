@@ -14,11 +14,11 @@ import zmq
 from atom.config import Config, ParallelConfig
 from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
+from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
-from atom.model_engine.scheduler_metrics import SchedulerMetrics
 from atom.model_engine.sequence import (
     Sequence,
     SequenceStatus,

@@ -274,6 +274,10 @@ process supervisor to call `mark_process_dead(pid)` after that process exits.
 Validate device-derived values at the measurement boundary with diagnostic
 context, rather than silently discarding them in a generic histogram.
 
+The `atom.metrics` package contains scheduler and GPU instruments and shared
+histogram helpers. Schedulers and model runners own the instrument instances
+and trigger observations; entrypoints initialize storage and expose metrics.
+
 | Module | Responsibility |
 | --- | --- |
 | `entrypoints/metrics.py` | Node-local directory lifetime and worker-node HTTP endpoint. |
@@ -281,7 +285,7 @@ context, rather than silently discarding them in a generic histogram.
 | `entrypoints/openai/metrics.py` | Existing state metrics, snapshot cache and async rendering. |
 | `entrypoints/openai/request_timing.py` | Request TTFT observations. |
 | `entrypoints/openai/streaming_dispatch.py` | Token-weighted ITL and stream silence. |
-| `model_engine/scheduler_metrics.py` | Scheduler observations using standard Histograms. |
-| `model_engine/gpu_metrics.py` | Bounded device-event lifecycle and standard Histograms. |
-| `utils/histogram.py` | Shared latency bounds and the weighted ITL extension. |
+| `metrics/scheduler.py` | Scheduler observations using standard Histograms. |
+| `metrics/gpu.py` | Bounded device-event lifecycle and standard Histograms. |
+| `metrics/histogram.py` | Shared latency bounds and the weighted ITL extension. |
 | `.github/scripts/atomesh/observability/` | Prometheus collection and HTML reporting. |

@@ -673,7 +673,7 @@ class StreamMetrics:
     """Delivery metrics owned by the API stream dispatcher."""
 
     def __init__(self, registry):
-        from atom.utils.histogram import WeightedHistogram
+        from atom.metrics.histogram import WeightedHistogram
 
         self._inter_token_latency = WeightedHistogram(
             "atom:inter_token_latency_seconds",

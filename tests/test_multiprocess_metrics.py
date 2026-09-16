@@ -14,8 +14,8 @@ import pytest
 def _observe(rank):
     from test_gpu_metrics import Event, complete_event, prefill_batch
 
-    from atom.model_engine.gpu_metrics import GPUForwardMetrics
-    from atom.model_engine.scheduler_metrics import SchedulerMetrics
+    from atom.metrics.gpu import GPUForwardMetrics
+    from atom.metrics.scheduler import SchedulerMetrics
 
     scheduler = SchedulerMetrics(rank, "prefill")
     for _ in range(5):
@@ -153,7 +153,7 @@ def test_request_context_survives_workers_and_repeated_metrics_scrapes(
 import sys
 from types import SimpleNamespace
 from prometheus_client import values
-from atom.model_engine.scheduler_metrics import SchedulerMetrics
+from atom.metrics.scheduler import SchedulerMetrics
 
 assert values.ValueClass._multiprocess
 rank = int(sys.argv[1])

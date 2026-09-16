@@ -9,7 +9,7 @@ from functools import wraps
 
 from prometheus_client import Histogram
 
-from atom.utils.histogram import LATENCY_BUCKETS
+from atom.metrics.histogram import LATENCY_BUCKETS
 
 logger = logging.getLogger("atom")
 

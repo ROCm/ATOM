@@ -20,7 +20,7 @@ from prometheus_client import (
     generate_latest,
 )
 
-from atom.model_engine.scheduler_metrics import TOKEN_BUCKETS
+from atom.metrics.scheduler import TOKEN_BUCKETS
 
 SCRIPTS = Path(__file__).resolve().parents[1] / ".github/scripts/atomesh/observability"
 

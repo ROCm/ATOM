@@ -13,7 +13,7 @@ from dataclasses import dataclass
 import numpy as np
 from prometheus_client import Gauge, Histogram
 
-from atom.utils.histogram import LATENCY_BUCKETS
+from atom.metrics.histogram import LATENCY_BUCKETS
 
 BATCH_BUCKETS = (1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 512, 1024)
 TOKEN_BUCKETS = (

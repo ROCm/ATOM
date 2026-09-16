@@ -14,18 +14,16 @@ from prometheus_client.utils import floatToGoString
 
 from atom.entrypoints.openai.metrics_setup import create_metrics_exporter
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
+from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import DecodeScheduler, Scheduler
-from atom.model_engine.scheduler_metrics import SchedulerMetrics
 from atom.model_engine.sequence import Sequence, SequenceStatus
 
 
 @pytest.fixture
 def clock(monkeypatch):
     now = [100.0]
-    monkeypatch.setattr(
-        "atom.model_engine.scheduler_metrics.time.perf_counter", lambda: now[0]
-    )
+    monkeypatch.setattr("atom.metrics.scheduler.time.perf_counter", lambda: now[0])
     return now
 
 
@@ -529,7 +527,7 @@ def test_prefill_context_records_full_prompt_once_and_chunk_batch_totals(monkeyp
     seqs = {seq.id: seq for seq in (decode, first, second)}
     for seq in seqs.values():
         metrics.enqueue(seq)
-    monkeypatch.setattr("atom.model_engine.scheduler_metrics.time.time", lambda: 100.25)
+    monkeypatch.setattr("atom.metrics.scheduler.time.time", lambda: 100.25)
     scheduled = ScheduledBatch(
         seqs,
         [1, 3, 4],
@@ -630,7 +628,7 @@ def test_decode_request_context_gauge_records_first_dispatch_once(monkeypatch):
     }
     for i in (1, 2):
         metrics.enqueue(seqs[i])
-    monkeypatch.setattr("atom.model_engine.scheduler_metrics.time.time", lambda: 100.25)
+    monkeypatch.setattr("atom.metrics.scheduler.time.time", lambda: 100.25)
     mixed = SimpleNamespace(
         req_ids=[1, 2, 3],
         is_dummy_run=False,

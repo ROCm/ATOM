@@ -4,7 +4,7 @@ import pytest
 from prometheus_client import CollectorRegistry, Histogram, generate_latest
 from prometheus_client.parser import text_string_to_metric_families
 
-from atom.utils.histogram import WeightedHistogram
+from atom.metrics.histogram import WeightedHistogram
 
 
 def samples(registry):
