@@ -2508,6 +2508,14 @@ class DeepseekV4Attention(nn.Module):
                 shuffle_weights(w, layout=(16, 16))
             # Cached as module attrs so the forward skips the reshape and the
             # scale conversion on every call.
+            #
+            # A VIEW of the live parameter, and `shuffle_weights` now writes
+            # through the storage rather than rebinding it, so this tracks the
+            # bytes rather than pinning the ones it was built from. That is why
+            # it is taken AFTER the shuffle above: built before, it would have
+            # named the same bytes in the wrong layout. Nothing shuffles this
+            # weight again -- `quant_type` is set to `No` below, which is also
+            # what a weight sync reads -- so tracking is what is wanted here.
             self._wo_a_w_fp8 = w.data.view(G, N, K)
             self._wo_a_w_scale = w_scale
             self._wo_a_mxscale = True

@@ -100,6 +100,18 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
         the sampler reaches them and can return an id the tokenizer cannot
         decode. Training frameworks mask them on their side; a rollout engine
         that does not disagrees with the trainer over exactly those positions.
+
+        This covers the decode sampling path, which is every token a colocated
+        rollout generates. Two other places reach a sampler without coming
+        through here, and are NOT covered:
+
+        * ``ModelRunner.prefill_forward`` samples the first token itself, for
+          the disaggregated prefill worker to hand to a decode engine.
+        * ``compute_argmax_token`` is greedy over a TP-SHARDED vocab, reducing
+          each rank's shard to ``(max, global_idx)``. Masking it needs the shard
+          offset, so it belongs with that reduction rather than here; a drafter
+          proposing a tail id is then rejected by the verify step above, but the
+          argmax a verify step compares against comes from the same function.
         """
         if self._true_vocab_size > 0 and logits.shape[-1] > self._true_vocab_size:
             logits[..., self._true_vocab_size :] = float("-inf")

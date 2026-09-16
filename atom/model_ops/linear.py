@@ -1253,7 +1253,13 @@ class ColumnParallelLinear(LinearBase):
 
         view = copy.copy(self)
         # nn.Module bookkeeping is shared by the shallow copy; give the view its
-        # own parameter dict so rebinding weight/scale cannot disturb `self`.
+        # own parameter dict so binding weight/scale on the view cannot disturb
+        # `self`. It does NOT isolate the bytes and is not meant to: the view
+        # narrows `self.weight.data`, so an in-place write to the parent -- a
+        # weight sync, or `shuffle_weights`, which no longer rebinds -- is seen
+        # through it. `_local_q_proj` is the only caller and rebuilds the view on
+        # every call anyway (its `is not` guard compares two `param.data`
+        # objects, and that attribute hands back a fresh one each access).
         view._parameters = dict(self._parameters)
         view.weight = nn.Parameter(
             self.weight.data.narrow(0, start, length), requires_grad=False
