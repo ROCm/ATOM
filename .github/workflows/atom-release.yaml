@@ -309,7 +309,10 @@ jobs:
             bash -c "
               set -e
               python3 -m pip install --force-reinstall --no-deps dist/atom-*.whl
-              cd /tmp && python3 -c 'import atom; print(\"atom import ok:\", atom.__file__, atom.__version__)'
+              # importlib.metadata, not atom.__version__: atom's __getattr__
+              # raises AttributeError for anything but LLMEngine, so reading
+              # atom.__version__ failed this step on every wheel ever built.
+              cd /tmp && python3 -c 'import atom; from importlib.metadata import version; print(\"atom import ok:\", atom.__file__, version(\"atom\"))'
               python3 -c 'import atom.mesh; print(\"atom.mesh import ok\")' || echo 'note: atom.mesh python import not required (cdylib only)'
             "
 
