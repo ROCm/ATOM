@@ -394,3 +394,107 @@ class TestResponseModels:
             error={"message": "Not found", "type": "invalid_request_error", "code": 404}
         )
         assert err.error["message"] == "Not found"
+
+
+# ============================================================================
+# Pre-tokenized prompts (PD decode reuses the prefill node's token ids)
+# ============================================================================
+
+
+class TestPromptTokenIds:
+    """Tests for `resolve_prompt_token_ids` and its two wire locations."""
+
+    @staticmethod
+    def _chat(**kwargs) -> ChatCompletionRequest:
+        return ChatCompletionRequest(
+            messages=[ChatMessage(role="user", content="hi")], **kwargs
+        )
+
+    def test_absent_means_render_and_tokenize(self):
+        assert self._chat().get_prompt_token_ids() is None
+        assert CompletionRequest(prompt="hi").get_prompt_token_ids() is None
+
+    def test_top_level_field(self):
+        assert self._chat(prompt_token_ids=[1, 2, 3]).get_prompt_token_ids() == [
+            1,
+            2,
+            3,
+        ]
+
+    def test_kv_transfer_params_location(self):
+        # vLLM's disaggregated-prefill shape: a proxy written against vLLM must
+        # be able to drive an ATOM decode node unchanged.
+        request = self._chat(
+            kv_transfer_params={"do_remote_prefill": True, "prompt_token_ids": [4, 5]}
+        )
+        assert request.get_prompt_token_ids() == [4, 5]
+
+    def test_both_locations_agreeing_is_fine(self):
+        request = self._chat(
+            prompt_token_ids=[9, 9],
+            kv_transfer_params={"prompt_token_ids": [9, 9]},
+        )
+        assert request.get_prompt_token_ids() == [9, 9]
+
+    def test_both_locations_disagreeing_is_rejected(self):
+        request = self._chat(
+            prompt_token_ids=[1],
+            kv_transfer_params={"prompt_token_ids": [2]},
+        )
+        with pytest.raises(ValueError, match="disagree"):
+            request.get_prompt_token_ids()
+
+    def test_empty_is_rejected(self):
+        # Distinct from absent: someone meant to send a prompt and sent none.
+        with pytest.raises(ValueError, match="empty"):
+            self._chat(prompt_token_ids=[]).get_prompt_token_ids()
+
+    @pytest.mark.parametrize("bad", ["5,6", 7, [-1], ["a"], [None], {"a": 1}])
+    def test_unvalidated_kv_location_rejects_non_token_ids(self, bad):
+        # The top-level field is typed, so pydantic guards it. This location is
+        # inside an untyped dict and has to be checked here.
+        request = self._chat(kv_transfer_params={"prompt_token_ids": bad})
+        with pytest.raises(ValueError, match="non-negative integers"):
+            request.get_prompt_token_ids()
+
+    def test_completion_prompt_or_tokens_prefers_ids(self):
+        request = CompletionRequest(prompt="ignored", prompt_token_ids=[1, 2])
+        assert request.get_prompt_or_tokens() == [1, 2]
+
+    def test_completion_prompt_or_tokens_falls_back_to_text(self):
+        assert CompletionRequest(prompt="hi").get_prompt_or_tokens() == "hi"
+
+    def test_completion_requires_one_of_the_two(self):
+        with pytest.raises(ValueError, match="'prompt' or 'prompt_token_ids'"):
+            CompletionRequest().get_prompt_or_tokens()
+
+    def test_responses_carry_prompt_token_ids(self):
+        usage = {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
+        chat = ChatCompletionResponse(
+            id="chatcmpl-1",
+            created=int(time.time()),
+            model="m",
+            choices=[],
+            usage=usage,
+            prompt_token_ids=[1, 2],
+        )
+        completion = CompletionResponse(
+            id="cmpl-1",
+            created=int(time.time()),
+            model="m",
+            choices=[],
+            usage=usage,
+            prompt_token_ids=[1, 2],
+        )
+        assert chat.model_dump()["prompt_token_ids"] == [1, 2]
+        assert completion.model_dump()["prompt_token_ids"] == [1, 2]
+
+    def test_responses_omit_prompt_token_ids_by_default(self):
+        resp = CompletionResponse(
+            id="cmpl-2",
+            created=int(time.time()),
+            model="m",
+            choices=[],
+            usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        )
+        assert resp.prompt_token_ids is None

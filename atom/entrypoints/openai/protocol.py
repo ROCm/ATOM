@@ -7,7 +7,14 @@ import json
 import time
 from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    NonNegativeInt,
+    TypeAdapter,
+    ValidationError,
+)
 
 # ============================================================================
 # Constants
@@ -33,6 +40,55 @@ def validate_max_tokens(max_tokens: int) -> int:
     if max_tokens < 1:
         raise ValueError(f"max_tokens must be at least 1, got {max_tokens}")
     return max_tokens
+
+
+#: An already-tokenized prompt. Validated by pydantic-core rather than a Python
+#: loop: the prompts this exists for run to tens of thousands of tokens, and
+#: the whole point is to be cheaper than tokenizing them.
+PromptTokenIds = list[NonNegativeInt]
+_PROMPT_TOKEN_IDS_ADAPTER = TypeAdapter(PromptTokenIds)
+
+
+def resolve_prompt_token_ids(
+    prompt_token_ids: PromptTokenIds | None,
+    kv_transfer_params: dict[str, Any] | None,
+) -> PromptTokenIds | None:
+    """The request's pre-tokenized prompt, from either wire location.
+
+    Two locations because two kinds of caller put it in different places. The
+    top-level ``prompt_token_ids`` is the general form, for any client that has
+    already tokenized and wants the server not to do it again.
+    ``kv_transfer_params["prompt_token_ids"]`` is where vLLM's disaggregated
+    prefill protocol carries it, so a vLLM-shaped proxy can drive an ATOM
+    decode node without knowing it is not talking to vLLM.
+
+    Both present and disagreeing is rejected rather than settled by precedence.
+    These ids decide which KV blocks the P->D transfer is expected to fill, so
+    choosing one of two different prompts does not degrade the request, it
+    silently answers a question nobody asked.
+    """
+    from_kv = (kv_transfer_params or {}).get("prompt_token_ids")
+    if prompt_token_ids is None and from_kv is None:
+        return None
+
+    if from_kv is not None:
+        try:
+            from_kv = _PROMPT_TOKEN_IDS_ADAPTER.validate_python(from_kv)
+        except ValidationError as e:
+            raise ValueError(
+                "kv_transfer_params['prompt_token_ids'] must be a list of "
+                f"non-negative integers: {e.errors()[0]['msg']}"
+            ) from e
+        if prompt_token_ids is not None and from_kv != prompt_token_ids:
+            raise ValueError(
+                "prompt_token_ids and kv_transfer_params['prompt_token_ids'] "
+                "disagree; a request cannot carry two different prompts"
+            )
+
+    ids = prompt_token_ids if prompt_token_ids is not None else from_kv
+    if not ids:
+        raise ValueError("prompt_token_ids was given but is empty")
+    return ids
 
 
 def openai_stop_reason(finish_reason: str | None) -> str | None:
@@ -224,6 +280,19 @@ class ChatCompletionRequest(BaseModel):
     # Optional KV-transfer metadata for P/D disaggregation.
     kv_transfer_params: dict[str, Any] | None = None
     data_parallel_rank: int | None = None
+    # An already-rendered, already-tokenized prompt. When present, `messages`
+    # is still required (and still validated) but is not rendered or tokenized
+    # -- see `resolve_prompt_token_ids`. This is how a PD decode node avoids
+    # repeating the template render and tokenize the prefill node already did.
+    prompt_token_ids: PromptTokenIds | None = None
+    # Ask for this request's prompt token ids back on the response, so the
+    # caller can hand them to a second node. Non-streaming only; n > 1 is
+    # fine because siblings share one prompt.
+    return_token_ids: bool | None = None
+
+    def get_prompt_token_ids(self) -> PromptTokenIds | None:
+        """This request's pre-tokenized prompt, or None to render+tokenize."""
+        return resolve_prompt_token_ids(self.prompt_token_ids, self.kv_transfer_params)
 
     def get_max_tokens(self) -> int:
         """Return the effective generation cap for OpenAI chat requests."""
@@ -249,7 +318,10 @@ class CompletionRequest(BaseModel):
     model_config = {"extra": "ignore"}
 
     model: str | None = None
-    prompt: str
+    # Optional only because `prompt_token_ids` is the other way to supply the
+    # prompt; exactly one of the two is required, enforced by
+    # `get_prompt_or_tokens`.
+    prompt: str | None = None
     temperature: float | None = DEFAULT_TEMPERATURE
     top_k: int | None = DEFAULT_TOP_K
     top_p: float | None = DEFAULT_TOP_P
@@ -263,6 +335,27 @@ class CompletionRequest(BaseModel):
     # Optional DPA routing hint inserted by atomesh for DP-aware workers.
     data_parallel_rank: int | None = None
     n: int | None = 1
+    # See `ChatCompletionRequest` for both of these.
+    prompt_token_ids: PromptTokenIds | None = None
+    return_token_ids: bool | None = None
+
+    def get_prompt_token_ids(self) -> PromptTokenIds | None:
+        """This request's pre-tokenized prompt, or None to tokenize `prompt`."""
+        return resolve_prompt_token_ids(self.prompt_token_ids, self.kv_transfer_params)
+
+    def get_prompt_or_tokens(self) -> "str | PromptTokenIds":
+        """The prompt in whichever form the client supplied it.
+
+        Token ids win when both are present: a caller that went to the trouble
+        of sending ids sent them to be used, and `resolve_prompt_token_ids` has
+        already rejected the case where they contradict a sibling copy.
+        """
+        ids = self.get_prompt_token_ids()
+        if ids is not None:
+            return ids
+        if self.prompt is None:
+            raise ValueError("either 'prompt' or 'prompt_token_ids' is required")
+        return self.prompt
 
     def get_max_tokens(self) -> int:
         """Return the effective generation cap for completion requests."""
@@ -288,6 +381,8 @@ class ChatCompletionResponse(BaseModel):
     choices: list[dict[str, Any]]
     usage: dict[str, Any]
     kv_transfer_params: dict[str, Any] | None = None
+    # Echoed back only when the request set `return_token_ids`.
+    prompt_token_ids: PromptTokenIds | None = None
 
     model_config = ConfigDict(extra="allow")
 
@@ -303,6 +398,8 @@ class CompletionResponse(BaseModel):
     usage: dict[str, Any]
     # Optional KV-transfer metadata returned for P/D disaggregation.
     kv_transfer_params: dict[str, Any] | None = None
+    # Echoed back only when the request set `return_token_ids`.
+    prompt_token_ids: PromptTokenIds | None = None
 
 
 class ModelCard(BaseModel):
