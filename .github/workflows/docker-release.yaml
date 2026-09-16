@@ -14,7 +14,7 @@ on:
         type: boolean
         default: true
       base_image_override:
-        description: "Build one literal base image instead of the lines above. Example: rocm/pytorch:latest. Publishes under a suffix read from the image."
+        description: "Build one other base instead of the lines above: rocm7-py310 (ubuntu22.04/py3.10), rocm7-latest (rocm/pytorch:latest), or any literal image reference. Publishes under a suffix read from the image."
         default: ""
       atom_repo:
         description: "ATOM repo"
