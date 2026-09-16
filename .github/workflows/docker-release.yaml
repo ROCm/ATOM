@@ -5,25 +5,17 @@ on:
     - cron: '48 13 * * *'  # Every day at 21:48 Beijing Time (UTC+8)
   workflow_dispatch:
     inputs:
-      base_image:
-        description: "Base Docker image for ATOM build"
-        type: choice
-        default: "rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0"
-        options:
-          - rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0
-          - rocm/pytorch:latest
-          - rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.10.0
-          # rocm10: builds on the rocm10-base stage in atom_release.dockerfile
-          # (ubuntu:24.04 + AMD stable wheel channel 10.0.0, the TheRock pip
-          # distribution). Published tags carry a -rocm10 suffix; latest /
-          # sglang-latest are NOT updated (the ROCm 7 line stays the default).
-          - rocm10
-          # rocm101-nightly: 10.1 tracking line (nightly channel, date-stamped
-          # 10.1.0a<date> wheels). Build + golden test only, nothing is pushed
-          # to Docker Hub — it exists to surface 10.1 breaks before GA
-          # (2026-10-05). Once 10.1 RC/GA lands on the stable channel, build
-          # with plain rocm10 instead and retire this option.
-          - rocm101-nightly
+      build_rocm7:
+        description: "Build the ROCm 7 line for manual runs (scheduled nightly runs always build every live line; default enabled)"
+        type: boolean
+        default: true
+      build_rocm10:
+        description: "Build the ROCm 10 line for manual runs (scheduled nightly runs always build every live line; default enabled)"
+        type: boolean
+        default: true
+      base_image_override:
+        description: "Build one literal base image instead of the lines above. Example: rocm/pytorch:latest. Publishes under a suffix read from the image."
+        default: ""
       atom_repo:
         description: "ATOM repo"
         default: "https://github.com/ROCm/ATOM.git"
@@ -89,15 +81,66 @@ on:
         type: boolean
         default: false
 
+# The live lines, defined once for the whole workflow. LINE_STABLE owns the
+# unsuffixed tags (latest, nightly_<ts>, vllm-latest, sglang-latest);
+# LINE_NEXT publishes the same set suffixed with the ROCm version read out of
+# its image. Promoting ROCm 10 is these two values and nothing else: `latest`
+# follows, and the line that used to be stable simply stops being built.
+env:
+  LINE_STABLE: rocm7
+  LINE_NEXT: rocm10
+
 jobs:
+  # Which lines this run builds. A separate job because `strategy.matrix` is
+  # evaluated before any step runs, so the list has to arrive as a `needs`
+  # output rather than be computed inside the build job.
+  plan:
+    name: Resolve which lines to build
+    runs-on: ubuntu-latest
+    outputs:
+      lines: ${{ steps.lines.outputs.lines }}
+    steps:
+      - name: Resolve lines
+        id: lines
+        run: |
+          set -euo pipefail
+          OVERRIDE="${{ inputs.base_image_override || '' }}"
+          if [ -n "${OVERRIDE}" ]; then
+            # A one-off build on a literal image reference, nothing else.
+            printf 'lines=["%s"]\n' "${OVERRIDE}" >> "${GITHUB_OUTPUT}"
+            echo "Lines: ${OVERRIDE} (base_image_override)"
+            exit 0
+          fi
+
+          lines=""
+          add() { lines="${lines:+${lines},}\"$1\""; }
+
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            # Like the OOT and SGLang layers, a scheduled run builds every
+            # live line regardless of the toggles; the toggles exist so a
+            # manual run can build one line without the other.
+            add "${LINE_STABLE}"
+            add "${LINE_NEXT}"
+          else
+            if [ "${{ inputs.build_rocm7 }}" = "true" ]; then add rocm7; fi
+            if [ "${{ inputs.build_rocm10 }}" = "true" ]; then add rocm10; fi
+          fi
+
+          if [ -z "${lines}" ]; then
+            echo "No line selected: enable at least one of build_rocm7 / build_rocm10, or set base_image_override."
+            exit 1
+          fi
+          echo "lines=[${lines}]" >> "${GITHUB_OUTPUT}"
+          echo "Lines: [${lines}]"
+
   docker-release:
     name: Nightly Docker Release
+    needs: plan
     runs-on: ${{ inputs.runner || 'linux-atom-mi35x-1' }}
     strategy:
       fail-fast: false
       matrix:
-        base_image:
-          - ${{ inputs.base_image || 'rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0' }}
+        base_image: ${{ fromJSON(needs.plan.outputs.lines) }}
 
     env:
       ATOM_REPO: "https://github.com/ROCm/ATOM.git"
@@ -158,6 +201,55 @@ jobs:
           echo "SGLANG_TAG_SUFFIX: ${{ inputs.sglang_tag_suffix || '' }}"
           echo "BASE_IMAGE_FLAVOR: ${{ matrix.base_image }}"
 
+      # One place that turns a line name into everything the rest of the job
+      # needs: which base image to build on, which extra build-args that line
+      # wants, and whether it publishes at all. Before this, each of those
+      # lived as its own `if [ "${{ matrix.base_image }}" = "rocm10" ]` inside
+      # a push step -- which is how the vLLM push came to have none, and
+      # published ROCm 10 images over the ROCm 7 `vllm-latest` tag.
+      - name: Resolve flavor
+        id: flavor
+        run: |
+          set -euo pipefail
+          FLAVOR="${{ matrix.base_image }}"
+          EXTRA_BUILD_ARGS=""
+
+          case "${FLAVOR}" in
+            rocm7)
+              BASE_IMAGE="rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0"
+              ;;
+            rocm7-py310)
+              BASE_IMAGE="rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.10.0"
+              ;;
+            rocm7-latest)
+              BASE_IMAGE="rocm/pytorch:latest"
+              ;;
+            rocm10)
+              # rocm10-base is a stage inside atom_release.dockerfile, not an
+              # image to pull: the ROCm 10 stack is assembled from the AMD
+              # stable wheel channel on plain ubuntu:24.04.
+              BASE_IMAGE="rocm10-base"
+              ;;
+            */*|*:*)
+              # A literal image reference, for a one-off build on something
+              # that has no line name.
+              BASE_IMAGE="${FLAVOR}"
+              ;;
+            *)
+              echo "Unknown base_image flavor '${FLAVOR}'."
+              exit 1
+              ;;
+          esac
+
+          echo "flavor=${FLAVOR} base_image=${BASE_IMAGE}"
+          {
+            echo "FLAVOR=${FLAVOR}"
+            echo "BASE_IMAGE=${BASE_IMAGE}"
+            echo "EXTRA_BUILD_ARGS<<EOF_ARGS"
+            echo "${EXTRA_BUILD_ARGS}"
+            echo "EOF_ARGS"
+          } >> "${GITHUB_ENV}"
+
       - name: Build Docker image
         timeout-minutes: 180
         run: |
@@ -168,57 +260,7 @@ jobs:
             ATOM_CHECKOUT="${ATOM_COMMIT}"
           fi
           echo "ATOM checkout ref: ${ATOM_CHECKOUT} (branch: ${{ github.ref_name }})"
-          # The rocm10* flavors select the rocm10-base stage inside
-          # atom_release.dockerfile (pip SDK assembly) instead of pulling a
-          # rocm/pytorch apt image; every other flavor value is a literal
-          # image reference passed through as BASE_IMAGE.
-          BASE_IMAGE="${{ matrix.base_image }}"
-          EXTRA_BUILD_ARGS=""
-          case "${BASE_IMAGE}" in
-            rocm10)
-              BASE_IMAGE="rocm10-base"
-              ;;
-            rocm101-nightly)
-              # 10.1 tracking line: nightly channel, latest date-stamped
-              # 10.1.0a<date> wheels. The date stamp is resolved at build
-              # time from the channel (pip cannot take a glob), pinned in
-              # the log for reproducibility.
-              BASE_IMAGE="rocm10-base"
-              NIGHTLY_SDK_VERSION=$(curl -sL --max-time 60 \
-                "https://nightly.repo.amd.com/rocm/whl-next/rocm-sdk-core/" \
-                | grep -oE 'rocm_sdk_core-10\.1\.0a[0-9]+-py3' \
-                | sed 's/rocm_sdk_core-//; s/-py3//' | sort -V | tail -1)
-              if [ -z "${NIGHTLY_SDK_VERSION}" ]; then
-                echo "ERROR: could not resolve a 10.1.0a<date> version from the nightly channel"
-                exit 1
-              fi
-              echo "Resolved 10.1 nightly SDK version: ${NIGHTLY_SDK_VERSION}"
-              # torchaudio on the 10.1 nightly channel is 2.11.0.3 (not the
-              # stable channel's 2.11.0); resolve it from the channel like the
-              # SDK version so the date-stamped line never pins a stale number.
-              NIGHTLY_TORCHAUDIO_VERSION=$(curl -sL --max-time 60 \
-                "https://nightly.repo.amd.com/rocm/whl-next/torchaudio/" \
-                | grep -oE 'torchaudio-2\.11[^"<>]*cp312[^"<>]*linux[^"<>]*\.whl' \
-                | grep "rocm${NIGHTLY_SDK_VERSION}" | sed 's/torchaudio-//; s/+rocm.*//' | sort -V | tail -1)
-              if [ -z "${NIGHTLY_TORCHAUDIO_VERSION}" ]; then
-                echo "ERROR: could not resolve a torchaudio version for ${NIGHTLY_SDK_VERSION} from the nightly channel"
-                exit 1
-              fi
-              echo "Resolved 10.1 nightly torchaudio version: ${NIGHTLY_TORCHAUDIO_VERSION}"
-              # ROCM_TRITON_VERSION is deliberately empty: torch's own
-              # metadata pins the exact triton it was built against, and the
-              # nightly channel carries several triton variants per date whose
-              # commit drifts independently of torch — any explicit pick can
-              # fight torch's pin and die with ResolutionImpossible. Empty
-              # means the dockerfile lets torch's dependency decide.
-              EXTRA_BUILD_ARGS="--build-arg ROCM_SDK_VERSION=${NIGHTLY_SDK_VERSION} \
-                --build-arg ROCM_TORCH_VERSION=2.12.0 \
-                --build-arg ROCM_TORCHAUDIO_VERSION=${NIGHTLY_TORCHAUDIO_VERSION} \
-                --build-arg ROCM_TRITON_VERSION= \
-                --build-arg ROCM_INDEX_URL=https://nightly.repo.amd.com/rocm/whl-next/"
-              ;;
-          esac
-          echo "BASE_IMAGE: ${BASE_IMAGE}"
+          echo "Building flavor ${FLAVOR} on BASE_IMAGE ${BASE_IMAGE}"
           DOCKER_BUILDKIT=1 docker build --pull --network=host -t atom_release:ci \
           --build-arg BASE_IMAGE="${BASE_IMAGE}" \
           --build-arg GPU_ARCH="${{ env.GPU_ARCH }}" \
@@ -232,6 +274,33 @@ jobs:
           --build-arg CACHEBUST=$(date +%s) \
           -f docker/atom_release.dockerfile .
           docker inspect atom_release:ci
+
+      # The tag suffix comes out of the image, not out of the line's nickname.
+      # A nickname says what we called the line ("rocm10"); the image knows
+      # which ROCm it actually carries (10.0.0 vs 10.1.0), and that is what a
+      # puller needs the tag to tell them. It also keeps the spelling the same
+      # as torch's and the SDK's (rocm10.0).
+      - name: Resolve tag suffix
+        run: |
+          set -euo pipefail
+          if [ "${FLAVOR}" = "${LINE_STABLE}" ]; then
+            # The stable line owns the unsuffixed tags: latest, nightly_<ts>,
+            # vllm-latest, sglang-latest.
+            TAG_SUFFIX=""
+            echo "Stable line (${FLAVOR}): publishing unsuffixed tags"
+          else
+            ROCM_VER=$(docker run --rm --entrypoint="" atom_release:ci \
+              bash -lc 'cat /opt/rocm/.info/version 2>/dev/null \
+                || python3 -c "import torch; print(torch.version.hip or \"\")"' \
+              | tr -d '[:space:]')
+            if [ -z "${ROCM_VER}" ]; then
+              echo "ERROR: could not read a ROCm version out of the image; refusing to publish an unlabelled tag"
+              exit 1
+            fi
+            TAG_SUFFIX="-rocm$(echo "${ROCM_VER}" | cut -d. -f1,2)"
+            echo "Line ${FLAVOR} carries ROCm ${ROCM_VER}; tag suffix ${TAG_SUFFIX}"
+          fi
+          echo "TAG_SUFFIX=${TAG_SUFFIX}" >> "${GITHUB_ENV}"
 
       - name: Test Docker image
         if: ${{ success() && steps.gates.outputs.main == 'true' && inputs.skip_tests != true }}
@@ -296,21 +365,7 @@ jobs:
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
-          # The rocm101-nightly tracking line never pushes: it exists to
-          # surface 10.1 breaks in CI, not to publish an image.
-          if [ "${{ matrix.base_image }}" = "rocm101-nightly" ]; then
-            echo "rocm101-nightly tracking build: build + test only, skipping push."
-            exit 0
-          fi
-          # rocm10 flavor tags carry a -rocm10 suffix: an immutable
-          # nightly_<ts>-rocm10 plus a rolling latest-rocm10, so the line has a
-          # stable name to pull while it runs alongside ROCm 7. Bare latest is
-          # left alone (the ROCm 7 apt-image line stays the default) — the
-          # eventual switch moves that pointer and nothing else.
-          FLAVOR_SUFFIX=""
-          if [ "${{ matrix.base_image }}" = "rocm10" ]; then
-            FLAVOR_SUFFIX="-rocm10"
-          fi
+          FLAVOR_SUFFIX="${TAG_SUFFIX}"
           CUSTOM_TAG="${{ inputs.custom_tag || '' }}"
           if [ -n "${CUSTOM_TAG}" ]; then
             if [[ ! "${CUSTOM_TAG}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
@@ -335,7 +390,7 @@ jobs:
                 docker tag atom_release:ci rocm/atom-dev:${TAG}
                 docker tag atom_release:ci rocm/atom-dev:latest${FLAVOR_SUFFIX}
                 .github/scripts/docker_push_retry.sh rocm/atom-dev:${TAG} rocm/atom-dev:latest${FLAVOR_SUFFIX}
-                echo "rocm10 flavor: tags rocm/atom-dev:${TAG} and rocm/atom-dev:latest${FLAVOR_SUFFIX}. Skipping latest update."
+                echo "${FLAVOR}: tags rocm/atom-dev:${TAG} and rocm/atom-dev:latest${FLAVOR_SUFFIX}. Leaving latest to ${LINE_STABLE}."
               else
                 docker tag atom_release:ci rocm/atom-dev:latest
                 docker tag atom_release:ci rocm/atom-dev:${TAG}
@@ -350,6 +405,15 @@ jobs:
         continue-on-error: true
         timeout-minutes: 180
         run: |
+          # The vLLM and SGLang layers belong to the stable line only. They
+          # are owned and tagged by someone else, so a second line must not
+          # build them, and above all must not publish over their tags -- the
+          # ROCm 10 line would otherwise have replaced vllm-latest and the
+          # day's vllm-v<ver>-nightly_<date> with a ROCm 10 image.
+          if [ "${FLAVOR}" != "${LINE_STABLE}" ]; then
+            echo "${FLAVOR} is not the stable line: skipping the OOT vLLM layer (owned by the ROCm 7 line)."
+            exit 0
+          fi
           OOT_BASE_IMAGE="atom_release:ci"
           echo "Using OOT base image: ${OOT_BASE_IMAGE}"
           docker build --network=host -t atom_oot_release:ci \
@@ -381,6 +445,15 @@ jobs:
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
           set -euo pipefail
+          # The vLLM and SGLang layers belong to the stable line only. They
+          # are owned and tagged by someone else, so a second line must not
+          # build them, and above all must not publish over their tags -- the
+          # ROCm 10 line would otherwise have replaced vllm-latest and the
+          # day's vllm-v<ver>-nightly_<date> with a ROCm 10 image.
+          if [ "${FLAVOR}" != "${LINE_STABLE}" ]; then
+            echo "${FLAVOR} is not the stable line: skipping the OOT vLLM push layer (owned by the ROCm 7 line)."
+            exit 0
+          fi
           VLLM_VER="${VLLM_VERSION}"
           OOT_TAG_SUFFIX="${{ inputs.oot_tag_suffix || '' }}"
           OOT_TAG="vllm-v${VLLM_VER}-nightly_$(date +%Y%m%d)"
@@ -405,10 +478,13 @@ jobs:
         if: ${{ success() && steps.gates.outputs.sglang == 'true' }}
         timeout-minutes: 180
         run: |
-          # The rocm101-nightly tracking line stops after the native build +
-          # golden test; the SGLang layer is not part of what it tracks.
-          if [ "${{ matrix.base_image }}" = "rocm101-nightly" ]; then
-            echo "rocm101-nightly tracking build: skipping SGLang layer."
+          # The vLLM and SGLang layers belong to the stable line only. They
+          # are owned and tagged by someone else, so a second line must not
+          # build them, and above all must not publish over their tags -- the
+          # ROCm 10 line would otherwise have replaced vllm-latest and the
+          # day's vllm-v<ver>-nightly_<date> with a ROCm 10 image.
+          if [ "${FLAVOR}" != "${LINE_STABLE}" ]; then
+            echo "${FLAVOR} is not the stable line: skipping the SGLang layer (owned by the ROCm 7 line)."
             exit 0
           fi
           SGLANG_BASE_IMAGE="atom_release:ci"
@@ -437,22 +513,18 @@ jobs:
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
           set -euo pipefail
-          # rocm101-nightly never reaches here (SGLang build is skipped), but
-          # keep the guard so a future re-enable cannot publish a tracking image.
-          if [ "${{ matrix.base_image }}" = "rocm101-nightly" ]; then
-            echo "rocm101-nightly tracking build: skipping SGLang push."
+          # The vLLM and SGLang layers belong to the stable line only. They
+          # are owned and tagged by someone else, so a second line must not
+          # build them, and above all must not publish over their tags -- the
+          # ROCm 10 line would otherwise have replaced vllm-latest and the
+          # day's vllm-v<ver>-nightly_<date> with a ROCm 10 image.
+          if [ "${FLAVOR}" != "${LINE_STABLE}" ]; then
+            echo "${FLAVOR} is not the stable line: skipping the SGLang push layer (owned by the ROCm 7 line)."
             exit 0
-          fi
-          # rocm10 flavor tags carry a -rocm10 suffix, including a rolling
-          # sglang-latest-rocm10. Bare sglang-latest is left alone (the ROCm 7
-          # line stays the default).
-          FLAVOR_SUFFIX=""
-          if [ "${{ matrix.base_image }}" = "rocm10" ]; then
-            FLAVOR_SUFFIX="-rocm10"
           fi
           SGLANG_VER="${{ inputs.sglang_version || env.SGLANG_VERSION }}"
           SGLANG_TAG_SUFFIX="${{ inputs.sglang_tag_suffix || '' }}"
-          SGLANG_TAG="sglang-v${SGLANG_VER}-nightly_$(date +%Y%m%d)${FLAVOR_SUFFIX}"
+          SGLANG_TAG="sglang-v${SGLANG_VER}-nightly_$(date +%Y%m%d)"
           SGLANG_LATEST_TAG="sglang-latest"
           if [ -n "${SGLANG_TAG_SUFFIX}" ]; then
             if [[ ! "${SGLANG_TAG_SUFFIX}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
@@ -463,15 +535,7 @@ jobs:
           fi
           docker tag atom_sglang_release:ci rocm/atom-dev:${SGLANG_TAG}
           .github/scripts/docker_push_retry.sh rocm/atom-dev:${SGLANG_TAG}
-          if [ -n "${FLAVOR_SUFFIX}" ]; then
-            if [ -z "${SGLANG_TAG_SUFFIX}" ]; then
-              docker tag atom_sglang_release:ci rocm/atom-dev:${SGLANG_LATEST_TAG}${FLAVOR_SUFFIX}
-              .github/scripts/docker_push_retry.sh rocm/atom-dev:${SGLANG_LATEST_TAG}${FLAVOR_SUFFIX}
-              echo "rocm10 flavor: tags rocm/atom-dev:${SGLANG_TAG} and rocm/atom-dev:${SGLANG_LATEST_TAG}${FLAVOR_SUFFIX}. Skipping sglang-latest update."
-            else
-              echo "rocm10 flavor with a custom suffix: tag rocm/atom-dev:${SGLANG_TAG} only. Skipping the rolling and sglang-latest updates."
-            fi
-          elif [ -z "${SGLANG_TAG_SUFFIX}" ]; then
+          if [ -z "${SGLANG_TAG_SUFFIX}" ]; then
             docker tag atom_sglang_release:ci rocm/atom-dev:${SGLANG_LATEST_TAG}
             .github/scripts/docker_push_retry.sh rocm/atom-dev:${SGLANG_LATEST_TAG}
           else
@@ -491,7 +555,10 @@ jobs:
           docker rm atom_release_ci || true
           # Remove build and tagged images to free disk space
           docker rmi atom_release:ci || true
-          docker rmi rocm/atom-dev:latest || true
+          # latest, latest-rocm10.0, sglang-latest-rocm10.0, ... -- the
+          # suffixed rolling tags were left on disk by the old cleanup.
+          docker images "rocm/atom-dev:latest*" -q | xargs -r docker rmi || true
+          docker images "rocm/atom-dev:*-latest*" -q | xargs -r docker rmi || true
           docker rmi atom_oot_release:ci || true
           docker rmi atom_sglang_release:ci || true
           # Remove nightly tagged image if it exists
