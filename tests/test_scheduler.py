@@ -1739,6 +1739,82 @@ class TestPreemptStripsExactlyThePlaceholders:
         assert seq.num_tokens == seq.num_prompt_tokens
         assert seq.num_completion_tokens == 0
 
+    @staticmethod
+    def _verify_output(seq_id, tokens, num_rejected, mtp_k):
+        """A step that actually verified drafts.
+
+        The row is what the other cases in this class do not have. Without one,
+        postprocess skips the in-place overwrite entirely and only appends, so
+        the two widths coincide and nothing here is under test.
+
+        `num_new + num_rejected == drafts + 1` is a law of the verify step -- the
+        model is given one anchor plus `drafts` drafts and hands back the
+        accepted prefix plus one -- so a pair that breaks it describes a step no
+        engine runs.
+        """
+        return ScheduledBatchOutput(
+            req_ids=[seq_id],
+            token_ids=[tuple(tokens)],
+            num_rejected=np.array([num_rejected], dtype=np.int32),
+            num_bonus=np.array([0], dtype=np.int32),
+            draft_token_ids=np.array([[900 + i for i in range(mtp_k)]], dtype=np.int32),
+            is_deferred_out=True,
+        )
+
+    @staticmethod
+    def _trailing_eos(seq, eos):
+        tokens = list(seq.token_ids)
+        count = 0
+        while count < len(tokens) and tokens[-1 - count] == eos:
+            count += 1
+        return count
+
+    @pytest.mark.parametrize(
+        "mtp_k,accepted", [(1, 0), (1, 1), (2, 0), (2, 2), (3, 0), (3, 1), (3, 3)]
+    )
+    def test_a_verify_step_widens_the_run_and_the_strip_follows(
+        self, mtp_k, accepted, seq_factory
+    ):
+        """The overwrite consumes only part of the window it is given.
+
+        The window is `num_placeholder + mtp_k` wide on a verify step, and the
+        step hands back `mtp_k - num_rejected + 1` tokens for it, so
+        `mtp_k + num_rejected` slots of it are still `eos_token_id` when the run
+        for the NEXT step is appended behind them. The trailing run settles at
+        `2 * mtp_k + 1`, whatever the acceptance rate, and the width recorded for
+        `preempt` used to name only the appended part of it -- leaving that many
+        EOS in the recomputed context, which is the fault this class is about.
+        """
+        sched = self._sched(mtp_k)
+        prompt = [5, 6, 7, 8]
+        seq = seq_factory(prompt)
+        sched.add(seq)
+        sched.schedule()
+        sched.postprocess(list(sched.running), self._deferred_prefill_output())
+
+        # Three steps, so the tail reaches its steady state rather than the
+        # narrower run the prefill step alone leaves.
+        real = []
+        for step in range(3):
+            sched.schedule()
+            rows = [200 + 10 * step + i for i in range(accepted + 1)]
+            real += rows
+            sched.postprocess(
+                list(sched.running),
+                self._verify_output(seq.id, rows, mtp_k - accepted, mtp_k),
+            )
+
+        eos = sched.eos_token_id
+        assert self._trailing_eos(seq, eos) == 2 * mtp_k + 1
+        assert seq.num_placeholder_tokens == 2 * mtp_k + 1
+
+        assert sched.preempt(seq) is True
+
+        assert eos not in list(seq.token_ids)
+        assert list(seq.token_ids) == prompt + real
+        assert list(seq.output_tokens) == real
+        assert seq.num_completion_tokens == len(real)
+
     def test_transferred_drafts_are_stripped_but_t0_is_kept(self, seq_factory):
         """The P/D first-decode path appends the remote's T0 -- a real
         generated token -- followed by its drafts, which are placeholders in

@@ -2779,6 +2779,21 @@ class Scheduler:
                 for i, el in enumerate(token_ids):
                     seq.token_ids[-required_placeholders + i] = el
                     seq.output_tokens[-required_placeholders + i] = el
+                # What the write did NOT consume of the window it was given.
+                # Those slots are still `eos_token_id`, so they are still
+                # placeholders, and on a verify step there are always some: the
+                # window is `mtp_k` wider than the run appended for it (the
+                # `offset` above) and the step hands back `mtp_k - num_rejected
+                # + 1` tokens for it. Recorded rather than left to `preempt` to
+                # re-derive -- `num_placeholder_tokens` is the width it reads,
+                # and until this line it named only the run appended below.
+                # Measured steady state, deferred output and drafts every step:
+                # the trailing `eos` run is `2 * mtp_k + 1` while the recorded
+                # width was `mtp_k + 1 - num_rejected`, so a preemption left
+                # `mtp_k + num_rejected` of them in the recomputed context.
+                seq.num_placeholder_tokens = max(
+                    0, required_placeholders - len(token_ids)
+                )
                 if seq.return_logprobs and token_logprob is not None:
                     if seq.logprobs:
                         seq.logprobs[-1] = token_logprob
@@ -2992,7 +3007,12 @@ class Scheduler:
                         seq.append_token(self.eos_token_id)
                         if seq.return_logprobs:
                             seq.logprobs.append(0.0)
-                    seq.num_placeholder_tokens = num
+                    # Added to what the overwrite above left unconsumed, not
+                    # replacing it: both runs are trailing `eos_token_id` and
+                    # both are what `preempt` has to strip. `=` also undercounted
+                    # a sequence that went two steps without a row -- nothing
+                    # consumed the first run, and this one appends beyond it.
+                    seq.num_placeholder_tokens += num
         for seq in finished_seqs:
             logger.debug("Freeing blocks for finished seq %s", seq.id)
             if seq.is_partial_prefill:
