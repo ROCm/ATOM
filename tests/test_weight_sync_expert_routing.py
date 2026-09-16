@@ -174,6 +174,89 @@ def test_a_named_expert_buffer_is_refused_under_expert_parallelism():
         )
 
 
+# ── the wrappers ModelRunner rebinds onto self.model ──────────────────────
+
+
+def _tbo_wrapped(model):
+    """The real `UBatchWrapper`. It needs no device to construct, so nothing
+    here has to stand in for it and get its shape wrong."""
+    from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
+
+    return UBatchWrapper(model)
+
+
+def _compiled(model):
+    """What compilation level 1 rebinds. `torch.compile` compiles nothing until
+    the module is called; this is only its `OptimizedModule` shell."""
+    return torch.compile(model, backend="eager")
+
+
+@pytest.mark.parametrize("wrap", [_tbo_wrapped, _compiled], ids=["tbo", "compiled"])
+def test_a_wrapper_does_not_move_the_names_the_trainer_sends(wrap):
+    """Both hold the model as a CHILD, so `named_modules()` on the wrapper
+    prefixes every parameter with the wrapper's own attribute name -- `model.`
+    or `_orig_mod.` -- and then nothing the trainer sends matches anything."""
+    model, experts = _moe_model()
+    updater = _updater(model)
+    updater.model = wrap(model)
+
+    mapping = updater._get_param_to_module_mapping()
+
+    assert "mlp.experts.w13_weight" in mapping
+    assert mapping["mlp.experts.w13_weight"][0] is experts
+
+
+@pytest.mark.parametrize("wrap", [_tbo_wrapped, _compiled], ids=["tbo", "compiled"])
+def test_the_mappings_reached_by_attribute_are_unaffected(wrap):
+    """These two are plain attribute lookups, and BOTH wrappers forward those to
+    what they wrap (`UBatchWrapper.__getattr__`, `OptimizedModule.__getattr__`),
+    so they were never the broken half. Pinned because asking the unwrapped
+    model instead must not be a change: one module answering all four lookups is
+    the point, not a repair."""
+    model, _ = _moe_model()
+    model.get_expert_mapping = lambda: [("experts.w13_weight", "gate_proj", 0, "w1")]
+    model.packed_modules_mapping = {"gate_proj": ("gate_up_proj", 0)}
+    updater = _updater(model)
+    updater.model = wrap(model)
+
+    assert updater._get_expert_params_mapping() == [
+        ("gate_proj", "experts.w13_weight", 0, "w1")
+    ]
+    assert updater._get_packed_modules_mapping() == {"gate_proj": ("gate_up_proj", 0)}
+    assert updater._get_packed_shard_order() == {"gate_up_proj": [0]}
+
+
+def test_a_sync_that_matched_nothing_says_so_above_debug(caplog):
+    """What the wrapper bug looked like from outside: `updated=0, skipped=N` on
+    an info line, indistinguishable from a bucket that legitimately held
+    nothing. The next name convention nobody has thought of gets this."""
+    model, _ = _moe_model()
+    updater = _updater(model)
+
+    with caplog.at_level("WARNING", logger="atom"):
+        updated = updater.update_weights([("nobody.knows.this", torch.zeros(2))])
+
+    assert updated == 0
+    assert "matched NOTHING" in caplog.text
+
+
+def test_a_rebind_after_the_first_lookup_rebuilds_the_mapping():
+    """The caches were `hasattr`-keyed: nothing invalidates that, and there is
+    no hook here to invalidate it from. Keyed on the model they were built from,
+    they rebuild themselves when that changes."""
+    model, experts = _moe_model()
+    other_model, other_experts = _moe_model()
+    updater = _updater(model)
+
+    first = updater._get_param_to_module_mapping()
+    assert first["mlp.experts.w13_weight"][0] is experts
+
+    updater.model = other_model
+    second = updater._get_param_to_module_mapping()
+
+    assert second["mlp.experts.w13_weight"][0] is other_experts
+
+
 # ── a sync that fails part way through ────────────────────────────────────
 
 

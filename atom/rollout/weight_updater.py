@@ -31,6 +31,25 @@ _FUSED_EXPERT_LEAVES = {
 _EXPERTS_PREFIX_SUFFIX = ".experts"
 
 
+def _unwrap_once(module) -> torch.nn.Module | None:
+    """The model inside one wrapper `ModelRunner` may have rebound onto itself,
+    or None when *module* is not one. See `_sync_target_model`.
+
+    `_orig_mod` is `torch.compile`'s own name for what it wrapped, private
+    enough that a model is not going to have one of its own. The import is
+    deferred to keep this module importable without the TBO package, as the
+    tests that drive the updater on a stand-in rely on.
+    """
+    compiled_inner = getattr(module, "_orig_mod", None)
+    if isinstance(compiled_inner, torch.nn.Module):
+        return compiled_inner
+    from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
+
+    if isinstance(module, UBatchWrapper):
+        return module.model
+    return None
+
+
 class WeightUpdaterMixin:
     """Mixin providing weight update capabilities for ModelRunner.
 
@@ -43,6 +62,55 @@ class WeightUpdaterMixin:
       - self.clear_kv_cache() — method
     """
 
+    def _sync_target_model(self) -> torch.nn.Module:
+        """The model the trainer's parameter names are relative to.
+
+        Not always ``self.model``. ``ModelRunner`` rebinds that twice after the
+        model is built: to a ``UBatchWrapper`` under TBO, and to
+        ``torch.compile(...)`` at compilation level 1. Both are ``nn.Module``s
+        holding the real model as a CHILD, so ``named_modules()`` on either
+        prefixes every parameter with the wrapper's own attribute name --
+        ``model.`` or ``_orig_mod.``. Not one name the trainer sends then
+        matches anything, every weight is counted `skipped` at debug level, and
+        the whole update is the silent no-op this path exists to remove --
+        under two supported configurations.
+
+        Both wrappers do forward plain attribute lookups to what they wrap, so
+        ``get_expert_mapping`` and ``packed_modules_mapping`` were reachable
+        through them. They are asked of this model anyway, so that all four
+        lookups describe one module rather than relying on each wrapper to
+        keep forwarding.
+
+        Peeled by TYPE, not by attribute name: nearly every HF-derived model has
+        a submodule literally called ``model``, and peeling that would drop a
+        prefix the trainer does send.
+        """
+        model = self.model
+        while True:
+            inner = _unwrap_once(model)
+            if inner is None:
+                return model
+            model = inner
+
+    def _warn_if_nothing_matched(self, updated: int, skipped: int) -> None:
+        """A sync that matched nothing is the failure this whole path is about.
+
+        It stays reachable however many name conventions are covered -- a wrapper
+        rebound onto `self.model` was one, a trainer whose names come from
+        somewhere new is the next -- and `updated=0, skipped=N` on an info line
+        reads exactly like a bucket that legitimately held nothing. Said once, at
+        the level someone reads, and phrased as what it costs: the rollout goes
+        on serving the weights it already had.
+        """
+        if updated == 0 and skipped > 0:
+            logger.warning(
+                f"{self.label}: weight update matched NOTHING -- {skipped} "
+                f"parameter(s) resolved to no module, so nothing was written and "
+                f"the rollout is still serving the weights it had. Compare the "
+                f"sender's names against the model's own "
+                f"(`model.named_parameters()`)."
+            )
+
     def _get_param_to_module_mapping(self) -> dict[str, tuple]:
         """
         Get or build the parameter name to module mapping.
@@ -53,14 +121,23 @@ class WeightUpdaterMixin:
         Returns:
             Dict mapping parameter full name to (module, param_name, param) tuple
         """
-        if not hasattr(self, "_param_to_module") or self._param_to_module is None:
+        model = self._sync_target_model()
+        # Keyed on the model it was built from, so a rebind of `self.model`
+        # rebuilds instead of serving names from the module that is no longer
+        # there. A `hasattr` cache cannot be invalidated by anything, and there
+        # is no hook here to invalidate it from.
+        if (
+            getattr(self, "_param_to_module", None) is None
+            or getattr(self, "_param_to_module_of", None) is not model
+        ):
             self._param_to_module = {}
-            for module_name, module in self.model.named_modules():
+            for module_name, module in model.named_modules():
                 for param_name, param in module.named_parameters(recurse=False):
                     full_name = (
                         f"{module_name}.{param_name}" if module_name else param_name
                     )
                     self._param_to_module[full_name] = (module, param_name, param)
+            self._param_to_module_of = model
             logger.debug(
                 f"{self.label}: Built param_to_module mapping with "
                 f"{len(self._param_to_module)} parameters"
@@ -68,19 +145,25 @@ class WeightUpdaterMixin:
         return self._param_to_module
 
     def _get_packed_modules_mapping(self) -> dict:
-        if not hasattr(self, "_cached_packed_mapping"):
+        model = self._sync_target_model()
+        if getattr(self, "_cached_packed_mapping_of", None) is not model:
             self._cached_packed_mapping = (
-                getattr(self.model, "packed_modules_mapping", None) or {}
+                getattr(model, "packed_modules_mapping", None) or {}
             )
+            self._cached_packed_mapping_of = model
         return self._cached_packed_mapping
 
     def _get_packed_shard_order(self) -> dict[str, list]:
         """Build {target_suffix: [shard_id_0, shard_id_1, ...]} preserving declaration order."""
-        if not hasattr(self, "_cached_packed_shard_order"):
+        packed = self._get_packed_modules_mapping()
+        # Derived from that mapping, so it is stale exactly when that is: keyed
+        # on the same object rather than on its own first call.
+        if getattr(self, "_cached_packed_shard_order_of", None) is not packed:
             order: dict[str, list] = {}
-            for _, (tgt, shard_id) in self._get_packed_modules_mapping().items():
+            for tgt, shard_id in packed.values():
                 order.setdefault(tgt, []).append(shard_id)
             self._cached_packed_shard_order = order
+            self._cached_packed_shard_order_of = packed
         return self._cached_packed_shard_order
 
     def _resolve_packed_name(
@@ -189,11 +272,16 @@ class WeightUpdaterMixin:
 
         The same mapping the model loader consults, from the same
         ``model.get_expert_mapping()``, ordered longest fragment first so a
-        more specific one wins. Built once; models with no MoE layer leave it
-        empty and every lookup then short-circuits.
+        more specific one wins. Built once per model; models with no MoE layer
+        leave it empty and every lookup then short-circuits.
+
+        Asked of the unwrapped model, like every other lookup here: an answer of
+        "no mapping" is indistinguishable from a model with no MoE, so it is not
+        a question to leave depending on a wrapper's attribute forwarding.
         """
-        if not hasattr(self, "_cached_expert_mapping"):
-            get_expert_mapping = getattr(self.model, "get_expert_mapping", None)
+        model = self._sync_target_model()
+        if getattr(self, "_cached_expert_mapping_of", None) is not model:
+            get_expert_mapping = getattr(model, "get_expert_mapping", None)
             entries = [
                 (weight_name_part, param_name_part, expert_id, shard_id)
                 for param_name_part, weight_name_part, expert_id, shard_id in (
@@ -202,6 +290,7 @@ class WeightUpdaterMixin:
             ]
             entries.sort(key=lambda entry: len(entry[0]), reverse=True)
             self._cached_expert_mapping = entries
+            self._cached_expert_mapping_of = model
         return self._cached_expert_mapping
 
     @property
@@ -897,6 +986,7 @@ class WeightUpdaterMixin:
             f"updated={updated}, skipped={skipped}, "
             f"ignored_scales={ignored_scales}"
         )
+        self._warn_if_nothing_matched(updated, skipped)
         return updated
 
     def update_weights_from_shm(
@@ -1025,6 +1115,7 @@ class WeightUpdaterMixin:
                 f"updated={updated}, skipped={skipped}, "
                 f"ignored_scales={ignored_scales}, is_last={is_last}"
             )
+            self._warn_if_nothing_matched(updated, skipped)
             return updated
         finally:
             shm.close()
@@ -1192,4 +1283,5 @@ class WeightUpdaterMixin:
             f"updated={updated}, skipped={skipped}, "
             f"ignored_scales={ignored_scales}, is_last={is_last}"
         )
+        self._warn_if_nothing_matched(updated, skipped)
         return updated
