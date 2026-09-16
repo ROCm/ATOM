@@ -199,7 +199,9 @@ function updateReading(s){
   const records=requestRecords(s),record=view==="chart"&&activePanel===s&&hoverTime!==null?s.hoveredRequest:records.at(-1);
   s.value.replaceChildren(node("span","",fmtCount(record?.context_tokens)),node("small","","tokens"));s.stat.textContent=fmtCount(records.length)+" requests in range"+(record?" · "+record.request_id:"");return;
  }
- const key=s.p.cache_breakdown?"reuse":[...STAT_KEYS].reverse().find(k=>s.visible.has(k));const point=key&&hoverTime!==null?near(s.p.series[key],hoverTime):null;const value=s.p.cache_breakdown?(s.p.series.reuse||[]).find(p=>p[0]===selectedCountTime(s))?.[1]:hoverTime!==null?point?.[1]:latest(s.p.series[key],range[1],range[0]);s.value.replaceChildren(node("span","",fmt(value)),node("small","",s.p.unit));s.stat.textContent=key?LABELS[key]+(hoverTime!==null?" · "+utc(hoverTime):" · Latest in range"):"No series selected";
+ // Gauge headlines follow panel semantics; histogram headlines prefer the highest visible percentile.
+ const priority={blocks:["used","evictable","vacant"],queues:["running","waiting","waiting_kv"],cache:["hit"]}[s.p.kind]||[...GLOBAL_STAT_KEYS].reverse();
+ const key=s.p.cache_breakdown?"reuse":priority.find(k=>s.visible.has(k));const point=key&&hoverTime!==null?near(s.p.series[key],hoverTime):null;const value=s.p.cache_breakdown?(s.p.series.reuse||[]).find(p=>p[0]===selectedCountTime(s))?.[1]:hoverTime!==null?point?.[1]:latest(s.p.series[key],range[1],range[0]);s.value.replaceChildren(node("span","",fmt(value)),node("small","",s.p.unit));s.stat.textContent=key?LABELS[key]+(hoverTime!==null?" · "+utc(hoverTime):" · Latest in range"):"No series selected";
 }
 function renderTable(s){
  updateBlockCounts(s);
