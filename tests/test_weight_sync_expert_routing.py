@@ -221,6 +221,81 @@ def test_a_shuffled_buffer_is_not_carried_into_the_next_sync(monkeypatch):
 
 
 @needs_aiter
+def test_a_half_delivered_expert_does_not_poison_every_later_sync(monkeypatch):
+    """Keeping the entry was worse than useless.
+
+    Nothing later completes one -- a sync sends every shard of an expert or the
+    write is refused outright -- so the entry would fail this function again on
+    every sync for the life of the process, and take every other buffer's
+    relayout down with it each time. The bytes are recoverable without it: the
+    next update that sends the whole expert overwrites both halves row-major.
+    """
+    import atom.model_ops.utils as utils_mod
+
+    model, experts = _moe_model()
+    updater = _updater(model)
+    shuffled = []
+    monkeypatch.setattr(
+        utils_mod,
+        "shuffle_expert_slices",
+        lambda buffer, ids, **k: shuffled.append(tuple(ids)),
+        raising=True,
+    )
+    pending = updater._pending_expert_relayout
+    pending[(experts, "w13_weight")] = {0: {"w1", "w3"}, 1: {"w1"}}
+
+    with pytest.raises(RuntimeError, match=r"w13_weight\[1\] arrived without"):
+        updater._finalize_expert_weight_sync()
+
+    # Per expert, not per buffer: expert 1 cannot be relaid out, and that is no
+    # reason for expert 0 to keep reading row-major bytes through the
+    # permutation.
+    assert shuffled == [(0,)]
+    assert not pending, "the half-delivered entry is dropped, not carried"
+
+    # A later sync over another buffer is not taken down with it.
+    pending[(experts, "w2_weight")] = {e: {"w2"} for e in range(EXPERTS)}
+    updater._finalize_expert_weight_sync()
+
+    assert shuffled == [(0,), (0, 1)]
+    assert not pending
+
+
+@needs_aiter
+def test_a_whole_expert_resent_later_gets_its_layout_back(monkeypatch):
+    """What repairs the half-delivered slice: an update carrying every shard
+    writes row-major over both halves, and that entry relays out normally."""
+    import atom.model_ops.utils as utils_mod
+
+    model, experts = _moe_model()
+    updater = _updater(model)
+    shuffled = []
+    monkeypatch.setattr(
+        utils_mod,
+        "shuffle_expert_slices",
+        lambda buffer, ids, **k: shuffled.append(tuple(ids)),
+        raising=True,
+    )
+    updater._pending_expert_relayout[(experts, "w13_weight")] = {1: {"w1"}}
+
+    with pytest.raises(RuntimeError, match="half new and"):
+        updater._finalize_expert_weight_sync()
+    assert shuffled == []
+
+    updater._apply_named_expert_buffer(
+        "mlp.experts.w13_weight",
+        "w13_weight",
+        experts,
+        experts.w13_weight,
+        torch.full_like(experts.w13_weight, 7.0),
+    )
+    updater._finalize_expert_weight_sync()
+
+    assert shuffled == [(0, 1)]
+    assert not updater._pending_expert_relayout
+
+
+@needs_aiter
 def test_a_buffer_the_loop_never_reached_survives(monkeypatch):
     """The other direction: an entry the loop did not get to still describes a
     row-major buffer, so dropping it would leave the kernel reading row-major
