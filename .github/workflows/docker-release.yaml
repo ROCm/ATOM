@@ -365,9 +365,20 @@ jobs:
           # honoured, a wrong path fails every build instead -- check the file
           # is there and say so plainly, rather than reporting a missing
           # golden file as a mismatch.
-          GOLDEN=".github/workflows/golden_outputs/Meta-Llama-3-8B-Instruct_golden_output.txt"
+          # One golden file per line. Greedy decoding is not portable across
+          # ROCm generations: on the same machine and the same weights, ROCm 7
+          # and ROCm 10 answered four of the six prompts differently -- not
+          # wrongly, just differently, because different kernels change the
+          # arithmetic enough to flip an argmax, after which the texts
+          # diverge. A single golden file therefore cannot gate two lines; the
+          # stable line keeps the existing name, each other line gets its own.
+          GOLDEN=".github/workflows/golden_outputs/Meta-Llama-3-8B-Instruct${TAG_SUFFIX}_golden_output.txt"
           if [ ! -f "${GOLDEN}" ]; then
-            echo "Golden output file not found: ${GOLDEN}"
+            echo "No golden output for this line: ${GOLDEN}"
+            echo "Generate it on CI hardware from a known-good run of this line:"
+            echo "  docker exec <container> python3 -m atom.examples.simple_inference \\"
+            echo "    --model meta-llama/Meta-Llama-3-8B-Instruct --temperature 0 \\"
+            echo "    | grep -E '^Prompt: |^Completion:' > ${GOLDEN}"
             exit 1
           fi
           # Ignore whitespace and EOL differences in the diff
