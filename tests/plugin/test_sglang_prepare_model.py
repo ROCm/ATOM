@@ -10,8 +10,9 @@ prepare_model.
 """
 
 import sys
-import pytest
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from atom.plugin import prepare as plugin_runtime
 from atom.plugin.sglang import prepare as sglang_prepare
@@ -65,7 +66,7 @@ def test_prepare_model_rejects_unsupported_architecture():
         {
             "atom.plugin.register": fake_register,
             "atom.plugin.sglang.runtime": fake_runtime,
-            "atom.plugin.sglang.graph_capture_patch": MagicMock(
+            "atom.plugin.sglang.patches.graph_capture_patch": MagicMock(
                 apply_graph_capture_patch=MagicMock()
             ),
         },
@@ -101,7 +102,7 @@ def test_prepare_model_sglang_happy_path():
             "atom.plugin.register": fake_register,
             "atom.plugin.config": fake_config_mod,
             "atom.plugin.sglang.runtime": fake_runtime,
-            "atom.plugin.sglang.graph_capture_patch": MagicMock(
+            "atom.plugin.sglang.patches.graph_capture_patch": MagicMock(
                 apply_graph_capture_patch=MagicMock()
             ),
         },
@@ -155,7 +156,7 @@ def test_prepare_model_remaps_quant_config_for_generic_wrapper():
             "atom.plugin.register": fake_register,
             "atom.plugin.config": fake_config_mod,
             "atom.plugin.sglang.runtime": fake_runtime,
-            "atom.plugin.sglang.graph_capture_patch": MagicMock(
+            "atom.plugin.sglang.patches.graph_capture_patch": MagicMock(
                 apply_graph_capture_patch=MagicMock()
             ),
         },
@@ -198,7 +199,7 @@ def test_prepare_model_selects_sglang_dict_for_deepseek_v2():
             "atom.plugin.register": fake_register,
             "atom.plugin.config": fake_config_mod,
             "atom.plugin.sglang.runtime": fake_runtime,
-            "atom.plugin.sglang.graph_capture_patch": MagicMock(
+            "atom.plugin.sglang.patches.graph_capture_patch": MagicMock(
                 apply_graph_capture_patch=MagicMock()
             ),
         },
@@ -229,7 +230,7 @@ def test_prepare_model_sets_framework_to_sglang():
             "atom.plugin.register": fake_register,
             "atom.plugin.config": fake_config_mod,
             "atom.plugin.sglang.runtime": fake_runtime,
-            "atom.plugin.sglang.graph_capture_patch": MagicMock(
+            "atom.plugin.sglang.patches.graph_capture_patch": MagicMock(
                 apply_graph_capture_patch=MagicMock()
             ),
         },

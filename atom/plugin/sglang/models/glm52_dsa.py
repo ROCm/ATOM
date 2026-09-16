@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from atom.plugin.sglang.models.deepseek_mla import _align_qknorm_fusion_for_sglang
+from atom.plugin.sglang.models.deepseek_mla import (
+    _align_qknorm_fusion_for_sglang,
+    _patch_indexer_layernorm_for_sglang,
+)
 from atom.plugin.sglang.models.deepseek_mla_forward import (
     _patch_attention_projs_for_sglang_mxfp4,
 )
@@ -46,9 +49,10 @@ def setup_glm52_dsa_for_sglang(model: Any) -> None:
 
         _align_qknorm_fusion_for_sglang(module)
         _patch_attention_projs_for_sglang_mxfp4(module)
+        _patch_indexer_layernorm_for_sglang(module)
 
         if not isinstance(module.mla_attn, SGLangATOMGLM52MLAAttention):
-            raise RuntimeError(
+            raise TypeError(
                 "GLM-5.2 SGLang native DSA setup expected "
                 "SGLangATOMGLM52MLAAttention. Ensure the GLM construction "
                 "context is installed before model initialization."

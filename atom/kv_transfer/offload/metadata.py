@@ -16,7 +16,12 @@ from typing import Any
 
 import torch
 
-from atom.kv_transfer.disaggregation.types import ConnectorMetadata, ReqId
+from atom.kv_transfer.disaggregation.types import (
+    ConnectorMetadata,
+    LoadOperationId,
+    ReqId,
+    SaveOperationId,
+)
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -37,7 +42,7 @@ class ATOMRawBytesLMCacheMetadata:
         self.__dict__.update(vars(base_metadata))
         self.atom_block_size = int(atom_block_size)
         self.atom_bytes_per_block = int(bytes_per_block)
-        chunk_size = int(getattr(base_metadata, "chunk_size"))
+        chunk_size = int(base_metadata.chunk_size)
         if self.atom_block_size <= 0:
             raise ValueError("ATOM raw-byte metadata: atom_block_size must be > 0")
         if self.atom_bytes_per_block <= 0:
@@ -87,6 +92,11 @@ class LoadSpec:
     lmcache_cached_tokens: int
     # Set True by update_state_after_alloc once blocks are reserved for the load.
     can_load: bool = False
+    # Optional transport boundary. A full-prompt LMCache hit still exposes only
+    # ``prompt_tokens - 1`` cached tokens to the scheduler (the final token must
+    # be recomputed), but chunk-oriented transports need to retrieve the whole
+    # final chunk. ``None`` keeps the legacy boundary above.
+    transfer_end_tokens: int | None = None
 
 
 @dataclass
@@ -97,6 +107,24 @@ class SaveSpec:
     skip_leading_tokens: int
     # Set False to suppress the store for this step (e.g. nothing new to save).
     can_save: bool = True
+
+
+@dataclass(frozen=True)
+class SlotSaveSpec:
+    """Identity and source group for one full-slot sidecar snapshot."""
+
+    boundary_tokens: int
+    boundary_block_hash: int
+    source_group: int
+
+
+@dataclass(frozen=True)
+class SlotLoadSpec:
+    """Identity and destination group for one full-slot sidecar restore."""
+
+    boundary_tokens: int
+    boundary_block_hash: int
+    destination_group: int
 
 
 @dataclass
@@ -115,6 +143,13 @@ class LMCacheReqMeta:
     save_spec: SaveSpec | None = None
     # True on the request's final prefill chunk (store the unaligned tail too).
     is_last_prefill: bool = True
+    slot_load_spec: SlotLoadSpec | None = None
+    slot_save_spec: SlotSaveSpec | None = None
+    # Exact scheduler-lifetime generation shared by PAGE and SLOT completion
+    # reports; late TP notifications for another save must not satisfy this one.
+    save_operation: SaveOperationId | None = None
+    # Appended for positional compatibility with existing metadata producers.
+    load_operation: LoadOperationId | None = None
 
 
 class LMCacheOffloadMetadata(ConnectorMetadata):
@@ -126,11 +161,34 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
     descriptors the worker consumes in ``start_load_kv``.
     """
 
+    #: `state_loads` is the one that is easy to miss: it carries no
+    #: `LMCacheReqMeta`, so a step whose only work is a state load looks empty
+    #: to anything that only counts requests -- and the requests parked on
+    #: those loads are woken by nothing but the report they would never be
+    #: asked to produce.
+    WORK_FIELDS = ConnectorMetadata.WORK_FIELDS + (
+        "requests",
+        "lookup_requests_in_step",
+        "state_loads",
+        "state_stores",
+    )
+
     def __init__(self) -> None:
         super().__init__()
         self.requests: list[LMCacheReqMeta] = []
-        # req_ids whose scheduler-side lookup pin should be released this step.
+        # req_ids whose worker-side lookup pin can be released this step.
         self.lookup_requests_in_step: list[str] = []
+        # (req_id, state_hash, target_group) for the K3 state tier. A separate
+        # list because a state load shares no shape with a KV transfer -- no
+        # token ids, no block ids, no chunking -- only the park/report
+        # lifecycle, which is why it rides the metadata rather than the batch.
+        self.state_loads: list[tuple] = []
+        # (StateStoreOperationId, unit_ids) for checkpoints leaving HBM for the
+        # CPU tier. Keyed by the operation id, not by request: by the time a
+        # store lands its request is long gone, and the op (prefix hash plus
+        # generation) is what the source-release and index reports carry back to
+        # settle the pin and index the hash.
+        self.state_stores: list[tuple] = []
 
     def add_request(self, meta: LMCacheReqMeta) -> None:
         self.requests.append(meta)

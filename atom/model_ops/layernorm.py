@@ -1239,21 +1239,27 @@ class LayerNorm(nn.Module):
         self,
         dim: int,
         eps: float = 1e-6,
+        dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         self.dim = dim
         self.eps = eps
-        self.weight = atom_parameter(torch.ones(dim))
-        self.bias = atom_parameter(torch.zeros(dim))
+        self.weight = atom_parameter(torch.ones(dim, dtype=dtype))
+        self.bias = atom_parameter(torch.zeros(dim, dtype=dtype))
 
     def forward(
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # aiter layernorm kernels require weight/bias to match the input dtype;
+        # cast here (no-op when they already match) since params may be stored in
+        # a different dtype (e.g. fp32 for a fused kernel that reads them directly).
+        weight = self.weight.to(x.dtype)
+        bias = self.bias.to(x.dtype)
         if residual is None:
-            return layernorm2d_fwd_(x, self.weight, self.bias, self.eps, self.dim)
+            return layernorm2d_fwd_(x, weight, bias, self.eps, self.dim)
         else:
             return layernorm2d_fwd_with_add_(
-                x, self.weight, residual, self.bias, self.eps, self.dim
+                x, weight, residual, bias, self.eps, self.dim
             )

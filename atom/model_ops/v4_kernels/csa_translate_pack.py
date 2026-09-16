@@ -10,7 +10,7 @@ Replaces the chain (per CSA layer, per fwd):
     safe_bid  = batch_id.clamp(0).long()
     safe_blk  = block_idx.long().clamp(0, mnbps-1)
     phys      = block_tables[safe_bid_expanded, safe_blk]      # fancy index
-    paged     = swa_pages + phys * csa_block_capacity + slot
+    row       = phys * envelope_rows + slot
     packed_write(paged, kv_indices_csa, kv_indptr_csa, ...)     # triton
 
 with a single triton kernel that does the indexer-topk → paged offset
@@ -40,12 +40,11 @@ Correctness:
     (batch_id=-1) bail in the kernel preamble.
 """
 
-from typing import Optional
-
 import torch
 import triton
 import triton.language as tl
 
+from atom.model_ops.v4_kernels.pool_index import compress_row
 from atom.utils.decorators import mark_trace
 
 # Target workgroup count for BLOCK_K tuning (see csa_translate_pack): grow the
@@ -60,13 +59,13 @@ def _csa_translate_pack_kernel(
     block_tables_ptr,  # [bs, mnbps] int32 — page table
     positions_ptr,  # [T] int — global token positions (only read under INLINE_SKIP_FROM_POS)
     kv_indptr_csa_ptr,  # [T+1] int32 — packed cumsum; per-token valid_k = indptr[t+1]-indptr[t]-skip[t]
-    batch_id_per_token_ptr,  # [T] int32 — token → seq, sentinel -1
+    batch_id_per_q_token_ptr,  # [T] int32 — token → seq, sentinel -1
     skip_prefix_len_per_token_ptr,  # [T] int32 — per-token write offset; ignored when INLINE_SKIP_FROM_POS
     kv_indices_csa_ptr,  # [total_indices] int32 — destination
-    swa_pages,  # i32 — SWA region size, runtime int
     mnbps,  # i32 — max blocks per seq, runtime int
     index_topk: tl.constexpr,
     csa_block_capacity: tl.constexpr,
+    ENVELOPE_ROWS: tl.constexpr,  # rows one block occupies across all layers
     BLOCK_K: tl.constexpr,
     INLINE_SKIP_FROM_POS: tl.constexpr,  # True → skip = min(pos+1, WINDOW_SIZE) (decode); False → load from buffer (prefill)
     WINDOW_SIZE: tl.constexpr,  # SWA window; only used under INLINE_SKIP_FROM_POS
@@ -76,18 +75,18 @@ def _csa_translate_pack_kernel(
 
     # CG-padded slot sentinel: builder fills [actual_T:padded_T] with -1
     # so the captured kernel grid (= padded_T) bails on padded entries.
-    bid = tl.load(batch_id_per_token_ptr + pid_t)
+    bid = tl.load(batch_id_per_q_token_ptr + pid_t)
     if bid < 0:
         return
 
     # Per-token valid_k is derived from the indptr delta we already need to
     # load anyway:
     #   kv_indptr_csa[t+1] - kv_indptr_csa[t] = skip[t] + valid_k[t]
-    # (CPU builder packs `(prefix_swa_count_or_actual_swa) + csa_valid_k`
-    # per token — see `_attach_v4_paged_decode_meta` / `_build_paged_prefill_meta`).
+    # (both builders pack `(prefix_swa_count_or_actual_swa) + csa_valid_k` per
+    # token — `build_v4_paged_decode_indptr` on the device for decode,
+    # `_build_paged_prefill_meta` on the host for prefill).
     # Reading the delta replaces the previous chain
-    # `min(min((pos+1)//ratio, n_csa_seq), index_topk)` — eliminates the
-    # `n_csa_seq` load and the `(pos+1)//ratio` compute, and stays
+    # `min((pos+1)//ratio, index_topk)` — eliminates that compute, and stays
     # CORRECT under the aiter `top_k_per_row_*` contract which only writes
     # `[0, min(k, row_length))` (the tail is uninitialized garbage from
     # `torch.empty`, never -1 — aiter tests confirm via `compare_topk_results`
@@ -133,10 +132,9 @@ def _csa_translate_pack_kernel(
         mask=in_range,
         other=0,
     )
-    paged = swa_pages + phys * csa_block_capacity + slot
     tl.store(
         kv_indices_csa_ptr + write_base + k_offs,
-        paged,
+        compress_row(phys, slot, ENVELOPE_ROWS),
         mask=in_range,
     )
 
@@ -147,11 +145,11 @@ def csa_translate_pack(
     block_tables: torch.Tensor,
     positions: torch.Tensor,
     kv_indptr_csa: torch.Tensor,
-    batch_id_per_token: torch.Tensor,
-    skip_prefix_len_per_token: Optional[torch.Tensor],
+    batch_id_per_q_token: torch.Tensor,
+    skip_prefix_len_per_token: torch.Tensor | None,
     kv_indices_csa: torch.Tensor,
     *,
-    swa_pages: int,
+    envelope_rows: int,
     csa_block_capacity: int,
     window_size: int = 0,
     prefix: str = "",
@@ -160,9 +158,10 @@ def csa_translate_pack(
 
     Per-token `valid_k` is recovered from `kv_indptr_csa[t+1] - kv_indptr_csa[t]
     - skip[t]`, which equals the Indexer's per-row visibility
-    (`min((pos+1)//ratio, n_committed_csa[bid], index_topk)`) by construction
-    of the CPU-side indptr builders (see `_attach_v4_paged_decode_meta`,
-    `_build_paged_prefill_meta`). aiter's `top_k_per_row_*` writes only
+    (`min((pos+1)//ratio, index_topk)`) by construction of the indptr builders
+    (`build_v4_paged_decode_indptr` on the device for decode,
+    `_build_paged_prefill_meta` on the host for prefill). aiter's
+    `top_k_per_row_*` writes only
     `[0, valid_k)` and leaves the tail UNINITIALIZED (`torch.empty`, no
     `-1` fill), so the explicit `k_offs < valid_k` mask is what keeps the
     kernel correct — the previous `topk >= 0` check would NOT have been a
@@ -183,7 +182,7 @@ def csa_translate_pack(
                                    → kv_len=0). The kernel reads both
                                    `[t]` and `[t+1]` so `valid_k[t]` is
                                    recovered as `indptr[t+1] - indptr[t] - skip[t]`.
-      batch_id_per_token:          [T] int32 — token → seq, sentinel -1 for
+      batch_id_per_q_token:          [T] int32 — token → seq, sentinel -1 for
                                    CG-padded slots.
       skip_prefix_len_per_token:   [T] int32 OR None — per-token SWA prefix
                                    length (the tail segment of each token's
@@ -198,9 +197,12 @@ def csa_translate_pack(
                                    this kernel writes the CSA topk section at
                                    the slice head
                                    `[indptr[t], indptr[t]+valid_k[t])`.
-      swa_pages:                   SWA region size — `num_slots * window_size`,
-                                   fixed at CG capture time. Keyword-only.
-      csa_block_capacity:          `block_size // ratio = 128 // 4 = 32`
+      envelope_rows:               rows one block occupies across all layers —
+                                   the compress stride, from
+                                   `UnifiedPoolGeometry.envelope_rows`. Fixed at
+                                   CG capture time. Keyword-only.
+      csa_block_capacity:          `block_size // ratio = 256 // 4 = 64`, the
+                                   rows this layer contributes per block
                                    (constexpr; triton can strength-reduce
                                    // and %). Keyword-only.
       window_size:                 SWA window. When > 0 the kernel computes
@@ -217,9 +219,9 @@ def csa_translate_pack(
         raise ValueError("skip_prefix_len_per_token is required when window_size == 0")
     if kv_indptr_csa.numel() < T + 1:
         raise ValueError(f"kv_indptr_csa.numel()={kv_indptr_csa.numel()} < T+1={T + 1}")
-    if batch_id_per_token.numel() < T:
+    if batch_id_per_q_token.numel() < T:
         raise ValueError(
-            f"batch_id_per_token.numel()={batch_id_per_token.numel()} < T={T}"
+            f"batch_id_per_q_token.numel()={batch_id_per_q_token.numel()} < T={T}"
         )
     if not inline_skip and skip_prefix_len_per_token.numel() < T:
         raise ValueError(
@@ -255,13 +257,13 @@ def csa_translate_pack(
         block_tables,
         positions,
         kv_indptr_csa,
-        batch_id_per_token,
+        batch_id_per_q_token,
         skip_ptr,
         kv_indices_csa,
-        swa_pages,
         mnbps,
         index_topk=index_topk,
         csa_block_capacity=csa_block_capacity,
+        ENVELOPE_ROWS=envelope_rows,
         BLOCK_K=BLOCK_K,
         INLINE_SKIP_FROM_POS=inline_skip,
         WINDOW_SIZE=window_size,
@@ -273,11 +275,11 @@ def csa_translate_pack_reference(
     block_tables: torch.Tensor,
     positions: torch.Tensor,
     kv_indptr_csa: torch.Tensor,
-    batch_id_per_token: torch.Tensor,
-    skip_prefix_len_per_token: Optional[torch.Tensor],
+    batch_id_per_q_token: torch.Tensor,
+    skip_prefix_len_per_token: torch.Tensor | None,
     kv_indices_csa: torch.Tensor,
     *,
-    swa_pages: int,
+    envelope_rows: int,
     csa_block_capacity: int,
     window_size: int = 0,
 ) -> None:
@@ -289,7 +291,7 @@ def csa_translate_pack_reference(
     T, _ = topk_local.shape
     indptr = kv_indptr_csa.to(torch.int64)
     poses = positions.to(torch.int64)
-    bids = batch_id_per_token.to(torch.int64)
+    bids = batch_id_per_q_token.to(torch.int64)
     inline_skip = window_size > 0
     skips = (
         skip_prefix_len_per_token.to(torch.int64)
@@ -312,6 +314,6 @@ def csa_translate_pack_reference(
         blk_idx = (topk // csa_block_capacity).clamp(0, mnbps - 1)
         slot = topk % csa_block_capacity
         phys = block_tables[bid, blk_idx].to(torch.int64)
-        paged = swa_pages + phys * csa_block_capacity + slot
+        rows = phys * envelope_rows + slot
         for k in range(valid_k):
-            kv_indices_csa[base + k] = int(paged[k].item())
+            kv_indices_csa[base + k] = int(rows[k].item())

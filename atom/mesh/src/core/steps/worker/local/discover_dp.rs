@@ -90,16 +90,15 @@ pub async fn get_dp_info(url: &str, api_key: Option<&str>) -> Result<DpInfo, Str
         dp_size
     };
 
-    let model_id = if let Some(model_id) = info
-        .and_then(|info| {
-            info.model_id
-                .filter(|s| !s.is_empty())
-                .or(info.served_model_name.filter(|s| !s.is_empty()))
-                .or_else(|| {
-                    info.model_path
-                        .and_then(|path| path.split('/').next_back().map(|s| s.to_string()))
-                })
-        }) {
+    let model_id = if let Some(model_id) = info.and_then(|info| {
+        info.model_id
+            .filter(|s| !s.is_empty())
+            .or(info.served_model_name.filter(|s| !s.is_empty()))
+            .or_else(|| {
+                info.model_path
+                    .and_then(|path| path.split('/').next_back().map(|s| s.to_string()))
+            })
+    }) {
         model_id
     } else {
         get_openai_model_id(url, api_key)

@@ -46,7 +46,8 @@ class TestKindPrefix:
             use_cudagraph=False,
             is_dummy=False,
             tbo_on=False,
-            bs=2,
+            scheduled_bs=2,
+            running_bs=2,
             batch=prefill_batch(14721, [7803, 6918]),
         )
         assert lbl.startswith("prefill[")
@@ -58,7 +59,8 @@ class TestKindPrefix:
             use_cudagraph=True,
             is_dummy=False,
             tbo_on=False,
-            bs=64,
+            scheduled_bs=64,
+            running_bs=64,
             batch=decode_batch(64, d=64),
         )
         assert lbl.startswith("decode[")
@@ -70,7 +72,8 @@ class TestKindPrefix:
             use_cudagraph=False,
             is_dummy=False,
             tbo_on=False,
-            bs=300,
+            scheduled_bs=300,
+            running_bs=300,
             batch=decode_batch(300, d=300),
         )
         assert lbl.startswith("eager_decode[")
@@ -81,7 +84,8 @@ class TestKindPrefix:
             use_cudagraph=True,
             is_dummy=True,
             tbo_on=False,
-            bs=1,
+            scheduled_bs=1,
+            running_bs=1,
             batch=decode_batch(1, d=1),
         )
         real = build_run_label(
@@ -89,7 +93,8 @@ class TestKindPrefix:
             use_cudagraph=True,
             is_dummy=False,
             tbo_on=False,
-            bs=1,
+            scheduled_bs=1,
+            running_bs=1,
             batch=decode_batch(1, d=1),
         )
         assert dummy.startswith("dummy_decode[")
@@ -103,7 +108,8 @@ class TestKindPrefix:
             use_cudagraph=False,
             is_dummy=True,
             tbo_on=False,
-            bs=1,
+            scheduled_bs=1,
+            running_bs=1,
             batch=prefill_batch(8192, [8192]),
         )
         assert lbl.startswith("dummy_prefill[")
@@ -115,7 +121,8 @@ class TestKindPrefix:
             use_cudagraph=False,
             is_dummy=True,
             tbo_on=False,
-            bs=1,
+            scheduled_bs=1,
+            running_bs=1,
             batch=decode_batch(1, d=1),
         )
         assert lbl.startswith("dummy_eager_decode[")
@@ -128,7 +135,8 @@ class TestFields:
             use_cudagraph=False,
             is_dummy=False,
             tbo_on=True,
-            bs=3,
+            scheduled_bs=3,
+            running_bs=3,
             batch=prefill_batch(16384, [7000, 6000, 3384]),
         )
         assert lbl.endswith("tbo=1]")
@@ -139,7 +147,8 @@ class TestFields:
             use_cudagraph=True,
             is_dummy=False,
             tbo_on=False,
-            bs=128,
+            scheduled_bs=128,
+            running_bs=128,
             batch=decode_batch(128, d=126, p=2, spec=3),
         )
         assert " p=2" in lbl and " d=126" in lbl and " spec=3" in lbl
@@ -150,7 +159,8 @@ class TestFields:
             use_cudagraph=False,
             is_dummy=False,
             tbo_on=False,
-            bs=8,
+            scheduled_bs=8,
+            running_bs=8,
             batch=prefill_batch(8000, list(range(8))),
         )
         assert "...+5" in lbl  # 8 seqs → first 3 shown + "...+5"
@@ -161,7 +171,8 @@ class TestFields:
             use_cudagraph=True,
             is_dummy=False,
             tbo_on=False,
-            bs=16,
+            scheduled_bs=16,
+            running_bs=16,
             batch=None,
         )
         assert lbl == "decode[bs=16]"
@@ -175,8 +186,8 @@ class TestGraphBs:
             use_cudagraph=True,
             is_dummy=False,
             tbo_on=False,
-            bs=117,
-            graph_bs=128,
+            scheduled_bs=117,
+            running_bs=128,
             batch=decode_batch(117, d=117),
         )
         assert lbl.startswith("decode[bs=117/128 ")
@@ -188,41 +199,38 @@ class TestGraphBs:
             use_cudagraph=True,
             is_dummy=False,
             tbo_on=False,
-            bs=128,
-            graph_bs=128,
+            scheduled_bs=128,
+            running_bs=128,
             batch=decode_batch(128, d=128),
         )
         assert lbl.startswith("decode[bs=128 ")
         assert "/" not in lbl
 
-    def test_graph_bs_below_real_bs_omits_slash(self):
-        # Guard is "graph padded ABOVE real" (graph_bs > bs). A graph_bs < bs
-        # never happens in production (the cudagraph path always has
-        # graph_bs >= bs), but if it did we keep the plain real bs rather than
-        # emit a misleading "bs=128/64".
-        lbl = build_run_label(
-            is_prefill=False,
-            use_cudagraph=True,
-            is_dummy=False,
-            tbo_on=False,
-            bs=128,
-            graph_bs=64,
-            batch=decode_batch(128, d=128),
-        )
-        assert lbl.startswith("decode[bs=128 ")
-        assert "/" not in lbl
+    def test_the_single_number_is_what_ran(self):
+        """The unslashed form reports `running_bs`, not `scheduled_bs`.
 
-    def test_graph_bs_none_is_backward_compatible(self):
-        # Omitting graph_bs keeps the legacy single-number form.
-        lbl = build_run_label(
-            is_prefill=False,
-            use_cudagraph=True,
-            is_dummy=False,
-            tbo_on=False,
-            bs=64,
-            batch=decode_batch(64, d=64),
+        They are equal here -- `decide` ceils to a captured size, so the
+        cudagraph path never runs narrower than it scheduled -- which is
+        exactly why reading the wrong one is invisible in the output. Pinned
+        by construction instead: a caller that passed only `scheduled_bs`
+        would not compile.
+        """
+        import inspect
+
+        params = inspect.signature(build_run_label).parameters
+        assert params["running_bs"].default is inspect.Parameter.empty, (
+            "every step has a running_bs; making it optional invites a caller "
+            "to omit it and silently label a padded step as unpadded"
         )
-        assert lbl.startswith("decode[bs=64 ")
+        with pytest.raises(TypeError):
+            build_run_label(
+                is_prefill=False,
+                use_cudagraph=True,
+                is_dummy=False,
+                tbo_on=False,
+                scheduled_bs=64,
+                batch=decode_batch(64, d=64),
+            )
 
     def test_dummy_decode_padded(self):
         lbl = build_run_label(
@@ -230,21 +238,21 @@ class TestGraphBs:
             use_cudagraph=True,
             is_dummy=True,
             tbo_on=False,
-            bs=1,
-            graph_bs=8,
+            scheduled_bs=1,
+            running_bs=8,
             batch=decode_batch(1, d=1),
         )
         assert lbl.startswith("dummy_decode[bs=1/8 ")
 
     def test_graph_bs_ignored_on_eager_path(self):
-        # graph_bs only applies to the CUDAGraph path; eager decode ignores it.
+        # running_bs only applies to the CUDAGraph path; eager decode ignores it.
         lbl = build_run_label(
             is_prefill=False,
             use_cudagraph=False,
             is_dummy=False,
             tbo_on=False,
-            bs=300,
-            graph_bs=512,
+            scheduled_bs=300,
+            running_bs=512,
             batch=decode_batch(300, d=300),
         )
         assert lbl.startswith("eager_decode[bs=300 ")
@@ -260,8 +268,8 @@ class TestGraphBs:
             use_cudagraph=True,
             is_dummy=False,
             tbo_on=False,
-            bs=117,
-            graph_bs=128,
+            scheduled_bs=117,
+            running_bs=128,
             batch=decode_batch(117, d=117),
         )
         assert int(re.search(r"bs=(\d+)", lbl).group(1)) == 117

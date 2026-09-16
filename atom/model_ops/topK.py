@@ -6,8 +6,10 @@ from typing import Optional
 
 import torch
 from aiter.jit.utils.torch_guard import torch_compile_guard
+
 from atom.config import get_current_atom_config
 from atom.model_ops.utils import _has_module
+from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 
 
@@ -25,7 +27,22 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
     # layout (set by the vLLM plugin under DP+EP); disable it there.
     if dp_size > 1 and config.moe_ep_flatten_tp_across_dp:
         return False
-    if dp_size > 1 and _has_module("mori") and config.enable_dp_attention:
+    # Only the selected MoRI transport needs this switch; the TP fusion is a
+    # different mechanism, and an explicitly selected RCCL/none backend must
+    # not be inferred from the mere presence of the ``mori`` Python package.
+    # EPLB always fuses, otherwise the env decides.
+    requested_all2all = getattr(config, "moe_all2all_backend", "auto")
+    mori_selected = (
+        requested_all2all in {"auto", "mori"}
+        and not envs.ATOM_DISABLE_MORI_EP
+        and _has_module("mori")
+    )
+    if (
+        dp_size > 1
+        and mori_selected
+        and config.enable_dp_attention
+        and not (getattr(config, "eplb_enable", False) or envs.ATOM_FUSE_SHARED_EXPERT)
+    ):
         return False
 
     if quant_config is not None and shared_expert_prefix is not None:

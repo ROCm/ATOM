@@ -11,12 +11,18 @@ AITER build, and `loader.py` imports AITER at module level.
 """
 
 import concurrent.futures
+import contextlib
+import json
 import logging
+import os
+import time
 from collections.abc import Callable, Iterable
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
 from transformers import AutoConfig
+from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from atom.model_loader.expert_staging import ExpertStagingPool
 from atom.model_loader.weight_dispatch import WeightDispatcher
@@ -26,7 +32,60 @@ from atom.model_loader.weight_names import (
 )
 from atom.utils import envs
 
+if TYPE_CHECKING:
+    from atom.model_loader.online_quant_streaming import OnlineQuantStreamer
+
 logger = logging.getLogger("atom")
+
+
+def rank_tag() -> str:
+    """`rank_N` for log lines, or `rank_?` before the process group exists.
+
+    Mirrors how `weight_iterator` reads the rank: diagnostics must never be the
+    thing that breaks a load, and single-process tools have no group at all.
+    """
+    with contextlib.suppress(Exception):
+        if torch.distributed.is_initialized():
+            return f"rank_{torch.distributed.get_rank()}"
+    return "rank_?"
+
+
+def verify_shard_files_present(model_name_or_path: str) -> None:
+    """Fail early when the shard index references files that are not on disk.
+
+    An interrupted download leaves a complete ``model.safetensors.index.json``
+    next to an incomplete set of shards. Without this check the load happily
+    skips every tensor those shards held, and the first symptom is the far
+    downstream "MoE parameter(s) did not receive every routed expert" report --
+    which reads like a loader or quantization bug rather than a missing file.
+    Naming the absent shards here turns that into a one-line diagnosis.
+
+    No-op for single-file checkpoints, for a bare HF repo id (nothing to stat),
+    and for an unreadable index (the existing load path already reports that).
+    """
+    index_path = os.path.join(model_name_or_path, SAFE_WEIGHTS_INDEX_NAME)
+    if not os.path.isfile(index_path):
+        return
+    try:
+        with open(index_path) as f:
+            weight_map = json.load(f).get("weight_map", {})
+    except (OSError, ValueError):
+        return
+    shards = sorted(set(weight_map.values()))
+    missing = [
+        s for s in shards if not os.path.isfile(os.path.join(model_name_or_path, s))
+    ]
+    if not missing:
+        return
+    shown = "\n  ".join(missing[:20])
+    elided = f"\n  ... and {len(missing) - 20} more" if len(missing) > 20 else ""
+    raise FileNotFoundError(
+        f"Checkpoint at {model_name_or_path} is incomplete: "
+        f"{SAFE_WEIGHTS_INDEX_NAME} references {len(shards)} shard file(s), "
+        f"but {len(missing)} of them are absent:\n  {shown}{elided}\n"
+        "Re-download the checkpoint -- an interrupted `hf download` is the "
+        "usual cause, and re-running it resumes the missing files."
+    )
 
 
 def load_weights_into_model(
@@ -43,6 +102,7 @@ def load_weights_into_model(
     fuse_shared_expert: Callable[[str, str], bool],
     is_rank0: Callable[[], bool],
     weights_iterator: Callable[..., Iterable[tuple[str, torch.Tensor]]],
+    online_quant_streamer: "OnlineQuantStreamer | None" = None,
 ) -> set[str]:
     """Copy every checkpoint tensor into the model parameter it belongs to.
 
@@ -53,6 +113,8 @@ def load_weights_into_model(
     - ``fuse_shared_expert``     ``(shared_prefix, routed_prefix) -> fuse?``
     - ``is_rank0``               suppress duplicate diagnostics off rank 0
     - ``weights_iterator``       ``(path, disable_mmap, wants) -> (name, tensor)``
+
+    ``online_quant_streamer`` tracks module completion during loading.
     """
 
     def _n_routed_experts() -> int | None:
@@ -99,6 +161,8 @@ def load_weights_into_model(
         ),
     )
     params_dict = dict(model.named_parameters())
+    if online_quant_streamer is not None:
+        online_quant_streamer.bind_params_dict(params_dict)
     # Pre-index expert_mapping by weight_name_part for O(1) lookup.
     # Original code does O(N) scan of expert_mapping (768 entries) per tensor,
     # causing ~19s of CPU time for 90k expert tensors. This reduces it to O(1).
@@ -130,6 +194,9 @@ def load_weights_into_model(
     staging_pool = ExpertStagingPool(_lookup_moe_module)
 
     num_threads = envs.ATOM_LOADER_NUM_THREADS
+    if online_quant_streamer is not None:
+        num_threads = online_quant_streamer.resolve_num_threads(num_threads)
+        online_quant_streamer.setup_online_quant_pool()
     if num_threads > 1:
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=num_threads)
     else:
@@ -137,10 +204,20 @@ def load_weights_into_model(
     futures = []
 
     def _submit(fn, *args):
-        if executor is not None:
+        # All streamed writes pass through `run` for completion tracking.
+        if online_quant_streamer is not None:
+            if executor is None:
+                online_quant_streamer.run(fn, args)
+            else:
+                futures.append(executor.submit(online_quant_streamer.run, fn, args))
+        elif executor is not None:
             futures.append(executor.submit(fn, *args))
         else:
             fn(*args)
+
+    batching_excluded = None
+    if online_quant_streamer is not None:
+        batching_excluded = online_quant_streamer.manages_param
 
     dispatcher = WeightDispatcher(
         model=model,
@@ -150,7 +227,14 @@ def load_weights_into_model(
         spec_decode=spec_decode,
         submit=_submit,
         staging_pool=staging_pool,
+        # The streamer and ExpertStagingPool own disjoint parameters. Streamed
+        # parameters use the streamer's host staging so they can be quantized
+        # and released as soon as their module completes. Non-streamed expert
+        # parameters still need ExpertStagingPool; globally disabling it when a
+        # streamer exists turns large per-expert checkpoints into tens of
+        # thousands of small loader/H2D operations.
         batching_enabled=executor is not None,
+        batching_excluded=batching_excluded,
         default_weight_loader=default_weight_loader,
         packed_modules_mapping=packed_modules_mapping,
         expert_index=expert_index,
@@ -159,6 +243,11 @@ def load_weights_into_model(
         detect_fused_expert_fn=getattr(model, "detect_fused_expert_format", None),
         get_fused_expert_mapping_fn=getattr(model, "get_fused_expert_mapping", None),
         load_fused_expert_weights_fn=load_fused_expert_weights_fn,
+        on_fused_param=(
+            None
+            if online_quant_streamer is None
+            else online_quant_streamer.materialize_fused_param
+        ),
     )
 
     # Rewriting a name is the same question as "is this tensor wanted", and the
@@ -172,6 +261,20 @@ def load_weights_into_model(
             rewritten[ckpt_name] = rewriter.rewrite(ckpt_name)
         return rewritten[ckpt_name] is not None
 
+    # Cheap stat-only preflight: an incomplete download otherwise surfaces as a
+    # confusing partial-expert-coverage error thousands of tensors later.
+    # Skipped under --load_dummy, which never touches the checkpoint.
+    if not load_dummy:
+        verify_shard_files_present(model_name_or_path)
+
+    # Phase timings. The caller reports one aggregate number for the whole load,
+    # which cannot tell "the disk is slow" from "the per-tensor dispatch is
+    # slow" -- and those have opposite fixes. With a thread pool the read loop
+    # races ahead of the work it queues, so a small `read+queue` next to a large
+    # `drain` locates the cost in the workers rather than in the read.
+    num_tensors = 0
+    t_read = t_drain = t_quant_drain = t_flush = 0.0
+
     try:
         disable_mmap = envs.ATOM_DISABLE_MMAP
         # Reject by name before the tensor is materialized. A drafter load reads
@@ -179,6 +282,7 @@ def load_weights_into_model(
         # can be skipped without being read at all. Under `--load_dummy` nothing
         # is loaded, so nothing is wanted -- and the rewriter, which is allowed
         # to raise on a checkpoint it cannot map, is never consulted.
+        _t0 = time.perf_counter()
         for name, weight_tensor in weights_iterator(
             model_name_or_path,
             disable_mmap,
@@ -193,11 +297,21 @@ def load_weights_into_model(
             if name is None:
                 continue
             dispatcher.dispatch(_orig_ckpt_name, name, weight_tensor)
+            num_tensors += 1
+        t_read = time.perf_counter() - _t0
 
+        _t0 = time.perf_counter()
         if executor is not None:
             # Drain all tasks (surfacing errors) before the safety flush.
             for future in concurrent.futures.as_completed(futures):
                 future.result()
+        t_drain = time.perf_counter() - _t0
+
+        # Measure the non-overlapped streaming tail.
+        if online_quant_streamer is not None:
+            _t0 = time.perf_counter()
+            online_quant_streamer.drain()
+            t_quant_drain = time.perf_counter() - _t0
 
         loaded_weights_record = dispatcher.loaded_weights_record
         dropped_ckpt_keys = dispatcher.dropped_ckpt_keys
@@ -207,7 +321,9 @@ def load_weights_into_model(
         # routed base experts. The per-parameter check further down is too
         # coarse to see this -- it only knows whether a parameter was touched
         # at all -- so report it while the (slot, shard) detail is still around.
+        _t0 = time.perf_counter()
         staging_report = staging_pool.flush_pending()
+        t_flush = time.perf_counter() - _t0
         if staging_report.incomplete:
             detail = "\n  ".join(staging_report.incomplete)
             message = (
@@ -224,6 +340,35 @@ def load_weights_into_model(
     finally:
         if executor is not None:
             executor.shutdown(wait=True)
+        if online_quant_streamer is not None:
+            online_quant_streamer.shutdown()
+
+    # Every rank logs its own line: the spread between ranks is itself one of
+    # the things these numbers exist to explain.
+    if online_quant_streamer is not None:
+        logger.info(
+            "[%s] weight load phases (including streaming online quant): "
+            "read+queue %.2fs (%d tensors) | drain %.2fs | quant drain %.2fs | "
+            "staging flush %.2fs | threads %d",
+            rank_tag(),
+            t_read,
+            num_tensors,
+            t_drain,
+            t_quant_drain,
+            t_flush,
+            num_threads,
+        )
+    else:
+        logger.info(
+            "[%s] weight load phases: read+queue %.2fs (%d tensors) | "
+            "drain %.2fs | staging flush %.2fs | threads %d",
+            rank_tag(),
+            t_read,
+            num_tensors,
+            t_drain,
+            t_flush,
+            num_threads,
+        )
 
     _report_coverage(
         loaded_weights_record=loaded_weights_record,
@@ -234,6 +379,8 @@ def load_weights_into_model(
     )
 
     # Avoid holding stale Parameter refs that prevent storage release.
+    if online_quant_streamer is not None:
+        online_quant_streamer.release_params_dict()
     del params_dict
 
     return loaded_weights_record

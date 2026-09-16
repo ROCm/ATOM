@@ -26,6 +26,7 @@ from atom.models.deepseek_v2 import (
     _mxfp4_activation_quant_layout,
 )
 from atom.models.utils import maybe_prefix
+from atom.plugin.sglang.models.kv_cache_utils import is_fp8_kv_cache_dtype
 
 try:
     from sglang.srt.model_executor.runner import get_is_capture_mode
@@ -64,7 +65,7 @@ except ImportError:
 from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
 )
-from sglang.srt.layers.quantization.fp8_kernel import (
+from sglang.kernels.ops.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
@@ -291,7 +292,7 @@ def init_sgl_attrs(
     attn.alt_stream = None
     attn.kv_cache_dtype = kv_cache_dtype
     attn.use_fused_qk_rope_concat_and_cache_mla = (
-        kv_cache_dtype == "fp8_e4m3" or _use_aiter_gfx95
+        is_fp8_kv_cache_dtype(kv_cache_dtype) or _use_aiter_gfx95
     )
     attn.current_sgl_plugin_attn_path = None
     attn.w_kc, attn.w_vc = None, None
@@ -485,7 +486,7 @@ def _concat_mha_k_for_non_absorbed(
     )
 
     try:
-        from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
+        from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
     except ImportError as exc:
         logger.warning(
             "Unable to import concat_and_cast_mha_k_triton; "

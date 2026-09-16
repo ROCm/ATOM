@@ -54,11 +54,22 @@ pub fn should_forward_request_header(name: &str) -> bool {
     name.eq_ignore_ascii_case("authorization")
         || name.eq_ignore_ascii_case("x-request-id")
         || name.eq_ignore_ascii_case("x-correlation-id")
+        || name.eq_ignore_ascii_case("x-session-id")
         || name.eq_ignore_ascii_case("traceparent")
         || name.eq_ignore_ascii_case("tracestate")
         || name
             .get(..REQUEST_ID_PREFIX.len())
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(REQUEST_ID_PREFIX))
+}
+
+/// Return the non-empty session ID used as the data-parallel sticky routing key.
+#[inline]
+pub fn extract_sticky_routing_key(headers: Option<&HeaderMap>) -> Option<&str> {
+    headers?
+        .get("x-session-id")?
+        .to_str()
+        .ok()
+        .filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]
@@ -75,6 +86,8 @@ mod tests {
         assert!(should_forward_request_header("X-Request-Id"));
         assert!(should_forward_request_header("x-correlation-id"));
         assert!(should_forward_request_header("X-Correlation-ID"));
+        assert!(should_forward_request_header("x-session-id"));
+        assert!(should_forward_request_header("X-Session-ID"));
         assert!(should_forward_request_header("traceparent"));
         assert!(should_forward_request_header("Traceparent"));
         assert!(should_forward_request_header("tracestate"));
@@ -99,6 +112,25 @@ mod tests {
         assert!(!should_forward_request_header("cookie"));
         assert!(!should_forward_request_header("x-custom-header"));
         assert!(!should_forward_request_header("x-api-key"));
+    }
+
+    #[test]
+    fn test_extract_sticky_routing_key() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", HeaderValue::from_static("session-123"));
+        assert_eq!(
+            extract_sticky_routing_key(Some(&headers)),
+            Some("session-123")
+        );
+    }
+
+    #[test]
+    fn test_extract_sticky_routing_key_ignores_missing_or_empty_values() {
+        assert_eq!(extract_sticky_routing_key(None), None);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", HeaderValue::from_static(""));
+        assert_eq!(extract_sticky_routing_key(Some(&headers)), None);
     }
 
     // ===================== should_forward_header_no_alloc tests =====================

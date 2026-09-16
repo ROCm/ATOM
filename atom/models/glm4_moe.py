@@ -263,15 +263,16 @@ class Glm4MoeAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        # config.rope_parameters.setdefault("partial_rotary_factor", 0.5)
-        partial_rotary_factor = 0.5
+        rope_parameters = dict(getattr(config, "rope_parameters", None) or {})
+        rope_parameters.setdefault("partial_rotary_factor", 0.5)
+        partial_rotary_factor = rope_parameters["partial_rotary_factor"]
+        rotary_dim = int(self.head_dim * partial_rotary_factor)
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=self.head_dim,
+            rotary_dim=rotary_dim,
             base=rope_theta,
             max_position=max_position_embeddings,
-            # rope_parameters=config.rope_parameters,
-            partial_rotary_factor=partial_rotary_factor,
+            rope_scaling=rope_parameters,
         )
         if self.enable_qk_norm_rope_cache_quant_fusion:
             cos = self.rotary_emb.cos_cache

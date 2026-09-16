@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import importlib
 import logging
-from typing import Any
+from collections.abc import Iterable
+from typing import Any, ClassVar
 
 from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
@@ -41,7 +42,9 @@ class KVConnectorFactory:
         connector = KVConnectorFactory.create_connector(config, role="worker")
     """
 
-    _registry: dict[str, dict[str, str]] = {}
+    _registry: ClassVar[dict[str, dict[str, str]]] = {}
+    _aliases: ClassVar[dict[str, str]] = {}
+    _requires_pd_staging: ClassVar[dict[str, bool]] = {}
 
     @classmethod
     def register(
@@ -52,6 +55,8 @@ class KVConnectorFactory:
         worker_class: str,
         scheduler_module: str,
         scheduler_class: str,
+        aliases: Iterable[str] = (),
+        requires_pd_staging: bool = True,
     ) -> None:
         """Register a KV connector backend.
 
@@ -68,6 +73,61 @@ class KVConnectorFactory:
             "scheduler_module": scheduler_module,
             "scheduler_class": scheduler_class,
         }
+        canonical = name.casefold()
+        cls._aliases[canonical] = name
+        for alias in aliases:
+            normalized = alias.strip().casefold()
+            if not normalized:
+                raise ValueError("KV connector aliases must be non-empty")
+            existing = cls._aliases.get(normalized)
+            if existing is not None and existing != name:
+                raise ValueError(
+                    f"KV connector alias {alias!r} is already registered for "
+                    f"{existing!r}"
+                )
+            cls._aliases[normalized] = name
+        cls._requires_pd_staging[name] = bool(requires_pd_staging)
+
+    @classmethod
+    def canonical_name(cls, value: object, *, path: str = "kv_transfer_config") -> str:
+        """Resolve a configured connector name through the shared registry.
+
+        Configuration parsing, attention-pool allocation, and connector
+        construction must use the same aliases.  Keeping this in the factory
+        prevents model backends from inspecting the private registry.
+        """
+
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{path} requires a non-empty 'kv_connector' string")
+        normalized = value.strip().casefold()
+        canonical = cls._aliases.get(normalized)
+        if canonical is None:
+            available = sorted(cls._registry)
+            raise ValueError(
+                f"{path} has unknown KV connector {value!r}; available: {available}"
+            )
+        return canonical
+
+    @classmethod
+    def topology_uses_pd_staging(
+        cls,
+        kv_transfer_config: dict[str, Any] | None,
+        *,
+        path: str = "kv_transfer_config",
+    ) -> bool:
+        """Return whether the configured connector needs compressor P/D staging."""
+
+        if kv_transfer_config is None or kv_transfer_config == {}:
+            return False
+        if not isinstance(kv_transfer_config, dict):
+            raise TypeError(
+                "kv_transfer_config must be a dict or None, "
+                f"got {type(kv_transfer_config).__name__}"
+            )
+        connector = cls.canonical_name(
+            kv_transfer_config.get("kv_connector"), path=path
+        )
+        return cls._requires_pd_staging.get(connector, True)
 
     @classmethod
     def create_connector(
@@ -87,13 +147,9 @@ class KVConnectorFactory:
             :class:`KVConnectorSchedulerBase` instance.
         """
         kv_cfg = getattr(config, "kv_transfer_config", {}) or {}
-        backend_name = kv_cfg.get("kv_connector", "moriio")
-
-        if backend_name not in cls._registry:
-            raise ValueError(
-                f"Unknown KV connector backend {backend_name!r}. "
-                f"Available: {list(cls._registry.keys())}"
-            )
+        backend_name = cls.canonical_name(
+            kv_cfg.get("kv_connector", "moriio"), path="kv_transfer_config"
+        )
 
         entry = cls._registry[backend_name]
 

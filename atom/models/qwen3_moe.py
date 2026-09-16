@@ -133,7 +133,18 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
-        if self.tp_size > 1 and not ENABLE_ALLREDUCE_RMSNORM_FUSION:
+        # Mori all-to-all assembles the per-token output during finalize.
+        # Pure TP+EP only computes local expert contributions and still needs
+        # the outer TP all-reduce because this FusedMoE uses reduce_results=False.
+        output_is_assembled = (
+            self.experts.moe_parallel_config.use_all2all_kernels
+            and self.experts.quant_method.using_modular_kernel
+        )
+        if (
+            self.tp_size > 1
+            and not output_is_assembled
+            and not ENABLE_ALLREDUCE_RMSNORM_FUSION
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         # return to 1d if input is 1d
         return final_hidden_states.squeeze(0) if is_input_1d else final_hidden_states

@@ -201,7 +201,7 @@ If AIPerf is not already installed in the container, prepare an isolated venv.
 ```bash
 export AIPERF_DIR=${AIPERF_DIR:-/workspace/codes/aiperf}
 export AIPERF_VENV=${AIPERF_VENV:-/workspace/venvs/aiperf-sa}
-export SA_AIPERF_COMMIT=${SA_AIPERF_COMMIT:-0d2aa0572ac685943d38c580675c4a61023581d3}
+export SA_AIPERF_COMMIT=${SA_AIPERF_COMMIT:-b7b16cf851885567988a643282266bce74e34437}
 
 mkdir -p "$(dirname "${AIPERF_DIR}")" "$(dirname "${AIPERF_VENV}")"
 if [[ ! -d "${AIPERF_DIR}/.git" ]]; then
@@ -230,7 +230,7 @@ PY
 ## Step 7: Run the Agentic Dataset Benchmark
 
 The smoke defaults below use a short benchmark duration. Increase
-`BENCHMARK_DURATION`, `AGENTIC_CACHE_WARMUP_DURATION`, and `NUM_DATASET_ENTRIES`
+`BENCHMARK_DURATION`, `WARMUP_REQUESTS_PER_LANE`, and `NUM_DATASET_ENTRIES`
 for a full run.
 
 ```bash
@@ -244,7 +244,7 @@ export OUTPUT_DIR=${OUTPUT_DIR:-/workspace/results/aiperf_m3_pd_lmcache_256k/smo
 
 export CONCURRENCY=${CONCURRENCY:-1}
 export BENCHMARK_DURATION=${BENCHMARK_DURATION:-20}
-export AGENTIC_CACHE_WARMUP_DURATION=${AGENTIC_CACHE_WARMUP_DURATION:-1}
+export WARMUP_REQUESTS_PER_LANE=${WARMUP_REQUESTS_PER_LANE:-1}
 export MAX_CONTEXT_LENGTH=${MAX_CONTEXT_LENGTH:-262144}
 export NUM_DATASET_ENTRIES=${NUM_DATASET_ENTRIES:-39}
 export TRAJECTORY_START_MIN_RATIO=${TRAJECTORY_START_MIN_RATIO:-0.25}
@@ -268,7 +268,7 @@ mkdir -p "${OUTPUT_DIR}"
   --failed-request-threshold "${FAILED_REQUEST_THRESHOLD}" \
   --trajectory-start-min-ratio "${TRAJECTORY_START_MIN_RATIO}" \
   --trajectory-start-max-ratio "${TRAJECTORY_START_MAX_RATIO}" \
-  --agentic-cache-warmup-duration "${AGENTIC_CACHE_WARMUP_DURATION}" \
+  --warmup-requests-per-lane "${WARMUP_REQUESTS_PER_LANE}" \
   --use-server-token-count \
   --no-gpu-telemetry \
   --tokenizer "${TOKENIZER}" \
@@ -286,7 +286,7 @@ overrides:
 
 ```bash
 export BENCHMARK_DURATION=1800
-export AGENTIC_CACHE_WARMUP_DURATION=600
+export WARMUP_REQUESTS_PER_LANE=10
 export CONCURRENCY=1
 export NUM_DATASET_ENTRIES=393
 export MAX_CONTEXT_LENGTH=262144

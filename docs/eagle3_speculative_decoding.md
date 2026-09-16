@@ -45,7 +45,7 @@ to the internal name:
 
 | Target stack            | Draft HF arch (in `config.json`)        | Internal class (in `support_eagle_model_arch_dict`) | Source file                              | KV cache                                                                 |
 |-------------------------|-----------------------------------------|-----------------------------------------------------|------------------------------------------|--------------------------------------------------------------------------|
-| MHA / GQA (Llama-style) | `LlamaForCausalLMEagle3`                | `Eagle3LlamaModel`                                  | `atom/models/eagle3_llama.py`            | Independent draft pool via `Eagle3DraftBuilder`                          |
+| MHA / GQA (Llama-style) | `LlamaForCausalLMEagle3`                | `Eagle3LlamaModel`                                  | `atom/models/eagle3_llama.py`            | Independent draft pool via `DraftKvBuilder`                          |
 | MLA (DeepSeek V3 / K2.6)| `Eagle3DeepseekV2ForCausalLM`           | `Eagle3DeepseekMLAModel`                            | `atom/models/eagle3_deepseek_mla.py`     | Piggybacks the target's MLA KV pool at `layer_id = num_hidden_layers`    |
 
 Both classes implement the same set of EAGLE 3.1 toggles. The MLA variant
@@ -69,9 +69,35 @@ hidden_for_logits, hidden_for_next_step = model(input_ids, positions, hidden_sta
   otherwise identical to `hidden_for_logits`. This is what the propose loop
   feeds back as `hidden_states` on the next speculative step.
 
-`EagleProposer.propose()` (`atom/spec_decode/eagle.py`) unpacks the tuple via
-`isinstance(model_out, tuple)`, so legacy drafters returning a single tensor
-continue to work without changes.
+`EagleProposer.propose()` (`atom/spec_decode/eagle_proposer.py`) unpacks the
+tuple via `isinstance(model_out, tuple)`, so legacy drafters returning a single
+tensor continue to work without changes.
+
+### `compute_draft_ids`
+
+Every draft model `EagleProposer` can build must also implement:
+
+```python
+def compute_draft_ids(self, hidden_states: torch.Tensor) -> torch.Tensor: ...  # [N] int64
+```
+
+The propose loop calls it once per draft step, unconditionally — there is no
+capability probe, so a draft model missing it raises `AttributeError` mid
+rollout.
+
+Every implementation routes through `ParallelLMHead.compute_argmax_token`: each
+rank reduces its own vocab shard to `(max_val, global_idx)` and only `[N, 2]` is
+all-gathered, instead of the `[N, vocab]` that `compute_logits` would gather.
+This is token-identical to `compute_logits(hidden_states).argmax(-1)` — the
+values compared are the same logits, ties break to the lowest global index, and
+the LM head's prefill last-token slice never fires on this path (`is_draft` is
+set for the whole propose loop; plugin mode skips the slice outright). Models
+whose readout is more than a bare head (`DeepseekV4MTP`'s hc_head + norm, the
+EAGLE 3.1 `norm_output=False` norm) apply that prefix identically in both
+methods.
+
+The DSpark archs are exempt: `DSparkProposer` drafts a whole block per forward
+and never enters this loop.
 
 ## Usage
 
@@ -112,8 +138,8 @@ to pre-EAGLE-3.1 ATOM.
 
 ## Runtime acceptance stats
 
-ATOM's scheduler already emits per-window acceptance via the `SpecStats`
-class (`atom/model_engine/scheduler.py`). With
+ATOM's scheduler already emits per-window acceptance via the spec section of
+`EngineStats` (`atom/model_engine/engine_stats.py`). With
 `num_speculative_tokens=3`, a `[MTP Stats]` line appears every 1000 decode
 steps in the server log:
 
@@ -159,7 +185,7 @@ draft sized to K2.6, which is not yet publicly available.
   custom HF modeling code, and `Stream` cannot be pickled.
 - **`mtp_start_layer_idx` dispatch** in `atom/model_engine/model_runner.py`
   branches on `speculative_config.method == "eagle3"`, not on the presence
-  of `eagle3_draft_builder`. MLA drafts piggyback the target pool and so
+  of `draft_kv_builder`. MLA drafts piggyback the target pool and so
   have no draft builder, but they still need the layer-index offset.
 - **Do not modify `@support_torch_compile`-decorated model files** for
   EAGLE-related changes — instrument at call sites (`EagleProposer.propose`,

@@ -22,6 +22,7 @@ import msgpack
 import msgspec
 import numpy as np
 import zmq
+from aiter.dist.parallel_state import get_dp_group, get_tp_group
 
 from atom.config import Config
 from atom.kv_transfer.disaggregation.base import (
@@ -29,12 +30,11 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorSchedulerBase,
 )
 from atom.kv_transfer.disaggregation.moriio.moriio_common import (
+    _MORIIO_AVAILABLE,
     MoRIIOAgentMetadata,
     MoRIIOConstants,
-    _MORIIO_AVAILABLE,
     get_port_offset,
 )
-from atom.kv_transfer.disaggregation.utils import chunk_tensor_for_rdma
 from atom.kv_transfer.disaggregation.moriio.moriio_engine import MoRIIOWrapper
 from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
@@ -43,6 +43,7 @@ from atom.kv_transfer.disaggregation.types import (
     ReqMeta,
     TransferId,
 )
+from atom.kv_transfer.disaggregation.utils import chunk_tensor_for_rdma
 from atom.model_engine.sequence import Sequence
 from atom.utils import (
     get_open_port,
@@ -50,7 +51,6 @@ from atom.utils import (
     zmq_socket_ctx,
 )
 from atom.utils.network import get_ip
-from aiter.dist.parallel_state import get_dp_group, get_tp_group
 
 if _MORIIO_AVAILABLE:
     from mori.io import (
@@ -659,7 +659,7 @@ class MoRIIOConnector(KVConnectorBase):
                 if msg == MoRIIOConstants.GET_META_MSG:
                     # Phase 1: send engine metadata
                     sock.send_multipart((identity, b"", encoded_data))
-                    logger.info("Handshake: sent engine metadata to peer")
+                    logger.debug("Handshake: sent engine metadata to peer")
                     # Phase 2: send per-layer KV cache metadata
                     buf = msgpack.dumps(layer_name_to_local_kv_cache_metadata)
                     sock.send_multipart((identity, b"", buf))
@@ -769,7 +769,7 @@ class MoRIIOConnector(KVConnectorBase):
         thread safety).  Once all complete, the request is placed on
         ``_ready_requests`` for RDMA reads.
         """
-        logger.info(
+        logger.debug(
             "Initiating background handshake for req %s -> %s",
             req_id,
             remote_engine_id,
@@ -781,7 +781,7 @@ class MoRIIOConnector(KVConnectorBase):
         remote_dp_size = int(meta.remote_dp_size)
 
         def _on_all_done(_f: Future[Any], entry=(req_id, meta)):
-            logger.info("All handshakes completed for req %s", req_id)
+            logger.debug("All handshakes completed for req %s", req_id)
             self._ready_requests.put(entry)
             self.load_ready_flag[remote_engine_id] = True
             self.write_ready_flags[remote_engine_id] = True
@@ -959,7 +959,7 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
             assert (
                 not self.is_producer
             ), "Only the decode (consumer) side handles do_remote_prefill"
-            self._reqs_need_recv[seq.id] = (seq, seq.block_table)
+            self._reqs_need_recv[seq.id] = (seq, list(seq.block_table))
             params["do_remote_prefill"] = False
             logger.debug(
                 "Queued req %s for remote KV loading (%d blocks)",
@@ -983,7 +983,7 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         seq.kv_transfer_params_output = {
             "do_remote_prefill": True,
             "do_remote_decode": False,
-            "remote_block_ids": seq.block_table.copy(),
+            "remote_block_ids": list(seq.block_table),
             "remote_engine_id": self.engine_id,
             "remote_host": self.host_ip,
             "remote_port": self.handshake_port,
@@ -993,6 +993,7 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
             "transfer_id": seq.id,
             "first_token_id": first_token_id,
             "draft_token_ids": draft_token_ids,
+            "prefix_cache_hit_tokens": getattr(seq, "prefix_cache_hit_tokens", 0),
         }
 
         # Clean up transfer ID mapping on the consumer side

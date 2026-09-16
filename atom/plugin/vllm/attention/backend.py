@@ -1,15 +1,51 @@
-from typing import Type
+from typing import ClassVar
 
 import torch
+from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
+
 from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE
 
 
-class AiterMhaBackendForVllm:
+def _indexes_kv_by_block_stride_for_backend(backend_cls) -> bool:
+    try:
+        kv_cache_stride_order = backend_cls.get_kv_cache_stride_order(
+            include_num_layers_dimension=False
+        )
+        layered_kv_cache_stride_order = backend_cls.get_kv_cache_stride_order(
+            include_num_layers_dimension=True
+        )
+    except (AttributeError, NotImplementedError):
+        return False
+
+    if len(layered_kv_cache_stride_order) != len(kv_cache_stride_order) + 1:
+        return False
+
+    return layered_kv_cache_stride_order[0] != 0
+
+
+class _VllmAttentionBackendCompat:
+    """Compatibility surface for duck-typed ATOM attention backends."""
+
+    @classmethod
+    def customize_spec(cls, spec):
+        """Keep vLLM 0.28's post-hoc KV spec unchanged."""
+        return spec
+
+    @classmethod
+    def supports_device_cpu_query_lens_mismatch(cls) -> bool:
+        """ATOM metadata builders plan from exact CPU query boundaries."""
+        return False
+
+
+class AiterMhaBackendForVllm(_VllmAttentionBackendCompat):
     """vLLM-facing MHA backend surface for ATOM attention layers."""
 
     accept_output_buffer: bool = False
-    supported_dtypes: list = [torch.float16, torch.bfloat16]
+    supported_dtypes: ClassVar[list[torch.dtype]] = [
+        torch.float16,
+        torch.bfloat16,
+    ]
     forward_includes_kv_cache_update: bool = True
 
     @staticmethod
@@ -18,6 +54,10 @@ class AiterMhaBackendForVllm:
 
     @staticmethod
     def get_supported_kernel_block_sizes():
+        # Keep the physical kernel page at 16 even when vLLM's hybrid KV manager
+        # uses a larger logical page. Advertising arbitrary multiples makes
+        # fp8 hybrid models execute cache kernels against the unsplit logical
+        # page and corrupts TP output.
         return [16]
 
     @classmethod
@@ -70,9 +110,21 @@ class AiterMhaBackendForVllm:
     def is_ssm(cls) -> bool:
         return False
 
+    @classmethod
+    def supports_sliding_window(cls) -> bool:
+        return True
+
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return False
+
     @staticmethod
     def get_required_kv_cache_layout():
         return None
+
+    @classmethod
+    def indexes_kv_by_block_stride(cls) -> bool:
+        return _indexes_kv_by_block_stride_for_backend(cls)
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
@@ -83,7 +135,7 @@ class AiterMhaBackendForVllm:
         return False
 
     @staticmethod
-    def get_builder_cls() -> Type:
+    def get_builder_cls() -> type:
         from atom.plugin.vllm.attention.metadata import AiterMhaMetadataBuilderForVllm
 
         return AiterMhaMetadataBuilderForVllm
@@ -99,11 +151,22 @@ class AiterMhaBackendForVllm:
         return (cls.__module__, cls.__qualname__)
 
 
-class AiterMlaBackendForVllm:
+class AiterMhaFlexibleBlockBackendForVllm(AiterMhaBackendForVllm):
+    """Draft-only backend whose Triton path accepts the logical KV page size."""
+
+    @staticmethod
+    def get_supported_kernel_block_sizes():
+        return [MultipleOf(16)]
+
+
+class AiterMlaBackendForVllm(_VllmAttentionBackendCompat):
     """vLLM-facing dense MLA backend surface for ATOM attention layers."""
 
     accept_output_buffer: bool = True
-    supported_dtypes: list = [torch.float16, torch.bfloat16]
+    supported_dtypes: ClassVar[list[torch.dtype]] = [
+        torch.float16,
+        torch.bfloat16,
+    ]
     forward_includes_kv_cache_update: bool = True
 
     @staticmethod
@@ -129,11 +192,37 @@ class AiterMlaBackendForVllm:
         return (num_blocks, block_size, head_size)
 
     @classmethod
+    def get_kv_cache_block_dim(
+        cls,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> int:
+        sentinel = 1234567
+        shape = cls.get_kv_cache_shape(
+            sentinel,
+            block_size,
+            num_kv_heads,
+            head_size,
+            cache_dtype_str=cache_dtype_str,
+        )
+        return shape.index(sentinel)
+
+    @classmethod
     def is_mla(cls) -> bool:
         return True
 
     @classmethod
     def is_ssm(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_sliding_window(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_pcp(cls) -> bool:
         return False
 
     @staticmethod
@@ -154,8 +243,12 @@ class AiterMlaBackendForVllm:
     ) -> tuple[int, ...]:
         return (1, 0, 2, 3) if include_num_layers_dimension else (0, 1, 2)
 
+    @classmethod
+    def indexes_kv_by_block_stride(cls) -> bool:
+        return _indexes_kv_by_block_stride_for_backend(cls)
+
     @staticmethod
-    def get_builder_cls() -> Type:
+    def get_builder_cls() -> type:
         from atom.plugin.vllm.attention.metadata import AiterMlaMetadataBuilderForVllm
 
         return AiterMlaMetadataBuilderForVllm
@@ -172,7 +265,7 @@ class AiterMlaBackendForVllm:
 
 
 class AtomAiterMLAPrefillBackend(MLAPrefillBackend):
-    """vLLM 0.22 MLA prefill interface backed by ATOM's aiter path."""
+    """vLLM MLA prefill interface backed by ATOM's aiter path."""
 
     @staticmethod
     def get_name() -> str:
@@ -180,7 +273,6 @@ class AtomAiterMLAPrefillBackend(MLAPrefillBackend):
 
     def __init__(
         self,
-        layer,
         num_heads: int,
         scale: float,
         kv_lora_rank: int,
@@ -188,6 +280,7 @@ class AtomAiterMLAPrefillBackend(MLAPrefillBackend):
         qk_rope_head_dim: int,
         v_head_dim: int,
         vllm_config,
+        layer=None,
     ) -> None:
         super().__init__(
             num_heads=num_heads,
@@ -200,7 +293,33 @@ class AtomAiterMLAPrefillBackend(MLAPrefillBackend):
         )
         self._layer = layer
 
-    def run_prefill_new_tokens(self, q, k, v, return_softmax_lse):
+    def clone(self):
+        return self.__class__(
+            num_heads=self.num_heads,
+            scale=self.scale,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            v_head_dim=self.v_head_dim,
+            vllm_config=self.vllm_config,
+            layer=self._layer,
+        )
+
+    def run_prefill_new_tokens(
+        self,
+        q,
+        k,
+        v,
+        return_softmax_lse,
+        out=None,
+        output_scale=None,
+    ):
+        if self._layer is None:
+            raise RuntimeError("ATOM MLA prefill backend is not bound to a layer.")
+        if out is not None or output_scale is not None:
+            raise NotImplementedError(
+                "ATOM MLA prefill does not support fused quantized output."
+            )
         return self._layer._run_prefill_new_tokens(
             self._prefill_metadata,
             q,
@@ -209,18 +328,29 @@ class AtomAiterMLAPrefillBackend(MLAPrefillBackend):
             return_softmax_lse,
         )
 
-    def run_prefill_context_chunk(self, chunk_idx: int, q, k, v):
-        return self._layer._run_prefill_context_chunk(
-            self._prefill_metadata,
-            chunk_idx,
-            q,
-            k,
-            v,
+    def run_prefill_context_chunk(self, chunk, q, k, v, out=None):
+        if self._layer is None:
+            raise RuntimeError("ATOM MLA prefill backend is not bound to a layer.")
+        if out is not None:
+            raise NotImplementedError(
+                "ATOM MLA context prefill does not support an output buffer."
+            )
+        return self._layer._flash_attn_varlen_diff_headdims(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=chunk.query_start_loc,
+            cu_seqlens_k=chunk.cu_seq_lens,
+            max_seqlen_q=chunk.max_query_len,
+            max_seqlen_k=chunk.max_seq_len,
+            softmax_scale=self.scale,
+            causal=False,
+            return_softmax_lse=True,
         )
 
 
 def build_vllm_mla_prefill_backend(layer, vllm_config):
-    """Create the vLLM 0.22 MLA prefill backend for an ATOM MLA layer."""
+    """Create the vLLM MLA prefill backend for an ATOM MLA layer."""
     return AtomAiterMLAPrefillBackend(
         layer=layer,
         num_heads=layer.num_heads,
@@ -246,7 +376,7 @@ class AiterSparseMlaBackendForVllm(AiterMlaBackendForVllm):
         return 64
 
     @staticmethod
-    def get_builder_cls() -> Type:
+    def get_builder_cls() -> type:
         from atom.plugin.vllm.attention.metadata import AiterMlaSparseMetadataBuilder
 
         return AiterMlaSparseMetadataBuilder
@@ -279,7 +409,7 @@ class AiterSparseMlaIndexerBackendForVllm(AiterMlaBackendForVllm):
         return 64
 
     @staticmethod
-    def get_builder_cls() -> Type:
+    def get_builder_cls() -> type:
         from atom.plugin.vllm.attention.metadata import (
             AiterMlaSparseIndexerMetadataBuilder,
         )
@@ -301,12 +431,19 @@ class AiterSparseMlaIndexerBackendForVllm(AiterMlaBackendForVllm):
         return (cls.__module__, cls.__qualname__)
 
 
-class MiniMaxM3SparseAttentionBackend:
+class MiniMaxM3SparseAttentionBackend(_VllmAttentionBackendCompat):
     """vLLM-facing sparse MHA backend surface for MiniMax-M3."""
 
     accept_output_buffer: bool = True
-    supported_dtypes: list = [torch.float16, torch.bfloat16]
-    supported_kv_cache_dtypes: list = ["bfloat16", "fp8", "fp8_e4m3"]
+    supported_dtypes: ClassVar[list[torch.dtype]] = [
+        torch.float16,
+        torch.bfloat16,
+    ]
+    supported_kv_cache_dtypes: ClassVar[list[str]] = [
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+    ]
     forward_includes_kv_cache_update: bool = True
 
     @staticmethod
@@ -344,7 +481,7 @@ class MiniMaxM3SparseAttentionBackend:
         return SPARSE_BLOCK_SIZE
 
     @staticmethod
-    def get_builder_cls() -> Type:
+    def get_builder_cls() -> type:
         from atom.plugin.vllm.attention.metadata import (
             MinimaxM3SparseAttentionMetadataBuilder,
         )
@@ -367,6 +504,14 @@ class MiniMaxM3SparseAttentionBackend:
     def is_ssm(cls) -> bool:
         return False
 
+    @classmethod
+    def supports_sliding_window(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return False
+
     @staticmethod
     def get_required_kv_cache_layout():
         return None
@@ -387,13 +532,22 @@ class MiniMaxM3SparseAttentionBackend:
             raise ValueError(
                 f"MiniMax-M3 sparse block size must be {SPARSE_BLOCK_SIZE}."
             )
-        return (2, num_blocks, block_size, num_kv_heads, head_size)
+        return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
     @staticmethod
     def get_kv_cache_stride_order(
         include_num_layers_dimension: bool = False,
     ) -> tuple[int, ...]:
-        raise NotImplementedError
+        if include_num_layers_dimension:
+            raise NotImplementedError
+        # Keep the logical block dimension first so vLLM does not normalize this
+        # cache together with the block-first index cache. Physically place K/V
+        # first so each cache remains contiguous for the page-16 ASM kernels.
+        return (1, 0, 2, 3, 4)
+
+    @classmethod
+    def indexes_kv_by_block_stride(cls) -> bool:
+        return _indexes_kv_by_block_stride_for_backend(cls)
 
     @staticmethod
     def get_impl_cls():
@@ -424,7 +578,7 @@ class SparseMHAIndexerBackend(AiterMlaBackendForVllm):
         return SPARSE_BLOCK_SIZE
 
     @staticmethod
-    def get_builder_cls() -> Type:
+    def get_builder_cls() -> type:
         from atom.plugin.vllm.attention.metadata import (
             MinimaxM3SparseAttentionMetadataBuilder,
         )
@@ -454,13 +608,13 @@ class SparseMHAIndexerBackend(AiterMlaBackendForVllm):
         return (0, 1, 2)
 
 
-class GDNAttentionBackend:
+class GDNAttentionBackend(_VllmAttentionBackendCompat):
     @staticmethod
     def get_name() -> str:
         return "ROCM_GDN_ATTENTION"
 
     @staticmethod
-    def get_impl_cls() -> Type:
+    def get_impl_cls() -> type:
         from atom.plugin.vllm.attention.layer_gdn import GatedDeltaNet
 
         return GatedDeltaNet

@@ -5,9 +5,11 @@
 
 import importlib
 import sys
+from contextlib import nullcontext
 from types import ModuleType
 from unittest.mock import patch
 
+import pytest
 import torch
 
 
@@ -69,7 +71,9 @@ def _make_fake_modules() -> dict[str, ModuleType]:
         ),
         "aiter.dist.parallel_state": _module(
             "aiter.dist.parallel_state",
-            get_pp_group=lambda: _Obj(is_first_rank=True, is_last_rank=True),
+            get_pp_group=lambda: _Obj(
+                is_first_rank=True, is_last_rank=True, world_size=1
+            ),
         ),
         "atom.model_loader.loader": _module(
             "atom.model_loader.loader",
@@ -82,7 +86,7 @@ def _make_fake_modules() -> dict[str, ModuleType]:
             Qwen3_5Model=type("Qwen3_5Model", (), {}),
             Qwen3_5MoeForCausalLM=type("Qwen3_5MoeForCausalLM", (), {}),
             detect_fused_expert_format=lambda *_a, **_k: False,
-            get_fused_expert_mapping=lambda: [],
+            get_fused_expert_mapping=list,
             load_fused_expert_weights=lambda *_a, **_k: True,
         ),
         "atom.models.utils": _module(
@@ -100,6 +104,13 @@ def _make_fake_modules() -> dict[str, ModuleType]:
                 (),
                 {},
             ),
+        ),
+        "atom.plugin.sglang.runtime": _module(
+            "atom.plugin.sglang.runtime",
+            SGLangForwardBatchMetadata=object,
+            SGLangPluginRuntime=object,
+            get_model_arch_spec=lambda _arch: _Obj(bind_cache_views=None),
+            plugin_runtime_scope=lambda **_kwargs: nullcontext(),
         ),
         "atom.plugin.sglang.models.base_model_wrapper": _module(
             "atom.plugin.sglang.models.base_model_wrapper",
@@ -133,7 +144,14 @@ def test_qwen35_bf16_mapping_uses_fused_in_proj_layout():
     assert "in_proj_ba" not in remapped
 
 
-def test_qwen35_prepare_adaptations_remap_quant_config():
+@pytest.mark.parametrize(
+    "model_arch",
+    [
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+    ],
+)
+def test_qwen35_prepare_adaptations_remap_quant_config(model_arch):
     with patch.dict(sys.modules, _make_fake_modules()):
         sys.modules.pop("atom.plugin.sglang.models.qwen3_5", None)
         module = importlib.import_module("atom.plugin.sglang.models.qwen3_5")
@@ -156,9 +174,7 @@ def test_qwen35_prepare_adaptations_remap_quant_config():
             ),
         )
 
-        module.apply_prepare_model_adaptations(
-            atom_config, "Qwen3_5MoeForConditionalGeneration"
-        )
+        module.apply_prepare_model_adaptations(atom_config, model_arch)
 
     assert text_config.n_shared_experts == 1
     assert text_config.n_routed_experts == 256
@@ -167,3 +183,86 @@ def test_qwen35_prepare_adaptations_remap_quant_config():
     assert (
         calls["weights_mapper"].orig_to_new_prefix["model.language_model."] == "model."
     )
+
+
+class _FakeLayer:
+    def __call__(self, positions, hidden_states, residual):
+        del positions
+        next_residual = (
+            hidden_states.clone() if residual is None else hidden_states + residual
+        )
+        return hidden_states + 1, next_residual
+
+
+class _FakeNorm:
+    def __call__(self, hidden_states, residual):
+        return hidden_states + residual, None
+
+
+class _FakeDecoderStack:
+    def __init__(self):
+        self.config = _Obj(hidden_size=2)
+        self.start_layer = 0
+        self.end_layer = 2
+        self.layers = [_FakeLayer(), _FakeLayer()]
+        self.norm = _FakeNorm()
+
+    def get_input_embeddings(self, input_ids):
+        return input_ids.to(torch.float32)
+
+
+def test_decoder_stack_dflash_capture_uses_shifted_residual_stream():
+    with patch.dict(sys.modules, _make_fake_modules()):
+        sys.modules.pop("atom.plugin.sglang.models.qwen3_5", None)
+        module = importlib.import_module("atom.plugin.sglang.models.qwen3_5")
+        stack = _FakeDecoderStack()
+        inputs_embeds = torch.tensor([[1.0, 2.0]])
+        positions = torch.tensor([0])
+
+        final_hidden, aux_hidden = module._forward_qwen35_decoder_stack(
+            stack,
+            input_ids=None,
+            positions=positions,
+            inputs_embeds=inputs_embeds,
+            dflash_capture_points=(1,),
+        )
+
+    assert len(aux_hidden) == 1
+    torch.testing.assert_close(aux_hidden[0], torch.tensor([[3.0, 5.0]]))
+    assert final_hidden.shape == inputs_embeds.shape
+
+
+def test_decoder_stack_dflash_capture_includes_previous_deepstack():
+    with patch.dict(sys.modules, _make_fake_modules()):
+        sys.modules.pop("atom.plugin.sglang.models.qwen3_5", None)
+        module = importlib.import_module("atom.plugin.sglang.models.qwen3_5")
+        stack = _FakeDecoderStack()
+        inputs_embeds = torch.tensor([[1.0, 2.0]])
+        deepstack = torch.tensor([[10.0, 20.0, 0.0, 0.0, 0.0, 0.0]])
+
+        _, aux_hidden = module._forward_qwen35_decoder_stack(
+            stack,
+            input_ids=None,
+            positions=torch.tensor([0]),
+            inputs_embeds=inputs_embeds,
+            input_deepstack_embeds=deepstack,
+            dflash_capture_points=(1,),
+        )
+
+    torch.testing.assert_close(aux_hidden[0], torch.tensor([[13.0, 25.0]]))
+
+
+def test_dflash_setter_keeps_outer_wrapper_shifted_points():
+    with patch.dict(sys.modules, _make_fake_modules()):
+        sys.modules.pop("atom.plugin.sglang.models.qwen3_5", None)
+        module = importlib.import_module("atom.plugin.sglang.models.qwen3_5")
+        adapter_cls = module._get_qwen35_language_model_stack_cls(
+            module.Qwen3_5ForCausalLM
+        )
+        adapter = object.__new__(adapter_cls)
+        adapter.model = _Obj(start_layer=0, end_layer=60)
+        adapter.atom_config = _Obj(enable_dp_attention=False)
+
+        adapter.set_dflash_layers_to_capture([2, 10, 18, 26, 34, 42, 50, 58])
+
+    assert adapter.dflash_capture_points == (2, 10, 18, 26, 34, 42, 50, 58)

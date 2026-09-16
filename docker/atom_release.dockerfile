@@ -1,5 +1,6 @@
-# Default base image
-ARG BASE_IMAGE="rocm/pytorch:latest"
+# Keep the release reproducible on the ROCm 7.2.4 / PyTorch 2.10 stack.
+# The digest prevents this historical tag from being moved underneath us.
+ARG BASE_IMAGE="rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0@sha256:4449f856653602317e4101a76fce599c7fcd58ccec2e539951fce5f73083179e"
 ARG GPU_ARCH="gfx942;gfx950"
 
 # ====================================================================
@@ -24,13 +25,49 @@ ARG GPU_ARCH
 ENV GPU_ARCH_LIST=$GPU_ARCH
 ENV PYTORCH_ROCM_ARCH=$GPU_ARCH
 
-RUN pip install --upgrade pip && \
+# Use the legacy HSA IPC mode. The new mode keeps GPU memory pinned after
+# hipFree when a rank dies, so a crashed vLLM/LMCache worker leaves its VRAM
+# behind and the server crash-loops on "not enough free GPU memory".
+# Set in the base stage so every downstream image (atom, vllm-atom, sglang-atom)
+# inherits it. See https://github.com/ROCm/rocm-libraries/issues/6266 and the
+# same setting in vllm's own docker/Dockerfile.rocm.
+ENV HSA_ENABLE_IPC_MODE_LEGACY=1
+
+# AITER's prebuilt and runtime-JIT modules must use the same pybind ABI.
+RUN pip install --upgrade pip "pybind11==3.0.4" && \
     apt-get update && \
     apt --fix-broken install -y && \
     apt-get install -y \
         git cython3 ibverbs-utils openmpi-bin libopenmpi-dev \
         libpci-dev cmake libdw1 locales && \
     rm -rf /var/lib/apt/lists/*
+
+# Newer rocm/pytorch images install ROCm libraries through Python wheels
+# instead of /opt/rocm. Register those directories so dpkg-shlibdeps can
+# resolve RCCL's dependencies while retaining compatibility with /opt/rocm.
+RUN ROCM_SDK_LIB_DIRS="$(python -c \
+        'import glob, os; print("\n".join(sorted({os.path.dirname(p) for p in glob.glob("/opt/venv/lib/python*/site-packages/_rocm_sdk*/lib/*.so*")})))')" && \
+    if [ -n "${ROCM_SDK_LIB_DIRS}" ]; then \
+        printf '%s\n' "${ROCM_SDK_LIB_DIRS}" \
+            > /etc/ld.so.conf.d/rocm-python-sdk.conf; \
+        ldconfig; \
+    fi
+
+# Pin Triton to the perf-good ROCm build. The base rocm/pytorch image ships a
+# newer Triton (3.8.0) that regressed benchmark throughput; install the
+# AMD-published 3.7.0 wheel plus its matching triton_kernels from AMD's index,
+# here in the shared base so every downstream stage (the aiter build included)
+# links the same Triton. Empty TRITON_PIN_VERSION keeps the base image's Triton.
+ARG TRITON_INDEX_URL="https://pypi.amd.com/triton/release/rocm-7.2.0/simple/"
+ARG TRITON_PIN_VERSION="3.7.0+amd.rocm7.2.0.git89002410"
+ARG TRITON_KERNELS_PIN_VERSION="1.0.0+amd.rocm7.2.0.git89002410"
+RUN if [ -n "${TRITON_PIN_VERSION}" ]; then \
+        echo "========== [base] Pin Triton ${TRITON_PIN_VERSION} (index ${TRITON_INDEX_URL}) =========="; \
+        pip install --index-url "${TRITON_INDEX_URL}" --force-reinstall --no-deps \
+            "triton==${TRITON_PIN_VERSION}" \
+            "triton_kernels==${TRITON_KERNELS_PIN_VERSION}" && \
+        python -c "import importlib.metadata as m; print('triton pinned ->', m.version('triton'))"; \
+    fi
 
 # --------------------------------------------------------------------
 # Stage 1: RCCL — parallel
@@ -201,49 +238,75 @@ RUN echo "========== Install atomesh binary ==========" && \
     cp target/release/atomesh /usr/local/bin/atomesh && \
     atomesh --version
 
-# ========== LMCache (HIP c_ops) for KV offload ==========
-# ATOM's KV offload uses the LMCache connector, which needs LMCache's c_ops
-# built for ROCm. NEVER `pip install lmcache` — it pulls CUDA torch and breaks
-# the ROCm stack. Build from source pinned to a release tag, against the image's
-# torch. KEY: the install must be EDITABLE (`pip install -e .`); at this tag a
-# non-editable `pip install .` silently SKIPS the c_ops extension and falls back
-# to the slow python backend. Verified end-to-end (tp8 offload store via c_ops)
-# on gfx950. NOTE: tp>1 offload also needs aiter's eager-NCCL-init fix
-# (device_id= to init_process_group); that belongs in aiter (tracked separately),
-# not here — the CI build_aiter stage picks it up once merged.
-ARG LMCACHE_TAG=v0.4.5
-# PYTORCH_ROCM_ARCH is inherited as ENV from the `base` stage (=${GPU_ARCH});
-# hipcc reads it to target both gfx942 and gfx950. Do not re-derive from
-# ${GPU_ARCH} here — ARG does not cross FROM so it would be empty in this stage.
-RUN echo "========== [ATOM] LMCache HIP c_ops (${LMCACHE_TAG}, arch=${PYTORCH_ROCM_ARCH}) ==========" && \
-    git clone https://github.com/LMCache/LMCache.git /opt/LMCache && \
-    cd /opt/LMCache && git checkout ${LMCACHE_TAG} && \
-    "${VENV_PYTHON}" -m pip install -r requirements/build.txt && \
-    CXX=hipcc BUILD_WITH_HIP=1 \
-      "${VENV_PYTHON}" -m pip install -e . --no-build-isolation --no-deps && \
-    "${VENV_PYTHON}" -m pip install --no-deps \
-        prometheus_client==0.25.0 aiofile==3.11.1 caio==0.9.25 && \
-    "${VENV_PYTHON}" -c "import torch, lmcache, lmcache.c_ops; \
+# ========== LMCache (ROCm 7.2.4 / torch 2.10) for KV offload ==========
+# Install the official wheel built for the image's exact PyTorch ABI. Keep
+# --no-deps so pip cannot replace the preinstalled ROCm torch stack.
+ARG LMCACHE_WHEEL_NAME=lmcache-0.5.5rc3+rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1-cp312-cp312-manylinux_2_39_x86_64.whl
+ARG LMCACHE_WHEEL_URL=https://github.com/LMCache/LMCache/releases/download/v0.5.5rc3-rocm-torch210/lmcache-0.5.5rc3%2Brocm7.2.4.torch2.10.git3d3aa833.cxx11abi1-cp312-cp312-manylinux_2_39_x86_64.whl
+ARG LMCACHE_WHEEL_SHA256=06cda2fef1c2cf3926ffa59c4ba13b6029c6e40d3fba6db2bc2e7350a29c280f
+# Docker builds do not expose a GPU, so LMCache's torch.cuda.is_available()
+# backend predicate is overridden only in the validation process below.
+RUN echo "========== [ATOM] Install LMCache ROCm torch 2.10 wheel ==========" && \
+    curl -fL "${LMCACHE_WHEEL_URL}" -o "/tmp/${LMCACHE_WHEEL_NAME}" && \
+    echo "${LMCACHE_WHEEL_SHA256}  /tmp/${LMCACHE_WHEEL_NAME}" | sha256sum -c - && \
+    "${VENV_PYTHON}" -m pip install \
+        prometheus_client==0.25.0 aiofile==3.11.1 aiofiles caio==0.9.25 \
+        blake3 redis sortedcontainers pyzmq cupy-rocm-7-0 \
+        cachetools cryptography numba openai \
+        opentelemetry-api==1.40.0 opentelemetry-sdk==1.40.0 \
+        opentelemetry-exporter-otlp==1.40.0 \
+        opentelemetry-exporter-prometheus==0.61b0 && \
+    "${VENV_PYTHON}" -m pip install --no-deps "/tmp/${LMCACHE_WHEEL_NAME}" && \
+    rm -f "/tmp/${LMCACHE_WHEEL_NAME}" && \
+    "${VENV_PYTHON}" -c "import torch; torch.cuda.is_available = lambda: True; import lmcache, lmcache.cuda_ops, lmcache.lmcache_native; \
 from lmcache.v1.cache_engine import LMCacheEngineBuilder; \
 from lmcache.v1.memory_management import MemoryFormat; \
 from lmcache.v1.lookup_client.factory import LookupClientFactory; \
 from lmcache.v1.config import LMCacheEngineConfig; \
 from lmcache.v1.metadata import LMCacheMetadata; \
+from lmcache.integration.atom import AtomMPSchedulerAdapter, AtomMPTransferSpec, AtomMPWorkerAdapter; \
+from lmcache.utils import EngineType; \
+from lmcache.v1.multiprocess.futures import DeviceMessagingFuture; \
+from lmcache.v1.multiprocess.group_view import EngineGroupInfo; \
 assert 'rocm' in torch.__version__, torch.__version__; \
-assert lmcache.c_ops.__file__.endswith('.so'), 'c_ops fell back to python backend!'; \
-print('OK: lmcache', lmcache.__version__, 'HIP c_ops; torch', torch.__version__)"
+assert lmcache.__version__.startswith('0.5.5rc3+rocm7.2.4.torch2.10'), lmcache.__version__; \
+assert lmcache.cuda_ops.__file__.endswith('.so'), lmcache.cuda_ops.__file__; \
+assert lmcache.lmcache_native.__file__.endswith('.so'), lmcache.lmcache_native.__file__; \
+assert hasattr(lmcache.cuda_ops, 'execute_object_group_transfer'), 'cuda_ops extension is incomplete'; \
+assert EngineType.ATOM.value == 'atom'; \
+assert DeviceMessagingFuture.__module__ == 'lmcache.v1.multiprocess.futures'; \
+assert AtomMPTransferSpec.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
+assert AtomMPSchedulerAdapter.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
+assert AtomMPWorkerAdapter.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
+print('OK: lmcache', lmcache.__version__, 'HIP cuda_ops; torch', torch.__version__)"
 
 # ========== SemiAnalysis aiperf agentic benchmark tool ==========
-# Install the SemiAnalysis fork pinned to the commit that supports the SA
-# agentic datasets (semianalysis_cc_traces_weka_062126*).
+# The SemiAnalysis fork, which is what carries the SA agentic datasets
+# (semianalysis_cc_traces_weka_062126*).
+#
+# Pinned to the commit InferenceX's `utils/aiperf` submodule points at, so our
+# image ships the aiperf they measure with. Their pointer is a deliberate,
+# frequently-moved pin -- four bumps in the first half of August 2026, and a
+# same-day revert on 2026-07-28 -- with commit titles that read "pin AIPerf v1
+# timing watchdog", "pin additive AIPerf main warmup". Tracking aiperf's master
+# instead would take in exactly the upstream changes they evaluate and
+# sometimes reject.
+#
+# It therefore has to be followed by hand. To re-check:
+#   git ls-tree main utils/aiperf     # in a clone of SemiAnalysisAI/InferenceX
+#
+# `SA_AIPERF_REF` accepts any ref; empty means "whatever HEAD points at", which
+# is why the checkout below is conditional rather than naming a branch (an
+# upstream default-branch rename would otherwise break unrelated builds).
 ARG INSTALL_SA_AIPERF=1
-ARG SA_AIPERF_COMMIT="0d2aa0572ac685943d38c580675c4a61023581d3"
+ARG SA_AIPERF_REF="754356e9a39acc6cc6afb242d123bb57c3fb6f75"
 RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
-        echo "========== [ATOM] Install SemiAnalysis aiperf (${SA_AIPERF_COMMIT}) =========="; \
+        echo "========== [ATOM] Install SemiAnalysis aiperf (ref=${SA_AIPERF_REF:-<default branch>}) =========="; \
         rm -rf /opt/aiperf && \
         git clone https://github.com/SemiAnalysisAI/aiperf.git /opt/aiperf && \
         cd /opt/aiperf && \
-        git checkout "${SA_AIPERF_COMMIT}" && \
+        { [ -z "${SA_AIPERF_REF}" ] || git checkout "${SA_AIPERF_REF}"; } && \
+        echo "[ATOM] aiperf resolved to $(git rev-parse HEAD)" && \
         sed -i '/^[[:space:]]*"transformers @ git+/d' pyproject.toml && \
         ! grep -q '^[[:space:]]*"transformers @ git+' pyproject.toml && \
         "${VENV_PYTHON}" -m pip install -e . && \
@@ -252,6 +315,22 @@ RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
         command -v aiperf && aiperf --help >/dev/null; \
     else \
         echo "========== Skipped SemiAnalysis aiperf (INSTALL_SA_AIPERF=0) =========="; \
+    fi
+
+# Guarantee the perf-good Triton survived every install above: re-pin if
+# something pulled a different one, then assert the exact version or fail the
+# build -- the image must never silently ship the base image's newer Triton.
+ARG TRITON_INDEX_URL="https://pypi.amd.com/triton/release/rocm-7.2.0/simple/"
+ARG TRITON_PIN_VERSION="3.7.0+amd.rocm7.2.0.git89002410"
+ARG TRITON_KERNELS_PIN_VERSION="1.0.0+amd.rocm7.2.0.git89002410"
+RUN if [ -n "${TRITON_PIN_VERSION}" ]; then \
+        cur="$("${VENV_PYTHON}" -c 'import importlib.metadata as m; print(m.version("triton"))' 2>/dev/null || echo none)"; \
+        if [ "${cur}" != "${TRITON_PIN_VERSION}" ]; then \
+            echo "[atom_image] Triton drifted to ${cur}; re-pinning ${TRITON_PIN_VERSION}"; \
+            "${VENV_PYTHON}" -m pip install --index-url "${TRITON_INDEX_URL}" --force-reinstall --no-deps \
+                "triton==${TRITON_PIN_VERSION}" "triton_kernels==${TRITON_KERNELS_PIN_VERSION}"; \
+        fi; \
+        "${VENV_PYTHON}" -c "import importlib.metadata as m; v=m.version('triton'); assert v == '${TRITON_PIN_VERSION}', 'Triton dist is '+v+', expected ${TRITON_PIN_VERSION}'; print('[atom_image] final triton', v)"; \
     fi
 
 CMD ["/bin/bash"]

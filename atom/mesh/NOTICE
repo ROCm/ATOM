@@ -9,3 +9,11 @@ which is licensed under the Apache License, Version 2.0.
   Licensed under the Apache License, Version 2.0
   https://www.apache.org/licenses/LICENSE-2.0
 
+This product includes vendored source from tool-parser 1.0.0
+(https://crates.io/crates/tool-parser/1.0.0), derived from SMG commit
+7455eaee1da5212ae5e0fd33d80a903029d2f981.
+
+  Copyright SMG contributors
+  Licensed under the Apache License, Version 2.0
+  https://www.apache.org/licenses/LICENSE-2.0
+

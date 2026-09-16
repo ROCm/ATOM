@@ -28,8 +28,10 @@ runner.
     flush_staged(param, staging, filled) -> None
 """
 
+import functools
 import logging
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -38,18 +40,50 @@ import torch
 
 logger = logging.getLogger("atom")
 
+# `zero_` on a packed dtype only reaches `fill_cpu` -- which has no kernel for
+# it -- once the tensor is big enough for torch's parallel path (GRAIN_SIZE,
+# 32768 elements). Below that it takes a memset fast path and succeeds, so a
+# small probe would answer "zeroable" for every dtype and defeat the point.
+_ZERO_PROBE_NUMEL = 1 << 15
+
+
+@functools.cache
+def _cpu_zeroable(dtype: torch.dtype) -> bool:
+    """Whether a staging-sized CPU tensor of `dtype` can be `zero_`d.
+
+    Cached per dtype: a checkpoint has a handful of dtypes and tens of
+    thousands of tensors, and the probe allocates (briefly) to answer.
+    """
+    try:
+        torch.empty(_ZERO_PROBE_NUMEL, dtype=dtype, device="cpu").zero_()
+    except NotImplementedError:
+        return False
+    except RuntimeError:
+        # Some dtypes cannot even be allocated flat on CPU. Treat that the same
+        # way -- raw bytes stage correctly for anything.
+        return False
+    return True
+
 
 @dataclass
 class StagingEntry:
     """One in-flight fused parameter's staging buffer and its filled regions."""
 
     param: torch.nn.Parameter
-    staging: torch.Tensor
+    # None until the first arrival materializes it: the entry is published
+    # before its buffer exists so concurrent first-arrivals for one parameter
+    # share one allocation. See `ExpertStagingPool._ensure_staging`.
+    staging: torch.Tensor | None
     moe: Any
     expected: int
     name: str
     filled: set[tuple[int, str]] = field(default_factory=set)
     lock: threading.Lock = field(default_factory=threading.Lock)
+    # Set by `decline` when it takes this entry off the table. A thread that
+    # was mid-arrival at that moment reads it and writes its own region back,
+    # because `decline`'s flush could not have covered a region that had not
+    # landed yet. Written and read under the pool lock, never the entry lock.
+    disowned: bool = False
 
     @property
     def complete(self) -> bool:
@@ -85,6 +119,12 @@ class ExpertStagingPool:
         self._declined: set[int] = set()
         self._lock = threading.Lock()
         self._batchable: dict[int, bool] = {}
+        # Staging-allocation accounting, reported once at flush time. Pinning
+        # host memory runs at ~4 GB/s, so a buffer built and then dropped is
+        # not free -- these counts are how that would show up.
+        self._alloc_count = 0
+        self._alloc_bytes = 0
+        self._alloc_seconds = 0.0
 
     def is_batchable(self, param: torch.nn.Parameter, full_param_name: str) -> bool:
         """Whether arrivals for this parameter should go through the pool."""
@@ -145,12 +185,15 @@ class ExpertStagingPool:
 
         if entry is None:
             entry = self._get_or_create_entry(param, moe, full_param_name)
-            if entry is None:  # declined while we were allocating
+            if entry is None:  # declined before this arrival could publish one
                 self._direct_load(
                     param, full_param_name, shard_id, global_expert_id, loaded_weight
                 )
                 return
 
+        # An entry read straight from the table may have been published by
+        # another thread that has not finished allocating its buffer yet.
+        self._ensure_staging(entry)
         staged = moe.stage_expert_weight(
             param=param,
             staging=entry.staging,
@@ -172,12 +215,21 @@ class ExpertStagingPool:
         with entry.lock:
             entry.filled.add((local_eid, shard_id))
             complete = entry.complete
-        if complete:
-            with self._lock:
-                claimed = self._entries.pop(pid, None) is entry
-            if claimed:
-                with entry.lock:
-                    moe.flush_staged(param, entry.staging, entry.filled)
+        # Two ways this thread owes the write-back. `claimed` is the ordinary
+        # one: this arrival was the last, so it takes the entry and flushes it.
+        # `disowned` is the race -- `decline` took the entry while this thread
+        # was still working on it, either during the allocation above (it skips
+        # the flush entirely while `staging` is None) or between the copy and
+        # the `filled.add` (it flushes a `filled` set this region is missing
+        # from). Either way the region is lost unless we write it back here,
+        # which is safe: the path that declined writes only regions the pool
+        # never staged, so the two never touch the same bytes.
+        with self._lock:
+            claimed = complete and self._entries.pop(pid, None) is entry
+            disowned = entry.disowned
+        if claimed or disowned:
+            with entry.lock:
+                moe.flush_staged(param, entry.staging, entry.filled)
 
     def decline(self, param: torch.nn.Parameter) -> None:
         """Hand this parameter over to another loader path.
@@ -191,7 +243,13 @@ class ExpertStagingPool:
         with self._lock:
             self._declined.add(pid)
             entry = self._entries.pop(pid, None)
-        if entry is not None:
+            if entry is not None:
+                entry.disowned = True
+        # `staging is None` means the entry was published but no arrival ever
+        # materialized its buffer, so there is nothing staged to write back.
+        # An arrival still in flight will notice `disowned` and write its own
+        # region back once it lands.
+        if entry is not None and entry.staging is not None:
             with entry.lock:
                 entry.moe.flush_staged(param, entry.staging, entry.filled)
 
@@ -208,27 +266,70 @@ class ExpertStagingPool:
         report = StagingReport()
         for entry in pending:
             with entry.lock:
-                entry.moe.flush_staged(entry.param, entry.staging, entry.filled)
+                if entry.staging is not None:
+                    entry.moe.flush_staged(entry.param, entry.staging, entry.filled)
                 report.incomplete.append(entry.missing_description())
+        # One allocation per batched parameter is the floor. A count above it
+        # means buffers are being built and dropped again.
+        logger.info(
+            "Staging buffers: %d allocated (%.1f GiB, %.2fs pinning)",
+            self._alloc_count,
+            self._alloc_bytes / 1024**3,
+            self._alloc_seconds,
+        )
         return report
 
     # ── internals ─────────────────────────────────────────────────────────
 
     def _get_or_create_entry(self, param, moe, name: str) -> StagingEntry | None:
         pid = id(param)
-        # Allocate outside the lock: the buffer is parameter-sized and pinning
-        # it is slow enough that holding the lock would serialize every layer.
-        candidate = StagingEntry(
-            param=param,
-            staging=self._allocate_staging(param),
-            moe=moe,
-            expected=moe.expected_batched_arrivals(param),
-            name=name,
-        )
         with self._lock:
             if pid in self._declined:
                 return None
-            return self._entries.setdefault(pid, candidate)
+            entry = self._entries.get(pid)
+            if entry is None:
+                entry = StagingEntry(
+                    param=param,
+                    staging=None,
+                    moe=moe,
+                    expected=moe.expected_batched_arrivals(param),
+                    name=name,
+                )
+                self._entries[pid] = entry
+        self._ensure_staging(entry)
+        return entry
+
+    def _ensure_staging(self, entry: StagingEntry) -> None:
+        """Materialize `entry`'s buffer once, whichever thread gets here first.
+
+        The alternative -- allocate first, publish second -- lets every
+        concurrent first-arrival for one parameter build a parameter-sized
+        pinned buffer so that one of them can be kept (341 of 573 buffers on
+        DeepSeek-R1 MXFP4). Waiting here instead idles the other workers for
+        the length of one allocation, which is only the better trade while
+        something else is keeping the device fed: with `ATOM_LOADER_PREFETCH`
+        off, those idle workers were the ones driving the cold read and the
+        load went 154s -> 183s. With prefetch on -- the default -- the reader
+        owns that job and this is worth ~5s of warm load.
+
+        Deliberately outside the pool lock: pinning host memory runs at
+        ~4 GB/s, so holding the pool lock across it would serialize every layer
+        against every other. The entry's own lock only orders the threads that
+        want this one parameter.
+        """
+        if entry.staging is not None:
+            return
+        with entry.lock:
+            if entry.staging is not None:
+                return
+            t0 = time.perf_counter()
+            staging = self._allocate_staging(entry.param)
+            elapsed = time.perf_counter() - t0
+            entry.staging = staging
+        with self._lock:
+            self._alloc_count += 1
+            self._alloc_bytes += staging.numel() * staging.element_size()
+            self._alloc_seconds += elapsed
 
     @staticmethod
     def _allocate_staging(param: torch.nn.Parameter) -> torch.Tensor:
@@ -238,17 +339,25 @@ class ExpertStagingPool:
         padded MXFP4 shard, say) must read back as zero, matching what the
         parameter itself was initialised to.
         """
+        # Pick the dtype before allocating. Discovering it the other way --
+        # allocate, let `zero_` raise, allocate again -- costs a full pinned
+        # allocation per parameter, and host pinning runs at ~4.2 GB/s cold.
+        # On DeepSeek-R1 MXFP4 every routed-expert parameter is packed, so the
+        # discarded first buffer was ~40% of the loader worker pool's time.
+        dtype = param.data.dtype if _cpu_zeroable(param.data.dtype) else torch.uint8
 
         def _alloc(pinned: bool) -> torch.Tensor:
             try:
                 t = torch.empty(
                     param.data.shape,
-                    dtype=param.data.dtype,
+                    dtype=dtype,
                     device="cpu",
                     pin_memory=pinned,
                 )
-                # Must stay inside the try: for packed dtypes (fp4x2) the
-                # allocation succeeds and it is `zero_` that has no CPU kernel.
+                # Kept inside the try: `_cpu_zeroable` probes one size, and a
+                # dtype it clears there could still fail here. Falling back
+                # costs what this function used to cost every time, which is
+                # the right price for being wrong rarely.
                 t.zero_()
             except NotImplementedError:
                 # Stage the raw bytes instead and let the flush re-view the

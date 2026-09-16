@@ -51,10 +51,46 @@ def _slice_i32(tensor: torch.Tensor, batch_size: int) -> torch.Tensor:
 
 
 def _get_query_lens(forward_batch, batch_size: int) -> torch.Tensor:
+    if forward_batch.forward_mode.is_target_verify():
+        spec_info = getattr(forward_batch, "spec_info", None)
+        if spec_info is None:
+            raise RuntimeError("MiniMax-M3 target_verify requires speculative metadata")
+        draft_num = int(spec_info.draft_token_num)
+        return torch.full(
+            (batch_size,),
+            draft_num,
+            dtype=torch.int32,
+            device=forward_batch.seq_lens.device,
+        )
     query_lens = getattr(forward_batch, "extend_seq_lens", None)
     if query_lens is None:
-        query_lens = getattr(forward_batch, "seq_lens")
+        query_lens = forward_batch.seq_lens
     return _slice_i32(query_lens, batch_size)
+
+
+def _get_seq_lens(forward_batch, batch_size: int) -> torch.Tensor:
+    seq_lens = _slice_i32(forward_batch.seq_lens, batch_size)
+    if forward_batch.forward_mode.is_target_verify():
+        spec_info = getattr(forward_batch, "spec_info", None)
+        if spec_info is None:
+            raise RuntimeError("MiniMax-M3 target_verify requires speculative metadata")
+        seq_lens = seq_lens + int(spec_info.draft_token_num)
+    return seq_lens
+
+
+def _get_max_seq_len(forward_batch, batch_size: int, seq_lens: torch.Tensor) -> int:
+    seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+    if seq_lens_cpu is not None and batch_size:
+        max_seq_len = int(seq_lens_cpu[:batch_size].max().item())
+        if forward_batch.forward_mode.is_target_verify():
+            spec_info = getattr(forward_batch, "spec_info", None)
+            if spec_info is None:
+                raise RuntimeError(
+                    "MiniMax-M3 target_verify requires speculative metadata"
+                )
+            max_seq_len += int(spec_info.draft_token_num)
+        return max_seq_len
+    return int(seq_lens.max().item()) if batch_size else 0
 
 
 def _get_prefix_lens(
@@ -93,8 +129,9 @@ def _is_fp8_kv_cache_tensor(kv_cache: torch.Tensor) -> bool:
         "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
         "BLOCK_SIZE_H": lambda args: triton.next_power_of_2(args["gqa_group_size"]),
         "BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["max_topk"]),
-        "BLOCK_SIZE_QH": lambda args: args["BLOCK_SIZE_Q"]
-        * triton.next_power_of_2(args["gqa_group_size"]),
+        "BLOCK_SIZE_QH": lambda args: (
+            args["BLOCK_SIZE_Q"] * triton.next_power_of_2(args["gqa_group_size"])
+        ),
     }
 )
 @triton.jit
@@ -167,15 +204,21 @@ def _sgl_m3_sparse_fwd_kernel(
         off_t = tl.arange(0, BLOCK_SIZE_T)
         topk_idx = tl.load(t_ptr_j + off_t * stride_tk, mask=off_t < max_topk, other=-1)
         real_topk = tl.sum((topk_idx >= 0).to(tl.int32), axis=0)
-        q_ptrs = tl.make_block_ptr(
-            base=q_ptr + q_start * stride_qn + pid_h * stride_qh,
-            shape=(q_len, gqa_group_size, head_dim),
-            strides=(stride_qn, stride_qh, stride_qd),
-            offsets=(pid_q_j * BLOCK_SIZE_Q, 0, 0),
-            block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D),
-            order=(2, 1, 0),
+        _q_ptrs_0 = (pid_q_j * BLOCK_SIZE_Q) + tl.arange(0, BLOCK_SIZE_Q)
+        _q_ptrs_1 = (0) + tl.arange(0, BLOCK_SIZE_H)
+        _q_ptrs_2 = (0) + tl.arange(0, BLOCK_SIZE_D)
+        q = tl.load(
+            q_ptr
+            + q_start * stride_qn
+            + pid_h * stride_qh
+            + _q_ptrs_0[:, None, None] * (stride_qn)
+            + _q_ptrs_1[None, :, None] * (stride_qh)
+            + _q_ptrs_2[None, None, :] * (stride_qd),
+            mask=(_q_ptrs_0[:, None, None] < (q_len))
+            & (_q_ptrs_1[None, :, None] < (gqa_group_size))
+            & (_q_ptrs_2[None, None, :] < (head_dim)),
+            other=0.0,
         )
-        q = tl.load(q_ptrs, boundary_check=(0, 1, 2), padding_option="zero")
         off_q = (
             tl.arange(0, BLOCK_SIZE_Q)[:, None]
             + pid_q_j * BLOCK_SIZE_Q
@@ -229,15 +272,21 @@ def _sgl_m3_sparse_fwd_kernel(
             lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
         acc_o = acc_o * tl.exp2(m_i - lse_i)[:, None]
         acc_o = tl.reshape(acc_o, BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D)
-        o_ptrs = tl.make_block_ptr(
-            base=o_ptr + q_start * stride_on + pid_h * stride_oh,
-            shape=(q_len, gqa_group_size, head_dim),
-            strides=(stride_on, stride_oh, stride_od),
-            offsets=(pid_q_j * BLOCK_SIZE_Q, 0, 0),
-            block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D),
-            order=(2, 1, 0),
+        _o_ptrs_0 = (pid_q_j * BLOCK_SIZE_Q) + tl.arange(0, BLOCK_SIZE_Q)
+        _o_ptrs_1 = (0) + tl.arange(0, BLOCK_SIZE_H)
+        _o_ptrs_2 = (0) + tl.arange(0, BLOCK_SIZE_D)
+        tl.store(
+            o_ptr
+            + q_start * stride_on
+            + pid_h * stride_oh
+            + _o_ptrs_0[:, None, None] * (stride_on)
+            + _o_ptrs_1[None, :, None] * (stride_oh)
+            + _o_ptrs_2[None, None, :] * (stride_od),
+            acc_o.to(o_ptr.dtype.element_ty),
+            mask=(_o_ptrs_0[:, None, None] < (q_len))
+            & (_o_ptrs_1[None, :, None] < (gqa_group_size))
+            & (_o_ptrs_2[None, None, :] < (head_dim)),
         )
-        tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1, 2))
 
 
 @triton.heuristics(
@@ -315,15 +364,18 @@ def _sgl_m3_sparse_decode_kernel(
     m_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
     lse_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
     acc_o = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_D), dtype=tl.float32)
-    q_ptrs = tl.make_block_ptr(
-        base=q_ptr + pid_b * stride_qn + pid_h * stride_qh,
-        shape=(gqa_group_size, head_dim),
-        strides=(stride_qh, stride_qd),
-        offsets=(0, 0),
-        block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
-        order=(1, 0),
+    _q_ptrs_0 = (0) + tl.arange(0, BLOCK_SIZE_H)
+    _q_ptrs_1 = (0) + tl.arange(0, BLOCK_SIZE_D)
+    q = tl.load(
+        q_ptr
+        + pid_b * stride_qn
+        + pid_h * stride_qh
+        + _q_ptrs_0[:, None] * (stride_qh)
+        + _q_ptrs_1[None, :] * (stride_qd),
+        mask=(_q_ptrs_0[:, None] < (gqa_group_size))
+        & (_q_ptrs_1[None, :] < (head_dim)),
+        other=0.0,
     )
-    q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
 
     cur_idx_ptr = idx_base + chunk_start_topk * stride_tk
     for _ in tl.range(chunk_start_topk, chunk_end_topk):
@@ -367,15 +419,19 @@ def _sgl_m3_sparse_decode_kernel(
         lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
     scale = tl.where(lse_i > float("-inf"), tl.exp2(m_i - lse_i), tl.zeros_like(lse_i))
     acc_o = acc_o * scale[:, None]
-    o_ptrs = tl.make_block_ptr(
-        base=o_ptr + pid_c * stride_o_c + pid_b * stride_o_b + pid_h * stride_o_h,
-        shape=(gqa_group_size, head_dim),
-        strides=(stride_o_h, stride_o_d),
-        offsets=(0, 0),
-        block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
-        order=(1, 0),
+    _o_ptrs_0 = (0) + tl.arange(0, BLOCK_SIZE_H)
+    _o_ptrs_1 = (0) + tl.arange(0, BLOCK_SIZE_D)
+    tl.store(
+        o_ptr
+        + pid_c * stride_o_c
+        + pid_b * stride_o_b
+        + pid_h * stride_o_h
+        + _o_ptrs_0[:, None] * (stride_o_h)
+        + _o_ptrs_1[None, :] * (stride_o_d),
+        acc_o.to(o_ptr.dtype.element_ty),
+        mask=(_o_ptrs_0[:, None] < (gqa_group_size))
+        & (_o_ptrs_1[None, :] < (head_dim)),
     )
-    tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1))
     l_ptrs = (
         lse_ptr
         + pid_c * stride_l_c
@@ -607,21 +663,37 @@ def build_minimax_m3_block_table(forward_batch, page_size: int) -> torch.Tensor:
 
     if not forward_batch.forward_mode.is_decode_or_idle():
         query_lens = _get_query_lens(forward_batch, batch_size)
-        seq_lens = _slice_i32(forward_batch.seq_lens, batch_size)
+        seq_lens = _get_seq_lens(forward_batch, batch_size)
         prefix_lens = _get_prefix_lens(forward_batch, batch_size, seq_lens, query_lens)
         out_cache_loc = forward_batch.out_cache_loc
-        offset = 0
-        for req_idx in range(batch_size):
-            prefix_len = int(prefix_lens[req_idx].item())
-            query_len = int(query_lens[req_idx].item())
-            if query_len > 0:
-                token_table[req_idx, prefix_len : prefix_len + query_len] = (
-                    out_cache_loc[offset : offset + query_len]
-                )
-            offset += query_len
+        # MTP target verify can run inside a non-decode CUDA Graph. Keep this
+        # update tensor-only because the eager fallback's .item() calls cannot
+        # be captured.
+        if _is_stream_capturing():
+            columns = torch.arange(token_table.shape[1], device=token_table.device)
+            rel_pos = columns.unsqueeze(0) - prefix_lens.unsqueeze(1)
+            mask = (rel_pos >= 0) & (rel_pos < query_lens.unsqueeze(1))
+            query_offsets = torch.cumsum(query_lens, dim=0) - query_lens
+            src_idx = (query_offsets.unsqueeze(1) + rel_pos).clamp_min(0)
+            max_src_idx = max(int(out_cache_loc.numel()) - 1, 0)
+            src_idx = src_idx.clamp_max(max_src_idx).to(torch.long)
+            src_values = out_cache_loc.gather(0, src_idx.reshape(-1)).view_as(src_idx)
+            token_table = torch.where(mask, src_values, token_table)
+        else:
+            offset = 0
+            for req_idx in range(batch_size):
+                prefix_len = int(prefix_lens[req_idx].item())
+                query_len = int(query_lens[req_idx].item())
+                if query_len > 0:
+                    token_table[req_idx, prefix_len : prefix_len + query_len] = (
+                        out_cache_loc[offset : offset + query_len]
+                    )
+                offset += query_len
 
-    seq_lens = _slice_i32(forward_batch.seq_lens, batch_size)
-    if _is_stream_capturing() and forward_batch.forward_mode.is_decode_or_idle():
+    seq_lens = _get_seq_lens(forward_batch, batch_size)
+    # MTP target verify also reaches this builder during graph capture. Use the
+    # static token-table width instead of reading seq_lens.max() back to CPU.
+    if _is_stream_capturing():
         max_blocks = int(token_table.shape[1]) // page_size
     else:
         max_seq_len = int(seq_lens.max().item()) if batch_size else 0
@@ -639,11 +711,8 @@ def build_minimax_m3_forward_metadata(
 
     validate_minimax_m3_page_size(page_size)
     batch_size = _get_batch_size(forward_batch)
-    seq_lens = _slice_i32(forward_batch.seq_lens, batch_size)
-    if _is_stream_capturing() and forward_batch.forward_mode.is_decode_or_idle():
-        max_seq_len = int(block_table.shape[1]) * page_size
-    else:
-        max_seq_len = int(seq_lens.max().item()) if batch_size else 0
+    seq_lens = _get_seq_lens(forward_batch, batch_size)
+    max_seq_len = _get_max_seq_len(forward_batch, batch_size, seq_lens)
 
     if forward_batch.forward_mode.is_decode_or_idle():
         return MiniMaxM3SGLangMetadata(
@@ -666,6 +735,16 @@ def build_minimax_m3_forward_metadata(
     torch.cumsum(query_lens, dim=0, out=cu_seqlens_q[1:])
     torch.cumsum(seq_lens, dim=0, out=cu_seqlens_k[1:])
 
+    # MTP target verify graph metadata needs a host scalar without synchronizing
+    # on the GPU query_lens tensor.
+    if _is_stream_capturing():
+        if forward_batch.forward_mode.is_target_verify():
+            max_query_len = int(getattr(forward_batch.spec_info, "draft_token_num", 1))
+        else:
+            max_query_len = int(getattr(forward_batch, "extend_num_tokens", None) or 1)
+    else:
+        max_query_len = int(query_lens.max().item()) if batch_size else 0
+
     return MiniMaxM3SGLangMetadata(
         is_decode=False,
         seq_lens=seq_lens,
@@ -674,7 +753,7 @@ def build_minimax_m3_forward_metadata(
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
         context_lens=context_lens,
-        max_query_len=int(query_lens.max().item()) if batch_size else 0,
+        max_query_len=max_query_len,
     )
 
 
@@ -793,6 +872,7 @@ def minimax_m3_sparse_attention_for_sglang(
     from atom.model_ops.minimax_m3.index_topk import (
         minimax_m3_index_topk,
         minimax_m3_index_topk_decode,
+        n_valid_column_per_row_for_forward,
     )
 
     if metadata.is_decode:
@@ -808,6 +888,20 @@ def minimax_m3_sparse_attention_for_sglang(
             layer.local_blocks,
             layer.num_kv_heads,
             layer.scaling,
+            # Hoisted onto `forward_batch`, not `metadata`: this function
+            # rebuilds `metadata` per sparse layer, so it is the batch that
+            # lives exactly one forward. One row per request here -- this path
+            # takes the `max_query_len=1` default.
+            n_valid_column_per_row=n_valid_column_per_row_for_forward(
+                forward_batch,
+                "decode",
+                metadata.seq_lens,
+                metadata.seq_lens,
+                batch=batch_size,
+                total_q=batch_size,
+                num_idx_heads=layer.num_idx_heads,
+                decode_max_q=1,
+            ),
         )
         minimax_m3_sparse_attn_decode_split_kv(
             q[:batch_size],
@@ -825,7 +919,13 @@ def minimax_m3_sparse_attention_for_sglang(
     else:
         assert metadata.cu_seqlens_q is not None
         assert metadata.context_lens is not None
-        num_tokens = int(metadata.cu_seqlens_q[-1].item())
+        # Captured MTP verify/extend uses the fixed padded Q shape; avoid reading
+        # cu_seqlens_q back to the host while the graph is being recorded.
+        num_tokens = (
+            int(q.shape[0])
+            if _is_stream_capturing()
+            else int(metadata.cu_seqlens_q[-1].item())
+        )
         topk_idx = minimax_m3_index_topk(
             index_q[:num_tokens],
             index_cache,
@@ -840,6 +940,18 @@ def minimax_m3_sparse_attention_for_sglang(
             layer.local_blocks,
             layer.num_kv_heads,
             layer.scaling,
+            # Ragged rows: query starts, and the keys already behind each
+            # request. Same owner as the decode branch above.
+            n_valid_column_per_row=n_valid_column_per_row_for_forward(
+                forward_batch,
+                "prefill",
+                metadata.cu_seqlens_q,
+                metadata.context_lens,
+                batch=metadata.cu_seqlens_q.shape[0] - 1,
+                total_q=num_tokens,
+                num_idx_heads=layer.num_idx_heads,
+                decode_max_q=0,
+            ),
         )
         minimax_m3_sparse_attn_split_kv(
             q[:num_tokens],

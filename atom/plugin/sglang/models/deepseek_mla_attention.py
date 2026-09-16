@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch import nn
 
+from atom.plugin.sglang.models.kv_cache_utils import is_fp8_kv_cache_dtype
 from atom.plugin.sglang.runtime.context import is_draft_extend_mode
 
 if TYPE_CHECKING:
@@ -245,10 +246,9 @@ class SGLangDeepseekMLAAttention(nn.Module):
             q_cache_scale = getattr(mla_attn, "q_scale", None)
             if q_cache_scale is None:
                 q_cache_scale = mla_attn.k_scale
-            q_out_dtype = (
-                dtypes.fp8 if attn.kv_cache_dtype == "fp8_e4m3" else q_nope_out.dtype
-            )
-            q_descale = q_cache_scale if attn.kv_cache_dtype == "fp8_e4m3" else None
+            use_fp8_q = is_fp8_kv_cache_dtype(attn.kv_cache_dtype)
+            q_out_dtype = dtypes.fp8 if use_fp8_q else q_nope_out.dtype
+            q_descale = q_cache_scale if use_fp8_q else None
             q = torch.empty(
                 (
                     q_nope_out.shape[0],

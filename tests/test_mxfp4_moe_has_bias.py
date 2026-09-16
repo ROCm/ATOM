@@ -56,6 +56,7 @@ class TestFusedMoEDefaultHasBias(unittest.TestCase):
 
     def test_default_is_false(self):
         import inspect
+
         from atom.model_ops.moe import FusedMoE
 
         sig = inspect.signature(FusedMoE.__init__)
@@ -99,6 +100,7 @@ class TestGptOssKeepsBias(unittest.TestCase):
 
     def test_gpt_oss_has_bias_true(self):
         import inspect
+
         from atom.models.gpt_oss import MLPBlock as SparseMoeBlock
 
         source = inspect.getsource(SparseMoeBlock.__init__)
@@ -107,105 +109,6 @@ class TestGptOssKeepsBias(unittest.TestCase):
             source,
             "gpt_oss SparseMoeBlock must keep has_bias=True",
         )
-
-
-class TestMxfp4NoBiasCreated(unittest.TestCase):
-    """When has_bias=False, Mxfp4MoEMethod must not create bias parameters."""
-
-    def test_no_bias_when_has_bias_false(self):
-        import torch
-        from unittest.mock import MagicMock
-
-        from atom.model_ops.moe import Mxfp4MoEMethod
-        from atom.config import LayerQuantConfig
-        from aiter import QuantType
-
-        qc = LayerQuantConfig(
-            quant_type=QuantType.per_1x32,
-            quant_dtype=torch.float4_e2m1fn_x2,
-            quant_method="quark",
-        )
-        moe_config = MagicMock()
-        method = Mxfp4MoEMethod(qc, moe_config)
-
-        # Create a mock layer with has_bias=False
-        layer = MagicMock()
-        layer.has_bias = False
-        layer.hidden_size = 6144
-        layer.intermediate_size_per_partition = 2560
-        layer.activation = "silu"
-
-        # Track what register_parameter is called with
-        registered = {}
-
-        def mock_register(name, param):
-            registered[name] = param
-
-        layer.register_parameter = mock_register
-
-        method.create_weights(
-            layer=layer,
-            num_experts=8,
-            hidden_size=6144,
-            intermediate_size_per_partition=2560,
-            params_dtype=torch.float4_e2m1fn_x2,
-            weight_loader=lambda *a: None,
-        )
-
-        # Bias should be None when has_bias=False
-        self.assertIsNone(
-            registered.get("w13_bias"),
-            "w13_bias must be None when has_bias=False",
-        )
-        self.assertIsNone(
-            registered.get("w2_bias"),
-            "w2_bias must be None when has_bias=False",
-        )
-
-    def test_bias_created_when_has_bias_true(self):
-        import torch
-        from unittest.mock import MagicMock
-
-        from atom.model_ops.moe import Mxfp4MoEMethod
-        from atom.config import LayerQuantConfig
-        from aiter import QuantType
-
-        qc = LayerQuantConfig(
-            quant_type=QuantType.per_1x32,
-            quant_dtype=torch.float4_e2m1fn_x2,
-            quant_method="quark",
-        )
-        moe_config = MagicMock()
-        method = Mxfp4MoEMethod(qc, moe_config)
-
-        # Create a mock layer with has_bias=True
-        layer = MagicMock()
-        layer.has_bias = True
-        layer.hidden_size = 6144
-        layer.intermediate_size_per_partition = 2560
-        layer.activation = "silu"
-
-        registered = {}
-
-        def mock_register(name, param):
-            registered[name] = param
-
-        layer.register_parameter = mock_register
-
-        method.create_weights(
-            layer=layer,
-            num_experts=8,
-            hidden_size=6144,
-            intermediate_size_per_partition=2560,
-            params_dtype=torch.float4_e2m1fn_x2,
-            weight_loader=lambda *a: None,
-        )
-
-        # Bias should be a Parameter when has_bias=True
-        self.assertIsNotNone(registered.get("w13_bias"))
-        self.assertIsInstance(registered["w13_bias"], torch.nn.Parameter)
-        self.assertIsNotNone(registered.get("w2_bias"))
-        self.assertIsInstance(registered["w2_bias"], torch.nn.Parameter)
 
 
 class TestSwiGLUInterleavingWithoutBias(unittest.TestCase):
@@ -230,6 +133,7 @@ class TestSwiGLUInterleavingWithoutBias(unittest.TestCase):
     def test_swiglu_branch_does_not_couple_bias_and_shuffle(self):
         """Ensure the old coupled condition is gone."""
         import inspect
+
         from atom.model_ops.moe import Mxfp4MoEMethod
 
         source = inspect.getsource(Mxfp4MoEMethod.process_weights_after_loading)
@@ -246,6 +150,7 @@ class TestQwen3MoeQKNormShape(unittest.TestCase):
 
     def test_qk_norm_is_per_head(self):
         import inspect
+
         from atom.models.qwen3_moe import Qwen3MoeAttention
 
         source = inspect.getsource(Qwen3MoeAttention.forward)

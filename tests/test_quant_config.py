@@ -134,6 +134,17 @@ def _load_module(filename: str, module_name: str):
     sys.modules[module_name] = mod
     with _temporary_mocks():
         spec.loader.exec_module(mod)
+        # `quant_spec` resolves its AITER handles on first *use* rather than at
+        # import, so executing the module body is no longer enough to bind
+        # them. Touch them while the stand-ins above are still installed --
+        # afterwards there is no aiter to resolve against on a CPU-only runner.
+        #
+        # Deliberately not left in `sys.modules` instead: a lingering fake
+        # `aiter` would satisfy `pytest.importorskip("aiter")` in the other
+        # test modules, and whether it did would depend on collection order.
+        if hasattr(mod, "QuantType"):
+            _ = mod.QuantType.No
+            _ = mod.d_dtypes.get("fp8")
     return mod
 
 

@@ -7,6 +7,8 @@ on:
       - 'atom/mesh/**'
       - '.github/benchmark/models_atomesh.yaml'
       - '.github/scripts/atomesh/**'
+      - 'atom/entrypoints/openai/**'
+      - '.github/scripts/slurm_submit_helpers.sh'
       - '.github/workflows/atomesh-benchmark.yaml'
   pull_request:
     branches: [main]
@@ -15,12 +17,13 @@ on:
       - 'atom/mesh/**'
       - '.github/benchmark/models_atomesh.yaml'
       - '.github/scripts/atomesh/**'
+      - 'atom/entrypoints/openai/**'
+      - '.github/scripts/slurm_submit_helpers.sh'
       - '.github/workflows/atomesh-benchmark.yaml'
   schedule:
-    # TW weekend nightly at 21:00 Beijing time (13:00 UTC).
-    - cron: '0 13 * * 6'
-    - cron: '0 13 * * 0'
-    # Spur nightly at 00:10 Beijing time (16:10 UTC).
+    # TW nightly for DeepSeek and GLM-Agentic cases only at 00:00 Beijing time (16:00 UTC).
+    - cron: '0 16 * * 5'
+    # Spur MI350X nightly at 00:10 Beijing time (16:10 UTC).
     - cron: '10 16 * * *'
   workflow_dispatch:
     inputs:
@@ -32,18 +35,62 @@ on:
         options:
           - smoke
           - nightly
+      rdma_smoke_nodes:
+        description: 'Comma-separated Slurm nodes for the Mooncake RDMA smoke test; defaults to atomesh_1p1d_nodes'
+        required: false
+        default: ''
+        type: string
       run_all_models:
         description: 'Run all models from models_atomesh.yaml'
         required: false
-        default: true
+        default: false
         type: boolean
       model_names:
-        description: 'Optional when run_all_models=false. Comma-separated: DeepSeek-V4-Pro,GLM-5.2-MXFP4,Kimi-K2.5-MXFP4,MiniMax-M3-MXFP4,MiniMax-M3-MXFP8'
+        description: 'When run_all_models=false, run all cases in the selected suite for these model families. Comma-separated: DeepSeek-V4-Pro,GLM-5.2-MXFP4,Kimi-K3-MXFP4,Kimi-K2.5-MXFP4,MiniMax-M3-MXFP4,MiniMax-M3-MXFP8'
         required: false
         default: ''
         type: string
       case_names:
-        description: 'Overrides model_names. Comma-separated: ds-v4-1p1d-tp8-smoke,ds-v4-1p1d-tp8,ds-v4-1p1d-dpa-tp8,ds-v4-2p1d-dpa-tp8,glm-52-mxfp4-1p1d-tp4,glm-52-mxfp4-1p1d-tp8,kimi-k25-1p1d-tp4,kimi-k25-1p1d-tp4-tp8,kimi-k25-2p1d-tp4,kimi-k25-1p2d-tp4,minimax-m3-fp4-1p1d-tp4,minimax-m3-fp4-2p1d-dpa-tp4,minimax-m3-fp4-1p1d-tp4-eagle3,minimax-m3-fp4-2p1d-dpa-tp4-eagle3,minimax-m3-fp8-1p1d-tp4,minimax-m3-fp8-2p1d-dpa-tp4,minimax-m3-fp8-1p1d-tp4-eagle3,minimax-m3-fp8-2p1d-dpa-tp4-eagle3'
+        description: |
+          Overrides model_names. Enter comma-separated case names.
+          DeepSeek:
+            ds-v4-1p1d-tp8-smoke,ds-v4-1p1d-tp8,ds-v4-1p1d-dpa-tp8,
+            ds-v4-1p1d-tp8-mtp3,ds-v4-1p1d-dpa-tp8-mtp1
+
+          GLM:
+            glm-52-mxfp4-1p1d-tp4,glm-52-mxfp4-1p1d-tp8,
+            glm-52-mxfp4-1p1d-tp4-agentic-1m-c1,glm-52-mxfp4-1p1d-tp4-agentic-1m-c2,
+            glm-52-mxfp4-1p1d-tp4-agentic-1m-c4,glm-52-mxfp4-1p1d-tp4-agentic-1m-c8,
+            glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c32,
+            glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c40,
+            glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c48,
+            glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c56,
+            glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c24,
+            glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c32,
+            glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c48
+
+          Kimi-K3:
+            kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c1,
+            kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c2,
+            kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c4,
+            kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c8,
+            kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c12,
+            kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c14,
+            kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c16,
+            kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c32,
+            kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c40,
+            kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c56,
+            kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c64
+
+          Kimi-K2.5:
+            kimi-k25-1p1d-tp4,kimi-k25-1p1d-tp4-tp8,
+            kimi-k25-2p1d-tp4,kimi-k25-1p2d-tp4
+
+          MiniMax:
+            minimax-m3-fp4-1p1d-tp4,minimax-m3-fp4-2p1d-dpa-tp4,
+            minimax-m3-fp4-1p1d-tp4-eagle3,minimax-m3-fp4-2p1d-dpa-tp4-eagle3,
+            minimax-m3-fp8-1p1d-tp4,minimax-m3-fp8-2p1d-dpa-tp4,
+            minimax-m3-fp8-1p1d-tp4-eagle3,minimax-m3-fp8-2p1d-dpa-tp4-eagle3
         required: false
         default: ''
         type: string
@@ -53,35 +100,70 @@ on:
         default: rocm/atom-dev:latest
         type: string
       atomesh_slurm_submit_runner:
-        description: 'GitHub runner label used to submit Slurm jobs: atomesh-cicd = TW MI355X, atomesh-cicd-mi350 = Spur MI350X'
+        description: 'GitHub runner label used to submit Slurm jobs: atomesh-cicd = TW MI355X, atomesh-cicd-mi350 = Spur MI350X, atomesh-cicd-mi355-crusoe = Crusoe MI355X'
         required: false
         default: atomesh-cicd
         type: choice
         options:
           - atomesh-cicd
           - atomesh-cicd-mi350
-      atomesh_log_root:
-        description: 'Root directory for ATOMesh Slurm logs'
+          - atomesh-cicd-mi355-crusoe
+      atomesh_slurm_account:
+        description: 'TW Slurm account: amd-frameworks[42/44/47], amd-tw[36/43]; Crusoe v2 uses amd-aifw-dev'
         required: false
-        default: ''
-        type: string
+        default: auto
+        type: choice
+        options:
+          - auto
+          - amd-frameworks
+          - amd-tw
+      atomesh_slurm_partition:
+        description: 'TW Slurm partition: amd-frameworks[42/44/47], amd-tw[36/43]; Crusoe v2 uses the default partition'
+        required: false
+        default: auto
+        type: choice
+        options:
+          - auto
+          - amd-frameworks
+          - amd-tw
+      atomesh_single_node:
+        description: 'ATOMesh single-node P/D placement; auto uses the existing runner/node configuration'
+        required: false
+        default: auto
+        type: choice
+        options:
+          - auto
+          - mia1-p01-g36
+          - mia1-p01-g43
+          - mia1-p02-g42
+          - mia1-p02-g44
+          - mia1-p02-g47
       atomesh_1p1d_nodes:
-        description: 'Optional comma-separated ATOMesh 1P1D nodes'
+        description: 'TW 1P1D node pair; Crusoe v2 selects from its configured candidate pool'
         required: false
-        default: ''
-        type: string
+        default: auto
+        type: choice
+        options:
+          - auto
+          - mia1-p02-g42,mia1-p02-g44
+          - mia1-p02-g42,mia1-p02-g47
+          - mia1-p02-g44,mia1-p02-g47
+          - mia1-p01-g36,mia1-p01-g43
       atomesh_2p1d_nodes:
-        description: 'Optional comma-separated ATOMesh 2P1D nodes'
+        description: 'TW 2P1D nodes; Crusoe v2 selects from its configured candidate pool'
         required: false
-        default: ''
-        type: string
+        default: auto
+        type: choice
+        options:
+          - auto
+          - mia1-p02-g42,mia1-p02-g44,mia1-p02-g47
       benchmark_concurrency:
         description: 'Optional benchmark concurrency override, e.g. 1,2,4 (no quotes)'
         required: false
         default: ''
         type: string
       eval_concurrency:
-        description: 'Optional lm_eval concurrency override, e.g. 64 or 32,64 (no quotes)'
+        description: 'Optional accuracy result-concurrency override; SWE-bench agent workers come from models_atomesh.yaml'
         required: false
         default: ''
         type: string
@@ -97,19 +179,21 @@ on:
         type: boolean
 
 env:
-  ATOMESH_SLURM_ACCOUNT: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '' || 'amd-frameworks' }}
-  ATOMESH_SLURM_PARTITION: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '' || 'amd-frameworks' }}
+  ATOMESH_SINGLE_NODE: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_single_node || 'auto' }}
+  ATOMESH_SLURM_ACCOUNT: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_account != 'auto' && inputs.atomesh_slurm_account || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd' && 'amd-frameworks' || '') }}
+  ATOMESH_SLURM_PARTITION: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_partition != 'auto' && inputs.atomesh_slurm_partition || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd' && 'amd-frameworks' || (((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-crusoe-mi355' || (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi355-crusoe') && 'amd-spur' || '')) }}
   ATOMESH_SLURM_SUBMIT_RUNNER: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd') }}
   ATOMESH_DASHBOARD_HARDWARE: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'MI350X' || 'MI355X' }}
   ATOMESH_PD_RANK_MAPPING_POLICY: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'idx2idx' || 'none' }}
-  ATOMESH_LOG_ROOT: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_log_root != '' && inputs.atomesh_log_root || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '/data/${USER}/logs/ATOMESH_LOG/' || '/it-share/ATOMESH_LOG/') }}
-  ATOMESH_MODEL_ROOT: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '/data/models2' || '/mnt/models' }}
-  ATOMESH_1P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_1p1d_nodes != '' && inputs.atomesh_1p1d_nodes || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' || 'mia1-p02-g42,mia1-p02-g44') }}
-  ATOMESH_2P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_2p1d_nodes != '' && inputs.atomesh_2p1d_nodes || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' || 'mia1-p02-g42,mia1-p02-g44,mia1-p02-g47') }}
+  ATOMESH_LOG_ROOT: ${{ ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '/data/${USER}/logs/ATOMESH_LOG/' || (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi355-crusoe' && '/home/junyyang/ATOMesh_ACTION_RUNNER/ATOMesh_LOG/' || (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-crusoe-mi355' && '/shared_nfs/ATOMESH_CI/LOG/' || '/it-share/ATOMESH_LOG/') }}
+  ATOMESH_MODEL_ROOT: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '/data/models2' || (((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-crusoe-mi355' || (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi355-crusoe') && '/shared_nfs/huggingface_models/amd' || '/mnt/models') }}
+  ATOMESH_1P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_1p1d_nodes != 'auto' && inputs.atomesh_1p1d_nodes || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' || (!((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-crusoe-mi355' || (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi355-crusoe') && 'mia1-p02-g42,mia1-p02-g44' || '')) }}
+  ATOMESH_2P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_2p1d_nodes != 'auto' && inputs.atomesh_2p1d_nodes || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' || (((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-crusoe-mi355' || (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi355-crusoe') && '' || 'mia1-p02-g42,mia1-p02-g44,mia1-p02-g47')) }}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd') }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  # Keep manual benchmark dispatches independent so different cases on the same branch can run together.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd') }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' && github.ref != 'refs/heads/main' }}
 
 permissions:
   actions: read
@@ -123,6 +207,7 @@ jobs:
     outputs:
       matrix_json: ${{ steps.matrix.outputs.matrix_json }}
       has_matrix: ${{ steps.matrix.outputs.has_matrix }}
+      image: ${{ steps.image.outputs.image }}
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
@@ -224,6 +309,7 @@ jobs:
           RUN_ALL_MODELS: ${{ github.event_name == 'workflow_dispatch' && inputs.run_all_models || github.event_name != 'workflow_dispatch' }}
           MODEL_NAMES: ${{ github.event_name == 'workflow_dispatch' && inputs.model_names || '' }}
           CASE_NAMES: ${{ github.event_name == 'workflow_dispatch' && inputs.case_names || '' }}
+          EVENT_SCHEDULE: ${{ github.event_name == 'schedule' && github.event.schedule || '' }}
           ATOMESH_IMAGE: ${{ steps.image.outputs.image }}
           ATOMESH_BENCHMARK_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.benchmark_concurrency || '' }}
           ATOMESH_EVAL_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.eval_concurrency || '' }}
@@ -243,15 +329,61 @@ jobs:
             fi
           fi
 
-          python3 .github/scripts/atomesh/pd_matrix.py \
-            --suite "$SUITE" \
-            ${MODEL_NAME:+--model "$MODEL_NAME"} \
-            ${CASE_NAME:+--case "$CASE_NAME"} \
-            ${ATOMESH_IMAGE:+--image "$ATOMESH_IMAGE"} \
-            ${ATOMESH_BENCHMARK_CONCURRENCY:+--benchmark-concurrency "$ATOMESH_BENCHMARK_CONCURRENCY"} \
-            ${ATOMESH_EVAL_CONCURRENCY:+--eval-concurrency "$ATOMESH_EVAL_CONCURRENCY"} \
-            --output atomesh-matrix.json \
-            --github-output
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" && "${EVENT_SCHEDULE}" == "0 16 * * 5" ]]; then
+            ATOMESH_SLURM_ACCOUNT=amd-frameworks \
+            ATOMESH_SLURM_PARTITION=amd-frameworks \
+            ATOMESH_SLURM_SUBMIT_RUNNER=atomesh-cicd \
+            ATOMESH_1P1D_NODES=mia1-p02-g42,mia1-p02-g44,mia1-p02-g47 \
+            ATOMESH_2P1D_NODES=mia1-p02-g42,mia1-p02-g44,mia1-p02-g47 \
+              python3 .github/scripts/atomesh/pd_matrix.py \
+              --suite nightly \
+              --model DeepSeek-V4-Pro \
+              ${ATOMESH_IMAGE:+--image "$ATOMESH_IMAGE"} \
+              --output atomesh-matrix-deepseek.json
+
+            ATOMESH_SLURM_ACCOUNT=amd-tw \
+            ATOMESH_SLURM_PARTITION=amd-tw \
+            ATOMESH_SLURM_SUBMIT_RUNNER=atomesh-cicd \
+            ATOMESH_1P1D_NODES=mia1-p01-g36,mia1-p01-g43 \
+            ATOMESH_2P1D_NODES=mia1-p01-g36,mia1-p01-g43 \
+              python3 .github/scripts/atomesh/pd_matrix.py \
+              --suite nightly \
+              --model GLM-5.2-MXFP4 \
+              --benchmark-kind aiperf_agentic \
+              ${ATOMESH_IMAGE:+--image "$ATOMESH_IMAGE"} \
+              --output atomesh-matrix-glm.json
+
+            python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          deepseek = json.loads(Path("atomesh-matrix-deepseek.json").read_text(encoding="utf-8")).get("include", [])
+          glm_agentic = json.loads(Path("atomesh-matrix-glm.json").read_text(encoding="utf-8")).get("include", [])
+          matrix = {"include": deepseek + glm_agentic}
+          Path("atomesh-matrix.json").write_text(
+              json.dumps(matrix, indent=2),
+              encoding="utf-8",
+          )
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write(f"matrix_json={json.dumps(matrix, separators=(',', ':'))}\n")
+              output.write(f"has_matrix={'true' if matrix['include'] else 'false'}\n")
+          print(
+              "Scheduled TW nightly matrix: "
+              f"{len(deepseek)} DeepSeek case(s), {len(glm_agentic)} GLM agentic case(s)"
+          )
+          PY
+          else
+            python3 .github/scripts/atomesh/pd_matrix.py \
+              --suite "$SUITE" \
+              ${MODEL_NAME:+--model "$MODEL_NAME"} \
+              ${CASE_NAME:+--case "$CASE_NAME"} \
+              ${ATOMESH_IMAGE:+--image "$ATOMESH_IMAGE"} \
+              ${ATOMESH_BENCHMARK_CONCURRENCY:+--benchmark-concurrency "$ATOMESH_BENCHMARK_CONCURRENCY"} \
+              ${ATOMESH_EVAL_CONCURRENCY:+--eval-concurrency "$ATOMESH_EVAL_CONCURRENCY"} \
+              --output atomesh-matrix.json \
+              --github-output
+          fi
           cat atomesh-matrix.json
 
       - name: Validate ATOMesh P/D matrix
@@ -290,6 +422,699 @@ jobs:
           name: atomesh-benchmark-matrix
           path: atomesh-matrix.json
 
+  rdma-smoke-test:
+    name: Mooncake RDMA smoke test
+    needs: [load-config]
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.suite == 'smoke' }}
+    runs-on: ${{ inputs.atomesh_slurm_submit_runner }}
+    timeout-minutes: 45
+    env:
+      RDMA_SMOKE_IMAGE: ${{ needs.load-config.outputs.image }}
+      RDMA_SMOKE_NODES: ${{ inputs.rdma_smoke_nodes }}
+      SLURM_SUBMIT_RUNNER: ${{ inputs.atomesh_slurm_submit_runner }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Run Mooncake RDMA transfer test on selected nodes
+        run: |
+          set -euo pipefail
+          export PATH="/usr/local/slurm-24.05.5.1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+
+          if [[ -z "${RDMA_SMOKE_IMAGE}" ]]; then
+            echo "::error::No ATOM image was resolved for the RDMA smoke test."
+            exit 1
+          fi
+
+          nodes="${RDMA_SMOKE_NODES:-${ATOMESH_1P1D_NODES:-}}"
+          nodes="${nodes// /}"
+          if [[ -n "${nodes}" ]]; then
+            IFS=',' read -r -a node_list <<< "${nodes}"
+            node_count="${#node_list[@]}"
+            if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" && "${node_count}" -gt 2 ]]; then
+              # Request two nodes from the candidate pool for cross-node smoke.
+              node_count=2
+            fi
+          else
+            # Allocate two nodes by default so both local and cross-node GDR are validated.
+            node_count=2
+          fi
+          if [[ "${node_count}" -lt 1 ]]; then
+            echo "::error::GPUDirect RDMA smoke testing requires at least one Slurm node."
+            exit 1
+          fi
+
+          current_user="$(id -un 2>/dev/null || id -u)"
+          log_root="${ATOMESH_LOG_ROOT//\$\{USER\}/${current_user}}"
+          log_root="${log_root//\$USER/${current_user}}"
+          if [[ "$(hostname -s)" == "pit2-vm-amd-xl-02" ]]; then
+            log_root="/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG"
+          fi
+          run_dir="${log_root%/}/rdma-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "${run_dir}"
+          chmod 0777 "${run_dir}"
+          export RDMA_SMOKE_RUN_DIR="${run_dir}"
+          export RDMA_SMOKE_NODE_COUNT="${node_count}"
+          CURRENT_USER="${current_user}"
+          ATOMESH_CELL_ID="rdma-smoke"
+          RESULT_DIR="${run_dir}"
+          SLURM_JOB_NAME="rdma-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          SLURM_OUTPUT="${run_dir}/slurm-%j.out"
+          SLURM_ERROR="${run_dir}/slurm-%j.err"
+          SLURM_CANCEL_HELPER="${run_dir}/slurm-cancel.sh"
+          SLURM_LOG_POLL_INTERVAL="${SLURM_LOG_POLL_INTERVAL:-15}"
+          SLURM_ACCOUNT="${ATOMESH_SLURM_ACCOUNT:-}"
+          SLURM_PARTITION="${ATOMESH_SLURM_PARTITION:-}"
+          SLURM_QOS=""
+          USES_SPUR_CONTROLLER=0
+          SPUR_CONTROLLER_ADDR=""
+          SPUR_ACCOUNTING_ADDR=""
+          if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+            USES_SPUR_CONTROLLER=1
+            SPUR_CONTROLLER_ADDR="http://134.199.196.72:6817"
+            SPUR_ACCOUNTING_ADDR="http://134.199.196.72:6819"
+          elif [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
+            USES_SPUR_CONTROLLER=1
+            SPUR_CONTROLLER_ADDR="http://crs-m2m-cpu-spur-v2-001.crusoe.amd.com:6817"
+            SPUR_ACCOUNTING_ADDR="${SPUR_V2_ACCOUNTING_ADDR:-http://crs-m2m-cpu-spur-v2-001.crusoe.amd.com:6819}"
+            SLURM_ACCOUNT="amd-aifw-dev"
+            SLURM_PARTITION=""
+            SLURM_QOS="amd-aifw-dev-qos"
+          fi
+          if [[ "$(hostname -s)" == "pit2-vm-amd-xl-02" ]]; then
+            SLURM_PARTITION="amd-spur"
+            SLURM_QOS="amd-frameworks-qos"
+          fi
+          source "${GITHUB_WORKSPACE}/.github/scripts/slurm_submit_helpers.sh"
+          install_slurm_cancel_traps
+
+          rank_script="${run_dir}/run-rdma-smoke-rank.sh"
+          cat > "${rank_script}" <<'RANK_SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          rank="${SLURM_PROCID:-${SPUR_TASK_OFFSET:-0}}"
+          job_id="${SLURM_JOB_ID:-${SPUR_JOB_ID:-local}}"
+          container="atomesh-rdma-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${job_id}-${rank}-$$"
+          rank_host="$(hostname)"
+          cleanup() {
+            echo "=== Removing RDMA smoke container ${container} ==="
+            # Do not wait on D-state RDMA leftovers: kill/rm with a bound so
+            # the Slurm task can exit instead of sitting in COMPLETING.
+            if command -v timeout >/dev/null 2>&1; then
+              timeout 20 docker kill "${container}" >/dev/null 2>&1 || true
+              timeout 20 docker rm -f "${container}" >/dev/null 2>&1 || true
+            else
+              docker kill "${container}" >/dev/null 2>&1 || true
+              docker rm -f "${container}" >/dev/null 2>&1 || true
+            fi
+          }
+          on_error() {
+            local rc="$1"
+            local line="$2"
+            local command="$3"
+            echo "ERROR: RDMA smoke rank ${rank} failed on ${rank_host}: rc=${rc} line=${line} command=${command}" >&2
+          }
+          on_signal() {
+            local signal="$1"
+            local rc="$2"
+            echo "ERROR: RDMA smoke rank ${rank} received ${signal} on ${rank_host}" >&2
+            exit "${rc}"
+          }
+          publish_rank_rc() {
+            local rc="$1"
+            local rc_file
+            [[ -n "${RDMA_SMOKE_RUN_DIR:-}" ]] || return 0
+            rc_file="${RDMA_SMOKE_RUN_DIR}/rank-rc-${rank}"
+            printf '%s\n' "${rc}" > "${rc_file}.tmp" 2>/dev/null || return 0
+            mv "${rc_file}.tmp" "${rc_file}" 2>/dev/null || true
+          }
+          on_exit() {
+            local rc=$?
+            trap - EXIT
+            echo "=== RDMA smoke rank exit: rank=${rank} host=${rank_host} pid=$$ job=${job_id} container=${container} rc=${rc} ==="
+            # Publish before cleanup: Slurm accounting is unreliable on Spur, so
+            # the workflow falls back to these per-rank codes.
+            publish_rank_rc "${rc}"
+            cleanup
+            exit "${rc}"
+          }
+          trap 'on_error "$?" "${LINENO}" "${BASH_COMMAND}"' ERR
+          trap on_exit EXIT
+          trap 'on_signal HUP 129' HUP
+          trap 'on_signal INT 130' INT
+          trap 'on_signal TERM 143' TERM
+          cleanup
+
+          echo "=== RDMA smoke rank start: rank=${rank} host=${rank_host} pid=$$ job=${job_id} container=${container} ==="
+          echo "=== Pulling RDMA smoke image on rank ${rank}: ${RDMA_SMOKE_IMAGE} ==="
+          docker pull "${RDMA_SMOKE_IMAGE}"
+          echo "=== RDMA smoke image pull complete on rank ${rank} ==="
+          docker_args=(
+            run -i --name "${container}"
+            --network host --ipc host
+            --privileged
+            --device=/dev/kfd
+            --device=/dev/dri
+            --device=/dev/infiniband
+            --group-add=video
+            --cap-add=IPC_LOCK
+            --ulimit memlock=-1:-1
+            -e MC_GID_INDEX=1
+            -e MC_ENABLE_DEST_DEVICE_AFFINITY=1
+            -e SMOKE_RANK="${rank}"
+            -e SMOKE_NODE_COUNT="${RDMA_SMOKE_NODE_COUNT}"
+            -e SMOKE_RUN_DIR=/rdma-smoke-shared
+            -v "${RDMA_SMOKE_RUN_DIR}:/rdma-smoke-shared"
+          )
+          host_ionic="$(readlink -f /usr/lib/x86_64-linux-gnu/libionic.so.1 2>/dev/null || true)"
+          [[ -z "${host_ionic}" ]] || docker_args+=(
+            -v "${host_ionic}:/usr/lib/x86_64-linux-gnu/libionic.so.1:ro"
+          )
+          [[ ! -e /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so ]] || docker_args+=(
+            -v /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:ro
+          )
+          [[ ! -e /etc/libibverbs.d/ionic.driver ]] || docker_args+=(
+            -v /etc/libibverbs.d/ionic.driver:/etc/libibverbs.d/ionic.driver:ro
+          )
+          docker_args+=(
+            "${RDMA_SMOKE_IMAGE}"
+            bash -s
+          )
+          printf '=== RDMA smoke docker command on rank %s ===' "${rank}"
+          printf ' %q' docker "${docker_args[@]}"
+          echo
+          echo "=== Starting RDMA smoke container on rank ${rank} ==="
+          set +e
+          docker "${docker_args[@]}" <<'CONTAINER_SCRIPT'
+          set -euo pipefail
+
+          mapfile -t rdma_devices < <(
+            for device_path in /sys/class/infiniband/*; do
+              [[ -e "${device_path}" ]] && basename "${device_path}"
+            done
+          )
+          if [[ "${#rdma_devices[@]}" -eq 0 ]]; then
+            echo "ERROR: no RDMA devices found under /sys/class/infiniband" >&2
+            exit 1
+          fi
+          echo "RDMA devices: ${rdma_devices[*]}"
+          ibv_devinfo
+          rocm-smi --showproductname || true
+
+          gpu_count="$(python3 - <<'PY'
+          import torch
+          print(torch.cuda.device_count())
+          PY
+          )"
+          if ! [[ "${gpu_count}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "ERROR: no ROCm GPUs are visible for GPUDirect RDMA testing" >&2
+            exit 1
+          fi
+          echo "Visible ROCm GPUs: ${gpu_count}"
+
+          rdma_context="/app/mooncake/mooncake-transfer-engine/src/transport/rdma_transport/rdma_context.cpp"
+          python3 - "${rdma_context}" <<'PY'
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          source = path.read_text()
+
+          old = "            uint32_t init = 16;"
+          new = "            uint32_t init = max_dest_rd_atomic_;"
+
+          if source.count(old) != 1:
+              raise RuntimeError(
+                  f"Expected exactly one Mooncake RDMA atomic setting, "
+                  f"found {source.count(old)} in {path}"
+              )
+
+          path.write_text(source.replace(old, new))
+          print(f"Patched Mooncake RDMA atomic limits in {path}")
+          PY
+
+          build_dir="/tmp/mooncake-rdma-smoke-build"
+          rm -rf "${build_dir}"
+          cmake -S /app/mooncake -B "${build_dir}" \
+            -DUSE_HIP=ON \
+            -DUSE_ETCD=OFF \
+            -DBUILD_UNIT_TESTS=ON
+          cmake --build "${build_dir}" \
+            --target transfer_engine_validator \
+            --parallel "$(nproc)"
+          validator_bin="${build_dir}/mooncake-transfer-engine/example/transfer_engine_validator"
+          if [[ ! -x "${validator_bin}" ]]; then
+            echo "ERROR: transfer_engine_validator was not built at ${validator_bin}" >&2
+            exit 1
+          fi
+
+          rdma_device_csv="$(IFS=,; echo "${rdma_devices[*]}")"
+          export RDMA_DEVICE_CSV="${rdma_device_csv}"
+          export GPU_COUNT="${gpu_count}"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          devices = os.environ["RDMA_DEVICE_CSV"].split(",")
+          gpu_count = int(os.environ["GPU_COUNT"])
+          matrix = {}
+          for gpu_id in range(gpu_count):
+              matrix[f"cuda:{gpu_id}"] = [devices, []]
+          Path("/tmp/rdma-smoke-nic-priority.json").write_text(
+              json.dumps(matrix),
+              encoding="utf-8",
+          )
+          PY
+          echo "NIC priority matrix:"
+          cat /tmp/rdma-smoke-nic-priority.json
+
+          target_pid=""
+          cleanup_processes() {
+            [[ -z "${target_pid}" ]] || kill "${target_pid}" 2>/dev/null || true
+            [[ -z "${target_pid}" ]] || wait "${target_pid}" 2>/dev/null || true
+          }
+          trap cleanup_processes EXIT HUP INT TERM
+
+          wait_for_p2p_address() {
+            local target_log="$1"
+            local target_pid="$2"
+            local timeout_seconds="$3"
+            local deadline=$((SECONDS + timeout_seconds))
+            local address=""
+            while true; do
+              address="$(awk '
+                /Transfer Engine RPC using P2P handshake, listening on / {
+                  print $NF
+                  exit
+                }
+              ' "${target_log}" 2>/dev/null || true)"
+              if [[ -n "${address}" ]] && kill -0 "${target_pid}" 2>/dev/null; then
+                printf '%s\n' "${address}"
+                return 0
+              fi
+              if ! kill -0 "${target_pid}" 2>/dev/null; then
+                echo "ERROR: P2P target exited before publishing its listening address" >&2
+                cat "${target_log}" >&2 || true
+                wait "${target_pid}" 2>/dev/null || true
+                return 1
+              fi
+              if [[ "${SECONDS}" -ge "${deadline}" ]]; then
+                echo "ERROR: timed out waiting for P2P target listening address" >&2
+                cat "${target_log}" >&2 || true
+                return 1
+              fi
+              sleep 1
+            done
+          }
+
+          if [[ "${gpu_count}" -ne 8 ]]; then
+            echo "ERROR: node-local prefill/decode RDMA testing requires exactly 8 GPUs, found ${gpu_count}" >&2
+            exit 1
+          fi
+          if [[ "${#rdma_devices[@]}" -lt 8 ]]; then
+            echo "ERROR: node-local prefill/decode RDMA testing requires at least 8 RDMA devices, found ${#rdma_devices[@]}" >&2
+            exit 1
+          fi
+
+          # The initiator writes prefill VRAM into the decode target. Register
+          # each decode buffer on its local HCA and the prefill GPU's alternate
+          # HCA, then verify destination affinity selects the matching HCA.
+          for ((prefill_gpu_id = 0; prefill_gpu_id < 4; prefill_gpu_id++)); do
+            decode_gpu_id=$((prefill_gpu_id + 4))
+            prefill_rdma_device="${rdma_devices[prefill_gpu_id]}"
+            decode_rdma_device="${rdma_devices[decode_gpu_id]}"
+            decode_device_csv="${decode_rdma_device},${prefill_rdma_device}"
+            prefill_matrix="/tmp/gdr-smoke-prefill-gpu-${prefill_gpu_id}-nic-priority.json"
+            decode_matrix="/tmp/gdr-smoke-decode-gpu-${decode_gpu_id}-nic-priority.json"
+            printf '{"cuda:0":[["%s"],[]]}\n' "${prefill_rdma_device}" > "${prefill_matrix}"
+            printf '{"cuda:0":[["%s","%s"],[]]}\n' \
+              "${decode_rdma_device}" "${prefill_rdma_device}" > "${decode_matrix}"
+
+            target_log="/tmp/gdr-smoke-decode-gpu-${decode_gpu_id}-target.log"
+            initiator_log="/tmp/gdr-smoke-prefill-gpu-${prefill_gpu_id}-initiator.log"
+
+            echo "=== GPUDirect RDMA prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) -> decode GPU ${decode_gpu_id} (${decode_rdma_device}, alternate ${prefill_rdma_device}) ==="
+            HIP_VISIBLE_DEVICES="${decode_gpu_id}" \
+            "${validator_bin}" \
+              --mode=target \
+              --protocol=rdma \
+              --metadata_server=P2PHANDSHAKE \
+              --local_server_name=127.0.0.2:0 \
+              --device_name="${decode_device_csv}" \
+              --nic_priority_matrix="${decode_matrix}" \
+              --use_vram=true \
+              --gpu_id=0 \
+              --buffer_size=100663296 \
+              >"${target_log}" 2>&1 &
+            target_pid=$!
+            target_name="$(wait_for_p2p_address "${target_log}" "${target_pid}" 30)"
+            echo "P2P target listening at ${target_name}"
+
+            set +e
+            MC_LOG_RDMA_SLICE_AFFINITY=1 \
+            GLOG_v=1 \
+            HIP_VISIBLE_DEVICES="${prefill_gpu_id}" \
+            timeout 120 "${validator_bin}" \
+              --mode=initiator \
+              --protocol=rdma \
+              --metadata_server=P2PHANDSHAKE \
+              --local_server_name=127.0.0.3:0 \
+              --segment_id="${target_name}" \
+              --device_name="${prefill_rdma_device}" \
+              --nic_priority_matrix="${prefill_matrix}" \
+              --use_vram=true \
+              --gpu_id=0 \
+              --buffer_size=100663296 \
+              --batch_size=1 \
+              --block_size=67108864 \
+              --threads=1 \
+              --duration=1 \
+              2>&1 | tee "${initiator_log}"
+            transfer_rc="${PIPESTATUS[0]}"
+            set -e
+
+            if [[ "${transfer_rc}" -ne 0 ]] ||
+               ! grep -q "Data validation passed" "${initiator_log}"; then
+              cat "${initiator_log}" >&2
+              cat "${target_log}" >&2
+              echo "ERROR: GPUDirect RDMA data validation failed from prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) to decode GPU ${decode_gpu_id} (${decode_rdma_device}, alternate ${prefill_rdma_device})" >&2
+              exit 1
+            fi
+            expected_affinity="local_device_name=${prefill_rdma_device}, peer_device_name=${prefill_rdma_device}"
+            if grep -Fq "RDMA slice affinity:" "${initiator_log}"; then
+              if ! grep -Fq "${expected_affinity}" "${initiator_log}"; then
+                grep -F "RDMA slice affinity:" "${initiator_log}" >&2 || true
+                echo "ERROR: GPUDirect RDMA selected the wrong HCA for prefill GPU ${prefill_gpu_id}" >&2
+                exit 1
+              fi
+            else
+              echo "WARNING: RDMA data validation passed, but HCA affinity logging was unavailable for prefill GPU ${prefill_gpu_id}" >&2
+            fi
+            kill "${target_pid}" 2>/dev/null || true
+            wait "${target_pid}" 2>/dev/null || true
+            target_pid=""
+            echo "GPUDirect RDMA passed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id} via alternate HCA ${prefill_rdma_device}"
+          done
+          echo "Node-local GPUDirect RDMA passed for all four prefill/decode GPU pairs"
+
+          if [[ "${SMOKE_NODE_COUNT}" -lt 2 ]]; then
+            echo "Single-node GPUDirect RDMA smoke test passed"
+            exit 0
+          fi
+
+          touch "${SMOKE_RUN_DIR}/local-gdr-done-${SMOKE_RANK}"
+          if [[ "${SMOKE_RANK}" -le 1 ]]; then
+            deadline=$((SECONDS + 300))
+            while true; do
+              completed_nodes=0
+              for marker in "${SMOKE_RUN_DIR}"/local-gdr-done-*; do
+                [[ -e "${marker}" ]] && completed_nodes=$((completed_nodes + 1))
+              done
+              [[ "${completed_nodes}" -ge "${SMOKE_NODE_COUNT}" ]] && break
+              if [[ "${SECONDS}" -ge "${deadline}" ]]; then
+                echo "ERROR: timed out waiting for node-local GDR tests" >&2
+                exit 1
+              fi
+              sleep 2
+            done
+          fi
+
+          wait_for_file() {
+            local path="$1"
+            local timeout_seconds="$2"
+            local description="$3"
+            local deadline=$((SECONDS + timeout_seconds))
+            while [[ ! -s "${path}" ]]; do
+              if [[ "${SECONDS}" -ge "${deadline}" ]]; then
+                echo "ERROR: timed out waiting for ${description}: ${path}" >&2
+                exit 1
+              fi
+              sleep 1
+            done
+          }
+
+          local_ip="$(ip route get 1.1.1.1 2>/dev/null | awk '
+            {
+              for (i = 1; i <= NF; i++) {
+                if ($i == "src" && i < NF) {
+                  print $(i + 1)
+                  exit
+                }
+              }
+            }
+          ')"
+          local_ip="${local_ip:-$(hostname -I | awk '{print $1}')}"
+          if [[ -z "${local_ip}" ]]; then
+            echo "ERROR: unable to determine node IP for cross-node GDR testing" >&2
+            exit 1
+          fi
+
+          peer_info="${SMOKE_RUN_DIR}/cross-node-prefill-info"
+          if [[ "${SMOKE_RANK}" -eq 0 ]]; then
+            {
+              echo "${local_ip}"
+              echo "${gpu_count}"
+            } > "${peer_info}.tmp"
+            mv "${peer_info}.tmp" "${peer_info}"
+          elif [[ "${SMOKE_RANK}" -eq 1 ]]; then
+            wait_for_file "${peer_info}" 60 "prefill node information"
+            mapfile -t peer_data < "${peer_info}"
+            prefill_node_ip="${peer_data[0]:-}"
+            prefill_gpu_count="${peer_data[1]:-0}"
+            if [[ -z "${prefill_node_ip}" || "${prefill_gpu_count}" -ne "${gpu_count}" ]]; then
+              echo "ERROR: cross-node GPU topology mismatch: prefill=${prefill_gpu_count}, decode=${gpu_count}" >&2
+              exit 1
+            fi
+          fi
+
+          if [[ "${SMOKE_RANK}" -eq 0 || "${SMOKE_RANK}" -eq 1 ]]; then
+            cross_prefill_gpu_ids=(0 1 2 3 4 5 6 7 0 1 2 3)
+            cross_decode_gpu_ids=(0 1 2 3 4 5 6 7 4 5 6 7)
+            for ((pair_index = 0; pair_index < ${#cross_prefill_gpu_ids[@]}; pair_index++)); do
+              prefill_gpu_id="${cross_prefill_gpu_ids[pair_index]}"
+              decode_gpu_id="${cross_decode_gpu_ids[pair_index]}"
+              prefill_rdma_device="${rdma_devices[prefill_gpu_id]}"
+              decode_rdma_device="${rdma_devices[decode_gpu_id]}"
+              decode_device_csv="${decode_rdma_device}"
+              expected_peer_device="${decode_rdma_device}"
+              is_cross_rail=0
+              if [[ "${prefill_gpu_id}" -ne "${decode_gpu_id}" ]]; then
+                decode_device_csv="${decode_rdma_device},${prefill_rdma_device}"
+                expected_peer_device="${prefill_rdma_device}"
+                is_cross_rail=1
+              fi
+              echo "=== Cross-node RDMA pair: prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) -> decode GPU ${decode_gpu_id} (${decode_device_csv}); expected peer HCA ${expected_peer_device} ==="
+              prefill_matrix="/tmp/cross-node-prefill-gpu-${prefill_gpu_id}-nic-priority.json"
+              decode_matrix="/tmp/cross-node-decode-gpu-${decode_gpu_id}-nic-priority.json"
+              printf '{"cuda:0":[["%s"],[]]}\n' "${prefill_rdma_device}" > "${prefill_matrix}"
+              if [[ "${is_cross_rail}" -eq 1 ]]; then
+                printf '{"cuda:0":[["%s","%s"],[]]}\n' \
+                  "${decode_rdma_device}" "${prefill_rdma_device}" > "${decode_matrix}"
+              else
+                printf '{"cuda:0":[["%s"],[]]}\n' "${decode_rdma_device}" > "${decode_matrix}"
+              fi
+              ready_file="${SMOKE_RUN_DIR}/cross-node-ready-prefill-${prefill_gpu_id}-decode-${decode_gpu_id}"
+              result_file="${SMOKE_RUN_DIR}/cross-node-result-prefill-${prefill_gpu_id}-decode-${decode_gpu_id}"
+              target_log="${SMOKE_RUN_DIR}/cross-node-prefill-${prefill_gpu_id}-decode-${decode_gpu_id}-target.log"
+
+              if [[ "${SMOKE_RANK}" -eq 1 ]]; then
+                echo "=== Cross-node decode target: ${local_ip}, GPU ${decode_gpu_id} (${decode_rdma_device}) ==="
+                HIP_VISIBLE_DEVICES="${decode_gpu_id}" \
+                "${validator_bin}" \
+                  --mode=target \
+                  --protocol=rdma \
+                  --metadata_server=P2PHANDSHAKE \
+                  --local_server_name="${local_ip}:0" \
+                  --device_name="${decode_device_csv}" \
+                  --nic_priority_matrix="${decode_matrix}" \
+                  --use_vram=true \
+                  --gpu_id=0 \
+                  --buffer_size=100663296 \
+                  >"${target_log}" 2>&1 &
+                target_pid=$!
+                target_name="$(wait_for_p2p_address "${target_log}" "${target_pid}" 30)"
+                echo "Cross-node P2P target listening at ${target_name}"
+                echo "${target_name}" > "${ready_file}.tmp"
+                mv "${ready_file}.tmp" "${ready_file}"
+
+                wait_for_file "${result_file}" 150 "prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id} result"
+                result="$(<"${result_file}")"
+                kill "${target_pid}" 2>/dev/null || true
+                wait "${target_pid}" 2>/dev/null || true
+                target_pid=""
+                if [[ "${result}" != "0" ]]; then
+                  cat "${target_log}" >&2
+                  echo "ERROR: cross-node GPUDirect RDMA failed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}" >&2
+                  exit 1
+                fi
+                echo "Cross-node GPUDirect RDMA passed on decode GPU ${decode_gpu_id}"
+              else
+                wait_for_file "${ready_file}" 60 "decode GPU ${decode_gpu_id} target"
+                target_name="$(<"${ready_file}")"
+                initiator_log="/tmp/cross-node-prefill-${prefill_gpu_id}-decode-${decode_gpu_id}-initiator.log"
+                echo "=== Cross-node prefill initiator: ${local_ip} GPU ${prefill_gpu_id} (${prefill_rdma_device}) -> ${target_name} decode GPU ${decode_gpu_id} ==="
+                transfer_batch_size=4
+                transfer_block_size=1048576
+                transfer_duration=2
+                affinity_env=()
+                if [[ "${is_cross_rail}" -eq 1 ]]; then
+                  transfer_batch_size=1
+                  transfer_block_size=67108864
+                  transfer_duration=1
+                  affinity_env=(MC_LOG_RDMA_SLICE_AFFINITY=1 GLOG_v=1)
+                fi
+                set +e
+                env "${affinity_env[@]}" HIP_VISIBLE_DEVICES="${prefill_gpu_id}" \
+                timeout 120 "${validator_bin}" \
+                  --mode=initiator \
+                  --protocol=rdma \
+                  --metadata_server=P2PHANDSHAKE \
+                  --local_server_name="${local_ip}:0" \
+                  --segment_id="${target_name}" \
+                  --device_name="${prefill_rdma_device}" \
+                  --nic_priority_matrix="${prefill_matrix}" \
+                  --use_vram=true \
+                  --gpu_id=0 \
+                  --buffer_size=100663296 \
+                  --batch_size="${transfer_batch_size}" \
+                  --block_size="${transfer_block_size}" \
+                  --threads=1 \
+                  --duration="${transfer_duration}" \
+                  2>&1 | tee "${initiator_log}"
+                transfer_rc="${PIPESTATUS[0]}"
+                set -e
+                if [[ "${transfer_rc}" -eq 0 ]] &&
+                   grep -q "Data validation passed" "${initiator_log}"; then
+                  result=0
+                else
+                  result=1
+                fi
+                if [[ "${result}" -eq 0 && "${is_cross_rail}" -eq 1 ]]; then
+                  expected_affinity="local_device_name=${prefill_rdma_device}, peer_device_name=${expected_peer_device}"
+                  if grep -Fq "RDMA slice affinity:" "${initiator_log}"; then
+                    if ! grep -Fq "${expected_affinity}" "${initiator_log}"; then
+                      grep -F "RDMA slice affinity:" "${initiator_log}" >&2 || true
+                      echo "ERROR: cross-node GPUDirect RDMA selected the wrong HCA from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}" >&2
+                      result=1
+                    fi
+                  else
+                    echo "WARNING: cross-node RDMA data validation passed, but HCA affinity logging was unavailable from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}" >&2
+                  fi
+                fi
+                echo "${result}" > "${result_file}.tmp"
+                mv "${result_file}.tmp" "${result_file}"
+                if [[ "${result}" -ne 0 ]]; then
+                  cat "${target_log}" >&2 || true
+                  echo "ERROR: cross-node GPUDirect RDMA data validation failed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}" >&2
+                  exit 1
+                fi
+                echo "Cross-node GPUDirect RDMA passed from prefill GPU ${prefill_gpu_id}"
+              fi
+            done
+          fi
+
+          if [[ "${SMOKE_RANK}" -eq 0 ]]; then
+            echo "Mooncake cross-node GPUDirect RDMA passed for same-index GPU pairs 0-7 and prefill GPUs 0-3 to decode GPUs 4-7"
+          fi
+          CONTAINER_SCRIPT
+          docker_rc=$?
+          set -e
+          echo "=== RDMA smoke container finished on rank ${rank}: rc=${docker_rc} ==="
+          exit "${docker_rc}"
+          RANK_SCRIPT
+          chmod +x "${rank_script}"
+
+          slurm_status_file="${run_dir}/slurm-job.rc"
+          rm -f "${slurm_status_file}" "${slurm_status_file}.tmp"
+          batch_script="${run_dir}/rdma-smoke.sbatch.sh"
+          rm -f "${run_dir}"/rank-rc-*
+          if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
+            # Spur launches one script per node; compute nodes have no srun.
+            cat > "${batch_script}" <<EOF
+          #!/usr/bin/env bash
+          set -euo pipefail
+          exec "${rank_script}"
+          EOF
+          else
+          cat > "${batch_script}" <<EOF
+          #!/usr/bin/env bash
+          set -euo pipefail
+          set +e
+          srun --nodes=${node_count} --ntasks=${node_count} --ntasks-per-node=1 \
+            "${rank_script}"
+          srun_rc=\$?
+          set -e
+          printf '%s\n' "\${srun_rc}" > "${slurm_status_file}.tmp"
+          mv "${slurm_status_file}.tmp" "${slurm_status_file}"
+          exit "\${srun_rc}"
+          EOF
+          fi
+          chmod +x "${batch_script}"
+
+          sbatch_cmd=(
+            sbatch
+            --parsable
+            --exclusive
+            --export=ALL
+            --job-name "${SLURM_JOB_NAME}"
+            --nodes "${node_count}"
+            --ntasks "${node_count}"
+            --ntasks-per-node 1
+            --time 00:30:00
+            --output "${SLURM_OUTPUT}"
+            --error "${SLURM_ERROR}"
+          )
+          if [[ -n "${nodes}" ]]; then
+            sbatch_cmd+=(--nodelist "${nodes}")
+          fi
+          if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+            sbatch_cmd+=(--controller "${SPUR_CONTROLLER_ADDR}")
+          else
+            [[ -z "${SLURM_ACCOUNT}" ]] || sbatch_cmd+=(--account "${SLURM_ACCOUNT}")
+            [[ -z "${SLURM_PARTITION}" ]] || sbatch_cmd+=(--partition "${SLURM_PARTITION}")
+            [[ -z "${SLURM_QOS}" ]] || sbatch_cmd+=(--qos "${SLURM_QOS}")
+            sbatch_cmd+=(--gres gpu:8)
+            if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
+              sbatch_cmd+=(
+                --controller "${SPUR_CONTROLLER_ADDR}"
+              )
+            fi
+          fi
+          sbatch_cmd+=("${batch_script}")
+
+          printf ' %q' "${sbatch_cmd[@]}"
+          echo
+          write_slurm_cancel_helper ""
+          set +e
+          sbatch_output="$("${sbatch_cmd[@]}")"
+          sbatch_rc=$?
+          set -e
+          echo "${sbatch_output}"
+          if [[ "${sbatch_rc}" -ne 0 ]]; then
+            echo "sbatch submit exit code: ${sbatch_rc}"
+            exit "${sbatch_rc}"
+          fi
+
+          JOB_ID="$(parse_sbatch_job_id "${sbatch_output}")"
+          SLURM_JOB_ACTIVE=1
+          echo "${JOB_ID}" | tee "${run_dir}/slurm-job-id"
+          write_slurm_cancel_helper "${JOB_ID}"
+          set_slurm_job_log_paths "${JOB_ID}"
+          monitor_slurm_job "${JOB_ID}"
+
+          # Spur leaves the job in COMPLETING while RDMA leftovers are reaped,
+          # so give sacct longer than the 30s default to publish a final state.
+          SLURM_ACCOUNTING_TIMEOUT="${SLURM_ACCOUNTING_TIMEOUT:-180}"
+          read_slurm_exit_code "${JOB_ID}"
+          read_slurm_status_files "${run_dir}" "${node_count}"
+          SLURM_JOB_ACTIVE=0
+          echo "slurm_state=${SLURM_STATE}"
+          echo "slurm_exit_code=${SLURM_EXIT_CODE}"
+          echo "slurm job exit code: ${SLURM_JOB_RC}"
+          exit "${SLURM_JOB_RC}"
+
   run-model-benchmark:
     name: ${{ matrix.id }}
     needs: [load-config]
@@ -300,17 +1125,111 @@ jobs:
         || (github.event_name == 'workflow_dispatch' && inputs.run_model_benchmark)
       )
     runs-on: ${{ matrix.runner.slurm_submit_runner }}
-    timeout-minutes: 420
+    timeout-minutes: ${{ matrix.run_eval && matrix.accuracy.task == 'swebench_lite' && 780 || 420 }}
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix: ${{ fromJson(needs.load-config.outputs.matrix_json) }}
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
 
-      - name: Print benchmark config
+      - name: Cancel existing jobs on benchmark nodes
+        if: ${{ github.event_name == 'schedule' }}
+        env:
+          NODES: ${{ join(matrix.nodes, ',') }}
+          SLURM_SUBMIT_RUNNER: ${{ matrix.runner.slurm_submit_runner }}
+        run: |
+          set -euo pipefail
+          export PATH="/usr/local/slurm-24.05.5.1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+
+          if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+            echo "Slurm job cleanup is disabled for ${SLURM_SUBMIT_RUNNER}; skipping."
+            exit 0
+          fi
+
+          if [[ -z "${NODES}" ]]; then
+            echo "No explicit benchmark nodes were selected; skipping Slurm job cleanup."
+            exit 0
+          fi
+
+          for command_name in squeue scancel; do
+            if ! command -v "${command_name}" >/dev/null 2>&1; then
+              echo "ERROR: ${command_name} not found on $(hostname). PATH=${PATH}" >&2
+              exit 127
+            fi
+          done
+
+          squeue_cmd=(squeue)
+          scancel_cmd=(scancel)
+          if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
+            controller="http://crs-m2m-cpu-spur-v2-001.crusoe.amd.com:6817"
+            squeue_cmd+=(--controller "${controller}")
+            scancel_cmd+=(--controller "${controller}")
+          fi
+
+          echo "=== Checking all users' Slurm jobs on ${NODES} ==="
+          job_ids="$("${squeue_cmd[@]}" --noheader --nodelist "${NODES}" --format="%A" | sort -u)"
+          if [[ -z "${job_ids}" ]]; then
+            echo "No existing Slurm jobs found on ${NODES}."
+            exit 0
+          fi
+
+          echo "Cancelling Slurm jobs on ${NODES}:"
+          printf '%s\n' "${job_ids}"
+          mapfile -t job_id_list <<< "${job_ids}"
+          for job_id in "${job_id_list[@]}"; do
+            if timeout 60s "${scancel_cmd[@]}" "${job_id}"; then
+              echo "Finished cancelling Slurm job ${job_id}."
+            else
+              status=$?
+              if [[ "${status}" -eq 124 ]]; then
+                echo "ERROR: Timed out after 60 seconds cancelling Slurm job ${job_id}." >&2
+              else
+                echo "ERROR: Failed cancelling Slurm job ${job_id} with exit code ${status}." >&2
+              fi
+              exit "${status}"
+            fi
+          done
+
+      - name: Resolve machine-specific benchmark paths
+        id: machine-paths
         env:
           CELL_JSON: ${{ toJson(matrix) }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import socket
+          from pathlib import Path
+
+          cell = json.loads(os.environ["CELL_JSON"])
+          # The matrix is expanded on ubuntu-latest, before the submit machine is known.
+          if socket.gethostname().split(".", 1)[0] == "pit2-vm-amd-xl-02":
+              old_model_root = os.environ["ATOMESH_MODEL_ROOT"].rstrip("/")
+
+              def remap_model_paths(value):
+                  if isinstance(value, dict):
+                      return {key: remap_model_paths(item) for key, item in value.items()}
+                  if isinstance(value, list):
+                      return [remap_model_paths(item) for item in value]
+                  if isinstance(value, str) and (value == old_model_root or value.startswith(old_model_root + "/")):
+                      return "/share_nfs/models" + value[len(old_model_root):]
+                  return value
+
+              cell = remap_model_paths(cell)
+              cell["runner"]["log_root"] = "/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG"
+              cell["runner"]["slurm_partition"] = "amd-spur"
+              cell["runner"]["slurm_qos"] = "amd-frameworks-qos"
+
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write(f"cell_json={json.dumps(cell, separators=(',', ':'))}\n")
+          PY
+
+      - name: Print benchmark config
+        env:
+          CELL_JSON: ${{ steps.machine-paths.outputs.cell_json }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -338,6 +1257,7 @@ jobs:
               "runner": get("runner.slurm_submit_runner"),
               "slurm_account": get("runner.slurm_account"),
               "slurm_partition": get("runner.slurm_partition"),
+              "slurm_qos": get("runner.slurm_qos"),
               "log_root": get("runner.log_root"),
               "nodes": ",".join(get("nodes", [])),
               "num_nodes": get("num_nodes"),
@@ -351,6 +1271,7 @@ jobs:
               "osl": get("osl"),
               "concurrency": get("concurrency"),
               "run_eval": get("run_eval"),
+              "accuracy": get("accuracy"),
           }
 
           print("=== ATOMesh benchmark config summary ===")
@@ -363,14 +1284,19 @@ jobs:
 
       - name: Run Slurm benchmark cell
         env:
-          CELL_JSON: ${{ toJson(matrix) }}
+          # Build the reviewed source in a separate setup container. Use the
+          # existing release profile for both benchmark and eval services.
+          ATOMESH_BUILD_MESH: ${{ matrix.benchmark.kind == 'aiperf_agentic' && 'true' || 'false' }}
+          ATOMESH_MESH_BUILD_PROFILE: release
+          CELL_JSON: ${{ steps.machine-paths.outputs.cell_json }}
           RESULT_DIR: atomesh-results
           SLURM_SUBMIT_RUNNER: ${{ matrix.runner.slurm_submit_runner }}
         run: |
           set -euo pipefail
           ORIGINAL_WORKSPACE="${GITHUB_WORKSPACE}"
+          CURRENT_USER="$(id -un 2>/dev/null || id -u)"
           if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
-            SHARED_WORKSPACE="/data/$(id -un)/atomesh-ci/${GITHUB_RUN_ID}/${{ matrix.id }}"
+            SHARED_WORKSPACE="/data/${CURRENT_USER}/atomesh-ci/${GITHUB_RUN_ID}/${{ matrix.id }}"
             rm -rf "${SHARED_WORKSPACE}"
             mkdir -p "${SHARED_WORKSPACE}"
             if command -v rsync >/dev/null 2>&1; then
@@ -383,17 +1309,40 @@ jobs:
           fi
           chmod +x .github/scripts/atomesh/*.sh .github/scripts/atomesh/*.py
           SLURM_CANCEL_HELPER="${RESULT_DIR}/${{ matrix.id }}.slurm-cancel.sh"
+          SLURM_JOB_NAME="${{ matrix.id }}-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          SPUR_CONTROLLER_ADDR="${SPUR_CONTROLLER_ADDR:-}"
+          if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
+            SPUR_CONTROLLER_ADDR="http://crs-m2m-cpu-spur-v2-001.crusoe.amd.com:6817"
+          elif [[ -z "${SPUR_CONTROLLER_ADDR}" && "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+            SPUR_CONTROLLER_ADDR="http://134.199.196.72:6817"
+          fi
           PD_SUBMIT_PID=""
+          scancel_slurm_by_name_from_wrapper() {
+            command -v scancel >/dev/null 2>&1 || return 0
+            local -a scancel_cmd=(scancel)
+            if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
+              scancel_cmd+=(--controller "${SPUR_CONTROLLER_ADDR}")
+            fi
+            scancel_cmd+=(--user "${CURRENT_USER}" --name "${SLURM_JOB_NAME}")
+            if command -v timeout >/dev/null 2>&1; then
+              timeout "${SLURM_SCANCEL_TIMEOUT_SECONDS:-8}" "${scancel_cmd[@]}" || true
+            else
+              "${scancel_cmd[@]}" || true
+            fi
+          }
           cleanup_slurm_from_wrapper() {
             local rc=$?
             trap - EXIT HUP INT TERM
             if [[ "${rc}" -ne 0 ]]; then
               echo "=== cancelling Slurm job from workflow wrapper rc=${rc} ==="
               if [[ -x "${SLURM_CANCEL_HELPER}" ]]; then
-                bash "${SLURM_CANCEL_HELPER}" || true
+                SLURM_CANCEL_WAIT_SECONDS="${SLURM_CANCEL_WAIT_SECONDS:-5}" \
+                  SLURM_CANCEL_KILL_WAIT_SECONDS="${SLURM_CANCEL_KILL_WAIT_SECONDS:-5}" \
+                  bash "${SLURM_CANCEL_HELPER}" || true
               else
                 echo "Slurm cancel helper is not available yet"
               fi
+              scancel_slurm_by_name_from_wrapper
             fi
             if [[ -n "${PD_SUBMIT_PID}" ]] && kill -0 "${PD_SUBMIT_PID}" 2>/dev/null; then
               kill "${PD_SUBMIT_PID}" 2>/dev/null || true
@@ -419,6 +1368,7 @@ jobs:
           set -euo pipefail
           mkdir -p atomesh-results
           SUMMARY_PATH="atomesh-results/${MATRIX_ID}-summary.md"
+          AIPERF_RAW_PATH="atomesh-results/${MATRIX_ID}-aiperf-raw.md"
           BENCHMARK_ACTION_INPUT="atomesh-results/${MATRIX_ID}-benchmark-action.json"
 
           python3 .github/scripts/atomesh/process_result.py \
@@ -428,6 +1378,11 @@ jobs:
             --hardware "${ATOMESH_DASHBOARD_HARDWARE}" \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
+          # Empty for standard ISL/OSL cases: only AIPerf writes the console dump.
+          python3 .github/scripts/atomesh/aiperf_console_report.py \
+            "atomesh-results/${MATRIX_ID}" \
+            --output "${AIPERF_RAW_PATH}"
+
           {
             echo "## ${MATRIX_ID}"
             echo
@@ -435,10 +1390,60 @@ jobs:
               echo "Slurm job: $(cat "atomesh-results/${MATRIX_ID}.slurm-job-id")"
               echo
             fi
+            if [ -f "atomesh-results/${MATRIX_ID}.log-root" ]; then
+              echo "Log path: \`$(cat "atomesh-results/${MATRIX_ID}.log-root")\`"
+              echo
+            fi
             cat "${SUMMARY_PATH}"
+            if [ -s "${AIPERF_RAW_PATH}" ]; then
+              echo
+              cat "${AIPERF_RAW_PATH}"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
           cat "${SUMMARY_PATH}"
+          if [ -s "${AIPERF_RAW_PATH}" ]; then
+            cat "${AIPERF_RAW_PATH}"
+          fi
+
+      - name: Upload AIPerf Perfetto traces
+        if: ${{ always() && matrix.benchmark.kind == 'aiperf_agentic' }}
+        uses: ./.github/actions/upload-aiperf-traces
+        with:
+          result-dir: atomesh-results/${{ matrix.id }}
+          artifact-name: aiperf-chrome-traces-${{ matrix.id }}
+          output-dir: aiperf-traces/${{ matrix.id }}
+          run-url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Prepare agentic PD latency reports
+        if: ${{ always() && matrix.benchmark.kind == 'aiperf_agentic' }}
+        id: metrics-reports
+        env:
+          MATRIX_ID: ${{ matrix.id }}
+        run: |
+          python3 .github/scripts/atomesh/observability/stage_reports.py \
+            --cell "$MATRIX_ID" \
+            --output "atomesh-reports/$MATRIX_ID"
+
+      - name: Upload agentic PD latency reports
+        if: ${{ always() && steps.metrics-reports.outcome == 'success' }}
+        id: metrics-artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: atomesh-latency-${{ matrix.id }}-${{ github.run_attempt }}
+          path: atomesh-reports/${{ matrix.id }}/
+          if-no-files-found: error
+
+      - name: Link latency reports in job summary
+        if: ${{ always() && steps.metrics-artifact.outcome == 'success' }}
+        env:
+          MATRIX_ID: ${{ matrix.id }}
+          METRICS_ARTIFACT_URL: ${{ steps.metrics-artifact.outputs.artifact-url }}
+        run: |
+          python3 .github/scripts/atomesh/observability/stage_reports.py \
+            --cell "$MATRIX_ID" \
+            --output "atomesh-reports/$MATRIX_ID" \
+            --summary-only
 
       - name: Upload model benchmark artifacts
         if: always()
@@ -478,7 +1483,73 @@ jobs:
             --summary atomesh-benchmark-summary.md \
             --hardware "${ATOMESH_DASHBOARD_HARDWARE}" \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # Empty for standard ISL/OSL cases: only AIPerf writes the console dump.
+          python3 .github/scripts/atomesh/aiperf_console_report.py \
+            atomesh-results \
+            --output atomesh-aiperf-raw.md
+          python3 - <<'PY' > atomesh-case-log-paths.md
+          import json
+          import re
+          from pathlib import Path
+
+          results = Path("atomesh-results")
+
+
+          def sort_key(case_id):
+              """Order this table like the perf summary: (benchmark_model_name,
+              max_concurrency), read from the case's own result JSON so both tables
+              key off the same fields. A cell that sweeps several concurrencies
+              leads at its lowest one; a case that died before writing any result
+              falls back to its id, whose prefix ahead of the NpMd topology token is
+              the model name.
+              """
+              keys = []
+              for path in sorted((results / case_id).rglob("pd-*.json")):
+                  try:
+                      payload = json.loads(path.read_text(encoding="utf-8"))
+                      model = str(payload.get("benchmark_model_name") or "")
+                      conc = int(payload.get("max_concurrency") or 0)
+                  except (OSError, ValueError, TypeError):
+                      continue
+                  keys.append((model.rstrip("/").split("/")[-1].lower(), conc))
+              if keys:
+                  return min(keys)
+              topology = re.search(r"-\d+p\d+d-", case_id)
+              found = re.findall(r"-c(\d+)-", case_id)
+              return (
+                  case_id[: topology.start()] if topology else case_id,
+                  int(found[-1]) if found else 0,
+              )
+
+
+          rows = []
+          for path in results.glob("*.log-root"):
+              case_id = path.name[: -len(".log-root")]
+              job_file = path.with_name(f"{case_id}.slurm-job-id")
+              job_id = job_file.read_text().strip() if job_file.is_file() else ""
+              rows.append((case_id, job_id or "--", path.read_text().strip()))
+
+          if rows:
+              print("### ATOMesh Case Log Paths")
+              print()
+              print("| Case | Slurm job | Log path |")
+              print("| --- | --- | --- |")
+              for case_id, job_id, log_root in sorted(
+                  rows, key=lambda row: sort_key(row[0]) + (row[0],)
+              ):
+                  print(f"| {case_id} | {job_id} | `{log_root}` |")
+              print()
+          PY
+          if [[ -s atomesh-case-log-paths.md ]]; then
+            cat atomesh-case-log-paths.md >> "$GITHUB_STEP_SUMMARY"
+          fi
           cat atomesh-benchmark-summary.md >> "$GITHUB_STEP_SUMMARY"
+          if [[ -s atomesh-aiperf-raw.md ]]; then
+            {
+              echo
+              cat atomesh-aiperf-raw.md
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
           ENTRY_COUNT="$(python3 - <<'PY'
           import json
           from pathlib import Path
@@ -495,6 +1566,15 @@ jobs:
             echo "No successful ATOMesh benchmark result JSONs were produced; dashboard publish will be skipped." >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: Upload AIPerf Perfetto traces
+        if: always()
+        uses: ./.github/actions/upload-aiperf-traces
+        with:
+          result-dir: atomesh-results
+          artifact-name: aiperf-chrome-traces-${{ github.run_id }}
+          output-dir: aiperf-traces
+          run-url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
       - name: Upload benchmark summary
         if: ${{ steps.summary.outputs.has_results == 'true' }}
         uses: actions/upload-artifact@v7
@@ -503,6 +1583,9 @@ jobs:
           path: |
             atomesh-benchmark-action.json
             atomesh-benchmark-summary.md
+            atomesh-aiperf-raw.md
+            atomesh-case-log-paths.md
+          if-no-files-found: ignore
 
   dashboard:
     concurrency:
@@ -535,6 +1618,12 @@ jobs:
           test -s atomesh-dashboard-input/atomesh-benchmark-action.json
           cp .github/dashboard/index.html /tmp/atomesh_dashboard_index.html
 
+      - name: Prepare existing dashboard data
+        id: prepare_dashboard_data
+        uses: ./.github/actions/prepare-dashboard-data
+        with:
+          data-path: benchmark-dashboard/data.js
+
       - name: Store ATOMesh benchmark result to dashboard
         uses: benchmark-action/github-action-benchmark@v1
         with:
@@ -542,9 +1631,15 @@ jobs:
           output-file-path: atomesh-dashboard-input/atomesh-benchmark-action.json
           gh-pages-branch: gh-pages
           benchmark-data-dir-path: benchmark-dashboard
-          auto-push: true
+          auto-push: false
           max-items-in-chart: 300
           github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate dashboard data after write
+        uses: ./.github/actions/validate-dashboard-data
+        with:
+          data-path: benchmark-dashboard/data.js
+          min-entries: ${{ steps.prepare_dashboard_data.outputs.entry_count }}
 
       - name: Deploy ATOMesh dashboard shell to gh-pages
         run: |

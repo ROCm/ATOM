@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use crate::core::{HashRing, Worker};
 
 mod cache_aware;
+mod dp_sticky;
 mod factory;
 mod power_of_two;
 mod prefix_hash;
@@ -19,6 +20,7 @@ mod round_robin;
 pub mod tree;
 pub(crate) mod utils;
 pub use cache_aware::CacheAwarePolicy;
+pub use dp_sticky::DpStickyPolicy;
 pub use factory::PolicyFactory;
 pub use power_of_two::PowerOfTwoPolicy;
 pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};

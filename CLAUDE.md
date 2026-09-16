@@ -31,6 +31,16 @@ openai_server.py → LLMEngine → CoreManager → EngineCore → Scheduler → 
                                                loop)                    KV cache, CUDAGraphs)
 ```
 
+ATOM also has a **diffusion subsystem** (`atom/diffusion/`) for video+audio
+generation, which is a sibling of `atom/model_engine/` rather than an extension
+of it — no KV cache, one fixed N-step denoise loop per job, four heterogeneous
+networks, and sequence parallelism across a *single* request:
+
+```
+diffusion_server.py → DiffusionEngine → DiffusionCoreManager → DiffusionEngineCore → PipelineRunner
+   (/v1/videos)        (JobScheduler)      (ZMQ, one PUSH/rank)    (per-GPU worker)     (ComposedPipeline)
+```
+
 Key entry points:
 - Server: `atom/entrypoints/openai_server.py`
 - Engine: `atom/model_engine/llm_engine.py` → `engine_core.py` → `scheduler.py` → `model_runner.py`
@@ -38,10 +48,13 @@ Key entry points:
 - Ops: `atom/model_ops/` — AITER kernel wrappers (linear, attention, fused_moe)
 - Config: `atom/config.py` (Config, KVCacheConfig, CompilationConfig)
 - Env vars: `atom/utils/envs.py` (all `ATOM_*` variable definitions)
+- Diffusion: `atom/diffusion/` — framework at the top level (`pipeline.py`,
+  `attention.py`, `ulysses.py`), engine in `engine/`, server in `entrypoints/`,
+  and one package per model in `models/<family>/`. Extras: `pip install -e ".[diffusion]"`
 
 ## Critical Rules
 
-- **NEVER modify `@support_torch_compile` decorated model files** — breaks Dynamo tracing even with `--enforce-eager`. Instrument at call sites instead (e.g., `ModelRunner.run_model()`, `EagleProposer.propose()`)
+- **NEVER modify `@support_torch_compile` decorated model files** — breaks Dynamo tracing even with `--enforce-eager`. Instrument at call sites instead (e.g., `ModelRunner.run_model()`, `EagleProposer.propose()`, `DSparkProposer.propose()`). `deepseek_v4_dspark.py` carries a COMPILE BOUNDARY block at the top naming exactly which functions are traced — read it before touching that file
 - **Multiprocessing must use `spawn`** — `fork` causes CUDA re-initialization crashes
 - **Set `AITER_LOG_LEVEL=WARNING` before starting server** — suppresses aiter kernel log flooding
 - **Clear compile cache before server restart:** `rm -rf /root/.cache/atom/*` — stale cache causes silent failures after code changes
@@ -79,3 +92,4 @@ Key entry points:
 | Performance benchmark | `/benchmark-guide` |
 | Debugging | `/debug-guide` |
 | Adding a model | `/add-model` |
+| MiniMax-H3 (video+audio diffusion) | `recipes/MiniMax-H3.md` |

@@ -92,6 +92,13 @@ python3 -m sglang.launch_server \
 On MI300X/MI308X, TP=8 is needed due to the memory limitations.
 Note `online_quant_config` for the difference compared to MI355. On MI300X/MI308X, both attention linear layers and MoE experts are online-quantized to PTPC-FP8, leveraging the high-performance kernels on these platforms.
 
+> **Note:** When enabling `online_quant_config` on MI300X / MI308X, clear the stale AITER JIT MoE artifact first. Otherwise SGLang may reuse an incompatible `.so` from a previous build and fail during server startup.
+#### Required when enabling online quant*: clear stale AITER JIT artifacts.
+```
+rm -f /app/aiter-test/aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_silu_per_token_mulWeightStage2.so && \
+rm -rf /app/aiter-test/aiter/jit/build/module_moe_ck2stages_f8_f8_preshuffle_on_b16_silu_per_token_mulWeightStage2; \
+```
+
 <a id="mi300x-mi308x-fp8"></a>
 
 #### GLM-5.2 FP8 Server
