@@ -27,6 +27,7 @@ def check_return_routed_experts(
     *,
     kv_transfer_config: dict | None = None,
     enable_rapidserve: bool = False,
+    enable_dp_attention: bool = False,
 ) -> None:
     """Refuse topologies that cannot assemble a full [seq_len-1] route tensor."""
     if dcp_size != 1 or pcp_size != 1:
@@ -50,6 +51,32 @@ def check_return_routed_experts(
             "prefill/decode disaggregation; decode skips KV allocation and "
             "never initializes the process-local capture buffer"
         )
+    if enable_dp_attention:
+        raise ValueError(
+            "enable_return_routed_experts does not support enable_dp_attention: "
+            "select_experts runs after the DP all-gather, so captured top-k ids "
+            "are aligned to the gathered token stream, not this rank's local "
+            "slot_mapping; export would silently return another rank's routes"
+        )
+
+
+def is_fused_moe_module(module: Any) -> bool:
+    """True for a real FusedMoE, including LazyMoEWrapper instances.
+
+    ``FusedMoEDecoratorForPluginMode`` replaces ``FusedMoE`` with a subclass
+    whose ``__new__`` returns an *undecorated* instance. ``isinstance(m,
+    FusedMoE)`` is then False, so callers must also accept the wrapper's base.
+    """
+    from atom.model_ops.moe import FusedMoE
+
+    types: tuple[type, ...] = (FusedMoE,) + tuple(
+        b for b in getattr(FusedMoE, "__bases__", ()) if isinstance(b, type)
+    )
+    return isinstance(module, types)
+
+
+def fused_moe_modules(root: Any) -> list:
+    return [m for m in root.modules() if is_fused_moe_module(m)]
 
 
 def kv_slots_from_block_table(

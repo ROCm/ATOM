@@ -53,7 +53,10 @@ def test_dcp_pcp_pp_fail_closed():
         check_return_routed_experts(1, 1, 1, kv_transfer_config={"kv_connector": "moriio"})
     with pytest.raises(ValueError, match="RapidServe"):
         check_return_routed_experts(1, 1, 1, enable_rapidserve=True)
+    with pytest.raises(ValueError, match="enable_dp_attention"):
+        check_return_routed_experts(1, 1, 1, enable_dp_attention=True)
     check_return_routed_experts(1, 1, 1, kv_transfer_config={})
+    check_return_routed_experts(1, 1, 1, enable_dp_attention=False)
 
 
 def test_rapidserve_decode_skip_is_rejected():
@@ -229,6 +232,35 @@ def test_trim_routed_experts_before_request_output():
         routed_experts=trimmed,
     )
     assert ro.routed_experts.shape[0] == 3
+
+
+def test_lazy_wrapper_fused_moe_is_detected(monkeypatch):
+    """Plugin LazyMoEWrapper instances are not isinstance(FusedMoE).
+
+    Do not import ``atom.model_ops.moe``: FusedMoE pulls AITER, which needs a
+    GPU (rocminfo) even to load the class.
+    """
+    import sys
+    import types
+    import torch.nn as nn
+
+    from atom.model_ops.fused_moe.routed_experts_capturer import is_fused_moe_module
+
+    class InnerFusedMoE(nn.Module):
+        pass
+
+    class LazyMoEWrapper(InnerFusedMoE):
+        def __new__(cls, *args, **kwargs):
+            return InnerFusedMoE()
+
+    fake_moe = types.ModuleType("atom.model_ops.moe")
+    fake_moe.FusedMoE = LazyMoEWrapper
+    monkeypatch.setitem(sys.modules, "atom.model_ops.moe", fake_moe)
+
+    module = InnerFusedMoE()
+    assert is_fused_moe_module(module)
+    assert not isinstance(module, LazyMoEWrapper)
+    assert not is_fused_moe_module(nn.Identity())
 
 
 def test_triton_routing_ids_match_packed_histogram():

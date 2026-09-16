@@ -535,6 +535,9 @@ class Scheduler:
                     or "RapidServeModelRunner"
                     in str(getattr(config, "runner_qualname", ""))
                 ),
+                enable_dp_attention=bool(
+                    getattr(config, "enable_dp_attention", False)
+                ),
             )
         pc = getattr(config, "parallel_config", None)
         self.metrics = SchedulerMetrics(

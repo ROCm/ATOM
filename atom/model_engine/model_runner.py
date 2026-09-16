@@ -2055,14 +2055,15 @@ class ModelRunner:
             return None
         import re
 
-        from atom.model_ops.moe import FusedMoE
+        from atom.model_ops.fused_moe.routed_experts_capturer import fused_moe_modules
 
-        moes: list = []
-        for model in [self.model]:
-            moes.extend(m for m in model.modules() if isinstance(m, FusedMoE))
+        moes: list = fused_moe_modules(self.model)
         if not moes:
-            self._routed_experts_geo = None
-            return None
+            raise ValueError(
+                "enable_return_routed_experts requires at least one FusedMoE "
+                "module; this model has none (dense checkpoints cannot "
+                "return routed_experts)"
+            )
         layer_ids: list[int] = []
         for ordinal, moe in enumerate(moes):
             prefix = getattr(moe, "prefix", "") or ""
@@ -4340,6 +4341,9 @@ class RapidServeModelRunner(ModelRunner):
             getattr(self.config, "pipeline_parallel_size", 1),
             kv_transfer_config=getattr(self.config, "kv_transfer_config", None),
             enable_rapidserve=True,
+            enable_dp_attention=bool(
+                getattr(self.config, "enable_dp_attention", False)
+            ),
         )
 
     def get_num_blocks(self) -> dict[str, object]:

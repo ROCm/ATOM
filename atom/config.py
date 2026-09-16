@@ -1719,8 +1719,8 @@ class Config:
     enable_prefix_caching: bool = True
     # Return per-request MoE routes from generate() as int16
     # [seq_len - 1, num_layers, top_k]. Scatter is CUDA-graph-safe (device
-    # write inside fused MoE). Requires DCP=PCP=PP=1 and no KV transfer /
-    # offload / RapidServe P/D; prefix cache stays on.
+    # write inside fused MoE). Requires DCP=PCP=PP=1, no DP-attention, and
+    # no KV transfer / offload / RapidServe P/D; prefix cache stays on.
     enable_return_routed_experts: bool = False
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
@@ -2151,6 +2151,7 @@ class Config:
                     or self.disagg_is_decode
                     or "RapidServeModelRunner" in self.runner_qualname
                 ),
+                enable_dp_attention=self.enable_dp_attention,
             )
 
         if self.speculative_config is not None:

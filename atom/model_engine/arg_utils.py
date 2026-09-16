@@ -214,7 +214,8 @@ class EngineArgs:
             action="store_true",
             help="Return per-request MoE expert ids on generate() as "
             "routed_experts int16 [seq_len-1, num_layers, top_k]. "
-            "Requires DCP=PCP=PP=1 and no KV transfer, offload, or RapidServe.",
+            "Requires DCP=PCP=PP=1, no DP-attention, and no KV transfer, "
+            "offload, or RapidServe.",
         )
         parser.add_argument(
             "--port",
