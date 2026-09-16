@@ -488,6 +488,8 @@ def _make_connector(**overrides):
     )
     conn = object.__new__(mc.MooncakeConnector)
     conn._completion_lock = threading.Lock()
+    conn._dispatch_in_flight = set()
+    conn._deferred_failures = {}
     conn._fence_lock = threading.Lock()
     conn._pending_recv_expected = {}
     conn._pending_recv_stages = {}
@@ -546,9 +548,6 @@ def test_write_done_nonce_cleaned_up_on_completion():
     conn._pending_recv_nonce["r1"] = 777
     conn._record_write_done("r1", 0, 0, 777)
     assert "r1" not in conn._pending_recv_nonce
-
-
-
 
 
 def test_failed_write_done_returns_the_staging_row_to_the_pool():

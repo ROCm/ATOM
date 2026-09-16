@@ -762,7 +762,8 @@ def _fp4_pd_pair(builder_cls, writer, kv_dtype="fp8", coalesce=False):
     for name in ("_execute_block_slot_transfer", "_consumer_region_map"):
         setattr(conn, name, types.MethodType(writer[name], conn))
     req = {
-        "consumer_block_base_addrs": [r.base_addr for r in dst.block_regions],
+        # FP4 consumers advertise under the FP4-only key (version fence).
+        "consumer_block_base_addrs_fp4": [r.base_addr for r in dst.block_regions],
         "consumer_block_bpb": [r.unit_bytes for r in dst.block_regions],
         "consumer_region_roles": [r.semantic_role for r in dst.block_regions],
         "consumer_block_mr_ends": [[r.total_bytes] for r in dst.block_regions],
@@ -840,7 +841,7 @@ def test_fp4_pd_layout_mismatch_fails_before_any_write(
         req.pop("consumer_region_roles")
     elif mismatch == "missing_scale":
         for key in (
-            "consumer_block_base_addrs",
+            "consumer_block_base_addrs_fp4",
             "consumer_block_bpb",
             "consumer_region_roles",
         ):
@@ -870,7 +871,7 @@ def test_fp4_pd_layout_mismatch_fails_before_any_write(
     conn._rdma_write_with_retry = lambda *args: calls.append(args) or True
     with pytest.raises(
         RuntimeError,
-        match="mismatch|out of range|disagree|requires the consumer|Cannot layer-map",
+        match="mismatch|out of range|disagree|requires the consumer|Cannot layer-map|unwritten",
     ):
         conn._execute_block_slot_transfer(
             req, "test", [0], [1], {"slot_index": -1, "swa_block_ids": [1]}, "fp4"
