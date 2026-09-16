@@ -61,6 +61,7 @@ from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
     Pool,
     PoolPlan,
     SubPoolSpec,
+    page_pool,
     plan_pools,
 )
 from atom.model_ops.decode_input_ids import (
@@ -1446,6 +1447,18 @@ class ModelRunner:
         specs = list(self.attn_metadata_builder.sub_pool_specs())
         if hasattr(self, "draft_kv_builder"):
             specs += self.draft_kv_builder.sub_pool_specs()
+        geo = self._routed_experts_geometry()
+        if geo is not None:
+            from atom.model_ops.fused_moe.routed_experts_capturer import (
+                capture_bytes_per_kv_block,
+            )
+
+            num_layers, top_k = geo
+            specs.append(
+                page_pool(
+                    capture_bytes_per_kv_block(self.block_size, num_layers, top_k)
+                )
+            )
         return specs
 
     def _state_pool_names(self) -> list[str]:
@@ -1593,6 +1606,16 @@ class ModelRunner:
         available_for_kv = min(available_for_kv_budget, free)
 
         torch.set_default_device("cpu")
+
+        geo = self._routed_experts_geometry()
+        if geo is not None:
+            from atom.model_ops.fused_moe.routed_experts_capturer import (
+                capture_pad_row_bytes,
+            )
+
+            available_for_kv = max(
+                0, int(available_for_kv) - capture_pad_row_bytes(*geo)
+            )
 
         specs = self._sub_pool_specs()
 
@@ -2013,22 +2036,29 @@ class ModelRunner:
         self._maybe_init_routed_experts_capturer(num_kvcache_blocks)
         return True
 
-    def _maybe_init_routed_experts_capturer(self, num_kvcache_blocks: int) -> None:
+    def _routed_experts_geometry(self) -> tuple[int, int] | None:
+        """``(num_layers, top_k)`` for the capture buffer, or None if unused.
+
+        Assigns ``moe_capture_layer_id`` on each FusedMoE. Cached so pool
+        planning and capturer init share one walk.
+        """
+        if hasattr(self, "_routed_experts_geo"):
+            return self._routed_experts_geo
         if not getattr(self.config, "enable_return_routed_experts", False):
-            return
+            self._routed_experts_geo = None
+            return None
+        if not hasattr(self, "model"):
+            return None
         import re
 
-        from atom.model_ops.fused_moe.routed_experts_capturer import (
-            RoutedExpertsCapturer,
-        )
         from atom.model_ops.moe import FusedMoE
 
-        models = [self.model]
         moes: list = []
-        for model in models:
+        for model in [self.model]:
             moes.extend(m for m in model.modules() if isinstance(m, FusedMoE))
         if not moes:
-            return
+            self._routed_experts_geo = None
+            return None
         layer_ids: list[int] = []
         for ordinal, moe in enumerate(moes):
             prefix = getattr(moe, "prefix", "") or ""
@@ -2041,11 +2071,26 @@ class ModelRunner:
                 idx = ordinal
             moe.moe_capture_layer_id = idx
             layer_ids.append(idx)
+        self._routed_experts_geo = (
+            max(layer_ids) + 1,
+            max(int(m.top_k) for m in moes),
+        )
+        return self._routed_experts_geo
+
+    def _maybe_init_routed_experts_capturer(self, num_kvcache_blocks: int) -> None:
+        geo = self._routed_experts_geometry()
+        if geo is None:
+            return
+        from atom.model_ops.fused_moe.routed_experts_capturer import (
+            RoutedExpertsCapturer,
+        )
+
+        num_layers, top_k = geo
         num_slots = int(num_kvcache_blocks) * int(self.block_size)
         RoutedExpertsCapturer.init(
             num_slots=num_slots,
-            num_layers=max(layer_ids) + 1,
-            top_k=max(int(m.top_k) for m in moes),
+            num_layers=num_layers,
+            top_k=top_k,
             device=self.device,
         )
 

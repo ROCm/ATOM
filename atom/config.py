@@ -1910,11 +1910,13 @@ class Config:
         if self.enable_return_routed_experts and (
             self.decode_context_parallel_size != 1
             or self.prefill_context_parallel_size != 1
+            or self.pipeline_parallel_size != 1
         ):
             raise ValueError(
                 "enable_return_routed_experts requires "
-                "decode_context_parallel_size == 1 and "
-                "prefill_context_parallel_size == 1"
+                "decode_context_parallel_size == 1, "
+                "prefill_context_parallel_size == 1, and "
+                "pipeline_parallel_size == 1"
             )
         # assert os.path.isdir(self.model)
 

@@ -20,12 +20,18 @@ import torch
 _INSTANCE: RoutedExpertsCapturer | None = None
 
 
-def check_return_routed_experts(dcp_size: int, pcp_size: int) -> None:
-    """vLLM #28284 only refused context-parallel capture (incomplete slots)."""
+def check_return_routed_experts(
+    dcp_size: int, pcp_size: int, pp_size: int = 1
+) -> None:
+    """Refuse topologies that cannot assemble a full [seq_len-1] route tensor."""
     if dcp_size != 1 or pcp_size != 1:
         raise ValueError(
             "enable_return_routed_experts requires decode_context_parallel_size "
             "== 1 and prefill_context_parallel_size == 1"
+        )
+    if pp_size != 1:
+        raise ValueError(
+            "enable_return_routed_experts requires pipeline_parallel_size == 1"
         )
 
 
@@ -62,8 +68,33 @@ def _current_slot_mapping() -> torch.Tensor | None:
     return slots if isinstance(slots, torch.Tensor) else None
 
 
+def capture_bytes_per_kv_block(
+    block_size: int, num_layers: int, top_k: int
+) -> int:
+    """PAGE-pool surcharge: int32 routes for every token slot in one KV block."""
+    return int(block_size) * int(num_layers) * int(top_k) * 4
+
+
+def capture_pad_row_bytes(num_layers: int, top_k: int) -> int:
+    """Sacrificial dummy-slot row charged once, not per KV block."""
+    return int(num_layers) * int(top_k) * 4
+
+
+def trim_routed_experts(routes: np.ndarray | None, num_tokens: int):
+    """Keep routes for every forwarded token: ``num_tokens - 1`` rows."""
+    if routes is None:
+        return None
+    keep = max(int(num_tokens) - 1, 0)
+    if routes.shape[0] != keep:
+        return routes[:keep]
+    return routes
+
+
 class RoutedExpertsCapturer:
-    """Persistent GPU buffer: ``[num_kv_slots, num_layers, top_k]``."""
+    """Persistent GPU buffer: ``[num_kv_slots + 1, num_layers, top_k]``.
+
+    The extra row is a sacrificial pad target for graph dummy slots (``-1``).
+    """
 
     def __init__(
         self,
@@ -81,8 +112,12 @@ class RoutedExpertsCapturer:
         self.num_slots = int(num_slots)
         self.num_layers = int(num_layers)
         self.top_k = int(top_k)
+        # Last row is a sacrificial pad target. Graph dummy slots are -1;
+        # mapping them to 0 and then index-putting would clobber a real write
+        # to physical slot 0 in the same capture (duplicate indices).
+        self._pad_slot = self.num_slots
         self.buffer = torch.zeros(
-            (self.num_slots, self.num_layers, self.top_k),
+            (self.num_slots + 1, self.num_layers, self.top_k),
             dtype=dtype,
             device=device,
         )
@@ -125,10 +160,15 @@ class RoutedExpertsCapturer:
         slots = slots[:n]
         k = min(int(topk_ids.shape[-1]), self.top_k)
         ids = topk_ids[:n, :k].to(device=self.buffer.device, dtype=self.buffer.dtype)
-        valid = slots >= 0
-        safe = slots.to(dtype=torch.long).clamp(min=0, max=self.num_slots - 1)
-        dst = self.buffer[safe, layer_id, :k]
-        self.buffer[safe, layer_id, :k] = torch.where(valid.unsqueeze(-1), ids, dst)
+        slots_i = slots.to(dtype=torch.long)
+        valid = slots_i >= 0
+        phys = slots_i.clamp(min=0, max=self.num_slots - 1)
+        dest = torch.where(valid, phys, torch.full_like(phys, self._pad_slot))
+        if k < self.top_k:
+            row = self.buffer.new_zeros((n, self.top_k))
+            row[:, :k] = ids
+            ids = row
+        self.buffer[dest, layer_id, :] = ids
 
     def export_batch(
         self,

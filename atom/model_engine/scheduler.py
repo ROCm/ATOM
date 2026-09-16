@@ -527,6 +527,7 @@ class Scheduler:
             check_return_routed_experts(
                 getattr(config, "decode_context_parallel_size", 1),
                 getattr(config, "prefill_context_parallel_size", 1),
+                getattr(config, "pipeline_parallel_size", 1),
             )
         pc = getattr(config, "parallel_config", None)
         self.metrics = SchedulerMetrics(
@@ -3024,6 +3025,14 @@ class Scheduler:
             # A terminal event is required even when truncation leaves no
             # tokens (for example max_tokens <= 0). Async consumers wait for
             # this finished RequestOutput and would otherwise block forever.
+            if leave_reason is not None and seq.routed_experts is not None:
+                from atom.model_ops.fused_moe.routed_experts_capturer import (
+                    trim_routed_experts,
+                )
+
+                seq.routed_experts = trim_routed_experts(
+                    seq.routed_experts, num_tokens
+                )
             if stream_output_queue is not None and (
                 new_tokens or leave_reason is not None
             ):
@@ -3064,10 +3073,6 @@ class Scheduler:
                 seq.num_tokens = num_tokens
                 seq.leave_reason = leave_reason
                 seq.status = SequenceStatus.FINISHED
-                if seq.routed_experts is not None:
-                    keep = max(int(num_tokens) - 1, 0)
-                    if seq.routed_experts.shape[0] != keep:
-                        seq.routed_experts = seq.routed_experts[:keep]
                 self.total_finished_requests += 1
                 self.total_prompt_tokens += int(seq.num_prompt_tokens)
                 self.total_generation_tokens += max(

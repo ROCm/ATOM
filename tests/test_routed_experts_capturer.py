@@ -13,9 +13,12 @@ from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.model_ops.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
+    capture_bytes_per_kv_block,
+    capture_pad_row_bytes,
     check_return_routed_experts,
     kv_slots_from_block_table,
     maybe_capture_routed_experts,
+    trim_routed_experts,
 )
 
 
@@ -37,12 +40,14 @@ def test_config_flag_defaults_off():
     assert field.default is False
 
 
-def test_dcp_pcp_fail_closed():
-    check_return_routed_experts(1, 1)
+def test_dcp_pcp_pp_fail_closed():
+    check_return_routed_experts(1, 1, 1)
     with pytest.raises(ValueError, match="decode_context_parallel_size"):
         check_return_routed_experts(2, 1)
     with pytest.raises(ValueError, match="prefill_context_parallel_size"):
         check_return_routed_experts(1, 2)
+    with pytest.raises(ValueError, match="pipeline_parallel_size"):
+        check_return_routed_experts(1, 1, 2)
 
 
 def test_flag_off_leaves_field_absent():
@@ -112,6 +117,20 @@ def test_length_contract_prompt_plus_completion_minus_one():
     assert exported.shape[0] == prompt_len + completion_len - 1
 
 
+def test_graph_dummy_does_not_clobber_slot_zero():
+    """Trailing -1 must not restore the pre-write value of physical slot 0."""
+    device = _device()
+    capturer = RoutedExpertsCapturer.init(
+        num_slots=8, num_layers=1, top_k=2, device=device
+    )
+    capturer.buffer[:, 0, :] = -7
+    slots = torch.tensor([0, -1], device=device)
+    ids = torch.tensor([[9, 8], [1, 2]], dtype=torch.int32, device=device)
+    capturer.capture(0, ids, slot_mapping=slots)
+    assert capturer.buffer[0, 0].tolist() == [9, 8]
+    assert capturer.buffer[capturer._pad_slot, 0].tolist() == [1, 2]
+
+
 def test_graph_dummy_negative_slots_ignored():
     device = _device()
     capturer = RoutedExpertsCapturer.init(
@@ -159,3 +178,31 @@ def test_kv_slots_from_block_table():
         9 * 16,
         9 * 16 + 1,
     ]
+
+
+def test_capture_page_bytes_are_budgeted_per_block():
+    assert capture_bytes_per_kv_block(16, 58, 8) == 16 * 58 * 8 * 4
+    assert capture_pad_row_bytes(58, 8) == 58 * 8 * 4
+    from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
+        PAGED_CLASS,
+        page_pool,
+        plan_pools,
+    )
+
+    kv = page_pool(1024)
+    capture = page_pool(capture_bytes_per_kv_block(16, 2, 2))
+    plan = plan_pools([kv, capture], available_bytes=1024 * 10 + 256, max_num_seqs=1)
+    assert plan.entry_bytes[PAGED_CLASS] == 1024 + capture_bytes_per_kv_block(16, 2, 2)
+
+
+def test_trim_routed_experts_before_request_output():
+    routes = np.arange(6, dtype=np.int16).reshape(6, 1, 1)
+    trimmed = trim_routed_experts(routes, num_tokens=4)
+    assert trimmed.shape[0] == 3
+    ro = RequestOutput(
+        request_id=0,
+        output_tokens=[1],
+        finished=True,
+        routed_experts=trimmed,
+    )
+    assert ro.routed_experts.shape[0] == 3
