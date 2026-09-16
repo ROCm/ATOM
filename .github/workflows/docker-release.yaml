@@ -362,8 +362,22 @@ jobs:
 
           echo ""
           echo "========== Comparing output with golden outputs =========="
+          # golden_outputs is a directory; the file inside is named for the
+          # model the test runs. The path here used to be
+          # ".github/workflows/golden_outputs.txt", which has never existed:
+          # diff failed to open it every time, and the `|| true` that used to
+          # follow turned that into "Output matches golden outputs." So this
+          # comparison has never actually run. Now that the exit code is
+          # honoured, a wrong path fails every build instead -- check the file
+          # is there and say so plainly, rather than reporting a missing
+          # golden file as a mismatch.
+          GOLDEN=".github/workflows/golden_outputs/Meta-Llama-3-8B-Instruct_golden_output.txt"
+          if [ ! -f "${GOLDEN}" ]; then
+            echo "Golden output file not found: ${GOLDEN}"
+            exit 1
+          fi
           # Ignore whitespace and EOL differences in the diff
-          if diff -u -B -w --strip-trailing-cr atom_release_output.txt .github/workflows/golden_outputs.txt; then
+          if diff -u -B -w --strip-trailing-cr atom_release_output.txt "${GOLDEN}"; then
             echo "Output matches golden outputs."
           else
             echo "Output does not match golden outputs."
