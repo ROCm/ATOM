@@ -18,8 +18,10 @@ import multiprocessing
 import pickle
 import queue
 import threading
+import time
 import weakref
 from contextlib import ExitStack
+from dataclasses import dataclass
 from threading import Thread
 from typing import ClassVar
 
@@ -27,7 +29,7 @@ import zmq
 import zmq.asyncio
 from aiter.dist.shm_broadcast import MessageQueue
 
-from atom.kv_transfer.disaggregation import KVOutputAggregator
+from atom.kv_transfer.disaggregation import KVConnectorOutput, KVOutputAggregator
 from atom.utils import (
     get_mp_context,
     get_open_zmq_ipc_path,
@@ -42,6 +44,25 @@ from atom.utils.gc_utils import maybe_attach_gc_debug_callback, tune_gc
 from atom.utils.numa_utils import numa_bind_to_node
 
 logger = logging.getLogger("atom")
+
+
+@dataclass
+class _PendingKvAggregation:
+    """Worker outputs retained for one outstanding KV aggregation RPC.
+
+    Worker replies drain once and carry no generation identifier, so at most
+    one aggregation may be outstanding. ``worker_outputs[rank]`` stays
+    ``None`` until that rank's queue is consumed.
+    """
+
+    worker_outputs: list[KVConnectorOutput | None]
+    started_at: float
+    wait_warning_logged: bool = False
+
+    def missing_worker_ranks(self) -> list[int]:
+        return [
+            rank for rank, output in enumerate(self.worker_outputs) if output is None
+        ]
 
 
 class AsyncIOProc:
@@ -303,6 +324,7 @@ class AsyncIOProcManager:
         self.kv_outputs_queues: list[queue.Queue] = [
             queue.Queue() for _ in range(proc_num)
         ]
+        self._pending_kv_aggregation: _PendingKvAggregation | None = None
         self.kv_output_threads: list[threading.Thread] = []
 
         for i in range(proc_num):
@@ -433,42 +455,79 @@ class AsyncIOProcManager:
                 raise ret
             return ret
 
+    def _start_kv_aggregation(
+        self, func_name: str, args: tuple[object, ...]
+    ) -> _PendingKvAggregation:
+        """Broadcast one KV aggregation RPC and record its empty result slots."""
+        self.rpc_broadcast_mq.enqueue((func_name, *args))
+        pending = _PendingKvAggregation(
+            worker_outputs=[None] * self.proc_num,
+            started_at=time.monotonic(),
+        )
+        self._pending_kv_aggregation = pending
+        return pending
+
     def call_func_with_aggregation(self, func_name: str, *args, timeout: float = 10.0):
         """RPC call with KV output aggregation across all workers.
 
-        Broadcasts the function call to all workers, collects their
-        KV outputs, and returns the aggregated result.
+        At most one aggregation is outstanding. The first call starts it;
+        subsequent calls non-blockingly drain its per-rank replies. Once a batch
+        is complete, the next batch is started before returning the completed
+        result, keeping one poll in flight without delaying every other engine
+        step. A missing rank leaves the current aggregation open and returns
+        ``None``. ``timeout`` is only the age after which it is logged.
 
         Args:
             func_name: Method name to invoke on each worker's runner.
-            timeout: Maximum seconds to wait for each worker's output.
+            timeout: Seconds an incomplete aggregation may age before logging.
 
         Returns:
-            Aggregated :class:`KVConnectorOutput`, or ``None`` on timeout.
+            Aggregated :class:`KVConnectorOutput`, or ``None`` while the
+            current aggregation is still missing ranks.
         """
         if self.kv_output_aggregator is None:
             self.kv_output_aggregator = KVOutputAggregator(world_size=self.proc_num)
 
         logger.debug(f"{self.label}: call_func_with_aggregation {func_name} {args}")
-        msg = (func_name, *args)
-        self.rpc_broadcast_mq.enqueue(msg)
+        pending = self._pending_kv_aggregation
+        if pending is None:
+            pending = self._start_kv_aggregation(func_name, args)
 
-        # Collect KV outputs from all workers
-        worker_outputs = []
-        for i, output_queue in enumerate(self.kv_outputs_queues):
+        # Each rank has its own queue, so later ranks can be consumed while
+        # an earlier rank is still missing. Replies are drain-once and carry
+        # no generation identifier, so they belong to this outstanding
+        # aggregation until it closes.
+        for rank, output_queue in enumerate(self.kv_outputs_queues):
+            if pending.worker_outputs[rank] is not None:
+                continue
             try:
-                output = output_queue.get(timeout=timeout)
-                worker_outputs.append(output)
+                pending.worker_outputs[rank] = output_queue.get_nowait()
             except queue.Empty:
-                logger.error(
-                    f"{self.label}: Timeout waiting for KV output from worker {i}"
-                )
-                return None
+                continue
 
-        if not worker_outputs:
+        missing = pending.missing_worker_ranks()
+        if missing:
+            waited = time.monotonic() - pending.started_at
+            if timeout > 0 and waited >= timeout and not pending.wait_warning_logged:
+                logger.error(
+                    "%s: KV aggregation still waiting for workers %s after %.1fs",
+                    self.label,
+                    missing,
+                    waited,
+                )
+                pending.wait_warning_logged = True
             return None
 
-        kv_output = self.kv_output_aggregator.aggregate(worker_outputs=worker_outputs)
+        kv_output = self.kv_output_aggregator.aggregate(
+            worker_outputs=[
+                output for output in pending.worker_outputs if output is not None
+            ]
+        )
+        self._pending_kv_aggregation = None
+        # Keep the completion query pipelined: workers can produce this next
+        # snapshot while EngineCore processes the completed one and executes
+        # the following forward. This still leaves exactly one outstanding RPC.
+        self._start_kv_aggregation(func_name, args)
         logger.debug(f"Aggregated KV output: {kv_output}")
         return kv_output
 

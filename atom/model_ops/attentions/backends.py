@@ -479,6 +479,17 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         self.model_runner.forward_vars.update(attn_metadata)
         self.has_sliding_window = hasattr(hf_config, "sliding_window")
 
+    def _publish_indexer_fp4_decode_schedule(
+        self, attn_metadata, bs: int, next_n: int, ubatch: int = 0
+    ) -> None:
+        """Nothing to refresh: this backend has no FP4 sparse indexer.
+
+        `EagleProposer` publishes on whatever builder the target uses, so every
+        backend a draft can run against has to answer. Only the MLA one
+        overrides. Inert by contract, not just by accident -- the draft reuses
+        the target's metadata, so a write here would reach the verify step.
+        """
+
     def prepare_block_tables(self, batch: ScheduledBatch):
         """Marshal the batch's block tables into `forward_vars["block_tables"]`.
 
@@ -770,12 +781,18 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         ctx = self._upload_prefill_mirrors(
             scheduled_bs, running_bs, scheduled_tokens, has_cached, cached_lens
         )
-        if has_cached:
+        if has_cached or tbo_enabled():
             # Layer-invariant, so built once here rather than in every layer's
             # prefix gather. On the device: `total_kv` has no upper bound.
             # `context_lens` is `running_bs` wide and its padded tail is zero,
             # so it still sums to exactly `total_kv` -- which is handed over so
             # the build does not stop the device to measure itself.
+            # Built with no prefix of its own under TBO, because `has_cached`
+            # can turn on AFTER the split: the ubatch whose first request
+            # straddles it re-attaches the half its partner wrote. Its K
+            # geometry is then `cached + all_new` per request -- the request
+            # range `split_attn_metadata` already slices out of this -- so the
+            # only way to get that slice wrong is to have nothing to slice.
             ctx["batch_id_per_k_token"] = build_batch_ids_device(
                 ctx["context_lens"], total=total_kv
             )

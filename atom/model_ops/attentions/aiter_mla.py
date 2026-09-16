@@ -27,6 +27,15 @@ from atom.distributed.pcp_utils import (
     pcp_pad_len,
     pcp_round_robin_query_indices,
 )
+from atom.kv_transfer.disaggregation.index_staging import (
+    gather_dcp_preshuffled_index_pages,
+    prepare_dcp_index_gather_indices,
+)
+from atom.kv_transfer.disaggregation.pd_producer import (
+    index_staging_pool_size as _index_staging_pool_size,
+)
+from atom.kv_transfer.disaggregation.pd_producer import mooncake_pd_producer_configured
+from atom.kv_transfer.disaggregation.sharded_transfer import DCPShardPlan
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import (
     _MLA_MIN_HEADS,
@@ -38,6 +47,14 @@ from atom.model_ops.attention_mla import (
 from atom.model_ops.glm5_next.geometry import (
     effective_kpool_size,
     topk_output_width,
+)
+from atom.model_ops.sparse_indexer_fp4 import (
+    FP4_MQA_BLOCK_K,
+    FP4_MQA_PARALLEL_UNIT_NUM,
+    fp4_decode_parallel_units,
+    fp4_decode_schedule,
+    fp4_prefill_schedule,
+    sparse_indexer_fp4_enabled,
 )
 from atom.utils import CpuGpuBuffer, envs, upload_numpy
 from atom.utils.block_convert import (
@@ -248,6 +265,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     # backend). The fused kernel handles both sparse and dense MLA.
     fuse_mtp_decode_position_update = True
 
+    # `__init__` decides this; the default serves builders assembled field by
+    # field, as tests do.
+    _indexer_fp4 = False
+
     def _global_num_draft_layers(self) -> int:
         """Return draft layers in the target MLA pool across all PP stages."""
         runner = self.model_runner
@@ -372,6 +393,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
         self.index_kpool = effective_kpool_size(configured_kpool)
         self.index_topk_out = topk_output_width(self.index_topk, configured_kpool)
+        self._indexer_fp4 = self.is_sparse and sparse_indexer_fp4_enabled(
+            config.index_cache_dtype, hf_config, warn=True
+        )
         self.dtype_kv = dtypes.d_dtypes[config.kv_cache_dtype]
         self.dtype_q = self.dtype_kv
 
@@ -512,6 +536,23 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 self.max_num_batched_tokens,
                 dtype=torch.int32,
                 device=self.device,
+            )
+            # `[P, 4]` int32 read by the mqa-logits kernel during a CUDAGraph
+            # replay, so it has to be a fixed address refreshed in place, and
+            # one per ubatch since TBO has two in flight.
+            self._indexer_fp4_cta_info = (
+                [
+                    torch.zeros(
+                        fp4_decode_parallel_units(self.max_bs, max_seqlen_qo),
+                        4,
+                        **i32_kwargs,
+                    )
+                    for _ in range(
+                        self._NUM_TBO_UBATCHES + 1 if config.enable_tbo else 1
+                    )
+                ]
+                if self._indexer_fp4
+                else []
             )
             # One block-table row per query token; only MTP verify needs a
             # copy. Built once per step, not in the indexer, where every
@@ -1172,6 +1213,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 "index_rows_per_block": self._index_rows_per_block(),
                 "index_dim": aligned_index_cache_dim(hf_config),
                 "index_dtype": dtypes.fp8,
+                "index_head_dim": hf_config.index_head_dim,
+                "index_fp4": self._indexer_fp4,
             }
             if runner.has_mla_indexer
             else {}
@@ -1183,6 +1226,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             kv_dtype=dtypes.d_dtypes[runner.config.kv_cache_dtype],
             **indexer,
         )
+
+    def _supports_dcp_index_staging(self) -> bool:
+        """Whether producer index pages can be gathered into DCP consumer pages.
+
+        The gather reconstructs scheduler-block MFMA tiles from token-granular
+        physical pages. Hybrid KDA builders whose index cache is already
+        scheduler-block indexed (and may compress tokens) override this.
+        """
+        return True
 
     def allocate_kv_cache_tensors(self, *, blocks: int, buf) -> dict:
         """Allocate this model's MLA pool inside the runner's paged region.
@@ -1246,10 +1298,27 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 )
             index_cache_layer_id = runner.index_cache_layer_map[global_layer_id]
             index_cache = self.kv_pool.layer("index", index_cache_layer_id)
-            # Use aligned dimension to avoid memory copy in torch inductor
-            module.indexer.k_cache.kv_cache[0] = index_cache.view(
-                -1, 1, runner.aligned_index_dim
+            # `is_sparse` is this branch's own condition, so both sides
+            # reduce to the same `sparse_indexer_fp4_enabled` call on the same
+            # two inputs and cannot legitimately disagree. Compared rather than
+            # assigned: the Indexer built `k_cache` from its own answer before
+            # this runs, so writing the builder's over it would leave the flag
+            # describing an object it no longer matches.
+            assert module.indexer._indexer_fp4 == self._indexer_fp4, (
+                "FP4 sparse indexer verdict diverged: metadata builder says "
+                f"{self._indexer_fp4}, layer {global_layer_id}'s Indexer says "
+                f"{module.indexer._indexer_fp4}"
             )
+            if self._indexer_fp4:
+                module.indexer.k_cache.kv_cache[0] = index_cache
+                module.indexer.k_cache.kv_cache_scale = self.kv_pool.layer(
+                    "index_scale", index_cache_layer_id
+                )
+            else:
+                # Use aligned dimension to avoid memory copy in torch inductor
+                module.indexer.k_cache.kv_cache[0] = index_cache.view(
+                    -1, 1, runner.aligned_index_dim
+                )
         module.kv_cache = kv_cache
         return KVCacheTensor(
             layer_num=module.layer_num,
@@ -1262,6 +1331,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
     def get_kv_transfer_tensors(self):
         from atom.kv_transfer.disaggregation.types import (
+            INDEX_CACHE_ROLE,
+            MLA_KV_ROLE,
             KVTransferRegion,
             KVTransferTensors,
         )
@@ -1269,23 +1340,54 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         runner = self.model_runner
         if self.kv_pool is None:
             return None
+        if self._indexer_fp4:
+            # A connector is handed one `INDEX_CACHE_ROLE` region per layer --
+            # the whole vocabulary it and its DCP shard plan have for the
+            # indexer -- and the FP4 cache is two planes neither parses.
+            if runner.config.kv_transfer_config:
+                raise NotImplementedError(
+                    "KV transfer with the FP4 sparse indexer is unsupported: "
+                    "the region map cannot describe its separate e8m0 scale "
+                    "plane. Pass --index_cache_dtype fp8 to use a connector."
+                )
+            return None
         # What the pool was built with, not what the hook would recompute: a
         # hybrid caches for fewer layers than the model has, and the consumer
         # indices below are positions in the allocated rows.
         num_layers = self.kv_pool.layers
+        index_tensors: list[torch.Tensor] = []
 
         # A row of each is one scheduler block, so `stride(0)` is already the
         # bytes a transfer moves per block -- no `block_ratio` after the fact,
         # and no per-field override to keep in step with the pooling ones.
-        block_regions = [
-            KVTransferRegion(
-                base_addr=t.data_ptr(),
-                total_bytes=t.numel() * t.element_size(),
-                unit_bytes=t.stride(0) * t.element_size(),
-                semantic_role=f"mla.{role}",
+        # DCP PD still dispatches on the two collapsed roles (`mla.kv` /
+        # `dsa.index_cache`) rather than the pool's per-layer names.
+        region_tensors = self.kv_pool.region_tensors()
+        block_regions: list[KVTransferRegion] = []
+        for role, t in region_tensors:
+            bpb = t.stride(0) * t.element_size()
+            if role.startswith("index."):
+                block_regions.append(
+                    KVTransferRegion(
+                        base_addr=t.data_ptr(),
+                        total_bytes=t.numel() * t.element_size(),
+                        unit_bytes=bpb,
+                        semantic_role=INDEX_CACHE_ROLE,
+                    )
+                )
+                index_tensors.append(t)
+                continue
+            block_regions.append(
+                KVTransferRegion(
+                    base_addr=t.data_ptr(),
+                    total_bytes=t.numel() * t.element_size(),
+                    unit_bytes=bpb,
+                    semantic_role=(
+                        MLA_KV_ROLE if role.startswith("kv.") else f"mla.{role}"
+                    ),
+                )
             )
-            for role, t in self.kv_pool.region_tensors()
-        ]
+        block_tensor_views = [t for _, t in region_tensors]
 
         block_region_consumer_indices = None
         index_cache_layer_ids = getattr(runner, "index_cache_layer_ids", ())
@@ -1379,10 +1481,93 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 for layer_id in local_index_layer_ids
             ]
 
+        index_staging_region = None
+        index_staging_pool_size = 0
+        index_staging_chunk_pages = 0
+        prepare_sharded_index = None
+        gather_sharded_index = None
+        if (
+            index_tensors
+            and getattr(self, "dcp_world_size", None) == 1
+            and mooncake_pd_producer_configured(runner.config)
+            and self._supports_dcp_index_staging()
+        ):
+            # A Mooncake P/D producer can receive requests from a DCP
+            # consumer whose index cache is sharded below one MFMA tile. Keep a
+            # small per-send-thread pool that repacks one index layer at a time;
+            # latent MLA pages continue to transfer directly.
+            scheduler_block_size = runner.config.kv_cache_block_size
+            if scheduler_block_size % 16:
+                raise RuntimeError(
+                    "Preshuffled DSA index P/D staging requires "
+                    "kv_cache_block_size divisible by 16, got "
+                    f"{scheduler_block_size}"
+                )
+            index_staging_pool_size = _index_staging_pool_size(runner.config)
+            index_staging_chunk_pages = 256
+            first_index_page = index_tensors[0]
+            index_head_dim = getattr(runner.config.hf_config, "index_head_dim", None)
+            page_bytes = first_index_page.stride(0) * first_index_page.element_size()
+            staging = torch.empty(
+                (
+                    index_staging_pool_size,
+                    index_staging_chunk_pages,
+                    page_bytes,
+                ),
+                dtype=torch.uint8,
+                device=first_index_page.device,
+            )
+            index_staging_region = KVTransferRegion(
+                base_addr=staging.data_ptr(),
+                total_bytes=staging.numel() * staging.element_size(),
+                unit_bytes=index_staging_chunk_pages * page_bytes,
+                semantic_role="dsa.index_staging",
+            )
+
+            def prepare_sharded_index(plan: DCPShardPlan):
+                return prepare_dcp_index_gather_indices(plan, first_index_page.device)
+
+            def gather_sharded_index(
+                region_idx,
+                indices,
+                pool_idx,
+            ):
+                index_region_idx = region_idx - num_layers
+                if not 0 <= index_region_idx < len(index_tensors):
+                    raise IndexError(
+                        f"Index region {region_idx} maps to invalid cache row "
+                        f"{index_region_idx}"
+                    )
+                slot = staging[pool_idx]
+                pages = gather_dcp_preshuffled_index_pages(
+                    index_tensors[index_region_idx],
+                    slot,
+                    indices,
+                    index_head_dim,
+                    runner.config.kv_cache_block_size,
+                    1,
+                )
+                return slot.data_ptr(), pages
+
         return KVTransferTensors(
             block_regions=block_regions,
             slot_regions=[],
+            block_tensor_views=block_tensor_views,
             block_region_consumer_indices=block_region_consumer_indices,
+            index_staging_region=index_staging_region,
+            index_staging_pool_size=index_staging_pool_size,
+            index_staging_chunk_pages=index_staging_chunk_pages,
+            prepare_sharded_index=prepare_sharded_index,
+            gather_sharded_index=gather_sharded_index,
+            # MLA's latent projection is replicated across TP. Sparse MLA's
+            # index-key projection/cache is replicated as well; only the query
+            # heads and absorbed KV-B/output projections are TP-sharded.
+            # Consequently every PAGE byte published above is identical on
+            # every TP worker (DCP/PCP are separate axes and are rejected by
+            # the current LMCache MP connector).
+            tp_replication_factor=int(
+                getattr(runner.config, "tensor_parallel_size", 1) or 1
+            ),
         )
 
     def _build_dcp_indexer_prefill_meta(self, attn_metadata, bs: int, counts, var):
@@ -1445,6 +1630,43 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.dcp_indexer_gather_index = torch.from_numpy(
             src.astype(np.int32)
         ).to(dev, non_blocking=True)
+        if self._indexer_fp4:
+            self._build_dcp_indexer_fp4_prefill_meta(
+                attn_metadata, bs, lpad, cu_pad, total_kv, var
+            )
+
+    def _build_dcp_indexer_fp4_prefill_meta(
+        self, attn_metadata, bs: int, lpad, cu_pad, total_kv: int, var
+    ):
+        """Publish the local slot list and identity page table FP4 staging reads.
+
+        The slot formula must track `cp_gather_indexer_k_quant_cache`, the FP8
+        plane's gather, which the FP4 planes have no equivalent of. Its padded
+        indices stay inside the sequence's own blocks, so the staging read
+        cannot leave the allocation.
+        """
+        block = self.model_runner.block_size
+        dev = self.device
+        seq_of = np.repeat(np.arange(bs, dtype=np.int64), lpad)
+        j = np.arange(int(cu_pad[bs]), dtype=np.int64) - np.repeat(cu_pad[:bs], lpad)
+        table = var["block_tables"].np[:bs].astype(np.int64)
+        slots = table[seq_of, j // block] * block + (j % block)
+        attn_metadata.dcp_indexer_fp4_local_slots = torch.from_numpy(
+            slots.astype(np.int32)
+        ).to(dev, non_blocking=True)
+
+        # Fixed width, not `pages`: the scorer specializes on this table's
+        # stride, so a per-batch width recompiles it. Sized at a whole batch's
+        # summed context rather than `block_tables`' one-sequence allowance --
+        # co-scheduled prefills run past that allowance whenever prefix caching
+        # keeps their cached tokens off `max_num_batched_tokens`, which is a
+        # legal schedule, and this table is the only thing that would have
+        # bounded it. Buys one scorer variant against the non-DCP width.
+        pages = -(-total_kv // block)
+        cols = self.max_bs * self.block_table_cols
+        staged_tables = torch.zeros(bs, cols, dtype=torch.int32, device=dev)
+        staged_tables[:, :pages] = torch.arange(pages, dtype=torch.int32, device=dev)
+        attn_metadata.dcp_indexer_fp4_block_tables = staged_tables
 
     def _sparse_selected_counts(self, seq_lens):
         """How many KV entries the indexer actually selects for each row.
@@ -1550,6 +1772,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
             attn_metadata.sparse_kv_indptr = var["sparse_kv_indptr"].copy_to_gpu(
                 scheduled_tokens + 1
+            )
+            self._publish_indexer_fp4_prefill_schedule(
+                attn_metadata, sparse_counts, int(full_seq_lens.sum())
             )
             if self.dcp_world_size > 1:
                 self._build_dcp_indexer_prefill_meta(attn_metadata, bs, counts, var)
@@ -2020,6 +2245,105 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         rows.view(running_bs, max_seqlen_q, -1).copy_(block_tables.unsqueeze(1))
         attn_metadata.dcp_token_block_tables = rows
 
+    def _publish_indexer_fp4_decode_schedule(
+        self, attn_metadata: AttentionMetaData, bs: int, next_n: int, ubatch: int = 0
+    ) -> None:
+        """Refresh the FP4 decode CTA schedule; the captured kernel replays off
+        it, and every indexer layer of a step shares the one answer.
+
+        A replay reads the buffer's CONTENTS, so every decode forward has to
+        call this -- including the MTP draft's, whose rows are its own. The
+        lengths come from the published buffer rather than the metadata's view
+        of it, because a draft following a prefill carries prefill metadata.
+        """
+        if not self._indexer_fp4:
+            return
+        parallel_units = fp4_decode_parallel_units(bs, next_n)
+        cta_info = self._indexer_fp4_cta_info[ubatch][:parallel_units]
+        # `[:n]` past the end truncates rather than raising, while
+        # `indexer_fp4_n_ctas` still hands the kernel `n`. The rows past the end
+        # would then go unscheduled, and the logits buffer they should have
+        # written is `torch.empty` -- aiter only sentinels it when it builds the
+        # schedule itself, which it never does here.
+        assert cta_info.shape[0] == parallel_units
+        if self.dcp_world_size > 1:
+            # DCP scores this rank's shard. Its rows are query tokens carrying
+            # their own local window, so next_n is already flattened out of the
+            # row axis and the width is the sharded one -- `parallel_units`
+            # stays the non-DCP count, which keeps the captured grid identical.
+            from atom.model_ops.dcp_ops import dcp_local_logits_width
+            from atom.utils.forward_context import (
+                get_published_dcp_local_context_lens,
+            )
+
+            # A TBO ubatch owns rows from its own offset, not the batch's first
+            # `bs`, and it already publishes that slice on its metadata -- the
+            # same tensor the scorer reads. The global buffer stays the fallback
+            # so callers that publish nothing keep the prefix they had.
+            context_lens = get_published_dcp_local_context_lens(
+                attn_metadata, bs * next_n
+            )
+            if context_lens is None:
+                context_lens = self.model_runner.forward_vars[
+                    "dcp_local_context_lens"
+                ].gpu[: bs * next_n]
+            schedule_next_n = 1
+            width = dcp_local_logits_width(
+                self.model_runner.config.max_model_len, self.dcp_world_size
+            )
+        else:
+            context_lens = attn_metadata.context_lens[:bs]
+            schedule_next_n = next_n
+            width = self.model_runner.config.max_model_len
+        fp4_decode_schedule(
+            context_lens,
+            FP4_MQA_BLOCK_K,
+            parallel_units,
+            width,
+            schedule_next_n,
+            cta_info,
+        )
+        attn_metadata.indexer_fp4_cta_info = cta_info
+        attn_metadata.indexer_fp4_n_ctas = parallel_units
+
+    def _publish_indexer_fp4_prefill_schedule(
+        self, attn_metadata: AttentionMetaData, local_ends_np: np.ndarray, total_kv: int
+    ) -> None:
+        """Build the FP4 ragged-prefill schedule and the width it scores in.
+
+        The width comes off `sparse_counts`, which the host already holds, so
+        right-sizing the logits buffer to this batch rather than max_model_len
+        costs no device sync.
+
+        Under DCP the scorer reads a staged copy of every sequence's keys rather
+        than the in-place shard, so its columns are the flat concatenated ones
+        the FP8 path ranks in and the width is the whole key set.
+        """
+        if not self._indexer_fp4:
+            return
+        if self.dcp_world_size > 1:
+            local_starts = attn_metadata.cu_seqlen_ks
+            local_ends = attn_metadata.cu_seqlen_ke
+            max_seq_len = max(int(total_kv), 1)
+        else:
+            local_starts = None
+            local_ends = attn_metadata.cu_seqlen_ke - attn_metadata.cu_seqlen_ks
+            max_seq_len = max(int(local_ends_np.max(initial=0)), 1)
+        (
+            attn_metadata.indexer_fp4_cta_info,
+            attn_metadata.indexer_fp4_n_ctas,
+            attn_metadata.indexer_fp4_local_starts,
+        ) = fp4_prefill_schedule(
+            attn_metadata.batch_id_per_q_token,
+            local_ends,
+            FP4_MQA_BLOCK_K,
+            FP4_MQA_PARALLEL_UNIT_NUM,
+            max_seq_len,
+            local_starts,
+        )
+        attn_metadata.indexer_fp4_local_ends = local_ends
+        attn_metadata.indexer_fp4_max_seq_len = max_seq_len
+
     def prepare_decode(
         self,
         batch: ScheduledBatch,
@@ -2326,6 +2650,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 "sparse_kv_last_page_lens"
             ].gpu[:running_bs]
         self._publish_dcp_token_block_tables(attn_metadata, running_bs, max_seqlen_q)
+        self._publish_indexer_fp4_decode_schedule(
+            attn_metadata, running_bs, max_seqlen_q
+        )
 
         # running_bs, not scheduled_bs: the padded rows have to be split into the
         # ubatches too, or accuracy drifts.
@@ -2631,6 +2958,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 "sparse_kv_last_page_lens"
             ].gpu[:bs]
         self._publish_dcp_token_block_tables(attn_matadata, bs, max_q_len)
+        self._publish_indexer_fp4_decode_schedule(attn_matadata, bs, max_q_len)
         positions = var["positions"].copy_to_gpu(scheduled_tokens)
         context = Context(
             positions=positions,
@@ -2708,6 +3036,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # DCP, so a ubatch always runs one query per sequence.
             assert max_q_len == 1
             attn.dcp_token_block_tables = attn.block_tables
+        # Slot 0 stays the full-batch schedule, so a ubatch never overwrites
+        # one the other's kernels still read.
+        self._publish_indexer_fp4_decode_schedule(
+            attn, running_bs, max_q_len, ubatch=ubatch_idx + 1
+        )
         return attn
 
     def build_ubatch_prefill_metadata(

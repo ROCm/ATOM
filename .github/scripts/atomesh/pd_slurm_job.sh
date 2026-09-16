@@ -17,7 +17,8 @@ chmod 0777 "${RUN_DIR}" 2>/dev/null || true
 
 EXECUTION_PHASES=(combined)
 if [[ "${BENCHMARK_KIND:-random}" == "aiperf_agentic" \
-  && "${EVAL_TASK:-gsm8k}" == "swebench_lite" \
+  && ( "${EVAL_TASK:-gsm8k}" == "swebench_lite" \
+    || "${EVAL_TASK:-gsm8k}" == "gsm8k" ) \
   && ( "${RUN_EVAL:-false}" == "true" || "${RUN_EVAL:-false}" == "1" ) ]]; then
   EXECUTION_PHASES=(benchmark eval)
 fi
@@ -97,6 +98,7 @@ allow = (
     # Preserve FlyDSL cache overrides for non-root Spur containers.
     "FLYDSL_",
     "SPEC_",
+    "STATE_CHECKPOINT_",
     "DRAFT_MODEL_PATH",
     "NUM_SPEC_TOKENS",
     "EXTRA_SERVER_ARGS",
@@ -173,6 +175,12 @@ EOF
     docker pull "${DOCKER_IMAGE}"
   fi
 
+  local mesh_binary="${ATOMESH_MESH_BINARY:-/app/ATOM/atom/mesh/target/release/atomesh}"
+  if [[ "${rank}" -eq 0 ]]; then
+    mesh_binary="$(bash "${REPO_ROOT}/.github/scripts/atomesh/setup_mesh.sh" \
+      "${REPO_ROOT}" "${RUN_DIR}" "${DOCKER_IMAGE}" "${env_file}" "${JOB_ID}")" || return $?
+  fi
+
   docker_args=(
     run --name "${container}"
     --user "$(id -u):$(id -g)"
@@ -184,6 +192,7 @@ EOF
     --env-file "${env_file}"
     -e ATOMESH_EXECUTION_PHASE="${execution_phase}"
     -e ATOMESH_SERVICE_PORT_OFFSET="${service_port_offset}"
+    -e ATOMESH_MESH_BINARY="${mesh_binary}"
     -e SLURM_JOB_ID="${JOB_ID}"
     -e SPUR_JOB_ID="${SPUR_JOB_ID:-${JOB_ID}}"
     -e NODE_RANK="${rank}"
@@ -221,6 +230,12 @@ EOF
     -v /mnt:/mnt
     -v /data:/data
   )
+  if [[ -d /shared_nfs ]]; then
+    docker_args+=(-v /shared_nfs:/shared_nfs)
+  fi
+  if [[ -d /share_nfs/models ]]; then
+    docker_args+=(-v /share_nfs/models:/share_nfs/models)
+  fi
 
   if [[ "${rank}" -eq 0 \
     && "${EVAL_TASK:-}" == "swebench_lite" \
@@ -534,7 +549,15 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
       if [[ "${execution_phase}" != "eval" ]]; then
         docker pull "'"${DOCKER_IMAGE}"'"
       fi
+      mesh_binary="${ATOMESH_MESH_BINARY:-/app/ATOM/atom/mesh/target/release/atomesh}"
+      if [[ "${rank}" -eq 0 ]]; then
+        mesh_binary="$(bash "'"${REPO_ROOT}"'/.github/scripts/atomesh/setup_mesh.sh" \
+          "'"${REPO_ROOT}"'" "'"${RUN_DIR}"'" "'"${DOCKER_IMAGE}"'" "'"${ENV_FILE}"'" "'"${SLURM_JOB_ID}"'")"
+      fi
       nested_docker_args=()
+      if [[ -d /shared_nfs ]]; then
+        nested_docker_args+=(-v /shared_nfs:/shared_nfs:ro)
+      fi
       if [[ "${rank}" -eq 0 \
         && "${EVAL_TASK:-}" == "swebench_lite" \
         && ( "${RUN_EVAL:-false}" == "true" || "${RUN_EVAL:-false}" == "1" ) ]]; then
@@ -580,6 +603,7 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
         --env-file "'"${ENV_FILE}"'" \
         -e ATOMESH_EXECUTION_PHASE="${execution_phase}" \
         -e ATOMESH_SERVICE_PORT_OFFSET="${service_port_offset}" \
+        -e ATOMESH_MESH_BINARY="${mesh_binary}" \
         -e SLURM_JOB_ID="'"${SLURM_JOB_ID}"'" \
         -e NODE_RANK="${rank}" \
         -e NODE0_ADDR="'"${NODE0_ADDR}"'" \
@@ -600,8 +624,6 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
         2>&1 | tee "${rank_dir}/${container_log}"
       docker_rc="${PIPESTATUS[0]}"
       set -e
-      printf "%s\n" "${docker_rc}" > "'"${RUN_DIR}"'/rank-rc-${rank}.tmp" 2>/dev/null || true
-      mv "'"${RUN_DIR}"'/rank-rc-${rank}.tmp" "'"${RUN_DIR}"'/rank-rc-${rank}" 2>/dev/null || true
       if command -v timeout >/dev/null 2>&1; then
         timeout 20 docker kill "${container}" >/dev/null 2>&1 || true
         timeout 20 docker rm -f "${container}" >/dev/null 2>&1 || true

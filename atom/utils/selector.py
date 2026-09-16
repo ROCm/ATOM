@@ -27,6 +27,7 @@ class Family(StrEnum):
     """
 
     V4 = "v4"
+    QSA_GDN = "qsa_gdn"
     KIMI_MLA = "kimi_mla"
     MLA = "mla"
     GDN = "gdn"
@@ -45,6 +46,9 @@ class Family(StrEnum):
 # What makes a hybrid one is which of its layers are linear, and no field says
 # that -- so these two are named, and everything else is read off the shape.
 _KIMI_MLA_TYPES = ("kimi_linear", "glm5_next_text")
+# Qwen3.8-Flash-Next is a GDN hybrid too, but its full-attention layers are QSA
+# rather than MHA, so it gets its own backend instead of riding the GDN one.
+_QSA_GDN_TYPES = ("qwen4_exp_text",)
 _GDN_TYPES = ("qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text")
 _V4_TYPES = ("deepseek_v4", "deepseek_v4_mtp")
 
@@ -69,6 +73,8 @@ def attn_family(hf_text_config) -> Family:
     arches = getattr(hf_text_config, "architectures", None) or []
     if any("DeepseekV4" in str(arch) for arch in arches) or model_type in _V4_TYPES:
         return Family.V4
+    if model_type in _QSA_GDN_TYPES:
+        return Family.QSA_GDN
     if model_type in _KIMI_MLA_TYPES:
         return Family.KIMI_MLA
     if getattr(hf_text_config, "kv_lora_rank", None) is not None:
@@ -113,6 +119,8 @@ def _cached_get_attn_backend(
 def get_attn_backend_cls(family: Family, use_sglang: bool, use_vllm: bool) -> str:
     if family is Family.V4:
         return "atom.model_ops.attentions.deepseek_v4_attn.DeepseekV4Backend"
+    if family is Family.QSA_GDN:
+        return "atom.model_ops.attentions.qwen4_exp_attn.Qwen4ExpBackend"
     if family is Family.KIMI_MLA:
         return "atom.model_ops.attentions.kimi_mla_gdn_attn.KimiMLAGDNBackend"
     if family is Family.MLA:

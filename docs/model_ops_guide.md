@@ -14,6 +14,7 @@ ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions f
 | `Attention` | `base_attention.py` | `unified_attention_with_output_base` (custom op) | Unified attention entry |
 | MHA `Attention` | `attention_mha.py` | `flash_attn_varlen_func`, `pa_fwd_asm`, `pa_persistent_fwd`, `pa_decode_gluon` | Multi-head attention |
 | `MLAAttention` | `attention_mla.py` | `mla_decode_fwd`, `mla_prefill_fwd`, `concat_and_cache_mla`, `fused_qk_rope_concat_and_cache_mla` | Multi-head latent attention |
+| DSA sparse indexer | `sparse_indexer_fp4.py` | `flydsl_pa_mqa_logits_fp4`, `indexer_qk_rope_quant_and_cache`, `top_k_per_row_decode` | FP4 (E2M1 + e8m0) index-cache geometry, scoring and CTA schedules |
 | `FusedMoE` | `moe.py` | `aiter.fused_moe.fused_moe`, `asm_moe` | Mixture of experts |
 | `RMSNorm` | `layernorm.py` | `rmsnorm2d_fwd`, `rmsnorm2d_fwd_with_add`, `fused_add_rmsnorm_pad` | RMS normalization |
 | `LayerNorm` | `layernorm.py` | `layernorm2d_fwd`, `layernorm2d_fwd_with_add` | Layer normalization |
@@ -146,11 +147,24 @@ The MHA `Attention` class handles standard models (Llama, Qwen3, Mixtral, etc.).
 | Phase | Condition | Method | AITER Kernel |
 |---|---|---|---|
 | Prefill | Always | `prefill_attention` | `aiter.flash_attn_varlen_func` |
+| Decode | `ATOM_USE_UNIFIED_ATTN` and `block_size == 256` | `paged_attention_persistent_asm` | `aiter.pa_persistent_fwd` |
+| Decode | past a paged kernel's envelope, or `ATOM_USE_UNIFIED_ATTN` / `use_flash_layout` | `paged_attention_unified` | `aiter.ops.triton.unified_attention` |
 | Decode | `use_triton_attn=True` | `paged_attention_triton` | `torch.ops.aiter.pa_decode_gluon` |
-| Decode | `block_size == 1024` | `paged_attention_persistent_asm` | `aiter.pa_persistent_fwd` |
 | Decode | Default | `paged_attention_asm` | `aiter.pa_fwd_asm` |
 
 The `use_triton_attn` flag is set when `sliding_window != -1` or `head_dim != 128`.
+
+Both paged kernels stop short of unified, at different points, and drafting
+multiplies the query group into both limits (`base_attention.py`):
+
+| Kernel | Envelope | Past it |
+|---|---|---|
+| gluon | `query_length <= 4` and `next_pow2(qlen) * max(16 // next_pow2(qlen), next_pow2(ratio)) <= 64`, where `ratio = q_heads / kv_heads` | no layout arm; Triton fails to compile |
+| `pa_fwd_asm` | `qlen x q_heads/kv_heads <= 16` | `get_heuristic_kernel` silently re-runs with `mtp=1` |
+
+`_dispatch_decode` is the single place that answers this; the runners do not
+re-decide. Unified carries one descale for the whole tensor, so a per-token
+quantized layer routed there raises rather than returning wrong numbers.
 
 ### Multi-head latent attention (`attention_mla.py`)
 

@@ -233,7 +233,7 @@ class TestAfterItRecovers:
 
 
 class TestTheEndpointUsesIt:
-    """Three streaming responses, and the watchdog has to wrap all three.
+    """Four streaming responses, and the watchdog has to wrap all four.
 
     It wrapped two: `_logged_stream` was a logging helper the Anthropic
     endpoint never called. A gauge with an endpoint-shaped hole is worse than
@@ -247,7 +247,7 @@ class TestTheEndpointUsesIt:
         src = pathlib.Path(api_server.__file__).read_text()
         total = src.count("StreamingResponse(")
         wrapped = len(re.findall(r"StreamingResponse\(\s*_client_stream\(", src))
-        assert total == 3, f"the endpoint count changed ({total}); check this test"
+        assert total == 4, f"the endpoint count changed ({total}); check this test"
         assert wrapped == total, (
             f"{total - wrapped} of {total} StreamingResponse calls are served "
             "from an unwrapped generator"

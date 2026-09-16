@@ -13,12 +13,14 @@ A DSV4 boundary is reusable only when both PAGE and SLOT restore successfully.
 Missing, incompatible, or corrupt sidecar data fails closed to recomputation.
 
 The public configuration remains `kv_connector: "lmcache_offload"`. The thin
-top-level shell resolves one of three layouts: `kimi_k3` when
-`hf_config.model_type == "kimi_linear"` (dense paged MLA KV plus a KDA
-per-request state tier), `hybrid` when `hf_config.compress_ratios` is present
-(DSV4 PAGE+SLOT), and `dense` otherwise. `kv_transfer_config.offload_layout` can
-override that choice without giving scheduler and worker different connector
-names.
+top-level shell resolves one of four layouts: `m3` for MiniMax-M3 PAGE regions
+(including its NSA index cache), `kimi_k3` when the text config has
+`model_type == "kimi_linear"` (dense paged MLA KV plus a KDA per-request state
+tier), `hybrid` when `hf_config.compress_ratios` is present (DSV4 PAGE+SLOT),
+and `dense` otherwise. `kv_transfer_config.offload_layout` can override
+compatible choices without giving scheduler and worker different connector
+names. MiniMax-M3 cannot be overridden away from `m3`, because the other codecs
+do not preserve its NSA index cache.
 
 GDN/linear-attention models (`qwen3_next`, `qwen3_5_*`; e.g. Qwen3-Next,
 Qwen3.5) are the one family the resolver does **not** map to a layout: they carry
@@ -412,6 +414,16 @@ The GPU connector uses a **bounded** staging buffer
 one group copies host↔staging, the next packs/unpacks on a separate CUDA stream,
 handed off via ready/free events. Transfers larger than the buffer are split into
 groups, so HBM staging cost is capped regardless of prefix length.
+
+SAVE chunk staging is scheduled strictly tail-to-head by token range. For B1–B8
+with two-block LMCache chunks, GPU source reads and source-safe notifications are
+B7–B8, B5–B6, B3–B4, B1–B2. Each assembled transfer record keeps its original
+MemoryObj, token range, and block-ID slice together, so reversing scheduling
+cannot cross-wire payloads. LOAD remains head-to-tail. LMCache's current
+`CacheEngine.store` API retains the cache-key list internally and exposes only
+MemoryObjs/ranges to the GPU connector; therefore ATOM cannot safely reorder the
+later `StorageManager.batched_put` batch. Backend submission remains one opaque
+batch in LMCache's original key/object order, after tail-to-head GPU staging.
 
 **`OFFLOAD_GPU_STAGING_CHUNKS` sizes *each* staging buffer, and there is more than
 one.** The buffer is thread-local (`threading.local`), and load and save run on
@@ -873,7 +885,13 @@ Connector-specific tuning (env):
 | `OFFLOAD_PUBLICATION_TIMEOUT_S` | 5.0 | Finite, nonnegative maximum wait after PAGE or AOS1 submission for session visibility. `0` performs exactly one immediate probe. |
 | `OFFLOAD_PUBLICATION_POLL_INTERVAL_S` | 0.01 | Finite, positive sleep interval between visibility probes; prevents busy-spinning. |
 | `OFFLOAD_COMMITTED_SIDECAR_CAPACITY` | 65536 | Positive integer bound for scheduler-session AOS1 commit discovery. Oldest commits are evicted first. |
-| `OFFLOAD_PROFILE` | 0 | Emit `[OFFLOAD-LOAD-PROF]` / `[OFFLOAD-SAVE-PROF]` per-transfer timing. |
+| `OFFLOAD_PROFILE` | 0 | Emit `[OFFLOAD-SAVE-PROF]` / `[OFFLOAD-LOAD-PROF]` records with transfer counts, fast-path evidence, and outer store/retrieve wall time. |
+
+Pinned-host asynchronous copies and one batched PAGE block-ID upload per
+transfer are the built-in `BlockGPUConnector` fast path; there are no feature
+flags for these two pieces. Both the Dense codec and the DSV4/M3 PAGE codec
+implement the prepared-ID API. A future codec or direction without that API
+still falls back safely to per-group ID preparation and blocking host copies.
 
 `kv_transfer_config` may also override any LMCache field via a
 `"lmcache.<field>": value` extra. The actual connector extra
@@ -1058,9 +1076,11 @@ terminal message distinguishing `SLOT sidecar save published` from
 `SLOT sidecar save failed`, and `SLOT sidecar load restored` from
 `SLOT sidecar load failed`. “Published” means the submitted object became
 visible through LMCache `contains` within the bounded policy; it does not claim
-a durable backend flush. PAGE transfer timing remains opt-in with
-`OFFLOAD_PROFILE=1` via
-`[OFFLOAD-SAVE-PROF]` and `[OFFLOAD-LOAD-PROF]`.
+a durable backend flush. PAGE transfer diagnostics remain opt-in with
+`OFFLOAD_PROFILE=1` via `[OFFLOAD-SAVE-PROF]` and `[OFFLOAD-LOAD-PROF]`.
+These records report payload/group counts, whether batched IDs and asynchronous
+host copies actually ran, and outer store/retrieve wall time. Connector phase
+and GPU-event timings are not collected.
 
 Common diagnostics:
 

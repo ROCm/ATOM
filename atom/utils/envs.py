@@ -23,6 +23,11 @@ from collections.abc import Callable
 from typing import Any
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Protect reused KV prefixes from one-off prefill scans. Opt-in.
+    "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
+    "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
+        os.getenv("ATOM_PREFIX_CACHE_PROTECTED_RATIO", "0.5")
+    ),
     # --- Data Parallelism ---
     "ATOM_DP_RANK": lambda: int(os.getenv("ATOM_DP_RANK", "0")),
     "ATOM_DP_RANK_LOCAL": lambda: int(os.getenv("ATOM_DP_RANK_LOCAL", "0")),
@@ -54,6 +59,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ATOM remaps the SGLang world into internal TP x PCP groups.
     # 0 means unset.
     "ATOM_SGLANG_PCP_SIZE": lambda: int(os.getenv("ATOM_SGLANG_PCP_SIZE", "0") or "0"),
+    # Keep SGLang's tc_piecewise/Inductor compilation path for prefill, but
+    # bypass its per-bucket CUDA Graph capture, static-buffer staging, and token
+    # padding. This is an experimental ATOM SGLang-plugin-only mode.
+    "ATOM_SGLANG_PREFILL_COMPILE_ONLY": lambda: (
+        os.getenv("ATOM_SGLANG_PREFILL_COMPILE_ONLY", "0") == "1"
+    ),
+    # Broadcast EAGLE3 verification predictions and acceptance decisions from
+    # TP rank 0 so every tensor-parallel rank advances with identical results.
+    # SGLang lacks this broadcast path; the ATOM plugin adds it to match native
+    # ATOM's tensor-parallel verification semantics.
+    # Disabled by default because native SGLang normally keeps ranks in sync.
+    "ATOM_SGLANG_EAGLE3_TP_VERIFY_BROADCAST": lambda: (
+        os.getenv("ATOM_SGLANG_EAGLE3_TP_VERIFY_BROADCAST", "0") == "1"
+    ),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
     "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (
@@ -70,9 +89,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MLA_SHUFFLE_KV": lambda: (
         os.getenv("ATOM_USE_TRITON_MLA_SHUFFLE_KV", "0") == "1"
     ),
+    # Run the routed experts with the aiter Triton/gluon MoE kernels instead of
+    # FlyDSL fused_moe, on prefill and decode alike. For SiLU models on gfx1250
+    # this selects the a8w4 GUGU (gate/up-interleaved) kernel -- the default --
+    # which fuses SiLU into GEMM1's write-back and the MXFP8 requant into its
+    # epilogue. SwiGLU models (GPT-OSS) and CDNA archs keep the general
+    # moe_gemm_a16w4 / a4w4 / a8w4 path. Defaults to on for gfx94x, and for
+    # gfx95x when ATOM_USE_TRITON_GEMM is set.
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
-    "ATOM_USE_TRITON_MOE_DECODE": lambda: os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0")
-    == "1",
+    # Split the routed experts by phase: FlyDSL fused_moe on prefill, the Triton
+    # /gluon GUGU kernel on decode. Needs ATOM_USE_TRITON_MOE=1 (it narrows that
+    # flag, it cannot enable Triton on its own) plus gfx1250 + ATOM_MOE_GU_ITLV=1
+    # + SiLU, because it keeps a single copy of the weights in the FlyDSL layout
+    # and hands Triton a zero-copy view of it -- which is only valid where the
+    # two preshuffles agree byte-for-byte -- which is what ATOM_MOE_GU_ITLV=1
+    # buys, and why the prep asserts it: only the interleaved layout is shared,
+    # so at ATOM_MOE_GU_ITLV=0 the FlyDSL prep and the Triton view disagree.
+    # tests/test_mxfp4_triton_moe_decode.py runs both real preps and compares.
+    #
+    # Arms under EP as well as TP, at both EP entry points -- the modular-kernel
+    # (transport) path and the local no-transport one build the same views.
+    "ATOM_USE_TRITON_MOE_DECODE": lambda: (
+        os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0") == "1"
+    ),
+    # Select the a4w4 Triton wrapper instead of the a8w4 default, on both the TP
+    # and EP paths. Only chooses *which* wrapper runs -- it cannot enable the
+    # Triton path on its own, and asserts if set without ATOM_USE_TRITON_MOE.
+    # The weights are identical (both are w4); only the activation quant
+    # differs, so no extra weight prep or memory is involved.
+    "ATOM_USE_TRITON_MOE_A4W4": lambda: (
+        os.getenv("ATOM_USE_TRITON_MOE_A4W4", "0") == "1"
+    ),
     # Force DP-attention + EP through the collective fallback even when mori is
     # installed. This is useful for controlled A/B tests and for deployments
     # where the mori shared-memory transport is unavailable or undesirable.
@@ -95,7 +142,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # own MEGA_DISPATCH=flydsl|mori), 0 binds mori's v2 op-layer running plain
     # gather, i.e. the untouched upstream baseline.
     "ATOM_MORI_V2_FUSED": lambda: os.getenv("ATOM_MORI_V2_FUSED", "0") == "1",
+    # Reuse a 128-token MegaMoEV2 instance for native DP-unified small decode/
+    # verify/draft forwards on the supported EP8, 48-experts-per-rank layout. Set to 0
+    # to keep the configured max_num_batched_tokens capacity for every graph.
+    "ATOM_MEGA_DECODE_FAST_PATH": lambda: (
+        os.getenv("ATOM_MEGA_DECODE_FAST_PATH", "1") == "1"
+    ),
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
+    # Match SGLang's gfx950 pure-prefill fast path: cast Q/K/V to FP8 and use
+    # AITER's head-dim-256 per-tensor FMHA kernel. Set to 0 for the BF16
+    # flash_attn_varlen_func fallback.
+    "ATOM_AITER_FP8_PREFILL_ATTN": lambda: (
+        os.getenv("ATOM_AITER_FP8_PREFILL_ATTN", "1") == "1"
+    ),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
     # flydsl drop-in for V4-Pro Compressor (Main BF16 + Indexer FP8) paths.
@@ -106,6 +165,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSED_COMPRESS_USE_FLYDSL": lambda: os.getenv(
         "ATOM_FUSED_COMPRESS_USE_FLYDSL", "auto"
     ).lower(),
+    # gather_kv_b_proj (the MLA cached-prefix expansion): swap the Triton op for
+    # the flydsl a8w8 gather-GEMM. Added 2026-09-09.
+    "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ": lambda: (
+        os.getenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "1") == "1"
+    ),
     # QK-norm-rope-cache-quant fusion for Qwen3 dense and MoE; disabled by default.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"
@@ -277,11 +341,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Log every garbage collection: generation, duration, objects reclaimed.
     "ATOM_GC_DEBUG": lambda: os.getenv("ATOM_GC_DEBUG", "0") == "1",
     # "t0,t1,t2" for gc.set_threshold(); empty keeps CPython's default.
-    # Read independently by the API server, each EngineCore and each
-    # ModelRunner worker -- thresholds are per-interpreter.  A fallback for
-    # ATOM_GC_FREEZE=0: freezing removes the cost of a pass, this only spaces
-    # the passes out.  See tune_gc in atom/utils/gc_utils.py.
+    # Thresholds are per-interpreter, but this is one variable, read by every
+    # process that serves -- and only the frontend was measured to reclaim
+    # nothing, so setting it tunes three others blind. t0 must be >= 1: zero
+    # stops collection while the watch still reports the healthy shape.
+    # See tune_gc in atom/utils/gc_utils.py.
     "ATOM_GC_THRESHOLD": lambda: os.getenv("ATOM_GC_THRESHOLD", "").strip(),
+    # Whether the incremental detokenizer may reuse the delta it last emitted
+    # in place of one of its two decodes per update. "auto" verifies at startup
+    # that this tokenizer decodes a token span the same way wherever the window
+    # starts; "on"/"off" pin it. Unrelated to the KV prefix cache.
+    # See enable_delta_reuse in atom/entrypoints/openai/streaming_dispatch.py.
+    "ATOM_DETOKENIZER_DELTA_REUSE": lambda: os.getenv(
+        "ATOM_DETOKENIZER_DELTA_REUSE", "auto"
+    )
+    .strip()
+    .lower(),
+    # How often the reused delta is checked against a real decode once reuse is
+    # on. 1 checks every update; a mismatch corrects that call's output and
+    # turns reuse off for the process.  Text, not int, for the reason
+    # ATOM_GC_THRESHOLD is: it is read as an argument at a callsite that has
+    # already loaded the weights, so it is parsed where a bad value can be
+    # answered with a warning instead of a traceback.
+    "ATOM_DETOKENIZER_AUDIT_EVERY": lambda: os.getenv(
+        "ATOM_DETOKENIZER_AUDIT_EVERY", ""
+    ).strip(),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
     # When profiling is active, append detailed attention aggregates (sqsq, sqsk, sk)
     # to the prefill[]/decode[] trace labels emitted by ModelRunner.run_model.
@@ -365,6 +449,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Force Triton attention fallbacks where available. Set to 1 to bypass
     # optional ASM/OPUS fast paths during debugging.
     "ATOM_FORCE_ATTN_TRITON": lambda: (os.getenv("ATOM_FORCE_ATTN_TRITON", "0") == "1"),
+    # Force the OPUS kernel for DeepSeek-V4 fp8 sparse prefill instead of the
+    # aiter asm kernel (`mla_sparse_prefill_fp8_asm`, the default). Escape hatch
+    # for the asm path; that kernel is gfx1250-only and hard-requires H == 128,
+    # so smaller local head counts fall back to OPUS regardless of this flag.
+    "ATOM_FORCE_V4_PREFILL_OPUS": lambda: (
+        os.getenv("ATOM_FORCE_V4_PREFILL_OPUS", "0") == "1"
+    ),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
