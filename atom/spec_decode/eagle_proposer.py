@@ -138,14 +138,15 @@ class EagleProposer(Drafter):
             self._reuse_step_buffers = False
             return ()
         draft_hf = self.speculative_config.draft_model_hf_config
-        # DeepSeek-V4 carries the mHC residual, so its hidden is [N, hc, dim]
-        # rather than [N, dim]. GLM inherits hc_mult from its backbone, but
-        # its NextN block carries an ordinary two-dimensional residual.
-        hc = (
-            None
-            if draft_hf.architectures[0] == "Glm5NextMTPModel"
-            else getattr(draft_hf, "hc_mult", None)
-        )
+        shape_fn = getattr(self.model, "draft_graph_hidden_state_shape", None)
+        if shape_fn is not None:
+            hidden_shape = shape_fn(draft_hf)
+        else:
+            # Other draft models retain the config-based mHC shape contract.
+            hc = getattr(draft_hf, "hc_mult", None)
+            hidden_shape = (draft_hf.hidden_size,)
+            if hc is not None:
+                hidden_shape = (hc, draft_hf.hidden_size)
         inputs = {
             # The same int32 the token buffer step 0 reads: the loop rebinds
             # `input_ids` from that buffer to this one, and `stage` asserts the
@@ -153,22 +154,15 @@ class EagleProposer(Drafter):
             "input_ids": StagedInput(dtype=torch.int32),
             "positions": StagedInput(dtype=torch.int64),
             "hidden_states": StagedInput(
-                shape=(
-                    (hc, draft_hf.hidden_size)
-                    if hc is not None
-                    else (draft_hf.hidden_size,)
-                ),
+                shape=hidden_shape,
                 dtype=self.dtype,
             ),
         }
-        # Keep this capability at the non-compiled call site. These MTP models
-        # have the two-dimensional hidden-state and shared-head contracts needed
-        # to feed their fixed graph inputs directly; other draft architectures
-        # remain on the owned-output path.
-        self._reuse_step_buffers = draft_hf.architectures[0] in {
-            "DeepSeekMTPModel",
-            "Glm5NextMTPModel",
-        }
+        # Only models with the fixed hidden-state and shared-head contracts
+        # can feed the staged buffers directly. Others own their output storage.
+        self._reuse_step_buffers = getattr(
+            self.model, "reuse_draft_graph_step_buffers", False
+        )
         self.step = DraftGraph(
             forward=self._step_forward,
             epilogue=self._step_head,

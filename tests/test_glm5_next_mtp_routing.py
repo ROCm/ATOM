@@ -137,14 +137,14 @@ def test_glm5_next_mtp_mirrors_block_quant_excludes():
 
 
 @pytest.mark.parametrize(
-    "architecture, expected",
+    "architecture, expected, reuse_buffers",
     [
-        ("Glm5NextMTPModel", (4096,)),
-        ("DeepSeekV4MTPModel", (4, 4096)),
-        ("DeepSeekMTPModel", (4096,)),
+        ("Glm5NextMTPModel", (4096,), True),
+        ("DeepseekV4MTPModel", (4, 4096), False),
+        ("DeepSeekMTPModel", (4096,), True),
     ],
 )
-def test_mtp_graph_stages_actual_residual_shape(architecture, expected):
+def test_mtp_graph_stages_actual_residual_shape(architecture, expected, reuse_buffers):
     import torch
 
     EagleProposer = _eagle_proposer()
@@ -152,10 +152,20 @@ def test_mtp_graph_stages_actual_residual_shape(architecture, expected):
     hf = SimpleNamespace(architectures=[architecture], hidden_size=4096)
     if architecture != "DeepSeekMTPModel":
         hf.hc_mult = 4
+    if architecture == "Glm5NextMTPModel":
+        model_class, _ = _mtp_symbols()
+        model = object.__new__(model_class)
+    elif architecture == "DeepSeekMTPModel":
+        from atom.models.deepseek_mtp import DeepSeekMTP
+
+        model = object.__new__(DeepSeekMTP)
+    else:
+        model = SimpleNamespace()
     proposer = SimpleNamespace(
         runner=SimpleNamespace(use_mrope=False),
         mtp_k=3,
         speculative_config=SimpleNamespace(draft_model_hf_config=hf),
+        model=model,
         dtype=torch.bfloat16,
         _step_forward=lambda *a, **kw: None,
         _step_head=lambda *a, **kw: None,
@@ -163,6 +173,7 @@ def test_mtp_graph_stages_actual_residual_shape(architecture, expected):
     )
     (graph,) = EagleProposer._declare_draft_graphs(proposer)
     assert graph.inputs["hidden_states"].shape == expected
+    assert proposer._reuse_step_buffers is reuse_buffers
     graph.bind(SimpleNamespace(max_num_seqs=8), "cpu")
     source = torch.ones((1, *expected), dtype=torch.bfloat16)
     staged = graph.stage(4, {"hidden_states": source})["hidden_states"]

@@ -352,6 +352,12 @@ class DeepSeekMTP(nn.Module):
     predictor_layer_cls = DeepSeekMultiTokenPredictorLayer
     packed_modules_mapping_override: dict[str, tuple[str, int]] | None = None
     supports_indexer_projection_fusion = True
+    reuse_draft_graph_step_buffers = True
+
+    @staticmethod
+    def draft_graph_hidden_state_shape(draft_hf) -> tuple[int, ...]:
+        """NextN carries a two-dimensional residual, including for GLM."""
+        return (draft_hf.hidden_size,)
 
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
