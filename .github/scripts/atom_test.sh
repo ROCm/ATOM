@@ -1,6 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
+ATOM_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 TYPE=${1:-launch}
 MODEL_PATH=${2:-meta-llama/Meta-Llama-3-8B-Instruct}
 EXTRA_ARGS=("${@:3}")
@@ -84,7 +86,7 @@ if [ "$TYPE" == "launch" ]; then
 
   echo ""
   echo "========== Waiting for ATOM server to start =========="
-  # Phase 1: Wait for HTTP server to be up via /health endpoint (45 min max)
+  # Phase 1: Wait for a nonempty API model list (45 min max)
   max_retries=45
   retry_interval=60
   server_up=false
@@ -95,8 +97,9 @@ if [ "$TYPE" == "launch" ]; then
           tail -50 "$ATOM_SERVER_LOG" 2>/dev/null || true
           exit 1
       fi
-      if curl -sf "http://localhost:${ATOM_SERVER_PORT}/health" -o /dev/null; then
-          echo "ATOM server HTTP endpoint is up."
+      if python3 "${ATOM_SCRIPT_DIR}/../../scripts/check_server_ready.py" \
+          "http://localhost:${ATOM_SERVER_PORT}/v1/models" >/dev/null; then
+          echo "ATOM server model list is ready."
           server_up=true
           break
       fi
@@ -110,7 +113,7 @@ if [ "$TYPE" == "launch" ]; then
   fi
 
   # Phase 2: Warmup - send a real completion request to ensure model is fully ready
-  # (CUDA graph capture, JIT compilation, etc. may still be in progress after /health returns OK)
+  # Exercise generation as well as the model-list endpoint.
   echo "========== Warming up ATOM server =========="
   warmup_retries=10
   warmup_interval=30

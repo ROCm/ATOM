@@ -105,6 +105,13 @@ For multi-node DP, include every node's `--server-port` as a target (repeat
 `--prefill` / `--decode`); native histogram storage is local to each node.
 The coordinator's endpoint does not include remote histogram observations.
 
+Readiness probes must target each serving API's `/v1/models` and validate a
+nonempty OpenAI model list. For multi-node DP, use the coordinator, whose API
+starts after all engine ranks are ready. Remote DP worker ports expose only
+metrics, even after model loading; a successful scrape is not a readiness signal.
+The shared probe is `scripts/check_server_ready.py URL`. Keep remote worker
+addresses in the Prometheus targets, not the API readiness or router backend list.
+
 Prometheus 3.5.0 is downloaded and verified against its release checksums when
 no executable is already available. `ATOMESH_PROMETHEUS_BIN` can point to an
 installed executable. `ATOMESH_MESH_TARGET_DIR` selects the host's persistent

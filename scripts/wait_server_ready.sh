@@ -1,6 +1,8 @@
 #!/bin/bash
 # Poll http://localhost:$PORT/v1/models until the ATOM server is ready or
 # the max wait elapses. Exit 0 = ready, 1 = timeout / startup error.
+# Requires a nonempty OpenAI model list. For multi-node DP, run this on the
+# coordinator: remote DP worker ports expose metrics, not a serving API.
 #
 # Usage: bash scripts/wait_server_ready.sh [PORT] [MAX_MIN] [POLL_SEC] [LOG_FILE]
 #   PORT      default 8000
@@ -12,6 +14,7 @@
 
 set -uo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PORT="${1:-8000}"
 MAX_MIN="${2:-6}"
 POLL="${3:-30}"
@@ -27,7 +30,8 @@ fi
 
 for ((i=1; i<=ITERS; i++)); do
     sleep "$POLL"
-    READY=$(curl -s -m 3 "http://localhost:${PORT}/v1/models" 2>/dev/null | head -c 60)
+    READY=$(python3 "${SCRIPT_DIR}/check_server_ready.py" \
+        "http://localhost:${PORT}/v1/models" --timeout 3) || READY=""
     if [ -f "$LOG_FILE" ]; then
         # Detect truncation/recreation: if current size < snapshot, the file
         # was rewritten (e.g. start_atom_server.sh `tee` truncates). Reset
