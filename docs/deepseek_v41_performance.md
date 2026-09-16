@@ -74,6 +74,41 @@ captured stages. `trace221_current` and `trace222_baseline` contain separate
 `perf221_*` and `v4_reuse221_comparison.json` retain the unprofiled results.
 These TP2 measurements are neither TP4 DSpark acceptance nor task accuracy.
 
+## Decode graph boundary and shared metadata (2026-09-15)
+
+The required decode execution boundary is at most two graph replays per step,
+keyed by `running_bs` and `running_tokens`. Bucket-specific instances are allowed;
+per-layer graph splits do not satisfy this requirement. The experiment adding
+input/output projection graphs to every layer was withdrawn before commit and
+archived as `graph227_withdrawn.patch`. The existing four-stage-per-layer executor
+is still present and must be replaced; full decode capture is not complete.
+
+Request metadata now uses the same persistent `CpuGpuBuffer` storage and token
+layout helpers as V4: `build_batch_ids`, `prefill_positions`, and `pack_rows`.
+V4 and V4.1 share state-slot buffer allocation and the existing
+`_populate_state_slot_mappings` / `_stage` publisher. V4.1 consumes
+`v4_meta_state_slot_out`; it does not introduce a separate state-slot field.
+Pool-slot conversion remains geometry-owned: V4's unified plane reverses the
+slot axis, while V4.1's entry arena uses scheduler slot IDs directly.
+
+The actual request/token counts are `scheduled_bs` / `scheduled_tokens`, and
+execution capacities are `running_bs` / `running_tokens`. Block-table row stride
+and buffer addresses stay fixed across steps. Token padding follows V4's `-1`
+request-ID sentinel. Existing eager consumers still use active views; changing
+these metadata buffers alone does not make the per-request compressor/indexer
+loop capturable. Those consumers and their speculative state writes remain the
+next integration work, using V4's batched plans and indexing interfaces.
+
+The focused metadata/cache/DSpark-interface regression passes 59 tests,
+including replay of the existing V4 window-write kernel after request reorder,
+slot relocation and position changes without recapture. It also checks V4's
+original slot conversion and empty-batch padding. Evidence:
+`p10_dspark/metadata229_tests.log`. The final `metadata229_target` TP2 runtime
+completed three fixed-output workloads (16 output tokens/request) on physical
+GPUs 3/0, HIP 0/1. This is a runtime smoke test, not a quality or throughput gate.
+`metadata228_dspark` stopped at the existing TP4 admission gate before model
+loading and is not a passing DSpark run.
+
 ## Cache format and attention boundary
 
 | Region | Values | Scales | Bytes per row |

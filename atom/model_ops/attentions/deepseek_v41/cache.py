@@ -10,13 +10,12 @@ from atom.model_ops.attentions.deepseek_v41.packed_rows import (
     pack_rows,
     write_packed_window,
 )
-from atom.model_ops.attentions.deepseek_v41_state import AttentionStep
 from atom.model_ops.attentions.pool_layout.entry_arena import EntryMajorArena
 from atom.model_ops.deepseek_v41.compressor import CompressorTail
 from atom.model_ops.v4_kernels.state_writes import swa_write
 
 from .indices import build_indices
-from .metadata import BatchStep
+from .metadata import prepare_batch_step
 from .speculative import TentativeState
 
 
@@ -134,7 +133,16 @@ class PagedAttentionCache:
                 "Commit the accepted prefix before reusing or checkpointing state"
             )
 
-    def begin_step(self, requests, *, tentative=False):
+    def begin_step(
+        self,
+        requests,
+        *,
+        tentative=False,
+        buffers=None,
+        running_bs=None,
+        running_tokens=None,
+        state_slot_out=None,
+    ):
         self.require_committed()
         requests = tuple(requests)
         if tentative and (
@@ -166,52 +174,14 @@ class PagedAttentionCache:
                 raise ValueError("A request cannot alias its own PAGE rows")
             seen.add(span.slot)
             offset += span.length
-        device = self.pool.device
-        positions = torch.tensor(
-            [pos for span in requests for pos in range(span.position, span.end)],
-            dtype=torch.int32,
-            device=device,
-        )
-        cu = torch.tensor(
-            [span.offset for span in requests] + [offset],
-            dtype=torch.int32,
-            device=device,
-        )
-        slots = torch.tensor(
-            [span.slot for span in requests], dtype=torch.int32, device=device
-        )
-        batches = torch.tensor(
-            [i for i, span in enumerate(requests) for _ in range(span.length)],
-            dtype=torch.int32,
-            device=device,
-        )
-        width = max((len(span.block_ids) for span in requests), default=0)
-        tables = torch.tensor(
-            [
-                list(span.block_ids) + [0] * (width - len(span.block_ids))
-                for span in requests
-            ],
-            dtype=torch.int32,
-            device=device,
-        ).reshape(len(requests), width)
-        local_steps = tuple(
-            AttentionStep(
-                span.position,
-                span.length,
-                positions[span.token_slice],
-                cu[i : i + 2] - span.offset,
-            )
-            for i, span in enumerate(requests)
-        )
-        return BatchStep(
+        return prepare_batch_step(
             requests,
-            positions,
-            cu,
-            slots,
-            batches,
-            tables,
-            local_steps,
+            self.pool.device,
             tentative=tentative,
+            buffers=buffers,
+            running_bs=running_bs,
+            running_tokens=running_tokens,
+            state_slot_out=state_slot_out,
         )
 
     def prepare_state(self, step):
@@ -279,9 +249,11 @@ class PagedAttentionCache:
 
     def requests(self, step):
         for i, (span, local_step) in enumerate(zip(step.requests, step.request_steps)):
-            yield RequestCache(
-                self, span, step.block_tables[i]
-            ), local_step, span.token_slice
+            yield (
+                RequestCache(self, span, step.block_tables[i]),
+                local_step,
+                span.token_slice,
+            )
 
     def write_window(self, layer, kv, step):
         if step.length:

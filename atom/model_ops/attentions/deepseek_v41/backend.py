@@ -5,18 +5,21 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
-from atom.model_engine.engram_runtime import EngramInputPreparer
-from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
-from atom.models.deepseek_v41.config import AttentionMode, build_attention_topology
-from tests.models.deepseek_v41.cache_visibility_snapshot import (  # DIAGNOSTIC179
-    CacheVisibilitySnapshot,
-)
 
+from atom.model_engine.engram_runtime import EngramInputPreparer
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attentions.backends import AttentionBackend, CommonAttentionBuilder
+from atom.model_ops.attentions.deepseek_v4_attn import (
+    DeepseekV4AttentionMetadataBuilder,
+)
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import page_pool, state_pool
+from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+from atom.models.deepseek_v41.config import AttentionMode, build_attention_topology
 from atom.utils.forward_context import AttentionMetaData, AttnState, Context
+from tests.models.deepseek_v41.cache_visibility_snapshot import (  # DIAGNOSTIC179
+    CacheVisibilitySnapshot,
+)
 
 from .cache import PagedAttentionCache
 from .checkpoints import StateCopies
@@ -36,9 +39,27 @@ class DeepseekV41Backend(AttentionBackend):
 
 
 class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
+    # Reuse V4's publisher and staging contract, including fixed addresses and
+    # running_bs padding. Only pool-slot -> physical-row geometry differs.
+    _stage = DeepseekV4AttentionMetadataBuilder._stage
+    _populate_state_slot_mappings = (
+        DeepseekV4AttentionMetadataBuilder._populate_state_slot_mappings
+    )
+
+    @staticmethod
+    def _physical_slots(pool_slots):
+        # V4's unified plane reverses pool slots. V4.1's EntryMajorArena uses
+        # the scheduler's slot index directly.
+        return pool_slots
+
     def __init__(self, model_runner):
         self.block_size = model_runner.block_size
         super().__init__(model_runner)
+        model_runner.forward_vars.update(
+            DeepseekV4AttentionMetadataBuilder._state_slot_buffers(
+                self.max_bs, self.device, read_side=False
+            )
+        )
         self.config = model_runner.config.hf_config
         topology = build_attention_topology(self.config)[
             : self.config.num_hidden_layers
@@ -173,12 +194,22 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         )
         if cache is None:
             raise RuntimeError("CSA2 cache must be allocated before serving")
+        # Zero-token scheduler rows are excluded from spans. Publish in this
+        # same request order, including the private dummy slots used at startup.
+        state_slot_out = self._populate_state_slot_mappings(
+            SimpleNamespace(state_slots_committed=[span.slot for span in spans]),
+            len(spans),
+            running_bs,
+        )
         step = cache.begin_step(
-            spans, tentative=tentative and not batch.is_dummy_run and bool(spans)
+            spans,
+            tentative=tentative and not batch.is_dummy_run and bool(spans),
+            buffers=self.model_runner.forward_vars,
+            running_bs=running_bs,
+            running_tokens=running_tokens,
+            state_slot_out=state_slot_out,
         )
         positions = self.model_runner.forward_vars["positions"]
-        positions.gpu[:offset].copy_(step.positions)
-        positions.gpu[offset:running_tokens].zero_()
         cu = self.model_runner.forward_vars["cu_seqlens_q"].gpu[: running_bs + 1]
         metadata = AttentionMetaData(
             cu_seqlens_q=cu,
@@ -196,9 +227,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                     first, end = max(start, span.position), min(start + count, span.end)
                     if first < end:
                         token_mask[
-                            span.offset
-                            + first
-                            - span.position : span.offset
+                            span.offset + first - span.position : span.offset
                             + end
                             - span.position
                         ] = False
@@ -289,10 +318,6 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             state_slots_committed=(),
             total_seqs_num=bs,
             total_tokens_num=tokens,
-        )
-        cu = self.model_runner.forward_vars["cu_seqlens_q"].gpu
-        cu[: bs + 1].copy_(
-            torch.arange(bs + 1, device=self.device, dtype=cu.dtype) * max_q_len
         )
         metadata, positions = self._prepare(batch, bs, tokens)
         self.prepare_model_inputs(

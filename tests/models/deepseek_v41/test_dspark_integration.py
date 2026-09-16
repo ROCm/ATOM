@@ -6,13 +6,14 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
-from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
 from torch import nn
 
 from atom.config import SpeculativeConfig, get_hf_config
+from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
+from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
 from atom.spec_decode.drafter import AuxCaptureSpec
 from atom.spec_decode.dspark_proposer import DSparkProposer
+from tests.attentions.deepseek_v41.helpers import metadata_buffers
 
 from .reference import FIXTURES
 
@@ -53,13 +54,7 @@ def test_capture_builder_uses_full_query_width_and_private_state(width):
     before = builder.cache.backing.clone()
     builder.block_size, builder.device = 16, "cpu"
     builder.max_num_batched_tokens = 12
-    builder.model_runner = SimpleNamespace(
-        forward_vars={
-            "positions": SimpleNamespace(gpu=torch.empty(12, dtype=torch.int64)),
-            "cu_seqlens_q": SimpleNamespace(gpu=torch.empty(3, dtype=torch.int32)),
-            "input_ids": SimpleNamespace(gpu=torch.zeros(12, dtype=torch.int32)),
-        }
-    )
+    builder.model_runner = SimpleNamespace(forward_vars=metadata_buffers(2, 12, 1))
     prepared = []
     builder.prepare_model_inputs = lambda tokens, metadata: prepared.append(
         tokens.numel()
@@ -157,13 +152,9 @@ def test_decode_positions_use_accepted_prefix_and_full_reservation():
     )
     builder.cache = PagedAttentionCache(builder.geometry, 20, 5, "cpu")
     builder.block_size, builder.device = 16, "cpu"
-    positions = torch.empty(4, dtype=torch.int32)
     builder.model_runner = SimpleNamespace(
         tokenID_processor=SimpleNamespace(num_rejected=np.array([0, 4])),
-        forward_vars={
-            "positions": SimpleNamespace(gpu=positions),
-            "cu_seqlens_q": SimpleNamespace(gpu=torch.tensor([0, 1, 4])),
-        },
+        forward_vars=metadata_buffers(2, 4, 10),
     )
     batch = SimpleNamespace(
         is_dummy_run=False,

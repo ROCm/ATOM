@@ -4213,6 +4213,20 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     # Helpers.                                                           #
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _state_slot_buffers(max_bs, device, *, prefix="", read_side=True):
+        """Allocate the persistent slot maps used by V4 attention consumers."""
+        directions = ("out", "in") if read_side else ("out",)
+        return {
+            f"{prefix}v4_meta_state_slot_{direction}": CpuGpuBuffer(
+                max_bs,
+                dtype=torch.int32,
+                device=device,
+                pin_memory=torch.device(device).type != "cpu",
+            )
+            for direction in directions
+        }
+
     def _alloc_v4_metadata_buffers(self) -> None:
         """Pre-allocate every buffer the V4 metadata builder writes into.
 
@@ -4252,11 +4266,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # `_populate_state_slot_mappings`); attn_metadata.state_slot_out
         # exposes that GPU view to all downstream consumers (no second
         # H2D-staged copy).
-        bufs["v4_meta_state_slot_out"] = CpuGpuBuffer(bs, **i32)
         # Read side of the compressor ring (`_populate_state_slot_in`). Its own
         # buffer on every path, forked or not, so the captured decode graph sees
         # a stable address.
-        bufs["v4_meta_state_slot_in"] = CpuGpuBuffer(bs, **i32)
+        bufs.update(self._state_slot_buffers(bs, self.device))
 
         # Phase B: paged-decode index buffers (consumed by Phase C/E).
         # Sized to worst-case decode shape `T = max_bs * (1 + max_spec_steps)`
@@ -4439,8 +4452,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             bufs[f"{p}cu_seqlens_q"] = CpuGpuBuffer(bs + 1, **i32)
 
             # V4 decode metadata buffers.
-            bufs[f"{p}v4_meta_state_slot_out"] = CpuGpuBuffer(bs, **i32)
-            bufs[f"{p}v4_meta_state_slot_in"] = CpuGpuBuffer(bs, **i32)
+            bufs.update(self._state_slot_buffers(bs, self.device, prefix=p))
             bufs[f"{p}v4_kv_indices_swa"] = torch.zeros(T_dec * win, **i32)
             bufs[f"{p}v4_kv_indices_csa"] = torch.zeros(
                 T_dec * (win + self.index_topk), **i32
@@ -4498,9 +4510,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         """
         buf = self.model_runner.forward_vars[name]
         n = arr.shape[0] if arr.ndim > 0 else 1
-        assert (
-            n > 0
-        ), f"Cannot stage empty array for {name!r} — ensure the input array has at least one element."
         cap = buf.np.shape[0]
         assert n <= cap, (
             f"V4 buffer {name!r} too small: need {n}, have {cap}. "
