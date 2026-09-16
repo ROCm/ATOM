@@ -196,6 +196,22 @@ class LLMEngine:
         multimodal_data_list: list[dict] | None = None,
         request_ids: list[str] | None = None,
     ):
+        """Submit one batch of prompts.
+
+        ``SamplingParams.n > 1`` fans out: a prompt becomes ``n`` sibling
+        sequences, and the batch handed to the scheduler is prompt-major --
+        prompt 0's siblings in order, then prompt 1's. Sequence ids are assigned
+        in that same order, which is what makes :meth:`generate`'s flat list
+        line up with a prompt list expanded by ``n``. It is one request per
+        sibling from here on; nothing downstream reassembles them.
+
+        This used to reach ``io_processor.preprocess``, which returns a single
+        sequence and refuses ``n > 1`` outright, so offline ``n > 1`` raised
+        before a token was generated. That guard is still there and still right
+        for a caller that expects one sequence back -- the two entry points
+        differ in whether the caller is prepared for siblings, not in what they
+        support.
+        """
         # if sampling params is not list, use it for all prompts
         if not isinstance(sampling_params_list, list):
             sampling_params_iter = itertools.repeat(sampling_params_list)
@@ -274,6 +290,14 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         request_ids: list[str] | None = None,
     ) -> list[str]:
+        """Complete every prompt and return the outputs as ONE flat list.
+
+        Not one entry per prompt: ``SamplingParams.n`` of them, prompt-major
+        (see :meth:`add_request`), because the sort below is over sequence ids
+        and those are assigned in fan-out order. A caller pairing prompts with
+        outputs has to expand its own list by ``n`` to do it -- with ``n = 1``,
+        the usual case, that is the identity and the list is 1:1 as before.
+        """
         # Reset DP routing state (round-robin cursor + in-flight load) so a
         # fresh batch gets deterministic DP assignment and no leaked counts.
         self.core_mgr.reset_dp_router()

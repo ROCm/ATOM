@@ -29,13 +29,24 @@ class _IOProcessorDouble:
 
     def __init__(self):
         self.fanout_calls = []
+        self._next_id = 0
 
     def preprocess_fanout(self, prompt_or_tokens, sampling_params, **kwargs):
         self.fanout_calls.append((prompt_or_tokens, sampling_params, kwargs))
         n = max(1, int(getattr(sampling_params, "n", 1)))
-        return [
-            SimpleNamespace(prompt=prompt_or_tokens, choice_index=i) for i in range(n)
-        ]
+        siblings = []
+        for choice_index in range(n):
+            # Ids ascend in creation order, as a real `Sequence`'s do: that is
+            # the only reason `generate`'s sort comes out prompt-major.
+            siblings.append(
+                SimpleNamespace(
+                    id=self._next_id,
+                    prompt=prompt_or_tokens,
+                    choice_index=choice_index,
+                )
+            )
+            self._next_id += 1
+        return siblings
 
 
 def _engine():
@@ -85,6 +96,61 @@ def test_the_request_id_is_passed_as_the_parent():
     LLMEngine.add_request(engine, ["hello"], SamplingParams(n=2), request_ids=["req-7"])
 
     assert io.fanout_calls[0][2]["parent_request_id"] == "req-7"
+
+
+class _GeneratingEngine:
+    """Enough of the engine for the real `generate` to run over the real
+    `add_request`: one step, handing back everything that was submitted."""
+
+    add_request = LLMEngine.add_request
+    generate = LLMEngine.generate
+    step = LLMEngine.step
+    is_finished = LLMEngine.is_finished
+
+    def __init__(self):
+        self.io_processor = _IOProcessorDouble()
+        self.io_processor.has_pending_requests = lambda: self._pending
+        self.io_processor.postprocess = lambda seqs: {
+            seq.id: f"{seq.prompt}#{seq.choice_index}" for seq in seqs
+        }
+        self._submitted: list = []
+        self._pending = True
+        self.core_mgr = SimpleNamespace(
+            reset_dp_router=lambda: None,
+            add_request=self._submitted.extend,
+            get_output=self._get_output,
+            is_alive=lambda: True,
+            is_rest=lambda: False,
+        )
+
+    def _get_output(self):
+        self._pending = False
+        return list(self._submitted)
+
+
+def test_generate_hands_back_the_siblings_prompt_major():
+    """The contract a caller has to zip against.
+
+    `generate` returns ONE flat list -- `n` entries per prompt, prompt-major --
+    because it sorts by sequence id and those ascend in fan-out order. So a
+    caller pairing prompts with outputs expands its own list by `n`; it does not
+    get a list of lists, and nothing downstream regroups the siblings. Pinned
+    because it is now the only statement of that ordering that a change can
+    break: `Lumen-RL`'s ATOM server groups equal prompts, sets `n` to the group
+    size, and zips the result against the same expansion.
+    """
+    outputs = _GeneratingEngine().generate(
+        ["a", "b"], [SamplingParams(n=2), SamplingParams(n=3)]
+    )
+
+    assert outputs == ["a#0", "a#1", "b#0", "b#1", "b#2"]
+
+
+def test_generate_is_one_to_one_at_n_equals_one():
+    """The usual case, and the one every existing caller is written against."""
+    outputs = _GeneratingEngine().generate(["a", "b", "c"], SamplingParams(n=1))
+
+    assert outputs == ["a#0", "b#0", "c#0"]
 
 
 def test_preprocess_still_refuses_n_greater_than_one():
