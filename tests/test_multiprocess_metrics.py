@@ -115,8 +115,10 @@ def _run_node():
 
 
 def test_spawned_metrics_are_exported_without_snapshots_and_restart_cleanly():
+    root = Path(__file__).resolve().parents[1]
     env = dict(os.environ)
     env.pop("PROMETHEUS_MULTIPROC_DIR", None)
+    env["PYTHONPATH"] = os.pathsep.join([str(root), env.get("PYTHONPATH", "")])
     results = []
     for _ in range(2):
         result = subprocess.run(
