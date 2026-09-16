@@ -299,8 +299,6 @@ fi
 
 IFS=',' read -r -a IP_ARRAY <<< "${IPADDRS}"
 
-# These arrays contain independent serving APIs, not individual DP ranks.
-# A multi-node DP group must use its coordinator as the API/router target.
 prefill_args=()
 prefill_ips=()
 prefill_ports=()
@@ -508,14 +506,14 @@ if [[ -n "${STATE_CHECKPOINT_INTERVAL_TOKENS}" ]]; then
     --state-checkpoint-interval-tokens "${STATE_CHECKPOINT_INTERVAL_TOKENS}"
   )
 fi
-wait_api_ready() {
+wait_http() {
   local url="$1"
   local name="$2"
   local timeout="$3"
   local pid="${4:-}"
   local deadline=$(( $(date +%s) + timeout ))
   echo "[wait] ${name} ${url} timeout=${timeout}s"
-  until python3 "${ATOMESH_SCRIPT_DIR}/../../../scripts/check_server_ready.py" "${url}" >/dev/null; do
+  until curl -sf --max-time 10 "${url}" >/dev/null 2>&1; do
     if [[ -n "${pid}" ]] && ! kill -0 "${pid}" 2>/dev/null; then
       set +e
       wait "${pid}"
@@ -1317,13 +1315,13 @@ if [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
   decode_pid="${server_pid}"
   trap 'cleanup_processes ${router_pid:-} ${prefill_pid:-} ${decode_pid:-}' EXIT
   for ip in "${prefill_ips[@]}"; do
-    wait_api_ready "http://${ip}:${PREFILL_PORT}/v1/models" "prefill-${ip}" "${WAIT_SERVER_TIMEOUT}" "${prefill_pid}"
+    wait_http "http://${ip}:${PREFILL_PORT}/health" "prefill-${ip}" "${WAIT_SERVER_TIMEOUT}" "${prefill_pid}"
   done
   for ip in "${decode_ips[@]}"; do
-    wait_api_ready "http://${ip}:${DECODE_PORT}/v1/models" "decode-${ip}" "${WAIT_SERVER_TIMEOUT}" "${decode_pid}"
+    wait_http "http://${ip}:${DECODE_PORT}/health" "decode-${ip}" "${WAIT_SERVER_TIMEOUT}" "${decode_pid}"
   done
   start_router
-  wait_api_ready "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
+  wait_http "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
   run_benchmark_and_eval
   cleanup_processes "${router_pid}" "${prefill_pid}" "${decode_pid}"
 elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
@@ -1341,34 +1339,34 @@ elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   done
   trap 'cleanup_processes ${router_pid:-} ${prefill_pids[*]:-}' EXIT
   for idx in "${!prefill_ips[@]}"; do
-    wait_api_ready "http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/v1/models" \
+    wait_http "http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/health" \
       "prefill-${prefill_ips[$idx]}:${prefill_ports[$idx]}" \
       "${WAIT_SERVER_TIMEOUT}" "${prefill_pids[$idx]}"
   done
   for idx in "${!decode_ips[@]}"; do
-    wait_api_ready "http://${decode_ips[$idx]}:${decode_ports[$idx]}/v1/models" \
+    wait_http "http://${decode_ips[$idx]}:${decode_ports[$idx]}/health" \
       "decode-${decode_ips[$idx]}:${decode_ports[$idx]}" \
       "${WAIT_SERVER_TIMEOUT}"
   done
   start_router
-  wait_api_ready "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
+  wait_http "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
   run_benchmark_and_eval
   cleanup_processes "${router_pid}" "${prefill_pids[@]}"
 elif [[ "${NODE_RANK}" -eq 0 ]]; then
   start_prefill "prefill-rank-0"
   trap 'cleanup_processes ${router_pid:-} ${server_pid:-}' EXIT
   for idx in "${!prefill_ips[@]}"; do
-    wait_api_ready "http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/v1/models" \
+    wait_http "http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/health" \
       "prefill-${prefill_ips[$idx]}:${prefill_ports[$idx]}" \
       "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
   done
   for idx in "${!decode_ips[@]}"; do
-    wait_api_ready "http://${decode_ips[$idx]}:${decode_ports[$idx]}/v1/models" \
+    wait_http "http://${decode_ips[$idx]}:${decode_ports[$idx]}/health" \
       "decode-${decode_ips[$idx]}:${decode_ports[$idx]}" \
       "${WAIT_SERVER_TIMEOUT}"
   done
   start_router
-  wait_api_ready "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
+  wait_http "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
   run_benchmark_and_eval
   kill "${router_pid}" "${server_pid}" 2>/dev/null || true
 elif [[ "${DECODE_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -eq "${xP}" ]]; then
@@ -1385,25 +1383,25 @@ elif [[ "${DECODE_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -eq "${xP}" ]]; then
     decode_pids+=("${server_pid}")
   done
   trap 'cleanup_processes ${decode_pids[*]:-}' EXIT
-  wait_api_ready "http://${NODE0_ADDR}:${ROUTER_PORT}/v1/models" "router" "${WAIT_SERVER_TIMEOUT}"
+  wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}"
   wait_router_closed
   cleanup_processes "${decode_pids[@]}"
 elif [[ "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   start_decode
   trap 'cleanup_processes ${server_pid:-}' EXIT
-  wait_api_ready "http://${NODE0_ADDR}:${ROUTER_PORT}/v1/models" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
+  wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
   wait_router_closed
   cleanup_processes "${server_pid}"
 elif [[ "${NODE_RANK}" -lt "${xP}" ]]; then
   start_prefill "prefill-rank-${NODE_RANK}"
   trap 'cleanup_processes ${server_pid:-}' EXIT
-  wait_api_ready "http://${NODE0_ADDR}:${ROUTER_PORT}/v1/models" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
+  wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
   wait_router_closed
   cleanup_processes "${server_pid}"
 else
   start_decode
   trap 'cleanup_processes ${server_pid:-}' EXIT
-  wait_api_ready "http://${NODE0_ADDR}:${ROUTER_PORT}/v1/models" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
+  wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
   wait_router_closed
   cleanup_processes "${server_pid}"
 fi

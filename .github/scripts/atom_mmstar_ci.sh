@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ATOM_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-
 MODEL_PATH="${MODEL_PATH:-/models/Qwen/Qwen3.5-35B-A3B-FP8}"
 ATOM_PORT="${ATOM_PORT:-8000}"
 RESULT_DIR="${RESULT_DIR:-/tmp/atom_mmstar_results}"
@@ -68,9 +66,8 @@ for ((i=1; i<=SERVER_READY_RETRIES; i++)); do
     exit 1
   fi
 
-  if python3 "${ATOM_SCRIPT_DIR}/../../scripts/check_server_ready.py" \
-    "http://127.0.0.1:${ATOM_PORT}/v1/models" >/dev/null; then
-    echo "ATOM server model list is ready."
+  if curl -fsS "http://127.0.0.1:${ATOM_PORT}/health" >/dev/null 2>&1; then
+    echo "ATOM server health endpoint is ready."
     break
   fi
 
