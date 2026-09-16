@@ -135,6 +135,9 @@ class GatedDeltaNet(nn.Module):
         self.head_k_dim = head_k_dim
         self.head_v_dim = head_v_dim
         self.allow_aiter_flydsl = kwargs.get("allow_aiter_flydsl", False)
+        # Opt-in is only eligibility. The standalone cache builder resolves the
+        # policy once with ReplaySSM, architecture and the actual state tensor.
+        self.gdn_flydsl_policy = None
 
     def rearrange_mixed_qkv(self, mixed_qkv):
         if mixed_qkv is None:
@@ -180,6 +183,7 @@ class GatedDeltaNet(nn.Module):
         # to hold are reconstructed from `replay_buf_*` on demand.
         ssm_state = layer_cache.v_cache
         use_replayssm = getattr(gdn_metadata, "replayssm", False)
+        flydsl_policy = self.gdn_flydsl_policy
 
         has_initial_state = gdn_metadata.has_initial_state
         spec_query_start_loc = gdn_metadata.spec_query_start_loc
@@ -322,14 +326,15 @@ class GatedDeltaNet(nn.Module):
 
         use_flydsl_decode = False
         if (
-            self.allow_aiter_flydsl
+            flydsl_policy is not None
+            and flydsl_policy.decode
             and not use_lossy_gdn_decode
             and not use_replayssm
             and spec_sequence_masks is None
             and gdn_metadata.num_prefills == 0
             and gdn_metadata.num_decodes > 0
         ):
-            from atom.model_ops.fla_ops.aiter_flydsl import decode_supported
+            from atom.model_ops.fla_ops.gdn_flydsl import decode_supported
 
             use_flydsl_decode = decode_supported(
                 query_non_spec,
@@ -424,8 +429,12 @@ class GatedDeltaNet(nn.Module):
             ckpt = gdn_metadata.ssm_checkpoints
             flydsl_metadata = getattr(gdn_metadata, "flydsl_prefill_metadata", None)
             use_flydsl_prefill = False
-            if self.allow_aiter_flydsl:
-                from atom.model_ops.fla_ops.aiter_flydsl import (
+            if (
+                flydsl_policy is not None
+                and flydsl_policy.prefill
+                and not use_replayssm
+            ):
+                from atom.model_ops.fla_ops.gdn_flydsl import (
                     prefill,
                     prefill_supported,
                 )
@@ -544,7 +553,7 @@ class GatedDeltaNet(nn.Module):
             last_recurrent_state = None
         elif gdn_metadata.num_decodes > 0:
             if use_flydsl_decode:
-                from atom.model_ops.fla_ops.aiter_flydsl import decode
+                from atom.model_ops.fla_ops.gdn_flydsl import decode
 
                 core_attn_out_non_spec, last_recurrent_state = decode(
                     query_non_spec,

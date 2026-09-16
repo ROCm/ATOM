@@ -7,12 +7,17 @@ if not torch.cuda.is_available() or torch.version.hip is None:
     pytest.skip("ROCm GPU required", allow_module_level=True)
 
 from atom.model_ops.attention_gdn import fused_gdn_gating
-from atom.model_ops.fla_ops import aiter_flydsl as fly
+from atom.model_ops.fla_ops import gdn_flydsl as fly
 from atom.model_ops.fla_ops.chunk import (
     chunk_gated_delta_rule,
     pop_last_intermediate_states,
 )
 from atom.model_ops.fla_ops.fused_recurrent import fused_recurrent_gated_delta_rule
+
+requires_gfx942 = pytest.mark.skipif(
+    torch.cuda.get_device_properties().gcnArchName.split(":")[0] != "gfx942",
+    reason="FlyDSL GDN decode is supported only on gfx942",
+)
 
 
 def inputs(tokens, hk=8, hv=24, seed=123):
@@ -142,6 +147,7 @@ def baseline_decode(q, k, v, a, b, state, log, bias, reads, writes):
 
 
 @pytest.mark.parametrize("batch", [1, 3, 4, 16, 64, 128])
+@requires_gfx942
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("physical_vk", [True])
 def test_decode(batch, state_dtype, physical_vk):
@@ -162,6 +168,7 @@ def test_decode(batch, state_dtype, physical_vk):
 
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("physical_vk", [True])
+@requires_gfx942
 def test_decode_graph_mixed_padding(state_dtype, physical_vk):
     q, k, v, a, b, log, bias = inputs(4)
     original = torch.randn(8, 24, 128, 128, device="cuda", dtype=state_dtype) * 0.1
@@ -238,7 +245,13 @@ def test_triton_decode_vk_fallback():
     torch.testing.assert_close(vk, state, rtol=0.008, atol=2e-6)
 
 
-def test_qwen_backend_binds_zero_copy_vk_state(monkeypatch):
+@pytest.mark.parametrize("replayssm", [False, True])
+@pytest.mark.parametrize("supported_arch", [False, True])
+@pytest.mark.parametrize("decode_backend", ["auto", "triton", "flydsl"])
+@pytest.mark.parametrize("allowed", [False, True])
+def test_qwen_backend_binds_zero_copy_vk_state(
+    monkeypatch, replayssm, supported_arch, decode_backend, allowed
+):
     from types import SimpleNamespace
 
     from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
@@ -251,9 +264,175 @@ def test_qwen_backend_binds_zero_copy_vk_state(monkeypatch):
         lambda self, module: SimpleNamespace(v_cache=raw),
     )
     builder = object.__new__(Qwen4ExpMetadataBuilder)
-    layer = SimpleNamespace(base_linear_attention=None)
+    builder.replayssm = replayssm
+    from atom.utils import envs
+
+    monkeypatch.setattr(envs, "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", False)
+    monkeypatch.setattr(fly, "backend", lambda stage: decode_backend)
+    monkeypatch.setattr(fly, "ops", lambda: object())
+    monkeypatch.setattr(fly, "decode_device_supported", lambda device: supported_arch)
+    attention = SimpleNamespace(allow_aiter_flydsl=allowed, dt_bias=raw)
+    layer = SimpleNamespace(base_linear_attention=None, impl=attention)
     result = builder.build_kv_cache_tensor(layer)
     assert result.v_cache.data_ptr() == raw.data_ptr()
-    assert result.v_cache.stride()[-2:] == (1, 128)
-    monkeypatch.setattr(fly, "backend", lambda stage: "triton")
-    assert builder.build_kv_cache_tensor(layer).v_cache is raw
+    expected = (
+        allowed and not replayssm and supported_arch and decode_backend != "triton"
+    )
+    assert attention.gdn_flydsl_policy.decode == expected
+    assert result.v_cache.stride()[-2:] == ((1, 128) if expected else (128, 1))
+    if replayssm:
+        assert not attention.gdn_flydsl_policy.prefill
+        assert not builder._flydsl_prefill_enabled
+        assert result.v_cache is raw
+
+
+def test_unsupported_device_decode_fallback(monkeypatch):
+    from types import SimpleNamespace
+
+    q, k, v, a, b, log, bias = inputs(3)
+    state = torch.randn(6, 24, 128, 128, device="cuda", dtype=torch.bfloat16) * 0.1
+    vk = state.transpose(-1, -2).contiguous().transpose(-1, -2)
+    reads = torch.arange(3, device="cuda", dtype=torch.int32)
+    writes = reads + 3
+    monkeypatch.setattr(fly, "backend", lambda stage: "auto")
+    monkeypatch.setattr(fly, "ops", lambda: object())
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(gcnArchName="gfx950"),
+    )
+    assert not fly.decode_supported(q, k, v, a, b, vk, log, bias, reads, writes)
+    with pytest.raises(ValueError, match="Unsupported"):
+        fly.decode(q, k, v, a, b, vk, log, bias, reads, writes)
+    # The fallback consumes the same logical KV values; no FlyDSL launch occurs.
+    monkeypatch.undo()
+    expected = baseline_decode(q, k, v, a, b, state, log, bias, reads, writes)
+    actual = baseline_decode(q, k, v, a, b, vk, log, bias, reads, writes)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(vk, state, rtol=0.008, atol=2e-6)
+
+
+@pytest.mark.parametrize("missing_ops", [False, True])
+@pytest.mark.parametrize("lossy_decode", [False, True])
+def test_policy_dependencies_and_lossy(monkeypatch, missing_ops, lossy_decode):
+    monkeypatch.setattr(fly, "backend", lambda stage: "auto")
+    monkeypatch.setattr(fly, "ops", lambda: None if missing_ops else object())
+    monkeypatch.setattr(fly, "decode_device_supported", lambda device: True)
+    policy = fly.select_policy(
+        allowed=True,
+        replayssm=False,
+        lossy_decode=lossy_decode,
+        state=torch.empty(1, 24, 128, 128, device="cuda", dtype=torch.bfloat16),
+        activation_dtype=torch.bfloat16,
+    )
+    assert policy.prefill == (not missing_ops)
+    assert policy.decode == (not missing_ops and not lossy_decode)
+
+
+@pytest.mark.parametrize("mode", ["replayssm", "unsupported", "disabled", "flydsl"])
+def test_cache_policy_forward_dispatch(monkeypatch, mode):
+    """Exercise the cache-builder -> real GDN forward contract, not just gates."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from atom.model_ops import attention_gdn as gdn
+    from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
+    from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpMetadataBuilder
+    from atom.model_ops.fla_ops.replayssm import replayssm_buffer_shapes
+    from atom.utils import envs
+
+    if mode == "flydsl" and not fly.decode_device_supported(torch.device("cuda")):
+        pytest.skip("FlyDSL decode numerical coverage requires gfx942")
+    q, k, v, a, b, log, bias = inputs(3)
+    raw = torch.randn(3, 24, 128, 128, device="cuda", dtype=torch.bfloat16) * 0.1
+    reference = raw.clone()
+    idx = torch.arange(3, device="cuda", dtype=torch.int32)
+    cu = torch.arange(4, device="cuda", dtype=torch.int32)
+    sk, su, sg = replayssm_buffer_shapes(4, 24, 128, 128, False)
+    cache = SimpleNamespace(
+        v_cache=raw,
+        k_cache=torch.zeros(3, 1, 1, device="cuda", dtype=torch.bfloat16),
+        replay_buf_k=torch.zeros((3, *sk), device="cuda", dtype=torch.bfloat16),
+        replay_buf_u=torch.zeros((3, *su), device="cuda", dtype=torch.bfloat16),
+        replay_buf_g=torch.zeros((3, *sg), device="cuda", dtype=torch.float32),
+    )
+    attention = gdn.GatedDeltaNet.__new__(gdn.GatedDeltaNet)
+    torch.nn.Module.__init__(attention)
+    for name, value in {
+        "layer_num": 0,
+        "tp_size": 1,
+        "num_k_heads": 8,
+        "num_v_heads": 24,
+        "head_k_dim": 128,
+        "head_v_dim": 128,
+        "A_log": log,
+        "dt_bias": bias,
+        "allow_aiter_flydsl": True,
+        "activation": "silu",
+        "conv1d": SimpleNamespace(weight=torch.zeros(1, 1, 1), bias=None),
+    }.items():
+        setattr(attention, name, value)
+    builder = object.__new__(Qwen4ExpMetadataBuilder)
+    builder.replayssm = mode == "replayssm"
+    monkeypatch.setattr(envs, "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", False)
+    monkeypatch.setattr(
+        fly, "backend", lambda stage: "triton" if mode == "disabled" else "auto"
+    )
+    if mode == "unsupported":
+        monkeypatch.setattr(fly, "decode_device_supported", lambda device: False)
+    monkeypatch.setattr(
+        GDNAttentionMetadataBuilder, "build_kv_cache_tensor", lambda self, module: cache
+    )
+    cache = builder.build_kv_cache_tensor(
+        SimpleNamespace(base_linear_attention=None, impl=attention)
+    )
+    # Production binds a zero-filled pool before prefill populates logical KV
+    # states. Seed logical values after binding, not physical pre-bind storage.
+    cache.v_cache.copy_(reference)
+    metadata = SimpleNamespace(
+        replayssm=builder.replayssm,
+        has_initial_state=None,
+        spec_query_start_loc=None,
+        non_spec_query_start_loc=cu,
+        spec_sequence_masks=None,
+        spec_token_indx=None,
+        non_spec_token_indx=None,
+        spec_state_indices_tensor=None,
+        non_spec_state_indices_tensor=idx,
+        non_spec_state_indices_in_tensor=idx,
+        num_actual_tokens=3,
+        num_accepted_tokens=None,
+        num_prefills=0,
+        num_decodes=3,
+        write_pos=torch.zeros(3, device="cuda", dtype=torch.int32),
+        slot_idx=idx,
+        replayssm_max_query_len=1,
+        replayssm_route="serial",
+    )
+    context = SimpleNamespace(
+        attn_metadata=SimpleNamespace(gdn_metadata=metadata),
+        kv_cache_data={"layer_0": cache},
+    )
+    monkeypatch.setattr(gdn, "get_forward_context", lambda: context)
+    # Isolate GDN from the unrelated convolution, preserving real q/k/v values.
+    monkeypatch.setattr(
+        gdn, "causal_conv1d_update", lambda *args, **kwargs: (q[0], k[0], v[0])
+    )
+    recurrent = Mock(wraps=gdn.fused_recurrent_gated_delta_rule)
+    replay = Mock(wraps=gdn.replayssm_gated_delta_rule)
+    decode = Mock(wraps=fly.decode)
+    monkeypatch.setattr(gdn, "fused_recurrent_gated_delta_rule", recurrent)
+    monkeypatch.setattr(gdn, "replayssm_gated_delta_rule", replay)
+    monkeypatch.setattr(fly, "decode", decode)
+    actual = attention(
+        torch.empty(3, 1, device="cuda"), b, a, torch.empty_like(v[0]), "layer_0"
+    )
+    expected = baseline_decode(q, k, v, a, b, reference, log, bias, idx, idx)
+    close(actual, expected[0], mode)
+    assert decode.call_count == int(mode == "flydsl")
+    assert replay.call_count == int(mode == "replayssm")
+    assert recurrent.call_count == int(mode in ("unsupported", "disabled"))
+    if mode == "replayssm":
+        assert cache.v_cache.is_contiguous()
+    else:
+        close(cache.v_cache, reference, "forward state")
