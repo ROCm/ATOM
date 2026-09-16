@@ -224,7 +224,14 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             else None
         )
         embedding_cls = VocabParallelEmbedding
-        if policy is not None and policy.is_quantized:
+        # PLE storage is independent of the linear layers' quantization format.
+        embedding_dtype = getattr(config, "ple_embedding_dtype", None)
+        if embedding_dtype == "float8_e4m3fn":
+            embedding_cls = _Qwen4ExpFP8Embedding
+        elif embedding_dtype not in (None, "bfloat16"):
+            raise ValueError(f"unsupported ple_embedding_dtype: {embedding_dtype}")
+        elif embedding_dtype is None and policy is not None and policy.is_quantized:
+            # Older checkpoints specify PLE storage through the FP8 policy.
             if quant_config.quant_method != "fp8":
                 raise ValueError("PLE embedding supports BF16 or FP8 checkpoints")
             # PLE uses a global scalar, independently of the linear block scales.
@@ -416,6 +423,7 @@ class Qwen4ExpPLELayer(nn.Module):
         state_indices_in: torch.Tensor,
         state_indices_out: torch.Tensor,
         has_initial_state: torch.Tensor,
+        num_accepted_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One flat varlen path for prefill, decode and graph padding."""
         return dilated_causal_conv1d(
@@ -427,6 +435,7 @@ class Qwen4ExpPLELayer(nn.Module):
             state_indices_out,
             has_initial_state,
             self.short_conv_dilation,
+            num_accepted_tokens,
         )
 
     def gated_memory(
@@ -500,6 +509,8 @@ class Qwen4ExpPLELayer(nn.Module):
             metadata.state_indices_out,
             metadata.has_initial_state,
             self.ple_embedding.eos_token_id,
+            history_width=self.ple_embedding.ngram_size - 1,
+            num_accepted_tokens=metadata.num_accepted_tokens,
         )
         gated_value = self.gated_memory(
             hidden_states, input_ids, metadata.query_start_loc, ngram_context
@@ -512,5 +523,6 @@ class Qwen4ExpPLELayer(nn.Module):
             metadata.state_indices_in,
             metadata.state_indices_out,
             metadata.has_initial_state,
+            metadata.num_accepted_tokens,
         )
         return gated_value.flatten(-2) + conv_output

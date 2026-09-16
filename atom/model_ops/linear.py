@@ -1997,7 +1997,16 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
         else:
             self.num_kv_heads = 1
             self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
-        self.num_index_heads = self.num_kv_heads
+        # Indexer-only CP scores every index head on every rank, so index_q is
+        # replicated at full width instead of following the KV-head sharding --
+        # the same treatment index_k already gets. index_k, q, k and v are
+        # untouched, so this widens the GEMM by 3 head-columns and nothing else.
+        from atom.distributed.indexer_cp import indexer_cp_enabled
+
+        self.indexer_cp = indexer_cp_enabled()
+        self.num_index_heads = (
+            self.total_num_index_heads if self.indexer_cp else self.num_kv_heads
+        )
 
         output_sizes = [
             self.num_heads * self.head_size * tp_size,
@@ -2061,7 +2070,11 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
 
         if loaded_shard_id == "q":
             shard_rank = self.tp_rank
-        elif loaded_shard_id == "index_k":
+        elif loaded_shard_id == "index_k" or (
+            loaded_shard_id == "index_q" and self.indexer_cp
+        ):
+            # Replicated: shard_size already spans every index head, so there is
+            # only one shard to take.
             shard_rank = 0
         else:
             shard_rank = self.tp_rank // self.num_kv_head_replicas

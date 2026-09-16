@@ -13,36 +13,30 @@ Usage:
 """
 
 import asyncio
-import base64
-import binascii
 import contextlib
-import io
 import json
 import logging
 import os
 import time
-import urllib.request
 import uuid
 from asyncio import AbstractEventLoop
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from transformers import AutoProcessor, AutoTokenizer
 
-if TYPE_CHECKING:
-    from PIL import Image
-
 from atom import SamplingParams
+from atom.entrypoints.chat_utils import has_multimodal_content, parse_chat_messages
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
-from atom.model_engine.multimodal import build_multimodal_inputs
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import new_token_ids
+from atom.multimodal.processing import prepare_multimodal_inputs
 from atom.utils import envs
 from atom.utils.arg_parser import FlexibleArgumentParser
 from atom.utils.gc_utils import (
@@ -650,42 +644,9 @@ def _validate_sequence_context_length(seq) -> None:
 
 
 def _has_multimodal_content(messages: list[Any]) -> bool:
-    for message in messages:
-        content = getattr(message, "content", None)
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            if isinstance(part, dict) and part.get("type") in {"image", "image_url"}:
-                return True
-    return False
-
-
-def _load_image_from_url(url: str) -> "Image.Image":
-    # Imported here, not at module scope, and this is the one place in the
-    # file that needs it at runtime. Pillow is not a declared dependency, so a
-    # module-scope `from PIL import Image` made the whole server module
-    # unimportable wherever it is absent -- which is the non-GPU CI runner,
-    # where the only test that reached this module had to wrap its import in a
-    # try/except and degrade to `api_server = None`. Text-only serving does
-    # not need Pillow, so it should not be a condition of importing the
-    # server; a request that actually carries an image raises here, naming it.
-    from PIL import Image
-
-    if url.startswith("data:"):
-        try:
-            _, encoded = url.split(",", 1)
-            image_bytes = base64.b64decode(encoded, validate=True)
-        except (ValueError, binascii.Error) as exc:
-            raise ValueError("Invalid base64 data URL for image_url") from exc
-        return Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-    if url.startswith(("http://", "https://")):
-        with urllib.request.urlopen(url, timeout=30) as response:
-            image_bytes = response.read()
-        return Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-    url = url.removeprefix("file://")
-    return Image.open(url).convert("RGB")
+    return has_multimodal_content(
+        [{"content": message.content} for message in messages]
+    )
 
 
 def _get_multimodal_processor():
@@ -696,118 +657,25 @@ def _get_multimodal_processor():
     return processor
 
 
-def _collect_multimodal_parts(
-    messages: list[Any],
-) -> tuple[list[dict[str, Any]], list["Image.Image"]]:
-    """Normalize chat messages into processor form, loading every image.
-
-    Content parts keep the order the client sent them in; the images are
-    returned separately in that same order.
-    """
-    processor_messages: list[dict[str, Any]] = []
-    images: list[Image.Image] = []
-
-    for message in messages:
-        content = getattr(message, "content", None)
-        if isinstance(content, str) or content is None:
-            processor_messages.append({"role": message.role, "content": content or ""})
-            continue
-
-        parts: list[dict[str, Any]] = []
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            part_type = part.get("type")
-            if part_type == "text":
-                parts.append({"type": "text", "text": part.get("text", "")})
-            elif part_type == "image_url":
-                image_url = part.get("image_url", {})
-                url = image_url.get("url") if isinstance(image_url, dict) else None
-                if not url:
-                    raise ValueError(
-                        "image_url content part must include image_url.url"
-                    )
-                image = _load_image_from_url(url)
-                images.append(image)
-                parts.append({"type": "image", "image": image})
-            elif part_type == "image":
-                url = part.get("image")
-                if not isinstance(url, str):
-                    raise ValueError(
-                        "image content part must include an image URL/path"
-                    )
-                image = _load_image_from_url(url)
-                images.append(image)
-                parts.append({"type": "image", "image": image})
-        processor_messages.append({"role": message.role, "content": parts})
-
-    return processor_messages, images
-
-
-def _images_before_text(
-    processor_messages: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Hoist image parts ahead of the text within each message.
-
-    Qwen3.5's template only reliably emits <|image_pad|> when image entries
-    precede the text, matching the native offline multimodal example.
-    """
-    reordered: list[dict[str, Any]] = []
-    for message in processor_messages:
-        content = message["content"]
-        if not isinstance(content, list):
-            reordered.append(message)
-            continue
-        parts = [part for part in content if part["type"] == "image"]
-        texts = [part["text"] for part in content if part["type"] == "text"]
-        if texts:
-            parts.append({"type": "text", "text": "\n".join(texts)})
-        reordered.append({"role": message["role"], "content": parts})
-    return reordered
-
-
 def _prepare_multimodal_inputs(
     messages: list[Any],
     chat_template_kwargs: dict[str, Any],
     tools: Any = None,
 ) -> tuple[list[int], dict[str, Any]]:
-    mm_processor = _get_multimodal_processor()
-    processor_messages, images = _collect_multimodal_parts(messages)
-
-    if not images:
-        raise ValueError("Multimodal request did not contain any images")
-
-    # Models whose processor deviates from the Qwen convention register their
-    # own builder (e.g. Kimi-K3's messages+medias API and unexpanded
-    # <|media_pad|> placeholders).
-    built = build_multimodal_inputs(
+    conversation, media = parse_chat_messages(
+        [
+            {**message.to_template_dict(), "content": message.content}
+            for message in messages
+        ]
+    )
+    return prepare_multimodal_inputs(
         _get_engine_config(),
-        mm_processor,
-        processor_messages,
-        images,
+        _get_multimodal_processor(),
+        conversation,
+        media,
         chat_template_kwargs,
         tools=tools,
     )
-    if built is not None:
-        return built
-
-    template_kwargs = dict(chat_template_kwargs)
-    template_kwargs.pop("tokenize", None)
-    template_kwargs.pop("add_generation_prompt", None)
-    text = mm_processor.apply_chat_template(
-        _images_before_text(processor_messages),
-        tokenize=False,
-        add_generation_prompt=True,
-        **template_kwargs,
-    )
-    if images and "<|image_pad|>" not in text:
-        raise ValueError("Multimodal chat template did not emit image placeholders")
-    inputs = mm_processor(text=[text], images=images, return_tensors="pt")
-    multimodal_data = {
-        "pixel_values": inputs["pixel_values"],
-        "image_grid_thw": inputs["image_grid_thw"],
-    }
-    return inputs["input_ids"][0].tolist(), multimodal_data
 
 
 # ── Batched stream dispatch ──────────────────────────────────────────────
@@ -1730,7 +1598,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
 
         is_multimodal = _has_multimodal_content(messages)
         if is_multimodal:
-            # Image loading (blocking network I/O, up to a 30s urlopen) plus
+            # Media loading (blocking network I/O, up to a 30s urlopen) plus
             # processor preprocessing are heavy and would stall the event loop;
             # run them in a worker thread. Warm the processor on the loop first
             # so concurrent cold-start requests don't race on its lazy init.

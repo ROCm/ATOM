@@ -23,8 +23,8 @@ python -m atom.entrypoints.openai_server \
 The API listens on port 8000 by default. Use
 `Qwen/Qwen3.8-Flash-Next-FP8` as the `model` in API requests.
 
-BF16 is the only supported KV cache format. The block size must be divisible
-by `indexer_compress_ratio` (4); 64 is used in this example.
+BF16 is the only supported KV cache format. The default block size already
+satisfies `indexer_compress_ratio` (4); no block-size override is needed.
 
 Choose a GPU with enough memory for the weights, recurrent state, and KV
 cache. Adjust `--max-num-seqs`, `--max-model-len`, and
@@ -33,17 +33,40 @@ In particular, `--max-num-seqs` defaults to 512; lowering it reduces the
 preallocated recurrent-state memory. These are resource controls, not
 model-specific requirements.
 
+## Native MTP
+
+Use the draft weights included in the same checkpoint:
+
+```bash
+python -m atom.entrypoints.openai_server \
+  --model Qwen/Qwen3.8-Flash-Next-FP8 \
+  --trust-remote-code \
+  -tp 1 \
+  --method mtp --num-speculative-tokens 2 \
+  --no-enable_prefix_caching
+```
+
+Draft depths 1, 2, and 3 are supported. The checkpoint contains one draft
+layer, reused at each step; no separate draft model is needed. The target
+and draft share the embedding and output head.
+
 ## Usage notes and limitations
 
 - For image requests, use `--no-enable_prefix_caching` and sufficient cache
   capacity to avoid preemption until the image caching/recompute limitations
   are resolved. Image prompts must fit within `--max-num-batched-tokens`.
-- Preserve the checkpoint's quantization exclusions. Quantized GDN input
-  projections are not supported.
+- Preserve the checkpoint's quantization exclusions and `ple_embedding_dtype`
+  when present. GDN inputs support unquantized weights or per-channel FP8 QKV/Z
+  with unquantized B/A. GDN input online quantization is not supported.
+- PTPC (`compressed-tensors`) checkpoint loading is supported, but end-to-end
+  execution on gfx950 is blocked by the default small-batch MoE dispatch:
+  its second-stage kernel requires a 256-aligned intermediate size, whereas
+  this model uses 640. The FP8 example above uses block-wise quantization.
 - Chunked text prefill and full decode CUDA graphs are supported. Piecewise
   compilation/CUDA graphs are not supported.
-- MTP/speculative decoding, pipeline parallelism, context parallelism,
-  DP attention, TBO, and external KV transfer/offload are not supported.
+- Only native MTP speculation is supported. Pipeline parallelism, context
+  parallelism, DP attention, TBO, and external KV transfer/offload are not
+  supported.
 - This example covers FP8 with TP1. Pure TP2 is not currently validated;
   it can fail MoE warmup on gfx950 due to an MoE dispatch limitation.
 - Video inference and long-context accuracy have not been validated.

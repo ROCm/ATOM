@@ -396,3 +396,51 @@ class Qwen3VisionTransformer(nn.Module):
 
         hidden_states = self.merger(hidden_states)
         return hidden_states
+
+
+def _images_before_text(messages: list[dict]) -> list[dict]:
+    """Retain the native Qwen template convention: images precede text."""
+    reordered = []
+    for message in messages:
+        content = message["content"]
+        if isinstance(content, list):
+            parts = [part for part in content if part["type"] == "image"]
+            texts = [part["text"] for part in content if part["type"] == "text"]
+            if texts:
+                parts.append({"type": "text", "text": "\n".join(texts)})
+            content = parts
+        reordered.append({**message, "content": content})
+    return reordered
+
+
+def build_qwen_vl_inputs(
+    atom_config,
+    processor,
+    prompt: str | list[dict],
+    images: list,
+    chat_template_kwargs: dict,
+    tools=None,
+) -> tuple[list[int], dict]:
+    """Apply the existing template/processor convention and validate image slots."""
+    if isinstance(prompt, str):
+        text = prompt
+    else:
+        template_kwargs = dict(chat_template_kwargs)
+        template_kwargs.pop("tokenize", None)
+        template_kwargs.pop("add_generation_prompt", None)
+        text = processor.apply_chat_template(
+            _images_before_text(prompt),
+            tokenize=False,
+            add_generation_prompt=True,
+            **template_kwargs,
+        )
+    num_placeholders = text.count("<|image_pad|>")
+    if num_placeholders != len(images):
+        raise ValueError(
+            f"Prompt has {num_placeholders} image placeholders but {len(images)} images"
+        )
+    processed = processor(text=[text], images=images, return_tensors="pt")
+    return processed["input_ids"][0].tolist(), {
+        "pixel_values": processed["pixel_values"],
+        "image_grid_thw": processed["image_grid_thw"],
+    }
