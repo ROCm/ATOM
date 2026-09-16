@@ -460,8 +460,9 @@ def test_workload_uses_dispatch_snapshot_and_observes_prompt_once(clock):
     assert snapshot["prefill_batch_tokens"]["buckets"][-1][1] == 2
     assert snapshot["prefill_context_tokens"]["sum"] == 19024
     assert snapshot["prefill_context_tokens"]["buckets"][-1][1] == 2
-    assert snapshot["prefill_request_context_tokens"]["sum"] == 19024
-    assert snapshot["prefill_request_context_tokens"]["buckets"][-1][1] == 2
+    request_context = metrics.prefill_request_context_tokens.collect()[0].samples
+    assert len(request_context) == 1
+    assert request_context[0].value == 10000
     assert snapshot["decode_context_tokens"]["sum"] == 4001
     assert snapshot["decode_context_tokens"]["buckets"][-1][1] == 2
     mixed.is_dummy_run = True
@@ -469,21 +470,26 @@ def test_workload_uses_dispatch_snapshot_and_observes_prompt_once(clock):
     assert histogram_values_by_name(metrics) == snapshot
 
 
-def test_prefill_context_uses_chunk_end_and_excludes_decode_and_padding(monkeypatch):
+def test_prefill_context_records_full_prompt_once_and_chunk_batch_totals(monkeypatch):
     import numpy as np
+    from prometheus_client import CollectorRegistry, generate_latest
 
     from atom.model_engine.scheduler import ScheduledBatch
     from atom.model_engine.sequence import SequenceType
 
     monkeypatch.delenv("ATOM_ENABLE_METRICS_DEVICE_TIMER", raising=False)
-    metrics = SchedulerMetrics()
+    registry = CollectorRegistry()
+    metrics = SchedulerMetrics(registry=registry)
     decode = Sequence([1, 2], block_size=4)
     decode.type = SequenceType.DECODE
-    first = Sequence(list(range(12)), block_size=4)
-    second = Sequence(list(range(20)), block_size=4)
+    first = Sequence(list(range(12)), block_size=4, request_id="first")
+    second = Sequence(list(range(20)), block_size=4, request_id="second")
     first.type = second.type = SequenceType.PREFILL
     first.num_cached_tokens, second.num_cached_tokens = 4, 8
     seqs = {seq.id: seq for seq in (decode, first, second)}
+    for seq in seqs.values():
+        metrics.enqueue(seq)
+    monkeypatch.setattr("atom.model_engine.scheduler_metrics.time.time", lambda: 100.25)
     scheduled = ScheduledBatch(
         seqs,
         [1, 3, 4],
@@ -498,12 +504,24 @@ def test_prefill_context_uses_chunk_end_and_excludes_decode_and_padding(monkeypa
     # Scheduling can advance the live sequences before dispatch.
     first.num_cached_tokens = 7
     second.num_cached_tokens = 12
+    scheduled.is_dummy_run = True
+    metrics.record_forward(scheduled, seqs)
+    assert metrics.prefill_request_context_tokens.collect()[0].samples == []
+    scheduled.is_dummy_run = False
     metrics.record_forward(scheduled, seqs)
     initial = histogram_values_by_name(metrics)
     assert initial["prefill_context_tokens"]["sum"] == 19  # 7 + 12
     assert initial["prefill_context_tokens"]["buckets"][-1][1] == 1
-    assert initial["prefill_request_context_tokens"]["sum"] == 19
-    assert initial["prefill_request_context_tokens"]["buckets"][-1][1] == 2
+    requests = metrics.prefill_request_context_tokens.collect()[0].samples
+    assert [(s.labels["request_id"], s.value) for s in requests] == [
+        ("first", 12),
+        ("second", 20),
+    ]
+    assert all(s.labels["started_at"] == "100.25" for s in requests)
+    assert (
+        "# TYPE atom:prefill_request_context_tokens gauge"
+        in generate_latest(registry).decode()
+    )
     assert initial["prefill_batch_tokens"]["sum"] == 7
     assert initial["decode_context_tokens"]["sum"] == 2
 
@@ -519,11 +537,46 @@ def test_prefill_context_uses_chunk_end_and_excludes_decode_and_padding(monkeypa
     final = histogram_values_by_name(metrics)
     assert final["prefill_context_tokens"]["sum"] == 31  # 19 + 12
     assert final["prefill_context_tokens"]["buckets"][-1][1] == 2
-    assert final["prefill_request_context_tokens"]["sum"] == 31
-    assert final["prefill_request_context_tokens"]["buckets"][-1][1] == 3
+    assert metrics.prefill_request_context_tokens.collect()[0].samples == requests
     tail.is_dummy_run = True
     metrics.record_forward(tail, seqs)
     assert histogram_values_by_name(metrics) == final
+
+    # Re-admission after preemption must retain the original prompt sample.
+    first.is_partial_prefill = True
+    owner = SimpleNamespace(
+        _is_preemptable=lambda seq: True,
+        total_preemptions=0,
+        _partial_prefill_count=1,
+        spec_decode_local=False,
+        _connector_release_stalled_save=lambda seq: None,
+        block_manager=SimpleNamespace(deallocate=lambda seq: None),
+        waiting=deque(),
+    )
+    assert Scheduler.preempt(owner, first)
+    metrics.enqueue(first)
+    tail.is_dummy_run = False
+    metrics.record_forward(tail, seqs)
+    assert metrics.prefill_request_context_tokens.collect()[0].samples == requests
+
+    third = Sequence(list(range(30)), block_size=4, request_id="third")
+    third.type = SequenceType.PREFILL
+    metrics.enqueue(third)
+    seqs[third.id] = third
+    next_batch = ScheduledBatch(
+        {first.id: first, third.id: third},
+        [5, 4],
+        9,
+        total_tokens_num_prefill=9,
+        total_seqs_num=2,
+        total_seqs_num_prefill=2,
+    )
+    metrics.record_forward(next_batch, seqs)
+    final_requests = metrics.prefill_request_context_tokens.collect()[0].samples
+    assert final_requests[:2] == requests
+    assert len(final_requests) == 3
+    assert final_requests[-1].labels["request_id"] == "third"
+    assert final_requests[-1].value == 30
 
 
 def test_decode_request_context_gauge_records_first_dispatch_once(monkeypatch):
@@ -620,10 +673,6 @@ def test_large_batch_contexts_have_finite_buckets_through_exposition(
     # Finite buckets must contain the observations; otherwise Prometheus
     # clips any quantile in +Inf to the highest finite bound.
     assert dict(histogram["buckets"])[total] == 1
-    if phase == "prefill":
-        request_histogram = snapshot["prefill_request_context_tokens"]
-        assert request_histogram["buckets"][-2] == (8388608, rows)
-
     values = samples(exporter)
     labels = (("dp_rank", "0"), ("engine_role", phase))
     bucket_labels = (*labels, ("le", floatToGoString(total)))

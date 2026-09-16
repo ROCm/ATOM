@@ -135,8 +135,9 @@ def test_spawned_metrics_are_exported_without_snapshots_and_restart_cleanly():
     assert results[0]["series"] == results[1]["series"]
 
 
-def test_decode_request_context_survives_workers_and_repeated_metrics_scrapes(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_request_context_survives_workers_and_repeated_metrics_scrapes(
+    monkeypatch, tmp_path, phase
 ):
     from prometheus_client.parser import text_string_to_metric_families
 
@@ -154,23 +155,25 @@ from atom.model_engine.scheduler_metrics import SchedulerMetrics
 
 assert values.ValueClass._multiprocess
 rank = int(sys.argv[1])
-metrics = SchedulerMetrics(rank, "decode")
-seq = SimpleNamespace(external_request_id=f"request-{rank}")
+phase = sys.argv[2]
+metrics = SchedulerMetrics(rank, phase)
+seq = SimpleNamespace(external_request_id=f"request-{rank}", num_prompt_tokens=1000 + rank)
 metrics.enqueue(seq)
 seqs = {1: seq}
 batch = SimpleNamespace(
-    req_ids=[1], is_dummy_run=False, total_seqs_num_decode=1,
-    context_lens=[1000 + rank],
+    req_ids=[1], is_dummy_run=False, total_seqs_num_decode=int(phase == "decode"),
+    total_seqs_num_prefill=int(phase == "prefill"), total_tokens_num_prefill=100,
+    num_cached_tokens=[100], context_lens=[200 if phase == "prefill" else 1000 + rank],
 )
 metrics.record_forward(batch, seqs)
-batch.context_lens = [2000 + rank]
+batch.context_lens = [400 if phase == "prefill" else 2000 + rank]
 metrics.record_forward(batch, seqs)
 seqs.clear()
 del seq
 """
     for rank in (0, 1):
         result = subprocess.run(
-            [sys.executable, "-c", script, str(rank)],
+            [sys.executable, "-c", script, str(rank), phase],
             cwd=root,
             env=env,
             capture_output=True,
@@ -192,7 +195,7 @@ del seq
                     text_string_to_metric_families(response.read().decode())
                 )
             family = next(
-                f for f in families if f.name == "atom:decode_request_context_tokens"
+                f for f in families if f.name == f"atom:{phase}_request_context_tokens"
             )
             assert family.type == "gauge"
             assert len(family.samples) == 2
@@ -202,7 +205,7 @@ del seq
                 for s in family.samples
             } == {("0", "request-0", 1000), ("1", "request-1", 1001)}
             assert all(
-                s.labels["engine_role"] == "decode"
+                s.labels["engine_role"] == phase
                 and s.labels["sequence_id"] == "1"
                 and float(s.labels["started_at"]) > 0
                 for s in family.samples

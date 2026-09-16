@@ -36,21 +36,22 @@ All metrics to inspect the full set. Desktop charts use two columns:
 - Uncached prompt tokens per request and actual prefill tokens per forward.
 - Prefill batch context tokens: sum of the prefill rows' logical context lengths
   through the current chunk, including cached and previously computed prefixes.
-- Prefill request context tokens: one sample per prefill row on every real forward.
-  For an 80K cached prefix plus a 4K chunk, context is 84K while actual prefill work
-  is 4K. Later chunks contribute new samples; future prompt chunks, decode rows,
-  and graph padding are excluded. These CPU scheduler metrics are available even
-  when GPU event timing is disabled.
+- Prefill request context length: full input token count, including cached
+  prefixes, recorded once at first real local prefill dispatch. A 100K prompt
+  split into 4K chunks produces one 100K value; later chunks and preemption do
+  not add samples. The per-batch context above still measures each chunk end.
 - Decode batch context tokens: sum of logical sequence lengths per real batch.
 - Decode request context length: exact token count at the first real decode
-  dispatch, once per request sequence. Collected through Prometheus `/metrics`
-  as a Gauge with request ID and dispatch-time labels. The scatter plot shows
-  individual requests; hover for identity or use Data table / CSV for all values.
-  Repeated scrapes and later decode steps do not create additional report rows.
-  Samples persist until the service's metrics directory is cleaned, so the number
-  of time series grows with requests.
+  dispatch, once per request sequence.
 - Prefill and Decode GPU forward: per-worker device-event duration, including
   stream communication/waits; PP samples cover each local stage, not the full pipeline.
+
+Both request context metrics are collected through Prometheus `/metrics` as
+Gauges with request ID and phase dispatch-time labels. Scatter plots show each
+request; hover for identity or use Data table / CSV for all values. Repeated
+scrapes do not create additional report rows. Samples persist until the service's
+metrics directory is cleaned, so series count grows with requests. These CPU
+scheduler metrics are available even when GPU event timing is disabled.
 
 Mean, P50, P90, P95, and P99 can be toggled globally or per chart. The report also
 supports hiding charts, time-range selection, a data table, and CSV export.

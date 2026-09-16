@@ -578,18 +578,20 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
             "atom:prefill_request_tokens",
             "atom:prefill_batch_tokens",
             "atom:prefill_context_tokens",
-            "atom:prefill_request_context_tokens",
             "atom:decode_context_tokens",
             "atom:gpu_forward_seconds",
             "atom:prefill_request_gpu_forward_seconds",
         )
     ]
-    request_context_gauge = Gauge(
-        "atom:decode_request_context_tokens",
-        "fixture",
-        ["request_id", "sequence_id", "started_at"],
-        registry=registry,
-    )
+    request_context_gauges = {
+        phase: Gauge(
+            f"atom:{phase}_request_context_tokens",
+            "fixture",
+            ["request_id", "sequence_id", "started_at"],
+            registry=registry,
+        )
+        for phase in ("prefill", "decode")
+    }
     cached = Counter("atom:prefix_cache_cached_tokens", "fixture", registry=registry)
     offload = Counter("atom:prefix_cache_offload_tokens", "fixture", registry=registry)
     prompt = Counter("atom:prefix_cache_full_tokens", "fixture", registry=registry)
@@ -606,7 +608,7 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
         batch,
         transfer,
         queues,
-        request_context_gauge,
+        *request_context_gauges.values(),
         *workload,
     ):
         other_registry.register(metric)
@@ -636,13 +638,14 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
                 batch.observe(4)
                 transfer.observe(0.02)
                 for hist, value in zip(
-                    workload, (2000, 512, 48000, 12000, 32000, 0.008, 0.030)
+                    workload, (2000, 512, 48000, 32000, 0.008, 0.030)
                 ):
                     hist.observe(value)
                 started = str(time.time())
-                request_context_gauge.labels(
-                    "request-" + started, started, started
-                ).set(8000)
+                for phase, value in (("prefill", 12000), ("decode", 8000)):
+                    request_context_gauges[phase].labels(
+                        "request-" + started, started, started
+                    ).set(value)
                 cached.inc(8)
                 offload.inc(1)
                 prompt.inc(10)
@@ -754,20 +757,21 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
             assert means and all(value == pytest.approx(30) for value in means)
         for panel_id, expected in (
             ("prefill_context_tokens", 48000),
-            ("prefill_request_context_tokens", 12000),
+            ("decode_context_tokens", 32000),
         ):
             panel = panels[panel_id]
             for bundle in (panel, *panel["instances"].values()):
                 means = [v for _, v in bundle["series"]["mean"] if v is not None]
                 assert means and all(v == pytest.approx(expected) for v in means)
-        request_context = panels["decode_request_context_tokens"]
-        assert request_context["title"] == "Decode request context length"
         assert panels["decode_context_tokens"]["title"] == "Decode batch context tokens"
-        assert len(request_context["records"]) == 24  # 12 requests on two targets.
-        for bundle in request_context["instances"].values():
-            assert len(bundle["records"]) == 12
-            assert all(r["context_tokens"] == 8000 for r in bundle["records"])
-            assert len({r["request_id"] for r in bundle["records"]}) == 12
+        for phase, expected in (("prefill", 12000), ("decode", 8000)):
+            request_context = panels[f"{phase}_request_context_tokens"]
+            assert request_context["title"] == f"{phase.title()} request context length"
+            assert len(request_context["records"]) == 24  # 12 requests on two targets.
+            for bundle in request_context["instances"].values():
+                assert len(bundle["records"]) == 12
+                assert all(r["context_tokens"] == expected for r in bundle["records"])
+                assert len({r["request_id"] for r in bundle["records"]}) == 12
         kv = panels["prefill_kv_blocks"]
         assert {v for _, v in kv["series"]["used"] if v is not None} == {50.0}
         assert {

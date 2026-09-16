@@ -49,7 +49,7 @@ def test_prometheus_export_uses_real_response_values_and_keeps_missing_points(
     monkeypatch.setattr(report.urllib.request, "urlopen", response)
     output = tmp_path / "report.html"
     data = report.generate_report("http://prometheus.example", 100, 110, output)
-    assert len(queries) == 1 + sum(
+    assert len(queries) == 2 + sum(
         len(list(report.panel_queries(p, 60))) * (1 if p["role"] == "overall" else 2)
         for p in data["panels"]
     )
@@ -149,32 +149,31 @@ def test_grouped_queries_preserve_instances_and_weight_ratios():
     assert "sum by (le)" in aggregate and "instance" not in aggregate
     assert panels["decode_context_tokens"]["unit"] == "tokens"
     assert panels["decode_context_tokens"]["title"] == "Decode batch context tokens"
-    request = panels["decode_request_context_tokens"]
-    assert request["title"] == "Decode request context length"
-    assert request["unit"] == "tokens" and request["category"] == "workload"
-    assert 'role="decode"' in request["selector"]
-    assert request["kind"] == "requests"
-    assert report.statistics_for(request) == ()
-    query = report.request_context_query(request, 100, 110)
-    assert "max_over_time(atom:decode_request_context_tokens{" in query
-    assert "request_id, sequence_id, started_at" in query
     standalone = {p["id"]: p for p in report.panels_for("standalone")}
-    assert (
-        'role="standalone"' in standalone["decode_request_context_tokens"]["selector"]
-    )
+    for phase in ("prefill", "decode"):
+        request = panels[f"{phase}_request_context_tokens"]
+        assert request["title"] == f"{phase.title()} request context length"
+        assert request["unit"] == "tokens" and request["category"] == "workload"
+        assert f'role="{phase}"' in request["selector"]
+        assert request["kind"] == "requests" and request["phase"] == phase
+        assert report.statistics_for(request) == ()
+        query = report.request_context_query(request, 100, 110)
+        assert f"max_over_time(atom:{phase}_request_context_tokens{{" in query
+        assert "request_id, sequence_id, started_at" in query
+        service = standalone[f"{phase}_request_context_tokens"]
+        assert 'role="standalone"' in service["selector"]
+        assert service["phase"] == phase
     assert panels["prefill_batch_tokens"]["metric"] == "atom:prefill_batch_tokens"
 
 
 @pytest.mark.parametrize("deployment", ["pd", "standalone"])
-def test_prefill_context_panels_use_token_histograms_and_instance_filters(deployment):
+def test_batch_context_panels_use_token_histograms_and_instance_filters(deployment):
     panels = {p["id"]: p for p in report.panels_for(deployment)}
-    role = "prefill" if deployment == "pd" else "standalone"
-    for metric, title in (
-        ("prefill_context_tokens", "Prefill batch context tokens"),
-        ("prefill_request_context_tokens", "Prefill request context tokens"),
-    ):
+    for phase in ("prefill", "decode"):
+        role = phase if deployment == "pd" else "standalone"
+        metric = f"{phase}_context_tokens"
         panel = panels[metric]
-        assert panel["title"] == title
+        assert panel["title"] == f"{phase.title()} batch context tokens"
         assert panel["category"] == "workload" and panel["unit"] == "tokens"
         assert panel["role"] == role and not panel["overview"]
         assert report.statistics_for(panel) == ("mean", "p50", "p90", "p95", "p99")
@@ -354,7 +353,10 @@ def test_request_context_uses_dispatch_times_and_deduplicates_scrapes(monkeypatc
     assert len([r for r in records if r["request_id"] == "reused-id"]) == 2
 
 
-def test_request_context_collects_per_instance_and_round_trips(monkeypatch, tmp_path):
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_request_context_collects_per_instance_and_round_trips(
+    monkeypatch, tmp_path, phase
+):
     records = [
         {
             "timestamp": 105.123,
@@ -368,11 +370,11 @@ def test_request_context_collects_per_instance_and_round_trips(monkeypatch, tmp_
     monkeypatch.setattr(report, "fetch_series", lambda *args: [[100, 1], [110, 1]])
     monkeypatch.setattr(report, "fetch_instance_series", lambda *args: {})
     data = report.generate_report("http://fixture", 100, 110, tmp_path / "report.html")
-    panel = next(p for p in data["panels"] if p.get("kind") == "requests")
+    panel = next(p for p in data["panels"] if p.get("phase") == phase)
     assert panel["records"] == records
     assert panel["instances"]["node:8020"]["records"] == records
     assert panel["series"] == {}
-    assert {"role": "decode", "instance": "node:8020"} in data["meta"]["instances"]
+    assert {"role": phase, "instance": "node:8020"} in data["meta"]["instances"]
     assert "</script><request>" not in (tmp_path / "report.html").read_text()
     panel["records"][0]["context_tokens"] = -1
     with pytest.raises(ValueError, match="context_tokens"):

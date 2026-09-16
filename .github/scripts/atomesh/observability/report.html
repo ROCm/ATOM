@@ -88,6 +88,7 @@ function setPanelScope(s){
 }
 function node(tag,cls,text){const el=document.createElement(tag);if(cls)el.className=cls;if(text!==undefined)el.textContent=text;return el;}
 function requestRecords(s){return (s.p.records||[]).filter(r=>r.timestamp>=range[0]&&r.timestamp<=range[1]);}
+function dispatchLabel(p){return p.phase==="prefill"?"First prefill":"First decode";}
 function requestTime(t){return new Date(t*1000).toISOString().slice(11,23);}
 function latest(points,t=META.end,lower=-Infinity){let result=null;for(const point of points||[])if(point[0]>=lower&&point[0]<=t&&finite(point[1]))result=point[1];return result;}
 function near(points,t){if(!points?.length)return null;let a=0,b=points.length-1;while(a<b){const m=(a+b)>>1;if(points[m][0]<t)a=m+1;else b=m;}if(a>0&&Math.abs(points[a-1][0]-t)<Math.abs(points[a][0]-t))a--;return Math.abs(points[a][0]-t)<=META.step*1.5?points[a]:null;}
@@ -97,7 +98,7 @@ $("duration-summary").textContent=fmt(timeSpan/60);$("step-summary").textContent
 $("ttft-summary").textContent=fmt(latest(states.find(s=>["mesh_ttft","api_ttft"].includes(s.p.id))?.p.series.p99));
 $("itl-summary").textContent=fmt(latest(states.find(s=>s.p.id==="decode_itl")?.p.series.p99));
 $("demo-notice").hidden=META.kind!=="demo";$("kind-badge").textContent=META.kind==="demo"?"PREVIEW":"REPORT";$("kind-badge").classList.toggle("demo",META.kind==="demo");
-$("report-note").textContent="Units are shown per chart. Latency and batch distributions summarize the preceding "+META.window+" seconds; queue depths and KV utilization are sampled states. Zoom changes the displayed time range only. Percentiles are estimated from histogram buckets; missing data remains a gap. Decode request context points are exact first-decode values, one per request; use Data table or CSV for request IDs. Prefill, Decode and Mesh measure different boundaries. Do not add their percentiles.";
+$("report-note").textContent="Units are shown per chart. Latency and batch distributions summarize the preceding "+META.window+" seconds; queue depths and KV utilization are sampled states. Zoom changes the displayed time range only. Percentiles are estimated from histogram buckets; missing data remains a gap. Request context points show full input lengths for prefill and first-decode lengths for decode, once per request; use Data table or CSV for request IDs. Prefill, Decode and Mesh measure different boundaries. Do not add their percentiles.";
 $("errors").textContent=META.notes?.length?"Report notes: "+META.notes.join("；"):"";
 const statButtons={};
 for(const k of GLOBAL_STAT_KEYS){const b=node("button","chip");b.dataset.stat=k;b.append(node("i","dot"),node("span","",LABELS[k]));b.style.setProperty("--series",COLORS[k]);b.onclick=()=>{const on=!states.every(s=>s.visible.has(k)||!(s.p.series[k]||[]).some(v=>finite(v[1])));for(const s of states)if((s.p.series[k]||[]).some(v=>finite(v[1])))on?s.visible.add(k):s.visible.delete(k);refresh();};$("stat-controls").append(b);statButtons[k]=b;}
@@ -205,7 +206,7 @@ function renderTable(s){
  updateReading(s);
  if(s.p.kind==="requests"){
   const records=requestRecords(s),table=node("table"),head=node("thead"),hr=node("tr");
-  for(const label of ["First decode · UTC","Request ID","Context · tokens","Instance","Sequence ID"])hr.append(node("th","",label));head.append(hr);table.append(head);
+  for(const label of [dispatchLabel(s.p)+" · UTC","Request ID","Context · tokens","Instance","Sequence ID"])hr.append(node("th","",label));head.append(hr);table.append(head);
   const body=node("tbody");for(const record of records){const row=node("tr");for(const value of [requestTime(record.timestamp),record.request_id,fmtCount(record.context_tokens),record.instance,record.sequence_id])row.append(node("td","",value));body.append(row);}table.append(body);s.table.replaceChildren(table);
   if(!records.length)s.table.append(node("div","nothing","No request context records in this time range"));return;
  }
@@ -233,7 +234,7 @@ function refresh(){
  let column=1;
  for(const s of orderedStates.filter(s=>!pairedStates.has(s)&&isShown(s))){s.card.style.setProperty("--panel-row",row);s.card.style.setProperty("--panel-column",column);if(column===2)row++;column=3-column;}
  for(const k of GLOBAL_STAT_KEYS){const available=states.filter(s=>(s.p.series[k]||[]).some(v=>finite(v[1])));statButtons[k].disabled=!available.length;statButtons[k].setAttribute("aria-pressed",available.length>0&&available.every(s=>s.visible.has(k)));}
- for(const s of states){s.toggle.hidden=!(matchesRole(s)&&matchesCategory(s));s.source.textContent=s.p.label+" · "+(s.role==="overall"?"Global":s.scope||"All instances");s.footLabel.textContent=(s.p.kind==="requests"?"First decode · one value per request":s.p.kind&&s.p.kind!=="cache"?"Sampled state":"Window "+META.window+" s")+" · "+(s.scope||"Pooled across instances");s.toggle.setAttribute("aria-pressed",s.enabled);s.card.hidden=!isShown(s);s.shell.hidden=view!=="chart";s.table.hidden=view!=="table";for(const k of Object.keys(s.legends)){s.legends[k].setAttribute("aria-pressed",s.visible.has(k));s.legends[k].disabled=!(s.p.series[k]||[]).some(v=>finite(v[1]));}if(isShown(s)){if(view==="table")renderTable(s);else draw(s);}}
+ for(const s of states){s.toggle.hidden=!(matchesRole(s)&&matchesCategory(s));s.source.textContent=s.p.label+" · "+(s.role==="overall"?"Global":s.scope||"All instances");s.footLabel.textContent=(s.p.kind==="requests"?dispatchLabel(s.p)+" · one value per request":s.p.kind&&s.p.kind!=="cache"?"Sampled state":"Window "+META.window+" s")+" · "+(s.scope||"Pooled across instances");s.toggle.setAttribute("aria-pressed",s.enabled);s.card.hidden=!isShown(s);s.shell.hidden=view!=="chart";s.table.hidden=view!=="table";for(const k of Object.keys(s.legends)){s.legends[k].setAttribute("aria-pressed",s.visible.has(k));s.legends[k].disabled=!(s.p.series[k]||[]).some(v=>finite(v[1]));}if(isShown(s)){if(view==="table")renderTable(s);else draw(s);}}
 }
 $("export-csv").onclick=()=>{
  const rows=[["panel","statistic","timestamp_utc","value","unit","instance","request_id","sequence_id"]];

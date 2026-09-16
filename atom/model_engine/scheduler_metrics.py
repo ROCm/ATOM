@@ -1,7 +1,8 @@
 """Scheduler-owned Prometheus observations.
 
-Only the scheduler owner updates these counters. No GPU synchronization or
-per-request labels are needed, and a scrape never consumes observations.
+Only the scheduler owner updates these metrics. Request context gauges carry
+per-request labels. No GPU synchronization is needed, and scrapes never consume
+observations.
 """
 
 from __future__ import annotations
@@ -95,13 +96,13 @@ class SchedulerMetrics:
             buckets=BATCH_CONTEXT_BUCKETS,
             registry=registry,
         ).labels(**labels)
-        self.prefill_request_context_tokens = Histogram(
+        self.prefill_request_context_tokens = Gauge(
             "atom:prefill_request_context_tokens",
-            "Logical context length per real prefill request row on each forward, including cached prefixes through the current chunk; request-forward weighted, without padding or TP multiplication.",
-            labels,
-            buckets=TOKEN_BUCKETS,
+            "Full prompt length including cached prefixes at first real prefill dispatch, once per request sequence; retained until metrics storage is cleaned.",
+            [*labels, "request_id", "sequence_id", "started_at"],
+            multiprocess_mode="max",
             registry=registry,
-        ).labels(**labels)
+        )
         self.decode_context_tokens = Histogram(
             "atom:decode_context_tokens",
             "Sum of logical decode sequence lengths per real forward, without padding or TP multiplication.",
@@ -154,6 +155,19 @@ class SchedulerMetrics:
         if timing is not None and succeeded and timing.is_pd:
             self.pd_transfer.observe(now - started)
 
+    def _record_request_context(self, metric, req_id, seq, tokens):
+        # Retain completed requests so a scrape can still see short requests.
+        metric.labels(
+            **self._labels,
+            request_id=(
+                getattr(seq, "external_request_id", None)
+                or getattr(seq, "parent_request_id", None)
+                or str(req_id)
+            ),
+            sequence_id=str(req_id),
+            started_at=str(time.time()),
+        ).set(int(tokens))
+
     def record_forward(self, batch, seqs) -> None:
         if batch.is_dummy_run or not batch.req_ids:
             return
@@ -172,19 +186,11 @@ class SchedulerMetrics:
                 and context_lens is not None
                 and not timing.decode_context_observed
             ):
-                # The marker survives preemption. Retain the sample after the
-                # request completes so a scrape can still see short requests.
+                # The marker survives preemption.
                 timing.decode_context_observed = True
-                self.decode_request_context_tokens.labels(
-                    **self._labels,
-                    request_id=(
-                        getattr(seq, "external_request_id", None)
-                        or getattr(seq, "parent_request_id", None)
-                        or str(req_id)
-                    ),
-                    sequence_id=str(req_id),
-                    started_at=str(time.time()),
-                ).set(int(context_lens[i]))
+                self._record_request_context(
+                    self.decode_request_context_tokens, req_id, seq, context_lens[i]
+                )
         # Count real request rows, not MTP tokens or a padded graph size.
         if batch.total_seqs_num_decode > 0:
             self.decode_batch_size.observe(batch.total_seqs_num_decode)
@@ -198,21 +204,34 @@ class SchedulerMetrics:
                 )
         if getattr(batch, "total_seqs_num_prefill", 0) > 0:
             self.prefill_batch_tokens.observe(batch.total_tokens_num_prefill)
-            context_lens = getattr(batch, "context_lens", None)
-            total_context = 0
-            # ScheduledBatch packs decode rows before prefill rows. Use its
-            # immutable offsets: scheduling may already have advanced the seq.
+            # ScheduledBatch packs decode rows before prefill rows.
             for i in range(batch.total_seqs_num_decode, len(batch.req_ids)):
-                if context_lens is not None:
-                    tokens = int(context_lens[i])
-                    self.prefill_request_context_tokens.observe(tokens)
-                    total_context += tokens
-                seq = seqs[batch.req_ids[i]]
+                req_id = batch.req_ids[i]
+                seq = seqs[req_id]
                 timing = getattr(seq, "queue_timing", None)
                 if timing is not None and not timing.prefill_observed:
                     self.prefill_request_tokens.observe(
                         max(0, seq.num_prompt_tokens - batch.num_cached_tokens[i])
                     )
+                    # Full input length, independent of chunk size or prefix
+                    # reuse. The same marker survives chunks and preemption.
+                    self._record_request_context(
+                        self.prefill_request_context_tokens,
+                        req_id,
+                        seq,
+                        seq.num_prompt_tokens,
+                    )
                     timing.prefill_observed = True
             if context_lens is not None:
-                self.prefill_context_tokens.observe(total_context)
+                # Batch context still uses immutable chunk ends, including
+                # cached prefixes and excluding decode rows and graph padding.
+                self.prefill_context_tokens.observe(
+                    int(
+                        np.sum(
+                            context_lens[
+                                batch.total_seqs_num_decode : len(batch.req_ids)
+                            ],
+                            dtype=np.int64,
+                        )
+                    )
+                )

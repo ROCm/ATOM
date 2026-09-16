@@ -240,31 +240,19 @@ def panels_for(deployment: str) -> list[dict]:
                 "scale": 1,
             }
         )
-    for metric, title, detail in (
-        (
-            "prefill_context_tokens",
-            "Prefill batch context tokens",
-            "Sum of logical prefill contexts through the current chunk · includes cached prefixes · excludes decode rows and padding",
-        ),
-        (
-            "prefill_request_context_tokens",
-            "Prefill request context tokens",
-            "Logical context per request on every prefill forward · cached prefix + current chunk · request-forward weighted",
-        ),
-    ):
-        panels.append(
-            {
-                "id": metric,
-                "role": role,
-                "title": title,
-                "label": f"{role.upper()} · WORKLOAD",
-                "detail": detail,
-                "metric": f"atom:{metric}",
-                "selector": f'job="atom",role="{role}"',
-                "unit": "tokens",
-                "scale": 1,
-            }
-        )
+    panels.append(
+        {
+            "id": "prefill_context_tokens",
+            "role": role,
+            "title": "Prefill batch context tokens",
+            "label": f"{role.upper()} · WORKLOAD",
+            "detail": "Sum of logical prefill contexts through the current chunk · includes cached prefixes · excludes decode rows and padding",
+            "metric": "atom:prefill_context_tokens",
+            "selector": f'job="atom",role="{role}"',
+            "unit": "tokens",
+            "scale": 1,
+        }
+    )
     role = roles[-1]
     panels.append(
         {
@@ -279,21 +267,34 @@ def panels_for(deployment: str) -> list[dict]:
             "scale": 1,
         }
     )
-    panels.append(
-        {
-            "id": "decode_request_context_tokens",
-            "role": role,
-            "title": "Decode request context length",
-            "label": f"{role.upper()} · WORKLOAD",
-            "detail": "One exact value per request at its first real decode dispatch · hover for request ID · no repeated samples after preemption",
-            "kind": "requests",
-            "metric": "atom:decode_request_context_tokens",
-            "records": [],
-            "selector": f'job="atom",role="{role}"',
-            "unit": "tokens",
-            "scale": 1,
-        }
-    )
+    for phase, role, detail in (
+        (
+            "prefill",
+            roles[0],
+            "Full input length including cached prefixes · once per request at first real prefill dispatch · independent of chunk size",
+        ),
+        (
+            "decode",
+            roles[-1],
+            "One exact value per request at its first real decode dispatch · hover for request ID · no repeated samples after preemption",
+        ),
+    ):
+        panels.append(
+            {
+                "id": f"{phase}_request_context_tokens",
+                "role": role,
+                "title": f"{phase.title()} request context length",
+                "label": f"{role.upper()} · WORKLOAD",
+                "detail": detail,
+                "kind": "requests",
+                "phase": phase,
+                "metric": f"atom:{phase}_request_context_tokens",
+                "records": [],
+                "selector": f'job="atom",role="{role}"',
+                "unit": "tokens",
+                "scale": 1,
+            }
+        )
     for panel in panels:
         match = re.search(r'role="([^"]+)"', panel["selector"])
         panel.setdefault("role", match[1] if match else "overall")
@@ -470,7 +471,7 @@ def validate_request_context(record):
 
 def request_context_query(panel, start, end):
     # Include every scrape in the run, even if a short-lived server disappeared
-    # between report points. started_at labels identify actual dispatch times.
+    # between report points. started_at labels identify the phase's first dispatch.
     window_ms = max(1, math.ceil((end - start) * 1000))
     return (
         "max by (instance, request_id, sequence_id, started_at) ("
