@@ -319,6 +319,8 @@ class Qwen4ExpAttention(nn.Module):
             qsa.compressed_slot_mapping,
             self.indexer.compress_ratio,
             position_cache=self.rope_position_cache,
+            # Draft RoPE is one ahead of its logical cache slots.
+            rope_position_offset=int(get_forward_context().context.is_draft),
         )
         normalized = self.indexer.normalize_compressed_keys(pooled, first_positions)
         qsa_store_rows(

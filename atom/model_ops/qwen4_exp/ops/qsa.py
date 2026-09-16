@@ -403,6 +403,7 @@ def _qsa_compress_groups_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
     LOAD_POSITIONS: tl.constexpr,
+    ROPE_POSITION_OFFSET: tl.constexpr,
 ) -> None:
     """Mean-pool the group that ends at each token, reading the paged raw cache."""
     row = tl.program_id(0)
@@ -482,7 +483,7 @@ def _qsa_compress_groups_kernel(
             mask=(row < num_rows) & (axes < 3),
         )
     else:
-        first_position = tl.where(valid_row, first_position, 0)
+        first_position = tl.where(valid_row, first_position + ROPE_POSITION_OFFSET, 0)
         tl.store(
             first_positions_ptr + row * stride_first_row + axes * stride_first_axis,
             first_position,
@@ -498,6 +499,7 @@ def qsa_compress_groups(
     compressed_slots: torch.Tensor,
     compress_ratio: int,
     position_cache: torch.Tensor | None = None,
+    rope_position_offset: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pool the group closed by each token; return `(pooled, first_positions)`.
 
@@ -506,6 +508,8 @@ def qsa_compress_groups(
     the same mapping, so junk rows are never written. `first_positions` is
     `[rows, 3]` int64 -- three identical linear positions for a text model, the
     cached mRoPE axes when `position_cache` is supplied.
+    Without that cache, `rope_position_offset` shifts only RoPE coordinates,
+    not the logical positions used to address and group keys.
     """
     if raw_key_cache.ndim != 4 or raw_key_cache.shape[2] != 1:
         raise ValueError("raw_key_cache must be [pages, page_size, 1, head_dim]")
@@ -561,6 +565,7 @@ def qsa_compress_groups(
         HEAD_DIM=head_dim,
         BLOCK_D=triton.next_power_of_2(head_dim),
         LOAD_POSITIONS=load_positions,
+        ROPE_POSITION_OFFSET=0 if load_positions else rope_position_offset,
         num_warps=4,
     )
     return pooled, first_positions

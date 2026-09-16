@@ -12,10 +12,185 @@ pytest.importorskip("aiter.ops.enum", exc_type=ImportError)
 
 from atom.model_ops.qwen4_exp.ops.ple import advance_ngram_state, dilated_causal_conv1d
 from atom.model_ops.qwen4_exp.ops.qsa import (
+    qsa_apply_mrope,
+    qsa_compressed_slots,
     qsa_draft_decode_metadata,
     qsa_select_paged_tokens,
     qsa_sparse_paged_gqa,
 )
+
+
+@pytest.fixture
+def qsa_rope():
+    from atom.model_ops.qwen4_exp.qsa_attention import build_qwen4_exp_rope
+
+    config = SimpleNamespace(
+        head_dim=256,
+        max_position_embeddings=8192,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 10000000.0,
+            "partial_rotary_factor": 0.25,
+            "mrope_section": [11, 11, 10],
+            "mrope_interleaved": True,
+        },
+    )
+    return build_qwen4_exp_rope(config, 128).to("cuda")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize("tokens", [1, 2, 4])
+@pytest.mark.parametrize("padding", [0, 5])
+@pytest.mark.parametrize("mrope", [False, True])
+def test_middle_prefill_draft_preserves_position_axes(
+    monkeypatch, qsa_rope, tokens, padding, mrope
+):
+    from atom.spec_decode import eagle_proposer
+
+    device = "cuda"
+    positions = torch.arange(tokens + padding, device=device) + 16
+    if mrope:
+        positions = (
+            positions[None, :] + torch.tensor([0, 20, 40], device=device)[:, None]
+        )
+    original_positions = positions.clone()
+    hidden = torch.randn(tokens, 4, 128, device=device, dtype=torch.bfloat16)
+    expected_positions = positions[..., :tokens] + 1
+    expected_q, _ = qsa_apply_mrope(qsa_rope, expected_positions, hidden)
+    anchor = torch.tensor([99], device=device)
+    context = SimpleNamespace(
+        scheduled_bs=1, is_draft=False, draft_anchor_overrides=anchor
+    )
+    monkeypatch.setattr(
+        eagle_proposer, "get_forward_context", lambda: SimpleNamespace(context=context)
+    )
+    monkeypatch.setattr(eagle_proposer, "_pcp_active_for_draft_model", lambda _: False)
+    seen = []
+
+    def draft_model(input_ids, positions, hidden_states):
+        assert context.is_draft
+        torch.testing.assert_close(positions, expected_positions)
+        torch.testing.assert_close(input_ids[-1:], anchor)
+        actual_q, _ = qsa_apply_mrope(qsa_rope, positions, hidden_states)
+        torch.testing.assert_close(actual_q, expected_q, rtol=0, atol=0)
+        seen.append(True)
+
+    drafter = SimpleNamespace(
+        model=draft_model,
+        prepare_inputs=lambda _: torch.tensor([tokens - 1], device=device),
+        aux_for=lambda _: None,
+        runner=SimpleNamespace(
+            tokenID_processor=SimpleNamespace(
+                input_ids=SimpleNamespace(gpu=torch.arange(tokens + 1, device=device))
+            )
+        ),
+    )
+    eagle_proposer.EagleProposer.compute_draft_kv(drafter, positions, hidden, [99])
+    assert seen == [True]
+    assert not context.is_draft
+    torch.testing.assert_close(positions, original_positions)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize("is_draft", [False, True])
+@pytest.mark.parametrize("k", [1, 2, 3])
+@torch.inference_mode()
+def test_qsa_rope_cache_matches_implicit_positions(monkeypatch, qsa_rope, is_draft, k):
+    from atom.model_ops.layernorm import GemmaRMSNorm
+    from atom.model_ops.qwen4_exp import qsa_attention
+
+    torch.manual_seed(2026)
+    device, block, ratio, pages = "cuda", 16, 4, 258
+    indexer = qsa_attention.Qwen4ExpIndexer.__new__(qsa_attention.Qwen4ExpIndexer)
+    torch.nn.Module.__init__(indexer)
+    indexer.index_n_heads, indexer.index_kv_heads, indexer.index_head_dim = 4, 1, 128
+    indexer.token_topk, indexer.compress_ratio = 2048, ratio
+    indexer.rotary_emb = qsa_rope
+    indexer.q_layernorm = GemmaRMSNorm(128).to(device=device, dtype=torch.bfloat16)
+    indexer.k_layernorm = GemmaRMSNorm(128).to(device=device, dtype=torch.bfloat16)
+    # Supply packed projection output; exercise the real norm/RoPE/cache/selection.
+    indexer.index_qk_proj = lambda hidden, otype: hidden
+    monkeypatch.setattr(
+        qsa_attention,
+        "get_forward_context",
+        lambda: SimpleNamespace(context=SimpleNamespace(is_draft=is_draft)),
+    )
+    layers = [
+        SimpleNamespace(
+            indexer=indexer,
+            raw_key_cache=torch.zeros(
+                pages, block, 1, 128, device=device, dtype=torch.bfloat16
+            ),
+            compressed_key_cache=torch.zeros(
+                pages, block // ratio, 1, 128, device=device, dtype=torch.bfloat16
+            ),
+            rope_position_cache=(
+                torch.zeros(pages, block, 1, 3, device=device, dtype=torch.int64)
+                if cached
+                else None
+            ),
+        )
+        for cached in (False, True)
+    ]
+    tables = torch.randperm(pages, device=device).to(torch.int32)[None]
+    start = 0
+    # Short middle chunks cross a group/page; later rows exceed the 512-group
+    # budget, then exercise a verification-width pass and single-token drafts.
+    for count in (15, 2, 1, 4075, k + 1, 1, 1):
+        logical = torch.arange(start, start + count, device=device)
+        slots = tables[0, logical // block].long() * block + logical % block
+        positions = (logical + int(is_draft))[None].expand(3, -1)
+        logical = torch.cat((logical, logical.new_full((2,), -1)))
+        slots = torch.cat((slots, slots.new_full((2,), -1)))
+        positions = torch.cat((positions, positions.new_zeros((3, 2))), dim=1)
+        requests = torch.zeros(count + 2, device=device, dtype=torch.int32)
+        requests[-2:] = -1
+        compressed = torch.empty_like(slots)
+        qsa_compressed_slots(slots, logical, ratio, compressed)
+        metadata = SimpleNamespace(
+            block_tables=tables,
+            token_to_req=requests,
+            logical_positions=logical,
+            slot_mapping=slots,
+            compressed_slot_mapping=compressed,
+            seq_lens=torch.tensor([start + count], device=device, dtype=torch.int32),
+            max_seq_len=start + count,
+        )
+        originals = [x.clone() for x in (logical, slots, compressed)]
+        hidden = torch.randn(count + 2, 640, device=device, dtype=torch.bfloat16)
+        selected = [
+            qsa_attention.Qwen4ExpAttention._select_tokens(
+                layer, hidden, positions, metadata
+            )
+            for layer in layers
+        ]
+        torch.testing.assert_close(selected[0], selected[1], rtol=0, atol=0)
+        assert (selected[0][-2:] == -1).all()
+        for name in ("raw_key_cache", "compressed_key_cache"):
+            torch.testing.assert_close(
+                getattr(layers[0], name), getattr(layers[1], name), rtol=0, atol=0
+            )
+        for actual, expected in zip((logical, slots, compressed), originals):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        start += count
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = [
+            qsa_attention.Qwen4ExpAttention._select_tokens(
+                layer, hidden, positions, metadata
+            )
+            for layer in layers
+        ]
+    for _ in range(3):
+        hidden.normal_()
+        graph.replay()
+        for layer, actual in zip(layers, captured):
+            expected = qsa_attention.Qwen4ExpAttention._select_tokens(
+                layer, hidden, positions, metadata
+            )
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(captured[0], captured[1], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("k", [0, 1, 2, 3])
