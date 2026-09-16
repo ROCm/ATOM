@@ -155,6 +155,11 @@ class ConnectorCompletion:
 # token-contiguous, while producer preshuffled DSA index bytes require staging.
 MLA_KV_ROLE = "mla.kv"
 INDEX_CACHE_ROLE = "dsa.index_cache"
+# FP4 splits the DSv4 CSA indexer into two PAGE regions -- packed data and
+# e8m0 scales -- whose roles share this prefix. The names themselves are minted
+# by DeepseekV4AttentionMetadataBuilder._indexer_page_pools; a transport only
+# needs the prefix to tell the layout apart from the single-region FP8 one.
+INDEX_CACHE_FP4_PREFIX = "dsv4.csa_indexer.fp4_"
 # Producer gather callbacks need one staging slot per concurrent send worker.
 # Mooncake and attention-pool allocation share this fallback so their defaults
 # cannot drift independently.

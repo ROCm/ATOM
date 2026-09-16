@@ -14,7 +14,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from atom.kv_transfer.disaggregation.types import KVTransferRegion, KVTransferTensors
+from atom.kv_transfer.disaggregation.types import (
+    INDEX_CACHE_FP4_PREFIX,
+    KVTransferRegion,
+    KVTransferTensors,
+)
 from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
@@ -739,6 +743,11 @@ def _fp4_pd_pair(builder_cls, writer, kv_dtype="fp8", coalesce=False):
     conn = SimpleNamespace(
         _block_regions=[(r.base_addr, r.unit_bytes) for r in src.block_regions],
         _block_region_roles=[r.semantic_role for r in src.block_regions],
+        _fp4_index_layout=any(
+            r.semantic_role is not None
+            and r.semantic_role.startswith(INDEX_CACHE_FP4_PREFIX)
+            for r in src.block_regions
+        ),
         _block_region_consumer_indices=None,
         _block_mr_ends=[[r.total_bytes] for r in src.block_regions],
         _swa_block_regions=src.swa_block_regions,
@@ -755,7 +764,7 @@ def _fp4_pd_pair(builder_cls, writer, kv_dtype="fp8", coalesce=False):
     req = {
         "consumer_block_base_addrs": [r.base_addr for r in dst.block_regions],
         "consumer_block_bpb": [r.unit_bytes for r in dst.block_regions],
-        "consumer_block_roles": [r.semantic_role for r in dst.block_regions],
+        "consumer_region_roles": [r.semantic_role for r in dst.block_regions],
         "consumer_block_mr_ends": [[r.total_bytes] for r in dst.block_regions],
         "consumer_slot_base_addrs": [],
         "consumer_slot_bps": [],
@@ -828,18 +837,18 @@ def test_fp4_pd_layout_mismatch_fails_before_any_write(
 ):
     owners, _src, _dst, conn, req = _fp4_pd_pair(v4_builder_cls, mooncake_page_writer)
     if mismatch == "missing_roles":
-        req.pop("consumer_block_roles")
+        req.pop("consumer_region_roles")
     elif mismatch == "missing_scale":
         for key in (
             "consumer_block_base_addrs",
             "consumer_block_bpb",
-            "consumer_block_roles",
+            "consumer_region_roles",
         ):
             req[key].pop()
     elif mismatch == "scale_width":
         req["consumer_block_bpb"][-1] *= 2
     elif mismatch == "swapped_layers":
-        roles = req["consumer_block_roles"]
+        roles = req["consumer_region_roles"]
         roles[-1], roles[-2] = roles[-2], roles[-1]
     else:
         fp8_builder = _transfer_builder(
@@ -852,14 +861,17 @@ def test_fp4_pd_layout_mismatch_fails_before_any_write(
         if mismatch == "fp8_consumer":
             req["consumer_block_base_addrs"] = [r.base_addr for r in regions]
             req["consumer_block_bpb"] = [r.unit_bytes for r in regions]
-            req["consumer_block_roles"] = [r.semantic_role for r in regions]
+            req["consumer_region_roles"] = [r.semantic_role for r in regions]
         else:
             conn._block_regions = [(r.base_addr, r.unit_bytes) for r in regions]
             conn._block_region_roles = [r.semantic_role for r in regions]
 
     calls = []
     conn._rdma_write_with_retry = lambda *args: calls.append(args) or True
-    with pytest.raises(RuntimeError, match="layout mismatch|Cannot layer-map"):
+    with pytest.raises(
+        RuntimeError,
+        match="mismatch|out of range|disagree|requires the consumer|Cannot layer-map",
+    ):
         conn._execute_block_slot_transfer(
             req, "test", [0], [1], {"slot_index": -1, "swa_block_ids": [1]}, "fp4"
         )

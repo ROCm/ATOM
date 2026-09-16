@@ -45,6 +45,7 @@ from atom.kv_transfer.disaggregation.sharded_transfer import (
 )
 from atom.kv_transfer.disaggregation.types import (
     DEFAULT_SHARDED_STAGING_WORKERS,
+    INDEX_CACHE_FP4_PREFIX,
     INDEX_CACHE_ROLE,
     MLA_KV_ROLE,
     ConnectorMetadata,
@@ -155,6 +156,11 @@ def _configure_mooncake_transport(protocol: str) -> None:
 
 # ZMQ side-channel message types
 MSG_WRITE_REQUEST = b"write_request"
+# Layout-versioned variant. FP4 registers the DSv4 indexer as two PAGE
+# regions instead of one, so a producer that predates that layout would map
+# the plan onto the wrong regions. Tagging the request makes such a producer
+# reject it as an unknown message type rather than write mismatched bytes.
+MSG_WRITE_REQUEST_FP4 = b"write_request_fp4"
 MSG_WRITE_DONE = b"write_done"
 MSG_GET_META = b"get_meta"
 # PP-prefill only: consumer tells stage-0 a request's KV is fully received from
@@ -651,6 +657,7 @@ class MooncakeConnector(KVConnectorBase):
         self.kv_caches_base_addr: list[int] = []
         self._per_block_bytes_list: list[int] = []
         self._block_region_roles: list[str | None] = []
+        self._fp4_index_layout: bool = False
         self.kv_cache_shape: tuple[int, ...] | None = None
         self.block_len: int = config.kv_cache_block_size
         self.num_blocks: int = 0
@@ -660,7 +667,6 @@ class MooncakeConnector(KVConnectorBase):
         self._has_slot_regions: bool = False
         # (base_addr, bytes_per_block) per region
         self._block_regions: list[tuple[int, int]] = []
-        self._block_region_roles: list[str] = []
         self._block_region_consumer_indices: list[int] | None = None
         # Sliding-window regions, keyed by the request's state slot (not by the
         # compressed block_table above). Kept whole rather than as
@@ -849,6 +855,10 @@ class MooncakeConnector(KVConnectorBase):
         self.kv_caches_base_addr = [r.base_addr for r in tt.block_regions]
         self._per_block_bytes_list = [r.unit_bytes for r in tt.block_regions]
         self._block_region_roles = [r.semantic_role for r in tt.block_regions]
+        self._fp4_index_layout = any(
+            role is not None and role.startswith(INDEX_CACHE_FP4_PREFIX)
+            for role in self._block_region_roles
+        )
         if (
             not self.is_producer
             and self.dcp_size > 1
@@ -1129,7 +1139,7 @@ class MooncakeConnector(KVConnectorBase):
                             b for b, _ in self._block_regions
                         ],
                         "consumer_block_bpb": [bpb for _, bpb in self._block_regions],
-                        "consumer_block_roles": self._block_region_roles,
+                        "consumer_region_roles": self._block_region_roles,
                         # SWA ring, keyed by state slot. The whole region
                         # travels, not just its base: a reverse-indexed one
                         # needs its extent to place slot 0.
@@ -1168,7 +1178,12 @@ class MooncakeConnector(KVConnectorBase):
                             meta.transfer_id,
                             self.tp_size,
                         )
-                self._send_on_socket(remote_addr, [MSG_WRITE_REQUEST, write_request])
+                write_msg = (
+                    MSG_WRITE_REQUEST_FP4
+                    if self._fp4_index_layout
+                    else MSG_WRITE_REQUEST
+                )
+                self._send_on_socket(remote_addr, [write_msg, write_request])
                 logger.debug(
                     "[CONSUMER] write_request sent for req %s (transfer_id=%s) "
                     "to stage %d/%d at %s, off=%d, dst_block_ids=%s",
@@ -1284,7 +1299,7 @@ class MooncakeConnector(KVConnectorBase):
                     sock.send_multipart([identity, b"", encoded])
                     logger.debug("Sent metadata to peer")
 
-                elif msg_type == MSG_WRITE_REQUEST:
+                elif msg_type in (MSG_WRITE_REQUEST, MSG_WRITE_REQUEST_FP4):
                     request_data = msgpack.loads(parts[2])
                     logger.debug(
                         "[PRODUCER] Received write_request for req %s "
@@ -1898,33 +1913,54 @@ class MooncakeConnector(KVConnectorBase):
             request_data.get("consumer_num_layers"),
             self._block_region_consumer_indices,
         )
-        # FP4 data and e8m0 scales are distinct PAGE regions. Validate before
-        # any RDMA write; older FP8 peers may omit roles, but FP4 peers must
-        # advertise the complete layout, including each layer's scale pool.
-        local_roles = getattr(self, "_block_region_roles", [])
-        remote_roles = request_data.get("consumer_block_roles", [])
-        if any(
-            role and role.startswith("dsv4.csa_indexer.fp4_")
-            for role in [*local_roles, *remote_roles]
-        ) and (
-            len(local_roles) != len(self._block_regions)
-            or len(local_roles) != len(remote_roles)
-            or len(remote_roles) != len(consumer_block_addrs)
-            or len(consumer_block_bpb) != len(consumer_block_addrs)
-            or any(
-                not 0 <= cidx < len(remote_roles)
-                or local_roles[i] != remote_roles[cidx]
-                or self._block_regions[i][1] != consumer_block_bpb[cidx]
-                for i, cidx in enumerate(block_cmap)
-            )
+        # The plan comes from this stage's region order but the bytes land at
+        # block_cmap[region_idx], and equal region counts do not make the two
+        # orders match. Validate both semantic role and physical width so an
+        # incompatible layout fails before any RDMA write instead of silently
+        # corrupting KV: FP4 splits the indexer into separate packed-data and
+        # e8m0 scale regions, so a mismapped plan is otherwise invisible.
+        consumer_roles = request_data.get("consumer_region_roles")
+        n_consumer = len(consumer_block_addrs)
+        if len(block_cmap) != len(self._block_regions) or any(
+            not 0 <= cidx < n_consumer for cidx in block_cmap
         ):
             raise RuntimeError(
-                "FP4 index PAGE layout mismatch: producer and consumer must "
-                "advertise matching data/scale roles and block byte widths"
+                f"Region map out of range for req {req_id}: {len(block_cmap)} "
+                f"mapped indices for {len(self._block_regions)} local regions "
+                f"onto {n_consumer} consumer regions"
+            )
+        if len(consumer_block_bpb) != n_consumer or (
+            consumer_roles is not None and len(consumer_roles) != n_consumer
+        ):
+            raise RuntimeError(
+                f"Consumer region arrays disagree for req {req_id}: "
+                f"{n_consumer} base addresses, {len(consumer_block_bpb)} byte "
+                f"widths, "
+                f"{len(consumer_roles) if consumer_roles is not None else 'no'} "
+                "roles"
+            )
+        if self._fp4_index_layout and consumer_roles is None:
+            raise RuntimeError(
+                f"FP4 index layout requires the consumer to advertise region "
+                f"roles, but req {req_id} carries none; the peer predates the "
+                "two-region indexer layout"
             )
         for region_idx, (src_base, bpb) in enumerate(self._block_regions):
             cidx = block_cmap[region_idx]
             dst_base = consumer_block_addrs[cidx]
+            role = self._block_region_roles[region_idx]
+            if consumer_roles is not None and consumer_roles[cidx] != role:
+                raise RuntimeError(
+                    f"Region role mismatch for req {req_id}: local region "
+                    f"{region_idx} is {role!r}, but consumer region "
+                    f"{cidx} is {consumer_roles[cidx]!r}"
+                )
+            if consumer_block_bpb[cidx] != bpb:
+                raise RuntimeError(
+                    f"Region byte-size mismatch for req {req_id}: producer "
+                    f"region {region_idx} has {bpb}, consumer region "
+                    f"{cidx} has {consumer_block_bpb[cidx]}"
+                )
             for sb, db in zip(src_block_ids, dst_block_ids):
                 block_src.append(src_base + sb * bpb)
                 block_dst.append(dst_base + db * consumer_block_bpb[cidx])
@@ -2272,7 +2308,15 @@ class MooncakeConnector(KVConnectorBase):
                 self._pending_recv_nonce.pop(req_id, None)
 
         if failed:
-            self._pending_recv_slots.pop(req_id, None)
+            # Return the staging row to the pool. The scatter is deliberately
+            # skipped -- the bytes never landed -- but the row itself must not
+            # leak, or _acquire_staging_slot() blocks forever once the pool is
+            # exhausted by repeated failures.
+            slot_info = self._pending_recv_slots.pop(req_id, None)
+            if slot_info is not None:
+                _, pool_idx = slot_info
+                if pool_idx >= 0:
+                    self._release_staging_slot(pool_idx)
             self._pending_recv_blocks.pop(req_id, None)
             with self._completion_lock:
                 self.failed_recving.add(req_id)
