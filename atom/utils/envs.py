@@ -155,6 +155,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_AITER_FP8_PREFILL_ATTN": lambda: (
         os.getenv("ATOM_AITER_FP8_PREFILL_ATTN", "1") == "1"
     ),
+    # Pack mHC fn weights once after loading and use BF16 hi/lo computation.
+    # Set to 0 before model loading to retain FP32 fn and FP32 mHC computation.
+    "ATOM_MHC_USE_BF16": lambda: os.getenv("ATOM_MHC_USE_BF16", "1") == "1",
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
     # flydsl drop-in for V4-Pro Compressor (Main BF16 + Indexer FP8) paths.
@@ -451,6 +454,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Force Triton attention fallbacks where available. Set to 1 to bypass
     # optional ASM/OPUS fast paths during debugging.
     "ATOM_FORCE_ATTN_TRITON": lambda: (os.getenv("ATOM_FORCE_ATTN_TRITON", "0") == "1"),
+    # Force the OPUS kernel for DeepSeek-V4 fp8 sparse prefill instead of the
+    # aiter asm kernel (`mla_sparse_prefill_fp8_asm`, the default). Escape hatch
+    # for the asm path; that kernel is gfx1250-only and hard-requires H == 128,
+    # so smaller local head counts fall back to OPUS regardless of this flag.
+    "ATOM_FORCE_V4_PREFILL_OPUS": lambda: (
+        os.getenv("ATOM_FORCE_V4_PREFILL_OPUS", "0") == "1"
+    ),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
