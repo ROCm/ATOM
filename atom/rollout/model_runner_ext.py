@@ -4,6 +4,7 @@
 import inspect
 import logging
 import os
+from contextlib import nullcontext
 from typing import Optional
 
 import numpy as np
@@ -238,30 +239,32 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
         context = forward_context.context
 
         if context.is_prefill:
-            positions = context.positions
-            if getattr(self, "_use_hook_capture", False):
-                self._hook_captured_hidden_states = {}
-                self._hook_capture_enabled = True
-                try:
-                    hidden_states = self.model(input_ids, positions)
-                finally:
-                    self._hook_capture_enabled = False
-                captured = self._hook_captured_hidden_states
-            else:
-                result = self.model(
-                    input_ids,
-                    positions,
-                    capture_hidden_state_layers=self._aux_layer_ids,
-                )
-                if isinstance(result, tuple):
-                    hidden_states, captured = result
+            metrics = self.gpu_forward_metrics
+            with metrics.measure(batch) if metrics is not None else nullcontext():
+                positions = context.positions
+                if getattr(self, "_use_hook_capture", False):
+                    self._hook_captured_hidden_states = {}
+                    self._hook_capture_enabled = True
+                    try:
+                        hidden_states = self.model(input_ids, positions)
+                    finally:
+                        self._hook_capture_enabled = False
+                    captured = self._hook_captured_hidden_states
                 else:
-                    hidden_states = result
-                    captured = {}
-            logits = self.model.compute_logits(hidden_states)
-            self._captured_hidden_states = captured
-            self._captured_last_hidden_states = hidden_states.detach()
-            return logits, hidden_states
+                    result = self.model(
+                        input_ids,
+                        positions,
+                        capture_hidden_state_layers=self._aux_layer_ids,
+                    )
+                    if isinstance(result, tuple):
+                        hidden_states, captured = result
+                    else:
+                        hidden_states = result
+                        captured = {}
+                logits = self.model.compute_logits(hidden_states)
+                self._captured_hidden_states = captured
+                self._captured_last_hidden_states = hidden_states.detach()
+                return logits, hidden_states
 
         return super().run_model(input_ids, batch)
 
