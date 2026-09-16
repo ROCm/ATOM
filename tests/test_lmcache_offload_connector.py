@@ -1032,6 +1032,155 @@ def test_dense_codec_rejects_per_request_state_by_default():
     assert codec.num_blocks == 6
 
 
+# --- FP4 sparse indexer: the index region is two planes -------------------
+#
+# `--index_cache_dtype fp4` stores the indexer keys as packed E2M1 plus a
+# separate e8m0 exponent plane (`mla_kv_pool.py` declares both). A codec that
+# moves the keys without the exponents restores a prefix whose every index is
+# still in bounds and whose scoring is wrong -- so these pin that both planes
+# are in the moved bytes, not just that registration succeeded.
+
+_FP4_ROWS = 64  # FP4_KV_BLOCK_SIZE
+_FP4_K_TILES = 1  # index_head_dim 128 // _K_TILE 128
+_FP4_NTPW = 4
+
+
+def _fp4_index_kv_caches(torch, num_blocks, *, with_scale=True):
+    """One DSA layer shaped like the FP4 pool's two index planes.
+
+    Shapes follow `fp4_index_block_shapes(64, 128)`: data
+    `(k_tiles, 4, rows, 16)` and scale `(k_tiles, 4, rows)`, both uint8, with
+    the pool's block axis outermost.
+    """
+    gen = torch.arange
+    kv = (gen(num_blocks * _FP4_ROWS * 16, dtype=torch.uint8) % 251).reshape(
+        num_blocks, _FP4_ROWS, 16
+    )
+    index = (
+        gen(num_blocks * _FP4_K_TILES * _FP4_NTPW * _FP4_ROWS * 16, dtype=torch.uint8)
+        % 241
+    ).reshape(num_blocks, _FP4_K_TILES, _FP4_NTPW, _FP4_ROWS, 16)
+    scale = (
+        gen(num_blocks * _FP4_K_TILES * _FP4_NTPW * _FP4_ROWS, dtype=torch.uint8) % 239
+        + 3
+    ).reshape(num_blocks, _FP4_K_TILES, _FP4_NTPW, _FP4_ROWS)
+    return {
+        "l0": SimpleNamespace(
+            k_cache=kv,
+            v_cache=None,
+            k_scale=None,
+            v_scale=None,
+            index_cache=index,
+            index_scale=scale if with_scale else None,
+        )
+    }
+
+
+def test_dense_codec_moves_the_fp4_index_scale_plane():
+    """A store/restore cycle must bring the e8m0 plane back with the keys.
+
+    The planes are zeroed between pack and unpack because that is what the
+    cycle this codec serves actually does to them -- the blocks are freed and
+    handed to another request before the restore. Asserting round-trip
+    equality without the zeroing would pass on a codec that never moved the
+    scale plane at all: it would simply still be holding its original bytes.
+    """
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    num_blocks = 4
+    original = _fp4_index_kv_caches(torch, num_blocks)
+    kv_caches = {
+        "l0": SimpleNamespace(
+            k_cache=original["l0"].k_cache.clone(),
+            v_cache=None,
+            k_scale=None,
+            v_scale=None,
+            index_cache=original["l0"].index_cache.clone(),
+            index_scale=original["l0"].index_scale.clone(),
+        )
+    }
+
+    codec = DenseKVByteCodec(kv_caches)
+
+    # Three planes move, not two, and the block price counts all three.
+    assert len(codec._segments) == 3
+    assert codec.num_blocks == num_blocks
+    assert codec.bytes_per_block == sum(
+        t.numel() // num_blocks
+        for t in (
+            kv_caches["l0"].k_cache,
+            kv_caches["l0"].index_cache,
+            kv_caches["l0"].index_scale,
+        )
+    )
+
+    _install_fake_fused_chunk_major(codec)
+    block_ids = list(range(num_blocks))
+    device_buf = torch.empty(
+        codec.bytes_per_block * num_blocks, dtype=torch.uint8, device=codec.device
+    )
+    codec.gpu_to_chunk_major_device_buffer(device_buf, [block_ids])
+
+    # The blocks are reused by someone else before the restore.
+    for plane in ("k_cache", "index_cache", "index_scale"):
+        getattr(kv_caches["l0"], plane).zero_()
+
+    codec.chunk_major_device_buffer_to_gpu(device_buf, [block_ids])
+
+    for plane in ("k_cache", "index_cache", "index_scale"):
+        assert torch.equal(
+            getattr(kv_caches["l0"], plane), getattr(original["l0"], plane)
+        ), f"{plane} did not survive the store/restore cycle"
+
+
+def test_dense_codec_orders_the_fp4_scale_plane_after_its_keys():
+    """Segment order is the on-disk byte layout, so it is part of the contract.
+
+    Reordering these silently reinterprets every chunk already in a tier that
+    `build_page_namespace` still considers the same domain -- the namespace
+    document has no segment order in it. A reorder has to bump
+    `PAGE_LAYOUT_VERSION`, and this is what makes that deliberate.
+    """
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    kv_caches = _fp4_index_kv_caches(torch, 4)
+    codec = DenseKVByteCodec(kv_caches)
+
+    layer = kv_caches["l0"]
+    assert [s.data_ptr() for s in codec._segments] == [
+        layer.k_cache.data_ptr(),
+        layer.index_cache.data_ptr(),
+        layer.index_scale.data_ptr(),
+    ]
+
+
+def test_dense_codec_fp8_indexer_layout_is_unchanged():
+    """FP8 has one index plane and must keep the byte layout it already has.
+
+    `index_scale` is None on every non-FP4 layer, and the FP8 caches already
+    written to a tier have to stay readable.
+    """
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    kv_caches = _fp4_index_kv_caches(torch, 4, with_scale=False)
+    codec = DenseKVByteCodec(kv_caches)
+
+    layer = kv_caches["l0"]
+    assert len(codec._segments) == 2
+    assert codec.bytes_per_block == (
+        layer.k_cache.numel() // 4 + layer.index_cache.numel() // 4
+    )
+
+
 def test_lmcache_connector_maps_dcp_ranges_on_virtual_block_grid():
     import torch
 

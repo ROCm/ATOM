@@ -130,6 +130,14 @@ class DenseKVByteCodec:
                 getattr(kvt, "v_scale", None),
                 # DSA indexer cache (GLM-5.2 / DeepSeek-V3.2 sparse layers).
                 getattr(kvt, "index_cache", None),
+                # Its e8m0 exponents under `--index_cache_dtype fp4`, None
+                # otherwise. Appended after the keys rather than beside them
+                # because this order IS the stored byte layout: `bytes_per_block`
+                # sums these in sequence and a chunk is read back by offset.
+                # Reordering reinterprets every chunk already in a tier, and
+                # `build_page_namespace` has no segment order in it to notice --
+                # so a reorder has to bump `PAGE_LAYOUT_VERSION`.
+                getattr(kvt, "index_scale", None),
             ):
                 if t is not None and isinstance(t, torch.Tensor) and t.numel() > 0:
                     self._segments.append(t)

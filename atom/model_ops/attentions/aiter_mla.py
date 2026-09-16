@@ -1286,6 +1286,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         kv_cache = self.kv_pool.layer("kv", row).view(-1, 1, self.kv_pool.entry_dim)
         module.max_model_len = runner.config.max_model_len
         index_cache = None
+        index_scale = None
         if runner.has_mla_indexer and module.indexer is not None:
             # The compact map is keyed by GLOBAL model layer ids, which the
             # pool row above is not -- on a non-first PP stage row 0 may be
@@ -1310,10 +1311,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 f"{module.indexer._indexer_fp4}"
             )
             if self._indexer_fp4:
+                # Held in a local as well as on the indexer: the e8m0 plane is
+                # half the index region, so whatever moves `index_cache` has to
+                # be handed this too (see `KVCacheTensor.index_scale`).
+                index_scale = self.kv_pool.layer("index_scale", index_cache_layer_id)
                 module.indexer.k_cache.kv_cache[0] = index_cache
-                module.indexer.k_cache.kv_cache_scale = self.kv_pool.layer(
-                    "index_scale", index_cache_layer_id
-                )
+                module.indexer.k_cache.kv_cache_scale = index_scale
             else:
                 # Use aligned dimension to avoid memory copy in torch inductor
                 module.indexer.k_cache.kv_cache[0] = index_cache.view(
@@ -1327,6 +1330,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             k_scale=None,
             v_scale=None,
             index_cache=index_cache if runner.has_mla_indexer else None,
+            index_scale=index_scale if runner.has_mla_indexer else None,
         )
 
     def get_kv_transfer_tensors(self):
@@ -1344,11 +1348,26 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # A connector is handed one `INDEX_CACHE_ROLE` region per layer --
             # the whole vocabulary it and its DCP shard plan have for the
             # indexer -- and the FP4 cache is two planes neither parses.
-            if runner.config.kv_transfer_config:
+            #
+            # That is a statement about the REGION MAP, so it only binds the
+            # transports that read one. An offload connector does not: it never
+            # looks at the return value here, and builds its codec from the
+            # `KVCacheTensor`s instead, where an FP4 layer now carries both
+            # planes (`index_cache` plus `index_scale`). Its unit is a whole
+            # block, so the e8m0 row swizzle -- which lives inside one block --
+            # rides along untouched. Refusing it too would cost FP4 the
+            # offload path for a reason that does not apply to it.
+            from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+            if KVConnectorFactory.topology_uses_pd_staging(
+                runner.config.kv_transfer_config
+            ):
                 raise NotImplementedError(
-                    "KV transfer with the FP4 sparse indexer is unsupported: "
-                    "the region map cannot describe its separate e8m0 scale "
-                    "plane. Pass --index_cache_dtype fp8 to use a connector."
+                    "P/D KV transfer with the FP4 sparse indexer is "
+                    "unsupported: the region map cannot describe its separate "
+                    "e8m0 scale plane. Pass --index_cache_dtype fp8 to use a "
+                    "P/D connector; CPU/NVMe offload (lmcache_offload) carries "
+                    "both planes and needs no change."
                 )
             return None
         # What the pool was built with, not what the hook would recompute: a
