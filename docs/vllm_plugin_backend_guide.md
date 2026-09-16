@@ -191,7 +191,7 @@ Currently, the plugin backend supports the following model architectures:
 
 Kimi-K3 uses vLLM's hybrid/Mamba cache contract for KDA recurrent state and
 ATOM's MLA backend for full-attention layers. See the
-[Kimi-K3 vLLM recipe](../recipes/atom_vllm/Kimi-K3.md) for its TP8, FLA,
+[Kimi-K3 vLLM recipe](https://github.com/ROCm/ATOM/blob/main/recipes/atom_vllm/Kimi-K3.md) for its TP8, FLA,
 prefix-caching, and text-only requirements.
 
 ## Installation and quick start

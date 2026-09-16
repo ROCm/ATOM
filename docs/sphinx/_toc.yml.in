@@ -27,6 +27,8 @@ subtrees:
         title: Model operations
       - file: online_quantization_guide
         title: Online quantization
+      - file: online_quantization_streaming_guide
+        title: Streaming online quantization
       - file: online_quantization_best_practices
         title: Online quantization best practices
       - file: eagle3_speculative_decoding
@@ -43,6 +45,8 @@ subtrees:
         title: Compilation and CUDA graphs
       - file: serving_benchmarking_guide
         title: Serving and benchmarking
+      - file: metrics_guide
+        title: Metrics
 
   - caption: Framework integrations
     entries:

@@ -1,20 +1,42 @@
 # Configuration file for the Sphinx documentation builder.
 
-import os
+import subprocess
 import sys
+from pathlib import Path
 
-sys.path.insert(0, os.path.abspath(".."))
+DOCS_DIR = Path(__file__).resolve().parent
+REPO_ROOT = DOCS_DIR.parent
+sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(DOCS_DIR / "_ext"))
 
 # -- Project information -----------------------------------------------------
 project = "ATOM"
 copyright = "Copyright (c) %Y Advanced Micro Devices, Inc. All rights reserved."
 author = "Advanced Micro Devices, Inc."
-version = "0.1.0"
-release = version
+
+
+# Read the checked-out source revision, never an installed ATOM package. A
+# development checkout must not be labeled as an old stable release.
+def git_revision(*args):
+    try:
+        return subprocess.check_output(
+            ["git", *args], cwd=REPO_ROOT, text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+release = git_revision("describe", "--tags", "--always", "--dirty")
+version = release
+source_revision = git_revision("rev-parse", "--short=12", "HEAD")
+rst_prolog = f".. |source_revision| replace:: {source_revision}\n"
+html_last_updated_fmt = "%Y-%m-%d"
+html_title = f"ATOM {release} documentation"
 
 # -- General configuration ---------------------------------------------------
 extensions = [
     "rocm_docs",
+    "model_registry",
     "sphinx.ext.napoleon",
     "sphinx.ext.viewcode",
     # enabled by rocm_docs:
@@ -24,9 +46,19 @@ extensions = [
 ]
 
 external_toc_path = "./sphinx/_toc.yml"
+external_projects_current_project = "atom"
+# These guides use explicit URLs for external documentation, not intersphinx
+# roles. Do not fetch every ROCm project's inventory for an ATOM build.
+external_projects = []
 
 templates_path = ["_templates"]
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "DOCUMENTATION_AUDIT_REPORT.md"]
+exclude_patterns = [
+    "_build",
+    "Thumbs.db",
+    ".DS_Store",
+    "DOCUMENTATION_AUDIT_REPORT.md",
+    "_ext",
+]
 
 # -- Options for HTML output -------------------------------------------------
 html_theme = "rocm_docs_theme"

@@ -1,41 +1,36 @@
 ATOM
 ====
 
-**ATOM** (Accelerated Training and Optimization for Models) is AMD's high-performance LLM serving framework optimized for ROCm platforms.
+**ATOM** (AiTer Optimized Model) is AMD's high-performance LLM serving framework optimized for ROCm platforms.
 Find the source code at `<https://github.com/ROCm/ATOM>`__.
 
 Features
 --------
 
 * **High Performance**: Optimized kernels for AMD Instinct GPUs
-* **Model Support**: Wide range of LLM architectures (Llama, GPT, etc.)
+* **Model Implementations**: See the registry-backed :doc:`model_support_guide`
 * **Distributed Serving**: Multi-GPU and multi-node deployment
 * **Compilation**: CUDAGraph and ROCm optimizations
 * **Benchmarking**: Built-in performance measurement tools
 
-Supported GPUs
---------------
+Hardware and validation
+-----------------------
 
-.. list-table::
-   :header-rows: 1
-   :widths: 30 20 20 30
+ATOM uses ROCm and AITER kernels for AMD Instinct GPUs. MI300X (CDNA 3,
+``gfx942``) and MI355X (CDNA 4, ``gfx950``) correspond to the kernel build
+targets in the project's `CI configurations <https://github.com/ROCm/ATOM/tree/main/.github>`_.
+Model, precision, kernel and parallelism choices determine the supported
+combination; a GPU architecture name alone is not a full compatibility claim.
+Start with :doc:`installation` and the model-specific :doc:`model_run_guide`.
 
-   * - GPU
-     - Architecture
-     - Memory
-     - Status
-   * - AMD Instinct MI355X
-     - CDNA 4 (gfx950)
-     - 288 GB HBM3e
-     - ✅ Fully Supported (primary CI target)
-   * - AMD Instinct MI300X
-     - CDNA 3 (gfx942)
-     - 192 GB HBM3
-     - ✅ Fully Supported
-   * - AMD Instinct MI250X
-     - CDNA 2 (gfx90a)
-     - 128 GB HBM2e
-     - ✅ Fully Supported
+Documentation revision
+----------------------
+
+This documentation was built from source commit |source_revision|. The version
+in the page title comes from the checked-out Git tag or development revision.
+The ``latest`` site tracks development; use `GitHub Releases
+<https://github.com/ROCm/ATOM/releases>`_ for published release artifacts and
+release notes.
 
 Quick links
 -----------
