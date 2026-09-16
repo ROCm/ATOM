@@ -103,9 +103,14 @@ on:
         options:
           - linux-atom-mi35x-1
           - build-only-atom
-  push:
-    tags:
-      - 'v*'
+
+# No `push: tags` trigger here on purpose. The automation workflow carries
+# one, and it calls this workflow -- so a tag push that reached both would
+# build and publish the same tag twice, the second run colliding with the
+# release the first one had already created. The tag path is not lost: a
+# called workflow still sees the event that started the caller, so
+# github.event_name is 'push' and GITHUB_REF_NAME is the tag in the steps
+# below, exactly as it was when the trigger lived here.
 
 permissions:
   contents: write  # create the GitHub Release and upload assets
