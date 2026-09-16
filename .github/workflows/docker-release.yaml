@@ -6,11 +6,11 @@ on:
   workflow_dispatch:
     inputs:
       build_rocm7:
-        description: "Build the ROCm 7 line for manual runs (scheduled nightly runs always build every live line; default enabled)"
+        description: "Build the ROCm 7 line -> rocm/atom-dev:latest + :nightly_<ts> (scheduled nightly runs always build every live line; default enabled)"
         type: boolean
         default: true
       build_rocm10:
-        description: "Build the ROCm 10 line for manual runs (scheduled nightly runs always build every live line; default enabled)"
+        description: "Build the ROCm 10 line -> rocm/atom-dev:latest-rocm10.0 + :nightly_<ts>-rocm10.0 (scheduled nightly runs always build every live line; default enabled)"
         type: boolean
         default: true
       base_image_override:
