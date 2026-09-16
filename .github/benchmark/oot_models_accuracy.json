@@ -104,6 +104,7 @@
     "model_name": "Qwen3.5-397B-A17B-MXFP4 TP4",
     "model_path": "amd/Qwen3.5-397B-A17B-MXFP4",
     "extra_args": "--tensor-parallel-size 4 --async-scheduling --load-format fastsafetensors --trust-remote-code --compilation-config '{\"cudagraph_mode\": \"FULL_AND_PIECEWISE\"}' --kv-cache-dtype fp8 --no-enable_prefix_caching --gpu-memory-utilization 0.9",
+    "client_command": "lm_eval --model local-completions --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/completions,num_concurrent=65,max_retries=1,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot ${LM_EVAL_NUM_FEWSHOT} --output_path ${OUTPUT_PATH}",
     "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0\nGATED_DELTA_RULE_TRITON_AUTOTUNE=1",
     "runner": "atom-plugin-acc-validation-runner-vllm",
     "test_level": "nightly",
@@ -111,7 +112,7 @@
     "accuracy_test_threshold": 0.83,
     "accuracy_baseline": 0.82,
     "accuracy_baseline_model": "Qwen/Qwen3-235B-A22B-Instruct-2507",
-    "_baseline_note": "Using Qwen3-235B baseline as proxy; needs CI measurement for Qwen3.5 specific baseline"
+    "_baseline_note": "Threshold and baseline below are still the Qwen3-235B proxy and have NOT been re-derived; doing so needs a run under this entry's own extra_args. What is measured (2026-09-16, this branch, but with TP4 as the only server flag, gsm8k 3-shot, exact_match flexible-extract, n-samples 1319): 0.8506-0.8522 at lm-eval's default max_gen_toks=256 versus 0.9439-0.9568 at 2048, the 256 default truncating this model's reasoning (confirmed directly in the samples by the fraction with no '####' answer line). Those 256 runs also carried ATOM_DEBUG_KV_BOUNDS=1, so that step is not single-variable. The explicit client_command above is load-bearing: without it this cell falls back to the default lm-eval invocation in atom_oot_test.sh, which passes no max_gen_toks at all."
   },
   {
     "model_name": "Meta-Llama-3.1-405B-Instruct-FP8 TP8",
