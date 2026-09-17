@@ -1017,6 +1017,11 @@ class ModelRunner:
             del self.model
         if hasattr(self, "drafter"):
             del self.drafter
+        from atom.model_ops.fused_moe.routed_experts_capturer import (
+            RoutedExpertsCapturer,
+        )
+
+        RoutedExpertsCapturer.reset()
         torch.cuda.empty_cache()
         return True
 

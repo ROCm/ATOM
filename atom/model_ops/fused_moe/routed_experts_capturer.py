@@ -226,6 +226,9 @@ class RoutedExpertsCapturer:
 
     @classmethod
     def reset(cls) -> None:
+        """Drop the process-local GPU/CPU buffers. Sleep KV teardown uses this
+        so wake does not size a new pool against a still-live capture tensor.
+        """
         global _INSTANCE
         _INSTANCE = None
 
