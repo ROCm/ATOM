@@ -115,8 +115,9 @@ if is_crusoe_v2:
         "http://crs-m2m-cpu-spur-v2-001.crusoe.amd.com:6819"
     )
 elif not spur_controller_addr:
-    spur_controller_addr = os.environ.get(
-        "SPUR_CONTROLLER_ADDR", "http://134.199.196.72:6817"
+    spur_controller_addr = os.environ.get("SPUR_CONTROLLER_ADDR") or (
+        "http://134.199.196.72:6817"
+        if slurm_submit_runner == "atomesh-cicd-mi350" else ""
     )
 
 exports = {
@@ -309,6 +310,8 @@ USES_SPUR_CONTROLLER=0
 if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
   USES_SPUR_CONTROLLER=1
 fi
+source "${REPO_ROOT}/.github/scripts/slurm_submit_helpers.sh"
+detect_slurm_backend
 
 echo "=== ATOMesh benchmark cell ==="
 echo "cell=${ATOMESH_CELL_ID}"
@@ -383,7 +386,6 @@ stream_spur_shared_logs_once() {
 if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
   SLURM_EXTRA_LOG_STREAMER=stream_spur_shared_logs_once
 fi
-source "${REPO_ROOT}/.github/scripts/slurm_submit_helpers.sh"
 install_slurm_cancel_traps
 
 IFS=',' read -r -a NODE_ARRAY <<< "${NODE_LIST}"
@@ -419,7 +421,7 @@ else
     --export=ALL 
     --job-name "${SLURM_JOB_NAME}"
   )
-  if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
+  if [[ "${USES_SPUR_CONTROLLER}" == "1" && -n "${SPUR_CONTROLLER_ADDR}" ]]; then
     SBATCH_CMD+=(--controller "${SPUR_CONTROLLER_ADDR}")
   fi
   if [[ -n "${SLURM_ACCOUNT}" ]]; then
@@ -471,6 +473,8 @@ echo "${JOB_ID}" | tee "${RESULT_DIR}/${ATOMESH_CELL_ID}.slurm-job-id"
 write_slurm_cancel_helper "${JOB_ID}"
 
 set_slurm_job_log_paths "${JOB_ID}"
+SLURM_STATUS_DIR="${LOG_ROOT}/slurm_job-${JOB_ID}"
+SLURM_STATUS_RANKS="${NUM_NODES}"
 monitor_slurm_job "${JOB_ID}"
 
 # Fall back to published results if accounting has no final state.
