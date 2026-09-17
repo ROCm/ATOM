@@ -50,7 +50,9 @@ def test_dcp_pcp_pp_fail_closed():
     with pytest.raises(ValueError, match="pipeline_parallel_size"):
         check_return_routed_experts(1, 1, 2)
     with pytest.raises(ValueError, match="KV transfer"):
-        check_return_routed_experts(1, 1, 1, kv_transfer_config={"kv_connector": "moriio"})
+        check_return_routed_experts(
+            1, 1, 1, kv_transfer_config={"kv_connector": "moriio"}
+        )
     with pytest.raises(ValueError, match="RapidServe"):
         check_return_routed_experts(1, 1, 1, enable_rapidserve=True)
     with pytest.raises(ValueError, match="enable_dp_attention"):
@@ -139,9 +141,7 @@ def test_length_contract_prompt_plus_completion_minus_one():
     ids = torch.arange(n_routes, device=device, dtype=torch.int32).unsqueeze(-1)
     capturer.capture(0, ids, slot_mapping=slots)
     capturer.store_step(slots)
-    exported = capturer.export_batch(
-        [1], [[0]], [n_routes], block_size=16
-    )[1]
+    exported = capturer.export_batch([1], [[0]], [n_routes], block_size=16)[1]
     assert exported.shape[0] == n_routes
     assert exported.shape[0] == prompt_len + completion_len - 1
 
@@ -196,9 +196,7 @@ def test_maybe_capture_skips_when_uninitialized():
     class _Layer:
         moe_capture_layer_id = 0
 
-    maybe_capture_routed_experts(
-        _Layer(), torch.zeros((2, 2), dtype=torch.int32)
-    )
+    maybe_capture_routed_experts(_Layer(), torch.zeros((2, 2), dtype=torch.int32))
     assert RoutedExpertsCapturer.get() is None
 
 
@@ -259,7 +257,9 @@ def test_commit_pending_keep_last_does_not_wait():
     rows = torch.tensor([[[5, 6]]], dtype=torch.int16)
     capturer._pending.append((dest, rows))
     capturer.commit_pending(keep_last=True)
-    np.testing.assert_array_equal(capturer.cpu_buffer[3], np.zeros((1, 2), dtype=np.int16))
+    np.testing.assert_array_equal(
+        capturer.cpu_buffer[3], np.zeros((1, 2), dtype=np.int16)
+    )
     capturer.commit_pending(keep_last=False)
     np.testing.assert_array_equal(capturer.cpu_buffer[3, 0], [5, 6])
 
@@ -314,7 +314,8 @@ def test_lazy_wrapper_fused_moe_is_detected(monkeypatch):
     """
     import sys
     import types
-    import torch.nn as nn
+
+    from torch import nn
 
     from atom.model_ops.fused_moe.routed_experts_capturer import is_fused_moe_module
 

@@ -31,11 +31,6 @@ from atom.config import (
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.eplb import eplb_map_and_record_fused
-from atom.model_ops.fused_moe.routed_experts_capturer import (
-    RoutedExpertsCapturer,
-    maybe_capture_routed_experts,
-    topk_ids_from_triton_routing,
-)
 from atom.model_ops.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
     FusedMoEConfig,
@@ -60,6 +55,11 @@ from atom.model_ops.fused_moe.modular_kernel import (
     FusedMoEPrepareAndFinalize,
 )
 from atom.model_ops.fused_moe.mori_prepare_finalize import MoriPrepareAndFinalize
+from atom.model_ops.fused_moe.routed_experts_capturer import (
+    RoutedExpertsCapturer,
+    maybe_capture_routed_experts,
+    topk_ids_from_triton_routing,
+)
 from atom.model_ops.fused_moe.shared_expert_dispatch import remap_topk_to_dispatch
 from atom.model_ops.topK import (
     init_aiter_topK_meta_data,

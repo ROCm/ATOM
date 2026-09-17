@@ -115,9 +115,7 @@ def _current_slot_mapping() -> torch.Tensor | None:
     return slots if isinstance(slots, torch.Tensor) else None
 
 
-def capture_bytes_per_kv_block(
-    block_size: int, num_layers: int, top_k: int
-) -> int:
+def capture_bytes_per_kv_block(block_size: int, num_layers: int, top_k: int) -> int:
     """PAGE-pool surcharge: int32 routes for every token slot in one KV block."""
     return int(block_size) * int(num_layers) * int(top_k) * 4
 
@@ -262,9 +260,7 @@ class RoutedExpertsCapturer:
 
     def _apply_cpu_store(self, dest: np.ndarray, rows: np.ndarray) -> None:
         dest = np.asarray(dest, dtype=np.int64).reshape(-1)
-        rows = np.asarray(rows, dtype=np.int16).reshape(
-            -1, self.num_layers, self.top_k
-        )
+        rows = np.asarray(rows, dtype=np.int16).reshape(-1, self.num_layers, self.top_k)
         mask = (dest >= 0) & (dest < self.num_slots)
         if not np.any(mask):
             return
@@ -311,9 +307,7 @@ class RoutedExpertsCapturer:
         dest = self._dest_slots(slots)
         rows = self.buffer[dest].to(dtype=torch.int16)
         use_async = (
-            stream is not None
-            and self.buffer.is_cuda
-            and torch.cuda.is_available()
+            stream is not None and self.buffer.is_cuda and torch.cuda.is_available()
         )
         if not use_async:
             self.commit_pending()
@@ -351,9 +345,7 @@ class RoutedExpertsCapturer:
         return out
 
 
-def maybe_capture_routed_experts(
-    layer: Any, topk_ids: torch.Tensor
-) -> None:
+def maybe_capture_routed_experts(layer: Any, topk_ids: torch.Tensor) -> None:
     """No-op when capture is off, uninitialized, or still in dummy warmup."""
     capturer = RoutedExpertsCapturer.get()
     if capturer is None or topk_ids is None:
