@@ -49,11 +49,10 @@ permissions:
   contents: read
   pull-requests: write
 
-# Smoke configuration. The full set is five entries across five concurrency
-# levels (25 jobs); this cuts it to the cheapest single entry and the three
-# judging levels (3 jobs) so the first real run exercises every code path --
-# same runner, same catalog, same criterion -- at a fraction of the machine
-# time. Widen these once the mechanics are proven; nothing else changes.
+# The agreed set: five entries across five concurrency levels, 25 jobs. It was
+# a single-entry smoke until d76360456; the matrix step now fails on a short
+# matrix rather than letting a typo surface at the judge as `partial`.
+# Narrowing for an experiment is a change to this block and nothing else.
 env:
   # Catalog prefixes, not display names -- MiniMax-M3-MXFP8 is `m3-mxfp8` here.
   # DeepSeek-V4-Pro MTP3 is added automatically alongside its base by the matrix
