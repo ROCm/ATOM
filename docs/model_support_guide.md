@@ -2,50 +2,37 @@
 
 ATOM (AiTer Optimized Model) is AMD's lightweight LLM inference engine built on AITER kernels for ROCm/HIP GPUs. This guide covers the supported model architectures, weight loading, and how to add new models.
 
-## Quick Reference
+## Native model registry
 
-The model registry lives in `atom/model_engine/model_runner.py` as `support_model_arch_dict`:
+ATOM resolves the Hugging Face `architectures` field in a checkpoint's
+`config.json` against `support_model_arch_dict` in
+[`atom/model_engine/model_runner.py`](https://github.com/ROCm/ATOM/blob/main/atom/model_engine/model_runner.py).
+The table below is generated directly from
+that registry when this documentation is built. It lists implementations present
+in this source revision, including architecture aliases; it is not a validation
+matrix for all checkpoints or GPUs.
 
-```python
-support_model_arch_dict = {
-    "Qwen3ForCausalLM": "atom.models.qwen3.Qwen3ForCausalLM",
-    "Qwen3MoeForCausalLM": "atom.models.qwen3_moe.Qwen3MoeForCausalLM",
-    "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5ForConditionalGenerationTextOnly",
-    "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeForConditionalGenerationTextOnly",
-    "LlamaForCausalLM": "atom.models.llama.LlamaForCausalLM",
-    "MixtralForCausalLM": "atom.models.mixtral.MixtralForCausalLM",
-    "DeepseekV3ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
-    "DeepseekV32ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
-    "GptOssForCausalLM": "atom.models.gpt_oss.GptOssForCausalLM",
-    "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2.GlmMoeDsaForCausalLM",
-    "Glm4MoeForCausalLM": "atom.models.glm4_moe.Glm4MoeForCausalLM",
-    "Glm5NextForConditionalGeneration": "atom.models.glm5_next.Glm5NextForConditionalGeneration",
-    "Qwen3NextForCausalLM": "atom.models.qwen3_next.Qwen3NextForCausalLM",
-}
+```{atom-model-registry}
 ```
 
-ATOM resolves the HuggingFace `architectures` field from a model's `config.json` against this dictionary. If the architecture string matches a key, ATOM imports and instantiates the corresponding class.
+Match your checkpoint, precision, GPU and TP/DP/EP/PP configuration to the
+[model run guide](model_run_guide.md) and the repository's
+[CI configurations](https://github.com/ROCm/ATOM/tree/main/.github). Registration
+alone does not imply multimodal support: for example,
+`Mistral3ForConditionalGeneration` maps to a text-only implementation. Check the
+implementation and launch recipe before enabling vision, speculative decoding,
+context parallelism or graph modes.
 
-## Supported model architectures
+For implemented online quantization paths and restrictions, see the
+[online quantization guide](online_quantization_guide.md). Do not infer support
+for a checkpoint's quantization format from its architecture name.
 
-| HF Architecture | ATOM Module | ATOM Class | MoE | MLA | Key Features |
-|---|---|---|---|---|---|
-| `Qwen3ForCausalLM` | `atom.models.qwen3` | `Qwen3ForCausalLM` | No | No | GQA, QK norm, RoPE |
-| `Qwen3MoeForCausalLM` | `atom.models.qwen3_moe` | `Qwen3MoeForCausalLM` | Yes | No | GQA, QK norm, FusedMoE, sparse+dense layer mixing, QK norm+RoPE+cache+quant fusion |
-| `Qwen3_5ForConditionalGeneration` | `atom.models.qwen3_5` | `Qwen3_5ForConditionalGenerationTextOnly` | No | No | Hybrid architecture: full attention + Gated DeltaNet linear attention, GQA, QK norm, RoPE |
-| `Qwen3_5MoeForConditionalGeneration` | `atom.models.qwen3_5` | `Qwen3_5MoeForConditionalGenerationTextOnly` | Yes | No | Hybrid architecture: full attention + Gated DeltaNet, GQA, QK norm, FusedMoE |
-| `LlamaForCausalLM` | `atom.models.llama` | `LlamaForCausalLM` | No | No | GQA, RoPE, fused RMSNorm+quant, fused SiLU+mul+quant |
-| `MixtralForCausalLM` | `atom.models.mixtral` | `MixtralForCausalLM` | Yes | No | GQA, RoPE, FusedMoE with TP sharding |
-| `DeepseekV3ForCausalLM` | `atom.models.deepseek_v2` | `DeepseekV2ForCausalLM` | Yes | Yes | MLA attention, LoRA-compressed QKV, FusedMoE with shared experts, FP4/FP8 fused kernels |
-| `DeepseekV32ForCausalLM` | `atom.models.deepseek_v2` | `DeepseekV2ForCausalLM` | Yes | Yes | Same as above with V3.2 index-based top-k routing |
-| `GptOssForCausalLM` | `atom.models.gpt_oss` | `GptOssForCausalLM` | Yes | No | GQA, RoPE, sliding window attention (every other layer), attention sinks, bias in QKV and MoE |
-| `GlmMoeDsaForCausalLM` | `atom.models.deepseek_v2` | `GlmMoeDsaForCausalLM` | Yes | Yes | Reuses `DeepseekV2ForCausalLM` — GLM-5 is structurally similar to DeepSeek V3.2 |
-| `Glm4MoeForCausalLM` | `atom.models.glm4_moe` | `Glm4MoeForCausalLM` | Yes | No | GQA, partial RoPE (0.5 factor), QK norm, shared+routed experts, sigmoid scoring, grouped top-k |
-| `Glm5NextForConditionalGeneration` | `atom.models.glm5_next` | `Glm5NextForConditionalGeneration` | Yes | Yes | Text-only GLM-5.3-Flash: hybrid KDA + pooled sparse MLA, mHC, NoPE zero padding; PCP/DCP/MTP/TBO not yet supported |
-| `Qwen3NextForCausalLM` | `atom.models.qwen3_next` | `Qwen3NextForCausalLM` | Yes | No | Hybrid architecture: full attention + Gated DeltaNet linear attention, GQA, QK norm, FusedMoE |
-| `KimiK3ForConditionalGeneration` | `atom.models.kimi_k3` | `KimiK3ForConditionalGeneration` | Yes | Yes | Hybrid architecture: MLA full attention + KDA linear attention, SiTU activation, MXFP4 latent MoE, MoonViT3d vision tower |
+Speculative draft models, such as `DeepSeekMTP`, `Qwen3NextMTP` and `Qwen3_5MTP`,
+are loaded separately and are not entries in this native model registry.
 
-**Note:** `DeepSeekMTP` (`atom.models.deepseek_mtp.DeepSeekMTP`), `Qwen3NextMTP` (`atom.models.qwen3_next_mtp.Qwen3NextMTP`), and `Qwen3_5MTP` (`atom.models.qwen3_5_mtp.Qwen3_5MTP`) are not in the registry — they are used exclusively as speculative draft models and are loaded separately via `EagleProposer`.
+The following architecture notes explain selected implementations. They are
+not a second, exhaustive support inventory; the generated table above includes
+all registered architectures in this build.
 
 ## Model architecture details
 

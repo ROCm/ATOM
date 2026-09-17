@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - '.github/pages/**'
+      - '.github/workflows/deploy-pages.yml'
   workflow_dispatch:
 
 # To add a new page:
@@ -33,6 +34,9 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           CURRENT_SHA=$(git rev-parse HEAD)
 
+          # Preserve the root redirect as well as the page directories.
+          cp .github/pages/index.html /tmp/atom-pages-index.html
+
           # Save all page directories before switching branches
           for dir in .github/pages/*/; do
             page_name=$(basename "$dir")
@@ -43,6 +47,9 @@ jobs:
           # Switch to gh-pages
           git fetch origin gh-pages
           git checkout gh-pages
+
+          cp /tmp/atom-pages-index.html index.html
+          git add index.html
 
           # Copy each page to its destination
           for dir in /tmp/page_*/; do

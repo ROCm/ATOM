@@ -289,7 +289,7 @@ class LLMEngine:
         prompts: list[str],
         sampling_params: SamplingParams | list[SamplingParams],
         request_ids: list[str] | None = None,
-    ) -> list[str]:
+    ) -> list[dict[str, Any]]:
         """Complete every prompt and return the outputs as ONE flat list.
 
         Not one entry per prompt: ``SamplingParams.n`` of them, prompt-major

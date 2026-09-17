@@ -7,10 +7,14 @@ installation, and environment setup.
 Requirements
 ------------
 
-* Python 3.10 to 3.12
-* `ROCm 6.0 or later <https://rocm.docs.amd.com/en/latest/install/rocm.html>`_
-* PyTorch with ROCm support
-* AMD Instinct GPU (MI200, MI300, or MI350 series recommended)
+* Python 3.10 or later (see ``requires-python`` in ``pyproject.toml``)
+* A compatible ROCm and ROCm-enabled PyTorch installation
+* An AMD Instinct GPU supported by your model and kernel configuration
+
+Use the pre-built image below for a matched development stack. The package
+metadata alone does not establish compatibility with every ROCm release or GPU;
+consult the `current CI configurations <https://github.com/ROCm/ATOM/tree/main/.github>`_
+and :doc:`model_run_guide` for model-specific settings.
 
 If ROCm is not yet installed, follow the `ROCm installation guide
 <https://rocm.docs.amd.com/en/latest/install/rocm.html>`_ before continuing.
@@ -37,26 +41,36 @@ From source
 
 .. code-block:: bash
 
-   git clone --recursive https://github.com/ROCm/ATOM.git
+   # Start in an environment with a compatible ROCm-enabled PyTorch installed.
+   python -m pip install amd-aiter
+   git clone https://github.com/ROCm/ATOM.git
    cd ATOM
-   pip install -r requirements.txt
-   pip install -e .
+   python -m pip install -e .
 
-The ``--recursive`` flag is required because ATOM depends on AITER as a
-submodule.
+AITER is installed separately; it is not an ATOM submodule. ATOM declares its
+Python dependencies in ``pyproject.toml``. For a non-editable installation, use
+``python -m pip install .`` instead. Select an AITER wheel compatible with the
+environment, following the `AITER installation guide
+<https://rocm.github.io/aiter/installation.html>`_.
+
+For a base container and its matching ROCm/PyTorch versions, see the maintained
+`README installation recipe <https://github.com/ROCm/ATOM#installation>`_.
 
 Docker
 ^^^^^^
 
-The pre-built image includes ROCm, PyTorch, and all ATOM dependencies.
+The nightly development image includes ROCm, PyTorch, AITER, and ATOM.
+``latest`` is a moving tag; record its digest when reproducing a result and
+reuse that digest for subsequent runs.
 
 .. code-block:: bash
 
-   docker pull rocm/atom:latest
+   docker pull rocm/atom-dev:latest
+   docker image inspect rocm/atom-dev:latest --format '{{json .RepoDigests}}'
 
    docker run --device=/dev/kfd --device=/dev/dri \
               --group-add video --ipc=host \
-              -it rocm/atom:latest
+              -it rocm/atom-dev:latest
 
 ``--device=/dev/kfd`` and ``--device=/dev/dri`` expose the GPU to the
 container. ``--ipc=host`` is required for multi-GPU workloads that use shared
@@ -72,16 +86,13 @@ Set these variables in your shell before building or starting the server:
    # ROCm installation path (default if installed via package manager)
    export ROCM_PATH=/opt/rocm
 
-   # Target GPU architectures — include every architecture you intend to run on
-   # gfx90a = MI250X, gfx942 = MI300X, gfx950 = MI355X
-   export GPU_ARCHS="gfx90a;gfx942"
-
    # Suppress AITER kernel log flooding during server startup
    export AITER_LOG_LEVEL=WARNING
 
-``GPU_ARCHS`` controls which GPU targets are compiled. Omitting an architecture
-means ATOM will not run on that GPU. See :doc:`environment_variables` for a
-full list of ``ATOM_*`` runtime variables.
+``GPU_ARCHS`` is used by kernel build paths such as AITER source builds. Follow
+the relevant dependency's build instructions when setting it; it is not an
+ATOM runtime support switch. See :doc:`environment_variables` for
+``ATOM_*`` runtime variables.
 
 Verify the installation
 -----------------------
@@ -90,8 +101,10 @@ Run the following to confirm ATOM imported correctly and ROCm is accessible:
 
 .. code-block:: python
 
+   import importlib.metadata
    import atom
    import torch
+   import triton
 
    print("ATOM modules available:")
    print(f"  - LLMEngine: {hasattr(atom, 'LLMEngine')}")
@@ -99,10 +112,15 @@ Run the following to confirm ATOM imported correctly and ROCm is accessible:
 
    print(f"\nPyTorch version: {torch.__version__}")
    print(f"ROCm available: {torch.cuda.is_available()}")
-   print(f"ROCm version: {torch.version.hip if hasattr(torch.version, 'hip') else 'N/A'}")
+   print(f"ROCm version: {torch.version.hip}")
+   print(f"Triton version: {triton.__version__}")
+   for distribution in ("atom", "amd-aiter"):
+       print(f"{distribution}: {importlib.metadata.version(distribution)}")
 
 A successful installation prints ``True`` for both ``LLMEngine`` and
-``SamplingParams``, and shows a ROCm version string rather than ``N/A``.
+``SamplingParams``, reports an available GPU, and shows a nonempty ROCm version
+string. Save this output together with the container digest or source commits
+when reporting a regression.
 
 Troubleshooting
 ---------------

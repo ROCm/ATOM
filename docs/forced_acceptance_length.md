@@ -171,7 +171,7 @@ is a runtime decision there is no upfront check that would catch the shortfall,
 and a benchmark reporting a number it never hit is worse than one that refuses
 to start, so ATOM rejects the combination at startup. Drop
 `confidence_schedule` for forced-acceptance runs; see
-[`recipes/DSpark.md`](../recipes/DSpark.md).
+[`recipes/DSpark.md`](https://github.com/ROCm/ATOM/blob/main/recipes/DSpark.md).
 
 **Needs a speculative method.** The flag requires `--method` and a non-zero
 `--num-speculative-tokens`. Without draft positions there is no schedule to

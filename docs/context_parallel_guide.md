@@ -45,7 +45,7 @@ TP and Expert Parallelism (EP): the total world size is `world = tp × pcp`.
 - **Best fit**: long-context / large-prompt prefill on DeepSeek-V4, where prefill
   TTFT dominates.
 - **Combine with**: `--enable-tbo` (prefill) to overlap the MoE communication PCP
-  introduces (see [Overlapping communication with TBO](#overlapping-communication-with-tbo)).
+  introduces (see [Overlapping communication with TBO](#pcp--tbo-prefill-overlap)).
   TBO is only usable with `ATOM_PCP_MOE_MERGE=1` **and `-tp 1`** (see
   [Constraints & Compatibility](#constraints--compatibility)).
 - **Requires**: `world = tp × pcp` GPUs, e.g. `-tp 4 -pcp 2` on 8 GPUs.
@@ -423,7 +423,7 @@ python -m atom.entrypoints.openai_server \
 
 ### ATOM server — Kimi-K3: TP8 + DCP8 (8 GPUs, gfx950)
 
-`-dcp 8` is the only addition to the [Kimi-K3 recipe](../recipes/Kimi-K3.md)
+`-dcp 8` is the only addition to the [Kimi-K3 recipe](https://github.com/ROCm/ATOM/blob/main/recipes/Kimi-K3.md)
 launch; every other flag keeps its recipe value. See
 [DCP on Kimi-K3](#dcp-on-kimi-k3-hybrid-kda--mla) for what DCP does and does not
 shard on a hybrid model.
@@ -444,7 +444,7 @@ python -m atom.entrypoints.openai_server \
 
 ### ATOM server — Kimi-K3: TP8 + DCP8 + DSpark (8 GPUs, gfx950)
 
-Add the [DSpark](../recipes/DSpark.md) flags to the command above; the draft is
+Add the [DSpark](https://github.com/ROCm/ATOM/blob/main/recipes/DSpark.md) flags to the command above; the draft is
 a separate checkpoint. See
 [DCP + Speculative Decode](#dcp--speculative-decode-mtp--dspark).
 
@@ -553,7 +553,7 @@ smoke with no traceback, HIP error, or engine failure.
 
 **Kimi-K3 validated** (ATOM server, 8×MI355 gfx950, `-tp 8 -dcp 8`, fp8 KV, full 1319
 GSM8K 5-shot at 64 concurrency): **flexible-extract 0.9553 / strict-match
-0.9553**, inside the [Kimi-K3 recipe](../recipes/Kimi-K3.md)'s
+0.9553**, inside the [Kimi-K3 recipe](https://github.com/ROCm/ATOM/blob/main/recipes/Kimi-K3.md)'s
 0.9538–0.9591 band. Prefix caching was **off** for that run, matching the
 recipe — K3's KDA recurrent state cannot be reconstructed from the paged MLA
 cache alone, and prefix caching combined with DCP on K3 is not part of the
@@ -610,7 +610,7 @@ baseline (≈0.95) across bf16/fp8 and `num_speculative_tokens` 1/2/3.
 
 ### DSpark (Kimi-K3)
 
-[DSpark](../recipes/DSpark.md) drafts a whole block in one parallel backbone
+[DSpark](https://github.com/ROCm/ATOM/blob/main/recipes/DSpark.md) drafts a whole block in one parallel backbone
 pass instead of `k` serial passes. Two properties decide how it meets DCP:
 
 - **The draft shares the target's paged pool and block tables**, so it inherits
