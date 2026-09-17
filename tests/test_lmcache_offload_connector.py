@@ -5240,6 +5240,34 @@ def test_replica_world_size_counts_pp_and_tp_but_not_dp():
     assert offcfg.lmcache_replica_world_size(SimpleNamespace()) == 1
 
 
+def test_replica_world_size_reads_vllm_parallel_config():
+    # On the plugin path `config` is a VllmConfig, which keeps the parallel
+    # sizes under `parallel_config` and carries nothing at the top level.
+    # Reading only the top level returned world=1 for a TP4 replica, so the
+    # all-rank lookup_server_worker_ids=[0,1,2,3] went out of range and the
+    # lookup client silently failed to build -- leaving the offload tier
+    # written but never read.
+    vllm_shaped = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            tensor_parallel_size=4,
+        )
+    )
+    assert offcfg.lmcache_replica_world_size(vllm_shaped) == 4
+
+    vllm_shaped_pp = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=2,
+            tensor_parallel_size=4,
+        )
+    )
+    assert offcfg.lmcache_replica_world_size(vllm_shaped_pp) == 8
+
+    # A parallel_config that only carries ranks (ATOM's own shape) must not
+    # shadow the top-level sizes.
+    assert offcfg.lmcache_replica_world_size(_dp_config(5, pp_size=4, tp_size=8)) == 32
+
+
 class _RecordingRunnerMgr:
     def __init__(self) -> None:
         self.calls: list[tuple[str, object]] = []
