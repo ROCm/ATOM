@@ -49,7 +49,7 @@ backends:
 models:
   DeepSeek-V4-Pro:
     backend: atom
-    model_path: "${ATOMESH_MODEL_ROOT}/DeepSeek-V4-Pro/"
+    model_path: "${ATOMESH_MODEL_ROOT}/deepseek-ai/DeepSeek-V4-Pro/"
     precision: FP4
     env:
       common:
@@ -182,7 +182,7 @@ models:
 
   GLM-5.2-MXFP4:
     backend: atom
-    model_path: "${ATOMESH_MODEL_ROOT}/GLM-5.2-MXFP4"
+    model_path: "${ATOMESH_MODEL_ROOT}/amd/GLM-5.2-MXFP4"
     precision: MXFP4
     env:
       common:
@@ -466,7 +466,7 @@ models:
 
   Kimi-K3-MXFP4:
     backend: atom
-    model_path: "${ATOMESH_MODEL_ROOT}/Kimi-K3"
+    model_path: "${ATOMESH_MODEL_ROOT}/moonshotai/Kimi-K3"
     precision: MXFP4
     env:
       common:
@@ -691,7 +691,7 @@ models:
 
   Kimi-K2.5-MXFP4:
     backend: atom
-    model_path: "${ATOMESH_MODEL_ROOT}/Kimi-K2.5-MXFP4/"
+    model_path: "${ATOMESH_MODEL_ROOT}/amd/Kimi-K2.5-MXFP4/"
     precision: MXFP4
     env:
       common:
@@ -825,7 +825,7 @@ models:
 
   MiniMax-M3-MXFP4:
     backend: atom
-    model_path: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-MXFP4"
+    model_path: "${ATOMESH_MODEL_ROOT}/amd/MiniMax-M3-MXFP4"
     precision: MXFP4
     env:
       common:
@@ -970,7 +970,7 @@ models:
 
   MiniMax-M3-MXFP8:
     backend: atom
-    model_path: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-MXFP8"
+    model_path: "${ATOMESH_MODEL_ROOT}/MiniMaxAI/MiniMax-M3-MXFP8"
     precision: MXFP8
     env:
       common:
