@@ -31,10 +31,12 @@ class EngineUtilityHandler:
         The scheduler instance, needed by MTP statistics handlers.
     profiler_delay_iters : int, optional
         Engine steps to skip after ``start_profile`` before the profiler
-        records (default 0, record immediately).
+        records (default 0, record immediately). A ``start_profile`` carrying
+        its own ``delay_iters`` overrides this for that run only.
     profiler_max_iters : int, optional
         Recorded steps after which the profiler stops itself (default 0, run
-        until ``stop_profile``).
+        until ``stop_profile``). A ``start_profile`` carrying
+        its own ``max_iters`` overrides this for that run only.
     """
 
     # Utility command name  ->  handler method name
@@ -69,6 +71,11 @@ class EngineUtilityHandler:
         self.scheduler = scheduler
         self.profiler_delay_iters = profiler_delay_iters
         self.profiler_max_iters = profiler_max_iters
+        # The window in force for the current run. `start_profile` may carry
+        # its own, so these are what the counters read; the two fields above
+        # stay immutable defaults for the next request that omits them.
+        self._effective_delay_iters = profiler_delay_iters
+        self._effective_max_iters = profiler_max_iters
         self._profiler_pending = 0
         self._profiler_recorded = 0
         self._profiler_active = False
@@ -289,26 +296,46 @@ class EngineUtilityHandler:
         logger.info(f"{self.label}: profiler stopped, result={result}")
         return result
 
+    def _resolve_window(self, args: dict):
+        """Fix the window for one run from the request, else the launch flags.
+
+        Resolved per request rather than written back onto
+        ``profiler_delay_iters`` / ``profiler_max_iters``, so one caller's
+        window cannot leak into the next request that asks for none.
+        """
+        delay = args.get("delay_iters")
+        max_iters = args.get("max_iters")
+        self._effective_delay_iters = (
+            self.profiler_delay_iters if delay is None else int(delay)
+        )
+        self._effective_max_iters = (
+            self.profiler_max_iters if max_iters is None else int(max_iters)
+        )
+
     def _handle_start_profile(self, args: dict):
         if self._profiler_active or self._profiler_pending:
             # Starting twice without an intervening stop would leave one trace
             # spanning both runs while the window counts from the second call.
+            # Resolving before this check would also let the rejected call
+            # move the window the live run is being measured against.
             result = {
                 "error": "Profiling is already in progress. Call /stop_profile first."
             }
             logger.warning(f"{self.label}: {result['error']}")
-        elif self.profiler_delay_iters:
-            self._profiler_pending = self.profiler_delay_iters
-            result = {
-                "armed_after_iters": self.profiler_delay_iters,
-                "message": (
-                    f"Profiling armed. Recording starts after "
-                    f"{self.profiler_delay_iters} engine steps."
-                ),
-            }
-            logger.info(f"{self.label}: {result['message']}")
         else:
-            result = self._start_profiler_now()
+            self._resolve_window(args)
+            if self._effective_delay_iters:
+                self._profiler_pending = self._effective_delay_iters
+                result = {
+                    "armed_after_iters": self._effective_delay_iters,
+                    "message": (
+                        f"Profiling armed. Recording starts after "
+                        f"{self._effective_delay_iters} engine steps."
+                    ),
+                }
+                logger.info(f"{self.label}: {result['message']}")
+            else:
+                result = self._start_profiler_now()
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "start_profile", "result": result})
         )
@@ -329,9 +356,9 @@ class EngineUtilityHandler:
             self._profiler_pending -= 1
             if self._profiler_pending == 0:
                 self._start_profiler_now()
-        elif self._profiler_active and self.profiler_max_iters:
+        elif self._profiler_active and self._effective_max_iters:
             self._profiler_recorded += 1
-            if self._profiler_recorded >= self.profiler_max_iters:
+            if self._profiler_recorded >= self._effective_max_iters:
                 self._stop_profiler_now()
 
     # ------------------------------------------------------------------

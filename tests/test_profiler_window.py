@@ -91,15 +91,18 @@ def run_steps(handler, count):
         handler.profiler_step()
 
 
-def rpc_steps(delay=0, max_iters=0, steps=20):
+def rpc_steps(delay=0, max_iters=0, steps=20, body=None):
     """Run a window and report which step each RPC landed on.
 
     Step 0 is the `start_profile` request itself, before any forward. A name
     absent from the result was never sent, so an equality check on the whole
     mapping also pins the cases that must never auto-stop.
+
+    *delay* / *max_iters* are the launch flags; *body* is the request payload,
+    which may carry a window of its own.
     """
     handler, mgr = make_handler(delay, max_iters)
-    handler._handle_start_profile({})
+    handler._handle_start_profile({} if body is None else body)
     landed = dict.fromkeys(mgr.calls, 0)
     for step in range(1, steps + 1):
         already_sent = len(mgr.calls)
@@ -171,6 +174,81 @@ def test_windows_reset_between_requests():
     handler._handle_stop_profile({})
     run_steps(handler, 10)
     assert mgr.calls == one_window * 2 + ["stop_profiler"]
+
+
+# ── Per-request window ────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "body, expected",
+    [
+        # Both fields overridden: neither launch flag is consulted.
+        ({"delay_iters": 0, "max_iters": 3}, {"start_profiler": 0, "stop_profiler": 3}),
+        # One field each way -- the omitted one still comes from its flag.
+        ({"max_iters": 1}, {"start_profiler": 4, "stop_profiler": 5}),
+        ({"delay_iters": 1}, {"start_profiler": 1, "stop_profiler": 9}),
+        # An explicit 0 is a value, not an omission: it has to beat the flag's
+        # 8 and record until /stop_profile rather than fall back to it.
+        ({"delay_iters": 0, "max_iters": 0}, {"start_profiler": 0}),
+    ],
+)
+def test_request_body_overrides_the_launch_flags(body, expected):
+    assert rpc_steps(delay=4, max_iters=8, body=body) == expected
+
+
+def test_a_bodyless_request_keeps_the_launch_flags():
+    """What the endpoint actually sends when the POST carried no body.
+
+    It passes both kwargs unconditionally, so the payload has the keys
+    present and set to None rather than absent -- the case a handler reading
+    `args.get(...)` truthily instead of against None would get wrong.
+    """
+    payload = {"cmd": "start_profile", "delay_iters": None, "max_iters": None}
+    assert rpc_steps(delay=2, max_iters=3, body=payload) == {
+        "start_profiler": 2,
+        "stop_profiler": 5,
+    }
+    assert rpc_steps(delay=2, max_iters=3, body=payload) == rpc_steps(2, 3)
+
+
+def test_a_request_window_does_not_outlive_its_run():
+    handler, mgr = make_handler(delay=0, max_iters=5)
+    one_window = ["start_profiler", "stop_profiler"]
+
+    handler._handle_start_profile({"max_iters": 1})
+    run_steps(handler, 1)
+    assert mgr.calls == one_window
+
+    # The next request omits the field, so it falls back to the flag's 5 --
+    # not to the 1 the previous caller asked for. Resolving the override onto
+    # `profiler_max_iters` itself would stop this window on its first step.
+    handler._handle_start_profile({})
+    run_steps(handler, 4)
+    assert mgr.calls == one_window + ["start_profiler"]
+    handler.profiler_step()
+    assert mgr.calls == one_window * 2
+    assert (handler.profiler_delay_iters, handler.profiler_max_iters) == (
+        0,
+        5,
+    ), "the launch flags are defaults and must stay untouched"
+
+
+def test_a_rejected_start_cannot_move_the_live_window():
+    """The window belongs to the run that is being measured.
+
+    Resolving the request before the already-in-progress check would let a
+    refused call retarget a recording that is already half over -- the reply
+    says 409 and the trace silently runs to someone else's length.
+    """
+    handler, mgr = make_handler(delay=0, max_iters=3)
+    handler._handle_start_profile({})
+    handler.profiler_step()
+
+    handler._handle_start_profile({"delay_iters": 0, "max_iters": 100})
+    assert "error" in list(handler.output_queue.queue)[-1][1]["result"]
+
+    run_steps(handler, 2)
+    assert mgr.calls == ["start_profiler", "stop_profiler"]
 
 
 def test_call_func_ticks_only_on_completed_forwards():

@@ -289,8 +289,17 @@ class LLMEngine:
         outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
         return outputs
 
-    def start_profile(self) -> list[dict[str, Any]]:
-        responses = self.core_mgr.broadcast_utility_command_sync("start_profile")
+    def start_profile(
+        self, delay_iters: int | None = None, max_iters: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Start profiling on every engine.
+
+        *delay_iters* / *max_iters* override the launch flags for this run
+        only; ``None`` leaves each engine on its configured default.
+        """
+        responses = self.core_mgr.broadcast_utility_command_sync(
+            "start_profile", delay_iters=delay_iters, max_iters=max_iters
+        )
         return [resp.get("result", {}) for resp in responses]
 
     def stop_profile(self) -> list[dict[str, Any]]:

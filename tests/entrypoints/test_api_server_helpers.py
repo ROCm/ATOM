@@ -19,6 +19,7 @@ import inspect
 import sys
 import types
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 from import_guard import skip_if_dependency_missing
@@ -264,6 +265,105 @@ class TestAnthropicSamplingParams:
         assert captured["temperature"] == 0.0
         assert captured["top_p"] == 0.95
         assert captured["top_k"] == -1
+
+
+class TestStartProfileBody:
+    """`/start_profile` takes the window in the request, or not at all.
+
+    A caller that cannot restart the server to change `--profiler-*-iters`
+    sends the window it wants instead, and a caller that sends nothing has to
+    behave exactly as before.
+    """
+
+    # What `benchmark_serving.py --profile` sends. It reaches this endpoint
+    # through `async_request_openai_completions`, which asserts only that the
+    # URL ends in "completions" or "profile" and posts its usual completion
+    # payload either way -- a body this endpoint ignored when it took none.
+    BENCHMARK_CLIENT_PAYLOAD: ClassVar[dict] = {
+        "model": "test",
+        "prompt": "hi",
+        "temperature": 0.0,
+        "best_of": 1,
+        "max_tokens": 128,
+        "logprobs": None,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+
+    @staticmethod
+    def _client(monkeypatch, recorded):
+        """The real route, over HTTP, with only the engine replaced.
+
+        Driven through the app rather than by awaiting the coroutine, because
+        the parse and the status code are the behaviour under test and both
+        belong to FastAPI. Deliberately not used as a context manager:
+        entering one runs the app's lifespan, which builds a real engine.
+        """
+        pytest.importorskip("httpx")
+        from fastapi.testclient import TestClient
+
+        def start_profile(**kwargs):
+            recorded.append(kwargs)
+            return [{"message": "Profiling started"}]
+
+        monkeypatch.setattr(
+            api_server, "engine", SimpleNamespace(start_profile=start_profile)
+        )
+        return TestClient(api_server.app)
+
+    def test_a_bodyless_post_overrides_nothing(self, monkeypatch):
+        recorded: list[dict] = []
+        client = self._client(monkeypatch, recorded)
+
+        response = client.post("/start_profile")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "success"
+        assert recorded == [{"delay_iters": None, "max_iters": None}]
+
+        # An empty object is the same request with a body attached.
+        assert client.post("/start_profile", json={}).status_code == 200
+        assert recorded[-1] == {"delay_iters": None, "max_iters": None}
+
+    def test_the_body_window_reaches_the_engine(self, monkeypatch):
+        recorded: list[dict] = []
+        client = self._client(monkeypatch, recorded)
+
+        response = client.post(
+            "/start_profile", json={"delay_iters": 100, "max_iters": 200}
+        )
+
+        assert response.status_code == 200
+        assert recorded == [{"delay_iters": 100, "max_iters": 200}]
+
+    @pytest.mark.parametrize("field", ["delay_iters", "max_iters"])
+    @pytest.mark.parametrize("value", [-1, "abc"])
+    def test_a_bad_window_is_refused_before_the_engine(self, monkeypatch, field, value):
+        """422 from body validation, not a 500 out of the engine.
+
+        The engine must not be told to start at all: a request that was
+        refused has to leave the profiler exactly as it was.
+        """
+        recorded: list[dict] = []
+        client = self._client(monkeypatch, recorded)
+
+        response = client.post("/start_profile", json={field: value})
+
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["loc"] == ["body", field]
+        assert recorded == []
+
+    def test_the_benchmark_clients_completion_payload_is_still_accepted(
+        self, monkeypatch
+    ):
+        """Extra fields are ignored rather than forbidden, or --profile 422s."""
+        recorded: list[dict] = []
+        client = self._client(monkeypatch, recorded)
+
+        response = client.post("/start_profile", json=self.BENCHMARK_CLIENT_PAYLOAD)
+
+        assert response.status_code == 200
+        assert recorded == [{"delay_iters": None, "max_iters": None}]
 
 
 class TestValidateContextLength:

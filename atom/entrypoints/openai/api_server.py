@@ -65,6 +65,7 @@ from .protocol import (
     CompletionRequest,
     ModelCard,
     ModelList,
+    StartProfileRequest,
 )
 from .reasoning import (
     ReasoningChannel,
@@ -2441,10 +2442,16 @@ async def server_info():
 
 
 @app.post("/start_profile")
-async def start_profile():
-    """Start profiling the engine."""
+async def start_profile(request: StartProfileRequest | None = None):
+    """Start profiling the engine.
+
+    An omitted window field falls back to its ``--profiler-*-iters`` flag.
+    """
     try:
-        results = engine.start_profile()
+        results = engine.start_profile(
+            delay_iters=None if request is None else request.delay_iters,
+            max_iters=None if request is None else request.max_iters,
+        )
     except Exception as e:
         logger.exception("Failed to start profiling")
         raise HTTPException(status_code=500, detail=f"Failed to start profiling: {e!s}")

@@ -44,7 +44,7 @@ clients (curl, OpenAI SDK, lm-eval) work without modification.
 | `POST` | `/v1/completions` | Text completion (CompletionRequest -> CompletionResponse) |
 | `GET`  | `/v1/models` | List available models |
 | `GET`  | `/health` | Health check (returns `{"status": "ok"}`) |
-| `POST` | `/start_profile` | Start torch profiler on the engine |
+| `POST` | `/start_profile` | Start torch profiler on the engine (optional StartProfileRequest body) |
 | `POST` | `/stop_profile` | Stop torch profiler and flush traces |
 
 ### Request models
@@ -763,6 +763,30 @@ curl -s -S -X POST http://127.0.0.1:8000/stop_profile
 The server must be started with `--torch-profiler-dir` or with
 `ATOM_TORCH_PROFILER_DIR` set for these endpoints to produce traces.
 For large traces, set `ATOM_PROFILER_TIMEOUT` higher before starting the server.
+
+#### Bounding the window per request
+
+`/start_profile` takes an optional body carrying the window for that run, so
+a bounded trace no longer needs a server restart to change it:
+
+```bash
+# Skip 100 engine steps of ramp-up, record 200, then stop and export
+curl -s -S -X POST http://127.0.0.1:8000/start_profile \
+  -H 'Content-Type: application/json' \
+  -d '{"delay_iters": 100, "max_iters": 200}'
+```
+
+| Field | Effect |
+|-------|--------|
+| `delay_iters` | Engine steps to skip before recording starts. Omitted, it falls back to `--profiler-delay-iters` |
+| `max_iters` | Recorded steps after which the engine stops itself and writes the trace, making `/stop_profile` optional. Omitted, it falls back to `--profiler-max-iters` |
+
+Both are per-run: an omitted field returns to its launch flag on the next
+request rather than to whatever the previous caller asked for. Both must be
+`>= 0`, and a negative value is a 422 from body validation. `0` means "no
+delay" and "record until `/stop_profile`" respectively — an explicit `0`
+still overrides a non-zero flag. A bodyless POST behaves exactly as before,
+which is what keeps `benchmark_serving.py --profile` working.
 
 ### Programmatic profiling
 
