@@ -106,7 +106,7 @@ for(const b of $("role-controls").querySelectorAll("button")){
  b.disabled=b.dataset.role!=="all"&&!states.some(s=>s.role===b.dataset.role);
  b.onclick=()=>{roleFilter=b.dataset.role;hoverTime=null;activePanel=null;refresh();};
 }
-for(const [key,label] of [["overview","Overview"],["latency","Latency"],["workload","Workload"],["cache","Cache & KV"],["host","Host CPU"],["all","All metrics"]]){
+for(const [key,label] of [["overview","Overview"],["latency","Latency"],["workload","Workload"],["cache","Cache & KV"],["all","All metrics"]]){
  const b=node("button","chip",label);b.dataset.category=key;
  b.onclick=()=>{categoryFilter=key;hoverTime=null;activePanel=null;refresh();};
  $("category-controls").append(b);

@@ -1,0 +1,36 @@
+{
+  "archived_on": "2026-09-17",
+  "review_start_inclusive": "3ff61024bca742c8864daf7a91d806a352d9a5b0",
+  "review_base": "709c25be0b2840abdb05e76fa523896e279bb917",
+  "review_end": "c2c68165d02c0db0be46dcdb780570237359415c",
+  "worktree_head_at_archival": "a673da60a6c0eb6892edfb88a39822eef34df4b8",
+  "original_result_python": "3.10.12",
+  "measurement": "median of seven runs; calling thread CPU time; microseconds per call",
+  "scope": "Historical pre-simplification instrumentation microbenchmark; no actual tokenizer or GPU inference benchmark.",
+  "provenance": "Original script/results copied byte-for-byte from session temporary files; source snapshots read from review_end; dependency versions and complete original machine configuration were not captured.",
+  "original_files": {
+    "original/atom_metrics_review_bench.py.txt": {
+      "source": "/tmp/atom_metrics_review_bench.py",
+      "sha256": "3bb0b72f05bad3ba0fbaa7afb14f6afa9c7117ee292b5f561dda8f1ad2b4d076"
+    },
+    "results/atom_metrics_review_bench_mutex.json": {
+      "source": "/tmp/atom_metrics_review_bench_mutex.json",
+      "sha256": "4b0a8f68a5fe679652a47bd09892aa46b52035b6b9d50a9e38e3a5327cfe264d"
+    },
+    "results/atom_metrics_review_bench_mmap.json": {
+      "source": "/tmp/atom_metrics_review_bench_mmap.json",
+      "sha256": "400b9028ff9f5ee013675c7aad6d5911e62f8d671fbd75781457927178174b4a"
+    },
+    "original/cpu_metrics_tests_before_simplification.py.txt": {
+      "source": "/tmp/atom-metrics-simplification-backup/test_cpu_metrics.py",
+      "sha256": "04598635ea06850956c2e658cd76ab288b95221be2a56d3e364eb5fcd1fba2b9"
+    }
+  },
+  "source_snapshot_sha256": {
+    "atom/entrypoints/openai/ttft_breakdown.py": "e4a3471aa1f844ae8216095d79107021af5d8560c6daf249ea31a3f573b40bd7",
+    "atom/entrypoints/openai/streaming_dispatch.py": "e944d65a7153c3b31fb3b4ae5980957beb61abbbef878196d5228e21a8241559",
+    "atom/entrypoints/openai/cpu_metrics.py": "3d634a00cd256faeb1135d5da2273dae96f15a97554a68da84cdde95375079e0",
+    "atom/model_engine/run_labels.py": "851ac842ba05c478045469a1f4f2f1f347e57e0c96aaf778ce58cb0694890288"
+  },
+  "source_snapshot_storage_suffix": ".txt"
+}

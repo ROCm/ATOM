@@ -1,0 +1,16 @@
+{
+  "python": "3.10.12",
+  "value_class": "MutexValue",
+  "timing": "median of 7 runs; calling thread CPU time, microseconds per call",
+  "noop_baseline_us": 0.0168,
+  "detokenize_observer_off_us": 0.0829,
+  "detokenize_observer_on_us": 0.6433,
+  "histogram_observe_zero_us": 0.4612,
+  "trace_disabled_one_span_us": 1.3536,
+  "repeated_callback_dedupe_us": 0.1403,
+  "cpu_collect_cached_us": 23.5919,
+  "cpu_tree_refresh_us": 47.654,
+  "api_stage_render_us": 560.5436,
+  "api_stage_series_count": 210,
+  "detokenize_added_us": 0.5604
+}

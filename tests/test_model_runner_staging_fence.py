@@ -92,12 +92,17 @@ def test_dummy_forward_participates_in_staging_lifetime():
 
     prepare_model = _attribute_calls(method, "prepare_model")
     run_model = _attribute_calls(method, "run_model")
-    assert len(prepare_model) == len(run_model) == 1
-    assert (
+    # Traced and direct branches must both keep the staging boundaries.
+    assert len(prepare_model) == len(run_model) == 2
+    assert all(
         calls_by_name["_gate_staging_reuse"][0].lineno
-        < prepare_model[0].lineno
+        < call.lineno
         < calls_by_name["_mark_staging_h2d_enqueued"][0].lineno
-        < run_model[0].lineno
+        for call in prepare_model
+    )
+    assert all(
+        calls_by_name["_mark_staging_h2d_enqueued"][0].lineno < call.lineno
+        for call in run_model
     )
 
 
@@ -108,9 +113,11 @@ def test_prefill_ready_events_are_recorded_after_model_submission():
     ready_events = _attribute_calls(method, "_record_kv_cache_ready")
     helper_source = ast.unparse(helper)
 
-    assert len(run_model) == 1
+    assert len(run_model) == 2
     assert len(ready_events) == 2
-    assert all(run_model[0].lineno < event.lineno for event in ready_events)
+    assert all(
+        call.lineno < event.lineno for call in run_model for event in ready_events
+    )
     assert "batch.total_seqs_num_prefill <= 0" in helper_source
     assert "batch.is_final_chunk" in helper_source
     assert "if is_final" in helper_source

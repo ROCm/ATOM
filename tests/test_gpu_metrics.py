@@ -93,7 +93,7 @@ def test_poll_checks_only_the_unfinished_head_of_a_full_queue():
 
 
 def test_sample_and_propose_share_the_pending_fifo_without_request_sums():
-    metrics = GPUForwardMetrics(Event)
+    metrics = GPUForwardMetrics(Event, enable_stages=True)
     with metrics.measure_sample(batch()):
         pass
     with metrics.measure_propose(batch(prefill=1, decode=0)):
@@ -463,7 +463,7 @@ def test_sample_and_propose_are_native_histograms_without_phase_labels():
     from prometheus_client.parser import text_string_to_metric_families
 
     registry = CollectorRegistry()
-    metrics = GPUForwardMetrics(Event, registry=registry)
+    metrics = GPUForwardMetrics(Event, registry=registry, enable_stages=True)
     with metrics.measure_sample(batch()):
         pass
     with metrics.measure_propose(batch()):
@@ -484,3 +484,25 @@ def test_sample_and_propose_are_native_histograms_without_phase_labels():
     }
     assert samples[("atom:gpu_sample_seconds_sum", None)] == pytest.approx(0.003)
     assert samples[("atom:gpu_propose_seconds_sum", None)] == pytest.approx(0.005)
+
+
+def test_forward_timer_does_not_enable_sampling_or_propose_events():
+    from prometheus_client import CollectorRegistry, generate_latest
+
+    registry = CollectorRegistry()
+    metrics = GPUForwardMetrics(Event, registry=registry)
+    with metrics.measure(batch()):
+        pass
+    pending = metrics.pending[0]
+    queries = pending[2].queries
+    with metrics.measure_sample(batch()):
+        pass
+    with metrics.measure_propose(batch()):
+        pass
+    assert len(metrics.pending) == 1
+    assert pending[2].queries == queries
+    assert metrics.sample is None and metrics.propose is None
+    text = generate_latest(registry).decode()
+    assert "atom:gpu_forward_seconds" in text
+    assert "atom:gpu_sample_seconds" not in text
+    assert "atom:gpu_propose_seconds" not in text

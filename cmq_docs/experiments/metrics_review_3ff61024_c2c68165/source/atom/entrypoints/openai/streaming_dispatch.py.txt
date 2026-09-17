@@ -431,8 +431,8 @@ class StreamOutputCollector:
         state = chunk.pop("_detokenizer", None)
         if state is not None:
             try:
-                chunk["text"] = state.update(
-                    chunk["token_ids"], bool(chunk.get("finished"))
+                chunk["text"] = _detokenize_timed(
+                    state, chunk["token_ids"], bool(chunk.get("finished"))
                 )
             except Exception:
                 logger.exception(
@@ -530,6 +530,19 @@ class StreamDeliveryTiming:
 class StreamState:
     detokenizer: IncrementalStreamDetokenizer
     timing: StreamDeliveryTiming = field(default_factory=StreamDeliveryTiming)
+    observe_detokenize: Callable[[float], None] | None = None
+
+
+def _detokenize_timed(state: StreamState, token_ids: list[int], finished: bool) -> str:
+    """Run ``detokenizer.update`` and optionally record its wall time."""
+    observe = state.observe_detokenize
+    if observe is None:
+        return state.detokenizer.update(token_ids, finished)
+    t0 = time.perf_counter()
+    try:
+        return state.detokenizer.update(token_ids, finished)
+    finally:
+        observe(time.perf_counter() - t0)
 
 
 class _BufferedChunk(NamedTuple):
@@ -565,10 +578,12 @@ class StreamBatchDispatcher:
         tokenizer: Any,
         synthetic_text: str | None = None,
         observe_inter_token_latency: Callable[[float, int], None] | None = None,
+        observe_detokenize: Callable[[float], None] | None = None,
     ):
         self.tokenizer = tokenizer
         self.synthetic_text = synthetic_text
         self._observe_inter_token_latency = observe_inter_token_latency
+        self._observe_detokenize = observe_detokenize
         self._thread_local = threading.local()
 
     def new_state(self) -> StreamState:
@@ -576,7 +591,8 @@ class StreamBatchDispatcher:
         return StreamState(
             IncrementalStreamDetokenizer(
                 self.tokenizer, synthetic_text=self.synthetic_text
-            )
+            ),
+            observe_detokenize=self._observe_detokenize,
         )
 
     def enqueue(
@@ -608,11 +624,12 @@ class StreamBatchDispatcher:
                 # Keep this state with the pending chunk until get(). Moving
                 # only the JSON/socket work downstream still made four output
                 # threads decode every token while contending for the GIL.
-                item.chunk["_detokenizer"] = item.state.detokenizer
+                item.chunk["_detokenizer"] = item.state
             else:
                 # Queue consumers cannot decode on read and still receive a
                 # prepared chunk, as before.
-                item.chunk["text"] = item.state.detokenizer.update(
+                item.chunk["text"] = _detokenize_timed(
+                    item.state,
                     item.chunk.get("token_ids") or [],
                     bool(item.chunk.get("finished")),
                 )

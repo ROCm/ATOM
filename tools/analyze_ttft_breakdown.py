@@ -20,6 +20,11 @@ def _parse_histograms(text: str) -> dict[str, dict[str, float]]:
     for line in text.splitlines():
         if line.startswith("#") or "_bucket{" not in line:
             continue
+        if (
+            line.startswith("atom:time_to_first_token_seconds_")
+            and 'streaming="true"' not in line
+        ):
+            continue
         m = re.search(r"^(\S+)_bucket\{.*le=\"([^\"]+)\".*\} (\S+)", line)
         if not m:
             continue
@@ -34,6 +39,11 @@ def _parse_sum_count(text: str) -> dict[str, tuple[float, float]]:
     out: dict[str, tuple[float, float]] = {}
     for line in text.splitlines():
         if line.startswith("#"):
+            continue
+        if (
+            line.startswith("atom:time_to_first_token_seconds_")
+            and 'streaming="true"' not in line
+        ):
             continue
         m = re.search(r"^(\S+)_(sum|count)(?:\{[^}]*\})?\s+(\S+)", line)
         if not m:
@@ -85,15 +95,15 @@ def _row(
     return mean
 
 
-# Stages that partition TTFT. `pd_kv` is a subset of `queue_time` and
-# `gpu_forward` a subset of `forward_to_output`, so neither is a term.
-ADDITIVE_STAGES = (
+# Different populations and uncovered boundaries prevent an additive identity.
+STAGES = (
     ("atom:ttft_api_preprocess_seconds", "api_preprocess"),
-    ("atom:ttft_api_enqueue_seconds", "api_enqueue"),
     ("atom:request_queue_time_seconds", "queue_time (engine)"),
     ("atom:ttft_forward_to_output_seconds", "forward_to_output"),
-    ("atom:ttft_output_to_callback_seconds", "output_to_callback"),
-    ("atom:ttft_callback_to_sse_seconds", "callback_to_sse"),
+    ("atom:ttft_output_delivery_seconds", "output_delivery (optional)"),
+    ("atom:api_body_parse_seconds", "body reception / handling"),
+    ("atom:api_chat_template_seconds", "actual chat template calls"),
+    ("atom:api_tokenize_seconds", "actual tokenize calls"),
 )
 SUBSET_STAGES = (
     ("atom:pd_kv_transfer_seconds", "  pd_kv (part of queue_time)"),
@@ -111,26 +121,18 @@ def main() -> int:
     sums = _parse_sum_count(text)
 
     print("Decode TTFT stage breakdown (API + engine histograms):\n")
-    total = 0.0
-    for name, label in ADDITIVE_STAGES:
-        total += _row(name, label, sums, buckets)
+    for name, label in STAGES:
+        _row(name, label, sums, buckets)
     print()
     for name, label in SUBSET_STAGES:
         _row(name, label, sums, buckets)
     print()
-    ttft = _row(
-        "atom:time_to_first_token_seconds", "ttft_total (measured)", sums, buckets
-    )
+    _row("atom:time_to_first_token_seconds", "ttft_total (streaming)", sums, buckets)
 
-    # Only means are additive: per-stage percentiles do not sum to the TTFT
-    # percentile, because the stages' long tails land on different requests.
-    print(f"\n  sum of stage means           mean={total * 1000:>8.1f}ms")
-    if ttft > 0:
-        residual = ttft - total
-        print(
-            f"  residual vs measured             "
-            f"{residual * 1000:+.1f}ms ({residual / ttft * 100:+.2f}% of ttft)"
-        )
+    print(
+        "\nStages cover different request populations and incomplete boundaries; "
+        "means/quantiles are not summed. Unsampled stages are n/a."
+    )
     return 0
 
 

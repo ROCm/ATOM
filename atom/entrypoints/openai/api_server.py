@@ -40,7 +40,7 @@ from atom.entrypoints.chat_utils import has_multimodal_content, parse_chat_messa
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.request import RequestOutput
-from atom.model_engine.run_labels import ttft_trace_span
+from atom.model_engine.run_labels import TTFT_TRACE_ENABLED, ttft_trace_span
 from atom.model_engine.sequence import new_token_ids
 from atom.multimodal.processing import prepare_multimodal_inputs
 from atom.utils import envs
@@ -144,11 +144,6 @@ from .tool_parser.registry import (
     TOOL_CALL_PARSER_HELP,
     forbids_tool_calls,
     resolve_tool_call_parser,
-)
-from .ttft_breakdown import (
-    discard_callback_tracking,
-    first_callback_perf,
-    mark_first_callback,
 )
 
 # Configure logging
@@ -519,12 +514,14 @@ async def _client_stream(
                         ):
                             timing = None
                         elif has_generated_output(payload):
-                            sse_at = timing.first_output(streaming=True)
-                            callback_perf = first_callback_perf(request_id)
-                            if sse_at is not None and callback_perf is not None:
-                                _ttft_breakdown.observe_callback_to_sse(
-                                    sse_at - callback_perf
+                            if (
+                                _ttft_breakdown.output_delivery_enabled
+                                and timing.scheduler_output_at is not None
+                            ):
+                                _ttft_breakdown.observe_output_delivery(
+                                    time.time() - timing.scheduler_output_at
                                 )
+                            timing.first_output(streaming=True)
                             timing = None
                 if timing is None and _request_logger is None:
                     break
@@ -717,17 +714,6 @@ def _send_stream_chunk_direct(
     state: Any,
 ) -> None:
     """Buffer a single-request chunk for this engine step."""
-    if request_output.output_tokens:
-        # Wall clock pairs with the engine's stamp across the process boundary;
-        # perf_counter pairs with the SSE stamp taken later in this process.
-        mark_first_callback(
-            request_id,
-            scheduler_output_at=request_output.scheduler_output_at,
-            callback_at=time.time(),
-            callback_perf=time.perf_counter(),
-            metrics=_ttft_breakdown,
-            has_tokens=bool(request_output.output_tokens),
-        )
     assert _stream_batch_dispatcher is not None
     _stream_batch_dispatcher.enqueue(
         loop=loop,
@@ -834,7 +820,7 @@ async def generate_async(
             tokenize_s = time.perf_counter() - tokenize_t0
         else:
             tokens = prompt_or_tokens
-            tokenize_s = 0.0
+            tokenize_s = None
         seq = engine.io_processor.preprocess(
             tokens,
             sampling_params,
@@ -846,13 +832,10 @@ async def generate_async(
         )
         return seq, tokenize_s
 
-    executor_t0 = time.perf_counter()
     seq, tokenize_s = await loop.run_in_executor(None, do_preprocess)
-    executor_wall = time.perf_counter() - executor_t0
     timing = get_request_timing()
-    if timing is not None:
+    if timing is not None and tokenize_s is not None:
         _ttft_breakdown.observe_api_tokenize(tokenize_s)
-        _ttft_breakdown.observe_api_preprocess_wait(executor_wall - tokenize_s)
     try:
         _validate_sequence_context_length(seq)
     except Exception:
@@ -1094,7 +1077,7 @@ async def generate_async_fanout(
             tokenize_s = time.perf_counter() - tokenize_t0
         else:
             tokens = prompt_or_tokens
-            tokenize_s = 0.0
+            tokenize_s = None
         seqs = engine.io_processor.preprocess_fanout(
             tokens,
             sampling_params,
@@ -1108,13 +1091,10 @@ async def generate_async_fanout(
         )
         return seqs, tokenize_s
 
-    executor_t0 = time.perf_counter()
     seqs, tokenize_s = await loop.run_in_executor(None, do_preprocess)
-    executor_wall = time.perf_counter() - executor_t0
     timing = get_request_timing()
-    if timing is not None:
+    if timing is not None and tokenize_s is not None:
         _ttft_breakdown.observe_api_tokenize(tokenize_s)
-        _ttft_breakdown.observe_api_preprocess_wait(executor_wall - tokenize_s)
     try:
         _validate_sequence_context_length(seqs[0])
     except Exception:
@@ -1253,51 +1233,61 @@ async def setup_streaming_request(
     assert _stream_batch_dispatcher is not None
     detokenizer = _stream_batch_dispatcher.new_state()
 
+    timing = get_request_timing()
+    track_output_delivery = (
+        _ttft_breakdown.output_delivery_enabled and timing is not None
+    )
+
     def stream_callback(request_output: RequestOutput) -> None:
+        if (
+            track_output_delivery
+            and request_output.output_tokens
+            and timing.scheduler_output_at is None
+        ):
+            timing.scheduler_output_at = request_output.scheduler_output_at
         _send_stream_chunk_direct(
             request_output, request_id, stream_collector, stream_loop, detokenizer
         )
 
     executor_loop = asyncio.get_event_loop()
 
-    timing = get_request_timing()
-    middleware_start = timing.started_at if timing is not None else time.perf_counter()
+    def preprocess():
+        if isinstance(prompt_or_tokens, str):
+            tokenize_t0 = time.perf_counter()
+            tokens = engine.tokenizer.encode(prompt_or_tokens)
+            tokenize_s = time.perf_counter() - tokenize_t0
+        else:
+            tokens = prompt_or_tokens
+            tokenize_s = None
+        seq = engine.io_processor.preprocess(
+            tokens,
+            sampling_params,
+            stream_callback=stream_callback,
+            kv_transfer_params=kv_transfer_params,
+            multimodal_data=multimodal_data,
+            data_parallel_rank=data_parallel_rank,
+            dp_session_id=dp_session_id,
+            dp_parent_session_id=dp_parent_session_id,
+        )
+        return seq, tokenize_s
 
     def do_preprocess():
-        with ttft_trace_span("ttft[api_preprocess]"):
-            if isinstance(prompt_or_tokens, str):
-                tokenize_t0 = time.perf_counter()
-                tokens = engine.tokenizer.encode(prompt_or_tokens)
-                tokenize_s = time.perf_counter() - tokenize_t0
-            else:
-                tokens = prompt_or_tokens
-                tokenize_s = 0.0
-            seq = engine.io_processor.preprocess(
-                tokens,
-                sampling_params,
-                stream_callback=stream_callback,
-                kv_transfer_params=kv_transfer_params,
-                multimodal_data=multimodal_data,
-                data_parallel_rank=data_parallel_rank,
-                dp_session_id=dp_session_id,
-                dp_parent_session_id=dp_parent_session_id,
-            )
+        if TTFT_TRACE_ENABLED:
+            with ttft_trace_span("ttft[api_preprocess]"):
+                seq, tokenize_s = preprocess()
+        else:
+            seq, tokenize_s = preprocess()
         _seq_id_to_request_id[seq.id] = request_id
         return seq, tokenize_s
 
     seq = None
     try:
-        with ttft_trace_span("ttft[api_preprocess_wait]"):
-            executor_t0 = time.perf_counter()
-            seq, tokenize_s = await executor_loop.run_in_executor(None, do_preprocess)
-            executor_wall = time.perf_counter() - executor_t0
-        preprocess_done_at = time.perf_counter()
+        seq, tokenize_s = await executor_loop.run_in_executor(None, do_preprocess)
         if timing is not None:
-            _ttft_breakdown.observe_api_tokenize(tokenize_s)
-            _ttft_breakdown.observe_api_preprocess_wait(executor_wall - tokenize_s)
-            _ttft_breakdown.observe_api_preprocess(
-                preprocess_done_at - middleware_start
-            )
+            preprocess_s = time.perf_counter() - timing.started_at
+            if tokenize_s is not None:
+                _ttft_breakdown.observe_api_tokenize(tokenize_s)
+            _ttft_breakdown.observe_api_preprocess(preprocess_s)
         _validate_sequence_context_length(seq)
     except Exception:
         _stream_loops.pop(request_id, None)
@@ -1317,11 +1307,7 @@ async def setup_streaming_request(
     # %-style, not an f-string: the arguments are formatted only if the
     # record is emitted, and this runs once per request with debug off.
     logger.debug("API: Created request_id=%s, seq_id=%s", request_id, seq_id)
-    with ttft_trace_span("ttft[api_enqueue]"):
-        engine.core_mgr.add_request([seq])
-    enqueued_at = time.perf_counter()
-    if timing is not None:
-        _ttft_breakdown.observe_api_enqueue(enqueued_at - preprocess_done_at)
+    engine.core_mgr.add_request([seq])
 
     return seq_id, stream_collector, seq.num_prompt_tokens
 
@@ -1356,7 +1342,6 @@ def cleanup_request(request_id: str) -> None:
     """
     _stream_loops.pop(request_id, None)
     _request_start_times.pop(request_id, None)
-    discard_callback_tracking(request_id)
 
 
 class _ClientDisconnected(Exception):
@@ -1513,7 +1498,7 @@ async def setup_streaming_request_fanout(
             tokenize_s = time.perf_counter() - tokenize_t0
         else:
             tokens = prompt_or_tokens
-            tokenize_s = 0.0
+            tokenize_s = None
         seqs = engine.io_processor.preprocess_fanout(
             tokens,
             sampling_params,
@@ -1531,13 +1516,10 @@ async def setup_streaming_request_fanout(
 
     seqs = []
     try:
-        executor_t0 = time.perf_counter()
         seqs, tokenize_s = await executor_loop.run_in_executor(None, do_preprocess)
-        executor_wall = time.perf_counter() - executor_t0
         timing = get_request_timing()
-        if timing is not None:
+        if timing is not None and tokenize_s is not None:
             _ttft_breakdown.observe_api_tokenize(tokenize_s)
-            _ttft_breakdown.observe_api_preprocess_wait(executor_wall - tokenize_s)
         _validate_sequence_context_length(seqs[0])
     except Exception:
         _stream_loops.pop(request_id, None)
@@ -1771,11 +1753,6 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             # again would cost the largest single slice of decode TTFT to
             # arrive at the same list -- see docs/ttft_breakdown_guide.md.
             prompt_or_tokens = pretokenized
-            if timing is not None:
-                # An explicit zero, so the histogram's count still matches the
-                # request count on a decode node and the skip reads as "0 ms"
-                # rather than as a missing metric.
-                _ttft_breakdown.observe_api_chat_template(0.0)
         else:
             template_t0 = time.perf_counter()
             prompt_or_tokens = apply_chat_template(
@@ -3102,7 +3079,6 @@ def main():
         tokenizer,
         synthetic_text=synthetic_token_text,
         observe_inter_token_latency=_stream_metrics.observe_inter_token_latency,
-        observe_detokenize=_ttft_breakdown.observe_api_detokenize_chunk,
     )
     # Here and not in the dispatcher's constructor: it replays a few thousand
     # updates, which every test that builds a dispatcher would then pay for.

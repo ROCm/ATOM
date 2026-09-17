@@ -142,16 +142,8 @@ class TestDecodeSkipsTheWorkPrefillAlreadyDid:
         assert server.generate[0][0] == "hi"
 
 
-class TestTheSkipIsVisibleInTheChatTemplateHistogram:
-    """A skipped render observes 0, and a real render observes its own wall.
-
-    The zero matters as much as the measurement: without it the histogram's
-    count would not match the request count on a decode node, and "we skipped
-    the template" would be indistinguishable from "this build has no such
-    metric". These run under a request timing, which is the only state that
-    turns the observations on -- the tests above call the handler bare, so they
-    cannot see this code at all.
-    """
+class TestOnlyActualChatTemplateCallsAreObserved:
+    """A skipped render adds no sample; actual calls retain their timings."""
 
     @staticmethod
     def _timed(monkeypatch):
@@ -171,7 +163,7 @@ class TestTheSkipIsVisibleInTheChatTemplateHistogram:
             and sample.name.endswith(("_count", "_sum"))
         }
 
-    def test_reused_ids_observe_a_zero(self, monkeypatch, server):
+    def test_reused_ids_do_not_observe(self, monkeypatch, server):
         exporter = self._timed(monkeypatch)
 
         asyncio.run(
@@ -180,7 +172,7 @@ class TestTheSkipIsVisibleInTheChatTemplateHistogram:
 
         samples = self._template_samples(exporter)
         assert server.templates == 0
-        assert samples["atom:api_chat_template_seconds_count"] == 1
+        assert samples["atom:api_chat_template_seconds_count"] == 0
         assert samples["atom:api_chat_template_seconds_sum"] == 0
 
     def test_a_real_render_observes_its_own_wall_time(self, monkeypatch, server):

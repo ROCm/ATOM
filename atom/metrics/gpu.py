@@ -2,13 +2,14 @@
 
 Also covers the decode-step slices that ``gpu_forward`` deliberately excludes —
 sampling (plus rejection sampling) and MTP propose — under the same
-``ATOM_ENABLE_METRICS_DEVICE_TIMER`` gate and the same CUDA-event pool rules.
+``ATOM_ENABLE_METRICS_DEVICE_STAGES`` opt-in, in addition to the forward timer.
+All enabled stages share the bounded CUDA-event pool.
 """
 
 import logging
 import math
 from collections import OrderedDict, deque
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import wraps
 
@@ -45,7 +46,9 @@ class GPUForwardMetrics:
         tp_rank=0,
         engine_role="default",
         registry=None,
+        enable_stages=False,
     ):
+        self.enable_stages = enable_stages
         self.event_factory = event_factory
         self.max_pending = max_pending
         self.pending = deque()
@@ -63,20 +66,22 @@ class GPUForwardMetrics:
             buckets=LATENCY_BUCKETS,
             registry=registry,
         ).labels(**labels)
-        self.sample = Histogram(
-            "atom:gpu_sample_seconds",
-            "Per-worker device-event duration of sampling and rejection sampling inside postprocess, including any TP/PCP broadcasts of sampled ids before forward_done_event. Excludes prepare_model, target forward and MTP propose. Same ATOM_ENABLE_METRICS_DEVICE_TIMER gate as gpu_forward_seconds.",
-            labels,
-            buckets=LATENCY_BUCKETS,
-            registry=registry,
-        ).labels(**labels)
-        self.propose = Histogram(
-            "atom:gpu_propose_seconds",
-            "Per-worker device-event duration of the whole MTP propose() call (all draft steps summed). Excludes prepare_model, target forward and sampling. Same ATOM_ENABLE_METRICS_DEVICE_TIMER gate as gpu_forward_seconds.",
-            labels,
-            buckets=LATENCY_BUCKETS,
-            registry=registry,
-        ).labels(**labels)
+        self.sample = self.propose = None
+        if enable_stages:
+            self.sample = Histogram(
+                "atom:gpu_sample_seconds",
+                "Per-worker device-event duration of sampling and rejection sampling inside postprocess, including any TP/PCP broadcasts of sampled ids before forward_done_event. Excludes prepare_model, target forward and MTP propose. Requires ATOM_ENABLE_METRICS_DEVICE_TIMER=1 and ATOM_ENABLE_METRICS_DEVICE_STAGES=1.",
+                labels,
+                buckets=LATENCY_BUCKETS,
+                registry=registry,
+            ).labels(**labels)
+            self.propose = Histogram(
+                "atom:gpu_propose_seconds",
+                "Per-worker device-event duration of the whole MTP propose() call (all draft steps summed). Excludes prepare_model, target forward and sampling. Requires ATOM_ENABLE_METRICS_DEVICE_TIMER=1 and ATOM_ENABLE_METRICS_DEVICE_STAGES=1.",
+                labels,
+                buckets=LATENCY_BUCKETS,
+                registry=registry,
+            ).labels(**labels)
         self.prefill_requests = Histogram(
             "atom:prefill_request_gpu_forward_seconds",
             "Per-worker sum of participating batch device durations across a request's initial local prefill chunks; once after all chunks complete, not exclusive request compute time.",
@@ -160,10 +165,14 @@ class GPUForwardMetrics:
 
     def measure_sample(self, batch):
         """Device-event duration of sampling + rejection sampling in postprocess."""
+        if not self.enable_stages:
+            return nullcontext()
         return self._measure(batch, _KIND_SAMPLE, track_requests=False)
 
     def measure_propose(self, batch):
         """Device-event duration of the whole MTP propose() call (all draft steps)."""
+        if not self.enable_stages:
+            return nullcontext()
         return self._measure(batch, _KIND_PROPOSE, track_requests=False)
 
     @contextmanager

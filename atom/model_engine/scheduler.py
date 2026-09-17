@@ -3036,6 +3036,12 @@ class Scheduler:
                         qt.first_scheduler_output_wall_at if qt is not None else None
                     ),
                 )
+                if (
+                    request_output.scheduler_output_at is not None
+                    and output_tokens_list
+                ):
+                    # Carry the diagnostic stamp once, not on every decode chunk.
+                    qt.first_scheduler_output_wall_at = None
 
                 if request_output.kv_transfer_params_output is not None:
                     logger.debug("KV transfer output present in stream output.")

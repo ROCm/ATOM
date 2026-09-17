@@ -45,7 +45,11 @@ from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
-from atom.model_engine.run_labels import build_run_label, ttft_trace_span
+from atom.model_engine.run_labels import (
+    TTFT_TRACE_ENABLED,
+    build_run_label,
+    ttft_trace_span,
+)
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import (
     Sequence,
@@ -823,6 +827,7 @@ class ModelRunner:
         if envs.ATOM_ENABLE_METRICS_DEVICE_TIMER:
             self.gpu_forward_metrics = GPUForwardMetrics(
                 lambda: torch.cuda.Event(enable_timing=True),
+                enable_stages=envs.ATOM_ENABLE_METRICS_DEVICE_STAGES,
                 dp_rank=config.parallel_config.data_parallel_rank,
                 pp_rank=config.parallel_config.pipeline_parallel_rank,
                 tp_rank=self.rank,
@@ -2997,7 +3002,7 @@ class ModelRunner:
         gpu_metrics = getattr(self, "gpu_forward_metrics", None)
         sample_cm = (
             gpu_metrics.measure_sample(batch)
-            if gpu_metrics is not None
+            if gpu_metrics is not None and gpu_metrics.enable_stages
             else nullcontext()
         )
         with sample_cm:
@@ -3104,7 +3109,9 @@ class ModelRunner:
         draft_token_ids: np.ndarray | None = None
         propose_cm = (
             gpu_metrics.measure_propose(batch)
-            if gpu_metrics is not None and hasattr(self, "drafter")
+            if gpu_metrics is not None
+            and gpu_metrics.enable_stages
+            and hasattr(self, "drafter")
             else nullcontext()
         )
         if self.tokenID_processor.is_deferred_out:
@@ -3214,17 +3221,24 @@ class ModelRunner:
         # race the dummy's still-pending H2D copies.
         self._advance_forward_vars()
         self._gate_staging_reuse()
-        with ttft_trace_span("ttft[prepare_model]"):
-            (
-                input_ids,
-                temperatures,
-                top_ks,
-                top_ps,
-                all_greedy,
-                needs_independent_noise,
-            ) = self.prepare_model(batch)
+        if TTFT_TRACE_ENABLED:
+            with ttft_trace_span("ttft[prepare_model]"):
+                prepared = self.prepare_model(batch)
+        else:
+            prepared = self.prepare_model(batch)
+        (
+            input_ids,
+            temperatures,
+            top_ks,
+            top_ps,
+            all_greedy,
+            needs_independent_noise,
+        ) = prepared
         self._mark_staging_h2d_enqueued()
-        with ttft_trace_span("ttft[gpu_forward]"):
+        if TTFT_TRACE_ENABLED:
+            with ttft_trace_span("ttft[gpu_forward]"):
+                logits, hidden_states = self.run_model(input_ids, batch)
+        else:
             logits, hidden_states = self.run_model(input_ids, batch)
 
         pp_group = get_pp_group()
@@ -3283,7 +3297,19 @@ class ModelRunner:
                 draft_token_ids=None,
             )
 
-        with ttft_trace_span("ttft[postprocess]"):
+        if TTFT_TRACE_ENABLED:
+            with ttft_trace_span("ttft[postprocess]"):
+                fwd_output = self.postprocess(
+                    batch,
+                    logits,
+                    temperatures,
+                    top_ks,
+                    top_ps,
+                    all_greedy,
+                    hidden_states,
+                    needs_independent_noise=needs_independent_noise,
+                )
+        else:
             fwd_output = self.postprocess(
                 batch,
                 logits,

@@ -130,17 +130,10 @@ def test_scheduler_queries_keep_units_and_gauge_semantics():
 
 
 def test_preprocess_and_step_stages_are_panels_of_their_own():
-    """Everything api_preprocess and a decode step are made of gets a panel.
-
-    They were instrumented but unplotted, so a report could not answer either
-    question the histograms exist for: which stage of preprocess a TTFT went
-    into, and whether ITL times the tokens per forward lands on the device time
-    of a step. Asserted per role, because the answers differ by role -- a
-    decode node reusing the prefill's ids observes 0 for template and tokenize.
-    """
+    """Reports query retained stages and opt-in diagnostics only."""
     panels = {p["id"]: p for p in report.panels_for("pd")}
     for role in ("prefill", "decode"):
-        for stage in ("body_parse", "chat_template", "tokenize", "preprocess_wait"):
+        for stage in ("body_parse", "chat_template", "tokenize"):
             panel = panels[f"{role}_api_{stage}"]
             assert panel["metric"] == f"atom:api_{stage}_seconds"
             assert f'role="{role}"' in panel["selector"]
@@ -149,11 +142,18 @@ def test_preprocess_and_step_stages_are_panels_of_their_own():
             panel = panels[f"{role}_gpu_{stage}"]
             assert panel["metric"] == f"atom:gpu_{stage}_seconds"
             assert report.query_for(panel, "mean", 60).startswith("1000 * ")
-    # Delivery, not a TTFT slice, so only the streaming role carries it.
-    assert panels["decode_api_detokenize"]["metric"] == (
-        "atom:api_detokenize_chunk_seconds"
+    assert panels["decode_ttft_output_delivery"]["metric"] == (
+        "atom:ttft_output_delivery_seconds"
     )
-    assert "prefill_api_detokenize" not in panels
+    removed = (
+        "detokenize",
+        "preprocess_wait",
+        "api_enqueue",
+        "output_to_callback",
+        "callback_to_sse",
+    )
+    assert not any(part in key for key in panels for part in removed)
+    assert not any(panel.get("kind") == "cpu" for panel in panels.values())
 
 
 def test_a_gauge_panel_is_averaged_rather_than_read_as_a_histogram():

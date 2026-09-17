@@ -1,0 +1,73 @@
+import json
+import os
+import statistics
+import sys
+import tempfile
+import time
+import timeit
+from types import SimpleNamespace
+
+storage = None
+if '--multiprocess' in sys.argv:
+    storage = tempfile.TemporaryDirectory(prefix='atom-metrics-review-')
+    os.environ['PROMETHEUS_MULTIPROC_DIR'] = storage.name
+os.environ['ATOM_TTFT_TRACE'] = '0'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['OMP_NUM_THREADS'] = '1'
+sys.path.insert(0, '/it-share/mengqingcao/code/ATOM_baseline_9acb0843')
+from prometheus_client import CollectorRegistry, generate_latest, multiprocess, values
+from atom.entrypoints.openai.ttft_breakdown import (
+    TtftBreakdownMetrics, mark_first_callback, _first_callback_at,
+)
+from atom.entrypoints.openai.streaming_dispatch import StreamState, _detokenize_timed
+from atom.entrypoints.openai.cpu_metrics import _ProcessTree, collect_cpu_metrics
+from atom.model_engine.run_labels import ttft_trace_span
+
+registry = CollectorRegistry()
+metrics = TtftBreakdownMetrics(registry)
+
+class NoopDetokenizer:
+    def update(self, token_ids, finished):
+        return 'x'
+
+state_off = StreamState(NoopDetokenizer())
+state_on = StreamState(NoopDetokenizer(), observe_detokenize=metrics.observe_api_detokenize_chunk)
+tokens = [1]
+
+def trace_off():
+    with ttft_trace_span('ttft[gpu_forward]'):
+        pass
+
+def repeated_callback():
+    mark_first_callback('existing', scheduler_output_at=1.0,
+                        callback_at=time.time(), callback_perf=time.perf_counter(),
+                        metrics=metrics, has_tokens=True)
+
+_first_callback_at['existing'] = 1.0
+
+def measure(fn, n=50000):
+    times = timeit.Timer(fn, timer=time.thread_time).repeat(repeat=7, number=n)
+    return round(statistics.median(times) / n * 1e6, 4)
+
+result = {
+    'python': sys.version.split()[0],
+    'value_class': values.ValueClass.__name__,
+    'timing': 'median of 7 runs; calling thread CPU time, microseconds per call',
+    'noop_baseline_us': measure(lambda: None),
+    'detokenize_observer_off_us': measure(lambda: _detokenize_timed(state_off, tokens, False)),
+    'detokenize_observer_on_us': measure(lambda: _detokenize_timed(state_on, tokens, False)),
+    'histogram_observe_zero_us': measure(lambda: metrics.observe_api_tokenize(0.0)),
+    'trace_disabled_one_span_us': measure(trace_off),
+    'repeated_callback_dedupe_us': measure(repeated_callback),
+    'cpu_collect_cached_us': measure(lambda: list(collect_cpu_metrics({})), n=100),
+    'cpu_tree_refresh_us': measure(lambda: _ProcessTree(refresh_seconds=0).snapshot(), n=5),
+}
+if storage is not None:
+    exported = CollectorRegistry()
+    multiprocess.MultiProcessCollector(exported)
+else:
+    exported = registry
+result['api_stage_render_us'] = measure(lambda: generate_latest(exported), n=100)
+result['api_stage_series_count'] = sum(1 for line in generate_latest(exported).splitlines() if not line.startswith(b'#'))
+result['detokenize_added_us'] = round(result['detokenize_observer_on_us'] - result['detokenize_observer_off_us'], 4)
+print(json.dumps(result, indent=2))

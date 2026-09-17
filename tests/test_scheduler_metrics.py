@@ -693,7 +693,9 @@ def test_large_batch_contexts_have_finite_buckets_through_exposition(
     assert values[(f"atom:{phase}_context_tokens_count", labels)] == 1
 
 
-def test_forward_to_output_records_first_emit_once(clock):
+@pytest.mark.parametrize("enabled", [False, True])
+def test_forward_to_output_records_first_emit_once(clock, monkeypatch, enabled):
+    monkeypatch.setenv("ATOM_ENABLE_METRICS_OUTPUT_DELIVERY", str(int(enabled)))
     metrics = SchedulerMetrics()
     seq = SimpleNamespace()
     metrics.enqueue(seq)
@@ -708,4 +710,42 @@ def test_forward_to_output_records_first_emit_once(clock):
     assert histogram_values_by_name(metrics)["forward_to_output"][
         "sum"
     ] == pytest.approx(0.05)
-    assert seq.queue_timing.first_scheduler_output_wall_at is not None
+    assert (seq.queue_timing.first_scheduler_output_wall_at is not None) == enabled
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_delivery_stamp_is_carried_only_by_first_output(monkeypatch, enabled):
+    from atom.model_engine.scheduler import ScheduledBatchOutput
+
+    monkeypatch.setenv("ATOM_ENABLE_METRICS_OUTPUT_DELIVERY", str(int(enabled)))
+    scheduler = Scheduler(MockConfig())
+    seq = Sequence([1, 3, 4], block_size=4)
+    scheduler.add(seq)
+    queue = Queue()
+    outputs = []
+    for token in (10, 11):
+        scheduled, seqs = scheduler.schedule()
+        # The engine records dispatch after schedule(), before the worker runs.
+        scheduler.metrics.record_forward(scheduled, seqs)
+        scheduler.postprocess(
+            list(scheduler.running),
+            ScheduledBatchOutput(
+                req_ids=[seq.id],
+                token_ids=[(token,)],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+            stream_output_queue=queue,
+        )
+        outputs.append(queue.get_nowait()[0][1])
+    assert outputs[0].output_tokens == [10]
+    assert outputs[1].output_tokens == [11]
+    assert (outputs[0].scheduler_output_at is not None) == enabled
+    assert outputs[1].scheduler_output_at is None
+    assert (
+        histogram_values_by_name(scheduler.metrics)["forward_to_output"]["buckets"][-1][
+            1
+        ]
+        == 1
+    )

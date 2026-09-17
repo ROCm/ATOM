@@ -627,7 +627,6 @@ def test_dispatcher_keeps_no_per_stream_state():
         "tokenizer",
         "synthetic_text",
         "_observe_inter_token_latency",
-        "_observe_detokenize",
         "_thread_local",
     }
     for collector in collectors:

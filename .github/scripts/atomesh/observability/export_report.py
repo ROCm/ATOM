@@ -177,9 +177,8 @@ def panels_for(deployment: str) -> list[dict]:
                 "unit": "ms",
             }
         )
-    # TTFT stage slices, cut so each ends where the next begins. Their means add
-    # up to the role's streaming TTFT; their percentiles do not, because the
-    # stages' tails land on different requests. docs/ttft_breakdown_guide.md.
+    # Stage populations differ (HTTP requests versus sequences); these panels
+    # are diagnostic views, not additive terms of a TTFT identity.
     role = roles[-1]
     for suffix, title, observer, detail in (
         (
@@ -189,28 +188,16 @@ def panels_for(deployment: str) -> list[dict]:
             "Middleware entry → preprocess() returns · chat template, tokenize, sequence build · thread-pooled, so it overlaps other requests but is serial ahead of this one's enqueue",
         ),
         (
-            "api_enqueue",
-            "TTFT · API enqueue",
-            "API",
-            "preprocess() returns → add_request() returns · handing the sequence to the engine",
-        ),
-        (
             "forward_to_output",
             "TTFT · forward to output",
             "SCHEDULER",
             "First real forward dispatch → scheduler's first generation emit · superset of GPU forward: also spans prepare_model, drafting, sampling and postprocess",
         ),
         (
-            "output_to_callback",
-            "TTFT · output to callback",
-            "IPC",
-            "Scheduler emit → API stream callback · the engine→API hop, measured on wall clock since the ends are separate processes",
-        ),
-        (
-            "callback_to_sse",
-            "TTFT · callback to SSE",
+            "output_delivery",
+            "TTFT · output delivery",
             "API",
-            "Stream callback → first SSE payload carrying content · detokenize, frame encode, and the output-thread→event-loop hop",
+            "Scheduler first generation emit → first generated SSE payload · IPC and frontend processing · opt-in: ATOM_ENABLE_METRICS_OUTPUT_DELIVERY=1 · excludes transport to the client",
         ),
     ):
         panels.append(
@@ -225,30 +212,24 @@ def panels_for(deployment: str) -> list[dict]:
                 "unit": "ms",
             }
         )
-    # What api_preprocess is made of. Recorded on every role, and on a decode
-    # node reusing the prefill's ids the template and tokenize stages observe an
-    # explicit 0 -- so a flat zero line here means "skipped", not "not measured".
+    # Template/tokenize count only operations that actually run, including
+    # decode fallback. Reused token ids do not add zero-duration observations.
     for role in roles:
         for suffix, title, detail in (
             (
                 "body_parse",
                 "API body parse",
-                "Request JSON decode and pydantic validation, before preprocess() · chat completions only",
+                "Middleware entry → chat handler entry · body reception, JSON/pydantic processing, dependencies and waits",
             ),
             (
                 "chat_template",
                 "API chat template",
-                "apply_chat_template and the custom message encoder · observes 0 when the request already carries prompt_token_ids",
+                "Actual apply_chat_template calls · no observations when prompt_token_ids are reused",
             ),
             (
                 "tokenize",
                 "API tokenize",
-                "tokenizer.encode on the rendered prompt · observes 0 when the input is already token ids, which is the whole point of the PD id handoff",
-            ),
-            (
-                "preprocess_wait",
-                "API preprocess wait",
-                "The executor wall for preprocess minus the tokenizer call · thread-pool queue delay plus Sequence construction",
+                "Actual tokenizer.encode calls in API preprocessing · no observations for pre-tokenized inputs",
             ),
         ):
             panels.append(
@@ -266,23 +247,11 @@ def panels_for(deployment: str) -> list[dict]:
     role = roles[-1]
     panels.append(
         {
-            "id": f"{role}_api_detokenize",
-            "role": role,
-            "title": "API detokenize",
-            "label": f"{role.upper()} · API",
-            "detail": "Incremental detokenize per streamed chunk · inside the TTFT callback-to-SSE slice for the first chunk, and on the ITL delivery path for every one after",
-            "metric": "atom:api_detokenize_chunk_seconds",
-            "selector": f'job="atom",role="{role}"',
-            "unit": "ms",
-        }
-    )
-    panels.append(
-        {
             "id": f"{role}_mtp_tokens_per_forward",
             "role": role,
             "title": "MTP tokens per forward",
             "label": f"{role.upper()} · SPECULATION",
-            "detail": "Accepted tokens emitted per decode step · the multiplier between inter-token latency and step wall time, so ITL times this is what GPU per-step, sampling and propose have to add up to",
+            "detail": "Average tokens per forward · acceptance efficiency; token-weighted ITL and worker step timings have different sample populations",
             "metric": "atom:mtp_average_tokens_per_forward",
             "selector": f'job="atom",role="{role}"',
             "unit": "tokens",
@@ -320,7 +289,7 @@ def panels_for(deployment: str) -> list[dict]:
                     "label": f"{role.upper()} · GPU WORKERS",
                     "unit": "ms",
                     "metric": "atom:gpu_sample_seconds",
-                    "detail": "Sampling and rejection sampling inside postprocess, including the TP/PCP broadcast of sampled ids · one observation per worker forward that samples · same device-timer gate as GPU per-step",
+                    "detail": "Sampling and rejection sampling inside postprocess, including the TP/PCP broadcast of sampled ids · one observation per worker forward that samples · requires both ATOM_ENABLE_METRICS_DEVICE_TIMER=1 and ATOM_ENABLE_METRICS_DEVICE_STAGES=1",
                 },
                 {
                     **common,
@@ -329,17 +298,7 @@ def panels_for(deployment: str) -> list[dict]:
                     "label": f"{role.upper()} · GPU WORKERS",
                     "unit": "ms",
                     "metric": "atom:gpu_propose_seconds",
-                    "detail": "The whole MTP propose() · one observation per worker forward that drafts · GPU per-step plus sampling plus this is the device time of one decode step",
-                },
-                {
-                    **common,
-                    "id": f"{role}_cpu",
-                    "title": f"{role.title()} host CPU",
-                    "label": f"{role.upper()} · HOST",
-                    "unit": "cores",
-                    "kind": "cpu",
-                    "metric": "atom:process_cpu_seconds",
-                    "detail": "Cores consumed by this role's process tree · API row bounds api_preprocess, engine row covers engine cores and GPU workers · compare against atom:process_cpus",
+                    "detail": "The whole MTP propose() · one observation per worker forward that drafts · requires both ATOM_ENABLE_METRICS_DEVICE_TIMER=1 and ATOM_ENABLE_METRICS_DEVICE_STAGES=1",
                 },
             ]
         )

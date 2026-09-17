@@ -62,6 +62,9 @@ class RequestTiming:
     observe: Callable[[float, bool], None]
     recorded: bool = False
     streaming_response: bool = False
+    # Optional wall-clock stamp copied from the engine's first token output.
+    # The request callback captures this object across the thread boundary.
+    scheduler_output_at: float | None = None
 
     def first_output(self, *, streaming: bool) -> float | None:
         if not self.recorded:

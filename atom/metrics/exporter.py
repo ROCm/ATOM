@@ -19,8 +19,6 @@ from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 
-from atom.entrypoints.openai.cpu_metrics import collect_cpu_metrics
-
 Snapshot = dict[str, Any]
 SnapshotState = tuple[Snapshot, int, float]
 
@@ -447,7 +445,6 @@ class _AtomMetricsCollector:
             yield metric
 
         yield from _gc_metrics(describe=describe)
-        yield from collect_cpu_metrics(None if describe else snapshot)
 
 
 def _gc_metrics(

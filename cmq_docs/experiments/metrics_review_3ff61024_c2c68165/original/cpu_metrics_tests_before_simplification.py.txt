@@ -1,0 +1,272 @@
+"""Process-tree CPU accounting, without spawning an engine."""
+
+from types import SimpleNamespace
+
+import psutil
+import pytest
+from prometheus_client import CollectorRegistry, generate_latest
+
+from atom.entrypoints.openai import cpu_metrics
+from atom.entrypoints.openai.cpu_metrics import (
+    _SELF_LABEL,
+    _ProcessTree,
+    _visible_cpus,
+    collect_cpu_metrics,
+)
+
+
+class Proc:
+    """Stands in for psutil.Process, counting the reads a scrape performs."""
+
+    def __init__(self, name, user=0.0, system=0.0, threads=1, alive=True):
+        self._name = name
+        self.times = SimpleNamespace(user=user, system=system)
+        self.threads = threads
+        self.alive = alive
+        self.reads = 0
+
+    def name(self):
+        return self._name
+
+    def oneshot(self):
+        class Ctx:
+            def __enter__(inner):
+                return None
+
+            def __exit__(inner, *exc):
+                return False
+
+        return Ctx()
+
+    def cpu_times(self):
+        if not self.alive:
+            raise psutil.NoSuchProcess(1234)
+        self.reads += 1
+        return self.times
+
+    def num_threads(self):
+        if not self.alive:
+            raise psutil.NoSuchProcess(1234)
+        return self.threads
+
+
+def samples(metrics, name):
+    for metric in metrics:
+        if metric.name == name:
+            return {tuple(sorted(s.labels.items())): s.value for s in metric.samples}
+    raise AssertionError(f"{name} was not exported")
+
+
+def with_tree(monkeypatch, pairs):
+    monkeypatch.setattr(
+        cpu_metrics, "_TREE", SimpleNamespace(snapshot=lambda: list(pairs))
+    )
+
+
+def test_describe_reserves_families_without_reading_any_process(monkeypatch):
+    """The registry describes at import time, before a snapshot exists."""
+
+    def forbidden():
+        raise AssertionError("describe must not read process state")
+
+    monkeypatch.setattr(cpu_metrics, "_TREE", SimpleNamespace(snapshot=forbidden))
+    families = list(collect_cpu_metrics(None))
+
+    assert [m.name for m in families] == [
+        "atom:process_cpu_seconds",
+        "atom:process_threads",
+        "atom:process_cpus",
+    ]
+    assert all(m.samples == [] for m in families)
+
+
+def test_processes_sharing_a_title_are_summed_not_emitted_twice(monkeypatch):
+    """Two ranks may carry the same title; duplicate label sets are invalid."""
+    with_tree(
+        monkeypatch,
+        [
+            (_SELF_LABEL, Proc("api", user=1.0, system=0.5, threads=9)),
+            ("worker", Proc("w0", user=2.0, system=1.0, threads=3)),
+            ("worker", Proc("w1", user=4.0, system=2.0, threads=5)),
+        ],
+    )
+    families = list(collect_cpu_metrics({}))
+
+    cpu = samples(families, "atom:process_cpu_seconds")
+    assert cpu[(("mode", "user"), ("process", "worker"))] == 6.0
+    assert cpu[(("mode", "system"), ("process", "worker"))] == 3.0
+    assert cpu[(("mode", "user"), ("process", "api"))] == 1.0
+    # One row per (process, mode), so the exposition stays renderable.
+    assert len(cpu) == 4
+    assert samples(families, "atom:process_threads")[(("process", "worker"),)] == 8.0
+
+
+def test_a_process_that_exits_mid_scrape_does_not_fail_the_scrape(monkeypatch):
+    """Rendering runs on the loop serving every stream; it must not raise."""
+    with_tree(
+        monkeypatch,
+        [
+            (_SELF_LABEL, Proc("api", user=1.0, system=0.5)),
+            ("engine", Proc("engine", alive=False)),
+        ],
+    )
+    cpu = samples(list(collect_cpu_metrics({})), "atom:process_cpu_seconds")
+
+    assert set(cpu) == {
+        (("mode", "user"), ("process", "api")),
+        (("mode", "system"), ("process", "api")),
+    }
+
+
+def test_a_tree_that_cannot_be_walked_still_reports_this_process(monkeypatch):
+    class Unwalkable(Proc):
+        def children(self, recursive):
+            raise psutil.Error()
+
+    monkeypatch.setattr(
+        psutil, "Process", lambda: Unwalkable("api", user=3.0, system=1.0)
+    )
+    monkeypatch.setattr(cpu_metrics, "_TREE", _ProcessTree())
+
+    cpu = samples(list(collect_cpu_metrics({})), "atom:process_cpu_seconds")
+
+    assert cpu[(("mode", "user"), ("process", "api"))] == 3.0
+
+
+class Tree:
+    """A self process whose children are fixed, counting the /proc walks."""
+
+    def __init__(self, children):
+        self._children = children
+        self.walks = 0
+
+    def name(self):
+        return "atom::api"
+
+    def children(self, recursive):
+        assert recursive
+        self.walks += 1
+        return self._children
+
+
+def test_titles_drop_the_shared_prefix_that_set_process_title_writes(monkeypatch):
+    # set_process_title writes "<prefix>::<name>"; the prefix is constant across
+    # the tree, so only the name distinguishes a rank.
+    child = Proc("atom::engine_dp0", user=1.0)
+    monkeypatch.setattr(psutil, "Process", lambda: Tree([child]))
+    tree = _ProcessTree()
+
+    assert [label for label, _ in tree.snapshot()] == [_SELF_LABEL, "engine_dp0"]
+
+
+def test_a_title_free_child_falls_back_to_its_process_name(monkeypatch):
+    monkeypatch.setattr(psutil, "Process", lambda: Tree([Proc("python3")]))
+
+    assert [label for label, _ in _ProcessTree().snapshot()][1] == "python3"
+
+
+def test_the_proc_walk_is_cached_because_it_scans_every_pid(monkeypatch):
+    """children(recursive=True) is O(all pids); a scrape must not pay it."""
+    root = Tree([Proc("atom::engine", user=1.0)])
+    monkeypatch.setattr(psutil, "Process", lambda: root)
+    tree = _ProcessTree(refresh_seconds=1e6)
+
+    for _ in range(50):
+        tree.snapshot()
+
+    assert root.walks == 1
+
+
+def test_the_cached_tree_is_refreshed_once_the_timer_expires(monkeypatch):
+    root = Tree([Proc("atom::engine", user=1.0)])
+    monkeypatch.setattr(psutil, "Process", lambda: root)
+    clock = iter([0.0, 100.0])
+    # Patch the module's handle, not the shared time module.
+    monkeypatch.setattr(
+        cpu_metrics, "time", SimpleNamespace(monotonic=lambda: next(clock))
+    )
+    tree = _ProcessTree(refresh_seconds=30.0)
+
+    tree.snapshot()
+    tree.snapshot()
+
+    assert root.walks == 2
+
+
+def test_this_process_is_measured_for_real_and_reports_its_own_ceiling():
+    """No fakes: the api row must be real, finite and non-negative."""
+    families = list(collect_cpu_metrics({}))
+    cpu = samples(families, "atom:process_cpu_seconds")
+    user = cpu[(("mode", "user"), ("process", _SELF_LABEL))]
+
+    assert user >= 0.0
+    assert samples(families, "atom:process_threads")[(("process", _SELF_LABEL),)] >= 1.0
+    cpus = samples(families, "atom:process_cpus")[()]
+    assert cpus == float(_visible_cpus()) >= 1.0
+
+
+def test_cpu_seconds_only_ever_increase_for_this_process():
+    """A counter that went backwards would make rate() report a false spike."""
+    label = (("mode", "user"), ("process", _SELF_LABEL))
+    first = samples(list(collect_cpu_metrics({})), "atom:process_cpu_seconds")
+    sum(range(400000))  # burn measurable user time
+    second = samples(list(collect_cpu_metrics({})), "atom:process_cpu_seconds")
+
+    assert second[label] >= first[label]
+
+
+def test_the_exposition_renders_through_a_registry_the_way_the_server_does():
+    registry = CollectorRegistry(auto_describe=False)
+
+    class Collector:
+        def describe(self):
+            return collect_cpu_metrics(None)
+
+        def collect(self):
+            return collect_cpu_metrics({})
+
+    registry.register(Collector())
+    text = generate_latest(registry).decode()
+
+    assert 'atom:process_cpu_seconds_total{mode="user",process="api"}' in text
+    assert "# TYPE atom:process_cpu_seconds_total counter" in text
+    assert "# TYPE atom:process_cpus gauge" in text
+
+
+def test_the_server_registers_cpu_collection_alongside_its_other_sources():
+    """Regression: the collector is only useful if the exporter carries it."""
+    from atom.entrypoints.openai.metrics_setup import create_metrics_exporter
+
+    exporter, *_ = create_metrics_exporter()
+    text = exporter.render().decode()
+
+    assert "atom:process_cpu_seconds_total" in text
+    assert "atom:process_cpus" in text
+
+
+@pytest.mark.parametrize("deployment", ["pd", "standalone"])
+def test_report_panels_query_cores_split_at_the_event_loop(deployment):
+    import importlib.util
+    from pathlib import Path
+
+    path = (
+        Path(__file__).resolve().parents[1]
+        / ".github/scripts/atomesh/observability/export_report.py"
+    )
+    spec = importlib.util.spec_from_file_location("export_report", path)
+    export_report = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(export_report)
+
+    panels = [p for p in export_report.panels_for(deployment) if p.get("kind") == "cpu"]
+
+    assert panels, "every deployment needs host CPU panels"
+    for panel in panels:
+        assert panel["unit"] == "cores" and panel["category"] == "host"
+        assert export_report.statistics_for(panel) == ("api", "engine")
+        api = export_report.query_for(panel, "api", 60)
+        engine = export_report.query_for(panel, "engine", 60)
+        # rate() of a counter, not a sampled gauge: bursts between scrapes are
+        # the whole point of the panel.
+        assert api.startswith("sum(rate(atom:process_cpu_seconds_total{")
+        assert 'process="api"' in api and 'process!="api"' in engine
+        assert "[60s]))" in api

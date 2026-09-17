@@ -14,6 +14,7 @@ import numpy as np
 from prometheus_client import Gauge, Histogram
 
 from atom.metrics.histogram import LATENCY_BUCKETS
+from atom.utils import envs
 
 BATCH_BUCKETS = (1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 512, 1024)
 TOKEN_BUCKETS = (
@@ -50,12 +51,13 @@ class RequestQueueTiming:
     decode_context_observed: bool = False
     first_forward_at: float | None = None
     first_scheduler_output_at: float | None = None
-    # Wall clock for API↔engine TTFT slices (perf_counter is process-local).
+    # Optional wall-clock stamp, consumed by the first token-bearing output.
     first_scheduler_output_wall_at: float | None = None
 
 
 class SchedulerMetrics:
     def __init__(self, dp_rank=0, engine_role="default", *, registry=None):
+        self.output_delivery_enabled = envs.ATOM_ENABLE_METRICS_OUTPUT_DELIVERY
         labels = {"dp_rank": str(dp_rank), "engine_role": engine_role}
         self._labels = labels
         self.queue_time = Histogram(
@@ -254,6 +256,7 @@ class SchedulerMetrics:
             return
         now = time.perf_counter()
         timing.first_scheduler_output_at = now
-        timing.first_scheduler_output_wall_at = time.time()
+        if self.output_delivery_enabled:
+            timing.first_scheduler_output_wall_at = time.time()
         if timing.first_forward_at is not None:
             self.forward_to_output.observe(now - timing.first_forward_at)

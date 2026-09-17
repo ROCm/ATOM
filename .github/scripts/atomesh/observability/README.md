@@ -6,7 +6,9 @@ additional workflow input or long-running monitoring server is required.
 
 GPU event timing is disabled by default in ATOM. Agentic CI sets
 `ATOM_ENABLE_METRICS_DEVICE_TIMER=1` on the prefill and decode services so their
-GPU panels have data. Set `env.common.ATOM_ENABLE_METRICS_DEVICE_TIMER: "0"` in the job
+forward and request-prefill GPU panels have data. Sampling and propose need
+`env.common.ATOM_ENABLE_METRICS_DEVICE_STAGES: "1"` as well. Output delivery needs
+`env.common.ATOM_ENABLE_METRICS_OUTPUT_DELIVERY: "1"` on both roles. Set `env.common.ATOM_ENABLE_METRICS_DEVICE_TIMER: "0"` in the job
 configuration to disable it; GPU panels then have no samples. Other metrics
 remain available. Event polling stops at the first unfinished event and reuses
 completed pairs, with at most 256 pending pairs per worker and no GPU synchronization.
@@ -17,37 +19,29 @@ that artifact, then open a `report.html` file. GitHub Actions summaries cannot
 execute the report's JavaScript; the report runs locally without a server.
 
 The report defaults to an eight-panel Overview with Prefill/Decode TTFT, queue
-time, total cache reuse, and GPU forward latency. Use Latency, Workload, Cache & KV, Host CPU, or
+time, total cache reuse, and GPU forward latency. Use Latency, Workload, Cache & KV, or
 All metrics to inspect the full set. Desktop charts use two columns:
 
 - Mesh overall TTFT: ingress to first generated streaming output.
 - Decode ITL: output intervals normalized and weighted by new token count.
 - Prefill local TTFT: request arrival to first internal token delivery.
 - Decode local TTFT: request arrival to first generated streaming output.
-- Decode TTFT stages: five Latency-view panels cutting the local TTFT above into
-  API preprocess, API enqueue, forward to output, output to callback, and
-  callback to SSE. Together with queue time they tile the interval, so their
-  means add up to local TTFT; their percentiles do not, because the stages' tails
-  land on different requests. Forward to output is a superset of GPU forward.
-  Only streaming requests are sampled. See
-  [the TTFT breakdown guide](../../../../docs/ttft_breakdown_guide.md).
-- API preprocess stages: body parse, chat template, tokenize, and preprocess
-  wait, per role. These subdivide the API preprocess stage above rather than
-  tiling the TTFT, and they are sampled on non-streaming requests too. A decode
-  node reusing the prefill's token ids observes an explicit 0 for chat template
-  and tokenize, so a flat zero line means the work was skipped, not unmeasured —
-  which is the whole point of the id handoff, since tokenize is the largest
-  single stage on the prefill side.
-- Decode API detokenize: incremental detokenize per streamed chunk. Inside the
-  callback-to-SSE stage for the first chunk and on the ITL delivery path after.
-- Prefill and Decode GPU sampling and GPU MTP propose: device-event durations for
-  sampling (including the TP/PCP broadcast of sampled ids) and for the whole MTP
-  `propose()`. GPU forward plus these two is the device time of one decode step,
-  which is what inter-token latency times the tokens per forward below has to
-  land on; the remainder is host time with no histogram of its own.
-- MTP tokens per forward: accepted tokens emitted per decode step, averaged over
-  the reporting engines. The multiplier between inter-token latency and step wall
-  time — multiply ITL by this, not by the MTP width, which is the ceiling.
+- TTFT diagnostics: API preprocess, scheduler forward-to-output, and optional
+  output delivery (scheduler first emit to the first generated SSE payload).
+  Output delivery includes IPC and frontend processing but excludes transport to
+  the client. It requires `ATOM_ENABLE_METRICS_OUTPUT_DELIVERY=1` on API and engine
+  processes. These panels have different sample populations and do not sum to TTFT.
+  See [the TTFT guide](../../../../docs/ttft_breakdown_guide.md).
+- API preprocessing: middleware-to-chat-handler time (body reception, validation
+  and waits), actual chat template calls and actual tokenization calls, per role.
+  Reused token ids do not generate zero samples; no calls in an interval means
+  unavailable data. Decode fallback still produces samples.
+- GPU sampling and MTP propose: device-event durations collected only with
+  `ATOM_ENABLE_METRICS_DEVICE_STAGES=1` in addition to the basic device timer.
+  They include sampled-id broadcasts and all draft steps respectively.
+- MTP tokens per forward: acceptance efficiency, averaged over reporting engines.
+  This ratio, token-weighted ITL and per-worker GPU durations use different
+  populations/windows; their differences are not measurements of host CPU time.
 - Prefill and Decode request queues: running, waiting, and external KV waits.
 - Prefill and Decode queue time: engine receipt to first forward dispatch,
   including input queue residence, scheduling, and KV loading waits.
@@ -69,14 +63,8 @@ All metrics to inspect the full set. Desktop charts use two columns:
   dispatch, once per request sequence.
 - Prefill and Decode GPU forward: per-worker device-event duration, including
   stream communication/waits; PP samples cover each local stage, not the full pipeline.
-- Prefill and Decode host CPU: cores consumed by each role's process tree, in the
-  Host CPU view. Two curves split at the process that owns the event loop —
-  API process (chat templating, tokenization, SSE) and Engine + workers (scheduler
-  loop and GPU workers). Compare against `atom:process_cpus`, the visible CPU count.
-  This is the panel that separates a CPU-starved host from one waiting on the GPU:
-  every other latency here is device time or wall clock, and those two look alike.
-  An API curve pinned near 1.0 core is a saturated event loop, which inflates the
-  API preprocess stage above whatever the GPU is doing.
+CPU accounting is external: use `pidstat` or a process exporter alongside the
+benchmark. New reports do not query ATOM process-tree CPU metrics.
 
 Both request context metrics are collected through Prometheus `/metrics` as
 Gauges with request ID and phase dispatch-time labels. Scatter plots show each
@@ -94,7 +82,7 @@ chart and series selections are retained when switching roles. Small screens
 stack charts in the same order.
 The global Statistics controls contain only Mean, P50, P90, P95, and P99.
 Queue and KV state controls stay inside their own panels. Units are milliseconds,
-requests, tokens, cores, or percent as indicated on each chart and in the CSV.
+requests, tokens, or percent as indicated on each chart and in the CSV.
 The existing KV utilization panels also display summed Used / Total block
 counts for the latest point in the selected range, or the hovered point.
 Their data tables and CSV include the raw counts with unit `blocks`.

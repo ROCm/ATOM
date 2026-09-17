@@ -96,50 +96,30 @@ Observed in the API process, plus one live-read gauge.
 
 ### Decode TTFT stage breakdown
 
-Wall-clock slices of a streaming request's TTFT, cut so that each slice ends
-exactly where the next begins. Their **means** therefore add up to
-`atom:time_to_first_token_seconds{streaming="true"}`; their percentiles do not,
-because the request that is slow to tokenize is rarely the one that is slow to
-load KV.
-
-Four are observed in the API process (Path A). `forward_to_output` is observed in
-the scheduler (Path B) and carries `dp_rank` and `engine_role`. Only streaming
-requests are sampled, and fan-out (`n > 1`) requests are not: their engine
-callbacks run through a different dispatcher that does not stamp these slices.
+Request preparation and first-output diagnostics. Their populations differ:
+API preprocess and output delivery cover single-sequence streaming requests,
+while scheduler forward-to-output covers sequences, including non-streaming
+and fanout. Means and percentiles do not form an additive TTFT breakdown.
 
 | Metric | Type / unit | Definition |
 | --- | --- | --- |
-| `atom:ttft_api_preprocess_seconds` | Histogram, s | Middleware entry to `io_processor.preprocess()` return: chat template, tokenize, sequence construction. Runs in a thread pool, so it overlaps *other* requests, but it is strictly serial ahead of this request's own enqueue. |
-| `atom:ttft_api_enqueue_seconds` | Histogram, s | `preprocess()` return to `core_mgr.add_request()` return — handing the sequence to the engine. |
-| `atom:ttft_forward_to_output_seconds` | Histogram, s | First real forward dispatch to the scheduler's first generation emit. A **superset** of `atom:gpu_forward_seconds`: it also spans `prepare_model`, MTP drafting, sampling and postprocess, plus any scheduled step in which the request did not yet produce a token. |
-| `atom:ttft_output_to_callback_seconds` | Histogram, s | Scheduler emit to the API process's stream callback — the engine→API hop. Measured on wall clock, because the two ends are different processes and `perf_counter` is process-local. |
-| `atom:ttft_callback_to_sse_seconds` | Histogram, s | Stream callback to the first SSE payload carrying generated content: detokenize, chunk build, frame encode, and the hop from the engine output thread to the request's event loop. |
+| `atom:ttft_api_preprocess_seconds` | Histogram, s | Middleware entry through `preprocess()` return, including template rendering, tokenization, Sequence construction and intervening waits. Single-sequence streaming only. |
+| `atom:ttft_forward_to_output_seconds` | Histogram, s | First real forward dispatch through scheduler first generation emit, once per sequence. Includes preparation, sampling and output handling beyond target forward compute. |
+| `atom:ttft_output_delivery_seconds` | Histogram, s | Scheduler first generation emit through the first generated SSE payload in the API generator. Includes IPC and frontend processing, excludes transport to the client. Single-sequence streaming only. Requires `ATOM_ENABLE_METRICS_OUTPUT_DELIVERY=1` on API and engine processes; absent by default. |
+| `atom:api_body_parse_seconds` | Histogram, s | Middleware entry through chat handler entry: body reception, JSON parsing, Pydantic validation, FastAPI dependencies and intervening waits. |
+| `atom:api_chat_template_seconds` | Histogram, s | Wall time of actual `apply_chat_template` calls, including the custom encoder. No observation when token ids are reused. Multimodal preparation is excluded. |
+| `atom:api_tokenize_seconds` | Histogram, s | Wall time of actual `tokenizer.encode` calls in shared API preprocessing paths, including chat and completions. No observation for pre-tokenized input. |
 
-`api_preprocess` is also subdivided on `/v1/chat/completions` (same Path A
-buckets). Counts stay aligned with the superset by observing **0** when a stage
-is skipped (e.g. `prompt_token_ids` reuse skips template and tokenize):
+Template/tokenize count executed operations, not all requests. A decode service
+that reuses prompt token ids produces no new samples for these operations;
+nonzero samples can expose fallback tokenization. Empty intervals are unavailable,
+not a measured zero. The template/tokenize means cannot be subtracted from the
+all-request preprocess mean without accounting for the different populations.
 
-| Metric | Type / unit | Definition |
-| --- | --- | --- |
-| `atom:api_body_parse_seconds` | Histogram, s | Middleware entry to chat handler entry: JSON body read + pydantic validation + FastAPI deps. |
-| `atom:api_chat_template_seconds` | Histogram, s | `apply_chat_template` wall time. Observes 0 when the request already carries `prompt_token_ids`. Multimodal prepare is not included yet. |
-| `atom:api_tokenize_seconds` | Histogram, s | `tokenizer.encode` wall time for the chat prompt. Observes 0 when the input is already token ids. |
-| `atom:api_preprocess_wait_seconds` | Histogram, s | `run_in_executor` wall minus tokenize: thread-pool queue delay plus `Sequence` construction. |
-| `atom:api_detokenize_chunk_seconds` | Histogram, s | Per streaming chunk wall time of `IncrementalStreamDetokenizer.update` (ITL path, not a TTFT slice). |
-
-**TODO:** the same subdivides are not yet wired on `/v1/completions`,
-`/v1/messages`, or atomesh standalone.
-
-`atom:request_queue_time_seconds` fills the gap between `api_enqueue` and
-`forward_to_output`, so the whole identity is
-
-```
-api_preprocess + api_enqueue + queue_time + forward_to_output
-    + output_to_callback + callback_to_sse  ==  time_to_first_token
-```
-
-`atom:pd_kv_transfer_seconds` is a *subset* of `queue_time`, not another term.
-See `docs/ttft_breakdown_guide.md` for the derivation and a measured example.
+Queue time starts at engine receipt, after ZMQ receive. It does not cover the
+whole interval between API preprocessing and engine admission.
+`atom:pd_kv_transfer_seconds` is a subset of queue time. See
+[the TTFT guide](ttft_breakdown_guide.md) for boundaries and optional diagnostics.
 
 ### Scheduler
 
@@ -196,12 +176,12 @@ default `0` emits no samples. See `docs/environment_variables.md`.
 | Metric | Type / unit | Definition |
 | --- | --- | --- |
 | `atom:gpu_forward_seconds` | Histogram, s | Per-step target forward device-event duration on each worker, including stream communication and waits. One observation per completed forward, pooling prefill, decode and mixed steps. Excludes `prepare_model`, sampling and MTP drafting. |
-| `atom:gpu_sample_seconds` | Histogram, s | Per-worker device-event duration of sampling and rejection sampling inside `postprocess`, including TP/PCP broadcasts of sampled ids before `forward_done_event`. Same gate as `gpu_forward_seconds`; no `phase` label. |
-| `atom:gpu_propose_seconds` | Histogram, s | Per-worker device-event duration of the whole MTP `propose()` call (all draft steps summed). Same gate as `gpu_forward_seconds`; no `phase` label. |
+| `atom:gpu_sample_seconds` | Histogram, s | Per-worker device-event duration of sampling and rejection sampling inside `postprocess`, including TP/PCP broadcasts of sampled ids before `forward_done_event`. Requires both `ATOM_ENABLE_METRICS_DEVICE_TIMER=1` and `ATOM_ENABLE_METRICS_DEVICE_STAGES=1`; no `phase` label. |
+| `atom:gpu_propose_seconds` | Histogram, s | Per-worker device-event duration of the whole MTP `propose()` call (all draft steps summed). Requires both `ATOM_ENABLE_METRICS_DEVICE_TIMER=1` and `ATOM_ENABLE_METRICS_DEVICE_STAGES=1`; no `phase` label. |
 | `atom:prefill_request_gpu_forward_seconds` | Histogram, s | Per-worker sum of the batch device durations a request participated in across its initial local prefill chunks. One sample once every chunk has been measured. |
 
-Each worker exports forward, sample, propose, and per-request prefill
-distributions. They retain histogram buckets, count and sum for means and
+Each enabled worker exports forward and per-request prefill distributions.
+Sampling and propose are registered only with the separate device-stages opt-in. They retain histogram buckets, count and sum for means and
 percentiles. These histograms have no `phase` label; P/D services remain
 distinguishable by `engine_role` or the scrape's `role` label. Queries that
 previously filtered GPU steps by `phase` must use the service role instead.
@@ -209,14 +189,10 @@ In a standalone service, all forward modes share the same step distribution.
 These histograms aggregate observations; the report does not retain or display
 individual step timestamps or request records.
 
-Steady-state decode step identity (means; multiply ITL by
-`mtp_average_tokens_per_forward` to get the step period):
-
-```
-ITL × mtp_tokens_per_forward
-  ≈ gpu_forward + gpu_sample + gpu_propose + residual
-```
-
+GPU step samples are batch/worker durations; ITL is token-weighted, and the MTP
+ratio has its own averaging window. Comparisons require matching populations
+and workload assumptions. A difference between these aggregates is not a
+measurement of CPU execution time.
 
 ### Prefix cache and KV reuse
 
@@ -283,37 +259,11 @@ Summed across DP ranks by `LLMEngine.get_metrics_statistics()`.
 
 ### Host CPU
 
-Every other latency metric here is either GPU device time or a wall-clock
-interval, so a host that is out of CPU looks identical to one waiting on the
-GPU. These counters separate the two. Defined in
-`atom/entrypoints/openai/cpu_metrics.py`.
-
-The API process is the parent of every engine core and GPU worker
-(`get_mp_context()` spawns them), so it accounts for the whole tree with no
-engine-side plumbing. Processes are grouped by the title `set_process_title`
-gives them, with the API process itself reported as `api`; processes sharing a
-title are summed, since emitting one label set twice is invalid exposition.
-
-| Metric | Type / unit | Definition |
-| --- | --- | --- |
-| `atom:process_cpu_seconds` | Counter, s | CPU consumed by this server's processes. Labels: `process` (`api`, or a `set_process_title` name), `mode` (`user`, `system`). `rate()` over it is cores in use. The `api` row owns chat templating, tokenization and SSE, so it is the one that bounds `atom:ttft_api_preprocess_seconds`. |
-| `atom:process_threads` | Gauge | Threads per process. For `api` this is the event loop plus its executor pool — the ceiling on concurrent tokenization. |
-| `atom:process_cpus` | Gauge | Logical CPUs visible to the server, from `sched_getaffinity` so cgroup and affinity limits are honored. The ceiling `rate(atom:process_cpu_seconds_total)` runs against. |
-
-Reading them: `sum(rate(atom:process_cpu_seconds_total{role="decode"}[60s]))`
-against `atom:process_cpus` is decode's CPU utilization. An `api` row pinned
-near 1.0 core is a saturated event loop, which inflates `api_preprocess`
-regardless of GPU state; an `engine` total flat while step wall time grows is
-the opposite, and points at the GPU or the fabric.
-
-> Counters, not a utilization gauge, for the same reason the queue metrics are
-> sampled state and the latencies are histograms: a gauge read once per scrape
-> misses everything in between, and CPU saturation is bursty. `rate()` is
-> correct at any scrape interval. The descendant set is discovered on a 30 s
-> timer rather than per scrape, because `children(recursive=True)` walks every
-> pid while the worker set is static after startup — a scrape then costs one
-> small procfs read per process (0.22 ms for a 9-process tree), against the
-> 11.9 ms that disqualified `gc.get_freeze_count()` below.
+Host process-tree metrics are collected externally, for example with `pidstat`
+or a process exporter. ATOM no longer scans descendants during `/metrics`
+scrapes or exports `atom:process_cpu_seconds_total`, `atom:process_threads`, or
+`atom:process_cpus`. Record CPU usage alongside throughput and latency when
+comparing instrumentation overhead; save affinity/quota as benchmark metadata.
 
 ### Process and exporter health
 
@@ -385,7 +335,7 @@ it on the event loop before rendering in a worker thread.
 | `metrics/request.py` | TTFT and token-weighted ITL instrument definitions and recording interfaces. |
 | `entrypoints/openai/request_timing.py` | Request lifecycle timing and generated-output detection. |
 | `entrypoints/openai/streaming_dispatch.py` | Streaming delivery, observation timing and live stream silence. |
-| `entrypoints/openai/ttft_breakdown.py` | `TtftBreakdownMetrics` (TTFT stage slices) and the first-callback stamp map. |
+| `entrypoints/openai/ttft_breakdown.py` | `TtftBreakdownMetrics` (preparation and optional first-output delivery). |
 | `entrypoints/openai/streaming_dispatch.py` | Token-weighted ITL and stream silence. |
 | `metrics/scheduler.py` | Scheduler observations using standard Histograms. |
 | `metrics/gpu.py` | Bounded device-event lifecycle and standard Histograms. |
