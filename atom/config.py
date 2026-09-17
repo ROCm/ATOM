@@ -44,9 +44,20 @@ class KVCacheTensor:
     v_cache: torch.Tensor = field(default_factory=lambda: torch.tensor([]))
     k_scale: torch.Tensor = None
     v_scale: torch.Tensor = None
-    # DSA sparse layers (GLM-5.2 / DeepSeek-V3.2): indexer key cache, block-major
-    # ``(num_blocks, block_size, aligned_index_dim)``. Omitted for non-DSA layers.
+    # DSA sparse layers (GLM-5.2 / DeepSeek-V3.2): indexer key cache, block-major.
+    # Its per-block shape follows ``--index_cache_dtype``: the FP8 row is
+    # ``(num_blocks, block_size, aligned_index_dim)``, while FP4 is the packed
+    # E2M1 plane ``(num_blocks, k_tiles, 4, block_size, 16)`` that
+    # ``fp4_index_block_shapes`` fixes, paired with ``index_scale`` below.
+    # Omitted for non-DSA layers.
     index_cache: torch.Tensor | None = None
+    # The e8m0 scale plane paired with ``index_cache`` under
+    # ``--index_cache_dtype fp4``, block-major over the same block axis. None on
+    # every other layer, FP8 indexers included. The FP4 index region is two
+    # planes, not one: a mover that takes ``index_cache`` alone restores keys
+    # without their exponents, and every index it computes stays in bounds while
+    # doing it. Whatever moves one must move the other.
+    index_scale: torch.Tensor | None = None
     # ReplaySSM record buffers for linear-attention layers: this layer's slice
     # of the (k, u, g) pools.  None for every other attention type.  Carried
     # here because the layer-id -> linear-attn-index mapping already lives in

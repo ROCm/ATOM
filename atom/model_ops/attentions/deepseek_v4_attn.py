@@ -311,6 +311,10 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     kv_last_page_lens: torch.Tensor | None = None
     """[padded_T] int32 GPU — per-token last-page length `ones(N)` (page_size=1
     → every page is full)."""
+    empty_kv_indptr: torch.Tensor | None = None
+    """[padded_T+1] all-zero int32 GPU — empty extend-stream CSR used when
+    `ATOM_USE_V4_PREFILL_ASM_FOR_DECODE=1` reuses the H=128 prefill ASM kernel
+    for decode. Backed by one immutable buffer shared by every layer."""
 
     # ----- Indexer / sparse-layout side metadata -----
     indexer_meta: dict[str, Any] | None = None
@@ -2415,6 +2419,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.qo_indptr = self._stage(
                 "v4_qo_indptr", self._v4_qo_indptr_np[: running_bs + 1]
             )
+            attn_metadata.empty_kv_indptr = self.model_runner.forward_vars[
+                "v4_empty_kv_indptr"
+            ][: running_bs + 1]
 
         # NOT rebuilt (unused by SWA-only MTP layer; would block a future
         # CSA/HCA MTP layer — assert at top guards):
@@ -3663,6 +3670,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             qo_buf.np[: T + 1] = self._v4_qo_indptr_np[: T + 1]
             qo_buf.np[T + 1 : T_pad + 1] = T
             attn_metadata.qo_indptr = qo_buf.copy_to_gpu(T_pad + 1)
+            attn_metadata.empty_kv_indptr = self.model_runner.forward_vars[
+                "v4_empty_kv_indptr"
+            ][: T_pad + 1]
 
     def _build_paged_prefill_meta(
         self,
@@ -4319,6 +4329,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # the per-fwd cost is a slice + H2D.
         bufs["v4_qo_indptr"] = CpuGpuBuffer(T_dec + 1, **i32)
         self._v4_qo_indptr_np = np.arange(T_dec + 1, dtype=np.int32)
+        # Immutable, device-only empty CSR for reusing the H=128 sparse-prefill
+        # ASM kernel in decode. Shared read-only across layers and TBO ubatches.
+        bufs["v4_empty_kv_indptr"] = torch.zeros(T_dec + 1, **i32)
         # Per-seq `ctx_len // 4` (raw, no clamp). Consumed by the indexer's
         # `cu_committed` cumsum — per-SEQUENCE, host-side, prefill only.
         # Single per-token mapping shared across ALL V4 consumers:

@@ -45,6 +45,15 @@ on:
   # still be driven by hand for a one-off without going through the cadence.
   workflow_call:
     inputs:
+      # Default 'none': build the wheels and stop. Publishing is something a
+      # caller asks for, the way aiter's release_type defaults to none and
+      # its automation opts in. Without this, every dispatch meant to check
+      # that the build still works would create a tag and a release as a side
+      # effect -- the only way to try the flow was to cancel the run mid-way.
+      release_type:
+        type: string
+        required: false
+        default: 'none'
       commit:
         type: string
         required: false
@@ -72,6 +81,14 @@ on:
 
   workflow_dispatch:
     inputs:
+      release_type:
+        description: "none = build and validate the wheels only, publishing nothing. release = create the tag and the GitHub Release."
+        type: choice
+        required: false
+        default: 'none'
+        options:
+          - none
+          - release
       commit:
         description: 'Commit/tag/ref to build (leave empty to use current commit)'
         required: false
@@ -287,12 +304,16 @@ jobs:
           # ATOM_MESH_BUILD=1 is the same hook the docker image uses: builds
           # the rust mesh crate and places libmesh.so under atom/mesh/target/
           # for package-data pickup (pyproject [tool.setuptools.package-data]).
+          # The checkout belongs to the runner's user and the container
+          # builds as root, so git refuses to read /workspace -- "detected
+          # dubious ownership" -- and the build backend's git introspection
+          # dies before a wheel is started. Mark it safe inside the container.
           docker exec \
             -e SETUPTOOLS_SCM_PRETEND_VERSION="${WHEEL_VERSION}" \
             -e ATOM_MESH_BUILD=1 \
             -w /workspace \
             "atom_build_${{ matrix.flavor }}" \
-            bash -c "python3 -m pip wheel . --no-deps -w dist && ls -lh dist/"
+            bash -c "git config --global --add safe.directory /workspace && python3 -m pip wheel . --no-deps -w dist && ls -lh dist/"
 
       - name: Validate wheel
         run: |
@@ -364,6 +385,9 @@ jobs:
   publish:
     name: Publish the release once every flavor is in
     needs: build-and-release
+    # Nothing is published unless it was asked for. A build that only wanted
+    # to know whether the wheels still build ends after the job above.
+    if: ${{ (inputs.release_type || 'none') != 'none' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
