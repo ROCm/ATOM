@@ -1105,3 +1105,63 @@ def test_pr_comment_script_is_valid_javascript():
         check=True,
         capture_output=True,
     )
+
+
+DUMMY_ARGS = "--load_dummy=xavier --fake-eplb"
+
+
+def test_dummy_weight_args_reach_every_phase(workspace, fake_docker):
+    """Weight-loading flags must apply to warmup, base and head alike.
+
+    A pairing where one phase loaded real weights and another loaded dummy
+    ones would report the difference between two models as a code delta. The
+    flags are appended inside this script for exactly that reason -- there is
+    no per-phase place to set them, so there is no way to set them for one
+    phase only. The cell's own server args have to survive alongside.
+    """
+    ws, base_sha, head_sha = workspace
+    bindir, log = fake_docker
+    for half, sha in (("warmup", base_sha), ("base", base_sha), ("head", head_sha)):
+        run_half(ws, bindir, sha, half, DUMMY_WEIGHT_ARGS=DUMMY_ARGS)
+
+    launches = [
+        ln for ln in log.read_text().splitlines()
+        if ln.startswith("STDIN:") and "launch" in ln
+    ]
+    assert len(launches) == 3, f"expected one launch per phase, got {launches}"
+    for ln in launches:
+        assert DUMMY_ARGS in ln, f"dummy flags missing from: {ln}"
+        assert "--method mtp" in ln, f"cell server args dropped from: {ln}"
+
+
+def test_dummy_weight_args_are_recorded_with_the_result(workspace, fake_docker):
+    """SERVER_ARGS lands in the result JSON's metadata. If it carried only the
+    cell's args, an artifact measured on dummy weights would be indis-
+    tinguishable from one measured on the checkpoint."""
+    ws, base_sha, _ = workspace
+    bindir, log = fake_docker
+    run_half(ws, bindir, base_sha, "base", DUMMY_WEIGHT_ARGS=DUMMY_ARGS)
+
+    bench = [
+        ln for ln in log.read_text().splitlines()
+        if ln.startswith("ARGS:") and "benchmark" in ln
+    ]
+    assert bench, "no benchmark invocation recorded"
+    assert DUMMY_ARGS in bench[0], "dummy flags not recorded in SERVER_ARGS"
+
+
+def test_no_dummy_args_leaves_the_launch_line_untouched(workspace, fake_docker):
+    """Clearing the variable has to restore a real-weight run exactly, not
+    leave a bare `--load_dummy` or an empty value behind."""
+    ws, base_sha, _ = workspace
+    bindir, log = fake_docker
+    run_half(ws, bindir, base_sha, "base", DUMMY_WEIGHT_ARGS="")
+
+    text = log.read_text()
+    assert "load_dummy" not in text and "fake-eplb" not in text
+    launch = [
+        ln for ln in text.splitlines()
+        if ln.startswith("STDIN:") and "launch" in ln
+    ]
+    assert len(launch) == 1
+    assert launch[0].rstrip().endswith("--kv_cache_dtype fp8 -tp 8 --method mtp")
