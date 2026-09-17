@@ -97,7 +97,8 @@ on:
           MiniMax:
             minimax-m3-fp4-1p1d-tp4,minimax-m3-fp4-2p1d-dpa-tp4,
             minimax-m3-fp4-1p1d-tp4-eagle3,minimax-m3-fp4-2p1d-dpa-tp4-eagle3,
-            minimax-m3-fp8-1p1d-tp4,minimax-m3-fp8-2p1d-dpa-tp4,minimax-m3-fp8-2p1d-tp8,minimax-m3-fp8-2p1d-dpa-tp8,
+            minimax-m3-fp8-1p1d-tp4,minimax-m3-fp8-2p1d-dpa-tp4,
+            minimax-m3-fp8-2p1d-tp8,minimax-m3-fp8-2p1d-dpa-tp8,
             minimax-m3-fp8-1p1d-tp4-eagle3,minimax-m3-fp8-2p1d-dpa-tp4-eagle3
         required: false
         default: ''
