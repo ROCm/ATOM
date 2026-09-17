@@ -295,10 +295,15 @@ EOF
 
 run_spur_job() {
   if [[ -z "${SPUR_TASK_OFFSET:-}" || -z "${SPUR_PEER_NODES:-}" ]]; then
-    return 1
+    echo "ERROR: Spur worker requires SPUR_TASK_OFFSET and SPUR_PEER_NODES" >&2
+    return 2
   fi
 
   local node_rank="${SPUR_TASK_OFFSET}"
+  if [[ ! "${node_rank}" =~ ^[0-9]+$ || "${node_rank}" -ge "${NUM_NODES}" ]]; then
+    echo "ERROR: invalid Spur worker rank ${node_rank} for ${NUM_NODES} nodes" >&2
+    return 2
+  fi
   local env_file="${RUN_DIR}/docker-rank-${node_rank}.env"
   local peers=()
   IFS=',' read -r -a peers <<< "${SPUR_PEER_NODES}"
@@ -395,9 +400,23 @@ EOF
   return 0
 }
 
-if [[ -n "${SPUR_TASK_OFFSET:-}" || -n "${SPUR_PEER_NODES:-}" ]]; then
+if [[ "${1:-}" == "--spur-worker" ]]; then
   run_spur_job
   exit $?
+fi
+
+if [[ -n "${SPUR_JOB_ID:-}" || -n "${SPUR_TASK_OFFSET:-}" || -n "${SPUR_PEER_NODES:-}" ]]; then
+  # Spur sbatch runs the batch script only on the first allocated node; the
+  # other nodes run placeholders until an srun step dispatches their workers.
+  # Use an explicit worker argument because the batch shell also has rank 0
+  # in SPUR_TASK_OFFSET. srun assigns each worker's rank and inherits the batch
+  # environment, including SPUR_PEER_NODES in allocation order.
+  echo "=== Spur job ${JOB_ID}: dispatching ${NUM_NODES} node workers ==="
+  exec srun \
+    --nodes="${NUM_NODES}" \
+    --ntasks="${NUM_NODES}" \
+    --ntasks-per-node=1 \
+    bash "${REPO_ROOT}/.github/scripts/atomesh/pd_slurm_job.sh" --spur-worker
 fi
 
 mapfile -t ALLOC_NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
