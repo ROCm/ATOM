@@ -2099,9 +2099,44 @@ class ModelRunner:
             device=self.device,
         )
 
+    def _store_routed_experts_step(
+        self,
+        batch: ScheduledBatch,
+        *,
+        stream: torch.cuda.Stream | None = None,
+        wait_event: torch.cuda.Event | None = None,
+        slot_mapping: torch.Tensor | None = None,
+    ) -> bool:
+        if not getattr(self.config, "enable_return_routed_experts", False):
+            return False
+        if getattr(batch, "is_dummy_run", False) or self.rank != 0:
+            return False
+        from atom.model_ops.fused_moe.routed_experts_capturer import (
+            RoutedExpertsCapturer,
+        )
+
+        capturer = RoutedExpertsCapturer.get()
+        if capturer is None:
+            return False
+        return capturer.store_step(
+            slot_mapping, stream=stream, wait_event=wait_event
+        )
+
+    def _commit_routed_experts(self, *, keep_last: bool = False) -> None:
+        from atom.model_ops.fused_moe.routed_experts_capturer import (
+            RoutedExpertsCapturer,
+        )
+
+        capturer = RoutedExpertsCapturer.get()
+        if capturer is not None:
+            capturer.commit_pending(keep_last=keep_last)
+
     def _attach_routed_experts(
         self, batch: ScheduledBatch, output: ScheduledBatchOutput
     ) -> None:
+        """CPU gather in this runner process. The capturer is not visible to
+        the EngineCore scheduler (runner is an ``AsyncIOProcManager`` child).
+        """
         if not getattr(self.config, "enable_return_routed_experts", False):
             return
         if getattr(batch, "is_dummy_run", False) or self.rank != 0:
@@ -3191,11 +3226,21 @@ class ModelRunner:
                 sampled_logprobs = get_tp_group().broadcast(sampled_logprobs, src=0)
 
         self.forward_done_event.record()
-        # Capture before prepare_sampled_ids(), which advances self.prev_batch to current batch.
+        deferred = self.tokenID_processor.is_deferred_out
+        # Capture before prepare_sampled_ids(), which advances self.prev_batch.
         prev_batch = self.tokenID_processor.prev_batch
+        from atom.model_ops.fused_moe.routed_experts_capturer import (
+            _current_slot_mapping,
+        )
+
+        slots = _current_slot_mapping()
         token_id_dict, logprobs_map = self.tokenID_processor.prepare_sampled_ids(
             batch, sampled_tokens, self.forward_done_event, sampled_logprobs
         )
+        # Blocking D2H after recv: previous copy_done already waited, so this
+        # memcpy does not absorb the current decode. cpu_buffer is complete
+        # before the next step attaches this batch as prev_batch.
+        self._store_routed_experts_step(batch, slot_mapping=slots)
         # Extract req_ids and token_ids from dict (key -1 is the is_deferred_out flag)
         req_ids_out = [k for k in token_id_dict if k != -1]
         token_ids_out = [token_id_dict[k] for k in req_ids_out]
@@ -3272,7 +3317,9 @@ class ModelRunner:
             logprobs=logprobs_map,
             dspark_ell=dspark_ell,
         )
-        self._attach_routed_experts(batch, output)
+        attach_batch = prev_batch if deferred and prev_batch is not None else batch
+        if not (deferred and prev_batch is None):
+            self._attach_routed_experts(attach_batch, output)
         return output
 
     def _record_kv_cache_ready(self, batch: ScheduledBatch) -> None:
@@ -3363,6 +3410,9 @@ class ModelRunner:
                     None,  # nothing verified -> segment's last row
                     align_only=True,
                 )
+            self.forward_done_event.record()
+            # No token copy_done on this path; blocking store is fine.
+            self._store_routed_experts_step(batch)
             reset_forward_context()
             # Mark this slot's GPU work (attention consumed its metadata) done.
             self._record_forward_vars_event()
@@ -3374,7 +3424,6 @@ class ModelRunner:
                 num_bonus=None,
                 draft_token_ids=None,
             )
-            self._attach_routed_experts(batch, output)
             return output
 
         fwd_output = self.postprocess(

@@ -101,12 +101,14 @@ def test_interleaved_two_request_scatter_gather():
     )
     capturer.capture(0, ids_b1, slot_mapping=slots_b1)
     capturer.capture(1, ids_b1 + 100, slot_mapping=slots_b1)
+    capturer.store_step(slots_b1)
 
     # Later step: only A token 2, B idle
     slots_b2 = torch.tensor([2], device=device)
     ids_b2 = torch.tensor([[14, 15]], dtype=torch.int32, device=device)
     capturer.capture(0, ids_b2, slot_mapping=slots_b2)
     capturer.capture(1, ids_b2 + 100, slot_mapping=slots_b2)
+    capturer.store_step(slots_b2)
 
     exported = capturer.export_batch(
         req_ids=[7, 9],
@@ -136,6 +138,7 @@ def test_length_contract_prompt_plus_completion_minus_one():
     slots = torch.arange(n_routes, device=device)
     ids = torch.arange(n_routes, device=device, dtype=torch.int32).unsqueeze(-1)
     capturer.capture(0, ids, slot_mapping=slots)
+    capturer.store_step(slots)
     exported = capturer.export_batch(
         [1], [[0]], [n_routes], block_size=16
     )[1]
@@ -181,6 +184,7 @@ def test_prefix_hit_reuses_physical_slots():
     slots = torch.tensor([0, 1, 2], device=device)
     ids = torch.tensor([[7, 8], [9, 10], [11, 12]], dtype=torch.int32, device=device)
     capturer.capture(0, ids, slot_mapping=slots)
+    capturer.store_step(slots)
     # Request B prefix-hits A's blocks; gather the same physical slots.
     a = capturer.export_batch([1], [[0]], [3], block_size=16)[1]
     b = capturer.export_batch([2], [[0]], [3], block_size=16)[2]
@@ -204,6 +208,74 @@ def test_kv_slots_from_block_table():
         9 * 16,
         9 * 16 + 1,
     ]
+    pos = torch.arange(18, dtype=torch.long)
+    blocks = torch.tensor([4, 9], dtype=torch.long)
+    gpu_formula = (blocks[pos // 16] * 16 + (pos % 16)).tolist()
+    assert slots.tolist() == gpu_formula
+
+
+def test_store_step_skips_pad_and_matches_gpu_rows():
+    device = _device()
+    capturer = RoutedExpertsCapturer.init(
+        num_slots=8, num_layers=1, top_k=2, device=device
+    )
+    capturer.buffer[:, 0, :] = -7
+    real = torch.tensor([0], device=device)
+    capturer.capture(
+        0,
+        torch.tensor([[9, 8]], dtype=torch.int32, device=device),
+        slot_mapping=real,
+    )
+    capturer.store_step(real)
+    dummy = torch.tensor([-1, -1], device=device)
+    capturer.capture(
+        0,
+        torch.tensor([[1, 2], [3, 4]], dtype=torch.int32, device=device),
+        slot_mapping=dummy,
+    )
+    capturer.store_step(dummy)
+    exported = capturer.export_batch([1], [[0]], [1], block_size=16)[1]
+    np.testing.assert_array_equal(exported[:, 0, :], [[9, 8]])
+
+
+def test_export_without_store_step_is_empty():
+    device = _device()
+    capturer = RoutedExpertsCapturer.init(
+        num_slots=8, num_layers=1, top_k=2, device=device
+    )
+    slots = torch.tensor([0, 1], device=device)
+    ids = torch.tensor([[7, 8], [9, 10]], dtype=torch.int32, device=device)
+    capturer.capture(0, ids, slot_mapping=slots)
+    exported = capturer.export_batch([1], [[0]], [2], block_size=16)[1]
+    np.testing.assert_array_equal(exported, np.zeros((2, 1, 2), dtype=np.int16))
+
+
+def test_commit_pending_keep_last_does_not_wait():
+    """In-flight step stays in _pending until the next recv-equivalent commit."""
+    capturer = RoutedExpertsCapturer.init(
+        num_slots=8, num_layers=1, top_k=2, device="cpu"
+    )
+    dest = torch.tensor([3], dtype=torch.int32)
+    rows = torch.tensor([[[5, 6]]], dtype=torch.int16)
+    capturer._pending.append((dest, rows))
+    capturer.commit_pending(keep_last=True)
+    np.testing.assert_array_equal(capturer.cpu_buffer[3], np.zeros((1, 2), dtype=np.int16))
+    capturer.commit_pending(keep_last=False)
+    np.testing.assert_array_equal(capturer.cpu_buffer[3, 0], [5, 6])
+
+
+def test_store_step_empty_returns_false_so_flush_can_commit():
+    """Last deferred flush has no slots: caller must commit keep_last=False."""
+    capturer = RoutedExpertsCapturer.init(
+        num_slots=8, num_layers=1, top_k=2, device="cpu"
+    )
+    dest = torch.tensor([3], dtype=torch.int32)
+    rows = torch.tensor([[[5, 6]]], dtype=torch.int16)
+    capturer._pending.append((dest, rows))
+    empty = torch.tensor([], dtype=torch.long)
+    assert capturer.store_step(empty) is False
+    capturer.commit_pending(keep_last=False)
+    np.testing.assert_array_equal(capturer.cpu_buffer[3, 0], [5, 6])
 
 
 def test_capture_page_bytes_are_budgeted_per_block():

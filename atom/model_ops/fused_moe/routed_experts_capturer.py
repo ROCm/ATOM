@@ -4,9 +4,9 @@
 """CUDA-graph-safe MoE route capture indexed by physical KV slots.
 
 Matches the vLLM ``enable_return_routed_experts`` contract: scatter logical
-expert ids into ``buffer[slot, layer, :]`` during fused MoE, then gather a
-per-request ``[seq_len - 1, num_layers, top_k]`` int16 tensor from the
-sequence's block table.
+expert ids into ``buffer[slot, layer, :]`` during fused MoE, D2H this step's
+``slot_mapping`` rows into a CPU slot buffer, then numpy-gather a per-request
+``[seq_len - 1, num_layers, top_k]`` int16 tensor from the block table.
 """
 
 from __future__ import annotations
@@ -86,13 +86,16 @@ def kv_slots_from_block_table(
     *,
     device: torch.device | str | None = None,
     dtype: torch.dtype = torch.long,
-) -> torch.Tensor:
-    """Physical KV slots for the first ``num_tokens`` positions."""
-    if num_tokens <= 0:
-        return torch.empty(0, dtype=dtype, device=device)
-    pos = torch.arange(num_tokens, device=device, dtype=dtype)
-    blocks = torch.as_tensor(list(block_table), device=device, dtype=dtype)
-    return blocks[pos // block_size] * int(block_size) + (pos % block_size)
+) -> np.ndarray:
+    """Physical KV slots for the first ``num_tokens`` positions (host numpy)."""
+    del device, dtype
+    n = int(num_tokens)
+    if n <= 0:
+        return np.empty(0, dtype=np.int64)
+    blocks = np.asarray(list(block_table), dtype=np.int64)
+    pos = np.arange(n, dtype=np.int64)
+    bs = np.int64(block_size)
+    return blocks[pos // bs] * bs + (pos % bs)
 
 
 def _current_slot_mapping() -> torch.Tensor | None:
@@ -171,6 +174,8 @@ class RoutedExpertsCapturer:
     """Persistent GPU buffer: ``[num_kv_slots + 1, num_layers, top_k]``.
 
     The extra row is a sacrificial pad target for graph dummy slots (``-1``).
+    A host ``int16`` twin is filled incrementally by ``store_step`` so finish
+    export is a numpy gather, not a GPU ``as_tensor(block_table)``.
     """
 
     def __init__(
@@ -198,6 +203,11 @@ class RoutedExpertsCapturer:
             dtype=dtype,
             device=device,
         )
+        self.cpu_buffer = np.zeros(
+            (self.num_slots + 1, self.num_layers, self.top_k),
+            dtype=np.int16,
+        )
+        self._pending: list[tuple[torch.Tensor, torch.Tensor]] = []
 
     @classmethod
     def init(
@@ -237,15 +247,91 @@ class RoutedExpertsCapturer:
         slots = slots[:n]
         k = min(int(topk_ids.shape[-1]), self.top_k)
         ids = topk_ids[:n, :k].to(device=self.buffer.device, dtype=self.buffer.dtype)
-        slots_i = slots.to(dtype=torch.long)
-        valid = slots_i >= 0
-        phys = slots_i.clamp(min=0, max=self.num_slots - 1)
-        dest = torch.where(valid, phys, torch.full_like(phys, self._pad_slot))
+        dest = self._dest_slots(slots)
         if k < self.top_k:
             row = self.buffer.new_zeros((n, self.top_k))
             row[:, :k] = ids
             ids = row
         self.buffer[dest, layer_id, :] = ids
+
+    def _dest_slots(self, slot_mapping: torch.Tensor) -> torch.Tensor:
+        slots_i = slot_mapping.reshape(-1).to(dtype=torch.long)
+        valid = slots_i >= 0
+        phys = slots_i.clamp(min=0, max=self.num_slots - 1)
+        return torch.where(valid, phys, torch.full_like(phys, self._pad_slot))
+
+    def _apply_cpu_store(self, dest: np.ndarray, rows: np.ndarray) -> None:
+        dest = np.asarray(dest, dtype=np.int64).reshape(-1)
+        rows = np.asarray(rows, dtype=np.int16).reshape(
+            -1, self.num_layers, self.top_k
+        )
+        mask = (dest >= 0) & (dest < self.num_slots)
+        if not np.any(mask):
+            return
+        self.cpu_buffer[dest[mask]] = rows[mask]
+
+    def commit_pending(self, *, keep_last: bool = False) -> None:
+        """Write host rows whose D2H is already covered by token ``copy_done``.
+
+        ``keep_last`` leaves the in-flight current step (queued before
+        ``send_to_cpu_async``) until the next ``recv_async_output``.
+        """
+        if not self._pending:
+            return
+        if keep_last and len(self._pending) <= 1:
+            return
+        ready, self._pending = (
+            (self._pending[:-1], self._pending[-1:])
+            if keep_last
+            else (self._pending, [])
+        )
+        for dest, rows in ready:
+            self._apply_cpu_store(dest.numpy(), rows.numpy())
+
+    def store_step(
+        self,
+        slot_mapping: torch.Tensor | None = None,
+        *,
+        stream: torch.cuda.Stream | None = None,
+        wait_event: torch.cuda.Event | None = None,
+    ) -> bool:
+        """D2H this step's ``buffer[slot_mapping]`` into the CPU slot buffer.
+
+        Snapshot ``dest``/``rows`` on the default stream (private from the next
+        capture), then enqueue non-blocking D2H on the token
+        ``async_copy_stream`` after ``wait_event`` so it lands before the
+        caller's ``copy_done``. Do not record a private event: the existing
+        ``recv_async_output`` wait covers this memcpy.
+
+        Returns True when a new memcpy was queued (or applied inline). False
+        means this step had nothing to store; the caller must then
+        ``commit_pending(keep_last=False)`` so the previous in-flight decode
+        is visible to ``export_batch`` (last deferred flush has no new copy).
+        """
+        slots = slot_mapping if slot_mapping is not None else _current_slot_mapping()
+        if slots is None or slots.numel() == 0:
+            return False
+        dest = self._dest_slots(slots)
+        rows = self.buffer[dest].to(dtype=torch.int16)
+        use_async = (
+            stream is not None
+            and self.buffer.is_cuda
+            and torch.cuda.is_available()
+        )
+        if not use_async:
+            self.commit_pending()
+            self._apply_cpu_store(
+                dest.detach().cpu().numpy(),
+                rows.detach().cpu().numpy(),
+            )
+            return True
+        with torch.cuda.stream(stream):
+            if wait_event is not None:
+                wait_event.wait(stream)
+            dest_cpu = dest.to(dtype=torch.int32).to("cpu", non_blocking=True)
+            rows_cpu = rows.to("cpu", non_blocking=True)
+        self._pending.append((dest_cpu, rows_cpu))
+        return True
 
     def export_batch(
         self,
@@ -254,7 +340,7 @@ class RoutedExpertsCapturer:
         num_tokens_list: AbcSequence[int],
         block_size: int,
     ) -> dict[int, np.ndarray]:
-        """D2H gather: ``[num_tokens, num_layers, top_k]`` int16 per request."""
+        """CPU gather: ``[num_tokens, num_layers, top_k]`` int16 per request."""
         out: dict[int, np.ndarray] = {}
         for req_id, block_table, ntok in zip(
             req_ids, block_tables, num_tokens_list, strict=False
@@ -262,15 +348,9 @@ class RoutedExpertsCapturer:
             n = int(ntok)
             if n <= 0 or not block_table:
                 continue
-            slots = kv_slots_from_block_table(
-                block_table,
-                n,
-                block_size,
-                device=self.buffer.device,
-            )
-            slots = slots.clamp(min=0, max=self.num_slots - 1)
-            routes = self.buffer[slots].to(dtype=torch.int16).detach().cpu().numpy()
-            out[int(req_id)] = routes
+            slots = kv_slots_from_block_table(block_table, n, block_size)
+            slots = np.clip(slots, 0, self.num_slots - 1)
+            out[int(req_id)] = self.cpu_buffer[slots].copy()
         return out
 
 
