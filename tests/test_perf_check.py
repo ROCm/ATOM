@@ -672,43 +672,76 @@ def _git(cwd, *args):
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
 
 
-@pytest.fixture
-def workspace(tmp_path):
-    """A git repo with two commits, standing in for the checked-out PR."""
-    ws = tmp_path / "ws"
-    ws.mkdir()
+def _two_commit_repo(ws, script_in_head_only=False):
+    """A git repo with a base and a head commit, standing in for the PR.
+
+    `script_in_head_only` reproduces the merge-base that predates this
+    feature: the base commit has no .github/scripts at all, and the head
+    commit adds the pairing script. Every other caller wants both commits to
+    differ only in marker.txt, which is what the shim reads to tell which one
+    is checked out.
+    """
     _git(ws, "init", "-q")
     _git(ws, "config", "user.email", "t@example.com")
     _git(ws, "config", "user.name", "t")
 
+    def commit(message):
+        _git(ws, "add", "-A")
+        _git(ws, "commit", "-qm", message)
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=ws, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
     (ws / "marker.txt").write_text("base\n")
-    _git(ws, "add", "-A")
-    _git(ws, "commit", "-qm", "base")
-    base_sha = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=ws, check=True, capture_output=True, text=True
-    ).stdout.strip()
+    base_sha = commit("base")
 
+    if script_in_head_only:
+        scripts = ws / ".github" / "scripts"
+        scripts.mkdir(parents=True)
+        (scripts / "perf_check_half.sh").write_text(HALF_SH.read_text())
+        (scripts / "perf_check_half.sh").chmod(0o755)
     (ws / "marker.txt").write_text("head\n")
-    _git(ws, "add", "-A")
-    _git(ws, "commit", "-qm", "head")
-    head_sha = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=ws, check=True, capture_output=True, text=True
-    ).stdout.strip()
+    head_sha = commit("head")
 
-    return ws, base_sha, head_sha
+    return base_sha, head_sha
 
 
 @pytest.fixture
-def fake_docker(tmp_path):
-    """A `docker` shim that records calls and fabricates a benchmark result.
+def workspace(tmp_path):
+    """A checked-out PR whose two commits differ only in marker.txt."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    return (ws, *_two_commit_repo(ws))
+
+
+def _docker_shim(bindir, log, concs=(128,), model="DeepSeek-V4-Pro-mtp3"):
+    """Write a `docker` shim that records calls and fabricates benchmark results.
 
     It reads marker.txt from the workspace, so the throughput it reports
-    depends on which commit is currently checked out -- that is how the test
-    proves the checkout actually took effect before the benchmark ran.
+    depends on which commit is currently checked out -- that is how the tests
+    prove the checkout actually took effect before the benchmark ran.
+
+    One shim, parameterised by concurrency level, rather than a second copy
+    for the multi-level case: two shims drift, and the one that is not the
+    fixture is the one nobody notices has stopped resembling atom_test.sh.
     """
-    bindir = tmp_path / "bin"
-    bindir.mkdir()
-    log = tmp_path / "docker.log"
+    # A single level writes `${RESULT_FILENAME}.json` -- the catalog's
+    # result_filename already carries isl/osl/conc, so the name is complete.
+    # Several levels append their own, using RESULT_FILENAME as the prefix
+    # perf_check_half.sh actually globs on.
+    writes = "\n".join(
+        textwrap.dedent(f"""\
+            cat > "${{RESULT_FILENAME}}{'' if len(concs) == 1 else f'-8192-1024-{conc}-0.8'}.json" <<EOF
+        {{"benchmark_backend":"ATOM",
+         "benchmark_model_name":"{model}",
+         "random_input_len":8192,"random_output_len":1024,
+         "max_concurrency":{conc},
+         "output_throughput":$((base_tput/2)),"total_token_throughput":$base_tput,
+         "mean_ttft_ms":420.0,"mean_tpot_ms":$tpot}}
+        EOF""")
+        for conc in concs
+    )
 
     (bindir / "docker").write_text(textwrap.dedent(f"""\
             #!/usr/bin/env bash
@@ -722,26 +755,35 @@ def fake_docker(tmp_path):
             case "$*" in
               *benchmark*)
                 marker=$(cat marker.txt)
-                if [ "$marker" = "head" ]; then tput=16000; else tput=17000; fi
-                cat > "{RESULT_FILENAME}.json" <<EOF
-            {{"benchmark_backend":"ATOM",
-             "benchmark_model_name":"DeepSeek-V4-Pro-mtp3",
-             "random_input_len":8192,"random_output_len":1024,
-             "max_concurrency":128,
-             "output_throughput":$((tput/2)),"total_token_throughput":$tput,
-             "mean_ttft_ms":420.0,"mean_tpot_ms":30.0}}
-            EOF
+                if [ "$marker" = "head" ]; then base_tput=16000; tpot=32
+                else base_tput=17000; tpot=30; fi
+            @WRITES@
                 ;;
               *stop*) echo "STOP" >> "{log}" ;;
             esac
-            """))
+            """).replace("@WRITES@", writes))
     (bindir / "docker").chmod(0o755)
     return bindir, log
 
 
-def run_half(ws, bindir, sha, half, **env):
+@pytest.fixture
+def fake_docker(tmp_path):
+    """The single-level shim, which every pairing-mechanics test uses."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    return _docker_shim(bindir, tmp_path / "docker.log")
+
+
+def run_half(ws, bindir, sha, half, script=None, **env):
+    """Invoke one half the way the workflow does.
+
+    `script` points at the copy to run. It defaults to the one in this
+    checkout; the self-hosting test passes a staged copy outside the
+    workspace, which is what the workflow does and the only reason the
+    parameter exists.
+    """
     result = subprocess.run(
-        ["bash", str(HALF_SH), sha, half],
+        ["bash", str(script or HALF_SH), sha, half],
         cwd=ws,
         check=False,
         capture_output=True,
@@ -892,55 +934,16 @@ def test_runs_when_the_target_commit_does_not_contain_the_script(tmp_path, fake_
 
     ws = tmp_path / "selfhost"
     ws.mkdir()
-    _git(ws, "init", "-q")
-    _git(ws, "config", "user.email", "t@example.com")
-    _git(ws, "config", "user.name", "t")
-
-    # base: no .github/scripts at all, exactly like a merge-base predating this
-    (ws / "marker.txt").write_text("base\n")
-    _git(ws, "add", "-A")
-    _git(ws, "commit", "-qm", "base without the pairing script")
-    base_sha = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=ws, check=True, capture_output=True, text=True
-    ).stdout.strip()
-
-    # head: adds the script, as this PR does
-    scripts = ws / ".github" / "scripts"
-    scripts.mkdir(parents=True)
-    (scripts / "perf_check_half.sh").write_text(HALF_SH.read_text())
-    (scripts / "perf_check_half.sh").chmod(0o755)
-    (ws / "marker.txt").write_text("head\n")
-    _git(ws, "add", "-A")
-    _git(ws, "commit", "-qm", "head adds the pairing script")
-    head_sha = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=ws, check=True, capture_output=True, text=True
-    ).stdout.strip()
+    base_sha, head_sha = _two_commit_repo(ws, script_in_head_only=True)
 
     # Staged outside the workspace, which is what the workflow does.
     staged = tmp_path / "staged.sh"
     staged.write_text(HALF_SH.read_text())
     staged.chmod(0o755)
 
-    env = {
-        **os.environ,
-        "PATH": f"{bindir}:{os.environ['PATH']}",
-        "CONTAINER": "atom-perf-check",
-        "MODEL_PATH": "m",
-        "ARGS": "",
-        "RESULT_FILENAME": RESULT_FILENAME,
-        "CONC": "128",
-        "ISL": "8192",
-        "OSL": "1024",
-        "RANDOM_RANGE_RATIO": "0.8",
-    }
     for sha, half in ((base_sha, "base"), (head_sha, "head")):
-        result = subprocess.run(
-            ["bash", str(staged), sha, half],
-            cwd=ws,
-            check=False,
-            capture_output=True,
-            text=True,
-            env=env,
+        result = run_half(
+            ws, bindir, sha, half, script=staged, MODEL_PATH="m", ARGS=""
         )
         assert result.returncode == 0, f"{half} half failed: {result.stderr[-400:]}"
 
@@ -1047,26 +1050,7 @@ def test_full_matrix_of_halves_produces_a_regression(workspace, tmp_path):
     ws, base_sha, head_sha = workspace
     bindir = tmp_path / "bin3"
     bindir.mkdir()
-    (bindir / "docker").write_text(textwrap.dedent("""\
-            #!/usr/bin/env bash
-            set -euo pipefail
-            if [[ "$*" == *"-i"* ]]; then cat > /dev/null; exit 0; fi
-            case "$*" in
-              *benchmark*)
-                marker=$(cat marker.txt)
-                for c in 64 128 256; do
-                  if [ "$marker" = "head" ]; then t=$((16000+c)); p=32; else t=$((17000+c)); p=30; fi
-                  cat > "run-8192-1024-$c-0.8.json" <<EOF
-            {"benchmark_backend":"ATOM","benchmark_model_name":"M",
-             "random_input_len":8192,"random_output_len":1024,
-             "max_concurrency":$c,"output_throughput":$t,
-             "total_token_throughput":$t,"mean_ttft_ms":420.0,"mean_tpot_ms":$p}
-            EOF
-                done
-                ;;
-            esac
-            """))
-    (bindir / "docker").chmod(0o755)
+    _docker_shim(bindir, tmp_path / "docker3.log", concs=(64, 128, 256), model="M")
 
     for sha, half in ((base_sha, "base"), (head_sha, "head")):
         run_half(ws, bindir, sha, half, RESULT_FILENAME="run")
