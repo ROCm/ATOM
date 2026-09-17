@@ -462,6 +462,9 @@ def test_build_kv_cache_tensor_binds_compact_index_slice():
         layer_num=5,
         indexer=SimpleNamespace(
             k_cache=SimpleNamespace(kv_cache=[None]),
+            # The binder compares its own FP4 verdict against the layer's and
+            # asserts they agree, so the double has to carry one.
+            _indexer_fp4=False,
         ),
     )
     builder = _bind_builder(module, {3: 0, 5: 1}, rows_before=2)
@@ -472,6 +475,34 @@ def test_build_kv_cache_tensor_binds_compact_index_slice():
     assert module.indexer.k_cache.kv_cache[0][0] == ("index", 1)
     assert cache_tensor.layer_num == module.layer_num
     assert cache_tensor.index_cache.identity == ("index", 1)
+    # FP8 has one index plane; the second stays unset rather than aliasing it.
+    assert cache_tensor.index_scale is None
+
+
+def test_build_kv_cache_tensor_publishes_both_fp4_index_planes():
+    """Under FP4 the index region is two planes, and both have to leave here.
+
+    The e8m0 plane is bound onto the indexer either way -- what this pins is
+    that it also reaches the `KVCacheTensor`, which is the only thing the dense
+    offload codec reads. Without it a restored prefix carries keys whose
+    exponents are whatever the block held before, every index in bounds.
+    """
+    module = _MlaLayer(
+        layer_num=5,
+        indexer=SimpleNamespace(
+            k_cache=SimpleNamespace(kv_cache=[None], kv_cache_scale=None),
+            _indexer_fp4=True,
+        ),
+    )
+    builder = _bind_builder(module, {3: 0, 5: 1}, rows_before=2)
+    builder._indexer_fp4 = True
+
+    cache_tensor = builder.build_kv_cache_tensor(module)
+
+    assert module.indexer.k_cache.kv_cache[0].identity == ("index", 1)
+    assert module.indexer.k_cache.kv_cache_scale.identity == ("index_scale", 1)
+    assert cache_tensor.index_cache.identity == ("index", 1)
+    assert cache_tensor.index_scale.identity == ("index_scale", 1)
 
 
 def test_build_shared_layer_keeps_main_kv_without_index_slice():

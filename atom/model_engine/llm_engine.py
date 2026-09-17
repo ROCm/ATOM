@@ -13,8 +13,8 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
-from atom.model_engine.multimodal import get_mrope_input_positions
 from atom.model_engine.sequence import Sequence
+from atom.multimodal.registry import get_mrope_input_positions
 from atom.sampling_params import SamplingParams
 from atom.utils import envs
 
@@ -196,6 +196,22 @@ class LLMEngine:
         multimodal_data_list: list[dict] | None = None,
         request_ids: list[str] | None = None,
     ):
+        """Submit one batch of prompts.
+
+        ``SamplingParams.n > 1`` fans out: a prompt becomes ``n`` sibling
+        sequences, and the batch handed to the scheduler is prompt-major --
+        prompt 0's siblings in order, then prompt 1's. Sequence ids are assigned
+        in that same order, which is what makes :meth:`generate`'s flat list
+        line up with a prompt list expanded by ``n``. It is one request per
+        sibling from here on; nothing downstream reassembles them.
+
+        This used to reach ``io_processor.preprocess``, which returns a single
+        sequence and refuses ``n > 1`` outright, so offline ``n > 1`` raised
+        before a token was generated. That guard is still there and still right
+        for a caller that expects one sequence back -- the two entry points
+        differ in whether the caller is prepared for siblings, not in what they
+        support.
+        """
         # if sampling params is not list, use it for all prompts
         if not isinstance(sampling_params_list, list):
             sampling_params_iter = itertools.repeat(sampling_params_list)
@@ -251,14 +267,14 @@ class LLMEngine:
             mm_data_iter,
             request_id_iter,
         ):
-            req = self.io_processor.preprocess(
+            fanout = self.io_processor.preprocess_fanout(
                 prompt,
                 sampling_param,
                 stream_callback=callback,
                 multimodal_data=mm_data,
-                request_id=request_id,
+                parent_request_id=request_id,
             )
-            reqs.append(req)
+            reqs.extend(fanout)
         self.core_mgr.add_request(reqs)
 
     def step(self) -> list[Sequence]:
@@ -274,6 +290,14 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         request_ids: list[str] | None = None,
     ) -> list[str]:
+        """Complete every prompt and return the outputs as ONE flat list.
+
+        Not one entry per prompt: ``SamplingParams.n`` of them, prompt-major
+        (see :meth:`add_request`), because the sort below is over sequence ids
+        and those are assigned in fan-out order. A caller pairing prompts with
+        outputs has to expand its own list by ``n`` to do it -- with ``n = 1``,
+        the usual case, that is the identity and the list is 1:1 as before.
+        """
         # Reset DP routing state (round-robin cursor + in-flight load) so a
         # fresh batch gets deterministic DP assignment and no leaked counts.
         self.core_mgr.reset_dp_router()
@@ -486,10 +510,9 @@ class LLMEngine:
         a local dict lookup: no round trip, no deadline, and nothing that can
         fail just because the engine is busy.
         """
+        latest_metrics = self.core_mgr.latest_metrics.copy()
         rank_stats = [
-            stats
-            for stats in self.core_mgr.latest_metrics.values()
-            if stats.get("enabled", False)
+            stats for stats in latest_metrics.values() if stats.get("enabled", False)
         ]
 
         def summed(key: str) -> int:
@@ -554,6 +577,12 @@ class LLMEngine:
             key: sum(int(stats.get(key, 0)) for stats in cache_rank_stats)
             for key in cache_keys
         }
+        # Keep the admitted supplemental reuse population aligned with the HBM
+        # and input counters. Missing older snapshots are not a zero tier hit.
+        if all("offload_tokens" in stats for stats in cache_rank_stats):
+            cache_totals["offload_tokens"] = sum(
+                int(stats["offload_tokens"]) for stats in cache_rank_stats
+            )
         # NOTE: `full`, while `get_cache_statistics` divides by `reusable`, so
         # this endpoint reads lower for the same engine — `full` counts the
         # trailing block no cache is offered, and that fixed size weighs more
@@ -591,6 +620,25 @@ class LLMEngine:
             "kv_blocks_total": kv_total,
             "kv_blocks_indexed": summed("kv_blocks_indexed"),
             "kv_cache_usage_ratio": kv_used / kv_total if kv_total else 0.0,
+            "scheduler_metrics": [
+                {
+                    "dp_rank": rank,
+                    "engine_role": stats.get("role") or "default",
+                    **stats["scheduler_metrics"],
+                    "kv_blocks": (
+                        {
+                            "used": stats["kv_blocks_used"],
+                            "evictable": stats["kv_blocks_evictable"],
+                            "vacant": stats["kv_blocks_vacant"],
+                            "total": stats["kv_blocks_total"],
+                        }
+                        if "kv_blocks_total" in stats
+                        else {}
+                    ),
+                }
+                for rank, stats in latest_metrics.items()
+                if stats.get("enabled") and "scheduler_metrics" in stats
+            ],
             "mtp": {
                 "enabled": bool(mtp_rank_stats),
                 "total_draft_tokens": mtp_draft,

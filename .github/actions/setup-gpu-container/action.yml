@@ -108,6 +108,14 @@ runs:
         # (e.g. benchmark + regression) don't clobber each other's file.
         ENV_FILE="/tmp/atom_${CONTAINER_NAME}_env.txt"
         printenv MODEL_ENV_VARS | grep -v '^$' > "$ENV_FILE" || true
+        if [ "${RUNNER_LABEL}" = "linux-atom-do-mi350x-8" ] || [ "${RUNNER_LABEL}" = "linux-atom-do-mi350x-8.test" ]; then
+          grep -v -E '^(NCCL_SOCKET_IFNAME|MORI_SOCKET_IFNAME)=' "$ENV_FILE" > "${ENV_FILE}.tmp" || true
+          mv "${ENV_FILE}.tmp" "$ENV_FILE"
+          {
+            echo "NCCL_SOCKET_IFNAME=lo"
+            echo "MORI_SOCKET_IFNAME=lo"
+          } >> "$ENV_FILE"
+        fi
 
         IMAGE_TAG="${RESOLVED_ATOM_BASE_IMAGE:-$ATOM_BASE_IMAGE}"
         echo "Starting container with image: $IMAGE_TAG"
@@ -129,13 +137,17 @@ runs:
         MMAP_FLAG=""
         [ "${DISABLE_MMAP}" = "true" ] && MMAP_FLAG="-e ATOM_DISABLE_MMAP=true"
 
+        GROUP_ADD_FLAGS="--group-add video"
+        if getent group render >/dev/null 2>&1; then
+          GROUP_ADD_FLAGS="${GROUP_ADD_FLAGS} --group-add $(getent group render | cut -d: -f3)"
+        fi
+
         docker run -dt $PULL_FLAG $NETWORK_FLAG --device=/dev/kfd $DEVICE_FLAG \
         -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
         $MODEL_MOUNT \
         -w /workspace \
-        --ipc=host --group-add video \
+        --ipc=host $GROUP_ADD_FLAGS \
         --shm-size=16G \
-        --privileged \
         --cap-add=SYS_PTRACE \
         -e HF_TOKEN="${HF_TOKEN:-}" \
         -e ATOM_DOCKER_IMAGE="${ATOM_DASHBOARD_DOCKER_IMAGE:-}" \

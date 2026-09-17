@@ -391,7 +391,7 @@ class TestRequestLoggingCannotBreakTheStream:
 
     @staticmethod
     def _logged(chunk):
-        """What `_log_sse` writes, without touching the module's real logger."""
+        """Exercise logging at the real client stream boundary."""
         written = []
 
         class Recorder:
@@ -402,7 +402,14 @@ class TestRequestLoggingCannotBreakTheStream:
         original = api_server._request_logger
         api_server._request_logger = Recorder
         try:
-            api_server._log_sse(chunk, "req-1")
+
+            async def source():
+                yield chunk
+
+            async def collect():
+                return [c async for c in frames(source(), "req-1")]
+
+            assert asyncio.run(collect()) == [chunk]
         finally:
             api_server._request_logger = original
         return written
@@ -429,7 +436,14 @@ class TestRequestLoggingCannotBreakTheStream:
         original = api_server._request_logger
         api_server._request_logger = None
         try:
-            api_server._log_sse(self.COALESCED, "req-1")
+
+            async def source():
+                yield self.COALESCED
+
+            async def collect():
+                return [c async for c in frames(source(), "req-1")]
+
+            assert asyncio.run(collect()) == [self.COALESCED]
         finally:
             api_server._request_logger = original
 

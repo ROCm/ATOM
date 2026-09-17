@@ -371,8 +371,8 @@ RUN echo "========== [ATOM] Installing MORI nightly ==========" && \
 # ROCm build whose version string doesn't match rocm-hip's declared dependency,
 # leaving dpkg in a broken state that blocks all subsequent apt-get install calls.
 ARG INSTALL_MOONCAKE=1
-ARG MOONCAKE_REPO="https://github.com/Jasen2201/Mooncake.git"
-ARG MOONCAKE_COMMIT="fix/ionic-mr-and-qp-resource-fixes"
+ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
+ARG MOONCAKE_COMMIT="v0.3.14-rc1"
 ARG VENV_PYTHON="/opt/venv/bin/python"
 
 # [MC 1/4] Clone
@@ -421,15 +421,24 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
     fi
 
 # [MC 3/4] CMake build with HIP support + system install
+# RDMA and HIP are auto-installed together. Multi-protocol support preserves
+# both protocols and excludes HIP IPC for cross-host transfers.
 RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
-        echo "========== [MC 3/4] Build and install Mooncake (USE_HIP=ON) =========="; \
+        echo "========== [MC 3/4] Build and install Mooncake (USE_HIP=ON USE_HIP_DMABUF=ON ENABLE_MULTI_PROTOCOL=ON) =========="; \
         mkdir -p /app/mooncake/build && cd /app/mooncake/build \
-        && cmake .. -DUSE_HIP=ON -DUSE_ETCD=ON \
+        && cmake .. -DUSE_HIP=ON -DUSE_HIP_DMABUF=ON -DUSE_ETCD=ON \
+             -DENABLE_MULTI_PROTOCOL=ON \
+        && { grep -qx 'ENABLE_MULTI_PROTOCOL:BOOL=ON' CMakeCache.txt \
+             || { echo "ERROR: Mooncake multi-protocol support is required for cross-host RDMA with HIP"; exit 1; }; } \
         && make -j$(nproc) && make install \
         && ldconfig \
         && echo "--- Clean up build artifacts ---" \
         && rm -rf /app/mooncake/build /app/mooncake/.git; \
     fi
+
+# Default to ibv_reg_mr; set MOONCAKE_DISABLE_HIP_DMABUF=0 at runtime to opt in
+# to HIP dma-buf when supported by the Mooncake build.
+ENV MOONCAKE_DISABLE_HIP_DMABUF=1
 
 # ========== Install Rust toolchain ==========
 ARG RUST_VERSION="1.94.0"

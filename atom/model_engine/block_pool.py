@@ -151,7 +151,7 @@ class BlockPool:
         vacant count, which is the number that actually has to reach zero
         before `blocks_evicted` can start moving.
         """
-        return sum(1 for b in self._free if self.blocks[b].hash != -1)
+        return len(self._cached) + len(self._protected)
 
     def eviction_stats(self) -> dict[str, int]:
         """Content this pool destroyed, and the headroom it has left.

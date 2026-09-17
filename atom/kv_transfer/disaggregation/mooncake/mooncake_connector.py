@@ -45,6 +45,7 @@ from atom.kv_transfer.disaggregation.sharded_transfer import (
 )
 from atom.kv_transfer.disaggregation.types import (
     DEFAULT_SHARDED_STAGING_WORKERS,
+    INDEX_CACHE_FP4_PREFIX,
     INDEX_CACHE_ROLE,
     MLA_KV_ROLE,
     ConnectorMetadata,
@@ -122,6 +123,43 @@ def _auto_select_ib_device(phys_idx: int) -> str:
     return rdma_device
 
 
+def _parse_ib_devices(configured_devices: str) -> list[str]:
+    """Normalize a comma-separated Mooncake RDMA device filter."""
+    return list(
+        dict.fromkeys(
+            device.strip() for device in configured_devices.split(",") if device.strip()
+        )
+    )
+
+
+def _select_ib_devices(
+    protocol: str,
+    configured_devices: str,
+    phys_idx: int | None,
+    *,
+    enable_alternate_hca: bool = False,
+    hca_count: int = 8,
+) -> list[str]:
+    """Resolve the HCAs on which Mooncake registers this rank's GPU memory."""
+    if protocol.strip().lower() == "tcp":
+        return []
+    if configured_devices:
+        return _parse_ib_devices(configured_devices)
+    if phys_idx is None:
+        raise ValueError("physical GPU index is required for RDMA device selection")
+
+    primary = _auto_select_ib_device(phys_idx)
+    devices = [primary]
+    if enable_alternate_hca:
+        if hca_count <= 0:
+            raise ValueError("ib_hca_count must be a positive integer")
+        for idx in range(hca_count):
+            device = _auto_select_ib_device(idx)
+            if device not in devices and _ib_device_exists(device):
+                devices.append(device)
+    return devices
+
+
 def _select_ib_device(
     protocol: str, configured_device: str, phys_idx: int | None
 ) -> str:
@@ -133,13 +171,7 @@ def _select_ib_device(
     choice. RDMA-family transports retain the existing configured/automatic
     device selection.
     """
-    if protocol.strip().lower() == "tcp":
-        return ""
-    if configured_device:
-        return configured_device
-    if phys_idx is None:
-        raise ValueError("physical GPU index is required for RDMA device selection")
-    return _auto_select_ib_device(phys_idx)
+    return ",".join(_select_ib_devices(protocol, configured_device, phys_idx))
 
 
 def _configure_mooncake_transport(protocol: str) -> None:
@@ -576,13 +608,17 @@ class MooncakeConnector(KVConnectorBase):
         # cannot activate an available HCA as an alternate path.
         # AMD GPU nodes pair GPU N with NIC N, but the HCA name is cluster
         # dependent: Spur MI350 exposes ionic_N while older setups used rdmaN.
-        # Registering GPU memory with a non-local RDMA NIC fails with
-        # EINVAL.  Pass the device name as a filter so Mooncake only
-        # creates a context for the local NIC.
+        # By default, register only with the local NIC. Cross-rail PD may opt
+        # into registering on ionic_0..ionic_{N-1} so any remote rank can reach
+        # this GPU's buffers via a reachable HCA.
         _configure_mooncake_transport(self.protocol)
         configured_ib_device = kv_transfer_config.get(
             "ib_device", ""
         ) or os.environ.get("ATOM_MOONCAKE_IB_DEVICE", "")
+        enable_alternate_hca = bool(
+            kv_transfer_config.get("ib_enable_alternate_hca", False)
+        )
+        hca_count = int(kv_transfer_config.get("ib_hca_count", 8))
         phys_idx: int | None = None
         if self.protocol.strip().lower() != "tcp" and not configured_ib_device:
             visible_idx = torch.cuda.current_device()
@@ -594,12 +630,21 @@ class MooncakeConnector(KVConnectorBase):
                 phys_idx = int(visible_list[visible_idx])
             else:
                 phys_idx = visible_idx
-        ib_device = _select_ib_device(self.protocol, configured_ib_device, phys_idx)
+        ib_devices = _select_ib_devices(
+            self.protocol,
+            configured_ib_device,
+            phys_idx,
+            enable_alternate_hca=enable_alternate_hca,
+            hca_count=hca_count,
+        )
+        ib_device = ",".join(ib_devices)
+        primary_ib_device = ib_devices[0] if ib_devices else ""
+        self.ib_devices = ib_devices
         if self.protocol.strip().lower() == "tcp":
             logger.info("Mooncake TCP selected; RDMA device selection is disabled")
         elif not configured_ib_device:
             logger.info(
-                "Auto-selecting RDMA device %s for physical GPU %d "
+                "Auto-selecting RDMA devices %s for physical GPU %d "
                 "(visible_idx=%d, tp_rank=%d)",
                 ib_device,
                 phys_idx,
@@ -608,15 +653,16 @@ class MooncakeConnector(KVConnectorBase):
             )
 
         rdma_local_ip = (
-            _ip_for_ib_device(ib_device, default_local_ip)
-            if ib_device
+            _ip_for_ib_device(primary_ib_device, default_local_ip)
+            if primary_ib_device
             else default_local_ip
         )
         if rdma_local_ip != default_local_ip:
             logger.info(
-                "Using RDMA-local IP %s for ib_device=%s instead of default IP %s",
+                "Using RDMA-local IP %s for primary ib_device=%s "
+                "instead of default IP %s",
                 rdma_local_ip,
-                ib_device,
+                primary_ib_device,
                 default_local_ip,
             )
         self.local_ip = rdma_local_ip
@@ -651,6 +697,7 @@ class MooncakeConnector(KVConnectorBase):
         self.kv_caches_base_addr: list[int] = []
         self._per_block_bytes_list: list[int] = []
         self._block_region_roles: list[str | None] = []
+        self._fp4_index_layout: bool = False
         self.kv_cache_shape: tuple[int, ...] | None = None
         self.block_len: int = config.kv_cache_block_size
         self.num_blocks: int = 0
@@ -721,6 +768,12 @@ class MooncakeConnector(KVConnectorBase):
         self.done_recving: set[str] = set()
         self.failed_recving: set[str] = set()
         self._completion_lock = threading.Lock()
+        # Requests still being dispatched to producer PP stages, and failures
+        # that arrived mid-dispatch. Those producers are not cancelled, so a
+        # stage-0 failure must not reach the scheduler until every stage
+        # request is out.
+        self._dispatch_in_flight: set[ReqId] = set()
+        self._deferred_failures: dict[ReqId, tuple[int, int, int]] = {}
 
         # --- GPU memory fence: blocks pending coherence enforcement ---
         self._blocks_pending_fence: list[int] = []
@@ -848,6 +901,10 @@ class MooncakeConnector(KVConnectorBase):
         self.kv_caches_base_addr = [r.base_addr for r in tt.block_regions]
         self._per_block_bytes_list = [r.unit_bytes for r in tt.block_regions]
         self._block_region_roles = [r.semantic_role for r in tt.block_regions]
+        self._fp4_index_layout = any(
+            role is not None and role.startswith(INDEX_CACHE_FP4_PREFIX)
+            for role in self._block_region_roles
+        )
         if (
             not self.is_producer
             and self.dcp_size > 1
@@ -906,11 +963,12 @@ class MooncakeConnector(KVConnectorBase):
 
         logger.info(
             "Registering %d RDMA chunks (%d block regions, %d slot regions, "
-            "max_chunk=%.2f GiB)",
+            "max_chunk=%.2f GiB, ib_devices=%s)",
             len(reg_ptrs),
             len(tt.block_regions),
             len(tt.slot_regions),
             self._MAX_RDMA_CHUNK_BYTES / (1024**3),
+            ",".join(self.ib_devices) or "<none>",
         )
 
         ret = self.transfer_engine.batch_register_memory(reg_ptrs, reg_sizes)
@@ -1128,6 +1186,7 @@ class MooncakeConnector(KVConnectorBase):
                             b for b, _ in self._block_regions
                         ],
                         "consumer_block_bpb": [bpb for _, bpb in self._block_regions],
+                        "consumer_region_roles": self._block_region_roles,
                         # SWA ring, keyed by state slot. The whole region
                         # travels, not just its base: a reverse-indexed one
                         # needs its extent to place slot 0.
@@ -1141,10 +1200,37 @@ class MooncakeConnector(KVConnectorBase):
                         "consumer_staging_bytes": self._staging_slot_bytes,
                     }
                 )
+                if self._fp4_index_layout:
+                    # Version fence. A producer predating the two-region FP4
+                    # layout looks up "consumer_block_base_addrs"
+                    # unconditionally, so publishing under an FP4-only key
+                    # makes it raise KeyError, which _execute_transfer turns
+                    # into a transfer failure. The mixed-version pair fails
+                    # closed instead of writing FP8-shaped bytes into FP4
+                    # regions. Current producers accept either key.
+                    request_body["consumer_block_base_addrs_fp4"] = request_body.pop(
+                        "consumer_block_base_addrs"
+                    )
             else:
                 request_body["consumer_base_addrs"] = self.kv_caches_base_addr
 
             write_request = msgpack.dumps(request_body)
+
+            # Registered before the first send: a producer failure can be
+            # notified while this loop is still running, and the handler needs
+            # the slot and block records to already be there or it cannot
+            # reclaim them.
+            self._pending_recv.add(req_id)
+            # Only delta blocks need fencing; reused prefix blocks are coherent.
+            self._pending_recv_blocks[req_id] = list(dst_block_ids)
+            if meta.local_slot_index >= 0:
+                self._pending_recv_slots[req_id] = (
+                    meta.local_slot_index,
+                    consumer_staging_pool_idx,
+                )
+
+            with self._completion_lock:
+                self._dispatch_in_flight.add(req_id)
 
             for stage in range(remote_pp_size):
                 remote_port = meta.remote_handshake_port + _port_offset(
@@ -1179,14 +1265,14 @@ class MooncakeConnector(KVConnectorBase):
                     dst_block_ids[:10],
                 )
 
-            self._pending_recv.add(req_id)
-            # Only delta blocks need fencing; reused prefix blocks are coherent.
-            self._pending_recv_blocks[req_id] = list(dst_block_ids)
-            if meta.local_slot_index >= 0:
-                self._pending_recv_slots[req_id] = (
-                    meta.local_slot_index,
-                    consumer_staging_pool_idx,
-                )
+            with self._completion_lock:
+                self._dispatch_in_flight.discard(req_id)
+                deferred = self._deferred_failures.pop(req_id, None)
+            if deferred is not None:
+                # A producer failed while later stages were still being
+                # dispatched. Every request is out now, so it is safe to
+                # publish the failure and let the scheduler fall back.
+                self._record_write_done(req_id, *deferred, success=False)
 
     # -----------------------------------------------------------------
     # Staging pool management
@@ -1871,7 +1957,13 @@ class MooncakeConnector(KVConnectorBase):
         req_id: str,
     ) -> bool:
         """Two-phase RDMA for backends with per-request state: block regions first, then slot regions."""
-        consumer_block_addrs = request_data["consumer_block_base_addrs"]
+        consumer_is_fp4 = "consumer_block_base_addrs_fp4" in request_data
+        addr_key = (
+            "consumer_block_base_addrs_fp4"
+            if consumer_is_fp4
+            else "consumer_block_base_addrs"
+        )
+        consumer_block_addrs = request_data[addr_key]
         consumer_block_bpb = request_data["consumer_block_bpb"]
         consumer_slot_addrs = request_data["consumer_slot_base_addrs"]
         consumer_slot_bps = request_data["consumer_slot_bps"]
@@ -1896,9 +1988,84 @@ class MooncakeConnector(KVConnectorBase):
             request_data.get("consumer_num_layers"),
             self._block_region_consumer_indices,
         )
+        # The plan comes from this stage's region order but the bytes land at
+        # block_cmap[region_idx], and equal region counts do not make the two
+        # orders match. Validate both semantic role and physical width so an
+        # incompatible layout fails before any RDMA write instead of silently
+        # corrupting KV: FP4 splits the indexer into separate packed-data and
+        # e8m0 scale regions, so a mismapped plan is otherwise invisible.
+        consumer_roles = request_data.get("consumer_region_roles")
+        n_consumer = len(consumer_block_addrs)
+        if consumer_is_fp4 != self._fp4_index_layout:
+            raise RuntimeError(
+                f"Index cache dtype mismatch for req {req_id}: producer "
+                f"fp4={self._fp4_index_layout}, consumer fp4={consumer_is_fp4}"
+            )
+        if len(block_cmap) != len(self._block_regions) or any(
+            not 0 <= cidx < n_consumer for cidx in block_cmap
+        ):
+            raise RuntimeError(
+                f"Region map out of range for req {req_id}: {len(block_cmap)} "
+                f"mapped indices for {len(self._block_regions)} local regions "
+                f"onto {n_consumer} consumer regions"
+            )
+        if len(consumer_block_bpb) != n_consumer or (
+            consumer_roles is not None and len(consumer_roles) != n_consumer
+        ):
+            raise RuntimeError(
+                f"Consumer region arrays disagree for req {req_id}: "
+                f"{n_consumer} base addresses, {len(consumer_block_bpb)} byte "
+                f"widths, "
+                f"{len(consumer_roles) if consumer_roles is not None else 'no'} "
+                "roles"
+            )
+        if (
+            self._fp4_index_layout
+            and self.pp_size == 1
+            and sorted(block_cmap) != list(range(n_consumer))
+        ):
+            # Bounds only prove each producer region lands somewhere valid,
+            # not that the map is a permutation. A consumer with an extra
+            # trailing data/scale pair keeps a stale PAGE, and a duplicated
+            # destination silently overwrites one region with another -- which
+            # the role check cannot catch, because semantic_role is optional
+            # and two None-role regions of equal width compare equal. Under
+            # pp_size > 1 the map is legitimately partial and
+            # _consumer_region_map's group check enforces total coverage.
+            raise RuntimeError(
+                f"Region map is not one-to-one for req {req_id}: "
+                f"{sorted(block_cmap)} over {n_consumer} consumer regions; "
+                "an FP4 layout must map each region exactly once"
+            )
+        if self._fp4_index_layout and consumer_roles is None:
+            # Both ends of a PD pair run the same source tree, so this is a
+            # deployment error rather than a version to negotiate with: a peer
+            # that predates the two-region indexer layout advertises no roles,
+            # and there is nothing to map its single FP8 region onto. The
+            # reverse pairing -- an older producer receiving FP4 requests -- is
+            # fenced on the consumer side by the FP4-only base-address key,
+            # which such a producer cannot look up.
+            raise RuntimeError(
+                f"FP4 index layout requires the consumer to advertise region "
+                f"roles, but req {req_id} carries none; the peer predates the "
+                "two-region indexer layout"
+            )
         for region_idx, (src_base, bpb) in enumerate(self._block_regions):
             cidx = block_cmap[region_idx]
             dst_base = consumer_block_addrs[cidx]
+            role = self._block_region_roles[region_idx]
+            if consumer_roles is not None and consumer_roles[cidx] != role:
+                raise RuntimeError(
+                    f"Region role mismatch for req {req_id}: local region "
+                    f"{region_idx} is {role!r}, but consumer region "
+                    f"{cidx} is {consumer_roles[cidx]!r}"
+                )
+            if consumer_block_bpb[cidx] != bpb:
+                raise RuntimeError(
+                    f"Region byte-size mismatch for req {req_id}: producer "
+                    f"region {region_idx} has {bpb}, consumer region "
+                    f"{cidx} has {consumer_block_bpb[cidx]}"
+                )
             for sb, db in zip(src_block_ids, dst_block_ids):
                 block_src.append(src_base + sb * bpb)
                 block_dst.append(dst_base + db * consumer_block_bpb[cidx])
@@ -2223,6 +2390,10 @@ class MooncakeConnector(KVConnectorBase):
                 )
                 return False
             if not success:
+                if req_id in self._dispatch_in_flight:
+                    # Replayed by the dispatch loop once all stages are out.
+                    self._deferred_failures[req_id] = (pp_rank, tp_rank, write_nonce)
+                    return False
                 del self._pending_recv_expected[req_id]
                 self._pending_recv_stages.pop(req_id, None)
                 self._pending_recv_nonce.pop(req_id, None)
@@ -2246,7 +2417,15 @@ class MooncakeConnector(KVConnectorBase):
                 self._pending_recv_nonce.pop(req_id, None)
 
         if failed:
-            self._pending_recv_slots.pop(req_id, None)
+            # Return the staging row to the pool. The scatter is deliberately
+            # skipped -- the bytes never landed -- but the row itself must not
+            # leak, or _acquire_staging_slot() blocks forever once the pool is
+            # exhausted by repeated failures.
+            slot_info = self._pending_recv_slots.pop(req_id, None)
+            if slot_info is not None:
+                _, pool_idx = slot_info
+                if pool_idx >= 0:
+                    self._release_staging_slot(pool_idx)
             self._pending_recv_blocks.pop(req_id, None)
             with self._completion_lock:
                 self.failed_recving.add(req_id)
