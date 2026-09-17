@@ -127,6 +127,79 @@ def test_fp4_indexer_refuses_offload_layouts_that_read_regions():
         AiterMLAMetadataBuilder.get_kv_transfer_tensors(builder)
 
 
+def test_fp4_indexer_serves_multi_wrapping_only_dense_offload():
+    """A `multi` is whatever it wraps, not a name to refuse on sight.
+
+    `MultiConnector.register_kv_caches` forwards `transfer_tensors` to each sub
+    unchanged, so a `multi` holding only dense offload hands it to a connector
+    that ignores it. Refusing the wrapper would deny a topology that works.
+    """
+    builder = _fp4_builder(
+        {
+            "kv_connector": "multi",
+            "connectors": [{"kv_connector": "lmcache_offload", "kv_role": "offload"}],
+        }
+    )
+
+    assert AiterMLAMetadataBuilder.get_kv_transfer_tensors(builder) is None
+
+
+def test_fp4_indexer_refuses_multi_with_any_region_reader():
+    """One region-reading sub is enough: they all get the same `None`."""
+    builder = _fp4_builder(
+        {
+            "kv_connector": "multi",
+            "connectors": [
+                {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+                {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+            ],
+        }
+    )
+
+    with pytest.raises(NotImplementedError, match="region map"):
+        AiterMLAMetadataBuilder.get_kv_transfer_tensors(builder)
+
+
+def test_region_map_verdict_comes_from_the_registration():
+    """A connector declares this where it is registered, not here.
+
+    The default is "reads them", so a backend that never says otherwise is
+    refused rather than quietly handed a `None` its `register_kv_caches` may
+    not survive. A connector that consumes only `KVCacheTensor`s declares
+    `reads_block_regions=False` at registration and is served without anyone
+    editing the attention backend.
+    """
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    KVConnectorFactory.register(
+        "fp4gate_probe_tensors_only",
+        worker_module="atom.kv_transfer.offload.connector",
+        worker_class="LMCacheOffloadConnector",
+        scheduler_module="atom.kv_transfer.offload.connector",
+        scheduler_class="LMCacheOffloadConnectorScheduler",
+        reads_block_regions=False,
+    )
+    KVConnectorFactory.register(
+        "fp4gate_probe_default",
+        worker_module="atom.kv_transfer.offload.connector",
+        worker_class="LMCacheOffloadConnector",
+        scheduler_module="atom.kv_transfer.offload.connector",
+        scheduler_class="LMCacheOffloadConnectorScheduler",
+    )
+    try:
+        served = _fp4_builder({"kv_connector": "fp4gate_probe_tensors_only"})
+        assert AiterMLAMetadataBuilder.get_kv_transfer_tensors(served) is None
+
+        refused = _fp4_builder({"kv_connector": "fp4gate_probe_default"})
+        with pytest.raises(NotImplementedError, match="region map"):
+            AiterMLAMetadataBuilder.get_kv_transfer_tensors(refused)
+    finally:
+        for name in ("fp4gate_probe_tensors_only", "fp4gate_probe_default"):
+            KVConnectorFactory._registry.pop(name, None)
+            KVConnectorFactory._requires_pd_staging.pop(name, None)
+            KVConnectorFactory._reads_block_regions.pop(name, None)
+
+
 def test_fp4_gate_reads_the_shared_connector_predicate():
     """Pinned to the factory's own answer, not to a second list of names here.
 
