@@ -170,7 +170,6 @@ class ScheduledBatch:
         is_final_chunk: list[bool] | None = None,
         next_token_ids: list[int] | None = None,
         state_maintenance_ops: StateMaintenanceOps | None = None,
-        is_first_decode_without_local_prefill: list[bool] | None = None,
     ):
         if scheduled_spec_decode_tokens is None:
             scheduled_spec_decode_tokens = {}
@@ -244,14 +243,9 @@ class ScheduledBatch:
             dtype=bool,
         )
 
-        self.is_first_decode_without_local_prefill = (
-            [seq.is_first_decode for seq in seqs.values()]
-            if is_first_decode_without_local_prefill is None
-            else list(is_first_decode_without_local_prefill)
-        )
-        assert len(self.is_first_decode_without_local_prefill) == len(
-            seqs
-        ), "first-decode flags must align with scheduled sequences"
+        self.is_first_decode_without_local_prefill = [
+            seq.is_first_decode for seq in seqs.values()
+        ]
         self.mrope_positions_by_req = {
             seq.id: seq.mrope_positions
             for seq in seqs.values()
@@ -1999,6 +1993,17 @@ class Scheduler:
         """
         for seq in scheduled_seqs.values():
             seq.state_fork_src = -1
+
+    @staticmethod
+    def _consume_first_decode(scheduled_seqs: dict[int, Sequence]) -> None:
+        """Clear the first-decode flags the batch just snapshotted.
+
+        Same contract as `_consume_state_forks`: the flag describes one
+        forward, and the batch constructor reads it off `Sequence`, so it can
+        only be cleared once that read has happened.
+        """
+        for seq in scheduled_seqs.values():
+            seq.is_first_decode = False
 
     # -- Remote KV / offload admission helpers ------------------------------
     def _resolve_waiting_remote_kv(
@@ -4135,7 +4140,6 @@ class DecodeScheduler(Scheduler):
         scheduled_seqs: dict[int, Sequence] = {}
         num_scheduled_tokens: list[int] = []
         scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
-        first_decode_flags: list[bool] = []
 
         with self._prefill_lock:
             while self.running and len(scheduled_seqs) < self.max_num_seqs:
@@ -4156,10 +4160,6 @@ class DecodeScheduler(Scheduler):
                     num_new_tokens = self.mtp_k + 1
                     self.block_manager.may_append(seq, num_new_tokens)
                     scheduled_seqs[seq.id] = seq
-                    is_first_decode = bool(seq.is_first_decode)
-                    first_decode_flags.append(is_first_decode)
-                    if is_first_decode:
-                        seq.is_first_decode = False
                     seq.type = SequenceType.DECODE
                     num_scheduled_tokens.append(num_new_tokens)
 
@@ -4183,19 +4183,17 @@ class DecodeScheduler(Scheduler):
                 pwait = sum(seq.num_tokens for seq in self.prefill_waiting.values())
                 self.cu_fraction = _optimal_cu_fraction(total_tokens_num_decode, pwait)
 
-        return (
-            ScheduledBatch(
-                seqs=scheduled_seqs,
-                num_scheduled_tokens=num_scheduled_tokens,
-                total_tokens_num=total_tokens_num_decode,
-                total_tokens_num_decode=total_tokens_num_decode,
-                total_seqs_num=len(scheduled_seqs),
-                total_seqs_num_decode=len(scheduled_seqs),
-                num_spec_step=self.mtp_k if self.spec_decode_local else 0,
-                scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
-                cu_stream_fraction=self.cu_fraction,
-                state_maintenance_ops=self.block_manager.take_state_maintenance_ops(),
-                is_first_decode_without_local_prefill=first_decode_flags,
-            ),
-            scheduled_seqs,
+        decode_batch = ScheduledBatch(
+            seqs=scheduled_seqs,
+            num_scheduled_tokens=num_scheduled_tokens,
+            total_tokens_num=total_tokens_num_decode,
+            total_tokens_num_decode=total_tokens_num_decode,
+            total_seqs_num=len(scheduled_seqs),
+            total_seqs_num_decode=len(scheduled_seqs),
+            num_spec_step=self.mtp_k if self.spec_decode_local else 0,
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            cu_stream_fraction=self.cu_fraction,
+            state_maintenance_ops=self.block_manager.take_state_maintenance_ops(),
         )
+        self._consume_first_decode(scheduled_seqs)
+        return (decode_batch, scheduled_seqs)
