@@ -61,6 +61,8 @@ def _adapter(monkeypatch):
     adapter._seqs = SeqViewRegistry()
     adapter._promised_loads = {}
     adapter._deferred_frees = set()
+    adapter._deferred_free_at = {}
+    adapter._next_save_reconcile_at = 0.0
     adapter._releases_in_flight = set()
     adapter._save_reports = {}
     adapter._load_failure_reports = {}
@@ -163,6 +165,99 @@ def test_a_partial_quorum_does_not_release_the_lease(monkeypatch):
     _report(adapter, save.save_operation, ranks=1)
 
     assert adapter._collect_releases() == ["r0"]
+
+
+def test_a_quorum_that_never_completes_is_abandoned(monkeypatch):
+    """A rank that never reports must not pin the blocks for the whole run.
+
+    Every gate on the release path waits for all ranks. Before the reconcile,
+    that wait was unbounded: one worker dying mid-store, or one rank whose
+    `store()` parked inside LMCache and neither returned nor raised, left
+    `should_defer_free` true forever. vLLM holds that request's blocks until the
+    connector names it in `finished_sending`, so the pool lost that capacity for
+    the life of the server while `has_pending_push_work` kept the engine
+    stepping over a request that could never finish.
+    """
+    adapter, scheduler = _adapter(monkeypatch)
+    request, seq = _admit(adapter)
+    (save,) = _emit_save(adapter, seq, PROMPT)
+    adapter.request_finished(request, [])
+
+    # Every rank but one. The quorum can never be reached from here.
+    _report(adapter, save.save_operation, ranks=WORLD - 1)
+    assert scheduler.should_defer_free(seq) is True
+
+    # Inside the window the deferral stands: reclaiming early would race a copy
+    # that is still reading those blocks.
+    adapter._reconcile_stale_saves()
+    assert adapter._collect_releases() == []
+    assert scheduler.should_defer_free(seq) is True
+
+    timeout = connector_mod.offload_save_abandon_timeout_s()
+    assert timeout > 0, "the default pin timeout must arm the reconcile"
+    adapter._deferred_free_at["r0"] -= timeout + 1
+    adapter._next_save_reconcile_at = 0.0
+
+    adapter._reconcile_stale_saves()
+
+    assert scheduler.should_defer_free(seq) is False
+    assert adapter._collect_releases() == ["r0"]
+    # Nothing left holding the request: not the partial quorum, not the partial
+    # save tally, not the SeqView.
+    assert adapter._completion_reports == {}
+    assert adapter._save_reports == {}
+    assert len(adapter._seqs) == 0
+
+
+def test_the_reconcile_is_off_when_lmcache_pinning_is_disabled(monkeypatch):
+    """A non-positive pin timeout disables reclamation, as on the native path.
+
+    The window is safe only because it is derived from LMCache's own pin
+    timeout. With pinning off there is no such derivation, so there is no honest
+    window, and abandoning would be guesswork against a possibly-live copy.
+    """
+    adapter, scheduler = _adapter(monkeypatch)
+    request, seq = _admit(adapter)
+    (save,) = _emit_save(adapter, seq, PROMPT)
+    adapter.request_finished(request, [])
+    _report(adapter, save.save_operation, ranks=WORLD - 1)
+
+    monkeypatch.setattr(connector_mod, "offload_save_abandon_timeout_s", lambda: 0.0)
+    adapter._deferred_free_at["r0"] -= 10_000.0
+
+    adapter._reconcile_stale_saves()
+
+    assert scheduler.should_defer_free(seq) is True
+    assert adapter._collect_releases() == []
+
+
+def test_build_connector_meta_runs_the_reconcile_before_releasing(monkeypatch):
+    """Order matters: a save abandoned this step is released this step.
+
+    Reconciling after `_collect_releases` would hold each abandoned request one
+    extra step -- harmless on a busy engine, but the failure this bounds is an
+    engine with nothing else to run.
+    """
+    adapter, _scheduler = _adapter(monkeypatch)
+    order = []
+    monkeypatch.setattr(
+        adapter, "_reconcile_stale_saves", lambda: order.append("reconcile")
+    )
+    monkeypatch.setattr(
+        adapter, "_collect_releases", lambda: order.append("collect") or []
+    )
+
+    adapter.build_connector_meta(
+        SimpleNamespace(
+            preempted_req_ids=set(),
+            scheduled_new_reqs=(),
+            scheduled_cached_reqs=SimpleNamespace(
+                req_ids=[], num_computed_tokens=[], new_block_ids=[], resumed_req_ids=()
+            ),
+        )
+    )
+
+    assert order == ["reconcile", "collect"]
 
 
 def test_one_rank_failing_fails_the_whole_store(monkeypatch):

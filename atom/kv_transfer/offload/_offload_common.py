@@ -589,6 +589,7 @@ class OffloadSchedulerMixin(ABC):
             "saved_tokens": self.total_saved_tokens,
             "loads_pending": len(self._load_inflight_tokens),
             "saves_pending": len(self._save_inflight_tokens),
+            "suppressed_load_retries": self.total_suppressed_load_retries,
         }
         if hasattr(self, "total_early_released_blocks"):
             statistics.update(

@@ -42,7 +42,7 @@ BUDGET = 256  # one prefill chunk: four blocks
 PROMPT = 1024  # four budgets, so three saves are hidden behind the first
 
 
-def _adapter(monkeypatch):
+def _adapter(monkeypatch, dcp=1):
     """The adapter wired to a real `DenseOffloadScheduler`.
 
     Built without `__init__` for the same reason the sibling files do it: a real
@@ -51,13 +51,13 @@ def _adapter(monkeypatch):
     monkeypatch.setattr(
         offcfg,
         "build_lmcache_config",
-        lambda _c=None: SimpleNamespace(chunk_size=CHUNK),
+        lambda _c=None: SimpleNamespace(chunk_size=CHUNK * dcp),
     )
     monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_a: object())
     config = SimpleNamespace(
         kv_transfer_config={"kv_role": "kv_both"},
         kv_cache_block_size=BLOCK,
-        decode_context_parallel_size=1,
+        decode_context_parallel_size=dcp,
         tensor_parallel_size=WORLD,
     )
     adapter = object.__new__(connector_mod.AtomLMCacheOffloadConnector)
@@ -66,6 +66,8 @@ def _adapter(monkeypatch):
     adapter._seqs = SeqViewRegistry()
     adapter._promised_loads = {}
     adapter._deferred_frees = set()
+    adapter._deferred_free_at = {}
+    adapter._next_save_reconcile_at = 0.0
     adapter._releases_in_flight = set()
     adapter._save_reports = {}
     adapter._load_failure_reports = {}
@@ -182,3 +184,34 @@ def test_a_resumed_request_replaces_its_table_instead_of_appending(monkeypatch):
     _step(adapter, "r0", BUDGET, new_blocks=fresh, resumed=["r0"])
 
     assert seq.block_table == fresh
+
+
+def test_the_frontier_is_capped_in_virtual_blocks_under_dcp(monkeypatch):
+    """One scheduler block id covers `block_size * dcp` tokens, not `block_size`.
+
+    The cap exists because KV past the block table is in no block this connector
+    knows about. Priced in physical blocks it under-reports coverage by the DCP
+    factor, so on a dcp=2 deployment every request's save frontier is pinned at
+    half of what is actually resident -- the same "half of every long prefix is
+    invisible to the tier, and every metric says success" shape this file was
+    written for, just triggered by a config rather than by prompt length.
+
+    The whole offload stack already indexes this table in virtual units
+    (`chunked_scheduler.virtual_block_size`), so the cap is the one place that
+    disagreed.
+    """
+    dcp = 2
+    adapter, scheduler = _adapter(monkeypatch, dcp=dcp)
+    assert scheduler.virtual_block_size == BLOCK * dcp
+
+    blocks = 8
+    resident = blocks * BLOCK * dcp  # 1024 tokens, all of them computed
+    request = SimpleNamespace(
+        request_id="r0", prompt_token_ids=list(range(resident + 1))
+    )
+    adapter.update_state_after_alloc(request, (list(range(blocks)),), 0)
+
+    _step(adapter, "r0", resident)
+
+    seq = adapter._seqs.get("r0")
+    assert seq.num_cached_tokens == resident

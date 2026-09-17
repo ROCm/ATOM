@@ -62,6 +62,8 @@ def _adapter(world_size: int = 1, defer=()) -> tuple[object, _FakeScheduler]:
     adapter._seqs = SeqViewRegistry()
     adapter._promised_loads = {}
     adapter._deferred_frees = set()
+    adapter._deferred_free_at = {}
+    adapter._next_save_reconcile_at = 0.0
     adapter._releases_in_flight = set()
     adapter._save_reports = {}
     adapter._load_failure_reports = {}

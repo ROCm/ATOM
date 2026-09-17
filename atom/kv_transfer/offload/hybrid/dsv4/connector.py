@@ -229,6 +229,20 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         # The ATOM LMCache GPU connector owns per-thread staging streams.
         # OFFLOAD_COPY_WORKERS tunes the SAVE pool only.
         n_save_workers = int(os.environ.get("OFFLOAD_COPY_WORKERS", "1"))
+        # The SLOT load path is *not* thread-safe against itself: a worker batch
+        # shares one staging row across its loads (`_SlotLoadBatchReservation`)
+        # precisely because the load executor runs them in submission order. A
+        # second load thread would run two loads through the same staging row
+        # concurrently and corrupt both. OFFLOAD_LOAD_WORKERS therefore does not
+        # apply to DSV4 -- honour it loudly rather than silently.
+        n_load_env = int(os.environ.get("OFFLOAD_LOAD_WORKERS", "1"))
+        if n_load_env != 1:
+            logger.warning(
+                "ATOM DSV4 offload: ignoring OFFLOAD_LOAD_WORKERS=%d; the SLOT "
+                "load path shares one staging row per worker batch and requires "
+                "a serial load executor",
+                n_load_env,
+            )
         self._max_pending_saves = max_pending_saves(kvc, n_save_workers)
         self._save_admission = threading.BoundedSemaphore(self._max_pending_saves)
         # Terminal PAGE-save outcomes, drained by ``get_finished`` onto
@@ -240,6 +254,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         self._init_worker_common(
             config,
             save_workers=n_save_workers,
+            load_workers=1,
             thread_name_prefix="lmc-offload",
         )
         # Kept separate from _done_save: PAGE completion releases deferred

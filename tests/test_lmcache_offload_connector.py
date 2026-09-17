@@ -3846,6 +3846,10 @@ def test_dsv4_failed_load_is_not_retried_for_the_same_request():
 
     assert sched.get_num_new_matched_tokens(seq) == (0, False)
     assert sched.total_suppressed_load_retries == 1
+    # Reported, not just counted: a suppressed retry is a silent hit-rate loss
+    # -- the request serves correctly, from HBM, having skipped the tier -- so
+    # the only way to see it in a running server is through the statistics dict.
+    assert sched.get_statistics()["suppressed_load_retries"] == 1
 
     sched.request_finished(seq)
     assert sched._load_failed_seqs == {}
@@ -4938,6 +4942,7 @@ def test_scheduler_offload_statistics_are_cumulative():
         "saved_tokens": 4096,
         "loads_pending": 0,
         "saves_pending": 0,
+        "suppressed_load_retries": 0,
     }
 
 

@@ -90,6 +90,10 @@ def main():
     )
     args = ap.parse_args()
 
+    # Up front, not next to the write: a bad --out-dir should fail in 0 s
+    # rather than after both passes and the flood have already run.
+    os.makedirs(args.out_dir, exist_ok=True)
+
     rng = random.Random(args.seed)
     # Markers are drawn from the run's seed, so both arms see the same prompts.
     prompts = []
