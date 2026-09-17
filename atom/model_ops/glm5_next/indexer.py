@@ -22,6 +22,7 @@ from atom.model_ops.attention_mla import (
     triton_convert_req_index_to_global_index,
     triton_convert_req_index_to_global_index_dsa_prefill,
 )
+from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
 from atom.utils import envs, forward_context
 from atom.utils.custom_register import direct_register_custom_op
 
@@ -232,16 +233,9 @@ def _sparse_attn_indexer_kpool(
         pool_ke = pool_ke.to(torch.int32)
         pool_topk = torch.empty((n_tokens, select_k), dtype=torch.int32, device=device)
 
-        budget_bytes = envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB * 1024 * 1024
-        if budget_bytes > 0 and budget_bytes // (max_pools * 4) < n_tokens:
-            budget_rows = budget_bytes // (max_pools * 4)
-            chunk_rows = (
-                (budget_rows // 128) * 128
-                if budget_rows >= 128
-                else 1 << (max(1, budget_rows).bit_length() - 1)
-            )
-        else:
-            chunk_rows = n_tokens
+        chunk_rows = sparse_indexer_row_chunk(
+            n_tokens, max_pools, envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
+        )
 
         for start in range(0, n_tokens, chunk_rows):
             end = min(start + chunk_rows, n_tokens)

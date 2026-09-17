@@ -409,8 +409,9 @@ copy has completed and the CPU frame owns the bytes. CRC/header finalization,
 PAGE visibility polling, and `DSV4CheckpointStore.put()` continue from that CPU
 frame.
 
-The GPU connector uses a **bounded** staging buffer
-(`OFFLOAD_GPU_STAGING_CHUNKS` chunks, default 2) and a two-stage pipeline: while
+The GPU connector uses a **bounded** staging buffer (sized in bytes by
+default, see below; `OFFLOAD_GPU_STAGING_CHUNKS` overrides) and a two-stage
+pipeline: while
 one group copies host↔staging, the next packs/unpacks on a separate CUDA stream,
 handed off via ready/free events. Transfers larger than the buffer are split into
 groups, so HBM staging cost is capped regardless of prefix length.
@@ -434,12 +435,51 @@ staging HBM is therefore:
 ```
 staging_chunk_bytes = (LMCACHE_CHUNK_SIZE / block_size) * bytes_per_block
 per_buffer_bytes    = OFFLOAD_GPU_STAGING_CHUNKS * staging_chunk_bytes
-resident_HBM        ≈ (1 load + OFFLOAD_COPY_WORKERS save) * per_buffer_bytes
+resident_HBM        ≈ (OFFLOAD_LOAD_WORKERS load + OFFLOAD_COPY_WORKERS save) * per_buffer_bytes
 ```
 
 For the chunk2 run that is `2 * 16.76 MiB ≈ 33.5 MiB` per buffer × (1 load + 1
 save) ≈ **67 MiB** total. Raising `OFFLOAD_GPU_STAGING_CHUNKS` speeds up transfers
 but multiplies *both* buffers.
+
+**A chunk is not a fixed size, so the default is denominated in bytes.**
+`staging_chunk_bytes` scales with `LMCACHE_CHUNK_SIZE / block_size`, which is 8
+for the reference config above and **1** for GLM-5.2 (`LMCACHE_CHUNK_SIZE=64`,
+`--block-size 64`). A fixed chunk count therefore hands the two models buffers
+~6x apart -- 33.5 MiB vs 5.8 MiB -- and the model on the small end pays the
+difference in per-group overhead. Unset, the connector instead asks for
+`_DEFAULT_GPU_STAGING_BYTES` (48 MiB) worth of chunks, clamped to
+`[2, 64]`: geometries whose chunk already exceeds the target keep the two
+chunks they have always had, and a geometry with a very small chunk cannot turn
+the byte target into an unbounded count. Setting
+`OFFLOAD_GPU_STAGING_CHUNKS` explicitly bypasses all of this;
+`OFFLOAD_GPU_STAGING_MAX_BYTES` still caps whatever comes out.
+
+Measured on GLM-5.2 (TP4, 28K prefix, pool 64, 600 s, seed 71502, paired arms):
+
+| `OFFLOAD_GPU_STAGING_CHUNKS` | per buffer | tok/s | vs 2 chunks |
+|---|---|---|---|
+| 2 (old default) | 5.8 MB | 378.73 | -- |
+| 11 | 33.6 MB | 403.24 | +6.47% |
+| 16 | 48.8 MB | 403.98 | +6.67% |
+| 32 | 97.7 MB | 403.23 | +6.47% |
+| unset (new default) | 48.8 MB | 398.42 | +5.20% |
+
+The last row is the byte rule running for real, not a forced chunk count: on
+this model it resolves to 16 chunks and a byte-identical 48,844,800-byte
+buffer, so it and the `16` arm are a **same-config repeat**. They differ by
+1.38%, which is therefore the measured run-to-run floor for this grid and is
+what the other rows have to clear. The three large forced arms span 0.19% --
+below that floor, i.e. indistinguishable -- so the plateau starts at or before
+11 chunks and 48 MiB sits inside it rather than on its edge. Taking the
+pessimistic member of the repeat pair, the byte default is worth **+5.20%**
+over the old fixed 2. External hit rate is 81.0-81.2% in every arm above 2
+(79.7% at 2), so the gain is not "reads less, therefore faster".
+
+GLM-5.2 is hybrid KV -- 78 sparse-MLA layers at 576 B/token plus 21 DSA
+indexer layers at 132 B/token -- but the DSV4 codec reports one fused
+`bytes_per_block` covering both (47,700 B/token x 64 = 2.91 MiB), so the byte
+rule resolves once per rank, not once per layer group.
 
 Stateful DSV4 reserves an additional persistent full-SLOT staging allocation:
 
@@ -876,9 +916,10 @@ Connector-specific tuning (env):
 | Env | Default | Purpose |
 |-----|:-------:|---------|
 | `OFFLOAD_MIN_LOAD_TOKENS` | 8192 | Don't reload a hit smaller than this; recompute is cheaper. |
-| `OFFLOAD_COPY_WORKERS` | 1 | SAVE daemon threads. LOAD is always a single thread (TTFT-critical). |
+| `OFFLOAD_COPY_WORKERS` | 1 | SAVE daemon threads. |
+| `OFFLOAD_LOAD_WORKERS` | 1 | LOAD daemon threads. One is enough until the CPU tier serves real traffic; past that, requests park inside `retrieve` and the scheduler admits fewer of them. Each thread costs one more `gpu_staging_buffer_bytes` per rank. |
 | `OFFLOAD_MAX_PENDING_SAVES` | `max(2, 2 × OFFLOAD_COPY_WORKERS)` | Positive integer bound on total admitted worker saves (running + queued), acquired before SLOT snapshot or executor submission. |
-| `OFFLOAD_GPU_STAGING_CHUNKS` | 2 | Chunks per bounded GPU staging buffer. Sizes **each** buffer — load and save own separate ones, so resident HBM ≈ `(1 + OFFLOAD_COPY_WORKERS) × chunks × chunk_bytes`. |
+| `OFFLOAD_GPU_STAGING_CHUNKS` | 48 MiB worth, clamped to `[2, 64]` | Chunks per bounded GPU staging buffer. Unset, the count is derived from a byte target so geometries with different bytes-per-chunk get the same buffer size. Sizes **each** buffer — load and save own separate ones, so resident HBM ≈ `(OFFLOAD_LOAD_WORKERS + OFFLOAD_COPY_WORKERS) × chunks × chunk_bytes`. |
 | `OFFLOAD_GPU_STAGING_MAX_BYTES` | — | Hard cap on staging bytes (clamps the chunk count). |
 | `OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER` | 0 | Free the staging buffer after each transfer (lower idle HBM, higher churn). |
 | `OFFLOAD_SLOT_STAGING_SLOTS` | 1 | DSV4 only: number of persistent full-SLOT GPU staging rows. Must be at least 1; HBM cost is this value × `slot_bytes`. |
@@ -1202,7 +1243,7 @@ Exact run configuration (so the numbers reproduce):
 | `--gpu-memory-utilization` | 0.95 | tight HBM → forces eviction → exercises reload |
 | `LMCACHE_MAX_LOCAL_CPU_SIZE` | 312.5 | GiB per rank |
 | `OFFLOAD_MIN_LOAD_TOKENS` | 8192 | |
-| `OFFLOAD_GPU_STAGING_CHUNKS` | **2** | sanity config; raise for throughput |
+| `OFFLOAD_GPU_STAGING_CHUNKS` | **2** | pinned; equals the byte-derived default for this geometry |
 | prefix cache | on | |
 
 The LMBenchmark CxS runs use the same `LMCACHE_CHUNK_SIZE=256` / `block-size=32`;

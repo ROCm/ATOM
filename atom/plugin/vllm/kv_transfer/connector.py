@@ -23,6 +23,7 @@ per transfer, not one layer at a time.
 """
 
 import logging
+import time
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -33,6 +34,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorWorkerMetadata,
 )
 
+from atom.kv_transfer.disaggregation.types import ConnectorCompletion
+from atom.kv_transfer.offload._offload_common import offload_save_abandon_timeout_s
 from atom.plugin.vllm.kv_transfer.kv_cache_layout import build_kv_cache_tensors
 from atom.plugin.vllm.kv_transfer.offload_config import build_offload_config
 from atom.plugin.vllm.kv_transfer.seq_view import SeqViewRegistry
@@ -41,6 +44,12 @@ if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
 
 logger = logging.getLogger("atom")
+
+# How often the stale-save reconcile actually runs. `build_connector_meta` is
+# called every step, but the window it enforces is minutes long, so matching the
+# native engine's reconcile cadence (`model_engine.scheduler`) keeps the per-step
+# cost off the scheduling path.
+_SAVE_RECONCILE_INTERVAL_S = 5.0
 
 
 class AtomOffloadMetadata(KVConnectorMetadata):
@@ -80,11 +89,20 @@ class AtomOffloadWorkerMetadata(KVConnectorWorkerMetadata):
     written its shard: acting on the first report would drop
     ``should_defer_free`` while a slower rank is still reading the blocks.
     ``aggregate`` sums the ranks of one step; the scheduler half sums the steps.
+
+    ``completions`` carries ATOM's connector-owned completion channels, which
+    are a third thing vLLM has no slot for. They are what releases the save's
+    block lease, and without them ``should_defer_free`` never goes false: the
+    per-operation owner and source-safe maps only ever grow, every finished
+    request keeps its blocks, and the pool deadlocks on capacity with nothing
+    running. The events are forwarded verbatim rather than interpreted --
+    channel semantics belong to the layout, not to this adapter.
     """
 
-    def __init__(self, saved=None, load_failed=None) -> None:
+    def __init__(self, saved=None, load_failed=None, completions=None) -> None:
         self.saved: dict[str, int] = dict(saved or {})
         self.load_failed: dict[str, int] = dict(load_failed or {})
+        self.completions: list[ConnectorCompletion] = list(completions or ())
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
@@ -93,12 +111,13 @@ class AtomOffloadWorkerMetadata(KVConnectorWorkerMetadata):
             mine = getattr(self, field)
             for req_id, count in (getattr(other, field, None) or {}).items():
                 mine[req_id] = mine.get(req_id, 0) + int(count)
+        self.completions.extend(getattr(other, "completions", None) or ())
         return self
 
     def __repr__(self) -> str:
         return (
             f"AtomOffloadWorkerMetadata(saved={self.saved}, "
-            f"load_failed={self.load_failed})"
+            f"load_failed={self.load_failed}, completions={self.completions})"
         )
 
 
@@ -127,16 +146,26 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         self._pending_release_ids: list[str] = []
         self._worker_saved: dict[str, int] = {}
         self._worker_load_failed: dict[str, int] = {}
+        self._worker_completions: list[ConnectorCompletion] = []
 
         # Scheduler half: requests whose free vLLM is holding for us, split by
         # what they are still waiting for -- the save to land, or the worker to
         # echo the release back. See `_collect_releases`.
         self._deferred_frees: set[str] = set()
+        # req_id -> monotonic time the deferral started, the clock
+        # `_reconcile_stale_saves` bounds the wait against.
+        self._deferred_free_at: dict[str, float] = {}
         self._releases_in_flight: set[str] = set()
         # Per-request rank tallies for the two facts that travel as worker
         # metadata rather than as one of vLLM's two id sets.
         self._save_reports: dict[str, int] = {}
         self._load_failure_reports: dict[str, int] = {}
+        # channel/operation key -> [ranks reported, succeeded on all of them,
+        # monotonic time the first rank reported]. The timestamp is carried so a
+        # stale quorum can be identified in the log; the wait itself is bounded
+        # by the deferral clock -- see `_reconcile_stale_saves`.
+        self._completion_reports: dict[tuple, list] = {}
+        self._next_save_reconcile_at = 0.0
         self._world_size = max(
             1, int(getattr(vllm_config.parallel_config, "world_size", 1) or 1)
         )
@@ -306,6 +335,10 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         for completion in out.finished_saving:
             req_id = _req_id_of(completion)
             self._worker_saved[req_id] = self._worker_saved.get(req_id, 0) + 1
+        # ATOM's connector-owned channels. `finished_saving` above is the
+        # legacy terminal that clears `_save_inflight`; these are what release
+        # the save's block lease, and dropping them deadlocks the pool.
+        self._worker_completions.extend(out.connector_completions)
 
         finished_sending = set(self._pending_release_ids)
         self._pending_release_ids.clear()
@@ -332,11 +365,16 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         none: the aggregator folds only non-``None`` metadata, and a step with
         no offload activity should not pickle an empty object per rank.
         """
-        if not (self._worker_saved or self._worker_load_failed):
+        if not (
+            self._worker_saved or self._worker_load_failed or self._worker_completions
+        ):
             return None
-        meta = AtomOffloadWorkerMetadata(self._worker_saved, self._worker_load_failed)
+        meta = AtomOffloadWorkerMetadata(
+            self._worker_saved, self._worker_load_failed, self._worker_completions
+        )
         self._worker_saved = {}
         self._worker_load_failed = {}
+        self._worker_completions = []
         return meta
 
     def shutdown(self) -> None:
@@ -411,7 +449,16 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         Capping is the correct semantics, not just a guard: KV for tokens past
         the block table is not in any block this connector knows about, so
         offering it up was never right. The remainder is saved on a later step,
-        once the allocation catches up.
+        once the allocation catches up -- which is why the block table has to be
+        grown here as well. vLLM calls ``update_state_after_alloc`` exactly once
+        per admission and hands it only the blocks allocated by then, so a
+        prompt longer than one prefill budget leaves a permanently short table:
+        the cap then pins the frontier at the first chunk forever, the save loop
+        sees ``aligned == saved`` on every later step, and everything past the
+        first chunk is never offloaded at all. Measured on GLM-5.2 with a
+        16,384-token budget: 20k-token prompts stored exactly 16,384 tokens and
+        nothing else, so half of every long prefix was invisible to the external
+        tier while every metric reported success.
 
         Only long prompts reach this: a chat-sized prompt is allocated in one
         go, so the two quantities never separate and every gsm8k-scale test
@@ -421,7 +468,19 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         -- both for ordering reasons spelled out at their helpers.
         """
         preempted = self._handle_preempted(scheduler_output)
-        block_size = int(self._config.kv_cache_block_size)
+        # Virtual, not physical: under decode context parallelism one scheduler
+        # block id covers `kv_cache_block_size * decode_context_parallel_size`
+        # tokens, and the block table this frontier is clamped against is the
+        # same one ATOM indexes in virtual units (`chunked_scheduler`). Pricing
+        # it physically would under-report coverage by the DCP factor and clamp
+        # away the tail of every prompt. Identity when DCP=1.
+        block_size = int(self._scheduler.virtual_block_size)
+        for req_id, new_blocks, replaces in _scheduled_block_growth(scheduler_output):
+            seq = self._seqs.get(req_id)
+            if seq is None:
+                continue
+            grown = _block_ids(new_blocks)
+            seq.set_block_table(grown if replaces else seq.block_table + grown)
         for req_id, num_tokens in _scheduled_frontiers(scheduler_output):
             seq = self._seqs.get(req_id)
             if seq is not None:
@@ -429,6 +488,9 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
                 seq.set_num_cached_tokens(min(int(num_tokens), covered))
         inner = self._scheduler.build_connector_meta()
         self._check_promised_loads(inner)
+        # Before `_collect_releases`, so a save abandoned on this step turns
+        # into a release on this step rather than on the next one.
+        self._reconcile_stale_saves()
         return AtomOffloadMetadata(inner, preempted, self._collect_releases())
 
     def _handle_preempted(self, scheduler_output) -> list[str]:
@@ -468,6 +530,86 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
             logger.debug("ATOM LMCache offload: preempted %s", req_ids)
         return req_ids
 
+    def _reconcile_stale_saves(self) -> None:
+        """Abandon a deferred save whose rank reports are never coming.
+
+        Every gate on the release path waits for all ranks: a save is terminal
+        once `_save_reports` reaches world size, an operation's lease is dropped
+        once `_completion_reports` does. Neither wait had a bound. One lost
+        report -- a worker that died mid-store, a rank whose `store()` parked
+        inside LMCache and neither returned nor raised -- leaves
+        `should_defer_free` true forever, so vLLM holds that request's blocks
+        and this adapter holds its SeqView for the life of the server. The pool
+        loses that capacity permanently, and `has_pending_push_work` keeps the
+        engine stepping over a request that can never finish.
+
+        ATOM's native engine already bounds exactly this, on the same clock
+        (`model_engine.scheduler._reconcile_stalled_saves`); the plugin path
+        simply had no equivalent. The window is LMCache's own pin timeout plus a
+        margin, which is what makes abandoning safe rather than merely
+        convenient: past it the copy the deferral was protecting is provably not
+        running, because `_guard` reports on both the return and the raise path,
+        so a missing report means the save is parked inside LMCache and LMCache
+        has already force-unpinned its source. See
+        `offload_save_abandon_timeout_s`; a non-positive
+        `LMCACHE_EC_PIN_TIMEOUT_SEC` disables reclamation, and this is then a
+        no-op, matching the native path.
+
+        Only the request half of the native reconcile is mirrored.
+        `reclaim_stale_leases` is the other half, and it is not merely inert
+        here but unimplementable: it reclaims *block ids*, which the native
+        engine hands to `BlockManager.free_leased_blocks`, and a vLLM connector
+        has no such channel -- it can only name request ids in
+        `finished_sending`. Consistently, nothing on this path ever calls
+        `activate_block_leases`, so no lease exists to reclaim. `abandon_save`
+        is keyed by request id, which *is* the unit vLLM frees, and it clears
+        precisely the state `should_defer_free` reads (`_save_inflight`,
+        `_save_operation_*`, `_save_tracker`) -- so the release falls out of the
+        `_collect_releases` pass that runs immediately after this.
+
+        The quorum entries are dropped rather than forced through as a failed
+        completion, because a failed store keeps its ranges unsafe by design:
+        forcing one would free nothing and would also clear a newer save
+        generation. A rank report arriving after the drop opens a fresh entry
+        whose clock starts then -- bounded, and harmless once the save it
+        belongs to has already been abandoned.
+        """
+        timeout = offload_save_abandon_timeout_s()
+        if timeout <= 0 or not self._deferred_frees:
+            return
+        now = time.monotonic()
+        if now < self._next_save_reconcile_at:
+            return
+        self._next_save_reconcile_at = now + _SAVE_RECONCILE_INTERVAL_S
+
+        # `setdefault`, so a deferral with no recorded start -- a request parked
+        # before this bookkeeping existed, or a test that seeds the set directly
+        # -- starts its clock now instead of being abandoned on sight.
+        stalled = [
+            req_id
+            for req_id in sorted(self._deferred_frees)
+            if now - self._deferred_free_at.setdefault(req_id, now) >= timeout
+        ]
+        if not stalled:
+            return
+        for req_id in stalled:
+            self._scheduler.abandon_save(req_id)
+            self._save_reports.pop(req_id, None)
+            self._load_failure_reports.pop(req_id, None)
+            for key in [
+                key for key in self._completion_reports if _req_id_of(key[1]) == req_id
+            ]:
+                del self._completion_reports[key]
+        logger.warning(
+            "ATOM LMCache offload: abandoned %d deferred save(s) with no "
+            "completion report after %.0fs (LMCache force-unpins a stalled save "
+            "without reporting it); their blocks are released so the engine does "
+            "not stall: %s",
+            len(stalled),
+            timeout,
+            stalled,
+        )
+
     def _collect_releases(self) -> list[str]:
         """Requests whose deferred free is now safe to hand back to vLLM.
 
@@ -497,6 +639,8 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
             self._seqs.drop(req_id)
             released.append(req_id)
         self._deferred_frees.difference_update(released)
+        for req_id in released:
+            self._deferred_free_at.pop(req_id, None)
         self._releases_in_flight.update(released)
         return released
 
@@ -601,6 +745,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         """
         if meta is None:
             return
+        self._apply_completions(getattr(meta, "completions", None) or ())
         for req_id, count in (getattr(meta, "load_failed", None) or {}).items():
             rid = str(req_id)
             self._load_failure_reports[rid] = self._load_failure_reports.get(
@@ -618,6 +763,47 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
             if quorums:
                 self._scheduler.save_finished_by_request(rid)
 
+    def _apply_completions(self, completions) -> None:
+        """Hand ATOM's connector-owned completions on, once every rank agrees.
+
+        These are the events `should_defer_free` waits for. The dense layout
+        emits two channels per save -- the staged source ranges becoming safe to
+        overwrite, and the store landing -- and the second is what pops the
+        operation's block lease. Drop them and `_save_operation_owner` only
+        grows: every finished request defers forever, each pinning its blocks
+        and its SeqView, until the pool has no free block left and the engine
+        sits at zero running requests with one waiting on capacity.
+
+        Quorum is by count, as for `saved`: the worker's completion set is
+        drained on each `get_finished`, so a rank reports one event once.
+        Failure is dominant -- a store that failed on any rank did not persist
+        that range, and `_store_finished` keeps the lease so the range is not
+        advertised as source-safe.
+
+        The return value is deliberately ignored. ATOM's native worker treats a
+        ``True`` here as ALSO a terminal save; on this path the same save
+        already travels the legacy `finished_saving` channel (the dense
+        connector emits both), and completing it twice would let a delayed
+        report clear a newer save generation.
+        """
+        for completion in completions:
+            key = completion.key
+            report = self._completion_reports.get(key)
+            if report is None:
+                report = self._completion_reports[key] = [0, True, time.monotonic()]
+            report[0] += 1
+            report[1] = report[1] and bool(completion.succeeded)
+            if report[0] < self._world_size:
+                continue
+            del self._completion_reports[key]
+            handled = self._scheduler.connector_completion(
+                ConnectorCompletion(key[0], key[1], report[1])
+            )
+            if handled is False:
+                logger.warning(
+                    "ATOM LMCache offload: unhandled completion channel %s", key[0]
+                )
+
     def request_finished(self, request, block_ids) -> tuple[bool, dict | None]:
         req_id = request.request_id
         self._promised_loads.pop(req_id, None)
@@ -630,6 +816,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
                 # the connector names the id in `finished_sending`, and
                 # `_collect_releases` is what eventually produces that.
                 self._deferred_frees.add(req_id)
+                self._deferred_free_at.setdefault(req_id, time.monotonic())
                 return True, None
             self._seqs.drop(req_id)
         return False, None
@@ -655,8 +842,41 @@ def _block_ids(blocks) -> list[int]:
         and blocks
         and isinstance(blocks[0], (list, tuple))
     ):
-        return [int(b) for group in blocks for b in group]
+        # One group is the supported shape and unwraps to its ids. More than one
+        # means vLLM is paging this request against several independent block
+        # tables; concatenating them yields a list whose positions no longer map
+        # to token offsets, and the codec would happily copy bytes into the
+        # wrong blocks with nothing logged. ``build_kv_cache_tensors`` rejects
+        # the same condition from the tensor side at registration; this is the
+        # per-request half, for a model that only splits groups later.
+        if len(blocks) > 1:
+            raise ValueError(
+                "ATOM offload connector: vLLM allocated blocks in "
+                f"{len(blocks)} KV cache groups "
+                f"(sizes={[len(g) for g in blocks]}); the byte codec addresses "
+                "KV with a single block table and cannot flatten them."
+            )
+        return [int(b) for b in blocks[0]]
     return [int(b) for b in (blocks or [])]
+
+
+def _scheduled_block_growth(scheduler_output):
+    """Yield ``(request_id, new_block_ids, replaces)`` for this step.
+
+    ``update_state_after_alloc`` fires once, when a request leaves the waiting
+    queue, and carries only the blocks allocated by then. Every block allocated
+    after that -- each further chunk of a chunked prefill, and each block decode
+    appends -- is announced only here. A request in ``resumed_req_ids`` is one
+    vLLM re-admitted after preemption: its ids REPLACE the old table rather than
+    extending it, because the blocks it held went back to the pool.
+    """
+    cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
+    req_ids = getattr(cached, "req_ids", None) or []
+    new_blocks = getattr(cached, "new_block_ids", None) or []
+    resumed = getattr(cached, "resumed_req_ids", None) or ()
+    for req_id, blocks in zip(req_ids, new_blocks):
+        if blocks is not None:
+            yield req_id, blocks, req_id in resumed
 
 
 def _scheduled_frontiers(scheduler_output):

@@ -232,7 +232,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # max_num_batched_tokens, so a fixed row count would not adapt to total_kv
     # (see GLM-5.2 OOM #1376) — a memory budget does. Each chunk still scores
     # the full KV, so every row's top-k is exact (no cross-chunk merge). Set to
-    # 0 to disable chunking (always single-shot).
+    # 0 to disable this soft budget; chunking still enforces aiter's hard 2 GiB
+    # buffer-descriptor cap, above which the kernel fails to compile and aborts
+    # the process (see atom/model_ops/sparse_indexer_chunk.py).
     "ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB": lambda: int(
         os.getenv("ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB", "2048")
     ),
@@ -496,6 +498,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # so smaller local head counts fall back to OPUS regardless of this flag.
     "ATOM_FORCE_V4_PREFILL_OPUS": lambda: (
         os.getenv("ATOM_FORCE_V4_PREFILL_OPUS", "0") == "1"
+    ),
+    # Reuse the gfx1250 H=128 sparse-prefill ASM kernel for DeepSeek-V4 fp8
+    # decode. Ineligible shapes keep the dedicated decode ASM path.
+    "ATOM_USE_V4_PREFILL_ASM_FOR_DECODE": lambda: (
+        os.getenv("ATOM_USE_V4_PREFILL_ASM_FOR_DECODE", "0") == "1"
     ),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
