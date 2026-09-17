@@ -134,6 +134,7 @@ on:
           - auto
           - amd-frameworks
           - amd-tw
+          - amd-spur
       atomesh_single_node:
         description: 'ATOMesh single-node P/D placement; auto lets Slurm select TW nodes unless a node list is specified'
         required: false
