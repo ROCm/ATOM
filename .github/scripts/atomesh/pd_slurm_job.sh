@@ -166,9 +166,22 @@ EOF
   render_gid="$(getent group render 2>/dev/null | cut -d: -f3 || true)"
   host_ionic="$(readlink -f /usr/lib/x86_64-linux-gnu/libionic.so.1 2>/dev/null || true)"
   nccl_socket_ifname="${NCCL_SOCKET_IFNAME:-}"
-  if [[ -z "${nccl_socket_ifname}" && -d /sys/class/net/eth1 ]]; then
-    nccl_socket_ifname="eth1"
+  local node_ip="${IPS[rank]}"
+  if [[ -z "${nccl_socket_ifname}" ]]; then
+    # Use the interface owning this worker's Spur address (10.19.x.x on
+    # TensorWave). Autodetection can select the blocked 10.13.x.x network;
+    # interface names also differ between clusters, so do not assume eth1.
+    if ! nccl_socket_ifname="$(ip -o -4 addr show | awk -v node_ip="${node_ip}" '
+      { split($4, address, "/") }
+      address[1] == node_ip { sub(/@.*/, "", $2); print $2; exit }
+    ')" || [[ -z "${nccl_socket_ifname}" ]]; then
+      echo "ERROR: cannot find a local IPv4 interface for Spur address ${node_ip}; set NCCL_SOCKET_IFNAME explicitly" >&2
+      return 2
+    fi
+    # NCCL treats a leading '=' as an exact interface-name match.
+    nccl_socket_ifname="=${nccl_socket_ifname}"
   fi
+  echo "[network] rank=${rank} ip=${node_ip} NCCL_SOCKET_IFNAME=${nccl_socket_ifname}"
 
   bounded_docker_rm "${container}"
   if [[ "${execution_phase}" != "eval" ]]; then

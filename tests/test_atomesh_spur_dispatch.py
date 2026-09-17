@@ -30,6 +30,19 @@ class SpurDispatchTest(unittest.TestCase):
         self.bin_dir = self.root / "bin"
         self.bin_dir.mkdir()
         self.write_tool(
+            "ip",
+            """
+            import os
+
+            rank = int(os.environ["SPUR_TASK_OFFSET"])
+            interface = "eno0" if rank == 0 else "enp5s0"
+            print("1: lo inet 127.0.0.1/8 scope host lo")
+            print(f"2: eno1 inet 10.13.0.{rank + 1}/21 scope global eno1")
+            if not os.environ.get("MISSING_NODE_INTERFACE"):
+                print(f"3: {interface} inet 10.19.0.{rank + 1}/21 scope global {interface}")
+            """,
+        )
+        self.write_tool(
             "srun",
             """
             import json
@@ -79,7 +92,7 @@ class SpurDispatchTest(unittest.TestCase):
             "SLURM_JOB_ID": "42",
             "SPUR_JOB_ID": "42",
             "SPUR_TASK_OFFSET": "0",
-            "SPUR_PEER_NODES": "10.0.0.1:6818,10.0.0.2:6818",
+            "SPUR_PEER_NODES": "10.19.0.1:6818,10.19.0.2:6818",
             "SPUR_NODELIST": "prefill-node,decode-node",
             "NUM_NODES": "2",
             "ATOMESH_CELL_ID": "test-cell",
@@ -128,8 +141,10 @@ class SpurDispatchTest(unittest.TestCase):
             runs = [call for call in calls if call[0] == "run"]
             self.assertEqual(len(runs), 1)
             self.assertIn(f"NODE_RANK={rank}", runs[0])
-            self.assertIn("NODE0_ADDR=10.0.0.1", runs[0])
-            self.assertIn("IPADDRS=10.0.0.1,10.0.0.2", runs[0])
+            self.assertIn("NODE0_ADDR=10.19.0.1", runs[0])
+            self.assertIn("IPADDRS=10.19.0.1,10.19.0.2", runs[0])
+            interface = "eno0" if rank == 0 else "enp5s0"
+            self.assertIn(f"NCCL_SOCKET_IFNAME=={interface}", runs[0])
             self.assertIn(["rm", "-f", f"atomesh-test-cell-42-{rank}"], calls)
             self.assertEqual((self.run_dir / f"rank-rc-{rank}").read_text(), "0\n")
 
@@ -162,10 +177,27 @@ class SpurDispatchTest(unittest.TestCase):
 
     def test_single_node_allocation(self):
         self.run_job(
-            NUM_NODES="1", SPUR_NODELIST="node0", SPUR_PEER_NODES="10.0.0.1:6818"
+            NUM_NODES="1", SPUR_NODELIST="node0", SPUR_PEER_NODES="10.19.0.1:6818"
         )
         self.assertEqual((self.run_dir / "rank-rc-0").read_text(), "0\n")
         self.assertFalse((self.root / "docker-1.jsonl").exists())
+
+    def test_explicit_nccl_interface_override_is_preserved(self):
+        self.run_job(
+            "--spur-worker",
+            NCCL_SOCKET_IFNAME="=custom0",
+            MISSING_NODE_INTERFACE="1",
+        )
+        run = next(call for call in self.docker_calls(0) if call[0] == "run")
+        self.assertIn("NCCL_SOCKET_IFNAME==custom0", run)
+
+    def test_missing_node_interface_fails_before_container_start(self):
+        result = self.run_job(
+            "--spur-worker", expected_rc=2, MISSING_NODE_INTERFACE="1"
+        )
+        self.assertIn("cannot find a local IPv4 interface", result.stderr)
+        self.assertFalse(any(call[0] == "run" for call in self.docker_calls(0)))
+        self.assertEqual((self.run_dir / "rank-rc-0").read_text(), "2\n")
 
     def test_benchmark_and_eval_phases_run_on_each_worker(self):
         self.run_job(
