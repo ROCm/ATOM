@@ -297,11 +297,8 @@ class RoutedExpertsCapturer:
     ) -> bool:
         """D2H this step's ``buffer[slot_mapping]`` into the CPU slot buffer.
 
-        Snapshot ``dest``/``rows`` on the default stream (private from the next
-        capture), then enqueue non-blocking D2H on the token
-        ``async_copy_stream`` after ``wait_event`` so it lands before the
-        caller's ``copy_done``. Do not record a private event: the existing
-        ``recv_async_output`` wait covers this memcpy.
+        Snapshot dest/rows on the default stream, then enqueue non-blocking
+        D2H on the token ``async_copy_stream`` after ``wait_event`` when used.
 
         Returns True when a new memcpy was queued (or applied inline). False
         means this step had nothing to store; the caller must then
