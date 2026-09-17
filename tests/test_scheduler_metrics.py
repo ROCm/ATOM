@@ -587,8 +587,9 @@ def test_decode_request_context_gauge_records_first_dispatch_once(monkeypatch):
 
     registry = CollectorRegistry()
     metrics = SchedulerMetrics(registry=registry)
+    # Live sequence lengths deliberately differ from the dispatched context snapshot.
     seqs = {
-        i: SimpleNamespace(num_tokens=999999, external_request_id=f"request-{i}")
+        i: Sequence([1, 2], block_size=4, id=i, request_id=f"request-{i}")
         for i in (1, 2, 3)
     }
     for i in (1, 2):
