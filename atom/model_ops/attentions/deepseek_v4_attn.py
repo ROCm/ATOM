@@ -137,6 +137,21 @@ def _uses_pd_staging(kv_transfer_config: dict | None) -> bool:
     return KVConnectorFactory.topology_uses_pd_staging(kv_transfer_config)
 
 
+def _validate_fp4_indexer_transfer(kv_transfer_config: dict) -> None:
+    """FP4 PAGE pools require a connector that consumes transfer regions."""
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    name = KVConnectorFactory.canonical_name(kv_transfer_config.get("kv_connector"))
+    if name == "multi":
+        for child in kv_transfer_config.get("connectors", []):
+            _validate_fp4_indexer_transfer(child)
+    elif name != "mooncake" and _uses_pd_staging(kv_transfer_config):
+        raise NotImplementedError(
+            "DeepSeek-V4 FP4 index PD transfer requires Mooncake; "
+            f"{name} does not consume the V4 PAGE/SLOT transfer regions"
+        )
+
+
 # AF_PIECEWISE: attn-core capture/replay (keyed layer, bucket_bs, q_eff, nt_pad).
 # Owns its isolated graph pool + per-key graph cache + output buffers.
 # State field carrying the windows of layers whose KV dtype is not the pool's.
@@ -1841,18 +1856,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         # `get_kv_transfer_tensors` is called unconditionally on every
         # `allocate_kv_cache`; returning None means "no transfer region."
-        # Standalone LMCache offload can carry both FP4 indexer pools, but PD
-        # connectors have a separate producer/consumer region contract which
-        # has not been extended to the FP4 scale pool yet.
+        # Mooncake and standalone offload consume the same PAGE description,
+        # including the separate packed FP4 data and e8m0 scale pools.
         transfer_config = getattr(runner.config, "kv_transfer_config", None)
         transfer_active = bool(transfer_config)
-        if self._indexer_fp4 and transfer_active and _uses_pd_staging(transfer_config):
-            raise NotImplementedError(
-                "DeepSeek-V4 PD transfer with --index_cache_dtype fp4 is "
-                "unsupported; standalone LMCache offload supports FP4, but "
-                "Mooncake/Moriio producer-consumer staging does not yet map "
-                "the separate FP4 indexer scale pool."
-            )
+        if self._indexer_fp4 and transfer_active:
+            _validate_fp4_indexer_transfer(transfer_config)
         if transfer_active and getattr(runner.config, "pipeline_parallel_size", 1) > 1:
             raise NotImplementedError(
                 "DeepSeek-V4 KV transfer/PD and sidecar offload with pipeline "

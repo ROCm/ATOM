@@ -360,7 +360,7 @@ class EagleProposer(Drafter):
         input_ids.scatter_(0, last_token_indices, anchor_ids)
 
         d_input_ids = input_ids
-        d_positions = positions[:num_tokens] + 1
+        d_positions = positions[..., :num_tokens] + 1
         d_hidden = draft_hidden
         # Same split as propose()'s i==0 step: this pass reuses the same
         # 1/pcp-reindexed attn_metadata. Only q is sharded -- attention

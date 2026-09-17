@@ -18,9 +18,31 @@ Third-party / dependency env vars (NCCL, torch, HuggingFace, AITER, FLA) are
 documented at the bottom of this file but NOT managed here.
 """
 
+import logging
+import math
 import os
 from collections.abc import Callable
 from typing import Any
+
+logger = logging.getLogger("atom")
+
+
+def _positive_float_env(name: str, default: str) -> float:
+    raw_value = os.getenv(name, default)
+    try:
+        value = float(raw_value)
+        if math.isfinite(value) and value > 0:
+            return value
+    except ValueError:
+        pass
+    logger.warning(
+        "Invalid %s=%r: expected a finite positive number; using default %s",
+        name,
+        raw_value,
+        default,
+    )
+    return float(default)
+
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
@@ -232,6 +254,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_GLM5_DISABLE_FUSED_MHC": lambda: (
         os.getenv("ATOM_GLM5_DISABLE_FUSED_MHC", "0") == "1"
     ),
+    # MiniMax-M3 indexer-only context parallelism, as an ops override for
+    # dcp_config.indexer_dcp_only. Selection is bit-identical to the TP path, so
+    # this is an exact A/B: it trades a per-layer all-to-all for full MMA
+    # occupancy in the block scorer, winning above ~1M batch*context tokens and
+    # losing below. Unset leaves the config field alone.
+    "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
     # Kimi-K3 DSpark draft: fuse the per-layer context-row KV write
     # (K3DSparkMLAAttention.write_context_kv) into one Triton kernel --
     # RMSNorm(kv_c) + rope(k_pe) + concat + paged-cache store, versus today's
@@ -334,7 +362,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT": lambda: (
         os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT", "1") == "1"
     ),
+    "ATOM_USE_MODEL_SENSITIVE_RMSNORM": lambda: (
+        os.getenv("ATOM_USE_MODEL_SENSITIVE_RMSNORM", "0") == "1"
+    ),
     # --- Profiling & Logging ---
+    "ATOM_METRICS_UPDATE_INTERVAL_S": lambda: _positive_float_env(
+        "ATOM_METRICS_UPDATE_INTERVAL_S", "1.0"
+    ),
+    "ATOM_ENABLE_METRICS_DEVICE_TIMER": lambda: os.getenv(
+        "ATOM_ENABLE_METRICS_DEVICE_TIMER", "0"
+    )
+    == "1",
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     # Move the startup heap (model, compiled graph, tokenizer, KV block pool)
     # into CPython's permanent generation once warmup is done, so collections
