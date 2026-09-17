@@ -145,6 +145,7 @@ class SpurDispatchTest(unittest.TestCase):
             self.assertIn("IPADDRS=10.19.0.1,10.19.0.2", runs[0])
             interface = "eno0" if rank == 0 else "enp5s0"
             self.assertIn(f"NCCL_SOCKET_IFNAME=={interface}", runs[0])
+            self.assertIn(f"MORI_SOCKET_IFNAME={interface}", runs[0])
             self.assertIn(["rm", "-f", f"atomesh-test-cell-42-{rank}"], calls)
             self.assertEqual((self.run_dir / f"rank-rc-{rank}").read_text(), "0\n")
 
@@ -185,11 +186,28 @@ class SpurDispatchTest(unittest.TestCase):
     def test_explicit_nccl_interface_override_is_preserved(self):
         self.run_job(
             "--spur-worker",
+            NCCL_SOCKET_IFNAME="=custom0,custom1",
+        )
+        run = next(call for call in self.docker_calls(0) if call[0] == "run")
+        self.assertIn("NCCL_SOCKET_IFNAME==custom0,custom1", run)
+        self.assertIn("MORI_SOCKET_IFNAME=eno0", run)
+
+    def test_explicit_mori_interface_override_is_preserved(self):
+        self.run_job("--spur-worker", MORI_SOCKET_IFNAME="custom0")
+        run = next(call for call in self.docker_calls(0) if call[0] == "run")
+        self.assertIn("NCCL_SOCKET_IFNAME==eno0", run)
+        self.assertIn("MORI_SOCKET_IFNAME=custom0", run)
+
+    def test_explicit_interfaces_skip_address_lookup(self):
+        self.run_job(
+            "--spur-worker",
             NCCL_SOCKET_IFNAME="=custom0",
+            MORI_SOCKET_IFNAME="custom1",
             MISSING_NODE_INTERFACE="1",
         )
         run = next(call for call in self.docker_calls(0) if call[0] == "run")
         self.assertIn("NCCL_SOCKET_IFNAME==custom0", run)
+        self.assertIn("MORI_SOCKET_IFNAME=custom1", run)
 
     def test_missing_node_interface_fails_before_container_start(self):
         result = self.run_job(
@@ -210,6 +228,9 @@ class SpurDispatchTest(unittest.TestCase):
             self.assertIn("ATOMESH_SERVICE_PORT_OFFSET=0", runs[0])
             self.assertIn("ATOMESH_EXECUTION_PHASE=eval", runs[1])
             self.assertIn("ATOMESH_SERVICE_PORT_OFFSET=1000", runs[1])
+            interface = "eno0" if rank == 0 else "enp5s0"
+            for run in runs:
+                self.assertIn(f"MORI_SOCKET_IFNAME={interface}", run)
 
 
 if __name__ == "__main__":
