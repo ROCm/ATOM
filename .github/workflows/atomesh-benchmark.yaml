@@ -1516,7 +1516,14 @@ jobs:
 
           cell = json.loads(os.environ["CELL_JSON"])
           # The matrix is expanded on ubuntu-latest, before the submit machine is known.
-          if socket.gethostname().split(".", 1)[0] == "pit2-vm-amd-xl-02":
+          machine_name = socket.gethostname().split(".", 1)[0]
+          lmcache_disk = cell["runner"].get("lmcache_local_disk_by_machine", {}).get(machine_name)
+          if lmcache_disk:
+              for role_env in cell.get("env", {}).values():
+                  if role_env.get("LMCACHE_LOCAL_DISK"):
+                      role_env["LMCACHE_LOCAL_DISK"] = lmcache_disk
+
+          if machine_name == "pit2-vm-amd-xl-02":
               old_model_root = os.environ["ATOMESH_MODEL_ROOT"].rstrip("/")
 
               def remap_model_paths(value):
