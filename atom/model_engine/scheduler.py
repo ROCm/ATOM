@@ -535,9 +535,7 @@ class Scheduler:
                     or "RapidServeModelRunner"
                     in str(getattr(config, "runner_qualname", ""))
                 ),
-                enable_dp_attention=bool(
-                    getattr(config, "enable_dp_attention", False)
-                ),
+                enable_dp_attention=bool(getattr(config, "enable_dp_attention", False)),
             )
         pc = getattr(config, "parallel_config", None)
         self.metrics = SchedulerMetrics(
@@ -3040,9 +3038,7 @@ class Scheduler:
                     trim_routed_experts,
                 )
 
-                seq.routed_experts = trim_routed_experts(
-                    seq.routed_experts, num_tokens
-                )
+                seq.routed_experts = trim_routed_experts(seq.routed_experts, num_tokens)
             if stream_output_queue is not None and (
                 new_tokens or leave_reason is not None
             ):

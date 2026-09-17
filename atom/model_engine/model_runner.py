@@ -2118,9 +2118,7 @@ class ModelRunner:
         capturer = RoutedExpertsCapturer.get()
         if capturer is None:
             return False
-        return capturer.store_step(
-            slot_mapping, stream=stream, wait_event=wait_event
-        )
+        return capturer.store_step(slot_mapping, stream=stream, wait_event=wait_event)
 
     def _commit_routed_experts(self, *, keep_last: bool = False) -> None:
         from atom.model_ops.fused_moe.routed_experts_capturer import (
