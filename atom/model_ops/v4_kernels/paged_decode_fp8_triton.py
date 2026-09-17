@@ -1520,9 +1520,7 @@ def _q7_dp_hca_regular_config(T: int) -> tuple[int, int, int, int] | None:
     one program per query outweighs the KV reuse of the q4/h16 kernel.  The
     bk32 variants are particularly important at B7--B9 and B14+, where the
     old grouped path is 3--22% slower across the measured 384--4224 row HCA
-    windows.  The longest hot B12 window uses a wider one-stage BK64 tile;
-    unlike the deeper BK64 pipelines, it stays within LDS and cuts launch-side
-    loop overhead.  B1--B4 keep query fusion because they do not expose enough
+    windows.  B1--B4 keep query fusion because they do not expose enough
     independent regular programs.
     """
     requests = T // 7
@@ -1536,10 +1534,8 @@ def _q7_dp_hca_regular_config(T: int) -> tuple[int, int, int, int] | None:
         return 32, 2, 2, 16
     if requests == 10:
         return 32, 7, 2, 16
-    if requests <= 11:
+    if requests <= 12:
         return 32, 3, 2, 16
-    if requests == 12:
-        return 64, 3, 1, 0
     if requests == 13:
         return 32, 4, 2, 16
     return 32, 2, 2, 16
