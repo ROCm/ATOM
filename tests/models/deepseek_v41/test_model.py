@@ -251,36 +251,44 @@ def test_shared_expert_keeps_tp_partials_fp32(reference, single_rank):
         assert not torch.equal(early_rounding, expected)
 
 
-def test_capture_and_replay_offer_the_execution_policy_the_same_stages():
-    """A decode step routes the FFN through `run`; a prefill step does not.
+def test_a_block_runs_the_same_stages_whatever_the_step_kind():
+    """One path through the block, so a capture cannot record another one.
 
-    The stage set is what a graph capture records, so a capture built on the
-    wrong step kind records a different set than the replay runs and the
-    difference is silent -- the missing stage just falls back to eager. This
-    pins the routing so `build_for_cudagraph_capture`'s step kind has something
-    to be wrong against.
+    The decode and prefill FFNs used to be separate calls so that a graph
+    executor could capture the decode one; the whole forward is the captured
+    unit now, and a step kind that changed which stages ran would change what
+    a replay is a recording of.
     """
     from atom.models.deepseek_v41.model import Block
 
     block = Block.__new__(Block)
     state = SimpleNamespace(residual="residual", pre_mix="pre_mix")
     five = ("hidden", "residual", "pre", "post", "comb")
-    block.prepare_attention = lambda *args: five
-    block.attn = lambda *args: "attn_out"
-    block.prepare_ffn = lambda *args: five
-    block.decode_ffn = lambda *args: ("decode_out",)
-    block.ffn = lambda *args: "prefill_out"
-    block.finish_ffn = lambda *args: ("residual", "pre_mix")
+    seen = []
+
+    def stage(name, result):
+        def call(*args):
+            seen.append(name)
+            return result
+
+        return call
+
+    block.prepare_attention = stage("prepare_attention", five)
+    block.attn = stage("attn", "attn_out")
+    block.prepare_ffn = stage("prepare_ffn", five)
+    block.ffn = stage("ffn", "ffn_out")
+    block.finish_ffn = stage("finish_ffn", ("residual", "pre_mix"))
 
     def stages_for(decode):
-        seen = []
+        seen.clear()
+        block.forward(state, None, SimpleNamespace(decode=decode), None)
+        return list(seen)
 
-        def run(function, *args):
-            seen.append(function)
-            return function(*args)
-
-        block.forward(state, None, SimpleNamespace(decode=decode), None, execution=run)
-        return seen
-
-    assert block.decode_ffn in stages_for(decode=True)
-    assert block.decode_ffn not in stages_for(decode=False)
+    assert stages_for(decode=True) == stages_for(decode=False)
+    assert stages_for(decode=True) == [
+        "prepare_attention",
+        "attn",
+        "prepare_ffn",
+        "ffn",
+        "finish_ffn",
+    ]

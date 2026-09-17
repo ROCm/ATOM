@@ -1,15 +1,10 @@
 # SPDX-License-Identifier: MIT
 """ModelRunner interface over the accepted V4.1 text backbone."""
 
-from functools import partial
-
 import torch
-import torch.nn.functional as F
 
-from atom.config import CUDAGraphMode
 from atom.utils.forward_context import get_forward_context
 
-from .execution import DenseGraphExecutor
 from .multimodal import DeepseekV41MultimodalModel
 
 
@@ -27,49 +22,37 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
             max_length=config.max_model_len,
             online_quant_config=config.online_quant_config,
         )
-        self.dense_graphs = None if config.enforce_eager else DenseGraphExecutor()
 
     @torch.inference_mode()
     def forward(self, input_ids, positions, inputs_embeds=None):
-        context = get_forward_context()
-        metadata = context.attn_metadata
-        execution = None
-        if (
-            self.dense_graphs is not None
-            and context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
-        ):
-            execution = partial(
-                self.dense_graphs.run,
-                bucket=context.batch_descriptor.num_tokens,
-                capture=context.in_hipgraph,
-            )
+        """Pure tensor work: every row handed in, and no state of its own.
+
+        Nothing here reads a Python request or writes one back, which is what
+        lets the whole forward be one captured graph. The step's padding rows
+        are computed like any other and dropped by the caller; making them a
+        narrower forward is what a replay cannot do.
+        """
+        metadata = get_forward_context().attn_metadata
         step = metadata.step
-        if step.length:
-            hidden = self.forward_hidden(
-                input_ids[: step.length].unsqueeze(0),
-                metadata.cache,
-                step,
-                metadata.engram_embeddings,
-                execution=execution,
-                inputs_embeds=(
-                    None
-                    if inputs_embeds is None
-                    else inputs_embeds[: step.length].unsqueeze(0)
-                ),
-                image_mask=metadata.image_mask,
-            ).squeeze(0)
-            # A synthetic batch stages addresses; it does not advance state.
-            # `prepare_model_inputs` already reads `dummy` for the other half of
-            # that rule -- it skips the cursor read a graph capture would
-            # otherwise take from whoever owns these slots.
-            # This branch is host-side and differs between capture and replay,
-            # so it cannot survive into a whole-forward capture: the cursor
-            # write moves out of the model before FULL is enabled.
-            if not metadata.dummy:
-                metadata.cache.finish_step(step, metadata.next_histories)
-        else:
-            hidden = self.embed.weight.new_empty((0, self.config.hidden_size))
-        return F.pad(hidden, (0, 0, 0, input_ids.numel() - step.length))
+        step.begin_forward()
+        if not step.requests:
+            # Nothing scheduled here, so no layer has anything to read or
+            # write. The caller still wants its rows back.
+            return self.embed.weight.new_zeros(
+                (input_ids.numel(), self.config.hidden_size)
+            )
+        if input_ids.numel() != step.width:
+            raise ValueError("Token rows disagree with the width this step declared")
+        return self.forward_hidden(
+            input_ids.unsqueeze(0),
+            metadata.cache,
+            step,
+            metadata.engram_embeddings,
+            inputs_embeds=(
+                None if inputs_embeds is None else inputs_embeds.unsqueeze(0)
+            ),
+            image_mask=metadata.image_mask,
+        ).squeeze(0)
 
     def compute_logits(self, hidden):
         return self.head.get_logits(self.norm(hidden))

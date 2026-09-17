@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 import torch
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 from atom.models.deepseek_v41.config import normalize_hf_config, validate_runtime_config
 from atom.models.deepseek_v41.runtime import DeepseekV41RuntimeModel
@@ -124,12 +125,55 @@ def test_empty_rank_padding_has_no_cache_writes(monkeypatch):
     model = DeepseekV41RuntimeModel.__new__(DeepseekV41RuntimeModel)
     torch.nn.Module.__init__(model)
     model.config = SimpleNamespace(hidden_size=64)
-    model.dense_graphs = None
     model.embed = torch.nn.Embedding(16, 64)
-    # No layers are constructed: any attempted execution of padded rows fails.
+    # No layers are constructed: a step with no requests must not reach one.
     output = model(torch.zeros(8, dtype=torch.int32), torch.zeros(8, dtype=torch.int32))
     assert output.shape == (8, 64) and output.count_nonzero() == 0
     torch.testing.assert_close(cache.backing, before, rtol=0, atol=0)
+
+
+def test_a_forward_reads_nothing_the_forward_before_it_selected(monkeypatch):
+    """Graph capture runs the model twice over one step.
+
+    Anything a layer fills on a miss is a kernel the recorded pass skips, so
+    the graph does not contain it; its replay then reads the capture batch's
+    answer while every kernel that did get recorded reads the live step. The
+    two disagree by exactly the padding a `has_invalid=False` attention kernel
+    dereferences, so this is a fault, not a drift. `tiles` and `indptrs` are
+    not in here because no layer fills them -- `begin_step` does, once.
+    """
+    from atom.models.deepseek_v41 import runtime
+
+    geo = V41PoolGeometry(2, ((1, 2),), 4, 4, 512, 32)
+    cache = PagedAttentionCache(geo, 4, 2, "cpu")
+    step = cache.begin_step([RequestSpan(0, 0, 0, 1, 0, (0,))], plans={})
+    memos = {name: getattr(step, name) for name in ("selected", "candidates")}
+    for name, memo in memos.items():
+        memo["what the last forward worked out"] = name
+    metadata = SimpleNamespace(
+        step=step,
+        cache=cache,
+        engram_embeddings=None,
+        image_mask=None,
+    )
+    monkeypatch.setattr(
+        runtime, "get_forward_context", lambda: SimpleNamespace(attn_metadata=metadata)
+    )
+    seen = {}
+    monkeypatch.setattr(
+        DeepseekV41RuntimeModel,
+        "forward_hidden",
+        lambda self, tokens, *args, **kwargs: (
+            seen.update({name: dict(memo) for name, memo in memos.items()}),
+            torch.zeros(*tokens.shape, 64),
+        )[1],
+    )
+    model = DeepseekV41RuntimeModel.__new__(DeepseekV41RuntimeModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(hidden_size=64)
+    model.embed = torch.nn.Embedding(16, 64)
+    model(torch.zeros(1, dtype=torch.int32), torch.zeros(1, dtype=torch.int32))
+    assert seen == {name: {} for name in memos}
 
 
 @pytest.mark.parametrize("cache_dtype", ["bf16", "fp4"])
@@ -147,6 +191,27 @@ def test_supported_cache_and_piecewise_graph_modes(cache_dtype, graph):
             ),
         )
     )
+
+
+@pytest.mark.parametrize(
+    "index_dtype, capturable", [("fp8", True), ("bf16", False), ("fp4", False)]
+)
+def test_whole_forward_capture_admits_only_the_paged_scorer(index_dtype, capturable):
+    """FULL is the mode where a decode step is one replay, and the tiled
+    scorer cannot be in one: it walks the batch on the host."""
+    from atom.config import CUDAGraphMode
+
+    value = runtime_config(
+        kv_cache_dtype="fp4" if index_dtype == "fp4" else "bf16",
+        index_cache_dtype=index_dtype,
+        enforce_eager=False,
+        compilation_config=SimpleNamespace(level=0, cudagraph_mode=CUDAGraphMode.FULL),
+    )
+    if capturable:
+        validate_runtime_config(value)
+        return
+    with pytest.raises(ValueError, match="paged scorer"):
+        validate_runtime_config(value)
 
 
 @pytest.mark.parametrize("graph", [False, True])

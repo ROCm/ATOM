@@ -68,7 +68,9 @@ def test_capture_builder_uses_full_query_width_and_serving_storage(width):
     assert prepared == [2 * width]
     assert context.running_tokens == context.scheduled_tokens == 2 * width
     assert not context.is_dummy_run and metadata.dummy
-    assert metadata.step.length == 2 * width
+    assert metadata.step.width == metadata.step.scheduled == 2 * width
+    # The bucket reaches the metadata, so `run_model` keys the right graph.
+    assert metadata.step.max_q_len == metadata.max_seqlen_q == width
     # Behind a full window, not at 0: the capture has to record the branch a
     # replayed step takes, and at position 0 the compressor reads no history.
     start = builder.geometry.window_size
@@ -81,8 +83,67 @@ def test_capture_builder_uses_full_query_width_and_serving_storage(width):
         == builder.model_runner.forward_vars["v4_meta_state_slot_out"].gpu.data_ptr()
     )
     assert torch.equal(builder.cache.backing, before)
+    # One page, repeated, exactly as V4's capture builds its block table. A
+    # capture runs a real forward, so every distinct page it names is a page
+    # it writes; naming a run of them hands the block pool's first pages rows
+    # a later request reads wherever its own prefill has not reached yet,
+    # which surfaces as a fault in the prefill scorer hundreds of tokens later
+    # and points nowhere near capture.
+    assert set(
+        metadata.step.block_tables[: metadata.step.scheduled_bs].flatten().tolist()
+    ) == {0}
     with pytest.raises(ValueError, match="capture shape"):
         builder.build_for_cudagraph_capture(3, 6)
+
+
+def test_draft_context_write_spans_the_forwards_width_not_its_tokens(monkeypatch):
+    """The draft writes the rows the target just ran, padding included.
+
+    `positions` and the aux hidden states come off the target forward, so they
+    span the graph's width; the batch's own token count is a different, smaller
+    number, and slicing by it would leave the tail of a padded decode unwritten
+    while the read side gathers by absolute position regardless.
+    """
+    from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+    from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+
+    cache = PagedAttentionCache(
+        V41PoolGeometry(1, ((0, 2),), 4, 4, 512, 32), 8, 4, "cpu"
+    )
+    step = cache.begin_step(
+        [RequestSpan(0, 0, 0, 1, 0, (0,))], running_bs=2, running_tokens=2, plans={}
+    )
+    # Three distinct numbers, so a slice by the wrong one cannot pass.
+    assert step.scheduled == 1 and step.width == 2
+    written = []
+    monkeypatch.setattr(
+        cache,
+        "write_window",
+        lambda layer, keys, taken: written.append((layer, keys, taken)),
+    )
+    monkeypatch.setattr(
+        "atom.utils.forward_context.get_forward_context",
+        lambda: SimpleNamespace(
+            context=SimpleNamespace(is_dummy_run=False),
+            attn_metadata=SimpleNamespace(cache=cache, step=step),
+        ),
+    )
+    draft = DeepseekV41DSpark.__new__(DeepseekV41DSpark)
+    nn.Module.__init__(draft)
+    draft.rope = object()
+    draft.project_context = lambda rows: rows
+    attention = SimpleNamespace(
+        spec=SimpleNamespace(layer_id=0),
+        project_context=lambda hidden, positions, rope, packed: (hidden, positions),
+    )
+    draft.mtp = [SimpleNamespace(attn=attention)]
+    aux = torch.arange(4 * 8, dtype=torch.float32).view(4, 8)
+    draft.write_context_kv(aux, torch.arange(4))
+    layer, (hidden, positions), taken = written.pop()
+    assert not written and layer == 0 and taken is step
+    torch.testing.assert_close(hidden, aux[: step.width].unsqueeze(0))
+    torch.testing.assert_close(positions, torch.arange(step.width)[None])
 
 
 class ShiftBlock(nn.Module):

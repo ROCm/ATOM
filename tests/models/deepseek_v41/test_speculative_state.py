@@ -49,7 +49,16 @@ def test_every_prefix_survives_ring_wrap_and_ragged_request_order(
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("ROCm GPU required")
     geometry = V41PoolGeometry(
-        2, ((0, 2), (1, 1)), 16, 128, 128, 32, packed=packed, speculative_tokens=5
+        2,
+        ((0, 2), (1, 1)),
+        16,
+        128,
+        128,
+        32,
+        packed=packed,
+        speculative_tokens=5,
+        # The only class the window-only specs below ask for.
+        layer_ratios=(0,),
     )
     cache = PagedAttentionCache(geometry, 40, 5, device)
     spans = (
@@ -81,7 +90,6 @@ def test_every_prefix_survives_ring_wrap_and_ragged_request_order(
         write_window(
             cache, layer, step, encoded_rows(step.positions, layer, geometry, device)
         )
-    cache.finish_step(step, None)
     assert torch.equal(cache.cursor, old_cursors)
     with pytest.raises(RuntimeError, match="Commit the accepted prefix"):
         cache.begin_step(spans)
@@ -89,7 +97,7 @@ def test_every_prefix_survives_ring_wrap_and_ragged_request_order(
     copies.cache = cache
     with pytest.raises(RuntimeError, match="Commit the accepted prefix"):
         copies.entry(4)
-    cache.commit_tentative(torch.tensor(accepted_lengths, device=device))
+    cache.commit_tentative(step, torch.tensor(accepted_lengths, device=device))
     assert torch.equal(cache.state_bytes[0], untouched)
     for i, (span, count) in enumerate(zip(spans, accepted_lengths)):
         end = span.position + count
@@ -136,17 +144,46 @@ def test_tentative_state_refuses_missing_prefixes_and_out_of_range_acceptance():
     cache = PagedAttentionCache(geometry, 1, 1, "cpu")
     cache.cursor[0, 0] = 3
     span = RequestSpan(1, 3, 0, 6, 0, (0,))
+    stale = cache.begin_step((span,))
     step = cache.begin_step((span,), tentative=True)
     cache.prepare_state(step)
     with pytest.raises(RuntimeError, match="missing"):
-        cache.finish_step(step, None)
+        cache.commit_tentative(step, [1])
     cache.pending.stage_history(span, [1, 2, 3, 4, 5, 6])
-    cache.finish_step(step, None)
     for length in (0, 7):
         with pytest.raises(RuntimeError, match="outside"):
-            cache.commit_tentative([length])
-    cache.commit_tentative([1])
+            cache.commit_tentative(step, [length])
+    # The accepted prefix belongs to one forward. Another step's lengths would
+    # index this one's staged cursors and commit a row nobody verified.
+    with pytest.raises(RuntimeError, match="not prepared for this step"):
+        cache.commit_tentative(stale, [1])
+    cache.commit_tentative(step, [1])
     assert cache.cursor[0, 0] == 4
+
+
+def test_commit_moves_the_scheduled_cursors_and_no_padding_requests():
+    """A padded verify step is wider than its batch.
+
+    The padding rows of `slots` carry 0, which is a real STATE slot and in
+    general somebody else's, so anything that pairs a slot with per-request
+    host data has to stop at `scheduled_bs`. The width here is deliberately
+    not the batch: at `running_bs == scheduled_bs` a slice by either is the
+    same slice and proves nothing.
+    """
+    geometry = V41PoolGeometry(1, ((0, 2),), 16, 128, 128, 32, speculative_tokens=5)
+    cache = PagedAttentionCache(geometry, 1, 4, "cpu")
+    for slot in range(4):
+        cache.cursor[slot, 0] = 3
+    spans = (RequestSpan(1, 3, 0, 2, 3, (0,)), RequestSpan(2, 3, 2, 2, 1, (0,)))
+    step = cache.begin_step(spans, tentative=True, running_bs=3, running_tokens=6)
+    assert step.scheduled_bs == 2 and step.slots.tolist() == [3, 1, 0]
+    cache.prepare_state(step)
+    for span in spans:
+        cache.pending.stage_history(span, [7, 9])
+    cache.commit_tentative(step, [2, 1])
+    assert cache.cursor[3, 0] == 5 and cache.cursor[1, 0] == 4
+    # The slot the padding named, untouched: it belongs to nobody in this step.
+    assert cache.cursor[0, 0] == 3 and cache.cursor[2, 0] == 3
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
@@ -189,8 +226,7 @@ def test_a_rejected_round_leaves_the_next_one_as_if_it_never_drafted(
             0, compressor, *compressor.project(hidden[:, :length]), step, rope
         )
         cache.pending.stage_history(span, [-1] * length)
-        cache.finish_step(step, None)
-        cache.commit_tentative([accepted])
+        cache.commit_tentative(step, [accepted])
         return cache
 
     def round_two(cache):
@@ -200,7 +236,7 @@ def test_a_rejected_round_leaves_the_next_one_as_if_it_never_drafted(
         latent, positions = cache.compress(
             0, compressor, *compressor.project(following), step, rope
         )
-        cache.finish_step(step, [[-1, -1, -1]])
+        cache.advance_cursor(step, [[-1, -1, -1]])
         return latent, positions
 
     drafting, honest = round_one(drafted), round_one(accepted)
@@ -222,7 +258,15 @@ def test_block_context_read_decodes_only_the_selected_request_windows(packed):
     from atom.model_ops.blockscale import quantize_fp8
 
     geometry = V41PoolGeometry(
-        2, ((0, 2),), 16, 128, 512, 32, packed=packed, speculative_tokens=5
+        2,
+        ((0, 2),),
+        16,
+        128,
+        512,
+        32,
+        packed=packed,
+        speculative_tokens=5,
+        layer_ratios=(0,),
     )
     cache = PagedAttentionCache(geometry, 24, 4, "cuda")
     spans = (
@@ -237,7 +281,7 @@ def test_block_context_read_decodes_only_the_selected_request_windows(packed):
     cache.write_window(
         1, quantize_fp8(values) if packed else expected_rows.unsqueeze(0), step
     )
-    cache.finish_step(step, [[1, 2, 3], [4, 5, 6]])
+    cache.advance_cursor(step, [[1, 2, 3], [4, 5, 6]])
     actual = cache.read_window(1, torch.tensor([1, 3, 1], device="cuda"))
     expected = torch.empty_like(actual)
     for i, span in enumerate((spans[1], spans[0], spans[1])):
@@ -257,7 +301,15 @@ def test_verify_decode_kernel_is_causal_after_writing_the_whole_block(packed):
 
     torch.manual_seed(863)
     geometry = V41PoolGeometry(
-        1, ((0, 2),), 16, 4, 512, 32, packed=packed, speculative_tokens=5
+        1,
+        ((0, 2),),
+        16,
+        4,
+        512,
+        32,
+        packed=packed,
+        speculative_tokens=5,
+        layer_ratios=(0,),
     )
     cache = PagedAttentionCache(geometry, 1, 1, "cuda")
     raw = torch.randn(13, 512, device="cuda", dtype=torch.bfloat16)

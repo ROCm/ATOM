@@ -73,6 +73,108 @@ def test_tiled_indexer_candidates_and_reindex_match_dense_oracle(reference, widt
     assert torch.equal(reindex, expected_ids)
 
 
+@pytest.mark.parametrize("candidates", [False, True])
+def test_selection_count_matches_its_closed_form(candidates):
+    """How many ids a row returns is `min(visible, columns)`, not a count.
+
+    `_indptr_scan` reserves exactly that many slots ahead of the scorer, and
+    the window segment is written at the other end of the same slice. A row
+    that returned fewer would leave the difference between them unwritten, and
+    the attention kernel reads whatever is in it.
+
+    This is the tiled scorer's half; the paged one is below.
+    """
+    # A layer with no candidate source takes the fused top-k, which is a GPU
+    # kernel; the candidate arm is the one that runs everywhere.
+    device = "cpu" if candidates else "cuda"
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("ROCm GPU required")
+    torch.manual_seed(517)
+    batch, queries, heads, dim, width, topk = 2, 6, 4, 32, 48, 5
+    q = torch.rand(batch, queries, heads, dim, device=device)
+    keys = torch.rand(batch, width, dim, device=device)
+    weights = torch.rand(batch, queries, heads, device=device)
+    # Both sides of the `min`: rows below the top-k and rows far above it.
+    visible = torch.tensor([0, 1, 4, 5, 9, width], device=device)
+    blocks = None
+    if candidates:
+        blocks = select_indices(
+            q,
+            weights,
+            keys,
+            visible,
+            topk=topk,
+            make_candidates=True,
+            block_size=8,
+            topk_blocks=6,
+        )[1]
+    selected, _ = select_indices(
+        q,
+        weights,
+        keys,
+        visible,
+        topk=topk,
+        candidate_blocks=blocks,
+        block_size=8,
+        query_tile=3,
+        key_tile=16,
+    )
+    expected = visible.clamp(max=selected.shape[-1]).expand(batch, -1)
+    assert torch.equal((selected >= 0).sum(-1), expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("masked", [False, True])
+def test_paged_top_k_returns_one_id_per_visible_row(masked):
+    """The other half, and the one a captured decode step runs.
+
+    `_indptr_scan` reserves `min(visible, k)` slots per row for this kernel's
+    output. Two things could make it emit fewer and leave the difference
+    unwritten: a row shorter than `k`, which it documents padding with -1, and
+    a row whose surviving scores are `-inf` because the candidate mask removed
+    the rest. The second is the one nothing states, and the sparse attention
+    kernel is called with `has_invalid=False` -- it dereferences every slot in
+    the range the indptr claims.
+
+    Columns past `visible` are left uninitialized on purpose: that is what the
+    paged scorer hands over, since its kernel returns before writing them.
+    """
+    from aiter.ops.topk import top_k_per_row_decode
+
+    rows, width, topk = 6, 512, 64
+    visible = torch.tensor([1, 7, 63, 64, 65, width], dtype=torch.int32, device="cuda")
+    logits = torch.empty(rows, width, dtype=torch.float32, device="cuda")
+    torch.manual_seed(311)
+    for row, count in enumerate(visible.tolist()):
+        logits[row, :count] = torch.randn(count, device="cuda")
+    if masked:
+        # What `restrict_to_candidates` leaves behind: every visible row still
+        # reachable, but through scores the mask drove to -inf outside a
+        # handful of blocks. Keep more than `topk` of them so the count is
+        # still bounded by `min(visible, topk)` and not by the mask.
+        keep = 128
+        for row, count in enumerate(visible.tolist()):
+            if count > keep:
+                logits[row, keep:count] = -torch.inf
+    selected = torch.empty(rows, topk, dtype=torch.int32, device="cuda")
+    top_k_per_row_decode(
+        logits,
+        1,
+        visible,
+        selected,
+        rows,
+        logits.stride(0),
+        logits.stride(1),
+        k=topk,
+        stable=True,
+    )
+    expected = visible.clamp(max=topk).to(torch.int64)
+    assert torch.equal((selected >= 0).sum(-1), expected), (
+        f"visible={visible.tolist()} k={topk} masked={masked} "
+        f"got={(selected >= 0).sum(-1).tolist()}"
+    )
+
+
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize("tie_break", ["small_position", "large_position"])
 @pytest.mark.parametrize("key_tile", [8, 16, 32])

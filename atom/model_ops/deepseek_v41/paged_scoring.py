@@ -53,6 +53,11 @@ def unit_table(block_tables, batch_ids, units_per_page):
     A PAGE holds `units_per_page` consecutive tiles, so this is the request's
     PAGE table with each entry expanded in place -- the translation the plane's
     region-major layout buys and the reason a block id is not a PAGE id.
+
+    Defined only where the batch id is: a padding row's tiles are whatever
+    row -1 gathers, and the scorer bails on its zero visible count before it
+    loads one. Naming a real request there would state a guarantee this does
+    not give.
     """
     pages = block_tables[batch_ids.long()].long()
     tiles = torch.arange(units_per_page, device=pages.device)

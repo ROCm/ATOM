@@ -121,6 +121,11 @@ def _write_window(
 ):
     t = tl.program_id(0)
     batch = tl.load(batches + t)
+    # A padding row owns no request, so there is nowhere for it to write and
+    # nothing at `slots[-1]` to read. The grid is the forward's width because
+    # that is the width a captured replay runs.
+    if batch < 0:
+        return
     end = tl.load(cu + batch + 1)
     if t < end - WINDOW:
         return
@@ -135,8 +140,8 @@ def _write_window(
 
 
 def write_packed_window(values, scales, pool, step, window, dim):
-    if step.length:
-        _write_window[(step.length,)](
+    if step.width:
+        _write_window[(step.width,)](
             values.view(torch.uint8),
             scales.view(torch.uint8),
             pool,

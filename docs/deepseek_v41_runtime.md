@@ -100,27 +100,46 @@ an even cache block size. The architecture is `DeepseekV41ForCausalLM`.
 `small_position` and `large_position` remain configurable through
 `index_topk_tie_break` in the HF text config/overrides.
 
-Two cache combinations are supported: BF16 KV/index storage, or
-`kv_cache_dtype="fp4", index_cache_dtype="fp4"`. In the latter, main and index
-rows use their distinct FP4 formats, while SWA uses FP8. The offline numerical
-interface retains BF16 QAT storage. Both use the original V4 BF16 attention
-kernels and inverse RoPE; the V4 files have no P09 modifications.
+Three cache combinations are supported: BF16 KV with a BF16 or FP8 index
+plane, or `kv_cache_dtype="fp4", index_cache_dtype="fp4"`. In the last, main
+and index rows use their distinct FP4 formats, while SWA uses FP8. The FP8
+index plane is the one a paged scorer reads, and `bf16/fp8` is DeepSeek-V4's
+own pair. The offline numerical interface retains BF16 QAT storage. All use
+the original V4 BF16 attention kernels and inverse RoPE; the V4 files have no
+P09 modifications.
 
-`enforce_eager=True` remains the baseline. Optional graph execution requires
-`enforce_eager=False` and `CompilationConfig(level=0,
-cudagraph_mode=CUDAGraphMode.PIECEWISE)`. Only pure tensor stages are recorded;
-request metadata, compression, indexing and host Engram preparation remain
-outside capture. The decode FFN and its RCCL reductions are captured with the
-rest: the routed experts are V4's `FusedMoE`, which is capturable at every
-shape, so there is no expert backend to select and no capture exclusion.
+`enforce_eager=True` remains the baseline. Two graph modes are accepted, both
+with `enforce_eager=False` and `CompilationConfig(level=0, ...)`:
+
+- `cudagraph_mode=CUDAGraphMode.FULL` captures the whole decode forward, one
+  graph per `(batch size, query bucket)`, and a decode step is one replay of
+  it. This mode additionally requires `index_cache_dtype="fp8"`: the tiled
+  scorer the other formats use walks the batch one request at a time off
+  host-side positions, and a capture would freeze this batch's requests into
+  every replay. Refused at startup otherwise. Prefill stays eager -- the
+  runner only ever captures decode shapes.
+- `cudagraph_mode=CUDAGraphMode.PIECEWISE` records the compiled dense pieces
+  and leaves attention eager between them.
+
+Under either mode a decode forward runs the width the step declares --
+`running_bs` requests and `running_tokens` rows -- rather than the scheduled
+batch, because a replay runs the width it was captured at whatever the batch
+turns out to be. The padding carries V4's own sentinels: a padding token's
+batch id is `-1` and a padding request is zero-length in `cu_seqlens_q`, and
+every scatter bails on one or the other, so those rows read and write nothing.
+
+The FFN and its RCCL reductions are captured with the rest: the routed experts
+are V4's `FusedMoE`, which is capturable at every shape, so there is no expert
+backend to select and no capture exclusion.
 
 See [the P09 report](deepseek_v41_performance.md) for cache formats, graph
 ownership, comparison commands and measured limits. Native five-token DSpark
-supports TP4 text requests with BF16 caches; target PIECEWISE graphs are
-optional. Its draft windows, accepted-prefix state, calibration and validated
-scope are documented in [the DSpark guide](deepseek_v41_dspark.md).
-Packed speculative caches and multimodal speculation are rejected. FULL graphs, torch.compile, PP/CP/DP, TBO, KV transfer,
-plugin execution and EPLB also remain rejected before loading.
+supports TP4 text requests with BF16 caches; target graphs are optional. Its
+draft windows, accepted-prefix state, calibration and validated scope are
+documented in [the DSpark guide](deepseek_v41_dspark.md).
+Packed speculative caches and multimodal speculation are rejected.
+torch.compile, PP/CP/DP, TBO, KV transfer, plugin execution and EPLB also
+remain rejected before loading.
 
 The [V4.1 chat/tool protocol](deepseek_v41_protocol.md) is enabled by P06.
 [Vision and multimodal chunking](deepseek_v41_vision.md) are enabled independently

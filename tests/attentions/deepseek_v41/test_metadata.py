@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 from atom.model_ops.attentions.deepseek_v41.backend import DeepseekV41MetadataBuilder
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
@@ -50,32 +49,35 @@ def test_staged_metadata_refreshes_reordered_ragged_and_empty_batches(device):
         step = staged_step(
             cache, requests, buffers=buffers, running_bs=4, running_tokens=8
         )
+        # The step spans the forward's width, padding included: a captured
+        # graph runs those rows whatever the batch, so they have to be
+        # described rather than sliced off.
+        assert step.width == 8 and step.scheduled == sum(s.length for s in requests)
         expected_positions = [
             p for span in requests for p in range(span.position, span.end)
         ]
         expected_batches = [
             i for i, span in enumerate(requests) for _ in range(span.length)
         ]
-        assert step.positions.tolist() == expected_positions
-        assert step.batch_ids.tolist() == expected_batches
-        assert step.slots.tolist() == [span.slot for span in requests]
+        pad_tokens, pad_requests = 8 - step.scheduled, 4 - len(requests)
+        # `-1` for a padding token and a zero-length span for a padding
+        # request: the two sentinels every consumer bails on.
+        assert step.batch_ids.tolist() == expected_batches + [-1] * pad_tokens
+        assert step.positions.tolist() == expected_positions + [0] * pad_tokens
         assert step.cu_seqlens_q.tolist() == [span.offset for span in requests] + [
-            step.length
-        ]
+            step.scheduled
+        ] * (pad_requests + 1)
+        assert (
+            step.slots.tolist() == [span.slot for span in requests] + [0] * pad_requests
+        )
+        assert step.block_tables.shape[0] == 4
         assert step.block_tables.stride(0) == 4
         for i, span in enumerate(requests):
             assert step.block_tables[i].tolist() == list(span.block_ids) + [0] * (
                 4 - len(span.block_ids)
             )
             assert step.request_steps[i].cu_seqlens_q.tolist() == [0, span.length]
-        assert buffers["batch_id_per_q_token"].gpu[step.length :].tolist() == [-1] * (
-            8 - step.length
-        )
-        assert buffers["positions"].gpu[step.length :].count_nonzero() == 0
-        assert buffers["cu_seqlens_q"].gpu[len(requests) + 1 :].tolist() == [
-            step.length
-        ] * (4 - len(requests))
-        assert buffers["block_tables"].gpu[len(requests) :].count_nonzero() == 0
+        assert step.block_tables[len(requests) :].count_nonzero() == 0
         assert {
             name: value.gpu.data_ptr() for name, value in buffers.items()
         } == pointers
@@ -88,6 +90,63 @@ def test_staged_metadata_refreshes_reordered_ragged_and_empty_batches(device):
                 tensor.untyped_storage().data_ptr()
                 == buffers[name].gpu.untyped_storage().data_ptr()
             )
+
+
+@pytest.mark.parametrize("engram", [False, True])
+def test_engram_rows_are_staged_for_the_width_not_for_the_tokens(engram):
+    """The forward runs wider than the batch, and Engram feeds every row.
+
+    `input_ids` at this point is the scheduled prefix -- `run_model` zeroes the
+    padding tail after the metadata is built -- so the width cannot be read off
+    it. Staging one row per token instead of one per row is a shape error the
+    first padded verify step raises, which is why the ladder has to miss.
+    """
+    geo = V41PoolGeometry(1, ((0, 2),), 4, 4, 512, 32)
+    cache = PagedAttentionCache(geo, 8, 4, "cpu")
+    buffers = metadata_buffers(4, 8, 4, "cpu")
+    step = staged_step(
+        cache,
+        (RequestSpan(17, 1, 0, 3, 3, (5, 1)),),
+        buffers=buffers,
+        running_bs=2,
+        running_tokens=6,
+    )
+    assert step.scheduled == 3 and step.width == 6 and cache.pending is None
+    builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    builder.geometry, builder.device = geo, "cpu"
+    builder.config = SimpleNamespace(
+        engram_layer_ids=(0,),
+        engram_max_ngram_size=3,
+        engram_n_heads=2,
+        engram_head_dim=4,
+    )
+    staged = {}
+    builder.engram = (
+        SimpleNamespace(
+            prepare=lambda spans, tokens, histories, **kwargs: staged.update(
+                tokens=tokens.numel(), **kwargs
+            )
+            or SimpleNamespace(
+                embeddings={0: torch.zeros(1, kwargs["padded_rows"], 16)},
+                histories=histories,
+                compressed_rows=(),
+            )
+        )
+        if engram
+        else None
+    )
+    metadata = SimpleNamespace(step=step, cache=cache, dummy=True, token_mask=None)
+    builder.prepare_model_inputs(
+        torch.zeros(step.scheduled, dtype=torch.int32), metadata
+    )
+    assert metadata.engram_embeddings[0].shape[:2] == (1, step.width)
+    if engram:
+        assert staged == {
+            "tokens": step.scheduled,
+            "padded_rows": step.width,
+            "dummy": True,
+            "token_mask": None,
+        }
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")

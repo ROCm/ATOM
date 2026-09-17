@@ -179,18 +179,45 @@ loop they were alternatives to. Their measurements survive only as historical
 diagnostics; the numbers below that compare expert backends describe code that
 no longer exists.
 
-`models/deepseek_v41/execution.py` owns stable inputs, outputs and a distinct
-CUDA graph allocation pool per block stage and token bucket. Startup capture
-uses private dummy PAGE/STATE storage. Live request state is never captured or
-modified by warmup. Replay copies current inputs, clears padding and returns
-only live rows; an uncaptured bucket falls back to normal execution.
+A decode step is **two replays**: the draft's, and one whole target forward.
+`cudagraph_mode=FULL` uses the runner's own capture -- `capture_cudagraph`
+records `model(input_ids, positions)` into `self.graphs[(bs, max_q_len)]` and
+`run_model` replays exactly one of them -- so there is no V4.1-specific graph
+machinery and no per-stage entries. The per-stage `DenseGraphExecutor` that
+preceded it keyed its entries on a bound method, giving every layer its own:
+40 layers x 4 stages x 3 buckets, which trace230 measured as 120 launches per
+step at 12.3% kernel coverage.
 
-Captured stages are attention preparation, FFN preparation and residual
-completion, plus the decode FFN and its collectives -- `FusedMoE` is capturable
-at every shape, so the eager expert loop's capture exclusion is gone.
-Attention/cache/index/compressor work, request positions, Engram CPU
-lookup and committed history stay outside these graphs. FULL graphs and
-`torch.compile` remain unsupported.
+Measured on the DSpark performance workload at TP4, FP8 index plane, 12 decode
+steps: **23 `hipGraphLaunch` in total, one per `decode[...]` scope and one per
+`propose_dspark[...]`**, with 99.6% of the decode scope's kernel time inside
+its graph and 72.9% across the whole run (the rest is prefill, which is eager
+by design).
+
+What that cost to make possible: the decode forward has to be pure tensor work
+at a fixed width. The cursor write moved out of the model into
+`prepare_model_inputs` (a replay runs no Python); the compression plan is cut
+to a content-independent `running_bs * per-seq bound` with a sentinel tail; and
+the step's tensors span the forward's own width rather than the scheduled
+batch. A sentinel plan row keeps its `-1`, which makes `page * per_page +
+offset` negative -- the row index V4's writers already skip, and what
+`indexer_k_quant_and_cache` bails on. The one writer that cannot skip on its
+own is torch advanced indexing, where a negative index is legal and lands on
+somebody's live row, so the BF16/FP4 scatter filters by the plan's own
+`batch_id >= 0` first. That path is never inside a captured graph: FULL
+admits only the FP8 index plane.
+
+`cudagraph_mode=PIECEWISE` remains available and records the compiled dense
+pieces with attention eager between them. Startup capture binds the serving
+allocation and uses STATE slots `[0, bs)`, and names **block 0 for every entry
+of every synthetic request** -- V4's capture block table exactly. Naming a run
+of distinct pages instead makes capture write that many, and those are the
+pages the block pool hands out first: a request that later gets one reads
+capture's rows wherever its own prefill has not reached yet, which surfaced as
+a fault in the prefill scorer several hundred tokens later.
+`validate_runtime --graph` asserts every page outside that bound is untouched.
+Host Engram lookup stays outside either mode. `torch.compile` remains
+unsupported.
 
 ## Accepted MoE numerical change
 

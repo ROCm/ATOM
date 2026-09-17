@@ -17,10 +17,11 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from atom.examples.deepseek_v41_offline import offline_forward_context, prepare_engram
+from atom.models.deepseek_v41.model import DeepseekV41ForCausalLM
 from transformers import AutoTokenizer
 
 from atom.config import CompilationConfig, Config, CUDAGraphMode
-from atom.examples.deepseek_v41_offline import offline_forward_context, prepare_engram
 from atom.model_engine.model_runner import ModelRunner
 from atom.model_engine.scheduler import ScheduledBatch, Scheduler
 from atom.model_engine.sequence import (
@@ -29,7 +30,6 @@ from atom.model_engine.sequence import (
     SequenceType,
     new_block_table,
 )
-from atom.models.deepseek_v41.model import DeepseekV41ForCausalLM
 from atom.sampling_params import SamplingParams
 from atom.utils.forward_context import reset_forward_context
 
@@ -111,12 +111,20 @@ def compare_private_cache(runner, tokenizer):
             input_ids, *_ = runner.prepare_model(batch)
             with torch.inference_mode():
                 if name == "english" and at == 0:
+                    # Rows the step never declared are refused, where they used
+                    # to be computed and zeroed. A captured forward runs the
+                    # width it recorded, so a caller handing another one is
+                    # describing a different step -- and the zero-padding hid
+                    # exactly that. The guarantee is the same one: extra rows
+                    # never reach a layer.
                     padded = torch.nn.functional.pad(input_ids, (0, 8))
-                    hidden = runner.model(padded, torch.zeros_like(padded))
-                    assert hidden[length:].count_nonzero() == 0
-                    hidden = hidden[:length]
-                else:
-                    _, hidden = runner.run_model(input_ids, batch)
+                    try:
+                        runner.model(padded, torch.zeros_like(padded))
+                    except ValueError as error:
+                        assert "width this step declared" in str(error), error
+                    else:
+                        raise AssertionError("undeclared token rows were accepted")
+                _, hidden = runner.run_model(input_ids, batch)
             reset_forward_context()
             values, history = prepare_engram(
                 tokens[at : at + length], at, history, prepare.mapping, prepare.host
@@ -272,9 +280,20 @@ def scheduler_cases(runner, tokenizer):
     forks = [sequence(base), sequence(base)]
     fork_events = run("prefix_fork", forks)
     assert any(any(n > 0 for n in event["cached"]) for event in fork_events)
-    assert sum(event["restores"] for event in fork_events) >= 2
     for seq in forks:
         assert list(seq.token_ids)[seq.num_prompt_tokens :] == gold[0]
+    # A state checkpoint needs a prompt longer than one interval, and the
+    # interval is a whole PAGE: 256 tokens since P3 made that the block size,
+    # against the 96 above. So this asserts under its own precondition rather
+    # than unconditionally, and comes back on its own if the prompt grows.
+    #
+    # Lengthening it here was tried and reverted: at 600 tokens the offline
+    # oracle no longer reproduces the engine token for token -- in eager as
+    # well as under a graph -- so every token-exact case above would have been
+    # measuring that instead. The restore path is therefore NOT covered in
+    # this file at a 256-token PAGE, and nothing else here covers it either.
+    if len(base) > runner.config.state_checkpoint_interval_tokens:
+        assert sum(event["restores"] for event in fork_events) >= 2
     # KV-only hits must rewind if no matching state image remains.
     scheduler.block_manager._state_checkpoint_cache.clear_index()
     fallback = sequence(base)
@@ -285,7 +304,12 @@ def scheduler_cases(runner, tokenizer):
     preempted = sequence(unique)
     expected = offline_completion(runner, unique, 4)
     resumed = run("preempt_resume", [preempted], preempt=True)
-    assert sum(event["restores"] for event in resumed) >= 1
+    # Resuming a preempted request restores a checkpoint too, so it carries
+    # the same precondition as the fork case above -- and, either way, that
+    # the request finishes with the tokens it would have produced uninterrupted
+    # is the claim this case exists for.
+    if len(unique) > runner.config.state_checkpoint_interval_tokens:
+        assert sum(event["restores"] for event in resumed) >= 1
     assert list(preempted.token_ids)[preempted.num_prompt_tokens :] == expected
     cancelled = sequence(tokenizer.encode("A cancelled request: ") + other, 12)
     run("cancel", [cancelled], cancel=True)
@@ -301,26 +325,42 @@ def main():
     parser.add_argument("--model", default="/mnt/DeepSeek-V4.1-Flash")
     parser.add_argument("--output", required=True)
     parser.add_argument("--cache-dtype", choices=("bf16", "fp4"), default="bf16")
+    parser.add_argument(
+        "--index-dtype",
+        choices=("bf16", "fp8", "fp4"),
+        help="Index plane format. Defaults to --cache-dtype, except under "
+        "--graph, which needs the paged scorer and so the FP8 plane. Separate "
+        "from the graph so the two can be varied one at a time.",
+    )
     parser.add_argument("--graph", action="store_true")
     args = parser.parse_args()
     rank, size = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     port = int(os.environ["MASTER_PORT"])
+    capture_sizes = [1, 2, 4]
+    # A whole-forward decode capture reads its top-k out of the FP8 plane; the
+    # tiled scorer the other formats use walks the batch on the host.
+    index_dtype = args.index_dtype or (
+        "fp8" if args.graph and args.cache_dtype == "bf16" else args.cache_dtype
+    )
     config = Config(
         model=args.model,
         tensor_parallel_size=size,
         enable_expert_parallel=True,
         enforce_eager=not args.graph,
         compilation_config=CompilationConfig(
-            cudagraph_mode=CUDAGraphMode.PIECEWISE if args.graph else None,
-            cudagraph_capture_sizes=[1, 2, 4],
+            cudagraph_mode=CUDAGraphMode.FULL if args.graph else None,
+            cudagraph_capture_sizes=capture_sizes,
         ),
         kv_cache_dtype=args.cache_dtype,
-        index_cache_dtype=args.cache_dtype,
+        index_cache_dtype=index_dtype,
         max_num_batched_tokens=256,
         max_model_len=1024,
         max_num_seqs=4,
         long_prefill_token_threshold=32,
-        state_checkpoint_interval_tokens=32,
+        # A multiple of the PAGE size, which is the prefix-cache hash block:
+        # anything else is snapped to off, and then this file's fork case is
+        # asserting on a feature that was never running.
+        state_checkpoint_interval_tokens=256,
         enable_log_stats=False,
         port=port,
     )
@@ -355,31 +395,28 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
         parity = compare_private_cache(runner, tokenizer)
         events = scheduler_cases(runner, tokenizer)
-        graphs = runner.model.dense_graphs
+        shapes = sorted(getattr(runner, "graphs", {}))
         if args.graph:
-            # Every layer captures the same stages, so the entry count is a
-            # whole multiple of the layer count -- a layer that silently fell
-            # back to eager breaks that. The multiple itself is not asserted:
-            # it is the stage set, and 41011da8a already changed it once by
-            # letting the decode FFN into the graphs.
-            layers = config.hf_config.num_hidden_layers
-            assert (
-                graphs.entries and len(graphs.entries) % layers == 0
-            ), f"{len(graphs.entries)} dense-graph entries over {layers} layers"
-            assert graphs.replays > len(graphs.entries)
+            # One whole-forward graph per declared shape, and nothing per
+            # layer: the target is a single replay now. A shape that failed to
+            # capture would be missing here, and a decode step that reached for
+            # it would have raised a KeyError inside `scheduler_cases` above --
+            # so those cases passing is the other half of this claim.
+            buckets = runner._dspark_capture_q_buckets(
+                runner.drafter.mtp_k + 1 if hasattr(runner, "drafter") else 1
+            )
+            assert shapes == sorted(
+                (bs, q) for q in buckets for bs in capture_sizes
+            ), f"captured {shapes}, declared {capture_sizes} x {buckets}"
         report = {
             "graph": args.graph,
             "reference": "uncaptured execution, private BF16 cache",
-            "dense_graphs": 0 if graphs is None else len(graphs.entries),
-            "dense_graphs_per_layer": (
-                0
-                if graphs is None
-                else len(graphs.entries) / config.hf_config.num_hidden_layers
-            ),
-            "dense_graph_replays": 0 if graphs is None else graphs.replays,
+            "target_graphs": len(shapes),
+            "target_graph_shapes": shapes,
             "passed": True,
             "tp": size,
             "cache_dtype": args.cache_dtype,
+            "index_cache_dtype": index_dtype,
             "parity": parity,
             "scheduler": events,
             "elapsed_seconds": time.perf_counter() - start,

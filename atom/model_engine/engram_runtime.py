@@ -10,7 +10,6 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-
 from atom.model_ops.engram_lookup import HostEmbeddingTable
 
 
@@ -320,14 +319,13 @@ class EngramInputPreparer:
     def from_checkpoint(cls, directory, config, max_tokens, device):
         from contextlib import ExitStack
 
-        from transformers import AutoTokenizer
-
         from atom.model_loader.deepseek_v41 import engram_tables
         from atom.model_ops.engram import (
             CompressedTokenizer,
             EngramConfig,
             NgramHashMapping,
         )
+        from transformers import AutoTokenizer
 
         resources = ExitStack()
         try:
@@ -353,10 +351,28 @@ class EngramInputPreparer:
             resources.close()
             raise
 
-    def prepare(self, spans, token_ids, histories, *, dummy=False, token_mask=None):
+    def prepare(
+        self,
+        spans,
+        token_ids,
+        histories,
+        *,
+        dummy=False,
+        token_mask=None,
+        padded_rows=None,
+    ):
+        """Stage one embedding row per row the forward will run.
+
+        `token_ids` are the rows the requests own. `padded_rows` is the width
+        the forward runs, which is wider whenever the batch was padded up to a
+        captured shape -- the tail belongs to no request, so it is staged as
+        zeros rather than looked up, and it cannot be read off `token_ids`
+        because the padding is applied to the model's input after this.
+        """
         compressed_rows = []
+        rows = token_ids.numel() if padded_rows is None else padded_rows
         if dummy:
-            self.host.stage_dummy(token_ids.numel())
+            self.host.stage_dummy(rows)
             next_histories = histories
         else:
             # These are the final GPU IDs, including deferred decode tokens.
@@ -384,7 +400,7 @@ class EngramInputPreparer:
                 next_histories.append(
                     self.mapping.advance_history(history[None, :], compressed)[0]
                 )
-            self.host.stage_embeddings(requests, padded_rows=token_ids.numel())
+            self.host.stage_embeddings(requests, padded_rows=rows)
             next_histories = np.asarray(next_histories, dtype=np.int64).reshape(
                 histories.shape
             )

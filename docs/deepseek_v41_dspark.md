@@ -7,9 +7,10 @@ request scheduler and unchanged V4 BF16 attention kernels.
 
 ## Supported configuration
 
-The P10 acceptance configuration is TP4 with whole-expert EP, BF16 KV and index
-caches, and text requests. Target execution can be eager or use PIECEWISE
-graphs; the draft currently runs eagerly. Packed speculative caches, multimodal
+The P10 acceptance configuration is TP4 with whole-expert EP, BF16 KV, a BF16
+or FP8 index plane, and text requests. Target execution can be eager, one
+whole-forward graph per decode step (`FULL`, which needs the FP8 plane), or
+PIECEWISE; the draft has its own graph. Packed speculative caches, multimodal
 speculation, synthetic acceptance and relaxed MTP acceptance are not admitted. Speculative output token logprobs are
 also rejected because the current output protocol cannot return them correctly.
 Non-speculative vision and packed cache support are independent. Both target
@@ -39,8 +40,10 @@ config = Config(
 
 For target graphs, set `enforce_eager=False` and
 `compilation_config=CompilationConfig(level=0,
-cudagraph_mode=CUDAGraphMode.PIECEWISE)`. Whole-draft capture is explicitly
-disabled: its request-window reads still need live request metadata.
+cudagraph_mode=CUDAGraphMode.FULL)` with `index_cache_dtype="fp8"`, which makes
+a decode step two replays: the draft's, keyed by request count, and the
+target's, keyed by `(batch size, query bucket)`. `PIECEWISE` remains available
+and records the dense pieces only.
 It must not silently capture warmup slots or reuse another request's window.
 
 ## State and sampling contracts
@@ -300,9 +303,10 @@ An initial Engram-only row-serialization experiment did not exercise the
 intended intervention: PIECEWISE replay bypassed the Python hook installed on
 Engram. Its 18/32 output reproduced the fixed run exactly and cannot exclude
 Engram as a contributor. The artifact is marked invalid for that intervention.
-A diagnostic graph-boundary fix now preserves input buckets/padding and records
-actual intervention calls; a real GPU graph test covers verify versus prefill and
-draft. This remains diagnostic code, not a product arithmetic change.
+The graph-boundary workaround that followed is gone with the per-stage graphs
+it reached into. A Python probe cannot intervene inside a captured forward at
+all, so these diagnostics run eager or PIECEWISE and say so; the GPU test now
+covers only that the probe fires on a verify pass and on nothing else.
 
 Calling the original attention kernel one row at a time scored 16/32 and did
 not recover the baseline. These experiments do not demonstrate an attention

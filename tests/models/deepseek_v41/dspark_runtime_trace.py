@@ -2,9 +2,9 @@
 """Replay each verify row from a pre-forward STATE/PAGE snapshot."""
 
 import torch
+
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
-
 from atom.utils.forward_context import get_forward_context
 
 
@@ -104,7 +104,7 @@ class VerifyTrace:
                         for i, span in enumerate(step.requests)
                         if offset < span.length
                     ]
-                    for offset in range(step.max_length)
+                    for offset in range(step.max_q_len)
                 ]
             else:
                 groups = [
@@ -146,7 +146,7 @@ class VerifyTrace:
                 sequential_logits = self.runner.model.head.get_logits(
                     self.runner.model.norm(values).flatten(0, 1)
                 )
-                shadow.finish_step(
+                shadow.advance_cursor(
                     local,
                     torch.stack(
                         [cache.pending.cursors[i, offset, 1:] for i, _, offset in group]

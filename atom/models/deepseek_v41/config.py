@@ -102,6 +102,14 @@ def build_attention_topology(config) -> tuple[LayerAttentionSpec, ...]:
         config.candidate_topk_blocks <= 0 or config.candidate_block_size <= 0
     ):
         raise ValueError("Candidate block count and size must be positive")
+    if candidate >= 0 and (
+        config.candidate_topk_blocks * config.candidate_block_size < config.index_topk
+    ):
+        # A row's selection count is read off its position rather than counted
+        # (`_indptr_scan`), which holds only while the candidates can hold a
+        # whole top-k. Below that a consumer scores fewer rows than it reserves
+        # room for and leaves a hole in its own slice.
+        raise ValueError("Candidate blocks must be able to hold a whole top-k")
 
     result = []
     kv_owner = topk_owner = candidate_kv_owner = None
@@ -318,8 +326,9 @@ def validate_runtime_config(config):
     graph_mode = getattr(config.compilation_config, "cudagraph_mode", None)
     for name, enabled in (
         (
-            "CUDAGraph mode (use PIECEWISE or enforce_eager=True)",
-            not config.enforce_eager and graph_mode != CUDAGraphMode.PIECEWISE,
+            "CUDAGraph mode (use FULL, PIECEWISE or enforce_eager=True)",
+            not config.enforce_eager
+            and graph_mode not in (CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE),
         ),
         ("torch.compile", config.compilation_config.level != 0),
         ("pipeline parallel", config.pipeline_parallel_size != 1),
@@ -363,6 +372,19 @@ def validate_runtime_config(config):
         raise ValueError(
             "DeepSeek-V4.1 large-position tie-breaking needs the tiled scorer; "
             "use index_cache_dtype=bf16"
+        )
+    # FULL captures whole decode forwards, so a decode step becomes one
+    # replay. The tiled scorer walks the batch off host positions, which a
+    # capture freezes into every replay; only the paged scorer reads its
+    # bounds off the device.
+    if (
+        graph_mode == CUDAGraphMode.FULL
+        and not config.enforce_eager
+        and config.index_cache_dtype != "fp8"
+    ):
+        raise ValueError(
+            "DeepSeek-V4.1 whole-forward capture needs the paged scorer; use "
+            "index_cache_dtype=fp8 or cudagraph_mode=PIECEWISE"
         )
     if config.kv_cache_block_size % 2:
         raise ValueError("DeepSeek-V4.1 PAGE token count must be even")

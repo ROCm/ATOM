@@ -343,7 +343,7 @@ def main():
             enable_expert_parallel=True,
             enforce_eager=not args.graph,
             compilation_config=CompilationConfig(
-                cudagraph_mode=CUDAGraphMode.PIECEWISE if args.graph else None,
+                cudagraph_mode=CUDAGraphMode.FULL if args.graph else None,
                 cudagraph_capture_sizes=[1, 2, 4],
             ),
             speculative_config=SpeculativeConfig(
@@ -356,7 +356,10 @@ def main():
                 calibration_profile=args.calibration_profile,
             ),
             kv_cache_dtype=args.cache_dtype,
-            index_cache_dtype=args.cache_dtype,
+            # A whole-forward decode capture reads its top-k out of the FP8
+            # plane; the tiled scorer the other formats use walks the batch on
+            # the host, so there is nothing for a graph to record.
+            index_cache_dtype="fp8" if args.graph else args.cache_dtype,
             max_num_batched_tokens=256,
             max_model_len=512,
             max_num_seqs=4,
@@ -385,12 +388,12 @@ def main():
         runner.allocate_kv_cache(1024)
         if args.graph:
             runner.capture_cudagraph()
-            report["target_graph_tokens"] = sorted(runner._piecewise_captured_tokens)
+            report["target_graph_shapes"] = sorted(runner.graphs)
+            assert report["target_graph_shapes"]
             from atom.utils import envs
 
             expected = runner.capture_sizes if envs.ATOM_DRAFT_CUDAGRAPH else []
             assert sorted(runner.drafter.block._cuda_graphs) == expected
-            replay_start = runner.model.dense_graphs.replays
         tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
         if args.ragged_probe:
             calls = 0
@@ -417,11 +420,10 @@ def main():
             ragged_probe=args.ragged_probe,
             sampling_probe=args.sampling_probe,
         )
-        if args.graph:
-            report["target_graph_replays"] = (
-                runner.model.dense_graphs.replays - replay_start
-            )
-            assert report["target_graph_replays"] > 0
+        # No replay counter to check any more, and none to add: a FULL decode
+        # step indexes `runner.graphs` and replays it, so a shape that was
+        # never captured raises here rather than falling back to eager. The
+        # scenarios above completing is that claim.
         if rank == 0:
             args.output.write_text(json.dumps(report, indent=2) + "\n")
     finally:

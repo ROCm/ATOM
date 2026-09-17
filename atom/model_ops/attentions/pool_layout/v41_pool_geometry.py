@@ -73,6 +73,14 @@ class V41PoolGeometry:
     # index one has a paged scorer that dictates a format.
     index_dtype: str = "bf16"
     speculative_tokens: int = 0
+    # The distinct compression ratios this configuration's layers run, read
+    # off the topology rather than enumerated, so a ratio no layer wants gets
+    # no buffer. Every layer at a ratio reserves its rows the same way, so the
+    # indptr is the ratio's and not the layer's -- the same thing V4's three
+    # `kv_indptr_{swa,csa,hca}` are, at one fixed address each.
+    layer_ratios: tuple[int, ...] = ()
+    # The width a scorer emits, before a request short on history narrows it.
+    index_topk: int = 0
 
     def __post_init__(self):
         if self.speculative_tokens < 0:
@@ -170,6 +178,30 @@ class V41PoolGeometry:
     def compress_ratios(self):
         """`(ratio, overlap)` per distinct ratio: CSA2 never overlaps."""
         return tuple(sorted({(ratio, False) for _, ratio in self.owners}))
+
+    def scores_paged(self, decode):
+        """Whether a shape's top-k comes from the plane, not from a tile.
+
+        Two conditions and neither implies the other: the plane in the format
+        the paged scorer reads, and a step whose visibility is a row prefix.
+        """
+        return self.index_dtype == "fp8" and decode
+
+    def batch_topk(self, ratio, longest, decode):
+        """The selection width a batch gets at `ratio`, before a scorer runs.
+
+        The paged scorer always emits `index_topk` and pads what a row cannot
+        see; the tiled one emits `min(topk, that request's committed rows)`.
+        Host arithmetic either way, which is what lets the indptr reserve its
+        rows up front -- each row's count is closed-form in this width.
+        """
+        if not ratio:
+            return 0
+        return (
+            self.index_topk
+            if self.scores_paged(decode)
+            else min(self.index_topk, longest // ratio)
+        )
 
     @property
     def compress_ring_slots(self):

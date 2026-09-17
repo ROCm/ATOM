@@ -5,8 +5,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import torch
-
 from atom.model_ops.attentions.deepseek_v41_state import AttentionStep
+
 from atom.model_ops.attentions.token_layout.batch_ids import build_batch_ids
 from atom.model_ops.attentions.token_layout.prefill import prefill_positions
 from atom.utils import CpuGpuBuffer, pack_rows
@@ -32,6 +32,17 @@ class RequestSpan:
 
 @dataclass
 class BatchStep:
+    """One forward's shape, in rows the kernels run rather than tokens owned.
+
+    Every tensor here spans the forward's own width -- `running_tokens` rows
+    and `running_bs` requests -- and not the scheduled batch, because a
+    captured graph replays the width it was captured at whatever the batch
+    turns out to be. The tail past `scheduled` is padding: a token there
+    carries batch id -1, which is what the scatters bail on, and a request
+    there is zero-length in `cu_seqlens_q`, which is what the per-request
+    kernels bail on.
+    """
+
     requests: tuple[RequestSpan, ...]
     positions: torch.Tensor
     cu_seqlens_q: torch.Tensor
@@ -39,30 +50,51 @@ class BatchStep:
     batch_ids: torch.Tensor
     block_tables: torch.Tensor
     request_steps: tuple[AttentionStep, ...]
+    # Tokens the requests own, against `width` rows the forward runs.
+    scheduled: int = 0
+    # Rows per request this forward runs -- the CUDAGraph query bucket, not
+    # the longest request in the batch. A ragged verify step whose longest
+    # request is shorter still replays the bucket's graph, so every shape
+    # derived from it has to be the bucket's.
+    max_q_len: int = 0
+    # The batch's longest context, which sets the selection width per ratio.
+    longest: int = 0
+    # Everything below is one forward's, not one layer's. `indptrs` is filled
+    # by `begin_step` into fixed addresses; the rest are filled by the layer
+    # that gets there first and dropped by `begin_forward`.
     selected: dict[int, torch.Tensor] = field(default_factory=dict)
-    # Layer -> its candidate blocks for the whole batch, and ratio -> the tile
-    # table its owners page over. Both are one answer per forward that several
-    # layers read, which is the only reason they are memoized on the step.
     candidates: dict[int, torch.Tensor] = field(default_factory=dict)
     tiles: dict[int, torch.Tensor] = field(default_factory=dict)
+    indptrs: dict[int, tuple] = field(default_factory=dict)
     # ratio -> CompressPlan. One per distinct compression ratio in the model,
     # built once per forward and read by every owner that shares that ratio.
     plans: dict[int, object] = field(default_factory=dict)
     tentative: bool = False
 
+    def begin_forward(self):
+        """Drop what the last forward over this step worked out.
+
+        A capture runs the model twice on one step, so a table surviving into
+        the recorded pass is a kernel that pass skips -- absent from the graph,
+        and read at capture-time values on every replay.
+        """
+        self.selected.clear()
+        self.candidates.clear()
+        self.tiles.clear()
+
     @property
-    def length(self):
+    def width(self):
         return self.positions.numel()
+
+    @property
+    def scheduled_bs(self):
+        return len(self.requests)
 
     @property
     def decode(self):
         # Verification has ring slack for the entire tentative block. All rows
         # can use the same causal paged-decode kernel as autoregressive decode.
         return self.tentative or all(request.length == 1 for request in self.requests)
-
-    @property
-    def max_length(self):
-        return max((request.length for request in self.requests), default=0)
 
 
 def prepare_batch_step(
@@ -73,14 +105,16 @@ def prepare_batch_step(
     buffers=None,
     running_bs=None,
     running_tokens=None,
+    max_q_len=None,
     state_slot_out=None,
 ):
     """Stage request metadata using the same persistent buffers/layout as V4.
 
     The serving builder owns buffers; isolated cache callers may allocate private
     ones. CPU request spans remain available for Engram and state lifecycle work.
-    Existing eager consumers see active views; the backing token map uses V4's
-    -1 padding sentinel and block-table stride stays fixed across steps.
+    The published views span the forward's full width, padding included, since
+    that is the width its kernels run; the backing token map uses V4's -1
+    padding sentinel and block-table stride stays fixed across steps.
     """
     scheduled_bs = len(requests)
     lengths = np.asarray([span.length for span in requests], dtype=np.int32)
@@ -89,6 +123,8 @@ def prepare_batch_step(
     running_tokens = scheduled_tokens if running_tokens is None else running_tokens
     if running_bs < scheduled_bs or running_tokens < scheduled_tokens:
         raise ValueError("Request metadata exceeds the declared batch/token capacity")
+    if max_q_len is not None and lengths.size and max_q_len < int(lengths.max()):
+        raise ValueError("A request is longer than the query width this forward runs")
     if buffers is None:
         width = max((len(span.block_ids) for span in requests), default=0)
         shapes = {
@@ -133,8 +169,12 @@ def prepare_batch_step(
     if state_slot_out is None:
         # Isolated eager cache callers have no metadata builder. Serving passes
         # the already-published V4 state_slot_out view; it is never restaged here.
+        # Padded to the same width serving publishes, so a caller that asks for
+        # a wider forward than its batch gets the shape the kernels will see.
         state_slot_out = torch.tensor(
-            [span.slot for span in requests], dtype=torch.int32, device=device
+            [span.slot for span in requests] + [0] * (running_bs - scheduled_bs),
+            dtype=torch.int32,
+            device=device,
         )
     tables = buffers["block_tables"]
     if scheduled_bs:
@@ -145,8 +185,8 @@ def prepare_batch_step(
     published = {
         name: buffers[name].copy_to_gpu(count) for name, count in required.items()
     }
-    pos = published["positions"][:scheduled_tokens]
-    ptr = published["cu_seqlens_q"][: scheduled_bs + 1]
+    pos = published["positions"]
+    ptr = published["cu_seqlens_q"]
     local_steps = tuple(
         AttentionStep(
             span.position,
@@ -160,9 +200,16 @@ def prepare_batch_step(
         requests,
         pos,
         ptr,
-        state_slot_out[:scheduled_bs],
-        published["batch_id_per_q_token"][:scheduled_tokens],
-        published["block_tables"][:scheduled_bs],
+        state_slot_out[:running_bs],
+        published["batch_id_per_q_token"],
+        published["block_tables"],
         local_steps,
+        scheduled=scheduled_tokens,
+        longest=max((span.end for span in requests), default=0),
+        max_q_len=(
+            max((span.length for span in requests), default=0)
+            if max_q_len is None
+            else max_q_len
+        ),
         tentative=tentative,
     )

@@ -76,7 +76,6 @@ def run_case(runner, prompts, output_tokens, *, multimodal_data=None):
         (arrivals[seq.id][-1] - arrivals[seq.id][0]) / (output_tokens - 1)
         for seq in sequences
     ]
-    graphs = getattr(runner.model, "dense_graphs", None)
     return {
         "ttft_ms": statistics.mean(first) * 1000,
         "tpot_ms": statistics.mean(tpot) * 1000,
@@ -84,7 +83,7 @@ def run_case(runner, prompts, output_tokens, *, multimodal_data=None):
         "output_tokens_per_second": len(sequences) * output_tokens / elapsed,
         "peak_allocated_gib": torch.cuda.max_memory_allocated() / 2**30,
         "steps": steps,
-        "graph_replays": 0 if graphs is None else graphs.replays,
+        "target_graph_shapes": sorted(getattr(runner, "graphs", {})),
         "output_sha256": hashlib.sha256(json.dumps(outputs).encode()).hexdigest(),
         "outputs": outputs,
     }
@@ -121,7 +120,7 @@ def main():
         enable_expert_parallel=True,
         enforce_eager=not args.graph,
         compilation_config=CompilationConfig(
-            cudagraph_mode=CUDAGraphMode.PIECEWISE if args.graph else None,
+            cudagraph_mode=CUDAGraphMode.FULL if args.graph else None,
             cudagraph_capture_sizes=buckets,
         ),
         kv_cache_dtype=args.cache_dtype,
@@ -153,7 +152,7 @@ def main():
         report = {
             "label": args.label,
             "cache_dtype": args.cache_dtype,
-        "index_dtype": args.index_dtype or args.cache_dtype,
+            "index_dtype": args.index_dtype or args.cache_dtype,
             "graph": args.graph,
             "tp": size,
             "output_tokens": args.output_tokens,

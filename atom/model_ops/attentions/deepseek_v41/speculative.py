@@ -16,7 +16,7 @@ class TentativeState:
     def __init__(self, cache, step):
         self.cache, self.step = cache, step
         self.request_indices = {span.slot: i for i, span in enumerate(step.requests)}
-        batch, width = len(step.requests), step.max_length
+        batch, width = step.scheduled_bs, step.max_q_len
         self.cursors = torch.empty(
             batch,
             width,
@@ -25,7 +25,6 @@ class TentativeState:
             device=cache.pool.device,
         )
         self.histories_written = set()
-        self.finished = False
 
     def stage_history(self, span, compressed_ids):
         ids = torch.as_tensor(
@@ -44,15 +43,10 @@ class TentativeState:
         self.cursors[i, : span.length, 1:] = prefixes
         self.histories_written.add(span.slot)
 
-    def finish(self):
-        if self.histories_written != set(self.request_indices):
-            raise RuntimeError("Tentative state is missing an Engram prefix")
-        self.finished = True
-
     def commit(self, accepted_lengths):
         """Lengths include the guaranteed target input: zero drafts means one."""
-        if not self.finished:
-            raise RuntimeError("Cannot commit before the target forward finishes")
+        if self.histories_written != set(self.request_indices):
+            raise RuntimeError("Tentative state is missing an Engram prefix")
         lengths = torch.as_tensor(
             accepted_lengths, dtype=torch.int64, device=self.cursors.device
         )
@@ -66,5 +60,7 @@ class TentativeState:
             "Accepted prefix is outside the verification span",
         )
         batch = torch.arange(lengths.numel(), device=lengths.device)
-        slots = self.step.slots.long()
+        # The scheduled prefix, not the forward's width: a padding request owns
+        # no slot, and the 0 standing in for one is a live request's.
+        slots = self.step.slots[: self.step.scheduled_bs].long()
         self.cache.cursor[slots] = self.cursors[batch, lengths - 1]

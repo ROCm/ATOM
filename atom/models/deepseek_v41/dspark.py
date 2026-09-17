@@ -4,14 +4,14 @@
 from copy import copy
 
 import torch
-from torch import nn
-
-from atom.model_loader.weight_names import WeightsMapper
 from atom.model_ops.blockscale import quantize_fp8
 from atom.model_ops.deepseek_v41.dspark import draft_attention, draft_step, rotate_rows
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.deepseek_v41.projections import grouped_output_projection
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
+from torch import nn
+
+from atom.model_loader.weight_names import WeightsMapper
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
@@ -201,10 +201,14 @@ class DeepseekV41DSpark(DSparkDraftModel):
             return
         metadata = forward.attn_metadata
         cache, step = metadata.cache, metadata.step
-        hidden = self.project_context(aux_concat[: step.length].unsqueeze(0))
+        # The forward's own width, padding included, because that is what the
+        # target just ran and what these buffers therefore hold. A padding row
+        # belongs to a zero-length request in `cu_seqlens_q`, so it is
+        # projected and then written nowhere.
+        hidden = self.project_context(aux_concat[: step.width].unsqueeze(0))
         for attention in self.context_layers:
             keys = attention.project_context(
-                hidden, positions[: step.length][None], self.rope, packed=cache.packed
+                hidden, positions[: step.width][None], self.rope, packed=cache.packed
             )
             cache.write_window(
                 attention.spec.layer_id,

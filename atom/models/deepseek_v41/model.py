@@ -122,53 +122,19 @@ class Block(nn.Module):
         )
         return self.ffn_norm(hidden), residual, pre, post, comb
 
-    def decode_ffn(self, hidden, image_mask):
-        return (self.ffn(hidden, image_mask),)
-
     def finish_ffn(self, output, residual, pre, post, comb):
         return expand_residual(output, residual, post, comb), pre
 
-    def forward(
-        self,
-        state,
-        cache,
-        step,
-        rope,
-        embeddings=None,
-        image_mask=None,
-        *,
-        execution=None,
-    ):
-        # Execution policy may capture pure tensor stages. Attention, request
-        # state and expert dispatch keep their own execution/lifetime contracts.
-        run = (
-            (lambda function, *args: function(*args))
-            if execution is None
-            else execution
-        )
-        hidden, residual, pre, post, comb = run(
-            self.prepare_attention,
-            state.residual,
-            state.pre_mix,
-            embeddings,
-            image_mask,
+    def forward(self, state, cache, step, rope, embeddings=None, image_mask=None):
+        hidden, residual, pre, post, comb = self.prepare_attention(
+            state.residual, state.pre_mix, embeddings, image_mask
         )
         output = self.attn(hidden, cache, step, rope)
-        hidden, residual, pre, post, comb = run(
-            self.prepare_ffn,
-            output,
-            residual,
-            pre,
-            post,
-            comb,
+        hidden, residual, pre, post, comb = self.prepare_ffn(
+            output, residual, pre, post, comb
         )
-        if step.decode:
-            (output,) = run(self.decode_ffn, hidden, image_mask)
-        else:
-            output = self.ffn(hidden, image_mask)
-        return SinglePassHCState(
-            *run(self.finish_ffn, output, residual, pre, post, comb)
-        )
+        output = self.ffn(hidden, image_mask)
+        return SinglePassHCState(*self.finish_ffn(output, residual, pre, post, comb))
 
 
 class DeepseekV41ForCausalLM(nn.Module):
@@ -290,7 +256,6 @@ class DeepseekV41ForCausalLM(nn.Module):
         step,
         engram_embeddings=None,
         *,
-        execution=None,
         inputs_embeds=None,
         image_mask=None,
     ):
@@ -314,7 +279,6 @@ class DeepseekV41ForCausalLM(nn.Module):
                 rope,
                 engram_embeddings.get(spec.layer_id),
                 image_mask=image_mask,
-                execution=execution,
             )
         hidden = state.collapse()
         return hidden

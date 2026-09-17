@@ -7,6 +7,12 @@ from functools import partial
 import numpy as np
 import pytest
 import torch
+
+from atom.model_engine.page_unit_checkpoint import (
+    CheckpointRestoreOp,
+    CheckpointStoreOp,
+    PagedStateCheckpointSpec,
+)
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 from atom.model_ops.attentions.deepseek_v41.checkpoints import StateCopies
 from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
@@ -20,12 +26,6 @@ from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 from atom.models.deepseek_v41.attention import Attention
 from atom.models.deepseek_v41.config import build_attention_topology
 from tests.attentions.deepseek_v41.helpers import geometry
-
-from atom.model_engine.page_unit_checkpoint import (
-    CheckpointRestoreOp,
-    CheckpointStoreOp,
-    PagedStateCheckpointSpec,
-)
 
 
 def _where(location, text):
@@ -180,7 +180,7 @@ def test_attention_math_and_odd_tail_survive_exact_checkpoint(
             torch.testing.assert_close(
                 actual, expected, rtol=0, atol=0, msg=partial(_where, where)
             )
-        paged.finish_step(step, history)
+        paged.advance_cursor(step, history)
         private.finish_step(eager_step)
         if n == 0:
             units = tuple(range(spec.units_per_checkpoint))

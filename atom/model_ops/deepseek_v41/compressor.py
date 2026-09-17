@@ -43,11 +43,16 @@ def compress_batch(cache, owner, compressor, values, scores, step, rope, *, scat
     # Ratio 1 has no gate, and a one-element softmax weighs 1 whatever the
     # score is, so the gate input only has to be finite.
     gate = values if scores is None else scores
+    # One row per plan row, not per boundary the batch happens to cross: that
+    # is the kernel's grid, and a decode plan is cut to a capacity a capture
+    # can record. The sentinel tail is projected like any other row and then
+    # skipped by the writers, which is cheaper than a host-side count.
+    capacity = plan.compress_plan_gpu.shape[0]
     latent = rotated = None
-    if plan.num_compress:
+    if capacity:
         # BF16: what the index key's BF16 `wk` consumes.
         latent = torch.empty(
-            plan.num_compress, head_dim, dtype=torch.bfloat16, device=values.device
+            capacity, head_dim, dtype=torch.bfloat16, device=values.device
         )
         rotated = torch.empty_like(latent) if scatter is None else None
         fused_compress_attn(
@@ -92,7 +97,7 @@ def compress_batch(cache, owner, compressor, values, scores, step, rope, *, scat
     )
     if latent is None:
         return None, None, None
-    rows = plan.compress_plan_gpu[: plan.num_compress, 2].long() // ratio
+    rows = plan.compress_plan_gpu[:, 2].long() // ratio
     return latent.unsqueeze(0), rows, None if rotated is None else rotated.unsqueeze(0)
 
 

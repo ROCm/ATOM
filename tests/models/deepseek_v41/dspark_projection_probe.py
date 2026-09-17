@@ -69,16 +69,20 @@ def ordered_reductions():
 
 
 def serial_verify_operations(names):
-    """Causal probe: change only named operations during target verification."""
+    """Causal probe: change only named operations during target verification.
+
+    Eager or PIECEWISE only. These are Python interventions, and a FULL
+    capture records device work -- a replay would run the recording, probe and
+    all, and report nothing. There used to be a per-stage bypass here for
+    exactly that reason; the stages it reached into are gone.
+    """
     import torch
 
     from atom.model_ops.engram_layer import EngramOp
     from atom.models.deepseek_v41 import attention
-    from atom.models.deepseek_v41.execution import DenseGraphExecutor
     from atom.utils.forward_context import get_forward_context
 
     stats = {name: {"calls": 0, "rows": 0, "max_rows": 0} for name in names}
-    stats["engram_graph_stage_bypasses"] = 0
 
     def observed(name, rows):
         item = stats[name]
@@ -112,31 +116,6 @@ def serial_verify_operations(names):
             return torch.cat(output).view_as(hidden)
 
         EngramOp.forward = engram_probe
-        graph_run = DenseGraphExecutor.run
-
-        def graph_probe(self, function, *args, bucket, capture=False):
-            layer = getattr(function, "__self__", None)
-            if (
-                not capture
-                and verifying()
-                and function.__name__ == "prepare_attention"
-                and getattr(layer, "engram", None) is not None
-            ):
-                key = (function, bucket, tuple(x is None for x in args))
-                entry = self.entries.get(key)
-                if entry is not None:
-                    # The original graph captured with tentative=False, so its
-                    # replay cannot execute the Python intervention above.
-                    # Preserve its exact input bucket/padding and bypass only
-                    # this stage, leaving prefill and all other graphs intact.
-                    self._copy(entry.inputs, args)
-                    stats["engram_graph_stage_bypasses"] += 1
-                    output = function(*entry.inputs)
-                    length = args[0].shape[1]
-                    return tuple(value[:, :length] for value in output)
-            return graph_run(self, function, *args, bucket=bucket, capture=capture)
-
-        DenseGraphExecutor.run = graph_probe
 
     if "attention" in names:
         decode = attention.sparse_attn_v4_paged_decode

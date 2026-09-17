@@ -5,8 +5,73 @@ import torch
 import triton
 import triton.language as tl
 
-from atom.model_ops.deepseek_v41.paged_indices import _indptr
 from atom.model_ops.v4_kernels.pool_index import window_constexprs, window_row
+
+
+@triton.jit
+def _indptr_scan(
+    batches,
+    positions,
+    cu,
+    pptr,
+    eptr,
+    tokens,
+    DECODE: tl.constexpr,
+    WINDOW: tl.constexpr,
+    RATIO: tl.constexpr,
+    TOPK: tl.constexpr,
+    EXTEND: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """One program: a running offset over the forward's whole token axis.
+
+    V4's `_v4_decode_indptr_kernel`, for CSA2's classes: a prefix sum has to
+    see every earlier token, so this is one serial scan rather than a grid, and
+    `tokens` is a runtime argument so a fresh token count does not make a fresh
+    JIT variant.
+
+    A padding token contributes 0, which leaves the tail of each indptr flat --
+    the zero-length slice every reader downstream bails on, and the reason the
+    writer below can skip those rows without leaving a hole.
+
+    A row's selection count is closed-form rather than counted: the scorers
+    emit `min(visible, columns)` ids and pad the rest with -1, which
+    `test_selection_count_matches_its_closed_form` pins. It holds only while
+    the candidates can hold a whole top-k, which `build_attention_topology`
+    refuses a config without.
+    """
+    tl.store(pptr, 0)
+    if EXTEND:
+        tl.store(eptr, 0)
+    prefix_total = 0
+    extend_total = 0
+    for base in tl.range(0, tokens, BLOCK):
+        idx = base + tl.arange(0, BLOCK)
+        in_range = idx < tokens
+        bid = tl.load(batches + idx, mask=in_range, other=-1)
+        live = in_range & (bid >= 0)
+        pos = tl.load(positions + idx, mask=live, other=0).to(tl.int32)
+        start = tl.load(cu + bid, mask=live, other=0)
+        first = tl.maximum(pos - WINDOW + 1, 0)
+        # Decode sees its own token; a prefill chunk sees only what its first
+        # token already had, the rest arriving as the extend segment.
+        history_end = (
+            pos + 1
+            if DECODE
+            else tl.load(positions + start, mask=live, other=0).to(tl.int32)
+        )
+        count = tl.maximum(history_end - first, 0)
+        if TOPK:
+            count += tl.minimum((pos + 1) // RATIO, TOPK)
+        count = tl.where(live, count, 0)
+        tl.store(pptr + idx + 1, prefix_total + tl.cumsum(count, axis=0), mask=in_range)
+        prefix_total += tl.sum(count)
+        if EXTEND:
+            reach = tl.where(live, tl.minimum(idx - start + 1, WINDOW), 0)
+            tl.store(
+                eptr + idx + 1, extend_total + tl.cumsum(reach, axis=0), mask=in_range
+            )
+            extend_total += tl.sum(reach)
 
 
 @triton.jit
@@ -39,6 +104,10 @@ def _indices(
 ):
     t = tl.program_id(0)
     batch = tl.load(batches + t)
+    # Defined only where the batch id is, as V4's decode writer is: a padding
+    # row owns no slot to address and was given no room to write into.
+    if batch < 0:
+        return
     start = tl.load(cu + batch)
     pos = tl.load(positions + t)
     first = tl.maximum(0, pos - WINDOW + 1)
@@ -82,38 +151,64 @@ def _indices(
         tl.store(extend + begin + i, t - count + 1 + i, i < count)
 
 
+def fill_step_indptrs(step, geometry, buffers, longest):
+    """`{ratio: (prefix indptr, extend indptr, reserved top-k)}` for this step.
+
+    Into the caller's fixed buffers, before any layer runs. Both halves are
+    load-bearing: a table a layer fills on a miss is one a capture's recorded
+    pass skips, and a table at a fresh address each forward is one its replay
+    reads at the capture's.
+    """
+    built = {}
+    for ratio in geometry.layer_ratios:
+        prefix, extend = buffers[ratio]
+        topk = geometry.batch_topk(ratio, longest, step.decode)
+        pptr = prefix[: step.width + 1]
+        eptr = pptr if step.decode else extend[: step.width + 1]
+        _indptr_scan[(1,)](
+            step.batch_ids,
+            step.positions,
+            step.cu_seqlens_q,
+            pptr,
+            eptr,
+            step.width,
+            DECODE=step.decode,
+            WINDOW=geometry.window_size,
+            RATIO=ratio or 1,
+            TOPK=topk,
+            EXTEND=not step.decode,
+            BLOCK=1024,
+        )
+        built[ratio] = (pptr, eptr, topk)
+    return built
+
+
 def build_indices(selected, step, geometry, window, owner, ratio):
-    positions = step.positions
-    first = (positions - geometry.window_size + 1).clamp_min(0)
-    starts = step.cu_seqlens_q[:-1][step.batch_ids.long()]
-    history_end = positions + 1 if step.decode else positions[starts.long()]
-    counts = (history_end - first).clamp_min(0)
     topk = 0 if selected is None else selected.shape[-1]
-    if topk:
-        counts = counts + (selected >= 0).sum(-1, dtype=torch.int32).flatten()
-    pptr = _indptr(counts)
+    pptr, eptr, reserved = step.indptrs[ratio]
+    if topk != reserved:
+        # Each row's reserve is closed-form in the width, and was taken before
+        # any scorer ran. Another width leaves every row a hole its reader
+        # dereferences.
+        raise ValueError(f"Scorer width {topk} is not the {reserved} reserved")
     prefix = torch.empty(
-        step.length * (topk + geometry.window_size),
+        step.width * (topk + geometry.window_size),
         dtype=torch.int64 if geometry.packed else torch.int32,
-        device=positions.device,
+        device=step.positions.device,
     )
-    extend_counts = (
-        torch.arange(step.length, device=positions.device) - starts + 1
-    ).clamp_max(geometry.window_size)
-    eptr = pptr if step.decode else _indptr(extend_counts)
     extend = torch.empty(
-        0 if step.decode else step.length * min(step.max_length, geometry.window_size),
+        0 if step.decode else step.width * min(step.max_q_len, geometry.window_size),
         dtype=torch.int32,
-        device=positions.device,
+        device=step.positions.device,
     )
-    if step.length:
-        _indices[(step.length,)](
+    if step.width:
+        _indices[(step.width,)](
             selected if topk else prefix,
             pptr,
             prefix,
             eptr,
             extend,
-            positions,
+            step.positions,
             step.batch_ids,
             step.cu_seqlens_q,
             step.slots,

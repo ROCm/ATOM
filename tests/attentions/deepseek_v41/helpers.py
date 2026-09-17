@@ -13,6 +13,10 @@ def geometry(config, block=4):
         config.sliding_window,
         config.head_dim,
         config.index_head_dim,
+        layer_ratios=tuple(
+            sorted(set(config.compress_ratios[: config.num_hidden_layers]))
+        ),
+        index_topk=config.index_topk,
     )
 
 

@@ -39,6 +39,10 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--baseline", action="store_true")
     parser.add_argument("--graph", action="store_true")
+    # The arm P5 replaced. Kept so the two are one flag apart on one harness:
+    # the claim is a launch count per decode step, and a claim like that needs
+    # the thing it improved on still runnable.
+    parser.add_argument("--piecewise", action="store_true")
     parser.add_argument("--calibration-profile")
     parser.add_argument("--production", action="store_true")
     parser.add_argument("--trace", action="store_true")
@@ -151,7 +155,15 @@ def main():
             enable_expert_parallel=True,
             enforce_eager=not args.graph,
             compilation_config=CompilationConfig(
-                cudagraph_mode=CUDAGraphMode.PIECEWISE if args.graph else None,
+                cudagraph_mode=(
+                    None
+                    if not args.graph
+                    else (
+                        CUDAGraphMode.PIECEWISE
+                        if args.piecewise
+                        else CUDAGraphMode.FULL
+                    )
+                ),
                 cudagraph_capture_sizes=[1, 2, 4],
             ),
             speculative_config=speculative,
@@ -208,21 +220,19 @@ def main():
         runner.allocate_kv_cache(pool_blocks)
         if args.graph:
             runner.capture_cudagraph()
-            report["target_graph_tokens"] = sorted(runner._piecewise_captured_tokens)
-            # Stages-per-layer, which is the number a capture built on the wrong
-            # step kind gets wrong: `decode_ffn` is only offered to the
-            # execution policy on a decode step, and a speculative bucket is
-            # only a decode step because the capture asks for one.
-            dense = runner.model.dense_graphs
-            report["dense_graphs_per_layer"] = (
-                0
-                if dense is None
-                else len(dense.entries) / config.hf_config.num_hidden_layers
-            )
+            # One number per arm, and they are not the same number: PIECEWISE
+            # captures dense pieces keyed by token count with attention eager
+            # between them, FULL captures one whole forward per (bs, q).
+            report["piecewise_graph_tokens"] = sorted(runner._piecewise_captured_tokens)
+            report["target_graph_shapes"] = sorted(getattr(runner, "graphs", {}))
             report["draft_graph_sizes"] = (
                 [] if args.baseline else sorted(runner.drafter.block._cuda_graphs)
             )
-            assert report["target_graph_tokens"]
+            assert (
+                report["piecewise_graph_tokens"]
+                if args.piecewise
+                else report["target_graph_shapes"]
+            )
             if not args.baseline:
                 from atom.utils import envs
 

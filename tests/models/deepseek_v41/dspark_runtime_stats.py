@@ -43,7 +43,10 @@ class RuntimeStats:
 
     def commit(self, metadata, last_indices):
         if metadata.step.tentative:
-            counts = last_indices - metadata.step.cu_seqlens_q[:-1]
+            # The scheduled prefix, as the builder takes it: `cu_seqlens_q`
+            # spans the forward's width, and the padding requests past the
+            # batch have no accepted prefix to count.
+            counts = last_indices - metadata.step.cu_seqlens_q[: last_indices.numel()]
             self.prefixes.append(
                 (
                     counts.detach().clone(),

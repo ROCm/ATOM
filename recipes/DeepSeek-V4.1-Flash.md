@@ -25,6 +25,7 @@ EP, with weights at `/mnt/DeepSeek-V4.1-Flash`. AITER is pinned to
 | P08 | Multimodal chunking and embedding lifetime | Complete; small-chunk quality tradeoff accepted |
 | P09 | Packed cache, AITER W4A8 experts and PIECEWISE graphs | Complete; MoE precision tradeoff accepted |
 | P10 | V4.1 DSpark and accepted-prefix state commit | Implemented and tested; zero-shot raw quality decision pending |
+| P10b | FP8 index plane, paged decode scorer and the whole-forward target graph | Implemented; a decode step is the draft's replay plus the target's |
 | P11 | Candidate-only indexing, Engram residency and fusion | Pending |
 | P12 | Optional CED decoder replay | Pending |
 | P13 | Optional encoder replay and persistent global cache | Pending |

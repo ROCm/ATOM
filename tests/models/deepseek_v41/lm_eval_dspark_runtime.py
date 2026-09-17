@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import torch
+from atom.models.deepseek_v41.config import validate_runtime_config
 from lm_eval import simple_evaluate
 from lm_eval.api.model import LM
 from transformers import AutoTokenizer
@@ -36,7 +37,6 @@ from atom.entrypoints.openai.chat_encoders import (
 from atom.model_engine.model_runner import ModelRunner
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence
-from atom.models.deepseek_v41.config import validate_runtime_config
 from atom.sampling_params import SamplingParams
 from atom.utils.forward_context import get_forward_context
 
@@ -380,6 +380,11 @@ def main():
         help="Index plane format; defaults to the BF16 this driver pins",
     )
     parser.add_argument("--max-output-tokens", type=int, default=256)
+    # The arm FULL replaced, kept so the two are one flag apart on one harness.
+    # PIECEWISE at `level=0` has no compiled pieces to replay, so this arm runs
+    # the target eagerly -- which is exactly the control an accuracy comparison
+    # wants, and what it is named after is where its graphs would go.
+    parser.add_argument("--piecewise", action="store_true")
     args = parser.parse_args()
     if args.audit_state and (args.serial_verify_ops or args.tasks != ["gsm8k"]):
         parser.error("State audit requires unmodified greedy GSM8K generation")
@@ -415,7 +420,9 @@ def main():
             enable_expert_parallel=True,
             enforce_eager=False,
             compilation_config=CompilationConfig(
-                cudagraph_mode=CUDAGraphMode.PIECEWISE,
+                cudagraph_mode=(
+                    CUDAGraphMode.PIECEWISE if args.piecewise else CUDAGraphMode.FULL
+                ),
                 cudagraph_capture_sizes=[1, 2, 4],
             ),
             speculative_config=(
