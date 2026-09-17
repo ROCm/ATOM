@@ -511,7 +511,7 @@ models:
                 max_num_seqs: 32
                 max_num_batched_tokens: 8192
                 method: dspark
-                draft_model: "${ATOMESH_MODEL_ROOT}/Kimi-K3-DSpark"
+                draft_model: "${ATOMESH_MODEL_ROOT}/Inferact/Kimi-K3-DSpark"
                 num_speculative_tokens: 7
                 spec_decode_acceptance_length: 3.84
             prefill:
@@ -553,7 +553,7 @@ models:
               max_num_seqs: 32
               max_num_batched_tokens: 4096
               method: dspark
-              draft_model: "${ATOMESH_MODEL_ROOT}/Kimi-K3-DSpark"
+              draft_model: "${ATOMESH_MODEL_ROOT}/Inferact/Kimi-K3-DSpark"
               num_speculative_tokens: 3
               spec_decode_acceptance_length: 3.00
           prefill:
