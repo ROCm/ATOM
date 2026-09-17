@@ -1898,6 +1898,10 @@ class Scheduler:
         seq.status = SequenceStatus.WAITING
         if not self._connector_flag("is_offload"):
             self._uncount_inflight_load(seq)
+            # P/D fallback goes through can_allocate/allocate again. Release the
+            # receive reservation first, otherwise it either fails the empty
+            # block-table assertion or waits for space occupied by itself.
+            self.block_manager.deallocate(seq)
         if seq.offload_joint.load_hash != -1 or seq.offload_joint.boundary_tokens:
             # The state never arrived, so the boundary is not this request's
             # history. Disown it exactly as `BlockManager.allocate` does at

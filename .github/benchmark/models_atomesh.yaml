@@ -190,9 +190,9 @@ models:
       decode: {}
     service:
       prefill:
-        cudagraph_mode: FULL_AND_PIECEWISE
+        cudagraph_mode: FULL
       decode:
-        cudagraph_mode: FULL_AND_PIECEWISE
+        cudagraph_mode: FULL
     server:
       common_args:
         trust_remote_code: true
@@ -249,6 +249,7 @@ models:
 
         # Keep each AgentX concurrency in its own job so every measurement starts
         # from a fresh ATOM service instead of inheriting HBM prefix-cache state.
+        # Match the standalone TP4 recipe: MTP5, AL 3.61, and 2 * CONC sequences.
         - <<: &glm52_agentic_tp4_tp4
             topology: 1p1d
             pd_worker_layout: single_node
@@ -259,26 +260,33 @@ models:
               common_args: &glm52_agentic_args
                 kv_cache_dtype: fp8
                 block_size: 16
-                gpu_memory_utilization: 0.9
+                gpu_memory_utilization: 0.95
                 max_model_len: ""
-                max_num_seqs: 512
+                max_num_seqs: 2
                 enable_prefix_caching: true
-                decode_max_num_seqs: 512
-                max_num_batched_tokens: ""
-                decode_max_num_batched_tokens: ""
-                online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}'
-            prefill:
+                decode_max_num_seqs: 2
+                max_num_batched_tokens: 16384
+                decode_max_num_batched_tokens: 16384
+                online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*"]}'
+                extra_args: "--method mtp --num-speculative-tokens 5 --spec-decode-acceptance-length 3.61"
+            prefill: &glm52_agentic_tp4_worker
               workers: 1
               tp: 4
-            decode:
-              workers: 1
-              tp: 4
-              cudagraph: none
+              cudagraph: "[1,2]"
+            decode: *glm52_agentic_tp4_worker
             env:
+              common:
+                PYTHONNOUSERSITE: "1"
+                PYTHONHASHSEED: "0"
+                # Keep the recipe's offload settings; the PD connector is Mooncake.
+                LMCACHE_LOCAL_CPU: "True"
+                LMCACHE_NUMA_MODE: auto
+                LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
+                LMCACHE_CHUNK_SIZE: "256"
+                OFFLOAD_MIN_LOAD_TOKENS: "8192"
               prefill:
                 HIP_VISIBLE_DEVICES: "0,1,2,3"
               decode:
-                MAX_JOBS: "16"
                 HIP_VISIBLE_DEVICES: "4,5,6,7"
             benchmark: &agentic_1m_aiperf
               kind: aiperf_agentic
@@ -306,28 +314,45 @@ models:
             run_eval: false
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c1
           concurrency: [1]
-          server:
-            common_args: &glm52_agentic_mtp_args
-              <<: *glm52_agentic_args
-              extra_args: "--method mtp --num-speculative-tokens 4 --spec-decode-acceptance-rate 0.5825"
 
         - <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c2
           concurrency: [2]
           server:
-            common_args: *glm52_agentic_mtp_args
+            common_args:
+              <<: *glm52_agentic_args
+              max_num_seqs: 4
+              decode_max_num_seqs: 4
+          prefill: &glm52_agentic_tp4_c2_worker
+            <<: *glm52_agentic_tp4_worker
+            cudagraph: "[1,2,4]"
+          decode: *glm52_agentic_tp4_c2_worker
 
         - <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c4
           concurrency: [4]
           server:
-            common_args: *glm52_agentic_mtp_args
+            common_args:
+              <<: *glm52_agentic_args
+              max_num_seqs: 8
+              decode_max_num_seqs: 8
+          prefill: &glm52_agentic_tp4_c4_worker
+            <<: *glm52_agentic_tp4_worker
+            cudagraph: "[1,2,4,8]"
+          decode: *glm52_agentic_tp4_c4_worker
 
         - <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c8
           concurrency: [8]
           server:
-            common_args: *glm52_agentic_mtp_args
+            common_args:
+              <<: *glm52_agentic_args
+              max_num_seqs: 16
+              decode_max_num_seqs: 16
+          prefill: &glm52_agentic_tp4_c8_worker
+            <<: *glm52_agentic_tp4_worker
+            cudagraph: "[1,2,4,8,12,16]"
+          decode: *glm52_agentic_tp4_c8_worker
 
         # CPP4 prefill (PP4 x TP1) paired with TP4+DCP4 decode on one node.
         - &glm52_agentic_lmcache_cpp4_dcp4
@@ -417,6 +442,19 @@ models:
           topology: 1p1d_dpa
           pd_worker_layout: single_node
           concurrency: [24]
+          # Keep the DPA settings independent of the small-concurrency TP4 recipe.
+          server:
+            common_args:
+              kv_cache_dtype: fp8
+              block_size: 16
+              gpu_memory_utilization: 0.9
+              max_model_len: ""
+              max_num_seqs: 512
+              enable_prefix_caching: true
+              decode_max_num_seqs: 512
+              max_num_batched_tokens: ""
+              decode_max_num_batched_tokens: ""
+              online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}'
           prefill:
             workers: 1
             tp: 4
