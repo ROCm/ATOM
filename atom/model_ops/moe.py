@@ -2165,14 +2165,83 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
         # Standard Triton weight/forward paths must not preempt it.
         self.use_triton = False
         self.use_triton_decode = False
+        self._hybrid_enabled = envs.ATOM_MEGA_HYBRID_ENABLE
+        gfx = get_gfx()
+        if self._hybrid_enabled and gfx != "gfx950":
+            logger.warning(
+                "ATOM_MEGA_HYBRID_ENABLE=1 requested but arch=%r is not "
+                "gfx950 (gfx1250 has its own separate mega kernel "
+                "implementation, mega_moe_gfx1250, that this hybrid dispatch "
+                "was never built or tested against) -- falling back to "
+                "mega-only.",
+                gfx,
+            )
+            self._hybrid_enabled = False
+        if self._hybrid_enabled and not self.is_guinterleave:
+            # Without ATOM_MOE_GU_ITLV=1, mega's and standard's weight
+            # layouts aren't byte-identical, so hybrid would need to retain
+            # both full weight copies (+90GB on DeepSeek-V4-Pro) instead of
+            # aliasing one onto the other. That memory increase's
+            # performance impact (VRAM pressure, allocator behavior) hasn't
+            # been validated, so -- same as the gfx1250 guard above --
+            # decline rather than silently pay an unvalidated cost.
+            # (This also sidesteps the EPLB case: get_eplb_weight_views only
+            # migrates the mega-side views, so EPLB would silently stale the
+            # standard copy after the first rebalance if hybrid ran here.)
+            logger.warning(
+                "ATOM_MEGA_HYBRID_ENABLE=1 requires ATOM_MOE_GU_ITLV=1 (the "
+                "aliased weight-layout path); without it hybrid would need "
+                "to retain both mega and standard weight copies (+90GB on "
+                "DeepSeek-V4-Pro) with unvalidated performance impact -- "
+                "falling back to mega-only."
+            )
+            self._hybrid_enabled = False
 
     def _process_weight_layout_after_loading(self, layer) -> None:
         from atom.model_ops.fused_moe.flydsl_mega_experts import build_mega_weights
 
-        build_mega_weights(layer)
+        if self._hybrid_enabled:
+            # On gfx950 with is_guinterleave=True, mega's and standard's
+            # weight-shuffle transforms are byte-identical, so _mega_* can
+            # alias the standard-shuffled tensors instead of duplicating them.
+            layouts_are_identical = self.is_guinterleave and not self.is_gfx1250
+            if layouts_are_identical:
+                super()._process_weight_layout_after_loading(layer)
+                layer._mega_w1 = layer.w13_weight.data
+                layer._mega_w1_scale = layer.w13_weight_scale.data
+                layer._mega_w2 = layer.w2_weight.data
+                layer._mega_w2_scale = layer.w2_weight_scale.data
+                logger.info(
+                    "Prepared MegaMoE weights for fused MoE layer (hybrid: "
+                    "_mega_* aliased onto the standard layout, no duplicate "
+                    "weight memory -- is_guinterleave=True, arch=%s)",
+                    "gfx1250" if self.is_gfx1250 else "gfx9xx",
+                )
+            else:
+                # Not reachable in practice: __init__ already falls back to
+                # mega-only whenever not is_guinterleave, and to mega-only
+                # on any non-gfx950 arch, so _hybrid_enabled here implies
+                # is_guinterleave=True and not is_gfx1250 -- i.e.
+                # layouts_are_identical is always True. Kept as
+                # defense-in-depth in case those guards are ever bypassed.
+                # Layouts differ: build_mega_weights needs the raw,
+                # pre-shuffle layout, so it must run before super() shuffles
+                # w13_weight/w2_weight in place for the standard fallback.
+                build_mega_weights(layer)
+                super()._process_weight_layout_after_loading(layer)
+                logger.warning(
+                    "Prepared MegaMoE weights for fused MoE layer (hybrid: "
+                    "mega and standard layouts differ under this config "
+                    "[is_guinterleave=%s, gfx1250=%s] -- both copies retained, "
+                    "full extra weight memory paid)",
+                    self.is_guinterleave,
+                    self.is_gfx1250,
+                )
+            return
 
         # Mega reads only _mega_* weights. Release the raw AITER weight copies
         # and skip the standard shuffle so both layouts are not retained.
+        build_mega_weights(layer)
         layer.w13_weight.data = torch.empty(
             0, dtype=layer.w13_weight.dtype, device=layer.w13_weight.device
         )
@@ -2187,16 +2256,43 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
         # installs itself as the whole-pipeline `fused_experts` backend, so the
         # post-routing tail of the inherited `apply` dispatches to it exactly the
         # way it dispatches to the MORI modular kernel.
-        from atom.model_ops.fused_moe.flydsl_mega_experts import MegaFusedExperts
+        from atom.model_ops.fused_moe.flydsl_mega_experts import (
+            HybridFusedExperts,
+            MegaFusedExperts,
+        )
 
-        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
-        self.fused_experts = MegaFusedExperts(
+        standard_experts = None
+        if self._hybrid_enabled:
+            # Build the standard backend first, then reset fused_experts so
+            # the base class's None-before-assignment assert doesn't fire
+            # when mega is built below.
+            super().init_prepare_finalize(layer)
+            standard_experts = self.fused_experts
+            self.fused_experts = None
+        else:
+            self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+
+        mega_experts = MegaFusedExperts(
             layer,
             model_dim=self.hidden_size,
             inter_dim=self.intermediate_size,
             mtpr=self.moe.max_num_tokens,
             quant="a8w4",
         )
+
+        if standard_experts is None:
+            self.fused_experts = mega_experts
+        else:
+            self.fused_experts = HybridFusedExperts(
+                mega=mega_experts,
+                standard=standard_experts,
+                min_tokens=envs.ATOM_MEGA_HYBRID_MIN_TOKENS,
+            )
+            logger.info(
+                "MegaMoE hybrid dispatch enabled: mega for steps with "
+                "max(running_tokens_across_dp) >= %d tokens, standard below.",
+                envs.ATOM_MEGA_HYBRID_MIN_TOKENS,
+            )
 
     def get_eplb_weight_views(self, layer: torch.nn.Module) -> list[torch.Tensor]:
         """Return expert-major views owned by EPLB."""
