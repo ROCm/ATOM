@@ -1165,3 +1165,33 @@ def test_no_dummy_args_leaves_the_launch_line_untouched(workspace, fake_docker):
     ]
     assert len(launch) == 1
     assert launch[0].rstrip().endswith("--kv_cache_dtype fp8 -tp 8 --method mtp")
+
+
+def test_every_job_below_the_gate_reads_the_gate_decision():
+    """The label gate only bites if each job checks its output.
+
+    `check_heavy_ci_gate.sh` exits 0 whether or not the PR carries `ci:perf` --
+    an unlabelled PR is not a failure, it is a PR that did not ask for a
+    benchmark -- and writes the verdict to `should_run`. So `needs: gate`
+    gates nothing on its own: `needs` blocks on failure, and the gate never
+    fails. Without this test the workflow reads as gated and runs 25 GPU jobs
+    on every push -- which is what it did until this test was added, with the
+    label doing nothing at all.
+    """
+    import yaml
+
+    workflow = yaml.safe_load(
+        (REPO / ".github" / "workflows" / "atom-perf-check.yaml").read_text()
+    )
+    assert (
+        workflow["jobs"]["gate"]["outputs"]["should_run"]
+        == "${{ steps.gate.outputs.should_run }}"
+    )
+    for name, job in workflow["jobs"].items():
+        if name == "gate":
+            continue
+        assert "gate" in job["needs"], f"{name} must depend on the gate"
+        assert "needs.gate.outputs.should_run == 'true'" in job["if"], (
+            f"{name} lists the gate in `needs` but never reads its decision, "
+            "so it runs on unlabelled PRs"
+        )

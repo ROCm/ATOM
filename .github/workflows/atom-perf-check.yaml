@@ -110,10 +110,18 @@ jobs:
     name: perf-check-gate
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # The script always exits 0 -- an unlabelled PR is not a failure, it is a
+    # PR that did not ask for a benchmark. So the decision travels as an
+    # output, and every job below it is gated on that output. Listing gate in
+    # `needs` alone gates nothing: `needs` only blocks on failure.
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+      reason: ${{ steps.gate.outputs.reason }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Require the ci:perf label
+        id: gate
         env:
           # Deliberately NOT ci:full -- that label already fans out the heavy
           # accuracy suites, and folding a paired benchmark into it would double
@@ -125,6 +133,7 @@ jobs:
   build-matrix:
     name: Build perf matrix
     needs: gate
+    if: ${{ needs.gate.outputs.should_run == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -194,6 +203,7 @@ jobs:
   paired-bench:
     name: ${{ matrix.cell.display }} c=${{ matrix.cell.conc }}
     needs: [gate, build-matrix]
+    if: ${{ needs.gate.outputs.should_run == 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -412,8 +422,11 @@ jobs:
     # gate must stay in `needs` even though paired-bench already depends on it:
     # `needs.gate` is only in scope for jobs that list it, so referencing it
     # below without this is an unresolved expression, not a false condition.
+    # And it must read `.outputs.should_run`, not `.result`: the gate succeeds
+    # whether or not the label is there, so `.result == 'success'` would post a
+    # judgement on every push to an unlabelled PR.
     needs: [gate, paired-bench]
-    if: always() && needs.gate.result == 'success'
+    if: always() && needs.gate.outputs.should_run == 'true'
     runs-on: ubuntu-latest        # pure CPU, seconds
     timeout-minutes: 15
     steps:
