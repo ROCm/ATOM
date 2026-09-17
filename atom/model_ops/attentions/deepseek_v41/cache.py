@@ -147,12 +147,26 @@ class PagedAttentionCache:
         # `[slot count, end + history]`, staged rather than built per step: a
         # fresh `torch.as_tensor` per forward is a fresh allocation and a fresh
         # pageable copy, and a batch can hold at most one request per slot.
+        pinned = torch.device(device).type != "cpu"
         self._cursor_staging = CpuGpuBuffer(
             slots,
             self.cursor.shape[1],
             dtype=self.cursor.dtype,
             device=device,
-            pin_memory=torch.device(device).type != "cpu",
+            pin_memory=pinned,
+        )
+        # The same, for a verify step's candidate cursors: one row per prefix
+        # a request could have accepted, plus the length that bounds it.
+        self.tentative_staging = CpuGpuBuffer(
+            slots,
+            geometry.speculative_tokens + 1,
+            self.cursor.shape[1],
+            dtype=self.cursor.dtype,
+            device=device,
+            pin_memory=pinned,
+        )
+        self.tentative_limits = CpuGpuBuffer(
+            slots, dtype=self.cursor.dtype, device=device, pin_memory=pinned
         )
         self.pool = (
             self.backing.view(-1, 1)
@@ -351,7 +365,7 @@ class PagedAttentionCache:
                     f"found {cursors[i, 0]}; replay from a recoverable boundary"
                 )
         if step.tentative:
-            self.pending = TentativeState(self, step)
+            self.pending = TentativeState(self, step, cursors[:, 1:])
         return cursors[:, 1:]
 
     def advance_cursor(self, step, histories):
