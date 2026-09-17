@@ -5,9 +5,9 @@
 
 import json
 import os
-import textwrap
 import subprocess
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -52,14 +52,22 @@ class SlurmResultsTest(unittest.TestCase):
     def test_accounting_interfaces(self):
         cases = [
             (
-                {"USES_SPUR_CONTROLLER": "1", "SLURM_ACCOUNT": "amd-aifw-dev",
-                 "SPUR_CONTROLLER_ADDR": "http://controller:6817"},
-                "--controller http://controller:6817 -j 5147 --noheader "
-                "--format JobID%30,State%30,ExitCode%20 --account amd-aifw-dev",
+                {
+                    "USES_SPUR_CONTROLLER": "1",
+                    "SLURM_ACCOUNT": "amd-aifw-dev",
+                    "SPUR_CONTROLLER_ADDR": "http://controller:6817",
+                },
+                (
+                    "--controller http://controller:6817 -j 5147 --noheader "
+                    "--format JobID%30,State%30,ExitCode%20 --account amd-aifw-dev"
+                ),
                 "999 FAILED 1:0\n5147 COMPLETED 0:0",
             ),
             (
-                {"USES_SPUR_CONTROLLER": "1", "SPUR_ACCOUNTING_ADDR": "http://legacy:6819"},
+                {
+                    "USES_SPUR_CONTROLLER": "1",
+                    "SPUR_ACCOUNTING_ADDR": "http://legacy:6819",
+                },
                 "-j 5147 --noheader --format JobID%30,State%30,ExitCode%20",
                 "5147 CANCELLED -1:0",
             ),
@@ -199,34 +207,50 @@ class SlurmMonitoringTest(unittest.TestCase):
         (self.root / "replies").write_text(json.dumps(replies))
         return subprocess.run(
             ["bash", "-c", 'set -euo pipefail\nsource "$HELPERS"\n' + script],
+            check=False,
             env={
                 "PATH": str(self.bin) + os.pathsep + os.environ["PATH"],
-                "HELPERS": str(HELPERS), "TEST_DIR": str(self.root),
-                "JOB_ID": "831", "CURRENT_USER": "test",
-                "SLURM_JOB_ACTIVE": "1", "SLURM_JOB_NAME": "test-job",
+                "HELPERS": str(HELPERS),
+                "TEST_DIR": str(self.root),
+                "JOB_ID": "831",
+                "CURRENT_USER": "test",
+                "SLURM_JOB_ACTIVE": "1",
+                "SLURM_JOB_NAME": "test-job",
                 "SLURM_CANCEL_HELPER": str(self.root / "cancel.sh"),
                 "SLURM_JOB_OUTPUT": str(self.root / "job.out"),
                 "SLURM_JOB_ERROR": str(self.root / "job.err"),
-                "SLURM_SQUEUE_RETRY_INTERVAL": "0", "SLURM_LOG_POLL_INTERVAL": "0",
-                "SLURM_ACCOUNTING_TIMEOUT": "0", "SLURM_CANCEL_WAIT_SECONDS": "0",
-                "SLURM_SQUEUE_INITIAL_ATTEMPTS": "2", "SLURM_STATUS_UNKNOWN_TIMEOUT": "0",
+                "SLURM_SQUEUE_RETRY_INTERVAL": "0",
+                "SLURM_LOG_POLL_INTERVAL": "0",
+                "SLURM_ACCOUNTING_TIMEOUT": "0",
+                "SLURM_CANCEL_WAIT_SECONDS": "0",
+                "SLURM_SQUEUE_INITIAL_ATTEMPTS": "2",
+                "SLURM_STATUS_UNKNOWN_TIMEOUT": "0",
                 **env,
-            }, capture_output=True, text=True, timeout=15,
+            },
+            capture_output=True,
+            text=True,
+            timeout=15,
         )
 
     def calls(self, command):
-        return [x for x in map(json.loads, (self.root / "calls").read_text().splitlines())
-                if x[0] == command]
+        return [
+            x
+            for x in map(json.loads, (self.root / "calls").read_text().splitlines())
+            if x[0] == command
+        ]
 
     def test_backend_detection_from_client(self):
-        result = self.run_script('detect_slurm_backend; echo "backend=$USES_SPUR_CONTROLLER"',
-                                 {"help": "Administrative control for Spur"})
+        result = self.run_script(
+            'detect_slurm_backend; echo "backend=$USES_SPUR_CONTROLLER"',
+            {"help": "Administrative control for Spur"},
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("backend=1", result.stdout)
 
     def test_native_backend_detection(self):
         result = self.run_script(
-            'detect_slurm_backend; echo "backend=$USES_SPUR_CONTROLLER"', {},
+            'detect_slurm_backend; echo "backend=$USES_SPUR_CONTROLLER"',
+            {},
             SPUR_CONTROLLER_ADDR="http://inherited-but-unused:6817",
         )
         self.assertIn("backend=0", result.stdout)
@@ -234,9 +258,11 @@ class SlurmMonitoringTest(unittest.TestCase):
     def test_configured_controller_list_is_preserved(self):
         addresses = "http://controller-a:6817,http://controller-b:6817"
         result = self.run_script(
-            'detect_slurm_backend; query_slurm_accounting_job 831',
-            {"help": "Administrative control for Spur",
-             "sacct": [{"out": "999 FAILED 1:0\n831 CANCELLED -1:0"}]},
+            "detect_slurm_backend; query_slurm_accounting_job 831",
+            {
+                "help": "Administrative control for Spur",
+                "sacct": [{"out": "999 FAILED 1:0\n831 CANCELLED -1:0"}],
+            },
             SPUR_CONTROLLER_ADDR=addresses,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -247,7 +273,7 @@ class SlurmMonitoringTest(unittest.TestCase):
 
     def test_missing_queue_entry_does_not_finish_running_job(self):
         result = self.run_script(
-            'install_slurm_cancel_traps; monitor_slurm_job 831; read_slurm_exit_code 831; '
+            "install_slurm_cancel_traps; monitor_slurm_job 831; read_slurm_exit_code 831; "
             'echo "result=$SLURM_STATE|$SLURM_JOB_RC"',
             {
                 "squeue": [{"out": "831|PENDING|0:00|1|(None)"}, {}, {}, {}],
@@ -266,32 +292,45 @@ class SlurmMonitoringTest(unittest.TestCase):
         self.assertFalse(self.calls("sacct"))
 
     def test_query_error_recovers_and_keeps_diagnostics(self):
-        result = self.run_script('install_slurm_cancel_traps; monitor_slurm_job 831', {
-            "squeue": [{"rc": 1, "err": "transport unavailable"}, {}],
-            "scontrol": [{"out": "JobId=831 JobState=RUNNING ExitCode=0:0"},
-                         {"out": "JobId=831 JobState=COMPLETED ExitCode=0:0"}],
-        })
+        result = self.run_script(
+            "install_slurm_cancel_traps; monitor_slurm_job 831",
+            {
+                "squeue": [{"rc": 1, "err": "transport unavailable"}, {}],
+                "scontrol": [
+                    {"out": "JobId=831 JobState=RUNNING ExitCode=0:0"},
+                    {"out": "JobId=831 JobState=COMPLETED ExitCode=0:0"},
+                ],
+            },
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("transport unavailable", result.stderr)
         self.assertFalse(self.calls("scancel"))
 
     def test_status_outage_preserves_job_and_marks_infrastructure_failure(self):
-        result = self.run_script('install_slurm_cancel_traps; monitor_slurm_job 831', {
-            "squeue": [{"rc": 1, "err": "queue offline"}],
-            "scontrol": [{"rc": 1, "err": "controller offline"}],
-            "sacct": [{"rc": 1, "err": "accounting offline"}],
-        })
+        result = self.run_script(
+            "install_slurm_cancel_traps; monitor_slurm_job 831",
+            {
+                "squeue": [{"rc": 1, "err": "queue offline"}],
+                "scontrol": [{"rc": 1, "err": "controller offline"}],
+                "sacct": [{"rc": 1, "err": "accounting offline"}],
+            },
+        )
         self.assertEqual(result.returncode, 75, result.stderr)
         for error in ("queue offline", "controller offline", "accounting offline"):
             self.assertIn(error, result.stderr)
-        self.assertEqual((self.root / "cancel.sh.status-unknown").read_text().strip(), "831")
+        self.assertEqual(
+            (self.root / "cancel.sh.status-unknown").read_text().strip(), "831"
+        )
         self.assertFalse(self.calls("scancel"))
 
     def test_evicted_job_uses_accounting_terminal_state(self):
         result = self.run_script(
             'monitor_slurm_job 831; read_slurm_exit_code 831; echo "result=$SLURM_STATE|$SLURM_JOB_RC"',
-            {"squeue": [{}], "scontrol": [{}],
-             "sacct": [{"out": "1000|COMPLETED|0:0\n831|FAILED|7:0"}]},
+            {
+                "squeue": [{}],
+                "scontrol": [{}],
+                "sacct": [{"out": "1000|COMPLETED|0:0\n831|FAILED|7:0"}],
+            },
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("result=FAILED|7", result.stdout)
@@ -301,14 +340,18 @@ class SlurmMonitoringTest(unittest.TestCase):
         (self.root / "rank-rc-0").write_text("0\n")
         result = self.run_script(
             'monitor_slurm_job 831; read_slurm_exit_code 831; echo "result=$SLURM_JOB_RC"',
-            {}, SLURM_STATUS_DIR=str(self.root), SLURM_STATUS_RANKS="1",
+            {},
+            SLURM_STATUS_DIR=str(self.root),
+            SLURM_STATUS_RANKS="1",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("result=0", result.stdout)
 
     def test_explicit_cancellation_still_cancels(self):
-        result = self.run_script('install_slurm_cancel_traps; on_slurm_cancel TERM 143',
-                                 {"squeue": [{}], "scancel": [{}]})
+        result = self.run_script(
+            "install_slurm_cancel_traps; on_slurm_cancel TERM 143",
+            {"squeue": [{}], "scancel": [{}]},
+        )
         self.assertEqual(result.returncode, 143, result.stderr)
         self.assertTrue(self.calls("scancel"))
 
@@ -318,8 +361,10 @@ class SlurmMonitoringTest(unittest.TestCase):
         end = workflow.index("          trap cleanup_slurm_from_wrapper EXIT", start)
         cleanup = textwrap.dedent(workflow[start:end])
         script = (
-            'scancel_slurm_by_name_from_wrapper() { scancel --name test-job; }\n'
-            'PD_SUBMIT_PID=""\n' + cleanup + '\ntrap cleanup_slurm_from_wrapper EXIT\nexit 75'
+            "scancel_slurm_by_name_from_wrapper() { scancel --name test-job; }\n"
+            'PD_SUBMIT_PID=""\n'
+            + cleanup
+            + "\ntrap cleanup_slurm_from_wrapper EXIT\nexit 75"
         )
         (self.root / "cancel.sh.status-unknown").write_text("831\n")
         result = self.run_script(script, {"scancel": [{}]})
@@ -335,8 +380,9 @@ class SlurmMonitoringTest(unittest.TestCase):
         path = self.bin / "scontrol"
         path.write_text("#!/bin/sh\nexec sleep 30\n")
         path.chmod(0o755)
-        result = self.run_script('query_slurm_controller_job 831', {},
-                                 SLURM_QUERY_TIMEOUT_SECONDS="0.1")
+        result = self.run_script(
+            "query_slurm_controller_job 831", {}, SLURM_QUERY_TIMEOUT_SECONDS="0.1"
+        )
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("scontrol query failed", result.stderr)
 
