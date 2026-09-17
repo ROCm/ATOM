@@ -15,6 +15,7 @@ _ATOM_ENV_VARS = [
     "ATOM_DP_BASE_PORT",
     "ATOM_USE_TRITON_GEMM",
     "ATOM_USE_TRITON_MXFP4_BMM",
+    "ATOM_USE_V4_PREFILL_ASM_FOR_DECODE",
     "ATOM_MHC_USE_BF16",
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION",
     "ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION",
@@ -79,6 +80,9 @@ class TestEnvsDefaults:
 
     def test_use_triton_gemm_default(self):
         assert _get_envs().ATOM_USE_TRITON_GEMM is False
+
+    def test_use_v4_prefill_asm_for_decode_default_disabled(self):
+        assert _get_envs().ATOM_USE_V4_PREFILL_ASM_FOR_DECODE is False
 
     def test_ds_input_rmsnorm_quant_fusion_default_enabled(self):
         assert _get_envs().ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is True
@@ -149,6 +153,10 @@ class TestEnvsOverrides:
         monkeypatch.setenv("ATOM_DP_BASE_PORT", "29800")
         assert _get_envs().ATOM_DP_MASTER_PORT == 29700
         assert _get_envs().ATOM_DP_BASE_PORT == 29800
+
+    def test_use_v4_prefill_asm_for_decode_enabled(self, monkeypatch):
+        monkeypatch.setenv("ATOM_USE_V4_PREFILL_ASM_FOR_DECODE", "1")
+        assert _get_envs().ATOM_USE_V4_PREFILL_ASM_FOR_DECODE is True
 
     def test_torch_profiler_dir_override(self, monkeypatch):
         monkeypatch.setenv("ATOM_TORCH_PROFILER_DIR", "/tmp/prof")

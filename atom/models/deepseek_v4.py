@@ -3143,8 +3143,9 @@ class DeepseekV4Attention(nn.Module):
                 kv_indices = attn_md.kv_indices_hca
                 kv_indptr = attn_md.kv_indptr_hca
             # Dispatch on kv-cache layout inside the wrapper: fp8 2buff
-            # (unified_kv_rope set) → aiter asm op5 with pre-packed fp8 Q + the
-            # 2buff fp8/bf16 pools read with no requant; bf16 (unified_kv_rope
+            # (unified_kv_rope set) → aiter ASM with pre-packed fp8 Q + the
+            # 2buff fp8/bf16 pools read with no requant. The optional H=128
+            # prefill-ASM decode route also consumes the shared empty CSR.
             o = sparse_attn_v4_paged_decode(
                 qkn.q_sa,
                 self.unified_kv,
@@ -3156,6 +3157,7 @@ class DeepseekV4Attention(nn.Module):
                 q_packed_in=qkn.q_packed,
                 q_rope_in=qkn.q_rope,
                 qo_indptr=attn_md.qo_indptr,
+                empty_kv_indptr=attn_md.empty_kv_indptr,
                 prefix=f"{self.layer_name}.sparse_attn_decode",
             )  # [S, H, head_dim]
         else:

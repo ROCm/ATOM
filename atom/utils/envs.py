@@ -497,6 +497,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FORCE_V4_PREFILL_OPUS": lambda: (
         os.getenv("ATOM_FORCE_V4_PREFILL_OPUS", "0") == "1"
     ),
+    # Reuse the gfx1250 H=128 sparse-prefill ASM kernel for DeepSeek-V4 fp8
+    # decode. Ineligible shapes keep the dedicated decode ASM path.
+    "ATOM_USE_V4_PREFILL_ASM_FOR_DECODE": lambda: (
+        os.getenv("ATOM_USE_V4_PREFILL_ASM_FOR_DECODE", "0") == "1"
+    ),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
