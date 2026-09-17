@@ -259,6 +259,7 @@ def build_cell(
     required_nodes = required_node_count(pd_worker_layout, prefill_cfg, decode_cfg)
     slurm_submit_runner = str(runner_cfg.get("slurm_submit_runner", ""))
     allow_auto_nodes = slurm_submit_runner in {
+        "atomesh-cicd",
         "atomesh-cicd-mi350",
         "atomesh-cicd-mi355-crusoe",
     }
@@ -271,7 +272,7 @@ def build_cell(
             raise ValueError("ATOMESH_SINGLE_NODE must specify exactly one node")
     else:
         nodes = resolve_nodes(suite_cfg.get("nodes"))
-        if allow_auto_nodes and not requires_explicit_candidate_nodes:
+        if slurm_submit_runner == "atomesh-cicd-mi355-crusoe":
             nodes = []
     if allow_auto_nodes and requires_explicit_candidate_nodes:
         if not nodes:
@@ -312,7 +313,9 @@ def build_cell(
             f"{suite_cfg.get('name', model_name)} needs at least "
             f"{required_nodes} node(s)"
         )
-    num_nodes = required_nodes if allow_auto_nodes else len(nodes)
+    num_nodes = (
+        required_nodes if not nodes or requires_explicit_candidate_nodes else len(nodes)
+    )
 
     server_args = deep_merge(
         model_cfg.get("server", {}).get("common_args", {}),
