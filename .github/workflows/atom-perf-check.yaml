@@ -18,6 +18,22 @@ name: ATOM Perf Check (PR)
 # container, and no new script duplicating benchmark-tmpl.yml's launch/bench
 # logic -- atom_test.sh already does all of it.
 #
+# This workflow does not produce absolute numbers, by design. Three lines
+# divide the work: atom-benchmark.yaml runs real weights nightly and owns the
+# dashboard and every figure quoted outside the repo; this one, and the
+# per-commit check that will follow it, are regression detectors -- they answer
+# "did this move against its own pair" and nothing else. Which is why dummy
+# weights are the right trade here and would not be there.
+#
+# The comparison is to an aiter operator test: synthetic inputs, deterministic
+# behaviour, repeatability bought with realism. One difference is worth keeping
+# in view. An operator test covers each operator explicitly, on shapes and
+# distributions chosen for it. This is one synthetic workload whose operator
+# mix `--fake-eplb` has changed -- MoE grouped-GEMM is amplified because every
+# expert is lit each step, and attention's share is correspondingly damped. So
+# the sensitivity this line offers is not uniform across operators, and a claim
+# that it covers attention-side regressions would need its own evidence.
+#
 # Weights are loaded dummy (`DUMMY_WEIGHT_ARGS`, appended to every phase by
 # perf_check_half.sh). Model load is 76% of the benchmark it precedes on these
 # runners -- 297s median against a 369s DeepSeek-V4-Pro cell, measured from 31
