@@ -77,6 +77,12 @@ def _v4_rope_head_dim(hf_config) -> int:
     return int(getattr(hf_config, "qk_rope_head_dim", 64))
 
 
+# What `DeepseekV4Args` uses when the HF config carries no `index_topk`, so
+# readers that only see `hf_config` agree with the model on how many rows the
+# sparse indexer selects per token.
+_V4_DEFAULT_INDEX_TOPK = 1024
+
+
 def deepseek_v4_draft_proxy_layer_name(hf_config) -> str:
     return (
         f"model.layers.{int(hf_config.num_hidden_layers)}."
@@ -111,6 +117,41 @@ def _v4_spec_steps(vllm_config) -> int:
 
 def _v4_win_with_spec(vllm_config, window_size: int) -> int:
     return int(window_size) + _v4_spec_steps(vllm_config)
+
+
+def v4_prefix_warmup_tokens(vllm_config) -> int:
+    """Tokens a resumed request must forward into its own state before reuse.
+
+    Must equal what ``deepseek_v4_prefix_patch.apply_vllm_v4_prefix_swa_patch``
+    withholds from a local prefix hit, because both answers describe the same
+    requirement and a request that satisfies one but not the other is served
+    from state nobody rebuilt. Same inputs and the same override, so the two
+    can only disagree if that patch's formula changes -- which is why the
+    offload path asks here rather than carrying a constant of its own.
+
+    Two independent floors, hence the max: the SWA ring's stride
+    (``win_with_spec``), and ``index_topk``, which is the binding one on
+    DeepSeek-V4-Flash and is empirical -- below it the sparse indexer emits
+    another request's content rather than merely stale window data.
+    """
+    import math
+    import os
+
+    hf = vllm_config.model_config.hf_config
+    win_with_spec = _v4_win_with_spec(
+        vllm_config, int(getattr(hf, "sliding_window", 128) or 128)
+    )
+    # 1024, not 0, when the HF config omits it: that is what `DeepseekV4Args`
+    # defaults to, so the indexer really does select 1024 rows per token. A 0
+    # fallback would leave both reuse paths withholding the 128-token window
+    # floor while the indexer reads 1024 tokens of history the request never
+    # forwarded.
+    index_topk = int(getattr(hf, "index_topk", None) or _V4_DEFAULT_INDEX_TOPK)
+    blocks = math.ceil(max(win_with_spec, index_topk) / ATOM_DEEPSEEK_V4_BLOCK_SIZE)
+    override = os.environ.get("ATOM_V4_PREFIX_WARMUP_BLOCKS")
+    if override:
+        blocks = int(override)
+    return max(0, blocks) * ATOM_DEEPSEEK_V4_BLOCK_SIZE
 
 
 def _v4_state_layout(vllm_config, kv_fp8: bool):
@@ -422,6 +463,15 @@ def slice_deepseek_v4_proxy_cache_views(
     return {
         "geometry": geometry,
         "state_arena": arena,
+        # The planes and block count themselves, which the per-layer views
+        # below cannot reconstruct. A KV connector describes a transfer unit as
+        # a base pointer plus a stride, so it needs the plane a block's
+        # envelope lives in -- not a layer's slice of it. Native holds the
+        # equivalent as `_kv_planes()` (see
+        # `deepseek_v4_attn.get_kv_transfer_tensors`).
+        "kv_plane": kv_plane,
+        "kv_plane_rope": kv_plane_rope,
+        "num_blocks": num_blocks,
         "unified": unified,
         "csa_main": csa_main,
         "csa_indexer": csa_indexer,
@@ -902,6 +952,10 @@ def bind_deepseek_v4_proxy_cache_views(
     # the bridge cannot read from common_attn_metadata.
     if not hasattr(model, "_atom_v4_slot_allocator"):
         model._atom_v4_slot_allocator = _V4StateSlotAllocator(num_slots)
+    # Also publish it module-side: the LMCache offload connector has to resolve
+    # a request's state slot and is handed no model reference.
+    global ATOM_V4_SLOT_ALLOCATOR
+    ATOM_V4_SLOT_ALLOCATOR = model._atom_v4_slot_allocator
     window_size = int(model.args.window_size)
     win_with_spec = _v4_win_with_spec(vllm_config, window_size)
     # Single fp8 authority for the whole bind (must agree with the _proxy_page_bytes
@@ -1199,6 +1253,10 @@ def _make_compress_plans(
     return plans
 
 
+# Set on model bind, for readers outside the forward path (LMCache offload).
+ATOM_V4_SLOT_ALLOCATOR = None
+
+
 class _V4StateSlotAllocator:
     """Stable per-request state-slot allocator over ``[0, num_slots)``.
 
@@ -1231,6 +1289,18 @@ class _V4StateSlotAllocator:
         self._free: list[int] = list(range(self.num_slots - 1, -1, -1))
         self._last_seen: list[int] = [-1] * self.num_slots
         self._step = 0
+        # Keys batched in the most recent `assign`, so `reserve` -- which is
+        # called with no batch of its own -- can still honour the class's
+        # "a live request never loses its slot" rule.
+        self._live_keys: set = set()
+        # Eviction bookkeeping. `_live_keys` is the previous batch, not the
+        # true live set, so an eviction can land on a request that is still
+        # in flight -- silently clearing its window and compressor state.
+        # Remember every key that loses a slot; if it comes back to `assign`
+        # with tokens already computed, that eviction corrupted it.
+        self._evicted: dict[object, int] = {}
+        self.stat_evictions = 0
+        self.stat_live_victims = 0
 
     def assign(self, req_keys, num_computed):
         """Return ``(slots: np.int32[num_reqs], reset_slots: set[int])``.
@@ -1252,6 +1322,7 @@ class _V4StateSlotAllocator:
         )
         n = len(keys)
         active = set(keys)
+        self._live_keys = active
         key_to_slot = self._key_to_slot
         slot_to_key = self._slot_to_key
         last_seen = self._last_seen
@@ -1262,6 +1333,28 @@ class _V4StateSlotAllocator:
             k = keys[i]
             slot = key_to_slot.get(k)
             if slot is None:
+                # Reaching a forward with computed tokens and no slot is the
+                # normal case for reuse, not a fault: a local prefix hit and a
+                # CPU load both hand the request a prefix it did not forward,
+                # and it binds a fresh slot here to rebuild its ring into.
+                # Nothing was restored into a slot under its id, so there is
+                # nothing for it to have missed. This used to warn, on the
+                # premise that a restore had reserved the slot first.
+                stolen_at = self._evicted.pop(k, None)
+                if stolen_at is not None and nc[i] > 0:
+                    self.stat_live_victims += 1
+                    logger.warning(
+                        "ATOM V4 slot theft: req %s lost its state slot at "
+                        "step %d and is back at step %d with %d tokens "
+                        "already computed; its window/compressor state was "
+                        "wiped (live victims so far: %d, evictions: %d)",
+                        k,
+                        stolen_at,
+                        step,
+                        nc[i],
+                        self.stat_live_victims,
+                        self.stat_evictions,
+                    )
                 slot = self._acquire(active)
                 key_to_slot[k] = slot
                 slot_to_key[slot] = k
@@ -1272,6 +1365,21 @@ class _V4StateSlotAllocator:
             slots[i] = slot
             last_seen[slot] = step
         return np.asarray(slots, dtype=np.int32), reset
+
+    def release(self, key) -> None:
+        """Return a finished request's slot to the free list.
+
+        The scheduler is the only authority on a request being finished --
+        absence from a batch means finished, preempted or waiting on a load,
+        and this class cannot tell those apart. Handing the slot back here is
+        what keeps the free list from draining, so ``_acquire`` rarely has to
+        take a slot from anyone.
+        """
+        slot = self._key_to_slot.pop(key, None)
+        if slot is None:
+            return
+        self._slot_to_key[slot] = None
+        self._free.append(slot)
 
     def _acquire(self, active: set) -> int:
         if self._free:
@@ -1291,6 +1399,10 @@ class _V4StateSlotAllocator:
         old = self._slot_to_key[victim]
         if old is not None:
             self._key_to_slot.pop(old, None)
+            if len(self._evicted) > 200000:
+                self._evicted.clear()
+            self._evicted[old] = self._step
+            self.stat_evictions += 1
         self._slot_to_key[victim] = None
         return victim
 

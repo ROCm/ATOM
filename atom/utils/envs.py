@@ -417,6 +417,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "ATOM_PROFILER_TIMEOUT": lambda: float(os.getenv("ATOM_PROFILER_TIMEOUT", "300")),
     "ATOM_LOG_MORE": lambda: int(os.getenv("ATOM_LOG_MORE", "0")) != 0,
+    # Level for the `atom` logger, by name (DEBUG/INFO/WARNING/...). Empty
+    # leaves whatever the process already configured. `atom.utils` pins that
+    # logger to INFO for hot-path reasons, so a reader that wants DEBUG has to
+    # re-apply it after import; DSV4LMCacheConnector does that at construction.
+    "ATOM_LOG_LEVEL": lambda: os.getenv("ATOM_LOG_LEVEL", ""),
     # RTL (rocm-trace-lite) GPU kernel tracing — set to output directory to enable.
     # When set, the server launch is wrapped with `rtl trace` to collect per-kernel
     # GPU timestamps for both prefill and decode phases.
@@ -605,6 +610,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # legacy). Empty means: respect ATOM_V4_BACKEND for all layers. Used for
     # layer-by-layer bisect during migration. Example: "0,3,15,30".
     "ATOM_V4_BACKEND_LAYERS": lambda: os.getenv("ATOM_V4_BACKEND_LAYERS", ""),
+    # Proxy blocks a reused prefix must re-forward before its own SWA ring and
+    # sparse-indexer rows are its own again. Empty means derive it from the
+    # model: ceil(max(win_with_spec, index_topk) / 128). Set it only to
+    # experiment -- too low and the indexer reads rows this request never
+    # forwarded. Both reuse paths read it, the local prefix hit and the CPU
+    # tier load, through `v4_prefix_warmup_tokens`.
+    "ATOM_V4_PREFIX_WARMUP_BLOCKS": lambda: os.getenv(
+        "ATOM_V4_PREFIX_WARMUP_BLOCKS", ""
+    ),
     # --- Debug Dump (atom/utils/debug_helper/) ---
     # All disabled (empty / no-op) by default. Set to enable instrumentation
     # for forward / weight / sampler bisecting; safe to leave wired in
