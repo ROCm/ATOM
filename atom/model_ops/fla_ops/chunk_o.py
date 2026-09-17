@@ -217,9 +217,9 @@ def chunk_fwd_o(
             f"chunk_fwd_o: caller-provided o.shape {tuple(o.shape)} != "
             f"v.shape {tuple(v.shape)}"
         )
-        assert o.dtype == v.dtype, (
-            f"chunk_fwd_o: caller-provided o.dtype {o.dtype} != v.dtype {v.dtype}"
-        )
+        assert (
+            o.dtype == v.dtype
+        ), f"chunk_fwd_o: caller-provided o.dtype {o.dtype} != v.dtype {v.dtype}"
         assert o.is_contiguous(), (
             "chunk_fwd_o: caller-provided o must be contiguous (kernel "
             "assumes stride (H*V, 1) on the (T, V) plane)"

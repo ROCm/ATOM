@@ -437,9 +437,9 @@ def gdn_decode_update_lossy_fast(
         if ssm_state_indices_in is None
         else ssm_state_indices_in.contiguous()
     )
-    assert ssm_state_indices_in.shape == ssm_state_indices.shape, (
-        "ssm_state_indices_in must match ssm_state_indices in shape"
-    )
+    assert (
+        ssm_state_indices_in.shape == ssm_state_indices.shape
+    ), "ssm_state_indices_in must match ssm_state_indices in shape"
 
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]

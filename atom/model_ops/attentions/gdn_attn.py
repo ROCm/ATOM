@@ -1504,9 +1504,9 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         attn_metadata, positions = super().prepare_decode(
             batch, running_bs, running_tokens, max_seqlen_q
         )
-        self.model_runner.forward_vars["cu_seqlens_q"].cpu[running_bs:] = (
-            batch.total_tokens_num_decode
-        )
+        self.model_runner.forward_vars["cu_seqlens_q"].cpu[
+            running_bs:
+        ] = batch.total_tokens_num_decode
         # we fill the attn_metadata cu_seqlens_q here since aiter attn won't calc it for decode
         attn_metadata.cu_seqlens_q = self.model_runner.forward_vars[
             "cu_seqlens_q"
