@@ -1430,7 +1430,10 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 load_failure_reason = "staging_cleanup"
             # A worker owns one lookup pin for the emitted composite load. It is
             # released after PAGE and SLOT reach a terminal state, exactly once.
-            self._lookup_unpin(req.req_id)
+            self._lookup_unpin(
+                req.req_id,
+                after_retrieve=self._load_retrieve_ran(req, self.chunk_size),
+            )
             self._complete_load(req, succeeded=loaded)
             if slot_spec is not None:
                 if loaded:

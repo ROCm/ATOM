@@ -705,3 +705,27 @@ def test_dense_load_failure_by_request_resolves_the_parked_generation(monkeypatc
 
     assert connector._save_tracker["81"] == [seq, 8]
     assert "81" not in connector._active_load_operations
+
+
+def test_lookup_unpin_after_retrieve_drops_bookkeeping_without_engine_call():
+    worker = DenseOffloadConnector(_config("kv_consumer"))
+    lookup_pins = {"77": {"LocalCPUBackend": ["chunk-key"]}}
+    calls = []
+
+    def _fail_unpin(_lookup_id):
+        calls.append(_lookup_id)
+        raise AssertionError("lookup_unpin should not run after retrieve")
+
+    worker._engine = SimpleNamespace(
+        lookup_pins=lookup_pins,
+        lookup_unpin=_fail_unpin,
+    )
+
+    try:
+        worker._lookup_unpin(77, after_retrieve=True)
+
+        assert calls == []
+        assert "77" not in lookup_pins
+    finally:
+        worker._save_executor.shutdown(wait=True)
+        worker._load_executor.shutdown(wait=True)

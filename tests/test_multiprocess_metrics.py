@@ -81,7 +81,9 @@ def _run_node():
             if family.name.endswith("_request_context_tokens"):
                 assert family.type == "gauge"
             for sample in family.samples:
-                if sample.name.startswith("atom:gc_"):
+                if sample.name.startswith("atom:gc_") or sample.name.startswith(
+                    "atom:process_"
+                ):
                     continue
                 key = (sample.name, tuple(sorted(sample.labels.items())))
                 assert key not in result, key  # No direct + multiprocess duplicates.

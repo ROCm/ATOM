@@ -915,7 +915,10 @@ class TestFanoutSeedsImplicitReasoning:
             for _ in range(6):
                 try:
                     raw = await asyncio.wait_for(gen.__anext__(), timeout=2)
-                except (StopAsyncIteration, TimeoutError):
+                # `asyncio.TimeoutError` spelled out: only from 3.11 is it the
+                # builtin, and on 3.10 the bare name catches neither the
+                # timeout nor anything else this raises.
+                except (StopAsyncIteration, asyncio.TimeoutError):
                     break
                 if raw.startswith("data: ") and not raw.startswith("data: [DONE]"):
                     out.append(json.loads(raw[6:])["choices"][0]["delta"])

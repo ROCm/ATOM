@@ -8,10 +8,11 @@ from atom.metrics.exporter import AtomMetricsExporter
 from atom.metrics.request import RequestMetrics, StreamMetrics
 
 from .streaming_dispatch import longest_silence_seconds
+from .ttft_breakdown import TtftBreakdownMetrics
 
 
 def create_metrics_exporter() -> (
-    tuple[AtomMetricsExporter, RequestMetrics, StreamMetrics]
+    tuple[AtomMetricsExporter, RequestMetrics, StreamMetrics, TtftBreakdownMetrics]
 ):
     exporter = AtomMetricsExporter(stream_silence=longest_silence_seconds)
     registry = exporter.registry
@@ -25,4 +26,5 @@ def create_metrics_exporter() -> (
         registry = None
     request_metrics = RequestMetrics(registry)
     stream_metrics = StreamMetrics(registry)
-    return exporter, request_metrics, stream_metrics
+    ttft_breakdown = TtftBreakdownMetrics(registry)
+    return exporter, request_metrics, stream_metrics, ttft_breakdown

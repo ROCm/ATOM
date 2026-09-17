@@ -33,6 +33,8 @@ GAUGE_SERIES = {
     "reuse",
     "gpu",
     "lmcache",
+    "api",
+    "engine",
 }
 
 
@@ -175,6 +177,118 @@ def panels_for(deployment: str) -> list[dict]:
                 "unit": "ms",
             }
         )
+    # TTFT stage slices, cut so each ends where the next begins. Their means add
+    # up to the role's streaming TTFT; their percentiles do not, because the
+    # stages' tails land on different requests. docs/ttft_breakdown_guide.md.
+    role = roles[-1]
+    for suffix, title, observer, detail in (
+        (
+            "api_preprocess",
+            "TTFT · API preprocess",
+            "API",
+            "Middleware entry → preprocess() returns · chat template, tokenize, sequence build · thread-pooled, so it overlaps other requests but is serial ahead of this one's enqueue",
+        ),
+        (
+            "api_enqueue",
+            "TTFT · API enqueue",
+            "API",
+            "preprocess() returns → add_request() returns · handing the sequence to the engine",
+        ),
+        (
+            "forward_to_output",
+            "TTFT · forward to output",
+            "SCHEDULER",
+            "First real forward dispatch → scheduler's first generation emit · superset of GPU forward: also spans prepare_model, drafting, sampling and postprocess",
+        ),
+        (
+            "output_to_callback",
+            "TTFT · output to callback",
+            "IPC",
+            "Scheduler emit → API stream callback · the engine→API hop, measured on wall clock since the ends are separate processes",
+        ),
+        (
+            "callback_to_sse",
+            "TTFT · callback to SSE",
+            "API",
+            "Stream callback → first SSE payload carrying content · detokenize, frame encode, and the output-thread→event-loop hop",
+        ),
+    ):
+        panels.append(
+            {
+                "id": f"{role}_ttft_{suffix}",
+                "role": role,
+                "title": title,
+                "label": f"{role.upper()} · {observer}",
+                "detail": detail,
+                "metric": f"atom:ttft_{suffix}_seconds",
+                "selector": f'job="atom",role="{role}"',
+                "unit": "ms",
+            }
+        )
+    # What api_preprocess is made of. Recorded on every role, and on a decode
+    # node reusing the prefill's ids the template and tokenize stages observe an
+    # explicit 0 -- so a flat zero line here means "skipped", not "not measured".
+    for role in roles:
+        for suffix, title, detail in (
+            (
+                "body_parse",
+                "API body parse",
+                "Request JSON decode and pydantic validation, before preprocess() · chat completions only",
+            ),
+            (
+                "chat_template",
+                "API chat template",
+                "apply_chat_template and the custom message encoder · observes 0 when the request already carries prompt_token_ids",
+            ),
+            (
+                "tokenize",
+                "API tokenize",
+                "tokenizer.encode on the rendered prompt · observes 0 when the input is already token ids, which is the whole point of the PD id handoff",
+            ),
+            (
+                "preprocess_wait",
+                "API preprocess wait",
+                "The executor wall for preprocess minus the tokenizer call · thread-pool queue delay plus Sequence construction",
+            ),
+        ):
+            panels.append(
+                {
+                    "id": f"{role}_api_{suffix}",
+                    "role": role,
+                    "title": f"{role.title()} {title}",
+                    "label": f"{role.upper()} · API",
+                    "detail": detail,
+                    "metric": f"atom:api_{suffix}_seconds",
+                    "selector": f'job="atom",role="{role}"',
+                    "unit": "ms",
+                }
+            )
+    role = roles[-1]
+    panels.append(
+        {
+            "id": f"{role}_api_detokenize",
+            "role": role,
+            "title": "API detokenize",
+            "label": f"{role.upper()} · API",
+            "detail": "Incremental detokenize per streamed chunk · inside the TTFT callback-to-SSE slice for the first chunk, and on the ITL delivery path for every one after",
+            "metric": "atom:api_detokenize_chunk_seconds",
+            "selector": f'job="atom",role="{role}"',
+            "unit": "ms",
+        }
+    )
+    panels.append(
+        {
+            "id": f"{role}_mtp_tokens_per_forward",
+            "role": role,
+            "title": "MTP tokens per forward",
+            "label": f"{role.upper()} · SPECULATION",
+            "detail": "Accepted tokens emitted per decode step · the multiplier between inter-token latency and step wall time, so ITL times this is what GPU per-step, sampling and propose have to add up to",
+            "metric": "atom:mtp_average_tokens_per_forward",
+            "selector": f'job="atom",role="{role}"',
+            "unit": "tokens",
+            "kind": "gauge",
+        }
+    )
     for role in roles:
         common = {"selector": f'job="atom",role="{role}"', "role": role}
         panels.extend(
@@ -198,6 +312,34 @@ def panels_for(deployment: str) -> list[dict]:
                     "unit": "ms",
                     "metric": "atom:gpu_forward_seconds",
                     "detail": "One observation per worker forward step · includes GPU stream communication/waits · excludes input prep, sampling and drafting",
+                },
+                {
+                    **common,
+                    "id": f"{role}_gpu_sample",
+                    "title": f"{role.title()} GPU sampling",
+                    "label": f"{role.upper()} · GPU WORKERS",
+                    "unit": "ms",
+                    "metric": "atom:gpu_sample_seconds",
+                    "detail": "Sampling and rejection sampling inside postprocess, including the TP/PCP broadcast of sampled ids · one observation per worker forward that samples · same device-timer gate as GPU per-step",
+                },
+                {
+                    **common,
+                    "id": f"{role}_gpu_propose",
+                    "title": f"{role.title()} GPU MTP propose",
+                    "label": f"{role.upper()} · GPU WORKERS",
+                    "unit": "ms",
+                    "metric": "atom:gpu_propose_seconds",
+                    "detail": "The whole MTP propose() · one observation per worker forward that drafts · GPU per-step plus sampling plus this is the device time of one decode step",
+                },
+                {
+                    **common,
+                    "id": f"{role}_cpu",
+                    "title": f"{role.title()} host CPU",
+                    "label": f"{role.upper()} · HOST",
+                    "unit": "cores",
+                    "kind": "cpu",
+                    "metric": "atom:process_cpu_seconds",
+                    "detail": "Cores consumed by this role's process tree · API row bounds api_preprocess, engine row covers engine cores and GPU workers · compare against atom:process_cpus",
                 },
             ]
         )
@@ -299,13 +441,17 @@ def panels_for(deployment: str) -> list[dict]:
         match = re.search(r'role="([^"]+)"', panel["selector"])
         panel.setdefault("role", match[1] if match else "overall")
         panel["category"] = (
-            "cache"
-            if panel.get("kind") in {"cache", "blocks"}
+            "host"
+            if panel.get("kind") == "cpu"
             else (
-                "workload"
-                if panel.get("kind") == "queues"
-                or panel["unit"] in {"requests", "tokens"}
-                else "latency"
+                "cache"
+                if panel.get("kind") in {"cache", "blocks"}
+                else (
+                    "workload"
+                    if panel.get("kind") == "queues"
+                    or panel["unit"] in {"requests", "tokens"}
+                    else "latency"
+                )
             )
         )
         panel.setdefault(
@@ -324,12 +470,22 @@ def panels_for(deployment: str) -> list[dict]:
 def statistics_for(panel: dict):
     if panel.get("kind") == "requests":
         return ()
+    if panel.get("kind") == "gauge":
+        # One line, because a gauge has no distribution to take quantiles of.
+        # `mean` rather than a name of its own: the HTML legend, the CSV export
+        # and the statistic chips are all keyed on the shared statistic names.
+        return ("mean",)
     if panel.get("kind") == "cache":
         return ("reuse", "lmcache", "gpu") if panel.get("cache_breakdown") else ("hit",)
     if panel.get("kind") == "queues":
         return ("running", "waiting", "waiting_kv")
     if panel.get("kind") == "blocks":
         return ("used", "evictable", "vacant")
+    if panel.get("kind") == "cpu":
+        # Split at the process that owns the event loop, because that is the
+        # boundary the two CPU questions fall on: `api` bounds tokenization and
+        # SSE delivery, `engine` is the scheduler loop plus the GPU workers.
+        return ("api", "engine")
     return tuple(STATISTICS)
 
 
@@ -380,11 +536,22 @@ def query_for(panel: dict, statistic: str, window: int, *, by_instance=False) ->
         hit = cache_count_query_for(panel, state, window, by_instance=by_instance)
         total = cache_count_query_for(panel, "prompt", window, by_instance=by_instance)
         return f"100 * {hit} / {total}"
+    if panel.get("kind") == "gauge":
+        # Averaged, not summed: the value is already a per-engine ratio, so a
+        # second reporting engine must not double it.
+        average = "avg by (instance)" if by_instance else "avg"
+        return f"{average}({metric}{{{selector}}})"
     if panel.get("kind") in {"queues", "blocks"}:
         numerator = f'{aggregate}({metric}{{{selector},state="{statistic}"}})'
         if panel["kind"] == "queues":
             return numerator
         return f'100 * {numerator} / {aggregate}({metric}{{{selector},state="total"}})'
+    if panel.get("kind") == "cpu":
+        # Counter, so rate() -- a utilization gauge sampled once per scrape
+        # would miss exactly the bursts this panel exists to catch. Summing
+        # user and system, and over every process in the group, gives cores.
+        process = 'process="api"' if statistic == "api" else 'process!="api"'
+        return f"{aggregate}(rate({metric}_total{{{selector},{process}}}[{window}s]))"
     scale = panel.get("scale", 1000)
 
     def rate(suffix):
@@ -636,7 +803,7 @@ def demo_data() -> dict:
                 statistics_for(panel), (1.0, 0.89, 1.16, 1.28, 1.53)
             )
         }
-        if panel["unit"] == "tokens":
+        if panel["unit"] == "tokens" and panel.get("kind") != "gauge":
             factor = (
                 2000
                 if panel["id"] in {"prefill_context_tokens", "decode_context_tokens"}
@@ -645,6 +812,15 @@ def demo_data() -> dict:
             panel["series"] = {
                 k: [[t, round(v * factor)] for t, v in points]
                 for k, points in panel["series"].items()
+            }
+        if panel.get("kind") == "gauge":
+            # Tokens per forward is a small per-step ratio, so it skips the
+            # token-count factor above: MTP-3 accepts a few, never thousands.
+            panel["series"] = {
+                "mean": [
+                    [start + i * step, round(value / 4, 2)]
+                    for i, value in enumerate(points)
+                ]
             }
         if panel.get("kind") == "cache":
             panel["series"] = {
@@ -800,8 +976,8 @@ def validate_data(data: dict) -> None:
         if panel["id"] in identifiers:
             raise ValueError("Panel identifiers must be unique")
         identifiers.add(panel["id"])
-        if panel.get("unit", "ms") not in {"ms", "requests", "%", "tokens"}:
-            raise ValueError("Panel unit must be ms, requests, tokens or %")
+        if panel.get("unit", "ms") not in {"ms", "requests", "%", "tokens", "cores"}:
+            raise ValueError("Panel unit must be ms, requests, tokens, cores or %")
         instances = panel.get("instances", {})
         if not isinstance(instances, dict) or any(
             not isinstance(k, str) or not k for k in instances

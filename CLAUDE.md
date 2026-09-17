@@ -89,6 +89,7 @@ Key entry points:
 | Configuration | `docs/configuration_guide.md` |
 | Distributed | `docs/distributed_guide.md` |
 | Metrics & observability | `docs/metrics_guide.md` |
+| Decode TTFT stage breakdown | `docs/ttft_breakdown_guide.md` |
 | CI/PR workflow | `/ci-pr-guide` |
 | Performance benchmark | `/benchmark-guide` |
 | Debugging | `/debug-guide` |

@@ -408,6 +408,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_DETOKENIZER_AUDIT_EVERY", ""
     ).strip(),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
+    "ATOM_TTFT_TRACE": lambda: os.getenv("ATOM_TTFT_TRACE", "0") == "1",
+    "ATOM_API_PROFILER_DIR": lambda: os.getenv("ATOM_API_PROFILER_DIR", None),
     # When profiling is active, append detailed attention aggregates (sqsq, sqsk, sk)
     # to the prefill[]/decode[] trace labels emitted by ModelRunner.run_model.
     "ATOM_ENABLE_DETAILED_ANNOTATION": lambda: (

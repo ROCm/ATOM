@@ -48,6 +48,10 @@ class RequestQueueTiming:
     is_pd: bool = False
     prefill_observed: bool = False
     decode_context_observed: bool = False
+    first_forward_at: float | None = None
+    first_scheduler_output_at: float | None = None
+    # Wall clock for API↔engine TTFT slices (perf_counter is process-local).
+    first_scheduler_output_wall_at: float | None = None
 
 
 class SchedulerMetrics:
@@ -71,6 +75,13 @@ class SchedulerMetrics:
         self.pd_transfer = Histogram(
             "atom:pd_kv_transfer_seconds",
             "Decode-side PD KV load wait until all workers complete; includes dispatch, handshake and notification.",
+            labels,
+            buckets=LATENCY_BUCKETS,
+            registry=registry,
+        ).labels(**labels)
+        self.forward_to_output = Histogram(
+            "atom:ttft_forward_to_output_seconds",
+            "Decode TTFT slice: first real forward dispatch through scheduler first generation emit.",
             labels,
             buckets=LATENCY_BUCKETS,
             registry=registry,
@@ -181,6 +192,7 @@ class SchedulerMetrics:
             if not timing.observed:
                 self.queue_time.observe(now - timing.received_at)
                 timing.observed = True
+                timing.first_forward_at = now
             if (
                 i < batch.total_seqs_num_decode
                 and context_lens is not None
@@ -235,3 +247,13 @@ class SchedulerMetrics:
                         )
                     )
                 )
+
+    def record_first_scheduler_output(self, seq) -> None:
+        timing = getattr(seq, "queue_timing", None)
+        if timing is None or timing.first_scheduler_output_at is not None:
+            return
+        now = time.perf_counter()
+        timing.first_scheduler_output_at = now
+        timing.first_scheduler_output_wall_at = time.time()
+        if timing.first_forward_at is not None:
+            self.forward_to_output.observe(now - timing.first_forward_at)

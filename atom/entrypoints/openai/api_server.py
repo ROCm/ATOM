@@ -40,6 +40,7 @@ from atom.entrypoints.chat_utils import has_multimodal_content, parse_chat_messa
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.request import RequestOutput
+from atom.model_engine.run_labels import ttft_trace_span
 from atom.model_engine.sequence import new_token_ids
 from atom.multimodal.processing import prepare_multimodal_inputs
 from atom.utils import envs
@@ -81,6 +82,7 @@ from .reasoning import (
 from .reasoning_dialects import resolve_dialect
 from .request_timing import (
     RequestTimingMiddleware,
+    get_request_timing,
     get_stream_timing,
     has_generated_output,
     record_nonstream_first_token,
@@ -142,6 +144,11 @@ from .tool_parser.registry import (
     TOOL_CALL_PARSER_HELP,
     forbids_tool_calls,
     resolve_tool_call_parser,
+)
+from .ttft_breakdown import (
+    discard_callback_tracking,
+    first_callback_perf,
+    mark_first_callback,
 )
 
 # Configure logging
@@ -378,7 +385,10 @@ _ANTHROPIC_PING_FRAME = event_frame("ping", {"type": "ping"})
 # 35 discarded bytes. The keepalive only has to beat proxy and SDK idle-read
 # timeouts, which are tens of seconds.
 _ANTHROPIC_PING_INTERVAL_SECONDS = 5.0
-_metrics_exporter, _request_metrics, _stream_metrics = create_metrics_exporter()
+_metrics_exporter, _request_metrics, _stream_metrics, _ttft_breakdown = (
+    create_metrics_exporter()
+)
+_api_profiler = None
 _background_tasks: list[asyncio.Task] = []
 # The watch compares two `gc.get_stats()` reads against something that moves on
 # the scale of minutes, so it has no reason to ride the metrics cadence.
@@ -509,7 +519,12 @@ async def _client_stream(
                         ):
                             timing = None
                         elif has_generated_output(payload):
-                            timing.first_output(streaming=True)
+                            sse_at = timing.first_output(streaming=True)
+                            callback_perf = first_callback_perf(request_id)
+                            if sse_at is not None and callback_perf is not None:
+                                _ttft_breakdown.observe_callback_to_sse(
+                                    sse_at - callback_perf
+                                )
                             timing = None
                 if timing is None and _request_logger is None:
                     break
@@ -702,6 +717,17 @@ def _send_stream_chunk_direct(
     state: Any,
 ) -> None:
     """Buffer a single-request chunk for this engine step."""
+    if request_output.output_tokens:
+        # Wall clock pairs with the engine's stamp across the process boundary;
+        # perf_counter pairs with the SSE stamp taken later in this process.
+        mark_first_callback(
+            request_id,
+            scheduler_output_at=request_output.scheduler_output_at,
+            callback_at=time.time(),
+            callback_perf=time.perf_counter(),
+            metrics=_ttft_breakdown,
+            has_tokens=bool(request_output.output_tokens),
+        )
     assert _stream_batch_dispatcher is not None
     _stream_batch_dispatcher.enqueue(
         loop=loop,
@@ -746,15 +772,22 @@ def _send_stream_chunk_tagged(
 
 
 async def generate_async(
-    prompt: str,
+    prompt_or_tokens: str | list[int],
     sampling_params: SamplingParams,
     request_id: str,
     kv_transfer_params: dict[str, Any] | None = None,
     data_parallel_rank: int | None = None,
     dp_session_id: str | None = None,
     dp_parent_session_id: str | None = None,
+    return_token_ids: bool = False,
 ) -> AsyncGenerator[dict[str, Any], None]:
-    """Generate text asynchronously for non-streaming requests."""
+    """Generate text asynchronously for non-streaming requests.
+
+    ``return_token_ids`` adds the prompt's token ids to the yielded dict under
+    ``prompt_token_ids``. They are read off the local ``Sequence`` that
+    ``preprocess`` just built, so this costs one list copy and no IPC -- the
+    engine is never asked for something the API process already has.
+    """
     token_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
@@ -793,8 +826,17 @@ async def generate_async(
         )
 
     def do_preprocess():
-        return engine.io_processor.preprocess(
-            prompt,
+        # Encode here rather than letting preprocess() do it, so the tokenizer
+        # call can be timed apart from Sequence construction.
+        if isinstance(prompt_or_tokens, str):
+            tokenize_t0 = time.perf_counter()
+            tokens = engine.tokenizer.encode(prompt_or_tokens)
+            tokenize_s = time.perf_counter() - tokenize_t0
+        else:
+            tokens = prompt_or_tokens
+            tokenize_s = 0.0
+        seq = engine.io_processor.preprocess(
+            tokens,
             sampling_params,
             stream_callback=completion_callback,
             kv_transfer_params=kv_transfer_params,
@@ -802,8 +844,15 @@ async def generate_async(
             dp_session_id=dp_session_id,
             dp_parent_session_id=dp_parent_session_id,
         )
+        return seq, tokenize_s
 
-    seq = await loop.run_in_executor(None, do_preprocess)
+    executor_t0 = time.perf_counter()
+    seq, tokenize_s = await loop.run_in_executor(None, do_preprocess)
+    executor_wall = time.perf_counter() - executor_t0
+    timing = get_request_timing()
+    if timing is not None:
+        _ttft_breakdown.observe_api_tokenize(tokenize_s)
+        _ttft_breakdown.observe_api_preprocess_wait(executor_wall - tokenize_s)
     try:
         _validate_sequence_context_length(seq)
     except Exception:
@@ -843,7 +892,13 @@ async def generate_async(
 
     text = delivered_text(all_token_ids)
     num_tokens_input = (
-        seq.num_prompt_tokens if seq is not None else len(tokenizer.encode(prompt))
+        seq.num_prompt_tokens
+        if seq is not None
+        else len(
+            prompt_or_tokens
+            if isinstance(prompt_or_tokens, list)
+            else tokenizer.encode(prompt_or_tokens)
+        )
     )
     num_tokens_output = len(all_token_ids)
     finished_at = time.time()
@@ -870,6 +925,9 @@ async def generate_async(
     }
     if kv_transfer_output_meta_info is not None:
         response["kv_transfer_output_meta_info"] = kv_transfer_output_meta_info
+    if return_token_ids and seq is not None:
+        # `list`, not the array itself: this leaves the API process as JSON.
+        response["prompt_token_ids"] = list(seq.prompt_token_ids)
     yield response
 
 
@@ -982,12 +1040,18 @@ async def generate_async_fanout(
     data_parallel_rank: int | None = None,
     dp_session_id: str | None = None,
     dp_parent_session_id: str | None = None,
+    return_token_ids: bool = False,
 ) -> list[dict[str, Any]]:
     """Non-streaming n>1 path: fan out N siblings and await all of them.
 
     Returns a list of per-sibling output dicts in the same shape as
     :func:`generate_async` yields for n==1, so response builders can treat
     each entry the same way.
+
+    ``return_token_ids`` puts ``prompt_token_ids`` on the *first* output only.
+    The siblings answer one prompt that ``preprocess_fanout`` tokenized once,
+    so there is one list to report; it rides where ``num_tokens_input``'s
+    shared value is already read from.
     """
 
     n = int(sampling_params.n)
@@ -1024,8 +1088,15 @@ async def generate_async_fanout(
     stream_callbacks = [make_callback(i) for i in range(n)]
 
     def do_preprocess():
-        return engine.io_processor.preprocess_fanout(
-            prompt_or_tokens,
+        if isinstance(prompt_or_tokens, str):
+            tokenize_t0 = time.perf_counter()
+            tokens = engine.tokenizer.encode(prompt_or_tokens)
+            tokenize_s = time.perf_counter() - tokenize_t0
+        else:
+            tokens = prompt_or_tokens
+            tokenize_s = 0.0
+        seqs = engine.io_processor.preprocess_fanout(
+            tokens,
             sampling_params,
             stream_callbacks=stream_callbacks,
             kv_transfer_params=kv_transfer_params,
@@ -1035,8 +1106,15 @@ async def generate_async_fanout(
             dp_session_id=dp_session_id,
             dp_parent_session_id=dp_parent_session_id,
         )
+        return seqs, tokenize_s
 
-    seqs = await loop.run_in_executor(None, do_preprocess)
+    executor_t0 = time.perf_counter()
+    seqs, tokenize_s = await loop.run_in_executor(None, do_preprocess)
+    executor_wall = time.perf_counter() - executor_t0
+    timing = get_request_timing()
+    if timing is not None:
+        _ttft_breakdown.observe_api_tokenize(tokenize_s)
+        _ttft_breakdown.observe_api_preprocess_wait(executor_wall - tokenize_s)
     try:
         _validate_sequence_context_length(seqs[0])
     except Exception:
@@ -1101,6 +1179,8 @@ async def generate_async_fanout(
                 "latency": finished_at - started_at,
             }
         )
+    if return_token_ids and seqs:
+        outputs[0]["prompt_token_ids"] = list(seqs[0].prompt_token_ids)
     return outputs
 
 
@@ -1116,6 +1196,33 @@ def validate_model(requested_model: str | None) -> None:
             status_code=400,
             detail=f"Requested model '{requested_model}' does not match "
             f"server model '{model_name}'",
+        )
+
+
+def _validate_return_token_ids(
+    return_token_ids: bool | None, stream: bool | None
+) -> None:
+    """``return_token_ids`` is answerable on the non-streaming paths only.
+
+    Rejected where it cannot be answered rather than ignored. The caller asking
+    for these ids is a PD proxy that will hand them to a decode node so it can
+    skip rendering and tokenizing; dropping them silently puts that cost back
+    and leaves no signal anywhere that it happened, which is precisely the
+    failure mode this path exists to remove.
+
+    ``n > 1`` is fine and deliberately not rejected here: the siblings share one
+    prompt, which ``preprocess_fanout`` tokenizes once, so there is exactly one
+    answer. Rejecting it would also have been a trap rather than a guard --
+    atomesh injects this field itself and forwards the client's ``n``
+    untouched, so a client that asked for four samples through a PD pair would
+    have been handed a 400 naming a field it never sent.
+    """
+    if not return_token_ids:
+        return
+    if stream:
+        raise ValueError(
+            "return_token_ids is not supported with stream=true; the ids are "
+            "returned on the response body, which a stream does not have"
         )
 
 
@@ -1153,23 +1260,44 @@ async def setup_streaming_request(
 
     executor_loop = asyncio.get_event_loop()
 
+    timing = get_request_timing()
+    middleware_start = timing.started_at if timing is not None else time.perf_counter()
+
     def do_preprocess():
-        seq = engine.io_processor.preprocess(
-            prompt_or_tokens,
-            sampling_params,
-            stream_callback=stream_callback,
-            kv_transfer_params=kv_transfer_params,
-            multimodal_data=multimodal_data,
-            data_parallel_rank=data_parallel_rank,
-            dp_session_id=dp_session_id,
-            dp_parent_session_id=dp_parent_session_id,
-        )
+        with ttft_trace_span("ttft[api_preprocess]"):
+            if isinstance(prompt_or_tokens, str):
+                tokenize_t0 = time.perf_counter()
+                tokens = engine.tokenizer.encode(prompt_or_tokens)
+                tokenize_s = time.perf_counter() - tokenize_t0
+            else:
+                tokens = prompt_or_tokens
+                tokenize_s = 0.0
+            seq = engine.io_processor.preprocess(
+                tokens,
+                sampling_params,
+                stream_callback=stream_callback,
+                kv_transfer_params=kv_transfer_params,
+                multimodal_data=multimodal_data,
+                data_parallel_rank=data_parallel_rank,
+                dp_session_id=dp_session_id,
+                dp_parent_session_id=dp_parent_session_id,
+            )
         _seq_id_to_request_id[seq.id] = request_id
-        return seq
+        return seq, tokenize_s
 
     seq = None
     try:
-        seq = await executor_loop.run_in_executor(None, do_preprocess)
+        with ttft_trace_span("ttft[api_preprocess_wait]"):
+            executor_t0 = time.perf_counter()
+            seq, tokenize_s = await executor_loop.run_in_executor(None, do_preprocess)
+            executor_wall = time.perf_counter() - executor_t0
+        preprocess_done_at = time.perf_counter()
+        if timing is not None:
+            _ttft_breakdown.observe_api_tokenize(tokenize_s)
+            _ttft_breakdown.observe_api_preprocess_wait(executor_wall - tokenize_s)
+            _ttft_breakdown.observe_api_preprocess(
+                preprocess_done_at - middleware_start
+            )
         _validate_sequence_context_length(seq)
     except Exception:
         _stream_loops.pop(request_id, None)
@@ -1189,7 +1317,11 @@ async def setup_streaming_request(
     # %-style, not an f-string: the arguments are formatted only if the
     # record is emitted, and this runs once per request with debug off.
     logger.debug("API: Created request_id=%s, seq_id=%s", request_id, seq_id)
-    engine.core_mgr.add_request([seq])
+    with ttft_trace_span("ttft[api_enqueue]"):
+        engine.core_mgr.add_request([seq])
+    enqueued_at = time.perf_counter()
+    if timing is not None:
+        _ttft_breakdown.observe_api_enqueue(enqueued_at - preprocess_done_at)
 
     return seq_id, stream_collector, seq.num_prompt_tokens
 
@@ -1218,12 +1350,13 @@ def cleanup_request(request_id: str) -> None:
 
     Runs once, after every one of the request's streams has been cleaned up.
     Separate from :func:`cleanup_stream` because a fan-out has n streams but
-    one request: folding both into one call meant these two pops ran n times,
+    one request: folding both into one call meant these pops ran n times,
     n-1 of them no-ops, and made a caller pass a seq id and a request id
     together when each half only needs one of them.
     """
     _stream_loops.pop(request_id, None)
     _request_start_times.pop(request_id, None)
+    discard_callback_tracking(request_id)
 
 
 class _ClientDisconnected(Exception):
@@ -1374,8 +1507,15 @@ async def setup_streaming_request_fanout(
     executor_loop = asyncio.get_event_loop()
 
     def do_preprocess():
+        if isinstance(prompt_or_tokens, str):
+            tokenize_t0 = time.perf_counter()
+            tokens = engine.tokenizer.encode(prompt_or_tokens)
+            tokenize_s = time.perf_counter() - tokenize_t0
+        else:
+            tokens = prompt_or_tokens
+            tokenize_s = 0.0
         seqs = engine.io_processor.preprocess_fanout(
-            prompt_or_tokens,
+            tokens,
             sampling_params,
             stream_callbacks=stream_callbacks,
             kv_transfer_params=kv_transfer_params,
@@ -1387,11 +1527,17 @@ async def setup_streaming_request_fanout(
         )
         for seq in seqs:
             _seq_id_to_request_id[seq.id] = request_id
-        return seqs
+        return seqs, tokenize_s
 
     seqs = []
     try:
-        seqs = await executor_loop.run_in_executor(None, do_preprocess)
+        executor_t0 = time.perf_counter()
+        seqs, tokenize_s = await executor_loop.run_in_executor(None, do_preprocess)
+        executor_wall = time.perf_counter() - executor_t0
+        timing = get_request_timing()
+        if timing is not None:
+            _ttft_breakdown.observe_api_tokenize(tokenize_s)
+            _ttft_breakdown.observe_api_preprocess_wait(executor_wall - tokenize_s)
         _validate_sequence_context_length(seqs[0])
     except Exception:
         _stream_loops.pop(request_id, None)
@@ -1539,6 +1685,10 @@ async def general_error_handler(request: Request, exc: Exception):
 async def chat_completions(request: ChatCompletionRequest, raw_request: Request):
     """Handle chat completion requests (OpenAI-compatible)."""
 
+    timing = get_request_timing()
+    if timing is not None:
+        _ttft_breakdown.observe_api_body_parse(time.perf_counter() - timing.started_at)
+
     validate_model(request.model)
 
     try:
@@ -1575,6 +1725,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 merged_kwargs["thinking_effort"] = _th_effort
 
         effective_n = _coerce_n(request.n, request.temperature)
+        _validate_return_token_ids(request.return_token_ids, request.stream)
         sampling_params = _build_sampling_params(
             temperature=request.temperature,
             max_tokens=request.get_max_tokens(),
@@ -1596,45 +1747,68 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         _log_request_model("request", request_id, request)
 
         is_multimodal = _has_multimodal_content(messages)
+        multimodal_data = None
         if is_multimodal:
             # Media loading (blocking network I/O, up to a 30s urlopen) plus
             # processor preprocessing are heavy and would stall the event loop;
             # run them in a worker thread. Warm the processor on the loop first
             # so concurrent cold-start requests don't race on its lazy init.
+            # Multimodal prepare is not subdivided into api_chat_template /
+            # api_tokenize yet (TODO with multimodal metrics).
             _get_multimodal_processor()
             loop = asyncio.get_running_loop()
-            token_ids, multimodal_data = await loop.run_in_executor(
+            prompt_or_tokens, multimodal_data = await loop.run_in_executor(
                 None,
                 _prepare_multimodal_inputs,
                 messages,
                 merged_kwargs,
                 request.tools,
             )
+        elif (pretokenized := request.get_prompt_token_ids()) is not None:
+            # A PD decode node: the prefill node already rendered this exact
+            # template and tokenized the result, and its ids are what the KV
+            # blocks in flight were computed from. Rendering and tokenizing
+            # again would cost the largest single slice of decode TTFT to
+            # arrive at the same list -- see docs/ttft_breakdown_guide.md.
+            prompt_or_tokens = pretokenized
+            if timing is not None:
+                # An explicit zero, so the histogram's count still matches the
+                # request count on a decode node and the skip reads as "0 ms"
+                # rather than as a missing metric.
+                _ttft_breakdown.observe_api_chat_template(0.0)
         else:
-            prompt = apply_chat_template(
+            template_t0 = time.perf_counter()
+            prompt_or_tokens = apply_chat_template(
                 tokenizer,
                 custom_message_encoder,
                 [msg.to_template_dict() for msg in messages],
                 tools=request.tools,
                 **merged_kwargs,
             )
+            if timing is not None:
+                _ttft_breakdown.observe_api_chat_template(
+                    time.perf_counter() - template_t0
+                )
 
         # The K3 template may inject the opening reasoning marker into the prompt
         # itself; if so the stream begins mid-thought and the ReasoningFilter must
-        # start in the thinking state. Multimodal inputs arrive pre-tokenized.
+        # start in the thinking state. Keyed on the input's own type rather than
+        # on `is_multimodal`, because pre-tokenized prompts arrive as ids too.
         _reasoning = reasoning_channel(
             (
-                prompt_tokens_start_in_reasoning(token_ids, tokenizer.decode)
-                if is_multimodal
-                else prompt_starts_in_reasoning(prompt)
+                prompt_starts_in_reasoning(prompt_or_tokens)
+                if isinstance(prompt_or_tokens, str)
+                else prompt_tokens_start_in_reasoning(
+                    prompt_or_tokens, tokenizer.decode
+                )
             ),
             template_kwargs=merged_kwargs,
         )
 
         # Streaming
         if request.stream:
-            stream_input = token_ids if is_multimodal else prompt
-            stream_multimodal_data = multimodal_data if is_multimodal else None
+            stream_input = prompt_or_tokens
+            stream_multimodal_data = multimodal_data
             if effective_n > 1:
                 seq_ids, stream_collector, num_prompt_tokens = (
                     await setup_streaming_request_fanout(
@@ -1692,11 +1866,12 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         if is_multimodal and effective_n > 1:
             outputs = await _race_disconnect(
                 generate_async_fanout(
-                    token_ids,
+                    prompt_or_tokens,
                     sampling_params,
                     request_id,
                     multimodal_data=multimodal_data,
                     kv_transfer_params=request.kv_transfer_params,
+                    return_token_ids=bool(request.return_token_ids),
                     **dp_routing,
                 ),
                 raw_request,
@@ -1716,7 +1891,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         elif is_multimodal:
             final_output = await _run_nonstream_with_disconnect(
                 generate_async_multimodal(
-                    token_ids,
+                    prompt_or_tokens,
                     multimodal_data,
                     sampling_params,
                     request_id,
@@ -1740,10 +1915,11 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         elif effective_n > 1:
             outputs = await _race_disconnect(
                 generate_async_fanout(
-                    prompt,
+                    prompt_or_tokens,
                     sampling_params,
                     request_id,
                     kv_transfer_params=request.kv_transfer_params,
+                    return_token_ids=bool(request.return_token_ids),
                     **dp_routing,
                 ),
                 raw_request,
@@ -1763,10 +1939,11 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         else:
             final_output = await _run_nonstream_with_disconnect(
                 generate_async(
-                    prompt,
+                    prompt_or_tokens,
                     sampling_params,
                     request_id,
                     kv_transfer_params=request.kv_transfer_params,
+                    return_token_ids=bool(request.return_token_ids),
                     **dp_routing,
                 ),
                 raw_request,
@@ -1806,6 +1983,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
 
     try:
         effective_n = _coerce_n(request.n, request.temperature)
+        _validate_return_token_ids(request.return_token_ids, request.stream)
         sampling_params = _build_sampling_params(
             temperature=request.temperature,
             max_tokens=request.get_max_tokens(),
@@ -1815,6 +1993,9 @@ async def completions(request: CompletionRequest, raw_request: Request):
             top_p=request.top_p,
             n=effective_n,
         )
+        # Either the text or an already-tokenized prompt, whichever the client
+        # sent. `preprocess` takes both, so nothing downstream branches on it.
+        prompt_or_tokens = request.get_prompt_or_tokens()
 
         request_id = f"cmpl-{uuid.uuid4().hex}"
         dp_session_id, dp_parent_session_id = _get_dp_session_affinity_ids(raw_request)
@@ -1831,7 +2012,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
             if effective_n > 1:
                 seq_ids, stream_collector, num_prompt_tokens = (
                     await setup_streaming_request_fanout(
-                        request.prompt,
+                        prompt_or_tokens,
                         sampling_params,
                         request_id,
                         kv_transfer_params=request.kv_transfer_params,
@@ -1850,7 +2031,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
             else:
                 seq_id, stream_collector, num_prompt_tokens = (
                     await setup_streaming_request(
-                        request.prompt,
+                        prompt_or_tokens,
                         sampling_params,
                         request_id,
                         kv_transfer_params=request.kv_transfer_params,
@@ -1875,10 +2056,11 @@ async def completions(request: CompletionRequest, raw_request: Request):
         if effective_n > 1:
             outputs = await _race_disconnect(
                 generate_async_fanout(
-                    request.prompt,
+                    prompt_or_tokens,
                     sampling_params,
                     request_id,
                     kv_transfer_params=request.kv_transfer_params,
+                    return_token_ids=bool(request.return_token_ids),
                     **dp_routing,
                 ),
                 raw_request,
@@ -1890,10 +2072,11 @@ async def completions(request: CompletionRequest, raw_request: Request):
         else:
             final_output = await _run_nonstream_with_disconnect(
                 generate_async(
-                    request.prompt,
+                    prompt_or_tokens,
                     sampling_params,
                     request_id,
                     kv_transfer_params=request.kv_transfer_params,
+                    return_token_ids=bool(request.return_token_ids),
                     **dp_routing,
                 ),
                 raw_request,
@@ -2681,8 +2864,27 @@ async def server_info():
 @app.post("/start_profile")
 async def start_profile():
     """Start profiling the engine."""
+    global _api_profiler
     try:
         engine.start_profile()
+        profiler_dir = envs.ATOM_API_PROFILER_DIR
+        if profiler_dir and _api_profiler is not None:
+            # Overwriting the handle would strand the running profiler's CPU
+            # hooks with no way left to exit them.
+            logger.warning("API profiler already running; ignoring duplicate start")
+        elif profiler_dir:
+            from torch import profiler as torch_profiler
+
+            os.makedirs(profiler_dir, exist_ok=True)
+            _api_profiler = torch_profiler.profile(
+                activities=[
+                    torch_profiler.ProfilerActivity.CPU,
+                ],
+                record_shapes=envs.ATOM_PROFILER_MORE,
+                with_stack=envs.ATOM_PROFILER_MORE,
+                profile_memory=envs.ATOM_PROFILER_MORE,
+            )
+            _api_profiler.__enter__()
         return {"status": "success", "message": "Profiling started"}
     except Exception as e:
         logger.exception("Failed to start profiling")
@@ -2692,8 +2894,19 @@ async def start_profile():
 @app.post("/stop_profile")
 async def stop_profile():
     """Stop profiling the engine."""
+    global _api_profiler
     try:
         traces = engine.stop_profile()
+        # Drop the handle first: a failing export must not leave the endpoint
+        # believing a profiler is still running.
+        profiler, _api_profiler = _api_profiler, None
+        if profiler is not None:
+            profiler.__exit__(None, None, None)
+            profiler_dir = envs.ATOM_API_PROFILER_DIR
+            if profiler_dir:
+                profiler.export_chrome_trace(
+                    os.path.join(profiler_dir, "api_process_trace.json")
+                )
         return {
             "status": "success",
             "message": "Profiling stopped. Trace files generated.",
@@ -2889,6 +3102,7 @@ def main():
         tokenizer,
         synthetic_text=synthetic_token_text,
         observe_inter_token_latency=_stream_metrics.observe_inter_token_latency,
+        observe_detokenize=_ttft_breakdown.observe_api_detokenize_chunk,
     )
     # Here and not in the dispatcher's constructor: it replays a few thousand
     # updates, which every test that builds a dispatcher would then pay for.

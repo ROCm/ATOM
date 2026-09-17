@@ -129,6 +129,48 @@ def test_scheduler_queries_keep_units_and_gauge_semantics():
     assert "pd_kv_transfer" not in {p["id"] for p in report.panels_for("standalone")}
 
 
+def test_preprocess_and_step_stages_are_panels_of_their_own():
+    """Everything api_preprocess and a decode step are made of gets a panel.
+
+    They were instrumented but unplotted, so a report could not answer either
+    question the histograms exist for: which stage of preprocess a TTFT went
+    into, and whether ITL times the tokens per forward lands on the device time
+    of a step. Asserted per role, because the answers differ by role -- a
+    decode node reusing the prefill's ids observes 0 for template and tokenize.
+    """
+    panels = {p["id"]: p for p in report.panels_for("pd")}
+    for role in ("prefill", "decode"):
+        for stage in ("body_parse", "chat_template", "tokenize", "preprocess_wait"):
+            panel = panels[f"{role}_api_{stage}"]
+            assert panel["metric"] == f"atom:api_{stage}_seconds"
+            assert f'role="{role}"' in panel["selector"]
+            assert panel["unit"] == "ms" and panel["category"] == "latency"
+        for stage in ("sample", "propose"):
+            panel = panels[f"{role}_gpu_{stage}"]
+            assert panel["metric"] == f"atom:gpu_{stage}_seconds"
+            assert report.query_for(panel, "mean", 60).startswith("1000 * ")
+    # Delivery, not a TTFT slice, so only the streaming role carries it.
+    assert panels["decode_api_detokenize"]["metric"] == (
+        "atom:api_detokenize_chunk_seconds"
+    )
+    assert "prefill_api_detokenize" not in panels
+
+
+def test_a_gauge_panel_is_averaged_rather_than_read_as_a_histogram():
+    panel = next(p for p in report.panels_for("pd") if p.get("kind") == "gauge")
+    assert panel["id"] == "decode_mtp_tokens_per_forward"
+    assert report.statistics_for(panel) == ("mean",)
+    query = report.query_for(panel, "mean", 60)
+    # Averaged over the engines reporting it: the value is already a per-engine
+    # ratio, so summing would report twice the tokens a step actually accepted.
+    assert query == 'avg(atom:mtp_average_tokens_per_forward{job="atom",role="decode"})'
+    assert "rate(" not in query and "histogram_quantile" not in query
+    grouped = report.query_for(panel, "mean", 60, by_instance=True)
+    assert grouped.startswith("avg by (instance)(")
+    assert [q[1] for q in report.panel_queries(panel, 60)] == ["mean"]
+    assert panel["unit"] == "tokens" and panel["category"] == "workload"
+
+
 def test_grouped_queries_preserve_instances_and_weight_ratios():
     panels = {p["id"]: p for p in report.panels_for("pd")}
     cache = report.query_for(panels["prefill_cache_hit"], "reuse", 60, by_instance=True)

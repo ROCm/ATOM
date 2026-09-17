@@ -16,7 +16,7 @@ from atom.entrypoints.openai.streaming_dispatch import longest_silence_seconds
 
 
 def test_metrics_endpoint_allows_sse_delivery_while_rendering(monkeypatch):
-    exporter, _, _ = create_metrics_exporter()
+    exporter, _, _, _ = create_metrics_exporter()
     entered, resume = threading.Event(), threading.Event()
     owner = threading.get_ident()
     original = exporter.render
@@ -229,7 +229,7 @@ def test_streaming_ttft_includes_preprocessing_skips_role_and_records_once(
     monkeypatch.setattr(
         "atom.entrypoints.openai.request_timing.time.perf_counter", lambda: clock[0]
     )
-    exporter, request_metrics, _ = create_metrics_exporter()
+    exporter, request_metrics, _, _ = create_metrics_exporter()
     chunks = [
         _sse({"choices": [{"delta": {"role": "assistant"}}]}),
         _sse({"choices": [{"delta": {"content": "four tokens at once"}}]}),

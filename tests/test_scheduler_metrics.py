@@ -316,7 +316,7 @@ def test_cache_tiers_preserve_admitted_reuse_through_snapshots():
     engine = SimpleNamespace(
         core_mgr=SimpleNamespace(latest_metrics=ranks, get_dp_router_statistics=dict)
     )
-    exporter, _, _ = create_metrics_exporter()
+    exporter, _, _, _ = create_metrics_exporter()
     for _ in range(2):
         exporter.update(LLMEngine.get_metrics_statistics(engine))
         values = samples(exporter)
@@ -421,14 +421,22 @@ def test_failed_pd_transfer_does_not_record_successful_cache_admission():
     scheduler._update_from_kv_xfer_finished(KVConnectorOutput(failed_recving={seq.id}))
     assert scheduler.engine_stats.total_requests == 0
     # At the failure/success branch, choose fallback without counting a PD hit.
-    # Local prefill admission is covered separately; block recovery is not part
-    # of this metrics change.
     assert scheduler._resolve_waiting_remote_kv(seq, deque()) is False
     assert scheduler.engine_stats.total_requests == 0
     assert scheduler.engine_stats.total_full_tokens == 0
     assert scheduler.engine_stats.total_cached_tokens == 0
     assert scheduler.engine_stats.total_offload_tokens == 0
     assert seq.num_tokens == 16  # P's first output token was not injected.
+    assert not seq.block_table
+    assert seq.num_cached_tokens == 0
+
+    # The failed receive's destination blocks must not reach allocate() again.
+    batch, _ = scheduler.schedule()
+
+    assert batch.total_seqs_num_prefill == 1
+    assert seq in scheduler.running
+    assert seq.block_table
+    assert seq.prefix_cache_hit_tokens == 0
 
 
 def test_pp_head_records_once_when_dispatching_a_real_forward(clock):
@@ -657,7 +665,7 @@ def test_decode_request_context_gauge_records_first_dispatch_once(monkeypatch):
 def test_large_batch_contexts_have_finite_buckets_through_exposition(
     phase, rows, context
 ):
-    exporter, _, _ = create_metrics_exporter()
+    exporter, _, _, _ = create_metrics_exporter()
     metrics = SchedulerMetrics(engine_role=phase, registry=exporter.registry)
     seqs = {i: SimpleNamespace(id=i) for i in range(rows)}
     scheduled = SimpleNamespace(
@@ -683,3 +691,21 @@ def test_large_batch_contexts_have_finite_buckets_through_exposition(
     assert values[(f"atom:{phase}_context_tokens_bucket", bucket_labels)] == 1
     assert values[(f"atom:{phase}_context_tokens_sum", labels)] == total
     assert values[(f"atom:{phase}_context_tokens_count", labels)] == 1
+
+
+def test_forward_to_output_records_first_emit_once(clock):
+    metrics = SchedulerMetrics()
+    seq = SimpleNamespace()
+    metrics.enqueue(seq)
+    clock[0] = 100.4
+    metrics.record_forward(
+        SimpleNamespace(req_ids=[1], is_dummy_run=False, total_seqs_num_decode=1),
+        {1: seq},
+    )
+    clock[0] = 100.45
+    metrics.record_first_scheduler_output(seq)
+    metrics.record_first_scheduler_output(seq)
+    assert histogram_values_by_name(metrics)["forward_to_output"][
+        "sum"
+    ] == pytest.approx(0.05)
+    assert seq.queue_timing.first_scheduler_output_wall_at is not None

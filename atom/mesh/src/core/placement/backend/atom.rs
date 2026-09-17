@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use tracing::warn;
 use uuid::Uuid;
 
 use super::super::types::AdapterError;
@@ -57,6 +58,43 @@ impl AtomAdapter {
         }
         Ok(())
     }
+
+    /// Carry the prefill node's prompt token ids across to decode, so decode
+    /// reuses them instead of rendering the chat template and tokenizing the
+    /// prompt a second time. Returns how many ids were carried.
+    ///
+    /// Not a `kv_transfer_params` field by rights -- these are not transfer
+    /// parameters -- but that is where vLLM's disaggregated-prefill protocol
+    /// puts them, and matching it is what lets a vLLM-shaped proxy drive an
+    /// ATOM decode node and vice versa. The prefill *response* carries them
+    /// top-level, which is also vLLM's shape; the two differ, hence the move.
+    ///
+    /// An absent key is not an error. A prefill node predating this, or one
+    /// that declined `return_token_ids`, leaves decode to tokenize exactly as
+    /// it did before -- slower, still correct. A key that is present but not
+    /// an array is a prefill bug worth a log line, and skipping it keeps the
+    /// request answerable.
+    pub fn carry_prompt_token_ids(prefill_body: &Value, kv: &mut Value) -> usize {
+        let Some(ids) = prefill_body.get("prompt_token_ids") else {
+            return 0;
+        };
+        if ids.is_null() {
+            return 0;
+        }
+        let Some(len) = ids.as_array().map(|a| a.len()).filter(|n| *n > 0) else {
+            warn!(
+                "prefill returned an unusable prompt_token_ids ({}); decode will tokenize",
+                ids
+            );
+            return 0;
+        };
+        let Some(obj) = kv.as_object_mut() else {
+            warn!("decode kv_transfer_params is not an object; dropping prompt_token_ids");
+            return 0;
+        };
+        obj.insert("prompt_token_ids".to_string(), ids.clone());
+        len
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +142,11 @@ impl BackendAdapter for AtomAdapter {
             obj.insert("max_completion_tokens".to_string(), json!(1));
         }
         obj.remove("stream_options");
+        // Prefill has to render the chat template and tokenize anyway; asking
+        // for the result back is what lets decode skip doing both again. Safe
+        // to ask unconditionally: a node that does not know the field ignores
+        // it, and `carry_prompt_token_ids` then finds nothing to carry.
+        obj.insert("return_token_ids".to_string(), Value::Bool(true));
         Ok(())
     }
 

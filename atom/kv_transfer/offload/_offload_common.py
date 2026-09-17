@@ -256,14 +256,35 @@ class OffloadWorkerMixin:
 
         self._lookup_unpin(req_id)
 
-    def _lookup_unpin(self, req_id) -> None:
+    @staticmethod
+    def _load_retrieve_ran(req, chunk_size: int) -> bool:
+        """Return whether a load job reached ``engine.retrieve()``."""
+
+        load_spec = getattr(req, "load_spec", None)
+        if load_spec is None:
+            return False
+        hbm = int(load_spec.hbm_cached_tokens)
+        lmc = int(load_spec.lmcache_cached_tokens)
+        if lmc <= hbm:
+            return False
+        chunk = int(chunk_size or 256)
+        return hbm % chunk == 0
+
+    def _lookup_unpin(self, req_id, *, after_retrieve: bool = False) -> None:
         """Best-effort release of one worker-side LMCache lookup pin."""
 
         engine = getattr(self, "_engine", None)
         if engine is None:
             return
+        lookup_id = str(req_id)
+        if after_retrieve:
+            # LMCache retrieve() already unpins MemoryObjs; only drop bookkeeping.
+            lookup_pins = getattr(engine, "lookup_pins", None)
+            if lookup_pins is not None:
+                lookup_pins.pop(lookup_id, None)
+                return
         try:
-            engine.lookup_unpin(str(req_id))
+            engine.lookup_unpin(lookup_id)
         except Exception:  # optional third-party cleanup boundary
             logger.debug(
                 "LMCache offload: lookup unpin failed for req=%s",

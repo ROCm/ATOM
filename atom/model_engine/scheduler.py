@@ -1896,9 +1896,18 @@ class Scheduler:
             return False
 
         seq.status = SequenceStatus.WAITING
-        if not self._connector_flag("is_offload"):
+        is_offload = self._connector_flag("is_offload")
+        if not is_offload:
             self._uncount_inflight_load(seq)
-        if seq.offload_joint.load_hash != -1 or seq.offload_joint.boundary_tokens:
+            # A P/D consumer allocates the destination table before starting
+            # the remote receive.  Failed transfers must release that table
+            # before local-prefill fallback re-enters can_allocate/allocate;
+            # unlike the offload resume path, it cannot reuse partially
+            # received KV.
+            self.block_manager.deallocate(seq)
+        if is_offload and (
+            seq.offload_joint.load_hash != -1 or seq.offload_joint.boundary_tokens
+        ):
             # The state never arrived, so the boundary is not this request's
             # history. Disown it exactly as `BlockManager.allocate` does at
             # admission, otherwise the resume runs with `num_cached_tokens > 0`
@@ -2977,6 +2986,7 @@ class Scheduler:
             # terminal response with no completion tokens must keep TTFT zero.
             if num_tokens - seq.num_prompt_tokens >= 1 and seq.first_token_time == 0.0:
                 seq.first_token_time = time.time()
+                self.metrics.record_first_scheduler_output(seq)
 
             # Counted here, not from `len(token_ids)` above: `new_tokens` is
             # what reaches RequestOutput, and it differs from the forward's
@@ -3012,6 +3022,7 @@ class Scheduler:
                     if isinstance(new_tokens, tuple)
                     else new_tokens.copy()
                 )
+                qt = getattr(seq, "queue_timing", None)
                 request_output = RequestOutput(
                     request_id=seq.id,
                     output_tokens=output_tokens_list,
@@ -3021,6 +3032,9 @@ class Scheduler:
                         seq, "kv_transfer_params_output", None
                     ),
                     num_cached_tokens=getattr(seq, "prefix_cache_hit_tokens", 0),
+                    scheduler_output_at=(
+                        qt.first_scheduler_output_wall_at if qt is not None else None
+                    ),
                 )
 
                 if request_output.kv_transfer_params_output is not None:

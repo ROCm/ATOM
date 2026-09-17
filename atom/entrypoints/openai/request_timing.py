@@ -63,15 +63,22 @@ class RequestTiming:
     recorded: bool = False
     streaming_response: bool = False
 
-    def first_output(self, *, streaming: bool) -> None:
+    def first_output(self, *, streaming: bool) -> float | None:
         if not self.recorded:
             self.recorded = True
-            self.observe(time.perf_counter() - self.started_at, streaming)
+            now = time.perf_counter()
+            self.observe(now - self.started_at, streaming)
+            return now
+        return None
 
 
 _request_timing: ContextVar[RequestTiming | None] = ContextVar(
     "request_timing", default=None
 )
+
+
+def get_request_timing() -> RequestTiming | None:
+    return _request_timing.get()
 
 
 def get_stream_timing() -> RequestTiming | None:

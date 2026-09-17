@@ -54,7 +54,7 @@ def test_events_are_polled_without_waiting_and_reused_only_after_completion():
         pass
     assert len(metrics.pending) == 2
     # A different stream may complete the second pair before the first.
-    for event in metrics.pending[1][:2]:
+    for event in metrics.pending[1][1:3]:
         event.ready = True
     snapshot = histogram_values_by_name(metrics)
     assert len(metrics.pending) == 2
@@ -68,8 +68,8 @@ def test_events_are_polled_without_waiting_and_reused_only_after_completion():
     reused = tuple(metrics.free[-1])
     with metrics.measure(batch(prefill=1, decode=1)):
         pass
-    assert tuple(metrics.pending[-1][:2]) == reused
-    for start, end, _ in metrics.pending:
+    assert tuple(metrics.pending[-1][1:3]) == reused
+    for _, start, end, _ in metrics.pending:
         start.ready = end.ready = True
     snapshot = histogram_values_by_name(metrics)
     assert len(metrics.pending) == 0
@@ -83,13 +83,32 @@ def test_poll_checks_only_the_unfinished_head_of_a_full_queue():
     for _ in range(256):
         with metrics.measure(batch()):
             pass
-    for index, (start, end, _) in enumerate(metrics.pending):
+    for index, (_, start, end, _) in enumerate(metrics.pending):
         start.ready = end.ready = index > 0
         end.queries = 0
     metrics.poll()
-    assert [end.queries for _, end, _ in metrics.pending] == [1] + [0] * 255
+    assert [end.queries for _, _, end, _ in metrics.pending] == [1] + [0] * 255
     assert not metrics.free
     assert histogram_values(metrics.steps)["sum"] == 0
+
+
+def test_sample_and_propose_share_the_pending_fifo_without_request_sums():
+    metrics = GPUForwardMetrics(Event)
+    with metrics.measure_sample(batch()):
+        pass
+    with metrics.measure_propose(batch(prefill=1, decode=0)):
+        pass
+    assert len(metrics.pending) == 2
+    assert metrics.pending[0][0] == "sample"
+    assert metrics.pending[1][0] == "propose"
+    complete_event(metrics, 0, 4)
+    complete_event(metrics, 1, 12)
+    snapshot = histogram_values_by_name(metrics)
+    assert snapshot["sample"]["sum"] == pytest.approx(0.004)
+    assert snapshot["propose"]["sum"] == pytest.approx(0.012)
+    assert snapshot["steps"]["sum"] == 0
+    assert snapshot["prefill_requests"]["buckets"][-1][1] == 0
+    assert not metrics.requests
 
 
 def test_warmup_dummy_failure_and_decorator_do_not_create_spurious_samples():
@@ -226,7 +245,7 @@ def prefill_batch(*chunks, decode=0):
 
 
 def complete_event(metrics, index=0, milliseconds=8):
-    start, end, _ = metrics.pending[index]
+    _, start, end, _ = metrics.pending[index]
     start.duration_ms = milliseconds
     start.ready = end.ready = True
 
@@ -437,3 +456,31 @@ def test_invalid_device_duration_is_logged_and_does_not_poison_histograms(
     complete_event(metrics)
     values = histogram_values_by_name(metrics)
     assert values["steps"]["sum"] == values["prefill_requests"]["sum"] == 0.008
+
+
+def test_sample_and_propose_are_native_histograms_without_phase_labels():
+    from prometheus_client import CollectorRegistry
+    from prometheus_client.parser import text_string_to_metric_families
+
+    registry = CollectorRegistry()
+    metrics = GPUForwardMetrics(Event, registry=registry)
+    with metrics.measure_sample(batch()):
+        pass
+    with metrics.measure_propose(batch()):
+        pass
+    complete_event(metrics, 0, 3)
+    complete_event(metrics, 1, 5)
+    metrics.poll()
+    values = histogram_values_by_name(metrics)
+    assert values["sample"]["sum"] == pytest.approx(0.003)
+    assert values["propose"]["sum"] == pytest.approx(0.005)
+    samples = {
+        (s.name, s.labels.get("phase")): s.value
+        for family in text_string_to_metric_families(
+            __import__("prometheus_client").generate_latest(registry).decode()
+        )
+        for s in family.samples
+        if s.name in {"atom:gpu_sample_seconds_sum", "atom:gpu_propose_seconds_sum"}
+    }
+    assert samples[("atom:gpu_sample_seconds_sum", None)] == pytest.approx(0.003)
+    assert samples[("atom:gpu_propose_seconds_sum", None)] == pytest.approx(0.005)

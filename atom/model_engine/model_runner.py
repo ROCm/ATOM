@@ -45,7 +45,7 @@ from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
-from atom.model_engine.run_labels import build_run_label
+from atom.model_engine.run_labels import build_run_label, ttft_trace_span
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import (
     Sequence,
@@ -2994,90 +2994,102 @@ class ModelRunner:
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
-        if spec_decode_metadata is None:
-            # The LM head emitted one row per sequence the step FORWARDED,
-            # which prefill pads to `running_bs` for the draft pass that
-            # follows it. Cut to the scheduled batch here and nowhere else:
-            # this is the boundary where a padded forward becomes a
-            # per-request result, and everything below counts requests -- the
-            # sampler's per-row parameters and the logprob gather both. Cut
-            # after either and the pad rows divide `[running_bs, V]` by
-            # `[scheduled_bs, 1]`.
-            logits = logits[:bs]
-            sampled_tokens = self.sampler(
-                logits,
-                temperatures,
-                top_ks,
-                top_ps,
-                all_greedy,
-                needs_independent_noise=needs_independent_noise,
-            )
-            num_reject_tokens = self.tokenID_processor.default_num_rejected_tokens[:bs]
-            next_token_locs = num_reject_tokens
-            # No drafts scored -> no accept count; anchor on the segment's last
-            # row. NOT `mtp_k - num_reject_tokens`, which is a zero buffer here.
-            num_bonus_tokens = None
-        else:
-            assert logits is not None
-            bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
-            target_logits_indices = spec_decode_metadata.target_logits_indices
-
-            bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
-            target_logits = torch.index_select(logits, 0, target_logits_indices)
-            bonus_token_ids = self.sampler(
-                logits=bonus_logits,
-                temperatures=temperatures,
-                top_ks=top_ks,
-                top_ps=top_ps,
-                all_greedy=all_greedy,
-                needs_independent_noise=needs_independent_noise,
-            )
-            # Validate shapes match expectations
-            if target_logits.shape[0] != len(spec_decode_metadata.draft_token_ids):
-                raise ValueError(
-                    f"Shape mismatch: target_logits.shape[0]={target_logits.shape[0]} "
-                    f"but len(draft_token_ids)={len(spec_decode_metadata.draft_token_ids)}. "
-                    f"target_logits_indices shape={spec_decode_metadata.target_logits_indices.shape}, "
-                    f"logits.shape[0]={logits.shape[0]}"
+        gpu_metrics = getattr(self, "gpu_forward_metrics", None)
+        sample_cm = (
+            gpu_metrics.measure_sample(batch)
+            if gpu_metrics is not None
+            else nullcontext()
+        )
+        with sample_cm:
+            if spec_decode_metadata is None:
+                # The LM head emitted one row per sequence the step FORWARDED,
+                # which prefill pads to `running_bs` for the draft pass that
+                # follows it. Cut to the scheduled batch here and nowhere else:
+                # this is the boundary where a padded forward becomes a
+                # per-request result, and everything below counts requests -- the
+                # sampler's per-row parameters and the logprob gather both. Cut
+                # after either and the pad rows divide `[running_bs, V]` by
+                # `[scheduled_bs, 1]`.
+                logits = logits[:bs]
+                sampled_tokens = self.sampler(
+                    logits,
+                    temperatures,
+                    top_ks,
+                    top_ps,
+                    all_greedy,
+                    needs_independent_noise=needs_independent_noise,
                 )
+                num_reject_tokens = self.tokenID_processor.default_num_rejected_tokens[
+                    :bs
+                ]
+                next_token_locs = num_reject_tokens
+                # No drafts scored -> no accept count; anchor on the segment's last
+                # row. NOT `mtp_k - num_reject_tokens`, which is a zero buffer here.
+                num_bonus_tokens = None
+            else:
+                assert logits is not None
+                bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
+                target_logits_indices = spec_decode_metadata.target_logits_indices
 
-            sampled_tokens, num_bonus_tokens = self.rejection_sampler.forward(
-                spec_decode_metadata,
-                target_logits,
-                bonus_token_ids,
-            )
-            # PCP ranks decode redundantly and are consistent only while their
-            # kernels agree bit-for-bit -- they don't (hidden differs by ~1 bf16
-            # ULP, flipping ~24% of the near-tie verify argmaxes). Accept counts
-            # then differ per rank and the emitted streams fork. Sync the
-            # decision instead: the ids and how many.
-            if get_pcp_world_size() > 1 and hasattr(self, "drafter"):
-                _g = get_pcp_group()
-                sampled_tokens = _g.broadcast(sampled_tokens.contiguous(), src=0)
-                if torch.is_tensor(num_bonus_tokens):
-                    num_bonus_tokens = _g.broadcast(
-                        num_bonus_tokens.contiguous(), src=0
+                bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
+                target_logits = torch.index_select(logits, 0, target_logits_indices)
+                bonus_token_ids = self.sampler(
+                    logits=bonus_logits,
+                    temperatures=temperatures,
+                    top_ks=top_ks,
+                    top_ps=top_ps,
+                    all_greedy=all_greedy,
+                    needs_independent_noise=needs_independent_noise,
+                )
+                # Validate shapes match expectations
+                if target_logits.shape[0] != len(spec_decode_metadata.draft_token_ids):
+                    raise ValueError(
+                        f"Shape mismatch: target_logits.shape[0]={target_logits.shape[0]} "
+                        f"but len(draft_token_ids)={len(spec_decode_metadata.draft_token_ids)}. "
+                        f"target_logits_indices shape={spec_decode_metadata.target_logits_indices.shape}, "
+                        f"logits.shape[0]={logits.shape[0]}"
                     )
-            num_reject_tokens = self.drafter.mtp_k - num_bonus_tokens
-            next_token_locs = num_bonus_tokens
 
-        # Drafter input must agree across TP ranks.
-        if get_tp_group().world_size > 1 and (
-            self.tokenID_processor.is_deferred_out or hasattr(self, "drafter")
-        ):
-            sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
+                sampled_tokens, num_bonus_tokens = self.rejection_sampler.forward(
+                    spec_decode_metadata,
+                    target_logits,
+                    bonus_token_ids,
+                )
+                # PCP ranks decode redundantly and are consistent only while their
+                # kernels agree bit-for-bit -- they don't (hidden differs by ~1 bf16
+                # ULP, flipping ~24% of the near-tie verify argmaxes). Accept counts
+                # then differ per rank and the emitted streams fork. Sync the
+                # decision instead: the ids and how many.
+                if get_pcp_world_size() > 1 and hasattr(self, "drafter"):
+                    _g = get_pcp_group()
+                    sampled_tokens = _g.broadcast(sampled_tokens.contiguous(), src=0)
+                    if torch.is_tensor(num_bonus_tokens):
+                        num_bonus_tokens = _g.broadcast(
+                            num_bonus_tokens.contiguous(), src=0
+                        )
+                num_reject_tokens = self.drafter.mtp_k - num_bonus_tokens
+                next_token_locs = num_bonus_tokens
 
-        # Compute logprobs if any sequence requested them
-        need_logprobs = any(batch.return_logprobs)
-        sampled_logprobs = None
-        if need_logprobs:
-            logits_fp32 = logits.float()
-            log_probs = torch.log_softmax(logits_fp32, dim=-1)
-            sampled_logprobs = log_probs.gather(
-                -1, sampled_tokens.to(torch.long).unsqueeze(-1)
-            ).squeeze(-1)
-            if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
-                sampled_logprobs = get_tp_group().broadcast(sampled_logprobs, src=0)
+            # Drafter input must agree across TP ranks.
+            if get_tp_group().world_size > 1 and (
+                self.tokenID_processor.is_deferred_out or hasattr(self, "drafter")
+            ):
+                sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
+
+            # Compute logprobs if any sequence requested them
+            need_logprobs = any(batch.return_logprobs)
+            sampled_logprobs = None
+            if need_logprobs:
+                logits_fp32 = logits.float()
+                log_probs = torch.log_softmax(logits_fp32, dim=-1)
+                sampled_logprobs = log_probs.gather(
+                    -1, sampled_tokens.to(torch.long).unsqueeze(-1)
+                ).squeeze(-1)
+                if (
+                    get_tp_group().world_size > 1
+                    and self.tokenID_processor.is_deferred_out
+                ):
+                    sampled_logprobs = get_tp_group().broadcast(sampled_logprobs, src=0)
 
         self.forward_done_event.record()
         # Capture before prepare_sampled_ids(), which advances self.prev_batch to current batch.
@@ -3090,6 +3102,11 @@ class ModelRunner:
         token_ids_out = [token_id_dict[k] for k in req_ids_out]
 
         draft_token_ids: np.ndarray | None = None
+        propose_cm = (
+            gpu_metrics.measure_propose(batch)
+            if gpu_metrics is not None and hasattr(self, "drafter")
+            else nullcontext()
+        )
         if self.tokenID_processor.is_deferred_out:
             if hasattr(self, "drafter"):
                 prev_rejected_num = self.tokenID_processor.prev_rejected_num
@@ -3101,16 +3118,17 @@ class ModelRunner:
                     sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
                 ).view(bs)
                 self.tokenID_processor.prev_token_ids = next_token_ids
-                draft_token_ids = self.propose_draft_token_ids(
-                    batch,
-                    self.tokenID_processor.input_ids.gpu[
-                        1 : batch.total_tokens_num + 1
-                    ],
-                    hidden_states,
-                    next_token_ids,
-                    num_reject_tokens,
-                    num_bonus_tokens,
-                )
+                with propose_cm:
+                    draft_token_ids = self.propose_draft_token_ids(
+                        batch,
+                        self.tokenID_processor.input_ids.gpu[
+                            1 : batch.total_tokens_num + 1
+                        ],
+                        hidden_states,
+                        next_token_ids,
+                        num_reject_tokens,
+                        num_bonus_tokens,
+                    )
                 # self.debug(f"{num_bonus_tokens=}")
 
             elif prev_batch is not None:
@@ -3130,16 +3148,17 @@ class ModelRunner:
                 next_token_ids = torch.gather(
                     sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
                 ).view(bs)
-                draft_token_ids = self.propose_draft_token_ids(
-                    batch,
-                    self.tokenID_processor.input_ids.gpu[
-                        1 : batch.total_tokens_num + 1
-                    ],
-                    hidden_states,
-                    next_token_ids,
-                    num_reject_tokens,
-                    num_bonus_tokens,
-                )
+                with propose_cm:
+                    draft_token_ids = self.propose_draft_token_ids(
+                        batch,
+                        self.tokenID_processor.input_ids.gpu[
+                            1 : batch.total_tokens_num + 1
+                        ],
+                        hidden_states,
+                        next_token_ids,
+                        num_reject_tokens,
+                        num_bonus_tokens,
+                    )
 
         # DSpark Phase 2: carry this step's per-request ell back to the scheduler
         # as a {req_id: ell} dict (req_id-keyed avoids any output/draft batch
@@ -3195,16 +3214,18 @@ class ModelRunner:
         # race the dummy's still-pending H2D copies.
         self._advance_forward_vars()
         self._gate_staging_reuse()
-        (
-            input_ids,
-            temperatures,
-            top_ks,
-            top_ps,
-            all_greedy,
-            needs_independent_noise,
-        ) = self.prepare_model(batch)
+        with ttft_trace_span("ttft[prepare_model]"):
+            (
+                input_ids,
+                temperatures,
+                top_ks,
+                top_ps,
+                all_greedy,
+                needs_independent_noise,
+            ) = self.prepare_model(batch)
         self._mark_staging_h2d_enqueued()
-        logits, hidden_states = self.run_model(input_ids, batch)
+        with ttft_trace_span("ttft[gpu_forward]"):
+            logits, hidden_states = self.run_model(input_ids, batch)
 
         pp_group = get_pp_group()
         pp_non_last = pp_group.world_size > 1 and not pp_group.is_last_rank
@@ -3262,16 +3283,17 @@ class ModelRunner:
                 draft_token_ids=None,
             )
 
-        fwd_output = self.postprocess(
-            batch,
-            logits,
-            temperatures,
-            top_ks,
-            top_ps,
-            all_greedy,
-            hidden_states,
-            needs_independent_noise=needs_independent_noise,
-        )
+        with ttft_trace_span("ttft[postprocess]"):
+            fwd_output = self.postprocess(
+                batch,
+                logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                all_greedy,
+                hidden_states,
+                needs_independent_noise=needs_independent_noise,
+            )
 
         reset_forward_context()
         self._record_forward_vars_event()

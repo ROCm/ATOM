@@ -563,7 +563,7 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
     blocks = Gauge(
         "atom:scheduler_kv_cache_blocks", "fixture", ["state"], registry=registry
     )
-    workload = [
+    histograms = [
         Histogram(
             name,
             "fixture",
@@ -581,8 +581,31 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
             "atom:decode_context_tokens",
             "atom:gpu_forward_seconds",
             "atom:prefill_request_gpu_forward_seconds",
+            "atom:gpu_sample_seconds",
+            "atom:gpu_propose_seconds",
+            "atom:api_body_parse_seconds",
+            "atom:api_chat_template_seconds",
+            "atom:api_tokenize_seconds",
+            "atom:api_preprocess_wait_seconds",
+            "atom:api_detokenize_chunk_seconds",
+            "atom:ttft_api_preprocess_seconds",
+            "atom:ttft_api_enqueue_seconds",
+            "atom:ttft_forward_to_output_seconds",
+            "atom:ttft_output_to_callback_seconds",
+            "atom:ttft_callback_to_sse_seconds",
         )
     ]
+    mtp_tokens = Gauge(
+        "atom:mtp_average_tokens_per_forward", "fixture", registry=registry
+    )
+    # Two rows, because the CPU panel splits on the process that owns the event
+    # loop: `process="api"` against everything else.
+    cpu = Counter(
+        "atom:process_cpu_seconds",
+        "fixture",
+        ["process", "mode"],
+        registry=registry,
+    )
     request_context_gauges = {
         phase: Gauge(
             f"atom:{phase}_request_context_tokens",
@@ -599,6 +622,7 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
         queues.labels(state).set(2)
     for state, value in (("used", 2), ("evictable", 3), ("vacant", 5), ("total", 10)):
         blocks.labels(state).set(value)
+    mtp_tokens.set(2.99)
 
     other_registry = CollectorRegistry()
     for metric in (
@@ -608,8 +632,10 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
         batch,
         transfer,
         queues,
+        mtp_tokens,
+        cpu,
         *request_context_gauges.values(),
-        *workload,
+        *histograms,
     ):
         other_registry.register(metric)
     other_blocks = Gauge(
@@ -638,9 +664,32 @@ def test_real_prometheus_exports_all_panels_after_failed_benchmark_and_stops(tmp
                 batch.observe(4)
                 transfer.observe(0.02)
                 for hist, value in zip(
-                    workload, (2000, 512, 48000, 32000, 0.008, 0.030)
+                    histograms,
+                    (
+                        2000,
+                        512,
+                        48000,
+                        32000,
+                        0.008,
+                        0.030,
+                        0.0002,
+                        0.003,
+                        0.002,
+                        0.0008,
+                        0.16,
+                        0.005,
+                        0.00002,
+                        0.013,
+                        0.0004,
+                        0.062,
+                        0.0021,
+                        0.0009,
+                    ),
+                    strict=True,
                 ):
                     hist.observe(value)
+                for process in ("api", "engine"):
+                    cpu.labels(process, "user").inc(0.25)
                 started = str(time.time())
                 for phase, value in (("prefill", 12000), ("decode", 8000)):
                     request_context_gauges[phase].labels(

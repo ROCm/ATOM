@@ -29,6 +29,7 @@ fall outside those, so dummies never pollute the prefill/decode statistics.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -95,3 +96,17 @@ def build_run_label(
         label += " tbo=1"
     label += "]"
     return label
+
+
+@contextmanager
+def ttft_trace_span(name: str):
+    """Optional ``record_function`` span when ``ATOM_TTFT_TRACE=1``."""
+    from atom.utils import envs
+
+    if not envs.ATOM_TTFT_TRACE:
+        yield
+        return
+    from torch.profiler import record_function
+
+    with record_function(name):
+        yield

@@ -17,13 +17,37 @@ that artifact, then open a `report.html` file. GitHub Actions summaries cannot
 execute the report's JavaScript; the report runs locally without a server.
 
 The report defaults to an eight-panel Overview with Prefill/Decode TTFT, queue
-time, total cache reuse, and GPU forward latency. Use Latency, Workload, Cache & KV, or
+time, total cache reuse, and GPU forward latency. Use Latency, Workload, Cache & KV, Host CPU, or
 All metrics to inspect the full set. Desktop charts use two columns:
 
 - Mesh overall TTFT: ingress to first generated streaming output.
 - Decode ITL: output intervals normalized and weighted by new token count.
 - Prefill local TTFT: request arrival to first internal token delivery.
 - Decode local TTFT: request arrival to first generated streaming output.
+- Decode TTFT stages: five Latency-view panels cutting the local TTFT above into
+  API preprocess, API enqueue, forward to output, output to callback, and
+  callback to SSE. Together with queue time they tile the interval, so their
+  means add up to local TTFT; their percentiles do not, because the stages' tails
+  land on different requests. Forward to output is a superset of GPU forward.
+  Only streaming requests are sampled. See
+  [the TTFT breakdown guide](../../../../docs/ttft_breakdown_guide.md).
+- API preprocess stages: body parse, chat template, tokenize, and preprocess
+  wait, per role. These subdivide the API preprocess stage above rather than
+  tiling the TTFT, and they are sampled on non-streaming requests too. A decode
+  node reusing the prefill's token ids observes an explicit 0 for chat template
+  and tokenize, so a flat zero line means the work was skipped, not unmeasured —
+  which is the whole point of the id handoff, since tokenize is the largest
+  single stage on the prefill side.
+- Decode API detokenize: incremental detokenize per streamed chunk. Inside the
+  callback-to-SSE stage for the first chunk and on the ITL delivery path after.
+- Prefill and Decode GPU sampling and GPU MTP propose: device-event durations for
+  sampling (including the TP/PCP broadcast of sampled ids) and for the whole MTP
+  `propose()`. GPU forward plus these two is the device time of one decode step,
+  which is what inter-token latency times the tokens per forward below has to
+  land on; the remainder is host time with no histogram of its own.
+- MTP tokens per forward: accepted tokens emitted per decode step, averaged over
+  the reporting engines. The multiplier between inter-token latency and step wall
+  time — multiply ITL by this, not by the MTP width, which is the ceiling.
 - Prefill and Decode request queues: running, waiting, and external KV waits.
 - Prefill and Decode queue time: engine receipt to first forward dispatch,
   including input queue residence, scheduling, and KV loading waits.
@@ -45,6 +69,14 @@ All metrics to inspect the full set. Desktop charts use two columns:
   dispatch, once per request sequence.
 - Prefill and Decode GPU forward: per-worker device-event duration, including
   stream communication/waits; PP samples cover each local stage, not the full pipeline.
+- Prefill and Decode host CPU: cores consumed by each role's process tree, in the
+  Host CPU view. Two curves split at the process that owns the event loop —
+  API process (chat templating, tokenization, SSE) and Engine + workers (scheduler
+  loop and GPU workers). Compare against `atom:process_cpus`, the visible CPU count.
+  This is the panel that separates a CPU-starved host from one waiting on the GPU:
+  every other latency here is device time or wall clock, and those two look alike.
+  An API curve pinned near 1.0 core is a saturated event loop, which inflates the
+  API preprocess stage above whatever the GPU is doing.
 
 Both request context metrics are collected through Prometheus `/metrics` as
 Gauges with request ID and phase dispatch-time labels. Scatter plots show each
@@ -62,7 +94,7 @@ chart and series selections are retained when switching roles. Small screens
 stack charts in the same order.
 The global Statistics controls contain only Mean, P50, P90, P95, and P99.
 Queue and KV state controls stay inside their own panels. Units are milliseconds,
-requests, tokens, or percent as indicated on each chart and in the CSV.
+requests, tokens, cores, or percent as indicated on each chart and in the CSV.
 The existing KV utilization panels also display summed Used / Total block
 counts for the latest point in the selected range, or the hovered point.
 Their data tables and CSV include the raw counts with unit `blocks`.
@@ -206,7 +238,9 @@ Python callers can use `collect_report(...)` to fetch data without writing files
 convenience API that does both. The JSON interface uses
 Unix timestamps in seconds, values in the panel's `unit` (default `ms` for older
 reports), and `null` for missing points. Gauge panels set `kind` to `queues` or
-`blocks` and use state names as series keys. See `report-data.example.json` for
+`blocks` and use state names as series keys. A plain gauge with no states sets
+`kind: "gauge"` and carries the single series key `mean`, because a gauge has no
+distribution to take quantiles of. See `report-data.example.json` for
 a small synthetic latency example.
 KV panels additionally carry `block_counts.used` and `block_counts.total`
 time series; older JSON without these fields displays unavailable counts as a dash.

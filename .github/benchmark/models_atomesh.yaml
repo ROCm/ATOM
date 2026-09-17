@@ -7,6 +7,9 @@ defaults:
     cpus_per_task: 114
     time_limit: "08:00:00"
     log_root: "${ATOMESH_LOG_ROOT}"
+    # Selected by the submit machine's short hostname in the workflow.
+    lmcache_local_disk_by_machine:
+      crs-m2m-cpu-spur-v2-009: "/mnt/m2m_nobackup/atomesh_lmcache/lmcache-job"
   benchmark:
     random_range_ratio: 0.8
     request_rate: inf
@@ -387,7 +390,8 @@ models:
               # The path follows the default atomesh-cicd fleet, where /mnt is
               # local and already holds ATOMESH_MODEL_ROOT. The mi350 and crusoe
               # fleets keep their models on /data and /shared_nfs instead, so a
-              # dispatch onto those needs this pointed at their own local disk.
+              # dispatch onto those needs a runner.lmcache_local_disk_by_machine
+              # override pointing at their own local disk.
               LMCACHE_LOCAL_DISK: "/mnt/lmcache-job"
               LMCACHE_MAX_LOCAL_DISK_SIZE: "500"
               OFFLOAD_PROFILE: "1"

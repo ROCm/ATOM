@@ -134,7 +134,9 @@ def _run_bounded(coro, timeout=5.0):
         asyncio.run(asyncio.wait_for(coro, timeout))
     except asyncio.CancelledError:
         return
-    except TimeoutError:
+    except asyncio.TimeoutError:
+        # Not the bare builtin: the two are the same exception only from 3.11,
+        # so on 3.10 this message would be lost to a raw error instead.
         pytest.fail(f"still running after {timeout}s; a guard swallowed the cancel")
     pytest.fail("returned on its own; this must run until cancelled")
 

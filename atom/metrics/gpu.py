@@ -1,4 +1,9 @@
-"""Nonblocking, bounded device-event timing for real target-model forwards."""
+"""Nonblocking, bounded device-event timing for real target-model forwards.
+
+Also covers the decode-step slices that ``gpu_forward`` deliberately excludes —
+sampling (plus rejection sampling) and MTP propose — under the same
+``ATOM_ENABLE_METRICS_DEVICE_TIMER`` gate and the same CUDA-event pool rules.
+"""
 
 import logging
 import math
@@ -12,6 +17,10 @@ from prometheus_client import Histogram
 from atom.metrics.histogram import LATENCY_BUCKETS
 
 logger = logging.getLogger("atom")
+
+_KIND_FORWARD = "forward"
+_KIND_SAMPLE = "sample"
+_KIND_PROPOSE = "propose"
 
 
 @dataclass
@@ -54,6 +63,20 @@ class GPUForwardMetrics:
             buckets=LATENCY_BUCKETS,
             registry=registry,
         ).labels(**labels)
+        self.sample = Histogram(
+            "atom:gpu_sample_seconds",
+            "Per-worker device-event duration of sampling and rejection sampling inside postprocess, including any TP/PCP broadcasts of sampled ids before forward_done_event. Excludes prepare_model, target forward and MTP propose. Same ATOM_ENABLE_METRICS_DEVICE_TIMER gate as gpu_forward_seconds.",
+            labels,
+            buckets=LATENCY_BUCKETS,
+            registry=registry,
+        ).labels(**labels)
+        self.propose = Histogram(
+            "atom:gpu_propose_seconds",
+            "Per-worker device-event duration of the whole MTP propose() call (all draft steps summed). Excludes prepare_model, target forward and sampling. Same ATOM_ENABLE_METRICS_DEVICE_TIMER gate as gpu_forward_seconds.",
+            labels,
+            buckets=LATENCY_BUCKETS,
+            registry=registry,
+        ).labels(**labels)
         self.prefill_requests = Histogram(
             "atom:prefill_request_gpu_forward_seconds",
             "Per-worker sum of participating batch device durations across a request's initial local prefill chunks; once after all chunks complete, not exclusive request compute time.",
@@ -92,11 +115,18 @@ class GPUForwardMetrics:
             self.requests.move_to_end(req_id)
         return states
 
+    def _histogram(self, kind: str):
+        if kind == _KIND_SAMPLE:
+            return self.sample
+        if kind == _KIND_PROPOSE:
+            return self.propose
+        return self.steps
+
     def poll(self):
         # Stop at the first unfinished event instead of scanning the backlog.
         # Other streams may finish sooner; their samples wait for the head.
         while self.pending:
-            start, end, requests = self.pending[0]
+            kind, start, end, requests = self.pending[0]
             if not end.query():
                 break
             self.pending.popleft()
@@ -112,25 +142,37 @@ class GPUForwardMetrics:
                         self._discard_request(state.req_id)
                 self.free.append((start, end))
                 continue
-            self.steps.observe(seconds)
-            for state in requests:
-                state.pending -= 1
-                if not state.valid:
-                    continue
-                state.total += seconds
-                # Publish only once every chunk has been measured.
-                if state.final and state.pending == 0:
-                    self.prefill_requests.observe(state.total)
-                    del self.requests[state.req_id]
+            self._histogram(kind).observe(seconds)
+            if kind == _KIND_FORWARD:
+                for state in requests:
+                    state.pending -= 1
+                    if not state.valid:
+                        continue
+                    state.total += seconds
+                    # Publish only once every chunk has been measured.
+                    if state.final and state.pending == 0:
+                        self.prefill_requests.observe(state.total)
+                        del self.requests[state.req_id]
             self.free.append((start, end))
 
-    @contextmanager
     def measure(self, batch):
+        return self._measure(batch, _KIND_FORWARD, track_requests=True)
+
+    def measure_sample(self, batch):
+        """Device-event duration of sampling + rejection sampling in postprocess."""
+        return self._measure(batch, _KIND_SAMPLE, track_requests=False)
+
+    def measure_propose(self, batch):
+        """Device-event duration of the whole MTP propose() call (all draft steps)."""
+        return self._measure(batch, _KIND_PROPOSE, track_requests=False)
+
+    @contextmanager
+    def _measure(self, batch, kind: str, *, track_requests: bool):
         self.poll()
         if batch is None or batch.is_dummy_run or not batch.req_ids:
             yield
             return
-        requests = self._request_chunks(batch)
+        requests = self._request_chunks(batch) if track_requests else ()
         if len(self.pending) >= self.max_pending:
             for state in requests:
                 self._discard_request(state.req_id)
@@ -152,7 +194,7 @@ class GPUForwardMetrics:
             # when the next forward reuses it.
             self.free.append((start, end))
             raise
-        self.pending.append((start, end, requests))
+        self.pending.append((kind, start, end, requests))
 
 
 def record_gpu_forward(func):

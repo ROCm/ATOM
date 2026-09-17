@@ -47,9 +47,9 @@
 "use strict";
 const DATA=JSON.parse(document.getElementById("report-data").textContent);
 const META=DATA.meta, GLOBAL_STAT_KEYS=["mean","p50","p90","p95","p99"];
-const STAT_KEYS=[...GLOBAL_STAT_KEYS,"running","waiting","waiting_kv","used","evictable","vacant","hit","reuse","lmcache","gpu"].filter(k=>DATA.panels.some(p=>k in p.series));
-const LABELS={mean:"Mean",p50:"P50",p90:"P90",p95:"P95",p99:"P99",running:"Running",waiting:"Waiting",waiting_kv:"KV waiting",used:"Used",evictable:"Cached / evictable",vacant:"Vacant",hit:"Cache hit",reuse:"Total reuse",gpu:"GPU",lmcache:"LMCache"};
-const COLORS={mean:"#8490a8",p50:"#22a69a",p90:"#6382ef",p95:"#b483da",p99:"#f09b58",running:"#3864e8",waiting:"#f09b58",waiting_kv:"#b483da",used:"#3864e8",evictable:"#22a69a",vacant:"#8490a8",hit:"#22a69a",reuse:"#22a69a",gpu:"#6382ef",lmcache:"#b483da"};
+const STAT_KEYS=[...GLOBAL_STAT_KEYS,"running","waiting","waiting_kv","used","evictable","vacant","hit","reuse","lmcache","gpu","api","engine"].filter(k=>DATA.panels.some(p=>k in p.series));
+const LABELS={mean:"Mean",p50:"P50",p90:"P90",p95:"P95",p99:"P99",running:"Running",waiting:"Waiting",waiting_kv:"KV waiting",used:"Used",evictable:"Cached / evictable",vacant:"Vacant",hit:"Cache hit",reuse:"Total reuse",gpu:"GPU",lmcache:"LMCache",api:"API process",engine:"Engine + workers"};
+const COLORS={mean:"#8490a8",p50:"#22a69a",p90:"#6382ef",p95:"#b483da",p99:"#f09b58",running:"#3864e8",waiting:"#f09b58",waiting_kv:"#b483da",used:"#3864e8",evictable:"#22a69a",vacant:"#8490a8",hit:"#22a69a",reuse:"#22a69a",gpu:"#6382ef",lmcache:"#b483da",api:"#f09b58",engine:"#3864e8"};
 const $=id=>document.getElementById(id), finite=v=>typeof v==="number"&&Number.isFinite(v);
 const fmt=v=>finite(v)?v.toLocaleString("en-US",{maximumFractionDigits:v<10?2:1}):"—";
 const fmtCount=v=>finite(v)?v.toLocaleString("en-US",{maximumFractionDigits:0}):"—";
@@ -106,7 +106,7 @@ for(const b of $("role-controls").querySelectorAll("button")){
  b.disabled=b.dataset.role!=="all"&&!states.some(s=>s.role===b.dataset.role);
  b.onclick=()=>{roleFilter=b.dataset.role;hoverTime=null;activePanel=null;refresh();};
 }
-for(const [key,label] of [["overview","Overview"],["latency","Latency"],["workload","Workload"],["cache","Cache & KV"],["all","All metrics"]]){
+for(const [key,label] of [["overview","Overview"],["latency","Latency"],["workload","Workload"],["cache","Cache & KV"],["host","Host CPU"],["all","All metrics"]]){
  const b=node("button","chip",label);b.dataset.category=key;
  b.onclick=()=>{categoryFilter=key;hoverTime=null;activePanel=null;refresh();};
  $("category-controls").append(b);
