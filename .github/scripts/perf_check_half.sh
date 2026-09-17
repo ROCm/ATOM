@@ -15,7 +15,8 @@
 # tunes it.
 #
 # Expects from the caller's environment: CONTAINER, MODEL_PATH, ARGS,
-# RESULT_FILENAME, plus whatever atom_test.sh itself reads.
+# RESULT_FILENAME, plus whatever atom_test.sh itself reads. DUMMY_WEIGHT_ARGS
+# is optional and appended to ARGS for every phase (see below).
 
 set -euo pipefail
 
@@ -56,7 +57,9 @@ if [ "$HALF" = "warmup" ]; then
   # does not on MI355X, where run 34233036220 still showed +4.19/+5.65/+3.10%
   # at c=64/128/256 across three machines. Launch and model load dominate a
   # phase (~10.4 of 17.6 min at c=64), so matching the measurement costs about
-  # 14% of job wall clock rather than a whole extra phase.
+  # 14% of job wall clock rather than a whole extra phase. Under dummy weights
+  # that split moves the other way -- load falls out and the benchmark is what
+  # is left -- so a full-length warmup costs proportionally more of the job.
   export NUM_PROMPTS_OVERRIDE="${WARMUP_PROMPTS:-$(( CONC * ${WARMUP_MULT:-10} ))}"
   echo "warmup: NUM_PROMPTS_OVERRIDE=${NUM_PROMPTS_OVERRIDE} (results discarded)"
 fi
@@ -77,6 +80,53 @@ git checkout --force --detach "$COMMIT"
 git clean -fdx --exclude=perf-pair --exclude=.git
 git --no-pager log -1 --format='%H %s'
 
+# Weight-loading flags, appended to ARGS for EVERY phase. Deliberately applied
+# here rather than in the matrix cell: the pairing is only valid if base, head
+# and warmup load weights the same way, and a single append point makes a
+# half-applied setting impossible to express.
+#
+# What this buys, measured on the MI355X runners this workflow uses (ATOM
+# Benchmark run 35121706150, 2026-09-16, 31 successful jobs, grepped from
+# `Model load done: ... (weights loaded in Xs)`):
+#
+#     DeepSeek-V4-Pro     297s median (282-341, n=8)
+#     GLM-5.2-FP8         344s        (311-425, n=3)
+#     Kimi-K3             635s        (n=1)
+#     MiniMax-M3-MXFP8    156s        (147-237, n=3)
+#     gpt-oss-120b         37s        (35-37,   n=6)
+#
+# against a 369s benchmark for the same DeepSeek cell -- model load is 76% of
+# the measurement it precedes, and this workflow pays it three times per job.
+# `--load_dummy=xavier` drops it to ~0.1s (no tensor is materialized).
+#
+# It is not free. Measured locally (MI308X, DeepSeek-V4-Flash, tp=8) dummy
+# weights ran 20.2% slower -- 4542 vs 5425 tok/s, TPOT 121.0 vs 100.6ms --
+# because `--fake-eplb` installs a deterministic synthetic routing table that
+# lights all 256 experts every decode step, where learned routing is skewed
+# and lights fewer. Net on the DeepSeek cell: 297 + ~30s of shorter cudagraph
+# capture saved, 0.202 x 369 = 75s of longer benchmark paid, about +4 min per
+# phase and +12 min per job. Break-even is a ~44s load, which every model here
+# except gpt-oss-120b clears by 3x or more.
+#
+# `--fake-eplb` is required, not optional: `--load_dummy` alone leaves the
+# recycled `e_score_correction_bias` in place, which collapses every token onto
+# one EP rank (see moe.py:2899). MXFP4 is the validated dummy path
+# (loader.py:179); FP8 is made finite but is not distribution-realistic.
+#
+# TWO THINGS THIS CHANGES FOR THE READER, both handled in the workflow:
+#   - absolute numbers are NOT comparable to the dashboard, so the history
+#     baseline check is switched off when this is set;
+#   - sensitivity to a real regression under dummy weights has NOT been
+#     measured against a known injection. The pairing still holds base and
+#     head to the same footing, so a delta is still a delta, but its magnitude
+#     may not match what real weights would have reported.
+#
+# Set DUMMY_WEIGHT_ARGS to the empty string to measure on real weights.
+LAUNCH_ARGS="${ARGS:-}${DUMMY_WEIGHT_ARGS:+ ${DUMMY_WEIGHT_ARGS}}"
+if [ -n "${DUMMY_WEIGHT_ARGS:-}" ]; then
+  echo "${HALF}: dummy weights active -- ${DUMMY_WEIGHT_ARGS}"
+fi
+
 if [ -n "${MODEL_HOST_ROOT:-}" ]; then
   model_path="/models/${MODEL_PATH}"
 else
@@ -88,7 +138,7 @@ echo "========== ${HALF}: launching server =========="
 # exactly once. Substituting ARGS into a `bash -lc "..."` string instead
 # collides single-quoted JSON values with the outer quotes and strips them
 # (argparse then rejects the value). Mirrors benchmark-tmpl.yml.
-echo ".github/scripts/atom_test.sh launch ${model_path} ${ARGS:-}" \
+echo ".github/scripts/atom_test.sh launch ${model_path} ${LAUNCH_ARGS}" \
   | docker exec -i "$CONTAINER" bash -l
 
 echo "========== ${HALF}: running benchmark =========="
@@ -101,7 +151,7 @@ echo "========== ${HALF}: running benchmark =========="
 # on how the container was created.
 docker exec \
   -e RESULT_FILENAME="${RESULT_FILENAME}" \
-  -e SERVER_ARGS="${ARGS:-}" \
+  -e SERVER_ARGS="${LAUNCH_ARGS}" \
   -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS:-}" \
   -e ISL="${ISL}" \
   -e OSL="${OSL}" \

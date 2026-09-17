@@ -18,6 +18,15 @@ name: ATOM Perf Check (PR)
 # container, and no new script duplicating benchmark-tmpl.yml's launch/bench
 # logic -- atom_test.sh already does all of it.
 #
+# Weights are loaded dummy (`DUMMY_WEIGHT_ARGS`, appended to every phase by
+# perf_check_half.sh). Model load is 76% of the benchmark it precedes on these
+# runners -- 297s median against a 369s DeepSeek-V4-Pro cell, measured from 31
+# jobs of ATOM Benchmark run 35121706150 -- and this job pays it three times.
+# The trade is a 20.2% slower benchmark and absolute numbers that no longer
+# line up with the dashboard; the net is about 12 minutes off a DeepSeek job.
+# Clear the variable to measure on real weights. Full rationale, measurements
+# and caveats live next to the append point in perf_check_half.sh.
+#
 # Concurrency levels split into two roles. Levels at or above 64 decide the
 # verdict; 4 and 32 are measured and displayed but never judged, because low
 # concurrency pollutes a verdict in both directions -- it manufactures false
@@ -65,6 +74,20 @@ env:
   # no mapping is needed (and a job-level one is not even allowed to
   # reference env).
   WARMUP_MULT: 10
+
+  # Weight-loading flags appended to every phase by perf_check_half.sh, which
+  # carries the full rationale and the measurements. In short: model load is
+  # 76% of the benchmark it precedes on the MI355X runners (297s vs 369s for
+  # DeepSeek-V4-Pro), and this job pays it three times. Dummy weights trade
+  # that for a 20.2% slower benchmark and win by ~12 min per job.
+  #
+  # Not PERF_-prefixed, for the same reason as WARMUP_MULT: workflow-level env
+  # is inherited straight into every step and perf_check_half.sh reads this
+  # name. Set to "" to measure on real weights.
+  #
+  # `--fake-eplb` is not decoration -- `--load_dummy` alone leaves a recycled
+  # routing bias that collapses every token onto one EP rank.
+  DUMMY_WEIGHT_ARGS: "--load_dummy=xavier --fake-eplb"
 
 jobs:
   # ---------------------------------------------------------------- gate ---
@@ -337,6 +360,7 @@ jobs:
               "base_sha": os.environ["BASE_SHA"],
               "head_sha": os.environ["HEAD_SHA"],
               "runner": os.environ["RUNNER_NAME"],
+              "dummy_weight_args": os.environ.get("DUMMY_WEIGHT_ARGS", ""),
           }
           pathlib.Path("perf-pair/provenance.json").write_text(json.dumps(meta))
           PY
@@ -406,6 +430,9 @@ jobs:
 
       - name: Fetch the dashboard history
         id: history
+        # Skipped under dummy weights: the judge would not use it, and a step
+        # that fetches a baseline nobody consults reads like one that does.
+        if: env.DUMMY_WEIGHT_ARGS == ''
         continue-on-error: true
         run: |
           set -euo pipefail
@@ -426,13 +453,31 @@ jobs:
           # moving together needs no noise estimate -- and loses the escalation
           # and the baseline check. Degrading is correct; pretending we have a
           # baseline reference we could not fetch would not be.
-          if [ -s dashboard-data.js ]; then
+          # Dummy weights move the absolute operating point (-16.3% throughput
+          # where it was measured), so every history-derived check is comparing
+          # against runs of a different thing: the baseline sanity check would
+          # fire on every PR, and the sigma band behind the single-level
+          # escalation is a real-weight noise estimate. Both go off. The paired
+          # criterion -- base and head on one machine, one image, one container
+          # -- needs no history and is unaffected.
+          if [ -n "${DUMMY_WEIGHT_ARGS:-}" ]; then
+            echo "::warning::dummy weights active -- baseline sanity check and sigma gate are off, and absolute numbers are not comparable to the dashboard"
+            HISTORY_ARG="--no-history"
+          elif [ -s dashboard-data.js ]; then
             HISTORY_ARG="--history dashboard-data.js"
           else
             echo "::warning::no dashboard history -- baseline sanity check and sigma gate are off"
             HISTORY_ARG="--no-history"
           fi
           CONTEXT="base \`${{ github.event.pull_request.base.sha }}\` -> head \`${{ github.event.pull_request.head.sha }}\` · \`${{ steps.collect.outputs.digest }}\`"
+          # Say it in the comment, not only in the log. A reader who takes an
+          # absolute number from this table to the dashboard has to be told it
+          # will not match, and that the delta's magnitude is not calibrated
+          # against a known injection.
+          if [ -n "${DUMMY_WEIGHT_ARGS:-}" ]; then
+            NOTE="**Measured on dummy weights** (\`${DUMMY_WEIGHT_ARGS}\`) -- absolute throughput is not comparable to the dashboard, and the history-based baseline check is off. Base and head are still paired on one machine, image and container, so the delta is a like-for-like comparison, but its magnitude has not been calibrated against a known regression."
+            CONTEXT="${CONTEXT}"$'\n\n'"${NOTE}"
+          fi
           # --expect-entries is not optional: an entry whose job died entirely
           # produces no files at all, so without it a run where most jobs failed
           # reads as clean.
