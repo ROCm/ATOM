@@ -197,6 +197,8 @@ class FusedMoEParallelConfig:
     # times finer and each rank repeats the gathered tokens that many times.
     dp_logical_ratio: int = 1
     requested_all2all_backend: str = "auto"
+    # The other half of --all2all-backend: which MoRI kernel family to ask for.
+    low_latency: bool = False
 
     @property
     def selected_all2all_backend(self) -> str | None:
@@ -247,6 +249,7 @@ class FusedMoEParallelConfig:
         requested_all2all_backend = getattr(
             parallel_config, "moe_all2all_backend", "auto"
         )
+        low_latency = getattr(parallel_config, "enable_low_latency", False)
 
         # When EP shards across the flattened DP * TP space (vLLM plugin under
         # EP), the ep rank must be computed in that flattened group space.
@@ -305,6 +308,7 @@ class FusedMoEParallelConfig:
                 use_ep=False,
                 local_ep_size=1,
                 requested_all2all_backend=requested_all2all_backend,
+                low_latency=low_latency,
             )
         # DP + EP / TP + EP / DP + TP + EP
         assert use_ep
@@ -327,6 +331,7 @@ class FusedMoEParallelConfig:
             local_ep_size=atom_config.parallel_config.data_parallel_size_local
             * tp_size_,
             requested_all2all_backend=requested_all2all_backend,
+            low_latency=low_latency,
         )
 
 
@@ -655,6 +660,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             assert quant_config is not None
 
             from atom.model_ops.fused_moe.mori_prepare_finalize import (
+                _NUM_TBO_UBATCHES,
                 resolve_mori_dispatch,
             )
 
@@ -684,6 +690,18 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # dtype above -- MoRI infers dispatch from the tensor, combine from this.
             mori_combine_quant_type = envs.ATOM_MORI_COMBINE_QUANT
 
+            from atom.utils.tbo.ubatching import tbo_enabled
+
+            is_async = tbo_enabled()
+            low_latency = moe.low_latency
+            if all2all_manager.internode and mori_combine_quant_type != "none":
+                # MoRI registers no blockwise combine kernel for these; without
+                # this it fails later, at kernel lookup.
+                raise ValueError(
+                    f"ATOM_MORI_COMBINE_QUANT={mori_combine_quant_type!r} is "
+                    "unsupported on the inter-node MoRI kernels."
+                )
+
             all_to_all_args = {
                 "rank": all2all_manager.rank,
                 "num_ep_ranks": all2all_manager.world_size,
@@ -699,6 +717,8 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 "num_local_experts": moe.num_local_experts,
                 "num_experts_per_token": moe.experts_per_token,
                 "gpu_per_node": moe.moe_parallel_config.local_ep_size,
+                # aiter crosses this with its own internode probe.
+                "low_latency": low_latency,
             }
             if mori_combine_quant_type != "none":
                 # Only inject when actually requested: aiter's _make_all2all_kwargs
@@ -706,55 +726,25 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 # an unexpected "quant_type" kwarg.
                 all_to_all_args["quant_type"] = mori_combine_quant_type
 
-            from atom.utils.tbo.ubatching import tbo_enabled
-
-            handle = all2all_manager.get_handle(all_to_all_args)
-            is_async = tbo_enabled()
-            atom_config = get_current_atom_config()
-            low_latency = getattr(atom_config, "enable_low_latency", False)
-
-            common_args = {
-                "rank": all2all_manager.rank,
-                "world_size": all2all_manager.world_size,
-                "hidden_dim": moe.hidden_dim,
-                "scale_dim": scale_dim,
-                # Match max_num_tokens_per_dp_rank / max_tokens_per_rank (= moe.max_num_tokens);
-                # leaving this hardcoded 16384 truncates the TBO mori buffer at mbt>16384.
-                "max_num_inp_token_per_rank": moe.max_num_tokens,
-                "num_local_experts": moe.num_local_experts,
-                "num_experts_per_token": moe.experts_per_token,
-                "gpu_per_node": moe.moe_parallel_config.local_ep_size,
-                # The same probe the sync handle uses (aiter sets it from
-                # in_the_same_node_as). Sharing one source keeps prefill and
-                # decode on the same kernel type -- inferring it from
-                # `world_size <= 8` instead let them disagree on a 2-node x
-                # 4-GPU group, running IntraNode kernels across a boundary
-                # that has no P2P mapping.
-                "internode": all2all_manager.internode,
-                "data_type_itemsize": moe.in_dtype.itemsize,
-                "max_token_type_size": moe.in_dtype.itemsize,
-                "scale_type_size": scale_type_size,
-                "quant_type": mori_combine_quant_type,
-            }
-
+            # An op holds routing state from its dispatch to its combine, so
+            # concurrent TBO ubatches cannot share the cached one.
+            sync_handle = all2all_manager.get_handle(all_to_all_args)
             tbo_mori_ops = None
-            # Prefill (sync path). aiter picks its kernel from the same
-            # internode probe, so this is not necessarily IntraNode.
-            sync_handle = handle
             if is_async:
-                from atom.model_ops.fused_moe.mori_prepare_finalize import (
-                    _NUM_TBO_UBATCHES,
-                    init_mori_op,
+                tbo_mori_ops = all2all_manager.get_handles(
+                    all_to_all_args, _NUM_TBO_UBATCHES
                 )
 
-                tbo_mori_ops = [
-                    init_mori_op(
-                        **common_args,
-                        low_latency=low_latency,
-                        instance_id=i,
-                    )
-                    for i in range(_NUM_TBO_UBATCHES)
-                ]
+            # Off the op, not re-derived: the mapping is aiter's.
+            kernel_name = sync_handle.config.kernel_type.name
+            logger.info(
+                "[MORI] EP all2all kernel=%s internode=%s low_latency=%s "
+                "tbo_ubatch_ops=%d",
+                kernel_name,
+                all2all_manager.internode,
+                low_latency,
+                len(tbo_mori_ops) if tbo_mori_ops else 0,
+            )
 
             prepare_finalize = MoriPrepareAndFinalize(
                 sync_handle,
@@ -763,7 +753,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 dispatch_format=dispatch_format,
                 is_async=is_async,
                 tbo_mori_ops=tbo_mori_ops,
-                low_latency=low_latency,
             )
 
         return prepare_finalize
