@@ -959,6 +959,19 @@ class Scheduler:
         if callable(callback):
             callback(req_id)
 
+    def _connector_source_blocks_released(self, seq: Sequence) -> None:
+        """Tell the connector its source blocks are back in the pool.
+
+        The terminal half of `request_finished` for a connector that deferred
+        the free. Not `request_finished` a second time: that one also takes the
+        P/D send claim, so re-invoking it would re-arm the claim this release
+        just cleared. Guarded -- the base declares a no-op default, but a
+        connector stub need not have it.
+        """
+        callback = getattr(self.kv_connector, "source_blocks_released", None)
+        if callable(callback):
+            callback(seq)
+
     def _maybe_release_deferred(self, seq: Sequence) -> None:
         """Release once every connector has let go of the source blocks.
 
@@ -969,7 +982,9 @@ class Scheduler:
 
         Deliberately does not call `request_finished` -- callers arrive with the
         request already finished, and a second call re-arms the P/D send claim
-        this check just cleared.
+        this check just cleared. The block-lifetime cleanup that the second call
+        used to carry is now its own hook, `source_blocks_released`, invoked
+        below once the free has actually happened.
         """
         if (
             seq.id not in self.deferred_free_blocks
@@ -980,6 +995,9 @@ class Scheduler:
 
         self.deferred_free_blocks.pop(seq.id, None)
         self.block_manager.deallocate(seq)
+        # After the free, not before: the connector may only forget the state
+        # keyed on these blocks once nothing can read them again.
+        self._connector_source_blocks_released(seq)
 
     def _save_abandon_timeout_s(self) -> float:
         """Seconds a deferred save may sit before reclamation, or 0 to disable.
@@ -1008,7 +1026,9 @@ class Scheduler:
 
         Abandoning the save is not the same as freeing the blocks: the release
         still goes through `should_defer_free`, so an unreported P/D send keeps
-        its source alive and `finished_sending` frees it later. Reclamation
+        its source alive and `finished_sending` frees it later -- which is why
+        the release attempt repeats every interval while the abandon happens
+        once (`_save_abandoned`). Reclamation
         does not re-invoke `request_finished`: it was already called when the
         request finished. It does notify the connector via `abandon_save` -- freeing
         the blocks here is not enough on its own: the connector holds the save in
@@ -1057,26 +1077,35 @@ class Scheduler:
             and now - seq._deferred_save_at >= timeout
         ]
         released = 0
+        abandoned = 0
         for seq in stalled:
-            self._connector_abandon_save(seq)
-            # One shot: clearing the stamp drops this seq out of `stalled`. If a
-            # send still claims the blocks the release below no-ops and
-            # `finished_sending` becomes their only releaser -- as it already is
-            # for any producer request.
-            seq._deferred_save_at = None
-            self._abandoned_saves += 1
+            # The save is abandoned once; the release attempt is not. Whether
+            # the blocks come back is a separate question -- a send that has
+            # not reported still claims them -- and giving up on the first
+            # attempt (by clearing the stamp) was how an unanswerable claim,
+            # an abort's above all, lost its blocks for good. Retry each
+            # interval instead, so a late `finished_sending`, or an explicit
+            # retirement, is enough to collect them.
+            if not getattr(seq, "_save_abandoned", False):
+                self._connector_abandon_save(seq)
+                seq._save_abandoned = True
+                self._abandoned_saves += 1
+                abandoned += 1
             self._maybe_release_deferred(seq)
             if seq.id not in self.deferred_free_blocks:
+                seq._deferred_save_at = None
                 released += 1
-        if stalled:
+        if abandoned or released:
             logger.warning(
                 "Abandoned %d offload save(s) still deferred after %.0fs with no "
                 "completion report (LMCache force-unpins a stalled save without "
-                "reporting it); released %d allocation(s), retaining any source "
-                "a P/D send still owns. total abandoned_saves=%d",
-                len(stalled),
+                "reporting it); released %d of %d stalled allocation(s), retrying "
+                "the rest while a P/D send still owns the source. "
+                "total abandoned_saves=%d",
+                abandoned,
                 timeout,
                 released,
+                len(stalled),
                 self._abandoned_saves,
             )
         return released + lease_reclaims
@@ -1967,6 +1996,9 @@ class Scheduler:
             # Already-dispatched loads retain the completion-driven path below.
             self.kv_connector.cancel_pending_load(seq)
             self.kv_connector.request_finished(seq)
+            # No send will ever be issued for an abort, so nothing would
+            # otherwise retire a claim taken above. See `postprocess`.
+            self._connector_send_finished(seq.id)
             self.deferred_free_blocks[seq.id] = seq
             self._maybe_release_deferred(seq)
         if not has_inflight_load or not self._connector_flag("is_offload"):
@@ -1995,6 +2027,9 @@ class Scheduler:
         callback = getattr(self.kv_connector, "request_finished", None)
         if callable(callback):
             callback(seq)
+        # As in `_reject_aborted_waiting`: an abort never sends, so the
+        # scheduler retires the send claim rather than waiting for a report.
+        self._connector_send_finished(seq.id)
         self._maybe_release_deferred(seq)
 
     def _finish_aborted_load_cleanup(self, req_id) -> bool:
@@ -3032,6 +3067,30 @@ class Scheduler:
                 ),
             )
 
+            if leave_reason is not None:
+                # Before `request_finished`, not after: a connector's claim on
+                # this request's source blocks is conditional on it (mooncake
+                # and moriio decline to claim an abort, since an abort never
+                # sends and the claim would never clear). Assigned here rather
+                # than in the finish block below, which runs after the one call
+                # that reads it.
+                seq.leave_reason = leave_reason
+                if self.kv_connector is not None:
+                    # Exactly once per finished request. Side-effecting since
+                    # the source claim moved into it, and it has to run whether
+                    # or not there is a stream queue, so it cannot live inside
+                    # the output block below.
+                    callback = getattr(self.kv_connector, "request_finished", None)
+                    if callable(callback):
+                        callback(seq)
+                    if leave_reason == "aborted":
+                        # The scheduler knows no send will ever be issued for
+                        # this request, so it retires the claim itself rather
+                        # than relying on every backend to re-derive that from
+                        # `leave_reason`. Nothing else would: `send_finished`
+                        # is driven by a completion report that is not coming.
+                        self._connector_send_finished(seq.id)
+
             # Prepare stream output
             # A terminal event is required even when truncation leaves no
             # tokens (for example max_tokens <= 0). Async consumers wait for
@@ -3039,8 +3098,6 @@ class Scheduler:
             if stream_output_queue is not None and (
                 new_tokens or leave_reason is not None
             ):
-                if self.kv_connector is not None and leave_reason is not None:
-                    self.kv_connector.request_finished(seq)
                 output_tokens_list = (
                     list(new_tokens)
                     if isinstance(new_tokens, tuple)
@@ -3071,7 +3128,8 @@ class Scheduler:
                 #     f"Sequence {seq.id} finished with reason: {leave_reason}, {seq.token_ids[-8:]=}"
                 # )
                 seq.num_tokens = num_tokens
-                seq.leave_reason = leave_reason
+                # `seq.leave_reason` was already assigned above, before
+                # `request_finished` read it.
                 seq.status = SequenceStatus.FINISHED
                 self.total_finished_requests += 1
                 self.total_prompt_tokens += int(seq.num_prompt_tokens)
@@ -3107,8 +3165,9 @@ class Scheduler:
                 seq.is_partial_prefill = False
                 self._partial_prefill_count -= 1
             if self.kv_connector is not None:
-                if hasattr(self.kv_connector, "request_finished"):
-                    self.kv_connector.request_finished(seq)
+                # `request_finished` already ran once, above, while the reason
+                # was being settled -- it must not run again now that the claim
+                # it takes is a side effect.
                 if self._connector_should_defer_free(seq):
                     protected = self._connector_protected_block_ids(seq)
                     if protected is not None:

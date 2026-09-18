@@ -2711,6 +2711,25 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         self._load_save_floors.pop(sid, None)
         return True
 
+    def _drop_finished_save_state(self, sid: str, seq) -> None:
+        """Forget a finished request's save bookkeeping.
+
+        Keyed on the *blocks*, not the request: `_save_tracker` holds the
+        `Sequence` and is what `build_connector_meta`'s save loop iterates
+        (reading `seq.block_table` straight out of it), so it may only be
+        dropped once nothing can still read that block table. The sidecar
+        failure set and the watermark records are scoped to the same tracker
+        entry and go with it. Both terminals route here -- `request_finished`
+        when the free was not deferred at all, `source_blocks_released` when
+        it was.
+        """
+        entry = self._save_tracker.get(sid)
+        if entry is None or entry[0] is not seq:
+            return
+        self._save_tracker.pop(sid, None)
+        self._failed_sidecar_saves.pop(sid, None)
+        self._save_watermark_rollback.pop(sid, None)
+
     def request_finished(self, seq) -> None:
         sid = str(seq.id)
         self._release_failed_load_attempt(sid, seq)
@@ -2725,13 +2744,23 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         cached = self._sidecar_hash_cache.get(sid)
         if cached is not None and cached[0] is seq:
             self._sidecar_hash_cache.pop(sid, None)
-        entry = self._save_tracker.get(sid)
-        if entry is not None and entry[0] is seq and not self.should_defer_free(seq):
-            self._save_tracker.pop(sid, None)
-            self._failed_sidecar_saves.pop(sid, None)
-            self._save_watermark_rollback.pop(sid, None)
+        if not self.should_defer_free(seq):
+            self._drop_finished_save_state(sid, seq)
         if hasattr(seq, "_load_operation"):
             delattr(seq, "_load_operation")
+
+    def source_blocks_released(self, seq) -> None:
+        """Terminal for the deferred path: the blocks are back in the pool.
+
+        DSV4 always defers -- it has no early-release exit and so no
+        `_finish_retired_request` -- which makes this the *only* terminal its
+        normal completion path ever reaches. Without it every request leaks a
+        tracker entry (and the `Sequence` it pins), and a request whose
+        watermark was rolled back by a failed save keeps `page_save_due` True
+        forever, re-emitting a save against a freed, reusable block table on
+        every step.
+        """
+        self._drop_finished_save_state(str(seq.id), seq)
 
 
 __all__ = [

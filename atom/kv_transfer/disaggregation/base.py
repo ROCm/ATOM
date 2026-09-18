@@ -102,3 +102,17 @@ class KVConnectorSchedulerBase(ABC):
     def request_finished(self, seq: Any) -> None:
         """Populate KV transfer output metadata when a request completes."""
         ...
+
+    def source_blocks_released(self, seq: Any) -> None:
+        """The scheduler has returned this request's source blocks to the pool.
+
+        The terminal half of `request_finished` for a connector that deferred
+        the free: at `request_finished` time `should_defer_free` is still True,
+        so any state whose lifetime is the *blocks* rather than the *request*
+        cannot be dropped yet. This is the call that says it can.
+
+        Deliberately not `request_finished` called a second time: that one also
+        takes the P/D send claim, and re-invoking it would re-arm the very claim
+        the release just cleared. Default no-op -- only connectors that own
+        block-lifetime state (the offload schedulers) implement it.
+        """

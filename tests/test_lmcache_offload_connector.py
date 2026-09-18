@@ -120,7 +120,7 @@ class _OffloadMixinStub(OffloadSchedulerMixin):
     """Concrete `OffloadSchedulerMixin` for tests that exercise only frontier and
     completion mechanics, not a real save/load lifecycle.
 
-    The mixin now declares the six save/load methods abstract (a missing
+    The mixin now declares the seven save/load methods abstract (a missing
     forwarder is a construction-time TypeError, not a silent no-op behind the
     shell). Test doubles must therefore satisfy the contract; this base fills it
     with harmless defaults so the ABC constructs, and each local `_Connector`
@@ -133,6 +133,7 @@ class _OffloadMixinStub(OffloadSchedulerMixin):
     def save_finished(self, req_id) -> None: ...
     def abandon_save(self, req_id) -> None: ...
     def release_stalled_save(self, seq) -> None: ...
+    def source_blocks_released(self, seq) -> None: ...
     def load_failed(self, req_id) -> bool:
         return False
 
@@ -3030,6 +3031,64 @@ def test_page_watermark_records_do_not_outlive_their_request():
     sched._save_inflight.clear()
     sched.request_finished(seq)
     assert sched._save_watermark_rollback == {}
+
+
+def test_a_deferred_request_is_forgotten_when_its_blocks_come_back():
+    """`request_finished` cannot be the terminal for a request that defers.
+
+    It runs while `should_defer_free` is still True -- the save is the reason
+    the blocks are held -- so the tracker, which holds the `Sequence` and is
+    what the save loop iterates, has to survive it. `save_finished` clears only
+    `_save_inflight`, and `abandon_save` / `release_stalled_save` are failure
+    exits, so nothing else ever drops it: the scheduler saying the blocks are
+    back is the only remaining terminal. Miss it and every completed request
+    leaks its tracker entry, and one whose watermark was rolled back keeps
+    re-emitting saves against a freed, reusable block table.
+    """
+    sched = _scheduler()
+    seq = SimpleNamespace(
+        id=740,
+        token_ids=list(range(16)),
+        block_table=[1, 2, 3, 4],
+        num_prompt_tokens=16,
+        num_cached_tokens=8,
+        has_per_req_cache=False,
+    )
+    sched._save_tracker["740"] = [seq, 0]
+    sched._failed_sidecar_saves["740"] = {(8, 0xABC)}
+    sched.build_connector_meta()
+    assert sched._save_inflight["740"] and sched._save_watermark_rollback["740"]
+
+    sched.request_finished(seq)
+    assert sched.should_defer_free(seq) is True
+    assert sched._save_tracker["740"][0] is seq, "the save still reads these blocks"
+
+    # The save reports; nothing is deferring the free any more.
+    sched._save_inflight.clear()
+    assert sched.should_defer_free(seq) is False
+    assert "740" in sched._save_tracker, "completion alone does not retire it"
+
+    sched.source_blocks_released(seq)
+
+    assert sched._save_tracker == {}
+    assert sched._failed_sidecar_saves == {}
+    assert sched._save_watermark_rollback == {}
+
+
+def test_a_released_request_does_not_take_a_successors_tracker_entry():
+    """Identity-guarded, like every other terminal here.
+
+    A recycled request id whose new lifecycle has already registered must not
+    lose its entry to the previous one's release.
+    """
+    sched = _scheduler()
+    old = SimpleNamespace(id=741)
+    new = SimpleNamespace(id=741)
+    sched._save_tracker["741"] = [new, 0]
+
+    sched.source_blocks_released(old)
+
+    assert sched._save_tracker["741"][0] is new
 
 
 def test_worker_reports_a_page_verdict_on_every_terminal_path():
@@ -6261,7 +6320,7 @@ def test_offload_mixin_lifecycle_is_enforced_at_construction():
     """The abstract lifecycle contract is enforcement, not documentation.
 
     `OffloadSchedulerMixin` inherits `ABC`, so ABCMeta refuses to instantiate a
-    subclass that leaves any of the six save/load methods unimplemented. This is
+    subclass that leaves any of the seven save/load methods unimplemented. This is
     the mechanism that turns a missing forwarder into a construction-time
     TypeError instead of a silent no-op behind the delegating shell -- the
     failure mode that let DSV4 ship without `abandon_save`. (On a *plain* class
@@ -6274,6 +6333,8 @@ def test_offload_mixin_lifecycle_is_enforced_at_construction():
         def save_finished(self, req_id): ...
 
         def release_stalled_save(self, seq): ...
+
+        def source_blocks_released(self, seq): ...
 
         def load_failed(self, req_id):
             return False

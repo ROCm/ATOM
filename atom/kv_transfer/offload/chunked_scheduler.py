@@ -856,6 +856,19 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             if getattr(seq, "_load_operation", None) == operation:
                 delattr(seq, "_load_operation")
 
+    def _drop_finished_save_state(self, sid: str, seq) -> None:
+        """Forget a finished request's save bookkeeping.
+
+        Keyed on the *blocks*, not the request: the tracker entry holds the
+        `Sequence` and is what `build_connector_meta`'s save loop iterates, so
+        it may only be dropped once nothing can still read that block table.
+        Both terminals route here -- `request_finished` when the free was not
+        deferred at all, `source_blocks_released` when it was.
+        """
+        entry = self._save_tracker.get(sid)
+        if entry is not None and entry[0] is seq:
+            self._save_tracker.pop(sid, None)
+
     def request_finished(self, seq) -> None:
         sid = str(seq.id)
         if self._load_lifecycles.get(sid) is seq:
@@ -878,12 +891,22 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                     int(getattr(seq, "num_cached_tokens", 0)),
                     int(seq.num_prompt_tokens),
                 )
-                if not self.should_defer_free(seq):
-                    self._save_tracker.pop(sid, None)
-            elif not self.should_defer_free(seq):
-                self._save_tracker.pop(sid, None)
+            if not self.should_defer_free(seq):
+                self._drop_finished_save_state(sid, seq)
         if hasattr(seq, "_load_operation"):
             delattr(seq, "_load_operation")
+
+    def source_blocks_released(self, seq) -> None:
+        """Terminal for the deferred path: the blocks are back in the pool.
+
+        `request_finished` ran while `should_defer_free` was still True, so it
+        left the tracker in place. Nothing else pops it on a save that
+        *completes* normally (`save_finished` clears only `_save_inflight`;
+        `abandon_save` and `release_stalled_save` cover the failure exits), so
+        without this the entry -- and the `Sequence` it pins -- lives forever,
+        and the save loop keeps visiting a freed, reusable block table.
+        """
+        self._drop_finished_save_state(str(seq.id), seq)
 
 
 __all__ = [

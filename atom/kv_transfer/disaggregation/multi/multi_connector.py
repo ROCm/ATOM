@@ -486,6 +486,15 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             if hasattr(c, "request_finished"):
                 c.request_finished(seq)
 
+    def source_blocks_released(self, seq: Any) -> None:
+        # The terminal half of `request_finished` for whichever sub deferred
+        # the free. Fanned to all: only the offload sub keeps block-lifetime
+        # state, and the default is a no-op.
+        for c in self._connectors:
+            fn = getattr(c, "source_blocks_released", None)
+            if callable(fn):
+                fn(seq)
+
     def abandon_save(self, req_id: Any) -> None:
         # Reclamation of a stalled offload save (see
         # `DenseOffloadConnector.abandon_save`). Only the offload sub tracks

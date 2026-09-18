@@ -453,7 +453,9 @@ class OffloadSchedulerMixin(ABC):
 
     # Save/load lifecycle contract. Declared abstract so a missing forwarder is
     # a construction-time TypeError, not a silent no-op behind the delegating
-    # shell -- the failure mode that let DSV4 ship without abandon_save. The
+    # shell -- the failure mode that let DSV4 ship without abandon_save, and
+    # later without the `source_blocks_released` terminal that is its only exit
+    # for a request whose save completed normally. The
     # bodies differ by layout (dense keeps one save per request; DSV4 keeps a
     # set plus a SLOT sidecar), so each impl supplies its own; the contract
     # detail lives on those concrete overrides.
@@ -463,6 +465,8 @@ class OffloadSchedulerMixin(ABC):
     def abandon_save(self, req_id) -> None: ...
     @abstractmethod
     def release_stalled_save(self, seq) -> None: ...
+    @abstractmethod
+    def source_blocks_released(self, seq) -> None: ...
     @abstractmethod
     def load_failed(self, req_id) -> bool: ...
     @abstractmethod

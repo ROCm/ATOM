@@ -139,6 +139,9 @@ def test_view_accepts_the_frozen_placement_the_chunked_scheduler_writes():
     scheduler._release_failed_load_attempt = (
         ChunkedOffloadSchedulerBase._release_failed_load_attempt.__get__(scheduler)
     )
+    scheduler._drop_finished_save_state = (
+        ChunkedOffloadSchedulerBase._drop_finished_save_state.__get__(scheduler)
+    )
 
     ChunkedOffloadSchedulerBase.request_finished(scheduler, view)
 

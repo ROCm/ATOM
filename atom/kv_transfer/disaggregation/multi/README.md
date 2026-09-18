@@ -53,7 +53,7 @@ blocks / wake sequences.
        (P/D xfer)                (LMCache)
 ```
 
-### The seven hooks (`base.py`)
+### The eight hooks (`base.py`)
 
 | Side | Hook | Purpose |
 |---|---|---|
@@ -61,6 +61,7 @@ blocks / wake sequences.
 | scheduler | `update_state_after_alloc(seq)` | After HBM blocks are allocated, record the "to recv / to save" intent. |
 | scheduler | `build_connector_meta()` | Pack this step's transfer requests into a `meta`. |
 | scheduler | `request_finished(seq)` | Clean up when a request finishes. |
+| scheduler | `source_blocks_released(seq)` | The finished request's HBM is back in the pool — drop the state whose lifetime was those blocks. Default no-op. |
 | worker | `register_kv_caches(tensors)` | Once at init: hand the HBM KV tensor addresses to the connector (it reads/writes through these). |
 | worker | `start_load_kv(meta)` | Kick off the async transfers (load in / save out). |
 | worker | `get_finished()` | Report which req IDs finished sending / recving / saving / failed. |
@@ -133,6 +134,7 @@ on the same tick.
 |         -> start its decode    |                                    |
 |     sent/saved -> check free   |                                    |
 |     finished                   | * request_finished(seq)            |
+|     blocks actually freed      | * source_blocks_released(seq)      |
 |                                                                     |
 |     loop  -->  back to [1]     |                                    |
 +=====================================================================+
@@ -167,6 +169,7 @@ real sub-connectors and fans out / merges per hook. Three classes:
 | update_state_after_alloc   | fan-out to ALL subs            |
 | build_connector_meta       | pack -> MultiConnectorMetadata |
 | request_finished           | fan-out to ALL subs            |
+| source_blocks_released     | fan-out to ALL subs            |
 +=============================================================+
             |                                       |
             v                                       v
@@ -296,8 +299,14 @@ The claim is taken in `request_finished` — the call that hands the peer this
 request's block addresses — and not at allocation. Before it the allocation is
 nobody's but ours, and `Scheduler._is_preemptable` is the negation of this same
 predicate: claiming at alloc would pin every running request on a prefill node
-and leave `_preempt_one_running` nothing to choose under memory pressure. An
-aborted request is never advertised, so it is never claimed.
+and leave `_preempt_one_running` nothing to choose under memory pressure.
+
+An aborted request is never advertised, so it is never claimed — which is why
+`postprocess` settles `seq.leave_reason` *before* the single
+`request_finished` call that reads it, and why `Scheduler` then retires the
+claim itself (`_connector_send_finished`) rather than trusting each backend to
+re-derive "this will never send". Nothing else could: `send_finished` is driven
+by a completion report that is not coming.
 
 > **Scope:** completion reports name a *request*, not a connector, so two send
 > sub-connectors would be indistinguishable in `finished_sending` and the first
@@ -323,7 +332,25 @@ computed in 64-token steps saves `[0,64)` and `[64,128)` during prefill, then
 
 `_reconcile_stalled_deferred_saves` abandons a save whose report never arrives,
 then re-asks `should_defer_free`: if the send still claims the source, the
-blocks stay put and `finished_sending` remains their only releaser.
+blocks stay put and `finished_sending` remains their only releaser. The abandon
+happens once (`seq._save_abandoned`); the release attempt repeats every
+interval, so a late report still collects the blocks.
+
+### The other half of `request_finished`
+
+`request_finished` runs while `should_defer_free` is still true — that is the
+whole point of the park — so a connector cannot use it to drop state whose
+lifetime is the *blocks* rather than the request. The offload schedulers keep
+exactly that: `_save_tracker` holds the `Sequence` and is what the save loop
+iterates, reading `seq.block_table` out of it.
+
+`source_blocks_released(seq)` is the terminal for it, called by
+`_maybe_release_deferred` right after `block_manager.deallocate`. It is
+deliberately not `request_finished` a second time: that call also *takes* the
+send claim, so re-invoking it would re-arm the claim the release just cleared.
+The default on `KVConnectorSchedulerBase` is a no-op; only the offload
+schedulers implement it, and `MultiConnectorScheduler` fans it out. The vLLM
+plugin's `_collect_releases` makes the same split at its own release point.
 
 ### Regression coverage
 
@@ -331,13 +358,17 @@ blocks stay put and `finished_sending` remains their only releaser.
 either order, save operation IDs preserved, >1 producer refused, ownership
 ORed across subs.
 `tests/test_lmcache_offload_connector.py` — chunks 2..N dispatch with no send,
-and each dispatched save getting a full retention window.
+each dispatched save getting a full retention window, and a deferred request's
+save state being dropped at `source_blocks_released` (identity-guarded).
 `tests/test_pd_source_claim.py` — the claim's timing on both P/D backends:
 taken at publication, not at alloc; dropped on `send_finished`; never taken for
 a local-only, aborted, or consumer-side request.
 `tests/test_scheduler.py` — the joint barrier in both completion orders, the
-stall reclaimer not freeing under a pending send, and a running producer
-request staying preemptable.
+stall reclaimer retrying rather than giving up under a pending send, a running
+producer request staying preemptable, an aborted producer request getting its
+blocks back (both because it is never claimed and because the scheduler retires
+a claim taken anyway), and the release reaching `source_blocks_released` without
+a second `request_finished`.
 `tests/test_pp_kv_status.py` — per-operation PP quorum, send not held for it.
 `tests/test_pd_pp.py`, `tests/test_kv_drain_liveness.py` — idle suffix dispatch
 through the shared drain throttle, and engine quiescence.
