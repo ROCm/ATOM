@@ -57,6 +57,12 @@ class _LazyAiterAttr:
 QuantType = _LazyAiterAttr("aiter", "QuantType")
 d_dtypes = _LazyAiterAttr("aiter.utility.dtypes", "d_dtypes")
 
+# Logical quant dtype used for dispatch. NVFP4 is a composite format rather
+# than a torch.dtype: its checkpoint stores packed uint8 weights, FP8-E4M3
+# group scales, and FP32 global scales.
+NVFP4_DTYPE = "nvfp4"
+NVFP4_GROUP_SIZE = 16
+
 # ──────────────────────────────────────────────────────────────────────
 # Typed layer-level spec
 # ──────────────────────────────────────────────────────────────────────
@@ -70,7 +76,8 @@ class LayerQuantConfig:
     # class is created, which would resolve the lazy AITER name at import time
     # and undo the deferral above. The factory runs per instantiation instead.
     quant_type: QuantType = field(default_factory=lambda: QuantType.No)
-    quant_dtype: Any = torch.bfloat16  # torch.dtype (use Any for forward compat)
+    # Usually a torch.dtype; composite formats use a logical dispatch marker.
+    quant_dtype: Any = torch.bfloat16
     is_dynamic: bool = True
     quant_method: str | None = None
 
@@ -115,9 +122,17 @@ def should_stream_online_quant(
         return False
     if quant_config is None or not getattr(quant_config, "online_quant", False):
         return False
+    source_cfg = quant_config.get_layer_quant_config(prefix)
+    online_cfg = quant_config.get_layer_quant_config(prefix, use_online_quant=True)
+    if source_cfg.quant_dtype == NVFP4_DTYPE:
+        # The dedicated source decoder consumes packed group-16/E4M3 weights
+        # plus weight_scale_2 before producing the row-major MXFP4 target.
+        return (
+            online_cfg.quant_type == QuantType.per_1x32
+            and online_cfg.quant_dtype == d_dtypes.get("fp4x2")
+        )
     if not can_dequant_weight_online(source_quant_type, source_quant_dtype):
         return False
-    online_cfg = quant_config.get_layer_quant_config(prefix, use_online_quant=True)
     return not should_skip_online_quant(
         source_quant_type, source_quant_dtype, online_cfg
     )
@@ -227,19 +242,106 @@ def _parse_quant_dtype(dtype_str: str | None) -> Any:
     return torch.bfloat16
 
 
-def _parse_is_dynamic(input_tensors: dict | None) -> bool:
+def _parse_is_dynamic(input_tensors: dict | list | None) -> bool:
     if input_tensors is None:
         return True
+    if isinstance(input_tensors, list):
+        # Sequential scale quantization (NVFP4) has a dynamic FP4 first stage
+        # followed by a static FP8 scale-quant stage. Activation dynamism is
+        # defined by the first stage.
+        if not input_tensors:
+            return True
+        input_tensors = input_tensors[0]
     return input_tensors.get("is_dynamic", True)
+
+
+def _quark_weight_spec(
+    weight: dict | list,
+    input_tensors: dict | list | None,
+) -> tuple[dict, Any | None]:
+    """Return the primary weight stage and an optional logical dtype override.
+
+    ATOM historically accepted only one Quark weight-spec dictionary. Quark's
+    NVFP4 export uses two sequential stages for both weights and activations:
+
+    1. packed FP4 E2M1, per-group with group_size=16;
+    2. FP8 E4M3 per-tensor quantization of the first-stage scales.
+
+    Keep the AITER quant type at per_1x32 for loader compatibility (AITER has
+    no per_1x16 enum), but use ``NVFP4_DTYPE`` as the logical ``quant_dtype``
+    so allocation and execution cannot confuse this format with MXFP4.
+    """
+    weight_is_multi_stage = isinstance(weight, list) and len(weight) > 1
+    input_is_multi_stage = isinstance(input_tensors, list) and len(input_tensors) > 1
+    if not weight_is_multi_stage and not input_is_multi_stage:
+        if isinstance(weight, dict):
+            return weight, None
+        if (
+            isinstance(weight, list)
+            and len(weight) == 1
+            and isinstance(weight[0], dict)
+        ):
+            return weight[0], None
+        raise ValueError(
+            "A single-stage Quark weight config must be a dictionary or a "
+            "one-entry list containing a dictionary."
+        )
+
+    if (
+        not isinstance(weight, list)
+        or len(weight) != 2
+        or not all(isinstance(stage, dict) for stage in weight)
+        or not isinstance(input_tensors, list)
+        or len(input_tensors) != 2
+        or not all(isinstance(stage, dict) for stage in input_tensors)
+    ):
+        raise ValueError(
+            "Unsupported Quark multi-stage quantization config. ATOM recognizes "
+            "only NVFP4 with two dictionary stages in both `weight` and "
+            "`input_tensors`."
+        )
+
+    weight_fp4, weight_scale_quant = weight
+    input_fp4, input_scale_quant = input_tensors
+    is_nvfp4 = (
+        str(weight_fp4.get("dtype", "")).lower().startswith("fp4")
+        and weight_fp4.get("qscheme") == "per_group"
+        and weight_fp4.get("group_size") == NVFP4_GROUP_SIZE
+        and not weight_fp4.get("is_dynamic")
+        and str(input_fp4.get("dtype", "")).lower().startswith("fp4")
+        and input_fp4.get("qscheme") == "per_group"
+        and input_fp4.get("group_size") == NVFP4_GROUP_SIZE
+        and input_fp4.get("is_dynamic") is True
+        and str(weight_scale_quant.get("dtype", "")).lower().startswith("fp8_e4m3")
+        and weight_scale_quant.get("qscheme") == "per_tensor"
+        and not weight_scale_quant.get("is_dynamic")
+        and str(input_scale_quant.get("dtype", "")).lower().startswith("fp8_e4m3")
+        and input_scale_quant.get("qscheme") == "per_tensor"
+        and not input_scale_quant.get("is_dynamic")
+    )
+    if not is_nvfp4:
+        raise ValueError(
+            "Unsupported Quark multi-stage quantization config. ATOM recognizes "
+            "only NVFP4: static FP4 weights and dynamic FP4 activations with "
+            "per-group(group_size=16), each followed by static FP8-E4M3 "
+            "per-tensor scale quantization."
+        )
+    return weight_fp4, NVFP4_DTYPE
 
 
 def _build_quark_layer_spec(layer_dict: dict) -> LayerQuantConfig:
     """Build a :class:`LayerQuantConfig` from a single Quark per-layer dict."""
     weight = layer_dict.get("weight", {}) or {}
+    input_tensors = layer_dict.get("input_tensors")
+    weight, quant_dtype_override = _quark_weight_spec(weight, input_tensors)
     return LayerQuantConfig(
         quant_type=_parse_quant_type(weight.get("qscheme")),
-        quant_dtype=_parse_quant_dtype(weight.get("dtype")),
-        is_dynamic=_parse_is_dynamic(layer_dict.get("input_tensors")),
+        quant_dtype=(
+            quant_dtype_override
+            if quant_dtype_override is not None
+            else _parse_quant_dtype(weight.get("dtype"))
+        ),
+        is_dynamic=_parse_is_dynamic(input_tensors),
         quant_method="quark",
     )
 

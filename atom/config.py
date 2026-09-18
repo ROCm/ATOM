@@ -438,7 +438,7 @@ class QuantizationConfig:
         return self.global_spec.quant_type
 
     @property
-    def quant_dtype(self) -> torch.dtype:
+    def quant_dtype(self) -> Any:
         return self.global_spec.quant_dtype
 
     @property

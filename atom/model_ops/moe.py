@@ -73,12 +73,16 @@ from atom.model_ops.utils import (
 from atom.plugin.vllm.moe import FusedMoEDecoratorForPluginMode
 from atom.quant_spec import (
     LayerQuantConfig,
+    NVFP4_DTYPE,
+    NVFP4_GROUP_SIZE,
     should_skip_online_quant,
     should_stream_online_quant,
 )
 from atom.quantization.quark.utils import (
+    dequantize_nvfp4,
     dequant_moe_weight_online,
     dequant_weight_online,
+    quant_mxfp4_dynamic,
     quant_weight_online,
 )
 from atom.utils import envs
@@ -1073,6 +1077,192 @@ direct_register_custom_op(
     mutates_args=[],
     fake_impl=rocm_aiter_fused_moe_fake,
 )
+
+
+class Nvfp4MoEMethod(FusedMoEMethodBase):
+    """Quark NVFP4 MoE source representation.
+
+    This deliberately stops before any kernel-specific shuffle. The raw
+    group-16 E4M3 scales and their per-tensor global scales remain in checkpoint
+    layout until the online pass converts them to MXFP4.
+    Direct NVFP4 inference is intentionally unsupported.
+    """
+
+    def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
+        super().__init__(moe)
+        self.quant_config = quant_config
+        self.quant_type = quant_config.quant_type
+        self.quant_dtype = quant_config.quant_dtype
+        self.quant_method = quant_config.quant_method or ""
+        self.group_size = NVFP4_GROUP_SIZE
+        self.pad_align = 1
+
+    @staticmethod
+    def _register_parameter(
+        layer: torch.nn.Module,
+        name: str,
+        tensor: torch.Tensor,
+        extra_weight_attrs: dict,
+    ) -> None:
+        param = atom_parameter(tensor)
+        layer.register_parameter(name, param)
+        set_weight_attrs(param, extra_weight_attrs)
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        del params_dtype
+        if hidden_size % self.group_size != 0:
+            raise ValueError(
+                "NVFP4 hidden size "
+                f"({hidden_size}) must be divisible by group_size={self.group_size}."
+            )
+        if intermediate_size_per_partition % self.group_size != 0:
+            raise ValueError(
+                "NVFP4 intermediate size per TP partition "
+                f"({intermediate_size_per_partition}) must be divisible by "
+                f"group_size={self.group_size}."
+            )
+
+        self.num_experts = num_experts
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size_per_partition
+        self.hidden_pad = 0
+        self.intermediate_pad = 0
+        scale_dtype = torch.float8_e4m3fn
+        weight_device = (
+            "meta" if getattr(layer, "_stream_online_quant", False) else None
+        )
+
+        self._register_parameter(
+            layer,
+            "w13_weight",
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // 2,
+                dtype=torch.uint8,
+                device=weight_device,
+            ),
+            extra_weight_attrs,
+        )
+        self._register_parameter(
+            layer,
+            "w2_weight",
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // 2,
+                dtype=torch.uint8,
+                device=weight_device,
+            ),
+            extra_weight_attrs,
+        )
+        self._register_parameter(
+            layer,
+            "w13_weight_scale",
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // self.group_size,
+                dtype=scale_dtype,
+                device=weight_device,
+            ),
+            extra_weight_attrs,
+        )
+        self._register_parameter(
+            layer,
+            "w2_weight_scale",
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // self.group_size,
+                dtype=scale_dtype,
+                device=weight_device,
+            ),
+            extra_weight_attrs,
+        )
+
+        # w13 combines w1 and w3, so retain both source projections' scalar
+        # metadata independently. w2 has one scalar per expert.
+        for name, shape in (
+            ("w13_weight_scale_2", (num_experts, 2)),
+            ("w2_weight_scale_2", (num_experts,)),
+            ("w13_input_scale_2", (num_experts, 2)),
+            ("w2_input_scale_2", (num_experts,)),
+        ):
+            self._register_parameter(
+                layer,
+                name,
+                torch.empty(shape, dtype=torch.float32, device=weight_device),
+                extra_weight_attrs,
+            )
+
+        if layer.has_bias:
+            self._register_parameter(
+                layer,
+                "w13_bias",
+                torch.empty(
+                    num_experts,
+                    2 * intermediate_size_per_partition,
+                    dtype=torch.bfloat16,
+                    device=weight_device,
+                ),
+                extra_weight_attrs,
+            )
+            self._register_parameter(
+                layer,
+                "w2_bias",
+                torch.empty(
+                    num_experts,
+                    hidden_size,
+                    dtype=torch.bfloat16,
+                    device=weight_device,
+                ),
+                extra_weight_attrs,
+            )
+        else:
+            layer.register_parameter("w13_bias", None)
+            layer.register_parameter("w2_bias", None)
+
+        # Names consumed by common FusedMoE plumbing. They have no NVFP4
+        # checkpoint tensors; the global-scale values above are the inputs
+        # needed by the online converter.
+        layer.w13_input_scale = None
+        layer.w2_input_scale = None
+        layer.w13_swizzle_layout = None
+        layer.w2_swizzle_layout = None
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(getattr(layer, "quant_config", None), "online_quant", False):
+            raise RuntimeError(
+                "NVFP4 source method reached post-load processing before the "
+                "FusedMoE online conversion ran."
+            )
+
+    def init_prepare_finalize(self, layer: torch.nn.Module) -> None:
+        # No communication/kernel buffers are valid until conversion to a
+        # supported runtime format has happened.
+        return
+
+    def get_fused_moe_quant_config(
+        self, layer: torch.nn.Module
+    ) -> FusedMoEQuantConfig | None:
+        return None
+
+    def apply(self, layer: torch.nn.Module, *args, **kwargs) -> torch.Tensor:
+        raise RuntimeError(
+            f"{getattr(layer, 'prefix', '<fused_moe>')}: NVFP4 checkpoint "
+            "weights are loaded, but direct NVFP4 inference is intentionally "
+            "blocked. Convert this layer to MXFP4 during online quantization "
+            "before forward."
+        )
 
 
 class Mxfp4MoEMethod(FusedMoEMethodBase):
@@ -3387,6 +3577,8 @@ class FusedMoE(torch.nn.Module):
         ):
             # Use CompressedTensorsFp8MoEMethod for compressed-tensors format
             self.quant_method = CompressedTensorsFp8MoEMethod(layer_quant_config, moe)
+        elif layer_quant_config.quant_dtype == NVFP4_DTYPE:
+            self.quant_method = Nvfp4MoEMethod(layer_quant_config, moe)
         elif layer_quant_config.quant_dtype == dtypes.fp8:
             self.quant_method = Fp8MoEMethod(layer_quant_config, moe)
         elif layer_quant_config.quant_dtype == dtypes.fp4x2:
@@ -3398,7 +3590,7 @@ class FusedMoE(torch.nn.Module):
 
         assert self.quant_method is not None
         if self.expert_layout.uses_all2all_fusion and not isinstance(
-            self.quant_method, Mxfp4MoEMethod
+            self.quant_method, (Mxfp4MoEMethod, Nvfp4MoEMethod)
         ):
             raise NotImplementedError(
                 "Shared-expert fusion is only wired up for the MXFP4 MoE path, got "
@@ -3690,10 +3882,19 @@ class FusedMoE(torch.nn.Module):
         online_quant_dtype = online_quant_config.quant_dtype
         source_quant_type = self.layer_quant_config.quant_type
         source_quant_dtype = self.layer_quant_config.quant_dtype
+        source_is_nvfp4 = source_quant_dtype == NVFP4_DTYPE
         if should_skip_online_quant(
             source_quant_type, self.params_dtype, online_quant_config
         ):
             return
+        if source_is_nvfp4 and not (
+            online_quant_type.value == QuantType.per_1x32.value
+            and online_quant_dtype == dtypes.fp4x2
+        ):
+            raise ValueError(
+                f"{self.layer_name}: Quark NVFP4 expert weights can currently "
+                "be converted only to the MXFP4 online target."
+            )
 
         # Re-quantize any source we can dequantize back to float first:
         # unquantized (No), per-output-channel FP8 (per_Token / ptpc_fp8),
@@ -3716,7 +3917,18 @@ class FusedMoE(torch.nn.Module):
             QuantType.per_1x32,
         )
 
-        def _dequant_func(w: torch.Tensor, sc: torch.Tensor) -> torch.Tensor:
+        def _dequant_func(
+            w: torch.Tensor,
+            sc: torch.Tensor,
+            global_scale: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            if source_is_nvfp4:
+                return dequantize_nvfp4(
+                    w.contiguous(),
+                    sc.contiguous(),
+                    global_scale,
+                    out_dtype=torch.float32,
+                )
             return dequant_weight_online(
                 w.contiguous(), sc.contiguous(), source_quant_type, source_quant_dtype
             )
@@ -3724,6 +3936,8 @@ class FusedMoE(torch.nn.Module):
         # Online weight quant dispatch (MXFP4 vs FP8), shared with the Linear
         # path via a single helper under quark so both stay in sync.
         def _quant_weight(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            if source_is_nvfp4:
+                return quant_mxfp4_dynamic(w)
             return quant_weight_online(
                 w,
                 online_quant_type=online_quant_type,
@@ -3760,6 +3974,10 @@ class FusedMoE(torch.nn.Module):
         old_w2_data = self.w2_weight.data
         old_w13_scale = self.w13_weight_scale.data if need_dequant else None
         old_w2_scale = self.w2_weight_scale.data if need_dequant else None
+        old_w13_scale_2 = (
+            self.w13_weight_scale_2.data if source_is_nvfp4 else None
+        )
+        old_w2_scale_2 = self.w2_weight_scale_2.data if source_is_nvfp4 else None
         device = old_w13_data.device
 
         # Switch quant_method and allocate target quantized-type buffers.
@@ -3791,7 +4009,12 @@ class FusedMoE(torch.nn.Module):
         target_rows_are_batchable = online_quant_type != QuantType.per_1x128 or (
             old_w13_data.shape[1] // 2 % 128 == 0 and old_w2_data.shape[1] % 128 == 0
         )
-        if row_local_target and target_rows_are_batchable and not need_gather_w2:
+        if (
+            not source_is_nvfp4
+            and row_local_target
+            and target_rows_are_batchable
+            and not need_gather_w2
+        ):
             self._online_quant_row_local_batched(
                 old_w13_data=old_w13_data,
                 old_w2_data=old_w2_data,
@@ -3807,6 +4030,7 @@ class FusedMoE(torch.nn.Module):
                 "quant_type": online_quant_type.name,
                 "quant_dtype": str(online_quant_dtype),
             }
+            self.params_dtype = online_quant_dtype
             return
 
         for expert_id in range(self.local_num_experts):
@@ -3820,39 +4044,93 @@ class FusedMoE(torch.nn.Module):
                 w1_bf16 = _dequant_func(
                     w13_local[:w1_size],
                     w13_scale[:s1_size],
+                    (
+                        old_w13_scale_2[expert_id, 0]
+                        if source_is_nvfp4
+                        else None
+                    ),
                 )
                 w3_bf16 = _dequant_func(
                     w13_local[w1_size:],
                     w13_scale[s1_size:],
+                    (
+                        old_w13_scale_2[expert_id, 1]
+                        if source_is_nvfp4
+                        else None
+                    ),
                 )
             else:
                 w1_bf16 = w13_local[:w1_size]
                 w3_bf16 = w13_local[w1_size:]
 
+            if source_is_nvfp4:
+                target_hidden = self.w13_weight.shape[2] * 2
+                hidden_pad = target_hidden - w1_bf16.shape[1]
+                if hidden_pad < 0:
+                    raise RuntimeError(
+                        f"{self.layer_name}: MXFP4 target hidden size "
+                        f"{target_hidden} is smaller than NVFP4 source K "
+                        f"{w1_bf16.shape[1]}."
+                    )
+                if hidden_pad:
+                    w1_bf16 = torch.nn.functional.pad(
+                        w1_bf16, (0, hidden_pad)
+                    )
+                    w3_bf16 = torch.nn.functional.pad(
+                        w3_bf16, (0, hidden_pad)
+                    )
             w1_q, w1_s = _quant_weight(w1_bf16)
             w3_q, w3_s = _quant_weight(w3_bf16)
             del w1_bf16, w3_bf16
 
             w13_expert = self.w13_weight.data[expert_id]
             w13_scale_expert = self.w13_weight_scale.data[expert_id]
-            for shard_id, wq, ws in (("w1", w1_q, w1_s), ("w3", w3_q, w3_s)):
-                self._load_model_weight_or_group_weight_scale(
-                    shard_dim=0,
-                    expert_data=w13_expert,
-                    shard_id=shard_id,
-                    loaded_weight=wq,
-                    tp_rank=self.tp_rank,
-                    load_full=True,
+            if source_is_nvfp4:
+                target_half_rows = w13_expert.shape[0] // 2
+                self._copy_quant_storage(
+                    w13_expert[: w1_q.shape[0], : w1_q.shape[1]],
+                    w1_q,
                 )
-                self._load_quant_weight_scale(
-                    expert_data=w13_scale_expert,
-                    shard_dim=0,
-                    shard_id=shard_id,
-                    loaded_weight=ws,
-                    tp_rank=self.tp_rank,
-                    quant_type=online_quant_type,
-                    load_full=True,
+                self._copy_quant_storage(
+                    w13_expert[
+                        target_half_rows : target_half_rows + w3_q.shape[0],
+                        : w3_q.shape[1],
+                    ],
+                    w3_q,
                 )
+                self._copy_quant_storage(
+                    w13_scale_expert[: w1_s.shape[0], : w1_s.shape[1]],
+                    w1_s,
+                )
+                self._copy_quant_storage(
+                    w13_scale_expert[
+                        target_half_rows : target_half_rows + w3_s.shape[0],
+                        : w3_s.shape[1],
+                    ],
+                    w3_s,
+                )
+            else:
+                for shard_id, wq, ws in (
+                    ("w1", w1_q, w1_s),
+                    ("w3", w3_q, w3_s),
+                ):
+                    self._load_model_weight_or_group_weight_scale(
+                        shard_dim=0,
+                        expert_data=w13_expert,
+                        shard_id=shard_id,
+                        loaded_weight=wq,
+                        tp_rank=self.tp_rank,
+                        load_full=True,
+                    )
+                    self._load_quant_weight_scale(
+                        expert_data=w13_scale_expert,
+                        shard_dim=0,
+                        shard_id=shard_id,
+                        loaded_weight=ws,
+                        tp_rank=self.tp_rank,
+                        quant_type=online_quant_type,
+                        load_full=True,
+                    )
             del w1_q, w3_q, w1_s, w3_s
 
             # w2 row-parallel: optionally gather before quantization
@@ -3863,41 +4141,90 @@ class FusedMoE(torch.nn.Module):
                 w2_local = _dequant_func(
                     w2_local,
                     old_w2_scale[expert_id],
+                    old_w2_scale_2[expert_id] if source_is_nvfp4 else None,
                 )
             if need_gather_w2:
                 w2_full = tp_group.all_gather(w2_local, dim=1)
+                if source_is_nvfp4:
+                    target_cols = self.w2_weight.shape[2] * 2 * self.tp_size
+                    if target_cols > w2_full.shape[1]:
+                        w2_full = torch.nn.functional.pad(
+                            w2_full, (0, target_cols - w2_full.shape[1])
+                        )
                 w2_q, w2_s = _quant_weight(w2_full)
                 del w2_full
             else:
+                if source_is_nvfp4:
+                    target_cols = self.w2_weight.shape[2] * 2
+                    if target_cols > w2_local.shape[1]:
+                        w2_local = torch.nn.functional.pad(
+                            w2_local, (0, target_cols - w2_local.shape[1])
+                        )
                 w2_q, w2_s = _quant_weight(w2_local)
 
-            self._load_model_weight_or_group_weight_scale(
-                shard_dim=1,
-                expert_data=self.w2_weight.data[expert_id],
-                shard_id="w2",
-                loaded_weight=w2_q,
-                tp_rank=self.tp_rank,
-                load_full=load_full_w2,
-            )
-            # per_Token scale is along output dim (not TP-split), never needs shard
-            w2_scale_load_full = (
-                False if online_quant_type == QuantType.per_Token else load_full_w2
-            )
-            self._load_quant_weight_scale(
-                expert_data=self.w2_weight_scale.data[expert_id],
-                shard_dim=1,
-                shard_id="w2",
-                loaded_weight=w2_s,
-                tp_rank=self.tp_rank,
-                quant_type=online_quant_type,
-                load_full=w2_scale_load_full,
-            )
+            if source_is_nvfp4:
+                if need_gather_w2:
+                    local_q_cols = w2_q.shape[1] // self.tp_size
+                    local_s_cols = w2_s.shape[1] // self.tp_size
+                    w2_q = w2_q.narrow(
+                        1, self.tp_rank * local_q_cols, local_q_cols
+                    ).contiguous()
+                    w2_s = w2_s.narrow(
+                        1, self.tp_rank * local_s_cols, local_s_cols
+                    ).contiguous()
+                self._copy_quant_storage(
+                    self.w2_weight.data[
+                        expert_id, : w2_q.shape[0], : w2_q.shape[1]
+                    ],
+                    w2_q,
+                )
+                self._copy_quant_storage(
+                    self.w2_weight_scale.data[
+                        expert_id, : w2_s.shape[0], : w2_s.shape[1]
+                    ],
+                    w2_s,
+                )
+            else:
+                self._load_model_weight_or_group_weight_scale(
+                    shard_dim=1,
+                    expert_data=self.w2_weight.data[expert_id],
+                    shard_id="w2",
+                    loaded_weight=w2_q,
+                    tp_rank=self.tp_rank,
+                    load_full=load_full_w2,
+                )
+                # per_Token scale is along output dim (not TP-split), never needs shard
+                w2_scale_load_full = (
+                    False
+                    if online_quant_type == QuantType.per_Token
+                    else load_full_w2
+                )
+                self._load_quant_weight_scale(
+                    expert_data=self.w2_weight_scale.data[expert_id],
+                    shard_dim=1,
+                    shard_id="w2",
+                    loaded_weight=w2_s,
+                    tp_rank=self.tp_rank,
+                    quant_type=online_quant_type,
+                    load_full=w2_scale_load_full,
+                )
             del w2_q, w2_s
 
         del old_w13_data, old_w2_data
         if need_dequant:
             del old_w13_scale, old_w2_scale
+        if source_is_nvfp4:
+            del old_w13_scale_2, old_w2_scale_2
+            for name in (
+                "w13_weight_scale_2",
+                "w2_weight_scale_2",
+                "w13_input_scale_2",
+                "w2_input_scale_2",
+            ):
+                if hasattr(self, name):
+                    delattr(self, name)
 
+        self.params_dtype = online_quant_dtype
         self._online_quant_info = {
             "layer": self.layer_name,
             "quant_type": online_quant_type.name,
@@ -4510,6 +4837,51 @@ class FusedMoE(torch.nn.Module):
         for slot in range(n_base, self.expert_layout.routed_physical_per_rank):
             dst[slot].zero_()
 
+    def _load_nvfp4_global_scale(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        shard_id: str,
+        expert_id: int,
+    ) -> bool:
+        """Load one per-expert NVFP4 per-tensor global scale.
+
+        Returns whether ``param`` is one of the four NVFP4 scalar-metadata
+        parameters. These values are replicated across TP ranks and selected
+        only by the local expert id (plus w1/w3 half for w13).
+        """
+        w13_params = (
+            getattr(self, "w13_weight_scale_2", None),
+            getattr(self, "w13_input_scale_2", None),
+        )
+        w2_params = (
+            getattr(self, "w2_weight_scale_2", None),
+            getattr(self, "w2_input_scale_2", None),
+        )
+        if not any(param is candidate for candidate in (*w13_params, *w2_params)):
+            return False
+
+        value = loaded_weight.reshape(-1)
+        if value.numel() != 1:
+            raise RuntimeError(
+                "Each NVFP4 expert projection must provide exactly one "
+                f"global scale, got shape {tuple(loaded_weight.shape)}."
+            )
+        if any(param is candidate for candidate in w13_params):
+            if shard_id not in ("w1", "w3"):
+                raise ValueError(
+                    f"NVFP4 w13 global scale requires w1/w3, got {shard_id!r}."
+                )
+            target = param.data[expert_id, 0 if shard_id == "w1" else 1]
+        else:
+            if shard_id != "w2":
+                raise ValueError(
+                    f"NVFP4 w2 global scale requires w2, got {shard_id!r}."
+                )
+            target = param.data[expert_id]
+        target.copy_(value[0])
+        return True
+
     def weight_loader(
         self,
         param: torch.nn.Parameter,
@@ -4518,12 +4890,25 @@ class FusedMoE(torch.nn.Module):
         shard_id: str = "",
         expert_id: int = 0,
     ) -> None:
+        is_nvfp4 = bool(
+            self.layer_quant_config is not None
+            and self.layer_quant_config.quant_dtype == NVFP4_DTYPE
+        )
+        if is_nvfp4 and weight_name == "":
+            raise RuntimeError(
+                "Merged NVFP4 expert loading is not supported; this loader "
+                "expects split per-expert w1/w2/w3 checkpoint tensors."
+            )
         if self.layer_quant_config.quant_dtype == dtypes.fp4x2 and weight_name == "":
             self.mxf4_merged_weight_loader(param, loaded_weight, expert_id)
             return
 
         expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
         if expert_id == -1:
+            return
+        if is_nvfp4 and self._load_nvfp4_global_scale(
+            param, loaded_weight, shard_id, expert_id
+        ):
             return
 
         # compressed-tensors checkpoints with packed weights are stored flipped

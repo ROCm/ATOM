@@ -46,6 +46,7 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from atom.quant_spec import NVFP4_DTYPE
 from atom.utils.decorators import support_torch_compile
 
 
@@ -54,6 +55,19 @@ def _get_text_config(config: PretrainedConfig) -> PretrainedConfig:
 
 
 def _sparse_attention_layer_ids(config: PretrainedConfig) -> set[int]:
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types is not None:
+        if len(layer_types) != config.num_hidden_layers:
+            raise ValueError(
+                "MiniMax-M3 layer_types length must equal num_hidden_layers: "
+                f"{len(layer_types)} != {config.num_hidden_layers}."
+            )
+        return {
+            i
+            for i, layer_type in enumerate(layer_types)
+            if layer_type == "minimax_m3_sparse"
+        }
+
     cfg = getattr(config, "sparse_attention_config", None)
     if not cfg:
         return set()
@@ -61,6 +75,24 @@ def _sparse_attention_layer_ids(config: PretrainedConfig) -> set[int]:
     if freq is None:
         return set()
     return {i for i, enabled in enumerate(freq) if enabled != 0}
+
+
+def _get_sparse_attention_config(config: PretrainedConfig) -> dict:
+    """Normalize legacy nested and current flat MiniMax-M3 indexer fields."""
+    sparse_cfg = dict(getattr(config, "sparse_attention_config", None) or {})
+    aliases = {
+        "sparse_num_index_heads": "index_n_heads",
+        "sparse_index_dim": "index_head_dim",
+        "sparse_block_size": "index_block_size",
+        "sparse_topk_blocks": "index_topk_blocks",
+        "sparse_local_block": "index_local_blocks",
+    }
+    for legacy_name, flat_name in aliases.items():
+        if legacy_name not in sparse_cfg and hasattr(config, flat_name):
+            sparse_cfg[legacy_name] = getattr(config, flat_name)
+    sparse_cfg.setdefault("sparse_init_block", 0)
+    sparse_cfg.setdefault("sparse_score_type", "max")
+    return sparse_cfg
 
 
 def _sparse_attention_layer_ordinals(config: PretrainedConfig) -> dict[int, int]:
@@ -98,6 +130,21 @@ def _should_skip_minimax_m3_index_topk(
 
 
 def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
+    mlp_layer_types = getattr(config, "mlp_layer_types", None)
+    if mlp_layer_types is not None:
+        if len(mlp_layer_types) != config.num_hidden_layers:
+            raise ValueError(
+                "MiniMax-M3 mlp_layer_types length must equal num_hidden_layers: "
+                f"{len(mlp_layer_types)} != {config.num_hidden_layers}."
+            )
+        layer_type = mlp_layer_types[layer_id]
+        if layer_type not in ("dense", "sparse"):
+            raise ValueError(
+                f"Unsupported MiniMax-M3 MLP layer type {layer_type!r} "
+                f"at layer {layer_id}."
+            )
+        return layer_type == "sparse"
+
     moe_layer_freq = getattr(config, "moe_layer_freq", None)
     if moe_layer_freq is None:
         return True
@@ -167,6 +214,21 @@ def make_minimax_m3_expert_params_mapping(
                 param_prefix = "experts.w2_"
                 scale_param = "experts.w2_weight_scale"
             for weight_name in weight_names:
+                # NVFP4's per-tensor global-scale tensors used to match only via
+                # the broad trailing-dot rule below. Keep them explicit so a
+                # future mapping refactor cannot silently route or drop them.
+                for global_scale_ckpt_name in ("weight_scale_2", "input_scale_2"):
+                    mapping.append(
+                        (
+                            f"{param_prefix}{global_scale_ckpt_name}",
+                            (
+                                f"experts.{expert_id}.{weight_name}."
+                                f"{global_scale_ckpt_name}"
+                            ),
+                            expert_id,
+                            shard_id,
+                        )
+                    )
                 for scale_name in ("scale", "weight_scale"):
                     mapping.append(
                         (
@@ -212,10 +274,13 @@ class MiniMaxM3MLP(nn.Module):
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
         )
-        if config.hidden_act != "swigluoai":
+        # Transformers' native MiniMaxM3VLTextConfig normalizes this field to
+        # "silu", while the checkpoint's remote config preserves
+        # "swigluoai". Both describe the same MiniMax SwiGLU-OAI block here.
+        if config.hidden_act not in ("swigluoai", "silu"):
             raise ValueError(
                 f"Unsupported MiniMax-M3 activation {config.hidden_act!r}; "
-                "expected 'swigluoai'."
+                "expected 'swigluoai' or the Transformers alias 'silu'."
             )
         self.swiglu_alpha = getattr(config, "swiglu_alpha", 1.702)
         self.swiglu_beta = getattr(config, "swiglu_beta", 1.0)
@@ -437,7 +502,7 @@ class MiniMaxM3SparseAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.kv_cache_dtype = cache_config
 
-        sparse_cfg = config.sparse_attention_config
+        sparse_cfg = _get_sparse_attention_config(config)
         sparse_block_size = sparse_cfg["sparse_block_size"]
         if sparse_block_size != SPARSE_BLOCK_SIZE:
             raise ValueError(
@@ -797,6 +862,17 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         super().__init__()
         config = _get_text_config(atom_config.hf_config)
         self.config = config
+        quant_config = atom_config.quant_config
+        self.nvfp4_load_only = (
+            not quant_config.online_quant
+            and any(
+                spec.quant_dtype == NVFP4_DTYPE
+                for spec in (
+                    quant_config.global_quant_config,
+                    *(spec for _, spec in quant_config.layer_pattern_specs),
+                )
+            )
+        )
         self.model = MiniMaxM3Model(
             atom_config=atom_config,
             prefix=maybe_prefix(prefix, "model"),
@@ -844,6 +920,12 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **_: object,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+        if self.nvfp4_load_only:
+            raise RuntimeError(
+                "MiniMax-M3 NVFP4 checkpoint weights loaded successfully, but "
+                "direct NVFP4 inference is intentionally blocked. Enable the "
+                "NVFP4 -> MXFP4 path with an MXFP4 online quant config."
+            )
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
