@@ -711,6 +711,8 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
             w2_scale=kwargs.get("w2_scale"),
             bias1=kwargs.get("bias1"),
             bias2=kwargs.get("bias2"),
+            expert_mask=kwargs.get("expert_mask"),
+            local_expert_hash=kwargs.get("expert_map"),
             a1_scale=kwargs.get("a1_scale"),
             a2_scale=kwargs.get("a2_scale"),
             recv_token_bound=self._recv_bound(
