@@ -13,6 +13,7 @@ from atom.model_ops.attention_mla import MLAAttention
 from atom.model_ops.glm5_next.geometry import (
     effective_kpool_size,
     pooled_path_enabled,
+    speculative_kpool_history_size,
 )
 from atom.utils import envs
 
@@ -197,6 +198,13 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             )
         return rows
 
+    def _kpool_history_size(self) -> int:
+        """Return the documented ring bound for speculative rejection."""
+        pool = self._kpool_size()
+        spec = self.model_runner.config.speculative_config
+        num_speculative_tokens = None if spec is None else spec.num_speculative_tokens
+        return speculative_kpool_history_size(pool, num_speculative_tokens)
+
     def _kpool_tail_bytes(self) -> int:
         """Per-request tail bytes across every indexer-owning layer."""
         kpool = self._kpool_size()
@@ -204,7 +212,9 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             return 0
         hf = self.model_runner.config.hf_config
         index_cache_layer_ids, _ = self._index_cache_layout()
-        per_layer = 2 * kpool * hf.index_head_dim * torch.bfloat16.itemsize
+        per_layer = (
+            2 * self._kpool_history_size() * hf.index_head_dim * torch.bfloat16.itemsize
+        )
         return len(index_cache_layer_ids) * per_layer
 
     def _kpool_tail_plane_shape(self) -> tuple[int, int] | None:
@@ -263,7 +273,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                 len(index_cache_layer_ids),
                 entries.get(STATE_SLOT_CLASS, 0),
                 2,  # 0 = K, 1 = gate score
-                self._kpool_size(),
+                self._kpool_history_size(),
                 hf.index_head_dim,
             ),
             dtype=torch.bfloat16,
