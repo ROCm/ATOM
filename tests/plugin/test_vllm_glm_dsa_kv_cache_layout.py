@@ -2,7 +2,8 @@
 
 Covers every GLM model that registers a DSA indexer: **GLM-5.2 and GLM-5.3**,
 which are the same architecture and produce a byte-for-byte identical KV
-registration. That is measured, not assumed -- both serve at TP=4 with
+registration. That is measured, not assumed -- every checkpoint in ``_MODELS``
+below was served at TP=4 and logged
 
     ATOM LMCache offload: registered 78 layers, num_blocks=8192
     ATOM LMCache offload:   78 x kv tail_shape=(64, 576) dtype=torch.uint8
