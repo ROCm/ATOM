@@ -12,8 +12,22 @@ rail. ATOM's opt-in matched-rail mode uses one single-HCA engine per rail.
 
 ## Configuration
 
-On both prefill and decode servers, set the same allowlist of matched local
-HCA names before starting the servers:
+On both prefill and decode servers, enable automatic discovery before startup:
+
+```bash
+export ATOM_MOONCAKE_MATCHED_RAILS=auto
+```
+
+Auto mode finds HCAs in the primary GPU-local HCA's numbered name family and
+includes those with at least one ACTIVE RDMA port in local sysfs. For example,
+a primary `ionic_2` discovers active `ionic_*` HCAs and excludes an unrelated
+`mlx5_0`. Families such as `rdmaN` and `mlx5_N` are also supported; neither
+the names nor the number of HCAs are hardcoded. Startup logs the resolved list.
+A missing/inactive primary, unavailable sysfs, or an unnumbered primary name
+produces an actionable error instead of silently disabling matched rails.
+
+To restrict the allowed rails, or use other naming schemes, an explicit list
+remains supported:
 
 ```bash
 export ATOM_MOONCAKE_MATCHED_RAILS=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7
@@ -26,8 +40,10 @@ All allowlisted HCAs must exist locally, and the primary must be in the list.
 Combining this mode with a multi-HCA primary engine or TCP is rejected.
 
 The same name must identify corresponding, mutually reachable rails across
-P/D hosts. This configuration is an explicit deployment mapping, not topology
-discovery. The source GPU memory must support registration on every selected
+P/D hosts; matching is by name, not list position. Auto mode discovers local
+HCAs and link state, not cross-host reachability or memory-registration support.
+It does not infer a mapping between differently named remote HCAs.
+The source GPU memory must support registration on every selected
 HCA; the feature does not change driver, GID, routing, or DMA-BUF support.
 
 Configure the router to choose P/D ranks independently:

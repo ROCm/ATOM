@@ -13,11 +13,13 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
 import msgpack
@@ -87,6 +89,7 @@ except ImportError:
 MOONCAKE_DEFAULT_PROTOCOL = "rdma"
 PREFILL_LOOKUP_TIMEOUT = 60
 PREFILL_LOOKUP_POLL_INTERVAL = 0.01
+_IB_SYSFS_ROOT = Path("/sys/class/infiniband")
 
 
 def _swa_ring_ids(seq) -> list[int]:
@@ -109,7 +112,7 @@ def _swa_ring_ids(seq) -> list[int]:
 
 
 def _ib_device_exists(device_name: str) -> bool:
-    return os.path.exists(f"/sys/class/infiniband/{device_name}")
+    return (_IB_SYSFS_ROOT / device_name).exists()
 
 
 def _auto_select_ib_device(phys_idx: int) -> str:
@@ -159,6 +162,70 @@ def _select_ib_devices(
             if device not in devices and _ib_device_exists(device):
                 devices.append(device)
     return devices
+
+
+def _discover_active_matched_rails(primary_device: str) -> list[str]:
+    """Discover active HCAs in the primary's numbered device-name family."""
+    family = re.fullmatch(r"(.*\D)(\d+)", primary_device)
+    if family is None:
+        raise ValueError(
+            f"Cannot auto-discover matched rails for HCA {primary_device!r}; "
+            "set ATOM_MOONCAKE_MATCHED_RAILS to an explicit HCA list"
+        )
+    pattern = re.compile(re.escape(family[1]) + r"(\d+)")
+    try:
+        devices = list(_IB_SYSFS_ROOT.iterdir())
+    except OSError as exc:
+        raise ValueError(
+            f"Cannot discover RDMA HCAs in {_IB_SYSFS_ROOT}; "
+            "set ATOM_MOONCAKE_MATCHED_RAILS to an explicit HCA list"
+        ) from exc
+
+    active = []
+    for device in devices:
+        match = pattern.fullmatch(device.name)
+        if match is None:
+            continue
+        for state_file in device.glob("ports/*/state"):
+            try:
+                state = state_file.read_text().partition(":")[0].strip()
+            except OSError:
+                continue
+            if state == "4":  # IB_PORT_ACTIVE, also used by RoCE HCAs.
+                active.append((int(match[1]), device.name))
+                break
+    rails = [name for _, name in sorted(active)]
+    if primary_device not in rails:
+        raise ValueError(
+            f"Primary HCA {primary_device!r} has no readable ACTIVE RDMA port; "
+            "check the link and sysfs visibility before using matched rails"
+        )
+    logger.info(
+        "Auto-discovered Mooncake matched rails: primary=%s rails=%s",
+        primary_device,
+        rails,
+    )
+    return rails
+
+
+def _resolve_matched_rails(
+    protocol: str, ib_devices: list[str], configured_rails: str
+) -> list[str]:
+    value = configured_rails.strip()
+    if value.lower() == "auto":
+        # Check transport and primary shape before reading RDMA sysfs.
+        if protocol.strip().lower() != "rdma":
+            raise ValueError("ATOM_MOONCAKE_MATCHED_RAILS requires protocol=rdma")
+        if len(ib_devices) != 1:
+            raise ValueError(
+                "Matched rails require a single primary HCA per engine; "
+                "disable ib_enable_alternate_hca and use at most one ib_device"
+            )
+        rails = _discover_active_matched_rails(ib_devices[0])
+    else:
+        rails = _parse_ib_devices(value)
+    _validate_matched_rails(protocol, ib_devices, rails)
+    return rails
 
 
 def _validate_matched_rails(
@@ -661,8 +728,9 @@ class MooncakeConnector(KVConnectorBase):
         ib_device = ",".join(ib_devices)
         primary_ib_device = ib_devices[0] if ib_devices else ""
         self.ib_devices = ib_devices
-        matched_rails = _parse_ib_devices(envs.ATOM_MOONCAKE_MATCHED_RAILS)
-        _validate_matched_rails(self.protocol, ib_devices, matched_rails)
+        matched_rails = _resolve_matched_rails(
+            self.protocol, ib_devices, envs.ATOM_MOONCAKE_MATCHED_RAILS
+        )
         # Advertise only an unambiguous, single-HCA destination. An engine
         # registered on multiple NICs can still choose an unreachable rail.
         self.ib_device = ib_devices[0] if len(ib_devices) == 1 else None

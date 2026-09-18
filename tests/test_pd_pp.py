@@ -1062,6 +1062,122 @@ def test_matched_rails_disabled_preserves_tcp_and_multi_hca(monkeypatch):
     mc._validate_matched_rails("rdma", ["ionic_2"], ["ionic_2", "ionic_6"])
 
 
+@pytest.fixture
+def matched_rail_sysfs(tmp_path, monkeypatch):
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    monkeypatch.setattr(mc, "_IB_SYSFS_ROOT", tmp_path)
+
+    def add(name, *states):
+        device = tmp_path / name
+        device.mkdir(exist_ok=True)
+        for index, state in enumerate(states, 1):
+            port = device / "ports" / str(index)
+            port.mkdir(parents=True)
+            if state is not None:
+                (port / "state").write_text(state)
+        return device
+
+    return mc, add
+
+
+@pytest.mark.parametrize("prefix", ["ionic_", "rdma", "mlx5_"])
+@pytest.mark.parametrize("value", ["auto", " AUTO "])
+def test_matched_rails_auto_discovers_only_active_primary_family(
+    matched_rail_sysfs, prefix, value
+):
+    mc, add = matched_rail_sysfs
+    for suffix in (10, 2, 0):
+        add(f"{prefix}{suffix}", "4: ACTIVE\n")
+    add(f"{prefix}3", "1: DOWN\n")
+    add(f"{prefix}4", None)  # A missing state file is not an active port.
+    add(f"{prefix}5")  # No ports exposed.
+    add(f"{prefix}6", "2: INIT\n", "4: ACTIVE\n")
+    add(f"{prefix}7", "4: ACTIVE\n", "4: ACTIVE\n")  # Include a device once.
+    add(f"{prefix}8_extra", "4: ACTIVE\n")
+    add("other_0", "4: ACTIVE\n")
+
+    assert mc._resolve_matched_rails("rdma", [f"{prefix}2"], value) == [
+        f"{prefix}{i}" for i in (0, 2, 6, 7, 10)
+    ]
+
+
+def test_matched_rails_auto_excludes_unrelated_active_nic(matched_rail_sysfs):
+    mc, add = matched_rail_sysfs
+    for i in range(8):
+        add(f"ionic_{i}", "4: ACTIVE\n")
+    add("mlx5_0", "4: ACTIVE\n")
+    assert mc._resolve_matched_rails("rdma", ["ionic_2"], "auto") == [
+        f"ionic_{i}" for i in range(8)
+    ]
+
+
+@pytest.mark.parametrize("state", [None, "1: DOWN\n", "invalid"])
+def test_matched_rails_auto_rejects_inactive_primary(matched_rail_sysfs, state):
+    mc, add = matched_rail_sysfs
+    add("ionic_2", state)
+    add("ionic_6", "4: ACTIVE\n")
+    with pytest.raises(ValueError, match="Primary HCA.*no readable ACTIVE"):
+        mc._resolve_matched_rails("rdma", ["ionic_2"], "auto")
+
+
+def test_matched_rails_auto_rejects_missing_primary(matched_rail_sysfs):
+    mc, add = matched_rail_sysfs
+    add("ionic_6", "4: ACTIVE\n")
+    with pytest.raises(ValueError, match="Primary HCA.*no readable ACTIVE"):
+        mc._resolve_matched_rails("rdma", ["ionic_2"], "auto")
+
+
+def test_matched_rails_auto_reports_hidden_sysfs(matched_rail_sysfs, tmp_path):
+    mc, _ = matched_rail_sysfs
+    mc._IB_SYSFS_ROOT = tmp_path / "not-mounted"
+    with pytest.raises(ValueError, match="Cannot discover RDMA HCAs"):
+        mc._resolve_matched_rails("rdma", ["ionic_2"], "auto")
+
+
+def test_matched_rails_auto_requires_numbered_names(matched_rail_sysfs):
+    mc, add = matched_rail_sysfs
+    add("custom_hca", "4: ACTIVE\n")
+    with pytest.raises(ValueError, match="explicit HCA list"):
+        mc._resolve_matched_rails("rdma", ["custom_hca"], "auto")
+    assert mc._resolve_matched_rails("rdma", ["custom_hca"], "custom_hca") == [
+        "custom_hca"
+    ]
+
+
+@pytest.mark.parametrize(
+    "protocol,devices,message",
+    [
+        ("tcp", [], "protocol=rdma"),
+        ("rdma", [], "single primary"),
+        ("rdma", ["ionic_0", "ionic_1"], "single primary"),
+    ],
+)
+def test_matched_rails_auto_validates_before_discovery(
+    monkeypatch, protocol, devices, message
+):
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    discovery = MagicMock(side_effect=AssertionError("must not discover"))
+    monkeypatch.setattr(mc, "_discover_active_matched_rails", discovery)
+    with pytest.raises(ValueError, match=message):
+        mc._resolve_matched_rails(protocol, devices, "auto")
+    discovery.assert_not_called()
+
+
+def test_matched_rails_explicit_list_and_unset_do_not_discover(matched_rail_sysfs):
+    mc, add = matched_rail_sysfs
+    add("ionic_2", "4: ACTIVE\n")
+    add("ionic_6", "1: DOWN\n")
+    # Preserve explicit-list behavior; only auto filters link state.
+    assert mc._resolve_matched_rails(
+        "rdma", ["ionic_2"], " ionic_6, ionic_2,ionic_6, "
+    ) == ["ionic_6", "ionic_2"]
+    mc._IB_SYSFS_ROOT = mc._IB_SYSFS_ROOT / "not-mounted"
+    assert mc._resolve_matched_rails("tcp", [], " ") == []
+    assert mc._resolve_matched_rails("rdma", ["ionic_2", "ionic_6"], "") == []
+
+
 def _matched_rail_producer():
     from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
 

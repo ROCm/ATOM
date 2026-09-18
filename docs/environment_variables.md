@@ -346,7 +346,7 @@ See `atom/utils/envs.py` for the full list of lazy-evaluated environment variabl
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **ATOM_MOONCAKE_MATCHED_RAILS** | str | "" | Comma-separated allowlist of corresponding local RDMA HCAs. Enables a lazily initialized, single-HCA engine pool on P, selected by D's advertised HCA. Requires RDMA and a single primary HCA. Unset preserves the existing transport behavior. |
+| **ATOM_MOONCAKE_MATCHED_RAILS** | str | "" | Use `auto` to discover ACTIVE local HCAs in the primary HCA's numbered name family, or set a comma-separated allowlist. Enables a lazy single-HCA engine pool on P, selected by D's advertised HCA name. Requires RDMA, a single primary HCA, and corresponding same-name rails across hosts. Unset preserves existing behavior. |
 
 See [Mooncake matched rails](mooncake_matched_rails.md) for independent P/D
 rank configuration, deployment requirements, and registration lifetime.
