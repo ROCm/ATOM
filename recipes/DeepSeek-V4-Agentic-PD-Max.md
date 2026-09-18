@@ -41,7 +41,7 @@ P/D GPU-rank selection while keeping each transfer on a reachable NIC rail.
 
 Replace `<HCA_0>` through `<HCA_7>` with each node's actual HCA names,
 ordered so that matching list positions identify mutually reachable rails. See
-[RDMA rails and HCA registration](pd_disaggregation_guide.md#rdma-rails-and-hca-registration)
+[Matched RDMA rails](../docs/mooncake_matched_rails.md)
 for topology and registration details.
 
 These settings control HCA selection and reachability. The GPU memory
@@ -78,7 +78,7 @@ export ATOM_PREFIX_CACHE_POLICY=lru
 export ATOM_PREFIX_CACHE_PROTECTED_RATIO=0.5
 
 python3 -u -m atom.entrypoints.openai_server \
-  --model $MODEL_PATH --served-model-name deepseek-ai/DeepSeek-V4-Pro \
+  --model "$MODEL_PATH" --served-model-name deepseek-ai/DeepSeek-V4-Pro \
   --host 0.0.0.0 --server-port $PORT \
   --tensor-parallel-size 8 \
   --kv-cache-dtype fp8 --index-cache-dtype fp4 \
@@ -115,7 +115,7 @@ atomesh launch --host 0.0.0.0 --port 8000 --pd-disaggregation \
   --prefill http://<PREFILL_IP>:8010 --decode http://<DECODE_IP>:8020 \
   --prefill-policy round_robin --decode-policy round_robin \
   --atom-pd-rank-mapping-policy none \
-  --backend atom --model-path $TOKENIZER_PATH \
+  --backend atom --model-path "$TOKENIZER_PATH" \
   --disable-circuit-breaker --prometheus-port 29100 \
   --request-timeout-secs 1800
 ```
@@ -131,7 +131,7 @@ Both sides use the cache-aware router shown in the next section.
 export GPU_MEM=0.75                      # 0.70 on decode
 
 python3 -u -m atom.entrypoints.openai_server \
-  --model $MODEL_PATH --served-model-name deepseek-ai/DeepSeek-V4-Pro \
+  --model "$MODEL_PATH" --served-model-name deepseek-ai/DeepSeek-V4-Pro \
   --host 0.0.0.0 --server-port $PORT \
   --tensor-parallel-size 8 \
   --enable-dp-attention \
@@ -200,7 +200,7 @@ atomesh launch --host 0.0.0.0 --port 8000 --pd-disaggregation \
   --dp-aware --prefill-policy cache_aware --decode-policy cache_aware \
   --cache-threshold 0.8 --balance-abs-threshold 20 --balance-rel-threshold 2.0 \
   --eviction-interval 300 --atom-pd-rank-mapping-policy none \
-  --backend atom --model-path $TOKENIZER_PATH \
+  --backend atom --model-path "$TOKENIZER_PATH" \
   --disable-circuit-breaker --prometheus-port 29100 \
   --request-timeout-secs 1800
 ```
@@ -247,7 +247,7 @@ export OFFLOAD_MIN_LOAD_TOKENS=8192
 export OFFLOAD_SLOT_STAGING_SLOTS=4
 
 python3 -u -m atom.entrypoints.openai_server \
-  --model $MODEL_PATH --served-model-name deepseek-ai/DeepSeek-V4-Pro \
+  --model "$MODEL_PATH" --served-model-name deepseek-ai/DeepSeek-V4-Pro \
   --host 0.0.0.0 --server-port 8010 \
   --tensor-parallel-size 8 \
   --enable-dp-attention \
@@ -273,7 +273,7 @@ export ATOM_HOST_IP=10.0.0.2                    # this node
 # and drop the three OFFLOAD_* lines entirely
 
 python3 -u -m atom.entrypoints.openai_server \
-  --model $MODEL_PATH --served-model-name deepseek-ai/DeepSeek-V4-Pro \
+  --model "$MODEL_PATH" --served-model-name deepseek-ai/DeepSeek-V4-Pro \
   --host 0.0.0.0 --server-port 8020 \
   --tensor-parallel-size 8 \
   --enable-dp-attention \
@@ -297,7 +297,7 @@ atomesh launch --host 0.0.0.0 --port 8000 --pd-disaggregation \
   --dp-aware --prefill-policy cache_aware --decode-policy cache_aware \
   --cache-threshold 0.8 --balance-abs-threshold 20 --balance-rel-threshold 2.0 \
   --eviction-interval 300 --atom-pd-rank-mapping-policy none \
-  --backend atom --model-path $TOKENIZER_PATH \
+  --backend atom --model-path "$TOKENIZER_PATH" \
   --disable-circuit-breaker --prometheus-port 29100 \
   --request-timeout-secs 1800
 
@@ -305,7 +305,7 @@ aiperf profile --scenario inferencex-agentx-mvp \
   --url http://localhost:8000 --endpoint /v1/chat/completions \
   --endpoint-type chat --streaming \
   --model deepseek-ai/DeepSeek-V4-Pro \
-  --tokenizer $TOKENIZER_PATH --tokenizer-trust-remote-code \
+  --tokenizer "$TOKENIZER_PATH" --tokenizer-trust-remote-code \
   --concurrency 256 --benchmark-duration 3600 \
   --stats-interval 30 --random-seed 42 \
   --failed-request-threshold 0.10 \
@@ -385,7 +385,7 @@ aiperf profile --scenario inferencex-agentx-mvp \
   --url http://localhost:8000 --endpoint /v1/chat/completions \
   --endpoint-type chat --streaming \
   --model deepseek-ai/DeepSeek-V4-Pro \
-  --tokenizer $TOKENIZER_PATH --tokenizer-trust-remote-code \
+  --tokenizer "$TOKENIZER_PATH" --tokenizer-trust-remote-code \
   --concurrency $CONC --benchmark-duration 3600 \
   --stats-interval 30 --random-seed 42 \
   --failed-request-threshold 0.10 \
