@@ -141,6 +141,29 @@ class NullEventPublisher(EventPublisher):
         return
 
 
+def offset_endpoint(endpoint: str, data_parallel_rank: int | None) -> str:
+    """Make a configured ZMQ bind endpoint unique per data-parallel rank.
+
+    Every DP rank runs its own Scheduler and therefore its own publisher, but
+    they all read the same `KVEventsConfig`, so binding the configured address
+    verbatim collides from rank 1 onward. `tcp://host:port` gets the rank added
+    to the port; `ipc://` and `inproc://` get a `_dp{rank}` suffix. Rank 0 (or
+    no DP) keeps the configured endpoint, so single-engine deployments and
+    existing consumers see no change.
+    """
+    if not data_parallel_rank:
+        return endpoint
+    if endpoint.startswith("tcp://"):
+        host, sep, port = endpoint.rpartition(":")
+        if sep and port.isdigit():
+            return f"{host}:{int(port) + data_parallel_rank}"
+        raise ValueError(
+            f"cannot offset KV event endpoint {endpoint!r} for dp_rank "
+            f"{data_parallel_rank}: tcp endpoints need an explicit numeric port"
+        )
+    return f"{endpoint}_dp{data_parallel_rank}"
+
+
 class ZmqEventPublisher(EventPublisher):
     """ZMQ PUB-socket publisher.
 
@@ -156,14 +179,21 @@ class ZmqEventPublisher(EventPublisher):
     and `payload` is the msgpack-encoded EventBatch. Consumers must use
     `recv_multipart()`.
 
-    `seq` is assigned at enqueue time, so a batch dropped on queue overflow
-    still consumes a sequence number: the drop surfaces to subscribers as a
-    gap in the seq stream rather than vanishing silently. Two loss cases:
+    `seq` is assigned at enqueue time, so a batch that never reaches the wire
+    still consumes a sequence number: the loss surfaces to subscribers as a
+    gap in the seq stream rather than vanishing silently. Three loss cases:
       * transport drop (slow/late SUB) — detectable as a gap AND recoverable
         from the replay buffer (the batch was sent, so it is buffered);
       * queue-overflow drop (slow encoder/sender) — detectable as a gap but
         NOT recoverable (never sent, never buffered); also counted in
-        `stats['dropped']`.
+        `stats['dropped']`;
+      * encode failure — same as overflow, counted in `stats['encode_errors']`.
+
+    Sequence numbers start at 0 per publisher process and advance by one per
+    batch, so the 2**64-1 modulus is a wire-format bound, not an operational
+    one: at one batch per scheduler step the counter cannot wrap within the
+    lifetime of a process. Replay ordering (`seq >= start_seq`) therefore
+    assumes no wrap inside the retained window; see `_service_replay`.
     """
 
     def __init__(
@@ -201,11 +231,22 @@ class ZmqEventPublisher(EventPublisher):
             maxsize=buffer_steps
         )
 
+        # Effective bind addresses, after the per-DP-rank offset.
+        self.endpoint = offset_endpoint(endpoint, data_parallel_rank)
+        self.replay_endpoint = (
+            offset_endpoint(replay_endpoint, data_parallel_rank)
+            if replay_endpoint
+            else ""
+        )
+
         ctx = zmq.Context.instance()
         self._socket = ctx.socket(zmq.PUB)
         self._socket.set_hwm(hwm)
-        self._socket.bind(endpoint)
-        self._zmq_error_cls = zmq.ZMQError  # captured so _run doesn't re-import
+        self._socket.bind(self.endpoint)
+        # Captured so the sender thread never re-imports zmq.
+        self._zmq_error_cls = zmq.ZMQError
+        self._zmq_again_cls = zmq.Again
+        self._zmq_noblock = zmq.NOBLOCK
 
         # Optional replay: a ROUTER socket + ring buffer of recently-sent
         # batches. A subscriber that detects a seq gap can request everything
@@ -217,15 +258,22 @@ class ZmqEventPublisher(EventPublisher):
         # lifetime, and only when replay is enabled.
         self._replay = None
         self._replay_buffer: deque[tuple[int, bytes, bytes]] | None = None
-        if replay_endpoint:
+        if self.replay_endpoint:
             self._replay = ctx.socket(zmq.ROUTER)
-            self._replay.bind(replay_endpoint)
+            # Replay is serviced on the sender thread, so a replay client that
+            # stops reading must never stall live publication. ROUTER_MANDATORY
+            # turns a full per-peer pipe into an error instead of a silent drop,
+            # and every replay send is NOBLOCK, so that error is EAGAIN: the
+            # request is abandoned (see _service_replay) and live sends resume.
+            self._replay.setsockopt(zmq.ROUTER_MANDATORY, 1)
+            self._replay.bind(self.replay_endpoint)
             self._replay_buffer = deque(maxlen=replay_buffer_steps)
 
         self._seq_gen = itertools.count()
         self._drops = 0
         self._sent = 0
         self._replayed = 0
+        self._replay_aborted = 0
         self._encode_errors = 0
         self._closing = False
         self._lock = threading.Lock()
@@ -245,6 +293,16 @@ class ZmqEventPublisher(EventPublisher):
             events=evt_list,
             data_parallel_rank=self._dp_rank,
         )
+        # Assign the sequence number here (at enqueue), before encoding and
+        # not at send: a batch lost to an encode failure or dropped on overflow
+        # below still consumes a seq, so every loss is visible to subscribers
+        # as a gap instead of vanishing silently.
+        # Keep seq in [0, 2**64-2] so the wire frame, the replay-buffer key, and
+        # the start_seq comparison in _service_replay all use the same value,
+        # AND never collide with the reserved all-0xFF REPLAY_DONE terminal
+        # (modulo, not mask).
+        seq = next(self._seq_gen) % 0xFFFFFFFFFFFFFFFF
+
         try:
             payload = self._encoder.encode(batch)
         except Exception:
@@ -260,16 +318,6 @@ class ZmqEventPublisher(EventPublisher):
                     "tracked via stats['encode_errors']"
                 )
             return
-
-        # Assign the sequence number here (at enqueue), not at send: a batch
-        # dropped on overflow below still consumes a seq, so the drop is
-        # visible to subscribers as a gap instead of vanishing silently.
-        # Keep seq in [0, 2**64-2] so the wire frame, the replay-buffer key, and
-        # the start_seq comparison in _service_replay all use the same value,
-        # AND never collide with the reserved all-0xFF REPLAY_DONE terminal
-        # (modulo, not mask). Wrap-around is expected on an extremely
-        # long-lived sender.
-        seq = next(self._seq_gen) % 0xFFFFFFFFFFFFFFFF
 
         # Non-blocking enqueue; drop oldest on overflow.
         while True:
@@ -350,7 +398,12 @@ class ZmqEventPublisher(EventPublisher):
         REPLAY_DONE distinguishes it from data frames, and the msgpack window
         lets the consumer see whether events before `start_seq` were already
         evicted (start_seq < oldest) and terminate without a timeout even on a
-        zero-match request."""
+        zero-match request.
+
+        Ordering is plain integer comparison. A window straddling the 2**64-1
+        wrap would misorder, but the counter starts at 0 per process and steps
+        by one per batch, so reaching the wrap is not achievable in practice
+        (~1.8e19 batches). Not handled by design; see the class docstring."""
         frames = self._replay.recv_multipart()
         if len(frames) < 2:
             logger.warning("KV event replay: malformed request %r", frames)
@@ -366,7 +419,8 @@ class ZmqEventPublisher(EventPublisher):
         buf = self._replay_buffer or ()
         for seq, seq_bytes, payload in buf:
             if seq >= start_seq:
-                self._replay.send_multipart([*prefix, seq_bytes, payload])
+                if not self._replay_send([*prefix, seq_bytes, payload]):
+                    return
                 with self._lock:
                     self._replayed += 1
         # Terminal frame with the available window. Encode with the module
@@ -375,7 +429,31 @@ class ZmqEventPublisher(EventPublisher):
         oldest = buf[0][0] if buf else None
         latest = buf[-1][0] if buf else None
         window = msgspec.msgpack.encode([oldest, latest])
-        self._replay.send_multipart([*prefix, REPLAY_DONE, window])
+        self._replay_send([*prefix, REPLAY_DONE, window])
+
+    def _replay_send(self, frames: list[bytes]) -> bool:
+        """Non-blocking send on the replay ROUTER. Returns False when the
+        client's pipe is full (or the client is gone), in which case the caller
+        abandons the rest of this replay: the consumer is not draining, and
+        blocking here would stall the live PUB stream that shares this thread.
+        The consumer sees a missing REPLAY_DONE and can re-request."""
+        try:
+            self._replay.send_multipart(frames, flags=self._zmq_noblock)
+            return True
+        except self._zmq_again_cls:
+            reason = "client not draining"
+        except self._zmq_error_cls as e:  # EHOSTUNREACH: peer disconnected
+            reason = f"{e.__class__.__name__}: {e}"
+        with self._lock:
+            self._replay_aborted += 1
+            first = self._replay_aborted == 1
+        if first:
+            logger.warning(
+                "KV event replay abandoned (%s); further aborts are counted in "
+                "stats['replay_aborted']",
+                reason,
+            )
+        return False
 
     # Test/diagnostic hooks.
     @property
@@ -385,6 +463,7 @@ class ZmqEventPublisher(EventPublisher):
                 "sent": self._sent,
                 "dropped": self._drops,
                 "replayed": self._replayed,
+                "replay_aborted": self._replay_aborted,
                 "encode_errors": self._encode_errors,
             }
 

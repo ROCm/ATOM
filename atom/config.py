@@ -1403,14 +1403,16 @@ class KVEventsConfig:
     publisher: str = "zmq"  # "null" | "zmq"
     endpoint: str = "tcp://127.0.0.1:5557"
     topic: str = ""
-    # ROUTER endpoint subscribers use to request replay of missed batches by
-    # sequence number. Empty string keeps replay disabled (PUB-only).
-    replay_endpoint: str = ""
     # ZMQ high-water-mark on the PUB socket (0 = unlimited).
     hwm: int = 0
     # Bounded in-process queue between scheduler and sender thread. When full,
     # oldest batch is dropped — KV events are advisory, never stall inference.
     buffer_steps: int = 10_000
+    # New fields go after the pre-existing ones so positional constructor
+    # calls keep binding the same way.
+    # ROUTER endpoint subscribers use to request replay of missed batches by
+    # sequence number. Empty string keeps replay disabled (PUB-only).
+    replay_endpoint: str = ""
     # Size of the replay ring buffer (distinct from buffer_steps). Bounds the
     # long-lived retention of encoded payloads; only allocated when replay is
     # enabled. Each entry can be sizable (includes token_ids), so tune per the

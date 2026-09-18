@@ -640,9 +640,17 @@ class Scheduler:
                 data_parallel_rank=dp_rank,
             )
             logger.info(
-                "KV event publisher enabled: kind=%s endpoint=%s dp_rank=%s",
+                "KV event publisher enabled: kind=%s endpoint=%s "
+                "replay_endpoint=%s dp_rank=%s",
                 kv_events_cfg.publisher,
-                kv_events_cfg.endpoint,
+                # The zmq publisher offsets its bind addresses per DP rank;
+                # log what was actually bound, not the shared config value.
+                getattr(self.kv_event_publisher, "endpoint", kv_events_cfg.endpoint),
+                getattr(
+                    self.kv_event_publisher,
+                    "replay_endpoint",
+                    kv_events_cfg.replay_endpoint,
+                ),
                 dp_rank,
             )
         else:

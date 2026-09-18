@@ -212,6 +212,28 @@ discoverable from the central env reference despite bypassing the registry.
 | **LMCACHE_EC_PIN_TIMEOUT_SEC** | float | LMCache's own (300) | LMCache's source-pin timeout. ATOM reads it only to derive the engine's save-abandon window (`pin + 30s`), so the two stay ordered — a lost store report is reclaimed only after LMCache would already have force-unpinned its source. Non-positive disables ATOM's reclamation. ATOM sets no default of its own; when unset it assumes LMCache's. |
 | **OFFLOAD_MAX_PENDING_SAVES** | int | **2**, flat, for the engine-side/state-tier reader (`scheduler.py`); `max(2, 2 × OFFLOAD_COPY_WORKERS)` for the KV-leg reader (`_offload_common.py`) | Bound on total in-flight offload transfers (running + queued) held before a SLOT snapshot or executor submission. A KV save and a state store both pin bytes out of the same pool while they run, so the KV leg and the K3 state tier share this one number rather than each carrying its own. Two readers compute it, though: the KV leg's canonical `_offload_common.max_pending_saves` derives the shown default from `OFFLOAD_COPY_WORKERS` and **raises** on an unparseable value, while the scheduler's state-tier reader (`_offload_max_pending_saves`) has a simpler fallback — a flat default of **2** (no `OFFLOAD_COPY_WORKERS` scaling) that **warns and uses 2** on an unparseable value rather than raising. Set the env to an explicit integer to pin both. |
 
+## KV cache events
+
+The scheduler can publish prefix-cache changes (`BlockStored`, `BlockRemoved`,
+`AllBlocksCleared`, and `BlockStored(medium=REMOTE)` for KV received from a
+PD producer) over ZMQ so external routers and cache managers can mirror what
+each engine holds. Every batch carries a monotonic 8-byte sequence number;
+a consumer that sees a gap can ask for the missed batches over the optional
+replay socket. Events are advisory and never stall inference: the in-process
+queue drops the oldest batch when full. These variables build the default
+`KVEventsConfig` (see `atom/config.py`); a CLI flag, when given, overrides them.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_KV_EVENTS_ENABLE** | bool | 0 (false) | Set to `1` to publish KV cache events. |
+| **ATOM_KV_EVENTS_PUBLISHER** | str | `zmq` | `zmq` or `null` (accepts events and discards them). |
+| **ATOM_KV_EVENTS_ENDPOINT** | str | `tcp://127.0.0.1:5557` | ZMQ PUB bind address. Under data parallelism every rank binds its own socket: `tcp://` endpoints get the DP rank added to the port, `ipc://`/`inproc://` endpoints get a `_dp<rank>` suffix. Rank 0 uses the configured value unchanged. |
+| **ATOM_KV_EVENTS_TOPIC** | str | `""` | Subscription topic prefix sent as the first frame of every message. |
+| **ATOM_KV_EVENTS_HWM** | int | 0 | ZMQ high-water mark on the PUB socket (0 = unlimited). |
+| **ATOM_KV_EVENTS_BUFFER_STEPS** | int | 10000 | Depth of the in-process queue between the scheduler and the sender thread. When full, the oldest batch is dropped and counted in the publisher's `dropped` stat; the dropped batch still consumes a sequence number, so subscribers see the loss as a gap. |
+| **ATOM_KV_EVENTS_REPLAY_ENDPOINT** | str | `""` | ZMQ ROUTER bind address for replay requests. Empty disables replay (PUB-only). A consumer sends an 8-byte big-endian start sequence and receives every retained batch with `seq >= start`, followed by a `REPLAY_DONE` terminal frame carrying the retained `[oldest, latest]` window. Offset per DP rank the same way as the PUB endpoint. Replay is serviced on the sender thread with non-blocking sends: a client that stops reading has its replay abandoned (counted in `replay_aborted`) rather than stalling live publication. |
+| **ATOM_KV_EVENTS_REPLAY_BUFFER_STEPS** | int | 10000 | Number of most recently *sent* batches retained for replay. Independent of `ATOM_KV_EVENTS_BUFFER_STEPS`; each entry holds an encoded payload including token ids, so size it against the event rate and memory budget. Must be >= 1 when replay is enabled. |
+
 ## Profiling & debugging
 
 | Variable | Type | Default | Description |

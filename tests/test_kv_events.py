@@ -18,11 +18,13 @@ from __future__ import annotations
 
 import contextlib
 import time
+from types import SimpleNamespace
 
 import msgspec
 import pytest
 from conftest import MockConfig
 
+from atom.config import KVEventsConfig
 from atom.distributed.kv_events import (
     MEDIUM_GPU,
     MEDIUM_REMOTE,
@@ -35,8 +37,10 @@ from atom.distributed.kv_events import (
     NullEventPublisher,
     ZmqEventPublisher,
     make_publisher,
+    offset_endpoint,
 )
 from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.scheduler import Scheduler
 
 # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -367,6 +371,182 @@ class TestDCPBlockStoredGranularity:
         assert event.medium == MEDIUM_REMOTE
 
 
+# ── Scheduler: BlockStored(REMOTE) on remote-KV completion ─────────────────
+
+
+class TestSchedulerRemoteStore:
+    """`Scheduler._update_waiting_for_remote_kv` walks the block table and
+    emits one BlockStored(REMOTE) for the blocks that arrived from the
+    producer. The stub block manager records the call so the test pins the
+    offset/parent derivation without a real pool."""
+
+    @staticmethod
+    def _scheduler(hash_block_size: int, blocks: dict[int, tuple[int, list[int]]]):
+        calls: list[dict] = []
+        table = {
+            bid: SimpleNamespace(hash=h, token_ids=toks)
+            for bid, (h, toks) in blocks.items()
+        }
+        bm = SimpleNamespace(
+            kv_events_enabled=True,
+            enable_prefix_caching=False,  # isolate the event path
+            hash_block_size=hash_block_size,
+            kv=SimpleNamespace(block=lambda bid: table[bid]),
+            record_remote_store=lambda **kw: calls.append(kw),
+        )
+        sched = Scheduler.__new__(Scheduler)
+        sched.block_manager = bm
+        sched.kv_connector = SimpleNamespace(is_offload=False)
+        sched.finished_recving_kv_req_ids = []
+        return sched, calls
+
+    def test_offset_and_parent_follow_first_remote_block(self):
+        # Blocks 0-1 were a local prefix hit (8 cached tokens at hbs=4), blocks
+        # 2-3 arrived remotely. The event must start at token 8 and chain off
+        # the last cached hash.
+        sched, calls = self._scheduler(
+            hash_block_size=4,
+            blocks={
+                10: (100, [0, 1, 2, 3]),
+                11: (101, [4, 5, 6, 7]),
+                12: (102, [8, 9, 10, 11]),
+                13: (103, [12, 13, 14, 15]),
+            },
+        )
+        sched.finished_recving_kv_req_ids = ["7"]
+        seq = SimpleNamespace(id=7, block_table=[10, 11, 12, 13], num_cached_tokens=8)
+
+        assert sched._update_waiting_for_remote_kv(seq) is True
+        assert calls == [
+            {
+                "block_hashes": [102, 103],
+                "token_ids": list(range(8, 16)),
+                "parent_block_hash": 101,
+                "token_offset": 8,
+            }
+        ]
+
+    def test_unhashed_block_pushes_offset_past_cached_prefix(self):
+        # An unhashed (partial) block right after the cached prefix is skipped;
+        # the offset must come from the first remote block's real index (3),
+        # not from num_cached_blocks (2).
+        sched, calls = self._scheduler(
+            hash_block_size=4,
+            blocks={
+                10: (100, [0, 1, 2, 3]),
+                11: (101, [4, 5, 6, 7]),
+                12: (-1, []),
+                13: (103, [12, 13, 14, 15]),
+            },
+        )
+        sched.finished_recving_kv_req_ids = [8]
+        seq = SimpleNamespace(id=8, block_table=[10, 11, 12, 13], num_cached_tokens=8)
+
+        assert sched._update_waiting_for_remote_kv(seq) is True
+        assert len(calls) == 1
+        assert calls[0]["block_hashes"] == [103]
+        assert calls[0]["parent_block_hash"] == 101
+        assert calls[0]["token_offset"] == 12
+
+    def test_offset_uses_hash_block_size_under_dcp(self):
+        # DCP world size 2, block_size 4 -> each block-table entry spans 8
+        # global tokens. One cached entry (8 tokens) then one remote entry: the
+        # remote event starts at token 8, not at 1 * block_size == 4.
+        sched, calls = self._scheduler(
+            hash_block_size=8,
+            blocks={
+                20: (200, list(range(8))),
+                21: (201, list(range(8, 16))),
+            },
+        )
+        sched.finished_recving_kv_req_ids = ["9"]
+        seq = SimpleNamespace(id=9, block_table=[20, 21], num_cached_tokens=8)
+
+        assert sched._update_waiting_for_remote_kv(seq) is True
+        assert calls == [
+            {
+                "block_hashes": [201],
+                "token_ids": list(range(8, 16)),
+                "parent_block_hash": 200,
+                "token_offset": 8,
+            }
+        ]
+
+    def test_no_event_when_everything_was_cached(self):
+        sched, calls = self._scheduler(
+            hash_block_size=4, blocks={10: (100, [0, 1, 2, 3])}
+        )
+        sched.finished_recving_kv_req_ids = ["1"]
+        seq = SimpleNamespace(id=1, block_table=[10], num_cached_tokens=4)
+
+        assert sched._update_waiting_for_remote_kv(seq) is True
+        assert calls == []
+
+
+# ── Config ─────────────────────────────────────────────────────────────────
+
+
+class TestKVEventsConfig:
+    def test_new_fields_do_not_shift_positional_callers(self):
+        # replay_* were appended after the pre-existing fields so a positional
+        # KVEventsConfig(enable, publisher, endpoint, topic, hwm, buffer_steps)
+        # still binds the same way.
+        cfg = KVEventsConfig(True, "zmq", "tcp://127.0.0.1:5557", "t", 128, 64)
+        assert cfg.hwm == 128
+        assert cfg.buffer_steps == 64
+        assert cfg.replay_endpoint == ""
+        assert cfg.replay_buffer_steps == 10_000
+
+
+# ── Per-DP-rank endpoints ──────────────────────────────────────────────────
+
+
+class TestEndpointOffset:
+    @pytest.mark.parametrize(
+        ("endpoint", "rank", "expected"),
+        [
+            ("tcp://127.0.0.1:5557", None, "tcp://127.0.0.1:5557"),
+            ("tcp://127.0.0.1:5557", 0, "tcp://127.0.0.1:5557"),
+            ("tcp://127.0.0.1:5557", 3, "tcp://127.0.0.1:5560"),
+            ("tcp://*:5557", 1, "tcp://*:5558"),
+            ("tcp://[::1]:5557", 2, "tcp://[::1]:5559"),
+            ("ipc:///tmp/kv-events.sock", 1, "ipc:///tmp/kv-events.sock_dp1"),
+            ("inproc://kv", 2, "inproc://kv_dp2"),
+        ],
+    )
+    def test_offset_endpoint(self, endpoint, rank, expected):
+        assert offset_endpoint(endpoint, rank) == expected
+
+    def test_tcp_without_numeric_port_is_rejected_for_nonzero_rank(self):
+        with pytest.raises(ValueError, match="numeric port"):
+            offset_endpoint("tcp://127.0.0.1:*", 1)
+
+    def test_dp_ranks_bind_distinct_pub_and_replay_sockets(self):
+        # Two ranks configured with the *same* endpoints (as every DP Scheduler
+        # is) must both start; before the offset rank 1 died on address-in-use.
+        pytest.importorskip("zmq")
+        pub_ep = "inproc://test-kv-dp-pub"
+        replay_ep = "inproc://test-kv-dp-router"
+        pubs = []
+        try:
+            for rank in (0, 1):
+                pubs.append(
+                    ZmqEventPublisher(
+                        endpoint=pub_ep,
+                        replay_endpoint=replay_ep,
+                        buffer_steps=4,
+                        data_parallel_rank=rank,
+                    )
+                )
+            assert pubs[0].endpoint == pub_ep
+            assert pubs[0].replay_endpoint == replay_ep
+            assert pubs[1].endpoint == pub_ep + "_dp1"
+            assert pubs[1].replay_endpoint == replay_ep + "_dp1"
+        finally:
+            for pub in pubs:
+                pub.shutdown()
+
+
 # ── Publisher ──────────────────────────────────────────────────────────────
 
 
@@ -648,6 +828,57 @@ class TestReplayEndpointWiring:
         finally:
             pub.shutdown()
 
+    def test_slow_replay_client_does_not_stall_live_publishing(self):
+        # A DEALER that requests a large window and never reads fills its pipe.
+        # The replay must be abandoned (non-blocking send -> EAGAIN under
+        # ROUTER_MANDATORY) and the sender thread must keep serving PUB.
+        zmq = pytest.importorskip("zmq")
+        pub_ep = "inproc://test-kv-replay-slow-pub"
+        replay_ep = "inproc://test-kv-replay-slow-router"
+        # An inproc pipe holds ROUTER SNDHWM + DEALER RCVHWM complete messages,
+        # and libzmq snapshots the binder's HWM at bind time, so the publisher
+        # side stays at its default (1000) and the dealer side is pinned to 1:
+        # a replay of more than 1001 batches must hit the wall.
+        n = 1200
+        pub = ZmqEventPublisher(
+            endpoint=pub_ep,
+            replay_endpoint=replay_ep,
+            buffer_steps=n,
+            replay_buffer_steps=n,
+        )
+        ctx = zmq.Context.instance()
+        dealer = ctx.socket(zmq.DEALER)
+        dealer.set_hwm(1)
+        try:
+            for i in range(n):
+                pub.publish([BlockRemoved(block_hashes=[i])])
+            polls = 500
+            while pub.stats["sent"] < n and polls > 0:
+                time.sleep(0.02)
+                polls -= 1
+            assert pub.stats["sent"] == n
+
+            dealer.connect(replay_ep)
+            dealer.send(b"\x00" * 8)  # start_seq = 0: replay everything, never read
+            polls = 500
+            while pub.stats["replay_aborted"] == 0 and polls > 0:
+                time.sleep(0.02)
+                polls -= 1
+            assert pub.stats["replay_aborted"] == 1
+            assert pub.stats["replayed"] < n
+            assert pub._sender.is_alive()
+
+            # Live publication keeps flowing after the abandoned replay.
+            pub.publish([BlockRemoved(block_hashes=[n])])
+            polls = 200
+            while pub.stats["sent"] < n + 1 and polls > 0:
+                time.sleep(0.02)
+                polls -= 1
+            assert pub.stats["sent"] == n + 1
+        finally:
+            dealer.close(linger=0)
+            pub.shutdown()
+
     def test_replay_buffer_steps_must_be_positive(self):
         pytest.importorskip("zmq")
         with pytest.raises(ValueError):
@@ -671,6 +902,32 @@ class TestReplayEndpointWiring:
             item = next(it for it in list(pub._queue.queue) if it is not None)
             assert item[0] != reserved
             assert item[0] == 0  # reserved % (2**64 - 1)
+        finally:
+            with contextlib.suppress(Exception):
+                pub._socket.close(linger=0)
+
+    def test_encode_failure_consumes_seq_number(self):
+        # seq is assigned before encoding, so a batch lost to an encode error is
+        # a visible gap like an overflow drop, not a silent renumbering.
+        pytest.importorskip("zmq")
+        pub = ZmqEventPublisher(endpoint="inproc://test-kv-seq-encode", buffer_steps=4)
+        pub._queue.put_nowait(None)  # stop sender so we can inspect the queue
+        pub._sender.join(timeout=2.0)
+
+        class _BadEncoder:
+            def encode(self, _):
+                raise RuntimeError("boom")
+
+        try:
+            good_encoder = pub._encoder
+            pub._encoder = _BadEncoder()
+            pub.publish([BlockRemoved(block_hashes=[1])])
+            pub.publish([BlockRemoved(block_hashes=[2])])
+            pub._encoder = good_encoder
+            pub.publish([BlockRemoved(block_hashes=[3])])
+            assert pub.stats["encode_errors"] == 2
+            item = next(it for it in list(pub._queue.queue) if it is not None)
+            assert item[0] == 2  # seqs 0 and 1 were consumed by the failures
         finally:
             with contextlib.suppress(Exception):
                 pub._socket.close(linger=0)
