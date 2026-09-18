@@ -197,7 +197,7 @@ nohup atomesh launch \
   >mesh.log 2>&1 &
 ```
 
-### PD Mixed Deployment (Standalone)
+### Single node and PD Mixed Deployment (Standalone)
 
 Start a fresh server for each concurrency point.
 
@@ -210,7 +210,7 @@ The validated standalone configuration is:
 | Parallelism | TP4 |
 | KV cache | FP8 |
 | Prefix cache | Enabled |
-| CPU offload | LMCache, 512 GiB per TP rank (2 TiB total), 256-token chunks |
+| CPU offload | LMCache, 256 GiB per TP rank (1 TiB total), 256-token chunks |
 | Speculative decoding | Native MTP, draft depth per concurrency (see below) |
 | Forced acceptance length | Golden AL for that depth (see below) |
 | Profiling duration | 3,600 seconds |
@@ -244,19 +244,13 @@ export MODEL_PATH=${MODEL_PATH:-amd/GLM-5.2-MXFP4}
 export PYTHONNOUSERSITE=1
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
-
-# TP4 GPU and NUMA placement used by the current MI355X runs.
-export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-1,3,5,7}
-export ATOM_NUMA_NODE=${ATOM_NUMA_NODE:-0,0,1,1}
-export ATOM_NUMA_BIND=1
-export ATOM_AUTO_NUMA_BIND=0
-export ATOM_CRASH_ON_NUMA_BIND_FAILURE=1
+export ATOM_USE_FLYDSL_GATHER_KV_B_PROJ=0
 
 # LMCache-related settings
 export PYTHONHASHSEED=0
 export LMCACHE_LOCAL_CPU=True
 export LMCACHE_NUMA_MODE=auto
-export LMCACHE_MAX_LOCAL_CPU_SIZE=200
+export LMCACHE_MAX_LOCAL_CPU_SIZE=256
 export LMCACHE_CHUNK_SIZE=256
 export OFFLOAD_MIN_LOAD_TOKENS=8192
 
@@ -271,7 +265,6 @@ case "${CONC}" in
   8)  CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8,12,16]';             MTP_K=5; MTP_AL=3.61 ;;
   10) CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8,12,16,20]';          MTP_K=4; MTP_AL=3.33 ;;
   12) CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8,12,16,20,24]';       MTP_K=4; MTP_AL=3.33 ;;
-  16) CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8,12,16,20,24,28,32]'; MTP_K=4; MTP_AL=3.33 ;;
   *)
     echo "Unsupported CONC=${CONC}" >&2
     exit 2
@@ -339,26 +332,17 @@ export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
 export ATOM_USE_FLYDSL_GATHER_KV_B_PROJ=0
 
-# TP4 GPU and NUMA placement used by the current MI355X runs.
-export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-1,3,5,7}
-export ATOM_NUMA_NODE=${ATOM_NUMA_NODE:-0,0,1,1}
-export ATOM_NUMA_BIND=1
-export ATOM_AUTO_NUMA_BIND=0
-export ATOM_CRASH_ON_NUMA_BIND_FAILURE=1
-
 # LMCache-related settings
 export PYTHONHASHSEED=0
 export LMCACHE_LOCAL_CPU=True
 export LMCACHE_NUMA_MODE=auto
-export LMCACHE_MAX_LOCAL_CPU_SIZE=200
+export LMCACHE_MAX_LOCAL_CPU_SIZE=256
 export LMCACHE_CHUNK_SIZE=256
 export OFFLOAD_MIN_LOAD_TOKENS=8192
 
 export TP=${TP:-4}
 export DCP=${DCP:-4}
 export CONC=${CONC:-64}
-export ATOM_MLA_PAGE_SIZE=1
-export ATOM_DCP_REPLICATE_INDEX_CACHE="${ATOM_DCP_REPLICATE_INDEX_CACHE:-0}"
 
 if (( CONC < 16 )); then
   echo "DCP mode expects large CONC (>=16); got CONC=${CONC}" >&2
@@ -384,7 +368,7 @@ python -m atom.entrypoints.openai_server \
   --gpu-memory-utilization 0.95 \
   --kv_cache_dtype fp8 \
   --online_quant_config \
-    '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}' \
+    '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*"]}' \
   --kv-transfer-config \
     '{"kv_connector":"lmcache_offload","kv_role":"offload"}' \
   --tensor-parallel-size "${TP}" \
@@ -527,7 +511,7 @@ python3 -m lm_eval \
   --gen_kwargs max_gen_toks=16384,temperature=0,top_p=1
 ```
 
-Validated standalone GSM8K 5-shot result:
+Validated standalone GSM8K 20-shot result:
 
 ```text
 local-chat-completions ({'model': 'amd/GLM-5.2-MXFP4', 'base_url': 'http://0.0.0.0:8000/v1/chat/completions', 'api_key': 'EMPTY', 'eos_string': '</s>', 'max_retries': 5, 'num_concurrent': 16, 'timeout': 1800, 'tokenized_requests': False, 'max_length': 1048576}), gen_kwargs: ({'max_tokens': 16384, 'temperature': 0, 'top_p': 1}), limit: None, num_fewshot: None, batch_size: 1

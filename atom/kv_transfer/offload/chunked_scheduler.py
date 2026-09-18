@@ -150,15 +150,18 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if previous is not None and previous is not seq:
             self._clear_pending_load(sid)
             self._active_load_operations.pop(sid, None)
+            self._load_failed_seqs.pop(sid, None)
         self._load_lifecycles[sid] = seq
 
     def get_num_new_matched_tokens(self, seq) -> tuple[int, bool]:
         if not self._do_load or self._lookup_client is None:
             return 0, False
         self._begin_load_lifecycle(seq)
+        sid = str(seq.id)
+        if self._repeat_load_suppressed(seq, sid):
+            return 0, False
         num_prompt = seq.num_prompt_tokens
         token_ids = list(seq.token_ids[:num_prompt])
-        sid = str(seq.id)
         pending = self._lookup_results.get(sid)
         if pending is not None and pending[0] is not seq:
             # An older lifecycle still owns this worker-side pin. Its cleanup
@@ -202,10 +205,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             )
         if not hit:
             return 0, False
-        hit = int(hit)
-        if hit == num_prompt:  # full-prompt hit → recompute last token
-            hit -= 1
-        self._hit_save_floors[sid] = self._chunk_floor(hit)
+        hit = self._loadable_hit(hit, num_prompt)
+        self._hit_save_floors[sid] = hit
         need = hit - int(seq.num_cached_tokens)
         if need <= 0:
             self._clear_pending_load(sid)
@@ -824,6 +825,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             # [HBM, LMC) chunks be saved again instead of permanently treating
             # them as already persisted.
             entry[1] = self._chunk_floor(floor)
+        self._record_failed_load_attempt(sid)
         self._clear_pending_load(sid)
         return True
 
@@ -862,6 +864,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 self._active_load_operations.pop(sid, None)
                 self._cancel_load_statistics(active[1])
             self._load_lifecycles.pop(sid, None)
+        self._release_failed_load_attempt(sid, seq)
         entry = self._save_tracker.get(sid)
         if entry is not None and entry[0] is seq:
             if self._early_release:

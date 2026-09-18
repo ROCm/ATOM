@@ -62,9 +62,12 @@ def _adapter(world_size: int = 1, defer=()) -> tuple[object, _FakeScheduler]:
     adapter._seqs = SeqViewRegistry()
     adapter._promised_loads = {}
     adapter._deferred_frees = set()
+    adapter._deferred_free_at = {}
+    adapter._next_save_reconcile_at = 0.0
     adapter._releases_in_flight = set()
     adapter._save_reports = {}
     adapter._load_failure_reports = {}
+    adapter._completion_reports = {}
     adapter._world_size = world_size
     return adapter, scheduler
 
@@ -265,6 +268,7 @@ class _FakeWorker:
             finished_loading=out.get("finished_loading", set()),
             failed_loading=out.get("failed_loading", set()),
             finished_saving=out.get("finished_saving", set()),
+            connector_completions=out.get("connector_completions", set()),
         )
         self.error_blocks = out.get("error_blocks", set())
         self.fenced: list = []
@@ -285,6 +289,7 @@ def _worker_adapter(worker):
     adapter._pending_release_ids = []
     adapter._worker_saved = {}
     adapter._worker_load_failed = {}
+    adapter._worker_completions = []
     return adapter
 
 
