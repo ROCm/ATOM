@@ -123,9 +123,7 @@ class NodeSelectionTest(unittest.TestCase):
                 cell = self.build_cell(
                     runner=runner, nodes="n1,n2,n3", node_pool="tw1,tw2"
                 )
-                expected = (
-                    ["n1", "n2", "n3"] if runner == "atomesh-cicd-mi350" else []
-                )
+                expected = ["n1", "n2", "n3"] if runner == "atomesh-cicd-mi350" else []
                 self.assertEqual(cell["nodes"], expected)
                 self.assertEqual(cell["num_nodes"], 2)
 
