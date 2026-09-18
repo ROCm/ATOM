@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Callable
 
 logger = logging.getLogger("atom")
 
@@ -15,12 +16,20 @@ class RailEnginePool:
 
     Memory belongs to the connector and must outlive this pool. All engines
     register exactly the same MR ranges, but own separate lkeys and metadata.
-    Additional engines are created once, under a lock, on the first request.
+    Additional engines are created once, under a lock, on the first request,
+    using the selected HCA's address from local_ip_for_device.
     A failed rail stays failed until restart rather than retrying registration
     on every request or silently falling back to an unreachable rail.
     """
 
-    def __init__(self, factory, primary, primary_device, devices, local_ip):
+    def __init__(
+        self,
+        factory,
+        primary,
+        primary_device,
+        devices,
+        local_ip_for_device: Callable[[str], str],
+    ):
         self._factory = factory
         self._primary_device = primary_device
         self._devices = frozenset(devices)
@@ -28,7 +37,7 @@ class RailEnginePool:
             raise ValueError("The primary HCA must be one of the configured rails")
         self._engines = {primary_device: primary}
         self._errors = {}
-        self._local_ip = local_ip
+        self._local_ip_for_device = local_ip_for_device
         self._regions = None
         self._lock = threading.Lock()
 
@@ -60,10 +69,17 @@ class RailEnginePool:
             registered = []
             started = time.monotonic()
             try:
+                # A matched rail can have a different RDMA-local address than
+                # the primary HCA. Resolve it before creating the engine.
+                local_ip = self._local_ip_for_device(device)
+                if not isinstance(local_ip, str) or not local_ip:
+                    raise ValueError(f"No local address resolved for rail {device}")
                 engine = self._factory()
-                ret = engine.initialize(self._local_ip, "P2PHANDSHAKE", "rdma", device)
+                ret = engine.initialize(local_ip, "P2PHANDSHAKE", "rdma", device)
                 if ret != 0:
-                    raise RuntimeError(f"initialize({device}) returned {ret}")
+                    raise RuntimeError(
+                        f"initialize({device}, {local_ip}) returned {ret}"
+                    )
                 # Individual registration makes rollback exact on partial failure.
                 for ptr, size in self._regions:
                     ret = engine.register_memory(ptr, size)
@@ -73,8 +89,10 @@ class RailEnginePool:
                         )
                     registered.append(ptr)
                 logger.info(
-                    "PD_RAIL_READY device=%s rpc_port=%d chunks=%d elapsed_ms=%.3f",
+                    "PD_RAIL_READY device=%s local_ip=%s rpc_port=%d "
+                    "chunks=%d elapsed_ms=%.3f",
                     device,
+                    local_ip,
                     engine.get_rpc_port(),
                     len(registered),
                     (time.monotonic() - started) * 1000,

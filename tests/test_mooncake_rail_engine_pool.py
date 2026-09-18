@@ -3,7 +3,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -13,6 +13,7 @@ from atom.kv_transfer.disaggregation.mooncake.rail_engine_pool import RailEngine
 class FakeEngine:
     def __init__(self):
         self.device = None
+        self.ip = None
         self.regions = []
         self.released = []
         self.fail_ptr = None
@@ -22,6 +23,7 @@ class FakeEngine:
         assert metadata == "P2PHANDSHAKE"
         assert protocol == "rdma"
         self.device = device
+        self.ip = ip
         return self.init_result
 
     def register_memory(self, ptr, size):
@@ -49,7 +51,11 @@ def pool_fixture():
         return engine
 
     pool = RailEnginePool(
-        factory, primary, "ionic_2", ["ionic_2", "ionic_4", "ionic_6"], "127.0.0.1"
+        factory,
+        primary,
+        "ionic_2",
+        ["ionic_2", "ionic_4", "ionic_6"],
+        lambda device: "127.0.0.1",
     )
     pool.set_regions([1024, 2048, 3072], [64, 128, 256])
     return pool, primary, created
@@ -94,7 +100,7 @@ def test_registration_failure_rolls_back_in_reverse_and_is_not_retried():
     failed.fail_ptr = 3072
     factory = Mock(return_value=failed)
     pool = RailEnginePool(
-        factory, primary, "ionic_2", ["ionic_2", "ionic_6"], "127.0.0.1"
+        factory, primary, "ionic_2", ["ionic_2", "ionic_6"], lambda device: "127.0.0.1"
     )
     pool.set_regions([1024, 2048, 3072], [64, 128, 256])
 
@@ -114,7 +120,7 @@ def test_initialize_failure_is_remembered_without_registering():
     failed.init_result = -1
     factory = Mock(return_value=failed)
     pool = RailEnginePool(
-        factory, primary, "ionic_2", ["ionic_2", "ionic_6"], "127.0.0.1"
+        factory, primary, "ionic_2", ["ionic_2", "ionic_6"], lambda device: "127.0.0.1"
     )
     pool.set_regions([1024], [64])
     with pytest.raises(RuntimeError, match="initialize"):
@@ -130,7 +136,11 @@ def test_rollback_continues_after_unregister_error():
     failed.fail_ptr = 3072
     failed.unregister_memory = Mock(side_effect=[RuntimeError("driver error"), 0])
     pool = RailEnginePool(
-        lambda: failed, FakeEngine(), "ionic_2", ["ionic_2", "ionic_6"], "127.0.0.1"
+        lambda: failed,
+        FakeEngine(),
+        "ionic_2",
+        ["ionic_2", "ionic_6"],
+        lambda device: "127.0.0.1",
     )
     pool.set_regions([1024, 2048, 3072], [64, 128, 256])
     with pytest.raises(RuntimeError, match="register_memory"):
@@ -144,7 +154,9 @@ def test_rollback_continues_after_unregister_error():
 
 
 def test_regions_must_be_ready_and_cannot_be_replaced():
-    pool = RailEnginePool(FakeEngine, FakeEngine(), "ionic_2", ["ionic_2"], "127.0.0.1")
+    pool = RailEnginePool(
+        FakeEngine, FakeEngine(), "ionic_2", ["ionic_2"], lambda device: "127.0.0.1"
+    )
     with pytest.raises(RuntimeError, match="not ready"):
         pool.get("ionic_2")
     for ptrs, sizes in [([], []), ([1024], [])]:
@@ -157,4 +169,75 @@ def test_regions_must_be_ready_and_cannot_be_replaced():
 
 def test_primary_must_be_a_configured_rail():
     with pytest.raises(ValueError, match="primary HCA"):
-        RailEnginePool(FakeEngine, FakeEngine(), "ionic_2", ["ionic_6"], "127.0.0.1")
+        RailEnginePool(
+            FakeEngine, FakeEngine(), "ionic_2", ["ionic_6"], lambda device: "127.0.0.1"
+        )
+
+
+def test_each_rail_resolves_its_own_address_once():
+    primary = FakeEngine()
+    created = []
+
+    def factory():
+        engine = FakeEngine()
+        created.append(engine)
+        return engine
+
+    addresses = {"ionic_4": "192.0.2.4", "ionic_6": "192.0.2.6"}
+    resolver = Mock(side_effect=addresses.__getitem__)
+    pool = RailEnginePool(
+        factory,
+        primary,
+        "ionic_2",
+        ["ionic_2", "ionic_4", "ionic_6"],
+        local_ip_for_device=resolver,
+    )
+    pool.set_regions([1024], [64])
+
+    assert pool.get("ionic_2") is primary
+    resolver.assert_not_called()
+    for device, ip in addresses.items():
+        engine = pool.get(device)
+        assert engine.device == device
+        assert engine.ip == ip
+        assert pool.get(device) is engine
+    assert resolver.call_args_list == [call("ionic_4"), call("ionic_6")]
+    assert len(created) == 2
+
+
+def test_address_resolution_failure_is_cached_before_engine_creation():
+    primary = FakeEngine()
+    factory = Mock()
+    resolver = Mock(side_effect=OSError("RDMA address unavailable"))
+    pool = RailEnginePool(
+        factory,
+        primary,
+        "ionic_2",
+        ["ionic_2", "ionic_6"],
+        local_ip_for_device=resolver,
+    )
+    pool.set_regions([1024], [64])
+
+    with pytest.raises(OSError, match="RDMA address unavailable"):
+        pool.get("ionic_6")
+    with pytest.raises(RuntimeError, match="previously failed"):
+        pool.get("ionic_6")
+    factory.assert_not_called()
+    resolver.assert_called_once_with("ionic_6")
+    assert pool.get("ionic_2") is primary
+
+
+@pytest.mark.parametrize("address", [None, ""])
+def test_empty_rail_address_does_not_initialize_an_engine(address):
+    factory = Mock()
+    pool = RailEnginePool(
+        factory,
+        FakeEngine(),
+        "ionic_2",
+        ["ionic_2", "ionic_6"],
+        local_ip_for_device=lambda device: address,
+    )
+    pool.set_regions([1024], [64])
+    with pytest.raises(ValueError, match="No local address"):
+        pool.get("ionic_6")
+    factory.assert_not_called()

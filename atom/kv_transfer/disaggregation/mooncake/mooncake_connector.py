@@ -793,7 +793,9 @@ class MooncakeConnector(KVConnectorBase):
                 self.transfer_engine,
                 primary_ib_device,
                 matched_rails,
-                self.local_ip,
+                local_ip_for_device=lambda device: _ip_for_ib_device(
+                    device, default_local_ip
+                ),
             )
             logger.info(
                 "Mooncake matched rails enabled: primary=%s rails=%s",

@@ -1265,7 +1265,11 @@ def test_missing_consumer_rail_notifies_failure_without_writing():
     conn = _matched_rail_producer()
     factory = MagicMock()
     conn._rail_pool = RailEnginePool(
-        factory, conn.transfer_engine, "ionic_2", ["ionic_2"], "127.0.0.1"
+        factory,
+        conn.transfer_engine,
+        "ionic_2",
+        ["ionic_2"],
+        lambda device: "127.0.0.1",
     )
     conn._rail_pool.set_regions([100], [64])
     conn._execute_block_transfer = MagicMock()
