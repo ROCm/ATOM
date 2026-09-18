@@ -793,6 +793,9 @@ class MooncakeConnector(KVConnectorBase):
                 self.transfer_engine,
                 primary_ib_device,
                 matched_rails,
+                # This address is the P2P RPC endpoint, not the RDMA GID.
+                # IPv6-only rails may share a reachable host IPv4 for RPC;
+                # the engine's device filter still selects the matched HCA.
                 local_ip_for_device=lambda device: _ip_for_ib_device(
                     device, default_local_ip
                 ),
