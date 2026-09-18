@@ -911,67 +911,8 @@ class WeightUpdaterMixin:
         Returns:
             Number of parameters successfully updated
         """
-        param_to_module = self._get_param_to_module_mapping()
-
-        updated = 0
-        skipped = 0
-        ignored_scales = 0
-
-        for name, tensor in named_tensors:
-            if name not in param_to_module:
-                result = self._apply_unmatched_weight(name, tensor, param_to_module)
-                if result == "updated":
-                    updated += 1
-                elif result == "accumulated":
-                    pass
-                elif "weight_scale" in name or "input_scale" in name:
-                    ignored_scales += 1
-                else:
-                    logger.debug(f"{self.label}: Unmatched parameter: {name}")
-                    skipped += 1
-                continue
-
-            module, param_name, param = param_to_module[name]
-            weight_loader = getattr(module, "weight_loader", None)
-
-            if param_name in _EXPERT_BUFFER_SHARDS:
-                self._apply_named_expert_buffer(name, param_name, module, param, tensor)
-                updated += 1
-            elif self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
-                self._requantize_fp8_weight(module, param_name, param, tensor)
-                updated += 1
-            elif self._is_fp8_param(module, param) and tensor.dtype == param.dtype:
-                tensor = tensor.to(device=self.device)
-                self._copy_into_param(param, tensor)
-                self._post_process_fp8_weight(module, param)
-                updated += 1
-            elif tensor.shape == param.shape:
-                tensor = tensor.to(device=self.device, dtype=param.dtype)
-                self._copy_into_param(param, tensor)
-                updated += 1
-            elif weight_loader is not None and callable(weight_loader):
-                try:
-                    tensor = tensor.to(device=self.device)
-                    self._load_into_param(param, weight_loader, tensor)
-                    updated += 1
-                except Exception as e:  # noqa: BLE001 - a loader raises anything
-                    logger.warning(
-                        f"{self.label}: weight_loader failed for {name}: {e}"
-                    )
-                    skipped += 1
-            else:
-                tp_size = self.world_size
-                tp_rank = self.rank
-                if tp_size > 1 and self._try_shard_weight(
-                    param, tensor, tp_rank, tp_size
-                ):
-                    updated += 1
-                else:
-                    logger.warning(
-                        f"{self.label}: Shape mismatch for {name}: "
-                        f"expected {param.shape}, got {tensor.shape}"
-                    )
-                    skipped += 1
+        counts = self._apply_named_tensors(named_tensors)
+        updated = counts["updated"]
 
         self._finalize_expert_weight_sync()
 
@@ -983,11 +924,298 @@ class WeightUpdaterMixin:
 
         logger.info(
             f"{self.label}: Weight update complete - "
-            f"updated={updated}, skipped={skipped}, "
-            f"ignored_scales={ignored_scales}"
+            f"updated={updated}, skipped={counts['skipped']}, "
+            f"ignored_scales={counts['ignored_scales']}"
         )
-        self._warn_if_nothing_matched(updated, skipped)
+        self._warn_if_nothing_matched(updated, counts["skipped"])
         return updated
+
+    def _apply_named_tensors(
+        self, named_tensors: list[tuple[str, torch.Tensor]]
+    ) -> dict:
+        """Apply one batch of named tensors, without finalising anything.
+
+        Extracted from ``update_weights`` so the bucketed RDMA path can reuse it
+        verbatim. Finalisation (expert relayout, KV clear, accumulator teardown)
+        deliberately stays with the caller: a bucketed stream must do it once at
+        commit, not once per bucket, or a fused parameter whose shards span
+        buckets would be finalised half-built.
+
+        Returns counts plus the set of parameter names actually written, which
+        is what commit-time coverage verification needs.
+        """
+        param_to_module = self._get_param_to_module_mapping()
+
+        updated = 0
+        skipped = 0
+        ignored_scales = 0
+        written: set[str] = set()
+        skipped_names: set[str] = set()
+
+        for name, tensor in named_tensors:
+            if name not in param_to_module:
+                result = self._apply_unmatched_weight(name, tensor, param_to_module)
+                if result == "updated":
+                    updated += 1
+                    written.add(name)
+                elif result == "accumulated":
+                    # A shard of a fused parameter; it counts once the group
+                    # completes, which may be in a later bucket.
+                    pass
+                elif "weight_scale" in name or "input_scale" in name:
+                    ignored_scales += 1
+                else:
+                    logger.debug(f"{self.label}: Unmatched parameter: {name}")
+                    skipped += 1
+                    skipped_names.add(name)
+                continue
+
+            module, param_name, param = param_to_module[name]
+            weight_loader = getattr(module, "weight_loader", None)
+
+            if param_name in _EXPERT_BUFFER_SHARDS:
+                self._apply_named_expert_buffer(name, param_name, module, param, tensor)
+                updated += 1
+                written.add(name)
+            elif self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
+                self._requantize_fp8_weight(module, param_name, param, tensor)
+                updated += 1
+                written.add(name)
+                # Requantisation writes the scale as a side effect, so a naive
+                # named_parameters() diff at commit would report it missing.
+                self._record_scale_side_effect(written, name, param_name, module)
+            elif self._is_fp8_param(module, param) and tensor.dtype == param.dtype:
+                tensor = tensor.to(device=self.device)
+                self._copy_into_param(param, tensor)
+                self._post_process_fp8_weight(module, param)
+                updated += 1
+                written.add(name)
+            elif tensor.shape == param.shape:
+                tensor = tensor.to(device=self.device, dtype=param.dtype)
+                self._copy_into_param(param, tensor)
+                updated += 1
+                written.add(name)
+            elif weight_loader is not None and callable(weight_loader):
+                try:
+                    tensor = tensor.to(device=self.device)
+                    self._load_into_param(param, weight_loader, tensor)
+                    updated += 1
+                    written.add(name)
+                except Exception as e:  # noqa: BLE001 - a loader raises anything
+                    logger.warning(
+                        f"{self.label}: weight_loader failed for {name}: {e}"
+                    )
+                    skipped += 1
+                    skipped_names.add(name)
+            else:
+                tp_size = self.world_size
+                tp_rank = self.rank
+                if tp_size > 1 and self._try_shard_weight(
+                    param, tensor, tp_rank, tp_size
+                ):
+                    updated += 1
+                    written.add(name)
+                else:
+                    logger.warning(
+                        f"{self.label}: Shape mismatch for {name}: "
+                        f"expected {param.shape}, got {tensor.shape}"
+                    )
+                    skipped += 1
+                    skipped_names.add(name)
+
+        return {
+            "updated": updated,
+            "skipped": skipped,
+            "ignored_scales": ignored_scales,
+            "written": written,
+            "skipped_names": skipped_names,
+        }
+
+    def _record_scale_side_effect(
+        self,
+        written: set[str],
+        name: str,
+        param_name: str,
+        module: torch.nn.Module,
+    ) -> None:
+        """Credit a ``weight_scale`` that requantisation wrote indirectly.
+
+        Coverage is checked against ``named_parameters()``, which includes the
+        scales. They are never sent over the wire -- they are derived when a
+        full-precision tensor is requantised -- so without this they look
+        permanently missing and ``verify_full_load`` would reject every stream.
+        """
+        if not isinstance(getattr(module, "weight_scale", None), torch.nn.Parameter):
+            return
+        prefix = (
+            name[: -len(param_name)] if param_name and name.endswith(param_name) else ""
+        )
+        written.add(f"{prefix}weight_scale")
+
+    # ── bucketed, transactional reload (the RDMA path) ────────────────────
+    #
+    # A stream arrives as many buckets and is applied in place, so a failure
+    # halfway leaves the model a mix of two versions. That is worse than not
+    # starting: inference keeps serving and is quietly wrong. So the stream is
+    # framed as a transaction, and a failed one fences serving until a later
+    # full reload succeeds.
+
+    def begin_weight_update(self, version: int) -> dict:
+        """Open a versioned reload."""
+        version = int(version)
+        active = getattr(self, "_weight_update_version", None)
+        if active is not None:
+            raise RuntimeError(
+                f"weight update v{active} is already in progress; "
+                "a concurrent reload would interleave two versions"
+            )
+        last = getattr(self, "_last_started_weight_version", None)
+        if last is not None and version <= last:
+            # Monotonic versions are what let a receiver reject a replayed or
+            # out-of-order stream instead of silently going backwards.
+            raise RuntimeError(
+                f"weight update version must increase: last={last}, got={version}"
+            )
+
+        self._weight_update_version = version
+        self._last_started_weight_version = version
+        self._weight_update_written: set[str] = set()
+        self._weight_update_skipped: set[str] = set()
+        self._weight_update_buckets = 0
+        self._weight_update_bytes = 0
+        if hasattr(self, "_packed_weight_accum"):
+            self._packed_weight_accum.clear()
+        logger.info(f"{self.label}: began weight update v{version}")
+        return {"version": version, "state": "receiving"}
+
+    def apply_weight_bucket(
+        self,
+        named_tensors: list[tuple[str, torch.Tensor]],
+        payload_bytes: int = 0,
+    ) -> dict:
+        """Apply one bucket, keeping cross-bucket state for the rest."""
+        if getattr(self, "_weight_update_version", None) is None:
+            raise RuntimeError("no weight update in progress; call begin first")
+        try:
+            counts = self._apply_named_tensors(named_tensors)
+        except Exception as exc:
+            self.abort_weight_update(self._weight_update_version, exc)
+            raise
+
+        self._weight_update_written |= counts["written"]
+        self._weight_update_skipped |= counts["skipped_names"]
+        self._weight_update_buckets += 1
+        self._weight_update_bytes += int(payload_bytes)
+        return {
+            "version": self._weight_update_version,
+            "bucket": self._weight_update_buckets,
+            "updated": counts["updated"],
+            "skipped": sorted(counts["skipped_names"]),
+        }
+
+    def commit_weight_update(self, version: int, verify_full_load: bool = True) -> dict:
+        """Finalise the reload and make the new version eligible to serve."""
+        version = int(version)
+        active = getattr(self, "_weight_update_version", None)
+        if active is None:
+            raise RuntimeError("no weight update in progress")
+        if active != version:
+            error = RuntimeError(
+                f"commit version mismatch: in progress v{active}, asked v{version}"
+            )
+            self.abort_weight_update(active, error)
+            raise error
+
+        try:
+            # Once, at the end: a fused parameter's shards may have spanned
+            # buckets, so relayout before this point would work on a half-built
+            # parameter.
+            self._finalize_expert_weight_sync()
+
+            leftover = sorted(getattr(self, "_packed_weight_accum", {}).keys())
+            if leftover:
+                raise RuntimeError(
+                    "reload ended with incomplete fused parameters: " f"{leftover[:20]}"
+                )
+
+            if verify_full_load:
+                expected = {
+                    name for name, _ in self._sync_target_model().named_parameters()
+                }
+                missing = sorted(expected - self._weight_update_written)
+                if missing or self._weight_update_skipped:
+                    raise RuntimeError(
+                        "incomplete weight reload: wrote "
+                        f"{len(self._weight_update_written)}/{len(expected)} "
+                        f"parameters; missing={missing[:20]} "
+                        f"skipped={sorted(self._weight_update_skipped)[:20]}"
+                    )
+
+            self.clear_kv_cache()
+        except Exception as exc:
+            self.abort_weight_update(version, exc)
+            raise
+
+        manifest = {
+            "version": version,
+            "buckets": self._weight_update_buckets,
+            "bytes": self._weight_update_bytes,
+            "loaded_internal": len(self._weight_update_written),
+            "skipped": sorted(self._weight_update_skipped),
+        }
+        self._weight_update_version = None
+        self._last_committed_weight_version = version
+        self._weight_update_healthy = True
+        self._weight_update_failure = None
+        if hasattr(self, "_packed_weight_accum"):
+            self._packed_weight_accum.clear()
+        logger.info(
+            f"{self.label}: committed weight update v{version} "
+            f"({manifest['buckets']} buckets, "
+            f"{manifest['loaded_internal']} parameters)"
+        )
+        return manifest
+
+    def abort_weight_update(self, version: int, error: object) -> dict:
+        """Discard the transaction and fence serving."""
+        active = getattr(self, "_weight_update_version", None)
+        version = int(active if active is not None else version)
+        self._weight_update_version = None
+        self._weight_update_healthy = False
+        self._weight_update_failure = str(error)
+        if hasattr(self, "_packed_weight_accum"):
+            self._packed_weight_accum.clear()
+        logger.error(f"{self.label}: aborted weight update v{version}: {error}")
+        return {"version": version, "state": "aborted", "error": str(error)}
+
+    def assert_weight_update_ready(self) -> None:
+        """Refuse to serve mid-reload or after a partial one.
+
+        Called from ``forward``. The cost of a false stop is a raised error; the
+        cost of not stopping is rollouts generated from a half-updated model,
+        which surfaces much later as unexplained divergence.
+        """
+        if getattr(self, "_weight_update_version", None) is not None:
+            raise RuntimeError(
+                f"{self.label}: serving is fenced while weight update "
+                f"v{self._weight_update_version} is in progress"
+            )
+        if getattr(self, "_weight_update_healthy", True):
+            return
+        raise RuntimeError(
+            f"{self.label}: serving is fenced after a partial weight update; "
+            "a newer full reload must succeed first. failure="
+            f"{getattr(self, '_weight_update_failure', 'unknown')}"
+        )
+
+    def get_weight_update_status(self) -> dict:
+        """Reportable state, so an orchestrator can see the fence over RPC."""
+        return {
+            "healthy": getattr(self, "_weight_update_healthy", True),
+            "in_progress": getattr(self, "_weight_update_version", None),
+            "last_committed": getattr(self, "_last_committed_weight_version", None),
+            "failure": getattr(self, "_weight_update_failure", None),
+        }
 
     def update_weights_from_shm(
         self,
