@@ -59,7 +59,6 @@ class _FakeScheduler:
     def cancel_pending_load(self, seq) -> None:
         self.cancelled.append(str(seq.id))
 
-
     def protected_block_ids(self, seq):
         return self.protected
 
@@ -517,7 +516,7 @@ def test_without_a_block_pool_the_whole_request_is_still_deferred():
 
 def test_an_empty_protection_set_takes_no_share_at_all():
     """`touch([])` is not merely wasteful -- there is no share to give back."""
-    adapter, scheduler, pool = _leasing_adapter(protected=frozenset())
+    adapter, _scheduler, pool = _leasing_adapter(protected=frozenset())
 
     assert _finish(adapter) == (False, None)
     assert pool.touched == []
@@ -536,9 +535,7 @@ def test_a_lease_is_handed_back_tail_first_once_its_save_is_source_safe():
 
 
 def test_a_lease_whose_save_never_reports_is_force_released(caplog, monkeypatch):
-    monkeypatch.setattr(
-        connector_mod, "offload_save_abandon_timeout_s", lambda: 330.0
-    )
+    monkeypatch.setattr(connector_mod, "offload_save_abandon_timeout_s", lambda: 330.0)
     adapter, scheduler, pool = _leasing_adapter(protected=frozenset({3}))
     _finish(adapter)
 
