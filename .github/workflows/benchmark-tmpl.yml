@@ -73,6 +73,10 @@ on:
         type: string
         required: false
         default: ""
+      aiter_commit:
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -131,6 +135,13 @@ jobs:
             -e CONC=${{ env.CONC }} -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }}
             -e ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }}
             -e ENABLE_RTL_PROFILER=${{ inputs.enable_rtl && '1' || '0' }}
+
+      - name: Reinstall AITER from requested ref
+        if: ${{ inputs.aiter_commit != '' }}
+        env:
+          CONTAINER_NAME: atom-benchmark
+          AITER_GIT_REF: ${{ inputs.aiter_commit }}
+        run: bash .github/scripts/install_aiter_from_ref.sh
 
       - name: Collect GPU info (inside container)
         id: gpu-info
