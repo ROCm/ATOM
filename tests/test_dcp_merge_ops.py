@@ -56,6 +56,7 @@ try:
         _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT_FP8,
         _MLA_DCP_SPARSE_PREFILL_WIDTHS,
         _MLA_DCP_SPARSE_PREFILL_WIDTHS_PERSISTENT,
+        _q_proj_is_qrep_widened,
         mla_dcp_kernel_num_heads,
         mla_dcp_sparse_prefill_is_persistent,
         mla_dcp_sparse_prefill_num_heads,
@@ -927,16 +928,72 @@ def test_gate_reason_is_human_readable():
     assert "decode_context_parallel_size" in reason
 
 
-def test_gate_allows_speculative_decode():
-    """QREP only changes how q_out is produced (load-time replicated q_proj vs.
-    a runtime AllGather); the cprr mask the qlen>1 MTP/eagle3/dspark verify path
-    uses keys off KV-side round-robin position, not off q_out's provenance, so
-    the two are independent. Confirmed on GLM-5.2-FP8 sparse DCP8 fp8 MTP=3
-    (gsm8k nshot=20): QREP-on 0.9469/0.9477 vs QREP-off 0.9492/0.9492, well
-    within noise. This used to be gated off out of first-cut caution, not a
-    known conflict -- regression-guard that decision here.
+def test_gate_does_not_look_at_speculative_config():
+    """Gated off in the first cut on the suspicion that QREP's full-group-head
+    q_out conflicted with the qlen>1 verify path (the `cprr` kernel for dense
+    MLA, or the sparse indexer's per-token candidate exchange). Auditing both
+    showed no coupling: q_out's provenance (AllGather vs QREP) is invisible to
+    either consumer. GLM-5.2-FP8 sparse dcp8 fp8 MTP=3 ran clean end-to-end
+    (gsm8k nshot=20, QREP-on 0.9469/0.9477 vs QREP-off 0.9492/0.9492) -- though
+    that arm never selects `cprr` (sparse MTP verify flattens to qlen=1 per
+    token), so it covers the sparse indexer side of this claim, not `cprr`.
+
+    A value assertion on the old 3-arg signature would pass again if
+    `speculative_config` were re-added as an optional keyword with a default,
+    which is the likeliest recurrence. Pin the decoupling at the signature
+    instead, same as `test_gate_takes_no_interleave_input` above.
     """
-    assert qrep_unsupported_reason(8, False) is None
+    import inspect
+
+    params = inspect.signature(qrep_unsupported_reason).parameters
+    assert not any("spec" in p for p in params), (
+        f"the QREP gate must not key off the speculative config; got {list(params)}"
+    )
+
+
+# ─────────────────────────────────────── per-layer QREP eligibility (CPU) ──
+#
+# `enable_query_replication` is a config-wide intent, but only layers built
+# with `qrep_tp_override` actually have a q_proj that wide: eagle3 / DSpark
+# draft models build their own q_proj independently of the target model, and
+# some models (e.g. GLM-5.3's `_ZeroRopePad`-wrapped q_proj) have not wired
+# the override at all. `_q_proj_is_qrep_widened` is the runtime check that
+# keeps those layers on the AllGather path instead of misreading a narrow q as
+# the wide QREP layout.
+
+
+class _FakeLinear:
+    def __init__(self, out_features, in_features=8):
+        self.weight = torch.empty(out_features, in_features)
+
+
+class _NoWeight:
+    """Stand-in for `_ZeroRopePad`: wraps a linear but exposes no `.weight`."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+
+@needs_dcp_ops
+def test_q_proj_is_qrep_widened_true_when_shard_matches():
+    q_proj = _FakeLinear(out_features=64 * 128)  # qrep_num_heads * qk_head_dim
+    assert _q_proj_is_qrep_widened(q_proj, qrep_num_heads=64, qk_head_dim=128)
+
+
+@needs_dcp_ops
+def test_q_proj_is_qrep_widened_false_for_plain_per_rank_shard():
+    """The un-widened case: e.g. an eagle3 / DSpark draft's own q_proj, built
+    without `qrep_tp_override`, still at the plain `num_heads/tp` width."""
+    q_proj = _FakeLinear(out_features=8 * 128)  # num_local_heads * qk_head_dim
+    assert not _q_proj_is_qrep_widened(q_proj, qrep_num_heads=64, qk_head_dim=128)
+
+
+@needs_dcp_ops
+def test_q_proj_is_qrep_widened_false_when_no_weight_attr():
+    """GLM-5.3's `_ZeroRopePad` wraps its inner Linear without exposing
+    `.weight` on itself -- must fall back cleanly, not raise."""
+    q_proj = _NoWeight(_FakeLinear(out_features=8 * 128))
+    assert not _q_proj_is_qrep_widened(q_proj, qrep_num_heads=64, qk_head_dim=128)
 
 
 # ═══════════════════════════════ ColumnParallelLinear.make_row_view (GPU) ══

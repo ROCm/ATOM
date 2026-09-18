@@ -357,12 +357,23 @@ wired, so it can default on without breaking mixed runs:
 | `-dcp 1` | `decode_context_parallel_size <= 1 (no DCP group)` — no AllGather Q to remove |
 | fp4 (`ATOM_USE_TRITON_MXFP4_BMM=1`) | `fp4 (mxfp4) BMM weights` — different scale structure |
 
-QREP composes with speculative decode (MTP / eagle3 / DSpark): QREP only
-changes how `q_out` is produced (load-time replicated `q_proj` instead of a
-runtime AllGather), while the `cprr` kernel's mask keys off the KV side's
-round-robin position — the two are independent. Validated on GLM-5.2-FP8
-sparse DCP8, fp8 KV, MTP=3 (gsm8k nshot=20): QREP on 0.9469/0.9477 vs. QREP
-off 0.9492/0.9492, within noise.
+QREP composes with **MTP** (dense MLA and sparse / DSA): QREP only changes how
+`q_out` is produced (load-time replicated `q_proj` instead of a runtime
+AllGather), while the verify path's mask (the `cprr` kernel on dense, the
+sparse indexer's per-token candidate exchange on sparse / DSA) keys off the KV
+side, not off `q_out`'s provenance — the two are independent. Validated on
+GLM-5.2-FP8 sparse DCP8, fp8 KV, MTP=3 (gsm8k nshot=20): QREP on
+0.9469/0.9477 vs. QREP off 0.9492/0.9492, within combined stderr. That arm
+never selects `cprr` (sparse MTP verify flattens to `q_len=1` per token, see
+below), so this covers the sparse indexer side; dense MLA + `cprr` + QREP
+rests on the code-reading argument above and has not been independently
+re-run.
+
+Layers whose `q_proj` was not built with the QREP override — **eagle3** and
+**DSpark** draft models build their own `q_proj` independently of the target
+model and do not opt in — fall back to AllGather automatically per layer
+(logged once as `enable_query_replication is on, but this layer's q_proj was
+not built with qrep_tp_override`), regardless of the global flag.
 
 Check the server log for `query_replication disabled: ...` to see whether it
 actually took effect; the flag being `true` is not the same as QREP running.
@@ -571,8 +582,8 @@ validated configuration.
 
 ## DCP + Speculative Decode (MTP / DSpark)
 
-DCP composes with two drafters: **MTP** (`--method mtp`) on dense MLA, and
-**DSpark** (`--method dspark`) on Kimi-K3. Both verify several draft tokens per
+DCP composes with two drafters: **MTP** (`--method mtp`) on both dense MLA and
+sparse / DSA, and **DSpark** (`--method dspark`) on Kimi-K3. Both verify several draft tokens per
 step, so decode runs with query length `q > 1`. That is where DCP's round-robin
 sharding starts to matter: whenever such a decode is **causal**, its mask has to
 be expressed on **global** token positions rather than the rank-local ones the
@@ -584,10 +595,11 @@ bidirectional and skips it.
 MTP verifies `q = num_speculative_tokens + 1` tokens per step under a causal
 mask, so the intra-block mask has to be applied on global positions. This is
 handled by a dedicated **round-robin CP (`cprr`) MLA kernel**, selected
-automatically when DCP is on, `q > 1`, and the decode is causal. This applies
-equally to dense MLA (V3 / R1) and sparse / DSA (V3.2-Exp, GLM's sparse
-attention): the sparse indexer's candidate exchange handles `q > 1` directly on
-the sharded index cache, with no dependency on `cprr`.
+automatically when DCP is on, `q > 1`, and the decode is causal — that is the
+**dense MLA** (V3 / R1) path. **Sparse / DSA** (V3.2-Exp, GLM's sparse
+attention) reaches the same result by a different route and never selects
+`cprr`: MTP verify is flattened to a per-token `q_len = 1` layout over the
+sharded index cache, so there is no intra-block mask to place.
 
 **Support matrix:**
 
@@ -595,9 +607,9 @@ the sharded index cache, with no dependency on `cprr`.
 |---|---|
 | GPU arch | **gfx950 only** (the `cprr` kernel is persistent-only and ships for gfx950; gfx942 has no such kernel) |
 | Method | `--method mtp` (`num_speculative_tokens` = 1, 2, or 3) |
-| KV cache dtype | **bf16 and fp8** both work for all of `num_speculative_tokens` 1/2/3 — dense MLA only; sparse / DSA validated on fp8 |
-| DCP size | dcp2 / dcp4 / dcp8 all validated (`tp8`) — dense MLA only; sparse / DSA validated at dcp8 |
-| Model | Dense MLA (V3 / R1): full matrix above. Sparse / DSA (GLM-5.2-FP8): validated at fp8 KV, `num_speculative_tokens=3`, dcp8 (gsm8k nshot=20 matches the non-speculative DCP baseline within noise); other combinations follow the same mechanism but are not independently re-checked |
+| KV cache dtype | **bf16 and fp8** both work for all of `num_speculative_tokens` 1/2/3 (dense MLA) |
+| DCP size | dcp2 / dcp4 / dcp8 all validated (`tp8`, dense MLA) |
+| Model | Dense MLA (V3 / R1): full matrix above (exercises the `cprr` kernel). Sparse / DSA (GLM-5.2-FP8): validated at fp8 KV, `num_speculative_tokens=3`, dcp8 — QREP-on and QREP-off agree within combined stderr on gsm8k nshot=20 (0.9469/0.9477 vs. 0.9492/0.9492); other `num_speculative_tokens`, KV dtypes, and DCP sizes on sparse follow the same mechanism but are not independently re-checked |
 
 **Usage** (add MTP flags to any DCP command):
 

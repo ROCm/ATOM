@@ -462,6 +462,20 @@ def qrep_tp_override(tp_size: int) -> dict:
     }
 
 
+def _q_proj_is_qrep_widened(q_proj, qrep_num_heads: int, qk_head_dim: int) -> bool:
+    """Whether `q_proj` was actually built with `qrep_tp_override`.
+
+    A layer built without the override (an eagle3 / DSpark draft's own q_proj,
+    or a model that has not wired QREP support) still produces `q_proj.weight`
+    at the plain per-rank width. Reinterpreting that as the wide QREP layout
+    would either silently fold the wrong rows into one head group or raise
+    downstream depending on shape divisibility -- checking the actual width
+    here means such a layer falls back to AllGather instead.
+    """
+    weight = getattr(q_proj, "weight", None)
+    return weight is not None and weight.shape[0] == qrep_num_heads * qk_head_dim
+
+
 def is_rocm_aiter_fp4bmm_enabled() -> bool:
     return envs.ATOM_USE_TRITON_MXFP4_BMM
 
@@ -759,11 +773,31 @@ class MLAAttention(nn.Module):
         # DCP Query Replication (QREP): q_proj is sharded on effective TP =
         # tp/dcp, so each rank produces the whole DCP-group head set and decode
         # can skip the per-step AllGather Q. W_K is gathered to match, at load.
-        self.qrep_enabled = (
+        # Only layers built with `qrep_tp_override` actually have a q_proj this
+        # wide -- eagle3 / DSpark draft models and GLM-5.3's `_ZeroRopePad`
+        # wrapper build their own q_proj independently of the target model and
+        # never apply the override. Checking the per-layer intent (config flag)
+        # is not enough: gating on the actual weight width also catches a layer
+        # silently reinterpreting a narrow q as a wide one instead of either
+        # working correctly or raising.
+        self.qrep_num_heads = self.num_heads * self.dcp_world_size
+        wants_qrep = (
             self.dcp_world_size > 1
             and get_current_atom_config().dcp_config.enable_query_replication
         )
-        self.qrep_num_heads = self.num_heads * self.dcp_world_size
+        self.qrep_enabled = wants_qrep and _q_proj_is_qrep_widened(
+            self.q_proj, self.qrep_num_heads, self.qk_head_dim
+        )
+        if wants_qrep and not self.qrep_enabled and not getattr(
+            MLAAttention, "_qrep_not_widened_logged", False
+        ):
+            MLAAttention._qrep_not_widened_logged = True
+            logger.warning(
+                "dcp_config.enable_query_replication is on, but this layer's "
+                "q_proj was not built with qrep_tp_override (e.g. an eagle3 / "
+                "DSpark draft, or a model that has not wired QREP support) -- "
+                "falling back to AllGather Q for it."
+            )
         if self.qrep_enabled:
             assert self.qrep_num_heads >= _MLA_MIN_HEADS, (
                 "DCP query replication requires the DCP-group head set "
