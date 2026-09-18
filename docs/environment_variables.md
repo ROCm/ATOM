@@ -341,3 +341,12 @@ dp_size = envs.ATOM_DP_SIZE
 ```
 
 See `atom/utils/envs.py` for the full list of lazy-evaluated environment variables.
+
+## Mooncake PD matched rails
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_MOONCAKE_MATCHED_RAILS** | str | "" | Comma-separated allowlist of corresponding local RDMA HCAs. Enables a lazily initialized, single-HCA engine pool on P, selected by D's advertised HCA. Requires RDMA and a single primary HCA. Unset preserves the existing transport behavior. |
+
+See [Mooncake matched rails](mooncake_matched_rails.md) for independent P/D
+rank configuration, deployment requirements, and registration lifetime.

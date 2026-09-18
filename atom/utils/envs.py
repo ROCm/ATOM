@@ -45,6 +45,8 @@ def _positive_float_env(name: str, default: str) -> float:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Opt-in single-HCA engine pool for rail-isolated Mooncake PD fabrics.
+    "ATOM_MOONCAKE_MATCHED_RAILS": lambda: os.getenv("ATOM_MOONCAKE_MATCHED_RAILS", ""),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
     "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
