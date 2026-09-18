@@ -5,6 +5,8 @@ import argparse
 import sys
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 # conftest.py stubs atom.* and zmq before any atom imports are attempted,
 # but arg_utils.py imports LLMEngine from atom and CompilationConfig /
 # SpeculativeConfig from atom.config, which the minimal stub doesn't expose.
@@ -236,3 +238,29 @@ class TestEngineArgsIndexCacheDtype:
         )
 
         assert args.index_cache_dtype == "fp8"
+
+
+class TestSchedulingPolicyCli:
+    """`--scheduling-policy sjf` must reach the engine kwargs the Config is
+    built from; a flag that parses but never arrives is the classic silent
+    no-op for a scheduler knob."""
+
+    def _parse(self, argv):
+        parser = argparse.ArgumentParser()
+        EngineArgs.add_cli_args(parser)
+        return EngineArgs.from_cli_args(parser.parse_args(argv))
+
+    def test_default_is_fcfs(self):
+        assert self._parse([])._get_engine_kwargs()["scheduling_policy"] == "fcfs"
+
+    def test_sjf_reaches_engine_kwargs(self):
+        kwargs = self._parse(["--scheduling-policy", "sjf"])._get_engine_kwargs()
+        assert kwargs["scheduling_policy"] == "sjf"
+
+    def test_max_skip_steps_reaches_engine_kwargs(self):
+        kwargs = self._parse(["--sjf-max-skip-steps", "8"])._get_engine_kwargs()
+        assert kwargs["sjf_max_skip_steps"] == 8
+
+    def test_an_unknown_policy_is_refused_at_parse_time(self):
+        with pytest.raises(SystemExit):
+            self._parse(["--scheduling-policy", "lifo"])
