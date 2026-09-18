@@ -1,18 +1,24 @@
 # SPDX-License-Identifier: MIT
 """V4.1 DSpark math and checkpoint layout; context storage is caller-owned."""
 
+import logging
 from copy import copy
 
 import torch
-from atom.model_ops.blockscale import quantize_fp8
-from atom.model_ops.deepseek_v41.dspark import draft_attention, draft_step, rotate_rows
+from atom.model_ops.blockscale import native_quant_linear, quantize_fp8
+from atom.model_ops.deepseek_v41.dspark import (
+    draft_attention,
+    draft_step,
+    fused_draft_kv_tail,
+    rotate_rows,
+)
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.deepseek_v41.projections import grouped_output_projection
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 from torch import nn
 
 from atom.model_loader.weight_names import WeightsMapper
-from atom.model_ops.layernorm import RMSNorm
+from atom.model_ops.layernorm import RMSNorm, rmsnorm2d_fwd_
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
 from atom.models.deepseek_v4 import make_v4_quant_config
@@ -27,6 +33,8 @@ from .attention import Attention
 from .config import build_attention_topology
 from .layers import native_quant_config
 from .model import Block, DeepseekV41ForCausalLM
+
+logger = logging.getLogger("atom")
 
 
 class DraftAttention(Attention):
@@ -206,15 +214,165 @@ class DeepseekV41DSpark(DSparkDraftModel):
         # belongs to a zero-length request in `cu_seqlens_q`, so it is
         # projected and then written nowhere.
         hidden = self.project_context(aux_concat[: step.width].unsqueeze(0))
-        for attention in self.context_layers:
-            keys = attention.project_context(
-                hidden, positions[: step.width][None], self.rope, packed=cache.packed
+        positions = positions[: step.width][None]
+        layers = self.context_layers
+        fused = self._context_kv_fusion()
+        if fused is None:
+            for attention in layers:
+                keys = attention.project_context(
+                    hidden, positions, self.rope, packed=cache.packed
+                )
+                cache.write_window(attention.spec.layer_id, keys, step)
+            return
+        weight, weight_scale, group_rows, width = fused
+        kv = native_quant_linear(
+            hidden, weight, weight_scale, weight_group_rows=group_rows
+        ).unflatten(-1, (len(layers), width))
+        tail = self._draft_kv_tail_fusion()
+        if tail is None:
+            # Concatenating the per-stage norms puts the stage axis in front,
+            # which buys two things: each stage's rows become contiguous again
+            # (both window writers address rows by width, so a strided stage
+            # would be written wrong), and the stage axis is then exactly what
+            # RoPE treats as its batch -- `_rotate_cuda` repeats `positions`
+            # once per batch row, which is the per-stage rotation, unrolled.
+            kv = torch.cat(
+                [
+                    rmsnorm2d_fwd_(
+                        kv[..., i, :], a.kv_norm.weight, a.kv_norm.eps, width
+                    )
+                    for i, a in enumerate(layers)
+                ]
             )
+            keys = quantize_fp8(
+                self.rope(kv, positions.flatten()), dequantize=not cache.packed
+            )
+        else:
+            # Same stage-major result, one kernel: the cat is not fused but
+            # deleted, each program writing its row straight to its stage slot.
+            norm_weight, eps = tail
+            keys = fused_draft_kv_tail(
+                kv,
+                norm_weight,
+                positions.flatten(),
+                self.rope.cos_cache,
+                self.rope.sin_cache,
+                eps,
+                packed=cache.packed,
+            )
+        for i, attention in enumerate(layers):
             cache.write_window(
                 attention.spec.layer_id,
-                keys,
+                tuple(t[i : i + 1] for t in keys) if cache.packed else keys[i : i + 1],
                 step,
             )
+
+    def _context_kv_fusion(self):
+        """The stages' `wkv` weights concatenated once, or None to stay per stage.
+
+        Every stage's `wkv` reads the same projected hidden and emits the same
+        `head_dim` width, so the weights concatenate along the output dim and
+        one GEMM produces all of them. The norms stay per stage -- their
+        weights differ, and hoisting them out by normalizing with a unit weight
+        and scaling after costs a second bf16 rounding that measurably loses to
+        the single fused one (a quarter of the elements move, every one of them
+        away from an fp64 reference). So this fuses only what is bit-exact:
+        measured against the per-stage chain, both cache layouts reproduce it
+        exactly, stage for stage.
+
+        This removes host work, not FLOPs. `write_context_kv` runs eager -- the
+        draft KV write is not in the graph -- and at decode widths most of its
+        wall time is the Python between the ops rather than the ops: one GEMM,
+        one RoPE and one quantize replace three of each, and the shared
+        activation is quantized once instead of once per stage.
+
+        Measured on MI355X (TP=4, DSpark, 5 spec tokens): the eager region's
+        median host span falls 1485us -> 993us and its top-level op count
+        169 -> 96, which moves median TPOT 3.35ms -> 3.20ms. Mind that gap.
+        This decode loop is GPU-bound -- compute kernels cover ~91% of it and
+        collectives ~1% -- so cutting host work pays only where it was exposed,
+        and a launch-count fix here is worth a few percent, not more.
+        """
+        fused = self.__dict__.get("_context_kv_fused", False)
+        if fused is not False:
+            return fused
+        layers = self.context_layers
+        first = layers[0]
+        # A caller may hand this model stand-in layers that carry only
+        # `project_context` -- the per-stage path needs nothing else, so a
+        # missing `wkv` means "do not fuse", not "crash".
+        if any(getattr(a, "wkv", None) is None for a in layers):
+            self._context_kv_fused = None
+            return None
+        shape = {
+            (a.wkv.native_a8_group_rows, a.wkv.input_size, a.wkv.output_size)
+            for a in layers
+        }
+        if (
+            len(shape) != 1
+            or first.wkv.native_a8_group_rows is None
+            or any(a.wkv.bias is not None for a in layers)
+        ):
+            fused = None
+        else:
+            fused = (
+                torch.cat([a.wkv.weight for a in layers]),
+                torch.cat([a.wkv.weight_scale for a in layers]),
+                first.wkv.native_a8_group_rows,
+                first.wkv.output_size,
+            )
+        self._context_kv_fused = fused
+        return fused
+
+    def _draft_kv_tail_fusion(self):
+        """The stages' norm weights stacked once, or None to keep the op chain.
+
+        What the tail kernel needs that the GEMM fusion above does not: norms
+        whose math it inlines (ATOM's RMSNorm, not a Gemma-style `x * (1 + w)`),
+        one shared eps, a rope whose cached frequencies cover the row's tail
+        lanes, and a row width its group-32 quantizer and `tl.arange` can take.
+        Each stage keeps its own weight -- that is the axis the kernel indexes,
+        and hoisting the weights out is the rounding the sibling fusion already
+        measured as a loss.
+
+        Every one of those is structural for V4.1, so a None means a model this
+        file was not written for rather than anything transient -- which is why
+        there is no switch: the op chain below is the fallback, not debug code,
+        and it stays reachable on its own terms.
+        """
+        tail = self.__dict__.get("_draft_kv_tail", False)
+        if tail is not False:
+            return tail
+        layers = self.context_layers
+        norms = [a.kv_norm for a in layers]
+        width = norms[0].weight.shape[-1]
+        pe_dim = self.rope.cos_cache.shape[-1] * 2
+        eps = {n.eps for n in norms}
+        if (
+            not all(isinstance(n, RMSNorm) for n in norms)
+            or len(eps) != 1
+            # Stacking would raise rather than fall back, and the stage axis is
+            # only an axis if every stage is the same width.
+            or any(n.weight.shape[-1] != width for n in norms)
+            or width % 32
+            or width & (width - 1)
+            or pe_dim > width
+        ):
+            tail = None
+        else:
+            tail = (torch.stack([n.weight for n in norms]), eps.pop())
+        # Resolved once per process and then cached, so one line. Without it a
+        # model this file does not recognise would leave the fusion inert with
+        # nothing in the log to say so.
+        logger.info(
+            "DSpark draft KV tail: %s (%d stages x %d, rope %d)",
+            "per-op" if tail is None else "FUSED",
+            len(norms),
+            width,
+            pe_dim,
+        )
+        self._draft_kv_tail = tail
+        return tail
 
     def block_backbone(self, input_ids, positions, num_draft):
         from atom.utils.forward_context import get_forward_context
