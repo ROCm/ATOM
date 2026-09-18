@@ -161,7 +161,24 @@ class DeepseekV41TextConfig(PretrainedConfig):
     model_type = "deepseek_v41_text"
 
     def __init__(self, index_topk_tie_break="small_position", **kwargs):
+        # transformers >= 5.13 runs RoPE standardization inside the base
+        # __post_init__ (fired by super().__init__). It reads
+        # self.max_position_embeddings eagerly -- it is the default argument to
+        # rope_parameters.setdefault("original_max_position_embeddings", ...),
+        # which Python evaluates even when the key is already present -- before the
+        # base class has assigned it from kwargs, raising AttributeError. Seed it
+        # first so standardization finds it; transformers 5.12 has no such
+        # __post_init__ hook and simply reassigns the same value in super().
+        if "max_position_embeddings" in kwargs:
+            self.max_position_embeddings = kwargs["max_position_embeddings"]
         super().__init__(**kwargs)
+        # transformers >= 5.13 folds rope_theta into rope_parameters when
+        # rope_scaling is present and drops the top-level attribute the model
+        # reads as config.rope_theta; restore it from the folded params (or raw
+        # kwargs). transformers 5.12 keeps the attribute, so this is a no-op there.
+        if not hasattr(self, "rope_theta"):
+            rope_params = getattr(self, "rope_parameters", None) or {}
+            self.rope_theta = kwargs.get("rope_theta", rope_params.get("rope_theta"))
         try:
             self.index_topk_tie_break = IndexTieBreak(index_topk_tie_break).value
         except ValueError as error:
