@@ -74,12 +74,14 @@ def apply_prepare_qwen4_exp_adaptations(atom_config: Any, model_arch: str) -> No
     quant_config = getattr(atom_config, "quant_config", None)
     if quant_config is None:
         return
-    from atom.models.qwen4_exp import Qwen4ExpLinearAttention
 
     hf = getattr(atom_config.hf_config, "text_config", None) or atom_config.hf_config
     ngram_parts = int(getattr(hf, "split_ngram_parts", 128) or 128)
+    # Native GDN must see the four checkpoint shards before packing. Folding
+    # them onto ``in_proj_qkvzba`` here rewrites PTPC exclude ``in_proj_b/a``
+    # onto the same name as quantized ``in_proj_qkv/z``, so the layer builds
+    # unquantized ``qkvzba`` and drops ``weight_scale`` (72 tensors / 36 GDN).
     packed = {
-        **Qwen4ExpLinearAttention.packed_modules_mapping,
         **dict(getattr(native, "packed_modules_mapping", {})),
         **{
             f".ngram_embedding.shard_{shard}.": (".ngram_embedding.", shard)
