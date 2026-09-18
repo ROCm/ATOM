@@ -654,6 +654,13 @@ class MooncakeConnector(KVConnectorBase):
     GPU memory via ``batch_transfer_sync_write``.
     """
 
+    # Class-level default so every construction path has a rail pool to read.
+    # ``__init__`` overwrites it, but the transfer path also runs on instances
+    # built without it (tests use ``object.__new__``) and on instances whose
+    # ``__init__`` aborted before the matched-rail block; both must fall back to
+    # the single shared ``transfer_engine`` instead of raising AttributeError.
+    _rail_pool: RailEnginePool | None = None
+
     def __init__(self, config: Config) -> None:
         self.tp_rank = get_tp_group().rank_in_group
         self.dp_rank = get_dp_group().rank_in_group

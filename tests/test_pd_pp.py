@@ -669,8 +669,10 @@ def _make_transfer_connector(prefill_data, captured):
     conn._kv_cache_ready_events = {}
     conn.done_sending = set()
     conn._wait_for_prefill_data = lambda _transfer_id: dict(prefill_data)
+    # Mirrors the real signature: the transfer helpers take a keyword-only
+    # ``engine`` so each request can be pinned to its own matched rail (#2276).
     conn._execute_block_slot_transfer = (
-        lambda request, target, src, dst, data, req_id: captured.append(
+        lambda request, target, src, dst, data, req_id, *, engine=None: captured.append(
             (request, target, src, dst, data, req_id)
         )
         or True
@@ -1372,6 +1374,12 @@ def test_concurrent_pd_requests_keep_their_selected_engine(has_slot_data, matche
     requests = [_matched_rail_request(f"req-{device}", device) for device in engines]
     for request in requests:
         request["has_slot_regions"] = has_slot_data
+        if has_slot_data:
+            # A stateful transfer must carry the producer's final source slot
+            # (#2154); _execute_transfer rejects the request before it ever
+            # reaches the rail selection this test exercises.
+            request["src_slot_index"] = 5
+            request["dst_slot_index"] = 6
     with ThreadPoolExecutor(max_workers=2) as executor:
         list(executor.map(conn._execute_transfer, requests))
 
