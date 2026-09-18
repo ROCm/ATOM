@@ -157,7 +157,10 @@ def test_a_graph_sized_plans_sentinel_rows_land_on_the_page_nobody_owns():
     from atom.model_ops.v4_kernels import make_compress_plans
     from atom.utils import CpuGpuBuffer
 
-    geo = V41PoolGeometry(1, ((0, 2),), 32, 4, 512, 32, speculative_tokens=1)
+    # Two owners, because one leaves a PAGE exactly `rows * dim` wide and the
+    # scatter's plane contiguous -- the shape that hides a destination folding
+    # the two axes into one.
+    geo = V41PoolGeometry(2, ((0, 2), (1, 2)), 32, 4, 512, 32, speculative_tokens=1)
     cache = PagedAttentionCache(geo, 6, 2, "cpu")
     running_bs, max_q_len = 2, 2
     spans = (RequestSpan(1, 4, 0, 2, 0, (3, 5)),)
@@ -184,18 +187,20 @@ def test_a_graph_sized_plans_sentinel_rows_land_on_the_page_nobody_owns():
     assert plan.compress_plan_gpu.shape[0] > plan.num_compress > 0
     live = plan.compress_plan_gpu[:, 1] >= 0
     # Positive control: with no sentinel row there is nothing to place, and the
-    # assertions below would hold for destinations that ignore the question.
+    # assertions below would hold for a scatter that ignores the question.
     assert live.any() and not live.all()
     rows = plan.compress_plan_gpu[:, 2] // 2
     per_page = geo.rows_per_page(2)
-    pages, offsets, resolved = cache._plan_destinations(step, rows, 2, per_page)
-    assert resolved.tolist() == live.tolist()
-    # Negative, and negative after the writers' own `page * per_page + offset`
-    # too: that is the row index V4's kernels skip, and the reason the fp8
-    # path needs no destination of its own for a row that has no value.
-    assert (pages[~live] * per_page + offsets[~live] < 0).all()
-    # The live rows still resolve through the request's own PAGE table.
+    pages = cache.pages.view("main_0")[0]
+    pages.fill_(0)
+    # A value no row shares, so a row that landed says which one it was.
+    value = torch.arange(1, rows.numel() + 1, dtype=pages.dtype, device=pages.device)
+    filled = value[None, :, None].expand(1, -1, pages.shape[-1])
+    cache._scatter_rows(pages, step, rows, filled, 2)
     table = step.block_tables[plan.compress_plan_gpu[:, 1].long()]
-    expected = table[live, (rows[live] // per_page)]
-    assert pages[live].tolist() == expected.tolist()
-    assert offsets[live].tolist() == (rows[live] % per_page).tolist()
+    for i in live.nonzero().flatten().tolist():
+        page = table[i, rows[i] // per_page]
+        assert pages[page, rows[i] % per_page, 0] == value[i]
+    # Exactly the live rows were written: a sentinel reaching `-1` would have
+    # landed on the last page's last row, which is a live request's.
+    assert int((pages != 0).any(-1).sum()) == int(live.sum())

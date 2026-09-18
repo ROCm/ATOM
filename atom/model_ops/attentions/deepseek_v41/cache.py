@@ -3,9 +3,6 @@
 
 import numpy as np
 import torch
-from aiter.ops.cache import (
-    indexer_k_quant_and_cache,
-)
 from atom.model_ops.attentions.deepseek_v41.packed_rows import (
     gather_prefix_rows,
     pack_rows,
@@ -17,6 +14,7 @@ from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
 )
 from atom.model_ops.blockscale import quantize_fp4
 from atom.model_ops.deepseek_v41.compressor import compress_batch
+from atom.model_ops.deepseek_v41.index_write import write_index_rows
 from atom.model_ops.deepseek_v41.paged_scoring import unit_table
 
 from atom.model_ops.attentions.pool_layout.entry_arena import EntryMajorArena
@@ -355,20 +353,19 @@ class PagedAttentionCache:
         return latent, rows
 
     def write_index(self, owner, step, rows, index, ratio):
-        """One pass quantizes and preshuffles.
+        """One pass quantizes, preshuffles and scatters.
 
-        A row is addressed by its position in the plane, which a page and an
-        offset into it come to, the plane being dense.
+        The kernel resolves a row's address from the plan and the PAGE table
+        itself, so nothing here computes one.
         """
-        per_page = self.geometry.rows_per_page(ratio)
-        physical, offsets, _ = self._plan_destinations(step, rows, ratio, per_page)
-        indexer_k_quant_and_cache(
+        write_index_rows(
             index[0],
-            self.index_units[owner],
-            physical * per_page + offsets,
-            self.geometry.index_dim,
-            INDEX_FP8_SCALE_FMT,
-            preshuffle=True,
+            self.index_planes[owner],
+            step.plans[ratio].compress_plan_gpu,
+            rows,
+            step.block_tables,
+            self.geometry.rows_per_page(ratio),
+            scale_fmt=INDEX_FP8_SCALE_FMT,
         )
 
     def unit_tiles(self, step, ratio):
@@ -388,35 +385,25 @@ class PagedAttentionCache:
             )
         return table
 
-    def _plan_destinations(self, step, rows, ratio, per_page):
-        """Each plan row's physical page and its offset in that page.
-
-        A plan's rows come from several requests at once, so the page comes
-        from the row's own `batch_id` rather than one request's contiguous run.
-
-        A plan cut to a CUDAGraph's fixed grid ends in sentinel rows, `-1` in
-        both fields, and they stay negative: `-1 * per_page + (per_page - 1)`
-        is again `-1`, the row index V4's writers already skip. `live` is for
-        the one writer that cannot skip on its own -- torch advanced indexing,
-        where a negative index is legal and lands on somebody's live row.
-        """
-        batch = step.plans[ratio].compress_plan_gpu[: rows.numel(), 1].long()
-        live = batch >= 0
-        pages = step.block_tables[batch.clamp_min(0), (rows // per_page).clamp_min(0)]
-        return torch.where(live, pages.long(), -1), rows % per_page, live
-
     def _scatter_rows(self, pages, step, rows, value, ratio):
         """One destination per plan row, resolved from that same plan.
 
         A pair is native value and scale bytes, which is what the caller has
         when the plane it is writing is a quantized one -- the plane's own
         dtype is not asked, because the value already answered it.
+
+        Page and offset stay apart rather than becoming one row index: a page
+        is a stride in the arena and not `rows * dim` of it, so flattening the
+        two would copy the plane and drop the write. `live` is what keeps a
+        plan's sentinel rows out, torch indexing having no `-1` to skip on --
+        the index plane's kernel reads the plan and needs none of this.
         """
-        physical, offsets, live = self._plan_destinations(
-            step, rows, ratio, pages.shape[1]
-        )
+        per_page = pages.shape[1]
+        batch = step.plans[ratio].compress_plan_gpu[: rows.numel(), 1].long()
+        live = batch >= 0
+        page = step.block_tables[batch.clamp_min(0), (rows // per_page).clamp_min(0)]
         rows_in = pack_rows(*value) if isinstance(value, tuple) else value
-        pages[physical[live], offsets[live]] = rows_in[0][live]
+        pages[page.long()[live], (rows % per_page)[live]] = rows_in[0][live]
 
     def compress_state(self, owner):
         """This owner's `(kv_state, score_state)`, each `[slots, ring, dim]`.

@@ -3,7 +3,8 @@
 
 A source layer picks the blocks, and the layers after it score their own rows
 only inside them (`restrict_to_candidates`). Both are read out of the FP8 plane
-by `paged_scoring`, which is the only index scorer there is.
+by `paged_scoring`, which is the only index scorer there is -- and which bands
+the plane so that these kernels' `row * stride` stays inside int32.
 """
 
 import torch
@@ -23,6 +24,7 @@ def _blocks(width, block_size):
 def _restrict_kernel(
     logits,
     candidates,
+    visible,
     width,
     topk_blocks,
     logits_stride,
@@ -30,35 +32,58 @@ def _restrict_kernel(
     BLOCK: tl.constexpr,
     TILE: tl.constexpr,
     STEPS: tl.constexpr,
+    LANES: tl.constexpr,
 ):
     """-inf the columns of the blocks this row did not choose.
 
     A row's candidates are ascending with a `-1` tail, so reading that tail as a
     value past every block id makes the row monotone and one binary search
     answers membership.
+
+    Only out to the row's own visibility: the top-k below reads no further, so
+    a -inf past it is a store nobody loads. A row's tiles are walked by `LANES`
+    programs striding over them rather than one program each, so the grid stays
+    a function of the batch alone -- what a captured replay reruns -- while the
+    work follows the context a row actually has.
     """
     row = tl.program_id(0)
-    ids = tl.program_id(1) * TILE + tl.arange(0, TILE)
-    lo = tl.zeros((TILE,), tl.int32)
-    hi = tl.full((TILE,), topk_blocks, tl.int32)
-    for _ in tl.static_range(STEPS):
-        mid = (lo + hi) // 2
+    seen = tl.load(visible + row).to(tl.int32)
+    for tile in range(tl.program_id(1), tl.cdiv(seen, TILE * BLOCK), LANES):
+        ids = tile * TILE + tl.arange(0, TILE)
+        lo = tl.zeros((TILE,), tl.int32)
+        hi = tl.full((TILE,), topk_blocks, tl.int32)
+        for _ in tl.static_range(STEPS):
+            mid = (lo + hi) // 2
+            got = tl.load(
+                candidates + row * candidate_stride + mid, mid < topk_blocks, other=-1
+            )
+            below = tl.where(got < 0, width, got) < ids
+            lo = tl.where(below, mid + 1, lo)
+            hi = tl.where(below, hi, mid)
         got = tl.load(
-            candidates + row * candidate_stride + mid, mid < topk_blocks, other=-1
+            candidates + row * candidate_stride + lo, lo < topk_blocks, other=-1
         )
-        below = tl.where(got < 0, width, got) < ids
-        lo = tl.where(below, mid + 1, lo)
-        hi = tl.where(below, hi, mid)
-    got = tl.load(candidates + row * candidate_stride + lo, lo < topk_blocks, other=-1)
-    columns = ids[:, None] * BLOCK + tl.arange(0, BLOCK)[None, :]
-    tl.store(
-        logits + row * logits_stride + columns,
-        float("-inf"),
-        (columns < width) & (got != ids)[:, None],
-    )
+        columns = ids[:, None] * BLOCK + tl.arange(0, BLOCK)[None, :]
+        tl.store(
+            logits + row * logits_stride + columns,
+            float("-inf"),
+            (columns < seen) & (got != ids)[:, None],
+        )
 
 
-def restrict_to_candidates(logits, candidates, block_size, tile=64):
+def _restrict_lanes(rows):
+    """Programs per row, so the grid fills the machine and stops there.
+
+    A tall batch wants few -- one program per row keeps that row's candidate
+    list hot across its tiles -- and a short one wants many, having too few
+    rows to occupy anything. `rows` is the only quantity known on the host and
+    fixed for a captured shape. A fixed count is off by 12x at one end of
+    `/app/logs_claude/restrict_lanes_sweep.md`, this by at most a third.
+    """
+    return min(256, max(1, 16384 // max(rows, 1)))
+
+
+def restrict_to_candidates(logits, candidates, visible, block_size, tile=64):
     """-inf every column outside the candidate blocks, in place.
 
     The blocks are an earlier layer's, picked from that layer's own scores, so
@@ -70,9 +95,11 @@ def restrict_to_candidates(logits, candidates, block_size, tile=64):
     """
     rows, width = logits.shape
     topk_blocks = candidates.shape[-1]
-    _restrict_kernel[(rows, triton.cdiv(_blocks(width, block_size), tile))](
+    lanes = min(_restrict_lanes(rows), triton.cdiv(_blocks(width, block_size), tile))
+    _restrict_kernel[(rows, lanes)](
         logits,
         candidates,
+        visible,
         width,
         topk_blocks,
         logits.stride(0),
@@ -80,6 +107,7 @@ def restrict_to_candidates(logits, candidates, block_size, tile=64):
         BLOCK=block_size,
         TILE=tile,
         STEPS=max(topk_blocks - 1, 1).bit_length() + 1,
+        LANES=lanes,
     )
 
 
@@ -118,13 +146,15 @@ def _block_maxima_kernel(
         tl.store(ends + row, (seen + BLOCK - 1) // BLOCK)
 
 
-def pick_candidate_blocks(logits, visible, block_size, topk_blocks, tile=64):
-    """The `topk_blocks` best blocks per row, ascending, `-1` padded.
+def pick_candidate_blocks(logits, visible, block_size, out, tile=64):
+    """Write the best blocks per row into `out`, ascending, `-1` padded.
 
-    A block's score is its best visible row's. The bound and the ordering both
-    belong to kernels that already take them, so neither is applied here.
+    `out` is as wide as the count to keep. A block's score is its best visible
+    row's; the bound and the ordering both belong to kernels that already take
+    them, so neither is applied here.
     """
     rows, width = logits.shape
+    topk_blocks = out.shape[-1]
     blocks = _blocks(width, block_size)
     maxima = torch.empty(rows, blocks, dtype=torch.float32, device=logits.device)
     ends = torch.empty(rows, dtype=torch.int32, device=logits.device)
@@ -139,18 +169,16 @@ def pick_candidate_blocks(logits, visible, block_size, topk_blocks, tile=64):
         BLOCK=block_size,
         TILE=tile,
     )
-    chosen = torch.empty(rows, topk_blocks, dtype=torch.int32, device=logits.device)
     # The decode entry point: its prefill sibling would want a row-start array
     # as well, and every row here starts at zero.
     top_k_per_row_decode(
         maxima,
         1,
         ends,
-        chosen,
+        out,
         rows,
         maxima.stride(0),
         maxima.stride(1),
         k=topk_blocks,
         stable=True,
     )
-    return chosen

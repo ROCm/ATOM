@@ -30,7 +30,7 @@ from atom.model_ops.v4_kernels import (
 )
 
 from .config import AttentionMode
-from .layers import native_quant_config, reduce_output
+from .layers import native_quant_config
 
 
 class Indexer(nn.Module):
@@ -125,7 +125,7 @@ class Attention(nn.Module):
             config.o_groups * self.o_rank,
             config.hidden_size,
             quant_config=native_quant_config(),
-            reduce_results=False,
+            reduce_results=True,
         )
         self.compressor = (
             Compressor(
@@ -281,4 +281,4 @@ class Attention(nn.Module):
         )
         grouped_weight = self.wo_a.weight.view(self.groups, self.o_rank, -1)
         output = grouped_output_projection(output, grouped_weight)
-        return reduce_output(self.wo_b(output.flatten(-2)))
+        return self.wo_b(output.flatten(-2))

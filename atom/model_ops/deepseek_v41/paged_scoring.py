@@ -63,6 +63,17 @@ def unit_table(block_tables, batch_ids, units_per_page):
     return (pages[..., None] * units_per_page + tiles).flatten(-2).int()
 
 
+def plane_rows(width):
+    """Query rows a `width`-column logits plane may hold at once.
+
+    Its readers reach a row as `row * stride` in int32, so a plane past 2**31
+    elements wraps to a negative address. `width` follows the model-length cap
+    and not the live context, so only a long-context configuration can get
+    there; wherever a batch already fits, this leaves it in one piece.
+    """
+    return max(1, (2**31 - 1) // width)
+
+
 def score_topk_paged(
     query,
     weights,
@@ -88,44 +99,61 @@ def score_topk_paged(
 
     `candidates` bounds this layer to an earlier layer's blocks and
     `candidate_count` makes this layer that earlier one; never both.
+
+    Rows run in bands of `plane_rows(width)`, a bound rather than a knob: a
+    width that fits the whole batch in one band gets one.
     """
     rows, heads = weights.shape
     tile = plane.shape[1]
     width = tiles.shape[1] * tile
     q_fp8, q_scale = quantize_query_rows(query)
-    logits = torch.empty(rows, width, dtype=torch.float32, device=query.device)
-    deepgemm_fp8_paged_mqa_logits(
-        q_fp8.view(rows, 1, heads, q_fp8.shape[-1]),
-        plane.unsqueeze(-2),
-        # Q's scale is dequantized by folding it into its head's weight, which
-        # is the only place the kernel has for it.
-        scale_indexer_weights(
-            weights.contiguous(), q_scale.view(rows, heads, 1), weights_scale
-        ),
-        logits,
-        visible,
-        tiles,
-        width,
-        KVBlockSize=tile,
-        Preshuffle=True,
+    # Q's scale is dequantized by folding it into its head's weight, which is
+    # the only place the kernel has for it. Elementwise, so the whole batch's
+    # goes in one launch and a band takes its slice.
+    scaled = scale_indexer_weights(
+        weights.contiguous(), q_scale.view(rows, heads, 1), weights_scale
     )
-    chosen = None
-    if candidate_count:
-        chosen = pick_candidate_blocks(logits, visible, block_size, candidate_count)
-    if candidates is not None:
-        restrict_to_candidates(logits, candidates, block_size)
     selected = torch.empty(rows, topk, dtype=torch.int32, device=query.device)
-    top_k_per_row_decode(
-        logits,
-        1,
-        visible,
-        selected,
-        rows,
-        logits.stride(0),
-        logits.stride(1),
-        k=topk,
-        stable=True,
+    chosen = (
+        torch.empty(rows, candidate_count, dtype=torch.int32, device=query.device)
+        if candidate_count
+        else None
     )
+    band = plane_rows(width)
+    # One band's plane, reused; a short last band is a prefix of it.
+    logits = torch.empty(
+        min(rows, band), width, dtype=torch.float32, device=query.device
+    )
+    for start in range(0, rows, band):
+        count = min(band, rows - start)
+        span = slice(start, start + count)
+        seen, scores = visible[span], logits[:count]
+        deepgemm_fp8_paged_mqa_logits(
+            q_fp8[span].view(count, 1, heads, q_fp8.shape[-1]),
+            plane.unsqueeze(-2),
+            scaled[span],
+            scores,
+            seen,
+            tiles[span],
+            width,
+            KVBlockSize=tile,
+            Preshuffle=True,
+        )
+        if candidate_count:
+            pick_candidate_blocks(scores, seen, block_size, chosen[span])
+        if candidates is not None:
+            restrict_to_candidates(scores, candidates[span], seen, block_size)
+        top_k_per_row_decode(
+            scores,
+            1,
+            seen,
+            selected[span],
+            count,
+            scores.stride(0),
+            scores.stride(1),
+            k=topk,
+            stable=True,
+        )
     # Ascending already: `stable=True` is aiter's deterministic ascending,
     # smallest-index-first emit with `-1` for a short row, which is the order
     # the attention kernel sums its prefix in. Re-sorting it here was a kernel

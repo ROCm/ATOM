@@ -25,7 +25,7 @@ from atom.models.dspark_draft import DSparkDraftModel
 
 from .attention import Attention
 from .config import build_attention_topology
-from .layers import native_quant_config, reduce_output
+from .layers import native_quant_config
 from .model import Block, DeepseekV41ForCausalLM
 
 
@@ -53,9 +53,7 @@ class DraftAttention(Attention):
         output = rotate_rows(rope, output, step.positions, inverse=True)
         output = output.unflatten(-2, (self.groups, -1)).flatten(-2)
         weight = self.wo_a.weight.view(self.groups, self.o_rank, -1)
-        return reduce_output(
-            self.wo_b(grouped_output_projection(output, weight).flatten(-2))
-        )
+        return self.wo_b(grouped_output_projection(output, weight).flatten(-2))
 
 
 class DraftBlock(Block):
