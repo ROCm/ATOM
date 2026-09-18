@@ -132,6 +132,12 @@ Use the TP exports with DP attention enabled. Set `CONC` to the target request
 concurrency (64 or 128) on both server nodes. No offload tier is needed at these
 concurrencies. Both sides use the cache-aware router shown in the next section.
 
+`ATOM_NUMA_BIND=1` and `GPU_MAX_HW_QUEUES=5` are inherited from the TP exports.
+With `--dp-aware`, the router selects each P/D rank and sends an explicit rank
+hint, which takes priority over engine-local session affinity and load balancing.
+The `ATOM_DP_SESSION_AFFINITY` and `ATOM_DP_LB_REQ_EQUIV` exports are therefore
+not needed for this routing path.
+
 ```bash
 # ...the TP exports above, plus:
 export ATOM_ENABLE_PREFILL_DELAYER=0       # Disable cross-DP prefill coalescing
@@ -313,7 +319,7 @@ aiperf profile --scenario inferencex-agentx-mvp \
   --stats-interval 30 --random-seed 42 \
   --failed-request-threshold 0.10 \
   --trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75 \
-  --warmup-requests-per-lane 5 \
+  --warmup-requests-per-lane 10 \
   --trace-idle-gap-cap-seconds 300 \
   --agentic-warmup-grace-period 1800 \
   --use-server-token-count --no-gpu-telemetry \
@@ -393,7 +399,7 @@ aiperf profile --scenario inferencex-agentx-mvp \
   --stats-interval 30 --random-seed 42 \
   --failed-request-threshold 0.10 \
   --trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75 \
-  --warmup-requests-per-lane 5 \
+  --warmup-requests-per-lane 10 \
   --trace-idle-gap-cap-seconds 300 \
   --agentic-warmup-grace-period 1800 \
   --use-server-token-count --no-gpu-telemetry \
