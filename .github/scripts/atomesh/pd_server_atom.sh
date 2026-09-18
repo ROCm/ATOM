@@ -453,19 +453,26 @@ decode_cudagraph_args=()
 build_cudagraph_args prefill prefill_cudagraph_args
 build_cudagraph_args decode decode_cudagraph_args
 
+worker_cache_base() {
+  echo "${ATOMESH_WORKER_CACHE_BASE:-${XDG_CACHE_HOME:-/tmp/atomesh-cache-${SLURM_JOB_ID:-local}-${NODE_RANK}}/workers}"
+}
+
 build_server_cache_env() {
   local role="$1"
   local server_port="$2"
   local -n out="$3"
-  local cache_base cache_root
+  local cache_root
 
-  cache_base="${ATOMESH_WORKER_CACHE_BASE:-${XDG_CACHE_HOME:-/tmp/atomesh-cache-${SLURM_JOB_ID:-local}-${NODE_RANK}}/workers}"
-  cache_root="${cache_base}/${role}-${server_port}"
-  mkdir -p "${cache_root}"/{home,xdg,torchinductor,triton,aiter/jit,flydsl}
+  cache_root="$(worker_cache_base)/${role}-${server_port}"
+  mkdir -p "${cache_root}"/{home,xdg,hf/modules,torchinductor,triton,aiter/jit,flydsl}
 
+  # Containers run as the host uid, so any image that bakes HF_HOME under /root
+  # leaves trust_remote_code models unable to materialise their tokenizer code.
   out=(
     "HOME=${cache_root}/home"
     "XDG_CACHE_HOME=${cache_root}/xdg"
+    "HF_HOME=${cache_root}/hf"
+    "HF_MODULES_CACHE=${cache_root}/hf/modules"
     "TORCHINDUCTOR_CACHE_DIR=${cache_root}/torchinductor"
     "TRITON_CACHE_DIR=${cache_root}/triton"
     "AITER_CACHE_DIR=${cache_root}/aiter"
@@ -1100,6 +1107,11 @@ run_aiperf_agentic_benchmark() {
     report_args+=(--decode "${decode_ips[$idx]}:${decode_ports[$idx]}")
   done
 
+  # aiperf tokenises with the same trust_remote_code model the servers load, so
+  # it needs a writable module cache for the same reason they do.
+  local aiperf_hf_home="$(worker_cache_base)/aiperf-client/hf"
+  mkdir -p "${aiperf_hf_home}/modules"
+
   local conc
   IFS=',' read -r -a concs <<< "${CONC_LIST}"
   for conc in "${concs[@]}"; do
@@ -1128,6 +1140,8 @@ run_aiperf_agentic_benchmark() {
     AIPERF_DATASET_CONFIGURATION_TIMEOUT="${AIPERF_DATASET_CONFIGURATION_TIMEOUT}" \
     AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT="${AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT}" \
     AIPERF_UI_REALTIME_METRICS_ENABLED=true \
+    HF_HOME="${aiperf_hf_home}" \
+    HF_MODULES_CACHE="${aiperf_hf_home}/modules" \
       python3 "${ATOMESH_SCRIPT_DIR}/observability/collect_metrics.py" \
       --output "${out_dir}/metrics" "${report_args[@]}" -- \
       "${AIPERF_VENV}/bin/aiperf" profile \
