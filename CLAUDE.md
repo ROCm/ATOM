@@ -88,6 +88,7 @@ Key entry points:
 | Serving & benchmarking | `docs/serving_benchmarking_guide.md` |
 | Configuration | `docs/configuration_guide.md` |
 | Distributed | `docs/distributed_guide.md` |
+| Metrics & observability | `docs/metrics_guide.md` |
 | CI/PR workflow | `/ci-pr-guide` |
 | Performance benchmark | `/benchmark-guide` |
 | Debugging | `/debug-guide` |

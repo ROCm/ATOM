@@ -26,7 +26,6 @@ import torch
 from atom.kv_transfer.disaggregation.types import SaveOperationId, SaveSourceGroupId
 from atom.kv_transfer.offload.atom_lmcache_staging import (
     _env_flag,
-    _env_int,
     _env_optional_int,
     _PipelineStage,
     _StagingBuffer,
@@ -36,6 +35,34 @@ from atom.kv_transfer.offload.atom_lmcache_staging import (
 )
 
 logger = logging.getLogger("atom")
+
+
+# Experimental. The staging pipeline owns one buffer, so group n+1's pack
+# already waits on the free event group n's copy records and the two streams
+# never overlap on the GPU -- measured offline, span == pack + copy to within
+# 1%. What the second stream does still cost is a cross-stream event handoff
+# per group, and in-server that handoff is where the time goes: 2.28 ms of GPU
+# work inside a 16.86 ms span. Running both legs on one stream makes the
+# handoff a no-op of in-order execution and gives up an overlap that does not
+# exist. Correctness is unaffected -- one stream is strictly more ordered than
+# two, and the terminal synchronize is unchanged.
+_SINGLE_STREAM = _env_flag("OFFLOAD_SINGLE_STREAM")
+
+# The default staging buffer is denominated in bytes, not in LMCache chunks --
+# see `_default_staging_buffer_chunks` for why. 48 MiB: on GLM-5.2, whose chunk
+# is 2.91 MiB, in-server throughput is flat from 33.6 MB (11 chunks) through
+# 97.7 MB (32) and 5.2-6.7% below that plateau at 5.8 MB (2), so the target
+# sits inside the measured plateau rather than on its edge. The range is two
+# measurements of this same 48 MiB point, whose 1.38% spread is the run-to-run
+# floor for that grid.
+_DEFAULT_GPU_STAGING_BYTES = 48 * 1024 * 1024
+# Floor, not a target: a geometry whose single chunk already exceeds the byte
+# target keeps the two chunks it has always had instead of dropping to one.
+_MIN_DEFAULT_GPU_STAGING_CHUNKS = 2
+# The buffer is allocated at its full size, so a geometry with a tiny chunk
+# must not turn the byte target into an unbounded chunk count. 4x past the
+# measured plateau.
+_MAX_DEFAULT_GPU_STAGING_CHUNKS = 64
 
 
 class BlockByteCodec(Protocol):
@@ -233,7 +260,9 @@ class BlockGPUConnector:
         self._quarantined_staging_tensors: list[torch.Tensor] = []
         self._quarantined_block_id_owners: list[Any] = []
         self._quarantined_staging_lock = threading.Lock()
-        requested_buffer_chunks = _env_int("OFFLOAD_GPU_STAGING_CHUNKS", 2)
+        requested_buffer_chunks = _env_optional_int("OFFLOAD_GPU_STAGING_CHUNKS")
+        if requested_buffer_chunks is None:
+            requested_buffer_chunks = self._default_staging_buffer_chunks()
         max_staging_bytes = _env_optional_int("OFFLOAD_GPU_STAGING_MAX_BYTES")
         if max_staging_bytes is not None:
             if max_staging_bytes < self._gpu_staging_chunk_bytes:
@@ -253,6 +282,33 @@ class BlockGPUConnector:
         )
         self._release_gpu_staging_after_transfer = _env_flag(
             "OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER"
+        )
+
+    def _default_staging_buffer_chunks(self) -> int:
+        """Chunks making up the default staging buffer for this KV geometry.
+
+        The buffer exists to keep one leg of the staging pipeline fed, and what
+        the copy engine and the pack kernel both care about is its size in
+        *bytes*. A chunk is not a fixed size: it is
+        ``LMCACHE_CHUNK_SIZE / block_size`` blocks, which is 8 in the reference
+        config and 1 for GLM-5.2. A fixed chunk count therefore hands those two
+        models buffers ~6x apart, and the model on the small end pays for it in
+        per-group overhead -- measured at 5.2% of end-to-end throughput taking
+        the pessimistic of two runs, which is what the byte-denominated default
+        recovers.
+
+        The size asked for is per KV geometry, but a codec reports one fused
+        ``bytes_per_block`` even for a hybrid cache, so this resolves once per
+        rank rather than once per layer group.
+
+        Applied as a floor-raiser only, so a geometry whose chunk already
+        exceeds the byte target keeps the historical two chunks rather than
+        being cut to one.
+        """
+        chunks_for_target = _DEFAULT_GPU_STAGING_BYTES // self._gpu_staging_chunk_bytes
+        return max(
+            _MIN_DEFAULT_GPU_STAGING_CHUNKS,
+            min(chunks_for_target, _MAX_DEFAULT_GPU_STAGING_CHUNKS),
         )
 
     @property
@@ -846,12 +902,13 @@ class BlockGPUConnector:
                     state, groups, "gpu_to_chunk_major_device_buffer"
                 )
             )
+            copy_stream = state.pack_stream if _SINGLE_STREAM else state.copy_stream
             self._run_staged_pipeline(
                 state,
                 groups,
                 stage_a=pack_stage,
                 stage_b=_PipelineStage(
-                    state.copy_stream,
+                    copy_stream,
                     lambda group, buf: self._slice_to_memory_objs(
                         group,
                         buf,
@@ -882,11 +939,12 @@ class BlockGPUConnector:
                     state, groups, "chunk_major_device_buffer_to_gpu"
                 )
             )
+            copy_stream = state.pack_stream if _SINGLE_STREAM else state.copy_stream
             self._run_staged_pipeline(
                 state,
                 groups,
                 stage_a=_PipelineStage(
-                    state.copy_stream,
+                    copy_stream,
                     lambda group, buf: self._memory_objs_to_slice(
                         group,
                         buf,

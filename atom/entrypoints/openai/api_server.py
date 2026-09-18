@@ -12,37 +12,36 @@ Usage:
     python -m atom.entrypoints.openai_server --model <model> [options]
 """
 
+if __name__ == "__main__":
+    from atom.metrics.prometheus import initialize_metrics
+
+    initialize_metrics()
+
 import asyncio
-import base64
-import binascii
 import contextlib
-import io
 import json
 import logging
 import os
 import time
-import urllib.request
 import uuid
 from asyncio import AbstractEventLoop
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from transformers import AutoProcessor, AutoTokenizer
 
-if TYPE_CHECKING:
-    from PIL import Image
-
 from atom import SamplingParams
+from atom.entrypoints.chat_utils import has_multimodal_content, parse_chat_messages
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
-from atom.model_engine.multimodal import build_multimodal_inputs
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import new_token_ids
+from atom.multimodal.processing import prepare_multimodal_inputs
 from atom.utils import envs
 from atom.utils.arg_parser import FlexibleArgumentParser
 from atom.utils.gc_utils import (
@@ -61,7 +60,7 @@ from .chat_encoders import (
     render_probe_prompt,
     resolve_reasoning_toggle,
 )
-from .metrics import AtomMetricsExporter
+from .metrics_setup import create_metrics_exporter
 from .protocol import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_K,
@@ -80,7 +79,12 @@ from .reasoning import (
     thinking_switched_off,
 )
 from .reasoning_dialects import resolve_dialect
-from .request_timing import RequestTimingMiddleware, record_nonstream_first_token
+from .request_timing import (
+    RequestTimingMiddleware,
+    get_stream_timing,
+    has_generated_output,
+    record_nonstream_first_token,
+)
 from .serving_anthropic import (
     AnthropicBlocks,
     AnthropicMessagesRequest,
@@ -122,7 +126,7 @@ from .serving_responses import (
     unsupported_responses_parameter,
 )
 from .serving_responses import stream_failure_frames as responses_stream_failure_frames
-from .sse import event_frame
+from .sse import event_frame, iter_sse_data
 from .streaming_dispatch import (
     SYNTHETIC_TOKEN_TEXT,
     FrameWait,
@@ -374,9 +378,8 @@ _ANTHROPIC_PING_FRAME = event_frame("ping", {"type": "ping"})
 # 35 discarded bytes. The keepalive only has to beat proxy and SDK idle-read
 # timeouts, which are tens of seconds.
 _ANTHROPIC_PING_INTERVAL_SECONDS = 5.0
-_metrics_exporter = AtomMetricsExporter()
+_metrics_exporter, _request_metrics, _stream_metrics = create_metrics_exporter()
 _background_tasks: list[asyncio.Task] = []
-_METRICS_REFRESH_INTERVAL_SECONDS = 5.0
 # The watch compares two `gc.get_stats()` reads against something that moves on
 # the scale of minutes, so it has no reason to ride the metrics cadence.
 _GC_WATCH_INTERVAL_SECONDS = 60.0
@@ -447,50 +450,11 @@ def _log_request_model(event_type: str, request_id: str, model: Any) -> None:
     request logging off. Measured 20-26 us on an agent-shaped request against
     0.07 us for the guard.
 
-    `_log_sse` directly below already asks the question in this order. Two
-    spellings of one rule in one module is what this removes.
+    The client stream wrapper also skips parsing when no observer needs it.
     """
     if _request_logger is None:
         return
     _log_request_event(event_type, request_id, model.model_dump())
-
-
-def _log_sse(chunk: str, request_id: str) -> None:
-    """Log every SSE frame in `chunk`, and never fail the stream doing it.
-
-    One yield can carry several frames: `serving_chat` deliberately coalesces
-    finish + usage + `[DONE]` into one send, because at a wave boundary many
-    requests finalize at once and collapsing three socket writes per request
-    to one relieves the event loop. This used to `json.loads` the whole send
-    as a single payload, which raises `Extra data:` on exactly that frame --
-    out of the generator, so with `--request-log` on, the *last* frame of
-    every OpenAI stream never reached the client and no `[DONE]` was sent.
-
-    And frames are not all `data:`-first. Anthropic writes `event: NAME` on
-    the line above, so a `startswith("data: ")` test skipped every frame that
-    endpoint produces -- silently, which for a log is the worst failure it
-    can have.
-
-    A payload that will not parse is logged as text rather than dropped or
-    raised: this is the diagnostic path, and it must not be the reason a
-    response fails.
-    """
-    if _request_logger is None:
-        return
-    for frame in chunk.split("\n\n"):
-        payload = None
-        for line in frame.splitlines():
-            if line.startswith("data:"):
-                payload = line[5:].strip()
-        if payload is None:
-            continue
-        if payload == "[DONE]":
-            _log_request_event("stream_done", request_id, None)
-            continue
-        try:
-            _log_request_event("stream_chunk", request_id, json.loads(payload))
-        except ValueError:
-            _log_request_event("stream_chunk_unparsed", request_id, payload)
 
 
 async def _client_stream(
@@ -510,6 +474,9 @@ async def _client_stream(
     with an endpoint-shaped hole in it is worse than none, because the zero it
     reports looks like an answer.
     """
+    # StreamingResponse sends its headers before iterating this generator, so
+    # the middleware has already marked whether this response is eligible.
+    timing = get_stream_timing()
     it = gen.__aiter__()
     delivered = False
     while True:
@@ -521,7 +488,31 @@ async def _client_stream(
             except StopAsyncIteration:
                 return
         delivered = True
-        _log_sse(chunk, request_id)
+        # Parse each complete local frame once for both logging and TTFT.
+        # After first output (or a terminal event), logging alone needs parsing.
+        if timing is not None or _request_logger is not None:
+            for data in iter_sse_data(chunk):
+                if data == "[DONE]":
+                    timing = None
+                    _log_request_event("stream_done", request_id, None)
+                else:
+                    try:
+                        payload = json.loads(data)
+                    except ValueError:
+                        # Diagnostics must not swallow malformed output.
+                        _log_request_event("stream_chunk_unparsed", request_id, data)
+                        continue
+                    _log_request_event("stream_chunk", request_id, payload)
+                    if timing is not None:
+                        if isinstance(payload, dict) and (
+                            "error" in payload or payload.get("type") == "error"
+                        ):
+                            timing = None
+                        elif has_generated_output(payload):
+                            timing.first_output(streaming=True)
+                            timing = None
+                if timing is None and _request_logger is None:
+                    break
         yield chunk
 
 
@@ -650,42 +641,9 @@ def _validate_sequence_context_length(seq) -> None:
 
 
 def _has_multimodal_content(messages: list[Any]) -> bool:
-    for message in messages:
-        content = getattr(message, "content", None)
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            if isinstance(part, dict) and part.get("type") in {"image", "image_url"}:
-                return True
-    return False
-
-
-def _load_image_from_url(url: str) -> "Image.Image":
-    # Imported here, not at module scope, and this is the one place in the
-    # file that needs it at runtime. Pillow is not a declared dependency, so a
-    # module-scope `from PIL import Image` made the whole server module
-    # unimportable wherever it is absent -- which is the non-GPU CI runner,
-    # where the only test that reached this module had to wrap its import in a
-    # try/except and degrade to `api_server = None`. Text-only serving does
-    # not need Pillow, so it should not be a condition of importing the
-    # server; a request that actually carries an image raises here, naming it.
-    from PIL import Image
-
-    if url.startswith("data:"):
-        try:
-            _, encoded = url.split(",", 1)
-            image_bytes = base64.b64decode(encoded, validate=True)
-        except (ValueError, binascii.Error) as exc:
-            raise ValueError("Invalid base64 data URL for image_url") from exc
-        return Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-    if url.startswith(("http://", "https://")):
-        with urllib.request.urlopen(url, timeout=30) as response:
-            image_bytes = response.read()
-        return Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-    url = url.removeprefix("file://")
-    return Image.open(url).convert("RGB")
+    return has_multimodal_content(
+        [{"content": message.content} for message in messages]
+    )
 
 
 def _get_multimodal_processor():
@@ -696,118 +654,25 @@ def _get_multimodal_processor():
     return processor
 
 
-def _collect_multimodal_parts(
-    messages: list[Any],
-) -> tuple[list[dict[str, Any]], list["Image.Image"]]:
-    """Normalize chat messages into processor form, loading every image.
-
-    Content parts keep the order the client sent them in; the images are
-    returned separately in that same order.
-    """
-    processor_messages: list[dict[str, Any]] = []
-    images: list[Image.Image] = []
-
-    for message in messages:
-        content = getattr(message, "content", None)
-        if isinstance(content, str) or content is None:
-            processor_messages.append({"role": message.role, "content": content or ""})
-            continue
-
-        parts: list[dict[str, Any]] = []
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            part_type = part.get("type")
-            if part_type == "text":
-                parts.append({"type": "text", "text": part.get("text", "")})
-            elif part_type == "image_url":
-                image_url = part.get("image_url", {})
-                url = image_url.get("url") if isinstance(image_url, dict) else None
-                if not url:
-                    raise ValueError(
-                        "image_url content part must include image_url.url"
-                    )
-                image = _load_image_from_url(url)
-                images.append(image)
-                parts.append({"type": "image", "image": image})
-            elif part_type == "image":
-                url = part.get("image")
-                if not isinstance(url, str):
-                    raise ValueError(
-                        "image content part must include an image URL/path"
-                    )
-                image = _load_image_from_url(url)
-                images.append(image)
-                parts.append({"type": "image", "image": image})
-        processor_messages.append({"role": message.role, "content": parts})
-
-    return processor_messages, images
-
-
-def _images_before_text(
-    processor_messages: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Hoist image parts ahead of the text within each message.
-
-    Qwen3.5's template only reliably emits <|image_pad|> when image entries
-    precede the text, matching the native offline multimodal example.
-    """
-    reordered: list[dict[str, Any]] = []
-    for message in processor_messages:
-        content = message["content"]
-        if not isinstance(content, list):
-            reordered.append(message)
-            continue
-        parts = [part for part in content if part["type"] == "image"]
-        texts = [part["text"] for part in content if part["type"] == "text"]
-        if texts:
-            parts.append({"type": "text", "text": "\n".join(texts)})
-        reordered.append({"role": message["role"], "content": parts})
-    return reordered
-
-
 def _prepare_multimodal_inputs(
     messages: list[Any],
     chat_template_kwargs: dict[str, Any],
     tools: Any = None,
 ) -> tuple[list[int], dict[str, Any]]:
-    mm_processor = _get_multimodal_processor()
-    processor_messages, images = _collect_multimodal_parts(messages)
-
-    if not images:
-        raise ValueError("Multimodal request did not contain any images")
-
-    # Models whose processor deviates from the Qwen convention register their
-    # own builder (e.g. Kimi-K3's messages+medias API and unexpanded
-    # <|media_pad|> placeholders).
-    built = build_multimodal_inputs(
+    conversation, media = parse_chat_messages(
+        [
+            {**message.to_template_dict(), "content": message.content}
+            for message in messages
+        ]
+    )
+    return prepare_multimodal_inputs(
         _get_engine_config(),
-        mm_processor,
-        processor_messages,
-        images,
+        _get_multimodal_processor(),
+        conversation,
+        media,
         chat_template_kwargs,
         tools=tools,
     )
-    if built is not None:
-        return built
-
-    template_kwargs = dict(chat_template_kwargs)
-    template_kwargs.pop("tokenize", None)
-    template_kwargs.pop("add_generation_prompt", None)
-    text = mm_processor.apply_chat_template(
-        _images_before_text(processor_messages),
-        tokenize=False,
-        add_generation_prompt=True,
-        **template_kwargs,
-    )
-    if images and "<|image_pad|>" not in text:
-        raise ValueError("Multimodal chat template did not emit image placeholders")
-    inputs = mm_processor(text=[text], images=images, return_tensors="pt")
-    multimodal_data = {
-        "pixel_values": inputs["pixel_values"],
-        "image_grid_thw": inputs["image_grid_thw"],
-    }
-    return inputs["input_ids"][0].tolist(), multimodal_data
 
 
 # ── Batched stream dispatch ──────────────────────────────────────────────
@@ -1595,6 +1460,7 @@ async def _periodic(interval: float, step: Callable[[], Awaitable[None]]) -> Non
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown."""
+    metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
     logger.info("Server started successfully and ready to accept requests")
     tune_gc()
     maybe_attach_gc_debug_callback("api_server")
@@ -1607,7 +1473,7 @@ async def lifespan(app: FastAPI):
     _background_tasks[:] = [
         asyncio.create_task(_periodic(interval, step), name=step.__name__)
         for interval, step in (
-            (_METRICS_REFRESH_INTERVAL_SECONDS, _refresh_metrics_once),
+            (metrics_interval, _refresh_metrics_once),
             (_GC_WATCH_INTERVAL_SECONDS, _reclaim_watch_once),
         )
     ]
@@ -1621,6 +1487,7 @@ async def lifespan(app: FastAPI):
         # shutdown the thing that cannot be stopped.
         await asyncio.gather(*_background_tasks, return_exceptions=True)
         _background_tasks.clear()
+        await _metrics_exporter.wait_for_render()
         logger.info("Server shutting down, releasing resources...")
         if engine is not None:
             engine.close()
@@ -1629,7 +1496,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="ATOM OpenAI API Server", lifespan=lifespan)
 app.add_middleware(
     RequestTimingMiddleware,
-    observe_ttft=_metrics_exporter.observe_time_to_first_token,
+    observe_ttft=_request_metrics.observe_time_to_first_token,
 )
 
 
@@ -1730,7 +1597,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
 
         is_multimodal = _has_multimodal_content(messages)
         if is_multimodal:
-            # Image loading (blocking network I/O, up to a 30s urlopen) plus
+            # Media loading (blocking network I/O, up to a 30s urlopen) plus
             # processor preprocessing are heavy and would stall the event loop;
             # run them in a worker thread. Warm the processor on the loop first
             # so concurrent cold-start requests don't race on its lazy init.
@@ -2700,7 +2567,7 @@ async def health():
 async def metrics():
     """Expose cached standalone-engine metrics in Prometheus text format."""
     return Response(
-        content=_metrics_exporter.render(),
+        content=await _metrics_exporter.render_async(),
         headers={"Content-Type": _metrics_exporter.content_type},
     )
 
@@ -2943,6 +2810,23 @@ def main():
 
     logger.info(f"Initializing engine with model {args.model}...")
     engine_args = EngineArgs.from_cli_args(args)
+    # Remote DP nodes block inside engine startup and never run the API loop.
+    # Expose their local mmap metrics on the same configured HTTP port.
+    dp_rank = (
+        envs.ATOM_DP_RANK
+        if envs.is_set("ATOM_DP_RANK")
+        else engine_args.data_parallel_rank
+    )
+    if dp_rank > 0:
+        from atom.metrics.prometheus import start_metrics_server
+
+        server, _ = start_metrics_server(args.host, args.server_port)
+        try:
+            engine_args.create_engine(tokenizer=tokenizer)
+        finally:
+            server.shutdown()
+            server.server_close()
+        return
     _template_source = chat_template_source(tokenizer, custom_message_encoder)
     reasoning_dialect, _dialect_stated = resolve_dialect(
         _template_source,
@@ -3004,7 +2888,7 @@ def main():
     _stream_batch_dispatcher = StreamBatchDispatcher(
         tokenizer,
         synthetic_text=synthetic_token_text,
-        observe_inter_token_latency=_metrics_exporter.observe_inter_token_latency,
+        observe_inter_token_latency=_stream_metrics.observe_inter_token_latency,
     )
     # Here and not in the dispatcher's constructor: it replays a few thousand
     # updates, which every test that builds a dispatcher would then pay for.
