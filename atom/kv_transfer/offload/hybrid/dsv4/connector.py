@@ -2430,6 +2430,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                 save_operation,
                 aligned - saved if page_save_due else 0,
             )
+            self._refresh_save_reclaim_clock(seq)
             meta.add_request(
                 LMCacheReqMeta(
                     req_id=seq.id,

@@ -434,6 +434,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             )
             entry[1] = aligned
             self._save_inflight[sid] = save_operation
+            self._refresh_save_reclaim_clock(seq)
             self._save_rr_last = sid
             if getattr(self, "_early_release", False):
                 # Freeze the exact token-index -> block-id mapping before a
@@ -624,8 +625,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             return
         self._save_inflight.pop(sid, None)
         if getattr(self, "_early_release", False):
-            # The dedicated connector completion reports store success/failure.
-            # This legacy terminal remains for MultiConnector save pairing.
+            # Store success/failure and lease release travel on the dedicated
+            # connector channel. This terminal only clears the in-flight save.
             self._finish_retired_request(sid)
             return
         self._finish_save_statistics(req_id)

@@ -1630,6 +1630,35 @@ def _spec_config(mtp_k):
     )
 
 
+class TestProducerPreemptability:
+    """A P/D producer must not make its own running requests unpreemptable.
+
+    `_is_preemptable` negates `should_defer_free`, the predicate that now
+    carries the send's claim. Claiming at alloc instead of at
+    `request_finished` would pin every running request on a prefill node.
+    """
+
+    def test_preemptable_until_the_send_is_published(self, scheduler, seq_factory):
+        seq = seq_factory([1, 2, 3, 4])
+        scheduler.add(seq)
+        scheduler.schedule()
+        published: set[str] = set()
+        scheduler.kv_connector = SimpleNamespace(
+            is_producer=True,
+            # Claim only once the peer has the addresses, as the real ones do.
+            request_finished=lambda s: published.add(str(s.id)),
+            should_defer_free=lambda s: str(s.id) in published,
+        )
+
+        assert scheduler._is_preemptable(seq) is True
+        scheduler.kv_connector.request_finished(seq)
+        assert scheduler._is_preemptable(seq) is False
+
+        published.clear()
+        assert scheduler._preempt_one_running() is True
+        assert seq.status == SequenceStatus.WAITING
+
+
 class TestPreemptStripsExactlyThePlaceholders:
     """`preempt()` and `postprocess()` have to agree on the placeholder width.
 
@@ -1961,6 +1990,44 @@ class TestPostprocess:
         seq = self._prefill(scheduler, seq_factory([1, 2, 3, 4]))
         scheduler.postprocess(list(scheduler.running), self._output(seq.id, [2]))
         assert scheduler.get_request_counts() == (0, 0)
+
+    @pytest.mark.parametrize("pp_size", [1, 4])
+    def test_producer_retains_blocks_until_send_finishes(self, seq_factory, pp_size):
+        # The claim lives on the connector, not on a producer branch here: the
+        # scheduler only asks `should_defer_free` and retires via `send_finished`.
+        sched = Scheduler(MockConfig(pipeline_parallel_size=pp_size))
+        seq = self._prefill(sched, seq_factory([1, 2, 3, 4]))
+        pending_send: set[str] = set()
+        sched.kv_connector = SimpleNamespace(
+            is_producer=True,
+            update_state_after_alloc=lambda s: pending_send.add(str(s.id)),
+            should_defer_free=lambda s: str(s.id) in pending_send,
+            send_finished=lambda rid: pending_send.discard(str(rid)),
+        )
+        sched.kv_connector.update_state_after_alloc(seq)
+        sched.postprocess([seq], self._output(seq.id, [2]))
+
+        assert seq.block_table
+        assert not sched.is_finished()
+        sched._update_from_kv_xfer_finished(
+            KVConnectorOutput(finished_sending={seq.id})
+        )
+        assert not seq.block_table
+        assert sched.is_finished()
+
+    def test_producer_without_a_send_claim_frees_immediately(self, seq_factory):
+        # No claim -> nothing defers it. The old producer branch parked it
+        # anyway, waiting for a send that was never issued.
+        sched = Scheduler(MockConfig())
+        seq = self._prefill(sched, seq_factory([1, 2, 3, 4]))
+        sched.kv_connector = SimpleNamespace(
+            is_producer=True, should_defer_free=lambda s: False
+        )
+        sched.postprocess([seq], self._output(seq.id, [2]))
+
+        assert not seq.block_table
+        assert not sched.deferred_free_blocks
+        assert sched.is_finished()
 
 
 # ── chunked-prefill finality ───────────────────────────────────────────────
@@ -2472,6 +2539,38 @@ class TestStalledOffloadSaveReclaim:
         assert freed == [1]
         # Notified with the string request id, matching the connector's sid keys.
         assert abandoned == ["1"]
+
+    def test_save_timeout_does_not_release_a_pending_producer_send(self, monkeypatch):
+        """Abandoning the save must not free a source the RDMA still reads.
+
+        The reclaimer drops offload's work, then re-asks the composite: an
+        unreported send keeps its claim, so `finished_sending` stays the only
+        thing that can free these blocks.
+        """
+        import time as _time
+
+        seq = SimpleNamespace(id=1, _deferred_save_at=_time.monotonic() - 500.0)
+        pending_send = {"1"}
+        connector = SimpleNamespace(
+            save_abandon_timeout_s=lambda: 100.0,
+            abandon_save=lambda sid: None,
+            should_defer_free=lambda s: str(s.id) in pending_send,
+            send_finished=lambda rid: pending_send.discard(str(rid)),
+        )
+        s, freed = self._sched(monkeypatch, [seq], connector=connector)
+        assert s._reconcile_stalled_deferred_saves() == 0
+        assert not freed
+        assert seq.id in s.deferred_free_blocks
+        # Counted as abandoned though nothing was released, and dropped from
+        # the stalled set so a later pass cannot double-count it.
+        assert s._abandoned_saves == 1
+        assert seq._deferred_save_at is None
+
+        # Once the send reports, the same predicate lets the blocks go.
+        connector.send_finished(1)
+        s._maybe_release_deferred(seq)
+        assert freed == [seq.id]
+        assert not s.deferred_free_blocks
 
     def test_it_self_throttles_so_a_1ms_poll_is_cheap(self, monkeypatch):
         import time as _time

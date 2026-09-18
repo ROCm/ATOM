@@ -948,7 +948,29 @@ class Scheduler:
         if callable(callback):
             callback(str(seq.id))
 
+    def _connector_send_finished(self, req_id) -> None:
+        """Drop the connector's send claim on a request's source blocks.
+
+        The mutator half of `should_defer_free` for the send leg, as
+        `_connector_abandon_save` is for the save leg. Guarded: only a producer
+        connector tracks sends.
+        """
+        callback = getattr(self.kv_connector, "send_finished", None)
+        if callable(callback):
+            callback(req_id)
+
     def _maybe_release_deferred(self, seq: Sequence) -> None:
+        """Release once every connector has let go of the source blocks.
+
+        `should_defer_free` is the one predicate; `MultiConnector` ORs it across
+        its subs. It must stay a predicate rather than a tally of completion
+        reports, because offload also owns chunks it has computed but not yet
+        dispatched a save for.
+
+        Deliberately does not call `request_finished` -- callers arrive with the
+        request already finished, and a second call re-arms the P/D send claim
+        this check just cleared.
+        """
         if (
             seq.id not in self.deferred_free_blocks
             or getattr(seq, "_awaiting_aborted_load_cleanup", False)
@@ -956,9 +978,6 @@ class Scheduler:
         ):
             return
 
-        callback = getattr(self.kv_connector, "request_finished", None)
-        if callable(callback):
-            callback(seq)
         self.deferred_free_blocks.pop(seq.id, None)
         self.block_manager.deallocate(seq)
 
@@ -987,11 +1006,12 @@ class Scheduler:
         never-reported save keeps `has_pending_kv_work()` True forever and the
         engine busy-loops with every GPU idle.
 
-        Mirrors the producer `finished_sending` reclaim (pop + deallocate),
-        deliberately not re-invoking `request_finished`: it was already called
-        when the request finished, before the block free was deferred. It does
-        notify the connector via `abandon_save`, though -- freeing the blocks
-        here is not enough on its own: the connector still holds the save in
+        Abandoning the save is not the same as freeing the blocks: the release
+        still goes through `should_defer_free`, so an unreported P/D send keeps
+        its source alive and `finished_sending` frees it later. Reclamation
+        does not re-invoke `request_finished`: it was already called when the
+        request finished. It does notify the connector via `abandon_save` -- freeing
+        the blocks here is not enough on its own: the connector holds the save in
         `_save_inflight` (and, on K3, in the stall latch), so `should_defer_free`
         would stay True and `has_pending_kv_work()` would never clear without
         that drop.
@@ -1036,22 +1056,30 @@ class Scheduler:
             if getattr(seq, "_deferred_save_at", None) is not None
             and now - seq._deferred_save_at >= timeout
         ]
+        released = 0
         for seq in stalled:
-            self.deferred_free_blocks.pop(seq.id, None)
             self._connector_abandon_save(seq)
-            self.block_manager.deallocate(seq)
+            # One shot: clearing the stamp drops this seq out of `stalled`. If a
+            # send still claims the blocks the release below no-ops and
+            # `finished_sending` becomes their only releaser -- as it already is
+            # for any producer request.
+            seq._deferred_save_at = None
             self._abandoned_saves += 1
+            self._maybe_release_deferred(seq)
+            if seq.id not in self.deferred_free_blocks:
+                released += 1
         if stalled:
             logger.warning(
-                "Reclaimed %d offload save(s) still deferred after %.0fs with no "
+                "Abandoned %d offload save(s) still deferred after %.0fs with no "
                 "completion report (LMCache force-unpins a stalled save without "
-                "reporting it); freed their blocks so the engine does not stall. "
-                "total abandoned_saves=%d",
+                "reporting it); released %d allocation(s), retaining any source "
+                "a P/D send still owns. total abandoned_saves=%d",
                 len(stalled),
                 timeout,
+                released,
                 self._abandoned_saves,
             )
-        return len(stalled) + lease_reclaims
+        return released + lease_reclaims
 
     def _unschedulable_reason(self, seq: Sequence) -> str | None:
         """Return a human-readable reason if `seq` is permanently unschedulable.
@@ -1938,6 +1966,7 @@ class Scheduler:
             # is in flight yet, but the connector still owns cleanup work.
             # Already-dispatched loads retain the completion-driven path below.
             self.kv_connector.cancel_pending_load(seq)
+            self.kv_connector.request_finished(seq)
             self.deferred_free_blocks[seq.id] = seq
             self._maybe_release_deferred(seq)
         if not has_inflight_load or not self._connector_flag("is_offload"):
@@ -1961,6 +1990,11 @@ class Scheduler:
         if hasattr(seq, "_awaiting_aborted_load_cleanup"):
             delattr(seq, "_awaiting_aborted_load_cleanup")
         self._uncount_inflight_load(seq)
+        # The one path that never went through `postprocess`, so it finishes
+        # the request here rather than before the park.
+        callback = getattr(self.kv_connector, "request_finished", None)
+        if callable(callback):
+            callback(seq)
         self._maybe_release_deferred(seq)
 
     def _finish_aborted_load_cleanup(self, req_id) -> bool:
@@ -3075,13 +3109,7 @@ class Scheduler:
             if self.kv_connector is not None:
                 if hasattr(self.kv_connector, "request_finished"):
                     self.kv_connector.request_finished(seq)
-                if self._connector_flag("is_producer"):
-                    logger.debug(
-                        "Deferring block free for seq %s until KV send completes.",
-                        seq.id,
-                    )
-                    self.deferred_free_blocks[seq.id] = seq
-                elif self._connector_should_defer_free(seq):
+                if self._connector_should_defer_free(seq):
                     protected = self._connector_protected_block_ids(seq)
                     if protected is not None:
                         # Early block release: only the save's exact source
@@ -3112,8 +3140,8 @@ class Scheduler:
                         )
                     else:
                         logger.debug(
-                            "Deferring block free for seq %s until KV save "
-                            "completes.",
+                            "Deferring block free for seq %s until every KV "
+                            "owner releases it.",
                             seq.id,
                         )
                         # Stamp when the save was deferred so the reconciler
@@ -3337,8 +3365,8 @@ class Scheduler:
         """Reconcile scheduler state with completed KV transfers.
 
         * ``finished_recving``: marks requests as ready for decode scheduling.
-        * ``finished_sending``: releases deferred block allocations on the
-          producer side.
+        * ``finished_sending``: releases the producer's send ownership; blocks
+          remain deferred while the connector still has offload work.
         """
         if kv_connector_output is None:
             return
@@ -3416,19 +3444,28 @@ class Scheduler:
                 self.kv_connector.is_producer
             ), "Only producer should free blocks after sending KV"
             logger.debug("Finished sending KV transfer for request %s", req_id)
+            # Before asking, not after: the release below queries the connector.
+            self._connector_send_finished(req_id)
             seq = self._deferred_sequence(req_id)
             if seq is None:
                 # Already reclaimed by `_reconcile_stalled_deferred_saves` after
                 # a stall; a late completion report has nothing left to free.
                 continue
-            self.deferred_free_blocks.pop(seq.id, None)
-            self.block_manager.deallocate(seq)
+            # Arm save reclamation only now -- a timeout could not have freed
+            # these blocks while the send still claimed them.
+            if (
+                self._connector_should_defer_free(seq)
+                and getattr(seq, "_deferred_save_at", None) is None
+            ):
+                seq._deferred_save_at = time.monotonic()
+            self._maybe_release_deferred(seq)
 
-        if not is_producer:
-            for req_id in finished_saving:
-                seq = self._deferred_sequence(req_id)
-                if seq is not None:
-                    self._maybe_release_deferred(seq)
+        # Runs for producers too: a chunk completing is what lets the connector
+        # dispatch the next one.
+        for req_id in finished_saving:
+            seq = self._deferred_sequence(req_id)
+            if seq is not None:
+                self._maybe_release_deferred(seq)
         # Early-release requests are never in `deferred_free_blocks` (they were
         # fully torn down, minus their lease, at finish time), so the loops
         # above have nothing to find for them. Drain independently of producer

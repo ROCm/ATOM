@@ -4685,7 +4685,10 @@ def test_pending_work_tracks_undispatched_loads_and_unreported_saves():
     assert sched.has_pending_work() is False
 
 
-def test_chunked_prefill_save_uses_computed_frontier_and_serializes_inflight():
+@pytest.mark.parametrize("send_first", [False, True])
+def test_chunked_prefill_save_uses_computed_frontier_and_serializes_inflight(
+    send_first,
+):
     sched = _scheduler()
     seq = SimpleNamespace(
         id=10,
@@ -4710,13 +4713,91 @@ def test_chunked_prefill_save_uses_computed_frontier_and_serializes_inflight():
     meta2 = sched.build_connector_meta()
     assert len(meta2.requests) == 0
 
-    sched.save_finished(meta1.requests[0].save_operation)
+    # The producer finishes with one save in flight and a suffix not yet issued.
+    # The `multi=[mooncake, lmcache_offload]` composite ORs the send's claim
+    # with offload's, so either one alone keeps the source alive.
+    pending_send = {str(seq.id)}
+    freed = []
+    engine_sched = Scheduler.__new__(Scheduler)
+    engine_sched.deferred_free_blocks = {seq.id: seq}
+    engine_sched.block_manager = SimpleNamespace(deallocate=freed.append)
+    engine_sched.kv_connector = SimpleNamespace(
+        is_producer=True,
+        is_offload=True,
+        process_completions=sched.process_completions,
+        should_defer_free=lambda s: (
+            str(s.id) in pending_send or sched.should_defer_free(s)
+        ),
+        send_finished=lambda rid: pending_send.discard(str(rid)),
+    )
+    report = engine_sched._update_from_kv_xfer_finished
+    if send_first:
+        report(KVConnectorOutput(finished_sending={seq.id}))
+        assert not freed
+        assert seq._deferred_save_at > 0
+
+    first_save = meta1.requests[0].save_operation
+    report(KVConnectorOutput(finished_saving={first_save}))
+    assert str(seq.id) not in sched._save_inflight
+    assert not freed  # The undispatched suffix still owns the source blocks.
     meta3 = sched.build_connector_meta()
 
     assert len(meta3.requests) == 1
     assert len(meta3.requests[0].token_ids) == 12
     assert meta3.requests[0].save_spec.skip_leading_tokens == 8
     assert meta3.requests[0].is_last_prefill is True
+
+    report(KVConnectorOutput(finished_saving={first_save}))  # Stale generation.
+    assert not freed
+    report(KVConnectorOutput(finished_saving={meta3.requests[0].save_operation}))
+    if not send_first:
+        assert not freed  # All saves finished, but the send still owns blocks.
+        report(KVConnectorOutput(finished_sending={seq.id}))
+    assert freed == [seq]
+    assert not engine_sched.deferred_free_blocks
+
+
+def test_each_dispatched_save_gets_a_full_source_retention_window():
+    """A deferred request dispatches its chunks serially, so the retention
+    clock cannot be stamped once at park time.
+
+    `_reconcile_stalled_deferred_saves` abandons a save older than
+    `save_abandon_timeout_s()`. One stamp used to be enough (one save per
+    finished request); now generation k+1 would inherit the remains of
+    generation 1's window -- and `abandon_save` cannot cancel the worker's
+    running `store()`, so its source would be freed mid-copy.
+    """
+    import time as _time
+
+    sched = _scheduler()
+    seq = SimpleNamespace(
+        id=11,
+        token_ids=list(range(12)),
+        block_table=[3, 4, 5],
+        num_prompt_tokens=12,
+        num_cached_tokens=8,
+        is_partial_prefill=True,
+    )
+    sched._save_tracker[str(seq.id)] = [seq, 0]
+
+    first = sched.build_connector_meta().requests[0]
+    # The request finishes and is parked; the scheduler stamps the clock.
+    parked_at = _time.monotonic() - 1000.0
+    seq._deferred_save_at = parked_at
+    seq.num_cached_tokens = 12
+    seq.is_partial_prefill = False
+
+    sched.save_finished(first.save_operation)
+    suffix = sched.build_connector_meta().requests[0]
+
+    assert suffix.save_spec.skip_leading_tokens == 8, "this is a later generation"
+    assert (
+        seq._deferred_save_at > parked_at
+    ), "the suffix save needs its own window, or the reclaimer frees it mid-copy"
+
+    # A request still in `running` has no clock; arming one here would hand the
+    # reclaimer a sequence it must not touch.
+    sched._refresh_save_reclaim_clock(SimpleNamespace(id=12))
 
 
 def test_finished_saving_releases_deferred_free_with_string_req_id():
@@ -5955,6 +6036,9 @@ def test_every_member_the_scheduler_reads_is_reachable_through_the_shell():
         # alias-aware sweep above sees it, so anchor it so a regression to a
         # `self.kv_connector`-only scan fails here loudly.
         "max_pending_saves",
+        # Without this read the send's claim never clears and a producer's
+        # blocks are parked forever.
+        "send_finished",
     }
     lost = sorted(must_be_seen - probed)
     assert not lost, (
@@ -5976,9 +6060,14 @@ def test_every_member_the_scheduler_reads_is_reachable_through_the_shell():
     # listed here. Anything ELSE the composite fails to expose is NOT routed and
     # lands as a failure below, forcing a deliberate decision rather than a
     # silent default; add it here only with the routing that covers it.
+    # `send_finished` is the mirror-image exception on the other shell: offload
+    # has no send to retire, so its absence is the right answer rather than a
+    # silent default (`_connector_send_finished` guards on `callable`). The
+    # composite does expose it, so only the plain offload shell is excused.
     multi_routes_via_sub: set[str] = {"max_pending_saves"}
+    pd_only: set[str] = {"send_finished"}
     for shell in (LMCacheOffloadConnectorScheduler, MultiConnectorScheduler):
-        allow = multi_routes_via_sub if shell is MultiConnectorScheduler else set()
+        allow = multi_routes_via_sub if shell is MultiConnectorScheduler else pd_only
         missing = sorted(
             n for n in probed if n not in allow and not _shell_exposes(shell, n)
         )

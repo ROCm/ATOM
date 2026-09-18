@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 
@@ -534,6 +535,22 @@ class OffloadSchedulerMixin(ABC):
 
     def _track_save_statistics(self, operation, tokens: int) -> None:
         self._save_inflight_tokens[operation] = max(0, int(tokens))
+
+    def _refresh_save_reclaim_clock(self, seq) -> None:
+        """Give every newly dispatched save a full source-retention window.
+
+        A finished, deferred request dispatches its chunks serially, but the
+        clock is stamped once at park time -- so generation k+1 would inherit
+        the remains of generation 1's window and be abandoned by
+        `_reconcile_stalled_deferred_saves` mid-copy. Restart it per dispatch;
+        holding older work longer is the safe direction.
+        """
+        now = time.monotonic()
+        if getattr(seq, "_deferred_save_at", None) is not None:
+            seq._deferred_save_at = now
+        lease_times = getattr(self, "_save_lease_at", {})
+        if id(seq) in lease_times:
+            lease_times[id(seq)] = now
 
     def _finish_load_statistics(self, operation, *, succeeded: bool) -> None:
         if operation not in self._load_inflight_tokens:
