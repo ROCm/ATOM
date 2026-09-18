@@ -393,11 +393,13 @@ class SlurmNodeSelectionTest(unittest.TestCase):
             [
                 "bash",
                 "-c",
-                'set -euo pipefail\nsource "$HELPERS"\n'
-                'run_slurm_query() { printf "n1\\nn2\\nn3\\nn4\\nn4\\n"; '
-                'return "$QUERY_STATUS"; }\n'
-                'slurm_node_selection_args "$CANDIDATES" "$COUNT"\n'
-                'printf "%s\\n" "${SLURM_NODE_SELECTION_ARGS[@]}"',
+                (
+                    'set -euo pipefail\nsource "$HELPERS"\n'
+                    'run_slurm_query() { printf "n1\\nn2\\nn3\\nn4\\nn4\\n"; '
+                    'return "$QUERY_STATUS"; }\n'
+                    'slurm_node_selection_args "$CANDIDATES" "$COUNT"\n'
+                    'printf "%s\\n" "${SLURM_NODE_SELECTION_ARGS[@]}"'
+                ),
             ],
             env={
                 **os.environ,
@@ -407,6 +409,7 @@ class SlurmNodeSelectionTest(unittest.TestCase):
                 "USES_SPUR_CONTROLLER": str(int(spur)),
                 "QUERY_STATUS": str(query_status),
             },
+            check=False,
             capture_output=True,
             text=True,
             timeout=10,
