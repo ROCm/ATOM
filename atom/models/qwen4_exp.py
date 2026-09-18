@@ -1,8 +1,10 @@
 import fnmatch
+import re
 from typing import ClassVar
 
 import numpy as np
 import torch
+from aiter import QuantType, dtypes
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
     get_tensor_model_parallel_rank,
@@ -73,10 +75,24 @@ class _Qwen4ExpQuantizationConfig:
                 names.append("model." + name)
         field = "online_" if use_online_quant else ""
         excludes = getattr(self._config, field + "exclude_layers")
-        if any(
-            self._config._is_excluded(name, excludes, check_children=check_children)
-            for name in names
-        ):
+        if self.quant_method == "compressed-tensors" and not use_online_quant:
+            # Exact module targets do not exclude their children in this format.
+            excluded = any(
+                (
+                    re.search(pattern[3:], name)
+                    if pattern.startswith("re:")
+                    else name == pattern
+                    or (check_children and pattern.startswith(name + "."))
+                )
+                for name in names
+                for pattern in excludes
+            )
+        else:
+            excluded = any(
+                self._config._is_excluded(name, excludes, check_children=check_children)
+                for name in names
+            )
+        if excluded:
             return LayerQuantConfig(quant_dtype=self.torch_dtype)
         for pattern, spec in getattr(self._config, field + "layer_pattern_specs"):
             if any(
@@ -268,7 +284,8 @@ class Qwen4ExpLinearAttention(nn.Module):
     Same recurrence as Qwen3-Next -- ATOM's `LinearAttention` / `GatedDeltaNet`
     run it unchanged. Separate checkpoint projections are packed into the
     existing MergedColumnParallelLinear at load time, with Q/K/V sharded
-    independently. The forward consumes zero-copy [Q|K|V|Z|B|A] views.
+    independently. PTPC inputs use an FP8 QKVZ projection and a BF16 BA
+    projection; unquantized inputs retain the single packed QKVZBA projection.
     """
 
     @property
@@ -288,21 +305,36 @@ class Qwen4ExpLinearAttention(nn.Module):
         self, atom_config, config, quant_config=None, prefix: str = ""
     ) -> None:
         super().__init__()
+        self.quantized_inputs = False
         if quant_config is not None:
-            # B/A have 48 output rows, so separately quantized checkpoint
-            # shards cannot share packed block scales. Published FP8 weights
-            # exclude GDN; reject other source/online layouts before loading.
-            for projection in ("qkv", "z", "b", "a"):
-                name = f"{prefix}.in_proj_{projection}"
-                for online in (False, True) if quant_config.online_quant else (False,):
+            qkv, z, b, a = (
+                quant_config.get_layer_quant_config(f"{prefix}.in_proj_{projection}")
+                for projection in ("qkv", "z", "b", "a")
+            )
+            self.quantized_inputs = any(
+                policy.is_quantized for policy in (qkv, z, b, a)
+            )
+            if self.quantized_inputs and not (
+                qkv == z
+                and qkv.quant_type == QuantType.per_Token
+                and qkv.quant_dtype == dtypes.fp8
+                and qkv.is_dynamic
+                and not b.is_quantized
+                and not a.is_quantized
+            ):
+                raise ValueError(
+                    "Qwen GDN requires unquantized inputs or matching dynamic "
+                    "per-channel FP8 QKV/Z with unquantized B/A"
+                )
+            if quant_config.online_quant:
+                for projection in ("qkv", "z", "b", "a"):
+                    name = f"{prefix}.in_proj_{projection}"
                     policy = quant_config.get_layer_quant_config(
-                        name, use_online_quant=online
+                        name, use_online_quant=True
                     )
                     if policy.is_quantized:
                         raise ValueError(
-                            "Qwen3.8-Flash-Next requires unquantized GDN input "
-                            f"projections; {name} is quantized "
-                            f"({'online' if online else 'source'} policy)"
+                            f"Qwen GDN input online quantization is not supported: {name}"
                         )
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
@@ -324,20 +356,38 @@ class Qwen4ExpLinearAttention(nn.Module):
                 f"(k={self.num_k_heads}, v={self.num_v_heads})"
             )
 
-        self.in_proj_qkvzba = MergedColumnParallelLinear(
-            self.hidden_size,
-            [
-                self.key_dim,
-                self.key_dim,
-                self.value_dim,
-                self.value_dim,
-                self.num_v_heads,
-                self.num_v_heads,
-            ],
-            bias=False,
-            quant_config=None,
-            prefix=f"{prefix}.in_proj_qkvzba",
-        )
+        qkvz_sizes = [self.key_dim, self.key_dim, self.value_dim, self.value_dim]
+        ba_sizes = [self.num_v_heads, self.num_v_heads]
+        if self.quantized_inputs:
+            self.in_proj_qkvz = MergedColumnParallelLinear(
+                self.hidden_size,
+                qkvz_sizes,
+                bias=False,
+                quant_config=quant_config,
+                # QKV and Z have the same policy, checked above.
+                prefix=f"{prefix}.in_proj_qkv",
+            )
+            self.in_proj_ba = MergedColumnParallelLinear(
+                self.hidden_size,
+                ba_sizes,
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.in_proj_ba",
+            )
+            self.packed_modules_mapping = {
+                ".in_proj_qkv": (".in_proj_qkvz", (0, 1, 2)),
+                ".in_proj_z": (".in_proj_qkvz", 3),
+                ".in_proj_b": (".in_proj_ba", 0),
+                ".in_proj_a": (".in_proj_ba", 1),
+            }
+        else:
+            self.in_proj_qkvzba = MergedColumnParallelLinear(
+                self.hidden_size,
+                qkvz_sizes + ba_sizes,
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.in_proj_qkvzba",
+            )
         self.out_proj = RowParallelLinear(
             self.value_dim,
             self.hidden_size,
@@ -352,7 +402,8 @@ class Qwen4ExpLinearAttention(nn.Module):
             input_size=self.conv_kernel_size,
             output_size=self.conv_dim,
             bias=False,
-            quant_config=quant_config,
+            # This checkpoint module is a depthwise Conv1d, not a Linear.
+            quant_config=None,
             prefix=f"{prefix}.conv1d",
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
@@ -395,16 +446,22 @@ class Qwen4ExpLinearAttention(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
         v_heads = self.num_v_heads // self.tp_size
-        projected = self.in_proj_qkvzba(hidden_states)
-        mixed_qkv, z, b, a = projected.split(
-            [
-                self.conv_dim // self.tp_size,
-                self.value_dim // self.tp_size,
-                v_heads,
-                v_heads,
-            ],
-            dim=-1,
-        )
+        if self.quantized_inputs:
+            mixed_qkv, z = self.in_proj_qkvz(hidden_states).split(
+                [self.conv_dim // self.tp_size, self.value_dim // self.tp_size], dim=-1
+            )
+            b, a = self.in_proj_ba(hidden_states).chunk(2, dim=-1)
+        else:
+            projected = self.in_proj_qkvzba(hidden_states)
+            mixed_qkv, z, b, a = projected.split(
+                [
+                    self.conv_dim // self.tp_size,
+                    self.value_dim // self.tp_size,
+                    v_heads,
+                    v_heads,
+                ],
+                dim=-1,
+            )
         z = z.view(num_tokens, v_heads, self.head_v_dim)
 
         core_attn_out = torch.empty_like(z)
@@ -545,6 +602,7 @@ class Qwen4ExpModel(nn.Module):
         config = atom_config.hf_config
         self.config = config
         self.hc_count = int(config.hc_count)
+        self.return_hc_state = atom_config.speculative_config is not None
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size
@@ -600,12 +658,14 @@ class Qwen4ExpModel(nn.Module):
         for layer in self.layers[self.start_layer : self.end_layer]:
             hidden_states = layer(positions, hidden_states, input_ids)
 
+        if self.return_hc_state:
+            return hidden_states.view(-1, self.hc_count, self.config.hidden_size)
         mixed, _ = self.hyper_connection_mixer.mix(hidden_states)
         return mixed
 
 
 class Qwen4ExpForConditionalGeneration(nn.Module):
-    """Qwen3.8-Flash-Next. The MTP draft layer is skipped at load; everything else runs.
+    """Qwen3.8-Flash-Next target model; MTP weights belong to the separate drafter.
 
     The vision tower is only built when the engine was given a multimodal
     config, so a text-only deployment neither allocates its 0.9 GB nor pays
@@ -636,7 +696,7 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
     }
     # `model.visual.` is added at construction time when the tower is absent.
     skip_weight_prefixes: ClassVar[list[str]] = [
-        "mtp.",  # MTP draft layer: not ported
+        "mtp.",
     ]
     # The shared expert stays a standalone module: the routed experts arrive
     # as one stacked tensor with no slot to fuse it into.
@@ -700,8 +760,12 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         Qwen4ExpBackend.validate_config(atom_config)
         config = atom_config.hf_config
         self.config = config
+        self.extra_output_dims = (
+            (int(config.hc_count),)
+            if atom_config.speculative_config is not None
+            else ()
+        )
         self.packed_modules_mapping = {
-            **Qwen4ExpLinearAttention.packed_modules_mapping,
             **self.packed_modules_mapping,
             **{
                 f".ngram_embedding.shard_{shard}.": (".ngram_embedding.", shard)
@@ -736,6 +800,13 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
             prefix=maybe_prefix(prefix, "model"),
             quant_config=self.quant_config,
         )
+        for module in self.model.modules():
+            if isinstance(module, Qwen4ExpLinearAttention):
+                for source, (target, shard) in module.packed_modules_mapping.items():
+                    self.packed_modules_mapping[module.prefix + source] = (
+                        module.prefix + target,
+                        shard,
+                    )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
@@ -791,6 +862,10 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor):
+        if self.extra_output_dims:
+            hidden_states, _ = self.model.hyper_connection_mixer.mix(
+                hidden_states.flatten(1)
+            )
         return self.lm_head(hidden_states)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:

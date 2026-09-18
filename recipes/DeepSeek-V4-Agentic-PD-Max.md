@@ -32,6 +32,28 @@ c=1). PD earns its keep from 64 up, where it buys 2.6–3.6× the per-user outpu
 rate. Use the TP section if your deployment is already PD-disaggregated, not as
 a reason to split two nodes for low concurrency.
 
+## RDMA rail configuration
+
+The two-node TP8 examples assume matching, mutually reachable GPU-local RDMA
+rails; the DP examples use `idx2idx` rank mapping. Keep the default local-HCA
+registration for this topology: the Mooncake configs below intentionally omit
+`ib_enable_alternate_hca` and `ib_hca_count`.
+
+Set `MC_ENABLE_DEST_DEVICE_AFFINITY=1` on both server nodes, including the
+prefill server using the `multi` connector. The exports below include it so
+Mooncake can select a destination HCA reachable from the initiator's local rail.
+
+If you adapt this recipe to a cross-rail layout, add
+`"ib_enable_alternate_hca": true` and `"ib_hca_count": 8` to the **decode
+Mooncake connector** config. If decode uses a `multi` connector, put these
+fields inside its Mooncake entry. Check the actual HCA names and GPU/rail
+mapping first; see [RDMA rails and HCA registration](pd_disaggregation_guide.md#rdma-rails-and-hca-registration)
+for defaults, explicit-device overrides, and a complete consumer example.
+
+These settings control HCA selection and reachability. The GPU memory
+registration workaround described in [If the servers OOM at
+startup](#if-the-servers-oom-at-startup) addresses a separate driver-level issue.
+
 ## TP — concurrency 1 – 32
 
 ```bash
@@ -39,6 +61,7 @@ export AITER_BF16_FP8_MOE_BOUND=0
 export ATOM_MOE_GU_ITLV=1
 export ATOM_HOST_IP=<PREFILL_IP>          # <DECODE_IP> on the decode node
 export MC_GID_INDEX=1
+export MC_ENABLE_DEST_DEVICE_AFFINITY=1
 export NCCL_IB_DISABLE=1
 export ATOM_DISABLE_MMAP=true
 
@@ -189,6 +212,7 @@ export ATOM_MOE_GU_ITLV=1
 export ATOM_HOST_IP=10.0.0.1                    # this node
 export ATOM_DISABLE_MMAP=true
 export MC_GID_INDEX=1
+export MC_ENABLE_DEST_DEVICE_AFFINITY=1
 export NCCL_IB_DISABLE=1
 
 export ATOM_NUMA_BIND=1

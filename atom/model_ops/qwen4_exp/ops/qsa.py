@@ -30,6 +30,75 @@ from aiter.ops.topk import top_k_per_row_prefill
 
 
 @triton.jit
+def _draft_decode_metadata(
+    Lengths,
+    Tables,
+    Reject,
+    Slots,
+    Positions,
+    Requests,
+    Compressed,
+    N: tl.constexpr,
+    REAL: tl.constexpr,
+    TS: tl.constexpr,
+    PAGE: tl.constexpr,
+    RATIO: tl.constexpr,
+    HAS_REJECT: tl.constexpr,
+    B: tl.constexpr,
+):
+    req = tl.program_id(0) * B + tl.arange(0, B)
+    live = req < REAL
+    length = tl.load(Lengths + req, req < N, 0)
+    if HAS_REJECT:
+        length -= tl.load(Reject + req, live, 0)
+    length = tl.where(live, length, 0)
+    pos = length - 1
+    valid = live & (pos >= 0)
+    page = tl.load(Tables + req * TS + pos // PAGE, valid, 0)
+    slot = tl.where(valid, page.to(tl.int64) * PAGE + pos % PAGE, -1)
+    tl.store(Lengths + req, length, req < N)
+    tl.store(Positions + req, pos, req < N)
+    tl.store(Requests + req, tl.where(live, req, -1), req < N)
+    tl.store(Slots + req, slot, req < N)
+    tl.store(
+        Compressed + req,
+        tl.where(valid & (length % RATIO == 0), slot // RATIO, -1),
+        req < N,
+    )
+
+
+def qsa_draft_decode_metadata(
+    lengths: torch.Tensor,
+    tables: torch.Tensor,
+    rejected: torch.Tensor | None,
+    slots: torch.Tensor,
+    positions: torch.Tensor,
+    requests: torch.Tensor,
+    compressed: torch.Tensor,
+    real_requests: int,
+    block_size: int,
+    compress_ratio: int,
+) -> None:
+    """Update draft lengths and physical write slots after verification."""
+    _draft_decode_metadata[(triton.cdiv(lengths.numel(), 128),)](
+        lengths,
+        tables,
+        rejected,
+        slots,
+        positions,
+        requests,
+        compressed,
+        lengths.numel(),
+        real_requests,
+        tables.stride(0),
+        block_size,
+        compress_ratio,
+        rejected is not None,
+        128,
+    )
+
+
+@triton.jit
 def _qsa_compressed_slots_kernel(
     slots_ptr,
     positions_ptr,
@@ -334,6 +403,7 @@ def _qsa_compress_groups_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
     LOAD_POSITIONS: tl.constexpr,
+    ROPE_POSITION_OFFSET: tl.constexpr,
 ) -> None:
     """Mean-pool the group that ends at each token, reading the paged raw cache."""
     row = tl.program_id(0)
@@ -413,7 +483,7 @@ def _qsa_compress_groups_kernel(
             mask=(row < num_rows) & (axes < 3),
         )
     else:
-        first_position = tl.where(valid_row, first_position, 0)
+        first_position = tl.where(valid_row, first_position + ROPE_POSITION_OFFSET, 0)
         tl.store(
             first_positions_ptr + row * stride_first_row + axes * stride_first_axis,
             first_position,
@@ -429,6 +499,7 @@ def qsa_compress_groups(
     compressed_slots: torch.Tensor,
     compress_ratio: int,
     position_cache: torch.Tensor | None = None,
+    rope_position_offset: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pool the group closed by each token; return `(pooled, first_positions)`.
 
@@ -437,6 +508,8 @@ def qsa_compress_groups(
     the same mapping, so junk rows are never written. `first_positions` is
     `[rows, 3]` int64 -- three identical linear positions for a text model, the
     cached mRoPE axes when `position_cache` is supplied.
+    Without that cache, `rope_position_offset` shifts only RoPE coordinates,
+    not the logical positions used to address and group keys.
     """
     if raw_key_cache.ndim != 4 or raw_key_cache.shape[2] != 1:
         raise ValueError("raw_key_cache must be [pages, page_size, 1, head_dim]")
@@ -492,6 +565,7 @@ def qsa_compress_groups(
         HEAD_DIM=head_dim,
         BLOCK_D=triton.next_power_of_2(head_dim),
         LOAD_POSITIONS=load_positions,
+        ROPE_POSITION_OFFSET=0 if load_positions else rope_position_offset,
         num_warps=4,
     )
     return pooled, first_positions
@@ -918,6 +992,9 @@ def qsa_select_paged_tokens(
             logits.stride(0),
             logits.stride(1),
             block_topk,
+            # Equal index scores must choose the same keys and ordering in
+            # single-token decode and multi-token verification.
+            stable=True,
         )
         qsa_expand_block_indices(
             selected_groups,
@@ -1115,6 +1192,7 @@ def qsa_sparse_paged_gqa(
     token_to_request: torch.Tensor,
     softmax_scale: float | None = None,
     kv_splits: int | None = None,
+    num_decode_requests: int | None = None,
 ) -> torch.Tensor:
     """Grouped-query attention restricted to `logical_indices` (-1 = padding)."""
     if q.ndim != 3:
@@ -1151,11 +1229,15 @@ def qsa_sparse_paged_gqa(
     block_d = max(16, triton.next_power_of_2(q.shape[2]))
     block_n = 32
     if kv_splits is None:
-        # Small decode batches otherwise expose as little as one CTA/layer.
+        # Keep decode reduction order independent of the verification width.
+        # Prefill continues to size parallelism from its flat query rows.
+        split_rows = q.shape[0] if num_decode_requests is None else num_decode_requests
+        if split_rows <= 0:
+            raise ValueError("num_decode_requests must be positive")
         kv_splits = (
             min(
                 16,
-                triton.next_power_of_2(triton.cdiv(512, q.shape[0] * k_cache.shape[2])),
+                triton.next_power_of_2(triton.cdiv(512, split_rows * k_cache.shape[2])),
             )
             if logical_indices.shape[1] >= 512
             else 1

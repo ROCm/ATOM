@@ -73,6 +73,10 @@ on:
         type: string
         required: false
         default: ""
+      aiter_commit:
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -106,7 +110,8 @@ jobs:
           if [ -n "$containers" ]; then
             docker kill $containers || true
           fi
-          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace \
+            rocm/pytorch:latest bash -lc "ls -la /workspace/ && chmod -R u+rwX /workspace 2>/dev/null || true; find /workspace -mindepth 1 -delete" || true
 
       - name: Show ROCm status (host)
         run: docker ps -a && rocm-smi --showmemuse 2>/dev/null || true
@@ -130,6 +135,13 @@ jobs:
             -e CONC=${{ env.CONC }} -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }}
             -e ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }}
             -e ENABLE_RTL_PROFILER=${{ inputs.enable_rtl && '1' || '0' }}
+
+      - name: Reinstall AITER from requested ref
+        if: ${{ inputs.aiter_commit != '' }}
+        env:
+          CONTAINER_NAME: atom-benchmark
+          AITER_GIT_REF: ${{ inputs.aiter_commit }}
+        run: bash .github/scripts/install_aiter_from_ref.sh
 
       - name: Collect GPU info (inside container)
         id: gpu-info
@@ -279,7 +291,7 @@ jobs:
       - name: Clean Up
         if: always()
         run: |
-          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged \
-            ${{ inputs.image }} bash -lc "rm -rf /workspace/atom/ /workspace/aiter/ /workspace/bench_serving/" || true
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace \
+            ${{ inputs.image }} bash -lc "chmod -R u+rwX /workspace/atom /workspace/aiter /workspace/bench_serving 2>/dev/null || true; rm -rf /workspace/atom/ /workspace/aiter/ /workspace/bench_serving/" || true
           docker stop atom-benchmark || true
           docker rm atom-benchmark || true

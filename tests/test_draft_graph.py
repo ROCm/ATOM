@@ -52,6 +52,25 @@ def test_owning_a_recording_says_nothing_about_a_batch_it_is_not_at():
     assert not g.is_captured(44)
 
 
+def test_releasing_the_recordings_leaves_the_pass_runnable_eagerly():
+    """A draft pass WRITES the KV it attends, so its recording holds the base of
+    the pool a decode graph does, and a sleep that frees the pool has to drop
+    these too (`atom/rollout/memory_manager.py`). Nothing else has to be
+    arranged: `is_captured` answers no afterwards, which is exactly the
+    `ATOM_DRAFT_CUDAGRAPH=0` state, and the next warmup records again.
+    """
+    g = _graph()
+    g._cuda_graphs[48] = ("graph", "out")
+    g._cuda_graphs[64] = ("graph", "out")
+
+    assert g.release_graphs() == 2
+    assert not g.is_captured(48)
+    assert not g.is_captured(64)
+    # The staged buffers are ordinary allocations, sized once at `bind` for the
+    # very reason that a capture must not be what allocates them.
+    assert g.stage(2, {"row": torch.zeros(2, dtype=torch.int32)})["row"].shape[0] == 2
+
+
 def test_nothing_recorded_means_no_batch_replays():
     """`ATOM_DRAFT_CUDAGRAPH=0` leaves the inventory empty, and then every
     batch must answer no -- that is what keeps the eager pass unpadded."""

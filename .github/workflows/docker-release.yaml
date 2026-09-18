@@ -5,14 +5,17 @@ on:
     - cron: '48 13 * * *'  # Every day at 21:48 Beijing Time (UTC+8)
   workflow_dispatch:
     inputs:
-      base_image:
-        description: "Base Docker image for ATOM build"
-        type: choice
-        default: "rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0"
-        options:
-          - rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0
-          - rocm/pytorch:latest
-          - rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.10.0
+      build_rocm7:
+        description: "Build the ROCm 7 line -> rocm/atom-dev:latest + :nightly_<ts> (scheduled nightly runs always build every live line; default enabled)"
+        type: boolean
+        default: true
+      build_rocm10:
+        description: "Build the ROCm 10 line -> rocm/atom-dev:latest-rocm10.0 + :nightly_<ts>-rocm10.0 (scheduled nightly runs always build every live line; default enabled)"
+        type: boolean
+        default: true
+      base_image_override:
+        description: "Build one literal base image instead of the lines above, e.g. rocm/pytorch:latest or rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.10.0. Publishes under a suffix read from the image."
+        default: ""
       atom_repo:
         description: "ATOM repo"
         default: "https://github.com/ROCm/ATOM.git"
@@ -78,15 +81,80 @@ on:
         type: boolean
         default: false
 
+# The live lines, defined once for the whole workflow. LINE_STABLE owns the
+# unsuffixed tags (latest, nightly_<ts>, vllm-latest, sglang-latest);
+# LINE_NEXT publishes the same set suffixed with the ROCm version read out of
+# its image. Promoting ROCm 10 is these two values and nothing else: `latest`
+# follows, and the line that used to be stable simply stops being built.
+env:
+  LINE_STABLE: rocm7
+  LINE_NEXT: rocm10.0
+
 jobs:
+  # Which lines this run builds. A separate job because `strategy.matrix` is
+  # evaluated before any step runs, so the list has to arrive as a `needs`
+  # output rather than be computed inside the build job.
+  plan:
+    name: Resolve which lines to build
+    runs-on: ubuntu-latest
+    outputs:
+      lines: ${{ steps.lines.outputs.lines }}
+    steps:
+      - name: Resolve lines
+        id: lines
+        run: |
+          set -euo pipefail
+          OVERRIDE="${{ inputs.base_image_override || '' }}"
+          if [ -n "${OVERRIDE}" ]; then
+            # A one-off build on a literal image reference, nothing else.
+            printf 'lines=["%s"]\n' "${OVERRIDE}" >> "${GITHUB_OUTPUT}"
+            echo "Lines: ${OVERRIDE} (base_image_override)"
+            exit 0
+          fi
+
+          lines=""
+          add() { lines="${lines:+${lines},}\"$1\""; }
+
+          # only_release_oot / only_release_sglang mean "just rebuild that
+          # layer". Those layers belong to the stable line, so there is
+          # nothing for a second line to do -- without this it would spend
+          # three hours building an image that every later step skips.
+          if [ "${{ inputs.only_release_oot }}" = "true" ] || [ "${{ inputs.only_release_sglang }}" = "true" ]; then
+            printf 'lines=["%s"]\n' "${LINE_STABLE}" >> "${GITHUB_OUTPUT}"
+            echo "Lines: ${LINE_STABLE} (only_release_oot / only_release_sglang)"
+            exit 0
+          fi
+
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            # Like the OOT and SGLang layers, a scheduled run builds every
+            # live line regardless of the toggles; the toggles exist so a
+            # manual run can build one line without the other.
+            add "${LINE_STABLE}"
+            add "${LINE_NEXT}"
+          else
+            # The line names come from LINE_STABLE / LINE_NEXT, never spelled
+            # out here: a toggle selects a line, it does not name one. Writing
+            # them out is how renaming the line to rocm10.0 left this branch
+            # emitting "rocm10", which then resolved to nothing.
+            if [ "${{ inputs.build_rocm7 }}" = "true" ]; then add "${LINE_STABLE}"; fi
+            if [ "${{ inputs.build_rocm10 }}" = "true" ]; then add "${LINE_NEXT}"; fi
+          fi
+
+          if [ -z "${lines}" ]; then
+            echo "No line selected: enable at least one of build_rocm7 / build_rocm10, or set base_image_override."
+            exit 1
+          fi
+          echo "lines=[${lines}]" >> "${GITHUB_OUTPUT}"
+          echo "Lines: [${lines}]"
+
   docker-release:
     name: Nightly Docker Release
+    needs: plan
     runs-on: ${{ inputs.runner || 'linux-atom-mi35x-1' }}
     strategy:
       fail-fast: false
       matrix:
-        base_image:
-          - ${{ inputs.base_image || 'rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0' }}
+        base_image: ${{ fromJSON(needs.plan.outputs.lines) }}
 
     env:
       ATOM_REPO: "https://github.com/ROCm/ATOM.git"
@@ -145,6 +213,62 @@ jobs:
           echo "SGLANG_REF: ${{ inputs.sglang_ref || env.SGLANG_REF }}"
           echo "SGLANG_VERSION: ${{ inputs.sglang_version || env.SGLANG_VERSION }}"
           echo "SGLANG_TAG_SUFFIX: ${{ inputs.sglang_tag_suffix || '' }}"
+          echo "BASE_IMAGE_FLAVOR: ${{ matrix.base_image }}"
+
+      # One place that turns a line name into everything the rest of the job
+      # needs: which base image to build on, which extra build-args that line
+      # wants, and whether it publishes at all. Before this, each of those
+      # lived as its own `if [ "${{ matrix.base_image }}" = "rocm10" ]` inside
+      # a push step -- which is how the vLLM push came to have none, and
+      # published ROCm 10 images over the ROCm 7 `vllm-latest` tag.
+      - name: Resolve flavor
+        id: flavor
+        run: |
+          set -euo pipefail
+          FLAVOR="${{ matrix.base_image }}"
+          EXTRA_BUILD_ARGS=""
+
+          case "${FLAVOR}" in
+            rocm7)
+              BASE_IMAGE="rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0"
+              ;;
+            rocm10.0)
+              # rocm10-base is a stage inside atom_release.dockerfile, not an
+              # image to pull: the ROCm 10 stack is assembled from the AMD
+              # stable wheel channel on plain ubuntu:24.04.
+              BASE_IMAGE="rocm10-base"
+              ;;
+            */*|*:*)
+              # A literal image reference, for a one-off build on something
+              # that has no line name.
+              BASE_IMAGE="${FLAVOR}"
+              ;;
+            *)
+              echo "Unknown base_image flavor '${FLAVOR}'."
+              exit 1
+              ;;
+          esac
+
+          # Two lines now build in the same run, and a self-hosted runner
+          # shares its docker daemon with every other runner on that host. A
+          # single `atom_release:ci` tag and a single `atom_release_ci`
+          # container would then be two jobs writing the same two names: the
+          # second build retags the image out from under the first, and either
+          # Clean Up removes the other's container mid-test. Name both per
+          # line. SAFE_FLAVOR because base_image_override carries "/" and ":".
+          SAFE_FLAVOR=$(printf '%s' "${FLAVOR}" | sed 's/[^A-Za-z0-9._-]/-/g')
+          echo "flavor=${FLAVOR} base_image=${BASE_IMAGE} image=atom_release:ci-${SAFE_FLAVOR}"
+          {
+            echo "FLAVOR=${FLAVOR}"
+            echo "BASE_IMAGE=${BASE_IMAGE}"
+            echo "CI_IMAGE=atom_release:ci-${SAFE_FLAVOR}"
+            echo "CI_OOT_IMAGE=atom_oot_release:ci-${SAFE_FLAVOR}"
+            echo "CI_SGLANG_IMAGE=atom_sglang_release:ci-${SAFE_FLAVOR}"
+            echo "CI_CONTAINER=atom_release_ci_${SAFE_FLAVOR}"
+            echo "EXTRA_BUILD_ARGS<<EOF_ARGS"
+            echo "${EXTRA_BUILD_ARGS}"
+            echo "EOF_ARGS"
+          } >> "${GITHUB_ENV}"
 
       - name: Build Docker image
         timeout-minutes: 180
@@ -156,8 +280,9 @@ jobs:
             ATOM_CHECKOUT="${ATOM_COMMIT}"
           fi
           echo "ATOM checkout ref: ${ATOM_CHECKOUT} (branch: ${{ github.ref_name }})"
-          DOCKER_BUILDKIT=1 docker build --pull --network=host -t atom_release:ci \
-          --build-arg BASE_IMAGE="${{ matrix.base_image }}" \
+          echo "Building flavor ${FLAVOR} on BASE_IMAGE ${BASE_IMAGE}"
+          DOCKER_BUILDKIT=1 docker build --pull --network=host -t "${CI_IMAGE}" \
+          --build-arg BASE_IMAGE="${BASE_IMAGE}" \
           --build-arg GPU_ARCH="${{ env.GPU_ARCH }}" \
           --build-arg ATOM_REPO="${{ inputs.atom_repo || env.ATOM_REPO }}" \
           --build-arg ATOM_COMMIT="${ATOM_CHECKOUT}" \
@@ -165,16 +290,92 @@ jobs:
           --build-arg AITER_COMMIT="${{ inputs.aiter_commit || env.AITER_COMMIT }}" \
           --build-arg RCCL_REPO="${{ inputs.rccl_repo || env.RCCL_REPO }}" \
           --build-arg RCCL_BRANCH="${{ inputs.rccl_branch || env.RCCL_BRANCH }}" \
+          ${EXTRA_BUILD_ARGS} \
           --build-arg CACHEBUST=$(date +%s) \
           -f docker/atom_release.dockerfile .
-          docker inspect atom_release:ci
+          docker inspect "${CI_IMAGE}"
+
+      # Everything the image knows about itself, read out of the image: the
+      # tag suffix it publishes under, and the labels that record the stack it
+      # was built from. Read rather than assumed -- a nickname says what we
+      # called the line, the image knows what is actually in it.
+      - name: Read the image's versions and stamp them on it
+        run: |
+          set -euo pipefail
+          read_in_image() { docker run --rm --entrypoint="" "${CI_IMAGE}" bash -lc "$1" | tr -d '[:space:]'; }
+
+          ROCM_VER=$(read_in_image 'cat /opt/rocm/.info/version 2>/dev/null || python3 -c "import torch; print(torch.version.hip or \"\")"')
+          if [ -z "${ROCM_VER}" ]; then
+            echo "ERROR: could not read a ROCm version out of the image; refusing to publish an unlabelled tag"
+            exit 1
+          fi
+          TORCH_VER=$(read_in_image 'python3 -c "import torch; print(torch.__version__)"')
+          PY_VER=$(read_in_image 'python3 -c "import platform; print(platform.python_version())"')
+          TRITON_VER=$(read_in_image 'python3 -c "from importlib.metadata import version; print(version(\"triton\"))" 2>/dev/null || true')
+          # amd-aiter, not aiter: that is the distribution name the wheel
+          # declares, and asking for the wrong one silently yields an empty
+          # label rather than an error.
+          AITER_VER=$(read_in_image 'python3 -c "from importlib.metadata import version; print(version(\"amd-aiter\"))" 2>/dev/null || true')
+          ATOM_VER=$(read_in_image 'python3 -c "from importlib.metadata import version; print(version(\"atom\"))" 2>/dev/null || true')
+          # The commit is read from the clone inside the image, which is the
+          # commit that was actually built. The build step only has a ref name
+          # (a branch, usually), which is not what "revision" means.
+          ATOM_SHA=$(read_in_image 'git -C /app/ATOM rev-parse HEAD 2>/dev/null || true')
+
+          # Two components in the tag, three in the label. The tag is a name
+          # people pull by and scripts pin to, and ATOM already spells the
+          # line that way -- v0.1.5 shipped wheels as +rocm7.0, +rocm7.1,
+          # +rocm7.2. A patch bump (10.0.0 -> 10.0.1) must not rename a
+          # rolling tag out from under everyone, so the exact version lives in
+          # the label, where precision costs nothing.
+          if [ "${FLAVOR}" = "${LINE_STABLE}" ]; then
+            TAG_SUFFIX=""
+            echo "Stable line (${FLAVOR}): publishing unsuffixed tags"
+          else
+            TAG_SUFFIX="-rocm$(echo "${ROCM_VER}" | cut -d. -f1,2)"
+            echo "Line ${FLAVOR} carries ROCm ${ROCM_VER}; tag suffix ${TAG_SUFFIX}"
+            # A line named for a ROCm version has to carry that version. If
+            # someone changes ROCM_SDK_VERSION without renaming the line, the
+            # derived tag would quietly stop matching the name everything else
+            # is written in. Fail instead.
+            case "${FLAVOR}" in
+              rocm[0-9]*.[0-9]*)
+                if [ "${FLAVOR}" != "${TAG_SUFFIX#-}" ]; then
+                  echo "Line is called ${FLAVOR} but the image carries ROCm ${ROCM_VER} (${TAG_SUFFIX#-})."
+                  exit 1
+                fi
+                ;;
+            esac
+          fi
+          echo "TAG_SUFFIX=${TAG_SUFFIX}" >> "${GITHUB_ENV}"
+
+          # Stamp the stack onto the image. A tag cannot carry this much and
+          # stay pullable, and the only label the image had was ubuntu's
+          # org.opencontainers.image.version=24.04, which names the base OS
+          # while reading like the image's own version. One more layer, which
+          # holds metadata and no files: the image bytes do not change.
+          echo "FROM ${CI_IMAGE}" | DOCKER_BUILDKIT=1 docker build -q \
+            --label "org.opencontainers.image.title=ATOM" \
+            --label "org.opencontainers.image.version=${ATOM_VER}" \
+            --label "org.opencontainers.image.revision=${ATOM_SHA}" \
+            --label "org.opencontainers.image.source=https://github.com/ROCm/ATOM" \
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --label "com.amd.atom.line=${FLAVOR}" \
+            --label "com.amd.rocm.version=${ROCM_VER}" \
+            --label "com.amd.torch.version=${TORCH_VER}" \
+            --label "com.amd.triton.version=${TRITON_VER}" \
+            --label "com.amd.aiter.version=${AITER_VER}" \
+            --label "com.amd.python.version=${PY_VER}" \
+            -t "${CI_IMAGE}" -
+          echo "Labels on ${CI_IMAGE}:"
+          docker image inspect "${CI_IMAGE}" --format '{{json .Config.Labels}}'
 
       - name: Test Docker image
         if: ${{ success() && steps.gates.outputs.main == 'true' && inputs.skip_tests != true }}
         timeout-minutes: 60
         run: |
           echo "Clean up containers..."
-          docker ps -aq -f name=atom_release_ci | xargs -r docker stop | xargs -r docker rm
+          docker ps -aq -f "name=${CI_CONTAINER}" | xargs -r docker stop | xargs -r docker rm
               
           if [ -f "/etc/podinfo/gha-render-devices" ]; then
             DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
@@ -182,7 +383,7 @@ jobs:
             DEVICE_FLAG="--device /dev/dri"
           fi
               
-          echo "Starting container: atom_release_ci (image: atom_release:ci)"
+          echo "Starting container: ${CI_CONTAINER} (image: ${CI_IMAGE})"
           docker run -dt --device=/dev/kfd $DEVICE_FLAG \
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
             --ipc=host --group-add video \
@@ -192,10 +393,10 @@ jobs:
             --security-opt seccomp=unconfined \
             --ulimit memlock=-1 \
             --ulimit stack=67108864 \
-            --name atom_release_ci \
-            atom_release:ci
+            --name "${CI_CONTAINER}" \
+            "${CI_IMAGE}"
               
-          docker exec atom_release_ci bash -c \
+          docker exec "${CI_CONTAINER}" bash -c \
             "rm -f ~/.cache/huggingface/token ~/.cache/huggingface/stored_tokens 2>/dev/null; \
              python3 -m atom.examples.simple_inference \
                --model meta-llama/Meta-Llama-3-8B-Instruct \
@@ -207,15 +408,54 @@ jobs:
 
           echo ""
           echo "========== Comparing output with golden outputs =========="
+          # golden_outputs is a directory; the file inside is named for the
+          # model the test runs. The path here used to be
+          # ".github/workflows/golden_outputs.txt", which has never existed:
+          # diff failed to open it every time, and the `|| true` that used to
+          # follow turned that into "Output matches golden outputs." So this
+          # comparison has never actually run. Now that the exit code is
+          # honoured, a wrong path fails every build instead -- check the file
+          # is there and say so plainly, rather than reporting a missing
+          # golden file as a mismatch.
+          # One golden file per line. Greedy decoding is not portable across
+          # ROCm generations: on the same machine and the same weights, ROCm 7
+          # and ROCm 10 answered four of the six prompts differently -- not
+          # wrongly, just differently, because different kernels change the
+          # arithmetic enough to flip an argmax, after which the texts
+          # diverge. A single golden file therefore cannot gate two lines; the
+          # stable line keeps the existing name, each other line gets its own.
+          GOLDEN=".github/workflows/golden_outputs/Meta-Llama-3-8B-Instruct${TAG_SUFFIX}_golden_output.txt"
+          # Skipped until a baseline exists. This comparison has never once
+          # run -- the path was wrong from the start and `|| true` hid it --
+          # so nothing in the tree is known to be current: the file there
+          # holds 4 prompts while simple_inference sends 6, and ROCm 7 and
+          # ROCm 10 answer four of those six differently, so one file cannot
+          # serve both lines anyway. Diffing against it would print a
+          # guaranteed mismatch every night and mean nothing.
+          #
+          # The model still runs above, and its output is printed: that is a
+          # real check that the image can serve. Only the comparison waits.
+          #
+          # To turn it on: generate a baseline per line on CI hardware,
+          # commit them, and set GOLDEN_IS_AUTHORITATIVE=1. One deliberate
+          # step, taken when the baselines are real.
+          GOLDEN=".github/workflows/golden_outputs/Meta-Llama-3-8B-Instruct${TAG_SUFFIX}_golden_output.txt"
+          if [ "${GOLDEN_IS_AUTHORITATIVE:-0}" != "1" ]; then
+            echo "Golden comparison skipped: no current baseline for any line (see this step's comment)."
+            echo "To enable: write ${GOLDEN} from a known-good run of this line, then set GOLDEN_IS_AUTHORITATIVE=1."
+          elif [ ! -f "${GOLDEN}" ]; then
+            echo "No golden output for this line: ${GOLDEN}"
+            echo "Generate it on CI hardware from a known-good run of this line:"
+            echo "  docker exec <container> python3 -m atom.examples.simple_inference \\"
+            echo "    --model meta-llama/Meta-Llama-3-8B-Instruct --temperature 0 \\"
+            echo "    | grep -E '^Prompt: |^Completion:' > ${GOLDEN}"
+            exit 1
           # Ignore whitespace and EOL differences in the diff
-          diff -u -B -w --strip-trailing-cr atom_release_output.txt .github/workflows/golden_outputs.txt || true
-          DIFF_EXIT_CODE=$?
-          
-          if [ $DIFF_EXIT_CODE -ne 0 ]; then
+          elif diff -u -B -w --strip-trailing-cr atom_release_output.txt "${GOLDEN}"; then
+            echo "Output matches golden outputs."
+          else
             echo "Output does not match golden outputs."
             exit 1
-          else
-            echo "Output matches golden outputs."
           fi
 
       - name: Re-login to Docker Hub before push
@@ -235,29 +475,45 @@ jobs:
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
+          # Record every tag this job creates, so Clean Up can remove exactly
+          # those. The old cleanup removed by glob (nightly_*, latest*), which
+          # with two lines in one run means one job deleting the other's
+          # images -- possibly between its docker tag and its push.
+          tag_image() {
+            docker tag "$1" "$2"
+            echo "$2" >> "${RUNNER_TEMP}/pushed_tags.txt"
+          }
+          FLAVOR_SUFFIX="${TAG_SUFFIX}"
           CUSTOM_TAG="${{ inputs.custom_tag || '' }}"
           if [ -n "${CUSTOM_TAG}" ]; then
             if [[ ! "${CUSTOM_TAG}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
               echo "Invalid custom_tag '${CUSTOM_TAG}'. Allowed characters: letters, numbers, '.', '_' and '-'."
               exit 1
             fi
-            docker tag atom_release:ci rocm/atom-dev:${CUSTOM_TAG}
+            tag_image "${CI_IMAGE}" rocm/atom-dev:${CUSTOM_TAG}
             .github/scripts/docker_push_retry.sh rocm/atom-dev:${CUSTOM_TAG}
             echo "Custom tag: rocm/atom-dev:${CUSTOM_TAG}. Skipping latest update."
           else
             BRANCH="${{ github.ref_name }}"
             DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
-            TAG=nightly_$(date +%Y%m%d%H%M)
+            TAG=nightly_$(date +%Y%m%d%H%M)${FLAVOR_SUFFIX}
             if [ "${BRANCH}" != "${DEFAULT_BRANCH}" ]; then
               SAFE_BRANCH=$(echo "${BRANCH}" | sed 's/[^A-Za-z0-9._-]/-/g')
               TAG="${TAG}-${SAFE_BRANCH}"
-              docker tag atom_release:ci rocm/atom-dev:${TAG}
+              tag_image "${CI_IMAGE}" rocm/atom-dev:${TAG}
               .github/scripts/docker_push_retry.sh rocm/atom-dev:${TAG}
               echo "Branch '${BRANCH}'; tag: rocm/atom-dev:${TAG}. Skipping latest update."
             else
-              docker tag atom_release:ci rocm/atom-dev:latest
-              docker tag atom_release:ci rocm/atom-dev:${TAG}
-              .github/scripts/docker_push_retry.sh rocm/atom-dev:latest rocm/atom-dev:${TAG}
+              if [ -n "${FLAVOR_SUFFIX}" ]; then
+                tag_image "${CI_IMAGE}" rocm/atom-dev:${TAG}
+                tag_image "${CI_IMAGE}" rocm/atom-dev:latest${FLAVOR_SUFFIX}
+                .github/scripts/docker_push_retry.sh rocm/atom-dev:${TAG} rocm/atom-dev:latest${FLAVOR_SUFFIX}
+                echo "${FLAVOR}: tags rocm/atom-dev:${TAG} and rocm/atom-dev:latest${FLAVOR_SUFFIX}. Leaving latest to ${LINE_STABLE}."
+              else
+                tag_image "${CI_IMAGE}" rocm/atom-dev:latest
+                tag_image "${CI_IMAGE}" rocm/atom-dev:${TAG}
+                .github/scripts/docker_push_retry.sh rocm/atom-dev:latest rocm/atom-dev:${TAG}
+              fi
             fi
           fi
 
@@ -267,16 +523,25 @@ jobs:
         continue-on-error: true
         timeout-minutes: 180
         run: |
-          OOT_BASE_IMAGE="atom_release:ci"
+          # The vLLM and SGLang layers belong to the stable line only. They
+          # are owned and tagged by someone else, so a second line must not
+          # build them, and above all must not publish over their tags -- the
+          # ROCm 10 line would otherwise have replaced vllm-latest and the
+          # day's vllm-v<ver>-nightly_<date> with a ROCm 10 image.
+          if [ "${FLAVOR}" != "${LINE_STABLE}" ]; then
+            echo "${FLAVOR} is not the stable line: skipping the OOT vLLM layer (owned by the ROCm 7 line)."
+            exit 0
+          fi
+          OOT_BASE_IMAGE="${CI_IMAGE}"
           echo "Using OOT base image: ${OOT_BASE_IMAGE}"
-          docker build --network=host -t atom_oot_release:ci \
+          docker build --network=host -t "${CI_OOT_IMAGE}" \
             --build-arg OOT_BASE_IMAGE="${OOT_BASE_IMAGE}" \
             --build-arg MAX_JOBS=64 \
             --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
             --build-arg INSTALL_LM_EVAL=1 \
             --build-arg INSTALL_FASTSAFETENSORS=1 \
             -f docker/vllm_release.dockerfile .
-          docker inspect atom_oot_release:ci
+          docker inspect "${CI_OOT_IMAGE}"
 
       - name: Re-login to Docker Hub before OOT push
         id: login_oot
@@ -298,6 +563,23 @@ jobs:
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
           set -euo pipefail
+          # The vLLM and SGLang layers belong to the stable line only. They
+          # are owned and tagged by someone else, so a second line must not
+          # build them, and above all must not publish over their tags -- the
+          # ROCm 10 line would otherwise have replaced vllm-latest and the
+          # day's vllm-v<ver>-nightly_<date> with a ROCm 10 image.
+          if [ "${FLAVOR}" != "${LINE_STABLE}" ]; then
+            echo "${FLAVOR} is not the stable line: skipping the OOT vLLM push layer (owned by the ROCm 7 line)."
+            exit 0
+          fi
+          # Record every tag this job creates, so Clean Up can remove exactly
+          # those. The old cleanup removed by glob (nightly_*, latest*), which
+          # with two lines in one run means one job deleting the other's
+          # images -- possibly between its docker tag and its push.
+          tag_image() {
+            docker tag "$1" "$2"
+            echo "$2" >> "${RUNNER_TEMP}/pushed_tags.txt"
+          }
           VLLM_VER="${VLLM_VERSION}"
           OOT_TAG_SUFFIX="${{ inputs.oot_tag_suffix || '' }}"
           OOT_TAG="vllm-v${VLLM_VER}-nightly_$(date +%Y%m%d)"
@@ -309,10 +591,10 @@ jobs:
             fi
             OOT_TAG="${OOT_TAG}-${OOT_TAG_SUFFIX}"
           fi
-          docker tag atom_oot_release:ci rocm/atom-dev:${OOT_TAG}
+          tag_image "${CI_OOT_IMAGE}" rocm/atom-dev:${OOT_TAG}
           .github/scripts/docker_push_retry.sh rocm/atom-dev:${OOT_TAG}
           if [ -z "${OOT_TAG_SUFFIX}" ]; then
-            docker tag atom_oot_release:ci rocm/atom-dev:${OOT_LATEST_TAG}
+            tag_image "${CI_OOT_IMAGE}" rocm/atom-dev:${OOT_LATEST_TAG}
             .github/scripts/docker_push_retry.sh rocm/atom-dev:${OOT_LATEST_TAG}
           else
             echo "Custom OOT tag suffix '${OOT_TAG_SUFFIX}' provided; skipping rocm/atom-dev:${OOT_LATEST_TAG} update."
@@ -322,15 +604,24 @@ jobs:
         if: ${{ success() && steps.gates.outputs.sglang == 'true' }}
         timeout-minutes: 180
         run: |
-          SGLANG_BASE_IMAGE="atom_release:ci"
+          # The vLLM and SGLang layers belong to the stable line only. They
+          # are owned and tagged by someone else, so a second line must not
+          # build them, and above all must not publish over their tags -- the
+          # ROCm 10 line would otherwise have replaced vllm-latest and the
+          # day's vllm-v<ver>-nightly_<date> with a ROCm 10 image.
+          if [ "${FLAVOR}" != "${LINE_STABLE}" ]; then
+            echo "${FLAVOR} is not the stable line: skipping the SGLang layer (owned by the ROCm 7 line)."
+            exit 0
+          fi
+          SGLANG_BASE_IMAGE="${CI_IMAGE}"
           echo "Using SGLang+ATOM base image: ${SGLANG_BASE_IMAGE}"
-          docker build --network=host -t atom_sglang_release:ci \
+          docker build --network=host -t "${CI_SGLANG_IMAGE}" \
             --build-arg SGLANG_BASE_IMAGE="${SGLANG_BASE_IMAGE}" \
             --build-arg GPU_ARCH="${{ env.GPU_ARCH }}" \
             --build-arg SGLANG_REPO="${{ inputs.sglang_repo || env.SGLANG_REPO }}" \
             --build-arg SGLANG_REF="${{ inputs.sglang_ref || env.SGLANG_REF }}" \
             -f docker/sglang_release.dockerfile .
-          docker inspect atom_sglang_release:ci
+          docker inspect "${CI_SGLANG_IMAGE}"
 
       - name: Re-login to Docker Hub before SGLang push
         # Fresh token before this push: the SGLang build above adds even more
@@ -348,6 +639,23 @@ jobs:
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
           set -euo pipefail
+          # The vLLM and SGLang layers belong to the stable line only. They
+          # are owned and tagged by someone else, so a second line must not
+          # build them, and above all must not publish over their tags -- the
+          # ROCm 10 line would otherwise have replaced vllm-latest and the
+          # day's vllm-v<ver>-nightly_<date> with a ROCm 10 image.
+          if [ "${FLAVOR}" != "${LINE_STABLE}" ]; then
+            echo "${FLAVOR} is not the stable line: skipping the SGLang push layer (owned by the ROCm 7 line)."
+            exit 0
+          fi
+          # Record every tag this job creates, so Clean Up can remove exactly
+          # those. The old cleanup removed by glob (nightly_*, latest*), which
+          # with two lines in one run means one job deleting the other's
+          # images -- possibly between its docker tag and its push.
+          tag_image() {
+            docker tag "$1" "$2"
+            echo "$2" >> "${RUNNER_TEMP}/pushed_tags.txt"
+          }
           SGLANG_VER="${{ inputs.sglang_version || env.SGLANG_VERSION }}"
           SGLANG_TAG_SUFFIX="${{ inputs.sglang_tag_suffix || '' }}"
           SGLANG_TAG="sglang-v${SGLANG_VER}-nightly_$(date +%Y%m%d)"
@@ -359,10 +667,10 @@ jobs:
             fi
             SGLANG_TAG="${SGLANG_TAG}-${SGLANG_TAG_SUFFIX}"
           fi
-          docker tag atom_sglang_release:ci rocm/atom-dev:${SGLANG_TAG}
+          tag_image "${CI_SGLANG_IMAGE}" rocm/atom-dev:${SGLANG_TAG}
           .github/scripts/docker_push_retry.sh rocm/atom-dev:${SGLANG_TAG}
           if [ -z "${SGLANG_TAG_SUFFIX}" ]; then
-            docker tag atom_sglang_release:ci rocm/atom-dev:${SGLANG_LATEST_TAG}
+            tag_image "${CI_SGLANG_IMAGE}" rocm/atom-dev:${SGLANG_LATEST_TAG}
             .github/scripts/docker_push_retry.sh rocm/atom-dev:${SGLANG_LATEST_TAG}
           else
             echo "Custom SGLang tag suffix '${SGLANG_TAG_SUFFIX}' provided; skipping rocm/atom-dev:${SGLANG_LATEST_TAG} update."
@@ -377,16 +685,14 @@ jobs:
       - name: Clean Up
         if: always()
         run: |
-          docker stop atom_release_ci || true
-          docker rm atom_release_ci || true
-          # Remove build and tagged images to free disk space
-          docker rmi atom_release:ci || true
-          docker rmi rocm/atom-dev:latest || true
-          docker rmi atom_oot_release:ci || true
-          docker rmi atom_sglang_release:ci || true
-          # Remove nightly tagged image if it exists
-          docker images "rocm/atom-dev:nightly_*" -q | xargs -r docker rmi || true
-          docker images "rocm/atom-dev:vllm-v*-nightly_*" -q | xargs -r docker rmi || true
-          docker images "rocm/atom-dev:sglang-v*-nightly_*" -q | xargs -r docker rmi || true
-          docker rmi rocm/atom-dev:vllm-latest || true
-          docker rmi rocm/atom-dev:sglang-latest || true
+          docker stop "${CI_CONTAINER}" || true
+          docker rm "${CI_CONTAINER}" || true
+          # This job's own build images.
+          docker rmi "${CI_IMAGE}" "${CI_OOT_IMAGE}" "${CI_SGLANG_IMAGE}" || true
+          # ...and exactly the rocm/atom-dev tags this job created, rather
+          # than everything matching a glob: the other line's images are on
+          # the same daemon and may not have been pushed yet.
+          if [ -s "${RUNNER_TEMP}/pushed_tags.txt" ]; then
+            sort -u "${RUNNER_TEMP}/pushed_tags.txt" | xargs -r docker rmi || true
+            rm -f "${RUNNER_TEMP}/pushed_tags.txt"
+          fi

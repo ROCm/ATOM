@@ -574,7 +574,7 @@ def test_mp_lookup_pending_cleanup_drops_adapter_bookkeeping(monkeypatch):
     assert client.hit_tokens("req") is None
 
 
-def test_full_prompt_hit_retrieves_chunk_but_recomputes_last_token(monkeypatch):
+def _full_prompt_hit_scheduler(monkeypatch, chunk_size):
     monkeypatch.setattr(mp_connector.time, "sleep", lambda _seconds: None)
     adapter = _LookupAdapter([8])
     lookup = mp_connector._MPLookupClient(
@@ -589,10 +589,18 @@ def test_full_prompt_hit_retrieves_chunk_but_recomputes_last_token(monkeypatch):
     ChunkedOffloadSchedulerBase.__init__(
         scheduler,
         _config(),
-        chunk_size=8,
+        chunk_size=chunk_size,
         lookup_client=lookup,
     )
     scheduler._min_load_tokens = 0
+    return scheduler, lookup
+
+
+def test_full_prompt_hit_loads_to_the_chunk_boundary_below_the_last_token(monkeypatch):
+    # A full-prompt hit must leave a token to compute, and the tier resolves at
+    # chunk granularity, so the load floors to the chunk boundary below
+    # ``num_prompt - 1``: 8 tokens hit, 7 wanted, 4 loadable.
+    scheduler, lookup = _full_prompt_hit_scheduler(monkeypatch, chunk_size=4)
     seq = SimpleNamespace(
         id=7,
         num_prompt_tokens=8,
@@ -601,18 +609,36 @@ def test_full_prompt_hit_retrieves_chunk_but_recomputes_last_token(monkeypatch):
         block_table=[10, 11],
     )
 
-    assert scheduler.get_num_new_matched_tokens(seq) == (7, True)
-    assert scheduler._load_specs["7"].lmcache_cached_tokens == 7
+    assert scheduler.get_num_new_matched_tokens(seq) == (4, True)
+    assert scheduler._load_specs["7"].lmcache_cached_tokens == 4
     assert scheduler._load_specs["7"].transfer_end_tokens == 8
 
     scheduler.update_state_after_alloc(seq)
     request = scheduler.build_connector_meta().requests[0]
     assert request.token_ids == list(range(8))
-    assert request.load_spec.lmcache_cached_tokens == 7
+    assert request.load_spec.lmcache_cached_tokens == 4
     assert request.load_spec.transfer_end_tokens == 8
-    assert seq.offload_loaded_tokens == 7
+    assert seq.offload_loaded_tokens == 4
 
     assert scheduler.load_finished(request.load_operation) is True
+    assert lookup.hit_tokens("7") is None
+
+
+def test_full_prompt_hit_of_exactly_one_chunk_asks_for_no_load_at_all(monkeypatch):
+    # Same floor, but here it lands on zero: the decremented hit walks off the
+    # only chunk boundary there is. Asking for 7 of 8 tokens would name a
+    # partial chunk the tier cannot serve, and the load could never finish.
+    scheduler, lookup = _full_prompt_hit_scheduler(monkeypatch, chunk_size=8)
+    seq = SimpleNamespace(
+        id=7,
+        num_prompt_tokens=8,
+        num_cached_tokens=0,
+        token_ids=list(range(8)),
+        block_table=[10, 11],
+    )
+
+    assert scheduler.get_num_new_matched_tokens(seq) == (0, False)
+    assert "7" not in scheduler._load_specs
     assert lookup.hit_tokens("7") is None
 
 

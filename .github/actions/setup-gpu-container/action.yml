@@ -108,6 +108,14 @@ runs:
         # (e.g. benchmark + regression) don't clobber each other's file.
         ENV_FILE="/tmp/atom_${CONTAINER_NAME}_env.txt"
         printenv MODEL_ENV_VARS | grep -v '^$' > "$ENV_FILE" || true
+        if [ "${RUNNER_LABEL}" = "linux-atom-do-mi350x-8" ] || [ "${RUNNER_LABEL}" = "linux-atom-do-mi350x-8.test" ]; then
+          grep -v -E '^(NCCL_SOCKET_IFNAME|MORI_SOCKET_IFNAME)=' "$ENV_FILE" > "${ENV_FILE}.tmp" || true
+          mv "${ENV_FILE}.tmp" "$ENV_FILE"
+          {
+            echo "NCCL_SOCKET_IFNAME=lo"
+            echo "MORI_SOCKET_IFNAME=lo"
+          } >> "$ENV_FILE"
+        fi
 
         IMAGE_TAG="${RESOLVED_ATOM_BASE_IMAGE:-$ATOM_BASE_IMAGE}"
         echo "Starting container with image: $IMAGE_TAG"

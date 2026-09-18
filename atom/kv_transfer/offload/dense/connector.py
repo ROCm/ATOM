@@ -42,6 +42,7 @@ from atom.kv_transfer.offload._offload_common import (
     OffloadWorkerMixin,
     build_offload_engine,
     pp_aware_rank_and_world,
+    tokens_to_tensor,
     validated_kv_role,
 )
 from atom.kv_transfer.offload.chunked_scheduler import (
@@ -151,7 +152,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             "LMCache offload worker rank=%d: bytes_per_block=%d chunk=%d "
             "gpu_staging_chunk_bytes=%d gpu_staging_buffer_chunks=%d "
             "gpu_staging_buffer_bytes=%d release_gpu_staging=%s "
-            "save=%s load=%s",
+            "save=%s load=%s save_workers=%d load_workers=%d",
             rank,
             self._codec.bytes_per_block,
             self.chunk_size,
@@ -161,6 +162,8 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             gpu_connector.release_gpu_staging_after_transfer,
             self._do_save,
             self._do_load,
+            self.save_workers,
+            self.load_workers,
         )
 
     # -- per-step (RPC thread): only enqueue, never copy ------------------
@@ -264,7 +267,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         t_retrieve0 = time.perf_counter()
         self._reset_gpu_connector_transfer_stats()
         ret_mask = self._engine.retrieve(
-            torch.tensor(toks),
+            tokens_to_tensor(toks),
             mask=mask,
             block_ids=req.block_ids,
             req_id=str(req.req_id),
@@ -328,6 +331,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         mask = torch.ones(len(toks), dtype=torch.bool)
         mask[:skip] = False
 
+        tok_tensor = tokens_to_tensor(toks)
         t_store0 = time.perf_counter()
         self._reset_gpu_connector_transfer_stats()
         gpu_connector = self._engine.gpu_connector
@@ -339,7 +343,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         )
         with source_context:
             self._engine.store(
-                torch.tensor(toks),
+                tok_tensor,
                 mask=mask,
                 block_ids=req.block_ids,
                 req_id=str(req.req_id),

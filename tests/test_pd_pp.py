@@ -307,12 +307,100 @@ def test_mooncake_rdma_preserves_explicit_device():
     assert mc._select_ib_device("rdma", "ionic_3", None) == "ionic_3"
 
 
+def test_mooncake_rdma_normalizes_explicit_device_list():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    assert (
+        mc._select_ib_device("rdma", " ionic_4, ionic_0,ionic_4 ", None)
+        == "ionic_4,ionic_0"
+    )
+
+
 def test_mooncake_rdma_auto_selects_from_physical_gpu(monkeypatch):
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
     monkeypatch.setattr(mc, "_auto_select_ib_device", lambda idx: f"auto{idx}")
     assert mc._select_ib_device("rdma", "", 5) == "auto5"
+
+
+def test_mooncake_rdma_registers_all_alternate_hcas_for_upper_rail_gpu(monkeypatch):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.setattr(mc, "_auto_select_ib_device", lambda idx: f"ionic_{idx}")
+    monkeypatch.setattr(mc, "_ib_device_exists", lambda _device: True)
+
+    assert mc._select_ib_devices(
+        "rdma",
+        "",
+        4,
+        enable_alternate_hca=True,
+        hca_count=8,
+    ) == [
+        "ionic_4",
+        *(f"ionic_{idx}" for idx in range(4)),
+        *(f"ionic_{idx}" for idx in range(5, 8)),
+    ]
+
+
+def test_mooncake_rdma_registers_all_alternate_hcas_for_lower_rail_gpu(monkeypatch):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.setattr(mc, "_auto_select_ib_device", lambda idx: f"ionic_{idx}")
+    monkeypatch.setattr(mc, "_ib_device_exists", lambda _device: True)
+
+    assert mc._select_ib_devices(
+        "rdma",
+        "",
+        3,
+        enable_alternate_hca=True,
+        hca_count=8,
+    ) == [
+        "ionic_3",
+        "ionic_0",
+        "ionic_1",
+        "ionic_2",
+        *(f"ionic_{idx}" for idx in range(4, 8)),
+    ]
+
+
+def test_mooncake_rdma_skips_missing_alternate_hcas(monkeypatch):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.setattr(mc, "_auto_select_ib_device", lambda idx: f"ionic_{idx}")
+    monkeypatch.setattr(
+        mc,
+        "_ib_device_exists",
+        lambda device: device in {"ionic_3", "ionic_0", "ionic_7"},
+    )
+
+    assert mc._select_ib_devices(
+        "rdma",
+        "",
+        3,
+        enable_alternate_hca=True,
+        hca_count=8,
+    ) == ["ionic_3", "ionic_0", "ionic_7"]
+
+
+def test_mooncake_rdma_rejects_nonpositive_hca_count(monkeypatch):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.setattr(mc, "_auto_select_ib_device", lambda idx: f"ionic_{idx}")
+
+    with pytest.raises(ValueError, match="ib_hca_count"):
+        mc._select_ib_devices(
+            "rdma",
+            "",
+            4,
+            enable_alternate_hca=True,
+            hca_count=0,
+        )
 
 
 def test_mooncake_rdma_requires_gpu_index_without_explicit_device():
@@ -488,6 +576,8 @@ def _make_connector(**overrides):
     )
     conn = object.__new__(mc.MooncakeConnector)
     conn._completion_lock = threading.Lock()
+    conn._dispatch_in_flight = set()
+    conn._deferred_failures = {}
     conn._fence_lock = threading.Lock()
     conn._pending_recv_expected = {}
     conn._pending_recv_stages = {}
@@ -497,6 +587,7 @@ def _make_connector(**overrides):
     conn._pending_recv_slots = {}
     conn._blocks_pending_fence = []
     conn.done_recving = set()
+    conn.failed_recving = set()
     conn._scatter_slot = None
     conn._release_targets = {}
     for k, v in overrides.items():
@@ -545,6 +636,40 @@ def test_write_done_nonce_cleaned_up_on_completion():
     conn._pending_recv_nonce["r1"] = 777
     conn._record_write_done("r1", 0, 0, 777)
     assert "r1" not in conn._pending_recv_nonce
+
+
+def test_failed_write_done_returns_the_staging_row_to_the_pool():
+    """A rejected transfer must not leak the staging row it reserved.
+
+    The consumer reserves a row before asking the producer to write. When the
+    producer reports failure the bytes never landed, so the scatter is skipped
+    on purpose -- but the row still has to go back, or _acquire_staging_slot()
+    blocks forever once repeated failures drain the pool.
+    """
+    scattered = []
+    conn = _make_connector(
+        _staging_lock=threading.Lock(),
+        _staging_free=[],
+        _scatter_slot=lambda *args: scattered.append(args),
+    )
+    conn._pending_recv_expected["r1"] = 1
+    conn._pending_recv_slots["r1"] = (7, 3)
+
+    assert conn._record_write_done("r1", 0, 0, 0, success=False)
+
+    assert conn._staging_free == [3], "staging row was not returned to the pool"
+    assert not scattered, "a failed transfer must not scatter its staging row"
+    assert "r1" not in conn._pending_recv_slots
+    assert "r1" in conn.failed_recving
+
+
+def test_failed_write_done_without_a_staging_row_is_a_noop():
+    """Block-only transfers reserve no row; the failure path must not crash."""
+    conn = _make_connector(_staging_lock=threading.Lock(), _staging_free=[])
+    conn._pending_recv_expected["r1"] = 1
+    assert conn._record_write_done("r1", 0, 0, 0, success=False)
+    assert conn._staging_free == []
+    assert "r1" in conn.failed_recving
 
 
 def test_write_done_pp_only_dedup():

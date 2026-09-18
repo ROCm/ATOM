@@ -112,6 +112,10 @@ on:
         description: "ATOM commit SHA to checkout; leave empty to use the workflow ref"
         type: string
         default: ""
+      aiter_commit:
+        description: "ROCm/aiter commit SHA, tag, or branch to reinstall before benchmarking; leave empty to keep the image version"
+        type: string
+        default: ""
 
 permissions:
   actions: read
@@ -184,6 +188,7 @@ jobs:
       enable_rtl: ${{ inputs.enable_rtl || false }}
       extra_args: ${{ inputs.extra_args || '' }}
       atom_commit: ${{ inputs.atom_commit || '' }}
+      aiter_commit: ${{ inputs.aiter_commit || '' }}
 
   summarize-benchmark-result:
     concurrency:
@@ -440,6 +445,13 @@ jobs:
           env-vars: ${{ matrix.cell.env_vars }}
           hf-token: ${{ secrets.AMD_HF_TOKEN }}
           download-required: "false"
+
+      - name: Reinstall AITER from requested ref
+        if: ${{ inputs.aiter_commit != '' }}
+        env:
+          CONTAINER_NAME: atom-regression
+          AITER_GIT_REF: ${{ inputs.aiter_commit }}
+        run: bash .github/scripts/install_aiter_from_ref.sh
 
       - name: Launch server
         env:

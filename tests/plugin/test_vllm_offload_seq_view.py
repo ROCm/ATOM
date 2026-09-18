@@ -129,9 +129,15 @@ def test_view_accepts_the_frozen_placement_the_chunked_scheduler_writes():
     scheduler = SimpleNamespace(
         _load_lifecycles={},
         _active_load_operations={},
+        _load_failed_seqs={},
         _save_tracker={"r1": [view, 0]},
         _early_release=True,
         should_defer_free=lambda seq: False,
+    )
+    # Bind the real helper rather than stubbing it: it takes the seq, so a stub
+    # would hide exactly the kind of attribute access this test exists to catch.
+    scheduler._release_failed_load_attempt = (
+        ChunkedOffloadSchedulerBase._release_failed_load_attempt.__get__(scheduler)
     )
 
     ChunkedOffloadSchedulerBase.request_finished(scheduler, view)
