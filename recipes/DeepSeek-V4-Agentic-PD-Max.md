@@ -89,9 +89,8 @@ python3 -u -m atom.entrypoints.openai_server \
   --host 0.0.0.0 --server-port $PORT \
   --tensor-parallel-size 8 \
   --kv-cache-dtype fp8 --index-cache-dtype fp4 \
-  --enable-prefix-caching --block-size 16 \
-  --gpu-memory-utilization 0.70 \
-  --max-num-seqs 256 \
+  --enable-prefix-caching \
+  --max-num-seqs $(( CONC * 2 )) \
   --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
   --state-checkpoint-interval-tokens 8192 \
   --level 3 --cudagraph-mode FULL \
@@ -102,7 +101,8 @@ python3 -u -m atom.entrypoints.openai_server \
 
 Set `MODEL_PATH` to your 0813 checkpoint directory or model repository ID.
 `TOKENIZER_PATH` defaults to the same checkpoint; override it only if the
-matching tokenizer is stored separately. TP uses memory fraction 0.70 on both nodes and TBO is off.
+matching tokenizer is stored separately. Set `CONC` to the target request concurrency
+(1–32) before starting the servers. TBO is off on both nodes.
 `$PORT` is 8010 on prefill, 8020 on decode. `$KV_TRANSFER` is the plain
 Mooncake pair:
 
