@@ -36,6 +36,40 @@ run_slurm_query() {
   fi
 }
 
+slurm_node_selection_args() {
+  local candidates="$1" count="$2" all_nodes excluded
+  local -a candidate_nodes
+  SLURM_NODE_SELECTION_ARGS=()
+  [[ -n "${candidates}" ]] || return 0
+  IFS=',' read -r -a candidate_nodes <<< "${candidates}"
+  if [[ "${USES_SPUR_CONTROLLER}" == "1" || "${#candidate_nodes[@]}" -le "${count}" ]]; then
+    SLURM_NODE_SELECTION_ARGS=(-w "${candidates}")
+    return 0
+  fi
+  # Native Slurm requires every host in -w. Exclude the complement
+  # instead, so the scheduler can choose only the requested number of nodes.
+  if ! all_nodes="$(run_slurm_query sinfo -N -h -o '%N')" || [[ -z "${all_nodes}" ]]; then
+    echo "ERROR: Cannot query cluster nodes to restrict the candidate pool." >&2
+    return 1
+  fi
+  excluded="$(python3 - "${candidates}" "${count}" "${all_nodes}" <<'PY'
+import sys
+
+candidates = set(sys.argv[1].split(","))
+cluster = set(sys.argv[3].split())
+missing = candidates - cluster
+if missing:
+    raise SystemExit("Unknown candidate nodes: " + ",".join(sorted(missing)))
+if len(candidates) < int(sys.argv[2]):
+    raise SystemExit("Not enough distinct candidate nodes")
+print(",".join(sorted(cluster - candidates)))
+PY
+  )" || return 1
+  if [[ -n "${excluded}" ]]; then
+    SLURM_NODE_SELECTION_ARGS=(--exclude "${excluded}")
+  fi
+}
+
 slurm_state_is_terminal() {
   case "${1%%+*}" in
     COMPLETE|COMPLETED|FAILED|CANCELLED|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL|PREEMPTED|BOOT_FAIL|DEADLINE)

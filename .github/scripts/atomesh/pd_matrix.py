@@ -264,6 +264,11 @@ def build_cell(
         "atomesh-cicd-mi355-crusoe",
     }
     requires_explicit_candidate_nodes = slurm_submit_runner == "atomesh-cicd-mi350"
+    node_pool = (
+        resolve_nodes(os.environ.get("ATOMESH_NODE_POOL", ""))
+        if slurm_submit_runner == "atomesh-cicd"
+        else []
+    )
 
     single_node_override = os.environ.get("ATOMESH_SINGLE_NODE", "").strip()
     if single_node_pd and single_node_override not in ("", "auto"):
@@ -274,7 +279,20 @@ def build_cell(
         nodes = resolve_nodes(suite_cfg.get("nodes"))
         if slurm_submit_runner == "atomesh-cicd-mi355-crusoe":
             nodes = []
-    if allow_auto_nodes and requires_explicit_candidate_nodes:
+    if node_pool:
+        outside_pool = set(nodes) - set(node_pool)
+        if outside_pool:
+            raise ValueError(
+                "Nodes outside the atomesh-cicd candidate pool: "
+                + ",".join(sorted(outside_pool))
+            )
+        nodes = list(dict.fromkeys(nodes or node_pool))
+        if len(nodes) < required_nodes:
+            raise ValueError(
+                f"{suite_cfg.get('name', model_name)} needs at least "
+                f"{required_nodes} node(s)"
+            )
+    elif allow_auto_nodes and requires_explicit_candidate_nodes:
         if not nodes:
             raise ValueError(
                 f"{suite_cfg.get('name', model_name)} needs a non-empty "
@@ -309,7 +327,9 @@ def build_cell(
             f"{required_nodes} node(s)"
         )
     num_nodes = (
-        required_nodes if not nodes or requires_explicit_candidate_nodes else len(nodes)
+        required_nodes
+        if not nodes or requires_explicit_candidate_nodes or node_pool
+        else len(nodes)
     )
 
     server_args = deep_merge(

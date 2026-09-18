@@ -401,7 +401,7 @@ if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
 #SBATCH --chdir=/tmp
 EOF
   if [[ -n "${NODE_LIST}" ]]; then
-    printf '#SBATCH --nodelist=%s\n' "${NODE_LIST}" >> "${SUBMIT_SCRIPT}"
+    printf '#SBATCH -w %s\n' "${NODE_LIST}" >> "${SUBMIT_SCRIPT}"
   fi
   cat >> "${SUBMIT_SCRIPT}" <<EOF
 #SBATCH --output=${SLURM_OUTPUT}
@@ -442,7 +442,8 @@ else
     --time "${SLURM_TIME_LIMIT}"
   )
   if [[ -n "${NODE_LIST}" ]]; then
-    SBATCH_CMD+=(--nodelist "${NODE_LIST}")
+    slurm_node_selection_args "${NODE_LIST}" "${NUM_NODES}"
+    SBATCH_CMD+=("${SLURM_NODE_SELECTION_ARGS[@]}")
   fi
   SBATCH_CMD+=(
     --output "${SLURM_OUTPUT}"

@@ -24,8 +24,12 @@ class NodeSelectionTest(unittest.TestCase):
         prefill_workers=1,
         decode_workers=1,
         single_node="auto",
+        node_pool="",
     ):
-        with patch.dict(os.environ, {"ATOMESH_SINGLE_NODE": single_node}):
+        with patch.dict(
+            os.environ,
+            {"ATOMESH_SINGLE_NODE": single_node, "ATOMESH_NODE_POOL": node_pool},
+        ):
             return pd_matrix.build_cell(
                 cfg={
                     "defaults": {"runner": {"slurm_submit_runner": runner}},
@@ -81,6 +85,49 @@ class NodeSelectionTest(unittest.TestCase):
     def test_tw_insufficient_explicit_nodes_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "needs at least 2 node"):
             self.build_cell(nodes="mia1-p02-g42")
+
+    def test_configured_pool_preserves_candidates_and_required_count(self):
+        pool = "pit2-p03-g01,pit2-p03-g03,pit2-p03-g07,pit2-p03-g42"
+        for layout, prefill, decode, expected in (
+            ("single_node", 1, 1, 1),
+            ("multi_node", 1, 1, 2),
+            ("multi_node", 2, 1, 3),
+            ("prefill_single_node", 2, 1, 2),
+            ("decode_single_node", 1, 2, 2),
+        ):
+            with self.subTest(layout=layout, prefill=prefill, decode=decode):
+                cell = self.build_cell(
+                    node_pool=pool,
+                    layout=layout,
+                    prefill_workers=prefill,
+                    decode_workers=decode,
+                )
+                self.assertEqual(cell["nodes"], pool.split(","))
+                self.assertEqual(cell["num_nodes"], expected)
+
+    def test_configured_pool_validates_explicit_selection(self):
+        pool = "pit2-p03-g01,pit2-p03-g03,pit2-p03-g07"
+        cell = self.build_cell(node_pool=pool, nodes="pit2-p03-g03,pit2-p03-g07")
+        self.assertEqual(cell["nodes"], ["pit2-p03-g03", "pit2-p03-g07"])
+        cell = self.build_cell(
+            node_pool=pool, layout="single_node", single_node="pit2-p03-g07"
+        )
+        self.assertEqual(cell["nodes"], ["pit2-p03-g07"])
+        for nodes in ("pit2-p03-g01,pit2-p03-g44", "pit2-p03-g01,pit2-p03-g01"):
+            with self.subTest(nodes=nodes), self.assertRaises(ValueError):
+                self.build_cell(node_pool=pool, nodes=nodes)
+
+    def test_configured_pool_does_not_affect_other_runners(self):
+        for runner in ("atomesh-cicd-mi350", "atomesh-cicd-mi355-crusoe"):
+            with self.subTest(runner=runner):
+                cell = self.build_cell(
+                    runner=runner, nodes="n1,n2,n3", node_pool="tw1,tw2"
+                )
+                expected = (
+                    ["n1", "n2", "n3"] if runner == "atomesh-cicd-mi350" else []
+                )
+                self.assertEqual(cell["nodes"], expected)
+                self.assertEqual(cell["num_nodes"], 2)
 
     def test_spur_requires_candidates_and_allocates_required_count(self):
         with self.assertRaisesRegex(ValueError, "non-empty Spur nodelist"):

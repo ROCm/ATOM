@@ -387,5 +387,50 @@ class SlurmMonitoringTest(unittest.TestCase):
         self.assertIn("scontrol query failed", result.stderr)
 
 
+class SlurmNodeSelectionTest(unittest.TestCase):
+    def select(self, candidates, count, *, spur=False, query_status=0):
+        return subprocess.run(
+            [
+                "bash",
+                "-c",
+                'set -euo pipefail\nsource "$HELPERS"\n'
+                'run_slurm_query() { printf "n1\\nn2\\nn3\\nn4\\nn4\\n"; '
+                'return "$QUERY_STATUS"; }\n'
+                'slurm_node_selection_args "$CANDIDATES" "$COUNT"\n'
+                'printf "%s\\n" "${SLURM_NODE_SELECTION_ARGS[@]}"',
+            ],
+            env={
+                **os.environ,
+                "HELPERS": str(HELPERS),
+                "CANDIDATES": candidates,
+                "COUNT": str(count),
+                "USES_SPUR_CONTROLLER": str(int(spur)),
+                "QUERY_STATUS": str(query_status),
+            },
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    def test_native_pool_excludes_other_nodes(self):
+        result = self.select("n1,n2,n3", 2)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.split(), ["--exclude", "n4"])
+
+    def test_exact_nodes_and_spur_pool_use_nodelist(self):
+        for candidates, count, spur in (("n1,n2", 2, False), ("n1,n2,n3", 2, True)):
+            with self.subTest(spur=spur):
+                result = self.select(candidates, count, spur=spur)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.split(), ["-w", candidates])
+
+    def test_native_pool_fails_closed(self):
+        for candidates, status in (("n1,n2,unknown", 0), ("n1,n2,n3", 1)):
+            with self.subTest(candidates=candidates, status=status):
+                result = self.select(candidates, 2, query_status=status)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+
+
 if __name__ == "__main__":
     unittest.main()
