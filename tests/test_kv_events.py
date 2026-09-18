@@ -304,6 +304,27 @@ class TestBlockManagerHooks:
         assert events[0].medium == MEDIUM_REMOTE
         assert events[0].block_hashes == [42, 43]
 
+    def test_publish_loaded_prefix_offset_after_cached_prefix(self, seq_factory):
+        # Blocks 0-1 hashed by the prefill path, blocks 2-3 restored by the
+        # offload loader: one BlockStored per loaded block, positioned at
+        # tokens 8 and 12, the first chained off block 1's hash.
+        bm = _bm_with_events()
+        seq = seq_factory(list(range(16)))
+        bm.allocate(seq)
+        bm.hash_blocks(seq, 8)
+        local = [e for e in bm.take_events() if isinstance(e, BlockStored)]
+        assert len(local) == 1 and local[0].token_offset == 0
+
+        assert bm.publish_loaded_prefix(seq, start_token=8, end_token=16) == 8
+
+        loaded = [e for e in bm.take_events() if isinstance(e, BlockStored)]
+        assert [e.token_offset for e in loaded] == [8, 12]
+        assert all(e.block_size == 4 for e in loaded)
+        assert loaded[0].parent_block_hash == local[0].block_hashes[-1]
+        assert loaded[1].parent_block_hash == loaded[0].block_hashes[0]
+        assert loaded[0].token_ids == list(range(8, 12))
+        assert loaded[1].token_ids == list(range(12, 16))
+
     def test_record_remote_store_carries_token_offset(self, seq_factory):
         bm = _bm_with_events()
         bm.record_remote_store(
@@ -358,6 +379,26 @@ class TestDCPBlockStoredGranularity:
         event = self._only_stored_event(bm)
         self._assert_hash_block_aligned(event, expected_hashes=1)
         assert event.token_ids == list(range(8))
+
+    def test_publish_loaded_prefix_offset_after_cached_prefix_dcp(
+        self, seq_factory, monkeypatch
+    ):
+        # Block-table entry 0 was hashed locally (8 tokens at hbs=8); the
+        # offload load fills entry 1. Its event must start at token 8, in
+        # hash-block units, and chain off the locally hashed block.
+        bm = _dcp_bm_with_events(monkeypatch)
+        seq = seq_factory(list(range(16)))
+        bm.allocate(seq)
+        bm.hash_blocks(seq, 8)
+        local = self._only_stored_event(bm)
+
+        assert bm.publish_loaded_prefix(seq, start_token=8, end_token=16) == 8
+
+        event = self._only_stored_event(bm)
+        self._assert_hash_block_aligned(event, expected_hashes=1)
+        assert event.token_offset == 8
+        assert event.parent_block_hash == local.block_hashes[-1]
+        assert event.token_ids == list(range(8, 16))
 
     def test_record_remote_store_reports_hash_block_size(self, monkeypatch):
         bm = _dcp_bm_with_events(monkeypatch)
@@ -871,6 +912,45 @@ class TestReplayEndpointWiring:
             dealer.close(linger=0)
             assert data == []
             assert got_terminal
+        finally:
+            pub.shutdown()
+
+    def test_malformed_replay_request_is_rejected(self):
+        # start_seq must be exactly 8 bytes: b"" would parse as 0 and trigger
+        # a full replay, so short/long frames are dropped and only the
+        # well-formed request that follows is answered.
+        zmq = pytest.importorskip("zmq")
+        pub = ZmqEventPublisher(
+            endpoint="inproc://test-kv-replay-malformed-pub",
+            replay_endpoint="inproc://test-kv-replay-malformed-router",
+            buffer_steps=64,
+        )
+        ctx = zmq.Context.instance()
+        try:
+            for i in range(3):
+                pub.publish([BlockRemoved(block_hashes=[i])])
+            polls = 200
+            while pub.stats["sent"] < 3 and polls > 0:
+                time.sleep(0.02)
+                polls -= 1
+            dealer = ctx.socket(zmq.DEALER)
+            dealer.connect("inproc://test-kv-replay-malformed-router")
+            dealer.send(b"")  # empty start_seq
+            dealer.send(b"\x00" * 3)  # too short
+            dealer.send(b"\x00" * 9)  # too long
+            dealer.send((1).to_bytes(8, "big"))  # the only valid one
+            got: list[int] = []
+            dones = 0
+            while dealer.poll(timeout=500):
+                seq_bytes, _ = dealer.recv_multipart()
+                if seq_bytes == REPLAY_DONE:
+                    dones += 1
+                else:
+                    got.append(int.from_bytes(seq_bytes, "big"))
+            dealer.close(linger=0)
+            assert got == [1, 2]
+            assert dones == 1
+            assert pub.stats["replayed"] == 2
         finally:
             pub.shutdown()
 

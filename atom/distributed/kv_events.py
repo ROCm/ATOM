@@ -427,14 +427,14 @@ class ZmqEventPublisher(EventPublisher):
         replay. Request frame is `[client_id, (delim,) start_seq]`; the routing
         prefix is echoed back on every reply frame."""
         frames = self._replay.recv_multipart()
-        if len(frames) < 2:
+        # The wire contract is exactly one 8-byte big-endian start_seq after
+        # the routing prefix. int.from_bytes would happily read b"" as 0 and
+        # a longer frame as a huge value, so a garbled request could trigger a
+        # full replay; reject anything but the exact width.
+        if len(frames) < 2 or len(frames[-1]) != 8:
             logger.warning("KV event replay: malformed request %r", frames)
             return
-        try:
-            start_seq = int.from_bytes(frames[-1], "big")
-        except (TypeError, ValueError):
-            logger.warning("KV event replay: bad start_seq %r", frames[-1])
-            return
+        start_seq = int.from_bytes(frames[-1], "big")
         self._pending_replay = (frames[:-1], start_seq)
 
     def _advance_replay(self) -> None:
