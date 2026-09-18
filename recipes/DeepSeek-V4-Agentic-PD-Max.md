@@ -508,5 +508,6 @@ Both are properties of that cluster, not of PD or DeepSeek-V4.
   single node, no disaggregation. Start there.
 - [`DeepSeek-V4-Agentic-Benchmark.md`](DeepSeek-V4-Agentic-Benchmark.md) —
   cross-engine head-to-head.
-- [`MiniMax-M3-Cache-Policies.md`](MiniMax-M3-Cache-Policies.md) — the offload
-  tier's cache-policy knobs on a different model.
+- [`MiniMax-M3-Agentic-InferenceX.md`](MiniMax-M3-Agentic-InferenceX.md) — the
+  offload tier's cache-policy knobs on a different model, under
+  [Cache policies](MiniMax-M3-Agentic-InferenceX.md#cache-policies).
