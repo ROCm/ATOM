@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 # from flash_attn import flash_attn_with_kvcache
+import logging
 from abc import ABC, abstractmethod
 
 import torch
@@ -14,6 +15,8 @@ from atom.utils import envs, mark_spliting_op
 from atom.utils.selector import Family, get_attn_backend
 
 from .attention_mla import MLAModules, _mla_output_width
+
+logger = logging.getLogger("atom")
 
 
 # frontend interface class for constructing attention
@@ -57,8 +60,9 @@ PA_ASM_MAX_QUERY_GROUP_SIZE = 16
 # reference at 64 than at 8; and 64 is where the C++ PS reduce stops being built
 # at all, with no working fallback under it (see the test that pins this).
 PA_DENSE_SPLIT_TARGET_WG = 128
-# Overridable so the cap can be A/B'd against the shipping value without a
-# second ATOM tree. 32 remains the default and the shipping value: on
+# Overridable only to A/B the cap against aiter's FlyDSL decode (PR #4332),
+# which has both the fixed PS reduce and a kernel that keeps improving past 32
+# where gluon flattens. 32 remains the default and the shipping value: on
 # production aiter neither half of the bound above has moved.
 PA_DENSE_SPLIT_MAX = envs.ATOM_PA_DENSE_SPLIT_MAX
 
@@ -144,6 +148,148 @@ def run_pa_fwd_asm(
     )
 
 
+_FLYDSL_PA_MAX_PARTITIONS = 256
+_FLYDSL_PA_TILE = 256
+_flydsl_pa_routed: set[tuple] = set()
+
+
+def _flydsl_pa_decode_num_seqs(
+    *,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    context_lens: torch.Tensor,
+    max_seqlen_q: int,
+    max_context_partition_num: int,
+    context_partition_size: int,
+    compute_type: torch.dtype,
+    q_scale: torch.Tensor | None,
+    alibi_slopes: torch.Tensor | None,
+    sinks: torch.Tensor | None,
+    sliding_window: int,
+    ps: bool,
+) -> int | None:
+    """Sequence count to run aiter's FlyDSL paged decode with, or None for gluon.
+
+    Mirrors the kernel's own validation so an unsupported call falls to gluon
+    instead of raising from inside aiter. Every clause here is a hard reject
+    there, not a preference.
+
+    The returned count is the point of the function. FlyDSL indexes ``query``
+    as ``[num_seqs, query_length, ...]`` and demands ``q.shape[0] ==
+    context_lens.shape[0] * query_length`` exactly, while ATOM pads its two
+    axes independently: ``context_lens`` is built to ``running_bs`` (the
+    sequence axis, padded for graph identity) with ``[scheduled_bs:running_bs]``
+    zeroed, and ``q`` to ``running_tokens`` (the row axis, padded for MoE).
+    ``forward_context.Context`` says so outright -- "the ratio is not always
+    max_seqlen_q". So the two disagree by a padding slot on a perfectly
+    ordinary step, which is what raised
+
+        ValueError: query.shape[0] (12) must equal
+                    context_lengths.shape[0] * query_length (4 * 4)
+
+    gluon absorbs this: it derives its own batch as ``q.shape[0] //
+    query_length`` and the surplus rows, holding ``context_lens == 0``, do no
+    work. Recovering that count here and slicing the per-sequence arguments to
+    it hands FlyDSL the same rectangle, dropping exactly the zeroed tail.
+
+    Deliberately NOT restricted to ``max_seqlen_q == 1``. The dense path is
+    where FlyDSL's headroom over gluon lives (it splits past the 32 gluon's PS
+    reduce caps at), it runs ``max_seqlen_q == num_spec + 1``, and FlyDSL tunes
+    that shape specifically -- it has a query_length==4 MTP4 grid split. Only
+    the sparse path is naturally ``max_seqlen_q == 1``, having already given
+    every query token its own row, table and causal length.
+
+    The cache-layout clause is structural too: the page-16 SHUFFLE cache is
+    ``[nb, Hkv, head_dim // x, 16, x]`` with ``x = 16 // element_size``, which
+    equals FlyDSL's required ``[nb, Hkv, head_dim // 16, block_size, 16]``
+    exactly when the cache is 1 byte per element. A bf16 cache gives x == 8 and
+    is rejected -- as is its bf16 ``compute_type``.
+    """
+    import aiter
+
+    if alibi_slopes is not None or sinks is not None or q_scale is not None:
+        return None
+    if sliding_window > 0 or not ps:
+        return None
+    if compute_type is not aiter.dtypes.fp8 or k_cache.dtype is not aiter.dtypes.fp8:
+        return None
+    if k_cache.dim() != 5 or k_cache.shape[-1] != 16:
+        return None
+    if context_partition_size != _FLYDSL_PA_TILE:
+        return None
+    if not 1 <= max_context_partition_num <= _FLYDSL_PA_MAX_PARTITIONS:
+        return None
+    head_dim = q.shape[-1]
+    if not (head_dim == 64 or (head_dim % 128 == 0 and head_dim <= 1024)):
+        return None
+    # The rectangle, recovered the way gluon recovers it. See the docstring.
+    if max_seqlen_q < 1:
+        return None
+    num_seqs, remainder = divmod(q.shape[0], max_seqlen_q)
+    if remainder or not 1 <= num_seqs <= context_lens.shape[0]:
+        return None
+    return num_seqs
+
+
+
+_FLYDSL_PLAN_MAX_BATCH = 4096
+_FLYDSL_PLANS: dict[tuple, object] = {}
+_FLYDSL_PLAN_SCRATCH: dict[tuple, tuple] = {}
+
+
+def _flydsl_work_plan(context_lens, num_kv_heads, max_partitions, query_length,
+                      query_group_size, head_dim, out_dtype):
+    """aiter #5546's GPU work plan plus its scratch, cached per shape.
+
+    Two things must be allocated once and then only refreshed. The plan, because
+    allocation is illegal inside graph capture and a captured graph bakes in the
+    pointers -- rebuilding it per step would leave replay reading freed memory
+    (the hazard #2227 hit with `n_valid_column_per_row`). And the scratch,
+    because a planned call does NOT use the caller's static buffers: planned
+    output is packed as [kv_heads, plan.capacity, query_rows(, D)] whereas the
+    static API wants [num_seqs, kv_heads, partitions, query_rows(, D)]. Handing
+    over the static ones raises
+
+        ValueError: max_logits shape (2, 1, 64, 64) != (1, 128, 64)
+
+    which is what this function existed in a broken form long enough to cause.
+
+    Refreshing the plan is a GPU kernel with no device-to-host readback, so it
+    is safe to capture -- that property is what makes the planner usable here.
+    """
+    from aiter.ops.flydsl.pa_decode import plan_pa_decode
+
+    key = (
+        int(context_lens.shape[0]),
+        int(num_kv_heads),
+        int(max_partitions),
+        int(query_length),
+        int(query_group_size),
+        context_lens.device.index,
+    )
+    plan = plan_pa_decode(
+        context_lens,
+        num_kv_heads,
+        max_partitions=max_partitions,
+        query_length=query_length,
+        plan=_FLYDSL_PLANS.get(key),
+    )
+    _FLYDSL_PLANS[key] = plan
+
+    scratch = _FLYDSL_PLAN_SCRATCH.get(key)
+    rows = query_length * query_group_size
+    want = (num_kv_heads, int(plan.capacity), rows)
+    if scratch is None or tuple(scratch[0].shape) != want:
+        dev = context_lens.device
+        scratch = (
+            torch.empty(want, dtype=torch.float32, device=dev),
+            torch.empty(want, dtype=torch.float32, device=dev),
+            torch.empty(*want, head_dim, dtype=out_dtype, device=dev),
+        )
+        _FLYDSL_PLAN_SCRATCH[key] = scratch
+    return plan, scratch
+
+
 def run_pa_decode_gluon(
     output: torch.Tensor,
     q: torch.Tensor,
@@ -168,7 +314,102 @@ def run_pa_decode_gluon(
     sliding_window: int = -1,
     ps: bool = True,
 ):
-    """Run the AITER paged-attention Gluon decode kernel."""
+    """Run the AITER paged-attention decode kernel.
+
+    ATOM_PA_FLYDSL=1 routes to aiter's FlyDSL implementation (aiter PR #4332)
+    instead of the gluon one where FlyDSL's domain covers the call. MEASUREMENT
+    SWITCH, not a shipping default: the two take the same arguments and compute
+    the same thing, and the env exists to A/B them without two ATOM trees.
+
+    The two are not interchangeable everywhere, and the split is structural
+    rather than incidental -- see ``_flydsl_pa_decode_num_seqs``. Callers get
+    gluon for anything outside FlyDSL's domain, so enabling the env never turns
+    a working configuration into an exception.
+    """
+    flydsl_seqs = envs.ATOM_PA_FLYDSL and _flydsl_pa_decode_num_seqs(
+        q=q,
+        k_cache=k_cache,
+        context_lens=context_lens,
+        max_seqlen_q=max_seqlen_q,
+        max_context_partition_num=max_context_partition_num,
+        context_partition_size=context_partition_size,
+        compute_type=compute_type,
+        q_scale=q_scale,
+        alibi_slopes=alibi_slopes,
+        sinks=sinks,
+        sliding_window=sliding_window,
+        ps=ps,
+    )
+    if envs.ATOM_PA_FLYDSL:
+        # Report both routes, once per shape signature. A run where the env is
+        # set but every call still lands on gluon is otherwise indistinguishable
+        # from one where FlyDSL simply did not help.
+        sig = (bool(flydsl_seqs), max_seqlen_q, q.shape[0], context_lens.shape[0])
+        if sig not in _flydsl_pa_routed:
+            _flydsl_pa_routed.add(sig)
+            logger.info(
+                "pa_decode -> %s (rows=%d max_seqlen_q=%d padded_seqs=%d "
+                "head_dim=%d %s)",
+                f"flydsl[{flydsl_seqs} seqs]" if flydsl_seqs else "gluon",
+                q.shape[0],
+                max_seqlen_q,
+                context_lens.shape[0],
+                q.shape[-1],
+                compute_type,
+            )
+
+    if flydsl_seqs:
+        from aiter.ops.flydsl.pa_decode import pa_decode as _flydsl_pa_decode
+
+        work_plan = None
+        es, ml, tmp = exp_sums, max_logits, temporary_output
+        # #5546's planner refuses batches past 4096, and M3's sparse call site
+        # folds query tokens into num_seqs (`total_q * Hkv`), which reaches
+        # 32768 on a prefill-as-decode step. Falling back to the static path
+        # keeps those steps running; letting the planner raise killed a worker
+        # ~90 s into the run while the server kept answering /metrics, so the
+        # client sat in warmup for 66 minutes waiting on a reply that could
+        # never come.
+        if envs.ATOM_PA_FLYDSL_PLAN and flydsl_seqs <= _FLYDSL_PLAN_MAX_BATCH:
+            nkv = k_cache.shape[1]
+            work_plan, (ml, es, tmp) = _flydsl_work_plan(
+                context_lens[:flydsl_seqs],
+                nkv,
+                max_context_partition_num,
+                max_seqlen_q,
+                q.shape[-2] // nkv,
+                q.shape[-1],
+                output.dtype,
+            )
+
+        # Slice off ATOM's sequence-axis padding so the rectangle FlyDSL
+        # requires holds. Views, no copy: dim 0 is the outermost axis of each.
+        n = flydsl_seqs
+        return _flydsl_pa_decode(
+            output,
+            q,
+            k_cache,
+            v_cache,
+            context_lens[:n],
+            block_tables[:n],
+            softmax_scale,
+            max_seqlen_q,
+            max_context_partition_num,
+            context_partition_size,
+            compute_type,
+            q_scale,
+            k_scale,
+            v_scale,
+            exp_sums=es if work_plan is not None else exp_sums[:n],
+            max_logits=ml if work_plan is not None else max_logits[:n],
+            temporary_output=tmp if work_plan is not None else temporary_output[:n],
+            alibi_slopes=alibi_slopes,
+            sinks=sinks,
+            # FlyDSL spells "no sliding window" as 0; ATOM's gluon path uses -1.
+            sliding_window=0,
+            ps=ps,
+            work_plan=work_plan,
+        )
 
     return torch.ops.aiter.pa_decode_gluon(
         output,

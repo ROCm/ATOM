@@ -385,9 +385,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Force Triton attention fallbacks where available. Set to 1 to bypass
     # optional ASM/OPUS fast paths during debugging.
     "ATOM_FORCE_ATTN_TRITON": lambda: (os.getenv("ATOM_FORCE_ATTN_TRITON", "0") == "1"),
+    # Route the paged decode to aiter's FlyDSL kernel (aiter PR #4332) rather
+    # than the gluon one. A measurement switch: the two take the same arguments,
+    # and this exists to A/B them without maintaining two ATOM trees.
+    "ATOM_PA_FLYDSL": lambda: (os.getenv("ATOM_PA_FLYDSL", "0") == "1"),
+    # Opt into aiter #5546's GPU work planner on the FlyDSL decode. Needs
+    # ATOM_PA_FLYDSL=1; the planner is refreshed in place each forward.
+    #
+    # Default 0 and expected to stay there for this workload. The planner
+    # rebalances partitions across a batch whose KV lengths differ widely, and
+    # bills a refresh every step for it; #5546's own table is 2.15-8.64x on
+    # "one 200003-token request among 257-token ones" but 0.76-0.94x on uniform
+    # batches, and it concludes the data "support using dynamic plans for uneven
+    # KV work, not enabling them universally". An agentic M3 trace is not uneven
+    # enough: end-to-end against the same tree with the planner off, it costs
+    # 3.86% at conc 1, 11.50% at conc 10 and 18.28% at conc 20 -- monotonically
+    # worse with batch, which is the wrong direction for a rebalancer.
+    "ATOM_PA_FLYDSL_PLAN": lambda: (
+        os.getenv("ATOM_PA_FLYDSL_PLAN", "0") == "1"
+    ),
     # Cap on dense paged-decode KV splits. 32 is the shipping value and the
-    # only one production aiter supports; raising it needs an aiter that
-    # carries PR #4332, where the C++ PS reduce is built past 64.
+    # only one production aiter supports; raising it is meaningful only
+    # alongside ATOM_PA_FLYDSL=1 on an aiter that carries PR #4332.
     # `or` not a getenv default: an exported-but-empty var would otherwise
     # raise int('') at import and take the engine down before it starts.
     "ATOM_PA_DENSE_SPLIT_MAX": lambda: int(
