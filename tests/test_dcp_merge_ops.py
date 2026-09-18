@@ -534,10 +534,6 @@ def test_reorg_kvcache_rejects_a_wrong_total():
 # actually runs.
 
 
-class _Spec:
-    """Stand-in for a speculative_config; only its non-None-ness is read."""
-
-
 # ──────────────────────────────────────────────────── project-before-merge ──
 
 
@@ -890,19 +886,18 @@ def test_interleave_size_must_be_positive():
 
 
 @pytest.mark.parametrize(
-    "dcp, spec, mxfp4, expected",
+    "dcp, mxfp4, expected",
     [
-        (8, None, False, None),  # the ordinary case: supported
-        (2, None, False, None),
-        (1, None, False, "decode_context_parallel_size <= 1 (no DCP group)"),
-        (8, _Spec(), False, "speculative decode (qlen>1 cprr path)"),
-        (8, None, True, "fp4 (mxfp4) BMM weights"),
+        (8, False, None),  # the ordinary case: supported
+        (2, False, None),
+        (1, False, "decode_context_parallel_size <= 1 (no DCP group)"),
+        (8, True, "fp4 (mxfp4) BMM weights"),
         # dcp is checked first: with no DCP group the other reasons are moot.
-        (1, _Spec(), True, "decode_context_parallel_size <= 1 (no DCP group)"),
+        (1, True, "decode_context_parallel_size <= 1 (no DCP group)"),
     ],
 )
-def test_gate_truth_table(dcp, spec, mxfp4, expected):
-    assert qrep_unsupported_reason(dcp, spec, mxfp4) == expected
+def test_gate_truth_table(dcp, mxfp4, expected):
+    assert qrep_unsupported_reason(dcp, mxfp4) == expected
 
 
 def test_gate_takes_no_interleave_input():
@@ -928,8 +923,20 @@ def test_gate_takes_no_interleave_input():
 
 def test_gate_reason_is_human_readable():
     """The reason string is logged verbatim; it should name the actual cause."""
-    reason = qrep_unsupported_reason(1, None, False)
+    reason = qrep_unsupported_reason(1, False)
     assert "decode_context_parallel_size" in reason
+
+
+def test_gate_allows_speculative_decode():
+    """QREP only changes how q_out is produced (load-time replicated q_proj vs.
+    a runtime AllGather); the cprr mask the qlen>1 MTP/eagle3/dspark verify path
+    uses keys off KV-side round-robin position, not off q_out's provenance, so
+    the two are independent. Confirmed on GLM-5.2-FP8 sparse DCP8 fp8 MTP=3
+    (gsm8k nshot=20): QREP-on 0.9469/0.9477 vs QREP-off 0.9492/0.9492, well
+    within noise. This used to be gated off out of first-cut caution, not a
+    known conflict -- regression-guard that decision here.
+    """
+    assert qrep_unsupported_reason(8, False) is None
 
 
 # ═══════════════════════════════ ColumnParallelLinear.make_row_view (GPU) ══
