@@ -79,7 +79,6 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             self.config.index_head_dim,
             self.config.engram_max_ngram_size - 1,
             packed=model_runner.config.kv_cache_dtype == "fp4",
-            index_dtype=model_runner.config.index_cache_dtype,
             speculative_tokens=num_drafts,
             # Only the ratios the built layers run: a configuration with no
             # window-only layer gets no buffer for one.
@@ -160,11 +159,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         ]
 
     def state_transfer(self):
-        # Includes the tie policy: exact prefix images must belong to the same
-        # computation even when their byte geometry happens to agree.
-        return StateTransfer.copy(
-            f"{self.geometry.layout_id}:ties={self.config.index_topk_tie_break}"
-        )
+        return StateTransfer.copy(self.geometry.layout_id)
 
     def checkpoint_image_bytes(self):
         return self.geometry.state_bytes

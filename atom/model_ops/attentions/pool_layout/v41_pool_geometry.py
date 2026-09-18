@@ -68,10 +68,6 @@ class V41PoolGeometry:
     index_dim: int
     history_size: int = 3
     packed: bool = False
-    # The index plane's own storage. Separate from `packed`, which is the main
-    # and window planes': the two are read by different kernels and only the
-    # index one has a paged scorer that dictates a format.
-    index_dtype: str = "bf16"
     speculative_tokens: int = 0
     # The distinct compression ratios this configuration's layers run, read
     # off the topology rather than enumerated, so a ratio no layer wants gets
@@ -79,7 +75,8 @@ class V41PoolGeometry:
     # indptr is the ratio's and not the layer's -- the same thing V4's three
     # `kv_indptr_{swa,csa,hca}` are, at one fixed address each.
     layer_ratios: tuple[int, ...] = ()
-    # The width a scorer emits, before a request short on history narrows it.
+    # The width the scorer emits, whatever a row can see: a row short on
+    # history is `-1` padded, not narrowed.
     index_topk: int = 0
 
     def __post_init__(self):
@@ -103,8 +100,6 @@ class V41PoolGeometry:
             raise ValueError("BF16 attention rows must align to 256 bytes")
         if len({owner for owner, _ in self.owners}) != len(self.owners):
             raise ValueError("Each global owner must be declared once")
-        if self.index_dtype not in ("bf16", "fp4", "fp8"):
-            raise ValueError(f"Unknown index cache dtype {self.index_dtype!r}")
         for owner, ratio in self.owners:
             if not 0 <= owner < self.layers or ratio not in (1, 2):
                 raise ValueError("Invalid global owner or compression ratio")
@@ -112,13 +107,8 @@ class V41PoolGeometry:
                 raise ValueError("PAGE token count must divide every compression group")
             # A block id names `MQA_LOGITS_PRESHUFFLE_ROWS` rows, so a PAGE's
             # rows have to be a whole number of them -- the ratio-2 owners are
-            # what makes that a statement about twice the PAGE. Only FP8 is
-            # held to it: the other two formats are read by a gather that takes
-            # an arbitrary row stride.
-            if (
-                self.index_dtype == "fp8"
-                and self.rows_per_page(ratio) % MQA_LOGITS_PRESHUFFLE_ROWS
-            ):
+            # what makes that a statement about twice the PAGE.
+            if self.rows_per_page(ratio) % MQA_LOGITS_PRESHUFFLE_ROWS:
                 raise ValueError(
                     f"An FP8 index plane needs whole {MQA_LOGITS_PRESHUFFLE_ROWS}-row tiles: "
                     f"ratio {ratio} gives a PAGE {self.rows_per_page(ratio)} rows, "
@@ -142,23 +132,19 @@ class V41PoolGeometry:
 
     @property
     def index_row_bytes(self):
-        """What one index row costs, which for FP8 is not what one row *is*.
+        """What one index row costs, which is not what one row *is*.
 
-        Under preshuffle a row's bytes are interleaved across its tile, so the
-        FP8 number is the block over its rows -- the same convention
+        Under preshuffle a row's bytes are interleaved across its tile, so this
+        is the block over its rows -- the same convention
         `fp8_indexer_block_fields` states, and the reason a scale sits past the
         block's data rather than beside its own row.
         """
-        if self.index_dtype == "fp8":
-            block = indexer_block_regions(
-                fp8_indexer_block_fields(
-                    MQA_LOGITS_PRESHUFFLE_ROWS, self.index_dim, torch.float8_e4m3fn
-                )
-            )[1]
-            return block // MQA_LOGITS_PRESHUFFLE_ROWS
-        if self.index_dtype == "fp4":
-            return self.index_dim // 2 + self.index_dim // 32
-        return self.index_dim * 2
+        block = indexer_block_regions(
+            fp8_indexer_block_fields(
+                MQA_LOGITS_PRESHUFFLE_ROWS, self.index_dim, torch.float8_e4m3fn
+            )
+        )[1]
+        return block // MQA_LOGITS_PRESHUFFLE_ROWS
 
     @property
     def window_row_bytes(self):
@@ -179,29 +165,15 @@ class V41PoolGeometry:
         """`(ratio, overlap)` per distinct ratio: CSA2 never overlaps."""
         return tuple(sorted({(ratio, False) for _, ratio in self.owners}))
 
-    def scores_paged(self, decode):
-        """Whether a shape's top-k comes from the plane, not from a tile.
-
-        Two conditions and neither implies the other: the plane in the format
-        the paged scorer reads, and a step whose visibility is a row prefix.
-        """
-        return self.index_dtype == "fp8" and decode
-
-    def batch_topk(self, ratio, longest, decode):
+    def batch_topk(self, ratio):
         """The selection width a batch gets at `ratio`, before a scorer runs.
 
-        The paged scorer always emits `index_topk` and pads what a row cannot
-        see; the tiled one emits `min(topk, that request's committed rows)`.
-        Host arithmetic either way, which is what lets the indptr reserve its
-        rows up front -- each row's count is closed-form in this width.
+        The scorer emits `index_topk` and pads what a row cannot see, so this
+        is a constant rather than a batch's shape -- which is what lets the
+        indptr reserve its rows up front, and keeps the scan it feeds to one
+        compiled variant.
         """
-        if not ratio:
-            return 0
-        return (
-            self.index_topk
-            if self.scores_paged(decode)
-            else min(self.index_topk, longest // ratio)
-        )
+        return self.index_topk if ratio else 0
 
     @property
     def compress_ring_slots(self):
@@ -353,11 +325,13 @@ class V41PoolGeometry:
             # bump a v1 image would read as compatible and restore into fields
             # that no longer mean what it holds.
             #
-            # The index dtype is here even though no STATE field holds an index
-            # row: this string is also the tie policy a resumed prefix is
-            # matched on, and an index plane at a different precision selects
-            # different rows, so the prefix is a different computation.
-            f"dsv41-{'packed' if self.packed else 'bf16'}-index-{self.index_dtype}"
+            # The index plane's format is here even though no STATE field holds
+            # an index row: this string is what a resumed prefix is matched on,
+            # and a plane at a different precision selects different rows, so
+            # the prefix is a different computation. It is spelled out rather
+            # than read off a field because FP8 is the only plane the scorer
+            # takes -- an image from a build that had another must not match.
+            f"dsv41-{'packed' if self.packed else 'bf16'}-index-fp8"
             f"-state-v2:layers={self.layers}:owners={self.owners}"
             f":block={self.block_size}:window={self.window_size}"
             f":dims={self.head_dim},{self.index_dim}:history={self.history_size}"

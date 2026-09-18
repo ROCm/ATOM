@@ -7,7 +7,6 @@ import pytest
 import torch
 import triton
 import triton.language as tl
-from atom.model_ops.attentions.deepseek_v41.cache import PagedIndexKeys
 from atom.model_ops.attentions.deepseek_v41.packed_rows import (
     load_mixed_rows,
     pack_rows,
@@ -29,36 +28,32 @@ def test_native_byte_accounting():
     geo = V41PoolGeometry(
         40,
         ((2, 2), (8, 2), (14, 2), (20, 1)),
-        16,
+        32,
         128,
         512,
         128,
         packed=True,
-        index_dtype="fp4",
     )
-    bf16 = replace(geo, packed=False, index_dtype="bf16")
+    bf16 = replace(geo, packed=False)
     assert (geo.main_row_bytes, geo.index_row_bytes, geo.window_row_bytes) == (
         288,
-        68,
+        132,  # 128 B of data, one fp32 scale
         528,
     )
-    # 890 B per token over both planes; the index rows are a region apart, so
-    # only the main share of them is a page field.
-    assert sum(f.bytes_per_entry for f in geo.page_fields) == 16 * 720
-    assert geo.paged_bytes == 16 * 890
+    # The index rows are a region apart, so only the main share of them is a
+    # page field. `packed` is the main and window planes' alone -- the index
+    # plane has one format, so it weighs the same on both sides here.
+    assert sum(f.bytes_per_entry for f in geo.page_fields) == 32 * 720
+    # 2.5 index rows per token -- three ratio-2 owners and one ratio-1.
+    assert geo.paged_bytes == 32 * (720 + 2.5 * 132)
     assert geo.state_fields[0].bytes_per_entry == 40 * 128 * 528
-    assert geo.page_bytes < bf16.page_bytes / 3
+    assert geo.page_bytes < bf16.page_bytes / 2
     assert geo.state_bytes < bf16.state_bytes * 0.52
     assert geo.layout_id != bf16.layout_id
-    # The two planes are independent choices, and the identity says which pair
-    # a stored prefix was computed under.
-    fp8 = replace(geo, block_size=32, index_dtype="fp8")
-    assert fp8.layout_id != replace(fp8, index_dtype="fp4").layout_id
-    assert fp8.index_row_bytes == 132  # 128 B of data, one fp32 scale
     # A ratio-2 owner halves the PAGE, so the tile bound is a statement about
     # twice it: 16 tokens leave that owner 8 rows, which no block id names.
     with pytest.raises(ValueError, match="16-row tiles"):
-        replace(geo, index_dtype="fp8")
+        replace(geo, block_size=16)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
@@ -87,24 +82,6 @@ def test_native_main_window_rows_restore_exact_qat(magnitude):
         )
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-def test_paged_index_decodes_only_requested_rows():
-    torch.manual_seed(12)
-    x = torch.randn(45, 128, device="cuda", dtype=torch.bfloat16)
-    packed = pack_rows(*quantize_fp4(x))
-    expected = quantize_fp4(x, dequantize=True)
-    # Non-contiguous PAGE stride and permuted physical blocks.
-    backing = torch.zeros((10, 2, 8, 68), device="cuda", dtype=torch.uint8)
-    pages = backing[:, 1]
-    blocks = torch.tensor([7, 2, 5, 1, 8, 3], device="cuda")
-    ids = torch.arange(45, device="cuda")
-    pages[blocks[ids // 8], ids % 8] = packed
-    keys = PagedIndexKeys(pages, blocks, 45, 128)
-    torch.testing.assert_close(keys.tile(6, 17), expected[6:17][None], rtol=0, atol=0)
-    chosen = torch.tensor([[[44, 0, 9], [10, 43, 17]]], device="cuda")
-    torch.testing.assert_close(keys.gather(chosen), expected[chosen], rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")

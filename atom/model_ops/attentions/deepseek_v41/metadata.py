@@ -5,7 +5,6 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import torch
-from atom.model_ops.attentions.deepseek_v41_state import AttentionStep
 
 from atom.model_ops.attentions.token_layout.batch_ids import build_batch_ids
 from atom.model_ops.attentions.token_layout.prefill import prefill_positions
@@ -49,7 +48,6 @@ class BatchStep:
     slots: torch.Tensor
     batch_ids: torch.Tensor
     block_tables: torch.Tensor
-    request_steps: tuple[AttentionStep, ...]
     # Tokens the requests own, against `width` rows the forward runs.
     scheduled: int = 0
     # Rows per request this forward runs -- the CUDAGraph query bucket, not
@@ -57,8 +55,6 @@ class BatchStep:
     # request is shorter still replays the bucket's graph, so every shape
     # derived from it has to be the bucket's.
     max_q_len: int = 0
-    # The batch's longest context, which sets the selection width per ratio.
-    longest: int = 0
     # Everything below is one forward's, not one layer's. `indptrs` is filled
     # by `begin_step` into fixed addresses; the rest are filled by the layer
     # that gets there first and dropped by `begin_forward`.
@@ -185,27 +181,14 @@ def prepare_batch_step(
     published = {
         name: buffers[name].copy_to_gpu(count) for name, count in required.items()
     }
-    pos = published["positions"]
-    ptr = published["cu_seqlens_q"]
-    local_steps = tuple(
-        AttentionStep(
-            span.position,
-            span.length,
-            pos[span.token_slice],
-            ptr[i : i + 2] - span.offset,
-        )
-        for i, span in enumerate(requests)
-    )
     return BatchStep(
         requests,
-        pos,
-        ptr,
+        published["positions"],
+        published["cu_seqlens_q"],
         state_slot_out[:running_bs],
         published["batch_id_per_q_token"],
         published["block_tables"],
-        local_steps,
         scheduled=scheduled_tokens,
-        longest=max((span.end for span in requests), default=0),
         max_q_len=(
             max((span.length for span in requests), default=0)
             if max_q_len is None

@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: MIT
 """Unmodified V4 BF16 kernels with V4.1's dimensions and sparse inputs."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
-from atom.model_ops.attentions.deepseek_v41_state import EagerAttentionCache
 from atom.model_ops.v4_kernels import (
     sparse_attn_v4_paged_decode,
     sparse_attn_v4_paged_prefill,
 )
-from atom.models.deepseek_v41.config import build_attention_topology
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="ROCm GPU required"
@@ -18,17 +18,40 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.mark.parametrize("length", [1, 2])
 def test_v4_bf16_counts_sink_once_for_swa_and_global(small_config, length):
+    """A row visible to both the window and the selection is attended once.
+
+    With a zero query every score is equal, so the output is the mean of the
+    attended values against one sink: 2 rows give 6*2/3 and 3 give 6*3/4. A
+    row double-counted would move it.
+    """
+    from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+    from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+
     config = small_config
     config.head_dim = 512
-    spec = build_attention_topology(config)[3]
-    cache = EagerAttentionCache(config, (spec,), 2, 32, "cuda")
-    cache.main[spec.layer_id].fill_(6)
-    step = cache.begin_step(0, length, 2)
-    step.indices[spec.topk_owner] = torch.zeros(
-        2, length, 1, device="cuda", dtype=torch.int32
+    geo = V41PoolGeometry(
+        1,
+        ((0, 1),),
+        32,
+        config.sliding_window,
+        512,
+        32,
+        layer_ratios=(1,),
+        index_topk=1,
     )
+    cache = PagedAttentionCache(geo, 8, 2, "cuda")
+    cache.pages.view("main_0").fill_(6)
+    spans = (
+        RequestSpan(1, 0, 0, length, 0, (0, 1)),
+        RequestSpan(2, 0, length, length, 1, (2, 3)),
+    )
+    step = cache.begin_step(spans)
+    spec = SimpleNamespace(layer_id=0, ratio=1, kv_owner=0, topk_owner=0)
+    # Index row 0 for every query row: the same row its window already holds.
+    step.selected[0] = torch.zeros(1, step.width, 1, device="cuda", dtype=torch.int32)
     q = torch.zeros(2 * length, 8, 512, dtype=torch.bfloat16, device="cuda")
-    kv = torch.full((2, length, 512), 6.0, dtype=torch.bfloat16, device="cuda")
+    kv = torch.full((1, 2 * length, 512), 6.0, dtype=torch.bfloat16, device="cuda")
     sink = torch.zeros(8, device="cuda")
     prefix, pptr, extend, eptr = cache.attention_indices(spec, step)
     if length == 1:

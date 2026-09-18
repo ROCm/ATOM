@@ -7,10 +7,10 @@ request scheduler and unchanged V4 BF16 attention kernels.
 
 ## Supported configuration
 
-The P10 acceptance configuration is TP4 with whole-expert EP, BF16 KV, a BF16
-or FP8 index plane, and text requests. Target execution can be eager, one
-whole-forward graph per decode step (`FULL`, which needs the FP8 plane), or
-PIECEWISE; the draft has its own graph. Packed speculative caches, multimodal
+The P10 acceptance configuration is TP4 with whole-expert EP, BF16 KV, the
+FP8 index plane and text requests. Target execution can be eager, one
+whole-forward graph per decode step (`FULL`), or PIECEWISE; the draft has
+its own graph. Packed speculative caches, multimodal
 speculation, synthetic acceptance and relaxed MTP acceptance are not admitted. Speculative output token logprobs are
 also rejected because the current output protocol cannot return them correctly.
 Non-speculative vision and packed cache support are independent. Both target
@@ -27,7 +27,7 @@ config = Config(
     tensor_parallel_size=4,
     enable_expert_parallel=True,
     kv_cache_dtype="bf16",
-    index_cache_dtype="bf16",
+    index_cache_dtype="fp8",
     max_num_seqs=4,
     max_num_batched_tokens=512,
     max_model_len=4096,
@@ -40,7 +40,7 @@ config = Config(
 
 For target graphs, set `enforce_eager=False` and
 `compilation_config=CompilationConfig(level=0,
-cudagraph_mode=CUDAGraphMode.FULL)` with `index_cache_dtype="fp8"`, which makes
+cudagraph_mode=CUDAGraphMode.FULL)`, which makes
 a decode step two replays: the draft's, keyed by request count, and the
 target's, keyed by `(batch size, query bucket)`. `PIECEWISE` remains available
 and records the dense pieces only.

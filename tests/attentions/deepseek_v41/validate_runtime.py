@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
-"""Real TP4 paged/private-cache parity and scheduler lifecycle acceptance.
+"""Real TP4 scheduler lifecycle acceptance.
 
-Parity is measured against the engine's own irreproducibility rather than
-against zero; see `compare_private_cache`.
+Every case asserts that some other route -- chunked and reordered, forked,
+replayed from a missing image, preempted -- finishes with the tokens an
+uninterrupted scheduled run produced.
 
 Run with torchrun --nproc_per_node=4 -m tests.attentions.deepseek_v41.validate_runtime.
 One full model instance per rank; PAGE allocation is capped for this test.
@@ -15,189 +16,17 @@ import time
 from collections import deque
 from pathlib import Path
 
-import numpy as np
 import torch
-from atom.examples.deepseek_v41_offline import offline_forward_context, prepare_engram
-from atom.models.deepseek_v41.model import DeepseekV41ForCausalLM
 from transformers import AutoTokenizer
 
 from atom.config import CompilationConfig, Config, CUDAGraphMode
 from atom.model_engine.model_runner import ModelRunner
-from atom.model_engine.scheduler import ScheduledBatch, Scheduler
+from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import (
     Sequence,
     SequenceStatus,
-    SequenceType,
-    new_block_table,
 )
 from atom.sampling_params import SamplingParams
-from atom.utils.forward_context import reset_forward_context
-
-
-def reference_forward(model, *args, **kwargs):
-    # Hold model arithmetic fixed: quality against P05 is a separate comparison.
-    # This oracle uses an uncaptured forward and a private BF16 cache.
-    return DeepseekV41ForCausalLM.forward(model, *args, **kwargs)
-
-
-def divergence(actual, expected):
-    """The two numbers this file judges on, for any pair of logit tensors."""
-    return {
-        "relative_l2": float(
-            (actual.float() - expected.float()).norm() / expected.float().norm()
-        ),
-        "top1_mismatches": int((actual.argmax(-1) != expected.argmax(-1)).sum()),
-    }
-
-
-def compare_private_cache(runner, tokenizer):
-    """Teacher-force identical chunks, including long SWA wraps, and ask whether
-    the paged path sits inside the spread the engine shows against itself."""
-    prompts = [
-        (
-            "english",
-            tokenizer.encode("Explain why water expands when it freezes. " * 4),
-        ),
-        (
-            "chinese",
-            tokenizer.encode(
-                "请解释为什么天空是蓝色的，并说明日落时颜色发生变化的原因。" * 4
-            ),
-        ),
-        (
-            "code",
-            tokenizer.encode(
-                "def fibonacci(n):\n    # Return the nth Fibonacci number.\n" * 4
-            ),
-        ),
-        (
-            "long",
-            (tokenizer.encode("The quick brown fox jumps over the lazy dog. ") * 64)[
-                :525
-            ],
-        ),
-    ]
-    records = []
-    prepare = runner.attn_metadata_builder.engram
-    for name, tokens in prompts:
-        # Two oracles on independently advanced caches, fed the same chunks.
-        # The second one measures what the engine cannot reproduce about
-        # itself, which is the floor the paged path is judged against.
-        private = runner.model.new_cache(1)
-        control_cache = runner.model.new_cache(1)
-        history = np.full((1, 3), -1, dtype=np.int64)
-        seq = Sequence(tokens, runner.block_size, has_per_req_cache=True)
-        seq.type, seq.status, seq.state_slot = (
-            SequenceType.PREFILL,
-            SequenceStatus.RUNNING,
-            2,
-        )
-        count = -(-len(tokens) // runner.block_size)
-        seq.block_table = new_block_table(list(range(300, 300 + 2 * count, 2))[::-1])
-        at = 0
-        lengths = iter((3, 1, 129, 7))
-        while at < len(tokens):
-            length = min(next(lengths, 128), len(tokens) - at)
-            seq.num_cached_tokens = at
-            batch = ScheduledBatch(
-                {seq.id: seq},
-                [length],
-                length,
-                total_tokens_num_prefill=length,
-                total_seqs_num=1,
-                total_seqs_num_prefill=1,
-            )
-            runner.tokenID_processor.clean()
-            input_ids, *_ = runner.prepare_model(batch)
-            with torch.inference_mode():
-                if name == "english" and at == 0:
-                    # Rows the step never declared are refused, where they used
-                    # to be computed and zeroed. A captured forward runs the
-                    # width it recorded, so a caller handing another one is
-                    # describing a different step -- and the zero-padding hid
-                    # exactly that. The guarantee is the same one: extra rows
-                    # never reach a layer.
-                    padded = torch.nn.functional.pad(input_ids, (0, 8))
-                    try:
-                        runner.model(padded, torch.zeros_like(padded))
-                    except ValueError as error:
-                        assert "width this step declared" in str(error), error
-                    else:
-                        raise AssertionError("undeclared token rows were accepted")
-                _, hidden = runner.run_model(input_ids, batch)
-            reset_forward_context()
-            values, history = prepare_engram(
-                tokens[at : at + length], at, history, prepare.mapping, prepare.host
-            )
-            # Both sides want a logit per token, which is what the offline
-            # contract says; the serving context this forward ran under would
-            # have kept one row per sequence.
-            chunk = torch.tensor(tokens[at : at + length], device=runner.device)
-            with offline_forward_context(runner.config), torch.inference_mode():
-                actual = runner.model.head.get_logits(runner.model.norm(hidden))
-                expected = reference_forward(
-                    runner.model, chunk[None], private, values, full_logits=True
-                )[0]
-                repeated = reference_forward(
-                    runner.model, chunk[None], control_cache, values, full_logits=True
-                )[0]
-            record = {
-                "case": name,
-                "position": at,
-                "length": length,
-                "max_logit_error": (actual - expected).abs().max().item(),
-                **{f"paged_{k}": v for k, v in divergence(actual, expected).items()},
-                **{
-                    f"engine_noise_{k}": v
-                    for k, v in divergence(repeated, expected).items()
-                },
-            }
-            records.append(record)
-            if runner.rank == 0:
-                print("PARITY", json.dumps(record), flush=True)
-            cursor = runner.attn_metadata_builder.cache.cursor[2].cpu().numpy()
-            np.testing.assert_array_equal(
-                cursor, np.concatenate(([at + length], history[0]))
-            )
-            at += length
-        del private, control_cache
-    runner.tokenID_processor.clean()
-    # Judged against the measured floor, not against zero: V4's fused MoE is
-    # not reproducible on TP4+EP, so the same forward twice already differs and
-    # a bit-exact comparison can never pass. An order of magnitude above that
-    # floor is still far below what this file exists to catch -- a stale
-    # window or a wrong cache row collapses decode outright, not by 10x.
-    # Judged over the whole table, because which chunks diverge is the
-    # diagnosis and aborting on chunk one throws it away.
-    over = [
-        record
-        for record in records
-        if record["paged_relative_l2"] > 10 * record["engine_noise_relative_l2"]
-    ]
-    assert not over, json.dumps(over, indent=2)
-    return records
-
-
-def offline_completion(runner, tokens, count):
-    cache = runner.model.new_cache(1)
-    prepare = runner.attn_metadata_builder.engram
-    history = np.full((1, 3), -1, dtype=np.int64)
-    output = []
-    with offline_forward_context(runner.config):
-        for _ in range(count):
-            values, history = prepare_engram(
-                tokens, cache.position, history, prepare.mapping, prepare.host
-            )
-            logits = reference_forward(
-                runner.model,
-                torch.tensor([tokens], device=runner.device),
-                cache,
-                values,
-            )
-            token = int(logits.argmax(-1).item())
-            output.append(token)
-            tokens = [token]
-    return output
 
 
 def scheduler_cases(runner, tokenizer):
@@ -272,7 +101,12 @@ def scheduler_cases(runner, tokenizer):
     other = (
         tokenizer.encode("A Python function can return a list of prime numbers. ") * 10
     )[:81]
-    gold = [offline_completion(runner, tokens, 4) for tokens in (base, other)]
+    # An uninterrupted scheduled run, which is what every case below claims to
+    # reproduce. Previously an offline oracle, which stopped matching the
+    # engine past ~600 tokens and so capped how long these prompts could be.
+    baseline = [sequence(base), sequence(other)]
+    run("baseline", baseline)
+    gold = [list(seq.token_ids)[seq.num_prompt_tokens :] for seq in baseline]
     controls = [sequence(base), sequence(other)]
     run("chunked_batched_reorder", controls, reorder=True)
     for seq, expected in zip(controls, gold):
@@ -286,12 +120,8 @@ def scheduler_cases(runner, tokenizer):
     # interval is a whole PAGE: 256 tokens since P3 made that the block size,
     # against the 96 above. So this asserts under its own precondition rather
     # than unconditionally, and comes back on its own if the prompt grows.
-    #
-    # Lengthening it here was tried and reverted: at 600 tokens the offline
-    # oracle no longer reproduces the engine token for token -- in eager as
-    # well as under a graph -- so every token-exact case above would have been
-    # measuring that instead. The restore path is therefore NOT covered in
-    # this file at a 256-token PAGE, and nothing else here covers it either.
+    # The restore path is therefore NOT covered in this file at a 256-token
+    # PAGE, and nothing else here covers it either.
     if len(base) > runner.config.state_checkpoint_interval_tokens:
         assert sum(event["restores"] for event in fork_events) >= 2
     # KV-only hits must rewind if no matching state image remains.
@@ -301,8 +131,10 @@ def scheduler_cases(runner, tokenizer):
     assert replay[0]["cached"] == [0]
     assert list(fallback.token_ids)[fallback.num_prompt_tokens :] == gold[0]
     unique = tokenizer.encode("Discuss a different topic: binary search. ") + base
+    uninterrupted = sequence(unique)
+    run("preempt_baseline", [uninterrupted])
+    expected = list(uninterrupted.token_ids)[uninterrupted.num_prompt_tokens :]
     preempted = sequence(unique)
-    expected = offline_completion(runner, unique, 4)
     resumed = run("preempt_resume", [preempted], preempt=True)
     # Resuming a preempted request restores a checkpoint too, so it carries
     # the same precondition as the fork case above -- and, either way, that
@@ -325,23 +157,14 @@ def main():
     parser.add_argument("--model", default="/mnt/DeepSeek-V4.1-Flash")
     parser.add_argument("--output", required=True)
     parser.add_argument("--cache-dtype", choices=("bf16", "fp4"), default="bf16")
-    parser.add_argument(
-        "--index-dtype",
-        choices=("bf16", "fp8", "fp4"),
-        help="Index plane format. Defaults to --cache-dtype, except under "
-        "--graph, which needs the paged scorer and so the FP8 plane. Separate "
-        "from the graph so the two can be varied one at a time.",
-    )
     parser.add_argument("--graph", action="store_true")
     args = parser.parse_args()
     rank, size = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     port = int(os.environ["MASTER_PORT"])
     capture_sizes = [1, 2, 4]
-    # A whole-forward decode capture reads its top-k out of the FP8 plane; the
-    # tiled scorer the other formats use walks the batch on the host.
-    index_dtype = args.index_dtype or (
-        "fp8" if args.graph and args.cache_dtype == "bf16" else args.cache_dtype
-    )
+    # The index plane is FP8 whatever the main pool is: the paged scorer is
+    # the only reader and it is the format that scorer takes.
+    index_dtype = "fp8"
     config = Config(
         model=args.model,
         tensor_parallel_size=size,
@@ -393,7 +216,6 @@ def main():
             )
             del before
         tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
-        parity = compare_private_cache(runner, tokenizer)
         events = scheduler_cases(runner, tokenizer)
         shapes = sorted(getattr(runner, "graphs", {}))
         if args.graph:
@@ -417,7 +239,6 @@ def main():
             "tp": size,
             "cache_dtype": args.cache_dtype,
             "index_cache_dtype": index_dtype,
-            "parity": parity,
             "scheduler": events,
             "elapsed_seconds": time.perf_counter() - start,
             "peak_allocated_gib": torch.cuda.max_memory_allocated() / 2**30,

@@ -8,11 +8,6 @@ from enum import Enum
 from transformers import PretrainedConfig
 
 
-class IndexTieBreak(str, Enum):
-    SMALL_POSITION = "small_position"
-    LARGE_POSITION = "large_position"
-
-
 class AttentionMode(str, Enum):
     WINDOW = "window"
     FULL = "full"
@@ -160,7 +155,7 @@ class DeepseekV41TextConfig(PretrainedConfig):
 
     model_type = "deepseek_v41_text"
 
-    def __init__(self, index_topk_tie_break="small_position", **kwargs):
+    def __init__(self, **kwargs):
         # transformers >= 5.13 runs RoPE standardization inside the base
         # __post_init__ (fired by super().__init__). It reads
         # self.max_position_embeddings eagerly -- it is the default argument to
@@ -179,12 +174,6 @@ class DeepseekV41TextConfig(PretrainedConfig):
         if not hasattr(self, "rope_theta"):
             rope_params = getattr(self, "rope_parameters", None) or {}
             self.rope_theta = kwargs.get("rope_theta", rope_params.get("rope_theta"))
-        try:
-            self.index_topk_tie_break = IndexTieBreak(index_topk_tie_break).value
-        except ValueError as error:
-            raise ValueError(
-                "index_topk_tie_break must be small_position or large_position"
-            ) from error
 
     def validate_parallelism(self, tensor_parallel_size, expert_parallel_size=1):
         if tensor_parallel_size <= 0 or expert_parallel_size <= 0:
@@ -316,10 +305,7 @@ def validate_speculative_config(config):
             raise ValueError("DeepSeek-V4.1 DSpark must use the target checkpoint")
     if config.tensor_parallel_size != 4:
         raise ValueError("DeepSeek-V4.1 DSpark is validated on TP4")
-    if config.kv_cache_dtype != "bf16" or config.index_cache_dtype not in (
-        "bf16",
-        "fp8",
-    ):
+    if config.kv_cache_dtype != "bf16":
         raise ValueError("DeepSeek-V4.1 DSpark requires a BF16 KV cache")
     from atom.utils import envs
 
@@ -365,11 +351,15 @@ def validate_runtime_config(config):
         ("online quantization", config.online_quant_config is not None),
         ("EPLB", config.eplb_enable),
         (
-            # bf16/fp8 is DeepSeek-V4's own pair: an FP8 index plane is the one
-            # a paged scorer reads, and the main pool is independent of it.
-            "KV/index cache layout (use bf16/bf16, bf16/fp8 or fp4/fp4)",
-            (config.kv_cache_dtype, config.index_cache_dtype)
-            not in (("bf16", "bf16"), ("bf16", "fp8"), ("fp4", "fp4")),
+            # The plane a paged scorer reads. Only that scorer is left, so the
+            # format is the runtime's rather than a choice; the main pool stays
+            # independent of it and takes bf16 or fp4 either way.
+            "an index plane other than fp8",
+            config.index_cache_dtype != "fp8",
+        ),
+        (
+            "a KV cache other than bf16 or fp4",
+            config.kv_cache_dtype not in ("bf16", "fp4"),
         ),
     ):
         if enabled:
@@ -378,36 +368,10 @@ def validate_runtime_config(config):
         raise ValueError(
             "DeepSeek-V4.1 runtime does not support " + ", ".join(unsupported)
         )
-    # The paged scorer's top-k breaks ties by the smaller row and has no other
-    # mode, so this pair would score every decode step under a policy it does
-    # not implement -- and would only show up where scores tie exactly, which
-    # ReLU makes common rather than rare.
-    if (
-        config.index_cache_dtype == "fp8"
-        and config.hf_config.index_topk_tie_break == IndexTieBreak.LARGE_POSITION
-    ):
-        raise ValueError(
-            "DeepSeek-V4.1 large-position tie-breaking needs the tiled scorer; "
-            "use index_cache_dtype=bf16"
-        )
-    # FULL captures whole decode forwards, so a decode step becomes one
-    # replay. The tiled scorer walks the batch off host positions, which a
-    # capture freezes into every replay; only the paged scorer reads its
-    # bounds off the device.
-    if (
-        graph_mode == CUDAGraphMode.FULL
-        and not config.enforce_eager
-        and config.index_cache_dtype != "fp8"
-    ):
-        raise ValueError(
-            "DeepSeek-V4.1 whole-forward capture needs the paged scorer; use "
-            "index_cache_dtype=fp8 or cudagraph_mode=PIECEWISE"
-        )
     if config.kv_cache_block_size % 2:
         raise ValueError("DeepSeek-V4.1 PAGE token count must be even")
     if config.tensor_parallel_size > 1 and not config.enable_expert_parallel:
         raise ValueError(
             "DeepSeek-V4.1 uses whole-expert EP; set enable_expert_parallel=True"
         )
-    IndexTieBreak(config.hf_config.index_topk_tie_break)
     validate_speculative_config(config)

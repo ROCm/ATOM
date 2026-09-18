@@ -33,7 +33,6 @@ local-checkpoint and official-model tests skip. The checkpoint check validates
 all 48 headers, the complete 96085-tensor index, contiguous offsets, exact file
 sizes, readable final pages, and available
 download revision metadata. It does not checksum the 475 GiB tensor payload.
-Use `lm_eval_checkpoint.py` for paired real-checkpoint quality evaluation;
 commands and results are in `docs/deepseek_v41_validation.md`.
 
 P03 compares Single-Pass mHC, router, weighted SwiGLU, and Engram residual math
@@ -44,9 +43,9 @@ Prefetch and fallback row IDs both match that official history oracle. Request
 snapshot identity, ragged staging, padding, and cancellation are covered in
 `tests/model_ops/test_engram.py`. This remains module-level validation.
 
-P04 index selection tests live in `test_indexer.py`. They cover compact candidate
-blocks, candidate-only Reindex, causal visibility, short/empty prefixes, and both
-`small_position` and `large_position` score-tie policies on CPU and ROCm.
+Index selection tests live in `test_indexer.py`. They cover compact candidate
+blocks, candidate-only Reindex, causal visibility, short/empty prefixes, and the
+smaller-position score-tie rule on CPU and ROCm.
 Selection is stable across key tile boundaries; higher scores always win, the
 newest visible block is retained, and returned position IDs remain ascending.
 The pinned upstream top-k does not define a deterministic position tie rule, so

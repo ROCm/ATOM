@@ -51,7 +51,7 @@ def test_every_prefix_survives_ring_wrap_and_ragged_request_order(
     geometry = V41PoolGeometry(
         2,
         ((0, 2), (1, 1)),
-        16,
+        32,
         128,
         128,
         32,
@@ -140,7 +140,7 @@ def test_every_prefix_survives_ring_wrap_and_ragged_request_order(
 
 
 def test_tentative_state_refuses_missing_prefixes_and_out_of_range_acceptance():
-    geometry = V41PoolGeometry(1, ((0, 2),), 16, 128, 128, 32, speculative_tokens=5)
+    geometry = V41PoolGeometry(1, ((0, 2),), 32, 128, 128, 32, speculative_tokens=5)
     cache = PagedAttentionCache(geometry, 1, 1, "cpu")
     cache.cursor[0, 0] = 3
     span = RequestSpan(1, 3, 0, 6, 0, (0,))
@@ -170,7 +170,7 @@ def test_commit_moves_the_scheduled_cursors_and_no_padding_requests():
     not the batch: at `running_bs == scheduled_bs` a slice by either is the
     same slice and proves nothing.
     """
-    geometry = V41PoolGeometry(1, ((0, 2),), 16, 128, 128, 32, speculative_tokens=5)
+    geometry = V41PoolGeometry(1, ((0, 2),), 32, 128, 128, 32, speculative_tokens=5)
     cache = PagedAttentionCache(geometry, 1, 4, "cpu")
     for slot in range(4):
         cache.cursor[slot, 0] = 3
@@ -204,7 +204,7 @@ def test_a_rejected_round_leaves_the_next_one_as_if_it_never_drafted(
     from atom.model_ops.deepseek_v41.compressor import Compressor
     from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 
-    geometry = V41PoolGeometry(1, ((0, 2),), 16, 128, 128, 32, speculative_tokens=5)
+    geometry = V41PoolGeometry(1, ((0, 2),), 32, 128, 128, 32, speculative_tokens=5)
     drafted, position, blocks = 6, 40, tuple(range(8))
     torch.manual_seed(409)
     with torch.device("cuda"):
@@ -260,7 +260,7 @@ def test_block_context_read_decodes_only_the_selected_request_windows(packed):
     geometry = V41PoolGeometry(
         2,
         ((0, 2),),
-        16,
+        32,
         128,
         512,
         32,
@@ -303,7 +303,7 @@ def test_verify_decode_kernel_is_causal_after_writing_the_whole_block(packed):
     geometry = V41PoolGeometry(
         1,
         ((0, 2),),
-        16,
+        32,
         4,
         512,
         32,

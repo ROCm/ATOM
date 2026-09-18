@@ -18,14 +18,14 @@ EP, with weights at `/mnt/DeepSeek-V4.1-Flash`. AITER is pinned to
 | P01 | Nested configuration, CSA2 topology and format schema | Complete |
 | P02 | Native FP8/FP4 weights and kernel interfaces | Complete |
 | P03 | Single-Pass mHC, MoE arithmetic and Engram math/history | Complete |
-| P04 | Full-layer text baseline | Accepted; reference differences documented |
+| P04 | Full-layer text baseline | Accepted; the eager comparison path has since been removed |
 | P05 | Paging, batching and request-state lifecycle | Complete |
 | P06 | Chat, tools and reasoning-effort protocol | Complete |
 | P07 | Vision and image requests | Complete |
 | P08 | Multimodal chunking and embedding lifetime | Complete; small-chunk quality tradeoff accepted |
 | P09 | Packed cache, AITER W4A8 experts and PIECEWISE graphs | Complete; MoE precision tradeoff accepted |
 | P10 | V4.1 DSpark and accepted-prefix state commit | Implemented and tested; zero-shot raw quality decision pending |
-| P10b | FP8 index plane, paged decode scorer and the whole-forward target graph | Implemented; a decode step is the draft's replay plus the target's |
+| P10b | FP8 index plane, paged scorer and the whole-forward target graph | Implemented; a decode step is the draft's replay plus the target's, and prefill scores in the plane too |
 | P11 | Candidate-only indexing, Engram residency and fusion | Pending |
 | P12 | Optional CED decoder replay | Pending |
 | P13 | Optional encoder replay and persistent global cache | Pending |
@@ -38,12 +38,12 @@ have separate implementations.
 
 ## Run and validate
 
-See the [offline guide](../docs/deepseek_v41_offline.md) for a raw-text example,
-the [runtime guide](../docs/deepseek_v41_runtime.md) for paged execution and
-supported configuration, and [reference validation](../docs/deepseek_v41_validation.md)
-for the accepted numerical differences. The [protocol guide](../docs/deepseek_v41_protocol.md)
+See the [runtime guide](../docs/deepseek_v41_runtime.md) for paged execution and
+supported configuration. The [protocol guide](../docs/deepseek_v41_protocol.md)
 covers numeric reasoning effort, tool calls and multi-turn history. The runtime
-validates unsupported combinations before loading weights.
+validates unsupported combinations before loading weights. Arithmetic is judged
+against the published model through the `ATOM_DSV41_REFERENCE` unit tests, and
+quality end to end through `lm_eval`.
 
 For a bounded real-checkpoint TP4 regression in the development container:
 
@@ -75,14 +75,8 @@ use RCCL.
 
 ## Equal-score index selection
 
-The HF text-config option `index_topk_tie_break` accepts `small_position`
-(default) or `large_position`. It applies to index top-k, candidate-block ties
-and Reindex. The newest visible candidate block remains mandatory, and selected
-indices are returned in ascending position order under either tie policy.
-
-```json
-{"text_config": {"index_topk_tie_break": "large_position"}}
-```
-
-This is a field override within the checkpoint configuration. The native Config
-also accepts `hf_overrides={"index_topk_tie_break": "large_position"}`.
+Equal scores go to the smaller position, for index top-k, candidate-block ties
+and Reindex alike. The published implementation's `torch.topk` defines no tie
+rule at all; ATOM needs one because every tensor-parallel rank has to select
+the same KV set. The newest visible candidate block remains mandatory, and
+selected indices are returned in ascending position order.

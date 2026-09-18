@@ -15,7 +15,7 @@ def config():
         model="/model",
         tensor_parallel_size=4,
         kv_cache_dtype="bf16",
-        index_cache_dtype="bf16",
+        index_cache_dtype="fp8",
         hf_config=SimpleNamespace(),
         speculative_config=SimpleNamespace(
             method="dspark",
@@ -41,7 +41,6 @@ def test_static_and_explicitly_calibrated_native_dspark():
     [
         ("tensor_parallel_size", 8),
         ("kv_cache_dtype", "fp4"),
-        ("index_cache_dtype", "fp4"),
     ],
 )
 def test_unvalidated_runtime_combinations_are_rejected(field, value):

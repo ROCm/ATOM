@@ -374,11 +374,6 @@ def main():
     )
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--fewshot", type=int, default=0)
-    parser.add_argument(
-        "--index-dtype",
-        choices=("bf16", "fp8", "fp4"),
-        help="Index plane format; defaults to the BF16 this driver pins",
-    )
     parser.add_argument("--max-output-tokens", type=int, default=256)
     # The arm FULL replaced, kept so the two are one flag apart on one harness.
     # PIECEWISE at `level=0` has no compiled pieces to replay, so this arm runs
@@ -446,7 +441,7 @@ def main():
             ),
             torch_profiler_dir=profile_root,
             kv_cache_dtype="bf16",
-            index_cache_dtype=args.index_dtype or "bf16",
+            index_cache_dtype="fp8",
             max_num_batched_tokens=512,
             max_model_len=4096,
             max_num_seqs=4,

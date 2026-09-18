@@ -5,18 +5,17 @@ from typing import ClassVar
 
 import torch
 from aiter.dist.parallel_state import get_tp_group
-from torch import nn
-
-from atom.model_loader.weight_names import WeightsMapper
-from atom.model_ops.attentions.deepseek_v41_state import EagerAttentionCache
 from atom.model_ops.deepseek_v41.mhc import (
     SinglePassHCState,
     expand_residual,
 )
 from atom.model_ops.deepseek_v41.mhc_pre_delayed import pre_delayed
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
-from atom.model_ops.embed_head import VocabParallelEmbedding
 from atom.model_ops.engram_layer import EngramOp
+from torch import nn
+
+from atom.model_loader.weight_names import WeightsMapper
+from atom.model_ops.embed_head import VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
@@ -201,15 +200,6 @@ class DeepseekV41ForCausalLM(nn.Module):
             factor=scaling["factor"],
             beta_fast=scaling["beta_fast"],
             beta_slow=scaling["beta_slow"],
-        )
-
-    def new_cache(self, batch_size):
-        return EagerAttentionCache(
-            self.config,
-            self.topology,
-            batch_size,
-            self.max_length,
-            self.embed.weight.device,
         )
 
     @property

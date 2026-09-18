@@ -203,9 +203,8 @@ batch. A sentinel plan row keeps its `-1`, which makes `page * per_page +
 offset` negative -- the row index V4's writers already skip, and what
 `indexer_k_quant_and_cache` bails on. The one writer that cannot skip on its
 own is torch advanced indexing, where a negative index is legal and lands on
-somebody's live row, so the BF16/FP4 scatter filters by the plan's own
-`batch_id >= 0` first. That path is never inside a captured graph: FULL
-admits only the FP8 index plane.
+somebody's live row, so the packed-main scatter filters by the plan's own
+`batch_id >= 0` first.
 
 `cudagraph_mode=PIECEWISE` remains available and records the compiled dense
 pieces with attention eager between them. Startup capture binds the serving

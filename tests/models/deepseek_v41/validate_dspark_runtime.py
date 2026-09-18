@@ -11,6 +11,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import torch
+from atom.models.deepseek_v41.config import validate_runtime_config
+from tests.attentions.deepseek_v41.benchmark_runtime import run_case
 from transformers import AutoTokenizer
 
 from atom.config import (
@@ -21,8 +23,6 @@ from atom.config import (
     SpeculativeConfig,
 )
 from atom.model_engine.model_runner import ModelRunner
-from atom.models.deepseek_v41.config import validate_runtime_config
-from tests.attentions.deepseek_v41.benchmark_runtime import run_case
 
 
 def diagnostic_config(config):
@@ -82,11 +82,6 @@ def main():
     )
     parser.add_argument("--output-tokens", type=int, default=16)
     parser.add_argument("--cache-dtype", choices=("bf16", "fp4"), default="bf16")
-    parser.add_argument(
-        "--index-dtype",
-        choices=("bf16", "fp8", "fp4"),
-        help="Index plane format; defaults to --cache-dtype, as the engine does",
-    )
     args = parser.parse_args()
     if args.trace_layers is not None and args.trace_layers < 1:
         parser.error("--trace-layers must be positive")
@@ -174,7 +169,7 @@ def main():
             ),
             torch_profiler_dir=args.torch_profiler_dir,
             kv_cache_dtype=args.cache_dtype,
-            index_cache_dtype=args.index_dtype or args.cache_dtype,
+            index_cache_dtype="fp8",
             max_num_batched_tokens=512 if args.quality_config else 256,
             max_model_len=4096 if args.quality_config else 512,
             max_num_seqs=4,
@@ -197,7 +192,7 @@ def main():
         and not args.production,
         "calibration_profile": args.calibration_profile,
         "cache_dtype": args.cache_dtype,
-        "index_dtype": args.index_dtype or args.cache_dtype,
+        "index_dtype": "fp8",
         "single_row_padding_diagnostic": args.pad_single_row,
         "ordered_reductions_diagnostic": args.ordered_reductions,
         "fixed_attention_reduction_diagnostic": args.fixed_attention_reduction,

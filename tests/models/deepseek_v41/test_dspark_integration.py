@@ -47,7 +47,7 @@ def test_capture_builder_uses_full_query_width_and_serving_storage(width):
 
     builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
     builder.geometry = V41PoolGeometry(
-        1, ((0, 2),), 16, 128, 128, 32, speculative_tokens=5
+        1, ((0, 2),), 32, 128, 128, 32, speculative_tokens=5
     )
     # Enough PAGEs to hold a request that already owns a full window: capture
     # starts each synthetic request behind `window_size`, so the table it
@@ -109,7 +109,7 @@ def test_draft_context_write_spans_the_forwards_width_not_its_tokens(monkeypatch
     from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 
     cache = PagedAttentionCache(
-        V41PoolGeometry(1, ((0, 2),), 4, 4, 512, 32), 8, 4, "cpu"
+        V41PoolGeometry(1, ((0, 2),), 32, 4, 512, 32), 8, 4, "cpu"
     )
     step = cache.begin_step(
         [RequestSpan(0, 0, 0, 1, 0, (0,))], running_bs=2, running_tokens=2, plans={}
@@ -221,7 +221,7 @@ def test_decode_positions_use_accepted_prefix_and_full_reservation():
 
     builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
     builder.geometry = V41PoolGeometry(
-        1, ((0, 2),), 16, 128, 128, 32, speculative_tokens=5
+        1, ((0, 2),), 32, 128, 128, 32, speculative_tokens=5
     )
     builder.cache = PagedAttentionCache(builder.geometry, 20, 5, "cpu")
     builder.block_size, builder.device = 16, "cpu"

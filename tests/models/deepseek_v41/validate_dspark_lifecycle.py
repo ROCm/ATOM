@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import torch
+from tests.models.deepseek_v41.validate_dspark_runtime import diagnostic_config
 from transformers import AutoTokenizer
 
 from atom.config import (
@@ -23,7 +24,6 @@ from atom.model_engine.model_runner import ModelRunner
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus
 from atom.sampling_params import SamplingParams
-from tests.models.deepseek_v41.validate_dspark_runtime import diagnostic_config
 
 
 def run_scenarios(
@@ -356,10 +356,6 @@ def main():
                 calibration_profile=args.calibration_profile,
             ),
             kv_cache_dtype=args.cache_dtype,
-            # A whole-forward decode capture reads its top-k out of the FP8
-            # plane; the tiled scorer the other formats use walks the batch on
-            # the host, so there is nothing for a graph to record.
-            index_cache_dtype="fp8" if args.graph else args.cache_dtype,
             max_num_batched_tokens=256,
             max_model_len=512,
             max_num_seqs=4,

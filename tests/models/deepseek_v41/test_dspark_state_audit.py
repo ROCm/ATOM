@@ -6,7 +6,6 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-
 from atom.model_engine.engram_runtime import EngramInputPreparer
 from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
 from tests.model_ops.test_engram import make_runtime
@@ -127,7 +126,7 @@ def test_visible_cache_comparison_ignores_rejected_expired_and_draft_rows():
     from .dspark_runtime_trace import compare_visible_cache
 
     geometry = V41PoolGeometry(
-        3, ((0, 2), (1, 1)), 16, 128, 128, 32, speculative_tokens=5
+        3, ((0, 2), (1, 1)), 32, 128, 128, 32, speculative_tokens=5
     )
     cache = PagedAttentionCache(geometry, 12, 2, "cpu")
     shadow = PagedAttentionCache(geometry, 12, 2, "cpu")
@@ -139,8 +138,9 @@ def test_visible_cache_comparison_ignores_rejected_expired_and_draft_rows():
     window[0, 1, 132, 0] = 7  # rejected
     window[2, 1, 131, 0] = 9  # draft layer has its own state
     pages = cache.pages.view("main_0")[0]
+    rows = pages.shape[1]  # a ratio-2 owner's rows per PAGE, not the PAGE
     for index in [65, 66]:  # first accepted, second rejected
-        pages[blocks[index // 8], index % 8, 0] = 11
+        pages[blocks[index // rows], index % rows, 0] = 11
     result = compare_visible_cache(cache, shadow, span, 2, target_layers=2)
     assert result["window"] == [
         {"layer": 0, "max_error": 3, "positions": [131], "unequal": 1}

@@ -2154,15 +2154,23 @@ class Config:
         # not yet describe the separate FP4 scale pool, so those integrations
         # retain FP8 until their layouts support it. Every other model keeps
         # the historical KV-cache-dtype default.
-        if self.index_cache_dtype is None and is_deepseek_v4:
-            if self.plugin_config is None and not self.kv_transfer_config:
-                from aiter.jit.utils.chip_info import get_gfx
+        if self.index_cache_dtype is None:
+            if is_deepseek_v4:
+                if self.plugin_config is None and not self.kv_transfer_config:
+                    from aiter.jit.utils.chip_info import get_gfx
 
-                self.index_cache_dtype = "fp8" if get_gfx() == "gfx942" else "fp4"
-            else:
+                    self.index_cache_dtype = "fp8" if get_gfx() == "gfx942" else "fp4"
+                else:
+                    self.index_cache_dtype = "fp8"
+            elif self.hf_config.model_type == "deepseek_v41_text":
+                # CSA2 reads its index plane with the paged scorer and has no
+                # other, so the plane's format does not follow the main pool's.
+                # Only the default: an explicit value is carried through to the
+                # V4.1 runtime gate, which refuses anything else before weights
+                # load. Overriding it here would accept the flag and ignore it.
                 self.index_cache_dtype = "fp8"
-        elif self.index_cache_dtype is None:
-            self.index_cache_dtype = self.kv_cache_dtype
+            else:
+                self.index_cache_dtype = self.kv_cache_dtype
 
         if self.hf_config.model_type == "deepseek_v41_text":
             # CSA2's index plane is paged by the same scorer GLM's is, so a

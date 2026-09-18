@@ -6,15 +6,30 @@ inputs have exact BF16/FP32 sums, so no numerical tolerance can hide stale data.
 """
 
 import json
+import os
 
 import torch
 from aiter.dist.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
     get_tp_group,
+    init_distributed_environment,
+    initialize_model_parallel,
 )
 
-from atom.examples.deepseek_v41_offline import initialize_parallel
+
+def initialize_parallel():
+    rank, local_rank = int(os.environ["RANK"]), int(os.environ["LOCAL_RANK"])
+    size = int(os.environ["WORLD_SIZE"])
+    torch.cuda.set_device(local_rank)
+    init_distributed_environment(
+        world_size=size,
+        rank=rank,
+        local_rank=local_rank,
+        distributed_init_method="env://",
+    )
+    initialize_model_parallel(tensor_model_parallel_size=size)
+    return rank
 
 
 def main():

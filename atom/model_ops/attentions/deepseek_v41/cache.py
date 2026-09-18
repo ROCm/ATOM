@@ -3,13 +3,10 @@
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from aiter.ops.cache import (
-    cp_gather_indexer_k_quant_cache,
     indexer_k_quant_and_cache,
 )
 from atom.model_ops.attentions.deepseek_v41.packed_rows import (
-    gather_index_rows,
     gather_prefix_rows,
     pack_rows,
     write_packed_window,
@@ -20,7 +17,6 @@ from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
 )
 from atom.model_ops.blockscale import quantize_fp4
 from atom.model_ops.deepseek_v41.compressor import compress_batch
-from atom.model_ops.deepseek_v41.indexer import TensorIndexKeys
 from atom.model_ops.deepseek_v41.paged_scoring import unit_table
 
 from atom.model_ops.attentions.pool_layout.entry_arena import EntryMajorArena
@@ -34,61 +30,6 @@ from atom.utils import CpuGpuBuffer
 from .indices import build_indices, fill_step_indptrs
 from .metadata import prepare_batch_step
 from .speculative import TentativeState
-
-
-class PagedIndexKeys:
-    """Read only a scoring tile or the selected candidate rows."""
-
-    def __init__(self, pages, block_table, count, packed_dim=None):
-        self.pages, self.block_table = pages, block_table
-        self.packed_dim = packed_dim
-        self.shape = (1, count, packed_dim or pages.shape[-1])
-
-    def _read(self, ids):
-        if self.packed_dim is not None:
-            return gather_index_rows(self.pages, self.block_table, ids, self.packed_dim)
-        rows = self.pages.shape[1]
-        blocks = self.block_table[ids // rows].long()
-        return self.pages[blocks, ids % rows]
-
-    def tile(self, start, end):
-        ids = torch.arange(start, end, device=self.pages.device)
-        return self._read(ids).unsqueeze(0)
-
-    def gather(self, ids):
-        return self._read(ids)
-
-
-class RequestCache:
-    def __init__(self, cache, span, blocks):
-        self.cache, self.span, self.blocks = cache, span, blocks
-        self.packed = cache.geometry.packed
-        self.index_dtype = cache.geometry.index_dtype
-
-    def write_global(self, owner, begin, main, index):
-        planes = (self.cache.pages.view(f"main_{owner}")[0], main), (
-            self.cache.index_planes[owner],
-            index,
-        )
-        for pages, value in planes:
-            if isinstance(value, tuple):
-                value = pack_rows(*value)
-            rows = pages.shape[1]
-            ids = torch.arange(begin, begin + value.shape[1], device=value.device)
-            pages[self.blocks[ids // rows].long(), ids % rows] = value[0]
-
-    def index_keys(self, owner, count):
-        if self.index_dtype == "fp8":
-            # Preshuffled rows are not addressable one at a time; aiter's own
-            # inverse of the writer is what turns them back into a tile a
-            # scorer can read.
-            return TensorIndexKeys(self.cache.gather_index(owner, self.blocks, count))
-        return PagedIndexKeys(
-            self.cache.index_planes[owner],
-            self.blocks,
-            count,
-            self.cache.geometry.index_dim if self.index_dtype == "fp4" else None,
-        )
 
 
 class PagedAttentionCache:
@@ -112,7 +53,6 @@ class PagedAttentionCache:
         # One plane per owner, `[pages, rows, width]`, dense in its own rows:
         # the stride a paged reader is handed is the rows' and not the PAGE's.
         # Both sides of the index plane take the view from here.
-        self.index_ratios = dict(geometry.owners)
         self.index_planes = {
             owner: self._index_plane(
                 index_offsets[owner], geometry.rows_per_page(ratio)
@@ -120,17 +60,11 @@ class PagedAttentionCache:
             for owner, ratio in geometry.owners
         }
         # The same bytes as `[tiles, tile rows, width]`, which is what a block
-        # id addresses. FP8 only, and not for want of generality: the other
-        # formats are read a row at a time and their PAGE need not hold a whole
-        # number of tiles, so there is no such view of them to take.
-        self.index_units = (
-            {
-                owner: plane.view(-1, MQA_LOGITS_PRESHUFFLE_ROWS, plane.shape[-1])
-                for owner, plane in self.index_planes.items()
-            }
-            if geometry.index_dtype == "fp8"
-            else {}
-        )
+        # id addresses and what the scorer is handed.
+        self.index_units = {
+            owner: plane.view(-1, MQA_LOGITS_PRESHUFFLE_ROWS, plane.shape[-1])
+            for owner, plane in self.index_planes.items()
+        }
         self.state = EntryMajorArena(
             geometry.state_fields,
             slots,
@@ -208,19 +142,22 @@ class PagedAttentionCache:
         ]
 
     def _index_plane(self, offset, rows):
-        """`[pages, rows, width]` at `offset`, in whatever the rows are stored as.
+        """`[pages, rows, bytes]` at `offset`, untyped.
 
-        `as_strided`'s storage offset is absolute, so the retyped view's own
-        has to be added -- omit it and every plane addresses from the front of
-        the pool, over the main pages.
+        A preshuffled FP8 row interleaves its bytes across the tile and carries
+        its scale past the block's data, so a row has no element type to take a
+        view in -- the writer and the scorer both address it as bytes.
+
+        `as_strided`'s storage offset is absolute, so the retyped view's own has
+        to be added -- omit it and every plane addresses from the front of the
+        pool, over the main pages.
         """
-        dtype = torch.bfloat16 if self.geometry.index_dtype == "bf16" else torch.uint8
-        typed = self.backing.view(dtype)
-        width = self.geometry.index_row_bytes // dtype.itemsize
+        typed = self.backing.view(torch.uint8)
+        width = self.geometry.index_row_bytes
         return typed.as_strided(
             (self.num_pages, rows, width),
             (rows * width, width, 1),
-            typed.storage_offset() + offset // dtype.itemsize,
+            typed.storage_offset() + offset,
         )
 
     def _reserve_indptrs(self, tokens):
@@ -313,9 +250,7 @@ class PagedAttentionCache:
         if not step.positions.is_cuda:
             return step
         self._reserve_indptrs(step.width)
-        step.indptrs = fill_step_indptrs(
-            step, self.geometry, self.indptr_buffers, step.longest
-        )
+        step.indptrs = fill_step_indptrs(step, self.geometry, self.indptr_buffers)
         return step
 
     def _private_plans(self, requests, tentative):
@@ -420,33 +355,21 @@ class PagedAttentionCache:
         return latent, rows
 
     def write_index(self, owner, step, rows, index, ratio):
-        geometry = self.geometry
-        per_page = geometry.rows_per_page(ratio)
-        if geometry.index_dtype == "fp8":
-            # One pass quantizes and preshuffles, addressing a row by its
-            # position in the plane -- which a page and an offset into it come
-            # to, the plane being dense.
-            physical, offsets, _ = self._plan_destinations(step, rows, ratio, per_page)
-            indexer_k_quant_and_cache(
-                index[0],
-                self.index_units[owner],
-                physical * per_page + offsets,
-                geometry.index_dim,
-                INDEX_FP8_SCALE_FMT,
-                preshuffle=True,
-            )
-            return
-        if geometry.index_dtype == "fp4":
-            index = quantize_fp4(index)
-        self._scatter_rows(self.index_planes[owner], step, rows, index, ratio)
+        """One pass quantizes and preshuffles.
 
-    @property
-    def index_dtype(self):
-        return self.geometry.index_dtype
-
-    def scores_paged(self, step):
-        """Whether this step's top-k can come from the plane, not from a tile."""
-        return self.geometry.scores_paged(step.decode)
+        A row is addressed by its position in the plane, which a page and an
+        offset into it come to, the plane being dense.
+        """
+        per_page = self.geometry.rows_per_page(ratio)
+        physical, offsets, _ = self._plan_destinations(step, rows, ratio, per_page)
+        indexer_k_quant_and_cache(
+            index[0],
+            self.index_units[owner],
+            physical * per_page + offsets,
+            self.geometry.index_dim,
+            INDEX_FP8_SCALE_FMT,
+            preshuffle=True,
+        )
 
     def unit_tiles(self, step, ratio):
         """Tile ids per query token: one table per ratio, shared by its owners.
@@ -464,37 +387,6 @@ class PagedAttentionCache:
                 self.geometry.rows_per_page(ratio) // MQA_LOGITS_PRESHUFFLE_ROWS,
             )
         return table
-
-    def gather_index(self, owner, blocks, count):
-        """This request's first `count` index rows, dequantized to BF16.
-
-        aiter's own inverse of the preshuffling writer, so the two cannot
-        disagree about the layout. The unit table is the PAGE table expanded:
-        a page holds a fixed number of tiles, consecutively.
-        """
-        geometry = self.geometry
-        ratio = self.index_ratios[owner]
-        per_page = geometry.rows_per_page(ratio) // MQA_LOGITS_PRESHUFFLE_ROWS
-        device = self.pool.device
-        units = blocks.long()[:, None] * per_page + torch.arange(
-            per_page, device=device
-        )
-        keys = torch.empty(
-            (count, geometry.index_dim), dtype=torch.float8_e4m3fn, device=device
-        )
-        scales = torch.empty((count, 1), dtype=torch.float32, device=device)
-        cp_gather_indexer_k_quant_cache(
-            self.index_units[owner],
-            keys,
-            scales.view(torch.float8_e4m3fn),
-            units.flatten().int()[None],
-            torch.tensor([0, count], dtype=torch.int32, device=device),
-            preshuffle=True,
-        )
-        # In FP32 and back, not BF16 times FP32: the product of a stored value
-        # and its scale is what the scorer's own arithmetic uses, and a BF16
-        # intermediate would round twice.
-        return (keys.to(torch.float32) * scales).to(torch.bfloat16).unsqueeze(0)
 
     def _plan_destinations(self, step, rows, ratio, per_page):
         """Each plan row's physical page and its offset in that page.
@@ -563,14 +455,6 @@ class PagedAttentionCache:
         gather_prefix_rows(self.backing, tagged, ptr, output, 0, 1)
         return output.view(slots.numel(), window.ring_slots, self.geometry.head_dim)
 
-    def requests(self, step):
-        for i, (span, local_step) in enumerate(zip(step.requests, step.request_steps)):
-            yield (
-                RequestCache(self, span, step.block_tables[i]),
-                local_step,
-                span.token_slice,
-            )
-
     def write_window(self, layer, kv, step):
         if step.width:
             window = self.geometry.window(layer, self.num_pages)
@@ -594,27 +478,7 @@ class PagedAttentionCache:
             )
 
     def attention_indices(self, spec, step):
-        selected = None
-        if spec.ratio:
-            if spec.topk_owner not in step.selected:
-                parts = [local.indices[spec.topk_owner] for local in step.request_steps]
-                # The width the indptr reserved, not the widest part this
-                # batch produced: the reserve was taken before any scorer ran.
-                topk = self.geometry.batch_topk(spec.ratio, step.longest, step.decode)
-                selection = torch.cat(
-                    [
-                        F.pad(part, (0, topk - part.shape[-1]), value=-1)
-                        for part in parts
-                    ],
-                    dim=1,
-                )
-                # Out to the forward's width: the tiled scorer only ran on the
-                # rows a request owns, and `build_indices` reads one row per
-                # row the forward runs. A padding row selects nothing.
-                step.selected[spec.topk_owner] = F.pad(
-                    selection, (0, 0, 0, step.width - selection.shape[1]), value=-1
-                )
-            selected = step.selected[spec.topk_owner]
+        selected = step.selected[spec.topk_owner] if spec.ratio else None
         return build_indices(
             selected,
             step,

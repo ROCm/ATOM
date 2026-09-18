@@ -4,14 +4,14 @@ from copy import deepcopy
 from dataclasses import FrozenInstanceError
 
 import pytest
-
-from atom.config import get_hf_config
 from atom.models.deepseek_v41.config import (
     AttentionMode,
     NativeQuantization,
     build_attention_topology,
     normalize_hf_config,
 )
+
+from atom.config import get_hf_config
 from atom.quant_spec import get_quant_parser
 from atom.utils.selector import Family, attn_family, get_attn_backend_cls
 
@@ -127,19 +127,3 @@ def test_v41_never_falls_through_to_v4_backend(raw_config):
     )
     with pytest.raises(NotImplementedError, match="native ATOM"):
         get_attn_backend_cls(Family.CSA2, True, False)
-
-
-@pytest.mark.parametrize("policy", ["small_position", "large_position"])
-def test_index_tie_break_configuration_and_serialization(raw_config, policy):
-    raw_config["text_config"]["index_topk_tie_break"] = policy
-    config = normalize_hf_config(raw_config)
-    assert config.index_topk_tie_break == policy
-    assert config.to_dict()["index_topk_tie_break"] == policy
-    assert config._multimodal_config.text_config.index_topk_tie_break == policy
-
-
-def test_index_tie_break_default_and_rejection(raw_config):
-    assert normalize_hf_config(raw_config).index_topk_tie_break == "small_position"
-    raw_config["text_config"]["index_topk_tie_break"] = "random"
-    with pytest.raises(ValueError, match="index_topk_tie_break"):
-        normalize_hf_config(raw_config)

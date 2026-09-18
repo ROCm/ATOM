@@ -34,7 +34,7 @@ def test_staged_metadata_refreshes_reordered_ragged_and_empty_batches(device):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("ROCm GPU required")
     cache = PagedAttentionCache(
-        V41PoolGeometry(1, ((0, 2),), 4, 4, 512, 32), 8, 4, device
+        V41PoolGeometry(1, ((0, 2),), 32, 4, 512, 32), 8, 4, device
     )
     buffers = metadata_buffers(4, 8, 4, device)
     pointers = {name: value.gpu.data_ptr() for name, value in buffers.items()}
@@ -76,7 +76,6 @@ def test_staged_metadata_refreshes_reordered_ragged_and_empty_batches(device):
             assert step.block_tables[i].tolist() == list(span.block_ids) + [0] * (
                 4 - len(span.block_ids)
             )
-            assert step.request_steps[i].cu_seqlens_q.tolist() == [0, span.length]
         assert step.block_tables[len(requests) :].count_nonzero() == 0
         assert {
             name: value.gpu.data_ptr() for name, value in buffers.items()
@@ -101,7 +100,7 @@ def test_engram_rows_are_staged_for_the_width_not_for_the_tokens(engram):
     it. Staging one row per token instead of one per row is a shape error the
     first padded verify step raises, which is why the ladder has to miss.
     """
-    geo = V41PoolGeometry(1, ((0, 2),), 4, 4, 512, 32)
+    geo = V41PoolGeometry(1, ((0, 2),), 32, 4, 512, 32)
     cache = PagedAttentionCache(geo, 8, 4, "cpu")
     buffers = metadata_buffers(4, 8, 4, "cpu")
     step = staged_step(
@@ -151,7 +150,7 @@ def test_engram_rows_are_staged_for_the_width_not_for_the_tokens(engram):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 def test_v4_window_write_graph_reads_updated_requests_without_recapture():
-    geo = V41PoolGeometry(1, ((0, 2),), 4, 4, 512, 32)
+    geo = V41PoolGeometry(1, ((0, 2),), 32, 4, 512, 32)
     cache = PagedAttentionCache(geo, 8, 4, "cuda")
     buffers = metadata_buffers(2, 2, 2, "cuda")
     first = (RequestSpan(17, 0, 0, 1, 1, (0, 1)), RequestSpan(24, 2, 1, 1, 3, (2, 3)))

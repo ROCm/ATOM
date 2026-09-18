@@ -2,7 +2,13 @@
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 
 
-def geometry(config, block=4):
+def geometry(config, block=32):
+    """A PAGE of 32 because the index plane is FP8.
+
+    A block id names 16 rows and a ratio-2 owner halves the PAGE before that
+    count is taken, so 32 tokens is the floor -- the same floor production
+    rounds up to 256 for block-table reasons.
+    """
     return V41PoolGeometry(
         config.num_hidden_layers,
         tuple(

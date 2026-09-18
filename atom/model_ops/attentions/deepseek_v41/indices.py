@@ -151,7 +151,7 @@ def _indices(
         tl.store(extend + begin + i, t - count + 1 + i, i < count)
 
 
-def fill_step_indptrs(step, geometry, buffers, longest):
+def fill_step_indptrs(step, geometry, buffers):
     """`{ratio: (prefix indptr, extend indptr, reserved top-k)}` for this step.
 
     Into the caller's fixed buffers, before any layer runs. Both halves are
@@ -162,7 +162,7 @@ def fill_step_indptrs(step, geometry, buffers, longest):
     built = {}
     for ratio in geometry.layer_ratios:
         prefix, extend = buffers[ratio]
-        topk = geometry.batch_topk(ratio, longest, step.decode)
+        topk = geometry.batch_topk(ratio)
         pptr = prefix[: step.width + 1]
         eptr = pptr if step.decode else extend[: step.width + 1]
         _indptr_scan[(1,)](

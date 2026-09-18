@@ -4,24 +4,19 @@
 import torch
 from aiter import QuantType
 from aiter.dist.parallel_state import get_tp_group
-from torch import nn
-
 from atom.model_ops.attentions.deepseek_v41.packed_attention import (
     packed_decode,
     packed_prefill,
 )
 from atom.model_ops.blockscale import (
     dequantize_fp8_weight,
-    quantize_fp4,
     quantize_fp8,
 )
 from atom.model_ops.deepseek_v41.compressor import Compressor
-from atom.model_ops.deepseek_v41.indexer import select_indices
-from atom.model_ops.deepseek_v41.paged_scoring import (
-    round_query_rows,
-    score_topk_decode,
-)
+from atom.model_ops.deepseek_v41.paged_scoring import score_topk_paged
 from atom.model_ops.deepseek_v41.projections import grouped_output_projection
+from torch import nn
+
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -34,7 +29,7 @@ from atom.model_ops.v4_kernels import (
     sparse_attn_v4_paged_prefill,
 )
 
-from .config import AttentionMode, IndexTieBreak
+from .config import AttentionMode
 from .layers import native_quant_config, reduce_output
 
 
@@ -44,7 +39,6 @@ class Indexer(nn.Module):
         self.spec = spec
         self.heads, self.head_dim = config.index_n_heads, config.index_head_dim
         self.topk = config.index_topk
-        self.tie_break = IndexTieBreak(config.index_topk_tie_break)
         self.block_size, self.topk_blocks = (
             config.candidate_block_size,
             config.candidate_topk_blocks,
@@ -71,37 +65,17 @@ class Indexer(nn.Module):
     def weights_scale(self):
         return self.head_dim**-0.5 * self.heads**-0.5
 
-    def project_query(self, qr, rope, positions, index_dtype):
-        """The index query, rounded to whatever the plane's scorer will see.
+    def project_query(self, qr, qr_scale, rope, positions):
+        """The index query, left on the grid its reader rounds it to.
 
-        The QAT follows the stored keys: an FP8 plane is read by a kernel that
-        takes an FP8 query, so a tiled run over the same plane has to round the
-        same way or the two differ in the value and not just the arithmetic.
+        The published model FP4-rounds both sides whatever it holds; the one
+        scorer here quantizes the query itself, so rounding first would round
+        twice. `qr` arrives quantized, so this GEMM reuses that pair rather
+        than quantizing the tensor a second time.
         """
-        query = rope(
-            self.wq_b(qr).unflatten(-1, (self.heads, self.head_dim)), positions
-        )
-        if index_dtype == "fp8":
-            return round_query_rows(query)
-        return quantize_fp4(query, dequantize=True)
-
-    def forward(self, hidden, qr, keys, rope, step, candidates, *, index_dtype):
-        positions = torch.arange(
-            step.position, step.position + step.length, device=hidden.device
-        )
-        query = self.project_query(qr, rope, positions, index_dtype)
-        weights = self.weights_proj(hidden) * self.weights_scale
-        return select_indices(
-            query,
-            weights,
-            keys,
-            (positions + 1) // self.spec.ratio,
-            topk=self.topk,
-            candidate_blocks=candidates,
-            make_candidates=self.spec.produces_candidates,
-            block_size=self.block_size,
-            topk_blocks=self.topk_blocks,
-            tie_break=self.tie_break,
+        return rope(
+            self.wq_b(qr, x_scale=qr_scale).unflatten(-1, (self.heads, self.head_dim)),
+            positions,
         )
 
 
@@ -119,7 +93,15 @@ class Attention(nn.Module):
         self.wq_a = ReplicatedLinear(
             config.hidden_size, config.q_lora_rank, quant_config=native_quant_config()
         )
-        self.q_norm = RMSNorm(config.q_lora_rank, config.rms_norm_eps)
+        # Fused: the norm emits `(qr, qr_scale)` in the one launch, and both
+        # readers of `qr` -- this layer's `wq_b` and the indexer's -- take that
+        # pair instead of quantizing the same tensor once each.
+        self.q_norm = RMSNorm(
+            config.q_lora_rank,
+            config.rms_norm_eps,
+            fused_quant=True,
+            quant_config=native_quant_config(),
+        )
         self.wq_b = ColumnParallelLinear(
             config.q_lora_rank,
             config.num_attention_heads * self.head_dim,
@@ -177,37 +159,18 @@ class Attention(nn.Module):
             index = self.indexer.project_keys(latent, rope, rows * self.spec.ratio)
             cache.write_index(owner, step, rows, index, self.spec.ratio)
 
-    def _update_indices(self, hidden, qr, cache, step, rope):
-        if self.spec.ratio and self.indexer is not None:
-            owner = self.spec.kv_owner
-            count = (step.position + step.length) // self.spec.ratio
-            source = self.spec.candidate_source
-            selected, candidates_out = self.indexer(
-                hidden,
-                qr,
-                cache.index_keys(owner, count),
-                rope,
-                step,
-                None if source is None else step.candidates[source],
-                index_dtype=cache.index_dtype,
-            )
-            step.indices[self.spec.layer_id] = selected
-            if candidates_out is not None:
-                step.candidates[self.spec.layer_id] = candidates_out
+    def _select_indices(self, hidden, qr, qr_scale, cache, step, rope):
+        """This layer's top-k index rows, out of the paged plane.
 
-    def _score_batch(self, hidden, qr, cache, step, rope):
-        """Every query row's top-k at once, out of the paged plane.
-
-        The whole batch rather than a request at a time, which is what the
-        scorer takes and what `build_indices` wants anyway -- the per-request
-        walk only survived here because the tiled path needed one request's
-        key tile.
+        Every query row carries its own bound and its own tile list, so a
+        prefill token, a decode token and a drafted token are one shape to the
+        scorer and a ragged batch is not a case to it.
         """
         indexer, spec = self.indexer, self.spec
         positions = cache.rope_positions(step)
-        source = self.spec.candidate_source
-        selected, chosen = score_topk_decode(
-            indexer.project_query(qr, rope, positions, cache.index_dtype)[0],
+        source = spec.candidate_source
+        selected, chosen = score_topk_paged(
+            indexer.project_query(qr, qr_scale, rope, positions)[0],
             indexer.weights_proj(hidden)[0],
             cache.index_units[spec.kv_owner],
             cache.unit_tiles(step, spec.ratio),
@@ -262,9 +225,10 @@ class Attention(nn.Module):
 
     def forward(self, hidden, cache, step, rope):
         positions = cache.rope_positions(step)
-        qr = self.q_norm(self.wq_a(hidden))
+        qr, qr_scale = self.q_norm(self.wq_a(hidden))
         query = rope(
-            self.wq_b(qr).unflatten(-1, (self.heads, self.head_dim)), positions
+            self.wq_b(qr, x_scale=qr_scale).unflatten(-1, (self.heads, self.head_dim)),
+            positions,
         )
         raw_kv = rope(self.kv_norm(self.wkv(hidden)), positions)
         # Decode consumes only the stored window; do not materialize an unused
@@ -276,16 +240,8 @@ class Attention(nn.Module):
         )
         window_kv = quantize_fp8(raw_kv) if cache.packed else kv
         self._compress_batch(hidden, cache, step, rope)
-        if self.indexer is not None and cache.scores_paged(step):
-            self._score_batch(hidden, qr, cache, step, rope)
-        else:
-            # Per request, because the tiled scorer holds one request's key
-            # tile and bounds it by that request's committed row count. The
-            # paged scorer above takes the batch and needs no walk.
-            for request_cache, request_step, rows in cache.requests(step):
-                self._update_indices(
-                    hidden[:, rows], qr[:, rows], request_cache, request_step, rope
-                )
+        if self.indexer is not None:
+            self._select_indices(hidden, qr, qr_scale, cache, step, rope)
         prefix, prefix_indptr, extend, extend_indptr = cache.attention_indices(
             self.spec, step
         )

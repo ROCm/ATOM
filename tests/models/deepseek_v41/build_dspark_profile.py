@@ -32,7 +32,7 @@ def main():
         hf_config=get_hf_config(args.model),
         tensor_parallel_size=sps["tp"],
         kv_cache_dtype=sps["cache_dtype"],
-        index_cache_dtype=sps["cache_dtype"],
+        index_cache_dtype="fp8",
         enforce_eager=not sps["graph"],
     )
     identity = calibration_identity(config, torch.device("cuda", 0))

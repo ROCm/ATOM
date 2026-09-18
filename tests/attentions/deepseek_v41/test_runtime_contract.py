@@ -24,7 +24,7 @@ def test_production_geometry_has_only_four_global_owners():
             (owner, config.compress_ratios[owner])
             for owner in config.kv_source_layer_ids
         ),
-        16,
+        32,
         config.sliding_window,
         config.head_dim,
         config.index_head_dim,
@@ -38,8 +38,10 @@ def test_production_geometry_has_only_four_global_owners():
     # One field per owner: the index rows are a region of their own, bought
     # with the page and addressed by the same block id.
     assert len(geo.page_fields) == 4
-    assert geo.page_bytes == 16 * (3 / 2 + 1) * 512 * 2
-    assert geo.paged_bytes == 16 * (3 / 2 + 1) * (512 + 128) * 2
+    assert geo.page_bytes == 32 * (3 / 2 + 1) * 512 * 2
+    # 132 B per index row: 128 of data and one FP32 scale, the preshuffled
+    # block divided by the 16 rows it names.
+    assert geo.paged_bytes == 32 * (3 / 2 + 1) * (512 * 2 + 132)
     assert sum(f.bytes_per_entry for f in geo.state_fields) <= geo.state_bytes
     assert geo.state_fields[0].layers == 40
     assert all(field.in_checkpoint for field in geo.state_fields)
@@ -63,11 +65,11 @@ def runtime_config(**overrides):
         "online_quant_config": None,
         "eplb_enable": False,
         "kv_cache_dtype": "bf16",
-        "index_cache_dtype": "bf16",
+        "index_cache_dtype": "fp8",
         "kv_cache_block_size": 16,
         "tensor_parallel_size": 4,
         "enable_expert_parallel": True,
-        "hf_config": SimpleNamespace(index_topk_tie_break="small_position"),
+        "hf_config": SimpleNamespace(),
     }
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -92,12 +94,7 @@ def runtime_config(**overrides):
         {"online_quant_config": {}},
         {"eplb_enable": True},
         {"kv_cache_dtype": "fp8"},
-        {"index_cache_dtype": "fp4"},
-        # The paged scorer that an FP8 plane implies has one tie policy.
-        {
-            "index_cache_dtype": "fp8",
-            "hf_config": SimpleNamespace(index_topk_tie_break="large_position"),
-        },
+        {"index_cache_dtype": "bf16"},
         {"kv_cache_block_size": 3},
         {"enable_expert_parallel": False},
     ],
@@ -111,7 +108,7 @@ def test_unimplemented_modes_fail_before_loading(override):
 def test_empty_rank_padding_has_no_cache_writes(monkeypatch):
     from atom.models.deepseek_v41 import runtime
 
-    geo = V41PoolGeometry(2, ((1, 2),), 4, 4, 512, 32)
+    geo = V41PoolGeometry(2, ((1, 2),), 32, 4, 512, 32)
     cache = PagedAttentionCache(geo, 4, 2, "cpu")
     cache.backing.fill_(57)
     before = cache.backing.clone()
@@ -144,7 +141,7 @@ def test_a_forward_reads_nothing_the_forward_before_it_selected(monkeypatch):
     """
     from atom.models.deepseek_v41 import runtime
 
-    geo = V41PoolGeometry(2, ((1, 2),), 4, 4, 512, 32)
+    geo = V41PoolGeometry(2, ((1, 2),), 32, 4, 512, 32)
     cache = PagedAttentionCache(geo, 4, 2, "cpu")
     step = cache.begin_step([RequestSpan(0, 0, 0, 1, 0, (0,))], plans={})
     memos = {name: getattr(step, name) for name in ("selected", "candidates")}
@@ -179,12 +176,13 @@ def test_a_forward_reads_nothing_the_forward_before_it_selected(monkeypatch):
 @pytest.mark.parametrize("cache_dtype", ["bf16", "fp4"])
 @pytest.mark.parametrize("graph", [False, True])
 def test_supported_cache_and_piecewise_graph_modes(cache_dtype, graph):
+    """The main pool takes either format against the one index plane."""
     from atom.config import CUDAGraphMode
 
     validate_runtime_config(
         runtime_config(
             kv_cache_dtype=cache_dtype,
-            index_cache_dtype=cache_dtype,
+            index_cache_dtype="fp8",
             enforce_eager=not graph,
             compilation_config=SimpleNamespace(
                 level=0, cudagraph_mode=CUDAGraphMode.PIECEWISE
@@ -193,25 +191,15 @@ def test_supported_cache_and_piecewise_graph_modes(cache_dtype, graph):
     )
 
 
-@pytest.mark.parametrize(
-    "index_dtype, capturable", [("fp8", True), ("bf16", False), ("fp4", False)]
-)
-def test_whole_forward_capture_admits_only_the_paged_scorer(index_dtype, capturable):
-    """FULL is the mode where a decode step is one replay, and the tiled
-    scorer cannot be in one: it walks the batch on the host."""
-    from atom.config import CUDAGraphMode
+@pytest.mark.parametrize("index_dtype", ["bf16", "fp4"])
+def test_an_index_plane_other_than_fp8_is_refused(index_dtype):
+    """The paged scorer is the only one a cache has, and it reads FP8.
 
-    value = runtime_config(
-        kv_cache_dtype="fp4" if index_dtype == "fp4" else "bf16",
-        index_cache_dtype=index_dtype,
-        enforce_eager=False,
-        compilation_config=SimpleNamespace(level=0, cudagraph_mode=CUDAGraphMode.FULL),
-    )
-    if capturable:
-        validate_runtime_config(value)
-        return
-    with pytest.raises(ValueError, match="paged scorer"):
-        validate_runtime_config(value)
+    A plane stored otherwise has no reader, which is a load-time refusal and
+    not a slower path: the format is the runtime's, not a tuning knob.
+    """
+    with pytest.raises(ValueError, match="index plane other than fp8"):
+        validate_runtime_config(runtime_config(index_cache_dtype=index_dtype))
 
 
 @pytest.mark.parametrize("graph", [False, True])
@@ -225,7 +213,7 @@ def test_native_dspark_passes_production_admission(graph, dynamic):
         compilation_config=SimpleNamespace(
             level=0, cudagraph_mode=CUDAGraphMode.PIECEWISE
         ),
-        hf_config=SimpleNamespace(index_topk_tie_break="small_position"),
+        hf_config=SimpleNamespace(),
         speculative_config=SimpleNamespace(
             method="dspark",
             num_speculative_tokens=5,
@@ -239,6 +227,6 @@ def test_native_dspark_passes_production_admission(graph, dynamic):
         ),
     )
     validate_runtime_config(value)
-    value.kv_cache_dtype = value.index_cache_dtype = "fp4"
+    value.kv_cache_dtype = "fp4"
     with pytest.raises(ValueError, match="BF16"):
         validate_runtime_config(value)

@@ -61,7 +61,6 @@ def main():
                 confidence_schedule=True, ragged=True, disable_sps_calib=True
             ),
             kv_cache_dtype="bf16",
-            index_cache_dtype="bf16",
             max_num_batched_tokens=1024,
             max_model_len=512,
             max_num_seqs=4,

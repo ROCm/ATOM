@@ -99,7 +99,7 @@ def main():
             cudagraph_mode=CUDAGraphMode.PIECEWISE, cudagraph_capture_sizes=[1, 2, 4]
         ),
         kv_cache_dtype="fp4",
-        index_cache_dtype="fp4",
+        index_cache_dtype="fp8",
         max_num_batched_tokens=1024,
         max_model_len=2048,
         max_num_seqs=4,

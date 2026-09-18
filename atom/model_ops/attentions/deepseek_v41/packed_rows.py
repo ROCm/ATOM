@@ -51,54 +51,6 @@ def load_mixed_rows(pool, tagged_rows, dims, valid, D: tl.constexpr):
     return tl.where(mask, value * multiplier, 0).to(tl.bfloat16)
 
 
-@triton.jit
-def _gather_index(
-    pages,
-    table,
-    ids,
-    out,
-    COUNT: tl.constexpr,
-    D: tl.constexpr,
-    PAGE_STRIDE: tl.constexpr,
-    ROW_STRIDE: tl.constexpr,
-    ROWS: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    d = tl.arange(0, D)
-    logical = tl.load(ids + i, i < COUNT, other=0)
-    page = tl.load(table + logical // ROWS, i < COUNT, other=0).to(tl.int64)
-    base = page * PAGE_STRIDE + (logical % ROWS) * ROW_STRIDE
-    packed = tl.load(
-        pages + base[:, None] + d[None, :] // 2, i[:, None] < COUNT, other=0
-    )
-    code = (packed >> ((d[None, :] % 2) * 4)) & 15
-    scale = tl.load(
-        pages + base[:, None] + D // 2 + d[None, :] // 32, i[:, None] < COUNT, other=127
-    )
-    value = _e2m1(code) * _e8m0(scale)
-    tl.store(out + i[:, None] * D + d[None, :], value, i[:, None] < COUNT)
-
-
-def gather_index_rows(pages, table, ids, dim):
-    ids = ids.contiguous()
-    output = torch.empty((*ids.shape, dim), dtype=torch.bfloat16, device=pages.device)
-    if ids.numel():
-        _gather_index[(triton.cdiv(ids.numel(), 16),)](
-            pages,
-            table,
-            ids,
-            output,
-            ids.numel(),
-            dim,
-            pages.stride(0),
-            pages.stride(1),
-            pages.shape[1],
-            16,
-        )
-    return output
-
-
 def pack_rows(values, scales):
     """Interleave existing native value/scale bytes without quantizing again."""
     return torch.cat((values.view(torch.uint8), scales.view(torch.uint8)), dim=-1)

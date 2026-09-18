@@ -1,15 +1,22 @@
 # SPDX-License-Identifier: MIT
-"""Decode-time CSA2 index scoring, straight out of the FP8 paged plane.
+"""CSA2 index scoring, straight out of the FP8 paged plane.
 
-The tiled scorer in `indexer.py` reads keys as BF16 and holds a tile of them;
-this one hands the plane to `deepgemm_fp8_paged_mqa_logits` and never
-materializes a key. What it costs is expressiveness: visibility has to be a
-per-row prefix and ties go to the smaller position, which is why the other
-formats and the large-position tie-break stay on the tiled path.
+The only index scorer there is: it hands the plane to
+`deepgemm_fp8_paged_mqa_logits` and never materializes a key, and what it asks
+in return is that visibility be a per-row prefix.
 
-Each query row is its own batch item (`next_n=1`), which is how a speculative
-block gets an exact bound per drafted token rather than one shared by the
-request -- the same shape DeepSeek-V4's `_score_topk_decode` passes.
+Each query row is its own batch item (`next_n=1`) with its own bound and its
+own tile list, so nothing here is a function of the batch's composition: a
+prefill token, a decode token and a drafted token are the same row to it, and
+a ragged batch needs no uniform query length. DeepSeek-V4's own paged scorer
+reshapes `[bs, next_n]` and does demand one, which is why V4 keeps a separate
+concatenated-key scorer for prefill and this file does not.
+
+Scoring a prefill batch here rather than by concatenating the batch's keys was
+measured on the production geometry: `/app/logs_claude/v41_index_scorer_record.md`.
+The two arrangements pick identical rows and run within 15% of each other, and
+this one's logits are `1/batch` of the other's because its columns are one
+request's rows rather than every request's.
 """
 
 import torch
@@ -19,7 +26,10 @@ from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logi
 
 from atom.model_ops.v4_kernels import scale_indexer_weights
 
-from .indexer import ascending_with_padding
+from .indexer import (
+    pick_candidate_blocks,
+    restrict_to_candidates,
+)
 
 
 def quantize_query_rows(query):
@@ -34,17 +44,6 @@ def quantize_query_rows(query):
     scale = torch.empty((rows.shape[0], 1), dtype=torch.float32, device=rows.device)
     dynamic_per_token_scaled_quant(stored, rows, scale)
     return stored.view_as(query), scale
-
-
-def round_query_rows(query):
-    """The same rounding, kept in BF16 for the scorer that has no FP8 path.
-
-    So that a tiled run and a paged run differ in how they accumulate and not
-    in what they accumulate: the query a BF16 einsum sees is the one the FP8
-    kernel would have dequantized.
-    """
-    stored, scale = quantize_query_rows(query)
-    return (stored.float() * scale.view(*query.shape[:-1], 1)).to(query.dtype)
 
 
 def unit_table(block_tables, batch_ids, units_per_page):
@@ -64,68 +63,7 @@ def unit_table(block_tables, batch_ids, units_per_page):
     return (pages[..., None] * units_per_page + tiles).flatten(-2).int()
 
 
-def _as_blocks(logits, block_size):
-    """`[rows, blocks, block_size]`, a view -- so a write through it lands.
-
-    Always a view, never a padded copy: the scored width is a whole number of
-    tiles and a tile is a whole number of candidate blocks, so a width that
-    does not divide means the two were configured apart and the mask below
-    would be written into a temporary and lost.
-    """
-    rows, width = logits.shape
-    if width % block_size:
-        raise ValueError(
-            f"{width} scored columns is not a whole number of {block_size}-row "
-            "candidate blocks"
-        )
-    return logits.view(rows, -1, block_size)
-
-
-def restrict_to_candidates(logits, candidates, block_size):
-    """-inf every row outside the candidate blocks, in place.
-
-    The consumer layers attend inside the blocks their candidate source chose,
-    so scoring the whole width and removing the rest is the same selection --
-    a kept row's score is not a function of what else was scored. Padding
-    lands in a column past the real ones rather than on block 0, which a
-    `clamp` would silently keep.
-
-    Broadcast over the block axis rather than expanding the mask to one bool
-    per column: at a million-token context that expansion is the largest
-    allocation on the step.
-    """
-    blocks = -(-logits.shape[1] // block_size)
-    keep = torch.zeros(
-        logits.shape[0], blocks + 1, dtype=torch.bool, device=logits.device
-    )
-    ids = torch.where(candidates >= 0, candidates, blocks).long()
-    keep.scatter_(1, ids, torch.ones_like(ids, dtype=torch.bool))
-    _as_blocks(logits, block_size).masked_fill_(~keep[:, :blocks, None], -torch.inf)
-
-
-def pick_candidate_blocks(logits, visible, block_size, count):
-    """The `count` best blocks per row, ascending, with the newest pinned.
-
-    The block's score is its best row's, and the block holding the most recent
-    visible row is kept whatever it scored -- both are the tiled path's rules,
-    since this only changes where the scores come from.
-    """
-    maxima = _as_blocks(logits, block_size).amax(-1)
-    ids = torch.arange(maxima.shape[-1], device=logits.device).expand_as(maxima)
-    seen = visible.long()[:, None]
-    maxima = maxima.masked_fill(ids >= -(-seen // block_size), -torch.inf)
-    maxima = maxima.masked_fill(
-        (seen > 0) & (ids == (seen - 1) // block_size), torch.inf
-    )
-    # Stable, descending: ties go to the smaller block, as the tiled merge does.
-    order = maxima.sort(stable=True, dim=-1, descending=True).indices[:, :count]
-    chosen = ids.gather(-1, order)
-    return ascending_with_padding(
-        torch.where(maxima.gather(-1, order) > -torch.inf, chosen, -1)
-    )
-
-
-def score_topk_decode(
+def score_topk_paged(
     query,
     weights,
     plane,
@@ -138,7 +76,7 @@ def score_topk_decode(
     block_size=8,
     candidate_count=0,
 ):
-    """`(selected, candidate blocks)` for a whole decode batch.
+    """`(selected, candidate blocks)` for a whole forward's query rows.
 
     `selected` is `[rows, topk]` ascending compressed-row ids, -1 padded, the
     layout `build_indices` reads. Rows past a row's own visibility are never
@@ -147,6 +85,9 @@ def score_topk_decode(
 
     The scored width and the block the kernel pages by both come off `plane`,
     which is the only place either is a fact rather than a restatement.
+
+    `candidates` bounds this layer to an earlier layer's blocks and
+    `candidate_count` makes this layer that earlier one; never both.
     """
     rows, heads = weights.shape
     tile = plane.shape[1]
@@ -185,7 +126,8 @@ def score_topk_decode(
         k=topk,
         stable=True,
     )
-    # Ascending, because the attention kernel sums its prefix in the order it
-    # is given and the tiled path emits ascending: a different order is a
-    # different rounding, not a different selection.
-    return ascending_with_padding(selected), chosen
+    # Ascending already: `stable=True` is aiter's deterministic ascending,
+    # smallest-index-first emit with `-1` for a short row, which is the order
+    # the attention kernel sums its prefix in. Re-sorting it here was a kernel
+    # that changed nothing, ties included.
+    return selected, chosen

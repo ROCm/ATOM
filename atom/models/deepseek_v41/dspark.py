@@ -36,8 +36,10 @@ class DraftAttention(Attention):
         return quantize_fp8(keys, dequantize=not packed)
 
     def forward(self, hidden, context_kv, step, rope):
-        qr = self.q_norm(self.wq_a(hidden))
-        query = self.wq_b(qr).unflatten(-1, (self.heads, self.head_dim))
+        qr, qr_scale = self.q_norm(self.wq_a(hidden))
+        query = self.wq_b(qr, x_scale=qr_scale).unflatten(
+            -1, (self.heads, self.head_dim)
+        )
         query = rotate_rows(rope, query, step.positions)
         keys = self.project_context(hidden, step.positions, rope)
         output = draft_attention(
