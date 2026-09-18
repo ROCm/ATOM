@@ -220,8 +220,17 @@ PD producer) over ZMQ so external routers and cache managers can mirror what
 each engine holds. Every batch carries a monotonic 8-byte sequence number;
 a consumer that sees a gap can ask for the missed batches over the optional
 replay socket. Events are advisory and never stall inference: the in-process
-queue drops the oldest batch when full. These variables build the default
-`KVEventsConfig` (see `atom/config.py`); a CLI flag, when given, overrides them.
+queue drops the oldest batch when full. These variables are the only way to
+configure the feature today: they build `KVEventsConfig` (see `atom/config.py`)
+and there is no CLI flag.
+
+Endpoint rules: each publisher binds its PUB and replay endpoints offset by its
+data-parallel rank (see `ATOM_KV_EVENTS_ENDPOINT`), so with `tcp://` the two
+configured ports must be at least `data_parallel_size` apart or rank N's PUB
+lands on rank N-1's replay port. Under pipeline parallelism only the head stage
+publishes; downstream stages bind nothing. Prefill/decode disaggregation runs
+separate engine processes, and only decode publishes; if other engines share
+the host, give each its own endpoints.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|

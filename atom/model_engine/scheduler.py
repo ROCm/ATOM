@@ -627,7 +627,24 @@ class Scheduler:
         )
         if config.enable_prefix_caching:
             self.engine_stats.block_manager = self.block_manager
-        if kv_events_cfg is not None and kv_events_cfg.enable:
+        # Under pipeline parallelism every stage builds a Scheduler, but only
+        # the head stage schedules and hashes blocks; the others never produce
+        # events. Give them the null publisher so they neither bind the
+        # per-DP-rank endpoints (a downstream stage on the same host would
+        # collide with the head) nor emit duplicate streams.
+        pp_rank = (
+            getattr(parallel_cfg, "pipeline_parallel_rank", 0)
+            if parallel_cfg is not None
+            else 0
+        )
+        kv_events_on = kv_events_cfg is not None and kv_events_cfg.enable
+        if kv_events_on and pp_rank:
+            logger.info(
+                "KV event publisher disabled on PP stage %s: only the head "
+                "stage publishes",
+                pp_rank,
+            )
+        if kv_events_on and not pp_rank:
             self.kv_event_publisher: _EventPublisher = _make_publisher(
                 enabled=True,
                 publisher_kind=kv_events_cfg.publisher,

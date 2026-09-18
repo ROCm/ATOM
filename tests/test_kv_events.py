@@ -28,6 +28,7 @@ from atom.config import KVEventsConfig
 from atom.distributed.kv_events import (
     MEDIUM_GPU,
     MEDIUM_REMOTE,
+    REPLAY_CHUNK,
     REPLAY_DONE,
     AllBlocksCleared,
     BlockRemoved,
@@ -498,6 +499,42 @@ class TestKVEventsConfig:
         assert cfg.replay_buffer_steps == 10_000
 
 
+class TestPPPublisherOwnership:
+    @staticmethod
+    def _scheduler(pp_rank: int) -> Scheduler:
+        class _KVEventsConfig:
+            enable = True
+            publisher = "zmq"
+            endpoint = f"inproc://test-kv-pp-{pp_rank}"
+            topic = ""
+            hwm = 0
+            buffer_steps = 8
+            replay_endpoint = ""
+            replay_buffer_steps = 8
+
+        cfg = MockConfig(enable_prefix_caching=True)
+        cfg.kv_events_config = _KVEventsConfig()
+        cfg.parallel_config = SimpleNamespace(
+            data_parallel_rank=0, pipeline_parallel_rank=pp_rank
+        )
+        return Scheduler(cfg)
+
+    def test_head_stage_publishes(self):
+        pytest.importorskip("zmq")
+        sched = self._scheduler(pp_rank=0)
+        try:
+            assert isinstance(sched.kv_event_publisher, ZmqEventPublisher)
+        finally:
+            sched.shutdown_kv_events()
+
+    def test_downstream_stage_gets_null_publisher(self):
+        # Downstream PP stages never schedule, so they must not bind the
+        # (per-DP-rank) endpoints the head stage on the same host owns.
+        sched = self._scheduler(pp_rank=1)
+        assert isinstance(sched.kv_event_publisher, NullEventPublisher)
+        sched.shutdown_kv_events()
+
+
 # ── Per-DP-rank endpoints ──────────────────────────────────────────────────
 
 
@@ -520,6 +557,15 @@ class TestEndpointOffset:
     def test_tcp_without_numeric_port_is_rejected_for_nonzero_rank(self):
         with pytest.raises(ValueError, match="numeric port"):
             offset_endpoint("tcp://127.0.0.1:*", 1)
+
+    def test_bind_collision_explains_endpoint_rules(self):
+        pytest.importorskip("zmq")
+        pub = ZmqEventPublisher(endpoint="inproc://test-kv-collide", buffer_steps=4)
+        try:
+            with pytest.raises(RuntimeError, match="data_parallel_size apart"):
+                ZmqEventPublisher(endpoint="inproc://test-kv-collide", buffer_steps=4)
+        finally:
+            pub.shutdown()
 
     def test_dp_ranks_bind_distinct_pub_and_replay_sockets(self):
         # Two ranks configured with the *same* endpoints (as every DP Scheduler
@@ -827,6 +873,100 @@ class TestReplayEndpointWiring:
             assert got_terminal
         finally:
             pub.shutdown()
+
+    def test_large_replay_is_chunked_and_complete(self):
+        # A window several chunks long is delivered in order and finished with
+        # REPLAY_DONE; the chunking is invisible to the consumer.
+        zmq = pytest.importorskip("zmq")
+        n = REPLAY_CHUNK * 3 + 5
+        pub = ZmqEventPublisher(
+            endpoint="inproc://test-kv-replay-chunk-pub",
+            replay_endpoint="inproc://test-kv-replay-chunk-router",
+            buffer_steps=n,
+            replay_buffer_steps=n,
+        )
+        ctx = zmq.Context.instance()
+        try:
+            for i in range(n):
+                pub.publish([BlockRemoved(block_hashes=[i])])
+            polls = 500
+            while pub.stats["sent"] < n and polls > 0:
+                time.sleep(0.02)
+                polls -= 1
+            assert pub.stats["sent"] == n
+            dealer = ctx.socket(zmq.DEALER)
+            dealer.connect("inproc://test-kv-replay-chunk-router")
+            dealer.send((10).to_bytes(8, "big"))
+            got: list[int] = []
+            window = None
+            while dealer.poll(timeout=1000):
+                seq_bytes, payload = dealer.recv_multipart()
+                if seq_bytes == REPLAY_DONE:
+                    window = msgspec.msgpack.decode(payload)
+                    break
+                got.append(int.from_bytes(seq_bytes, "big"))
+            dealer.close(linger=0)
+            assert got == list(range(10, n))
+            assert window == [0, n - 1]
+            assert pub.stats["replayed"] == n - 10
+        finally:
+            pub.shutdown()
+
+    def test_replay_yields_to_live_queue_between_chunks(self):
+        # Drive the sender-loop pieces by hand: one _advance_replay call sends
+        # exactly one chunk and leaves the request pending, which is the seam
+        # where _run drains the live queue before the next chunk.
+        zmq = pytest.importorskip("zmq")
+        pub = ZmqEventPublisher(
+            endpoint="inproc://test-kv-replay-yield-pub",
+            replay_endpoint="inproc://test-kv-replay-yield-router",
+            buffer_steps=64,
+            replay_buffer_steps=64,
+        )
+        ctx = zmq.Context.instance()
+        dealer = ctx.socket(zmq.DEALER)
+        try:
+            for i in range(20):
+                pub.publish([BlockRemoved(block_hashes=[i])])
+            polls = 200
+            while pub.stats["sent"] < 20 and polls > 0:
+                time.sleep(0.02)
+                polls -= 1
+            pub._queue.put_nowait(None)  # stop the sender thread
+            pub._sender.join(timeout=2.0)
+            pub._replay_chunk = 7
+
+            dealer.connect("inproc://test-kv-replay-yield-router")
+            dealer.send(b"\x00" * 8)
+            assert pub._replay.poll(timeout=1000)
+            pub._accept_replay_request()
+            assert pub._pending_replay is not None
+
+            pub._advance_replay()
+            assert pub.stats["replayed"] == 7
+            assert pub._pending_replay[1] == 7  # resumes at seq 7
+            pub._advance_replay()
+            assert pub.stats["replayed"] == 14
+            pub._advance_replay()  # 6 left, then the terminal frame
+            assert pub.stats["replayed"] == 20
+            assert pub._pending_replay is None
+
+            got: list[int] = []
+            done = False
+            while dealer.poll(timeout=1000):
+                seq_bytes, _ = dealer.recv_multipart()
+                if seq_bytes == REPLAY_DONE:
+                    done = True
+                    break
+                got.append(int.from_bytes(seq_bytes, "big"))
+            assert got == list(range(20))
+            assert done
+        finally:
+            dealer.close(linger=0)
+            with contextlib.suppress(Exception):
+                pub._socket.close(linger=0)
+            with contextlib.suppress(Exception):
+                pub._replay.close(linger=0)
 
     def test_slow_replay_client_does_not_stall_live_publishing(self):
         # A DEALER that requests a large window and never reads fills its pipe.

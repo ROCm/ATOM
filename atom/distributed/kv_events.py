@@ -141,6 +141,28 @@ class NullEventPublisher(EventPublisher):
         return
 
 
+# Batches a single sender-loop iteration replays before it goes back to the
+# live queue. Bounds how long a large replay (default retention 10k batches)
+# can keep the live PUB stream waiting; it does not bound the replay itself.
+REPLAY_CHUNK: Final = 64
+
+
+def _bind(sock, endpoint: str, role: str, zmq_error_cls) -> None:
+    """Bind, turning EADDRINUSE and friends into an error that names the
+    endpoint rules, since the collision is usually a config mistake."""
+    try:
+        sock.bind(endpoint)
+    except zmq_error_cls as e:
+        raise RuntimeError(
+            f"KV events: cannot bind {role} socket to {endpoint!r}: {e}. "
+            "Each publisher binds its configured PUB and replay endpoints "
+            "offset by its DP rank, so (a) the two configured tcp ports must "
+            "be at least data_parallel_size apart, and (b) every other engine "
+            "process on this host (a P/D peer, another deployment) needs its "
+            "own ATOM_KV_EVENTS_ENDPOINT / ATOM_KV_EVENTS_REPLAY_ENDPOINT."
+        ) from e
+
+
 def offset_endpoint(endpoint: str, data_parallel_rank: int | None) -> str:
     """Make a configured ZMQ bind endpoint unique per data-parallel rank.
 
@@ -193,7 +215,7 @@ class ZmqEventPublisher(EventPublisher):
     batch, so the 2**64-1 modulus is a wire-format bound, not an operational
     one: at one batch per scheduler step the counter cannot wrap within the
     lifetime of a process. Replay ordering (`seq >= start_seq`) therefore
-    assumes no wrap inside the retained window; see `_service_replay`.
+    assumes no wrap inside the retained window; see `_advance_replay`.
     """
 
     def __init__(
@@ -242,7 +264,7 @@ class ZmqEventPublisher(EventPublisher):
         ctx = zmq.Context.instance()
         self._socket = ctx.socket(zmq.PUB)
         self._socket.set_hwm(hwm)
-        self._socket.bind(self.endpoint)
+        _bind(self._socket, self.endpoint, "PUB", zmq.ZMQError)
         # Captured so the sender thread never re-imports zmq.
         self._zmq_error_cls = zmq.ZMQError
         self._zmq_again_cls = zmq.Again
@@ -266,8 +288,13 @@ class ZmqEventPublisher(EventPublisher):
             # and every replay send is NOBLOCK, so that error is EAGAIN: the
             # request is abandoned (see _service_replay) and live sends resume.
             self._replay.setsockopt(zmq.ROUTER_MANDATORY, 1)
-            self._replay.bind(self.replay_endpoint)
+            _bind(self._replay, self.replay_endpoint, "replay ROUTER", zmq.ZMQError)
             self._replay_buffer = deque(maxlen=replay_buffer_steps)
+        # In-progress replay, if any: (routing prefix, next seq to send). Set
+        # by _accept_replay_request, advanced a chunk at a time by
+        # _advance_replay so live sends interleave with a long replay.
+        self._pending_replay: tuple[list[bytes], int] | None = None
+        self._replay_chunk = REPLAY_CHUNK
 
         self._seq_gen = itertools.count()
         self._drops = 0
@@ -360,16 +387,23 @@ class ZmqEventPublisher(EventPublisher):
         # Poll the replay socket between sends. When replay is disabled the
         # queue.get() blocks (timeout=None); when enabled it wakes periodically
         # so replay requests are serviced even while no events are flowing.
-        get_timeout = 0.05 if self._replay is not None else None
+        # While a replay is in progress the loop alternates: one chunk of
+        # replay, then whatever is on the live queue (without waiting), so a
+        # 10k-batch replay to a fast client cannot starve live publication.
+        idle_timeout = 0.05 if self._replay is not None else None
         while True:
             if self._replay is not None:
                 try:
-                    if self._replay.poll(0):
-                        self._service_replay()
+                    if self._pending_replay is None and self._replay.poll(0):
+                        self._accept_replay_request()
+                    if self._pending_replay is not None:
+                        self._advance_replay()
                 except self._zmq_error_cls:  # pragma: no cover - closed on shutdown
                     return
                 except Exception:  # pragma: no cover - replay is non-critical
                     logger.exception("KV event replay request failed")
+                    self._pending_replay = None
+            get_timeout = 0 if self._pending_replay is not None else idle_timeout
             try:
                 item = self._queue.get(timeout=get_timeout)
             except queue.Empty:
@@ -388,11 +422,26 @@ class ZmqEventPublisher(EventPublisher):
             except self._zmq_error_cls:  # pragma: no cover - socket closed
                 return
 
-    def _service_replay(self) -> None:
-        """Answer a pending replay request: resend every buffered batch with
-        seq >= the requested start sequence, then a terminal frame so the
-        consumer knows the reply is complete. Request frame is
-        `[client_id, (delim,) start_seq]`; we echo the routing prefix back.
+    def _accept_replay_request(self) -> None:
+        """Take one replay request off the ROUTER and make it the pending
+        replay. Request frame is `[client_id, (delim,) start_seq]`; the routing
+        prefix is echoed back on every reply frame."""
+        frames = self._replay.recv_multipart()
+        if len(frames) < 2:
+            logger.warning("KV event replay: malformed request %r", frames)
+            return
+        try:
+            start_seq = int.from_bytes(frames[-1], "big")
+        except (TypeError, ValueError):
+            logger.warning("KV event replay: bad start_seq %r", frames[-1])
+            return
+        self._pending_replay = (frames[:-1], start_seq)
+
+    def _advance_replay(self) -> None:
+        """Send the next chunk of the pending replay: up to `_replay_chunk`
+        buffered batches with seq >= the request's start sequence, in order.
+        When the buffer is exhausted, send a terminal frame so the consumer
+        knows the reply is complete, and clear the pending replay.
 
         The terminal frame is `[*prefix, REPLAY_DONE, [oldest, latest]]`:
         REPLAY_DONE distinguishes it from data frames, and the msgpack window
@@ -404,25 +453,27 @@ class ZmqEventPublisher(EventPublisher):
         wrap would misorder, but the counter starts at 0 per process and steps
         by one per batch, so reaching the wrap is not achievable in practice
         (~1.8e19 batches). Not handled by design; see the class docstring."""
-        frames = self._replay.recv_multipart()
-        if len(frames) < 2:
-            logger.warning("KV event replay: malformed request %r", frames)
-            return
-        try:
-            start_seq = int.from_bytes(frames[-1], "big")
-        except (TypeError, ValueError):
-            logger.warning("KV event replay: bad start_seq %r", frames[-1])
-            return
-        prefix = frames[:-1]  # [client_id] or [client_id, empty_delim]
+        assert self._pending_replay is not None
+        prefix, next_seq = self._pending_replay
         # Safe to iterate the deque directly: the sender thread is the only
-        # mutator and it is the same thread running this method.
+        # mutator and it is the same thread running this method. Batches
+        # appended by live sends between chunks simply extend the replay,
+        # which is what a consumer catching up wants.
         buf = self._replay_buffer or ()
+        sent = 0
         for seq, seq_bytes, payload in buf:
-            if seq >= start_seq:
-                if not self._replay_send([*prefix, seq_bytes, payload]):
-                    return
-                with self._lock:
-                    self._replayed += 1
+            if seq < next_seq:
+                continue
+            if not self._replay_send([*prefix, seq_bytes, payload]):
+                self._pending_replay = None
+                return
+            with self._lock:
+                self._replayed += 1
+            next_seq = seq + 1
+            sent += 1
+            if sent >= self._replay_chunk:
+                self._pending_replay = (prefix, next_seq)
+                return
         # Terminal frame with the available window. Encode with the module
         # helper (fresh encoder) rather than self._encoder, which the scheduler
         # thread uses concurrently in publish().
@@ -430,6 +481,7 @@ class ZmqEventPublisher(EventPublisher):
         latest = buf[-1][0] if buf else None
         window = msgspec.msgpack.encode([oldest, latest])
         self._replay_send([*prefix, REPLAY_DONE, window])
+        self._pending_replay = None
 
     def _replay_send(self, frames: list[bytes]) -> bool:
         """Non-blocking send on the replay ROUTER. Returns False when the
