@@ -33,7 +33,6 @@ from atom.model_ops.v4_kernels.v4_quant import (
     V4_TILE,
 )
 
-
 _ENABLE_NATIVE_BF16_V = os.environ.get("ATOM_V4_TRITON_NATIVE_BF16_V", "0") == "1"
 
 
@@ -1398,9 +1397,7 @@ def sparse_attn_v4_paged_decode_fp8_triton(
             dtype=(
                 torch.float16
                 if fp16_partials
-                else torch.bfloat16
-                if bf16_partials
-                else torch.float32
+                else torch.bfloat16 if bf16_partials else torch.float32
             ),
             device=q_packed.device,
         )
@@ -1575,9 +1572,7 @@ def sparse_attn_v4_paged_decode_fp8_triton_query_group(
             dtype=(
                 torch.float16
                 if fp16_partials
-                else torch.bfloat16
-                if bf16_partials
-                else torch.float32
+                else torch.bfloat16 if bf16_partials else torch.float32
             ),
             device=q_packed.device,
         )
