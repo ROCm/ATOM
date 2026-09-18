@@ -140,6 +140,28 @@ Quantization is a weight-side choice; it does not reach the KV cache, which both
 arms declare as fp8. The two arms are reported together below because every
 figure that follows came out **identical** on them unless a row says otherwise.
 
+**That identity is the expected result, so it cannot double as evidence the two
+arms were really different.** The layer count is fixed by the architecture, the
+token counts by the (seeded) prompt set, and the `Retrieved` histogram by the
+hit structure -- none of them *can* move when only the weight dtype changes, so
+they would read exactly the same if the second arm had never been restarted.
+What separates the arms is weight-side, and it is in the same two logs:
+
+| | MXFP4 | FP8 |
+|---|---|---|
+| `quantization=` in the engine config line | `quark` | `fp8` |
+| peak HBM during weight load + online quant, per rank | 112.46 GB | 187.96 GB |
+| `num_gpu_blocks` vLLM sized *before* the override | 48,709 / 48,676 / 48,676 / 48,665 | 21,269 / 21,236 / 21,236 / 21,225 |
+| fused quant custom ops | none | `+quant_fp8`, `fuse_norm_quant`, `fuse_act_quant` |
+| `/v1/models` on the port under test (check 0) | `amd/GLM-5.3-MXFP4` | `amd/GLM-5.3-FP8` |
+
+Note what that says about `--num-gpu-blocks-override 8192`. Pinning the pool is
+what makes the KV comparison apples-to-apples -- but it is also what erases the
+obvious witness, because both arms then report the same 524,288-token pool
+*by construction*. The witness has to be read one line earlier, from the sizing
+vLLM computed before the override, which still carries the 1.7x difference in
+weight footprint as a 2.3x difference in blocks.
+
 ### Registration
 
 ```
