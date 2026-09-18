@@ -66,9 +66,7 @@ export PYTHONUNBUFFERED=1
 export PYTHONHASHSEED=0
 export PYTHONFAULTHANDLER=1
 export AITER_LOG_LEVEL=WARNING
-export MAX_JOBS=16
-export ATOM_ENABLE_PREFILL_DELAYER=0
-export ATOM_PREFILL_DECODE_INTERVAL=0
+export MAX_JOBS=16                        # Optional: extension-build parallelism
 export AITER_BF16_FP8_MOE_BOUND=0
 export ATOM_MOE_GU_ITLV=1
 export ATOM_HOST_IP=<PREFILL_IP>          # <DECODE_IP> on the decode node
@@ -137,6 +135,7 @@ Both sides use the cache-aware router shown in the next section.
 
 ```bash
 # ...the TP exports above, plus:
+export ATOM_ENABLE_PREFILL_DELAYER=0       # Disable cross-DP prefill coalescing
 export GPU_MEM=0.75                      # 0.70 on decode
 
 python3 -u -m atom.entrypoints.openai_server \
@@ -231,9 +230,8 @@ export PYTHONUNBUFFERED=1
 export PYTHONHASHSEED=0
 export PYTHONFAULTHANDLER=1
 export AITER_LOG_LEVEL=WARNING
-export MAX_JOBS=16
+export MAX_JOBS=16                        # Optional: extension-build parallelism
 export ATOM_ENABLE_PREFILL_DELAYER=0
-export ATOM_PREFILL_DECODE_INTERVAL=0
 export AITER_BF16_FP8_MOE_BOUND=0
 export ATOM_MOE_GU_ITLV=1
 export ATOM_HOST_IP=10.0.0.1                    # this node
