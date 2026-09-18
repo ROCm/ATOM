@@ -86,6 +86,32 @@ def quantize_fp4(
     return output if dequantize else (output.view(torch.float4_e2m1fn_x2), scales)
 
 
+def _auto_split_k(m: int, n: int, k: int, device) -> int:
+    """How many ways to split K, chosen by how much of the device the grid fills.
+
+    The grid is `(cdiv(m, bm), cdiv(n, bn), splits)`. At decode widths that
+    product is tiny -- a 1280x5120 projection at m=32 is 20 workgroups against
+    256 CUs -- so without a K split most of the device idles and the GEMM runs
+    about twice as slow as it needs to. Splitting K is what fills it.
+
+    It is not free: each split writes an FP64 partial that a second pass reduces,
+    so a short K pays more for the partials than it wins in occupancy. Measured
+    on MI355X, K=2048 is already past that point (splitting costs ~15%) while
+    K>=4096 wins ~2x, which is where the gate sits. Splits are capped so each
+    one keeps a meaningful slice of K.
+    """
+    if m <= 16:
+        # The narrow path was tuned against this heuristic; leave it alone.
+        return min(16, triton.cdiv(k, 256))
+    if k < 4096:
+        return 1
+    blocks = triton.cdiv(m, 32) * triton.cdiv(n, 64)
+    units = torch.cuda.get_device_properties(device).multi_processor_count
+    if blocks >= units:
+        return 1
+    return max(1, min(16, k // 1024, -(-units // blocks)))
+
+
 def native_quant_linear(
     x,
     weight,
@@ -143,15 +169,16 @@ def native_quant_linear(
     if m == 0:
         return output
     bk = 32
-    splits = (
-        split_k
-        if split_k is not None
-        else (min(16, triton.cdiv(k, 256)) if m <= 16 else 1)
-    )
+    splits = split_k if split_k is not None else _auto_split_k(m, n, k, x.device)
     if not isinstance(splits, int) or splits < 1:
         raise ValueError("split_k must be a positive integer")
     part_k = triton.cdiv(triton.cdiv(k, splits), bk) * bk
     splits = triton.cdiv(k, part_k)
+    # FP64 partials, and measured to be worth it rather than assumed: dropping
+    # them to FP32 is no faster (the reduce is bound by its launches and its
+    # traffic, not by FP64 arithmetic) and puts the result off by more than
+    # 100% relative, because the FP8 products span a range an FP32 accumulator
+    # cannot hold together. Do not "optimize" this to FP32.
     partial = (
         output
         if splits == 1

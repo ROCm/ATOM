@@ -21,6 +21,13 @@ def native_quant_config(*, fp4=False):
 
 
 def reduce_output(partial):
+    """All-reduce a TP partial in FP32, then return it in the caller's dtype.
+
+    The upcast doubles what goes on the wire, which V4 does not do, so it looks
+    like an easy saving. It is not: measured over a 4-way sum, reducing in BF16
+    instead doubles the error against an FP64 reference while saving about 4 us
+    a call, and this runs on every layer, where the error accumulates.
+    """
     group = get_tp_group()
     if group.world_size == 1:
         return partial
