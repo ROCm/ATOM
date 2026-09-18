@@ -8,9 +8,15 @@ from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
+import logging
+
 import numpy as np
 import torch
 from atom.model_ops.engram_lookup import HostEmbeddingTable
+
+from atom.utils import CpuGpuBuffer, envs
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -86,6 +92,11 @@ class EngramPrefetcher:
         self._pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="engram-prefetch"
         )
+        # The dtype the staging buffers hold. Gathering straight into it avoids
+        # materializing the rows in float32 and then downcasting them on the way
+        # into staging -- two passes over the widest form of the data, on the
+        # host, on every step. `EngramHost` sets this from its own buffers.
+        self.out_dtype = torch.float32
         self._lock = threading.Lock()
         self._pending: dict[EngramRequest, object] = {}
         self._inflight: Future | None = None
@@ -120,13 +131,50 @@ class EngramPrefetcher:
                     history=np.asarray([request.history], dtype=np.int64),
                 )
                 rows.append(self._hash_mapping.to_row_indices(hashes, layer_id)[0])
-            gathered = self._tables[layer_id].gather(np.concatenate(rows))
+            gathered = self._tables[layer_id].gather(
+                np.concatenate(rows), out_dtype=self.out_dtype
+            )
             offset = 0
             for request in requests:
                 end = offset + len(request.token_ids)
                 results[(request, layer_id)] = gathered[offset:end]
                 offset = end
         return results
+
+    def row_indices(self, requests):
+        """The table rows `requests` name, per layer, flattened in request order.
+
+        `compute` without the gather: the hashing is cheap host arithmetic, and
+        the UVA path wants only these indices -- the rows themselves are read by
+        the device kernel.
+        """
+        compressed = [
+            self._hash_mapping.compress_tokens(
+                np.asarray([request.token_ids], dtype=np.int64),
+                (
+                    None
+                    if request.token_mask is None
+                    else np.asarray([request.token_mask])
+                ),
+            )
+            for request in requests
+        ]
+        out = {}
+        for layer_id in self.layer_ids:
+            rows = []
+            for request, tokens in zip(requests, compressed):
+                hashes = self._hash_mapping.hash_layer(
+                    tokens,
+                    layer_id,
+                    compress=False,
+                    history=np.asarray([request.history], dtype=np.int64),
+                )
+                rows.append(self._hash_mapping.to_row_indices(hashes, layer_id)[0])
+            # [tokens, num_hash_heads]: the UVA path hands the whole matrix to
+            # every rank, which keeps the heads a rank does not own addressable
+            # without an index exchange.
+            out[layer_id] = np.ascontiguousarray(np.concatenate(rows), dtype=np.int64)
+        return out
 
     def submit_compute(self, requests):
         requests = tuple(requests)
@@ -191,9 +239,18 @@ class EngramHost:
         device,
         dtype=torch.bfloat16,
     ):
-        from atom.utils import CpuGpuBuffer
-
         self.prefetcher = prefetcher
+        # Gather straight into the staging dtype rather than float32-then-downcast.
+        prefetcher.out_dtype = dtype
+        # Optional: let a device kernel read the tables over UVA instead of
+        # gathering them on the host (ATOM_ENGRAM_UVA). All-or-nothing -- a
+        # partially registered set would silently keep the host path for some
+        # layers, which is the confusing half-state to avoid.
+        self.uva = False
+        self._tp_group = None
+        self._ids_staging = None
+        if device.type == "cuda" and envs.ATOM_ENGRAM_UVA:
+            self.uva = self._enable_uva(prefetcher, num_hash_heads)
         self.max_num_tokens = max_num_tokens
         self.embed_width = num_hash_heads * head_dim
         self.device = device
@@ -261,6 +318,8 @@ class EngramHost:
                 values.update(
                     ((request, layer), value) for layer, value in cached.items()
                 )
+        if self.uva:
+            return self._stage_uva(requests, rows, staged)
         values.update(self.prefetcher.compute(missing))
         for layer, buffer in self.buffers.items():
             offset = 0
@@ -272,6 +331,133 @@ class EngramHost:
                 offset = end
             buffer.cpu[rows:staged].zero_()
         return self._copy_to_device(staged)
+
+    def _enable_uva(self, prefetcher, num_hash_heads):
+        """Page-lock this rank's head shard of every table; all-or-nothing.
+
+        Sharding is by hash HEAD. Each head owns a disjoint, contiguous row range
+        (the mapping's head offsets are their running sum), so a whole number of
+        heads is a contiguous row -- and byte -- range. A rank registers only that
+        range: the full table on every rank is what a TP job cannot afford.
+        """
+        from aiter.dist.parallel_state import get_tp_group
+
+        group = get_tp_group()
+        shards = group.world_size
+        if shards > num_hash_heads:
+            logger.info(
+                "engram: UVA lookup needs at most one shard per hash head "
+                "(%d shards, %d heads); using the host path",
+                shards,
+                num_hash_heads,
+            )
+            return False
+        self._tp_group = group if shards > 1 else None
+        per = -(-num_hash_heads // shards)
+        self.head_start = group.rank_in_group * per
+        self.local_heads = min(per, max(0, num_hash_heads - self.head_start))
+        self.total_heads = num_hash_heads
+        if self.local_heads <= 0:
+            logger.info("engram: UVA shard is empty on this rank; using the host path")
+            return False
+        mapping = prefetcher._hash_mapping
+        registered = 0
+        done = []
+        for layer_id, table in prefetcher._tables.items():
+            offsets = mapping.head_offsets[layer_id]
+            sizes = mapping.head_vocab_sizes[layer_id]
+            end_head = self.head_start + self.local_heads
+            row_start = int(offsets[self.head_start])
+            row_end = int(offsets[end_head - 1]) + int(sizes[end_head - 1])
+            if not table.enable_uva(row_start, row_end):
+                # Give back what the earlier tables already pinned: these pages
+                # are unswappable and the host path has no use for them.
+                for pinned in done:
+                    pinned.disable_uva()
+                logger.info("engram: UVA registration failed; using the host path")
+                return False
+            done.append(table)
+            registered += (row_end - row_start) * table.head_dim
+        logger.info(
+            "engram: UVA device lookup active -- heads [%d, %d) of %d, "
+            "%.1f GiB page-locked on this rank",
+            self.head_start,
+            self.head_start + self.local_heads,
+            num_hash_heads,
+            registered / 1024**3,
+        )
+        return True
+
+    def _stage_uva(self, requests, rows, staged):
+        """Device lookup: hash on the host, gather and dequantize on the GPU.
+
+        Only the row INDICES cross to the device (a few KB); the kernel reads the
+        table rows out of page-locked host memory and dequantizes them there, so
+        neither the gather nor the fp8 decode runs on the host and there is no
+        embedding H2D.
+
+        Each rank owns a slice of the hash heads and writes zeros for the rest, so
+        the all-gather that reassembles the full width is a concatenation. The
+        projection that consumes this is replicated, so every rank needs it whole.
+        """
+        per_layer = self.prefetcher.row_indices(requests)
+        # Stage the indices through pinned memory: `from_numpy(...).to(device)`
+        # copies from PAGEABLE memory, where `non_blocking` is silently ignored
+        # and the driver stages through its own bounce buffer every step.
+        if self._ids_staging is None:
+            self._ids_staging = CpuGpuBuffer(
+                self.max_num_tokens,
+                self.total_heads,
+                dtype=torch.int64,
+                device=self.device,
+                pin_memory=True,
+            )
+        for layer, buffer in self.buffers.items():
+            self._ids_staging.np[:rows] = per_layer[layer]
+            ids = self._ids_staging.copy_to_gpu(rows)
+            table = self.prefetcher._tables[layer]
+            if ids.shape != (rows, self.total_heads):
+                raise RuntimeError(
+                    f"engram UVA indices are {tuple(ids.shape)}, expected "
+                    f"{(rows, self.total_heads)}"
+                )
+            # empty, not zeros: the kernel stores every row it is given, writing
+            # zeros itself for the heads this rank does not own. Flat
+            # `[tokens, local_heads * head_dim]`, which is the same bytes the
+            # kernel writes and the layout the all-gather below wants.
+            flat = torch.empty(
+                rows,
+                self.local_heads * table.head_dim,
+                dtype=buffer.gpu.dtype,
+                device=self.device,
+            )
+            table.gather_into(
+                ids,
+                flat.view(rows, self.local_heads, table.head_dim),
+                head_start=self.head_start,
+                local_heads=self.local_heads,
+                total_heads=self.total_heads,
+            )
+            out = flat
+            if self._tp_group is not None:
+                # Gather on the LAST dim of a 2-D view, which is what routes this
+                # through aiter's IPC all-gather instead of NCCL: the custom path
+                # needs dim 0 or a 16-byte-aligned last dim, and a head slice is
+                # `local_heads * head_dim * 2` bytes wide. NCCL is not just
+                # slower here -- its end event, recorded during a CUDAGraph
+                # capture, is later read by the watchdog and crashes with
+                # hipErrorCapturedEvent (see moe.all_gather_with_padding).
+                # Rank-major concatenation puts head `h` back at column
+                # `h * head_dim`, so the result needs no transpose; the trailing
+                # columns are the padding an indivisible head count leaves.
+                out = self._tp_group.all_gather(out, use_custom=True, dim=1)
+                out = out[:, : self.embed_width]
+            buffer.gpu[:rows].copy_(out.reshape(rows, self.embed_width))
+            if staged > rows:
+                buffer.gpu[rows:staged].zero_()
+        self._staged_rows = staged
+        self._copy_pending = False
+        return staged
 
     def stage_dummy(self, num_rows):
         rows = self._prepare_staging(num_rows, None)
