@@ -12,6 +12,7 @@ from collections import deque
 from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
@@ -52,6 +53,11 @@ from atom.kv_transfer.offload import _block_gpu_connector
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
+from atom.kv_transfer.offload.chunked_scheduler import (
+    DENSE_PAGE_SOURCE_SAFE_CHANNEL,
+    DENSE_PAGE_STORE_CHANNEL,
+    ChunkedOffloadSchedulerBase,
+)
 from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadConnector,
     DenseOffloadScheduler,
@@ -7246,6 +7252,34 @@ class TestStateStoreCompletionsCarryAGeneration:
         assert self._report(agg, second) == {
             ConnectorCompletion(STATE_INDEX_CHANNEL, second, True)
         }
+
+    def test_a_dense_page_channel_reaches_the_base_rather_than_being_dropped(self):
+        """K3 inherits its save path from `DenseOffloadConnector`, which emits
+        `dense.page.source_safe` and `dense.page.store` under early block
+        release. The scheduler half needs both -- one marks a staging group
+        source-safe, the other retires a store -- and `ChunkedOffloadSchedulerBase`
+        owns them. Answering a bare `False` here (on the claim that no base
+        defined the method) logged them as unhandled and dropped them, so the
+        deferred blocks were never released.
+        """
+        s = _k3_scheduler()
+        seen = []
+        monkey = lambda self, c: seen.append(c.channel) or None
+        with mock.patch.object(
+            ChunkedOffloadSchedulerBase, "connector_completion", monkey
+        ):
+            for channel in (DENSE_PAGE_SOURCE_SAFE_CHANNEL, DENSE_PAGE_STORE_CHANNEL):
+                s.connector_completion(
+                    ConnectorCompletion(channel, SaveOperationId("r1", 0), True)
+                )
+        assert seen == [DENSE_PAGE_SOURCE_SAFE_CHANNEL, DENSE_PAGE_STORE_CHANNEL]
+
+        # A channel genuinely nobody owns still answers False, so the caller's
+        # "unhandled" contract is unchanged.
+        assert (
+            s.connector_completion(ConnectorCompletion("nobody.owns.this", 1, True))
+            is False
+        )
 
     def test_no_state_milestone_is_reported_as_a_terminal_save(self):
         """`process_completions` reads the callback's return value as a
