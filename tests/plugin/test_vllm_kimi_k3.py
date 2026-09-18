@@ -24,10 +24,11 @@ def test_kimi_k3_plugin_registries_are_synchronized():
     arch = "KimiK3ForConditionalGeneration"
     assert (
         _VLLM_MODEL_REGISTRY_OVERRIDES[arch]
-        == "atom.plugin.vllm.models.kimi_k3:KimiK3ForCausalLMVllm"
+        == "atom.plugin.vllm.models.kimi_k3:KimiK3ForConditionalGenerationVllm"
     )
     assert (
-        _ATOM_MODEL_CLASSES[arch] == "atom.plugin.vllm.models.kimi_k3:KimiK3ForCausalLM"
+        _ATOM_MODEL_CLASSES[arch]
+        == "atom.plugin.vllm.models.kimi_k3:KimiK3ForConditionalGeneration_"
     )
 
 
@@ -105,6 +106,146 @@ def test_kimi_k3_temporal_state_uses_fp32():
         conv_dtype, temporal_dtype = _get_k3_state_dtype(vllm_config)
         assert conv_dtype == torch.bfloat16
         assert temporal_dtype == torch.float32
+        """)
+
+
+def test_kimi_k3_outer_is_multimodal_and_hybrid():
+    _run_without_test_stubs("""
+        from vllm.model_executor.models.interfaces import IsHybrid
+
+        from atom.plugin.vllm.model_wrapper import ATOMForConditionalGeneration
+        from atom.plugin.vllm.models.kimi_k3 import (
+            KimiK3ForConditionalGenerationVllm,
+        )
+
+        mro = KimiK3ForConditionalGenerationVllm.__mro__
+        # Multimodal via ATOMForConditionalGeneration; hybrid state retained.
+        assert ATOMForConditionalGeneration in mro
+        assert IsHybrid in mro
+
+        # Image placeholder matches the checkpoint token.
+        assert (
+            KimiK3ForConditionalGenerationVllm.get_placeholder_str("image", 0)
+            == "<|kimi_image_placeholder|>"
+        )
+
+        # vLLM looks up the processor on the architecture class from
+        # get_model_architecture (this wrapper), not on the inner module.
+        assert "_processor_factory" in KimiK3ForConditionalGenerationVllm.__dict__
+        """)
+
+
+def test_kimi_k3_inner_conditional_generation_class():
+    _run_without_test_stubs("""
+        from inspect import Parameter, signature
+
+        from vllm.models.kimi_k3 import (
+            KimiK3ForConditionalGeneration as vLLMKimiK3,
+        )
+        from atom.plugin.vllm.models.kimi_k3 import (
+            KimiK3ForCausalLM,
+            KimiK3ForConditionalGeneration_,
+        )
+
+        # Inner class subclasses the upstream multimodal model so it inherits
+        # embed_multimodal / media parsing / vision-tower forward. Do not
+        # re-register the processor here: vLLM keys it per class, and the
+        # architecture class that must carry it is the outer wrapper.
+        assert issubclass(KimiK3ForConditionalGeneration_, vLLMKimiK3)
+        assert "_processor_factory" not in KimiK3ForConditionalGeneration_.__dict__
+        assert hasattr(KimiK3ForConditionalGeneration_, "_processor_factory")
+        parameters = signature(KimiK3ForConditionalGeneration_.__init__).parameters
+        assert parameters["vllm_config"].kind is Parameter.KEYWORD_ONLY
+
+        # Weight mapper collapses the double language_model nesting and renames
+        # the projector layers.
+        mapper = KimiK3ForConditionalGeneration_.hf_to_atom_mapper
+        assert mapper.orig_to_new_prefix["language_model."] == (
+            "language_model.language_model."
+        )
+        assert mapper.orig_to_new_prefix["mm_projector.proj.0"] == (
+            "mm_projector.linear_1"
+        )
+        assert mapper.orig_to_new_prefix["mm_projector.proj.2"] == (
+            "mm_projector.linear_2"
+        )
+
+        # Language-model wrapper exposes embed_input_ids for vLLM multimodal
+        # discovery.
+        assert hasattr(KimiK3ForCausalLM, "embed_input_ids")
+
+        # Quant exclusions are remapped after hf_to_atom_mapper. They must add
+        # the outer model root without applying the language_model nesting a
+        # second time.
+        from atom.config import QuantizationConfig
+
+        quant_config = QuantizationConfig()
+        quant_config.exclude_layers = [
+            "language_model.language_model.model.layers.0.mlp",
+            "language_model.language_model.lm_head",
+        ]
+        quant_config.apply_exclude_name_mapping(
+            KimiK3ForConditionalGeneration_.quant_exclude_name_mapping
+        )
+        assert quant_config.exclude_layers == [
+            "model.language_model.language_model.model.layers.0.mlp",
+            "model.language_model.language_model.lm_head",
+        ]
+        """)
+
+
+def test_kimi_k3_spec_decode_alias_writes_reach_language_model():
+    _run_without_test_stubs("""
+        import torch.nn as nn
+
+        from atom.plugin.vllm.models.kimi_k3 import KimiK3ForCausalLM
+
+        target = KimiK3ForCausalLM.__new__(KimiK3ForCausalLM)
+        nn.Module.__init__(target)
+        target.language_model = nn.Module()
+        target.language_model.model = nn.Linear(2, 2)
+        target.language_model.lm_head = nn.Linear(2, 3)
+
+        replacement_model = nn.Linear(2, 2)
+        replacement_head = nn.Linear(2, 3)
+        target.model = replacement_model
+        target.lm_head = replacement_head
+
+        assert target.model is replacement_model
+        assert target.language_model.model is replacement_model
+        assert target.lm_head is replacement_head
+        assert target.language_model.lm_head is replacement_head
+        """)
+
+
+def test_kimi_k3_vision_quant_excludes_cover_regex_and_globs():
+    _run_without_test_stubs("""
+        from types import SimpleNamespace
+
+        from atom.config import QuantizationConfig
+        from atom.plugin.vllm.models.kimi_k3 import (
+            KimiK3ForConditionalGeneration_,
+        )
+
+        model = SimpleNamespace(
+            atom_config=SimpleNamespace(quant_config=QuantizationConfig())
+        )
+        quant_config = object()
+        for exclude in (
+            "re:.*vision_tower.*",
+            "vision_tower*",
+            "*.vision_tower.*",
+            "model.vision_tower",
+        ):
+            assert (
+                KimiK3ForConditionalGeneration_._maybe_ignore_quant_config(
+                    model,
+                    quant_config,
+                    [exclude],
+                    "vision_tower",
+                )
+                is None
+            ), exclude
         """)
 
 
@@ -218,6 +359,49 @@ def test_kda_metadata_adapter_compacts_full_graph_padding():
         assert metadata.num_decode_tokens == 2
         assert metadata.non_spec_state_indices_tensor.tolist() == [5, 7, -1, -1]
         assert metadata.non_spec_query_start_loc.tolist() == [0, 1, 2, 2, 2]
+        """)
+
+
+def test_kda_metadata_adapter_leaves_unpadded_decode_unchanged():
+    _run_without_test_stubs("""
+        from types import SimpleNamespace
+
+        import torch
+
+        import atom.plugin.vllm.kda_backend as kda_backend
+
+        assert (
+            "_stage_packed_decode_query_start_loc"
+            not in kda_backend.AtomKimiK3KDAMetadataBuilder.__dict__
+        )
+
+        builder = SimpleNamespace(
+            use_full_cuda_graph=True,
+            decode_cudagraph_max_bs=2,
+        )
+        common = SimpleNamespace(
+            query_start_loc_cpu=torch.tensor([0, 1, 2], dtype=torch.int32),
+            num_reqs=2,
+        )
+        metadata = SimpleNamespace(
+            num_prefills=0,
+            num_spec_decodes=0,
+            num_decodes=2,
+            num_decode_tokens=2,
+            non_spec_state_indices_tensor=torch.tensor([3, 7], dtype=torch.int32),
+            non_spec_query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        )
+        state_indices = metadata.non_spec_state_indices_tensor
+        query_start_loc = metadata.non_spec_query_start_loc
+
+        kda_backend.AtomKimiK3KDAMetadataBuilder._adapt_full_graph_decode_metadata(
+            builder, common, metadata
+        )
+
+        assert metadata.non_spec_state_indices_tensor is state_indices
+        assert metadata.non_spec_query_start_loc is query_start_loc
+        assert metadata.num_decodes == 2
+        assert metadata.num_decode_tokens == 2
         """)
 
 
