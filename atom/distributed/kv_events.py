@@ -6,6 +6,7 @@ plus ATOM extensions (`BlockTransferred`, CPU/DISK/REMOTE medium constants)."""
 
 from __future__ import annotations
 
+import contextlib
 import itertools
 import logging
 import queue
@@ -298,15 +299,13 @@ class ZmqEventPublisher(EventPublisher):
                     pass
         self._sender.join(timeout=2.0)
         linger = 0 if self._sender.is_alive() else 1000
-        try:
+        # Best-effort close on shutdown: a socket already torn down by the
+        # sender thread must not turn shutdown into an error.
+        with contextlib.suppress(Exception):  # pragma: no cover
             self._socket.close(linger=linger)
-        except Exception:  # pragma: no cover
-            pass
         if self._replay is not None:
-            try:
+            with contextlib.suppress(Exception):  # pragma: no cover
                 self._replay.close(linger=0)
-            except Exception:  # pragma: no cover
-                pass
 
     # --- internal ---
     def _run(self) -> None:
@@ -358,7 +357,7 @@ class ZmqEventPublisher(EventPublisher):
             return
         try:
             start_seq = int.from_bytes(frames[-1], "big")
-        except Exception:
+        except (TypeError, ValueError):
             logger.warning("KV event replay: bad start_seq %r", frames[-1])
             return
         prefix = frames[:-1]  # [client_id] or [client_id, empty_delim]

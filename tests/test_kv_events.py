@@ -16,6 +16,7 @@ Covers:
 
 from __future__ import annotations
 
+import contextlib
 import time
 
 import msgspec
@@ -25,13 +26,13 @@ from conftest import MockConfig
 from atom.distributed.kv_events import (
     MEDIUM_GPU,
     MEDIUM_REMOTE,
+    REPLAY_DONE,
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
     BlockTransferred,
     EventBatch,
     NullEventPublisher,
-    REPLAY_DONE,
     ZmqEventPublisher,
     make_publisher,
 )
@@ -414,7 +415,7 @@ class TestReplayEndpointWiring:
             pub.shutdown()
 
     def test_env_replay_endpoint_default_and_override(self, monkeypatch):
-        import atom.utils.envs as envs
+        from atom.utils import envs
 
         monkeypatch.delenv("ATOM_KV_EVENTS_REPLAY_ENDPOINT", raising=False)
         assert envs.ATOM_KV_EVENTS_REPLAY_ENDPOINT == ""
@@ -436,7 +437,7 @@ class TestReplayEndpointWiring:
             pub.shutdown()
 
     def test_env_replay_buffer_steps(self, monkeypatch):
-        import atom.utils.envs as envs
+        from atom.utils import envs
 
         monkeypatch.delenv("ATOM_KV_EVENTS_REPLAY_BUFFER_STEPS", raising=False)
         assert envs.ATOM_KV_EVENTS_REPLAY_BUFFER_STEPS == 10000
@@ -667,14 +668,12 @@ class TestReplayEndpointWiring:
             reserved = int.from_bytes(REPLAY_DONE, "big")  # 2**64 - 1
             pub._seq_gen = iter([reserved, reserved + 1, 5])
             pub.publish([BlockRemoved(block_hashes=[1])])
-            item = [it for it in list(pub._queue.queue) if it is not None][0]
+            item = next(it for it in list(pub._queue.queue) if it is not None)
             assert item[0] != reserved
             assert item[0] == 0  # reserved % (2**64 - 1)
         finally:
-            try:
+            with contextlib.suppress(Exception):
                 pub._socket.close(linger=0)
-            except Exception:
-                pass
 
     def test_dropped_batches_consume_seq_numbers(self):
         # seq must be assigned at enqueue time so that a batch dropped on queue
@@ -698,10 +697,8 @@ class TestReplayEndpointWiring:
             ), f"expected (seq=4, payload); got {item!r}"
             assert pub.stats["dropped"] >= 4
         finally:
-            try:
+            with contextlib.suppress(Exception):
                 pub._socket.close(linger=0)
-            except Exception:
-                pass
 
     def test_publish_drops_oldest_on_overflow(self):
         # buffer_steps=1 + stopped sender => every publish past the first must
@@ -716,10 +713,8 @@ class TestReplayEndpointWiring:
                 pub.publish([BlockRemoved(block_hashes=[i])])
             assert pub.stats["dropped"] >= 4
         finally:
-            try:
+            with contextlib.suppress(Exception):
                 pub._socket.close(linger=0)
-            except Exception:
-                pass
 
     def test_publish_counts_encode_errors_without_raising(self):
         pytest.importorskip("zmq")
