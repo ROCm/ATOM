@@ -21,6 +21,12 @@ work on GLM-5.2 — see *Why a separate connector* below. For the same connector
 MiniMax-M3, see
 [MiniMax-M3 LMCache Byte Offload](MiniMax-M3-LMCache-Byte-Offload.md).
 
+**GLM-5.3 is the same architecture and needs nothing from this recipe changed
+but the model path** — see
+[GLM-5.3 LMCache Byte Offload](GLM-5.3-LMCache-Byte-Offload.md), which records
+what was measured to establish that and which of the numbers below do not
+transfer.
+
 ## Why a separate connector
 
 At TP=4 GLM-5.2 registers **99 KV entries in two physical layouts**:
@@ -338,6 +344,8 @@ signal; marker recall is the criterion that does.
 
 ## Related
 
+- [GLM-5.3 LMCache Byte Offload](GLM-5.3-LMCache-Byte-Offload.md) — the same
+  architecture; same connector, same 78-layer fold, no code of its own
 - [MiniMax-M3 LMCache Byte Offload](MiniMax-M3-LMCache-Byte-Offload.md) — the
   same connector on M3's three-layout registration
 - [LMCache KV Cache Offload](LMCache-KV-Cache-Offload.md) — generic plugin path
