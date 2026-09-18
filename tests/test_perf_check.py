@@ -690,7 +690,10 @@ def _two_commit_repo(ws, script_in_head_only=False):
         _git(ws, "commit", "-qm", message)
         return subprocess.run(
             ["git", "rev-parse", "HEAD"],
-            cwd=ws, check=True, capture_output=True, text=True,
+            cwd=ws,
+            check=True,
+            capture_output=True,
+            text=True,
         ).stdout.strip()
 
     (ws / "marker.txt").write_text("base\n")
@@ -730,8 +733,7 @@ def _docker_shim(bindir, log, concs=(128,), model="DeepSeek-V4-Pro-mtp3"):
     # result_filename already carries isl/osl/conc, so the name is complete.
     # Several levels append their own, using RESULT_FILENAME as the prefix
     # perf_check_half.sh actually globs on.
-    writes = "\n".join(
-        textwrap.dedent(f"""\
+    writes = "\n".join(textwrap.dedent(f"""\
             cat > "${{RESULT_FILENAME}}{'' if len(concs) == 1 else f'-8192-1024-{conc}-0.8'}.json" <<EOF
         {{"benchmark_backend":"ATOM",
          "benchmark_model_name":"{model}",
@@ -739,9 +741,7 @@ def _docker_shim(bindir, log, concs=(128,), model="DeepSeek-V4-Pro-mtp3"):
          "max_concurrency":{conc},
          "output_throughput":$((base_tput/2)),"total_token_throughput":$base_tput,
          "mean_ttft_ms":420.0,"mean_tpot_ms":$tpot}}
-        EOF""")
-        for conc in concs
-    )
+        EOF""") for conc in concs)
 
     (bindir / "docker").write_text(textwrap.dedent(f"""\
             #!/usr/bin/env bash
@@ -942,9 +942,7 @@ def test_runs_when_the_target_commit_does_not_contain_the_script(tmp_path, fake_
     staged.chmod(0o755)
 
     for sha, half in ((base_sha, "base"), (head_sha, "head")):
-        result = run_half(
-            ws, bindir, sha, half, script=staged, MODEL_PATH="m", ARGS=""
-        )
+        result = run_half(ws, bindir, sha, half, script=staged, MODEL_PATH="m", ARGS="")
         assert result.returncode == 0, f"{half} half failed: {result.stderr[-400:]}"
 
     assert len(list((ws / "perf-pair/base").glob("*.json"))) == 1
@@ -1109,7 +1107,8 @@ def test_dummy_weight_args_reach_every_phase(workspace, fake_docker):
         run_half(ws, bindir, sha, half, DUMMY_WEIGHT_ARGS=DUMMY_ARGS)
 
     launches = [
-        ln for ln in log.read_text().splitlines()
+        ln
+        for ln in log.read_text().splitlines()
         if ln.startswith("STDIN:") and "launch" in ln
     ]
     assert len(launches) == 3, f"expected one launch per phase, got {launches}"
@@ -1127,7 +1126,8 @@ def test_dummy_weight_args_are_recorded_with_the_result(workspace, fake_docker):
     run_half(ws, bindir, base_sha, "base", DUMMY_WEIGHT_ARGS=DUMMY_ARGS)
 
     bench = [
-        ln for ln in log.read_text().splitlines()
+        ln
+        for ln in log.read_text().splitlines()
         if ln.startswith("ARGS:") and "benchmark" in ln
     ]
     assert bench, "no benchmark invocation recorded"
@@ -1144,8 +1144,7 @@ def test_no_dummy_args_leaves_the_launch_line_untouched(workspace, fake_docker):
     text = log.read_text()
     assert "load_dummy" not in text and "fake-eplb" not in text
     launch = [
-        ln for ln in text.splitlines()
-        if ln.startswith("STDIN:") and "launch" in ln
+        ln for ln in text.splitlines() if ln.startswith("STDIN:") and "launch" in ln
     ]
     assert len(launch) == 1
     assert launch[0].rstrip().endswith("--kv_cache_dtype fp8 -tp 8 --method mtp")

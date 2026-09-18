@@ -68,3 +68,4 @@ unit-report.xml
 perf-pair/
 aa-*.json
 aa-*.log
+aa-*.md
