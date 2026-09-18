@@ -73,6 +73,9 @@ def _adapter(monkeypatch, dcp=1):
     adapter._load_failure_reports = {}
     adapter._completion_reports = {}
     adapter._world_size = WORLD
+    # No pool here: these cover the save frontier, not the block leases the
+    # connector takes when vLLM has handed it one.
+    adapter._gpu_block_pool = None
     return adapter, adapter._scheduler
 
 
