@@ -114,6 +114,40 @@ class PPKVAggregator:
             connector_completions=connector_completions,
         )
 
+    def forget(self, rid: ReqId) -> None:
+        """Drop a request's partial tallies: no further stage will report.
+
+        A tally only drains on full quorum, so a stage whose completion is lost
+        for good leaves its set here forever. Nothing else empties it -- the
+        scheduler's own reclaim (`_reconcile_stalled_deferred_saves`) frees the
+        blocks but cannot reach this dict -- and `has_pending()` then holds
+        `has_pending_kv_work()` True for the life of the process: the head
+        wakes every drain interval with nothing to do, and every shutdown burns
+        the full `KV_SHUTDOWN_DRAIN_TIMEOUT_S`. Bounded, but permanent, and it
+        accumulates per lost report.
+
+        Called for exactly the requests the scheduler has already abandoned, so
+        the two terminals share one trigger and cannot drift.
+
+        The caller names a request; these dicts are keyed by whatever the
+        worker reported, which for a save is a `SaveOperationId` as often as a
+        bare id, and by `(channel, operation_id)` for a connector completion.
+        So each key is collapsed onto its request first -- and through `str`,
+        because the scheduler counts in ints and the connectors in strings.
+        """
+
+        def _owned_by(completion) -> bool:
+            return str(getattr(completion, "req_id", completion)) == str(rid)
+
+        for tally in (self._loading, self._failed_loading, self._saving):
+            for key in [k for k in tally if _owned_by(k)]:
+                tally.pop(key, None)
+        # A connector completion whose operation names no request (a state-store
+        # boundary) belongs to none and is left alone.
+        for key in [k for k in self._connector if _owned_by(k[1])]:
+            self._connector.pop(key, None)
+            self._connector_failed.discard(key)
+
     def has_pending(self) -> bool:
         """True while any request is still short of its per-stage quorum.
 
