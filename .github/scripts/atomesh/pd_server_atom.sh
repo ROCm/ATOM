@@ -236,7 +236,7 @@ dump_launch_info() {
   echo "  ${role} launch info"
   echo "========================================"
   echo "--- environment ---"
-  env | grep -E '^(HIP_|HSA_|AITER_|ATOM_|RCCL_|NCCL_|CUDA_|MOONCAKE_|UCX_)' | sort || true
+  env | grep -E '^(HIP_|HSA_|AITER_|ATOM_|RCCL_|NCCL_|CUDA_|MOONCAKE_|MORI_|UCX_)' | sort || true
   echo "--- command ---"
   printf '%q ' "$@"
   echo ""
