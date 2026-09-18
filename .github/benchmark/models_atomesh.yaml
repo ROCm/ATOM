@@ -472,9 +472,8 @@ models:
         AITER_SITUV2_A4W4: "1"
         AITER_QUICK_REDUCE_QUANTIZATION: INT4
         AITER_FLYDSL_STAGE2_FP8: "1"
-        # AgentX enables comm-group reuse from CONC 56 up (C56/C64/C72/C80).
+        # AgentX enables comm-group reuse from CONC 56 up (C56/C64/C72).
         AITER_REUSE_IDENTICAL_COMM_GROUPS: "0"
-        ATOM_MLA_MAX_SPLIT_PER_BATCH: "256"
         ATOM_GDN_SSM_DTYPE: "fp16"
         # Already the ATOM default; pinned so a default flip cannot silently
         # move the published numbers.
@@ -495,6 +494,11 @@ models:
         enable_prefix_caching: true
         max_model_len: ""
         state_checkpoint_interval_tokens: -1
+        # ATOM resolves the tool-call format from the chat template at startup.
+        # Naming it fails closed: should the template ever stop rendering a tools
+        # payload, the auto path degrades to plain-text tool calls, which the
+        # vendor verifier reads as a model that cannot call tools at all.
+        extra_args: "--tool-call-parser kimi_k3"
         online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*"]}'
     suites:
       nightly:
@@ -549,7 +553,7 @@ models:
           display_topology: 1P1D-TP8-DCP8-DSPARK3
           concurrency: [8]
           server:
-            common_args: &kimi_k3_agentic_dspark3_args
+            common_args:
               gpu_memory_utilization: 0.90
               max_num_seqs: 32
               max_num_batched_tokens: 8192
@@ -576,29 +580,14 @@ models:
               LMCACHE_MAX_LOCAL_CPU_SIZE: "128"
               LMCACHE_CHUNK_SIZE: "1024"
               LMCACHE_NUMA_MODE: auto
-              LMCACHE_ENABLE_OUTPUT_PATH_MODE: "1"
-              LMCACHE_ENABLE_LAYOUT_FILE_MODE: "1"
               ATOM_NUMA_BIND: "1"
               ATOM_NUMA_NODE: "0,0,0,0,1,1,1,1"
               # Auto-binding off so the explicit ATOM_NUMA_NODE map is what takes effect.
               ATOM_AUTO_NUMA_BIND: "0"
-              OFFLOAD_KV_FOR_HYBRID: "1"
               OFFLOAD_PROFILE: "1"
               OFFLOAD_GPU_STAGING_CHUNKS: "32"
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":6301},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
-
-        - <<: *kimi_k3_agentic_dcp8_lmcache
-          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c12
-          concurrency: [12]
-          server:
-            common_args:
-              <<: *kimi_k3_agentic_dspark3_args
-              max_num_seqs: 24
-
-        - <<: *kimi_k3_agentic_dcp8_lmcache
-          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c14
-          concurrency: [14]
 
         - <<: *kimi_k3_agentic_dcp8_lmcache
           name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c16
@@ -671,15 +660,6 @@ models:
             common_args:
               <<: *kimi_k3_agentic_no_dspark_args
               max_num_seqs: 144
-          env: *kimi_k3_agentic_lmcache192_env
-
-        - <<: *kimi_k3_agentic_no_dspark
-          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c80
-          concurrency: [80]
-          server:
-            common_args:
-              <<: *kimi_k3_agentic_no_dspark_args
-              max_num_seqs: 160
           env: *kimi_k3_agentic_lmcache192_env
 
     accuracy:
