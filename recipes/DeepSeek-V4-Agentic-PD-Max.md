@@ -76,7 +76,7 @@ export ATOM_MOONCAKE_MATCHED_RAILS=auto
 export NCCL_IB_DISABLE=1
 export ATOM_DISABLE_MMAP=true
 export ATOM_NUMA_BIND=1
-export GPU_MAX_HW_QUEUES=5
+unset GPU_MAX_HW_QUEUES
 export ATOM_DP_MASTER_PORT=29510
 export ATOM_DP_BASE_PORT=29610
 
@@ -132,7 +132,7 @@ Use the TP exports with DP attention enabled. Set `CONC` to the target request
 concurrency (64 or 128) on both server nodes. No offload tier is needed at these
 concurrencies. Both sides use the cache-aware router shown in the next section.
 
-`ATOM_NUMA_BIND=1` and `GPU_MAX_HW_QUEUES=5` are inherited from the TP exports.
+`ATOM_NUMA_BIND=1` is inherited from the TP exports.
 With `--dp-aware`, the router selects each P/D rank and sends an explicit rank
 hint, which takes priority over engine-local session affinity and load balancing.
 The `ATOM_DP_SESSION_AFFINITY` and `ATOM_DP_LB_REQ_EQUIV` exports are therefore
@@ -246,7 +246,7 @@ export ATOM_MOONCAKE_MATCHED_RAILS=auto
 export NCCL_IB_DISABLE=1
 
 export ATOM_NUMA_BIND=1
-export GPU_MAX_HW_QUEUES=5
+unset GPU_MAX_HW_QUEUES
 export ATOM_DP_MASTER_PORT=29510
 export ATOM_DP_BASE_PORT=29610
 
