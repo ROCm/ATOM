@@ -3,28 +3,32 @@
 The two-node companion to
 [`DeepSeek-V4-Agentic-InferenceX.md`](DeepSeek-V4-Agentic-InferenceX.md). That
 file is one node, no disaggregation, and is the right starting point. This one
-splits prefill from decode across two nodes and adds a CPU KV offload tier,
-which is what the workload needs at high concurrency.
+splits prefill from decode across two nodes. The current C128 profile uses
+HBM prefix caching and independent P/D routing; the historical C256 profile
+also adds a CPU KV offload tier.
 
 - Hardware: MI355X ×8 per node, **two nodes**, prefill/decode disaggregated (1P1D)
-- Model: `deepseek-ai/DeepSeek-V4-Pro`, FP4 weights, FP8 KV, FP8 index cache
-  (FP8 is forced under PD — the single-node recipe's FP4 indexer has no
-  Mooncake staging layout, and `atom/config.py` rewrites it)
+- Model: `deepseek-ai/DeepSeek-V4-Pro`, FP4 weights and FP8 KV.
+  The current C128 profile explicitly selects FP4 index cache; the historical
+  profiles below leave the PD index-cache default at FP8.
 - Transport: Mooncake RDMA, GID index 1
 - Scenario: `inferencex-agentx-mvp`, dataset `semianalysis_cc_traces_weka_062126`
-- Router: `atomesh`, PD mode, `idx2idx` rank mapping
+- Router: `atomesh` in PD mode; current C128 uses separate P/D `cache_aware`
+  policies and `none` rank mapping with Mooncake matched rails.
 
 Pick the section by the concurrency you are running:
 
 | concurrency | section |
 |---|---|
 | 1 – 32 | [TP](#tp--concurrency-1--32) |
-| 64 – 128 | [DP attention](#dp-attention--concurrency-64--128) |
+| 64 | [Historical DP attention profile](#dp-attention--concurrency-64--128) |
+| 128 | [Current cache-aware profile](#current-c128--cache-aware-and-independent-pd-ranks) |
 | 256 and up | [DP attention with CPU offload](#dp-attention-with-cpu-offload--concurrency-256-and-up) |
 
-Each section is complete on its own — server commands for both nodes, the router
-line, and the client. Nothing carries over between them except the model path
-and the two node IPs.
+The current C128 profile includes its own server, router, and client commands.
+The earlier TP, DP, and CPU-offload profiles are retained with their original
+routing and speculation settings so the historical measurements remain
+identifiable. Do not attribute those measurements to the new C128 configuration.
 
 One note before you start: **below about 32 concurrency, a single node without PD
 gives roughly twice this per-chip throughput** (1,484 against 737 tok/s/chip at
@@ -34,25 +38,223 @@ a reason to split two nodes for low concurrency.
 
 ## RDMA rail configuration
 
-The two-node TP8 examples assume matching, mutually reachable GPU-local RDMA
-rails; the DP examples use `idx2idx` rank mapping. Keep the default local-HCA
-registration for this topology: the Mooncake configs below intentionally omit
-`ib_enable_alternate_hca` and `ib_hca_count`.
+The current C128 profile requires the cache-aware router initialization and
+Mooncake matched-rail changes in [PR #2276](https://github.com/ROCm/ATOM/pull/2276).
+Until that PR is merged, use a build carrying both changes.
 
-Set `MC_ENABLE_DEST_DEVICE_AFFINITY=1` on both server nodes, including the
-prefill server using the `multi` connector. The exports below include it so
-Mooncake can select a destination HCA reachable from the initiator's local rail.
+On a rail-isolated fabric, independent GPU ranks do not imply that different
+NIC rails can reach each other. For example, P GPU2 can send to D GPU6 through
+P `ionic_6` and D `ionic_6`. Set the same allowlist on both nodes:
 
-If you adapt this recipe to a cross-rail layout, add
-`"ib_enable_alternate_hca": true` and `"ib_hca_count": 8` to the **decode
-Mooncake connector** config. If decode uses a `multi` connector, put these
-fields inside its Mooncake entry. Check the actual HCA names and GPU/rail
-mapping first; see [RDMA rails and HCA registration](pd_disaggregation_guide.md#rdma-rails-and-hca-registration)
-for defaults, explicit-device overrides, and a complete consumer example.
+```bash
+export ATOM_MOONCAKE_MATCHED_RAILS=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7
+```
 
-These settings control HCA selection and reachability. The GPU memory
-registration workaround described in [If the servers OOM at
-startup](#if-the-servers-oom-at-startup) addresses a separate driver-level issue.
+Each name must identify a mutually reachable rail on both hosts. Keep a single
+primary HCA per rank and leave `ib_enable_alternate_hca` disabled for this mode.
+The producer creates additional single-HCA engines as needed and registers its
+existing GPU buffers on the requested rail. This permits independent P/D
+**GPU-rank** selection while keeping the two NIC endpoints on a matching rail.
+
+Multi-HCA registration by itself is not a connectivity test. Validate actual
+cross-rank KV writes and successful request completion; registration success
+alone does not prove QP establishment or data transfer. The matched-rail setting
+does not change routing tables, GIDs, drivers, or GPU-memory registration support.
+See [PR #2276's transport documentation](https://github.com/ROCm/ATOM/pull/2276/files)
+and [RDMA rails and HCA registration](pd_disaggregation_guide.md#rdma-rails-and-hca-registration).
+
+The historical profiles below retain `idx2idx` and local-HCA registration.
+Their `MC_ENABLE_DEST_DEVICE_AFFINITY=1` setting is not a replacement for matched
+rails when using the current independent-rank configuration.
+
+GPU-memory registration and startup allocation failures are separate checks;
+see [startup memory headroom](#if-the-servers-oom-at-startup).
+
+## Current C128 — cache-aware and independent P/D ranks
+
+This profile uses 8 prefill GPUs and 8 decode GPUs, TP8 with DP attention,
+HBM prefix caching, and no CPU offload. P and D both use `cache_aware` with
+abs20/rel2. P/D rank mapping is `none`. TBO is disabled on both servers.
+
+Use a DeepSeek-V4-Pro checkpoint with the DSpark draft included. This benchmark
+pins `--spec-decode-acceptance-length 3.01`; it is a synthetic acceptance setting,
+not a measurement of natural draft acceptance. Keep that setting fixed when
+comparing results.
+
+### Servers
+
+Run the following block on each server. Set `ROLE=prefill` on P and
+`ROLE=decode` on D, and replace the model path, IPs, and HCA names for your hosts.
+On systems requiring the GPU-registration shim, configure the site's validated
+`LD_PRELOAD` first; see the startup section below.
+
+```bash
+export ROLE=prefill                         # decode on the other node
+export MODEL_PATH=/path/to/DeepSeek-V4-Pro
+export PREFILL_IP=10.0.0.1
+export DECODE_IP=10.0.0.2
+
+case "$ROLE" in
+  prefill)
+    export ATOM_HOST_IP="$PREFILL_IP"
+    PORT=8010
+    KV_ROLE=kv_producer
+    GPU_MEMORY=0.75
+    ;;
+  decode)
+    export ATOM_HOST_IP="$DECODE_IP"
+    PORT=8020
+    KV_ROLE=kv_consumer
+    GPU_MEMORY=0.70
+    ;;
+  *) echo "ROLE must be prefill or decode" >&2; exit 1 ;;
+esac
+
+export AITER_BF16_FP8_MOE_BOUND=0
+export ATOM_MOE_GU_ITLV=1
+export ATOM_DISABLE_MMAP=true
+export AITER_LOG_LEVEL=WARNING
+export PYTHONHASHSEED=0
+export PYTHONUNBUFFERED=1
+export NCCL_IB_DISABLE=1
+export MC_GID_INDEX=1
+export ATOM_NUMA_BIND=1
+export GPU_MAX_HW_QUEUES=5
+export ATOM_DP_MASTER_PORT=29510
+export ATOM_DP_BASE_PORT=29610
+export ATOM_ENABLE_PREFILL_DELAYER=0
+export ATOM_PREFILL_DECODE_INTERVAL=0
+export ATOM_PREFIX_CACHE_POLICY=lru
+export ATOM_PREFIX_CACHE_PROTECTED_RATIO=0.5
+unset ATOM_MOONCAKE_IB_DEVICE
+export ATOM_MOONCAKE_MATCHED_RAILS=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7
+
+KV_TRANSFER=$(printf \
+  '{"kv_role":"%s","kv_connector":"mooncake","proxy_ip":"%s","handshake_port":6301,"protocol":"rdma"}' \
+  "$KV_ROLE" "$ATOM_HOST_IP")
+
+python3 -m atom.entrypoints.openai_server \
+  --model "$MODEL_PATH" --served-model-name deepseek-ai/DeepSeek-V4-Pro \
+  --host 0.0.0.0 --server-port "$PORT" \
+  --tensor-parallel-size 8 --enable-dp-attention \
+  --kv-cache-dtype fp8 --index-cache-dtype fp4 \
+  --enable-prefix-caching --gpu-memory-utilization "$GPU_MEMORY" \
+  --max-num-seqs 256 \
+  --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
+  --state-checkpoint-interval-tokens 8192 \
+  --level 3 --cudagraph-mode FULL \
+  --method dspark --num-speculative-tokens 3 \
+  --spec-decode-acceptance-length 3.01 \
+  --kv-transfer-config "$KV_TRANSFER"
+```
+
+Explicit `--index-cache-dtype fp4` uses the FP4 indexer data and scale transfer
+regions. Omitting it still defaults PD to FP8 on current builds. Use a build with
+FP4 transfer-region support on both sides; an older build that lacks those
+regions cannot reproduce this profile.
+
+The engine session-affinity variables used in the historical `dp_sticky`
+profile are not required here: the DP-aware router chooses explicit P/D ranks
+and maintains separate cache-aware pools.
+
+### Router
+
+After both `/health` endpoints return 200, start the router on the P host:
+
+```bash
+atomesh launch --host 0.0.0.0 --port 8000 --pd-disaggregation \
+  --prefill "http://$PREFILL_IP:8010" --decode "http://$DECODE_IP:8020" \
+  --dp-aware \
+  --prefill-policy cache_aware --decode-policy cache_aware \
+  --cache-threshold 0.8 \
+  --balance-abs-threshold 20 --balance-rel-threshold 2.0 \
+  --eviction-interval 300 \
+  --atom-pd-rank-mapping-policy none \
+  --backend atom --model-path "$MODEL_PATH" \
+  --disable-circuit-breaker --prometheus-port 29100 \
+  --request-timeout-secs 1800
+```
+
+Check `/workers` for 8 healthy prefill workers and 8 healthy decode workers.
+Confirm actual selections use `cache_aware` on both sides and that the router
+does not report missing-tree fallback. The decode tree-initialization message
+is debug-level; its absence at info level does not establish a missing tree.
+
+### Client
+
+Run on the router host with the same `MODEL_PATH` and `PREFILL_IP`:
+
+```bash
+export AIPERF_HTTP_TCP_USER_TIMEOUT=900000
+export AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT=300
+export AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES=0
+export AIPERF_DATASET_CONFIGURATION_TIMEOUT=1800
+export AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT=1800
+export AIPERF_UI_REALTIME_METRICS_ENABLED=true
+export AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true
+export AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID=true
+
+aiperf profile --scenario inferencex-agentx-mvp \
+  --url http://localhost:8000 --endpoint /v1/chat/completions \
+  --endpoint-type chat --streaming \
+  --model deepseek-ai/DeepSeek-V4-Pro \
+  --tokenizer "$MODEL_PATH" --tokenizer-trust-remote-code \
+  --concurrency 128 --benchmark-duration 3600 \
+  --stats-interval 30 --random-seed 42 \
+  --failed-request-threshold 0.10 \
+  --trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75 \
+  --warmup-requests-per-lane 5 \
+  --trace-idle-gap-cap-seconds 300 \
+  --agentic-warmup-grace-period 1800 \
+  --use-server-token-count --no-gpu-telemetry \
+  --num-dataset-entries 393 --slice-duration 1.0 \
+  --server-metrics "http://$PREFILL_IP:8010/metrics" \
+  --public-dataset semianalysis_cc_traces_weka_062126 \
+  --output-artifact-dir ./artifacts/dsv4-pd-c128
+```
+
+Warmup is separate from the 3,600-second profiling phase. Keep the five primers
+per lane when reproducing these results; the historical client below uses ten.
+
+### C128 results
+
+All values below use 16 total P+D GPUs and P TBO disabled.
+
+| Decode policy | Total token throughput per chip | Status |
+| --- | ---: | --- |
+| `round_robin` | **28,026.535 tok/s/chip** | Measured, 3,600-second profiling run |
+| `cache_aware` (recommended) | **~28,600 tok/s/chip** | Estimated for 3,600 seconds; not a measured full-length result |
+
+The cache-aware projection applies approximately 2% relative uplift to the
+measured round-robin result and remains unverified over a full 3,600-second run.
+To reproduce the measured configuration, replace only the router's
+`--decode-policy cache_aware` with `--decode-policy round_robin`.
+
+The measured D round-robin run had **94.997%** token-weighted prompt cache reads,
+**64.579 tok/s/user** P90 interactivity (1 / P90 request ITL), mean TTFT
+**8,389.867 ms**, and mean ITL **14.608 ms**. These supporting metrics belong to
+the measured round-robin run, not to the cache-aware projection.
+
+The throughput scorer uses successful profiling requests:
+
+```text
+sum(input_tokens + output_tokens)
+  / (last successful request end - first successful request start)
+  / total P+D GPUs
+
+= (1,613,972,389 + 13,760,691) / 3,629.892739688 / 16
+= 28,026.5354366 tok/s/chip
+```
+
+Warmup, errors, and cancelled requests are excluded. Raw records matched all
+13,513 successful requests; 23 tail requests were cancelled after the completion
+grace. The run's logs recorded 12,500 cross-rank transfers and zero transport
+errors, including warmup traffic. Do not substitute AIPerf's observation-window
+`total_token_throughput` or its separately exported `active_total_throughput`.
+
+These results came from the experimental deployment carrying the router and
+matched-rail fixes, not a full-model rerun of the assembled main-branch PR.
+They do not isolate the performance contribution of either fix.
 
 ## TP — concurrency 1 – 32
 
@@ -199,7 +401,7 @@ atomesh launch --host 0.0.0.0 --port 8000 --pd-disaggregation \
 
 ## Complete example — concurrency 256, both nodes
 
-The config the *Measured* tuned row was produced with, written out in full so it
+The config the historical *tuned* row was produced with, written out in full so it
 can be copied without resolving any of the `$VAR` above. Substitute only the two
 IPs and `$MODEL_PATH`.
 
@@ -402,7 +604,7 @@ grep -c 'SLOT sidecar load restored' server.log   # must be non-zero
 trip through the CPU tier; it is emitted only after both succeed, and
 deliberately excludes a PAGE-only hit or an HBM prefix-cache hit.
 
-## Measured
+## Historical measurements
 
 16 chips, 3,600 s measurement per cell. `tok/s/chip` is
 `(ΣISL + ΣOSL) / duration / 16` and counts input tokens, so it is dominated by
@@ -465,26 +667,29 @@ xPyD. Two traps:
 
 ## Three flags deliberately not passed
 
-Everything else in the commands is pinned on purpose, including values that
-happen to match ATOM's current defaults. These three are left out because
-passing them is either a no-op or actively misleading:
+The historical commands omit these three flags. The current C128 profile
+explicitly pins its FP4 index-cache format and graph mode; those settings are
+listed separately above.
 
 | flag | why it is gone |
 |---|---|
 | `--block-size 16` | **Ignored on V4.** `config.py` overrides `kv_cache_block_size` to 256 unconditionally: V4 needs a multiple of `lcm(4, 128)`, and 2×lcm gives the 64 CSA entries per block that the FP4 paged-MQA-logits indexer kernels require. Passing 16 changes nothing and suggests V4 blocks are 16 tokens. |
-| `--index-cache-dtype fp8` | Forced anyway. `config.py` sets `fp8` whenever `kv_transfer_config` is set, which is every PD launch — Mooncake's producer-consumer staging has no layout for FP4's separate indexer scale pool. This is why PD cannot use the single-node recipe's `fp4`. |
+| `--index-cache-dtype fp8` | Omitted by the historical profiles because PD defaults to FP8. This is a default, not a forced override: the current C128 profile explicitly selects FP4 and requires support for its data and scale transfer regions. |
 | `--cudagraph-mode FULL` | Already the default, and unlike the pinned flags above it was never varied in any run here. |
 
 ## If the servers OOM at startup
 
-It should not happen where RDMA memory registration works — the commands above
-are then the whole configuration, and `--gpu-memory-utilization` is left at
-ATOM's 0.9 default, the same value the single-node recipe uses. PD does not need
-a lower one.
+Validate GPU-memory registration and allocation headroom separately. Successful
+registration does not guarantee that the later NCCL barrier, graph capture, or
+runtime kernels can allocate their buffers. Do not assume the 0.9 default is safe
+for every TP/DP configuration. The current C128 profile pins the measured
+0.75 prefill / 0.70 decode budgets; lower them if startup or runtime allocation
+fails on your system.
 
 The Crusoe MI355X cluster these numbers came from is not such a place: ROCm's
 GPU memory registration fails there, and the runs behind this file needed two
-things that are deliberately not in the commands.
+things: a site-specific registration shim and lower memory budgets. The current
+C128 commands include the measured budgets, while the older commands omit them.
 
 **An `LD_PRELOAD` shim** intercepting `ibv_reg_mr_iova2`. The native path
 returns `EFAULT`/`EINVAL` on GPU memory, so the shim exports a dma-buf fd with
