@@ -600,8 +600,8 @@ deliberately excludes a PAGE-only hit or an HBM prefix-cache hit.
 
 The historical DP rows used `dp_sticky` / `idx2idx`, FP8 index cache,
 MTP acceptance setting 2.49, ten warmup requests per lane, and prefill TBO.
-The TP rows used the TP configuration. They remain useful historical context, but are not results for
-the shared cache-aware DP baseline.
+The TP rows used the TP configuration. These measurements remain historical
+context rather than results for the shared cache-aware DP baseline.
 
 16 chips, 3,600 s measurement per cell. `tok/s/chip` is
 `(ΣISL + ΣOSL) / duration / 16` and counts input tokens, so it is dominated by
@@ -667,10 +667,10 @@ measurement; C128 1P1D results do not predict its scaling.
 All DP commands explicitly pin FP4 index cache and FULL graph mode. The TP
 commands retain their earlier defaults. Block size remains model-controlled.
 
-| flag | why it is gone |
+| flag | treatment in this recipe |
 |---|---|
 | `--block-size 16` | **Ignored on V4.** `config.py` overrides `kv_cache_block_size` to 256 unconditionally: V4 needs a multiple of `lcm(4, 128)`, and 2×lcm gives the 64 CSA entries per block that the FP4 paged-MQA-logits indexer kernels require. Passing 16 changes nothing and suggests V4 blocks are 16 tokens. |
-| `--index-cache-dtype fp8` | Omitted by the TP profile because PD defaults to FP8. This is a default, not a forced override: all DP profiles explicitly select FP4 and requires support for its data and scale transfer regions. |
+| `--index-cache-dtype fp8` | Omitted by the TP profile because PD defaults to FP8. This is a default, not a forced override: all DP profiles explicitly select FP4 and require support for its data and scale transfer regions. |
 | `--cudagraph-mode FULL` | Already the default; explicitly pinned in every DP server command for reproducibility. |
 
 ## If the servers OOM at startup
@@ -682,8 +682,8 @@ for every TP/DP configuration. The DP baseline pins the C128-measured
 0.75 prefill / 0.70 decode budgets; lower them if startup or runtime allocation
 fails on your system.
 
-The Crusoe MI355X cluster these numbers came from is not such a place: ROCm's
-GPU memory registration fails there, and the runs behind this file needed two
+On the Crusoe MI355X cluster used for these measurements, native ROCm GPU
+memory registration failed. The runs behind this file needed two
 things: a site-specific registration shim and lower memory budgets. The current
 DP commands include the C128-measured budgets, while the TP commands omit them.
 
