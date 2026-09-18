@@ -68,6 +68,9 @@ def _adapter(monkeypatch):
     adapter._load_failure_reports = {}
     adapter._completion_reports = {}
     adapter._world_size = WORLD
+    # No pool here: these cover the whole-request deferral, which is what the
+    # connector falls back to when it cannot take exact block leases.
+    adapter._gpu_block_pool = None
     return adapter, adapter._scheduler
 
 
