@@ -670,7 +670,7 @@ class TestLifespanOwnsTheBackgroundTasks:
     does -- the tasks above are only reachable through here."""
 
     @staticmethod
-    def _run(monkeypatch):
+    def _run(monkeypatch, interval="3600"):
         started = []
         for name in ("tune_gc", "maybe_attach_gc_debug_callback", "freeze_gc_heap"):
             monkeypatch.setattr(api_server, name, lambda *a, **k: 0)
@@ -678,7 +678,7 @@ class TestLifespanOwnsTheBackgroundTasks:
         monkeypatch.setattr(api_server, "engine", None)
         # Long enough that neither step runs: this is about the tasks existing
         # and being cancelled, not about what they do.
-        monkeypatch.setattr(api_server, "_METRICS_REFRESH_INTERVAL_SECONDS", 3600)
+        monkeypatch.setenv("ATOM_METRICS_UPDATE_INTERVAL_S", interval)
         monkeypatch.setattr(api_server, "_GC_WATCH_INTERVAL_SECONDS", 3600)
 
         async def drive():
@@ -707,6 +707,26 @@ class TestLifespanOwnsTheBackgroundTasks:
 
         assert all(t.cancelled() for t in tasks)
         assert api_server._background_tasks == []
+
+    @pytest.mark.parametrize(
+        "configured,expected", [("0.25", 0.25), ("0", 1.0), ("bad", 1.0)]
+    )
+    def test_metrics_refresh_uses_shared_interval(
+        self, monkeypatch, configured, expected
+    ):
+        intervals = {}
+        periodic = api_server._periodic
+
+        def capture(interval, step):
+            intervals[step.__name__] = interval
+            return periodic(interval, step)
+
+        monkeypatch.setattr(api_server, "_periodic", capture)
+        self._run(monkeypatch, interval=configured)
+        assert intervals == {
+            "_refresh_metrics_once": expected,
+            "_reclaim_watch_once": 3600,
+        }
 
 
 class TestTheCensusEndpointKeepsTheLoopFree:

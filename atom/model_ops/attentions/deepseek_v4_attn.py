@@ -137,6 +137,21 @@ def _uses_pd_staging(kv_transfer_config: dict | None) -> bool:
     return KVConnectorFactory.topology_uses_pd_staging(kv_transfer_config)
 
 
+def _validate_fp4_indexer_transfer(kv_transfer_config: dict) -> None:
+    """FP4 PAGE pools require a connector that consumes transfer regions."""
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    name = KVConnectorFactory.canonical_name(kv_transfer_config.get("kv_connector"))
+    if name == "multi":
+        for child in kv_transfer_config.get("connectors", []):
+            _validate_fp4_indexer_transfer(child)
+    elif name != "mooncake" and _uses_pd_staging(kv_transfer_config):
+        raise NotImplementedError(
+            "DeepSeek-V4 FP4 index PD transfer requires Mooncake; "
+            f"{name} does not consume the V4 PAGE/SLOT transfer regions"
+        )
+
+
 # AF_PIECEWISE: attn-core capture/replay (keyed layer, bucket_bs, q_eff, nt_pad).
 # Owns its isolated graph pool + per-key graph cache + output buffers.
 # State field carrying the windows of layers whose KV dtype is not the pool's.
@@ -296,6 +311,10 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     kv_last_page_lens: torch.Tensor | None = None
     """[padded_T] int32 GPU — per-token last-page length `ones(N)` (page_size=1
     → every page is full)."""
+    empty_kv_indptr: torch.Tensor | None = None
+    """[padded_T+1] all-zero int32 GPU — empty extend-stream CSR used when
+    `ATOM_USE_V4_PREFILL_ASM_FOR_DECODE=1` reuses the H=128 prefill ASM kernel
+    for decode. Backed by one immutable buffer shared by every layer."""
 
     # ----- Indexer / sparse-layout side metadata -----
     indexer_meta: dict[str, Any] | None = None
@@ -1841,18 +1860,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         # `get_kv_transfer_tensors` is called unconditionally on every
         # `allocate_kv_cache`; returning None means "no transfer region."
-        # Standalone LMCache offload can carry both FP4 indexer pools, but PD
-        # connectors have a separate producer/consumer region contract which
-        # has not been extended to the FP4 scale pool yet.
+        # Mooncake and standalone offload consume the same PAGE description,
+        # including the separate packed FP4 data and e8m0 scale pools.
         transfer_config = getattr(runner.config, "kv_transfer_config", None)
         transfer_active = bool(transfer_config)
-        if self._indexer_fp4 and transfer_active and _uses_pd_staging(transfer_config):
-            raise NotImplementedError(
-                "DeepSeek-V4 PD transfer with --index_cache_dtype fp4 is "
-                "unsupported; standalone LMCache offload supports FP4, but "
-                "Mooncake/Moriio producer-consumer staging does not yet map "
-                "the separate FP4 indexer scale pool."
-            )
+        if self._indexer_fp4 and transfer_active:
+            _validate_fp4_indexer_transfer(transfer_config)
         if transfer_active and getattr(runner.config, "pipeline_parallel_size", 1) > 1:
             raise NotImplementedError(
                 "DeepSeek-V4 KV transfer/PD and sidecar offload with pipeline "
@@ -2407,6 +2420,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.qo_indptr = self._stage(
                 "v4_qo_indptr", self._v4_qo_indptr_np[: running_bs + 1]
             )
+            attn_metadata.empty_kv_indptr = self.model_runner.forward_vars[
+                "v4_empty_kv_indptr"
+            ][: running_bs + 1]
 
         # NOT rebuilt (unused by SWA-only MTP layer; would block a future
         # CSA/HCA MTP layer — assert at top guards):
@@ -3655,6 +3671,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             qo_buf.np[: T + 1] = self._v4_qo_indptr_np[: T + 1]
             qo_buf.np[T + 1 : T_pad + 1] = T
             attn_metadata.qo_indptr = qo_buf.copy_to_gpu(T_pad + 1)
+            attn_metadata.empty_kv_indptr = self.model_runner.forward_vars[
+                "v4_empty_kv_indptr"
+            ][: T_pad + 1]
 
     def _build_paged_prefill_meta(
         self,
@@ -4311,6 +4330,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # the per-fwd cost is a slice + H2D.
         bufs["v4_qo_indptr"] = CpuGpuBuffer(T_dec + 1, **i32)
         self._v4_qo_indptr_np = np.arange(T_dec + 1, dtype=np.int32)
+        # Immutable, device-only empty CSR for reusing the H=128 sparse-prefill
+        # ASM kernel in decode. Shared read-only across layers and TBO ubatches.
+        bufs["v4_empty_kv_indptr"] = torch.zeros(T_dec + 1, **i32)
         # Per-seq `ctx_len // 4` (raw, no clamp). Consumed by the indexer's
         # `cu_committed` cumsum — per-SEQUENCE, host-side, prefill only.
         # Single per-token mapping shared across ALL V4 consumers:

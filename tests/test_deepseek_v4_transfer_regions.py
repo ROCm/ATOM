@@ -14,7 +14,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from atom.kv_transfer.disaggregation.types import KVTransferRegion, KVTransferTensors
+from atom.kv_transfer.disaggregation.types import (
+    INDEX_CACHE_FP4_PREFIX,
+    KVTransferRegion,
+    KVTransferTensors,
+)
 from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
@@ -522,17 +526,42 @@ def test_fp4_indexer_offload_covers_data_and_scale_page_regions(v4_builder_cls):
     assert len(transfer.swa_block_regions) == len(planes)
 
 
-def test_fp4_indexer_pd_transfer_remains_unsupported(v4_builder_cls):
+@pytest.mark.parametrize("kv_dtype", ["fp8", "bf16"])
+@pytest.mark.parametrize("composite", [False, True])
+def test_fp4_indexer_pd_covers_data_and_scales(v4_builder_cls, kv_dtype, composite):
+    config = {"kv_connector": "mooncake", "kv_role": "kv_both"}
+    if composite:
+        config = {
+            "kv_connector": "multi",
+            "connectors": [
+                config,
+                {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+            ],
+        }
+    builder, geo, planes, widths = _transfer_builder(
+        v4_builder_cls,
+        kv_dtype=kv_dtype,
+        transfer_config=config,
+        indexer_fp4=True,
+    )
+    _assert_transfer_geometry(builder, geo, planes, widths)
+
+
+@pytest.mark.parametrize("composite", [False, True])
+def test_fp4_indexer_moriio_remains_unsupported(v4_builder_cls, composite):
+    config = {"kv_connector": "moriio"}
+    if composite:
+        config = {"kv_connector": "multi", "connectors": [config]}
     builder, *_ = _transfer_builder(
         v4_builder_cls,
         kv_dtype="fp8",
-        transfer_config={"kv_connector": "mooncake", "kv_role": "kv_both"},
+        transfer_config=config,
         indexer_fp4=True,
     )
 
     with pytest.raises(
         NotImplementedError,
-        match=r"PD transfer.*index_cache_dtype fp4.*unsupported",
+        match=r"FP4 index PD transfer requires Mooncake",
     ):
         builder.get_kv_transfer_tensors()
 
@@ -664,6 +693,190 @@ def test_allocate_per_req_cache_sizes_pd_staging_for_transfer_topology(
 
     assert allocated["v4_state_pool_size"] == expected_pool_size
     assert allocated["v4_state_pool"].numel() == expected_pool_size * 16
+
+
+@pytest.fixture(scope="module")
+def mooncake_page_writer():
+    """Run the production descriptor planner with a byte-copy NIC substitute."""
+    import ast
+    import logging
+    import time
+
+    from atom.kv_transfer.disaggregation.port_offset import consumer_region_indices
+
+    path = Path(__file__).parents[1] / (
+        "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py"
+    )
+    tree = ast.parse(path.read_text())
+    names = {"_execute_block_slot_transfer", "_consumer_region_map"}
+    methods = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    namespace = {
+        "KVTransferRegion": KVTransferRegion,
+        "consumer_region_indices": consumer_region_indices,
+        "logger": logging.getLogger(__name__),
+        "time": time,
+        "torch": torch,
+    }
+    exec(  # noqa: S102 - runs the production planner extracted above
+        compile(ast.Module(body=methods, type_ignores=[]), str(path), "exec"), namespace
+    )
+    return namespace
+
+
+def _fp4_pd_pair(builder_cls, writer, kv_dtype="fp8", coalesce=False):
+    from dataclasses import asdict
+
+    builders = [
+        _transfer_builder(
+            builder_cls,
+            kv_dtype=kv_dtype,
+            transfer_config={"kv_connector": "mooncake"},
+            indexer_fp4=True,
+        )[0]
+        for _ in range(2)
+    ]
+    src, dst = [b.get_kv_transfer_tensors() for b in builders]
+    conn = SimpleNamespace(
+        _block_regions=[(r.base_addr, r.unit_bytes) for r in src.block_regions],
+        _block_region_roles=[r.semantic_role for r in src.block_regions],
+        _fp4_index_layout=any(
+            r.semantic_role is not None
+            and r.semantic_role.startswith(INDEX_CACHE_FP4_PREFIX)
+            for r in src.block_regions
+        ),
+        _block_region_consumer_indices=None,
+        _block_mr_ends=[[r.total_bytes] for r in src.block_regions],
+        _swa_block_regions=src.swa_block_regions,
+        _slot_regions=[],
+        _coalesce_blocks=coalesce,
+        _trace_transfers=False,
+        _num_local_layers=4,
+        _start_layer=0,
+        pp_size=1,
+        tp_rank=0,
+    )
+    for name in ("_execute_block_slot_transfer", "_consumer_region_map"):
+        setattr(conn, name, types.MethodType(writer[name], conn))
+    req = {
+        # FP4 consumers advertise under the FP4-only key (version fence).
+        "consumer_block_base_addrs_fp4": [r.base_addr for r in dst.block_regions],
+        "consumer_block_bpb": [r.unit_bytes for r in dst.block_regions],
+        "consumer_region_roles": [r.semantic_role for r in dst.block_regions],
+        "consumer_block_mr_ends": [[r.total_bytes] for r in dst.block_regions],
+        "consumer_slot_base_addrs": [],
+        "consumer_slot_bps": [],
+        "consumer_swa_block_regions": [asdict(r) for r in dst.swa_block_regions],
+        "dst_swa_block_ids": [0],
+        "dst_slot_index": -1,
+    }
+    return builders, src, dst, conn, req
+
+
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8"])
+@pytest.mark.parametrize("coalesce", [False, True])
+@pytest.mark.parametrize("src_ids,dst_ids", [([2, 0], [0, 2]), ([0, 1], [1, 2])])
+def test_fp4_pd_copies_data_scales_and_swa_without_touching_other_blocks(
+    v4_builder_cls, mooncake_page_writer, kv_dtype, coalesce, src_ids, dst_ids
+):
+    import ctypes
+
+    owners, src, dst, conn, req = _fp4_pd_pair(
+        v4_builder_cls, mooncake_page_writer, kv_dtype, coalesce
+    )
+    src_regions = src.block_regions + src.swa_block_regions
+    dst_regions = dst.block_regions + dst.swa_block_regions
+    expected = []
+    for n, (sr, dr) in enumerate(zip(src_regions, dst_regions, strict=True)):
+        # Different layers and byte offsets expose missing scales, swapped
+        # pools, and incorrect block strides instead of just copying zeros.
+        payload = bytes((i + 31 * n) % 251 for i in range(sr.total_bytes))
+        ctypes.memmove(sr.base_addr, payload, len(payload))
+        ctypes.memset(dr.base_addr, 255, dr.total_bytes)
+        target = bytearray([255]) * dr.total_bytes
+        pairs = zip(src_ids, dst_ids) if n < len(src.block_regions) else [(1, 0)]
+        for sb, db in pairs:
+            so = sr.unit_addr(sb) - sr.base_addr
+            do = dr.unit_addr(db) - dr.base_addr
+            target[do : do + dr.unit_bytes] = payload[so : so + sr.unit_bytes]
+        expected.append(bytes(target))
+
+    calls = []
+
+    def write(target, sources, destinations, sizes, request_id, kind):
+        calls.append(kind)
+        for s, d, size in zip(sources, destinations, sizes, strict=True):
+            ctypes.memmove(d, s, size)
+        return True
+
+    conn._rdma_write_with_retry = write
+    assert conn._execute_block_slot_transfer(
+        req, "test", src_ids, dst_ids, {"slot_index": -1, "swa_block_ids": [1]}, "fp4"
+    )
+    assert calls == ["block"]
+    for region, wanted in zip(dst_regions, expected, strict=True):
+        assert ctypes.string_at(region.base_addr, region.total_bytes) == wanted
+    assert owners  # Keep all tensor allocations alive through the copy.
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        "missing_roles",
+        "missing_scale",
+        "scale_width",
+        "swapped_layers",
+        "fp8_producer",
+        "fp8_consumer",
+    ],
+)
+def test_fp4_pd_layout_mismatch_fails_before_any_write(
+    v4_builder_cls, mooncake_page_writer, mismatch
+):
+    owners, _src, _dst, conn, req = _fp4_pd_pair(v4_builder_cls, mooncake_page_writer)
+    if mismatch == "missing_roles":
+        req.pop("consumer_region_roles")
+    elif mismatch == "missing_scale":
+        for key in (
+            "consumer_block_base_addrs_fp4",
+            "consumer_block_bpb",
+            "consumer_region_roles",
+        ):
+            req[key].pop()
+    elif mismatch == "scale_width":
+        req["consumer_block_bpb"][-1] *= 2
+    elif mismatch == "swapped_layers":
+        roles = req["consumer_region_roles"]
+        roles[-1], roles[-2] = roles[-2], roles[-1]
+    else:
+        fp8_builder = _transfer_builder(
+            v4_builder_cls,
+            kv_dtype="fp8",
+            transfer_config={"kv_connector": "mooncake"},
+        )[0]
+        owners.append(fp8_builder)
+        regions = fp8_builder.get_kv_transfer_tensors().block_regions
+        if mismatch == "fp8_consumer":
+            req["consumer_block_base_addrs"] = [r.base_addr for r in regions]
+            req["consumer_block_bpb"] = [r.unit_bytes for r in regions]
+            req["consumer_region_roles"] = [r.semantic_role for r in regions]
+        else:
+            conn._block_regions = [(r.base_addr, r.unit_bytes) for r in regions]
+            conn._block_region_roles = [r.semantic_role for r in regions]
+
+    calls = []
+    conn._rdma_write_with_retry = lambda *args: calls.append(args) or True
+    with pytest.raises(
+        RuntimeError,
+        match="mismatch|out of range|disagree|requires the consumer|Cannot layer-map|one-to-one",
+    ):
+        conn._execute_block_slot_transfer(
+            req, "test", [0], [1], {"slot_index": -1, "swa_block_ids": [1]}, "fp4"
+        )
+    assert not calls
 
 
 def test_v4_sidecar_offload_rejects_pipeline_parallelism_before_registration(

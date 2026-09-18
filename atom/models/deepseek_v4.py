@@ -95,6 +95,7 @@ from atom.model_ops.quant_v4 import act_quant_inplace
 from atom.model_ops.sparse_attn_v4 import (
     hc_split_sinkhorn,
 )
+from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
 from atom.model_ops.triton_hash_topk import hash_topk_triton
 from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.utils import atom_parameter, shuffle_weights
@@ -1278,9 +1279,9 @@ class Compressor(nn.Module):
                          Required for the Indexer FP8 path (slot resolution).
         """
         assert self.rotary_emb is not None, "compressor.rotary_emb must be set by owner"
-        assert (
-            x.dim() == 2 and x.shape[-1] == self.dim
-        ), f"Compressor expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
+        assert x.dim() == 2 and x.shape[-1] == self.dim, (
+            f"Compressor expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
+        )
         ratio = self.compress_ratio
         overlap = self.overlap
         d = self.head_dim
@@ -1519,9 +1520,9 @@ class Indexer(nn.Module):
         # Register self in static_forward_context so the
         # `torch.ops.aiter.indexer_score_topk` dispatcher can look us up by
         # `layer_name` (= self.prefix). Same pattern as V4 MoE registration.
-        get_current_atom_config().compilation_config.static_forward_context[
-            prefix
-        ] = self
+        get_current_atom_config().compilation_config.static_forward_context[prefix] = (
+            self
+        )
 
     @mark_trace
     def forward_batched(
@@ -1775,33 +1776,17 @@ class Indexer(nn.Module):
         ``_max_model_len_idx`` for FP4) is unbounded by ``max_num_batched_tokens``,
         so a burst of long-context requests can push a single un-chunked
         allocation to tens of GiB (#1376). ``chunk_tokens`` shrinks as
-        ``row_width`` grows. When the budget is disabled (0) or a single chunk
-        already fits, the loop runs once (``chunk_start==0`` and
-        ``chunk_end==total_tokens``) and matches the single-shot path — callers
-        can detect that to reuse a schedule precomputed outside the fwd.
+        ``row_width`` grows. When a single chunk already fits, the loop runs
+        once (``chunk_start==0`` and ``chunk_end==total_tokens``) and matches the
+        single-shot path — callers can detect that to reuse a schedule
+        precomputed outside the fwd.
 
         Returns ``[total_tokens, topk]`` int32 (raw kernel output; caller remaps).
         """
         topk_out = torch.empty((total_tokens, topk), dtype=torch.int32, device=device)
-        budget_bytes = SPARSE_INDEXER_LOGITS_BUDGET_MB * 1024 * 1024
-        if (
-            budget_bytes > 0
-            and row_width > 0
-            and budget_bytes // (row_width * 4) < total_tokens
-        ):
-            # 4 bytes per fp32 logit; row_width * 4 is one row's footprint. Round
-            # the budget-derived row count DOWN: a multiple of 128 (aligned to the
-            # kernel's row tiling) in the normal regime, avoiding coarse power-of-2
-            # doubling. Below 128 rows (extreme row_width), fall back to a
-            # power-of-2 floor so it degrades 64/32/.../1 instead of collapsing to 1.
-            budget_rows = budget_bytes // (row_width * 4)
-            if budget_rows >= 128:
-                chunk_tokens = (budget_rows // 128) * 128
-            else:
-                chunk_tokens = 1 << (max(1, budget_rows).bit_length() - 1)
-        else:
-            # Budget disabled, or a single chunk already fits all rows.
-            chunk_tokens = total_tokens
+        chunk_tokens = sparse_indexer_row_chunk(
+            total_tokens, row_width, SPARSE_INDEXER_LOGITS_BUDGET_MB
+        )
         for chunk_start in range(0, total_tokens, chunk_tokens):
             chunk_end = min(chunk_start + chunk_tokens, total_tokens)
             rs = row_starts[chunk_start:chunk_end]
@@ -2271,12 +2256,12 @@ class DeepseekV4Attention(nn.Module):
         # TP shards heads + groups across ranks. ColumnParallelLinear (wq_b, wo_a)
         # auto-splits output dim, so per-rank counts must be divided by tp_size.
         tp_size = get_tensor_model_parallel_world_size()
-        assert (
-            args.n_heads % tp_size == 0
-        ), f"n_heads={args.n_heads} not divisible by tp={tp_size}"
-        assert (
-            args.o_groups % tp_size == 0
-        ), f"o_groups={args.o_groups} not divisible by tp={tp_size}"
+        assert args.n_heads % tp_size == 0, (
+            f"n_heads={args.n_heads} not divisible by tp={tp_size}"
+        )
+        assert args.o_groups % tp_size == 0, (
+            f"o_groups={args.o_groups} not divisible by tp={tp_size}"
+        )
         self.tp_size = tp_size
         self.n_local_heads = args.n_heads // tp_size
         self.q_lora_rank = args.q_lora_rank
@@ -2694,18 +2679,18 @@ class DeepseekV4Attention(nn.Module):
         The return order groups the two consumers: FULL reads q/kv_pre plus
         qr/qr_scale; PIECEWISE reads idx_* plus the flattened QK/RoPE fields.
         """
-        assert (
-            x.dim() == 2 and x.shape[-1] == self.dim
-        ), f"DeepseekV4Attention expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
+        assert x.dim() == 2 and x.shape[-1] == self.dim, (
+            f"DeepseekV4Attention expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
+        )
         if _V4_FORCE_UE8M0_QUANT:
             x = x.clone()
             act_quant_inplace(x, 128, "ue8m0")
 
         qkv_a = self.wqkv_a(x)
         q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
-        assert (
-            not _V4_FORCE_UE8M0_QUANT
-        ), "_V4_FORCE_UE8M0_QUANT incompatible with fused q_norm quant (qr is already FP8)"
+        assert not _V4_FORCE_UE8M0_QUANT, (
+            "_V4_FORCE_UE8M0_QUANT incompatible with fused q_norm quant (qr is already FP8)"
+        )
 
         qr, qr_scale = self.q_norm(q_lora)
         q = self.wq_b(qr, x_scale=qr_scale)
@@ -3144,8 +3129,9 @@ class DeepseekV4Attention(nn.Module):
                 kv_indices = attn_md.kv_indices_hca
                 kv_indptr = attn_md.kv_indptr_hca
             # Dispatch on KV-cache layout inside the wrapper. Native 2-buffer
-            # FP8 uses the tuned Triton path by default and consumes pre-packed
-            # Q plus the FP8 NoPE/BF16 RoPE pools without requantization.
+            # FP8 uses the tuned Triton path by default; its AITER fallbacks
+            # include the optional gfx1250 H=128 prefill-ASM route, which also
+            # consumes the shared empty CSR. No route requantizes the cache.
             o = sparse_attn_v4_paged_decode(
                 qkn.q_sa,
                 self.unified_kv,
@@ -3157,6 +3143,7 @@ class DeepseekV4Attention(nn.Module):
                 q_packed_in=qkn.q_packed,
                 q_rope_in=qkn.q_rope,
                 qo_indptr=attn_md.qo_indptr,
+                empty_kv_indptr=attn_md.empty_kv_indptr,
                 prefix=f"{self.layer_name}.sparse_attn_decode",
                 query_group=v4_decode_query_group(
                     attn_md.min_seqlen_q, attn_md.max_seqlen_q
@@ -3619,14 +3606,14 @@ class MoE(nn.Module):
         Then renormalize so weights sum to 1 per token.
         """
         fwd_input_ids = get_forward_context().context.input_ids
-        assert (
-            fwd_input_ids is not None
-        ), "forward_context.context.input_ids is None — caller must invoke DeepseekV4ForCausalLM.forward, not DeepseekV4Model.forward directly."
+        assert fwd_input_ids is not None, (
+            "forward_context.context.input_ids is None — caller must invoke DeepseekV4ForCausalLM.forward, not DeepseekV4Model.forward directly."
+        )
         ids = fwd_input_ids.flatten()
         num_tokens = gating_output.shape[0]
-        assert (
-            ids.shape[0] == num_tokens
-        ), f"input_ids length {ids.shape[0]} does not match gating_output num_tokens {num_tokens}"
+        assert ids.shape[0] == num_tokens, (
+            f"input_ids length {ids.shape[0]} does not match gating_output num_tokens {num_tokens}"
+        )
         tid2eid = self.gate.tid2eid
 
         # Fused-shared expert: the custom_routing_function path bypasses
@@ -3748,7 +3735,8 @@ class MoE(nn.Module):
         return routed
 
     def single_stream_moe_forward(
-        self, x: torch.Tensor  # [num_tokens, dim]
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Sequential: shared_experts → routed_experts → combine."""
         shared = self.shared_experts(x) if self.shared_experts is not None else None
@@ -3762,7 +3750,8 @@ class MoE(nn.Module):
         )
 
     def dual_stream_moe_forward(
-        self, x: torch.Tensor  # [num_tokens, dim]
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Run shared_experts on `alt_stream` in parallel with routed_experts
         on the current stream. Mirrors V2's pattern. Both reads of `x` are
@@ -3800,9 +3789,9 @@ class MoE(nn.Module):
         # Hash-layer routing reads `input_ids` from forward_context.context
         # inside `_hash_topk` (FusedMoE.custom_routing_function callback);
         # the MoE call itself doesn't need it as a parameter.
-        assert (
-            x.dim() == 2 and x.shape[-1] == self.dim
-        ), f"MoE expects 2D [num_tokens, {self.dim}], got {tuple(x.shape)}"
+        assert x.dim() == 2 and x.shape[-1] == self.dim, (
+            f"MoE expects 2D [num_tokens, {self.dim}], got {tuple(x.shape)}"
+        )
         if self._use_dual_stream or self._use_comm_fused_dispatch:
             # Keep stream and comm-fused dispatch opaque to torch.compile.
             return torch.ops.aiter.maybe_dual_stream_forward(x, self.prefix)
@@ -4207,14 +4196,15 @@ class ParallelHead(ParallelLMHead):
         self.hc_eps = hc_eps
 
     def get_logits(
-        self, x: torch.Tensor  # [num_tokens, dim]
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]
     ) -> torch.Tensor:  # [bs, vocab]
         """Project to vocab logits via the inherited `ParallelLMHead.forward`,
         which handles last-token slicing (prefill) + tgemm.mm + all-gather.
         """
-        assert (
-            x.dim() == 2 and x.shape[-1] == self.dim
-        ), f"get_logits expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
+        assert x.dim() == 2 and x.shape[-1] == self.dim, (
+            f"get_logits expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
+        )
         return super().forward(x)
 
     def hc_head(

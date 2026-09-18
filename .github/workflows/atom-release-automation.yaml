@@ -204,5 +204,7 @@ jobs:
     uses: ./.github/workflows/atom-release.yaml
     secrets: inherit
     with:
+      # The scheduled release is the one caller that does want to publish.
+      release_type: release
       commit: ${{ needs.prepare.outputs.release_tag }}
       flavors: both

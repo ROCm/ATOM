@@ -95,6 +95,27 @@ def test_qwen35_conditional_generation_uses_sglang_attention_runtime(
     assert model_spec.prepare_config is not None
 
 
+def test_qwen4_exp_uses_custom_entryclass_and_gdn_context():
+    """Flash keeps its own EntryClass; a generated wrapper would duplicate it."""
+    resolved_arch, model_spec = resolve_model_arch_spec(
+        SimpleNamespace(architectures=["Qwen4ExpForConditionalGeneration"])
+    )
+
+    assert resolved_arch == "Qwen4ExpForConditionalGeneration"
+    assert "Qwen4ExpForConditionalGeneration" not in MODEL_ARCH_SPECS
+    assert model_spec.wrapper_binds_gdn_context
+    assert model_spec.prepare_config is not None
+    assert model_spec.prepare_config.__name__ == "_prepare_qwen4_exp_config"
+    assert model_spec.build_forward_metadata is None
+
+    assert resolved_arch == "Qwen4ExpForConditionalGeneration"
+    assert "Qwen4ExpForConditionalGeneration" not in MODEL_ARCH_SPECS
+    assert model_spec.wrapper_binds_gdn_context
+    assert model_spec.prepare_config is not None
+    assert model_spec.prepare_config.__name__ == "_prepare_qwen4_exp_config"
+    assert model_spec.build_forward_metadata is None
+
+
 def test_resolve_model_arch_spec_supports_glm_model_type_fallback():
     resolved_arch, model_spec = resolve_model_arch_spec(
         SimpleNamespace(architectures=[], model_type="glm_moe_dsa")
@@ -156,6 +177,8 @@ def test_resolve_model_arch_spec_supports_family_version_architectures(
         ("qwen3_next", "Qwen3NextForCausalLM"),
         ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
         ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
+        ("qwen4_exp", "Qwen4ExpForConditionalGeneration"),
+        ("qwen4_exp_text", "Qwen4ExpForConditionalGeneration"),
     ),
 )
 def test_resolve_qwen_family_versions_use_their_own_adapter(
