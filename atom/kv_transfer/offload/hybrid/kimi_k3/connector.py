@@ -855,12 +855,18 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
             )
             target.add(op)
             return None
-        # Channels this connector does not own. `DenseOffloadConnector` and the
-        # rest of the MRO define no `connector_completion`, so `super().` would
-        # raise AttributeError; `False` is the caller's contract for "unhandled"
-        # (see `_offload_common._apply_connector_completions`) and matches the
-        # DSV4 sibling connector.
-        return False
+        # Channels this connector does not own go to the base, which DOES
+        # define `connector_completion` (`ChunkedOffloadSchedulerBase`, since
+        # #1953) and owns the dense PAGE channels. Returning a bare `False`
+        # here -- on the claim that no base defined the method -- swallowed
+        # them: this class inherits its save path from `DenseOffloadConnector`,
+        # which emits `dense.page.source_safe` and `dense.page.store` under
+        # early block release, and the scheduler half needs both to mark a
+        # staging group source-safe and to retire a store. Dropped, they were
+        # logged as "unhandled channel" and the deferred blocks were never
+        # released. The base still answers `False` for a channel nobody owns,
+        # so the caller's contract is unchanged.
+        return super().connector_completion(completion)
 
     def take_state_source_releases(self) -> set:
         """Drain the stores whose PAGE units the GPU has finished reading.
