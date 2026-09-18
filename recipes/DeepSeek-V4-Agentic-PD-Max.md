@@ -128,14 +128,13 @@ atomesh launch --host 0.0.0.0 --port 8000 --pd-disaggregation \
 
 ## DP attention — concurrency 64 – 128
 
-Use the TP exports with DP attention enabled and memory fraction 0.75 on
-prefill / 0.70 on decode. No offload tier is needed at these concurrencies.
-Both sides use the cache-aware router shown in the next section.
+Use the TP exports with DP attention enabled. Set `CONC` to the target request
+concurrency (64 or 128) on both server nodes. No offload tier is needed at these
+concurrencies. Both sides use the cache-aware router shown in the next section.
 
 ```bash
 # ...the TP exports above, plus:
 export ATOM_ENABLE_PREFILL_DELAYER=0       # Disable cross-DP prefill coalescing
-export GPU_MEM=0.75                      # 0.70 on decode
 
 python3 -u -m atom.entrypoints.openai_server \
   --model "$MODEL_PATH" --served-model-name deepseek-ai/DeepSeek-V4-Pro \
@@ -143,9 +142,8 @@ python3 -u -m atom.entrypoints.openai_server \
   --tensor-parallel-size 8 \
   --enable-dp-attention \
   --kv-cache-dtype fp8 --index-cache-dtype fp4 \
-  --enable-prefix-caching --block-size 16 \
-  --gpu-memory-utilization $GPU_MEM \
-  --max-num-seqs 256 \
+  --enable-prefix-caching \
+  --max-num-seqs $(( CONC * 2 )) \
   --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
   --state-checkpoint-interval-tokens 8192 \
   --level 3 --cudagraph-mode FULL \
@@ -215,13 +213,14 @@ atomesh launch --host 0.0.0.0 --port 8000 --pd-disaggregation \
 ## Complete example — concurrency 256, both nodes
 
 The updated DP commands with the tuned CPU offload settings, written out in
-full. Substitute the two IPs, model/tokenizer paths, and NIC names. The
+full. Substitute the two IPs and model/tokenizer paths. The
 historical measurements below used the earlier server and router configuration.
 
 
 ### Prefill node
 
 ```bash
+export CONC=256
 export MODEL_PATH="<DeepSeek-V4-Pro-0813 checkpoint path or model ID>"
 export TOKENIZER_PATH="$MODEL_PATH"
 export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
@@ -258,9 +257,8 @@ python3 -u -m atom.entrypoints.openai_server \
   --tensor-parallel-size 8 \
   --enable-dp-attention \
   --kv-cache-dtype fp8 --index-cache-dtype fp4 \
-  --enable-prefix-caching --block-size 16 \
-  --gpu-memory-utilization 0.75 \
-  --max-num-seqs 256 \
+  --enable-prefix-caching \
+  --max-num-seqs $(( CONC * 2 )) \
   --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
   --state-checkpoint-interval-tokens 8192 \
   --level 3 --cudagraph-mode FULL \
@@ -271,7 +269,7 @@ python3 -u -m atom.entrypoints.openai_server \
 
 ### Decode node
 
-No offload tier, no `--enable-tbo`, memory fraction 0.70.
+No offload tier and no `--enable-tbo`.
 
 ```bash
 # same exports as above, except:
@@ -284,9 +282,8 @@ python3 -u -m atom.entrypoints.openai_server \
   --tensor-parallel-size 8 \
   --enable-dp-attention \
   --kv-cache-dtype fp8 --index-cache-dtype fp4 \
-  --enable-prefix-caching --block-size 16 \
-  --gpu-memory-utilization 0.70 \
-  --max-num-seqs 256 \
+  --enable-prefix-caching \
+  --max-num-seqs $(( CONC * 2 )) \
   --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
   --state-checkpoint-interval-tokens 8192 \
   --level 3 --cudagraph-mode FULL \
@@ -465,8 +462,8 @@ Three caveats on that pair. The tuned run sampled a longer trace
 perhaps a fifth of the +42% is the workload rather than the settings — the TTFT
 and cache-hit moves are not affected by this. Output-per-user falls 56.2 → 35.1,
 so this buys throughput with interactivity rather than for free. And both c=256
-rows ran with `--max-num-seqs 256`, matching the server limit above; neither
-measures the updated 0813 + `dspark` configuration.
+rows ran with `--max-num-seqs 256`; neither measures the updated
+0813 + `dspark` configuration.
 
 Two more things to read. **c=128 is the knee at default settings** — c=256
 doubles the concurrency for no throughput and 13× the TTFT, and it is the tuned
@@ -491,15 +488,14 @@ The commands pin these values to match the current launch scripts:
 
 | flag | behavior |
 |---|---|
-| `--block-size 16` | V4 overrides the effective block size to 256; passing 16 does not select 16-token blocks. |
 | `--index-cache-dtype fp4` | Selects the FP4 index cache, including its data and scale regions in PD transfer. |
 | `--cudagraph-mode FULL` | Pins full CUDA graph capture explicitly. |
 
 ## If the servers OOM at startup
 
-The commands set memory utilization explicitly: 0.70 on both TP nodes,
-and 0.75 prefill / 0.70 decode for DP. Memory registration and workspace
-requirements vary by cluster.
+The server commands use the default memory utilization. If startup runs out of
+memory, set `--gpu-memory-utilization` for the affected node; registration and
+workspace requirements vary by cluster.
 
 The Crusoe MI355X cluster these numbers came from also needed a GPU-memory
 registration workaround:
