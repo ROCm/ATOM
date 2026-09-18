@@ -150,17 +150,28 @@ What separates the arms is weight-side, and it is in the same two logs:
 | | MXFP4 | FP8 |
 |---|---|---|
 | `quantization=` in the engine config line | `quark` | `fp8` |
-| peak HBM during weight load + online quant, per rank | 112.46 GB | 187.96 GB |
+| steady `consumed memory (weights + non-torch)`, per rank | 117.84 / 117.93 / 117.93 / 117.96 GiB | 196.43 / 196.53 / 196.53 / 196.56 GiB |
+| `Available KV cache memory`, per rank | 138.49 / 138.39 / 138.39 / 138.36 GiB | 60.47 / 60.38 / 60.38 / 60.35 GiB |
 | `num_gpu_blocks` vLLM sized *before* the override | 48,709 / 48,676 / 48,676 / 48,665 | 21,269 / 21,236 / 21,236 / 21,225 |
+| *peak* HBM during weight load + online quant, per rank | 112.46 GB | 187.96 GB |
 | fused quant custom ops | none | `+quant_fp8`, `fuse_norm_quant`, `fuse_act_quant` |
 | `/v1/models` on the port under test (check 0) | `amd/GLM-5.3-MXFP4` | `amd/GLM-5.3-FP8` |
 
-Note what that says about `--num-gpu-blocks-override 8192`. Pinning the pool is
-what makes the KV comparison apples-to-apples -- but it is also what erases the
-obvious witness, because both arms then report the same 524,288-token pool
-*by construction*. The witness has to be read one line earlier, from the sizing
-vLLM computed before the override, which still carries the 1.7x difference in
-weight footprint as a 2.3x difference in blocks.
+The peak row and the steady rows are different quantities and must not be
+chained: the peak is what the loader touched (and here it reads *lower* than the
+steady figure, because `consumed memory` is measured afterwards and includes
+non-torch overhead the loader's own counter never saw). What sets the block
+count is the steady row, and it sets it by **subtraction, not by ratio** --
+FP8's weights consume 78.6 GiB more, so 78.0 GiB less is left for KV, which is
+the whole of the 2.29x difference in blocks. Quoting the 1.67x weight ratio as
+if it produced the 2.29x block ratio would be wrong arithmetic that happens to
+have the right sign.
+
+Note also what this says about `--num-gpu-blocks-override 8192`. Pinning the
+pool is what makes the KV comparison apples-to-apples -- but it is also what
+erases the obvious witness, because both arms then report the same
+524,288-token pool *by construction*. The witness survives one line earlier, in
+the sizing vLLM computed before the override.
 
 ### Registration
 
