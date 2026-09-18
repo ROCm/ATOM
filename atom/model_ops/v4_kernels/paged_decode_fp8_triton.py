@@ -15,6 +15,8 @@ stripes, depending on active concurrency.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -32,6 +34,9 @@ from atom.model_ops.v4_kernels.v4_quant import (
 )
 
 
+_ENABLE_NATIVE_BF16_V = os.environ.get("ATOM_V4_TRITON_NATIVE_BF16_V", "0") == "1"
+
+
 @triton.jit
 def _e8m0_scale(byte):
     """Decode E8M0 byte B as 2**(B-127), with B=0 as the zero sentinel."""
@@ -40,6 +45,121 @@ def _e8m0_scale(byte):
     # sentinel B=0 to +0.0 without an exp2 instruction.
     bits = byte.to(tl.uint32) << 23
     return bits.to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _scaled_e4m3x4_to_bf16_asm(
+    raw_word,
+    scale_byte,
+    ROWS: tl.constexpr,
+    COLS: tl.constexpr,
+):
+    """Convert four packed E4M3FN bytes with two native gfx950 instructions."""
+    scale = _e8m0_scale(scale_byte)
+    converted01, converted23 = tl.inline_asm_elementwise(
+        asm="""
+        v_cvt_scalef32_pk_bf16_fp8 $0, $2, $3 op_sel:[0,0];
+        v_cvt_scalef32_pk_bf16_fp8 $1, $2, $3 op_sel:[1,0];
+        """,
+        constraints="=&v,=&v,v,v",
+        args=[raw_word, scale],
+        dtype=(tl.uint32, tl.uint32),
+        is_pure=True,
+        pack=1,
+    )
+    value0 = (converted01 & 0xFFFF).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+    value1 = (converted01 >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+    value2 = (converted23 & 0xFFFF).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+    value3 = (converted23 >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+    # tl.join appends a minor dimension.  This crossing order flattens to
+    # value0,value1,value2,value3 for each original packed word.
+    return tl.reshape(
+        tl.join(tl.join(value0, value2), tl.join(value1, value3)),
+        (ROWS, COLS),
+    )
+
+
+@triton.jit
+def _load_bf16_v_group_asm(
+    kv_packed_u8_ptr,
+    slot,
+    valid,
+    kv_stride_n,
+    GROUP: tl.constexpr,
+    PACK_OFF_SCALE: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    """Load and native-dequantize one 64-wide V group."""
+    word_offs = tl.arange(0, TILE // 4)
+    scale_byte = tl.load(
+        kv_packed_u8_ptr + slot * kv_stride_n + PACK_OFF_SCALE + 2 * GROUP,
+        mask=valid,
+        other=0,
+    )
+    raw_word_ptr = (kv_packed_u8_ptr + slot[:, None] * kv_stride_n + GROUP * TILE).to(
+        tl.pointer_type(tl.uint32)
+    )
+    raw_word = tl.load(
+        raw_word_ptr + word_offs[None, :],
+        mask=valid[:, None],
+        other=0,
+    )
+    scale_full = tl.broadcast_to(
+        scale_byte[:, None],
+        (slot.shape[0], TILE // 4),
+    )
+    return _scaled_e4m3x4_to_bf16_asm(
+        raw_word,
+        scale_full,
+        ROWS=slot.shape[0],
+        COLS=TILE,
+    )
+
+
+@triton.jit
+def _bf16_v_group128_dot_asm(
+    p,
+    kv_packed_u8_ptr,
+    slot,
+    valid,
+    kv_stride_n,
+    GROUP: tl.constexpr,
+    PACK_OFF_SCALE: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    """Compute P@V for two adjacent 64-wide native-dequantized groups."""
+    word_offs = tl.arange(0, 2 * TILE // 4)
+    raw_word_ptr = (
+        kv_packed_u8_ptr + slot[:, None] * kv_stride_n + GROUP * 2 * TILE
+    ).to(tl.pointer_type(tl.uint32))
+    raw_word = tl.load(
+        raw_word_ptr + word_offs[None, :],
+        mask=valid[:, None],
+        other=0,
+    )
+    scale_offs = tl.arange(0, 2)
+    scale_pair = tl.load(
+        kv_packed_u8_ptr
+        + slot[:, None] * kv_stride_n
+        + PACK_OFF_SCALE
+        + 2 * (GROUP * 2 + scale_offs[None, :]),
+        mask=valid[:, None],
+        other=0,
+    )
+    scale_byte = tl.reshape(
+        tl.broadcast_to(
+            scale_pair[:, :, None],
+            (slot.shape[0], 2, TILE // 4),
+        ),
+        (slot.shape[0], 2 * TILE // 4),
+    )
+    value = _scaled_e4m3x4_to_bf16_asm(
+        raw_word,
+        scale_byte,
+        ROWS=slot.shape[0],
+        COLS=2 * TILE,
+    )
+    return tl.dot(p.to(tl.bfloat16), value)
 
 
 @triton.jit
@@ -125,6 +245,7 @@ def _paged_decode_fp8_2buff_fused_kernel(
     PIPE_STAGES: tl.constexpr,
     USE_MXFP8_QK: tl.constexpr,
     USE_MXFP8_V: tl.constexpr,
+    USE_NATIVE_BF16_V: tl.constexpr,
     KV_SPLITS: tl.constexpr,
 ):
     """Native 2buff attention stage-1; direct output or split-K partials."""
@@ -212,7 +333,12 @@ def _paged_decode_fp8_2buff_fused_kernel(
     neg_large = -3.4028234663852886e38
     m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
     l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
-    if USE_MXFP8_V:
+    if USE_NATIVE_BF16_V:
+        acc0 = tl.zeros((BLOCK_H, 2 * TILE), dtype=tl.float32)
+        acc1 = tl.zeros((BLOCK_H, 2 * TILE), dtype=tl.float32)
+        acc2 = tl.zeros((BLOCK_H, 2 * TILE), dtype=tl.float32)
+        acc3 = tl.zeros((BLOCK_H, 2 * TILE), dtype=tl.float32)
+    elif USE_MXFP8_V:
         # Keep eight 64-wide accumulators so each NoPE group can absorb its
         # per-token e8m0 V scale into P before a native BF16 x FP8 dot.
         acc0 = tl.zeros((BLOCK_H, TILE), dtype=tl.float32)
@@ -382,6 +508,48 @@ def _paged_decode_fp8_2buff_fused_kernel(
                 TILE=TILE,
             )
             acc7 = acc7 * alpha[:, None] + tl.dot(p.to(tl.bfloat16), kv_rope_mx)
+        elif USE_NATIVE_BF16_V:
+            acc0 = acc0 * alpha[:, None] + _bf16_v_group128_dot_asm(
+                p,
+                kv_packed_u8_ptr,
+                slot,
+                valid,
+                kv_stride_n,
+                GROUP=0,
+                PACK_OFF_SCALE=PACK_OFF_SCALE,
+                TILE=TILE,
+            )
+            acc1 = acc1 * alpha[:, None] + _bf16_v_group128_dot_asm(
+                p,
+                kv_packed_u8_ptr,
+                slot,
+                valid,
+                kv_stride_n,
+                GROUP=1,
+                PACK_OFF_SCALE=PACK_OFF_SCALE,
+                TILE=TILE,
+            )
+            acc2 = acc2 * alpha[:, None] + _bf16_v_group128_dot_asm(
+                p,
+                kv_packed_u8_ptr,
+                slot,
+                valid,
+                kv_stride_n,
+                GROUP=2,
+                PACK_OFF_SCALE=PACK_OFF_SCALE,
+                TILE=TILE,
+            )
+            kv_nope_tail = _load_bf16_v_group_asm(
+                kv_packed_u8_ptr,
+                slot,
+                valid,
+                kv_stride_n,
+                GROUP=6,
+                PACK_OFF_SCALE=PACK_OFF_SCALE,
+                TILE=TILE,
+            )
+            kv_tail = tl.cat(kv_nope_tail, kv_rope_mx, dim=1)
+            acc3 = acc3 * alpha[:, None] + tl.dot(p.to(tl.bfloat16), kv_tail)
         else:
             if USE_MXFP8_QK:
                 # Reload V after softmax instead of keeping a full BF16
@@ -428,7 +596,11 @@ def _paged_decode_fp8_2buff_fused_kernel(
         m_i = m_new
         l_i = l_new
 
-    if USE_MXFP8_V:
+    if USE_NATIVE_BF16_V:
+        acc01 = tl.cat(acc0, acc1, dim=1)
+        acc23 = tl.cat(acc2, acc3, dim=1)
+        acc = tl.cat(acc01, acc23, dim=1)
+    elif USE_MXFP8_V:
         acc01 = tl.cat(acc0, acc1, dim=1)
         acc23 = tl.cat(acc2, acc3, dim=1)
         acc45 = tl.cat(acc4, acc5, dim=1)
@@ -843,6 +1015,7 @@ def _paged_decode_fp8_query_group_kernel(
     PACK_OFF_SCALE: tl.constexpr,
     PIPE_STAGES: tl.constexpr,
     USE_MXFP8_QK: tl.constexpr,
+    USE_NATIVE_BF16_V: tl.constexpr,
     KV_SPLITS: tl.constexpr,
 ):
     """Fuse adjacent speculative queries that share one request's KV indices."""
@@ -933,7 +1106,13 @@ def _paged_decode_fp8_query_group_kernel(
     neg_large = -3.4028234663852886e38
     m_i = tl.full((BLOCK_M,), neg_large, dtype=tl.float32)
     l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
-    acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+    if USE_NATIVE_BF16_V:
+        acc0 = tl.zeros((BLOCK_M, 2 * TILE), dtype=tl.float32)
+        acc1 = tl.zeros((BLOCK_M, 2 * TILE), dtype=tl.float32)
+        acc2 = tl.zeros((BLOCK_M, 2 * TILE), dtype=tl.float32)
+        acc3 = tl.zeros((BLOCK_M, 2 * TILE), dtype=tl.float32)
+    else:
+        acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
     k_offs = tl.arange(0, BLOCK_K)
     for j in tl.range(tile_start, tile_end, num_stages=PIPE_STAGES):
         k_pos = j * BLOCK_K + k_offs
@@ -1005,7 +1184,49 @@ def _paged_decode_fp8_query_group_kernel(
         alpha = tl.exp2(m_i - m_new)
         p = tl.exp2(scores - m_new[:, None])
         l_i = l_i * alpha + tl.sum(p, axis=1)
-        if USE_MXFP8_QK:
+        if USE_NATIVE_BF16_V:
+            acc0 = acc0 * alpha[:, None] + _bf16_v_group128_dot_asm(
+                p,
+                kv_packed_u8_ptr,
+                slot,
+                valid,
+                kv_stride_n,
+                GROUP=0,
+                PACK_OFF_SCALE=PACK_OFF_SCALE,
+                TILE=TILE,
+            )
+            acc1 = acc1 * alpha[:, None] + _bf16_v_group128_dot_asm(
+                p,
+                kv_packed_u8_ptr,
+                slot,
+                valid,
+                kv_stride_n,
+                GROUP=1,
+                PACK_OFF_SCALE=PACK_OFF_SCALE,
+                TILE=TILE,
+            )
+            acc2 = acc2 * alpha[:, None] + _bf16_v_group128_dot_asm(
+                p,
+                kv_packed_u8_ptr,
+                slot,
+                valid,
+                kv_stride_n,
+                GROUP=2,
+                PACK_OFF_SCALE=PACK_OFF_SCALE,
+                TILE=TILE,
+            )
+            kv_nope_tail = _load_bf16_v_group_asm(
+                kv_packed_u8_ptr,
+                slot,
+                valid,
+                kv_stride_n,
+                GROUP=6,
+                PACK_OFF_SCALE=PACK_OFF_SCALE,
+                TILE=TILE,
+            )
+            kv_tail = tl.cat(kv_nope_tail, kv_rope_mx, dim=1)
+            acc3 = acc3 * alpha[:, None] + tl.dot(p.to(tl.bfloat16), kv_tail)
+        elif USE_MXFP8_QK:
             # Keep the gathered FP8 tile out of the score/softmax live range.
             # Re-reading V costs bandwidth, but materially lowers register
             # pressure for the 64x512 q4/head tile on gfx950.
@@ -1041,9 +1262,15 @@ def _paged_decode_fp8_query_group_kernel(
                 volatile=True,
             ).to(tl.bfloat16)
             kv = tl.where(nope_mask[None, :], kv_nope, kv_rope).to(tl.bfloat16)
-        acc = acc * alpha[:, None]
-        acc = tl.dot(p.to(tl.bfloat16), kv, acc)
+        if not USE_NATIVE_BF16_V:
+            acc = acc * alpha[:, None]
+            acc = tl.dot(p.to(tl.bfloat16), kv, acc)
         m_i = m_new
+
+    if USE_NATIVE_BF16_V:
+        acc01 = tl.cat(acc0, acc1, dim=1)
+        acc23 = tl.cat(acc2, acc3, dim=1)
+        acc = tl.cat(acc01, acc23, dim=1)
 
     if KV_SPLITS > 1:
         tl.store(
@@ -1119,6 +1346,7 @@ def sparse_attn_v4_paged_decode_fp8_triton(
     fp16_partials: bool = False,
     use_mxfp8_qk: bool = False,
     use_mxfp8_v: bool = False,
+    use_native_bf16_v: bool = False,
     kv_splits: int = 1,
 ) -> torch.Tensor:
     """Run the experimental single-pass native-2buff FP8 Triton kernel."""
@@ -1154,6 +1382,8 @@ def sparse_attn_v4_paged_decode_fp8_triton(
         raise ValueError("kv_splits must be in [1, 16]")
     if bf16_partials and fp16_partials:
         raise ValueError("at most one reduced-precision partial dtype may be selected")
+    if use_native_bf16_v and not use_mxfp8_qk:
+        raise ValueError("native BF16 V requires native MXFP8 QK")
     T, H, _ = q_packed.shape
     if kv_indptr.numel() < T + 1:
         raise ValueError("kv_indptr must contain at least T+1 entries")
@@ -1168,7 +1398,9 @@ def sparse_attn_v4_paged_decode_fp8_triton(
             dtype=(
                 torch.float16
                 if fp16_partials
-                else torch.bfloat16 if bf16_partials else torch.float32
+                else torch.bfloat16
+                if bf16_partials
+                else torch.float32
             ),
             device=q_packed.device,
         )
@@ -1224,6 +1456,7 @@ def sparse_attn_v4_paged_decode_fp8_triton(
         PIPE_STAGES=num_stages,
         USE_MXFP8_QK=use_mxfp8_qk,
         USE_MXFP8_V=use_mxfp8_v,
+        USE_NATIVE_BF16_V=use_native_bf16_v,
         KV_SPLITS=kv_splits,
         num_warps=num_warps,
         num_stages=num_stages,
@@ -1301,6 +1534,7 @@ def sparse_attn_v4_paged_decode_fp8_triton_query_group(
     waves_per_eu: int = 1,
     matrix_instr_nonkdim: int = 0,
     use_mxfp8_qk: bool = False,
+    use_native_bf16_v: bool = False,
     reduce_d_chunk: int = 512,
     reduce_num_warps: int = 1,
     bf16_partials: bool = False,
@@ -1325,6 +1559,8 @@ def sparse_attn_v4_paged_decode_fp8_triton_query_group(
         raise ValueError("num_warps must be 4 or 8")
     if bf16_partials and fp16_partials:
         raise ValueError("at most one reduced-precision partial dtype may be selected")
+    if use_native_bf16_v and not use_mxfp8_qk:
+        raise ValueError("native BF16 V requires native MXFP8 QK")
     T, H, _ = q_packed.shape
     if T % query_group:
         raise ValueError("T must be divisible by query_group")
@@ -1339,7 +1575,9 @@ def sparse_attn_v4_paged_decode_fp8_triton_query_group(
             dtype=(
                 torch.float16
                 if fp16_partials
-                else torch.bfloat16 if bf16_partials else torch.float32
+                else torch.bfloat16
+                if bf16_partials
+                else torch.float32
             ),
             device=q_packed.device,
         )
@@ -1404,6 +1642,7 @@ def sparse_attn_v4_paged_decode_fp8_triton_query_group(
         PACK_OFF_SCALE=V4_PACK_OFF_SCALE,
         PIPE_STAGES=num_stages,
         USE_MXFP8_QK=use_mxfp8_qk,
+        USE_NATIVE_BF16_V=use_native_bf16_v,
         KV_SPLITS=kv_splits,
         num_warps=num_warps,
         num_stages=num_stages,
@@ -1541,6 +1780,25 @@ def _q7_dp_hca_regular_config(T: int) -> tuple[int, int, int, int] | None:
     return 32, 2, 2, 16
 
 
+def _q7_dp_hca_native_low_batch_config(
+    T: int,
+) -> tuple[int, int, int, int] | None:
+    """Return qh64 configs unlocked by the lower-pressure native V path.
+
+    The regular kernel used to lose to four-query KV sharing below B5 because
+    its software FP8 dequantization needed too many live registers.  Native
+    FP8-to-BF16 conversion reverses that trade-off: one query per program now
+    exposes enough split-K parallelism to beat the grouped kernel across the
+    heterogeneous AgentX HCA vectors.
+    """
+    requests = T // 7
+    if requests == 1:
+        return 32, 16, 2, 16
+    if requests <= 4:
+        return 32, 8, 2, 16
+    return None
+
+
 def _dspark_auto_config(T: int) -> tuple[int, int, int]:
     """Return (block_k, splits, stages) for the six-row DSpark draft block."""
     requests = triton.cdiv(T, 6)
@@ -1619,6 +1877,8 @@ def sparse_attn_v4_paged_decode_fp8_triton_auto(
                     fp16_partials=True,
                 )
             hca_config = _q7_dp_hca_regular_config(T) if kv_kind == "hca" else None
+            if hca_config is None and kv_kind == "hca" and _ENABLE_NATIVE_BF16_V:
+                hca_config = _q7_dp_hca_native_low_batch_config(T)
             if hca_config is not None:
                 block_k, kv_splits, stages, matrix_nonkdim = hca_config
                 return sparse_attn_v4_paged_decode_fp8_triton(
@@ -1638,6 +1898,10 @@ def sparse_attn_v4_paged_decode_fp8_triton_auto(
                     waves_per_eu=1,
                     matrix_instr_nonkdim=matrix_nonkdim,
                     use_mxfp8_qk=True,
+                    # Keep native V opt-in while the gfx950-only instruction
+                    # and low-batch dispatch receive broader coverage.  The
+                    # combined path improves matched C64/C96 AgentX ITL.
+                    use_native_bf16_v=_ENABLE_NATIVE_BF16_V,
                     reduce_d_chunk=512,
                     reduce_num_warps=1,
                     fp16_partials=True,

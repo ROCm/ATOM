@@ -548,6 +548,62 @@ class TestV4NativeFp8Routing:
         assert kwargs["waves_per_eu"] == 1
         assert kwargs["matrix_instr_nonkdim"] == 0
         assert kwargs["use_mxfp8_qk"] is True
+        assert kwargs.get("use_native_bf16_v", False) is False
+        assert kwargs["reduce_num_warps"] == 1
+        assert kwargs["fp16_partials"] is True
+
+    @pytest.mark.parametrize(
+        "requests,expected_splits",
+        [
+            (1, 16),
+            (2, 8),
+            (3, 8),
+            (4, 8),
+        ],
+    )
+    def test_q7_dp_hca_native_bf16_v_uses_regular_low_batch_kernel(
+        self, monkeypatch, requests, expected_splits
+    ):
+        from atom.model_ops.v4_kernels import paged_decode_fp8_triton as fp8
+
+        calls = []
+        monkeypatch.setattr(fp8, "_ENABLE_NATIVE_BF16_V", True)
+        monkeypatch.setattr(
+            fp8,
+            "sparse_attn_v4_paged_decode_fp8_triton",
+            lambda *args, **kwargs: calls.append(("regular", kwargs)) or "regular",
+        )
+        monkeypatch.setattr(
+            fp8,
+            "sparse_attn_v4_paged_decode_fp8_triton_query_group",
+            lambda *args, **kwargs: (
+                calls.append(("query_group", kwargs)) or "query_group"
+            ),
+        )
+        q = SimpleNamespace(shape=(requests * 7, 128, 512))
+        result = fp8.sparse_attn_v4_paged_decode_fp8_triton_auto(
+            q,
+            object(),
+            object(),
+            object(),
+            object(),
+            object(),
+            object(),
+            1.0,
+            query_group=7,
+            kv_kind="hca",
+        )
+        assert result == "regular"
+        _, kwargs = calls[0]
+        assert kwargs["block_h"] == 64
+        assert kwargs["block_k"] == 32
+        assert kwargs["kv_splits"] == expected_splits
+        assert kwargs["num_stages"] == 2
+        assert kwargs["num_warps"] == 4
+        assert kwargs["waves_per_eu"] == 1
+        assert kwargs["matrix_instr_nonkdim"] == 16
+        assert kwargs["use_mxfp8_qk"] is True
+        assert kwargs["use_native_bf16_v"] is True
         assert kwargs["reduce_num_warps"] == 1
         assert kwargs["fp16_partials"] is True
 
@@ -608,8 +664,35 @@ class TestV4NativeFp8Routing:
         assert kwargs["num_stages"] == stages
         assert kwargs["matrix_instr_nonkdim"] == matrix
         assert kwargs["use_mxfp8_qk"] is True
+        assert kwargs["use_native_bf16_v"] is False
         assert kwargs["reduce_num_warps"] == 1
         assert kwargs["fp16_partials"] is True
+
+    def test_q7_dp_hca_native_bf16_v_requires_explicit_opt_in(self, monkeypatch):
+        from atom.model_ops.v4_kernels import paged_decode_fp8_triton as fp8
+
+        calls = []
+        monkeypatch.setattr(fp8, "_ENABLE_NATIVE_BF16_V", True)
+        monkeypatch.setattr(
+            fp8,
+            "sparse_attn_v4_paged_decode_fp8_triton",
+            lambda *args, **kwargs: calls.append(kwargs) or "regular",
+        )
+        q = SimpleNamespace(shape=(5 * 7, 128, 512))
+        result = fp8.sparse_attn_v4_paged_decode_fp8_triton_auto(
+            q,
+            object(),
+            object(),
+            object(),
+            object(),
+            object(),
+            object(),
+            1.0,
+            query_group=7,
+            kv_kind="hca",
+        )
+        assert result == "regular"
+        assert calls[0]["use_native_bf16_v"] is True
 
     @pytest.mark.parametrize(
         "requests,expected",
