@@ -126,6 +126,10 @@ class TestThePriorityBetweenFamilies:
     def test_the_gdn_hybrids(self, model_type):
         assert attn_family(cfg(model_type=model_type)) == GDN
 
+    def test_qwen4_exp_wins_over_gdn(self):
+        """Qwen3.8-Flash-Next is a GDN hybrid whose full-attn layers are QSA."""
+        assert attn_family(cfg(model_type="qwen4_exp_text")) == Family.QSA_GDN
+
 
 class TestWhatRidesAnMlaPool:
 

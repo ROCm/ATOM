@@ -25,6 +25,9 @@ from atom.plugin.sglang.attention_backend.backend_resolver import (
     resolve_attn_backend,
     resolve_mamba_req_pool,
 )
+from atom.plugin.sglang.patches.qwen4_exp_recognition_patch import (
+    apply_gdn_pad_sentinels,
+)
 from atom.utils.forward_context import (
     AttentionMetaData,
     Context,
@@ -498,6 +501,12 @@ class SGLangGDNForwardContext:
             query_start_loc, idx = reconstructed
         device = query_start_loc.device
         idx = idx.to(dtype=torch.int32, device=device)
+        # Native GDN pad clone. Hybrid already pads Flash like 2.4T;
+        # drop this after Native GDN consumes Hybrid buffers directly.
+        # See apply_gdn_pad_sentinels in qwen4_exp_recognition_patch.py.
+        idx, query_start_loc = apply_gdn_pad_sentinels(
+            forward_batch, idx, query_start_loc, mode, bs
+        )
         common_kwargs = {
             "num_spec_decodes": 0,
             "num_spec_decode_tokens": 0,
