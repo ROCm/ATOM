@@ -30,6 +30,7 @@ from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadScheduler,
 )
 from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.sequence import Sequence
 
 
 def _config(role="kv_producer", *, block_size=4):
@@ -42,6 +43,7 @@ def _config(role="kv_producer", *, block_size=4):
 
 
 def _early_release_scheduler(monkeypatch, role="kv_producer", *, chunk_size=8):
+    monkeypatch.setenv("OFFLOAD_MIN_SAVE_TOKENS", "0")
     monkeypatch.setattr(
         offcfg,
         "build_lmcache_config",
@@ -81,6 +83,23 @@ def _finish_and_lease(scheduler, seq):
     assert protected is not None
     scheduler.activate_block_leases(seq, protected)
     return protected
+
+
+def _resident_sequence(scheduler, req_id, num_prompt_tokens, num_blocks):
+    """Build a real hashed prefix so late-save admission can reacquire it."""
+    bm = BlockManager(
+        MockConfig(
+            num_kvcache_blocks=max(32, num_blocks + 8),
+            kv_cache_block_size=4,
+            enable_prefix_caching=True,
+        )
+    )
+    seq = Sequence(list(range(num_prompt_tokens)), 4, id=req_id)
+    assert bm.allocate(seq, bm.can_allocate(seq))
+    table = list(seq.block_table)
+    bm.hash_blocks(seq, num_prompt_tokens, start_tokens=0)
+    scheduler.bind_block_manager(bm)
+    return bm, seq, table
 
 
 class TestBlockPoolLeaseOwnership:
@@ -295,40 +314,81 @@ class TestSourceSafeBoundary:
 class TestIncrementalLeaseRelease:
     def test_b1_b2_release_while_b3_b8_remain_protected(self, monkeypatch):
         scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
-        seq = _seq(100, num_prompt_tokens=48, num_blocks=12)
+        bm, seq, table = _resident_sequence(scheduler, 100, 48, 12)
         scheduler.update_state_after_alloc(seq)
 
         seq.num_cached_tokens = 8
         op1 = scheduler.build_connector_meta().requests[0].save_operation
         seq.num_cached_tokens = 32
         protected = _finish_and_lease(scheduler, seq)
-        assert protected == frozenset(range(8))
+        assert protected == frozenset(table[:2])
+        bm.deallocate_partial(seq, protected)
 
         assert scheduler.connector_completion(_source_safe(op1, (0, 8))) is None
-        assert scheduler.take_source_safe_releases() == [frozenset({0, 1})]
-        assert scheduler.protected_block_ids(seq) == frozenset(range(2, 8))
+        released = scheduler.take_source_safe_releases()
+        assert released == [frozenset(table[:2])]
+        bm.free_leased_blocks(released[0])
+        assert scheduler.protected_block_ids(seq) == frozenset()
 
         assert scheduler.connector_completion(_store_terminal(op1)) is True
         op2 = scheduler.build_connector_meta().requests[0].save_operation
+        assert scheduler.protected_block_ids(seq) == frozenset(table[2:8])
         assert scheduler.connector_completion(_source_safe(op2, (8, 32))) is None
-        assert scheduler.take_source_safe_releases() == [frozenset(range(2, 8))]
+        assert scheduler.take_source_safe_releases() == [frozenset(table[2:8])]
         scheduler.connector_completion(_store_terminal(op2))
         assert scheduler.protected_block_ids(seq) == frozenset()
 
     def test_final_pending_save_survives_request_block_table_clear(self, monkeypatch):
         scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
-        seq = _seq(101, num_prompt_tokens=32, num_blocks=8)
+        bm, seq, table = _resident_sequence(scheduler, 101, 32, 8)
         scheduler.update_state_after_alloc(seq)
         seq.num_cached_tokens = 32
         protected = _finish_and_lease(scheduler, seq)
-        assert protected == frozenset(range(8))
+        assert protected == frozenset()
         assert scheduler.has_pending_work() is True
 
-        seq.block_table.clear()
-        seq.num_cached_tokens = 0
+        bm.deallocate_partial(seq, protected)
+        assert list(seq.block_table) == []
+        assert bm.kv.num_used == 0
         request = scheduler.build_connector_meta().requests[0]
-        assert request.block_ids == list(range(8))
+        assert request.block_ids == table
         assert request.token_ids == list(range(32))
+        assert scheduler.protected_block_ids(seq) == frozenset(table)
+        assert bm.kv.num_used == 8
+
+    def test_late_acquire_stops_at_first_evicted_hash_gap(self, monkeypatch):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        bm, seq, table = _resident_sequence(scheduler, 102, 32, 8)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 32
+        protected = _finish_and_lease(scheduler, seq)
+        bm.deallocate_partial(seq, protected)
+
+        # Reuse the fifth block for unrelated content. The first four blocks
+        # remain canonical, but the save must not splice blocks after this gap.
+        bm.kv.allocate(table[4])
+        [request] = scheduler.build_connector_meta().requests
+        assert request.token_ids == list(range(16))
+        assert request.block_ids[:4] == table[:4]
+        assert request.save_spec.skip_leading_tokens == 0
+        assert scheduler.protected_block_ids(seq) == frozenset(table[:4])
+
+    def test_late_acquire_below_save_threshold_is_released_and_skipped(
+        self, monkeypatch
+    ):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        scheduler._min_save_tokens = 24
+        bm, seq, table = _resident_sequence(scheduler, 103, 32, 8)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 32
+        protected = _finish_and_lease(scheduler, seq)
+        bm.deallocate_partial(seq, protected)
+        bm.kv.allocate(table[4])
+
+        assert scheduler.build_connector_meta().requests == []
+        assert str(seq.id) not in scheduler._save_tracker
+        assert scheduler.protected_block_ids(seq) == frozenset()
+        assert bm.kv.num_used == 1
 
 
 class TestTPQuorum:
@@ -398,6 +458,7 @@ class TestNoDoubleFree:
         seq = _seq(399, num_prompt_tokens=16, num_blocks=4)
         scheduler.update_state_after_alloc(seq)
         seq.num_cached_tokens = 8
+        scheduler.build_connector_meta()
         _finish_and_lease(scheduler, seq)
         scheduler._save_lease_at[id(seq)] = time.monotonic() - 10
 

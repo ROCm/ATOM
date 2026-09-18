@@ -293,8 +293,10 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         self,
         store_ops: Sequence[CheckpointStoreOp],
         restore_ops: Sequence[CheckpointRestoreOp],
+        descriptor_slot: int = 0,
     ) -> None:
         """Copy checkpoints between Active Slots and arbitrary PAGEs."""
+        del descriptor_slot
         if store_ops or restore_ops:
             raise NotImplementedError(
                 f"{type(self).__name__} does not implement PAGE-backed state copy"

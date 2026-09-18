@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.types import (
     KVTransferRegion,
@@ -37,7 +38,10 @@ def _config(
     dcp: int = 1,
     pcp: int = 1,
     dp: int = 1,
+    dp_local: int | None = None,
+    dp_rank: int = 0,
     enable_dp_attention: bool = False,
+    enable_expert_parallel: bool = False,
     role: str = "offload",
     extra: dict | None = None,
     kv_lora_rank: int | None = None,
@@ -63,8 +67,13 @@ def _config(
         decode_context_parallel_size=dcp,
         prefill_context_parallel_size=pcp,
         enable_dp_attention=enable_dp_attention,
+        enable_expert_parallel=enable_expert_parallel,
         speculative_config=None,
-        parallel_config=SimpleNamespace(data_parallel_size=dp),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=dp,
+            data_parallel_size_local=dp if dp_local is None else dp_local,
+            data_parallel_rank=dp_rank,
+        ),
         kv_transfer_config={
             "kv_connector": "lmcache_mp",
             "kv_role": role,
@@ -79,8 +88,7 @@ def _config(
         ({"pp": 2}, "does not support PP"),
         ({"dcp": 2}, "does not support DCP"),
         ({"pcp": 2}, "does not support PCP"),
-        ({"dp": 2}, "TP-only"),
-        ({"enable_dp_attention": True}, "TP-only"),
+        ({"dp": 2, "dp_local": 1}, "only within one host"),
         ({"tp": 1.5}, "tensor_parallel_size must be an integer"),
     ],
 )
@@ -94,6 +102,23 @@ def test_mp_config_accepts_arbitrary_model_type():
         2,
         1,
     )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"dp": 2, "dp_rank": 1},
+        {"dp": 2, "enable_dp_attention": True},
+        {
+            "tp": 1,
+            "dp": 8,
+            "enable_dp_attention": True,
+            "enable_expert_parallel": True,
+        },
+    ],
+)
+def test_mp_config_accepts_single_host_dp_and_dpa(kwargs):
+    assert mp_connector._validate_mp_config(_config(**kwargs))[1] == 1
 
 
 def test_mp_scheduler_is_not_a_dense_transport_scheduler():
@@ -172,12 +197,37 @@ def test_parallel_strategy_keeps_every_tp_rank(monkeypatch):
     )
 
     strategies = [
-        mp_connector._parallel_strategy(_config(tp=8), rank) for rank in range(8)
+        mp_connector._parallel_strategy(_config(tp=8, dp=2), rank) for rank in range(8)
     ]
 
     assert {strategy.world_size for strategy in strategies} == {8}
     assert {strategy.worker_id for strategy in strategies} == set(range(8))
     assert {strategy.tp_size for strategy in strategies} == {8}
+
+
+def test_parallel_strategy_uses_one_worker_per_dpa_engine(monkeypatch):
+    class AtomMPParallelConfig:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    adapter_module = types.ModuleType("lmcache.integration.atom")
+    adapter_module.AtomMPParallelConfig = AtomMPParallelConfig
+    monkeypatch.setitem(sys.modules, "lmcache.integration.atom", adapter_module)
+
+    strategy = mp_connector._parallel_strategy(
+        _config(
+            tp=1,
+            dp=8,
+            dp_rank=5,
+            enable_dp_attention=True,
+            enable_expert_parallel=True,
+        ),
+        0,
+    )
+
+    assert strategy.world_size == 1
+    assert strategy.worker_id == 0
+    assert strategy.tp_size == 1
 
 
 def test_parallel_strategy_collapses_fully_replicated_mla(monkeypatch):
@@ -201,6 +251,21 @@ def test_parallel_strategy_collapses_fully_replicated_mla(monkeypatch):
     assert {strategy.world_size for strategy in strategies} == {1}
     assert {strategy.worker_id for strategy in strategies} == {0}
     assert {strategy.tp_size for strategy in strategies} == {8}
+
+
+def test_auto_rank_collapse_distinguishes_glm52_mla_from_minimax_m3_gqa():
+    glm52 = _config(model_type="glm_moe_dsa", tp=8, kv_lora_rank=512)
+    minimax = _config(model_type="minimax_m3_vl", tp=8)
+    minimax.hf_config.architectures = ["MiniMaxM3SparseForConditionalGeneration"]
+    minimax.hf_config.text_config = SimpleNamespace(
+        num_key_value_heads=4,
+        # Stay fail-closed for this model family even if a wrapper grows an
+        # unrelated field with the same name in the future.
+        kv_lora_rank=512,
+    )
+
+    assert mp_connector._tp_replication_factor(glm52) == 8
+    assert mp_connector._tp_replication_factor(minimax) == 1
 
 
 def test_tp_rank_collapse_can_be_disabled_and_rejects_bad_values():
@@ -291,9 +356,25 @@ def test_model_namespace_reuses_generic_page_namespace(monkeypatch):
 
     config = _config(model_type="ordinary_mha", tp=4)
     assert mp_connector._model_namespace(config) == (
-        "model::atom-page-v2-layout::lmcache-mp-v2"
+        "model::atom-page-v2-layout::lmcache-mp-v3"
     )
     assert calls == [(config, cfg, 4)]
+
+
+def test_dp_replicas_share_model_namespace_but_not_request_sessions(monkeypatch):
+    cfg = object()
+    monkeypatch.setattr(mp_connector.offcfg, "build_lmcache_config", lambda _kvc: cfg)
+    monkeypatch.setattr(
+        mp_connector.offcfg,
+        "build_page_namespace",
+        lambda _config, _lmcache_cfg, world: f"page-tp{world}",
+    )
+    rank0 = _config(tp=4, dp=2, dp_rank=0)
+    rank1 = _config(tp=4, dp=2, dp_rank=1)
+
+    assert mp_connector._model_namespace(rank0) == mp_connector._model_namespace(rank1)
+    assert mp_connector._mp_session_id(rank0, 0) == "atom-offload-dp0:0"
+    assert mp_connector._mp_session_id(rank1, 0) == "atom-offload-dp1:0"
 
 
 def test_scheduler_validates_role_before_connecting(monkeypatch):
@@ -361,7 +442,8 @@ def _transfer_tensors(*, tp_replication_factor: int = 1) -> KVTransferTensors:
 
 
 def test_build_cache_views_groups_opaque_layouts():
-    views = mp_connector._build_cache_views(_transfer_tensors(), num_blocks=2)
+    transfer_tensors = _transfer_tensors()
+    views = mp_connector._build_cache_views(transfer_tensors, num_blocks=2)
 
     assert list(views.tensors) == [
         "page.0.primary.0",
@@ -371,6 +453,43 @@ def test_build_cache_views_groups_opaque_layouts():
     ]
     assert views.layer_groups == ((0, 1), (2, 3))
     assert views.bytes_per_block == 2 * (4 * 32 * 2 + 4 * 16)
+    assert all(tensor.dtype == torch.uint8 for tensor in views.tensors.values())
+    assert tuple(views.tensors["page.0.primary.0"].shape) == (2, 4, 64)
+    assert tuple(views.tensors["page.2.sidecar.0"].shape) == (2, 4, 16)
+    assert views.tensors["page.0.primary.0"].data_ptr() == (
+        transfer_tensors.block_tensor_views[0].data_ptr()
+    )
+
+
+def test_build_cache_views_publishes_float8_pages_as_raw_bytes():
+    fp8 = getattr(torch, "float8_e4m3fn", None)
+    if fp8 is None:
+        pytest.skip("torch build has no float8_e4m3fn")
+
+    page = torch.empty((2, 4, 32), dtype=fp8)
+    page.view(torch.uint8).copy_(
+        torch.arange(page.numel(), dtype=torch.uint8).reshape(page.shape)
+    )
+    region = KVTransferRegion(
+        base_addr=page.data_ptr(),
+        total_bytes=page.numel(),
+        unit_bytes=page[0].numel(),
+        semantic_role="latent",
+    )
+    transfer = KVTransferTensors(
+        block_regions=[region],
+        slot_regions=[],
+        block_tensor_views=[page],
+    )
+    transfer.set_block_count(2)
+
+    views = mp_connector._build_cache_views(transfer, num_blocks=2)
+    published = views.tensors["page.0.latent"]
+
+    assert published.dtype == torch.uint8
+    assert published.shape == page.shape
+    assert published.data_ptr() == page.data_ptr()
+    assert torch.equal(published, page.view(torch.uint8))
 
 
 def test_build_cache_views_rejects_missing_or_bad_geometry():
@@ -461,6 +580,7 @@ def test_mp_lookup_releases_only_hbm_prefix_after_retrieve_handoff(monkeypatch):
     adapter = _LookupAdapter([None, 8])
     client = mp_connector._MPLookupClient(
         adapter,
+        config=_config(),
         timeout=10.0,
         poll_interval=0.01,
     )
@@ -471,7 +591,10 @@ def test_mp_lookup_releases_only_hbm_prefix_after_retrieve_handoff(monkeypatch):
 
     # LMCache owns and releases [4, 8) once retrieve is submitted, including
     # on terminal failure. The scheduler releases only the HBM-resident prefix.
+    assert adapter.submissions == [("atom-offload-dp0:req", list(range(8)))]
     assert [(call["start"], call["end"]) for call in adapter.freed] == [(0, 4)]
+    assert {call["request_id"] for call in adapter.freed} == {"atom-offload-dp0:req"}
+    assert adapter.cleaned == ["atom-offload-dp0:req", "atom-offload-dp0:req"]
     assert client.hit_tokens("req") is None
 
 
@@ -480,6 +603,7 @@ def test_mp_lookup_releases_hit_suffix_outside_retrieve_range(monkeypatch):
     adapter = _LookupAdapter([12])
     client = mp_connector._MPLookupClient(
         adapter,
+        config=_config(),
         timeout=10.0,
         poll_interval=0.01,
     )
@@ -524,6 +648,7 @@ def test_mp_lookup_rejects_retrieve_beyond_lookup_hit(monkeypatch):
     adapter = _LookupAdapter([8])
     client = mp_connector._MPLookupClient(
         adapter,
+        config=_config(),
         timeout=10.0,
         poll_interval=0.01,
     )
@@ -543,6 +668,7 @@ def test_mp_lookup_timeout_defers_cleanup_until_result(monkeypatch):
     adapter = _LookupAdapter([None, None])
     client = mp_connector._MPLookupClient(
         adapter,
+        config=_config(),
         timeout=1.0,
         poll_interval=0.01,
     )
@@ -553,7 +679,7 @@ def test_mp_lookup_timeout_defers_cleanup_until_result(monkeypatch):
     adapter.results.append(8)
     client.clear_lookup_status("req")
     assert [(call["start"], call["end"]) for call in adapter.freed] == [(0, 8)]
-    assert adapter.cleaned == ["req"]
+    assert adapter.cleaned == ["atom-offload-dp0:req"]
 
 
 def test_mp_lookup_pending_cleanup_drops_adapter_bookkeeping(monkeypatch):
@@ -563,6 +689,7 @@ def test_mp_lookup_pending_cleanup_drops_adapter_bookkeeping(monkeypatch):
     adapter = _LookupAdapter([None, None])
     client = mp_connector._MPLookupClient(
         adapter,
+        config=_config(),
         timeout=1.0,
         poll_interval=0.01,
     )
@@ -570,7 +697,7 @@ def test_mp_lookup_pending_cleanup_drops_adapter_bookkeeping(monkeypatch):
     assert client.lookup(list(range(8)), "req") == 0
     client.clear_lookup_status("req")
 
-    assert adapter.cleaned == ["req"]
+    assert adapter.cleaned == ["atom-offload-dp0:req"]
     assert client.hit_tokens("req") is None
 
 
@@ -579,6 +706,7 @@ def test_full_prompt_hit_retrieves_chunk_but_recomputes_last_token(monkeypatch):
     adapter = _LookupAdapter([8])
     lookup = mp_connector._MPLookupClient(
         adapter,
+        config=_config(),
         timeout=1.0,
         poll_interval=0.01,
     )
@@ -620,6 +748,7 @@ def test_stale_load_failure_does_not_release_current_generation_locks():
     adapter = _LookupAdapter([])
     lookup = mp_connector._MPLookupClient(
         adapter,
+        config=_config(),
         timeout=1.0,
         poll_interval=0.01,
     )
@@ -679,6 +808,7 @@ class _WorkerFuture:
         self.ready = False
         self.value = result
         self.query_error = None
+        self.completed_ranges = []
 
     def query(self):
         if self.query_error is not None:
@@ -689,6 +819,11 @@ class _WorkerFuture:
         if not self.ready:
             raise TimeoutError("future is not ready")
         return self.value
+
+    def take_completed_ranges(self):
+        ranges = self.completed_ranges
+        self.completed_ranges = []
+        return ranges
 
 
 @pytest.fixture
@@ -743,6 +878,9 @@ class _WorkerAdapter:
         self.saves.append((request_id, op, event, future))
         return future
 
+    def submit_store_request_with_chunk_events(self, request_id, op, event):
+        return self.submit_store_request(request_id, op, event)
+
     def shutdown(self):
         self.shutdown_called = True
 
@@ -794,6 +932,7 @@ def test_worker_uses_transfer_boundary_and_exact_completion(fake_lmcache_modules
     )
 
     worker._submit_load(request, object())
+    assert adapter.loads[0][0] == "atom-offload-dp0:5"
     submitted = adapter.loads[0][1]
     assert submitted.start == 0
     assert submitted.end == 8
@@ -984,6 +1123,7 @@ def test_worker_save_slices_chunk_blocks_and_preserves_operation(
     )
 
     worker._submit_save(request, object())
+    assert adapter.saves[0][0] == "atom-offload-dp0:8"
     submitted = adapter.saves[0][1]
     assert submitted.start == 8
     assert submitted.end == 16
@@ -991,6 +1131,33 @@ def test_worker_save_slices_chunk_blocks_and_preserves_operation(
 
     _finish_save(worker, "save:8:2")
     assert worker.get_finished().finished_saving == {operation}
+
+
+def test_worker_reports_chunk_source_safe_before_store_terminal(fake_lmcache_modules):
+    adapter = _WorkerAdapter()
+    worker = _worker(adapter)
+    operation = SaveOperationId(req_id=81, generation=2)
+    request = LMCacheReqMeta(
+        req_id=81,
+        token_ids=list(range(16)),
+        block_ids=[30, 31, 32, 33],
+        save_spec=SaveSpec(skip_leading_tokens=0),
+        save_operation=operation,
+    )
+
+    worker._submit_save(request, object())
+    future = worker._pending_saves["save:81:2"].future
+    future.completed_ranges = [(8, 16)]
+    output = worker.get_finished()
+
+    assert output.finished_saving == set()
+    assert output.connector_completions == {
+        mp_connector.ConnectorCompletion(
+            mp_connector.DENSE_PAGE_SOURCE_SAFE_CHANNEL,
+            mp_connector.SaveSourceGroupId(operation, ((8, 16),)),
+            True,
+        )
+    }
 
 
 def test_non_writer_completes_save_without_submitting(fake_lmcache_modules):
@@ -1009,9 +1176,51 @@ def test_non_writer_completes_save_without_submitting(fake_lmcache_modules):
     worker._submit_save(request, object())
 
     assert adapter.saves == []
-    assert worker.get_finished().finished_saving == {operation}
+    output = worker.get_finished()
+    assert output.finished_saving == {operation}
+    assert {
+        completion.operation_id.ranges
+        for completion in output.connector_completions
+        if completion.channel == mp_connector.DENSE_PAGE_SOURCE_SAFE_CHANNEL
+    } == {((0, 8),)}
     with pytest.raises(RuntimeError, match="duplicate LMCache MP save"):
         worker._submit_save(request, object())
+
+
+def test_collapsed_tp_early_release_waits_only_for_the_single_writer_dma(
+    fake_lmcache_modules,
+):
+    operation = SaveOperationId(req_id=91, generation=1)
+    request = LMCacheReqMeta(
+        req_id=91,
+        token_ids=list(range(16)),
+        block_ids=[40, 41, 42, 43],
+        save_spec=SaveSpec(skip_leading_tokens=0),
+        save_operation=operation,
+    )
+    writer = _worker(_WorkerAdapter())
+    non_writer = _worker(_WorkerAdapter())
+    non_writer._is_kv_writer = False
+    writer._submit_save(request, object())
+    non_writer._submit_save(request, object())
+    writer_future = writer._pending_saves["save:91:1"].future
+    writer_future.completed_ranges = [(0, 8)]
+
+    aggregator = KVOutputAggregator(world_size=2)
+    first = aggregator.aggregate([writer.get_finished(), non_writer.get_finished()])
+    assert {
+        completion.operation_id.ranges
+        for completion in first.connector_completions
+        if completion.channel == mp_connector.DENSE_PAGE_SOURCE_SAFE_CHANNEL
+    } == {((0, 8),)}
+
+    writer_future.completed_ranges = [(8, 16)]
+    second = aggregator.aggregate([writer.get_finished(), non_writer.get_finished()])
+    assert {
+        completion.operation_id.ranges
+        for completion in second.connector_completions
+        if completion.channel == mp_connector.DENSE_PAGE_SOURCE_SAFE_CHANNEL
+    } == {((8, 16),)}
 
 
 def test_worker_tracks_two_load_generations_for_one_raw_request(

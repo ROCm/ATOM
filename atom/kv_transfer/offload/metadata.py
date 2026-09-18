@@ -128,6 +128,16 @@ class SlotLoadSpec:
 
 
 @dataclass
+class NativeStateTransfer:
+    """One immutable native checkpoint image sharing a PAGE transfer operation."""
+
+    unit_ids: tuple[int, ...]
+    boundary_tokens: int
+    prefix_hash: int
+    destination_slot: int | None = None
+
+
+@dataclass
 class LMCacheReqMeta:
     """Everything the worker needs to load/save one request's KV this step."""
 
@@ -150,6 +160,7 @@ class LMCacheReqMeta:
     save_operation: SaveOperationId | None = None
     # Appended for positional compatibility with existing metadata producers.
     load_operation: LoadOperationId | None = None
+    native_state: NativeStateTransfer | None = None
 
 
 class LMCacheOffloadMetadata(ConnectorMetadata):

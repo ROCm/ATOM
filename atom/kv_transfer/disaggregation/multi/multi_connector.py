@@ -424,6 +424,13 @@ class MultiConnector(KVConnectorBase):
 class MultiConnectorScheduler(KVConnectorSchedulerBase):
     """Scheduler-side composite connector."""
 
+    def bind_block_manager(self, block_manager: Any) -> None:
+        """Bind native checkpoint owners before any request can be admitted."""
+        for connector in self._connectors:
+            bind = getattr(connector, "bind_block_manager", None)
+            if callable(bind):
+                bind(block_manager)
+
     def __init__(self, config: Any) -> None:
         self._connectors = _build_subconnectors(config, role="scheduler")
         self.is_producer = any(

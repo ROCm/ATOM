@@ -741,7 +741,7 @@ class GDNStateMixin(PoolRowsMixin):
             )
         return self._checkpoint_plan_cache
 
-    def _checkpoint_descriptor_buffer(self) -> CpuGpuBuffer:
+    def _checkpoint_descriptor_buffer(self, descriptor_slot: int = 0) -> CpuGpuBuffer:
         """Pinned staging for a step's whole descriptor, sized for the worst step.
 
         Pinned because the alternative synchronizes: a pageable H2D from
@@ -760,16 +760,34 @@ class GDNStateMixin(PoolRowsMixin):
         storing one of them from the wrong slot besides; the two constraints
         have the same owner and move together.
         """
-        if getattr(self, "_checkpoint_descriptor", None) is None:
+        if descriptor_slot < 0:
+            raise ValueError("checkpoint descriptor slot must be non-negative")
+        if (
+            descriptor_slot == 0
+            and getattr(self, "_checkpoint_descriptor", None) is not None
+        ):
+            return self._checkpoint_descriptor
+        restore_descriptors = getattr(self, "_checkpoint_restore_descriptors", None)
+        if restore_descriptors is None:
+            restore_descriptors = {}
+            self._checkpoint_restore_descriptors = restore_descriptors
+        if descriptor_slot and descriptor_slot in restore_descriptors:
+            return restore_descriptors[descriptor_slot]
+        if descriptor_slot == 0 or descriptor_slot not in restore_descriptors:
             plan = self._checkpoint_copy_plan()
             max_ops = 2 * int(self.model_runner.config.max_num_seqs)
-            self._checkpoint_descriptor = CpuGpuBuffer(
+            descriptor = CpuGpuBuffer(
                 max_ops * plan.num_spans,
                 3,
                 dtype=torch.int64,
                 device=self.model_runner.mamba_k_cache.device,
             )
-        return self._checkpoint_descriptor
+            if descriptor_slot == 0:
+                self._checkpoint_descriptor = descriptor
+            else:
+                restore_descriptors[descriptor_slot] = descriptor
+            return descriptor
+        raise AssertionError("unreachable checkpoint descriptor allocation")
 
     def _validate_paged_state_op(self, op) -> None:
         """Refuse an op this worker cannot honour, before it addresses memory.
@@ -805,7 +823,9 @@ class GDNStateMixin(PoolRowsMixin):
         if any(unit < 0 or unit >= num_blocks for unit in op.unit_ids):
             raise RuntimeError("state checkpoint PAGE unit is out of range")
 
-    def execute_paged_state_copies(self, store_ops, restore_ops) -> None:
+    def execute_paged_state_copies(
+        self, store_ops, restore_ops, descriptor_slot: int = 0
+    ) -> None:
         """Copy raw checkpoint bytes between slots and non-contiguous PAGEs.
 
         Every op of either direction goes into one descriptor and one launch.
@@ -823,7 +843,7 @@ class GDNStateMixin(PoolRowsMixin):
         slot_bases = self._checkpoint_slot_bases()
         per_op = plan.num_spans
         total = (len(store_ops) + len(restore_ops)) * per_op
-        staging = self._checkpoint_descriptor_buffer()
+        staging = self._checkpoint_descriptor_buffer(descriptor_slot)
         if total > staging.np.shape[0]:
             raise RuntimeError(
                 f"a step asked to copy {total // per_op} checkpoints, more "

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import sys
 import types
@@ -16,7 +17,9 @@ import pytest
 import torch
 
 from atom.kv_transfer.offload.mp.backend import _build_cache_views
+from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 from atom.model_ops.attentions.mla_kv_pool import MlaKvPool
+from atom.model_ops.attentions.pool_layout.entry_arena import EntryField
 
 _MISSING = object()
 _REPO_ROOT = Path(__file__).parents[1]
@@ -77,6 +80,31 @@ def _sub_pool_module():
         SubPoolSpec=type("SubPoolSpec", (), {}),
         page_pool=lambda size: size,
     )
+
+
+@pytest.fixture(scope="module")
+def mha_export_method():
+    # Execute only the shipped exporter: importing the full backend requires a
+    # GPU AITER build, while this PAGE-view contract is plain torch geometry.
+    source = _REPO_ROOT / "atom/model_ops/attentions/aiter_attention.py"
+    module = ast.parse(source.read_text())
+    builder = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "AiterAttentionMetadataBuilder"
+    )
+    method = next(
+        node
+        for node in builder.body
+        if isinstance(node, ast.FunctionDef) and node.name == "get_kv_transfer_tensors"
+    )
+    namespace = {}
+    exec(  # noqa: S102 -- execute the local exporter under the CPU fixture
+        compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"),
+        namespace,
+    )
+    return namespace["get_kv_transfer_tensors"]
 
 
 @pytest.fixture(scope="module")
@@ -166,6 +194,39 @@ def _assert_region_view_geometry(transfer):
         assert view.data_ptr() == region.base_addr
         assert view[0].numel() * view.element_size() == region.unit_bytes
         assert view.numel() * view.element_size() == region.total_bytes
+
+
+def test_minimax_m3_builder_publishes_gqa_and_index_views_without_tp_collapse(
+    mha_export_method,
+):
+    num_blocks = 3
+    pool = MhaKvPool(
+        layers=2,
+        block_size=128,
+        num_kv_heads=1,
+        head_dim=128,
+        kv_dtype=torch.float8_e4m3fnuz,
+        extra_fields=(EntryField("index", 1, (128 * 128,), torch.uint8),),
+    )
+    pool.allocate(num_blocks, "cpu")
+    builder = SimpleNamespace(kv_pools={"gqa4": pool})
+
+    transfer = mha_export_method(builder)
+    transfer.set_block_count(num_blocks)
+
+    assert transfer.tp_replication_factor == 1
+    assert len(transfer.block_regions) == 4 * 2 + 1
+    assert all(
+        region.semantic_role.startswith("mha.gqa4.")
+        for region in transfer.block_regions
+    )
+    assert all(view.shape[:2] == (num_blocks, 1) for view in transfer.block_tensor_views)
+    _assert_region_view_geometry(transfer)
+    cache_views = _build_cache_views(transfer, num_blocks=num_blocks)
+    assert len(cache_views.tensors) == len(transfer.block_regions)
+
+    transfer.block_tensor_views[-1][1].fill_(7)
+    assert torch.all(pool.field_view("index", 0, torch.uint8, (num_blocks, -1))[1] == 7)
 
 
 @pytest.mark.parametrize("index_layers,index_rows", [(0, 0), (2, 2), (1, 1)])

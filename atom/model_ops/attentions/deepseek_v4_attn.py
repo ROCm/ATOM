@@ -648,6 +648,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._checkpoint_plan_cache: SegmentedCopyPlan | None = None
         self._checkpoint_slot_base_cache: np.ndarray | None = None
         self._checkpoint_descriptor: CpuGpuBuffer | None = None
+        self._checkpoint_restore_descriptors: dict[int, CpuGpuBuffer] = {}
 
     @property
     def prep_stream(self):
@@ -886,6 +887,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self,
         store_ops: Sequence[CheckpointStoreOp],
         restore_ops: Sequence[CheckpointRestoreOp],
+        descriptor_slot: int = 0,
     ) -> None:
         """Copy raw checkpoint bytes between slots and non-contiguous PAGEs.
 
@@ -904,7 +906,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         slot_bases = self._checkpoint_slot_bases()
         per_op = plan.num_spans
         total = (len(store_ops) + len(restore_ops)) * per_op
-        staging = self._checkpoint_descriptor_buffer()
+        staging = self._checkpoint_descriptor_buffer(descriptor_slot)
         if total > staging.np.shape[0]:
             raise RuntimeError(
                 f"a step asked to copy {total // per_op} checkpoints, more "
@@ -1077,6 +1079,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._checkpoint_plan_cache = None
         self._checkpoint_slot_base_cache = None
         self._checkpoint_descriptor = None
+        self._checkpoint_restore_descriptors = {}
 
     def warmup_per_req_cache(self) -> None:
         """Run one checkpoint copy now, so the first real one is only a copy.
@@ -1107,7 +1110,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         launch_copy_descriptor(staging.copy_to_gpu(plan.num_spans), plan)
 
-    def _checkpoint_descriptor_buffer(self) -> CpuGpuBuffer:
+    def _checkpoint_descriptor_buffer(self, descriptor_slot: int = 0) -> CpuGpuBuffer:
         """Pinned staging for a step's whole descriptor, sized for the worst step.
 
         Pinned because the alternative synchronizes: a pageable H2D from
@@ -1125,16 +1128,28 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         which keeps one pending boundary per sequence -- see the longer note on
         `GDNStateMixin._checkpoint_descriptor_buffer`.
         """
-        if self._checkpoint_descriptor is None:
+        if descriptor_slot < 0:
+            raise ValueError("checkpoint descriptor slot must be non-negative")
+        if descriptor_slot == 0 and self._checkpoint_descriptor is not None:
+            return self._checkpoint_descriptor
+        restore_descriptors = self._checkpoint_restore_descriptors
+        if descriptor_slot and descriptor_slot in restore_descriptors:
+            return restore_descriptors[descriptor_slot]
+        if descriptor_slot == 0 or descriptor_slot not in restore_descriptors:
             plan = self._checkpoint_copy_plan()
             max_ops = 2 * int(self.model_runner.config.max_num_seqs)
-            self._checkpoint_descriptor = CpuGpuBuffer(
+            descriptor = CpuGpuBuffer(
                 max_ops * plan.num_spans,
                 3,
                 dtype=torch.int64,
                 device=self._kv_planes()[0].device,
             )
-        return self._checkpoint_descriptor
+            if descriptor_slot == 0:
+                self._checkpoint_descriptor = descriptor
+            else:
+                restore_descriptors[descriptor_slot] = descriptor
+            return descriptor
+        raise AssertionError("unreachable checkpoint descriptor allocation")
 
     def _checkpoint_copy_plan(self) -> SegmentedCopyPlan:
         """Where a slot's checkpoint ranges meet a whole image's PAGE regions.
@@ -1869,6 +1884,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         elem_fp32 = 4
 
         block_regions: list[KVTransferRegion] = []
+        block_tensor_views: list[torch.Tensor] = []
         swa_block_regions: list[KVTransferRegion] = []
         slot_regions: list[KVTransferRegion] = []
 
@@ -1894,6 +1910,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             )
         )
         for plane, row_bytes, role in planes:
+            if not plane.is_contiguous():
+                raise RuntimeError("a KV plane must be contiguous to be transferred")
+            # Retain the real allocation owner, excluding the reverse-indexed
+            # SLOT tail. One opaque physical slot represents one scheduler
+            # PAGE; envelope rows span multiple layers, not logical tokens.
+            block_tensor_views.append(
+                plane[: self.num_blocks * geo.envelope_rows].view(
+                    self.num_blocks,
+                    1,
+                    geo.block_bytes(row_bytes) // plane.element_size(),
+                )
+            )
             block_regions.append(
                 KVTransferRegion(
                     plane.data_ptr(),
@@ -1914,6 +1942,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     raise RuntimeError(
                         "a CSA indexer layer must be contiguous to be transferred"
                     )
+                block_tensor_views.append(view.view(self.num_blocks, 1, view.stride(0)))
                 block_regions.append(
                     KVTransferRegion(
                         view.data_ptr(),
@@ -1993,6 +2022,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             staging_pool_size=pool_size if staging_region else 0,
             gather_slot=gather_slot,
             scatter_slot=scatter_slot,
+            block_tensor_views=block_tensor_views,
+            # DSv4 PAGE KV and its compact C4/SWA checkpoint image are MLA
+            # state before any TP-sharded projection, so both are byte-identical
+            # on every TP rank. One writer is sufficient; all ranks still read.
+            tp_replication_factor=int(
+                getattr(runner.config, "tensor_parallel_size", 1) or 1
+            ),
+            native_state_tp_replication_factor=int(
+                getattr(runner.config, "tensor_parallel_size", 1) or 1
+            ),
+            paged_state_checkpoint_spec=checkpoint_spec,
+            execute_paged_state_copies=self.execute_paged_state_copies,
         )
 
     # ------------------------------------------------------------------ #

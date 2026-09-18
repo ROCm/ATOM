@@ -760,6 +760,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
         if not self.kv_pools:
             return None
+        region_tensors = [
+            (geometry, role, tensor)
+            for geometry, pool in self.kv_pools.items()
+            for role, tensor in pool.region_tensors()
+        ]
         # Every field of every pool, indexer cache included: a region per
         # (pool, field, layer), in declared order.
         return KVTransferTensors(
@@ -772,10 +777,18 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                     # per-layer regions are otherwise named alike.
                     semantic_role=f"mha.{geometry}.{role}",
                 )
-                for geometry, pool in self.kv_pools.items()
-                for role, tensor in pool.region_tensors()
+                for geometry, role, tensor in region_tensors
             ],
             slot_regions=[],
+            # MHA arenas expose one contiguous byte row per scheduler block.
+            # LMCache MP deliberately treats the last two dimensions as opaque
+            # copy geometry, so adding a singleton physical-slot dimension is
+            # a zero-copy view of the exact region declared above.
+            block_tensor_views=[tensor.unsqueeze(1) for _, _, tensor in region_tensors],
+            # GQA/MQA KV heads are sharded or only partially replicated across
+            # TP. In particular MiniMax-M3 must keep one stored shard per rank;
+            # whole-object TP collapse is unsafe for this PAGE layout.
+            tp_replication_factor=1,
         )
 
     def prepare_mtp_decode(
