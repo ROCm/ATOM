@@ -1599,9 +1599,7 @@ class DCPConfig:
         return cls(**cfg)
 
 
-def qrep_unsupported_reason(
-    dcp_size: int, speculative_config, mxfp4_bmm: bool
-) -> str | None:
+def qrep_unsupported_reason(dcp_size: int, mxfp4_bmm: bool) -> str | None:
     """Why DCP query replication cannot run here, or None if it can.
 
     Kept a module-level pure function so it is unit-testable: the alternative,
@@ -1611,9 +1609,6 @@ def qrep_unsupported_reason(
     if dcp_size <= 1:
         # No DCP group means there is no AllGather Q to remove.
         return "decode_context_parallel_size <= 1 (no DCP group)"
-    if speculative_config is not None:
-        # MTP / eagle3 / dspark run a qlen>1 verify on the cprr kernel.
-        return "speculative decode (qlen>1 cprr path)"
     if mxfp4_bmm:
         # fp4 (mxfp4) absorbed BMM has a different scale structure.
         return "fp4 (mxfp4) BMM weights"
@@ -2041,7 +2036,6 @@ class Config:
         if self.dcp_config.enable_query_replication:
             qrep_off = qrep_unsupported_reason(
                 self.decode_context_parallel_size,
-                self.speculative_config,
                 envs.ATOM_USE_TRITON_MXFP4_BMM,
             )
             if qrep_off is not None:
