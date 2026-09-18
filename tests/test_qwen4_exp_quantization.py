@@ -50,9 +50,7 @@ def test_sglang_plugin_ptpc_remap_keeps_gdn_shards():
             text_config=None,
         ),
     )
-    apply_prepare_qwen4_exp_adaptations(
-        atom_config, "Qwen4ExpForConditionalGeneration"
-    )
+    apply_prepare_qwen4_exp_adaptations(atom_config, "Qwen4ExpForConditionalGeneration")
     view = qwen4_exp._Qwen4ExpQuantizationConfig(config)
     prefix = "model.layers.0.linear_attn"
     assert view.get_layer_quant_config(prefix + ".in_proj_qkv").is_quantized
