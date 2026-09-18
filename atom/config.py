@@ -2017,9 +2017,9 @@ class Config:
                 "speculative decode for block-level interleave."
             )
 
-        # DCP Query Replication (QREP) first-cut gating: turn the flag OFF
-        # (warn, not error) for combinations not yet wired, so it can default to
-        # on without breaking mixed runs.
+        # DCP Query Replication (QREP) gating: turn the flag OFF (warn, not
+        # error) for combinations that cannot use it, so it can default to on
+        # without breaking mixed runs.
         if self.dcp_config.enable_query_replication:
             qrep_off = qrep_unsupported_reason(
                 self.decode_context_parallel_size,
@@ -2028,7 +2028,7 @@ class Config:
             if qrep_off is not None:
                 logger.warning(
                     "dcp_config.enable_query_replication disabled: %s not "
-                    "supported in the first cut.",
+                    "supported.",
                     qrep_off,
                 )
                 self.dcp_config.enable_query_replication = False
