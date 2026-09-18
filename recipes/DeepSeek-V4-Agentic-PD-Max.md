@@ -141,11 +141,18 @@ not needed for this routing path.
 # ...the TP exports above, plus:
 export ATOM_ENABLE_PREFILL_DELAYER=0       # Disable cross-DP prefill coalescing
 
+# Prefill uses port 8010; decode uses port 8020.
+PREFILL_ARGS=()
+if [[ "$PORT" == "8010" ]]; then
+  export GPU_MAX_HW_QUEUES=5
+  PREFILL_ARGS=(--enable-tbo)
+fi
+
 python3 -u -m atom.entrypoints.openai_server \
   --model "$MODEL_PATH" --served-model-name deepseek-ai/DeepSeek-V4-Pro \
   --host 0.0.0.0 --server-port $PORT \
   --tensor-parallel-size 8 \
-  --enable-dp-attention \
+  --enable-dp-attention "${PREFILL_ARGS[@]}" \
   --kv-cache-dtype fp8 --index-cache-dtype fp4 \
   --enable-prefix-caching \
   --max-num-seqs $(( CONC * 2 )) \
@@ -157,7 +164,9 @@ python3 -u -m atom.entrypoints.openai_server \
   --kv-transfer-config "$KV_TRANSFER"
 ```
 
-TBO is off on both nodes. The router selects P/D ranks independently using
+Prefill uses TBO with `GPU_MAX_HW_QUEUES=5`; decode keeps TBO off and
+uses the runtime default hardware queue count. The router selects P/D ranks
+independently using
 cache-aware policies with `balance-abs-threshold=20` and
 `balance-rel-threshold=2.0`.
 
@@ -245,6 +254,7 @@ export ATOM_MOONCAKE_MATCHED_RAILS=auto
 export NCCL_IB_DISABLE=1
 
 export ATOM_NUMA_BIND=1
+export GPU_MAX_HW_QUEUES=5
 export ATOM_DP_MASTER_PORT=29510
 export ATOM_DP_BASE_PORT=29610
 
@@ -259,7 +269,7 @@ python3 -u -m atom.entrypoints.openai_server \
   --model "$MODEL_PATH" --served-model-name deepseek-ai/DeepSeek-V4-Pro \
   --host 0.0.0.0 --server-port 8010 \
   --tensor-parallel-size 8 \
-  --enable-dp-attention \
+  --enable-dp-attention --enable-tbo \
   --kv-cache-dtype fp8 --index-cache-dtype fp4 \
   --enable-prefix-caching \
   --max-num-seqs $(( CONC * 2 )) \
@@ -278,7 +288,7 @@ No offload tier and no `--enable-tbo`.
 ```bash
 # same exports as above, except:
 export ATOM_HOST_IP=10.0.0.2                    # this node
-# and drop the three OFFLOAD_* lines entirely
+# omit GPU_MAX_HW_QUEUES and the three OFFLOAD_* exports
 
 python3 -u -m atom.entrypoints.openai_server \
   --model "$MODEL_PATH" --served-model-name deepseek-ai/DeepSeek-V4-Pro \
