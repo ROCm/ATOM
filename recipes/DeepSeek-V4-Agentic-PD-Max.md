@@ -34,13 +34,22 @@ a reason to split two nodes for low concurrency.
 
 ## RDMA rail configuration
 
-The two-node examples use matching, mutually reachable RDMA rails on both
-nodes. Export `ATOM_MOONCAKE_MATCHED_RAILS` in the same rail order on prefill
-and decode, and leave `ATOM_MOONCAKE_IB_DEVICE` unset. This allows independent
-P/D GPU-rank selection while keeping each transfer on a reachable NIC rail.
+`ATOM_MOONCAKE_MATCHED_RAILS` is an opt-in setting for rail-isolated RDMA
+fabrics, where a NIC can reach its corresponding NIC on another node but not
+every remote NIC. The examples below enable it to support independent P/D GPU
+ranks on that topology. If the default GPU-local HCA pairs are already mutually
+reachable for every allowed P/D pairing, omit this export.
 
-Replace `<HCA_0>` through `<HCA_7>` with each node's actual HCA names,
-ordered so that matching list positions identify mutually reachable rails. See
+For matched-rail mode, set the same HCA-name allowlist on prefill and decode,
+and leave `ATOM_MOONCAKE_IB_DEVICE` unset to select each GPU's primary HCA.
+Replace `<HCA_0>` through `<HCA_7>` with the actual names, such as `ionic_0`
+through `ionic_7` on the validated eight-NIC deployment. The allowlist must
+include the primary HCA and every HCA used by decode; the number of entries is
+deployment-specific.
+
+Matching is by **HCA name**, not list position: the same name must identify
+mutually reachable rails on both nodes. Reordering lists does not map different
+local names to each other. See
 [Matched RDMA rails](../docs/mooncake_matched_rails.md)
 for topology and registration details.
 
@@ -66,6 +75,7 @@ export ATOM_MOE_GU_ITLV=1
 export ATOM_HOST_IP=<PREFILL_IP>          # <DECODE_IP> on the decode node
 export MC_GID_INDEX=1
 unset ATOM_MOONCAKE_IB_DEVICE
+# For rail-isolated fabrics; omit if all default P/D HCA pairs are reachable.
 export ATOM_MOONCAKE_MATCHED_RAILS="<HCA_0>,<HCA_1>,<HCA_2>,<HCA_3>,<HCA_4>,<HCA_5>,<HCA_6>,<HCA_7>"
 export NCCL_IB_DISABLE=1
 export ATOM_DISABLE_MMAP=true
@@ -231,6 +241,7 @@ export ATOM_HOST_IP=10.0.0.1                    # this node
 export ATOM_DISABLE_MMAP=true
 export MC_GID_INDEX=1
 unset ATOM_MOONCAKE_IB_DEVICE
+# For rail-isolated fabrics; omit if all default P/D HCA pairs are reachable.
 export ATOM_MOONCAKE_MATCHED_RAILS="<HCA_0>,<HCA_1>,<HCA_2>,<HCA_3>,<HCA_4>,<HCA_5>,<HCA_6>,<HCA_7>"
 export NCCL_IB_DISABLE=1
 
