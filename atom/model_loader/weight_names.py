@@ -22,6 +22,11 @@ WeightsMapping = Mapping[str, str | None]
 """If a key maps to a value of `None`, the corresponding weight is ignored."""
 
 
+def _drop_ignored(mapping: WeightsMapping) -> dict[str, str]:
+    """Keep only the genuine renames of `mapping`, dropping the `None` values."""
+    return {orig: new for orig, new in mapping.items() if new is not None}
+
+
 @dataclass
 class WeightsMapper:
     """Maps the name of each weight if they match the following patterns."""
@@ -85,14 +90,21 @@ class WeightsMapper:
             if (out_name := self._map_name(name)) is not None
         }
 
-    def get_unstacked_mapper(self) -> "WeightsMapper":
+    def get_rename_mapper(self) -> "WeightsMapper":
         """Return the mapper variant suitable for quantization config names.
 
-        ATOM keeps packed-module handling separate from checkpoint-name
-        rewriting, so this mapper never contains vLLM-style stacked mappings
-        and is already unstacked.
+        Consumers that *name* modules rather than load them (vLLM's
+        quantization config layer lists, LoRA name parsing) cannot act on a
+        `None` mapping — "do not load this weight" would silently shrink an
+        ignore list — so those entries are dropped.  ATOM keeps packed-module
+        handling separate from checkpoint-name rewriting, so there are no
+        vLLM-style stacked mappings to drop here.
         """
-        return self
+        return WeightsMapper(
+            orig_to_new_substr=_drop_ignored(self.orig_to_new_substr),
+            orig_to_new_prefix=_drop_ignored(self.orig_to_new_prefix),
+            orig_to_new_suffix=_drop_ignored(self.orig_to_new_suffix),
+        )
 
 
 def have_shared_expert(name: str) -> str | None:

@@ -41,12 +41,22 @@ from atom.plugin.prepare import _set_framework_backbone
 
 logger = logging.getLogger("atom")
 
+# vLLM 0.29 resolves the MTP draft of DSA-family targets (``deepseek_v32``,
+# ``glm_moe_dsa``, i.e. DeepSeek-V3.2 and GLM-5.x) to "DeepseekV32MTPModel";
+# 0.28 called the very same draft block "DeepSeekMTPModel". Both names map onto
+# ATOM's ``atom.models.deepseek_mtp:DeepSeekMTP``.
+_DEEPSEEK_MTP_ARCHES: set[str] = {
+    "DeepSeekMTPModel",
+    "DeepseekV32MTPModel",
+}
 _MTP_MASK_INPUT_ARCH: set[str] = {
     "DeepSeekMTPModel",
+    "DeepseekV32MTPModel",
     "Glm4MoeMTPModel",
 }
 _MTP_DRAFT_MODEL_ARCHES: set[str] = {
     "DeepSeekMTPModel",
+    "DeepseekV32MTPModel",
     "DeepSeekV4MTPModel",
     "DeepseekV4MTPModel",
     "Qwen3NextMTP",
@@ -148,6 +158,7 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "Glm4MoeForCausalLM": "atom.models.glm4_moe:Glm4MoeForCausalLM",
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2:GlmMoeDsaForCausalLM",
     "DeepSeekMTPModel": "atom.models.deepseek_mtp:DeepSeekMTP",
+    "DeepseekV32MTPModel": "atom.models.deepseek_mtp:DeepSeekMTP",
     "DeepSeekV4MTPModel": "atom.plugin.vllm.models.deepseek_v4_mtp:DeepseekV4MTP",
     "Glm4MoeMTPModel": "atom.models.glm4_moe_mtp:Glm4MoeMTP",
     "Qwen3NextForCausalLM": "atom.plugin.vllm.models.qwen3_next:Qwen3NextForCausalLM",
@@ -530,7 +541,14 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             and not self.is_dspark_draft_model
         ):
             self._enable_eagle3_target_interface()
-        if self.is_mtp:
+        if self.is_mtp and model_arch in _DEEPSEEK_V4_ARCHES:
+            # Only DeepSeek-V4 targets can answer this: the pre-hc_head
+            # residual is produced by the V4 forward branch alone. vLLM's
+            # runner tests for the attribute and then subscripts the result
+            # without a None check, so exposing it on any other MTP target
+            # crashes profile_run:
+            #     spec_hidden_states = pre_hc_hidden_states[: ...]
+            #     TypeError: 'NoneType' object is not subscriptable
             self.get_mtp_target_hidden_states = self._get_mtp_target_hidden_states
         if self.is_mtp or self.is_eagle3:
             # Mirror nested attributes required by vLLM speculative decoding.
@@ -764,9 +782,10 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         otherwise feed the post-logits hidden shape expected by older MTP
         models.
 
-        Exposed under its public name only on MTP targets (see `__init__`):
-        vLLM decides whether to override the drafter's input by testing for the
-        attribute alone, so any speculator carrying it would be fed this.
+        Exposed under its public name only on DeepSeek-V4 MTP targets (see
+        `__init__`): vLLM decides whether to override the drafter's input by
+        testing for the attribute alone and then subscripts what it gets back,
+        so a target that cannot produce the residual must not carry it.
         """
         # Prefer the persistent in-graph residual buffer on the native V4 model.
         # It is refreshed by a captured `copy_` every forward (including FULL
@@ -1000,7 +1019,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                     self._mtp_target_hidden_states = hidden_states
         else:
             if (
-                self.model_arch in {"Qwen3NextMTP", "DeepSeekMTPModel"}
+                self.model_arch in {"Qwen3NextMTP", *_DEEPSEEK_MTP_ARCHES}
                 and "spec_step_idx" not in model_kwargs
             ):
                 model_kwargs["spec_step_idx"] = (
@@ -1016,7 +1035,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         if not self.pp_group.is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
-        if self.model_arch == "DeepSeekMTPModel":
+        if self.model_arch in _DEEPSEEK_MTP_ARCHES:
             # vLLM's DeepSeek-MTP contract wants (sample_hidden, recycle_hidden).
             # DeepSeekMultiTokenPredictorLayer.forward already returns the
             # post-final-norm hidden, and compute_logits no longer re-norms, so

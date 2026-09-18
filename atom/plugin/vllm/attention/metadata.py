@@ -447,6 +447,42 @@ class MinimaxM3SparseMetadata:
     max_query_len: int
     prefill: MinimaxM3SparsePrefillMetadata | None = None
     decode: MinimaxM3SparseDecodeMetadata | None = None
+    # ``slot_mapping`` rebased onto the half-page numbering the fused KV writer
+    # uses now that K and V share a block; see
+    # ``MinimaxM3SparseAttentionMetadataBuilder._rebase_slots_to_half_pages``.
+    # The index cache keeps the untouched ``slot_mapping``.
+    half_page_slot_mapping: torch.Tensor | None = None
+
+
+def _uniform_decode_query_len(
+    query_start_loc_cpu: torch.Tensor | None, num_decodes: int
+) -> int | None:
+    """Query length shared by every decode request, or None if they differ.
+
+    ATOM's decode kernels recover a request from a flat query row by dividing:
+    the M3 index-topk kernels use ``row // max_query_len`` (and the causal
+    cutoff ``seq_len - max_query_len + tok + 1``), and aiter's gluon paged
+    decode reshapes ``q`` to ``[q.shape[0] // max_query_len, max_query_len,
+    ...]``. Both only hold when every decode request contributes exactly
+    ``max_query_len`` rows.
+
+    Speculative decode breaks that on both sides. On the target model a request
+    that joins without draft tokens contributes one row next to requests
+    verifying ``num_spec + 1``; on the EAGLE/MTP draft a request contributes
+    however many tokens the last step accepted. vLLM keeps all of them in the
+    decode segment because each query length is still within the reorder
+    threshold, so the builders have to check the lengths themselves.
+    """
+    if num_decodes <= 0 or query_start_loc_cpu is None:
+        return None
+    starts = query_start_loc_cpu[: num_decodes + 1]
+    if starts.numel() != num_decodes + 1:
+        return None
+    query_lens = starts[1:] - starts[:-1]
+    first = int(query_lens[0])
+    if not bool(torch.all(query_lens == first)):
+        return None
+    return first
 
 
 class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
@@ -488,7 +524,38 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
         self.prefill_qo_indptr = torch.arange(
             max_num_batched_tokens + 1, dtype=torch.int32, device=device
         )
+        # vLLM 0.29 stores K and V as two head slots of one page, so the fused
+        # KV-insert sees 2 * num_blocks half-pages
+        # (MiniMaxM3SparseAttention._page16_shuffle_cache_for_sparse_kernel) and
+        # every build has to re-index the slot mapping into that space. The
+        # destination must be persistent: uniform-batch cudagraphs bake the
+        # captured pointer into the replayed kernels.
+        self._paged_slot_mapping = torch.empty(
+            max_num_batched_tokens, dtype=torch.int64, device=device
+        )
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+
+    def _rebase_slots_to_half_pages(self, slot_mapping: torch.Tensor) -> torch.Tensor:
+        """Map token slots onto the K/V half-page space of the 0.29 cache.
+
+        Logical block ``b`` starts at half-page ``2 * b``, so a slot gains one
+        block per block it is already past. ``PAD_SLOT_ID`` (-1) stays negative
+        and is passed through untouched.
+
+        The result is published as ``half_page_slot_mapping`` rather than
+        replacing ``slot_mapping``, because this builder also serves the key-only
+        index cache, whose single head slot leaves its own numbering unchanged.
+        The block table is likewise left alone: the sparse block-table emitters
+        apply the stride themselves (``BLOCK_PAGE_STRIDE``).
+        """
+        out = self._paged_slot_mapping[: slot_mapping.shape[0]]
+        torch.div(
+            slot_mapping.clamp(min=0),
+            self.block_size,
+            rounding_mode="floor",
+            out=out,
+        )
+        return out.mul_(self.block_size).add_(slot_mapping)
 
     def build(
         self,
@@ -519,9 +586,34 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
 
         # Plain decode has max_query_len == 1, while MTP/spec decode verifies
         # num_spec+1 tokens per request. Both should use the decode path, but only
-        # when the split says there are no prefill/extend requests in the batch.
-        if num_decodes > 0 and num_extends == 0 and num_prefills == 0:
-            return self._build_uniform_decode_metadata(common_attn_metadata)
+        # when the split says there are no prefill/extend requests in the batch
+        # AND every decode request carries the same number of query tokens -- the
+        # decode kernels index a request as `row // max_query_len`, so a ragged
+        # decode segment would read the wrong request and the wrong causal
+        # cutoff. Spec decode produces such a segment whenever a request without
+        # draft tokens sits next to requests verifying num_spec+1 tokens.
+        decode_query_len = _uniform_decode_query_len(
+            common_attn_metadata.query_start_loc_cpu, num_decodes
+        )
+        if (
+            num_decodes > 0
+            and num_extends == 0
+            and num_prefills == 0
+            and decode_query_len is not None
+        ):
+            return self._build_uniform_decode_metadata(
+                common_attn_metadata, decode_query_len
+            )
+
+        if num_decodes > 0 and decode_query_len is None:
+            # Ragged decode segment: hand those requests to the prefill kernel,
+            # which derives causality from cu_seqlens_q/context_lens and so
+            # accepts variable query lengths. The prefill slice below starts at
+            # num_decodes/num_decode_tokens, so zeroing both widens it to the
+            # whole batch.
+            num_prefills += num_decodes
+            num_decodes = 0
+            num_decode_tokens = 0
 
         num_tokens = common_attn_metadata.num_actual_tokens
         num_prefills_total = num_extends + num_prefills
@@ -564,16 +656,23 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
 
         decode_metadata: MinimaxM3SparseDecodeMetadata | None = None
         if num_decodes > 0:
+            # decode_query_len is the measured length, not the reorder
+            # threshold: a mixed batch whose decode segment is plain decode has
+            # query_len == 1 even when the threshold is num_spec + 1, and
+            # feeding the threshold to the kernels would mis-map every row.
             decode_metadata = MinimaxM3SparseDecodeMetadata(
                 seq_lens=seq_lens[:num_decodes],
                 block_table=block_table[:num_decodes],
-                max_query_len=self.reorder_batch_threshold,
+                max_query_len=decode_query_len,
             )
 
         return MinimaxM3SparseMetadata(
             seq_lens=seq_lens,
             max_seq_len=common_attn_metadata.max_seq_len,
             slot_mapping=common_attn_metadata.slot_mapping,
+            half_page_slot_mapping=self._rebase_slots_to_half_pages(
+                common_attn_metadata.slot_mapping
+            ),
             num_actual_tokens=num_tokens,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
@@ -585,12 +684,21 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
             decode=decode_metadata,
         )
 
-    def _build_uniform_decode_metadata(self, common_attn_metadata):
+    def _build_uniform_decode_metadata(
+        self, common_attn_metadata, decode_query_len: int | None = None
+    ):
         assert common_attn_metadata is not None
 
         num_reqs = common_attn_metadata.num_reqs
         num_tokens = common_attn_metadata.num_actual_tokens
-        max_query_len = common_attn_metadata.max_query_len
+        # Callers that already measured the per-request query length pass it in;
+        # cudagraph capture builds a uniform batch by construction, so falling
+        # back to the batch maximum is exact there.
+        max_query_len = (
+            decode_query_len
+            if decode_query_len is not None
+            else common_attn_metadata.max_query_len
+        )
         seq_lens = common_attn_metadata.seq_lens
         block_table = common_attn_metadata.block_table_tensor
 
@@ -603,6 +711,9 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
             seq_lens=seq_lens,
             max_seq_len=common_attn_metadata.max_seq_len,
             slot_mapping=common_attn_metadata.slot_mapping,
+            half_page_slot_mapping=self._rebase_slots_to_half_pages(
+                common_attn_metadata.slot_mapping
+            ),
             num_actual_tokens=num_tokens,
             num_decodes=num_reqs,
             num_decode_tokens=num_tokens,
@@ -660,11 +771,13 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
         self.block_ratio = 1
 
         sliding_window_sizes: set[tuple[int, int] | None] = set()
+        self._mha_layers: list = []
         layers = get_layers_from_vllm_config(config, AttentionLayerBase, layer_names)
         for layer in layers.values():
             from atom.plugin.vllm.attention.layer import AttentionForVllmMHA
 
             assert isinstance(layer, AttentionForVllmMHA)
+            self._mha_layers.append(layer)
             sliding_window = layer.sliding_window
             if sliding_window is None or sliding_window == -1:
                 sliding_window_sizes.add(None)
@@ -707,7 +820,68 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
         max_num_batched_tokens = config.scheduler_config.max_num_batched_tokens
         i64_kwargs = {"dtype": torch.int64, "device": device}
         self.positions = CpuGpuBuffer(max_num_batched_tokens, **i64_kwargs)
+
+        # ATOM splits vLLM 0.29's [B, 2, N, C] page into two K/V planes that each
+        # see 2 * B half-pages (AttentionForVllmMHA._split_kv_cache), so every
+        # build re-indexes the block table and slot mapping into that space.
+        # The destinations must be persistent: full/uniform-batch cudagraphs bake
+        # the captured pointers into the replayed kernels.
+        self._kernel_page_size: int | None = None
+        self.max_num_reqs = config.scheduler_config.max_num_seqs
+        self._paged_block_table: torch.Tensor | None = None
+        self._paged_slot_mapping = torch.empty(max_num_batched_tokens, **i64_kwargs)
+
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+
+    def _kernel_page_tokens(self) -> int:
+        """Tokens per physical KV page, which is what the block table indexes.
+
+        vLLM may split a manager block into smaller kernel blocks, so this is
+        the bound cache's token dim rather than ``kv_cache_spec.block_size``.
+        Before the caches are bound (profile runs) attention never executes, so
+        the manager block size is a good enough stand-in.
+        """
+        if self._kernel_page_size is None:
+            kv_cache = self._mha_layers[0].kv_cache
+            if kv_cache.ndim != 4:
+                return self.block_size
+            self._kernel_page_size = kv_cache.shape[2]
+        return self._kernel_page_size
+
+    def _pack_kv_pages(self, common_attn_metadata):
+        """Re-index the block table and slot mapping for ATOM's K/V page planes.
+
+        Block ``b`` lives at half-page ``2 * b`` in both planes, so a page id
+        doubles and a slot gains one page per page it is already past.
+        ``PAD_SLOT_ID`` (-1) stays negative and is passed through untouched.
+        """
+        page_tokens = self._kernel_page_tokens()
+
+        src_block_table = common_attn_metadata.block_table_tensor
+        num_reqs, num_cols = src_block_table.shape
+        if (
+            self._paged_block_table is None
+            or self._paged_block_table.shape[1] != num_cols
+            or self._paged_block_table.shape[0] < num_reqs
+        ):
+            self._paged_block_table = torch.empty(
+                (max(self.max_num_reqs, num_reqs), num_cols),
+                dtype=src_block_table.dtype,
+                device=src_block_table.device,
+            )
+        block_table = self._paged_block_table[:num_reqs]
+        torch.mul(src_block_table, 2, out=block_table)
+
+        src_slot_mapping = common_attn_metadata.slot_mapping
+        slot_mapping = self._paged_slot_mapping[: src_slot_mapping.shape[0]]
+        torch.div(
+            src_slot_mapping.clamp(min=0),
+            page_tokens,
+            rounding_mode="floor",
+            out=slot_mapping,
+        )
+        slot_mapping.mul_(page_tokens).add_(src_slot_mapping)
+        return block_table, slot_mapping
 
     def build(
         self,
@@ -736,6 +910,23 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
             num_extend_tokens,
             num_prefill_tokens,
         ) = split_ret
+
+        # aiter's gluon decode kernel derives the batch as
+        # `q.shape[0] // max_query_len`, so a decode segment whose requests
+        # disagree on query length cannot go through it. EAGLE/MTP propose steps
+        # produce exactly that: a request's query length there is however many
+        # draft tokens the previous step accepted. Send such a segment to the
+        # extend path instead, which is varlen (driven by cu_seqlens_q). Decode
+        # requests sort before extends, so widening the extend segment covers
+        # them without reordering.
+        decode_query_len = _uniform_decode_query_len(
+            common_attn_metadata.query_start_loc_cpu, num_decodes
+        )
+        if num_decodes > 0 and decode_query_len is None:
+            num_extends += num_decodes
+            num_extend_tokens += num_decode_tokens
+            num_decodes = 0
+            num_decode_tokens = 0
 
         prefill_only = num_decodes == 0 and num_extends == 0 and num_prefills > 0
         decode_only = num_decodes > 0 and num_extends == 0 and num_prefills == 0
@@ -767,7 +958,7 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
                     - prefill_query_start_loc[prefill_start]
                 )
             if num_decodes > 0:
-                decode_max_query_len = query_lens_cpu[:num_decodes].max().item()
+                decode_max_query_len = decode_query_len
                 decode_max_seq_len = seq_lens[:num_decodes].max().item()
                 decode_query_start_loc = decode_query_start_loc[: num_decodes + 1]
 
@@ -855,6 +1046,12 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
             max_context_chunk = _CP_TOKENS_PER_ITER_ROCM // num_extends
             from vllm.utils.math_utils import cdiv
 
+            # Every extend row can start at token 0, leaving no preceding KV to
+            # chunk over. vLLM 0.29's cudagraph memory profiling walks straight
+            # into that: InputBatch.make_dummy hands out seq_len == query_len,
+            # and when num_tokens does not divide num_reqs the query lengths
+            # disagree, so the widening above moves the whole (dummy) decode
+            # segment here. num_chunks is then legitimately 0.
             num_chunks = cdiv(computed_kv_lens.max().item(), max_context_chunk)
 
             chunk_starts = (
@@ -875,7 +1072,11 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
             torch.cumsum(
                 chunk_seq_lens, dim=1, out=cu_seq_lens_cpu[:, 1:], dtype=torch.int32
             )
-            max_cum_tokens = cu_seq_lens_cpu[:, -1].max().item()
+            # cu_seq_lens_cpu is [0, num_extends + 1] when num_chunks == 0, and
+            # torch.max() with no dim rejects an empty input.
+            max_cum_tokens = (
+                cu_seq_lens_cpu[:, -1].max().item() if num_chunks > 0 else 0
+            )
 
             # Build token->batch mapping robustly, even with zero-length batches.
             batch_id_per_k_token_tensor = torch.zeros(
@@ -930,6 +1131,7 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
         use_cascade = False
 
         num_actual_tokens = common_attn_metadata.num_actual_tokens
+        block_table, slot_mapping = self._pack_kv_pages(common_attn_metadata)
 
         attn_metadata = AiterMhaMetadataForVllm(
             num_actual_tokens=num_actual_tokens,
@@ -938,8 +1140,8 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
             query_start_loc=common_attn_metadata.query_start_loc,
             max_seq_len=common_attn_metadata.max_seq_len,
             seq_lens=common_attn_metadata.seq_lens,
-            block_table=common_attn_metadata.block_table_tensor,
-            slot_mapping=common_attn_metadata.slot_mapping,
+            block_table=block_table,
+            slot_mapping=slot_mapping,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,
@@ -965,35 +1167,44 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
         """
         Build attention metadata for draft model without CPU-GPU sync.
 
-        During EAGLE/MTP drafting all requests are uniform decodes, so we can
-        skip split_decodes_prefills_and_extends() and avoid all .cpu() /
-        .item() calls that would otherwise break CUDA graph capture.
+        Drafting is usually a uniform decode, and then we can skip
+        split_decodes_prefills_and_extends() and avoid all .cpu() / .item()
+        calls that would otherwise break CUDA graph capture.
+
+        It is not always uniform, though: a request's query length here is
+        however many draft tokens the previous step accepted, so one request
+        can bring fewer rows than its neighbours. The gluon decode kernel
+        reshapes q to [q.shape[0] // max_query_len, max_query_len, ...] and
+        would fail on such a batch, so fall back to the full build(), which
+        routes a ragged segment to the varlen extend path.
         """
         query_start_loc = common_attn_metadata.query_start_loc_cpu
         query_lens = query_start_loc[1:] - query_start_loc[:-1]
         is_prefill = query_lens > self.reorder_batch_threshold
 
-        if torch.any(is_prefill):
+        num_reqs = common_attn_metadata.num_reqs
+        decode_query_len = _uniform_decode_query_len(query_start_loc, num_reqs)
+        if torch.any(is_prefill) or decode_query_len is None:
             return self.build(
                 common_prefix_len=0, common_attn_metadata=common_attn_metadata
             )
 
-        num_reqs = common_attn_metadata.num_reqs
         num_tokens = common_attn_metadata.num_actual_tokens
         decode_metadata = AiterMhaPhaseMetadata(
-            max_query_len=common_attn_metadata.max_query_len,
+            max_query_len=decode_query_len,
             max_seq_len=common_attn_metadata.max_seq_len,
             query_start_loc=common_attn_metadata.query_start_loc,
         )
+        block_table, slot_mapping = self._pack_kv_pages(common_attn_metadata)
         return AiterMhaMetadataForVllm(
             num_actual_tokens=num_tokens,
             num_actual_kv_tokens=0,
-            max_query_len=common_attn_metadata.max_query_len,
+            max_query_len=decode_query_len,
             query_start_loc=common_attn_metadata.query_start_loc,
             max_seq_len=common_attn_metadata.max_seq_len,
             seq_lens=common_attn_metadata.seq_lens,
-            block_table=common_attn_metadata.block_table_tensor,
-            slot_mapping=common_attn_metadata.slot_mapping,
+            block_table=block_table,
+            slot_mapping=slot_mapping,
             num_decodes=num_reqs,
             num_decode_tokens=num_tokens,
             num_prefills=0,

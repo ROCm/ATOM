@@ -606,7 +606,10 @@ def _deepseek_v32_indexer_get_attn_backend(self):
 
 
 def _deepseek_v32_indexer_bind_kv_cache(self, kv_cache):
-    self.kv_cache = kv_cache
+    # vLLM 0.29 hands every layer a logical [B, H, N, C] page view. The indexer
+    # publishes a single head slot, so drop it to get the ATOM kernels'
+    # [num_blocks, block_size, head_dim].
+    self.kv_cache = kv_cache.squeeze(1)
 
 
 def DeepseekV32IndexerCacheDecoratorForPluginMode(cls):
