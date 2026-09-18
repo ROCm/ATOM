@@ -44,6 +44,7 @@ from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_t
 from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.kv_budget import own_non_torch_bytes
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
@@ -642,6 +643,9 @@ class ModelRunner:
         self.tp_world_size = config.tp_world_size
         self.rank = rank
         self.label = f"Model Runner{rank}/{self.tp_world_size}"
+        # Our own out-of-allocator device footprint, measured the first time the
+        # KV budget is sized. See get_num_blocks.
+        self._non_torch_baseline: int | None = None
         self.hf_text_config = get_hf_text_config(hf_config)
         if self.hf_text_config.model_type in ["llama"] and self.config.torch_dtype in [
             torch.bfloat16,
@@ -874,6 +878,31 @@ class ModelRunner:
         base overhead. Base runner reserves nothing; override point for
         setups that share the GPU with another process."""
         return 0
+
+    def _own_non_torch_bytes(self, total: int, free: int) -> int:
+        """Our out-of-allocator device memory, not the whole card's.
+
+        Policy and its reasoning live in `kv_budget.own_non_torch_bytes`; this
+        holds the baseline and reports when the two readings disagree, which
+        they only do when something else is on the card. `min(..., free)` in
+        `get_num_blocks` remains the physical guard either way.
+        """
+        reserved = torch.cuda.memory_reserved()
+        charged = own_non_torch_bytes(total, free, reserved, self._non_torch_baseline)
+        if self._non_torch_baseline is None:
+            self._non_torch_baseline = charged
+            return charged
+        live = max((total - free) - reserved, 0)
+        if live != charged:
+            logger.info(
+                "%s: %.2fGB held outside our allocator, %.2fGB of it another "
+                "process's; charging the %.2fGB that is ours",
+                self.label,
+                live / (1 << 30),
+                (live - charged) / (1 << 30),
+                charged / (1 << 30),
+            )
+        return charged
 
     def _setup_device_and_distributed(self, rank: int, config: Config):
         # Calculate local device rank considering DP, PP and PCP.
@@ -1575,9 +1604,9 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         # weights + peak activation tensors (PyTorch allocator high-water).
         peak_torch = max(peak, current)
-        # RCCL/NCCL buffers etc. held outside the allocator: device-used minus
-        # torch-reserved. Ignoring it over-allocates KV and OOMs at runtime.
-        non_torch = max((total - free) - torch.cuda.memory_reserved(), 0)
+        # RCCL/NCCL buffers etc. held outside the allocator. Ignoring it
+        # over-allocates KV and OOMs at runtime.
+        non_torch = self._own_non_torch_bytes(total, free)
 
         cudagraph_overhead = self._estimate_cudagraph_overhead()
         safety_margin = int(total * 0.02)

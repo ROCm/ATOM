@@ -450,6 +450,22 @@ class MemoryManagerMixin:
             # Absent when only the piecewise store had anything in it.
             if hasattr(self, "_graphs_backup_keys"):
                 del self._graphs_backup_keys
+            # A capture runs the model for real -- a warmup forward and then the
+            # captured one -- against `build_for_cudagraph_capture`'s metadata,
+            # so it writes K and V through that slot mapping. On startup the
+            # bytes land in a pool no request has reached yet; here the pool is
+            # one step from serving, and what the capture left is read as some
+            # other sequence's context. A decode whose attention covers a
+            # polluted slot returns NaN for that row, the sampler draws token 0
+            # out of the all-NaN row, and that one logprob turns the step's
+            # whole rollout -- every aggregate, and `grad_norm` with it -- into
+            # NaN, so the update is dropped.
+            #
+            # Nothing else on this path zeroes it. `AsyncLLMEngine.sleep` does,
+            # but before releasing the pool, and the `clear_kv_cache()` that
+            # ends a weight sync runs while `kv_cache` is still None -- between
+            # the two wakes -- where it returns early.
+            self.clear_kv_cache()
             logger.info(f"{self.label}: CUDA graph recapture completed")
         except Exception:
             logger.exception(f"{self.label}: CUDA graph recapture failed")

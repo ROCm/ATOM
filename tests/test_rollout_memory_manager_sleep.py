@@ -206,6 +206,38 @@ def test_releasing_only_the_kv_pool_still_invalidates_the_graphs():
     assert not hasattr(runner, "_graphs_backup_keys")
 
 
+def test_wake_clears_what_the_recapture_wrote_into_the_pool():
+    """A capture runs the model for real, so it leaves K and V behind.
+
+    `capture_cudagraph` does a warmup forward and then the captured one, both
+    against `build_for_cudagraph_capture`'s metadata, so both write through
+    that slot mapping. On startup those bytes land in a pool no request has
+    reached yet. Here the pool is one step from serving and what the capture
+    left is read as another sequence's context: a decode whose attention
+    covers a polluted slot returns NaN for that row, the sampler draws token 0
+    out of the all-NaN row, and that single logprob turns the step's whole
+    rollout -- every aggregate, and `grad_norm` with it -- into NaN.
+
+    Nothing else on the wake path zeroes it. `AsyncLLMEngine.sleep` does, but
+    before releasing the pool; and the `clear_kv_cache()` that ends a weight
+    sync runs between the two wakes, while `kv_cache` is still None.
+    """
+    runner = _Runner(enforce_eager=False, keep_resident=False)
+
+    runner.release_memory(tags=["kv_cache"])
+    _report_weights_on_device(runner)
+
+    def _capture_writes_kv():
+        runner.captures += 1
+        runner.kv_cache.fill_(float("nan"))
+
+    runner.capture_cudagraph = _capture_writes_kv
+    runner.resume_memory(tags=["kv_cache"])
+
+    assert runner.captures == 1
+    assert not bool(runner.kv_cache.isnan().any())
+
+
 def test_resident_sleep_keeps_the_graphs_on_a_kv_only_release():
     runner = _Runner(enforce_eager=False, keep_resident=True)
     pool = runner.kv_cache
