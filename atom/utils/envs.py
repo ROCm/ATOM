@@ -385,6 +385,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Force Triton attention fallbacks where available. Set to 1 to bypass
     # optional ASM/OPUS fast paths during debugging.
     "ATOM_FORCE_ATTN_TRITON": lambda: (os.getenv("ATOM_FORCE_ATTN_TRITON", "0") == "1"),
+    # Cap on dense paged-decode KV splits. 32 is the shipping value and the
+    # only one production aiter supports; raising it needs an aiter that
+    # carries PR #4332, where the C++ PS reduce is built past 64.
+    # `or` not a getenv default: an exported-but-empty var would otherwise
+    # raise int('') at import and take the engine down before it starts.
+    "ATOM_PA_DENSE_SPLIT_MAX": lambda: int(
+        os.getenv("ATOM_PA_DENSE_SPLIT_MAX") or 32
+    ),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"

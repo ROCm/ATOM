@@ -10,7 +10,7 @@ import triton.language as tl
 from torch import nn
 
 from atom.config import get_current_atom_config
-from atom.utils import mark_spliting_op
+from atom.utils import envs, mark_spliting_op
 from atom.utils.selector import Family, get_attn_backend
 
 from .attention_mla import MLAModules, _mla_output_width
@@ -57,7 +57,10 @@ PA_ASM_MAX_QUERY_GROUP_SIZE = 16
 # reference at 64 than at 8; and 64 is where the C++ PS reduce stops being built
 # at all, with no working fallback under it (see the test that pins this).
 PA_DENSE_SPLIT_TARGET_WG = 128
-PA_DENSE_SPLIT_MAX = 32
+# Overridable so the cap can be A/B'd against the shipping value without a
+# second ATOM tree. 32 remains the default and the shipping value: on
+# production aiter neither half of the bound above has moved.
+PA_DENSE_SPLIT_MAX = envs.ATOM_PA_DENSE_SPLIT_MAX
 
 
 def dense_decode_splits(num_seqs: int, num_kv_heads: int) -> int:
