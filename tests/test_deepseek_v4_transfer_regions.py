@@ -806,7 +806,10 @@ def test_fp4_pd_copies_data_scales_and_swa_without_touching_other_blocks(
 
     calls = []
 
-    def write(target, sources, destinations, sizes, request_id, kind):
+    selected_engine = object()
+
+    def write(target, sources, destinations, sizes, request_id, kind, *, engine=None):
+        assert engine is selected_engine
         calls.append(kind)
         for s, d, size in zip(sources, destinations, sizes, strict=True):
             ctypes.memmove(d, s, size)
@@ -814,7 +817,13 @@ def test_fp4_pd_copies_data_scales_and_swa_without_touching_other_blocks(
 
     conn._rdma_write_with_retry = write
     assert conn._execute_block_slot_transfer(
-        req, "test", src_ids, dst_ids, {"slot_index": -1, "swa_block_ids": [1]}, "fp4"
+        req,
+        "test",
+        src_ids,
+        dst_ids,
+        {"slot_index": -1, "swa_block_ids": [1]},
+        "fp4",
+        engine=selected_engine,
     )
     assert calls == ["block"]
     for region, wanted in zip(dst_regions, expected, strict=True):
