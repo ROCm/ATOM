@@ -1059,7 +1059,7 @@ models:
             common_args:
               decode_max_num_seqs: 1024
           benchmark:
-            wait_server_timeout: 4500
+            wait_server_timeout: 1800
           run_eval: true
           eval_concurrency: [128, 768]
 
@@ -1083,7 +1083,34 @@ models:
             tp: 8
             extra_args: "--enable-dp-attention"
           benchmark:
-            wait_server_timeout: 4500
+            wait_server_timeout: 1800
+          run_eval: true
+          eval_concurrency: [128, 768]
+
+        - name: minimax-m3-fp8-2p1d-dpa-tp8-eagle3
+          topology: 2p1d_dpa_eagle3
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [256, 512, 768, 1024]
+          server:
+            common_args:
+              decode_max_num_seqs: 1024
+              method: eagle3
+              draft_model: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-EAGLE3"
+              num_speculative_tokens: 3
+              online_quant_config: '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*.gate.*", "*.block_sparse_moe.experts*"]}'
+          prefill:
+            workers: 2
+            tp: 8
+            extra_args: "--enable-dp-attention --enable-tbo prefill"
+          decode:
+            workers: 1
+            tp: 8
+            extra_args: "--enable-dp-attention"
+          benchmark:
+            wait_server_timeout: 1800
           run_eval: true
           eval_concurrency: [128, 768]
 
