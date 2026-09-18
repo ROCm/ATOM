@@ -405,9 +405,14 @@ def _build_glm52_dsa_metadata(
         )
         if is_draft_decode:
             try:
-                from sglang.srt.model_executor.cuda_graph_runner import (
-                    get_is_capture_mode,
-                )
+                try:
+                    from sglang.srt.model_executor.runner_utils import (
+                        get_is_capture_mode,
+                    )
+                except ImportError:
+                    from sglang.srt.model_executor.cuda_graph_runner import (
+                        get_is_capture_mode,
+                    )
 
                 in_graph_warmup = get_is_capture_mode()
             except Exception:  # noqa: BLE001 - SGLang version compatibility
