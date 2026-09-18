@@ -106,7 +106,7 @@ and this to its args:
 
 ### Cache policies
 
-Three knobs above are what make the offload tier worth having; without them HBM and CPU both fall back to LRU and lookup defaults to rank 0.
+`LMCACHE_LOCAL_CPU` / `LMCACHE_MAX_LOCAL_CPU_SIZE` / `LMCACHE_CHUNK_SIZE` turn the CPU tier on and size it. The remaining four variables are what make it worth having — two policies plus a fix that has no knob. Leave them out and HBM and CPU both fall back to plain LRU, and lookup defaults to rank 0.
 
 - **`LMCACHE_LOOKUP_SERVER_WORKER_IDS=0,1,2,3` — all-rank lookup.** One id per TP4 rank. Each rank updates its own cache recency and pins its own KV shard, and the **minimum** hit length across ranks is the common restorable prefix — so a shard another rank has already evicted is never trusted.
 - **`LMCACHE_CACHE_POLICY=ATOM_SLRU` + `ATOM_PREFIX_CACHE_POLICY=slru` — segmented LRU.** New data enters probation, reused data is promoted to protection; probationary data is evicted first, demoting older protected entries once the limit is exceeded. `ATOM_PREFIX_CACHE_PROTECTED_RATIO=0.5` caps HBM protection at that fraction of total pool blocks; CPU protection targets half the resident chunks. Protected data stays evictable — referenced/pinned data does not. Separate CPU queues keep probationary eviction from scanning the protected segment, though pinned entries may still require a scan.
@@ -114,7 +114,7 @@ Three knobs above are what make the offload tier worth having; without them HBM 
 
 Only **synchronous** lookup is supported; enabling `LMCACHE_ENABLE_ASYNC_LOADING` is rejected at startup.
 
-Lookup scope is the single biggest of the three. Measured at 48c, 1800 s, 256 GiB CPU cache per rank, no NVMe, FP8 KV, synthetic acceptance 0.5933 — **both arms had SLRU and the pin fix on, only the lookup scope changed**:
+Lookup scope is the biggest of the three by a wide margin. Measured at 48c, 1800 s, 256 GiB CPU cache per rank, no NVMe, FP8 KV, synthetic acceptance 0.5933 — **both arms had SLRU and the pin fix on, only the lookup scope changed**:
 
 | | rank 0 only | all-rank |
 |---|---:|---:|
