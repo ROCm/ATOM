@@ -5,6 +5,18 @@
 
 set -euo pipefail
 
+# GID 0 is IPv6 link-local on TW. Keep Mooncake and RCCL independently
+# configurable because GID tables and cross-node reachability vary by fabric.
+export MC_GID_INDEX="${MC_GID_INDEX:-0}"
+export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-0}"
+for gid_var in MC_GID_INDEX NCCL_IB_GID_INDEX; do
+  if [[ ! "${!gid_var}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: ${gid_var} must be a non-negative integer" >&2
+    exit 2
+  fi
+done
+echo "RDMA GID indices: Mooncake=${MC_GID_INDEX}, RCCL=${NCCL_IB_GID_INDEX}"
+
 REPO_ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
 SCRIPT_PATH="${REPO_ROOT}/.github/scripts/atomesh/pd_server_atom.sh"
 JOB_ID="${SLURM_JOB_ID:-${SPUR_JOB_ID:-local}}"
@@ -105,6 +117,8 @@ allow = (
     "RUN_EVAL",
     "EVAL_",
     "SWEBENCH_",
+    "MC_GID_INDEX",
+    "NCCL_IB_GID_INDEX",
 )
 for key, value in sorted(os.environ.items()):
     if key.startswith(allow):
@@ -233,7 +247,6 @@ EOF
     -e FLYDSL_RUNTIME_CACHE_DIR="/tmp/atomesh-cache-${JOB_ID}-${rank}/flydsl"
     -e NCCL_NET_PLUGIN=none
     -e NCCL_IB_HCA=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7
-    -e NCCL_IB_GID_INDEX=1
     -e NCCL_CROSS_NIC=0
     -e NCCL_PXN_DISABLE=0
     -e NCCL_NET_DISABLE_INTRA=1

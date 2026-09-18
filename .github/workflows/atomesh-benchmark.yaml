@@ -48,6 +48,16 @@ on:
         options:
           - '1'
           - '2'
+      mooncake_gid_index:
+        description: 'Mooncake RDMA GID index for smoke and model tests (0 selects IPv6 link-local on TW; verify cross-node reachability)'
+        required: false
+        default: '0'
+        type: string
+      rccl_gid_index:
+        description: 'RCCL RDMA GID index for model tests (0 selects IPv6 link-local on TW)'
+        required: false
+        default: '0'
+        type: string
       run_all_models:
         description: 'Run all models from models_atomesh.yaml'
         required: false
@@ -188,6 +198,8 @@ on:
         type: boolean
 
 env:
+  MC_GID_INDEX: ${{ inputs.mooncake_gid_index || '0' }}
+  NCCL_IB_GID_INDEX: ${{ inputs.rccl_gid_index || '0' }}
   ATOMESH_SINGLE_NODE: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_single_node || 'auto' }}
   ATOMESH_SLURM_ACCOUNT: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_account != 'auto' && inputs.atomesh_slurm_account || '' }}
   ATOMESH_SLURM_PARTITION: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_partition != 'auto' && inputs.atomesh_slurm_partition || (((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-crusoe-mi355' || (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi355-crusoe') && 'amd-spur' || '') }}
@@ -477,6 +489,10 @@ jobs:
             echo "::error::No ATOM image was resolved for the RDMA smoke test."
             exit 1
           fi
+          if [[ ! "${MC_GID_INDEX}" =~ ^[0-9]+$ ]]; then
+            echo "::error::MC_GID_INDEX must be a non-negative integer."
+            exit 2
+          fi
 
           nodes="${RDMA_SMOKE_NODES:-${ATOMESH_1P1D_NODES:-}}"
           nodes="${nodes// /}"
@@ -614,7 +630,7 @@ jobs:
             --group-add=video
             --cap-add=IPC_LOCK
             --ulimit memlock=-1:-1
-            -e MC_GID_INDEX=1
+            -e MC_GID_INDEX="${MC_GID_INDEX:-0}"
             -e MC_ENABLE_DEST_DEVICE_AFFINITY=1
             -e SMOKE_RANK="${rank}"
             -e SMOKE_NODE_COUNT="${RDMA_SMOKE_NODE_COUNT}"
@@ -667,6 +683,12 @@ jobs:
             exit 1
           fi
           echo "RDMA devices: ${rdma_devices[*]}"
+          echo "Mooncake RDMA GID index: ${MC_GID_INDEX}"
+          for rdma_device in "${rdma_devices[@]}"; do
+            gid_path="/sys/class/infiniband/${rdma_device}/ports/1/gids/${MC_GID_INDEX}"
+            selected_gid="$(cat "${gid_path}")"
+            echo "${rdma_device}/1 GID[${MC_GID_INDEX}]: ${selected_gid}"
+          done
           ibv_devinfo
           rocm-smi --showproductname || true
 
@@ -1362,6 +1384,7 @@ jobs:
             echo "- Image: \`${RDMA_SMOKE_IMAGE}\`"
             echo "- Requested nodes: \`${RDMA_SMOKE_NODE_COUNT}\`"
             echo "- Decode HCA mode: \`${RDMA_SMOKE_DECODE_HCA_MODE}\`"
+            echo "- Mooncake GID index: \`${MC_GID_INDEX}\`"
             echo "- Slurm job: \`${job_id:-not submitted}\`"
             echo
 
