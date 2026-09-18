@@ -2710,6 +2710,46 @@ class TestStalledOffloadSaveReclaim:
         assert not s.deferred_free_blocks
         assert seq._deferred_save_at is None
 
+    def test_a_claim_nobody_will_retire_is_escalated(self, monkeypatch, caplog):
+        """The retry is not an escape hatch on its own, so it must be visible.
+
+        Dropping the save no longer guarantees the release: `abandon_save` does
+        not clear an active load, and a send whose report is never coming keeps
+        its claim. The reclaimer then retries forever with nothing to show for
+        it -- the same wedge it exists to prevent, only silent. One ERROR after
+        `_RELEASE_WEDGE_ATTEMPTS` passes is what makes it diagnosable.
+        """
+        import logging
+        import time as _time
+
+        import atom.model_engine.scheduler as sched_mod
+
+        seq = SimpleNamespace(id=1, _deferred_save_at=_time.monotonic() - 500.0)
+        connector = SimpleNamespace(
+            save_abandon_timeout_s=lambda: 100.0,
+            abandon_save=lambda rid: None,
+            should_defer_free=lambda s: True,  # a claim that never clears
+        )
+        s, freed = self._sched(monkeypatch, [seq], connector=connector)
+
+        with caplog.at_level(logging.ERROR, logger=sched_mod.logger.name):
+            for _ in range(sched_mod._RELEASE_WEDGE_ATTEMPTS - 1):
+                s._next_save_reconcile_at = 0.0
+                s._reconcile_stalled_deferred_saves()
+            assert not caplog.records, "a merely slow send must not trip it"
+
+            s._next_save_reconcile_at = 0.0
+            s._reconcile_stalled_deferred_saves()
+            assert len(caplog.records) == 1
+            assert "[1]" in caplog.records[0].getMessage()
+
+            s._next_save_reconcile_at = 0.0
+            s._reconcile_stalled_deferred_saves()
+            assert len(caplog.records) == 1, "once per request, not once per pass"
+
+        assert not freed
+        assert s._abandoned_saves == 1, "the save is still only abandoned once"
+
     def test_it_self_throttles_so_a_1ms_poll_is_cheap(self, monkeypatch):
         import time as _time
 

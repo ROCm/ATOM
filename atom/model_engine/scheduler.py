@@ -56,6 +56,14 @@ logger = logging.getLogger("atom")
 # reconciler no-ops until this interval has passed.
 _SAVE_RECONCILE_INTERVAL_S = 5.0
 
+# Release attempts a deferred request may fail after its save was abandoned
+# before `_reconcile_stalled_deferred_saves` calls it wedged. The reclaimer
+# retries rather than force-freeing (a claimed source may be under a live RDMA
+# read), so a claim nobody will ever retire no longer has a way out -- it has
+# to be visible instead. Deliberately well past the abandon timeout: a P/D send
+# that is merely slow must not trip it.
+_RELEASE_WEDGE_ATTEMPTS = 12
+
 # Memoised result of `_offload_max_pending_saves`, a process constant likewise.
 _MAX_PENDING_OFFLOAD: int | None = None
 
@@ -535,6 +543,11 @@ class Scheduler:
         # Reclamation bookkeeping for offload saves whose completion is never
         # reported (see `_reconcile_stalled_deferred_saves`).
         self._abandoned_saves: int = 0
+        # Set by the PP head: a lost stage report leaves a partial quorum in
+        # its `PPKVAggregator`, which the scheduler owns no handle on. A direct
+        # callback rather than a buffer -- under `pp_size == 1` nobody sets it,
+        # and an unread buffer is its own slow leak.
+        self.on_save_abandoned = None
         self._next_save_reconcile_at: float = 0.0
 
         # Scheduling delay for batching efficiency
@@ -1020,7 +1033,7 @@ class Scheduler:
         the blocks were never released. Once the save has been deferred longer
         than `_save_abandon_timeout_s()` -- set above LMCache's pin
         timeout, so upstream has force-unpinned and released the source bytes --
-        the blocks are safe to return to the pool. Without this, a single
+        the save's own hold on the blocks can go. Without this, a single
         never-reported save keeps `has_pending_kv_work()` True forever and the
         engine busy-loops with every GPU idle.
 
@@ -1028,20 +1041,23 @@ class Scheduler:
         still goes through `should_defer_free`, so an unreported P/D send keeps
         its source alive and `finished_sending` frees it later -- which is why
         the release attempt repeats every interval while the abandon happens
-        once (`_save_abandoned`). Reclamation
-        does not re-invoke `request_finished`: it was already called when the
-        request finished. It does notify the connector via `abandon_save` -- freeing
-        the blocks here is not enough on its own: the connector holds the save in
-        `_save_inflight` (and, on K3, in the stall latch), so `should_defer_free`
-        would stay True and `has_pending_kv_work()` would never clear without
-        that drop.
+        once (`_save_abandoned`). The flip side is that this is no longer an
+        unconditional escape: if `abandon_save` does not clear every claim (an
+        active load does not go through it), the retry never succeeds, so
+        `_RELEASE_WEDGE_ATTEMPTS` makes that state loud rather than silent.
+        Reclamation does not re-invoke `request_finished`: it was already called
+        when the request finished. It does notify the connector via
+        `abandon_save` -- freeing the blocks here is not enough on its own: the
+        connector holds the save in `_save_inflight` (and, on K3, in the stall
+        latch), so `should_defer_free` would stay True and
+        `has_pending_kv_work()` would never clear without that drop.
 
         The complement of the K3 connector's stall escape
         (`kimi_k3.connector.save_stall_seconds()`), not a duplicate of it: that
         one releases the blocks of a save the backend never took, on a shorter
         clock, and leaves a save already handed out alone -- precisely the case
         this reclaims once the report is not coming. Between them every deferred
-        save has a way out.
+        save has a way out -- as long as dropping the save drops the last claim.
         """
         timeout = self._save_abandon_timeout_s()
         if timeout <= 0:
@@ -1078,6 +1094,7 @@ class Scheduler:
         ]
         released = 0
         abandoned = 0
+        wedged: list = []
         for seq in stalled:
             # The save is abandoned once; the release attempt is not. Whether
             # the blocks come back is a separate question -- a send that has
@@ -1090,11 +1107,31 @@ class Scheduler:
                 self._connector_abandon_save(seq)
                 seq._save_abandoned = True
                 self._abandoned_saves += 1
+                observer = getattr(self, "on_save_abandoned", None)
+                if callable(observer):
+                    observer(seq.id)
                 abandoned += 1
             self._maybe_release_deferred(seq)
             if seq.id not in self.deferred_free_blocks:
                 seq._deferred_save_at = None
                 released += 1
+            else:
+                seq._release_attempts = getattr(seq, "_release_attempts", 0) + 1
+                if seq._release_attempts == _RELEASE_WEDGE_ATTEMPTS:
+                    wedged.append(seq.id)
+        if wedged:
+            # Once: `_release_attempts` only equals the threshold on one pass.
+            logger.error(
+                "Blocks for request(s) %s survived %d release attempts (%.0fs) "
+                "after their save was abandoned -- a connector still claims the "
+                "source and no completion report is coming to retire that "
+                "claim. These blocks will not return to the pool and "
+                "has_pending_kv_work() stays True. Check the P/D backend's "
+                "send completions.",
+                wedged,
+                _RELEASE_WEDGE_ATTEMPTS,
+                _RELEASE_WEDGE_ATTEMPTS * _SAVE_RECONCILE_INTERVAL_S,
+            )
         if abandoned or released:
             logger.warning(
                 "Abandoned %d offload save(s) still deferred after %.0fs with no "

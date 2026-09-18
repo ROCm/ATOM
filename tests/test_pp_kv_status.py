@@ -228,3 +228,54 @@ def test_load_failure_does_not_block_another_request():
 def test_aggregator_rejects_bad_pp_size():
     with pytest.raises(ValueError):
         PPKVAggregator(0)
+
+
+def test_an_abandoned_save_releases_its_partial_quorum():
+    """`forget`: the aggregator's terminal for a report that is not coming.
+
+    A tally only drains on full quorum, so one lost stage report would pin
+    `has_pending()` -- and with it `has_pending_kv_work()` -- for the life of
+    the process: the head wakes every drain interval with nothing to do and
+    every shutdown burns the full drain timeout. Bounded, but permanent, and
+    it accumulates per lost report.
+
+    Keyed by what the worker reported (a `SaveOperationId` here), while the
+    scheduler abandons by `seq.id`, so `forget` has to collapse the two.
+    """
+    agg = PPKVAggregator(2)
+    op = SaveOperationId(req_id="7", generation=1)
+    assert agg.ingest(0, KVConnectorOutput(finished_saving={op})).is_empty()
+    assert agg.ingest(0, KVConnectorOutput(finished_loading={"8"})).is_empty()
+    assert agg.has_pending() is True
+
+    agg.forget(7)  # the scheduler counts in ints; the connector in strings
+
+    assert agg.has_pending() is True, "only request 7 is abandoned"
+    agg.forget("8")
+    assert agg.has_pending() is False
+
+    # The late report from the missing stage cannot resurrect the tally into a
+    # quorum of one.
+    assert agg.ingest(1, KVConnectorOutput(finished_saving={op})).is_empty()
+
+
+def test_the_pp_head_gives_the_aggregator_the_scheduler_s_verdict():
+    """The two terminals share one trigger, so they cannot drift.
+
+    The scheduler decides a save is beyond hope; it has no handle on the
+    aggregator, so the head registers the only route between them.
+    """
+    proc = _head(pp_size=2, local_outputs=[])
+    proc._pp_kv_aggregator = PPKVAggregator(2)
+    # The wiring `__init__` does; asserted through `has_pending_kv_work`, which
+    # is the predicate that keeps the head awake and stretches every shutdown.
+    proc.scheduler.on_save_abandoned = proc._forget_pp_save_quorum
+    proc.scheduler.deferred_free_blocks = {}
+    proc.scheduler.is_finished = lambda: True
+    proc.scheduler.kv_connector = None
+
+    proc._pp_kv_aggregator.ingest(0, KVConnectorOutput(finished_saving={"3"}))
+    assert proc.has_pending_kv_work() is True
+
+    proc.scheduler.on_save_abandoned(3)
+    assert proc.has_pending_kv_work() is False

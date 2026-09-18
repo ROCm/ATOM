@@ -50,6 +50,12 @@ class PPEngineCoreProc(EngineCore):
         # per-request ring now and publishes nothing, so the exception is gone.
         self._defer_prefix_hash: bool = bm.enable_prefix_caching
         self._pp_kv_aggregator: PPKVAggregator | None = None
+        # The aggregator's other terminal. Its tallies only drain on full
+        # quorum, so a stage whose report is lost for good would keep
+        # `has_pending_kv_work()` True for the life of the process. The
+        # scheduler already decides when a save is beyond hope; this is the
+        # only way that decision reaches a dict it has no handle on.
+        self.scheduler.on_save_abandoned = self._forget_pp_save_quorum
         logger.info(
             f"{self.label}: PP stage {self.pp_rank}/{self.pp_size} "
             f"(head={self.is_head}, last={self.is_last}) ready"
@@ -192,6 +198,16 @@ class PPEngineCoreProc(EngineCore):
                 )
 
     # -- KV transfer PP aggregation ------------------------------------------
+
+    def _forget_pp_save_quorum(self, req_id) -> None:
+        """Drop a request's partial stage tallies once its save is abandoned.
+
+        Fires from `Scheduler._reconcile_stalled_deferred_saves`, so the
+        aggregator gives up on exactly the requests the scheduler already has,
+        and the two cannot drift.
+        """
+        if self._pp_kv_aggregator is not None:
+            self._pp_kv_aggregator.forget(req_id)
 
     def has_pending_kv_work(self) -> bool:
         """Keep polling while an offload operation lacks stage completions.
