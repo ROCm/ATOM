@@ -40,20 +40,19 @@ every remote NIC. The examples below enable it to support independent P/D GPU
 ranks on that topology. If the default GPU-local HCA pairs are already mutually
 reachable for every allowed P/D pairing, omit this export.
 
-For matched-rail mode, set the same HCA-name allowlist on prefill and decode,
-and leave `ATOM_MOONCAKE_IB_DEVICE` unset to select each GPU's primary HCA.
-Replace `<HCA_0>` through `<HCA_7>` with the actual names, such as `ionic_0`
-through `ionic_7` on the validated eight-NIC deployment. The allowlist must
-include the primary HCA and every HCA used by decode; the number of entries is
-deployment-specific.
+For matched-rail mode, set `ATOM_MOONCAKE_MATCHED_RAILS=auto` on both
+prefill and decode, and leave `ATOM_MOONCAKE_IB_DEVICE` unset to select each
+GPU's primary HCA. Auto mode discovers ACTIVE HCAs in that primary's numbered
+name family and logs the resolved list. For example, an `ionic_2` primary
+selects active `ionic_*` devices without including an unrelated `mlx5_0`.
 
-Matching is by **HCA name**, not list position: the same name must identify
-mutually reachable rails on both nodes. Reordering lists does not map different
-local names to each other. See
-[Matched RDMA rails](../docs/mooncake_matched_rails.md)
-for topology and registration details.
+The same HCA name must identify mutually reachable rails on both nodes.
+Auto mode discovers local names and link state; it does not test cross-node
+reachability. An explicit comma-separated allowlist remains available for custom
+naming or restricting the selected rails. See
+[Matched RDMA rails](../docs/mooncake_matched_rails.md) for details.
 
-These settings control HCA selection and reachability. The GPU memory
+These settings control HCA selection. The GPU memory
 registration workaround described in [If the servers OOM at
 startup](#if-the-servers-oom-at-startup) addresses a separate driver-level issue.
 
@@ -76,7 +75,7 @@ export ATOM_HOST_IP=<PREFILL_IP>          # <DECODE_IP> on the decode node
 export MC_GID_INDEX=1
 unset ATOM_MOONCAKE_IB_DEVICE
 # For rail-isolated fabrics; omit if all default P/D HCA pairs are reachable.
-export ATOM_MOONCAKE_MATCHED_RAILS="<HCA_0>,<HCA_1>,<HCA_2>,<HCA_3>,<HCA_4>,<HCA_5>,<HCA_6>,<HCA_7>"
+export ATOM_MOONCAKE_MATCHED_RAILS=auto
 export NCCL_IB_DISABLE=1
 export ATOM_DISABLE_MMAP=true
 export ATOM_NUMA_BIND=1
@@ -242,7 +241,7 @@ export ATOM_DISABLE_MMAP=true
 export MC_GID_INDEX=1
 unset ATOM_MOONCAKE_IB_DEVICE
 # For rail-isolated fabrics; omit if all default P/D HCA pairs are reachable.
-export ATOM_MOONCAKE_MATCHED_RAILS="<HCA_0>,<HCA_1>,<HCA_2>,<HCA_3>,<HCA_4>,<HCA_5>,<HCA_6>,<HCA_7>"
+export ATOM_MOONCAKE_MATCHED_RAILS=auto
 export NCCL_IB_DISABLE=1
 
 export ATOM_NUMA_BIND=1
