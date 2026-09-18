@@ -33,6 +33,9 @@ RESULT_RE = re.compile(
     r"isl(?P<isl>\d+)-osl(?P<osl>\d+)-conc(?P<conc>\d+)-(?P<ratio>[0-9.]+)\.json$"
 )
 TOPOLOGY_RE = re.compile(r"(?P<p>\d+)p(?P<d>\d+)d", re.IGNORECASE)
+# `<P>p<D>d` names a split, `agg*` one server doing both, the same reading
+# `pd_server_atom.sh` and `pd_matrix.py` give the name.
+AGGREGATED_TOPOLOGY_RE = re.compile(r"(?:^|[\s_-])agg", re.IGNORECASE)
 TP_RE = re.compile(r"tp(?P<tp>\d+)", re.IGNORECASE)
 DCP_RE = re.compile(r"dcp(?P<dcp>\d+)", re.IGNORECASE)
 DUAL_TP_RE = re.compile(r"tp(?P<prefill_tp>\d+)-tp(?P<decode_tp>\d+)", re.IGNORECASE)
@@ -40,7 +43,7 @@ CPP_PP_RE = re.compile(r"(?:cpp|pp)(?P<pp>\d+)", re.IGNORECASE)
 PP_ARG_RE = re.compile(r"--pipeline-parallel-size(?:=|\s+)(\d+)", re.IGNORECASE)
 EVAL_CONC_RE = re.compile(r"(?:^|[_-])c(?P<conc>\d+)(?:$|[_-])", re.IGNORECASE)
 EVAL_TOPOLOGY_RE = re.compile(
-    r"(?:^|[_-])(?P<topology>\d+p\d+d(?:[_-]dpa)?)(?:$|[_-])",
+    r"(?:^|[_-])(?P<topology>\d+p\d+d(?:[_-]dpa)?|agg[a-z0-9]*)(?:$|[_-])",
     re.IGNORECASE,
 )
 
@@ -229,6 +232,21 @@ def parse_payload_date(payload: dict[str, Any]) -> tuple[str | None, int | None]
     return None, None
 
 
+def is_aggregated(payload: dict[str, Any], text: str) -> bool:
+    """Whether one server ran both phases, so its GPUs are the whole cell.
+
+    The launcher states this in `disaggregated`; results written before it did,
+    and the non-agentic ones that carry no such field, are read from the
+    topology name instead.
+    """
+    declared = payload.get("disaggregated")
+    if isinstance(declared, bool):
+        return not declared
+    if isinstance(declared, str) and declared.strip():
+        return declared.strip().lower() in {"false", "0", "no"}
+    return AGGREGATED_TOPOLOGY_RE.search(text) is not None
+
+
 def topology_resources(
     payload: dict[str, Any], fields: dict[str, Any]
 ) -> dict[str, int | None | bool]:
@@ -240,6 +258,7 @@ def topology_resources(
             fields.get("topology"),
         )
     )
+    aggregated = is_aggregated(payload, text)
     topology = TOPOLOGY_RE.search(text)
     prefill_workers = int_value(
         payload.get("prefill_workers"), payload.get("num_prefill_workers")
@@ -250,6 +269,12 @@ def topology_resources(
     if topology:
         prefill_workers = prefill_workers or int(topology.group("p"))
         decode_workers = decode_workers or int(topology.group("d"))
+    if aggregated:
+        # There are no separate prefill and decode services to count. The env
+        # file still carries the launcher's 1/1 placeholders, and counting
+        # those would bill the cell for two services' worth of GPUs.
+        prefill_workers = None
+        decode_workers = None
 
     prefill_tp = int_value(
         payload.get("prefill_tp"), payload.get("prefill_tensor_parallel_size")
@@ -301,11 +326,15 @@ def topology_resources(
     if num_decode_gpu is None and decode_workers and decode_tp:
         num_decode_gpu = decode_workers * decode_tp
     total_gpu = int_value(payload.get("total_gpu"))
+    if total_gpu is None and aggregated:
+        # Both phases share one server's GPUs, so the cell is that server.
+        total_gpu = decode_tp or prefill_tp
     if total_gpu is None and num_prefill_gpu is not None and num_decode_gpu is not None:
         total_gpu = num_prefill_gpu + num_decode_gpu
 
     lowered = text.lower()
     return {
+        "disaggregated": not aggregated,
         "prefill_workers": prefill_workers,
         "decode_workers": decode_workers,
         "prefill_tp": prefill_tp,
@@ -577,6 +606,9 @@ def perf_point(
         "decode_dcp": resources["decode_dcp"],
         "speculative_method": speculative_label(payload),
         "num_speculative_tokens": num_speculative_tokens,
+        # False marks a single server doing both phases: its row has no
+        # per-role worker or GPU counts, and total_gpu is that one server's.
+        "disaggregated": resources["disaggregated"],
         "prefill_workers": resources["prefill_workers"],
         "decode_workers": resources["decode_workers"],
         "prefill_dpa": resources["prefill_dpa"],
