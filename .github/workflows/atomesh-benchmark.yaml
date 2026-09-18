@@ -127,12 +127,13 @@ on:
           - atomesh-cicd-mi350
           - atomesh-cicd-mi355-crusoe
       atomesh_slurm_account:
-        description: 'TW Slurm account: amd-frameworks[42/44/47], amd-tw[36/43]; Crusoe v2 uses amd-aifw-dev'
+        description: 'Slurm account: amd-atom uses amd-atom-qos (salloc -A amd-atom --qos=amd-atom-qos); TW: amd-frameworks[42/44/47], amd-tw[36/43]; Crusoe v2 uses amd-aifw-dev'
         required: false
         default: auto
         type: choice
         options:
           - auto
+          - amd-atom
           - amd-frameworks
           - amd-tw
       atomesh_slurm_partition:
@@ -553,6 +554,9 @@ jobs:
           if [[ "$(hostname -s)" == "pit2-vm-amd-xl-02" ]]; then
             SLURM_PARTITION="amd-spur"
             SLURM_QOS="amd-frameworks-qos"
+          fi
+          if [[ "${SLURM_ACCOUNT}" == "amd-atom" ]]; then
+            SLURM_QOS="amd-atom-qos"
           fi
           source "${GITHUB_WORKSPACE}/.github/scripts/slurm_submit_helpers.sh"
           detect_slurm_backend
@@ -1566,6 +1570,12 @@ jobs:
               cell["runner"]["log_root"] = "/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG"
               cell["runner"]["slurm_partition"] = "amd-spur"
               cell["runner"]["slurm_qos"] = "amd-frameworks-qos"
+
+          if (
+              cell["runner"].get("slurm_account") == "amd-atom"
+              and cell["runner"].get("slurm_submit_runner") != "atomesh-cicd-mi355-crusoe"
+          ):
+              cell["runner"]["slurm_qos"] = "amd-atom-qos"
 
           with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
               output.write(f"cell_json={json.dumps(cell, separators=(',', ':'))}\n")
