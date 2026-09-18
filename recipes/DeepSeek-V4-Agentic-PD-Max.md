@@ -39,8 +39,8 @@ nodes. Export `ATOM_MOONCAKE_MATCHED_RAILS` in the same rail order on prefill
 and decode, and leave `ATOM_MOONCAKE_IB_DEVICE` unset. This allows independent
 P/D GPU-rank selection while keeping each transfer on a reachable NIC rail.
 
-The commands below use `ionic_0` through `ionic_7`. Substitute the actual HCA
-names for your cluster and verify rail-to-rail connectivity. See
+Replace `<HCA_0>` through `<HCA_7>` with each node's actual HCA names,
+ordered so that matching list positions identify mutually reachable rails. See
 [RDMA rails and HCA registration](pd_disaggregation_guide.md#rdma-rails-and-hca-registration)
 for topology and registration details.
 
@@ -51,8 +51,8 @@ startup](#if-the-servers-oom-at-startup) addresses a separate driver-level issue
 ## TP — concurrency 1 – 32
 
 ```bash
-export MODEL_PATH=/mnt/m2m_nobackup/models/DeepSeek-V4-Pro-0813
-export TOKENIZER_PATH=/mnt/m2m_nobackup/models/DeepSeek-V4-Pro
+export MODEL_PATH="<DeepSeek-V4-Pro-0813 checkpoint path or model ID>"
+export TOKENIZER_PATH="$MODEL_PATH"
 export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export PYTHONUNBUFFERED=1
 export PYTHONHASHSEED=0
@@ -66,7 +66,7 @@ export ATOM_MOE_GU_ITLV=1
 export ATOM_HOST_IP=<PREFILL_IP>          # <DECODE_IP> on the decode node
 export MC_GID_INDEX=1
 unset ATOM_MOONCAKE_IB_DEVICE
-export ATOM_MOONCAKE_MATCHED_RAILS=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7
+export ATOM_MOONCAKE_MATCHED_RAILS="<HCA_0>,<HCA_1>,<HCA_2>,<HCA_3>,<HCA_4>,<HCA_5>,<HCA_6>,<HCA_7>"
 export NCCL_IB_DISABLE=1
 export ATOM_DISABLE_MMAP=true
 export ATOM_NUMA_BIND=1
@@ -93,8 +93,9 @@ python3 -u -m atom.entrypoints.openai_server \
   --kv-transfer-config "$KV_TRANSFER"
 ```
 
-Set `MODEL_PATH` to the local 0813 weights and `TOKENIZER_PATH` to the
-matching tokenizer. TP uses memory fraction 0.70 on both nodes and TBO is off.
+Set `MODEL_PATH` to your 0813 checkpoint directory or model repository ID.
+`TOKENIZER_PATH` defaults to the same checkpoint; override it only if the
+matching tokenizer is stored separately. TP uses memory fraction 0.70 on both nodes and TBO is off.
 `$PORT` is 8010 on prefill, 8020 on decode. `$KV_TRANSFER` is the plain
 Mooncake pair:
 
@@ -110,7 +111,6 @@ Mooncake pair:
 Router for this section — note it drops the DP flags:
 
 ```bash
-export ATOM_PD_LOAD_PAIRING=independent
 atomesh launch --host 0.0.0.0 --port 8000 --pd-disaggregation \
   --prefill http://<PREFILL_IP>:8010 --decode http://<DECODE_IP>:8020 \
   --prefill-policy round_robin --decode-policy round_robin \
@@ -129,7 +129,6 @@ Both sides use the cache-aware router shown in the next section.
 ```bash
 # ...the TP exports above, plus:
 export GPU_MEM=0.75                      # 0.70 on decode
-export ATOM_DP_LOAD_SNAPSHOT=1           # prefill load reporting
 
 python3 -u -m atom.entrypoints.openai_server \
   --model $MODEL_PATH --served-model-name deepseek-ai/DeepSeek-V4-Pro \
@@ -196,7 +195,6 @@ host memory. Refuse to start unless `psutil.virtual_memory().available` clears
 Router for both DP sections (same line for either):
 
 ```bash
-export ATOM_PD_LOAD_PAIRING=independent
 atomesh launch --host 0.0.0.0 --port 8000 --pd-disaggregation \
   --prefill http://<PREFILL_IP>:8010 --decode http://<DECODE_IP>:8020 \
   --dp-aware --prefill-policy cache_aware --decode-policy cache_aware \
@@ -217,8 +215,8 @@ historical measurements below used the earlier server and router configuration.
 ### Prefill node
 
 ```bash
-export MODEL_PATH=/mnt/m2m_nobackup/models/DeepSeek-V4-Pro-0813
-export TOKENIZER_PATH=/mnt/m2m_nobackup/models/DeepSeek-V4-Pro
+export MODEL_PATH="<DeepSeek-V4-Pro-0813 checkpoint path or model ID>"
+export TOKENIZER_PATH="$MODEL_PATH"
 export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export PYTHONUNBUFFERED=1
 export PYTHONHASHSEED=0
@@ -233,14 +231,13 @@ export ATOM_HOST_IP=10.0.0.1                    # this node
 export ATOM_DISABLE_MMAP=true
 export MC_GID_INDEX=1
 unset ATOM_MOONCAKE_IB_DEVICE
-export ATOM_MOONCAKE_MATCHED_RAILS=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7
+export ATOM_MOONCAKE_MATCHED_RAILS="<HCA_0>,<HCA_1>,<HCA_2>,<HCA_3>,<HCA_4>,<HCA_5>,<HCA_6>,<HCA_7>"
 export NCCL_IB_DISABLE=1
 
 export ATOM_NUMA_BIND=1
 export GPU_MAX_HW_QUEUES=5
 export ATOM_DP_MASTER_PORT=29510
 export ATOM_DP_BASE_PORT=29610
-export ATOM_DP_LOAD_SNAPSHOT=1
 
 export ATOM_PREFIX_CACHE_POLICY=lru
 export ATOM_PREFIX_CACHE_PROTECTED_RATIO=0.5
@@ -295,7 +292,6 @@ python3 -u -m atom.entrypoints.openai_server \
 ### Router, then client
 
 ```bash
-export ATOM_PD_LOAD_PAIRING=independent
 atomesh launch --host 0.0.0.0 --port 8000 --pd-disaggregation \
   --prefill http://10.0.0.1:8010 --decode http://10.0.0.2:8020 \
   --dp-aware --prefill-policy cache_aware --decode-policy cache_aware \
