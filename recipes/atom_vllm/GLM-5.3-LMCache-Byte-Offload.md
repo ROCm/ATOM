@@ -71,7 +71,7 @@ that abort, not a second bug.)
 
 ## Verify it is actually on
 
-Same four checks as GLM-5.2, plus one that is worth running on any TP>1 arm:
+Same four checks as GLM-5.2, plus a fifth that is worth running on any TP>1 arm:
 
 ```bash
 # 1. vLLM's factory -- expect TP+1 lines (4 workers + EngineCore)
@@ -85,9 +85,12 @@ grep -o "worker_id: [0-9]*, worker_ids: \[[0-9, ]*\]" server.log | sort -u
 
 # 4. the tier is queried AND returns data
 curl -s localhost:8330/metrics | grep -E 'external_prefix_cache_(hits|queries)'
+
+# 5. every rank actually READ, not just built a client
+grep "Retrieved" server.log | grep -o "Worker_TP[0-9]*" | sort | uniq -c
 ```
 
-Check 3 is the one that catches a tier that looks healthy and is not. Before
+Checks 3 and 5 are the ones that catch a tier that looks healthy and is not. Before
 `lmcache_replica_world_size()` learned to read `parallel_config` (#2282), the
 plugin path reported `world=1` for a TP4 replica, ranks 1-3 raised inside
 `build_lmcache_metadata` and the exception was swallowed by a bare `except` in
@@ -98,6 +101,21 @@ one, with no error anywhere. Measured here, all four ranks report distinct ids:
 worker_id: 0, worker_ids: [0, 1, 2, 3]   (and 1, 2, 3)
 ```
 
+Check 5 is the same fault seen one step later, and it is the stronger of the
+two: check 3 proves each rank *built* a client, check 5 proves each rank *read*
+through it. Healthy TP4 spreads the `Retrieved` lines evenly -- measured here,
+`8 Worker_TP0 / 8 Worker_TP1 / 8 Worker_TP2 / 8 Worker_TP3` for 8 requests.
+The `world=1` failure shows up as lines from `Worker_TP0` alone.
+
+**A zero histogram is underdetermined, not a diagnosis.** No `Retrieved` lines
+at all looks identical whether the ranks never built a client or the tier is
+simply empty -- which is the normal state during early warmup, and also the
+steady state on an arm whose HBM hit rate is high enough that the connector
+only ever sees a short miss tail (measured on M3 TP4 by a parallel arm: `world`
+correctly 4, preflight green, and still zero rows). Separate the two by reading
+check 3 alongside it. Zero is never positive evidence; this probe is strong
+only when it is nonzero.
+
 **Judging liveness: `Retrieved > 0` and `external_prefix_cache_hits > 0`, and
 nothing else.** `Stored` lines appear on a tier that is never read. And on
 LMCache 0.4.5 a healthy readback logs **zero** `Double unpin` lines — that
@@ -106,10 +124,21 @@ so do not read 0 as "no retrieval".
 
 ## Measured
 
-`amd/GLM-5.3-MXFP4`, TP=4 on gfx950 GPUs 0-3, block size 64, fp8 KV,
-`--num-gpu-blocks-override 8192`, `LMCACHE_CHUNK_SIZE=64`, `PYTHONHASHSEED=0`,
+**Both GLM-5.3 checkpoints**, `amd/GLM-5.3-MXFP4` and `amd/GLM-5.3-FP8`, each
+TP=4 on gfx950 GPUs 0-3, block size 64, fp8 KV, `--num-gpu-blocks-override
+8192`, `--max-model-len 131072`, `LMCACHE_CHUNK_SIZE=64`, `PYTHONHASHSEED=0`,
 LMCache 0.4.5 from `rocm/atom-dev:vllm-0.28.0`. CPU tier 32 GiB/rank (see the
-caveat under Sizing).
+caveat under Sizing). The FP8 arm differs from the launch block above only in
+its `online_quant_config`, which is GLM-5.2-FP8's verbatim (see
+[GLM-5.md](GLM-5.md#glm-52-fp8)):
+
+```
+--additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "layer_quant_config": {"model.layers.*.mlp.experts": "per_block_fp8"}, "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}}'
+```
+
+Quantization is a weight-side choice; it does not reach the KV cache, which both
+arms declare as fp8. The two arms are reported together below because every
+figure that follows came out **identical** on them unless a row says otherwise.
 
 ### Registration
 
@@ -120,20 +149,25 @@ caveat under Sizing).
    ATOM LMCache offload:   21 x kv tail_shape=(64, 132) dtype=torch.uint8
 ```
 
-78, not 99 — the fold fired. The two tail shapes are byte-for-byte the GLM-5.2
-ones.
+78, not 99 — the fold fired. Byte-for-byte the same on MXFP4 and FP8, and
+byte-for-byte the GLM-5.2 tails.
 
 ### Correctness: two-pass restore
 
 `tools/kv_offload_twopass_check.py --n 8 --flood 24`:
 
-| | value |
-|---|---|
-| pass-2 prompt tokens | 160,200 |
-| pass-2 served from cache | **159,936 (99.84%)** |
-| marker recall, pass 1 / pass 2 | 8/8 / 8/8 |
-| `Retrieved` lines | 32 = 8 requests x 4 ranks, all full (`20160 out of 20160`) |
-| alloc failures / KV load failures / chunk-misalignment | 0 / 0 / 0 |
+| | MXFP4 | FP8 |
+|---|---|---|
+| pass-2 prompt tokens | 160,200 | 160,200 |
+| pass-2 served from cache | **159,936 (99.84%)** | **159,936 (99.84%)** |
+| marker recall, pass 1 / pass 2 | 8/8 / 8/8 | 8/8 / 8/8 |
+| `Retrieved` lines | 32, all full (`20160 out of 20160`) | 32, all full |
+| `Retrieved` per rank (check 5) | 8 / 8 / 8 / 8 | 8 / 8 / 8 / 8 |
+| alloc failures / KV load failures / chunk-misalignment | 0 / 0 / 0 | 0 / 0 / 0 |
+
+The prompt set is seeded, so the two arms were handed the *same* 160,200 tokens
+— the columns agreeing is a real comparison, not two independent runs that
+happened to land nearby.
 
 **This arm is its own control.** The GLM-5.2 recipe needed a separate
 tier-off arm to prove the flood really evicted HBM; here the same-arm
@@ -147,13 +181,14 @@ vllm:prompt_tokens_by_source_total{source="external_kv_transfer"}  159,936
 vllm:prompt_tokens_by_source_total{source="local_compute"}    642,277
 ```
 
+(Figures shown are the FP8 arm's; the MXFP4 arm's are the same to the token.)
 HBM's prefix cache hit **zero** times over the whole run, so every one of those
 159,936 restored tokens came through LMCache and nowhere else. (It is zero
 because the tool puts each prompt's random marker at the very *start*, so no two
 prompts share a prefix at all, and the 24-prompt flood is larger than the
 524,288-token pool.)
 
-Both identities close exactly on the drained server:
+Both identities close exactly on the drained server, on both arms:
 
 ```
 prefix_cache_queries - prefix_cache_hits == external_prefix_cache_queries
@@ -162,13 +197,16 @@ prefix_cache_hits + external_prefix_cache_hits == prompt_tokens_cached
         0         +      159,936           ==      159,936                 OK
 ```
 
-Do **not** read the tool's `identical_text_pass2_vs_pass1: 1/8` as a regression.
-A prefix-cache hit is not bit-reproducible against a cold run; GLM-5.2's
-tier-*off* arm scores 0/8 on the same field. Marker recall is the criterion.
+Do **not** read the tool's `identical_text_pass2_vs_pass1` (1/8 on MXFP4, 4/8 on
+FP8) as a regression, and do not read the gap between the two arms as a quality
+difference. A prefix-cache hit is not bit-reproducible against a cold run, so
+this field is sampling noise in both directions — GLM-5.2's tier-*off* arm,
+where nothing was restored at all, scores 0/8 on it. Marker recall is the
+criterion, and it is 8/8 everywhere.
 
 ### Not measured here
 
-**No throughput number for GLM-5.3.** This arm ran correctness only, on a
+**No throughput number for GLM-5.3.** Both arms ran correctness only, on a
 machine whose other socket was under a concurrent 256 GiB-tier job — exactly
 the host DRAM, CPU and PCIe the offload path spends, so any timing taken here
 would be measuring the neighbour. GLM-5.3 is the same architecture, the same KV
