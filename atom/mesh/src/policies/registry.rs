@@ -295,6 +295,19 @@ impl PolicyRegistry {
                 }
             }
         }
+        // PD mode keeps separate prefill/decode policy instances with their own
+        // trees. Skipping them leaves a removed worker as a live tenant, so the
+        // next matching prefix routes to a worker that no longer exists.
+        for policy in [self.prefill_policy.get(), self.decode_policy.get()]
+            .into_iter()
+            .flatten()
+        {
+            if policy.name() == "cache_aware" {
+                if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                    cache_aware.remove_worker_by_url(worker_url);
+                }
+            }
+        }
     }
 
     /// Initialize cache-aware policies for PD mode (prefill and decode) - lock-free

@@ -62,7 +62,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use rand::seq::IteratorRandom;
 use rand::Rng;
 use tracing::debug;
@@ -105,6 +105,9 @@ fn tree_key_for_worker(worker: &dyn Worker) -> String {
 pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
     trees: Arc<DashMap<String, Arc<Tree>>>,
+    /// Tree keys already reported as missing, so the request-path warning
+    /// fires once per key instead of once per request.
+    missing_tree_warned: Arc<DashSet<String>>,
     _eviction_task: Option<PeriodicTask>,
 }
 
@@ -144,6 +147,7 @@ impl CacheAwarePolicy {
         Self {
             config,
             trees,
+            missing_tree_warned: Arc::new(DashSet::new()),
             _eviction_task: eviction_task,
         }
     }
@@ -185,9 +189,16 @@ impl CacheAwarePolicy {
 
     /// Add a worker by URL and model (for backward compatibility)
     pub fn add_worker_by_url(&self, url: &str, model_id: &str) {
+        // This URL-only API has no WorkerType, so it seeds the regular pool.
+        // It must still use the namespaced key: a raw model_id would build a
+        // tree that select_worker never looks up, silently disabling affinity.
+        let tree_key = make_tree_key(
+            pool_tag(&WorkerType::Regular),
+            normalize_model_key(model_id),
+        );
         let tree = self
             .trees
-            .entry(model_id.to_string())
+            .entry(tree_key)
             .or_insert_with(|| Arc::new(Tree::new()));
         tree.insert("", url);
     }
@@ -412,12 +423,18 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             // placed at random, which is indistinguishable from "cache_aware is
             // enabled but useless". warn (not debug) so it is visible at the
             // default log level instead of silently degrading throughput.
-            tracing::warn!(
-                "cache_aware: no tree for key '{}', falling back to random placement \
-                 — pool was not seeded (init_pd_cache_aware_policies missed, or a \
-                 race during worker registration)",
-                model_id
-            );
+            // Warn once per key: this fires on the request path, and a missing
+            // tree affects every request, so an unthrottled warn would flood
+            // the log with one line per request.
+            if self.missing_tree_warned.insert(model_id.clone()) {
+                tracing::warn!(
+                    "cache_aware: no tree for key '{}', falling back to random \
+                     placement — pool was not seeded \
+                     (init_pd_cache_aware_policies missed, or a race during \
+                     worker registration)",
+                    model_id
+                );
+            }
             // Return a random healthy worker
             let mut rng = rand::rng();
             let random_idx = rng.random_range(0..healthy_indices.len());
@@ -460,6 +477,46 @@ impl Default for CacheAwarePolicy {
 mod tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
+
+    #[tokio::test]
+    async fn seeded_prefill_pool_routes_a_repeated_prefix_to_one_worker() {
+        // End-to-end guard for the namespaced key: init_workers and
+        // select_worker must agree on `pool::model`. If they diverge the tree
+        // lookup misses, selection silently falls back to random placement,
+        // and affinity is lost -- which key-string comparisons alone cannot
+        // catch.
+        let workers: Vec<Arc<dyn Worker>> = (0..4)
+            .map(|i| {
+                Arc::new(
+                    BasicWorkerBuilder::new(format!("http://p{i}:8000"))
+                        .worker_type(WorkerType::Prefill {
+                            bootstrap_port: None,
+                        })
+                        .model_id("m")
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect();
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        policy.init_workers(&workers);
+
+        let text = "a shared conversation prefix that should pin one worker";
+        let info = SelectWorkerInfo {
+            request_text: Some(text),
+            ..Default::default()
+        };
+        let first = policy.select_worker(&workers, &info).await.unwrap();
+        for _ in 0..8 {
+            assert_eq!(
+                policy.select_worker(&workers, &info).await,
+                Some(first),
+                "a repeated prefix must keep landing on its cached worker"
+            );
+        }
+    }
 
     #[test]
     fn prefill_and_decode_get_separate_cache_pools() {

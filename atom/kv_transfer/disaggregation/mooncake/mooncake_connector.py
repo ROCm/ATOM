@@ -1092,13 +1092,28 @@ class MooncakeConnector(KVConnectorBase):
                 "trying individual registration as fallback...",
                 ret,
             )
+            # A later chunk can fail after earlier ones registered. Leaving those
+            # behind strands Mooncake MRs for memory the caller is about to tear
+            # down, so a retry or a second connector in this process would leak
+            # registration resources. Roll back before propagating.
+            registered: list[int] = []
             for ptr, sz_bytes in zip(reg_ptrs, reg_sizes):
                 r = self.transfer_engine.register_memory(ptr, sz_bytes)
                 if r != 0:
+                    for done_ptr in reversed(registered):
+                        try:
+                            self.transfer_engine.unregister_memory(done_ptr)
+                        except Exception:
+                            logger.exception(
+                                "Rollback of Mooncake registration failed for "
+                                "ptr=%#x; continuing to unwind",
+                                done_ptr,
+                            )
                     raise RuntimeError(
                         f"Mooncake register_memory failed: "
                         f"ptr={ptr:#x} size={sz_bytes} ret={r}"
                     )
+                registered.append(ptr)
         else:
             logger.info("batch_register_memory OK (%d chunks)", len(reg_ptrs))
 
