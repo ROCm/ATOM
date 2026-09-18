@@ -106,7 +106,8 @@ jobs:
           if [ -n "$containers" ]; then
             docker kill $containers || true
           fi
-          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace \
+            rocm/pytorch:latest bash -lc "ls -la /workspace/ && chmod -R u+rwX,go+rwX /workspace 2>/dev/null || true; find /workspace -mindepth 1 -delete" || true
 
       - name: Show ROCm status (host)
         run: docker ps -a && rocm-smi --showmemuse 2>/dev/null || true
@@ -279,7 +280,7 @@ jobs:
       - name: Clean Up
         if: always()
         run: |
-          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged \
-            ${{ inputs.image }} bash -lc "rm -rf /workspace/atom/ /workspace/aiter/ /workspace/bench_serving/" || true
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace \
+            ${{ inputs.image }} bash -lc "chmod -R u+rwX,go+rwX /workspace/atom /workspace/aiter /workspace/bench_serving 2>/dev/null || true; rm -rf /workspace/atom/ /workspace/aiter/ /workspace/bench_serving/" || true
           docker stop atom-benchmark || true
           docker rm atom-benchmark || true
