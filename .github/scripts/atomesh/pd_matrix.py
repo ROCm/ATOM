@@ -160,6 +160,20 @@ def slug(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-").lower()
 
 
+AGGREGATED_TOPOLOGY_RE = re.compile(r"^agg", re.IGNORECASE)
+
+
+def is_disaggregated(topology: str) -> bool:
+    """Whether `topology` names a prefill/decode split.
+
+    The name carries this: `<P>p<D>d[_variant]` is a split, anything starting
+    with `agg` is one aggregated server. Keying off the whole `agg` prefix
+    rather than an exact spelling means no way of writing it reads as P/D by
+    accident, which would otherwise publish numbers measured in the wrong mode.
+    """
+    return not AGGREGATED_TOPOLOGY_RE.match(topology)
+
+
 def format_display_topology(
     topology: str,
     suite_cfg: dict[str, Any],
@@ -380,6 +394,9 @@ def build_cell(
         "topology": topology,
         "display_topology": display_topology,
         "pd_worker_layout": pd_worker_layout,
+        # Derived, not authored: the layout says where workers run, the topology
+        # says whether there is a prefill/decode split to place at all.
+        "disaggregated": is_disaggregated(topology),
         "nodes": nodes,
         "num_nodes": num_nodes,
         "isl": isl,

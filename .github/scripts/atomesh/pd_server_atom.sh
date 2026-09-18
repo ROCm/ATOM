@@ -28,6 +28,13 @@ case "${ATOMESH_PD_WORKER_LAYOUT}" in
     ;;
 esac
 
+# The layout above only says where workers go; whether prefill and decode split
+# at all comes from the name: `<P>p<D>d` splits, `agg*` is one server doing both.
+AGGREGATED=0
+if [[ "${TOPOLOGY,,}" == agg* ]]; then
+  AGGREGATED=1
+fi
+
 xP="${xP:-1}"
 yD="${yD:-1}"
 PREFILL_TP_SIZE="${PREFILL_TP_SIZE:-8}"
@@ -93,7 +100,7 @@ done
 unset shifted_port_name
 unset -f validate_shifted_port
 USE_EXPLICIT_DP_PORTS=0
-if [[ "${SINGLE_NODE_PD}" == "1" || "${PREFILL_SINGLE_NODE_PD}" == "1" || "${DECODE_SINGLE_NODE_PD}" == "1" ]]; then
+if [[ "${SINGLE_NODE_PD}" == "1" || "${PREFILL_SINGLE_NODE_PD}" == "1" || "${DECODE_SINGLE_NODE_PD}" == "1" || "${AGGREGATED}" == "1" ]]; then
   USE_EXPLICIT_DP_PORTS=1
 fi
 
@@ -216,7 +223,11 @@ fi
 mkdir -p "${RUNTIME_LOG_DIR}" "${RUN_DIR}"/{benchmark_results,eval_results} "${ATOM_TORCH_PROFILER_DIR}"
 
 role_tp="${PREFILL_TP_SIZE}"
-if [[ "${PREFILL_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -gt 0 ]]; then
+if [[ "${AGGREGATED}" == "1" ]]; then
+  # The aggregated server launches with decode_parallel, so its GPU count is the
+  # decode TP. Rank 0 would otherwise fall through to the prefill TP below.
+  role_tp="${DECODE_TP_SIZE}"
+elif [[ "${PREFILL_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -gt 0 ]]; then
   role_tp="${DECODE_TP_SIZE}"
 elif [[ "${NODE_RANK}" -ge "${xP}" ]]; then
   role_tp="${DECODE_TP_SIZE}"
@@ -305,7 +316,14 @@ prefill_ports=()
 decode_args=()
 decode_ips=()
 decode_ports=()
-if [[ "${SINGLE_NODE_PD}" == "1" ]]; then
+if [[ "${AGGREGATED}" == "1" ]]; then
+  # One server answers both roles, so both endpoint lists name it. `*_args` stay
+  # empty: they only ever feed the router, which this layout does not start.
+  prefill_ips+=("${IP_ARRAY[0]}")
+  prefill_ports+=("${ROUTER_PORT}")
+  decode_ips+=("${IP_ARRAY[0]}")
+  decode_ports+=("${ROUTER_PORT}")
+elif [[ "${SINGLE_NODE_PD}" == "1" ]]; then
   if [[ "${xP}" != "1" || "${yD}" != "1" ]]; then
     echo "ERROR: single_node PD worker layout currently supports only 1 prefill and 1 decode worker" >&2
     exit 1
@@ -761,6 +779,59 @@ start_decode() {
   start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${decode_cache_env[@]}" "${decode_dp_env[@]}" "${decode_cmd[@]}"
 }
 
+# The aggregated server reads the `decode` service block and `env.decode`: it is
+# the role that decodes, and folding prefill into it changes no decode-side
+# knob. Unlike the P/D roles it gets no default connector -- a lone server has
+# no peer to hand KV to -- so DECODE_KV_TRANSFER_CONFIG is honoured only when a
+# recipe sets one (e.g. standalone lmcache_offload) and omitted otherwise.
+start_aggregated() {
+  local log_name="${1:-server-rank-${NODE_RANK}}"
+  local server_port="${2:-${ROUTER_PORT}}"
+  local dp_master_port="${3:-${DECODE_DP_MASTER_PORT}}"
+  local dp_base_port="${4:-${DECODE_DP_BASE_PORT}}"
+  apply_role_env "ATOMESH_DECODE_ENV_" "${host_ip}"
+  reset_lmcache_disk
+  local max_conc
+  max_conc="$(echo "${BENCH_MAX_CONCURRENCY}" | tr 'x,' '\n' | sort -n | tail -1)"
+  local server_max_num_seqs="${MAX_NUM_SEQS}"
+  if [[ -n "${DECODE_MAX_NUM_SEQS}" ]]; then
+    server_max_num_seqs="${DECODE_MAX_NUM_SEQS}"
+  fi
+  local -a server_max_num_batched_tokens_args=()
+  if [[ -n "${DECODE_MAX_NUM_BATCHED_TOKENS}" ]]; then
+    server_max_num_batched_tokens_args=(
+      --max-num-batched-tokens "${DECODE_MAX_NUM_BATCHED_TOKENS}"
+    )
+  fi
+  if [[ "${ISL_LIST}" == "1024" && "${OSL}" == "1024" ]]; then
+    server_max_num_seqs="${max_conc}"
+  fi
+  local -a server_cache_env=()
+  build_server_cache_env "server" "${server_port}" server_cache_env
+  local -a server_dp_env=(
+    "ATOM_DP_MASTER_PORT=${dp_master_port}"
+    "ATOM_DP_BASE_PORT=${dp_base_port}"
+  )
+  local -a server_kv_transfer_args=()
+  if [[ -n "${DECODE_KV_TRANSFER_CONFIG}" ]]; then
+    server_kv_transfer_args=(--kv-transfer-config "${DECODE_KV_TRANSFER_CONFIG}")
+  fi
+  echo "[server] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${decode_cudagraph_args[*]:-none}"
+  local -a server_cmd=(
+    python3 -m atom.entrypoints.openai_server
+    "${server_common[@]}"
+    --server-port "${server_port}"
+    "${decode_parallel[@]}"
+    --max-num-seqs "${server_max_num_seqs}"
+    "${server_max_num_batched_tokens_args[@]}"
+    "${server_kv_transfer_args[@]}"
+    "${decode_cudagraph_args[@]}"
+    ${DECODE_SERVER_ARGS}
+  )
+  dump_launch_info "SERVER" "${server_cmd[@]}"
+  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${server_cache_env[@]}" "${server_dp_env[@]}" "${server_cmd[@]}"
+}
+
 start_router() {
   echo "[router] prefill=${prefill_args[*]} decode=${decode_args[*]}"
   local mesh_binary="${ATOMESH_MESH_BINARY:-/app/ATOM/atom/mesh/target/release/atomesh}"
@@ -884,7 +955,7 @@ write_aiperf_dashboard_json() {
   local aiperf_json="$1"
   local out_json="$2"
   local conc="$3"
-  python3 - "${aiperf_json}" "${out_json}" "${conc}" <<'PY'
+  AGGREGATED="${AGGREGATED}" python3 - "${aiperf_json}" "${out_json}" "${conc}" <<'PY'
 import json
 import os
 import sys
@@ -937,6 +1008,11 @@ payload = {
     "topology": os.environ.get("TOPOLOGY") or data.get("topology"),
     "display_topology": os.environ.get("DISPLAY_TOPOLOGY")
     or data.get("display_topology"),
+    # Whether a prefill/decode split produced these numbers. The launcher knows
+    # it for certain, and the dashboard needs it to size the cell: an
+    # aggregated run puts both phases on one server's GPUs, so its GPU count is
+    # that server's, not a prefill plus decode sum.
+    "disaggregated": os.environ.get("AGGREGATED") != "1",
     "precision": os.environ.get("PRECISION") or data.get("precision"),
     "random_input_len": int(
         data.get("max_context_length")
@@ -1021,19 +1097,25 @@ run_aiperf_agentic_benchmark() {
 
   local safe_model="${MODEL_NAME//\//-}"
   local -a server_metrics_args=(--server-metrics)
-  local -a report_args=(
-    --model "${MODEL_NAME} · ${DISPLAY_TOPOLOGY}"
-    --mesh "127.0.0.1:${PROMETHEUS_PORT}"
-  )
+  local -a report_args=(--model "${MODEL_NAME} · ${DISPLAY_TOPOLOGY}")
   local idx
-  for idx in "${!prefill_ips[@]}"; do
-    server_metrics_args+=("http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/metrics")
-    report_args+=(--prefill "${prefill_ips[$idx]}:${prefill_ports[$idx]}")
-  done
-  for idx in "${!decode_ips[@]}"; do
-    server_metrics_args+=("http://${decode_ips[$idx]}:${decode_ports[$idx]}/metrics")
-    report_args+=(--decode "${decode_ips[$idx]}:${decode_ports[$idx]}")
-  done
+  if [[ "${AGGREGATED}" == "1" ]]; then
+    # Both endpoint lists name the same server, so scrape it once: naming it
+    # per role would double it in every cross-role total. No --mesh either,
+    # since this layout starts no router to answer on the Prometheus port.
+    server_metrics_args+=("http://${decode_ips[0]}:${decode_ports[0]}/metrics")
+    report_args+=(--standalone "${decode_ips[0]}:${decode_ports[0]}")
+  else
+    report_args+=(--mesh "127.0.0.1:${PROMETHEUS_PORT}")
+    for idx in "${!prefill_ips[@]}"; do
+      server_metrics_args+=("http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/metrics")
+      report_args+=(--prefill "${prefill_ips[$idx]}:${prefill_ports[$idx]}")
+    done
+    for idx in "${!decode_ips[@]}"; do
+      server_metrics_args+=("http://${decode_ips[$idx]}:${decode_ports[$idx]}/metrics")
+      report_args+=(--decode "${decode_ips[$idx]}:${decode_ports[$idx]}")
+    done
+  fi
 
   local conc
   IFS=',' read -r -a concs <<< "${CONC_LIST}"
@@ -1315,7 +1397,20 @@ run_benchmark_and_eval() {
 
 write_metadata
 
-if [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
+if [[ "${AGGREGATED}" == "1" ]]; then
+  if [[ "${NODE_RANK}" -ne 0 ]]; then
+    echo "[server] rank=${NODE_RANK} idle: aggregated serves from a single node"
+    exit 0
+  fi
+  start_aggregated "server-rank-0"
+  aggregated_pid="${server_pid}"
+  trap 'cleanup_processes ${aggregated_pid:-}' EXIT
+  # No router to wait on: the server owns ROUTER_PORT, so the benchmark and eval
+  # clients reach it at the same address they use for a P/D cell.
+  wait_http "http://127.0.0.1:${ROUTER_PORT}/health" "server" "${WAIT_SERVER_TIMEOUT}" "${aggregated_pid}"
+  run_benchmark_and_eval
+  cleanup_processes "${aggregated_pid}"
+elif [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
   start_prefill "prefill-rank-0"
   prefill_pid="${server_pid}"
   decode_handshake_port=$((HANDSHAKE_PORT + PREFILL_TP_SIZE))

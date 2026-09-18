@@ -110,6 +110,10 @@ For multi-node DP, include every node's `--server-port` as a target (repeat
 `--prefill` / `--decode`); native histogram storage is local to each node.
 The coordinator's endpoint does not include remote histogram observations.
 
+An aggregated topology runs one server for both phases and no router, so it
+passes `--standalone <address>` instead of the `--prefill` / `--decode` pair and
+omits `--mesh`. Its report uses the `standalone` deployment panels.
+
 Prometheus 3.5.0 is downloaded and verified against its release checksums when
 no executable is already available. `ATOMESH_PROMETHEUS_BIN` can point to an
 installed executable. `ATOMESH_MESH_TARGET_DIR` selects the host's persistent

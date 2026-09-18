@@ -662,6 +662,46 @@ models:
               max_num_seqs: 144
           env: *kimi_k3_agentic_lmcache192_env
 
+        # Non-disaggregated counterpart to the C64 cell above: one server does
+        # prefill and decode on a single node, same workload and same server
+        # knobs, so the pair isolates what the P/D split itself is worth.
+        - <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-agg-tp8-dcp8-agentic-lmcache-1m-c64
+          topology: agg
+          display_topology: AGG-TP8-DCP8
+          # Placement only; `topology: agg` above is what says there is no
+          # prefill/decode split to place. The other single_node cells halve the
+          # node between two services, so this one keeps all 8 GPUs at TP8.
+          pd_worker_layout: single_node
+          concurrency: [64]
+          # Unused here; the aggregated server is configured by the decode block.
+          prefill: {}
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 128
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "0"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            # The aggregated server reads env.decode. These are the C64 prefill's
+            # LMCache settings, spelled out rather than merged from its anchor:
+            # that anchor also carries the mooncake half of the `multi`
+            # connector, which has no peer to stream KV to here. What is left is
+            # the same 192 GiB CPU tier behind a standalone offload connector.
+            decode:
+              LMCACHE_LOCAL_CPU: "True"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
+              LMCACHE_CHUNK_SIZE: "1024"
+              LMCACHE_NUMA_MODE: auto
+              ATOM_NUMA_BIND: "1"
+              ATOM_NUMA_NODE: "0,0,0,0,1,1,1,1"
+              ATOM_AUTO_NUMA_BIND: "0"
+              OFFLOAD_PROFILE: "1"
+              OFFLOAD_GPU_STAGING_CHUNKS: "32"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"lmcache_offload","kv_role":"offload"}
+
     accuracy:
       task: gsm8k
       fewshot: 5

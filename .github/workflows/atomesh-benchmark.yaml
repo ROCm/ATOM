@@ -1616,6 +1616,7 @@ jobs:
               "num_nodes": get("num_nodes"),
               "topology": get("topology"),
               "pd_worker_layout": get("pd_worker_layout"),
+              "disaggregated": get("disaggregated"),
               "prefill": get("service.prefill"),
               "decode": get("service.decode"),
               "router": get("service.router"),
