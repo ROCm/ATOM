@@ -87,8 +87,9 @@ from atom.kv_transfer.offload.metadata import (
     SlotSaveSpec,
 )
 from atom.model_engine.block_manager import BlockManager
-from atom.model_engine.scheduler import Scheduler
+from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import OffloadJointRecord, SequenceStatus
+from atom.sampling_params import SamplingParams
 
 if _torch_stub is not None and sys.modules.get("torch") is _torch_stub:
     # The torch-dependent atom imports above have bound their `torch` references,
@@ -163,6 +164,7 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched._active_load_operations = {}
     sched._save_inflight = {}
     sched._save_watermark_rollback = {}
+    sched._finished_save_progress_at = {}
     sched._lookup_in_step = []
     sched._handoff_loads = set()
     sched.hash_block_size = 4
@@ -3004,6 +3006,144 @@ def test_failed_page_save_rolls_the_watermark_back_and_re_emits():
     seq.num_cached_tokens = 16
     tail = sched.build_connector_meta().requests[0]
     assert tail.save_spec.skip_leading_tokens == 8
+
+
+@pytest.mark.parametrize("late_completion", [False, True])
+def test_failed_page_retries_end_without_reclaiming_a_live_copy(
+    monkeypatch, seq_factory, late_completion
+):
+    import time
+
+    now = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    offload = _scheduler()
+    monkeypatch.setattr(offload, "save_abandon_timeout_s", lambda: 30.0)
+    engine = Scheduler(MockConfig())
+    seq = seq_factory(list(range(16)), sampling_params=SamplingParams(max_tokens=1))
+    engine.add(seq)
+    batch, _ = engine.schedule()
+    engine.kv_connector = offload
+    sid = str(seq.id)
+    offload._save_tracker[sid] = [seq, 0]
+    engine.postprocess(
+        [seq],
+        ScheduledBatchOutput(
+            req_ids=[seq.id],
+            token_ids=[(7,)],
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
+        ),
+        batch=batch,
+    )
+
+    def fail(operation):
+        engine._update_from_kv_xfer_finished(
+            KVConnectorOutput(
+                finished_saving={operation},
+                connector_completions={_page_completion(operation, succeeded=False)},
+            )
+        )
+
+    for elapsed in (1, 10, 20, 29):
+        now[0] = 1000.0 + elapsed
+        operation = offload.build_connector_meta().requests[0].save_operation
+        if elapsed != 29 or not late_completion:
+            fail(operation)
+        assert seq.block_table
+
+    now[0] = 1031.0
+    assert (
+        not offload.build_connector_meta().requests
+    ), "retries must stop without progress"
+    # The most recent copy still has its full retention window.
+    assert engine._reconcile_stalled_deferred_saves() == 0
+    assert seq.block_table
+    if late_completion:
+        assert offload.should_defer_free(seq)
+        fail(operation)
+    else:
+        # A quiet idle poll eventually reclaims the undispatched retry too.
+        now[0] = 1060.0
+        assert engine._reconcile_stalled_deferred_saves() == 1
+
+    assert not seq.block_table
+    assert not offload._save_tracker
+    assert not offload._finished_save_progress_at
+    assert not offload.has_pending_work()
+    assert engine.is_finished()
+
+
+def test_successful_page_save_refreshes_finished_request_progress(monkeypatch):
+    import time
+
+    now = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    sched = _scheduler()
+    monkeypatch.setattr(sched, "save_abandon_timeout_s", lambda: 30.0)
+    seq = SimpleNamespace(
+        id=732,
+        token_ids=list(range(16)),
+        block_table=[1, 2, 3, 4],
+        num_prompt_tokens=16,
+        num_cached_tokens=8,
+    )
+    sched._save_tracker["732"] = [seq, 0]
+    first = sched.build_connector_meta().requests[0]
+    seq.num_cached_tokens = 16
+    sched.request_finished(seq)
+    now[0] = 1029.0
+    sched.process_completions(
+        KVConnectorOutput(
+            finished_saving={first.save_operation},
+            connector_completions={
+                _page_completion(first.save_operation, succeeded=True)
+            },
+        )
+    )
+
+    now[0] = 1031.0
+    suffix = sched.build_connector_meta().requests[0]
+    assert suffix.save_spec.skip_leading_tokens == 8
+    sched.process_completions(
+        KVConnectorOutput(
+            finished_saving={suffix.save_operation},
+            connector_completions={
+                _page_completion(suffix.save_operation, succeeded=True)
+            },
+        )
+    )
+    assert not sched.should_defer_free(seq)
+    sched.source_blocks_released(seq)
+    assert not sched._finished_save_progress_at
+
+
+def test_retry_expiry_keeps_inflight_sidecar_owned(monkeypatch):
+    import time
+
+    now = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    sched = _stateful_scheduler(hit=0)
+    monkeypatch.setattr(sched, "save_abandon_timeout_s", lambda: 30.0)
+    seq = _stateful_seq(
+        req_id=733, num_prompt_tokens=8192, num_cached_tokens=8192, group=2
+    )
+    sched._save_tracker["733"] = [seq, 0]
+    req = sched.build_connector_meta().requests[0]
+    sched.request_finished(seq)
+    now[0] = 1031.0
+    sched.process_completions(
+        KVConnectorOutput(
+            finished_saving={req.save_operation},
+            connector_completions={
+                _page_completion(req.save_operation, succeeded=False)
+            },
+        )
+    )
+    assert sched.should_defer_free(seq), "the sidecar still reads source blocks"
+    assert not sched.build_connector_meta().requests
+    sched.sidecar_save_failed(req.save_operation)
+    assert not sched.should_defer_free(seq)
 
 
 def test_page_watermark_records_do_not_outlive_their_request():

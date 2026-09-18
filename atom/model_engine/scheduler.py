@@ -2952,11 +2952,6 @@ class Scheduler:
                 )
             num_tokens = seq.num_tokens - num_placeholder_width - num_rejected
             leave_reason = None
-            # Client disconnected -> finish now via the normal stop path (frees
-            # KV blocks, emits a finished RequestOutput). A natural stop below
-            # may still overwrite the reason; either way the seq terminates.
-            if seq.status == SequenceStatus.ABORTED:
-                leave_reason = "aborted"
             # MTP edge case: `rejection_sampler` does NOT inspect EOS — it
             # only compares draft vs target_argmax for acceptance. So when
             # the verified token is EOS the kernel still emits 1+ accepted
@@ -3016,6 +3011,12 @@ class Scheduler:
                 if stop_at_idx is None or max_stop_at_idx < stop_at_idx:
                     stop_at_idx = max_stop_at_idx
                     leave_reason = "max_tokens"
+
+            # Natural stops still determine token truncation, but must not
+            # hide an abort: no peer will send the completion that retires a
+            # producer's source-block claim for a cancelled request.
+            if seq.status == SequenceStatus.ABORTED:
+                leave_reason = "aborted"
 
             # Drop accepted-draft tokens past the stop position (MTP only —
             # for non-spec the sampler emits exactly 1 token so this is a

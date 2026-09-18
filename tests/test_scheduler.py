@@ -2016,7 +2016,29 @@ class TestPostprocess:
         assert not seq.block_table
         assert sched.is_finished()
 
-    def test_an_aborted_producer_request_gets_its_blocks_back(self, seq_factory):
+    @pytest.mark.parametrize("pp_size", [1, 4])
+    @pytest.mark.parametrize("streaming", [False, True])
+    @pytest.mark.parametrize(
+        "tokens,max_tokens,stop_sequences,retained",
+        [
+            ([7], 100, [], [7]),
+            ([2, 7], 100, [], [2]),
+            ([7, 8], 1, [], [7]),
+            ([7, 8], 100, [[7]], [7]),
+            ([9, 8], 100, [], [9]),
+        ],
+        ids=["abort", "eos", "max_tokens", "stop_sequence", "stop_token"],
+    )
+    def test_an_aborted_producer_request_gets_its_blocks_back(
+        self,
+        seq_factory,
+        pp_size,
+        streaming,
+        tokens,
+        max_tokens,
+        stop_sequences,
+        retained,
+    ):
         """The claim is conditional on `leave_reason`, so it must be set first.
 
         A backend declines to claim an abort because an abort never sends and
@@ -2025,8 +2047,17 @@ class TestPostprocess:
         `request_finished` -- it used to assign it afterwards, so every aborted
         request on a producer node was claimed and then parked forever.
         """
-        sched = Scheduler(MockConfig())
-        seq = self._prefill(sched, seq_factory([1, 2, 3, 4]))
+        sched = Scheduler(
+            MockConfig(pipeline_parallel_size=pp_size, stop_token_ids=[9])
+        )
+        seq = self._prefill(
+            sched,
+            seq_factory(
+                [1, 2, 3, 4],
+                sampling_params=SamplingParams(max_tokens=max_tokens),
+                stop_token_sequences=stop_sequences,
+            ),
+        )
         pending_send: set[str] = set()
         seen_reasons: list = []
 
@@ -2043,16 +2074,19 @@ class TestPostprocess:
         )
         seq.status = SequenceStatus.ABORTED
 
-        # A non-EOS token: a natural stop would overwrite the reason and the
-        # test would no longer be about an abort at all. With a stream queue,
-        # because that is the branch that used to carry its own, earlier
-        # `request_finished` -- the one that ran before the reason was set.
-        sched.postprocess([seq], self._output(seq.id, [7]), mock.Mock())
+        stream = mock.Mock() if streaming else None
+        sched.postprocess([seq], self._output(seq.id, tokens), stream)
 
         assert seen_reasons == ["aborted"], "exactly once, with the reason settled"
+        assert not pending_send
         assert not seq.block_table
         assert not sched.deferred_free_blocks
         assert sched.is_finished()
+        assert seq.num_tokens == seq.num_prompt_tokens + len(retained)
+        if streaming:
+            output = stream.put_nowait.call_args.args[0][0][1]
+            assert output.finish_reason == "aborted"
+            assert output.output_tokens == retained
 
     def test_an_abort_retires_a_claim_the_backend_took_anyway(self, seq_factory):
         """The scheduler does not depend on every backend re-deriving the guard.
