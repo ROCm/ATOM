@@ -290,16 +290,70 @@ single SAVE-only pass measures nothing, so salt the prefixes to defeat the GPU
 prefix cache, size the HBM pool below the working set to force read-back, and
 take the noise floor from the OFF arm's own two-pass delta.
 
-Size both ends before spending GPU time. Per rank K3 costs **56,448 B/token** —
-`29 x 576 = 16,704` for attention plus `58.22 MiB / 1536 = 39,744` for the
-recurrent boundary state, so the recurrent leg is 2.4x the attention leg and
-dominates the tier. A tier smaller than the HBM pool has nothing to do: at the
-defaults above the pool holds ~1.89M prefix tokens while `20 GiB` of tier holds
-`20 GiB / 56,448 = 371k`, five times less, and the plugin path only ever offers
-the connector the tail that missed in HBM. Shrink the pool with
-`--num-gpu-blocks-override` and raise `LMCACHE_MAX_LOCAL_CPU_SIZE` until the
-window `[HBM pool, tier)` is non-empty, and keep both identical across the two
-arms.
+### Sizing the two ends before spending GPU time
+
+Per rank K3 costs **56,448 B/token** — `29 x 576 = 16,704` for attention plus
+`58.22 MiB / 1536 = 39,744` for the recurrent boundary state, so the recurrent
+leg is 2.4x the attention leg and dominates the tier.
+
+The tier can only do work for a turn whose reuse distance — the KV volume other
+requests write between the turn that produced a prefix and the turn that wants
+it back — lands in the half-open band `[HBM pool, tier)`. Shorter than the pool
+and HBM already had it; longer than the tier and both missed. So size the pool
+first, and count the population in the band before booting anything.
+
+**The pool is not `GPU KV cache size`.** That log line is
+`max_concurrency x max_model_len`, not a capacity. What caches a reusable prefix
+is the blocks left over once the live requests have taken theirs:
+
+```
+blocks per request = ceil(max_model_len / 1536) + 3 x (2 + num_speculative_blocks)
+                   = 43 + 12 = 55                        # at 65,536, spec_blocks=2
+reusable prefix     = (num_blocks - concurrency x 55) / 4 x 1536 tokens
+```
+
+The mamba term does not depend on `max_model_len` — in align mode `MambaSpec`
+asks for `page_size x (2 + num_speculative_blocks)` regardless
+(`vllm/v1/kv_cache_interface.py`) — so shortening the window only shrinks the
+attention term. The `/ 4` is one attention block plus one retained boundary
+block in each of the three mamba groups. Check the whole formula against the
+boot: `num_blocks / Maximum concurrency` printed `1584 / 28.80 = 55`.
+
+At the defaults that leaves `(1584 - 16 x 55) / 4 x 1536 = 270,336` tokens of
+reusable prefix against a `20 GiB / 56,448 = 380,435`-token tier: a band barely
+one part wide. Measured against the reuse distances of this very workload
+(`inferencex-agentx-mvp` on `semianalysis_cc_traces_weka_062126`, two
+independent K3 runs, offline from each run's `profile_export.jsonl`), **2-3% of turns fall in it** —
+the arm can only return a null result, and would do so no matter how the
+connector behaved.
+
+| `--num-gpu-blocks-override` | concurrency | reusable prefix | in band, 20 GiB tier |
+|---|---|---|---|
+| 1584 (default) | 28.8 | 270,336 tok | 2-3% |
+| 1300 | 23.6 | 161,280 tok | 16-22% |
+| **1100** | **20.0** | **84,480 tok** | **44-45%** |
+| 1000 | 18.2 | 46,080 tok | 71-72% |
+
+**Shrink the pool; do not grow the tier.** Making the tier merely exceed the
+*default* pool would want ~107 GiB/rank, i.e. ~853 GiB pinned across TP8 — the
+arithmetic runs into the host long before it runs into the cards. At 1100 blocks
+the default `20 GiB/rank` tier is already the larger end of the band, so the
+measurement needs no extra host memory at all.
+
+**Do not shorten `--max-model-len` to shrink the pool.** This trace's input
+sequences run past it already (median ISL ~74k tokens against a 65,536 window),
+so a shorter window truncates the workload rather than the pool.
+
+Those percentages are measured at 4 lanes and are an **upper bound** — a turn in
+the band still has to be looked up and hit. Reuse distance grows *sub*-linearly
+in lanes (8x the lanes moved it 2.3x), and across scale factors of 1.0 to 3.0
+the 1100-block row holds 44-64% while the default row never passes 20%. After
+the OFF arm runs, recompute the band from its own `profile_export.jsonl` at the
+concurrency actually used, rather than carrying these numbers forward.
+
+Set `NUM_GPU_BLOCKS_OVERRIDE`, `MAX_MODEL_LEN`, `CONC` and `LMC_CPU_GIB`
+identically on both arms: the band is defined by the first and last of them, and
+an arm whose band is empty measures its own configuration, not the connector.
 
 ## Current scope
 
