@@ -291,6 +291,12 @@ host_name="$(hostname)"
 
 apply_prefixed_env "ATOMESH_ENV_" "${host_ip}"
 
+# GPU timing is opt-in; agentic reports need it on both service roles.
+if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" ]]; then
+  export ATOMESH_PREFILL_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER="${ATOMESH_PREFILL_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER:-${ATOM_ENABLE_METRICS_DEVICE_TIMER:-1}}"
+  export ATOMESH_DECODE_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER="${ATOMESH_DECODE_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER:-${ATOM_ENABLE_METRICS_DEVICE_TIMER:-1}}"
+fi
+
 IFS=',' read -r -a IP_ARRAY <<< "${IPADDRS}"
 
 prefill_args=()
@@ -810,8 +816,10 @@ run_benchmark() {
     rm -rf "${bench_root}"
     mkdir -p "${bench_root}"
     git clone --depth 1 --filter=blob:none --sparse "${bench_repo_url}" "${bench_repo_dir}"
-    git -C "${bench_repo_dir}" sparse-checkout set utils/bench_serving
   fi
+  # The compatibility entrypoint imports infx from the repository root.
+  # Update cached checkouts too: older runs only populated utils/bench_serving.
+  git -C "${bench_repo_dir}" sparse-checkout set utils/bench_serving infx
   IFS=',' read -r -a isls <<< "${ISL_LIST}"
   IFS=',' read -r -a concs <<< "${CONC_LIST}"
   local safe_model="${MODEL_NAME//\//-}"

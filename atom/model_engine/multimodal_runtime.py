@@ -6,11 +6,57 @@ scheduler retains CPU payloads for retry, but sends them only until a successful
 prefill acknowledges the worker's lease. Decode carries no image payload.
 """
 
+import hashlib
 from dataclasses import dataclass, field
 
+import numpy as np
 import torch
 
-from .multimodal import embedding_indices
+
+def multimodal_cache_seed(data):
+    """Hash processed media once; token-only prefix identity is insufficient.
+
+    Include layout as well as values: an identical patch buffer arranged into
+    different image grids need not produce the same language embeddings.
+    """
+    digest = hashlib.blake2b(digest_size=8, person=b"ATOM-media-v1")
+    for name in ("pixel_values", "image_grid_thw", "token_types"):
+        value = data.get(name)
+        if value is None:
+            continue
+        if hasattr(value, "detach"):
+            value = value.detach().cpu().contiguous()
+            digest.update(str((value.dtype, tuple(value.shape))).encode())
+            digest.update(value.view(torch.uint8).numpy().tobytes())
+        else:
+            value = np.ascontiguousarray(value)
+            digest.update(str((value.dtype, value.shape)).encode())
+            digest.update(value.tobytes())
+    digest.update(repr(data.get("embedding_spans", ())).encode())
+    return int.from_bytes(digest.digest(), "little")
+
+
+def prefill_media_payload(data, cache_seed, *, cache_ready):
+    """Keep span metadata; send media tensors only until the worker owns a lease."""
+    omitted = {"token_types"}
+    if cache_ready:
+        omitted.update(("pixel_values", "image_grid_thw"))
+    return {
+        **{key: value for key, value in data.items() if key not in omitted},
+        "cache_seed": cache_seed,
+    }
+
+
+def embedding_indices(spans, position, length):
+    """Paired query/embedding indices for intersections with an input slice."""
+    query, source, offset = [], [], 0
+    for start, count in spans:
+        first, end = max(start, position), min(start + count, position + length)
+        if first < end:
+            query.extend(range(first - position, end - position))
+            source.extend(range(offset + first - start, offset + end - start))
+        offset += count
+    return query, source
 
 
 @dataclass

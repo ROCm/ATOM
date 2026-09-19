@@ -9,7 +9,10 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from atom.model_engine.multimodal import embedding_indices, multimodal_cache_seed
+from atom.model_engine.multimodal_runtime import (
+    embedding_indices,
+    multimodal_cache_seed,
+)
 from atom.models.deepseek_v41.image_processing import (
     DeepseekV41ImageProcessor,
     image_token_types,

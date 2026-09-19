@@ -45,11 +45,14 @@ if is_sglang():
         Qwen3_5MoeForCausalLM,
     )
     from atom.models.qwen3_next import Qwen3NextForCausalLM
+    from atom.models.qwen4_exp import Qwen4ExpForConditionalGeneration
 
     _ATOM_SUPPORTED_MODELS.update(
         {
             "DeepseekV4ForCausalLM": DeepseekV4ForCausalLM,
             "Qwen3NextForCausalLM": Qwen3NextForCausalLM,
+            "Qwen3_5ForCausalLM": Qwen3_5ForCausalLM,
+            "Qwen3_5MoeForCausalLM": Qwen3_5MoeForCausalLM,
             "Qwen3_5ForConditionalGeneration": Qwen3_5ForCausalLM,
             "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoeForCausalLM,
             # ROCm/ATOM#1078: route Kimi-K2.x through ATOM's quant-aware model
@@ -60,6 +63,8 @@ if is_sglang():
             # (BF16) attention projections.
             "KimiK25ForConditionalGeneration": KimiK25ForCausalLM,
             "KimiK3ForConditionalGeneration": KimiK3ForCausalLM,
+            # Qwen3.8-Flash-Next / Qwen4Exp — not Qwen3.5.
+            "Qwen4ExpForConditionalGeneration": Qwen4ExpForConditionalGeneration,
         }
     )
     _ATOM_SUPPORTED_DRAFT_MODELS = {

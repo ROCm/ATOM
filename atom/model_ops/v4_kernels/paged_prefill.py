@@ -62,8 +62,20 @@ except ImportError:
     pa_sparse_prefill_opus = None
     _HAS_OPUS = False
 
-from aiter.jit.utils.chip_info import get_gfx
+try:
+    from aiter.ops.mla_sparse_prefill import mla_sparse_prefill_fp8_asm
+
+    _HAS_PREFILL_ASM = True
+except ImportError:
+    mla_sparse_prefill_fp8_asm = None
+    _HAS_PREFILL_ASM = False
+
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
+
+# Local head count the aiter asm fp8 prefill kernel ships for; anything else
+# raises there rather than dispatching, so we filter on it up front.
+_PREFILL_ASM_HEADS = 128
 
 # Fixed best-known Triton meta for DeepSeek-V4 TP=8 / local H=8 prefill.
 _BLOCK_H = 16
@@ -638,7 +650,11 @@ def sparse_attn_v4_paged_prefill(
         # and extend K fed directly. No dequant of the prefix, no torch quant.
         from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_fp8_opus
 
-        return pa_sparse_prefill_fp8_opus(
+        # aiter's asm kernel is signature-compatible with the OPUS one, so the
+        # argument list below is shared. It is gfx1250-only and hard-requires
+        # H == 128 (one workgroup serves one query token x all heads), which a
+        # TP shard below 128 local heads cannot satisfy -- those keep OPUS.
+        args = (
             q_packed,
             q_rope,
             unified_kv,
@@ -651,7 +667,21 @@ def sparse_attn_v4_paged_prefill(
             kv_indptr_extend,
             attn_sink,
             softmax_scale,
-        )  # [S, H, head_dim] bf16
+        )
+        if (
+            _HAS_PREFILL_ASM
+            and not envs.ATOM_FORCE_V4_PREFILL_OPUS
+            and get_gfx_runtime() == "gfx1250"
+            and q_packed.shape[1] == _PREFILL_ASM_HEADS
+        ):
+            try:
+                return mla_sparse_prefill_fp8_asm(*args)
+            except RuntimeError:
+                # The ASM path has stricter runtime dtype/shape constraints;
+                # OPUS covers configurations it cannot serve.
+                pass
+
+        return pa_sparse_prefill_fp8_opus(*args)  # [S, H, head_dim] bf16
     # Backend selection: prefer OPUS when available; fall back to Triton on
     # import failure, env override, or runtime error (e.g. unsupported GPU).
     # OPUS covers both archs: gfx950 from source, gfx1250 from a prebuilt code

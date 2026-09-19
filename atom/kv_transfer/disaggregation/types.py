@@ -24,6 +24,20 @@ ReqId = str | int
 TransferId = int
 
 
+def kv_config_has_producer(kv_config: object) -> bool:
+    """Whether a KV config contains a P/D producer, including ``multi``.
+
+    Both the scheduler and the model runner branch on this: a producer
+    prefills and hands the request off after one token, so it neither defers
+    output nor speculates.
+    """
+    if not isinstance(kv_config, dict):
+        return False
+    if kv_config.get("kv_role") == "kv_producer":
+        return True
+    return any(kv_config_has_producer(sub) for sub in kv_config.get("connectors", []))
+
+
 @dataclass(frozen=True)
 class SaveOperationId:
     """Exact identity of one scheduler-issued PAGE/SLOT save generation.
@@ -155,6 +169,11 @@ class ConnectorCompletion:
 # token-contiguous, while producer preshuffled DSA index bytes require staging.
 MLA_KV_ROLE = "mla.kv"
 INDEX_CACHE_ROLE = "dsa.index_cache"
+# FP4 splits the DSv4 CSA indexer into two PAGE regions -- packed data and
+# e8m0 scales -- whose roles share this prefix. The names themselves are minted
+# by DeepseekV4AttentionMetadataBuilder._indexer_page_pools; a transport only
+# needs the prefix to tell the layout apart from the single-region FP8 one.
+INDEX_CACHE_FP4_PREFIX = "dsv4.csa_indexer.fp4_"
 # Producer gather callbacks need one staging slot per concurrent send worker.
 # Mooncake and attention-pool allocation share this fallback so their defaults
 # cannot drift independently.
@@ -365,6 +384,10 @@ class ReqMeta:
     remote_tp_size: int = 0
     transfer_id: int = 0
     local_slot_index: int = -1
+    # Producer's final committed state slot. This is distinct from
+    # `local_slot_index`, which is the consumer destination slot. Prefix
+    # checkpointing may move the producer request after admission.
+    remote_slot_index: int = -1
 
     # PD incremental: blocks already in decode's prefix cache; both sides
     # skip block_ids[:num_computed_blocks]. 0 = full transfer.
@@ -463,6 +486,7 @@ class ConnectorMetadata:
             ),
             transfer_id=kv_transfer_params.get("transfer_id", 0),
             local_slot_index=kv_transfer_params.get("local_slot_index", -1),
+            remote_slot_index=kv_transfer_params.get("remote_slot_index", -1),
             num_computed_blocks=kv_transfer_params.get("num_computed_blocks", 0),
             src_block_skip_factor=kv_transfer_params.get("src_block_skip_factor", 1),
         )

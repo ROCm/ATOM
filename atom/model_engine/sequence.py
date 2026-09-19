@@ -175,7 +175,7 @@ class Sequence:
         # Immutable content identity survives payload release and preemption.
         self.cache_seed = -1
         if multimodal_data is not None:
-            from atom.model_engine.multimodal import multimodal_cache_seed
+            from atom.model_engine.multimodal_runtime import multimodal_cache_seed
 
             self.cache_seed = multimodal_data.get("cache_seed")
             if self.cache_seed is None:
@@ -185,8 +185,13 @@ class Sequence:
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         # Host-known prefix, excluding deferred outputs and draft placeholders.
-        # Preemption can replay only these IDs; pending GPU results are resampled.
+        # Read by the DSpark state audit and the runtime benchmark; the width
+        # preemption strips is `num_placeholder_tokens`, which is recorded
+        # where the placeholders are appended.
         self.num_finalized_tokens = len(token_ids)
+        # Initial local prefill telemetry; kept across preemption/recomputation.
+        self.prefill_gpu_chunks = 0
+        self.prefill_gpu_complete = False
         self.num_rejected = 0
         self.num_cached_tokens = 0
         # Tokens whose blocks are registered in the prefix cache: through the

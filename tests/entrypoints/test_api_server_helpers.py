@@ -144,6 +144,104 @@ def _boom(*_args, **_kwargs):
     raise RuntimeError("boom")
 
 
+class TestMultimodalInputs:
+    @pytest.mark.parametrize(
+        "part",
+        [
+            {"type": "video_url", "video_url": {"url": "unused.mp4"}},
+            {"type": "audio_url", "audio_url": {"url": "unused.wav"}},
+            {"type": "input_audio", "input_audio": {"data": "YWJj", "format": "wav"}},
+        ],
+    )
+    def test_audio_and_video_reach_validation_instead_of_text_only_path(
+        self, monkeypatch, part
+    ):
+        from atom.entrypoints.openai.protocol import ChatMessage
+
+        messages = [ChatMessage(role="user", content=[part])]
+        monkeypatch.setattr(api_server, "_get_engine_config", lambda: None)
+        monkeypatch.setattr(api_server, "_get_multimodal_processor", lambda: None)
+        assert api_server._has_multimodal_content(messages)
+        with pytest.raises(ValueError, match="supported modalities: image"):
+            api_server._prepare_multimodal_inputs(messages, {})
+
+    @pytest.mark.parametrize(
+        "architecture",
+        [
+            "Qwen3_5ForConditionalGeneration",
+            "KimiK3ForConditionalGeneration",
+        ],
+    )
+    def test_online_and_offline_image_inputs_match(self, monkeypatch, architecture):
+        import base64
+        import io
+
+        import numpy as np
+
+        from atom.entrypoints.openai.protocol import ChatMessage
+        from atom.multimodal.processing import prepare_multimodal_inputs
+
+        image_module = pytest.importorskip("PIL.Image")
+        image = image_module.new("RGB", (2, 2), "red")
+        encoded = io.BytesIO()
+        image.save(encoded, format="PNG")
+        data_url = (
+            "data:image/png;base64," + base64.b64encode(encoded.getvalue()).decode()
+        )
+
+        class Processor:
+            def apply_chat_template(self, messages, **kwargs):
+                return "<|image_pad|> prompt"
+
+            def __call__(self, **kwargs):
+                images = kwargs.get("images")
+                if images is None:
+                    images = [item["image"] for item in kwargs["medias"]]
+                return {
+                    "input_ids": np.array([[9, 42, 8]]),
+                    "pixel_values": np.stack([np.asarray(image) for image in images]),
+                    "image_grid_thw": np.array([[1, 2, 2]]),
+                    "grid_thws": np.array([[1, 2, 2]]),
+                }
+
+        config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[architecture]),
+            multimodal_config=SimpleNamespace(
+                media_placeholder_token_id=42,
+                vision_config=SimpleNamespace(merge_kernel_size=2),
+            ),
+        )
+        processor = Processor()
+        monkeypatch.setattr(api_server, "_get_engine_config", lambda: config)
+        monkeypatch.setattr(api_server, "_get_multimodal_processor", lambda: processor)
+        online = [
+            ChatMessage(
+                role="user",
+                content=[
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                    {"type": "text", "text": "describe"},
+                ],
+            )
+        ]
+        offline = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": "describe"},
+                ],
+            }
+        ]
+        online_ids, online_data = api_server._prepare_multimodal_inputs(online, {})
+        offline_ids, offline_data = prepare_multimodal_inputs(
+            config, processor, offline, {"image": image}
+        )
+        assert online_ids == offline_ids == [9, 42, 8]
+        assert online_data.keys() == offline_data.keys()
+        for key in online_data:
+            np.testing.assert_array_equal(online_data[key], offline_data[key])
+
+
 class TestCoerceN:
     """``_coerce_n`` normalizes the request ``n`` before engine fan-out."""
 
@@ -572,7 +670,7 @@ class TestLifespanOwnsTheBackgroundTasks:
     does -- the tasks above are only reachable through here."""
 
     @staticmethod
-    def _run(monkeypatch):
+    def _run(monkeypatch, interval="3600"):
         started = []
         for name in ("tune_gc", "maybe_attach_gc_debug_callback", "freeze_gc_heap"):
             monkeypatch.setattr(api_server, name, lambda *a, **k: 0)
@@ -580,7 +678,7 @@ class TestLifespanOwnsTheBackgroundTasks:
         monkeypatch.setattr(api_server, "engine", None)
         # Long enough that neither step runs: this is about the tasks existing
         # and being cancelled, not about what they do.
-        monkeypatch.setattr(api_server, "_METRICS_REFRESH_INTERVAL_SECONDS", 3600)
+        monkeypatch.setenv("ATOM_METRICS_UPDATE_INTERVAL_S", interval)
         monkeypatch.setattr(api_server, "_GC_WATCH_INTERVAL_SECONDS", 3600)
 
         async def drive():
@@ -609,6 +707,26 @@ class TestLifespanOwnsTheBackgroundTasks:
 
         assert all(t.cancelled() for t in tasks)
         assert api_server._background_tasks == []
+
+    @pytest.mark.parametrize(
+        "configured,expected", [("0.25", 0.25), ("0", 1.0), ("bad", 1.0)]
+    )
+    def test_metrics_refresh_uses_shared_interval(
+        self, monkeypatch, configured, expected
+    ):
+        intervals = {}
+        periodic = api_server._periodic
+
+        def capture(interval, step):
+            intervals[step.__name__] = interval
+            return periodic(interval, step)
+
+        monkeypatch.setattr(api_server, "_periodic", capture)
+        self._run(monkeypatch, interval=configured)
+        assert intervals == {
+            "_refresh_metrics_once": expected,
+            "_reclaim_watch_once": 3600,
+        }
 
 
 class TestTheCensusEndpointKeepsTheLoopFree:

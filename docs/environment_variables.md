@@ -69,6 +69,7 @@ no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only whe
 |----------|------|---------|-------------|
 | **ATOM_USE_TRITON_GEMM** | bool | 0 (false) | If set to `1`, use AITER Triton FP4 weight preshuffled GEMM. Otherwise use AITER ASM FP4 weight preshuffled GEMM. |
 | **ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM** | bool | 0 (false) | If set to `1`, use AITER Triton FP4 GEMM with non-shuffled weights. Takes precedence over the FP4 preshuffled GEMM path selected by `ATOM_USE_TRITON_GEMM`. |
+| **ATOM_MHC_USE_BF16** | bool | 1 (true) | Use AITER BF16 hi/lo mHC computation for attention, FFN and head. After loading, replace FP32 fn storage with `mhc_shuffle_fn` output; no FP32 copy is retained. Set to `0` for FP32 mHC. Takes effect at model load; restart to change modes. On gfx1250, AITER enables shuffled residuals only while its runtime `mhc_fused_post_pre` policy remains fused (`M < 1024`); larger M uses ordinary residual layout and the standalone post/pre fallback. |
 | **ATOM_USE_TRITON_MXFP4_BMM** | bool | 0 (false) | If set to `1`, use FP4 BMM in MLA attention module. |
 | **ATOM_USE_FLYDSL_GATHER_KV_B_PROJ** | bool | 1 (true) | Use the FlyDSL fused gather + `kv_b_proj` GEMM for MLA's cached-prefix path. Covers page_size-1 fp8 (e4m3) KV with an fp8 weight on gfx950 — i.e. Kimi-K3 / DeepSeek MLA under `--kv-cache-dtype fp8`. Any other shape is rejected before launch and falls back to the Triton gather, once per process, with a warning. Set `0` to force Triton. |
 
@@ -96,6 +97,12 @@ combine knob as a quality/throughput tradeoff.
 | **ATOM_MORI_COMBINE_QUANT** | str | `none` | Combine-side codec passed into the MoRI config. `none` returns bf16; `fp8_blockwise` selects `EpCombineIntraNodeKernel_*_fp8bwq_*`; MoRI also accepts `fp8_direct_cast`. |
 
 ## Fusion passes
+
+### RMSNorm
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_USE_MODEL_SENSITIVE_RMSNORM** | bool | 0 (false) | If set to `1`, use AITER's model-sensitive RMSNorm rounding mode. This can change numerical results and prefill performance, so it is opt-in. |
 
 ### TP AllReduce fusion
 
@@ -205,10 +212,43 @@ discoverable from the central env reference despite bypassing the registry.
 | **LMCACHE_EC_PIN_TIMEOUT_SEC** | float | LMCache's own (300) | LMCache's source-pin timeout. ATOM reads it only to derive the engine's save-abandon window (`pin + 30s`), so the two stay ordered — a lost store report is reclaimed only after LMCache would already have force-unpinned its source. Non-positive disables ATOM's reclamation. ATOM sets no default of its own; when unset it assumes LMCache's. |
 | **OFFLOAD_MAX_PENDING_SAVES** | int | **2**, flat, for the engine-side/state-tier reader (`scheduler.py`); `max(2, 2 × OFFLOAD_COPY_WORKERS)` for the KV-leg reader (`_offload_common.py`) | Bound on total in-flight offload transfers (running + queued) held before a SLOT snapshot or executor submission. A KV save and a state store both pin bytes out of the same pool while they run, so the KV leg and the K3 state tier share this one number rather than each carrying its own. Two readers compute it, though: the KV leg's canonical `_offload_common.max_pending_saves` derives the shown default from `OFFLOAD_COPY_WORKERS` and **raises** on an unparseable value, while the scheduler's state-tier reader (`_offload_max_pending_saves`) has a simpler fallback — a flat default of **2** (no `OFFLOAD_COPY_WORKERS` scaling) that **warns and uses 2** on an unparseable value rather than raising. Set the env to an explicit integer to pin both. |
 
+## KV cache events
+
+The scheduler can publish prefix-cache changes (`BlockStored`, `BlockRemoved`,
+`AllBlocksCleared`, and `BlockStored(medium=REMOTE)` for KV received from a
+PD producer) over ZMQ so external routers and cache managers can mirror what
+each engine holds. Every batch carries a monotonic 8-byte sequence number;
+a consumer that sees a gap can ask for the missed batches over the optional
+replay socket. Events are advisory and never stall inference: the in-process
+queue drops the oldest batch when full. These variables are the only way to
+configure the feature today: they build `KVEventsConfig` (see `atom/config.py`)
+and there is no CLI flag.
+
+Endpoint rules: each publisher binds its PUB and replay endpoints offset by its
+data-parallel rank (see `ATOM_KV_EVENTS_ENDPOINT`), so with `tcp://` the two
+configured ports must be at least `data_parallel_size` apart or rank N's PUB
+lands on rank N-1's replay port. Under pipeline parallelism only the head stage
+publishes; downstream stages bind nothing. Prefill/decode disaggregation runs
+separate engine processes, and only decode publishes; if other engines share
+the host, give each its own endpoints.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_KV_EVENTS_ENABLE** | bool | 0 (false) | Set to `1` to publish KV cache events. |
+| **ATOM_KV_EVENTS_PUBLISHER** | str | `zmq` | `zmq` or `null` (accepts events and discards them). |
+| **ATOM_KV_EVENTS_ENDPOINT** | str | `tcp://127.0.0.1:5557` | ZMQ PUB bind address. Under data parallelism every rank binds its own socket: `tcp://` endpoints get the DP rank added to the port, `ipc://`/`inproc://` endpoints get a `_dp<rank>` suffix. Rank 0 uses the configured value unchanged. |
+| **ATOM_KV_EVENTS_TOPIC** | str | `""` | Subscription topic prefix sent as the first frame of every message. |
+| **ATOM_KV_EVENTS_HWM** | int | 0 | ZMQ high-water mark on the PUB socket (0 = unlimited). |
+| **ATOM_KV_EVENTS_BUFFER_STEPS** | int | 10000 | Depth of the in-process queue between the scheduler and the sender thread. When full, the oldest batch is dropped and counted in the publisher's `dropped` stat; the dropped batch still consumes a sequence number, so subscribers see the loss as a gap. |
+| **ATOM_KV_EVENTS_REPLAY_ENDPOINT** | str | `""` | ZMQ ROUTER bind address for replay requests. Empty disables replay (PUB-only). A consumer sends an 8-byte big-endian start sequence and receives every retained batch with `seq >= start`, followed by a `REPLAY_DONE` terminal frame carrying the retained `[oldest, latest]` window. Offset per DP rank the same way as the PUB endpoint. Replay is serviced on the sender thread with non-blocking sends: a client that stops reading has its replay abandoned (counted in `replay_aborted`) rather than stalling live publication. |
+| **ATOM_KV_EVENTS_REPLAY_BUFFER_STEPS** | int | 10000 | Number of most recently *sent* batches retained for replay. Independent of `ATOM_KV_EVENTS_BUFFER_STEPS`; each entry holds an encoded payload including token ids, so size it against the event rate and memory budget. Must be >= 1 when replay is enabled. |
+
 ## Profiling & debugging
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
+| **ATOM_METRICS_UPDATE_INTERVAL_S** | float | 1.0 | Shared interval in seconds for ordinary/DP/PP engine metrics pushes and API snapshot refresh. Must be finite and positive; read when each loop starts, so set it before starting every service process. Prometheus scraping is configured independently. Does not cache rendered `/metrics` responses or change when histogram observations are recorded. |
+| **ATOM_ENABLE_METRICS_DEVICE_TIMER** | bool | 0 (false) | Set to `1` before starting the service to collect GPU forward duration and cumulative request prefill GPU time. Uses CUDA/HIP events, a reusable pool capped at 256 pending pairs, and FIFO polling that stops at the first incomplete event. Adds event recording and query overhead; disabled services emit no GPU timing samples. Agentic dashboard CI explicitly enables it. |
 | **ATOM_TORCH_PROFILER_DIR** | str | — | When set, enables PyTorch profiler and writes traces to this directory. Create subdirectories per rank (e.g., `rank_0`, `dp0_tp0`). |
 | **ATOM_PROFILER_MORE** | bool | 0 (false) | When `ATOM_TORCH_PROFILER_DIR` is set and this is `1`, enables detailed profiling: `record_shapes`, `with_stack`, and `profile_memory`. Applies to both the run-phase profiler and the CUDA-graph capture profiler. |
 | **ATOM_ENABLE_DETAILED_ANNOTATION** | bool | 0 (false) | When profiling is active, appends detailed attention aggregates to the `prefill[]`/`decode[]` trace labels: `sqsq` (Σ N_Q²), `sqsk` (Σ N_Q·N_KV), and `sk` (Σ N_KV), where N_Q is the scheduled query tokens and N_KV the KV length per request. Used to estimate attention FLOPs for downstream roofline analysis. |
@@ -332,3 +372,12 @@ dp_size = envs.ATOM_DP_SIZE
 ```
 
 See `atom/utils/envs.py` for the full list of lazy-evaluated environment variables.
+
+## Mooncake PD matched rails
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_MOONCAKE_MATCHED_RAILS** | str | "" | Use `auto` to discover ACTIVE local HCAs in the primary HCA's numbered name family, or set a comma-separated allowlist. Enables a lazy single-HCA engine pool on P, selected by D's advertised HCA name. Requires RDMA, a single primary HCA, and corresponding same-name rails across hosts. Unset preserves existing behavior. |
+
+See [Mooncake matched rails](mooncake_matched_rails.md) for independent P/D
+rank configuration, deployment requirements, and registration lifetime.

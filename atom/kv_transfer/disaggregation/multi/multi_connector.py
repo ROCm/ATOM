@@ -46,16 +46,12 @@ Merge strategy mirrors vLLM's ``MultiConnector``, adapted to ATOM's
 
 Send/save pairing (the one tricky correctness point)
 ----------------------------------------------------
-On a producer node the scheduler frees a finished request's blocks as soon as it
-sees ``finished_sending`` (``scheduler.py``: producer path), and it can *also*
-free on ``finished_saving`` when the connector does not defer. If offload is
-still reading those blocks for its save when the moriio send completes (or vice
-versa), the free would corrupt the in-flight transfer. So when a request needs
-**both** a send and one or more saves, ``MultiConnector`` withholds *both*
-completion signals until every known save is done, then emits them together.
-The scheduler's ``finished_sending`` handler frees first; the
-``finished_saving`` handler then finds nothing to free and no-ops. This is the
-analogue of vLLM's ``_extra_async_saves`` refcount.
+Save completions are reported immediately so chunked prefill can submit its
+next save. Holding them for a send that has already been reported strands the
+scheduler's save generation forever. Sends wait for all worker-known saves;
+the scheduler additionally waits for any final save not yet dispatched before
+freeing the blocks. It remembers send completion on the deferred sequence, so
+neither completion order can free a source still in use.
 """
 
 from __future__ import annotations
@@ -241,7 +237,6 @@ class MultiConnector(KVConnectorBase):
         # when the metadata carries none -- whichever the worker will report.
         self._pending_save_ops: dict[str, set[SaveCompletionId]] = {}
         self._sent: dict[str, Any] = {}
-        self._saved: dict[str, set[SaveCompletionId]] = {}
         # The state tier of whichever sub owns one. Adopted in
         # `register_kv_caches` via `_adopt_state_tier`; set to None here so the
         # attribute exists before the subs register -- a probe for it must
@@ -357,24 +352,15 @@ class MultiConnector(KVConnectorBase):
             out.finished_saving = set(save_now)
             return out
 
-        # Pair each request's send and save before releasing either.
+        # Hold sends for known saves, but never hold a local save completion
+        # for a future (or already consumed) send notification.
         for r in send_now:
             self._sent[str(r)] = r
-        # State-tier store completions (`StateStoreOperationId`: a
-        # (prefix_hash, generation) pair) have no send counterpart to pair
-        # against. Parking them in `self._saved` leaked for the life of the
-        # process -- their key never enters `self._sent`, so the pop below never
-        # fired. They are terminal on their own: release immediately. Match on
-        # the exact type, not `hasattr(r, "req_id")` -- a bare `ReqId` save
-        # completion (a plain str/int) has no `req_id` attribute either and must
-        # still go through send/save pairing on a producer node.
-        state_saves: set = set()
+        # State stores have no request/send counterpart.
         for r in save_now:
             if isinstance(r, StateStoreOperationId):
-                state_saves.add(r)
                 continue
             key = completion_req_key(r)
-            self._saved.setdefault(key, set()).add(r)
             pending_ops = self._pending_save_ops.get(key)
             if pending_ops is not None:
                 pending_ops.discard(r)
@@ -382,16 +368,14 @@ class MultiConnector(KVConnectorBase):
                     self._pending_save_ops.pop(key, None)
 
         rel_send: set = set()
-        rel_save: set = set()
         for key, raw in list(self._sent.items()):
             if self._pending_save_ops.get(key):
                 continue  # hold: save still in flight for this request
             rel_send.add(raw)
             del self._sent[key]
-            rel_save.update(self._saved.pop(key, set()))
 
         out.finished_sending = rel_send
-        out.finished_saving = rel_save | state_saves
+        out.finished_saving = set(save_now)
         return out
 
     def get_finished_recv_blocks(self) -> list[int]:

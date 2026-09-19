@@ -43,8 +43,8 @@ use crate::{
     },
     policies::PolicyRegistry,
     protocols::{
-        chat::{ChatCompletionRequest, ChatMessage, MessageContent},
-        common::{InputIds, StringOrArray},
+        chat::ChatCompletionRequest,
+        common::{GenerationRequest, InputIds, StringOrArray},
         completion::CompletionRequest,
         generate::GenerateRequest,
     },
@@ -2065,18 +2065,18 @@ impl RouterTrait for PDRouter {
         let return_logprob = body.logprobs;
 
         let request_text = if self.policies_need_request_text() {
-            body.messages.first().and_then(|msg| match msg {
-                ChatMessage::User { content, .. } => match content {
-                    MessageContent::Text(text) => Some(text.clone()),
-                    MessageContent::Parts(_) => None,
-                },
-                ChatMessage::Developer { content, .. } => match content {
-                    MessageContent::Text(text) => Some(text.clone()),
-                    MessageContent::Parts(_) => None,
-                },
-                ChatMessage::System { content, .. } => Some(content.to_simple_string()),
-                _ => None,
-            })
+            // Route on the whole conversation, not just messages[0]. With only
+            // the first message every turn of a session hashes to the same
+            // routing text, so cache_aware's radix tree degenerates into a
+            // "first message -> worker" map that can never score the growing
+            // prefix that actually drives prefill cost. This is the same helper
+            // the non-PD router uses, keeping cache-aware routing consistent.
+            let text = body.extract_text_for_routing();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
         } else {
             None
         };
