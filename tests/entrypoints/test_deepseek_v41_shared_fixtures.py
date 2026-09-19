@@ -10,9 +10,17 @@ from atom.entrypoints.openai.tool_parser.stream import ToolCallStreamParser
 
 
 def test_shared_rust_fixtures():
-    fixtures = json.loads((Path(__file__).parent / "fixtures/deepseek_v41_dsml.json").read_text())
+    fixtures = json.loads(
+        (Path(__file__).parent / "fixtures/deepseek_v41_dsml.json").read_text()
+    )
     for fixture in fixtures:
-        tools = [{"type": "function", "function": {"name": c["name"], "parameters": {"type": "object"}}} for c in fixture["calls"]]
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": c["name"], "parameters": {"type": "object"}},
+            }
+            for c in fixture["calls"]
+        ]
         text, calls = parse_tool_calls(fixture["text"], tools, DsmlV41Parser)
         assert text == fixture["content"]
         for actual, expected in zip(calls, fixture["calls"], strict=True):

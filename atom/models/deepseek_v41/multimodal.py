@@ -2,7 +2,8 @@
 """Vision weight ownership and image-to-language embedding projection."""
 
 import torch
-from torch import nn
+
+from atom.model_ops.utils import atom_parameter
 
 from .model import DeepseekV41ForCausalLM
 from .vision import Aligner, ViT
@@ -19,7 +20,7 @@ class DeepseekV41MultimodalModel(DeepseekV41ForCausalLM):
         for name in ("image_start", "image_end", "image_newline"):
             self.register_parameter(
                 name,
-                nn.Parameter(torch.empty(config.hidden_size, dtype=torch.bfloat16)),
+                atom_parameter(torch.empty(config.hidden_size, dtype=torch.bfloat16)),
             )
 
     def embed_input_ids(self, input_ids):

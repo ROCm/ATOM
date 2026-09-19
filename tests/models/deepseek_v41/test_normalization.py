@@ -3,10 +3,10 @@
 
 import pytest
 import torch
-
 from atom.model_ops.blockscale import quantize_fp8
-from atom.model_ops.layernorm import RMSNorm
 from tests.models.deepseek_v41 import oracle_kernels
+
+from atom.model_ops.layernorm import RMSNorm
 
 
 @pytest.mark.parametrize("dim", [128, 512, 1280, 5120])

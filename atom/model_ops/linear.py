@@ -1174,67 +1174,7 @@ class LinearBase(nn.Module):
             y = tensor_model_parallel_all_reduce(y)
         return y
 
-
-class ReplicatedLinear(LinearBase):
-    def __init__(
-        self,
-        input_size: int,
-        output_size: int,
-        bias: bool = False,
-        quant_config: QuantizationConfig | None = None,
-        source_quant_dtype: torch.dtype = None,
-        prefix: str = "",
-        **kwargs,
-    ):
-        super().__init__(
-            input_size,
-            output_size,
-            tp_dim=None,
-            bias=bias,
-            quant_config=quant_config,
-            source_quant_dtype=source_quant_dtype,
-            prefix=prefix,
-        )
-
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        param_data = param.data
-        param.weight_loader_process(param_data, loaded_weight)
-
-
-class ColumnParallelLinear(LinearBase):
-    def __init__(
-        self,
-        input_size: int,
-        output_size: int,
-        bias: bool = False,
-        quant_config: QuantizationConfig | None = None,
-        source_quant_dtype: torch.dtype = None,
-        prefix: str = "",
-        override_tp_size: int | None = None,
-        override_tp_rank: int | None = None,
-        **kwargs,
-    ):
-        self.tp_dim = 0
-        super().__init__(
-            input_size,
-            output_size,
-            self.tp_dim,
-            bias,
-            quant_config=quant_config,
-            source_quant_dtype=source_quant_dtype,
-            prefix=prefix,
-            override_tp_size=override_tp_size,
-            override_tp_rank=override_tp_rank,
-        )
-
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        param_data = param.data
-        shard_size = param_data.size(self.tp_dim)
-        start_idx = self.tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
-        param.weight_loader_process(param_data, loaded_weight)
-
-    def make_row_view(self, start: int, length: int) -> "ColumnParallelLinear":
+    def make_row_view(self, start: int, length: int) -> "LinearBase":
         """A layer that computes only output rows [start, start+length).
 
         Motivation: DCP query replication makes q_proj emit the whole DCP group's
@@ -1306,6 +1246,66 @@ class ColumnParallelLinear(LinearBase):
             view.is_output_padded = False
         view.prefix = f"{getattr(self, 'prefix', '')}[rows {start}:{start + length}]"
         return view
+
+
+class ReplicatedLinear(LinearBase):
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        bias: bool = False,
+        quant_config: QuantizationConfig | None = None,
+        source_quant_dtype: torch.dtype = None,
+        prefix: str = "",
+        **kwargs,
+    ):
+        super().__init__(
+            input_size,
+            output_size,
+            tp_dim=None,
+            bias=bias,
+            quant_config=quant_config,
+            source_quant_dtype=source_quant_dtype,
+            prefix=prefix,
+        )
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        param_data = param.data
+        param.weight_loader_process(param_data, loaded_weight)
+
+
+class ColumnParallelLinear(LinearBase):
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        bias: bool = False,
+        quant_config: QuantizationConfig | None = None,
+        source_quant_dtype: torch.dtype = None,
+        prefix: str = "",
+        override_tp_size: int | None = None,
+        override_tp_rank: int | None = None,
+        **kwargs,
+    ):
+        self.tp_dim = 0
+        super().__init__(
+            input_size,
+            output_size,
+            self.tp_dim,
+            bias,
+            quant_config=quant_config,
+            source_quant_dtype=source_quant_dtype,
+            prefix=prefix,
+            override_tp_size=override_tp_size,
+            override_tp_rank=override_tp_rank,
+        )
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        param_data = param.data
+        shard_size = param_data.size(self.tp_dim)
+        start_idx = self.tp_rank * shard_size
+        loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
+        param.weight_loader_process(param_data, loaded_weight)
 
 
 class MergedColumnParallelLinear(LinearBase):
@@ -2207,6 +2207,18 @@ class MergedReplicatedLinear(ReplicatedLinear):
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
             prefix=prefix,
+        )
+
+    def shard_view(self, index: int) -> "LinearBase":
+        """A layer computing only the rows shard `index` was declared with.
+
+        The fused matrix is the loader's unit; a consumer of one half -- the
+        draft's KV projection out of a fused `[wq_a; wkv]` -- wants the rows
+        without restating where they start.
+        """
+        assert 0 <= index < len(self.output_sizes), index
+        return self.make_row_view(
+            sum(self.output_sizes[:index]), self.output_sizes[index]
         )
 
     def weight_loader(

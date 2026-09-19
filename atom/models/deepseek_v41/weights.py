@@ -327,7 +327,6 @@ class CheckpointReader:
 
     def __init__(self, directory, schema):
         self.directory = Path(directory)
-        self.schema = schema
         index = json.loads(
             (self.directory / "model.safetensors.index.json").read_text()
         )

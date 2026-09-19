@@ -3,11 +3,11 @@
 
 import pytest
 import torch
-
 from atom.model_ops.deepseek_v41.dspark import draft_attention, draft_step, rotate_rows
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
-from atom.models.deepseek_v4_dspark import DSparkConfidenceHead, DSparkMarkovHead
 from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
+
+from atom.models.deepseek_v4_dspark import DSparkConfidenceHead, DSparkMarkovHead
 
 
 def test_block_mask_keeps_all_draft_rows_and_only_the_visible_window():

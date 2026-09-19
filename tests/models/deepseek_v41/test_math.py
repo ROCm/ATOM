@@ -9,8 +9,6 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from torch import nn
-
 from atom.model_ops.deepseek_v41.mhc import (
     SinglePassHCState,
     apply_sublayer,
@@ -19,6 +17,7 @@ from atom.model_ops.deepseek_v41.mhc import (
 from atom.model_ops.deepseek_v41.moe import Expert, Router, weighted_swiglu
 from atom.model_ops.engram import CompressedTokenizer, EngramConfig, NgramHashMapping
 from atom.model_ops.engram_layer import EngramOp
+from torch import nn
 
 
 @contextmanager
@@ -160,41 +159,46 @@ def _reference_engram(reference, target):
     return ref
 
 
-def test_engram_fp32_gate_residual_and_image_mask(reference):
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+def test_engram_fp32_gate_residual_and_image_mask(reference, single_rank):
     torch.manual_seed(192)
     with bf16_default():
-        target = EngramOp(1, hidden_size=32, engram_hidden_size=64, hc_mult=4)
+        target = EngramOp(1, hidden_size=32, engram_hidden_size=64, hc_mult=4).cuda()
+    # ATOM layers allocate uninitialized -- weights arrive from a checkpoint.
+    target.wkv.weight.data.normal_(std=0.1)
     target.q_weight.data.normal_(mean=1, std=0.1)
     target.k_weight.data.normal_(mean=1, std=0.1)
     target.process_weights_after_loading()
     ref = _reference_engram(reference, target)
-    hidden = torch.randn(2, 7, 4, 32, dtype=torch.bfloat16)
-    embeddings = torch.randn(2, 7, 2, 32, dtype=torch.bfloat16)
+    hidden = torch.randn(2, 7, 4, 32, dtype=torch.bfloat16).cuda()
+    embeddings = torch.randn(2, 7, 2, 32, dtype=torch.bfloat16).cuda()
     mask = torch.tensor(
         [
             [True, True, False, False, True, False, True],
             [False, True, True, True, True, True, False],
         ]
-    )
+    ).cuda()
     expected = ref(hidden, embeddings, mask)
     actual = target(hidden, embeddings.flatten(-2), mask)
     assert torch.equal(actual, expected)
     assert torch.equal(actual[~mask], hidden[~mask])
 
 
-def test_zero_engram_dot_preserves_signed_sqrt_contract(reference):
-    target = EngramOp(1, hidden_size=32, engram_hidden_size=32, hc_mult=4)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+def test_zero_engram_dot_preserves_signed_sqrt_contract(reference, single_rank):
+    target = EngramOp(1, hidden_size=32, engram_hidden_size=32, hc_mult=4).cuda()
     target.wkv.weight.data.zero_()
     target.wkv.weight.data[-32:] = 1
+    target.process_weights_after_loading()
     reference_op = _reference_engram(reference, target)
-    hidden = torch.zeros(1, 1, 4, 32)
-    embeddings = torch.ones(1, 1, 1, 32)
+    hidden = torch.zeros(1, 1, 4, 32, device="cuda")
+    embeddings = torch.ones(1, 1, 1, 32, dtype=torch.bfloat16, device="cuda")
     assert torch.equal(
         target(hidden, embeddings.flatten(-2)), reference_op(hidden, embeddings)
     )
 
 
-def test_real_tokenizer_history_images_and_accepted_prefix(reference):
+def test_real_tokenizer_history_images_and_accepted_prefix(reference, single_rank):
     from transformers import AutoTokenizer
 
     directory = os.environ["ATOM_DSV41_REFERENCE"]
@@ -305,7 +309,8 @@ def test_real_tokenizer_history_images_and_accepted_prefix(reference):
 
 
 @pytest.fixture
-def projection_factory(monkeypatch):
+def native_quant(monkeypatch):
+    """V4.1's A8 policy, and a group for the layers that read one."""
     from aiter import QuantType
 
     from atom.config import QuantizationConfig
@@ -316,7 +321,7 @@ def projection_factory(monkeypatch):
         linear, "get_tp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=1)
     )
 
-    def make(k, n, fp4=False):
+    def make(fp4=False):
         config = QuantizationConfig()
         config.global_spec = LayerQuantConfig(
             quant_type=QuantType.per_1x32,
@@ -324,7 +329,17 @@ def projection_factory(monkeypatch):
             weight_block_size=(1, 32) if fp4 else (32, 32),
             activation_dtype=torch.float8_e4m3fn,
         )
-        return linear.ReplicatedLinear(k, n, quant_config=config).cuda()
+        return config
+
+    return make
+
+
+@pytest.fixture
+def projection_factory(native_quant):
+    from atom.model_ops import linear
+
+    def make(k, n, fp4=False):
+        return linear.ReplicatedLinear(k, n, quant_config=native_quant(fp4)).cuda()
 
     return make
 
@@ -362,12 +377,15 @@ def test_w4a8_expert_against_reference(reference, projection_factory):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-def test_native_engram_projection_and_gpu_gate(reference, projection_factory):
+def test_native_engram_projection_and_gpu_gate(reference, native_quant):
     torch.manual_seed(114)
     with bf16_default():
-        projection = projection_factory(64, 160)
         target = EngramOp(
-            1, hidden_size=32, engram_hidden_size=64, hc_mult=4, projection=projection
+            1,
+            hidden_size=32,
+            engram_hidden_size=64,
+            hc_mult=4,
+            quant_config=native_quant(),
         ).cuda()
         source_projection = reference.Linear(64, 160, dtype=torch.float8_e4m3fn)
         weight = (torch.randn(160, 64, dtype=torch.float32) * 16).to(
@@ -399,13 +417,14 @@ def test_native_engram_projection_and_gpu_gate(reference, projection_factory):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-def test_real_engram_weights_and_native_table_rows(reference, projection_factory):
-    from atom.config import get_hf_config
+def test_real_engram_weights_and_native_table_rows(reference, native_quant):
     from atom.models.deepseek_v41.weights import (
         CheckpointReader,
         build_weight_manifest,
         checkpoint_schema,
     )
+
+    from atom.config import get_hf_config
 
     directory = os.environ["ATOM_DSV41_REFERENCE"]
     config = get_hf_config(directory)
@@ -415,8 +434,7 @@ def test_real_engram_weights_and_native_table_rows(reference, projection_factory
         table = reader.engram_tables(config)[1]
         rows = (np.arange(24) * 16000000 + 7)[None, None, :]
         embeddings = table.gather(rows, out_dtype=torch.bfloat16)
-        projection = projection_factory(6144, 25600)
-        target = EngramOp(1, projection=projection).cuda()
+        target = EngramOp(1, quant_config=native_quant()).cuda()
         tensors = {
             name: reader.read(manifest[f"layers.1.engram.{name}"])
             for name in ("wkv.weight", "wkv.scale", "k_weight", "q_weight")

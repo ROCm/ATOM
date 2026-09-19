@@ -36,10 +36,9 @@ class PrefillTrace:
                     "ffn.gate",
                     "engram",
                     "engram.wkv",
-                    "attn.wq_a",
+                    "attn.wqkv_a",
                     "attn.q_norm",
                     "attn.wq_b",
-                    "attn.wkv",
                     "attn.kv_norm",
                     "attn.wo_b",
                 ):

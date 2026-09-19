@@ -38,25 +38,43 @@ logger = logging.getLogger("atom")
 
 
 class DraftAttention(Attention):
-    def project_context(self, hidden, positions, rope, *, packed=False):
-        keys = rotate_rows(rope, self.kv_norm(self.wkv(hidden)), positions)
+    def context_keys(self, kv_pre, positions, rope, *, packed=False):
+        keys = rotate_rows(rope, self.kv_norm(kv_pre), positions)
         # Unlike V4's mixed NoPE/RoPE layout, V4.1 QAT covers all head lanes.
         return quantize_fp8(keys, dequantize=not packed)
 
+    @property
+    def wkv_shard(self):
+        """`wqkv_a` narrowed to the KV rows, for the fused context-KV GEMM."""
+        view = self.__dict__.get("_wkv_shard")
+        if view is None:
+            view = self._wkv_shard = self.wqkv_a.shard_view(1)
+        return view
+
+    def project_context(self, hidden, positions, rope, *, packed=False):
+        """Target keys alone; the query half is computed and dropped.
+
+        As V4's draft does, and only on the unfused path -- when the stages
+        fuse, `write_context_kv` reads `wkv_shard` and no query is projected.
+        """
+        _, kv_pre = self.project_qkv(hidden)
+        return self.context_keys(kv_pre, positions, rope, packed=packed)
+
     def forward(self, hidden, context_kv, step, rope):
-        qr, qr_scale = self.q_norm(self.wq_a(hidden))
+        q_lora, kv_pre = self.project_qkv(hidden)
+        qr, qr_scale = self.q_norm(q_lora)
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
         )
         query = rotate_rows(rope, query, step.positions)
-        keys = self.project_context(hidden, step.positions, rope)
+        keys = self.context_keys(kv_pre, step.positions, rope)
         output = draft_attention(
             query,
             context_kv[self.spec.layer_id],
             keys,
             self.attn_sink,
             step,
-            self.head_dim**-0.5,
+            self.softmax_scale,
         )
         output = rotate_rows(rope, output, step.positions, inverse=True)
         output = output.unflatten(-2, (self.groups, -1)).flatten(-2)
@@ -68,6 +86,10 @@ class DraftBlock(Block):
     attention_cls = DraftAttention
 
     def __init__(self, config, spec, stage, prefix: str = "", *, moe_quant_config):
+        # No `alt_stream`: the draft keeps its shared expert on the one stream,
+        # as V4's own DSpark layers do. Forking here puts a second stream inside
+        # the propose graph's capture, which is a change with its own
+        # measurement to make, not a corollary of wiring the backbone.
         super().__init__(config, spec, prefix=prefix, moe_quant_config=moe_quant_config)
         if stage == 0:
             self.main_proj = ReplicatedLinear(
@@ -191,16 +213,6 @@ class DeepseekV41DSpark(DSparkDraftModel):
     def context_layers(self):
         return tuple(layer.attn for layer in self.mtp)
 
-    def project_context_kv(self, aux_concat, positions):
-        """Project once, then derive each stage's own quantized target keys."""
-        hidden = self.project_context(aux_concat)
-        return {
-            layer.attn.spec.layer_id: layer.attn.project_context(
-                hidden, positions, self.rope
-            )
-            for layer in self.mtp
-        }
-
     def write_context_kv(self, aux_concat, positions):
         from atom.utils.forward_context import get_forward_context
 
@@ -297,29 +309,29 @@ class DeepseekV41DSpark(DSparkDraftModel):
         if fused is not False:
             return fused
         layers = self.context_layers
-        first = layers[0]
         # A caller may hand this model stand-in layers that carry only
         # `project_context` -- the per-stage path needs nothing else, so a
-        # missing `wkv` means "do not fuse", not "crash".
-        if any(getattr(a, "wkv", None) is None for a in layers):
+        # missing projection means "do not fuse", not "crash". The KV half of
+        # `wqkv_a` is what a stage contributes; `shard_view` owns where its
+        # rows and its scale rows start.
+        if any(getattr(a, "wkv_shard", None) is None for a in layers):
             self._context_kv_fused = None
             return None
-        shape = {
-            (a.wkv.native_a8_group_rows, a.wkv.input_size, a.wkv.output_size)
-            for a in layers
-        }
+        shards = [a.wkv_shard for a in layers]
+        first = shards[0]
+        shape = {(s.native_a8_group_rows, s.input_size, s.output_size) for s in shards}
         if (
             len(shape) != 1
-            or first.wkv.native_a8_group_rows is None
-            or any(a.wkv.bias is not None for a in layers)
+            or first.native_a8_group_rows is None
+            or any(s.bias is not None for s in shards)
         ):
             fused = None
         else:
             fused = (
-                torch.cat([a.wkv.weight for a in layers]),
-                torch.cat([a.wkv.weight_scale for a in layers]),
-                first.wkv.native_a8_group_rows,
-                first.wkv.output_size,
+                torch.cat([s.weight for s in shards]),
+                torch.cat([s.weight_scale for s in shards]),
+                first.native_a8_group_rows,
+                first.output_size,
             )
         self._context_kv_fused = fused
         return fused

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+import itertools
 import json
 import os
 from types import SimpleNamespace
@@ -176,3 +177,35 @@ def test_real_engram_native_rows(schema):
                 )
             assert torch.equal(actual, torch.stack(expected)), layer
             assert table._tensor.device.type == "cpu"
+
+
+def test_packed_rules_claim_exactly_their_own_checkpoint_tensors(schema):
+    """Every fusion rule is a substring match, so state which names it takes.
+
+    `attn.wkv` and `attn.compressor.wkv` differ only in what sits between
+    `attn.` and `.wkv`, and `attn.wq_a` differs from `attn.wq_b` in one
+    character. The loader takes the first rule whose key is a substring and
+    stops looking, so a rule that reaches one tensor too far does not fail --
+    it loads that tensor into the wrong half of a fused parameter.
+    """
+    from atom.models.deepseek_v41.model import DeepseekV41ForCausalLM
+
+    rules = DeepseekV41ForCausalLM.packed_modules_mapping
+    claims = {key: {name for name in schema if key in name} for key in rules}
+    for left, right in itertools.combinations(rules, 2):
+        assert not claims[left] & claims[right], (left, right)
+    for key, names in claims.items():
+        assert names, key
+        # The key must land on a whole module path, not inside one: every name
+        # it claims has to end with the key plus one tensor suffix.
+        for name in names:
+            assert name.rsplit(".", 1)[0].endswith(key), (key, name)
+    # `layers.{i}.attn.wq_a` and `attn.wkv` for the 40 backbone layers and the
+    # 3 draft stages, weight and scale each.
+    assert len(claims["attn.wq_a"]) == len(claims["attn.wkv"]) == 86
+    # The two near misses, named rather than left to a set that came out empty:
+    # the compressor's own BF16 `wkv` (no scale), and the query's second half.
+    assert "layers.2.attn.compressor.wkv.weight" in schema
+    assert "layers.2.attn.compressor.wkv.weight" not in claims["attn.wkv"]
+    assert "layers.2.attn.wq_b.weight" in schema
+    assert "layers.2.attn.wq_b.weight" not in claims["attn.wq_a"]

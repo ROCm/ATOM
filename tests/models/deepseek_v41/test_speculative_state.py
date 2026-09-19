@@ -212,7 +212,6 @@ def test_a_rejected_round_leaves_the_next_one_as_if_it_never_drafted(
         rope = RotaryEmbedding(64, 4096, base=10000)
         for parameter in compressor.parameters():
             parameter.data.normal_(0, 0.05)
-        compressor.process_weights_after_loading()
         hidden = torch.randn(1, drafted, 64, dtype=torch.bfloat16)
         following = torch.randn(1, 3, 64, dtype=torch.bfloat16)
 

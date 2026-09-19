@@ -77,9 +77,9 @@ def serial_verify_operations(names):
     exactly that reason; the stages it reached into are gone.
     """
     import torch
-
     from atom.model_ops.engram_layer import EngramOp
     from atom.models.deepseek_v41 import attention
+
     from atom.utils.forward_context import get_forward_context
 
     stats = {name: {"calls": 0, "rows": 0, "max_rows": 0} for name in names}

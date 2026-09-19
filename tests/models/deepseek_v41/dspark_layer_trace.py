@@ -40,7 +40,7 @@ class LayerTrace:
             }
             modules.update(
                 (f"attn.{name}", getattr(layer.attn, name))
-                for name in ("wq_a", "q_norm", "wq_b", "wkv", "kv_norm", "wo_b")
+                for name in ("wqkv_a", "q_norm", "wq_b", "kv_norm", "wo_b")
             )
             if layer.engram is not None:
                 modules["engram"] = layer.engram
@@ -62,7 +62,6 @@ class LayerTrace:
             self.hooks.append(layer.register_forward_hook(leave))
 
         from aiter.dist.parallel_state import get_tp_group
-
         from atom.model_ops.deepseek_v41 import mhc
         from atom.models.deepseek_v41 import attention
 

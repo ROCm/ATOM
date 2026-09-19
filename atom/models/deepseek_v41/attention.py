@@ -20,6 +20,7 @@ from torch import nn
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
+    MergedReplicatedLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
@@ -48,13 +49,9 @@ class Indexer(nn.Module):
             self.heads * self.head_dim,
             quant_config=native_quant_config(),
         )
-        self.weights_proj = nn.Linear(
-            config.hidden_size, self.heads, bias=False, dtype=torch.bfloat16
-        )
+        self.weights_proj = ReplicatedLinear(config.hidden_size, self.heads, bias=False)
         if spec.mode == AttentionMode.FULL:
-            self.wk = nn.Linear(
-                config.head_dim, self.head_dim, bias=False, dtype=torch.bfloat16
-            )
+            self.wk = ReplicatedLinear(config.head_dim, self.head_dim, bias=False)
             self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
 
     def project_keys(self, latent, rope, positions):
@@ -89,9 +86,15 @@ class Attention(nn.Module):
             config.num_attention_heads // tp_size,
             config.o_groups // tp_size,
         )
+        self.softmax_scale = self.head_dim**-0.5
         self.attn_sink = atom_parameter(torch.empty(self.heads, dtype=torch.float32))
-        self.wq_a = ReplicatedLinear(
-            config.hidden_size, config.q_lora_rank, quant_config=native_quant_config()
+        # Fused [wq_a; wkv], as V4 declares it: one GEMM, and one
+        # quantization of the residual instead of two of each.
+        self.wqkv_a = MergedReplicatedLinear(
+            config.hidden_size,
+            [config.q_lora_rank, self.head_dim],
+            bias=False,
+            quant_config=native_quant_config(),
         )
         # Fused: the norm emits `(qr, qr_scale)` in the one launch, and both
         # readers of `qr` -- this layer's `wq_b` and the indexer's -- take that
@@ -106,9 +109,6 @@ class Attention(nn.Module):
             config.q_lora_rank,
             config.num_attention_heads * self.head_dim,
             quant_config=native_quant_config(),
-        )
-        self.wkv = ReplicatedLinear(
-            config.hidden_size, self.head_dim, quant_config=native_quant_config()
         )
         self.kv_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
         # wo_a: grouped LoRA. FP8 + e8m0 block scale on disk, BF16 in the
@@ -223,14 +223,19 @@ class Attention(nn.Module):
         self.wo_a.quant_type = QuantType.No
         self.wo_a.need_normalize_e4m3fn_to_e4m3fnuz = False
 
+    def project_qkv(self, hidden):
+        """The one GEMM the query and the KV latent both come out of."""
+        return torch.split(self.wqkv_a(hidden), self.wqkv_a.output_sizes, dim=-1)
+
     def forward(self, hidden, cache, step, rope):
         positions = cache.rope_positions(step)
-        qr, qr_scale = self.q_norm(self.wq_a(hidden))
+        q_lora, kv_pre = self.project_qkv(hidden)
+        qr, qr_scale = self.q_norm(q_lora)
         query = rope(
             self.wq_b(qr, x_scale=qr_scale).unflatten(-1, (self.heads, self.head_dim)),
             positions,
         )
-        raw_kv = rope(self.kv_norm(self.wkv(hidden)), positions)
+        raw_kv = rope(self.kv_norm(kv_pre), positions)
         # Decode consumes only the stored window; do not materialize an unused
         # BF16 copy when the persistent cache is packed.
         kv = (
@@ -255,7 +260,7 @@ class Attention(nn.Module):
                 prefix,
                 prefix_indptr,
                 self.attn_sink,
-                self.head_dim**-0.5,
+                self.softmax_scale,
             )
         else:
             prefill = packed_prefill if cache.packed else sparse_attn_v4_paged_prefill
@@ -268,7 +273,7 @@ class Attention(nn.Module):
                 extend,
                 extend_indptr,
                 self.attn_sink,
-                self.head_dim**-0.5,
+                self.softmax_scale,
                 out=flat_query,
             )
             # Preserve the prior ring until every query has consumed its prefix.

@@ -17,8 +17,8 @@ from torch import nn
 from atom.model_loader.weight_names import WeightsMapper
 from atom.model_ops.embed_head import VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
-from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.utils import atom_parameter
 from atom.models.deepseek_v4 import (
     DeepseekV4ForCausalLM,
     ParallelHead,
@@ -34,13 +34,25 @@ from .moe import MoE
 class Block(nn.Module):
     attention_cls = Attention
 
-    def __init__(self, config, spec, prefix: str = "", *, moe_quant_config):
+    def __init__(
+        self,
+        config,
+        spec,
+        prefix: str = "",
+        *,
+        moe_quant_config,
+        alt_stream: torch.cuda.Stream | None = None,
+    ):
         super().__init__()
         self.attn = self.attention_cls(config, spec)
         # FusedMoE names its parameters from this prefix, so it has to match the
         # module layout used by the shared loader: `layers.N` / `mtp.N`.
         self.ffn = MoE(
-            config, spec.layer_id, prefix=f"{prefix}.ffn", quant_config=moe_quant_config
+            config,
+            spec.layer_id,
+            prefix=f"{prefix}.ffn",
+            quant_config=moe_quant_config,
+            alt_stream=alt_stream,
         )
         self.attn_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.ffn_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -62,9 +74,7 @@ class Block(nn.Module):
             ):
                 self.register_parameter(
                     f"hc_{sublayer}_{suffix}",
-                    nn.Parameter(
-                        torch.empty(shape, dtype=torch.float32), requires_grad=False
-                    ),
+                    atom_parameter(torch.empty(shape, dtype=torch.float32)),
                 )
         self.engram = None
         if spec.layer_id in config.engram_layer_ids:
@@ -73,16 +83,13 @@ class Block(nn.Module):
                 * config.engram_n_heads
                 * config.engram_head_dim
             )
-            projection = ReplicatedLinear(
-                width, (hc + 1) * config.hidden_size, quant_config=native_quant_config()
-            )
             self.engram = EngramOp(
                 spec.layer_id,
                 config.hidden_size,
                 width,
                 hc,
                 config.rms_norm_eps,
-                projection=projection,
+                quant_config=native_quant_config(),
             )
 
     def prepare_attention(self, residual, pre_mix, embeddings, image_mask):
@@ -158,7 +165,13 @@ class DeepseekV41ForCausalLM(nn.Module):
         orig_to_new_suffix={".gate.bias": ".gate.e_score_correction_bias"},
     )
     weights_mapping: ClassVar[dict[str, str]] = {".scale": ".weight_scale_inv"}
+    # Substring keys, so the dots carry the meaning: `attn.wkv` must not
+    # reach `attn.compressor.wkv`, nor `attn.wq_a` reach `attn.wq_b`.
     packed_modules_mapping: ClassVar[dict[str, tuple[str, int]]] = {
+        "attn.wq_a": ("attn.wqkv_a", 0),
+        "attn.wkv": ("attn.wqkv_a", 1),
+        "compressor.wkv": ("compressor.wkv_gate", 0),
+        "compressor.wgate": ("compressor.wkv_gate", 1),
         "shared_experts.w1": ("shared_experts.gate_up_proj", 0),
         "shared_experts.w3": ("shared_experts.gate_up_proj", 1),
     }
@@ -177,12 +190,19 @@ class DeepseekV41ForCausalLM(nn.Module):
         self.moe_quant_config = make_v4_quant_config(
             config, online_quant_config=online_quant_config
         )
+        # The shared expert runs here, beside the routed pass rather than after
+        # it. One stream for the whole model and not one per layer: a layer's
+        # attention is done before its MoE starts and layers do not overlap, so
+        # they cannot contend. Forking is decided per call by
+        # `maybe_dual_stream_forward`, which declines above a token count.
+        self.alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
         self.layers = nn.ModuleList(
             Block(
                 config,
                 spec,
                 prefix=f"layers.{spec.layer_id}",
                 moe_quant_config=self.moe_quant_config,
+                alt_stream=self.alt_stream,
             )
             for spec in self.topology
         )

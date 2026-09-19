@@ -143,9 +143,8 @@ def test_native_gemm_nonuniform_scales_and_split_tails(fp4, n, k, m, splits):
     "prefix,fp4", [("layers.2.attn.wq_a", False), ("layers.2.ffn.experts.0.w1", True)]
 )
 def test_real_weight_slice_gemm(prefix, fp4):
-    from safetensors import safe_open
-
     from atom.model_ops.blockscale import native_quant_linear
+    from safetensors import safe_open
 
     directory = os.environ.get("ATOM_DSV41_REFERENCE")
     if not directory:

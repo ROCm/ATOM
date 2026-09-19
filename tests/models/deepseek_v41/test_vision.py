@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from atom.model_engine.multimodal import embedding_indices, multimodal_cache_seed
 from atom.models.deepseek_v41.image_processing import (
     DeepseekV41ImageProcessor,
     image_token_types,
@@ -26,7 +27,6 @@ from transformers import AutoTokenizer
 
 from atom.config import get_hf_config
 from atom.entrypoints.openai.chat_encoders import load_custom_message_encoder
-from atom.model_engine.multimodal import embedding_indices, multimodal_cache_seed
 
 from .reference import FIXTURES
 
@@ -128,7 +128,9 @@ def test_image_identity_survives_equal_placeholder_tokens(reference):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm device required")
-def test_real_vision_checkpoint_matches_reference(reference):
+def test_real_vision_checkpoint_matches_reference(reference, single_rank):
+    # `single_rank` because the tower's layers are ATOM's now, and those read
+    # the process group at construction where `nn.Linear` read nothing.
     config, vision_config, args = configs()
     official = sys.modules[reference.__package__ + ".vision"]
     # Only the 1.1 GB vision scope: no text model or Engram allocation.

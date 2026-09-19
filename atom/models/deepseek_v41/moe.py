@@ -12,23 +12,35 @@ directly. vLLM's ROCm V4.1 reuses the V4 MoE the same way.
 `bias_vl` is the one V4.1-only tensor: a second routing bias for image sentinel
 tokens. It is declared so the checkpoint loads and left unread, matching the
 text-only admission.
+
+The shared expert stays its own module rather than taking a routed slot: both
+are scaled per 1x32, but the shared one is FP8 where the routed ones are FP4,
+and one buffer holds one dtype. V4's checkpoints are the same pair, so there is
+no fused variant to inherit.
 """
 
 import torch
-from torch import nn
 
+from atom.model_ops.utils import atom_parameter
 from atom.models.deepseek_v4 import DeepseekV4Args
 from atom.models.deepseek_v4 import MoE as V4MoE
 
 
 class MoE(V4MoE):
-    def __init__(self, config, layer_id: int, prefix: str = "", *, quant_config):
+    def __init__(
+        self,
+        config,
+        layer_id: int,
+        prefix: str = "",
+        *,
+        quant_config,
+        alt_stream: torch.cuda.Stream | None = None,
+    ):
         args = DeepseekV4Args.from_hf_config(config)
         args.quant_config = quant_config
-        super().__init__(layer_id, args, prefix=prefix)
-        self.gate.bias_vl = nn.Parameter(
-            torch.empty(args.n_routed_experts, dtype=torch.float32),
-            requires_grad=False,
+        super().__init__(layer_id, args, prefix=prefix, alt_stream=alt_stream)
+        self.gate.bias_vl = atom_parameter(
+            torch.empty(args.n_routed_experts, dtype=torch.float32)
         )
 
     def forward(self, hidden, image_mask=None):

@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from .reference import load_reference
 
@@ -36,7 +37,99 @@ def single_rank(monkeypatch):
     monkeypatch.setattr(
         layernorm, "get_tensor_model_parallel_world_size", lambda: group.world_size
     )
+    # A biased `LinearBase` reads the engine-wide config for the dtype to
+    # allocate its bias in, which is the one thing a layer built outside an
+    # engine cannot supply. Same role as the group stub above: make ATOM's
+    # layers constructible on their own.
+    monkeypatch.setattr(
+        linear,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(torch_dtype=torch.bfloat16),
+    )
     return group
+
+
+@pytest.fixture
+def unallocated_moe(monkeypatch):
+    """Build the real model, Block, DraftBlock and V4.1 MoE constructors.
+
+    Stubbed out is only what needs a GPU or a checkpoint: weight allocation,
+    attention, and V4's `MoE.__init__` -- the last replaced by a recorder, so
+    what the V4.1 layer passes down to V4 is readable as plain attributes.
+    A test that wants a constructor exercised for real must not find it here.
+    """
+    from atom.models.deepseek_v41 import dspark, model, multimodal
+    from torch import nn
+
+    from atom.config import get_hf_config
+    from atom.models.deepseek_v4 import MoE as V4MoE
+
+    from .reference import FIXTURES
+
+    class UnallocatedModule(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    for module, names in (
+        (model, ("VocabParallelEmbedding", "ParallelHead", "RMSNorm")),
+        (dspark, ("ReplicatedLinear", "DSparkMarkovHead", "DSparkConfidenceHead")),
+        (multimodal, ("ViT", "Aligner")),
+    ):
+        for name in names:
+            monkeypatch.setattr(module, name, UnallocatedModule)
+    monkeypatch.setattr(model.Block, "attention_cls", UnallocatedModule)
+    monkeypatch.setattr(dspark.DraftBlock, "attention_cls", UnallocatedModule)
+
+    def capture_v4(self, layer_id, args, prefix="", alt_stream=None):
+        nn.Module.__init__(self)
+        self.gate = nn.Module()
+        self.quant_config = args.quant_config
+        self.prefix = prefix
+        self.alt_stream = alt_stream
+        self.n_routed_experts = args.n_routed_experts
+        self.n_activated_experts = args.n_activated_experts
+
+    monkeypatch.setattr(V4MoE, "__init__", capture_v4)
+
+    hf = get_hf_config(str(FIXTURES))
+    hf.engram_layer_ids = ()
+    return hf
+
+
+@pytest.fixture
+def build_v41(unallocated_moe):
+    """Build one V4.1 entry point by name, on the meta device.
+
+    All four are here because the model is reachable four ways and each
+    reaches its layers by its own path: what one hands them is not evidence
+    about what another does.
+    """
+    import torch
+    from atom.models.deepseek_v41 import dspark, model, runtime
+
+    hf = unallocated_moe
+
+    def build(entrypoint, online=None):
+        engine = SimpleNamespace(
+            hf_config=hf,
+            max_model_len=32,
+            enforce_eager=True,
+            online_quant_config=online,
+        )
+        with torch.device("meta"):
+            if entrypoint == "runtime":
+                return runtime.DeepseekV41RuntimeModel(engine)
+            if entrypoint == "offline":
+                return model.DeepseekV41ForCausalLM(
+                    hf, max_length=32, online_quant_config=online
+                )
+            if entrypoint == "draft":
+                return dspark.DeepseekV41DSpark(engine)
+            if entrypoint == "draft_offline":
+                return dspark.DeepseekV41DSpark(hf, max_length=32)
+            raise ValueError(f"No V4.1 entry point named {entrypoint!r}")
+
+    return build
 
 
 @pytest.fixture

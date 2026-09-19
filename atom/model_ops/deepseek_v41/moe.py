@@ -1,9 +1,16 @@
 # SPDX-License-Identifier: MIT
-"""V4.1 router and expert arithmetic, independent of dispatch/communication."""
+"""V4.1 router and expert arithmetic, independent of dispatch/communication.
+
+Reference only: serving routes through V4's `FusedMoE`, and nothing in `atom`
+imports this. It is the readable statement of the math those kernels compute,
+pinned against the published model by `tests/models/deepseek_v41/test_math.py`.
+"""
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+from atom.model_ops.utils import atom_parameter
 
 
 class Router(nn.Module):
@@ -13,16 +20,11 @@ class Router(nn.Module):
         super().__init__()
         if not 1 <= topk <= num_experts or gate_temperature <= 0:
             raise ValueError("Invalid router top-k or gate temperature")
-        self.weight = nn.Parameter(
-            torch.empty(num_experts, hidden_size, dtype=torch.bfloat16),
-            requires_grad=False,
+        self.weight = atom_parameter(
+            torch.empty(num_experts, hidden_size, dtype=torch.bfloat16)
         )
-        self.bias = nn.Parameter(
-            torch.empty(num_experts, dtype=torch.float32), requires_grad=False
-        )
-        self.bias_vl = nn.Parameter(
-            torch.empty(num_experts, dtype=torch.float32), requires_grad=False
-        )
+        self.bias = atom_parameter(torch.empty(num_experts, dtype=torch.float32))
+        self.bias_vl = atom_parameter(torch.empty(num_experts, dtype=torch.float32))
         self.topk = topk
         self.route_scale = route_scale
         self.gate_temperature = gate_temperature

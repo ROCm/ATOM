@@ -1,20 +1,24 @@
 # SPDX-License-Identifier: MIT
 """Engram projection and FP32 residual gating, derived from PR #2185.
 
-The V4.1 model injects its native A8 projection; checkpoint I/O, table lookups
-and request staging are owned by separate modules.
+Checkpoint I/O, table lookups and request staging are owned by separate
+modules.
 """
 
 import torch
 from torch import nn
+
+from atom.config import QuantizationConfig
+from atom.model_ops.linear import ReplicatedLinear
+from atom.model_ops.utils import atom_parameter
 
 
 class EngramOp(nn.Module):
     """One Engram module: gate a host-supplied memory read into the residual.
 
     `forward` consumes provider-supplied embeddings and returns the complete
-    updated residual. The projection can be ATOM's native A8 linear layer;
-    this module has no dependency on the provider's table residency.
+    updated residual; this module has no dependency on the provider's table
+    residency.
     """
 
     def __init__(
@@ -24,7 +28,7 @@ class EngramOp(nn.Module):
         engram_hidden_size: int = 6144,
         hc_mult: int = 4,
         norm_eps: float = 1e-20,
-        projection: nn.Module | None = None,
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -34,15 +38,18 @@ class EngramOp(nn.Module):
         self.norm_eps = norm_eps
 
         # One fused projection, laid out as the checkpoint stores it: the
-        # hc_mult key projections first, the single shared value projection last.
-        self.wkv = (
-            projection
-            if projection is not None
-            else nn.Linear(engram_hidden_size, (hc_mult + 1) * hidden_size, bias=False)
+        # hc_mult key projections first, the single shared value projection
+        # last. Built here, not taken as a module, so the shape is derived
+        # once from the arguments that already fix it.
+        self.wkv = ReplicatedLinear(
+            engram_hidden_size,
+            (hc_mult + 1) * hidden_size,
+            bias=False,
+            quant_config=quant_config,
         )
         self.register_buffer("gate_weight", None, persistent=False)
-        self.k_weight = nn.Parameter(torch.ones(hc_mult, hidden_size))
-        self.q_weight = nn.Parameter(torch.ones(hc_mult, hidden_size))
+        self.k_weight = atom_parameter(torch.ones(hc_mult, hidden_size))
+        self.q_weight = atom_parameter(torch.ones(hc_mult, hidden_size))
 
     @property
     def key_rows(self) -> int:
@@ -87,8 +94,6 @@ class EngramOp(nn.Module):
 
         key, residual = keys.float(), hidden_states.float()
         weight = self.gate_weight
-        if weight is None:
-            weight = self.q_weight.float() * self.k_weight.float()
         rstd = torch.rsqrt(residual.square().mean(-1) + self.norm_eps) * torch.rsqrt(
             key.square().mean(-1) + self.norm_eps
         )

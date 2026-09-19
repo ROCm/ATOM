@@ -131,3 +131,36 @@ def test_native_linear_dispatch_keeps_a8_qat(linear_modules):
     torch.testing.assert_close(
         module(x.cuda(), otype=torch.float32).cpu(), expected, rtol=3e-5, atol=3e-4
     )
+
+
+def test_merged_replicated_splits_v41_qkv_a_scale_rows(linear_modules):
+    """The fused `attn.wqkv_a` must land each disk shard on its own rows.
+
+    V4.1's widths are the point: 1280 query-LoRA rows then 512 KV rows, both
+    scaled per 32x32, so the scale shard boundary is row 40 and nothing about
+    it is checked by a uniform split. A shard offset computed on the weight
+    grid instead of the scale grid puts the KV scales 1240 rows too far in and
+    the GEMM reads whatever was there.
+    """
+    linear, group = linear_modules
+    group.world_size = 1
+    module = linear.MergedReplicatedLinear(5120, [1280, 512], quant_config=_config())
+    assert module.weight.shape == (1792, 5120)
+    assert module.weight_scale.shape == (56, 160)
+    shards = {
+        0: (
+            torch.full((1280, 5120), 3.0).to(torch.float8_e4m3fn),
+            torch.full((40, 160), 4.0).to(torch.float8_e8m0fnu),
+        ),
+        1: (
+            torch.full((512, 5120), 7.0).to(torch.float8_e4m3fn),
+            torch.full((16, 160), 64.0).to(torch.float8_e8m0fnu),
+        ),
+    }
+    for shard_id, (weight, scale) in shards.items():
+        module.weight_loader(module.weight, weight, shard_id)
+        module.weight_loader(module.weight_scale, scale, shard_id)
+    assert torch.equal(module.weight[:1280].float(), shards[0][0].float())
+    assert torch.equal(module.weight[1280:].float(), shards[1][0].float())
+    assert torch.equal(module.weight_scale[:40].float(), shards[0][1].float())
+    assert torch.equal(module.weight_scale[40:].float(), shards[1][1].float())

@@ -9,6 +9,19 @@ import numpy as np
 import pytest
 import torch
 
+
+@pytest.fixture(autouse=True)
+def _single_rank(monkeypatch):
+    """`EngramOp` builds an ATOM layer, and those read the process group."""
+    from types import SimpleNamespace
+
+    from atom.model_ops import linear
+
+    monkeypatch.setattr(
+        linear, "get_tp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=1)
+    )
+
+
 from atom.model_engine.engram_runtime import (
     EngramHost,
     EngramPrefetchCache,
@@ -312,21 +325,33 @@ def test_wait_without_submit_is_a_noop():
 
 
 def make_op(hidden=16, engram_hidden=24, hc=2) -> EngramOp:
-    return EngramOp(
+    """Unquantized, so the projection is BF16 -- the dtype `EngramHost` gathers
+    its rows into, and therefore what the embeddings below are."""
+    op = EngramOp(
         layer_id=1, hidden_size=hidden, engram_hidden_size=engram_hidden, hc_mult=hc
     )
+    op.process_weights_after_loading()
+    return op
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 def test_engram_op_is_token_flat():
     """ATOM residual streams are [num_tokens, hc, dim], not [batch, seq, ...]."""
-    op = make_op()
-    out = op(torch.randn(5, 2, 16), torch.randn(5, 24))
+    op = make_op().cuda()
+    out = op(
+        torch.randn(5, 2, 16).cuda(),
+        torch.randn(5, 24, dtype=torch.bfloat16).cuda(),
+    )
     assert out.shape == (5, 2, 16)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 def test_engram_op_accepts_leading_batch_dims():
-    op = make_op()
-    out = op(torch.randn(2, 3, 2, 16), torch.randn(2, 3, 24))
+    op = make_op().cuda()
+    out = op(
+        torch.randn(2, 3, 2, 16).cuda(),
+        torch.randn(2, 3, 24, dtype=torch.bfloat16).cuda(),
+    )
     assert out.shape == (2, 3, 2, 16)
 
 
@@ -378,7 +403,9 @@ def test_load_checkpoint_weights_dequantizes_blocks():
     op.load_checkpoint_weights(
         wkv, torch.ones(2, 16), torch.ones(2, 16), wkv_scale=scale, block=8
     )
-    torch.testing.assert_close(op.wkv.weight, torch.full((rows, cols), 3.0))
+    torch.testing.assert_close(
+        op.wkv.weight, torch.full((rows, cols), 3.0, dtype=torch.bfloat16)
+    )
 
 
 def test_load_checkpoint_weights_rejects_bad_scale_shape():

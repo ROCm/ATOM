@@ -11,6 +11,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from atom.model_ops.linear import ReplicatedLinear
+from atom.model_ops.utils import atom_parameter
+
 
 @lru_cache(8)
 def get_vision_cos_sin(n_h: int, n_w: int, dim: int, theta: float, device):
@@ -34,7 +37,7 @@ class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.bfloat16))
+        self.weight = atom_parameter(torch.ones(dim, dtype=torch.bfloat16))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dtype = x.dtype
@@ -46,8 +49,8 @@ class RMSNorm(nn.Module):
 class PatchEmbed(nn.Module):
     def __init__(self, args):
         super().__init__()
-        self.proj = nn.Linear(
-            3 * args.patch_size**2, args.hidden_size, dtype=torch.bfloat16
+        self.proj = ReplicatedLinear(
+            3 * args.patch_size**2, args.hidden_size, bias=True
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -59,10 +62,8 @@ class Attention(nn.Module):
         super().__init__()
         self.n_heads = args.num_attention_heads
         self.head_dim = args.hidden_size // args.num_attention_heads
-        self.wqkv = nn.Linear(
-            args.hidden_size, 3 * args.hidden_size, dtype=torch.bfloat16
-        )
-        self.wo = nn.Linear(args.hidden_size, args.hidden_size, dtype=torch.bfloat16)
+        self.wqkv = ReplicatedLinear(args.hidden_size, 3 * args.hidden_size, bias=True)
+        self.wo = ReplicatedLinear(args.hidden_size, args.hidden_size, bias=True)
 
     def forward(
         self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
@@ -83,15 +84,10 @@ class Attention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, args):
         super().__init__()
-        self.w1 = nn.Linear(
-            args.hidden_size,
-            2 * args.intermediate_size,
-            bias=False,
-            dtype=torch.bfloat16,
+        self.w1 = ReplicatedLinear(
+            args.hidden_size, 2 * args.intermediate_size, bias=False
         )
-        self.w2 = nn.Linear(
-            args.intermediate_size, args.hidden_size, bias=False, dtype=torch.bfloat16
-        )
+        self.w2 = ReplicatedLinear(args.intermediate_size, args.hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate, up = self.w1(x).chunk(2, dim=-1)
@@ -141,8 +137,8 @@ class Aligner(nn.Module):
         super().__init__()
         self.downsample_ratio = args.downsample_ratio
         in_dim = args.hidden_size * self.downsample_ratio**2
-        self.w1 = nn.Linear(in_dim, language_dim, dtype=torch.bfloat16)
-        self.w2 = nn.Linear(language_dim, language_dim, dtype=torch.bfloat16)
+        self.w1 = ReplicatedLinear(in_dim, language_dim, bias=True)
+        self.w2 = ReplicatedLinear(language_dim, language_dim, bias=True)
 
     def forward(self, x: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
         r = self.downsample_ratio

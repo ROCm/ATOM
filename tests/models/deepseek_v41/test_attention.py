@@ -43,13 +43,17 @@ def test_compressor_all_chunk_boundaries_against_official_decode(
     with reference.set_dtype(torch.bfloat16):
         source = reference.Compressor(args, 0)
         target = Compressor(64, 64, ratio, args.norm_eps).cuda()
-        for name, parameter in target.named_parameters():
-            value = (torch.randn(parameter.shape) * 0.1).bfloat16()
-            if name == "norm.weight":
-                value.fill_(1)
-            parameter.data.copy_(value)
-            dict(source.named_parameters())[name].data.copy_(value)
-        target.process_weights_after_loading()
+        upstream = dict(source.named_parameters())
+        # Filled one disk tensor at a time through the merged loader, which is
+        # how `packed_modules_mapping` fills `wkv_gate` -- so this also pins
+        # that the pooling half is shard 0 and the gate is shard 1. Feeding
+        # both halves the same numbers would make that unfalsifiable.
+        for shard_id, name in enumerate(("wkv",) if ratio == 1 else ("wkv", "wgate")):
+            value = (torch.randn(64, 64) * 0.1).bfloat16()
+            target.wkv_gate.weight_loader(target.wkv_gate.weight, value, shard_id)
+            upstream[f"{name}.weight"].data.copy_(value)
+        for norm in (target.norm.weight, upstream["norm.weight"]):
+            norm.data.fill_(1)
         hidden = torch.randn(2, 11, 64, dtype=torch.bfloat16)
         expected = []
         for position in range(hidden.shape[1]):
@@ -70,3 +74,77 @@ def test_compressor_all_chunk_boundaries_against_official_decode(
                 torch.cat(actual, dim=1), expected, rtol=1 / 128, atol=2**-10
             )
             assert (tail is None) == (ratio == 1)
+
+
+@pytest.mark.parametrize("ratio,rows", [(1, 32), (2, 64)])
+def test_compressor_holds_pool_and_gate_in_one_matrix(single_rank, ratio, rows):
+    """One parameter, and the two disk tensors land in their own row ranges.
+
+    A ratio-1 layer ships no `wgate` at all, so its matrix is the pooling half
+    alone -- and the merged loader has to refuse a gate shard there rather
+    than write past the rows it owns.
+    """
+    torch.manual_seed(451)
+    compressor = Compressor(96, 32, ratio, 1e-6)
+    assert [name for name, _ in compressor.named_parameters()] == [
+        "wkv_gate.weight",
+        "norm.weight",
+    ]
+    assert compressor.wkv_gate.weight.shape == (rows, 96)
+    shards = [torch.full((32, 96), float(i + 1)) for i in range(ratio)]
+    for shard_id, value in enumerate(shards):
+        compressor.wkv_gate.weight_loader(compressor.wkv_gate.weight, value, shard_id)
+    for shard_id, value in enumerate(shards):
+        loaded = compressor.wkv_gate.weight[shard_id * 32 : (shard_id + 1) * 32]
+        assert torch.equal(loaded.float(), value)
+    if ratio == 1:
+        with pytest.raises(AssertionError):
+            compressor.wkv_gate.weight_loader(compressor.wkv_gate.weight, shards[0], 1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+def test_compressor_project_hands_back_strided_halves(single_rank):
+    """The halves the two writers read: zero-copy, unit inner stride.
+
+    `fused_compress_attn` and `update_compressor_states` both take a row
+    stride but address the head dimension as `col_off + d`, so a trailing
+    chunk of one GEMM is exactly what they accept -- and making the halves
+    contiguous instead would put the copy back that the fusion removed.
+    """
+    torch.manual_seed(451)
+    compressor = Compressor(96, 32, 2, 1e-6).cuda()
+    compressor.wkv_gate.weight.data.normal_(std=0.1)
+    values, scores = compressor.project(torch.randn(7, 96, dtype=torch.bfloat16).cuda())
+    for half in (values, scores):
+        assert half.shape == (7, 32)
+        assert half.stride() == (64, 1)
+        assert half.untyped_storage().data_ptr() == values.untyped_storage().data_ptr()
+
+
+def test_draft_context_kv_fusion_sees_the_kv_half(single_rank, small_config):
+    """The fused context-KV GEMM reads a shard of `wqkv_a`, not a `wkv` layer.
+
+    It concatenates one projection per stage and declines when a stage cannot
+    supply one. Nothing else asserts that a real attention module supplies it,
+    so a rename on the model side turns the fusion off and only costs speed --
+    the per-stage fallback it falls back to is numerically identical.
+    """
+    from atom.models.deepseek_v41.config import build_attention_topology
+    from atom.models.deepseek_v41.dspark import DraftAttention
+
+    spec = build_attention_topology(small_config)[1]
+    attention = DraftAttention(small_config, spec)
+    shard = attention.wkv_shard
+    assert shard is not None
+    assert shard.output_size == small_config.head_dim
+    assert shard.native_a8_group_rows is not None
+    rows = attention.wqkv_a.output_sizes[0]
+    assert torch.equal(
+        shard.weight.view(torch.uint8),
+        attention.wqkv_a.weight.view(torch.uint8)[rows:],
+    )
+    group = attention.wqkv_a.weight_scale_row_group
+    assert torch.equal(
+        shard.weight_scale.view(torch.uint8),
+        attention.wqkv_a.weight_scale.view(torch.uint8)[rows // group :],
+    )

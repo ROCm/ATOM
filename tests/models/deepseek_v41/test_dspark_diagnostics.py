@@ -5,15 +5,17 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 from atom.model_ops.engram_layer import EngramOp
+
 from atom.utils import forward_context
 
 from .dspark_projection_probe import serial_verify_operations
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-def test_serial_engram_replaces_the_batched_call_during_verification_only(monkeypatch):
+def test_serial_engram_replaces_the_batched_call_during_verification_only(
+    monkeypatch, single_rank
+):
     """A diagnostic that cannot be switched off is not a diagnostic.
 
     The probe answers "does batching Engram across the drafted rows change
@@ -35,6 +37,9 @@ def test_serial_engram_replaces_the_batched_call_during_verification_only(monkey
     engram = EngramOp(1, hidden_size=32, engram_hidden_size=32, hc_mult=4).to(
         device="cuda", dtype=torch.bfloat16
     )
+    # ATOM layers allocate uninitialized -- weights arrive from a checkpoint.
+    engram.wkv.weight.data.normal_(std=0.1)
+    engram.process_weights_after_loading()
     hidden = torch.randn(1, 3, 4, 32, device="cuda", dtype=torch.bfloat16)
     embeddings = torch.randn(1, 3, 32, device="cuda", dtype=torch.bfloat16)
     with torch.inference_mode():

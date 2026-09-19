@@ -4,10 +4,10 @@
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from atom.model_ops.layernorm import RMSNorm
+from atom.model_ops.linear import MergedReplicatedLinear
 from atom.model_ops.v4_kernels import fused_compress_attn
 from atom.model_ops.v4_kernels.state_writes import update_compressor_states
 
@@ -63,7 +63,7 @@ def compress_batch(cache, owner, compressor, values, scores, step, rope, *, scat
             plan=plan,
             state_slot_mapping=step.slots,
             ape=compressor.ape,
-            rms_weight=compressor.norm_weight,
+            rms_weight=compressor.norm.weight,
             rms_eps=compressor.norm.eps,
             cos_cache=rope.cos_cache,
             sin_cache=rope.sin_cache,
@@ -107,39 +107,34 @@ class Compressor(nn.Module):
         if ratio not in (1, 2):
             raise ValueError("CSA2 compressor ratio must be 1 or 2")
         self.ratio = ratio
-        self.wkv = nn.Linear(hidden_size, head_dim, bias=False, dtype=torch.bfloat16)
+        # Fused [wkv; wgate], as V4 declares it. A ratio-1 layer ships no
+        # `wgate`, so there the matrix is the pooling half alone.
+        self.wkv_gate = MergedReplicatedLinear(
+            hidden_size,
+            [head_dim] * (1 if ratio == 1 else 2),
+            bias=False,
+            quant_config=None,
+        )
         self.norm = RMSNorm(head_dim, eps)
-        self.register_buffer("norm_weight", None, persistent=False)
         # V4 adds a learned position encoding to the gate before the softmax;
         # CSA2 does not, and the batched kernel takes it as a tensor rather
         # than a flag. Zeros say the same thing without a second code path.
         self.register_buffer(
             "ape", torch.zeros(ratio, head_dim, dtype=torch.float32), persistent=False
         )
-        if ratio > 1:
-            self.wgate = nn.Linear(
-                hidden_size, head_dim, bias=False, dtype=torch.bfloat16
-            )
-            self.register_buffer("pool_weight", None, persistent=False)
-            self.register_buffer("gate_weight", None, persistent=False)
-
-    def process_weights_after_loading(self):
-        # The fused kernel wants fp32 and contiguous; doing it here keeps it
-        # off the per-layer, per-step path.
-        self.norm_weight = self.norm.weight.float().contiguous()
-        if self.ratio > 1:
-            self.pool_weight = self.wkv.weight.float()
-            self.gate_weight = self.wgate.weight.float()
 
     def project(self, x):
-        """Expose per-token projections for accepted-prefix tail storage."""
+        """Per-token projections; ratio 1 pools nothing, so it has no gate.
+
+        `otype` is load-bearing above ratio 1: the weights are BF16, and
+        without it the accumulator is rounded to BF16 before the pool that
+        the published model specifies in FP32 ever sees it.
+        """
         if self.ratio == 1:
-            return self.wkv(x), None
-        if self.pool_weight is None or self.gate_weight is None:
-            raise RuntimeError("Compressor weights must be processed after loading")
-        values = F.linear(x.float(), self.pool_weight)
-        scores = F.linear(x.float(), self.gate_weight)
-        return values, scores
+            return self.wkv_gate(x), None
+        # Zero-copy halves; both readers take a row stride and need only unit
+        # stride along the head dimension.
+        return self.wkv_gate(x, otype=torch.float32).chunk(2, dim=-1)
 
     def pool(self, values, scores, start_position, tail=None, *, dtype):
         if self.ratio == 1:

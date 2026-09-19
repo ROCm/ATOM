@@ -3,7 +3,6 @@
 
 import pytest
 import torch
-
 from atom.model_ops.blockscale import native_quant_linear
 
 pytestmark = pytest.mark.skipif(
