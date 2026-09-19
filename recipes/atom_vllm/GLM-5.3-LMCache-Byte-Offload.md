@@ -43,7 +43,7 @@ GPUs 0-3 (gfx950):
 ```bash
 export PYTHONHASHSEED=0               # mandatory
 export LMCACHE_LOCAL_CPU=True
-export LMCACHE_MAX_LOCAL_CPU_SIZE=180 # GiB **per TP rank** -- see Sizing below
+export LMCACHE_MAX_LOCAL_CPU_SIZE=90  # GiB **per TP rank** -- size it, see Sizing below
 export LMCACHE_CHUNK_SIZE=64          # must equal --block-size
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
@@ -108,13 +108,25 @@ through it. Healthy TP4 spreads the `Retrieved` lines evenly -- measured here,
 The `world=1` failure shows up as lines from `Worker_TP0` alone.
 
 **A zero histogram is underdetermined, not a diagnosis.** No `Retrieved` lines
-at all looks identical whether the ranks never built a client or the tier is
-simply empty -- which is the normal state during early warmup, and also the
-steady state on an arm whose HBM hit rate is high enough that the connector
-only ever sees a short miss tail (measured on M3 TP4 by a parallel arm: `world`
-correctly 4, preflight green, and still zero rows). Separate the two by reading
-check 3 alongside it. Zero is never positive evidence; this probe is strong
-only when it is nonzero.
+at all has at least three causes that look identical:
+
+1. the ranks never built a client (`world=1`, check 3);
+2. the tier is healthy but the connector never reaches it -- normal during early
+   warmup, and the *steady* state whenever the HBM pool is large enough that only
+   a short miss tail is ever offered to the connector. Measured on M3 TP4 with
+   `world` correctly 4 and preflight green; measured again on GLM-5.2 at
+   `conc=32`, where the same tree gives `Retrieved=8` at
+   `--num-gpu-blocks-override 8192` and `Retrieved=0` at `16896` -- **only the
+   pool size changed**;
+3. the engine died on the first real tier load, before any line could be
+   written.
+
+Check 3 separates (1); `grep -c EngineDeadError` separates (3). Zero is never
+positive evidence; this probe is strong only when it is nonzero.
+
+Because of (2), **`Retrieved > 0` is a property of (tree, HBM pool), not of the
+tree** -- always report `--num-gpu-blocks-override` next to it, or the next
+reader will run a larger pool, see 0, and conclude the tree is broken.
 
 **Judging liveness: `Retrieved > 0` and `external_prefix_cache_hits > 0`, and
 nothing else.** `Stored` lines appear on a tier that is never read. And on
@@ -127,9 +139,10 @@ so do not read 0 as "no retrieval".
 **Both GLM-5.3 checkpoints**, `amd/GLM-5.3-MXFP4` and `amd/GLM-5.3-FP8`, each
 TP=4 on gfx950 GPUs 0-3, block size 64, fp8 KV, `--num-gpu-blocks-override
 8192`, `--max-model-len 131072`, `LMCACHE_CHUNK_SIZE=64`, `PYTHONHASHSEED=0`,
-LMCache 0.4.5 from `rocm/atom-dev:vllm-0.28.0`. CPU tier 32 GiB/rank (see the
-caveat under Sizing). The FP8 arm differs from the launch block above only in
-its `online_quant_config`, which is GLM-5.2-FP8's verbatim (see
+LMCache 0.4.5 from `rocm/atom-dev:vllm-0.28.0`. CPU tier **32 GiB/rank**, not
+the 90 in the launch block above -- these arms only have to prove restore, and
+host memory was shared at the time (see Sizing). The FP8 arm differs from the
+MXFP4 arm only in its `online_quant_config`, which is GLM-5.2-FP8's verbatim (see
 [GLM-5.md](GLM-5.md#glm-52-fp8)):
 
 ```
@@ -237,33 +250,156 @@ this field is sampling noise in both directions — GLM-5.2's tier-*off* arm,
 where nothing was restored at all, scores 0/8 on it. Marker recall is the
 criterion, and it is 8/8 everywhere.
 
-### Not measured here
+### Throughput, measured on GLM-5.3
 
-**No throughput number for GLM-5.3.** Both arms ran correctness only, on a
-machine whose other socket was under a concurrent 256 GiB-tier job — exactly
-the host DRAM, CPU and PCIe the offload path spends, so any timing taken here
-would be measuring the neighbour. GLM-5.3 is the same architecture, the same KV
-volume per token and the same code path as GLM-5.2, so the GLM-5.2 numbers
-(+50.4% at 64 prefixes) are the best available estimate — but they are GLM-5.2's
-numbers, not GLM-5.3's. Do not quote them as measured on GLM-5.3.
+A matched ON/OFF pair, back to back in the same slot, same tree
+(`b6e22c4792ab5202063089b28b4d4197750c3186`, `atom_dirty_lines=0`), same model
+(`amd/GLM-5.3-MXFP4`), TP=4 on GPUs 0-3, `--num-gpu-blocks-override 8192`,
+`LMCACHE_MAX_LOCAL_CPU_SIZE=90`, aiperf 600 s at concurrency 8 with a 64-prefix
+pool of 28,672 tokens and a 4,096-token unique tail, seed 530419. Both arms
+measured ISL 32,768.87 / 32,768.86 and OSL 512 / 512, so the workload matched.
+
+| | OFF | ON | |
+|---|---|---|---|
+| **request_throughput** | 0.5176 req/s | **0.6225 req/s** | **+20.3%** |
+| output_token_throughput | 265.01 tok/s | 318.73 tok/s | +20.3% |
+| request_count | 312 | 376 | +20.5% |
+| request_latency avg / p50 / p90 | 15446 / 15567 / 17415 ms | 12841 / 12284 / 15215 ms | −16.9 / −21.1 / −12.6% |
+| **TTFT** avg / p50 / p90 | 4377 / 4296 / 6758 ms | 3111 / 3062 / 5067 ms | **−28.9 / −28.7 / −25.0%** |
+| ITL avg / p50 / p90 | 21.66 / 21.32 / 27.90 ms | 19.04 / 18.61 / 22.90 ms | −12.1 / −12.7 / −17.9% |
+| benchmark_duration | 602.78 s | 604.00 s | +0.2% |
+
+`request_throughput` and `output_token_throughput` are **one** number, not two:
+OSL is fixed at 512, so the second is the first times 512 by construction.
+
+**Why it moved.** Server-side `vllm:prompt_tokens_by_source_total`, whose three
+components sum to `vllm:prompt_tokens_total` exactly on both arms:
+
+| source | OFF | ON |
+|---|---|---|
+| `local_compute` | 8,102,174 (79.25%) | 4,807,184 (39.02%) |
+| `local_cache_hit` | 2,121,728 (20.75%) | 2,465,792 (20.01%) |
+| `external_kv_transfer` | 0 | **5,048,128 (40.97%)** |
+| total | 10,223,902 | 12,321,104 |
+
+Prefill recompute fell from 13,441 to 7,959 tok/s (−40.8%) while the server
+delivered 20.5% more requests. The tier only feeds prefill, so TTFT should move
+most and most uniformly — it does (−28.9 / −28.7 / −25.0% across avg/p50/p90),
+while ITL's −12.1% is the second-order effect of prefill no longer competing
+with decode.
+
+**How much was reachable.** On the plugin path vLLM asks the connector only for
+what the HBM pool missed (`queries = num_tokens - local_computed`), so the
+connector's ceiling is the reusable prefix minus what HBM already served. Write
+the construction, not the total — `pool_size = 64` distinct prefixes means the
+**first occurrence of each is not reusable by anything**:
+
+    reusable  = (376 - 64) x 28,672 =  8,945,664   72.60% of ON prompt tokens
+    - HBM     =              2,465,792             20.01%
+    = headroom=              6,479,872             52.59%
+    supplied  =              5,048,128             40.97%  -> 77.9% of headroom
+
+For contrast, the same connector on GLM-5.2 at concurrency 40 supplied 0.43% of
+prompt tokens, because that arm's HBM pool was large enough to leave almost no
+miss tail. **The tier's value is set by the HBM pool, not by the tier size.**
+
+**Limits on the above.** The OFF side has three repeats (0.5148 / 0.5150 /
+0.5176 req/s, range 0.54%); the ON side is n=1, so no ON-side dispersion is
+quoted and the OFF range must not be borrowed for it. Throughput is quantised at
+1/376 = 0.27% (ON) and 1/312 = 0.32% (OFF). Two known asymmetries both favour
+the OFF arm — it ran second, on a warmer page cache, and started with 624.6 GiB
+free against the ON arm's 154.7 — so they cannot manufacture the gain, but they
+are not quantified either.
+
+### Host memory and tier residency
+
+Per-worker `RssAnon`, sampled every 10 s across both arms by one sampler into
+one file:
+
+| arm | per-worker | TP4 total | plateau |
+|---|---|---|---|
+| ON (tier 90) | 100.4 GiB | 401.7 GiB | n=51, spread 0.30 GiB |
+| OFF (no tier) | 9.7 GiB | 38.8 GiB | n=42, spread 0.00 GiB |
+
+The OFF arm sets the tier to zero, so **its `RssAnon` measures the fixed
+residency directly**: F = 9.7 GiB/worker. The difference then bounds tier
+residency at `(401.7 - 38.8) / 4 = 90.7 GiB/rank` against a declared 90.0
+(+0.8%) — an **upper** bound, because the subtraction charges the tier with
+everything that differs between the arms, including LMCache's own non-tier anon.
+Do not compute F as `R - TP x tier`: that assumes the declared tier in order to
+produce F, and cannot then check it.
+
+> **Trap.** `Staging buffers: 300 allocated (90.0 GiB, 7.25s pinning)` is **not
+> the KV tier.** It is ATOM's MoE expert staging. The OFF arm above prints it on
+> all four workers with `grep -cE "AtomLMCacheOffloadConnector|max_local_cpu_size"`
+> returning **0**, and a separate tier=64 arm prints the same `90.0 GiB`. Its
+> value is tier-independent, and on a tier=90 run it collides byte-for-byte with
+> the tier setting. Use `RssAnon` to see what the tier actually costs.
 
 ## Sizing
 
 Read [GLM-5.2's Sizing section](GLM-5.2-LMCache-Byte-Offload.md#sizing-do-this-before-benchmarking);
 the arithmetic is identical at 47,700 B/rank/token.
 
-The **32 GiB/rank used above is deliberately below what that section
-recommends** — host memory was shared with another job. It was enough for a
-40-request correctness run (802,213 prompt tokens ≈ 36 GiB/rank of traffic, with
-no allocation failures logged), and it is *not* enough for a benchmark: use
-`LMCACHE_MAX_LOCAL_CPU_SIZE=180` there, and size the tier for the whole run
-rather than for the prefix pool.
+The **32 GiB/rank used in the correctness arms is deliberately small** — host
+memory was shared with another job. It was enough for a 40-request run (802,213
+prompt tokens, no allocation failures logged) and is not enough for a benchmark.
 
-If the host is NUMA-split, bind the server to the socket its GPUs are on
-(`numactl --membind=<node>`) and gate on `MemFree >= 1.05 x tier`, on that node,
-not on `MemAvailable` — pinned memory does not reclaim page cache. Verify the
-binding took: `bind:0` in `/proc/<worker>/numa_maps`, not
-`Mems_allowed_list` (`--cpuset-mems` on rootless podman is silently ineffective).
+The benchmark above ran at **`LMCACHE_MAX_LOCAL_CPU_SIZE=90`**, not the 180 that
+GLM-5.2's Sizing section prescribes, and logged **zero** `Failed to allocate
+memory block ... no memory is available` over 600 s and 376 requests.
+
+The one number worth carrying across runs is the per-prefix unit, and it is
+measured rather than derived — the connector logs it:
+
+    Retrieved 28672 out of 28672 required tokens ... size: 1.2737 gb
+
+(28,672 x 47,700 B = 1.2736 GiB, so that `gb` is GiB.) The **reusable** working
+set is then `64 distinct prefixes x 1.2737 GiB = 81.5 GiB/rank`, and 90 is
+1.10x that.
+
+81.5 is a lower bound on what the tier must hold, not the requirement: the
+per-request cache-bust tails are stored too, are never reused, and at 0.18
+GiB/rank each they exceed the tier several times over within one 600 s window.
+They fit because the tier evicts them, which is what the tier is supposed to do
+with them. So do **not** try to size for the whole run's byte traffic — size for
+the reusable set and then check the outcome, because the two failure modes are
+each visible in one line:
+
+* under-sized: `no memory is available` appears at all (27,695 times in one
+  GLM-5.2 run at 40 GiB/rank);
+* over-sized: `RssAnon` carries the tier (see *Host memory and tier residency*)
+  while the external-hit count does not move.
+
+Both were checked here: zero allocation failures, and 40.97% of prompt tokens
+served externally. 180 was not tried; at TP=4 it is 720 GiB of pinned anon,
+which on this host is more than one NUMA node has free.
+
+47,700 B/rank/token is also the exchange rate between tier capacity and reuse
+distance: `tier_tokens = tier_bytes_per_rank / 47,700`. If your reuse distance
+exceeds that, the tier is being asked to hold something it will evict first.
+
+If the host is NUMA-split, **do not reach for `numactl --membind=<node>` first**:
+when `TP x tier` exceeds one node's free memory it is not a policy choice but a
+physical impossibility, and the allocation will spill or fail rather than
+honour the binding. At TP=4 and 90 GiB/rank that is 360 GiB of pinned anon, more
+than a single node had. The rank skew that follows is structural, not noise.
+(If you do bind, verify it took with `bind:0` in `/proc/<worker>/numa_maps`, not
+`Mems_allowed_list` — `--cpuset-mems` on rootless podman is silently ineffective.)
+
+Gate on `F + TP x tier` against **measured per-node free memory**, not on
+`MemFree >= 1.05 x tier`: the latter omits both the fixed residency and the
+other ranks. Measure F on an arm with the tier switched off (see *Host memory
+and tier residency* above) rather than deriving it from a declared tier.
+
+"Pinned memory does not reclaim page cache" is **too strong**. On the arm above,
+the tier pinned 360 GiB starting from 154.7 GiB free, and `Cached` fell 470.3
+GiB while `Dirty` stayed at 0.0 — reclaim carried the whole pin. The cheap
+retrospective test is `MemFree_after_stop - MemFree_before > 0` (here +469.9
+GiB, closing to 0.1% against the independently constructed `ΔCached`). But
+reclaim is **regional, not unconditional**: a separate arm asking for 850 GiB
+died with page cache that never moved. Neither case decides the other — measure
+your own.
 
 ## Related
 
