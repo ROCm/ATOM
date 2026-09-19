@@ -816,3 +816,28 @@ class KdaBoundaryPlanner:
         out = dict(self._index.stats())
         out["pinned_stores"] = len(self._pending_stores)
         return out
+
+
+def summarize_layout_id(layout_id: str) -> str:
+    """``build_layout_id``'s string with its per-layer tail run-length encoded.
+
+    That tail is one ``shape:dtype`` per layer, and on Kimi-K3 those 69 entries
+    are identical -- 4.5 KiB on one line, 36 KiB per boot across TP8, which
+    leaves the `grep` the recipe tells a reader to run scrolling past its own
+    answer. Encoding runs is lossless and order preserving, so the line still
+    shows every difference there is between two boots.
+
+    For the log only. The storage key folds in the full string from
+    ``build_layout_id``; shortening what a human reads must not shorten what
+    distinguishes one layout's bytes from another's.
+    """
+    head, sep, tail = layout_id.rpartition("|")
+    if not sep:
+        return layout_id
+    runs: list[list] = []
+    for item in tail.split(";"):
+        if runs and runs[-1][0] == item:
+            runs[-1][1] += 1
+        else:
+            runs.append([item, 1])
+    return head + "|" + ";".join(f"{n}x{item}" if n > 1 else item for item, n in runs)

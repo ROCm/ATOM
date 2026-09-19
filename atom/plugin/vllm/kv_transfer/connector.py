@@ -54,6 +54,7 @@ from atom.plugin.vllm.kv_transfer.kda_state import (
     build_layout_id,
     find_mamba_groups,
     step_boundary_offloads,
+    summarize_layout_id,
 )
 from atom.plugin.vllm.kv_transfer.kv_cache_layout import (
     build_kv_cache_tensors,
@@ -462,7 +463,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             "entry=%.2f MiB, layout=%s",
             sum(len(tensors) for tensors in tensors_by_group),
             views.entry_bytes / (1 << 20),
-            views.layout_id,
+            summarize_layout_id(views.layout_id),
         )
 
     def _dispatch_kda(self, metadata) -> None:

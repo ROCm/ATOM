@@ -149,10 +149,17 @@ here unchanged. What follows is only what K3 adds.
 
 ### Why K3 needs more than the M3 path
 
-K3 is hybrid, so vLLM builds **two** KV cache groups: MLA full attention and KDA
-recurrent state. A restored MLA prefix is correct only if the KDA state at the
-**same token boundary** is restored with it — half a restore is not a crash and
-not a log line, it is wrong output.
+K3 is hybrid, so vLLM splits the cache into two *kinds* of group — MLA full
+attention and KDA recurrent state. It does not build one group per kind. vLLM
+builds **equal-sized** groups, sized by the largest layer family, so K3's 29 MLA
+layers and 69 KDA layers come out as **four** groups: one attention group of 29
+and **three** mamba groups of 23 (measured: `groups=23,23,23`). All three mamba
+groups hold one logical state — one token boundary, one block id each — and none
+of them is restorable alone.
+
+A restored MLA prefix is correct only if the KDA state at the **same token
+boundary** is restored with it — half a restore is not a crash and not a log
+line, it is wrong output.
 
 The two groups therefore move by two different mechanisms:
 
@@ -187,7 +194,8 @@ are already there and are both **mandatory** for offload):
 export PYTHONHASHSEED=0              # mandatory, see Gotchas in the M3 recipe
 export LMCACHE_LOCAL_CPU=True
 export LMCACHE_MAX_LOCAL_CPU_SIZE=20 # GiB **per TP rank** -- TP8 x 20 = 160 GiB pinned
-export LMCACHE_CHUNK_SIZE=128        # must equal --block-size
+export LMCACHE_CHUNK_SIZE=1536       # multiple of the *effective* block size,
+                                     # which vLLM raises to 1536 -- see below
 export OFFLOAD_MIN_LOAD_TOKENS=256   # default 8192 disables the tier for chat-sized prompts
 
 vllm serve "${MODEL}" \
@@ -206,7 +214,14 @@ Three settings are K3-specific and each one is a hard failure if wrong:
   reports a load error deliberately whenever a recurrent state does not come
   back — that is the mechanism that keeps a half-restored prefix from being
   served — so under the default policy an ordinary eviction fails the request.
-- **`LMCACHE_CHUNK_SIZE` must be a multiple of the mamba block size.** Only
+- **`LMCACHE_CHUNK_SIZE` must be a multiple of the mamba block size, which is
+  not the `--block-size` you passed.** vLLM raises the attention block size so
+  the attention page is at least as large as the mamba page, logging `Setting
+  attention block size to 1536 tokens to ensure that attention page size is >=
+  mamba page size` (`vllm/platforms/interface.py`). `--block-size 128` does not
+  prevent this: it only fixes the *requested* size, and the hybrid alignment
+  step overrides it afterwards. On K3 the effective size is **1536**, so read it
+  out of the log rather than assuming the flag won. Only
   chunk-aligned boundaries are stored and only chunk-aligned boundaries are
   probed on lookup, so a chunk that ends between two boundaries can never
   produce a usable pair. The connector validates this at construction and names
@@ -222,8 +237,16 @@ boot. The connector declares it; the check below confirms HMA stayed on.
 On top of the four checks in the M3 recipe:
 
 ```bash
-# the recurrent leg found its group (one line per worker AND the EngineCore)
-grep "ATOM LMCache offload: recurrent state leg on group" server.log
+# the recurrent leg found its groups. These are TWO different lines from two
+# different processes, and each one alone leaves the other side unchecked:
+# the EngineCore prints the scheduler-side line, every worker prints its own.
+grep "ATOM LMCache offload: recurrent state leg on group" server.log  # EngineCore
+grep "ATOM LMCache offload: recurrent state tier up"      server.log  # 1 per worker
+
+# the dense leg strides by blocks, not tokens. `leading dim` is 1536x num_blocks
+# on K3 because the MLA backend asks for a kernel block size of 1; the two being
+# equal here would mean the codec is striding per token.
+grep "ATOM LMCache offload: registered" server.log  # 1 per worker
 
 # HMA must NOT have been turned off -- this line means the connector was not
 # recognised as SupportsHMA and the recurrent leg is not running
@@ -232,14 +255,51 @@ grep "Turning off hybrid kv cache manager" server.log   # expect no match
 
 ### Status
 
-The implementation and its unit coverage are in tree
-(`tests/test_vllm_kda_state_offload.py`). End-to-end validation on hardware —
-boot, two-pass accuracy against the 0.9507 / 0.9500 baseline above, and hit
-rate — has **not** been run yet; the numbers in this section are requirements,
-not measurements. When it is run, use the two-pass method: a single SAVE-only
-pass measures nothing, so salt the prefixes to defeat the GPU prefix cache, size
-the HBM pool below the working set to force read-back, and take the noise floor
-from the OFF arm's own two-pass delta.
+**Boot: validated** on 8xMI355 TP8 (2026-09-18). Three mamba groups on 0,1,2 and
+the attention group on 3, the hybrid memory allocator left on, and the
+deterministic smoke above answering 42. Measured geometry, for comparison
+against a future boot:
+
+```text
+Setting attention block size to 1536 tokens ...   # effective block size, not 128
+Available KV cache memory: 37.85 GiB              # per rank
+GPU KV cache size: 1,887,436 tokens, Maximum concurrency ... 28.80x
+registered 29 layers, num_blocks=1584 (leading dim 2433024, block_size=1536)
+recurrent state leg on group(s) 0,1,2 (mamba_block=1536, hash_block=1536, chunk=1536)
+recurrent state tier up, 69 layers, entry=58.22 MiB, ... groups=23,23,23
+bytes_per_block=25657344 chunk=1536
+```
+
+Two numbers there are worth checking rather than skimming, because both fail
+silently if they are wrong:
+
+- `bytes_per_block` must be `block_size x bytes_per_token`, here
+  `1536 x 16,704 = 25,657,344`. It is what the codec charges for one block-table
+  entry. If it comes back as the per-token figure instead, every entry is being
+  read as one token and the restored bytes come from the wrong rows — no error,
+  no log, just wrong output.
+- `leading dim` is `1536 x num_blocks`, not `num_blocks`. The MLA backend asks
+  vLLM for a kernel block size of 1, so the cache is allocated one row per token
+  while the block ids a connector receives stay manager ids. The two being equal
+  would mean this model is not on the kernel-block path and the check above is
+  the one that matters.
+
+**Accuracy and hit rate: not yet run.** The numbers earlier in this section are
+requirements, not measurements. When they are run, use the two-pass method: a
+single SAVE-only pass measures nothing, so salt the prefixes to defeat the GPU
+prefix cache, size the HBM pool below the working set to force read-back, and
+take the noise floor from the OFF arm's own two-pass delta.
+
+Size both ends before spending GPU time. Per rank K3 costs **56,448 B/token** —
+`29 x 576 = 16,704` for attention plus `58.22 MiB / 1536 = 39,744` for the
+recurrent boundary state, so the recurrent leg is 2.4x the attention leg and
+dominates the tier. A tier smaller than the HBM pool has nothing to do: at the
+defaults above the pool holds ~1.89M prefix tokens while `20 GiB` of tier holds
+`20 GiB / 56,448 = 371k`, five times less, and the plugin path only ever offers
+the connector the tail that missed in HBM. Shrink the pool with
+`--num-gpu-blocks-override` and raise `LMCACHE_MAX_LOCAL_CPU_SIZE` until the
+window `[HBM pool, tier)` is non-empty, and keep both identical across the two
+arms.
 
 ## Current scope
 

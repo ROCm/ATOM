@@ -30,6 +30,7 @@ from atom.plugin.vllm.kv_transfer.kda_state import (
     boundary_prefix_hash,
     build_layout_id,
     step_boundary_offloads,
+    summarize_layout_id,
     unwrap_kv_cache_spec,
 )
 from atom.plugin.vllm.kv_transfer.kv_cache_layout import (
@@ -826,3 +827,62 @@ def test_a_fold_that_does_not_divide_the_block_size_is_refused():
     # be right when the block size is odd -- the leading axis is something else.
     with pytest.raises(ValueError, match="does not divide the block size"):
         resolve_block_count(1584, 792, 1535)
+
+
+# --- the layout id a human reads vs the one the key folds in -----------------
+#
+# `build_layout_id` ends with one `shape:dtype` per layer: 69 identical entries
+# on K3, 1,877 characters on one line per worker. `summarize_layout_id` is for
+# the log only. It has to stay lossless, because its whole job is letting a
+# reader see that two boots' layouts differ -- a summary that could collapse a
+# real difference would read as "same layout" while the cache refuses to hit.
+
+
+def test_identical_layers_collapse_to_one_run():
+    layout = "vllm-kda|bs=1536|" + ";".join(["(1, 1, 884736):torch.int8"] * 69)
+    assert summarize_layout_id(layout) == (
+        "vllm-kda|bs=1536|69x(1, 1, 884736):torch.int8"
+    )
+
+
+def test_a_differing_layer_survives_the_collapse():
+    same = "(1, 1, 884736):torch.int8"
+    odd = "(1, 1, 884736):torch.float32"
+    a = summarize_layout_id("head|" + ";".join([same] * 69))
+    b = summarize_layout_id("head|" + ";".join([same] * 68 + [odd]))
+    assert a != b
+    assert b == f"head|68x{same};{odd}"
+
+
+def test_runs_keep_their_order():
+    a = "(1,):torch.int8"
+    b = "(2,):torch.int8"
+    # Same multiset, different order: the byte stream is the groups concatenated
+    # in order, so these are different layouts and must not summarize alike.
+    first = summarize_layout_id(f"head|{a};{a};{b}")
+    second = summarize_layout_id(f"head|{b};{a};{a}")
+    assert first == "head|2x(1,):torch.int8;(2,):torch.int8"
+    assert second == "head|(2,):torch.int8;2x(1,):torch.int8"
+    assert first != second
+
+
+def test_a_layout_id_with_no_tail_is_returned_unchanged():
+    assert summarize_layout_id("vllm-kda") == "vllm-kda"
+
+
+def test_the_summary_is_not_what_the_key_folds_in():
+    # If these ever became the same call, shortening the log would shorten the
+    # discriminator and two layouts could share a key -- silent wrong bytes, not
+    # a miss. Pin them apart.
+    class Spec:
+        mamba_type = "kda"
+        block_size = 1536
+        page_size_bytes = 884736
+        num_speculative_blocks = 0
+        tp_replicated = False
+
+    spec = Spec()
+    tensors = [[torch.zeros(4, 1, 1, 884736, dtype=torch.int8)] * 2]
+    full = build_layout_id([spec], tensors)
+    assert summarize_layout_id(full) != full
+    assert full.endswith("(1, 1, 884736):torch.int8;(1, 1, 884736):torch.int8")
