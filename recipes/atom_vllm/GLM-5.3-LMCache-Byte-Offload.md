@@ -246,15 +246,19 @@ prefix_cache_hits + external_prefix_cache_hits == prompt_tokens_cached
 Do **not** read the tool's `identical_text_pass2_vs_pass1` (1/8 on MXFP4, 4/8 on
 FP8) as a regression, and do not read the gap between the two arms as a quality
 difference. The reason is structural rather than statistical: a prefix-cache hit
-is not bit-reproducible against a cold run, so this field cannot measure quality
-in either direction, however many times it is sampled. What the field does under
-known-correct behaviour has been seen once — GLM-5.2's tier-*off* arm, where
-nothing was restored at all, scores 0/8 — but that is a different model, path and
-arm, so read it as a demonstration that 0/8 is compatible with correct output,
-not as a dispersion this run may be compared against. **No repeat of this field
-was measured on GLM-5.3**, so the 1/8-vs-4/8 gap is unexplained, not shown to be
-noise. Marker recall is the criterion, and it is 8/8 everywhere — measured here,
-on both arms.
+is not bit-reproducible against a cold run, so text that differs is expected
+whether or not anything is wrong, and no number of samples turns a low count --
+or a gap between two arms -- into a regression signal. The field is not
+symmetric and the claim here is only the one half the structure licenses: an
+*identical* pass would still be weak evidence that nothing broke; what the
+structure rules out is reading non-identical text as evidence that something
+did. What the field does under known-correct behaviour has been seen once —
+GLM-5.2's tier-*off* arm, where nothing was restored at all, scores 0/8 — but
+that is a different model, path and arm, so read it as a demonstration that 0/8
+is compatible with correct output, not as a dispersion this run may be compared
+against. **No repeat of this field was measured on GLM-5.3**, so the 1/8-vs-4/8
+gap is unexplained, not shown to be noise. Marker recall is the criterion, and
+it is 8/8 everywhere — measured here, on both arms.
 
 ### Throughput, measured on GLM-5.3
 
