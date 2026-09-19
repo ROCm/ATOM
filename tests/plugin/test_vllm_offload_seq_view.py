@@ -158,3 +158,142 @@ def test_preemption_forgets_the_frozen_placement_too():
 
     assert not hasattr(view, "_offload_finished_block_ids")
     assert not hasattr(view, "_offload_finished_cached_tokens")
+
+
+def test_view_takes_every_attribute_the_scheduler_the_plugin_builds_writes():
+    """The slot list has to track every scheduler module the plugin can reach.
+
+    `ChunkedOffloadSchedulerBase` is shared: the native path hands it an ATOM
+    `Sequence`, which has a `__dict__` and absorbs any attribute, while the
+    plugin path hands it this slotted view, which raises `AttributeError`. So a
+    commit that adds `seq.<something> = ...` to the shared scheduler is a
+    working change on one path and a crash on the other, with nothing in that
+    commit's own diff to suggest it.
+
+    That is not hypothetical: `offload_load_start_tokens` (#2154, P/D
+    disaggregation) was added to the shared scheduler with no slot here, which
+    made the *first successful tier load* on the plugin path raise -- the one
+    code path the feature exists for, so no boot or smoke test reaches it.
+
+    The scan walks from the class the plugin actually constructs, read out of
+    `connector.py` rather than named here, then over that class's whole MRO.
+    Scanning one hand-picked file instead would already be wrong today:
+    `_offload_common.OffloadSchedulerMixin._maybe_start_unaligned_handoff` is a
+    base of `ChunkedOffloadSchedulerBase` and writes two seq attributes from a
+    file `chunked_scheduler.py`'s own text never mentions -- both happen to be
+    slotted, so a file-scoped scan passes by luck, not by coverage. Deriving
+    both the class and its files makes the scan follow the wiring: add a dsv4
+    branch to `connector.py` and its five seq writes come into scope on their
+    own (three are unslotted today), with no edit here.
+
+    Remaining limitation, stated because it is load-bearing: the scan only sees
+    writes whose base name is literally `seq`. A method that binds the view to
+    some other local first would be missed, silently. Every such assignment in
+    the scanned modules uses `seq` today.
+    """
+    import ast
+    import importlib
+    import pathlib
+
+    from atom.plugin.vllm.kv_transfer.seq_view import SeqView
+
+    def _seq_writes(path: str) -> dict[str, int]:
+        found: dict[str, int] = {}
+        for node in ast.walk(ast.parse(pathlib.Path(path).read_text())):
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+                targets = [node.target]
+            else:
+                continue
+            for target in targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "seq"
+                ):
+                    found.setdefault(target.attr, node.lineno)
+        return found
+
+    # Which scheduler class does the plugin build? Read it off the source: the
+    # connector imports vllm at module scope, so it cannot be imported here,
+    # and hardcoding the name is exactly the assumption this test should not
+    # be making.
+    plugin_src = (
+        pathlib.Path(__file__)
+        .parents[2]
+        .joinpath("atom/plugin/vllm/kv_transfer/connector.py")
+    )
+    plugin_tree = ast.parse(plugin_src.read_text())
+    origin = {
+        alias.asname or alias.name: node.module
+        for node in ast.walk(plugin_tree)
+        if isinstance(node, ast.ImportFrom) and node.module
+        for alias in node.names
+    }
+    built: set[tuple[str, str]] = set()
+    for node in ast.walk(plugin_tree):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+            continue
+        if not isinstance(node.value.func, ast.Name):
+            continue
+        for target in node.targets:
+            if (
+                isinstance(target, ast.Attribute)
+                and target.attr == "_scheduler"
+                and node.value.func.id in origin
+            ):
+                built.add((origin[node.value.func.id], node.value.func.id))
+
+    assert built, (
+        f"found no `self._scheduler = <Imported>(...)` in {plugin_src} -- the "
+        "scan lost its entry point, so it is checking nothing"
+    )
+
+    written: dict[str, int] = {}
+    where: dict[str, str] = {}
+    scanned: set[str] = set()
+    for module_name, class_name in sorted(built):
+        cls = getattr(importlib.import_module(module_name), class_name)
+        for base in cls.__mro__:
+            source = getattr(importlib.import_module(base.__module__), "__file__", None)
+            if not source or "/atom/" not in source:
+                continue
+            scanned.add(pathlib.Path(source).name)
+            for name, line in _seq_writes(source).items():
+                written.setdefault(name, line)
+                where.setdefault(name, f"{pathlib.Path(source).name}:{line}")
+
+    # Guard the scope derivation, which is the part that can fail as a whole:
+    # rewire the connector through a factory or a conditional and the parse
+    # above finds no class, so the file set collapses to nothing and every
+    # assertion below passes vacuously. Name a file we know writes on a seq
+    # rather than only checking the set is non-empty -- the MRO always
+    # contributes the scheduler's own module, so non-empty is nearly free.
+    assert scanned, "scope derivation produced no files to scan"
+    assert "chunked_scheduler.py" in scanned, (
+        "scope derivation lost the known writer; scanned "
+        f"{sorted(scanned)} -- fix the derivation, not this assertion"
+    )
+
+    # Guard the scanner itself: if a refactor renames the loop variable, the
+    # scan silently finds nothing and this test passes while checking nothing.
+    assert "offload_loaded_tokens" in written, (
+        f"found no seq attribute writes across {sorted(built)} -- the scan is "
+        "broken, not the scheduler"
+    )
+
+    takeable = set(SeqView.__slots__) | {
+        name
+        for name in dir(SeqView)
+        if isinstance(getattr(SeqView, name, None), property)
+        and getattr(SeqView, name).fset is not None
+    }
+    missing = {name: where[name] for name in written if name not in takeable}
+
+    assert not missing, (
+        "the scheduler the plugin builds assigns these on a seq, which SeqView "
+        f"cannot hold: {missing} (name -> file:line). Add each to "
+        "SeqView.__slots__; do not delete the assignment -- the native path "
+        "reads it back."
+    )
