@@ -863,14 +863,11 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         config = _get_text_config(atom_config.hf_config)
         self.config = config
         quant_config = atom_config.quant_config
-        self.nvfp4_load_only = (
-            not quant_config.online_quant
-            and any(
-                spec.quant_dtype == NVFP4_DTYPE
-                for spec in (
-                    quant_config.global_quant_config,
-                    *(spec for _, spec in quant_config.layer_pattern_specs),
-                )
+        self.nvfp4_load_only = not quant_config.online_quant and any(
+            spec.quant_dtype == NVFP4_DTYPE
+            for spec in (
+                quant_config.global_quant_config,
+                *(spec for _, spec in quant_config.layer_pattern_specs),
             )
         )
         self.model = MiniMaxM3Model(
@@ -919,7 +916,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         **_: object,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
+    ) -> torch.Tensor | IntermediateTensors:
         if self.nvfp4_load_only:
             raise RuntimeError(
                 "MiniMax-M3 NVFP4 checkpoint weights loaded successfully, but "
@@ -928,7 +925,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             )
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
-    def compute_logits(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.lm_head(hidden_states)
 
     def make_empty_intermediate_tensors(

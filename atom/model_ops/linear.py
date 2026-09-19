@@ -542,13 +542,12 @@ class LinearBase(nn.Module):
                 divide(s, self.tp_size) for s in self.output_partition_sizes
             ]
 
-        if is_nvfp4:
-            if self.input_size % NVFP4_GROUP_SIZE != 0:
-                raise ValueError(
-                    f"{prefix}: NVFP4 input size per TP partition "
-                    f"({self.input_size}) must be divisible by "
-                    f"group_size={NVFP4_GROUP_SIZE}."
-                )
+        if is_nvfp4 and self.input_size % NVFP4_GROUP_SIZE != 0:
+            raise ValueError(
+                f"{prefix}: NVFP4 input size per TP partition "
+                f"({self.input_size}) must be divisible by "
+                f"group_size={NVFP4_GROUP_SIZE}."
+            )
 
         # Stream eligible source weights through meta storage.
         self._stream_online_quant = self.source_quant_dtype is None and (
@@ -569,8 +568,7 @@ class LinearBase(nn.Module):
             weight_dtype = torch.uint8 if is_nvfp4 else params_dtype
             weight_size = (
                 (self.output_size, self.input_size)
-                if params_dtype
-                not in (dtypes.fp4x2, dtypes.i4x2, NVFP4_DTYPE)
+                if params_dtype not in (dtypes.fp4x2, dtypes.i4x2, NVFP4_DTYPE)
                 else (self.output_size, self.input_size // 2)
             )
             self.weight = atom_parameter(
@@ -2398,7 +2396,7 @@ class MergedReplicatedLinear(ReplicatedLinear):
         self,
         param: nn.Parameter,
         loaded_weight: torch.Tensor,
-        loaded_shard_id: Optional[int] = None,
+        loaded_shard_id: int | None = None,
     ):  # ？
         if self._is_nvfp4_global_scale_param(param):
             self._load_nvfp4_global_scale(param, loaded_weight, loaded_shard_id)

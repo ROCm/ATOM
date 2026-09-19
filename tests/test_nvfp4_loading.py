@@ -22,7 +22,7 @@ from atom.models.minimax_m3 import (
     _sparse_attention_layer_ids,
     make_minimax_m3_expert_params_mapping,
 )
-from atom.quant_spec import LayerQuantConfig, NVFP4_DTYPE
+from atom.quant_spec import NVFP4_DTYPE, LayerQuantConfig
 from atom.quantization.quark.utils import dequantize_nvfp4
 
 
@@ -95,9 +95,7 @@ def test_nvfp4_merged_linear_loads_all_checkpoint_tensors(monkeypatch):
 
     for shard_id, value in enumerate((3.0, 4.0)):
         layer.weight_loader(layer.weight_scale_2, torch.tensor(value), shard_id)
-        layer.weight_loader(
-            layer.input_scale_2, torch.tensor(value + 2.0), shard_id
-        )
+        layer.weight_loader(layer.input_scale_2, torch.tensor(value + 2.0), shard_id)
     layer.process_weights_after_loading()
 
     assert layer.weight_scale_2.tolist() == [3.0, 4.0]
@@ -107,6 +105,7 @@ def test_nvfp4_merged_linear_loads_all_checkpoint_tensors(monkeypatch):
 
 
 def test_nvfp4_merged_linear_online_converts_to_mxfp4(monkeypatch):
+    monkeypatch.setenv("ATOM_ONLINE_QUANT_STREAMING", "0")
     tp_group = SimpleNamespace(rank_in_group=0, world_size=1)
     monkeypatch.setattr(linear_mod, "get_tp_group", lambda: tp_group)
     monkeypatch.setattr(
@@ -281,9 +280,9 @@ def test_nvfp4_moe_online_conversion_uses_each_projection_global_scale(
     def fake_mxfp4_quant(weight):
         converted.append(weight.clone())
         return (
-            torch.zeros(
-                weight.shape[0], weight.shape[1] // 2, dtype=torch.uint8
-            ).view(dtypes.fp4x2),
+            torch.zeros(weight.shape[0], weight.shape[1] // 2, dtype=torch.uint8).view(
+                dtypes.fp4x2
+            ),
             torch.full(
                 (weight.shape[0], weight.shape[1] // 32),
                 127,
@@ -319,23 +318,17 @@ def test_nvfp4_moe_online_conversion_uses_each_projection_global_scale(
             requires_grad=False,
         ),
         w13_weight_scale=nn.Parameter(
-            torch.full(
-                (1, 64, 4), 2.0, dtype=torch.float8_e4m3fn
-            ),
+            torch.full((1, 64, 4), 2.0, dtype=torch.float8_e4m3fn),
             requires_grad=False,
         ),
         w2_weight_scale=nn.Parameter(
-            torch.full(
-                (1, 64, 2), 2.0, dtype=torch.float8_e4m3fn
-            ),
+            torch.full((1, 64, 2), 2.0, dtype=torch.float8_e4m3fn),
             requires_grad=False,
         ),
         w13_weight_scale_2=nn.Parameter(
             torch.tensor([[0.5, 1.0]]), requires_grad=False
         ),
-        w2_weight_scale_2=nn.Parameter(
-            torch.tensor([1.5]), requires_grad=False
-        ),
+        w2_weight_scale_2=nn.Parameter(torch.tensor([1.5]), requires_grad=False),
         w13_input_scale_2=nn.Parameter(torch.ones(1, 2), requires_grad=False),
         w2_input_scale_2=nn.Parameter(torch.ones(1), requires_grad=False),
         _copy_quant_storage=FusedMoE._copy_quant_storage,
@@ -359,9 +352,7 @@ def test_nvfp4_moe_online_conversion_uses_each_projection_global_scale(
     ("hidden_size", "intermediate_size"),
     [(66, 32), (64, 34)],
 )
-def test_nvfp4_moe_rejects_non_group_aligned_dimensions(
-    hidden_size, intermediate_size
-):
+def test_nvfp4_moe_rejects_non_group_aligned_dimensions(hidden_size, intermediate_size):
     layer = nn.Module()
     layer.has_bias = False
     method = Nvfp4MoEMethod(_nvfp4_spec(), SimpleNamespace())

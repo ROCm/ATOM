@@ -12,7 +12,7 @@ from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
 from aiter.ops.triton.unified_attention import unified_attention
 from torch import nn
 
-from atom.config import get_current_atom_config
+from atom.config import _is_minimax_m3_config, get_current_atom_config
 from atom.model_ops.base_attention import (
     PA_ASM_MAX_QUERY_GROUP_SIZE,
     cp_mha_gather_cache,
@@ -1008,7 +1008,15 @@ class PagedAttentionImpl(nn.Module):
         # Only run_pa_fwd_asm is bounded here. The persistent paths above call
         # pa_persistent_fwd / pa_decode_bf16_asm, different kernels with their
         # own tables, so this envelope does not describe them.
-        if over_asm:
+        # MiniMax-M3's three dense layers share the sparse stack's physical
+        # 128-token KV pages. AITER's PA ASM tables have no block-128 entry and
+        # abort in get_heuristic_kernel instead of reporting an unsupported
+        # shape. The Gluon path reads this layout and is already the fallback
+        # for wider M3 query groups.
+        m3_block_128 = atom_config.kv_cache_block_size == 128 and _is_minimax_m3_config(
+            atom_config.hf_config
+        )
+        if over_asm or m3_block_128:
             return self.paged_attention_triton
         return self.paged_attention_asm
 

@@ -3974,9 +3974,7 @@ class FusedMoE(torch.nn.Module):
         old_w2_data = self.w2_weight.data
         old_w13_scale = self.w13_weight_scale.data if need_dequant else None
         old_w2_scale = self.w2_weight_scale.data if need_dequant else None
-        old_w13_scale_2 = (
-            self.w13_weight_scale_2.data if source_is_nvfp4 else None
-        )
+        old_w13_scale_2 = self.w13_weight_scale_2.data if source_is_nvfp4 else None
         old_w2_scale_2 = self.w2_weight_scale_2.data if source_is_nvfp4 else None
         device = old_w13_data.device
 
@@ -4044,20 +4042,12 @@ class FusedMoE(torch.nn.Module):
                 w1_bf16 = _dequant_func(
                     w13_local[:w1_size],
                     w13_scale[:s1_size],
-                    (
-                        old_w13_scale_2[expert_id, 0]
-                        if source_is_nvfp4
-                        else None
-                    ),
+                    (old_w13_scale_2[expert_id, 0] if source_is_nvfp4 else None),
                 )
                 w3_bf16 = _dequant_func(
                     w13_local[w1_size:],
                     w13_scale[s1_size:],
-                    (
-                        old_w13_scale_2[expert_id, 1]
-                        if source_is_nvfp4
-                        else None
-                    ),
+                    (old_w13_scale_2[expert_id, 1] if source_is_nvfp4 else None),
                 )
             else:
                 w1_bf16 = w13_local[:w1_size]
@@ -4073,12 +4063,8 @@ class FusedMoE(torch.nn.Module):
                         f"{w1_bf16.shape[1]}."
                     )
                 if hidden_pad:
-                    w1_bf16 = torch.nn.functional.pad(
-                        w1_bf16, (0, hidden_pad)
-                    )
-                    w3_bf16 = torch.nn.functional.pad(
-                        w3_bf16, (0, hidden_pad)
-                    )
+                    w1_bf16 = torch.nn.functional.pad(w1_bf16, (0, hidden_pad))
+                    w3_bf16 = torch.nn.functional.pad(w3_bf16, (0, hidden_pad))
             w1_q, w1_s = _quant_weight(w1_bf16)
             w3_q, w3_s = _quant_weight(w3_bf16)
             del w1_bf16, w3_bf16
@@ -4173,9 +4159,7 @@ class FusedMoE(torch.nn.Module):
                         1, self.tp_rank * local_s_cols, local_s_cols
                     ).contiguous()
                 self._copy_quant_storage(
-                    self.w2_weight.data[
-                        expert_id, : w2_q.shape[0], : w2_q.shape[1]
-                    ],
+                    self.w2_weight.data[expert_id, : w2_q.shape[0], : w2_q.shape[1]],
                     w2_q,
                 )
                 self._copy_quant_storage(
@@ -4195,9 +4179,7 @@ class FusedMoE(torch.nn.Module):
                 )
                 # per_Token scale is along output dim (not TP-split), never needs shard
                 w2_scale_load_full = (
-                    False
-                    if online_quant_type == QuantType.per_Token
-                    else load_full_w2
+                    False if online_quant_type == QuantType.per_Token else load_full_w2
                 )
                 self._load_quant_weight_scale(
                     expert_data=self.w2_weight_scale.data[expert_id],

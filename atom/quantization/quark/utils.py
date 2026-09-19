@@ -187,9 +187,7 @@ def dequantize_nvfp4(
     scale = weight_scale.to(torch.float32)
     if weight_scale_2 is not None:
         try:
-            scale = scale * weight_scale_2.to(
-                device=weight.device, dtype=torch.float32
-            )
+            scale = scale * weight_scale_2.to(device=weight.device, dtype=torch.float32)
         except RuntimeError as exc:
             raise ValueError(
                 "NVFP4 global scale is not broadcastable to block scales: "
@@ -213,9 +211,7 @@ def quant_mxfp4_dynamic(
             f"Dynamic MXFP4 quantization expects a 2D weight, got {weight.shape}."
         )
     if weight.shape[1] % 32 != 0:
-        raise ValueError(
-            f"MXFP4 logical K={weight.shape[1]} must be divisible by 32."
-        )
+        raise ValueError(f"MXFP4 logical K={weight.shape[1]} must be divisible by 32.")
 
     from aiter import dtypes
     from aiter.ops.triton.quant import (  # pyright: ignore[reportMissingImports]
