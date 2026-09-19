@@ -438,7 +438,7 @@ class QuantizationConfig:
         return self.global_spec.quant_type
 
     @property
-    def quant_dtype(self) -> torch.dtype:
+    def quant_dtype(self) -> Any:
         return self.global_spec.quant_dtype
 
     @property
@@ -843,16 +843,84 @@ def _is_minimax_m3_config(hf_config: PretrainedConfig) -> bool:
     return False
 
 
+def _resolve_minimax_m3_sparse_attention_config(
+    hf_config: PretrainedConfig,
+) -> dict:
+    """Return MiniMax-M3's sparse config across both checkpoint schemas.
+
+    The remote MiniMax config keeps these fields in ``sparse_attention_config``.
+    Transformers' built-in ``MiniMaxM3VLTextConfig`` instead consumes that
+    mapping and exposes only flat ``index_*`` fields. ATOM supports both config
+    classes, so every sparse-attention consumer must see the same normalized
+    answer rather than depending on which class loaded the checkpoint.
+    """
+    text_config = getattr(hf_config, "text_config", None)
+    if text_config is None:
+        text_config = hf_config
+    sparse_cfg = dict(getattr(text_config, "sparse_attention_config", None) or {})
+
+    aliases = {
+        "sparse_num_index_heads": "index_n_heads",
+        "sparse_index_dim": "index_head_dim",
+        "sparse_block_size": "index_block_size",
+        "sparse_topk_blocks": "index_topk_blocks",
+        "sparse_local_block": "index_local_blocks",
+    }
+    recovered = False
+    for sparse_name, flat_name in aliases.items():
+        flat_value = getattr(text_config, flat_name, None)
+        if sparse_name not in sparse_cfg and flat_value is not None:
+            sparse_cfg[sparse_name] = flat_value
+            recovered = True
+
+    layer_types = getattr(text_config, "layer_types", None)
+    if layer_types is not None and "sparse_attention_freq" not in sparse_cfg:
+        sparse_attention_freq = [
+            int(layer_type == "minimax_m3_sparse") for layer_type in layer_types
+        ]
+        if any(sparse_attention_freq):
+            sparse_cfg["sparse_attention_freq"] = sparse_attention_freq
+            recovered = True
+
+    if not sparse_cfg and not recovered:
+        return {}
+
+    sparse_cfg.setdefault("use_sparse_attention", True)
+    sparse_cfg.setdefault("sparse_init_block", 0)
+    sparse_cfg.setdefault("sparse_score_type", "max")
+    return sparse_cfg
+
+
+def _resolve_minimax_m3_kv_cache_block_size(
+    hf_config: PretrainedConfig,
+    scheduler_block_size: int,
+) -> int:
+    """Return a scheduler page compatible with MiniMax-M3's sparse kernels."""
+    if not _is_minimax_m3_config(hf_config):
+        return scheduler_block_size
+    sparse_cfg = _resolve_minimax_m3_sparse_attention_config(hf_config)
+    sparse_block_size = int(sparse_cfg.get("sparse_block_size", 0) or 0)
+    if not sparse_block_size or scheduler_block_size % sparse_block_size == 0:
+        return scheduler_block_size
+    return sparse_block_size
+
+
 def _normalize_minimax_m3_text_config(hf_config: PretrainedConfig) -> None:
     if not _is_minimax_m3_config(hf_config):
         return
     text_config = getattr(hf_config, "text_config", None)
-    if text_config is None or text_config is hf_config:
-        return
+    if text_config is None:
+        text_config = hf_config
 
-    if getattr(text_config, "hidden_act", None) == "swigluoai":
-        if getattr(text_config, "swiglu_beta", None) is None:
-            text_config.swiglu_beta = 1.0
+    sparse_cfg = _resolve_minimax_m3_sparse_attention_config(hf_config)
+    if sparse_cfg:
+        text_config.sparse_attention_config = sparse_cfg
+
+    if (
+        getattr(text_config, "hidden_act", None) == "swigluoai"
+        and getattr(text_config, "swiglu_beta", None) is None
+    ):
+        text_config.swiglu_beta = 1.0
 
     for attr_name in (
         "use_index_cache",
@@ -863,6 +931,9 @@ def _normalize_minimax_m3_text_config(hf_config: PretrainedConfig) -> None:
         attr_value = getattr(hf_config, attr_name, None)
         if attr_value is not None:
             setattr(text_config, attr_name, attr_value)
+
+    if text_config is hf_config:
+        return
 
     for attr_name, attr_value in vars(text_config).items():
         if attr_name.startswith("_") or getattr(hf_config, attr_name, None) is not None:
@@ -2064,6 +2135,18 @@ class Config:
             self.hf_config.update(self.hf_overrides)
             logger.info("Applied HF config overrides: %s", self.hf_overrides)
         _normalize_minimax_m3_text_config(self.hf_config)
+        resolved_block_size = _resolve_minimax_m3_kv_cache_block_size(
+            self.hf_config, self.kv_cache_block_size
+        )
+        if resolved_block_size != self.kv_cache_block_size:
+            logger.warning(
+                "MiniMax-M3 sparse attention requires --block-size to be a "
+                "multiple of %d; adjusting %d to %d.",
+                resolved_block_size,
+                self.kv_cache_block_size,
+                resolved_block_size,
+            )
+            self.kv_cache_block_size = resolved_block_size
         # Multimodal config (full config with vision_config) for vision encoder init
         self.multimodal_config = getattr(self.hf_config, "_multimodal_config", None)
         _normalize_moe_config_fields(self.hf_config, self.model)

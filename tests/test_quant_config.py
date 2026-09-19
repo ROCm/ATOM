@@ -156,6 +156,7 @@ _m = _load_module("config.py", "_atom_config_test")
 
 QuantizationConfig = _m.QuantizationConfig
 LayerQuantConfig = _qs.LayerQuantConfig
+NVFP4_DTYPE = _qs.NVFP4_DTYPE
 QuarkParser = _qs.QuarkParser
 QuarkOnlineParser = _qs.QuarkOnlineParser
 GenericParser = _qs.GenericParser
@@ -185,6 +186,13 @@ class TestLayerQuantConfig:
     def test_is_quantized(self):
         spec = LayerQuantConfig(quant_type=QuantType.per_Token, quant_dtype=FP8)
         assert spec.is_quantized is True
+
+    def test_nvfp4_dtype_is_explicit(self):
+        spec = LayerQuantConfig(
+            quant_type=QuantType.per_1x32,
+            quant_dtype=NVFP4_DTYPE,
+        )
+        assert spec.quant_dtype == "nvfp4"
 
     def test_frozen(self):
         spec = LayerQuantConfig()
@@ -267,6 +275,148 @@ class TestQuarkParser:
         assert result.global_spec.quant_type == QuantType.per_1x32
         assert result.global_spec.quant_dtype == FP4X2
         assert result.global_spec.is_dynamic is False
+
+    def test_two_stage_nvfp4(self):
+        parser = QuarkParser()
+        result = parser.parse(
+            {
+                "quant_method": "quark",
+                "global_quant_config": {
+                    "weight": [
+                        {
+                            "qscheme": "per_group",
+                            "dtype": "fp4",
+                            "group_size": 16,
+                            "is_dynamic": False,
+                            "is_scale_quant": False,
+                        },
+                        {
+                            "qscheme": "per_tensor",
+                            "dtype": "fp8_e4m3",
+                            "is_dynamic": False,
+                            "is_scale_quant": True,
+                        },
+                    ],
+                    "input_tensors": [
+                        {
+                            "qscheme": "per_group",
+                            "dtype": "fp4",
+                            "group_size": 16,
+                            "is_dynamic": True,
+                            "is_scale_quant": False,
+                        },
+                        {
+                            "qscheme": "per_tensor",
+                            "dtype": "fp8_e4m3",
+                            "is_dynamic": False,
+                            "is_scale_quant": True,
+                        },
+                    ],
+                },
+            }
+        )
+        spec = result.global_spec
+        assert spec.quant_type == QuantType.per_1x32
+        assert spec.quant_dtype == NVFP4_DTYPE
+        assert spec.is_dynamic is True
+
+    @pytest.mark.parametrize(
+        ("section", "stage", "field", "invalid_value"),
+        [
+            ("weight", 0, "is_dynamic", True),
+            ("input_tensors", 0, "is_dynamic", False),
+            ("input_tensors", 0, "group_size", 32),
+            ("weight", 1, "is_dynamic", True),
+            ("input_tensors", 1, "is_dynamic", True),
+        ],
+    )
+    def test_two_stage_nvfp4_rejects_mismatched_stage(
+        self, section, stage, field, invalid_value
+    ):
+        layer_config = {
+            "weight": [
+                {
+                    "qscheme": "per_group",
+                    "dtype": "fp4",
+                    "group_size": 16,
+                    "is_dynamic": False,
+                },
+                {
+                    "qscheme": "per_tensor",
+                    "dtype": "fp8_e4m3",
+                    "is_dynamic": False,
+                },
+            ],
+            "input_tensors": [
+                {
+                    "qscheme": "per_group",
+                    "dtype": "fp4",
+                    "group_size": 16,
+                    "is_dynamic": True,
+                },
+                {
+                    "qscheme": "per_tensor",
+                    "dtype": "fp8_e4m3",
+                    "is_dynamic": False,
+                },
+            ],
+        }
+        layer_config[section][stage][field] = invalid_value
+
+        with pytest.raises(ValueError, match="recognizes only NVFP4"):
+            QuarkParser().parse(
+                {
+                    "quant_method": "quark",
+                    "global_quant_config": layer_config,
+                }
+            )
+
+    def test_two_stage_nvfp4_requires_matching_input_stages(self):
+        with pytest.raises(ValueError, match="both `weight` and `input_tensors`"):
+            QuarkParser().parse(
+                {
+                    "quant_method": "quark",
+                    "global_quant_config": {
+                        "weight": [
+                            {
+                                "qscheme": "per_group",
+                                "dtype": "fp4",
+                                "group_size": 16,
+                                "is_dynamic": False,
+                            },
+                            {
+                                "qscheme": "per_tensor",
+                                "dtype": "fp8_e4m3",
+                                "is_dynamic": False,
+                            },
+                        ],
+                        "input_tensors": {"is_dynamic": True},
+                    },
+                }
+            )
+
+    def test_unknown_sequential_quark_format_is_rejected(self):
+        parser = QuarkParser()
+        with pytest.raises(ValueError, match="recognizes only NVFP4"):
+            parser.parse(
+                {
+                    "quant_method": "quark",
+                    "global_quant_config": {
+                        "weight": [
+                            {
+                                "qscheme": "per_group",
+                                "dtype": "fp4",
+                                "group_size": 32,
+                            },
+                            {
+                                "qscheme": "per_tensor",
+                                "dtype": "fp8_e4m3",
+                                "is_scale_quant": True,
+                            },
+                        ]
+                    },
+                }
+            )
 
     def test_no_input_tensors_defaults_dynamic(self):
         parser = QuarkParser()

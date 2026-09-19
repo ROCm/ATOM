@@ -250,15 +250,27 @@ class _Layer:
             setattr(self, name, name)
 
 
-def _route(monkeypatch, max_qlen, block_size=128, unified=False, force=False, **kw):
+def _route(
+    monkeypatch,
+    max_qlen,
+    block_size=128,
+    unified=False,
+    force=False,
+    minimax=False,
+    **kw,
+):
     from atom.model_ops import attention_mha as mha
 
     monkeypatch.setattr(mha.envs, "ATOM_USE_UNIFIED_ATTN", unified)
     monkeypatch.setattr(mha.envs, "ATOM_FORCE_ATTN_TRITON", force)
+    architectures = ["MiniMaxM3SparseForCausalLM"] if minimax else ["OtherModel"]
     monkeypatch.setattr(
         mha,
         "get_current_atom_config",
-        lambda: SimpleNamespace(kv_cache_block_size=block_size),
+        lambda: SimpleNamespace(
+            kv_cache_block_size=block_size,
+            hf_config=SimpleNamespace(architectures=architectures),
+        ),
     )
     return mha.PagedAttentionImpl._dispatch_decode(_Layer(**kw), max_qlen)
 
@@ -268,10 +280,14 @@ class TestDecodeRouting:
 
     def test_m3_dense_production_shape_stays_on_gluon(self, monkeypatch):
         """TP4, 3 draft tokens. The shape this change is measured on."""
-        assert _route(monkeypatch, 4) == "paged_attention_triton"
+        assert _route(monkeypatch, 4, minimax=True) == "paged_attention_triton"
 
     def test_no_drafting_still_reaches_asm(self, monkeypatch):
         assert _route(monkeypatch, 1) == "paged_attention_asm"
+
+    def test_m3_block_128_without_drafting_uses_gluon(self, monkeypatch):
+        """AITER's PA ASM tables have no block-128 kernel to dispatch."""
+        assert _route(monkeypatch, 1, minimax=True) == "paged_attention_triton"
 
     def test_past_gluon_falls_back_to_unified(self, monkeypatch):
         assert _route(monkeypatch, 5) == "paged_attention_unified"

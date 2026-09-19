@@ -11,7 +11,10 @@ import triton
 import triton.language as tl
 from aiter.dist.parallel_state import get_tp_group
 
-from atom.config import _is_minimax_m3_config
+from atom.config import (
+    _is_minimax_m3_config,
+    _resolve_minimax_m3_sparse_attention_config,
+)
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
 from atom.utils import CpuGpuBuffer, envs, pack_rows, upload_numpy
@@ -162,8 +165,7 @@ class AiterBackend(AttentionBackend):
             # `unified_attention`'s block table needs no conversion.
             return scheduler_block_size
         # MiniMax-M3's sparse kernels index the block its config names.
-        text_config = getattr(hf_config, "text_config", hf_config)
-        sparse_cfg = getattr(text_config, "sparse_attention_config", None)
+        sparse_cfg = _resolve_minimax_m3_sparse_attention_config(hf_config)
         sparse_block_size = sparse_cfg.get("sparse_block_size") if sparse_cfg else None
         if sparse_block_size and _is_minimax_m3_config(hf_config):
             return sparse_block_size
@@ -208,11 +210,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         model_runner=None,
     ):
         hf_config = model_runner.config.hf_config
-        text_config = getattr(hf_config, "text_config", hf_config)
-        sparse_cfg = getattr(text_config, "sparse_attention_config", None)
+        sparse_cfg = _resolve_minimax_m3_sparse_attention_config(hf_config)
         self._has_sparse_attention = bool(sparse_cfg) and _is_minimax_m3_config(
             hf_config
         )
+        self._sparse_attention_config = sparse_cfg if self._has_sparse_attention else {}
         # The backend's own, from the one rule `make_kv_pool` also reads, so a
         # draft resolving here gets it from its own config the same way.
         # `CommonAttentionBuilder` holds it to dividing the scheduler's.
@@ -572,9 +574,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         if not self._has_sparse_attention:
             return None
         runner = self.model_runner
-        hf_config = runner.config.hf_config
-        text_config = getattr(hf_config, "text_config", hf_config)
-        sparse_cfg = text_config.sparse_attention_config
+        sparse_cfg = self._sparse_attention_config
         return _IndexCacheSpec(
             # The walk, like every other count here. The config's
             # `sparse_attention_freq` says how many layers the *model* has an

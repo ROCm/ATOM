@@ -33,12 +33,16 @@ from atom.model_ops.utils import (
     shuffle_weights,
 )
 from atom.quant_spec import (
+    NVFP4_DTYPE,
+    NVFP4_GROUP_SIZE,
     LayerQuantConfig,
     should_skip_online_quant,
     should_stream_online_quant,
 )
 from atom.quantization.quark.utils import (
     dequant_weight_online,
+    dequantize_nvfp4,
+    quant_mxfp4_dynamic,
     quant_weight_online,
 )
 from atom.utils import envs
@@ -504,6 +508,7 @@ class LinearBase(nn.Module):
         params_dtype = layer_quant_config.quant_dtype
         self.source_quant_dtype = source_quant_dtype
         self.layer_quant_config = layer_quant_config
+        is_nvfp4 = params_dtype == NVFP4_DTYPE
         self.quant_config = quant_config
         super().__init__()
         self.reduce_results = reduce_results
@@ -537,6 +542,13 @@ class LinearBase(nn.Module):
                 divide(s, self.tp_size) for s in self.output_partition_sizes
             ]
 
+        if is_nvfp4 and self.input_size % NVFP4_GROUP_SIZE != 0:
+            raise ValueError(
+                f"{prefix}: NVFP4 input size per TP partition "
+                f"({self.input_size}) must be divisible by "
+                f"group_size={NVFP4_GROUP_SIZE}."
+            )
+
         # Stream eligible source weights through meta storage.
         self._stream_online_quant = self.source_quant_dtype is None and (
             should_stream_online_quant(quant_config, prefix, quant_type, params_dtype)
@@ -553,13 +565,14 @@ class LinearBase(nn.Module):
                 )
             )
         else:
+            weight_dtype = torch.uint8 if is_nvfp4 else params_dtype
             weight_size = (
                 (self.output_size, self.input_size)
-                if params_dtype not in [dtypes.fp4x2, dtypes.i4x2]
+                if params_dtype not in (dtypes.fp4x2, dtypes.i4x2, NVFP4_DTYPE)
                 else (self.output_size, self.input_size // 2)
             )
             self.weight = atom_parameter(
-                torch.empty(weight_size, dtype=params_dtype, device=param_device)
+                torch.empty(weight_size, dtype=weight_dtype, device=param_device)
             )
         if bias:
             output_type = get_current_atom_config().torch_dtype
@@ -573,7 +586,40 @@ class LinearBase(nn.Module):
         self.params_dtype = params_dtype
 
         if quant_type != QuantType.No and self.source_quant_dtype is None:
-            if quant_type == QuantType.per_Tensor:
+            if is_nvfp4:
+                # Quark NVFP4 wire format:
+                #   weight          U8-packed FP4 E2M1, two values per byte
+                #   weight_scale    FP8 E4M3, one scale per 16 logical values
+                #   weight_scale_2  F32 global weight scale per source projection
+                #   input_scale_2   F32 global input scale per source projection
+                #
+                # Merged linears retain one scalar per source projection so no
+                # information is lost before the NVFP4 -> MXFP4 online
+                # conversion pass.
+                self.weight_scale = atom_parameter(
+                    torch.empty(
+                        self.output_size,
+                        self.input_size // NVFP4_GROUP_SIZE,
+                        dtype=torch.float8_e4m3fn,
+                        device=param_device,
+                    )
+                )
+                global_scale_count = len(self.output_partition_sizes)
+                self.weight_scale_2 = atom_parameter(
+                    torch.empty(
+                        global_scale_count,
+                        dtype=torch.float32,
+                        device=param_device,
+                    )
+                )
+                self.input_scale_2 = atom_parameter(
+                    torch.empty(
+                        global_scale_count,
+                        dtype=torch.float32,
+                        device=param_device,
+                    )
+                )
+            elif quant_type == QuantType.per_Tensor:
                 self.weight_scale = atom_parameter(
                     torch.empty(
                         len(self.output_partition_sizes),
@@ -627,11 +673,18 @@ class LinearBase(nn.Module):
         else:
             self.weight.weight_loader_process = self.weight_loader_process
             self.register_parameter("weight_scale", None)
+        if not is_nvfp4 or self.source_quant_dtype is not None:
+            self.register_parameter("weight_scale_2", None)
+            self.register_parameter("input_scale_2", None)
         self.weight.weight_loader = self.weight_loader
         if self.bias is not None:
             self.bias.weight_loader = self.weight_loader
         if self.weight_scale is not None:
             self.weight_scale.weight_loader = self.weight_loader
+        for global_scale in (self.weight_scale_2, self.input_scale_2):
+            if global_scale is not None:
+                global_scale.weight_loader_process = self.weight_loader_process
+                global_scale.weight_loader = self.weight_loader
         self.need_normalize_e4m3fn_to_e4m3fnuz = params_dtype == torch.float8_e4m3fnuz
         self.quant_func = get_hip_quant(self.quant_type)
         self.is_output_padded = False
@@ -669,6 +722,58 @@ class LinearBase(nn.Module):
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
         param.weight_loader_process(param_data, loaded_weight)
+
+    def _is_nvfp4_global_scale_param(self, param: nn.Parameter) -> bool:
+        return self.params_dtype == NVFP4_DTYPE and (
+            param is getattr(self, "weight_scale_2", None)
+            or param is getattr(self, "input_scale_2", None)
+        )
+
+    def _load_nvfp4_global_scale(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: int | tuple[int, ...] | None = None,
+    ) -> None:
+        """Load replicated NVFP4 per-tensor global scales.
+
+        These scalars do not follow either tensor-parallel dimension. A merged
+        projection owns one value per source projection; ordinary projections
+        own one value. Every TP rank receives the same scalar(s).
+        """
+        param_data = param.data
+        values = loaded_weight.reshape(-1)
+        if isinstance(loaded_shard_id, tuple):
+            if values.numel() != len(loaded_shard_id):
+                raise RuntimeError(
+                    "NVFP4 global scale count does not match merged shard ids: "
+                    f"values={values.numel()}, shard_ids={loaded_shard_id}."
+                )
+            for value, shard_id in zip(values, loaded_shard_id):
+                self._load_nvfp4_global_scale(param, value, shard_id)
+            return
+        if loaded_shard_id is None:
+            if values.numel() != param_data.numel():
+                raise RuntimeError(
+                    "NVFP4 global scale shape mismatch: "
+                    f"param={tuple(param_data.shape)}, loaded={tuple(loaded_weight.shape)}."
+                )
+            param.weight_loader_process(param_data, values.reshape(param_data.shape))
+            return
+        if not isinstance(loaded_shard_id, int) or not (
+            0 <= loaded_shard_id < param_data.numel()
+        ):
+            raise ValueError(
+                f"Invalid NVFP4 global scale shard id {loaded_shard_id!r}; "
+                f"expected [0, {param_data.numel() - 1}]."
+            )
+        if values.numel() != 1:
+            raise RuntimeError(
+                "Each NVFP4 source projection must provide exactly one global "
+                f"scale, got {values.numel()}."
+            )
+        target = param_data.narrow(0, loaded_shard_id, 1)
+        param.weight_loader_process(target, values)
 
     def _gather_full_weight(self, weight):
         """Gather sharded weight from all TP ranks to reconstruct the full unpartitioned weight."""
@@ -722,6 +827,7 @@ class LinearBase(nn.Module):
         )
         online_quant_type = online_layer_quant_config.quant_type
         online_quant_dtype = online_layer_quant_config.quant_dtype
+        source_is_nvfp4 = self.params_dtype == NVFP4_DTYPE
         if should_skip_online_quant(
             self.quant_type, self.params_dtype, online_layer_quant_config
         ):
@@ -736,6 +842,14 @@ class LinearBase(nn.Module):
             f"Unsupported online quant: "
             f"dtype={online_quant_dtype}, type={online_quant_type}"
         )
+        if source_is_nvfp4 and not (
+            online_quant_type.value == QuantType.per_1x32.value
+            and online_quant_dtype == dtypes.fp4x2
+        ):
+            raise ValueError(
+                f"{self.prefix}: Quark NVFP4 checkpoints can currently be "
+                "converted only to the MXFP4 online target."
+            )
         # Quark models arrive in several source formats. We can re-quantize any
         # source we know how to dequantize back to float first: unquantized
         # (No), per-tensor FP8 (per_Tensor), per-output-channel FP8 (per_Token /
@@ -804,17 +918,43 @@ class LinearBase(nn.Module):
         # to the online target format (no-op for an unquantized source).
         # output_partition_sizes lets per_Tensor merged layers (qkv/gate_up)
         # apply the right per-partition scale to each output row-range.
-        weight = dequant_weight_online(
-            weight,
-            weight_scale,
-            self.quant_type,
-            self.params_dtype,
-            self.output_partition_sizes,
-        )
-
-        q_weight, weight_scale = quant_weight_online(
-            weight, online_quant_type, online_quant_dtype
-        )
+        if source_is_nvfp4:
+            if weight_scale is None:
+                raise RuntimeError(f"{self.prefix}: NVFP4 weight_scale is missing.")
+            global_scale = getattr(self, "weight_scale_2", None)
+            if global_scale is None:
+                raise RuntimeError(f"{self.prefix}: NVFP4 weight_scale_2 is missing.")
+            global_scale = global_scale.data.reshape(-1)
+            if global_scale.numel() != len(self.output_partition_sizes):
+                raise RuntimeError(
+                    f"{self.prefix}: expected {len(self.output_partition_sizes)} "
+                    "NVFP4 global weight scales, got "
+                    f"{global_scale.numel()}."
+                )
+            per_row_scale_2 = global_scale.repeat_interleave(
+                torch.tensor(
+                    self.output_partition_sizes,
+                    device=global_scale.device,
+                )
+            ).view(-1, 1)
+            weight = dequantize_nvfp4(
+                weight,
+                weight_scale,
+                per_row_scale_2,
+                out_dtype=torch.float32,
+            )
+            q_weight, weight_scale = quant_mxfp4_dynamic(weight)
+        else:
+            weight = dequant_weight_online(
+                weight,
+                weight_scale,
+                self.quant_type,
+                self.params_dtype,
+                self.output_partition_sizes,
+            )
+            q_weight, weight_scale = quant_weight_online(
+                weight, online_quant_type, online_quant_dtype
+            )
         if need_gather:
             q_weight, weight_scale = self._shard_quantized_weight(
                 q_weight, weight_scale
@@ -836,6 +976,9 @@ class LinearBase(nn.Module):
             online_quant_dtype == torch.float8_e4m3fnuz
             and online_quant_type == QuantType.per_Token
         )
+        if source_is_nvfp4:
+            self.weight_scale_2 = None
+            self.input_scale_2 = None
         # A dynamic online target (e.g. ptpc per_Token) quantizes activations at
         # runtime. Drop any static input_scale inherited from a static per_Tensor
         # source, otherwise the per-token quant kernel rejects it
@@ -864,10 +1007,21 @@ class LinearBase(nn.Module):
         shuffled and its N left unpadded, with the RuntimeError that exists to
         catch exactly that skipped along with the padding.
         """
+        if self.params_dtype == NVFP4_DTYPE:
+            if self.quant_config is not None and self.quant_config.online_quant:
+                self.online_quantize_weight()
+            if self.params_dtype == NVFP4_DTYPE:
+                # Keep the checkpoint's row-major U8/E4M3 layout intact when
+                # no online target was requested.
+                return
         if self.weight.numel() == 0:
             return
         # Re-quantize before process_weights if online quantization is enabled
-        if self.quant_config is not None and self.quant_config.online_quant:
+        if (
+            self.quant_config is not None
+            and self.quant_config.online_quant
+            and getattr(self, "_online_quant_info", None) is None
+        ):
             self.online_quantize_weight()
         if self.quant_type.value == QuantType.per_Tensor.value and (
             len(self.output_partition_sizes) > 1
@@ -1020,6 +1174,12 @@ class LinearBase(nn.Module):
         otype=dtypes.bf16,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.params_dtype == NVFP4_DTYPE:
+            raise RuntimeError(
+                f"{self.prefix}: NVFP4 checkpoint weights are loaded, but direct "
+                "NVFP4 inference is intentionally blocked. Convert this layer "
+                "to MXFP4 during online quantization before forward."
+            )
         # A quant path that cannot honour out= must not silently ignore it.
         assert out is None or self.supports_out(), (
             "Linear out= requested but this quant path does not support it "
@@ -1224,6 +1384,9 @@ class ColumnParallelLinear(LinearBase):
         )
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        if self._is_nvfp4_global_scale_param(param):
+            self._load_nvfp4_global_scale(param, loaded_weight)
+            return
         param_data = param.data
         shard_size = param_data.size(self.tp_dim)
         start_idx = self.tp_rank * shard_size
@@ -1338,6 +1501,9 @@ class MergedColumnParallelLinear(LinearBase):
         loaded_weight: torch.Tensor,
         loaded_shard_id: int | tuple[int, ...] | None = None,
     ):
+        if self._is_nvfp4_global_scale_param(param):
+            self._load_nvfp4_global_scale(param, loaded_weight, loaded_shard_id)
+            return
         # Support loading multiple consecutive shards in a single tensor.
         # This mirrors vLLM's behavior for packed modules like QKV.
         if isinstance(loaded_shard_id, tuple):
@@ -2174,6 +2340,9 @@ class RowParallelLinear(LinearBase):
         )
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        if self._is_nvfp4_global_scale_param(param):
+            self._load_nvfp4_global_scale(param, loaded_weight)
+            return
         param_data = param.data
         if param is not getattr(self, "bias", None):
             if (
@@ -2227,8 +2396,11 @@ class MergedReplicatedLinear(ReplicatedLinear):
         self,
         param: nn.Parameter,
         loaded_weight: torch.Tensor,
-        loaded_shard_id: Optional[int] = None,
+        loaded_shard_id: int | None = None,
     ):  # ？
+        if self._is_nvfp4_global_scale_param(param):
+            self._load_nvfp4_global_scale(param, loaded_weight, loaded_shard_id)
+            return
         param_data = param.data
         assert loaded_shard_id is not None
         assert loaded_shard_id < len(self.output_sizes)
