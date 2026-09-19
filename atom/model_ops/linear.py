@@ -33,15 +33,15 @@ from atom.model_ops.utils import (
     shuffle_weights,
 )
 from atom.quant_spec import (
-    LayerQuantConfig,
     NVFP4_DTYPE,
     NVFP4_GROUP_SIZE,
+    LayerQuantConfig,
     should_skip_online_quant,
     should_stream_online_quant,
 )
 from atom.quantization.quark.utils import (
-    dequantize_nvfp4,
     dequant_weight_online,
+    dequantize_nvfp4,
     quant_mxfp4_dynamic,
     quant_weight_online,
 )
