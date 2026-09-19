@@ -45,6 +45,8 @@ def _positive_float_env(name: str, default: str) -> float:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Opt-in single-HCA engine pool: "auto" or explicit comma-separated HCAs.
+    "ATOM_MOONCAKE_MATCHED_RAILS": lambda: os.getenv("ATOM_MOONCAKE_MATCHED_RAILS", ""),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
     "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
@@ -635,6 +637,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_KV_EVENTS_ENDPOINT", "tcp://127.0.0.1:5557"
     ),
     "ATOM_KV_EVENTS_TOPIC": lambda: os.getenv("ATOM_KV_EVENTS_TOPIC", ""),
+    # ROUTER endpoint for the replay socket; empty string disables replay.
+    "ATOM_KV_EVENTS_REPLAY_ENDPOINT": lambda: os.getenv(
+        "ATOM_KV_EVENTS_REPLAY_ENDPOINT", ""
+    ),
+    # Size of the replay ring buffer (distinct from the send queue depth).
+    "ATOM_KV_EVENTS_REPLAY_BUFFER_STEPS": lambda: int(
+        os.getenv("ATOM_KV_EVENTS_REPLAY_BUFFER_STEPS", "10000") or "10000"
+    ),
     "ATOM_KV_EVENTS_HWM": lambda: int(os.getenv("ATOM_KV_EVENTS_HWM", "0") or "0"),
     "ATOM_KV_EVENTS_BUFFER_STEPS": lambda: int(
         os.getenv("ATOM_KV_EVENTS_BUFFER_STEPS", "10000") or "10000"

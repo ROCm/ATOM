@@ -371,10 +371,11 @@ def build_lmcache_config(
     from lmcache.v1.config import LMCacheEngineConfig
 
     cfg = LMCacheEngineConfig.from_env()
-    # Preserve the legacy rank-0 default; explicit overrides can opt into
-    # all-rank lookup ([]) so every shard gets matching touches and pins.
+    # Every shard needs the lookup's pins and LRU touches. Rank-0-only lookup
+    # can advertise a prefix already evicted on another rank. LMCache uses
+    # [] for all workers and takes the minimum hit length across responses.
     if getattr(cfg, "lookup_server_worker_ids", None) is None:
-        cfg.lookup_server_worker_ids = [0]
+        cfg.lookup_server_worker_ids = []
     apply_extra_overrides(cfg, kv_transfer_config)
     # Async lookup has a separate polling/cancellation contract. This
     # connector currently implements only synchronous lookup; do not let an
@@ -430,15 +431,33 @@ def lmcache_replica_world_size(config) -> int:
 
     Worker ids index this replica-local grid rather than the global one.
     LMCache selects its lookup servers by worker id
-    (``cfg.lookup_server_worker_ids``, defaulting to ``[0]``), so global
-    numbering would leave every replica except the first without a server.
+    (``cfg.lookup_server_worker_ids``, defaulting to all workers), so explicit
+    subsets must also use replica-local numbering.
     Replica-local ids are also the right cache-key component: id ``i`` means
     "shard i of the model", which holds the same bytes in every replica, so
     replicas sharing a disk/remote backend share entries instead of
     duplicating them.
+
+    Read the sizes from the top level first and fall back to
+    ``config.parallel_config``: ATOM's own config carries them directly, while
+    the vLLM plugin path hands us a ``VllmConfig`` that keeps both under
+    ``parallel_config``. Looking only at the top level made both lookups fall
+    back to 1 there, so a TP4 replica reported world=1 -- which puts the
+    recipe's all-rank ``lookup_server_worker_ids=[0,1,2,3]`` out of range, and
+    the lookup client then fails to build.
     """
-    pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
-    tp_size = int(getattr(config, "tensor_parallel_size", 1) or 1)
+
+    def _dim(name: str) -> int:
+        for src in (config, getattr(config, "parallel_config", None)):
+            if src is None:
+                continue
+            val = getattr(src, name, None)
+            if val:
+                return int(val)
+        return 1
+
+    pp_size = _dim("pipeline_parallel_size")
+    tp_size = _dim("tensor_parallel_size")
     return max(1, pp_size * tp_size)
 
 

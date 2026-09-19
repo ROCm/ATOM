@@ -295,6 +295,19 @@ impl PolicyRegistry {
                 }
             }
         }
+        // PD mode keeps separate prefill/decode policy instances with their own
+        // trees. Skipping them leaves a removed worker as a live tenant, so the
+        // next matching prefix routes to a worker that no longer exists.
+        for policy in [self.prefill_policy.get(), self.decode_policy.get()]
+            .into_iter()
+            .flatten()
+        {
+            if policy.name() == "cache_aware" {
+                if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                    cache_aware.remove_worker_by_url(worker_url);
+                }
+            }
+        }
     }
 
     /// Initialize cache-aware policies for PD mode (prefill and decode) - lock-free
@@ -303,6 +316,18 @@ impl PolicyRegistry {
         prefill_workers: &[Arc<dyn Worker>],
         decode_workers: &[Arc<dyn Worker>],
     ) {
+        // Both call sites (worker registration and router construction) race:
+        // whichever runs second is the one that actually seeds. Log the inputs
+        // so a silent skip is diagnosable instead of surfacing as "cache_aware
+        // mysteriously routes at random".
+        tracing::info!(
+            "init_pd_cache_aware_policies: prefill_workers={} decode_workers={} \
+             prefill_policy={:?} decode_policy={:?}",
+            prefill_workers.len(),
+            decode_workers.len(),
+            self.prefill_policy.get().map(|p| p.name()),
+            self.decode_policy.get().map(|p| p.name()),
+        );
         // Initialize prefill policy if it's cache-aware (lock-free via OnceLock::get)
         if let Some(prefill_policy) = self.prefill_policy.get() {
             if prefill_policy.name() == "cache_aware" {
@@ -310,7 +335,9 @@ impl PolicyRegistry {
                     prefill_policy.as_any().downcast_ref::<CacheAwarePolicy>()
                 {
                     if !prefill_workers.is_empty() {
-                        debug!(
+                        // info-level: a silently skipped seed leaves cache_aware
+                        // treeless, which is invisible until throughput tanks.
+                        tracing::info!(
                             "Initializing prefill cache-aware policy with {} workers",
                             prefill_workers.len()
                         );

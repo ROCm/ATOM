@@ -147,6 +147,31 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
 
     BACKEND = Qwen4ExpBackend
 
+    def _build_gdn_cache_tensor(self, module):
+        cache = super().build_kv_cache_tensor(module)
+        if hasattr(module, "base_linear_attention"):
+            from atom.model_ops.fla_ops.gdn_flydsl import select_policy
+            from atom.utils import envs
+
+            attention = module.impl
+            policy = select_policy(
+                allowed=attention.allow_aiter_flydsl,
+                replayssm=self.replayssm,
+                lossy_decode=envs.ATOM_ENABLE_GDN_DECODE_LOSSY_FAST,
+                state=cache.v_cache,
+                activation_dtype=attention.dt_bias.dtype,
+            )
+            attention.gdn_flydsl_policy = policy
+            self._flydsl_prefill_enabled = (
+                getattr(self, "_flydsl_prefill_enabled", False) or policy.prefill
+            )
+            if policy.decode:
+                # Physical VK storage, exposed as a logical KV view. This is
+                # zero-copy and preserves all gather/scatter/fork interfaces.
+                # Triton fallback and checkpoint stores honor the inner strides.
+                cache.v_cache = cache.v_cache.transpose(-1, -2)
+        return cache
+
     def __init__(self, model_runner, **kwargs):
         super().__init__(model_runner=model_runner, **kwargs)
         hf = model_runner.config.hf_config
@@ -371,7 +396,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
     def build_kv_cache_tensor(self, module):
         """Bind the three caches a QSA layer owns; defer everything else."""
         if not getattr(module, "is_qsa_attention", False):
-            return super().build_kv_cache_tensor(module)
+            return self._build_gdn_cache_tensor(module)
 
         from atom.config import KVCacheTensor
 
@@ -535,6 +560,16 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             return attn_metadata, positions
 
         query_lens = np.asarray(batch.num_scheduled_tokens[:num_reqs], dtype=np.int64)
+        if (
+            attn_metadata.gdn_metadata is not None
+            and getattr(self, "_flydsl_prefill_enabled", False)
+            and not self.replayssm
+        ):
+            from atom.model_ops.fla_ops.gdn_flydsl import build_prefill_metadata
+
+            attn_metadata.gdn_metadata.flydsl_prefill_metadata = build_prefill_metadata(
+                query_lens, attn_metadata.gdn_metadata.non_spec_query_start_loc
+            )
         attn_metadata.qsa_metadata = self._build_qsa_metadata(
             attn_metadata, num_reqs, num_tokens, query_lens, num_tokens
         )

@@ -2102,6 +2102,9 @@ def atom_deepseek_v4_forward_context(
     if attn_metadata is None:
         # Fallback (profiling / dummy / standalone, before the proxy cache is
         # bound): build inline with fresh tensors. Never captured.
+        # No metadata attached means vLLM never ran the builder, so this is a
+        # warmup/dummy forward with no request identity: throwaway slots.
+        slot_allocator = None
         if common_attn_metadata is not None:
             common_attn_metadata.positions = positions
         _spec_cfg = getattr(atom_config, "speculative_config", None)
