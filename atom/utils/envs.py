@@ -432,6 +432,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # with that many threads; set to 1 to fall back to the original sequential
     # per-expert path.
     "ATOM_LOADER_NUM_THREADS": lambda: int(os.getenv("ATOM_LOADER_NUM_THREADS", "16")),
+    # Active weight-loader workers while the checkpoint iterator is still
+    # reading and submitting tensors. The executor is still created with
+    # ATOM_LOADER_NUM_THREADS workers; once iteration finishes, all of them are
+    # released to drain the queued work. Defaulting to the executor size keeps
+    # the historical fixed-concurrency behaviour when this knob is unset.
+    "ATOM_LOADER_STREAM_THREADS": lambda: int(
+        os.getenv(
+            "ATOM_LOADER_STREAM_THREADS",
+            os.getenv("ATOM_LOADER_NUM_THREADS", "16"),
+        )
+    ),
     # Warm the page cache with a background sequential reader instead of
     # leaving it to demand faults through the mmap. Measured on a local NVMe:
     # the fault-driven pattern sustains 3.2 GB/s where the device does 6.9 and
