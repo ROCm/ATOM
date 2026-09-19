@@ -158,3 +158,68 @@ def test_preemption_forgets_the_frozen_placement_too():
 
     assert not hasattr(view, "_offload_finished_block_ids")
     assert not hasattr(view, "_offload_finished_cached_tokens")
+
+
+def test_view_takes_every_attribute_the_shared_scheduler_writes_on_a_seq():
+    """The slot list has to track `chunked_scheduler.py`, so read that file.
+
+    `ChunkedOffloadSchedulerBase` is shared: the native path hands it an ATOM
+    `Sequence`, which has a `__dict__` and absorbs any attribute, while the
+    plugin path hands it this slotted view, which raises `AttributeError`. So a
+    commit that adds `seq.<something> = ...` to the shared scheduler is a
+    working change on one path and a crash on the other, with nothing in that
+    commit's own diff to suggest it.
+
+    That is not hypothetical: `offload_load_start_tokens` (#2154, P/D
+    disaggregation) was added to the shared scheduler with no slot here, which
+    made the *first successful tier load* on the plugin path raise -- the one
+    code path the feature exists for, so no boot or smoke test reaches it.
+
+    Enumerating the writes from the source is what makes this test able to fail
+    for a reason nobody has thought of yet; a hand-written list of names would
+    only re-encode what we already know today.
+    """
+    import ast
+    import pathlib
+
+    import atom.kv_transfer.offload.chunked_scheduler as cs
+    from atom.plugin.vllm.kv_transfer.seq_view import SeqView
+
+    tree = ast.parse(pathlib.Path(cs.__file__).read_text())
+
+    written: dict[str, int] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+            targets = [node.target]
+        else:
+            continue
+        for target in targets:
+            if (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "seq"
+            ):
+                written.setdefault(target.attr, node.lineno)
+
+    # Guard the scanner itself: if a refactor renames the loop variable, the
+    # scan silently finds nothing and this test passes while checking nothing.
+    assert "offload_loaded_tokens" in written, (
+        "found no seq attribute writes in chunked_scheduler.py -- the scan is "
+        "broken, not the scheduler"
+    )
+
+    takeable = set(SeqView.__slots__) | {
+        name
+        for name in dir(SeqView)
+        if isinstance(getattr(SeqView, name, None), property)
+        and getattr(SeqView, name).fset is not None
+    }
+    missing = {name: line for name, line in written.items() if name not in takeable}
+
+    assert not missing, (
+        "chunked_scheduler.py assigns these on a seq, which SeqView cannot "
+        f"hold: {missing} (name -> first line). Add each to SeqView.__slots__; "
+        "do not delete the assignment -- the native path reads it back."
+    )
