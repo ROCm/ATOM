@@ -217,7 +217,30 @@ def test_deferred_decode_returns_the_flat_width_it_staged():
     processor.pre_num_decode_token_per_seq = 1
     processor.prev_token_ids = np.zeros(2, dtype=np.int32)
     processor.draft_token_ids = None
-    processor.runner = SimpleNamespace(enforce_eager=True, capture_sizes=[])
+    # The real `decode_spans`, bound to a runner that owns only the published
+    # buffer it reads: the point of that method is that the lengths and their
+    # cumsum come off one array, which a double returning a hand-made pair
+    # would stop testing.
+    from atom.model_ops.attentions.backends import CommonAttentionBuilder
+
+    # One runner holding one `cu_seqlens_q`, read by the method under test and
+    # by `decode_spans` alike -- two buffers here would let them disagree,
+    # which is the thing `decode_spans` exists to prevent.
+    processor.runner = SimpleNamespace(
+        enforce_eager=True,
+        capture_sizes=[],
+        forward_vars={
+            "cu_seqlens_q": SimpleNamespace(
+                np=np.array([0, 4, 8], dtype=np.int32),
+                gpu=np.array([0, 4, 8], dtype=np.int32),
+            )
+        },
+    )
+    # Bound to a namespace rather than an instance: the class is abstract, and
+    # `decode_spans` needs nothing from it but `model_runner`.
+    builder = SimpleNamespace(model_runner=processor.runner)
+    builder.decode_spans = CommonAttentionBuilder.decode_spans.__get__(builder)
+    processor.runner.attn_metadata_builder = builder
     processor.get_token_locations = mock.Mock(
         return_value=SimpleNamespace(
             deferred_curr=np.array([], dtype=np.int32),
@@ -232,8 +255,14 @@ def test_deferred_decode_returns_the_flat_width_it_staged():
         # captured: the deferred path stages two q=4 rows.
         total_tokens_num=2,
         total_tokens_num_prefill=0,
-        total_tokens_num_decode=2,
+        # The expanded decode width, not the stale scheduler total above: two
+        # requests at q=4. `num_scheduled_tokens` says the same thing per
+        # request and `cu_seqlens_q` is its prefix sum, which is the agreement
+        # `decode_spans` exists to keep.
+        total_tokens_num_decode=8,
         total_seqs_num_prefill=0,
+        total_seqs_num_decode=2,
+        num_scheduled_tokens=np.array([4, 4], dtype=np.int32),
         req_ids=[10, 11],
         dynamic_spec_query_tokens_per_req=None,
         scheduled_spec_decode_tokens=np.arange(6, dtype=np.int32).reshape(2, 3),

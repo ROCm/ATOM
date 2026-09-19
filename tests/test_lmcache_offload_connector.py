@@ -1572,6 +1572,10 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
 
     if not hasattr(torch, "arange"):
         pytest.skip("real torch is unavailable")
+    # The fast path under test runs its copies inside `torch.cuda.stream()`,
+    # so it needs a device even though what it asserts is a layout.
+    if not torch.cuda.is_available():
+        pytest.skip("ROCm GPU required")
 
     # Force two physical pipeline groups so Dense must prepare all groups in
     # one metadata upload and launch each group by index.
@@ -1608,25 +1612,19 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
 
     monkeypatch.setattr(connector, "_ensure_staging_buffer", _ensure_staging_buffer)
 
-    class _FakeEvent:
-        def record(self, stream) -> None:
-            pass
-
-    class _FakeStream:
-        def wait_event(self, event) -> None:
-            pass
-
-        def synchronize(self) -> None:
-            pass
-
     class _FakeState:
         def __init__(self) -> None:
-            self.pack_stream = _FakeStream()
-            self.copy_stream = _FakeStream()
+            # Real streams and events, not doubles: the connector hands these
+            # to `torch.cuda.stream()` and to `Stream.wait_event`, which read a
+            # good deal more of those protocols than a double is worth
+            # reimplementing (device, stream_id, Event.wait ...). Nothing this
+            # test asserts needs them recorded.
+            self.pack_stream = torch.cuda.Stream()
+            self.copy_stream = torch.cuda.Stream()
             self.staging_buffer = SimpleNamespace(
                 tensor=None,
-                ready_event=_FakeEvent(),
-                free_event=_FakeEvent(),
+                ready_event=torch.cuda.Event(),
+                free_event=torch.cuda.Event(),
                 free_event_valid=False,
             )
 

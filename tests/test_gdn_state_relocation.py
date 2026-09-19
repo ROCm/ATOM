@@ -321,11 +321,15 @@ class _MLABase:
     BLOCKS = 7
 
     def get_kv_transfer_tensors(self):
-        return KVTransferTensors(
+        tensors = KVTransferTensors(
             block_regions=[KVTransferRegion(0x1000, 64 * self.BLOCKS, 64)],
             slot_regions=[],
-            num_blocks=self.BLOCKS,
         )
+        # `num_blocks` is `init=False`: a draft appends its regions after
+        # construction, so the count is fixed once, by the call that also
+        # checks every region divides into it.
+        tensors.set_block_count(self.BLOCKS)
+        return tensors
 
 
 def kimi_builder(kv_transfer_config, pp_size=1, replayssm=False):

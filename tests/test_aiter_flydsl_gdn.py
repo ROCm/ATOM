@@ -239,9 +239,12 @@ def test_triton_decode_vk_fallback():
     writes = reads + 3
     expected = baseline_decode(q, k, v, a, b, state, log, bias, reads, writes)
     actual = baseline_decode(q, k, v, a, b, vk, log, bias, reads, writes)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    # Different memory layouts compile independently; near-zero state values
-    # may differ by a BF16 rounding unit even when output tokens are identical.
+    # Different memory layouts compile independently, so near-zero values may
+    # differ by a BF16 rounding unit. That goes for the output as well as the
+    # state: on gfx950 two of 9216 output elements land 1.5e-5 apart, at a
+    # magnitude of 2e-3. A fallback reading the WRONG values is not what this
+    # admits -- it would be wrong by its own magnitude, not by an ulp.
+    torch.testing.assert_close(actual, expected, rtol=0.008, atol=2e-6)
     torch.testing.assert_close(vk, state, rtol=0.008, atol=2e-6)
 
 
@@ -308,7 +311,9 @@ def test_unsupported_device_decode_fallback(monkeypatch):
     monkeypatch.undo()
     expected = baseline_decode(q, k, v, a, b, state, log, bias, reads, writes)
     actual = baseline_decode(q, k, v, a, b, vk, log, bias, reads, writes)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    # Same BF16 rounding-unit allowance as `test_triton_decode_vk_fallback`,
+    # for the same reason: the two layouts compile independently.
+    torch.testing.assert_close(actual, expected, rtol=0.008, atol=2e-6)
     torch.testing.assert_close(vk, state, rtol=0.008, atol=2e-6)
 
 
