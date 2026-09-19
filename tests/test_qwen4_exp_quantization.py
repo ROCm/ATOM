@@ -35,6 +35,31 @@ def ptpc_config():
     return config
 
 
+def test_sglang_plugin_ptpc_remap_keeps_gdn_shards():
+    """Plugin quant remap must not collapse GDN qkv/z with unquantized b/a."""
+    from atom.plugin.sglang.models.qwen4_exp import (
+        apply_prepare_qwen4_exp_adaptations,
+    )
+
+    config = ptpc_config()
+    atom_config = SimpleNamespace(
+        quant_config=config,
+        hf_config=SimpleNamespace(
+            model_type="qwen4_exp",
+            split_ngram_parts=2,
+            text_config=None,
+        ),
+    )
+    apply_prepare_qwen4_exp_adaptations(atom_config, "Qwen4ExpForConditionalGeneration")
+    view = qwen4_exp._Qwen4ExpQuantizationConfig(config)
+    prefix = "model.layers.0.linear_attn"
+    assert view.get_layer_quant_config(prefix + ".in_proj_qkv").is_quantized
+    assert view.get_layer_quant_config(prefix + ".in_proj_z").is_quantized
+    assert not view.get_layer_quant_config(prefix + ".in_proj_b").is_quantized
+    assert not view.get_layer_quant_config(prefix + ".in_proj_a").is_quantized
+    assert not any("in_proj_qkvzba" in name for name in config.exclude_layers)
+
+
 def test_ptpc_exclusions_do_not_hide_quantized_children():
     config = ptpc_config()
     view = qwen4_exp._Qwen4ExpQuantizationConfig(config)

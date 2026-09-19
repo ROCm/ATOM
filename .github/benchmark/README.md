@@ -177,6 +177,11 @@ with a unique `suffix` and the structured fields above.
 variant a different grid via its own `scenarios`, or just tighten its
 `conc_min`/`conc_max`.
 
+**Benchmark an AITER change** — manually dispatch `ATOM Benchmark` with
+`aiter_commit` set to a ROCm/aiter commit SHA, tag, or branch. The benchmark
+container reinstalls `amd-aiter` from that ref before launching ATOM. Leave it
+empty to keep the version already baked into the selected Docker image.
+
 **Validate locally**
 ```bash
 python -m pytest tests/test_benchmark_catalog.py

@@ -127,6 +127,23 @@ def test_build_req_meta_reads_remote_pp_size():
     assert meta.remote_pp_size == 4
 
 
+def test_build_req_meta_keeps_remote_and_local_state_slots_distinct():
+    meta = ConnectorMetadata._build_req_meta(
+        req_id="r0",
+        local_block_ids=[0],
+        kv_transfer_params={
+            "remote_block_ids": [5],
+            "remote_host": "h",
+            "remote_handshake_port": 6301,
+            "tp_size": 1,
+            "local_slot_index": 11,
+            "remote_slot_index": 7,
+        },
+    )
+    assert meta.local_slot_index == 11
+    assert meta.remote_slot_index == 7
+
+
 def test_build_req_meta_defaults_pp_size_one():
     meta = ConnectorMetadata._build_req_meta(
         req_id="r0",
@@ -163,6 +180,7 @@ def test_producer_advertises_remote_pp_size():
         spec_token_ids=None,
         block_table=[1, 2, 3],
         id=99,
+        state_slot=7,
         state_slots=[],
         kv_transfer_params_output=None,
     )
@@ -172,6 +190,48 @@ def test_producer_advertises_remote_pp_size():
     assert seq.kv_transfer_params_output["block_size"] == 64
     assert seq.kv_transfer_params_output["dcp_size"] == 1
     assert seq.kv_transfer_params_output["remote_block_ids"] == [1, 2, 3]
+    assert seq.kv_transfer_params_output["remote_slot_index"] == 7
+
+
+@pytest.mark.parametrize(
+    "producer_slots",
+    [
+        # Compatibility form emitted by older producers.
+        {"local_slot_index": 7},
+        # The explicit source slot must win over the legacy field.
+        {"local_slot_index": 3, "remote_slot_index": 7},
+    ],
+)
+def test_consumer_preserves_producer_final_slot_before_setting_destination(
+    producer_slots,
+):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    sched = _mooncake_consumer_scheduler(mc)
+
+    # Nothing locally cached, so the incremental-transfer branch resolves to a
+    # full transfer and leaves the slot bookkeeping under test alone.
+    seq = SimpleNamespace(
+        id="decode-1",
+        state_slot=11,
+        block_table=[1, 2],
+        has_per_req_cache=False,
+        num_cached_tokens=0,
+        kv_transfer_params={
+            "do_remote_prefill": True,
+            "transfer_id": "prefill-1",
+            "hash_block_size": 64,
+            **producer_slots,
+        },
+    )
+    sched.update_state_after_alloc(seq)
+
+    assert seq.kv_transfer_params["remote_slot_index"] == 7
+    assert seq.kv_transfer_params["local_slot_index"] == 11
+    meta = sched.build_connector_meta().reqs_to_recv["decode-1"]
+    assert meta.remote_slot_index == 7
+    assert meta.local_slot_index == 11
 
 
 def _mooncake_consumer_scheduler(mc, block_size=64, dcp_size=1):
@@ -595,6 +655,79 @@ def _make_connector(**overrides):
     return conn
 
 
+def _make_transfer_connector(prefill_data, captured):
+    conn = _make_connector()
+    conn.pp_size = 1
+    conn.pp_rank = 0
+    conn.tp_size = 1
+    conn.dcp_size = 1
+    conn.transfer_engine = object()
+    conn._transfer_refcount_lock = threading.Lock()
+    conn._transfer_refcount = {}
+    conn._completed_prefills_lock = threading.Lock()
+    conn._completed_prefills = {}
+    conn._kv_cache_ready_events = {}
+    conn.done_sending = set()
+    conn._wait_for_prefill_data = lambda _transfer_id: dict(prefill_data)
+    # Mirrors the real signature: the transfer helpers take a keyword-only
+    # ``engine`` so each request can be pinned to its own matched rail (#2276).
+    conn._execute_block_slot_transfer = (
+        lambda request, target, src, dst, data, req_id, *, engine=None: captured.append(
+            (request, target, src, dst, data, req_id)
+        )
+        or True
+    )
+    conn._send_write_done = lambda *_args, **_kwargs: None
+    return conn
+
+
+def _stateful_write_request(**overrides):
+    request = {
+        "request_id": "decode-1",
+        "transfer_id": "prefill-1",
+        "consumer_host": "10.0.0.2",
+        "consumer_rpc_port": 42000,
+        "dst_block_ids": [9],
+        "notify_host": "10.0.0.2",
+        "notify_port": 42001,
+        "consumer_tp_size": 1,
+        "write_nonce": 1,
+        "has_slot_regions": True,
+        "src_slot_index": 7,
+        "src_swa_block_ids": [7],
+        "dst_slot_index": 11,
+    }
+    request.update(overrides)
+    return request
+
+
+def test_tp_transfer_uses_final_source_slot_after_checkpoint_move():
+    captured = []
+    conn = _make_transfer_connector(
+        {"block_ids": [3], "slot_index": 3, "swa_block_ids": [3]}, captured
+    )
+
+    conn._execute_transfer(_stateful_write_request())
+
+    assert len(captured) == 1
+    transferred = captured[0][4]
+    assert transferred["slot_index"] == 7
+    assert transferred["swa_block_ids"] == [7]
+
+
+@pytest.mark.parametrize("invalid_slot", [-1, None, "invalid"])
+def test_stateful_transfer_without_final_source_slot_fails_closed(caplog, invalid_slot):
+    captured = []
+    conn = _make_transfer_connector(
+        {"block_ids": [3], "slot_index": 3, "swa_block_ids": [3]}, captured
+    )
+
+    conn._execute_transfer(_stateful_write_request(src_slot_index=invalid_slot))
+
+    assert captured == []
+    assert "missing the producer's final source slot" in caplog.text
+
+
 def test_write_done_correct_nonce_accepted():
     conn = _make_connector()
     conn._pending_recv_expected["r1"] = 1
@@ -865,7 +998,10 @@ def test_dcp_block_descriptors_are_streamed_in_bounded_batches():
     batch_sizes = []
     transferred_bytes = 0
 
-    def record_batch(_target, src_addrs, dst_addrs, sizes, _req_id, _label):
+    def record_batch(
+        _target, src_addrs, dst_addrs, sizes, _req_id, _label, *, engine=None
+    ):
+        assert engine is None
         nonlocal transferred_bytes
         assert len(src_addrs) == len(dst_addrs) == len(sizes)
         assert len(src_addrs) <= connector._MAX_RDMA_ENTRIES_PER_BATCH
@@ -942,6 +1078,7 @@ def test_dcp_index_staging_waits_for_request_ready_event():
         [10],
         "req-1",
         ready_event,
+        engine=ready_event,
     )
     connector._index_staging_stream.wait_event.assert_called_once_with(ready_event)
     connector._execute_staged_index_layer_chunk.assert_called_once_with(
@@ -952,6 +1089,11 @@ def test_dcp_index_staging_waits_for_request_ready_event():
         [10],
         "req-1",
         gather_indices,
+        engine=ready_event,
+    )
+    assert all(
+        call.kwargs["engine"] is ready_event
+        for call in connector._rdma_write_with_retry.call_args_list
     )
 
 
@@ -1018,3 +1160,323 @@ def test_mooncake_records_one_ready_event_for_a_prefill_batch(monkeypatch):
 
     ready_event.record.assert_called_once_with(producer_stream)
     assert connector._kv_cache_ready_events == {11: ready_event, 12: ready_event}
+
+
+# ---------------------------------------------------------------------------
+# Matched-rail engines for independent P/D GPU ranks
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "protocol,devices,rails,message",
+    [
+        ("tcp", [], ["ionic_0"], "protocol=rdma"),
+        ("rdma", ["ionic_0", "ionic_1"], ["ionic_0", "ionic_1"], "single primary"),
+        ("rdma", ["ionic_0"], ["ionic_1"], "including the primary"),
+        ("rdma", ["ionic_0"], ["ionic_0", "missing"], "existing local HCAs"),
+    ],
+)
+def test_matched_rails_reject_invalid_transport_configuration(
+    monkeypatch, protocol, devices, rails, message
+):
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    monkeypatch.setattr(mc, "_ib_device_exists", lambda name: name.startswith("ionic_"))
+    with pytest.raises(ValueError, match=message):
+        mc._validate_matched_rails(protocol, devices, rails)
+
+
+def test_matched_rails_disabled_preserves_tcp_and_multi_hca(monkeypatch):
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    mc._validate_matched_rails("tcp", [], [])
+    mc._validate_matched_rails("rdma", ["ionic_0", "ionic_1"], [])
+    monkeypatch.setattr(mc, "_ib_device_exists", lambda _: True)
+    mc._validate_matched_rails("rdma", ["ionic_2"], ["ionic_2", "ionic_6"])
+
+
+@pytest.fixture
+def matched_rail_sysfs(tmp_path, monkeypatch):
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    monkeypatch.setattr(mc, "_IB_SYSFS_ROOT", tmp_path)
+
+    def add(name, *states):
+        device = tmp_path / name
+        device.mkdir(exist_ok=True)
+        for index, state in enumerate(states, 1):
+            port = device / "ports" / str(index)
+            port.mkdir(parents=True)
+            if state is not None:
+                (port / "state").write_text(state)
+        return device
+
+    return mc, add
+
+
+@pytest.mark.parametrize("prefix", ["ionic_", "rdma", "mlx5_"])
+@pytest.mark.parametrize("value", ["auto", " AUTO "])
+def test_matched_rails_auto_discovers_only_active_primary_family(
+    matched_rail_sysfs, prefix, value
+):
+    mc, add = matched_rail_sysfs
+    for suffix in (10, 2, 0):
+        add(f"{prefix}{suffix}", "4: ACTIVE\n")
+    add(f"{prefix}3", "1: DOWN\n")
+    add(f"{prefix}4", None)  # A missing state file is not an active port.
+    add(f"{prefix}5")  # No ports exposed.
+    add(f"{prefix}6", "2: INIT\n", "4: ACTIVE\n")
+    add(f"{prefix}7", "4: ACTIVE\n", "4: ACTIVE\n")  # Include a device once.
+    add(f"{prefix}8_extra", "4: ACTIVE\n")
+    add("other_0", "4: ACTIVE\n")
+
+    assert mc._resolve_matched_rails("rdma", [f"{prefix}2"], value) == [
+        f"{prefix}{i}" for i in (0, 2, 6, 7, 10)
+    ]
+
+
+def test_matched_rails_auto_excludes_unrelated_active_nic(matched_rail_sysfs):
+    mc, add = matched_rail_sysfs
+    for i in range(8):
+        add(f"ionic_{i}", "4: ACTIVE\n")
+    add("mlx5_0", "4: ACTIVE\n")
+    assert mc._resolve_matched_rails("rdma", ["ionic_2"], "auto") == [
+        f"ionic_{i}" for i in range(8)
+    ]
+
+
+@pytest.mark.parametrize("state", [None, "1: DOWN\n", "invalid"])
+def test_matched_rails_auto_rejects_inactive_primary(matched_rail_sysfs, state):
+    mc, add = matched_rail_sysfs
+    add("ionic_2", state)
+    add("ionic_6", "4: ACTIVE\n")
+    with pytest.raises(ValueError, match="Primary HCA.*no readable ACTIVE"):
+        mc._resolve_matched_rails("rdma", ["ionic_2"], "auto")
+
+
+def test_matched_rails_auto_rejects_missing_primary(matched_rail_sysfs):
+    mc, add = matched_rail_sysfs
+    add("ionic_6", "4: ACTIVE\n")
+    with pytest.raises(ValueError, match="Primary HCA.*no readable ACTIVE"):
+        mc._resolve_matched_rails("rdma", ["ionic_2"], "auto")
+
+
+def test_matched_rails_auto_reports_hidden_sysfs(matched_rail_sysfs, tmp_path):
+    mc, _ = matched_rail_sysfs
+    mc._IB_SYSFS_ROOT = tmp_path / "not-mounted"
+    with pytest.raises(ValueError, match="Cannot discover RDMA HCAs"):
+        mc._resolve_matched_rails("rdma", ["ionic_2"], "auto")
+
+
+def test_matched_rails_auto_requires_numbered_names(matched_rail_sysfs):
+    mc, add = matched_rail_sysfs
+    add("custom_hca", "4: ACTIVE\n")
+    with pytest.raises(ValueError, match="explicit HCA list"):
+        mc._resolve_matched_rails("rdma", ["custom_hca"], "auto")
+    assert mc._resolve_matched_rails("rdma", ["custom_hca"], "custom_hca") == [
+        "custom_hca"
+    ]
+
+
+@pytest.mark.parametrize(
+    "protocol,devices,message",
+    [
+        ("tcp", [], "protocol=rdma"),
+        ("rdma", [], "single primary"),
+        ("rdma", ["ionic_0", "ionic_1"], "single primary"),
+    ],
+)
+def test_matched_rails_auto_validates_before_discovery(
+    monkeypatch, protocol, devices, message
+):
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    discovery = MagicMock(side_effect=AssertionError("must not discover"))
+    monkeypatch.setattr(mc, "_discover_active_matched_rails", discovery)
+    with pytest.raises(ValueError, match=message):
+        mc._resolve_matched_rails(protocol, devices, "auto")
+    discovery.assert_not_called()
+
+
+def test_matched_rails_explicit_list_and_unset_do_not_discover(matched_rail_sysfs):
+    mc, add = matched_rail_sysfs
+    add("ionic_2", "4: ACTIVE\n")
+    add("ionic_6", "1: DOWN\n")
+    # Preserve explicit-list behavior; only auto filters link state.
+    assert mc._resolve_matched_rails(
+        "rdma", ["ionic_2"], " ionic_6, ionic_2,ionic_6, "
+    ) == ["ionic_6", "ionic_2"]
+    mc._IB_SYSFS_ROOT = mc._IB_SYSFS_ROOT / "not-mounted"
+    assert mc._resolve_matched_rails("tcp", [], " ") == []
+    assert mc._resolve_matched_rails("rdma", ["ionic_2", "ionic_6"], "") == []
+
+
+def _matched_rail_producer():
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    conn = object.__new__(mc.MooncakeConnector)
+    conn.dp_rank = 2
+    conn.pp_rank = 0
+    conn.pp_size = conn.tp_size = 1
+    conn._completed_prefills = {}
+    conn._kv_cache_ready_events = {}
+    conn._completed_prefills_lock = threading.Lock()
+    conn._transfer_refcount_lock = threading.Lock()
+    conn._completion_lock = threading.Lock()
+    conn._transfer_refcount = {}
+    conn.done_sending = set()
+    conn._wait_for_prefill_data = lambda _: {"block_ids": [1], "slot_index": -1}
+    conn._get_kv_cache_ready_event = lambda _: None
+    conn._notify_transfer_result = MagicMock()
+    conn.transfer_engine = MagicMock()
+    conn.transfer_engine.batch_transfer_sync_write.return_value = 0
+    conn.transfer_engine.get_first_buffer_address.return_value = 1
+    conn._rail_pool = None
+    return conn
+
+
+def _matched_rail_request(name, device):
+    return {
+        "request_id": name,
+        "transfer_id": name,
+        "consumer_host": device,
+        "consumer_rpc_port": 1234,
+        "consumer_ib_device": device,
+        "consumer_dp_rank": 6,
+        "dst_block_ids": [2],
+    }
+
+
+@pytest.mark.parametrize("has_slot_data", [False, True])
+@pytest.mark.parametrize("matched", [False, True])
+def test_concurrent_pd_requests_keep_their_selected_engine(has_slot_data, matched):
+    from concurrent.futures import ThreadPoolExecutor
+
+    conn = _matched_rail_producer()
+    extra = MagicMock()
+    extra.batch_transfer_sync_write.return_value = 0
+    extra.get_first_buffer_address.return_value = 1
+    engines = {"ionic_2": conn.transfer_engine, "ionic_6": extra}
+    if matched:
+        conn._rail_pool = SimpleNamespace(get=engines.__getitem__)
+    barrier = threading.Barrier(2)
+
+    def transfer(data, target, *_args, engine=None):
+        # Both selections must finish before either write. Mutating the
+        # connector's shared engine here would send a request on the wrong rail.
+        barrier.wait(timeout=10)
+        return conn._rdma_write_with_retry(
+            target, [100], [200], [64], data["request_id"], "test", engine=engine
+        )
+
+    conn._execute_block_transfer = transfer
+    conn._execute_block_slot_transfer = transfer
+    requests = [_matched_rail_request(f"req-{device}", device) for device in engines]
+    for request in requests:
+        request["has_slot_regions"] = has_slot_data
+        if has_slot_data:
+            # A stateful transfer must carry the producer's final source slot
+            # (#2154); _execute_transfer rejects the request before it ever
+            # reaches the rail selection this test exercises.
+            request["src_slot_index"] = 5
+            request["dst_slot_index"] = 6
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list(executor.map(conn._execute_transfer, requests))
+
+    assert conn.done_sending == {request["request_id"] for request in requests}
+    assert all(
+        call.kwargs["success"] for call in conn._notify_transfer_result.call_args_list
+    )
+    assert conn.transfer_engine is engines["ionic_2"]
+    for device, engine in engines.items():
+        calls = engine.batch_transfer_sync_write.call_args_list
+        expected = (
+            [f"{device}:1234"]
+            if matched
+            else (["ionic_2:1234", "ionic_6:1234"] if device == "ionic_2" else [])
+        )
+        assert sorted(call.args[0] for call in calls) == expected
+
+
+def test_missing_consumer_rail_notifies_failure_without_writing():
+    from atom.kv_transfer.disaggregation.mooncake.rail_engine_pool import RailEnginePool
+
+    conn = _matched_rail_producer()
+    factory = MagicMock()
+    conn._rail_pool = RailEnginePool(
+        factory,
+        conn.transfer_engine,
+        "ionic_2",
+        ["ionic_2"],
+        lambda device: "127.0.0.1",
+    )
+    conn._rail_pool.set_regions([100], [64])
+    conn._execute_block_transfer = MagicMock()
+    request = _matched_rail_request("old-consumer", None)
+    request.pop("consumer_ib_device")
+    conn._execute_transfer(request)
+    conn._notify_transfer_result.assert_called_once_with(request, success=False)
+    conn._execute_block_transfer.assert_not_called()
+    conn.transfer_engine.batch_transfer_sync_write.assert_not_called()
+    factory.assert_not_called()
+    assert not conn.done_sending
+
+
+@pytest.mark.parametrize("succeeds", [False, True])
+def test_rdma_chunks_and_retries_use_selected_engine(monkeypatch, succeeds):
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    monkeypatch.setattr(mc.time, "sleep", lambda _: None)
+    conn = _matched_rail_producer()
+    conn._MAX_RDMA_ENTRIES_PER_BATCH = 2
+    selected = MagicMock()
+    selected.batch_transfer_sync_write.side_effect = (
+        [-1, 0, 0] if succeeds else [-1, -1, -1]
+    )
+    assert (
+        conn._rdma_write_with_retry(
+            "consumer:1234",
+            [1, 2, 3],
+            [4, 5, 6],
+            [64, 64, 64],
+            "request",
+            "block",
+            engine=selected,
+        )
+        is succeeds
+    )
+    calls = selected.batch_transfer_sync_write.call_args_list
+    assert len(calls) == 3
+    assert calls[0].args == calls[1].args
+    if succeeds:
+        assert calls[-1].args == ("consumer:1234", [3], [6], [64])
+    conn.transfer_engine.batch_transfer_sync_write.assert_not_called()
+
+
+def test_staged_index_write_preserves_selected_engine(monkeypatch):
+    from contextlib import nullcontext
+
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    conn = _matched_rail_producer()
+    conn._acquire_index_staging_slot = lambda: 3
+    conn._release_index_staging_slot = MagicMock()
+    conn._index_staging_stream = SimpleNamespace(synchronize=MagicMock())
+    conn._gather_sharded_index = lambda *_args: (10000, 2)
+    conn._rdma_write_with_retry = MagicMock(return_value=True)
+    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _: nullcontext())
+    selected = object()
+    assert conn._execute_staged_index_layer_chunk(
+        "consumer:1234", 0, 20000, 64, [4, 5], "request", object(), engine=selected
+    )
+    conn._rdma_write_with_retry.assert_called_once_with(
+        "consumer:1234",
+        [10000],
+        [20256],
+        [128],
+        "request",
+        "staged-index",
+        engine=selected,
+    )
+    conn._index_staging_stream.synchronize.assert_called_once()
+    conn._release_index_staging_slot.assert_called_once_with(3)

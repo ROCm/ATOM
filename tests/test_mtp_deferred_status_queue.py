@@ -12,7 +12,10 @@ pytest.importorskip(
     exc_type=ImportError,
 )
 
-from atom.model_engine.model_runner import tokenIDProcessor
+from atom.model_engine.model_runner import (
+    _kv_config_has_producer,
+    tokenIDProcessor,
+)
 from atom.model_engine.scheduler import ScheduledBatch
 
 
@@ -112,6 +115,63 @@ def _processor() -> tokenIDProcessor:
     return processor
 
 
+@pytest.mark.parametrize(
+    ("kv_config", "expected"),
+    [
+        ({}, False),
+        ({"kv_connector": "mooncake", "kv_role": "kv_consumer"}, False),
+        ({"kv_connector": "mooncake", "kv_role": "kv_producer"}, True),
+        (
+            {
+                "kv_connector": "multi",
+                "connectors": [
+                    {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+                    {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+                ],
+            },
+            True,
+        ),
+    ],
+)
+def test_detects_remote_prefill_producer(kv_config, expected):
+    assert _kv_config_has_producer(kv_config) is expected
+
+
+@pytest.mark.parametrize(
+    ("kv_config", "expected"),
+    [
+        ({"kv_role": "kv_consumer"}, True),
+        ({"kv_role": "kv_producer"}, False),
+        (
+            {
+                "kv_connector": "multi",
+                "connectors": [
+                    {"kv_role": "offload"},
+                    {"kv_role": "kv_producer"},
+                ],
+            },
+            False,
+        ),
+    ],
+)
+def test_remote_prefill_producer_disables_deferred_output(kv_config, expected):
+    runner = SimpleNamespace(
+        config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            kv_transfer_config=kv_config,
+        ),
+        device="cuda",
+    )
+    with (
+        mock.patch("atom.model_engine.model_runner.CpuGpuBuffer"),
+        mock.patch("atom.model_engine.model_runner.torch.cuda.Stream"),
+        mock.patch("atom.model_engine.model_runner.torch.zeros"),
+    ):
+        processor = tokenIDProcessor(runner, max_num_batched_tokens=8)
+
+    assert processor.is_deferred_out is expected
+
+
 def test_middle_prefills_preserve_status_until_mixed_final_batch():
     processor = _processor()
 
@@ -132,3 +192,66 @@ def test_middle_prefills_preserve_status_until_mixed_final_batch():
     processor.recv_mtp_status_async.assert_called_once_with()
     np.testing.assert_array_equal(processor.prev_rejected_num, [2])
     np.testing.assert_array_equal(processor.prev_bonus_num, [1])
+
+
+def test_deferred_decode_returns_the_flat_width_it_staged():
+    processor = object.__new__(tokenIDProcessor)
+    processor.input_ids = SimpleNamespace(
+        np=np.zeros(16, dtype=np.int32),
+        gpu=np.zeros(16, dtype=np.int32),
+        copy_to_gpu=mock.Mock(),
+    )
+    processor.decode_cu = SimpleNamespace(
+        np=np.zeros(3, dtype=np.int32),
+        copy_to_gpu=mock.Mock(return_value=np.zeros(3, dtype=np.int32)),
+    )
+    processor.decode_src = SimpleNamespace(
+        np=np.zeros(2, dtype=np.int32),
+        copy_to_gpu=mock.Mock(return_value=np.zeros(2, dtype=np.int32)),
+    )
+    processor.is_deferred_out = True
+    processor.prev_batch = object()
+    processor.use_spec = True
+    processor.prev_rejected_num = None
+    processor.prev_bonus_num = None
+    processor.pre_num_decode_token_per_seq = 1
+    processor.prev_token_ids = np.zeros(2, dtype=np.int32)
+    processor.draft_token_ids = None
+    processor.runner = SimpleNamespace(enforce_eager=True, capture_sizes=[])
+    processor.get_token_locations = mock.Mock(
+        return_value=SimpleNamespace(
+            deferred_curr=np.array([], dtype=np.int32),
+            deferred_prev=np.array([], dtype=np.int32),
+            new_curr=np.array([0, 1], dtype=np.int32),
+        )
+    )
+
+    batch = SimpleNamespace(
+        scheduled_tokens=np.arange(8, dtype=np.int32),
+        # Simulate a worker-side shape expansion after the scheduler total was
+        # captured: the deferred path stages two q=4 rows.
+        total_tokens_num=2,
+        total_tokens_num_prefill=0,
+        total_tokens_num_decode=2,
+        total_seqs_num_prefill=0,
+        req_ids=[10, 11],
+        dynamic_spec_query_tokens_per_req=None,
+        scheduled_spec_decode_tokens=np.arange(6, dtype=np.int32).reshape(2, 3),
+        num_rejected=np.zeros(2, dtype=np.int32),
+        num_bonus=np.zeros(2, dtype=np.int32),
+        produces_output=lambda: False,
+    )
+
+    with mock.patch(
+        "atom.model_engine.model_runner.fill_deferred_decode_ids"
+    ) as fill_ids:
+        result = tokenIDProcessor.prepare_input_ids(processor, batch, 4)
+
+    assert result.shape == (8,)
+    # The prefill stage at the top of the method runs unconditionally and is a
+    # no-op on a decode batch; the staging that matters is the flat decode one.
+    assert processor.input_ids.copy_to_gpu.call_args_list == [
+        mock.call(0),
+        mock.call(8),
+    ]
+    fill_ids.assert_called_once()

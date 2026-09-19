@@ -171,6 +171,24 @@
     "_baseline_note": "SGLang-ATOM Qwen3.8 2.4T TP8 with FP8 KV cache, Native ATOM MHA/GDN bridge, compile-only prefill, and 5-shot GSM8K chat-completions."
   },
   {
+    "model_name": "Qwen3.8-Flash-Next-FP8 TP2",
+    "model_path": "Qwen/Qwen3.8-Flash-Next-FP8",
+    "extraArgs": "--trust-remote-code --tensor-parallel-size 2 --ep-size 2 --attention-backend aiter --kv-cache-dtype bf16 --page-size 64 --mem-fraction-static 0.95 --context-length 16384 --max-running-requests 32 --disable-radix-cache --reasoning-parser qwen3 --cuda-graph-backend-decode full --cuda-graph-max-bs-decode 32",
+    "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_PLUGINS=atom_sglang\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models\nSGLANG_USE_AITER=1\nSGLANG_AITER_KV_CACHE_LAYOUT=nhd\nAITER_LOG_LEVEL=WARNING\nAITER_MOE_PADDING_SIZE=128",
+    "runner": "atom-plugin-acc-validation-runner-sgl",
+    "test_level": "nightly",
+    "lm_eval_num_fewshot": 5,
+    "lm_eval_num_concurrent": 32,
+    "lm_eval_use_chat_completions": "1",
+    "lm_eval_extra_model_args": "max_retries=3,timeout=3600,tokenized_requests=False,trust_remote_code=True",
+    "lm_eval_batch_size": 1,
+    "lm_eval_gen_kwargs": "max_gen_toks=4096,until=<|im_end|>",
+    "accuracy_threshold": 0.96,
+    "accuracy_baseline": 0.9757,
+    "accuracy_baseline_model": "Qwen/Qwen3.8-Flash-Next-FP8",
+    "_baseline_note": "SGLang-ATOM Qwen3.8-Flash-Next TP2+EP, BF16 KV, page-size 64. Local GSM8K 5-shot chat flexible-extract = 0.9757 ± 0.0042; threshold leaves headroom for CI noise. Not Qwen3.5 and not the 2.4T GDN+MHA line."
+  },
+  {
     "model_name": "Qwen3.5-35B-A3B-FP8 TP2",
     "model_path": "Qwen/Qwen3.5-35B-A3B-FP8",
     "extraArgs": "--tensor-parallel-size 2 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
@@ -508,6 +526,24 @@
     "accuracy_baseline": null,
     "accuracy_baseline_model": "zai-org/GLM-5.2-FP8",
     "_baseline_note": "5-shot GSM8K local-completions coverage for GLM-5.2-FP8 IndexShare on MI308 using the SGLang-ATOM recipe server command."
+  },
+  {
+    "model_name": "MI308 Qwen3.8-Flash-Next-FP8 TP2",
+    "model_path": "Qwen/Qwen3.8-Flash-Next-FP8",
+    "extraArgs": "--trust-remote-code --tensor-parallel-size 2 --ep-size 2 --attention-backend aiter --kv-cache-dtype bf16 --page-size 64 --mem-fraction-static 0.95 --context-length 16384 --max-running-requests 32 --disable-radix-cache --reasoning-parser qwen3 --cuda-graph-backend-decode full --cuda-graph-max-bs-decode 32",
+    "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_PLUGINS=atom_sglang\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models\nSGLANG_USE_AITER=1\nSGLANG_AITER_KV_CACHE_LAYOUT=nhd\nAITER_LOG_LEVEL=WARNING\nAITER_MOE_PADDING_SIZE=128",
+    "runner": "atom-mi308-8gpu-plugins-accuracy",
+    "test_level": "nightly",
+    "lm_eval_num_fewshot": 5,
+    "lm_eval_num_concurrent": 32,
+    "lm_eval_use_chat_completions": "1",
+    "lm_eval_extra_model_args": "max_retries=3,timeout=3600,tokenized_requests=False,trust_remote_code=True",
+    "lm_eval_batch_size": 1,
+    "lm_eval_gen_kwargs": "max_gen_toks=4096,until=<|im_end|>",
+    "accuracy_threshold": 0.96,
+    "accuracy_baseline": 0.9757,
+    "accuracy_baseline_model": "Qwen/Qwen3.8-Flash-Next-FP8",
+    "_baseline_note": "MI308 SGLang-ATOM Qwen3.8-Flash-Next TP2+EP on gfx942 192 GiB. Same 5-shot chat GSM8K bar as the MI355 Flash entry; BF16 KV and page-size 64 are required."
   },
   {
     "model_name": "MI308 DeepSeek-V4-Flash",

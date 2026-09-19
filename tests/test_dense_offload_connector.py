@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
+import numpy as np
 import pytest
 
 from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
@@ -76,6 +78,60 @@ def _engine_scheduler(connector):
     scheduler.failed_recving_kv_req_ids = []
     scheduler.deferred_free_blocks = {}
     return scheduler
+
+
+def _stub_dcp_ops_without_triton(monkeypatch):
+    """BlockManager pulls get_dcp_local_seq_lens from dcp_ops, which imports Triton."""
+
+    def get_dcp_local_seq_lens(
+        seq_lens, dcp_size, dcp_rank, cp_kv_cache_interleave_size=1
+    ):
+        full_chunks = seq_lens // (cp_kv_cache_interleave_size * dcp_size)
+        base = full_chunks * cp_kv_cache_interleave_size
+        remainder_total = seq_lens - base * dcp_size
+        remainder = np.clip(
+            remainder_total - dcp_rank * cp_kv_cache_interleave_size,
+            0,
+            cp_kv_cache_interleave_size,
+        )
+        return base + remainder
+
+    fake_dcp_ops = ModuleType("atom.model_ops.dcp_ops")
+    fake_dcp_ops.get_dcp_local_seq_lens = get_dcp_local_seq_lens
+    monkeypatch.setitem(sys.modules, "atom.model_ops.dcp_ops", fake_dcp_ops)
+
+
+@pytest.mark.parametrize("hbm", [0, 8])
+def test_loaded_prefix_can_publish_suffix_and_be_reused(
+    monkeypatch, mock_config, seq_factory, hbm
+):
+    _stub_dcp_ops_without_triton(monkeypatch)
+    mock_config.enable_prefix_caching = True
+    mock_config.decode_context_parallel_size = 2
+    mock_config.num_kvcache_blocks = 16
+    host = Scheduler(mock_config)
+    connector = _scheduler(monkeypatch, "kv_consumer")
+    seq = seq_factory(list(range(25)))
+    host.block_manager.allocate(seq)
+    if hbm:
+        host.block_manager.hash_blocks(seq, hbm)
+        seq.num_cached_tokens = hbm
+    _arm_load(connector, seq, hbm=hbm, lmcache=16)
+
+    metadata = connector.build_connector_meta()
+    assert len(metadata.requests) == 1
+    # Model all ranks reporting successful load, then compute the next block.
+    host._mark_offload_load_ready(seq)
+    assert seq.num_cached_tokens == 16
+    assert seq.offload_promoted_tokens == 16 - hbm
+    host.block_manager.hash_blocks(seq, 8)
+    seq.num_cached_tokens = 24
+
+    following = seq_factory(list(range(25)))
+    matched = host.block_manager.can_allocate(following)
+    assert matched == 3
+    host.block_manager.allocate(following, matched)
+    assert following.num_cached_tokens == 24
 
 
 @pytest.mark.parametrize(

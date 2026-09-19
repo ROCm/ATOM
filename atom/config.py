@@ -650,6 +650,18 @@ def glm5_kpool_block_size(index_kpool: int) -> int:
     return index_kpool * _MQA_LOGITS_PRESHUFFLE_ROWS
 
 
+def _glm5_next_unsupported_features(config: "Config") -> list[str]:
+    """Return parallel modes that do not yet preserve GLM-5.3 k-pool state."""
+    unsupported = []
+    if config.prefill_context_parallel_size > 1:
+        unsupported.append("PCP")
+    if config.decode_context_parallel_size > 1:
+        unsupported.append("DCP")
+    if config.enable_tbo or config.enable_tbo_decode:
+        unsupported.append("TBO")
+    return unsupported
+
+
 _CONFIG_REGISTRY: dict[str, str] = {
     "deepseek_v32": "deepseek_v3",
     "deepseek_v4": "deepseek_v3",  # V4 reuses V3 schema; V4-specific fields
@@ -1172,6 +1184,8 @@ class SpeculativeConfig:
         "qwen4_exp_text": "qwen4_exp_mtp",
         "mimo_v2": "mimo_v2_mtp",
         "mimo_v2_flash": "mimo_v2_mtp",
+        "glm5_next": "glm5_next_mtp",
+        "glm5_next_text": "glm5_next_mtp",
     }
 
     # mtp_model_type → (n_predict_attr, architecture)
@@ -1180,6 +1194,7 @@ class SpeculativeConfig:
         "deepseek_v4_mtp": ("num_nextn_predict_layers", "DeepseekV4MTPModel"),
         "qwen3_next_mtp": ("num_nextn_predict_layers", "Qwen3NextMTPModel"),
         "qwen3_5_mtp": ("mtp_num_hidden_layers", "Qwen3_5MTPModel"),
+        "glm5_next_mtp": ("num_nextn_predict_layers", "Glm5NextMTPModel"),
         "qwen4_exp_mtp": ("mtp_num_hidden_layers", "Qwen4ExpMTPModel"),
     }
 
@@ -1393,6 +1408,16 @@ class KVEventsConfig:
     # Bounded in-process queue between scheduler and sender thread. When full,
     # oldest batch is dropped — KV events are advisory, never stall inference.
     buffer_steps: int = 10_000
+    # New fields go after the pre-existing ones so positional constructor
+    # calls keep binding the same way.
+    # ROUTER endpoint subscribers use to request replay of missed batches by
+    # sequence number. Empty string keeps replay disabled (PUB-only).
+    replay_endpoint: str = ""
+    # Size of the replay ring buffer (distinct from buffer_steps). Bounds the
+    # long-lived retention of encoded payloads; only allocated when replay is
+    # enabled. Each entry can be sizable (includes token_ids), so tune per the
+    # expected event rate and memory budget.
+    replay_buffer_steps: int = 10_000
 
     @classmethod
     def from_env(cls) -> "KVEventsConfig":
@@ -1404,8 +1429,10 @@ class KVEventsConfig:
             publisher=envs.ATOM_KV_EVENTS_PUBLISHER,
             endpoint=envs.ATOM_KV_EVENTS_ENDPOINT,
             topic=envs.ATOM_KV_EVENTS_TOPIC,
+            replay_endpoint=envs.ATOM_KV_EVENTS_REPLAY_ENDPOINT,
             hwm=envs.ATOM_KV_EVENTS_HWM,
             buffer_steps=envs.ATOM_KV_EVENTS_BUFFER_STEPS,
+            replay_buffer_steps=envs.ATOM_KV_EVENTS_REPLAY_BUFFER_STEPS,
         )
 
 
@@ -2221,15 +2248,7 @@ class Config:
         # set here and the attention builder sizes the index cache from it.
         is_glm5_next = any("Glm5Next" in str(a) for a in arches)
         if is_glm5_next:
-            unsupported_features = []
-            if self.prefill_context_parallel_size > 1:
-                unsupported_features.append("PCP")
-            if self.decode_context_parallel_size > 1:
-                unsupported_features.append("DCP")
-            if self.speculative_config is not None:
-                unsupported_features.append("speculative decoding")
-            if self.enable_tbo or self.enable_tbo_decode:
-                unsupported_features.append("TBO")
+            unsupported_features = _glm5_next_unsupported_features(self)
             if unsupported_features:
                 raise ValueError(
                     "GLM-5.3-Flash text serving does not yet support "

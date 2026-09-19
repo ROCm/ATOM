@@ -29,6 +29,7 @@ on:
           - MiniMax-M3-MXFP4 TP4
           - MiniMax-M3-MXFP8 EAGLE3 TP4 MTP3
           - Qwen3.8-2.4T-A95B-Quark-MXFP4 TP8
+          - Qwen3.8-Flash-Next-FP8 TP2
           - Qwen3.5-35B-A3B-FP8 TP2
           - Qwen3.5-35B-A3B TP2
           - Qwen3.5-397B-A17B-FP8 TP4
@@ -59,6 +60,7 @@ on:
           - MI308 Qwen3-32B-FP8 TP1
           - MI308 Qwen3-32B-FP8 TP8
           - MI308 GLM-5.2-FP8 TP8
+          - MI308 Qwen3.8-Flash-Next-FP8 TP2
           - MI308 DeepSeek-V4-Flash
       rebuild_atom_base_from_dockerfile:
         description: "Full build image before validation"
@@ -298,6 +300,21 @@ jobs:
                   "runner": "atom-plugin-acc-validation-runner-sgl",
               },
               {
+                  "toggle_env": "RUN_QWEN38_FLASH_NEXT_FP8_TP2",
+                  "model_name": "Qwen3.8-Flash-Next-FP8 TP2",
+                  "model_path": "Qwen/Qwen3.8-Flash-Next-FP8",
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 2 --ep-size 2 --attention-backend aiter --kv-cache-dtype bf16 --page-size 64 --mem-fraction-static 0.95 --context-length 16384 --max-running-requests 32 --disable-radix-cache --reasoning-parser qwen3 --cuda-graph-backend-decode full --cuda-graph-max-bs-decode 32",
+                  "lm_eval_num_fewshot": 5,
+                  "lm_eval_num_concurrent": 32,
+                  "lm_eval_use_chat_completions": "1",
+                  "lm_eval_extra_model_args": "max_retries=3,timeout=3600,tokenized_requests=False,trust_remote_code=True",
+                  "lm_eval_batch_size": 1,
+                  "lm_eval_gen_kwargs": "max_gen_toks=4096,until=<|im_end|>",
+                  "accuracy_test_threshold": 0.96,
+                  "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_PLUGINS=atom_sglang\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models\nSGLANG_USE_AITER=1\nSGLANG_AITER_KV_CACHE_LAYOUT=nhd\nAITER_LOG_LEVEL=WARNING\nAITER_MOE_PADDING_SIZE=128",
+                  "runner": "atom-plugin-acc-validation-runner-sgl",
+              },
+              {
                   "toggle_env": "RUN_QWEN35_35B_A3B_FP8_TP2",
                   "model_name": "Qwen3.5-35B-A3B-FP8 TP2",
                   "model_path": "Qwen/Qwen3.5-35B-A3B-FP8",
@@ -502,6 +519,20 @@ jobs:
                   "lm_eval_num_concurrent": 65,
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1\nSGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_ENABLE_TORCH_COMPILE=1\nSGLANG_USE_AITER=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nTORCHINDUCTOR_COMPILE_THREADS=128",
+                  "runner": "atom-mi308-8gpu-plugins-accuracy",
+              },
+              {
+                  "model_name": "MI308 Qwen3.8-Flash-Next-FP8 TP2",
+                  "model_path": "Qwen/Qwen3.8-Flash-Next-FP8",
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 2 --ep-size 2 --attention-backend aiter --kv-cache-dtype bf16 --page-size 64 --mem-fraction-static 0.95 --context-length 16384 --max-running-requests 32 --disable-radix-cache --reasoning-parser qwen3 --cuda-graph-backend-decode full --cuda-graph-max-bs-decode 32",
+                  "lm_eval_num_fewshot": 5,
+                  "lm_eval_num_concurrent": 32,
+                  "lm_eval_use_chat_completions": "1",
+                  "lm_eval_extra_model_args": "max_retries=3,timeout=3600,tokenized_requests=False,trust_remote_code=True",
+                  "lm_eval_batch_size": 1,
+                  "lm_eval_gen_kwargs": "max_gen_toks=4096,until=<|im_end|>",
+                  "accuracy_test_threshold": 0.96,
+                  "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_PLUGINS=atom_sglang\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models\nSGLANG_USE_AITER=1\nSGLANG_AITER_KV_CACHE_LAYOUT=nhd\nAITER_LOG_LEVEL=WARNING\nAITER_MOE_PADDING_SIZE=128",
                   "runner": "atom-mi308-8gpu-plugins-accuracy",
               },
               {
