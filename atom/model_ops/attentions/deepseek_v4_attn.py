@@ -2408,6 +2408,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # decode kernel only touches them when ratio != 0.
         attn_metadata.state = AttnState.DECODE
         attn_metadata.max_seqlen_q = 1
+        attn_metadata.min_seqlen_q = 1
         attn_metadata.kv_indices_swa = swa_indices_buf
         attn_metadata.kv_indptr_swa = swa_indptr
         attn_metadata.batch_id_per_q_token = batch_id_per_q_token
@@ -2565,7 +2566,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             cu_seqlens_k=None,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=int(context_lens_np.max()) if len(context_lens_np) else 1,
-            min_seqlen_q=0,
+            min_seqlen_q=int(lens.min()) if lens.size else 0,
             dropout_p=0.0,
             has_cached=False,
             total_kv=int(context_lens_np.sum()),
@@ -2755,7 +2756,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 cu_seqlens_k=None,
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_k=int(ub_ctx_np.max()) if ub_real_reqs > 0 else 1,
-                min_seqlen_q=0,
+                min_seqlen_q=(int(ub_extend_lens_np.min()) if ub_real_reqs > 0 else 0),
                 dropout_p=0.0,
                 has_cached=False,
                 total_kv=int(ub_ctx_np.sum()) if ub_real_reqs > 0 else 0,
@@ -4153,7 +4154,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             cu_seqlens_k=None,
             max_seqlen_q=max_q_len,
             max_seqlen_k=int(context_lens_np.max()) if bs else 1,
-            min_seqlen_q=0,
+            min_seqlen_q=int(extend_lens_np.min()) if bs else 0,
             dropout_p=0.0,
             has_cached=False,
             total_kv=int(context_lens_np.sum()),

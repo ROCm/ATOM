@@ -81,6 +81,19 @@ _FP8_GROUP_SIZE = 64
 _FP8_DTYPE = torch.float8_e4m3fnuz
 
 
+def v4_decode_query_group(min_seqlen_q: int, max_seqlen_q: int) -> int:
+    """Expose rectangular verify widths with a tuned Triton specialization.
+
+    Four-row verification uses the query-fused kernel, while DSpark K6 produces seven target
+    rows and uses a q7-specific regular/striped launch policy. All ragged or
+    otherwise unsupported shapes stay at one so they cannot accidentally
+    share KV indices across requests.
+    """
+    if min_seqlen_q == max_seqlen_q and min_seqlen_q in (4, 7):
+        return min_seqlen_q
+    return 1
+
+
 @functools.lru_cache(maxsize=1)
 def _cu_count() -> int:
     """Compute-unit count of the active GPU, queried once via aiter.
@@ -546,7 +559,7 @@ def _paged_decode_reduce_kernel(
     dc = tl.program_id(2)
 
     d_offs = dc * D_CHUNK + tl.arange(0, D_CHUNK)
-    k_offs = tl.arange(0, KV_SPLITS)
+    k_offs = tl.arange(0, triton.next_power_of_2(KV_SPLITS))
     d_mask = d_offs < D
 
     neg_large = -3.4028234663852886e38
@@ -1112,14 +1125,17 @@ def sparse_attn_v4_paged_decode(
     kv_last_page_lens: torch.Tensor | None = None,
     empty_kv_indptr: torch.Tensor | None = None,
     prefix: str = "",
+    query_group: int = 1,
+    kv_kind: str = "",
 ) -> torch.Tensor:
     """V4 decode sparse attention over a unified KV pool with paged indices.
 
-    Native 2buff fp8 (``unified_kv_rope`` provided): normally routes to the
-    aiter decode ASM kernel (op5). With
-    ``ATOM_USE_V4_PREFILL_ASM_FOR_DECODE=1``, gfx1250 H=128 instead reuses the
-    sparse-prefill ASM kernel with an empty extend stream. Both paths consume
-    pre-packed fp8 Q and the fp8 NoPE + bf16 RoPE pools with no requant.
+    Native 2buff fp8 (``unified_kv_rope`` provided): routes to the native-cache
+    Triton dispatcher when ``ATOM_USE_TRITON_ATTN=1``. Otherwise, eligible
+    gfx1250 H=128 shapes may reuse the sparse-prefill ASM kernel when
+    ``ATOM_USE_V4_PREFILL_ASM_FOR_DECODE=1``; remaining shapes use the aiter
+    decode ASM kernel (op5). All paths consume pre-packed fp8 Q and the fp8
+    NoPE + bf16 RoPE pools with no requant.
 
     Otherwise (bf16): the existing Triton / reference path. When ``kv_scales``
     is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and is dequantized
@@ -1127,6 +1143,23 @@ def sparse_attn_v4_paged_decode(
     unreachable from the model).
     """
     if unified_kv_rope is not None:
+        if os.environ.get("ATOM_USE_TRITON_ATTN", "1") == "1":
+            from atom.model_ops.v4_kernels.paged_decode_fp8_triton import (
+                sparse_attn_v4_paged_decode_fp8_triton_auto,
+            )
+
+            return sparse_attn_v4_paged_decode_fp8_triton_auto(
+                q_packed_in,
+                q_rope_in,
+                unified_kv,
+                unified_kv_rope,
+                kv_indices,
+                kv_indptr,
+                attn_sink,
+                softmax_scale,
+                query_group=query_group,
+                kv_kind=kv_kind,
+            )
         if (
             envs.ATOM_USE_V4_PREFILL_ASM_FOR_DECODE
             and q_packed_in is not None

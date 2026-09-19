@@ -114,6 +114,7 @@ from atom.model_ops.v4_kernels import (
     sparse_attn_v4_paged_prefill,
     swa_write,
     update_compressor_states,
+    v4_decode_query_group,
 )
 from atom.utils import envs, mark_spliting_op
 from atom.utils.attn_ffn_piecewise import decode_bucket_key, piecewise_core
@@ -3127,10 +3128,10 @@ class DeepseekV4Attention(nn.Module):
             else:  # ratio == 128
                 kv_indices = attn_md.kv_indices_hca
                 kv_indptr = attn_md.kv_indptr_hca
-            # Dispatch on kv-cache layout inside the wrapper: fp8 2buff
-            # (unified_kv_rope set) → aiter ASM with pre-packed fp8 Q + the
-            # 2buff fp8/bf16 pools read with no requant. The optional H=128
-            # prefill-ASM decode route also consumes the shared empty CSR.
+            # Dispatch on KV-cache layout inside the wrapper. Native 2-buffer
+            # FP8 uses the tuned Triton path by default; its AITER fallbacks
+            # include the optional gfx1250 H=128 prefill-ASM route, which also
+            # consumes the shared empty CSR. No route requantizes the cache.
             o = sparse_attn_v4_paged_decode(
                 qkn.q_sa,
                 self.unified_kv,
@@ -3144,6 +3145,10 @@ class DeepseekV4Attention(nn.Module):
                 qo_indptr=attn_md.qo_indptr,
                 empty_kv_indptr=attn_md.empty_kv_indptr,
                 prefix=f"{self.layer_name}.sparse_attn_decode",
+                query_group=v4_decode_query_group(
+                    attn_md.min_seqlen_q, attn_md.max_seqlen_q
+                ),
+                kv_kind="csa" if ratio == 4 else "hca" if ratio == 128 else "swa",
             )  # [S, H, head_dim]
         else:
             # Two-source paged prefill: prefix from `unified_kv` (per-ratio
@@ -3730,7 +3735,8 @@ class MoE(nn.Module):
         return routed
 
     def single_stream_moe_forward(
-        self, x: torch.Tensor  # [num_tokens, dim]
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Sequential: shared_experts → routed_experts → combine."""
         shared = self.shared_experts(x) if self.shared_experts is not None else None
@@ -3744,7 +3750,8 @@ class MoE(nn.Module):
         )
 
     def dual_stream_moe_forward(
-        self, x: torch.Tensor  # [num_tokens, dim]
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Run shared_experts on `alt_stream` in parallel with routed_experts
         on the current stream. Mirrors V2's pattern. Both reads of `x` are
@@ -4189,7 +4196,8 @@ class ParallelHead(ParallelLMHead):
         self.hc_eps = hc_eps
 
     def get_logits(
-        self, x: torch.Tensor  # [num_tokens, dim]
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]
     ) -> torch.Tensor:  # [bs, vocab]
         """Project to vocab logits via the inherited `ParallelLMHead.forward`,
         which handles last-token slicing (prefill) + tgemm.mm + all-gather.

@@ -12,7 +12,10 @@ from unittest import mock
 
 import pytest
 
-from atom.model_engine.prefill_delayer import PrefillDelayer
+from atom.model_engine.prefill_delayer import (
+    PrefillDecodeInterval,
+    PrefillDelayer,
+)
 
 MAX_BATCHED = 16384
 
@@ -346,6 +349,65 @@ class TestPrefillDecodeInterval:
         peer_prefill_ran = _add_rank({7: 1})
         assert call(d, pending_tokens=1000, reduce=peer_prefill_ran) is False
         assert d._stat_hold_decode_interval == 1
+
+
+class TestPrefillDecodeIntervalOnly:
+    def test_protects_exact_number_of_decode_passes(self):
+        interval = PrefillDecodeInterval(3)
+        interval.notify_prefill_executed()
+
+        for _ in range(3):
+            assert (
+                interval.should_allow_prefill(
+                    prefillable=True,
+                    pending_tokens=1,
+                    running_decode_batch=1,
+                )
+                is False
+            )
+
+        assert interval.should_allow_prefill(
+            prefillable=True,
+            pending_tokens=1,
+            running_decode_batch=1,
+        )
+        assert interval._stat_hold_decode_interval == 3
+
+    def test_countdown_advances_without_waiting_prefill(self):
+        interval = PrefillDecodeInterval(2)
+        interval.notify_prefill_executed()
+
+        assert interval.should_allow_prefill(
+            prefillable=False,
+            pending_tokens=0,
+            running_decode_batch=1,
+        )
+        assert interval.should_allow_prefill(
+            prefillable=False,
+            pending_tokens=0,
+            running_decode_batch=1,
+        )
+        assert interval._decode_interval_remaining == 0
+
+    def test_does_not_enable_prefill_coalescing(self):
+        interval = PrefillDecodeInterval(10)
+
+        assert interval.should_allow_prefill(
+            prefillable=True,
+            pending_tokens=1,
+            running_decode_batch=64,
+            kv_usage=0.5,
+        )
+
+    def test_no_decode_does_not_block_prefill(self):
+        interval = PrefillDecodeInterval(10)
+        interval.notify_prefill_executed()
+
+        assert interval.should_allow_prefill(
+            prefillable=True,
+            pending_tokens=1,
+            running_decode_batch=0,
+        )
 
 
 class TestStatsDistinct:

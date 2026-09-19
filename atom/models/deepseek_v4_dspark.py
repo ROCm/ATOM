@@ -887,6 +887,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
                 q_rope_in=qkn.q_rope,
                 qo_indptr=bufs.qo_indptr[: B * T + 1],
                 prefix=f"{a.layer_name}.dspark_attn_fp8",
+                kv_kind="dspark",
             )  # [B*T, n_heads, head_dim]
             out = out.view(B, T, a.n_local_heads, a.head_dim)
         else:

@@ -1,5 +1,11 @@
 """
-PrefillDelayer — a cross-DP-rank prefill *coalescer* for ATOM.
+Prefill admission controls for ATOM.
+
+``PrefillDecodeInterval`` is the lightweight TP-only control: after an
+executed prefill, it reserves a fixed number of scheduler passes for already
+running decode work before another prefill may be admitted.
+
+``PrefillDelayer`` is the cross-DP-rank prefill *coalescer*.
 
 Purpose
 -------
@@ -87,6 +93,65 @@ import torch
 logger = logging.getLogger(__name__)
 
 _DEBUG = os.environ.get("ATOM_PREFILL_DELAYER_DEBUG", "0") == "1"
+
+
+class PrefillDecodeInterval:
+    """Protect decode passes after a prefill without enabling coalescing.
+
+    This is the TP-only counterpart of SGLang's ``--prefill-decode-interval``.
+    It intentionally ignores fill, KV-pressure, and queue-age inputs: attaching
+    the full ``PrefillDelayer`` to DP1 would change more than the interval and
+    make an interval-only comparison impossible.
+    """
+
+    __slots__ = (
+        "_decode_interval_remaining",
+        "_prefill_executed_since_last_decision",
+        "_stat_hold_decode_interval",
+        "prefill_decode_interval",
+    )
+
+    def __init__(self, prefill_decode_interval: int):
+        if prefill_decode_interval < 0:
+            raise ValueError(
+                "prefill_decode_interval must be non-negative; "
+                f"got {prefill_decode_interval}"
+            )
+        self.prefill_decode_interval = prefill_decode_interval
+        self._decode_interval_remaining = 0
+        self._prefill_executed_since_last_decision = False
+        self._stat_hold_decode_interval = 0
+        logger.info(
+            "PrefillDecodeInterval initialized: prefill_decode_interval=%d",
+            prefill_decode_interval,
+        )
+
+    def notify_prefill_executed(self) -> None:
+        """Arm the interval on the scheduler pass after a real prefill."""
+        self._prefill_executed_since_last_decision = True
+
+    def should_allow_prefill(
+        self,
+        prefillable: bool,
+        pending_tokens: int,
+        running_decode_batch: int = 0,
+        kv_usage: float = 0.0,
+        has_partial: bool = False,
+        oldest_waiting_age_ms: float = 0.0,
+    ) -> bool:
+        del pending_tokens, kv_usage, has_partial, oldest_waiting_age_ms
+
+        if self._prefill_executed_since_last_decision:
+            self._decode_interval_remaining = self.prefill_decode_interval
+            self._prefill_executed_since_last_decision = False
+
+        if self._decode_interval_remaining > 0:
+            self._decode_interval_remaining -= 1
+            if prefillable and running_decode_batch > 0:
+                self._stat_hold_decode_interval += 1
+                return False
+
+        return True
 
 
 class PrefillDelayer:

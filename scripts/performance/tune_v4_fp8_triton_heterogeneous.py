@@ -1,0 +1,553 @@
+#!/usr/bin/env python3
+"""Tune DP-attention q7 HCA decode on heterogeneous request lengths.
+
+The ordinary tuner gives every request the same context length.  Agentic
+serving does not: one DP rank can decode a long request beside several much
+shorter requests.  This benchmark gives each request its own physical HCA
+cache and repeats that request's indices for the seven target verification
+rows.  HCA stores the 128-row local window plus one compressed row per 128
+context tokens, so command-line vectors contain context lengths rather than
+the already-compressed kernel row counts.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import statistics
+from collections.abc import Callable, Sequence
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+import torch
+
+from atom.model_ops.v4_kernels.paged_decode import _sparse_attn_v4_paged_decode_asm
+from atom.model_ops.v4_kernels.paged_decode_fp8_triton import (
+    sparse_attn_v4_paged_decode_fp8_triton,
+    sparse_attn_v4_paged_decode_fp8_triton_auto,
+    sparse_attn_v4_paged_decode_fp8_triton_query_group,
+)
+from atom.model_ops.v4_kernels.v4_quant import quantize_bf16_to_v4_2buff_triton
+from scripts.performance.bench_v4_kv_cache_dtype import (
+    HEAD_DIM,
+    ROPE_HEAD_DIM,
+    SOFTMAX_SCALE,
+)
+
+VERIFY_WIDTH = 7
+LOCAL_HEADS = 128
+WINDOW = 128
+COMPRESS_RATIO = 128
+
+
+@dataclass(frozen=True)
+class Config:
+    name: str
+    mode: str
+    block_h: int
+    block_k: int
+    kv_splits: int
+    num_stages: int
+    num_warps: int
+    matrix_instr_nonkdim: int
+    use_mxfp8_qk: bool = True
+    use_mxfp8_v: bool = False
+    use_native_bf16_v: bool = False
+    fused_query_group: int = 4
+
+
+CONFIGS = (
+    Config("auto-hca-q7", "auto", 64, 32, 8, 2, 4, 16),
+    Config("fp8v-bh64-bk32-s8-st2-w4", "fused", 64, 32, 8, 2, 4, 16),
+    *(
+        Config(
+            f"native-bh64-bk32-s{splits}-st2-w4",
+            "fused",
+            64,
+            32,
+            splits,
+            2,
+            4,
+            16,
+            use_native_bf16_v=True,
+        )
+        for splits in (2, 3, 4, 5, 6, 7, 8, 10, 12, 16)
+    ),
+    *(
+        Config(
+            f"native-bh64-bk64-s{splits}-st1-w4",
+            "fused",
+            64,
+            64,
+            splits,
+            1,
+            4,
+            0,
+            use_native_bf16_v=True,
+        )
+        for splits in (2, 3, 4, 5, 6, 7, 8, 10, 12, 16)
+    ),
+    Config(
+        "native-bh32-bk32-s8-st2-w4",
+        "fused",
+        32,
+        32,
+        8,
+        2,
+        4,
+        16,
+        use_native_bf16_v=True,
+    ),
+    Config(
+        "native-bh32-bk64-s8-st1-w4",
+        "fused",
+        32,
+        64,
+        8,
+        1,
+        4,
+        0,
+        use_native_bf16_v=True,
+    ),
+    Config(
+        "native-bh64-bk32-s8-st1-w4",
+        "fused",
+        64,
+        32,
+        8,
+        1,
+        4,
+        16,
+        use_native_bf16_v=True,
+    ),
+    Config(
+        "native-bh64-bk32-s8-st3-w4",
+        "fused",
+        64,
+        32,
+        8,
+        3,
+        4,
+        16,
+        use_native_bf16_v=True,
+    ),
+    Config(
+        "native-bh64-bk32-s8-st2-w2",
+        "fused",
+        64,
+        32,
+        8,
+        2,
+        2,
+        16,
+        use_native_bf16_v=True,
+    ),
+    Config(
+        "native-bh64-bk32-s8-st2-w8",
+        "fused",
+        64,
+        32,
+        8,
+        2,
+        8,
+        16,
+        use_native_bf16_v=True,
+    ),
+    Config(
+        "native-bh64-bk32-s8-st2-w4-mi0",
+        "fused",
+        64,
+        32,
+        8,
+        2,
+        4,
+        0,
+        use_native_bf16_v=True,
+    ),
+    Config(
+        "native-bh64-bk32-s8-st2-w4-mi32",
+        "fused",
+        64,
+        32,
+        8,
+        2,
+        4,
+        32,
+        use_native_bf16_v=True,
+    ),
+    *(
+        Config(
+            f"group-{'native' if native else 'fp8'}-fq{fused_q}-bk{block_k}-s{splits}",
+            "group",
+            16,
+            block_k,
+            splits,
+            1,
+            4,
+            0,
+            use_native_bf16_v=native,
+            fused_query_group=fused_q,
+        )
+        for native in (False, True)
+        for fused_q in (2, 4)
+        for block_k, splits in ((32, 4), (32, 8), (64, 4), (64, 8), (64, 16))
+    ),
+)
+
+DEFAULT_CONTEXT_VECTORS = (
+    (8192, 32768, 86016, 262144, 524288, 700000),
+    (32768, 65536, 98304, 131072, 262144, 524288),
+    (8192, 8192, 32768, 86016, 262144, 700000),
+)
+
+
+def _parse_vectors(value: str) -> list[tuple[int, ...]]:
+    try:
+        vectors = [
+            tuple(int(item) for item in vector.split(","))
+            for vector in value.split(";")
+        ]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("vectors must contain integers") from exc
+    if not vectors or any(
+        not vector or any(item <= 0 for item in vector) for vector in vectors
+    ):
+        raise argparse.ArgumentTypeError(
+            "vectors and context lengths must be non-empty and positive"
+        )
+    return vectors
+
+
+def _hca_rows(context_len: int) -> int:
+    return WINDOW + (context_len + VERIFY_WIDTH) // COMPRESS_RATIO
+
+
+def _make_heterogeneous_indices(
+    kv_lens: Sequence[int], device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    request_indices: list[torch.Tensor] = []
+    physical_offset = 0
+    for kv_len in kv_lens:
+        rows = torch.arange(
+            physical_offset,
+            physical_offset + kv_len,
+            dtype=torch.int32,
+            device=device,
+        )
+        request_indices.extend([rows] * VERIFY_WIDTH)
+        physical_offset += kv_len
+    indices = torch.cat(request_indices).contiguous()
+    query_kv_lens = torch.tensor(
+        [kv_len for kv_len in kv_lens for _ in range(VERIFY_WIDTH)],
+        dtype=torch.int32,
+        device=device,
+    )
+    indptr = torch.empty(query_kv_lens.numel() + 1, dtype=torch.int32, device=device)
+    indptr[0] = 0
+    torch.cumsum(query_kv_lens, dim=0, out=indptr[1:])
+    return indices, indptr
+
+
+def _capture(fn: Callable[[], torch.Tensor]) -> Callable[[], torch.Tensor]:
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        for _ in range(3):
+            fn()
+    side_stream.synchronize()
+    torch.cuda.current_stream().wait_stream(side_stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = fn()
+
+    def replay() -> torch.Tensor:
+        graph.replay()
+        return output
+
+    return replay
+
+
+def _time(
+    fn: Callable[[], torch.Tensor],
+    flush: torch.Tensor,
+    *,
+    warmup: int,
+    iterations: int,
+) -> tuple[float, float, float]:
+    for _ in range(warmup):
+        flush.add_(1.0)
+        fn()
+    torch.cuda.synchronize()
+    samples: list[float] = []
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    for _ in range(iterations):
+        flush.add_(1.0)
+        start.record()
+        fn()
+        end.record()
+        end.synchronize()
+        samples.append(float(start.elapsed_time(end)) * 1000.0)
+    samples.sort()
+    return (
+        statistics.median(samples),
+        samples[max(0, int(iterations * 0.1) - 1)],
+        samples[min(iterations - 1, int(iterations * 0.9))],
+    )
+
+
+def _make_runner(
+    config: Config,
+    q_packed: torch.Tensor,
+    q_rope: torch.Tensor,
+    kv_packed: torch.Tensor,
+    kv_rope: torch.Tensor,
+    indices: torch.Tensor,
+    indptr: torch.Tensor,
+    sink: torch.Tensor,
+) -> Callable[[], torch.Tensor]:
+    def run() -> torch.Tensor:
+        if config.mode == "auto":
+            return sparse_attn_v4_paged_decode_fp8_triton_auto(
+                q_packed,
+                q_rope,
+                kv_packed,
+                kv_rope,
+                indices,
+                indptr,
+                sink,
+                SOFTMAX_SCALE,
+                query_group=VERIFY_WIDTH,
+                kv_kind="hca",
+            )
+        if config.mode == "group":
+            return sparse_attn_v4_paged_decode_fp8_triton_query_group(
+                q_packed,
+                q_rope,
+                kv_packed,
+                kv_rope,
+                indices,
+                indptr,
+                sink,
+                SOFTMAX_SCALE,
+                query_group=VERIFY_WIDTH,
+                fused_query_group=config.fused_query_group,
+                block_h=config.block_h,
+                block_k=config.block_k,
+                kv_splits=config.kv_splits,
+                num_stages=config.num_stages,
+                num_warps=config.num_warps,
+                waves_per_eu=1,
+                matrix_instr_nonkdim=config.matrix_instr_nonkdim,
+                use_mxfp8_qk=config.use_mxfp8_qk,
+                use_native_bf16_v=config.use_native_bf16_v,
+                reduce_d_chunk=512,
+                reduce_num_warps=1,
+                fp16_partials=True,
+            )
+        return sparse_attn_v4_paged_decode_fp8_triton(
+            q_packed,
+            q_rope,
+            kv_packed,
+            kv_rope,
+            indices,
+            indptr,
+            sink,
+            SOFTMAX_SCALE,
+            block_h=config.block_h,
+            block_k=config.block_k,
+            kv_splits=config.kv_splits,
+            num_stages=config.num_stages,
+            num_warps=config.num_warps,
+            waves_per_eu=1,
+            matrix_instr_nonkdim=config.matrix_instr_nonkdim,
+            use_mxfp8_qk=config.use_mxfp8_qk,
+            use_mxfp8_v=config.use_mxfp8_v,
+            use_native_bf16_v=config.use_native_bf16_v,
+            reduce_d_chunk=512,
+            reduce_num_warps=1,
+            fp16_partials=True,
+        )
+
+    return run
+
+
+def benchmark_vector(
+    context_lens: Sequence[int],
+    *,
+    warmup: int,
+    iterations: int,
+    l2_flush_mib: int,
+    seed: int,
+    device: torch.device,
+) -> dict[str, object]:
+    kv_lens = [_hca_rows(context_len) for context_len in context_lens]
+    requests = len(context_lens)
+    tokens = requests * VERIFY_WIDTH
+    pages = sum(kv_lens)
+    torch.manual_seed(seed + sum(context_lens) + requests)
+    q = torch.randn(
+        (tokens, LOCAL_HEADS, HEAD_DIM), dtype=torch.bfloat16, device=device
+    )
+    kv = torch.randn((pages, HEAD_DIM), dtype=torch.bfloat16, device=device)
+    indices, indptr = _make_heterogeneous_indices(kv_lens, device)
+    sink = torch.randn((LOCAL_HEADS,), dtype=torch.float32, device=device)
+    q_packed, q_rope = quantize_bf16_to_v4_2buff_triton(q)
+    kv_packed, kv_rope = quantize_bf16_to_v4_2buff_triton(kv.view(pages, 1, HEAD_DIM))
+    kv_packed = kv_packed.view(pages, HEAD_DIM)
+    kv_rope = kv_rope.view(pages, ROPE_HEAD_DIM)
+    qo_indptr = torch.arange(tokens + 1, dtype=torch.int32, device=device)
+    flush = torch.zeros(
+        l2_flush_mib * 1024 * 1024 // 4, dtype=torch.float32, device=device
+    )
+
+    def run_aiter() -> torch.Tensor:
+        return _sparse_attn_v4_paged_decode_asm(
+            kv_packed,
+            indices,
+            indptr,
+            sink,
+            SOFTMAX_SCALE,
+            kv_rope,
+            q_packed,
+            q_rope,
+            qo_indptr=qo_indptr,
+        )
+
+    eager_runners = {
+        config.name: _make_runner(
+            config, q_packed, q_rope, kv_packed, kv_rope, indices, indptr, sink
+        )
+        for config in CONFIGS
+    }
+    reference = run_aiter().float()
+    aiter_runner = _capture(run_aiter)
+    runners = {name: _capture(fn) for name, fn in eager_runners.items()}
+    results: list[dict[str, object]] = []
+    current_us = 0.0
+    aiter_us, aiter_p10_us, aiter_p90_us = _time(
+        aiter_runner, flush, warmup=warmup, iterations=iterations
+    )
+    print(
+        f"             AITER: {aiter_us:7.2f} us "
+        f"p10/p90={aiter_p10_us:.2f}/{aiter_p90_us:.2f}",
+        flush=True,
+    )
+    for config in CONFIGS:
+        output = eager_runners[config.name]().float()
+        cosine = torch.nn.functional.cosine_similarity(
+            reference.flatten(), output.flatten(), dim=0
+        ).item()
+        relative_rmse = (
+            (output - reference).square().mean().sqrt()
+            / reference.square().mean().sqrt()
+        ).item()
+        median_us, p10_us, p90_us = _time(
+            runners[config.name], flush, warmup=warmup, iterations=iterations
+        )
+        if config is CONFIGS[0]:
+            current_us = median_us
+        result = {
+            "config": asdict(config),
+            "median_us": median_us,
+            "p10_us": p10_us,
+            "p90_us": p90_us,
+            "speedup_vs_current_pct": (current_us / median_us - 1.0) * 100.0,
+            "speedup_vs_aiter_pct": (aiter_us / median_us - 1.0) * 100.0,
+            "cosine_vs_aiter": cosine,
+            "relative_rmse_vs_aiter": relative_rmse,
+        }
+        results.append(result)
+        print(
+            f"  {config.name:>16}: {median_us:7.2f} us "
+            f"p10/p90={p10_us:.2f}/{p90_us:.2f} "
+            f"vs-current={result['speedup_vs_current_pct']:+6.2f}% "
+            f"vs-AITER={result['speedup_vs_aiter_pct']:+6.2f}% "
+            f"cos={cosine:.7f} rrmse={relative_rmse:.4%}",
+            flush=True,
+        )
+    results.sort(key=lambda item: float(item["median_us"]))
+    return {
+        "context_lens": list(context_lens),
+        "hca_kv_lens": kv_lens,
+        "requests": requests,
+        "tokens": tokens,
+        "aiter_us": aiter_us,
+        "aiter_p10_us": aiter_p10_us,
+        "aiter_p90_us": aiter_p90_us,
+        "results": results,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--context-vectors",
+        type=_parse_vectors,
+        default=list(DEFAULT_CONTEXT_VECTORS),
+        help="semicolon-separated vectors of comma-separated context lengths",
+    )
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--iterations", type=int, default=100)
+    parser.add_argument("--l2-flush-mib", type=int, default=64)
+    parser.add_argument("--seed", type=int, default=20260917)
+    parser.add_argument(
+        "--configs",
+        help="comma-separated config names; default benchmarks every config",
+    )
+    parser.add_argument("--json", type=Path)
+    args = parser.parse_args()
+    if args.warmup < 0 or args.iterations <= 0 or args.l2_flush_mib <= 0:
+        parser.error("warmup must be >=0; iterations and l2-flush-mib must be >0")
+    if not torch.cuda.is_available():
+        raise RuntimeError("this benchmark requires a ROCm GPU")
+
+    global CONFIGS
+    if args.configs:
+        requested = args.configs.split(",")
+        configs_by_name = {config.name: config for config in CONFIGS}
+        missing = [name for name in requested if name not in configs_by_name]
+        if missing:
+            parser.error(f"unknown configs: {','.join(missing)}")
+        CONFIGS = tuple(configs_by_name[name] for name in requested)
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    payload: dict[str, object] = {
+        "metadata": {
+            "torch": torch.__version__,
+            "hip": torch.version.hip,
+            "device": torch.cuda.get_device_properties(device).name,
+            "verify_width": VERIFY_WIDTH,
+            "local_heads": LOCAL_HEADS,
+            "warmup": args.warmup,
+            "iterations": args.iterations,
+            "l2_flush_mib": args.l2_flush_mib,
+            "cuda_graph": True,
+        },
+        "vectors": [],
+    }
+    for index, context_lens in enumerate(args.context_vectors, 1):
+        print(
+            f"vector {index}: contexts={list(context_lens)} "
+            f"HCA-rows={[_hca_rows(item) for item in context_lens]}",
+            flush=True,
+        )
+        result = benchmark_vector(
+            context_lens,
+            warmup=args.warmup,
+            iterations=args.iterations,
+            l2_flush_mib=args.l2_flush_mib,
+            seed=args.seed,
+            device=device,
+        )
+        payload["vectors"].append(result)  # type: ignore[union-attr]
+        torch.cuda.empty_cache()
+
+    if args.json is not None:
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(json.dumps(payload, indent=2) + "\n")
+        print(f"wrote {args.json}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

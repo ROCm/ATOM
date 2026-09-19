@@ -38,7 +38,7 @@ no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only whe
 | **ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK** | float | 0.9 | At/above this KV usage a prefillable rank force-releases (can't accumulate a bigger batch anyway). |
 | **ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK** | float\|"" | "" (None) | If set, a prefillable rank below this KV usage force-releases (GPU starving). |
 | **ATOM_PREFILL_DELAYER_MAX_QUEUE_MS** | float\|"" | "" (None) | TTFT SLA guard: if any rank's oldest schedulable waiting prefill has queued (since arrival) ≥ this many ms, force-release regardless of the fill target. Measures true end-to-end wait (backlog + coalescer holds), unlike the tick-based TTFT bound which only caps one hold episode. Empty = disabled; set to your TTFT budget (a small value under heavy backlog fires every tick and defeats coalescing). |
-| **ATOM_PREFILL_DECODE_INTERVAL** | int | 0 | After an executed prefill forward, protect this many scheduler passes for decode before admitting another prefill. `0` disables the interval. |
+| **ATOM_PREFILL_DECODE_INTERVAL** | int | 0 | After an executed prefill forward, protect this many scheduler passes for decode before admitting another prefill. In TP-only/DP1 mode this enables an interval-only gate without enabling prefill coalescing; DP-attention applies the interval through `PrefillDelayer`. `0` disables the interval. |
 | **ATOM_PREFILL_DELAYER_DEBUG** | bool | false | Per-tick FIRE/HOLD debug logging. |
 | **ATOM_PREFILL_DELAYER_LOG_EVERY** | int | 1000 | Emit aggregate stats (per-exit fire counts + hold rate) every N decisions (0 disables). |
 
@@ -67,6 +67,7 @@ no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only whe
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
+| **ATOM_USE_TRITON_ATTN** | bool | 1 (true) | Use Triton attention kernels, including the native two-buffer FP8 V4 decode path. Set `0` to use the available AITER/reference fallback. |
 | **ATOM_USE_TRITON_GEMM** | bool | 0 (false) | If set to `1`, use AITER Triton FP4 weight preshuffled GEMM. Otherwise use AITER ASM FP4 weight preshuffled GEMM. |
 | **ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM** | bool | 0 (false) | If set to `1`, use AITER Triton FP4 GEMM with non-shuffled weights. Takes precedence over the FP4 preshuffled GEMM path selected by `ATOM_USE_TRITON_GEMM`. |
 | **ATOM_MHC_USE_BF16** | bool | 1 (true) | Use AITER BF16 hi/lo mHC computation for attention, FFN and head. After loading, replace FP32 fn storage with `mhc_shuffle_fn` output; no FP32 copy is retained. Set to `0` for FP32 mHC. Takes effect at model load; restart to change modes. On gfx1250, AITER enables shuffled residuals only while its runtime `mhc_fused_post_pre` policy remains fused (`M < 1024`); larger M uses ordinary residual layout and the standalone post/pre fallback. |

@@ -167,6 +167,20 @@ class EngineCore:
                 config,
                 state_runtime=self.state_runtime,
             )
+            if (
+                config.pipeline_parallel_size == 1
+                and config.parallel_config.data_parallel_size == 1
+                and envs.ATOM_PREFILL_DECODE_INTERVAL > 0
+            ):
+                # The full PrefillDelayer also coalesces small prefills and is
+                # reserved for DPA. TP-only runs need the interval by itself so
+                # setting ATOM_PREFILL_DECODE_INTERVAL changes exactly one
+                # scheduling policy, matching SGLang's DP1 behavior.
+                from atom.model_engine.prefill_delayer import PrefillDecodeInterval
+
+                self.scheduler.set_prefill_delayer(
+                    PrefillDecodeInterval(envs.ATOM_PREFILL_DECODE_INTERVAL)
+                )
 
         self.kv_transfer_enabled = bool(config.kv_transfer_config)
         self._next_idle_kv_drain = 0.0
