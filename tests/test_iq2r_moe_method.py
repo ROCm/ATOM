@@ -168,6 +168,7 @@ def test_iq2r_apply_only_routes_and_delegates_to_aiter(monkeypatch):
 
     monkeypatch.setattr(aiter_iq2r_moe, "IQ2RMoeWorkspace", FakeWorkspace)
     monkeypatch.setattr(moe_mod, "fused_moe", fake_fused_moe)
+    monkeypatch.setattr(moe_mod, "_IQ2R_ROUTE_CAPTURE_DIR", "/tmp/capture")
 
     arguments = {
         "layer": layer,
@@ -204,3 +205,236 @@ def test_iq2r_apply_only_routes_and_delegates_to_aiter(monkeypatch):
     assert kwargs["iq2r_w1_tile_n"] == 128
     assert kwargs["iq2r_w2_tile_n"] == 64
     assert kwargs["iq2r_workspace"] == (8, 4, hidden.device)
+    assert kwargs["iq2r_router_logits"] is None
+    assert kwargs["iq2r_router_bias"] is None
+    assert not any(name.startswith("qtip2_") for name in kwargs)
+
+
+def test_iq2r_apply_folds_router_bias_only_in_fused_frontend(monkeypatch):
+    method = object.__new__(moe_mod.Iq2rMoEMethod)
+    method.moe = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(use_ep=False),
+        max_num_tokens=8,
+    )
+    method._workspaces = {}
+    layer = SimpleNamespace(
+        num_fused_shared_experts=0,
+        routed_scaling_factor=1.0,
+        w13_weight=torch.empty((128, 3), dtype=torch.uint8),
+        w13_weight_scale=torch.empty((128, 5), dtype=torch.uint8),
+        w2_weight=torch.empty((128, 2), dtype=torch.uint8),
+        w2_weight_scale=torch.empty((128, 7), dtype=torch.uint8),
+        w13_bias=torch.empty((128, 4), dtype=torch.bfloat16),
+        w2_bias=torch.empty((128, 2), dtype=torch.bfloat16),
+        iq2r_gate_up_metadata=object(),
+        iq2r_down_metadata=object(),
+        iq2r_gate_up_tile_n=128,
+        iq2r_down_tile_n=64,
+    )
+    hidden = torch.randn(3, 4, dtype=torch.bfloat16)
+    logits = torch.randn(3, 128, dtype=torch.bfloat16)
+    router_bias = torch.randn(128, dtype=torch.bfloat16)
+
+    class FakeWorkspace:
+        def __init__(self, tokens, topk):
+            self.topk_weights = torch.empty(tokens, topk, dtype=torch.float32)
+            self.topk_ids = torch.empty(tokens, topk, dtype=torch.int32)
+
+        @classmethod
+        def allocate(cls, tokens, topk, *, device):
+            del device
+            return cls(tokens, topk)
+
+    calls = []
+
+    def fake_fused_moe(**kwargs):
+        calls.append(kwargs)
+        return torch.empty_like(kwargs["hidden_states"])
+
+    monkeypatch.setattr(aiter_iq2r_moe, "IQ2RMoeWorkspace", FakeWorkspace)
+    monkeypatch.setattr(moe_mod, "fused_moe", fake_fused_moe)
+    monkeypatch.setattr(
+        moe_mod.FusedMoE,
+        "select_experts",
+        staticmethod(lambda **_kwargs: pytest.fail("fused routing must own top-k")),
+    )
+
+    method.apply(
+        layer=layer,
+        x=hidden,
+        router_logits=logits,
+        router_bias=router_bias,
+        top_k=4,
+        renormalize=True,
+        global_num_experts=128,
+        activation=moe_mod.ActivationType.Swiglu,
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["iq2r_router_logits"] is logits
+    assert calls[0]["iq2r_router_bias"] is router_bias
+
+
+def test_iq2r_router_bias_fallback_restores_bf16_logits(monkeypatch):
+    method = object.__new__(moe_mod.Iq2rMoEMethod)
+    method.moe = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(use_ep=False),
+        max_num_tokens=8,
+    )
+    method._workspaces = {}
+    layer = SimpleNamespace(
+        num_fused_shared_experts=0,
+        routed_scaling_factor=1.0,
+        w13_weight=torch.empty((128, 3), dtype=torch.uint8),
+        w13_weight_scale=torch.empty((128, 5), dtype=torch.uint8),
+        w2_weight=torch.empty((128, 2), dtype=torch.uint8),
+        w2_weight_scale=torch.empty((128, 7), dtype=torch.uint8),
+        w13_bias=torch.empty((128, 4), dtype=torch.bfloat16),
+        w2_bias=torch.empty((128, 2), dtype=torch.bfloat16),
+        iq2r_gate_up_metadata=object(),
+        iq2r_down_metadata=object(),
+        iq2r_gate_up_tile_n=128,
+        iq2r_down_tile_n=64,
+    )
+    hidden = torch.randn(3, 4, dtype=torch.bfloat16)
+    logits = torch.randn(3, 128, dtype=torch.bfloat16)
+    router_bias = torch.randn(128, dtype=torch.bfloat16)
+    selected_logits = []
+
+    class FakeWorkspace:
+        @classmethod
+        def allocate(cls, tokens, topk, *, device):
+            return (tokens, topk, device)
+
+    def fake_select(**kwargs):
+        selected_logits.append(kwargs["router_logits"])
+        return (
+            torch.full((3, 4), 0.25, dtype=torch.float32),
+            torch.arange(12, dtype=torch.int32).reshape(3, 4),
+        )
+
+    monkeypatch.setattr(aiter_iq2r_moe, "IQ2RMoeWorkspace", FakeWorkspace)
+    monkeypatch.setattr(moe_mod.FusedMoE, "select_experts", staticmethod(fake_select))
+    monkeypatch.setattr(moe_mod, "_IQ2R_ROUTE_CAPTURE_DIR", "/tmp/capture")
+    monkeypatch.setattr(
+        moe_mod,
+        "fused_moe",
+        lambda **kwargs: torch.empty_like(kwargs["hidden_states"]),
+    )
+
+    method.apply(
+        layer=layer,
+        x=hidden,
+        router_logits=logits,
+        router_bias=router_bias,
+        top_k=4,
+        renormalize=True,
+        global_num_experts=128,
+        activation=moe_mod.ActivationType.Swiglu,
+    )
+
+    assert len(selected_logits) == 1
+    assert selected_logits[0].dtype == torch.bfloat16
+    assert torch.equal(selected_logits[0], logits + router_bias)
+
+
+@pytest.mark.parametrize(
+    ("tokens", "defer_bias"),
+    [(2, True), (2, False), (9, True)],
+)
+def test_iq2r_router_dispatch_uses_concrete_runtime_m(monkeypatch, tokens, defer_bias):
+    quant_method = object.__new__(moe_mod.Iq2rMoEMethod)
+    quant_method.output_hidden_size = 2
+    calls = []
+
+    def fake_mm(x, weight, bias, *, otype):
+        calls.append((x, weight, bias, otype))
+        return torch.empty((x.shape[0], 128), dtype=torch.bfloat16)
+
+    monkeypatch.setattr(moe_mod.tgemm, "mm", fake_mm)
+    monkeypatch.setattr(moe_mod, "_IQ2R_DEFER_ROUTER_BIAS", defer_bias)
+
+    deferred_output = torch.full((tokens, 2), 1, dtype=torch.bfloat16)
+    ordinary_output = torch.full((tokens, 2), 2, dtype=torch.bfloat16)
+    layer = SimpleNamespace(
+        quant_method=quant_method,
+        balance_router_logits=None,
+        forward_iq2r_impl=lambda hidden, logits, bias: deferred_output,
+        forward_impl=lambda hidden, logits: ordinary_output,
+    )
+    hidden = torch.randn(tokens, 4, dtype=torch.bfloat16)
+    weight = torch.randn(128, 2, dtype=torch.bfloat16)
+    bias = torch.randn(128, dtype=torch.bfloat16)
+
+    output = moe_mod.FusedMoE.forward_iq2r_with_router_impl(
+        layer,
+        hidden,
+        weight,
+        bias,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0].shape == (tokens, 2)
+    assert calls[0][1] is weight
+    assert calls[0][3] == torch.bfloat16
+    if defer_bias and tokens <= 8:
+        assert calls[0][2] is None
+        assert output is deferred_output
+    else:
+        assert calls[0][2] is bias
+        assert output is ordinary_output
+
+
+def test_iq2r_expert_ablation_retains_topk_and_skips_experts(monkeypatch):
+    method = object.__new__(moe_mod.Iq2rMoEMethod)
+    method.moe = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(use_ep=False),
+        max_num_tokens=8,
+    )
+    method._workspaces = {}
+    layer = SimpleNamespace(
+        num_fused_shared_experts=0,
+        routed_scaling_factor=1.0,
+        w2_bias=torch.empty((128, 2), dtype=torch.bfloat16),
+    )
+    hidden = torch.randn(3, 4, dtype=torch.bfloat16)
+    logits = torch.randn(3, 128)
+    topk_weights = torch.tensor(
+        [[0.4, 0.3, 0.2, 0.1], [0.5, 0.2, 0.2, 0.1], [0.6, 0.2, 0.1, 0.1]],
+        dtype=torch.float32,
+    )
+    topk_ids = torch.arange(12, dtype=torch.int32).reshape(3, 4)
+    selections = []
+
+    def fake_select(**kwargs):
+        selections.append(kwargs)
+        return topk_weights, topk_ids
+
+    monkeypatch.setattr(
+        moe_mod.FusedMoE,
+        "select_experts",
+        staticmethod(fake_select),
+    )
+    monkeypatch.setattr(moe_mod, "_PROFILE_MOE_ABLATION", "experts")
+    monkeypatch.setattr(
+        moe_mod,
+        "fused_moe",
+        lambda **_kwargs: pytest.fail("expert kernel must not run in ablation"),
+    )
+
+    output = method.apply(
+        layer=layer,
+        x=hidden,
+        router_logits=logits,
+        top_k=4,
+        renormalize=True,
+        global_num_experts=128,
+        activation=moe_mod.ActivationType.Swiglu,
+    )
+
+    assert len(selections) == 1
+    assert output.shape == (3, 2)
+    assert torch.equal(
+        output,
+        topk_weights[:, :1].to(torch.bfloat16).expand(3, 2),
+    )
