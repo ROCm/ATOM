@@ -327,6 +327,12 @@ one file:
 | ON (tier 90) | 100.4 GiB | 401.7 GiB | n=51, spread 0.30 GiB |
 | OFF (no tier) | 9.7 GiB | 38.8 GiB | n=42, spread 0.00 GiB |
 
+`n` is how long each plateau lasted in 10 s samples, not how many independent
+chances the number had to be wrong: the OFF arm's spread of 0.00 says its 42
+readings are one value read 42 times. So the spread column bounds sampler and
+allocator stability within a run, and says nothing about run-to-run variance —
+each arm is still n=1 in runs, like the throughput above.
+
 The OFF arm sets the tier to zero, so **its `RssAnon` measures the fixed
 residency directly**: F = 9.7 GiB/worker. The difference then bounds tier
 residency at `(401.7 - 38.8) / 4 = 90.7 GiB/rank` against a declared 90.0
