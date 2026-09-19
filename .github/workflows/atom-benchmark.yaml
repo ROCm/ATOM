@@ -442,6 +442,7 @@ jobs:
           image: ${{ inputs.image || 'rocm/atom-dev:latest' }}
           container-name: atom-regression
           model-path: ${{ matrix.cell.model_path }}
+          runner: ${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || matrix.cell.runner }}
           env-vars: ${{ matrix.cell.env_vars }}
           hf-token: ${{ secrets.AMD_HF_TOKEN }}
           download-required: "false"

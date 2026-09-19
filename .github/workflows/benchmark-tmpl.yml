@@ -127,6 +127,7 @@ jobs:
           image: ${{ inputs.image }}
           container-name: atom-benchmark
           model-path: ${{ inputs.model_path }}
+          runner: ${{ inputs.runner }}
           env-vars: ${{ inputs.env_vars }}
           hf-token: ${{ secrets.AMD_HF_TOKEN }}
           download-required: "true"
