@@ -1,18 +1,24 @@
 # SPDX-License-Identifier: MIT
 """KDA recurrent-state offload for the vLLM plugin path.
 
-Kimi-K3 is hybrid: MLA full-attention layers plus KDA recurrent layers. vLLM
-builds one KV cache group per family, and a restored MLA prefix is only correct
-if the KDA state at the *same token boundary* is restored with it. Half a
-restore is not a crash and not a log line -- it is wrong output.
+Kimi-K3 is hybrid: MLA full-attention layers plus KDA recurrent layers. A
+restored MLA prefix is only correct if the KDA state at the *same token
+boundary* is restored with it. Half a restore is not a crash and not a log
+line -- it is wrong output.
 
-The two groups are moved by two different mechanisms, and that asymmetry is
+vLLM does not build one group per family. It builds equal-sized groups and
+takes the size from the smallest family, so K3's 69 KDA layers against 29
+full-attention layers come out as **three** mamba groups plus one attention
+group (see :func:`find_mamba_groups`). The three are one recurrent state here:
+they commit at the same token boundary and none of them is restorable alone.
+
+The two families are moved by two different mechanisms, and that asymmetry is
 forced, not chosen:
 
 * The MLA group is ordinary paged KV. ``DenseKVByteCodec`` gathers whole blocks
   by position out of the request's block table, exactly as it does for M3 and
   GLM-5.2. Nothing here changes it.
-* The KDA group in ``--mamba-cache-mode align`` cannot be read positionally at
+* The KDA groups in ``--mamba-cache-mode align`` cannot be read positionally at
   all. vLLM's own store connector says why (``mooncake/store/coordinator.py``,
   ``store_mask``): an align-mode mamba block table is not append-only -- a
   superseded state block is freed and nulled, and speculative blocks relocate in
@@ -23,8 +29,8 @@ forced, not chosen:
   ``kv_connector_block_state.boundary_state_offloads`` on 0.29 -- which names
   the exact block holding a committed boundary state.
 
-So a KDA boundary is stored as one whole opaque page under the prefix hash at
-that boundary -- one key, one block -- through
+So a KDA boundary is stored as one whole opaque image under the prefix hash at
+that boundary -- one key, one block per mamba group -- through
 :class:`~atom.kv_transfer.offload.hybrid.kimi_k3.state_object.StateByteCodec`,
 which already speaks that shape on ATOM's native path and shares the paged-KV
 LMCache ``StorageManager`` so the two tiers compete for one pool rather than two.
@@ -80,8 +86,21 @@ def unwrap_kv_cache_spec(spec: Any) -> Any:
     return spec
 
 
-def find_mamba_group(kv_cache_groups) -> tuple[int, Any] | None:
-    """``(group_id, spec)`` of the single mamba group, or None.
+def find_mamba_groups(kv_cache_groups) -> list[tuple[int, Any]]:
+    """``(group_id, spec)`` for every mamba KV cache group, in group order.
+
+    There is normally more than one, and the count is not a property of the
+    model family. vLLM splits a hybrid model's layers into equal-sized groups
+    and takes the group size from the *smallest* family
+    (``_get_kv_cache_groups_uniform_page_size``: ``group_size =
+    min_num_layers``, ``num_groups = cdiv(len(layers), group_size)``), so K3's
+    69 KDA layers against 29 full-attention layers become **three** mamba
+    groups of 23 plus one attention group. It is read here, never assumed.
+
+    All mamba groups are one logical recurrent state to this connector: the
+    split is an allocator artifact, every group commits its boundary at the
+    same token count, and a boundary is restorable only if all of them are
+    there. So a "boundary block" below is a tuple of block ids, one per group.
 
     Classification is by ``MambaSpec``, never by tensor shape: a mamba page and
     an attention page are both ``[num_blocks, ...]`` uint8 to this connector, so
@@ -90,21 +109,20 @@ def find_mamba_group(kv_cache_groups) -> tuple[int, Any] | None:
     try:
         from vllm.v1.kv_cache_interface import MambaSpec
     except ImportError:  # pragma: no cover - vLLM is absent in unit tests
-        return None
+        return []
     found: list[tuple[int, Any]] = []
     for group_id, group in enumerate(kv_cache_groups or ()):
         spec = unwrap_kv_cache_spec(group.kv_cache_spec)
         if isinstance(spec, MambaSpec):
             found.append((group_id, spec))
-    if not found:
-        return None
-    if len(found) > 1:
+    block_sizes = {int(getattr(spec, "block_size", 0)) for _, spec in found}
+    if len(block_sizes) > 1:
         raise ValueError(
-            "ATOM offload connector: more than one mamba KV cache group "
-            f"({[g for g, _ in found]}); the joint hit gate reconciles the "
-            "attention hit against exactly one recurrent state"
+            "ATOM offload connector: mamba KV cache groups disagree on block "
+            f"size ({sorted(block_sizes)}); one boundary is one block in every "
+            "group at the same token count, which those sizes cannot all be"
         )
-    return found[0]
+    return found
 
 
 def step_boundary_offloads(scheduler_output):
@@ -148,71 +166,92 @@ def boundary_prefix_hash(block_hash: bytes) -> int:
 
 
 class KdaPageViews:
-    """Address one mamba block as the ordered byte stream the codec moves.
+    """Address one boundary's mamba blocks as the ordered byte stream to move.
+
+    One boundary is one block **per mamba group**, not one block. vLLM spreads
+    the recurrent layers over several groups, each with its own block table,
+    and commits all of them at the same token count -- so the unit addressed
+    here is a tuple of block ids in group order, and the byte stream is every
+    group's layers concatenated in that same order.
 
     :class:`StateByteCodec` was written against ATOM's native slot model and
     asks its backend two questions -- ``page_unit_views`` for a store,
     ``state_entry_views`` for a load. On the plugin path both resolve to the
-    same thing, the per-layer views of one vLLM block, because vLLM allocates
-    the destination block for an external hit and the mamba group's own block
-    table is what the resuming forward reads. Keeping both methods (rather than
-    collapsing them) is what lets the native codec be reused verbatim.
+    same thing, the per-layer views of one boundary's blocks, because vLLM
+    allocates the destination blocks for an external hit and the mamba groups'
+    own block tables are what the resuming forward reads. Keeping both methods
+    (rather than collapsing them) is what lets the native codec be reused
+    verbatim.
 
-    Layer order is ``group.layer_names``, vLLM's own canonical order, so a
-    stream gathered on one rank is read back in the same order on the next run.
+    Layer order within a group is ``group.layer_names``, vLLM's own canonical
+    order, so a stream gathered on one rank is read back in the same order on
+    the next run.
     """
 
-    def __init__(self, tensors: list[torch.Tensor], *, layout_id: str) -> None:
-        if not tensors:
-            raise ValueError("KDA state offload: the mamba group registered no tensors")
-        self._tensors = list(tensors)
+    def __init__(
+        self, tensors_by_group: list[list[torch.Tensor]], *, layout_id: str
+    ) -> None:
+        groups = [list(tensors) for tensors in tensors_by_group]
+        if not groups or not all(groups):
+            raise ValueError("KDA state offload: a mamba group registered no tensors")
+        self._groups = groups
         self.layout_id = layout_id
-        self.num_blocks = int(self._tensors[0].shape[0])
-        for tensor in self._tensors:
-            if int(tensor.shape[0]) != self.num_blocks:
+        self.num_groups = len(groups)
+        self.num_blocks: list[int] = []
+        for tensors in groups:
+            counts = sorted({int(t.shape[0]) for t in tensors})
+            if len(counts) > 1:
                 raise ValueError(
                     "KDA state offload: mamba layers disagree on block count "
-                    f"({[int(t.shape[0]) for t in self._tensors]}); a boundary "
-                    "block id addresses every layer, so one stream would be "
-                    "gathered at the wrong offset"
+                    f"({counts}); a boundary block id addresses every layer in "
+                    "its group, so one stream would be gathered at the wrong "
+                    "offset"
                 )
+            self.num_blocks.append(counts[0])
         self.entry_bytes = sum(
-            int(t[0].numel()) * t[0].element_size() for t in self._tensors
+            int(t[0].numel()) * t[0].element_size()
+            for tensors in groups
+            for t in tensors
         )
 
-    def _views(self, block_id: int) -> list[torch.Tensor]:
-        block_id = int(block_id)
-        if not 0 <= block_id < self.num_blocks:
-            raise IndexError(
-                f"KDA state offload: block {block_id} is outside the mamba "
-                f"group's {self.num_blocks} blocks"
+    def _views(self, block_ids) -> list[torch.Tensor]:
+        ids = [int(b) for b in block_ids]
+        if len(ids) != self.num_groups:
+            raise ValueError(
+                "KDA state offload: a boundary is one block per mamba group, "
+                f"expected {self.num_groups} block ids, got {len(ids)}"
             )
-        return [t[block_id] for t in self._tensors]
+        views: list[torch.Tensor] = []
+        for tensors, block_id, num_blocks in zip(self._groups, ids, self.num_blocks):
+            if not 0 <= block_id < num_blocks:
+                raise IndexError(
+                    f"KDA state offload: block {block_id} is outside the mamba "
+                    f"group's {num_blocks} blocks"
+                )
+            views.extend(t[block_id] for t in tensors)
+        return views
 
     def page_unit_views(self, unit_ids) -> list[torch.Tensor]:
-        """Store source. Exactly one block; a state image is never split."""
-        ids = list(unit_ids)
-        if len(ids) != 1:
-            raise ValueError(
-                f"KDA state offload: a boundary is one block, got {len(ids)}"
-            )
-        return self._views(ids[0])
+        """Store source: this boundary's block in each mamba group."""
+        return self._views(unit_ids)
 
     def state_entry_views(self, slot) -> list[torch.Tensor]:
-        """Load destination: the block vLLM allocated for the external hit."""
+        """Load destination: the blocks vLLM allocated for the external hit."""
         return self._views(slot)
 
 
-def build_layout_id(spec: Any, tensors: list[torch.Tensor]) -> str:
+def build_layout_id(specs: list[Any], tensors_by_group) -> str:
     """Name the geometry the bytes were written under.
 
     Folded into the storage key by ``StateByteCodec.key``. One prefix hash maps
     to a different image under a different mamba block size, speculative-block
-    count, dtype or TP shape, and KV and state entries share one LMCache pool
-    with no field saying what an entry is -- so without this a config change
-    reads back another layout's bytes as state, which is silent wrong output
-    rather than a miss.
+    count, dtype, TP shape *or group split* -- the last one because the byte
+    stream is the groups concatenated in order, so re-splitting the same layers
+    reorders it. KV and state entries share one LMCache pool with no field
+    saying what an entry is, so without this a config change reads back another
+    layout's bytes as state, which is silent wrong output rather than a miss.
     """
+    spec = specs[0]
     mamba_type = getattr(spec, "mamba_type", None)
     parts = [
         "vllm-kda",
@@ -221,19 +260,28 @@ def build_layout_id(spec: Any, tensors: list[torch.Tensor]) -> str:
         f"page={int(getattr(spec, 'page_size_bytes', 0))}",
         f"spec_blocks={int(getattr(spec, 'num_speculative_blocks', 0))}",
         f"tp_replicated={int(bool(getattr(spec, 'tp_replicated', False)))}",
-        f"layers={len(tensors)}",
-        ";".join(f"{tuple(t.shape[1:])}:{t.dtype}" for t in tensors),
+        "groups=" + ",".join(str(len(t)) for t in tensors_by_group),
+        ";".join(
+            f"{tuple(t.shape[1:])}:{t.dtype}"
+            for tensors in tensors_by_group
+            for t in tensors
+        ),
     ]
     return "|".join(parts)
 
 
 @dataclass(frozen=True)
 class KdaStore:
-    """One boundary state on its way out: op id, key, and source block."""
+    """One boundary state on its way out: op id, key, and source blocks.
+
+    ``block_ids`` is one block per mamba group, in group order -- the whole
+    recurrent state at this boundary, which is the only unit that can be
+    restored.
+    """
 
     op_id: int
     prefix_hash: int
-    block_id: int
+    block_ids: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -246,19 +294,20 @@ class KdaLoad:
     at face value and caches the whole external prefix, serving an MLA prefix
     whose recurrent state was never restored.
 
-    ``block_id <= 0`` means the destination could not be resolved; the tier
-    fails it without touching the device, which is the same outcome as a miss.
+    An empty ``block_ids``, or any entry ``<= NULL_BLOCK_ID``, means the
+    destination could not be resolved; the tier fails it without touching the
+    device, which is the same outcome as a miss.
     """
 
     req_id: str
     prefix_hash: int
-    block_id: int
+    block_ids: tuple[int, ...]
     error_block_ids: tuple[int, ...] = ()
 
 
 @dataclass
 class _PendingStore:
-    block_id: int
+    block_ids: tuple[int, ...]
     prefix_hash: int
     reports: int = 0
     failures: int = 0
@@ -347,15 +396,15 @@ class KdaStateTier:
                 # launch by the time this runs, and blocking the compute stream
                 # instead would put offload on the critical path.
                 ready_event.synchronize()
-            ok = bool(self._codec.put(int(store.prefix_hash), [int(store.block_id)]))
+            ok = bool(self._codec.put(int(store.prefix_hash), store.block_ids))
         except Exception:  # deliberately blind
             # `put` reaches into LMCache, whose failure modes are its own. A
             # store that cannot happen costs one boundary -- not this thread,
             # whose death would strand every request parked on a later load.
             logger.warning(
-                "KDA state offload: store of hash %d (block %d) failed",
+                "KDA state offload: store of hash %d (blocks %s) failed",
                 store.prefix_hash,
-                store.block_id,
+                store.block_ids,
                 exc_info=True,
             )
         with self._lock:
@@ -365,8 +414,8 @@ class KdaStateTier:
     def _do_load(self, load: KdaLoad) -> None:
         ok = False
         try:
-            if load.block_id > NULL_BLOCK_ID:
-                ok = bool(self._codec.get(int(load.prefix_hash), int(load.block_id)))
+            if load.block_ids and all(b > NULL_BLOCK_ID for b in load.block_ids):
+                ok = bool(self._codec.get(int(load.prefix_hash), load.block_ids))
         except Exception:  # a failed load is a normal path
             # LMCache's LRU can drop bytes under a hash the index still
             # advertises. Retracting that claim is the scheduler's job; the
@@ -427,7 +476,7 @@ class KdaBoundaryPlanner:
     def __init__(
         self,
         *,
-        group_id: int,
+        group_ids,
         mamba_block_size: int,
         hash_block_size: int,
         chunk_size: int,
@@ -435,7 +484,9 @@ class KdaBoundaryPlanner:
         can_store: bool = True,
         can_load: bool = True,
     ) -> None:
-        self.group_id = int(group_id)
+        self.group_ids = tuple(int(g) for g in group_ids)
+        if not self.group_ids:
+            raise ValueError("KDA state offload: no mamba KV cache group to plan for")
         self.mamba_block_size = int(mamba_block_size)
         self.hash_block_size = int(hash_block_size)
         self.chunk_size = int(chunk_size)
@@ -543,8 +594,9 @@ class KdaBoundaryPlanner:
 
         The destination is positional and that is safe here, unlike on the save
         side: vLLM has just allocated this request's mamba blocks for the hit,
-        so row ``num_total_computed // mamba_block_size - 1`` is the block the
-        resuming forward will read its initial state from.
+        so row ``num_total_computed // mamba_block_size - 1`` of *each* mamba
+        group is the block the resuming forward will read its initial state
+        from. All of them, because the state is only whole across the groups.
 
         A destination that cannot be resolved is queued as a failing load rather
         than dropped. Dropping it would leave the dense leg to report success on
@@ -562,8 +614,8 @@ class KdaBoundaryPlanner:
             num_external_tokens,
             attention_block_size,
         )
-        block_id = self._boundary_block(group_blocks, num_total_computed)
-        if h is None or block_id <= NULL_BLOCK_ID:
+        block_ids = self._boundary_blocks(group_blocks, num_total_computed)
+        if h is None or not block_ids:
             logger.warning(
                 "KDA state offload: %s hit %d tokens but its boundary state has "
                 "no %s; failing the load so the prefix is recomputed",
@@ -571,21 +623,36 @@ class KdaBoundaryPlanner:
                 num_total_computed,
                 "key" if h is None else "destination block",
             )
-            self._loads.append(KdaLoad(req_id, int(h or 0), 0, error_blocks))
+            self._loads.append(KdaLoad(req_id, int(h or 0), (), error_blocks))
             return
         self._index.request_load(req_id, h)
-        self._loads.append(KdaLoad(req_id, h, block_id, error_blocks))
+        self._loads.append(KdaLoad(req_id, h, block_ids, error_blocks))
 
-    def _boundary_block(
+    def _boundary_blocks(
         self, group_blocks: tuple[list[int], ...], num_total_computed: int
-    ) -> int:
-        if self.group_id >= len(group_blocks):
-            return 0
-        blocks = group_blocks[self.group_id]
+    ) -> tuple[int, ...]:
+        """This boundary's destination block in each mamba group, or ``()``.
+
+        All or nothing: a state scattered into some of its groups leaves the
+        rest holding the previous occupant's recurrence, which is exactly the
+        half restore this module exists to prevent. One unresolved group
+        therefore fails the whole load.
+        """
         row = num_total_computed // self.mamba_block_size - 1
-        if row < 0 or row >= len(blocks):
-            return 0
-        return int(blocks[row])
+        if row < 0:
+            return ()
+        block_ids: list[int] = []
+        for group_id in self.group_ids:
+            if group_id >= len(group_blocks):
+                return ()
+            blocks = group_blocks[group_id]
+            if row >= len(blocks):
+                return ()
+            block_id = int(blocks[row])
+            if block_id <= NULL_BLOCK_ID:
+                return ()
+            block_ids.append(block_id)
+        return tuple(block_ids)
 
     def _attention_error_blocks(
         self,
@@ -644,7 +711,11 @@ class KdaBoundaryPlanner:
           chunk steps and can never select it, so storing it is pure volume;
         * a request that finished or was preempted in this same step -- its
           blocks are going away, so the pin would be taken on a block that is
-          already someone else's.
+          already someone else's;
+        * a boundary that did not report a block in *every* mamba group -- the
+          state is only whole across the groups, and storing the groups that
+          did report would put an unrestorable image under a hash that
+          :meth:`cap_hit` would then accept.
         """
         accepted: list[KdaStore] = []
         pool = self._pool
@@ -661,8 +732,10 @@ class KdaBoundaryPlanner:
                 )
                 continue
             block_hashes = getattr(request, "block_hashes", None) or ()
+            by_boundary: dict[int, dict[int, int]] = {}
             for group_id, block_id, boundary_tokens in entries:
-                if int(group_id) != self.group_id:
+                group_id = int(group_id)
+                if group_id not in self.group_ids:
                     continue
                 if int(block_id) <= NULL_BLOCK_ID:
                     continue
@@ -671,21 +744,35 @@ class KdaBoundaryPlanner:
                     continue
                 if boundary_tokens % self.chunk_size:
                     continue
+                by_boundary.setdefault(boundary_tokens, {})[group_id] = int(block_id)
+            for boundary_tokens in sorted(by_boundary):
+                blocks = by_boundary[boundary_tokens]
+                if len(blocks) != len(self.group_ids):
+                    logger.debug(
+                        "KDA state offload: boundary %d of %s reported %d of %d "
+                        "mamba groups; dropping the partial state",
+                        boundary_tokens,
+                        req_id,
+                        len(blocks),
+                        len(self.group_ids),
+                    )
+                    continue
                 h = self.boundary_hash(block_hashes, boundary_tokens)
                 if h is None:
                     continue
                 self._next_op_id += 1
-                store = KdaStore(self._next_op_id, h, int(block_id))
+                block_ids = tuple(blocks[group_id] for group_id in self.group_ids)
+                store = KdaStore(self._next_op_id, h, block_ids)
                 self._pending_stores[store.op_id] = _PendingStore(
-                    store.block_id, store.prefix_hash
+                    block_ids, store.prefix_hash
                 )
                 if pool is not None:
-                    pool.touch([pool.blocks[store.block_id]])
+                    pool.touch([pool.blocks[block_id] for block_id in block_ids])
                 accepted.append(store)
         return accepted
 
     def absorb_reports(self, stored, failed) -> None:
-        """Unpin a boundary block once every rank has reported on it.
+        """Unpin a boundary's blocks once every rank has reported on them.
 
         Quorum over ``stored | failed`` rather than ``stored`` alone: a rank
         that could not write its shard never sends a second report, so waiting
@@ -712,10 +799,12 @@ class KdaBoundaryPlanner:
             if pending.failures == 0:
                 self._index.note_stored(pending.prefix_hash)
             if pool is not None:
-                pool.free_blocks([pool.blocks[pending.block_id]])
+                pool.free_blocks(
+                    [pool.blocks[block_id] for block_id in pending.block_ids]
+                )
 
     def has_pending_work(self) -> bool:
-        """Keep the engine stepping while a boundary block is still pinned.
+        """Keep the engine stepping while a boundary's blocks are still pinned.
 
         Store completions only reach this process as worker metadata on a step.
         An engine that went idle with a pin outstanding would hold that block

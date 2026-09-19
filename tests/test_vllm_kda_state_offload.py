@@ -16,7 +16,8 @@ crash, so "it booted" proves nothing about them:
   back to the pool and whether a hash may be advertised at all.
 
 They deliberately avoid vLLM: both modules under test are importable without it
-(``find_mamba_group`` degrades to None), and the CI unit job has no vLLM.
+(``find_mamba_groups`` degrades to an empty list), and the CI unit job has
+no vLLM.
 """
 
 import pytest
@@ -33,10 +34,16 @@ from atom.plugin.vllm.kv_transfer.kda_state import (
 )
 from atom.plugin.vllm.kv_transfer.kv_cache_layout import (
     build_kv_cache_tensors,
+    gather_group_tensors,
+    resolve_block_count,
     split_kv_caches_by_group,
 )
 
 MAMBA_GROUP = 1
+#: K3 really has three; vLLM splits the recurrent layers into equal-sized
+#: groups and takes the size from the smallest family. The planner treats them
+#: as one state, so the multi-group tests below use both of these.
+MAMBA_GROUP_2 = 2
 ATTENTION_GROUP = 0
 MAMBA_BLOCK = 64
 HASH_BLOCK = 64
@@ -82,7 +89,7 @@ class FakePool:
 
 def make_planner(**kwargs):
     params = {
-        "group_id": MAMBA_GROUP,
+        "group_ids": (MAMBA_GROUP,),
         "mamba_block_size": MAMBA_BLOCK,
         "hash_block_size": HASH_BLOCK,
         "chunk_size": CHUNK,
@@ -90,6 +97,22 @@ def make_planner(**kwargs):
     }
     params.update(kwargs)
     return KdaBoundaryPlanner(**params)
+
+
+def store_one_two_groups(planner, request, *, boundary=CHUNK):
+    """The same, for a planner that owns two mamba groups."""
+    stores = planner.collect_stores(
+        {
+            request.request_id: [
+                (MAMBA_GROUP, 7, boundary),
+                (MAMBA_GROUP_2, 9, boundary),
+            ]
+        },
+        {request.request_id: request},
+    )
+    for store in stores:
+        planner.absorb_reports({store.op_id: WORLD}, {})
+    return stores
 
 
 def store_one(planner, request, *, block_id=7, boundary=CHUNK, group=MAMBA_GROUP):
@@ -285,7 +308,7 @@ def test_accepted_boundary_is_pinned_and_keyed_by_its_prefix_hash():
     stores = planner.collect_stores({"r0": [(MAMBA_GROUP, 7, CHUNK)]}, {"r0": request})
 
     assert len(stores) == 1
-    assert stores[0].block_id == 7
+    assert stores[0].block_ids == (7,)
     assert stores[0].prefix_hash == planner.boundary_hash(request.block_hashes, CHUNK)
     assert pool.touched == ["blk7"]
     assert planner.has_pending_work()
@@ -453,7 +476,7 @@ def test_load_destination_is_the_block_row_that_ends_the_hit():
 
     (load,) = planner.take_loads()
     assert load.req_id == "r0"
-    assert load.block_id == mamba_blocks[CHUNK // MAMBA_BLOCK - 1]
+    assert load.block_ids == (mamba_blocks[CHUNK // MAMBA_BLOCK - 1],)
     assert load.prefix_hash == planner.boundary_hash(request.block_hashes, CHUNK)
     # Exactly the attention blocks the dense leg is filling: [128, 256).
     assert load.error_block_ids == (22,)
@@ -467,7 +490,7 @@ def test_unresolvable_destination_is_queued_as_a_failing_load():
     planner.resolve_load(request, ([21, 22], []), CHUNK, ATTENTION_GROUP, 128, 128)
 
     (load,) = planner.take_loads()
-    assert load.block_id == 0
+    assert load.block_ids == ()
     assert load.error_block_ids == (22,)
 
 
@@ -477,6 +500,140 @@ def test_no_external_tokens_queues_nothing():
         FakeRequest("r0"), ([21], [11]), CHUNK, ATTENTION_GROUP, 0, 128
     )
     assert planner.take_loads() == []
+
+
+# --------------------------------------------------------------------------
+# several mamba groups -- K3's real shape
+# --------------------------------------------------------------------------
+def make_two_group_planner(**kwargs):
+    return make_planner(group_ids=(MAMBA_GROUP, MAMBA_GROUP_2), **kwargs)
+
+
+def test_a_boundary_is_stored_only_when_every_mamba_group_reported():
+    """One store, carrying one block per group, pinned in every group.
+
+    vLLM commits the same boundary in each mamba group and hands each one off
+    separately. Storing them as separate entries would put images under the
+    same prefix hash that no lookup could reconcile; storing one of them under
+    that hash would be an image that cannot be restored.
+    """
+    planner = make_two_group_planner()
+    pool = FakePool()
+    planner.bind_gpu_block_pool(pool)
+    request = FakeRequest("r0")
+
+    stores = planner.collect_stores(
+        {"r0": [(MAMBA_GROUP, 7, CHUNK), (MAMBA_GROUP_2, 9, CHUNK)]},
+        {"r0": request},
+    )
+
+    assert len(stores) == 1
+    # Group order, not hand-off order -- the byte stream is built that way.
+    assert stores[0].block_ids == (7, 9)
+    assert sorted(pool.touched) == ["blk7", "blk9"]
+
+    planner.absorb_reports({stores[0].op_id: WORLD}, {})
+    assert sorted(pool.freed) == ["blk7", "blk9"]
+    planner.begin_lookup(request)
+    assert planner.cap_hit(FakeSeq("r0"), CHUNK) == CHUNK
+
+
+def test_a_boundary_missing_one_group_is_dropped_whole():
+    planner = make_two_group_planner()
+    pool = FakePool()
+    planner.bind_gpu_block_pool(pool)
+    request = FakeRequest("r0")
+
+    stores = planner.collect_stores({"r0": [(MAMBA_GROUP, 7, CHUNK)]}, {"r0": request})
+
+    assert stores == []
+    assert pool.touched == []
+    assert not planner.has_pending_work()
+    planner.begin_lookup(request)
+    assert planner.cap_hit(FakeSeq("r0"), CHUNK) == 0
+
+
+def test_one_group_rejecting_a_boundary_takes_the_other_group_with_it():
+    """The null block is rejected per group, and that leaves the boundary
+    incomplete -- it must not be stored from the surviving group alone."""
+    planner = make_two_group_planner()
+    stores = planner.collect_stores(
+        {"r0": [(MAMBA_GROUP, 7, CHUNK), (MAMBA_GROUP_2, 0, CHUNK)]},
+        {"r0": FakeRequest("r0")},
+    )
+    assert stores == []
+
+
+def test_each_boundary_is_joined_independently():
+    planner = make_two_group_planner()
+    planner.bind_gpu_block_pool(FakePool())
+    request = FakeRequest("r0")
+
+    stores = planner.collect_stores(
+        {
+            "r0": [
+                (MAMBA_GROUP, 7, CHUNK),
+                (MAMBA_GROUP_2, 9, CHUNK),
+                (MAMBA_GROUP, 8, 2 * CHUNK),
+            ]
+        },
+        {"r0": request},
+    )
+
+    assert [store.block_ids for store in stores] == [(7, 9)]
+
+
+def test_load_names_one_destination_block_per_mamba_group():
+    planner = make_two_group_planner()
+    request = FakeRequest("r0")
+    store_one_two_groups(planner, request)
+    group_blocks = ([21, 22], [11, 12, 13, 14], [31, 32, 33, 34])
+
+    planner.resolve_load(request, group_blocks, CHUNK, ATTENTION_GROUP, 128, 128)
+
+    (load,) = planner.take_loads()
+    row = CHUNK // MAMBA_BLOCK - 1
+    assert load.block_ids == (
+        group_blocks[MAMBA_GROUP][row],
+        group_blocks[MAMBA_GROUP_2][row],
+    )
+
+
+def test_a_load_whose_second_group_has_no_destination_fails_whole():
+    """Scattering into one group would leave the other holding the previous
+    occupant's recurrence -- the half restore, with nothing to report it."""
+    planner = make_two_group_planner()
+    request = FakeRequest("r0")
+    store_one_two_groups(planner, request)
+
+    planner.resolve_load(
+        request, ([21, 22], [11, 12, 13, 14], []), CHUNK, ATTENTION_GROUP, 128, 128
+    )
+
+    (load,) = planner.take_loads()
+    assert load.block_ids == ()
+    assert load.error_block_ids == (22,)
+
+
+def test_mamba_groups_must_agree_on_block_size():
+    """A boundary is one block in every group at the same token count."""
+    pytest.importorskip("vllm")
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    from atom.plugin.vllm.kv_transfer.kda_state import find_mamba_groups
+
+    class Group:
+        def __init__(self, spec):
+            self.kv_cache_spec = spec
+
+    specs = [
+        MambaSpec.__new__(MambaSpec),
+        MambaSpec.__new__(MambaSpec),
+    ]
+    object.__setattr__(specs[0], "block_size", 64)
+    object.__setattr__(specs[1], "block_size", 128)
+    with pytest.raises(ValueError, match="disagree on block size"):
+        find_mamba_groups([Group(specs[0]), Group(specs[1])])
 
 
 # --------------------------------------------------------------------------
@@ -492,31 +649,53 @@ def test_chunk_size_must_be_a_multiple_of_the_mamba_block_size():
 # --------------------------------------------------------------------------
 def test_page_views_address_one_block_across_every_layer():
     tensors = [torch.arange(4 * 6, dtype=torch.uint8).reshape(4, 6) for _ in range(3)]
-    views = KdaPageViews(tensors, layout_id="x")
+    views = KdaPageViews([tensors], layout_id="x")
 
-    assert views.num_blocks == 4
+    assert views.num_blocks == [4]
     assert views.entry_bytes == 3 * 6
     assert len(views.page_unit_views([2])) == 3
     assert all(
         v.data_ptr() == t[2].data_ptr()
         for v, t in zip(views.page_unit_views([2]), tensors)
     )
-    assert [v.data_ptr() for v in views.state_entry_views(2)] == [
+    assert [v.data_ptr() for v in views.state_entry_views([2])] == [
         v.data_ptr() for v in views.page_unit_views([2])
+    ]
+
+
+def test_page_views_span_every_mamba_group_in_group_order():
+    """The image is the groups concatenated, each at its own block id: vLLM
+    gives every mamba group its own block table, and a state restored into
+    only some of them is the half restore this module exists to prevent."""
+    g0 = [torch.arange(4 * 6, dtype=torch.uint8).reshape(4, 6) for _ in range(2)]
+    g1 = [torch.arange(4 * 6, dtype=torch.uint8).reshape(4, 6) for _ in range(3)]
+    views = KdaPageViews([g0, g1], layout_id="x")
+
+    assert views.num_blocks == [4, 4]
+    assert views.entry_bytes == (2 + 3) * 6
+
+    got = views.page_unit_views([1, 3])
+    assert [v.data_ptr() for v in got] == [t[1].data_ptr() for t in g0] + [
+        t[3].data_ptr() for t in g1
+    ]
+    # Store and load must walk the identical stream, or the bytes land
+    # transposed across groups with no error anywhere.
+    assert [v.data_ptr() for v in views.state_entry_views([1, 3])] == [
+        v.data_ptr() for v in got
     ]
 
 
 def test_page_views_reject_layers_that_disagree_on_block_count():
     with pytest.raises(ValueError, match="disagree on block count"):
-        KdaPageViews([torch.zeros(4, 6), torch.zeros(5, 6)], layout_id="x")
+        KdaPageViews([[torch.zeros(4, 6), torch.zeros(5, 6)]], layout_id="x")
 
 
-def test_a_boundary_is_exactly_one_block():
-    views = KdaPageViews([torch.zeros(4, 6)], layout_id="x")
-    with pytest.raises(ValueError, match="a boundary is one block"):
+def test_a_boundary_is_one_block_per_mamba_group():
+    views = KdaPageViews([[torch.zeros(4, 6)]], layout_id="x")
+    with pytest.raises(ValueError, match="one block per mamba group"):
         views.page_unit_views([1, 2])
     with pytest.raises(IndexError):
-        views.state_entry_views(4)
+        views.state_entry_views([4])
 
 
 def test_layout_id_separates_geometries_that_share_a_pool():
@@ -528,13 +707,19 @@ def test_layout_id_separates_geometries_that_share_a_pool():
             self.num_speculative_blocks = 0
             self.tp_replicated = False
 
-    tensors = [torch.zeros(4, 6)]
-    base = build_layout_id(Spec(64, 1024), tensors)
+    tensors = [[torch.zeros(4, 6), torch.zeros(4, 6)]]
+    base = build_layout_id([Spec(64, 1024)], tensors)
 
-    assert build_layout_id(Spec(128, 1024), tensors) != base
-    assert build_layout_id(Spec(64, 2048), tensors) != base
-    assert build_layout_id(Spec(64, 1024), [torch.zeros(4, 7)]) != base
-    assert build_layout_id(Spec(64, 1024), tensors * 2) != base
+    assert build_layout_id([Spec(128, 1024)], tensors) != base
+    assert build_layout_id([Spec(64, 2048)], tensors) != base
+    assert build_layout_id([Spec(64, 1024)], [[torch.zeros(4, 7)]]) != base
+    assert build_layout_id([Spec(64, 1024)], tensors * 2) != base
+    # Same layers, different split: the stream is the groups concatenated, so
+    # re-splitting reorders it and must not read back under the old key.
+    assert (
+        build_layout_id([Spec(64, 1024)], [[torch.zeros(4, 6)], [torch.zeros(4, 6)]])
+        != base
+    )
 
 
 def test_uniform_type_wrapper_is_unwrapped_before_classification():
@@ -551,3 +736,93 @@ def test_uniform_type_wrapper_is_unwrapped_before_classification():
     inner = Inner()
     assert unwrap_kv_cache_spec(Wrapper(inner)) is inner
     assert unwrap_kv_cache_spec(inner) is inner
+
+
+# ---------------------------------------------------------------------------
+# Gathering the recurrent groups' tensors out of vLLM's registration
+#
+# This seam is where the worker half of the recurrent leg is wired up, and it
+# reads `split_kv_caches_by_group`'s output. That output is a LIST indexed by
+# group id, not a mapping -- a boot failure that no unit test saw, because
+# nothing fed the two functions to each other.
+# ---------------------------------------------------------------------------
+
+
+def test_group_tensors_are_gathered_through_the_split_output():
+    """The two functions compose: whatever the split returns, the gather reads."""
+    groups = [
+        FakeGroup(["kda.0", "kda.1"]),
+        FakeGroup(["mla.0"]),
+        FakeGroup(["kda.2"]),
+    ]
+    caches = {
+        "kda.0": torch.zeros(2),
+        "kda.1": torch.ones(2),
+        "mla.0": torch.full((2,), 7.0),
+        "kda.2": torch.full((2,), 9.0),
+    }
+    per_group = split_kv_caches_by_group(caches, groups)
+    gathered = gather_group_tensors(per_group, groups, [0, 2])
+    assert [[float(t[0]) for t in g] for g in gathered] == [[0.0, 1.0], [9.0]]
+
+
+def test_gathered_layers_keep_vllm_order_not_sorted_order():
+    """Sorting here would silently reorder the byte stream between runs."""
+    groups = [FakeGroup(["kda.10", "kda.2"])]
+    caches = {"kda.2": torch.zeros(1), "kda.10": torch.ones(1)}
+    gathered = gather_group_tensors(
+        split_kv_caches_by_group(caches, groups), groups, [0]
+    )
+    assert [float(t[0]) for t in gathered[0]] == [1.0, 0.0]
+
+
+def test_a_group_missing_one_layer_is_refused_not_shortened():
+    groups = [FakeGroup(["kda.0", "kda.1"]), FakeGroup(["mla.0"])]
+    caches = {"kda.0": torch.zeros(1), "mla.0": torch.zeros(1)}
+    per_group = split_kv_caches_by_group(caches, groups)
+    with pytest.raises(ValueError, match="kda.1"):
+        gather_group_tensors(per_group, groups, [0])
+
+
+def test_an_out_of_range_group_id_is_refused():
+    groups = [FakeGroup(["kda.0"])]
+    per_group = split_kv_caches_by_group({"kda.0": torch.zeros(1)}, groups)
+    with pytest.raises(ValueError, match="out of range"):
+        gather_group_tensors(per_group, groups, [1])
+
+
+# --- the block count the codec strides by -----------------------------------
+#
+# The dense leg has no bounds check that can catch a wrong block count: the ids
+# stay in range and the transfers succeed, so a stride that is a whole power of
+# the block size too fine restores bytes from the wrong rows in silence. The
+# recurrent leg does bounds-check (`KdaPageViews` refuses an id past its own
+# tensors), which is why that leg would have failed loudly and this one did not.
+
+
+def test_a_token_major_leading_dim_folds_to_the_block_count():
+    # Kimi-K3: ATOM's MLA backend asks for a kernel block size of 1, so vLLM
+    # allocates one row per token -- 1584 blocks of 1536 tokens.
+    assert resolve_block_count(1584 * 1536, 1584, 1536) == 1584
+
+
+def test_a_block_major_leading_dim_is_already_the_block_count():
+    # GLM-5.2: kernel block size equals the block size, so nothing folds.
+    assert resolve_block_count(8192, 8192, 64) == 8192
+
+
+def test_a_missing_vllm_block_count_is_refused_not_guessed():
+    with pytest.raises(ValueError, match="no KV cache block count"):
+        resolve_block_count(1584 * 1536, 0, 1536)
+
+
+def test_a_leading_dim_that_is_not_whole_blocks_is_refused():
+    with pytest.raises(ValueError, match="not a whole number"):
+        resolve_block_count(1000, 7, 1536)
+
+
+def test_a_fold_that_does_not_divide_the_block_size_is_refused():
+    # 1584 rows over 792 blocks implies 2 kernel blocks per block, which cannot
+    # be right when the block size is odd -- the leading axis is something else.
+    with pytest.raises(ValueError, match="does not divide the block size"):
+        resolve_block_count(1584, 792, 1535)

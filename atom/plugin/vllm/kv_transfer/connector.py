@@ -52,11 +52,13 @@ from atom.plugin.vllm.kv_transfer.kda_state import (
     KdaPageViews,
     KdaStateTier,
     build_layout_id,
-    find_mamba_group,
+    find_mamba_groups,
     step_boundary_offloads,
 )
 from atom.plugin.vllm.kv_transfer.kv_cache_layout import (
     build_kv_cache_tensors,
+    gather_group_tensors,
+    resolve_block_count,
     split_kv_caches_by_group,
 )
 from atom.plugin.vllm.kv_transfer.offload_config import build_offload_config
@@ -242,11 +244,11 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             1, int(getattr(vllm_config.parallel_config, "world_size", 1) or 1)
         )
 
-        # ---- hybrid (two KV cache groups) ----------------------------------
+        # ---- hybrid (several KV cache groups) -------------------------------
         # Resolved once here so both halves agree on which group is which. A
-        # single-group model leaves every field below inert and takes exactly
-        # the code path it takes today.
-        self._mamba_group = find_mamba_group(
+        # model with no mamba group leaves every field below inert and takes
+        # exactly the code path it takes today.
+        self._mamba_groups = find_mamba_groups(
             getattr(kv_cache_config, "kv_cache_groups", None) or ()
         )
         self._attn_group_id = self._resolve_attention_group(kv_cache_config)
@@ -292,8 +294,8 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         groups = getattr(kv_cache_config, "kv_cache_groups", None) or ()
         if len(groups) <= 1:
             return 0
-        mamba_id = self._mamba_group[0] if self._mamba_group else None
-        others = [gid for gid in range(len(groups)) if gid != mamba_id]
+        mamba_ids = {group_id for group_id, _ in self._mamba_groups}
+        others = [gid for gid in range(len(groups)) if gid not in mamba_ids]
         if len(others) != 1:
             raise ValueError(
                 "ATOM offload connector: expected exactly one non-recurrent KV "
@@ -304,11 +306,12 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
     def _init_kda_planner(self, vllm_config, kv_cache_config) -> None:
         """Stand up the scheduler half of the recurrent leg, if there is one."""
-        if self._mamba_group is None:
+        if not self._mamba_groups:
             return
         from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 
-        group_id, spec = self._mamba_group
+        group_ids = tuple(group_id for group_id, _ in self._mamba_groups)
+        spec = self._mamba_groups[0][1]
         cache_mode = getattr(vllm_config.cache_config, "mamba_cache_mode", None)
         if cache_mode != "align":
             # Any other mode keeps the recurrent state somewhere this connector
@@ -321,7 +324,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             )
         _, hash_block_size = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
         self._kda_planner = KdaBoundaryPlanner(
-            group_id=group_id,
+            group_ids=group_ids,
             mamba_block_size=int(spec.block_size),
             hash_block_size=int(hash_block_size),
             chunk_size=int(self._scheduler.chunk_size),
@@ -329,9 +332,9 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         )
         self._scheduler.install_hit_cap_hook(self._kda_planner.cap_hit)
         logger.info(
-            "ATOM LMCache offload: recurrent state leg on group %d "
+            "ATOM LMCache offload: recurrent state leg on group(s) %s "
             "(mamba_block=%d, hash_block=%d, chunk=%d)",
-            group_id,
+            ",".join(str(group_id) for group_id in group_ids),
             int(spec.block_size),
             int(hash_block_size),
             int(self._scheduler.chunk_size),
@@ -359,11 +362,18 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if not tensors:
             raise ValueError("ATOM offload connector: vLLM registered no KV caches")
 
-        # Every segment's per-block stride is derived from num_blocks, so it has
-        # to be the physical block count -- not a token count. Block-major KV
-        # carries it in dim 0; taking it from the first mapped k_cache keeps the
-        # value consistent with the very tensors the codec will slice.
-        num_blocks = int(tensors[0].k_cache.shape[0])
+        # Every segment's per-block stride is derived from num_blocks, so it
+        # has to be the count of blocks vLLM's block tables name, which is what
+        # `resolve_block_count` takes from the config and reconciles against the
+        # tensor. The leading dimension is NOT that count on ATOM's MLA backend:
+        # it asks for a kernel block size of 1, so vLLM allocates one row per
+        # token and dim 0 comes back 1536x too large on Kimi-K3.
+        leading_dim = int(tensors[0].k_cache.shape[0])
+        num_blocks = resolve_block_count(
+            leading_dim,
+            int(getattr(self._kv_cache_config, "num_blocks", 0)),
+            int(self._config.kv_cache_block_size),
+        )
 
         self._worker.register_kv_caches(
             {str(t.layer_num): t for t in tensors},
@@ -374,9 +384,12 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # those exist until the call above has run.
         self._init_kda_tier(per_group, list(groups))
         logger.info(
-            "ATOM LMCache offload: registered %d layers, num_blocks=%d",
+            "ATOM LMCache offload: registered %d layers, num_blocks=%d "
+            "(leading dim %d, block_size=%d)",
             len(tensors),
             num_blocks,
+            leading_dim,
+            int(self._config.kv_cache_block_size),
         )
         # Layout/dtype census. The codec moves opaque bytes, so a wrong dtype
         # never surfaces here -- it surfaces much later inside an attention
@@ -399,27 +412,25 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 dtype,
             )
 
-    def _init_kda_tier(self, per_group, groups) -> None:
+    def _init_kda_tier(
+        self, per_group: list[dict[str, "torch.Tensor"]], groups: list[Any]
+    ) -> None:
         """Stand up the worker half of the recurrent leg, if there is one."""
-        if self._mamba_group is None:
+        if not self._mamba_groups:
             return
         from atom.kv_transfer.offload.hybrid.kimi_k3.staging import StagedTransfer
         from atom.kv_transfer.offload.hybrid.kimi_k3.state_object import StateByteCodec
 
-        group_id, spec = self._mamba_group
-        caches = per_group[group_id]
-        # vLLM's own order, not sorted() and not dict order: the store gathers
-        # and the load scatters through this same list, so the only requirement
-        # is that it is the same list on every rank and after every restart.
-        names = list(groups[group_id].layer_names)
-        missing = [n for n in names if n not in caches]
-        if missing:
-            raise ValueError(
-                "ATOM offload connector: the recurrent KV cache group registered "
-                f"no tensor for {missing}; a boundary image would be short"
-            )
-        tensors = [caches[n] for n in names]
-        views = KdaPageViews(tensors, layout_id=build_layout_id(spec, tensors))
+        # Group order, and within a group vLLM's own layer order: the store
+        # gathers and the load scatters through this same list (see
+        # `gather_group_tensors`).
+        specs = [spec for _, spec in self._mamba_groups]
+        tensors_by_group = gather_group_tensors(
+            per_group, groups, [group_id for group_id, _ in self._mamba_groups]
+        )
+        views = KdaPageViews(
+            tensors_by_group, layout_id=build_layout_id(specs, tensors_by_group)
+        )
 
         # Sized to one whole state image. The KV staging buffer is sized in
         # LMCache chunks and is routinely an order of magnitude smaller, so
@@ -449,7 +460,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         logger.info(
             "ATOM LMCache offload: recurrent state tier up, %d layers, "
             "entry=%.2f MiB, layout=%s",
-            len(tensors),
+            sum(len(tensors) for tensors in tensors_by_group),
             views.entry_bytes / (1 << 20),
             views.layout_id,
         )
