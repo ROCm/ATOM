@@ -3,10 +3,15 @@
 
 import numpy as np
 import torch
+
 from atom.model_ops.attentions.deepseek_v41.packed_rows import (
     gather_prefix_rows,
     pack_rows,
     write_packed_window,
+)
+from atom.model_ops.attentions.pool_layout.entry_arena import EntryMajorArena
+from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+    MQA_LOGITS_PRESHUFFLE_ROWS,
 )
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
     INDEX_FP8_SCALE_FMT,
@@ -15,12 +20,7 @@ from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
 from atom.model_ops.blockscale import quantize_fp4
 from atom.model_ops.deepseek_v41.compressor import compress_batch
 from atom.model_ops.deepseek_v41.index_write import write_index_rows
-from atom.model_ops.deepseek_v41.paged_scoring import unit_table
-
-from atom.model_ops.attentions.pool_layout.entry_arena import EntryMajorArena
-from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
-    MQA_LOGITS_PRESHUFFLE_ROWS,
-)
+from atom.model_ops.deepseek_v41.unit_table import unit_table
 from atom.model_ops.v4_kernels import make_compress_plans
 from atom.model_ops.v4_kernels.state_writes import swa_write
 from atom.utils import CpuGpuBuffer
@@ -238,6 +238,7 @@ class PagedAttentionCache:
             running_tokens=running_tokens,
             max_q_len=max_q_len,
             state_slot_out=state_slot_out,
+            ratios=tuple(ratio for ratio, _ in self.geometry.compress_ratios),
         )
         step.plans = (
             self._private_plans(requests, tentative) if plans is None else plans
@@ -262,16 +263,18 @@ class PagedAttentionCache:
         lengths = np.asarray([span.length for span in requests], dtype=np.int32)
         rows = max(int(lengths.sum()) + len(requests), 1)
         device = self.pool.device
+
+        def buffer(*shape, dtype=torch.int32):
+            return CpuGpuBuffer(
+                *shape, dtype=dtype, device=device, pin_memory=device.type != "cpu"
+            )
+
+        # The same three the serving builder declares, under the same keys.
         buffers = {
             ratio: {
-                name: CpuGpuBuffer(
-                    rows,
-                    4,
-                    dtype=torch.int32,
-                    device=device,
-                    pin_memory=device.type != "cpu",
-                )
-                for name in ("compress", "write")
+                "compress": buffer(rows, 4),
+                "write": buffer(rows, 4),
+                "key_rope": buffer(rows, dtype=torch.int64),
             }
             for ratio, _ in self.geometry.compress_ratios
         }
@@ -338,7 +341,7 @@ class PagedAttentionCache:
             if self.packed
             else (self.pages.view(f"main_{owner}")[0], step.block_tables)
         )
-        latent, rows, rotated = compress_batch(
+        latent, rotated = compress_batch(
             self, owner, compressor, values, scores, step, rope, scatter=scatter
         )
         if rotated is not None:
@@ -346,25 +349,25 @@ class PagedAttentionCache:
             self._scatter_rows(
                 self.pages.view(f"main_{owner}")[0],
                 step,
-                rows,
                 packed,
                 compressor.ratio,
             )
-        return latent, rows
+        return latent
 
-    def write_index(self, owner, step, rows, index, ratio):
+    def write_index(self, owner, step, index, ratio):
         """One pass quantizes, preshuffles and scatters.
 
         The kernel resolves a row's address from the plan and the PAGE table
-        itself, so nothing here computes one.
+        itself, so nothing here computes one -- `ratio` is all it needs to
+        turn the plan's position into a compressed row.
         """
         write_index_rows(
             index[0],
             self.index_planes[owner],
             step.plans[ratio].compress_plan_gpu,
-            rows,
             step.block_tables,
             self.geometry.rows_per_page(ratio),
+            ratio=ratio,
             scale_fmt=INDEX_FP8_SCALE_FMT,
         )
 
@@ -385,7 +388,7 @@ class PagedAttentionCache:
             )
         return table
 
-    def _scatter_rows(self, pages, step, rows, value, ratio):
+    def _scatter_rows(self, pages, step, value, ratio):
         """One destination per plan row, resolved from that same plan.
 
         A pair is native value and scale bytes, which is what the caller has
@@ -399,8 +402,12 @@ class PagedAttentionCache:
         the index plane's kernel reads the plan and needs none of this.
         """
         per_page = pages.shape[1]
-        batch = step.plans[ratio].compress_plan_gpu[: rows.numel(), 1].long()
+        plan = step.plans[ratio].compress_plan_gpu
+        batch = plan[:, 1].long()
         live = batch >= 0
+        # The compressed row the index kernel derives inline; here it has to
+        # be a tensor, because torch indexing is what does the scatter.
+        rows = plan[:, 2].long() // ratio
         page = step.block_tables[batch.clamp_min(0), (rows // per_page).clamp_min(0)]
         rows_in = pack_rows(*value) if isinstance(value, tuple) else value
         pages[page.long()[live], (rows % per_page)[live]] = rows_in[0][live]

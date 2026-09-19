@@ -150,14 +150,12 @@ class Attention(nn.Module):
             return
         owner = self.spec.kv_owner
         values, scores = self.compressor.project(hidden)
-        latent, rows = cache.compress(
-            owner, self.compressor, values, scores, step, rope
-        )
+        latent = cache.compress(owner, self.compressor, values, scores, step, rope)
         if latent is not None:
-            # The group's first token, which is where the kernel rotated the
-            # main latent. Rotating the key anywhere else picks other rows.
-            index = self.indexer.project_keys(latent, rope, rows * self.spec.ratio)
-            cache.write_index(owner, step, rows, index, self.spec.ratio)
+            index = self.indexer.project_keys(
+                latent, rope, step.plans[self.spec.ratio].key_rope_positions_gpu
+            )
+            cache.write_index(owner, step, index, self.spec.ratio)
 
     def _select_indices(self, hidden, qr, qr_scale, cache, step, rope):
         """This layer's top-k index rows, out of the paged plane.
@@ -174,7 +172,7 @@ class Attention(nn.Module):
             indexer.weights_proj(hidden)[0],
             cache.index_units[spec.kv_owner],
             cache.unit_tiles(step, spec.ratio),
-            ((positions + 1) // spec.ratio).int(),
+            step.visible[spec.ratio],
             topk=indexer.topk,
             weights_scale=indexer.weights_scale,
             candidates=None if source is None else step.candidates[source],

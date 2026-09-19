@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import torch
 from aiter import mhc_post
 
+from atom.model_ops.deepseek_v41.mhc_pre_delayed import collapse_streams
 from atom.model_ops.deepseek_v41.projections import hc_projection
 from atom.model_ops.sparse_attn_v4 import hc_split_sinkhorn
 
@@ -29,11 +30,26 @@ class SinglePassHCState:
         return cls(residual, pre_mix)
 
     def collapse(self):
-        return (
-            (self.residual.float() * self.pre_mix.unsqueeze(-1))
-            .sum(-2)
-            .to(self.residual.dtype)
-        )
+        """BF16 streams weighted by the FP32 pre-mix.
+
+        The Triton body is the same expression in one launch instead of four,
+        and keeps its multiply and sum apart so the two agree to the bit. The
+        torch one stays for callers off the GPU.
+        """
+        if not self.residual.is_cuda:
+            return (
+                (self.residual.float() * self.pre_mix.unsqueeze(-1))
+                .sum(-2)
+                .to(self.residual.dtype)
+            )
+        *outer, hc_mult, hidden = self.residual.shape
+        # `view`, not `reshape`: a residual that stopped being contiguous
+        # should raise rather than be copied, because that copy is the launch
+        # this saves, paid twice.
+        return collapse_streams(
+            self.residual.view(-1, hc_mult, hidden),
+            self.pre_mix.view(-1, hc_mult),
+        ).view(*outer, hidden)
 
 
 def predict_mixes(

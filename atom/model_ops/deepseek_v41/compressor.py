@@ -31,9 +31,9 @@ def compress_batch(cache, owner, compressor, values, scores, step, rope, *, scat
     value echoed back and packs it itself. Rotating a second time in torch
     would round differently, and the FP4 grid turns that into level flips.
 
-    Returns `(latent, rows, rotated)`: the post-norm PRE-RoPE latent the index
-    key projects from, its compressed row per boundary, and the echo when
-    asked. All `None` when no request crossed a boundary.
+    Returns `(latent, rotated)`: the post-norm PRE-RoPE latent the index key
+    projects from, and the echo when asked. Both `None` when no request
+    crossed a boundary.
     """
     ratio = compressor.ratio
     plan = step.plans[ratio]
@@ -96,9 +96,8 @@ def compress_batch(cache, owner, compressor, values, scores, step, rope, *, scat
         prefix=f"csa2.compress_state_{owner}",
     )
     if latent is None:
-        return None, None, None
-    rows = plan.compress_plan_gpu[:, 2].long() // ratio
-    return latent.unsqueeze(0), rows, None if rotated is None else rotated.unsqueeze(0)
+        return None, None
+    return latent.unsqueeze(0), None if rotated is None else rotated.unsqueeze(0)
 
 
 class Compressor(nn.Module):

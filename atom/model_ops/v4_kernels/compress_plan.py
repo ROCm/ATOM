@@ -24,6 +24,10 @@ Two plan tensors are produced per `compress_ratio`:
                    downstream compressor forward will actually read). One row
                    per `update_compressor_states` kernel program.
 
+A caller that declares a `key_rope` buffer also gets `[N] int64` beside that
+ratio's compress plan: `(position // ratio) * ratio`, the group's first token
+and so where its index key is rotated. Declaring none costs nothing.
+
 Each plan is sliced to a kernel-grid length that depends on the mode: tight
 `num_compress` / `num_write` for eager, or a fixed `running_bs * per_seq_bound`
 for the decode CUDAGraph path (padding rows sentinel-filled). See
@@ -62,6 +66,25 @@ class CompressPlan:
     # Consumed by the indexer-FP8 path to derive a flat slot_mapping for
     # `indexer_k_quant_and_cache`. None for empty fwds.
     compress_plan_cpu: np.ndarray | None = None  # [num_compress, 4] int32 or None
+    # Where `fused_compress` rotated each group's main latent, so where that
+    # group's index key has to be rotated too -- anywhere else selects other
+    # rows. int64 because the RoPE ABI casts to it regardless.
+    key_rope_positions_gpu: torch.Tensor | None = None  # [≥num_compress] int64 or None
+
+
+def _publish_key_rope_positions(plan_buffers, ratio, compress_buffer, count):
+    """Where RoPE rotates each boundary's key, or None if nobody asked.
+
+    Read back from the compress buffer AFTER its sentinel tail is filled, so
+    sentinel rows get the same arithmetic the live ones do rather than a
+    constant that would have to be kept in agreement with it.
+    """
+    buffer = plan_buffers[ratio].get("key_rope")
+    if buffer is None:
+        return None
+    if count:
+        buffer.np[:count] = (compress_buffer.np[:count, 2] // ratio) * ratio
+    return buffer.copy_to_gpu(count)
 
 
 def plan_context_lens(
@@ -226,6 +249,9 @@ def make_compress_plans(
                 num_write=0,
                 cu_compress_cpu=np.zeros(max(bs, 1) + 1, dtype=np.int32),
                 compress_plan_cpu=None,
+                key_rope_positions_gpu=_publish_key_rope_positions(
+                    plan_buffers, ratio, cbuf, ccap
+                ),
             )
         return out
 
@@ -325,5 +351,8 @@ def make_compress_plans(
             num_write=n_write,
             cu_compress_cpu=cu_compress,
             compress_plan_cpu=compress_plan if n_compress > 0 else None,
+            key_rope_positions_gpu=_publish_key_rope_positions(
+                plan_buffers, ratio, cbuf, compress_slice
+            ),
         )
     return out

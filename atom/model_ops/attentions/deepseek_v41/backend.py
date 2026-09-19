@@ -5,10 +5,8 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
-from atom.model_engine.engram_runtime import EngramInputPreparer
-from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
-from atom.models.deepseek_v41.config import AttentionMode, build_attention_topology
 
+from atom.model_engine.engram_runtime import EngramInputPreparer
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attentions.backends import AttentionBackend, CommonAttentionBuilder
@@ -16,12 +14,14 @@ from atom.model_ops.attentions.deepseek_v4_attn import (
     DeepseekV4AttentionMetadataBuilder,
 )
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import page_pool, state_pool
+from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+from atom.models.deepseek_v41.config import AttentionMode, build_attention_topology
 from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import AttentionMetaData, AttnState, Context
 
 from .cache import PagedAttentionCache
 from .checkpoints import StateCopies
-from .metadata import RequestSpan
+from .metadata import RequestSpan, visible_buffer_name
 
 
 class DeepseekV41Backend(AttentionBackend):
@@ -45,6 +45,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
     # `_unique_compress_ratios_overlap` and the `v4_*_plan_{ratio}` buffers,
     # which the property and `__init__` below supply under V4's names.
     _build_compress_plans = DeepseekV4AttentionMetadataBuilder._build_compress_plans
+    # An index key is rotated at its compression group's first token, not at
+    # its own, so the plan has to publish those positions.
+    _publishes_key_rope = True
 
     @staticmethod
     def _physical_slots(pool_slots):
@@ -88,6 +91,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         model_runner.forward_vars.update(
             self._compress_plan_buffers(
                 self.geometry, self.max_num_batched_tokens, self.max_bs, self.device
+            )
+            | self._visible_buffers(
+                self.geometry, self.max_num_batched_tokens, self.device
             )
         )
         self.cache = self.copies = self.engram = None
@@ -150,7 +156,38 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 buffer.cpu.fill_(-1)
                 buffer.copy_to_gpu()
                 buffers[name] = buffer
+            # Beside the plan, never a fifth column in it: the fused kernel's
+            # row is a 16-byte 4xi32 struct it loads once. int64 so the RoPE
+            # ABI's own cast to int64 is a no-op.
+            key_rope = CpuGpuBuffer(
+                sizes[f"v4_compress_plan_{ratio}"],
+                dtype=torch.int64,
+                device=device,
+                pin_memory=device != "cpu",
+            )
+            # What a sentinel row works out to, so a pre-forward capture reads
+            # the value every forward writes.
+            key_rope.cpu.fill_(-ratio)
+            key_rope.copy_to_gpu()
+            buffers[f"v41_key_rope_positions_{ratio}"] = key_rope
         return buffers
+
+    @staticmethod
+    def _visible_buffers(geometry, max_num_batched_tokens, device):
+        """Fixed-address per-ratio visibility, one row per query token.
+
+        Every indexer layer at a ratio reads the same rows, so it is the
+        forward's metadata and not any layer's working set.
+        """
+        return {
+            visible_buffer_name(ratio): CpuGpuBuffer(
+                max_num_batched_tokens,
+                dtype=torch.int32,
+                device=device,
+                pin_memory=device != "cpu",
+            )
+            for ratio, _ in geometry.compress_ratios
+        }
 
     def sub_pool_specs(self):
         return [

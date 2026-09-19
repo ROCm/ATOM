@@ -5,10 +5,15 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
 from atom.model_ops.attentions.deepseek_v41.backend import DeepseekV41MetadataBuilder
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
-from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
+from atom.model_ops.attentions.deepseek_v41.metadata import (
+    RequestSpan,
+    visible_buffer_name,
+)
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+from atom.utils import CpuGpuBuffer
 from tests.attentions.deepseek_v41.helpers import metadata_buffers
 
 
@@ -33,10 +38,9 @@ def staged_step(cache, requests, *, buffers, running_bs, running_tokens):
 def test_staged_metadata_refreshes_reordered_ragged_and_empty_batches(device):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("ROCm GPU required")
-    cache = PagedAttentionCache(
-        V41PoolGeometry(1, ((0, 2),), 32, 4, 512, 32), 8, 4, device
-    )
-    buffers = metadata_buffers(4, 8, 4, device)
+    geo = V41PoolGeometry(1, ((0, 2),), 32, 4, 512, 32)
+    cache = PagedAttentionCache(geo, 8, 4, device)
+    buffers = metadata_buffers(4, 8, 4, device, geo)
     pointers = {name: value.gpu.data_ptr() for name, value in buffers.items()}
     first = RequestSpan(17, 1, 0, 3, 3, (5, 1))
     second = RequestSpan(24, 4, 3, 1, 1, (2, 7))
@@ -102,7 +106,7 @@ def test_engram_rows_are_staged_for_the_width_not_for_the_tokens(engram):
     """
     geo = V41PoolGeometry(1, ((0, 2),), 32, 4, 512, 32)
     cache = PagedAttentionCache(geo, 8, 4, "cpu")
-    buffers = metadata_buffers(4, 8, 4, "cpu")
+    buffers = metadata_buffers(4, 8, 4, "cpu", geo)
     step = staged_step(
         cache,
         (RequestSpan(17, 1, 0, 3, 3, (5, 1)),),
@@ -152,7 +156,7 @@ def test_engram_rows_are_staged_for_the_width_not_for_the_tokens(engram):
 def test_v4_window_write_graph_reads_updated_requests_without_recapture():
     geo = V41PoolGeometry(1, ((0, 2),), 32, 4, 512, 32)
     cache = PagedAttentionCache(geo, 8, 4, "cuda")
-    buffers = metadata_buffers(2, 2, 2, "cuda")
+    buffers = metadata_buffers(2, 2, 2, "cuda", geo)
     first = (RequestSpan(17, 0, 0, 1, 1, (0, 1)), RequestSpan(24, 2, 1, 1, 3, (2, 3)))
     step = staged_step(cache, first, buffers=buffers, running_bs=2, running_tokens=2)
     values = torch.randn(1, 2, 512, device="cuda", dtype=torch.bfloat16)
@@ -205,3 +209,48 @@ def test_shared_slot_publisher_preserves_pool_geometry_and_empty_padding(model):
         assert result.tolist() == expected + [0] * (4 - len(expected))
         assert cpu.tolist() == expected
         assert result.data_ptr() == pointer
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("positions_dtype", [torch.int32, torch.int64])
+def test_visible_rows_are_the_bound_every_indexer_layer_reads(ratio, positions_dtype):
+    """One bound per query row per ratio, staged beside `positions`.
+
+    The scorer bounds each row by how many compressed rows it may see, which
+    is `(position + 1) // ratio`. Every indexer layer at that ratio wants the
+    same answer, and the host already holds what the answer is made of:
+    `positions` is staged there, and the RoPE the model runs reads that very
+    mirror -- so this is no second source of truth.
+
+    The batch below is ragged AND narrower than the width the forward runs,
+    which is the shape that tells a per-token layout apart from a padded
+    `[bs, q]` one. Confuse those two and every row after the first short
+    request gets bounded by another request's position.
+
+    `positions` is int64 in serving (`ModelRunner.forward_vars`) and int32 in
+    the private buffers every other caller here gets, while the bound is int32
+    at both. So the narrowing runs on one path and not the other, which is a
+    difference no single-dtype arm can see.
+    """
+    geo = V41PoolGeometry(1, ((0, ratio),), 32, 4, 512, 32)
+    cache = PagedAttentionCache(geo, 8, 4, "cpu")
+    buffers = metadata_buffers(4, 8, 4, "cpu", geo)
+    buffers["positions"] = CpuGpuBuffer(8, dtype=positions_dtype, device="cpu")
+    requests = (
+        RequestSpan(17, 1, 0, 3, 3, (5, 1)),
+        RequestSpan(24, 9, 3, 1, 1, (2, 7)),
+    )
+    step = staged_step(cache, requests, buffers=buffers, running_bs=4, running_tokens=8)
+    # Armed: ragged, and padded past the batch, so the two layouts really do
+    # disagree over these rows.
+    assert step.scheduled == 4 < step.width == 8
+    assert len({span.length for span in requests}) > 1
+    assert step.positions.dtype == positions_dtype
+    assert step.visible[ratio].dtype == torch.int32
+    assert torch.equal(step.visible[ratio], ((step.positions + 1) // ratio).int())
+    # The staged tensor itself, not a copy: a capture records this address and
+    # every replay reads whatever the host left in it.
+    assert (
+        step.visible[ratio].untyped_storage().data_ptr()
+        == buffers[visible_buffer_name(ratio)].gpu.untyped_storage().data_ptr()
+    )

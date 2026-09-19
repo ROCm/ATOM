@@ -46,23 +46,6 @@ def quantize_query_rows(query):
     return stored.view_as(query), scale
 
 
-def unit_table(block_tables, batch_ids, units_per_page):
-    """One row per query token, naming the tiles of that request's PAGEs.
-
-    A PAGE holds `units_per_page` consecutive tiles, so this is the request's
-    PAGE table with each entry expanded in place -- the translation the plane's
-    region-major layout buys and the reason a block id is not a PAGE id.
-
-    Defined only where the batch id is: a padding row's tiles are whatever
-    row -1 gathers, and the scorer bails on its zero visible count before it
-    loads one. Naming a real request there would state a guarantee this does
-    not give.
-    """
-    pages = block_tables[batch_ids.long()].long()
-    tiles = torch.arange(units_per_page, device=pages.device)
-    return (pages[..., None] * units_per_page + tiles).flatten(-2).int()
-
-
 def plane_rows(width):
     """Query rows a `width`-column logits plane may hold at once.
 

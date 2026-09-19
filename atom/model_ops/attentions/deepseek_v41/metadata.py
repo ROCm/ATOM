@@ -55,13 +55,18 @@ class BatchStep:
     # request is shorter still replays the bucket's graph, so every shape
     # derived from it has to be the bucket's.
     max_q_len: int = 0
-    # Everything below is one forward's, not one layer's. `indptrs` is filled
-    # by `begin_step` into fixed addresses; the rest are filled by the layer
-    # that gets there first and dropped by `begin_forward`.
+    # Everything below is one forward's, not one layer's. `visible` and
+    # `indptrs` are filled into fixed addresses before any layer runs; the
+    # rest are filled by the layer that gets there first and dropped by
+    # `begin_forward`.
     selected: dict[int, torch.Tensor] = field(default_factory=dict)
     candidates: dict[int, torch.Tensor] = field(default_factory=dict)
     tiles: dict[int, torch.Tensor] = field(default_factory=dict)
     indptrs: dict[int, tuple] = field(default_factory=dict)
+    # ratio -> [width] int32: compressed rows each query row may see. Worked
+    # out on the host, where `positions` is staged and where RoPE takes its
+    # own, so this adds no second source of truth.
+    visible: dict[int, torch.Tensor] = field(default_factory=dict)
     # ratio -> CompressPlan. One per distinct compression ratio in the model,
     # built once per forward and read by every owner that shares that ratio.
     plans: dict[int, object] = field(default_factory=dict)
@@ -93,6 +98,11 @@ class BatchStep:
         return self.tentative or all(request.length == 1 for request in self.requests)
 
 
+def visible_buffer_name(ratio):
+    """One spelling for the buffer the builder declares and this module fills."""
+    return f"v41_index_visible_{ratio}"
+
+
 def prepare_batch_step(
     requests,
     device,
@@ -103,6 +113,7 @@ def prepare_batch_step(
     running_tokens=None,
     max_q_len=None,
     state_slot_out=None,
+    ratios=(),
 ):
     """Stage request metadata using the same persistent buffers/layout as V4.
 
@@ -128,6 +139,7 @@ def prepare_batch_step(
             "cu_seqlens_q": (running_bs + 1,),
             "batch_id_per_q_token": (running_tokens,),
             "block_tables": (running_bs, width),
+            **{visible_buffer_name(ratio): (running_tokens,) for ratio in ratios},
         }
         buffers = {
             name: CpuGpuBuffer(
@@ -143,6 +155,7 @@ def prepare_batch_step(
         "cu_seqlens_q": running_bs + 1,
         "batch_id_per_q_token": running_tokens,
         "block_tables": running_bs,
+        **{visible_buffer_name(ratio): running_tokens for ratio in ratios},
     }
     for name, count in required.items():
         if count > buffers[name].np.shape[0]:
@@ -160,6 +173,14 @@ def prepare_batch_step(
         out=positions.np[:scheduled_tokens],
     )
     positions.np[scheduled_tokens:running_tokens] = 0
+    for ratio in ratios:
+        # Padding rows hold position 0 and earn that position's count; the
+        # scorer reaches them with no visible columns either way. Written
+        # through the destination, which narrows serving's int64 positions to
+        # the int32 the scorer reads and spares an expression's temporaries.
+        visible = buffers[visible_buffer_name(ratio)].np[:running_tokens]
+        np.add(positions.np[:running_tokens], 1, out=visible)
+        np.floor_divide(visible, ratio, out=visible)
     batches = buffers["batch_id_per_q_token"]
     build_batch_ids(lengths, pad_to=running_tokens, out=batches.np)
     if state_slot_out is None:
@@ -195,4 +216,5 @@ def prepare_batch_step(
             else max_q_len
         ),
         tentative=tentative,
+        visible={ratio: published[visible_buffer_name(ratio)] for ratio in ratios},
     )

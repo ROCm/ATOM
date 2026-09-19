@@ -32,11 +32,11 @@ def _write_index_kernel(
     data,
     scales,
     plan,
-    rows,
     block_tables,
     per_page,
     table_stride,
     block_bytes,
+    RATIO: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     UE8M0: tl.constexpr,
     TILE: tl.constexpr,
@@ -44,16 +44,19 @@ def _write_index_kernel(
 ):
     """One program per plan row: quantize its key and store it at its address.
 
-    `plan` column 1 is the row's request. A sentinel row carries -1 there and
-    returns here, which is the same guard V4's compressor uses and the reason
-    this needs no arithmetic that keeps a negative negative.
+    `plan` column 1 is the row's request and column 2 its absolute position,
+    one 16-byte row so the second is free. A sentinel carries -1 in column 1
+    and returns here, the same guard V4's compressor uses and the reason this
+    needs no arithmetic that keeps a negative negative.
     """
     token = tl.program_id(0)
     batch = tl.load(plan + token * 4 + 1)
     if batch < 0:
         return
 
-    row = tl.load(rows + token)
+    # Never negative past that guard, so a plain floor divide stands; `RATIO`
+    # is constexpr, so ratio 1 compiles it away.
+    row = tl.load(plan + token * 4 + 2) // RATIO
     page = tl.load(block_tables + batch * table_stride + row // per_page)
     flat = page.to(tl.int64) * per_page + row % per_page
     tile = flat // TILE
@@ -79,15 +82,15 @@ def _write_index_kernel(
     tl.store(scales + (base + TILE * HEAD_DIM) // 4 + in_tile, scale)
 
 
-def write_index_rows(keys, plane, plan, rows, block_tables, per_page, *, scale_fmt):
+def write_index_rows(keys, plane, plan, block_tables, per_page, *, ratio, scale_fmt):
     """Write `keys` into `plane` at the addresses `plan` and `block_tables` give.
 
-    `plane` is the owner's whole index region as bytes; `rows` holds each plan
-    row's compressed-row index within its own request, which the PAGE table
-    turns into a physical row. `scale_fmt` is the plane's declared spelling,
+    `plane` is the owner's whole index region as bytes; a plan row's
+    compressed-row index is `position // ratio`, which the kernel derives from
+    the row it already loaded. `scale_fmt` is the plane's declared spelling,
     read here rather than at the call site so one place knows what it means.
     """
-    count = rows.numel()
+    count = plan.shape[0]
     if not count:
         return
     # `view`, not `reshape`: a plane that could not be seen flat would come
@@ -99,13 +102,13 @@ def write_index_rows(keys, plane, plan, rows, block_tables, per_page, *, scale_f
         flat.view(fp8),
         flat.view(torch.float32),
         plan,
-        rows,
         block_tables,
         per_page,
         block_tables.stride(0),
         # The plane's own last axis is one row's share of a block, so the block
         # is read off the tensor rather than rebuilt from the field list.
         TILE * plane.shape[-1],
+        RATIO=ratio,
         HEAD_DIM=keys.shape[-1],
         UE8M0=scale_fmt == "ue8m0",
         TILE=TILE,

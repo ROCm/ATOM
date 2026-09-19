@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Which MoE layers get a side stream for the shared expert, and which do not.
+"""Which side stream each model's MoE layers get for the shared expert.
 
 The shared expert cannot be folded into a routed slot on any V4/V4.1
 checkpoint -- it is FP8 where the routed experts are FP4 -- so it is a module
@@ -49,19 +49,25 @@ def test_backbone_gives_every_moe_the_one_stream_it_made(
 
 
 @pytest.mark.parametrize("entrypoint", ["draft", "draft_offline"])
-def test_draft_keeps_its_shared_expert_on_the_one_stream(
+def test_draft_forks_on_the_stream_it_is_handed(
     single_rank, unallocated_moe, build_v41, created_streams, entrypoint
 ):
-    """The draft does not fork, as V4's own DSpark layers do not.
+    """The draft forks too, on the backbone's stream rather than one of its own.
 
-    Not an oversight to be tidied up: forking here puts a second stream inside
-    the propose graph's capture, which is a change with its own measurement to
-    do. Pinned so that doing it is a decision rather than a side effect of
-    touching the backbone.
+    The two models never run at once, so a second handle would buy nothing;
+    serving hands this one down from `DSparkProposer`, which is where the
+    backbone is. Building none of its own is half the contract -- a draft that
+    quietly made one would fork on a stream the backbone never waits for.
+
+    This used to pin the opposite, on the grounds that forking would put a
+    second stream inside the propose graph's capture; the backbone's own decode
+    graph already does exactly that, so the capture was never the obstacle.
     """
-    instance = build_v41(entrypoint)
+    handed = FakeStream()
+    instance = build_v41(entrypoint, alt_stream=handed)
 
     assert created_streams == []
+    assert instance.alt_stream is handed
     assert instance.mtp
     for block in instance.mtp:
-        assert block.ffn.alt_stream is None
+        assert block.ffn.alt_stream is handed

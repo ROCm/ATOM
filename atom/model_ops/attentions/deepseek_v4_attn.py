@@ -398,6 +398,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     # Number of micro-batches for Two-Batch Overlap (TBO).
     _NUM_TBO_UBATCHES = 2
 
+    # Set by a subclass that rotates an index key at its compression group's
+    # first token instead of at its own. V4's rotate at their own, so its
+    # plans carry no such positions and it declares no buffer for them.
+    _publishes_key_rope = False
+
     def __init__(self, model_runner):
         super().__init__(model_runner)
         hf = model_runner.config.hf_config
@@ -3917,13 +3922,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             "— passing torch.Tensor here would trigger a hidden D2H sync"
         )
         var = self.model_runner.forward_vars
-        plan_buffers = {
-            ratio: {
+        plan_buffers = {}
+        for ratio, _ in self._unique_compress_ratios_overlap:
+            ratio_buffers = {
                 "compress": var[f"{buf_prefix_ubatch}v4_compress_plan_{ratio}"],
                 "write": var[f"{buf_prefix_ubatch}v4_write_plan_{ratio}"],
             }
-            for ratio, _ in self._unique_compress_ratios_overlap
-        }
+            if self._publishes_key_rope:
+                ratio_buffers["key_rope"] = var[
+                    f"{buf_prefix_ubatch}v41_key_rope_positions_{ratio}"
+                ]
+            plan_buffers[ratio] = ratio_buffers
         return make_compress_plans(
             extend_lens_np,
             context_lens_np,

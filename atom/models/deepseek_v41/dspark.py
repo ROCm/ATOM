@@ -85,12 +85,23 @@ class DraftAttention(Attention):
 class DraftBlock(Block):
     attention_cls = DraftAttention
 
-    def __init__(self, config, spec, stage, prefix: str = "", *, moe_quant_config):
-        # No `alt_stream`: the draft keeps its shared expert on the one stream,
-        # as V4's own DSpark layers do. Forking here puts a second stream inside
-        # the propose graph's capture, which is a change with its own
-        # measurement to make, not a corollary of wiring the backbone.
-        super().__init__(config, spec, prefix=prefix, moe_quant_config=moe_quant_config)
+    def __init__(
+        self,
+        config,
+        spec,
+        stage,
+        prefix: str = "",
+        *,
+        moe_quant_config,
+        alt_stream: torch.cuda.Stream | None = None,
+    ):
+        super().__init__(
+            config,
+            spec,
+            prefix=prefix,
+            moe_quant_config=moe_quant_config,
+            alt_stream=alt_stream,
+        )
         if stage == 0:
             self.main_proj = ReplicatedLinear(
                 config.hidden_size * len(config.dspark_target_layer_ids),
@@ -123,7 +134,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
     packed_modules_mapping = DeepseekV41ForCausalLM.packed_modules_mapping
     disable_fused_shared_loading = DeepseekV41ForCausalLM.disable_fused_shared_loading
 
-    def __init__(self, config, *, max_length=None):
+    def __init__(self, config, *, max_length=None, alt_stream=None):
         super().__init__()
         args = getattr(config, "hf_config", config)
         if args.num_nextn_predict_layers < 1 or args.dspark_block_size < 1:
@@ -140,6 +151,10 @@ class DeepseekV41DSpark(DSparkDraftModel):
             draft, online_quant_config=getattr(config, "online_quant_config", None)
         )
         topology = build_attention_topology(args)[args.num_hidden_layers :]
+        # The backbone's, handed down: the two models never run at once, so a
+        # stream of its own would buy nothing. Absent when built offline,
+        # which is also where nothing is fast enough to care.
+        self.alt_stream = alt_stream
         self.mtp = nn.ModuleList(
             # The stage index, not the topology's layer id: this prefix names
             # the module's own parameters, and `nn.ModuleList` numbers them
@@ -150,6 +165,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
                 i,
                 prefix=f"mtp.{i}",
                 moe_quant_config=self.moe_quant_config,
+                alt_stream=self.alt_stream,
             )
             for i, spec in enumerate(topology)
         )

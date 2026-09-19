@@ -109,7 +109,7 @@ def build_v41(unallocated_moe):
 
     hf = unallocated_moe
 
-    def build(entrypoint, online=None):
+    def build(entrypoint, online=None, alt_stream=None):
         engine = SimpleNamespace(
             hf_config=hf,
             max_model_len=32,
@@ -123,10 +123,14 @@ def build_v41(unallocated_moe):
                 return model.DeepseekV41ForCausalLM(
                     hf, max_length=32, online_quant_config=online
                 )
+            # The draft takes the backbone's stream; serving hands it down
+            # from `DSparkProposer`, which is where the backbone is.
             if entrypoint == "draft":
-                return dspark.DeepseekV41DSpark(engine)
+                return dspark.DeepseekV41DSpark(engine, alt_stream=alt_stream)
             if entrypoint == "draft_offline":
-                return dspark.DeepseekV41DSpark(hf, max_length=32)
+                return dspark.DeepseekV41DSpark(
+                    hf, max_length=32, alt_stream=alt_stream
+                )
             raise ValueError(f"No V4.1 entry point named {entrypoint!r}")
 
     return build

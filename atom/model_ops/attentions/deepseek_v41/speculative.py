@@ -60,10 +60,14 @@ class TentativeState:
         if lengths.shape != (count,):
             raise ValueError("Accepted lengths must match the scheduled requests")
         cursors = self.staging.copy_to_gpu(count)[:, : self.width]
-        torch._assert_async(
-            ((lengths >= 1) & (lengths <= self.limits.copy_to_gpu(count))).all(),
-            "Accepted prefix is outside the verification span",
-        )
+        # Four launches and a copy every step, and the only thing `self.limits`
+        # is staged for. Uncomment when a wrong accepted length is the suspect:
+        # neither end faults, so it is silent -- 0 indexes row -1, and a length
+        # past the staged span reads an earlier round's row.
+        # torch._assert_async(
+        #     ((lengths >= 1) & (lengths <= self.limits.copy_to_gpu(count))).all(),
+        #     "Accepted prefix is outside the verification span",
+        # )
         batch = torch.arange(count, device=lengths.device)
         # The scheduled prefix, not the forward's width: a padding request owns
         # no slot, and the 0 standing in for one is a live request's.

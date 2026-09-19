@@ -6,18 +6,18 @@ from dataclasses import replace
 import numpy as np
 import pytest
 import torch
-from atom.model_ops.attentions.deepseek_v41.cache import (
-    PagedAttentionCache,
-)
-from atom.model_ops.attentions.deepseek_v41.checkpoints import StateCopies
-from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
-from tests.attentions.deepseek_v41.helpers import geometry
 
 from atom.model_engine.page_unit_checkpoint import (
     CheckpointRestoreOp,
     CheckpointStoreOp,
     PagedStateCheckpointSpec,
 )
+from atom.model_ops.attentions.deepseek_v41.cache import (
+    PagedAttentionCache,
+)
+from atom.model_ops.attentions.deepseek_v41.checkpoints import StateCopies
+from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
+from tests.attentions.deepseek_v41.helpers import geometry
 
 
 @pytest.mark.parametrize("packed", [False, True])
@@ -153,7 +153,6 @@ def test_a_graph_sized_plans_sentinel_rows_land_on_the_page_nobody_owns():
     destination is the one PAGE the scheduler cannot name instead.
     """
     from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
-
     from atom.model_ops.v4_kernels import make_compress_plans
     from atom.utils import CpuGpuBuffer
 
@@ -189,6 +188,9 @@ def test_a_graph_sized_plans_sentinel_rows_land_on_the_page_nobody_owns():
     # Positive control: with no sentinel row there is nothing to place, and the
     # assertions below would hold for a scatter that ignores the question.
     assert live.any() and not live.all()
+    # Derived here rather than handed to the scatter: the scatter works the
+    # same rows out of the plan itself, so these assertions check that
+    # derivation instead of echoing a value the test supplied.
     rows = plan.compress_plan_gpu[:, 2] // 2
     per_page = geo.rows_per_page(2)
     pages = cache.pages.view("main_0")[0]
@@ -196,7 +198,7 @@ def test_a_graph_sized_plans_sentinel_rows_land_on_the_page_nobody_owns():
     # A value no row shares, so a row that landed says which one it was.
     value = torch.arange(1, rows.numel() + 1, dtype=pages.dtype, device=pages.device)
     filled = value[None, :, None].expand(1, -1, pages.shape[-1])
-    cache._scatter_rows(pages, step, rows, filled, 2)
+    cache._scatter_rows(pages, step, filled, 2)
     table = step.block_tables[plan.compress_plan_gpu[:, 1].long()]
     for i in live.nonzero().flatten().tolist():
         page = table[i, rows[i] // per_page]
@@ -204,3 +206,53 @@ def test_a_graph_sized_plans_sentinel_rows_land_on_the_page_nobody_owns():
     # Exactly the live rows were written: a sentinel reaching `-1` would have
     # landed on the last page's last row, which is a live request's.
     assert int((pages != 0).any(-1).sum()) == int(live.sum())
+
+
+def test_key_rope_positions_span_the_grid_and_carry_its_sentinels():
+    """Where every plan row's index key gets rotated, published by the plan.
+
+    A boundary's key is rotated at its compression group's FIRST token and not
+    at its own: `fused_compress` rotated that group's main latent there, and a
+    key rotated anywhere else selects other rows.
+
+    Two things a shorter or hand-filled tensor would get past: the grid is the
+    capacity rather than `num_compress`, so a sentinel row needs a position
+    too -- and at ratio 2 a sentinel's is `-2`, which is what a fill that
+    reasoned "sentinels are -1" would most likely miss.
+    """
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+    from atom.model_ops.v4_kernels import make_compress_plans
+    from atom.utils import CpuGpuBuffer
+
+    geo = V41PoolGeometry(2, ((0, 2), (1, 2)), 32, 4, 512, 32, speculative_tokens=1)
+
+    def build(with_key_rope):
+        buffers = {
+            name: CpuGpuBuffer(8, 4, dtype=torch.int32, device="cpu")
+            for name in ("compress", "write")
+        }
+        if with_key_rope:
+            buffers["key_rope"] = CpuGpuBuffer(8, dtype=torch.int64, device="cpu")
+        return make_compress_plans(
+            np.asarray([2], dtype=np.int32),
+            np.asarray([6], dtype=np.int32),
+            geo.compress_ratios,
+            plan_buffers={2: buffers},
+            running_bs=2,
+            max_q_len=2,
+            extra_write=1,
+        )[2]
+
+    plan = build(True)
+    positions = plan.compress_plan_gpu[:, 2]
+    # Armed: the grid really does run past the rows this batch filled, so the
+    # sentinel half of the comparison below is not vacuous.
+    assert plan.compress_plan_gpu.shape[0] > plan.num_compress > 0
+    assert (positions < 0).any()
+    assert plan.key_rope_positions_gpu.dtype == torch.int64
+    assert torch.equal(plan.key_rope_positions_gpu, positions.long() // 2 * 2)
+    # Named rather than left to the comparison: this is the value the ratio-1
+    # intuition gets wrong, and naming it makes the failure say so.
+    assert plan.key_rope_positions_gpu[plan.num_compress] == -2
+    # A caller that declares no buffer pays nothing and is handed nothing.
+    assert build(False).key_rope_positions_gpu is None

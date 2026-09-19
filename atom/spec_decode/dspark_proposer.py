@@ -310,7 +310,12 @@ class DSparkProposer(Drafter):
             # V4: the draft is part of the target checkpoint and shares its
             # config wholesale, so it inherits the target's compilation level
             # and its `_DSparkInner` is compiled (see deepseek_v4_dspark.py).
-            model = model_class(self.config)
+            # The backbone's side stream, not one of the draft's own: the two
+            # never run at once, so a second handle would buy nothing. A draft
+            # whose layers do not fork simply ignores it.
+            model = model_class(
+                self.config, alt_stream=getattr(self.runner.model, "alt_stream", None)
+            )
             if envs.ATOM_DSPARK_DISABLE_COMPILE:
                 # Flip the decorator's own bypass rather than handing the draft a
                 # cloned config with NO_COMPILATION (what the with-draft branch

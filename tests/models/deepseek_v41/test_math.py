@@ -461,3 +461,25 @@ def test_real_engram_weights_and_native_table_rows(reference, native_quant):
         # At BF16 output precision, tolerate at most one ulp away from zero;
         # FP32 reduction order differs across the CPU and GPU implementations.
         torch.testing.assert_close(actual, expected, rtol=1 / 128, atol=2**-10)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+def test_collapse_matches_the_torch_body_it_replaced():
+    """One launch instead of four, and the same bits.
+
+    `collapse_streams` keeps its multiply and its sum apart for exactly this
+    reason, so equality is the contract here rather than a tolerance.
+    """
+    torch.manual_seed(7)
+    hidden = torch.randn(1, 5, 256, dtype=torch.bfloat16, device="cuda")
+    state = SinglePassHCState.from_embeddings(hidden, 4)
+    state = SinglePassHCState(state.residual, torch.randn_like(state.pre_mix))
+    # Armed: the one-hot pre-mix a fresh state carries would agree with any
+    # weighting at all, so it cannot tell the two bodies apart.
+    assert (state.pre_mix.abs() > 1e-3).all()
+    expected = (
+        (state.residual.float() * state.pre_mix.unsqueeze(-1))
+        .sum(-2)
+        .to(state.residual.dtype)
+    )
+    assert torch.equal(state.collapse(), expected)
