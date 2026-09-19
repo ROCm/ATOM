@@ -327,12 +327,16 @@ independent K3 runs, offline from each run's `profile_export.jsonl`), **2-3% of 
 the arm can only return a null result, and would do so no matter how the
 connector behaved.
 
-| `--num-gpu-blocks-override` | concurrency | reusable prefix | in band, 20 GiB tier |
-|---|---|---|---|
-| 1584 (default) | 28.8 | 270,336 tok | 2-3% |
-| 1300 | 23.6 | 161,280 tok | 16-22% |
-| **1100** | **20.0** | **84,480 tok** | **44-45%** |
-| 1000 | 18.2 | 46,080 tok | 71-72% |
+| `--num-gpu-blocks-override` | concurrency | reusable prefix | in band @4 lanes | @16 lanes |
+|---|---|---|---|---|
+| 1584 (default) | 28.8 | 270,336 tok | 2-3% | 8-16% |
+| 1300 | 23.6 | 161,280 tok | 16-22% | 18-35% |
+| **1100** | **20.0** | **84,480 tok** | **44-45%** | **36-46%** |
+| 1000 | 18.2 | 46,080 tok | 71-72% | 38-65% |
+
+The 4-lane column is measured directly on two independent runs. The 16-lane
+column extrapolates one doubling from a third, measured at 8 lanes in the same
+sweep, over the range that brackets its own 4-to-8 ratio.
 
 **Shrink the pool; do not grow the tier.** Making the tier merely exceed the
 *default* pool would want ~107 GiB/rank, i.e. ~853 GiB pinned across TP8 — the
@@ -344,12 +348,23 @@ measurement needs no extra host memory at all.
 sequences run past it already (median ISL ~74k tokens against a 65,536 window),
 so a shorter window truncates the workload rather than the pool.
 
-Those percentages are measured at 4 lanes and are an **upper bound** — a turn in
-the band still has to be looked up and hit. Reuse distance grows *sub*-linearly
-in lanes (8x the lanes moved it 2.3x), and across scale factors of 1.0 to 3.0
-the 1100-block row holds 44-64% while the default row never passes 20%. After
-the OFF arm runs, recompute the band from its own `profile_export.jsonl` at the
-concurrency actually used, rather than carrying these numbers forward.
+Every percentage above is an **upper bound**: landing in the band is necessary
+for the tier to help, not sufficient, because the turn still has to be looked up
+and hit. Only a zero is a hard result.
+
+Reuse distance grows close to **linearly** in lanes. Measured within one K3
+sweep, 4 to 8 lanes moved it x1.90 at p75 and x1.97 at p50, against prompt-length
+distributions 7% apart. Do not measure this across models: a cross-model pair
+varies block size, bytes per token and the prompt-length distribution at the same
+time as the lane count, and attributes the product to lanes alone — doing exactly
+that produced a "sub-linear x2.3" here that the within-model axis then refuted.
+The 1-lane point in the same sweep is no good for it either, for the same reason
+in miniature: its median input sequence is 1.8x the other two.
+
+The choice of 1100 survives the whole range anyway — it holds 36-46% at 16 lanes
+where the default holds 8-16%. After the OFF arm runs, recompute the band from
+its own `profile_export.jsonl` at the concurrency actually used, rather than
+carrying any of these numbers forward.
 
 Set `NUM_GPU_BLOCKS_OVERRIDE`, `MAX_MODEL_LEN`, `CONC` and `LMC_CPU_GIB`
 identically on both arms: the band is defined by the first and last of them, and
