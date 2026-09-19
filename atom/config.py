@@ -1924,6 +1924,15 @@ class Config:
                 "moe_backend='mega' owns its MoRI transport and cannot use the "
                 "experimental RCCL prepare/finalize backend"
             )
+        if envs.ATOM_MEGA_HYBRID_ENABLE and self.moe_backend != "mega":
+            raise ValueError(
+                "ATOM_MEGA_HYBRID_ENABLE=1 requires moe_backend='mega' "
+                "(the hybrid dispatch lives inside MegaMxfp4MoEMethod)."
+            )
+        # Arch (gfx950-only) and EPLB/ATOM_MOE_GU_ITLV compatibility are
+        # checked in MegaMxfp4MoEMethod.__init__, which falls back to
+        # mega-only with a warning rather than failing hard -- those are
+        # runtime/hardware nuances, not plain misconfiguration.
 
         if isinstance(self.compilation_config, dict):
             self.compilation_config = CompilationConfig(**self.compilation_config)

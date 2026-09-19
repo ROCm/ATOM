@@ -166,6 +166,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # own MEGA_DISPATCH=flydsl|mori), 0 binds mori's v2 op-layer running plain
     # gather, i.e. the untouched upstream baseline.
     "ATOM_MORI_V2_FUSED": lambda: os.getenv("ATOM_MORI_V2_FUSED", "0") == "1",
+    # Per-step mega/standard MoE dispatch; only meaningful when moe_backend=="mega".
+    "ATOM_MEGA_HYBRID_ENABLE": lambda: os.getenv("ATOM_MEGA_HYBRID_ENABLE", "0") == "1",
+    # Token-count threshold (max across the DP/EP group) at or above which the
+    # hybrid picks mega for a step; below it, standard. See PR description for
+    # the live e2e data behind this default.
+    "ATOM_MEGA_HYBRID_MIN_TOKENS": lambda: int(
+        os.getenv("ATOM_MEGA_HYBRID_MIN_TOKENS", "1024")
+    ),
     # Reuse a 128-token MegaMoEV2 instance for native DP-unified small decode/
     # verify/draft forwards on the supported EP8, 48-experts-per-rank layout. Set to 0
     # to keep the configured max_num_batched_tokens capacity for every graph.

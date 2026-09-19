@@ -403,3 +403,31 @@ class MegaFusedExperts:
             swiglu_limit=getattr(self._layer, "swiglu_limit", 0.0),
             quant=self._quant,
         )
+
+
+class HybridFusedExperts:
+    """Per-step mega/standard MoE dispatch (``ATOM_MEGA_HYBRID_ENABLE``).
+
+    Stateless: holds two already-built backend callables and picks one per
+    call, since ``apply()`` can be reentered by different ubatches under TBO
+    and mutating a shared ``fused_experts`` in place would race.
+
+    Gates on ``running_tokens_across_dp`` (DP-synchronized), never a
+    per-rank-local signal: MoE dispatch/combine is a cross-rank collective
+    for both backends, so a per-rank-divergent choice would hang or corrupt
+    rather than just under-perform.
+    """
+
+    def __init__(self, *, mega, standard, min_tokens: int) -> None:
+        self.mega = mega
+        self.standard = standard
+        self.min_tokens = int(min_tokens)
+
+    def __call__(self, **kwargs):
+        from atom.utils.forward_context import get_forward_context
+
+        ctx = get_forward_context().context
+        across_dp = ctx.running_tokens_across_dp
+        tokens = max(across_dp) if across_dp else ctx.scheduled_tokens
+        backend = self.mega if tokens >= self.min_tokens else self.standard
+        return backend(**kwargs)
