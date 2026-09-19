@@ -3,8 +3,10 @@
 
 import logging
 
+from atom.model_engine.capabilities import EngineCapabilities, WorkerCapabilities
+from atom.model_engine.collective_rpc import RpcResult
 from atom.model_engine.llm_engine import LLMEngine
-from atom.rollout.weight_sync import load_weights_via_shm, load_weights_via_ipc
+from atom.rollout.weight_sync import load_weights_via_ipc, load_weights_via_shm
 
 logger = logging.getLogger("atom")
 
@@ -30,6 +32,59 @@ class AsyncLLMEngine(LLMEngine):
             "atom.rollout.model_runner_ext.RLHFModelRunner",
         )
         super().__init__(model, **kwargs)
+
+    def collective_rpc(
+        self,
+        method: str,
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict | None = None,
+        barrier: bool = False,
+    ) -> list[RpcResult]:
+        """Run *method* on every model runner across all DP and TP ranks.
+
+        Replies come back in DP-major then TP-rank order, one per rank. A rank
+        that failed carries its reason in ``RpcResult.error`` rather than
+        raising, so a partial failure still reports the ranks that succeeded --
+        which is what a caller verifying weight coverage needs.
+
+        The signature mirrors vLLM's ``collective_rpc`` so the same caller can
+        drive either engine. Intended for small control messages: bulk tensors
+        belong on the weight-sync data plane.
+
+        Note this stalls the affected DP rank's scheduling for the call's
+        duration, since the handler runs in the EngineCore busy loop. That is
+        wanted for a weight swap; it is not free for anything else.
+        """
+        return self.core_mgr.collective_rpc(
+            method,
+            args=args,
+            kwargs=kwargs,
+            barrier=barrier,
+            timeout=300.0 if timeout is None else timeout,
+        )
+
+    def get_capabilities(self, timeout: float = 60.0) -> EngineCapabilities:
+        """What this engine and its workers actually support.
+
+        Static topology comes from the engine's own config; the per-worker half
+        comes from one ``collective_rpc`` round, so discovery travels the same
+        path it describes. Features are **intersected** across ranks: a
+        capability is advertised only when every rank reports it, because a
+        feature present on some ranks is not usable by a collective.
+
+        Raises if any rank fails to answer. A partial view is worse than none --
+        a caller would negotiate a feature that then fails mid-collective.
+        """
+        replies = self.collective_rpc("get_worker_capabilities", timeout=timeout)
+        failed = [r for r in replies if not r.ok]
+        if failed:
+            raise RuntimeError(
+                "get_capabilities could not reach every rank: "
+                + "; ".join(f"tp{r.tp_rank}: {r.error}" for r in failed[:8])
+            )
+        workers = [WorkerCapabilities.from_payload(r.value) for r in replies]
+        return EngineCapabilities.from_workers(config=self.config, workers=workers)
 
     def sleep(self, level: int = 1):
         """Release GPU resources.
