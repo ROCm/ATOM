@@ -282,6 +282,12 @@ components sum to `vllm:prompt_tokens_total` exactly on both arms:
 | `external_kv_transfer` | 0 | **5,048,128 (40.97%)** |
 | total | 10,223,902 | 12,321,104 |
 
+Every percentage above is against that server-side total. aiperf's own
+`total_usage_prompt_tokens` reads 13 lower on **both** arms (10,223,889 /
+12,321,091) -- the startup health-check request, which the server counts and the
+client never issued. It is 0.0001% and changes nothing, but recompute against
+the same total the table used, or the sums stop closing.
+
 Prefill recompute fell from 13,441 to 7,959 tok/s (−40.8%) while the server
 delivered 20.5% more requests. The tier only feeds prefill, so TTFT should move
 most and most uniformly — it does (−28.9 / −28.7 / −25.0% across avg/p50/p90),
