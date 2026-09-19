@@ -1545,8 +1545,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         return output
 
     def _cp_index_topk_decode(
-        self, index_q, block_table, seq_lens, max_seq_len, max_query_len
-    ):
+        self, index_q, block_table, seq_lens, max_seq_len, max_query_len,
+        index_score_work_map=None, index_score_max_block=0,
+    ):  # fmt: skip
         """Decode top-k with the context sharded across the indexer-CP group.
 
         Score all index heads over this rank's 1/P of the blocks, reduce to this
@@ -1577,6 +1578,11 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             self.indexer_cp_world,
             max_query_len,
             self.scale,
+            # Built once per decode step in the metadata against this rank's
+            # local block bound, never here -- see `indexer_context_scores`.
+            # None means the scorer builds its own, at ~120us per sparse layer.
+            work_map=index_score_work_map,
+            max_block=index_score_max_block,
         )
         # Forced blocks are pinned in BOTH passes on purpose: one that lost its
         # owner shard's top-k would never arrive at the merge to be pinned.
@@ -1635,6 +1641,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                     decode_md.seq_lens,
                     sparse_metadata.max_seq_len,
                     max_query_len,
+                    index_score_work_map=sparse_metadata.index_score_work_map,
+                    index_score_max_block=sparse_metadata.index_score_max_block,
                 )
             else:
                 topk_idx, sparse_bt, sparse_ctx = minimax_m3_index_topk_decode(
@@ -1651,6 +1659,13 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                     emit_sparse_block_table=True,
                     max_query_len=max_query_len,
                     n_valid_column_per_row=sparse_metadata.n_valid_column_per_row,
+                    # Built once per decode step in the metadata, never here:
+                    # `make_work_map` is ~15 tiny launches costing ~120 us, so
+                    # per sparse layer it would swamp the kernel it feeds. None
+                    # means the scorer builds its own -- correct, and exactly
+                    # the price this hoist exists to avoid paying 57x a step.
+                    index_score_work_map=sparse_metadata.index_score_work_map,
+                    index_score_max_block=sparse_metadata.index_score_max_block,
                 )
             self._store_cached_topk(
                 sparse_metadata, topk_key, (topk_idx, sparse_bt, sparse_ctx)

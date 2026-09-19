@@ -42,6 +42,9 @@ def _local_topk(
     Scores,
     Keys,
     Lengths,
+    S_HEAD: tl.constexpr,
+    S_ROW: tl.constexpr,
+    S_BLOCK: tl.constexpr,
     TOKENS: tl.constexpr,
     HEADS: tl.constexpr,
     QUERY_LEN: tl.constexpr,
@@ -60,6 +63,11 @@ def _local_topk(
     The id inside each key is the GLOBAL block id, so the receiving merge never
     needs to know which rank a candidate came from.
 
+    The three score strides are explicit because the flydsl scorer writes a
+    feature-contiguous layout -- same shape, block axis strided -- which is
+    worth ~10% to it and which a hardcoded `* LOCAL_BLOCKS` cannot address. The
+    native selector takes its strides the same way for the same reason.
+
     Forced blocks are pinned HERE as well as in the merge. Pinning only at the
     merge loses them: a forced block that lost its own shard's top-k never
     arrives to be pinned. Pinning here costs nothing, because the candidate it
@@ -74,13 +82,13 @@ def _local_topk(
     # Blocks this query token may attend, in global numbering.
     causal_blocks = (length - QUERY_LEN + token + 128) // 128
     local_start = tl.maximum(0, causal_blocks - LOCAL_KEEP)
-    s_row = Scores + (head * TOKENS + row) * LOCAL_BLOCKS
+    s_row = Scores + head * S_HEAD + row * S_ROW
 
     off = tl.arange(0, BLOCK_SIZE_K)
     local_valid = off < LOCAL_BLOCKS
     block = off * WORLD + RANK
     valid = local_valid & (block < GLOBAL_BLOCKS) & (block < causal_blocks)
-    score = tl.load(s_row + off, mask=local_valid, other=-1e30).to(tl.float32)
+    score = tl.load(s_row + off * S_BLOCK, mask=local_valid, other=-1e30).to(tl.float32)
     score = _force(score, block, valid, local_start, INIT_BLOCKS)
     winners = tl.topk(_pack_score_key(score, block + 1, valid), BLOCK_SIZE_T)
     for start in tl.range(BLOCK_SIZE_K, LOCAL_BLOCKS, BLOCK_SIZE_K):
@@ -88,7 +96,9 @@ def _local_topk(
         local_valid = off < LOCAL_BLOCKS
         block = off * WORLD + RANK
         valid = local_valid & (block < GLOBAL_BLOCKS) & (block < causal_blocks)
-        score = tl.load(s_row + off, mask=local_valid, other=-1e30).to(tl.float32)
+        score = tl.load(
+            s_row + off * S_BLOCK, mask=local_valid, other=-1e30
+        ).to(tl.float32)
         score = _force(score, block, valid, local_start, INIT_BLOCKS)
         tile = tl.topk(_pack_score_key(score, block + 1, valid), BLOCK_SIZE_T)
         winners = tl.topk(tl.cat(winners, tile, can_reorder=True), BLOCK_SIZE_T)
@@ -207,8 +217,11 @@ def local_candidate_keys(
     if min(init_blocks, local_blocks) < 0:
         raise ValueError("forced-block counts must be non-negative")
     _require_packable(global_blocks)
-    if not scores.is_contiguous() or seq_lens.dtype != torch.int32:
-        raise ValueError("scores must be contiguous and lengths int32")
+    # Any stride triple is addressable (see `_local_topk`), so the requirement
+    # is only that the scorer laid the axes out at all -- a 0 stride on the
+    # block axis would silently score one block `local` times.
+    if scores.stride(2) == 0 or seq_lens.dtype != torch.int32:
+        raise ValueError("scores must have a real block axis and lengths int32")
     keys = torch.empty((heads, tokens, topk), dtype=torch.int64, device=scores.device)
     if tokens:
         # The tile must be at least as wide as the top-k it selects: the
@@ -226,6 +239,9 @@ def local_candidate_keys(
             scores,
             keys,
             seq_lens,
+            S_HEAD=scores.stride(0),
+            S_ROW=scores.stride(1),
+            S_BLOCK=scores.stride(2),
             TOKENS=tokens,
             HEADS=heads,
             QUERY_LEN=max_query_len,
