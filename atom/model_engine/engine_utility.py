@@ -5,6 +5,7 @@ import logging
 import queue
 from typing import ClassVar
 
+from atom.model_engine.collective_rpc import COLLECTIVE_RPC_CMD, RpcPayload
 from atom.model_engine.sequence import SequenceStatus
 from atom.utils import envs
 
@@ -47,6 +48,7 @@ class EngineUtilityHandler:
         "get_mtp_statistics": "_handle_get_mtp_statistics",
         "get_cache_statistics": "_handle_get_cache_statistics",
         "abort_request": "_handle_abort_request",
+        COLLECTIVE_RPC_CMD: "_handle_collective_rpc",
     }
 
     def __init__(
@@ -115,10 +117,93 @@ class EngineUtilityHandler:
             handler = getattr(self, handler_name)
             handler(args)
         else:
+            # Answer, do not just log. `broadcast_utility_command_sync` blocks
+            # for 300s on a response that a dropped command never produces, so
+            # a misspelled command used to cost five minutes and then report a
+            # timeout naming the command but not the cause.
             logger.warning(f"{self.label}: Unknown utility command: {cmd}")
+            self.output_queue.put_nowait(
+                (
+                    "UTILITY_RESPONSE",
+                    {"cmd": cmd, "error": f"unknown utility command {cmd!r}"},
+                )
+            )
 
         elapsed = _time.monotonic() - t0
         log(f"{self.label}: utility command '{cmd}' finished in {elapsed:.2f}s")
+
+    def _handle_collective_rpc(self, args: dict):
+        """Invoke an arbitrary ModelRunner method on every TP rank.
+
+        Runs in the EngineCore busy loop, so this DP rank stops scheduling for
+        the call's duration. That is wanted for a weight swap, but it does mean
+        a caller passing a long timeout is deliberately stalling generation.
+        """
+        method = args.get("method")
+        request_id = args.get("request_id")
+        if not method or not request_id:
+            self.output_queue.put_nowait(
+                (
+                    "UTILITY_RESPONSE",
+                    {
+                        "cmd": COLLECTIVE_RPC_CMD,
+                        "request_id": request_id,
+                        "error": "collective_rpc needs both 'method' and 'request_id'",
+                    },
+                )
+            )
+            return
+
+        payload = RpcPayload(
+            request_id=request_id,
+            args=tuple(args.get("args", ())),
+            kwargs=dict(args.get("kwargs") or {}),
+            barrier=bool(args.get("barrier", False)),
+        )
+        try:
+            replies = self.runner_mgr.collective_rpc(
+                method, payload, timeout=float(args.get("timeout", 300.0))
+            )
+        except Exception as exc:  # noqa: BLE001 - reported, never raised at the loop
+            # Raising here would kill the EngineCore busy loop and take the
+            # engine down with it; the caller gets the reason instead.
+            self.output_queue.put_nowait(
+                (
+                    "UTILITY_RESPONSE",
+                    {
+                        "cmd": COLLECTIVE_RPC_CMD,
+                        "request_id": request_id,
+                        "method": method,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+            )
+            return
+
+        failures = [r for r in replies if not r.ok]
+        logger.info(
+            f"{self.label}: collective_rpc {method} ranks={len(replies)} "
+            f"failed={len(failures)}"
+        )
+        self.output_queue.put_nowait(
+            (
+                "UTILITY_RESPONSE",
+                {
+                    "cmd": COLLECTIVE_RPC_CMD,
+                    "request_id": request_id,
+                    "method": method,
+                    "tp_world_size": self.runner_mgr.proc_num,
+                    "results": [
+                        {
+                            "tp_rank": r.tp_rank,
+                            "value": r.value,
+                            "error": r.error,
+                        }
+                        for r in replies
+                    ],
+                },
+            )
+        )
 
     def _handle_update_weights(self, args: dict):
         """Handle direct weight update command."""
@@ -128,6 +213,12 @@ class EngineUtilityHandler:
             "update_weights", named_tensors, flush_cache, wait_out=True
         )
         logger.info(f"{self.label}: update_weights completed, updated={result}")
+        # Without this, broadcast_utility_command_sync("update_weights", ...)
+        # can only ever time out. The _shm and _ipc variants always responded;
+        # this one never did.
+        self.output_queue.put_nowait(
+            ("UTILITY_RESPONSE", {"cmd": "update_weights", "result": result})
+        )
 
     def _handle_update_weights_shm(self, args: dict):
         """Handle shared-memory weight update command.
@@ -221,14 +312,21 @@ class EngineUtilityHandler:
         """Mark a sequence ABORTED (client disconnected) so the scheduler finishes
         it at the next step via the normal stop path (frees KV, drops it)."""
         req_id = args.get("req_id") if isinstance(args, dict) else None
-        if req_id is None or self.scheduler is None:
-            return
         found = False
-        for seq in list(self.scheduler.running) + list(self.scheduler.waiting):
-            if seq.id == req_id:
-                seq.status = SequenceStatus.ABORTED
-                found = True
-        logger.info(f"{self.label}: abort_request req_id={req_id} found={found}")
+        if req_id is not None and self.scheduler is not None:
+            for seq in list(self.scheduler.running) + list(self.scheduler.waiting):
+                if seq.id == req_id:
+                    seq.status = SequenceStatus.ABORTED
+                    found = True
+            logger.info(f"{self.label}: abort_request req_id={req_id} found={found}")
+        # Always answer, including on the early-return paths above: a caller
+        # using broadcast_utility_command_sync would otherwise hang for 300s.
+        self.output_queue.put_nowait(
+            (
+                "UTILITY_RESPONSE",
+                {"cmd": "abort_request", "req_id": req_id, "result": found},
+            )
+        )
 
     def _handle_configure_hidden_states(self, args: dict):
         """Configure hidden states extraction on all model runners (TorchSpec)."""
