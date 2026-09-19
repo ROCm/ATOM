@@ -252,15 +252,29 @@ def test_view_takes_every_attribute_the_scheduler_the_plugin_builds_writes():
 
     written: dict[str, int] = {}
     where: dict[str, str] = {}
+    scanned: set[str] = set()
     for module_name, class_name in sorted(built):
         cls = getattr(importlib.import_module(module_name), class_name)
         for base in cls.__mro__:
             source = getattr(importlib.import_module(base.__module__), "__file__", None)
             if not source or "/atom/" not in source:
                 continue
+            scanned.add(pathlib.Path(source).name)
             for name, line in _seq_writes(source).items():
                 written.setdefault(name, line)
                 where.setdefault(name, f"{pathlib.Path(source).name}:{line}")
+
+    # Guard the scope derivation, which is the part that can fail as a whole:
+    # rewire the connector through a factory or a conditional and the parse
+    # above finds no class, so the file set collapses to nothing and every
+    # assertion below passes vacuously. Name a file we know writes on a seq
+    # rather than only checking the set is non-empty -- the MRO always
+    # contributes the scheduler's own module, so non-empty is nearly free.
+    assert scanned, "scope derivation produced no files to scan"
+    assert "chunked_scheduler.py" in scanned, (
+        "scope derivation lost the known writer; scanned "
+        f"{sorted(scanned)} -- fix the derivation, not this assertion"
+    )
 
     # Guard the scanner itself: if a refactor renames the loop variable, the
     # scan silently finds nothing and this test passes while checking nothing.
